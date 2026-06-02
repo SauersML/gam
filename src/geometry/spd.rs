@@ -3,6 +3,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::geometry::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, cholesky_spd, dot, flatten,
     from_flat, inverse, spectral_map_spd, spectral_map_symmetric, sym,
+    tangent_basis_metric_orthonormal,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,28 +70,16 @@ impl RiemannianManifold for SpdManifold {
         self.n * self.n
     }
 
+    /// Basis of the symmetric tangent space, orthonormal under the
+    /// **affine-invariant metric** `⟨U,V⟩_P = tr(P⁻¹U P⁻¹V)` (i.e. `Qᵀ W Q = I`
+    /// with `W = metric_tensor(point) = P⁻¹ ⊗ P⁻¹`). The hand-rolled
+    /// Frobenius-orthonormal basis used previously is orthonormal only under the
+    /// embedded `tr(UV)` inner product, which is *not* the SPD metric off the
+    /// identity point, so it produced a basis that did not satisfy `Qᵀ W Q = I`.
+    /// We Gram–Schmidt the projected symmetric standard basis under `W` instead.
     fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
         check_len("SPD point", point.len(), self.ambient_dim())?;
-        // Frobenius-orthonormal basis of the symmetric tangent space. The
-        // diagonal generators E_ii already have ‖E_ii‖_F = 1; the off-diagonal
-        // generators place 1/√2 at both (i,j) and (j,i) so ‖E_ij‖²_F = ½ + ½ = 1
-        // (a single 1.0 at each entry would give ‖·‖_F = √2, a non-orthonormal
-        // basis).
-        let off = std::f64::consts::FRAC_1_SQRT_2;
-        let mut out = Array2::<f64>::zeros((self.ambient_dim(), self.dim()));
-        let mut col = 0usize;
-        for i in 0..self.n {
-            for j in i..self.n {
-                if i == j {
-                    out[[i * self.n + j, col]] = 1.0;
-                } else {
-                    out[[i * self.n + j, col]] = off;
-                    out[[j * self.n + i, col]] = off;
-                }
-                col += 1;
-            }
-        }
-        Ok(out)
+        tangent_basis_metric_orthonormal(self, point, self.n, self.n)
     }
 
     fn exp_map(
@@ -236,5 +225,39 @@ impl RiemannianManifold for SpdManifold {
         Err(GeometryError::Unsupported(
             "SPD exp_map_vjp: no analytic backward implemented",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tangent_basis_tests {
+    use super::SpdManifold;
+    use crate::geometry::manifold::RiemannianManifold;
+    use ndarray::Array1;
+
+    /// The SPD `tangent_basis` must be orthonormal under the affine-invariant
+    /// metric `⟨U,V⟩_P = tr(P⁻¹U P⁻¹V)`, i.e. `Qᵀ W Q = I` with
+    /// `W = metric_tensor(P)`. At a non-identity point the old hand-rolled
+    /// Frobenius-orthonormal basis fails this; the metric Gram–Schmidt fixes it.
+    #[test]
+    fn spd_tangent_basis_metric_orthonormal() {
+        let spd = SpdManifold::new(2);
+        // P = [[2, 0.5], [0.5, 1]] (SPD), row-major flatten.
+        let p = Array1::from(vec![2.0, 0.5, 0.5, 1.0]);
+        let q = spd.tangent_basis(p.view()).expect("tangent basis");
+        let w = spd.metric_tensor(p.view()).expect("metric tensor");
+        let d = spd.dim();
+        assert_eq!(q.ncols(), d, "basis must have dim() columns");
+        let wq = w.dot(&q);
+        let gram = q.t().dot(&wq);
+        for i in 0..d {
+            for j in 0..d {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (gram[[i, j]] - want).abs() <= 1.0e-10,
+                    "QᵀWQ != I at ({i},{j}): got {}",
+                    gram[[i, j]]
+                );
+            }
+        }
     }
 }

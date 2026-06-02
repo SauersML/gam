@@ -2,7 +2,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat,
-    identity, matrix_exp, projected_standard_basis_tangent, qr_thin, sym,
+    identity, matrix_exp, qr_thin, sym, tangent_basis_metric_orthonormal,
 };
 use crate::geometry::sphere::SphereManifold;
 
@@ -65,9 +65,15 @@ impl RiemannianManifold for StiefelManifold {
         self.n * self.k
     }
 
+    /// Basis of the tangent space, orthonormal under the **canonical metric**
+    /// `⟨Δ₁,Δ₂⟩ = tr(Δ₁ᵀ(I−½YYᵀ)Δ₂)` — i.e. `Qᵀ W Q = I` with
+    /// `W = metric_tensor(point)`. A Euclidean-orthonormal basis would be wrong
+    /// here because the canonical metric differs from the embedded inner product
+    /// off the `YᵀΔ = 0` subspace (e.g. the vertical tangent has canonical norm²
+    /// 1 but Euclidean norm² 2).
     fn tangent_basis(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Array2<f64>> {
         check_len("Stiefel point", point.len(), self.ambient_dim())?;
-        projected_standard_basis_tangent(self, point, self.n, self.k)
+        tangent_basis_metric_orthonormal(self, point, self.n, self.k)
     }
 
     /// Riemannian exponential under the **canonical metric**
@@ -478,4 +484,62 @@ fn qr_thin_vjp(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tangent_basis_tests {
+    use super::StiefelManifold;
+    use crate::geometry::manifold::RiemannianManifold;
+    use ndarray::Array1;
+
+    /// The Stiefel `tangent_basis` must be orthonormal under the canonical
+    /// metric: `Qᵀ W Q = I` with `W = metric_tensor(Y)`. A Euclidean-orthonormal
+    /// basis (the old shared routine) would give `Qᵀ W Q ≠ I` because the
+    /// canonical metric `tr(Δᵀ(I−½YYᵀ)Δ)` differs from the embedded inner
+    /// product off the `YᵀΔ = 0` subspace.
+    #[test]
+    fn stiefel_tangent_basis_metric_orthonormal() {
+        // St(3, 2) at Y = [e1, e2] (row-major flatten of the 3×2 frame).
+        let st = StiefelManifold::new(2, 3).expect("St(3,2) exists");
+        let y = Array1::from(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let q = st.tangent_basis(y.view()).expect("tangent basis");
+        let w = st.metric_tensor(y.view()).expect("metric tensor");
+        let d = st.dim();
+        assert_eq!(q.ncols(), d, "basis must have dim() columns");
+        // QᵀWQ
+        let wq = w.dot(&q);
+        let gram = q.t().dot(&wq);
+        for i in 0..d {
+            for j in 0..d {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (gram[[i, j]] - want).abs() <= 1.0e-10,
+                    "QᵀWQ != I at ({i},{j}): got {}",
+                    gram[[i, j]]
+                );
+            }
+        }
+    }
+
+    /// Sanity check the metric scaling the basis must capture: the vertical
+    /// tangent Δ = Y·[[0,−1],[1,0]] has canonical-metric norm² 1, not the
+    /// Euclidean 2. (This is the audit's discriminating case.)
+    #[test]
+    fn stiefel_vertical_tangent_canonical_norm() {
+        let st = StiefelManifold::new(2, 3).expect("St(3,2) exists");
+        let y = Array1::from(vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        // Δ = Y · [[0,-1],[1,0]] = columns (e2, -e1) ⇒ 3×2 with rows:
+        //   row0 = (0, -1), row1 = (1, 0), row2 = (0, 0). Row-major flatten.
+        let delta = Array1::from(vec![0.0, -1.0, 1.0, 0.0, 0.0, 0.0]);
+        let w = st.metric_tensor(y.view()).expect("metric tensor");
+        let wd = w.dot(&delta);
+        let mut norm_sq = 0.0;
+        for i in 0..delta.len() {
+            norm_sq += delta[i] * wd[i];
+        }
+        assert!(
+            (norm_sq - 1.0).abs() <= 1.0e-12,
+            "canonical-metric norm² of vertical tangent must be 1, got {norm_sq}"
+        );
+    }
 }

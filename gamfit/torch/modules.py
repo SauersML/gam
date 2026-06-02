@@ -189,9 +189,11 @@ class AdaptiveTopK(nn.Module):
     >>> from gamfit.torch import AdaptiveTopK
     >>> gate = AdaptiveTopK(F=8, k_min=2, k_max=6, head='mlp', hidden=16)
     >>> z_raw = torch.randn(4, 8)
-    >>> z_active, k_pred = gate(z_raw)
+    >>> z_active, k_pred, sparsity = gate(z_raw)
     >>> z_active.shape, k_pred.shape
     (torch.Size([4, 8]), torch.Size([4]))
+    >>> bool(sparsity.isfinite())
+    True
     >>> bool(gate.penalty().isfinite())
     True
     """
@@ -265,7 +267,24 @@ class AdaptiveTopK(nn.Module):
         gated = torch.sigmoid(raw)
         return self.k_min + (self.k_max - self.k_min) * gated
 
-    def forward(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, z: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(z_active, k_pred_eff, sparsity_penalty)``.
+
+        ``z_active`` is the straight-through-gated activation (hard top-K
+        forward, soft-mask backward); ``k_pred_eff`` is the per-row soft count
+        ``sum_j sigmoid((|z_ij| - tau_i)/temperature)`` whose expectation equals
+        the predicted per-row K. ``sparsity_penalty = lambda * mean(k_pred)`` is
+        the graph-connected penalty for THIS batch — add it directly to the
+        training loss so reconstruction + sparsity train ``k_head`` and
+        ``log_weight`` end-to-end on the exact batch just forwarded.
+
+        ``mean(k_pred)`` flows from ``k_head`` (it is *not* detached), so the
+        sparsity term backpropagates into the learned-K head; ``z_active``
+        flows recon gradient into ``z`` (hence into upstream parameters) through
+        the soft top-K surrogate via the STE.
+        """
         z = _check_2d_float_tensor(z, "z")
         if z.shape[1] != self.F:
             raise ValueError(f"AdaptiveTopK expected width {self.F}, got {z.shape[1]}")
@@ -277,25 +296,19 @@ class AdaptiveTopK(nn.Module):
         self._last_k_pred_mean_graph = k_pred_mean
         with torch.no_grad():
             self._last_k_pred_mean = k_pred_mean.detach()
-        # Known limitation (adaptive-k STE): reconstruction gradient still does not reach
-        # ``k_pred`` -- the straight-through ``z_active = z_active_soft + (z*hard -
-        # z_active_soft).detach()`` (see ``_AdaptiveTopKSTE.forward``) routes the
-        # recon gradient only through the soft mask wrt ``z``, while
-        # ``_AdaptiveTopKSTE.backward`` returns ``grad_k_pred`` solely from the
-        # auxiliary ``k_pred_eff`` output. A fuller STE would also propagate the
-        # recon gradient into ``k_pred`` via the order-statistic threshold ``tau``
-        # so the learned-K head is trained by reconstruction, not just by
-        # ``penalty()``. Deferred: it would change the STE Jacobian and the public
-        # forward returns a 2-tuple consumed by external callers.
-        return z_active, k_pred_eff
+        sparsity_penalty = torch.exp(self.log_weight) * k_pred_mean
+        return z_active, k_pred_eff, sparsity_penalty
 
     def penalty(self) -> torch.Tensor:
         """Return ``lambda * E[K_pred]`` using the most recent forward pass.
 
         The mean of ``k_pred`` is kept graph-connected from ``forward`` so that
         ``loss = recon + gate.penalty()`` backpropagates into ``k_head`` (and into
-        ``log_weight``). Before any forward pass this returns a graph-connected
-        zero anchored on ``log_weight``.
+        ``log_weight``). Prefer the ``sparsity_penalty`` returned directly by
+        :meth:`forward` for the current batch; this accessor returns the same
+        graph-connected quantity for the most recent forward and exists for
+        callers that hold the module rather than the forward outputs. Before any
+        forward pass it returns a graph-connected zero anchored on ``log_weight``.
         """
         weight = torch.exp(self.log_weight)
         if self._last_k_pred_mean_graph is None:

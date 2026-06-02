@@ -3,6 +3,7 @@ pub mod conformal;
 pub mod data;
 pub mod diagnostics;
 pub mod dispersion_cov;
+pub mod fisher_rao;
 pub mod formula_dsl;
 pub mod generative;
 pub mod hmc;

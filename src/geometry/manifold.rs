@@ -293,19 +293,31 @@ pub(crate) fn flatten(a: &Array2<f64>) -> Array1<f64> {
     out
 }
 
-/// Build an orthonormal basis of the tangent space at `point` by modified
-/// Gram–Schmidt over the projected ambient standard basis.
+/// Build a **Euclidean-orthonormal** basis of the tangent space at `point` by
+/// modified Gram–Schmidt over the projected ambient standard basis.
+///
+/// The returned columns satisfy `Qᵀ Q = I` under the *ambient Euclidean* inner
+/// product (the plain `dot`). This is the correct, intended basis for a
+/// manifold whose Riemannian metric *is* the embedded Euclidean metric on its
+/// horizontal tangent space — notably the **Grassmann** manifold, where the
+/// tangent inner product is `tr(Δ₁ᵀΔ₂)`.
+///
+/// It is **not** metric-orthonormal for a manifold with a non-Euclidean metric
+/// (Stiefel's canonical metric `⟨Δ₁,Δ₂⟩ = tr(Δ₁ᵀ(I−½YYᵀ)Δ₂)`, or SPD's
+/// affine-invariant metric): for those, use
+/// [`tangent_basis_metric_orthonormal`], which Gram–Schmidts under the
+/// manifold's own `metric_tensor`.
 ///
 /// This is the shared engine behind [`tangent_basis`](RiemannianManifold::tangent_basis)
-/// for the matrix manifolds whose tangent space has no closed-form basis (the
-/// Stiefel and Grassmann manifolds). It walks the `n × k` standard basis in
-/// column-major order (outer `col`, inner `row`), projects each `e_{row,col}`
-/// onto the tangent space via `m.project_tangent`, re-orthogonalizes against the
-/// columns accepted so far, and keeps it iff its residual norm exceeds the
-/// `1e-10` drop tolerance, stopping the moment `m.dim()` independent directions
-/// have been collected. Each caller keeps its own input validation and then
-/// delegates here, so the numerically delicate orthogonalization order, drop
-/// tolerance, and early-exit logic live in exactly one place.
+/// for the matrix manifolds whose tangent space has no closed-form basis. It
+/// walks the `n × k` standard basis in column-major order (outer `col`, inner
+/// `row`), projects each `e_{row,col}` onto the tangent space via
+/// `m.project_tangent`, re-orthogonalizes against the columns accepted so far,
+/// and keeps it iff its residual norm exceeds the `1e-10` drop tolerance,
+/// stopping the moment `m.dim()` independent directions have been collected.
+/// Each caller keeps its own input validation and then delegates here, so the
+/// numerically delicate orthogonalization order, drop tolerance, and early-exit
+/// logic live in exactly one place.
 pub(crate) fn projected_standard_basis_tangent<M: RiemannianManifold + ?Sized>(
     m: &M,
     point: ArrayView1<'_, f64>,
@@ -340,6 +352,75 @@ pub(crate) fn projected_standard_basis_tangent<M: RiemannianManifold + ?Sized>(
     Ok(Array2::<f64>::zeros((m.ambient_dim(), columns.len())))
 }
 
+/// Build a **metric-orthonormal** basis of the tangent space at `point`, i.e. a
+/// set of columns `Q` satisfying `Qᵀ W Q = I` where `W = m.metric_tensor(point)`
+/// is the manifold's Riemannian metric in flattened ambient coordinates.
+///
+/// This is the correct tangent basis for a manifold whose metric is **not** the
+/// embedded Euclidean inner product — Stiefel's canonical metric
+/// `⟨Δ₁,Δ₂⟩ = tr(Δ₁ᵀ(I−½YYᵀ)Δ₂)` and SPD's affine-invariant metric. (For a
+/// Euclidean-metric manifold like Grassmann, `W = I` and this coincides with
+/// [`projected_standard_basis_tangent`].)
+///
+/// Same projected-standard-basis walk as the Euclidean routine, but every inner
+/// product is the metric inner product `⟨u,v⟩_W = uᵀ W v` (via
+/// [`quad_form`]): Gram–Schmidt projections subtract `⟨q,v⟩_W · q` and the
+/// retained columns are normalized by `‖v‖_W = sqrt(⟨v,v⟩_W)`, so the resulting
+/// `Q` is orthonormal *in the manifold's metric*.
+///
+/// Concretely on `St(3, 2)` at `Y = [e₁, e₂]`, the vertical tangent
+/// `Δ = Y·[[0,−1],[1,0]]` has Euclidean norm² 2 but canonical-metric norm² 1, so
+/// a metric-orthonormal basis must reflect that — the Euclidean routine would
+/// mis-scale it.
+pub(crate) fn tangent_basis_metric_orthonormal<M: RiemannianManifold + ?Sized>(
+    m: &M,
+    point: ArrayView1<'_, f64>,
+    n: usize,
+    k: usize,
+) -> GeometryResult<Array2<f64>> {
+    let w = m.metric_tensor(point)?;
+    let mut columns: Vec<Array1<f64>> = Vec::with_capacity(m.dim());
+    for col in 0..k {
+        for row in 0..n {
+            let mut e = Array2::<f64>::zeros((n, k));
+            e[[row, col]] = 1.0;
+            let mut v = m.project_tangent(point, flatten(&e).view())?;
+            for q in &columns {
+                let proj = quad_form(w.view(), q.view(), v.view());
+                v -= &(q * proj);
+            }
+            let nrm = quad_form(w.view(), v.view(), v.view()).max(0.0).sqrt();
+            if nrm > 1.0e-10 {
+                columns.push(v / nrm);
+            }
+            if columns.len() == m.dim() {
+                let mut out = Array2::<f64>::zeros((m.ambient_dim(), m.dim()));
+                for j in 0..columns.len() {
+                    for i in 0..m.ambient_dim() {
+                        out[[i, j]] = columns[j][i];
+                    }
+                }
+                return Ok(out);
+            }
+        }
+    }
+    Ok(Array2::<f64>::zeros((m.ambient_dim(), columns.len())))
+}
+
+/// Thin/compact Gram–Schmidt QR factorization `A = Q·R` for an `n×k` input
+/// (`n ≥ k`). The returned `Q` is `n×k` with **orthonormal columns**
+/// (`QᵀQ = I`) and `R` is `k×k` upper-triangular.
+///
+/// On a rank-deficient column (residual ≈ 0 after orthogonalizing against the
+/// previously accepted columns) the diagonal `R[j, j]` is set to 0 and a
+/// *fallback* unit column is synthesized so the column count stays `k` and `Q`
+/// remains a valid orthonormal frame. The fallback is a standard axis `e_a`
+/// Gram–Schmidted against ALL previously accepted columns and renormalized; if
+/// that residual also vanishes (the axis lies in the accepted span) the next
+/// axis is tried, until an axis with a nonzero orthogonal residual is found.
+/// Simply planting `e_j` (the old behavior) breaks orthonormality — e.g. two
+/// identical columns `(1,1)/√2` would yield a fallback `e₂` with
+/// `q₁·q₂ = 1/√2 ≠ 0`.
 pub(crate) fn qr_thin(a: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
     let n = a.nrows();
     let k = a.ncols();
@@ -361,9 +442,33 @@ pub(crate) fn qr_thin(a: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
             for row in 0..n {
                 q[[row, j]] = v[row] / nrm;
             }
-        } else if j < n {
-            q[[j, j]] = 1.0;
+        } else {
+            // Rank-deficient column: `R[j, j] = 0`. Synthesize a fallback unit
+            // column orthogonal to ALL accepted columns 0..j by Gram–Schmidting
+            // a standard axis against them; try successive axes until one has a
+            // nonzero orthogonal residual (always succeeds for j < n since the
+            // accepted columns span a j-dimensional subspace of ℝⁿ, leaving an
+            // (n−j)-dimensional orthogonal complement that at least one axis
+            // touches).
             r[[j, j]] = 0.0;
+            for axis in 0..n {
+                let mut f = Array1::<f64>::zeros(n);
+                f[axis] = 1.0;
+                for i in 0..j {
+                    let qi = q.column(i);
+                    let proj = dot(qi, f.view());
+                    for row in 0..n {
+                        f[row] -= proj * q[[row, i]];
+                    }
+                }
+                let fnrm = norm(f.view());
+                if fnrm > GEOMETRY_EPS {
+                    for row in 0..n {
+                        q[[row, j]] = f[row] / fnrm;
+                    }
+                    break;
+                }
+            }
         }
     }
     (q, r)
@@ -593,6 +698,23 @@ pub(crate) fn matrix_exp(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     Ok(result)
 }
 
+/// Cholesky factor `L` of a symmetric positive-definite matrix (`A = L Lᵀ`).
+///
+/// This is a *positive-definiteness* test, not a conditioning test: a genuine
+/// SPD matrix with tiny eigenvalues (e.g. `[[1e-16]]`) must factor
+/// successfully. A pivot is rejected only when it is non-finite or fails to be
+/// strictly positive *relative to the matrix scale*. The floor
+/// `GEOMETRY_EPS · max(1, trace(A)/n)` is the ambient scale of the matrix
+/// multiplied by the relative machine-noise tolerance, so a positive pivot that
+/// is merely small in absolute terms (but large relative to nothing — the whole
+/// matrix is small) passes, while a zero, negative, or numerically-noise pivot
+/// (indefinite / singular directions) is rejected.
+///
+/// Callers needing a *conditioning* margin (a lower bound on the smallest
+/// eigenvalue) must check that separately; overloading this PD test with an
+/// absolute `GEOMETRY_EPS` floor wrongly rejected well-formed small-scale SPD
+/// points. No current caller (only `SpdManifold::matrix`, which validates SPD
+/// membership) depends on a conditioning margin here.
 pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     let n = a.nrows();
     if n != a.ncols() {
@@ -600,6 +722,32 @@ pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
             "Cholesky requires square input",
         ));
     }
+    // Scale-relative positive-definiteness floor. `trace(A)/n` is the mean
+    // diagonal, which equals `mean(eigenvalues)` and is therefore the natural
+    // scale of an SPD matrix's spectrum. The acceptance floor scales WITH the
+    // matrix (it shrinks for tiny matrices), so a uniformly small but genuine
+    // SPD matrix like `[[1e-16]]` — scale 1e-16, floor GEOMETRY_EPS·1e-16 =
+    // 1e-28 — passes, while a pivot that has collapsed to numerical noise
+    // relative to the matrix's own scale (the indefinite/singular directions)
+    // is rejected. An absolute `GEOMETRY_EPS` floor would have wrongly rejected
+    // such tiny SPD matrices; clamping the floor up to a constant would do the
+    // same, so we deliberately let it shrink with the spectrum.
+    let mut trace = 0.0_f64;
+    for i in 0..n {
+        trace += a[[i, i]];
+    }
+    if !trace.is_finite() {
+        return Err(GeometryError::InvalidPoint(
+            "matrix is not positive definite",
+        ));
+    }
+    // Reference scale of the matrix's spectrum. The acceptance floor is this
+    // scale times the relative tolerance, so a uniformly-tiny SPD matrix (small
+    // scale) has a correspondingly tiny floor and still factors, while a pivot
+    // that has collapsed to noise *relative to the matrix's own scale* (the
+    // indefinite/singular case) is rejected.
+    let scale = (trace / n as f64).abs().max(f64::MIN_POSITIVE);
+    let scale_eps = GEOMETRY_EPS * scale;
     let mut l = Array2::<f64>::zeros((n, n));
     for i in 0..n {
         for j in 0..=i {
@@ -608,7 +756,7 @@ pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
                 sum -= l[[i, k]] * l[[j, k]];
             }
             if i == j {
-                if sum <= GEOMETRY_EPS || !sum.is_finite() {
+                if !sum.is_finite() || sum <= scale_eps {
                     return Err(GeometryError::InvalidPoint(
                         "matrix is not positive definite",
                     ));
@@ -620,6 +768,129 @@ pub(crate) fn cholesky_spd(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
         }
     }
     Ok(l)
+}
+
+#[cfg(test)]
+mod cholesky_tests {
+    use super::{GeometryError, cholesky_spd};
+    use ndarray::Array2;
+
+    /// A genuine SPD matrix with a uniformly tiny spectrum (`[[1e-16]]`) must
+    /// factor: the issue is positive-definiteness, not absolute scale. The old
+    /// absolute `GEOMETRY_EPS` floor wrongly rejected it.
+    #[test]
+    fn cholesky_accepts_tiny_spd() {
+        let mut a = Array2::<f64>::zeros((1, 1));
+        a[[0, 0]] = 1.0e-16;
+        let l = cholesky_spd(&a).expect("tiny positive 1x1 must be SPD");
+        assert!((l[[0, 0]] - 1.0e-8).abs() <= 1.0e-16);
+    }
+
+    /// A well-scaled SPD matrix factors and reproduces `L Lᵀ = A`.
+    #[test]
+    fn cholesky_accepts_well_scaled_spd() {
+        // [[4, 2], [2, 3]] is SPD (eigenvalues ≈ 5.56, 1.44).
+        let mut a = Array2::<f64>::zeros((2, 2));
+        a[[0, 0]] = 4.0;
+        a[[0, 1]] = 2.0;
+        a[[1, 0]] = 2.0;
+        a[[1, 1]] = 3.0;
+        let l = cholesky_spd(&a).expect("well-scaled SPD must factor");
+        let recon = l.dot(&l.t());
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (recon[[i, j]] - a[[i, j]]).abs() <= 1.0e-12,
+                    "L Lᵀ != A at ({i},{j})"
+                );
+            }
+        }
+    }
+
+    /// A zero pivot (singular) and an indefinite matrix must be rejected as not
+    /// positive definite — the scale-relative floor still catches the genuine
+    /// non-PD case.
+    #[test]
+    fn cholesky_rejects_zero_and_indefinite() {
+        let zero = Array2::<f64>::zeros((1, 1));
+        match cholesky_spd(&zero) {
+            Err(GeometryError::InvalidPoint(_)) => {}
+            other => panic!("expected non-PD rejection of zero pivot, got {other:?}"),
+        }
+        // [[1, 2], [2, 1]] has eigenvalues 3 and −1 (indefinite): the Schur
+        // complement pivot 1 − 4 = −3 is negative.
+        let mut indef = Array2::<f64>::zeros((2, 2));
+        indef[[0, 0]] = 1.0;
+        indef[[0, 1]] = 2.0;
+        indef[[1, 0]] = 2.0;
+        indef[[1, 1]] = 1.0;
+        match cholesky_spd(&indef) {
+            Err(GeometryError::InvalidPoint(_)) => {}
+            other => panic!("expected non-PD rejection of indefinite matrix, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod qr_thin_tests {
+    use super::qr_thin;
+    use ndarray::Array2;
+
+    /// Two identical columns make the second residual vanish; the fallback axis
+    /// must be Gram–Schmidted against the first accepted column so `QᵀQ = I`.
+    /// The old behavior planted `e₂` directly, giving `q₁·q₂ = 1/√2`.
+    #[test]
+    fn qr_thin_duplicated_columns_orthonormal() {
+        let mut a = Array2::<f64>::zeros((2, 2));
+        // Both columns = (1, 1).
+        a[[0, 0]] = 1.0;
+        a[[1, 0]] = 1.0;
+        a[[0, 1]] = 1.0;
+        a[[1, 1]] = 1.0;
+        let (q, r) = qr_thin(&a);
+        // Deficient second column ⇒ R[1,1] = 0.
+        assert!(r[[1, 1]].abs() <= 1.0e-14, "deficient column must set R[1,1]=0");
+        let gram = q.t().dot(&q);
+        for i in 0..2 {
+            for j in 0..2 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (gram[[i, j]] - want).abs() <= 1.0e-12,
+                    "QᵀQ != I at ({i},{j}): got {}",
+                    gram[[i, j]]
+                );
+            }
+        }
+    }
+
+    /// A full-rank input still gives `QᵀQ = I` and reconstructs `A = QR`.
+    #[test]
+    fn qr_thin_full_rank_reconstructs() {
+        let mut a = Array2::<f64>::zeros((3, 2));
+        a[[0, 0]] = 1.0;
+        a[[1, 0]] = 1.0;
+        a[[2, 0]] = 0.0;
+        a[[0, 1]] = 1.0;
+        a[[1, 1]] = 0.0;
+        a[[2, 1]] = 1.0;
+        let (q, r) = qr_thin(&a);
+        let gram = q.t().dot(&q);
+        for i in 0..2 {
+            for j in 0..2 {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((gram[[i, j]] - want).abs() <= 1.0e-12, "QᵀQ != I at ({i},{j})");
+            }
+        }
+        let recon = q.dot(&r);
+        for i in 0..3 {
+            for j in 0..2 {
+                assert!(
+                    (recon[[i, j]] - a[[i, j]]).abs() <= 1.0e-12,
+                    "QR != A at ({i},{j})"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]

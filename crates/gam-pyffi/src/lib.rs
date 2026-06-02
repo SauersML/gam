@@ -130,8 +130,8 @@ use gam::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
 };
 use ndarray::{
-    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, ArrayViewD,
-    Axis, IxDyn, s,
+    Array1, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, IxDyn,
+    s,
 };
 use numpy::{
     IntoPyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayDyn, PyArrayMethods,
@@ -361,6 +361,57 @@ struct PyPredictOptions {
     /// `std_error ** 2` column.)
     interval: Option<f64>,
     time_grid: Option<Vec<f64>>,
+    /// Posterior covariance source for eta/mean intervals. One of
+    /// `"conditional"` (H⁻¹ only), `"smoothing"` (first-order smoothing
+    /// correction `H⁻¹ + J Var(ρ̂) Jᵀ` when available, else falls back to
+    /// conditional), or `"required"` (the smoothing correction, erroring if it
+    /// is unavailable). `None` keeps the engine default (`"smoothing"`). This
+    /// is the Python/CLI parity surface for `--covariance-mode`; it is read on
+    /// the delta-method (effectively-linear + interval) predict branch where
+    /// `PredictUncertaintyOptions` governs the covariance, mirroring the CLI's
+    /// `gam predict --covariance-mode`.
+    #[serde(default)]
+    covariance_mode: Option<String>,
+    /// When `true`, the effectively-linear interval branch also returns
+    /// response-scale observation intervals `Var(y_new|x) = Var(μ̂) + Var(Y|μ)`
+    /// via the engine's `includeobservation_interval`, surfaced as
+    /// `observation_lower` / `observation_upper` columns. `None`/`false`
+    /// preserves the prior behaviour (no observation interval).
+    #[serde(default)]
+    observation_interval: Option<bool>,
+    /// Opt-in distribution-free conformal calibration of the response-scale
+    /// interval (issue #310 family path). When `Some(level)` with
+    /// `level ∈ (0, 1)`, the model-based `mean_lower` / `mean_upper` are
+    /// REPLACED by the split-conformal interval `μ̂(x) ± q̂·s(x)` calibrated
+    /// from a held-out fold supplied via the `*_conformal` predict pyfunction.
+    /// `None` (default) leaves the interval untouched. Only the conformal
+    /// predict path reads this field.
+    #[serde(default)]
+    conformal_level: Option<f64>,
+}
+
+/// Parse the public `covariance_mode` string into the engine enum. `None`
+/// keeps the engine default (smoothing-preferred); unknown strings are a hard
+/// error so a typo never silently degrades to the default covariance.
+fn parse_covariance_mode(
+    raw: Option<&str>,
+) -> Result<Option<gam::predict::InferenceCovarianceMode>, String> {
+    let Some(text) = raw else {
+        return Ok(None);
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "conditional" => Ok(Some(gam::predict::InferenceCovarianceMode::Conditional)),
+        "smoothing" => Ok(Some(
+            gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        )),
+        "required" => Ok(Some(
+            gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
+        )),
+        other => Err(format!(
+            "covariance_mode must be one of \"conditional\", \"smoothing\", or \"required\"; \
+             got \"{other}\""
+        )),
+    }
 }
 
 #[derive(Serialize)]
@@ -369,6 +420,12 @@ struct PyPredictOptionsPayload {
     interval: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     time_grid: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    covariance_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation_interval: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conformal_level: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -2938,30 +2995,41 @@ fn formula_validation_html_json(payload_json: String) -> PyResult<String> {
     ))
 }
 
-#[pyfunction]
+#[pyfunction(signature = (interval, time_grid, covariance_mode=None, observation_interval=None))]
 fn build_predict_payload_json(
     interval: Option<f64>,
     time_grid: Option<Vec<f64>>,
+    covariance_mode: Option<String>,
+    observation_interval: Option<bool>,
 ) -> PyResult<String> {
+    // Validate the covariance-mode string here (before transport) so a typo
+    // surfaces as a clear error at the predict call site rather than as an
+    // opaque deserialization failure later.
+    parse_covariance_mode(covariance_mode.as_deref()).map_err(py_value_error)?;
     let payload = PyPredictOptionsPayload {
         interval,
         time_grid,
+        covariance_mode,
+        observation_interval,
+        conformal_level: None,
     };
     serde_json::to_string(&payload)
         .map_err(|err| py_value_error(format!("failed to serialize predict payload: {err}")))
 }
 
-#[pyfunction]
+#[pyfunction(signature = (model_bytes, headers, rows, interval, covariance_mode=None, observation_interval=None))]
 fn build_model_predict_payload_json(
     model_bytes: Vec<u8>,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
     interval: Option<f64>,
+    covariance_mode: Option<String>,
+    observation_interval: Option<bool>,
 ) -> PyResult<String> {
     let model_class = required_saved_model_payload_string_value(&model_bytes, "model_kind")?;
     let formula = required_saved_model_payload_string_value(&model_bytes, "formula")?;
     let time_grid = default_survival_time_grid(&model_class, &formula, headers, rows)?;
-    build_predict_payload_json(interval, time_grid)
+    build_predict_payload_json(interval, time_grid, covariance_mode, observation_interval)
 }
 
 #[pyfunction]
@@ -4777,6 +4845,11 @@ const PREFERRED_PREDICTION_COLUMNS: &[&str] = &[
     "std_error",
     "mean_lower",
     "mean_upper",
+    // Response-scale observation (prediction) interval, emitted only when
+    // `observation_interval=True` and the family supports it; ordered after
+    // the credible mean interval so the standard schema stays stable when off.
+    "observation_lower",
+    "observation_upper",
     // Issue #365: location-scale / GAMLSS families emit the fitted per-row
     // distribution scale (e.g. Gaussian σ) so the learned `noise_formula`
     // function is retrievable from Python; ordered after the mean columns.
@@ -18197,85 +18270,6 @@ fn rg_exp_map_dispatch(
     }
 }
 
-fn rg_normalize_fisher_rao_impl(
-    arr: ArrayViewD<'_, f64>,
-    n_rows: usize,
-    dim: usize,
-) -> Result<Array3<f64>, String> {
-    if !arr.iter().all(|v| v.is_finite()) {
-        return Err("fisher_rao_w must contain only finite values".to_string());
-    }
-    let shape = arr.shape().to_vec();
-    let out: Array3<f64> = match arr.ndim() {
-        1 => {
-            if shape[0] != n_rows {
-                return Err(format!(
-                    "fisher_rao_w vector must have length {n_rows}; got {}",
-                    shape[0]
-                ));
-            }
-            let mut block = Array3::<f64>::zeros((n_rows, dim, dim));
-            for row in 0..n_rows {
-                let value = arr[IxDyn(&[row])];
-                for d in 0..dim {
-                    block[[row, d, d]] = value;
-                }
-            }
-            block
-        }
-        2 => {
-            if shape[0] != dim || shape[1] != dim {
-                return Err(format!(
-                    "fisher_rao_w matrix must have shape ({dim}, {dim}); got ({}, {})",
-                    shape[0], shape[1]
-                ));
-            }
-            let mut block = Array3::<f64>::zeros((n_rows, dim, dim));
-            for row in 0..n_rows {
-                for r in 0..dim {
-                    for c in 0..dim {
-                        block[[row, r, c]] = arr[IxDyn(&[r, c])];
-                    }
-                }
-            }
-            block
-        }
-        3 => {
-            if shape[0] != n_rows || shape[1] != dim || shape[2] != dim {
-                return Err(format!(
-                    "fisher_rao_w must have shape ({n_rows}, {dim}, {dim}); got ({}, {}, {})",
-                    shape[0], shape[1], shape[2]
-                ));
-            }
-            let mut block = Array3::<f64>::zeros((n_rows, dim, dim));
-            for row in 0..n_rows {
-                for r in 0..dim {
-                    for c in 0..dim {
-                        block[[row, r, c]] = arr[IxDyn(&[row, r, c])];
-                    }
-                }
-            }
-            block
-        }
-        _ => return Err("fisher_rao_w must be a 1-D, 2-D, or 3-D numeric array".to_string()),
-    };
-    for row in 0..n_rows {
-        for r in 0..dim {
-            for c in 0..dim {
-                let a = out[[row, r, c]];
-                let b = out[[row, c, r]];
-                if (a - b).abs() > 1.0e-10 * (1.0 + a.abs() + b.abs()) {
-                    return Err("fisher_rao_w must be symmetric in every row block".to_string());
-                }
-            }
-            if out[[row, r, r]] < 0.0 {
-                return Err("fisher_rao_w diagonal entries must be non-negative".to_string());
-            }
-        }
-    }
-    Ok(out)
-}
-
 #[pyfunction]
 fn response_geometry_closure<'py>(
     py: Python<'py>,
@@ -18827,7 +18821,7 @@ fn response_geometry_normalize_fisher_rao<'py>(
 ) -> PyResult<Py<PyArray3<f64>>> {
     let arr = value.as_array().to_owned();
     let out = detach_py_result(py, "response_geometry_normalize_fisher_rao", move || {
-        rg_normalize_fisher_rao_impl(arr.view(), n_rows, dim)
+        gam::inference::fisher_rao::normalize_fisher_rao_blocks(arr.view(), n_rows, dim)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -24575,12 +24569,19 @@ fn predict_columns(
             // empirically worse against truth, and is inconsistent with the
             // link-wiggle path that never bias-corrects; bias-aware coverage is
             // already supplied by the smoothing-corrected covariance.
+            //
+            // CLI<->Python parity: `covariance_mode` (default smoothing-preferred,
+            // matching the prior hardcode) and `observation_interval` are now
+            // user-selectable, mirroring `gam predict --covariance-mode` and the
+            // engine's `includeobservation_interval` switch.
+            let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
+                .unwrap_or(gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred);
+            let includeobservation_interval = options.observation_interval.unwrap_or(false);
             let uncertainty_options = gam::predict::PredictUncertaintyOptions {
                 confidence_level,
-                covariance_mode:
-                    gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                covariance_mode,
                 mean_interval_method: gam::predict::MeanIntervalMethod::TransformEta,
-                includeobservation_interval: false,
+                includeobservation_interval,
                 apply_bias_correction: false,
                 ..gam::predict::PredictUncertaintyOptions::default()
             };
@@ -24595,6 +24596,16 @@ fn predict_columns(
             );
             columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
             columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
+            // Observation (prediction) interval: only present when the family
+            // and the `observation_interval` request both support it. Emitting
+            // it as separate columns keeps the standard schema untouched when
+            // off and never overwrites the credible `mean_lower`/`mean_upper`.
+            if let (Some(obs_lower), Some(obs_upper)) =
+                (prediction.observation_lower, prediction.observation_upper)
+            {
+                columns.insert("observation_lower".to_string(), obs_lower.to_vec());
+                columns.insert("observation_upper".to_string(), obs_upper.to_vec());
+            }
         }
         (None, true) => {
             let prediction = predictor
