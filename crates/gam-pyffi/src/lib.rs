@@ -18097,217 +18097,6 @@ fn equivariant_penalty_value<'py>(
 // that delegates to a pure-Rust impl on ndarray views.
 // ===========================================================================
 
-fn rg_require_positive(comp: ArrayView2<'_, f64>, label: &str) -> Result<(), String> {
-    for value in comp.iter() {
-        if *value <= 0.0 {
-            return Err(format!("{label} require strictly positive simplex values"));
-        }
-    }
-    Ok(())
-}
-
-fn rg_clr_impl(values: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
-    let comp = simplex_closure(values)?;
-    rg_require_positive(comp.view(), "CLR coordinates")?;
-    let (n, d) = comp.dim();
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let mut sum_log = 0.0_f64;
-        for col in 0..d {
-            let lg = comp[[row, col]].ln();
-            out[[row, col]] = lg;
-            sum_log += lg;
-        }
-        let mean = sum_log / (d as f64);
-        for col in 0..d {
-            out[[row, col]] -= mean;
-        }
-    }
-    Ok(out)
-}
-
-fn rg_resolve_reference(reference: isize, d: usize) -> usize {
-    let d_i = d as isize;
-    let mut r = reference % d_i;
-    if r < 0 {
-        r += d_i;
-    }
-    r as usize
-}
-
-fn rg_alr_impl(values: ArrayView2<'_, f64>, reference: isize) -> Result<Array2<f64>, String> {
-    let comp = simplex_closure(values)?;
-    rg_require_positive(comp.view(), "ALR coordinates")?;
-    let (n, d) = comp.dim();
-    let ref_idx = rg_resolve_reference(reference, d);
-    let mut out = Array2::<f64>::zeros((n, d - 1));
-    for row in 0..n {
-        let log_ref = comp[[row, ref_idx]].ln();
-        let mut k = 0usize;
-        for col in 0..d {
-            if col == ref_idx {
-                continue;
-            }
-            out[[row, k]] = comp[[row, col]].ln() - log_ref;
-            k += 1;
-        }
-    }
-    Ok(out)
-}
-
-fn rg_inverse_alr_impl(
-    coords: ArrayView2<'_, f64>,
-    reference: isize,
-) -> Result<Array2<f64>, String> {
-    let (n, dm1) = coords.dim();
-    if !coords.iter().all(|v| v.is_finite()) {
-        return Err("ALR coordinates must contain only finite values".to_string());
-    }
-    let d = dm1 + 1;
-    let ref_idx = rg_resolve_reference(reference, d);
-    let mut out = Array2::<f64>::zeros((n, d));
-    for row in 0..n {
-        let mut max_v = f64::NEG_INFINITY;
-        let mut k = 0usize;
-        for col in 0..d {
-            let v = if col == ref_idx {
-                0.0
-            } else {
-                let val = coords[[row, k]];
-                k += 1;
-                val
-            };
-            out[[row, col]] = v;
-            if v > max_v {
-                max_v = v;
-            }
-        }
-        let mut total = 0.0_f64;
-        for col in 0..d {
-            let e = (out[[row, col]] - max_v).exp();
-            out[[row, col]] = e;
-            total += e;
-        }
-        for col in 0..d {
-            out[[row, col]] /= total;
-        }
-    }
-    Ok(out)
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum RgSimplexCoord {
-    Clr,
-    Alr,
-}
-
-fn rg_parse_simplex_coord(coordinates: &str) -> Result<RgSimplexCoord, String> {
-    match coordinates.to_ascii_lowercase().as_str() {
-        "simplex" | "clr" => Ok(RgSimplexCoord::Clr),
-        "alr" => Ok(RgSimplexCoord::Alr),
-        other => Err(format!(
-            "simplex coordinates must be 'clr' or 'alr'; got {other:?}"
-        )),
-    }
-}
-
-fn rg_simplex_log_map_impl(
-    values: ArrayView2<'_, f64>,
-    base: ArrayView1<'_, f64>,
-    coord: RgSimplexCoord,
-    reference: isize,
-) -> Result<Array2<f64>, String> {
-    let comp = simplex_closure(values)?;
-    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let base_comp = simplex_closure(base2.view())?;
-    if comp.ncols() != base_comp.ncols() {
-        return Err("simplex values and base point have different dimensions".to_string());
-    }
-    rg_require_positive(comp.view(), "simplex log map")?;
-    rg_require_positive(base_comp.view(), "simplex log map")?;
-    match coord {
-        RgSimplexCoord::Clr => {
-            let values_clr = rg_clr_impl(values)?;
-            let base_clr = rg_clr_impl(base2.view())?;
-            let (n, d) = values_clr.dim();
-            let mut out = Array2::<f64>::zeros((n, d));
-            for row in 0..n {
-                for col in 0..d {
-                    out[[row, col]] = values_clr[[row, col]] - base_clr[[0, col]];
-                }
-            }
-            Ok(out)
-        }
-        RgSimplexCoord::Alr => {
-            let values_alr = rg_alr_impl(values, reference)?;
-            let base_alr = rg_alr_impl(base2.view(), reference)?;
-            let (n, dm1) = values_alr.dim();
-            let mut out = Array2::<f64>::zeros((n, dm1));
-            for row in 0..n {
-                for col in 0..dm1 {
-                    out[[row, col]] = values_alr[[row, col]] - base_alr[[0, col]];
-                }
-            }
-            Ok(out)
-        }
-    }
-}
-
-fn rg_simplex_exp_map_impl(
-    tangent: ArrayView2<'_, f64>,
-    base: ArrayView1<'_, f64>,
-    coord: RgSimplexCoord,
-    reference: isize,
-) -> Result<Array2<f64>, String> {
-    let base2 = Array2::from_shape_fn((1, base.len()), |(_, j)| base[j]);
-    let base_comp = simplex_closure(base2.view())?;
-    let d = base_comp.ncols();
-    match coord {
-        RgSimplexCoord::Clr => {
-            if tangent.ncols() != d {
-                return Err("CLR tangent dimension must equal simplex dimension".to_string());
-            }
-            let n = tangent.nrows();
-            let mut out = Array2::<f64>::zeros((n, d));
-            for row in 0..n {
-                let mut max_v = f64::NEG_INFINITY;
-                for col in 0..d {
-                    let lg = base_comp[[0, col]].ln() + tangent[[row, col]];
-                    out[[row, col]] = lg;
-                    if lg > max_v {
-                        max_v = lg;
-                    }
-                }
-                let mut total = 0.0_f64;
-                for col in 0..d {
-                    let e = (out[[row, col]] - max_v).exp();
-                    out[[row, col]] = e;
-                    total += e;
-                }
-                for col in 0..d {
-                    out[[row, col]] /= total;
-                }
-            }
-            Ok(out)
-        }
-        RgSimplexCoord::Alr => {
-            if tangent.ncols() + 1 != d {
-                return Err("ALR tangent dimension must be simplex dimension minus one".to_string());
-            }
-            let base_alr = rg_alr_impl(base2.view(), reference)?;
-            let n = tangent.nrows();
-            let dm1 = d - 1;
-            let mut shifted = Array2::<f64>::zeros((n, dm1));
-            for row in 0..n {
-                for col in 0..dm1 {
-                    shifted[[row, col]] = base_alr[[0, col]] + tangent[[row, col]];
-                }
-            }
-            rg_inverse_alr_impl(shifted.view(), reference)
-        }
-    }
-}
-
 fn rg_sphere_log_map_impl(
     values: ArrayView2<'_, f64>,
     base: ArrayView1<'_, f64>,
@@ -18467,7 +18256,7 @@ fn rg_log_map_dispatch(
         }
         "simplex" | "clr" | "alr" => {
             let coord_label = rg_resolve_simplex_coord_label(&kind, coordinates);
-            let coord = rg_parse_simplex_coord(&coord_label)?;
+            let coord = gam::geometry::simplex::parse_simplex_coord(&coord_label)?;
             let base_point = match base {
                 None => Array1::from(simplex_frechet_mean(values, None)?),
                 Some(b) => {
@@ -18475,7 +18264,12 @@ fn rg_log_map_dispatch(
                     simplex_closure(b2.view())?.row(0).to_owned()
                 }
             };
-            let tangent = rg_simplex_log_map_impl(values, base_point.view(), coord, reference)?;
+            let tangent = gam::geometry::simplex::simplex_log_map(
+                values,
+                base_point.view(),
+                coord,
+                reference,
+            )?;
             Ok((tangent, base_point, coord_label))
         }
         other => Err(rg_unknown_geometry(other)),
@@ -18497,8 +18291,8 @@ fn rg_exp_map_dispatch(
         "spherical" | "sphere" => rg_sphere_exp_map_impl(tangent, base),
         "simplex" | "clr" | "alr" => {
             let coord_label = rg_resolve_simplex_coord_label(&kind, coordinates);
-            let coord = rg_parse_simplex_coord(&coord_label)?;
-            rg_simplex_exp_map_impl(tangent, base, coord, reference)
+            let coord = gam::geometry::simplex::parse_simplex_coord(&coord_label)?;
+            gam::geometry::simplex::simplex_exp_map(tangent, base, coord, reference)
         }
         other => Err(rg_unknown_geometry(other)),
     }
@@ -18825,7 +18619,9 @@ fn response_geometry_clr<'py>(
     values: PyReadonlyArray2<'py, f64>,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let arr = values.as_array().to_owned();
-    let out = detach_py_result(py, "response_geometry_clr", move || rg_clr_impl(arr.view()))?;
+    let out = detach_py_result(py, "response_geometry_clr", move || {
+        gam::geometry::simplex::clr(arr.view())
+    })?;
     Ok(out.into_pyarray(py).unbind())
 }
 
@@ -18837,7 +18633,7 @@ fn response_geometry_alr<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let arr = values.as_array().to_owned();
     let out = detach_py_result(py, "response_geometry_alr", move || {
-        rg_alr_impl(arr.view(), reference)
+        gam::geometry::simplex::alr(arr.view(), reference)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -18850,7 +18646,7 @@ fn response_geometry_inverse_alr<'py>(
 ) -> PyResult<Py<PyArray2<f64>>> {
     let arr = coords.as_array().to_owned();
     let out = detach_py_result(py, "response_geometry_inverse_alr", move || {
-        rg_inverse_alr_impl(arr.view(), reference)
+        gam::geometry::simplex::inverse_alr(arr.view(), reference)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -19124,8 +18920,8 @@ fn response_geometry_simplex_log_map<'py>(
     let arr = values.as_array().to_owned();
     let base_owned = base.as_array().to_owned();
     let out = detach_py_result(py, "response_geometry_simplex_log_map", move || {
-        let coord = rg_parse_simplex_coord(&coordinates)?;
-        rg_simplex_log_map_impl(arr.view(), base_owned.view(), coord, reference)
+        let coord = gam::geometry::simplex::parse_simplex_coord(&coordinates)?;
+        gam::geometry::simplex::simplex_log_map(arr.view(), base_owned.view(), coord, reference)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
@@ -19141,8 +18937,8 @@ fn response_geometry_simplex_exp_map<'py>(
     let t_owned = tangent.as_array().to_owned();
     let base_owned = base.as_array().to_owned();
     let out = detach_py_result(py, "response_geometry_simplex_exp_map", move || {
-        let coord = rg_parse_simplex_coord(&coordinates)?;
-        rg_simplex_exp_map_impl(t_owned.view(), base_owned.view(), coord, reference)
+        let coord = gam::geometry::simplex::parse_simplex_coord(&coordinates)?;
+        gam::geometry::simplex::simplex_exp_map(t_owned.view(), base_owned.view(), coord, reference)
     })?;
     Ok(out.into_pyarray(py).unbind())
 }
