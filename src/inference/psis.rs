@@ -124,8 +124,8 @@ pub fn fit_gpd_moments(excesses: &[f64]) -> Option<(f64, f64)> {
     let mut len_scale = Vec::with_capacity(m_est);
     let mut max_ls = f64::NEG_INFINITY;
     for j in 1..=m_est {
-        let b = (1.0 - (m_est as f64 / (j as f64 - 0.5)).sqrt()) / (PRIOR_BS * x_star)
-            + 1.0 / x_max;
+        let b =
+            (1.0 - (m_est as f64 / (j as f64 - 0.5)).sqrt()) / (PRIOR_BS * x_star) + 1.0 / x_max;
         let k = profile_shape(b, &x);
         let arg = -(b / k);
         let ls = if arg.is_finite() && arg > 0.0 && k.is_finite() {
@@ -274,7 +274,10 @@ mod tests {
     /// fully degenerate (all-equal) inputs return `None` rather than NaN/`0.5`.
     #[test]
     fn psis_gpd_fit_handles_degenerate_inputs() {
-        assert!(fit_gpd_moments(&[1.0, 2.0, 3.0]).is_none(), "fewer than MIN_TAIL_COUNT");
+        assert!(
+            fit_gpd_moments(&[1.0, 2.0, 3.0]).is_none(),
+            "fewer than MIN_TAIL_COUNT"
+        );
         assert!(
             fit_gpd_moments(&[0.0, -1.0, f64::NAN, 0.0]).is_none(),
             "no positive finite excesses"

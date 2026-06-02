@@ -6264,7 +6264,9 @@ mod tests {
         // barely-PD blocks fail.
         let (strict_dt, strict_db, strict_cache) =
             solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &ArrowSolveOptions::direct())
-                .expect("default direct() must CONDITION the barely-PD blocks, not reject (gam#578)");
+                .expect(
+                    "default direct() must CONDITION the barely-PD blocks, not reject (gam#578)",
+                );
         for v in strict_dt.iter().chain(strict_db.iter()) {
             assert!(v.is_finite(), "conditioned strict step must be finite: {v}");
         }

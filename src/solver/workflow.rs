@@ -1594,9 +1594,7 @@ fn survival_transformation_edf(
             }
             attempts += 1;
             if attempts >= 8 {
-                return Err(
-                    "survival edf: penalized Hessian could not be factorized".to_string()
-                );
+                return Err("survival edf: penalized Hessian could not be factorized".to_string());
             }
             ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
         }
@@ -1689,7 +1687,9 @@ fn optimize_survival_transformation_smoothing(
         for k in 0..num_smoothing {
             lambdas[k] = rho_smooth[k].exp();
         }
-        candidate.set_penalty_lambdas(&lambdas).map_err(|e| e.to_string())?;
+        candidate
+            .set_penalty_lambdas(&lambdas)
+            .map_err(|e| e.to_string())?;
         let opts = crate::pirls::WorkingModelPirlsOptions {
             max_iterations: 400,
             convergence_tolerance: 1e-6,
@@ -1718,8 +1718,7 @@ fn optimize_survival_transformation_smoothing(
         // block order, as the unified survival LAML evaluator requires. The
         // candidate's λ are exactly `lambdas` (smoothing entries from the
         // proposal, ridge entries frozen), so build ρ from that vector directly.
-        let full_rho =
-            Array1::from_iter(lambdas.iter().filter(|&&l| l > 0.0).map(|&l| l.ln()));
+        let full_rho = Array1::from_iter(lambdas.iter().filter(|&&l| l > 0.0).map(|&l| l.ln()));
         let (cost, grad_full) = candidate
             .unified_lamlobjective_and_rhogradient(&beta, &state, &full_rho)
             .map_err(|err| format!("survival LAML evaluation failed: {err}"))?;
@@ -1752,9 +1751,8 @@ fn optimize_survival_transformation_smoothing(
             seed_budget: 1,
             ..Default::default()
         });
-    let context = format!(
-        "survival transformation smoothing-parameter selection (dim={num_smoothing})"
-    );
+    let context =
+        format!("survival transformation smoothing-parameter selection (dim={num_smoothing})");
     let mut obj = problem.build_objective(
         (),
         |_: &mut (), rho: &Array1<f64>| {
@@ -2562,8 +2560,14 @@ fn fit_survival_transformation_model(
         )?;
     }
 
-    let (prepared, mut penalty_blocks, beta0, structural_lower_bounds, mut model, num_smoothing_blocks) =
-        build_working_model(&baseline_cfg)?;
+    let (
+        prepared,
+        mut penalty_blocks,
+        beta0,
+        structural_lower_bounds,
+        mut model,
+        num_smoothing_blocks,
+    ) = build_working_model(&baseline_cfg)?;
     if cause_count > 1 || !spec.penalty_block_gamma_priors.is_empty() {
         let beta0_flat = replicate_pooled_baseline_seed_per_cause(beta0.view(), cause_count);
         return fit_cause_specific_survival_transformation_custom(

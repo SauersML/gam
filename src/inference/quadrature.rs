@@ -5364,8 +5364,8 @@ mod tests {
         // certifies within LOGIT_MAX_TERMS, and require both the mean and the
         // μ-derivative to match an independent high-resolution reference.
         for &(mu, sigma) in &[(8.0, 1.0), (10.0, 1.0), (15.0, 2.0)] {
-            let out =
-                logit_posterior_meanwith_deriv_exact(mu, sigma).expect("erfcx branch should certify");
+            let out = logit_posterior_meanwith_deriv_exact(mu, sigma)
+                .expect("erfcx branch should certify");
             assert_eq!(out.mode, IntegratedExpectationMode::ExactSpecialFunction);
             let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(mu, sigma);
             assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-9, max_relative = 1e-7);
@@ -5389,13 +5389,25 @@ mod tests {
         // and tail-asymptotic).
         let ctx = QuadratureContext::new();
         for &(mu, sigma) in &[(0.3, 0.3), (1.1, 0.8), (10.0, 1.0), (3.0, 3.0), (35.0, 1.0)] {
-            let pos = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, mu, sigma)
-                .expect("logit moments (+μ)");
-            let neg = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, -mu, sigma)
-                .expect("logit moments (-μ)");
-            assert_relative_eq!(pos.dmean_dmu, neg.dmean_dmu, epsilon = 1e-9, max_relative = 1e-7);
+            let pos =
+                integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, mu, sigma)
+                    .expect("logit moments (+μ)");
+            let neg =
+                integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, -mu, sigma)
+                    .expect("logit moments (-μ)");
+            assert_relative_eq!(
+                pos.dmean_dmu,
+                neg.dmean_dmu,
+                epsilon = 1e-9,
+                max_relative = 1e-7
+            );
             // And the mean reflects: E[sigmoid] at -μ equals 1 - E[sigmoid] at μ.
-            assert_relative_eq!(neg.mean, 1.0 - pos.mean, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(
+                neg.mean,
+                1.0 - pos.mean,
+                epsilon = 1e-9,
+                max_relative = 1e-7
+            );
         }
     }
 
@@ -5418,7 +5430,12 @@ mod tests {
             // — the Monahan ~0.11 error is gone.
             let (ref_mean, ref_d1, _, _) = logit_reference_jet_highres_simpson(mu, sigma);
             assert_relative_eq!(scalar.mean, ref_mean, epsilon = 1e-9, max_relative = 1e-8);
-            assert_relative_eq!(scalar.dmean_dmu, ref_d1, epsilon = 1e-9, max_relative = 1e-8);
+            assert_relative_eq!(
+                scalar.dmean_dmu,
+                ref_d1,
+                epsilon = 1e-9,
+                max_relative = 1e-8
+            );
             // The scalar and GHQ-jet entry points no longer disagree in the
             // first decimal place (#571 symptom). They are two independent
             // accurate quadratures, so we only require they agree to a
@@ -5426,7 +5443,12 @@ mod tests {
             // GHQ jet path itself carries ~1e-5 derivative error at these broad
             // sigmas, which is the loosest term here.
             assert_relative_eq!(scalar.mean, jet.mean, epsilon = 1e-4, max_relative = 1e-4);
-            assert_relative_eq!(scalar.dmean_dmu, jet.d1, epsilon = 1e-4, max_relative = 1e-4);
+            assert_relative_eq!(
+                scalar.dmean_dmu,
+                jet.d1,
+                epsilon = 1e-4,
+                max_relative = 1e-4
+            );
         }
     }
 

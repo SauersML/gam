@@ -2155,8 +2155,8 @@ mod smoothing_correction_outcome_tests {
                 x[[i, 1]] = t;
                 x[[i, 2]] = (tau * t).sin();
                 x[[i, 3]] = (tau * t).cos();
-                let base = 0.7 + 0.9 * t + 0.5 * (tau * t).sin()
-                    + 0.05 * ((i as f64) * 2.399_963).sin();
+                let base =
+                    0.7 + 0.9 * t + 0.5 * (tau * t).sin() + 0.05 * ((i as f64) * 2.399_963).sin();
                 y[i] = scale * base;
             }
             (x, y)
@@ -2275,7 +2275,11 @@ mod smoothing_correction_outcome_tests {
             frob1.is_finite() && frob1 > 0.0,
             "scale-1 cubature correction must be finite and non-zero (‖corr‖={frob1:.3e})"
         );
-        assert_eq!(corr1.dim(), corrc.dim(), "correction shape mismatch across scales");
+        assert_eq!(
+            corr1.dim(),
+            corrc.dim(),
+            "correction shape mismatch across scales"
+        );
 
         // Property under test: every entry scales by exactly c² (never c⁴).
         let mut worst_rel = 0.0_f64;

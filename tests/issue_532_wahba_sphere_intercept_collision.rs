@@ -85,8 +85,9 @@ fn grid_points() -> Vec<(f64, f64)> {
 fn fit_predict_and_rmse(formula: &str) -> (Vec<f64>, f64) {
     let data = make_dataset(1200, 532);
     let cfg = FitConfig::default(); // gaussian / identity / REML, intercept on
-    let result = fit_from_formula(formula, &data, &cfg)
-        .unwrap_or_else(|e| panic!("Wahba-sphere + intercept fit refused (#532): `{formula}`: {e}"));
+    let result = fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| {
+        panic!("Wahba-sphere + intercept fit refused (#532): `{formula}`: {e}")
+    });
     let FitResult::Standard(fit) = result else {
         panic!("expected standard GAM fit");
     };

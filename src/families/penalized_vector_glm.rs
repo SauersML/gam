@@ -342,7 +342,8 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         // the backtracking line search below validates it against `F` itself,
         // so the ridge never biases the converged β̂ — at the optimum the
         // gradient vanishes and the step → 0 regardless of τ.
-        let max_diag = (0..beta_flat_dim).fold(0.0_f64, |acc, idx| acc.max(hessian[[idx, idx]].abs()));
+        let max_diag =
+            (0..beta_flat_dim).fold(0.0_f64, |acc, idx| acc.max(hessian[[idx, idx]].abs()));
         let base_ridge = if max_diag.is_finite() && max_diag > 0.0 {
             max_diag * 1.0e-10
         } else {

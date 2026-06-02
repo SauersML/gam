@@ -1041,11 +1041,7 @@ mod tests {
                     crate::custom_family::PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
                         (p, p),
                         |(i, j)| {
-                            if i == j {
-                                (t + 1) as f64
-                            } else {
-                                0.0
-                            }
+                            if i == j { (t + 1) as f64 } else { 0.0 }
                         },
                     ))
                 })
@@ -1217,9 +1213,8 @@ mod tests {
         let y = array![[1.0], [1.0], [1.0]];
         let w = Array1::<f64>::ones(n);
         let x = Arc::new(Array2::<f64>::ones((n, 1)));
-        let s = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
-            Array2::<f64>::zeros((1, 1)),
-        )]);
+        let zero = Array2::<f64>::zeros((1, 1));
+        let s = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(zero)]);
         let nd = Arc::new(vec![0usize]);
         let err = MultinomialFamily::new(y, w, 1, x, s, nd).expect_err("K = 1 must be rejected");
         assert!(err.contains("K"));
