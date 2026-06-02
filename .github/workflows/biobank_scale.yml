@@ -102,6 +102,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -115,11 +120,60 @@ jobs:
           cargo build --release --bin gam
           ls -l target/release/gam
 
-      - name: Upload gam binary
+      - name: Build gamfit._rust Python extension
+        # bench/biobank_scale/runner.py loads `gamfit._rust` via
+        # bench/_rust_loader.py for survival_* and classification_*
+        # helpers (e.g. _survival_score_grid, survival_concordance,
+        # classification_metrics). Without this step the runner aborts the
+        # shard with `RuntimeError: gamfit Rust extension is not built`
+        # the moment any survival/classification method is exercised.
+        # Build via `maturin build` (not `develop`, which requires an
+        # active virtualenv the hosted runner does not provide), then
+        # extract `_rust*.so` from the wheel and stage it next to the
+        # `gam` binary so the benchmark job ships both through the same
+        # shared artifact.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --upgrade 'maturin>=1.7,<2'
+          rm -rf dist
+          maturin build --release -i python3 -o dist
+          python3 - <<'PY'
+          import glob
+          import pathlib
+          import shutil
+          import sys
+          import zipfile
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          if not wheels:
+              sys.exit("maturin produced no wheel under dist/")
+          wheel = wheels[-1]
+          out_dir = pathlib.Path("target/release")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(wheel) as zf:
+              matches = [
+                  m for m in zf.namelist()
+                  if m.startswith("gamfit/_rust") and (m.endswith(".so") or m.endswith(".pyd"))
+              ]
+              if not matches:
+                  sys.exit(f"no _rust*.so found inside {wheel}")
+              for member in matches:
+                  target = out_dir / pathlib.Path(member).name
+                  with zf.open(member) as src, target.open("wb") as dst:
+                      shutil.copyfileobj(src, dst)
+                  print(f"extracted {target}")
+          PY
+          ls -l target/release/_rust*.so
+
+      - name: Upload gam binary and Python extension
         uses: actions/upload-artifact@v4
         with:
           name: biobank-scale-gam-binary
-          path: target/release/gam
+          path: |
+            target/release/gam
+            target/release/_rust*.so
           if-no-files-found: error
 
   benchmark:
@@ -167,20 +221,38 @@ jobs:
           name: biobank-scale-prepared
           path: bench/biobank_scale/prepared
 
-      - name: Download prebuilt gam binary
+      - name: Download prebuilt gam binary and Python extension
         uses: actions/download-artifact@v4
         with:
           name: biobank-scale-gam-binary
           path: bench/biobank_scale/bin
 
-      - name: Stage gam binary into target/release
+      - name: Stage gam binary and gamfit._rust extension
+        # The runner imports gamfit._rust via bench/_rust_loader.py, which
+        # scans the source-tree `gamfit/` directory (the in-tree package
+        # shadows site-packages on sys.path because the runner does not
+        # install the wheel). Drop the artifact's `_rust*.so` directly
+        # there so the loader finds it; without this the bench shard
+        # aborts the first survival/classification call with `RuntimeError:
+        # gamfit Rust extension is not built`.
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           mkdir -p target/release
           cp bench/biobank_scale/bin/gam target/release/gam
           chmod +x target/release/gam
           ls -l target/release/gam
+          installed=0
+          for so in bench/biobank_scale/bin/_rust*.so; do
+            cp "$so" "gamfit/$(basename "$so")"
+            installed=$((installed + 1))
+          done
+          if [ "${installed}" -eq 0 ]; then
+            echo "::error title=Missing gamfit extension::No _rust*.so in biobank-scale-gam-binary artifact (bootstrap-runtime did not build gamfit._rust)"
+            exit 1
+          fi
+          ls -l gamfit/_rust*.so
 
       - name: Run benchmark method
         shell: bash
