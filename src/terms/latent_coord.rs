@@ -1087,6 +1087,74 @@ fn symmetrize(a: &mut Array2<f64>) {
 /// For `AuxPriorFamily::Ridge` the conditional mean is the closed-form ridge
 /// regression `(UᵀU + ε I)⁻¹ UᵀT` evaluated at each row's `u_n`. For
 /// `Linear` the ridge is zero (which raises if `UᵀU` is singular).
+/// Closed-form auxiliary-prior REML statistics at a fixed outer coordinate `t`.
+pub struct AuxPriorRemlStats {
+    pub residual_sq: f64,
+    pub log_mu: f64,
+    pub mu: f64,
+    pub auto: bool,
+    pub score: f64,
+}
+
+/// Auxiliary-prior REML statistics for a fixed outer coordinate `t`, given the
+/// precomputed `targets` (see [`aux_prior_targets`]). Returns the residual sum of
+/// squares, the precision `mu` (the supplied `aux_strength` when `Some`, else the
+/// closed-form REML optimum `mu = n / Σr²`), whether it was auto-selected, and
+/// the prior score `0.5·mu·Σr² − 0.5·n·ln(mu)`. The `log_mu` coordinate has this
+/// closed-form optimum at fixed `t` because only the normalized auxiliary prior
+/// depends on it.
+pub fn aux_prior_reml_stats(
+    t_mat: ArrayView2<'_, f64>,
+    targets: ArrayView2<'_, f64>,
+    aux_strength: Option<f64>,
+) -> Result<AuxPriorRemlStats, String> {
+    let n_obs = t_mat.nrows();
+    let latent_dim = t_mat.ncols();
+    let mut residual_sq = 0.0_f64;
+    for n in 0..n_obs {
+        for a in 0..latent_dim {
+            let diff = t_mat[[n, a]] - targets[[n, a]];
+            residual_sq += diff * diff;
+        }
+    }
+    if !residual_sq.is_finite() {
+        return Err("auxiliary prior residual norm must be finite".to_string());
+    }
+    let (log_mu, mu, auto) = match aux_strength {
+        Some(mu) => {
+            if !(mu.is_finite() && mu > 0.0) {
+                return Err(format!(
+                    "aux_strength must be finite and positive; got {mu}"
+                ));
+            }
+            (mu.ln(), mu, false)
+        }
+        None => {
+            if residual_sq <= 0.0 {
+                return Err(
+                    "aux_strength='auto' has no finite REML optimum when the auxiliary residual is zero"
+                        .to_string(),
+                );
+            }
+            let mu = (n_obs as f64) / residual_sq;
+            if !(mu.is_finite() && mu > 0.0) {
+                return Err(format!(
+                    "auto aux_strength selected a non-finite precision: {mu}"
+                ));
+            }
+            (mu.ln(), mu, true)
+        }
+    };
+    let score = 0.5 * mu * residual_sq - 0.5 * (n_obs as f64) * log_mu;
+    Ok(AuxPriorRemlStats {
+        residual_sq,
+        log_mu,
+        mu,
+        auto,
+        score,
+    })
+}
+
 pub fn aux_prior_targets(
     t: ArrayView2<'_, f64>,
     u: ArrayView2<'_, f64>,
