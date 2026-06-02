@@ -32,7 +32,7 @@ pub use analytic_penalties::{
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,
-    TotalVariationPenalty, WeightField, nested_prefix_bic, select_nested_prefix_schedule,
+    TotalVariationPenalty, WeightField,
 };
 pub use atom_selection::{
     AssignmentSparsityCoupling, AtomLibrary, AtomRecord, AtomSelectionStrategy, EntropicSoftmax,
