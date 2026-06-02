@@ -18216,6 +18216,101 @@ fn rg_sphere_exp_map_impl(
     Ok(out)
 }
 
+/// Project a spherical base point onto the unit sphere, rejecting a zero-norm
+/// input. Shared by the explicit `response_geometry_sphere_normalize_base` FFI
+/// and the consolidated log-map dispatch.
+fn rg_normalize_sphere_base(base: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+    let norm = base.iter().fold(0.0_f64, |acc, value| acc.hypot(*value));
+    if !norm.is_finite() || norm <= 0.0 {
+        return Err("spherical base point must have non-zero norm".to_string());
+    }
+    Ok(base.mapv(|v| v / norm))
+}
+
+/// Resolve the simplex coordinate label exactly as the response-geometry log/exp
+/// maps require: an explicit `coordinates` request wins (lower-cased), otherwise
+/// `alr` for an `alr` geometry and `clr` for everything else.
+fn rg_resolve_simplex_coord_label(kind: &str, coordinates: Option<&str>) -> String {
+    match coordinates {
+        Some(c) => c.to_ascii_lowercase(),
+        None => {
+            if kind == "alr" {
+                "alr".to_string()
+            } else {
+                "clr".to_string()
+            }
+        }
+    }
+}
+
+fn rg_unknown_geometry(other: &str) -> String {
+    format!("response_geometry must be one of 'spherical', 'simplex', 'clr', or 'alr'; got {other:?}")
+}
+
+/// Consolidated response-geometry log map: pick the base point (intrinsic
+/// Fréchet mean when none is supplied, else the projected/closed input base),
+/// dispatch to the sphere or simplex log map, and report the resolved
+/// coordinate label. This owns the geometry-kind routing, coordinate
+/// resolution, and base-point selection that previously lived in the Python
+/// wrapper.
+fn rg_log_map_dispatch(
+    values: ArrayView2<'_, f64>,
+    geometry: &str,
+    base: Option<ArrayView1<'_, f64>>,
+    coordinates: Option<&str>,
+    reference: isize,
+) -> Result<(Array2<f64>, Array1<f64>, String), String> {
+    let kind = geometry.to_ascii_lowercase();
+    match kind.as_str() {
+        "spherical" | "sphere" => {
+            let base_point = match base {
+                None => Array1::from(gam::geometry::sphere::sphere_frechet_mean(
+                    values, None, 1.0e-12, 256,
+                )?),
+                Some(b) => rg_normalize_sphere_base(b)?,
+            };
+            let tangent = rg_sphere_log_map_impl(values, base_point.view())?;
+            Ok((tangent, base_point, "spherical".to_string()))
+        }
+        "simplex" | "clr" | "alr" => {
+            let coord_label = rg_resolve_simplex_coord_label(&kind, coordinates);
+            let coord = rg_parse_simplex_coord(&coord_label)?;
+            let base_point = match base {
+                None => Array1::from(simplex_frechet_mean(values, None)?),
+                Some(b) => {
+                    let b2 = Array2::from_shape_fn((1, b.len()), |(_, j)| b[j]);
+                    simplex_closure(b2.view())?.row(0).to_owned()
+                }
+            };
+            let tangent = rg_simplex_log_map_impl(values, base_point.view(), coord, reference)?;
+            Ok((tangent, base_point, coord_label))
+        }
+        other => Err(rg_unknown_geometry(other)),
+    }
+}
+
+/// Consolidated response-geometry exponential map: dispatch tangent coordinates
+/// back to the response manifold given the geometry kind and (already resolved)
+/// coordinate label.
+fn rg_exp_map_dispatch(
+    tangent: ArrayView2<'_, f64>,
+    geometry: &str,
+    base: ArrayView1<'_, f64>,
+    coordinates: Option<&str>,
+    reference: isize,
+) -> Result<Array2<f64>, String> {
+    let kind = geometry.to_ascii_lowercase();
+    match kind.as_str() {
+        "spherical" | "sphere" => rg_sphere_exp_map_impl(tangent, base),
+        "simplex" | "clr" | "alr" => {
+            let coord_label = rg_resolve_simplex_coord_label(&kind, coordinates);
+            let coord = rg_parse_simplex_coord(&coord_label)?;
+            rg_simplex_exp_map_impl(tangent, base, coord, reference)
+        }
+        other => Err(rg_unknown_geometry(other)),
+    }
+}
+
 fn rg_normalize_fisher_rao_impl(
     arr: ArrayViewD<'_, f64>,
     n_rows: usize,
@@ -18941,15 +19036,67 @@ fn response_geometry_sphere_normalize_base<'py>(
     base: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let owned = base.as_array().to_owned();
-    let normalized = py.detach(move || -> Result<Array1<f64>, String> {
-        let norm = owned.iter().fold(0.0_f64, |acc, value| acc.hypot(*value));
-        if !norm.is_finite() || norm <= 0.0 {
-            return Err("spherical base point must have non-zero norm".to_string());
-        }
-        Ok(owned.mapv(|v| v / norm))
-    });
+    let normalized = py.detach(move || rg_normalize_sphere_base(owned.view()));
     let normalized = normalized.map_err(PyValueError::new_err)?;
     Ok(normalized.into_pyarray(py).unbind())
+}
+
+/// Consolidated response-geometry log map. Owns geometry-kind routing,
+/// coordinate resolution, and base-point selection (intrinsic Fréchet mean when
+/// `base` is `None`) so the Python wrapper marshals arrays only. Returns
+/// `(tangent, base_point, resolved_coordinate_label)`.
+#[pyfunction(signature = (values, geometry, base=None, coordinates=None, reference=-1))]
+fn response_geometry_log_map<'py>(
+    py: Python<'py>,
+    values: PyReadonlyArray2<'py, f64>,
+    geometry: String,
+    base: Option<PyReadonlyArray1<'py, f64>>,
+    coordinates: Option<String>,
+    reference: isize,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray1<f64>>, String)> {
+    let arr = values.as_array().to_owned();
+    let base_owned = base.as_ref().map(|b| b.as_array().to_owned());
+    let (tangent, base_point, coord_label) =
+        detach_py_result(py, "response_geometry_log_map", move || {
+            rg_log_map_dispatch(
+                arr.view(),
+                &geometry,
+                base_owned.as_ref().map(|b| b.view()),
+                coordinates.as_deref(),
+                reference,
+            )
+        })?;
+    Ok((
+        tangent.into_pyarray(py).unbind(),
+        base_point.into_pyarray(py).unbind(),
+        coord_label,
+    ))
+}
+
+/// Consolidated response-geometry exponential map. Dispatches tangent
+/// coordinates back to the response manifold given the geometry kind and the
+/// (already resolved) coordinate label.
+#[pyfunction(signature = (tangent, geometry, base, coordinates=None, reference=-1))]
+fn response_geometry_exp_map<'py>(
+    py: Python<'py>,
+    tangent: PyReadonlyArray2<'py, f64>,
+    geometry: String,
+    base: PyReadonlyArray1<'py, f64>,
+    coordinates: Option<String>,
+    reference: isize,
+) -> PyResult<Py<PyArray2<f64>>> {
+    let t_owned = tangent.as_array().to_owned();
+    let base_owned = base.as_array().to_owned();
+    let out = detach_py_result(py, "response_geometry_exp_map", move || {
+        rg_exp_map_dispatch(
+            t_owned.view(),
+            &geometry,
+            base_owned.view(),
+            coordinates.as_deref(),
+            reference,
+        )
+    })?;
+    Ok(out.into_pyarray(py).unbind())
 }
 
 #[pyfunction]
@@ -22993,6 +23140,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(response_geometry_simplex_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(response_geometry_sphere_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_log_map, module)?)?;
+    module.add_function(wrap_pyfunction!(response_geometry_exp_map, module)?)?;
     module.add_function(wrap_pyfunction!(
         response_geometry_sphere_normalize_base,
         module
