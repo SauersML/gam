@@ -3813,10 +3813,16 @@ where
         // Smoothing-parameter correction (first-order delta + optional cubature).
         // Passes None for large models; compute_smoothing_correction_auto falls
         // back to first-order correction when no base covariance is supplied.
+        // `dispersion_phi` is φ̂ at the optimum (σ̂² for Gaussian, 1 for fixed-scale
+        // families). The cubature path multiplies its dispersion-free curvature
+        // block `E_ρ[H(ρ)⁻¹] − H_opt⁻¹` by this φ̂ so the FULL cubature correction
+        // lands on the same c² variance scale as `Vb = φ̂·H_opt⁻¹` (#582); the
+        // var_beta = Cov_ρ[β̂] block is already on that scale and stays unscaled.
         let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
             &final_rho,
             &pirls_res,
             beta_covariance_unscaled.as_ref(),
+            dispersion_phi,
             finalgrad_norm,
         );
         smoothing_correction = smoothing_outcome.into_correction();
