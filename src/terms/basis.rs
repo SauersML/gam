@@ -17293,6 +17293,27 @@ fn prepare_duchon_derivative_contextwithworkspace(
 fn prepare_periodic_duchon_centers_1d(
     centers: Array2<f64>,
 ) -> Result<(Array2<f64>, f64, f64), BasisError> {
+    prepare_periodic_duchon_centers_1d_with_period(centers, None)
+}
+
+/// Variant of [`prepare_periodic_duchon_centers_1d`] that honors an explicit
+/// domain-wrap `period`.
+///
+/// The period is the circumference of the circle the smooth lives on, NOT the
+/// span of the supplied centers. On a half-open lattice — e.g.
+/// `linspace(0, 1, K, endpoint=false)` with `period = 1.0` — the centers cover
+/// only `period − one_spacing`, so deriving the period from the center span
+/// (`right − left`) undershoots the true wrap. That undersized period made the
+/// Bernoulli Green's-function kernel evaluate at the wrong argument and the
+/// resulting Gram was no longer the operator's true reproducing-norm matrix
+/// (gam#580). When `explicit_period` is `Some(P)` we use `P` as the wrap and
+/// require every center to fit inside one period (`span ≤ P`); when `None` we
+/// fall back to the legacy center-span period (the closed lattice the formula
+/// DSL builds, where the endpoints span exactly one period).
+fn prepare_periodic_duchon_centers_1d_with_period(
+    centers: Array2<f64>,
+    explicit_period: Option<f64>,
+) -> Result<(Array2<f64>, f64, f64), BasisError> {
     if centers.ncols() != 1 {
         crate::bail_invalid_basis!(
             "periodic Duchon smooths currently require exactly one covariate"
@@ -17309,7 +17330,27 @@ fn prepare_periodic_duchon_centers_1d(
     if !left.is_finite() || !right.is_finite() || left >= right {
         return Err(BasisError::InvalidRange(left, right));
     }
-    let period = right - left;
+    let span = right - left;
+    let period = match explicit_period {
+        Some(p) => {
+            if !p.is_finite() || p <= 0.0 {
+                crate::bail_invalid_basis!(
+                    "periodic Duchon period must be finite and positive; got {p}"
+                );
+            }
+            // Every center must lie inside a single period; the wrap may be
+            // larger than the center span (half-open lattice) but never
+            // smaller (that would fold distinct centers onto each other).
+            if p < span - 1.0e-10 * span.max(1.0) {
+                crate::bail_invalid_basis!(
+                    "periodic Duchon period ({p}) is smaller than the center span ({span}); \
+                     every center must lie within a single period"
+                );
+            }
+            p
+        }
+        None => span,
+    };
     let centers = collapse_periodic_endpoint(centers, left, period);
     Ok((centers, left, period))
 }
@@ -19641,6 +19682,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
     periodic: bool,
+    period: Option<f64>,
     order: usize,
 ) -> Result<Array2<f64>, BasisError> {
     if order > 2 {
@@ -19654,10 +19696,20 @@ pub fn create_duchon_basis_1d_derivative_dense(
     if t.iter().any(|v| !v.is_finite()) || centers.iter().any(|v| !v.is_finite()) {
         crate::bail_invalid_basis!("Duchon basis derivative requires finite t and center values");
     }
+    if !periodic && period.is_some() {
+        crate::bail_invalid_basis!(
+            "Duchon basis derivative period is only valid when periodic=true"
+        );
+    }
 
     let data = t.to_owned().insert_axis(Axis(1));
     let center_matrix = centers.to_owned().insert_axis(Axis(1));
     let mut workspace = BasisWorkspace::default();
+    // The user-requested Duchon order ``m`` is encoded in ``nullspace_order``;
+    // the PERIODIC kernel is the Bernoulli Green's function of ``(d²/dx²)^m``
+    // (PSD on the circle, gam#580) so it needs the original ``m`` even though
+    // the periodic *constraint* nullspace is forced to constants only.
+    let user_m = duchon_p_from_nullspace_order(nullspace_order);
     let effective_order = if periodic {
         DuchonNullspaceOrder::Zero
     } else {
@@ -19666,14 +19718,72 @@ pub fn create_duchon_basis_1d_derivative_dense(
     let p_order = duchon_p_from_nullspace_order(effective_order);
     let s_order = duchon_power_to_usize(power);
     validate_duchon_kernel_orders(None, p_order, s_order as f64, 1)?;
+
+    if periodic {
+        // Periodic case: mirror the forward Bernoulli Green's-function design
+        // (`build_periodic_duchon_basis_1d`) EXACTLY — same collapsed centers,
+        // same domain-wrap period, same constant-only constraint nullspace —
+        // so the analytic derivative is the true ∂/∂t of the forward design
+        // (gam#580). Using the polyharmonic triangle-wave kernel here (the old
+        // path) was inconsistent with the Bernoulli forward and silently wrong.
+        let (collapsed_centers, left, resolved_period) =
+            prepare_periodic_duchon_centers_1d_with_period(center_matrix, period)?;
+        let z = kernel_constraint_nullspace(
+            collapsed_centers.view(),
+            effective_order,
+            &mut workspace.cache,
+        )?;
+        let kernel_cols = z.ncols();
+        let k_centers = collapsed_centers.nrows();
+        let centers_col0: Vec<f64> = collapsed_centers.column(0).to_vec();
+        let mut raw_kernel = Array2::<f64>::zeros((t.len(), k_centers));
+        for i in 0..t.len() {
+            let x = wrap_to_period(t[i], left, resolved_period);
+            for j in 0..k_centers {
+                // Signed offset reduced to [−period/2, period/2]; r = |offset|.
+                let mut delta = (x - centers_col0[j]).rem_euclid(resolved_period);
+                if delta > 0.5 * resolved_period {
+                    delta -= resolved_period;
+                }
+                let r = delta.abs();
+                let sign = if delta > 0.0 {
+                    1.0
+                } else if delta < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                };
+                let (phi, phi_r, phi_rr) =
+                    periodic_duchon_kernel_bernoulli_triplet(r, user_m, resolved_period)?;
+                raw_kernel[[i, j]] = match order {
+                    0 => phi,
+                    1 => phi_r * sign,
+                    2 => phi_rr,
+                    other => {
+                        crate::bail_invalid_basis!(
+                            "Duchon basis derivative supports orders 0, 1, and 2; got order={other}"
+                        );
+                    }
+                };
+            }
+        }
+        // Forward design appends a single constant column; its t-derivative is
+        // zero (order ≥ 1) or one (order 0). Match that layout exactly.
+        let mut basis = Array2::<f64>::zeros((t.len(), kernel_cols + 1));
+        let design_kernel = fast_ab(&raw_kernel, &z);
+        basis
+            .slice_mut(s![.., 0..kernel_cols])
+            .assign(&design_kernel);
+        if order == 0 {
+            basis.column_mut(kernel_cols).fill(1.0);
+        }
+        return Ok(basis);
+    }
+
     let z =
         kernel_constraint_nullspace(center_matrix.view(), effective_order, &mut workspace.cache)?;
     let kernel_cols = z.ncols();
-    let poly_cols = if periodic {
-        1
-    } else {
-        polynomial_block_from_order(data.view(), effective_order).ncols()
-    };
+    let poly_cols = polynomial_block_from_order(data.view(), effective_order).ncols();
 
     let pure_coeff =
         PolyharmonicBlockCoeff::new((pure_duchon_block_order(p_order, s_order as f64)) as f64, 1);
@@ -19687,34 +19797,12 @@ pub fn create_duchon_basis_1d_derivative_dense(
         None,
         Some(&pure_coeff),
     );
-    let periodic_domain = if periodic {
-        let left = centers.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-        let right = centers.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        if !left.is_finite() || !right.is_finite() || left >= right {
-            return Err(BasisError::InvalidRange(left, right));
-        }
-        Some((left, right - left))
-    } else {
-        None
-    };
 
     let mut raw_kernel = Array2::<f64>::zeros((t.len(), centers.len()));
     for i in 0..t.len() {
-        let x = if let Some((left, period)) = periodic_domain {
-            wrap_to_period(t[i], left, period)
-        } else {
-            t[i]
-        };
+        let x = t[i];
         for j in 0..centers.len() {
-            let delta = if let Some((_left, period)) = periodic_domain {
-                let mut wrapped = (x - centers[j]).rem_euclid(period);
-                if wrapped > 0.5 * period {
-                    wrapped -= period;
-                }
-                wrapped
-            } else {
-                x - centers[j]
-            };
+            let delta = x - centers[j];
             let r = delta.abs();
             let sign = if delta > 0.0 {
                 1.0
@@ -19743,9 +19831,7 @@ pub fn create_duchon_basis_1d_derivative_dense(
     basis
         .slice_mut(s![.., 0..kernel_cols])
         .assign(&design_kernel);
-    if !periodic {
-        fill_duchon_1d_polynomial_derivative(&mut basis, kernel_cols, t, effective_order, order);
-    }
+    fill_duchon_1d_polynomial_derivative(&mut basis, kernel_cols, t, effective_order, order);
     Ok(basis)
 }
 
@@ -21745,6 +21831,80 @@ fn periodic_duchon_kernel_bernoulli(r: f64, m: usize, period: f64) -> Result<f64
     Ok(sign * even_bernoulli_polynomial(2 * m, t)?)
 }
 
+/// First and second derivatives ``(B'_{2m}(s), B''_{2m}(s))`` of the even
+/// Bernoulli polynomial w.r.t. its argument ``s``, for the orders the Duchon
+/// stack uses (``m ∈ {1, 2, 3, 4}``).
+///
+/// Obtained by differentiating the closed forms in [`even_bernoulli_polynomial`]
+/// (each is a plain polynomial in ``s``), so they are the EXACT derivatives of
+/// the forward kernel value — the analytic backward of the periodic Bernoulli
+/// Green's-function design (gam#580).
+fn even_bernoulli_polynomial_derivatives(degree: usize, s: f64) -> Result<(f64, f64), BasisError> {
+    let s2 = s * s;
+    match degree {
+        2 => Ok((2.0 * s - 1.0, 2.0)),
+        4 => {
+            let d1 = 4.0 * s2 * s - 6.0 * s2 + 2.0 * s;
+            let d2 = 12.0 * s2 - 12.0 * s + 2.0;
+            Ok((d1, d2))
+        }
+        6 => {
+            let s3 = s2 * s;
+            let s4 = s2 * s2;
+            let s5 = s4 * s;
+            let d1 = 6.0 * s5 - 15.0 * s4 + 10.0 * s3 - s;
+            let d2 = 30.0 * s4 - 60.0 * s3 + 30.0 * s2 - 1.0;
+            Ok((d1, d2))
+        }
+        8 => {
+            let s3 = s2 * s;
+            let s4 = s2 * s2;
+            let s5 = s4 * s;
+            let s6 = s4 * s2;
+            let s7 = s6 * s;
+            let d1 = 8.0 * s7 - 28.0 * s6 + 28.0 * s5 - (28.0 / 3.0) * s3 + (4.0 / 3.0) * s;
+            let d2 = 56.0 * s6 - 168.0 * s5 + 140.0 * s4 - 28.0 * s2 + 4.0 / 3.0;
+            Ok((d1, d2))
+        }
+        other => Err(BasisError::InvalidInput(format!(
+            "periodic Duchon Bernoulli kernel derivative only implemented for B_{{2m}} with m ∈ {{1, 2, 3, 4}}; got degree {other}"
+        ))),
+    }
+}
+
+/// Radial jet ``(φ, dφ/dr, d²φ/dr²)`` of the periodic Bernoulli Green's-function
+/// kernel ``φ(r) = (−1)^{m+1} · B_{2m}(r / period)``.
+///
+/// The forward design uses ``periodic_duchon_kernel_bernoulli``; this is its
+/// EXACT radial derivative so the analytic backward (the position-API VJP) is
+/// consistent with the Bernoulli forward, mirroring how the polyharmonic
+/// triplet feeds the non-periodic derivative path. The caller already reduces
+/// the signed offset to ``[−period/2, period/2]`` and passes ``r = |offset|``
+/// with the sign applied separately, so ``s = r / period ∈ [0, 1/2]`` needs no
+/// further modular reduction. Each ``d/dr`` brings a ``1/period`` factor by the
+/// chain rule.
+fn periodic_duchon_kernel_bernoulli_triplet(
+    r: f64,
+    m: usize,
+    period: f64,
+) -> Result<(f64, f64, f64), BasisError> {
+    if !period.is_finite() || period <= 0.0 {
+        crate::bail_invalid_basis!(
+            "periodic Duchon kernel requires positive finite period; got {period}"
+        );
+    }
+    if m == 0 {
+        crate::bail_invalid_basis!("periodic Duchon order m must be at least 1");
+    }
+    let s = (r / period).rem_euclid(1.0);
+    let sign = if m % 2 == 1 { 1.0 } else { -1.0 };
+    let phi = sign * even_bernoulli_polynomial(2 * m, s)?;
+    let (b1, b2) = even_bernoulli_polynomial_derivatives(2 * m, s)?;
+    let dphi_dr = sign * b1 / period;
+    let d2phi_dr2 = sign * b2 / (period * period);
+    Ok((phi, dphi_dr, d2phi_dr2))
+}
+
 /// Drop centers that periodically identify with the leftmost anchor.
 ///
 /// When the user describes a closed periodic lattice by including BOTH
@@ -21814,10 +21974,18 @@ fn build_periodic_duchon_basis_1d(
     // and the REML whitening transform amplifies machine noise into a ~10⁻⁶
     // negative eigenvalue, tripping the solver's PSD check.
     //
-    // ``prepare_periodic_duchon_centers_1d`` validates the center matrix,
-    // computes ``(left, period)`` and drops the periodically duplicate
-    // center, in one place that every periodic Duchon code path shares.
-    let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
+    // ``prepare_periodic_duchon_centers_1d_with_period`` validates the center
+    // matrix, computes ``(left, period)`` and drops the periodically duplicate
+    // center, in one place that every periodic Duchon code path shares. When
+    // ``spec.periodic`` carries an explicit per-axis period (the position-API
+    // half-open lattice path — gam#580), honor it as the domain wrap; otherwise
+    // derive it from the center span (the closed lattice the formula DSL emits).
+    let explicit_period = spec
+        .periodic
+        .as_ref()
+        .and_then(|axes| axes.first().copied().flatten());
+    let (centers, left, period) =
+        prepare_periodic_duchon_centers_1d_with_period(centers, explicit_period)?;
     // The user encodes the Duchon order ``m`` in ``spec.nullspace_order``
     // (``Zero → m=1``, ``Linear → m=2``, ``Degree(d) → m=d+1``). Periodicity
     // forces the *constraint* nullspace to ``{constants}`` (the only
@@ -22314,6 +22482,22 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
             out
         }
     };
+    // The 1D periodic circle is NOT a mixed-periodicity cylinder/torus: the
+    // chord-embedding polyharmonic kernel ``φ(r) = c·r^{2m−d}`` is only
+    // CONDITIONALLY positive-definite on ℝ and is genuinely indefinite under
+    // the chord metric on the circle (its periodised Gram carries large
+    // negative eigenvalues), so it cannot serve as a PSD penalty (gam#580).
+    // The actual Green's function of ``(d²/dx²)^m`` on the circle is the
+    // Bernoulli kernel built by ``build_periodic_duchon_basis_1d`` — full rank
+    // modulo constants, PSD by construction. Route the 1D periodic case there
+    // for EVERY caller (basis design and function-norm penalty alike) so the
+    // two stay consistent; reserve the chord builder for true ``d ≥ 2``
+    // cylinder/torus products where it is the right object.
+    if d == 1 && periodic_per_axis[0] {
+        let mut periodic_spec = spec.clone();
+        periodic_spec.periodic = Some(vec![Some(resolved_periods[0])]);
+        return build_periodic_duchon_basis_1d(data, &periodic_spec, centers, &mut workspace);
+    }
     build_duchon_basis_mixed_periodicity(
         data,
         spec,

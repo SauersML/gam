@@ -15054,7 +15054,7 @@ fn position_basis_derivative(
         }
         "duchon" => {
             validate_position_period("duchon", knots_or_centers, periodic, period)?;
-            duchon_basis_1d_derivative_impl(t, knots_or_centers, basis_order, 1, periodic)
+            duchon_basis_1d_derivative_impl(t, knots_or_centers, basis_order, 1, periodic, period)
         }
         other => Err(format!(
             "normalized_position_basis_kind returned an unsupported basis name: {other}"
@@ -28451,6 +28451,7 @@ fn duchon_basis_1d_derivative_impl(
     m: usize,
     order: usize,
     periodic: bool,
+    period: Option<f64>,
 ) -> Result<Array2<f64>, String> {
     validate_vector("t", t)?;
     validate_vector("centers", centers)?;
@@ -28463,6 +28464,7 @@ fn duchon_basis_1d_derivative_impl(
         0.0,
         duchon_nullspace_from_m(m),
         periodic,
+        if periodic { period } else { None },
         order,
     )
     .map_err(|err| format!("failed to evaluate Duchon basis derivative: {err}"))
