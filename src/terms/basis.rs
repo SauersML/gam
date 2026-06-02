@@ -24514,6 +24514,74 @@ pub fn auto_knot_vector_1d_quantile(
     })
 }
 
+/// Build a clamped full B-spline knot vector from explicit *internal* knot
+/// positions (mgcv `knots=` semantics).
+///
+/// The user supplies the interior knots (those strictly between the data
+/// endpoints). This wraps them in the standard clamped boundary stencil:
+/// `data_range.0` repeated `degree + 1` times, the sorted distinct internal
+/// positions, then `data_range.1` repeated `degree + 1` times — matching the
+/// layout produced by [`internal::generate_full_knot_vector`] for the uniform
+/// case, except the interior positions are taken verbatim from the caller.
+///
+/// Internal positions must lie strictly inside `(data_range.0, data_range.1)`,
+/// be finite, and be strictly increasing after sorting (no duplicates, which
+/// would create a degenerate knot span). The data range itself is derived from
+/// the covariate so the spline domain still spans the observed data even when
+/// the user only pins a few interior knots.
+pub fn clamped_knot_vector_from_internal_positions(
+    data_range: (f64, f64),
+    internal_positions: &[f64],
+    degree: usize,
+) -> Result<Array1<f64>, BasisError> {
+    let (minval, maxval) = data_range;
+    if !(minval.is_finite() && maxval.is_finite()) {
+        crate::bail_invalid_basis!(
+            "explicit knots require a finite data range, got ({minval:.6e}, {maxval:.6e})"
+        );
+    }
+    if minval >= maxval {
+        return Err(BasisError::InvalidRange(minval, maxval));
+    }
+    let scale = (maxval - minval).abs().max(1.0);
+    let tol = 1e-12 * scale;
+
+    let mut interior: Vec<f64> = Vec::with_capacity(internal_positions.len());
+    for &k in internal_positions {
+        if !k.is_finite() {
+            crate::bail_invalid_basis!("explicit knot position {k:.6e} is not finite");
+        }
+        if k <= minval + tol || k >= maxval - tol {
+            crate::bail_invalid_basis!(
+                "explicit internal knot {k:.6e} must lie strictly inside the data range \
+                 ({minval:.6e}, {maxval:.6e}); boundary knots are added automatically"
+            );
+        }
+        interior.push(k);
+    }
+    interior.sort_by(f64::total_cmp);
+    for w in interior.windows(2) {
+        if (w[1] - w[0]).abs() <= tol {
+            crate::bail_invalid_basis!(
+                "explicit internal knots must be strictly increasing; \
+                 found a duplicate/near-duplicate near {:.6e}",
+                w[0]
+            );
+        }
+    }
+
+    let total_knots = interior.len() + 2 * (degree + 1);
+    let mut knots = Vec::with_capacity(total_knots);
+    for _ in 0..=degree {
+        knots.push(minval);
+    }
+    knots.extend_from_slice(&interior);
+    for _ in 0..=degree {
+        knots.push(maxval);
+    }
+    Ok(Array::from_vec(knots))
+}
+
 /// Place `num_centers` Duchon centers on 1-D data via the equal-mass strategy.
 ///
 /// Thin public wrapper around [`select_equal_mass_centers`] specialised to a

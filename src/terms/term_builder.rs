@@ -1310,6 +1310,9 @@ pub fn build_smooth_basis(
                 "basis-dim",
                 "basisdim",
                 "knots",
+                "knot_placement",
+                "knot-placement",
+                "knotplacement",
                 "degree",
                 "penalty_order",
                 "m",
@@ -1362,10 +1365,13 @@ pub fn build_smooth_basis(
             } else {
                 1
             }),
-            knotspec: BSplineKnotSpec::Generate {
-                data_range: (minv, maxv),
-                num_internal_knots: n_knots,
-            },
+            knotspec: resolve_nonperiodic_bspline_knotspec(
+                options,
+                ds.values.column(c),
+                (minv, maxv),
+                degree,
+                n_knots,
+            )?,
             double_penalty: true,
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
@@ -1455,6 +1461,9 @@ pub fn build_smooth_basis(
                     "basis-dim",
                     "basisdim",
                     "knots",
+                    "knot_placement",
+                    "knot-placement",
+                    "knotplacement",
                     "degree",
                     "penalty_order",
                     "boundary",
@@ -1552,10 +1561,13 @@ pub fn build_smooth_basis(
                 }
             } else {
                 (
-                    BSplineKnotSpec::Generate {
-                        data_range: (minv, maxv),
-                        num_internal_knots: n_knots,
-                    },
+                    resolve_nonperiodic_bspline_knotspec(
+                        options,
+                        ds.values.column(c),
+                        (minv, maxv),
+                        degree,
+                        n_knots,
+                    )?,
                     parse_cyclic_boundary(options, minv, maxv)?,
                 )
             };
@@ -1991,6 +2003,9 @@ pub fn build_smooth_basis(
                     "basis_dim",
                     "basis-dim",
                     "basisdim",
+                    "knot_placement",
+                    "knot-placement",
+                    "knotplacement",
                     "degree",
                     "penalty_order",
                     "double_penalty",
@@ -2111,14 +2126,25 @@ pub fn build_smooth_basis(
                     )
                 } else {
                     let num_internal_knots = k_axis.saturating_sub(degree + 1).max(1);
-                    (
-                        BSplineKnotSpec::Generate {
+                    let knotspec = match parse_knot_placement(options)? {
+                        crate::basis::BSplineKnotPlacement::Uniform => BSplineKnotSpec::Generate {
                             data_range: (data_min, data_max),
                             num_internal_knots,
                         },
-                        OneDimensionalBoundary::Open,
-                        None,
-                    )
+                        crate::basis::BSplineKnotPlacement::Quantile => {
+                            crate::basis::auto_knot_vector_1d_quantile(
+                                ds.values.column(c),
+                                num_internal_knots,
+                                degree,
+                            )
+                            .map_err(|e| e.to_string())?;
+                            BSplineKnotSpec::Automatic {
+                                num_internal_knots: Some(num_internal_knots),
+                                placement: crate::basis::BSplineKnotPlacement::Quantile,
+                            }
+                        }
+                    };
+                    (knotspec, OneDimensionalBoundary::Open, None)
                 };
                 margins.push(BSplineBasisSpec {
                     degree,
@@ -2431,7 +2457,15 @@ pub fn parse_ps_internal_knots(
     // default. Lenient `option_usize` / `option_usize_any` silently swallow
     // unparseable values, which leaves the user thinking they configured
     // something when they did not.
-    let knots_internal = option_usize_strict(options, "knots")?;
+    // A list-valued `knots=[...]` carries explicit internal positions, not a
+    // count; it is consumed by `parse_explicit_internal_knots`. Treat it as
+    // "count not specified" here so the strict integer parse does not reject
+    // the bracketed value (the Provided path ignores the returned count).
+    let knots_internal = if knots_option_is_list(options) {
+        None
+    } else {
+        option_usize_strict(options, "knots")?
+    };
     let basis_dim = option_usize_any_strict(options, &["k", "basis_dim", "basis-dim", "basisdim"])?;
     if knots_internal.is_some() && basis_dim.is_some() {
         return Err(TermBuilderError::incompatible_config(
@@ -2454,6 +2488,144 @@ pub fn parse_ps_internal_knots(
             knots_internal.unwrap_or(default_internal_knots),
             knots_internal.is_none(),
         ))
+    }
+}
+
+/// True when the `knots` option value is a *list* literal (`[...]`, `c(...)`,
+/// or `(...)`) rather than a scalar count. mgcv's `knots=` accepts both: a
+/// single integer is an internal-knot count, while a vector is explicit
+/// internal knot positions. We disambiguate purely on the wrapper syntax so a
+/// bare `knots=5` keeps its historical count meaning.
+fn knots_option_is_list(options: &BTreeMap<String, String>) -> bool {
+    options
+        .get("knots")
+        .map(|raw| {
+            let t = raw.trim();
+            t.starts_with('[')
+                || t.starts_with("c(")
+                || t.starts_with("C(")
+                || t.starts_with('(')
+        })
+        .unwrap_or(false)
+}
+
+/// Parse `knots=[k0, k1, ...]` (or `c(...)` / `(...)`) into explicit internal
+/// knot positions. Returns `Ok(None)` when `knots` is absent or a scalar count
+/// (handled by [`parse_ps_internal_knots`]); `Ok(Some(positions))` when it is a
+/// non-empty numeric list; and an error for an empty or unparseable list.
+fn parse_explicit_internal_knots(
+    options: &BTreeMap<String, String>,
+) -> Result<Option<Vec<f64>>, String> {
+    if !knots_option_is_list(options) {
+        return Ok(None);
+    }
+    let raw = options
+        .get("knots")
+        .expect("knots_option_is_list implies the key is present");
+    // Unwrap the `c(...)` / `(...)` R-vector forms down to a bare `[...]`-style
+    // body so `split_list_option` (which only peels `[...]`) sees a clean list.
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix("c(")
+        .or_else(|| trimmed.strip_prefix("C("))
+        .or_else(|| trimmed.strip_prefix('('))
+        .and_then(|v| v.strip_suffix(')'))
+        .map(|inner| format!("[{inner}]"))
+        .unwrap_or_else(|| trimmed.to_string());
+    let tokens = split_list_option(&body);
+    if tokens.is_empty() {
+        return Err(TermBuilderError::invalid_option(format!(
+            "knots={raw} is an empty list; supply at least one internal knot position \
+             (e.g. knots=[0.2, 0.5, 0.8]) or a scalar count (e.g. knots=8)"
+        ))
+        .to_string());
+    }
+    let mut positions = Vec::with_capacity(tokens.len());
+    for tok in &tokens {
+        let value = parse_numeric_expr(tok).map_err(|err| {
+            TermBuilderError::invalid_option(format!(
+                "knots list entry '{tok}' is not a numeric position: {err}"
+            ))
+            .to_string()
+        })?;
+        positions.push(value);
+    }
+    Ok(Some(positions))
+}
+
+/// Resolve the `knot_placement=` option for an automatically generated knot
+/// vector. Accepts `"uniform"` (the default, equal spacing on the data range)
+/// and `"quantile"` (interior knots at empirical data quantiles, better for
+/// skewed covariates). Unknown values are rejected so typos do not silently
+/// fall back to uniform.
+fn parse_knot_placement(
+    options: &BTreeMap<String, String>,
+) -> Result<crate::basis::BSplineKnotPlacement, String> {
+    use crate::basis::BSplineKnotPlacement;
+    match options
+        .get("knot_placement")
+        .or_else(|| options.get("knot-placement"))
+        .or_else(|| options.get("knotplacement"))
+    {
+        None => Ok(BSplineKnotPlacement::Uniform),
+        Some(raw) => match raw.trim().trim_matches('"').trim_matches('\'').to_ascii_lowercase().as_str() {
+            "uniform" | "even" | "equal" => Ok(BSplineKnotPlacement::Uniform),
+            "quantile" | "quantiles" | "data" | "empirical" => Ok(BSplineKnotPlacement::Quantile),
+            other => Err(TermBuilderError::invalid_option(format!(
+                "knot_placement={other} is not recognised; expected \"uniform\" or \"quantile\""
+            ))
+            .to_string()),
+        },
+    }
+}
+
+/// Build the non-periodic 1D B-spline knot spec for the `ps`/`bspline` and
+/// factor-smooth marginal paths, honoring (in priority order):
+///   1. `knots=[...]` explicit internal positions  → [`BSplineKnotSpec::Provided`]
+///   2. `knot_placement="quantile"`                 → [`BSplineKnotSpec::Automatic`]
+///   3. uniform generation                          → [`BSplineKnotSpec::Generate`]
+///
+/// `data` is the covariate column (used to clamp explicit positions to the
+/// observed range and to drive quantile placement); `n_knots` is the resolved
+/// internal-knot count from [`parse_ps_internal_knots`] used for the automatic
+/// strategies.
+fn resolve_nonperiodic_bspline_knotspec(
+    options: &BTreeMap<String, String>,
+    data: ArrayView1<'_, f64>,
+    data_range: (f64, f64),
+    degree: usize,
+    n_knots: usize,
+) -> Result<BSplineKnotSpec, String> {
+    use crate::basis::{BSplineKnotPlacement, clamped_knot_vector_from_internal_positions};
+    if let Some(positions) = parse_explicit_internal_knots(options)? {
+        if option_usize_any_strict(options, &["k", "basis_dim", "basis-dim", "basisdim"])?.is_some()
+        {
+            return Err(TermBuilderError::incompatible_config(
+                "ps/bspline smooth: specify either explicit knots=[...] positions or \
+                 k=<basis_dim> (not both); the basis size is fixed by the knot vector",
+            )
+            .to_string());
+        }
+        let knots = clamped_knot_vector_from_internal_positions(data_range, &positions, degree)
+            .map_err(|e| e.to_string())?;
+        return Ok(BSplineKnotSpec::Provided(knots));
+    }
+    match parse_knot_placement(options)? {
+        BSplineKnotPlacement::Uniform => Ok(BSplineKnotSpec::Generate {
+            data_range,
+            num_internal_knots: n_knots,
+        }),
+        BSplineKnotPlacement::Quantile => {
+            // Validate the column up-front so an unfittable request surfaces a
+            // user-correctable error at parse time rather than deep in basis
+            // construction. The same data drives the eventual quantile knots.
+            crate::basis::auto_knot_vector_1d_quantile(data, n_knots, degree)
+                .map_err(|e| e.to_string())?;
+            Ok(BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(n_knots),
+                placement: BSplineKnotPlacement::Quantile,
+            })
+        }
     }
 }
 
