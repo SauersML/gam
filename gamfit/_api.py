@@ -2279,13 +2279,21 @@ def _resolve_position_basis_inputs(
     basis: str | None,
     basis_order: int | None,
     periodic: bool,
-) -> tuple[str, str, int, Any, Any, Any]:
+    period: float | None = None,
+) -> tuple[str, str, int, Any, Any, Any, float | None]:
     """Resolve the shared position-basis FFI inputs for every positions face.
 
     All four position-based Gaussian REML entrypoints (forward / backward /
     batched / batched-backward) opened with this identical preamble. Returns
-    ``(display_kind, effective_kind, order, t_np, knots_np, penalty_np)``.
+    ``(display_kind, effective_kind, order, t_np, knots_np, penalty_np,
+    eff_period)``. ``eff_period`` is the domain-wrap period the basis and penalty
+    must share: the explicit ``period`` when given, else (for periodic Duchon) a
+    value auto-derived from the resolved knots so the half-open grid wraps
+    cleanly (gam#580). The caller passes ``eff_period`` to the FFI basis build so
+    basis and penalty stay consistent.
     """
+    import numpy as np
+
     display_kind = str(
         basis if basis is not None else basis_kind if basis_kind is not None else "bspline"
     )
@@ -2298,6 +2306,20 @@ def _resolve_position_basis_inputs(
         label="knots_or_centers",
         degree=order,
     )
+    # Resolve the effective wrap period for periodic Duchon. The period is the
+    # domain wrap, not the knot span: on a half-open grid the knots span only
+    # (period − one_spacing). When the caller gives no explicit period, derive it
+    # as span + one mean knot spacing so points near the two ends are a single
+    # spacing apart across the wrap (an undersized period gave a non-PSD Gram —
+    # gam#580). Non-periodic / non-Duchon bases ignore this.
+    eff_period = period
+    kind_norm = str(display_kind).strip().lower().replace("_", "").replace("-", "")
+    if periodic and period is None and kind_norm in {"duchon", "duchonspline", "thinplate", "thinplatespline", "tps"}:
+        k = np.asarray(knots_np, dtype=float)
+        if k.size >= 2:
+            span = float(k.max() - k.min())
+            mean_spacing = span / max(k.size - 1, 1)
+            eff_period = span + mean_spacing
     # Auto-knot derivation may downgrade the degree for small n (#340); the
     # resolved knot vector is clamped for ``eff_order``, so the penalty and the
     # downstream FFI basis build must both use the effective order to stay
@@ -2308,8 +2330,9 @@ def _resolve_position_basis_inputs(
         basis_kind=display_kind,
         basis_order=eff_order,
         periodic=periodic,
+        period=eff_period,
     )
-    return display_kind, effective_kind, eff_order, t_np, knots_np, penalty_np
+    return display_kind, effective_kind, eff_order, t_np, knots_np, penalty_np, eff_period
 
 
 def gaussian_reml_fit_positions(
@@ -2337,7 +2360,7 @@ def gaussian_reml_fit_positions(
     """
     import numpy as np
 
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
         _resolve_position_basis_inputs(
             t,
             basis_kind,
@@ -2346,6 +2369,7 @@ def gaussian_reml_fit_positions(
             basis=basis,
             basis_order=basis_order,
             periodic=periodic,
+            period=period,
         )
     )
     try:
@@ -2357,7 +2381,7 @@ def gaussian_reml_fit_positions(
             penalty_np,
             order,
             bool(periodic),
-            None if period is None else float(period),
+            None if eff_period is None else float(eff_period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2403,7 +2427,7 @@ def gaussian_reml_fit_positions_backward(
     ``knots_or_centers`` and ``penalty`` accept the same auto-derived
     defaults as :func:`gaussian_reml_fit_positions`.
     """
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
         _resolve_position_basis_inputs(
             t,
             basis_kind,
@@ -2412,6 +2436,7 @@ def gaussian_reml_fit_positions_backward(
             basis=basis,
             basis_order=basis_order,
             periodic=periodic,
+            period=period,
         )
     )
     try:
@@ -2431,7 +2456,7 @@ def gaussian_reml_fit_positions_backward(
             forward_state,
             order,
             bool(periodic),
-            None if period is None else float(period),
+            None if eff_period is None else float(eff_period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2467,7 +2492,7 @@ def gaussian_reml_fit_positions_batched(
     """
     import numpy as np
 
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
         _resolve_position_basis_inputs(
             t,
             basis_kind,
@@ -2476,6 +2501,7 @@ def gaussian_reml_fit_positions_batched(
             basis=basis,
             basis_order=basis_order,
             periodic=periodic,
+            period=period,
         )
     )
     try:
@@ -2488,7 +2514,7 @@ def gaussian_reml_fit_positions_batched(
             penalty_np,
             order,
             bool(periodic),
-            None if period is None else float(period),
+            None if eff_period is None else float(eff_period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -2537,7 +2563,7 @@ def gaussian_reml_fit_positions_batched_backward(
     """
     offsets = _index_vector(row_offsets, "row_offsets")
     batch = int(offsets.size - 1)
-    display_kind, effective_kind, order, t_np, knots_np, penalty_np = (
+    display_kind, effective_kind, order, t_np, knots_np, penalty_np, eff_period = (
         _resolve_position_basis_inputs(
             t,
             basis_kind,
@@ -2546,6 +2572,7 @@ def gaussian_reml_fit_positions_batched_backward(
             basis=basis,
             basis_order=basis_order,
             periodic=periodic,
+            period=period,
         )
     )
     try:
@@ -2566,7 +2593,7 @@ def gaussian_reml_fit_positions_batched_backward(
             forward_state,
             order,
             bool(periodic),
-            None if period is None else float(period),
+            None if eff_period is None else float(eff_period),
             None if weights is None else _numeric_vector(weights, "weights"),
             None if init_lambda is None else float(init_lambda),
             None if by is None else _numeric_vector(by, "by"),
@@ -3659,6 +3686,7 @@ def _resolve_position_penalty(
     basis_kind: str,
     basis_order: int,
     periodic: bool,
+    period: float | None = None,
 ) -> Any:
     """Resolve the canonical single-λ penalty for position-based REML helpers.
 
@@ -3693,7 +3721,11 @@ def _resolve_position_penalty(
                     knots_or_centers,
                     m=int(basis_order),
                     periodic=bool(periodic),
-                    period=None,
+                    # Honor the explicit domain-wrap period so the periodic Gram
+                    # matches the basis (both now use the same period). Passing
+                    # None here auto-derived the center span and produced a
+                    # non-PSD penalty (gam#580).
+                    period=period,
                 )
             if penalty_kind in {"triple-operator", "tripleoperator", "operator"}:
                 raise ValueError(

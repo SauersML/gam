@@ -4068,11 +4068,16 @@ fn duchon_function_norm_penalty<'py>(
             periodic: None,
             boundary: OneDimensionalBoundary::Open,
         };
+        // Honor an explicit 1D `period` (the domain wrap) instead of
+        // auto-deriving it from the center span, which undershoots on a
+        // half-open grid and produced a non-PSD Gram (gam#580). For d>1 the
+        // per-axis periods are auto-derived in the core.
+        let periods_1d: Option<[f64; 1]> = if d == 1 { period.map(|p| [p]) } else { None };
         let built = build_duchon_basis_mixed_periodicity_auto(
             center_matrix.view(),
             &spec,
             &periodic_flags,
-            None,
+            periods_1d.as_ref().map(|p| p.as_slice()),
         )
         .map_err(|err| py_value_error(err.to_string()))?;
         // Mixed-periodicity builder emits a single Primary candidate (the
@@ -15027,7 +15032,7 @@ fn position_basis_design(
         }
         "duchon" => {
             validate_position_period("duchon", knots_or_centers, periodic, period)?;
-            duchon_basis_1d_impl(t, knots_or_centers, basis_order, periodic)
+            duchon_basis_1d_impl(t, knots_or_centers, basis_order, periodic, period)
         }
         other => Err(format!(
             "normalized_position_basis_kind returned an unsupported basis name: {other}"
@@ -15138,9 +15143,16 @@ fn validate_position_period(
                     "{label} period must be finite and positive; got {period}"
                 ));
             }
-            if (implied - period).abs() > 1.0e-10 * period.max(1.0) {
+            // The period is the domain WRAP, not the sample/center span. Centers
+            // on a half-open grid [start, start+period) (e.g. linspace(0,1,K,
+            // endpoint=False) with period 1.0) span only `period − one_spacing`,
+            // so requiring span == period rejected every legitimate explicit
+            // period (gam#580). The only real constraint is that every center
+            // fits inside a single period, i.e. `period >= span`.
+            if period < implied - 1.0e-10 * implied.max(1.0) {
                 return Err(format!(
-                    "{label} periodic support range ({implied}) must match explicit period ({period})"
+                    "{label} explicit period ({period}) is smaller than the center span \
+                     ({implied}); every center must lie within a single period"
                 ));
             }
         } else if label != "duchon" {
@@ -28389,6 +28401,7 @@ fn duchon_basis_1d_impl(
     centers: ArrayView1<'_, f64>,
     m: usize,
     periodic: bool,
+    period: Option<f64>,
 ) -> Result<Array2<f64>, String> {
     validate_vector("t", t)?;
     validate_vector("centers", centers)?;
@@ -28409,8 +28422,16 @@ fn duchon_basis_1d_impl(
         boundary: OneDimensionalBoundary::Open,
     };
     if periodic {
-        let built = build_duchon_basis_mixed_periodicity_auto(data.view(), &spec, &[true], None)
-            .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))?;
+        // Honor the explicit domain-wrap `period`; auto-derive (None) only when
+        // the caller did not supply one. Matches the penalty path (gam#580).
+        let periods_1d: Option<[f64; 1]> = period.map(|p| [p]);
+        let built = build_duchon_basis_mixed_periodicity_auto(
+            data.view(),
+            &spec,
+            &[true],
+            periods_1d.as_ref().map(|p| p.as_slice()),
+        )
+        .map_err(|err| format!("failed to evaluate Duchon basis: {err}"))?;
         return built
             .design
             .try_to_dense_by_chunks("duchon_basis_1d_impl")
