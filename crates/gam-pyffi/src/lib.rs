@@ -3,7 +3,7 @@ use faer::Side;
 use gam::basis::create_duchon_basis_1d_derivative_dense;
 use gam::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::estimate::{
-    BlockRole, EstimationError, ExternalOptimOptions, UnifiedFitResult,
+    BlockRole, EstimationError, ExternalOptimOptions,
     optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
     saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
