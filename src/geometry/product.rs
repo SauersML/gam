@@ -180,6 +180,11 @@ impl RiemannianManifold for ProductManifold {
         let mut off = 0usize;
         for component in &self.components {
             let m = component.ambient_dim();
+            // The product connection is block-diagonal: Γ assembles only from
+            // factor Christoffels. If a factor cannot provide chart-valid
+            // symbols (e.g. a curved embedded sphere/Grassmann/Stiefel returns
+            // Unsupported), propagate that rather than silently leaving its
+            // block a false flat zero — so the `?` here is deliberate.
             let gamma = component.christoffel_symbols(point.slice(s![off..off + m]))?;
             for k in 0..m {
                 for i in 0..m {
