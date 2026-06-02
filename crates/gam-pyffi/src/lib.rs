@@ -9699,6 +9699,14 @@ fn sae_manifold_fit_inner<'py>(
     problem
         .run(&mut objective, "SAE manifold")
         .map_err(estimation_error_to_pyerr)?;
+    // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
+    // ambient bands, read off the converged joint-Hessian Schur factor at the
+    // settled ρ. Computed before `into_fitted` consumes the objective; reflects
+    // the fitted (smooth) decoder shape, independent of any top-k assignment
+    // gate applied below.
+    let shape_uncertainty = objective
+        .decoder_shape_uncertainty()
+        .map_err(py_value_error)?;
     let (term, rho, loss) = objective.into_fitted();
 
     let mut assignments = term.assignment.assignments();
@@ -9808,6 +9816,17 @@ fn sae_manifold_fit_inner<'py>(
             assignments.column(atom_idx).to_owned().into_pyarray(py),
         )?;
         atom_dict.set_item("active_dim", atom_dim[atom_idx])?;
+        // Posterior shape uncertainty for this atom: φ-scaled decoder
+        // covariance Cov(β_k) and the closed-form ambient band (coords / mean /
+        // per-channel sd) along the atom's on-atom coordinates.
+        let unc = &shape_uncertainty.atoms[atom_idx];
+        atom_dict.set_item(
+            "decoder_covariance",
+            unc.decoder_covariance.clone().into_pyarray(py),
+        )?;
+        atom_dict.set_item("shape_band_coords", unc.band_coords.clone().into_pyarray(py))?;
+        atom_dict.set_item("shape_band_mean", unc.band_mean.clone().into_pyarray(py))?;
+        atom_dict.set_item("shape_band_sd", unc.band_sd.clone().into_pyarray(py))?;
         atoms_py.append(atom_dict)?;
     }
 
@@ -9833,6 +9852,9 @@ fn sae_manifold_fit_inner<'py>(
     out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", assignment_kind)?;
+    // Gaussian reconstruction scale φ̂ used to scale every per-atom decoder
+    // covariance (Cov(β_k) = φ̂·S_β⁻¹[block]).
+    out.set_item("dispersion", shape_uncertainty.dispersion)?;
     Ok(out.unbind())
 }
 
