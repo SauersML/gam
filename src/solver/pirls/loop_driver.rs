@@ -1457,9 +1457,7 @@ pub struct PirlsConfig {
     /// ([`crate::solver::arrow_schur::ArrowSchurSystem`]). When `None`
     /// (the default), the existing β-only path is used unchanged.
     ///
-    /// See `proposals/latent_coord.md` for the design and the math
-    /// audit caveats; see [`ArrowSchurInnerConfig`] for the closure
-    /// contract.
+    /// See [`ArrowSchurInnerConfig`] for the closure contract.
     pub arrow_schur: Option<ArrowSchurInnerConfig>,
 }
 

@@ -1,7 +1,6 @@
 //! Analytic penalty primitives for the three-tier (beta / ext-coord / rho) engine.
 //!
-//! See `proposals/composition_engine.md` §3-§4 and `proposals/latent_coord.md`
-//! §2.3 for the motivation. This module implements the structured
+//! This module implements the structured
 //! penalties identified as the minimal identifiability tools needed by an
 //! SAE / principal-manifold / latent-coordinate workflow:
 //!

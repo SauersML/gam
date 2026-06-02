@@ -776,9 +776,7 @@ class PeriodicSplineCurve(Smooth):
 class LatentCoord:
     """Per-row latent coordinates ``t ∈ ℝ^{N × d}`` as a first-class parameter.
 
-    See ``proposals/latent_coord.md`` in the gam repository for the design
-    rationale and the math; see ``src/terms/latent_coord.rs`` for the Rust
-    side.
+    See ``src/terms/latent_coord.rs`` for the Rust side.
 
     The familiar GAM picture is
 

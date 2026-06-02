@@ -6,8 +6,7 @@ pure dataclass — no computation runs at construction; the Rust side
 materializes the penalty's value / gradient / Hessian-vector product
 analytically inside the inner loop.
 
-See `proposals/composition_engine.md` §3-§4 and
-`proposals/latent_coord.md` §2.3 for the motivation. These structured
+These structured
 penalties span the identifiability tools the impossibility theorem
 says a principal-manifold / SAE / SAE-manifold engine needs:
 
@@ -41,8 +40,7 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   auxiliary-supervised gauge-fix block pins one subspace while a free block
   discovers the residual structure.
 * `AuxConditionalPriorPenalty` lives on t. Fixed-precomputed iVAE-style
-  row-conditional precision, the auxiliary-supervised sibling to ARD/Ortho
-  from `proposals/composition_engine.md` §4(c).
+  row-conditional precision, the auxiliary-supervised sibling to ARD/Ortho.
 * `IvaeRidgeMeanGauge` lives on t. It fixes the iVAE conditional-mean gauge
   by penalizing the component of t not explained by a ridge fit against
   auxiliary covariates u.

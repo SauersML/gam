@@ -711,10 +711,8 @@ where
                         bound_active_hint.as_mut(),
                     )
                 } else if let Some(arrow_cfg) = options.arrow_schur.as_ref() {
-                    // Arrow-Schur structured-inner-solve path. See
-                    // `proposals/latent_coord.md` §4 and
-                    // `proposals/composition_engine.md` §7 (audit
-                    // revisions). The driver-supplied closure assembles
+                    // Arrow-Schur structured-inner-solve path. The
+                    // driver-supplied closure assembles
                     // the bordered (t, β) system at the current β and
                     // current latent t; we solve via per-row d×d
                     // Cholesky + one K×K Schur factor, write the

@@ -1163,8 +1163,7 @@ pub struct WorkingModelPirlsOptions {
     ///
     /// **Scope note.** This wires the *inner* Gauss–Newton step. The REML
     /// outer-loop gradient w.r.t. `t` (which carries a shared `Schur⁻¹`
-    /// factor — see `proposals/composition_engine.md` §7 audit revisions)
-    /// is a separate plumbing change owned by the REML driver and is
+    /// factor) is a separate plumbing change owned by the REML driver and is
     /// **not** handled here.
     pub arrow_schur: Option<ArrowSchurInnerConfig>,
 }

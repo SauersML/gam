@@ -209,6 +209,7 @@ fn explicit_knot_list_conflicts_with_k() {
         &ResourcePolicy::default_library(),
     )
     .expect_err("knots=[...] together with k= must be rejected");
+    let err = err.to_string();
     assert!(
         err.contains("knots") && err.contains('k'),
         "error should explain the knots/k conflict, got: {err}"
@@ -228,6 +229,7 @@ fn out_of_range_explicit_knot_is_rejected() {
         &ResourcePolicy::default_library(),
     )
     .expect_err("interior knot outside the data range must be rejected");
+    let err = err.to_string();
     assert!(
         err.contains("strictly inside") || err.contains("data range"),
         "error should explain the out-of-range knot, got: {err}"

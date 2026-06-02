@@ -1,7 +1,5 @@
 //! `LatentCoord` — per-row latent coordinates as a first-class gamfit parameter.
 //!
-//! See `proposals/latent_coord.md` for the full design.
-//!
 //! The Riemannian update path follows manifold GPLVM practice (mGPLVM;
 //! Jensen/Kao/Tran/Stevenson 2020 and related head-direction / population
 //! manifold work): angular, spherical, and product-topology latents are

@@ -64,6 +64,7 @@ from ._api import (
     gaussian_reml_fit_formula,
     gaussian_reml_fit_latent,
     gaussian_reml_fit_latent_backward,
+    gaussian_reml_optimize_latent,
     glm_reml_fit_latent,
     glm_reml_fit_latent_backward,
     gaussian_reml_fit_positions,

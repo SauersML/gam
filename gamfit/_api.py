@@ -2829,6 +2829,121 @@ def gaussian_reml_fit_latent_backward(
     return result
 
 
+def gaussian_reml_optimize_latent(
+    y: Any,
+    n_obs: int,
+    latent_dim: int,
+    centers: Any,
+    penalty: Any,
+    *,
+    t: Any | None = None,
+    m: int = 2,
+    weights: Any | None = None,
+    fisher_w: Any | None = None,
+    init_lambda: float | None = None,
+    aux_u: Any | None = None,
+    aux_family: str = "ridge",
+    aux_strength: float | str | None = None,
+    dim_selection_log_precision: Any | None = None,
+    basis_kind: str = "duchon",
+    tensor_knots_concat: Any | None = None,
+    tensor_knot_offsets: Sequence[int] | None = None,
+    tensor_degrees: Sequence[int] | None = None,
+    manifold: str = "euclidean",
+    sigma_eff_mode: str = "profiled",
+    max_iter: int = 200,
+    grad_tol: float = 1.0e-8,
+    trust_radius: float = 1.0,
+    max_radius: float = 1.0e6,
+    n_restarts: int = 1,
+    restart_scale: float = 0.25,
+    seed: int = 0,
+    init: str = "spectral",
+    seed_neighbors: int = 10,
+) -> dict[str, Any]:
+    """Estimate the per-row latent coordinate ``t`` *and* the decoder.
+
+    This is the latent-*optimizing* companion to :func:`gaussian_reml_fit_latent`
+    (which is a single ``β | t`` solve at a fixed ``t``). It minimizes the same
+    Gaussian-REML score over ``t`` with a Riemannian trust region driven by the
+    analytic ``∂(reml_score)/∂t``, retracting each step onto ``manifold``, and
+    returns the full REML fit dictionary *at the recovered latent* together with
+    the optimized coordinate under the keys ``"t"`` / ``"latent"`` (shape
+    ``(n_obs, latent_dim)``) and ``"t_flat"``.
+
+    The objective is non-convex (a GP-LVM-style coordinate problem), so a cold
+    random start settles in a poor local optimum (see issue #627). With the
+    default ``init="spectral"`` the optimizer seeds restart 0 from a
+    Laplacian-eigenmaps embedding of ``y`` — which recovers the intrinsic
+    coordinate up to a monotone/rotation gauge — then polishes it, so a good
+    initial ``t`` is *not* required. ``t`` is optional; when omitted a zero
+    vector is used as the fallback start (taken only when the spectral seed is
+    unavailable, e.g. too few rows or a non-Euclidean ``manifold``). Pass
+    ``init="caller"`` to start from ``t`` unchanged (a pure local solve / explicit
+    warm start), ``n_restarts > 1`` to additionally try perturbed starts and keep
+    the lowest-score result, and ``seed_neighbors`` to set the spectral seed's
+    k-nearest-neighbour graph size.
+
+    The ``centers`` / ``penalty`` / ``basis_kind`` arguments define the decoder
+    basis exactly as in :func:`gaussian_reml_fit_latent`; the spectral seed is
+    affinely mapped onto the span of ``centers`` so it lands where ``Φ`` is
+    well-conditioned. The result also carries ``"grad_t_norm"``, ``"converged"``,
+    ``"objective_value"``, ``"n_restarts"``, and ``"init"`` diagnostics.
+    """
+    import numpy as np
+
+    expected = int(n_obs) * int(latent_dim)
+    if t is None:
+        t_vec = np.zeros(expected, dtype=float)
+    else:
+        t_vec = _numeric_vector(t, "t")
+
+    rust = rust_module()
+    try:
+        out = rust.gaussian_reml_optimize_latent(
+            t_vec,
+            _numeric_matrix(y, "y"),
+            int(n_obs),
+            int(latent_dim),
+            _numeric_matrix(centers, "centers"),
+            _numeric_matrix(penalty, "penalty"),
+            int(m),
+            None if weights is None else _numeric_vector(weights, "weights"),
+            None if fisher_w is None else _numeric_array(fisher_w, "fisher_w"),
+            None if init_lambda is None else float(init_lambda),
+            None if aux_u is None else _numeric_matrix(aux_u, "aux_u"),
+            str(aux_family),
+            _normalize_aux_strength(aux_strength),
+            None
+            if dim_selection_log_precision is None
+            else _numeric_vector(dim_selection_log_precision, "dim_selection_log_precision"),
+            str(basis_kind),
+            None
+            if tensor_knots_concat is None
+            else _numeric_vector(tensor_knots_concat, "tensor_knots_concat"),
+            None if tensor_knot_offsets is None else [int(v) for v in tensor_knot_offsets],
+            None if tensor_degrees is None else [int(v) for v in tensor_degrees],
+            str(manifold),
+            str(sigma_eff_mode),
+            int(max_iter),
+            float(grad_tol),
+            float(trust_radius),
+            float(max_radius),
+            int(n_restarts),
+            float(restart_scale),
+            int(seed),
+            str(init),
+            int(seed_neighbors),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    result = dict(out)
+    for key in ("coefficients", "fitted", "sigma2", "t", "latent", "t_flat"):
+        if result.get(key) is not None:
+            result[key] = np.asarray(result[key], dtype=float)
+    return result
+
+
 def glm_reml_fit_latent(
     t: Any,
     y: Any,

@@ -6426,11 +6426,14 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
 ///   closed-form Gaussian REML backward. This case delegates to
 ///   `gaussian_reml_multi_closed_form_backward` and produces gradients
 ///   identical to `gaussian_reml_fit_backward` (round-off agreement).
-/// - **Active cert (non-empty active set):** STOPPED per task instructions
-///   (the existing closed-form backward stack is hard-coded to the
-///   unconstrained `GaussianRemlEigenCache`/`reml_hess_rho` and cannot
-///   accept a tangent-wrapped operator without a substantial refactor —
-///   see report). Returns `NotImplementedError`.
+/// - **Active cert (non-empty active set):** reparametrise `β = Z γ` with
+///   `Z = null(A_act)` and run the interior closed-form backward on the
+///   reduced operators `X_Z = X Z`, `S_Z = Zᵀ S Z`, pulling upstream
+///   cotangents through `Z` and lifting the returned gradients back to full
+///   p-space (`grad_X = grad_X_Z · Zᵀ`, `grad_S = Z · grad_S_Z · Zᵀ`). Since
+///   `Z` depends only on the non-differentiable active-constraint geometry,
+///   this is the exact analytic adjoint. Delegates to
+///   `constrained_active_backward`.
 #[pyfunction(signature = (
     x,
     y,
@@ -7302,7 +7305,7 @@ fn gaussian_reml_fit_positions_batched_backward<'py>(
 // LatentCoord — N-D generalization of `gaussian_reml_fit_positions`
 // ---------------------------------------------------------------------------
 //
-// See `proposals/latent_coord.md` and `src/terms/latent_coord.rs`.
+// See `src/terms/latent_coord.rs`.
 //
 // The 1-D position path constructs Φ(t) on a Duchon/B-spline basis with
 // t ∈ ℝ^N, fits the Gaussian REML inner problem against Y, and (in the
@@ -9066,6 +9069,7 @@ fn gaussian_reml_fit_latent<'py>(
     }
     let analytic_penalties_for_thread = analytic_penalties.clone();
     let latent_payload_for_thread = latent_payload.clone();
+    let t_for_echo = t_values.clone();
     let (fit, _design, aux_strength_state) =
         detach_py_result(py, "gaussian_reml_fit_latent", move || {
             let registry = build_analytic_penalty_registry_from_json(
@@ -9101,6 +9105,14 @@ fn gaussian_reml_fit_latent<'py>(
     let out = PyDict::new(py);
     set_ok_gaussian_reml_items(py, &out, fit)?;
     set_aux_strength_items(py, &out, aux_strength_state)?;
+    // Echo the latent this fit was evaluated at. The forward primitive solves a
+    // single `β | t`; it does not move `t`, so the returned `t` equals the input.
+    // Callers driving the outer loop (or `gaussian_reml_optimize_latent`) read
+    // it back rather than having to thread the input through themselves.
+    let t_matrix = t_for_echo
+        .into_shape_with_order((n_obs, latent_dim))
+        .map_err(|err| py_value_error(err.to_string()))?;
+    out.set_item("t", t_matrix.into_pyarray(py))?;
     Ok(out.unbind())
 }
 
@@ -9684,6 +9696,12 @@ fn sae_manifold_fit_inner<'py>(
     let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
+    // Route every problem size through the full-batch objective on the owned
+    // `target`: the inner Arrow-Schur fit materializes the `(N × M_total)`
+    // basis, `(N × M_total × d)` jacobian, and `(N × K)` logit buffers in full,
+    // so the outer-cascade entry point owns the full target verbatim.
+    // `sae_streaming_plan` is exposed separately as a standalone diagnostic
+    // pyfunction.
     let mut objective = gam::terms::sae_manifold::SaeManifoldOuterObjective::new(
         base_term,
         z_view.to_owned(),
@@ -10063,6 +10081,119 @@ fn sae_streaming_plan(
 /// and a data-fit push to balance against.
 ///
 /// Returns the padded `(K, M_max, p_out)` decoder array directly.
+///
+/// Build a data-driven asymmetric assignment-logit seed for a cold start
+/// (issue #629). A uniform logit seed (`Array2::zeros`) is an exact symmetric
+/// saddle of the joint objective whenever the atoms are exchangeable under the
+/// assignment forward map: every atom carries identical responsibility, the
+/// LSQ decoder init projects the same target onto every atom, and the
+/// assignment update has no gradient to break the tie, so the fit never routes.
+/// The tiny `random_state` jitter is too weak to escape on conditioned data.
+///
+/// This helper runs one EM-style M-then-E step on the seed geometry: it fits
+/// each atom's decoder independently against the *full* response (each atom's
+/// own seed coordinates already give it a distinct `Phi_k`), measures the
+/// per-row reconstruction residual under that fit, and emits logits that prefer
+/// the atom which best explains each row. Rows that every atom explains equally
+/// well receive near-equal logits (the residual ties cancel), so the existing
+/// jitter still breaks those rare ties; rows with a clear best atom get a
+/// decisive — but bounded, hence escapable by the Newton refinement — head
+/// start. The result is a proper responsibility seed rather than a saddle.
+fn sae_residual_seed_logits(
+    basis_values: ArrayView3<'_, f64>,
+    basis_sizes: &[usize],
+    z: ArrayView2<'_, f64>,
+    gain: f64,
+) -> Result<Array2<f64>, String> {
+    let k_atoms = basis_sizes.len();
+    let (n_obs, p_out) = z.dim();
+    let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    if n_obs == 0 || p_out == 0 || k_atoms <= 1 {
+        return Ok(logits);
+    }
+    if basis_values.shape()[0] != k_atoms || basis_values.shape()[1] != n_obs {
+        return Err(format!(
+            "sae_residual_seed_logits: basis_values must start with (K, N)=({k_atoms}, {n_obs}); got {:?}",
+            basis_values.shape()
+        ));
+    }
+    let z_owned = z.to_owned();
+    // Per-row residual energy after fitting each atom independently.
+    let mut resid = Array2::<f64>::zeros((n_obs, k_atoms));
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        if m_k == 0 {
+            // No basis columns: the atom predicts zero, so its residual is the
+            // full row energy. Leave `resid` column at that value below.
+            for row in 0..n_obs {
+                let mut e = 0.0_f64;
+                for col in 0..p_out {
+                    e += z[[row, col]] * z[[row, col]];
+                }
+                resid[[row, atom_idx]] = e;
+            }
+            continue;
+        }
+        // Phi_k = basis_values[atom_idx, :, :m_k]  (N, m_k).
+        let mut phi = Array2::<f64>::zeros((n_obs, m_k));
+        for row in 0..n_obs {
+            for c in 0..m_k {
+                phi[[row, c]] = basis_values[[atom_idx, row, c]];
+            }
+        }
+        let mut gram = fast_ata(&phi);
+        let mut trace = 0.0_f64;
+        for i in 0..m_k {
+            trace += gram[[i, i]];
+        }
+        let jitter = (trace / m_k as f64).max(1.0).max(1.0e-12) * 1.0e-8;
+        for i in 0..m_k {
+            gram[[i, i]] += jitter;
+        }
+        let rhs = fast_atb(&phi, &z_owned);
+        let factor = gram
+            .cholesky(Side::Lower)
+            .map_err(|err| format!("sae_residual_seed_logits: Cholesky failed: {err:?}"))?;
+        let b_k = factor.solve_mat(&rhs); // (m_k, p_out)
+        if !b_k.iter().all(|v| v.is_finite()) {
+            return Err("sae_residual_seed_logits: non-finite LSQ solution".to_string());
+        }
+        let fitted = phi.dot(&b_k); // (N, p_out)
+        for row in 0..n_obs {
+            let mut e = 0.0_f64;
+            for col in 0..p_out {
+                let d = z[[row, col]] - fitted[[row, col]];
+                e += d * d;
+            }
+            resid[[row, atom_idx]] = e;
+        }
+    }
+    // Convert per-row residuals to logits relative to each row's own scale so
+    // the head start is dimensionless. The best atom (lowest residual) gets the
+    // highest logit; ties cancel. Normalise by the row's mean residual across
+    // atoms (with a floor relative to the dataset to keep near-zero-energy rows
+    // well posed) so the spread is O(gain) regardless of output magnitude.
+    let mut global_mean = 0.0_f64;
+    for row in 0..n_obs {
+        for k in 0..k_atoms {
+            global_mean += resid[[row, k]];
+        }
+    }
+    global_mean /= (n_obs * k_atoms) as f64;
+    let floor = (global_mean * 1.0e-6).max(1.0e-12);
+    for row in 0..n_obs {
+        let mut row_mean = 0.0_f64;
+        for k in 0..k_atoms {
+            row_mean += resid[[row, k]];
+        }
+        row_mean = (row_mean / k_atoms as f64).max(floor);
+        for k in 0..k_atoms {
+            logits[[row, k]] = -gain * resid[[row, k]] / row_mean;
+        }
+    }
+    Ok(logits)
+}
+
 fn sae_decoder_lsq_init(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -11076,6 +11207,25 @@ fn sae_manifold_fit_minimal<'py>(
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
+    // Data-driven asymmetric cold-start seed (issue #629). A uniform logit
+    // init is an exact symmetric saddle for K>=2 exchangeable atoms under
+    // softmax / IBP-MAP, so the fit never routes and the decoder overfits
+    // through the frozen uniform mixture. Replace the saddle with one EM-style
+    // M-then-E step on the seed geometry: prefer the atom that best
+    // reconstructs each row. JumpReLU keeps its margin-above-threshold seed
+    // (its degeneracy is a closed gate, not a routing tie), and warm-started
+    // logits are left exactly as supplied.
+    if logits_are_cold && k_atoms > 1 && matches!(assignment_kind.as_str(), "softmax" | "ibp_map") {
+        const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
+        let residual_logits = sae_residual_seed_logits(
+            basis_values.view(),
+            &basis_sizes,
+            z_view,
+            SAE_RESIDUAL_SEED_GAIN,
+        )
+        .map_err(py_value_error)?;
+        initial_logits = residual_logits;
+    }
     // Wire `random_state` into the optimizer init: jitter the initial
     // assignment logits with a tiny, seed-keyed deterministic perturbation
     // so different seeds explore different Newton trajectories (issue #178).
@@ -11528,6 +11678,7 @@ fn sae_manifold_predict_oos<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+<<<<<<< HEAD
     if !logits_are_warm && assignment_kind == "softmax" {
         let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
         let mut decoded = vec![0.0_f64; p_out];
@@ -11548,6 +11699,8 @@ fn sae_manifold_predict_oos<'py>(
         }
         term.assignment.logits.assign(&seeded_logits);
     }
+=======
+>>>>>>> origin/main
     let log_ard: Vec<Array1<f64>> = effective_atom_dim
         .iter()
         .map(|&d| Array1::<f64>::zeros(d))
@@ -12182,6 +12335,541 @@ fn gaussian_reml_fit_latent_backward<'py>(
     } else {
         out.set_item("grad_dim_selection_log_precision", py.None())?;
     }
+    Ok(out.unbind())
+}
+
+/// Owned inputs for the latent outer-optimization objective.
+///
+/// Bundles the data the value/gradient evaluation needs so a single struct can
+/// be reused across trust-region iterations and restarts without re-copying
+/// from Python.
+struct LatentOuterProblem {
+    y: Array2<f64>,
+    centers: Array2<f64>,
+    penalty: Array2<f64>,
+    weights: Option<Array1<f64>>,
+    aux_u: Option<Array2<f64>>,
+    dim_selection: Option<Array1<f64>>,
+    family: AuxPriorFamily,
+    aux_strength: Option<f64>,
+    init_lambda: Option<f64>,
+    sigma_eff_mode: SigmaEffMode,
+    n_obs: usize,
+    latent_dim: usize,
+    m: usize,
+    basis_kind: String,
+    tensor_knots: Option<Array1<f64>>,
+    tensor_knot_offsets: Option<Vec<usize>>,
+    tensor_degrees: Option<Vec<usize>>,
+}
+
+impl LatentOuterProblem {
+    /// REML score (inner Gaussian REML plus aux/dim identifiability priors) and,
+    /// when `want_grad`, the outer latent gradient `∂(reml_score)/∂t`.
+    ///
+    /// The value reproduces [`gaussian_reml_fit_latent`]'s `reml_score` and the
+    /// gradient reproduces [`gaussian_reml_fit_latent_backward`]'s `grad_t` at
+    /// `grad_reml_score = 1`, so the optimizer descends exactly the quantity the
+    /// forward primitive reports. A non-finite or unsolvable configuration maps
+    /// to `+∞` with no gradient, which the trust region rejects rather than
+    /// propagating a NaN into the inner adjoint.
+    fn value_and_grad(
+        &self,
+        t_flat: ArrayView1<'_, f64>,
+        want_grad: bool,
+    ) -> (f64, Option<Array1<f64>>) {
+        match self.try_value_and_grad(t_flat, want_grad) {
+            Ok(pair) => pair,
+            Err(_) => (f64::INFINITY, None),
+        }
+    }
+
+    fn try_value_and_grad(
+        &self,
+        t_flat: ArrayView1<'_, f64>,
+        want_grad: bool,
+    ) -> Result<(f64, Option<Array1<f64>>), String> {
+        let (design, t_mat, jet) = build_latent_forward_design(
+            &self.basis_kind,
+            t_flat,
+            self.n_obs,
+            self.latent_dim,
+            self.centers.view(),
+            self.m,
+            self.tensor_knots.as_ref().map(|a| a.view()),
+            self.tensor_knot_offsets.as_deref(),
+            self.tensor_degrees.as_deref(),
+        )?;
+        let weights_view = self.weights.as_ref().map(|w| w.view());
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            design.view(),
+            self.y.view(),
+            self.penalty.view(),
+            weights_view,
+            self.init_lambda,
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        let (prior_score, _aux_state) = latent_prior_score_and_aux_state_for_t(
+            t_mat.view(),
+            self.aux_u.as_ref().map(|a| a.view()),
+            self.family,
+            self.aux_strength,
+            self.dim_selection.as_ref().map(|a| a.view()),
+        )?;
+        let value = fit.reml_score + prior_score;
+        if !value.is_finite() {
+            return Ok((f64::INFINITY, None));
+        }
+        if !want_grad {
+            return Ok((value, None));
+        }
+        let mut grad_t = Array1::<f64>::zeros(self.n_obs * self.latent_dim);
+        add_latent_outer_reml_score_gradient(
+            &mut grad_t,
+            1.0,
+            design.view(),
+            self.y.view(),
+            t_mat.view(),
+            &jet,
+            self.penalty.view(),
+            weights_view,
+            &fit,
+            self.sigma_eff_mode,
+        )?;
+        // Identifiability-prior contributions, identical to the backward path's
+        // grad_t assembly at `grad_reml_score = 1`.
+        if let Some(u_arr) = self.aux_u.as_ref() {
+            let u_view = u_arr.view();
+            let stats =
+                latent_aux_prior_stats(t_mat.view(), u_view, self.family, self.aux_strength)?;
+            let residual = &t_mat - &stats.targets;
+            let projected_residual = aux_prior_targets(residual.view(), u_view, self.family)?;
+            let grad_base = residual - projected_residual;
+            for n in 0..self.n_obs {
+                for a in 0..self.latent_dim {
+                    grad_t[n * self.latent_dim + a] += stats.strength.mu * grad_base[[n, a]];
+                }
+            }
+        }
+        if let Some(log_prec) = self.dim_selection.as_ref() {
+            for n in 0..self.n_obs {
+                for a in 0..self.latent_dim {
+                    let prec = log_prec[a].exp();
+                    grad_t[n * self.latent_dim + a] += prec * t_mat[[n, a]];
+                }
+            }
+        }
+        if !grad_t.iter().all(|value| value.is_finite()) {
+            return Ok((f64::INFINITY, None));
+        }
+        Ok((value, Some(grad_t)))
+    }
+}
+
+/// Adapter exposing [`LatentOuterProblem`] to the Riemannian trust region.
+struct LatentOuterObjective<'a> {
+    problem: &'a LatentOuterProblem,
+}
+
+impl gam::geometry::RiemannianObjective for LatentOuterObjective<'_> {
+    fn value_gradient(
+        &mut self,
+        point: ArrayView1<'_, f64>,
+    ) -> gam::geometry::GeometryResult<(f64, Array1<f64>)> {
+        // A degenerate point yields `+∞` and a zero gradient: the trust region
+        // reads a zero gradient at the start as "stationary" (it stops at the
+        // finite init) and a `+∞` trial value as a rejected step (it shrinks).
+        match self.problem.value_and_grad(point, true) {
+            (value, Some(grad)) => Ok((value, grad)),
+            (_, None) => Ok((f64::INFINITY, Array1::<f64>::zeros(point.len()))),
+        }
+    }
+}
+
+/// Build the manifold the outer optimizer walks `t` on. `manifold` names the
+/// per-observation geometry; the full latent lives on the `n_obs`-fold product.
+fn build_latent_outer_manifold(
+    manifold: &str,
+    n_obs: usize,
+    latent_dim: usize,
+) -> Result<Box<dyn gam::geometry::RiemannianManifold>, String> {
+    let per_point = match manifold.to_ascii_lowercase().replace('-', "_").as_str() {
+        "euclidean" | "rn" => {
+            // One flat Euclidean block over the whole latent is equivalent to
+            // the product and avoids the per-observation slicing overhead.
+            return Ok(Box::new(gam::geometry::EuclideanManifold::new(
+                n_obs * latent_dim,
+            )));
+        }
+        "circle" | "s1" => {
+            if latent_dim != 1 {
+                return Err(format!(
+                    "circle latent manifold requires latent_dim == 1; got {latent_dim}"
+                ));
+            }
+            gam::geometry::ManifoldSpec::Circle
+        }
+        "sphere" => {
+            if latent_dim < 2 {
+                return Err(format!(
+                    "sphere latent manifold requires latent_dim >= 2 (S^{{d-1}} embeds in R^d); got {latent_dim}"
+                ));
+            }
+            gam::geometry::ManifoldSpec::Sphere {
+                intrinsic_dim: latent_dim - 1,
+            }
+        }
+        "torus" => gam::geometry::ManifoldSpec::Torus { dim: latent_dim },
+        other => {
+            return Err(format!(
+                "unknown latent manifold {other:?}; expected one of euclidean|circle|sphere|torus"
+            ));
+        }
+    };
+    let parts = std::iter::repeat_with(|| per_point.clone())
+        .take(n_obs)
+        .collect();
+    gam::geometry::ManifoldSpec::Product(parts)
+        .build()
+        .map_err(|err| err.to_string())
+}
+
+/// Build the restart-0 start for the latent outer optimizer from a spectral
+/// (Laplacian-eigenmaps) embedding of the responses `y`.
+///
+/// The embedding recovers the intrinsic coordinate up to monotone/rotation
+/// gauge; each axis is then affinely mapped from `[0, 1]` onto the span of the
+/// decoder `centers` for that axis so the seed lands where the basis `Φ` is
+/// well-conditioned. The seed is defined for the flat Euclidean latent (the
+/// default manifold); on a curved latent manifold (circle/sphere/torus) the
+/// embedding's scale and gauge are not directly comparable, so the caller's `t`
+/// is used unchanged and the optimizer relies on the caller's warm start.
+fn latent_spectral_seed_start(
+    y: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    manifold: &str,
+    n_obs: usize,
+    latent_dim: usize,
+    seed_neighbors: usize,
+    caller_t: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let manifold_norm = manifold.to_ascii_lowercase().replace('-', "_");
+    if !matches!(manifold_norm.as_str(), "euclidean" | "rn") {
+        return Ok(caller_t.to_owned());
+    }
+    if y.nrows() != n_obs {
+        return Err(format!(
+            "spectral seed: y has {} rows but n_obs = {n_obs}",
+            y.nrows()
+        ));
+    }
+    // Too few rows to expose `latent_dim` non-trivial modes: fall back to the
+    // caller's start rather than failing the whole optimize call.
+    if n_obs < latent_dim + 2 {
+        return Ok(caller_t.to_owned());
+    }
+    let coords = gam::geometry::laplacian_eigenmap_coords(y, latent_dim, seed_neighbors)?;
+    // Per-axis target span from the decoder centers; fall back to [0, 1] when an
+    // axis has no corresponding center column or a degenerate span.
+    let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
+    for a in 0..latent_dim {
+        let (lo, hi) = if a < centers.ncols() {
+            let col = centers.column(a);
+            let lo = col.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if lo.is_finite() && hi.is_finite() && hi > lo {
+                (lo, hi)
+            } else {
+                (0.0, 1.0)
+            }
+        } else {
+            (0.0, 1.0)
+        };
+        for n in 0..n_obs {
+            start[n * latent_dim + a] = lo + coords[[n, a]] * (hi - lo);
+        }
+    }
+    Ok(start)
+}
+
+/// Optimize the latent coordinate `t` against the Gaussian-REML objective.
+///
+/// Unlike [`gaussian_reml_fit_latent`], which performs a single `β | t` inner
+/// solve at a fixed `t`, this routine runs the *outer* latent optimization: it
+/// minimizes the REML score over `t` with a Riemannian trust region driven by
+/// the analytic `∂(reml_score)/∂t` (the same gradient
+/// [`gaussian_reml_fit_latent_backward`] returns), retracting each accepted
+/// step onto `manifold`. It returns the full REML fit dictionary *at the
+/// converged latent* plus the optimized `t`/`latent` arrays.
+///
+/// The latent REML objective is non-convex (a GP-LVM-style coordinate problem),
+/// so a single cold random start may settle in a poor local optimum. By default
+/// (`init="spectral"`) restart 0 starts from a Laplacian-eigenmaps embedding of
+/// the responses, which recovers the intrinsic coordinate up to gauge and lets
+/// the optimizer polish it to the global fit instead of sorting rows from
+/// scratch; the passed-in `t` is then only a fallback (too few rows, or a
+/// non-Euclidean `manifold`). Pass `init="caller"` to start from `t` unchanged
+/// (a pure local solve / explicit warm start), and `n_restarts > 1` to also
+/// optimize from perturbed starts and keep the lowest-score result.
+#[pyfunction(signature = (
+    t,
+    y,
+    n_obs,
+    latent_dim,
+    centers,
+    penalty,
+    m = 2,
+    weights = None,
+    fisher_w = None,
+    init_lambda = None,
+    aux_u = None,
+    aux_family = "ridge".to_string(),
+    aux_strength = None,
+    dim_selection_log_precision = None,
+    basis_kind = "duchon".to_string(),
+    tensor_knots_concat = None,
+    tensor_knot_offsets = None,
+    tensor_degrees = None,
+    manifold = "euclidean".to_string(),
+    sigma_eff_mode = "profiled".to_string(),
+    max_iter = 200,
+    grad_tol = 1.0e-8,
+    trust_radius = 1.0,
+    max_radius = 1.0e6,
+    n_restarts = 1,
+    restart_scale = 0.25,
+    seed = 0,
+    init = "spectral".to_string(),
+    seed_neighbors = 10,
+))]
+fn gaussian_reml_optimize_latent<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    y: PyReadonlyArray2<'py, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty: PyReadonlyArray2<'py, f64>,
+    m: usize,
+    weights: Option<PyReadonlyArray1<'py, f64>>,
+    fisher_w: Option<PyReadonlyArray3<'py, f64>>,
+    init_lambda: Option<f64>,
+    aux_u: Option<PyReadonlyArray2<'py, f64>>,
+    aux_family: String,
+    aux_strength: Option<f64>,
+    dim_selection_log_precision: Option<PyReadonlyArray1<'py, f64>>,
+    basis_kind: String,
+    tensor_knots_concat: Option<PyReadonlyArray1<'py, f64>>,
+    tensor_knot_offsets: Option<Vec<usize>>,
+    tensor_degrees: Option<Vec<usize>>,
+    manifold: String,
+    sigma_eff_mode: String,
+    max_iter: usize,
+    grad_tol: f64,
+    trust_radius: f64,
+    max_radius: f64,
+    n_restarts: usize,
+    restart_scale: f64,
+    seed: u64,
+    init: String,
+    seed_neighbors: usize,
+) -> PyResult<Py<PyDict>> {
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+
+    let family = match aux_family.to_ascii_lowercase().as_str() {
+        "ridge" => AuxPriorFamily::Ridge,
+        "linear" => AuxPriorFamily::Linear,
+        other => {
+            return Err(py_value_error(format!(
+                "aux_family must be 'ridge' or 'linear'; got {other:?}"
+            )));
+        }
+    };
+    let sigma_eff_mode = SigmaEffMode::parse(&sigma_eff_mode).map_err(py_value_error)?;
+    if n_restarts == 0 {
+        return Err(py_value_error("n_restarts must be at least 1".to_string()));
+    }
+    let expected = n_obs
+        .checked_mul(latent_dim)
+        .ok_or_else(|| py_value_error("n_obs * latent_dim overflows usize".to_string()))?;
+    let t_values = t.as_array().to_owned();
+    if t_values.len() != expected {
+        return Err(py_value_error(format!(
+            "t length {} must equal n_obs * latent_dim = {expected}",
+            t_values.len()
+        )));
+    }
+    // Choose the base start for restart 0 (further restarts perturb it). A
+    // spectral seed escapes the random-init local optimum that leaves the outer
+    // optimizer stuck (#627); `"caller"` keeps the passed-in `t` unchanged for
+    // callers that already have a good warm start or want a pure local solve.
+    let base_start = match init.to_ascii_lowercase().as_str() {
+        "caller" | "warm" | "passthrough" => t_values.clone(),
+        "spectral" | "laplacian" | "eigenmap" => latent_spectral_seed_start(
+            y.as_array(),
+            centers.as_array(),
+            &manifold,
+            n_obs,
+            latent_dim,
+            seed_neighbors,
+            t_values.view(),
+        )
+        .map_err(py_value_error)?,
+        other => {
+            return Err(py_value_error(format!(
+                "init must be 'spectral' or 'caller'; got {other:?}"
+            )));
+        }
+    };
+    let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
+    let fisher_values = fisher_w.as_ref().map(|w| w.as_array().to_owned());
+    let effective_weights = latent_scalar_weights_with_fisher(
+        n_obs,
+        weight_values.as_ref().map(|w| w.view()),
+        fisher_values.as_ref().map(|w| w.view()),
+    )
+    .map_err(py_value_error)?;
+    let dim_selection_values = dim_selection_log_precision
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
+    let tensor_knots_values = tensor_knots_concat
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
+
+    let problem = LatentOuterProblem {
+        y: y.as_array().to_owned(),
+        centers: centers.as_array().to_owned(),
+        penalty: penalty.as_array().to_owned(),
+        weights: effective_weights,
+        aux_u: aux_u.as_ref().map(|a| a.as_array().to_owned()),
+        dim_selection: dim_selection_values,
+        family,
+        aux_strength,
+        init_lambda,
+        sigma_eff_mode,
+        n_obs,
+        latent_dim,
+        m,
+        basis_kind,
+        tensor_knots: tensor_knots_values,
+        tensor_knot_offsets,
+        tensor_degrees,
+    };
+
+    let manifold_box =
+        build_latent_outer_manifold(&manifold, n_obs, latent_dim).map_err(py_value_error)?;
+    let trust_region = gam::geometry::RiemannianTrustRegion {
+        radius: trust_radius,
+        max_radius,
+        max_iter,
+        grad_tol,
+    };
+
+    // Restart 0 starts from `base_start` (the spectral seed, or the caller's `t`
+    // when `init="caller"`); further restarts perturb it in the tangent space and
+    // retract back onto the manifold, then we keep the lowest-score latent.
+    let (best_t, best_value) = py
+        .detach(|| -> Result<(Array1<f64>, f64), String> {
+            let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
+            let normal = rand_distr::Normal::new(0.0, restart_scale.abs().max(f64::MIN_POSITIVE))
+                .map_err(|err| err.to_string())?;
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let mut best: Option<(Array1<f64>, f64)> = None;
+            for restart in 0..n_restarts {
+                let start = if restart == 0 {
+                    base_start.clone()
+                } else {
+                    let noise =
+                        Array1::from_shape_fn(base_start.len(), |_| normal.sample(&mut rng));
+                    let tangent = manifold_ref
+                        .project_tangent(base_start.view(), noise.view())
+                        .map_err(|err| err.to_string())?;
+                    manifold_ref
+                        .retract(base_start.view(), tangent.view())
+                        .map_err(|err| err.to_string())?
+                };
+                let mut objective = LatentOuterObjective { problem: &problem };
+                let optimized = trust_region
+                    .minimize(manifold_ref, &mut objective, start.view())
+                    .map_err(|err| err.to_string())?;
+                let (value, _) = problem.value_and_grad(optimized.view(), false);
+                let improved = best.as_ref().map(|(_, b)| value < *b).unwrap_or(true);
+                if improved {
+                    best = Some((optimized, value));
+                }
+            }
+            best.ok_or_else(|| "no restart produced a latent".to_string())
+        })
+        .map_err(py_value_error)?;
+
+    // Final gradient norm at the chosen latent, as a convergence diagnostic.
+    let (_, final_grad) = problem.value_and_grad(best_t.view(), true);
+    let grad_t_norm = final_grad
+        .as_ref()
+        .map(|g| g.iter().map(|v| v * v).sum::<f64>().sqrt())
+        .unwrap_or(f64::INFINITY);
+
+    // Rebuild the full fit dictionary at the converged latent so callers get the
+    // identical schema [`gaussian_reml_fit_latent`] returns, then echo `t`. The
+    // detached fit closure must be `'static`, so move owned copies in (the
+    // problem's array buffers are no longer needed on this thread afterwards).
+    let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
+    let LatentOuterProblem {
+        y,
+        centers,
+        penalty,
+        weights,
+        aux_u,
+        dim_selection,
+        basis_kind,
+        tensor_knots,
+        tensor_knot_offsets,
+        tensor_degrees,
+        ..
+    } = problem;
+    let best_t_for_fit = best_t.clone();
+    let (fit, _design, aux_strength_state) =
+        detach_py_result(py, "gaussian_reml_optimize_latent", move || {
+            let registry = build_analytic_penalty_registry_from_json(Some(&latent_payload), None)?;
+            gaussian_reml_fit_latent_impl(
+                best_t_for_fit.view(),
+                y.view(),
+                n_obs,
+                latent_dim,
+                centers.view(),
+                m,
+                &basis_kind,
+                tensor_knots.as_ref().map(|a| a.view()),
+                tensor_knot_offsets.as_deref(),
+                tensor_degrees.as_deref(),
+                penalty.view(),
+                weights.as_ref().map(|w| w.view()),
+                init_lambda,
+                aux_u.as_ref().map(|a| a.view()),
+                family,
+                aux_strength,
+                dim_selection.as_ref().map(|a| a.view()),
+                Some(&registry),
+            )
+        })?;
+
+    let out = PyDict::new(py);
+    set_ok_gaussian_reml_items(py, &out, fit)?;
+    set_aux_strength_items(py, &out, aux_strength_state)?;
+    let t_matrix = best_t
+        .clone()
+        .into_shape_with_order((n_obs, latent_dim))
+        .map_err(|err| py_value_error(err.to_string()))?;
+    out.set_item("t", t_matrix.clone().into_pyarray(py))?;
+    out.set_item("latent", t_matrix.into_pyarray(py))?;
+    out.set_item("t_flat", best_t.into_pyarray(py))?;
+    out.set_item("grad_t_norm", grad_t_norm)?;
+    out.set_item("converged", grad_t_norm <= grad_tol)?;
+    out.set_item("objective_value", best_value)?;
+    out.set_item("n_restarts", n_restarts)?;
+    out.set_item("init", init)?;
     Ok(out.unbind())
 }
 
@@ -22040,6 +22728,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(gaussian_reml_fit_latent, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_reml_optimize_latent, module)?)?;
     module.add_function(wrap_pyfunction!(register_analytic_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_value_grad, module)?)?;
     module.add_function(wrap_pyfunction!(analytic_penalty_hvp, module)?)?;
@@ -23978,7 +24667,7 @@ fn predict_columns(
 /// Residual dispersion `φ̂` for the conformal calibration scale, mirroring the
 /// CLI/summary convention: Gaussian → σ̂², Gamma → fixed φ (else 1/σ̂ as the
 /// reciprocal-dispersion proxy), every other family → 1.0 (φ fixed at 1).
-fn conformal_dispersion_phi(fit: &UnifiedFitResult, family: &LikelihoodSpec) -> f64 {
+fn conformal_dispersion_phi(fit: &gam::estimate::UnifiedFitResult, family: &LikelihoodSpec) -> f64 {
     match family.response {
         ResponseFamily::Gaussian => fit.standard_deviation * fit.standard_deviation,
         ResponseFamily::Gamma => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
@@ -23999,7 +24688,7 @@ fn conformal_dispersion_phi(fit: &UnifiedFitResult, family: &LikelihoodSpec) -> 
 /// dataset (calibration is *labeled* held-out data, unlike a predict batch).
 fn conformal_calibration_arrays(
     model: &FittedModel,
-    fit: &UnifiedFitResult,
+    fit: &gam::estimate::UnifiedFitResult,
     calibration: EncodedDataset,
 ) -> Result<(Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>), String> {
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
@@ -26006,7 +26695,10 @@ fn representative_data_from_ranges(ranges: &[(f64, f64)]) -> Array2<f64> {
 /// rebuilt — e.g. a model saved without `resolved_termspec` or training feature
 /// ranges — so `summary()` always succeeds and simply omits the table when the
 /// information needed to compute it honestly is not available.
-fn summary_smooth_terms(model: &FittedModel, fit: &UnifiedFitResult) -> Vec<SummarySmoothTermRow> {
+fn summary_smooth_terms(
+    model: &FittedModel,
+    fit: &gam::estimate::UnifiedFitResult,
+) -> Vec<SummarySmoothTermRow> {
     use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
     use gam::smooth::ShapeConstraint;
 
@@ -31121,6 +31813,105 @@ mod tests {
         assert!(
             r2 > 0.5,
             "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain most of the signal"
+        );
+    }
+
+    /// Regression test for issue #629: the cold-start residual seed must break
+    /// the symmetric saddle of a uniform logit init by preferring, per row, the
+    /// atom whose seed geometry best reconstructs that row. Planted: two
+    /// periodic atoms with distinct seed phases driving disjoint output blocks
+    /// with known one-hot routing. The seed logits must (a) not be uniform and
+    /// (b) argmax-route most rows to their generating atom.
+    #[test]
+    fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
+        use ndarray::Array3;
+        let n = 64usize;
+        let p = 4usize;
+        let k = 2usize;
+        let m = 3usize;
+        let two_pi = std::f64::consts::TAU;
+        // Distinct seed phase per atom — mimics the PCA seed handing each
+        // periodic atom a different coordinate frame.
+        let phase = [0.0_f64, 0.3_f64];
+        // Deterministic pseudo-random latent + balanced shuffled routing.
+        let mut t = vec![0.0_f64; n];
+        let mut assign = vec![0usize; n];
+        let mut state = 0x1234_5678_9abc_def0_u64;
+        for i in 0..n {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            t[i] = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
+            assign[i] = if i < n / 2 { 0 } else { 1 };
+        }
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (state >> 33) as usize % (i + 1);
+            assign.swap(i, j);
+        }
+        // Per-atom seed basis (N, m) padded into (K, N, m).
+        let mut basis = Array3::<f64>::zeros((k, n, m));
+        for atom_idx in 0..k {
+            for i in 0..n {
+                let a = two_pi * (t[i] + phase[atom_idx]);
+                basis[[atom_idx, i, 0]] = 1.0;
+                basis[[atom_idx, i, 1]] = a.sin();
+                basis[[atom_idx, i, 2]] = a.cos();
+            }
+        }
+        // Disjoint decoder blocks: atom 0 -> cols [0,1], atom 1 -> cols [2,3].
+        let mut blocks = vec![Array2::<f64>::zeros((m, p)); k];
+        blocks[0][[1, 0]] = 1.5;
+        blocks[0][[2, 1]] = -1.2;
+        blocks[1][[1, 2]] = 1.3;
+        blocks[1][[2, 3]] = 0.9;
+        let mut z = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let kk = assign[i];
+            for j in 0..p {
+                let mut acc = 0.0;
+                for col in 0..m {
+                    acc += basis[[kk, i, col]] * blocks[kk][[col, j]];
+                }
+                z[[i, j]] = acc;
+            }
+        }
+        let basis_sizes = vec![m; k];
+        let logits = sae_residual_seed_logits(basis.view(), &basis_sizes, z.view(), 4.0)
+            .expect("residual seed must succeed");
+        assert_eq!(logits.shape(), &[n, k]);
+        assert!(logits.iter().all(|v| v.is_finite()));
+
+        // (a) Symmetry must be broken: at least one row has a non-trivial gap.
+        let max_gap = (0..n)
+            .map(|i| (logits[[i, 0]] - logits[[i, 1]]).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_gap > 0.3,
+            "residual seed left a near-symmetric logit field (max gap {max_gap:.4}); \
+             the uniform saddle would not be escaped"
+        );
+
+        // (b) The seed must route most rows to their generating atom, up to
+        // the trivial atom-label permutation.
+        let mut acc_direct = 0usize;
+        for i in 0..n {
+            let winner = if logits[[i, 0]] >= logits[[i, 1]] {
+                0
+            } else {
+                1
+            };
+            if winner == assign[i] {
+                acc_direct += 1;
+            }
+        }
+        let acc = (acc_direct.max(n - acc_direct)) as f64 / n as f64;
+        assert!(
+            acc >= 0.9,
+            "residual seed routing accuracy {acc:.3} (up to permutation) is too low; \
+             the E-step seed should recover the planted one-hot assignment"
         );
     }
 }
