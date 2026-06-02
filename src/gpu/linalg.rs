@@ -122,6 +122,23 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
     if admit { Some(runtime) } else { None }
 }
 
+/// Minimum batch size before a batched kernel is worth splitting across more
+/// than one device. Below this the per-tile launch + extra H2D/D2H staging on a
+/// second device costs more than the GEMM time it saves, so a small batch stays
+/// on the single primary device. This is a fixed, conservatively-large constant
+/// (magic-by-default; no flag) — multi-GPU only kicks in for genuinely large
+/// batches such as biobank-scale Arrow-Schur / Stage-3 blocks.
+#[cfg(target_os = "linux")]
+const MULTI_GPU_BATCH_FLOOR: usize = 64;
+
+/// True when the pool has >1 usable device and `batch` is large enough that
+/// splitting the batch dimension across devices is worthwhile.
+#[cfg(target_os = "linux")]
+#[inline]
+fn should_split_batch(batch: usize) -> bool {
+    GpuRuntime::global().is_some_and(|rt| rt.device_count() > 1) && batch >= MULTI_GPU_BATCH_FLOOR
+}
+
 #[inline]
 #[must_use]
 pub fn try_fast_ab_broadcast_b_batched(
@@ -140,8 +157,53 @@ pub fn try_fast_ab_broadcast_b_batched(
     #[cfg(target_os = "linux")]
     {
         let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
-        cuda_backend::gemm_broadcast_b_batched(runtime, a, b)
+        if should_split_batch(batch) {
+            if let Some(out) = scatter_broadcast_b_batched(runtime, a, b, m, n) {
+                return Some(out);
+            }
+            // A multi-GPU tile failed; fall through to the single-device path so
+            // the whole batch is still produced on the primary device.
+        }
+        cuda_backend::gemm_broadcast_b_batched(runtime.device.ordinal, a, b)
     }
+}
+
+/// Multi-GPU broadcast-B batched GEMM: split the batch dimension across all
+/// devices via [`scatter_batched`], running one cuBLAS strided-batched GEMM per
+/// device tile (each on its own bound ordinal). `b` is shared (broadcast) across
+/// every tile. Returns `None` if any tile fails so the caller falls back to the
+/// single-device path.
+#[cfg(target_os = "linux")]
+fn scatter_broadcast_b_batched(
+    runtime: &GpuRuntime,
+    a: ArrayView3<'_, f64>,
+    b: ArrayView2<'_, f64>,
+    m: usize,
+    n: usize,
+) -> Option<Array3<f64>> {
+    let batch = a.dim().0;
+    // One slot per batch item; the slot carries its own input matrix so the
+    // per-tile closure is range-agnostic and owns disjoint memory.
+    let mut items: Vec<(Array2<f64>, Option<Array2<f64>>)> = (0..batch)
+        .map(|i| (a.index_axis(ndarray::Axis(0), i).to_owned(), None))
+        .collect();
+    super::pool::scatter_batched(runtime, &mut items, |ordinal, tile| {
+        let tile_batch = tile.len();
+        if tile_batch == 0 {
+            return Some(());
+        }
+        let k = b.dim().0;
+        let mut a_tile = Array3::<f64>::zeros((tile_batch, m, k));
+        for (idx, (a_i, _)) in tile.iter().enumerate() {
+            a_tile.index_axis_mut(ndarray::Axis(0), idx).assign(a_i);
+        }
+        let out = cuda_backend::gemm_broadcast_b_batched(ordinal, a_tile.view(), b)?;
+        for (idx, (_, slot)) in tile.iter_mut().enumerate() {
+            *slot = Some(out.index_axis(ndarray::Axis(0), idx).to_owned());
+        }
+        Some(())
+    })?;
+    stitch_batched(items, m, n)
 }
 
 #[inline]
@@ -162,8 +224,79 @@ pub fn try_fast_abt_strided_batched(
     #[cfg(target_os = "linux")]
     {
         let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
-        cuda_backend::gemm_abt_strided_batched(runtime, a, b)
+        if should_split_batch(batch) {
+            if let Some(out) = scatter_abt_strided_batched(runtime, a, b, m, n) {
+                return Some(out);
+            }
+        }
+        cuda_backend::gemm_abt_strided_batched(runtime.device.ordinal, a, b)
     }
+}
+
+/// Multi-GPU A·Bᵀ strided-batched GEMM: split the batch dimension across all
+/// devices, running one strided-batched GEMM per device tile. Both `a` and `b`
+/// are batched (one matrix per batch item), so each slot carries its own
+/// `(a_i, b_i)` pair. Returns `None` on any tile failure.
+#[cfg(target_os = "linux")]
+fn scatter_abt_strided_batched(
+    runtime: &GpuRuntime,
+    a: ArrayView3<'_, f64>,
+    b: ArrayView3<'_, f64>,
+    m: usize,
+    n: usize,
+) -> Option<Array3<f64>> {
+    let batch = a.dim().0;
+    let mut items: Vec<(Array2<f64>, Array2<f64>, Option<Array2<f64>>)> = (0..batch)
+        .map(|i| {
+            (
+                a.index_axis(ndarray::Axis(0), i).to_owned(),
+                b.index_axis(ndarray::Axis(0), i).to_owned(),
+                None,
+            )
+        })
+        .collect();
+    super::pool::scatter_batched(runtime, &mut items, |ordinal, tile| {
+        let tile_batch = tile.len();
+        if tile_batch == 0 {
+            return Some(());
+        }
+        let k = tile[0].0.dim().1;
+        let mut a_tile = Array3::<f64>::zeros((tile_batch, m, k));
+        let mut b_tile = Array3::<f64>::zeros((tile_batch, n, k));
+        for (idx, (a_i, b_i, _)) in tile.iter().enumerate() {
+            a_tile.index_axis_mut(ndarray::Axis(0), idx).assign(a_i);
+            b_tile.index_axis_mut(ndarray::Axis(0), idx).assign(b_i);
+        }
+        let out = cuda_backend::gemm_abt_strided_batched(ordinal, a_tile.view(), b_tile.view())?;
+        for (idx, (_, _, slot)) in tile.iter_mut().enumerate() {
+            *slot = Some(out.index_axis(ndarray::Axis(0), idx).to_owned());
+        }
+        Some(())
+    })?;
+    let slots: Vec<((), Option<Array2<f64>>)> =
+        items.into_iter().map(|(_, _, slot)| ((), slot)).collect();
+    stitch_batched(slots, m, n)
+}
+
+/// Reassemble per-batch output slots (filled by the device tiles) into a single
+/// `batch × m × n` array. Returns `None` if any slot is still empty (a tile
+/// silently skipped its item), which forces the single-device fallback.
+#[cfg(target_os = "linux")]
+fn stitch_batched<L>(
+    items: Vec<(L, Option<Array2<f64>>)>,
+    m: usize,
+    n: usize,
+) -> Option<Array3<f64>> {
+    let batch = items.len();
+    let mut out = Array3::<f64>::zeros((batch, m, n));
+    for (idx, (_, slot)) in items.into_iter().enumerate() {
+        let block = slot?;
+        if block.dim() != (m, n) {
+            return None;
+        }
+        out.index_axis_mut(ndarray::Axis(0), idx).assign(&block);
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -384,11 +517,22 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
     }
     #[cfg(target_os = "linux")]
     {
-        let runtime = route_through_gpu(DispatchOp::Potrf {
-            p,
-            batch: matrices.len(),
-        })?;
-        cuda_backend::cholesky_batched_lower(runtime, matrices)
+        let batch = matrices.len();
+        let runtime = route_through_gpu(DispatchOp::Potrf { p, batch })?;
+        if should_split_batch(batch) {
+            // `matrices` is already the per-item slice, so the batch dimension
+            // tiles directly onto `scatter_batched`: each device factors its own
+            // contiguous block of matrices in place. On any tile failure the
+            // whole batch is re-run on the primary device for determinism (the
+            // factored tiles are overwritten by the single-device pass).
+            let split = super::pool::scatter_batched(runtime, matrices, |ordinal, tile| {
+                cuda_backend::cholesky_batched_lower(ordinal, tile)
+            });
+            if split.is_some() {
+                return Some(());
+            }
+        }
+        cuda_backend::cholesky_batched_lower(runtime.device.ordinal, matrices)
     }
 }
 
@@ -480,20 +624,20 @@ mod cuda_backend {
 
     #[inline]
     pub(super) fn gemm_broadcast_b_batched(
-        runtime: &GpuRuntime,
+        ordinal: usize,
         a: ArrayView3<'_, f64>,
         b: ArrayView2<'_, f64>,
     ) -> Option<Array3<f64>> {
-        super::super::blas::gemm_broadcast_b_batched_cuda(runtime, a, b)
+        super::super::blas::gemm_broadcast_b_batched_cuda(ordinal, a, b)
     }
 
     #[inline]
     pub(super) fn gemm_abt_strided_batched(
-        runtime: &GpuRuntime,
+        ordinal: usize,
         a: ArrayView3<'_, f64>,
         b: ArrayView3<'_, f64>,
     ) -> Option<Array3<f64>> {
-        super::super::blas::gemm_abt_strided_batched_cuda(runtime, a, b)
+        super::super::blas::gemm_abt_strided_batched_cuda(ordinal, a, b)
     }
 
     #[inline]
@@ -563,9 +707,12 @@ mod cuda_backend {
         Some(lower)
     }
 
+    /// Batched lower-Cholesky on a specific device ordinal. The ordinal's
+    /// context is expected to be bound on the calling thread (multi-GPU
+    /// `scatter_batched` worker or the single-device dispatcher).
     #[inline]
     pub(super) fn cholesky_batched_lower(
-        runtime: &GpuRuntime,
+        ordinal: usize,
         matrices: &mut [Array2<f64>],
     ) -> Option<()> {
         let first = matrices.first()?;
@@ -574,7 +721,7 @@ mod cuda_backend {
             return None;
         }
 
-        let stream = super::super::runtime::cuda_context_for(runtime.device.ordinal)?
+        let stream = super::super::runtime::cuda_context_for(ordinal)?
             .new_stream()
             .ok()?;
         let solver = DnHandle::new(stream.clone()).ok()?;
