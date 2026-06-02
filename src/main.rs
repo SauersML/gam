@@ -8547,17 +8547,6 @@ fn build_model_summary(
         ResponseFamily::Gaussian | ResponseFamily::Gamma
     );
     let residual_df = (y.len() as f64 - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0);
-    let dispersion_phi = match family.response {
-        ResponseFamily::Gaussian => fit.standard_deviation * fit.standard_deviation,
-        ResponseFamily::Gamma => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
-            if fit.standard_deviation.is_finite() && fit.standard_deviation > 0.0 {
-                1.0 / fit.standard_deviation
-            } else {
-                1.0
-            }
-        }),
-        _ => 1.0,
-    };
     let two_sided_parametric_p = |z: f64| -> Option<f64> {
         if !z.is_finite() {
             return None;
@@ -8743,7 +8732,6 @@ fn build_model_summary(
                     coeff_range: term.coeff_range.clone(),
                     edf,
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
-                    dispersion: dispersion_phi,
                     residual_df,
                     scale: if scale_is_estimated {
                         SmoothTestScale::Estimated

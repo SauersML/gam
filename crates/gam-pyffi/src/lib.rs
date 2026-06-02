@@ -26740,7 +26740,6 @@ fn summary_smooth_terms(
     let residual_df = n_obs
         .map(|n| (n - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0))
         .unwrap_or(f64::NAN);
-    let dispersion_phi = conformal_dispersion_phi(fit, &family);
     let scale = if scale_is_estimated {
         SmoothTestScale::Estimated
     } else {
@@ -26783,7 +26782,6 @@ fn summary_smooth_terms(
                     coeff_range: term.coeff_range.clone(),
                     edf,
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
-                    dispersion: dispersion_phi,
                     residual_df,
                     scale,
                 })

@@ -25,13 +25,17 @@ pub enum SmoothTestScale {
 /// Inputs to `wood_smooth_test`. `beta` is the full coefficient vector;
 /// the term block being tested is `beta[coeff_range]`. `covariance` is the
 /// matching posterior covariance Σ̂ (full p×p; the diagonal block is sliced
-/// out). `influence_matrix` is the optional coefficient-space influence
-/// `F = H⁻¹ X'WX`; when present `tr(F_jj)² / tr(F_jj²)` is used as the
-/// Wood-corrected reference d.f. `edf` is the smooth's effective d.f.
-/// (rank truncation for the penalized subblock); `nullspace_dim` is the
-/// fixed-effect (unpenalized) leading dimension within the block.
-/// `dispersion` is the residual variance estimate `φ̂`; `residual_df` is
-/// the matching denominator d.f. for the F branch.
+/// out). **`covariance` must be the scale-included posterior covariance**
+/// (mgcv `Vb`/`Vp`, i.e. `H⁻¹` already multiplied by the dispersion `φ̂`),
+/// so the Wald statistic `T = β̂'·Σ̂⁻·β̂` is dimensionless — the residual
+/// dispersion has already been divided out and the F-statistic is `T/ref_df`
+/// with *no* further `φ̂` factor. `influence_matrix` is the optional
+/// coefficient-space influence `F = H⁻¹ X'WX`; when present
+/// `tr(F_jj)² / tr(F_jj²)` is used as the Wood-corrected reference d.f.
+/// `edf` is the smooth's effective d.f. (rank truncation for the penalized
+/// subblock); `nullspace_dim` is the fixed-effect (unpenalized) leading
+/// dimension within the block. `residual_df` is the denominator d.f. for the
+/// `Estimated`-scale F branch.
 #[derive(Debug, Clone)]
 pub struct SmoothTestInput<'a> {
     pub beta: ArrayView1<'a, f64>,
@@ -40,7 +44,6 @@ pub struct SmoothTestInput<'a> {
     pub coeff_range: Range<usize>,
     pub edf: f64,
     pub nullspace_dim: usize,
-    pub dispersion: f64,
     pub residual_df: f64,
     pub scale: SmoothTestScale,
 }
@@ -63,9 +66,16 @@ pub struct SmoothTestResult {
 /// rank `round(edf − nullspace_dim)` via the spectral truncated
 /// pseudo-inverse of the matching Σ̂ subblock). The combined statistic
 /// `T` is compared against `χ²_{ref_df}` when the scale is `Known`, or
-/// `F = T/(ref_df·φ̂)` against `F_{ref_df, residual_df}` when
-/// `Estimated`. Returns `None` on degenerate inputs (empty block,
-/// non-finite EDF, zero dispersion, non-finite stat).
+/// `F = T/ref_df` against `F_{ref_df, residual_df}` when `Estimated`.
+///
+/// Because `covariance` is the scale-included posterior covariance, `T`
+/// already has the dispersion `φ̂` divided out (it is a proper Wald χ²);
+/// the estimated-scale F-statistic is therefore `T/ref_df` with no extra
+/// `φ̂` factor. Dividing by `φ̂` a second time — the historical defect
+/// fixed in issue #675 — makes the p-value scale as `1/φ̂` and so depend on
+/// the units of the response. Returns `None` on degenerate inputs (empty
+/// block, non-finite EDF, non-finite stat, or non-positive residual d.f.
+/// in the F branch).
 pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> {
     let start = input.coeff_range.start;
     let end = input.coeff_range.end;
@@ -75,8 +85,6 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
         || end > input.covariance.ncols()
         || !input.edf.is_finite()
         || input.edf <= 0.0
-        || !input.dispersion.is_finite()
-        || input.dispersion <= 0.0
     {
         return None;
     }
@@ -114,7 +122,11 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
             if !input.residual_df.is_finite() || input.residual_df <= 0.0 {
                 return None;
             }
-            let f_stat = statistic / (ref_df * input.dispersion);
+            // `statistic` is already a dispersion-free Wald χ² (the covariance
+            // is scale-included), so the estimated-scale F-statistic is the
+            // χ² divided by its reference d.f. only — mgcv's `Tr/rank`. Dividing
+            // by `φ̂` again would re-introduce a response-unit dependence (#675).
+            let f_stat = statistic / ref_df;
             let dist = FisherSnedecor::new(ref_df, input.residual_df).ok()?;
             1.0 - dist.cdf(f_stat)
         }
@@ -206,7 +218,6 @@ mod tests {
             coeff_range: 0..2,
             edf: 1.0,
             nullspace_dim: 0,
-            dispersion: 1.0,
             residual_df: 20.0,
             scale: SmoothTestScale::Known,
         })
@@ -214,5 +225,57 @@ mod tests {
         assert!((out.ref_df - 1.8).abs() < 1e-12);
         assert!(out.statistic > 0.0);
         assert!((0.0..=1.0).contains(&out.p_value));
+    }
+
+    /// Rescaling the response by `c` is `β → c·β`, `Σ → c²·Σ` (the covariance
+    /// is scale-included). The Wald statistic `T = β'Σ⁻β` is then invariant,
+    /// and — because the estimated-scale F-statistic is `T/ref_df` with no
+    /// further `φ̂` factor — so is the p-value. This is the unit-level guard
+    /// for issue #675: the historical `T/(ref_df·φ̂)` made the p-value scale
+    /// as `1/c²` even though `T` did not move.
+    #[test]
+    fn estimated_scale_pvalue_is_response_unit_invariant() {
+        let beta = array![2.5, -3.5, 1.8];
+        let cov = array![[2.0, 0.3, 0.0], [0.3, 1.5, 0.1], [0.0, 0.1, 0.9]];
+        let f = array![[0.7, 0.0, 0.0], [0.0, 0.6, 0.0], [0.0, 0.0, 0.4]];
+
+        let run = |c: f64| {
+            let beta_c = &beta * c;
+            let cov_c = &cov * (c * c);
+            wood_smooth_test(SmoothTestInput {
+                beta: beta_c.view(),
+                covariance: &cov_c,
+                influence_matrix: Some(&f),
+                coeff_range: 0..3,
+                edf: 2.0,
+                nullspace_dim: 0,
+                residual_df: 50.0,
+                scale: SmoothTestScale::Estimated,
+            })
+            .expect("smooth test")
+        };
+
+        let base = run(1.0);
+        assert!(base.statistic > 0.0);
+        // A non-trivial, clearly-significant p-value so the invariance check is
+        // not vacuously comparing two values pinned at a boundary.
+        assert!(base.p_value > 0.0 && base.p_value < 0.05);
+        for c in [1e-3, 0.1, 10.0, 1e3, 1e6] {
+            let scaled = run(c);
+            let rel_stat = (scaled.statistic - base.statistic).abs() / base.statistic;
+            assert!(
+                rel_stat < 1e-9,
+                "Wald statistic not scale-invariant at c={c}: {} vs {}",
+                scaled.statistic,
+                base.statistic
+            );
+            let rel_p = (scaled.p_value - base.p_value).abs() / base.p_value;
+            assert!(
+                rel_p < 1e-9,
+                "estimated-scale p-value not scale-invariant at c={c}: {} vs {}",
+                scaled.p_value,
+                base.p_value
+            );
+        }
     }
 }
