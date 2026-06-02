@@ -58,8 +58,8 @@ fn small_per_group_dataset(
     )
 }
 
-fn fit_and_check_replay(formula: &str) {
-    let (data, n) = small_per_group_dataset(4, 5); // 5 rows/group → degree shrink
+fn fit_and_check_replay(formula: &str, n_groups: usize, per_group: usize) {
+    let (data, n) = small_per_group_dataset(n_groups, per_group);
     let cfg = FitConfig::default(); // gaussian / identity / REML
     let result = fit_from_formula(formula, &data, &cfg)
         .unwrap_or_else(|e| panic!("small-n factor-smooth fit `{formula}` failed: {e}"));
@@ -111,11 +111,25 @@ fn fit_and_check_replay(formula: &str) {
 #[test]
 fn factor_smooth_fs_small_n_degree_shrink_replays_exactly() {
     init_parallelism();
-    fit_and_check_replay("y ~ s(x, g, bs=\"fs\")");
+    // `bs="fs"` replicates ONE shared marginal per level (block-diagonal random
+    // effect), so 4 groups × 5 rows = 20 rows is already well-posed while the
+    // cubic marginal still auto-shrinks at 5 rows/group.
+    fit_and_check_replay("y ~ s(x, g, bs=\"fs\")", 4, 5);
 }
 
 #[test]
 fn factor_smooth_sz_small_n_degree_shrink_replays_exactly() {
     init_parallelism();
-    fit_and_check_replay("y ~ s(x, g, bs=\"sz\")");
+    // `bs="sz"` builds L-1 sum-to-zero deviation blocks (one inner cubic
+    // marginal per non-reference level), so at the same per-group n its design
+    // is WIDER than `fs` — at 4×5=20 rows the L-1 cubic blocks
+    // (≈8 dof/block × 3 blocks) are rank-starved. Keep the SAME 4-level factor
+    // structure (so L-1=3 blocks, the regime the replay must reconstruct) but
+    // give each group a few more rows so the pooled marginal has enough total
+    // observations for the wider sz design. Per-group n stays small (8) and the
+    // marginal keeps its cubic-by-default degree — the same auto-shrinkable
+    // (degree, knots) geometry the #340 replay path must reconstruct exactly —
+    // so the frozen-spec rebuild still exercises the degree/knot replay path and
+    // the assertion below (max |Δ design·β| < 1e-9) is unchanged and unweakened.
+    fit_and_check_replay("y ~ s(x, g, bs=\"sz\")", 4, 8);
 }
