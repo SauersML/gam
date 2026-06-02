@@ -15119,6 +15119,74 @@ fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
     }
 }
 
+/// Exact derivative `dK_m^{pseudo}/d(cos γ)` of the pseudo-spline Wahba kernel
+/// [`wahba_sphere_kernel_pseudo_from_cos`].
+///
+/// The forward kernel is a polynomial in `w = (1 − cos γ)/2` with the
+/// auxiliary terms `c0 = √w`, `c = 2 c0 = 2√w`, and `a = ln(1 + 1/c0)`.
+/// Differentiating in `w` and applying the chain factor `dw/d(cos γ) = −1/2`
+/// gives the analytic `dK/d(cos γ)` below. Matches the forward floor on `w`
+/// so the (logarithmic) `a` term stays finite at `γ = 0`.
+#[inline]
+fn wahba_sphere_kernel_pseudo_derivative_dcos(cos_gamma: f64, m: usize) -> f64 {
+    let cg = cos_gamma.clamp(-1.0, 1.0);
+    let z = (1.0 - cg).max(f64::EPSILON * 1.0e-4);
+    let w = 0.5 * z;
+    let c0 = w.sqrt();
+    let a = (1.0 + 1.0 / c0).ln();
+    let c = 2.0 * c0;
+    let two_pi = 2.0 * std::f64::consts::PI;
+    // da/dw = −1/(2 c0² (c0 + 1)),  dc/dw = 1/√w = 1/c0.
+    let da_dw = -1.0 / (2.0 * c0 * c0 * (c0 + 1.0));
+    let dc_dw = 1.0 / c0;
+    // dK/dw for the requested order m (mirrors the forward `match m`).
+    let dk_dw = match m {
+        1 => {
+            // q1 = 2 a w − c + 1 ; K1 = (q1 − 0.5)/2π.
+            let dq1_dw = 2.0 * a + 2.0 * w * da_dw - dc_dw;
+            dq1_dw / two_pi
+        }
+        2 => {
+            // q2 = a(6w² − 2w) − 3 c w + 3w + 0.5 ; K2 = (q2/2 − 1/6)/2π.
+            let dq2_dw = da_dw * (6.0 * w * w - 2.0 * w) + a * (12.0 * w - 2.0)
+                - 3.0 * (dc_dw * w + c)
+                + 3.0;
+            (dq2_dw / 2.0) / two_pi
+        }
+        3 => {
+            // q3 = [a(60w³ − 36w²) + 30w² + c(8w − 30w²) − 3w + 1]/3 ;
+            // K3 = (q3/6 − 1/24)/2π.
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let dinner_dw = da_dw * (60.0 * w3 - 36.0 * w2)
+                + a * (180.0 * w2 - 72.0 * w)
+                + 60.0 * w
+                + (dc_dw * (8.0 * w - 30.0 * w2) + c * (8.0 - 60.0 * w))
+                - 3.0;
+            let dq3_dw = dinner_dw / 3.0;
+            (dq3_dw / 6.0) / two_pi
+        }
+        _ => {
+            // q4 = a(70w⁴ − 60w³ + 6w²) + 35w³(1 − c) + c·55w²/3
+            //      − 12.5w² − w/3 + 0.25 ; K4 = (q4/24 − 1/120)/2π.
+            let w2 = w * w;
+            let w3 = w2 * w;
+            let w4 = w3 * w;
+            // d/dw[35w³(1 − c)] = 35(3w²(1 − c) − w³·dc/dw).
+            // d/dw[c·55w²/3] = (55/3)(dc/dw·w² + c·2w).
+            let dq4_dw = da_dw * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
+                + a * (280.0 * w3 - 180.0 * w2 + 12.0 * w)
+                + 35.0 * (3.0 * w2 * (1.0 - c) - w3 * dc_dw)
+                + (55.0 / 3.0) * (dc_dw * w2 + c * 2.0 * w)
+                - 25.0 * w
+                - 1.0 / 3.0;
+            (dq4_dw / 24.0) / two_pi
+        }
+    };
+    // dw/d(cos γ) = −1/2.
+    dk_dw * (-0.5)
+}
+
 #[inline]
 fn trilog_unit(z: f64) -> f64 {
     const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;

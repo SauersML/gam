@@ -7,7 +7,7 @@
 - Never vendor external software.
 - Python should be a thin wrapper over Rust, and should avoid containing math or much logic. The Python library generally be in feature and behavior parity with the Rust library and CLI. Exception to both: if Python logic is necessary for interaction with external software, e.g., PyTorch.
 - The program must never run out of memory on reasonably-resourced computers.
-- REML (or LAML) always used, never GCV.
+- REML (or LAML) always used for fitting, never GCV.
 - Penalties (prior towards no effect) should usually be applied, except when obvious (e.g., an intercept generally should not have a penalty).
 - The default choices should give the best model for the user.
 - In general, the default should allow a configuration which recovers the null (empirical Bayes-like). Users must opt-in to overfitting potential, not the other way around.
