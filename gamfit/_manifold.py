@@ -237,7 +237,8 @@ class Circle(_RustManifold):
     """The unit circle ``S^1`` parameterized by a single angle coordinate
     ``theta`` (a 1-vector ``[theta]``), matching the Rust
     ``gam::geometry::Circle``. Points and tangents are both 1-D; ``exp`` adds
-    the tangent to the angle and wraps to ``(-pi, pi]``. The ambient and
+    the tangent to the angle and wraps to ``[-pi, pi)`` (the half-open interval
+    produced by ``rem_euclid``: ``+pi`` maps to ``-pi``). The ambient and
     intrinsic dimensions are therefore both ``1`` — there is no ``R^2``
     unit-vector embedding. All math from ``gam::geometry::Circle``."""
 
