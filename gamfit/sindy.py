@@ -97,29 +97,6 @@ def _build_library_spec(
     return spec
 
 
-def _format_three_sig_figs(value: float) -> str:
-    """Mirrors :func:`gam::solver::reml_compare::format_three_significant`.
-
-    Three significant figures, decimal for ``|v| < 1000``, scientific otherwise.
-    Trailing zeros are preserved (so ``10.0`` stays ``"10.0"``, not ``"10"``).
-    """
-    if value == 0.0:
-        return "0"
-    if not np.isfinite(value):
-        return str(value)
-    abs_v = abs(value)
-    exponent = int(np.floor(np.log10(abs_v)))
-    if exponent >= 3:
-        return f"{value:.2e}"
-    decimals = max(2 - exponent, 0)
-    scale = 10 ** decimals
-    # Decimal-domain half-away-from-zero rounding so 1.005 -> "1.01"
-    # (matches src/solver/reml_compare.rs::format_three_significant).
-    rounded_mag = np.floor(abs_v * scale + 0.5) / scale
-    rounded = rounded_mag if value > 0 else -rounded_mag
-    return f"{rounded:.{decimals}f}"
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -368,26 +345,15 @@ class SINDyAtoms:
                 f"SINDyAtoms.equations_human_readable: expected {self._state_dim} state names, "
                 f"got {len(names)}"
             )
-        lines: list[str] = []
-        for i in range(self._state_dim):
-            row = self.theta[i]
-            parts: list[str] = []
-            for coef, term_name in zip(row, self._term_names):
-                if coef == 0.0:
-                    continue
-                sign = "-" if coef < 0 else "+"
-                magnitude = _format_three_sig_figs(abs(coef))
-                if term_name == "1":
-                    rendered = magnitude
-                else:
-                    rendered = f"{magnitude}{term_name}"
-                if not parts:
-                    parts.append(f"-{rendered}" if sign == "-" else rendered)
-                else:
-                    parts.append(f" {sign} {rendered}")
-            rhs = "".join(parts) if parts else "0"
-            lines.append(f"d{names[i]}/dt = {rhs}")
-        return lines
+        # Number formatting, zero-drop, and sign/term assembly are owned by Rust
+        # (`gam::solver::sindy::sindy_render_equations`) so there is a single
+        # source of truth for SINDy equation rendering.
+        theta = np.ascontiguousarray(self.theta, dtype=np.float64)
+        return list(
+            rust_module().sindy_render_equations_array(
+                theta, list(self._term_names), list(names)
+            )
+        )
 
     # ------------------------------------------------------------------
     # Diagnostics

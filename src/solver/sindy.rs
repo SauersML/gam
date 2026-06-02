@@ -407,6 +407,67 @@ pub fn sindy_library(
     Ok((theta, names))
 }
 
+/// Render one human-readable ODE per state variable from a fitted SINDy
+/// coefficient matrix.
+///
+/// `theta` is the public-API coefficient layout `(state_dim, n_terms)`: row `i`
+/// is the coefficient vector for `d{state_i}/dt`. Coefficients are formatted to
+/// three significant figures via [`crate::solver::reml_compare::format_three_significant`]
+/// (the single source of truth for SINDy number formatting), exactly-zero
+/// coefficients are dropped, the first surviving term inlines its sign
+/// (`-10.0x`), and subsequent terms use a spaced separator (` - 3.00y`). The
+/// constant column (term name `"1"`) renders as a bare magnitude.
+pub fn sindy_render_equations(
+    theta: ArrayView2<'_, f64>,
+    term_names: &[String],
+    state_names: &[String],
+) -> Result<Vec<String>, String> {
+    use crate::solver::reml_compare::format_three_significant;
+    let (d, p) = theta.dim();
+    if state_names.len() != d {
+        return Err(format!(
+            "sindy_render_equations requires one state name per row; got {} names for {d} rows",
+            state_names.len()
+        ));
+    }
+    if term_names.len() != p {
+        return Err(format!(
+            "sindy_render_equations requires one term name per column; got {} names for {p} columns",
+            term_names.len()
+        ));
+    }
+    let mut lines = Vec::with_capacity(d);
+    for i in 0..d {
+        let mut rhs = String::new();
+        for (coef, term_name) in theta.row(i).iter().zip(term_names.iter()) {
+            let coef = *coef;
+            if coef == 0.0 {
+                continue;
+            }
+            let magnitude = format_three_significant(coef.abs());
+            let rendered = if term_name == "1" {
+                magnitude
+            } else {
+                format!("{magnitude}{term_name}")
+            };
+            if rhs.is_empty() {
+                if coef < 0.0 {
+                    rhs.push('-');
+                }
+                rhs.push_str(&rendered);
+            } else {
+                let sign = if coef < 0.0 { '-' } else { '+' };
+                rhs.push_str(&format!(" {sign} {rendered}"));
+            }
+        }
+        if rhs.is_empty() {
+            rhs.push('0');
+        }
+        lines.push(format!("d{}/dt = {rhs}", state_names[i]));
+    }
+    Ok(lines)
+}
+
 /// Estimate `dz/dt` from a trajectory by finite differences with spacing `dt`.
 ///
 /// Centered second-order differences on the interior, one-sided first-order
