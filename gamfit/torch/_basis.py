@@ -781,6 +781,189 @@ def smoothness_penalty(
     return from_numpy_like(s_np, knots), from_numpy_like(null_np, knots)
 
 
+def _gwr_vjp(
+    grad_coef: torch.Tensor,
+    grad_fitted: torch.Tensor,
+    X: torch.Tensor,
+    Y: torch.Tensor,
+    penalty: torch.Tensor,
+    weights: torch.Tensor,
+    coef: torch.Tensor,
+    ridge_lambda: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exact analytic VJP of one Gaussian row-weighted ridge solve.
+
+    For ``W=diag(weights)``, ``A = XᵀWX + λS``, ``b = XᵀWY``,
+    ``β = A⁻¹b``, ``fitted = Xβ``. With upstream cotangents ``β̄`` (wrt coef,
+    ``M×D``) and ``f̄`` (wrt fitted, ``N×D``):
+
+        β̄_tot = β̄ + Xᵀf̄
+        b̄      = λ_adj = A⁻¹ β̄_tot         (A SPD symmetric)
+        Ā      = −λ_adj βᵀ                   (M×M)
+        grad_X = W·X·(Ā + Āᵀ) + W·Y·b̄ᵀ + f̄·βᵀ
+        grad_Y = W·X·b̄
+        grad_S = sym(λ·Ā)
+        grad_w[i] = Σ Ā[m,m']·X[i,m]·X[i,m'] + Σ b̄[m,d]·X[i,m]·Y[i,d]
+
+    Returns ``(grad_X, grad_Y, grad_penalty, grad_weights)`` in ``X``'s dtype.
+    All tensors are 2D (single problem); ``weights`` is 1D ``(N,)``.
+    """
+    dt = X.dtype
+    Xc = X.to(dtype=dt)
+    Yc = Y.to(dtype=dt)
+    w = weights.to(dtype=dt)
+    beta = coef.to(dtype=dt)
+    gbeta = grad_coef.to(dtype=dt)
+    gfit = grad_fitted.to(dtype=dt)
+
+    A = Xc.transpose(-1, -2) @ (w.unsqueeze(-1) * Xc) + ridge_lambda * penalty.to(dtype=dt)
+    beta_bar_tot = gbeta + Xc.transpose(-1, -2) @ gfit  # (M, D)
+    lam_adj = torch.linalg.solve(A, beta_bar_tot)  # (M, D); b̄
+    A_bar = -(lam_adj @ beta.transpose(-1, -2))  # (M, M)
+
+    WX = w.unsqueeze(-1) * Xc  # (N, M)
+    WY = w.unsqueeze(-1) * Yc  # (N, D)
+    grad_X = (
+        WX @ (A_bar + A_bar.transpose(-1, -2))
+        + WY @ lam_adj.transpose(-1, -2)
+        + gfit @ beta.transpose(-1, -2)
+    )
+    grad_Y = WX @ lam_adj
+    grad_penalty = ridge_lambda * A_bar
+    grad_penalty = 0.5 * (grad_penalty + grad_penalty.transpose(-1, -2))
+    # grad_w[i] = Σ_{m,m'} Ā[m,m'] X[i,m] X[i,m'] + Σ_{m,d} b̄[m,d] X[i,m] Y[i,d]
+    grad_w = torch.einsum("nm,mp,np->n", Xc, A_bar, Xc) + torch.einsum(
+        "nm,md,nd->n", Xc, lam_adj, Yc
+    )
+    return grad_X, grad_Y, grad_penalty, grad_w
+
+
+class _GaussianWeightedRidgeFn(torch.autograd.Function):
+    """Closed-form Gaussian row-weighted ridge with exact analytic VJP.
+
+    Forward defers to the Rust ``gaussian_weighted_ridge`` (keeping the Rust
+    numerics) and returns ``(coef, fitted)``. Backward applies :func:`_gwr_vjp`
+    on the saved tensors with torch ops, yielding exact gradients through
+    ``X``, ``Y``, ``penalty`` and ``weights``. ``ridge_lambda`` is a python
+    float → non-differentiable.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        penalty: torch.Tensor,
+        weights: torch.Tensor,
+        ridge_lambda: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        coef_np, fit_np = _api.gaussian_weighted_ridge(
+            to_numpy_f64(X),
+            to_numpy_f64(Y),
+            to_numpy_f64(penalty),
+            to_numpy_f64(weights),
+            ridge_lambda=float(ridge_lambda),
+        )
+        coef = from_numpy_like(coef_np, X)
+        fitted = from_numpy_like(fit_np, X)
+        ctx.save_for_backward(X, Y, penalty, weights, coef)
+        ctx.ridge_lambda = float(ridge_lambda)
+        return coef, fitted
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None]:
+        grad_coef, grad_fitted = grad_outputs
+        X, Y, penalty, weights, coef = ctx.saved_tensors
+        grad_X, grad_Y, grad_penalty, grad_w = _gwr_vjp(
+            grad_coef, grad_fitted, X, Y, penalty, weights, coef, ctx.ridge_lambda
+        )
+        return grad_X, grad_Y, grad_penalty, grad_w, None
+
+
+class _GaussianWeightedRidgeBatchFn(torch.autograd.Function):
+    """Batched closed-form Gaussian row-weighted ridge with exact analytic VJP.
+
+    Forward defers to the Rust ``gaussian_weighted_ridge_batch`` and returns
+    ``(coef (K,M,D), fitted (K,Nmax,D))``. Backward applies the per-problem VJP
+    of :func:`_gwr_vjp` for each problem ``k``, masking padded rows: rows beyond
+    the ``row_counts[k]`` active prefix have their weights zeroed so they
+    contribute nothing to the backward math (matching the forward, which sees
+    only the active prefix). ``ridge_lambda`` is a python float →
+    non-differentiable; ``row_counts`` carries no gradient.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        X: torch.Tensor,
+        Y: torch.Tensor,
+        penalty: torch.Tensor,
+        weights: torch.Tensor,
+        ridge_lambda: float,
+        row_counts: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        coef_np, fit_np = _api.gaussian_weighted_ridge_batch(
+            to_numpy_f64(X),
+            to_numpy_f64(Y),
+            to_numpy_f64(penalty),
+            to_numpy_f64(weights),
+            ridge_lambda=float(ridge_lambda),
+            row_counts=None if row_counts is None else to_numpy_uintp(row_counts),
+        )
+        coef = from_numpy_like(coef_np, X)
+        fitted = from_numpy_like(fit_np, X)
+        ctx.save_for_backward(X, Y, penalty, weights, coef)
+        ctx.ridge_lambda = float(ridge_lambda)
+        # row_counts is an integer index tensor → store as a plain list, not a
+        # saved (differentiable) tensor.
+        ctx.row_counts = (
+            None if row_counts is None else [int(c) for c in row_counts.tolist()]
+        )
+        return coef, fitted
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None]:
+        grad_coef, grad_fitted = grad_outputs  # (K,M,D), (K,Nmax,D)
+        X, Y, penalty, weights, coef = ctx.saved_tensors
+        n_problems = X.shape[0]
+        n_max = X.shape[1]
+        grad_X = torch.zeros_like(X)
+        grad_Y = torch.zeros_like(Y)
+        grad_penalty = torch.zeros_like(penalty)
+        grad_w = torch.zeros_like(weights)
+        for k in range(n_problems):
+            active = n_max if ctx.row_counts is None else ctx.row_counts[k]
+            # Mask padded rows by zeroing their weights, exactly as the forward
+            # ignores them; zero-weight rows drop out of every VJP term.
+            wk = weights[k].clone()
+            gfit_k = grad_fitted[k]
+            if active < n_max:
+                wk[active:] = 0
+                # Padded fitted rows are not real model outputs; their upstream
+                # cotangent must not leak into grad_X / grad_coef.
+                gfit_k = gfit_k.clone()
+                gfit_k[active:] = 0
+            gXk, gYk, gPk, gwk = _gwr_vjp(
+                grad_coef[k],
+                gfit_k,
+                X[k],
+                Y[k],
+                penalty,
+                wk,
+                coef[k],
+                ctx.ridge_lambda,
+            )
+            grad_X[k] = gXk
+            grad_Y[k] = gYk
+            grad_penalty = grad_penalty + gPk
+            grad_w[k] = gwk
+        return grad_X, grad_Y, grad_penalty, grad_w, None, None
+
+
 def gaussian_weighted_ridge(
     X: torch.Tensor,
     Y: torch.Tensor,
