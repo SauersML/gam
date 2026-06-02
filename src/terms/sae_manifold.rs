@@ -3864,6 +3864,31 @@ impl SaeManifoldTerm {
                  degenerate at this ρ"
             ));
         }
+        let mut iterate_norm_sq = 0.0_f64;
+        for &v in self.assignment.logits.iter() {
+            iterate_norm_sq += v * v;
+        }
+        for coords in &self.assignment.coords {
+            let matrix = coords.as_matrix();
+            for &v in matrix.iter() {
+                iterate_norm_sq += v * v;
+            }
+        }
+        for atom in &self.atoms {
+            for &v in atom.decoder_coefficients.iter() {
+                iterate_norm_sq += v * v;
+            }
+        }
+        let residual_norm = step_norm_sq.sqrt();
+        let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
+        let residual_tolerance = 1.0e-4 * iterate_scale;
+        if residual_norm > residual_tolerance {
+            return Err(format!(
+                "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
+                 undamped Newton residual ‖Δ‖={residual_norm:.6e} exceeds tolerance \
+                 {residual_tolerance:.6e}. Refusing to rank an off-optimum Laplace criterion."
+            ));
+        }
         let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
             "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
              ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
@@ -4688,6 +4713,150 @@ impl SaeManifoldTerm {
             beta[idx] += step_size * delta_beta[idx];
         }
         self.set_flat_beta(beta.view())
+    }
+
+    fn solve_fixed_decoder_row_step(
+        h: ArrayView2<'_, f64>,
+        g: ArrayView1<'_, f64>,
+        base_ridge: f64,
+    ) -> Result<Array1<f64>, String> {
+        let d = h.nrows();
+        if h.ncols() != d || g.len() != d {
+            return Err(format!(
+                "SaeManifoldTerm::solve_fixed_decoder_row_step: shape mismatch H={:?}, g={}",
+                h.dim(),
+                g.len()
+            ));
+        }
+        if d == 0 {
+            return Ok(Array1::<f64>::zeros(0));
+        }
+        let mut ridge = base_ridge.max(1.0e-12);
+        let mut last_err = String::new();
+        for _ in 0..12 {
+            let mut a = h.to_owned();
+            for axis in 0..d {
+                a[[axis, axis]] += ridge;
+            }
+            match sae_cholesky_solve_neg_gradient(a.view(), g) {
+                Ok(delta) => return Ok(delta),
+                Err(err) => {
+                    last_err = err;
+                    ridge *= 10.0;
+                }
+            }
+        }
+        Err(format!(
+            "SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian did not factor after LM escalation; last error: {last_err}"
+        ))
+    }
+
+    fn fixed_decoder_step_from_rows(
+        sys: &ArrowSchurSystem,
+        ridge_ext_coord: f64,
+    ) -> Result<Array1<f64>, String> {
+        let total = sys.row_offsets[sys.rows.len()];
+        let mut delta = Array1::<f64>::zeros(total);
+        for (row_idx, row) in sys.rows.iter().enumerate() {
+            let row_delta =
+                Self::solve_fixed_decoder_row_step(row.htt.view(), row.gt.view(), ridge_ext_coord)?;
+            let start = sys.row_offsets[row_idx];
+            let end = sys.row_offsets[row_idx + 1];
+            if row_delta.len() != end - start {
+                return Err(format!(
+                    "SaeManifoldTerm::fixed_decoder_step_from_rows: row {row_idx} delta len {} != row span {}",
+                    row_delta.len(),
+                    end - start
+                ));
+            }
+            delta.slice_mut(s![start..end]).assign(&row_delta);
+        }
+        Ok(delta)
+    }
+
+    pub fn run_fixed_decoder_arrow_schur(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        max_iter: usize,
+        step_size: f64,
+        ridge_ext_coord: f64,
+    ) -> Result<SaeManifoldLoss, String> {
+        if !(step_size.is_finite() && step_size > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: step_size must be finite and positive; got {step_size}"
+            ));
+        }
+        if max_iter < 1 {
+            return Err(
+                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: max_iter must be positive".into(),
+            );
+        }
+        let beta_zero = Array1::<f64>::zeros(self.beta_dim());
+        let mut last_loss = self.loss(target, rho)?;
+        for _ in 0..max_iter {
+            self.advance_temperature_schedule()?;
+            let pre_step_loss = self.loss(target, rho)?;
+            let pre_step_total = pre_step_loss.total();
+            let sys = self
+                .assemble_arrow_schur(target, rho, analytic_penalties)
+                .map_err(|err| format!("SaeManifoldTerm::run_fixed_decoder_arrow_schur: {err}"))?;
+            let delta_ext_coord = Self::fixed_decoder_step_from_rows(&sys, ridge_ext_coord)?;
+            let directional_decrease = sae_manifold_newton_directional_decrease(
+                &sys,
+                delta_ext_coord.view(),
+                beta_zero.view(),
+            );
+            let grad_norm_sq: f64 = sys
+                .rows
+                .iter()
+                .flat_map(|row| row.gt.iter())
+                .map(|&v| v * v)
+                .sum();
+            let step_norm_sq: f64 = delta_ext_coord.iter().map(|&v| v * v).sum();
+            let directional_decrease_floor = 1.0e-14 * grad_norm_sq.sqrt() * step_norm_sq.sqrt();
+            let snapshot = self.snapshot_mutable_state();
+            if !(pre_step_total.is_finite()
+                && directional_decrease.is_finite()
+                && directional_decrease > 0.0
+                && directional_decrease > directional_decrease_floor)
+            {
+                self.restore_mutable_state(&snapshot);
+                last_loss = pre_step_loss;
+                break;
+            }
+
+            let mut trial_step_size = step_size;
+            let mut accepted_loss: Option<SaeManifoldLoss> = None;
+            for halving in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
+                if halving > 0 {
+                    self.restore_mutable_state(&snapshot);
+                }
+                let trial_result = self
+                    .apply_newton_step(delta_ext_coord.view(), beta_zero.view(), trial_step_size)
+                    .and_then(|()| self.loss(target, rho));
+                if let Ok(post_step_loss) = trial_result {
+                    let post_step_total = post_step_loss.total();
+                    let armijo_bound = pre_step_total
+                        - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
+                    if post_step_total.is_finite() && post_step_total <= armijo_bound {
+                        accepted_loss = Some(post_step_loss);
+                        break;
+                    }
+                }
+                trial_step_size *= 0.5;
+            }
+            match accepted_loss {
+                Some(loss) => last_loss = loss,
+                None => {
+                    self.restore_mutable_state(&snapshot);
+                    last_loss = pre_step_loss;
+                    break;
+                }
+            }
+        }
+        Ok(last_loss)
     }
 
     pub fn run_joint_fit_arrow_schur(
@@ -5740,6 +5909,58 @@ fn sae_manifold_newton_directional_decrease(
         gradient_dot_step += sys.gb[idx] * delta_beta[idx];
     }
     -gradient_dot_step
+}
+
+fn sae_cholesky_solve_neg_gradient(
+    h: ArrayView2<'_, f64>,
+    g: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let n = h.nrows();
+    if h.ncols() != n || g.len() != n {
+        return Err(format!(
+            "sae_cholesky_solve_neg_gradient: shape mismatch H={:?}, g={}",
+            h.dim(),
+            g.len()
+        ));
+    }
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = h[[i, j]];
+            for k in 0..j {
+                sum -= l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                if !(sum.is_finite() && sum > 0.0) {
+                    return Err(format!("non-positive Cholesky pivot at {i}: {sum}"));
+                }
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut sum = -g[i];
+        for k in 0..i {
+            sum -= l[[i, k]] * y[k];
+        }
+        y[i] = sum / l[[i, i]];
+    }
+    let mut x = Array1::<f64>::zeros(n);
+    for ii in 0..n {
+        let i = n - 1 - ii;
+        let mut sum = y[i];
+        for k in i + 1..n {
+            sum -= l[[k, i]] * x[k];
+        }
+        x[i] = sum / l[[i, i]];
+    }
+    if !x.iter().all(|v| v.is_finite()) {
+        return Err("sae_cholesky_solve_neg_gradient: non-finite solution".into());
+    }
+    Ok(x)
 }
 
 fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {

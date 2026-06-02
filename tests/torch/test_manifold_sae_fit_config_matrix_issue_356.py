@@ -1,6 +1,6 @@
 """Regression for issue #356 — ``ManifoldSAE.fit()`` joint solve across configs.
 
-Before the fix (gamfit 0.1.134) the closed-form joint Arrow-Schur co-fit
+Before the matrix-shape fix, the closed-form joint Arrow-Schur co-fit
 panicked or raised across every non-trivial config:
 
 ============== =============== ============= ================================

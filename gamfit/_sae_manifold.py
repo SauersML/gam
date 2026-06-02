@@ -92,6 +92,8 @@ class ManifoldSAE:
     learning_rate: float = 0.04
     max_iter: int = 50
     random_state: int = 0
+    top_k: int | None = None
+    jumprelu_threshold: float = 0.0
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -104,7 +106,7 @@ class ManifoldSAE:
         )
 
     @classmethod
-    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, assignment_label: str | None = None, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0) -> "ManifoldSAE":
+    def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, assignment_label: str | None = None, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0, top_k: int | None = None, jumprelu_threshold: float = 0.0) -> "ManifoldSAE":
         plans = list(payload.get("atom_plans", []))
         atoms = [SaeManifoldAtomFit(
             basis=str(atom.get("basis_kind", "")),
@@ -145,6 +147,8 @@ class ManifoldSAE:
             tau=float(tau), sparsity_strength=float(sparsity_strength),
             smoothness=float(smoothness), learning_rate=float(learning_rate),
             max_iter=int(max_iter), random_state=int(random_state),
+            top_k=None if top_k is None else int(top_k),
+            jumprelu_threshold=float(jumprelu_threshold),
         )
 
     def _oos_payload(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> dict[str, Any]:
@@ -168,6 +172,8 @@ class ManifoldSAE:
             sparsity_strength=float(self.sparsity_strength), smoothness=float(self.smoothness),
             max_iter=int(self.max_iter), learning_rate=float(self.learning_rate),
             initial_logits=logits_init, initial_coords=coords_init,
+            top_k=self.top_k,
+            jumprelu_threshold=float(self.jumprelu_threshold),
         )
         return dict(payload)
 
@@ -317,6 +323,8 @@ class ManifoldSAE:
             "learning_rate": float(self.learning_rate),
             "max_iter": int(self.max_iter),
             "random_state": int(self.random_state),
+            "top_k": self.top_k,
+            "jumprelu_threshold": float(self.jumprelu_threshold),
             "primitive_names": list(self.primitive_names),
             "basis_specs": list(self.basis_specs),
             "reml_score": float(self.reml_score),
@@ -411,6 +419,8 @@ class ManifoldSAE:
             learning_rate=float(payload["learning_rate"]),
             max_iter=int(payload["max_iter"]),
             random_state=int(payload["random_state"]),
+            top_k=None if payload.get("top_k") is None else int(payload["top_k"]),
+            jumprelu_threshold=float(payload.get("jumprelu_threshold", 0.0)),
         )
 
     @classmethod
@@ -493,6 +503,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     smoothness = float(kwargs.pop("smoothness", smoothness_weight))
     sparsity = float(kwargs.pop("sparsity_strength", sparsity_weight))
     tau = float(kwargs.pop("tau", _schedule_tau_start(gumbel_schedule, 0.5)))
+    jumprelu_threshold = float(kwargs.pop("jumprelu_threshold", 0.0))
     if "mechanism_sparsity_groups" in kwargs:
         raise TypeError(
             "sae_manifold_fit: 'mechanism_sparsity_groups' has been removed. "
@@ -541,6 +552,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(
             f"sparsity_weight (sparsity_strength) must be finite and "
             f"non-negative; got {sparsity}"
+        )
+    if not np.isfinite(jumprelu_threshold):
+        raise ValueError(
+            f"jumprelu_threshold must be finite; got {jumprelu_threshold}"
         )
     topology_supplied = atom_topology is not _TOPOLOGY_UNSET
     atom_topology_str = str(atom_topology) if topology_supplied else "circle"
@@ -667,6 +682,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         top_k=top_k_arg,
         initial_logits=logits_init,
         initial_coords=coords_init,
+        jumprelu_threshold=float(jumprelu_threshold),
     )
     payload_dict = dict(payload)
     return ManifoldSAE.from_payload(
@@ -675,7 +691,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
         tau=float(tau), sparsity_strength=float(sparsity), smoothness=float(smoothness),
         learning_rate=float(effective_lr), max_iter=int(max_iter_total),
-        random_state=int(random_state),
+        random_state=int(random_state), top_k=top_k_arg,
+        jumprelu_threshold=float(jumprelu_threshold),
     )
 
 

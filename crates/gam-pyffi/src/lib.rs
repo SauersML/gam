@@ -3,9 +3,8 @@ use faer::Side;
 use gam::basis::create_duchon_basis_1d_derivative_dense;
 use gam::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::estimate::{
-    BlockRole, EstimationError, ExternalOptimOptions, UnifiedFitResult,
-    optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
-    saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    BlockRole, EstimationError, ExternalOptimOptions, optimize_external_designwith_heuristic_lambdas,
+    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
     FaerCholesky, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata, fast_atb,
@@ -3381,17 +3380,13 @@ fn periodic_spline_curve_basis<'py>(
     ))
 }
 
-#[pyfunction]
-fn periodic_basis_with_jet<'py>(
-    py: Python<'py>,
-    t: PyReadonlyArray1<'py, f64>,
+fn build_wrapped_periodic_harmonic_basis_with_jet(
+    t: ArrayView1<'_, f64>,
     n_harmonics: usize,
-) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
-    let t = t.as_array();
+    label: &str,
+) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
     if t.iter().any(|value| !value.is_finite()) {
-        return Err(py_value_error(
-            "periodic_basis_with_jet requires finite t values".to_string(),
-        ));
+        return Err(format!("{label} requires finite t values"));
     }
 
     let n_rows = t.len();
@@ -3414,7 +3409,7 @@ fn periodic_basis_with_jet<'py>(
         penalty[[cos_col, cos_col]] = harmonic_penalty;
 
         for row in 0..n_rows {
-            let angle = frequency * t[row];
+            let angle = frequency * t[row].rem_euclid(1.0);
             let sin_value = angle.sin();
             let cos_value = angle.cos();
 
@@ -3424,6 +3419,22 @@ fn periodic_basis_with_jet<'py>(
             jet[[row, cos_col, 0]] = -frequency * sin_value;
         }
     }
+
+    Ok((phi, jet, penalty))
+}
+
+#[pyfunction]
+fn periodic_basis_with_jet<'py>(
+    py: Python<'py>,
+    t: PyReadonlyArray1<'py, f64>,
+    n_harmonics: usize,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray3<f64>>, Py<PyArray2<f64>>)> {
+    let (phi, jet, penalty) = build_wrapped_periodic_harmonic_basis_with_jet(
+        t.as_array(),
+        n_harmonics,
+        "periodic_basis_with_jet",
+    )
+    .map_err(py_value_error)?;
 
     Ok((
         phi.into_pyarray(py).unbind(),
@@ -3723,39 +3734,12 @@ fn basis_with_jet<'py>(
                     coords.ncols()
                 )));
             }
-            if coords.iter().any(|value| !value.is_finite()) {
-                return Err(py_value_error(
-                    "basis_with_jet periodic basis requires finite t values".to_string(),
-                ));
-            }
-
-            let n_rows = coords.nrows();
-            let n_cols = 1 + 2 * n_harmonics;
-            let mut phi = Array2::<f64>::zeros((n_rows, n_cols));
-            let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
-            let mut penalty = Array2::<f64>::zeros((n_cols, n_cols));
-            phi.column_mut(0).fill(1.0);
-            penalty[[0, 0]] = 1.0e-8;
-
-            for h in 1..=n_harmonics {
-                let h_f = h as f64;
-                let frequency = std::f64::consts::TAU * h_f;
-                let sin_col = 1 + 2 * (h - 1);
-                let cos_col = sin_col + 1;
-                let harmonic_penalty = h_f * h_f * h_f * h_f;
-                penalty[[sin_col, sin_col]] = harmonic_penalty;
-                penalty[[cos_col, cos_col]] = harmonic_penalty;
-
-                for row in 0..n_rows {
-                    let angle = frequency * coords[[row, 0]].rem_euclid(1.0);
-                    let sin_value = angle.sin();
-                    let cos_value = angle.cos();
-                    phi[[row, sin_col]] = sin_value;
-                    phi[[row, cos_col]] = cos_value;
-                    jet[[row, sin_col, 0]] = frequency * cos_value;
-                    jet[[row, cos_col, 0]] = -frequency * sin_value;
-                }
-            }
+            let (phi, jet, penalty) = build_wrapped_periodic_harmonic_basis_with_jet(
+                coords.column(0),
+                n_harmonics,
+                "basis_with_jet periodic basis",
+            )
+            .map_err(py_value_error)?;
 
             Ok((
                 phi.into_pyarray(py).unbind(),
@@ -10245,33 +10229,14 @@ fn sae_build_periodic_atom(
     t: ArrayView1<'_, f64>,
     n_harmonics: usize,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    if t.iter().any(|value| !value.is_finite()) {
-        return Err("sae_build_periodic_atom: t has non-finite entries".into());
-    }
-    let n_rows = t.len();
-    let n_cols = sae_periodic_basis_size(n_harmonics)?;
-    let mut phi = Array2::<f64>::zeros((n_rows, n_cols));
-    let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
-    let mut penalty = Array2::<f64>::zeros((n_cols, n_cols));
-    phi.column_mut(0).fill(1.0);
-    penalty[[0, 0]] = 1.0e-8;
-    for h in 1..=n_harmonics {
-        let h_f = h as f64;
-        let frequency = std::f64::consts::TAU * h_f;
-        let sin_col = 1 + 2 * (h - 1);
-        let cos_col = sin_col + 1;
-        let harmonic_penalty = h_f * h_f * h_f * h_f;
-        penalty[[sin_col, sin_col]] = harmonic_penalty;
-        penalty[[cos_col, cos_col]] = harmonic_penalty;
-        for row in 0..n_rows {
-            let angle = frequency * t[row];
-            let sin_value = angle.sin();
-            let cos_value = angle.cos();
-            phi[[row, sin_col]] = sin_value;
-            phi[[row, cos_col]] = cos_value;
-            jet[[row, sin_col, 0]] = frequency * cos_value;
-            jet[[row, cos_col, 0]] = -frequency * sin_value;
-        }
+    let (phi, jet, penalty) =
+        build_wrapped_periodic_harmonic_basis_with_jet(t, n_harmonics, "sae_build_periodic_atom")?;
+    let expected_cols = sae_periodic_basis_size(n_harmonics)?;
+    if phi.ncols() != expected_cols {
+        return Err(format!(
+            "sae_build_periodic_atom: basis width {} disagrees with declared width {expected_cols}",
+            phi.ncols()
+        ));
     }
     Ok((phi, jet, penalty))
 }
@@ -11250,6 +11215,7 @@ fn sae_manifold_fit_minimal<'py>(
     initial_logits = None,
     initial_coords = None,
     jumprelu_threshold = 0.0,
+    top_k = None,
 ))]
 fn sae_manifold_predict_oos<'py>(
     py: Python<'py>,
@@ -11271,6 +11237,7 @@ fn sae_manifold_predict_oos<'py>(
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
     jumprelu_threshold: f64,
+    top_k: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let x_view = x_new.as_array();
     let (n_obs, p_out) = x_view.dim();
@@ -11478,43 +11445,204 @@ fn sae_manifold_predict_oos<'py>(
             logits
         }
     };
-    // Mirror the fit path: re-evaluate each Duchon atom's basis at the OOS
-    // coordinates the Newton loop produces, using the trained centers.
+    if let Some(k_top) = top_k {
+        if k_top == 0 || k_top > k_atoms {
+            return Err(py_value_error(format!(
+                "sae_manifold_predict_oos: top_k must satisfy 1 <= top_k <= k_atoms={k_atoms}; got {k_top}"
+            )));
+        }
+    }
+    for (name, value) in [
+        ("alpha", alpha),
+        ("tau", tau),
+        ("smoothness", smoothness),
+        ("learning_rate", learning_rate),
+        ("ridge_ext_coord", ridge_ext_coord),
+        ("ridge_beta", ridge_beta),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(py_value_error(format!(
+                "sae_manifold_predict_oos: {name} must be finite and positive; got {value}"
+            )));
+        }
+    }
+    if !sparsity_strength.is_finite() || sparsity_strength < 0.0 {
+        return Err(py_value_error(format!(
+            "sae_manifold_predict_oos: sparsity_strength must be finite and non-negative; got {sparsity_strength}"
+        )));
+    }
+    const SPARSITY_DISABLED_FLOOR: f64 = 1.0e-300;
+    let sparsity_strength = if sparsity_strength == 0.0 {
+        SPARSITY_DISABLED_FLOOR
+    } else {
+        sparsity_strength
+    };
+
+    let mode = match assignment_kind.as_str() {
+        "softmax" => AssignmentMode::softmax(tau),
+        "ibp_map" => AssignmentMode::ibp_map(tau, alpha, false),
+        "jumprelu" => AssignmentMode::jumprelu(tau, jumprelu_threshold),
+        _ => {
+            return Err(py_value_error(format!(
+                "sae_manifold_predict_oos: assignment_kind must be one of 'softmax', 'ibp_map', or 'jumprelu'; got {assignment_kind}"
+            )));
+        }
+    };
+    let effective_atom_dim: Vec<usize> = plans.iter().map(|plan| plan.latent_dim).collect();
+    let mut coord_blocks = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let d = effective_atom_dim[atom_idx];
+        coord_blocks.push(start_coords.slice(s![atom_idx, 0..n_obs, 0..d]).to_owned());
+    }
     let atom_centers: Vec<Option<Array2<f64>>> = plans
         .iter()
         .map(|plan| plan.duchon_centers.clone())
         .collect();
-    // Return the full inner payload (issue #357): converged `assignments_z`,
-    // per-atom `on_atom_coords_t`, `logits`, and `fitted`. The supervised head
-    // reads OOS assignments; the amortized encoder reads converged coords.
-    sae_manifold_fit_inner(
-        py,
-        x_view,
-        &atom_basis,
-        atom_dim,
+    let evaluators = build_sae_basis_evaluators(
+        &basis_kinds,
+        &basis_sizes,
+        &effective_atom_dim,
+        &coord_blocks,
         &atom_centers,
+    )
+    .map_err(py_value_error)?;
+    let mut term = term_from_padded_blocks_with_mode(
+        n_obs,
+        p_out,
+        &basis_kinds,
         basis_values.view(),
         basis_jacobian.view(),
-        basis_sizes,
+        &basis_sizes,
+        &effective_atom_dim,
         decoder_coefficients.view(),
         smooth_penalties.view(),
         initial_logits.view(),
-        start_coords.view(),
-        alpha,
-        tau,
-        false,
-        assignment_kind,
-        sparsity_strength,
-        smoothness,
-        max_iter,
-        learning_rate,
-        ridge_ext_coord,
-        ridge_beta,
-        None,
-        None,
-        None,
-        jumprelu_threshold,
+        &coord_blocks,
+        mode,
+        &evaluators,
     )
+    .map_err(py_value_error)?;
+    let log_ard: Vec<Array1<f64>> = effective_atom_dim
+        .iter()
+        .map(|&d| Array1::<f64>::zeros(d))
+        .collect();
+    let mut rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
+    let loss = term
+        .run_fixed_decoder_arrow_schur(
+            x_view,
+            &mut rho,
+            None,
+            max_iter,
+            learning_rate,
+            ridge_ext_coord,
+        )
+        .map_err(py_value_error)?;
+
+    let mut assignments = term.assignment.assignments();
+    let mut fitted = term.fitted();
+    if let Some(k_top) = top_k {
+        if k_top < k_atoms {
+            let renormalise = assignment_kind == "softmax";
+            for row in 0..n_obs {
+                let mut paired: Vec<(f64, usize)> = (0..k_atoms)
+                    .map(|atom_idx| (assignments[[row, atom_idx]], atom_idx))
+                    .collect();
+                paired.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.1.cmp(&b.1))
+                });
+                let mut keep = vec![false; k_atoms];
+                for &(_, atom_idx) in paired.iter().take(k_top) {
+                    keep[atom_idx] = true;
+                }
+                if renormalise {
+                    let kept_sum: f64 = (0..k_atoms)
+                        .filter(|&atom_idx| keep[atom_idx])
+                        .map(|atom_idx| assignments[[row, atom_idx]])
+                        .sum();
+                    if !(kept_sum.is_finite() && kept_sum > 0.0) {
+                        return Err(py_value_error(format!(
+                            "sae_manifold_predict_oos: top_k softmax projection has non-positive kept mass on row {row}"
+                        )));
+                    }
+                    for atom_idx in 0..k_atoms {
+                        assignments[[row, atom_idx]] = if keep[atom_idx] {
+                            assignments[[row, atom_idx]] / kept_sum
+                        } else {
+                            0.0
+                        };
+                    }
+                } else {
+                    for atom_idx in 0..k_atoms {
+                        if !keep[atom_idx] {
+                            assignments[[row, atom_idx]] = 0.0;
+                        }
+                    }
+                }
+            }
+            fitted = Array2::<f64>::zeros((n_obs, p_out));
+            let mut g_buf = vec![0.0_f64; p_out];
+            for row in 0..n_obs {
+                for atom_idx in 0..k_atoms {
+                    let a_k = assignments[[row, atom_idx]];
+                    if a_k == 0.0 {
+                        continue;
+                    }
+                    term.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
+                    let mut out_row = fitted.row_mut(row);
+                    for out_col in 0..p_out {
+                        out_row[out_col] += a_k * g_buf[out_col];
+                    }
+                }
+            }
+        }
+    }
+
+    let log_ard_py = PyList::empty(py);
+    for atom_log_ard in &rho.log_ard {
+        log_ard_py.append(atom_log_ard.clone().into_pyarray(py))?;
+    }
+    let atoms_py = PyList::empty(py);
+    for atom_idx in 0..k_atoms {
+        let atom = &term.atoms[atom_idx];
+        let atom_dict = PyDict::new(py);
+        atom_dict.set_item(
+            "decoder_B",
+            atom.decoder_coefficients.clone().into_pyarray(py),
+        )?;
+        atom_dict.set_item("basis_kind", atom_basis[atom_idx].clone())?;
+        atom_dict.set_item("basis_centers", py.None())?;
+        atom_dict.set_item(
+            "on_atom_coords_t",
+            term.assignment.coords[atom_idx]
+                .as_matrix()
+                .into_pyarray(py),
+        )?;
+        atom_dict.set_item(
+            "assignments_z",
+            assignments.column(atom_idx).to_owned().into_pyarray(py),
+        )?;
+        atom_dict.set_item("active_dim", effective_atom_dim[atom_idx])?;
+        atoms_py.append(atom_dict)?;
+    }
+
+    let active_mask: Vec<bool> = (0..k_atoms)
+        .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)
+        .collect();
+    let out = PyDict::new(py);
+    out.set_item("atoms", atoms_py)?;
+    out.set_item("assignments_z", assignments.into_pyarray(py))?;
+    out.set_item("logits", term.assignment.logits.clone().into_pyarray(py))?;
+    out.set_item("atom_active_mask", active_mask)?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("reml_score", loss.evidence_proxy())?;
+    out.set_item("log_alpha", alpha.ln())?;
+    out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
+    out.set_item("log_ard", log_ard_py)?;
+    out.set_item("assignment_prior", assignment_kind)?;
+    out.set_item("chosen_k", k_atoms)?;
+    Ok(out.unbind())
 }
 
 /// Global coefficient of determination
@@ -26373,7 +26501,7 @@ fn summary_smooth_terms(
         let edf = fit
             .edf_by_block()
             .get(penalty_cursor..penalty_cursor + k)
-            .map(|block| block.iter().sum::<f64>())
+            .map(|block: &[f64]| block.iter().sum::<f64>())
             .unwrap_or(0.0);
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {

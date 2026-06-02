@@ -194,7 +194,7 @@ pub enum SurvivalTimeBasisConfig {
 /// Threading this snapshot end-to-end eliminates the prior bug pattern
 /// where each FFI builder had to reconstruct the metadata from
 /// `fit_config` + the formula (silent drift risk; one builder forgetting
-/// to do so caused gamfit 0.1.69's marginal-slope save→load break).
+/// to do so caused the marginal-slope save→load break).
 #[derive(Clone, Debug, PartialEq)]
 pub struct SavedSurvivalTimeBasis {
     pub basisname: String,

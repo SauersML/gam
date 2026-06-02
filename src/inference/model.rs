@@ -703,7 +703,7 @@ impl FittedModelPayload {
     /// This is the only path that should populate the `survival_time_*`
     /// fields used by the loader. Routing every FFI builder through this
     /// helper guarantees no builder can silently drop a field — the
-    /// gamfit 0.1.69 marginal-slope save→load bug was a builder that
+    /// marginal-slope save→load bug was a builder that
     /// missed `survival_time_basis`.
     pub fn apply_survival_time_basis(
         &mut self,
@@ -3950,7 +3950,7 @@ mod tests {
         let mut payload = survival_marginal_slope_payload(MODEL_PAYLOAD_VERSION, fit);
 
         // Snapshot writes must match every persisted survival_time_* field —
-        // forgetting one is exactly the gamfit 0.1.69 marginal-slope save
+        // forgetting one is exactly the marginal-slope save
         // regression. Routing through `apply_survival_time_basis` is the
         // structural contract that prevents that recurrence.
         let snapshot = SavedSurvivalTimeBasis {
