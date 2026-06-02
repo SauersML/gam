@@ -11678,29 +11678,6 @@ fn sae_manifold_predict_oos<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
-<<<<<<< HEAD
-    if !logits_are_warm && assignment_kind == "softmax" {
-        let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
-        let mut decoded = vec![0.0_f64; p_out];
-        for row in 0..n_obs {
-            for atom_idx in 0..k_atoms {
-                term.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
-                let mut err = 0.0_f64;
-                for out_col in 0..p_out {
-                    let diff = x_view[[row, out_col]] - decoded[out_col];
-                    err += diff * diff;
-                }
-                seeded_logits[[row, atom_idx]] = -err / tau;
-            }
-            let reference = seeded_logits[[row, k_atoms - 1]];
-            for atom_idx in 0..k_atoms {
-                seeded_logits[[row, atom_idx]] -= reference;
-            }
-        }
-        term.assignment.logits.assign(&seeded_logits);
-    }
-=======
->>>>>>> origin/main
     let log_ard: Vec<Array1<f64>> = effective_atom_dim
         .iter()
         .map(|&d| Array1::<f64>::zeros(d))
