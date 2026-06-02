@@ -487,26 +487,18 @@ fn sphere_mean_candidates(
     values: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
 ) -> Result<Vec<Array1<f64>>, String> {
-    let (n, d) = values.dim();
+    let (_, d) = values.dim();
     let mut candidates: Vec<Array1<f64>> = Vec::new();
-    let mut extrinsic = Array1::<f64>::zeros(d);
-    for row in 0..n {
-        for col in 0..d {
-            extrinsic[col] += weights[row] * values[[row, col]];
-        }
-    }
+    // Weighted extrinsic mean `Σ wᵢ pᵢ = Pᵀ w`: a single matrix–vector product
+    // over all points, dispatched to GPU by `fast_atv` for large batches.
+    let extrinsic = crate::linalg::faer_ndarray::fast_atv(&values, &weights);
     let ex_norm = norm(extrinsic.view());
     if ex_norm > 0.0 {
         candidates.push(extrinsic.mapv(|v| v / ex_norm));
     }
-    let mut moment = Array2::<f64>::zeros((d, d));
-    for row in 0..n {
-        for r in 0..d {
-            for c in 0..d {
-                moment[[r, c]] += weights[row] * values[[row, r]] * values[[row, c]];
-            }
-        }
-    }
+    // `M = Σ wᵢ pᵢ pᵢᵀ = Pᵀ diag(w) P` over all n points: the same GPU-dispatched
+    // weighted cross-product used by `sphere_second_moment`.
+    let moment = sphere_second_moment(values, weights);
     let mut v = Array1::<f64>::from_elem(d, 1.0 / (d as f64).sqrt());
     for _ in 0..64 {
         let mut nv = Array1::<f64>::zeros(d);
@@ -533,18 +525,15 @@ fn sphere_mean_candidates(
     Ok(candidates)
 }
 
-/// Build the weighted second-moment matrix `M = Σ wᵢ pᵢ pᵢᵀ`.
+/// Build the weighted second-moment matrix `M = Σ wᵢ pᵢ pᵢᵀ = Pᵀ diag(w) P`.
+///
+/// This is a single weighted cross-product over ALL `n` points, so it routes
+/// through [`crate::linalg::faer_ndarray::fast_xt_diag_x`], whose auto-dispatch
+/// shim runs the `Pᵀ diag(w) P` Gram on the GPU (`crate::gpu::try_fast_xt_diag_x`)
+/// when the batch is large enough and otherwise on faer. The result is bit-for-bit
+/// the same `d×d` symmetric Gram as the explicit triple loop (f64 throughout).
 fn sphere_second_moment(values: ArrayView2<'_, f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
-    let (n, d) = values.dim();
-    let mut moment = Array2::<f64>::zeros((d, d));
-    for row in 0..n {
-        for r in 0..d {
-            for c in 0..d {
-                moment[[r, c]] += weights[row] * values[[row, r]] * values[[row, c]];
-            }
-        }
-    }
-    moment
+    crate::linalg::faer_ndarray::fast_xt_diag_x(&values, &weights)
 }
 
 /// Dominant eigenvector of a symmetric PSD matrix via power iteration.
