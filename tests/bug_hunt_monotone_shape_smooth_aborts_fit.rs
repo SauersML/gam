@@ -142,4 +142,45 @@ fn monotone_increasing_shape_smooth_fits_already_monotone_data() {
         mono_range > 0.5 * free_range,
         "monotone fit collapsed: range {mono_range:.4} vs unconstrained {free_range:.4}"
     );
+
+    // OBJECTIVE TRUTH RECOVERY (primary). The constraint is non-binding, so a
+    // correct REML-invariant constrained fit must recover the data-generating
+    // truth `f(x) = x²` essentially as well as the unconstrained fit — NOT
+    // merely "span the response". We score both fits against the closed-form
+    // truth on the dense grid (centered to remove the unidentified additive
+    // level, since `s(x)` is identifiable only up to the model intercept) and
+    // require the monotone fit to MATCH-OR-BEAT the unconstrained fit within a
+    // tight margin. Before the over-smoothing fix the box-reparam double-penalty
+    // ridge `Tᵀ(ZZᵀ)T` blew up under the cumulative-sum conditioning, drove λ
+    // to its ceiling, and the RMSE-to-truth was ~the full signal range; this
+    // bound (≤ 1.10× the unconstrained RMSE) is the strict accuracy gate.
+    let grid: Vec<f64> = (0..p_mono.len())
+        .map(|j| j as f64 / (p_mono.len() as f64 - 1.0))
+        .collect();
+    let truth: Vec<f64> = grid.iter().map(|&g| g * g).collect();
+    let centered_rmse_to_truth = |pred: &[f64]| -> f64 {
+        let mean_p = pred.iter().sum::<f64>() / pred.len() as f64;
+        let mean_t = truth.iter().sum::<f64>() / truth.len() as f64;
+        let mse = pred
+            .iter()
+            .zip(truth.iter())
+            .map(|(&p, &t)| {
+                let r = (p - mean_p) - (t - mean_t);
+                r * r
+            })
+            .sum::<f64>()
+            / pred.len() as f64;
+        mse.sqrt()
+    };
+    let free_rmse = centered_rmse_to_truth(&p_free);
+    let mono_rmse = centered_rmse_to_truth(&p_mono);
+    assert!(
+        free_rmse < 0.05,
+        "unconstrained fit should recover x² closely (RMSE {free_rmse:.4})"
+    );
+    assert!(
+        mono_rmse <= 1.10 * free_rmse,
+        "monotone fit must recover x² as well as the unconstrained fit \
+         (constraint non-binding): mono RMSE {mono_rmse:.4} vs free RMSE {free_rmse:.4}"
+    );
 }

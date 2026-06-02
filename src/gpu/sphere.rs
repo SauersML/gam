@@ -1557,8 +1557,8 @@ mod sphere_gpu_tests {
             return;
         }
         use crate::basis::{
-            CenterStrategy, SphereMethod, SphericalSplineBasisSpec, build_spherical_spline_basis,
-            sobolev_s2_truncated_coefficients,
+            CenterStrategy, SphereMethod, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
+            build_spherical_spline_basis, sobolev_s2_truncated_coefficients,
         };
         let _ = sobolev_s2_truncated_coefficients(1, 1);
 
@@ -1574,6 +1574,7 @@ mod sphere_gpu_tests {
             method: SphereMethod::Wahba,
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::SobolevTruncated { lmax },
+            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
         };
         let result_gpu = build_spherical_spline_basis(data.view(), &spec_gpu)
             .expect("GPU-eligible build_spherical_spline_basis succeeds");
@@ -1783,7 +1784,8 @@ mod sphere_gpu_tests {
             return;
         }
         use crate::basis::{
-            CenterStrategy, SphereMethod, SphericalSplineBasisSpec, build_spherical_spline_basis,
+            CenterStrategy, SphereMethod, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
+            build_spherical_spline_basis,
         };
 
         let n_lat = 500usize;
@@ -1799,6 +1801,7 @@ mod sphere_gpu_tests {
             method: SphereMethod::Wahba,
             max_degree: None,
             wahba_kernel: SphereWahbaKernel::SobolevTruncated { lmax },
+            identifiability: SphericalSplineIdentifiability::CenterSumToZero,
         };
 
         // Warm-up GPU build.
