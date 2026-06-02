@@ -699,6 +699,10 @@ enum FamilyArg {
     #[value(alias = "nb", alias = "negbin", alias = "negative_binomial")]
     NegativeBinomial,
     GammaLog,
+    #[value(alias = "tw")]
+    Tweedie,
+    #[value(alias = "beta-regression")]
+    Beta,
     RoystonParmar,
     TransformationNormal,
 }
@@ -6874,6 +6878,8 @@ fn family_arg_name(arg: FamilyArg) -> &'static str {
         FamilyArg::PoissonLog => "poisson-log",
         FamilyArg::NegativeBinomial => "negative-binomial",
         FamilyArg::GammaLog => "gamma-log",
+        FamilyArg::Tweedie => "tweedie",
+        FamilyArg::Beta => "beta",
         FamilyArg::RoystonParmar => "royston-parmar",
         FamilyArg::TransformationNormal => "transformation-normal",
     }
@@ -8206,6 +8212,8 @@ fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> {
         FamilyArg::PoissonLog => Some("poisson"),
         FamilyArg::NegativeBinomial => Some("negative-binomial"),
         FamilyArg::GammaLog => Some("gamma"),
+        FamilyArg::Tweedie => Some("tweedie"),
+        FamilyArg::Beta => Some("beta"),
         FamilyArg::RoystonParmar => Some("royston-parmar"),
         FamilyArg::TransformationNormal => Some("transformation-normal"),
     }
@@ -10177,6 +10185,7 @@ mod tests {
         let y_binary = array![0.0, 1.0, 1.0, 0.0];
         let y_count = array![0.0, 1.0, 2.0, 3.0, 4.0];
         let y_positive = array![0.5, 1.5, 2.5, 3.5];
+        let y_unit = array![0.1, 0.3, 0.6, 0.9];
 
         let logit = LinkChoice {
             mode: LinkMode::Strict,
@@ -10244,6 +10253,22 @@ mod tests {
                 None,
                 None,
                 &y_positive,
+                ResponseColumnKind::Numeric,
+            ),
+            // Tweedie on non-negative continuous y; Beta on unit-interval y.
+            // Both reach the canonical resolver verbatim via the CLI adapter.
+            (
+                FamilyArg::Tweedie,
+                None,
+                None,
+                &y_positive,
+                ResponseColumnKind::Numeric,
+            ),
+            (
+                FamilyArg::Beta,
+                None,
+                None,
+                &y_unit,
                 ResponseColumnKind::Numeric,
             ),
             // Link-implied families. Log link on integer-valued y → Poisson;
