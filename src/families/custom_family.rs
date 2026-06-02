@@ -2120,6 +2120,43 @@ pub trait CustomFamily {
         false
     }
 
+    /// Per-block output-channel assignment for the identifiability audit.
+    ///
+    /// Multi-parameter families (Dirichlet, beta, Gaussian/binomial
+    /// location-scale, multinomial, …) drive several *independent* linear
+    /// predictors `η_r = X_r β_r`, one per distributional parameter / class.
+    /// Each [`ParameterBlockSpec`] feeds exactly one of those output channels.
+    /// When two blocks share the same covariate basis (e.g. every Dirichlet
+    /// component uses the same `[1 | B]`), their columns are *not* gauge
+    /// aliases — they are block-diagonal entries of the true joint Jacobian
+    /// `blkdiag(X_0, …, X_{m-1})`, full rank `Σ p_b`.
+    ///
+    /// The pre-fit identifiability audit can only see this block-diagonal
+    /// structure through the **channel-aware** route, which requires each
+    /// block to carry a multi-output `jacobian_callback` (n_outputs > 1).
+    /// Families built via the canonical helpers (`build_location_scale_block`,
+    /// `MultinomialFamily::build_block_specs`) wire that callback themselves;
+    /// families fit through the low-level `fit_custom_family` API with
+    /// hand-built specs do not, and the flat audit then mistakes the repeated
+    /// shared basis for cross-block aliases and refuses a well-posed fit
+    /// (issues #319 / #363 / #558).
+    ///
+    /// Returning `Some(channels)` — a vector of length `specs.len()` giving the
+    /// zero-based output channel each block drives — lets `fit_custom_family`
+    /// install the appropriate [`AdditiveBlockJacobian`] on any block that
+    /// lacks an explicit callback, so the audit routes channel-aware
+    /// automatically. The total channel count is `channels.iter().max() + 1`.
+    ///
+    /// Default `None`: the family is single-output (or has already wired its
+    /// own multi-output callbacks); the flat audit is used unchanged.
+    ///
+    /// When `Some`, the returned vector MUST have length equal to the number
+    /// of blocks; `fit_custom_family` surfaces a structured error otherwise.
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        assert_valid_blockspecs(specs, "output_channel_assignment");
+        None
+    }
+
     /// Optional dynamic geometry hook for blocks whose design/offset depend on
     /// current values of other blocks.
     fn block_geometry(
@@ -21872,13 +21909,82 @@ fn lift_fit_geometry_to_raw(
     (lifted_cov, lifted_geom)
 }
 
+/// Install the channel-aware `AdditiveBlockJacobian` callbacks declared by a
+/// family's [`CustomFamily::output_channel_assignment`].
+///
+/// Multi-output families that build their specs by hand (or through the
+/// low-level `fit_custom_family` API) declare their per-block output channel
+/// here so the pre-fit identifiability audit routes channel-aware instead of
+/// mistaking a shared covariate basis for cross-block aliases (#558). Blocks
+/// that already carry an explicit `jacobian_callback` are left untouched
+/// (the family wired its own, possibly β-dependent, multi-output Jacobian).
+///
+/// Returns `None` when the family declares no assignment (single-output flat
+/// route, the default) so the caller can keep borrowing the original specs
+/// without an allocation.
+fn wire_output_channels<F: CustomFamily + ?Sized>(
+    family: &F,
+    specs: &[ParameterBlockSpec],
+) -> Result<Option<Vec<ParameterBlockSpec>>, CustomFamilyError> {
+    let Some(channels) = family.output_channel_assignment(specs) else {
+        return Ok(None);
+    };
+    if channels.len() != specs.len() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "output_channel_assignment returned {} channels for {} blocks",
+                channels.len(),
+                specs.len(),
+            ),
+        });
+    }
+    let n_family_outputs = channels.iter().copied().max().map(|m| m + 1).unwrap_or(1);
+    if n_family_outputs <= 1 {
+        // A single output channel is exactly the flat route — nothing to wire.
+        return Ok(None);
+    }
+    // When every block already carries an explicit (family-wired) callback,
+    // the channel-aware route is already taken — avoid cloning the specs.
+    if specs.iter().all(|s| s.jacobian_callback.is_some()) {
+        return Ok(None);
+    }
+    let mut wired = specs.to_vec();
+    for (idx, spec) in wired.iter_mut().enumerate() {
+        // Respect a family-supplied callback (e.g. multinomial / location-scale
+        // already wire their own multi-output, possibly β-dependent Jacobian).
+        if spec.jacobian_callback.is_some() {
+            continue;
+        }
+        let own_output = channels[idx];
+        // The block's effective design at β=0 (with no callback) is exactly
+        // its linear design — the additive-block Jacobian for an `η_r = X_r β_r`
+        // channel.
+        let dense = spec.effective_design("wire_output_channels").map_err(|e| {
+            CustomFamilyError::DimensionMismatch {
+                reason: format!("block {idx} effective design for channel wiring: {e}"),
+            }
+        })?;
+        spec.jacobian_callback = Some(Arc::new(AdditiveBlockJacobian {
+            design: dense,
+            own_output,
+            n_family_outputs,
+        }));
+    }
+    Ok(Some(wired))
+}
+
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_prior: crate::types::RhoPrior,
 ) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
-    let raw_specs: &[ParameterBlockSpec] = specs;
+    // Multi-output families that omitted the per-block channel callback get it
+    // installed here from their declared `output_channel_assignment`, so the
+    // identifiability audit routes channel-aware (single source of truth for
+    // the channel-wiring; no per-test/per-builder duplication — #558).
+    let wired = wire_output_channels(family, specs)?;
+    let raw_specs: &[ParameterBlockSpec] = wired.as_deref().unwrap_or(specs);
     validate_blockspecs(raw_specs)?;
 
     // Pre-fit cross-block identifiability canonicalisation. Every

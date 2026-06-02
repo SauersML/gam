@@ -8029,6 +8029,18 @@ impl CustomFamily for GaussianLocationScaleFamily {
         true
     }
 
+    /// Two independent linear predictors: block 0 → μ channel, block 1 → log σ
+    /// channel. Declaring the channel topology lets `fit_custom_family` route
+    /// the identifiability audit channel-aware even when a caller builds the
+    /// blocks by hand (without `build_location_scale_block`'s callbacks), so a
+    /// shared μ/log-σ covariate basis is recognised as block-diagonal rather
+    /// than mistaken for cross-block intercept aliases (#558).
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        // Two-channel families: `[mu, log_sigma]`. The optional trailing
+        // zero-channel wiggle block (when present) also drives channel 0.
+        Some((0..specs.len()).map(|i| usize::from(i == Self::BLOCK_LOG_SIGMA)).collect())
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Operator-aware: when the unified evaluator picks the matrix-free
         // joint Hessian path (see `use_joint_matrix_free_path`), the workspace
