@@ -55,16 +55,22 @@ impl GrassmannManifold {
         &self,
         tangent: &Array2<f64>,
     ) -> GeometryResult<(Array2<f64>, Array1<f64>, Array2<f64>)> {
-        let gram = tangent.t().dot(tangent);
+        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        // ΔᵀΔ (k×n · n×k) and the left singular vectors U = Δ·V·Σ⁻¹ (n×k · k×k)
+        // both carry the large ambient dimension n; GPU-dispatch via fast_atb/ab.
+        let gram = fast_atb(tangent, tangent);
         let (evals, v) = jacobi_symmetric(&gram)?;
         let mut sigma = Array1::<f64>::zeros(self.k);
+        // U = Δ·V first (n×k), then scale each column j by 1/σ_j (skipping the
+        // numerically-zero singular values, exactly as the per-column form did).
+        let tangent_v = fast_ab(tangent, &v);
         let mut u = Array2::<f64>::zeros((self.n, self.k));
         for j in 0..self.k {
             sigma[j] = evals[j].max(0.0).sqrt();
             if sigma[j] > GEOMETRY_EPS {
-                let col = tangent.dot(&v.column(j).to_owned()) / sigma[j];
+                let inv_sigma = 1.0 / sigma[j];
                 for i in 0..self.n {
-                    u[[i, j]] = col[i];
+                    u[[i, j]] = tangent_v[[i, j]] * inv_sigma;
                 }
             }
         }
@@ -107,7 +113,12 @@ impl RiemannianManifold for GrassmannManifold {
             cos_d[[i, i]] = sigma[i].cos();
             sin_d[[i, i]] = sigma[i].sin();
         }
-        let next = y.dot(&v).dot(&cos_d).dot(&v.t()) + u.dot(&sin_d).dot(&v.t());
+        // Geodesic frame Y·V·cos(Σ)·Vᵀ + U·sin(Σ)·Vᵀ: dense products carrying the
+        // large ambient dimension n, GPU-dispatched via fast_ab/fast_abt.
+        use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+        let yv_cos = fast_ab(&fast_ab(&y, &v), &cos_d);
+        let u_sin = fast_ab(&u, &sin_d);
+        let next = &fast_abt(&yv_cos, &v) + &fast_abt(&u_sin, &v);
         Ok(flatten(&self.orthonormalize(&next)))
     }
 
@@ -136,23 +147,28 @@ impl RiemannianManifold for GrassmannManifold {
             }
             return sphere.log_map(p_from, p_to);
         }
+        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
         let y = from_flat(p_from, self.n, self.k)?;
         let z = from_flat(p_to, self.n, self.k)?;
-        let yt_z = y.t().dot(&z);
+        // YᵀZ (k×n · n×k), the normal Z − Y(YᵀZ) and M = normal·(YᵀZ)⁻¹ (n×k · k×k),
+        // and MᵀM (k×n · n×k): all carry n, GPU-dispatched via fast_atb/fast_ab.
+        let yt_z = fast_atb(&y, &z);
         let inv = inverse(&yt_z)?;
-        let normal = z - y.dot(&yt_z);
-        let m = normal.dot(&inv);
-        let gram = m.t().dot(&m);
+        let normal = z - fast_ab(&y, &yt_z);
+        let m = fast_ab(&normal, &inv);
+        let gram = fast_atb(&m, &m);
         let (evals, v) = jacobi_symmetric(&gram)?;
         let mut sigma = Array1::<f64>::zeros(self.k);
+        // U = M·V scaled column-wise by 1/tan(σ_j) (M·V is n×k · k×k, carrying n).
+        let m_v = fast_ab(&m, &v);
         let mut u = Array2::<f64>::zeros((self.n, self.k));
         for j in 0..self.k {
             let tan_sigma = evals[j].max(0.0).sqrt();
             sigma[j] = tan_sigma.atan();
             if tan_sigma > GEOMETRY_EPS {
-                let col = m.dot(&v.column(j).to_owned()) / tan_sigma;
+                let inv_tan = 1.0 / tan_sigma;
                 for i in 0..self.n {
-                    u[[i, j]] = col[i];
+                    u[[i, j]] = m_v[[i, j]] * inv_tan;
                 }
             }
         }
@@ -160,7 +176,11 @@ impl RiemannianManifold for GrassmannManifold {
         for i in 0..self.k {
             diag[[i, i]] = sigma[i];
         }
-        Ok(flatten(&u.dot(&diag).dot(&v.t())))
+        // Δ = U·Σ·Vᵀ: n×k · k×k · k×k, GPU-dispatched.
+        Ok(flatten(&crate::linalg::faer_ndarray::fast_abt(
+            &fast_ab(&u, &diag),
+            &v,
+        )))
     }
 
     fn parallel_transport(
@@ -230,12 +250,16 @@ impl RiemannianManifold for GrassmannManifold {
             cos_d[[i, i]] = sigma[i].cos();
             sin_d[[i, i]] = sigma[i].sin();
         }
-        // Coordinates of H in the U-frame: ut_h = Uᵀ H (k×k).
-        let ut_h = u.t().dot(&h);
-        // Geodesic-aligned components: -Y V sin(Σ) Uᵀ H + U cos(Σ) Uᵀ H.
-        let aligned = u.dot(&cos_d).dot(&ut_h) - y.dot(&v).dot(&sin_d).dot(&ut_h);
+        // Coordinates of H in the U-frame: ut_h = Uᵀ H (k×n · n×k). The transport
+        // operator's three dense terms all carry the large ambient dimension n;
+        // GPU-dispatch via fast_ab/fast_atb.
+        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        let ut_h = fast_atb(&u, &h);
+        // Geodesic-aligned components: U cos(Σ) Uᵀ H − Y V sin(Σ) Uᵀ H.
+        let aligned = &fast_ab(&fast_ab(&u, &cos_d), &ut_h)
+            - &fast_ab(&fast_ab(&fast_ab(&y, &v), &sin_d), &ut_h);
         // Component of H orthogonal to the geodesic 2-plane: (I - U Uᵀ) H.
-        let orthogonal = &h - &u.dot(&ut_h);
+        let orthogonal = &h - &fast_ab(&u, &ut_h);
         Ok(flatten(&(aligned + orthogonal)))
     }
 
@@ -306,10 +330,13 @@ impl RiemannianManifold for GrassmannManifold {
             self.n,
             self.k,
         )?;
-        let gxx = x.t().dot(&x);
-        let gyy = y.t().dot(&y);
-        let gxy = x.t().dot(&y);
-        let gyx = y.t().dot(&x);
+        // Tangent Gram matrices (each k×n · n×k, carrying the large ambient
+        // dimension n), GPU-dispatched via fast_atb.
+        use crate::linalg::faer_ndarray::fast_atb;
+        let gxx = fast_atb(&x, &x);
+        let gyy = fast_atb(&y, &y);
+        let gxy = fast_atb(&x, &y);
+        let gyx = fast_atb(&y, &x);
         let trace_product = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
             let mut acc = 0.0;
             for i in 0..self.k {
@@ -353,9 +380,12 @@ impl RiemannianManifold for GrassmannManifold {
         point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
+        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
         let y = from_flat(point, self.n, self.k)?;
         let z = from_flat(vec, self.n, self.k)?;
-        let projected = &z - y.dot(&y.t().dot(&z));
+        // Z − Y(YᵀZ): YᵀZ (k×n · n×k) and Y·(YᵀZ) (n×k · k×k) both carry n,
+        // GPU-dispatched via fast_atb/fast_ab.
+        let projected = &z - &fast_ab(&y, &fast_atb(&y, &z));
         Ok(flatten(&projected))
     }
 
