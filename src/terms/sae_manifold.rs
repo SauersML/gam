@@ -2579,9 +2579,21 @@ impl SaeManifoldTerm {
             .unwrap_or(0);
         let (budget, chunk_window) = match crate::gpu::runtime::GpuRuntime::global() {
             Some(rt) => {
-                let device_budget = rt.memory_budget_bytes;
-                let window = (device_budget / 16).max(CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE);
-                (device_budget / 4, window)
+                // Aggregate the working-set budget over EVERY device: per-atom
+                // batched smoothness/Gram work fans out across the whole pool, so
+                // the in-core ceiling is the sum of all ordinals' budgets rather
+                // than only the primary device's. The per-tile chunk window still
+                // sizes against a single device's slice (one ordinal at a time
+                // holds a tile in core), so it uses the per-device budget.
+                let aggregate_budget: usize = rt
+                    .device_ordinals()
+                    .iter()
+                    .map(|&ord| rt.memory_budget_for(ord))
+                    .sum();
+                let per_device_budget = aggregate_budget / rt.device_count().max(1);
+                let window =
+                    (per_device_budget / 16).max(CPU_L2_CACHE_BYTES * CHUNK_CACHE_MULTIPLE);
+                (aggregate_budget / 4, window)
             }
             None => (
                 HOST_IN_CORE_BYTES,
@@ -2766,9 +2778,19 @@ impl SaeManifoldTerm {
             .saturating_mul(BYTES_PER_F64);
 
         let budget = match crate::gpu::runtime::GpuRuntime::global() {
-            // Allow up to one quarter of the device budget for the dense Gram,
-            // matching the streaming dispatcher's in-core fraction.
-            Some(rt) => rt.memory_budget_bytes / 4,
+            // Allow up to one quarter of the AGGREGATE device budget for the dense
+            // Gram, matching the streaming dispatcher's in-core fraction. The
+            // per-atom-pair Gram blocks fan out across the whole device pool, so
+            // the in-core fraction sums every ordinal's budget, not just the
+            // primary's.
+            Some(rt) => {
+                let aggregate: usize = rt
+                    .device_ordinals()
+                    .iter()
+                    .map(|&ord| rt.memory_budget_for(ord))
+                    .sum();
+                aggregate / 4
+            }
             None => HOST_GRAM_BYTES,
         };
         if dense_gram_bytes <= budget {
@@ -2916,10 +2938,19 @@ impl SaeManifoldTerm {
         // The quadratic form only sees the symmetric part of `S`, so reusing
         // the raw (un-symmetrised) `smooth_penalty` here is numerically
         // identical to the symmetrised assembly form.
+        // Per-atom `S_k · B_k` products are independent across atoms, so they ride
+        // the multi-GPU batched smoothness GEMM (uniform-shape groups tiled across
+        // every device); `symmetrize = false` because the quadratic form only sees
+        // the symmetric part of `S` regardless. Exact CPU fallback per atom.
+        let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
+            .atoms
+            .iter()
+            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .collect();
+        let sb_all = batched_smooth_sb(&sb_inputs, false);
         let mut acc = 0.0;
-        for atom in &self.atoms {
-            let sb = atom.smooth_penalty.dot(&atom.decoder_coefficients);
-            acc += 0.5 * lambda_smooth * (&atom.decoder_coefficients * &sb).sum();
+        for (atom, sb) in self.atoms.iter().zip(sb_all.iter()) {
+            acc += 0.5 * lambda_smooth * (&atom.decoder_coefficients * sb).sum();
         }
         acc
     }
@@ -3035,6 +3066,17 @@ impl SaeManifoldTerm {
         // is constructed (#296).
         let mut smooth_ops: Vec<Arc<dyn BetaPenaltyOp>> = Vec::with_capacity(self.atoms.len());
         let mut smooth_grad_gb = vec![0.0_f64; beta_dim];
+        // Per-atom smoothness-gradient GEMMs `½(S_k+S_kᵀ)·B_k` are independent
+        // across atoms; batch them across ALL GPUs (uniform-shape tiles) and
+        // scale by `lambda_smooth` below. `symmetrize = true` reproduces the
+        // per-atom symmetrised `scaled_s/λ` used by the Kronecker op. Exact CPU
+        // fallback per atom keeps the result bit-for-bit with the all-CPU path.
+        let sym_sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
+            .atoms
+            .iter()
+            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .collect();
+        let sym_sb_all = batched_smooth_sb(&sym_sb_inputs, true);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             let off = beta_offsets[atom_idx];
@@ -3046,10 +3088,10 @@ impl SaeManifoldTerm {
                     scaled_s[[i, j]] = lambda_smooth * s_ij;
                 }
             }
-            // Gradient: g[beta_i] += (λ S_k B_k)[i, out_col]. Concentrate the
-            // scattered triple loop into a single (m×m)·(m×p) GEMM (mirrors the
-            // pattern in `decoder_smoothness_value`) for cache locality.
-            let sb = scaled_s.dot(&atom.decoder_coefficients);
+            // Gradient: g[beta_i] += (λ S_k B_k)[i, out_col]. The (m×m)·(m×p)
+            // GEMM `½(S+Sᵀ)·B_k` was computed in the multi-GPU batch above; here
+            // we only apply the scalar `lambda_smooth`.
+            let sb = &sym_sb_all[atom_idx] * lambda_smooth;
             for out_col in 0..p {
                 for i in 0..m {
                     let beta_i = off + i * p + out_col;
@@ -4107,20 +4149,19 @@ impl SaeManifoldTerm {
     /// in the flat β layout, the denominator of the λ_smooth Fellner-Schall
     /// update. `S_k` is symmetrised defensively (as the assembler does).
     fn decoder_smoothness_quadratic_form(&self) -> f64 {
+        // `Σ_k Σ_oc B_k[:,oc]ᵀ ½(S_k+S_kᵀ) B_k[:,oc]` = `Σ_k <B_k, ½(S_k+S_kᵀ)·B_k>`.
+        // The per-atom `½(S+Sᵀ)·B_k` GEMMs are independent, so they ride the
+        // multi-GPU batched smoothness GEMM (uniform-shape tiles across every
+        // device) with an exact per-atom CPU fallback.
+        let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
+            .atoms
+            .iter()
+            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .collect();
+        let sb_all = batched_smooth_sb(&sb_inputs, true);
         let mut acc = 0.0_f64;
-        for atom in &self.atoms {
-            let s = &atom.smooth_penalty;
-            let b = &atom.decoder_coefficients;
-            let m = atom.basis_size();
-            let p = atom.output_dim();
-            for oc in 0..p {
-                for i in 0..m {
-                    for j in 0..m {
-                        let s_ij = 0.5 * (s[[i, j]] + s[[j, i]]);
-                        acc += b[[i, oc]] * s_ij * b[[j, oc]];
-                    }
-                }
-            }
+        for (atom, sb) in self.atoms.iter().zip(sb_all.iter()) {
+            acc += (&atom.decoder_coefficients * sb).sum();
         }
         acc
     }
@@ -5958,6 +5999,153 @@ fn sae_manifold_newton_directional_decrease(
         gradient_dot_step += sys.gb[idx] * delta_beta[idx];
     }
     -gradient_dot_step
+}
+
+/// Per-atom decoder-smoothness GEMM `S_k · B_k`, batched across ALL GPUs.
+///
+/// Every atom contributes one dense product of its `(m_k × m_k)` smoothness
+/// penalty `S_k` with its `(m_k × p)` decoder coefficients `B_k`. These products
+/// are independent across atoms, so the per-atom axis is the natural batch /
+/// device-fan-out dimension. This helper:
+///
+///   * groups atoms by identical `(m_k, p)` shape (the strided-batched cuBLAS
+///     GEMM requires a uniform tile),
+///   * for each group with ≥ 2 atoms whose aggregate flop count clears the
+///     dispatch threshold, partitions the group's atoms across every available
+///     device with [`crate::gpu::pool::scatter_batched`] and runs one
+///     `try_fast_abt_strided_batched` per device tile (computing
+///     `S_k · B_k = S_k · (B_kᵀ)ᵀ`),
+///   * falls back, atom-by-atom, to the exact ndarray `S_k.dot(B_k)` whenever no
+///     GPU runtime is present, the pool returns `None`, or a tile's batched GEMM
+///     declines. The result is bit-for-bit identical to the all-CPU path (f64
+///     throughout, same accumulation order per product).
+///
+/// Returns one `S_k · B_k` matrix per atom, in atom order. `symmetrize`
+/// pre-symmetrises each `S_k` (the assembly path needs `½(S+Sᵀ)`); the value /
+/// quadratic-form callers pass `false` since the quadratic form only sees the
+/// symmetric part regardless.
+fn batched_smooth_sb(
+    sb_inputs: &[(ArrayView2<'_, f64>, ArrayView2<'_, f64>)],
+    symmetrize: bool,
+) -> Vec<Array2<f64>> {
+    let n_atoms = sb_inputs.len();
+    // Materialise the (optionally symmetrised) S factors once; the GPU tile and
+    // the CPU fallback both read these, so a single pass keeps the two routes
+    // numerically identical.
+    let s_mats: Vec<Array2<f64>> = sb_inputs
+        .iter()
+        .map(|(s, _)| {
+            if symmetrize {
+                let m = s.nrows();
+                let mut sym = Array2::<f64>::zeros((m, m));
+                for i in 0..m {
+                    for j in 0..m {
+                        sym[[i, j]] = 0.5 * (s[[i, j]] + s[[j, i]]);
+                    }
+                }
+                sym
+            } else {
+                s.to_owned()
+            }
+        })
+        .collect();
+
+    // Exact CPU fallback for a single atom, reused by both the no-GPU route and
+    // per-tile decline.
+    let cpu_one = |idx: usize| -> Array2<f64> { s_mats[idx].dot(&sb_inputs[idx].1) };
+
+    let rt = match crate::gpu::runtime::GpuRuntime::global() {
+        Some(rt) => rt,
+        None => return (0..n_atoms).map(cpu_one).collect(),
+    };
+
+    // Group atom indices by uniform (m, p) shape; only same-shape groups can ride
+    // a strided-batched GEMM tile.
+    let mut groups: std::collections::BTreeMap<(usize, usize), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (idx, (_, b)) in sb_inputs.iter().enumerate() {
+        let m = s_mats[idx].nrows();
+        let p = b.ncols();
+        groups.entry((m, p)).or_default().push(idx);
+    }
+
+    let mut out: Vec<Option<Array2<f64>>> = (0..n_atoms).map(|_| None).collect();
+    for ((m, p), members) in groups {
+        // Singletons and tiny groups gain nothing from batched device launch;
+        // the single-product `fast_*` shim (size-gated) already handles a large
+        // lone GEMM, so route those straight through the CPU-or-shim helper.
+        if members.len() < 2 || m == 0 || p == 0 {
+            for &idx in &members {
+                out[idx] = Some(cpu_one(idx));
+            }
+            continue;
+        }
+        // Build the per-tile batched inputs lazily inside the device closure so
+        // each device only packs the atoms it owns. `items` carries the member
+        // atom indices; `scatter_batched` slices it per device ordinal.
+        let mut items: Vec<usize> = members.clone();
+        let s_ref = &s_mats;
+        let out_ptr = &mut out;
+        // Collect per-tile results into a side channel keyed by atom index, then
+        // splice them in after scatter completes (scatter's closure borrows
+        // `items` immutably-per-tile and must stay `Sync`).
+        let tile_results: std::sync::Mutex<Vec<(usize, Array2<f64>)>> =
+            std::sync::Mutex::new(Vec::with_capacity(members.len()));
+        let ok = crate::gpu::pool::scatter_batched(rt, &mut items, |_ordinal, slice| {
+            if slice.is_empty() {
+                return Some(());
+            }
+            let batch = slice.len();
+            // A = stacked S_k  (batch, m, m); B = stacked B_kᵀ (batch, p, m) so
+            // that `A · Bᵀ` per tile yields `S_k · B_k` (batch, m, p).
+            let mut a = Array3::<f64>::zeros((batch, m, m));
+            let mut bt = Array3::<f64>::zeros((batch, p, m));
+            for (t, &idx) in slice.iter().enumerate() {
+                let s = &s_ref[idx];
+                let b = &sb_inputs[idx].1;
+                for i in 0..m {
+                    for j in 0..m {
+                        a[[t, i, j]] = s[[i, j]];
+                    }
+                }
+                for i in 0..p {
+                    for j in 0..m {
+                        bt[[t, i, j]] = b[[j, i]];
+                    }
+                }
+            }
+            let prod = crate::gpu::try_fast_abt_strided_batched(a.view(), bt.view())?;
+            let mut sink = tile_results.lock().expect("tile_results mutex poisoned");
+            for (t, &idx) in slice.iter().enumerate() {
+                sink.push((idx, prod.slice(s![t, .., ..]).to_owned()));
+            }
+            Some(())
+        });
+        match ok {
+            Some(()) => {
+                let sink = tile_results.into_inner().expect("tile_results mutex poisoned");
+                for (idx, mat) in sink {
+                    out_ptr[idx] = Some(mat);
+                }
+                // Any member a tile silently skipped (cannot happen with the
+                // contract, but keep the result total) falls back to CPU.
+                for &idx in &members {
+                    if out_ptr[idx].is_none() {
+                        out_ptr[idx] = Some(cpu_one(idx));
+                    }
+                }
+            }
+            None => {
+                for &idx in &members {
+                    out[idx] = Some(cpu_one(idx));
+                }
+            }
+        }
+    }
+    out.into_iter()
+        .enumerate()
+        .map(|(idx, slot)| slot.unwrap_or_else(|| cpu_one(idx)))
+        .collect()
 }
 
 fn sae_cholesky_solve_neg_gradient(
