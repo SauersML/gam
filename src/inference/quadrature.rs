@@ -305,6 +305,30 @@ const LOGIT_SIGMA_TAYLOR_MAX: f64 = 2.5e-1;
 const LOGIT_TAIL_LOG_MAX: f64 = -18.0;
 const LOGIT_ERFCX_MU_MAX: f64 = 40.0;
 const LOGIT_ERFCX_SIGMA_MAX: f64 = 6.0;
+/// Latent SD above which the logistic-normal *jet* stops trusting Gauss–Hermite
+/// quadrature. The jet integrands are the localized inverse-link derivatives
+/// `sigmoid^(k)` (bumps of characteristic width O(1) in η, hence width O(1/σ) in
+/// the standardized GH coordinate). Once σ grows past ~1, GH can no longer
+/// resolve the higher derivatives. Measured 31/51-node GH relative error vs a
+/// 16384-interval Simpson reference (μ≈σ) shows the knee precisely:
+///
+/// ```text
+///   σ     d1        d2        d3
+///   0.8   2.8e-16   5.4e-13   2.1e-12
+///   1.0   4.7e-12   1.4e-10   2.1e-9     ← still excellent
+///   1.2   4.8e-10   4.5e-9    1.9e-7
+///   1.5   4.8e-8    5.9e-8    1.8e-5
+///   2.5   6.9e-5    9.2e-4    3.0e-2
+///   5.0   1.7e-3    7.8e-2    2.1e+0     ← d3 209% wrong
+/// ```
+///
+/// Adaptive Simpson, by contrast, holds ~1e-12 on every component at every σ.
+/// So at σ ≤ 1 GH is both accurate (≤ ~2e-9 on all four components) and cheap
+/// (31 nodes); beyond σ = 1 the jet is integrated by adaptive Simpson instead,
+/// with `mean`/`d1` reused verbatim from the scalar controlled backend so the
+/// scalar dispatcher and the jet agree by construction (#571 — the GH jet used
+/// to drift ~4e-3 from the scalar value at (μ=3, σ=3)).
+const LOGIT_JET_GHQ_SIGMA_MAX: f64 = 1.0;
 const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
 const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
 const CLOGLOG_RARE_EVENT_LOG_MAX: f64 = -18.0;
@@ -2572,6 +2596,12 @@ pub fn integrated_inverse_link_jet(
         }
         LinkFunction::Probit => Ok(integrated_probit_jet(mu, sigma)),
         LinkFunction::Logit => {
+            if sigma > LOGIT_JET_GHQ_SIGMA_MAX {
+                // Wide σ: Gauss-Hermite under-resolves the localized
+                // sigmoid^(k) integrands. Integrate accurately and reuse the
+                // scalar backend's mean/d1 so the two entry points agree (#571).
+                return logit_wide_sigma_jet(mu, sigma);
+            }
             // Integrate the full pointwise jet directly: the same
             // Gauss-Hermite nodes evaluate component_point_jet, so mean/d1
             // retain their scalar-backend values to rounding and d2/d3 are
@@ -2620,6 +2650,34 @@ pub fn integrated_inverse_link_jet(
     }
 }
 
+/// Accurate logistic-normal jet for the wide-σ regime (σ > `LOGIT_JET_GHQ_SIGMA_MAX`)
+/// where Gauss–Hermite can no longer resolve the localized inverse-link
+/// derivatives. `mean` and `d1` are taken verbatim from the scalar controlled
+/// backend, so the scalar dispatcher and the jet return identical values at
+/// wide σ (the #571 scalar-vs-jet disagreement is closed by construction rather
+/// than by two independent quadratures merely agreeing to a tolerance). `d2`
+/// and `d3` are the location-derivatives `E[sigmoid''(η)]`, `E[sigmoid'''(η)]`,
+/// integrated by the same adaptive-Simpson rule the scalar path trusts as its
+/// reference (resolved to ~1e-12 at every σ). The returned `mode` mirrors the
+/// scalar backend's mode for the regime.
+#[inline]
+fn logit_wide_sigma_jet(mu: f64, sigma: f64) -> Result<IntegratedInverseLinkJet, EstimationError> {
+    let scalar = logit_posterior_meanwith_deriv_controlled(mu, sigma)?;
+    let d2 = integrate_normal_adaptive(mu, sigma, |x| {
+        component_point_jet(LinkComponent::Logit, x).2
+    });
+    let d3 = integrate_normal_adaptive(mu, sigma, |x| {
+        component_point_jet(LinkComponent::Logit, x).3
+    });
+    Ok(IntegratedInverseLinkJet {
+        mean: scalar.mean,
+        d1: scalar.dmean_dmu.max(0.0),
+        d2,
+        d3,
+        mode: scalar.mode,
+    })
+}
+
 #[inline]
 pub fn integrated_logit_inverse_link_jet_pirls(
     quadctx: &QuadratureContext,
@@ -2639,6 +2697,9 @@ pub fn integrated_logit_inverse_link_jet_pirls(
             d3,
             mode: IntegratedExpectationMode::ExactClosedForm,
         });
+    }
+    if sigma > LOGIT_JET_GHQ_SIGMA_MAX {
+        return logit_wide_sigma_jet(mu, sigma);
     }
     let (mean, d1, d2, d3) = integrate_normal_ghq_adaptive(quadctx, mu, sigma, |x| {
         component_point_jet(LinkComponent::Logit, x)
@@ -5412,6 +5473,61 @@ mod tests {
     }
 
     #[test]
+    fn test_logit_dmean_dmu_equals_fd_of_mean_across_regimes() {
+        // Regression for #571/#572 from the contract angle: the dispatcher's
+        // returned `dmean_dmu` MUST equal d/dμ of the dispatcher's own `mean`
+        // (the location-family identity the integrated-PIRLS Fisher weight and
+        // working response depend on). A central finite difference of the
+        // public `mean` is an end-to-end check that is blind to *which* internal
+        // branch produced the value — it would have caught the #572 erfcx
+        // derivative (2.4× too large) and any future formula that returns a
+        // derivative inconsistent with its own mean. Grid points are chosen well
+        // inside single regimes (away from the σ∈{0.25,6} and |μ|=40 branch
+        // seams) so the mean is locally smooth and a tight FD is meaningful:
+        //   - quadrature-fallback band (erfcx-eligible but un-certifiable),
+        //   - erfcx self-certified band (large |μ|),
+        //   - small-σ Taylor band,
+        //   - large-σ (erfcx-ineligible) band.
+        let ctx = QuadratureContext::new();
+        let h = 1e-4;
+        let cases = [
+            (0.0, 0.8),  // quadrature fallback, μ=0 (the #572 failure family)
+            (0.7, 0.8),  // quadrature fallback, off-center
+            (1.5, 1.2),  // quadrature fallback
+            (-1.1, 0.9), // quadrature fallback, μ<0 (reflection path)
+            (8.0, 1.0),  // erfcx self-certified
+            (10.0, 1.5), // erfcx self-certified
+            (-9.0, 1.0), // erfcx self-certified, μ<0
+            (0.5, 0.05), // small-σ Taylor
+            (0.5, 20.0), // large-σ, erfcx-ineligible → quadrature
+        ];
+        for &(mu, sigma) in &cases {
+            let at = |m: f64| {
+                integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, m, sigma)
+                    .expect("logit moments")
+            };
+            let out = at(mu);
+            let fd = (at(mu + h).mean - at(mu - h).mean) / (2.0 * h);
+            assert!(
+                (out.dmean_dmu - fd).abs() <= 1e-5,
+                "dmean_dmu must equal d/dμ of mean at (μ={mu}, σ={sigma}): \
+                 returned {}, FD of mean {} (mode {:?})",
+                out.dmean_dmu,
+                fd,
+                out.mode
+            );
+            // Physical ceiling: E[sigmoid'(η)] ≤ sigmoid'(0) = 0.25 for every
+            // (μ, σ); a Gaussian average of sigmoid' (max 0.25) can never exceed
+            // it. The #572 bug returned 0.58 here, violating this hard bound.
+            assert!(
+                out.dmean_dmu <= 0.25 + 1e-9 && out.dmean_dmu >= 0.0,
+                "dmean_dmu out of [0, 0.25] at (μ={mu}, σ={sigma}): {}",
+                out.dmean_dmu
+            );
+        }
+    }
+
+    #[test]
     fn test_logit_scalar_matches_jet_at_large_sigma() {
         // Regression for #571: the scalar dispatcher used to return the
         // Monahan probit mean (e.g. 0.9206 at (3,3)) while the jet path
@@ -5436,19 +5552,81 @@ mod tests {
                 epsilon = 1e-9,
                 max_relative = 1e-8
             );
-            // The scalar and GHQ-jet entry points no longer disagree in the
-            // first decimal place (#571 symptom). They are two independent
-            // accurate quadratures, so we only require they agree to a
-            // cross-method tolerance far tighter than the old 0.11 gap; the
-            // GHQ jet path itself carries ~1e-5 derivative error at these broad
-            // sigmas, which is the loosest term here.
-            assert_relative_eq!(scalar.mean, jet.mean, epsilon = 1e-4, max_relative = 1e-4);
+            // At wide σ the jet no longer integrates mean/d1 by Gauss-Hermite
+            // (which under-resolves the localized sigmoid^(k) integrands and
+            // drifted ~4e-3 from the scalar adaptive-Simpson value — the
+            // residual #571 symptom). The jet now *reuses* the scalar backend's
+            // mean/d1 (see `logit_wide_sigma_jet`), so the two public entry
+            // points are identical to the bit, not merely close. Pin that
+            // strong invariant.
+            assert_relative_eq!(scalar.mean, jet.mean, epsilon = 1e-12, max_relative = 1e-12);
             assert_relative_eq!(
                 scalar.dmean_dmu,
                 jet.d1,
-                epsilon = 1e-4,
-                max_relative = 1e-4
+                epsilon = 1e-12,
+                max_relative = 1e-12
             );
+        }
+    }
+
+    #[test]
+    fn test_logit_jet_accurate_at_wide_sigma() {
+        // Regression for the residual #571 root cause: at wide σ the 51-node
+        // Gauss-Hermite jet under-resolves the localized sigmoid^(k) integrands
+        // and drifts from the truth (e.g. d1 ≈ 0.0702 vs 0.0700 at (3,3)). The
+        // jet now routes σ > LOGIT_JET_GHQ_SIGMA_MAX through adaptive Simpson.
+        // Pin ALL FOUR jet components (mean, d1, d2, d3) to an independent
+        // high-resolution Simpson reference, across the broad-σ band, and pin
+        // that the PIRLS hot-path jet returns identical values.
+        let ctx = QuadratureContext::new();
+        for &(mu, sigma) in &[(3.0, 3.0), (4.0, 4.0), (2.0, 5.0), (5.0, 5.0), (0.5, 20.0)] {
+            let jet = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma)
+                .expect("wide-σ logit jet");
+            let (rm, rd1, rd2, rd3) = logit_reference_jet_highres_simpson(mu, sigma);
+            assert_relative_eq!(jet.mean, rm, epsilon = 1e-8, max_relative = 1e-7);
+            assert_relative_eq!(jet.d1, rd1, epsilon = 1e-8, max_relative = 1e-6);
+            assert_relative_eq!(jet.d2, rd2, epsilon = 1e-8, max_relative = 1e-6);
+            assert_relative_eq!(jet.d3, rd3, epsilon = 1e-8, max_relative = 1e-6);
+            // d1 is the scalar backend's derivative verbatim (consistency #571).
+            let scalar =
+                integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, mu, sigma)
+                    .expect("scalar logit moments");
+            assert_relative_eq!(jet.d1, scalar.dmean_dmu, epsilon = 1e-12);
+            assert_relative_eq!(jet.mean, scalar.mean, epsilon = 1e-12);
+            // PIRLS hot-path jet must match the general jet bit-for-bit.
+            let pirls = integrated_logit_inverse_link_jet_pirls(&ctx, mu, sigma)
+                .expect("wide-σ PIRLS logit jet");
+            assert_relative_eq!(pirls.mean, jet.mean, epsilon = 1e-12);
+            assert_relative_eq!(pirls.d1, jet.d1, epsilon = 1e-12);
+            assert_relative_eq!(pirls.d2, jet.d2, epsilon = 1e-12);
+            assert_relative_eq!(pirls.d3, jet.d3, epsilon = 1e-12);
+            assert_eq!(pirls.mode, jet.mode);
+        }
+    }
+
+    #[test]
+    fn test_logit_jet_continuous_across_ghq_simpson_seam() {
+        // The jet switches integrators at σ = LOGIT_JET_GHQ_SIGMA_MAX (GHQ at or
+        // below, adaptive Simpson above). Both sides are accurate, so the seam
+        // must not introduce a visible jump that would perturb PIRLS. The seam
+        // jump is exactly (GHQ value − Simpson value) at the threshold σ, so we
+        // evaluate BOTH integrators at the same σ to isolate that jump from the
+        // jet's genuine σ-dependence (a 1e-6 step in σ alone moves the mean by
+        // ~∂M/∂σ·1e-6 ≈ 6e-8, which would otherwise masquerade as a seam jump).
+        let ctx = QuadratureContext::new();
+        let sigma = LOGIT_JET_GHQ_SIGMA_MAX;
+        for mu in [-2.0, -0.5, 0.0, 0.7, 1.3, 3.0] {
+            // Dispatch path at the threshold uses GHQ (σ is not > the cutoff).
+            let ghq = integrated_inverse_link_jet(&ctx, LinkFunction::Logit, mu, sigma)
+                .expect("jet at seam (GHQ dispatch)");
+            // Same σ, but forced through the adaptive-Simpson backend.
+            let simpson = logit_wide_sigma_jet(mu, sigma).expect("jet at seam (Simpson)");
+            // GHQ at σ=1 holds to ≤ ~2e-9 on all four components (Simpson is
+            // ~1e-12), so the seam jump is bounded by GHQ's residual error.
+            assert_relative_eq!(ghq.mean, simpson.mean, epsilon = 1e-9, max_relative = 1e-8);
+            assert_relative_eq!(ghq.d1, simpson.d1, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(ghq.d2, simpson.d2, epsilon = 1e-9, max_relative = 1e-7);
+            assert_relative_eq!(ghq.d3, simpson.d3, epsilon = 1e-8, max_relative = 1e-6);
         }
     }
 
