@@ -1,12 +1,21 @@
 """Differentiable basis, penalty, and closed-form ridge primitives for torch.
 
-These wrappers mirror the NumPy entry points in :mod:`gamfit._api`.
-``bspline_basis`` and ``duchon_basis`` carry an analytic backward with
-respect to their evaluation locations through :class:`torch.autograd.Function`
-subclasses (the Duchon backward contracts the upstream cotangent with the
-input-location jets of the *built* design from the Rust
-``duchon_basis_with_jets`` kernel, and supports second-order autograd). The
-derivative, penalty, and closed-form ridge paths are forward-only and
+These wrappers mirror the NumPy entry points in :mod:`gamfit._api`. Every
+differentiable primitive carries an exact analytic backward through a
+:class:`torch.autograd.Function` subclass (no finite differences):
+
+* ``bspline_basis`` / ``bspline_basis_derivative`` — grad wrt ``t`` via the
+  ``(order+1)``-th derivative basis (diagonal in ``t``), with second-order
+  autograd for the open case;
+* ``duchon_basis`` — grad wrt ``points`` via the input-location jets of the
+  *built* design (``duchon_basis_with_jets``), second-order capable;
+* ``sphere_basis`` — grad wrt ``points`` via the Rust ``sphere_basis_jet``
+  input-location jet (penalty is structural, detached);
+* ``gaussian_weighted_ridge`` / ``gaussian_weighted_ridge_batch`` —
+  closed-form VJP of ``β = (XᵀWX + λS)⁻¹XᵀWY`` through ``X``, ``Y``,
+  ``penalty`` and ``weights`` (forward keeps the Rust numerics).
+
+The remaining penalty-construction paths are structural (forward-only) and
 produced via the detach-cast-call-numpy-wrap path in
 :mod:`gamfit.torch._coerce`.
 """
@@ -957,6 +966,18 @@ class _GaussianWeightedRidgeBatchFn(torch.autograd.Function):
                 coef[k],
                 ctx.ridge_lambda,
             )
+            if active < n_max:
+                # The forward sees only the active prefix, so the outputs are
+                # independent of every padded row → their gradient is exactly
+                # zero. grad_X/grad_Y rows already vanish (zero weight + zeroed
+                # gfit), but grad_w[i] = Σ Ā X[i]X[i] + Σ b̄ X[i]Y[i] is built
+                # from the un-zeroed X/Y rows, so zero it explicitly.
+                gXk = gXk.clone()
+                gYk = gYk.clone()
+                gwk = gwk.clone()
+                gXk[active:] = 0
+                gYk[active:] = 0
+                gwk[active:] = 0
             grad_X[k] = gXk
             grad_Y[k] = gYk
             grad_penalty = grad_penalty + gPk
@@ -974,9 +995,12 @@ def gaussian_weighted_ridge(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Closed-form Gaussian row-weighted ridge solve.
 
-    Forward-only: :mod:`gamfit._api` exposes no analytic VJP for this primitive,
-    so the returned tensors carry no autograd path. ``weights`` are likelihood
-    row weights, not a multiplicative gate on the design row.
+    The returned ``(coef, fitted)`` carry an exact analytic backward through
+    ``X``, ``Y``, ``penalty`` and ``weights`` (forward keeps the Rust numerics;
+    backward applies the closed-form VJP of ``β = (XᵀWX + λS)⁻¹XᵀWY`` with torch
+    ops). ``ridge_lambda`` is a python float and is non-differentiable.
+    ``weights`` are likelihood row weights, not a multiplicative gate on the
+    design row.
 
     Parameters
     ----------
@@ -996,14 +1020,11 @@ def gaussian_weighted_ridge(
     (torch.Tensor, torch.Tensor)
         ``coefficients`` of shape ``(M, D)`` and ``fitted`` of shape ``(N, D)``.
     """
-    coef_np, fit_np = _api.gaussian_weighted_ridge(
-        to_numpy_f64(X),
-        to_numpy_f64(Y),
-        to_numpy_f64(penalty),
-        to_numpy_f64(weights),
-        ridge_lambda=float(ridge_lambda),
+    apply = cast(
+        Callable[..., tuple[torch.Tensor, torch.Tensor]],
+        _GaussianWeightedRidgeFn.apply,
     )
-    return from_numpy_like(coef_np, X), from_numpy_like(fit_np, X)
+    return apply(X, Y, penalty, weights, float(ridge_lambda))
 
 
 def gaussian_weighted_ridge_batch(
@@ -1017,10 +1038,14 @@ def gaussian_weighted_ridge_batch(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Batched closed-form Gaussian row-weighted ridge solve.
 
-    Forward-only: no analytic VJP is exposed in :mod:`gamfit._api`. ``X`` has
-    shape ``(K, Nmax, M)``, ``Y`` has shape ``(K, Nmax, D)``, ``weights`` has
-    shape ``(K, Nmax)``, and ``row_counts`` optionally marks the active row
-    prefix per problem in a padded ragged batch.
+    The returned ``(coef, fitted)`` carry an exact analytic backward through
+    ``X``, ``Y``, ``penalty`` and ``weights``, applied per problem with the
+    closed-form VJP (forward keeps the Rust numerics). ``X`` has shape
+    ``(K, Nmax, M)``, ``Y`` has shape ``(K, Nmax, D)``, ``weights`` has shape
+    ``(K, Nmax)``, and ``row_counts`` optionally marks the active row prefix per
+    problem in a padded ragged batch — padded rows contribute zero to the
+    backward (their weights are zeroed). ``ridge_lambda`` is a python float and
+    is non-differentiable; ``row_counts`` carries no gradient.
 
     Returns
     -------
@@ -1028,12 +1053,8 @@ def gaussian_weighted_ridge_batch(
         ``coefficients`` of shape ``(K, M, D)`` and ``fitted`` of shape
         ``(K, Nmax, D)``.
     """
-    coef_np, fit_np = _api.gaussian_weighted_ridge_batch(
-        to_numpy_f64(X),
-        to_numpy_f64(Y),
-        to_numpy_f64(penalty),
-        to_numpy_f64(weights),
-        ridge_lambda=float(ridge_lambda),
-        row_counts=None if row_counts is None else to_numpy_uintp(row_counts),
+    apply = cast(
+        Callable[..., tuple[torch.Tensor, torch.Tensor]],
+        _GaussianWeightedRidgeBatchFn.apply,
     )
-    return from_numpy_like(coef_np, X), from_numpy_like(fit_np, X)
+    return apply(X, Y, penalty, weights, float(ridge_lambda), row_counts)
