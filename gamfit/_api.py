@@ -3434,7 +3434,27 @@ def _index_vector(values: Any, label: str) -> Any:
     if arr.size == 0:
         raise ValueError(f"{label} cannot be empty")
     if arr.dtype != np.dtype(np.uintp):
-        raise TypeError(f"{label} must be a numpy uintp array for zero-copy FFI")
+        # Coerce integer-valued input (torch tensor, int64/lists, integral
+        # floats) to the uintp layout the FFI needs, instead of rejecting it.
+        # This mirrors how `t`/`y` are coerced and keeps the call site
+        # symmetric (see issue gam#581).
+        kind = arr.dtype.kind
+        if kind in ("i", "u"):
+            if kind == "i" and np.any(arr < 0):
+                raise ValueError(f"{label} must be non-negative")
+        elif kind == "f":
+            if not np.all(np.isfinite(arr)):
+                raise ValueError(f"{label} must contain only finite values")
+            if np.any(arr < 0) or np.any(arr != np.floor(arr)):
+                raise TypeError(
+                    f"{label} must be integer-valued; got non-integer float entries"
+                )
+        else:
+            raise TypeError(
+                f"{label} must be an integer array (or integral numeric); "
+                f"got dtype {arr.dtype}"
+            )
+        arr = np.ascontiguousarray(arr.astype(np.uintp))
     if label == "row_offsets":
         if arr.size < 2:
             raise ValueError("row_offsets must contain at least start and stop offsets")
