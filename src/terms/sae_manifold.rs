@@ -8755,4 +8755,128 @@ mod tests {
             "the two penalties must not collapse onto the same atom"
         );
     }
+
+    /// Build a minimal single-atom periodic SAE outer objective for the
+    /// warm-start contract tests (gam#577 / gam#579).
+    fn warmstart_test_objective() -> SaeManifoldOuterObjective {
+        let coords = array![[0.10], [0.35], [0.62], [0.88]];
+        let (phi, jet) = periodic_basis(&coords);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            // Decoder mapping the 3 basis fns to a single output channel.
+            array![[0.30], [-0.20], [0.15]],
+            // Mild ridge-like smoothness penalty so the inner solve is PD.
+            Array2::<f64>::eye(3),
+        )
+        .unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode(
+            // Nonzero assignment mass so H_tt carries genuine data curvature.
+            array![[0.9_f64], [0.8], [0.7], [0.6]],
+            vec![coords],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.20_f64], [-0.10], [0.30], [0.05]];
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1)]);
+        SaeManifoldOuterObjective::new(term, target, None, rho, 8, 1.0, 1.0e-6, 1.0e-6)
+    }
+
+    /// gam#577 / gam#579 root cause: the continuation pre-warm forwards an
+    /// EMPTY β before the first accepted eval (`state.last_beta` starts
+    /// empty). The seed hook must treat that as the documented "no warm-start
+    /// available, proceed cold" no-op (`SeedOutcome::NoSlot`) rather than
+    /// erroring on `β length 0 != decoder dim` — the error dropped EVERY
+    /// continuation seed and forced a full cold solve on every outer seed.
+    #[test]
+    fn seed_inner_state_accepts_empty_beta_as_noslot() {
+        let mut obj = warmstart_test_objective();
+        let empty: Array1<f64> = Array1::zeros(0);
+        let outcome = obj
+            .seed_inner_state(&empty)
+            .expect("empty-β seed must be accepted as a no-op, not rejected (gam#577/#579)");
+        assert!(
+            matches!(outcome, SeedOutcome::NoSlot),
+            "empty-β seed must report NoSlot (proceed cold); got {outcome:?}"
+        );
+    }
+
+    /// A populated β whose length matches the decoder dimension must be
+    /// INSTALLED and then GENUINELY REUSED by the next inner solve — this is
+    /// the warm-start the continuation walk relies on for the big speedup
+    /// (gam#577 / gam#579). We verify reuse behaviorally: seed a known β, run
+    /// one eval with zero inner Newton iterations (so the solve cannot move
+    /// β off the seed), and confirm the published `inner_beta_hint` is exactly
+    /// the seeded β. A cold start would have published the term's pristine β
+    /// instead.
+    #[test]
+    fn seed_inner_state_installs_and_reuses_matching_beta() {
+        let mut obj = warmstart_test_objective();
+        let dim = obj.term.beta_dim();
+        // A distinctive seed that differs from the term's pristine decoder.
+        let pristine = obj.term.flatten_beta();
+        let seed: Array1<f64> =
+            Array1::from_shape_fn(dim, |i| pristine[i] + 0.5 + 0.01 * (i as f64));
+        assert!(
+            (&seed - &pristine).iter().any(|d| d.abs() > 1e-6),
+            "seed must differ from the pristine β for the reuse check to be meaningful"
+        );
+
+        let outcome = obj
+            .seed_inner_state(&seed)
+            .expect("a length-matching β must install");
+        assert!(
+            matches!(outcome, SeedOutcome::Installed),
+            "matching β must report Installed; got {outcome:?}"
+        );
+
+        // Freeze the inner solve at zero Newton iterations: β cannot move off
+        // the warm-start, so the published hint must equal the seed exactly.
+        obj.inner_max_iter = 0;
+        let rho_flat = obj.baseline_rho.to_flat();
+        let eval = OuterObjective::eval(&mut obj, &rho_flat)
+            .expect("eval at the warm-started β must succeed");
+        let hint = eval
+            .inner_beta_hint
+            .expect("the SAE objective must publish inner_beta_hint for continuation reuse");
+        assert_eq!(
+            hint.len(),
+            dim,
+            "published hint must have decoder dimension"
+        );
+        for (i, (&h, &s)) in hint.iter().zip(seed.iter()).enumerate() {
+            assert!(
+                (h - s).abs() < 1e-12,
+                "warm-started β must be reused verbatim by the inner solve at coord {i}: \
+                 hint {h} != seed {s} (gam#577/#579)"
+            );
+        }
+    }
+
+    /// The seed contract is only relaxed for the EMPTY sentinel. A populated
+    /// β whose length disagrees with the decoder dimension is a genuine
+    /// layout bug and must still surface a typed error rather than being
+    /// silently dropped.
+    #[test]
+    fn seed_inner_state_rejects_wrong_length_populated_beta() {
+        let mut obj = warmstart_test_objective();
+        let dim = obj.term.beta_dim();
+        let wrong: Array1<f64> = Array1::zeros(dim + 1);
+        let err = obj
+            .seed_inner_state(&wrong)
+            .expect_err("a populated β of the wrong length must be rejected");
+        match err {
+            EstimationError::RemlOptimizationFailed(msg) => {
+                assert!(
+                    msg.contains("decoder dim"),
+                    "error must name the decoder-dim mismatch; got: {msg}"
+                );
+            }
+            other => panic!("expected RemlOptimizationFailed, got {other:?}"),
+        }
+    }
 }
