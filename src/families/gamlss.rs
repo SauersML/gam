@@ -9238,7 +9238,8 @@ impl DesignTwoBlockRowCoeffOperator {
 ///   H = [[X_mu^T diag(w) X_mu,    X_mu^T diag(cross) X_ls],
 ///        [X_ls^T diag(cross) X_mu, X_ls^T diag(scale) X_ls]],
 ///
-/// with `cross = 2κm` and `scale = 2κ²n + κ'(a−n)`. The matvec applies
+/// with `cross = 2κm` and `scale = 2κ²a` (the Fisher/expected (log σ, log σ)
+/// information, #566 — see `exact_newton_joint_hessian`). The matvec applies
 /// each block by a single design-matrix multiply on each side, so the cost
 /// is Θ(n (p_mu + p_ls)) per `Hv` rather than Θ(n (p_mu + p_ls)²) to form
 /// the dense matrix.
@@ -9264,8 +9265,12 @@ impl GaussianLocationScaleHessianWorkspace {
         let rows = family.get_or_compute_row_scalars(etamu, eta_ls)?;
         let coeff_mm = rows.w.clone();
         let coeff_ml = 2.0 * &rows.kappa * &rows.m;
-        let amn = &rows.obs_weight - &rows.n;
-        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.n + &rows.kappa_prime * &amn;
+        // Fisher/expected (log σ, log σ) information E[H_{ls,ls}] = 2κ²a (#566):
+        // the observed 2κ²n + κ'(a−n) collapses at small residuals and
+        // over-smooths the scale; E[n]=a gives the residual-free 2κ²a, matching
+        // `exact_newton_joint_hessian` so the matrix-free operator and the
+        // dense path feed the REML determinant the same curvature.
+        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         Ok(Self {
             family,
             block_states,
@@ -9980,18 +9985,6 @@ fn gls_wiggle_second_directional_coeffs(
     let dm_uv = &(2.0 * &rows.w * &(q_u * &szeta_v + q_v * &szeta_u)) - &(&rows.w * q_uv)
         + &(4.0 * &rows.m * &(&szeta_u * &szeta_v))
         - 2.0 * &rows.m * &rows.kappa_prime * &zeta_u_zeta_v;
-    let dn_uv = &(2.0 * &rows.w * &(q_u * q_v))
-        + &(4.0 * &rows.m * &(q_u * &szeta_v + q_v * &szeta_u))
-        - &(2.0 * &rows.m * q_uv)
-        + &(4.0 * &rows.n * &(&szeta_u * &szeta_v))
-        - 2.0 * &rows.n * &rows.kappa_prime * &zeta_u_zeta_v;
-    let dn_u = -(2.0 * &rows.m * q_u) - &(2.0 * &rows.n * &szeta_u);
-    let dn_v = -(2.0 * &rows.m * q_v) - &(2.0 * &rows.n * &szeta_v);
-    let one_minus_2kappa = rows.kappa.mapv(|k| 1.0 - 2.0 * k);
-    let kappa_tprime =
-        &rows.kappa_dprime * &one_minus_2kappa - 2.0 * &(&rows.kappa_prime * &rows.kappa_prime);
-    let amn = &rows.obs_weight - &rows.n;
-
     let coeff_mm_uv = &(&dw_uv * &geom.dq_dq0.mapv(|v| v * v))
         + &(2.0 * &dw_u * &geom.dq_dq0 * s1_v)
         + &(2.0 * &dw_v * &geom.dq_dq0 * s1_u)
@@ -10008,15 +10001,14 @@ fn gls_wiggle_second_directional_coeffs(
         * &(&dm_uv * &geom.dq_dq0 + &dm_u * s1_v + &dm_v * s1_u + &rows.m * s1_uv)
         + 2.0 * &rows.kappa_prime * &(zeta_u * &a_md_v + zeta_v * &a_md_u)
         + 2.0 * &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m * &geom.dq_dq0;
-    let two_ki2_minus_kpi = 2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime;
-    let four_kkpi_minus_kdpi = 4.0 * &(&rows.kappa * &rows.kappa_prime) - &rows.kappa_dprime;
-    let zeta_n_sym = zeta_u * &dn_v + zeta_v * &dn_u;
-    let bracketed_eta_eta =
-        4.0 * &rows.n * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
-            + &kappa_tprime * &amn;
-    let coeff_ll_uv = &two_ki2_minus_kpi * &dn_uv
-        + &four_kkpi_minus_kdpi * &zeta_n_sym
-        + &bracketed_eta_eta * &zeta_u_zeta_v;
+    // Second directional derivative of the Fisher (log σ, log σ) block
+    // coeff_ll = 2κ²a (#566). η_ls is linear in β (no zeta_uv), so the only
+    // surviving term is ∂²(2κ²a)/∂η² · zeta_u·zeta_v = 4a(κ'²+κκ'')·zeta_u·zeta_v
+    // — matching the dense helper `d_uv` (gaussian_jointsecond_directionalweights).
+    let coeff_ll_uv = 4.0
+        * &rows.obs_weight
+        * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
+        * &zeta_u_zeta_v;
 
     let a_u = &dw_u * &geom.dq_dq0 + &rows.w * s1_u;
     let a_v = &dw_v * &geom.dq_dq0 + &rows.w * s1_v;
@@ -10286,7 +10278,6 @@ impl GaussianLocationScaleWiggleFamily {
         let basis1_u = scale_matrix_rows(&geom.basis_d2, &xi)?;
         let dw_u = -2.0 * &rows.w * &szeta;
         let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
 
         let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
@@ -10372,7 +10363,6 @@ impl GaussianLocationScaleWiggleFamily {
         g2_u += &fast_av(&geom.basis_d2, &uw);
         let dw_u = -2.0 * &rows.w * &szeta;
         let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
 
         let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
@@ -11016,9 +11006,6 @@ impl GaussianLocationScaleWiggleFamily {
         let e_b = &dir_b.z_ls_psi;
         let e_ab = &second_drifts.z_ls_ab;
         let amn = &rows.obs_weight - &rows.n;
-        let one_minus_2kappa = rows.kappa.mapv(|k| 1.0 - 2.0 * k);
-        let kappa_tprime =
-            &rows.kappa_dprime * &one_minus_2kappa - 2.0 * &(&rows.kappa_prime * &rows.kappa_prime);
         // 4κ² − 2κ' (∂²w/∂η² style coefficient when both directions hit η_ls).
         let four_k2_minus_2kpi = 4.0 * &rows.kappa * &rows.kappa - 2.0 * &rows.kappa_prime;
 
@@ -11086,11 +11073,12 @@ impl GaussianLocationScaleWiggleFamily {
         );
 
         // Static blocks under logb. coeff_mm has no κ; coeff_ml = 2κmD;
-        // coeff_ll = 2κ²n + κ'(a−n); l = 2κm. The directional derivatives
-        // pick up κ', κ'', κ''' on every leg that hits η_ls.
+        // coeff_ll = Fisher 2κ²a (#566); l = 2κm. The cross-block directional
+        // derivatives pick up κ', κ'' on every leg that hits η_ls; the Fisher
+        // (ls,ls) block depends only on η_ls so its derivatives carry only κ.
         let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
         let coeff_ml = 2.0 * &rows.kappa * &rows.m * &geom.dq_dq0;
-        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.n + &rows.kappa_prime * &amn;
+        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         // coeff_mm_a/b/ab: structurally κ-free; correctness now follows from
         // dw_a/_b/_ab and dm_a/_b/_ab carrying the κ chain on η_ls (above).
         let coeff_mm_a = &(&dw_a * &geom.dq_dq0.mapv(|v| v * v))
@@ -11127,23 +11115,18 @@ impl GaussianLocationScaleWiggleFamily {
                     + e_b * &(&dm_a * &geom.dq_dq0 + &rows.m * &s1_a))
             + 2.0 * &rows.kappa_dprime * &(e_a * e_b) * &rows.m * &geom.dq_dq0
             + 2.0 * &rows.kappa_prime * e_ab * &(&rows.m * &geom.dq_dq0);
-        // coeff_ll_a = (2κ²−κ')n_a + (4κκ'n + κ''(a−n))·e_a.
-        let coeff_ll_a = (2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime) * &dn_a
-            + (4.0 * &rows.kappa * &rows.kappa_prime * &rows.n + &rows.kappa_dprime * &amn) * e_a;
-        let coeff_ll_b = (2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime) * &dn_b
-            + (4.0 * &rows.kappa * &rows.kappa_prime * &rows.n + &rows.kappa_dprime * &amn) * e_b;
-        // coeff_ll_ab: full ψ-second-order ∂²(2κ²n + κ'(a−n))/∂a∂b. β-only
-        // factored form per math team's verification, plus the η_ab leg
-        // (4κκ'n + κ''(a−n))·e_ab from differentiating once at η_ab.
-        let coeff_ll_ab = (2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime) * &dn_ab
-            + (4.0 * &rows.kappa * &rows.kappa_prime - &rows.kappa_dprime)
-                * &(e_a * &dn_b + e_b * &dn_a)
-            + (4.0
-                * &rows.n
-                * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
-                + &kappa_tprime * &amn)
-                * &(e_a * e_b)
-            + (4.0 * &rows.kappa * &rows.kappa_prime * &rows.n + &rows.kappa_dprime * &amn) * e_ab;
+        // Fisher (ls,ls) coeff_ll = 2κ²a (a constant prior weight) depends only
+        // on η_ls (#566): ∂(2κ²a)/∂η = 4κκ'a, so the ψ-first derivatives are
+        // 4κκ'a·e_a / e_b. The η_ab leg carries one κ on top.
+        let coeff_ll_a = 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * e_a;
+        let coeff_ll_b = 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * e_b;
+        // coeff_ll_ab = ∂²(2κ²a)/∂a∂b = 4a(κ'²+κκ'')·e_a·e_b + 4κκ'a·e_ab
+        // (mirrors the dense helper `d2h_ls_ls`).
+        let coeff_ll_ab = 4.0
+            * &rows.obs_weight
+            * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
+            * &(e_a * e_b)
+            + 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * e_ab;
         let a = &rows.w * &geom.dq_dq0;
         let a_a = &dw_a * &geom.dq_dq0 + &rows.w * &s1_a;
         let a_b = &dw_b * &geom.dq_dq0 + &rows.w * &s1_b;
@@ -11435,28 +11418,17 @@ impl GaussianLocationScaleWiggleFamily {
         // logb κ-chain on η_ls; e_a = ψ_a's η_ls direction, ζ = β-direction.
         // η_au = zls_a_u is the second mixed derivative (β·ψ).
         let e_a = &dir_a.z_ls_psi;
-        let amn = &rows.obs_weight - &rows.n;
-        let one_minus_2kappa = rows.kappa.mapv(|k| 1.0 - 2.0 * k);
-        let kappa_tprime =
-            &rows.kappa_dprime * &one_minus_2kappa - 2.0 * &(&rows.kappa_prime * &rows.kappa_prime);
         let four_k2_minus_2kpi = 4.0 * &rows.kappa * &rows.kappa - 2.0 * &rows.kappa_prime;
         let dw_u = -2.0 * &rows.w * &rows.kappa * &zeta;
         let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &rows.kappa * &zeta);
-        let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &rows.kappa * &zeta);
         let dw_a = -2.0 * &rows.w * &rows.kappa * e_a;
         let dm_a = -(&rows.w * &q_a) - &(2.0 * &rows.m * &rows.kappa * e_a);
-        let dn_a = -(2.0 * &rows.m * &q_a) - &(2.0 * &rows.n * &rows.kappa * e_a);
         let dw_a_u = &four_k2_minus_2kpi * &rows.w * &(e_a * &zeta)
             - &(2.0 * &rows.w * &rows.kappa * &zls_a_u);
         let dm_a_u = &(2.0 * &rows.w * &rows.kappa * &(&q_a * &zeta + &q_u * e_a))
             - &(&rows.w * &q_a_u)
             + &(&four_k2_minus_2kpi * &rows.m * &(e_a * &zeta))
             - &(2.0 * &rows.m * &rows.kappa * &zls_a_u);
-        let dn_a_u = &(2.0 * &rows.w * &(&q_a * &q_u))
-            + &(4.0 * &rows.m * &rows.kappa * &(&q_a * &zeta + &q_u * e_a))
-            - &(2.0 * &rows.m * &q_a_u)
-            + &(&four_k2_minus_2kpi * &rows.n * &(e_a * &zeta))
-            - &(2.0 * &rows.n * &rows.kappa * &zls_a_u);
 
         let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
@@ -11465,9 +11437,9 @@ impl GaussianLocationScaleWiggleFamily {
         // coeff_ml_u = ∂(2κmD)/∂u = 2κ(dm_u·D + m·s1_u) + 2κ'·ζ·m·D.
         let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
             + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
-        // coeff_ll_u = (2κ²−κ')·dn_u + (4κκ'·n + κ''(a−n))·ζ.
-        let coeff_ll_u = (2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime) * &dn_u
-            + (4.0 * &rows.kappa * &rows.kappa_prime * &rows.n + &rows.kappa_dprime * &amn) * &zeta;
+        // Fisher (ls,ls) coeff_ll = 2κ²a (#566); ∂(2κ²a)/∂η = 4κκ'a, so the
+        // β-drift derivative along ζ is 4κκ'a·ζ.
+        let coeff_ll_u = 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * &zeta;
         let coeff_mm_a_u = &(&dw_a_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &dw_a * &geom.dq_dq0 * &s1_u)
             + &(2.0 * &dw_u * &geom.dq_dq0 * &s1_a)
@@ -11488,18 +11460,14 @@ impl GaussianLocationScaleWiggleFamily {
                     + &zeta * &(&dm_a * &geom.dq_dq0 + &rows.m * &s1_a))
             + 2.0 * &rows.kappa_dprime * &(e_a * &zeta) * &rows.m * &geom.dq_dq0
             + 2.0 * &rows.kappa_prime * &zls_a_u * &(&rows.m * &geom.dq_dq0);
-        // coeff_ll_a_u = ∂²(2κ²n + κ'(a−n))/∂a∂u — full mixed second
-        // derivative with the η_au leg added via (4κκ'n + κ''(a−n))·η_au.
-        let coeff_ll_a_u = (2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime) * &dn_a_u
-            + (4.0 * &rows.kappa * &rows.kappa_prime - &rows.kappa_dprime)
-                * &(e_a * &dn_u + &zeta * &dn_a)
-            + (4.0
-                * &rows.n
-                * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
-                + &kappa_tprime * &amn)
-                * &(e_a * &zeta)
-            + (4.0 * &rows.kappa * &rows.kappa_prime * &rows.n + &rows.kappa_dprime * &amn)
-                * &zls_a_u;
+        // coeff_ll_a_u = ∂²(2κ²a)/∂a∂u for the Fisher (ls,ls) block (#566):
+        // 4a(κ'²+κκ'')·e_a·ζ + 4κκ'a·η_au (the η_au=zls_a_u mixed leg), mirroring
+        // the dense mixed-drift helper.
+        let coeff_ll_a_u = 4.0
+            * &rows.obs_weight
+            * &(&rows.kappa_prime * &rows.kappa_prime + &rows.kappa * &rows.kappa_dprime)
+            * &(e_a * &zeta)
+            + 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * &zls_a_u;
 
         let a = &rows.w * &geom.dq_dq0;
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;

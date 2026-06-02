@@ -3,6 +3,7 @@ use gam::families::gamlss::{
     BinomialLocationScaleFamily, BinomialMeanWiggleFamily, GammaLogFamily,
     GaussianLocationScaleFamily, PoissonLogFamily,
 };
+use gam::families::sigma_link::LOGB_SIGMA_FLOOR;
 use gam::matrix::DesignMatrix;
 use gam::resource::ResourcePolicy;
 use gam::types::{InverseLink, StandardLink};
@@ -64,11 +65,40 @@ fn gamlss_joint_derivatives_match_finite_difference() {
     let y_ga = array![1.2, 0.8, 2.0, 1.5, 0.6];
     let w = Array1::ones(5);
 
+    // The (log σ, log σ) block of the Gaussian location-scale joint Hessian is
+    // the Fisher/expected information E[H_{ls,ls}] = Σ 2κ²a·z² (gam#566), NOT
+    // the observed log-likelihood curvature 2κ²n + κ'(a−n) that finite
+    // differencing the log-likelihood recovers. The Fisher form is what feeds
+    // the REML determinant/EDF (Fisher scoring, as gamlss/mgcv gaulss do); the
+    // score stays the exact observed gradient so the stationary point is
+    // unchanged. So for the Gaussian ls block we assert against the analytic
+    // Fisher value instead of FD; every other diagonal/cross block and every
+    // score component still matches FD of the actual log-likelihood exactly.
+    type LsFisherOverride = Option<(usize, Box<dyn Fn(&Array1<f64>) -> f64>)>;
+    let z_for_fisher = z.clone();
+    let w_for_fisher = w.clone();
+    let gaussian_ls_fisher: LsFisherOverride = Some((
+        1usize,
+        Box::new(move |beta: &Array1<f64>| {
+            // η_ls = z·β_ls; σ = LOGB_SIGMA_FLOOR + exp(η_ls); κ = (dσ/dη)/σ.
+            (0..z_for_fisher.nrows())
+                .map(|i| {
+                    let eta_ls = z_for_fisher[[i, 0]] * beta[1];
+                    let dsigma = eta_ls.exp();
+                    let sigma = LOGB_SIGMA_FLOOR + dsigma;
+                    let kappa = dsigma / sigma;
+                    2.0 * kappa * kappa * w_for_fisher[i] * z_for_fisher[[i, 0]].powi(2)
+                })
+                .sum()
+        }),
+    ));
+
     let families: Vec<(
         Box<dyn CustomFamily>,
         Vec<ParameterBlockSpec>,
         Array1<f64>,
         Option<(usize, usize)>,
+        LsFisherOverride,
     )> = vec![
         (
             Box::new(GaussianLocationScaleFamily {
@@ -82,6 +112,7 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             vec![spec("mu", &x), spec("log_sigma", &z)],
             array![0.3, -0.2],
             Some((0, 1)),
+            gaussian_ls_fisher,
         ),
         (
             Box::new(BinomialLocationScaleFamily {
@@ -95,6 +126,7 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             vec![spec("threshold", &x), spec("log_sigma", &z)],
             array![0.1, 0.15],
             Some((0, 1)),
+            None,
         ),
         (
             Box::new(BinomialMeanWiggleFamily {
@@ -111,6 +143,7 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             ],
             array![0.05, 0.02],
             Some((0, 1)),
+            None,
         ),
         (
             Box::new(PoissonLogFamily {
@@ -119,6 +152,7 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             }),
             vec![spec("eta", &x)],
             array![0.25],
+            None,
             None,
         ),
         (
@@ -130,10 +164,11 @@ fn gamlss_joint_derivatives_match_finite_difference() {
             vec![spec("eta", &x)],
             array![0.2],
             None,
+            None,
         ),
     ];
 
-    for (fam, specs, beta0, cross_pair) in families {
+    for (fam, specs, beta0, cross_pair, ls_fisher_override) in families {
         let f = |b: &Array1<f64>| {
             let states = if specs.len() == 2 {
                 vec![
@@ -183,13 +218,45 @@ fn gamlss_joint_derivatives_match_finite_difference() {
         let analytic_h = -&h_pos;
         for i in 0..beta0.len() {
             let g_fd = fd_grad(&f, &beta0, i, 1e-6);
-            let h_fd = fd_hess_diag(&f, &beta0, i, 1e-5);
+            // The score (gradient) is always the exact observed gradient, so it
+            // must match FD of the log-likelihood to machine precision — this is
+            // what guarantees the joint Newton converges to the true MLE
+            // stationary point even when the (ls,ls) curvature is Fisher.
             assert!(
                 (analytic_grad[i] - g_fd).abs() <= 1e-7,
                 "grad mismatch i={i}: analytic={} fd={}",
                 analytic_grad[i],
                 g_fd
             );
+            if let Some((ls_idx, fisher_fn)) = ls_fisher_override.as_ref()
+                && *ls_idx == i
+            {
+                // Fisher (expected) (ls,ls) information feeds the REML
+                // determinant (gam#566); assert the analytic block equals the
+                // analytic Fisher value Σ 2κ²a·z², not the observed FD curvature.
+                // `analytic_h = -h_pos`, so the log-likelihood-space entry is
+                // the negative of the (positive-definite) Fisher information.
+                let fisher = fisher_fn(&beta0);
+                assert!(
+                    (analytic_h[[i, i]] + fisher).abs() <= 1e-9 * (1.0 + fisher.abs()),
+                    "ls,ls Fisher-info mismatch i={i}: analytic={} expected_fisher_negated={}",
+                    analytic_h[[i, i]],
+                    -fisher
+                );
+                // Confirm the Fisher form genuinely differs from the observed FD
+                // curvature on this (off-truth) data point — otherwise the
+                // assertion above would be vacuously also-FD and the #566 change
+                // untested.
+                let h_fd = fd_hess_diag(&f, &beta0, i, 1e-5);
+                assert!(
+                    (analytic_h[[i, i]] - h_fd).abs() > 1e-6,
+                    "ls,ls Fisher and observed FD coincide (test no longer exercises #566): analytic={} fd={}",
+                    analytic_h[[i, i]],
+                    h_fd
+                );
+                continue;
+            }
+            let h_fd = fd_hess_diag(&f, &beta0, i, 1e-5);
             assert!(
                 (analytic_h[[i, i]] - h_fd).abs() <= 1e-5,
                 "hess diag mismatch i={i}: analytic={} fd={}",

@@ -12306,7 +12306,15 @@ fn compute_kkt_refusal_report(
                 .map(|s| {
                     let n = s.beta.len();
                     let end = (acc + n).min(joint_grad.len());
-                    let nrm = if acc < end {
+                    // A width-0 block (e.g. a constant-scale `noise_formula="1"`
+                    // log_sigma channel collapsed to zero free coefficients,
+                    // gam#553) has no gradient and a zero residual — report 0.0,
+                    // not the NaN sentinel. The NaN sentinel is reserved for a
+                    // genuine layout mismatch: a positive-width block whose
+                    // coordinates fall past the end of the joint gradient.
+                    let nrm = if n == 0 {
+                        0.0
+                    } else if acc < end {
                         joint_grad
                             .slice(ndarray::s![acc..end])
                             .iter()
@@ -12994,6 +13002,87 @@ fn constrained_stationary_certificate_decision(
     } else {
         ConstrainedStationaryCertificate::RefusePhantomMultiplier
     }
+}
+
+/// Inf-norm of the active-set-projected stationarity residual restricted to the
+/// **range** of the joint penalized Hessian `H_pen = H + S(λ) + ridge·I`.
+///
+/// A penalized smooth whose penalty has a polynomial null space the censored /
+/// location-scale data does not pin down (TP / Bernstein trend directions in a
+/// survival `time_transform` or `log_sigma` channel, gam#553) leaves a residual
+/// that lives entirely in `ker(H_pen)`: along that direction the objective has
+/// neither curvature nor a constraint, so it is a genuinely *free* gauge
+/// direction, not an unresolved KKT defect. The total residual inf-norm then
+/// stays large forever and the phantom-multiplier refusal never clears, aborting
+/// the fit at REML startup even though the iterate is stationary on the entire
+/// identifiable (range) subspace.
+///
+/// The downstream outer IFT trace already removes the null-space component via
+/// the projected pseudo-inverse `U_S·H_proj⁻¹·U_Sᵀ`, so only a *range-space*
+/// residual component can bias the envelope gradient (see the "do NOT
+/// soft-accept" investigation note at the certifier call site). This returns the
+/// range-space inf-norm so the certifier can accept iff that — the only part
+/// that matters for outer correctness — is at tolerance, while a real defect
+/// (residual with mass in the curved subspace) still refuses.
+///
+/// Returns `None` when the penalized Hessian cannot be materialized or
+/// eigendecomposed, or carries no numerical null space — in which case the
+/// caller keeps the strict total-residual refusal (no null space ⇒ range = all).
+fn projected_residual_range_space_inf(
+    projected_residual: &Array1<f64>,
+    joint_hessian_source: &JointHessianSource,
+    ranges: &[(usize, usize)],
+    s_lambdas: &[Array2<f64>],
+    ridge: f64,
+    ridge_policy: RidgePolicy,
+    total_p: usize,
+) -> Option<f64> {
+    if total_p == 0 || projected_residual.len() != total_p {
+        return None;
+    }
+    let mut h_joint = materialize_joint_hessian_source(
+        joint_hessian_source,
+        total_p,
+        "penalty-null-space certificate spectrum",
+    )
+    .ok()?;
+    let model_diagonal_ridge = if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+        ridge
+    } else {
+        0.0
+    };
+    add_joint_penalty_to_matrix(&mut h_joint, ranges, s_lambdas, model_diagonal_ridge, None);
+    symmetrize_dense_in_place(&mut h_joint);
+    let (evals, evecs) = FaerEigh::eigh(&h_joint, Side::Lower).ok()?;
+    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+    let nullity = evals.iter().filter(|x| x.abs() < cutoff).count();
+    if nullity == 0 {
+        // No data-unconstrained null space — the range is the whole space, so
+        // the strict total-residual refusal already governs. Signal "no relief".
+        return None;
+    }
+    // Range-space residual = residual minus its projection onto ker(H_pen).
+    // Equivalently, accumulate the residual's coordinates along every
+    // range-space (|λ| ≥ cutoff) eigenvector. The eigenbasis is orthonormal,
+    // so ‖P_range r‖∞ is read off the reconstructed range component.
+    let mut range_component = Array1::<f64>::zeros(total_p);
+    for k in 0..evals.len() {
+        if evals[k].abs() < cutoff {
+            continue;
+        }
+        let coeff = evecs.column(k).dot(projected_residual);
+        range_component.scaled_add(coeff, &evecs.column(k));
+    }
+    Some(
+        range_component
+            .iter()
+            .map(|x: &f64| x.abs())
+            .fold(0.0_f64, f64::max),
+    )
 }
 
 fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -14687,8 +14776,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .zip(&block_penalty_norms)
                 .map(|(grad_norm, penalty_norm)| inner_tol * (1.0 + grad_norm.max(*penalty_norm)))
                 .collect::<Vec<_>>();
-            let block_stationarity_norms = {
-                let projected = exact_newton_joint_projected_stationarity_vector_from_gradient(
+            // Active-set-projected stationarity residual vector (multiplier
+            // mass of every pinned bound row already subtracted). Lifted out of
+            // the per-block norm reduction so the constrained-stationary
+            // certificate below can also test its component in the *range* of
+            // the penalized Hessian (gam#553 penalty-null-space acceptance).
+            let projected_residual_vec =
+                exact_newton_joint_projected_stationarity_vector_from_gradient(
                     gradient,
                     &states,
                     specs,
@@ -14698,6 +14792,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &block_constraints,
                     Some(cached_active_sets.as_slice()),
                 )?;
+            let block_stationarity_norms = {
                 let mut offset = 0usize;
                 states
                     .iter()
@@ -14705,7 +14800,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         let start = offset;
                         let end = start + state.beta.len();
                         offset = end;
-                        projected
+                        projected_residual_vec
                             .slice(ndarray::s![start..end])
                             .iter()
                             .map(|x: &f64| x.abs())
@@ -14778,6 +14873,32 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     line_search_attempts,
                     cycle_started.elapsed().as_secs_f64(),
                 );
+            }
+
+            // Divergence guard: a non-finite KKT residual, objective, or
+            // log-likelihood means the inner joint Newton has diverged (NaN
+            // mass propagating from a near-unidentified penalized block — the
+            // binomial location-scale shared-basis log-σ deviation channel is
+            // the canonical trigger, gam#554). Every convergence and
+            // residual-stall exit below is gated on finite `<=` comparisons,
+            // which a NaN residual silently defeats; left unguarded the loop
+            // then grinds the full `inner_loop_hard_ceiling` on every outer
+            // ρ-eval and every startup seed, which is the multi-hour "hang".
+            // Treat it as immediate non-convergence so the outer optimizer
+            // rejects this point cleanly instead of burning the budget.
+            if !residual.is_finite()
+                || !lastobjective.is_finite()
+                || !current_log_likelihood.is_finite()
+            {
+                log::warn!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | divergence guard: non-finite inner state (residual={:.3e}, objective={:.3e}, -loglik={:.3e}); returning unconverged so the outer optimizer rejects this ρ evaluation instead of running to inner_max_cycles.",
+                    cycle,
+                    residual,
+                    lastobjective,
+                    -current_log_likelihood,
+                );
+                converged = false;
+                break;
             }
 
             // KKT convergence: a small post-step residual is the
@@ -14997,6 +15118,53 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             cert_residual_factor * residual_tol,
                             objective_change,
                             geometric_tail_bound.unwrap_or(objective_change),
+                            objective_tol,
+                        );
+                        converged = true;
+                        break;
+                    }
+                    // Penalty-null-space acceptance (gam#553). The phantom-
+                    // multiplier refusal fires when the active-set-projected
+                    // residual is above tolerance, but that residual can be
+                    // confined to `ker(H_pen)` — the polynomial null space of a
+                    // penalized smooth (TP / Bernstein trend) that the censored
+                    // location-scale / custom-family data does not pin down in
+                    // the time_transform / log_sigma channel. Along that
+                    // direction there is neither curvature nor a constraint, so
+                    // it is a genuinely free gauge direction and the iterate is
+                    // stationary on the entire identifiable (range) subspace.
+                    // The downstream outer IFT trace removes exactly this
+                    // null-space component via the projected pseudo-inverse, so
+                    // only a *range-space* residual biases the envelope gradient
+                    // (the precise concern of the "do NOT soft-accept" note
+                    // below). Accept iff the range-space residual is at
+                    // tolerance — preserving outer-gradient correctness while no
+                    // longer aborting a well-posed fit on a data-unconstrained
+                    // null direction.
+                    if let Some(range_residual) = projected_residual_range_space_inf(
+                        &projected_residual_vec,
+                        &joint_hessian_source,
+                        &ranges,
+                        &s_lambdas,
+                        ridge,
+                        options.ridge_policy,
+                        total_p,
+                    ) && range_residual <= cert_residual_factor * residual_tol
+                    {
+                        log::info!(
+                            "[PIRLS/joint-Newton convergence] cycle {:>3} | penalty-null-space certificate (gam#553): \
+                             total projected residual={:.3e} > tol={:.3e} but its range-space (curved-subspace) \
+                             component={:.3e} ≤ {:.1}×tol={:.3e}; the remaining residual lies in the data-unconstrained \
+                             penalty null space ker(H_pen) (a free polynomial-trend gauge direction, not a defect) and is \
+                             projected out of the KKT residual by the outer IFT pseudo-inverse before the envelope \
+                             correction; |Δobjective|={:.3e}, obj_tol={:.3e}",
+                            cycle,
+                            residual,
+                            cert_residual_factor * residual_tol,
+                            range_residual,
+                            cert_residual_factor,
+                            cert_residual_factor * residual_tol,
+                            objective_change,
                             objective_tol,
                         );
                         converged = true;
@@ -15955,6 +16123,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let objective_change = (objective - lastobjective).abs();
         lastobjective = objective;
         cycles_done = cycle + 1;
+
+        // Divergence guard (mirrors the joint-Newton sibling, gam#554): a
+        // non-finite objective / log-likelihood means a near-unidentified
+        // penalized block has propagated NaN mass through the coordinate
+        // descent. Every convergence and divergence-frozen exit below is a
+        // finite `<=` comparison that NaN silently defeats, so without this
+        // the loop grinds the full `inner_max_cycles` on every outer ρ-eval
+        // and startup seed. Break unconverged so the outer optimizer rejects
+        // this point immediately instead of burning the budget.
+        if !objective.is_finite() || !cached_eval.log_likelihood.is_finite() {
+            log::warn!(
+                "[PIRLS/blockwise convergence] cycle {:>3} | divergence guard: non-finite inner state (objective={:.3e}, -loglik={:.3e}); returning unconverged so the outer optimizer rejects this ρ evaluation instead of running to inner_max_cycles.",
+                cycle,
+                objective,
+                -cached_eval.log_likelihood,
+            );
+            converged = false;
+            break;
+        }
 
         // Scale-aware tolerances — see the matching joint-Newton path
         // above for the rationale. At biobank scale absolute step/residual
