@@ -1127,11 +1127,11 @@ def fit(
     # which the scalar pipeline cannot represent. Routing here keeps the
     # high-level Python API uniform — `gamfit.fit(data, formula,
     # family='multinomial')` returns a `MultinomialModel` — while the
-    # underlying Rust entry is a dedicated formula→design→Newton path that
-    # bypasses the workflow.rs `FitRequest::Standard` materialiser. REML /
-    # LAML λ-selection for this family follows in the next slice; until
-    # then the inner solver uses a single uniform initial smoothing
-    # parameter shared across penalty blocks and active classes.
+    # underlying Rust entry is a dedicated formula→design→REML path that
+    # bypasses the workflow.rs `FitRequest::Standard` materialiser. The Rust
+    # `fit_penalized_multinomial_formula` driver runs the outer REML/LAML loop
+    # to select an independent smoothing parameter per (class, term); the
+    # `init_lambda` argument below is only the warm-start seed.
     family_canonical = str(family).lower().replace("_", "-") if family is not None else "auto"
     if family_canonical in {
         "multinomial",

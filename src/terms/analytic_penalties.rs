@@ -8016,54 +8016,6 @@ impl AnalyticPenalty for NestedPrefixPenalty {
     }
 }
 
-/// REML helper: given the K analytic per-shell penalty values at the current
-/// fit, the model's MultiShell deviance, the number of effective parameters
-/// per shell, and `n_eff` rows, compute the BIC for a candidate prefix
-/// schedule. The outer driver enumerates a small list of schedules
-/// (typically 4 in production: doubling, dyadic, golden-ratio, manual) and
-/// picks the schedule with the lowest BIC. This is the "discrete prefix
-/// boundaries" piece of the REML extension.
-///
-/// `bic = deviance + log(n_eff) · edf_total + 2 · (Σ_k log(1 + λ_k))`
-///
-/// The last term is a smooth proxy for the discrete shell-mask boundaries:
-/// it is monotone-increasing in each `λ_k` so the IFT derivative w.r.t. a
-/// boundary move (which only changes which shell a coordinate falls into,
-/// i.e. swaps which `λ_k` contributes) is well-defined as a finite difference
-/// across the discrete candidate set.
-#[must_use]
-pub fn nested_prefix_bic(
-    multishell_deviance: f64,
-    edf_total: f64,
-    n_eff: f64,
-    lambdas: &[f64],
-) -> f64 {
-    let shell_term: f64 = lambdas.iter().map(|l| 2.0 * (1.0 + l).ln()).sum();
-    multishell_deviance + n_eff.max(1.0).ln() * edf_total + shell_term
-}
-
-/// REML helper: select the prefix schedule (boundary set) and per-shell
-/// weights minimising `nested_prefix_bic` across a discrete candidate list.
-/// Returns `(best_index, best_bic)`.
-#[must_use]
-pub fn select_nested_prefix_schedule(
-    candidates: &[(Vec<usize>, Vec<f64>)],
-    multishell_deviances: &[f64],
-    edf_totals: &[f64],
-    n_eff: f64,
-) -> (usize, f64) {
-    assert_eq!(candidates.len(), multishell_deviances.len());
-    assert_eq!(candidates.len(), edf_totals.len());
-    let mut best = (0usize, f64::INFINITY);
-    for (i, (_prefixes, weights)) in candidates.iter().enumerate() {
-        let bic = nested_prefix_bic(multishell_deviances[i], edf_totals[i], n_eff, weights);
-        if bic < best.1 {
-            best = (i, bic);
-        }
-    }
-    best
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -9010,20 +8962,4 @@ mod tests {
         assert!(err.contains("strictly increasing"), "got: {err}");
     }
 
-    #[test]
-    fn nested_prefix_bic_picks_best_schedule() {
-        let candidates = vec![
-            (vec![64_usize, 256], vec![10.0_f64, 5.0]),
-            (vec![64, 256], vec![1.0, 0.5]),
-            (vec![64, 256], vec![0.01, 0.005]),
-        ];
-        let deviances = vec![100.0_f64, 100.0, 100.0];
-        let edfs = vec![50.0_f64, 50.0, 50.0];
-        let (best, _bic) = select_nested_prefix_schedule(&candidates, &deviances, &edfs, 1000.0);
-        assert_eq!(best, 2, "smallest λ wins under equal deviance");
-
-        let deviances2 = vec![10.0_f64, 100.0, 100.0];
-        let (best2, _) = select_nested_prefix_schedule(&candidates, &deviances2, &edfs, 1000.0);
-        assert_eq!(best2, 0, "low deviance overrides shell term");
-    }
 }
