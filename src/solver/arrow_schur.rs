@@ -5002,29 +5002,6 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
     partial
 }
 
-/// Bind the given device ordinal's CUDA context to the current worker thread so
-/// the per-row GPU GEMM shims issued from it offload to that device. A missing
-/// context or bind failure leaves the shims to no-op to CPU — the math is
-/// unchanged — so the result is intentionally consumed without escalation. On
-/// non-Linux builds there are no CUDA contexts; the ordinal is accepted so the
-/// multi-device fan-out compiles identically across platforms.
-#[cfg(target_os = "linux")]
-fn bind_tile_device(ordinal: usize) {
-    if let Some(ctx) = crate::gpu::runtime::cuda_context_for(ordinal) {
-        if ctx.bind_to_thread().is_err() {
-            // Fall through: this tile reduces on the CPU.
-        }
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn bind_tile_device(ordinal: usize) {
-    // No CUDA contexts off Linux; the ordinal must still be a real pool
-    // ordinal, which `usize` always satisfies — asserting it keeps the
-    // parameter live so the cross-platform signature carries no dead binding.
-    debug_assert!(ordinal < usize::MAX);
-}
-
 /// Reduce the per-row Schur contributions `Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`
 /// out of `schur` (seeded with `H_ββ + ρ_β·I`).
 ///
@@ -5078,7 +5055,21 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
                 let ordinal = *ordinal;
                 let range = range.clone();
                 scope.spawn(move || {
-                    bind_tile_device(ordinal);
+                    // Bind this ordinal's CUDA context on this worker thread so
+                    // the per-row GPU GEMM shims issued from `tile_schur_partial`
+                    // offload to that device. A missing context or bind failure
+                    // is intentionally consumed without escalation — the shims
+                    // no-op back to CPU and the math is unchanged. Off Linux
+                    // `GpuRuntime::global()` is always `None`, so this branch
+                    // is unreachable and the bind is omitted entirely.
+                    #[cfg(target_os = "linux")]
+                    {
+                        if let Some(ctx) = crate::gpu::runtime::cuda_context_for(ordinal) {
+                            if ctx.bind_to_thread().is_err() {
+                                // Fall through: this tile reduces on the CPU.
+                            }
+                        }
+                    }
                     tile_schur_partial(sys, htt_factors, backend, kind, ordinal, range)
                 })
             })
