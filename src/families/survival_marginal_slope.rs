@@ -20215,9 +20215,8 @@ pub fn fit_survival_marginal_slope_terms(
     // the frozen build, and `evaluate_custom_family_joint_hyper` refuses with
     // a "joint hyper rho dimension mismatch". Mirrors the CTN- and BMS-side
     // fixes in `fit_transformation_normal` and `fit_bernoulli_marginal_slope_terms`.
-    let (mut joint_designs, _) =
-        build_term_collection_designs_and_freeze_joint(data, &joint_specs)
-            .map_err(|e| format!("failed to rebuild frozen probe SMGS joint designs: {e}"))?;
+    let (mut joint_designs, _) = build_term_collection_designs_and_freeze_joint(data, &joint_specs)
+        .map_err(|e| format!("failed to rebuild frozen probe SMGS joint designs: {e}"))?;
     let marginal_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
     let (logslope_design, logslopespec_boot, logslope_surface_ranges) =

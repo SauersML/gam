@@ -33,9 +33,10 @@ use ndarray::{
 use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
-    ArrowRowBlock, ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions, BetaPenaltyOp,
-    CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp,
-    SparseGBlock, StreamingArrowSchur, solve_streaming_reduced_beta,
+    ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
+    ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp,
+    SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur,
+    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
 };
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
@@ -3815,7 +3816,7 @@ impl SaeManifoldTerm {
         // 1. Run the inner (t, β) Newton solve to convergence at FIXED ρ.
         //    `run_joint_fit_arrow_schur` no longer touches ρ.
         let mut rho_fixed = rho.clone();
-        let loss = self.run_joint_fit_arrow_schur(
+        let mut loss = self.run_joint_fit_arrow_schur(
             target,
             &mut rho_fixed,
             registry,
@@ -3832,44 +3833,88 @@ impl SaeManifoldTerm {
         //    damped factors and InexactPCG caches, which have no dense Schur
         //    factor). This is the same evidence convention the main GAM REML
         //    path uses.
-        let sys = self
-            .assemble_arrow_schur(target, rho, registry)
-            .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
-        // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
-        // and only the factor cache is consumed — the exact undamped log-det
-        // and the selected-inverse traces. As ρ sweeps to extremes (e.g. a
-        // wide ARD-α sweep), H_tt is genuinely PD but can be ill-conditioned;
-        // the standard Direct guard rejects that to protect Newton-step
-        // accuracy, but the log-det is exact from diag(L) regardless of the
-        // condition number and the traces only need the (PD) factor. So
-        // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
-        // still errors). The cache stays undamped at ridge=0, so
-        // `arrow_log_det_from_cache` remains exact.
         let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
-        let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
-            solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+        let mut total_inner_iter = inner_max_iter;
+        let max_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
+        let (log_det, cache) = loop {
+            let sys = self
+                .assemble_arrow_schur(target, rho, registry)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
-        // The Laplace normaliser ½log|H| is only the correct REML criterion at
-        // the inner optimum (t̂, β̂). The undamped Newton step computed here is
-        // the natural KKT residual of that solve: a step whose magnitude
-        // dwarfs the iterate means the inner loop did not converge at this ρ
-        // and the log-det would be evaluated off the manifold. Surface that as
-        // a recoverable error rather than returning a meaningless criterion.
-        let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
-            + delta_beta.iter().map(|&v| v * v).sum::<f64>();
-        if !step_norm_sq.is_finite() {
-            return Err(format!(
-                "SaeManifoldTerm::reml_criterion: undamped Newton residual is non-finite at \
-                 the inner optimum (‖Δ‖²={step_norm_sq}); the joint Hessian factorisation is \
-                 degenerate at this ρ"
-            ));
-        }
-        let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-            "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
-             ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
-             required for the Laplace normaliser"
-                .to_string()
-        })?;
+            // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
+            // and only the factor cache is consumed — the exact undamped log-det
+            // and the selected-inverse traces. As ρ sweeps to extremes (e.g. a
+            // wide ARD-α sweep), H_tt is genuinely PD but can be ill-conditioned;
+            // the standard Direct guard rejects that to protect Newton-step
+            // accuracy, but the log-det is exact from diag(L) regardless of the
+            // condition number and the traces only need the (PD) factor. So
+            // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
+            // still errors). The cache stays undamped at ridge=0, so
+            // `arrow_log_det_from_cache` remains exact.
+            let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
+                solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+                    .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+            // The Laplace normaliser ½log|H| is only the correct REML criterion at
+            // the inner optimum (t̂, β̂). The undamped Newton step computed here is
+            // the natural KKT residual of that solve: a step whose magnitude
+            // dwarfs the iterate means the inner loop did not converge at this ρ
+            // and the log-det would be evaluated off the manifold.
+            let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
+                + delta_beta.iter().map(|&v| v * v).sum::<f64>();
+            if !step_norm_sq.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::reml_criterion: undamped Newton residual is non-finite at \
+                     the inner optimum (‖Δ‖²={step_norm_sq}); the joint Hessian factorisation is \
+                     degenerate at this ρ"
+                ));
+            }
+            let mut iterate_norm_sq = 0.0_f64;
+            for &v in self.assignment.logits.iter() {
+                iterate_norm_sq += v * v;
+            }
+            for coords in &self.assignment.coords {
+                let matrix = coords.as_matrix();
+                for &v in matrix.iter() {
+                    iterate_norm_sq += v * v;
+                }
+            }
+            for atom in &self.atoms {
+                for &v in atom.decoder_coefficients.iter() {
+                    iterate_norm_sq += v * v;
+                }
+            }
+            let residual_norm = step_norm_sq.sqrt();
+            let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
+            let residual_tolerance = 1.0e-4 * iterate_scale;
+            if residual_norm <= residual_tolerance {
+                let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
+                    "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
+                     ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
+                     required for the Laplace normaliser"
+                        .to_string()
+                })?;
+                break (log_det, cache);
+            }
+            if total_inner_iter >= max_refine_iter {
+                return Err(format!(
+                    "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
+                     undamped Newton residual ‖Δ‖={residual_norm:.6e} exceeds tolerance \
+                     {residual_tolerance:.6e} after {total_inner_iter} inner iterations. \
+                     Refusing to rank an off-optimum Laplace criterion."
+                ));
+            }
+            let remaining = max_refine_iter - total_inner_iter;
+            let refine_iter = inner_max_iter.max(1).min(remaining);
+            loss = self.run_joint_fit_arrow_schur(
+                target,
+                &mut rho_fixed,
+                registry,
+                refine_iter,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )?;
+            total_inner_iter += refine_iter;
+        };
 
         // 3. Smoothing-penalty Occam term: −½·p·(Σ_k rank S_k)·log λ_smooth.
         let p_out = self.output_dim() as f64;
@@ -4690,6 +4735,150 @@ impl SaeManifoldTerm {
         self.set_flat_beta(beta.view())
     }
 
+    fn solve_fixed_decoder_row_step(
+        h: ArrayView2<'_, f64>,
+        g: ArrayView1<'_, f64>,
+        base_ridge: f64,
+    ) -> Result<Array1<f64>, String> {
+        let d = h.nrows();
+        if h.ncols() != d || g.len() != d {
+            return Err(format!(
+                "SaeManifoldTerm::solve_fixed_decoder_row_step: shape mismatch H={:?}, g={}",
+                h.dim(),
+                g.len()
+            ));
+        }
+        if d == 0 {
+            return Ok(Array1::<f64>::zeros(0));
+        }
+        let mut ridge = base_ridge.max(1.0e-12);
+        let mut last_err = String::new();
+        for _ in 0..12 {
+            let mut a = h.to_owned();
+            for axis in 0..d {
+                a[[axis, axis]] += ridge;
+            }
+            match sae_cholesky_solve_neg_gradient(a.view(), g) {
+                Ok(delta) => return Ok(delta),
+                Err(err) => {
+                    last_err = err;
+                    ridge *= 10.0;
+                }
+            }
+        }
+        Err(format!(
+            "SaeManifoldTerm::solve_fixed_decoder_row_step: row Hessian did not factor after LM escalation; last error: {last_err}"
+        ))
+    }
+
+    fn fixed_decoder_step_from_rows(
+        sys: &ArrowSchurSystem,
+        ridge_ext_coord: f64,
+    ) -> Result<Array1<f64>, String> {
+        let total = sys.row_offsets[sys.rows.len()];
+        let mut delta = Array1::<f64>::zeros(total);
+        for (row_idx, row) in sys.rows.iter().enumerate() {
+            let row_delta =
+                Self::solve_fixed_decoder_row_step(row.htt.view(), row.gt.view(), ridge_ext_coord)?;
+            let start = sys.row_offsets[row_idx];
+            let end = sys.row_offsets[row_idx + 1];
+            if row_delta.len() != end - start {
+                return Err(format!(
+                    "SaeManifoldTerm::fixed_decoder_step_from_rows: row {row_idx} delta len {} != row span {}",
+                    row_delta.len(),
+                    end - start
+                ));
+            }
+            delta.slice_mut(s![start..end]).assign(&row_delta);
+        }
+        Ok(delta)
+    }
+
+    pub fn run_fixed_decoder_arrow_schur(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &mut SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        max_iter: usize,
+        step_size: f64,
+        ridge_ext_coord: f64,
+    ) -> Result<SaeManifoldLoss, String> {
+        if !(step_size.is_finite() && step_size > 0.0) {
+            return Err(format!(
+                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: step_size must be finite and positive; got {step_size}"
+            ));
+        }
+        if max_iter < 1 {
+            return Err(
+                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: max_iter must be positive".into(),
+            );
+        }
+        let beta_zero = Array1::<f64>::zeros(self.beta_dim());
+        let mut last_loss = self.loss(target, rho)?;
+        for _ in 0..max_iter {
+            self.advance_temperature_schedule()?;
+            let pre_step_loss = self.loss(target, rho)?;
+            let pre_step_total = pre_step_loss.total();
+            let sys = self
+                .assemble_arrow_schur(target, rho, analytic_penalties)
+                .map_err(|err| format!("SaeManifoldTerm::run_fixed_decoder_arrow_schur: {err}"))?;
+            let delta_ext_coord = Self::fixed_decoder_step_from_rows(&sys, ridge_ext_coord)?;
+            let directional_decrease = sae_manifold_newton_directional_decrease(
+                &sys,
+                delta_ext_coord.view(),
+                beta_zero.view(),
+            );
+            let grad_norm_sq: f64 = sys
+                .rows
+                .iter()
+                .flat_map(|row| row.gt.iter())
+                .map(|&v| v * v)
+                .sum();
+            let step_norm_sq: f64 = delta_ext_coord.iter().map(|&v| v * v).sum();
+            let directional_decrease_floor = 1.0e-14 * grad_norm_sq.sqrt() * step_norm_sq.sqrt();
+            let snapshot = self.snapshot_mutable_state();
+            if !(pre_step_total.is_finite()
+                && directional_decrease.is_finite()
+                && directional_decrease > 0.0
+                && directional_decrease > directional_decrease_floor)
+            {
+                self.restore_mutable_state(&snapshot);
+                last_loss = pre_step_loss;
+                break;
+            }
+
+            let mut trial_step_size = step_size;
+            let mut accepted_loss: Option<SaeManifoldLoss> = None;
+            for halving in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
+                if halving > 0 {
+                    self.restore_mutable_state(&snapshot);
+                }
+                let trial_result = self
+                    .apply_newton_step(delta_ext_coord.view(), beta_zero.view(), trial_step_size)
+                    .and_then(|()| self.loss(target, rho));
+                if let Ok(post_step_loss) = trial_result {
+                    let post_step_total = post_step_loss.total();
+                    let armijo_bound = pre_step_total
+                        - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
+                    if post_step_total.is_finite() && post_step_total <= armijo_bound {
+                        accepted_loss = Some(post_step_loss);
+                        break;
+                    }
+                }
+                trial_step_size *= 0.5;
+            }
+            match accepted_loss {
+                Some(loss) => last_loss = loss,
+                None => {
+                    self.restore_mutable_state(&snapshot);
+                    last_loss = pre_step_loss;
+                    break;
+                }
+            }
+        }
+        Ok(last_loss)
+    }
+
     pub fn run_joint_fit_arrow_schur(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -4847,7 +5036,36 @@ impl SaeManifoldTerm {
             }
             if !accepted {
                 self.restore_mutable_state(&snapshot);
-                break;
+                let correction = ArrowProximalCorrectionOptions {
+                    initial_ridge: ridge_ext_coord.max(ridge_beta).max(1.0e-12),
+                    armijo_c1: SAE_MANIFOLD_ARMIJO_C1,
+                    ..ArrowProximalCorrectionOptions::default()
+                };
+                let accepted_step = solve_arrow_newton_step_with_proximal_correction(
+                    &sys,
+                    ridge_ext_coord,
+                    ridge_beta,
+                    pre_step_total,
+                    &ArrowSolveOptions::automatic(self.beta_dim()),
+                    &correction,
+                    |trial_delta_t, trial_delta_beta| {
+                        self.restore_mutable_state(&snapshot);
+                        self.apply_newton_step(trial_delta_t, trial_delta_beta, 1.0)
+                            .and_then(|()| self.loss(target, rho))
+                            .map(|loss| loss.total())
+                            .unwrap_or(f64::INFINITY)
+                    },
+                )
+                .map_err(|err| {
+                    self.restore_mutable_state(&snapshot);
+                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                })?;
+                if !(accepted_step.trial_objective_value.is_finite()
+                    && accepted_step.trial_objective_value < pre_step_total)
+                {
+                    self.restore_mutable_state(&snapshot);
+                    break;
+                }
             }
         }
         // ρ is owned by the outer engine and unchanged here; just return the
@@ -5740,6 +5958,58 @@ fn sae_manifold_newton_directional_decrease(
         gradient_dot_step += sys.gb[idx] * delta_beta[idx];
     }
     -gradient_dot_step
+}
+
+fn sae_cholesky_solve_neg_gradient(
+    h: ArrayView2<'_, f64>,
+    g: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let n = h.nrows();
+    if h.ncols() != n || g.len() != n {
+        return Err(format!(
+            "sae_cholesky_solve_neg_gradient: shape mismatch H={:?}, g={}",
+            h.dim(),
+            g.len()
+        ));
+    }
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = h[[i, j]];
+            for k in 0..j {
+                sum -= l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                if !(sum.is_finite() && sum > 0.0) {
+                    return Err(format!("non-positive Cholesky pivot at {i}: {sum}"));
+                }
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut sum = -g[i];
+        for k in 0..i {
+            sum -= l[[i, k]] * y[k];
+        }
+        y[i] = sum / l[[i, i]];
+    }
+    let mut x = Array1::<f64>::zeros(n);
+    for ii in 0..n {
+        let i = n - 1 - ii;
+        let mut sum = y[i];
+        for k in i + 1..n {
+            sum -= l[[k, i]] * x[k];
+        }
+        x[i] = sum / l[[i, i]];
+    }
+    if !x.iter().all(|v| v.is_finite()) {
+        return Err("sae_cholesky_solve_neg_gradient: non-finite solution".into());
+    }
+    Ok(x)
 }
 
 fn softmax_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
@@ -7368,12 +7638,12 @@ mod tests {
     fn sphere_chart_jet_matches_fd_at_clamp_boundary() {
         // Latitudes spanning interior, exactly the former boundary, and beyond.
         let coords = array![
-            [std::f64::consts::FRAC_PI_2, 0.4],   // exactly +π/2 (former gate flip)
+            [std::f64::consts::FRAC_PI_2, 0.4], // exactly +π/2 (former gate flip)
             [-std::f64::consts::FRAC_PI_2, -1.1], // exactly -π/2
-            [1.45, 2.0],                          // just below +π/2
-            [1.69, -0.3],                         // just above +π/2
-            [2.3, 0.7],                           // well beyond +π/2
-            [0.35, 0.9],                          // interior control
+            [1.45, 2.0],                        // just below +π/2
+            [1.69, -0.3],                       // just above +π/2
+            [2.3, 0.7],                         // well beyond +π/2
+            [0.35, 0.9],                        // interior control
         ];
 
         let (_, jet) = sphere_chart_basis_jet(coords.view()).unwrap();

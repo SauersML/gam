@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""Benchmark gamfit's existing manifold SAE on SynthSAEBench-style data.
+
+This is a compact CPU-friendly version of SynthSAEBench-16k. It keeps the
+load-bearing benchmark properties from the paper: sparse ground-truth linear
+features, Zipfian firing rates, low-rank firing correlation, hierarchy with
+mutually exclusive siblings, superposition through an overcomplete dictionary,
+and metrics that score feature recovery directly instead of only
+reconstruction.
+
+The SAE being benchmarked is the repo's public implementation:
+``gamfit.sae_manifold_fit``. This file only supplies data generation and
+ground-truth scoring.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import time
+from dataclasses import asdict, dataclass
+from statistics import NormalDist
+from typing import Any
+
+import numpy as np
+
+import gamfit
+from gamfit._binding import rust_module
+
+
+@dataclass(frozen=True)
+class SynthConfig:
+    n_features: int
+    hidden_dim: int
+    corr_rank: int
+    corr_scale: float
+    p_min: float
+    p_max: float
+    zipf_exponent: float
+    hierarchy_branching: int
+    hierarchy_depth: int
+    bias_norm: float
+    seed: int
+
+
+@dataclass(frozen=True)
+class BenchmarkMetrics:
+    fit_api: str
+    seed: int
+    n_features: int
+    hidden_dim: int
+    n_train: int
+    n_test: int
+    atoms: int
+    basis: str
+    atom_dim: int
+    assignment: str
+    top_k: int | None
+    true_l0_train: float
+    true_l0_test: float
+    learned_l0_train: float
+    learned_l0_test: float
+    train_r2: float
+    test_r2: float
+    mcc: float
+    feature_uniqueness: float
+    probing_precision: float
+    probing_recall: float
+    probing_f1: float
+    matching: str
+    learned_directions: int
+    fit_seconds: float
+    score_seconds: float
+
+
+class SynthSAEBenchData:
+    def __init__(self, cfg: SynthConfig) -> None:
+        self.cfg = cfg
+        rng = np.random.default_rng(cfg.seed)
+        dictionary = rng.standard_normal((cfg.n_features, cfg.hidden_dim))
+        dictionary /= np.maximum(np.linalg.norm(dictionary, axis=1, keepdims=True), 1e-12)
+        self.dictionary = dictionary
+
+        ranks = np.arange(1, cfg.n_features + 1, dtype=float)
+        raw = ranks ** (-cfg.zipf_exponent)
+        raw = (raw - raw.min()) / max(float(raw.max() - raw.min()), 1e-12)
+        self.probs = cfg.p_min + raw * (cfg.p_max - cfg.p_min)
+        self.thresholds = np.array(
+            [NormalDist().inv_cdf(1.0 - float(p)) for p in self.probs],
+            dtype=float,
+        )
+        self.mag_mean = np.linspace(5.0, 4.0, cfg.n_features)
+        self.mag_std = np.abs(rng.normal(0.5, 0.5, size=cfg.n_features))
+
+        self.factor, self.delta = self._make_low_rank_correlation(rng)
+        self.parents, self.children_by_parent, self.nodes_by_depth = self._make_hierarchy()
+        bias = rng.standard_normal(cfg.hidden_dim)
+        bias /= max(float(np.linalg.norm(bias)), 1e-12)
+        self.bias = cfg.bias_norm * bias
+
+    def _make_low_rank_correlation(self, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+        rank = max(0, min(int(self.cfg.corr_rank), int(self.cfg.n_features)))
+        if rank == 0 or self.cfg.corr_scale == 0.0:
+            return np.zeros((self.cfg.n_features, 0), dtype=float), np.ones(self.cfg.n_features)
+        factor = self.cfg.corr_scale * rng.standard_normal((self.cfg.n_features, rank))
+        row_power = np.sum(factor * factor, axis=1)
+        max_power = float(row_power.max(initial=0.0))
+        if max_power > 0.99:
+            factor *= math.sqrt(0.99 / max_power)
+            row_power = np.sum(factor * factor, axis=1)
+        return factor, np.maximum(1.0 - row_power, 0.01)
+
+    def _make_hierarchy(self) -> tuple[np.ndarray, dict[int, list[int]], list[list[int]]]:
+        parents = np.full(self.cfg.n_features, -1, dtype=int)
+        children_by_parent: dict[int, list[int]] = {}
+        nodes_by_depth: list[list[int]] = [[] for _ in range(self.cfg.hierarchy_depth + 1)]
+        next_node = 0
+        while next_node < self.cfg.n_features:
+            root = next_node
+            nodes_by_depth[0].append(root)
+            next_node += 1
+            frontier = [root]
+            for depth in range(1, self.cfg.hierarchy_depth + 1):
+                new_frontier: list[int] = []
+                for parent in frontier:
+                    children: list[int] = []
+                    for _ in range(self.cfg.hierarchy_branching):
+                        if next_node >= self.cfg.n_features:
+                            break
+                        child = next_node
+                        next_node += 1
+                        parents[child] = parent
+                        children.append(child)
+                        new_frontier.append(child)
+                        nodes_by_depth[depth].append(child)
+                    if children:
+                        children_by_parent[parent] = children
+                    if next_node >= self.cfg.n_features:
+                        break
+                frontier = new_frontier
+                if not frontier or next_node >= self.cfg.n_features:
+                    break
+        return parents, children_by_parent, nodes_by_depth
+
+    def sample(self, n: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(seed)
+        if self.factor.shape[1] == 0:
+            g = rng.standard_normal((n, self.cfg.n_features))
+        else:
+            eps = rng.standard_normal((n, self.factor.shape[1]))
+            eta = rng.standard_normal((n, self.cfg.n_features))
+            g = eps @ self.factor.T + eta * np.sqrt(self.delta)[None, :]
+        firing = g > self.thresholds[None, :]
+        coeff = firing * np.maximum(
+            self.mag_mean[None, :] + self.mag_std[None, :] * rng.standard_normal(firing.shape),
+            0.0,
+        )
+        self._apply_hierarchy(coeff, rng)
+        x = coeff @ self.dictionary + self.bias[None, :]
+        return np.ascontiguousarray(x), np.ascontiguousarray(coeff), coeff > 0.0
+
+    def _apply_hierarchy(self, coeff: np.ndarray, rng: np.random.Generator) -> None:
+        for depth_nodes in self.nodes_by_depth[1:]:
+            for child in depth_nodes:
+                parent = int(self.parents[child])
+                if parent >= 0:
+                    coeff[:, child] *= coeff[:, parent] > 0.0
+        for children in self.children_by_parent.values():
+            if len(children) <= 1:
+                continue
+            active = coeff[:, children] > 0.0
+            rows = np.flatnonzero(np.sum(active, axis=1) > 1)
+            for row in rows:
+                active_children = np.flatnonzero(active[row])
+                keep = int(rng.choice(active_children))
+                drop = [children[int(i)] for i in active_children if int(i) != keep]
+                coeff[row, drop] = 0.0
+
+
+def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
+    ss_res = float(np.sum((x - fitted) ** 2))
+    ss_tot = float(np.sum((x - x.mean(axis=0, keepdims=True)) ** 2))
+    return 1.0 - ss_res / max(ss_tot, 1e-12)
+
+
+def _basis_values(kind: str, coords: np.ndarray, n_harmonics: int) -> np.ndarray:
+    if kind == "periodic":
+        phi, _jet, _penalty = rust_module().basis_with_jet(
+            "periodic",
+            np.ascontiguousarray(np.asarray(coords[:, :1], dtype=float)),
+            {"n_harmonics": int(n_harmonics)},
+        )
+        return np.asarray(phi, dtype=float)
+    if kind == "duchon":
+        x = np.asarray(coords, dtype=float)
+        return np.column_stack([np.ones(x.shape[0]), x[:, 0]])
+    return np.column_stack([np.ones(coords.shape[0]), np.asarray(coords[:, 0], dtype=float)])
+
+
+def _learned_components(fit: gamfit.ManifoldSAE) -> tuple[np.ndarray, np.ndarray]:
+    directions: list[np.ndarray] = []
+    activations: list[np.ndarray] = []
+    assignments = np.asarray(fit.assignments, dtype=float)
+    for k, block in enumerate(fit.decoder_blocks):
+        basis = fit.basis_specs[k]
+        coords = np.asarray(fit.coords[k], dtype=float)
+        n_harmonics = fit._n_harmonics[k] if k < len(fit._n_harmonics) else 1
+        phi = _basis_values(basis, coords, n_harmonics)
+        rows = min(phi.shape[1], block.shape[0])
+        for row in range(rows):
+            direction = np.asarray(block[row], dtype=float)
+            norm = float(np.linalg.norm(direction))
+            if row == 0 or norm <= 1e-10:
+                continue
+            directions.append(direction / norm)
+            activations.append(assignments[:, k] * phi[:, row])
+    if not directions:
+        return np.zeros((0, fit.training_data.shape[1])), np.zeros((fit.training_data.shape[0], 0))
+    return np.vstack(directions), np.column_stack(activations)
+
+
+def _match_directions(learned: np.ndarray, truth: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
+    if learned.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=int), "none"
+    sim = np.abs(learned @ truth.T)
+    try:
+        from scipy.optimize import linear_sum_assignment  # type: ignore
+
+        rows, cols = linear_sum_assignment(-sim)
+        return np.asarray(rows, dtype=int), np.asarray(cols, dtype=int), "hungarian"
+    except Exception:
+        pairs: list[tuple[int, int]] = []
+        used_rows: set[int] = set()
+        used_cols: set[int] = set()
+        flat_order = np.argsort(sim, axis=None)[::-1]
+        for flat in flat_order:
+            row, col = np.unravel_index(int(flat), sim.shape)
+            if int(row) in used_rows or int(col) in used_cols:
+                continue
+            pairs.append((int(row), int(col)))
+            used_rows.add(int(row))
+            used_cols.add(int(col))
+            if len(used_rows) == min(sim.shape):
+                break
+        rows = np.array([r for r, _c in pairs], dtype=int)
+        cols = np.array([c for _r, c in pairs], dtype=int)
+        return rows, cols, "greedy"
+
+
+def _best_f1(score: np.ndarray, truth: np.ndarray) -> tuple[float, float, float]:
+    y = np.asarray(truth, dtype=bool)
+    s = np.abs(np.asarray(score, dtype=float))
+    if not np.any(y):
+        return 0.0, 0.0, 0.0
+    thresholds = np.unique(np.quantile(s, np.linspace(0.0, 1.0, 101)))
+    best = (0.0, 0.0, 0.0)
+    for threshold in thresholds:
+        pred = s >= threshold
+        tp = float(np.sum(pred & y))
+        fp = float(np.sum(pred & ~y))
+        fn = float(np.sum(~pred & y))
+        precision = tp / max(tp + fp, 1.0)
+        recall = tp / max(tp + fn, 1.0)
+        f1 = 2.0 * precision * recall / max(precision + recall, 1e-12)
+        if f1 > best[2]:
+            best = (precision, recall, f1)
+    return best
+
+
+def _component_scores_from_payload(fit: gamfit.ManifoldSAE, payload: dict[str, Any]) -> np.ndarray:
+    assignments = np.asarray(payload["assignments"], dtype=float)
+    all_scores: list[np.ndarray] = []
+    for k, block in enumerate(fit.decoder_blocks):
+        basis = fit.basis_specs[k]
+        coords = np.asarray(payload["coords"][k], dtype=float)
+        n_harmonics = fit._n_harmonics[k] if k < len(fit._n_harmonics) else 1
+        phi = _basis_values(basis, coords, n_harmonics)
+        for row in range(min(phi.shape[1], block.shape[0])):
+            direction = np.asarray(block[row], dtype=float)
+            if row == 0 or float(np.linalg.norm(direction)) <= 1e-10:
+                continue
+            all_scores.append(assignments[:, k] * phi[:, row])
+    if not all_scores:
+        n = np.asarray(payload["fitted"], dtype=float).shape[0]
+        return np.zeros((n, 0))
+    return np.column_stack(all_scores)
+
+
+def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
+    cfg = SynthConfig(
+        n_features=args.features,
+        hidden_dim=args.hidden_dim,
+        corr_rank=min(args.corr_rank, args.features),
+        corr_scale=args.corr_scale,
+        p_min=args.p_min,
+        p_max=args.p_max,
+        zipf_exponent=args.zipf_exponent,
+        hierarchy_branching=args.hierarchy_branching,
+        hierarchy_depth=args.hierarchy_depth,
+        bias_norm=args.bias_norm,
+        seed=seed,
+    )
+    synth = SynthSAEBenchData(cfg)
+    train_x, train_coeff, _train_fire = synth.sample(args.n_train, seed + 1)
+    test_x, _test_coeff, test_fire = synth.sample(args.n_test, seed + 2)
+
+    t0 = time.perf_counter()
+    fit = gamfit.sae_manifold_fit(
+        Z=train_x,
+        n_atoms=args.atoms,
+        atom_basis=args.atom_basis,
+        atom_dim=args.atom_dim,
+        assignment=args.assignment,
+        top_k=args.top_k,
+        isometry_weight=args.isometry_weight,
+        ard_per_atom=args.ard_per_atom,
+        sparsity_weight=args.sparsity_weight,
+        smoothness_weight=args.smoothness_weight,
+        max_iter=args.max_iter,
+        learning_rate=args.learning_rate,
+        random_state=seed,
+    )
+    fit_seconds = time.perf_counter() - t0
+
+    t1 = time.perf_counter()
+    test_payload = fit.converged_latents(test_x)
+    test_recon = np.asarray(test_payload["fitted"], dtype=float)
+    learned_test = _component_scores_from_payload(fit, test_payload)
+    learned_dirs, learned_train = _learned_components(fit)
+    rows, cols, matching = _match_directions(learned_dirs, synth.dictionary)
+    if rows.size:
+        mcc = float(np.mean(np.abs(np.sum(learned_dirs[rows] * synth.dictionary[cols], axis=1))))
+        uniqueness = float(len(set(int(c) for c in cols)) / max(len(rows), 1))
+        precision, recall, f1 = _probing_metrics_for_matches(
+            fit,
+            test_payload,
+            test_fire,
+            rows,
+            cols,
+        )
+    else:
+        mcc = 0.0
+        uniqueness = 0.0
+        precision = recall = f1 = 0.0
+    score_seconds = time.perf_counter() - t1
+
+    return BenchmarkMetrics(
+        fit_api="gamfit.sae_manifold_fit",
+        seed=seed,
+        n_features=args.features,
+        hidden_dim=args.hidden_dim,
+        n_train=args.n_train,
+        n_test=args.n_test,
+        atoms=args.atoms,
+        basis=args.atom_basis,
+        atom_dim=args.atom_dim,
+        assignment=args.assignment,
+        top_k=args.top_k,
+        true_l0_train=float(np.mean(np.sum(train_coeff > 0.0, axis=1))),
+        true_l0_test=float(np.mean(np.sum(test_fire, axis=1))),
+        learned_l0_train=float(np.mean(np.sum(np.abs(learned_train) > 1e-8, axis=1))),
+        learned_l0_test=float(np.mean(np.sum(np.abs(learned_test) > 1e-8, axis=1))),
+        train_r2=_r2(train_x, np.asarray(fit.fitted, dtype=float)),
+        test_r2=_r2(test_x, np.asarray(test_recon, dtype=float)),
+        mcc=mcc,
+        feature_uniqueness=uniqueness,
+        probing_precision=precision,
+        probing_recall=recall,
+        probing_f1=f1,
+        matching=matching,
+        learned_directions=int(learned_dirs.shape[0]),
+        fit_seconds=fit_seconds,
+        score_seconds=score_seconds,
+    )
+
+
+def _summarize(metrics: list[BenchmarkMetrics]) -> dict[str, Any]:
+    numeric_fields = [
+        "true_l0_train",
+        "true_l0_test",
+        "learned_l0_train",
+        "learned_l0_test",
+        "train_r2",
+        "test_r2",
+        "mcc",
+        "feature_uniqueness",
+        "probing_precision",
+        "probing_recall",
+        "probing_f1",
+        "learned_directions",
+        "fit_seconds",
+        "score_seconds",
+    ]
+    out: dict[str, Any] = {}
+    for field in numeric_fields:
+        values = np.array([float(getattr(item, field)) for item in metrics], dtype=float)
+        mean = float(np.mean(values))
+        std = float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
+        out[field] = {
+            "mean": mean,
+            "std": std,
+            "cv": float(std / abs(mean)) if mean != 0.0 else None,
+        }
+    return out
+
+
+def _benchmark_notes() -> dict[str, Any]:
+    return {
+        "implemented": {
+            "core": [
+                "train_r2",
+                "test_r2",
+                "true_l0",
+                "learned_l0",
+            ],
+            "synthsaebench": [
+                "GT-MCC-style absolute-cosine feature recovery",
+                "GT-F1-style matched-latent firing precision/recall/F1",
+                "feature uniqueness",
+            ],
+            "saebench_compatible_synthetic": [
+                "sparse-probing analogue on matched ground-truth features",
+            ],
+        },
+        "not_applicable_without_llm_task_stack": {
+            "SAEBench": [
+                "SCR and TPP need task datasets, probes, and latent ablations on an LLM SAE.",
+                "Autointerp needs natural-language activating examples.",
+                "RAVEL needs entity-attribute prompts and causal interventions on an LLM.",
+            ],
+            "SAGE": [
+                "Requires an LLM, task prompts, attribution/cross-section discovery, supervised feature dictionaries, and downstream logit-difference interventions.",
+                "This synthetic activation harness can report direct ground-truth recovery, but cannot honestly run SAGE Test 1 sufficiency/necessity or Test 2 sparse controllability without the LLM task circuit.",
+            ],
+        },
+    }
+
+
+def _probing_metrics_for_matches(
+    fit: gamfit.ManifoldSAE,
+    payload: dict[str, Any],
+    fire: np.ndarray,
+    rows: np.ndarray,
+    cols: np.ndarray,
+) -> tuple[float, float, float]:
+    scores = _component_scores_from_payload(fit, payload)
+    if scores.shape[1] == 0:
+        return 0.0, 0.0, 0.0
+    metrics = [_best_f1(scores[:, int(row)], fire[:, int(col)]) for row, col in zip(rows, cols)]
+    return tuple(float(np.mean([m[i] for m in metrics])) for i in range(3))  # type: ignore[return-value]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--features", type=int, default=256)
+    parser.add_argument("--hidden-dim", type=int, default=64)
+    parser.add_argument("--n-train", type=int, default=512)
+    parser.add_argument("--n-test", type=int, default=256)
+    parser.add_argument("--atoms", type=int, default=64)
+    parser.add_argument("--atom-basis", default="duchon")
+    parser.add_argument("--atom-dim", type=int, default=1)
+    parser.add_argument("--assignment", default="softmax")
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--max-iter", type=int, default=25)
+    parser.add_argument("--learning-rate", type=float, default=1.0)
+    parser.add_argument("--sparsity-weight", type=float, default=0.01)
+    parser.add_argument("--smoothness-weight", type=float, default=0.01)
+    parser.add_argument("--isometry-weight", type=float, default=0.0)
+    parser.add_argument("--ard-per-atom", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--corr-rank", type=int, default=8)
+    parser.add_argument("--corr-scale", type=float, default=0.1)
+    parser.add_argument("--p-min", type=float, default=5e-4)
+    parser.add_argument("--p-max", type=float, default=0.4)
+    parser.add_argument("--zipf-exponent", type=float, default=0.5)
+    parser.add_argument("--hierarchy-branching", type=int, default=4)
+    parser.add_argument("--hierarchy-depth", type=int, default=3)
+    parser.add_argument("--bias-norm", type=float, default=10.0)
+    parser.add_argument("--seed", type=int, default=0, help="Single seed used when --seeds is omitted.")
+    parser.add_argument("--seeds", type=int, nargs="+", default=None)
+    args = parser.parse_args()
+
+    if args.atoms >= args.n_train:
+        parser.error("--atoms must be smaller than --n-train")
+    seeds = args.seeds if args.seeds is not None else [args.seed]
+    metrics = [run_one(args, int(seed)) for seed in seeds]
+    payload = {
+        "benchmark": "SynthSAEBench-style direct ground-truth benchmark for gamfit manifold SAE",
+        "fit_api": "gamfit.sae_manifold_fit",
+        "notes": _benchmark_notes(),
+        "runs": [asdict(item) for item in metrics],
+        "summary": _summarize(metrics),
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
