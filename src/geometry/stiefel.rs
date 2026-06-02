@@ -454,15 +454,18 @@ fn qr_thin_vjp(
     }
     // RHS = Q̄ + Q·copyltu(Mqr)  (n×k).
     let rhs = q_bar + &q.dot(&sym_low);
-    // Solve normal̄·Rᵀ = RHS for normal̄ (so normal̄ = RHS·R⁻ᵀ). With R upper
-    // triangular this is a forward substitution in the column index j:
-    //   normal̄[row, j]·R[j, j] = RHS[row, j] − Σ_{l<j} normal̄[row, l]·R[j, l].
+    // Solve normal̄·Rᵀ = RHS for normal̄ (so normal̄ = RHS·R⁻ᵀ). `R` is upper
+    // triangular, hence `Rᵀ` is lower triangular, so column `j` of the product
+    // couples columns `l ≥ j` of normal̄:
+    //   (normal̄·Rᵀ)[row, j] = Σ_{l ≥ j} normal̄[row, l]·R[j, l] = RHS[row, j].
+    // This is a back substitution in the column index `j` (descending):
+    //   normal̄[row, j]·R[j, j] = RHS[row, j] − Σ_{l > j} normal̄[row, l]·R[j, l].
     let n = rhs.nrows();
     let mut out = Array2::<f64>::zeros((n, k));
     for row in 0..n {
-        for j in 0..k {
+        for j in (0..k).rev() {
             let mut acc = rhs[[row, j]];
-            for l in 0..j {
+            for l in (j + 1)..k {
                 acc -= out[[row, l]] * r[[j, l]];
             }
             let diag = r[[j, j]];
