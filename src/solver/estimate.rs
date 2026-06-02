@@ -3487,8 +3487,21 @@ where
         .dot(pirls_res.beta_transformed.as_ref());
     let beta_orig = conditioning.backtransform_beta(&beta_orig_internal);
 
-    // Weighted residual sum of squares for Gaussian models
-    let n = y_o.len() as f64;
+    // Effective sample size for dispersion/REML accounting.
+    //
+    // A prior weight of exactly 0 makes a row contribute nothing to any weighted
+    // cross-product (XᵀWX, XᵀWy) or to the weighted RSS (w_i·r_i² = 0), so such a
+    // row is statistically equivalent to an absent row. The *only* channel left by
+    // which it could still perturb the fit is an explicit observation count. To
+    // keep zero-weight rows exactly equivalent to absent rows (R's `n.ok =
+    // nobs − Σ[w==0]`, mgcv's dropped zero-weight observations), the dispersion
+    // sample size must be the count of positive-weight rows, not the raw row
+    // count. Otherwise the Gaussian scale φ̂ = weighted_rss / (n − edf) puts a
+    // numerator that already excludes zero-weight rows over a denominator that
+    // counts them, biasing φ̂ low and shrinking every SE (#584). The REML
+    // criterion's own observation count (which drives λ selection) lives in the
+    // inner-solution assembly and must apply the same positive-weight count.
+    let n = w_o.iter().filter(|&&wi| wi > 0.0).count() as f64;
     let weighted_rss = if matches!(cfg.link_function(), LinkFunction::Identity) {
         let fitted = {
             let mut eta = offset_o.clone();
@@ -3868,10 +3881,24 @@ where
             None
         };
 
+        // Vp = Vb + J·V_ρ·Jᵀ, both terms on the SAME dispersion (variance) scale.
+        //
+        // The smoothing correction is built from the coefficient sensitivities
+        // J = dβ̂/dρ = −H⁻¹(λ_k S_k(β̂ − μ_k)), which are linear in β̂, and from
+        // V_ρ = (∇²_ρρ V)⁻¹. Under a Gaussian rescaling y → c·y the fit is exactly
+        // equivariant: β̂ → c·β̂ (so J → c·J), H is response-scale-invariant, the
+        // REML/LAML cost gains only a ρ-independent (n/2)·log(c²) offset (so its
+        // ρ-gradient and ρ-Hessian — hence V_ρ — are dispersion-free), and φ̂ → c²·φ̂.
+        // Therefore J·V_ρ·Jᵀ ∝ c · c⁰ · c = c², i.e. the correction is already on
+        // the c² variance scale, exactly like Vb = φ̂·H⁻¹ ∝ c². It must be added
+        // directly to Vb. Multiplying it by dispersion_phi
+        // (≈ c²) again would make the correction scale as c⁴, inflating every
+        // predict() interval for large-magnitude responses (#582). dispersion_phi is
+        // applied once, where it belongs: in Vb = scaled_covariance(H⁻¹, dispersion_phi).
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();
-                corrected += &(corr * dispersion_phi);
+                corrected += corr;
                 enforce_symmetry(&mut corrected);
                 Some(corrected)
             }
