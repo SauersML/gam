@@ -1146,7 +1146,7 @@ def fit(
                     headers,
                     rows,
                     formula,
-                    1.0,   # init_lambda — REML-selected λ lands in the next slice.
+                    1.0,   # init_lambda — warm-start seed; λ is REML-selected in Rust.
                     50,    # max_iter
                     1.0e-7,  # tol
                 )
