@@ -100,7 +100,10 @@ impl RiemannianManifold for SpdManifold {
         // chains; route them through the GPU-dispatched fast_ab shim.
         let middle = fast_ab(&fast_ab(&inv_sqrt_p, &u), &inv_sqrt_p);
         let exp_middle = spectral_map_symmetric(&middle, |x| Ok(x.exp()))?;
-        Ok(flatten(&sym(&fast_ab(&fast_ab(&sqrt_p, &exp_middle), &sqrt_p))))
+        Ok(flatten(&sym(&fast_ab(
+            &fast_ab(&sqrt_p, &exp_middle),
+            &sqrt_p,
+        ))))
     }
 
     fn log_map(
@@ -116,7 +119,10 @@ impl RiemannianManifold for SpdManifold {
         // Dense n×n spectral conjugations, GPU-dispatched via fast_ab.
         let middle = fast_ab(&fast_ab(&inv_sqrt_p, &q), &inv_sqrt_p);
         let log_middle = spectral_map_spd(&middle, |x| Ok(x.ln()))?;
-        Ok(flatten(&sym(&fast_ab(&fast_ab(&sqrt_p, &log_middle), &sqrt_p))))
+        Ok(flatten(&sym(&fast_ab(
+            &fast_ab(&sqrt_p, &log_middle),
+            &sqrt_p,
+        ))))
     }
 
     fn parallel_transport(

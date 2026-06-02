@@ -51,8 +51,12 @@ use crate::solver::identifiability_audit::{
 /// A [`RowJacobianOperator`] built from a [`BlockEffectiveJacobian`] callback.
 ///
 /// At audit time we call `effective_jacobian_at` once with `beta = 0` and
-/// no family scalars.  The callback returns an `(n * k, p)` stacked matrix
-/// (row-major channel stacking: block `i·k .. (i+1)·k` is observation `i`).
+/// no family scalars.  The callback returns an `(n * k, p)` **channel-major**
+/// stacked matrix: rows `r·n .. (r+1)·n` carry channel `r`'s row Jacobian, so
+/// `stacked[r·n + i, j]` is observation `i`'s row at output `r`.  Every
+/// existing implementation — `AdditiveBlockJacobian`, the
+/// survival-marginal-slope time/marginal/logslope callbacks, etc. — emits
+/// this layout (see `BlockEffectiveJacobian::effective_jacobian_at`).
 /// We reshape that into the `(n, p, k)` tensor that `RowJacobianOperator`
 /// expects.
 struct BlockJacobianAsRowOp {
@@ -103,13 +107,16 @@ impl BlockJacobianAsRowOp {
                 n_rows * k,
             ));
         }
-        // Reshape (n*k, p) → (n, p, k) by interpreting stacked row `i*k + r`
-        // as channel `r` for observation `i`.
+        // Reshape (n*k, p) → (n, p, k) using the channel-major layout produced
+        // by every BlockEffectiveJacobian implementation: row `r*n + i` of
+        // `stacked` is observation `i`, channel `r`.
         let mut jac = Array3::<f64>::zeros((n_rows, p_block, k));
-        for i in 0..n_rows {
-            for j in 0..p_block {
-                for r in 0..k {
-                    jac[[i, j, r]] = stacked[[i * k + r, j]];
+        for r in 0..k {
+            let row_base = r * n_rows;
+            for i in 0..n_rows {
+                let src_row = row_base + i;
+                for j in 0..p_block {
+                    jac[[i, j, r]] = stacked[[src_row, j]];
                 }
             }
         }
@@ -661,16 +668,22 @@ pub fn canonicalize_for_identifiability(
             };
             match spec.effective_jacobian_at("canonicalize_rank_check", &state) {
                 Ok(j_b) => {
-                    // j_b is (nk_b, p_b) where nk_b = n_rows * k_b
-                    // For single-channel blocks k_b = 1, so nk_b = n_rows.
-                    // For multi-channel blocks k_b = k, so nk_b = nk.
-                    // We embed single-channel blocks in the first k rows of
-                    // each observation's nk block.
+                    // j_b is channel-major (k_b·n_rows, p_b): row `r·n_rows + i`
+                    // carries observation `i`'s channel-`r` row Jacobian
+                    // (the layout produced by every BlockEffectiveJacobian
+                    // impl — see `BlockJacobianAsRowOp`).  j_pre is built in
+                    // the audit-compiler's interleaved layout (row `i*k + r`
+                    // for observation `i`, channel `r`), so this is a
+                    // channel-major → interleaved transpose.
                     let k_b = j_b.nrows() / n_rows;
-                    for i in 0..n_rows {
-                        for j in 0..p_b {
-                            for r in 0..k_b.min(k) {
-                                j_pre[[i * k + r, col_off + j]] = j_b[[i * k_b + r, j]];
+                    let r_max = k_b.min(k);
+                    for r in 0..r_max {
+                        let src_row_base = r * n_rows;
+                        for i in 0..n_rows {
+                            let dst_row = i * k + r;
+                            let src_row = src_row_base + i;
+                            for j in 0..p_b {
+                                j_pre[[dst_row, col_off + j]] = j_b[[src_row, j]];
                             }
                         }
                     }

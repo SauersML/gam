@@ -9842,7 +9842,10 @@ fn sae_manifold_fit_inner<'py>(
             "decoder_covariance",
             unc.decoder_covariance.clone().into_pyarray(py),
         )?;
-        atom_dict.set_item("shape_band_coords", unc.band_coords.clone().into_pyarray(py))?;
+        atom_dict.set_item(
+            "shape_band_coords",
+            unc.band_coords.clone().into_pyarray(py),
+        )?;
         atom_dict.set_item("shape_band_mean", unc.band_mean.clone().into_pyarray(py))?;
         atom_dict.set_item("shape_band_sd", unc.band_sd.clone().into_pyarray(py))?;
         atoms_py.append(atom_dict)?;
@@ -11678,6 +11681,26 @@ fn sae_manifold_predict_oos<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+    if !logits_are_warm && assignment_kind == "softmax" {
+        let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
+        let mut decoded = vec![0.0_f64; p_out];
+        for row in 0..n_obs {
+            for atom_idx in 0..k_atoms {
+                term.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
+                let mut err = 0.0_f64;
+                for out_col in 0..p_out {
+                    let diff = x_view[[row, out_col]] - decoded[out_col];
+                    err += diff * diff;
+                }
+                seeded_logits[[row, atom_idx]] = -err / tau;
+            }
+            let reference = seeded_logits[[row, k_atoms - 1]];
+            for atom_idx in 0..k_atoms {
+                seeded_logits[[row, atom_idx]] -= reference;
+            }
+        }
+        term.assignment.logits.assign(&seeded_logits);
+    }
     let log_ard: Vec<Array1<f64>> = effective_atom_dim
         .iter()
         .map(|&d| Array1::<f64>::zeros(d))
