@@ -21786,8 +21786,7 @@ fn apply_identifiability_to_jet(raw_jet: &Array3<f64>, z: &Array2<f64>) -> Array
     let mut out = Array3::<f64>::zeros((n, kp, 2));
     for axis in 0..2 {
         // raw_axis: (N, K); out_axis = raw_axis · z → (N, K').
-        let raw_axis: ndarray::ArrayView2<'_, f64> =
-            raw_jet.index_axis(ndarray::Axis(2), axis);
+        let raw_axis: ndarray::ArrayView2<'_, f64> = raw_jet.index_axis(ndarray::Axis(2), axis);
         let projected = raw_axis.dot(z);
         out.slice_mut(ndarray::s![.., .., axis]).assign(&projected);
     }
