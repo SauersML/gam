@@ -44,7 +44,7 @@ use crate::terms::analytic_penalties::{
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
-use crate::linalg::faer_ndarray::FaerEigh;
+use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use crate::solver::arrow_schur::{ArrowFactorCache, solve_arrow_newton_step_with_options};
 use crate::solver::estimate::EstimationError;
 use crate::solver::evidence::arrow_log_det_from_cache;
@@ -9064,4 +9064,192 @@ mod tests {
             other => panic!("expected RemlOptimizationFailed, got {other:?}"),
         }
     }
+}
+
+/// PCA-based seed for SAE atom latent coordinates. Centers `z`, takes its SVD,
+/// and projects onto leading principal components to initialize each atom's
+/// chart according to its [`SaeAtomBasisKind`]: periodic atoms read an angle off
+/// the top-2 PCs (remaining axes min-max normalized to `[-0.5, 0.5]`), sphere
+/// atoms read `(lat, lon)` off the unit-normalized top-3 PCs, torus axes read a
+/// `[0, 1)` phase off disjoint PC pairs, and Euclidean/other atoms take
+/// score-scaled, min-max-normalized PC projections. Returns a padded
+/// `(K_atoms, n_obs, d_max)` coordinate array.
+pub fn sae_pca_seed_initial_coords(
+    z: ArrayView2<'_, f64>,
+    basis_kinds: &[SaeAtomBasisKind],
+    atom_dim: &[usize],
+) -> Result<Array3<f64>, String> {
+    let k_atoms = basis_kinds.len();
+    let (n_obs, _p_out) = z.dim();
+    let d_max = atom_dim.iter().copied().max().unwrap_or(1).max(1);
+    let mut out = Array3::<f64>::zeros((k_atoms, n_obs, d_max));
+    if n_obs == 0 || z.ncols() == 0 {
+        return Ok(out);
+    }
+    let mut col_means = Array1::<f64>::zeros(z.ncols());
+    for col in 0..z.ncols() {
+        let mut acc = 0.0_f64;
+        for row in 0..n_obs {
+            acc += z[[row, col]];
+        }
+        col_means[col] = acc / n_obs as f64;
+    }
+    let mut centered = z.to_owned();
+    for row in 0..n_obs {
+        for col in 0..z.ncols() {
+            centered[[row, col]] -= col_means[col];
+        }
+    }
+    let (u_opt, s_vals, vt_opt) = centered
+        .svd(true, true)
+        .map_err(|err| format!("sae_pca_seed: SVD failed: {err:?}"))?;
+    let u = u_opt.ok_or_else(|| "sae_pca_seed: SVD returned no U".to_string())?;
+    let vt = vt_opt.ok_or_else(|| "sae_pca_seed: SVD returned no Vt".to_string())?;
+    let vt_rows = vt.nrows();
+    let u_cols = u.ncols();
+    let two_pi = std::f64::consts::TAU;
+    for atom_idx in 0..k_atoms {
+        let d = atom_dim[atom_idx];
+        if d == 0 {
+            continue;
+        }
+        match &basis_kinds[atom_idx] {
+            SaeAtomBasisKind::Periodic => {
+                if vt_rows >= 2 {
+                    let pc1 = vt.row(0);
+                    let pc2_row = if atom_idx == 0 {
+                        1
+                    } else {
+                        1 + atom_idx % vt_rows.saturating_sub(1).max(1)
+                    };
+                    let pc2 = vt.row(pc2_row.min(vt_rows - 1));
+                    for row in 0..n_obs {
+                        let mut a = 0.0_f64;
+                        let mut b = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            a += centered[[row, col]] * pc1[col];
+                            b += centered[[row, col]] * pc2[col];
+                        }
+                        out[[atom_idx, row, 0]] = b.atan2(a) / two_pi;
+                    }
+                }
+                for axis in 1..d {
+                    if axis >= vt_rows {
+                        break;
+                    }
+                    let pc = vt.row(axis);
+                    let mut proj = Array1::<f64>::zeros(n_obs);
+                    for row in 0..n_obs {
+                        let mut acc = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            acc += centered[[row, col]] * pc[col];
+                        }
+                        proj[row] = acc;
+                    }
+                    let (min_v, max_v) = proj
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                            (lo.min(v), hi.max(v))
+                        });
+                    let span = max_v - min_v;
+                    if span > 0.0 {
+                        for row in 0..n_obs {
+                            out[[atom_idx, row, axis]] = (proj[row] - min_v) / span - 0.5;
+                        }
+                    }
+                }
+            }
+            SaeAtomBasisKind::Sphere => {
+                // Seed the sphere chart from the top-3 PCs: drop the centred
+                // response onto (pc0, pc1, pc2), unit-normalise, and read off
+                // (lat, lon). This places every row on the chart with
+                // `lat ∈ (-π/2, π/2)` and `lon ∈ (-π, π]`.
+                let n_pc = vt_rows.min(3);
+                if n_pc == 0 {
+                    continue;
+                }
+                let pcs: Vec<_> = (0..n_pc).map(|i| vt.row(i)).collect();
+                for row in 0..n_obs {
+                    let mut amb = [0.0_f64; 3];
+                    for (i, pc) in pcs.iter().enumerate() {
+                        let mut acc = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            acc += centered[[row, col]] * pc[col];
+                        }
+                        amb[i] = acc;
+                    }
+                    let norm = (amb[0] * amb[0] + amb[1] * amb[1] + amb[2] * amb[2]).sqrt();
+                    let (x, y, z) = if norm > 0.0 {
+                        (amb[0] / norm, amb[1] / norm, amb[2] / norm)
+                    } else {
+                        (1.0, 0.0, 0.0)
+                    };
+                    let lat = z.clamp(-1.0, 1.0).asin();
+                    let lon = y.atan2(x);
+                    if d >= 1 {
+                        out[[atom_idx, row, 0]] = lat;
+                    }
+                    if d >= 2 {
+                        out[[atom_idx, row, 1]] = lon;
+                    }
+                }
+            }
+            SaeAtomBasisKind::Torus => {
+                // Seed each torus axis from a disjoint pair of PCs: axis `a`
+                // uses (pc_{2a}, pc_{2a+1}) projected onto the centred
+                // response and read off as `atan2`, normalised to `[0, 1)`.
+                for axis in 0..d {
+                    let pc_a_idx = 2 * axis;
+                    let pc_b_idx = 2 * axis + 1;
+                    if pc_b_idx >= vt_rows {
+                        break;
+                    }
+                    let pc_a = vt.row(pc_a_idx);
+                    let pc_b = vt.row(pc_b_idx);
+                    for row in 0..n_obs {
+                        let mut a = 0.0_f64;
+                        let mut b = 0.0_f64;
+                        for col in 0..centered.ncols() {
+                            a += centered[[row, col]] * pc_a[col];
+                            b += centered[[row, col]] * pc_b[col];
+                        }
+                        // atan2 ∈ (-π, π]; map to phase ∈ [0, 1).
+                        let phase = b.atan2(a) / two_pi;
+                        let wrapped = phase - phase.floor();
+                        out[[atom_idx, row, axis]] = wrapped;
+                    }
+                }
+            }
+            _ => {
+                let k_cols = d.min(u_cols).min(s_vals.len());
+                let mut tmp = Array2::<f64>::zeros((n_obs, d));
+                for col in 0..k_cols {
+                    let s_col = s_vals[col];
+                    for row in 0..n_obs {
+                        tmp[[row, col]] = u[[row, col]] * s_col;
+                    }
+                }
+                for col in 0..d {
+                    let mut min_v = f64::INFINITY;
+                    let mut max_v = f64::NEG_INFINITY;
+                    for row in 0..n_obs {
+                        let v = tmp[[row, col]];
+                        if v < min_v {
+                            min_v = v;
+                        }
+                        if v > max_v {
+                            max_v = v;
+                        }
+                    }
+                    let span = max_v - min_v;
+                    if span > 0.0 {
+                        for row in 0..n_obs {
+                            out[[atom_idx, row, col]] = (tmp[[row, col]] - min_v) / span - 0.5;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(out)
 }
