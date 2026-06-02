@@ -114,6 +114,78 @@ class Diagnostics:
             interval_upper=predicted.get("mean_upper"),
         )
 
+    @classmethod
+    def from_binary_classification(
+        cls,
+        *,
+        formula: str,
+        response_name: str,
+        observed: list[float],
+        predicted: dict[str, list[float]],
+    ) -> "Diagnostics":
+        """Construct a :class:`Diagnostics` for a binary-classification fit.
+
+        Unlike :meth:`from_predictions`, which reports regression metrics
+        (MAE / RMSE / bias) that are meaningless on a ``{0, 1}`` response,
+        this populates ``metrics`` with the classification panel computed by
+        the Rust ``classification_metrics`` routine: ``auc``, ``pr_auc``,
+        ``brier``, ``logloss``, ``nagelkerke_r2`` (against the observed base
+        rate as the null model), and ``ece``. The ``predicted["mean"]`` series
+        is the model-implied :math:`P(y=1)`.
+
+        Parameters
+        ----------
+        formula : str
+            Model formula associated with the predictions.
+        response_name : str
+            Name of the response column.
+        observed : list of float
+            Observed ``{0, 1}`` labels.
+        predicted : dict of str to list of float
+            Prediction series. Must contain key ``"mean"`` (the predicted
+            positive-class probability); may carry interval bands.
+
+        Returns
+        -------
+        Diagnostics
+            Diagnostics record whose ``metrics`` hold the classification
+            panel and whose ``residuals`` are ``observed - P(y=1)``.
+
+        Examples
+        --------
+        >>> Diagnostics.from_binary_classification(
+        ...     formula="y ~ s(x)",
+        ...     response_name="y",
+        ...     observed=[0.0, 0.0, 1.0, 1.0],
+        ...     predicted={"mean": [0.1, 0.3, 0.7, 0.9]},
+        ... ).metrics["auc"]
+        1.0
+        """
+        try:
+            rust = rust_module()
+            import numpy as np
+
+            mean = predicted["mean"]
+            train_prev = float(np.mean(observed)) if len(observed) else 0.0
+            metrics = dict(rust.classification_metrics(observed, mean, train_prev))
+            metrics["n_obs"] = float(len(observed))
+            residuals_array = rust.compute_residuals(
+                np.asarray(observed, dtype=np.float64),
+                np.asarray(mean, dtype=np.float64),
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        return cls(
+            formula=formula,
+            response_name=response_name,
+            observed=observed,
+            residuals=list(residuals_array),
+            predicted=predicted,
+            metrics=metrics,
+            interval_lower=predicted.get("mean_lower"),
+            interval_upper=predicted.get("mean_upper"),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a plain ``dict`` snapshot of the diagnostics record.
 
