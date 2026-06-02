@@ -6292,11 +6292,9 @@ fn gaussian_joint_first_directionalweights(
     for i in 0..nobs {
         let wi = scalars.w[i];
         let mi = scalars.m[i];
-        let ni = scalars.n[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
-        let kdpi = scalars.kappa_dprime[i];
-        let amn = scalars.obs_weight[i] - ni;
+        let ai = scalars.obs_weight[i];
         let dm = dotmu[i];
         let de = dot_eta[i];
         // κ-scaled log-sigma direction.
@@ -6304,12 +6302,8 @@ fn gaussian_joint_first_directionalweights(
         w_u[i].write(-2.0 * wi * sde);
         // + 2·κ'·m·de: dκ/dη chain-rule from σ = b + e^η.
         c_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
-        // F_μ·dm + F_η·de with F = 2κ²n + κ'(a−n) (mirrors helper 4 dh_ls_ls).
-        d_u[i].write(
-            ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde)
-                + 2.0 * mi * kpi * dm
-                + (kdpi * amn + 6.0 * ki * kpi * ni) * de,
-        );
+        // Directional derivative of Fisher E[H_{ls,ls}]=2κ²a: 4κκ'a·de (#566).
+        d_u[i].write(4.0 * ki * kpi * ai * de);
     }
     // SAFETY: every slot of `w_u`, `c_u`, `d_u` was written exactly once
     // inside the loop above (one `.write(...)` per index per array).
@@ -6331,15 +6325,10 @@ fn gaussian_jointsecond_directionalweights(
     for i in 0..nobs {
         let wi = scalars.w[i];
         let mi = scalars.m[i];
-        let ni = scalars.n[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
         let kdpi = scalars.kappa_dprime[i];
-        // κ''' = κ''(1−2κ) − 2κ'²: needed for the (a−n)·deu·dev piece of d²H_{ls,ls}/∂η².
-        let ktpi = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
-        // (κ')² + κ·κ'' − 5κ²·κ': η-η coefficient from differentiating the OLD 2κ²n part.
-        let dlsls_eta_eta_old = kpi * kpi + ki * kdpi - 5.0 * ki * ki * kpi;
-        let amn = scalars.obs_weight[i] - ni;
+        let ai = scalars.obs_weight[i];
         let dmu = dotmu_u[i];
         let dmv = dotmuv[i];
         let deu = dot_eta_u[i];
@@ -6357,20 +6346,9 @@ fn gaussian_jointsecond_directionalweights(
                 - 2.0 * wi * kpi * de_sym
                 + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_eta,
         );
-        // d²/du dv of corrected H_{ls,ls} = 2κ²n + κ'(a−n). The "_old" bracket
-        // covers d²(2κ²n); the extra terms cover d²(κ'(a−n)).
-        d_uv[i].write(
-            ki * ki
-                * (4.0 * wi * dmu * dmv
-                    + 8.0 * mi * (dmu * sdev + dmv * sdeu)
-                    + 8.0 * ni * sdeu * sdev)
-                - 2.0 * kpi * wi * dmu * dmv
-                - 8.0 * mi * ki * kpi * de_sym
-                + 2.0 * mi * (kdpi - 2.0 * ki * kpi) * de_sym
-                + 4.0 * ni * dlsls_eta_eta_old * de_eta
-                + (2.0 * kpi * kpi + 4.0 * ki * kdpi - 4.0 * ki * ki * kpi) * ni * de_eta
-                + ktpi * amn * de_eta,
-        );
+        // d²/du dv of Fisher E[H_{ls,ls}]=2κ²a: bilinear in fixed directions
+        // u,v, no μ dependence ⇒ 4a(κ'²+κκ'')·deu·dev (#566).
+        d_uv[i].write(4.0 * ai * (kpi * kpi + ki * kdpi) * de_eta);
     }
     // SAFETY: every slot of `w_uv`, `c_uv`, `d_uv` was written exactly once
     // inside the loop above.
@@ -6418,17 +6396,25 @@ fn gaussian_joint_psi_firstweights(
         hmumu[i].write(wi);
         // Cross block: H_{μ,ls} = 2mκ (no κ' term — derivative of −m wrt η is 2mκ).
         hmu_ls[i].write(2.0 * ki * mi);
-        // + κ'·(a−n) term: H_{ls,ls} = κ(1−κ)(a−n) + 2κ²n.
-        h_ls_ls[i].write(2.0 * ki * ki * ni + kpi * (ai - ni));
+        // Fisher/expected (log σ, log σ) information: E[H_{ls,ls}] = 2κ²a.
+        // The observed curvature 2κ²n + κ'(a−n) collapses where the fitted
+        // residual is small (n→0), under-counting the scale block's EDF and
+        // letting REML over-smooth the scale predictor toward a flat constant
+        // (#566). Using E[n]=a (true model) gives the residual-free expected
+        // information 2κ²a, exactly as gamlss/mgcv gaulss Fisher-score the
+        // scale channel and as the diagonal PIRLS kernel already does
+        // (gaussian_diagonal_row_kernel: 2·obs_weight·κ²). The score
+        // (score_ls/dscore_ls/d2score_ls) stays the exact observed gradient so
+        // the joint Newton still converges to the true MLE stationary point;
+        // only the (ls,ls) curvature feeding the REML determinant/EDF is the
+        // expectation.
+        h_ls_ls[i].write(2.0 * ki * ki * ai);
         dhmumu[i].write(-2.0 * wi * sea);
         // + 2m·κ'·η̇: ∂(2mκ)/∂η = −4mκ² + 2mκ'.
         dhmu_ls[i].write(ki * (-2.0 * wi * ma - 4.0 * mi * sea) + 2.0 * mi * kpi * ea);
-        // + 2m·κ'·μ̇ + [κ''(a−n) + 6κκ'·n]·η̇ from differentiating κ'(a−n)+2κ²n.
-        dh_ls_ls[i].write(
-            ki * ki * (-4.0 * mi * ma - 4.0 * ni * sea)
-                + 2.0 * mi * kpi * ma
-                + (kdpi * (ai - ni) + 6.0 * ki * kpi * ni) * ea,
-        );
+        // Directional derivative of E[H_{ls,ls}]=2κ²a along (μ̇,η̇): no μ
+        // dependence; ∂(2κ²a)/∂η = 4κκ'a, so dh_ls_ls = 4κκ'a·η̇.
+        dh_ls_ls[i].write(4.0 * ki * kpi * ai * ea);
         objective_psirow[i].write(smu * ma + sls * ea);
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
@@ -6473,10 +6459,6 @@ fn gaussian_joint_psisecondweights(
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
         let kdpi = scalars.kappa_dprime[i];
-        // κ''' = κ''(1−2κ) − 2κ'²: needed for the (a−n)·η_a η_b piece of d²H_{ls,ls}/∂η².
-        let ktpi = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
-        // (κ')² + κ·κ'' − 5κ²·κ': η-η coefficient inside the d²H_{ls,ls} delta from differentiating the OLD 2κ²n piece.
-        let dlsls_eta_eta_old = kpi * kpi + ki * kdpi - 5.0 * ki * ki * kpi;
         let ai = scalars.obs_weight[i];
         let amn = ai - ni;
         let ma = mu_a[i];
@@ -6525,25 +6507,10 @@ fn gaussian_joint_psisecondweights(
                 + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * ea_eb
                 + 2.0 * mi * kpi * eab,
         );
-        // d²H_{ls,ls}/dψ_a dψ_b with corrected H_{ls,ls} = 2κ²n + κ'(a−n).
-        // F_μμ adds −2wκ'·ma_mb; F_μη adds 2m·(κ''−2κκ')·sym (on top of the
-        // −8mκκ' from differentiating 2κ²n); F_ηη adds (2κ'²+4κκ''−4κ²κ')n·ea_eb
-        // and κ'''(a−n)·ea_eb; F_μ adds 2mκ'·mab; F_η adds (2κκ'n + κ''(a−n))·eab.
-        d2h_ls_ls[i].write(
-            ki * ki
-                * (4.0 * wi * ma_mb + 8.0 * mi * cross + 8.0 * ni * sea_seb
-                    - 4.0 * mi * mab
-                    - 4.0 * ni * seab)
-                - 2.0 * kpi * wi * ma_mb
-                - 8.0 * mi * ki * kpi * cross_eta
-                + 2.0 * mi * (kdpi - 2.0 * ki * kpi) * cross_eta
-                + 4.0 * ni * dlsls_eta_eta_old * ea_eb
-                + (2.0 * kpi * kpi + 4.0 * ki * kdpi - 4.0 * ki * ki * kpi) * ni * ea_eb
-                + ktpi * amn * ea_eb
-                + 4.0 * ni * ki * kpi * eab
-                + 2.0 * mi * kpi * mab
-                + (2.0 * ki * kpi * ni + kdpi * amn) * eab,
-        );
+        // d²/dψ_a dψ_b of the Fisher (ls,ls) information E[H_{ls,ls}]=2κ²a (#566).
+        // No μ dependence; ∂(2κ²a)/∂η=4κκ'a and ∂(4κκ'a)/∂η=4a(κ'²+κκ'')a, so
+        // the second directional derivative is 4a(κ'²+κκ'')·ea·eb + 4aκκ'·eab.
+        d2h_ls_ls[i].write(4.0 * ai * (kpi * kpi + ki * kdpi) * ea_eb + 4.0 * ai * ki * kpi * eab);
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
     // exactly once inside the `for i in 0..nobs` loop above.
@@ -6578,15 +6545,10 @@ fn gaussian_joint_psi_mixed_driftweights(
     for i in 0..nobs {
         let wi = scalars.w[i];
         let mi = scalars.m[i];
-        let ni = scalars.n[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
         let kdpi = scalars.kappa_dprime[i];
-        // κ''' = κ''(1−2κ) − 2κ'²: needed for the (a−n)·de·ea piece of d²H_{ls,ls}/∂η².
-        let ktpi = kdpi * (1.0 - 2.0 * ki) - 2.0 * kpi * kpi;
-        // (κ')² + κ·κ'' − 5κ²·κ': η-η coefficient from differentiating the OLD 2κ²n part.
-        let dlsls_eta_eta_old = kpi * kpi + ki * kdpi - 5.0 * ki * ki * kpi;
-        let amn = scalars.obs_weight[i] - ni;
+        let ai = scalars.obs_weight[i];
         let dm = dotmu[i];
         let de = dot_eta[i];
         let ma = mu_a[i];
@@ -6605,12 +6567,9 @@ fn gaussian_joint_psi_mixed_driftweights(
         dhmumu_u[i].write(-2.0 * wi * sde);
         // + 2·κ'·m·de.
         dhmu_ls_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
-        // F_μ·dm + F_η·de with F = 2κ²n + κ'(a−n) (mirrors helper 4 dh_ls_ls).
-        dh_ls_ls_u[i].write(
-            ki * ki * (-4.0 * mi * dm - 4.0 * ni * sde)
-                + 2.0 * mi * kpi * dm
-                + (kdpi * amn + 6.0 * ki * kpi * ni) * de,
-        );
+        // Directional derivative of Fisher E[H_{ls,ls}]=2κ²a along (dm,de):
+        // no μ dependence, ∂(2κ²a)/∂η=4κκ'a ⇒ 4κκ'a·de (#566).
+        dh_ls_ls_u[i].write(4.0 * ki * kpi * ai * de);
         // − 2·κ'·w·de·ea: ∂²w/∂η² = 4wκ² − 2wκ'.
         d2hmumu[i].write(4.0 * wi * sde * sea - 2.0 * wi * sdea - 2.0 * wi * kpi * de_ea);
         // − 2·κ'·w·(dm·ea + de·ma) + 2·m·(κ''−6κκ')·de·ea + 2·m·κ'·dea from d²(2mκ).
@@ -6620,23 +6579,9 @@ fn gaussian_joint_psi_mixed_driftweights(
                 + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_ea
                 + 2.0 * mi * kpi * dea,
         );
-        // d²/(drift × ψ) of corrected H_{ls,ls} = 2κ²n + κ'(a−n). The "_old"
-        // bracket covers d²(2κ²n); the extra κ'/κ''/κ''' terms cover d²(κ'(a−n)).
-        d2h_ls_ls[i].write(
-            ki * ki
-                * (4.0 * wi * dm * ma + 8.0 * mi * cross + 8.0 * ni * sde * sea
-                    - 4.0 * mi * dma
-                    - 4.0 * ni * sdea)
-                - 2.0 * kpi * wi * dm * ma
-                - 8.0 * mi * ki * kpi * cross_eta
-                + 2.0 * mi * (kdpi - 2.0 * ki * kpi) * cross_eta
-                + 4.0 * ni * dlsls_eta_eta_old * de_ea
-                + (2.0 * kpi * kpi + 4.0 * ki * kdpi - 4.0 * ki * ki * kpi) * ni * de_ea
-                + ktpi * amn * de_ea
-                + 4.0 * ni * ki * kpi * dea
-                + 2.0 * mi * kpi * dma
-                + (2.0 * ki * kpi * ni + kdpi * amn) * dea,
-        );
+        // d²/(drift × ψ) of Fisher E[H_{ls,ls}]=2κ²a: 4a(κ'²+κκ'')·de·ea +
+        // 4aκκ'·dea (drift direction de, ψ direction ea, mixed dea) (#566).
+        d2h_ls_ls[i].write(4.0 * ai * (kpi * kpi + ki * kdpi) * de_ea + 4.0 * ai * ki * kpi * dea);
     }
     // SAFETY: every `MaybeUninit` slot in each field array was written
     // exactly once inside the `for i in 0..nobs` loop above.
@@ -7255,11 +7200,16 @@ impl GaussianLocationScaleFamily {
         }
 
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        // H_{μ,ls} = 2κm. H_{ls,ls} = 2κ²n + κ'(a−n): the κ'(a−n) piece is
-        // ∂[κ(a−n)]/∂η, lost if κ is treated as constant under the logb link.
+        // H_{μ,ls} = 2κm. (log σ, log σ) block uses the Fisher/expected
+        // information E[H_{ls,ls}] = 2κ²a (a = obs_weight): the observed
+        // curvature 2κ²n + κ'(a−n) collapses where the residual is small
+        // (n→0), under-counting the scale EDF and over-smoothing the scale
+        // predictor (#566). E[n]=a at the true model ⇒ 2κ²a, the residual-free
+        // Fisher form gamlss/mgcv gaulss use. The exact observed score still
+        // drives the Newton step, so the stationary point is unchanged; only
+        // the curvature feeding the REML determinant is the expectation.
         let cross = 2.0 * &rows.kappa * &rows.m;
-        let amn = &rows.obs_weight - &rows.n;
-        let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.n + &rows.kappa_prime * &amn;
+        let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &rows.w, &cross, &scale,
         )?))
@@ -10252,8 +10202,10 @@ impl GaussianLocationScaleWiggleFamily {
         // 2κ²n + κ'(a−n) under the logb link (the κ'(a−n) piece is lost if κ
         // is treated as constant under ∂/∂η_ls).
         let coeff_ml = (2.0 * &rows.kappa * &rows.m) * &geom.dq_dq0;
-        let amn = &rows.obs_weight - &rows.n;
-        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.n + &rows.kappa_prime * &amn;
+        // Fisher/expected (log σ, log σ) information E[H_{ls,ls}] = 2κ²a (#566):
+        // the observed 2κ²n + κ'(a−n) collapses at small residuals and
+        // over-smooths the scale; E[n]=a gives the residual-free 2κ²a.
+        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         let coeff_mw_b = &rows.w * &geom.dq_dq0;
         let coeff_mw_d = -&rows.m;
         // ls-wiggle cross block carries one κ from the η_ls chain.
@@ -10335,23 +10287,19 @@ impl GaussianLocationScaleWiggleFamily {
         let dw_u = -2.0 * &rows.w * &szeta;
         let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
         let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
-        let amn = &rows.obs_weight - &rows.n;
 
         let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
             - &(&dm_u * &geom.d2q_dq02)
             - &(&rows.m * &g2_u);
-        // Static blocks: H_{μ,ls} = 2κm·dq_dq0; H_{ls,ls} = 2κ²n + κ'(a−n).
-        // Differentiating along α = (xi, zeta, phi) carries dκ/dη_ls = κ' on
-        // every term that originally read just κ. The η_w direction has no
-        // direct η_ls dependence so does not contribute κ' factors directly,
-        // but does enter dn_u via q_u as a μ-chain — already captured.
+        // Static blocks: H_{μ,ls} = 2κm·dq_dq0; H_{ls,ls} = Fisher 2κ²a (#566).
+        // Differentiating the cross block along α = (xi, zeta, phi) carries
+        // dκ/dη_ls = κ' on every term that originally read just κ. The Fisher
+        // (ls,ls) block 2κ²a depends only on η_ls (a is the constant prior
+        // weight), so its directional derivative is 4κκ'a·zeta.
         let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
             + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
-        let coeff_ll_u = 2.0 * &rows.kappa * &rows.kappa * &dn_u
-            + 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.n)
-            + &rows.kappa_dprime * &(&zeta * &amn)
-            - &rows.kappa_prime * &dn_u;
+        let coeff_ll_u = 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.obs_weight);
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
         let c_u = -&dm_u;
         // ls-wiggle cross block: l = 2κm; differentiating gains 2κ'·m·zeta.
@@ -10425,7 +10373,6 @@ impl GaussianLocationScaleWiggleFamily {
         let dw_u = -2.0 * &rows.w * &szeta;
         let dm_u = -(&rows.w * &q_u) - &(2.0 * &rows.m * &szeta);
         let dn_u = -(2.0 * &rows.m * &q_u) - &(2.0 * &rows.n * &szeta);
-        let amn = &rows.obs_weight - &rows.n;
 
         let coeff_mm_u = &(&dw_u * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
@@ -10433,10 +10380,8 @@ impl GaussianLocationScaleWiggleFamily {
             - &(&rows.m * &g2_u);
         let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
             + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
-        let coeff_ll_u = 2.0 * &rows.kappa * &rows.kappa * &dn_u
-            + 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.n)
-            + &rows.kappa_dprime * &(&zeta * &amn)
-            - &rows.kappa_prime * &dn_u;
+        // Fisher (ls,ls) 2κ²a directional derivative: 4κκ'a·zeta (#566).
+        let coeff_ll_u = 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.obs_weight);
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
         let c_u = -&dm_u;
         let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&rows.m * &zeta);
@@ -10881,9 +10826,9 @@ impl GaussianLocationScaleWiggleFamily {
             &(fast_atv(&basis_a, &s_w) + fast_atv(&geom.basis, &s_w_a)),
         );
 
-        // Static blocks under logb: coeff_ml = 2κmD; coeff_ll = 2κ²n + κ'(a−n); l = 2κm.
-        // Directional pieces add κ' on the e_a leg (and κ'' would only show
-        // up at second-order, so this single-ψ path stops at κ').
+        // Static blocks under logb: coeff_ml = 2κmD; coeff_ll = Fisher 2κ²a; l = 2κm.
+        // Cross-block directional pieces add κ' on the e_a leg; the Fisher
+        // (ls,ls) block 2κ²a depends only on η_ls, so coeff_ll_a = 4κκ'a·e_a (#566).
         let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
         let coeff_mm_a = &(&dw_a * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_a)
@@ -10892,9 +10837,8 @@ impl GaussianLocationScaleWiggleFamily {
         let coeff_ml = 2.0 * &rows.kappa * &rows.m * &geom.dq_dq0;
         let coeff_ml_a = 2.0 * &rows.kappa * &(&dm_a * &geom.dq_dq0 + &rows.m * &s1_a)
             + 2.0 * &rows.kappa_prime * &(e_a * &rows.m * &geom.dq_dq0);
-        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.n + &rows.kappa_prime * &amn;
-        let coeff_ll_a = (2.0 * &rows.kappa * &rows.kappa - &rows.kappa_prime) * &dn_a
-            + (4.0 * &rows.kappa * &rows.kappa_prime * &rows.n + &rows.kappa_dprime * &amn) * e_a;
+        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
+        let coeff_ll_a = 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * e_a;
         let a = &rows.w * &geom.dq_dq0;
         let a_a = &dw_a * &geom.dq_dq0 + &rows.w * &s1_a;
         let c = -&rows.m;
