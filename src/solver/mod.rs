@@ -54,3 +54,10 @@ pub use estimate::reml::unified::CorrectedCovarianceError;
 /// also serves the in-process workflow pipeline. Exposed here so PyFFI can name
 /// it without the (crate-private) `workflow` module being publicly reachable.
 pub use workflow::descriptors::build_analytic_penalty_registry_from_descriptors;
+/// Process-wide counter of smoothing-corrections that took the sigma-cubature
+/// (second-order) branch in
+/// `estimate::reml::eval::RemlState::compute_smoothing_correction_auto`.
+/// Re-exported so integration tests can snapshot it before/after a fit and
+/// prove the cubature path (rather than the first-order linearization) was
+/// actually exercised — see the #582 response-scale-equivariance regression.
+pub use estimate::reml::eval::SMOOTHING_CORRECTION_CUBATURE_COUNT;

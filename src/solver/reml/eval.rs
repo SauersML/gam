@@ -491,6 +491,7 @@ impl<'a> RemlState<'a> {
         final_rho: &Array1<f64>,
         final_fit: &PirlsResult,
         base_covariance: Option<&Array2<f64>>,
+        dispersion_phi: f64,
         finalgrad_norm: f64,
     ) -> SmoothingCorrectionOutcome {
         use SmoothingCorrectionFallbackSeverity::{NumericalFailure, Routine};
@@ -769,9 +770,31 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        let point_pairs: Vec<(Array2<f64>, Array1<f64>)> =
-            point_results.into_iter().flatten().collect();
-        let mut total_cov = accumulate_sigma_cubature_total_covariance(&point_pairs, p);
+        // Dispersion scaling of the curvature (conditional-covariance) term.
+        //
+        // Each sigma point yields `(H(ρ)⁻¹, β̂(ρ))`. The inverse Hessian H(ρ)⁻¹
+        // is dispersion-free (for Gaussian, H = XᵀWX + S with W carrying no φ),
+        // exactly like `base_cov = H_opt⁻¹`. The law of total covariance for the
+        // smoothing-parameter-marginalised posterior is
+        //   V_p = E_ρ[Cov(β|ρ)] + Cov_ρ[β̂(ρ)]
+        //       = E_ρ[φ̂·H(ρ)⁻¹]  +  Cov_ρ[β̂(ρ)].
+        // The SECOND term (`var_beta` inside the accumulator) is built from β̂
+        // directly: under y→c·y it inherits β̂→c·β̂ and so already lives on the
+        // c² variance scale — it must NOT be multiplied by φ̂. The FIRST term is
+        // the dispersion-free curvature `E_ρ[H(ρ)⁻¹]`; it is c⁰ and must carry
+        // exactly one factor of φ̂ to reach the c² variance scale. We therefore
+        // scale ONLY the per-sigma inverse-Hessian blocks by φ̂ before
+        // accumulating, leaving β̂ (hence `var_beta`) untouched. This is the
+        // Wood (2016) `Vc` form with φ fixed at the optimum φ̂ — identical to how
+        // estimate.rs builds `Vb = φ̂·H_opt⁻¹` and adds the first-order
+        // `J·V_ρ·Jᵀ` (itself ∝ c², dispersion-free) directly. Applying φ̂ a
+        // second time anywhere would make the curvature block scale as c⁴ (#582).
+        let scaled_pairs: Vec<(Array2<f64>, Array1<f64>)> = point_results
+            .into_iter()
+            .flatten()
+            .map(|(cov_point, beta_point)| (cov_point.mapv(|v| dispersion_phi * v), beta_point))
+            .collect();
+        let mut total_cov = accumulate_sigma_cubature_total_covariance(&scaled_pairs, p);
         if !total_cov.iter().all(|v| v.is_finite()) {
             return self.finalize_smoothing_outcome(first_order_numerical(
                 first_order_correction,
@@ -780,7 +803,16 @@ impl<'a> RemlState<'a> {
         }
         enforce_symmetry(&mut total_cov);
 
-        let mut corr = total_cov - base_cov;
+        // `total_cov = φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂]`. The consumer adds this
+        // correction onto the SCALED conditional covariance `Vb = φ̂·H_opt⁻¹`
+        // (estimate.rs), so the matrix we must subtract from `total_cov` to form
+        // the additive correction is that same φ̂-scaled base — not the
+        // dispersion-free `H_opt⁻¹` that was passed in. Subtracting `φ̂·base_cov`
+        // makes the curvature block telescope exactly:
+        //   Vp = φ̂·H_opt⁻¹ + (φ̂·E_ρ[H⁻¹] − φ̂·H_opt⁻¹) + Cov_ρ[β̂]
+        //      = φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂],
+        // which scales by exactly c², consistent with Vb (#582).
+        let mut corr = total_cov - base_cov.mapv(|v| dispersion_phi * v);
         enforce_symmetry(&mut corr);
 
         self.finalize_smoothing_outcome(SmoothingCorrectionOutcome::Cubature {

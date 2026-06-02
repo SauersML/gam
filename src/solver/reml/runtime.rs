@@ -8115,7 +8115,21 @@ impl<'a> RemlState<'a> {
             log_likelihood: ctx.log_likelihood,
             penalty_quadratic: pirls_result.stable_penalty_term,
             beta,
-            n_observations: self.y.len(),
+            // Effective sample size for the REML/LAML criterion. A prior weight
+            // of exactly 0 makes a row contribute nothing to any weighted
+            // cross-product (XᵀWX, XᵀWy) or to the weighted deviance, so it is
+            // statistically equivalent to an absent row. The ONLY channel left
+            // by which it could still perturb λ selection / EDF / dispersion is
+            // the explicit observation count `n` that enters the profiled-scale
+            // denominator `(n − M_p)` and the `(n−M_p)/2·log(2πφ̂)` REML term.
+            // Counting zero-weight rows there puts a deviance numerator that
+            // already excludes them over a denominator that does not, biasing φ̂
+            // low, shifting the selected λ, and shrinking every SE. Use the
+            // count of positive-weight rows (R's `n.ok = nobs − Σ[w==0]`, mgcv's
+            // dropped zero-weight observations) — identical to the effective `n`
+            // estimate.rs uses for the dispersion denominator (#584). With no
+            // weights / all weights 1 this equals `self.y.len()`.
+            n_observations: self.weights.iter().filter(|&&wi| wi > 0.0).count(),
             hessian_op,
             penalty_coords,
             penalty_logdet,
@@ -8794,6 +8808,7 @@ impl<'a> RemlState<'a> {
                     for idx in 0..alo_gradient.len() {
                         gradient[idx] += alo_gradient[idx];
                     }
+<<<<<<< HEAD
                     // The ALO augmentation contributes only a cost and gradient
                     // term; its Gauss-Newton curvature term was dropped as dead
                     // (see "drop dead ALO-stabilization Hessian computation"), so
@@ -8802,6 +8817,17 @@ impl<'a> RemlState<'a> {
                     // augmented cost+gradient via its ratio test, and keeping the
                     // base Hessian preserves the `HessianSource::Analytic` invariant
                     // the outer plan relies on.
+=======
+                    // The augmented objective is `V(ρ) + C(ρ)`. The ALO
+                    // stabilization no longer produces a separate ρ-Hessian for
+                    // `C(ρ)` (dropped as dead computation); the base-REML analytic
+                    // Hessian in `result.hessian` is retained as the curvature
+                    // model. ARC's adaptive cubic regularization still converges on
+                    // the exact augmented cost+gradient via its ratio test, so a
+                    // slightly inexact curvature model only changes step quality,
+                    // not correctness, and the `HessianSource::Analytic` invariant
+                    // still holds.
+>>>>>>> b015ecc12 (fix(reml): complete response-scale-equivariant Vp + effective-n REML (#582, #584))
                 }
                 _ => {
                     log::warn!(
