@@ -18136,18 +18136,24 @@ fn rg_sphere_log_map_impl(
         if dot <= -1.0 + 1.0e-12 {
             return Err("spherical log map is undefined at antipodal points".to_string());
         }
-        let theta = dot.acos();
-        let sin_theta = theta.sin();
-        let scale = if sin_theta > 1.0e-12 {
-            theta / sin_theta
-        } else {
-            1.0
-        };
-        if theta < 1.0e-12 {
+        // Geodesic angle via theta = atan2(|u|, p·q) with u = q − (p·q)p, the
+        // component of q orthogonal to p (|u| = sin theta). For nearby points
+        // p·q rounds to exactly 1.0 in f64 and acos(p·q) collapses a genuine
+        // ~1e-9 distance to 0; |u| is formed straight from the coordinates with
+        // no near-1 subtraction, so atan2(|u|, p·q) ≈ |u| stays accurate and
+        // the tangent norm equals the geodesic distance as documented.
+        let mut s_sq = 0.0_f64;
+        for col in 0..d {
+            let uc = y[[row, col]] - dot * b_mat[[0, col]];
+            s_sq += uc * uc;
+        }
+        let s = s_sq.sqrt();
+        if s < 1.0e-12 {
             for col in 0..d {
                 out[[row, col]] = 0.0;
             }
         } else {
+            let scale = s.atan2(dot) / s;
             for col in 0..d {
                 out[[row, col]] = (y[[row, col]] - dot * b_mat[[0, col]]) * scale;
             }

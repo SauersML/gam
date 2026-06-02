@@ -138,8 +138,15 @@ pub trait Manifold: Send + Sync {
         vec![1.0; self.ambient_dim()]
     }
 
-    /// Riemannian inner product `<ξ, η>_p`. Default: weighted ambient
-    /// inner product restricted to `T_p M`.
+    /// Inner product `<ξ, η>_p` under the solver's **working metric**: the
+    /// weighted ambient inner product `Σ_i w_i ξ_i η_i` restricted to `T_p M`,
+    /// with `w = metric_weights()`. The weights are a deliberate trust-region
+    /// *preconditioning* rescaling, so for the curved manifolds this is a
+    /// constant rescaling of the induced embedding metric `ξᵀη` — a valid
+    /// Riemannian metric, but **not** the standard unit-radius induced metric
+    /// (e.g. on the unit sphere it scales the antipodal distance π down to 1).
+    /// Optimization is run consistently under this metric; it is not the
+    /// canonical geometric distance and callers must not read it as such.
     fn inner_product(&self, p: ArrayView1<f64>, xi: ArrayView1<f64>, eta: ArrayView1<f64>) -> f64 {
         assert_eq!(p.len(), self.ambient_dim());
         assert_eq!(xi.len(), eta.len());
@@ -471,11 +478,15 @@ impl Manifold for Sphere {
         );
     }
     fn vector_transport(&self, from: ArrayView1<f64>, to: ArrayView1<f64>, xi: ArrayViewMut1<f64>) {
-        // Projection transport (proposal §6.4). Cheap, stable, not exactly
-        // isometric. Antipodal case (to ≈ -from) does not divide by zero
-        // here — unlike exact geodesic transport which has a 1+<p,q>
-        // denominator. The transported tangent can be small near antipodal
-        // endpoints; that is a correctness-preserving degradation.
+        // Projection (first-order) vector transport (proposal §6.4): cheap and
+        // stable, but only a first-order approximation to parallel transport —
+        // it does NOT preserve the inner product. Unlike exact geodesic
+        // transport (which has a 1+<p,q> denominator) it does not divide by zero
+        // in the antipodal case (to ≈ -from); there it can shrink the tangent
+        // toward zero. That is a fidelity loss, not a "correctness-preserving"
+        // operation — it is accepted here only because the optimizer tolerates
+        // an approximate transport, not because the result is the true parallel
+        // transport.
         assert_eq!(from.len(), self.n + 1);
         self.project_tangent(to, xi);
     }
