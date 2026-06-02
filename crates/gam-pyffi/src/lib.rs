@@ -8018,53 +8018,20 @@ fn latent_aux_prior_stats(
     aux_strength: Option<f64>,
 ) -> Result<LatentAuxPriorStats, String> {
     let targets = aux_prior_targets(t_mat, u_view, aux_family)?;
-    let n_obs = t_mat.nrows();
-    let latent_dim = t_mat.ncols();
-    let mut residual_sq = 0.0_f64;
-    for n in 0..n_obs {
-        for a in 0..latent_dim {
-            let diff = t_mat[[n, a]] - targets[[n, a]];
-            residual_sq += diff * diff;
-        }
-    }
-    if !residual_sq.is_finite() {
-        return Err("auxiliary prior residual norm must be finite".to_string());
-    }
-    // The pyffi latent entry points receive `t` as the current outer
-    // coordinate. When Python passes None/"auto", the log_mu coordinate has
-    // a closed-form REML optimum for this fixed t because only the normalized
-    // auxiliary prior depends on it.
-    let (log_mu, mu, auto) = match aux_strength {
-        Some(mu) => {
-            if !(mu.is_finite() && mu > 0.0) {
-                return Err(format!(
-                    "aux_strength must be finite and positive; got {mu}"
-                ));
-            }
-            (mu.ln(), mu, false)
-        }
-        None => {
-            if residual_sq <= 0.0 {
-                return Err(
-                    "aux_strength='auto' has no finite REML optimum when the auxiliary residual is zero"
-                        .to_string(),
-                );
-            }
-            let mu = (n_obs as f64) / residual_sq;
-            if !(mu.is_finite() && mu > 0.0) {
-                return Err(format!(
-                    "auto aux_strength selected a non-finite precision: {mu}"
-                ));
-            }
-            (mu.ln(), mu, true)
-        }
-    };
-    let score = 0.5 * mu * residual_sq - 0.5 * (n_obs as f64) * log_mu;
+    // The closed-form auxiliary-prior REML statistics (residual norm + the
+    // log_mu optimum at fixed t + the prior score) live in core; this packs
+    // them into the FFI latent-fit plumbing struct.
+    let stats =
+        gam::terms::latent_coord::aux_prior_reml_stats(t_mat, targets.view(), aux_strength)?;
     Ok(LatentAuxPriorStats {
         targets,
-        residual_sq,
-        strength: LatentAuxStrengthState { log_mu, mu, auto },
-        score,
+        residual_sq: stats.residual_sq,
+        strength: LatentAuxStrengthState {
+            log_mu: stats.log_mu,
+            mu: stats.mu,
+            auto: stats.auto,
+        },
+        score: stats.score,
     })
 }
 
