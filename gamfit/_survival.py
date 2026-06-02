@@ -491,6 +491,101 @@ class SurvivalPrediction:
     def _survival_block(self, params: Any, times_arr: Any) -> Any:
         return rust_module().survival_block(params, times_arr)
 
+    def risk_score_at(self, horizon: Any) -> Any:
+        """Per-row scalar risk score at a single ``horizon`` time.
+
+        The risk score is the cumulative hazard :math:`H(\\text{horizon})`,
+        which is monotone in failure propensity: a larger value means a
+        subject is *more* likely to have failed by ``horizon``. This is the
+        ordering convention Harrell's C-index expects (higher risk pairs with
+        shorter survival), so it can be fed directly to :meth:`concordance`.
+
+        Parameters
+        ----------
+        horizon : float
+            Single evaluation time at which to read each row's cumulative
+            hazard.
+
+        Returns
+        -------
+        numpy.ndarray
+            One-dimensional array of per-row cumulative hazards.
+        """
+        import numpy as np
+
+        horizon_value = float(horizon)
+        cumulative = self.cumulative_hazard_at([horizon_value])
+        return np.asarray(cumulative, dtype=float).reshape(-1)
+
+    def concordance(
+        self,
+        event_times: Any,
+        events: Any,
+        *,
+        risk_score: Any | None = None,
+        horizon: Any | None = None,
+    ) -> float:
+        """Harrell's concordance index (C-index) for this prediction.
+
+        Quantifies how well the model's risk ordering agrees with the
+        observed (possibly right-censored) failure ordering: of all
+        comparable subject pairs, the fraction the model ranks correctly
+        (ties counted as one half). ``0.5`` is chance, ``1.0`` is perfect
+        discrimination. Computed by the Rust ``survival_concordance`` routine.
+
+        The risk score defaults to the per-row cumulative hazard at
+        ``horizon`` (the largest observed event time when ``horizon`` is
+        ``None``) via :meth:`risk_score_at`; higher risk means earlier
+        expected failure. Pass an explicit ``risk_score`` to score an
+        arbitrary linear predictor or other risk surrogate instead.
+
+        Parameters
+        ----------
+        event_times : array-like of float
+            Observed event / censoring time per row, aligned with this
+            prediction's rows.
+        events : array-like of float
+            Event indicator per row (``1`` = observed failure, ``0`` =
+            censored).
+        risk_score : array-like of float, optional
+            Explicit per-row risk score (higher = higher risk). When
+            ``None`` (default) the cumulative hazard at ``horizon`` is used.
+        horizon : float, optional
+            Evaluation time for the default cumulative-hazard risk score.
+            Ignored when ``risk_score`` is supplied. Defaults to the maximum
+            observed ``event_times``.
+
+        Returns
+        -------
+        float
+            Harrell's C-index in ``[0, 1]``.
+
+        Examples
+        --------
+        >>> prediction.concordance(times, events)
+        0.78
+        """
+        import numpy as np
+
+        times_arr = np.asarray(event_times, dtype=float).reshape(-1)
+        events_arr = np.asarray(events, dtype=float).reshape(-1)
+        if risk_score is None:
+            horizon_value = (
+                float(horizon)
+                if horizon is not None
+                else float(np.max(times_arr))
+            )
+            score_arr = self.risk_score_at(horizon_value)
+        else:
+            score_arr = np.asarray(risk_score, dtype=float).reshape(-1)
+        return float(
+            rust_module().survival_concordance(
+                times_arr.tolist(),
+                score_arr.tolist(),
+                events_arr.tolist(),
+            )
+        )
+
 
 def ordered_prediction_columns(columns: dict[str, list[float]]) -> dict[str, list[float]]:
     columns_json = json.dumps(columns, separators=(",", ":"))

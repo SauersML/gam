@@ -361,3 +361,103 @@ class GAMClassifier(ClassifierMixin, _BaseGAMEstimator):
         array([1, 0, 1, 1, 0])
         """
         return self.classes_.take(np.argmax(self.predict_proba(X), axis=1))
+
+    def metrics(self, X: Any, y: Any) -> dict[str, float]:
+        """Classification-metric panel for ``X`` against true labels ``y``.
+
+        Surfaces the Rust ``classification_metrics`` routine on the model's
+        positive-class probabilities: ``auc``, ``pr_auc``, ``brier``,
+        ``logloss``, ``nagelkerke_r2`` (relative to the observed base rate),
+        and ``ece``. ``y`` may carry the original label dtype (strings,
+        ``{-1, +1}``, ``{0, 1}``, …); it is encoded against :attr:`classes_`
+        exactly as at fit time so the positive class is ``classes_[1]``.
+
+        Parameters
+        ----------
+        X : Any
+            Serving table with the feature columns seen at fit time.
+        y : array-like
+            True labels, drawn from :attr:`classes_`.
+
+        Returns
+        -------
+        dict of str to float
+            The classification-metric panel.
+
+        Examples
+        --------
+        >>> clf.metrics(X_test, y_test)["auc"]
+        0.91
+        """
+        check_is_fitted(self, "model_")
+        observed = self._encode_labels(y)
+        positive = self.predict_proba(X)[:, 1].astype(float)
+        train_prev = float(np.mean(observed)) if observed.size else 0.0
+        return dict(
+            rust_module().classification_metrics(
+                observed.tolist(),
+                positive.tolist(),
+                train_prev,
+            )
+        )
+
+    def score(self, X: Any, y: Any, sample_weight: Any | None = None) -> float:
+        """Area under the ROC curve (AUC) of the model on ``(X, y)``.
+
+        Overrides scikit-learn's default accuracy score with AUC, the natural
+        threshold-free discrimination metric for the probabilistic output of
+        a GAM classifier, computed through the Rust ``classification_metrics``
+        routine. ``sample_weight`` is honoured by restricting the AUC to the
+        rows with strictly positive weight (an AUC is rank-based and has no
+        per-pair weighting), keeping the call signature compatible with the
+        scikit-learn scorer protocol.
+
+        Parameters
+        ----------
+        X : Any
+            Serving table with the feature columns seen at fit time.
+        y : array-like
+            True labels, drawn from :attr:`classes_`.
+        sample_weight : array-like or None, optional
+            Per-row weights; rows with weight ``<= 0`` are dropped before
+            scoring. ``None`` (default) scores every row.
+
+        Returns
+        -------
+        float
+            AUC in ``[0, 1]``; ``0.5`` is chance, ``1.0`` is perfect ranking.
+
+        Examples
+        --------
+        >>> clf.score(X_test, y_test)
+        0.91
+        """
+        check_is_fitted(self, "model_")
+        observed = self._encode_labels(y)
+        positive = self.predict_proba(X)[:, 1].astype(float)
+        if sample_weight is not None:
+            keep = np.asarray(sample_weight, dtype=float).reshape(-1) > 0.0
+            observed = observed[keep]
+            positive = positive[keep]
+        return float(rust_module().auc_from_predictions(observed.tolist(), positive.tolist()))
+
+    def _encode_labels(self, y: Any) -> np.ndarray:
+        """Encode ``y`` to ``{0, 1}`` against :attr:`classes_`.
+
+        Mirrors the fit-time convention (positive class is ``classes_[1]``)
+        so metric inputs line up with the model's positive-class probability.
+        Labels not present in :attr:`classes_` raise, rather than silently
+        scoring against a phantom class.
+        """
+        arr = np.asarray(y).reshape(-1)
+        positive = self.classes_[1]
+        negative = self.classes_[0]
+        is_positive = arr == positive
+        is_negative = arr == negative
+        unknown = ~(is_positive | is_negative)
+        if np.any(unknown):
+            raise ValueError(
+                "GAMClassifier scoring received labels outside classes_="
+                f"{self.classes_!r}: {np.unique(arr[unknown])!r}"
+            )
+        return is_positive.astype(int)

@@ -2181,3 +2181,125 @@ def test_torch_fit_rejects_shape_constraint_with_multi_smooth_list() -> None:
     ]
     with pytest.raises(NotImplementedError):
         torch_fit(points=[x, x], response=y, smooths=smooths)
+
+
+def test_diagnose_auto_selects_classification_metrics_for_binary_family() -> None:
+    """`Model.diagnose` reports the classification panel (not RMSE/MAE) for a
+    binomial family, auto-selected from the fitted family with no user flag."""
+    _require_extension()
+    rng = np.random.default_rng(20260601)
+    n = 200
+    x = np.sort(rng.uniform(-3.0, 3.0, size=n))
+    p = 1.0 / (1.0 + np.exp(-2.0 * x))
+    y = rng.binomial(1, p).astype(float)
+    frame = pd.DataFrame({"x": x, "y": y})
+
+    model = gamfit.fit(frame, "y ~ s(x)", family="binomial")
+    diag = model.diagnose(frame)
+
+    # Classification panel keys must be present; regression-only keys must not
+    # be reported for a binary family (RMSE/MAE on {0,1} probabilities is
+    # meaningless).
+    for key in ("auc", "pr_auc", "brier", "logloss", "nagelkerke_r2", "ece"):
+        assert key in diag.metrics, f"missing classification metric {key!r}"
+    assert "rmse" not in diag.metrics
+    assert "mae" not in diag.metrics
+
+    auc = float(diag.metrics["auc"])
+    assert 0.0 <= auc <= 1.0
+    # The data are strongly separable in x, so a correctly-wired AUC must be
+    # well above chance.
+    assert auc > 0.85, f"binary diagnose AUC unexpectedly low: {auc:.3f}"
+    assert 0.0 <= float(diag.metrics["brier"]) <= 0.25
+    assert 0.0 <= float(diag.metrics["ece"]) <= 1.0
+
+
+def test_diagnose_keeps_regression_metrics_for_gaussian_family() -> None:
+    """Non-binary families keep the regression metric panel (RMSE/MAE), i.e.
+    the auto-selection does not misfire on Gaussian fits."""
+    _require_extension()
+    model = gamfit.fit(training_frame(), "y ~ x")
+    diag = model.diagnose(training_frame())
+    assert "rmse" in diag.metrics
+    assert "auc" not in diag.metrics
+
+
+def test_gamclassifier_score_is_auc_and_metrics_panel_is_sane() -> None:
+    """`GAMClassifier.score` returns AUC over `classification_metrics`, and
+    `.metrics` surfaces the full panel on a separable case."""
+    _require_extension()
+    rng = np.random.default_rng(20260602)
+    n = 200
+    x = np.sort(rng.uniform(-3.0, 3.0, size=n))
+    p = 1.0 / (1.0 + np.exp(-2.5 * x))
+    y = rng.binomial(1, p).astype(int)
+    X = pd.DataFrame({"x": x})
+
+    clf = GAMClassifier(formula="y ~ s(x)", family="binomial").fit(X, y)
+
+    auc = clf.score(X, y)
+    assert 0.0 <= auc <= 1.0
+    assert auc > 0.85, f"GAMClassifier.score (AUC) unexpectedly low: {auc:.3f}"
+
+    panel = clf.metrics(X, y)
+    for key in ("auc", "pr_auc", "brier", "logloss", "nagelkerke_r2", "ece"):
+        assert key in panel, f"missing classification metric {key!r}"
+    # .score must agree with the AUC entry of the full panel.
+    np.testing.assert_allclose(auc, float(panel["auc"]), atol=1e-9)
+
+    # A perfectly-separable, perfectly-ranked subset scores AUC == 1.0, and
+    # sample_weight==0 rows are dropped before scoring (sklearn scorer
+    # contract compatibility).
+    y_ranked = (x > 0.0).astype(int)
+    perfect = clf.score(X, y_ranked)
+    assert perfect == 1.0, f"separable ranking must give AUC 1.0; got {perfect}"
+    weights = np.ones(n, dtype=float)
+    weights[0] = 0.0
+    assert clf.score(X, y_ranked, sample_weight=weights) == 1.0
+
+
+def test_survival_prediction_concordance_recovers_known_ordering() -> None:
+    """`SurvivalPrediction.concordance` returns Harrell's C-index via the Rust
+    `survival_concordance` routine, with the default cumulative-hazard risk
+    score recovering a perfectly-ordered case."""
+    # Higher cumulative hazard => higher risk => should fail earlier. Build a
+    # prediction whose hazard ordering matches the observed failure ordering
+    # exactly, so the default risk score yields a perfect C-index of 1.0.
+    times = np.array([10.0, 20.0, 30.0], dtype=float)
+    cumulative = np.array(
+        [
+            [0.30, 0.60, 0.90],  # highest risk
+            [0.15, 0.30, 0.45],  # medium risk
+            [0.05, 0.10, 0.15],  # lowest risk
+        ],
+        dtype=float,
+    )
+    survival_surface = np.exp(-cumulative)
+    pred = gamfit.SurvivalPrediction(
+        model_class="survival marginal-slope",
+        parameters=np.zeros((3, 1), dtype=float),
+        parameter_names=("linear_predictor",),
+        times=times,
+        survival=survival_surface,
+        cumulative_hazard=cumulative,
+    )
+
+    # Observed failure times mirror the risk ranking: the highest-risk subject
+    # fails first. All are observed events.
+    event_times = np.array([5.0, 15.0, 25.0], dtype=float)
+    events = np.array([1.0, 1.0, 1.0], dtype=float)
+
+    c_index = pred.concordance(event_times, events)
+    assert c_index == 1.0, f"perfectly-ordered risk must give C-index 1.0; got {c_index}"
+
+    # Reversing the observed ordering inverts every comparable pair => 0.0.
+    reversed_times = np.array([25.0, 15.0, 5.0], dtype=float)
+    c_reversed = pred.concordance(reversed_times, events)
+    assert c_reversed == 0.0, f"anti-correlated ordering must give 0.0; got {c_reversed}"
+
+    # An explicit risk score is honoured verbatim; a constant score gives the
+    # chance C-index of 0.5 (every comparable pair is a tie).
+    c_tie = pred.concordance(
+        event_times, events, risk_score=np.ones(3, dtype=float)
+    )
+    assert c_tie == 0.5, f"constant risk score must give 0.5; got {c_tie}"
