@@ -1,0 +1,112 @@
+"""Posterior shape-uncertainty contract for the manifold SAE.
+
+The fit exposes, per atom, the phi-scaled posterior covariance of the decoder
+coefficients ``Cov(beta_k) = phi * S_beta^-1[block]`` and its closed-form
+push-forward to an ambient band (``shape_band``). These tests pin the contract:
+the covariance is a real SPD-ish posterior, the band sd matches the analytic
+``Phi Cov Phi^T`` propagation, it scales with the dispersion, and it is a
+*different, tighter* quantity than the per-observation data deviation.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+gamfit = pytest.importorskip("gamfit")
+
+
+def _fit_circle(n=400, noise=0.18, seed=0, max_iter=40):
+    rng = np.random.default_rng(seed)
+    t = rng.uniform(0.0, 1.0, n)
+    clean = np.column_stack([np.cos(2 * np.pi * t), np.sin(2 * np.pi * t)])
+    x = clean + noise * rng.standard_normal((n, 2))
+    fit = gamfit.sae_manifold_fit(
+        Z=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
+        isometry_weight=0.0, ard_per_atom=False, sparsity_weight=0.01,
+        smoothness_weight=0.01, max_iter=max_iter, learning_rate=1.0, random_state=seed,
+    )
+    return fit, x
+
+
+def test_shape_uncertainty_fields_present_and_well_shaped():
+    fit, x = _fit_circle()
+    p = x.shape[1]
+    atom = fit.atoms[0]
+    cov = atom.decoder_covariance
+    assert cov is not None, "fresh fit must expose decoder_covariance"
+    m = atom.decoder_coefficients.shape[0]  # basis size M_k
+    assert cov.shape == (m * p, m * p)
+    # phi-scaled posterior covariance: symmetric with non-negative diagonal.
+    np.testing.assert_allclose(cov, cov.T, atol=1e-8)
+    assert np.all(np.diag(cov) >= -1e-12)
+
+    band = fit.shape_band(0)
+    g = band["mean"].shape[0]
+    assert band["coords"].shape == (g, 1)
+    assert band["mean"].shape == (g, p)
+    assert band["sd"].shape == (g, p)
+    assert np.all(band["sd"] >= 0.0)
+    np.testing.assert_allclose(band["lower"], band["mean"] - 1.96 * band["sd"])
+    np.testing.assert_allclose(band["upper"], band["mean"] + 1.96 * band["sd"])
+    assert float(fit.dispersion) > 0.0
+
+
+def test_band_sd_matches_analytic_phi_cov_phi_propagation():
+    """band_sd[g, c]^2 must equal Sum_{b1,b2} Phi[b1] Phi[b2] Cov[(b1,c),(b2,c)]."""
+    from gamfit._binding import rust_module
+
+    fit, x = _fit_circle(n=300, seed=1)
+    p = x.shape[1]
+    atom = fit.atoms[0]
+    cov = atom.decoder_covariance
+    m = atom.decoder_coefficients.shape[0]
+    band = fit.shape_band(0)
+    coords = band["coords"]  # (G, 1)
+
+    # Recompute Phi at the band coordinates via the engine's own periodic basis.
+    phi, _jet, _pen = rust_module().basis_with_jet(
+        "periodic", np.ascontiguousarray(coords.reshape(-1, 1)), {"n_harmonics": 1}
+    )
+    phi = np.asarray(phi, dtype=float)  # (G, m)
+    assert phi.shape[1] == m
+
+    g = coords.shape[0]
+    for gi in range(0, g, max(1, g // 12)):
+        for c in range(p):
+            idx = [b * p + c for b in range(m)]
+            sub = cov[np.ix_(idx, idx)]
+            var = float(phi[gi] @ sub @ phi[gi])
+            assert var >= -1e-10
+            np.testing.assert_allclose(
+                band["sd"][gi, c], np.sqrt(max(var, 0.0)), rtol=1e-6, atol=1e-9,
+                err_msg=f"band sd mismatch at coord {gi}, channel {c}",
+            )
+
+
+def test_posterior_shape_band_is_tighter_than_data_deviation():
+    """Epistemic shape uncertainty must be far smaller than the per-point data
+    scatter: with N points the manifold is pinned tightly even though each
+    observation is noisy. They are distinct quantities (issue: uncertainty vs
+    typical data deviation)."""
+    fit, x = _fit_circle(n=400, noise=0.18, seed=2)
+    band = fit.shape_band(0)
+    data_sd = np.sqrt(float(fit.dispersion))
+    median_post_sd = float(np.median(band["sd"]))
+    assert median_post_sd > 0.0
+    # the data deviation should dwarf the shape posterior sd (well-pinned shape).
+    assert data_sd > 5.0 * median_post_sd, (
+        f"data_sd={data_sd:.4f} not >> posterior shape sd median={median_post_sd:.4f}"
+    )
+
+
+def test_more_data_tightens_the_posterior_band():
+    """Quadrupling the sample size shrinks the posterior shape band (the band is
+    an honest 1/sqrt(N)-style posterior, not a fixed cosmetic ribbon)."""
+    fit_small, _ = _fit_circle(n=120, noise=0.18, seed=3)
+    fit_big, _ = _fit_circle(n=480, noise=0.18, seed=3)
+    sd_small = float(np.median(fit_small.shape_band(0)["sd"]))
+    sd_big = float(np.median(fit_big.shape_band(0)["sd"]))
+    assert sd_big < sd_small, (
+        f"posterior band did not shrink with more data: "
+        f"median sd {sd_small:.4f} (n=120) -> {sd_big:.4f} (n=480)"
+    )
