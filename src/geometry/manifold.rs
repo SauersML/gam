@@ -81,15 +81,24 @@ pub trait RiemannianManifold: Send + Sync {
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         // Default projection is the identity (Euclidean-flat tangent space).
-        // Validate the input point dimension matches the manifold's ambient
-        // dimension so a caller passing the wrong-length vector fails fast
-        // here rather than producing a silently mis-shaped tangent vector.
+        // Validate that BOTH the base point and the tangent vector live in the
+        // ambient space so a caller passing a wrong-length vector fails fast
+        // here rather than producing a silently mis-shaped tangent vector. The
+        // tangent of `T_pM` is represented in the same ambient coordinates as
+        // the point, so its length must equal `ambient_dim()` too.
         let expected = self.ambient_dim();
         if point.len() != expected {
             return Err(GeometryError::DimensionMismatch {
                 context: "project_tangent point",
                 expected,
                 got: point.len(),
+            });
+        }
+        if vec.len() != expected {
+            return Err(GeometryError::DimensionMismatch {
+                context: "project_tangent vector",
+                expected,
+                got: vec.len(),
             });
         }
         Ok(vec.to_owned())
@@ -532,14 +541,16 @@ pub(crate) fn spectral_map_symmetric(
 }
 
 /// Dense matrix exponential `exp(A)` via scaling-and-squaring with a truncated
-/// Taylor series. The Frobenius norm of `A` is driven below 1/2 by repeated
+/// Taylor series. The Frobenius norm of `A` is driven below 1/4 by repeated
 /// halving (`A → A / 2^s`), where Taylor converges rapidly and stably; the
-/// result is then squared `s` times. With the scaled norm `< 1/2`, a degree-12
-/// Taylor tail is bounded by `‖A_s‖^{13} / 13! · 1/(1 - ‖A_s‖)`, so the fixed
-/// degree reaches full f64 precision. This is the standard, exact algorithm; no
-/// eigendecomposition is assumed (the inputs here are the non-normal
-/// canonical-metric block matrices on Stiefel, which are skew-like but not
-/// symmetric, so `spectral_map_*` does not apply).
+/// result is then squared `s` times. With the scaled norm `θ < 1/4`, the
+/// degree-12 Taylor tail is bounded by `θ^{13} / 13! · 1/(1 - θ)`; since `13! ≈
+/// 6.23e9`, this is below `4·0.25^{13}/6.23e9 ≈ 3.8e-18`, i.e. under one f64 ulp,
+/// so the fixed degree truly reaches full f64 precision (the `< 1/2` threshold
+/// previously used left a ~2e-14 tail, two orders above an ulp). This is the
+/// standard, exact algorithm; no eigendecomposition is assumed (the inputs here
+/// are the non-normal canonical-metric block matrices on Stiefel, which are
+/// skew-like but not symmetric, so `spectral_map_*` does not apply).
 pub(crate) fn matrix_exp(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     let n = a.nrows();
     if n != a.ncols() {
@@ -553,14 +564,14 @@ pub(crate) fn matrix_exp(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
         ));
     }
     // Frobenius norm; choose the squaring count so the scaled matrix has norm
-    // below 1/2, comfortably inside the Taylor radius for a degree-12 series.
+    // below 1/4, which keeps the degree-12 Taylor truncation under one f64 ulp.
     let mut frob = 0.0;
     for v in a.iter() {
         frob += v * v;
     }
     let frob = frob.sqrt();
-    let squarings = if frob > 0.5 {
-        (frob / 0.5).log2().ceil() as i32
+    let squarings = if frob > 0.25 {
+        (frob / 0.25).log2().ceil() as i32
     } else {
         0
     };
