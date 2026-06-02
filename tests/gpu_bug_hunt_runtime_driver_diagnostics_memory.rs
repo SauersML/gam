@@ -95,7 +95,7 @@ fn device_memory_representations_guard_against_invalid_csr_and_double_free_style
 fn diagnostics_counters_increment_on_every_dispatch_and_reset_clears_them() {
     gam::gpu::profile::clear();
     let a = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).expect("shape");
-    let _ = gam::gpu::try_fast_ab(a.view(), a.view());
+    drop(gam::gpu::try_fast_ab(a.view(), a.view()));
     let after_dispatch = gam::gpu::profile::snapshot();
     assert!(
         !after_dispatch.stats.is_empty(),

@@ -155,7 +155,7 @@ fn bug_vector_response_rejects_row_weight_dimension_mismatch_and_noise_diagonals
         "LowRank VectorNoise diag_precision must return the diagonal precision unchanged."
     );
 
-    let _ = GaussianVectorLikelihood::from_target(&VectorResponseTarget::new(
+    GaussianVectorLikelihood::from_target(&VectorResponseTarget::new(
         y,
         VectorNoise::Diagonal(array![1.0, 1.0]),
     ))

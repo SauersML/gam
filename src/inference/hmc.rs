@@ -1326,11 +1326,9 @@ fn cloglog_bernoulli_logp_and_residual(eta: f64, y: f64) -> Result<(f64, f64), E
         crate::bail_invalid_estim!("cloglog eta must be finite and within [-700, 700]; got {eta}");
     }
     let exp_eta = eta.exp();
-    let log_mu = if exp_eta <= std::f64::consts::LN_2 {
-        (-(-exp_eta).exp_m1()).ln()
-    } else {
-        (-(-exp_eta).exp()).ln_1p()
-    };
+    // log_mu = log(1 - exp(-exp_eta)); exp_eta > 0 on the guarded domain, so this is
+    // exactly the canonical cancellation-free log1mexp (single source of truth).
+    let log_mu = crate::inference::probability::log1mexp_positive(exp_eta);
     let log_one_minus_mu = -exp_eta;
     let grad_log_mu = (eta - exp_eta - log_mu).exp();
     let ll_i = y * log_mu + (1.0 - y) * log_one_minus_mu;

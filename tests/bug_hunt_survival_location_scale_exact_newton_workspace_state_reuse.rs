@@ -49,7 +49,7 @@ fn workspace_state_reuse_does_not_change_repeated_fit_output_after_different_cal
     ]);
 
     let theta_first = fit_theta(&data_a);
-    let _ = fit_theta(&data_b);
+    fit_theta(&data_b);
     let theta_second = fit_theta(&data_a);
 
     let max_abs = theta_first
