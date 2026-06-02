@@ -86,13 +86,23 @@ impl ResourcePolicy {
     /// Uses `MaterializeIfSmall`: dense materialization is allowed only when the
     /// matrix fits under `max_single_materialization_bytes`. This lets small-data
     /// families that lack an implicit operator work out of the box, while
-    /// biobank-scale problems error out and force the analytic-operator path.
-    /// Set `derivative_storage_mode = AnalyticOperatorRequired` explicitly to
+    /// pathologically large problems still error out and force the analytic-operator
+    /// path. Set `derivative_storage_mode = AnalyticOperatorRequired` explicitly to
     /// reject all dense fallback.
+    ///
+    /// The 1 GiB single-materialization budget matches the established
+    /// biobank-scale densification ceiling used elsewhere in the codebase
+    /// (e.g. `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`). Real
+    /// biobank-scale GAMLSS spatial designs (320k rows × ~130 cols ≈ 0.32 GiB)
+    /// must be materializable under this default because their families
+    /// (e.g. `BinomialLocationScale`) eagerly densify in
+    /// `build_location_scale_block` and have no operator-only fallback. A
+    /// tighter cap silently classified those as "too big" even though the
+    /// only available code path is the dense one.
     pub const fn default_library() -> Self {
         Self {
-            max_single_materialization_bytes: 256 * 1024 * 1024, // 256 MiB
-            max_operator_cache_bytes: 1024 * 1024 * 1024,        // 1 GiB
+            max_single_materialization_bytes: 1024 * 1024 * 1024, // 1 GiB
+            max_operator_cache_bytes: 1024 * 1024 * 1024,         // 1 GiB
             max_spatial_distance_cache_bytes: SPATIAL_DISTANCE_CACHE_MAX_BYTES,
             max_owned_data_cache_bytes: 512 * 1024 * 1024, // 512 MiB
             row_chunk_target_bytes: 8 * 1024 * 1024,       // 8 MiB per chunk

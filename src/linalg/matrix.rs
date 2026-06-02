@@ -1500,7 +1500,7 @@ impl DenseDesignMatrix {
         // operator-backed block dense-materializes to only ~3 MiB and is
         // genuinely safe. We now pick the permissive policy and let the
         // byte-cap inside the materialization guard reject anything that
-        // would actually blow the 256 MiB single-materialization budget.
+        // would actually blow the default 1 GiB single-materialization budget.
         // Callers that need strict refusal still get it by calling
         // `try_to_dense_arc_with_policy(ctx, &analytic_operator_required())`.
         let policy = ResourcePolicy::default_library();
@@ -1512,7 +1512,8 @@ impl DenseDesignMatrix {
     /// Uses the supplied policy's `max_single_materialization_bytes` cap when
     /// deciding whether to densify a lazy operator-backed design.  The default
     /// `try_to_dense_arc` always uses `ResourcePolicy::default_library()` (the
-    /// conservative 256 MiB cap suitable for ad-hoc dense conversions); cache
+    /// 1 GiB cap suitable for ad-hoc dense conversions, matching the
+    /// `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES` ceiling); cache
     /// layers that have their own larger cap (e.g.
     /// `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`) can call this
     /// method to consume the inner under their own threshold without forcing
