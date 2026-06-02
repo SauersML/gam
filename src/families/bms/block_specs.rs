@@ -611,15 +611,36 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
     };
     let probit_scale = probit_frailty_scale(initial_sigma);
-    let (mut joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
+    let (_raw_joint_designs, mut joint_specs) = build_term_collection_designs_and_freeze_joint(
         data_view,
         &[spec.marginalspec.clone(), spec.logslopespec.clone()],
     )
     .map_err(|e| e.to_string())?;
-    let marginal_design = joint_designs.remove(0);
-    let logslope_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
     let logslopespec_boot = joint_specs.remove(0);
+    // Rebuild the probe designs from the frozen `*_boot` specs so the probe's
+    // penalty topology matches the topology produced by every other build path
+    // in this optimization. The spatial optimizer's own bootstrap
+    // (`build_term_collection_designs_and_freeze_joint(data, &[marginalspec_boot,
+    // logslopespec_boot])` inside `optimize_spatial_length_scale_exact_joint`)
+    // and every subsequent kappa-driven rebuild feed the basis builder the
+    // captured `FrozenTransform` identifiability. Applying that captured
+    // transform to the same kernel can land the structural null-space block on
+    // the other side of `build_nullspace_shrinkage_penalty`'s spectral
+    // tolerance, so the raw and frozen builds disagree on whether the trend
+    // ridge survives as an active penalty candidate. Without this rebuild,
+    // `marginal_penalty_count` / `logslope_design.penalties.len()` are taken
+    // from the raw build but every subsequent evaluator measures the frozen
+    // build, and `evaluate_custom_family_joint_hyper` refuses with a
+    // "joint hyper rho dimension mismatch". Mirrors the CTN-side fix in
+    // `fit_transformation_normal`.
+    let (mut joint_designs, _) = build_term_collection_designs_and_freeze_joint(
+        data_view,
+        &[marginalspec_boot.clone(), logslopespec_boot.clone()],
+    )
+    .map_err(|e| format!("failed to rebuild frozen probe BMS joint designs: {e}"))?;
+    let marginal_design = joint_designs.remove(0);
+    let logslope_design = joint_designs.remove(0);
     let (latent_measure, latent_z_calibration) =
         build_latent_measure_with_geometry(&spec.z, &spec.weights, &spec.latent_z_policy)?;
     if latent_measure.is_empirical() && sigma_learnable {
