@@ -149,16 +149,6 @@ def response_matrix_from_table(data: Any, response_columns: Sequence[str]) -> An
     )
 
 
-_SIMPLEX_KINDS = {"simplex", "clr", "alr"}
-_SPHERE_KINDS = {"spherical", "sphere"}
-
-
-def _resolve_simplex_coord(kind: str, coordinates: str | None) -> str:
-    if coordinates is not None:
-        return coordinates.lower()
-    return "alr" if kind == "alr" else "clr"
-
-
 def geometry_log_map(
     values: Any,
     *,
@@ -167,33 +157,23 @@ def geometry_log_map(
     coordinates: str | None = None,
     reference: int = -1,
 ) -> tuple[Any, Any, str]:
+    """Map response observations to tangent coordinates at an intrinsic base.
+
+    Geometry-kind routing, simplex-coordinate resolution, and base-point
+    selection (intrinsic Fréchet mean when ``base`` is ``None``) all live in
+    Rust (``response_geometry_log_map``); this only marshals arrays.
+    """
     np = _np()
-    kind = geometry.lower()
-    if kind in _SPHERE_KINDS:
-        if base is None:
-            base_point = sphere_frechet_mean(values)
-        else:
-            # Normalize a single base row via the sphere_log_map FFI by mapping
-            # the base to itself: the impl normalizes its base argument internally.
-            base_point = _ffi(
-                "response_geometry_sphere_normalize_base",
-                np.asarray(base, dtype=float).reshape(-1),
-            )
-        return sphere_log_map(values, base_point), base_point, "spherical"
-    if kind in _SIMPLEX_KINDS:
-        coord = _resolve_simplex_coord(kind, coordinates)
-        if base is None:
-            base_point = simplex_frechet_mean(values)
-        else:
-            base_point = closure(np.asarray(base, dtype=float).reshape(1, -1))[0]
-        return (
-            simplex_log_map(values, base_point, coordinates=coord, reference=reference),
-            base_point,
-            coord,
-        )
-    raise ValueError(
-        "response_geometry must be one of 'spherical', 'simplex', 'clr', or 'alr'"
+    base_arr = None if base is None else np.asarray(base, dtype=float).reshape(-1)
+    tangent, base_point, coord = _ffi(
+        "response_geometry_log_map",
+        np.asarray(values, dtype=float),
+        str(geometry),
+        base_arr,
+        None if coordinates is None else str(coordinates),
+        int(reference),
     )
+    return tangent, base_point, coord
 
 
 def geometry_exp_map(
@@ -204,14 +184,15 @@ def geometry_exp_map(
     coordinates: str | None = None,
     reference: int = -1,
 ) -> Any:
-    kind = geometry.lower()
-    if kind in _SPHERE_KINDS:
-        return sphere_exp_map(tangent, base)
-    if kind in _SIMPLEX_KINDS:
-        coord = _resolve_simplex_coord(kind, coordinates)
-        return simplex_exp_map(tangent, base, coordinates=coord, reference=reference)
-    raise ValueError(
-        "response_geometry must be one of 'spherical', 'simplex', 'clr', or 'alr'"
+    """Map tangent coordinates back onto the response manifold (Rust-owned)."""
+    np = _np()
+    return _ffi(
+        "response_geometry_exp_map",
+        np.asarray(tangent, dtype=float),
+        str(geometry),
+        np.asarray(base, dtype=float).reshape(-1),
+        None if coordinates is None else str(coordinates),
+        int(reference),
     )
 
 
