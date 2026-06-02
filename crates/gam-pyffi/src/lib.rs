@@ -95,6 +95,7 @@ use gam::terms::basis::{
     matern_input_location_hessian_nd, matern_input_location_jet_nd,
     matern_radial_first_derivative_nd, monomial_exponents, periodic_bspline_first_derivative_nd,
     resolve_duchon_orders, select_spherical_farthest_point_centers, sphere_first_derivative_nd,
+    spherical_spline_design_jet,
 };
 use gam::terms::input_loc_derivatives::contract_input_loc_gradient;
 use gam::terms::interchange_decoder::{
@@ -4317,6 +4318,124 @@ fn sphere_basis_with_centers<'py>(
         design.into_pyarray(py).unbind(),
         penalty.into_pyarray(py).unbind(),
     ))
+}
+
+/// Resolve `(method, wahba_kernel)` from the user `kernel` string, shared by
+/// the sphere basis + sphere jet entry points. Harmonic carries no Wahba
+/// kernel; the degree probe is supplied separately by each caller.
+fn sphere_kernel_kind_from_str(
+    kernel: &str,
+    site: &str,
+) -> PyResult<(SphereMethod, SphereWahbaKernel)> {
+    match kernel.to_ascii_lowercase().as_str() {
+        "sobolev" => Ok((SphereMethod::Wahba, SphereWahbaKernel::Sobolev)),
+        "pseudo" => Ok((SphereMethod::Wahba, SphereWahbaKernel::Pseudo)),
+        "harmonic" => Ok((SphereMethod::Harmonic, SphereWahbaKernel::Sobolev)),
+        other => Err(py_value_error(format!(
+            "{site} kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
+        ))),
+    }
+}
+
+/// Analytic DESIGN jet `∂Φ/∂(lat, lon)` of the spherical-spline basis built by
+/// `sphere_basis` (auto Wahba farthest-point centers, or harmonic degree `L =
+/// n_centers`).
+///
+/// Returns a `(N, K, 2)` array where `K` equals the column count of the
+/// `sphere_basis` design and the last axis is `(∂col/∂lat, ∂col/∂lon)` in the
+/// same angular units as the input (degrees by default, radians when
+/// `radians=True`). All derivatives are exact analytic forms — no finite
+/// differences.
+#[pyfunction(signature = (points, n_centers, penalty_order = 2, kernel = "sobolev", radians = false))]
+fn sphere_basis_jet<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    n_centers: usize,
+    penalty_order: usize,
+    kernel: &str,
+    radians: bool,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let pts = points.as_array();
+    if pts.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "sphere_basis_jet expects points of shape (N, 2) [lat, lon]; got d={}",
+            pts.ncols()
+        )));
+    }
+    if !(1..=4).contains(&penalty_order) {
+        return Err(py_value_error(format!(
+            "sphere_basis_jet penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
+        )));
+    }
+    let (method, wahba_kernel) = sphere_kernel_kind_from_str(kernel, "sphere_basis_jet")?;
+    let max_degree = matches!(method, SphereMethod::Harmonic).then_some(n_centers);
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint {
+            num_centers: n_centers,
+        },
+        penalty_order,
+        double_penalty: false,
+        radians,
+        method,
+        max_degree,
+        wahba_kernel,
+        identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+    };
+    let jet =
+        spherical_spline_design_jet(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    Ok(jet.into_pyarray(py).unbind())
+}
+
+/// Analytic DESIGN jet `∂Φ/∂(lat, lon)` of the spherical-spline basis built by
+/// `sphere_basis_with_centers` (explicit Wahba centers; harmonic uses
+/// `L = centers.nrows()` as a degree probe, mirroring the forward).
+///
+/// Returns `(N, K, 2)` aligned column-for-column with the
+/// `sphere_basis_with_centers` design, last axis `(∂col/∂lat, ∂col/∂lon)`.
+#[pyfunction(signature = (points, centers, penalty_order = 2, kernel = "sobolev", radians = false))]
+fn sphere_basis_jet_with_centers<'py>(
+    py: Python<'py>,
+    points: PyReadonlyArray2<'py, f64>,
+    centers: PyReadonlyArray2<'py, f64>,
+    penalty_order: usize,
+    kernel: &str,
+    radians: bool,
+) -> PyResult<Py<PyArray3<f64>>> {
+    let pts = points.as_array();
+    let ctrs = centers.as_array();
+    if pts.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "sphere_basis_jet_with_centers expects points of shape (N, 2) [lat, lon]; got d={}",
+            pts.ncols()
+        )));
+    }
+    if ctrs.ncols() != 2 {
+        return Err(py_value_error(format!(
+            "sphere_basis_jet_with_centers expects centers of shape (K, 2) [lat, lon]; got d={}",
+            ctrs.ncols()
+        )));
+    }
+    if !(1..=4).contains(&penalty_order) {
+        return Err(py_value_error(format!(
+            "sphere_basis_jet_with_centers penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
+        )));
+    }
+    let (method, wahba_kernel) =
+        sphere_kernel_kind_from_str(kernel, "sphere_basis_jet_with_centers")?;
+    let max_degree = matches!(method, SphereMethod::Harmonic).then_some(ctrs.nrows());
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
+        penalty_order,
+        double_penalty: false,
+        radians,
+        method,
+        max_degree,
+        wahba_kernel,
+        identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+    };
+    let jet =
+        spherical_spline_design_jet(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
+    Ok(jet.into_pyarray(py).unbind())
 }
 
 /// Chart-local seven-column sphere basis with analytic lat/lon jet.
@@ -22767,6 +22886,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(sphere_chart_basis_with_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(sphere_basis_jet, module)?)?;
+    module.add_function(wrap_pyfunction!(sphere_basis_jet_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(thin_plate_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(auto_knots_1d, module)?)?;
     module.add_function(wrap_pyfunction!(auto_centers_1d, module)?)?;

@@ -1766,6 +1766,77 @@ def sphere_basis(
     return np.asarray(design, dtype=float), np.asarray(penalty, dtype=float)
 
 
+def sphere_basis_jet(
+    points: Any,
+    n_centers: int,
+    *,
+    penalty_order: int = 2,
+    kernel: str = "sobolev",
+    radians: bool = False,
+) -> Any:
+    """Analytic design jet ``∂Φ/∂(lat, lon)`` of the spherical-spline basis.
+
+    Mirrors :func:`sphere_basis` (auto Wahba farthest-point centers, or
+    harmonic degree ``L = n_centers``) and returns the exact analytic
+    derivative of its design matrix — no finite differences.
+
+    Parameters
+    ----------
+    points : array-like of shape ``(N, 2)`` — latitude, longitude.
+    n_centers : Wahba center count (``kernel='sobolev' | 'pseudo'``) or
+        harmonic truncation degree ``L``.
+    penalty_order : roughness order ``m ∈ {1,2,3,4}``. Default ``2``.
+    kernel : one of ``'sobolev'``, ``'pseudo'``, ``'harmonic'``.
+    radians : default ``False`` (degrees). True for radians.
+
+    Returns
+    -------
+    ndarray of shape ``(N, K, 2)`` — ``K`` matches the :func:`sphere_basis`
+    design column count; the last axis is ``(∂col/∂lat, ∂col/∂lon)`` in the
+    same angular units as the input.
+    """
+    import numpy as np
+
+    pts_np = np.asarray(points, dtype=float)
+    if pts_np.ndim != 2 or pts_np.shape[1] != 2:
+        raise ValueError(
+            f"sphere_basis_jet expects points of shape (N, 2); got {pts_np.shape}"
+        )
+    if pts_np.shape[0] == 0:
+        raise ValueError("sphere_basis_jet: points cannot be empty")
+    if not np.all(np.isfinite(pts_np)):
+        raise ValueError("sphere_basis_jet: points contains NaN/Inf")
+    n_centers_i = int(n_centers)
+    penalty_order_i = int(penalty_order)
+    if n_centers_i <= 0:
+        raise ValueError(f"n_centers must be positive, got {n_centers}")
+    if penalty_order_i not in (1, 2, 3, 4):
+        raise ValueError("penalty_order must be one of 1, 2, 3, or 4")
+    lat = pts_np[:, 0]
+    if radians:
+        bound = float(np.pi / 2.0)
+        if np.any(lat < -bound - 1e-9) or np.any(lat > bound + 1e-9):
+            raise ValueError(
+                "sphere_basis_jet: latitude (radians) must lie in [-π/2, π/2]"
+            )
+    else:
+        if np.any(lat < -90.0 - 1e-9) or np.any(lat > 90.0 + 1e-9):
+            raise ValueError(
+                "sphere_basis_jet: latitude (degrees) must lie in [-90, 90]"
+            )
+    try:
+        jet = rust_module().sphere_basis_jet(
+            pts_np,
+            n_centers_i,
+            penalty_order_i,
+            str(kernel),
+            bool(radians),
+        )
+    except Exception as exc:
+        raise map_exception(exc) from exc
+    return np.asarray(jet, dtype=float)
+
+
 def smoothness_penalty(
     knots: Any,
     *,
