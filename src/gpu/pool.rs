@@ -142,7 +142,7 @@ pub fn balanced_partition(
         tiles.push((device.ordinal, start..end));
         start = end;
     }
-    debug_assert_eq!(start, n_units, "balanced_partition tiles must cover 0..n");
+    assert_eq!(start, n_units, "balanced_partition tiles must cover 0..n");
     tiles
 }
 
@@ -216,11 +216,34 @@ pub fn scatter_batched<T: Send>(
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn scatter_batched<T: Send>(
-    _rt: &GpuRuntime,
-    _items: &mut [T],
-    _f: impl Fn(usize, &mut [T]) -> Option<()> + Sync,
+    rt: &GpuRuntime,
+    items: &mut [T],
+    f: impl Fn(usize, &mut [T]) -> Option<()> + Sync,
 ) -> Option<()> {
-    None
+    // Off Linux there are no CUDA contexts to bind, so `balanced_partition`
+    // yields no tiles and there is nothing to fan the batch across — report
+    // `None` so the caller runs its deterministic whole-batch CPU fallback.
+    // The per-tile invocation is kept so the contract is honoured verbatim if a
+    // non-Linux backend ever exposes devices: each tile's closure runs over its
+    // own disjoint sub-slice, with no device binding to perform on this
+    // platform (the only step the Linux path adds).
+    let tiles = balanced_partition(rt, items.len());
+    if tiles.is_empty() {
+        return None;
+    }
+    let mut rest = items;
+    let mut consumed = 0usize;
+    let mut all_ok = true;
+    for (ordinal, range) in &tiles {
+        let take = range.end - consumed;
+        let (head, tail) = rest.split_at_mut(take);
+        if f(*ordinal, head).is_none() {
+            all_ok = false;
+        }
+        rest = tail;
+        consumed = range.end;
+    }
+    if all_ok { Some(()) } else { None }
 }
 
 #[cfg(test)]
