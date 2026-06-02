@@ -24269,7 +24269,7 @@ fn predict_columns(
 /// Residual dispersion `φ̂` for the conformal calibration scale, mirroring the
 /// CLI/summary convention: Gaussian → σ̂², Gamma → fixed φ (else 1/σ̂ as the
 /// reciprocal-dispersion proxy), every other family → 1.0 (φ fixed at 1).
-fn conformal_dispersion_phi(fit: &UnifiedFitResult, family: &LikelihoodSpec) -> f64 {
+fn conformal_dispersion_phi(fit: &gam::estimate::UnifiedFitResult, family: &LikelihoodSpec) -> f64 {
     match family.response {
         ResponseFamily::Gaussian => fit.standard_deviation * fit.standard_deviation,
         ResponseFamily::Gamma => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
@@ -24290,7 +24290,7 @@ fn conformal_dispersion_phi(fit: &UnifiedFitResult, family: &LikelihoodSpec) -> 
 /// dataset (calibration is *labeled* held-out data, unlike a predict batch).
 fn conformal_calibration_arrays(
     model: &FittedModel,
-    fit: &UnifiedFitResult,
+    fit: &gam::estimate::UnifiedFitResult,
     calibration: EncodedDataset,
 ) -> Result<(Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>), String> {
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
@@ -26297,7 +26297,10 @@ fn representative_data_from_ranges(ranges: &[(f64, f64)]) -> Array2<f64> {
 /// rebuilt — e.g. a model saved without `resolved_termspec` or training feature
 /// ranges — so `summary()` always succeeds and simply omits the table when the
 /// information needed to compute it honestly is not available.
-fn summary_smooth_terms(model: &FittedModel, fit: &UnifiedFitResult) -> Vec<SummarySmoothTermRow> {
+fn summary_smooth_terms(
+    model: &FittedModel,
+    fit: &gam::estimate::UnifiedFitResult,
+) -> Vec<SummarySmoothTermRow> {
     use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
     use gam::smooth::ShapeConstraint;
 
