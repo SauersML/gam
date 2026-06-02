@@ -129,7 +129,7 @@ def _import_run_suite_exports(stem: str) -> typing.Any:
 CV_SPLITS = 5
 CV_SEED = 42
 _RUST_BIN_PATH: Path | None = None
-_GAMFIT_RUST_MODULE: typing.Any | None = None
+_BENCH_RUST_LOADER: typing.Any = None
 HEARTBEAT_INTERVAL_SEC = 15.0
 # For short-lived commands, poll more frequently at startup so heartbeat
 # diagnostics capture meaningful process stats before exit.
@@ -139,39 +139,38 @@ _MAX_CAPTURE_CHARS = 200000
 _OUTPUT_LOCK = threading.Lock()
 
 
+def _load_bench_rust_loader() -> typing.Any:
+    """Load `bench/_rust_loader.py` lazily and cache it."""
+
+    global _BENCH_RUST_LOADER
+    if _BENCH_RUST_LOADER is not None:
+        return _BENCH_RUST_LOADER
+    loader_path = BENCH_DIR / "_rust_loader.py"
+    spec = importlib.util.spec_from_file_location("bench_rust_loader", loader_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load bench rust loader from {loader_path}")
+    loader_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loader_mod)
+    _BENCH_RUST_LOADER = loader_mod
+    return loader_mod
+
+
 def _gamfit_rust() -> typing.Any:
     """Load gamfit's Rust extension without importing the package facade.
 
-    The .so/.pyd lives in whichever `gamfit/` directory Python's import
-    system would pick: the source tree (after `maturin develop`) or the
-    site-packages wheel directory (after `pip install <wheel>`, which is
-    what CI does). `find_spec` locates the package without executing
-    `gamfit/__init__.py`, so we still skip the heavy facade import the
-    fuzz scripts deliberately avoid.
+    The .so/.pyd may live in the source tree (after `maturin develop`),
+    in a pip-installed wheel under site-packages (CI's path), or in any
+    other location on the sys.path / installed-distribution search list.
+    The bench-shared loader enumerates every plausible location so it
+    finds the compiled extension even when the source tree shadows the
+    pip-installed wheel on the import path (which is exactly what
+    `bench/fuzz_vs_mgcv.py`'s `sys.path.insert(0, str(ROOT))` triggers).
+    The package facade in `gamfit/__init__.py` is deliberately bypassed
+    by loading the `.so` directly via spec_from_file_location, so the
+    heavy import-time work the fuzz scripts avoid stays out of the path.
     """
-    global _GAMFIT_RUST_MODULE
-    if _GAMFIT_RUST_MODULE is not None:
-        return _GAMFIT_RUST_MODULE
-    search_dirs: list[Path] = []
-    pkg_spec = importlib.util.find_spec("gamfit")
-    if pkg_spec is not None and pkg_spec.submodule_search_locations:
-        search_dirs.extend(Path(d) for d in pkg_spec.submodule_search_locations)
-    source_tree = ROOT / "gamfit"
-    if source_tree not in search_dirs:
-        search_dirs.append(source_tree)
-    rust_candidates: list[Path] = []
-    for d in search_dirs:
-        rust_candidates.extend(sorted(d.glob("_rust*.so")))
-        rust_candidates.extend(sorted(d.glob("_rust*.pyd")))
-    if not rust_candidates:
-        raise RuntimeError("gamfit Rust extension is not built")
-    spec = importlib.util.spec_from_file_location("_rust", rust_candidates[0])
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to load gamfit Rust extension from {rust_candidates[0]}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _GAMFIT_RUST_MODULE = module
-    return module
+
+    return _load_bench_rust_loader().load_gamfit_rust_module(ROOT)
 
 
 def _flat_float_list(values: typing.Any) -> list[float]:

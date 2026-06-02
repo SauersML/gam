@@ -31,38 +31,30 @@ def configure(context: dict[str, typing.Any]) -> None:
     globals().update(context)
 
 
-_GAMFIT_RUST_MODULE: typing.Any | None = None
+_BENCH_RUST_LOADER: typing.Any = None
+
+
+def _load_bench_rust_loader() -> typing.Any:
+    global _BENCH_RUST_LOADER
+    if _BENCH_RUST_LOADER is not None:
+        return _BENCH_RUST_LOADER
+    loader_path = Path(__file__).resolve().parent / "_rust_loader.py"
+    spec = importlib.util.spec_from_file_location("bench_rust_loader", loader_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load bench rust loader from {loader_path}")
+    loader_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loader_mod)
+    _BENCH_RUST_LOADER = loader_mod
+    return loader_mod
 
 
 def _gamfit_rust() -> typing.Any:
-    # See `bench/run_suite.py::_gamfit_rust` for the find_spec rationale —
-    # this helper mirrors that loader so the dataset builders find the
-    # Rust extension whether it lives in the source tree (after
-    # `maturin develop`) or under site-packages (after CI's
-    # `pip install <wheel>`).
-    global _GAMFIT_RUST_MODULE
-    if _GAMFIT_RUST_MODULE is not None:
-        return _GAMFIT_RUST_MODULE
-    search_dirs: list[Path] = []
-    pkg_spec = importlib.util.find_spec("gamfit")
-    if pkg_spec is not None and pkg_spec.submodule_search_locations:
-        search_dirs.extend(Path(d) for d in pkg_spec.submodule_search_locations)
-    source_tree = ROOT / "gamfit"
-    if source_tree not in search_dirs:
-        search_dirs.append(source_tree)
-    rust_candidates: list[Path] = []
-    for d in search_dirs:
-        rust_candidates.extend(sorted(d.glob("_rust*.so")))
-        rust_candidates.extend(sorted(d.glob("_rust*.pyd")))
-    if not rust_candidates:
-        raise RuntimeError("gamfit Rust extension is not built")
-    spec = importlib.util.spec_from_file_location("_rust", rust_candidates[0])
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to load gamfit Rust extension from {rust_candidates[0]}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _GAMFIT_RUST_MODULE = module
-    return module
+    # The bench-shared loader walks every site-packages / sys.path
+    # location AND the source tree, so it finds the compiled
+    # `_rust*.so` whether it sits next to the importable `gamfit`
+    # package (the source-tree shadow case) or only in the
+    # pip-installed wheel's site-packages directory.
+    return _load_bench_rust_loader().load_gamfit_rust_module(ROOT)
 
 
 def _matrix_rows(matrix: typing.Any, y: typing.Any, prefix: str = "pc") -> list[dict[str, float]]:
