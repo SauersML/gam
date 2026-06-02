@@ -3924,6 +3924,67 @@ impl ArrowFactorCache {
         }
         Ok(out)
     }
+
+    /// Dense principal sub-block of the β-block of the full inverse,
+    /// `(H⁻¹)_ββ[block, block] = S_β⁻¹[block, block]`, shape `(W, W)` with
+    /// `W = block.len()`.
+    ///
+    /// For the bordered arrow Hessian `H = [[A, B], [Bᵀ, H_ββ]]`, the β-block
+    /// of `H⁻¹` is exactly `S_β⁻¹` (the inverse of the Schur complement whose
+    /// Cholesky factor this cache holds). This returns the contiguous
+    /// `block × block` sub-block — e.g. one SAE atom's decoder coefficients via
+    /// [`crate::terms::sae_manifold::SaeManifoldTerm::beta_block_offsets`] — by
+    /// solving `S_β x = e_j` for each `j ∈ block` (reusing the cached factor)
+    /// and gathering the `block` rows of each solution column. `W`
+    /// back-substitutions of size `K`; the result is symmetrized to clear
+    /// back-substitution rounding asymmetry. Up to a dispersion scale `φ`, this
+    /// block is the joint posterior covariance `Cov(β_block)` of those
+    /// coefficients with the latent coordinates already marginalized out (that
+    /// is precisely what Schur-eliminating the per-row `t`-blocks does).
+    ///
+    /// Same dense-Schur requirement / error contract as
+    /// [`Self::schur_inverse_apply`]; additionally errors when `block` runs past
+    /// `K`.
+    pub fn schur_inverse_block(
+        &self,
+        block: std::ops::Range<usize>,
+    ) -> Result<Array2<f64>, ArrowSchurError> {
+        let Some(schur_factor) = self.schur_factor.as_ref() else {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: "schur_inverse_block requires a dense Schur factor; \
+                         the InexactPCG mode does not form one"
+                    .to_string(),
+            });
+        };
+        if block.end > self.k {
+            return Err(ArrowSchurError::SchurFactorFailed {
+                reason: format!(
+                    "schur_inverse_block: block end {} exceeds K {}",
+                    block.end, self.k
+                ),
+            });
+        }
+        let w = block.len();
+        let mut out = Array2::<f64>::zeros((w, w));
+        let mut e_j = Array1::<f64>::zeros(self.k);
+        for (jc, j) in block.clone().enumerate() {
+            e_j.fill(0.0);
+            e_j[j] = 1.0;
+            let col = cholesky_solve_vector(schur_factor, &e_j);
+            for (ic, i) in block.clone().enumerate() {
+                out[[ic, jc]] = col[i];
+            }
+        }
+        // S_β⁻¹ is symmetric; symmetrize to clear back-substitution rounding.
+        for ic in 0..w {
+            for jc in (ic + 1)..w {
+                let avg = 0.5 * (out[[ic, jc]] + out[[jc, ic]]);
+                out[[ic, jc]] = avg;
+                out[[jc, ic]] = avg;
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Schur-eliminate the per-row latent block and solve with an explicit BA
@@ -7063,6 +7124,40 @@ mod tests {
             (trace - trace_dense).abs() < 1e-9,
             "Kron-block trace {trace} vs dense {trace_dense}"
         );
+
+        // schur_inverse_block must reproduce a contiguous dense sub-block of
+        // (H⁻¹)_ββ — both the full β-block and an interior single-coordinate
+        // window — and be exactly symmetric.
+        let full = cache
+            .schur_inverse_block(0..k)
+            .expect("dense Schur cache must support schur_inverse_block");
+        assert_eq!(full.dim(), (k, k));
+        for r in 0..k {
+            for c in 0..k {
+                let expected = h_inv[[beta_off + r, beta_off + c]];
+                assert!(
+                    (full[[r, c]] - expected).abs() < 1e-9,
+                    "block[{r},{c}] {} vs dense {expected}",
+                    full[[r, c]]
+                );
+                assert!(
+                    (full[[r, c]] - full[[c, r]]).abs() < 1e-12,
+                    "schur_inverse_block must be symmetric at [{r},{c}]"
+                );
+            }
+        }
+        let sub = cache
+            .schur_inverse_block(1..k)
+            .expect("interior block must be supported");
+        assert_eq!(sub.dim(), (k - 1, k - 1));
+        assert!(
+            (sub[[0, 0]] - h_inv[[beta_off + 1, beta_off + 1]]).abs() < 1e-9,
+            "interior block [1,1] {} vs dense {}",
+            sub[[0, 0]],
+            h_inv[[beta_off + 1, beta_off + 1]]
+        );
+        // Out-of-range block must error rather than panic.
+        assert!(cache.schur_inverse_block(0..(k + 1)).is_err());
     }
 
     /// Evidence/log-det mode: a per-row `H_tt` that is PD but ill-conditioned
