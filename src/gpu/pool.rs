@@ -74,10 +74,7 @@ impl GpuRuntime {
 /// tile the whole range. Devices that round to a zero-width tile are dropped so
 /// no worker is spawned for empty work.
 #[must_use]
-pub fn balanced_partition(
-    rt: &GpuRuntime,
-    n_units: usize,
-) -> Vec<(usize, std::ops::Range<usize>)> {
+pub fn balanced_partition(rt: &GpuRuntime, n_units: usize) -> Vec<(usize, std::ops::Range<usize>)> {
     if n_units == 0 || rt.devices.is_empty() {
         return Vec::new();
     }

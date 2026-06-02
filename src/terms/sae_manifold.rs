@@ -3923,7 +3923,6 @@ impl SaeManifoldTerm {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
-<<<<<<< HEAD
             // Evidence-only factorization: the Newton step (Δt, Δβ) is discarded
             // and only the factor cache is consumed — the exact undamped log-det
             // and the selected-inverse traces. As ρ sweeps to extremes (e.g. a
@@ -3999,54 +3998,6 @@ impl SaeManifoldTerm {
             )?;
             total_inner_iter += refine_iter;
         };
-=======
-        // The Laplace normaliser ½log|H| is only the correct REML criterion at
-        // the inner optimum (t̂, β̂). The undamped Newton step computed here is
-        // the natural KKT residual of that solve: a step whose magnitude
-        // dwarfs the iterate means the inner loop did not converge at this ρ
-        // and the log-det would be evaluated off the manifold. Surface that as
-        // a recoverable error rather than returning a meaningless criterion.
-        let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
-            + delta_beta.iter().map(|&v| v * v).sum::<f64>();
-        if !step_norm_sq.is_finite() {
-            return Err(format!(
-                "SaeManifoldTerm::reml_criterion: undamped Newton residual is non-finite at \
-                 the inner optimum (‖Δ‖²={step_norm_sq}); the joint Hessian factorisation is \
-                 degenerate at this ρ"
-            ));
-        }
-        let mut iterate_norm_sq = 0.0_f64;
-        for &v in self.assignment.logits.iter() {
-            iterate_norm_sq += v * v;
-        }
-        for coords in &self.assignment.coords {
-            let matrix = coords.as_matrix();
-            for &v in matrix.iter() {
-                iterate_norm_sq += v * v;
-            }
-        }
-        for atom in &self.atoms {
-            for &v in atom.decoder_coefficients.iter() {
-                iterate_norm_sq += v * v;
-            }
-        }
-        let residual_norm = step_norm_sq.sqrt();
-        let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
-        let residual_tolerance = 1.0e-4 * iterate_scale;
-        if residual_norm > residual_tolerance {
-            return Err(format!(
-                "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
-                 undamped Newton residual ‖Δ‖={residual_norm:.6e} exceeds tolerance \
-                 {residual_tolerance:.6e}. Refusing to rank an off-optimum Laplace criterion."
-            ));
-        }
-        let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-            "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
-             ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
-             required for the Laplace normaliser"
-                .to_string()
-        })?;
->>>>>>> origin/main
 
         // 3. Smoothing-penalty Occam term: −½·p·(Σ_k rank S_k)·log λ_smooth.
         let p_out = self.output_dim() as f64;
@@ -6336,7 +6287,6 @@ fn sae_manifold_newton_directional_decrease(
     -gradient_dot_step
 }
 
-<<<<<<< HEAD
 /// Per-atom decoder-smoothness GEMM `S_k · B_k`, batched across ALL GPUs.
 ///
 /// Every atom contributes one dense product of its `(m_k × m_k)` smoothness
@@ -6460,7 +6410,9 @@ fn batched_smooth_sb(
         // `tile_results` are released; write the results back into `out`.
         match ok {
             Some(()) => {
-                let sink = tile_results.into_inner().expect("tile_results mutex poisoned");
+                let sink = tile_results
+                    .into_inner()
+                    .expect("tile_results mutex poisoned");
                 for (idx, mat) in sink {
                     out[idx] = Some(mat);
                 }
@@ -6485,8 +6437,6 @@ fn batched_smooth_sb(
         .collect()
 }
 
-=======
->>>>>>> origin/main
 fn sae_cholesky_solve_neg_gradient(
     h: ArrayView2<'_, f64>,
     g: ArrayView1<'_, f64>,

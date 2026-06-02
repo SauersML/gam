@@ -1200,7 +1200,8 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         // CPU loop: a barely-PD but ill-conditioned block forces the whole batch
         // back onto the per-row path so its ridge can lift, never silently using
         // a contaminated factor.
-        if let Some(batched) = try_factor_blocks_batched(rows, ridge_t, d, tolerate_ill_conditioning)
+        if let Some(batched) =
+            try_factor_blocks_batched(rows, ridge_t, d, tolerate_ill_conditioning)
         {
             return Ok(batched);
         }
@@ -4963,14 +4964,8 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
     let mut factors: Vec<(Array2<f64>, Array2<f64>)> = Vec::with_capacity(range.len());
     let mut total_d = 0usize;
     for i in range.clone() {
-        let (left, right) = row_schur_contribution_factors(
-            sys,
-            i,
-            &sys.rows[i],
-            &htt_factors[i],
-            backend,
-            kind,
-        );
+        let (left, right) =
+            row_schur_contribution_factors(sys, i, &sys.rows[i], &htt_factors[i], backend, kind);
         total_d += left.nrows();
         factors.push((left, right));
     }
@@ -4984,15 +4979,17 @@ fn tile_schur_partial<B: BatchedBlockSolver>(
         let mut base = 0usize;
         for (left, right) in &factors {
             let di = left.nrows();
-            left_stack.slice_mut(ndarray::s![base..base + di, ..]).assign(left);
-            right_stack.slice_mut(ndarray::s![base..base + di, ..]).assign(right);
+            left_stack
+                .slice_mut(ndarray::s![base..base + di, ..])
+                .assign(left);
+            right_stack
+                .slice_mut(ndarray::s![base..base + di, ..])
+                .assign(right);
             base += di;
         }
-        if let Some(product) = crate::gpu::try_fast_atb_on_ordinal(
-            ordinal,
-            left_stack.view(),
-            right_stack.view(),
-        ) {
+        if let Some(product) =
+            crate::gpu::try_fast_atb_on_ordinal(ordinal, left_stack.view(), right_stack.view())
+        {
             return product.mapv(|v| -v);
         }
     }
@@ -5063,15 +5060,7 @@ fn reduce_row_schur_contributions<B: BatchedBlockSolver + Sync>(
     let Some(tiles) = tiles else {
         // Single-device / CPU: reduce serially in place (original order).
         for (i, row) in sys.rows.iter().enumerate() {
-            subtract_row_schur_contribution(
-                sys,
-                i,
-                row,
-                &htt_factors[i],
-                backend,
-                kind,
-                schur,
-            );
+            subtract_row_schur_contribution(sys, i, row, &htt_factors[i], backend, kind, schur);
         }
         return;
     };
