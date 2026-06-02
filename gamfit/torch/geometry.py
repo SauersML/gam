@@ -7,6 +7,8 @@ device-local. NumPy callers use :mod:`gamfit._response_geometry` directly.
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 
 from .._binding import rust_module
@@ -80,6 +82,77 @@ def clr(values: torch.Tensor) -> torch.Tensor:
     return logs - logs.mean(dim=1, keepdim=True)
 
 
+def _ilr_basis(d: int, *, dtype: Any, device: Any) -> torch.Tensor:
+    """Helmert orthonormal contrast basis ``V`` of shape ``(d, d-1)``.
+
+    Columns are an orthonormal basis of the sum-zero hyperplane (the CLR
+    subspace). ILR coordinates are ``ilr(x) = clr(x) @ V`` and the inverse is
+    ``clr = ilr @ Vᵀ``. Because ``V`` is orthonormal, the Euclidean metric on the
+    ``(d-1)``-dim ILR coordinates is exactly the Aitchison metric pulled back from
+    the simplex: ``‖ilr(x) − ilr(y)‖₂`` equals the Aitchison distance. Ordinary
+    Gaussian/Euclidean fitting in ILR coordinates is therefore isometric to
+    Aitchison geometry with no extra metric weighting.
+    """
+    if d < 2:
+        raise ValueError("ILR basis requires at least two parts")
+    v = _tc.zeros((d, d - 1), dtype=dtype, device=device)
+    for i in range(1, d):
+        scale = (i / (i + 1.0)) ** 0.5
+        for k in range(i):
+            v[k, i - 1] = scale / i
+        v[i, i - 1] = -scale
+    return v
+
+
+def ilr(values: torch.Tensor, *, reference: int = -1) -> torch.Tensor:
+    """Isometric log-ratio coordinates for positive compositions.
+
+    ILR maps a ``d``-part composition to ``d-1`` Euclidean coordinates that are
+    isometric to Aitchison geometry: Euclidean distance in ILR space equals
+    Aitchison distance on the simplex. The ``reference`` argument is accepted for
+    a uniform call signature with :func:`alr` but is unused — the Helmert basis
+    is canonical and reference-free.
+    """
+    del reference  # Helmert ILR basis is reference-free; kept for signature parity.
+    coords = clr(values)
+    basis = _ilr_basis(coords.shape[1], dtype=coords.dtype, device=coords.device)
+    return coords @ basis
+
+
+def inverse_ilr(coords: torch.Tensor, *, reference: int = -1) -> torch.Tensor:
+    """Map ILR coordinates back to the simplex."""
+    del reference  # Helmert ILR basis is reference-free; kept for signature parity.
+    if not isinstance(coords, torch.Tensor):
+        raise TypeError("coords must be a torch.Tensor")
+    if coords.dim() != 2:
+        raise ValueError("ILR coordinates must be a 2-D tensor")
+    if not _tc.is_floating_point(coords):
+        coords = coords.to(dtype=_tc.float64)
+    d = coords.shape[1] + 1
+    basis = _ilr_basis(d, dtype=coords.dtype, device=coords.device)
+    clr_coords = coords @ basis.transpose(0, 1)
+    log_parts = clr_coords - clr_coords.max(dim=1, keepdim=True).values
+    parts = log_parts.exp()
+    return parts / parts.sum(dim=1, keepdim=True)
+
+
+def aitchison_metric(d: int, *, dtype: Any = None, device: Any = None) -> torch.Tensor:
+    """Aitchison Gram matrix ``G = I_{d-1} − (1/d)·11ᵀ`` for ALR coordinates.
+
+    ALR is a valid chart but is NOT isometric to Aitchison geometry: in ALR
+    coordinates the Aitchison inner product is ``⟨u, v⟩ = uᵀ G v`` with this
+    ``(d-1)×(d-1)`` Gram matrix (for ``d = 3`` it is ``[[2/3, -1/3], [-1/3,
+    2/3]]`` ≠ I). Residual norms and gradients in ALR fitting must be weighted by
+    ``G`` to be Aitchison-correct; prefer ILR, which makes ``G = I``.
+    """
+    if d < 2:
+        raise ValueError("Aitchison metric requires at least two parts")
+    dt = _tc.float64 if dtype is None else dtype
+    eye = _tc.eye(d - 1, dtype=dt, device=device)
+    ones = _tc.full((d - 1, d - 1), 1.0 / d, dtype=dt, device=device)
+    return eye - ones
+
+
 def alr(values: torch.Tensor, *, reference: int = -1) -> torch.Tensor:
     """Additive log-ratio coordinates for positive compositions."""
     comp = _closure_tensor(values)
@@ -125,10 +198,18 @@ def simplex_log_map(
     values: torch.Tensor,
     base: torch.Tensor,
     *,
-    coordinates: str = "clr",
+    coordinates: str = "ilr",
     reference: int = -1,
 ) -> torch.Tensor:
-    """Log map at an intrinsic simplex base point in CLR or ALR coordinates."""
+    """Log map at an intrinsic simplex base point in ILR, CLR, or ALR coordinates.
+
+    ``ilr`` (default) and ``clr`` are isometric to Aitchison geometry, so the
+    Euclidean norm of the returned tangent equals the Aitchison geodesic
+    distance from ``base`` to each row of ``values``. ``alr`` is a valid but
+    NON-isometric chart: its Euclidean tangent norm is not the Aitchison
+    distance (the Aitchison Gram is :func:`aitchison_metric`, not the
+    identity), so weight residuals/gradients by that Gram when fitting in ALR.
+    """
     comp = _closure_tensor(values)
     if not isinstance(base, torch.Tensor):
         raise TypeError("base must be a torch.Tensor")
@@ -139,21 +220,28 @@ def simplex_log_map(
     if bool((comp <= 0.0).any()) or bool((base_arr <= 0.0).any()):
         raise ValueError("simplex log map requires strictly positive values and base point")
     coord = coordinates.lower()
-    if coord in {"simplex", "clr"}:
+    if coord in {"simplex", "ilr"}:
+        return ilr(comp, reference=reference) - ilr(base_arr, reference=reference)
+    if coord == "clr":
         return clr(comp) - clr(base_arr)
     if coord == "alr":
         return alr(comp, reference=reference) - alr(base_arr, reference=reference)
-    raise ValueError("simplex coordinates must be 'clr' or 'alr'")
+    raise ValueError("simplex coordinates must be 'ilr', 'clr', or 'alr'")
 
 
 def simplex_exp_map(
     tangent: torch.Tensor,
     base: torch.Tensor,
     *,
-    coordinates: str = "clr",
+    coordinates: str = "ilr",
     reference: int = -1,
 ) -> torch.Tensor:
-    """Exponential map from simplex tangent coordinates back to compositions."""
+    """Exponential map from simplex tangent coordinates back to compositions.
+
+    The default ``ilr`` chart (and ``clr``) is isometric to Aitchison geometry;
+    ``alr`` is the non-isometric chart. Must match the ``coordinates`` used by
+    :func:`simplex_log_map`. ILR/ALR tangents have ``D-1`` columns, CLR has ``D``.
+    """
     if not isinstance(tangent, torch.Tensor):
         raise TypeError("tangent must be a torch.Tensor")
     z = tangent if _tc.is_floating_point(tangent) else tangent.to(dtype=_tc.float64)
@@ -163,7 +251,12 @@ def simplex_exp_map(
         raise TypeError("base must be a torch.Tensor")
     base_arr = _closure_tensor(base.to(device=z.device, dtype=z.dtype).reshape(1, -1))
     coord = coordinates.lower()
-    if coord in {"simplex", "clr"}:
+    if coord in {"simplex", "ilr"}:
+        if z.shape[1] != base_arr.shape[1] - 1:
+            raise ValueError("ILR tangent dimension must be simplex dimension minus one")
+        base_ilr = ilr(base_arr, reference=reference)
+        return inverse_ilr(base_ilr + z, reference=reference)
+    if coord == "clr":
         if z.shape[1] != base_arr.shape[1]:
             raise ValueError("CLR tangent dimension must equal simplex dimension")
         log_parts = base_arr.log() + z
@@ -175,7 +268,7 @@ def simplex_exp_map(
             raise ValueError("ALR tangent dimension must be simplex dimension minus one")
         base_alr = alr(base_arr, reference=reference)
         return inverse_alr(base_alr + z, reference=reference)
-    raise ValueError("simplex coordinates must be 'clr' or 'alr'")
+    raise ValueError("simplex coordinates must be 'ilr', 'clr', or 'alr'")
 
 
 _SPHERE_ANTIPODAL_TOL = 1e-12

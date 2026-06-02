@@ -534,6 +534,126 @@ fn sphere_mean_candidates(
     Ok(candidates)
 }
 
+/// Build the weighted second-moment matrix `M = Σ wᵢ pᵢ pᵢᵀ`.
+fn sphere_second_moment(
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Array2<f64> {
+    let (n, d) = values.dim();
+    let mut moment = Array2::<f64>::zeros((d, d));
+    for row in 0..n {
+        for r in 0..d {
+            for c in 0..d {
+                moment[[r, c]] += weights[row] * values[[row, r]] * values[[row, c]];
+            }
+        }
+    }
+    moment
+}
+
+/// Dominant eigenvector of a symmetric PSD matrix via power iteration.
+fn sphere_dominant_axis(moment: ArrayView2<'_, f64>) -> Option<Array1<f64>> {
+    let d = moment.nrows();
+    if d == 0 {
+        return None;
+    }
+    let mut v = Array1::<f64>::from_elem(d, 1.0 / (d as f64).sqrt());
+    for _ in 0..128 {
+        let mut nv = Array1::<f64>::zeros(d);
+        for r in 0..d {
+            let mut acc = 0.0;
+            for c in 0..d {
+                acc += moment[[r, c]] * v[c];
+            }
+            nv[r] = acc;
+        }
+        let nrm = norm(nv.view());
+        if nrm <= 0.0 {
+            return None;
+        }
+        nv.mapv_inplace(|x| x / nrm);
+        v = nv;
+    }
+    let nrm = norm(v.view());
+    if nrm > 0.0 {
+        Some(v.mapv(|x| x / nrm))
+    } else {
+        None
+    }
+}
+
+/// Deterministic equatorial minimizer for a non-identifiable (antipodal /
+/// degenerate) Fréchet problem.
+///
+/// When the data's second-moment matrix has its mass concentrated along a single
+/// axis `a` (e.g. equal-weight `{e1, −e1}` gives `M = diag(1,0,…)`), the Fréchet
+/// objective `½ Σ wᵢ d(μ, pᵢ)²` is minimized by the ENTIRE great subsphere
+/// orthogonal to `a` — every point of that equator is an exact minimizer, so no
+/// log-map iteration can converge to a unique point. Rather than reporting the
+/// problem as unsolvable (which would contradict the documented contract), pick
+/// one minimizer that is fully determined by the inputs:
+///
+///   1. `a` = dominant eigenvector of `M = Σ wᵢ pᵢ pᵢᵀ` (the antipodal axis).
+///   2. Among the coordinate axes `e_k`, pick the one LEAST aligned with the
+///      data, i.e. the smallest diagonal moment `M[k,k]`, tie-broken by the
+///      lowest coordinate index `k`.
+///   3. Project `e_k` onto the orthogonal complement of `a` and normalize; the
+///      result lies on the equator (hence is a true minimizer) and is uniquely
+///      determined by the inputs.
+///
+/// Returns `None` only when no equatorial direction can be formed (degenerate
+/// dimension), in which case the caller surfaces the genuine error.
+fn sphere_equatorial_minimizer(
+    values: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Option<Array1<f64>> {
+    let (_, d) = values.dim();
+    if d == 0 {
+        return None;
+    }
+    let moment = sphere_second_moment(values, weights);
+    let axis = sphere_dominant_axis(moment.view())?;
+    // Choose the coordinate axis least aligned with the data (smallest diagonal
+    // second moment), tie-broken by lowest index.
+    let mut best_k = 0usize;
+    let mut best_diag = moment[[0, 0]];
+    for k in 1..d {
+        let diag = moment[[k, k]];
+        if diag < best_diag {
+            best_diag = diag;
+            best_k = k;
+        }
+    }
+    // Project e_{best_k} onto the orthogonal complement of `axis`, then onto the
+    // complements of any further degenerate directions by simply normalizing the
+    // residual; for a rank-1 concentration this single projection suffices.
+    let mut cand = Array1::<f64>::zeros(d);
+    cand[best_k] = 1.0;
+    let proj = dot(cand.view(), axis.view());
+    for col in 0..d {
+        cand[col] -= proj * axis[col];
+    }
+    let nrm = norm(cand.view());
+    if nrm > 0.0 {
+        return Some(cand.mapv(|x| x / nrm));
+    }
+    // `e_{best_k}` was parallel to `axis`; fall back to the first coordinate axis
+    // whose residual after projection is non-degenerate (lowest index wins).
+    for k in 0..d {
+        let mut c = Array1::<f64>::zeros(d);
+        c[k] = 1.0;
+        let p = dot(c.view(), axis.view());
+        for col in 0..d {
+            c[col] -= p * axis[col];
+        }
+        let n = norm(c.view());
+        if n > 0.0 {
+            return Some(c.mapv(|x| x / n));
+        }
+    }
+    None
+}
+
 fn sphere_weighted_log_step(
     values: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -668,7 +788,102 @@ pub fn sphere_frechet_mean(
             best_mu = Some(mu);
         }
     }
-    best_mu
-        .map(|mu| mu.to_vec())
-        .ok_or_else(|| "spherical Fréchet mean is not identifiable for these points".to_string())
+    if let Some(mu) = best_mu {
+        return Ok(mu.to_vec());
+    }
+    // No log-map iteration converged: the problem is non-identifiable because the
+    // data has a degenerate/antipodal structure (e.g. equal-weight {e1, −e1},
+    // whose minimizer set is the entire orthogonal equator). Honor the documented
+    // contract by returning ONE deterministic equatorial minimizer rather than an
+    // endpoint surrogate or a "not identifiable" error.
+    if let Some(mu) = sphere_equatorial_minimizer(y.view(), w.view()) {
+        return Ok(mu.to_vec());
+    }
+    // Truly no minimizer can be formed (degenerate dimension); surface the error.
+    Err("spherical Fréchet mean is not identifiable for these points".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    fn obj_at(values: ArrayView2<'_, f64>, weights: ArrayView1<'_, f64>, mu: &[f64]) -> f64 {
+        let mu_arr = Array1::from(mu.to_vec());
+        sphere_frechet_objective(values, weights, mu_arr.view())
+    }
+
+    #[test]
+    fn antipodal_pair_returns_deterministic_equatorial_minimizer() {
+        // Equal-weight {e1, -e1} on S^2: the Fréchet objective is minimized by the
+        // ENTIRE equator orthogonal to e1, so no log-map iteration converges. The
+        // tie-breaker must return one deterministic minimizer on that equator
+        // rather than the "not identifiable" error.
+        let values = array![[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]];
+        let mean = sphere_frechet_mean(values.view(), None, 1.0e-12, 256)
+            .expect("antipodal pair must return a deterministic minimizer");
+        assert_eq!(mean.len(), 3);
+
+        // It is a unit vector.
+        let nrm = (mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]).sqrt();
+        assert!((nrm - 1.0).abs() < 1e-9, "mean must be a unit vector, got {nrm}");
+
+        // It lies on the equator orthogonal to the antipodal axis e1.
+        assert!(mean[0].abs() < 1e-9, "mean must be orthogonal to e1, got {mean:?}");
+
+        // The dominant data axis is e1 (col 0); the least-aligned coordinate axis
+        // is e2 (col 1, lowest index among the zero-moment axes). The projection of
+        // e2 onto the complement of e1 is e2 itself, so the deterministic pick is
+        // exactly +e2.
+        assert!((mean[1] - 1.0).abs() < 1e-9, "expected +e2, got {mean:?}");
+        assert!(mean[2].abs() < 1e-9, "expected +e2, got {mean:?}");
+
+        // And it is genuinely a minimizer: its objective ties the equatorial value
+        // pi^2/2 attained by e.g. e2 and by e3, and is strictly below the value at
+        // an endpoint e1 (which is NOT a minimizer for this data).
+        let w = normalize_weights(2, None).unwrap();
+        let y = normalize_sphere_matrix(values.view()).unwrap();
+        let obj_mean = obj_at(y.view(), w.view(), &mean);
+        let obj_e3 = obj_at(y.view(), w.view(), &[0.0, 0.0, 1.0]);
+        let obj_e1 = obj_at(y.view(), w.view(), &[1.0, 0.0, 0.0]);
+        assert!(
+            (obj_mean - obj_e3).abs() < 1e-9,
+            "equatorial minimizer must tie other equatorial points: {obj_mean} vs {obj_e3}"
+        );
+        assert!(
+            obj_mean < obj_e1 - 1e-9,
+            "equatorial minimizer must beat an endpoint: {obj_mean} vs {obj_e1}"
+        );
+    }
+
+    #[test]
+    fn antipodal_minimizer_is_deterministic_across_calls() {
+        let values = array![[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]];
+        let a = sphere_frechet_mean(values.view(), None, 1.0e-12, 256).unwrap();
+        let b = sphere_frechet_mean(values.view(), None, 1.0e-12, 256).unwrap();
+        assert_eq!(a, b, "tie-breaker must be deterministic across calls");
+    }
+
+    #[test]
+    fn empty_input_still_errors() {
+        // Zero-weight / empty input has no minimizer; the genuine error must remain.
+        let values = array![[1.0, 0.0, 0.0]];
+        let zero = array![0.0_f64];
+        let err = sphere_frechet_mean(values.view(), Some(zero.view()), 1.0e-12, 256);
+        assert!(err.is_err(), "zero-weight input must still error");
+    }
+
+    #[test]
+    fn non_degenerate_mean_unchanged() {
+        // A clearly identifiable cluster must still converge to the ordinary
+        // Karcher mean, not the equatorial fallback.
+        let values = array![
+            [1.0, 0.0, 0.0],
+            [0.9, 0.1, 0.0],
+            [0.9, 0.0, 0.1]
+        ];
+        let mean = sphere_frechet_mean(values.view(), None, 1.0e-12, 256).unwrap();
+        // Mean should be close to e1 (dominant direction), not on the equator.
+        assert!(mean[0] > 0.9, "expected near-e1 mean, got {mean:?}");
+    }
 }
