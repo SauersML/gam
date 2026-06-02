@@ -1598,6 +1598,39 @@ fn analytic_penalty_row_hessian_fingerprint(
     Some(hasher.finish_u64())
 }
 
+/// Structural/value fingerprint for a cross-row (non-row-block-diagonal)
+/// Psi-tier analytic penalty.
+///
+/// Unlike [`analytic_penalty_row_hessian_fingerprint`], which can read a
+/// closed-form per-row diagonal, a cross-row penalty's curvature only surfaces
+/// through its Hessian-vector product. We probe the penalty's PSD majorizer
+/// against the *current latent vector itself* — a deterministic, penalty- and
+/// state-dependent probe — and hash the resulting vector together with the
+/// penalty name, target length, and local ρ. Any change to the operator that
+/// matters for the Newton solve (different ρ, different smoothing geometry,
+/// different latent linearization point) perturbs this probe, correctly
+/// invalidating any factor cache keyed on the row-Hessian fingerprint.
+fn cross_row_penalty_fingerprint(
+    penalty: &AnalyticPenaltyKind,
+    target_t: ArrayView1<'_, f64>,
+    rho_local: ArrayView1<'_, f64>,
+) -> u64 {
+    let mut hasher = Fingerprinter::new();
+    hasher.write_str("arrow-schur-analytic-cross-row-hessian-v1");
+    hasher.write_str(penalty.name());
+    hasher.write_usize(target_t.len());
+    hasher.write_usize(rho_local.len());
+    for &rho in rho_local.iter() {
+        hasher.write_f64(rho);
+    }
+    let probe = penalty.psd_majorizer_hvp(target_t, rho_local, target_t);
+    hasher.write_usize(probe.len());
+    for &value in probe.iter() {
+        hasher.write_f64(value);
+    }
+    hasher.finish_u64()
+}
+
 fn write_latent_manifold(hasher: &mut Fingerprinter, manifold: &LatentManifold) {
     match manifold {
         LatentManifold::Euclidean => {
@@ -1807,6 +1840,47 @@ pub struct ArrowSchurSystem {
     /// `DensePenaltyOp` — identical observable behaviour, no new allocation
     /// hot-path cost for callers that have not opted in.
     pub penalty_op: Option<Arc<dyn BetaPenaltyOp>>,
+    /// Registered Psi-tier analytic penalties whose Hessian couples *distinct*
+    /// latent rows (non-row-block-diagonal), captured by
+    /// [`Self::add_analytic_penalty_contributions`].
+    ///
+    /// These penalties (`TotalVariationPenalty`, `SheafConsistencyPenalty`,
+    /// block-orthogonality, …) produce off-row Hessian blocks `∂²P/∂t_i∂t_j`
+    /// (`i ≠ j`) that the arrow elimination — which assumes each `H_tt^(i)` is
+    /// independent of every other row — cannot represent. Their *gradient* is
+    /// still folded into `g_t` exactly like every other Psi penalty; only their
+    /// curvature is held here, applied during the solve as a full-latent
+    /// Hessian-vector product `P_cross · Δt` against the penalty's
+    /// `psd_majorizer_hvp`. When this vector is non-empty,
+    /// [`solve_arrow_newton_step_artifacts`] auto-selects the matrix-free
+    /// full-system PCG path (arrow block-diagonal inverse as preconditioner)
+    /// instead of the exact one-shot Schur elimination. When empty, the system
+    /// is purely row-block-diagonal and the exact Schur path is unchanged.
+    pub cross_row_penalties: Vec<CrossRowLatentPenalty>,
+}
+
+/// A captured cross-row Psi-tier analytic penalty: the penalty kind plus the
+/// global-ρ slice (`rho_local`) it was registered with.
+///
+/// Holds an owned copy of the local ρ-axes so the penalty's
+/// [`AnalyticPenaltyKind::psd_majorizer_hvp`] can be evaluated during the
+/// matrix-free full-system solve without re-deriving the ρ layout. The penalty
+/// itself is an `Arc`-backed clone (cheap), so capturing it does not copy the
+/// penalty payload.
+#[derive(Debug, Clone)]
+pub struct CrossRowLatentPenalty {
+    /// The non-row-block-diagonal Psi penalty (e.g. `TotalVariationPenalty`).
+    pub penalty: AnalyticPenaltyKind,
+    /// The penalty's local ρ-axes (its slice of the global ρ vector).
+    pub rho_local: Array1<f64>,
+    /// The flat latent vector (`N·d`, row-major) the penalty's curvature was
+    /// linearized at — i.e. the `target_t` passed to
+    /// [`ArrowSchurSystem::add_analytic_penalty_contributions`]. The Hessian of
+    /// a nonlinear penalty (the smoothed-TV curvature weights `φ''(D t)`,
+    /// etc.) depends on this point, so `psd_majorizer_hvp` must be evaluated
+    /// against it for the Newton operator to be the true Hessian at the
+    /// current iterate.
+    pub target_t: Array1<f64>,
 }
 
 impl ArrowSchurSystem {
@@ -1833,6 +1907,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
+            cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -1885,6 +1960,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op,
+            cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -1929,6 +2005,7 @@ impl ArrowSchurSystem {
             analytic_row_hessian_fingerprint: 0,
             block_offsets: Arc::from([] as [Range<usize>; 0]),
             penalty_op: None,
+            cross_row_penalties: Vec::new(),
         };
         sys.refresh_row_hessian_fingerprint();
         sys
@@ -2164,14 +2241,33 @@ impl ArrowSchurSystem {
     /// **Composition path.** Each registered [`AnalyticPenaltyKind`] is
     /// queried for `grad_target` (added to `g_t` or `g_β`) and then for
     /// `hessian_diag` first. Diagonal penalties (ARD and the shipped
-    /// sparsity kernels) are injected directly. Psi-tier penalties with
-    /// off-row Hessian blocks are rejected because the arrow representation
-    /// has no place to store them. The supported row-block-only Psi-tier
+    /// sparsity kernels) are injected directly. The row-block-only Psi-tier
     /// penalties are `ARDPenalty`, `SparsityPenalty`,
     /// `SoftmaxAssignmentSparsity`, `IBPAssignment`,
     /// `RowPrecisionPrior`, `ParametricRowPrecisionPrior`, and
-    /// `ScadMcpPenalty`. Dense Beta-tier penalties still fall back to `hvp`
-    /// probes against the canonical basis vectors for `β`.
+    /// `ScadMcpPenalty`. Their `d × d` per-row Hessian folds into
+    /// `rows[i].htt`, so the exact arrow Schur elimination (`N` independent
+    /// `d × d` row solves) represents them exactly. Dense Beta-tier penalties
+    /// still fall back to `hvp` probes against the canonical basis vectors for
+    /// `β`.
+    ///
+    /// **Cross-row Psi penalties.** Penalties whose Hessian couples *distinct*
+    /// latent rows — `TotalVariationPenalty`, `SheafConsistencyPenalty`,
+    /// block-orthogonality, … — produce off-row blocks `∂²P/∂t_i∂t_j`
+    /// (`i ≠ j`) that the arrow elimination cannot store, since it assumes each
+    /// `H_tt^(i)` is independent of every other row. These are handled without
+    /// any approximation: their **gradient** is folded into `g_t` exactly as
+    /// for every other Psi penalty (`grad_target → g_t`), and their full
+    /// **curvature** is captured into [`Self::cross_row_penalties`] as a
+    /// matrix-free operator. At solve time, `K = K0 + P_cross` where `K0` is
+    /// the block-diagonal arrow operator and `P_cross · Δt = Σ_p ρ_p ·
+    /// psd_majorizer_hvp_p(t, Δt)` is the cross-row penalty Hessian applied to
+    /// the full flat latent vector. The presence of any captured cross-row
+    /// penalty auto-routes [`Self::solve`] through the matrix-free full-system
+    /// PCG path (the exact arrow block-diagonal inverse `K0⁻¹` is the
+    /// preconditioner `M⁻¹`); a purely row-block-diagonal system keeps the
+    /// exact one-shot Schur path unchanged. No new flag is involved — the route
+    /// is selected from the captured penalty set alone (magic by default).
     ///
     /// `target_t` is the full flat latent-coordinate vector (row-major, `N·d` entries)
     /// at the current iterate; `target_beta` is the current `β`. `rho`
@@ -2186,22 +2282,35 @@ impl ArrowSchurSystem {
     ) -> Result<(), ArrowSchurError> {
         let layout = registry.rho_layout();
         let mut penalty_fingerprints = Vec::new();
-        for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
+        self.cross_row_penalties.clear();
+        for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(ndarray::s![rho_slice.clone()]);
             match tier {
                 PenaltyTier::Psi => {
-                    if !analytic_penalty_is_row_block_diagonal(penalty) {
-                        return Err(ArrowSchurError::SchurFactorFailed {
-                            reason: format!(
-                                "analytic penalty {name:?} couples latent rows; cross-row Hessian contributions are not yet supported on any production solver path. Consider using a row-block-only penalty (ARDPenalty, SparsityPenalty, SoftmaxAssignmentSparsity, IBPAssignment) or filing an issue requesting cross-row Hessian support."
-                            ),
+                    if analytic_penalty_is_row_block_diagonal(penalty) {
+                        // Row-block-diagonal: fold gradient + per-row d×d
+                        // curvature into rows[i].htt, exactly representable by
+                        // the arrow Schur elimination.
+                        self.add_ext_coord_penalty(penalty, target_t, rho_local);
+                        if let Some(fingerprint) =
+                            analytic_penalty_row_hessian_fingerprint(penalty, target_t, rho_local)
+                        {
+                            penalty_fingerprints.push(fingerprint);
+                        }
+                    } else {
+                        // Cross-row: fold the gradient into g_t (exact, like
+                        // every Psi penalty), but DO NOT fold any curvature into
+                        // the row blocks — its off-row coupling cannot be stored
+                        // there. Capture the penalty so the solve applies its
+                        // full Hessian-vector product P_cross·Δt over the flat
+                        // latent vector. This auto-selects the matrix-free
+                        // full-system PCG path.
+                        self.add_ext_coord_penalty_gradient_only(penalty, target_t, rho_local);
+                        self.cross_row_penalties.push(CrossRowLatentPenalty {
+                            penalty: penalty.clone(),
+                            rho_local: rho_local.to_owned(),
+                            target_t: target_t.to_owned(),
                         });
-                    }
-                    self.add_ext_coord_penalty(penalty, target_t, rho_local);
-                    if let Some(fingerprint) =
-                        analytic_penalty_row_hessian_fingerprint(penalty, target_t, rho_local)
-                    {
-                        penalty_fingerprints.push(fingerprint);
                     }
                 }
                 PenaltyTier::Beta => {
@@ -2213,6 +2322,18 @@ impl ArrowSchurSystem {
                     // outer level.
                 }
             }
+        }
+        // Cross-row penalties contribute to the Newton Hessian operator, not
+        // the stored row blocks, so they must still invalidate the row-Hessian
+        // cache when their curvature changes. Probe each captured penalty's PSD
+        // majorizer against the current latent vector (a deterministic, generic
+        // probe) and fold the resulting signature in.
+        for cross in &self.cross_row_penalties {
+            penalty_fingerprints.push(cross_row_penalty_fingerprint(
+                &cross.penalty,
+                target_t,
+                cross.rho_local.view(),
+            ));
         }
         self.analytic_row_hessian_fingerprint = if penalty_fingerprints.is_empty() {
             0
@@ -2288,6 +2409,60 @@ impl ArrowSchurSystem {
                 }
             },
         );
+    }
+
+    /// Fold ONLY the latent gradient `grad_target → g_t` of an analytic
+    /// penalty, leaving the row-block Hessian untouched.
+    ///
+    /// Used for cross-row Psi penalties: their gradient enters `g_t` exactly
+    /// like every other Psi penalty, but their curvature must NOT be scattered
+    /// into the per-row `H_tt^(i)` blocks (the diagonal piece would be
+    /// double-counted and the off-row coupling cannot be stored there). The
+    /// full curvature is instead applied as a matrix-free `P_cross · Δt`
+    /// during the solve, via [`Self::cross_row_penalties`].
+    fn add_ext_coord_penalty_gradient_only(
+        &mut self,
+        penalty: &AnalyticPenaltyKind,
+        target_t: ArrayView1<'_, f64>,
+        rho_local: ArrayView1<'_, f64>,
+    ) {
+        let d = self.d;
+        let n = self.rows.len();
+        assert_eq!(target_t.len(), n * d);
+        let grad = penalty.grad_target(target_t, rho_local);
+        for flat in 0..n * d {
+            self.rows[flat / d].gt[flat % d] += grad[flat];
+        }
+    }
+
+    /// Apply the aggregate cross-row penalty Hessian `P_cross · v` over the
+    /// full flat latent vector `v` (length `Σ_i row_dims[i]`), accumulating
+    /// into `out`.
+    ///
+    /// `P_cross = Σ_p psd_majorizer_hvp_p(target_t, ·; ρ_p)` summed over every
+    /// captured cross-row penalty. Each penalty's `psd_majorizer_hvp` is its
+    /// exact (PSD) Hessian-vector product over the `N·d` flat latent vector —
+    /// for `TotalVariationPenalty` this is `Dᵀ diag(φ''(D t)) D · v`, the
+    /// graph/forward-difference Laplacian-style coupling that links distinct
+    /// rows. The ρ scaling is already baked into each penalty's resolved
+    /// weight, so no extra factor is applied here.
+    ///
+    /// This is only valid for homogeneous systems (every row of dimension
+    /// `d`), the only shape cross-row latent penalties are defined on; the
+    /// flat-index convention `flat = i·d + j` matches every penalty's
+    /// `latent_dim`/row-major contract.
+    fn apply_cross_row_penalty_hessian(&self, v: ArrayView1<'_, f64>, out: &mut Array1<f64>) {
+        for cross in &self.cross_row_penalties {
+            assert_eq!(cross.target_t.len(), v.len());
+            let hv =
+                cross
+                    .penalty
+                    .psd_majorizer_hvp(cross.target_t.view(), cross.rho_local.view(), v);
+            assert_eq!(hv.len(), out.len());
+            for i in 0..out.len() {
+                out[i] += hv[i];
+            }
+        }
     }
 
     fn add_beta_penalty(
@@ -4099,6 +4274,15 @@ fn solve_arrow_newton_step_artifacts(
     ridge_beta: f64,
     options: &ArrowSolveOptions,
 ) -> Result<ArrowNewtonStepArtifacts, ArrowSchurError> {
+    // Auto-select the cross-row path: when any registered Psi penalty couples
+    // distinct latent rows, the exact one-shot Schur elimination (which assumes
+    // each H_tt^(i) is independent) cannot represent the off-row Hessian blocks.
+    // Route the FULL (t, β) Newton system through matrix-free preconditioned CG
+    // with the exact arrow block-diagonal inverse as the preconditioner. No
+    // flag: the route is implied by the captured cross-row penalty set.
+    if !sys.cross_row_penalties.is_empty() {
+        return solve_arrow_newton_step_cross_row(sys, ridge_t, ridge_beta, options);
+    }
     if let Some(chunk_size) = options.streaming_chunk_size {
         let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
         let (delta_t, delta_beta, schur_factor) = streaming.solve(ridge_t, ridge_beta, options)?;
@@ -4198,6 +4382,329 @@ fn solve_arrow_newton_step_artifacts(
         schur_factor,
         pcg_diagnostics,
     })
+}
+
+/// Exact inverse of the block-diagonal arrow operator `K0 + ridge`, used as
+/// the preconditioner for the cross-row full-system CG.
+///
+/// Holds the per-row `H_tt^(i) + ridge_t·I` Cholesky factors and the dense
+/// Schur-complement factor `S = (H_ββ + ridge_β·I) − Σ_i H_tβ^(i)ᵀ
+/// (H_tt^(i))⁻¹ H_tβ^(i)`, so applying `M⁻¹` to an arbitrary RHS is a single
+/// Schur back/forward substitution — exactly the algebra
+/// [`solve_arrow_newton_step_artifacts`] performs, generalized to a free RHS.
+struct ArrowBlockDiagInverse<'a, B: BatchedBlockSolver> {
+    sys: &'a ArrowSchurSystem,
+    backend: &'a B,
+    htt_factors: Vec<Array2<f64>>,
+    schur_factor: Array2<f64>,
+}
+
+impl<'a, B: BatchedBlockSolver> ArrowBlockDiagInverse<'a, B> {
+    fn build(
+        sys: &'a ArrowSchurSystem,
+        ridge_t: f64,
+        ridge_beta: f64,
+        tolerate_ill_conditioning: bool,
+        backend: &'a B,
+    ) -> Result<Self, ArrowSchurError> {
+        let htt_factors =
+            backend.factor_blocks(&sys.rows, ridge_t, sys.d, tolerate_ill_conditioning)?;
+        let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, backend)?;
+        let schur_factor =
+            cholesky_lower(&schur).map_err(|e| ArrowSchurError::SchurFactorFailed { reason: e })?;
+        Ok(Self {
+            sys,
+            backend,
+            htt_factors,
+            schur_factor,
+        })
+    }
+
+    /// Solve `(K0 + ridge) · [x_t; x_β] = [r_t; r_β]` exactly.
+    ///
+    /// `r_t` is flat row-major (`Σ_i row_dims[i]`); `r_β` is length `K`. The
+    /// outputs `x_t` / `x_β` use the same layout.
+    fn apply(
+        &self,
+        r_t: ArrayView1<'_, f64>,
+        r_beta: ArrayView1<'_, f64>,
+    ) -> (Array1<f64>, Array1<f64>) {
+        let sys = self.sys;
+        let n = sys.rows.len();
+        let k = sys.k;
+        // Reduced β RHS: r_β − Σ_i H_βt^(i) (H_tt^(i))⁻¹ r_t,i.
+        let mut rhs_beta = r_beta.to_owned();
+        for i in 0..n {
+            let di = sys.row_dims[i];
+            let base = sys.row_offsets[i];
+            let r_ti = r_t.slice(ndarray::s![base..base + di]).to_owned();
+            let u_i = self.backend.solve_block_vector(&self.htt_factors[i], &r_ti);
+            let mut acc = Array1::<f64>::zeros(k);
+            sys_htbeta_accumulate_transpose(sys, i, &sys.rows[i], u_i.view(), &mut acc);
+            for a in 0..k {
+                rhs_beta[a] -= acc[a];
+            }
+        }
+        // x_β = S⁻¹ rhs_β.
+        let x_beta = cholesky_solve_lower(&self.schur_factor, &rhs_beta);
+        // x_t,i = (H_tt^(i))⁻¹ (r_t,i − H_tβ^(i) x_β).
+        let total_dt = sys.row_offsets[n];
+        let mut x_t = Array1::<f64>::zeros(total_dt);
+        let mut htbeta_xb = Array1::<f64>::zeros(sys.d);
+        for i in 0..n {
+            let di = sys.row_dims[i];
+            let base = sys.row_offsets[i];
+            for c in 0..di {
+                htbeta_xb[c] = 0.0;
+            }
+            let mut slab = htbeta_xb.slice_mut(ndarray::s![..di]).to_owned();
+            sys_htbeta_apply_row(sys, i, &sys.rows[i], x_beta.view(), &mut slab);
+            let mut rhs_i = Array1::<f64>::zeros(di);
+            for c in 0..di {
+                rhs_i[c] = r_t[base + c] - slab[c];
+            }
+            let xi = self.backend.solve_block_vector(&self.htt_factors[i], &rhs_i);
+            for c in 0..di {
+                x_t[base + c] = xi[c];
+            }
+        }
+        (x_t, x_beta)
+    }
+}
+
+/// Apply the full cross-row Newton operator `A = (K0 + ridge) + P_cross` to
+/// `[x_t; x_β]`, writing `[y_t; y_β]`.
+///
+/// `(K0 + ridge)` is the block-diagonal arrow operator: per row
+/// `y_t,i = (H_tt^(i) + ridge_t·I) x_t,i + H_tβ^(i) x_β`, and
+/// `y_β = Σ_i H_βt^(i) x_t,i + (H_ββ + ridge_β·I) x_β`. `P_cross` adds the
+/// captured cross-row penalty Hessian to the latent block only:
+/// `y_t += P_cross · x_t`.
+fn arrow_cross_row_matvec(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x_t: ArrayView1<'_, f64>,
+    x_beta: ArrayView1<'_, f64>,
+) -> (Array1<f64>, Array1<f64>) {
+    let n = sys.rows.len();
+    let k = sys.k;
+    let total_dt = sys.row_offsets[n];
+    let mut y_t = Array1::<f64>::zeros(total_dt);
+    let mut y_beta = Array1::<f64>::zeros(k);
+    let mut htbeta_xb = Array1::<f64>::zeros(sys.d);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        let row = &sys.rows[i];
+        // H_tt^(i) x_t,i + ridge_t x_t,i.
+        for a in 0..di {
+            let mut acc = ridge_t * x_t[base + a];
+            for b in 0..di {
+                acc += row.htt[[a, b]] * x_t[base + b];
+            }
+            y_t[base + a] = acc;
+        }
+        // + H_tβ^(i) x_β.
+        for c in 0..di {
+            htbeta_xb[c] = 0.0;
+        }
+        let mut slab = htbeta_xb.slice_mut(ndarray::s![..di]).to_owned();
+        sys_htbeta_apply_row(sys, i, row, x_beta, &mut slab);
+        for c in 0..di {
+            y_t[base + c] += slab[c];
+        }
+        // y_β += H_βt^(i) x_t,i.
+        let x_ti = x_t.slice(ndarray::s![base..base + di]).to_owned();
+        sys_htbeta_accumulate_transpose(sys, i, row, x_ti.view(), &mut y_beta);
+    }
+    // y_β += (H_ββ + ridge_β·I) x_β.
+    {
+        let x_beta_slice = x_beta.as_slice().expect("x_beta contiguous");
+        let y_beta_slice = y_beta.as_slice_mut().expect("y_beta contiguous");
+        sys.penalty_matvec_add(x_beta_slice, y_beta_slice);
+    }
+    for a in 0..k {
+        y_beta[a] += ridge_beta * x_beta[a];
+    }
+    // y_t += P_cross · x_t (cross-row penalty Hessian, latent block only).
+    sys.apply_cross_row_penalty_hessian(x_t, &mut y_t);
+    (y_t, y_beta)
+}
+
+/// Solve the full bordered Newton system when one or more registered Psi
+/// penalties couple distinct latent rows.
+///
+/// The operator is `A = (K0 + ridge) + P_cross`, SPD whenever the arrow
+/// block-diagonal `K0 + ridge` is PD (enforced by the per-row factor checks)
+/// and every cross-row penalty contributes a PSD `psd_majorizer_hvp`. We solve
+/// `A · [Δt; Δβ] = −[g_t; g_β]` by preconditioned conjugate gradients, using
+/// the exact arrow block-diagonal inverse `M⁻¹ = (K0 + ridge)⁻¹` as the
+/// preconditioner — the same Schur elimination the row-block-diagonal path
+/// uses, here applied to the CG residual rather than the negated gradient.
+/// Because `M⁻¹` inverts everything except the (small, structured) `P_cross`
+/// coupling, the preconditioned operator `M⁻¹ A = I + M⁻¹ P_cross` has a
+/// tightly clustered spectrum and CG converges in a handful of iterations.
+fn solve_arrow_newton_step_cross_row(
+    sys: &ArrowSchurSystem,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+) -> Result<ArrowNewtonStepArtifacts, ArrowSchurError> {
+    let backend = CpuBatchedBlockSolver;
+    let precond = ArrowBlockDiagInverse::build(
+        sys,
+        ridge_t,
+        ridge_beta,
+        options.tolerate_ill_conditioning,
+        &backend,
+    )?;
+
+    let n = sys.rows.len();
+    let k = sys.k;
+    let total_dt = sys.row_offsets[n];
+
+    // RHS b = −g = [−g_t; −g_β].
+    let mut b_t = Array1::<f64>::zeros(total_dt);
+    for i in 0..n {
+        let di = sys.row_dims[i];
+        let base = sys.row_offsets[i];
+        for c in 0..di {
+            b_t[base + c] = -sys.rows[i].gt[c];
+        }
+    }
+    let mut b_beta = Array1::<f64>::zeros(k);
+    for a in 0..k {
+        b_beta[a] = -sys.gb[a];
+    }
+
+    // Preconditioned CG on the full (t, β) system.
+    // x = 0; r = b − A·0 = b; z = M⁻¹ r; p = z.
+    let mut x_t = Array1::<f64>::zeros(total_dt);
+    let mut x_beta = Array1::<f64>::zeros(k);
+    let mut r_t = b_t.clone();
+    let mut r_beta = b_beta.clone();
+    let (mut z_t, mut z_beta) = precond.apply(r_t.view(), r_beta.view());
+    let mut p_t = z_t.clone();
+    let mut p_beta = z_beta.clone();
+    let mut rz = dot2(&r_t, &r_beta, &z_t, &z_beta);
+
+    let b_norm = (dot2(&b_t, &b_beta, &b_t, &b_beta)).sqrt();
+    // Solve the linear Newton system to tight relative accuracy. The cross-row
+    // path is exact-CG (no trust region), so we drive the residual to machine-
+    // scale relative tolerance; the spectrum I + M⁻¹P_cross makes this cheap.
+    let tol = 1e-12_f64.max(1e-13 * b_norm);
+    let max_iter = (total_dt + k).max(64) * 4;
+
+    let mut iters = 0usize;
+    let mut converged = b_norm == 0.0;
+    while iters < max_iter && !converged {
+        let (ap_t, ap_beta) = arrow_cross_row_matvec(sys, ridge_t, ridge_beta, p_t.view(), p_beta.view());
+        let pap = dot2(&p_t, &p_beta, &ap_t, &ap_beta);
+        if !(pap.is_finite() && pap > 0.0) {
+            return Err(ArrowSchurError::PcgFailed {
+                reason: format!(
+                    "cross-row full-system CG hit non-positive curvature pᵀAp={pap:e}; \
+                     the cross-row penalty Hessian or arrow block is not PD at this iterate"
+                ),
+            });
+        }
+        let alpha = rz / pap;
+        for i in 0..total_dt {
+            x_t[i] += alpha * p_t[i];
+            r_t[i] -= alpha * ap_t[i];
+        }
+        for a in 0..k {
+            x_beta[a] += alpha * p_beta[a];
+            r_beta[a] -= alpha * ap_beta[a];
+        }
+        let r_norm = (dot2(&r_t, &r_beta, &r_t, &r_beta)).sqrt();
+        iters += 1;
+        if r_norm <= tol {
+            converged = true;
+            break;
+        }
+        let (nz_t, nz_beta) = precond.apply(r_t.view(), r_beta.view());
+        z_t = nz_t;
+        z_beta = nz_beta;
+        let rz_new = dot2(&r_t, &r_beta, &z_t, &z_beta);
+        let beta_cg = rz_new / rz;
+        for i in 0..total_dt {
+            p_t[i] = z_t[i] + beta_cg * p_t[i];
+        }
+        for a in 0..k {
+            p_beta[a] = z_beta[a] + beta_cg * p_beta[a];
+        }
+        rz = rz_new;
+    }
+
+    if !converged {
+        let r_norm = (dot2(&r_t, &r_beta, &r_t, &r_beta)).sqrt();
+        return Err(ArrowSchurError::PcgFailed {
+            reason: format!(
+                "cross-row full-system CG did not converge in {iters} iters \
+                 (‖r‖={r_norm:e}, tol={tol:e})"
+            ),
+        });
+    }
+
+    let final_residual = (dot2(&r_t, &r_beta, &r_t, &r_beta)).sqrt();
+    let diag = PcgDiagnostics {
+        iterations: iters,
+        matvec_calls: iters,
+        precond_apply_calls: iters + 1,
+        ridge_escalations: 0,
+        final_relative_residual: if b_norm > 0.0 {
+            final_residual / b_norm
+        } else {
+            0.0
+        },
+        stopping_reason: PcgStopReason::Converged,
+    };
+
+    Ok(ArrowNewtonStepArtifacts {
+        delta_t: x_t,
+        delta_beta: x_beta,
+        htt_factors: precond.htt_factors,
+        schur_factor: Some(precond.schur_factor),
+        pcg_diagnostics: diag,
+    })
+}
+
+/// `⟨[a_t; a_β], [b_t; b_β]⟩` over the stacked latent/β vector.
+fn dot2(a_t: &Array1<f64>, a_beta: &Array1<f64>, b_t: &Array1<f64>, b_beta: &Array1<f64>) -> f64 {
+    let mut acc = 0.0_f64;
+    for i in 0..a_t.len() {
+        acc += a_t[i] * b_t[i];
+    }
+    for a in 0..a_beta.len() {
+        acc += a_beta[a] * b_beta[a];
+    }
+    acc
+}
+
+/// Solve `L Lᵀ x = b` given the lower Cholesky factor `L`.
+fn cholesky_solve_lower(l: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let n = l.nrows();
+    // Forward solve L y = b.
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut sum = b[i];
+        for j in 0..i {
+            sum -= l[[i, j]] * y[j];
+        }
+        y[i] = sum / l[[i, i]];
+    }
+    // Back solve Lᵀ x = y.
+    let mut x = Array1::<f64>::zeros(n);
+    for i in (0..n).rev() {
+        let mut sum = y[i];
+        for j in (i + 1)..n {
+            sum -= l[[j, i]] * x[j];
+        }
+        x[i] = sum / l[[i, i]];
+    }
+    x
 }
 
 fn reduced_rhs_beta<B: BatchedBlockSolver>(
