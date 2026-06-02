@@ -1189,6 +1189,24 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
         d: usize,
         tolerate_ill_conditioning: bool,
     ) -> Result<Vec<Array2<f64>>, ArrowSchurError> {
+        // Multi-GPU fast path: the per-row blocks `H_tt^(i) + ridge_t·I` are
+        // independent same-size SPD systems — exactly the batch
+        // `crate::gpu::try_cholesky_batched_lower_inplace` spreads across ALL
+        // usable devices (the batched POTRF tiles over the pool). It is only
+        // valid when every row is the uniform `d×d` shape (heterogeneous rows
+        // keep the per-row CPU loop) and only succeeds when EVERY block is PD at
+        // the base ridge; a non-PD block returns `None`, so we fall back to the
+        // exact per-row CPU path that performs minimal per-block ridge
+        // escalation. After a successful batched factorization we re-apply the
+        // identical κ-conditioning rejection `factor_one_row` enforces, so the
+        // result is bit-for-bit equivalent (modulo IEEE reduction order) to the
+        // CPU loop: a barely-PD but ill-conditioned block forces the whole batch
+        // back onto the per-row path so its ridge can lift, never silently using
+        // a contaminated factor.
+        if let Some(batched) = try_factor_blocks_batched(rows, ridge_t, d, tolerate_ill_conditioning)
+        {
+            return Ok(batched);
+        }
         let mut out = Vec::with_capacity(rows.len());
         for (row_idx, row) in rows.iter().enumerate() {
             out.push(factor_one_row(
@@ -1242,6 +1260,77 @@ impl BatchedBlockSolver for CpuBatchedBlockSolver {
             }
         }
     }
+}
+
+/// Attempt the per-row block factorization as one device batch spread across
+/// every usable GPU.
+///
+/// The `n` per-row blocks `H_tt^(i) + ridge_t·I` are independent SPD systems of
+/// the uniform shape `d×d`; `crate::gpu::try_cholesky_batched_lower_inplace`
+/// factors the whole batch with a batched POTRF that the shared device pool
+/// tiles across all ordinals. Returns `Some(factors)` only when:
+///   * every row really is the uniform `(d, d)` shape with a length-`d` `g_t`
+///     (heterogeneous systems keep the per-row CPU loop), and
+///   * a device is available and EVERY block is positive-definite at the base
+///     ridge (a non-PD block makes the batched POTRF return `None`), and
+///   * unless `tolerate_ill_conditioning`, every resulting factor passes the
+///     same diagonal-ratio κ ceiling `factor_one_row` enforces.
+///
+/// Any of those failing returns `None`, so the caller runs the exact per-row
+/// CPU path (which performs minimal per-block ridge escalation and the κ check).
+/// The factor a device POTRF produces is the lower Cholesky of the identical
+/// SPD matrix the CPU `cholesky_lower` would, with the strict upper triangle
+/// zeroed — bit-for-bit equivalent modulo IEEE-754 reduction order.
+fn try_factor_blocks_batched(
+    rows: &[ArrowRowBlock],
+    ridge_t: f64,
+    d: usize,
+    tolerate_ill_conditioning: bool,
+) -> Option<Vec<Array2<f64>>> {
+    if d == 0 || rows.is_empty() {
+        return None;
+    }
+    // Uniform-shape gate: a heterogeneous row defeats the single batched POTRF.
+    if rows
+        .iter()
+        .any(|row| row.htt.dim() != (d, d) || row.gt.len() != d)
+    {
+        return None;
+    }
+    // No device → let the CPU path own the work (it is the exact fallback).
+    if !crate::gpu::runtime::GpuRuntime::is_available() {
+        return None;
+    }
+
+    // Assemble the damped blocks `H_tt^(i) + ridge_t·I` for the batched POTRF.
+    let mut blocks: Vec<Array2<f64>> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut block = row.htt.clone();
+        for a in 0..d {
+            block[[a, a]] += ridge_t;
+        }
+        blocks.push(block);
+    }
+
+    // Batched lower Cholesky over ALL usable GPUs. `None` ⇒ either no device
+    // accepted the workload or some block was not PD at the base ridge; either
+    // way the per-row CPU path must own escalation.
+    crate::gpu::try_cholesky_batched_lower_inplace(&mut blocks)?;
+
+    // Re-apply the κ-conditioning rejection so a barely-PD block forces the
+    // whole batch back to the per-row path (where its ridge lifts), matching
+    // `factor_one_row` semantics exactly. Evidence/log-det-only callers
+    // tolerate ill-conditioning and skip this, as on the CPU path.
+    if !tolerate_ill_conditioning {
+        let kappa_max = safe_spd_kappa_max(d);
+        for factor in &blocks {
+            let kappa_est = cholesky_factor_kappa_estimate(factor);
+            if !(kappa_est.is_finite() && kappa_est <= kappa_max) {
+                return None;
+            }
+        }
+    }
+    Some(blocks)
 }
 
 /// Diagonal-ratio condition-number proxy for an SPD matrix from its lower
