@@ -146,6 +146,136 @@ class _BsplineJetFn(torch.autograd.Function):
         return grad_t, None, None, None
 
 
+class _BsplineDerivJetFn(torch.autograd.Function):
+    """``∂[Φ^(order)]/∂t`` for the 1D B-spline derivative basis.
+
+    The ``order``-th derivative basis is diagonal in ``t`` (row ``n`` depends
+    only on ``t_n``), and its input-location derivative is the
+    ``(order+1)``-th derivative basis ``Φ^(order+1)``. Forward returns
+    ``Φ^(order+1)`` as a tracked ``(N, K)`` tensor; backward routes the
+    input-location curvature through ``Φ^(order+2)`` so a *second* backward is
+    exact and analytic for the open (non-periodic) case.
+
+    Periodic: the open higher-order Rust kernel is not exposed for periodic
+    bases (issue #233). For ``order == 0`` the first jet uses
+    ``periodic_bspline_input_location_first_derivative``; any deeper periodic
+    jet raises a clear ``NotImplementedError`` rather than leaking a Rust
+    string.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        t: torch.Tensor,
+        knots: torch.Tensor,
+        degree: int,
+        order: int,
+        periodic: bool,
+    ) -> torch.Tensor:
+        t_np = to_numpy_f64(t)
+        knots_np = to_numpy_f64(knots)
+        if periodic:
+            if order != 0:
+                raise NotImplementedError(
+                    "Higher-order autograd through the periodic B-spline "
+                    "derivative basis is not yet exposed; the Rust core only "
+                    "provides the periodic order-1 input-location derivative."
+                )
+            from .._binding import rust_module
+
+            left = float(knots_np[0])
+            right = float(knots_np[-1])
+            num_basis = int(knots_np.shape[0] - 1)
+            jet_3d = rust_module().periodic_bspline_input_location_first_derivative(
+                t_np.reshape(-1, 1), left, right, int(degree), num_basis,
+            )
+            jet_np = jet_3d.reshape(jet_3d.shape[0], jet_3d.shape[1])
+        else:
+            jet_np = _api.bspline_basis_derivative(
+                t_np,
+                knots_np,
+                degree=int(degree),
+                order=int(order) + 1,
+                periodic=False,
+            )
+        ctx.save_for_backward(t, knots)
+        ctx.degree = int(degree)
+        ctx.order = int(order)
+        ctx.periodic = bool(periodic)
+        return from_numpy_like(jet_np, t)
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        (grad_jet,) = grad_outputs  # (N, K)
+        t, knots = ctx.saved_tensors
+        if ctx.periodic:
+            raise NotImplementedError(
+                "Second-order autograd through the periodic B-spline "
+                "derivative basis is not yet exposed; the Rust core needs a "
+                "periodic input-location higher-derivative kernel."
+            )
+        second_np = _api.bspline_basis_derivative(
+            to_numpy_f64(t),
+            to_numpy_f64(knots),
+            degree=ctx.degree,
+            order=ctx.order + 2,
+            periodic=False,
+        )
+        second = from_numpy_like(second_np, t)
+        grad_t = (grad_jet.to(dtype=second.dtype) * second).sum(dim=-1)
+        return grad_t, None, None, None, None
+
+
+class _BsplineDerivFn(torch.autograd.Function):
+    """Autograd Function evaluating the ``order``-th B-spline derivative basis.
+
+    Forward calls ``bspline_basis_derivative(order=order)``. Because the
+    derivative basis is diagonal in ``t``, ``∂L/∂t[n] = Σ_k grad_out[n,k] ·
+    Φ^(order+1)[n,k]``. Backward routes that contraction through
+    :class:`_BsplineDerivJetFn` (which evaluates ``Φ^(order+1)`` and whose own
+    backward evaluates ``Φ^(order+2)``), so a second backward — the
+    input-location curvature — is exact and analytic for the open case.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        t: torch.Tensor,
+        knots: torch.Tensor,
+        degree: int,
+        order: int,
+        periodic: bool,
+    ) -> torch.Tensor:
+        t_np = to_numpy_f64(t)
+        knots_np = to_numpy_f64(knots)
+        deriv_np = _api.bspline_basis_derivative(
+            t_np,
+            knots_np,
+            degree=int(degree),
+            order=int(order),
+            periodic=bool(periodic),
+        )
+        ctx.save_for_backward(t, knots)
+        ctx.degree = int(degree)
+        ctx.order = int(order)
+        ctx.periodic = bool(periodic)
+        return from_numpy_like(deriv_np, t)
+
+    @staticmethod
+    def backward(
+        ctx: Any, *grad_outputs: torch.Tensor
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        (grad_deriv,) = grad_outputs
+        t, knots = ctx.saved_tensors
+        jet = cast(Callable[..., torch.Tensor], _BsplineDerivJetFn.apply)(
+            t, knots, int(ctx.degree), int(ctx.order), bool(ctx.periodic)
+        )
+        grad_t = (grad_deriv.to(dtype=jet.dtype) * jet).sum(dim=-1)
+        return grad_t, None, None, None, None
+
+
 def _duchon_basis_kwargs(
     m: int,
     length_scale: float | None,
@@ -331,17 +461,21 @@ def bspline_basis_derivative(
 ) -> torch.Tensor:
     """Evaluate derivatives of the B-spline basis at ``t``.
 
-    Forward-only: the returned tensor does not carry a backward through ``t``.
-    Callers that need a differentiable basis should use ``bspline_basis`` and
-    rely on autograd, since the derivative primitive has no analytic VJP in
-    :mod:`gamfit._api`.
+    The returned tensor carries an exact analytic backward with respect to
+    ``t``: the ``order``-th derivative basis is diagonal in ``t``, so
+    ``∂L/∂t[n] = Σ_k grad_out[n,k] · Φ^(order+1)[n,k]`` via the Rust
+    ``(order+1)``-th derivative. For the open (non-periodic) case a second
+    backward — the input-location curvature — is also exact, routing through
+    ``Φ^(order+2)``. For the periodic case only the order-1 input-location
+    derivative is exposed by the Rust core; deeper periodic backward raises a
+    clear ``NotImplementedError``.
 
     Parameters
     ----------
     t : torch.Tensor
-        Evaluation locations of shape ``(n_t,)``.
+        Evaluation locations of shape ``(n_t,)``. Differentiable input.
     knots : torch.Tensor
-        Knot vector.
+        Knot vector. Treated as structural — no gradient is propagated.
     degree : int, optional
         Spline degree. Default ``3``.
     order : int, optional
@@ -355,14 +489,8 @@ def bspline_basis_derivative(
         Derivative basis matrix of shape ``(n_t, n_basis)``.
     """
     knots_t, eff_degree = _resolve_knots_tensor(t, knots, degree=int(degree))
-    deriv = _api.bspline_basis_derivative(
-        to_numpy_f64(t),
-        to_numpy_f64(knots_t),
-        degree=eff_degree,
-        order=int(order),
-        periodic=bool(periodic),
-    )
-    return from_numpy_like(deriv, t)
+    apply = cast(Callable[..., torch.Tensor], _BsplineDerivFn.apply)
+    return apply(t, knots_t, eff_degree, int(order), bool(periodic))
 
 
 def duchon_basis(
