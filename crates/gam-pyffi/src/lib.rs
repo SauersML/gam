@@ -7012,22 +7012,52 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     let is_interior = active_empty || no_constraints;
 
     if !is_interior {
-        // See header doc + report: the closed-form Gaussian REML backward
-        // stack is welded to the unconstrained eigen-cache. The tangent-
-        // projected variant requires constructing `P = Z (ZᵀHZ)⁻¹ Zᵀ` and a
-        // projected penalty pinv `Z (ZᵀSZ)⁺ Zᵀ`, plus a projected
-        // `reml_hess_rho_T`. Refactoring the per-helper VJPs to accept these
-        // as separate parameters instead of pulling from `cache`.
-        return Err(PyNotImplementedError::new_err(
-            "gaussian_reml_fit_with_constraints_backward: analytic VJP at \
-             non-empty active sets (active cert exit) is not yet implemented. \
-             The math identity is `H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ`, `S⁺ → Z(ZᵀSZ)⁺Zᵀ`, \
-             but the closed-form Gaussian REML helpers in \
-             `src/solver/gaussian_reml.rs` consume the unconstrained \
-             `GaussianRemlEigenCache` directly and cannot yet accept these \
-             projected operators."
-                .to_string(),
-        ));
+        // Active cert: tangent-projected envelope-theorem VJP.
+        //
+        // At the active cert the equality constraints `A_act β̂ = 0` confine
+        // β̂ — and every sensitivity of the outer REML objective — to the
+        // tangent space `range(Z)`, where `Z = null(A_act)` is a p×k
+        // orthonormal basis (k = p − rank(A_act)). Reparametrise `β = Z γ`,
+        // `γ ∈ ℝ^k`. The reduced problem is the SAME closed-form Gaussian
+        // REML on the projected operators
+        //     X_Z = X Z   (n×k),    S_Z = Zᵀ S Z   (k×k),
+        // with `y`, `w` unchanged. This realises exactly the documented
+        // substitution `H⁻¹ → Z(ZᵀHZ)⁻¹Zᵀ`, `S⁺ → Z(ZᵀSZ)⁺Zᵀ`: the reduced
+        // inverse Hessian is `(ZᵀHZ)⁻¹`, lifted by Z on both sides, and the
+        // reduced penalty pseudo-inverse is `(ZᵀSZ)⁺`.
+        //
+        // The forward outputs map as β̂ = Z γ̂ and fitted = X_Z γ̂ = X β̂; the
+        // outer scalars (λ, REML score, edf) are functions of the reduced
+        // system. We therefore run the interior backward on the reduced
+        // problem with upstream cotangents pulled back through Z, then lift
+        // the returned gradients back to full p-space:
+        //     X_Z = X Z    ⟹  grad_X = grad_X_Z · Zᵀ
+        //     S_Z = Zᵀ S Z ⟹  grad_S = Z · grad_S_Z · Zᵀ
+        //     grad_y, grad_weights pass through unchanged.
+        // Z is a constant (it depends only on the non-differentiable active
+        // constraint geometry), so this is the exact analytic adjoint.
+        return constrained_active_backward(
+            py,
+            x.as_array(),
+            y.as_array(),
+            penalty.as_array(),
+            weights.as_ref().map(|w| w.as_array()),
+            a_inequality
+                .as_ref()
+                .expect("active cert implies a non-empty constraint matrix")
+                .as_array(),
+            active_indices
+                .as_ref()
+                .expect("active cert implies a non-empty active index set")
+                .as_array(),
+            log_lambda_at_optimum,
+            grad_coefficients.as_ref().map(|g| g.as_array()),
+            grad_fitted.as_ref().map(|g| g.as_array()),
+            grad_lambda,
+            grad_log_lambda,
+            grad_reml_score,
+            grad_edf,
+        );
     }
 
     // Interior cert: envelope theorem in full p-space. The constrained
@@ -7089,6 +7119,146 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
     out.set_item("grad_x", backward.grad_x.into_pyarray(py))?;
     out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
     out.set_item("grad_penalty", backward.grad_penalty.into_pyarray(py))?;
+    out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
+    Ok(out.unbind())
+}
+
+/// Tangent-projected analytic VJP for the constrained Gaussian REML fit at a
+/// non-empty active set (active cert exit).
+///
+/// See the call site for the derivation. In short: with `Z = null(A_act)` a
+/// p×k orthonormal basis of the tangent space, the constrained problem is the
+/// unconstrained closed-form Gaussian REML on the reduced operators
+/// `X_Z = X Z`, `S_Z = Zᵀ S Z`. We pull the upstream cotangents back through
+/// `Z`, call the SAME interior backward (`gaussian_reml_multi_closed_form_
+/// backward`) on the reduced system, and lift its gradients back to p-space:
+/// `grad_X = grad_X_Z Zᵀ`, `grad_S = Z grad_S_Z Zᵀ`; `grad_y`/`grad_weights`
+/// are invariant under the reparametrisation.
+#[allow(clippy::too_many_arguments)]
+fn constrained_active_backward<'py>(
+    py: Python<'py>,
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    weights: Option<ArrayView1<'_, f64>>,
+    a_inequality: ArrayView2<'_, f64>,
+    active_indices: ArrayView1<'_, u64>,
+    log_lambda_at_optimum: Option<f64>,
+    grad_coefficients: Option<ArrayView2<'_, f64>>,
+    grad_fitted: Option<ArrayView2<'_, f64>>,
+    grad_lambda: f64,
+    grad_log_lambda: f64,
+    grad_reml_score: f64,
+    grad_edf: f64,
+) -> PyResult<Py<PyDict>> {
+    let p = x.ncols();
+    if a_inequality.ncols() != p {
+        return Err(py_value_error(format!(
+            "a_inequality has {} cols; expected {p} to match X columns",
+            a_inequality.ncols(),
+        )));
+    }
+
+    // Assemble the active constraint rows `A_act` (m_act × p).
+    let mut a_act = Array2::<f64>::zeros((active_indices.len(), p));
+    for (out_row, &idx) in active_indices.iter().enumerate() {
+        let idx = idx as usize;
+        if idx >= a_inequality.nrows() {
+            return Err(py_value_error(format!(
+                "active index {idx} out of range for a_inequality with {} rows",
+                a_inequality.nrows(),
+            )));
+        }
+        a_act.row_mut(out_row).assign(&a_inequality.row(idx));
+    }
+
+    // `Z = null(A_act)`. `rrqr_nullspace_basis(M)` returns an orthonormal
+    // basis of `null(Mᵀ)`; feeding `A_actᵀ` (p × m_act, tall since p ≥ m_act
+    // at any valid cert) therefore yields `null((A_actᵀ)ᵀ) = null(A_act)` as a
+    // p×k orthonormal basis.
+    let a_act_t = a_act.t().to_owned();
+    let z = gam::faer_ndarray::rrqr_nullspace_basis(
+        &a_act_t,
+        gam::faer_ndarray::default_rrqr_rank_alpha(),
+    )
+    .map_err(|err| py_value_error(format!("failed to build tangent null-space basis Z: {err}")))?
+    .0;
+    let k = z.ncols();
+    if k == 0 {
+        // The active set pins β̂ to the origin: every sensitivity vanishes on
+        // the (empty) tangent space. The exact adjoint is the zero VJP.
+        let out = PyDict::new(py);
+        out.set_item("grad_x", Array2::<f64>::zeros(x.dim()).into_pyarray(py))?;
+        out.set_item("grad_y", Array2::<f64>::zeros(y.dim()).into_pyarray(py))?;
+        out.set_item("grad_penalty", Array2::<f64>::zeros((p, p)).into_pyarray(py))?;
+        out.set_item(
+            "grad_weights",
+            Array1::<f64>::zeros(x.nrows()).into_pyarray(py),
+        )?;
+        return Ok(out.unbind());
+    }
+
+    // Reduce the system to Z-coordinates: X_Z = X Z, S_Z = Zᵀ S Z.
+    let x_z = x.dot(&z);
+    let penalty_z = z.t().dot(&penalty).dot(&z);
+
+    // Pull upstream cotangents back through Z. The coefficient output is
+    // β̂ = Z γ̂, so its cotangent maps as `grad_γ = Zᵀ grad_β` (k × d). The
+    // fitted output (X_Z γ̂ = X β̂) and the outer scalars are unchanged.
+    let grad_coefficients_z: Option<Array2<f64>> =
+        grad_coefficients.map(|g| z.t().dot(&g));
+
+    // Chain `grad_log_lambda` onto `grad_lambda` via dlog λ/dλ = 1/λ, mirroring
+    // the interior branch (λ and log λ pull the same scalar).
+    let init_lambda = log_lambda_at_optimum.map(|rho| rho.exp());
+    let mut effective_grad_lambda = grad_lambda;
+    if grad_log_lambda != 0.0 {
+        let lam = init_lambda.unwrap_or(0.0);
+        if lam > 0.0 {
+            effective_grad_lambda += grad_log_lambda / lam;
+        } else {
+            return Err(py_value_error(
+                "gaussian_reml_fit_with_constraints_backward: grad_log_lambda is \
+                 non-zero but log_lambda_at_optimum is missing or λ ≤ 0; cannot \
+                 chain dlog λ/dλ = 1/λ."
+                    .to_string(),
+            ));
+        }
+    }
+
+    let y_owned = y.to_owned();
+    let weight_owned = weights.map(|w| w.to_owned());
+    let grad_fitted_owned = grad_fitted.map(|g| g.to_owned());
+    let backward = detach_pyresult(
+        py,
+        "gaussian_reml_fit_with_constraints_backward",
+        move || {
+            gaussian_reml_multi_closed_form_backward(
+                x_z.view(),
+                y_owned.view(),
+                penalty_z.view(),
+                weight_owned.as_ref().map(|w| w.view()),
+                init_lambda,
+                effective_grad_lambda,
+                grad_coefficients_z.as_ref().map(|g| g.view()),
+                grad_fitted_owned.as_ref().map(|g| g.view()),
+                grad_reml_score,
+                grad_edf,
+            )
+            .map_err(estimation_error_to_pyerr)
+        },
+    )?;
+
+    // Lift the reduced gradients back to full p-space.
+    //   X_Z = X Z    ⟹  grad_X = grad_X_Z Zᵀ      (n×p)
+    //   S_Z = Zᵀ S Z ⟹  grad_S = Z grad_S_Z Zᵀ    (p×p)
+    let grad_x = backward.grad_x.dot(&z.t());
+    let grad_penalty = z.dot(&backward.grad_penalty).dot(&z.t());
+
+    let out = PyDict::new(py);
+    out.set_item("grad_x", grad_x.into_pyarray(py))?;
+    out.set_item("grad_y", backward.grad_y.into_pyarray(py))?;
+    out.set_item("grad_penalty", grad_penalty.into_pyarray(py))?;
     out.set_item("grad_weights", backward.grad_weights.into_pyarray(py))?;
     Ok(out.unbind())
 }
