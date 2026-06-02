@@ -15010,6 +15010,24 @@ pub fn fit_transformation_normal(
     let analytic_psi_available =
         build_block_spatial_psi_derivatives(covariate_data, &boot_spec, &boot_design)?.is_some();
 
+    // Rebuild from the frozen `boot_spec` so the probe's penalty topology
+    // matches the topology produced by every other build path in this
+    // optimization. The outer optimizer's own bootstrap
+    // (`build_term_collection_designs_and_freeze_joint(data, &[boot_spec])`)
+    // and the geometry cache's `build_term_collection_design(_, &effective_spec)`
+    // both feed the basis builder a frozen `FrozenTransform` identifiability,
+    // while `boot_design` was built from the raw `covariate_spec` with
+    // identifiability computed from scratch. Applying the captured
+    // `FrozenTransform` to the same Duchon kernel can land the structural
+    // null-space block on either side of `build_nullspace_shrinkage_penalty`'s
+    // spectral tolerance, so the raw and frozen builds disagree on whether
+    // the trend ridge survives as an active penalty candidate. Without this
+    // rebuild, `n_penalties` is taken from the raw build but every subsequent
+    // evaluator measures the frozen build, and `evaluate_custom_family_joint_hyper`
+    // refuses with a `joint hyper rho dimension mismatch`.
+    let probe_design = build_term_collection_design(covariate_data, &boot_spec)
+        .map_err(|e| format!("failed to rebuild frozen probe covariate design: {e}"))?;
+
     // Build an initial family + blocks for capability probing.
     let probe_family = TransformationNormalFamily::from_prebuilt_response_basis(
         response,
@@ -15021,11 +15039,11 @@ pub fn fit_transformation_normal(
         resp_transform.clone(),
         weights,
         offset,
-        boot_design.design.clone(),
-        boot_design
+        probe_design.design.clone(),
+        probe_design
             .penalties
             .iter()
-            .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), boot_design.design.ncols()))
+            .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), probe_design.design.ncols()))
             .collect(),
         &effective_config,
         warm_start,
