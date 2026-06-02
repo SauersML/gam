@@ -9013,8 +9013,7 @@ impl<'a> RemlState<'a> {
         let mut grad = Array1::<f64>::zeros(k);
         for i in 0..nrows {
             let h_i = alo.leverage[i];
-            let dev_eta_grad =
-                -2.0 * self.weights[i] * (self.y[i] - alo.eta_tilde[i]) / phi_safe;
+            let dev_eta_grad = -2.0 * self.weights[i] * (self.y[i] - alo.eta_tilde[i]) / phi_safe;
             let b_prime = alo_leverage_barrier_derivative(h_i);
             for kk in 0..k {
                 let u_ik = deta_loo[[i, kk]];

@@ -22,12 +22,12 @@
 //! match the model's own fitted values), which can only hold if the per-level
 //! marginal dimension is replayed exactly.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 
 /// Build a dataset with `n_groups` groups and only `per_group` rows each — small
 /// enough to force the cubic-default B-spline marginal to auto-shrink its degree.

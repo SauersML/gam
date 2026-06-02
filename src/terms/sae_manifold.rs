@@ -8512,8 +8512,7 @@ mod tests {
             "psd_majorizer_hvp without a cache must be the zero block; got {pre:?}"
         );
 
-        let installed =
-            refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+        let installed = refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
         assert!(
             installed,
             "second-jet cache must install for the PSD-majorizer liveness test"

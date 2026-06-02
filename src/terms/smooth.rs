@@ -6,9 +6,8 @@ use crate::basis::{
     KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
     OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint,
-    build_bspline_basis_1d, build_duchon_basis, build_duchon_basis_log_kappa_derivatives,
-    build_duchon_basiswithworkspace, build_matern_basis,
+    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
+    build_duchon_basis_log_kappa_derivatives, build_duchon_basiswithworkspace, build_matern_basis,
     build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
     build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
     build_spherical_spline_basis, build_thin_plate_basis,
@@ -5814,7 +5813,9 @@ fn build_factor_smooth(
             ))
         })?;
         let start = level_idx * p;
-        dense.slice_mut(s![i, start..start + p]).assign(&base.row(i));
+        dense
+            .slice_mut(s![i, start..start + p])
+            .assign(&base.row(i));
     }
 
     // Penalties: replicate each marginal penalty into a block-diagonal

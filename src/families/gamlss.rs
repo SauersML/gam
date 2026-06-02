@@ -7987,7 +7987,11 @@ impl CustomFamily for GaussianLocationScaleFamily {
     fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
         // Two-channel families: `[mu, log_sigma]`. The optional trailing
         // zero-channel wiggle block (when present) also drives channel 0.
-        Some((0..specs.len()).map(|i| usize::from(i == Self::BLOCK_LOG_SIGMA)).collect())
+        Some(
+            (0..specs.len())
+                .map(|i| usize::from(i == Self::BLOCK_LOG_SIGMA))
+                .collect(),
+        )
     }
 
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {

@@ -84,9 +84,8 @@ use gam::terms::basis::{
     DuchonOperatorPenaltySpec, MaternBasisSpec, MaternIdentifiability, MaternNu,
     OneDimensionalBoundary, OperatorPenaltySpec, PeriodicBSplineBasisSpec, SpatialIdentifiability,
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
-    SplineScratch,
-    auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile, bspline_tensor_first_derivative,
-    build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
+    SplineScratch, auto_centers_1d_equal_mass, auto_knot_vector_1d_quantile,
+    bspline_tensor_first_derivative, build_duchon_basis, build_duchon_basis_mixed_periodicity_auto,
     build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
@@ -8952,7 +8951,10 @@ fn multinomial_model_metadata_pyfunc<'py>(
     out.set_item("n_active_classes", envelope.saved.n_active_classes)?;
     out.set_item("training_headers", envelope.saved.training_headers.clone())?;
     out.set_item("lambdas", envelope.saved.lambdas.clone())?;
-    out.set_item("lambdas_per_block", envelope.saved.lambdas_per_block.clone())?;
+    out.set_item(
+        "lambdas_per_block",
+        envelope.saved.lambdas_per_block.clone(),
+    )?;
     out.set_item("iterations", envelope.saved.iterations)?;
     out.set_item("converged", envelope.saved.converged)?;
     out.set_item(

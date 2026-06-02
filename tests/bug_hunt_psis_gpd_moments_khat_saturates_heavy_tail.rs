@@ -63,7 +63,8 @@ fn psis_gpd_khat_crosses_reliability_gate_on_heavy_tail() {
     let k_true = 0.8_f64;
     let sigma = 1.3_f64;
     let xs = deterministic_gpd_sample(100_000, k_true, sigma);
-    let (k_hat, _sigma_hat) = fit_gpd_moments(&xs).expect("GPD fit should succeed on positive data");
+    let (k_hat, _sigma_hat) =
+        fit_gpd_moments(&xs).expect("GPD fit should succeed on positive data");
     assert!(
         k_hat > 0.7,
         "heavy GPD tail k_true={k_true} reported as k_hat={k_hat:.4}: below the \
