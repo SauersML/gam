@@ -7997,35 +7997,6 @@ fn validate_dense_fisher_w(
     Ok(())
 }
 
-fn add_block_diagonal_penalty(
-    hessian: &mut Array2<f64>,
-    penalty: ArrayView2<'_, f64>,
-    lambda: f64,
-    n_outputs: usize,
-) -> Result<(), String> {
-    let k = penalty.ncols();
-    if penalty.nrows() != k {
-        return Err(format!(
-            "penalty must be square for dense Fisher fit; got {}x{}",
-            penalty.nrows(),
-            penalty.ncols()
-        ));
-    }
-    if hessian.dim() != (k * n_outputs, k * n_outputs) {
-        return Err("dense Fisher Hessian shape mismatch while adding penalty".to_string());
-    }
-    for output in 0..n_outputs {
-        let offset = output * k;
-        for row in 0..k {
-            for col in 0..k {
-                let s_sym = 0.5 * (penalty[[row, col]] + penalty[[col, row]]);
-                hessian[[offset + row, offset + col]] += lambda * s_sym;
-            }
-        }
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug)]
 struct LatentAuxStrengthState {
     log_mu: f64,
@@ -8190,42 +8161,22 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
             "init_lambda must be finite and positive for dense Fisher fit; got {lambda}"
         )));
     }
-    let mut hessian = gam::pirls::dense_block_xtwx(design, fisher_w, Some(row_weights.view()))
-        .map_err(|err| py_value_error(err.to_string()))?;
-    add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs).map_err(py_value_error)?;
-    let rhs = gam::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights.view()))
-        .map_err(|err| py_value_error(err.to_string()))?;
-    let beta_vec =
-        gam::linalg::utils::solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
-        .map_err(py_value_error)?;
-    let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
-    for output in 0..n_outputs {
-        for col in 0..k {
-            coefficients[[col, output]] = beta_vec[output * k + col];
-        }
-    }
-    let fitted = design.dot(&coefficients);
-    let mut sigma2 = Array1::<f64>::zeros(n_outputs);
-    let mut objective = latent_prior_score;
-    for row in 0..n_obs {
-        for a in 0..n_outputs {
-            let ra = y[[row, a]] - fitted[[row, a]];
-            sigma2[a] += row_weights[row] * ra * ra;
-            for b in 0..n_outputs {
-                objective += 0.5
-                    * row_weights[row]
-                    * ra
-                    * fisher_w[[row, a, b]]
-                    * (y[[row, b]] - fitted[[row, b]]);
-            }
-        }
-    }
-    for output in 0..n_outputs {
-        sigma2[output] /= (n_obs.saturating_sub(k).max(1)) as f64;
-        let beta_col = coefficients.column(output);
-        let s_beta = penalty.dot(&beta_col);
-        objective += 0.5 * lambda * beta_col.dot(&s_beta);
-    }
+    // Closed-form fixed-λ multi-output Gaussian fit under the dense Fisher-Rao
+    // metric lives in core; this shim validates inputs and packs the PyDict.
+    let fit = gam::solver::gaussian_reml::dense_fisher_gaussian_fit(
+        design,
+        y,
+        penalty,
+        row_weights.view(),
+        fisher_w,
+        lambda,
+        latent_prior_score,
+    )
+    .map_err(|err| py_value_error(err.to_string()))?;
+    let coefficients = fit.coefficients;
+    let fitted = fit.fitted;
+    let sigma2 = fit.sigma2;
+    let objective = fit.objective;
     let out = PyDict::new(py);
     out.set_item("status", "ok")?;
     out.set_item("lambda", lambda)?;
