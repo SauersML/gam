@@ -137,6 +137,15 @@ fn main() {
         &mut cargo_lint_allow_offenders,
     );
 
+    let gamfit_version =
+        read_gamfit_project_version(&manifest_dir).expect("failed to read gamfit version");
+    let mut gamfit_version_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_non_latest_gamfit_versions(
+        &manifest_dir,
+        &gamfit_version,
+        &mut gamfit_version_offenders,
+    );
+
     // `#[should_panic]` without `expected = "..."` catches any panic and
     // masks unrelated bugs. Require an `expected` string.
     let mut should_panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
@@ -398,6 +407,19 @@ fn main() {
         sections.push(Section {
             title: "Cargo.toml [lints.*] `allow` entry (manifest-level lint silencing banned — fix the code instead of disabling the lint)".to_string(),
             rows: cargo_lint_allow_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !gamfit_version_offenders.is_empty() {
+        sections.push(Section {
+            title: format!(
+                "non-latest gamfit version reference (expected {})",
+                gamfit_version
+            ),
+            rows: gamfit_version_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -736,6 +758,182 @@ fn manifest_const_bool(source: &str, key: &str) -> std::io::Result<bool> {
         std::io::ErrorKind::InvalidData,
         format!("missing manifest const {key}"),
     ))
+}
+
+fn read_gamfit_project_version(manifest_dir: &Path) -> std::io::Result<String> {
+    let path = manifest_dir.join("pyproject.toml");
+    let content = fs::read_to_string(&path)?;
+    read_toml_version_line(&content).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pyproject.toml is missing a top-level version",
+        )
+    })
+}
+
+fn scan_for_non_latest_gamfit_versions(
+    root: &Path,
+    latest: &str,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    require_toml_version(
+        root,
+        Path::new("crates/gam-pyffi/Cargo.toml"),
+        latest,
+        offenders,
+    );
+    require_uv_lock_gamfit_version(root, latest, offenders);
+
+    visit_files(root, root, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        scan_gamfit_version_content(rel, content, latest, offenders);
+    });
+}
+
+fn require_toml_version(
+    root: &Path,
+    rel: &Path,
+    latest: &str,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let path = root.join(rel);
+    let content = match fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(_) => {
+            offenders.push((
+                rel.to_path_buf(),
+                1,
+                format!("missing version file; expected gamfit {latest}"),
+            ));
+            return;
+        }
+    };
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("version = ") {
+            continue;
+        }
+        match read_quoted_value_after_prefix(trimmed, "version = ") {
+            Some(version) if version == latest => return,
+            Some(_) | None => {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+                return;
+            }
+        }
+    }
+    offenders.push((
+        rel.to_path_buf(),
+        1,
+        format!("missing version line; expected gamfit {latest}"),
+    ));
+}
+
+fn require_uv_lock_gamfit_version(
+    root: &Path,
+    latest: &str,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let rel = Path::new("uv.lock");
+    let content = match fs::read_to_string(root.join(rel)) {
+        Ok(content) => content,
+        Err(_) => {
+            offenders.push((
+                rel.to_path_buf(),
+                1,
+                format!("missing uv.lock gamfit package; expected {latest}"),
+            ));
+            return;
+        }
+    };
+
+    let mut inside_package = false;
+    let mut inside_gamfit = false;
+    for (idx, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed == "[[package]]" {
+            inside_package = true;
+            inside_gamfit = false;
+            continue;
+        }
+        if !inside_package {
+            continue;
+        }
+        if trimmed == "name = \"gamfit\"" {
+            inside_gamfit = true;
+            continue;
+        }
+        if inside_gamfit && trimmed.starts_with("version = ") {
+            match read_quoted_value_after_prefix(trimmed, "version = ") {
+                Some(version) if version == latest => return,
+                Some(_) | None => {
+                    offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+                    return;
+                }
+            }
+        }
+    }
+
+    offenders.push((
+        rel.to_path_buf(),
+        1,
+        format!("missing gamfit package version; expected {latest}"),
+    ));
+}
+
+fn read_toml_version_line(content: &str) -> Option<String> {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(version) = read_quoted_value_after_prefix(trimmed, "version = ") {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
+fn read_quoted_value_after_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(prefix)?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn gamfit_versions_in_line(line: &str) -> Vec<String> {
+    let mut versions = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(offset) = line[search_start..].find("0.1.") {
+        let start = search_start + offset;
+        let mut end = start + "0.1.".len();
+        while end < line.len() && line.as_bytes()[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > start + "0.1.".len() {
+            versions.push(line[start..end].to_string());
+        }
+        search_start = end;
+    }
+    versions
+}
+
+fn scan_gamfit_version_content(
+    rel: &Path,
+    content: &str,
+    latest: &str,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    for (line_idx, line) in content.lines().enumerate() {
+        let lower = line.to_ascii_lowercase();
+        if !lower.contains("gamfit") || !line.contains("0.1.") {
+            continue;
+        }
+        for version in gamfit_versions_in_line(line) {
+            if version != latest {
+                offenders.push((rel.to_path_buf(), line_idx + 1, line.to_string()));
+            }
+        }
+    }
 }
 
 /// One banned-pattern report section: a title plus the file/line rows that
@@ -2712,7 +2910,7 @@ fn scan_for_vendor_directories(
         // Skip the same housekeeping noise `visit_files` skips, so we don't
         // descend into `.git`, `target/`, or the lake/python caches just to
         // chase a phantom `vendor/`.
-        if name.starts_with('.')
+        if (name.starts_with('.') && name != ".github")
             || name == "target"
             || name.starts_with("target-")
             || name == "node_modules"
@@ -2760,7 +2958,7 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
         {
             continue;
         }
-        if name.starts_with('.')
+        if (name.starts_with('.') && name != ".github")
             || name == "target"
             || name.starts_with("target-")
             || name == "node_modules"
