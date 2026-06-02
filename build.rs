@@ -3932,6 +3932,13 @@ fn rel_path_is_scannable(rel: &Path) -> bool {
 const TO_DO_HISTORY_LEDGER_FILENAME: &str = "todo_history.txt";
 const FN_ANCHOR_PREFIX: &str = "fn ";
 const FILE_ANCHOR: &str = "file";
+/// Minimum normalized length of a marker's trailing description for the
+/// rename-evasion check to key on it. Below this a short, generic tail could
+/// collide with unrelated prose and false-positive.
+const MIN_REWORD_DESCRIPTION_LEN: usize = 24;
+/// How many recent commits the rename-evasion history walk inspects. Bounds the
+/// cost of the `git log -G` shell-out while covering realistic relabel windows.
+const TO_DO_HISTORY_GIT_DEPTH: usize = 120;
 
 #[derive(Clone)]
 struct ToDoHistorySite {
@@ -3970,6 +3977,12 @@ fn run_todo_marker_history_audit(
                 .or_insert(site);
         }
     }
+    // Recover markers that were relabelled away in recent commits. The ledger is
+    // gitignored (absent in a fresh CI clone) and git HEAD no longer carries the
+    // committed-away marker, so without this the rename-evasion would escape CI.
+    for (key, site) in collect_reworded_marker_sites_from_git_history(manifest_dir, needle) {
+        previous.entry(key).or_insert(site);
+    }
 
     let mut current_contents: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
@@ -3989,7 +4002,7 @@ fn run_todo_marker_history_audit(
         };
         let git_content = git_contents.get(&previous_site.file).map(String::as_str);
         if let Some((line_no, reason)) =
-            removed_todo_site_violation(current_content, git_content, previous_site)
+            removed_todo_site_violation(current_content, git_content, previous_site, needle)
         {
             violations.push((
                 PathBuf::from(&previous_site.file),
@@ -4071,11 +4084,218 @@ fn normalize_history_site_line(line: &str) -> String {
         .collect()
 }
 
+/// Lowercase a comment's prose, dropping comment punctuation and collapsing every
+/// run of non-alphanumeric characters to a single space, then trimming. Makes the
+/// rename-evasion comparison insensitive to comment style (`//` vs `#`), the
+/// leading `:` after a marker, and incidental spacing.
+fn normalize_marker_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = true;
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            for low in ch.to_lowercase() {
+                out.push(low);
+            }
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// The normalized human description trailing a marker token in `site_line`: the
+/// text after `needle`, with an optional leading `(qualifier)` and `:`/spacing
+/// stripped. `None` when there is no description to key on.
+fn marker_description(site_line: &str, needle: &str) -> Option<String> {
+    let pos = site_line.find(needle)?;
+    let after = site_line[pos + needle.len()..].trim_start();
+    let after = match after.strip_prefix('(') {
+        Some(rest) => match rest.find(')') {
+            Some(close) => &rest[close + 1..],
+            None => rest,
+        },
+        None => after,
+    };
+    let desc = normalize_marker_text(after);
+    if desc.is_empty() { None } else { Some(desc) }
+}
+
+/// True for a line that begins (after indentation) with a `//` or `#` line-comment
+/// lead-in, excluding Rust attributes (`#[...]`). Only a comment line can carry a
+/// relabelled marker; a description resurfacing inside real code is not one.
+fn line_is_comment_lead(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("//") || (t.starts_with('#') && !t.starts_with("#["))
+}
+
+/// Detect the rename-evasion: the marker token is gone from its recorded site, but
+/// the *deferred description* it carried still survives in a current comment line
+/// (relabelled — e.g. the `// TODO:` / `# TODO(x):` lead-in swapped for
+/// `# Known limitation`/`# Deferred`). Returns the 1-based line number of the
+/// surviving remnant. Independent of git HEAD, so committing the relabel away
+/// cannot escape it; gated on a reasonably specific description to avoid
+/// coincidental matches.
+fn reworded_marker_remnant_survives(
+    current_content: &str,
+    previous_site: &ToDoHistorySite,
+    needle: &str,
+) -> Option<usize> {
+    let description = marker_description(&previous_site.site, needle)?;
+    if description.len() < MIN_REWORD_DESCRIPTION_LEN {
+        return None;
+    }
+    for (idx, line) in current_content.lines().enumerate() {
+        if line.contains(needle) || !line_is_comment_lead(line) {
+            continue;
+        }
+        if normalize_marker_text(line).contains(&description) {
+            return Some(idx + 1);
+        }
+    }
+    None
+}
+
+/// Walk recent git history for marker lines that were *relabelled away* — a hunk
+/// that removed a marker-bearing line and, in the same hunk, added a line which
+/// preserves that line's description but no longer carries the marker. These are
+/// the rename-evasions that survive committing the change, so the working-tree +
+/// gitignored-ledger view (absent in a fresh CI clone) would otherwise miss them.
+/// Returned as history sites keyed like the ledger so they merge into `previous`.
+fn collect_reworded_marker_sites_from_git_history(
+    manifest_dir: &Path,
+    needle: &str,
+) -> std::collections::BTreeMap<(String, String, String), ToDoHistorySite> {
+    let mut out = std::collections::BTreeMap::new();
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("log")
+        .arg(format!("-n{TO_DO_HISTORY_GIT_DEPTH}"))
+        .arg(format!("-G{needle}"))
+        .arg("-p")
+        .arg("--no-color")
+        .arg("-U0")
+        .arg("--format=%n")
+        .arg("--")
+        .arg(".")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return out,
+    };
+    let text = match String::from_utf8(output.stdout) {
+        Ok(t) => t,
+        Err(_) => return out,
+    };
+
+    fn flush(
+        current_file: &Option<String>,
+        removed: &mut Vec<String>,
+        added: &mut Vec<String>,
+        needle: &str,
+        out: &mut std::collections::BTreeMap<(String, String, String), ToDoHistorySite>,
+    ) {
+        if let Some(rel) = current_file {
+            let rel_path = Path::new(rel);
+            let scannable = rel != "build.rs"
+                && !rel_path_is_skipped_for_scans(rel_path)
+                && rel_path_is_scannable(rel_path);
+            if scannable {
+                for removed_line in removed.iter() {
+                    if !removed_line.contains(needle) {
+                        continue;
+                    }
+                    let Some(desc) = marker_description(removed_line, needle) else {
+                        continue;
+                    };
+                    if desc.len() < MIN_REWORD_DESCRIPTION_LEN {
+                        continue;
+                    }
+                    let relabelled = added.iter().any(|added_line| {
+                        !added_line.contains(needle)
+                            && normalize_marker_text(added_line).contains(&desc)
+                    });
+                    if relabelled {
+                        let site = ToDoHistorySite {
+                            file: rel.clone(),
+                            anchor: FILE_ANCHOR.to_string(),
+                            site: normalize_history_site_line(removed_line),
+                            line_no: 0,
+                        };
+                        out.insert(
+                            (site.file.clone(), site.anchor.clone(), site.site.clone()),
+                            site,
+                        );
+                    }
+                }
+            }
+        }
+        removed.clear();
+        added.clear();
+    }
+
+    let mut current_file: Option<String> = None;
+    let mut removed: Vec<String> = Vec::new();
+    let mut added: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if line.starts_with("diff --git ") {
+            flush(&current_file, &mut removed, &mut added, needle, &mut out);
+            current_file = None;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            flush(&current_file, &mut removed, &mut added, needle, &mut out);
+            let rel = rest.trim();
+            current_file = if rel == "/dev/null" {
+                None
+            } else {
+                Some(rel.to_string())
+            };
+            continue;
+        }
+        if line.starts_with("@@") {
+            flush(&current_file, &mut removed, &mut added, needle, &mut out);
+            continue;
+        }
+        if line.starts_with("---") || line.starts_with("+++") {
+            continue;
+        }
+        if let Some(body) = line.strip_prefix('-') {
+            removed.push(body.to_string());
+        } else if let Some(body) = line.strip_prefix('+') {
+            added.push(body.to_string());
+        }
+    }
+    flush(&current_file, &mut removed, &mut added, needle, &mut out);
+    out
+}
+
 fn removed_todo_site_violation(
     current_content: &str,
     git_content: Option<&str>,
     previous_site: &ToDoHistorySite,
+    needle: &str,
 ) -> Option<(usize, String)> {
+    // Rename-evasion: the marker token is gone, but the description it carried
+    // still survives in a current comment (relabelled). Relabelling does not
+    // resolve the owed work, so it costs exactly what the marker did. Checked
+    // first and independent of git HEAD, so committing the relabel away cannot
+    // escape it.
+    if let Some(line_no) = reworded_marker_remnant_survives(current_content, previous_site, needle) {
+        return Some((
+            line_no,
+            "marker removed but its description survives reworded under a different \
+             label (rename-evasion) — implement the work or delete the whole note; \
+             relabelling the marker does not resolve it"
+                .to_string(),
+        ));
+    }
+
     if let Some(sig) = previous_site.anchor.strip_prefix(FN_ANCHOR_PREFIX) {
         if let Some(git_content) = git_content {
             if normalized_fn_body_code_without_comments(current_content, sig)

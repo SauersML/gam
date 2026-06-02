@@ -1,7 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array};
 
 use crate::geometry::manifold::{
-    GeometryResult, RiemannianManifold, check_len, identity, wrap_angle, zero_christoffel,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, identity, wrap_angle,
+    zero_christoffel,
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -73,6 +74,33 @@ impl RiemannianManifold for CircleManifold {
         check_len("Circle curvature point", point.len(), 1)?;
         check_len("Circle curvature tangent u", tangent_pair.0.len(), 1)?;
         check_len("Circle curvature tangent v", tangent_pair.1.len(), 1)?;
-        Ok(0.0)
+        // Sectional curvature is a function of a 2-plane in the tangent space:
+        // its denominator ‖u‖²‖v‖² − ⟨u,v⟩² is the squared area of the tangent
+        // parallelogram, which is identically 0 on a 1-D manifold (all tangents
+        // are collinear). The quantity is therefore *undefined* here — returning
+        // 0.0 would falsely report "flat", conflating the absence of a 2-plane
+        // with vanishing curvature.
+        Err(GeometryError::Unsupported(
+            "sectional curvature is undefined on a 1-dimensional manifold",
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CircleManifold;
+    use crate::geometry::manifold::{GeometryError, RiemannianManifold};
+    use ndarray::array;
+
+    #[test]
+    fn sectional_curvature_is_unsupported_in_one_dimension() {
+        let m = CircleManifold::new();
+        let point = array![0.3];
+        let u = array![1.0];
+        let v = array![1.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported on 1-D circle, got {other:?}"),
+        }
     }
 }

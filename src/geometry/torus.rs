@@ -1,7 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GeometryResult, RiemannianManifold, check_len, identity, wrap_angle, zero_christoffel,
+    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity,
+    wrap_angle, zero_christoffel,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +84,73 @@ impl RiemannianManifold for TorusManifold {
         check_len("Torus curvature point", point.len(), self.dim)?;
         check_len("Torus curvature tangent u", tangent_pair.0.len(), self.dim)?;
         check_len("Torus curvature tangent v", tangent_pair.1.len(), self.dim)?;
+        // Sectional curvature is defined only on a 2-plane in the tangent space.
+        // A torus of dimension < 2 has no such plane (all tangents collinear),
+        // so the quantity is undefined — returning 0.0 would falsely report
+        // "flat" rather than "no 2-plane exists".
+        if self.dim < 2 {
+            return Err(GeometryError::Unsupported(
+                "sectional curvature is undefined on a manifold of dimension below 2",
+            ));
+        }
+        // For dim ≥ 2 the flat torus has identically zero curvature on any
+        // *nondegenerate* tangent 2-plane. But the value is only defined when
+        // (u, v) actually span a plane: the parallelogram area
+        // ‖u‖²‖v‖² − ⟨u,v⟩² must be nonzero. A collinear (or zero) pair has zero
+        // area and the sectional curvature 0/0 is undefined.
+        let uu = dot(tangent_pair.0, tangent_pair.0);
+        let vv = dot(tangent_pair.1, tangent_pair.1);
+        let uv = dot(tangent_pair.0, tangent_pair.1);
+        let area_sq = uu * vv - uv * uv;
+        if area_sq <= GEOMETRY_EPS {
+            return Err(GeometryError::Singular(
+                "sectional curvature undefined for collinear/degenerate tangent pair",
+            ));
+        }
         Ok(0.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TorusManifold;
+    use crate::geometry::manifold::{GeometryError, RiemannianManifold};
+    use ndarray::array;
+
+    #[test]
+    fn sectional_curvature_is_unsupported_below_two_dimensions() {
+        let m = TorusManifold::new(1);
+        let point = array![0.3];
+        let u = array![1.0];
+        let v = array![1.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported on 1-D torus, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_is_singular_for_collinear_pair() {
+        let m = TorusManifold::new(2);
+        let point = array![0.1, 0.2];
+        let u = array![1.0, 0.0];
+        // v parallel to u (collinear): zero parallelogram area.
+        let v = array![2.0, 0.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Singular(_)) => {}
+            other => panic!("expected Singular for collinear pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_is_zero_for_independent_pair() {
+        let m = TorusManifold::new(2);
+        let point = array![0.1, 0.2];
+        let u = array![1.0, 0.0];
+        let v = array![0.0, 1.0];
+        let k = m
+            .sectional_curvature(point.view(), (u.view(), v.view()))
+            .expect("flat torus has defined curvature on a nondegenerate plane");
+        assert!(k.abs() <= 1.0e-12, "flat torus sectional curvature must be 0, got {k}");
     }
 }

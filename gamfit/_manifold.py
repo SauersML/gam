@@ -308,10 +308,291 @@ class CylinderManifold(_RustManifold):
         return f"CylinderManifold(open_dim={self._open})"
 
 
+class Grassmann(_RustManifold):
+    """The Grassmann manifold ``Gr(k, n)`` of ``k``-dimensional linear
+    subspaces of ``R^n``, represented by an ``n × k`` matrix with orthonormal
+    columns (a point on the manifold is the *column span*, so any two such
+    matrices related by a ``k × k`` orthogonal rotation denote the same point).
+
+    GEOMETRY PRIMITIVES ONLY. This descriptor exposes the intrinsic Riemannian
+    ``exp / log / metric / dimension / ambient_dim`` of ``gam::geometry::
+    GrassmannManifold`` (routed through the generic ``manifold_*`` FFI, which
+    parses the ``{"kind": "grassmann", ...}`` descriptor). It is *not* yet a
+    fittable latent smooth — wiring Grassmann into the penalized
+    ``Smooth(latent=..., basis=..., penalty=...)`` solver requires new Rust
+    solver work and is out of scope here.
+
+    A point / tangent is supplied to ``exp / log`` as a **flattened** length-
+    ``n*k`` vector (the ``n × k`` matrix in row-major order), matching the
+    Rust ``ambient_dim = n*k`` contract. The intrinsic dimension is
+    ``k * (n - k)``.
+    """
+
+    def __init__(self, k: int = 1, n: int = 2) -> None:
+        k_i, n_i = int(k), int(n)
+        if k_i < 1 or n_i < 1 or k_i > n_i:
+            raise ValueError(
+                "Grassmann requires 1 <= k <= n (Gr(k, n) is the set of "
+                f"k-dimensional subspaces of R^n); got k={k_i}, n={n_i}"
+            )
+        self.json = {"kind": "grassmann", "k": k_i, "n": n_i}
+        self._k = k_i
+        self._n = n_i
+        self._dim = k_i * (n_i - k_i)
+        self._ambient_dim = n_i * k_i
+
+    def __repr__(self) -> str:
+        return f"Grassmann(k={self._k}, n={self._n})"
+
+
+class Stiefel(_RustManifold):
+    """The (compact) Stiefel manifold ``St(n, k)`` of orthonormal ``k``-frames
+    in ``R^n``, represented by an ``n × k`` matrix with orthonormal columns
+    (here the matrix *itself* is the point — unlike Grassmann, frames differing
+    by a column rotation are distinct).
+
+    GEOMETRY PRIMITIVES ONLY. Exposes the intrinsic Riemannian
+    ``exp / log / metric / dimension / ambient_dim`` of ``gam::geometry::
+    StiefelManifold`` via the generic ``manifold_*`` FFI
+    (``{"kind": "stiefel", ...}``). Not yet a fittable latent smooth; the
+    penalized-smooth path needs new Rust solver work and is out of scope.
+
+    A point / tangent is supplied to ``exp / log`` as a **flattened** length-
+    ``n*k`` vector (the ``n × k`` matrix in row-major order), matching the Rust
+    ``ambient_dim = n*k`` contract. The intrinsic dimension is
+    ``n*k - k*(k+1)/2``.
+    """
+
+    def __init__(self, k: int = 1, n: int = 2) -> None:
+        k_i, n_i = int(k), int(n)
+        if k_i < 1 or n_i < 1 or k_i > n_i:
+            raise ValueError(
+                "Stiefel requires 1 <= k <= n (St(n, k) is the set of "
+                f"orthonormal k-frames in R^n); got k={k_i}, n={n_i}"
+            )
+        self.json = {"kind": "stiefel", "k": k_i, "n": n_i}
+        self._k = k_i
+        self._n = n_i
+        self._dim = n_i * k_i - k_i * (k_i + 1) // 2
+        self._ambient_dim = n_i * k_i
+
+    def __repr__(self) -> str:
+        return f"Stiefel(k={self._k}, n={self._n})"
+
+
+class Spd(_RustManifold):
+    """The manifold of ``n × n`` symmetric positive-definite matrices under the
+    affine-invariant Riemannian metric.
+
+    GEOMETRY PRIMITIVES ONLY. Exposes the intrinsic Riemannian
+    ``exp / log / metric / dimension / ambient_dim`` of ``gam::geometry::
+    SpdManifold`` via the generic ``manifold_*`` FFI (``{"kind": "spd", ...}``).
+    Not yet a fittable latent smooth; the penalized-smooth path needs new Rust
+    solver work and is out of scope.
+
+    A point / tangent is supplied to ``exp / log`` as a **flattened** length-
+    ``n*n`` vector (the ``n × n`` matrix in row-major order; points must be SPD,
+    tangents symmetric), matching the Rust ``ambient_dim = n*n`` contract. The
+    intrinsic dimension is ``n*(n+1)/2``.
+    """
+
+    def __init__(self, n: int = 2) -> None:
+        n_i = int(n)
+        if n_i < 1:
+            raise ValueError(f"Spd requires n >= 1; got n={n_i}")
+        self.json = {"kind": "spd", "n": n_i}
+        self._n = n_i
+        self._dim = n_i * (n_i + 1) // 2
+        self._ambient_dim = n_i * n_i
+
+    def __repr__(self) -> str:
+        return f"Spd(n={self._n})"
+
+
+class Poincare(ManifoldDescriptor):
+    """The Poincaré-ball model of hyperbolic space ``H^d`` (the open unit ball
+    in ``R^d`` with constant negative curvature ``c < 0``).
+
+    GEOMETRY PRIMITIVES ONLY. This descriptor exposes numpy-side hyperbolic
+    primitives — ``exp / log / distance / metric / project`` — built directly on
+    the registered ``poincare_*`` FFI (``gam::geometry::poincare``), so non-torch
+    users can reach hyperbolic geometry without going through
+    :class:`gamfit.torch.hyperbolic.PoincareAtoms`. It is *not* yet a fittable
+    latent smooth: the penalized ``Smooth(...)`` solver path for hyperbolic
+    latents needs new Rust solver work and is out of scope here.
+
+    Unlike the other descriptors in this module, the Poincaré model is *not*
+    routed through the generic JSON ``manifold_*`` FFI (which has no
+    ``"poincare"`` kind); every primitive delegates to the canonical
+    ``poincare_*`` Rust functions. The general (non-origin) exponential and
+    logarithm are composed *exactly* from the registered origin primitives via
+    Möbius addition, using the gyrovector identities (Ganea et al. 2018, with
+    their ``c > 0`` mapped to our ``c < 0``)::
+
+        lambda_p = 2 / (1 + c |p|^2)                       # conformal factor
+        exp_p(v) = p (+) exp_origin( (lambda_p / 2) v )
+        log_p(q) = (2 / lambda_p) log_origin( (-p) (+) q )
+
+    where ``(+)`` is :func:`poincare_mobius_add`. Both reduce to the registered
+    origin maps at ``p = 0`` (``lambda_0 = 2``). The Riemannian metric is
+    conformal to the Euclidean one, ``g_p = lambda_p^2 I``.
+
+    Points and tangents are length-``d`` vectors (a single point) or
+    ``(N, d)`` arrays (a batch, one point per row). Ambient and intrinsic
+    dimension are both ``d``.
+
+    Parameters
+    ----------
+    dim:
+        Ball dimension ``d`` (>= 1).
+    curvature:
+        Sectional curvature ``c``; must be strictly negative (default
+        ``-1.0``, matching :class:`gamfit.torch.hyperbolic.PoincareAtoms`).
+    """
+
+    def __init__(self, dim: int = 2, curvature: float = -1.0) -> None:
+        d = int(dim)
+        if d < 1:
+            raise ValueError(f"Poincare.dim must be >= 1; got {d}")
+        c = float(curvature)
+        if not np.isfinite(c) or c >= 0.0:
+            raise ValueError(
+                "Poincare requires strictly negative curvature (c < 0); "
+                f"got curvature={curvature!r}"
+            )
+        self._dim = d
+        self._ambient_dim = d
+        self.curvature = c
+
+    @property
+    def dimension(self) -> int:
+        return self._dim
+
+    @property
+    def ambient_dim(self) -> int:
+        return self._ambient_dim
+
+    def __repr__(self) -> str:
+        return f"Poincare(dim={self._dim}, curvature={self.curvature})"
+
+    # -- low-level single-point primitives (direct poincare_* FFI) --------
+    def _mobius_add(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
+        out = _rust_module().poincare_mobius_add(u, v, self.curvature)
+        return np.asarray(out, dtype=np.float64)
+
+    def _exp_origin(self, v: np.ndarray) -> np.ndarray:
+        out = _rust_module().poincare_exp_origin(v, self.curvature)
+        return np.asarray(out, dtype=np.float64)
+
+    def _log_origin(self, y: np.ndarray) -> np.ndarray:
+        out = _rust_module().poincare_log_origin(y, self.curvature)
+        return np.asarray(out, dtype=np.float64)
+
+    def _lambda(self, p: np.ndarray) -> float:
+        """Conformal factor ``lambda_p = 2 / (1 + c |p|^2)`` at ``p``."""
+        return 2.0 / (1.0 + self.curvature * float(np.dot(p, p)))
+
+    def _exp_one(self, p: np.ndarray, v: np.ndarray) -> np.ndarray:
+        return self._mobius_add(p, self._exp_origin(0.5 * self._lambda(p) * v))
+
+    def _log_one(self, p: np.ndarray, q: np.ndarray) -> np.ndarray:
+        neg_p = -p
+        return (2.0 / self._lambda(p)) * self._log_origin(self._mobius_add(neg_p, q))
+
+    def _distance_one(self, a: np.ndarray, b: np.ndarray) -> float:
+        return float(_rust_module().poincare_distance(a, b, self.curvature))
+
+    def _project_one(self, p: np.ndarray) -> np.ndarray:
+        out = _rust_module().poincare_project_into_ball(p, self.curvature)
+        return np.asarray(out, dtype=np.float64)
+
+    # -- batched ManifoldDescriptor surface -------------------------------
+    def exp(self, p: Any, v: Any) -> Any:
+        torch_mod = _maybe_import_torch()
+        p_2d, p_shape = _to_2d_numpy(p)
+        v_2d, _ = _to_2d_numpy(v)
+        out = np.stack(
+            [self._exp_one(p_2d[i], v_2d[i]) for i in range(p_2d.shape[0])]
+        )
+        if len(p_shape) == 1:
+            out = out.reshape(-1)
+        if torch_mod is not None and isinstance(p, torch_mod.Tensor):
+            return torch_mod.as_tensor(out, dtype=p.dtype, device=p.device)
+        return out
+
+    def log(self, p: Any, q: Any) -> Any:
+        torch_mod = _maybe_import_torch()
+        p_2d, p_shape = _to_2d_numpy(p)
+        q_2d, _ = _to_2d_numpy(q)
+        out = np.stack(
+            [self._log_one(p_2d[i], q_2d[i]) for i in range(p_2d.shape[0])]
+        )
+        if len(p_shape) == 1:
+            out = out.reshape(-1)
+        if torch_mod is not None and isinstance(p, torch_mod.Tensor):
+            return torch_mod.as_tensor(out, dtype=p.dtype, device=p.device)
+        return out
+
+    def distance(self, a: Any, b: Any) -> Any:
+        """Geodesic (hyperbolic) distance ``d_c(a, b)`` via
+        :func:`poincare_distance`. Scalar for two single points, else a length-
+        ``N`` array of per-row distances."""
+        torch_mod = _maybe_import_torch()
+        a_2d, a_shape = _to_2d_numpy(a)
+        b_2d, _ = _to_2d_numpy(b)
+        dists = np.array(
+            [self._distance_one(a_2d[i], b_2d[i]) for i in range(a_2d.shape[0])],
+            dtype=np.float64,
+        )
+        if len(a_shape) == 1:
+            scalar = float(dists[0])
+            if torch_mod is not None and isinstance(a, torch_mod.Tensor):
+                return torch_mod.as_tensor(scalar, dtype=a.dtype, device=a.device)
+            return scalar
+        if torch_mod is not None and isinstance(a, torch_mod.Tensor):
+            return torch_mod.as_tensor(dists, dtype=a.dtype, device=a.device)
+        return dists
+
+    def metric(self, p: Any) -> Any:
+        """Conformal Poincaré metric ``g_p = lambda_p^2 I`` at ``p`` (a
+        ``(d, d)`` SPD matrix). Built from the conformal factor; no separate
+        FFI tensor call is needed because the metric is closed-form diagonal."""
+        torch_mod = _maybe_import_torch()
+        p_arr, _ = _to_2d_numpy(p)
+        point = p_arr[0]
+        lam = self._lambda(point)
+        g = (lam * lam) * np.eye(self._dim, dtype=np.float64)
+        if torch_mod is not None and isinstance(p, torch_mod.Tensor):
+            return torch_mod.as_tensor(g, dtype=p.dtype, device=p.device)
+        return g
+
+    def project(self, p: Any) -> Any:
+        """Clamp ``p`` strictly inside the ball via
+        :func:`poincare_project_into_ball` (a no-op for already-interior
+        points). Accepts a single point or an ``(N, d)`` batch."""
+        torch_mod = _maybe_import_torch()
+        p_2d, p_shape = _to_2d_numpy(p)
+        out = np.stack([self._project_one(p_2d[i]) for i in range(p_2d.shape[0])])
+        if len(p_shape) == 1:
+            out = out.reshape(-1)
+        if torch_mod is not None and isinstance(p, torch_mod.Tensor):
+            return torch_mod.as_tensor(out, dtype=p.dtype, device=p.device)
+        return out
+
+
+# Backwards-readable hyperbolic alias.
+Hyperbolic = Poincare
+
+
 __all__ = [
     "Euclidean",
     "Circle",
     "Sphere",
     "Torus",
     "CylinderManifold",
+    "Grassmann",
+    "Stiefel",
+    "Spd",
+    "Poincare",
+    "Hyperbolic",
 ]

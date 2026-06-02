@@ -197,6 +197,30 @@ class SkipAffineSmooth(nn.Module):
         y_hat = z @ self.W_dec + self.skip_term(x_in) + self.b_out
         return y_hat, z
 
+    def sparsity_penalty(self, x_in: torch.Tensor) -> torch.Tensor:
+        """JumpReLU sparsity penalty on the pre-activation latents.
+
+        Evaluates ``JumpReLUPenalty`` (weight ``= lambda_sparse``) on the
+        pre-gate code ``z_pre = encode(x_in)``. This is the term that trades
+        fidelity against sparsity in :meth:`loss`; its scale IS the module's
+        ``lambda_sparse`` so different ``lambda_sparse`` give different values.
+        """
+        z_pre = self.encode(x_in)
+        return self.jumprelu(z_pre)
+
+    def loss(self, x_in: torch.Tensor, y_out: torch.Tensor) -> torch.Tensor:
+        """Canonical training objective: reconstruction MSE + sparsity penalty.
+
+        ``loss = mean((y_hat - y_out) ** 2) + jumprelu_penalty(z_pre)`` where the
+        JumpReLU penalty already carries ``weight = lambda_sparse`` (set in
+        ``__init__``). The sparse weight is therefore genuinely in the objective:
+        two modules built with different ``lambda_sparse`` produce different
+        ``loss`` on the same ``(x_in, y_out)``.
+        """
+        y_hat, _ = self.forward(x_in)
+        recon = torch.mean((y_hat - y_out) ** 2)
+        return recon + self.sparsity_penalty(x_in)
+
     # --------------------------------------------------------------
     # Convenience: attribution-graph edge weights at JumpReLU-active points
     # --------------------------------------------------------------
