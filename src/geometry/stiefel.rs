@@ -99,8 +99,12 @@ impl RiemannianManifold for StiefelManifold {
             self.n,
             self.k,
         )?;
-        let a = y.t().dot(&delta); // k×k skew-symmetric
-        let normal = &delta - &y.dot(&a); // (I − YYᵀ)Δ
+        // YᵀΔ (k×n · n×k) and Y·A (n×k · k×k) both carry the large ambient
+        // dimension n, so route them through the GPU-dispatched fast_atb/fast_ab
+        // shims; small frames stay on faer.
+        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        let a = fast_atb(&y, &delta); // k×k skew-symmetric
+        let normal = &delta - &fast_ab(&y, &a); // (I − YYᵀ)Δ
         let (q, r) = qr_thin(&normal); // n×k, k×k
 
         // Block generator [[A, −Rᵀ], [R, 0]] of size 2k×2k.
@@ -116,18 +120,13 @@ impl RiemannianManifold for StiefelManifold {
         let exp_block = matrix_exp(&block)?;
 
         // Result = [Y Q] · exp_block[:, 0..k]; only the first k columns of the
-        // exponential survive against the [[I_k], [0]] selector.
-        let mut result = Array2::<f64>::zeros((self.n, self.k));
-        for col in 0..self.k {
-            for row in 0..self.n {
-                let mut acc = 0.0;
-                for s in 0..self.k {
-                    acc += y[[row, s]] * exp_block[[s, col]];
-                    acc += q[[row, s]] * exp_block[[self.k + s, col]];
-                }
-                result[[row, col]] = acc;
-            }
-        }
+        // exponential survive against the [[I_k], [0]] selector, so this splits
+        // into Y·exp_block[0..k, 0..k] + Q·exp_block[k.., 0..k] — two n×k · k×k
+        // products carrying the large ambient dimension n, GPU-dispatched via
+        // fast_ab.
+        let top = exp_block.slice(ndarray::s![0..self.k, 0..self.k]);
+        let bot = exp_block.slice(ndarray::s![self.k..two_k, 0..self.k]);
+        let result = &fast_ab(&y, &top) + &fast_ab(&q, &bot);
         Ok(flatten(&result))
     }
 
@@ -195,14 +194,13 @@ impl RiemannianManifold for StiefelManifold {
         }
         let y = from_flat(point, self.n, self.k)?;
         // M = I_n − ½ Y Yᵀ (n×n, symmetric positive definite for Yᵀ Y = I_k).
+        // Y Yᵀ (n×k · k×n) carries the large ambient dimension n, GPU-dispatched
+        // via fast_abt.
+        let yyt = crate::linalg::faer_ndarray::fast_abt(&y, &y);
         let mut m = identity(self.n);
         for i in 0..self.n {
             for p in 0..self.n {
-                let mut yyt = 0.0;
-                for s in 0..self.k {
-                    yyt += y[[i, s]] * y[[p, s]];
-                }
-                m[[i, p]] -= 0.5 * yyt;
+                m[[i, p]] -= 0.5 * yyt[[i, p]];
             }
         }
         // G = M ⊗ I_k in the row-major flattened basis.
@@ -264,9 +262,13 @@ impl RiemannianManifold for StiefelManifold {
         point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
+        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
         let y = from_flat(point, self.n, self.k)?;
         let z = from_flat(vec, self.n, self.k)?;
-        let correction = y.dot(&sym(&y.t().dot(&z)));
+        // Tangent projection z − Y·sym(Yᵀz): YᵀZ (k×n · n×k) and Y·S (n×k · k×k)
+        // both carry the large ambient dimension n, GPU-dispatched via
+        // fast_atb/fast_ab.
+        let correction = fast_ab(&y, &sym(&fast_atb(&y, &z)));
         Ok(flatten(&(z - correction)))
     }
 
@@ -315,12 +317,16 @@ impl RiemannianManifold for StiefelManifold {
         let two_k = 2 * k;
 
         // ── Recompute the forward intermediates exactly as `exp_map` does. ──
+        // Every dense product below either contracts or carries the large
+        // ambient dimension n (k×n · n×k or n×k · k×k); route them all through
+        // the GPU-dispatched fast_ab/fast_atb/fast_abt shims.
+        use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
         let y = from_flat(point, self.n, k)?;
         let z = from_flat(tangent_vec, self.n, k)?; // raw (unprojected) input
-        let s_proj = sym(&y.t().dot(&z)); // S = sym(Yᵀz)
-        let delta = &z - &y.dot(&s_proj); // Δ = z − Y·S
-        let a = y.t().dot(&delta); // A = YᵀΔ (skew)
-        let normal = &delta - &y.dot(&a); // (I − YYᵀ)Δ
+        let s_proj = sym(&fast_atb(&y, &z)); // S = sym(Yᵀz)
+        let delta = &z - &fast_ab(&y, &s_proj); // Δ = z − Y·S
+        let a = fast_atb(&y, &delta); // A = YᵀΔ (skew)
+        let normal = &delta - &fast_ab(&y, &a); // (I − YYᵀ)Δ
         let (q, r) = qr_thin(&normal); // n×k, k×k upper-triangular
 
         let mut block = Array2::<f64>::zeros((two_k, two_k));
@@ -339,13 +345,13 @@ impl RiemannianManifold for StiefelManifold {
         // M_tl = exp_block[0:k, 0:k], M_bl = exp_block[k:2k, 0:k].
         let m_tl = exp_block.slice(ndarray::s![0..k, 0..k]).to_owned();
         let m_bl = exp_block.slice(ndarray::s![k..two_k, 0..k]).to_owned();
-        let mut y_bar = grad.dot(&m_tl.t()); // Ȳ += Ḡ·M_tlᵀ
-        let q_bar = grad.dot(&m_bl.t()); // Q̄ = Ḡ·M_blᵀ
+        let mut y_bar = fast_abt(&grad, &m_tl); // Ȳ += Ḡ·M_tlᵀ
+        let q_bar = fast_abt(&grad, &m_bl); // Q̄ = Ḡ·M_blᵀ
 
         // M̄ (2k×2k): top-left = Yᵀ·Ḡ, bottom-left = Qᵀ·Ḡ, rest zero.
         let mut m_bar = Array2::<f64>::zeros((two_k, two_k));
-        let yt_g = y.t().dot(&grad);
-        let qt_g = q.t().dot(&grad);
+        let yt_g = fast_atb(&y, &grad);
+        let qt_g = fast_atb(&q, &grad);
         for i in 0..k {
             for j in 0..k {
                 m_bar[[i, j]] = yt_g[[i, j]];
@@ -372,19 +378,19 @@ impl RiemannianManifold for StiefelManifold {
 
         // ── Step 3 (normal = Δ − Y·A). ──
         let mut delta_bar = normal_bar.clone();
-        y_bar = y_bar - &normal_bar.dot(&a.t()); // Ȳ += −normal̄·Aᵀ
-        a_bar = a_bar - &y.t().dot(&normal_bar); // Ā += −(Yᵀ·normal̄)
+        y_bar = y_bar - &fast_abt(&normal_bar, &a); // Ȳ += −normal̄·Aᵀ
+        a_bar = a_bar - &fast_atb(&y, &normal_bar); // Ā += −(Yᵀ·normal̄)
 
         // ── Step 2 (A = Yᵀ·Δ). ──
-        y_bar = y_bar + &delta.dot(&a_bar.t()); // Ȳ += Δ·Āᵀ
-        delta_bar = delta_bar + &y.dot(&a_bar); // Δ̄ += Y·Ā
+        y_bar = y_bar + &fast_abt(&delta, &a_bar); // Ȳ += Δ·Āᵀ
+        delta_bar = delta_bar + &fast_ab(&y, &a_bar); // Δ̄ += Y·Ā
 
         // ── Step 1 (Δ = z − Y·sym(Yᵀz)). ──
         // z̄ = Δ̄ − Y·sym(Yᵀ·Δ̄)
         // Ȳ += −Δ̄·S − z·sym(Yᵀ·Δ̄)
-        let sym_yt_db = sym(&y.t().dot(&delta_bar));
-        let z_bar = &delta_bar - &y.dot(&sym_yt_db);
-        y_bar = y_bar - &delta_bar.dot(&s_proj) - &z.dot(&sym_yt_db);
+        let sym_yt_db = sym(&fast_atb(&y, &delta_bar));
+        let z_bar = &delta_bar - &fast_ab(&y, &sym_yt_db);
+        y_bar = y_bar - &fast_ab(&delta_bar, &s_proj) - &fast_ab(&z, &sym_yt_db);
 
         Ok((flatten(&y_bar), flatten(&z_bar)))
     }
@@ -445,7 +451,8 @@ fn qr_thin_vjp(
 ) -> GeometryResult<Array2<f64>> {
     let k = r.nrows();
     // Mqr = Rᵀ·R̄ − Q̄ᵀ·Q  (k×k).
-    let mqr = r.t().dot(r_bar) - q_bar.t().dot(q);
+    use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+    let mqr = r.t().dot(r_bar) - fast_atb(q_bar, q);
     // copyltu: symmetric matrix from the lower triangle of Mqr.
     let mut sym_low = Array2::<f64>::zeros((k, k));
     for i in 0..k {
@@ -459,7 +466,7 @@ fn qr_thin_vjp(
         }
     }
     // RHS = Q̄ + Q·copyltu(Mqr)  (n×k).
-    let rhs = q_bar + &q.dot(&sym_low);
+    let rhs = q_bar + &fast_ab(q, &sym_low);
     // Solve normal̄·Rᵀ = RHS for normal̄ (so normal̄ = RHS·R⁻ᵀ). `R` is upper
     // triangular, hence `Rᵀ` is lower triangular, so column `j` of the product
     // couples columns `l ≥ j` of normal̄:
