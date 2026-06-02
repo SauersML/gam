@@ -61,6 +61,29 @@ pub struct ScoreRow {
     pub effective_dof: Option<f64>,
 }
 
+/// Log Bayes factor of model `a` over model `b`, computed from the minimised
+/// REML/LAML costs the optimiser stores on each fit.
+///
+/// `reml_score` is a penalised *negative* log marginal likelihood plus a
+/// Laplace correction — a cost the optimiser minimises, so **lower is better**.
+/// Under the Laplace approximation the log marginal likelihood of a fit is
+/// `-reml_score` up to common normalising constants, hence
+///
+/// ```text
+/// log BF(a over b) = log P(D|a) − log P(D|b) = (−score_a) − (−score_b)
+///                  = score_b − score_a.
+/// ```
+///
+/// `exp` of this is `> 1` exactly when `a` is the better-supported (lower-cost)
+/// model. This is the single source of truth for the cost→Bayes-factor sign
+/// convention: both [`compare_reml_fits`] and the Python `bayes_factor_vs`
+/// entry point route through it, so the two can never disagree on direction
+/// (the failure mode of issue #575, the mirror image of the #396 inversion).
+#[inline]
+pub fn log_bayes_factor(reml_score_a: f64, reml_score_b: f64) -> f64 {
+    reml_score_b - reml_score_a
+}
+
 pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlComparison, String> {
     if candidates.is_empty() {
         return Err("compare_models requires at least one fit".to_string());
@@ -81,10 +104,10 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
 
     for row in candidates.iter() {
         // `delta = row.score - best_score ≥ 0` is the cost gap from the
-        // winner. Under the Laplace approximation that gap equals
-        // log(P(D|winner)/P(D|row)) up to common normalising constants, so
-        // its exponential is the Bayes factor in favour of the winner.
-        let delta = row.score - best_score;
+        // winner, i.e. the log Bayes factor in favour of the winner over this
+        // row. Routed through the shared `log_bayes_factor` so the comparator
+        // and the FFI `bayes_factor_vs` cannot drift apart on sign.
+        let delta = log_bayes_factor(best_score, row.score);
         let bayes_factor = delta.exp();
         ranking.push(RankedRow {
             name: row.name.clone(),
@@ -104,7 +127,7 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
 
     let evidence_summary = if candidates.len() >= 2 {
         let runner_up = &candidates[1];
-        let best_log_bayes_factor_vs_runner_up = runner_up.score - best_score;
+        let best_log_bayes_factor_vs_runner_up = log_bayes_factor(best_score, runner_up.score);
         format!(
             "{} wins by Bayes factor {} over {}",
             winner,
@@ -173,7 +196,45 @@ pub fn format_three_significant(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{RemlCandidate, compare_reml_fits};
+    use super::{RemlCandidate, compare_reml_fits, log_bayes_factor};
+
+    /// The cost→Bayes-factor convention: `reml_score` is a minimised cost, so
+    /// the log BF of `a` over `b` is `score_b - score_a`, which is `> 0`
+    /// exactly when `a` is the lower-cost (better) model. This is the single
+    /// source of truth both the comparator and the FFI `bayes_factor_vs`
+    /// route through; locking it here pins issue #575's direction.
+    #[test]
+    fn log_bayes_factor_favours_lower_cost_model() {
+        // `a` is the better fit (lower cost) -> log BF(a over b) > 0.
+        let better = 311.06_f64;
+        let worse = 815.71_f64;
+        assert!(log_bayes_factor(better, worse) > 0.0);
+        assert!(log_bayes_factor(better, worse).exp() > 1.0);
+        // Reciprocity: BF(b over a) is the exact negative on the log scale.
+        assert!((log_bayes_factor(worse, better) + log_bayes_factor(better, worse)).abs() < 1e-12);
+        assert!(log_bayes_factor(worse, better) < 0.0);
+        // Equal-cost models are indistinguishable: log BF = 0, BF = 1.
+        assert_eq!(log_bayes_factor(5.0, 5.0), 0.0);
+        // The comparator's per-row Bayes factor must equal `exp(log BF of the
+        // winner over the row)` for the same scores.
+        let comparison = compare_reml_fits(vec![
+            RemlCandidate {
+                index: 0,
+                name: "better".to_string(),
+                score: better,
+                edf: None,
+            },
+            RemlCandidate {
+                index: 1,
+                name: "worse".to_string(),
+                score: worse,
+                edf: None,
+            },
+        ])
+        .expect("finite candidates compare");
+        let row = &comparison.ranking[1];
+        assert!((row.delta - log_bayes_factor(better, worse)).abs() < 1e-12);
+    }
 
     /// The optimiser stores a minimised REML cost on each fit; the lowest
     /// cost should win, with `delta = row.score - best_score ≥ 0` and the

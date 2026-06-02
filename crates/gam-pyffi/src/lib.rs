@@ -75,7 +75,9 @@ use gam::smooth::{
     freeze_term_collection_from_design,
 };
 use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
-use gam::solver::reml_compare::{RemlCandidate, compare_reml_fits as compare_reml_fits_core};
+use gam::solver::reml_compare::{
+    RemlCandidate, compare_reml_fits as compare_reml_fits_core, log_bayes_factor,
+};
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
 use gam::terms::basis::{
     BasisOptions, CenterStrategy, Dense, DuchonBasisSpec, DuchonNullspaceOrder,
@@ -2790,7 +2792,12 @@ fn bayes_factor_log_diff(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyRe
         fit_result_from_saved_model_for_prediction(&model_a).map_err(PyValueError::new_err)?;
     let fit_b =
         fit_result_from_saved_model_for_prediction(&model_b).map_err(PyValueError::new_err)?;
-    Ok(fit_a.reml_score - fit_b.reml_score)
+    // `reml_score` is a minimised cost (lower = better marginal likelihood),
+    // so the log Bayes factor of A over B is `score_b - score_a`, not
+    // `score_a - score_b`. Route through the shared convention so this agrees
+    // with `compare_reml_fits` (issue #575: the raw subtraction was inverted,
+    // reporting overwhelming evidence for the worse-fitting model).
+    Ok(log_bayes_factor(fit_a.reml_score, fit_b.reml_score))
 }
 
 #[pyfunction]

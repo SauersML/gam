@@ -398,11 +398,21 @@ class Model:
 
     @property
     def evidence(self) -> float:
-        """REML / LAML log marginal-likelihood score for this fit."""
+        """Minimised REML / LAML cost for this fit (penalised negative log
+        marginal likelihood plus Laplace correction). It is a *cost*, so
+        **lower is better** -- the model with the smaller ``evidence`` is the
+        better-supported one. Use :meth:`bayes_factor_vs` or
+        ``gamfit.compare_models`` for a direct comparison.
+        """
         return float(rust_module().model_evidence(self._model_bytes))
 
     def bayes_factor_vs(self, other: "Model") -> float:
-        """Bayes factor of this fit against ``other``."""
+        """Bayes factor of this fit against ``other``.
+
+        Returns ``> 1`` when this fit is better supported than ``other``
+        (i.e. has the lower :attr:`evidence` cost) and ``< 1`` otherwise,
+        agreeing with the winner reported by ``gamfit.compare_models``.
+        """
         # allow-list (a): FFI input validation.
         if not isinstance(other, Model):
             raise TypeError(
