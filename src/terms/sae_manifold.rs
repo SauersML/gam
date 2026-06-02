@@ -5139,15 +5139,30 @@ impl SaeManifoldTerm {
     fn accumulate_decoder_gram(&self, grams: &mut [Array2<f64>]) {
         let n = self.n_obs();
         let assignments = self.assignment.assignments();
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+        // Each atom's Gram `G_k = Φ_kᵀ diag(a_k²) Φ_k` is an independent
+        // weighted cross-product over the N rows — the canonical `xt_diag_x`
+        // shape, and independent across the per-atom axis. This feeds a
+        // tolerance-based identifiability RANK decision (not a fitted quantity),
+        // so the device path's accumulation order is admissible.
+        //
+        // Spread the atoms across EVERY device via `gpu::pool::scatter_batched`;
+        // each device tile computes its atoms' Grams through the size-gated
+        // `try_fast_xt_diag_x` shim. Atoms whose device path declines (no
+        // runtime, sub-threshold size, or backend miss) drop to the exact CPU
+        // rank-1 accumulation, so the result matches the all-CPU path.
+        let weights: Vec<Array1<f64>> = (0..self.atoms.len())
+            .map(|atom_idx| {
+                let col = assignments.column(atom_idx);
+                col.mapv(|a| a * a)
+            })
+            .collect();
+
+        // CPU per-atom contribution, used for fallback and as the whole path
+        // when no GPU runtime is present.
+        let cpu_one = |atom_idx: usize, gram: &mut Array2<f64>| {
+            let atom = &self.atoms[atom_idx];
             let m = atom.basis_size();
-            if m == 0 {
-                continue;
-            }
             let assign_col = assignments.column(atom_idx);
-            let gram = &mut grams[atom_idx];
-            // G_k += Σ_row a_row² · φ_row φ_rowᵀ. Hoist the weighted row into a
-            // scratch vector so the rank-1 update is one O(M²) pass per row.
             let mut weighted = vec![0.0_f64; m];
             for row in 0..n {
                 let a_k = assign_col[row];
@@ -5164,6 +5179,70 @@ impl SaeManifoldTerm {
                     }
                     for j in 0..m {
                         gram[[i, j]] += wi * weighted[j];
+                    }
+                }
+            }
+        };
+
+        let rt = crate::gpu::runtime::GpuRuntime::global();
+        match rt {
+            None => {
+                for atom_idx in 0..self.atoms.len() {
+                    if self.atoms[atom_idx].basis_size() == 0 {
+                        continue;
+                    }
+                    cpu_one(atom_idx, &mut grams[atom_idx]);
+                }
+            }
+            Some(rt) => {
+                // Device tiles produce each owned atom's Gram into a side channel
+                // keyed by atom index; splice them back into `grams` (with `+=`
+                // accumulation) after the scatter. Atoms the device declines are
+                // marked so the CPU fallback runs for exactly those.
+                let mut items: Vec<usize> = (0..self.atoms.len())
+                    .filter(|&i| self.atoms[i].basis_size() > 0)
+                    .collect();
+                let device_grams: std::sync::Mutex<Vec<(usize, Array2<f64>)>> =
+                    std::sync::Mutex::new(Vec::with_capacity(items.len()));
+                let declined: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+                let atoms_ref = &self.atoms;
+                let weights_ref = &weights;
+                let ok = crate::gpu::pool::scatter_batched(rt, &mut items, |_ordinal, slice| {
+                    for &atom_idx in slice.iter() {
+                        let phi = atoms_ref[atom_idx].basis_values.view();
+                        let w = weights_ref[atom_idx].view();
+                        match crate::gpu::linalg::try_fast_xt_diag_x(phi, w) {
+                            Some(g) => device_grams
+                                .lock()
+                                .expect("device_grams mutex poisoned")
+                                .push((atom_idx, g)),
+                            None => declined
+                                .lock()
+                                .expect("declined mutex poisoned")
+                                .push(atom_idx),
+                        }
+                    }
+                    Some(())
+                });
+                match ok {
+                    Some(()) => {
+                        for (atom_idx, g) in device_grams
+                            .into_inner()
+                            .expect("device_grams mutex poisoned")
+                        {
+                            grams[atom_idx] += &g;
+                        }
+                        for atom_idx in declined.into_inner().expect("declined mutex poisoned") {
+                            cpu_one(atom_idx, &mut grams[atom_idx]);
+                        }
+                    }
+                    None => {
+                        for atom_idx in 0..self.atoms.len() {
+                            if self.atoms[atom_idx].basis_size() == 0 {
+                                continue;
+                            }
+                            cpu_one(atom_idx, &mut grams[atom_idx]);
+                        }
                     }
                 }
             }
