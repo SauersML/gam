@@ -12489,6 +12489,64 @@ fn build_latent_outer_manifold(
         .map_err(|err| err.to_string())
 }
 
+/// Build the restart-0 start for the latent outer optimizer from a spectral
+/// (Laplacian-eigenmaps) embedding of the responses `y`.
+///
+/// The embedding recovers the intrinsic coordinate up to monotone/rotation
+/// gauge; each axis is then affinely mapped from `[0, 1]` onto the span of the
+/// decoder `centers` for that axis so the seed lands where the basis `Φ` is
+/// well-conditioned. The seed is defined for the flat Euclidean latent (the
+/// default manifold); on a curved latent manifold (circle/sphere/torus) the
+/// embedding's scale and gauge are not directly comparable, so the caller's `t`
+/// is used unchanged and the optimizer relies on the caller's warm start.
+fn latent_spectral_seed_start(
+    y: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    manifold: &str,
+    n_obs: usize,
+    latent_dim: usize,
+    seed_neighbors: usize,
+    caller_t: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let manifold_norm = manifold.to_ascii_lowercase().replace('-', "_");
+    if !matches!(manifold_norm.as_str(), "euclidean" | "rn") {
+        return Ok(caller_t.to_owned());
+    }
+    if y.nrows() != n_obs {
+        return Err(format!(
+            "spectral seed: y has {} rows but n_obs = {n_obs}",
+            y.nrows()
+        ));
+    }
+    // Too few rows to expose `latent_dim` non-trivial modes: fall back to the
+    // caller's start rather than failing the whole optimize call.
+    if n_obs < latent_dim + 2 {
+        return Ok(caller_t.to_owned());
+    }
+    let coords = gam::geometry::laplacian_eigenmap_coords(y, latent_dim, seed_neighbors)?;
+    // Per-axis target span from the decoder centers; fall back to [0, 1] when an
+    // axis has no corresponding center column or a degenerate span.
+    let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
+    for a in 0..latent_dim {
+        let (lo, hi) = if a < centers.ncols() {
+            let col = centers.column(a);
+            let lo = col.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = col.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if lo.is_finite() && hi.is_finite() && hi > lo {
+                (lo, hi)
+            } else {
+                (0.0, 1.0)
+            }
+        } else {
+            (0.0, 1.0)
+        };
+        for n in 0..n_obs {
+            start[n * latent_dim + a] = lo + coords[[n, a]] * (hi - lo);
+        }
+    }
+    Ok(start)
+}
+
 /// Optimize the latent coordinate `t` against the Gaussian-REML objective.
 ///
 /// Unlike [`gaussian_reml_fit_latent`], which performs a single `β | t` inner
@@ -12500,10 +12558,14 @@ fn build_latent_outer_manifold(
 /// converged latent* plus the optimized `t`/`latent` arrays.
 ///
 /// The latent REML objective is non-convex (a GP-LVM-style coordinate problem),
-/// so a single cold random start may settle in a poor local optimum. Pass
-/// `n_restarts > 1` to optimize from `n_restarts` perturbed starts (seeded by
-/// `seed`) and keep the lowest-score result, or warm-start `t` near a good
-/// configuration.
+/// so a single cold random start may settle in a poor local optimum. By default
+/// (`init="spectral"`) restart 0 starts from a Laplacian-eigenmaps embedding of
+/// the responses, which recovers the intrinsic coordinate up to gauge and lets
+/// the optimizer polish it to the global fit instead of sorting rows from
+/// scratch; the passed-in `t` is then only a fallback (too few rows, or a
+/// non-Euclidean `manifold`). Pass `init="caller"` to start from `t` unchanged
+/// (a pure local solve / explicit warm start), and `n_restarts > 1` to also
+/// optimize from perturbed starts and keep the lowest-score result.
 #[pyfunction(signature = (
     t,
     y,
@@ -12532,6 +12594,8 @@ fn build_latent_outer_manifold(
     n_restarts = 1,
     restart_scale = 0.25,
     seed = 0,
+    init = "spectral".to_string(),
+    seed_neighbors = 10,
 ))]
 fn gaussian_reml_optimize_latent<'py>(
     py: Python<'py>,
@@ -12562,6 +12626,8 @@ fn gaussian_reml_optimize_latent<'py>(
     n_restarts: usize,
     restart_scale: f64,
     seed: u64,
+    init: String,
+    seed_neighbors: usize,
 ) -> PyResult<Py<PyDict>> {
     use rand::SeedableRng;
     use rand_distr::Distribution;
@@ -12589,6 +12655,28 @@ fn gaussian_reml_optimize_latent<'py>(
             t_values.len()
         )));
     }
+    // Choose the base start for restart 0 (further restarts perturb it). A
+    // spectral seed escapes the random-init local optimum that leaves the outer
+    // optimizer stuck (#627); `"caller"` keeps the passed-in `t` unchanged for
+    // callers that already have a good warm start or want a pure local solve.
+    let base_start = match init.to_ascii_lowercase().as_str() {
+        "caller" | "warm" | "passthrough" => t_values.clone(),
+        "spectral" | "laplacian" | "eigenmap" => latent_spectral_seed_start(
+            y.as_array(),
+            centers.as_array(),
+            &manifold,
+            n_obs,
+            latent_dim,
+            seed_neighbors,
+            t_values.view(),
+        )
+        .map_err(py_value_error)?,
+        other => {
+            return Err(py_value_error(format!(
+                "init must be 'spectral' or 'caller'; got {other:?}"
+            )));
+        }
+    };
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let fisher_values = fisher_w.as_ref().map(|w| w.as_array().to_owned());
     let effective_weights = latent_scalar_weights_with_fisher(
@@ -12633,9 +12721,9 @@ fn gaussian_reml_optimize_latent<'py>(
         grad_tol,
     };
 
-    // Restart 0 always starts from the caller's `t`; further restarts perturb it
-    // in the tangent space and retract back onto the manifold, then we keep the
-    // lowest-score converged latent.
+    // Restart 0 starts from `base_start` (the spectral seed, or the caller's `t`
+    // when `init="caller"`); further restarts perturb it in the tangent space and
+    // retract back onto the manifold, then we keep the lowest-score latent.
     let (best_t, best_value) = py
         .detach(|| -> Result<(Array1<f64>, f64), String> {
             let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
@@ -12645,14 +12733,15 @@ fn gaussian_reml_optimize_latent<'py>(
             let mut best: Option<(Array1<f64>, f64)> = None;
             for restart in 0..n_restarts {
                 let start = if restart == 0 {
-                    t_values.clone()
+                    base_start.clone()
                 } else {
-                    let noise = Array1::from_shape_fn(t_values.len(), |_| normal.sample(&mut rng));
+                    let noise =
+                        Array1::from_shape_fn(base_start.len(), |_| normal.sample(&mut rng));
                     let tangent = manifold_ref
-                        .project_tangent(t_values.view(), noise.view())
+                        .project_tangent(base_start.view(), noise.view())
                         .map_err(|err| err.to_string())?;
                     manifold_ref
-                        .retract(t_values.view(), tangent.view())
+                        .retract(base_start.view(), tangent.view())
                         .map_err(|err| err.to_string())?
                 };
                 let mut objective = LatentOuterObjective { problem: &problem };
@@ -12734,6 +12823,7 @@ fn gaussian_reml_optimize_latent<'py>(
     out.set_item("converged", grad_t_norm <= grad_tol)?;
     out.set_item("objective_value", best_value)?;
     out.set_item("n_restarts", n_restarts)?;
+    out.set_item("init", init)?;
     Ok(out.unbind())
 }
 
