@@ -320,8 +320,16 @@ mod tests {
             }
             1.0 - sse / sst
         };
-        assert!(r2_of(&ta) > 0.95, "true axis a not recovered: R²={}", r2_of(&ta));
-        assert!(r2_of(&tb) > 0.95, "true axis b not recovered: R²={}", r2_of(&tb));
+        assert!(
+            r2_of(&ta) > 0.95,
+            "true axis a not recovered: R²={}",
+            r2_of(&ta)
+        );
+        assert!(
+            r2_of(&tb) > 0.95,
+            "true axis b not recovered: R²={}",
+            r2_of(&tb)
+        );
     }
 
     #[test]

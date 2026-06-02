@@ -3,8 +3,9 @@ use faer::Side;
 use gam::basis::create_duchon_basis_1d_derivative_dense;
 use gam::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::estimate::{
-    BlockRole, EstimationError, ExternalOptimOptions, optimize_external_designwith_heuristic_lambdas,
-    saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
+    BlockRole, EstimationError, ExternalOptimOptions,
+    optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
+    saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 use gam::faer_ndarray::{
     FaerCholesky, array2_to_matmut, factorize_symmetricwith_fallback, fast_ata, fast_atb,
@@ -12578,9 +12579,9 @@ fn gaussian_reml_optimize_latent<'py>(
     if n_restarts == 0 {
         return Err(py_value_error("n_restarts must be at least 1".to_string()));
     }
-    let expected = n_obs.checked_mul(latent_dim).ok_or_else(|| {
-        py_value_error("n_obs * latent_dim overflows usize".to_string())
-    })?;
+    let expected = n_obs
+        .checked_mul(latent_dim)
+        .ok_or_else(|| py_value_error("n_obs * latent_dim overflows usize".to_string()))?;
     let t_values = t.as_array().to_owned();
     if t_values.len() != expected {
         return Err(py_value_error(format!(
@@ -12599,7 +12600,9 @@ fn gaussian_reml_optimize_latent<'py>(
     let dim_selection_values = dim_selection_log_precision
         .as_ref()
         .map(|a| a.as_array().to_owned());
-    let tensor_knots_values = tensor_knots_concat.as_ref().map(|a| a.as_array().to_owned());
+    let tensor_knots_values = tensor_knots_concat
+        .as_ref()
+        .map(|a| a.as_array().to_owned());
 
     let problem = LatentOuterProblem {
         y: y.as_array().to_owned(),
@@ -12677,8 +12680,7 @@ fn gaussian_reml_optimize_latent<'py>(
     // identical schema [`gaussian_reml_fit_latent`] returns, then echo `t`. The
     // detached fit closure must be `'static`, so move owned copies in (the
     // problem's array buffers are no longer needed on this thread afterwards).
-    let latent_payload =
-        serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
+    let latent_payload = serde_json::json!({"t": {"name": "t", "n": n_obs, "d": latent_dim}});
     let LatentOuterProblem {
         y,
         centers,
@@ -31760,7 +31762,11 @@ mod tests {
         // the trivial atom-label permutation.
         let mut acc_direct = 0usize;
         for i in 0..n {
-            let winner = if logits[[i, 0]] >= logits[[i, 1]] { 0 } else { 1 };
+            let winner = if logits[[i, 0]] >= logits[[i, 1]] {
+                0
+            } else {
+                1
+            };
             if winner == assign[i] {
                 acc_direct += 1;
             }
