@@ -5645,6 +5645,21 @@ impl OuterObjective for SaeManifoldOuterObjective {
     }
 
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        // Contract (see src/solver/reml/continuation.rs:727-737): an empty-β
+        // seed means "no warm-start available, use your own cold default" and
+        // MUST be accepted as a no-op. The continuation pre-warm forwards the
+        // previous eval's `inner_beta_hint`, but before the first accepted eval
+        // that hint is empty (`state.last_beta` starts empty). Rejecting it
+        // fatally dropped every continuation seed and forced a full cold solve
+        // on every outer seed — the slowness in gam#577. Only a *populated* β
+        // must match the decoder dimension.
+        if beta.is_empty() {
+            // NoSlot is the documented continuation reply for "no usable seed;
+            // proceed cold, no log" (outer_strategy.rs:1776). The real β slot
+            // gets populated on the next accepted eval, which publishes
+            // `inner_beta_hint`, so steps 2+ warm-start normally.
+            return Ok(SeedOutcome::NoSlot);
+        }
         if beta.len() != self.term.beta_dim() {
             return Err(EstimationError::RemlOptimizationFailed(format!(
                 "SaeManifoldOuterObjective::seed_inner_state: β length {} != decoder dim {}",
