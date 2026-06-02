@@ -849,7 +849,10 @@ mod qr_thin_tests {
         a[[1, 1]] = 1.0;
         let (q, r) = qr_thin(&a);
         // Deficient second column ⇒ R[1,1] = 0.
-        assert!(r[[1, 1]].abs() <= 1.0e-14, "deficient column must set R[1,1]=0");
+        assert!(
+            r[[1, 1]].abs() <= 1.0e-14,
+            "deficient column must set R[1,1]=0"
+        );
         let gram = q.t().dot(&q);
         for i in 0..2 {
             for j in 0..2 {
@@ -878,7 +881,10 @@ mod qr_thin_tests {
         for i in 0..2 {
             for j in 0..2 {
                 let want = if i == j { 1.0 } else { 0.0 };
-                assert!((gram[[i, j]] - want).abs() <= 1.0e-12, "QᵀQ != I at ({i},{j})");
+                assert!(
+                    (gram[[i, j]] - want).abs() <= 1.0e-12,
+                    "QᵀQ != I at ({i},{j})"
+                );
             }
         }
         let recon = q.dot(&r);

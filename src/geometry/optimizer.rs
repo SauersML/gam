@@ -24,11 +24,7 @@ pub trait RiemannianObjective {
         // Validate the shapes the contract requires (a tangent at `point`), then
         // report "no curvature available" so the trust region selects the
         // Cauchy point. We never fabricate a Hessian here.
-        check_len(
-            "hessian_vector_product tangent",
-            tangent.len(),
-            point.len(),
-        )?;
+        check_len("hessian_vector_product tangent", tangent.len(), point.len())?;
         Ok(None)
     }
 }
@@ -197,9 +193,7 @@ impl RiemannianTrustRegion {
 
         // Probe for curvature once: if the objective exposes no Hessian–vector
         // product we take the Cauchy point.
-        let has_hessian = objective
-            .hessian_vector_product(x, grad)?
-            .is_some();
+        let has_hessian = objective.hessian_vector_product(x, grad)?.is_some();
 
         if !has_hessian {
             return self.cauchy_point(manifold, x, grad, delta);
@@ -218,11 +212,11 @@ impl RiemannianTrustRegion {
         // m(z) = g(grad,z) + ½ g(z,Hz); we recompute it at the end for ρ.
         let max_cg = 2 * n + 1;
         for _ in 0..max_cg {
-            let hp = objective
-                .hessian_vector_product(x, p.view())?
-                .ok_or(crate::geometry::manifold::GeometryError::Unsupported(
+            let hp = objective.hessian_vector_product(x, p.view())?.ok_or(
+                crate::geometry::manifold::GeometryError::Unsupported(
                     "Hessian–vector product became unavailable mid-subproblem",
-                ))?;
+                ),
+            )?;
             let php = g_inner(manifold, x, p.view(), hp.view())?;
             if php <= 0.0 {
                 // Negative curvature: go to the boundary along p.
@@ -314,11 +308,11 @@ fn model_reduction(
     eta: ArrayView1<'_, f64>,
 ) -> GeometryResult<f64> {
     let lin = g_inner(manifold, x, grad, eta)?;
-    let heta = objective
-        .hessian_vector_product(x, eta)?
-        .ok_or(crate::geometry::manifold::GeometryError::Unsupported(
+    let heta = objective.hessian_vector_product(x, eta)?.ok_or(
+        crate::geometry::manifold::GeometryError::Unsupported(
             "Hessian–vector product unavailable while scoring the model",
-        ))?;
+        ),
+    )?;
     let quad = g_inner(manifold, x, eta, heta.view())?;
     Ok(-lin - 0.5 * quad)
 }
@@ -475,8 +469,7 @@ impl RiemannianLBFGS {
             // old gradient is likewise transported to T_{x}M before subtraction.
             let path = transport_path(&old_x, &x);
             let s = manifold.parallel_transport(path.view(), eta.view())?;
-            let transported_old_grad =
-                manifold.parallel_transport(path.view(), old_grad.view())?;
+            let transported_old_grad = manifold.parallel_transport(path.view(), old_grad.view())?;
             let y = &grad - &transported_old_grad;
             // Commit the (s, y) pair only when the metric curvature condition
             // g_x(s, y) > 0 holds (strict positivity). This is required for the
@@ -630,7 +623,9 @@ mod tests {
         };
         let mut obj = Square;
         let x0 = Array1::from_vec(vec![0.1]);
-        let x = tr.minimize(&manifold, &mut obj, x0.view()).expect("TR runs");
+        let x = tr
+            .minimize(&manifold, &mut obj, x0.view())
+            .expect("TR runs");
         assert!(
             x[0].abs() < 1.0e-6,
             "trust region must converge to 0, got {}",
@@ -658,7 +653,9 @@ mod tests {
         // must strictly decrease.
         let x0 = Array1::from_vec(vec![0.1]);
         let f0 = obj.value_gradient(x0.view()).unwrap().0;
-        let x1 = tr.minimize(&manifold, &mut obj, x0.view()).expect("TR runs");
+        let x1 = tr
+            .minimize(&manifold, &mut obj, x0.view())
+            .expect("TR runs");
         let f1 = obj.value_gradient(x1.view()).unwrap().0;
         assert!(f1 <= f0, "objective increased: {f0} -> {f1}");
         assert!(x1[0].abs() <= x0[0].abs() + 1e-15, "moved away from min");
@@ -678,7 +675,9 @@ mod tests {
         };
         let mut obj = SquareGradOnly;
         let x0 = Array1::from_vec(vec![0.1]);
-        let x = tr.minimize(&manifold, &mut obj, x0.view()).expect("TR runs");
+        let x = tr
+            .minimize(&manifold, &mut obj, x0.view())
+            .expect("TR runs");
         assert!(
             x[0].abs() < 1.0e-6,
             "Cauchy-point trust region must converge to 0, got {}",
@@ -691,11 +690,7 @@ mod tests {
     #[test]
     fn trust_region_solves_spd_quadratic() {
         let manifold = EuclideanManifold::new(3);
-        let a = ndarray::array![
-            [4.0, 1.0, 0.0],
-            [1.0, 3.0, 1.0],
-            [0.0, 1.0, 2.0],
-        ];
+        let a = ndarray::array![[4.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0],];
         let b = Array1::from_vec(vec![1.0, 2.0, -1.0]);
         // Reference solution A x = b.
         let x_ref = crate::geometry::manifold::inverse(&a).unwrap().dot(&b);
@@ -707,7 +702,9 @@ mod tests {
             grad_tol: 1.0e-12,
         };
         let x0 = Array1::from_vec(vec![0.0, 0.0, 0.0]);
-        let x = tr.minimize(&manifold, &mut obj, x0.view()).expect("TR runs");
+        let x = tr
+            .minimize(&manifold, &mut obj, x0.view())
+            .expect("TR runs");
         for i in 0..3 {
             assert!(
                 (x[i] - x_ref[i]).abs() < 1.0e-6,
@@ -723,11 +720,7 @@ mod tests {
     #[test]
     fn lbfgs_reduces_euclidean_quadratic() {
         let manifold = EuclideanManifold::new(3);
-        let a = ndarray::array![
-            [5.0, 1.0, 0.5],
-            [1.0, 4.0, 1.0],
-            [0.5, 1.0, 3.0],
-        ];
+        let a = ndarray::array![[5.0, 1.0, 0.5], [1.0, 4.0, 1.0], [0.5, 1.0, 3.0],];
         let b = Array1::from_vec(vec![2.0, -1.0, 0.5]);
         let x_ref = crate::geometry::manifold::inverse(&a).unwrap().dot(&b);
         let mut obj = Quadratic { a, b };

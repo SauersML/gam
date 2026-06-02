@@ -5994,8 +5994,9 @@ fn fill_assignment_logit_jvp_rows(
                 if !jumprelu_in_optimization_band(logits[logit_col], threshold, temperature) {
                     continue;
                 }
-                let activation =
-                    crate::linalg::utils::stable_logistic((logits[logit_col] - threshold) * inv_tau);
+                let activation = crate::linalg::utils::stable_logistic(
+                    (logits[logit_col] - threshold) * inv_tau,
+                );
                 let da = activation * (1.0 - activation) * inv_tau;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = da * decoded[[logit_col, out_col]];
@@ -6139,7 +6140,8 @@ fn assignment_prior_grad_hdiag(
                 if !jumprelu_in_optimization_band(logit, threshold, temperature) {
                     continue;
                 }
-                let activation = crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+                let activation =
+                    crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 g[idx] = sparsity_strength * slope * inv_tau;
                 d[idx] = sparsity_strength * slope * slope * inv_tau2;
@@ -6570,7 +6572,11 @@ mod tests {
         // Just above threshold the centered surrogate is ≈ 0.5; the old
         // uncentered surrogate would have been σ(2.0) ≈ 0.88.
         assert_abs_diff_eq!(gates[0], 0.5, epsilon = 1e-3);
-        assert!(gates[0] < 0.6, "surrogate not centered at threshold: {}", gates[0]);
+        assert!(
+            gates[0] < 0.6,
+            "surrogate not centered at threshold: {}",
+            gates[0]
+        );
         // Strictly below the threshold the gate is hard-zero.
         assert_abs_diff_eq!(gates[1], 0.0, epsilon = 1e-12);
     }
@@ -8011,7 +8017,8 @@ mod tests {
             // prior gradient. Softmax identifiability is handled by its
             // reference-logit chart, not by adding curvature to gate logits.
             let sparsity = if jumprelu_in_optimization_band(logit, threshold, temperature) {
-                let activation = crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+                let activation =
+                    crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
                 sparsity_strength * slope * slope * inv_tau2
             } else {

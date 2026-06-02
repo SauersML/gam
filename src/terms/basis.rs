@@ -21813,7 +21813,9 @@ fn spherical_harmonic_jet(
         crate::bail_invalid_basis!("spherical-harmonic jet max_degree must be >= 1");
     }
     if max_degree > 32 {
-        crate::bail_invalid_basis!("spherical-harmonic jet max_degree {max_degree} too large; cap is 32");
+        crate::bail_invalid_basis!(
+            "spherical-harmonic jet max_degree {max_degree} too large; cap is 32"
+        );
     }
     let n = data.nrows();
     let p = max_degree * (max_degree + 2);
@@ -21840,8 +21842,8 @@ fn spherical_harmonic_jet(
                 for (local_i, mut out_row) in block.outer_iter_mut().enumerate() {
                     let i = row_offset + local_i;
                     let lat_raw = data[(i, 0)] * deg;
-                    let lat = lat_raw
-                        .clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+                    let lat =
+                        lat_raw.clamp(-std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
                     let lon = data[(i, 1)] * deg;
                     let cos_lat = lat.cos();
                     let x = lat.sin();
@@ -21854,8 +21856,7 @@ fn spherical_harmonic_jet(
                     }
                     p_buf[idx(0, 0)] = 1.0;
                     for m in 1..=max_degree {
-                        p_buf[idx(m, m)] =
-                            -((2 * m - 1) as f64) * somx2 * p_buf[idx(m - 1, m - 1)];
+                        p_buf[idx(m, m)] = -((2 * m - 1) as f64) * somx2 * p_buf[idx(m - 1, m - 1)];
                     }
                     for m in 0..max_degree {
                         p_buf[idx(m + 1, m)] = ((2 * m + 1) as f64) * x * p_buf[idx(m, m)];
@@ -21895,8 +21896,7 @@ fn spherical_harmonic_jet(
                             let nlm = norms[idx(l, m_pos)];
                             let mf = m_pos as f64;
                             // ∂/∂φ = N·sin(mψ)·P'·cosφ ; ∂/∂ψ = N·m cos(mψ)·P.
-                            out_row[[col, 0]] =
-                                nlm * sin_buf[m_pos] * dp(l, m_pos) * cos_lat * deg;
+                            out_row[[col, 0]] = nlm * sin_buf[m_pos] * dp(l, m_pos) * cos_lat * deg;
                             out_row[[col, 1]] =
                                 nlm * mf * cos_buf[m_pos] * p_buf[idx(l, m_pos)] * deg;
                             col += 1;
