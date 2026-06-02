@@ -509,6 +509,13 @@ def test_predict_point_estimate_is_invariant_to_interval_request() -> None:
     is the cleanest: there is no link nonlinearity to justify any correction),
     and on identity-link Gaussian the un-shifted plug-in estimate is also the
     one that matches ground truth.
+
+    The invariant point itself is the SPEC default: for a curved inverse link
+    it is the posterior mean ``E[g⁻¹(Xβ)]`` (matching the ``gam predict`` CLI
+    default), not the plug-in mode ``g⁻¹(Xβ̂)``. The binomial/logit case below
+    additionally asserts the reported mean really is that integrated posterior
+    mean — it differs from the naive ``sigmoid(linear_predictor)`` and is pulled
+    toward 0.5 by Jensen's inequality.
     """
     rng = np.random.default_rng(11)
     n = 2000
@@ -578,6 +585,23 @@ def test_predict_point_estimate_is_invariant_to_interval_request() -> None:
         assert np.all(lower <= interval_mean + 1e-9)
         assert np.all(interval_mean <= upper + 1e-9)
         assert np.all(np.asarray(tab["std_error"], dtype=float) > 0.0)
+
+        # SPEC: the default point estimate is the posterior mean, not the
+        # plug-in mode. For the logit link this is observable: the reported
+        # ``mean`` is the coefficient-uncertainty-integrated ``E[sigmoid(η)]``,
+        # which differs from the naive plug-in ``sigmoid(η̂)`` (bit-identical to
+        # what the old plug-in path emitted) and is shrunk toward 0.5 by
+        # Jensen's inequality on the sigmoid.
+        if name == "binomial":
+            plugin_prob = 1.0 / (1.0 + np.exp(-plain_lp))
+            assert not np.allclose(plain, plugin_prob, atol=1e-6), (
+                "binomial default predict must be the posterior mean "
+                "E[sigmoid(η)], not the plug-in sigmoid(η̂)"
+            )
+            assert np.all(np.abs(plain - 0.5) <= np.abs(plugin_prob - 0.5) + 1e-9), (
+                "posterior-mean probabilities must be pulled toward 0.5 "
+                "relative to the plug-in"
+            )
 
         # On identity-link Gaussian, the (now un-shifted) plug-in estimate is
         # the one that tracks the truth; a recentred estimate measurably
