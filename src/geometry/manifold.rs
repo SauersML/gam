@@ -234,7 +234,10 @@ pub(crate) fn dot(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
 /// can support while keeping each tile a non-trivial GEMM, so the batch axis is
 /// long enough to cross `crate::gpu::linalg`'s multi-GPU batch floor and spread
 /// across every device.
-pub(crate) fn fast_ab_rows_multi_gpu(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Array2<f64> {
+pub(crate) fn fast_ab_rows_multi_gpu(
+    a: ArrayView2<'_, f64>,
+    b: ArrayView2<'_, f64>,
+) -> Array2<f64> {
     use crate::linalg::faer_ndarray::fast_ab;
     let (m, k) = a.dim();
     let (kb, n) = b.dim();
@@ -243,8 +246,8 @@ pub(crate) fn fast_ab_rows_multi_gpu(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f
     // Only worth the reshape/stitch overhead when the pool actually has more than
     // one device and there are enough rows to tile across it; otherwise the plain
     // single-device shim is strictly better.
-    let multi_gpu = crate::gpu::runtime::GpuRuntime::global()
-        .is_some_and(|rt| rt.device_count() > 1);
+    let multi_gpu =
+        crate::gpu::runtime::GpuRuntime::global().is_some_and(|rt| rt.device_count() > 1);
     // The batch axis must clear the multi-GPU floor used inside the dispatch
     // layer (64) for the split to engage, so we need at least that many tiles.
     const MIN_TILES: usize = 64;
@@ -260,7 +263,8 @@ pub(crate) fn fast_ab_rows_multi_gpu(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f
             .to_owned()
             .into_shape_with_order((tiles, rows_per_tile, k));
         if let Ok(a3) = a3 {
-            if let Some(result3) = crate::gpu::try_fast_ab_broadcast_b_batched(a3.view(), b.view()) {
+            if let Some(result3) = crate::gpu::try_fast_ab_broadcast_b_batched(a3.view(), b.view())
+            {
                 let mut out = Array2::<f64>::zeros((m, n));
                 for t in 0..tiles {
                     let block = result3.index_axis(ndarray::Axis(0), t);

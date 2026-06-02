@@ -574,7 +574,7 @@ mod cuda {
         bump: Option<f64>,
         // Tile-level reduction, written into the tile's first slot only.
         tile_partial_schur: Option<Vec<f64>>, // k*k col-major, = Σ Y_iᵀY_i
-        tile_partial_rhs: Option<Vec<f64>>,    // k, = Σ Y_iᵀu_i
+        tile_partial_rhs: Option<Vec<f64>>,   // k, = Σ Y_iᵀu_i
         // Back-sub output for this row.
         delta_t_block: Vec<f64>, // d
     }
@@ -778,9 +778,7 @@ mod cuda {
 
     /// Tile starts: the leading global row index of each device tile (where the
     /// tile-level partial reduction was written by the forward pass).
-    fn tile_starts(
-        tiles: &[(usize, std::ops::Range<usize>)],
-    ) -> impl Iterator<Item = usize> + '_ {
+    fn tile_starts(tiles: &[(usize, std::ops::Range<usize>)]) -> impl Iterator<Item = usize> + '_ {
         tiles.iter().map(|(_, range)| range.start)
     }
 
@@ -797,8 +795,8 @@ mod cuda {
         }
         // `scatter_batched` has already bound this ordinal's context on this
         // worker thread; the stream below targets that same device.
-        let stream = crate::gpu::runtime::cuda_context_for(ordinal)
-            .and_then(|ctx| ctx.new_stream().ok())?;
+        let stream =
+            crate::gpu::runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
         let solver = DnHandle::new(stream.clone()).ok()?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
         let m = tile.len();
@@ -879,8 +877,8 @@ mod cuda {
         }
         // `scatter_batched` has already bound this ordinal's context on this
         // worker thread; the stream below targets that same device.
-        let stream = crate::gpu::runtime::cuda_context_for(ordinal)
-            .and_then(|ctx| ctx.new_stream().ok())?;
+        let stream =
+            crate::gpu::runtime::cuda_context_for(ordinal).and_then(|ctx| ctx.new_stream().ok())?;
         let blas = CudaBlas::new(stream.clone()).ok()?;
         let m = tile.len();
 
