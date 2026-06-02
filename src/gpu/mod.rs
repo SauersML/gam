@@ -29,6 +29,7 @@ pub mod numerics_device;
 pub mod numerics_host;
 pub mod pirls_row;
 pub mod policy;
+pub mod pool;
 pub mod polya_gamma;
 pub mod profile;
 pub mod reml_trace;
@@ -45,6 +46,7 @@ pub use device::GpuDeviceInfo;
 pub use error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, MixedPrecisionPolicy};
+pub use pool::{balanced_partition, scatter_batched};
 pub use profile::{KernelStat, KernelStatsSnapshot};
 pub use runtime::GpuRuntime;
 
