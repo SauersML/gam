@@ -558,21 +558,36 @@ mod cuda {
             .clone_htod(&g_host)
             .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
 
-        // ----- Layer A: batched lower Cholesky of D in place -----
-        let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
-        if let Some(idx) = info_host.iter().position(|info| *info != 0) {
-            let pivot = info_host[idx];
-            let scale = sys.rows[idx]
-                .htt
-                .diag()
-                .iter()
-                .map(|v| v.abs())
-                .fold(0.0_f64, f64::max)
-                .max(1.0);
-            return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
-                row: idx,
-                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
-            });
+        // ----- Layer A: batched lower Cholesky of D -----
+        // The n tip blocks `D_i = H_tt^(i) + ρ_t·I` are independent SPD systems —
+        // the canonical multi-GPU axis. With more than one usable device, factor
+        // the whole batch across ALL GPUs via the pool-tiled host batched
+        // Cholesky and upload the stacked factors back into `d_dev`; the
+        // remaining single-stream pipeline (trsm / Schur / back-sub) then runs on
+        // the primary device unchanged. With a single device the in-place
+        // on-device `potrf_batched` is kept verbatim (the existing fast path).
+        if crate::gpu::runtime::GpuRuntime::global()
+            .map(crate::gpu::runtime::GpuRuntime::device_count)
+            .unwrap_or(0)
+            > 1
+        {
+            match potrf_batched_pool(&d_host, d, n) {
+                Ok(factored_col) => {
+                    d_dev = stream
+                        .clone_htod(&factored_col)
+                        .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+                }
+                Err(ArrowSchurGpuFailure::Unavailable) => {
+                    // Pool path declined (mixed shapes, transient): fall back to
+                    // the single-device on-device batched POTRF.
+                    let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
+                    bump_on_potrf_info(sys, &info_host)?;
+                }
+                Err(other) => return Err(other),
+            }
+        } else {
+            let info_host = potrf_batched(&solver, &stream, d, n, &mut d_dev)?;
+            bump_on_potrf_info(sys, &info_host)?;
         }
 
         // ----- Layer B (1/2): in-place triangular solves -----
@@ -680,6 +695,82 @@ mod cuda {
             delta_beta,
             log_det_hessian: log_det,
         })
+    }
+
+    /// Translate a batched-POTRF info vector into the `RidgeBumpRequired`
+    /// diagnostic the outer LM escalation consumes: the first non-zero `info`
+    /// marks a non-PD tip block, and the bump is scaled by that block's
+    /// diagonal magnitude. Returns `Ok(())` when every block factored.
+    fn bump_on_potrf_info(
+        sys: &ArrowSchurSystem,
+        info_host: &[i32],
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        if let Some(idx) = info_host.iter().position(|info| *info != 0) {
+            let pivot = info_host[idx];
+            let scale = sys.rows[idx]
+                .htt
+                .diag()
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0_f64, f64::max)
+                .max(1.0);
+            return Err(ArrowSchurGpuFailure::RidgeBumpRequired {
+                row: idx,
+                bump: scale * (pivot.abs() as f64).max(1.0) * f64::EPSILON.sqrt() * 1024.0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Factor the `n` tip blocks `D_i = H_tt^(i) + ρ_t·I` across ALL usable GPUs
+    /// via the pool-tiled batched Cholesky, returning the stacked column-major
+    /// lower factors ready to upload as `d_dev`.
+    ///
+    /// `d_host` is the stacked column-major `n·d·d` buffer `pack_host` already
+    /// built (each `d×d` block contiguous, with the per-block ρ_t ridge folded
+    /// in). The blocks are rehydrated into host `Array2`s and handed to
+    /// `crate::gpu::try_cholesky_batched_lower_inplace`, which spreads the
+    /// batched POTRF over the device pool. On any decline — including a non-PD
+    /// block (the pool path reports a whole-batch `None` without the offending
+    /// row) — this returns `Unavailable` so the caller re-runs the single-device
+    /// `potrf_batched`, which surfaces the precise `RidgeBumpRequired` row.
+    fn potrf_batched_pool(
+        d_host: &[f64],
+        d: usize,
+        n: usize,
+    ) -> Result<Vec<f64>, ArrowSchurGpuFailure> {
+        let block_len = d.checked_mul(d).ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        if d_host.len() != n.checked_mul(block_len).ok_or(ArrowSchurGpuFailure::Unavailable)? {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+        // Rehydrate column-major d×d blocks into row-major host Array2 (ndarray
+        // is row-major; index [r, c] = column-major[c*d + r]).
+        let mut blocks: Vec<ndarray::Array2<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let base = i * block_len;
+            let mut block = ndarray::Array2::<f64>::zeros((d, d));
+            for c in 0..d {
+                for r in 0..d {
+                    block[[r, c]] = d_host[base + c * d + r];
+                }
+            }
+            blocks.push(block);
+        }
+        // Multi-GPU batched lower Cholesky. `None` ⇒ decline / non-PD block.
+        crate::gpu::try_cholesky_batched_lower_inplace(&mut blocks)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        // Re-pack the lower factors to the stacked column-major layout `d_dev`
+        // expects (strict upper already zeroed by the batched kernel).
+        let mut factored_col = vec![0.0_f64; n * block_len];
+        for (i, block) in blocks.iter().enumerate() {
+            let base = i * block_len;
+            for c in 0..d {
+                for r in 0..d {
+                    factored_col[base + c * d + r] = block[[r, c]];
+                }
+            }
+        }
+        Ok(factored_col)
     }
 
     fn potrf_batched(
