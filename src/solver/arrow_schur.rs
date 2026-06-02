@@ -5025,7 +5025,7 @@ fn bind_tile_device(ordinal: usize) {
     // No CUDA contexts off Linux; the ordinal must still be a real pool
     // ordinal, which `usize` always satisfies — asserting it keeps the
     // parameter live so the cross-platform signature carries no dead binding.
-    debug_assert!(ordinal < usize::MAX);
+    assert!(ordinal < usize::MAX);
 }
 
 /// Reduce the per-row Schur contributions `Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`
