@@ -1,9 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat,
-    identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin,
-    zero_christoffel,
+    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
+    from_flat, identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin,
 };
 use crate::geometry::sphere::SphereManifold;
 
@@ -118,6 +117,23 @@ impl RiemannianManifold for GrassmannManifold {
         p_to: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         if let Some(sphere) = self.as_sphere() {
+            // Gr(1,n) = ℝP^{n-1}: the line span(p_to) is represented equally by
+            // ±p_to, so before applying the sphere logarithm we pick the
+            // representative in p_from's hemisphere (p_from·q ≥ 0). Without this
+            // the sphere would report distance π−ε for two nearly-identical
+            // lines that are ε apart. At the projective cut locus p_from·p_to=0
+            // (principal angle π/2) the log is not unique, so we reject it —
+            // mirroring the (YᵀZ)⁻¹ singularity of the general-k branch below.
+            let c = dot(p_from, p_to);
+            if c.abs() <= GEOMETRY_EPS {
+                return Err(GeometryError::Singular(
+                    "Grassmann Gr(1,n) log is undefined at the projective cut locus (principal angle π/2)",
+                ));
+            }
+            if c < 0.0 {
+                let aligned = -&p_to.to_owned();
+                return sphere.log_map(p_from, aligned.view());
+            }
             return sphere.log_map(p_from, p_to);
         }
         let y = from_flat(p_from, self.n, self.k)?;
@@ -153,6 +169,20 @@ impl RiemannianManifold for GrassmannManifold {
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
         if let Some(sphere) = self.as_sphere() {
+            // Gr(1,n) = ℝP^{n-1}: align the final representative's sign to the
+            // first point's hemisphere so the transport runs along the minimal
+            // RP geodesic (the sphere geodesic to the aligned ±endpoint), rather
+            // than the antipodal great circle. The tangent space at a line is
+            // the same for ±q, so negating the endpoint representative is the
+            // correct lift.
+            let last = point_along.nrows().saturating_sub(1);
+            if point_along.nrows() >= 2
+                && dot(point_along.row(0), point_along.row(last)) < 0.0
+            {
+                let mut aligned = point_along.to_owned();
+                aligned.row_mut(last).mapv_inplace(|x| -x);
+                return sphere.parallel_transport(aligned.view(), vec);
+            }
             return sphere.parallel_transport(point_along, vec);
         }
         check_len(
@@ -222,7 +252,14 @@ impl RiemannianManifold for GrassmannManifold {
             point.len(),
             self.ambient_dim(),
         )?;
-        Ok(zero_christoffel(self.ambient_dim()))
+        // Gr(k,n) is a curved symmetric space — its sectional_curvature below is
+        // nonzero for k ≥ 2 (and +1 for k = 1), which is incompatible with a
+        // globally-zero ambient Christoffel tensor. There is no flat global
+        // chart, so we refuse rather than return false (zero) symbols that would
+        // make downstream code treat the manifold as flat.
+        Err(GeometryError::Unsupported(
+            "Christoffel symbols of the embedded Grassmannian require a local chart",
+        ))
     }
 
     fn sectional_curvature(
