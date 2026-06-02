@@ -231,14 +231,13 @@ pub(crate) fn quad_form(
     let n = a.len();
     assert_eq!(g.nrows(), n);
     assert_eq!(g.ncols(), b.len());
-    let mut out = 0.0;
-    for i in 0..n {
-        let ai = a[i];
-        for j in 0..b.len() {
-            out += ai * g[[i, j]] * b[j];
-        }
-    }
-    out
+    // aᵀ G b: the inner matrix–vector product G·b is the O(n²) cost and is the
+    // hot kernel of every metric inner product (g_inner / g_norm) and of the
+    // metric Gram–Schmidt tangent basis. Route it through the GPU-dispatched
+    // fast_av shim so large-ambient metrics (SPD/Stiefel/Grassmann n²×n²) offload
+    // to the GPU; the trailing a·(Gb) is an O(n) dot.
+    let gb = crate::linalg::faer_ndarray::fast_av(&g, &b);
+    dot(a, gb.view())
 }
 
 pub(crate) fn identity(n: usize) -> Array2<f64> {
@@ -629,7 +628,10 @@ pub(crate) fn spectral_map_spd(
         }
         diag[[i, i]] = f(evals[i])?;
     }
-    Ok(evecs.dot(&diag).dot(&evecs.t()))
+    // Reconstruction V·f(Λ)·Vᵀ: two dense n×n products GPU-dispatched via
+    // fast_ab/fast_abt for large ambient dimension.
+    use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+    Ok(fast_abt(&fast_ab(&evecs, &diag), &evecs))
 }
 
 pub(crate) fn spectral_map_symmetric(
@@ -642,7 +644,9 @@ pub(crate) fn spectral_map_symmetric(
     for i in 0..n {
         diag[[i, i]] = f(evals[i])?;
     }
-    Ok(evecs.dot(&diag).dot(&evecs.t()))
+    // Reconstruction V·f(Λ)·Vᵀ, GPU-dispatched via fast_ab/fast_abt.
+    use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+    Ok(fast_abt(&fast_ab(&evecs, &diag), &evecs))
 }
 
 /// Dense matrix exponential `exp(A)` via scaling-and-squaring with a truncated
@@ -685,15 +689,18 @@ pub(crate) fn matrix_exp(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
 
     // exp(A_scaled) = sum_{k>=0} A_scaled^k / k! by term recurrence:
     //   term_k = term_{k-1} · A_scaled / k.
+    // Both the Taylor term recurrence and the scaling-and-squaring use dense
+    // n×n products; GPU-dispatch them via fast_ab for large blocks.
+    use crate::linalg::faer_ndarray::fast_ab;
     let mut result = identity(n);
     let mut term = identity(n);
     for k in 1..=12 {
-        term = term.dot(&a_scaled) / (k as f64);
+        term = fast_ab(&term, &a_scaled) / (k as f64);
         result = result + &term;
     }
     // exp(A) = exp(A_scaled)^{2^squarings}.
     for _ in 0..squarings {
-        result = result.dot(&result);
+        result = fast_ab(&result, &result);
     }
     Ok(result)
 }
