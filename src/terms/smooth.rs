@@ -2396,23 +2396,28 @@ impl SpatialLogKappaCoords {
                 .clamp(options.min_length_scale, options.max_length_scale);
             let psi_bar = -length_scale.ln(); // global scale = −ln(length_scale)
 
-            let aniso = get_spatial_aniso_log_scales(spec, term_idx);
-            let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(1);
-
-            match aniso {
-                Some(ref eta) if eta.len() == d && d > 1 => {
-                    let eta = center_aniso_log_scales(eta);
-                    // Existing per-axis anisotropy: ψ_a = ψ̄ + η_a
-                    for &eta_a in &eta {
-                        vals.push(psi_bar + eta_a);
-                    }
-                    dims.push(d);
+            if spatial_term_uses_per_axis_psi(spec, term_idx) {
+                // Per-axis anisotropy is enrolled in the joint outer vector:
+                // ψ_a = ψ̄ + η_a, one slot per axis. The hyper_dirs builder
+                // produces matching per-axis derivatives in
+                // `try_build_spatial_term_log_kappa_aniso_derivativeinfos`.
+                let d = get_spatial_feature_dim(spec, term_idx).unwrap_or(1);
+                let eta_raw = get_spatial_aniso_log_scales(spec, term_idx)
+                    .expect("predicate guarantees aniso_log_scales is Some");
+                let eta = center_aniso_log_scales(&eta_raw);
+                for &eta_a in &eta {
+                    vals.push(psi_bar + eta_a);
                 }
-                _ => {
-                    // Isotropic (1-D, or multi-D without explicit anisotropy)
-                    vals.push(psi_bar);
-                    dims.push(1);
-                }
+                dims.push(d);
+            } else {
+                // Isotropic enrollment — either a 1-D term, a multi-D term
+                // without explicit anisotropy, or a basis (e.g. Duchon) whose
+                // η is a fixed geometry parameter rather than a REML hyper
+                // axis. Exactly one ψ̄ slot, matching the single
+                // `SpatialPsiDerivative` produced by
+                // `try_build_spatial_term_log_kappa_derivativeinfo`.
+                vals.push(psi_bar);
+                dims.push(1);
             }
         }
         Self {
@@ -13837,22 +13842,7 @@ pub(crate) fn try_build_spatial_log_kappa_derivativeinfo_list(
     let mut out = Vec::new();
     let mut aniso_gid = 0usize;
     for &term_idx in spatial_terms {
-        let aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx);
-        let dim = get_spatial_feature_dim(resolvedspec, term_idx);
-        // Duchon anisotropy η is a fixed, geometry-derived basis parameter, never
-        // a REML hyper axis (see `spatial_term_supports_hyper_optimization`). A
-        // hybrid Duchon (explicit κ) still optimizes its scalar length scale, but
-        // through the regular κ path with η held at its geometry init — so it is
-        // excluded from the per-axis aniso enrollment here.
-        let is_duchon = matches!(
-            resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis),
-            Some(SmoothBasisSpec::Duchon { .. })
-        );
-        if let (Some(eta), Some(d)) = (&aniso, dim)
-            && eta.len() == d
-            && d > 1
-            && !is_duchon
-        {
+        if spatial_term_uses_per_axis_psi(resolvedspec, term_idx) {
             if let Some(entries) = try_build_spatial_term_log_kappa_aniso_derivativeinfos(
                 data,
                 resolvedspec,
@@ -14981,11 +14971,49 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     Ok(hyper_dirs)
 }
 
+/// Whether a spatial term contributes per-axis ψ entries to the outer joint
+/// hyperparameter vector.
+///
+/// A term enrolls per-axis log-κ ψ when (a) it carries `aniso_log_scales`
+/// matching its feature dimension, (b) its dimension is `> 1`, and (c) its
+/// basis supports REML-side anisotropic κ optimization. Duchon is explicitly
+/// excluded: its anisotropy η is a fixed, geometry-derived basis parameter,
+/// never a REML hyper axis. A hybrid Duchon (explicit κ) still optimizes its
+/// scalar length scale through the regular isotropic-κ path, so it
+/// contributes a single ψ entry, not one per axis.
+///
+/// This predicate is the *single source of truth* for the joint-θ layout:
+/// `has_aniso_terms`, `spatial_dims_per_term`, `from_length_scales_aniso`,
+/// and the hyper_dirs builder `try_build_spatial_log_kappa_derivativeinfo_list`
+/// all consult it, so the outer optimizer's `n_params = rho_dim + Σ ψ_per_term`
+/// always matches the gradient length produced by the inner unified evaluator.
+fn spatial_term_uses_per_axis_psi(
+    resolvedspec: &TermCollectionSpec,
+    term_idx: usize,
+) -> bool {
+    let Some(d) = get_spatial_feature_dim(resolvedspec, term_idx) else {
+        return false;
+    };
+    if d <= 1 {
+        return false;
+    }
+    let Some(eta) = get_spatial_aniso_log_scales(resolvedspec, term_idx) else {
+        return false;
+    };
+    if eta.len() != d {
+        return false;
+    }
+    !matches!(
+        resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis),
+        Some(SmoothBasisSpec::Duchon { .. })
+    )
+}
+
 /// Compute `dims_per_term` for a list of spatial term indices.
 ///
 /// Returns a vector where entry i is the number of stored ψ values for
-/// spatial term i: 1 for isotropic terms, d for anisotropic terms with a
-/// scalar length scale, and d - 1 for pure Duchon anisotropy.
+/// spatial term i: `d` for terms that enroll per-axis anisotropy in the
+/// REML joint vector (`spatial_term_uses_per_axis_psi`), `1` otherwise.
 pub(crate) fn spatial_dims_per_term(
     resolvedspec: &TermCollectionSpec,
     spatial_terms: &[usize],
@@ -14993,18 +15021,22 @@ pub(crate) fn spatial_dims_per_term(
     spatial_terms
         .iter()
         .map(|&term_idx| {
-            let d = get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1);
-            let has_aniso = get_spatial_aniso_log_scales(resolvedspec, term_idx).is_some();
-            if has_aniso && d > 1 { d } else { 1 }
+            if spatial_term_uses_per_axis_psi(resolvedspec, term_idx) {
+                get_spatial_feature_dim(resolvedspec, term_idx).unwrap_or(1)
+            } else {
+                1
+            }
         })
         .collect()
 }
 
-/// Check whether any spatial terms carry per-axis anisotropy.
+/// Check whether any spatial terms enroll per-axis anisotropic ψ in the joint
+/// outer vector. Mirrors the hyper_dirs builder's enrollment predicate so the
+/// outer θ-layout cannot drift from the inner evaluator's ψ count.
 fn has_aniso_terms(resolvedspec: &TermCollectionSpec, spatial_terms: &[usize]) -> bool {
-    spatial_terms.iter().any(|&term_idx| {
-        get_spatial_aniso_log_scales(resolvedspec, term_idx).is_some_and(|eta| eta.len() > 1)
-    })
+    spatial_terms
+        .iter()
+        .any(|&term_idx| spatial_term_uses_per_axis_psi(resolvedspec, term_idx))
 }
 
 /// Emits the `theta`-keyed memoization accessors shared verbatim by the
