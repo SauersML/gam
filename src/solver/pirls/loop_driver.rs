@@ -665,9 +665,28 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
-    fit_model_for_fixed_rho_with_adaptive_kkt(rho, problem, penalty, config, warm_start_beta, None)
+    fit_model_for_fixed_rho_with_adaptive_kkt(
+        rho,
+        problem,
+        penalty,
+        config,
+        warm_start_beta,
+        None,
+        false,
+    )
 }
 
+/// `refine_gamma_dispersion`: when `true`, after the inner P-IRLS solve
+/// converges, re-estimate the Gamma dispersion shape ν = 1/φ at the *converged*
+/// linear predictor and iterate (β, ν) to their joint fixed point at the current
+/// λ (see the in-body comment at the refresh loop). This is ON only for the
+/// single final, reported fit at the REML-selected λ (#678). It is deliberately
+/// OFF for every REML cost / sigma-point evaluation: re-profiling ν against each
+/// trial λ's converged residuals would couple the scale to the smoothing
+/// parameter (a flat over-smoothed μ inflates the Gamma deviance ⇒ smaller ν ⇒
+/// larger φ ⇒ a smaller `deviance/(2φ)` REML term), perversely rewarding
+/// over-smoothing and biasing λ selection. mgcv likewise estimates the Gamma
+/// scale at the converged fit, not inside the λ search.
 pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix> + Clone>(
     rho: LogSmoothingParamsView<'_>,
     problem: PirlsProblem<'a, X>,
@@ -675,6 +694,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
     adaptive_kkt_tolerance: Option<AdaptiveKktTolerance>,
+    refine_gamma_dispersion: bool,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let PirlsProblem {
         x,
@@ -1302,6 +1322,93 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         &options,
         &mut iteration_logger,
     )?;
+
+    // ── Gamma dispersion: re-estimate the shape at the *converged* η (#678) ──
+    //
+    // The inner LM solve estimates the Gamma shape ν = 1/φ **once** from the
+    // warm-start η and freezes it for the rest of the solve (see the
+    // `gamma_shape_locked` doc on `GamWorkingModel`): holding ν fixed keeps the
+    // product φ·λ — and hence the penalized argmin β̂ — a stationary LM target,
+    // so the gain ratio compares one objective. That lock is correct *within* a
+    // solve, but it pins ν to whatever η the solve started from. When the fit
+    // cold-starts (the final dedicated fit at the converged ρ passes
+    // `warm_start_beta = None`, and seed screening starts from a default guess),
+    // that warm-start η has not yet captured the mean structure; the leftover
+    // spread of μ inflates the Gamma deviance term `mean[y/μ − ln(y/μ) − 1]` and
+    // biases ν **down** (φ up) by >2× whenever μ varies appreciably. The mean
+    // surface still converges (β̂ is essentially scale-free here), but the frozen
+    // ν that survives into `UnifiedFitResult::dispersion_phi()` — and from there
+    // into every coefficient SE `Vb = H⁻¹·φ̂`, prediction interval, and
+    // observation-noise interval — is the early, mean-spread-contaminated value.
+    //
+    // Fix: after the solve converges, re-estimate ν at the converged η. If it
+    // moved, re-solve β (warm-started, ν held fixed at the refreshed value) and
+    // repeat, driving the pair (β, ν) to their joint fixed point at the current
+    // λ. At convergence the reported dispersion is the Gamma ML estimate at the
+    // converged mean (mgcv's post-hoc Pearson/deviance scale), and the final
+    // working state — `finalweights`, the penalized Hessian, the deviance, μ —
+    // is rebuilt with that same ν, so `Vb = H⁻¹·φ̂` stays internally consistent.
+    // Warm-started solves (every REML cost eval) already sit near the converged
+    // η, so the first refresh check confirms ν and exits without a re-solve; the
+    // added cost there is a single O(n) shape evaluation.
+    if refine_gamma_dispersion && working_model.likelihood.scale.gamma_shape_is_estimated() {
+        // A few passes suffice: the converged-η shape map is a strong
+        // contraction (β̂ barely moves once the mean is captured), so cold
+        // starts settle in 1–2 re-solves and warm starts in zero.
+        const MAX_SHAPE_REFRESH: usize = 5;
+        // Relative shape tolerance below which a re-solve cannot move any
+        // reported quantity meaningfully (far under statistical resolution).
+        const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
+        for refresh_iter in 0..MAX_SHAPE_REFRESH {
+            let refreshed_shape = super::estimate_gamma_shape_from_eta(
+                y,
+                working_summary.state.eta.as_ref(),
+                priorweights,
+            );
+            let prior_shape = working_model.likelihood.gamma_shape().unwrap_or(1.0);
+            let rel_change =
+                (refreshed_shape - prior_shape).abs() / prior_shape.max(f64::MIN_POSITIVE);
+            // Install the refreshed shape and hold it fixed for any re-solve so
+            // the LM objective stays stationary (the lock is *re-armed*, not
+            // released — the seed-from-warm-start branch in `update_with_curvature`
+            // must not overwrite this deliberately chosen value). Because this
+            // assignment evaluated the shape at the *current* converged η and no
+            // re-solve follows it on the exit paths below, the reported shape
+            // always equals `estimate_gamma_shape_from_eta(final_eta)` — the
+            // self-consistency invariant the in-module Gamma unit test checks.
+            working_model.likelihood =
+                working_model.likelihood.clone().with_gamma_shape(refreshed_shape);
+            working_model.gamma_shape_locked = true;
+            if rel_change <= SHAPE_REFRESH_REL_TOL {
+                // Converged: the working-state buffers (weights, Hessian,
+                // deviance) already reflect a shape within tolerance of
+                // `refreshed_shape`, because the only way to reach here without
+                // a re-solve is that the prior solve's shape already matched the
+                // converged-η estimate. Nothing left to rebuild.
+                break;
+            }
+            if refresh_iter + 1 == MAX_SHAPE_REFRESH {
+                // Final allowed pass and the shape is still drifting (a
+                // pathological non-contraction). Do NOT re-solve: re-solving
+                // would advance `final_eta` past the η the just-installed shape
+                // was evaluated at, breaking the stored-shape == estimate(final_eta)
+                // invariant. Stopping here keeps the reported shape exactly the
+                // ML estimate at the reported η; the residual weight/φ drift is
+                // bounded by the last `rel_change` and never worse than the
+                // pre-fix frozen-warm-start value.
+                break;
+            }
+            // The shape moved: re-solve β at the corrected shape, warm-started
+            // at the converged β, so the final working state is rebuilt with the
+            // refreshed ν.
+            working_summary = runworking_model_pirls(
+                &mut working_model,
+                working_summary.beta.clone(),
+                &options,
+                &mut iteration_logger,
+            )?;
+        }
+    }
 
     // Extract workspace before consuming working_model so we can reuse
     // the pre-allocated buffers in calculate_edfwithworkspace_with_penalty.

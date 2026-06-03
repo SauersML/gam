@@ -132,7 +132,6 @@ fn smooth_test_estimated_scale_pvalue_matches_f_distribution_formula() {
     let beta = array![0.0, 0.4, -0.3, 0.25];
     let covariance = Array2::from_diag(&Array1::from(vec![1.0, 0.8, 0.6, 1.2]));
     let residual_df = 120.0;
-    let dispersion = 1.7;
 
     let out = wood_smooth_test(SmoothTestInput {
         beta: beta.view(),
@@ -141,13 +140,16 @@ fn smooth_test_estimated_scale_pvalue_matches_f_distribution_formula() {
         coeff_range: 1..4,
         edf: 3.0,
         nullspace_dim: 0,
-        dispersion,
         residual_df,
         scale: SmoothTestScale::Estimated,
     })
     .expect("Wood smooth test should return a finite statistic and p-value for positive-definite covariance");
 
-    let f_stat = out.statistic / (out.ref_df * dispersion);
+    // `covariance` is scale-included, so `wood_smooth_test` returns the proper
+    // Wald χ² (dispersion already divided out by the covariance scale). The
+    // Estimated-scale F-statistic is therefore `T / ref_df` with no further
+    // `φ̂` factor.
+    let f_stat = out.statistic / out.ref_df;
     let dist = FisherSnedecor::new(out.ref_df, residual_df)
         .expect("F distribution parameters should be valid for positive reference and residual df");
     let expected_p = 1.0 - dist.cdf(f_stat);
@@ -170,7 +172,6 @@ fn smooth_test_scale_has_consistent_alpha_rejection_ordering() {
         coeff_range: 1..4,
         edf: 3.0,
         nullspace_dim: 0,
-        dispersion: 1.0,
         residual_df: 80.0,
         scale: SmoothTestScale::Estimated,
     })

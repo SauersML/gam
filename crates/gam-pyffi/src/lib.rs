@@ -3,7 +3,7 @@ use faer::Side;
 use gam::basis::create_duchon_basis_1d_derivative_dense;
 use gam::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
 use gam::estimate::{
-    BlockRole, EstimationError, ExternalOptimOptions, UnifiedFitResult,
+    BlockRole, EstimationError, ExternalOptimOptions,
     optimize_external_designwith_heuristic_lambdas, saved_latent_cloglog_state_from_fit,
     saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
@@ -9135,6 +9135,13 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
 const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
 /// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
 const SAE_SPHERE_BASIS_SIZE: usize = 7;
+/// Per-(compact)-axis resolution of the global decoder-projection coordinate
+/// seed used by the fixed-decoder OOS solve. 256 phases on the circle spaces
+/// adjacent grid points ≈0.004 apart, comfortably inside the basin of the
+/// analytic Newton refinement for a small harmonic order, while staying cheap
+/// (`O(K·N·256·p)` for periodic atoms). See
+/// [`gam::terms::sae_manifold::SaeManifoldTerm::seed_coords_by_decoder_projection`].
+const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 /// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
 /// `dim`, sized so the native reproducing-norm Gram (`PenaltySource::Primary`)
 /// on the scale-free polyharmonic basis is well-posed in every dimension.
@@ -11681,6 +11688,20 @@ fn sae_manifold_predict_oos<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+    // Global decoder-projection coordinate seed (cold start only). With the
+    // decoder frozen, the exact OOS latent of each row is its projection onto
+    // the atom's image manifold, `argmin_t ‖x − Φ(t)·B‖²`. That objective is
+    // non-convex on the compact periodic / torus / sphere latents, so the
+    // PCA-`atan2` seed plus a few Newton steps lands many rows in the wrong
+    // basin and mis-routes them (negative R², near-uniform assignments). Seeding
+    // from a dense manifold grid puts every row in the correct basin before the
+    // residual-based softmax logit seed and the Newton refinement below. An
+    // explicit warm `initial_coords` (e.g. from an amortized encoder, issue
+    // #357) is respected as-is and not overwritten.
+    if initial_coords.is_none() {
+        term.seed_coords_by_decoder_projection(x_view, SAE_OOS_PROJECTION_GRID_RESOLUTION)
+            .map_err(py_value_error)?;
+    }
     if !logits_are_warm && assignment_kind == "softmax" {
         let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
         let mut decoded = vec![0.0_f64; p_out];
@@ -16811,6 +16832,313 @@ fn nagelkerke_r2_from_predictions(
     eps: f64,
 ) -> PyResult<Option<f64>> {
     benchmark_nagelkerke_r2_with_null_mean(&observed, &predicted_mean, null_mean, eps)
+}
+
+#[pyfunction(signature = (y, n_splits, seed, stratified))]
+fn make_folds_indices(
+    y: Vec<f64>,
+    n_splits: usize,
+    seed: u64,
+    stratified: bool,
+) -> PyResult<Vec<(Vec<usize>, Vec<usize>)>> {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use std::collections::BTreeMap;
+
+    if n_splits == 0 {
+        return Err(py_value_error(
+            "make_folds_indices: n_splits must be >= 1".to_string(),
+        ));
+    }
+    let n = y.len();
+    if n == 0 {
+        return Err(py_value_error(
+            "make_folds_indices: y must have at least one observation".to_string(),
+        ));
+    }
+    for (i, v) in y.iter().enumerate() {
+        if !v.is_finite() {
+            return Err(py_value_error(format!(
+                "make_folds_indices: y[{i}] is not finite ({v}); CV labels must be finite"
+            )));
+        }
+    }
+    if n_splits >= 2 && n < n_splits {
+        return Err(py_value_error(format!(
+            "make_folds_indices: n_splits={n_splits} cannot exceed n_observations={n}"
+        )));
+    }
+
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // Group row indices either into a single bucket (unstratified) or into
+    // one bucket per exact label value (stratified). Using the bit pattern
+    // as the key produces a well-defined grouping even when labels are
+    // floats; NaN is rejected above.
+    let mut buckets: Vec<Vec<usize>> = if stratified {
+        let mut by_label: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        for (i, v) in y.iter().enumerate() {
+            by_label.entry(v.to_bits()).or_default().push(i);
+        }
+        by_label.into_values().collect()
+    } else {
+        vec![(0..n).collect()]
+    };
+
+    if n_splits >= 2 {
+        // K-fold: round-robin assignment per bucket guarantees that every
+        // row lands in exactly one test fold and that strata are balanced
+        // across folds.
+        let mut fold_of_row = vec![usize::MAX; n];
+        for bucket in buckets.iter_mut() {
+            bucket.shuffle(&mut rng);
+            for (k, &idx) in bucket.iter().enumerate() {
+                fold_of_row[idx] = k % n_splits;
+            }
+        }
+        let mut folds: Vec<(Vec<usize>, Vec<usize>)> =
+            (0..n_splits).map(|_| (Vec::new(), Vec::new())).collect();
+        for (idx, &f) in fold_of_row.iter().enumerate() {
+            for (k, fold) in folds.iter_mut().enumerate() {
+                if k == f {
+                    fold.1.push(idx);
+                } else {
+                    fold.0.push(idx);
+                }
+            }
+        }
+        for (k, (train, test)) in folds.iter().enumerate() {
+            if test.is_empty() {
+                return Err(py_value_error(format!(
+                    "make_folds_indices: fold {k}/{n_splits} has empty test set \
+                     (n={n}); reduce n_splits or supply more observations"
+                )));
+            }
+            if train.is_empty() {
+                return Err(py_value_error(format!(
+                    "make_folds_indices: fold {k}/{n_splits} has empty train set \
+                     (n={n}); reduce n_splits or supply more observations"
+                )));
+            }
+        }
+        Ok(folds)
+    } else {
+        // n_splits == 1: a single deterministic holdout. Hold out 1/5 of
+        // each stratum, matching the proportion of one fold from the
+        // default 5-fold split so binary/survival validation that demands
+        // ≥1 row of each class in both train and test is satisfied as
+        // long as each class has ≥2 observations (the contract the Python
+        // wrapper documents).
+        const HOLDOUT_DENOMINATOR: usize = 5;
+        let mut train: Vec<usize> = Vec::new();
+        let mut test: Vec<usize> = Vec::new();
+        for bucket in buckets.iter_mut() {
+            bucket.shuffle(&mut rng);
+            let m = bucket.len();
+            // ≥1 in test, ≥1 in train for every stratum of size ≥ 2.
+            // Strata of size 1 (which only the unstratified single-bucket
+            // path with n == 1 can produce — already rejected above for
+            // stratified=true via empty-fold check below) collapse to
+            // train, which the empty-test sanity check will catch.
+            let mut n_test = m / HOLDOUT_DENOMINATOR;
+            if n_test == 0 && m >= 2 {
+                n_test = 1;
+            }
+            if n_test >= m && m >= 2 {
+                n_test = m - 1;
+            }
+            for (i, &idx) in bucket.iter().enumerate() {
+                if i < n_test {
+                    test.push(idx);
+                } else {
+                    train.push(idx);
+                }
+            }
+        }
+        if test.is_empty() {
+            return Err(py_value_error(format!(
+                "make_folds_indices: holdout split has empty test set (n={n}); \
+                 supply at least 2 observations (and ≥2 per class when stratified)"
+            )));
+        }
+        if train.is_empty() {
+            return Err(py_value_error(format!(
+                "make_folds_indices: holdout split has empty train set (n={n}); \
+                 supply at least 2 observations (and ≥2 per class when stratified)"
+            )));
+        }
+        train.sort_unstable();
+        test.sort_unstable();
+        Ok(vec![(train, test)])
+    }
+}
+
+fn gaussian_log_loss_value(
+    observed: &[f64],
+    predicted_mean: &[f64],
+    sigma: &[f64],
+    eps: f64,
+) -> PyResult<f64> {
+    let n = observed.len();
+    if n == 0 {
+        return Err(py_value_error(
+            "gaussian_log_loss_from_predictions: observed must be non-empty".to_string(),
+        ));
+    }
+    if predicted_mean.len() != n {
+        return Err(py_value_error(format!(
+            "gaussian_log_loss_from_predictions length mismatch: observed={n} predicted_mean={}",
+            predicted_mean.len()
+        )));
+    }
+    if sigma.len() != 1 && sigma.len() != n {
+        return Err(py_value_error(format!(
+            "gaussian_log_loss_from_predictions: sigma length must be 1 or {n}; got {}",
+            sigma.len()
+        )));
+    }
+    if !eps.is_finite() || eps <= 0.0 {
+        return Err(py_value_error(format!(
+            "gaussian_log_loss_from_predictions: eps must be positive and finite; got {eps}"
+        )));
+    }
+    let scalar_sigma = sigma.len() == 1;
+    let two_pi = std::f64::consts::TAU;
+    let mut total = 0.0_f64;
+    for i in 0..n {
+        let y = observed[i];
+        let mu = predicted_mean[i];
+        if !y.is_finite() {
+            return Err(py_value_error(format!(
+                "gaussian_log_loss_from_predictions: observed[{i}] is not finite ({y})"
+            )));
+        }
+        if !mu.is_finite() {
+            return Err(py_value_error(format!(
+                "gaussian_log_loss_from_predictions: predicted_mean[{i}] is not finite ({mu})"
+            )));
+        }
+        let s_raw = if scalar_sigma { sigma[0] } else { sigma[i] };
+        if !s_raw.is_finite() {
+            return Err(py_value_error(format!(
+                "gaussian_log_loss_from_predictions: sigma[{}] is not finite ({s_raw})",
+                if scalar_sigma { 0 } else { i }
+            )));
+        }
+        let s = s_raw.abs().max(eps);
+        let r = y - mu;
+        total += 0.5 * (two_pi * s * s).ln() + 0.5 * (r / s) * (r / s);
+    }
+    Ok(total / n as f64)
+}
+
+#[pyfunction(signature = (observed, predicted_mean, sigma, eps = 1e-12))]
+fn gaussian_log_loss_from_predictions(
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    sigma: Vec<f64>,
+    eps: f64,
+) -> PyResult<f64> {
+    gaussian_log_loss_value(&observed, &predicted_mean, &sigma, eps)
+}
+
+#[pyfunction]
+fn gaussian_prediction_scores_from_predictions(
+    py: Python<'_>,
+    observed: Vec<f64>,
+    predicted_mean: Vec<f64>,
+    sigma: Vec<f64>,
+) -> PyResult<Py<PyDict>> {
+    let diag =
+        gam::inference::diagnostics::diagnostics_from_predictions(&observed, &predicted_mean)
+            .map_err(py_value_error)?;
+    let logloss = gaussian_log_loss_value(&observed, &predicted_mean, &sigma, 1.0e-12)?;
+
+    let out = PyDict::new(py);
+    out.set_item("n_obs", diag.n_obs)?;
+    out.set_item("rmse", diag.rmse)?;
+    out.set_item("mse", diag.rmse * diag.rmse)?;
+    out.set_item("mae", diag.mae)?;
+    out.set_item("bias", diag.bias)?;
+    out.set_item("logloss", logloss)?;
+    match diag.r_squared {
+        Some(r2) => out.set_item("r2", r2)?,
+        None => out.set_item("r2", py.None())?,
+    }
+    Ok(out.unbind())
+}
+
+#[pyfunction]
+fn zscore_train_test_arrays<'py>(
+    py: Python<'py>,
+    train: PyReadonlyArray2<'py, f64>,
+    test: PyReadonlyArray2<'py, f64>,
+) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray2<f64>>)> {
+    let tr = train.as_array();
+    let te = test.as_array();
+    let p = tr.ncols();
+    if te.ncols() != p {
+        return Err(py_value_error(format!(
+            "zscore_train_test_arrays: train has {p} columns but test has {}",
+            te.ncols()
+        )));
+    }
+    let n_train = tr.nrows();
+    if n_train == 0 {
+        return Err(py_value_error(
+            "zscore_train_test_arrays: train has zero rows; cannot estimate column statistics"
+                .to_string(),
+        ));
+    }
+    let n_train_f = n_train as f64;
+    for (j, col) in tr.axis_iter(Axis(1)).enumerate() {
+        for (i, v) in col.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(py_value_error(format!(
+                    "zscore_train_test_arrays: train[{i}, {j}] is not finite ({v})"
+                )));
+            }
+        }
+    }
+    for (j, col) in te.axis_iter(Axis(1)).enumerate() {
+        for (i, v) in col.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(py_value_error(format!(
+                    "zscore_train_test_arrays: test[{i}, {j}] is not finite ({v})"
+                )));
+            }
+        }
+    }
+
+    let mut means = vec![0.0_f64; p];
+    let mut stds = vec![1.0_f64; p];
+    for j in 0..p {
+        let col = tr.column(j);
+        let mean = col.iter().sum::<f64>() / n_train_f;
+        means[j] = mean;
+        // Population standard deviation matches sklearn StandardScaler and
+        // pandas (ddof=0). A constant column collapses to std=0 below; we
+        // pass the centred zero through unchanged by leaving the divisor
+        // at 1.0 in that branch (column has no variation to scale away).
+        let var = col.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n_train_f;
+        let std = var.sqrt();
+        stds[j] = if std > 0.0 { std } else { 1.0 };
+    }
+
+    let mut tr_out = Array2::<f64>::zeros(tr.raw_dim());
+    let mut te_out = Array2::<f64>::zeros(te.raw_dim());
+    for j in 0..p {
+        let mean = means[j];
+        let std = stds[j];
+        for i in 0..tr.nrows() {
+            tr_out[[i, j]] = (tr[[i, j]] - mean) / std;
+        }
+        for i in 0..te.nrows() {
+            te_out[[i, j]] = (te[[i, j]] - mean) / std;
+        }
+    }
+    Ok((tr_out.into_pyarray(py).unbind(), te_out.into_pyarray(py).unbind()))
 }
 
 #[pyfunction]
@@ -22847,6 +23175,13 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(brier_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(make_folds_indices, module)?)?;
+    module.add_function(wrap_pyfunction!(gaussian_log_loss_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_prediction_scores_from_predictions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(zscore_train_test_arrays, module)?)?;
     module.add_function(wrap_pyfunction!(classification_metrics, module)?)?;
     module.add_function(wrap_pyfunction!(survival_concordance, module)?)?;
     module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
@@ -23958,17 +24293,37 @@ fn extend_model_with_random_effect_level(
     let coefficient_variance = match supplied_variance {
         Some(variance) => variance,
         None => {
-            let lambda = payload
+            let fit = payload
                 .fit_result
                 .as_ref()
-                .and_then(|fit| fit.lambdas.get(penalty_index).copied())
+                .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?;
+            let lambda = fit
+                .lambdas
+                .get(penalty_index)
+                .copied()
                 .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
                 .ok_or_else(|| {
                     format!(
                         "extend_with_group term '{term_name}' has no finite positive prior lambda"
                     )
                 })?;
-            1.0 / lambda
+            // The unseen-level default prior is the fitted random-effect
+            // variance component `σ_b² = φ̂ / λ` (mgcv's `λ = φ̂ / σ_b²`
+            // convention), NOT the scale-free `1 / λ`. `φ̂` is the residual
+            // dispersion that scales every predict-time covariance: `1` for
+            // fixed-scale families (Poisson/Binomial — where `φ̂/λ` collapses
+            // to the old `1/λ`), but `σ̂²` for Gaussian and the estimated
+            // dispersion for Gamma/Tweedie/NB. Omitting `φ̂` made the prior
+            // (and any deployment interval built from it) wrong by `1/φ̂` and,
+            // for an estimated scale, not response-scale equivariant. See #674.
+            let phi = fit.dispersion_phi();
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err(format!(
+                    "extend_with_group term '{term_name}' has a non-finite or non-positive \
+                     dispersion (φ̂ = {phi}); cannot form the default prior variance"
+                ));
+            }
+            phi / lambda
         }
     };
     extend_training_feature_range(
@@ -26740,7 +27095,6 @@ fn summary_smooth_terms(
     let residual_df = n_obs
         .map(|n| (n - fit.edf_total().unwrap_or(fit.beta.len() as f64)).max(1.0))
         .unwrap_or(f64::NAN);
-    let dispersion_phi = conformal_dispersion_phi(fit, &family);
     let scale = if scale_is_estimated {
         SmoothTestScale::Estimated
     } else {
@@ -26783,7 +27137,6 @@ fn summary_smooth_terms(
                     coeff_range: term.coeff_range.clone(),
                     edf,
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
-                    dispersion: dispersion_phi,
                     residual_df,
                     scale,
                 })
@@ -31913,5 +32266,126 @@ mod tests {
             "residual seed routing accuracy {acc:.3} (up to permutation) is too low; \
              the E-step seed should recover the planted one-hot assignment"
         );
+    }
+
+    /// CV-fold partitioning contract used by the benchmark suite:
+    /// every row appears in exactly one test fold and not in its own
+    /// train set, both partitions are non-empty per fold, and the
+    /// stratified path balances class counts across folds.
+    #[test]
+    fn make_folds_indices_kfold_partitions_unstratified() {
+        let n = 50usize;
+        let y: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let folds = make_folds_indices(y, 5, 7, false).expect("5-fold should succeed");
+        assert_eq!(folds.len(), 5);
+
+        let mut seen = vec![0usize; n];
+        for (train, test) in &folds {
+            assert!(!train.is_empty(), "every fold has a non-empty train set");
+            assert!(!test.is_empty(), "every fold has a non-empty test set");
+            let train_set: std::collections::HashSet<usize> = train.iter().copied().collect();
+            for &i in test {
+                assert!(
+                    !train_set.contains(&i),
+                    "row {i} appears in both train and test of a fold"
+                );
+                seen[i] += 1;
+            }
+            assert_eq!(
+                train.len() + test.len(),
+                n,
+                "train + test must cover the full row set"
+            );
+        }
+        for (i, &count) in seen.iter().enumerate() {
+            assert_eq!(count, 1, "row {i} must appear in exactly one test fold");
+        }
+    }
+
+    #[test]
+    fn make_folds_indices_stratified_balances_classes() {
+        // 30 positives, 20 negatives.
+        let mut y = vec![1.0; 30];
+        y.extend(std::iter::repeat(0.0).take(20));
+        let folds = make_folds_indices(y, 5, 11, true).expect("stratified 5-fold");
+        assert_eq!(folds.len(), 5);
+
+        for (_, test) in &folds {
+            let positives = test.iter().filter(|&&i| i < 30).count();
+            let negatives = test.iter().filter(|&&i| i >= 30).count();
+            // 30 / 5 = 6 positives per fold, 20 / 5 = 4 negatives.
+            assert_eq!(positives, 6, "stratified fold positive count");
+            assert_eq!(negatives, 4, "stratified fold negative count");
+        }
+    }
+
+    #[test]
+    fn make_folds_indices_holdout_partitions_with_split() {
+        let n = 25usize;
+        let y: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let folds = make_folds_indices(y, 1, 42, false).expect("holdout split");
+        assert_eq!(folds.len(), 1);
+        let (train, test) = &folds[0];
+        assert!(!train.is_empty());
+        assert!(!test.is_empty());
+        assert_eq!(train.len() + test.len(), n);
+        // 1/5 holdout convention: n/5 = 5 rows in test.
+        assert_eq!(test.len(), 5);
+        // Train and test must be disjoint.
+        let train_set: std::collections::HashSet<usize> = train.iter().copied().collect();
+        assert!(test.iter().all(|&i| !train_set.contains(&i)));
+    }
+
+    #[test]
+    fn make_folds_indices_seed_determinism_and_variation() {
+        let n = 40usize;
+        let y: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let a = make_folds_indices(y.clone(), 5, 17, false).expect("seed=17");
+        let b = make_folds_indices(y.clone(), 5, 17, false).expect("seed=17 (repeat)");
+        let c = make_folds_indices(y, 5, 18, false).expect("seed=18");
+        assert_eq!(a, b, "same seed must reproduce the same fold layout");
+        assert_ne!(a, c, "different seeds should produce different layouts");
+    }
+
+    #[test]
+    fn gaussian_log_loss_value_matches_closed_form() {
+        // log-loss = mean of 0.5·log(2π σ²) + 0.5·((y-μ)/σ)²
+        // With y = μ everywhere, the squared-residual term vanishes and the
+        // loss is exactly 0.5·log(2π σ²).
+        let y = vec![1.0, 2.0, 3.0, 4.0];
+        let mu = vec![1.0, 2.0, 3.0, 4.0];
+        let sigma_scalar = vec![1.5];
+        let got = gaussian_log_loss_value(&y, &mu, &sigma_scalar, 1.0e-12).expect("log-loss");
+        let expected = 0.5 * (std::f64::consts::TAU * 1.5 * 1.5).ln();
+        assert!(
+            (got - expected).abs() < 1.0e-12,
+            "log-loss with y=μ should equal 0.5·log(2π σ²) = {expected}, got {got}"
+        );
+
+        // Per-row σ matches the scalar broadcast when all entries agree.
+        let sigma_vec = vec![1.5; y.len()];
+        let got_vec = gaussian_log_loss_value(&y, &mu, &sigma_vec, 1.0e-12).expect("vec sigma");
+        assert!((got_vec - got).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn gaussian_log_loss_value_rejects_invalid_sigma_length() {
+        let y = vec![0.0, 1.0, 2.0];
+        let mu = vec![0.0, 1.0, 2.0];
+        let bad_sigma = vec![1.0, 2.0]; // length 2 with n=3
+        assert!(gaussian_log_loss_value(&y, &mu, &bad_sigma, 1.0e-12).is_err());
+    }
+
+    #[test]
+    fn make_folds_indices_rejects_invalid_inputs() {
+        // n_splits == 0
+        assert!(make_folds_indices(vec![0.0, 1.0], 0, 0, false).is_err());
+        // empty y
+        assert!(make_folds_indices(Vec::<f64>::new(), 5, 0, false).is_err());
+        // n < n_splits (kfold)
+        assert!(make_folds_indices(vec![0.0, 1.0], 5, 0, false).is_err());
+        // non-finite y
+        assert!(make_folds_indices(vec![0.0, f64::NAN, 1.0], 2, 0, false).is_err());
+        assert!(make_folds_indices(vec![0.0, f64::INFINITY, 1.0], 2, 0, false).is_err());
     }
 }

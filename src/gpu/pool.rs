@@ -208,6 +208,7 @@ pub fn scatter_batched<T: Send>(
     })
 }
 
+<<<<<<< HEAD
 // Non-linux builds have no CUDA contexts to bind, so there is no device tiling to
 // perform. Some callers (e.g. the SAE decoder-Gram and S·B batched paths) invoke
 // `scatter_batched` unconditionally and rely on it existing on every target, so
@@ -216,6 +217,23 @@ pub fn scatter_batched<T: Send>(
 // back to CPU when no device is present, so a device-free run still produces
 // correct results, and the caller's `match` takes the same `Some`/`None` paths it
 // would on Linux.
+=======
+/// Non-linux `scatter_batched`: there are no CUDA contexts to bind off Linux,
+/// so device fan-out is unavailable.
+///
+/// This must exist on every target, not just Linux: not every caller is inside
+/// `#[cfg(target_os = "linux")]` — the SAE manifold per-atom Gram/smoothness
+/// scatters (`src/terms/sae_manifold.rs`) call it from platform-independent
+/// code. At runtime off Linux `GpuRuntime::global()` returns `None`, so the
+/// `Some(rt)` branch that reaches here is never taken; the body only needs to
+/// compile and honour the contract. `balanced_partition` yields no tiles when
+/// the runtime has no devices, so this reports `None` and the caller runs its
+/// deterministic whole-batch CPU fallback. The per-tile invocation is kept so
+/// the contract is honoured verbatim if a non-Linux backend ever exposes
+/// devices: each tile's closure runs over its own disjoint sub-slice, with no
+/// device binding to perform on this platform (the only step the Linux path
+/// adds).
+>>>>>>> 06a79a7be867827d299f9bc100f9ef8a47af1223
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn scatter_batched<T: Send>(
@@ -223,8 +241,28 @@ pub fn scatter_batched<T: Send>(
     items: &mut [T],
     f: impl Fn(usize, &mut [T]) -> Option<()> + Sync,
 ) -> Option<()> {
+<<<<<<< HEAD
     let ordinal = rt.device_ordinals().first().copied().unwrap_or(0);
     f(ordinal, items)
+=======
+    let tiles = balanced_partition(rt, items.len());
+    if tiles.is_empty() {
+        return None;
+    }
+    let mut rest = items;
+    let mut consumed = 0usize;
+    let mut all_ok = true;
+    for (ordinal, range) in &tiles {
+        let take = range.end - consumed;
+        let (head, tail) = rest.split_at_mut(take);
+        if f(*ordinal, head).is_none() {
+            all_ok = false;
+        }
+        rest = tail;
+        consumed = range.end;
+    }
+    if all_ok { Some(()) } else { None }
+>>>>>>> 06a79a7be867827d299f9bc100f9ef8a47af1223
 }
 
 #[cfg(test)]
