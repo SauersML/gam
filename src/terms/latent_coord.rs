@@ -242,6 +242,46 @@ impl LatentManifold {
         }
     }
 
+    /// Per-ambient-axis periodicity: `Some(period)` for an axis that wraps
+    /// modulo a finite period (a `Circle` factor, including the longitude of
+    /// the lat/lon sphere chart), `None` for a non-periodic axis (Euclidean,
+    /// Interval, or an embedded `Sphere` axis whose retraction is smooth and
+    /// has no cut).
+    ///
+    /// Used by the SAE-manifold ARD prior to switch from the cut-discontinuous
+    /// Euclidean `½α t²` to a smooth von-Mises energy on periodic axes. The
+    /// embedded `Sphere` is deliberately reported as non-periodic: its
+    /// retraction `(t+ξ)/‖t+ξ‖` is globally smooth, so the ambient `½α‖t‖²`
+    /// prior has no discontinuity there.
+    pub fn axis_periods(&self) -> Vec<Option<f64>> {
+        match self {
+            Self::Euclidean => vec![None],
+            Self::Circle { period } => {
+                assert!(
+                    period.is_finite() && *period > 0.0,
+                    "LatentManifold::Circle requires a finite positive period; got {period}"
+                );
+                vec![Some(*period)]
+            }
+            Self::Sphere { dim } => vec![None; *dim],
+            Self::Interval { .. } => vec![None],
+            Self::Product(parts) => {
+                let mut out = Vec::with_capacity(self.ambient_dim(1));
+                for part in parts {
+                    out.extend(part.axis_periods());
+                }
+                out
+            }
+            Self::ProductWithMetric { manifolds, .. } => {
+                let mut out = Vec::with_capacity(self.ambient_dim(1));
+                for part in manifolds {
+                    out.extend(part.axis_periods());
+                }
+                out
+            }
+        }
+    }
+
     /// Project an arbitrary ambient point back to the manifold.
     pub fn project_point(&self, t: ArrayView1<'_, f64>) -> Array1<f64> {
         match self {
@@ -931,6 +971,26 @@ impl LatentCoordValues {
         } else {
             self.manifold.metric_weights()
         }
+    }
+
+    /// Effective per-axis periodicity (`Some(period)` on wrapped axes). When
+    /// the declared manifold is non-Euclidean it is authoritative; when it is
+    /// Euclidean, an explicit override retraction (if any) decides. Returns a
+    /// `Vec` of length `latent_dim`.
+    pub(crate) fn effective_axis_periods(&self) -> Vec<Option<f64>> {
+        let periods = if self.manifold.is_euclidean() {
+            self.retraction_registry.axis_periods(self.latent_dim)
+        } else {
+            self.manifold.axis_periods()
+        };
+        assert_eq!(
+            periods.len(),
+            self.latent_dim,
+            "effective_axis_periods length {} != latent_dim {}",
+            periods.len(),
+            self.latent_dim
+        );
+        periods
     }
 
     pub fn with_manifold(&self, manifold: LatentManifold) -> Self {
