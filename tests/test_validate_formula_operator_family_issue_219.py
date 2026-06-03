@@ -8,7 +8,7 @@ operator family across `:`, `*`, `/`, `^`, `I(...)`, plus composition
 with `s(...)`, `te(...)`, `ti(...)`, and `group(...)`.
 
 Tests are written to fail loudly until the grammar accepts these
-operators; none are marked xfail/skip so the gap surfaces in CI.
+operators; none are masked as expected failures, so the gap surfaces in CI.
 """
 
 from __future__ import annotations

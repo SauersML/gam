@@ -4,10 +4,8 @@ Exercises post-fit deployment-time random-effect-level extension at
 ``gamfit/_model.py:1675`` together with the ``precision_hyperpriors``
 fit-time callable path at ``gamfit/_api.py:141``.
 
-A few assertions are intentionally marked ``xfail`` where the public
-Python API does not currently expose enough state to verify the
-underlying numerical relationship — those xfails point at the
-file:line in the source where the missing surface would have to live.
+Assertions are intentionally strict: public-API gaps should fail loudly rather
+than being masked as expected failures.
 """
 from __future__ import annotations
 
@@ -181,15 +179,6 @@ def test_extend_with_already_existing_level_rejected() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Fitted lambdas for a saved Model are not exposed through the Python "
-        "binding (see gamfit/_summary.py and gamfit/_model.py); cannot verify "
-        "the MAP relation (a-1+ν/2)/(b+ q/2) from src/types.rs:209 without a "
-        "summary['lambdas'] / Model.smoothing_parameters() accessor."
-    ),
-    strict=False,
-)
 def test_precision_hyperpriors_dict_path_drives_fitted_lambda() -> None:
     # Strong-prior fit vs weak-prior fit on the same data should produce
     # observably different group offsets if the dict is wired through.
@@ -211,7 +200,7 @@ def test_precision_hyperpriors_dict_path_drives_fitted_lambda() -> None:
     eta_weak = _predict_eta(weak, rows)
     spread_strong = float(np.std(eta_strong))
     spread_weak = float(np.std(eta_weak))
-    assert spread_strong < spread_weak  # xfail anchor
+    assert spread_strong < spread_weak
 
 
 def test_precision_hyperpriors_dict_path_accepts_known_label() -> None:
@@ -278,14 +267,6 @@ def test_precision_hyperpriors_callable_pair_dict_form_accepted() -> None:
     assert np.all(np.isfinite(eta))
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Fitted lambdas are not exposed to Python (no accessor in "
-        "gamfit/_summary.py or gamfit/_model.py), so the (shape, rate)->lambda* "
-        "round-trip from src/types.rs:209 cannot be checked from the public API."
-    ),
-    strict=False,
-)
 def test_precision_hyperpriors_callable_changes_fitted_lambda() -> None:
     strong = gamfit.fit(
         _training_frame(),
@@ -349,15 +330,6 @@ def test_precision_hyperpriors_callable_returning_nonfinite_is_rejected() -> Non
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Combined check of (a, b) hyperprior + non-zero prior mean against the "
-        "closed-form lambda* requires Python access to fitted lambdas and the "
-        "per-group quadratic (beta-mu)'S(beta-mu); neither is exposed (see "
-        "gamfit/_summary.py)."
-    ),
-    strict=False,
-)
 def test_hyperprior_plus_prior_mean_matches_closed_form_lambda_star() -> None:
     fit_model = gamfit.fit(
         _training_frame(),

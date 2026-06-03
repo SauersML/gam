@@ -42,7 +42,7 @@ def _mixed_signal_data(d_atom: int, *, n: int = 96, p: int = 5, seed: int = 0) -
     return z - z.mean(axis=0, keepdims=True)
 
 
-def _fit_or_xfail(z: np.ndarray, *, atom_topology: str, d_atom: int):
+def _fit_or_fail(z: np.ndarray, *, atom_topology: str, d_atom: int):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -62,7 +62,7 @@ def _fit_or_xfail(z: np.ndarray, *, atom_topology: str, d_atom: int):
                 random_state=13,
             )
     except Exception as exc:
-        pytest.xfail(
+        pytest.fail(
             "SAE manifold topology x d_atom matrix documents the current "
             f"d=1 solver gap and related convergence work: "
             f"atom_topology={atom_topology!r}, d_atom={d_atom}, "
@@ -73,9 +73,9 @@ def _fit_or_xfail(z: np.ndarray, *, atom_topology: str, d_atom: int):
         or not np.isfinite(fit.reconstruction_r2)
         or fit.reconstruction_r2 < MIN_R2
     ):
-        pytest.xfail(
+        pytest.fail(
             "SAE manifold topology x d_atom matrix did not pass the "
-            f"skip-if-not-converged guard for atom_topology={atom_topology!r}, "
+            f"convergence guard for atom_topology={atom_topology!r}, "
             f"d_atom={d_atom}: reconstruction_r2={fit.reconstruction_r2!r}"
         )
     return fit
@@ -85,7 +85,7 @@ def _fit_or_xfail(z: np.ndarray, *, atom_topology: str, d_atom: int):
 @pytest.mark.parametrize("d_atom", D_ATOMS)
 def test_sae_manifold_fits_each_topology_dimension_pair(atom_topology: str, d_atom: int):
     z = _mixed_signal_data(d_atom, seed=100 + d_atom)
-    fit = _fit_or_xfail(z, atom_topology=atom_topology, d_atom=d_atom)
+    fit = _fit_or_fail(z, atom_topology=atom_topology, d_atom=d_atom)
 
     assert fit.fitted.shape == z.shape
     assert fit.assignments.shape == (z.shape[0], 1)

@@ -17178,7 +17178,10 @@ fn zscore_train_test_arrays<'py>(
             te_out[[i, j]] = (te[[i, j]] - mean) / std;
         }
     }
-    Ok((tr_out.into_pyarray(py).unbind(), te_out.into_pyarray(py).unbind()))
+    Ok((
+        tr_out.into_pyarray(py).unbind(),
+        te_out.into_pyarray(py).unbind(),
+    ))
 }
 
 #[pyfunction]
@@ -23216,7 +23219,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_loss_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(nagelkerke_r2_from_predictions, module)?)?;
     module.add_function(wrap_pyfunction!(make_folds_indices, module)?)?;
-    module.add_function(wrap_pyfunction!(gaussian_log_loss_from_predictions, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        gaussian_log_loss_from_predictions,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         gaussian_prediction_scores_from_predictions,
         module

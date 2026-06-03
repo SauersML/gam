@@ -123,15 +123,21 @@ fn gamma_dispersion_is_conditional_noise_not_mean_spread() {
         mu.push(mui);
         y.push(yi);
     }
-    assert!(y.iter().all(|&v| v > 0.0), "Gamma outcomes must be positive");
+    assert!(
+        y.iter().all(|&v| v > 0.0),
+        "Gamma outcomes must be positive"
+    );
 
     // --- model-independent truth: φ from the KNOWN means --------------------
     // E[(y/μ − 1)²] = Var(y)/μ² = φ. This uses the true μ, not any fitted value,
     // so it is an unbiased estimate of the conditional dispersion regardless of
     // the model.
-    let phi_true: f64 =
-        y.iter().zip(mu.iter()).map(|(&yi, &mui)| (yi / mui - 1.0).powi(2)).sum::<f64>()
-            / (n as f64);
+    let phi_true: f64 = y
+        .iter()
+        .zip(mu.iter())
+        .map(|(&yi, &mui)| (yi / mui - 1.0).powi(2))
+        .sum::<f64>()
+        / (n as f64);
 
     // --- fit y ~ s(x, k=10) with a Gamma(log) family ------------------------
     let headers: Vec<String> = ["y", "x"].into_iter().map(String::from).collect();
