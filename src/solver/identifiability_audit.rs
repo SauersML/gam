@@ -1644,10 +1644,9 @@ pub fn audit_identifiability_channel_aware(
     // cross-block alias is still caught by `hard_alias_pair`.
     let intra_block_only_ca = aliased_pairs.is_empty();
 
-    let fatal = (joint_rank_deficient
-        && !gauge_resolves_rank_deficiency_ca
-        && !intra_block_only_ca)
-        || hard_alias_pair.is_some();
+    let fatal =
+        (joint_rank_deficient && !gauge_resolves_rank_deficiency_ca && !intra_block_only_ca)
+            || hard_alias_pair.is_some();
 
     let fatal_detail = if fatal {
         let mut parts: Vec<String> = Vec::new();

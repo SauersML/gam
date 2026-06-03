@@ -2127,13 +2127,7 @@ mod tests {
     /// diagonal collapses toward ~0.25, never 1).
     #[test]
     fn gamma_log_nuts_target_curvature_matches_unscaled_hessian_issue_680() {
-        let x = array![
-            [1.0, -0.7],
-            [1.0, 0.3],
-            [1.0, 1.1],
-            [1.0, -0.2],
-            [1.0, 0.8],
-        ];
+        let x = array![[1.0, -0.7], [1.0, 0.3], [1.0, 1.1], [1.0, -0.2], [1.0, 0.8],];
         let mode = array![0.4_f64, -0.6_f64];
         let y = array![1.2_f64, 0.7, 2.3, 0.9, 1.6];
         let weights = array![1.0_f64, 1.5, 0.8, 1.2, 1.0];

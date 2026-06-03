@@ -2216,13 +2216,6 @@ impl ArrowSchurSystem {
         self.row_hessian_fingerprint = self.current_row_hessian_fingerprint();
     }
 
-    /// Mark dense per-row cross-block slabs as active supplements to the
-    /// installed matrix-free row operator.
-    pub fn activate_dense_htbeta_supplement(&mut self) {
-        self.htbeta_dense_supplement = true;
-        self.refresh_row_hessian_fingerprint();
-    }
-
     /// Install a matrix-free shared-block operator for Agarwal-style
     /// inexact Schur PCG.
     ///
@@ -2245,6 +2238,13 @@ impl ArrowSchurSystem {
         )));
         self.hbb_matvec = Some(matvec_arc);
         self.hbb_diag = Some(diag);
+        self.refresh_row_hessian_fingerprint();
+    }
+
+    /// Mark the dense per-row cross-block slabs as active supplements to the
+    /// installed matrix-free row operator.
+    pub fn activate_dense_htbeta_supplement(&mut self) {
+        self.htbeta_dense_supplement = true;
         self.refresh_row_hessian_fingerprint();
     }
 
@@ -3405,11 +3405,7 @@ fn sys_htbeta_materialize_row(
                 mat[[c, a]] += col[c];
             }
         }
-        mat
-    } else {
-        if use_dense && row.htbeta.dim() == (di, k) {
-            return mat;
-        }
+    } else if use_dense && row.htbeta.dim() != (di, k) {
         // SAFETY: reaching here means the assembler installed neither a
         // correctly-shaped (di, k) dense H_tβ block nor an htbeta_matvec
         // operator — a construction-time invariant violation in the caller, not
@@ -3420,6 +3416,7 @@ fn sys_htbeta_materialize_row(
             row.htbeta.dim()
         );
     }
+    mat
 }
 
 /// Probe each column of `H_tβ^(row)` by applying the operator to `e_a` and
@@ -7109,11 +7106,12 @@ mod tests {
     #[test]
     fn sys_htbeta_materialize_row_sums_operator_and_dense_slab() {
         let mut sys = ArrowSchurSystem::new(1, 1, 3);
-        sys.rows[0].htbeta = array![[0.25_f64, 0.5, -0.75]];
+        sys.rows[0].htbeta = array![[0.25_f64, 0.5, 0.75]];
+        sys.activate_dense_htbeta_supplement();
         sys.set_row_htbeta_operator(
             |row_idx, x, out| {
                 assert_eq!(row_idx, 0);
-                out[0] = 2.0 * x[0] - x[1] + 0.5 * x[2];
+                out[0] += 2.0 * x[0] - x[1] + 0.5 * x[2];
             },
             |row_idx, v, out| {
                 assert_eq!(row_idx, 0);
@@ -7122,15 +7120,14 @@ mod tests {
                 out[2] += 0.5 * v[0];
             },
         );
-        sys.activate_dense_htbeta_supplement();
 
         let htbeta = sys_htbeta_materialize_row(&sys, 0, &sys.rows[0]);
-        assert_eq!(htbeta, array![[2.25_f64, -0.5, -0.25]]);
+        assert_eq!(htbeta, array![[2.25_f64, -0.5, 1.25]]);
 
         let x = array![1.0_f64, 2.0, -1.0];
         let mut applied = Array1::<f64>::zeros(1);
         sys_htbeta_apply_row(&sys, 0, &sys.rows[0], x.view(), &mut applied);
-        assert!((applied[0] - 1.5).abs() < 1.0e-12);
+        assert!((applied[0] - 0.0).abs() < 1.0e-12);
 
         let mut transposed = Array1::<f64>::zeros(3);
         sys_htbeta_accumulate_transpose(
@@ -7140,7 +7137,7 @@ mod tests {
             array![2.0_f64].view(),
             &mut transposed,
         );
-        assert_eq!(transposed, array![4.5_f64, -1.0, -0.5]);
+        assert_eq!(transposed, array![4.5_f64, -1.0, 2.5]);
     }
 
     /// Issue #195 / gam#578: when the per-row block is barely-PD at

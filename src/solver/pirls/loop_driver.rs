@@ -1376,8 +1376,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // re-solve follows it on the exit paths below, the reported shape
             // always equals `estimate_gamma_shape_from_eta(final_eta)` — the
             // self-consistency invariant the in-module Gamma unit test checks.
-            working_model.likelihood =
-                working_model.likelihood.clone().with_gamma_shape(refreshed_shape);
+            working_model.likelihood = working_model
+                .likelihood
+                .clone()
+                .with_gamma_shape(refreshed_shape);
             working_model.gamma_shape_locked = true;
             if rel_change <= SHAPE_REFRESH_REL_TOL {
                 // Converged: the working-state buffers (weights, Hessian,

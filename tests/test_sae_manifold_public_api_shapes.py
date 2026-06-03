@@ -30,7 +30,7 @@ def _two_atom_curve_data(n: int = 120, seed: int = 0) -> np.ndarray:
     return z - z.mean(axis=0, keepdims=True)
 
 
-def _fresh_two_atom_fit_or_xfail(z: np.ndarray):
+def _fresh_two_atom_fit_or_fail(z: np.ndarray):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -50,7 +50,7 @@ def _fresh_two_atom_fit_or_xfail(z: np.ndarray):
                 random_state=21,
             )
     except Exception as exc:
-        pytest.xfail(
+        pytest.fail(
             "per-atom uncertainty and coordinate-range public API test is "
             "guarded until the current d=1 multi-atom solver gap converges: "
             f"{type(exc).__name__}: {exc}"
@@ -60,9 +60,9 @@ def _fresh_two_atom_fit_or_xfail(z: np.ndarray):
         or not np.isfinite(fit.reconstruction_r2)
         or fit.reconstruction_r2 < 0.05
     ):
-        pytest.xfail(
+        pytest.fail(
             "per-atom uncertainty and coordinate-range public API test did "
-            "not pass the skip-if-not-converged guard: "
+            "not pass the convergence guard: "
             f"reconstruction_r2={fit.reconstruction_r2!r}"
         )
     return fit
@@ -70,7 +70,7 @@ def _fresh_two_atom_fit_or_xfail(z: np.ndarray):
 
 def test_per_atom_uncertainty_shape_band_and_coordinate_range_shapes_are_sane():
     z = _two_atom_curve_data()
-    fit = _fresh_two_atom_fit_or_xfail(z)
+    fit = _fresh_two_atom_fit_or_fail(z)
     p = z.shape[1]
 
     assert len(fit.atoms) == 2
@@ -84,7 +84,7 @@ def test_per_atom_uncertainty_shape_band_and_coordinate_range_shapes_are_sane():
             or atom.shape_band_mean is None
             or atom.shape_band_sd is None
         ):
-            pytest.xfail(
+            pytest.fail(
                 "fresh SAE fit did not populate per-atom posterior "
                 f"uncertainty arrays for atom={atom_k}"
             )
