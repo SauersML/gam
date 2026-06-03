@@ -18,11 +18,6 @@ git tag and both package versions.
 
 ## v0.3.79 — gam 0.3.79 / gamfit 0.1.151 (2026-06-03)
 
-> Supersedes the yanked `gam` 0.3.78: that tag failed a release-time
-> version-reference check (`build.rs`) before any wheel shipped, so `gamfit`
-> 0.1.151 is published for the first time here.
-
-
 ### New
 
 - **Cross-atom decoder incoherence for manifold SAE fits**
