@@ -1599,10 +1599,11 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
     hasher.write_usize(sys.d);
     hasher.write_usize(sys.k);
     // When htbeta_matvec is installed (Kronecker / matrix-free path),
-    // row.htbeta is a zero slab that does not capture the operator state.
-    // Hash the Arc pointer address as a proxy: a new Arc is allocated per
-    // assemble call, so the fingerprint is invalidated each time the system
-    // is rebuilt with a fresh Kronecker operator.
+    // row.htbeta is usually a zero slab that does not capture the operator
+    // state. Hash the Arc pointer address as a proxy: a new Arc is allocated
+    // per assemble call, so the fingerprint is invalidated each time the
+    // system is rebuilt with a fresh Kronecker operator. Analytic penalties may
+    // opt into a dense supplemental slab; when active, hash it as well.
     // SAFETY: We cast the fat pointer to a thin *const () to extract the data
     // pointer address as a fingerprint proxy. No dereference occurs; the only
     // use is as a usize hash input, which is sound for any aligned pointer.
@@ -1613,7 +1614,12 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
     for row in sys.rows.iter() {
         write_array2_fingerprint(&mut hasher, &row.htt);
         match htbeta_op_addr {
-            Some(addr) => hasher.write_usize(addr),
+            Some(addr) => {
+                hasher.write_usize(addr);
+                if sys.htbeta_dense_supplement {
+                    write_array2_fingerprint(&mut hasher, &row.htbeta);
+                }
+            }
             None => write_array2_fingerprint(&mut hasher, &row.htbeta),
         }
     }
@@ -1946,6 +1952,9 @@ pub struct ArrowSchurSystem {
     /// GPU PCG and streaming Schur paths to `O(m_i · p)` per row. Installed in
     /// lock-step with `htbeta_matvec` by [`Self::set_row_htbeta_operator`].
     pub htbeta_transpose_matvec: Option<RowHtbetaTransposeMatvec>,
+    /// Whether `rows[*].htbeta` contains a dense contribution that must be added
+    /// on top of the matrix-free row operator.
+    pub htbeta_dense_supplement: bool,
     /// Optional diagonal of the matrix-free shared block, used by the
     /// Schur-Jacobi preconditioner in the Agarwal-style PCG path.
     pub hbb_diag: Option<Array1<f64>>,
@@ -2063,6 +2072,7 @@ impl ArrowSchurSystem {
             hbb_matvec: None,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
+            htbeta_dense_supplement: false,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d,
@@ -2116,6 +2126,7 @@ impl ArrowSchurSystem {
             hbb_matvec: Some(matvec_arc),
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
+            htbeta_dense_supplement: false,
             hbb_diag: Some(diag),
             gb: Array1::<f64>::zeros(k),
             d,
@@ -2161,6 +2172,7 @@ impl ArrowSchurSystem {
             hbb_matvec: None,
             htbeta_matvec: None,
             htbeta_transpose_matvec: None,
+            htbeta_dense_supplement: false,
             hbb_diag: None,
             gb: Array1::<f64>::zeros(k),
             d: max_d,
@@ -2202,6 +2214,13 @@ impl ArrowSchurSystem {
     /// Store the current row-system fingerprint on the system.
     pub fn refresh_row_hessian_fingerprint(&mut self) {
         self.row_hessian_fingerprint = self.current_row_hessian_fingerprint();
+    }
+
+    /// Mark dense per-row cross-block slabs as active supplements to the
+    /// installed matrix-free row operator.
+    pub fn activate_dense_htbeta_supplement(&mut self) {
+        self.htbeta_dense_supplement = true;
+        self.refresh_row_hessian_fingerprint();
     }
 
     /// Install a matrix-free shared-block operator for Agarwal-style
@@ -3297,9 +3316,9 @@ impl std::fmt::Debug for ArrowUndampedFactors {
 
 /// Apply `H_tβ^(row) · x` for one row, writing into `out` (length `d`).
 ///
-/// Routes through `sys.htbeta_matvec` when present; otherwise indexes the dense
-/// `row.htbeta` slab.  Panics when neither is available (zero-sized block and no
-/// matvec) — callers must not invoke this when no cross-block is wired.
+/// Sums the installed matrix-free operator, when present, and any correctly
+/// shaped dense `row.htbeta` slab. This lets structured data-fit rows coexist
+/// with dense analytic-penalty cross blocks on the same row.
 fn sys_htbeta_apply_row(
     sys: &ArrowSchurSystem,
     row_idx: usize,
@@ -3307,18 +3326,20 @@ fn sys_htbeta_apply_row(
     x: ArrayView1<'_, f64>,
     out: &mut Array1<f64>,
 ) {
+    out.fill(0.0);
     if let Some(op) = sys.htbeta_matvec.as_ref() {
         op(row_idx, x, out);
-    } else {
-        // Per-row dim from the actual block shape (supports hetereogeneous systems).
+    }
+    if (sys.htbeta_dense_supplement || sys.htbeta_matvec.is_none())
+        && row.htbeta.dim() == (out.len(), sys.k)
+    {
         let di = row.htbeta.nrows();
-        let k = sys.k;
         for c in 0..di {
             let mut acc = 0.0_f64;
-            for a in 0..k {
+            for a in 0..sys.k {
                 acc += row.htbeta[[c, a]] * x[a];
             }
-            out[c] = acc;
+            out[c] += acc;
         }
     }
 }
@@ -3327,8 +3348,8 @@ fn sys_htbeta_apply_row(
 ///
 /// `out[a] += Σ_c H_tβ^(row)[c, a] · v[c]`
 ///
-/// Routes through `sys.htbeta_matvec` (column-probe) when present; otherwise
-/// indexes the dense `row.htbeta` slab directly.
+/// Sums the installed matrix-free operator, when present, and any correctly
+/// shaped dense `row.htbeta` slab.
 fn sys_htbeta_accumulate_transpose(
     sys: &ArrowSchurSystem,
     row_idx: usize,
@@ -3337,18 +3358,18 @@ fn sys_htbeta_accumulate_transpose(
     out: &mut Array1<f64>,
 ) {
     if let Some(op) = sys.htbeta_matvec.as_ref() {
-        let di = v.len();
-        htbeta_probe_transpose(row_idx, op, v, out, di, sys.k);
-    } else {
-        // Per-row dim from actual block shape.
+        htbeta_probe_transpose(row_idx, op, v, out, v.len(), sys.k);
+    }
+    if (sys.htbeta_dense_supplement || sys.htbeta_matvec.is_none())
+        && row.htbeta.dim() == (v.len(), sys.k)
+    {
         let di = row.htbeta.nrows();
-        let k = sys.k;
         for c in 0..di {
             let vc = v[c];
             if vc == 0.0 {
                 continue;
             }
-            for a in 0..k {
+            for a in 0..sys.k {
                 out[a] += row.htbeta[[c, a]] * vc;
             }
         }
@@ -3357,10 +3378,8 @@ fn sys_htbeta_accumulate_transpose(
 
 /// Materialize the dense `(di, k)` cross-block for one row.
 ///
-/// When `sys.htbeta_matvec` is set, probes each of the `k` standard basis
-/// vectors to reconstruct the matrix.  The operator is authoritative in the
-/// matrix-free SAE path; dense slabs may be allocated but intentionally unwritten.
-/// When no operator is installed, clones the correctly shaped dense slab.
+/// Materializes the sum of the installed matrix-free operator and any correctly
+/// shaped dense slab on the row.
 fn sys_htbeta_materialize_row(
     sys: &ArrowSchurSystem,
     row_idx: usize,
@@ -3368,8 +3387,13 @@ fn sys_htbeta_materialize_row(
 ) -> Array2<f64> {
     let di = sys.row_dims[row_idx];
     let k = sys.k;
+    let use_dense = sys.htbeta_dense_supplement || sys.htbeta_matvec.is_none();
+    let mut mat = if use_dense && row.htbeta.dim() == (di, k) {
+        row.htbeta.clone()
+    } else {
+        Array2::<f64>::zeros((di, k))
+    };
     if let Some(op) = sys.htbeta_matvec.as_ref() {
-        let mut mat = Array2::<f64>::zeros((di, k));
         let mut e_a = Array1::<f64>::zeros(k);
         let mut col = Array1::<f64>::zeros(di);
         for a in 0..k {
@@ -3378,13 +3402,13 @@ fn sys_htbeta_materialize_row(
             col.fill(0.0);
             op(row_idx, e_a.view(), &mut col);
             for c in 0..di {
-                mat[[c, a]] = col[c];
+                mat[[c, a]] += col[c];
             }
         }
         mat
     } else {
-        if row.htbeta.dim() == (di, k) {
-            return row.htbeta.clone();
+        if use_dense && row.htbeta.dim() == (di, k) {
+            return mat;
         }
         // SAFETY: reaching here means the assembler installed neither a
         // correctly-shaped (di, k) dense H_tβ block nor an htbeta_matvec
@@ -4304,8 +4328,8 @@ where
     // are indistinguishable from rounding noise; increases smaller than this
     // are pure rounding and indicate the incumbent is already a (numerical)
     // stationary point.
-    let objective_resolution = correction.convergence_objective_rel_tol.max(0.0)
-        * (current_objective_value.abs() + 1.0);
+    let objective_resolution =
+        correction.convergence_objective_rel_tol.max(0.0) * (current_objective_value.abs() + 1.0);
 
     let mut proximal_ridge = correction.initial_ridge.max(0.0);
     let mut last_reason = String::from("no attempts were made");
@@ -7083,9 +7107,9 @@ mod tests {
     }
 
     #[test]
-    fn sys_htbeta_materialize_row_prefers_operator_over_allocated_zero_slab() {
+    fn sys_htbeta_materialize_row_sums_operator_and_dense_slab() {
         let mut sys = ArrowSchurSystem::new(1, 1, 3);
-        sys.rows[0].htbeta = Array2::<f64>::zeros((1, 3));
+        sys.rows[0].htbeta = array![[0.25_f64, 0.5, -0.75]];
         sys.set_row_htbeta_operator(
             |row_idx, x, out| {
                 assert_eq!(row_idx, 0);
@@ -7098,9 +7122,25 @@ mod tests {
                 out[2] += 0.5 * v[0];
             },
         );
+        sys.activate_dense_htbeta_supplement();
 
         let htbeta = sys_htbeta_materialize_row(&sys, 0, &sys.rows[0]);
-        assert_eq!(htbeta, array![[2.0_f64, -1.0, 0.5]]);
+        assert_eq!(htbeta, array![[2.25_f64, -0.5, -0.25]]);
+
+        let x = array![1.0_f64, 2.0, -1.0];
+        let mut applied = Array1::<f64>::zeros(1);
+        sys_htbeta_apply_row(&sys, 0, &sys.rows[0], x.view(), &mut applied);
+        assert!((applied[0] - 1.5).abs() < 1.0e-12);
+
+        let mut transposed = Array1::<f64>::zeros(3);
+        sys_htbeta_accumulate_transpose(
+            &sys,
+            0,
+            &sys.rows[0],
+            array![2.0_f64].view(),
+            &mut transposed,
+        );
+        assert_eq!(transposed, array![4.5_f64, -1.0, -0.5]);
     }
 
     /// Issue #195 / gam#578: when the per-row block is barely-PD at

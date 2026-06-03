@@ -16,6 +16,25 @@ The two packages are versioned independently — `gam` tracks the Rust engine,
 `gamfit` the Python wheel — but released together. Each entry is headed with the
 git tag and both package versions.
 
+## v0.3.80 — gam 0.3.80 / gamfit 0.1.152 (2026-06-03)
+
+### Fixed
+
+- **Manifold SAE isometry curvature now includes the coupled coordinate/decoder
+  Gauss-Newton cross block.** The Arrow-Schur system can now add dense analytic
+  `H_tβ` supplements on top of the matrix-free row operator, so the isometry
+  metric penalty contributes consistently to `H_tt`, `H_tβ`, and `H_ββ` instead
+  of leaving the Schur complement with a missing cross term.
+- **Matrix-free and dense SAE cross-block curvature now compose deterministically.**
+  `ArrowSchurSystem` fingerprints dense `H_tβ` supplements when they are active,
+  and all apply/materialize/transpose paths sum the matrix-free and dense pieces.
+
+### Notes
+
+- This release intentionally keeps the strict SAE KKT gradient tolerance. It does
+  not include the earlier experimental tolerance relaxation that made low-quality
+  isometry fits appear converged.
+
 ## v0.3.79 — gam 0.3.79 / gamfit 0.1.151 (2026-06-03)
 
 ### New
