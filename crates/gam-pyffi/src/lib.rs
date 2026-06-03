@@ -23958,9 +23958,10 @@ fn extend_model_with_random_effect_level(
     let coefficient_variance = match supplied_variance {
         Some(variance) => variance,
         None => {
-            let fit = payload.fit_result.as_ref().ok_or_else(|| {
-                "extend_with_group requires saved fit_result; refit".to_string()
-            })?;
+            let fit = payload
+                .fit_result
+                .as_ref()
+                .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?;
             let lambda = fit
                 .lambdas
                 .get(penalty_index)
