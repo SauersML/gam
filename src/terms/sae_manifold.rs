@@ -1058,6 +1058,23 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
         // Cap the total number of grid points; pick the largest per-axis count
         // whose d-th power stays within the cap (at least 2 per axis).
         const MAX_GRID_POINTS: usize = 4096;
+        // Even the coarsest dense grid is `2^d` points: above `d = 12` that
+        // already exceeds the cap, so no on-manifold grid can satisfy it (the
+        // `per_axis > 2` loop floors at 2 and would otherwise emit a runaway
+        // `2^d`-row grid that the per-row global-argmin scan must then walk). A
+        // dense seed grid is infeasible for such a high-dimensional torus
+        // anyway, so fall back to the incoming (PCA) seed exactly as the
+        // unbounded / basis-linear evaluators do.
+        let mut floor_total: usize = 1;
+        for _ in 0..d {
+            match floor_total.checked_mul(2) {
+                Some(v) => floor_total = v,
+                None => return None,
+            }
+        }
+        if floor_total > MAX_GRID_POINTS {
+            return None;
+        }
         let mut per_axis = resolution.max(2);
         while per_axis > 2 {
             let mut total: usize = 1;
@@ -1640,7 +1657,36 @@ pub struct SaeManifoldAtom {
     pub basis_values: Array2<f64>,
     pub basis_jacobian: Array3<f64>,
     pub decoder_coefficients: Array2<f64>,
+    /// Effective (intrinsic) roughness Gram `S̃_k` that every consumer reads
+    /// (smoothness value, gradient, Kronecker Hessian op, REML rank/log-det).
+    ///
+    /// `S̃_k` is the raw coefficient-space Gram [`Self::smooth_penalty_raw`]
+    /// reparameterized by the decoder pullback metric so the roughness — and
+    /// hence the topology evidence — is gauge-invariant under reparameterization
+    /// of the latent coordinate `t` (issue #673). It is recomputed from the
+    /// current basis Jacobian and decoder coefficients by
+    /// [`Self::refresh_intrinsic_smooth_penalty`] (lagged-diffusivity: the
+    /// metric weight is frozen within each inner Newton/evidence assembly and
+    /// refreshed between them, so at convergence the penalty is the true
+    /// arc-length roughness). For constant-speed atoms (the periodic sin/cos
+    /// basis on `S¹`) the metric weight is uniform, so `S̃_k = c·S_k` and the
+    /// relative roughness — the only thing the topology comparison sees — is
+    /// unchanged.
     pub smooth_penalty: Array2<f64>,
+    /// Canonical raw roughness Gram `S_k` in raw coefficient/`t` space (the
+    /// finite-/cyclic-difference Reinsch Gram or the Duchon RKHS Gram). Never
+    /// mutated after construction; [`Self::smooth_penalty`] is derived from it
+    /// each assembly via the pullback-metric reweighting.
+    pub smooth_penalty_raw: Array2<f64>,
+    /// Roughness operator order `r` of [`Self::smooth_penalty_raw`], recovered
+    /// once at construction as its null-space dimension (an order-`r`
+    /// difference / Duchon penalty annihilates the degree-`<r` polynomials, so
+    /// `nullity(S) = r`). Sets the arc-length reweighting exponent
+    /// `β = ½ − r` (`β = −3/2` for the standard second-derivative penalty):
+    /// the metric-speed power that converts raw-`t` roughness into intrinsic
+    /// arc-length roughness. `0` when the raw Gram is empty/zero (no
+    /// reweighting).
+    pub smooth_penalty_order: usize,
     pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     /// Same evaluator upcast to `dyn SaeBasisSecondJet` when the
     /// implementation provides a closed-form Hessian. `None` for
@@ -1688,17 +1734,30 @@ impl SaeManifoldAtom {
         if p == 0 {
             return Err("SaeManifoldAtom::new: decoder output dimension must be positive".into());
         }
-        Ok(Self {
+        // Recover the roughness operator order `r` from the raw Gram's
+        // null-space dimension (`nullity(S) = r` for an order-`r` difference /
+        // Duchon penalty). This pins the arc-length reweighting exponent
+        // `β = ½ − r` once, so the per-assembly reweighting needs no
+        // eigendecomposition in the hot loop.
+        let smooth_penalty_order = smooth_penalty_nullity(&smooth_penalty)?;
+        let mut atom = Self {
             name: name.into(),
             basis_kind,
             latent_dim,
             basis_values,
-            basis_jacobian,
             decoder_coefficients,
+            smooth_penalty_raw: smooth_penalty.clone(),
             smooth_penalty,
+            smooth_penalty_order,
+            basis_jacobian,
             basis_evaluator: None,
             basis_second_jet: None,
-        })
+        };
+        // Seed `smooth_penalty` with the intrinsic Gram at the initial
+        // decoder/coordinates so the very first assembly already reads the
+        // pullback-metric-reweighted penalty.
+        atom.refresh_intrinsic_smooth_penalty();
+        Ok(atom)
     }
 
     pub fn with_basis_evaluator(mut self, evaluator: Arc<dyn SaeBasisEvaluator>) -> Self {
@@ -1814,6 +1873,173 @@ impl SaeManifoldAtom {
             }
         }
     }
+
+    /// Recompute the intrinsic (arc-length) roughness Gram
+    /// [`Self::smooth_penalty`] from [`Self::smooth_penalty_raw`], the current
+    /// basis Jacobian, and the current decoder coefficients (issue #673).
+    ///
+    /// The raw penalty `0.5·λ·tr(BᵀS B)` measures roughness per unit of the raw
+    /// latent coordinate `t`, so it is *not* invariant under reparameterizing
+    /// `t` — and the model evidence that ranks an atom's topology (circle vs
+    /// line) inherits that gauge dependence. The decoder curve is
+    /// `g(t) = Φ(t) B` and its pulled-back metric is the scalar squared speed
+    /// `m(t) = ‖g'(t)‖² = ‖J(t)‖²` with `J(t) = Φ'(t) B` (the decoder
+    /// Jacobian, [`Self::fill_decoded_derivative_row`]). The arc-length
+    /// roughness of an order-`r` operator reweights the raw-`t` derivative
+    /// energy density by `m^{½−r}` (`= m^{−3/2}` for the standard
+    /// second-derivative penalty), which removes the gauge dependence.
+    ///
+    /// Realised as a per-coefficient symmetric congruence
+    /// `S̃ = W^{½} S W^{½}`, `W = diag(w_μ)`, `w_μ = m̄_μ^{β}`, `β = ½ − r`,
+    /// where `m̄_μ` is the basis-activation-weighted average squared speed
+    /// localised to coefficient `μ`,
+    /// `m̄_μ = (Σ_n Φ_μ(t_n)² m_n) / Σ_n Φ_μ(t_n)²`, `m_n = ‖J(t_n)‖²`. The
+    /// congruence keeps `S̃` symmetric PSD with the same rank as `S` (Sylvester
+    /// inertia), so the Kronecker Hessian `S̃ ⊗ I_p` and the REML
+    /// `rank(S)`-Occam term are structurally unchanged; only the metric-aware
+    /// log-det / quadratic value move, which is exactly the gauge correction.
+    ///
+    /// The metric weight is frozen at the current `B` (lagged-diffusivity /
+    /// IRLS surrogate): within one inner solve the penalty stays a quadratic
+    /// Gram form, and refreshing `W` between assemblies makes the *converged*
+    /// penalty the true arc-length roughness. Constant-speed atoms (the
+    /// periodic sin/cos basis, `m̄_μ ≡ c`) get `S̃ = c^β S`, a uniform rescale
+    /// that leaves relative roughness — the only thing the topology comparison
+    /// reads — unchanged, so periodic atoms are unaffected.
+    ///
+    /// Conservative scope: the scalar-speed reweighting is the genuine
+    /// arc-length normalisation only for a 1-D latent (the circle-vs-line case
+    /// the issue is about). For `latent_dim != 1`, or a degenerate (empty/zero)
+    /// raw Gram, `S̃ = S` is left untouched.
+    pub fn refresh_intrinsic_smooth_penalty(&mut self) {
+        let m = self.basis_size();
+        // No reweighting when there is no penalty operator order to invert into
+        // arc length, or for higher-dim latents where the metric is a matrix
+        // (det(g) volume reweighting is deferred — see scope note above).
+        if m == 0 || self.smooth_penalty_order == 0 || self.latent_dim != 1 {
+            self.smooth_penalty.assign(&self.smooth_penalty_raw);
+            return;
+        }
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let beta = 0.5 - self.smooth_penalty_order as f64;
+
+        // Per-sample squared speed m_n = ‖J(t_n)‖², J(t_n) = Φ'(t_n) B (axis 0,
+        // the single latent axis), and the basis-activation accumulators
+        // act_μ = Σ_n Φ_μ(t_n)² and num_μ = Σ_n Φ_μ(t_n)² m_n.
+        let mut act = vec![0.0_f64; m];
+        let mut num = vec![0.0_f64; m];
+        let mut deriv = vec![0.0_f64; p];
+        for row in 0..n {
+            self.fill_decoded_derivative_row(row, 0, &mut deriv);
+            let mut speed_sq = 0.0_f64;
+            for &d in deriv.iter() {
+                speed_sq += d * d;
+            }
+            for col in 0..m {
+                let phi = self.basis_values[[row, col]];
+                let w = phi * phi;
+                if w == 0.0 {
+                    continue;
+                }
+                act[col] += w;
+                num[col] += w * speed_sq;
+            }
+        }
+
+        // Representative squared speed per coefficient, and the geometric-mean
+        // center of the finite positive speeds. Only finite positive speeds
+        // enter the center so a degenerate (inf/NaN) sample cannot corrupt it.
+        let mut speeds = vec![0.0_f64; m];
+        let mut log_acc = 0.0_f64;
+        let mut log_cnt = 0usize;
+        for col in 0..m {
+            let s = if act[col] > 0.0 { num[col] / act[col] } else { 0.0 };
+            speeds[col] = s;
+            if s > 0.0 && s.is_finite() {
+                log_acc += s.ln();
+                log_cnt += 1;
+            }
+        }
+        let center = if log_cnt > 0 {
+            (log_acc / log_cnt as f64).exp()
+        } else {
+            0.0
+        };
+        // Degenerate curve (no finite positive speed anywhere, or a non-finite
+        // center): the pullback metric carries no usable scale, so leave the
+        // penalty at its raw Gram — exactly `S̃ = S_raw`, matching the
+        // constant-speed limit with no spurious magnitude inflation.
+        if !(center > 0.0 && center.is_finite()) {
+            self.smooth_penalty.assign(&self.smooth_penalty_raw);
+            return;
+        }
+
+        // Reweight relative to the center so the congruence is a *scale-free*
+        // shape reweighting: the geometric mean of `w_μ` is 1, so a
+        // constant-speed atom (every `s_μ = center`) gives `w_μ ≡ 1` and hence
+        // `S̃ = S_raw` exactly — periodic atoms are untouched and no overall
+        // magnitude (which `λ` already owns) leaks in. The relative floor keeps
+        // a vanishing-speed coefficient at a small fraction of the typical
+        // speed rather than a singular negative power, and clamps any non-finite
+        // ratio back to a finite weight.
+        const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
+        let mut root_w = vec![0.0_f64; m];
+        for col in 0..m {
+            // Normalised squared speed (ratio to the geometric-mean center),
+            // floored below and treated as the floor when non-finite.
+            let ratio = speeds[col] / center;
+            let ratio = if ratio.is_finite() {
+                ratio.max(RELATIVE_SPEED_FLOOR)
+            } else {
+                // inf/NaN ratio (e.g. an overflowed speed) → cap at 1/floor so
+                // its weight stays finite and the rank is preserved.
+                1.0 / RELATIVE_SPEED_FLOOR
+            };
+            // w_μ = ratio^β; the congruence uses W^{½}, so store ratio^{β/2}.
+            root_w[col] = ratio.powf(0.5 * beta);
+        }
+
+        // S̃ = W^{½} S_raw W^{½}: scale row i and column j by root_w.
+        for i in 0..m {
+            let ri = root_w[i];
+            for j in 0..m {
+                self.smooth_penalty[[i, j]] = ri * self.smooth_penalty_raw[[i, j]] * root_w[j];
+            }
+        }
+    }
+}
+
+/// Null-space dimension of the symmetric PSD roughness Gram `S` — the order
+/// `r` of the difference / Duchon penalty it encodes (`nullity(S) = r`, since
+/// the operator annihilates exactly the degree-`<r` polynomials). Used once at
+/// atom construction to fix the arc-length reweighting exponent `β = ½ − r`.
+///
+/// Numerical null space: eigenvalues at or below `1e-9 · max_eig` (the same
+/// conventional relative spectral cutoff [`SaeManifoldTerm::symmetric_rank`]
+/// uses for `S`'s rank).
+fn smooth_penalty_nullity(s: &Array2<f64>) -> Result<usize, String> {
+    let m = s.ncols();
+    if m == 0 {
+        return Ok(0);
+    }
+    let mut sym = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..m {
+            sym[[i, j]] = 0.5 * (s[[i, j]] + s[[j, i]]);
+        }
+    }
+    let (evals, _evecs) = sym
+        .eigh(Side::Lower)
+        .map_err(|e| format!("smooth_penalty_nullity: eigh failed: {e}"))?;
+    let max_eig = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+    if !(max_eig > 0.0) {
+        // A zero (or negative-semidefinite) Gram carries no roughness; report a
+        // zero operator order so the reweighting is skipped.
+        return Ok(0);
+    }
+    let tol = 1.0e-9 * max_eig;
+    Ok(evals.iter().filter(|&&v| v <= tol).count())
 }
 
 /// Assignment prior/relaxation used by [`SaeAssignment`].
@@ -2620,13 +2846,21 @@ pub struct SaeManifoldTerm {
 /// `refresh_basis`-rebuilt basis evaluations (`basis_values`, `basis_jacobian`),
 /// plus the assignment logits and latent coordinates.
 ///
-/// Static fields (atom names, basis kinds, smoothness penalties, basis-evaluator
-/// `Arc`s, assignment mode, temperature schedule) are *not* snapshotted: they
-/// are invariant across an inner Newton line search, so the previous
-/// `self.clone()` per halving re-copied them needlessly. Cloning only the
-/// line-search state keeps the `O(N·M·d)` `basis_jacobian` copy off the
-/// per-halving hot path (one snapshot before the search, one restore per
-/// rejected trial) instead of firing it on every Armijo backtrack.
+/// Static fields (atom names, basis kinds, basis-evaluator `Arc`s, assignment
+/// mode, temperature schedule) are *not* snapshotted: they are invariant across
+/// an inner Newton line search, so the previous `self.clone()` per halving
+/// re-copied them needlessly. Cloning only the line-search state keeps the
+/// `O(N·M·d)` `basis_jacobian` copy off the per-halving hot path (one snapshot
+/// before the search, one restore per rejected trial) instead of firing it on
+/// every Armijo backtrack.
+///
+/// The intrinsic roughness Gram `smooth_penalty` (issue #673) is likewise not
+/// snapshotted: the metric reweight is frozen at the last
+/// [`SaeManifoldTerm::assemble_arrow_schur_scaled`] and is only recomputed at
+/// the *next* assembly, so it is invariant across a line search by
+/// construction — the trial objective must use the same frozen penalty
+/// quadratic the Newton step was built from (lagged diffusivity). The
+/// canonical `smooth_penalty_raw` / `smooth_penalty_order` are static.
 #[derive(Debug)]
 struct SaeManifoldMutableState {
     /// Per-atom `(basis_values, basis_jacobian, decoder_coefficients)`.
@@ -3167,6 +3401,74 @@ impl SaeManifoldTerm {
         Ok(value)
     }
 
+    /// Energy of the decoder-block analytic penalties that have no native
+    /// `SaeManifoldLoss` counterpart, evaluated at the current decoder `β` and
+    /// the converged SAE state. These act on the per-atom decoder coefficient
+    /// matrices: cross-atom decoder incoherence (#671), mechanism
+    /// (feature-group) sparsity, and nuclear-norm embedding rank (#672). Each
+    /// is injected with its live per-atom shape / co-activation before its
+    /// value is taken, mirroring the assemble path.
+    ///
+    /// This is deliberately narrower than [`Self::analytic_penalty_value_total`]:
+    /// it excludes the Psi-tier coordinate / assignment penalties (ARD,
+    /// Isometry, ScadMcp, BlockOrthogonality, IBP/softmax assignment sparsity).
+    /// The SAE already carries its own ARD (`loss.ard`) and assignment sparsity
+    /// (`loss.assignment_sparsity`) energy, so adding the registry ARD /
+    /// assignment value on top would double-count, and the gauge-only
+    /// coordinate penalties are not part of the penalized deviance the
+    /// REML/Laplace criterion scores. The decoder-block penalties, by contrast,
+    /// are real penalized-energy terms with no `loss.*` representative: the
+    /// inner solve minimizes them (they enter `gb`/`hbb`) but they were absent
+    /// from the criterion scalar `v`. This restores that consistency so the
+    /// ρ-sweep ranks the same objective the inner solve descends — the #671
+    /// incoherence lever in particular now shapes model selection, not just the
+    /// Newton step.
+    ///
+    /// NOTE: the coordinate-block penalties with no native `loss.*` twin
+    /// (`ScadMcp`, `BlockOrthogonality`) carry the same residual inconsistency
+    /// (scored in the line search via `penalized_objective_total`, absent from
+    /// the REML scalar). They are left out here because they share a registry
+    /// dispatch with the always-on `Isometry` gauge, whose inclusion in the
+    /// topology-comparison criterion is a separate design question (#673:
+    /// topology evidence is gauge-conditional). Folding the coord-tier energy in
+    /// is tracked apart from this #671 decoder fix.
+    pub fn analytic_decoder_penalty_value_total(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> Result<f64, ArrowSchurError> {
+        // Resolve each penalty's rho slice exactly as `analytic_penalty_value_total`
+        // does (registry-local rho at zeros), so a learnable decoder-penalty weight
+        // is honoured rather than indexing into an empty view.
+        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        let layout = registry.rho_layout();
+        let beta = self.flatten_beta();
+        let mut value = 0.0_f64;
+        for (penalty, (rho_slice, _tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
+            let rho_local = rho_global.slice(s![rho_slice.clone()]);
+            match penalty {
+                AnalyticPenaltyKind::DecoderIncoherence(base) => {
+                    if let Some(per_fit) = self.live_decoder_incoherence_penalty(base) {
+                        value += per_fit.value(beta.view(), rho_local);
+                    }
+                }
+                AnalyticPenaltyKind::MechanismSparsity(base) => {
+                    for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
+                        if start < end {
+                            value += per_atom.value(beta.view(), rho_local);
+                        }
+                    }
+                }
+                AnalyticPenaltyKind::NuclearNorm(base) => {
+                    for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
+                        value += per_atom.value(beta.slice(s![start..end]), rho_local);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(value)
+    }
+
     pub fn penalized_objective_total(
         &self,
         target: ArrayView2<'_, f64>,
@@ -3296,6 +3598,17 @@ impl SaeManifoldTerm {
                 rho.log_ard.len(),
                 self.k_atoms()
             ));
+        }
+        // Reparameterize each atom's roughness Gram into arc length at the
+        // current decoder/coordinates (issue #673). This is the single
+        // chokepoint for both the inner Newton assembly and the undamped
+        // evidence factorization, so freezing the pullback-metric weight here
+        // (lagged-diffusivity) keeps the smoothness value, gradient, Kronecker
+        // Hessian, and REML log-det mutually consistent within each assembly
+        // and makes the converged penalty — hence the topology evidence —
+        // gauge-invariant. Constant-speed (periodic) atoms are unaffected.
+        for atom in &mut self.atoms {
+            atom.refresh_intrinsic_smooth_penalty();
         }
         let n = self.n_obs();
         let p = self.output_dim();
@@ -4150,21 +4463,39 @@ impl SaeManifoldTerm {
             // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
             // still errors). The cache stays undamped at ridge=0, so
             // `arrow_log_det_from_cache` remains exact.
+            // The exact KKT stationarity residual is the joint gradient
+            // ‖g‖ = √(Σ_i ‖g_t^(i)‖² + ‖g_β‖²), read straight off the assembled
+            // system. Unlike the Newton step Δ = H⁻¹g, the gradient is
+            // factorisation-independent: it is NOT amplified by an inverse, so a
+            // genuinely stationary but ill-conditioned fit (tiny g, possibly large
+            // Δ in a flat direction) is correctly recognised as converged. The
+            // `with_ill_conditioning_tolerated` Direct factor below documents that
+            // its Δ may be inaccurate in exactly those flat directions, so using Δ
+            // alone as the convergence gate would falsely reject healthy fits.
+            let grad_norm_sq: f64 = sys
+                .rows
+                .iter()
+                .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
+                .sum::<f64>()
+                + sys.gb.iter().map(|&v| v * v).sum::<f64>();
             let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
                 solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
                     .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
             // The Laplace normaliser ½log|H| is only the correct REML criterion at
-            // the inner optimum (t̂, β̂). The undamped Newton step computed here is
-            // the natural KKT residual of that solve: a step whose magnitude
-            // dwarfs the iterate means the inner loop did not converge at this ρ
-            // and the log-det would be evaluated off the manifold.
+            // the inner optimum (t̂, β̂). Convergence is judged by EITHER a small
+            // gradient (KKT stationarity) OR a small undamped Newton step; the
+            // solve is only rejected as non-converged when BOTH are large, i.e.
+            // the iterate is neither stationary nor about to move negligibly. That
+            // disjunction is what keeps an ill-conditioned-but-stationary fit
+            // (small g, large Δ) from being rejected while still refusing to rank
+            // an off-optimum Laplace criterion that is genuinely mid-flight.
             let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
                 + delta_beta.iter().map(|&v| v * v).sum::<f64>();
-            if !step_norm_sq.is_finite() {
+            if !step_norm_sq.is_finite() || !grad_norm_sq.is_finite() {
                 return Err(format!(
-                    "SaeManifoldTerm::reml_criterion: undamped Newton residual is non-finite at \
-                     the inner optimum (‖Δ‖²={step_norm_sq}); the joint Hessian factorisation is \
-                     degenerate at this ρ"
+                    "SaeManifoldTerm::reml_criterion: undamped inner residual is non-finite at \
+                     the inner optimum (‖Δ‖²={step_norm_sq}, ‖g‖²={grad_norm_sq}); the joint \
+                     Hessian factorisation is degenerate at this ρ"
                 ));
             }
             let mut iterate_norm_sq = 0.0_f64;
@@ -4182,10 +4513,16 @@ impl SaeManifoldTerm {
                     iterate_norm_sq += v * v;
                 }
             }
-            let residual_norm = step_norm_sq.sqrt();
+            let step_norm = step_norm_sq.sqrt();
+            let grad_norm = grad_norm_sq.sqrt();
             let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
-            let residual_tolerance = 1.0e-4 * iterate_scale;
-            if residual_norm <= residual_tolerance {
+            // Relative parameter-step tolerance for Δ (well-conditioned charts);
+            // a tighter scaled tolerance for the gradient KKT residual. Accept on
+            // EITHER — a stationary gradient OR a negligible step — so an
+            // ill-conditioned-but-stationary fit is not falsely rejected.
+            let step_tolerance = 1.0e-4 * iterate_scale;
+            let grad_tolerance = 1.0e-6 * iterate_scale;
+            if grad_norm <= grad_tolerance || step_norm <= step_tolerance {
                 let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
                     "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
                      ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
@@ -4197,9 +4534,10 @@ impl SaeManifoldTerm {
             if total_inner_iter >= max_refine_iter {
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
-                     undamped Newton residual ‖Δ‖={residual_norm:.6e} exceeds tolerance \
-                     {residual_tolerance:.6e} after {total_inner_iter} inner iterations. \
-                     Refusing to rank an off-optimum Laplace criterion."
+                     neither the KKT gradient ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) nor \
+                     the undamped Newton step ‖Δ‖={step_norm:.6e} (tol {step_tolerance:.6e}) met \
+                     tolerance after {total_inner_iter} inner iterations. Refusing to rank an \
+                     off-optimum Laplace criterion."
                 ));
             }
             let remaining = max_refine_iter - total_inner_iter;
@@ -4224,7 +4562,22 @@ impl SaeManifoldTerm {
         }
         let occam = 0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth;
 
-        let v = loss.total() + 0.5 * log_det - occam;
+        // Decoder-block analytic-penalty energy (#671/#672). The inner solve
+        // descended this energy (it enters `gb`/`hbb`) but it had no native
+        // `loss.*` representative, so the Laplace criterion `v` was scoring a
+        // different objective than the one minimized. Add the converged
+        // decoder-penalty value so the ρ-sweep ranks the same penalized
+        // deviance. Excludes the Psi-tier ARD/assignment penalties already
+        // accounted for in `loss.total()` (see
+        // `analytic_decoder_penalty_value_total`).
+        let decoder_penalty_energy = match registry {
+            Some(reg) => self
+                .analytic_decoder_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
+            None => 0.0,
+        };
+
+        let v = loss.total() + decoder_penalty_energy + 0.5 * log_det - occam;
         Ok((v, loss, cache))
     }
 
@@ -4259,7 +4612,19 @@ impl SaeManifoldTerm {
         )?;
         let log_det = self.streaming_exact_arrow_log_det(target, rho, registry)?;
         let occam = self.reml_occam_term(rho)?;
-        Ok((loss.total() + 0.5 * log_det - occam, loss))
+        // Decoder-block analytic-penalty energy (#671/#672), matching the
+        // full-batch `reml_criterion_with_cache` path so streaming and dense
+        // criteria rank the identical penalized objective.
+        let decoder_penalty_energy = match registry {
+            Some(reg) => self
+                .analytic_decoder_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
+            None => 0.0,
+        };
+        Ok((
+            loss.total() + decoder_penalty_energy + 0.5 * log_det - occam,
+            loss,
+        ))
     }
 
     pub fn streaming_exact_arrow_log_det(
@@ -4722,6 +5087,23 @@ impl SaeManifoldTerm {
                                     rho_local,
                                     row_layout,
                                 );
+                                // The isometry penalty value depends on the
+                                // decoder B as well as the latent coords, through
+                                // the pullback metric `g = JᵀWJ` with the model
+                                // Jacobian `J = (∂Φ/∂t)·B`. `add_sae_coord_penalty`
+                                // only routes `∂P/∂t` into `gt`; the matching
+                                // `∂P/∂B` must be accumulated into `gb`, or the
+                                // assembled gradient disagrees with the penalized
+                                // objective on the β block (value path counts the
+                                // isometry energy, which moves with B).
+                                if let AnalyticPenaltyKind::Isometry(corrected) =
+                                    &corrected_kind
+                                {
+                                    self.add_sae_isometry_beta_penalty(
+                                        sys, atom_idx, coord, corrected, rho_local,
+                                    );
+                                    beta_penalty_written = true;
+                                }
                             } else {
                                 self.add_sae_coord_penalty(
                                     sys, atom_idx, off, coord, penalty, rho_local, row_layout,
@@ -4913,6 +5295,51 @@ impl SaeManifoldTerm {
                         sys.rows[row].htt[[row_off + b, row_off + axis]] += hv[row * d + b];
                     }
                 }
+            }
+        }
+    }
+
+    /// Accumulate the isometry penalty's decoder-block gradient `∂P/∂B` into the
+    /// β-tier `gb`. The isometry value
+    ///   `P = ½ μ Σ_n ‖J_nᵀ W J_n − G_ref‖²_F`
+    /// is a function of the model Jacobian `J_n[i, a] = Σ_m (∂Φ/∂t)[n, m, a]·B[m, i]`,
+    /// so it depends on the decoder `B` as well as the latent coords `t`. The
+    /// penalty exposes `∂P/∂J` (shape `(n_obs, p·d)`, layout `[n, i·d + a]`) via
+    /// [`IsometryPenalty::grad_jacobian`]; the chain rule through
+    /// `∂J[n, i·d + a]/∂B[m, i] = (∂Φ/∂t)[n, m, a]` gives
+    ///   `∂P/∂B[m, i] = Σ_n Σ_a (∂P/∂J)[n, i·d + a] · (∂Φ/∂t)[n, m, a]`.
+    /// The flat β layout is `β[beta_offsets[k] + m·p + i] = B_k[m, i]`, so each
+    /// atom's contribution lands in its own decoder span. The isometry penalty is
+    /// unscaled at the row-block (Psi) tier — mirroring its coord-block routing
+    /// and `analytic_penalty_value_total` — so no `penalty_scale` is applied here.
+    fn add_sae_isometry_beta_penalty(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        atom_idx: usize,
+        coord: &LatentCoordValues,
+        corrected: &Arc<IsometryPenalty>,
+        rho_local: ArrayView1<'_, f64>,
+    ) {
+        let atom = &self.atoms[atom_idx];
+        let d = coord.latent_dim();
+        let p = atom.decoder_coefficients.ncols();
+        let m = atom.basis_size();
+        let n_obs = coord.n_obs();
+        let grad_jac = corrected.grad_jacobian(coord.as_flat().view(), rho_local);
+        if grad_jac.dim() != (n_obs, p * d) {
+            return;
+        }
+        let jet = &atom.basis_jacobian;
+        let beta_off = self.beta_offsets()[atom_idx];
+        for basis_col in 0..m {
+            for i in 0..p {
+                let mut acc = 0.0;
+                for n in 0..n_obs {
+                    for a in 0..d {
+                        acc += grad_jac[[n, i * d + a]] * jet[[n, basis_col, a]];
+                    }
+                }
+                sys.gb[beta_off + basis_col * p + i] += acc;
             }
         }
     }
@@ -6075,6 +6502,12 @@ impl SaeManifoldTerm {
                     atom.latent_dim
                 ));
             }
+            // Seed the chunk atom from the *raw* roughness Gram (not the
+            // already arc-length-reweighted `smooth_penalty`), so its
+            // constructor recovers the true operator order and its own
+            // `refresh_intrinsic_smooth_penalty` reweights from the canonical
+            // penalty on the chunk's coordinates rather than double-applying
+            // the metric (issue #673).
             let mut chunk_atom = SaeManifoldAtom::new(
                 atom.name.clone(),
                 atom.basis_kind.clone(),
@@ -6082,7 +6515,7 @@ impl SaeManifoldTerm {
                 phi,
                 jet,
                 atom.decoder_coefficients.clone(),
-                atom.smooth_penalty.clone(),
+                atom.smooth_penalty_raw.clone(),
             )?;
             chunk_atom.basis_evaluator = atom.basis_evaluator.clone();
             chunk_atom.basis_second_jet = atom.basis_second_jet.clone();
@@ -9144,6 +9577,27 @@ mod tests {
                 "torus seed axis {axis} should take 16 distinct phases"
             );
         }
+
+        // d == 12: the coarsest dense grid is `2^12 = 4096`, exactly the cap —
+        // still emitted (per_axis floors at 2).
+        let g12 = TorusHarmonicEvaluator::new(12, 2)
+            .unwrap()
+            .projection_seed_grid(256)
+            .unwrap();
+        assert_eq!(g12.nrows(), 1usize << 12);
+        assert!(g12.nrows() <= 4096);
+
+        // d == 13: even the coarsest dense grid (`2^13 = 8192`) exceeds the
+        // cap, so no on-manifold grid can satisfy it. The evaluator must return
+        // `None` and let the row fall back to its PCA seed rather than allocate
+        // a runaway `2^d`-row grid for the per-row global-argmin scan to walk.
+        assert!(
+            TorusHarmonicEvaluator::new(13, 2)
+                .unwrap()
+                .projection_seed_grid(256)
+                .is_none(),
+            "torus d=13 seed grid (2^13 > 4096) must fall back to None, not blow up the cap"
+        );
     }
 
     /// `seed_coords_by_decoder_projection` must replace each cold coordinate

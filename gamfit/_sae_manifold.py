@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -727,11 +726,14 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         IBP/Gumbel assignment path. Alias kwarg: ``gumbel_schedule``.
     isometry_weight
         Weight for ``IsometryPenalty`` on the latent coordinate block. It is on
-        by default (``1.0``). Issue #673: the smoothness penalty is raw
-        coordinate roughness, not arc-length roughness, so topology evidence is
-        gauge-conditional. With ``isometry_weight <= 0`` the function raises a
-        :class:`UserWarning` because ``reml_score`` is not safe to compare
-        across topologies.
+        by default (``1.0``). Issue #673 (resolved): the decoder smoothness
+        penalty is now reparameterized by the pulled-back metric ``g = JᵀJ`` in
+        the Rust core, so the roughness — and the ``reml_score`` topology
+        evidence — is gauge-invariant under reparameterization of the latent
+        coordinate ``t`` even without the isometry penalty. ``IsometryPenalty``
+        remains a useful complementary regularizer (it drives ``g → I`` for an
+        interpretable, near-arc-length chart), but is no longer a precondition
+        for comparing ``reml_score`` across topologies.
     ard_per_atom
         If true, adds per-atom ARD row-block regularization on the latent
         coordinate block to select active intrinsic coordinates.
@@ -755,8 +757,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         MCP ``2.5``. SCAD requires ``gamma > 2``; MCP requires ``gamma > 1``.
     smoothness_weight
         Non-negative decoder smoothness weight. Alias kwarg: ``smoothness``.
-        The penalty is ``0.5 * lambda * sum B.T @ S @ B`` in the raw latent
-        coordinate ``t``.
+        The penalty is ``0.5 * lambda * sum B.T @ S̃ @ B`` where ``S̃`` is the
+        raw roughness Gram reparameterized by the decoder pullback metric
+        (arc-length roughness), so it is gauge-invariant under reparameterizing
+        the latent ``t`` (issue #673).
     alpha
         Assignment-prior concentration/scale. Pass a float for a fixed value or
         ``"auto"`` to mark alpha learnable in the Rust solve; returned metadata
@@ -929,31 +933,17 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         raise ValueError(
             f"jumprelu_threshold must be finite; got {jumprelu_threshold}"
         )
-    # Gauge-invariance of the topology evidence (issue #673). The decoder
-    # smoothness penalty is the raw-coordinate roughness 0.5*lambda*sum B^T S B,
-    # with S a fixed finite-/cyclic-difference Gram in the latent coordinate t
-    # (not arc-length). The reported `reml_score` therefore inherits the gauge
-    # of t: it is only comparable across topologies (e.g. circle vs euclidean)
-    # when the latent parameterization is (approximately) isometric, i.e. the
-    # pulled-back metric g = J^T J is near the identity. `IsometryPenalty`
-    # (isometry_weight > 0) is what drives g -> I, so it is on by default
-    # (isometry_weight=1.0) precisely to keep that comparison meaningful. With
-    # isometry off the raw-t roughness — and hence the REML Occam term and the
-    # joint log-det that enter `reml_score` — becomes gauge-dependent, so
-    # ranking topologies by `reml_score` is no longer well posed. Warn rather
-    # than fit silently.
-    if not (float(isometry_weight) > 0.0):
-        warnings.warn(
-            "sae_manifold_fit: isometry_weight <= 0 disables IsometryPenalty. "
-            "The decoder smoothness penalty is computed in the raw latent "
-            "coordinate t (not arc-length), so the resulting reml_score is "
-            "gauge-dependent and is NOT safe to compare across atom topologies "
-            "(e.g. circle vs euclidean) for topology selection. Keep "
-            "isometry_weight > 0 (the default is 1.0) whenever you compare "
-            "reml_score across topologies. See gam issue #673.",
-            UserWarning,
-            stacklevel=2,
-        )
+    # Gauge-invariance of the topology evidence (issue #673, resolved). The
+    # decoder smoothness penalty is reparameterized by the decoder pullback
+    # metric g = J^T J in the Rust core (arc-length roughness; see
+    # `SaeManifoldAtom::refresh_intrinsic_smooth_penalty`), so the roughness —
+    # and therefore the REML Occam / joint-log-det terms that enter
+    # `reml_score` — is invariant under reparameterizing the latent coordinate
+    # t. Topology comparison (e.g. circle vs euclidean) is thus well posed
+    # regardless of `isometry_weight`. `IsometryPenalty` (on by default) is now
+    # purely a complementary regularizer that drives g -> I for an
+    # interpretable near-arc-length chart; turning it off no longer makes
+    # `reml_score` gauge-dependent, so there is nothing to warn about.
     # Eager nuclear_norm_weight validation (issue #672). `0.0` is the canonical
     # "no rank penalty" baseline; reject negative / non-finite values so the
     # descriptor builder does not surface a cryptic Rust error.

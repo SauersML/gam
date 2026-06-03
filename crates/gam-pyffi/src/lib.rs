@@ -10103,12 +10103,16 @@ fn sae_streaming_plan(
 /// This helper runs one EM-style M-then-E step on the seed geometry: it fits
 /// each atom's decoder independently against the *full* response (each atom's
 /// own seed coordinates already give it a distinct `Phi_k`), measures the
-/// per-row reconstruction residual under that fit, and emits logits that prefer
-/// the atom which best explains each row. Rows that every atom explains equally
-/// well receive near-equal logits (the residual ties cancel), so the existing
-/// jitter still breaks those rare ties; rows with a clear best atom get a
-/// decisive — but bounded, hence escapable by the Newton refinement — head
-/// start. The result is a proper responsibility seed rather than a saddle.
+/// per-row reconstruction residual under that fit, and emits mean-centred logits
+/// that prefer the atom which best explains each row. Rows that every atom
+/// explains equally well land at exactly zero logits (the residual ties centre
+/// to the neutral state), so the existing jitter still breaks those rare ties;
+/// rows with a clear best atom get a decisive — but bounded, hence escapable by
+/// the Newton refinement — head start. The mean-centring is translation-identity
+/// for softmax and keeps the IBP-MAP `sigmoid(logit/τ)` gate neutral (0.5) on
+/// ties instead of slamming both gates shut, so the seed is safe for both
+/// assignment maps. The result is a proper responsibility seed rather than a
+/// saddle.
 fn sae_residual_seed_logits(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -10178,11 +10182,22 @@ fn sae_residual_seed_logits(
             resid[[row, atom_idx]] = e;
         }
     }
-    // Convert per-row residuals to logits relative to each row's own scale so
-    // the head start is dimensionless. The best atom (lowest residual) gets the
-    // highest logit; ties cancel. Normalise by the row's mean residual across
-    // atoms (with a floor relative to the dataset to keep near-zero-energy rows
-    // well posed) so the spread is O(gain) regardless of output magnitude.
+    // Convert per-row residuals to mean-centred logits relative to each row's
+    // own scale so the head start is dimensionless. The best atom (lowest
+    // residual) gets a positive logit, the worst a negative one, and a row whose
+    // atoms all explain it equally well lands at exactly zero. Normalise by the
+    // row's mean residual across atoms (with a floor relative to the dataset to
+    // keep near-zero-energy rows well posed) so the spread is O(gain) regardless
+    // of output magnitude.
+    //
+    // The mean-centring is what keeps the seed safe across assignment maps.
+    // Softmax is translation-invariant, so subtracting the per-row mean leaves
+    // it bit-identical to the raw `-gain·r/m` form. IBP-MAP, by contrast, maps
+    // each logit through an unnormalised `sigmoid(logit/τ)`: an *uncentred*
+    // negative-only seed would push *every* gate below 0.5 and slam a tied row
+    // shut (`sigmoid(-gain/τ)≈0`), which is worse than the neutral 0.5/0.5 state
+    // the uniform saddle held. Centring restores `logit=0 ⇒ gate=0.5` on ties
+    // and opens the gate (`logit>0`) only for atoms that beat the row mean.
     let mut global_mean = 0.0_f64;
     for row in 0..n_obs {
         for k in 0..k_atoms {
@@ -10198,7 +10213,7 @@ fn sae_residual_seed_logits(
         }
         row_mean = (row_mean / k_atoms as f64).max(floor);
         for k in 0..k_atoms {
-            logits[[row, k]] = -gain * resid[[row, k]] / row_mean;
+            logits[[row, k]] = -gain * (resid[[row, k]] - row_mean) / row_mean;
         }
     }
     Ok(logits)
