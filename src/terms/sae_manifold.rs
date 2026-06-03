@@ -2034,7 +2034,11 @@ impl SaeManifoldAtom {
         let mut log_acc = 0.0_f64;
         let mut log_cnt = 0usize;
         for col in 0..m {
-            let s = if act[col] > 0.0 { num[col] / act[col] } else { 0.0 };
+            let s = if act[col] > 0.0 {
+                num[col] / act[col]
+            } else {
+                0.0
+            };
             speeds[col] = s;
             if s > 0.0 && s.is_finite() {
                 log_acc += s.ln();
@@ -5261,9 +5265,7 @@ impl SaeManifoldTerm {
                                 // assembled gradient disagrees with the penalized
                                 // objective on the β block (value path counts the
                                 // isometry energy, which moves with B).
-                                if let AnalyticPenaltyKind::Isometry(corrected) =
-                                    &corrected_kind
-                                {
+                                if let AnalyticPenaltyKind::Isometry(corrected) = &corrected_kind {
                                     self.add_sae_isometry_beta_penalty(
                                         sys, atom_idx, coord, corrected, rho_local,
                                     );
@@ -5430,6 +5432,12 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        if let AnalyticPenaltyKind::Isometry(corrected) = penalty {
+            self.add_sae_isometry_metric_gn_blocks(
+                sys, atom_idx, dense_off, coord, corrected, rho_local, row_layout,
+            );
+            return;
+        }
         // `htt` is the PSD Newton / PIRLS curvature block: accumulate the PSD
         // majorizer (exact for convex penalties), not the indefinite exact
         // Hessian, for the same reason as `add_sae_logit_penalty` above.
@@ -5461,6 +5469,102 @@ impl SaeManifoldTerm {
                     }
                 }
             }
+        }
+    }
+
+    fn add_sae_isometry_metric_gn_blocks(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        atom_idx: usize,
+        dense_off: usize,
+        coord: &LatentCoordValues,
+        corrected: &Arc<IsometryPenalty>,
+        rho_local: ArrayView1<'_, f64>,
+        row_layout: Option<&SaeRowLayout>,
+    ) {
+        let n_obs = coord.n_obs();
+        let d = coord.latent_dim();
+        let atom = &self.atoms[atom_idx];
+        let p = atom.decoder_coefficients.ncols();
+        let m = atom.basis_size();
+        let Some(jac) = corrected.jacobian_cache() else {
+            return;
+        };
+        if jac.dim() != (n_obs, p * d) {
+            return;
+        }
+        let Some(jac2) = corrected.jacobian_second_cache() else {
+            return;
+        };
+        if jac2.dim() != (n_obs, p * d * d) {
+            return;
+        }
+        let beta_off = self.beta_offsets()[atom_idx];
+        let beta_block = m * p;
+        let jet = &atom.basis_jacobian;
+        let mu = corrected.scalar_weight * rho_local[corrected.rho_index].exp();
+        let mut metric_coord_jac = Array2::<f64>::zeros((d * d, d));
+        let mut metric_beta_jac = Array2::<f64>::zeros((d * d, beta_block));
+        let mut wrote_dense_cross = false;
+        for row in 0..n_obs {
+            let Some(row_off) = sae_coord_penalty_offset(row_layout, dense_off, row, atom_idx)
+            else {
+                continue;
+            };
+            let Some(wj) = Self::sae_isometry_weighted_jacobian_row(corrected, &jac, row, p, d)
+            else {
+                return;
+            };
+            metric_coord_jac.fill(0.0);
+            for a in 0..d {
+                for b in 0..d {
+                    let metric_row = a * d + b;
+                    for c in 0..d {
+                        let mut acc = 0.0;
+                        for i in 0..p {
+                            acc += jac2[[row, (i * d + a) * d + c]] * wj[[i, b]];
+                            acc += wj[[i, a]] * jac2[[row, (i * d + b) * d + c]];
+                        }
+                        metric_coord_jac[[metric_row, c]] = acc;
+                    }
+                }
+            }
+            metric_beta_jac.fill(0.0);
+            for a in 0..d {
+                for b in 0..d {
+                    let metric_row = a * d + b;
+                    for basis_col in 0..m {
+                        let jet_a = jet[[row, basis_col, a]];
+                        let jet_b = jet[[row, basis_col, b]];
+                        for output in 0..p {
+                            metric_beta_jac[[metric_row, basis_col * p + output]] =
+                                jet_a * wj[[output, b]] + wj[[output, a]] * jet_b;
+                        }
+                    }
+                }
+            }
+            for c in 0..d {
+                for e in 0..d {
+                    let mut acc = 0.0;
+                    for metric_row in 0..(d * d) {
+                        acc +=
+                            metric_coord_jac[[metric_row, c]] * metric_coord_jac[[metric_row, e]];
+                    }
+                    sys.rows[row].htt[[row_off + c, row_off + e]] += mu * acc;
+                }
+                for beta_col in 0..beta_block {
+                    let mut acc = 0.0;
+                    for metric_row in 0..(d * d) {
+                        acc += metric_coord_jac[[metric_row, c]]
+                            * metric_beta_jac[[metric_row, beta_col]];
+                    }
+                    sys.rows[row].htbeta[[row_off + c, beta_off + beta_col]] += mu * acc;
+                    wrote_dense_cross = true;
+                }
+            }
+        }
+        if wrote_dense_cross {
+            sys.activate_dense_htbeta_supplement();
         }
     }
 
@@ -5500,8 +5604,7 @@ impl SaeManifoldTerm {
                     for a in 0..d {
                         let mut acc = 0.0;
                         for weight_axis in 0..*rank {
-                            acc += u[[row, i * *rank + weight_axis]]
-                                * projected[[weight_axis, a]];
+                            acc += u[[row, i * *rank + weight_axis]] * projected[[weight_axis, a]];
                         }
                         out[[i, a]] = acc;
                     }
@@ -7343,9 +7446,7 @@ impl SaeManifoldOuterObjective {
             self.ridge_ext_coord,
             self.ridge_beta,
         )?;
-        let dispersion = self
-            .term
-            .reconstruction_dispersion(&loss, &cache, &rho)?;
+        let dispersion = self.term.reconstruction_dispersion(&loss, &cache, &rho)?;
         self.term.assemble_shape_uncertainty(&cache, dispersion)
     }
 
@@ -10084,7 +10185,10 @@ mod tests {
         .unwrap();
         let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
         let target = sae_fd_target(n_obs, p_out);
-        let log_ard = vec![Array1::from_elem(1, -30.0_f64), Array1::from_elem(1, -30.0_f64)];
+        let log_ard = vec![
+            Array1::from_elem(1, -30.0_f64),
+            Array1::from_elem(1, -30.0_f64),
+        ];
         let rho = SaeManifoldRho::new(0.0, 1.0e-4_f64.ln(), log_ard);
         (term, target, rho)
     }
@@ -10263,19 +10367,34 @@ mod tests {
         let mut reports: Vec<SaeFdBlockReport> = Vec::new();
 
         let single_cases: &[(&str, SaePenCaseKind, SaePenKind)] = &[
-            ("isometry_circle_d1", SaePenCaseKind::PeriodicD1, SaePenKind::Isometry),
-            ("isometry_euclid_d2", SaePenCaseKind::EuclideanD2, SaePenKind::Isometry),
+            (
+                "isometry_circle_d1",
+                SaePenCaseKind::PeriodicD1,
+                SaePenKind::Isometry,
+            ),
+            (
+                "isometry_euclid_d2",
+                SaePenCaseKind::EuclideanD2,
+                SaePenKind::Isometry,
+            ),
             ("ard_circle_d1", SaePenCaseKind::PeriodicD1, SaePenKind::Ard),
-            ("scadmcp_euclid_d1", SaePenCaseKind::EuclideanD1, SaePenKind::ScadMcp),
-            ("nuclearnorm_euclid_d1", SaePenCaseKind::EuclideanD1, SaePenKind::NuclearNorm),
+            (
+                "scadmcp_euclid_d1",
+                SaePenCaseKind::EuclideanD1,
+                SaePenKind::ScadMcp,
+            ),
+            (
+                "nuclearnorm_euclid_d1",
+                SaePenCaseKind::EuclideanD1,
+                SaePenKind::NuclearNorm,
+            ),
         ];
         for (label, case_kind, pen_kind) in single_cases {
             let (term, target, rho, slice) = sae_pen_term(*case_kind);
             let n_obs = term.n_obs();
             let latent_dim = term.assignment.coords[0].latent_dim();
             let beta_len = term.beta_dim();
-            let registry =
-                sae_pen_registry(*pen_kind, &slice, n_obs, latent_dim, beta_len, p_out);
+            let registry = sae_pen_registry(*pen_kind, &slice, n_obs, latent_dim, beta_len, p_out);
             term.validate_analytic_penalty_registry(&registry)
                 .expect("penalty registry must validate for the SAE term");
             reports.push(sae_pen_fd_check(label, &term, &target, &rho, &registry));
