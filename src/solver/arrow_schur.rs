@@ -1320,15 +1320,22 @@ fn try_factor_blocks_batched(
     // `factor_one_row` semantics exactly. Evidence/log-det-only callers
     // tolerate ill-conditioning and skip this, as on the CPU path.
     if !tolerate_ill_conditioning {
-        let kappa_max = safe_spd_kappa_max(d);
-        for factor in &blocks {
+        for (row, factor) in rows.iter().zip(blocks.iter()) {
+            let diag_scale = row_block_diag_scale(row, d);
             let kappa_est = cholesky_factor_kappa_estimate(factor);
-            if !(kappa_est.is_finite() && kappa_est <= kappa_max) {
+            if !cholesky_factor_passes_safe_inversion(factor, d, diag_scale, kappa_est) {
                 return None;
             }
         }
     }
     Some(blocks)
+}
+
+fn row_block_diag_scale(row: &ArrowRowBlock, d: usize) -> f64 {
+    (0..d)
+        .map(|a| row.htt[[a, a]].abs())
+        .fold(0.0_f64, f64::max)
+        .max(1.0)
 }
 
 /// Diagonal-ratio condition-number proxy for an SPD matrix from its lower
@@ -1359,6 +1366,45 @@ fn cholesky_factor_kappa_estimate(factor: &Array2<f64>) -> f64 {
     } else {
         f64::INFINITY
     }
+}
+
+/// Smallest Cholesky pivot estimate for `A = L Lᵀ`, using `L_ii²`.
+///
+/// The diagonal-ratio κ proxy is blind for scalar blocks: every positive
+/// `1×1` factor has κ=1 even when the pivot is tiny. This pivot floor catches
+/// absolute near-singularity relative to the row block scale.
+fn cholesky_factor_min_pivot_estimate(factor: &Array2<f64>) -> f64 {
+    let d = factor.nrows();
+    if d == 0 {
+        return 0.0;
+    }
+    let mut min_pivot = f64::INFINITY;
+    for a in 0..d {
+        let v = factor[[a, a]];
+        if !(v > 0.0 && v.is_finite()) {
+            return 0.0;
+        }
+        let pivot = v * v;
+        if pivot < min_pivot {
+            min_pivot = pivot;
+        }
+    }
+    min_pivot
+}
+
+fn safe_spd_pivot_min(diag_scale: f64) -> f64 {
+    f64::EPSILON.sqrt() * diag_scale.max(1.0)
+}
+
+fn cholesky_factor_passes_safe_inversion(
+    factor: &Array2<f64>,
+    dim: usize,
+    diag_scale: f64,
+    kappa_est: f64,
+) -> bool {
+    kappa_est.is_finite()
+        && kappa_est <= safe_spd_kappa_max(dim)
+        && cholesky_factor_min_pivot_estimate(factor) >= safe_spd_pivot_min(diag_scale)
 }
 
 /// Near-singularity condition-number ceiling for double precision at dimension
@@ -1415,10 +1461,7 @@ fn factor_one_row(
     // relative to the block's diagonal scale, so a genuinely broken block
     // (non-finite, or unboundedly indefinite) still surfaces as
     // `PerRowFactorFailed` for the outer loop to handle rather than looping.
-    let diag_scale = (0..d)
-        .map(|a| row.htt[[a, a]].abs())
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
+    let diag_scale = row_block_diag_scale(row, d);
     let ridge_cap = ridge_t.max(1.0e-12 * diag_scale) * 1.0e12;
     let mut ridge_eff = ridge_t;
     // Escalate the per-row ridge until the block is BOTH positive-definite AND
@@ -1454,7 +1497,7 @@ fn factor_one_row(
                 // contaminates S by spectral terms scaled by κ_i, so an
                 // over-threshold block is regularised further rather than used.
                 let kappa_est = cholesky_factor_kappa_estimate(&factor);
-                if kappa_est.is_finite() && kappa_est <= safe_spd_kappa_max(d) {
+                if cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est) {
                     break factor;
                 }
                 let next = if ridge_eff > 0.0 {
@@ -2459,9 +2502,13 @@ impl ArrowSchurSystem {
             let gt_e = row.gt.clone();
             let htt_e = row.htt.clone();
             let htbeta_e = row.htbeta.clone();
-            row.gt = manifold.project_to_tangent(t_i, gt_e.view());
+            row.gt = manifold.project_gradient_to_tangent(t_i, gt_e.view());
             row.htt = manifold.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
-            row.htbeta = manifold.project_matrix_columns_to_tangent(t_i, htbeta_e.view());
+            row.htbeta = manifold.project_matrix_columns_to_gradient_tangent(
+                t_i,
+                gt_e.view(),
+                htbeta_e.view(),
+            );
         }
         self.refresh_row_hessian_fingerprint();
     }
@@ -3273,9 +3320,10 @@ fn sys_htbeta_accumulate_transpose(
 
 /// Materialize the dense `(di, k)` cross-block for one row.
 ///
-/// When `sys.htbeta_matvec` is set and `row.htbeta` is zero-sized, probes each
-/// of the `k` standard basis vectors to reconstruct the matrix.  When the dense
-/// block is already present with the correct per-row shape, clones it.
+/// When `sys.htbeta_matvec` is set, probes each of the `k` standard basis
+/// vectors to reconstruct the matrix.  The operator is authoritative in the
+/// matrix-free SAE path; dense slabs may be allocated but intentionally unwritten.
+/// When no operator is installed, clones the correctly shaped dense slab.
 fn sys_htbeta_materialize_row(
     sys: &ArrowSchurSystem,
     row_idx: usize,
@@ -3283,31 +3331,34 @@ fn sys_htbeta_materialize_row(
 ) -> Array2<f64> {
     let di = sys.row_dims[row_idx];
     let k = sys.k;
-    if row.htbeta.dim() == (di, k) {
-        return row.htbeta.clone();
-    }
-    // Zero-sized or mismatched dense block: materialize via the matvec.
-    // SAFETY: reaching here with no htbeta_matvec is a programming error —
-    // the assembler must either populate htbeta or install htbeta_matvec.
-    let op = sys.htbeta_matvec.as_ref().unwrap_or_else(|| {
+    if let Some(op) = sys.htbeta_matvec.as_ref() {
+        let mut mat = Array2::<f64>::zeros((di, k));
+        let mut e_a = Array1::<f64>::zeros(k);
+        let mut col = Array1::<f64>::zeros(di);
+        for a in 0..k {
+            e_a.fill(0.0);
+            e_a[a] = 1.0;
+            col.fill(0.0);
+            op(row_idx, e_a.view(), &mut col);
+            for c in 0..di {
+                mat[[c, a]] = col[c];
+            }
+        }
+        mat
+    } else {
+        if row.htbeta.dim() == (di, k) {
+            return row.htbeta.clone();
+        }
+        // SAFETY: reaching here means the assembler installed neither a
+        // correctly-shaped (di, k) dense H_tβ block nor an htbeta_matvec
+        // operator — a construction-time invariant violation in the caller, not
+        // recoverable runtime input. The cross-block is mandatory for the Schur
+        // reduction and there is no meaningful fallback, so this is a hard bug.
         panic!(
             "row {row_idx}: htbeta shape {:?} != ({di}, {k}) and no htbeta_matvec installed",
             row.htbeta.dim()
-        )
-    });
-    let mut mat = Array2::<f64>::zeros((di, k));
-    let mut e_a = Array1::<f64>::zeros(k);
-    let mut col = Array1::<f64>::zeros(di);
-    for a in 0..k {
-        e_a.fill(0.0);
-        e_a[a] = 1.0;
-        col.fill(0.0);
-        op(row_idx, e_a.view(), &mut col);
-        for c in 0..di {
-            mat[[c, a]] = col[c];
-        }
+        );
     }
-    mat
 }
 
 /// Probe each column of `H_tβ^(row)` by applying the operator to `e_a` and
@@ -4238,9 +4289,15 @@ where
                             attempts: attempt + 1,
                         });
                     }
-                    last_reason = format!(
-                        "Armijo rejected trial objective {trial_value}; bound {armijo_bound}"
-                    );
+                    last_reason = {
+                        let step_norm = (delta_t.iter().map(|v| v * v).sum::<f64>()
+                            + delta_beta.iter().map(|v| v * v).sum::<f64>())
+                        .sqrt();
+                        format!(
+                            "Armijo rejected trial objective {trial_value}; bound {armijo_bound}; \
+                             |g|={grad_norm:.4e} g.p={g_dot_p:.4e} |step|={step_norm:.4e} ridge={proximal_ridge:.3e}"
+                        )
+                    };
                 }
             }
             Err(err) => {
@@ -5301,6 +5358,15 @@ fn schur_matvec<B: BatchedBlockSolver>(
     out: &mut Array1<f64>,
     backend: &B,
 ) {
+    // `steihaug_cg` reuses one output buffer across iterations and requires
+    // `matvec` to ASSIGN every entry of `out` (the contract `dense_matvec`
+    // upholds). This routine builds `S·x` purely by accumulation
+    // (`penalty_matvec_add`, `out[a] += ridge·x`, `out[a] -= neg_contrib`), so it
+    // MUST clear `out` first. Without this, iteration n>0 returns `S·x` plus the
+    // previous call's `S·p`, the PCG solves a corrupted reduced system, and the
+    // resulting Newton step is inconsistent with the assembled gradient
+    // (g·δ ≈ 0 — a non-descent direction that defeats the line search).
+    out.fill(0.0);
     let k = sys.k;
     // Route the penalty-side H_ββ x product through penalty_matvec_add (#296):
     // no Arc-clone hot-path cost when penalty_op is None (falls back to hbb inline).
@@ -6376,9 +6442,10 @@ pub enum ArrowSchurError {
     /// supplied ridge. Indicates an under-regularized latent block —
     /// typically a gauge-free fit without an identifiability penalty.
     PerRowFactorFailed { row: usize, reason: String },
-    /// A per-row `H_tt^(i)` block factored, but the Cholesky factor's
-    /// diagonal-ratio condition-number estimate exceeded the safe
-    /// threshold for the Schur reduction. Cholesky technically
+    /// A per-row `H_tt^(i)` block factored, but the Cholesky factor failed
+    /// the safe-inversion guard for the Schur reduction. This can be either
+    /// an excessive diagonal-ratio condition-number estimate or a numerically
+    /// tiny pivot relative to the row block scale. Cholesky technically
     /// succeeded, but the inverse used in
     /// `S = H_ββ − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)` is contaminated
     /// by spectral terms on the order of `κ_i`; functionally
@@ -6409,9 +6476,9 @@ impl std::fmt::Display for ArrowSchurError {
                 kappa_estimate,
             } => write!(
                 f,
-                "arrow-Schur: per-row H_tt^({row}) Cholesky succeeded but is \
-                 ill-conditioned (kappa_estimate={kappa_estimate:e}); Schur \
-                 reduction would be numerically contaminated"
+                "arrow-Schur: per-row H_tt^({row}) Cholesky succeeded but failed \
+                 the safe-inversion guard (kappa_estimate={kappa_estimate:e}); \
+                 Schur reduction would be numerically contaminated"
             ),
             ArrowSchurError::SchurFactorFailed { reason } => {
                 write!(f, "arrow-Schur: Schur complement Cholesky failed: {reason}")
@@ -6851,6 +6918,57 @@ mod tests {
             matches!(nan, Err(ArrowSchurError::PerRowFactorFailed { .. })),
             "non-finite block must surface PerRowFactorFailed, not loop or condition; got {nan:?}"
         );
+    }
+
+    #[test]
+    fn factor_one_row_conditions_scalar_tiny_pivot_via_ridge() {
+        let d = 1;
+        let k = 1;
+        let mut row = ArrowRowBlock::new(d, k);
+        row.htt = array![[1.0e-20_f64]];
+        row.htbeta = array![[1.0_f64]];
+        row.gt = array![0.0_f64];
+
+        let factor = factor_one_row(&row, 0.0, d, 0, false)
+            .expect("tiny positive scalar pivot must be ridge-conditioned");
+        let pivot = factor[[0, 0]] * factor[[0, 0]];
+        assert!(
+            pivot >= safe_spd_pivot_min(1.0),
+            "scalar pivot must be lifted above the absolute safe floor; got {pivot:e}"
+        );
+        assert!(
+            pivot > row.htt[[0, 0]],
+            "scalar block must not be accepted at the raw tiny pivot"
+        );
+
+        let tolerated = factor_one_row(&row, 0.0, d, 0, true)
+            .expect("tolerated log-det path must accept a positive scalar block");
+        let raw_pivot = tolerated[[0, 0]] * tolerated[[0, 0]];
+        assert!(
+            (raw_pivot - row.htt[[0, 0]]).abs() < 1.0e-30,
+            "tolerated factor must remain the raw scalar Cholesky"
+        );
+    }
+
+    #[test]
+    fn sys_htbeta_materialize_row_prefers_operator_over_allocated_zero_slab() {
+        let mut sys = ArrowSchurSystem::new(1, 1, 3);
+        sys.rows[0].htbeta = Array2::<f64>::zeros((1, 3));
+        sys.set_row_htbeta_operator(
+            |row_idx, x, out| {
+                assert_eq!(row_idx, 0);
+                out[0] = 2.0 * x[0] - x[1] + 0.5 * x[2];
+            },
+            |row_idx, v, out| {
+                assert_eq!(row_idx, 0);
+                out[0] += 2.0 * v[0];
+                out[1] -= v[0];
+                out[2] += 0.5 * v[0];
+            },
+        );
+
+        let htbeta = sys_htbeta_materialize_row(&sys, 0, &sys.rows[0]);
+        assert_eq!(htbeta, array![[2.0_f64, -1.0, 0.5]]);
     }
 
     /// Issue #195 / gam#578: when the per-row block is barely-PD at

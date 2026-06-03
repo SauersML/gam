@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use crate::terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
-    BlockSparsityPenalty, DifferenceOpKind, GumbelTemperatureSchedule, IBPAssignmentPenalty,
-    IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
-    MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
-    ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
-    RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ScheduleKind,
+    BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, GumbelTemperatureSchedule,
+    IBPAssignmentPenalty, IsometryPenalty, IvaeRidgeMeanGauge, JumpReLUPenalty,
+    MechanismSparsityPenalty, MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
+    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule, ScheduleKind,
     SoftmaxAssignmentSparsityPenalty, SparsityPenalty, TopKActivationPenalty,
     TotalVariationPenalty,
 };
@@ -769,6 +769,75 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     None => penalty,
                 };
                 registry.push(AnalyticPenaltyKind::BlockOrthogonality(Arc::new(penalty)));
+            }
+            "decoder_incoherence" => {
+                descriptor_no_unknown_keys(
+                    descriptor,
+                    &context,
+                    &[
+                        "kind",
+                        "target",
+                        "block_sizes",
+                        "p_out",
+                        "weight",
+                        "learnable",
+                        "weight_schedule",
+                    ],
+                )?;
+                // Parse the per-atom decoder basis-function counts M_k. These are
+                // a placeholder shape: the real M_k / p_out / target / coactivation
+                // are injected at fit time from the live SAE in
+                // `SaeManifoldTerm::add_sae_beta_penalty` (#671). The descriptor
+                // still constructs a well-formed penalty so the registry / FFI
+                // round-trips and the Python smoke test can confirm the descriptor
+                // is recognized.
+                let raw_block_sizes = descriptor
+                    .get("block_sizes")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| format!("{context}.block_sizes is required"))?;
+                let mut block_sizes = Vec::with_capacity(raw_block_sizes.len());
+                for (atom_idx, raw_m) in raw_block_sizes.iter().enumerate() {
+                    let raw_m = raw_m.as_u64().ok_or_else(|| {
+                        format!("{context}.block_sizes[{atom_idx}] must be a positive integer")
+                    })?;
+                    let m = json_positive_u64_to_usize(
+                        raw_m,
+                        &format!("{context}.block_sizes[{atom_idx}]"),
+                    )?;
+                    block_sizes.push(m);
+                }
+                let p_out = descriptor_usize(descriptor, "p_out", target.n)?;
+                let weight = descriptor_f64(descriptor, "weight", 1.0)?;
+                let learnable = descriptor
+                    .get("learnable")
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false);
+                let total: usize = block_sizes.iter().map(|&m| m * p_out).sum();
+                let decoder_slice = PsiSlice {
+                    range: 0..total,
+                    latent_dim: Some(block_sizes.len()),
+                };
+                // Uniform off-diagonal placeholder co-activation (1.0 off-diag,
+                // 0.0 diag); overwritten with the live mean gate product at fit.
+                let k = block_sizes.len();
+                let mut coactivation = Array2::<f64>::from_elem((k, k), 1.0);
+                for d in 0..k {
+                    coactivation[[d, d]] = 0.0;
+                }
+                let penalty = DecoderIncoherencePenalty::new(
+                    decoder_slice,
+                    block_sizes,
+                    p_out,
+                    coactivation,
+                    weight,
+                    learnable,
+                )
+                .map_err(|err| format!("{context}: {err}"))?;
+                let penalty = match weight_schedule {
+                    Some(schedule) => penalty.with_weight_schedule(schedule),
+                    None => penalty,
+                };
+                registry.push(AnalyticPenaltyKind::DecoderIncoherence(Arc::new(penalty)));
             }
             "ibp_assignment" | "ibp_assignment_penalty" => {
                 descriptor_no_unknown_keys(

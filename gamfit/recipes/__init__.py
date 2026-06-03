@@ -1,9 +1,13 @@
-"""Recipe namespace: high-level runners that assemble latent-factor gauge fixes.
+"""Recipe namespace: high-level runners for latent-factor workflows.
 
 Each recipe in this submodule returns a callable runner with a ``.fit(...)``
-entry point. Recipes are thin: they encode a single coordinated procedure
-(supervision plus identifiability) on top of the existing Smooth / penalty
-machinery so that the call site reads as one declarative step.
+entry point or a direct fit result. Recipes are thin: they encode one
+coordinated procedure on top of existing Smooth / penalty / SAE machinery so
+that the call site reads as one declarative step.
+
+``partial_supervision`` returns a gauge-fix recipe for splitting supervised and
+free latent blocks. ``sae_supervised`` fits a manifold SAE on all rows, then a
+supervised GAM/GLM head on the rows selected by ``supervised_mask``.
 """
 
 from __future__ import annotations

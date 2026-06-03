@@ -1,10 +1,11 @@
-"""Analytic structured penalties: isometry, sparsity, SCAD/MCP, ARD, TV, nuclear norm, block sparsity, mechanism sparsity, block orthogonality, orthogonality.
+"""Analytic structured penalties and SAE assignment priors.
 
 Thin Python configuration wrappers around the analytic primitives
-implemented in `src/terms/analytic_penalties.rs`. Each wrapper is a
-pure dataclass — no computation runs at construction; the Rust side
-materializes the penalty's value / gradient / Hessian-vector product
-analytically inside the inner loop.
+implemented in `src/terms/analytic_penalties.rs`. Some wrappers are Python
+dataclasses and others compose the Rust pyclass descriptor directly; in both
+cases construction only builds a descriptor. Penalty value / gradient /
+Hessian-vector products are evaluated by the Rust analytic kernels when the
+descriptor is passed into a fit or when ``value_grad`` / ``hvp`` is called.
 
 These structured
 penalties span the identifiability tools the impossibility theorem
@@ -14,11 +15,13 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
   produced by `LatentCoord`). Pulls the decoder's pullback metric
   toward a reference Riemannian metric — gauge fix for the
   diffeomorphism gauge that bare `LatentCoord` carries.
-* `SparsityPenalty` lives on β (SAE codes) or t (soft atom
-  assignments). Smoothed L¹ by default, with `ε` itself optionally
-  REML-selected.
+* `SparsityPenalty` lives on β (SAE codes) or t (soft atom assignments).
+  It is a smoothed L¹ penalty; the smoothing scale may be fixed by the
+  Rust descriptor.
 * `ScadMcpPenalty` lives on t. Concave element-wise sparsity that shrinks
   noise near zero while flattening the gradient for large true signals.
+  The Rust descriptor accepts SCAD/MCP variants (for example
+  ``variant="mcp"`` in the composition-engine examples).
 * `ARDPenalty` lives on t. One weight per latent axis, all
   REML-selectable. The Occam factor in the marginal likelihood
   prunes unused axes only after an AuxPrior or Isometry-style gauge
@@ -29,6 +32,14 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `NuclearNormPenalty` lives on t. Smoothed L¹ on singular values
   encourages low rank in a basis-free way; pair with ARD/Orthogonality
   depending on whether canonical-axis pruning or gauge fixing is also needed.
+* `SoftmaxAssignmentSparsityPenalty` and `IBPAssignmentPenalty` live on
+  row-wise assignment logits. They serialize to the Rust assignment-prior
+  registry used by SAE-style latent blocks; the IBP wrapper canonicalizes to
+  the finite IBP-MAP descriptor on the Rust side.
+* `TopKActivationPenalty`, `JumpReLUPenalty`, and `GatedSAEDecoder` support
+  the newer SAE assignment family. `TopKActivationPenalty` / `JumpReLUPenalty`
+  are Rust-backed analytic descriptors; `GatedSAEDecoder` is a small NumPy
+  reference decoder for the gated/JumpreLU contract.
 * `BlockSparsityPenalty` lives on t. Group-lasso smoothed L¹ on predefined
   latent-axis blocks, shrinking whole groups rather than individual entries
   or single ARD axes.
@@ -50,6 +61,12 @@ says a principal-manifold / SAE / SAE-manifold engine needs:
 * `OrthogonalityPenalty` lives on t. It fixes the rotation gauge by
   penalizing latent-axis correlations; pair it with ARD so pruned axes
   are identifiable.
+
+The generated :data:`PENALTY_MANIFEST` may include engine penalty kinds before
+this module binds a top-level Python wrapper for them. In this source tree the
+manifest records ``decoder_incoherence`` /
+``DecoderIncoherencePenalty`` engine support, while this module exposes only
+the wrapper names listed in :data:`__all__`.
 
 All analytic penalties compose with the existing smoothness penalty (`S(ρ)`),
 they slot into the same REML outer loop, and their weights are
@@ -368,7 +385,32 @@ TargetSpec: TypeAlias = str | int | Any
 
 @dataclass(frozen=True, slots=True)
 class ScalarWeightSchedule:
-    """Temperature-style annealing schedule for analytic penalty weights."""
+    """Annealing schedule for a scalar analytic-penalty weight.
+
+    Parameters
+    ----------
+    w_start, w_end:
+        Non-negative endpoints of the schedule.
+    kind:
+        ``"geometric"``, ``"linear"``, or ``"reciprocal_iter"``.
+    rate:
+        Geometric decay rate in ``(0, 1)`` when ``kind="geometric"``.
+    steps:
+        Positive number of linear interpolation steps when ``kind="linear"``.
+    iter_count:
+        Initial iteration counter, forwarded to the Rust descriptor.
+
+    Returns
+    -------
+    ScalarWeightSchedule
+        Use directly as ``weight_schedule`` or through
+        ``penalty.set_weight_schedule(schedule)``.
+
+    Raises
+    ------
+    ValueError
+        If endpoints or schedule-specific fields are invalid.
+    """
 
     w_start: float
     w_end: float
@@ -588,10 +630,131 @@ IsometryPenalty = _rust_descriptor_class("IsometryPenalty")
 ScadMcpPenalty = _rust_descriptor_class("ScadMcpPenalty")
 NuclearNormPenalty = _rust_descriptor_class("NuclearNormPenalty")
 
+_RUST_WRAPPER_DOCS: dict[str, str] = {
+    "ARDPenalty": """Automatic relevance determination penalty over latent axes.
+
+The Rust descriptor accepts the constructor fields supported by the compiled
+extension, including ``target`` and optional weight controls. It serializes to
+``kind="ard"`` and can be passed to ``gamfit.fit(..., penalties=[...])`` or
+evaluated directly with ``value_grad(t)`` / ``hvp(t, v)``.
+""",
+    "TopKActivationPenalty": """Analytic SAE top-k activation penalty descriptor.
+
+Targets the row-wise activation/assignment block named by ``target`` and
+serializes to ``kind="topk_activation"``. Direct evaluation uses the same Rust
+``value_grad`` / ``hvp`` kernels as the formula pipeline.
+""",
+    "JumpReLUPenalty": """Analytic JumpReLU SAE sparsity penalty descriptor.
+
+Represents the hard-threshold SAE assignment family exposed by
+``sae_manifold_fit(..., assignment="jumprelu")`` and the gated alias. The
+Python wrapper forwards constructor arguments to the Rust descriptor and
+supports ``value_grad(t)`` / ``hvp(t, v)`` in NumPy, Torch, and JAX frames.
+""",
+    "SparsityPenalty": """Smoothed element-wise sparsity penalty descriptor.
+
+Use for latent coordinates, SAE codes, or assignment-like blocks as accepted by
+the Rust descriptor. The wrapper is configuration-only until passed to a fit or
+evaluated through ``value_grad`` / ``hvp``.
+""",
+    "AuxConditionalPriorPenalty": """Fixed row-conditional iVAE precision prior.
+
+Lives on a latent block ``t`` and serializes to the Rust row-precision-prior
+descriptor. Use when the per-row conditional precision is precomputed outside
+the fit.
+""",
+    "BlockOrthogonalityPenalty": """Between-block latent-axis orthogonality penalty.
+
+Penalizes cross-products between declared axis groups while leaving axes within
+each group free. Commonly used to separate supervised and residual discovery
+blocks.
+""",
+    "IsometryPenalty": """Pullback-metric isometry penalty for latent coordinates.
+
+Use as a gauge fix for latent-coordinate decoders: the Rust side compares the
+decoder pullback metric against the configured reference metric and supplies
+analytic gradients/HVPs.
+""",
+    "ScadMcpPenalty": """Concave SCAD/MCP element-wise sparsity penalty.
+
+Targets latent coordinates and forwards fields such as ``target``, ``weight``,
+``n_eff``, and the Rust-supported ``variant`` selector. It shrinks small
+coordinates while flattening the derivative for large coordinates.
+""",
+    "NuclearNormPenalty": """Smoothed nuclear-norm penalty for latent-coordinate matrices.
+
+Encourages low-rank structure in the target block by penalizing singular
+values. It is wired through both the formula ``penalties=`` bridge and the
+direct Rust ``value_grad`` / ``hvp`` evaluators.
+""",
+    "BlockSparsityPenalty": """Group-lasso style block sparsity penalty.
+
+Shrinks declared latent-axis groups as units rather than individual entries.
+The exact accepted constructor fields are defined by the compiled Rust
+descriptor.
+""",
+    "ParametricAuxConditionalPriorPenalty": """Parametric iVAE row-precision prior.
+
+Learns a diagonal row-conditional precision map from auxiliary covariates via
+the Rust descriptor and applies it to the targeted latent block.
+""",
+    "IBPAssignmentPenalty": """Finite IBP prior over row-wise assignment logits.
+
+The public Rust-backed wrapper accepts fields such as ``k_max``, ``alpha``,
+``tau``, ``learnable``, and ``target`` where supported by the extension, then
+serializes to the finite IBP assignment descriptor.
+""",
+    "TotalVariationPenalty": """Smoothed total-variation penalty on ordered or graph-linked rows.
+
+Applies an L1-like penalty to first differences of the targeted latent block,
+using the Rust descriptor's configured difference operator.
+""",
+    "SoftmaxAssignmentSparsityPenalty": """Softmax assignment sparsity penalty descriptor.
+
+Targets row-wise assignment logits for the competitive softmax assignment
+family and serializes to ``kind="softmax_assignment_sparsity"``.
+""",
+    "OrthogonalityPenalty": """Latent-axis correlation penalty.
+
+Penalizes cross-axis correlations to fix the rotation gauge. Pair with ARD when
+axes should also be pruned by evidence.
+""",
+    "IvaeRidgeMeanGauge": """iVAE conditional-mean ridge gauge.
+
+Penalizes the component of a latent block not explained by a ridge map from
+auxiliary covariates, fixing the conditional-mean gauge used by iVAE-style
+identifiability arguments.
+""",
+    "MechanismSparsityPenalty": """Per-latent group-lasso sparsity on decoder weights.
+
+Unlike most penalties in this module, direct evaluation expects a decoder
+weight matrix ``(d_latent, p_features)`` and derives the latent dimension from
+its row count.
+""",
+}
+
+for _name, _doc in _RUST_WRAPPER_DOCS.items():
+    globals()[_name].__doc__ = _doc
+
 
 @dataclass(frozen=True, slots=True)
 class GatedSAEDecoder:
-    """Standalone gated SAE decoder with gate and amplitude weights."""
+    """Standalone NumPy gated SAE decoder with gate and amplitude weights.
+
+    Parameters
+    ----------
+    w_gate:
+        Square gate matrix of shape ``(F, F)``. Gates are
+        ``sigmoid(x @ w_gate.T) > 0.5``.
+    w_amp:
+        Amplitude matrix of shape ``(D, F)``. The decoded output is
+        ``(gate * x) @ w_amp.T``.
+
+    Raises
+    ------
+    ValueError
+        If shapes are incompatible or any weight is non-finite.
+    """
 
     w_gate: Any
     w_amp: Any
@@ -609,6 +772,14 @@ class GatedSAEDecoder:
         object.__setattr__(self, "w_amp", amp)
 
     def decode(self, x: Any) -> np.ndarray:
+        """Decode one vector ``(F,)`` or a batch ``(N, F)`` to ``(D,)`` / ``(N, D)``.
+
+        Raises
+        ------
+        ValueError
+            If the input is not one- or two-dimensional with width matching
+            ``w_gate.shape[1]``.
+        """
         x_arr = np.asarray(x, dtype=float)
         single = x_arr.ndim == 1
         x2 = x_arr.reshape(1, -1) if single else x_arr

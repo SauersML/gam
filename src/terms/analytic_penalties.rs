@@ -4,10 +4,10 @@
 //! penalties identified as the minimal identifiability tools needed by an
 //! SAE / principal-manifold / latent-coordinate workflow:
 //!
-//!   * [`IsometryPenalty`] — pulls the pullback metric of the decoder toward a
-//!     reference metric on the latent manifold. Lives on the extension-coordinate tier
-//!     (specifically on
-//!     a [`crate::terms::latent_coord::LatentCoordValues`] slice). Breaks the
+//!   * [`IsometryPenalty`] — pulls the decoder pullback metric
+//!     `J(t)^T W J(t)` toward a reference metric on the latent manifold. Lives
+//!     on the extension-coordinate tier (specifically on a
+//!     [`crate::terms::latent_coord::LatentCoordValues`] slice). Breaks the
 //!     diffeomorphism gauge so the inner Hessian on `t` is full-rank and the
 //!     IFT is well-defined.
 //!   * [`SparsityPenalty`] — smoothed L¹ (`sqrt(x² + ε²)`), Hoyer, or Log
@@ -26,8 +26,9 @@
 //!     latent axis is penalized independently on every edge. Promotes
 //!     piecewise-constant atom maps.
 //!   * [`NuclearNormPenalty`] — smoothed L¹ on singular values of a matrix
-//!     latent block. Promotes low intrinsic rank without choosing a canonical
-//!     axis basis.
+//!     latent block, `Σ_i (sqrt(σ_i² + ε²) - ε)`. Promotes low intrinsic rank
+//!     without choosing a canonical axis basis; in SAE wiring this is the
+//!     decoder-embedding rank-selection lever.
 //!   * [`BlockSparsityPenalty`] — group-lasso smoothed L¹ over predefined
 //!     latent-axis blocks. Unlike per-element L¹ or per-axis L² ARD, it
 //!     shrinks whole semantic groups together; pair with
@@ -49,6 +50,12 @@
 //!     intrinsic dimension should be identifiable.
 //!   * [`BlockOrthogonalityPenalty`] — penalizes only between-block
 //!     cross-products of latent axes, leaving within-block structure free.
+//!   * [`ScadMcpPenalty`] — elementwise nonconvex SCAD/MCP sparsity on
+//!     extension-coordinate latent blocks. Tapers the shrinkage derivative to
+//!     zero beyond the SCAD/MCP cutoff so large coefficients are not L¹-biased.
+//!   * [`DecoderIncoherencePenalty`] — β-tier SAE decoder penalty
+//!     `½·w·Σ_{j<k} W[j,k]·‖B_j^T B_k‖²_F`, with `W[j,k]` coming from
+//!     co-activation. Pushes co-firing atom decoder column spaces apart.
 //!
 //! All shipped primitives are **analytic**: no autograd, no finite differencing. Each
 //! exposes:
@@ -62,7 +69,8 @@
 //! The signatures are deliberately uniform with the existing smoothness path:
 //! the quadratic ARD penalty produces a [`crate::terms::smooth::BlockwisePenalty`]
 //! that slots directly into the canonical-penalty pipeline, while the
-//! non-quadratic Sparsity, TV, NuclearNorm, Orthogonality, and Isometry
+//! non-quadratic Sparsity, TV, NuclearNorm, SCAD/MCP, Orthogonality,
+//! DecoderIncoherence, and Isometry
 //! penalties produce [`AnalyticPenaltyOp`] handles that downstream PIRLS / REML consumers query
 //! through the same `value / gradient / hvp` interface they already use for
 //! smoothness.
@@ -75,8 +83,9 @@
 //! kernel-shape paths append ext-coords. The IsometryPenalty owns one `ρ`; the
 //! SparsityPenalty owns either zero (`ε` fixed) or one (`ε` REML-selected) plus
 //! one strength; the ARDPenalty owns `d` (one per latent axis);
-//! NuclearNorm, BlockSparsity, BlockOrthogonality, RowPrecisionPrior, and
-//! Orthogonality each own one strength only when their weight is learnable.
+//! NuclearNorm, BlockSparsity, BlockOrthogonality, ScadMcp,
+//! DecoderIncoherence, RowPrecisionPrior, and Orthogonality each own one
+//! strength only when their weight is learnable.
 //! IvaeRidgeMeanGauge owns one strength only when its weight is learnable.
 //! ParametricRowPrecisionPrior owns its log-baseline precision, raw distance
 //! sensitivity, and reference point coordinates, plus one strength axis when
@@ -94,6 +103,8 @@
 //! | NuclearNorm | ext-coord (latent t) | 0 or 1 (log μ_nuc)  |
 //! | BlockSparsity | ext-coord (latent t) | 0 or 1 (log μ_group) |
 //! | MechanismSparsity | β (decoder W) | 0 or 1 (log μ_mech) |
+//! | ScadMcp | ext-coord (latent t) | 0 or 1 (log μ_scad_mcp) |
+//! | DecoderIncoherence | β (SAE decoder blocks) | 0 or 1 (log μ_decoder_incoh) |
 //! | RowPrecisionPrior | ext-coord (latent t) | 0 or 1 (log μ_aux) |
 //! | IvaeRidgeMeanGauge | ext-coord (latent t) | 0 or 1 (log μ_ivae_mean) |
 //! | ParametricRowPrecisionPrior | ext-coord (latent t) | d + d + d·du [+1 log μ_aux] |
@@ -608,6 +619,11 @@ impl WeightField {
 /// statement is "one unit of motion in `t` ↦ one unit of behavioral change",
 /// so the `W_n` weighting is load-bearing.
 ///
+/// In the SAE objective this is the extension-coordinate gauge fix: it prevents
+/// the latent chart from absorbing arbitrary smooth reparameterizations of the
+/// decoder manifold. ARD, sparsity, or rank penalties can then select axes or
+/// structure in a chart whose metric scale is pinned.
+///
 /// **Contraction order invariant.** Every place this struct touches `W_n`,
 /// the contraction is `(J^T U_n)(U_n^T J)` — never `J^T W_n J` with `W_n`
 /// materialized as `p × p`. Concretely we form `M_n = U_n^T J_n ∈ ℝ^{r × d}`
@@ -617,13 +633,12 @@ impl WeightField {
 /// **When to use.** Whenever a `LatentCoord` block is in play without an
 /// auxiliary variable (`AuxPrior`) to break the diffeomorphism gauge. Fixes
 /// the audit finding that ARD is not a standalone gauge fix. With a Euclidean
-/// reference, the penalty pulls the decoder toward a
-/// local isometry, which is enough to make the inner Hessian on `t` full-rank
-/// and the IFT well-defined.
+/// reference, the penalty pulls the decoder toward a local isometry, which is
+/// enough to make the inner Hessian on `t` full-rank and the IFT well-defined.
 ///
 /// **Math.** Let `J_n ∈ ℝ^{p × d}` be the local decoder Jacobian. Then
-/// `g_n = J_n^T J_n` and the penalty is `½ μ Σ_n ‖J_n^T J_n − g^ref_n‖²_F`.
-/// Analytic gradient w.r.t. `t_n`:
+/// `g_n = J_n^T W_n J_n` and the penalty is
+/// `½ μ Σ_n ‖J_n^T W_n J_n − g^ref_n‖²_F`. Analytic gradient w.r.t. `t_n`:
 ///
 /// ```text
 ///   ∂P/∂t_{n,c}
@@ -632,6 +647,17 @@ impl WeightField {
 ///           + J_{n,:,a}^T W_n H_{n,:,b,c} ],
 ///   H_{n,i,a,c} = ∂J_{n,i,a}/∂t_{n,c}.
 /// ```
+///
+/// Gotchas:
+///
+/// * The value path returns the configured missing-cache default when the
+///   first-jet cache is absent; gradient/HVP paths need the first and second
+///   decoder jets and return zeros when the analytic jet source is unavailable.
+/// * The exact Hessian includes a residual-curvature term requiring the third
+///   decoder jet. REML/PIRLS curvature should prefer the Gauss-Newton PSD
+///   majorizer when a positive curvature block is required.
+/// * `W_n` is a metric weight, not a scalar confidence. Changing it changes the
+///   canonical units of latent motion.
 ///
 /// The per-row Jacobian `J_n` is exactly the radial-derivative jet
 /// `design_gradient_wrt_t` already computes for `LatentCoordValues`; the
@@ -2514,19 +2540,33 @@ impl AnalyticPenalty for SparsityPenalty {
 ///   α_j = weight · exp(ρ_j)
 /// ```
 ///
-/// summed over `j ∈ [0, d)`. Under REML, axis `j` whose data evidence is too
+/// summed over `j ∈ [0, d)` for the extension-coordinate target block
+/// `T ∈ ℝ^{n_eff × d}`. In the SAE objective this is the latent-axis
+/// dimension-selection prior: under REML, axis `j` whose data evidence is too
 /// weak gets `ρ_j → +∞` (precision → ∞, coefficients → 0), so the latent
-/// dimension is effectively pruned. The intrinsic dimensionality is read off
-/// as the count of finite `ρ_j` at convergence, but only after a separate
-/// gauge-fixing prior (AuxPrior or Isometry) has fixed the rotation gauge.
+/// dimension is effectively pruned.
 ///
 /// Because the penalty is quadratic and block-diagonal in latent axes, it
 /// reduces to a [`BlockwisePenalty`] per axis and slots into the existing
 /// canonical-penalty pipeline with zero extra wiring beyond appending `d`
 /// hyperparameter axes to `ρ`.
 ///
-/// When to use: any [`LatentCoordValues`] block where the intrinsic dimension
-/// is unknown. Compose with `IsometryPenalty` for full gauge fixing.
+/// Gotchas:
+///
+/// * ARD is not a standalone identifiability fix. The intrinsic dimensionality
+///   is meaningful only after a separate gauge-fixing prior (`AuxPrior`,
+///   `IsometryPenalty`, or an equivalent basis constraint) has fixed rotations
+///   and reparameterizations.
+/// * `n_eff` controls the Gaussian normalizer / Occam term. Override it only
+///   when rows have been aggregated or otherwise represent a different
+///   effective observation count than `target.len() / latent_dim`.
+/// * The row-major `LatentCoordValues` layout means each per-axis ridge is
+///   strided in memory; [`Self::as_blockwise`] expands it into scalar
+///   `BlockwisePenalty` entries rather than pretending each axis is contiguous.
+///
+/// When to use: any [`crate::terms::latent_coord::LatentCoordValues`] block
+/// where the intrinsic dimension is unknown. Compose with `IsometryPenalty`
+/// for full gauge fixing.
 #[derive(Debug, Clone)]
 pub struct ARDPenalty {
     pub target: PsiSlice,
@@ -3699,10 +3739,33 @@ impl AnalyticPenalty for MonotonicityPenalty {
 
 /// Basis-free low-rank penalty for a row-major `(n_eff, d)` latent block.
 ///
-/// The smoothed nuclear norm applies a Huber-style L¹ penalty to the singular
-/// spectrum, encouraging low intrinsic rank even when useful axes are rotated
-/// away from the canonical basis. It complements ARD's per-axis pruning and
-/// Orthogonality's basis-fixing role.
+/// Lives on the extension-coordinate tier. The target is viewed as
+/// `T ∈ ℝ^{n_eff × d}` and penalized by the smoothed nuclear norm
+///
+/// ```text
+///   P(T) = w · Σ_{i < r} (sqrt(σ_i(T)^2 + ε^2) - ε),
+/// ```
+///
+/// where `σ_i(T)` are singular values and `r` is either the full thin-SVD rank
+/// or `max_rank` when a spectral cap is supplied. The penalty is basis-free:
+/// it selects the rank of the decoder/latent embedding used by SAE wiring
+/// without first committing to a canonical coordinate axis.
+///
+/// In the SAE objective this is the decoder embedding-rank selection lever
+/// (#672): it shrinks unused singular directions of the matrix-valued latent
+/// block while allowing the active subspace to rotate. It complements ARD
+/// (axis-wise pruning after a gauge fix) and orthogonality/isometry terms
+/// (basis and metric identification).
+///
+/// Gotchas:
+///
+/// * The Hessian is spectral and dense; callers should use the analytic HVP,
+///   not a row-block diagonal shortcut.
+/// * `max_rank` truncates the active singular spectrum. If the cutoff splits a
+///   tied smoothed Gram eigenvalue, the HVP is undefined and the implementation
+///   treats that as a caller contract violation.
+/// * `ε > 0` smooths the zero singular-value kink. Very small `ε` makes rank
+///   selection sharper but increases curvature around nearly-null directions.
 #[derive(Debug, Clone)]
 pub struct NuclearNormPenalty {
     pub target: PsiSlice,
@@ -5838,9 +5901,9 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
 
 /// Concave alternative to smoothed-L¹ sparsity with less bias on large signals.
 /// MCP (Zhang 2010) and SCAD (Fan-Li 2001) keep strong shrinkage near zero but
-/// flatten the gradient on large coefficients; `gamma` controls concavity, and
-/// `gamma -> infinity` recovers the L¹ limit. Fan-Li recommend `gamma = 3.7`
-/// for SCAD.
+/// taper the derivative to zero for large coefficients; `gamma` controls
+/// concavity, and `gamma -> infinity` recovers the L¹ limit. Fan-Li recommend
+/// `gamma = 3.7` for SCAD.
 ///
 /// `SparsityPenalty` uses Huber-smoothed L¹, `Σ_j sqrt(t_j² + ε²)`, whose
 /// gradient magnitude stays constant outside the Huber region. That constant
@@ -5856,6 +5919,35 @@ pub enum PenaltyConcavity {
 }
 
 /// Element-wise SCAD/MCP family penalty on a row-major latent block.
+///
+/// Lives on the extension-coordinate tier. The target is a row-major
+/// `(n_eff, d)` latent block, but the penalty is coordinate-separable:
+/// `P(T) = Σ_i p(r_i; λ, γ)` with `r_i = sqrt(T_i² + ε²)` and
+/// `λ = weight · exp(ρ)` when the weight is learnable.
+///
+/// MCP uses
+///
+/// ```text
+///   p_MCP(r) = λr - (r² - ε²)/(2γ),       r ≤ γλ
+///            = γλ²/2 + ε²/(2γ),          r > γλ,
+/// ```
+///
+/// so the shrinkage derivative tapers linearly to zero at `γλ`. SCAD uses the
+/// Fan-Li three-region derivative: L¹ shrinkage up to `λ`, a linear taper on
+/// `(λ, γλ]`, and zero derivative beyond `γλ`.
+///
+/// In the SAE objective this is the nonconvex sparsity prior for latent
+/// extension-coordinate amplitudes: it still suppresses near-zero activations
+/// but avoids L¹'s bias on large coefficients that should remain active.
+///
+/// Gotchas:
+///
+/// * The exact Hessian diagonal can be negative in the taper region. This is a
+///   row-block-diagonal penalty, but not a PSD curvature source.
+/// * `γ` must be `> 1` for MCP and `> 2` for SCAD. Larger values approach
+///   smoothed L¹; smaller valid values make the taper more aggressive.
+/// * `ε > 0` smooths the absolute-value cusp and slightly shifts the effective
+///   cutoffs because the piecewise rules use `r = sqrt(t² + ε²)`.
 #[derive(Debug, Clone)]
 pub struct ScadMcpPenalty {
     pub target: PsiSlice,
@@ -6174,22 +6266,34 @@ impl AnalyticPenalty for ScadMcpPenalty {
 // ---------------------------------------------------------------------------
 
 /// Between-block-only orthogonality on a row-major matrix-valued latent
-/// block. Penalizes the squared Frobenius norm of the off-diagonal blocks
-/// of the latent Gram matrix `Tᵀ T`, where `T` is the row-major
+/// block.
+///
+/// Lives on the extension-coordinate tier. Penalizes the squared Frobenius
+/// norm of the between-block Gram matrices, where `T` is the row-major
 /// `n_eff × latent_dim` view of the target slice and `groups` partitions
 /// the latent axes into disjoint subsets:
 ///
 /// ```text
-///   P(T) = ½ · w · Σ_{g ≠ h}  ‖ (Tᵀ T)_{group_g, group_h} ‖²_F
+///   P(T) = ½ · w · Σ_{g < h} ‖ T[:, group_g]^T T[:, group_h] ‖²_F
 /// ```
 ///
-/// Within-block structure is unconstrained — the penalty zeroes out only
-/// off-diagonal blocks. Pair with a per-block ARD penalty when you also
-/// want within-block axis sparsity / scale identification.
+/// Within-block structure is unconstrained: this penalty only pushes different
+/// groups into mutually orthogonal subspaces. In the SAE objective it is the
+/// block-level separability / gauge term for latent decompositions where known
+/// or supervised coordinates should not leak into free coordinates.
 ///
-/// Typical use: gauge-fixing a latent decomposition where one block has
-/// been supervised (e.g. anchored to known coordinates) and a free block
-/// needs to inhabit the orthogonal complement of that supervision.
+/// Typical use: gauge-fixing a latent decomposition where one block has been
+/// supervised (e.g. anchored to known coordinates) and a free block needs to
+/// inhabit the orthogonal complement of that supervision. Pair with per-block
+/// ARD or sparsity when you also want within-block axis selection.
+///
+/// Gotchas:
+///
+/// * `groups` must be a true partition of all latent axes: every axis appears
+///   exactly once, and at least two groups are required.
+/// * The Hessian is dense across rows and axes even though an exact diagonal is
+///   available for diagnostics/preconditioning. Use the HVP for the full
+///   Newton curvature.
 #[derive(Debug, Clone)]
 pub struct BlockOrthogonalityPenalty {
     pub target: PsiSlice,
@@ -6586,6 +6690,342 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
 
     fn name(&self) -> &str {
         "block_orthogonality"
+    }
+
+    impl_scalar_apply_schedule!(weight);
+}
+
+// ---------------------------------------------------------------------------
+// Decoder column-space incoherence penalty
+// ---------------------------------------------------------------------------
+
+/// Cross-atom decoder column-space incoherence, restricted to co-activating
+/// atom pairs (issue #671).
+///
+/// Lives on the β tier and targets the flat SAE decoder coefficient block. The
+/// β layout concatenates the per-atom decoder blocks in atom order: atom `k`
+/// owns `M_k · p_out` coefficients, stored as
+/// `β[off_k + a·p_out + o]` for basis column `a` and output feature `o`.
+/// Mathematically it is convenient to view each atom as
+/// `B_k ∈ ℝ^{p_out × M_k}` with columns `B_k[o, a]`.
+///
+/// The penalty is the co-activation-masked cross-column-space overlap
+///
+/// ```text
+///   P = ½ · w · Σ_{j<k} W[j,k] · ‖B_j^T B_k‖²_F,
+///   W[j,k] = ½ · (coactivation[j,k] + coactivation[k,j]).
+/// ```
+///
+/// `coactivation[j,k]` is the mean over observations of
+/// `gate[n,j] · gate[n,k]`; pairs that never co-fire (`W[j,k] = 0`) contribute
+/// nothing. In the SAE objective this is the separability lever: atoms that
+/// are active on the same examples are discouraged from spanning the same
+/// decoder output directions, while unrelated atoms are not pushed apart just
+/// because they both exist in the dictionary.
+///
+/// The Hessian used here is the Gauss-Newton (positive-semidefinite) curvature
+/// of the Frobenius objective in `C`, dropping the indefinite second-order term
+/// in `C`. This keeps the β-tier Newton / PIRLS curvature block PSD, matching
+/// the other quadratic-on-Gram penalties.
+///
+/// Gotchas:
+///
+/// * `block_sizes` are decoder basis-column counts `M_k`, not output widths;
+///   every atom shares the same `p_out`.
+/// * The descriptor path builds a placeholder penalty; live SAE wiring replaces
+///   the co-activation matrix with the current mean gate products.
+/// * Offsets are interpreted against the vector passed to this penalty. In the
+///   SAE decoder-incoherence path the registered target slice is zero-based;
+///   callers using an already sliced target view must keep that convention.
+#[derive(Debug, Clone)]
+pub struct DecoderIncoherencePenalty {
+    pub target: PsiSlice,
+    /// Per-atom decoder basis-function counts `M_k`. The atom blocks are laid
+    /// out contiguously in β order; `Σ_k M_k·p_out == target.len()`.
+    pub block_sizes: Vec<usize>,
+    /// Output / feature dimension `p_out` (decoder column count, shared by all
+    /// atoms).
+    pub p_out: usize,
+    /// `(K, K)` joint gate activity. `coactivation[j,k]` is `mean_n gate[n,j]·gate[n,k]`.
+    pub coactivation: Array2<f64>,
+    /// Base strength. If `learnable_weight` is true the resolved strength is
+    /// `weight·exp(rho[rho_index])`; otherwise it is fixed at `weight`.
+    pub weight: f64,
+    pub learnable_weight: bool,
+    pub rho_index: usize,
+    pub weight_schedule: Option<ScalarWeightSchedule>,
+}
+
+impl DecoderIncoherencePenalty {
+    #[must_use = "build error must be handled"]
+    pub fn new(
+        target: PsiSlice,
+        block_sizes: Vec<usize>,
+        p_out: usize,
+        coactivation: Array2<f64>,
+        weight: f64,
+        learnable_weight: bool,
+    ) -> Result<Self, String> {
+        if target.is_empty() {
+            return Err("DecoderIncoherencePenalty::new requires a non-empty target".to_string());
+        }
+        if !(weight.is_finite() && weight > 0.0) {
+            return Err(format!(
+                "DecoderIncoherencePenalty::new requires finite weight > 0, got {weight}"
+            ));
+        }
+        if p_out == 0 {
+            return Err("DecoderIncoherencePenalty::new requires p_out > 0".to_string());
+        }
+        if block_sizes.len() < 2 {
+            return Err(
+                "DecoderIncoherencePenalty::new requires at least two atom blocks".to_string(),
+            );
+        }
+        let k = block_sizes.len();
+        if coactivation.dim() != (k, k) {
+            return Err(format!(
+                "DecoderIncoherencePenalty::new requires (K, K)=({k}, {k}) coactivation; got {:?}",
+                coactivation.dim()
+            ));
+        }
+        if !coactivation.iter().all(|value| value.is_finite()) {
+            return Err(
+                "DecoderIncoherencePenalty::new requires finite coactivation entries".to_string(),
+            );
+        }
+        let mut total = 0usize;
+        for &m in &block_sizes {
+            let span = m.checked_mul(p_out).ok_or_else(|| {
+                "DecoderIncoherencePenalty::new block span overflows usize".to_string()
+            })?;
+            total = total.checked_add(span).ok_or_else(|| {
+                "DecoderIncoherencePenalty::new total span overflows usize".to_string()
+            })?;
+        }
+        if total != target.len() {
+            return Err(format!(
+                "DecoderIncoherencePenalty::new Σ_k M_k·p_out = {total} does not match target length {}",
+                target.len()
+            ));
+        }
+        Ok(Self {
+            target,
+            block_sizes,
+            p_out,
+            coactivation,
+            weight,
+            learnable_weight,
+            rho_index: 0,
+            weight_schedule: None,
+        })
+    }
+
+    impl_with_weight_schedule!(weight);
+
+    fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
+        if self.learnable_weight {
+            self.weight * rho[self.rho_index].exp()
+        } else {
+            self.weight
+        }
+    }
+
+    /// Flat-β offset of atom `k`'s decoder block within the vector passed to
+    /// this penalty. SAE decoder-incoherence wiring registers a zero-based
+    /// target slice, so `target.range.start` is normally zero here.
+    fn block_offsets(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.block_sizes.len());
+        let mut cursor = self.target.range.start;
+        for &m in &self.block_sizes {
+            out.push(cursor);
+            cursor += m * self.p_out;
+        }
+        out
+    }
+
+    /// Symmetrized co-activation pair weight `½·(W[j,k] + W[k,j])`.
+    fn pair_weight(&self, j: usize, k: usize) -> f64 {
+        0.5 * (self.coactivation[[j, k]] + self.coactivation[[k, j]])
+    }
+
+    /// Cross-Gram `C[a, b] = Σ_o B_j[o, a]·B_k[o, b]`, shape `(M_j, M_k)`.
+    fn cross_gram(
+        target: ArrayView1<'_, f64>,
+        off_j: usize,
+        m_j: usize,
+        off_k: usize,
+        m_k: usize,
+        p_out: usize,
+    ) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((m_j, m_k));
+        for a in 0..m_j {
+            for b in 0..m_k {
+                let mut s = 0.0;
+                for o in 0..p_out {
+                    s += target[off_j + a * p_out + o] * target[off_k + b * p_out + o];
+                }
+                out[[a, b]] = s;
+            }
+        }
+        out
+    }
+}
+
+impl AnalyticPenalty for DecoderIncoherencePenalty {
+    fn tier(&self) -> PenaltyTier {
+        PenaltyTier::Beta
+    }
+
+    fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
+        if target.len() != self.target.len() {
+            return 0.0;
+        }
+        let offsets = self.block_offsets();
+        let k_atoms = self.block_sizes.len();
+        let mut acc = 0.0;
+        for j in 0..k_atoms {
+            for k in (j + 1)..k_atoms {
+                let w_pair = self.pair_weight(j, k);
+                if w_pair == 0.0 {
+                    continue;
+                }
+                let c = Self::cross_gram(
+                    target,
+                    offsets[j],
+                    self.block_sizes[j],
+                    offsets[k],
+                    self.block_sizes[k],
+                    self.p_out,
+                );
+                let mut frob_sq = 0.0;
+                for &value in c.iter() {
+                    frob_sq += value * value;
+                }
+                acc += w_pair * frob_sq;
+            }
+        }
+        0.5 * self.resolved_weight(rho) * acc
+    }
+
+    fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
+        let mut grad = Array1::<f64>::zeros(target.len());
+        if target.len() != self.target.len() {
+            return grad;
+        }
+        let offsets = self.block_offsets();
+        let k_atoms = self.block_sizes.len();
+        let weight = self.resolved_weight(rho);
+        for j in 0..k_atoms {
+            for k in (j + 1)..k_atoms {
+                let w_pair = self.pair_weight(j, k) * weight;
+                if w_pair == 0.0 {
+                    continue;
+                }
+                let off_j = offsets[j];
+                let off_k = offsets[k];
+                let m_j = self.block_sizes[j];
+                let m_k = self.block_sizes[k];
+                let c = Self::cross_gram(target, off_j, m_j, off_k, m_k, self.p_out);
+                // grad_j[a, o] += w · Σ_b C[a, b] · B_k[b, o]
+                for a in 0..m_j {
+                    for o in 0..self.p_out {
+                        let mut s = 0.0;
+                        for b in 0..m_k {
+                            s += c[[a, b]] * target[off_k + b * self.p_out + o];
+                        }
+                        grad[off_j + a * self.p_out + o] += w_pair * s;
+                    }
+                }
+                // grad_k[b, o] += w · Σ_a C[a, b] · B_j[a, o]
+                for b in 0..m_k {
+                    for o in 0..self.p_out {
+                        let mut s = 0.0;
+                        for a in 0..m_j {
+                            s += c[[a, b]] * target[off_j + a * self.p_out + o];
+                        }
+                        grad[off_k + b * self.p_out + o] += w_pair * s;
+                    }
+                }
+            }
+        }
+        grad
+    }
+
+    fn hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
+        let mut out = Array1::<f64>::zeros(target.len());
+        if target.len() != self.target.len() {
+            return out;
+        }
+        let offsets = self.block_offsets();
+        let k_atoms = self.block_sizes.len();
+        let weight = self.resolved_weight(rho);
+        for j in 0..k_atoms {
+            for k in (j + 1)..k_atoms {
+                let w_pair = self.pair_weight(j, k) * weight;
+                if w_pair == 0.0 {
+                    continue;
+                }
+                let off_j = offsets[j];
+                let off_k = offsets[k];
+                let m_j = self.block_sizes[j];
+                let m_k = self.block_sizes[k];
+                // Gauss-Newton directional Gram derivative:
+                //   dC[a, b] = Σ_o (Vj[a, o]·Bk[b, o] + Bj[a, o]·Vk[b, o]).
+                let mut d_c = Array2::<f64>::zeros((m_j, m_k));
+                for a in 0..m_j {
+                    for b in 0..m_k {
+                        let mut s = 0.0;
+                        for o in 0..self.p_out {
+                            s += v[off_j + a * self.p_out + o] * target[off_k + b * self.p_out + o]
+                                + target[off_j + a * self.p_out + o]
+                                    * v[off_k + b * self.p_out + o];
+                        }
+                        d_c[[a, b]] = s;
+                    }
+                }
+                // out_j[a, o] += w · Σ_b dC[a, b] · Bk[b, o]
+                for a in 0..m_j {
+                    for o in 0..self.p_out {
+                        let mut s = 0.0;
+                        for b in 0..m_k {
+                            s += d_c[[a, b]] * target[off_k + b * self.p_out + o];
+                        }
+                        out[off_j + a * self.p_out + o] += w_pair * s;
+                    }
+                }
+                // out_k[b, o] += w · Σ_a dC[a, b] · Bj[a, o]
+                for b in 0..m_k {
+                    for o in 0..self.p_out {
+                        let mut s = 0.0;
+                        for a in 0..m_j {
+                            s += d_c[[a, b]] * target[off_j + a * self.p_out + o];
+                        }
+                        out[off_k + b * self.p_out + o] += w_pair * s;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // `hessian_diag` is intentionally left at the trait default (returns `None`
+    // for a non-empty target): the Gauss-Newton Hessian of the cross-Gram
+    // Frobenius objective is dense, not diagonal, so curvature is supplied via
+    // the closed-form `hvp` / `psd_majorizer_hvp` path above.
+
+    impl_learnable_weight_grad_rho!();
+
+    impl_learnable_weight_rho_count!();
+
+    fn name(&self) -> &str {
+        "decoder_incoherence"
     }
 
     impl_scalar_apply_schedule!(weight);
@@ -7176,6 +7616,12 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 self.stochastic_diag_via_matvec()
             }
             AnalyticPenaltyKind::BlockOrthogonality(_) => self.diag_via_matvec(),
+            AnalyticPenaltyKind::DecoderIncoherence(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_diag_via_matvec()
+            }
+            AnalyticPenaltyKind::DecoderIncoherence(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::Orthogonality(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::NuclearNorm(_) => self.diag_via_matvec(),
             AnalyticPenaltyKind::BlockSparsity(_)
@@ -7326,6 +7772,11 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             {
                 self.stochastic_log_det_plus_lambda_i(lambda)
             }
+            AnalyticPenaltyKind::DecoderIncoherence(_)
+                if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
+            {
+                self.stochastic_log_det_plus_lambda_i(lambda)
+            }
             AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
                 if self.dim() > ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD =>
             {
@@ -7350,6 +7801,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
             | AnalyticPenaltyKind::MechanismSparsity(_)
             | AnalyticPenaltyKind::IvaeRidgeMeanGauge(_)
             | AnalyticPenaltyKind::BlockOrthogonality(_)
+            | AnalyticPenaltyKind::DecoderIncoherence(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::SheafConsistency(_)
             | AnalyticPenaltyKind::Monotonicity(_) => {

@@ -41,19 +41,62 @@ def _canonical_assignment(value: str, label: str) -> str:
 
 @dataclass(slots=True)
 class SaeManifoldAtomFit:
+    """Per-atom fit payload returned inside :class:`ManifoldSAE`.
+
+    Attributes
+    ----------
+    basis
+        Basis kind used by this atom, for example ``"periodic"``,
+        ``"euclidean"``, ``"duchon"``, ``"sphere"``, or ``"torus"``.
+    decoder_coefficients
+        Decoder basis coefficients ``B_k`` with shape ``(M_k, p)`` where
+        ``M_k`` is the atom basis size and ``p`` is the ambient/output
+        dimension. Values are in the same units as ``X`` because the basis
+        functions are dimensionless.
+    assignments
+        Per-observation assignment/gate values for this atom, shape ``(N,)``.
+        For ``assignment="softmax"`` these are mixture masses; for
+        ``"ibp"``/``"ibp_map"`` and ``"jumprelu"``/``"gated"`` these are
+        gate activations.
+    coords
+        Recovered on-atom latent coordinates ``t*`` for the training data,
+        shape ``(N, d_k)``. Units are the atom's raw latent coordinate system:
+        periodic/circle coordinates are normalized phase coordinates, while
+        euclidean/duchon coordinates are raw chart coordinates.
+    evidence
+        Fit REML score copied from the full SAE result.
+    active_dim
+        Estimated active intrinsic coordinate dimension for this atom.
+    decoder_covariance
+        Optional phi-scaled posterior covariance of the flattened decoder
+        coefficients, shape ``(M_k * p, M_k * p)`` in row-major
+        ``(basis, channel)`` layout. Entries have squared ``X`` units. Present
+        on fresh fits when the Rust payload includes posterior uncertainty.
+    shape_band_coords
+        Optional coordinate grid for the posterior shape band, shape
+        ``(G, d_k)``, in the same latent-coordinate units as ``coords``.
+    shape_band_mean
+        Optional fitted ambient manifold values on ``shape_band_coords``,
+        shape ``(G, p)``, in the same units as ``X``.
+    shape_band_sd
+        Optional per-channel posterior standard deviation of
+        ``shape_band_mean``, shape ``(G, p)``, in the same units as ``X``.
+    """
+
     basis: str
     decoder_coefficients: np.ndarray
     assignments: np.ndarray
     coords: np.ndarray
     evidence: float
     active_dim: int
-    # Posterior shape uncertainty (populated on a fresh fit; ``None`` on a
-    # deserialized model). ``decoder_covariance`` is the phi-scaled posterior
-    # covariance of this atom's decoder coefficients, shape ``(M_k*p, M_k*p)``
-    # in row-major ``(basis, channel)`` flat layout. The shape band is the
-    # closed-form push-forward to ambient space along the on-atom coordinates:
-    # ``shape_band_mean`` is the fitted point ``(G, p)``, ``shape_band_sd`` its
-    # per-channel posterior sd ``(G, p)``, at ``shape_band_coords`` ``(G, d_k)``.
+    # Posterior shape uncertainty. These fields are ``None`` only when the
+    # source payload did not include uncertainty arrays. ``decoder_covariance``
+    # is the phi-scaled posterior covariance of this atom's decoder
+    # coefficients, shape ``(M_k*p, M_k*p)`` in row-major ``(basis, channel)``
+    # flat layout. The shape band is the closed-form push-forward to ambient
+    # space along the on-atom coordinates: ``shape_band_mean`` is the fitted
+    # point ``(G, p)``, ``shape_band_sd`` its per-channel posterior sd
+    # ``(G, p)``, at ``shape_band_coords`` ``(G, d_k)``.
     decoder_covariance: np.ndarray | None = None
     shape_band_coords: np.ndarray | None = None
     shape_band_mean: np.ndarray | None = None
@@ -74,6 +117,24 @@ class SaeManifoldFitResult:
 
 @dataclass(slots=True)
 class ManifoldSAE:
+    """Fitted SAE-manifold model returned by :func:`sae_manifold_fit`.
+
+    The main result arrays are ``fitted`` ``(N, p)``, ``assignments`` ``(N, K)``,
+    ``coords`` as a list of per-atom ``(N, d_k)`` arrays, ``decoder_blocks`` as
+    per-atom ``(M_k, p)`` decoder matrices, and ``atoms`` as detailed
+    :class:`SaeManifoldAtomFit` payloads. Metadata records the resolved
+    ``assignment`` kind, per-atom topology/basis information, score fields
+    (``reml_score``, ``reconstruction_r2``, ``dispersion``), fit controls
+    (``alpha``, ``learnable_alpha``, ``tau``, ``top_k``,
+    ``jumprelu_threshold``), and cached training data used for exact
+    training-set predictions.
+
+    Public helpers include :meth:`predict`/:meth:`reconstruct`,
+    :meth:`encode`, :meth:`converged_latents`, :meth:`project`,
+    :meth:`shape_uncertainty`, :meth:`coordinate_range`, and
+    :meth:`typical_shape`.
+    """
+
     atoms: list[SaeManifoldAtomFit]
     atom_topology: str
     atom_topologies: list[str]
@@ -175,34 +236,140 @@ class ManifoldSAE:
             dispersion=float(payload.get("dispersion", 1.0)),
         )
 
-    def shape_band(self, atom_k: int, *, n_sd: float = 1.96) -> dict[str, np.ndarray]:
-        """Posterior shape band for atom ``atom_k``.
+    def _atom_index(self, atom: int) -> int:
+        k = int(atom)
+        if k < 0 or k >= len(self.atoms):
+            raise IndexError(f"atom={atom} out of range for K={len(self.atoms)} atoms")
+        return k
+
+    def shape_uncertainty(self, atom: int = 0, *, n_sd: float = 1.96) -> dict[str, np.ndarray]:
+        """Posterior ambient shape uncertainty for one atom.
 
         Returns ``{"coords", "mean", "sd", "lower", "upper"}`` — the fitted
-        ambient manifold point and its closed-form posterior uncertainty along
-        the atom's on-atom coordinates, with ``lower``/``upper`` the
-        ``mean ± n_sd·sd`` envelope (``n_sd=1.96`` is the pointwise 95% band).
-        The uncertainty is the Laplace posterior of the decoder shape with the
-        latent coordinates marginalized out; it widens automatically where the
-        atom is poorly identified. Available only on a freshly-fit model.
+        ambient curve/surface and its closed-form posterior uncertainty on the
+        atom's uncertainty grid. ``coords`` has shape ``(G, d_k)`` and uses the
+        atom's raw latent-coordinate units. ``mean`` and ``sd`` have shape
+        ``(G, p)`` and use the same ambient units as the training data ``X``;
+        ``lower``/``upper`` are ``mean ± n_sd * sd``. ``n_sd=1.96`` gives the
+        pointwise 95% posterior band. The per-atom decoder coefficient
+        covariance that generated this band is available as
+        ``self.atoms[atom].decoder_covariance``.
         """
-        k = int(atom_k)
-        if k < 0 or k >= len(self.atoms):
-            raise IndexError(f"atom_k={atom_k} out of range for K={len(self.atoms)} atoms")
+        k = self._atom_index(atom)
         atom = self.atoms[k]
-        if atom.shape_band_mean is None or atom.shape_band_sd is None:
+        if (
+            atom.shape_band_coords is None
+            or atom.shape_band_mean is None
+            or atom.shape_band_sd is None
+        ):
             raise ValueError(
-                "shape_band is only available on a freshly-fit ManifoldSAE; this "
-                "model was deserialized without the (fit-time) uncertainty arrays."
+                "shape_uncertainty is only available when the fit payload "
+                "includes shape_band_coords, shape_band_mean, and shape_band_sd."
             )
-        mean = atom.shape_band_mean
-        sd = atom.shape_band_sd
+        coords = np.asarray(atom.shape_band_coords, dtype=float)
+        mean = np.asarray(atom.shape_band_mean, dtype=float)
+        sd = np.asarray(atom.shape_band_sd, dtype=float)
+        width = float(n_sd) * sd
         return {
-            "coords": atom.shape_band_coords,
-            "mean": mean,
-            "sd": sd,
-            "lower": mean - float(n_sd) * sd,
-            "upper": mean + float(n_sd) * sd,
+            "coords": coords.copy(),
+            "mean": mean.copy(),
+            "sd": sd.copy(),
+            "lower": mean - width,
+            "upper": mean + width,
+        }
+
+    def shape_band(self, atom_k: int, *, n_sd: float = 1.96) -> dict[str, np.ndarray]:
+        """Compatibility alias for :meth:`shape_uncertainty`."""
+        return self.shape_uncertainty(atom=atom_k, n_sd=n_sd)
+
+    def coordinate_range(self, atom: int = 0) -> dict[str, Any]:
+        """Observed training-coordinate range for one atom.
+
+        Returns a dictionary with ``n`` and per-axis arrays ``min``, ``max``,
+        ``p05``, ``p50``/``median``, and ``p95`` of shape ``(d_k,)`` computed
+        from the atom's recovered training coordinates ``coords``. Coordinates
+        are in the atom's raw latent-coordinate units. ``quantile_levels`` is
+        ``[0.05, 0.50, 0.95]`` and ``quantiles`` has shape ``(3, d_k)``.
+        """
+        k = self._atom_index(atom)
+        coords = np.asarray(self.atoms[k].coords, dtype=float)
+        if coords.ndim != 2:
+            raise ValueError(
+                f"atom={atom} coords must be a 2D array; got shape {coords.shape}"
+            )
+        quantiles = np.percentile(coords, [5.0, 50.0, 95.0], axis=0)
+        p05, p50, p95 = quantiles
+        return {
+            "n": int(coords.shape[0]),
+            "min": np.min(coords, axis=0),
+            "max": np.max(coords, axis=0),
+            "p05": p05.copy(),
+            "p50": p50.copy(),
+            "median": p50.copy(),
+            "p95": p95.copy(),
+            "quantile_levels": np.asarray([0.05, 0.50, 0.95], dtype=float),
+            "quantiles": quantiles.copy(),
+        }
+
+    def typical_shape(
+        self,
+        atom: int = 0,
+        *,
+        quantile_range: tuple[float, float] = (5.0, 95.0),
+        n_sd: float = 1.0,
+    ) -> dict[str, Any]:
+        """Posterior shape band restricted to the atom's typical coordinate box.
+
+        ``quantile_range`` selects the coordinate percentiles used to define the
+        box, defaulting to the observed 5th-95th percentile range of
+        ``self.atoms[atom].coords``. The returned dict contains the selected
+        pointwise band (``coords``, ``mean``, ``sd``, ``lower``, ``upper``),
+        the coordinate summary from :meth:`coordinate_range`, and aggregate
+        ambient summaries over the selected grid: ``ambient_mean`` and
+        ``ambient_sd`` are the per-channel mean and standard deviation of the
+        fitted shape values across the typical coordinate range, while
+        ``posterior_sd_mean`` is the average per-channel posterior sd.
+        """
+        q_low, q_high = (float(quantile_range[0]), float(quantile_range[1]))
+        if not (0.0 <= q_low < q_high <= 100.0):
+            raise ValueError(
+                "quantile_range must be an increasing pair within [0, 100]; "
+                f"got {quantile_range!r}"
+            )
+        k = self._atom_index(atom)
+        fit_coords = np.asarray(self.atoms[k].coords, dtype=float)
+        if fit_coords.ndim != 2:
+            raise ValueError(
+                f"atom={atom} coords must be a 2D array; got shape {fit_coords.shape}"
+            )
+        coord_low, coord_high = np.percentile(fit_coords, [q_low, q_high], axis=0)
+        band = self.shape_uncertainty(atom=k, n_sd=n_sd)
+        grid = np.asarray(band["coords"], dtype=float)
+        if grid.ndim != 2 or grid.shape[1] != fit_coords.shape[1]:
+            raise ValueError(
+                "shape uncertainty coordinate grid is incompatible with recovered "
+                f"coords: grid shape {grid.shape}, coords shape {fit_coords.shape}"
+            )
+        mask = np.all((grid >= coord_low) & (grid <= coord_high), axis=1)
+        if not np.any(mask):
+            raise ValueError(
+                "shape uncertainty grid has no points inside the requested "
+                f"{q_low:g}-{q_high:g} percentile coordinate range for atom={atom}"
+            )
+        mean = np.asarray(band["mean"], dtype=float)[mask]
+        sd = np.asarray(band["sd"], dtype=float)[mask]
+        width = float(n_sd) * sd
+        return {
+            "coordinate_range": self.coordinate_range(atom=k),
+            "quantile_range": np.asarray([q_low, q_high], dtype=float),
+            "coords": grid[mask].copy(),
+            "mean": mean.copy(),
+            "sd": sd.copy(),
+            "lower": mean - width,
+            "upper": mean + width,
+            "ambient_mean": np.mean(mean, axis=0),
+            "ambient_sd": np.std(mean, axis=0),
+            "posterior_sd_mean": np.mean(sd, axis=0),
         }
 
     def _oos_payload(self, X: Any, *, t_init: Any = None, a_init: Any = None) -> dict[str, Any]:
@@ -364,6 +531,9 @@ class ManifoldSAE:
         disk via :meth:`save` / :func:`gamfit.save`) to recover an object that
         reproduces :meth:`predict` outputs bit-exactly on training data.
         """
+        def _optional_list(value: np.ndarray | None) -> Any:
+            return None if value is None else value.tolist()
+
         return {
             "schema": "gamfit.ManifoldSAE/v1",
             "atom_topology": self.atom_topology,
@@ -400,6 +570,10 @@ class ManifoldSAE:
                     "coords": a.coords.tolist(),
                     "evidence": float(a.evidence),
                     "active_dim": int(a.active_dim),
+                    "decoder_covariance": _optional_list(a.decoder_covariance),
+                    "shape_band_coords": _optional_list(a.shape_band_coords),
+                    "shape_band_mean": _optional_list(a.shape_band_mean),
+                    "shape_band_sd": _optional_list(a.shape_band_sd),
                 }
                 for a in self.atoms
             ],
@@ -419,6 +593,10 @@ class ManifoldSAE:
         schema = str(payload.get("schema", ""))
         if schema and schema != "gamfit.ManifoldSAE/v1":
             raise ValueError(f"ManifoldSAE.from_dict: unsupported schema {schema!r}")
+        def _optional_array(atom_payload: Mapping[str, Any], key: str) -> np.ndarray | None:
+            value = atom_payload.get(key)
+            return None if value is None else np.asarray(value, dtype=float)
+
         atoms = [
             SaeManifoldAtomFit(
                 basis=str(a["basis"]),
@@ -427,6 +605,10 @@ class ManifoldSAE:
                 coords=np.asarray(a["coords"], dtype=float),
                 evidence=float(a["evidence"]),
                 active_dim=int(a["active_dim"]),
+                decoder_covariance=_optional_array(a, "decoder_covariance"),
+                shape_band_coords=_optional_array(a, "shape_band_coords"),
+                shape_band_mean=_optional_array(a, "shape_band_mean"),
+                shape_band_sd=_optional_array(a, "shape_band_sd"),
             )
             for a in payload["atoms"]
         ]
@@ -504,50 +686,148 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      assignment: str = "ibp", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
-                     Z: Any = None, sparsity_weight: float = 1.0, smoothness_weight: float = 1.0,
+                     Z: Any = None, sparsity_weight: float = 1.0,
+                     gate_sparsity: str = "l1", scad_mcp_gamma: float | None = None,
+                     smoothness_weight: float = 1.0,
                      alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
+                     nuclear_norm_weight: float = 0.0, nuclear_norm_max_rank: int | None = None,
+                     decoder_incoherence_weight: float = 1.0,
                      top_k: int | None = None, t_init: Any = None, a_init: Any = None,
                      **kwargs: Any) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
-    ``decoder_feature_sparsity_groups`` was previously named
-    ``mechanism_sparsity_groups``. The rename reflects the actual semantics in
-    the SAE setting: ``MechanismSparsityPenalty`` group-lassoes over rows of
-    a ``(latent_dim, p_features)`` decoder block. For the standalone
-    ``MechSparsity`` use-case the rows are *latents* and the groups index
-    *features* (mechanisms); for the SAE decoder the rows are the per-atom
-    *basis functions* (M_k) and the groups still index the ``p_out`` output
-    features. The penalty drives basis-function-aligned feature groups to
-    zero, encouraging each basis function to load on a single feature
-    cluster. Multi-atom (``k_atoms >= 2``) SAEs are supported: the Rust
-    ``add_sae_beta_penalty`` dispatches the group-lasso per atom, rebuilding
-    the penalty target to each atom's ``(M_k, p_out)`` decoder block (#240).
+    Parameters
+    ----------
+    X, Z
+        Aliases for the response data matrix reconstructed by the SAE. Either
+        may be a finite 1D or 2D numeric array; 1D input is reshaped to
+        ``(N, 1)``. Passing both is allowed only when they are identical.
+        ``Z`` is not a warm start.
+    K
+        Number of atoms. Alias kwarg: ``n_atoms``. Must be positive, and the
+        training set must satisfy ``N > K``.
+    d_atom
+        Intrinsic coordinate dimension per atom. Alias kwarg: ``atom_dim``.
+        Pass an int for a shared dimension or a length-``K`` iterable for
+        heterogeneous atoms. ``None`` and ``"auto"`` currently resolve to
+        dimension 2 per atom.
+    atom_topology
+        Shared topology label used when ``atom_basis`` is not supplied. Common
+        values are ``"circle"``, ``"periodic"``, ``"sphere"``, ``"torus"``,
+        and ``"euclidean"``. If omitted, the default is ``"circle"``.
+    assignment
+        Assignment/gating family. ``"ibp"`` is the public canonical spelling
+        for the IBP-MAP gate path (internal canonical kind ``"ibp_map"``);
+        ``"ibp_map"`` is accepted as an alias. ``"softmax"`` uses soft mixture
+        masses. ``"jumprelu"`` and ``"gated"`` use the JumpReLU hard-gate
+        family. Alias kwarg: ``assignment_prior``.
+    schedule
+        Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
+        IBP/Gumbel assignment path. Alias kwarg: ``gumbel_schedule``.
+    isometry_weight
+        Weight for ``IsometryPenalty`` on the latent coordinate block. It is on
+        by default (``1.0``). Issue #673: the smoothness penalty is raw
+        coordinate roughness, not arc-length roughness, so topology evidence is
+        gauge-conditional. With ``isometry_weight <= 0`` the function raises a
+        :class:`UserWarning` because ``reml_score`` is not safe to compare
+        across topologies.
+    ard_per_atom
+        If true, adds per-atom ARD row-block regularization on the latent
+        coordinate block to select active intrinsic coordinates.
+    decoder_feature_sparsity_groups
+        Optional disjoint partition of output feature indices. Emits
+        ``MechanismSparsityPenalty`` on each atom's decoder block, encouraging
+        basis-function rows to load on a single feature group. The removed
+        kwarg ``mechanism_sparsity_groups`` is rejected.
+    n_iter
+        Maximum joint-solver iterations. Alias kwarg: ``max_iter``.
+    sparsity_weight
+        Non-negative assignment sparsity strength. Alias kwarg:
+        ``sparsity_strength``.
+    gate_sparsity
+        Gate sparsity penalty family. ``"l1"`` keeps the assignment-prior
+        sparsity path. ``"scad"`` and ``"mcp"`` emit the SAE row-block
+        ``ScadMcpPenalty`` on the ``"t"`` latent block with
+        ``weight=sparsity_weight``.
+    scad_mcp_gamma
+        Optional SCAD/MCP concavity parameter. Defaults are SCAD ``3.7`` and
+        MCP ``2.5``. SCAD requires ``gamma > 2``; MCP requires ``gamma > 1``.
+    smoothness_weight
+        Non-negative decoder smoothness weight. Alias kwarg: ``smoothness``.
+        The penalty is ``0.5 * lambda * sum B.T @ S @ B`` in the raw latent
+        coordinate ``t``.
+    alpha
+        Assignment-prior concentration/scale. Pass a float for a fixed value or
+        ``"auto"`` to mark alpha learnable in the Rust solve; returned metadata
+        records ``alpha=1.0`` and ``learnable_alpha=True`` in that case.
+    learning_rate
+        Damped Newton/Gauss-Newton step size. If omitted, the Python facade uses
+        ``1.0`` for IBP/softmax and ``0.05`` for JumpReLU/gated.
+    random_state
+        Integer seed forwarded to the Rust initializer.
+    block_orthogonality_weight
+        Weight for ``BlockOrthogonalityPenalty`` on the latent coordinate block.
+        Requires ``max(d_atom) >= 2`` and splits coordinate axes into singleton
+        orthogonality groups.
+    nuclear_norm_weight
+        Weight for decoder embedding-rank selection (#672). A positive value
+        emits ``NuclearNormPenalty`` on each atom's ``(M_k, p)`` decoder matrix
+        and shrinks its singular spectrum.
+    nuclear_norm_max_rank
+        Optional cap on the number of leading singular values penalized by the
+        nuclear-norm decoder penalty. ``None`` leaves the rank cap disabled.
+    decoder_incoherence_weight
+        Cross-atom decoder column-space incoherence weight (#671). It is on by
+        default (``1.0``) and applies when ``K >= 2``. The penalty uses the
+        empirical co-activation ``mean_n gate_j * gate_k`` and penalizes
+        ``||B_j.T @ B_k||_F^2`` for co-firing atom pairs.
+    top_k
+        Optional final assignment support projection. ``None`` and ``0``
+        disable it; integers in ``[1, K]`` keep only the top-k assignment masses
+        per observation and recompute ``fitted`` from that projected support.
+    t_init, a_init
+        Warm starts for amortized encoder distillation (#357). ``a_init`` has
+        shape ``(N, K)`` and seeds assignment logits. ``t_init`` has shape
+        ``(K, N, D_max)`` with ``D_max >= max(d_atom)`` and seeds per-atom
+        coordinates. ``converged_latents()``, ``encode()``, and ``project()``
+        expose the refined supervision targets.
+    tau
+        Alias-only kwarg giving the starting assignment temperature. If omitted,
+        it is inferred from ``schedule``/``gumbel_schedule`` or defaults to
+        ``0.5``.
+    jumprelu_threshold
+        Alias-only kwarg giving the JumpReLU/gated hard-gate threshold. Must be
+        finite.
+    atom_basis
+        Alias-only kwarg for per-atom basis kind(s). If supplied with
+        ``atom_topology``, both must resolve to the same topology.
 
-    Inputs and warm starts (issue #357). ``X`` / ``Z`` are *aliases* for the
-    response data matrix the SAE reconstructs — ``Z`` is **not** a warm start;
-    it is simply the named-argument form of the data. To warm-start the joint
-    solve from an amortized encoder's per-token prediction, pass ``a_init``
-    (assignment logits, shape ``(N, K)``) and/or ``t_init`` (on-manifold
-    coordinates, shape ``(K, N, D_max)`` with ``D_max >= max(atom_dim)``). With
-    a small ``n_iter`` the solver runs a bounded refinement of those seeds,
-    enabling the "encoder predicts -> solver refines -> distill the gap" loop.
-    The converged supervision targets ``t*`` / ``a*`` are read back via
-    :meth:`ManifoldSAE.converged_latents`, :meth:`ManifoldSAE.encode`, and the
-    standalone per-atom :meth:`ManifoldSAE.project`.
+    Returns
+    -------
+    ManifoldSAE
+        Fitted result. Core attributes are ``atoms`` (list of
+        :class:`SaeManifoldAtomFit`), ``fitted`` ``(N, p)``, ``assignments``
+        ``(N, K)``, ``coords`` as per-atom ``(N, d_k)`` arrays,
+        ``decoder_blocks`` as per-atom ``(M_k, p)`` decoder matrices,
+        ``basis_specs``, ``atom_topology``/``atom_topologies``, ``assignment``
+        and ``assignment_label``, ``reml_score``, ``reconstruction_r2``,
+        ``dispersion``, ``training_mean``, ``training_data``,
+        ``low_level_logits``, and fit-control metadata including ``alpha``,
+        ``learnable_alpha``, ``tau``, ``sparsity_strength``, ``smoothness``,
+        ``learning_rate``, ``max_iter``, ``random_state``, ``top_k``, and
+        ``jumprelu_threshold``. Each atom exposes ``basis``,
+        ``decoder_coefficients`` ``(M_k, p)``, per-atom ``assignments`` ``(N,)``,
+        recovered ``coords`` ``(N, d_k)``, ``evidence``, ``active_dim``,
+        ``decoder_covariance`` ``(M_k*p, M_k*p)``, ``shape_band_coords``
+        ``(G, d_k)``, ``shape_band_mean`` ``(G, p)``, and ``shape_band_sd``
+        ``(G, p)`` when the Rust payload includes posterior shape uncertainty.
 
-    Topology evidence is gauge-conditional (issue #673). The decoder smoothness
-    penalty is the raw-coordinate roughness ``0.5*lambda*sum B^T S B`` with ``S``
-    a fixed finite-/cyclic-difference Gram in the latent coordinate ``t``, *not*
-    intrinsic (arc-length) roughness. The penalty — and hence the REML Occam
-    term and joint log-det that enter ``reml_score`` — is therefore tied to the
-    gauge of ``t``. Comparing ``reml_score`` across atom topologies (e.g. circle
-    vs euclidean) is only well posed when the parameterization is approximately
-    isometric, i.e. the pulled-back metric ``g = J^T J`` is near the identity.
-    ``IsometryPenalty`` (``isometry_weight > 0``) is what drives ``g -> I``; it
-    is on by default (``isometry_weight=1.0``) for exactly this reason. Setting
-    ``isometry_weight <= 0`` disables it and makes the topology evidence
-    gauge-dependent — a :class:`UserWarning` is raised in that case.
+        Useful public methods include ``predict``/``reconstruct``, ``encode``,
+        ``converged_latents``, ``project``, ``per_atom_active_set``,
+        ``per_atom_latent_for``, ``shape_uncertainty(atom=..., n_sd=...)``,
+        ``shape_band(atom_k, n_sd=...)``, ``coordinate_range(atom=...)``, and
+        ``typical_shape(atom=..., quantile_range=(5.0, 95.0), n_sd=...)``.
     """
     if X is not None and Z is not None:
         xa = np.asarray(X, dtype=float)
@@ -572,6 +852,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     max_iter_total = int(kwargs.pop("max_iter", n_iter))
     smoothness = float(kwargs.pop("smoothness", smoothness_weight))
     sparsity = float(kwargs.pop("sparsity_strength", sparsity_weight))
+    gate_sparsity_kind = str(gate_sparsity).strip().lower()
+    if gate_sparsity_kind not in {"l1", "scad", "mcp"}:
+        raise ValueError(
+            "gate_sparsity must be one of 'l1', 'scad', or 'mcp'; "
+            f"got {gate_sparsity!r}"
+        )
+    if scad_mcp_gamma is None:
+        scad_mcp_gamma_value = 3.7 if gate_sparsity_kind == "scad" else 2.5
+    else:
+        scad_mcp_gamma_value = float(scad_mcp_gamma)
     tau = float(kwargs.pop("tau", _schedule_tau_start(gumbel_schedule, 0.5)))
     jumprelu_threshold = float(kwargs.pop("jumprelu_threshold", 0.0))
     if "mechanism_sparsity_groups" in kwargs:
@@ -623,6 +913,18 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"sparsity_weight (sparsity_strength) must be finite and "
             f"non-negative; got {sparsity}"
         )
+    if gate_sparsity_kind == "scad":
+        if not (np.isfinite(scad_mcp_gamma_value) and scad_mcp_gamma_value > 2.0):
+            raise ValueError(
+                "scad_mcp_gamma must be finite and > 2 for gate_sparsity='scad'; "
+                f"got {scad_mcp_gamma_value}"
+            )
+    elif gate_sparsity_kind == "mcp":
+        if not (np.isfinite(scad_mcp_gamma_value) and scad_mcp_gamma_value > 1.0):
+            raise ValueError(
+                "scad_mcp_gamma must be finite and > 1 for gate_sparsity='mcp'; "
+                f"got {scad_mcp_gamma_value}"
+            )
     if not np.isfinite(jumprelu_threshold):
         raise ValueError(
             f"jumprelu_threshold must be finite; got {jumprelu_threshold}"
@@ -651,6 +953,27 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             "reml_score across topologies. See gam issue #673.",
             UserWarning,
             stacklevel=2,
+        )
+    # Eager nuclear_norm_weight validation (issue #672). `0.0` is the canonical
+    # "no rank penalty" baseline; reject negative / non-finite values so the
+    # descriptor builder does not surface a cryptic Rust error.
+    if not np.isfinite(nuclear_norm_weight) or nuclear_norm_weight < 0.0:
+        raise ValueError(
+            f"nuclear_norm_weight must be finite and non-negative; "
+            f"got {nuclear_norm_weight}"
+        )
+    if nuclear_norm_max_rank is not None and int(nuclear_norm_max_rank) < 1:
+        raise ValueError(
+            f"nuclear_norm_max_rank must be >= 1 (or None to disable the cap); "
+            f"got {nuclear_norm_max_rank}"
+        )
+    # Eager decoder_incoherence_weight validation (issue #671). On by default
+    # (1.0); applies only for k_atoms >= 2 (it penalizes co-activating atom
+    # pairs). Reject negative / non-finite values.
+    if not np.isfinite(decoder_incoherence_weight) or decoder_incoherence_weight < 0.0:
+        raise ValueError(
+            f"decoder_incoherence_weight must be finite and non-negative; "
+            f"got {decoder_incoherence_weight}"
         )
     topology_supplied = atom_topology is not _TOPOLOGY_UNSET
     atom_topology_str = str(atom_topology) if topology_supplied else "circle"
@@ -695,19 +1018,28 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     else:
         effective_lr = float(learning_rate)
     penalties = [n for n, ok in (("IsometryPenalty", isometry_weight > 0.0), ("ARDPenalty", ard_per_atom),
+        ("ScadMcpPenalty", gate_sparsity_kind in {"scad", "mcp"} and sparsity > 0.0),
         ("MechanismSparsityPenalty", decoder_feature_sparsity_groups is not None),
-        ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0)) if ok]
+        ("BlockOrthogonalityPenalty", block_orthogonality_weight > 0.0),
+        ("NuclearNormPenalty", nuclear_norm_weight > 0.0),
+        ("DecoderIncoherencePenalty", decoder_incoherence_weight > 0.0 and k_atoms >= 2)) if ok]
     # Build the analytic-penalty registry payload that `sae_manifold_fit_minimal`
-    # passes into `run_joint_fit_arrow_schur`. The four user-facing knobs map
-    # to descriptors targeting the SAE latent block "t" (shape (n_obs, d_max)
-    # where d_max = max(atom_dim) — matches the registry latent built in
-    # `sae_manifold_fit_inner`). Issue #240: previously these knobs only
-    # populated `primitive_names` metadata.
+    # passes into `run_joint_fit_arrow_schur`. Row-block descriptors target the
+    # SAE latent block "t" (shape (n_obs, d_max), where d_max = max(atom_dim) —
+    # matches the registry latent built in `sae_manifold_fit_inner`). Issue #240:
+    # previously these knobs only populated `primitive_names` metadata.
     analytic_penalties_json = _build_analytic_penalties_payload(
         isometry_weight=isometry_weight,
         ard_per_atom=ard_per_atom,
+        gate_sparsity=gate_sparsity_kind,
+        sparsity_weight=sparsity,
+        scad_mcp_gamma=scad_mcp_gamma_value,
         decoder_feature_sparsity_groups=decoder_feature_sparsity_groups,
         block_orthogonality_weight=block_orthogonality_weight,
+        nuclear_norm_weight=nuclear_norm_weight,
+        nuclear_norm_max_rank=nuclear_norm_max_rank,
+        decoder_incoherence_weight=decoder_incoherence_weight,
+        k_atoms=k_atoms,
         d_max=max(dims),
         p_out=int(x.shape[1]),
     )
@@ -817,17 +1149,28 @@ def _build_analytic_penalties_payload(
     *,
     isometry_weight: float,
     ard_per_atom: bool,
+    gate_sparsity: str,
+    sparsity_weight: float,
+    scad_mcp_gamma: float,
     decoder_feature_sparsity_groups: list[list[int]] | None,
     block_orthogonality_weight: float,
+    nuclear_norm_weight: float,
+    nuclear_norm_max_rank: int | None,
+    decoder_incoherence_weight: float,
+    k_atoms: int,
     d_max: int,
     p_out: int,
 ) -> str | None:
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
     payload consumed by ``sae_manifold_fit_minimal``.
 
-    All five knobs now route through ``src/terms/sae_manifold.rs``.
+    The SAE regularizer knobs route through ``src/terms/sae_manifold.rs``.
     ``ard_per_atom``, ``isometry_weight``, and ``block_orthogonality_weight``
     target the row-block driver ("t" latent block).
+    ``gate_sparsity="scad"`` or ``"mcp"`` emits the row-block
+    ``scad_mcp`` descriptor on the same "t" block, using ``sparsity_weight`` as
+    its non-convex sparsity strength. The default ``"l1"`` emits no analytic
+    descriptor and preserves the existing assignment-prior sparsity path.
     ``decoder_feature_sparsity_groups`` targets the decoder coefficient
     block ("beta" latent block) and group-lassoes ``p_out`` features in rows
     of the per-basis-function decoder matrix. For ``k_atoms >= 2`` the Rust
@@ -835,11 +1178,28 @@ def _build_analytic_penalties_payload(
     the penalty target to each atom's ``(M_k, p_out)`` decoder block, so the
     concatenated ``flatten_beta`` layout with distinct ``M_k`` is handled
     natively (#240).
+
+    ``nuclear_norm_weight`` also targets the decoder ("beta") block (#672): it
+    emits a ``nuclear_norm`` descriptor that the Rust ``add_sae_beta_penalty``
+    dispatches per atom, treating each atom's ``(M_k, p_out)`` decoder block as
+    a matrix and shrinking its singular spectrum (embedding rank). ``n_eff`` is
+    deliberately *not* emitted — Rust sets it per atom to ``M_k``.
+    ``nuclear_norm_max_rank`` optionally caps the number of leading singular
+    values penalized.
     """
     items: list[dict[str, Any]] = []
     if bool(ard_per_atom):
         _require_sae_row_block_penalty("ard", "ard_per_atom")
         items.append({"kind": "ard", "target": "t"})
+    if gate_sparsity in {"scad", "mcp"} and float(sparsity_weight) > 0.0:
+        _require_sae_row_block_penalty("scad_mcp", "gate_sparsity")
+        items.append({
+            "kind": "scad_mcp",
+            "target": "t",
+            "variant": str(gate_sparsity),
+            "gamma": float(scad_mcp_gamma),
+            "weight": float(sparsity_weight),
+        })
     if isometry_weight is not None and float(isometry_weight) > 0.0:
         _require_sae_row_block_penalty("isometry", "isometry_weight")
         items.append({
@@ -902,6 +1262,35 @@ def _build_analytic_penalties_payload(
             "kind": "mechanism_sparsity",
             "target": "beta",
             "feature_groups": groups,
+        })
+    if nuclear_norm_weight is not None and float(nuclear_norm_weight) > 0.0:
+        # Targets the decoder ("beta") block. The Rust dispatch rebuilds the
+        # penalty per atom (n_eff = M_k, latent_dim = p_out), so we deliberately
+        # do NOT emit n_eff here — the registry-held base value is overridden.
+        item: dict[str, Any] = {
+            "kind": "nuclear_norm",
+            "target": "beta",
+            "weight": float(nuclear_norm_weight),
+        }
+        if nuclear_norm_max_rank is not None:
+            item["max_rank"] = int(nuclear_norm_max_rank)
+        items.append(item)
+    # Cross-atom decoder column-space incoherence (issue #671), ON by default,
+    # for k_atoms >= 2 (penalizes co-activating atom *pairs*). block_sizes/p_out
+    # are placeholders: the Rust `add_sae_beta_penalty` injects the real per-atom
+    # M_k, p_out, target, and the empirical co-activation (mean_n gate_j*gate_k)
+    # from the live SAE at fit time. We only signal the descriptor + weight.
+    if (
+        decoder_incoherence_weight is not None
+        and float(decoder_incoherence_weight) > 0.0
+        and int(k_atoms) >= 2
+    ):
+        items.append({
+            "kind": "decoder_incoherence",
+            "target": "beta",
+            "block_sizes": [1] * int(k_atoms),
+            "p_out": int(p_out),
+            "weight": float(decoder_incoherence_weight),
         })
     if not items:
         return None

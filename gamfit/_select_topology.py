@@ -1,4 +1,13 @@
-"""Evidence-based topology selection over common smooth topologies."""
+"""Evidence-based topology selection over common smooth topologies.
+
+Two public selectors are exposed:
+
+* :func:`select_topology` builds candidate formulas around an
+  ``s(..., type=AUTO)`` smooth and ranks fitted models by evidence-like scores.
+* :class:`TopologyAutoSelector` is a descriptor-style helper for selecting the
+  topology of one :class:`gamfit.LatentCoord` block while preserving the rest
+  of the caller's fit configuration.
+"""
 
 from __future__ import annotations
 
@@ -81,7 +90,32 @@ _NULL_HESSIAN_LOGDET_KEYS: tuple[str, ...] = (
 
 @dataclass(frozen=True, slots=True)
 class SelectTopologyResult:
-    """Result returned by :func:`select_topology`."""
+    """Result returned by :func:`select_topology`.
+
+    Attributes
+    ----------
+    winner_name:
+        Name of the selected candidate.
+    winner_fit:
+        Fitted model object for ``winner_name``.
+    scores:
+        Selected score for every candidate after applying ``score_scale``.
+    rankings:
+        Candidate names ordered best-first with their selected scores.
+    score_kind, score_scale:
+        Normalized scoring choices used for the run.
+    basis_sizes:
+        Fitted basis size per candidate.
+    effective_dim:
+        Effective degrees of freedom per candidate.
+    n_obs:
+        Observation count per candidate.
+    warnings:
+        Cross-score disagreement warnings; empty when rankings agree or cannot
+        be compared.
+    fits:
+        All fitted models when ``return_fits=True``; otherwise ``None``.
+    """
 
     winner_name: str
     winner_fit: Any
@@ -106,7 +140,45 @@ def select_topology(
     return_fits: bool = False,
     **fit_kwargs: Any,
 ) -> SelectTopologyResult:
-    """Select a topology by fitting candidates and ranking model evidence."""
+    """Select a topology by fitting candidates and ranking model evidence.
+
+    Parameters
+    ----------
+    data:
+        Table-like input accepted by :func:`gamfit.fit`.
+    response:
+        Response column name. A full formula is rejected; this helper creates
+        ``"<response> ~ s(<all other columns>, type=AUTO)"`` internally.
+    candidates:
+        Optional sequence of ``(name, Smooth)`` pairs or mappings with
+        ``"name"`` / ``"topology"``. When omitted, candidates are chosen from
+        Euclidean patch, circle, sphere, torus, and cylinder constructors whose
+        required dimension matches the predictor count.
+    score:
+        ``"reml"``, ``"laml"``, ``"bic"``, or ``"tk"``. ``"tk"`` adds the
+        Tierney-Kadane null-space normalizer to the raw REML/evidence score.
+    score_scale:
+        ``"per_observation"``, ``"per_effective_dim"``, or ``"raw"``.
+    return_fits:
+        Include all fitted candidate models on the result.
+    **fit_kwargs:
+        Forwarded unchanged to :func:`gamfit.fit` for every candidate.
+
+    Returns
+    -------
+    SelectTopologyResult
+        Winner, rankings, per-candidate diagnostics, and optionally all fits.
+
+    Raises
+    ------
+    ValueError
+        If the response is missing, fewer than two candidates are available, a
+        candidate fit yields a non-finite score, or requested score metadata is
+        unavailable.
+    TypeError
+        If explicit candidate entries are not mappings or ``(name, Smooth)``
+        pairs.
+    """
     # Gauge invariant: Tierney-Kadane comparisons require every candidate's
     # penalty null space to be represented with the same deterministic
     # orthonormal-basis convention. The Rust summary reports
@@ -818,7 +890,13 @@ def _score_disagreement_warnings(
 
 @dataclass(frozen=True, slots=True)
 class TopologyAutoSelectorResult:
-    """Ranked latent-topology selector result."""
+    """Ranked latent-topology selector result.
+
+    ``ranked`` is a best-first list of
+    ``(name, tk_score, raw_reml, effective_dim, n_obs, model)`` tuples.
+    ``winner`` is the selected tuple from that list. ``errors`` records
+    candidate-specific fit failures for candidates skipped during ranking.
+    """
 
     ranked: list[TopologyAutoSelectorRank]
     winner: TopologyAutoSelectorRank
@@ -826,7 +904,20 @@ class TopologyAutoSelectorResult:
 
 
 class TopologyAutoSelector:
-    """Builder for latent-coordinate topology selection."""
+    """Builder for latent-coordinate topology selection.
+
+    Parameters
+    ----------
+    candidates:
+        ``None`` for default candidates, topology-name strings, ``Smooth``
+        objects, or ``(name, Smooth)`` pairs.
+    score_scale:
+        ``"per_effective_dim"`` or ``"per_observation"`` for the Rust
+        Tierney-Kadane ranking payload.
+    latent:
+        Optional latent block name. Required when the ``latents`` mapping
+        passed to :meth:`fit` has more than one entry.
+    """
 
     def __init__(
         self,
@@ -843,18 +934,22 @@ class TopologyAutoSelector:
         self,
         candidates: Sequence[str | Smooth | tuple[str, Smooth]] | None,
     ) -> "TopologyAutoSelector":
+        """Set candidate topologies and return ``self`` for fluent chaining."""
         self.candidates = candidates
         return self
 
     def with_score_scale(self, score_scale: TopologyScoreScale) -> "TopologyAutoSelector":
+        """Set the TK score scale and return ``self``."""
         self.score_scale = _normalize_selector_score_scale(score_scale)
         return self
 
     def for_latent(self, latent: str) -> "TopologyAutoSelector":
+        """Select which latent block name this selector should rank."""
         self.latent = str(latent)
         return self
 
     def to_rust_descriptor(self) -> dict[str, Any]:
+        """Serialize selector configuration for composition-engine hosts."""
         payload: dict[str, Any] = {"score_scale": self.score_scale}
         if self.candidates is not None:
             payload["candidates"] = [
@@ -876,6 +971,32 @@ class TopologyAutoSelector:
         penalties: Sequence[Any] | None = None,
         **fit_kwargs: Any,
     ) -> TopologyAutoSelectorResult:
+        """Fit all fittable latent-topology candidates and rank them.
+
+        Parameters
+        ----------
+        data, formula:
+            Fit inputs passed to :func:`gamfit.fit`.
+        latents:
+            Mapping containing the latent block to retopologize. If more than
+            one latent is present, configure ``latent=...`` or call
+            :meth:`for_latent`.
+        penalties:
+            Analytic penalties forwarded to each candidate fit.
+        **fit_kwargs:
+            Additional :func:`gamfit.fit` keyword arguments.
+
+        Returns
+        -------
+        TopologyAutoSelectorResult
+            Ranking tuples, winner tuple, and skipped-candidate errors.
+
+        Raises
+        ------
+        ValueError
+            If no latent is supplied, the requested latent is absent, no
+            candidate can be fit, or required TK metadata is missing.
+        """
         latent_name, latent = _single_latent(latents, self.latent)
         n_obs = _n_obs(data, latent_name, latent)
         auto = _maybe_auto_smooth(formula)

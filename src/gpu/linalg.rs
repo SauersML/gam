@@ -384,7 +384,9 @@ pub fn try_fast_atb_on_ordinal(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        return None;
+        // `ordinal` selects a CUDA device that does not exist off Linux; there is
+        // nothing to dispatch to, so decline and let the caller run its CPU path.
+        return (ordinal, None::<Array2<f64>>).1;
     }
     #[cfg(target_os = "linux")]
     {

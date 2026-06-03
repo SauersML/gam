@@ -9,6 +9,7 @@ use crate::terms::analytic_penalties::{AnalyticPenalty, PenaltyTier};
 pub mod ard;
 pub mod block_orthogonality;
 pub mod block_sparsity;
+pub mod decoder_incoherence;
 pub mod ibp_assignment;
 pub mod isometry;
 pub mod ivae_ridge_mean_gauge;
@@ -59,6 +60,7 @@ macro_rules! analytic_penalty_registry {
             register!(ParametricRowPrecisionPrior, ParametricRowPrecisionPriorPenalty);
             register!(ScadMcp, ScadMcpPenalty);
             register!(BlockOrthogonality, BlockOrthogonalityPenalty);
+            register!(DecoderIncoherence, DecoderIncoherencePenalty);
             register!(Orthogonality, OrthogonalityPenalty);
             register!(SheafConsistency, SheafConsistencyPenalty);
         }

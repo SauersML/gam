@@ -106,6 +106,24 @@ Each pair shows the noisy input (left) and the recovered smooth
 (right). The full gallery and reproduction script:
 [docs/manifold-smooths.md](docs/manifold-smooths.md).
 
+Manifold SAE dictionary. `sae_manifold_fit` decomposes an activation /
+embedding matrix into `K` sparse atoms, each a low-dimensional typed shape
+(line, circle, sphere, torus, or Euclidean patch) with a per-token
+coordinate. Cross-atom decoder incoherence (on by default) keeps co-firing
+atoms separable; the IBP gate adapts the number of active atoms per token
+with true zeros. A fresh fit reports, per atom, a closed-form posterior
+shape band (mean curve ± sd) and the typical coordinate range the atom is
+used over — where each manifold lives, what shape, and how confident.
+
+```python
+fit = gamfit.sae_manifold_fit(Z=acts, K=16, d_atom=1, atom_topology="circle")
+recon = fit.predict(acts)              # (N, p) reconstruction
+band = fit.shape_band(0)               # {"coords","mean","sd","lower","upper"}
+extent = fit.coords[0].min(0), fit.coords[0].max(0)   # where atom 0 lives
+```
+
+Details: [docs/manifold-sae.md](docs/manifold-sae.md).
+
 Learnable link functions. A `flexible(base)` link adds a spline offset
 on top of a base link. `blended(l1, l2)` learns a mixture weight. `sas`
 and `beta-logistic` learn shape parameters.
@@ -244,6 +262,7 @@ Benchmarks: `python3 bench/run_suite.py --help`.
 - Full Python documentation: <https://gamfit.readthedocs.io/>.
 - Cookbook: [docs/cookbook.md](docs/cookbook.md).
 - Manifold smooths gallery: [docs/manifold-smooths.md](docs/manifold-smooths.md).
+- Manifold SAE dictionary: [docs/manifold-sae.md](docs/manifold-sae.md).
 
 ## Issues
 

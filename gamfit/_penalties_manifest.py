@@ -109,6 +109,12 @@ PENALTY_MANIFEST = (
         "row_block_diagonal": False,
     },
     {
+        "kind": "decoder_incoherence",
+        "rust": "DecoderIncoherence:DecoderIncoherencePenalty",
+        "python": "DecoderIncoherencePenalty",
+        "row_block_diagonal": False,
+    },
+    {
         "kind": "orthogonality",
         "rust": "Orthogonality:OrthogonalityPenalty",
         "python": "OrthogonalityPenalty",
