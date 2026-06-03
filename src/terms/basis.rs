@@ -33526,6 +33526,13 @@ mod tests {
         // Picks (m=2, s=1, d=3): closed-form q=2 IR fails (d+2q = 7 < 4m
         // = 8) so the factory must fall back to collocation `D_2^T D_2`
         // for stiffness; q=1 UV/IR both hold, so closed-form is used.
+        //
+        // Exercising the q=2 stiffness fallback requires the stiffness dial
+        // to be active. `DuchonOperatorPenaltySpec::default()` deliberately
+        // disables stiffness (`Primary` is the exact, superior curvature), so
+        // this factory-level test of the divergent-regime fallback drives the
+        // factory with `all_active()` — the all-three-dials spec used by the
+        // Matérn collocation overlay.
         use ndarray::Array2 as A2;
         let k = 16usize;
         let d = 3usize;
@@ -33560,7 +33567,7 @@ mod tests {
             &d0,
             &d1,
             &d2,
-            &DuchonOperatorPenaltySpec::default(),
+            &DuchonOperatorPenaltySpec::all_active(),
             p_order,
             s_order as f64,
             None,

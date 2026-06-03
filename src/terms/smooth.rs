@@ -25416,7 +25416,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_duchon_scale_dimensions_participate_without_length_scale() {
+    fn pure_duchon_scale_dimensions_seed_geometry_but_enroll_no_hyper_axis() {
         let mut spec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
@@ -25443,7 +25443,15 @@ mod tests {
         };
 
         crate::term_builder::enable_scale_dimensions(&mut spec);
-        assert_eq!(spatial_length_scale_term_indices(&spec), vec![0]);
+        // Duchon anisotropy η is a fixed, geometry-derived basis parameter,
+        // never a REML hyper axis (see `spatial_term_supports_hyper_optimization`).
+        // `scale_dims` seeds the per-axis metric on the spec, but a pure Duchon
+        // (no explicit κ) still contributes no outer length-scale/ψ optimization
+        // axis — "standardize the geometry, then learn the smoothness."
+        assert!(
+            spatial_length_scale_term_indices(&spec).is_empty(),
+            "pure Duchon must enroll no outer hyper axis even with scale_dims on"
+        );
         match &spec.smooth_terms[0].basis {
             SmoothBasisSpec::Duchon { spec, .. } => {
                 assert_eq!(spec.length_scale, None);
@@ -25454,57 +25462,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_duchon_apply_tospec_preserves_length_scale_none() {
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "pure_duchon".to_string(),
-                basis: SmoothBasisSpec::Duchon {
-                    feature_cols: vec![0, 1],
-                    spec: DuchonBasisSpec {
-                        periodic: None,
-                        center_strategy: CenterStrategy::UserProvided(array![
-                            [0.0, 0.0],
-                            [1.0, 0.0],
-                            [0.0, 1.0],
-                            [1.0, 1.0]
-                        ]),
-                        length_scale: None,
-                        power: 1.0,
-                        nullspace_order: DuchonNullspaceOrder::Linear,
-                        identifiability: SpatialIdentifiability::default(),
-                        aniso_log_scales: Some(vec![0.0, 0.0]),
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
-                        boundary: OneDimensionalBoundary::Open,
-                    },
-                    input_scales: None,
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
-
-        let updated = SpatialLogKappaCoords::new_with_dims(array![0.4], vec![1])
-            .apply_tospec(&spec, &[0])
-            .expect("pure Duchon update should succeed");
-        match &updated.smooth_terms[0].basis {
-            SmoothBasisSpec::Duchon { spec, .. } => {
-                assert_eq!(spec.length_scale, None);
-                let eta = spec
-                    .aniso_log_scales
-                    .as_ref()
-                    .expect("pure Duchon should keep aniso");
-                assert!((eta.iter().sum::<f64>()).abs() <= 1e-12);
-                assert!((eta[0] - 0.4).abs() <= 1e-12);
-                assert!((eta[1] + 0.4).abs() <= 1e-12);
-            }
-            _ => panic!("expected Duchon term"),
-        }
-    }
-
-    #[test]
-    fn pure_duchon_from_length_scales_aniso_centers_existing_eta() {
+    fn pure_duchon_from_length_scales_aniso_is_isotropic_single_psi() {
         let spec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
@@ -25535,17 +25493,20 @@ mod tests {
             }],
         };
 
-        let coords = SpatialLogKappaCoords::from_length_scales_aniso(
-            &spec,
-            &[0],
-            &SpatialLengthScaleOptimizationOptions::default(),
-        );
+        let opts = SpatialLengthScaleOptimizationOptions::default();
+        let coords = SpatialLogKappaCoords::from_length_scales_aniso(&spec, &[0], &opts);
 
-        assert_eq!(coords.dims_per_term(), &[2]);
-        let expected = [0.36666666666666664, -0.13333333333333336];
-        for (got, want) in coords.as_array().iter().zip(expected.iter()) {
-            assert!((got - want).abs() <= 1e-12);
-        }
+        // Duchon anisotropy η is a fixed, geometry-derived basis parameter, not
+        // a REML hyper axis. Even with multi-axis `aniso_log_scales`,
+        // `from_length_scales_aniso` enrolls a Duchon term as a single isotropic
+        // ψ̄ slot — matching the lone `SpatialPsiDerivative` the hyper_dirs
+        // builder emits — via the `spatial_term_uses_per_axis_psi` single source
+        // of truth. A pure Duchon carries no explicit κ, so ψ̄ defaults to
+        // −ln(min_length_scale).
+        assert_eq!(coords.dims_per_term(), &[1]);
+        assert_eq!(coords.as_array().len(), 1);
+        let expected_psi = -opts.min_length_scale.ln();
+        assert!((coords.as_array()[0] - expected_psi).abs() <= 1e-12);
     }
 
     #[test]
@@ -25926,12 +25887,19 @@ mod tests {
         assert_design_penalties_symmetric("frozen", &frozen_design);
         assert_reparam_penalty_symmetric("frozen", &frozen_design);
 
+        // Design B: a pure Duchon enrolls no outer ψ axis (η is a fixed,
+        // geometry-derived basis parameter), so the single-block exact-joint
+        // cache for this term is ρ-only. The penalties must stay symmetric
+        // through that cache exactly as they do through the base build and the
+        // freeze/rebuild above.
         let spatial_terms = spatial_length_scale_term_indices(&frozen);
+        assert!(
+            spatial_terms.is_empty(),
+            "pure Duchon enrolls no outer κ/ψ axis"
+        );
         let rho_dim = frozen_design.penalties.len();
-        let dims_per_term = vec![2];
-        let mut theta = Array1::<f64>::zeros(rho_dim + 2);
-        theta[rho_dim] = 0.2;
-        theta[rho_dim + 1] = -0.2;
+        let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+        let theta = Array1::<f64>::zeros(rho_dim);
 
         let mut cache = SingleBlockExactJointDesignCache::new(
             data.view(),
@@ -26186,10 +26154,17 @@ mod tests {
         };
         let joint_setup =
             two_block_exact_joint_hyper_setup(&frozen_specs[0], &frozen_specs[1], &kappa_options);
-        assert!(joint_setup.log_kappa_dim() > 0);
+        // Design B: Duchon anisotropy η is a fixed, geometry-derived basis
+        // parameter, never a REML axis, so two pure-Duchon blocks contribute no
+        // outer log-κ axis — the joint outer vector is ρ-only.
+        assert_eq!(joint_setup.log_kappa_dim(), 0);
 
         let mean_term_indices = spatial_length_scale_term_indices(&frozen_specs[0]);
         let noise_term_indices = spatial_length_scale_term_indices(&frozen_specs[1]);
+        assert!(
+            mean_term_indices.is_empty() && noise_term_indices.is_empty(),
+            "pure Duchon blocks enroll no outer κ/ψ axis"
+        );
         let mut cache = ExactJointDesignCache::new(
             data.view(),
             vec![
@@ -26209,39 +26184,23 @@ mod tests {
         )
         .expect("pure Duchon exact-joint cache");
 
-        let mut theta1 = joint_setup.theta0();
-        let psi_start = joint_setup.rho_dim();
-        theta1[psi_start] += 0.25;
-        theta1[psi_start + 1] -= 0.15;
+        // With no κ axis the joint outer vector is ρ-only; realizing the cache
+        // at θ₀ must reproduce the directly-rebuilt frozen designs, since there
+        // is no per-axis log-κ update to apply.
+        let theta0 = joint_setup.theta0();
+        assert_eq!(theta0.len(), joint_setup.rho_dim());
         cache
-            .ensure_theta(&theta1)
+            .ensure_theta(&theta0)
             .expect("pure Duchon cache theta update");
-
-        let log_kappa = SpatialLogKappaCoords::from_theta_tail_with_dims(
-            &theta1,
-            joint_setup.rho_dim(),
-            joint_setup.log_kappa_dims_per_term(),
-        );
-        let (mean_lk, noise_lk) = log_kappa.split_at(mean_term_indices.len());
-        let mean_updated = mean_lk
-            .apply_tospec(&frozen_specs[0], &mean_term_indices)
-            .expect("updated mean pure Duchon spec");
-        let noise_updated = noise_lk
-            .apply_tospec(&frozen_specs[1], &noise_term_indices)
-            .expect("updated noise pure Duchon spec");
-        let mean_rebuilt =
-            build_term_collection_design(data.view(), &mean_updated).expect("mean rebuilt");
-        let noise_rebuilt =
-            build_term_collection_design(data.view(), &noise_updated).expect("noise rebuilt");
         let cache_designs = cache.designs();
         assert_term_collection_designs_match(
             cache_designs[0],
-            &mean_rebuilt,
+            &rebuilt_designs[0],
             "mean pure Duchon cache",
         );
         assert_term_collection_designs_match(
             cache_designs[1],
-            &noise_rebuilt,
+            &rebuilt_designs[1],
             "noise pure Duchon cache",
         );
     }
@@ -27049,7 +27008,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_duchon_exposes_operator_penalties_to_exact_adaptive_regularization() {
+    fn pure_duchon_skips_operator_triplet_adaptive_overlay() {
         let n = 56usize;
         let mut data = Array2::<f64>::zeros((n, 2));
         let mut y = Array1::<f64>::zeros(n);
@@ -27121,15 +27080,20 @@ mod tests {
         )
         .expect("pure Duchon exact adaptive fit should succeed");
 
-        let diag = fit
-            .adaptive_diagnostics
-            .as_ref()
-            .expect("pure Duchon operator penalties should enable adaptive diagnostics");
-        assert_eq!(diag.maps.len(), 1);
-        assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
-        assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
-        assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
+        // The Charbonnier spatial-adaptive overlay reweights the full
+        // mass/tension/stiffness operator triplet. A redesigned Duchon basis
+        // deliberately ships its exact RKHS `Primary` curvature plus the lower
+        // mass/tension dials — never the stiffness order — so it does not carry
+        // the triplet the overlay consumes (see `extract_spatial_operator_runtime_caches`,
+        // which has no Duchon arm). Requesting adaptive regularization on a pure
+        // Duchon must therefore still fit finitely, but produces no operator-triplet
+        // overlay: only Matérn collocation bases feed the adaptive path.
+        assert!(
+            fit.adaptive_diagnostics.is_none(),
+            "pure Duchon carries no operator triplet, so the Charbonnier overlay must not run"
+        );
         assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
+        assert!(fit.fit.reml_score.is_finite());
     }
 
     #[test]
