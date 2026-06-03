@@ -5214,6 +5214,39 @@ impl UnifiedFitResult {
         self.inference.as_ref().map(|inf| inf.dispersion)
     }
 
+    /// Canonical residual dispersion `φ̂` that scales every coefficient
+    /// covariance via `Vb = H⁻¹·φ̂` (the same `φ̂` behind `predict()` standard
+    /// errors). For fixed-scale families (Poisson/Binomial) this is `1`; for
+    /// Gaussian it is `σ̂²`, for Gamma `1/shape`, etc.
+    ///
+    /// Unlike [`Self::dispersion`], which reads the cached `inference` block,
+    /// this is computed from fields that always survive serialization
+    /// (`likelihood_family`, `likelihood_scale`, `standard_deviation`). That
+    /// matters for deployment-time consumers operating on a saved model whose
+    /// `inference` block was dropped (e.g. `core_saved_fit_result` stores
+    /// `inference: None`): the cached `dispersion()` is then `None`, but the
+    /// scale is still recoverable and identical to the value used at fit time.
+    /// When the cached block is present its dispersion is preferred verbatim so
+    /// the two paths never diverge.
+    pub fn dispersion_phi(&self) -> f64 {
+        if let Some(dispersion) = self.dispersion() {
+            return dispersion.phi();
+        }
+        match &self.likelihood_family {
+            Some(spec) => {
+                let glm = GlmLikelihoodSpec {
+                    spec: spec.clone(),
+                    scale: self.likelihood_scale.clone(),
+                };
+                dispersion_from_likelihood(&glm, self.standard_deviation).phi()
+            }
+            // No engine-level family (custom/GAMLSS paths): no scalar
+            // response-scale dispersion is defined, so fall back to the
+            // fixed-scale convention `φ = 1`.
+            None => 1.0,
+        }
+    }
+
     /// Get the smoothing-parameter-corrected beta covariance (`Vp`) if available.
     ///
     /// Wood/mgcv name for the smoothing-parameter-corrected covariance `Vp`.

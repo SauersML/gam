@@ -23958,17 +23958,36 @@ fn extend_model_with_random_effect_level(
     let coefficient_variance = match supplied_variance {
         Some(variance) => variance,
         None => {
-            let lambda = payload
-                .fit_result
-                .as_ref()
-                .and_then(|fit| fit.lambdas.get(penalty_index).copied())
+            let fit = payload.fit_result.as_ref().ok_or_else(|| {
+                "extend_with_group requires saved fit_result; refit".to_string()
+            })?;
+            let lambda = fit
+                .lambdas
+                .get(penalty_index)
+                .copied()
                 .filter(|lambda| lambda.is_finite() && *lambda > 0.0)
                 .ok_or_else(|| {
                     format!(
                         "extend_with_group term '{term_name}' has no finite positive prior lambda"
                     )
                 })?;
-            1.0 / lambda
+            // The unseen-level default prior is the fitted random-effect
+            // variance component `σ_b² = φ̂ / λ` (mgcv's `λ = φ̂ / σ_b²`
+            // convention), NOT the scale-free `1 / λ`. `φ̂` is the residual
+            // dispersion that scales every predict-time covariance: `1` for
+            // fixed-scale families (Poisson/Binomial — where `φ̂/λ` collapses
+            // to the old `1/λ`), but `σ̂²` for Gaussian and the estimated
+            // dispersion for Gamma/Tweedie/NB. Omitting `φ̂` made the prior
+            // (and any deployment interval built from it) wrong by `1/φ̂` and,
+            // for an estimated scale, not response-scale equivariant. See #674.
+            let phi = fit.dispersion_phi();
+            if !(phi.is_finite() && phi > 0.0) {
+                return Err(format!(
+                    "extend_with_group term '{term_name}' has a non-finite or non-positive \
+                     dispersion (φ̂ = {phi}); cannot form the default prior variance"
+                ));
+            }
+            phi / lambda
         }
     };
     extend_training_feature_range(
