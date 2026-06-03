@@ -384,6 +384,14 @@ pub fn try_fast_atb_on_ordinal(
     }
     #[cfg(not(target_os = "linux"))]
     {
+        // No CUDA off Linux, so the per-ordinal fast path is unavailable. Read
+        // `ordinal` once (the cross-platform signature must carry it for the
+        // Linux branch below) and decline so the caller runs its CPU AtB. Unlike
+        // `a`/`b` — already consumed by `.dim()` above — `ordinal` is otherwise
+        // untouched on this target, and `warnings = "deny"` rejects a dead bind.
+        log::trace!(
+            "try_fast_atb_on_ordinal: CUDA unavailable off Linux; declining ordinal {ordinal}"
+        );
         return None;
     }
     #[cfg(target_os = "linux")]
