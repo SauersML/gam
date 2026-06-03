@@ -16,6 +16,15 @@ The two packages are versioned independently — `gam` tracks the Rust engine,
 `gamfit` the Python wheel — but released together. Each entry is headed with the
 git tag and both package versions.
 
+## v0.3.82 — gam 0.3.82 / gamfit 0.1.154 (2026-06-03)
+
+### Fixed
+
+- **Nuclear-norm HVP no longer panics on roundoff-scale smoothed Gram
+  eigenvalues.** The penalty now returns explicit errors for invalid spectra and
+  floors only numerical roundoff to the configured smoothing floor, preventing a
+  Rust panic from aborting Python SAE experiments.
+
 ## v0.3.81 — gam 0.3.81 / gamfit 0.1.153 (2026-06-03)
 
 ### Fixed
