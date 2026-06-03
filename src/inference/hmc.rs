@@ -456,13 +456,16 @@ struct SharedData {
     mode: Arc<Array1<f64>>,
     /// Auxiliary log-link family parameter: Gamma shape, Tweedie power, or NB theta.
     gamma_shape: f64,
-    /// Dispersion parameter φ used to scale the likelihood for families
-    /// with an estimated scale (Gaussian: σ²; Gamma: 1/shape). For fixed-
-    /// scale families this is `Known(1.0)`. The Gaussian log-likelihood
-    /// and its gradient multiply through by `1/φ` so that the whitened
-    /// sampler targets `φ·H⁻¹` rather than a silently mis-scaled
-    /// posterior. See `inference::dispersion_cov` for the ownership
-    /// invariants this field encodes.
+    /// Dispersion parameter φ (Gaussian: σ²; Gamma: 1/shape; `Known(1.0)` for
+    /// fixed-scale families). Consumed **only** by the likelihood adapters that
+    /// carry the dispersion in the data term itself: the profiled-Gaussian
+    /// log-likelihood and its gradient multiply through by `1/φ`, and the
+    /// Tweedie quasi-likelihood folds `1/φ` into its weight. It does NOT drive
+    /// the whitening or penalty scaling — those use the `cov_scale` invariant
+    /// (`NutsFamily::coefficient_covariance_scale`), which is `1.0` for Gamma
+    /// even though `φ ≠ 1`, because Gamma's dispersion already lives inside the
+    /// working weight (the `shape` factor in `gamma_log_logp_and_grad`). See
+    /// `inference::dispersion_cov` for the ownership invariants.
     dispersion: crate::solver::estimate::Dispersion,
     /// Number of samples
     n_samples: usize,
@@ -529,6 +532,43 @@ impl NutsFamily {
             },
         }
     }
+
+    /// Coefficient-covariance scale for the whitened NUTS target — the
+    /// NUTS-family counterpart of
+    /// [`crate::types::GlmLikelihoodSpec::coefficient_covariance_scale`] (#679).
+    ///
+    /// The sampler must reproduce the posterior `N(mode, Vb)` with
+    /// `Vb = scale · H⁻¹`, where `H = XᵀWX + S_λ` is the stored penalized
+    /// Hessian (penalty `S_λ` added **unscaled**). The returned `scale` is:
+    ///
+    /// * `profiled_gaussian_phi` (= σ̂²) for the **profiled Gaussian** identity
+    ///   model, whose working weight is scale-free (`W = priorweights`), so the
+    ///   stored `H` omits the dispersion and `Vb = σ̂²·H⁻¹`. The NUTS Gaussian
+    ///   log-likelihood is structurally this profiled form: scale-free
+    ///   residuals multiplied by `1/φ` (see `gaussian_logp_and_grad_into`).
+    /// * `1.0` for every **weight-carries-dispersion** family (Gamma, Tweedie,
+    ///   Negative-Binomial, and the fixed-scale Poisson/Binomial). Their
+    ///   working weight already folds in the reciprocal dispersion / full
+    ///   Fisher information — for Gamma-log the shape `ν = 1/φ` is baked into
+    ///   the likelihood score `∂ℓ/∂η = ν·(y/μ − 1)` — so the stored `H` is
+    ///   already the true penalized Hessian and `Vb = H⁻¹`. Multiplying by the
+    ///   dispersion again double-counts it and shrinks every posterior SD by
+    ///   `√dispersion` — exactly the Gamma-log defect addressed in #680.
+    ///
+    /// This single scalar governs BOTH the whitening preconditioner
+    /// (`L Lᵀ = scale·H⁻¹`, so `L` is scaled by `√scale`) and the target's
+    /// penalty weight (`penalty_scale = 1/scale`), keeping the sampled
+    /// posterior, its whitening metric, and the Wald `Vb` of #679 mutually
+    /// consistent. Crucially it does NOT key off the statistical dispersion
+    /// `φ`: Gamma carries `φ = 1/shape ≠ 1` yet still has `scale = 1`, because
+    /// that `φ` already lives inside `W`.
+    #[inline]
+    fn coefficient_covariance_scale(self, profiled_gaussian_phi: f64) -> f64 {
+        match self {
+            NutsFamily::Gaussian => profiled_gaussian_phi,
+            _ => 1.0,
+        }
+    }
 }
 
 /// Whitened-coordinate target for the No-U-Turn HMC sampler.
@@ -567,6 +607,12 @@ pub struct NutsPosterior {
     penalty_z_lin: Array1<f64>,
     /// Precomputed `0.5 μᵀ S μ` (scalar) — constant term of the penalty.
     penalty_z_const: f64,
+    /// Coefficient-covariance scale `cov_scale` (#679/#680 invariant): the
+    /// `Vb = cov_scale·H⁻¹` multiplier. `σ̂²` for profiled Gaussian, `1.0` for
+    /// every weight-carries-dispersion family. Drives both the whitening
+    /// (`L Lᵀ = cov_scale·H⁻¹`) and the target penalty weight
+    /// (`penalty_scale = 1/cov_scale`).
+    cov_scale: f64,
 }
 
 impl NutsPosterior {
@@ -643,18 +689,19 @@ impl NutsPosterior {
         // Since L_H is lower triangular, L_H^T is upper triangular
         let l_h = chol_factor.lower_triangular();
         let mut chol = solve_upper_triangular_transpose(&l_h, dim);
-        // Scale the Cholesky factor by sqrt(phi) so that L Lᵀ = phi · H⁻¹,
-        // i.e. the whitened sampler targets the φ-scaled posterior
-        // covariance `Vb`. For fixed-scale families (Binomial, Poisson)
-        // `phi == 1` and `sqrt_phi() == 1`, so this is a no-op. For
-        // Gaussian and Gamma the dispersion is estimated and this is the
-        // missing √φ that previously left the sampler whitening against
-        // a unit-variance reference instead of `Vb`.
+        // Whitening metric: `L Lᵀ` must equal the posterior covariance the
+        // sampler reproduces, `Vb = cov_scale · H⁻¹` (#679/#680 invariant), so
+        // scale `L` by `√cov_scale`. Only the profiled-Gaussian model carries a
+        // non-unit scale (σ̂² = `dispersion.phi()`); every weight-carries-
+        // dispersion family (Gamma/Tweedie/NB) already folds its dispersion into
+        // the stored `H`, so `cov_scale == 1` and this is a no-op. This replaces
+        // a previous `sqrt_phi()` multiply that wrongly scaled Gamma (and any
+        // φ-bearing family) by `√φ`, mis-preconditioning against `φ·H⁻¹`.
+        let cov_scale = nuts_family.coefficient_covariance_scale(dispersion.phi());
         {
-            use crate::inference::dispersion_cov::DispersionExt as _;
-            let sqrt_phi = dispersion.sqrt_phi();
-            if (sqrt_phi - 1.0).abs() > 0.0 {
-                chol.mapv_inplace(|v| v * sqrt_phi);
+            let sqrt_cov_scale = cov_scale.max(0.0).sqrt();
+            if (sqrt_cov_scale - 1.0).abs() > 0.0 {
+                chol.mapv_inplace(|v| v * sqrt_cov_scale);
             }
         }
         let chol_t = chol.t().to_owned();
@@ -696,6 +743,7 @@ impl NutsPosterior {
             penalty_z_quad,
             penalty_z_lin,
             penalty_z_const,
+            cov_scale,
         })
     }
 
@@ -741,17 +789,22 @@ impl NutsPosterior {
         // S·β multiply and the L^T·∇_β penalty chain-rule multiply, and lets
         // the penalty value, β-gradient and chain rule fuse into one pass.
         //
-        // The module invariant `Vb = φ · H^{-1}` with `H = X'WX + S` requires
-        // that the prior is `1/φ`-scaled whenever the likelihood is (Gaussian,
-        // GammaLog with the shape ≡ 1/φ scaling at `gamma_log_logp_and_grad`).
-        // For fixed-scale families (Bernoulli / Poisson) `φ ≡ 1` so
-        // `inv_phi = 1` collapses this to the original expression. This
-        // mirrors the `penalty_scale` branching in `LinkWigglePosterior`.
-        use crate::inference::dispersion_cov::DispersionExt as _;
-        let penalty_scale = match self.nuts_family {
-            NutsFamily::Gaussian | NutsFamily::GammaLog => self.data.dispersion.inv_phi(),
-            _ => 1.0,
-        };
+        // Penalty weight in the un-whitened β-target
+        // `log p(β) = loglik(β) − penalty_scale · ½ βᵀSβ`. The invariant is
+        // `Vb = cov_scale · H⁻¹` with `H = XᵀWX + S` (penalty added unscaled),
+        // so the target curvature must equal `Vb⁻¹ = H/cov_scale`. The
+        // likelihood already supplies `−∇²ℓ = (data Fisher info)/cov_scale`
+        // (explicitly `/σ²` for profiled Gaussian, implicitly via the working
+        // weight / the `shape ≡ 1/φ` baked into `gamma_log_logp_and_grad` for
+        // the dispersion-carrying families), so the penalty must match it:
+        //   penalty_scale = 1/cov_scale.
+        // That is `1/σ²` for profiled Gaussian and exactly `1.0` for
+        // Gamma/Tweedie/NB/Poisson/Binomial. The previous code used
+        // `dispersion.inv_phi()` for GammaLog (= shape = 1/φ ≠ 1), which
+        // double-counted the dispersion in the sampled posterior (#680); the
+        // statistical dispersion `φ` is NOT `1/cov_scale` for Gamma because it
+        // already lives inside `W`. Mirrors `LinkWigglePosterior`.
+        let penalty_scale = 1.0 / self.cov_scale.max(1e-300);
         let mz = self.penalty_z_quad.dot(z);
         let lin_term = self.penalty_z_lin.dot(z);
         let quad_term = 0.5 * z.dot(&mz);
@@ -4503,6 +4556,12 @@ pub struct LinkWigglePosterior {
     nuts_family: NutsFamily,
     /// Family-specific noise parameter: Gaussian sigma or Gamma shape.
     scale: f64,
+    /// Coefficient-covariance scale `cov_scale` (#679/#680 invariant): the
+    /// `Vb = cov_scale·H⁻¹` multiplier driving both the whitening
+    /// (`L Lᵀ = cov_scale·H⁻¹`) and the target penalty weight
+    /// (`penalty_scale = 1/cov_scale`). `σ²` for profiled Gaussian, `1.0` for
+    /// every weight-carries-dispersion family (Gamma/Tweedie/NB).
+    cov_scale: f64,
 }
 
 impl LinkWigglePosterior {
@@ -4560,24 +4619,21 @@ impl LinkWigglePosterior {
             .map_err(|e| format!("LinkWigglePosterior Cholesky failed: {:?}", e))?;
         let l_h = chol_factor.lower_triangular();
         let mut chol = solve_upper_triangular_transpose(&l_h, dim);
-        // Scale the Cholesky factor by √φ for families with estimated
-        // dispersion. For Gaussian the relevant scale is σ (so φ = σ²)
-        // and the posterior covariance the sampler should target is
-        // `Vb = φ·H⁻¹`. Without this scaling the sampler whitened
-        // against the unscaled Hessian, silently targeting H⁻¹.
-        // Fixed-scale families (Binomial / Poisson) take this branch
-        // with `sqrt_phi == 1` and pay no overhead.
-        // Gamma uses the shape parameterization: `scale = α = 1/φ`, so the
-        // dispersion that scales `Vb = φ·H⁻¹` is `φ = 1/α`. Without this
-        // factor the Gamma sampler whitened against an unscaled Hessian
-        // exactly the way the Gaussian branch did before this fix.
-        let sqrt_phi = match nuts_family {
-            NutsFamily::Gaussian => scale.max(0.0),
-            NutsFamily::GammaLog => 1.0 / scale.max(1e-10).sqrt(),
+        // Whitening metric `L Lᵀ = cov_scale · H⁻¹` (#679/#680 invariant), so
+        // scale `L` by `√cov_scale`. For the link-wiggle joint target `scale`
+        // is σ (Gaussian), so the profiled-Gaussian covariance scale is
+        // `cov_scale = σ²`. Every other family folds its dispersion into the
+        // working weight / the `shape`/`theta` already inside its
+        // log-likelihood, so `cov_scale = 1` and this is a no-op. The previous
+        // Gamma branch scaled `L` by `1/√shape = √φ`, mis-preconditioning the
+        // sampler against `φ·H⁻¹` instead of the correct `H⁻¹` (#680).
+        let cov_scale = match nuts_family {
+            NutsFamily::Gaussian => scale * scale,
             _ => 1.0,
         };
-        if (sqrt_phi - 1.0).abs() > 0.0 {
-            chol.mapv_inplace(|v| v * sqrt_phi);
+        let sqrt_cov_scale = cov_scale.max(0.0).sqrt();
+        if (sqrt_cov_scale - 1.0).abs() > 0.0 {
+            chol.mapv_inplace(|v| v * sqrt_cov_scale);
         }
         let chol_t = chol.t().to_owned();
         Ok(Self {
@@ -4596,6 +4652,7 @@ impl LinkWigglePosterior {
             n_samples,
             nuts_family,
             scale,
+            cov_scale,
         })
     }
 
@@ -4847,30 +4904,19 @@ impl LinkWigglePosterior {
             }
         }
 
-        // Penalty scaling factor: the Gaussian likelihood block above
-        // multiplies through by `inv_scale_sq = 1/φ`, so the penalty
-        // quadratic and its gradient must use the same factor — otherwise
-        // the prior and likelihood live on incompatible scales and the
-        // MAP-anchored posterior used for whitening picks up a hidden
-        // φ-mismatch.
-        //
-        // Gamma uses the shape parameterization: `self.scale = α = 1/φ` and
-        // the data-side log-likelihood already carries an explicit `shape`
-        // factor (`w_i * shape * (-y_i/μ - eta_i)` and
-        // `residual = w_i * shape * (y_i/μ - 1)`). Derivation: for the
-        // shape-rate Gamma with `Var(Y) = φ·μ² = μ²/α`, the canonical-form
-        // log-density score w.r.t. η on the log link is
-        // `dℓ/dη = α·(y/μ − 1)`. The data term is therefore implicitly
-        // `1/φ`-scaled via `shape = α`. The penalty must match that scale,
-        // so use `1/φ = shape` here.
-        //
-        // Other non-Gaussian fixed-scale branches (Binomial / Poisson) have
-        // `φ ≡ 1` and `1/φ = 1`, so the prior shape is unchanged.
-        let penalty_scale = match self.nuts_family {
-            NutsFamily::Gaussian => 1.0 / (self.scale * self.scale).max(1e-10),
-            NutsFamily::GammaLog => self.scale.max(1e-10),
-            _ => 1.0,
-        };
+        // Penalty weight = 1/cov_scale (#679/#680 invariant), matching the
+        // factor the likelihood already carries so the prior and likelihood
+        // live on the same scale and the MAP-anchored target curvature equals
+        // `Vb⁻¹ = H/cov_scale`. The Gaussian block above multiplies through by
+        // `1/σ²`, so `penalty_scale = 1/σ²`. The Gamma block carries an explicit
+        // `shape = 1/φ` factor in its score (`w_i·shape·(y/μ − 1)`) — that is
+        // the *data* Fisher information, already folded into the working
+        // weight, so the penalty must stay UNSCALED (`cov_scale = 1`,
+        // `penalty_scale = 1`). The previous code used `penalty_scale = shape`
+        // for Gamma, double-counting the dispersion in the sampled posterior
+        // and shrinking every posterior SD by `√φ` (#680). Tweedie/NB/Poisson/
+        // Binomial are unit-scale and unchanged.
+        let penalty_scale = 1.0 / self.cov_scale.max(1e-300);
 
         // Gradient w.r.t. θ (wiggle): ∂ℓ/∂θ = B(q₀)^T · residual − S_link · θ
         let s_link_theta = self.penalty_link.dot(&theta);
