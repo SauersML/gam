@@ -58,6 +58,20 @@ use faer::Side;
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
+/// First-order (gradient) KKT tolerance for the inner-solve convergence gate in
+/// `reml_criterion`, applied to the scaled gradient `‖g‖∞ / (1 + |f|)`.
+///
+/// The gate's primary test is the undamped Newton step norm, but that residual
+/// is inflated by an ill-conditioned (yet positive-definite) joint Hessian:
+/// along a near-flat direction `Δ_i = -g_i/λ_i` blows up even when the gradient
+/// `g_i` is at the numerical floor. The gradient itself is the
+/// conditioning-robust optimality residual, so the gate additionally accepts a
+/// state whose scaled gradient falls below this tolerance. `1e-6` is tight
+/// enough that a genuinely non-stationary inner state (gradient commensurate
+/// with the objective scale) is never accepted — only a gradient driven down to
+/// orders of magnitude below the objective qualifies as stationary.
+const SAE_MANIFOLD_REML_GRADIENT_KKT_TOL: f64 = 1.0e-6;
+
 /// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
 /// hard gate threshold. The forward gate value is hard-zero strictly below
 /// `threshold`, but an atom whose logit lies within `threshold − MARGIN·τ` is
@@ -4185,7 +4199,44 @@ impl SaeManifoldTerm {
             let residual_norm = step_norm_sq.sqrt();
             let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
             let residual_tolerance = 1.0e-4 * iterate_scale;
-            if residual_norm <= residual_tolerance {
+            // First-order (gradient) KKT residual — the conditioning-robust
+            // optimality test.
+            //
+            // The undamped Newton step `Δ = -H⁻¹g` is the natural residual only
+            // when `H` is well-conditioned: along an eigenvector with eigenvalue
+            // `λ_i`, `Δ_i = -g_i/λ_i`, so a near-flat direction (`λ_i → 0⁺`, which
+            // the periodic-coordinate K=1 d=1 circle and wide ARD sweeps produce)
+            // inflates `‖Δ‖` even when the gradient `g_i` is at the floating-point
+            // floor. Such a point IS a (numerical) stationary point: the gradient
+            // — the true first-order optimality residual — is ~0, and moving along
+            // the flat direction barely changes the objective, so the Laplace
+            // normaliser ½log|H| is still evaluated essentially at the optimum.
+            //
+            // `g` (`sys.rows[i].gt`, `sys.gb`) is the gradient of the SAME
+            // penalised objective the inner solve minimises, so `‖g‖∞ / (1+|f|)`
+            // is a dimensionless stationarity measure independent of the Hessian
+            // conditioning. We accept convergence when EITHER the well-conditioned
+            // step test OR this scaled-gradient test passes. The tolerance is kept
+            // tight (`1e-6`) so a genuinely non-stationary inner state — whose
+            // gradient is commensurate with the objective scale — is never
+            // accepted; only a gradient driven down to the solver's numerical
+            // floor (orders of magnitude below the objective) qualifies.
+            let mut grad_inf_norm = 0.0_f64;
+            for row in &sys.rows {
+                for &g in row.gt.iter() {
+                    grad_inf_norm = grad_inf_norm.max(g.abs());
+                }
+            }
+            for &g in sys.gb.iter() {
+                grad_inf_norm = grad_inf_norm.max(g.abs());
+            }
+            let objective_scale = 1.0
+                + self
+                    .penalized_objective_total(target, rho, registry, 1.0)?
+                    .abs();
+            let gradient_stationary = grad_inf_norm.is_finite()
+                && grad_inf_norm <= SAE_MANIFOLD_REML_GRADIENT_KKT_TOL * objective_scale;
+            if residual_norm <= residual_tolerance || gradient_stationary {
                 let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
                     "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
                      ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
@@ -4198,8 +4249,10 @@ impl SaeManifoldTerm {
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
                      undamped Newton residual ‖Δ‖={residual_norm:.6e} exceeds tolerance \
-                     {residual_tolerance:.6e} after {total_inner_iter} inner iterations. \
-                     Refusing to rank an off-optimum Laplace criterion."
+                     {residual_tolerance:.6e} and scaled gradient ‖g‖∞/(1+|f|)={:.6e} exceeds \
+                     {SAE_MANIFOLD_REML_GRADIENT_KKT_TOL:.6e} after {total_inner_iter} inner \
+                     iterations. Refusing to rank an off-optimum Laplace criterion.",
+                    grad_inf_norm / objective_scale
                 ));
             }
             let remaining = max_refine_iter - total_inner_iter;

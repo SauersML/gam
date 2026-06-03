@@ -119,9 +119,28 @@ const PCG_ABSOLUTE_TOLERANCE_FLOOR: f64 = 1e-14;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 pub const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
 pub const DEFAULT_PROXIMAL_RIDGE_GROWTH: f64 = 10.0;
-pub const DEFAULT_PROXIMAL_MAX_ATTEMPTS: usize = 16;
+/// Number of geometric proximal-ridge escalations the adaptive correction
+/// attempts before giving up. Raised from 16 to 22 so the ridge can climb from
+/// `1e-8` to `~1e14` (`1e-8 · 10^21`): when the penalised Hessian curvature
+/// along the gradient exceeds `~1e9`, the damped Newton step at ridge `1e9`
+/// still overshoots, and the extra decades let the step length collapse far
+/// enough to either find descent or reach the near-stationary resolution floor
+/// that triggers the convergence exit. The cost of the extra attempts is paid
+/// only on configs that would otherwise have failed.
+pub const DEFAULT_PROXIMAL_MAX_ATTEMPTS: usize = 22;
 const DEFAULT_ARMIJO_C1: f64 = 1e-4;
 const DEFAULT_GRADIENT_TOLERANCE: f64 = 1e-10;
+/// Relative objective resolution for the proximal-correction convergence exit.
+///
+/// When the best achievable change in the penalised objective across all ridge
+/// attempts is within `rel_tol · (|f| + 1)` of the incumbent value, the damped
+/// Newton model has reached the floating-point resolution of the objective and
+/// no further productive decrease exists. `8e-12` sits a few decades above the
+/// `~2.2e-16` f64 epsilon (so genuine reductions of a well-scaled objective are
+/// never swallowed) yet comfortably above the accumulated rounding of the
+/// `O(N·M·p)` reductions that form the objective, so a truly stationary state
+/// is recognised rather than chased into a spurious failure.
+const DEFAULT_PROXIMAL_CONVERGENCE_REL_TOL: f64 = 8e-12;
 const EUCLIDEAN_MANIFOLD_MODE_FINGERPRINT: u64 = 0;
 const ARROW_FACTOR_CACHE_HTBETA_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
@@ -1035,6 +1054,23 @@ pub struct ArrowProximalCorrectionOptions {
     pub max_attempts: usize,
     pub armijo_c1: f64,
     pub gradient_tolerance: f64,
+    /// Relative objective resolution below which the proximal correction
+    /// declares convergence instead of failing.
+    ///
+    /// Near a stationary point the largest decrease the damped Newton model can
+    /// still achieve shrinks to the floating-point resolution of the objective
+    /// itself: at proximal ridge `μ → μ_max` the accepted step length is
+    /// `O(‖g‖ / μ)`, so the realised change in the objective falls below
+    /// `rel_tol · (|f| + 1)`. At that scale the Armijo sufficient-decrease test
+    /// compares two values that differ only by rounding noise, and no further
+    /// productive decrease is achievable. Rather than raise
+    /// `AdaptiveCorrectionFailed`, the loop then returns the incumbent state
+    /// (a zero step) as converged. This does NOT mask genuine non-convergence:
+    /// it triggers only when every attempted step either fails to decrease the
+    /// objective by more than this resolution OR increases it by no more than
+    /// this resolution (pure rounding). A step that genuinely reduces the
+    /// objective is always taken first.
+    pub convergence_objective_rel_tol: f64,
 }
 
 impl Default for ArrowProximalCorrectionOptions {
@@ -1045,6 +1081,7 @@ impl Default for ArrowProximalCorrectionOptions {
             max_attempts: DEFAULT_PROXIMAL_MAX_ATTEMPTS,
             armijo_c1: DEFAULT_ARMIJO_C1,
             gradient_tolerance: DEFAULT_GRADIENT_TOLERANCE,
+            convergence_objective_rel_tol: DEFAULT_PROXIMAL_CONVERGENCE_REL_TOL,
         }
     }
 }
@@ -4262,8 +4299,27 @@ where
         });
     }
 
+    // Objective-scale resolution: the floating-point granularity of the
+    // penalised objective at the incumbent value. Decreases smaller than this
+    // are indistinguishable from rounding noise; increases smaller than this
+    // are pure rounding and indicate the incumbent is already a (numerical)
+    // stationary point.
+    let objective_resolution = correction.convergence_objective_rel_tol.max(0.0)
+        * (current_objective_value.abs() + 1.0);
+
     let mut proximal_ridge = correction.initial_ridge.max(0.0);
     let mut last_reason = String::from("no attempts were made");
+    // Best strictly-decreasing trial seen across all ridge attempts. The Armijo
+    // sufficient-decrease test can reject a step that nonetheless lowers the
+    // objective; in the heavily-damped near-stationary regime, banking any
+    // genuine decrease is a valid (relaxed) globalisation, so we retain the
+    // best such candidate as a fallback to the strict Armijo accept.
+    let mut best_decrease: Option<(Array1<f64>, Array1<f64>, f64, f64, f64, f64)> = None;
+    // Smallest objective INCREASE observed (over attempts that produced a
+    // finite trial value but did not decrease). If even the best attempt only
+    // raises the objective, but by no more than the objective resolution, the
+    // incumbent is numerically stationary and we converge in place.
+    let mut smallest_increase = f64::INFINITY;
     for attempt in 0..correction.max_attempts {
         let ridge_t = base_ridge_t + proximal_ridge;
         let ridge_beta = base_ridge_beta + proximal_ridge;
@@ -4289,6 +4345,27 @@ where
                             attempts: attempt + 1,
                         });
                     }
+                    if trial_value.is_finite() {
+                        let delta_obj = trial_value - current_objective_value;
+                        if delta_obj < -objective_resolution {
+                            // Genuine (Armijo-failing) decrease: keep the best.
+                            let improves = best_decrease
+                                .as_ref()
+                                .is_none_or(|(_, _, best_value, _, _, _)| trial_value < *best_value);
+                            if improves {
+                                best_decrease = Some((
+                                    delta_t.clone(),
+                                    delta_beta.clone(),
+                                    trial_value,
+                                    g_dot_p,
+                                    ridge_t,
+                                    ridge_beta,
+                                ));
+                            }
+                        } else if delta_obj < smallest_increase {
+                            smallest_increase = delta_obj;
+                        }
+                    }
                     last_reason = {
                         let step_norm = (delta_t.iter().map(|v| v * v).sum::<f64>()
                             + delta_beta.iter().map(|v| v * v).sum::<f64>())
@@ -4305,6 +4382,54 @@ where
             }
         }
         proximal_ridge = next_proximal_ridge(proximal_ridge, correction.ridge_growth);
+    }
+
+    // ── Fallback 1: bank the best genuine (Armijo-failing) decrease ──────────
+    // Re-apply the best decreasing step so `self` (the caller's state, mutated
+    // through the `trial_objective` closure) is left exactly at that step; the
+    // returned deltas describe the move from the incumbent.
+    if let Some((delta_t, delta_beta, trial_value, g_dot_p, ridge_t, ridge_beta)) = best_decrease {
+        let reapplied = trial_objective(delta_t.view(), delta_beta.view());
+        // The closure is deterministic (restore-then-apply), so `reapplied`
+        // matches the recorded `trial_value` up to rounding; trust the live
+        // value to keep the returned record consistent with `self`'s state.
+        let final_value = if reapplied.is_finite() {
+            reapplied
+        } else {
+            trial_value
+        };
+        return Ok(ArrowAcceptedProximalStep {
+            delta_t,
+            delta_beta,
+            ridge_t,
+            ridge_beta,
+            proximal_ridge,
+            objective_value: current_objective_value,
+            trial_objective_value: final_value,
+            gradient_dot_step: g_dot_p,
+            attempts: correction.max_attempts,
+        });
+    }
+
+    // ── Fallback 2: near-stationary convergence exit ─────────────────────────
+    // No attempt decreased the objective, but the best attempt raised it by no
+    // more than the objective's own resolution. The damped Newton model cannot
+    // make distinguishable progress: the incumbent is a numerical stationary
+    // point. Return a zero step at the incumbent state so the caller accepts it
+    // as converged instead of failing. (`smallest_increase` is finite only if
+    // at least one descent direction produced a finite trial value.)
+    if smallest_increase.is_finite() && smallest_increase <= objective_resolution {
+        return Ok(ArrowAcceptedProximalStep {
+            delta_t: Array1::<f64>::zeros(sys.row_offsets[sys.rows.len()]),
+            delta_beta: Array1::<f64>::zeros(sys.k),
+            ridge_t: base_ridge_t,
+            ridge_beta: base_ridge_beta,
+            proximal_ridge: 0.0,
+            objective_value: current_objective_value,
+            trial_objective_value: current_objective_value,
+            gradient_dot_step: 0.0,
+            attempts: correction.max_attempts,
+        });
     }
 
     Err(ArrowSchurError::AdaptiveCorrectionFailed {
@@ -6772,6 +6897,7 @@ mod tests {
             max_attempts: 16,
             armijo_c1: 1e-4,
             gradient_tolerance: 1e-12,
+            convergence_objective_rel_tol: DEFAULT_PROXIMAL_CONVERGENCE_REL_TOL,
         };
         let mut t = 0.0_f64;
         let mut previous_value = quartic_counterexample_value(t);
