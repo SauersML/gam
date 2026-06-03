@@ -1303,6 +1303,78 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         &mut iteration_logger,
     )?;
 
+    // ── Gamma dispersion: re-estimate the shape at the *converged* η (#678) ──
+    //
+    // The inner LM solve estimates the Gamma shape ν = 1/φ **once** from the
+    // warm-start η and freezes it for the rest of the solve (see the
+    // `gamma_shape_locked` doc on `GamWorkingModel`): holding ν fixed keeps the
+    // product φ·λ — and hence the penalized argmin β̂ — a stationary LM target,
+    // so the gain ratio compares one objective. That lock is correct *within* a
+    // solve, but it pins ν to whatever η the solve started from. When the fit
+    // cold-starts (the final dedicated fit at the converged ρ passes
+    // `warm_start_beta = None`, and seed screening starts from a default guess),
+    // that warm-start η has not yet captured the mean structure; the leftover
+    // spread of μ inflates the Gamma deviance term `mean[y/μ − ln(y/μ) − 1]` and
+    // biases ν **down** (φ up) by >2× whenever μ varies appreciably. The mean
+    // surface still converges (β̂ is essentially scale-free here), but the frozen
+    // ν that survives into `UnifiedFitResult::dispersion_phi()` — and from there
+    // into every coefficient SE `Vb = H⁻¹·φ̂`, prediction interval, and
+    // observation-noise interval — is the early, mean-spread-contaminated value.
+    //
+    // Fix: after the solve converges, re-estimate ν at the converged η. If it
+    // moved, re-solve β (warm-started, ν held fixed at the refreshed value) and
+    // repeat, driving the pair (β, ν) to their joint fixed point at the current
+    // λ. At convergence the reported dispersion is the Gamma ML estimate at the
+    // converged mean (mgcv's post-hoc Pearson/deviance scale), and the final
+    // working state — `finalweights`, the penalized Hessian, the deviance, μ —
+    // is rebuilt with that same ν, so `Vb = H⁻¹·φ̂` stays internally consistent.
+    // Warm-started solves (every REML cost eval) already sit near the converged
+    // η, so the first refresh check confirms ν and exits without a re-solve; the
+    // added cost there is a single O(n) shape evaluation.
+    if working_model.likelihood.scale.gamma_shape_is_estimated() {
+        // A few passes suffice: the converged-η shape map is a strong
+        // contraction (β̂ barely moves once the mean is captured), so cold
+        // starts settle in 1–2 re-solves and warm starts in zero.
+        const MAX_SHAPE_REFRESH: usize = 5;
+        // Relative shape tolerance below which a re-solve cannot move any
+        // reported quantity meaningfully (far under statistical resolution).
+        const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
+        for _ in 0..MAX_SHAPE_REFRESH {
+            let refreshed_shape = super::estimate_gamma_shape_from_eta(
+                y,
+                working_summary.state.eta.as_ref(),
+                priorweights,
+            );
+            let prior_shape = working_model.likelihood.gamma_shape().unwrap_or(1.0);
+            let rel_change =
+                (refreshed_shape - prior_shape).abs() / prior_shape.max(f64::MIN_POSITIVE);
+            // Install the refreshed shape and hold it fixed for any re-solve so
+            // the LM objective stays stationary (the lock is *re-armed*, not
+            // released — the seed-from-warm-start branch in `update_with_curvature`
+            // must not overwrite this deliberately chosen value).
+            working_model.likelihood =
+                working_model.likelihood.clone().with_gamma_shape(refreshed_shape);
+            working_model.gamma_shape_locked = true;
+            if rel_change <= SHAPE_REFRESH_REL_TOL {
+                // Converged: the working-state buffers (weights, Hessian,
+                // deviance) already reflect a shape within tolerance of
+                // `refreshed_shape`, because the only way to reach here without
+                // a re-solve is that the prior solve's shape already matched the
+                // converged-η estimate. Nothing left to rebuild.
+                break;
+            }
+            // The shape moved: re-solve β at the corrected shape, warm-started
+            // at the converged β, so the final working state is rebuilt with the
+            // refreshed ν.
+            working_summary = runworking_model_pirls(
+                &mut working_model,
+                working_summary.beta.clone(),
+                &options,
+                &mut iteration_logger,
+            )?;
+        }
+    }
+
     // Extract workspace before consuming working_model so we can reuse
     // the pre-allocated buffers in calculate_edfwithworkspace_with_penalty.
     // into_final_state() drops the workspace field anyway (it uses `..` in
