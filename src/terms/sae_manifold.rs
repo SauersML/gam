@@ -8225,6 +8225,208 @@ mod tests {
         }
     }
 
+    /// The compact-latent evaluators must each expose a
+    /// [`SaeBasisEvaluator::projection_seed_grid`] that spans their manifold,
+    /// and the unbounded / basis-linear evaluators must expose none (their PCA
+    /// seed already lands in the convex hull of the training coordinates).
+    /// Pins the grid extents the fixed-decoder OOS seed (#628) relies on.
+    #[test]
+    fn projection_seed_grid_spans_each_compact_manifold() {
+        use std::f64::consts::PI;
+
+        // Periodic S¹: `resolution` phases evenly on `[0, 1)` (endpoint
+        // excluded — `0` and `1` are the same point on the circle).
+        let periodic = PeriodicHarmonicEvaluator::new(3)
+            .unwrap()
+            .projection_seed_grid(16)
+            .unwrap();
+        assert_eq!(periodic.dim(), (16, 1));
+        for i in 0..16 {
+            assert_abs_diff_eq!(periodic[[i, 0]], i as f64 / 16.0, epsilon = 1e-12);
+        }
+        assert!(periodic.iter().all(|&t| (0.0..1.0).contains(&t)));
+
+        // Sphere lat/lon chart: an `r × r` grid, latitude strictly interior to
+        // the chart (poles are degenerate), longitude on `[-π, π)`.
+        let r = 6usize;
+        let sphere = SphereChartEvaluator.projection_seed_grid(r).unwrap();
+        assert_eq!(sphere.dim(), (r * r, 2));
+        for row in 0..r * r {
+            let lat = sphere[[row, 0]];
+            let lon = sphere[[row, 1]];
+            assert!(
+                lat > -PI / 2.0 && lat < PI / 2.0,
+                "sphere seed latitude {lat} is not strictly interior to the chart"
+            );
+            assert!(
+                (-PI..PI).contains(&lon),
+                "sphere seed longitude {lon} is outside [-π, π)"
+            );
+        }
+
+        // Unbounded / basis-linear latents expose no grid (default `None`).
+        assert!(
+            AffineCoordinateEvaluator::new(2)
+                .projection_seed_grid(64)
+                .is_none(),
+            "affine (unbounded) evaluator must not expose a projection seed grid"
+        );
+    }
+
+    /// The torus seed grid is the Cartesian product of per-axis `[0, 1)` phase
+    /// grids, with the per-axis resolution shrunk geometrically so the *total*
+    /// point count stays under a fixed cap as the latent dimension grows. Pins
+    /// the cap arithmetic (`per_axis^d ≤ 4096`) the OOS seed depends on so a
+    /// high-`d` torus atom never blows up the per-row global-argmin scan.
+    #[test]
+    fn torus_projection_seed_grid_caps_total_points() {
+        // d == 1: dense, no cap (256¹ ≤ 4096).
+        let g1 = TorusHarmonicEvaluator::new(1, 3)
+            .unwrap()
+            .projection_seed_grid(256)
+            .unwrap();
+        assert_eq!(g1.dim(), (256, 1));
+
+        // d == 3: per-axis shrunk to the largest `p` with `p³ ≤ 4096`, i.e.
+        // `p = 16` ⇒ exactly 4096 points.
+        let g3 = TorusHarmonicEvaluator::new(3, 3)
+            .unwrap()
+            .projection_seed_grid(256)
+            .unwrap();
+        assert_eq!(g3.ncols(), 3);
+        assert_eq!(g3.nrows(), 16 * 16 * 16);
+        assert!(
+            g3.nrows() <= 4096,
+            "torus d=3 seed grid has {} points, over the 4096 cap",
+            g3.nrows()
+        );
+        assert!(
+            g3.iter().all(|&t| (0.0..1.0).contains(&t)),
+            "every torus seed coordinate must be a phase on [0, 1)"
+        );
+        // Full Cartesian product: each axis takes exactly `per_axis` distinct
+        // phase values.
+        for axis in 0..3 {
+            let mut vals: Vec<f64> = g3.column(axis).iter().copied().collect();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            vals.dedup();
+            assert_eq!(
+                vals.len(),
+                16,
+                "torus seed axis {axis} should take 16 distinct phases"
+            );
+        }
+    }
+
+    /// `seed_coords_by_decoder_projection` must replace each cold coordinate
+    /// with the grid point whose frozen-decoder decode is closest to the target
+    /// row, and refresh the atom basis there. Built on a decoder that maps the
+    /// circle injectively into `ℝ²` (`decode(t) = (sin 2πt, cos 2πt)`) so the
+    /// per-row global argmin is unambiguous. Direct Rust pin for the #628 OOS
+    /// seed, complementing the Python oracle end-to-end test.
+    #[test]
+    fn seed_coords_by_decoder_projection_lands_on_grid_minimiser() {
+        use std::f64::consts::PI;
+
+        let resolution = 8usize;
+        // Deliberately wrong cold seed for both rows.
+        let init_coords = array![[0.05], [0.05]];
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let (phi0, jet0) = evaluator.evaluate(init_coords.view()).unwrap();
+        // (basis = [1, sin, cos]) × (2 output channels): decode(t) = (sin, cos).
+        let decoder = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(evaluator.clone());
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            // `K = logits.ncols()`; a single softmax atom is one logit column
+            // (the lone simplex coordinate, pinned to 1.0 in `try_assignments_row`).
+            Array2::<f64>::zeros((2, 1)),
+            vec![init_coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        // Targets sit exactly on two distinct grid phases `k / resolution`.
+        let phases = [3usize, 6usize];
+        let mut target = Array2::<f64>::zeros((2, 2));
+        for (row, &k) in phases.iter().enumerate() {
+            let t = k as f64 / resolution as f64;
+            target[[row, 0]] = (2.0 * PI * t).sin();
+            target[[row, 1]] = (2.0 * PI * t).cos();
+        }
+
+        term.seed_coords_by_decoder_projection(target.view(), resolution)
+            .unwrap();
+
+        // Each row was seeded onto its exact grid minimiser …
+        let seeded = term.assignment.coords[0].as_matrix();
+        let mut expected_coords = Array2::<f64>::zeros((2, 1));
+        for (row, &k) in phases.iter().enumerate() {
+            let expected = k as f64 / resolution as f64;
+            assert_abs_diff_eq!(seeded[[row, 0]], expected, epsilon = 1e-12);
+            expected_coords[[row, 0]] = expected;
+        }
+        // … and the basis cache was refreshed at the seeded coordinates.
+        let (phi_expected, _) = evaluator.evaluate(expected_coords.view()).unwrap();
+        assert_abs_diff_eq!(
+            (&term.atoms[0].basis_values - &phi_expected)
+                .mapv(f64::abs)
+                .sum(),
+            0.0,
+            epsilon = 1e-12
+        );
+    }
+
+    /// A target whose shape does not match `(n_obs, output_dim)` is a caller
+    /// bug and must surface as an error rather than silently mis-seeding.
+    #[test]
+    fn seed_coords_by_decoder_projection_rejects_shape_mismatch() {
+        let init_coords = array![[0.05], [0.05]];
+        let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let (phi0, jet0) = evaluator.evaluate(init_coords.view()).unwrap();
+        let decoder = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(evaluator);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((2, 1)),
+            vec![init_coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+        // Output dim is 2; pass a 3-column target.
+        let bad_target = Array2::<f64>::zeros((2, 3));
+        let err = term
+            .seed_coords_by_decoder_projection(bad_target.view(), 8)
+            .unwrap_err();
+        assert!(
+            err.contains("target shape"),
+            "expected a target-shape error, got: {err}"
+        );
+    }
+
     /// Parity guard for the sphere chart: the shared engine
     /// [`sphere_chart_basis_jet`] is the single source of derivative truth used
     /// by both the core SAE path ([`SphereChartEvaluator::evaluate`]) and the
