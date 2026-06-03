@@ -10352,14 +10352,39 @@ fn sae_decoder_lsq_init(
     }
     // Symmetric normal-equations matrix and rhs.
     let mut xtx = fast_ata(&x);
-    // Diagonal jitter: relative to the trace so the conditioning is
-    // dimensionless. The data-fit Newton step adds its own ridge later; this
-    // ridge only needs to keep the seed projection well-posed.
+    // Diagonal Tikhonov ridge for the seed projection (issue #671 multi-atom
+    // conditioning). The cold multi-atom seed places near-identical coordinates
+    // on every atom (the periodic seed shares the leading principal component
+    // across atoms), so the joint design's per-atom column blocks are nearly
+    // collinear and `X^T X` is severely ill-conditioned. A tiny mean-relative
+    // ridge (the historical `mean_diag * 1e-8`) leaves the near-null directions
+    // unregularized, producing decoder coefficients of order 1e5; the
+    // DecoderIncoherence penalty's gradient is cubic in `B`, so those seeds blow
+    // the joint solver up by ~1e15. We instead anchor the ridge to the SPECTRAL
+    // scale (the maximum diagonal, an upper bound on the largest eigenvalue)
+    // with a larger relative floor. This bounds the seed solution norm by
+    // roughly `||X^T Z|| / ridge` while leaving well-conditioned designs
+    // essentially unchanged (the ridge stays negligible against the signal
+    // eigenvalues there). Conditioning the seed is correct here: the inner
+    // data-fit Newton step refines `B` from a sane, bounded starting point
+    // rather than a pathological one.
     let mut trace = 0.0_f64;
+    let mut max_diag = 0.0_f64;
     for i in 0..m_total {
-        trace += xtx[[i, i]];
+        let d = xtx[[i, i]];
+        trace += d;
+        if d > max_diag {
+            max_diag = d;
+        }
     }
-    let jitter = (trace / m_total as f64).max(1.0).max(1.0e-12) * 1.0e-8;
+    let mean_diag = (trace / m_total as f64).max(0.0);
+    // Spectral-scale ridge: tie the floor to the largest diagonal so collinear
+    // column blocks (small eigenvalues) are damped relative to the design's
+    // dominant scale, not its average. `1e-4` is large enough to keep the seed
+    // coefficient norm bounded under near-duplicate atoms yet small enough that
+    // a well-conditioned design recovers essentially the unregularized LSQ fit.
+    let spectral_scale = max_diag.max(mean_diag).max(1.0e-12);
+    let jitter = spectral_scale * 1.0e-4;
     for i in 0..m_total {
         xtx[[i, i]] += jitter;
     }
