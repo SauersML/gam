@@ -341,8 +341,18 @@ impl SaeAtomBasisKind {
 /// ```
 ///
 /// The value, gradient, and curvature returned here all come from this single
-/// energy, so they are mutually FD-consistent and consistent with the Laplace
-/// `½ log|H|` term (whose `H_tt` diagonal is exactly `V''`).
+/// energy, so they are mutually FD-consistent. The *value* (`ard_value` /
+/// `loss.ard`) and the *gradient* (the assembled `gt`) use the exact `V` and
+/// `V'`. The curvature `V'' = α·cos(κt)` is INDEFINITE — it turns negative for
+/// `|κt|` past `π/2` (a quarter period) — so it is NOT written raw into the
+/// Newton/Schur `H_tt` diagonal: that would make the per-row coordinate block
+/// indefinite and the Schur (and log-det) Cholesky would fail on a non-PD pivot
+/// at `K ≥ 2`. The assembly accumulates the PSD majorizer `max(V'', 0)` into
+/// `H_tt` instead (mirroring `add_sae_coord_penalty`'s `psd_majorizer_diag` for
+/// the registry coord penalties). Majorizing the curvature of a *fixed* prior
+/// only damps the Newton step; the stationary point is set by the exact gradient
+/// `V'`, so it is unchanged. The Laplace `½ log|H|` is therefore evaluated on the
+/// same PSD-majorized `H_tt` (a valid Cholesky requires a PD operator anyway).
 ///
 /// `sq_equiv` is the Euclidean-equivalent `t²` such that `½·α·sq_equiv == V`,
 /// i.e. `sq_equiv = 2V/α = (2/κ²)(1−cos κt)`. It is what the
@@ -3418,6 +3428,18 @@ impl SaeManifoldTerm {
         let mut value = 0.0_f64;
         for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(s![rho_slice.clone()]);
+            // Skip the registry `ARDPenalty` here for the same reason it is
+            // skipped in `add_sae_analytic_penalty_contributions`: the coordinate
+            // ARD energy is already counted by `loss.ard` (the von-Mises
+            // `ard_value`), and the registry penalty's legacy Gaussian `½λt²` is
+            // period-discontinuous. Including it would double-count the energy and
+            // make this line-search objective jump across the branch cut while the
+            // assembled gradient (von-Mises only, after the assembly fix) stays
+            // continuous — i.e. a near-zero step would change the objective by a
+            // finite amount and Armijo would wrongly reject it.
+            if matches!(penalty, AnalyticPenaltyKind::Ard(_)) {
+                continue;
+            }
             match tier {
                 PenaltyTier::Psi => {
                     if matches!(
@@ -4059,13 +4081,26 @@ impl SaeManifoldTerm {
                         // contributes the per-axis prior energy), so it is NOT
                         // minibatch-scaled — the per-chunk row sums already
                         // reconstruct the full coordinate prior across a pass.
-                        // Gradient and curvature come from the SAME energy as
-                        // `ard_value` (`ArdAxisPrior`), so they stay FD- and
-                        // Laplace-`½log|H|`-consistent on periodic axes.
+                        // The value (`ard_value`/`loss.ard`) and the gradient
+                        // both come from the SAME `ArdAxisPrior` energy, so they
+                        // stay FD-consistent on periodic axes. The exact
+                        // von-Mises curvature `V'' = α·cos(κt)` is INDEFINITE —
+                        // it goes negative for |t| past a quarter period — so
+                        // writing it raw into the Newton/Schur `htt` diagonal
+                        // makes that PSD curvature block indefinite and the Schur
+                        // Cholesky (used both for the Newton step and the exact
+                        // log-det) fails on a non-PD pivot. Accumulate the PSD
+                        // majorizer `max(V'', 0)` instead, exactly as
+                        // `add_sae_coord_penalty` does for the registry coord
+                        // penalties: the positive part keeps `htt` PSD so the
+                        // factorization succeeds, and majorizing the curvature of
+                        // a fixed prior only damps the Newton step — it does not
+                        // move the stationary point (the gradient, which sets the
+                        // fixed point, stays the exact `V'`).
                         let alpha = rho.log_ard[k][axis].exp();
                         let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                         block.gt[starts[j] + axis] += prior.grad;
-                        block.htt[[starts[j] + axis, starts[j] + axis]] += prior.hess;
+                        block.htt[[starts[j] + axis, starts[j] + axis]] += prior.hess.max(0.0);
                     }
                 }
             } else {
@@ -4082,10 +4117,15 @@ impl SaeManifoldTerm {
                     let row_t = coord.row(row);
                     let periods = &ard_axis_periods[atom_idx];
                     for axis in 0..d {
+                        // PSD-majorize the (possibly negative) von-Mises curvature
+                        // into the Newton/Schur `htt` block; see the compact-layout
+                        // branch above for why `max(V'', 0)` is required to keep
+                        // `htt` PD (the exact `V'' = α·cos κt` is indefinite past a
+                        // quarter period and breaks the Schur/log-det Cholesky).
                         let alpha = rho.log_ard[atom_idx][axis].exp();
                         let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                         block.gt[off + axis] += prior.grad;
-                        block.htt[[off + axis, off + axis]] += prior.hess;
+                        block.htt[[off + axis, off + axis]] += prior.hess.max(0.0);
                     }
                 }
             }
@@ -5132,6 +5172,25 @@ impl SaeManifoldTerm {
         let mut beta_penalty_written = false;
         for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(layout.iter()) {
             let rho_local = rho_global.slice(s![rho_slice.clone()]);
+            // The coordinate ARD prior is owned by the built-in `ArdAxisPrior`
+            // path (the unconditional row-block gradient/curvature write above,
+            // and `ard_value`/`loss.ard` for the energy). That path uses the
+            // smooth von-Mises energy `V(t) = (α/κ²)(1−cos κt)` on periodic
+            // (Circle) axes, whose value, gradient (`α/κ·sin κt`), and curvature
+            // (`α·cos κt`) are mutually FD-consistent and continuous across the
+            // branch cut. The registry `ARDPenalty` is the legacy Euclidean
+            // Gaussian (`½λt²`, grad `λt`, curvature `λ`): adding it here would
+            // (a) double-count the coordinate prior in both gradient and Newton
+            // curvature, and (b) reintroduce the period-discontinuous `½λt²`
+            // energy — its grad `λt` is continuous but its value jumps by
+            // `½λ(t_after²−t_before²)` across the cut, so a near-zero Newton step
+            // crossing the cut changes the line-search objective discontinuously
+            // and Armijo rejects it. Skip it on every SAE path so the von-Mises
+            // built-in is the single source of truth (matching the REML criterion,
+            // which already scores only `loss.ard`).
+            if matches!(penalty, AnalyticPenaltyKind::Ard(_)) {
+                continue;
+            }
             match tier {
                 PenaltyTier::Psi => {
                     if matches!(
@@ -8662,6 +8721,136 @@ mod tests {
             (ard_after - ard_before).abs() < 1.0e-2,
             "periodic ARD jumped across the cut: before={ard_before}, after={ard_after}"
         );
+    }
+
+    /// The *full line-search objective* (`penalized_objective_total`) — not just
+    /// the built-in `loss.ard` — must be continuous across the period cut when a
+    /// registry `ARDPenalty` is present, which is the production SAE config
+    /// (`ard_per_atom=True` emits `{"kind":"ard","target":"t"}`). The registry
+    /// `ARDPenalty` value is the legacy Euclidean Gaussian `½λΣt²`, which jumps by
+    /// ≈ ½λ·P² across the cut. Before the fix it was summed into
+    /// `analytic_penalty_value_total` on top of the von-Mises `loss.ard`, so the
+    /// line-search objective jumped discontinuously while the assembled gradient
+    /// (also double-counting the Gaussian `λt`, but that piece is continuous)
+    /// predicted only an O(step) change — a near-zero Newton step crossing the
+    /// cut then raised the objective by ≈ ½λ and Armijo rejected it (BUG 1). The
+    /// fix skips the registry ARD on every SAE path so the smooth von-Mises
+    /// built-in is the single source of truth; the objective must now stay smooth.
+    #[test]
+    fn penalized_objective_continuous_across_periodic_cut_with_registry_ard() {
+        let coords0 = array![[0.999_f64]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.2], [-0.3], [0.4]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((1, 1)),
+            vec![coords0],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.1_f64]];
+        // Large precision makes the OLD Gaussian-registry jump (≈ ½λP² = 25) huge
+        // relative to the smooth O(step) von-Mises change.
+        let alpha = 50.0_f64;
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![alpha.ln()]]);
+
+        // Production-shaped registry: one ARD penalty on the "t" coord block.
+        let coord = &term.assignment.coords[0];
+        let mut registry = AnalyticPenaltyRegistry::new();
+        let ard_pen = ARDPenalty::new(
+            PsiSlice::full(coord.len(), Some(coord.latent_dim())),
+            coord.latent_dim(),
+        );
+        registry.push(AnalyticPenaltyKind::Ard(Arc::new(ard_pen)));
+
+        let obj_before = term
+            .penalized_objective_total(target.view(), &rho, Some(&registry), 1.0)
+            .unwrap();
+        let q = term.assignment.row_block_dim();
+        let beta_dim = term.beta_dim();
+        let mut delta_ext = Array1::<f64>::zeros(q);
+        delta_ext[q - 1] = 0.002; // 0.999 -> 1.001, wraps to 0.001 across the cut.
+        let delta_beta = Array1::<f64>::zeros(beta_dim);
+        term.apply_newton_step(delta_ext.view(), delta_beta.view(), 1.0)
+            .unwrap();
+        let wrapped = term.assignment.coords[0].row(0)[0];
+        assert!(
+            wrapped < 0.01,
+            "coordinate should have wrapped across the cut, got {wrapped}"
+        );
+        let obj_after = term
+            .penalized_objective_total(target.view(), &rho, Some(&registry), 1.0)
+            .unwrap();
+        // Smooth: a 0.002 step changes the full objective by a tiny amount. The
+        // OLD Gaussian-registry path jumped by ≈ ½·50·(1²−0²) = 25.
+        assert!(
+            (obj_after - obj_before).abs() < 1.0e-2,
+            "line-search objective jumped across the cut: before={obj_before}, after={obj_after}"
+        );
+    }
+
+    /// The von-Mises coordinate-prior curvature `V'' = α·cos(κt)` is indefinite
+    /// (negative for |t| past a quarter period). Writing it raw into the
+    /// Newton/Schur `htt` diagonal at K=2 made the per-row coordinate block, and
+    /// hence the Schur complement, non-PD and the Cholesky failed on a negative
+    /// pivot (BUG 3). The assembled `htt` diagonal on every periodic coord axis
+    /// must therefore be non-negative (the `max(V'',0)` PSD majorizer), while the
+    /// gradient stays the exact `V'`.
+    #[test]
+    fn periodic_ard_curvature_is_psd_in_assembled_htt() {
+        // Two rows past the quarter period (t in (0.25, 0.75)) where cos(2πt) < 0.
+        let coords0 = array![[0.40_f64], [0.60_f64]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.2], [-0.3], [0.4]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((2, 1)),
+            vec![coords0],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.1_f64], [0.2_f64]];
+        // Large α drives V''=α·cos(2πt) strongly negative at t=0.4,0.6
+        // (cos(0.8π)≈-0.809), so a raw write would push the data-fit-only htt
+        // diagonal negative.
+        let alpha = 100.0_f64;
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![alpha.ln()]]);
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        for (row_idx, row) in sys.rows.iter().enumerate() {
+            let d = row.htt.nrows();
+            for a in 0..d {
+                assert!(
+                    row.htt[[a, a]] >= 0.0,
+                    "row {row_idx} htt diagonal[{a}]={} must be PSD (von-Mises \
+                     curvature clamped to its positive part)",
+                    row.htt[[a, a]]
+                );
+            }
+        }
     }
 
     /// `snapshot_mutable_state` / `restore_mutable_state` (the in-place
