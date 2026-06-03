@@ -33,21 +33,24 @@ class _FakeRustModule:
     def sae_manifold_fit_minimal(
         self,
         z,
-        k_atoms,
         atom_basis,
         atom_dim,
-        assignment_kind,
         alpha,
         tau,
         learnable_alpha,
+        assignment_kind,
+        *,
         sparsity_strength,
         smoothness,
         max_iter,
         learning_rate,
         random_state,
         top_k,
-        *,
         gumbel_schedule=None,
+        analytic_penalties=None,
+        initial_logits=None,
+        initial_coords=None,
+        jumprelu_threshold=0.0,
     ):
         assert assignment_kind == "ibp_map"
         # Production Rust iterates internally; emulate per-iteration basis
@@ -60,7 +63,7 @@ class _FakeRustModule:
             t = coords_seed + 0.07 * float(step)
             phi, _jet, _pen = self.periodic_basis_with_jet(t, n_harmonics=2)
             self.basis_snapshots.append(np.array(phi, copy=True))
-        K = int(k_atoms)
+        K = len(atom_basis)
         logits = np.full((n, K), 0.1, dtype=float)
         # Final coordinates: nonzero so the test's `np.linalg.norm > 0` holds.
         coords = np.full((K, n, max(int(d) for d in atom_dim)), 0.1, dtype=float)

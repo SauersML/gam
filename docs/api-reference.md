@@ -365,6 +365,55 @@ topical guides for narrative explanations.
       show_root_heading: true
       heading_level: 3
 
+## Manifold SAE
+
+See the [Manifold SAE dictionary guide](manifold-sae.md) for the narrative.
+
+::: gamfit.sae_manifold_fit
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.ManifoldSAE
+    options:
+      show_root_heading: true
+      heading_level: 3
+      members_order: source
+      filters:
+        - "!^_"
+        - "^__init__$"
+        - "^__repr__$"
+
+::: gamfit.SaeManifoldAtomFit
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.SaeManifoldFitResult
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.GumbelTemperatureSchedule
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gumbel_geometric_schedule
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gumbel_linear_schedule
+    options:
+      show_root_heading: true
+      heading_level: 3
+
+::: gamfit.gumbel_reciprocal_iter_schedule
+    options:
+      show_root_heading: true
+      heading_level: 3
+
 ## Response geometry
 
 ::: gamfit.ResponseGeometryModel

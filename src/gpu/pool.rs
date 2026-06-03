@@ -208,12 +208,24 @@ pub fn scatter_batched<T: Send>(
     })
 }
 
-// Non-linux builds have no CUDA contexts to bind and therefore expose no
-// `scatter_batched`. Every caller is already gated to `#[cfg(target_os =
-// "linux")]` (the only `cuda_context_for` and the only `GpuRuntime` capable of
-// returning `Some` live there), so the previous non-linux stub returning `None`
-// was never reached and only existed to satisfy a cross-platform `pub use`.
-// `crate::gpu` now re-exports `scatter_batched` only on linux.
+// Non-linux builds have no CUDA contexts to bind, so there is no device tiling to
+// perform. Some callers (e.g. the SAE decoder-Gram and S·B batched paths) invoke
+// `scatter_batched` unconditionally and rely on it existing on every target, so
+// provide a real cross-platform implementation: run the whole batch as a single
+// CPU tile on the calling thread. The closure's per-item `try_fast_*` shims fall
+// back to CPU when no device is present, so a device-free run still produces
+// correct results, and the caller's `match` takes the same `Some`/`None` paths it
+// would on Linux.
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn scatter_batched<T: Send>(
+    rt: &GpuRuntime,
+    items: &mut [T],
+    f: impl Fn(usize, &mut [T]) -> Option<()> + Sync,
+) -> Option<()> {
+    let ordinal = rt.device_ordinals().first().copied().unwrap_or(0);
+    f(ordinal, items)
+}
 
 #[cfg(test)]
 mod tests {

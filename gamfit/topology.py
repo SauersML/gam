@@ -91,9 +91,16 @@ def Circle(
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Closed one-dimensional loop for angular scalar inputs.
+
     Use for phase, hue, time-of-day, or other periodic coordinates shaped
     like ``(N,)`` or one column. Set ``output_dim`` above one for a closed
     curve embedded in a higher-dimensional response.
+
+    Returns
+    -------
+    Smooth
+        ``PeriodicSplineCurve`` descriptor suitable for
+        :func:`gamfit.select_topology` candidates or ``smooths=`` mappings.
     """
     return _make_topology("circle", name=name, n_knots=n_knots, degree=degree, penalty_order=penalty_order, output_dim=output_dim, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
 
@@ -107,8 +114,14 @@ def Cylinder(
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Tensor topology with one periodic axis and one open axis.
+
     Use when inputs are shaped ``(N, 2)`` and the first column wraps while
     the second remains Euclidean, such as angle by height or season by trend.
+
+    Returns
+    -------
+    Smooth
+        ``TensorBSpline`` descriptor with periodicity ``(True, False)``.
     """
     return _make_topology("cylinder", name=name, n_knots=n_knots, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
 
@@ -122,8 +135,14 @@ def Torus(
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Tensor topology with two periodic axes.
+
     Use when inputs are shaped ``(N, 2)`` and both columns wrap, such as
     phase by phase or longitude by time-of-day.
+
+    Returns
+    -------
+    Smooth
+        ``TensorBSpline`` descriptor with periodicity ``(True, True)``.
     """
     return _make_topology("torus", name=name, n_knots=n_knots, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
 
@@ -141,8 +160,19 @@ def Sphere(
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Spherical topology for latitude/longitude style inputs.
+
     Use for directions on ``S^2`` represented as ``(N, 2)`` coordinates.
     ``dim`` remains part of the public signature but must be ``2``.
+
+    Returns
+    -------
+    Smooth
+        Spherical smooth descriptor.
+
+    Raises
+    ------
+    ValueError
+        If ``dim`` is not ``2``.
     """
     return _make_topology("sphere", name=name, n_knots=n_knots, dim=dim, penalty_order=penalty_order, kernel=kernel, radians=radians, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)
 
@@ -160,8 +190,14 @@ def EuclideanPatch(
     shape_constraint: ShapeConstraintLiteral | None = None,
 ) -> Smooth:
     """Open Euclidean baseline with no periodic axes.
+
     Use for inputs shaped ``(N, d)`` when no closed topology is assumed.
     For ``d > 1``, pass explicit ``centers``; ``None`` is forwarded so the
     underlying spec reports the required-center error.
+
+    Returns
+    -------
+    Smooth
+        Duchon smooth descriptor marked with the requested Euclidean dimension.
     """
     return _make_topology("euclidean_patch", d=d, name=name, n_centers=n_centers, centers=centers, m=m, length_scale=length_scale, by=by, double_penalty=double_penalty, shape_constraint=shape_constraint)

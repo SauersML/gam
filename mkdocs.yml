@@ -118,6 +118,7 @@ nav:
     - Difference smooths: difference-smooths.md
     - Families and link functions: families-and-links.md
     - Manifold smooths gallery: manifold-smooths.md
+    - Manifold SAE dictionary: manifold-sae.md
     - Survival models: survival.md
     - Marginal-slope models: marginal-slope.md
     - Location-scale models: location-scale.md

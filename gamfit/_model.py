@@ -35,6 +35,19 @@ from ._tables import normalize_table, response_column_name, restore_output_table
 
 
 class Model:
+    """Fitted scalar GAM/GLM model shell.
+
+    Instances are returned by :func:`gamfit.fit`, :func:`gamfit.fit_array`,
+    and :func:`gamfit.loads` for scalar-response fits. The serialized Rust
+    model payload is the source of truth; Python methods marshal table/array
+    inputs into the Rust extension and shape the returned predictions,
+    summaries, diagnostics, samples, and deployment extensions.
+
+    Use :meth:`predict` for named table inputs, :meth:`predict_array` only for
+    models fitted from positional arrays, :meth:`summary` for typed fit
+    metadata, and :meth:`save` / :meth:`dumps` for persistence.
+    """
+
     __slots__ = ("_model_bytes", "_training_table_kind")
 
     def __init__(self, *, _model_bytes: bytes, _training_table_kind: str | None = None) -> None:

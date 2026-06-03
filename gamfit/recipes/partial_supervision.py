@@ -59,7 +59,7 @@ class PartialSupervisionFit:
     warnings : list[str]
         Identifiability-theorem precondition issues from
         ``gamfit.identifiability.check`` (empty list when every
-        applicable theorem passed; absent when the check was disabled).
+        applicable theorem passed or when the check was disabled).
     report : IdentifiabilityReport | None
         Structured identifiability report. ``None`` when the check was
         disabled by passing ``check_identifiability=False``.
@@ -87,6 +87,18 @@ class PartialSupervisionFit:
         right-multiplied by ``map_R`` / ``map_A``; for ``anchor`` the
         affine map is applied. The free slice is orthogonalized against
         the new supervised slice when a free constraint is configured.
+
+        Returns
+        -------
+        ndarray
+            Concatenated supervised and free latent block.
+
+        Raises
+        ------
+        ValueError
+            If ``X_new`` is not 2D or its width does not equal ``T_dim``.
+        RuntimeError
+            If the fitted map needed by ``sup_method`` is missing.
         """
         X = np.ascontiguousarray(np.asarray(X_new, dtype=np.float64))
         if X.ndim != 2:
@@ -193,6 +205,17 @@ class PartialSupervisionRecipe:
             Initial latent block. Required when ``X.shape[1] < T_dim``.
         check_identifiability : bool, default True
             Run ``gamfit.identifiability.check`` on the result.
+
+        Returns
+        -------
+        PartialSupervisionFit
+            Aligned supervised/free latent blocks and fitted gauge maps.
+
+        Raises
+        ------
+        ValueError
+            If shapes are inconsistent or an initializer is required but not
+            supplied.
         """
         X = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
         if X.ndim != 2:
@@ -313,6 +336,17 @@ def partial_supervision(
     >>> fit = recipe.fit(rng.standard_normal((200, 8)))
     >>> fit.T_supervised.shape, fit.T_free.shape
     ((200, 3), (200, 3))
+
+    Returns
+    -------
+    PartialSupervisionRecipe
+        Recipe object; call ``.fit(X, T_init=None)`` to run the Rust solve.
+
+    Raises
+    ------
+    ValueError
+        Raised during recipe construction for invalid dimensions, methods, or
+        auxiliary array shape.
     """
     return PartialSupervisionRecipe(
         T_dim=T_dim,

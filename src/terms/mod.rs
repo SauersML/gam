@@ -25,10 +25,10 @@ pub mod torch_dispatch;
 
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp, AnalyticPenaltyRegistry,
-    BlockOrthogonalityPenalty, BlockSparsityPenalty, DifferenceOpKind, FrozenAnalyticPenaltyOp,
-    IBPAssignmentPenalty, IsometryDuchonRadialSource, IsometryPenalty, IsometryReference,
-    IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty, MonotonicityPenalty,
-    NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
+    BlockOrthogonalityPenalty, BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind,
+    FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IsometryDuchonRadialSource, IsometryPenalty,
+    IsometryReference, IvaeRidgeMeanGauge, JumpReLUPenalty, MechanismSparsityPenalty,
+    MonotonicityPenalty, NestedPrefixPenalty, NuclearNormPenalty, OrthogonalityPenalty,
     ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier, PsiSlice,
     RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
     SoftmaxAssignmentSparsityPenalty, SparsityKind, SparsityPenalty, TopKActivationPenalty,

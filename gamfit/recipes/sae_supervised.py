@@ -1,4 +1,4 @@
-"""SAE + supervised head recipe.
+"""SAE + supervised-head recipe.
 
 `sae_supervised(X, Y, supervised_mask, ...)` is pure orchestration:
 
@@ -7,18 +7,19 @@
 2. Extract the per-row latent assignments produced by that kernel.
 3. Fit a GLM head on the supervised slice of those latents via
    ``gamfit.fit`` against ``Y[supervised_mask]``.
-4. Return a uniform :class:`SaeSupervisedFit` result with ``.model``,
-   ``.report()``, and ``.predict(X)`` semantics.
+4. Return a uniform :class:`SaeSupervisedFit` result with ``.sae``,
+   ``.model``, ``.report()``, and ``.predict(X)`` semantics.
 
 Every numerical step delegates to a Rust kernel: SAE fit, R² scoring,
 GLM solve, prediction. This module only sequences those calls and
 shapes the inputs / outputs. No new math lives here.
 
-Out-of-sample prediction on genuinely new ``X`` is fully supported
-(issue #357): the Rust OOS predict path now returns the converged
-per-token assignments, which ``predict()`` feeds into the GLM head via
-:meth:`ManifoldSAE.encode`. Prediction on the original training ``X``
-reuses the cached fit assignments without re-solving.
+Out-of-sample prediction on genuinely new ``X`` is fully supported: the Rust
+OOS predict path returns converged per-token assignments, which ``predict()``
+feeds into the GLM head via :meth:`ManifoldSAE.encode`. The underlying
+:class:`ManifoldSAE` remains available as ``.sae`` for assignment diagnostics,
+per-atom decoder covariances, and posterior shape bands when the Rust fit
+produced those fields.
 """
 
 from __future__ import annotations
@@ -46,7 +47,9 @@ class SaeSupervisedFit:
     Attributes
     ----------
     sae : ManifoldSAE
-        Manifold SAE fit on the full ``X``. Owns the encoder / decoder.
+        Manifold SAE fit on the full ``X``. Owns the encoder / decoder,
+        per-row ``assignments``, per-atom fits, and any decoder-covariance /
+        shape-band fields produced by ``sae_manifold_fit``.
     model : gamfit.Model
         GLM head fit on ``(latents[supervised_mask], Y[supervised_mask])``.
     supervised_mask : (N,) bool ndarray
@@ -72,8 +75,8 @@ class SaeSupervisedFit:
     def report(self) -> dict[str, Any]:
         """Combined recipe-level summary.
 
-        Returns the SAE summary, the GLM head summary, and the per-row
-        counts. All numbers come from the underlying Rust kernels.
+        Returns the SAE summary, the GLM head summary, and row counts. All fit
+        statistics come from the underlying SAE and GAM/GLM objects.
         """
         return {
             "recipe": "sae_supervised",
@@ -89,13 +92,20 @@ class SaeSupervisedFit:
     def predict(self, X: np.ndarray) -> np.ndarray:
         """Predict the response for ``X``.
 
-        On the original training ``X`` (matched by shape + bit-equality
-        against the SAE's stored training data) the cached fit assignments
-        are reused. On genuinely new ``X`` the SAE's frozen-decoder OOS
-        solve recomputes the per-token assignments via
-        :meth:`ManifoldSAE.encode` (Rust kernel ``sae_manifold_predict_oos``,
-        issue #357); those latents are fed straight into the GLM head. No
-        Python-side re-derivation of the SAE encoder.
+        The SAE's frozen-decoder encoder computes an ``(N, K)`` assignment
+        matrix for ``X`` via :meth:`ManifoldSAE.encode`; those assignment
+        columns are fed straight into the fitted GAM/GLM head. No Python-side
+        re-derivation of the SAE encoder is performed.
+
+        Returns
+        -------
+        ndarray
+            Response predictions from the supervised head.
+
+        Raises
+        ------
+        ValueError
+            If ``X`` is not a 2D numeric matrix.
         """
         X_arr = np.asarray(X, dtype=np.float64)
         if X_arr.ndim != 2:
@@ -223,7 +233,16 @@ def sae_supervised(
     Returns
     -------
     SaeSupervisedFit
-        Uniform recipe result with ``.model``, ``.report()``, ``.predict(X)``.
+        Uniform recipe result with ``.sae``, ``.model``, ``.report()``, and
+        ``.predict(X)``. Inspect ``fit.sae.assignments`` for the learned
+        assignment matrix and ``fit.sae.atoms[i].decoder_covariance`` /
+        ``fit.sae.shape_band(i)`` for per-atom shape uncertainty when present.
+
+    Raises
+    ------
+    ValueError
+        If input shapes are inconsistent, no supervised rows are selected, or
+        ``K`` is outside the accepted range for the SAE fit.
     """
     X_arr = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
     if X_arr.ndim != 2:

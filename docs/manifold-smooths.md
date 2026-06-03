@@ -102,7 +102,9 @@ radial spike, fit via `gamfit.fit` directly) is in
 closed-form SAE manifold primitive. Atom *i* is a 1-D parametric curve in
 ambient `R^D`, parameterized by a manifold point and a decoder block; a shared
 encoder produces per-atom on-manifold coordinates and amplitudes from each
-input batch.
+input batch. The closed-form primitive itself — the objective, the typed
+topologies, posterior shape bands, and coordinate ranges — is documented in
+the [Manifold SAE dictionary guide](manifold-sae.md).
 
 ```python
 import torch
