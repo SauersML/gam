@@ -1873,6 +1873,151 @@ impl SaeManifoldAtom {
             }
         }
     }
+
+    /// Recompute the intrinsic (arc-length) roughness Gram
+    /// [`Self::smooth_penalty`] from [`Self::smooth_penalty_raw`], the current
+    /// basis Jacobian, and the current decoder coefficients (issue #673).
+    ///
+    /// The raw penalty `0.5·λ·tr(BᵀS B)` measures roughness per unit of the raw
+    /// latent coordinate `t`, so it is *not* invariant under reparameterizing
+    /// `t` — and the model evidence that ranks an atom's topology (circle vs
+    /// line) inherits that gauge dependence. The decoder curve is
+    /// `g(t) = Φ(t) B` and its pulled-back metric is the scalar squared speed
+    /// `m(t) = ‖g'(t)‖² = ‖J(t)‖²` with `J(t) = Φ'(t) B` (the decoder
+    /// Jacobian, [`Self::fill_decoded_derivative_row`]). The arc-length
+    /// roughness of an order-`r` operator reweights the raw-`t` derivative
+    /// energy density by `m^{½−r}` (`= m^{−3/2}` for the standard
+    /// second-derivative penalty), which removes the gauge dependence.
+    ///
+    /// Realised as a per-coefficient symmetric congruence
+    /// `S̃ = W^{½} S W^{½}`, `W = diag(w_μ)`, `w_μ = m̄_μ^{β}`, `β = ½ − r`,
+    /// where `m̄_μ` is the basis-activation-weighted average squared speed
+    /// localised to coefficient `μ`,
+    /// `m̄_μ = (Σ_n Φ_μ(t_n)² m_n) / Σ_n Φ_μ(t_n)²`, `m_n = ‖J(t_n)‖²`. The
+    /// congruence keeps `S̃` symmetric PSD with the same rank as `S` (Sylvester
+    /// inertia), so the Kronecker Hessian `S̃ ⊗ I_p` and the REML
+    /// `rank(S)`-Occam term are structurally unchanged; only the metric-aware
+    /// log-det / quadratic value move, which is exactly the gauge correction.
+    ///
+    /// The metric weight is frozen at the current `B` (lagged-diffusivity /
+    /// IRLS surrogate): within one inner solve the penalty stays a quadratic
+    /// Gram form, and refreshing `W` between assemblies makes the *converged*
+    /// penalty the true arc-length roughness. Constant-speed atoms (the
+    /// periodic sin/cos basis, `m̄_μ ≡ c`) get `S̃ = c^β S`, a uniform rescale
+    /// that leaves relative roughness — the only thing the topology comparison
+    /// reads — unchanged, so periodic atoms are unaffected.
+    ///
+    /// Conservative scope: the scalar-speed reweighting is the genuine
+    /// arc-length normalisation only for a 1-D latent (the circle-vs-line case
+    /// the issue is about). For `latent_dim != 1`, or a degenerate (empty/zero)
+    /// raw Gram, `S̃ = S` is left untouched.
+    pub fn refresh_intrinsic_smooth_penalty(&mut self) {
+        let m = self.basis_size();
+        // No reweighting when there is no penalty operator order to invert into
+        // arc length, or for higher-dim latents where the metric is a matrix
+        // (det(g) volume reweighting is deferred — see scope note above).
+        if m == 0 || self.smooth_penalty_order == 0 || self.latent_dim != 1 {
+            self.smooth_penalty.assign(&self.smooth_penalty_raw);
+            return;
+        }
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let beta = 0.5 - self.smooth_penalty_order as f64;
+
+        // Per-sample squared speed m_n = ‖J(t_n)‖², J(t_n) = Φ'(t_n) B (axis 0,
+        // the single latent axis), and the basis-activation accumulators
+        // act_μ = Σ_n Φ_μ(t_n)² and num_μ = Σ_n Φ_μ(t_n)² m_n.
+        let mut act = vec![0.0_f64; m];
+        let mut num = vec![0.0_f64; m];
+        let mut deriv = vec![0.0_f64; p];
+        for row in 0..n {
+            self.fill_decoded_derivative_row(row, 0, &mut deriv);
+            let mut speed_sq = 0.0_f64;
+            for &d in deriv.iter() {
+                speed_sq += d * d;
+            }
+            for col in 0..m {
+                let phi = self.basis_values[[row, col]];
+                let w = phi * phi;
+                if w == 0.0 {
+                    continue;
+                }
+                act[col] += w;
+                num[col] += w * speed_sq;
+            }
+        }
+
+        // Representative squared speed per coefficient. Degeneracy floors (zero
+        // total activation, or zero/near-zero local speed) are set relative to
+        // the geometric-mean center of the positive speeds so a flat or
+        // unsupported coefficient inherits a typical speed rather than a
+        // singular negative power, and the reweighting stays scale-free.
+        let mut speeds = vec![0.0_f64; m];
+        let mut log_acc = 0.0_f64;
+        let mut log_cnt = 0usize;
+        for col in 0..m {
+            let s = if act[col] > 0.0 { num[col] / act[col] } else { 0.0 };
+            speeds[col] = s;
+            if s > 0.0 {
+                log_acc += s.ln();
+                log_cnt += 1;
+            }
+        }
+        // Geometric-mean center of the positive speeds (1.0 if none are
+        // positive — then every weight floors to the center and S̃ = S_raw).
+        let center = if log_cnt > 0 {
+            (log_acc / log_cnt as f64).exp()
+        } else {
+            1.0
+        };
+        let speed_floor = center * 1.0e-6;
+        let mut root_w = vec![0.0_f64; m];
+        for col in 0..m {
+            let s = speeds[col].max(speed_floor);
+            // w_μ = s^β; the congruence uses W^{½}, so store s^{β/2}.
+            root_w[col] = s.powf(0.5 * beta);
+        }
+
+        // S̃ = W^{½} S_raw W^{½}: scale row i and column j by root_w.
+        for i in 0..m {
+            let ri = root_w[i];
+            for j in 0..m {
+                self.smooth_penalty[[i, j]] = ri * self.smooth_penalty_raw[[i, j]] * root_w[j];
+            }
+        }
+    }
+}
+
+/// Null-space dimension of the symmetric PSD roughness Gram `S` — the order
+/// `r` of the difference / Duchon penalty it encodes (`nullity(S) = r`, since
+/// the operator annihilates exactly the degree-`<r` polynomials). Used once at
+/// atom construction to fix the arc-length reweighting exponent `β = ½ − r`.
+///
+/// Numerical null space: eigenvalues at or below `1e-9 · max_eig` (the same
+/// conventional relative spectral cutoff [`SaeManifoldTerm::symmetric_rank`]
+/// uses for `S`'s rank).
+fn smooth_penalty_nullity(s: &Array2<f64>) -> Result<usize, String> {
+    let m = s.ncols();
+    if m == 0 {
+        return Ok(0);
+    }
+    let mut sym = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..m {
+            sym[[i, j]] = 0.5 * (s[[i, j]] + s[[j, i]]);
+        }
+    }
+    let (evals, _evecs) = sym
+        .eigh(Side::Lower)
+        .map_err(|e| format!("smooth_penalty_nullity: eigh failed: {e}"))?;
+    let max_eig = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+    if !(max_eig > 0.0) {
+        // A zero (or negative-semidefinite) Gram carries no roughness; report a
+        // zero operator order so the reweighting is skipped.
+        return Ok(0);
+    }
+    let tol = 1.0e-9 * max_eig;
+    Ok(evals.iter().filter(|&&v| v <= tol).count())
 }
 
 /// Assignment prior/relaxation used by [`SaeAssignment`].
