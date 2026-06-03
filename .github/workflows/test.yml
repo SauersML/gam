@@ -117,6 +117,22 @@ jobs:
           # than `--jobs` on the cargo line so rust-cache, criterion etc.
           # also see the cap.
           CARGO_BUILD_JOBS: "2"
+          # rust-lld's internal `llvm::parallelFor` defaults to one worker
+          # per available CPU (4 on ubuntu-latest), and the dep closure
+          # above pushes each lld worker's working set into the multi-GB
+          # range. With `CARGO_BUILD_JOBS=2` we now have *two* concurrent
+          # links × four lld workers each = eight large allocations in
+          # flight, which is what has been re-OOMing lld with
+          # `collect2: fatal error: ld terminated with signal 7 [Bus error]`
+          # at `llvm::parallelFor` (visible in the lld crash backtrace).
+          # `RUSTFLAGS=-C link-arg=-Wl,--threads=1` pins each lld
+          # invocation to a single worker so the per-link peak drops back
+          # under the budget the `CARGO_BUILD_JOBS=2` cap was sized for,
+          # at the cost of a slightly slower individual link (the symbol
+          # / section work serialises). The cargo-level parallelism is
+          # untouched: two integration-test binaries still link
+          # concurrently, just without lld over-subscribing the runner.
+          RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
         run: |
           set -uo pipefail
           # cargo test captures stdout/stderr by default and only re-prints
