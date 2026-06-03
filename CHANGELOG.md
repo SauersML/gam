@@ -16,6 +16,17 @@ The two packages are versioned independently — `gam` tracks the Rust engine,
 `gamfit` the Python wheel — but released together. Each entry is headed with the
 git tag and both package versions.
 
+## v0.3.81 — gam 0.3.81 / gamfit 0.1.153 (2026-06-03)
+
+### Fixed
+
+- **SAE decoder-incoherence convergence checks now fail loudly.** The cross-atom
+  decoder cross-Gram test no longer uses `pytest.xfail`; failed or degenerate
+  multi-atom fits now surface as ordinary test failures.
+- **Python wheel publishing no longer carries stale gamfit references.** Updated
+  the lockfile and REML benchmark guidance to the current `gamfit` version so
+  the release ban gate accepts the wheel build.
+
 ## v0.3.80 — gam 0.3.80 / gamfit 0.1.152 (2026-06-03)
 
 ### Fixed
