@@ -50,7 +50,7 @@ dependencies = [
 Homepage = "https://github.com/SauersML/gam"
 Repository = "https://github.com/SauersML/gam"
 Issues = "https://github.com/SauersML/gam/issues"
-Changelog = "https://github.com/SauersML/gam/releases"
+Changelog = "https://gamfit.readthedocs.io/en/latest/changelog/"
 
 [project.optional-dependencies]
 test = [
