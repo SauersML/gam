@@ -667,6 +667,15 @@ def _suggest_kwarg_typo(fn: Any) -> Any:
 
 @overload
 def fit(
+    activations: Any,
+    formula: None = ...,
+    *,
+    config: Mapping[str, Any] | None = ...,
+) -> dict[str, Any]: ...
+
+
+@overload
+def fit(
     data: Any,
     formula: str,
     *,
@@ -751,7 +760,7 @@ def fit(
 
 def fit(
     data: Any,
-    formula: str,
+    formula: str | None = None,
     *,
     family: str = "auto",
     offset: str | None = None,
@@ -787,8 +796,12 @@ def fit(
     penalties: Sequence[Any] | None = None,
     smooths: Mapping[Any, Any] | None = None,
     config: dict[str, Any] | None = None,
-) -> Model | ResponseGeometryModel:
-    """Fit a GAM model from a formula and a tabular dataset.
+) -> Model | ResponseGeometryModel | dict[str, Any]:
+    """Fit a GAM model, or fit SAE activations when ``formula`` is omitted.
+
+    ``gamfit.fit(data, formula, ...)`` keeps the formula-first GAM API.
+    ``gamfit.fit(activations, config=...)`` dispatches to the SAE research-loop
+    API and returns typed atoms, coordinates, and trust-score hooks.
 
     Parameters
     ----------
@@ -992,6 +1005,55 @@ def fit(
         Rust engine errors are mapped into the typed gamfit exception
         hierarchy.
     """
+    if formula is None:
+        formula_only = {
+            "family": family,
+            "offset": offset,
+            "weights": weights,
+            "transformation_normal": transformation_normal,
+            "transformation_normal_stage1": transformation_normal_stage1,
+            "survival_likelihood": survival_likelihood,
+            "baseline_target": baseline_target,
+            "baseline_scale": baseline_scale,
+            "baseline_shape": baseline_shape,
+            "baseline_rate": baseline_rate,
+            "baseline_makeham": baseline_makeham,
+            "z_column": z_column,
+            "link": link,
+            "logslope_formula": logslope_formula,
+            "frailty_kind": frailty_kind,
+            "frailty_sd": frailty_sd,
+            "hazard_loading": hazard_loading,
+            "scale_dimensions": scale_dimensions,
+            "adaptive_regularization": adaptive_regularization,
+            "firth": firth,
+            "noise_formula": noise_formula,
+            "noise_offset": noise_offset,
+            "flexible_link": flexible_link,
+            "precision_hyperpriors": precision_hyperpriors,
+            "constraints": constraints,
+            "response_geometry": response_geometry,
+            "response_columns": response_columns,
+            "response_coordinates": response_coordinates,
+            "response_reference": response_reference,
+            "fisher_rao_w": fisher_rao_w,
+            "latents": latents,
+            "penalties": penalties,
+            "smooths": smooths,
+        }
+        active_formula_kwargs = [
+            name for name, value in formula_only.items()
+            if value is not None and not (name == "family" and value == "auto")
+        ]
+        if active_formula_kwargs:
+            raise TypeError(
+                "gamfit.fit requires formula='...' when formula-model kwargs are supplied: "
+                + ", ".join(active_formula_kwargs)
+            )
+        from ._sae_manifold import fit as _sae_research_fit
+
+        return _sae_research_fit(data, config=config)
+
     if constraints:
         # Alias normalization, smooth-term scanning, and the `shape=` rewrite all
         # live in Rust (`gam::terms::smooth::apply_shape_constraints_to_formula`);

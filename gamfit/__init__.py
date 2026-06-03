@@ -287,10 +287,21 @@ from ._sae_manifold import (
     ManifoldSAE,
     SaeManifoldAtomFit,
     SaeManifoldFitResult,
+    align,
+    featurize,
+    fit as sae_fit,
     gumbel_geometric_schedule,
     gumbel_linear_schedule,
     gumbel_reciprocal_iter_schedule,
+    plot,
     sae_manifold_fit,
+)
+from ._sae_viz import plot_atom, plot_fit
+from ._sae_trust import atom_trust_scores, sae_trust_diagnostics
+from ._sae_benchmark import (
+    format_markdown as format_sae_benchmark_markdown,
+    run_benchmark as sae_benchmark,
+    sweep as sweep_sae_benchmark,
 )
 from ._schema import SchemaCheck, SchemaIssue
 from .sindy import SINDyAtoms

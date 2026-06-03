@@ -14,6 +14,7 @@ from ._penalty_bridge import (
     GumbelTemperatureSchedule,
     validate_gumbel_schedule_fields as _validate_gumbel_schedule_fields,
 )
+from ._sae_trust import atom_trust_scores, coerce_sae_trust_diagnostics
 
 
 # Canonical assignment-kind aliases. Both `assignment=` and `assignment_prior=`
@@ -151,6 +152,7 @@ class ManifoldSAE:
     training_data: np.ndarray
     low_level: SaeManifoldFitResult
     low_level_logits: np.ndarray
+    diagnostics: dict[str, Any]
     _basis_kinds: list[str]
     _atom_dims: list[int]
     _basis_sizes: list[int]
@@ -202,6 +204,12 @@ class ManifoldSAE:
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments_z"], dtype=float)
         logits = np.asarray(payload["logits"], dtype=float)
+        diagnostics = coerce_sae_trust_diagnostics(
+            payload,
+            n_atoms=len(atoms),
+            assignments=assigns,
+            logits=logits,
+        )
         coords = [atom.coords.copy() for atom in atoms]
         score = float(payload["reml_score"])
         chosen_k = int(payload["chosen_k"]) if "chosen_k" in payload else len(atoms)
@@ -224,6 +232,7 @@ class ManifoldSAE:
             reconstruction_r2=float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
             training_mean=x.mean(axis=0), training_data=x.copy(), low_level=low,
             low_level_logits=logits,
+            diagnostics=diagnostics,
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
             alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
@@ -240,6 +249,16 @@ class ManifoldSAE:
         if k < 0 or k >= len(self.atoms):
             raise IndexError(f"atom={atom} out of range for K={len(self.atoms)} atoms")
         return k
+
+    def atom_trust(self, atom: int) -> float:
+        """Scalar trust score for one atom, in ``[0, 1]``."""
+        k = self._atom_index(atom)
+        return float(np.asarray(self.diagnostics["atom_trust"], dtype=float)[k])
+
+    def atom_diagnostics(self, atom: int) -> dict[str, Any]:
+        """All trust diagnostic components for one atom."""
+        k = self._atom_index(atom)
+        return dict(self.diagnostics["atoms"][k])
 
     def shape_uncertainty(self, atom: int = 0, *, n_sd: float = 1.96) -> dict[str, np.ndarray]:
         """Posterior ambient shape uncertainty for one atom.
@@ -491,6 +510,16 @@ class ManifoldSAE:
         payload = self._oos_payload(x)
         return [np.asarray(atom["on_atom_coords_t"], dtype=float) for atom in payload["atoms"]]
 
+    def featurize(self, X: Any) -> list[np.ndarray]:
+        """Infer out-of-sample SAE coordinates for ``X``.
+
+        This is the first-class research-loop spelling of the frozen-decoder
+        OOS coordinate solve. It returns one ``(N, d_k)`` coordinate array per
+        atom, in atom order, and reuses cached training coordinates when ``X``
+        is the training activation matrix.
+        """
+        return self.per_atom_latent_for(X)
+
     def get_decoder(self) -> list[np.ndarray]:
         return [b.copy() for b in self.decoder_blocks]
 
@@ -518,6 +547,10 @@ class ManifoldSAE:
             "alpha": float(self.alpha), "learnable_alpha": bool(self.learnable_alpha),
             "reml_score": float(self.reml_score), "reconstruction_r2": float(self.reconstruction_r2),
             "dispersion": float(self.dispersion),
+            "atom_trust": np.asarray(self.diagnostics["atom_trust"], dtype=float).tolist(),
+            "untyped_atoms": [
+                i for i, diag in enumerate(self.diagnostics["atoms"]) if bool(diag["untyped"])
+            ],
             "avg_active_atoms": float(avg_active), "mean_assignment_mass": float(mean_mass),
             "active_dims": [a.active_dim for a in self.atoms],
             "primitives": list(self.primitive_names),
@@ -559,6 +592,11 @@ class ManifoldSAE:
             "fitted": self.fitted.tolist(),
             "assignments": self.assignments.tolist(),
             "logits": self.low_level_logits.tolist(),
+            "diagnostics": {
+                "atom_trust": np.asarray(self.diagnostics["atom_trust"], dtype=float).tolist(),
+                "atoms": [dict(atom) for atom in self.diagnostics["atoms"]],
+                "level0_test": str(self.diagnostics["level0_test"]),
+            },
             "coords": [c.tolist() for c in self.coords],
             "decoder_blocks": [b.tolist() for b in self.decoder_blocks],
             "atoms": [
@@ -614,6 +652,12 @@ class ManifoldSAE:
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments"], dtype=float)
         logits = np.asarray(payload["logits"], dtype=float)
+        diagnostics = coerce_sae_trust_diagnostics(
+            payload,
+            n_atoms=len(atoms),
+            assignments=assigns,
+            logits=logits,
+        )
         coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
         decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
         score = float(payload["reml_score"])
@@ -643,6 +687,7 @@ class ManifoldSAE:
             training_data=np.asarray(payload["training_data"], dtype=float),
             low_level=low,
             low_level_logits=logits,
+            diagnostics=diagnostics,
             _basis_kinds=list(payload["basis_kinds"]),
             _atom_dims=[int(d) for d in payload["atom_dims"]],
             _basis_sizes=[int(s) for s in payload["basis_sizes"]],
@@ -686,11 +731,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      Z: Any = None, sparsity_weight: float = 1.0,
-                     gate_sparsity: str = "l1", scad_mcp_gamma: float | None = None,
+                     gate_sparsity: str = "scad", scad_mcp_gamma: float | None = None,
                      smoothness_weight: float = 1.0,
                      alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
-                     nuclear_norm_weight: float = 0.0, nuclear_norm_max_rank: int | None = None,
+                     nuclear_norm_weight: float = 1.0, nuclear_norm_max_rank: int | None = None,
                      decoder_incoherence_weight: float = 1.0,
                      top_k: int | None = None, t_init: Any = None, a_init: Any = None,
                      **kwargs: Any) -> ManifoldSAE:
@@ -748,10 +793,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Non-negative assignment sparsity strength. Alias kwarg:
         ``sparsity_strength``.
     gate_sparsity
-        Gate sparsity penalty family. ``"l1"`` keeps the assignment-prior
-        sparsity path. ``"scad"`` and ``"mcp"`` emit the SAE row-block
-        ``ScadMcpPenalty`` on the ``"t"`` latent block with
-        ``weight=sparsity_weight``.
+        Gate sparsity penalty family. The default ``"scad"`` enables adaptive
+        non-convex sparsity for the recommended research objective. ``"l1"``
+        keeps the historical assignment-prior sparsity path. ``"scad"`` and
+        ``"mcp"`` emit the SAE row-block ``ScadMcpPenalty`` on the ``"t"``
+        latent block with ``weight=sparsity_weight``.
     scad_mcp_gamma
         Optional SCAD/MCP concavity parameter. Defaults are SCAD ``3.7`` and
         MCP ``2.5``. SCAD requires ``gamma > 2``; MCP requires ``gamma > 1``.
@@ -775,7 +821,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Requires ``max(d_atom) >= 2`` and splits coordinate axes into singleton
         orthogonality groups.
     nuclear_norm_weight
-        Weight for decoder embedding-rank selection (#672). A positive value
+        Weight for decoder embedding-rank selection (#672). It is on by
+        default (``1.0``) for the recommended research objective. A positive value
         emits ``NuclearNormPenalty`` on each atom's ``(M_k, p)`` decoder matrix
         and shrinks its singular spectrum.
     nuclear_norm_max_rank
@@ -1139,17 +1186,17 @@ def _build_analytic_penalties_payload(
     *,
     isometry_weight: float,
     ard_per_atom: bool,
-    gate_sparsity: str,
-    sparsity_weight: float,
-    scad_mcp_gamma: float,
     decoder_feature_sparsity_groups: list[list[int]] | None,
     block_orthogonality_weight: float,
-    nuclear_norm_weight: float,
-    nuclear_norm_max_rank: int | None,
-    decoder_incoherence_weight: float,
-    k_atoms: int,
     d_max: int,
     p_out: int,
+    gate_sparsity: str = "l1",
+    sparsity_weight: float = 0.0,
+    scad_mcp_gamma: float = 3.7,
+    nuclear_norm_weight: float = 0.0,
+    nuclear_norm_max_rank: int | None = None,
+    decoder_incoherence_weight: float = 0.0,
+    k_atoms: int = 1,
 ) -> str | None:
     """Translate the SAE regularizer knobs into the analytic-penalty JSON
     payload consumed by ``sae_manifold_fit_minimal``.
@@ -1382,6 +1429,121 @@ def _schedule_tau_start(schedule: Any, default: float) -> float:
     return default if payload is None else float(payload["tau_start"])
 
 
+_LAST_RESEARCH_LOOP_MODEL: ManifoldSAE | None = None
+
+
+def _default_research_k(n_obs: int) -> int:
+    """Choose a conservative atom count for ``fit(activations)``."""
+    return max(1, min(int(n_obs) - 1, 8, max(2, int(np.sqrt(max(1, int(n_obs)))))))
+
+
+def _trust_scores(model: ManifoldSAE, activations: np.ndarray | None = None) -> dict[str, Any]:
+    """Per-row and per-atom trust scores derived from atom diagnostics."""
+    x = model.training_data if activations is None else _as_2d_float(activations, "activations")
+    n_rows = int(x.shape[0])
+    atom_trust = atom_trust_scores(model.diagnostics)
+    n_atoms = int(atom_trust.shape[0])
+    if activations is None or (
+        x.shape == model.training_data.shape and np.allclose(x, model.training_data)
+    ):
+        assignments = np.asarray(model.assignments, dtype=float)
+    else:
+        assignments = np.asarray(model.encode(x), dtype=float)
+    if assignments.shape != (n_rows, n_atoms):
+        raise ValueError(
+            "trust score assignments shape mismatch: "
+            f"expected {(n_rows, n_atoms)}, got {assignments.shape}"
+        )
+    weights = np.clip(assignments, 0.0, np.inf)
+    denom = weights.sum(axis=1)
+    normalized = np.divide(
+        weights,
+        denom[:, None],
+        out=np.zeros_like(weights, dtype=float),
+        where=denom[:, None] > 0.0,
+    )
+    per_atom = normalized * atom_trust[None, :]
+    return {
+        "row": per_atom.sum(axis=1),
+        "per_atom": per_atom,
+        "atom": atom_trust,
+        "diagnostics": model.diagnostics,
+    }
+
+
+def _research_fit_dict(model: ManifoldSAE, activations: np.ndarray) -> dict[str, Any]:
+    trust = _trust_scores(model, activations)
+    return {
+        "model": model,
+        "atoms": list(model.atoms),
+        "coordinates": [c.copy() for c in model.coords],
+        "assignments": model.assignments.copy(),
+        "trust": trust,
+        "trust_scores": trust["row"].copy(),
+        "summary": model.summary(),
+    }
+
+
+def fit(activations: Any, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Fit the recommended SAE-manifold research objective to activations.
+
+    Parameters
+    ----------
+    activations
+        Finite activation matrix ``(N, p)``. A vector is reshaped to ``(N, 1)``.
+    config
+        Optional keyword overrides forwarded to :func:`sae_manifold_fit`.
+        Historical kwargs remain valid; for example pass
+        ``{"gate_sparsity": "l1", "nuclear_norm_weight": 0.0}`` to recreate
+        the older toy objective.
+
+    Returns
+    -------
+    dict
+        ``{"model", "atoms", "coordinates", "assignments", "trust",
+        "trust_scores", "summary"}``. ``atoms`` contains typed
+        :class:`SaeManifoldAtomFit` objects, ``coordinates`` is one
+        ``(N, d_k)`` array per atom, and ``trust`` contains row, atom, and
+        assignment-weighted per-row/per-atom scores derived from the fit
+        diagnostics.
+    """
+    global _LAST_RESEARCH_LOOP_MODEL
+    x = _as_2d_float(activations, "activations")
+    cfg = {} if config is None else dict(config)
+    if "K" not in cfg and "n_atoms" not in cfg:
+        cfg["K"] = _default_research_k(x.shape[0])
+    model = sae_manifold_fit(x, **cfg)
+    _LAST_RESEARCH_LOOP_MODEL = model
+    return _research_fit_dict(model, x)
+
+
+def featurize(new_activations: Any) -> list[np.ndarray]:
+    """Infer coordinates for new activations with the most recent SAE fit.
+
+    This promotes the existing frozen-decoder out-of-sample coordinate solve
+    to a first-class research-loop function. It returns one ``(N, d_k)`` array
+    per atom in the most recent :func:`fit` result. For explicit model-scoped
+    use, call ``result["model"].featurize(new_activations)``.
+    """
+    if _LAST_RESEARCH_LOOP_MODEL is None:
+        raise RuntimeError("gamfit.featurize requires a prior gamfit.fit(activations, config=...) call")
+    return _LAST_RESEARCH_LOOP_MODEL.featurize(new_activations)
+
+
+def align(fit_a: Any, fit_b: Any) -> Any:
+    """Align two SAE research-loop fits by delegating to ``gamfit._alignment``."""
+    from . import _alignment
+
+    return _alignment.align(fit_a, fit_b)
+
+
+def plot(atom: Any, **kwargs: Any) -> Any:
+    """Plot SAE atoms by delegating to ``gamfit._sae_viz``."""
+    from . import _sae_viz
+
+    return _sae_viz.plot(atom, **kwargs)
+
+
 __all__ = ["GumbelTemperatureSchedule", "ManifoldSAE", "SaeManifoldAtomFit", "SaeManifoldFitResult",
            "gumbel_geometric_schedule", "gumbel_linear_schedule", "gumbel_reciprocal_iter_schedule",
-           "sae_manifold_fit"]
+           "align", "featurize", "fit", "plot", "sae_manifold_fit"]
