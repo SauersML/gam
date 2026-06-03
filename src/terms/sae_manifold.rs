@@ -314,6 +314,75 @@ impl SaeAtomBasisKind {
     }
 }
 
+/// Per-axis ARD coordinate prior, evaluated as a smooth energy in the latent
+/// coordinate `t` with precision `alpha = exp(log_ard)`.
+///
+/// On a *Euclidean* axis the prior is the usual Gaussian negative-log density
+/// `½·α·t²`, with gradient `α·t` and curvature `α`.
+///
+/// On a *periodic* axis (a `Circle` factor of period `P`) the Euclidean `½α t²`
+/// is geometrically ill-posed (it depends on the arbitrary choice of origin /
+/// branch cut, so a Newton step crossing the cut makes the loss jump by
+/// `½α P²` and breaks Armijo descent). We replace it with the von-Mises energy
+///
+/// ```text
+///   V(t) = (α / κ²) · (1 − cos(κ t)),   κ = 2π / P
+/// ```
+///
+/// which is the period-`P` periodic function whose Taylor expansion at the
+/// origin is `½ α t² + O(t⁴)` — so it carries the *same* precision `α`
+/// (curvature at the origin) as the Gaussian, matching the ARD interpretation,
+/// but is globally smooth and continuous across the cut (`cos(κ·P)=cos 2π=1`).
+/// Its derivatives are
+///
+/// ```text
+///   V'(t)  = (α / κ) · sin(κ t)
+///   V''(t) = α · cos(κ t)
+/// ```
+///
+/// The value, gradient, and curvature returned here all come from this single
+/// energy, so they are mutually FD-consistent and consistent with the Laplace
+/// `½ log|H|` term (whose `H_tt` diagonal is exactly `V''`).
+///
+/// `sq_equiv` is the Euclidean-equivalent `t²` such that `½·α·sq_equiv == V`,
+/// i.e. `sq_equiv = 2V/α = (2/κ²)(1−cos κt)`. It is what the
+/// Mackay/Fellner–Schall `α ← n / (Σ sq_equiv + tr H⁻¹)` fixed point must use so
+/// that the prior energy it implies stays consistent with `ard_value`.
+#[derive(Clone, Copy, Debug)]
+struct ArdAxisPrior {
+    value: f64,
+    grad: f64,
+    hess: f64,
+    sq_equiv: f64,
+}
+
+impl ArdAxisPrior {
+    /// Evaluate the per-axis prior at coordinate `t` with precision `alpha`.
+    /// `period == None` selects the Euclidean Gaussian; `Some(p)` selects the
+    /// von-Mises periodic energy with period `p`.
+    fn eval(alpha: f64, t: f64, period: Option<f64>) -> Self {
+        match period {
+            None => Self {
+                value: 0.5 * alpha * t * t,
+                grad: alpha * t,
+                hess: alpha,
+                sq_equiv: t * t,
+            },
+            Some(p) => {
+                let kappa = std::f64::consts::TAU / p;
+                let (sin, cos) = (kappa * t).sin_cos();
+                let one_minus_cos = 1.0 - cos;
+                Self {
+                    value: (alpha / (kappa * kappa)) * one_minus_cos,
+                    grad: (alpha / kappa) * sin,
+                    hess: alpha * cos,
+                    sq_equiv: (2.0 / (kappa * kappa)) * one_minus_cos,
+                }
+            }
+        }
+    }
+}
+
 pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String>;
 
@@ -3533,17 +3602,24 @@ impl SaeManifoldTerm {
                     rho.log_ard[atom_idx].len()
                 ));
             }
+            // Per-axis periodicity selects the smooth von-Mises energy on
+            // wrapped (Circle) axes and the Gaussian on Euclidean axes.
+            let periods = coord.effective_axis_periods();
             for axis in 0..d {
                 let log_alpha = rho.log_ard[atom_idx][axis];
                 let alpha = log_alpha.exp();
-                let mut sq = 0.0;
+                let period = periods[axis];
+                let mut energy = 0.0;
                 for row in 0..n {
                     let v = coord.row(row)[axis];
-                    sq += v * v;
+                    energy += ArdAxisPrior::eval(alpha, v, period).value;
                 }
-                // Negative log Gaussian prior for precision alpha:
-                // 0.5 * alpha * ||t||^2 - 0.5 * n * log(alpha).
-                acc += 0.5 * alpha * sq - 0.5 * (n as f64) * log_alpha;
+                // Negative-log prior for precision alpha. The data-dependent
+                // energy is the (Gaussian or von-Mises) coordinate prior; the
+                // `-0.5 n log alpha` normaliser is the precision log-partition,
+                // unchanged because the von-Mises energy matches the Gaussian
+                // curvature `alpha` at the origin (same leading normaliser).
+                acc += energy - 0.5 * (n as f64) * log_alpha;
             }
         }
         Ok(acc)
@@ -3808,6 +3884,15 @@ impl SaeManifoldTerm {
         // Dense full-support index `[0, k_atoms)`, used by the row loop when no
         // compact layout is engaged so the active-atom iteration is uniform.
         let all_atoms_index: Vec<usize> = (0..k_atoms).collect();
+        // Per-atom per-axis periodicity, hoisted out of the row loop. Selects
+        // the smooth von-Mises coordinate prior on wrapped (Circle) axes and
+        // the Gaussian prior on Euclidean axes; see `ArdAxisPrior`.
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|coord| coord.effective_axis_periods())
+            .collect();
         for row in 0..n {
             let assignments = self.assignment.try_assignments_row(row)?;
             // Reconstruction uses the row's active support: for the dense
@@ -3968,14 +4053,19 @@ impl SaeManifoldTerm {
                         ));
                     }
                     let row_t = coord.row(row);
+                    let periods = &ard_axis_periods[k];
                     for axis in 0..d {
                         // ARD on coords is a genuine per-row prior (each row
-                        // contributes 0.5·α·t_row²), so it is NOT minibatch-
-                        // scaled — the per-chunk row sums already reconstruct
-                        // the full ‖t‖² across a pass.
+                        // contributes the per-axis prior energy), so it is NOT
+                        // minibatch-scaled — the per-chunk row sums already
+                        // reconstruct the full coordinate prior across a pass.
+                        // Gradient and curvature come from the SAME energy as
+                        // `ard_value` (`ArdAxisPrior`), so they stay FD- and
+                        // Laplace-`½log|H|`-consistent on periodic axes.
                         let alpha = rho.log_ard[k][axis].exp();
-                        block.gt[starts[j] + axis] += alpha * row_t[axis];
-                        block.htt[[starts[j] + axis, starts[j] + axis]] += alpha;
+                        let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
+                        block.gt[starts[j] + axis] += prior.grad;
+                        block.htt[[starts[j] + axis, starts[j] + axis]] += prior.hess;
                     }
                 }
             } else {
@@ -3990,10 +4080,12 @@ impl SaeManifoldTerm {
                     }
                     let off = coord_offsets[atom_idx];
                     let row_t = coord.row(row);
+                    let periods = &ard_axis_periods[atom_idx];
                     for axis in 0..d {
                         let alpha = rho.log_ard[atom_idx][axis].exp();
-                        block.gt[off + axis] += alpha * row_t[axis];
-                        block.htt[[off + axis, off + axis]] += alpha;
+                        let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
+                        block.gt[off + axis] += prior.grad;
+                        block.htt[[off + axis, off + axis]] += prior.hess;
                     }
                 }
             }
@@ -4690,15 +4782,24 @@ impl SaeManifoldTerm {
     /// This is the data-fit sufficient statistic for the ARD precision update
     /// (the numerator-side `‖t‖²` of the deleted `α = n/‖t‖²` rule). Returned
     /// per atom as an `Array1` of length `d_k`.
+    ///
+    /// On a *periodic* (Circle) axis the relevant statistic is the von-Mises
+    /// energy-equivalent `Σ_i 2/α·V(t_i) = Σ_i (2/κ²)(1−cos κ t_i)` (independent
+    /// of α), so that `½·α·sumsq == Σ_i V(t_i)` matches `ard_value`. This keeps
+    /// the Mackay/Fellner–Schall fixed point `α ← n / (sumsq + tr H⁻¹)`
+    /// consistent with the actual periodic prior energy rather than the
+    /// origin-dependent raw `t²`.
     fn ard_coord_sumsq(&self) -> Vec<Array1<f64>> {
         let mut out = Vec::with_capacity(self.k_atoms());
         for coord in &self.assignment.coords {
             let d = coord.latent_dim();
+            let periods = coord.effective_axis_periods();
             let mut sq = Array1::<f64>::zeros(d);
             for row in 0..coord.n_obs() {
                 let t = coord.row(row);
                 for axis in 0..d {
-                    sq[axis] += t[axis] * t[axis];
+                    // `sq_equiv` is independent of `alpha`; pass 1.0.
+                    sq[axis] += ArdAxisPrior::eval(1.0, t[axis], periods[axis]).sq_equiv;
                 }
             }
             out.push(sq);
@@ -8395,6 +8496,172 @@ mod tests {
             jet[[row, 2, 0]] = -2.0 * std::f64::consts::PI * angle.sin();
         }
         (phi, jet)
+    }
+
+    // --- Periodic/topology ARD prior smoothness + value↔grad consistency ---
+
+    /// The periodic von-Mises ARD energy must be continuous (in value, gradient,
+    /// and curvature) as the latent coordinate crosses the period cut. The old
+    /// Euclidean `½α t²` jumped by `½α P²` here, breaking Armijo descent. With
+    /// period `P = 1` the cut is at `t = 1 ≡ 0`: evaluating just below and just
+    /// above must agree to O(eps), and the wrapped-to-`0` representative must
+    /// match the unwrapped value.
+    #[test]
+    fn ard_axis_prior_periodic_is_continuous_across_cut() {
+        let alpha = 2.3_f64;
+        let period = 1.0_f64;
+        let eps = 1.0e-6;
+        let below = ArdAxisPrior::eval(alpha, period - eps, Some(period));
+        let above = ArdAxisPrior::eval(alpha, period + eps, Some(period));
+        let at_zero = ArdAxisPrior::eval(alpha, 0.0, Some(period));
+        // Crossing the cut changes value/grad/hess by O(eps), NOT O(½αP²≈1.15
+        // for the old Euclidean prior). value and hess are even in (t-cut) so
+        // they match to O(eps²); grad is odd through 0, so it flips sign but its
+        // magnitude → 0 at the cut and the jump is O(eps) (continuous).
+        let cont_tol = 10.0 * alpha * eps; // O(eps) continuity bound
+        assert!((below.value - above.value).abs() < cont_tol);
+        assert!((below.grad - above.grad).abs() < cont_tol);
+        assert!((below.hess - above.hess).abs() < cont_tol);
+        // The gradient vanishes at the cut (no kink): both one-sided values are
+        // O(eps), unlike the old prior whose grad was α·P ≈ 2.3 just below.
+        assert!(below.grad.abs() < cont_tol);
+        assert!(above.grad.abs() < cont_tol);
+        // The unwrapped representative `period - eps` and the wrapped-near-0
+        // representative agree: the energy is a genuine function on the circle.
+        assert_abs_diff_eq!(below.value, at_zero.value, epsilon = 1.0e-9);
+        // At the origin: zero energy/gradient, curvature == alpha (the ARD
+        // precision interpretation is preserved).
+        assert_abs_diff_eq!(at_zero.value, 0.0, epsilon = 1.0e-12);
+        assert_abs_diff_eq!(at_zero.grad, 0.0, epsilon = 1.0e-12);
+        assert_abs_diff_eq!(at_zero.hess, alpha, epsilon = 1.0e-12);
+        // `sq_equiv` is alpha-independent so the Mackay/Fellner-Schall update is
+        // a clean function of the coordinates.
+        let sq_a = ArdAxisPrior::eval(1.0, 0.3, Some(period)).sq_equiv;
+        let sq_b = ArdAxisPrior::eval(5.0, 0.3, Some(period)).sq_equiv;
+        assert_abs_diff_eq!(sq_a, sq_b, epsilon = 1.0e-12);
+        // ½·α·sq_equiv reproduces the energy (consistency with ard_value).
+        let p = ArdAxisPrior::eval(alpha, 0.3, Some(period));
+        assert_abs_diff_eq!(0.5 * alpha * p.sq_equiv, p.value, epsilon = 1.0e-12);
+    }
+
+    /// The per-axis prior gradient must be the exact derivative of its value, on
+    /// BOTH the Euclidean (Gaussian) and periodic (von-Mises) axes. This is the
+    /// d=1 value↔grad FD agreement that the line search depends on.
+    #[test]
+    fn ard_axis_prior_value_grad_fd_consistent() {
+        let alpha = 1.7_f64;
+        let h = 1.0e-6;
+        for &period in &[None, Some(1.0_f64), Some(std::f64::consts::TAU)] {
+            // Sample several points, including near a periodic cut.
+            for &t in &[-0.37_f64, 0.02, 0.49, 0.83, 0.999, 1.4] {
+                let p = ArdAxisPrior::eval(alpha, t, period);
+                let vp = ArdAxisPrior::eval(alpha, t + h, period).value;
+                let vm = ArdAxisPrior::eval(alpha, t - h, period).value;
+                let fd_grad = (vp - vm) / (2.0 * h);
+                assert_abs_diff_eq!(p.grad, fd_grad, epsilon = 1.0e-5);
+                // Hessian == derivative of gradient.
+                let gp = ArdAxisPrior::eval(alpha, t + h, period).grad;
+                let gm = ArdAxisPrior::eval(alpha, t - h, period).grad;
+                let fd_hess = (gp - gm) / (2.0 * h);
+                assert_abs_diff_eq!(p.hess, fd_hess, epsilon = 1.0e-5);
+            }
+        }
+    }
+
+    /// The manifold → per-axis periodicity map must classify every topology's
+    /// d=1 (and product) axes correctly: line=non-periodic, circle=periodic,
+    /// torus=per-axis periodic, sphere chart=(non-periodic lat, periodic lon),
+    /// embedded sphere=non-periodic (smooth retraction, no cut).
+    #[test]
+    fn axis_periods_map_each_topology() {
+        assert_eq!(LatentManifold::Euclidean.axis_periods(), vec![None]);
+        assert_eq!(
+            LatentManifold::Circle { period: 1.0 }.axis_periods(),
+            vec![Some(1.0)]
+        );
+        // Torus (Product of Circles), each axis periodic.
+        let torus = LatentManifold::Product(vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ]);
+        assert_eq!(torus.axis_periods(), vec![Some(1.0), Some(1.0)]);
+        // Sphere lat/lon chart: lat is an Interval (non-periodic), lon a Circle.
+        let sphere_chart = LatentManifold::Product(vec![
+            LatentManifold::Interval { lo: -1.0, hi: 1.0 },
+            LatentManifold::Circle {
+                period: std::f64::consts::TAU,
+            },
+        ]);
+        assert_eq!(
+            sphere_chart.axis_periods(),
+            vec![None, Some(std::f64::consts::TAU)]
+        );
+        // Embedded sphere: smooth retraction, reported non-periodic per axis.
+        assert_eq!(
+            LatentManifold::Sphere { dim: 3 }.axis_periods(),
+            vec![None, None, None]
+        );
+    }
+
+    /// End-to-end: a periodic term's `ard_value` must be continuous as a latent
+    /// coordinate is stepped across the period cut via the (wrapping)
+    /// retraction. Reproduces the original non-smoothness bug at the term level:
+    /// the old Euclidean prior made `loss.ard` jump by ~½α·P² when a Newton step
+    /// crossed `t = 1 ≡ 0`.
+    #[test]
+    fn ard_value_continuous_across_periodic_cut_d1() {
+        // Single periodic atom, one row sitting just below the cut at t≈1.
+        let coords0 = array![[0.999_f64]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.2], [-0.3], [0.4]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((1, 1)),
+            vec![coords0],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.1_f64]];
+        // Large alpha makes the OLD bug's jump (~½·α·P²) enormous relative to
+        // the smooth O(step) change; with the von-Mises prior it stays tiny.
+        let alpha = 50.0_f64;
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![alpha.ln()]]);
+
+        let ard_before = term.loss(target.view(), &rho).unwrap().ard;
+        // Step the coordinate by +0.002 so it crosses the cut: 0.999 -> 1.001,
+        // which the Circle retraction wraps to 0.001.
+        let q = term.assignment.row_block_dim();
+        let beta_dim = term.beta_dim();
+        let mut delta_ext = Array1::<f64>::zeros(q);
+        // coord axis is the last entry of the row block (after the logit).
+        delta_ext[q - 1] = 0.002;
+        let delta_beta = Array1::<f64>::zeros(beta_dim);
+        term.apply_newton_step(delta_ext.view(), delta_beta.view(), 1.0)
+            .unwrap();
+        let wrapped = term.assignment.coords[0].row(0)[0];
+        // Confirm the step actually crossed and wrapped near 0.
+        assert!(
+            wrapped < 0.01,
+            "coordinate should have wrapped across the cut, got {wrapped}"
+        );
+        let ard_after = term.loss(target.view(), &rho).unwrap().ard;
+        // Smooth: a 0.002 step near the cut changes the ARD energy by a tiny
+        // amount. The OLD Euclidean prior would jump by ≈ ½·α·(1² - 0²) = 25.
+        assert!(
+            (ard_after - ard_before).abs() < 1.0e-2,
+            "periodic ARD jumped across the cut: before={ard_before}, after={ard_after}"
+        );
     }
 
     /// `snapshot_mutable_state` / `restore_mutable_state` (the in-place
