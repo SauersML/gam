@@ -98,7 +98,13 @@ markdown_extensions:
       pygments_lang_class: true
   - pymdownx.inlinehilite
   - pymdownx.keys
-  - pymdownx.snippets
+  - pymdownx.snippets:
+      # Resolve `--8<--` includes from the repo root (so docs/changelog.md can
+      # pull in the root CHANGELOG.md) and from docs/. check_paths makes a
+      # missing include fail `mkdocs build --strict`, so the wired changelog
+      # cannot silently break.
+      base_path: [".", "docs"]
+      check_paths: true
   - pymdownx.superfences
   - pymdownx.tabbed:
       alternate_style: true
@@ -136,3 +142,4 @@ nav:
     - Cookbook: cookbook.md
     - GPU acceleration: gpu_acceleration.md
     - REML scaling: reml_scaling.md
+  - Changelog: changelog.md

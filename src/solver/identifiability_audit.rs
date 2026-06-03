@@ -1623,8 +1623,31 @@ pub fn audit_identifiability_channel_aware(
             })
         });
 
-    let fatal =
-        (joint_rank_deficient && !gauge_resolves_rank_deficiency_ca) || hard_alias_pair.is_some();
+    // Channel-aware rank deficiency that the pairwise scan does NOT detect
+    // (`aliased_pairs.is_empty()`) is non-fatal: the leverage-based report
+    // threshold already classifies every cross-block alias worth flagging,
+    // and the leverage-based halt threshold (`hard_alias_pair`) catches the
+    // ones strong enough to break the inner solve regardless. Any remaining
+    // joint-rank shortfall comes from either
+    //   (a) per-block compile-time structural reductions — the compiler's
+    //       `compile_with_dual_metric` shrinks each block's kept basis when
+    //       its own column space has redundancies, and that reduction is
+    //       absorbed into `CompiledBlock::t_lw` (with the penalty pull-back
+    //       enlarging the structural nullspace correspondingly), so the
+    //       inner penalised Newton solves a well-posed system; or
+    //   (b) below-threshold weak aliases that the smoothing-parameter ridge
+    //       and the penalised line search already regularise away.
+    // Neither case warrants a hard refusal of the fit. The existing
+    // gauge-resolution path (cross-block alias above the report threshold,
+    // attributed drops, gauge_priority breaks the tie) is unchanged; only
+    // the pairwise-clean case is relaxed.  Perfect / near-perfect
+    // cross-block alias is still caught by `hard_alias_pair`.
+    let intra_block_only_ca = aliased_pairs.is_empty();
+
+    let fatal = (joint_rank_deficient
+        && !gauge_resolves_rank_deficiency_ca
+        && !intra_block_only_ca)
+        || hard_alias_pair.is_some();
 
     let fatal_detail = if fatal {
         let mut parts: Vec<String> = Vec::new();
@@ -1731,6 +1754,17 @@ pub fn audit_identifiability_channel_aware(
             " — gauge-attributed drops (channel-aware): {} column(s) attributed to \
              lower-priority blocks via gauge_priority ordering; canonical-gauge pipeline \
              will proceed with reduced specs",
+            dropped_columns.len(),
+        )
+    } else if joint_rank_deficient && intra_block_only_ca {
+        // Pairwise scan was clean: the rank deficiency lives inside a single
+        // block's own column space (or in a sub-threshold cross-block alias).
+        // Canonicalisation drops the attributed columns and the fit proceeds.
+        format!(
+            " — intra-block drops (channel-aware): {} column(s) attributed to \
+             single-block redundancy (no cross-block alias above leverage-based \
+             report threshold); canonical-gauge pipeline will proceed with \
+             reduced specs",
             dropped_columns.len(),
         )
     } else if !aliased_pairs.is_empty() {

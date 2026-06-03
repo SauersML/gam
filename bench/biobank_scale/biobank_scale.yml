@@ -26,15 +26,6 @@
       "max_centers": 32
     },
     {
-      "name": "rust_gamlss_jointpc_duchon60",
-      "dataset": "disease",
-      "backend": "rust_gam",
-      "family": "binomial",
-      "spatial_basis": "duchon",
-      "centers": 60,
-      "include_sigma": true
-    },
-    {
       "name": "rust_margslope_aniso_duchon16d_linkwiggle_scorewarp_fast",
       "dataset": "disease",
       "backend": "rust_gam",

@@ -5224,10 +5224,14 @@ impl UnifiedFitResult {
         self.inference.as_ref().map(|inf| inf.dispersion)
     }
 
-    /// Canonical residual dispersion `φ̂` that scales every coefficient
-    /// covariance via `Vb = H⁻¹·φ̂` (the same `φ̂` behind `predict()` standard
-    /// errors). For fixed-scale families (Poisson/Binomial) this is `1`; for
-    /// Gaussian it is `σ̂²`, for Gamma `1/shape`, etc.
+    /// Canonical residual dispersion `φ̂` — the response-level observation noise
+    /// (Gaussian `σ̂²`, Gamma `1/shape`, Beta `1/(1+φ)`, fixed-scale families
+    /// `1`). This is the predictive observation-noise scale used to widen
+    /// prediction *observation* intervals; it is NOT the coefficient-covariance
+    /// scale (see [`Self::coefficient_covariance_scale`]). For families whose
+    /// IRLS working weight already carries `1/φ`, the two differ: the
+    /// coefficient covariance is `H⁻¹` (scale `1`) while this dispersion stays
+    /// `1/shape` (#679).
     ///
     /// Unlike [`Self::dispersion`], which reads the cached `inference` block,
     /// this is computed from fields that always survive serialization
@@ -5253,6 +5257,31 @@ impl UnifiedFitResult {
             // No engine-level family (custom/GAMLSS paths): no scalar
             // response-scale dispersion is defined, so fall back to the
             // fixed-scale convention `φ = 1`.
+            None => 1.0,
+        }
+    }
+
+    /// Multiplier that turns the stored unscaled inverse penalized Hessian
+    /// `H⁻¹` into the reported coefficient covariance `Vb = H⁻¹·scale`.
+    ///
+    /// This is the deployment-time / serialized-model counterpart of
+    /// `GlmLikelihoodSpec::coefficient_covariance_scale`, used wherever the full
+    /// stored `beta_covariance()` is unavailable and `Vb` must be reconstructed
+    /// from the factorized Hessian (large-model predict path). It returns the
+    /// profiled residual variance `σ̂²` for the scale-free profiled Gaussian and
+    /// `1.0` for every family whose IRLS working weight already carries the
+    /// dispersion / full Fisher information (Gamma, Tweedie, Beta,
+    /// Negative-Binomial, Poisson, Binomial) — see #679. For custom/GAMLSS
+    /// paths with no engine-level family it falls back to `1.0`.
+    pub fn coefficient_covariance_scale(&self) -> f64 {
+        match &self.likelihood_family {
+            Some(spec) => {
+                let glm = GlmLikelihoodSpec {
+                    spec: spec.clone(),
+                    scale: self.likelihood_scale.clone(),
+                };
+                glm.coefficient_covariance_scale(self.standard_deviation * self.standard_deviation)
+            }
             None => 1.0,
         }
     }
