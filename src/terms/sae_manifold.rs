@@ -1668,10 +1668,10 @@ pub struct SaeManifoldAtom {
     /// [`Self::refresh_intrinsic_smooth_penalty`] (lagged-diffusivity: the
     /// metric weight is frozen within each inner Newton/evidence assembly and
     /// refreshed between them, so at convergence the penalty is the true
-    /// arc-length roughness). For constant-speed atoms (the periodic sin/cos
-    /// basis on `S¹`) the metric weight is uniform, so `S̃_k = c·S_k` and the
-    /// relative roughness — the only thing the topology comparison sees — is
-    /// unchanged.
+    /// arc-length roughness). The metric weight is centered (geometric mean 1),
+    /// so for constant-speed atoms (the periodic sin/cos basis on `S¹`) every
+    /// weight is exactly `1` and `S̃_k = S_k` — periodic atoms are untouched
+    /// and no overall magnitude leaks into the penalty.
     pub smooth_penalty: Array2<f64>,
     /// Canonical raw roughness Gram `S_k` in raw coefficient/`t` space (the
     /// finite-/cyclic-difference Reinsch Gram or the Duchon RKHS Gram). Never
@@ -1984,17 +1984,21 @@ impl SaeManifoldAtom {
         // speed rather than a singular negative power, and clamps any non-finite
         // ratio back to a finite weight.
         const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
+        const RELATIVE_SPEED_CEIL: f64 = 1.0e6;
         let mut root_w = vec![0.0_f64; m];
         for col in 0..m {
             // Normalised squared speed (ratio to the geometric-mean center),
-            // floored below and treated as the floor when non-finite.
+            // clamped to `[1e-6, 1e6]` so a vanishing-/diverging-speed
+            // coefficient is treated as a bounded fraction/multiple of the
+            // typical speed rather than a singular negative power, and any
+            // non-finite ratio (e.g. an overflowed speed) maps to the ceiling.
+            // The symmetric clamp keeps every weight finite and centered near 1
+            // so the REML numerical-rank eigencutoff cannot drift.
             let ratio = speeds[col] / center;
             let ratio = if ratio.is_finite() {
-                ratio.max(RELATIVE_SPEED_FLOOR)
+                ratio.clamp(RELATIVE_SPEED_FLOOR, RELATIVE_SPEED_CEIL)
             } else {
-                // inf/NaN ratio (e.g. an overflowed speed) → cap at 1/floor so
-                // its weight stays finite and the rank is preserved.
-                1.0 / RELATIVE_SPEED_FLOOR
+                RELATIVE_SPEED_CEIL
             };
             // w_μ = ratio^β; the congruence uses W^{½}, so store ratio^{β/2}.
             root_w[col] = ratio.powf(0.5 * beta);
@@ -9337,6 +9341,434 @@ mod tests {
             coord,
             decoder,
         }
+    }
+
+    /// Which manifold/basis a penalty-FD case runs on.
+    #[derive(Clone, Copy)]
+    enum SaePenCaseKind {
+        EuclideanD1,
+        PeriodicD1,
+        EuclideanD2,
+    }
+
+    /// Which analytic penalty a penalty-FD case exercises.
+    #[derive(Clone, Copy)]
+    enum SaePenKind {
+        Isometry,
+        Ard,
+        ScadMcp,
+        NuclearNorm,
+        DecoderIncoherence,
+    }
+
+    /// Single-atom SAE term on the requested manifold for the penalty-FD checks.
+    /// Mirrors `sae_fd_term` but exposes the analytic second jet the Isometry
+    /// penalty needs and allows a chosen latent dimension.
+    fn sae_pen_term(
+        kind: SaePenCaseKind,
+    ) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho, PsiSlice) {
+        let n_obs = 12usize;
+        let p_out = 3usize;
+        let (coords, latent_dim, atom): (Array2<f64>, usize, SaeManifoldAtom) = match kind {
+            SaePenCaseKind::PeriodicD1 => {
+                let mut coords = Array2::<f64>::zeros((n_obs, 1));
+                for row in 0..n_obs {
+                    let x = row as f64;
+                    coords[[row, 0]] = 0.11 + 0.037 * x + 0.004 * (1.3 * x).sin();
+                }
+                let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+                let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+                let n_basis = phi.ncols();
+                let atom = SaeManifoldAtom::new(
+                    "periodic_d1",
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    phi,
+                    jet,
+                    sae_fd_decoder(n_basis, p_out),
+                    Array2::<f64>::eye(n_basis),
+                )
+                .unwrap()
+                .with_basis_second_jet(evaluator);
+                (coords, 1, atom)
+            }
+            SaePenCaseKind::EuclideanD1 => {
+                let mut coords = Array2::<f64>::zeros((n_obs, 1));
+                for row in 0..n_obs {
+                    let x = row as f64;
+                    coords[[row, 0]] = -0.41 + 0.052 * x + 0.006 * (1.7 * x).cos();
+                }
+                let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2).unwrap());
+                let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+                let n_basis = phi.ncols();
+                let atom = SaeManifoldAtom::new(
+                    "euclidean_d1",
+                    SaeAtomBasisKind::EuclideanPatch,
+                    1,
+                    phi,
+                    jet,
+                    sae_fd_decoder(n_basis, p_out),
+                    Array2::<f64>::eye(n_basis),
+                )
+                .unwrap()
+                .with_basis_second_jet(evaluator);
+                (coords, 1, atom)
+            }
+            SaePenCaseKind::EuclideanD2 => {
+                let mut coords = Array2::<f64>::zeros((n_obs, 2));
+                for row in 0..n_obs {
+                    let x = row as f64;
+                    coords[[row, 0]] = -0.33 + 0.041 * x + 0.005 * (1.1 * x).cos();
+                    coords[[row, 1]] = 0.27 - 0.036 * x + 0.004 * (0.9 * x).sin();
+                }
+                let evaluator = Arc::new(EuclideanPatchEvaluator::new(2, 2).unwrap());
+                let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+                let n_basis = phi.ncols();
+                let atom = SaeManifoldAtom::new(
+                    "euclidean_d2",
+                    SaeAtomBasisKind::EuclideanPatch,
+                    2,
+                    phi,
+                    jet,
+                    sae_fd_decoder(n_basis, p_out),
+                    Array2::<f64>::eye(n_basis),
+                )
+                .unwrap()
+                .with_basis_second_jet(evaluator);
+                (coords, 2, atom)
+            }
+        };
+        let manifold = atom.basis_kind.latent_manifold(latent_dim);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n_obs, 1)),
+            vec![coords],
+            vec![manifold],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = sae_fd_target(n_obs, p_out);
+        // Suppress the built-in ARD / smoothness contributions so the registered
+        // analytic penalty is the only penalty beyond data-fit + assignment prior.
+        let log_ard = vec![Array1::from_elem(latent_dim, -30.0_f64)];
+        let rho = SaeManifoldRho::new(0.0, 1.0e-4_f64.ln(), log_ard);
+        let slice = PsiSlice {
+            range: 0..n_obs * latent_dim,
+            latent_dim: Some(latent_dim),
+        };
+        (term, target, rho, slice)
+    }
+
+    /// Two-atom K=2 SAE term for the DecoderIncoherence FD check. Both atoms are
+    /// d=1 euclidean patches so the β block is `[B_1 (M×p), B_2 (M×p)]`.
+    fn sae_pen_term_k2() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+        let n_obs = 12usize;
+        let p_out = 3usize;
+        let mut atoms = Vec::with_capacity(2);
+        let mut coord_blocks = Vec::with_capacity(2);
+        for atom_idx in 0..2usize {
+            let mut coords = Array2::<f64>::zeros((n_obs, 1));
+            for row in 0..n_obs {
+                let x = row as f64;
+                coords[[row, 0]] = if atom_idx == 0 {
+                    -0.41 + 0.052 * x + 0.006 * (1.7 * x).cos()
+                } else {
+                    0.18 + 0.039 * x + 0.005 * (1.1 * x).sin()
+                };
+            }
+            let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2).unwrap());
+            let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
+            let n_basis = phi.ncols();
+            let mut decoder = sae_fd_decoder(n_basis, p_out);
+            if atom_idx == 1 {
+                for basis in 0..n_basis {
+                    for out_col in 0..p_out {
+                        decoder[[basis, out_col]] += 0.07 * ((basis + out_col) as f64 + 1.0).cos();
+                    }
+                }
+            }
+            let atom = SaeManifoldAtom::new(
+                "euclidean_d1",
+                SaeAtomBasisKind::EuclideanPatch,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(n_basis),
+            )
+            .unwrap()
+            .with_basis_second_jet(evaluator);
+            atoms.push(atom);
+            coord_blocks.push(coords);
+        }
+        let manifold = LatentManifold::Euclidean;
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::from_elem((n_obs, 2), 0.2),
+            coord_blocks,
+            vec![manifold.clone(), manifold],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        let target = sae_fd_target(n_obs, p_out);
+        let log_ard = vec![Array1::from_elem(1, -30.0_f64), Array1::from_elem(1, -30.0_f64)];
+        let rho = SaeManifoldRho::new(0.0, 1.0e-4_f64.ln(), log_ard);
+        (term, target, rho)
+    }
+
+    /// Registry holding exactly one analytic penalty of the requested kind,
+    /// sized for `term`'s coord / β block.
+    fn sae_pen_registry(
+        pen: SaePenKind,
+        coord_slice: &PsiSlice,
+        n_obs: usize,
+        latent_dim: usize,
+        beta_len: usize,
+        p_out: usize,
+    ) -> AnalyticPenaltyRegistry {
+        use crate::terms::analytic_penalties::PenaltyConcavity;
+        use crate::terms::analytic_penalties::ScadMcpPenalty;
+        let mut registry = AnalyticPenaltyRegistry::new();
+        match pen {
+            SaePenKind::Isometry => {
+                let penalty = IsometryPenalty::new_euclidean(coord_slice.clone(), latent_dim);
+                registry.push(AnalyticPenaltyKind::Isometry(Arc::new(penalty)));
+            }
+            SaePenKind::Ard => {
+                let penalty = ARDPenalty::new(coord_slice.clone(), latent_dim);
+                registry.push(AnalyticPenaltyKind::Ard(Arc::new(penalty)));
+            }
+            SaePenKind::ScadMcp => {
+                let penalty = ScadMcpPenalty::new(
+                    coord_slice.clone(),
+                    0.5,
+                    n_obs,
+                    3.0,
+                    1.0e-4,
+                    PenaltyConcavity::Mcp,
+                    false,
+                )
+                .unwrap();
+                registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(penalty)));
+            }
+            SaePenKind::NuclearNorm => {
+                let slice = PsiSlice {
+                    range: 0..beta_len,
+                    latent_dim: Some(beta_len / p_out),
+                };
+                let penalty =
+                    NuclearNormPenalty::new(slice, 0.7, p_out, 1.0e-4, None, false).unwrap();
+                registry.push(AnalyticPenaltyKind::NuclearNorm(Arc::new(penalty)));
+            }
+            SaePenKind::DecoderIncoherence => {
+                let m_per = beta_len / (2 * p_out);
+                let slice = PsiSlice {
+                    range: 0..beta_len,
+                    latent_dim: Some(beta_len / p_out),
+                };
+                let penalty = DecoderIncoherencePenalty::new(
+                    slice,
+                    vec![m_per, m_per],
+                    p_out,
+                    Array2::<f64>::from_elem((2, 2), 0.5),
+                    0.6,
+                    false,
+                )
+                .unwrap();
+                registry.push(AnalyticPenaltyKind::DecoderIncoherence(Arc::new(penalty)));
+            }
+        }
+        registry
+    }
+
+    /// FD-check the assembled gradient (`gt` / `gb`) against central differences
+    /// of `penalized_objective_total` with the registry's single analytic penalty
+    /// ACTIVE. Softmax mode always assembles the dense uniform row layout, so atom
+    /// `atom_idx`'s axis `a` for row `r` lives at `sys.rows[r].gt[off + a]` with
+    /// `off = coord_offsets()[atom_idx]` (a per-atom column offset, not a row
+    /// offset); the row index is the plain observation row.
+    fn sae_pen_fd_check(
+        label: &str,
+        term: &SaeManifoldTerm,
+        target: &Array2<f64>,
+        rho: &SaeManifoldRho,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> SaeFdBlockReport {
+        let epsilon = 1.0e-6;
+        let base_obj = term
+            .penalized_objective_total(target.view(), rho, Some(registry), 1.0)
+            .unwrap();
+        assert!(base_obj.is_finite(), "{label}: base objective not finite");
+
+        let mut assembled = term.clone();
+        let sys = assembled
+            .assemble_arrow_schur(target.view(), rho, Some(registry))
+            .unwrap();
+
+        let mut coord = SaeFdWorst::new();
+        let coord_offsets = term.assignment.coord_offsets();
+        for atom_idx in 0..term.k_atoms() {
+            let off = coord_offsets[atom_idx];
+            let d = term.assignment.coords[atom_idx].latent_dim();
+            let base_flat = term.assignment.coords[atom_idx].as_flat().clone();
+            let n_atom = base_flat.len() / d;
+            for row in 0..n_atom {
+                for axis in 0..d {
+                    let lin = row * d + axis;
+                    let mut plus = term.clone();
+                    let mut flat_p = base_flat.clone();
+                    flat_p[lin] += epsilon;
+                    plus.assignment.coords[atom_idx].set_flat(flat_p.view());
+                    let coords_p = plus.assignment.coords[atom_idx].as_matrix();
+                    plus.atoms[atom_idx].refresh_basis(coords_p.view()).unwrap();
+                    let obj_p = plus
+                        .penalized_objective_total(target.view(), rho, Some(registry), 1.0)
+                        .unwrap();
+
+                    let mut minus = term.clone();
+                    let mut flat_m = base_flat.clone();
+                    flat_m[lin] -= epsilon;
+                    minus.assignment.coords[atom_idx].set_flat(flat_m.view());
+                    let coords_m = minus.assignment.coords[atom_idx].as_matrix();
+                    minus.atoms[atom_idx]
+                        .refresh_basis(coords_m.view())
+                        .unwrap();
+                    let obj_m = minus
+                        .penalized_objective_total(target.view(), rho, Some(registry), 1.0)
+                        .unwrap();
+
+                    let finite_difference = (obj_p - obj_m) / (2.0 * epsilon);
+                    coord.observe(
+                        row * d + axis,
+                        sys.rows[row].gt[off + axis],
+                        finite_difference,
+                    );
+                }
+            }
+        }
+
+        let mut decoder = SaeFdWorst::new();
+        let beta = term.flatten_beta();
+        for beta_idx in 0..beta.len() {
+            let mut beta_plus = beta.clone();
+            beta_plus[beta_idx] += epsilon;
+            let mut plus = term.clone();
+            plus.set_flat_beta(beta_plus.view()).unwrap();
+            let obj_p = plus
+                .penalized_objective_total(target.view(), rho, Some(registry), 1.0)
+                .unwrap();
+
+            let mut beta_minus = beta.clone();
+            beta_minus[beta_idx] -= epsilon;
+            let mut minus = term.clone();
+            minus.set_flat_beta(beta_minus.view()).unwrap();
+            let obj_m = minus
+                .penalized_objective_total(target.view(), rho, Some(registry), 1.0)
+                .unwrap();
+
+            let finite_difference = (obj_p - obj_m) / (2.0 * epsilon);
+            decoder.observe(beta_idx, sys.gb[beta_idx], finite_difference);
+        }
+
+        SaeFdBlockReport {
+            label: label.to_string(),
+            base_loss: base_obj,
+            coord,
+            decoder,
+        }
+    }
+
+    /// EXACT agreement between the SAE assembled gradient and the penalized
+    /// objective it claims to be the gradient of, per analytic penalty kind.
+    /// Central FD of `penalized_objective_total` (penalty ACTIVE) must match the
+    /// assembled coord `gt` and decoder `gb`. This pins the isometry decoder
+    /// gradient (`∂P/∂B`) that the value path counts but the gradient path used
+    /// to drop, alongside ARD, ScadMcp, NuclearNorm, and DecoderIncoherence.
+    #[test]
+    fn sae_assembled_gradient_matches_penalized_objective_central_fd() {
+        let p_out = 3usize;
+        let mut reports: Vec<SaeFdBlockReport> = Vec::new();
+
+        let single_cases: &[(&str, SaePenCaseKind, SaePenKind)] = &[
+            ("isometry_circle_d1", SaePenCaseKind::PeriodicD1, SaePenKind::Isometry),
+            ("isometry_euclid_d2", SaePenCaseKind::EuclideanD2, SaePenKind::Isometry),
+            ("ard_circle_d1", SaePenCaseKind::PeriodicD1, SaePenKind::Ard),
+            ("scadmcp_euclid_d1", SaePenCaseKind::EuclideanD1, SaePenKind::ScadMcp),
+            ("nuclearnorm_euclid_d1", SaePenCaseKind::EuclideanD1, SaePenKind::NuclearNorm),
+        ];
+        for (label, case_kind, pen_kind) in single_cases {
+            let (term, target, rho, slice) = sae_pen_term(*case_kind);
+            let n_obs = term.n_obs();
+            let latent_dim = term.assignment.coords[0].latent_dim();
+            let beta_len = term.beta_dim();
+            let registry =
+                sae_pen_registry(*pen_kind, &slice, n_obs, latent_dim, beta_len, p_out);
+            term.validate_analytic_penalty_registry(&registry)
+                .expect("penalty registry must validate for the SAE term");
+            reports.push(sae_pen_fd_check(label, &term, &target, &rho, &registry));
+        }
+
+        {
+            let (term, target, rho) = sae_pen_term_k2();
+            let beta_len = term.beta_dim();
+            let slice = PsiSlice {
+                range: 0..beta_len,
+                latent_dim: Some(beta_len / p_out),
+            };
+            let registry = sae_pen_registry(
+                SaePenKind::DecoderIncoherence,
+                &slice,
+                term.n_obs(),
+                1,
+                beta_len,
+                p_out,
+            );
+            term.validate_analytic_penalty_registry(&registry)
+                .expect("DecoderIncoherence registry must validate for the K=2 SAE term");
+            reports.push(sae_pen_fd_check(
+                "decoder_incoherence_k2",
+                &term,
+                &target,
+                &rho,
+                &registry,
+            ));
+        }
+
+        let relative_tolerance = 1.0e-5;
+        let absolute_tolerance = 1.0e-7;
+        let mut all_blocks_match = true;
+        for report in &reports {
+            let coord_ok = report.coord.relative_error <= relative_tolerance
+                || report.coord.absolute_error <= absolute_tolerance;
+            let decoder_ok = report.decoder.relative_error <= relative_tolerance
+                || report.decoder.absolute_error <= absolute_tolerance;
+            all_blocks_match = all_blocks_match && coord_ok && decoder_ok;
+            let coord_status = if coord_ok { "MATCH" } else { "MISMATCH" };
+            let decoder_status = if decoder_ok { "MATCH" } else { "MISMATCH" };
+            eprintln!(
+                "{label}: base={base:.12e}; coord_gt={coord_status} max_rel={coord_rel:.6e} \
+                 max_abs={coord_abs:.6e} worst_row={coord_idx} analytic={coord_an:.12e} \
+                 fd={coord_fd:.12e}; decoder_gb={decoder_status} max_rel={decoder_rel:.6e} \
+                 max_abs={decoder_abs:.6e} worst_beta={decoder_idx} analytic={decoder_an:.12e} \
+                 fd={decoder_fd:.12e}",
+                label = report.label,
+                base = report.base_loss,
+                coord_rel = report.coord.relative_error,
+                coord_abs = report.coord.absolute_error,
+                coord_idx = report.coord.index,
+                coord_an = report.coord.analytic,
+                coord_fd = report.coord.finite_difference,
+                decoder_rel = report.decoder.relative_error,
+                decoder_abs = report.decoder.absolute_error,
+                decoder_idx = report.decoder.index,
+                decoder_an = report.decoder.analytic,
+                decoder_fd = report.decoder.finite_difference,
+            );
+        }
+        assert!(
+            all_blocks_match,
+            "SAE assembled gradient does not match central FD of the penalized objective"
+        );
     }
 
     #[test]
