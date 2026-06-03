@@ -2,18 +2,19 @@
 
 These exercise the pure-Python validation / payload / metadata logic of
 ``gamfit._sae_manifold`` directly, so they do not require the compiled Rust
-extension. The few places that would touch Rust (the row-block penalty
-capability probe) are monkeypatched to a no-op; any test that needs a *real*
-fit is guarded and ``xfail``-skipped when the extension is unavailable.
+extension. The few places that would touch Rust are monkeypatched to a fake
+module so these tests cover Python metadata wiring deterministically.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import numpy as np
 import pytest
 
+import gamfit
 import gamfit._sae_manifold as sae
 
 
@@ -30,8 +31,15 @@ def test_isometry_weight_changes_payload(monkeypatch):
     _no_row_block_probe(monkeypatch)
     common = dict(
         ard_per_atom=False,
+        gate_sparsity="l1",
+        sparsity_weight=0.0,
+        scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
         block_orthogonality_weight=0.0,
+        nuclear_norm_weight=0.0,
+        nuclear_norm_max_rank=None,
+        decoder_incoherence_weight=0.0,
+        k_atoms=1,
         d_max=2,
         p_out=3,
     )
@@ -56,8 +64,15 @@ def test_isometry_weight_zero_omits_descriptor(monkeypatch):
     payload = sae._build_analytic_penalties_payload(
         isometry_weight=0.0,
         ard_per_atom=False,
+        gate_sparsity="l1",
+        sparsity_weight=0.0,
+        scad_mcp_gamma=3.7,
         decoder_feature_sparsity_groups=None,
         block_orthogonality_weight=0.0,
+        nuclear_norm_weight=0.0,
+        nuclear_norm_max_rank=None,
+        decoder_incoherence_weight=0.0,
+        k_atoms=1,
         d_max=2,
         p_out=3,
     )
@@ -130,6 +145,7 @@ def _make_fit(kind: str, n_atoms: int = 4) -> sae.ManifoldSAE:
         )
         for _ in range(n_atoms)
     ]
+    diagnostics = _diagnostics(n_atoms)
     return sae.ManifoldSAE(
         atoms=atoms,
         atom_topology="circle",
@@ -139,8 +155,8 @@ def _make_fit(kind: str, n_atoms: int = 4) -> sae.ManifoldSAE:
         primitive_names=[],
         fitted=np.zeros((1, 1)),
         assignments=np.zeros((1, n_atoms)),
-        coords=[np.zeros((1, 1))],
-        decoder_blocks=[np.zeros((1, 1))],
+        coords=[np.zeros((1, 1)) for _ in range(n_atoms)],
+        decoder_blocks=[np.zeros((1, 1)) for _ in range(n_atoms)],
         basis_specs=["periodic"] * n_atoms,
         reml_score=0.0,
         reconstruction_r2=0.0,
@@ -150,12 +166,157 @@ def _make_fit(kind: str, n_atoms: int = 4) -> sae.ManifoldSAE:
             atoms, n_atoms, {}, {}, np.zeros((1, 1)), np.zeros((1, n_atoms)), [], 0.0
         ),
         low_level_logits=np.zeros((1, n_atoms)),
+        diagnostics=diagnostics,
         _basis_kinds=["periodic"] * n_atoms,
         _atom_dims=[1] * n_atoms,
         _basis_sizes=[1] * n_atoms,
         _n_harmonics=[0] * n_atoms,
         _duchon_centers=[None] * n_atoms,
     )
+
+
+def _diagnostics(n_atoms: int, trust: list[float] | None = None) -> dict[str, object]:
+    scores = np.ones(n_atoms, dtype=float) if trust is None else np.asarray(trust, dtype=float)
+    return {
+        "atom_trust": scores,
+        "atoms": [
+            {
+                "trust_score": float(scores[k]),
+                "sigma_min_tangent": 1.0,
+                "sigma_max_tangent": 1.0,
+                "tangent_condition_score": 1.0,
+                "mean_neighbor_coherence": 0.0,
+                "coherence_score": 1.0,
+                "topology_evidence_margin": 0.0,
+                "topology_margin_score": 0.5,
+                "coverage": 1.0,
+                "activation_frequency": 1.0,
+                "coverage_score": 1.0,
+                "typed_reconstruction_mse": 0.0,
+                "level0_reference_mse": 0.0,
+                "level0_residual_ratio": 1.0,
+                "level0_score": 1.0,
+                "untyped": False,
+                "active_token_count": 1,
+            }
+            for k in range(n_atoms)
+        ],
+        "level0_test": "local_pca_active_token_reference",
+    }
+
+
+class _FakeRustModule:
+    def sae_manifold_reconstruction_r2(self, observed, fitted) -> float:
+        observed = np.asarray(observed, dtype=float)
+        fitted = np.asarray(fitted, dtype=float)
+        ss_res = float(np.sum((observed - fitted) ** 2))
+        ss_tot = float(np.sum((observed - observed.mean(axis=0, keepdims=True)) ** 2))
+        return 1.0 - ss_res / max(ss_tot, 1.0e-12)
+
+    def sae_manifold_fit_minimal(
+        self,
+        z,
+        atom_basis,
+        atom_dim,
+        alpha,
+        tau,
+        learnable_alpha,
+        assignment_kind,
+        *,
+        sparsity_strength,
+        smoothness,
+        max_iter,
+        learning_rate,
+        gumbel_schedule,
+        analytic_penalties,
+        random_state,
+        top_k,
+        initial_logits,
+        initial_coords,
+        jumprelu_threshold,
+    ):
+        z = np.asarray(z, dtype=float)
+        n_obs, p_out = z.shape
+        k_atoms = len(atom_basis)
+        logits = np.zeros((n_obs, k_atoms), dtype=float)
+        assignments = np.full((n_obs, k_atoms), 1.0 / float(k_atoms), dtype=float)
+        atoms = []
+        for atom_k, basis in enumerate(atom_basis):
+            dim = int(atom_dim[atom_k])
+            atoms.append({
+                "basis_kind": str(basis),
+                "decoder_B": np.zeros((max(1, dim + 1), p_out), dtype=float),
+                "assignments_z": assignments[:, atom_k],
+                "on_atom_coords_t": np.zeros((n_obs, dim), dtype=float),
+                "active_dim": dim,
+            })
+        return {
+            "atoms": atoms,
+            "assignments_z": assignments,
+            "logits": logits,
+            "fitted": np.zeros_like(z),
+            "reml_score": -1.0,
+            "chosen_k": k_atoms,
+            "dispersion": 1.0,
+        }
+
+
+def test_new_sae_helpers_are_importable_and_defaults_are_research_objective():
+    assert gamfit.sae_fit is sae.fit
+    assert gamfit.align is sae.align
+    assert gamfit.plot is sae.plot
+    assert callable(gamfit.sae_trust_diagnostics)
+    assert callable(gamfit.atom_trust_scores)
+
+    signature = inspect.signature(sae.sae_manifold_fit)
+    assert signature.parameters["gate_sparsity"].default == "scad"
+    assert signature.parameters["nuclear_norm_weight"].default == 1.0
+    assert signature.parameters["decoder_incoherence_weight"].default == 1.0
+
+
+def test_trust_diagnostics_normalize_and_round_trip():
+    diagnostics = _diagnostics(2, trust=[0.25, 0.75])
+    normalized = gamfit.sae_trust_diagnostics({"diagnostics": diagnostics})
+    np.testing.assert_allclose(gamfit.atom_trust_scores(normalized), [0.25, 0.75])
+    assert normalized["atoms"][0]["trust_score"] == pytest.approx(0.25)
+    assert normalized["atoms"][1]["trust_score"] == pytest.approx(0.75)
+    assert normalized["level0_test"] == "local_pca_active_token_reference"
+
+
+def test_research_trust_scores_are_assignment_weighted():
+    fit = _make_fit("softmax", n_atoms=2)
+    fit.training_data = np.zeros((3, 1))
+    fit.assignments = np.asarray(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+        ],
+        dtype=float,
+    )
+    fit.diagnostics = _diagnostics(2, trust=[0.2, 0.8])
+
+    trust = sae._trust_scores(fit)
+    np.testing.assert_allclose(trust["atom"], [0.2, 0.8])
+    np.testing.assert_allclose(trust["row"], [0.2, 0.8, 0.5])
+    assert trust["per_atom"].shape == (3, 2)
+
+
+def test_alignment_public_api_uses_rich_result():
+    fit_a = _make_fit("softmax", n_atoms=2)
+    fit_b = _make_fit("softmax", n_atoms=2)
+    fit_a.decoder_blocks = [np.eye(2), np.fliplr(np.eye(2))]
+    fit_b.decoder_blocks = [np.fliplr(np.eye(2)), np.eye(2)]
+    for atom, block in zip(fit_a.atoms, fit_a.decoder_blocks):
+        atom.decoder_coefficients = block
+    for atom, block in zip(fit_b.atoms, fit_b.decoder_blocks):
+        atom.decoder_coefficients = block
+
+    aligned = gamfit.align(fit_a, fit_b)
+    assert aligned.assignment == [(0, 1), (1, 0)]
+    payload = aligned.to_dict()
+    assert payload["assignment"] == [[0, 1], [1, 0]]
+    assert "mean_grassmann_distance" in payload["summary"]
 
 
 @pytest.mark.parametrize(
@@ -223,32 +384,45 @@ def test_top_k_negative_raises(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Real-fit guards: only run when the compiled extension is importable. These
-# assert the end-to-end metadata wiring (#607 canonical kind, #608 mixed list).
+# Metadata wiring tests use the fake Rust module above so they are deterministic
+# and do not depend on the current convergence state of the compiled solver.
 # ---------------------------------------------------------------------------
-def _rust_available() -> bool:
-    try:
-        from gamfit._binding import rust_module
 
-        rust_module()
-        return True
-    except Exception:
-        return False
-
-
-@pytest.mark.skipif(not _rust_available(), reason="compiled gamfit._rust unavailable")
-def test_ibp_aliases_same_metadata_e2e():
+def test_ibp_aliases_same_metadata_e2e(monkeypatch):
+    fake = _FakeRustModule()
+    monkeypatch.setattr(sae, "rust_module", lambda: fake)
     x = np.random.default_rng(1).standard_normal((40, 4))
-    fit_ibp = sae.sae_manifold_fit(Z=x, K=3, d_atom=2, assignment="ibp", n_iter=2)
-    fit_map = sae.sae_manifold_fit(Z=x, K=3, d_atom=2, assignment="ibp_map", n_iter=2)
+    baseline = dict(
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        gate_sparsity="l1",
+        nuclear_norm_weight=0.0,
+        decoder_incoherence_weight=0.0,
+    )
+    fit_ibp = sae.sae_manifold_fit(
+        Z=x, K=3, d_atom=2, assignment="ibp", n_iter=2, **baseline
+    )
+    fit_map = sae.sae_manifold_fit(
+        Z=x, K=3, d_atom=2, assignment="ibp_map", n_iter=2, **baseline
+    )
     assert fit_ibp.assignment == fit_map.assignment == "ibp_map"
 
 
-@pytest.mark.skipif(not _rust_available(), reason="compiled gamfit._rust unavailable")
-def test_mixed_basis_topology_e2e():
+def test_mixed_basis_topology_e2e(monkeypatch):
+    fake = _FakeRustModule()
+    monkeypatch.setattr(sae, "rust_module", lambda: fake)
     x = np.random.default_rng(2).standard_normal((40, 4))
     fit = sae.sae_manifold_fit(
-        Z=x, K=2, d_atom=2, atom_basis=["periodic", "sphere"], n_iter=2
+        Z=x,
+        K=2,
+        d_atom=2,
+        atom_basis=["periodic", "sphere"],
+        n_iter=2,
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        gate_sparsity="l1",
+        nuclear_norm_weight=0.0,
+        decoder_incoherence_weight=0.0,
     )
     assert fit.atom_topology == "mixed"
     assert fit.atom_topologies == ["circle", "sphere"]
