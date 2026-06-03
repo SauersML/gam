@@ -20,8 +20,8 @@
 //! `cov_params() = scale·(XᵀW_sfX)⁻¹` (Pearson `scale = φ̂`) on the identical
 //! frozen basis. We compare the per-point linear-predictor standard error
 //! `SE(η_i) = √(xᵢᵀ Vb xᵢ)` — the quantity that flows straight into every CI —
-//! against statsmodels' `get_prediction().se` (linear scale). The corrected gam
-//! matches statsmodels to a tight tolerance; the BUGGY gam would come out a
+//! against statsmodels' link-scale SE `√(xᵢᵀ·cov_params·xᵢ)`. The corrected
+//! gam matches statsmodels to a tight tolerance; the BUGGY gam would come out a
 //! factor `√shape ≈ 1.6` too small, which this test rejects.
 
 use csv::StringRecord;
@@ -174,11 +174,14 @@ yv = np.asarray(df["y"], dtype=float)
 model = sm.GLM(yv, X, family=sm.families.Gamma(link=sm.families.links.Log()))
 res = model.fit()
 
-# Linear-predictor (link-scale) standard error per training row:
-# SE(eta_i) = sqrt(x_i' cov_params x_i). statsmodels' get_prediction(...).se
-# on linear='linear' gives exactly this.
-pr = res.get_prediction(X, which="linear")
-eta_se = np.asarray(pr.se, dtype=float)
+# Linear-predictor (link-scale) standard error per training row, computed
+# straight from the coefficient covariance to stay version-independent:
+#   SE(eta_i) = sqrt(x_i' cov_params x_i).
+# statsmodels' cov_params() = scale * (X'WX)^-1 with the scale-free Gamma
+# Fisher weight and Pearson scale = phi_hat — the mgcv/statsmodels convention
+# gam's corrected Vb must reproduce.
+cov = np.asarray(res.cov_params(), dtype=float)
+eta_se = np.sqrt(np.einsum("ij,jk,ik->i", X, cov, X))
 emit("eta_se", eta_se)
 emit("scale", [res.scale])
 "#,
