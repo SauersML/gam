@@ -9135,6 +9135,13 @@ fn sae_atom_basis_kind_from_str(value: &str) -> SaeAtomBasisKind {
 const SAE_DEFAULT_TORUS_HARMONICS: usize = 3;
 /// Sphere chart basis size (lat/lon ⇒ `[1, x, y, z, xy, yz, xz]`).
 const SAE_SPHERE_BASIS_SIZE: usize = 7;
+/// Per-(compact)-axis resolution of the global decoder-projection coordinate
+/// seed used by the fixed-decoder OOS solve. 256 phases on the circle spaces
+/// adjacent grid points ≈0.004 apart, comfortably inside the basin of the
+/// analytic Newton refinement for a small harmonic order, while staying cheap
+/// (`O(K·N·256·p)` for periodic atoms). See
+/// [`gam::terms::sae_manifold::SaeManifoldTerm::seed_coords_by_decoder_projection`].
+const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 /// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
 /// `dim`, sized so the native reproducing-norm Gram (`PenaltySource::Primary`)
 /// on the scale-free polyharmonic basis is well-posed in every dimension.
@@ -11681,6 +11688,20 @@ fn sae_manifold_predict_oos<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+    // Global decoder-projection coordinate seed (cold start only). With the
+    // decoder frozen, the exact OOS latent of each row is its projection onto
+    // the atom's image manifold, `argmin_t ‖x − Φ(t)·B‖²`. That objective is
+    // non-convex on the compact periodic / torus / sphere latents, so the
+    // PCA-`atan2` seed plus a few Newton steps lands many rows in the wrong
+    // basin and mis-routes them (negative R², near-uniform assignments). Seeding
+    // from a dense manifold grid puts every row in the correct basin before the
+    // residual-based softmax logit seed and the Newton refinement below. An
+    // explicit warm `initial_coords` (e.g. from an amortized encoder, issue
+    // #357) is respected as-is and not overwritten.
+    if initial_coords.is_none() {
+        term.seed_coords_by_decoder_projection(x_view, SAE_OOS_PROJECTION_GRID_RESOLUTION)
+            .map_err(py_value_error)?;
+    }
     if !logits_are_warm && assignment_kind == "softmax" {
         let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
         let mut decoded = vec![0.0_f64; p_out];
