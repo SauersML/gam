@@ -171,3 +171,90 @@ fn gamma_dispersion_is_conditional_noise_not_mean_spread() {
         1.0 / phi_true
     );
 }
+
+/// Fit a Gamma(log) GAM on `y ~ s(x, k=10)` and return the stored
+/// `dispersion_phi()`. Shared by the invariance test below.
+fn fit_gamma_dispersion(x: &[f64], y: &[f64]) -> f64 {
+    let n = x.len();
+    let headers: Vec<String> = ["y", "x"].into_iter().map(String::from).collect();
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| StringRecord::from(vec![y[i].to_string(), x[i].to_string()]))
+        .collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode gamma dataset");
+    let cfg = FitConfig {
+        family: Some("gamma".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(x, k=10)", &ds, &cfg).expect("gam gamma fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected a standard GAM fit for Gamma(log)");
+    };
+    fit.fit.dispersion_phi()
+}
+
+/// Root-cause regression from the *invariance* angle (#678): for a Gamma
+/// response `Var(Y|x) = φ·μ(x)²`, the dispersion φ is a property of the
+/// conditional noise alone and MUST be invariant to how spread out the mean
+/// `μ(x)` is. The frozen-warm-start-η bug made the reported φ grow with the
+/// spread of μ (constant mean → exact; steep mean → ~2× inflated), so the
+/// single sharpest signature of the bug is that the same conditional noise on
+/// a flat mean and on a steep mean report *different* dispersions.
+///
+/// We hold the conditional noise fixed (identical unit-mean Gamma(shape=4)
+/// draws, decorrelated from x the same way in both arms) and only change the
+/// mean surface:
+///   - flat:  μ = exp(0.5)            (spread 1.0)
+///   - steep: μ = exp(2.0·x), x∈[−2,2] (spread exp(8) ≈ 2981×)
+/// Both must recover φ ≈ 0.25 and, crucially, must agree with each other.
+#[test]
+fn gamma_dispersion_is_invariant_to_mean_spread() {
+    init_parallelism();
+
+    let shape_true = 4.0_f64;
+    let n = 400usize;
+    let unit = deterministic_gamma_unit_mean(shape_true, n);
+
+    let mut x = Vec::with_capacity(n);
+    let mut y_flat = Vec::with_capacity(n);
+    let mut y_steep = Vec::with_capacity(n);
+    for i in 0..n {
+        let xi = -2.0 + 4.0 * (i as f64) / ((n - 1) as f64);
+        // Same decorrelating shuffle of the unit draw against x in both arms,
+        // so the *conditional noise* is identical and only the mean differs.
+        let j = (i * 257 + 13) % n;
+        let u = unit[j];
+        x.push(xi);
+        y_flat.push((0.5_f64).exp() * u); // flat mean, spread 1.0
+        y_steep.push((2.0 * xi).exp() * u); // steep mean, spread exp(8) ≈ 2981×
+    }
+
+    let phi_flat = fit_gamma_dispersion(&x, &y_flat);
+    let phi_steep = fit_gamma_dispersion(&x, &y_steep);
+    eprintln!(
+        "phi_flat = {phi_flat:.4} (shape {:.3}); phi_steep = {phi_steep:.4} (shape {:.3}); \
+         ratio steep/flat = {:.3}",
+        1.0 / phi_flat,
+        1.0 / phi_steep,
+        phi_steep / phi_flat
+    );
+
+    // Each arm must land near the true φ = 1/shape = 0.25.
+    for (label, phi) in [("flat", phi_flat), ("steep", phi_steep)] {
+        let r = phi / 0.25;
+        assert!(
+            (0.8..=1.25).contains(&r),
+            "{label}-mean Gamma dispersion φ̂ = {phi:.4} is {r:.2}× the true φ = 0.25"
+        );
+    }
+
+    // Invariance: the steep-mean dispersion must not be inflated relative to the
+    // flat-mean dispersion despite a ~3000× larger spread of μ. Before the fix
+    // this ratio was ~2×; it must now stay within finite-sample noise.
+    let spread_ratio = phi_steep / phi_flat;
+    assert!(
+        (0.85..=1.18).contains(&spread_ratio),
+        "Gamma dispersion is not invariant to the spread of μ: steep/flat φ̂ ratio = {spread_ratio:.3} \
+         (φ_flat = {phi_flat:.4}, φ_steep = {phi_steep:.4}); the dispersion must reflect conditional \
+         noise only, not mean spread"
+    );
+}

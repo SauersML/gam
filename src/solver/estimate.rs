@@ -3443,7 +3443,7 @@ where
     // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
     // so the final accept-fit skips the streaming GEMM as well.
     let final_cache_handle = reml_state.gaussian_fixed_cache_if_eligible();
-    let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
+    let (pirls_res, _) = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
         LogSmoothingParamsView::new(final_rho.view()),
         pirls::PirlsProblem {
             x: reml_state.x(),
@@ -3478,6 +3478,12 @@ where
             ..cfg.as_pirls_config()
         },
         None,
+        None,
+        // Final, reported fit at the REML-selected λ: refine the Gamma
+        // dispersion shape at the converged η so `dispersion_phi()` and every
+        // SE / interval derived from it reflect the conditional noise, not the
+        // spread of μ (#678). λ is fixed here, so there is no scale↔λ feedback.
+        true,
     )?;
 
     // Map beta back to original basis
