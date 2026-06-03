@@ -3443,7 +3443,7 @@ where
     // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
     // so the final accept-fit skips the streaming GEMM as well.
     let final_cache_handle = reml_state.gaussian_fixed_cache_if_eligible();
-    let (pirls_res, _) = pirls::fit_model_for_fixed_rho(
+    let (pirls_res, _) = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
         LogSmoothingParamsView::new(final_rho.view()),
         pirls::PirlsProblem {
             x: reml_state.x(),
@@ -3478,6 +3478,12 @@ where
             ..cfg.as_pirls_config()
         },
         None,
+        None,
+        // Final, reported fit at the REML-selected λ: refine the Gamma
+        // dispersion shape at the converged η so `dispersion_phi()` and every
+        // SE / interval derived from it reflect the conditional noise, not the
+        // spread of μ (#678). λ is fixed here, so there is no scale↔λ feedback.
+        true,
     )?;
 
     // Map beta back to original basis
@@ -5214,6 +5220,39 @@ impl UnifiedFitResult {
         self.inference.as_ref().map(|inf| inf.dispersion)
     }
 
+    /// Canonical residual dispersion `φ̂` that scales every coefficient
+    /// covariance via `Vb = H⁻¹·φ̂` (the same `φ̂` behind `predict()` standard
+    /// errors). For fixed-scale families (Poisson/Binomial) this is `1`; for
+    /// Gaussian it is `σ̂²`, for Gamma `1/shape`, etc.
+    ///
+    /// Unlike [`Self::dispersion`], which reads the cached `inference` block,
+    /// this is computed from fields that always survive serialization
+    /// (`likelihood_family`, `likelihood_scale`, `standard_deviation`). That
+    /// matters for deployment-time consumers operating on a saved model whose
+    /// `inference` block was dropped (e.g. `core_saved_fit_result` stores
+    /// `inference: None`): the cached `dispersion()` is then `None`, but the
+    /// scale is still recoverable and identical to the value used at fit time.
+    /// When the cached block is present its dispersion is preferred verbatim so
+    /// the two paths never diverge.
+    pub fn dispersion_phi(&self) -> f64 {
+        if let Some(dispersion) = self.dispersion() {
+            return dispersion.phi();
+        }
+        match &self.likelihood_family {
+            Some(spec) => {
+                let glm = GlmLikelihoodSpec {
+                    spec: spec.clone(),
+                    scale: self.likelihood_scale.clone(),
+                };
+                dispersion_from_likelihood(&glm, self.standard_deviation).phi()
+            }
+            // No engine-level family (custom/GAMLSS paths): no scalar
+            // response-scale dispersion is defined, so fall back to the
+            // fixed-scale convention `φ = 1`.
+            None => 1.0,
+        }
+    }
+
     /// Get the smoothing-parameter-corrected beta covariance (`Vp`) if available.
     ///
     /// Wood/mgcv name for the smoothing-parameter-corrected covariance `Vp`.
@@ -6906,6 +6945,42 @@ mod estimate_policy_tests {
             inner_cycles: 0,
         })
         .expect("construct decode invariant test fit")
+    }
+
+    #[test]
+    fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
+        // With a cached `inference` block present, `dispersion_phi()` returns
+        // the stored dispersion verbatim so it can never diverge from the φ̂
+        // that scaled the covariances at fit time.
+        let fit = decode_invariant_test_fit();
+        assert_eq!(fit.dispersion(), Some(Dispersion::Known(1.0)));
+        assert_eq!(fit.dispersion_phi(), 1.0);
+
+        // Deployment-saved models drop `inference` (see `core_saved_fit_result`,
+        // which stores `inference: None`). `dispersion()` is then `None`, but
+        // `dispersion_phi()` must still recover the Gaussian scale φ̂ = σ̂² from
+        // the always-serialized `standard_deviation`. This is the code path the
+        // unseen-level prior variance (#674) relies on.
+        let mut stripped = fit.clone();
+        stripped.inference = None;
+        assert!(stripped.dispersion().is_none());
+        let expected_phi = stripped.standard_deviation * stripped.standard_deviation;
+        assert!(
+            (stripped.dispersion_phi() - expected_phi).abs() < 1e-12,
+            "fallback φ̂ should equal σ̂² = {expected_phi}, got {}",
+            stripped.dispersion_phi()
+        );
+
+        // A fixed-scale family (Poisson) keeps φ̂ = 1 on the fallback path even
+        // with a non-unit residual summary, so the unseen-level prior collapses
+        // to the historical 1/λ for those families.
+        let mut poisson = stripped.clone();
+        poisson.likelihood_family = Some(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ));
+        poisson.standard_deviation = 2.7;
+        assert_eq!(poisson.dispersion_phi(), 1.0);
     }
 
     #[test]

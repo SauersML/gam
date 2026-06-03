@@ -46,9 +46,7 @@ pub use device::GpuDeviceInfo;
 pub use error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, MixedPrecisionPolicy};
-pub use pool::balanced_partition;
-#[cfg(target_os = "linux")]
-pub use pool::scatter_batched;
+pub use pool::{balanced_partition, scatter_batched};
 pub use profile::{KernelStat, KernelStatsSnapshot};
 pub use runtime::GpuRuntime;
 
