@@ -6942,6 +6942,42 @@ mod estimate_policy_tests {
     }
 
     #[test]
+    fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
+        // With a cached `inference` block present, `dispersion_phi()` returns
+        // the stored dispersion verbatim so it can never diverge from the φ̂
+        // that scaled the covariances at fit time.
+        let fit = decode_invariant_test_fit();
+        assert_eq!(fit.dispersion(), Some(Dispersion::Known(1.0)));
+        assert_eq!(fit.dispersion_phi(), 1.0);
+
+        // Deployment-saved models drop `inference` (see `core_saved_fit_result`,
+        // which stores `inference: None`). `dispersion()` is then `None`, but
+        // `dispersion_phi()` must still recover the Gaussian scale φ̂ = σ̂² from
+        // the always-serialized `standard_deviation`. This is the code path the
+        // unseen-level prior variance (#674) relies on.
+        let mut stripped = fit.clone();
+        stripped.inference = None;
+        assert!(stripped.dispersion().is_none());
+        let expected_phi = stripped.standard_deviation * stripped.standard_deviation;
+        assert!(
+            (stripped.dispersion_phi() - expected_phi).abs() < 1e-12,
+            "fallback φ̂ should equal σ̂² = {expected_phi}, got {}",
+            stripped.dispersion_phi()
+        );
+
+        // A fixed-scale family (Poisson) keeps φ̂ = 1 on the fallback path even
+        // with a non-unit residual summary, so the unseen-level prior collapses
+        // to the historical 1/λ for those families.
+        let mut poisson = stripped.clone();
+        poisson.likelihood_family = Some(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ));
+        poisson.standard_deviation = 2.7;
+        assert_eq!(poisson.dispersion_phi(), 1.0);
+    }
+
+    #[test]
     fn resolve_external_family_rejects_unsupported_firth_request() {
         let err = resolve_external_family(
             &LikelihoodSpec::new(
