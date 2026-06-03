@@ -1902,10 +1902,11 @@ impl SaeManifoldAtom {
     /// The metric weight is frozen at the current `B` (lagged-diffusivity /
     /// IRLS surrogate): within one inner solve the penalty stays a quadratic
     /// Gram form, and refreshing `W` between assemblies makes the *converged*
-    /// penalty the true arc-length roughness. Constant-speed atoms (the
-    /// periodic sin/cos basis, `m̄_μ ≡ c`) get `S̃ = c^β S`, a uniform rescale
-    /// that leaves relative roughness — the only thing the topology comparison
-    /// reads — unchanged, so periodic atoms are unaffected.
+    /// penalty the true arc-length roughness. The per-coefficient weight is
+    /// centered (its geometric mean is 1), so constant-speed atoms (the
+    /// periodic sin/cos basis, `m̄_μ ≡ c`) get `w_μ ≡ 1` and hence `S̃ = S`
+    /// exactly — periodic atoms are unaffected and no overall magnitude (which
+    /// `λ` already owns) leaks into the penalty.
     ///
     /// Conservative scope: the scalar-speed reweighting is the genuine
     /// arc-length normalisation only for a 1-D latent (the circle-vs-line case
