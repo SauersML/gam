@@ -41,7 +41,7 @@ use crate::solver::arrow_schur::{
 use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     DecoderIncoherencePenalty, IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty,
-    NuclearNormPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty,
+    NuclearNormPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, WeightField,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
@@ -5464,8 +5464,56 @@ impl SaeManifoldTerm {
         }
     }
 
+    fn sae_isometry_weighted_jacobian_row(
+        corrected: &IsometryPenalty,
+        jac: &Array2<f64>,
+        row: usize,
+        p: usize,
+        d: usize,
+    ) -> Option<Array2<f64>> {
+        match &corrected.weight {
+            WeightField::Identity => {
+                let mut out = Array2::<f64>::zeros((p, d));
+                for i in 0..p {
+                    for a in 0..d {
+                        out[[i, a]] = jac[[row, i * d + a]];
+                    }
+                }
+                Some(out)
+            }
+            WeightField::Factored { u, rank, p_out } => {
+                if *p_out != p || u.nrows() != jac.nrows() || u.ncols() != p * *rank {
+                    return None;
+                }
+                let mut projected = Array2::<f64>::zeros((*rank, d));
+                for weight_axis in 0..*rank {
+                    for a in 0..d {
+                        let mut acc = 0.0;
+                        for i in 0..p {
+                            acc += u[[row, i * *rank + weight_axis]] * jac[[row, i * d + a]];
+                        }
+                        projected[[weight_axis, a]] = acc;
+                    }
+                }
+                let mut out = Array2::<f64>::zeros((p, d));
+                for i in 0..p {
+                    for a in 0..d {
+                        let mut acc = 0.0;
+                        for weight_axis in 0..*rank {
+                            acc += u[[row, i * *rank + weight_axis]]
+                                * projected[[weight_axis, a]];
+                        }
+                        out[[i, a]] = acc;
+                    }
+                }
+                Some(out)
+            }
+        }
+    }
+
     /// Accumulate the isometry penalty's decoder-block gradient `∂P/∂B` into the
-    /// β-tier `gb`. The isometry value
+    /// β-tier `gb` and its decoder-block Gauss-Newton majorizer into `hbb`. The
+    /// isometry value
     ///   `P = ½ μ Σ_n ‖J_nᵀ W J_n − G_ref‖²_F`
     /// is a function of the model Jacobian `J_n[i, a] = Σ_m (∂Φ/∂t)[n, m, a]·B[m, i]`,
     /// so it depends on the decoder `B` as well as the latent coords `t`. The
@@ -5473,6 +5521,11 @@ impl SaeManifoldTerm {
     /// [`IsometryPenalty::grad_jacobian`]; the chain rule through
     /// `∂J[n, i·d + a]/∂B[m, i] = (∂Φ/∂t)[n, m, a]` gives
     ///   `∂P/∂B[m, i] = Σ_n Σ_a (∂P/∂J)[n, i·d + a] · (∂Φ/∂t)[n, m, a]`.
+    /// Since `J` is linear in `B`, the PSD decoder curvature is the exact
+    /// pullback of the J-space Gauss-Newton block:
+    ///   `Σ_n jet[n,m,a] · B_GN^J[n,(i,a),(i',a')] · jet[n,m',a']`.
+    /// This drops only the indefinite residual-curvature term, matching the
+    /// file-wide PSD-majorizer convention for Newton / Arrow-Schur blocks.
     /// The flat β layout is `β[beta_offsets[k] + m·p + i] = B_k[m, i]`, so each
     /// atom's contribution lands in its own decoder span. The isometry penalty is
     /// unscaled at the row-block (Psi) tier — mirroring its coord-block routing
@@ -5505,6 +5558,69 @@ impl SaeManifoldTerm {
                     }
                 }
                 sys.gb[beta_off + basis_col * p + i] += acc;
+            }
+        }
+        let Some(jac) = corrected.jacobian_cache() else {
+            return;
+        };
+        if jac.dim() != (n_obs, p * d) {
+            return;
+        }
+        let mut weighted_jacobian_rows = Vec::with_capacity(n_obs);
+        for n in 0..n_obs {
+            let Some(wj) = Self::sae_isometry_weighted_jacobian_row(corrected, &jac, n, p, d)
+            else {
+                return;
+            };
+            weighted_jacobian_rows.push(wj);
+        }
+        let mu = corrected.scalar_weight * rho_local[corrected.rho_index].exp();
+        let mut metric_jvp = Array2::<f64>::zeros((d, d));
+        let mut jac_hvp = Array2::<f64>::zeros((p, d));
+        let mut beta_hvp = Array2::<f64>::zeros((m, p));
+        for probe_basis_col in 0..m {
+            for probe_output in 0..p {
+                beta_hvp.fill(0.0);
+                for n in 0..n_obs {
+                    let wj = &weighted_jacobian_rows[n];
+                    metric_jvp.fill(0.0);
+                    for a in 0..d {
+                        let probe_jet_a = jet[[n, probe_basis_col, a]];
+                        for b in 0..d {
+                            metric_jvp[[a, b]] = probe_jet_a * wj[[probe_output, b]]
+                                + wj[[probe_output, a]] * jet[[n, probe_basis_col, b]];
+                        }
+                    }
+                    jac_hvp.fill(0.0);
+                    for i in 0..p {
+                        for c in 0..d {
+                            let mut acc = 0.0;
+                            for b in 0..d {
+                                acc += metric_jvp[[c, b]] * wj[[i, b]];
+                            }
+                            for a in 0..d {
+                                acc += metric_jvp[[a, c]] * wj[[i, a]];
+                            }
+                            jac_hvp[[i, c]] = mu * acc;
+                        }
+                    }
+                    for basis_row in 0..m {
+                        for i in 0..p {
+                            let mut acc = 0.0;
+                            for a in 0..d {
+                                acc += jac_hvp[[i, a]] * jet[[n, basis_row, a]];
+                            }
+                            beta_hvp[[basis_row, i]] += acc;
+                        }
+                    }
+                }
+                let beta_col = beta_off + probe_basis_col * p + probe_output;
+                for basis_row in 0..m {
+                    for i in 0..p {
+                        sys.hbb[[beta_off + basis_row * p + i, beta_col]] +=
+                            beta_hvp[[basis_row, i]];
+                    }
+                }
             }
         }
     }
