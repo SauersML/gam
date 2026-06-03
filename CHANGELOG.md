@@ -16,7 +16,12 @@ The two packages are versioned independently — `gam` tracks the Rust engine,
 `gamfit` the Python wheel — but released together. Each entry is headed with the
 git tag and both package versions.
 
-## v0.3.78 — gam 0.3.78 / gamfit 0.1.151 (2026-06-03)
+## v0.3.79 — gam 0.3.79 / gamfit 0.1.151 (2026-06-03)
+
+> Supersedes the yanked `gam` 0.3.78: that tag failed a release-time
+> version-reference check (`build.rs`) before any wheel shipped, so `gamfit`
+> 0.1.151 is published for the first time here.
+
 
 ### New
 
