@@ -222,9 +222,16 @@ where
             }
         ));
     }
+    // Sign convention (issue #396, see `solver::reml_compare`): `tk_score` is a
+    // minimised TK / REML cost (penalised negative log marginal likelihood plus
+    // the null-space Laplace correction), so LOWER is better. Sort ASCENDING and
+    // take index 0 as the winner — the sibling selector in `solver::evidence`
+    // and the REML comparator both sort ascending for the same reason. The
+    // previous descending sort here treated the cost as a log-evidence and
+    // therefore selected the WORST-fitting topology.
     ranked.sort_by(|lhs, rhs| {
-        rhs.tk_score
-            .partial_cmp(&lhs.tk_score)
+        lhs.tk_score
+            .partial_cmp(&rhs.tk_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(TopologyAutoSelectorResult {

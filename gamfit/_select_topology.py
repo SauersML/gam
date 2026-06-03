@@ -667,7 +667,13 @@ def _coefficients_metadata(fit_obj: Any) -> Any | None:
 
 
 def _comparison_score(score: float, score_kind: ScoreKind) -> float:
-    return -float(score) if score_kind == "bic" else float(score)
+    # `compare_models` sorts its `reml_score` column ascending (lower is the
+    # better model; see `gamfit._reml_common.compare_models` /
+    # `solver::reml_compare`, issue #396). Every score kind handled here —
+    # REML, LAML, TK, and BIC (deviance + log(n)*k) — is a minimised
+    # lower-is-better cost, so all pass through with the SAME orientation.
+    # Negating BIC inverted the comparison and selected the WORST topology.
+    return float(score)
 
 
 def _scale_score(
