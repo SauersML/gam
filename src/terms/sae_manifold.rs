@@ -1058,6 +1058,23 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
         // Cap the total number of grid points; pick the largest per-axis count
         // whose d-th power stays within the cap (at least 2 per axis).
         const MAX_GRID_POINTS: usize = 4096;
+        // Even the coarsest dense grid is `2^d` points: above `d = 12` that
+        // already exceeds the cap, so no on-manifold grid can satisfy it (the
+        // `per_axis > 2` loop floors at 2 and would otherwise emit a runaway
+        // `2^d`-row grid that the per-row global-argmin scan must then walk). A
+        // dense seed grid is infeasible for such a high-dimensional torus
+        // anyway, so fall back to the incoming (PCA) seed exactly as the
+        // unbounded / basis-linear evaluators do.
+        let mut floor_total: usize = 1;
+        for _ in 0..d {
+            match floor_total.checked_mul(2) {
+                Some(v) => floor_total = v,
+                None => return None,
+            }
+        }
+        if floor_total > MAX_GRID_POINTS {
+            return None;
+        }
         let mut per_axis = resolution.max(2);
         while per_axis > 2 {
             let mut total: usize = 1;
@@ -1640,7 +1657,36 @@ pub struct SaeManifoldAtom {
     pub basis_values: Array2<f64>,
     pub basis_jacobian: Array3<f64>,
     pub decoder_coefficients: Array2<f64>,
+    /// Effective (intrinsic) roughness Gram `S̃_k` that every consumer reads
+    /// (smoothness value, gradient, Kronecker Hessian op, REML rank/log-det).
+    ///
+    /// `S̃_k` is the raw coefficient-space Gram [`Self::smooth_penalty_raw`]
+    /// reparameterized by the decoder pullback metric so the roughness — and
+    /// hence the topology evidence — is gauge-invariant under reparameterization
+    /// of the latent coordinate `t` (issue #673). It is recomputed from the
+    /// current basis Jacobian and decoder coefficients by
+    /// [`Self::refresh_intrinsic_smooth_penalty`] (lagged-diffusivity: the
+    /// metric weight is frozen within each inner Newton/evidence assembly and
+    /// refreshed between them, so at convergence the penalty is the true
+    /// arc-length roughness). For constant-speed atoms (the periodic sin/cos
+    /// basis on `S¹`) the metric weight is uniform, so `S̃_k = c·S_k` and the
+    /// relative roughness — the only thing the topology comparison sees — is
+    /// unchanged.
     pub smooth_penalty: Array2<f64>,
+    /// Canonical raw roughness Gram `S_k` in raw coefficient/`t` space (the
+    /// finite-/cyclic-difference Reinsch Gram or the Duchon RKHS Gram). Never
+    /// mutated after construction; [`Self::smooth_penalty`] is derived from it
+    /// each assembly via the pullback-metric reweighting.
+    pub smooth_penalty_raw: Array2<f64>,
+    /// Roughness operator order `r` of [`Self::smooth_penalty_raw`], recovered
+    /// once at construction as its null-space dimension (an order-`r`
+    /// difference / Duchon penalty annihilates the degree-`<r` polynomials, so
+    /// `nullity(S) = r`). Sets the arc-length reweighting exponent
+    /// `β = ½ − r` (`β = −3/2` for the standard second-derivative penalty):
+    /// the metric-speed power that converts raw-`t` roughness into intrinsic
+    /// arc-length roughness. `0` when the raw Gram is empty/zero (no
+    /// reweighting).
+    pub smooth_penalty_order: usize,
     pub basis_evaluator: Option<Arc<dyn SaeBasisEvaluator>>,
     /// Same evaluator upcast to `dyn SaeBasisSecondJet` when the
     /// implementation provides a closed-form Hessian. `None` for
@@ -1688,17 +1734,30 @@ impl SaeManifoldAtom {
         if p == 0 {
             return Err("SaeManifoldAtom::new: decoder output dimension must be positive".into());
         }
-        Ok(Self {
+        // Recover the roughness operator order `r` from the raw Gram's
+        // null-space dimension (`nullity(S) = r` for an order-`r` difference /
+        // Duchon penalty). This pins the arc-length reweighting exponent
+        // `β = ½ − r` once, so the per-assembly reweighting needs no
+        // eigendecomposition in the hot loop.
+        let smooth_penalty_order = smooth_penalty_nullity(&smooth_penalty)?;
+        let mut atom = Self {
             name: name.into(),
             basis_kind,
             latent_dim,
             basis_values,
-            basis_jacobian,
             decoder_coefficients,
+            smooth_penalty_raw: smooth_penalty.clone(),
             smooth_penalty,
+            smooth_penalty_order,
+            basis_jacobian,
             basis_evaluator: None,
             basis_second_jet: None,
-        })
+        };
+        // Seed `smooth_penalty` with the intrinsic Gram at the initial
+        // decoder/coordinates so the very first assembly already reads the
+        // pullback-metric-reweighted penalty.
+        atom.refresh_intrinsic_smooth_penalty();
+        Ok(atom)
     }
 
     pub fn with_basis_evaluator(mut self, evaluator: Arc<dyn SaeBasisEvaluator>) -> Self {
@@ -4150,21 +4209,39 @@ impl SaeManifoldTerm {
             // tolerate the ill-conditioning rejection here (a genuine non-PD pivot
             // still errors). The cache stays undamped at ridge=0, so
             // `arrow_log_det_from_cache` remains exact.
+            // The exact KKT stationarity residual is the joint gradient
+            // ‖g‖ = √(Σ_i ‖g_t^(i)‖² + ‖g_β‖²), read straight off the assembled
+            // system. Unlike the Newton step Δ = H⁻¹g, the gradient is
+            // factorisation-independent: it is NOT amplified by an inverse, so a
+            // genuinely stationary but ill-conditioned fit (tiny g, possibly large
+            // Δ in a flat direction) is correctly recognised as converged. The
+            // `with_ill_conditioning_tolerated` Direct factor below documents that
+            // its Δ may be inaccurate in exactly those flat directions, so using Δ
+            // alone as the convergence gate would falsely reject healthy fits.
+            let grad_norm_sq: f64 = sys
+                .rows
+                .iter()
+                .map(|row| row.gt.iter().map(|&v| v * v).sum::<f64>())
+                .sum::<f64>()
+                + sys.gb.iter().map(|&v| v * v).sum::<f64>();
             let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
                 solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
                     .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
             // The Laplace normaliser ½log|H| is only the correct REML criterion at
-            // the inner optimum (t̂, β̂). The undamped Newton step computed here is
-            // the natural KKT residual of that solve: a step whose magnitude
-            // dwarfs the iterate means the inner loop did not converge at this ρ
-            // and the log-det would be evaluated off the manifold.
+            // the inner optimum (t̂, β̂). Convergence is judged by EITHER a small
+            // gradient (KKT stationarity) OR a small undamped Newton step; the
+            // solve is only rejected as non-converged when BOTH are large, i.e.
+            // the iterate is neither stationary nor about to move negligibly. That
+            // disjunction is what keeps an ill-conditioned-but-stationary fit
+            // (small g, large Δ) from being rejected while still refusing to rank
+            // an off-optimum Laplace criterion that is genuinely mid-flight.
             let step_norm_sq: f64 = delta_t.iter().map(|&v| v * v).sum::<f64>()
                 + delta_beta.iter().map(|&v| v * v).sum::<f64>();
-            if !step_norm_sq.is_finite() {
+            if !step_norm_sq.is_finite() || !grad_norm_sq.is_finite() {
                 return Err(format!(
-                    "SaeManifoldTerm::reml_criterion: undamped Newton residual is non-finite at \
-                     the inner optimum (‖Δ‖²={step_norm_sq}); the joint Hessian factorisation is \
-                     degenerate at this ρ"
+                    "SaeManifoldTerm::reml_criterion: undamped inner residual is non-finite at \
+                     the inner optimum (‖Δ‖²={step_norm_sq}, ‖g‖²={grad_norm_sq}); the joint \
+                     Hessian factorisation is degenerate at this ρ"
                 ));
             }
             let mut iterate_norm_sq = 0.0_f64;
@@ -4182,10 +4259,16 @@ impl SaeManifoldTerm {
                     iterate_norm_sq += v * v;
                 }
             }
-            let residual_norm = step_norm_sq.sqrt();
+            let step_norm = step_norm_sq.sqrt();
+            let grad_norm = grad_norm_sq.sqrt();
             let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
-            let residual_tolerance = 1.0e-4 * iterate_scale;
-            if residual_norm <= residual_tolerance {
+            // Relative parameter-step tolerance for Δ (well-conditioned charts);
+            // a tighter scaled tolerance for the gradient KKT residual. Accept on
+            // EITHER — a stationary gradient OR a negligible step — so an
+            // ill-conditioned-but-stationary fit is not falsely rejected.
+            let step_tolerance = 1.0e-4 * iterate_scale;
+            let grad_tolerance = 1.0e-6 * iterate_scale;
+            if grad_norm <= grad_tolerance || step_norm <= step_tolerance {
                 let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
                     "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
                      ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
@@ -4197,9 +4280,10 @@ impl SaeManifoldTerm {
             if total_inner_iter >= max_refine_iter {
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
-                     undamped Newton residual ‖Δ‖={residual_norm:.6e} exceeds tolerance \
-                     {residual_tolerance:.6e} after {total_inner_iter} inner iterations. \
-                     Refusing to rank an off-optimum Laplace criterion."
+                     neither the KKT gradient ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) nor \
+                     the undamped Newton step ‖Δ‖={step_norm:.6e} (tol {step_tolerance:.6e}) met \
+                     tolerance after {total_inner_iter} inner iterations. Refusing to rank an \
+                     off-optimum Laplace criterion."
                 ));
             }
             let remaining = max_refine_iter - total_inner_iter;
@@ -9144,6 +9228,27 @@ mod tests {
                 "torus seed axis {axis} should take 16 distinct phases"
             );
         }
+
+        // d == 12: the coarsest dense grid is `2^12 = 4096`, exactly the cap —
+        // still emitted (per_axis floors at 2).
+        let g12 = TorusHarmonicEvaluator::new(12, 2)
+            .unwrap()
+            .projection_seed_grid(256)
+            .unwrap();
+        assert_eq!(g12.nrows(), 1usize << 12);
+        assert!(g12.nrows() <= 4096);
+
+        // d == 13: even the coarsest dense grid (`2^13 = 8192`) exceeds the
+        // cap, so no on-manifold grid can satisfy it. The evaluator must return
+        // `None` and let the row fall back to its PCA seed rather than allocate
+        // a runaway `2^d`-row grid for the per-row global-argmin scan to walk.
+        assert!(
+            TorusHarmonicEvaluator::new(13, 2)
+                .unwrap()
+                .projection_seed_grid(256)
+                .is_none(),
+            "torus d=13 seed grid (2^13 > 4096) must fall back to None, not blow up the cap"
+        );
     }
 
     /// `seed_coords_by_decoder_projection` must replace each cold coordinate
