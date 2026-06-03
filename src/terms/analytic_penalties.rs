@@ -3938,12 +3938,21 @@ impl NuclearNormPenalty {
         }
         let mut f = Array1::<f64>::zeros(d);
         let mut df = Array1::<f64>::zeros(d);
+        let eig_floor = (self.smoothing_eps * self.smoothing_eps).max(1.0e-15);
         for i in 0..d {
-            let lambda = evals[i];
-            assert!(
-                lambda.is_finite() && lambda > 0.0,
-                "NuclearNormPenalty expected positive smoothed Gram eigenvalue"
-            );
+            let mut lambda = evals[i];
+            if !lambda.is_finite() {
+                return Err(format!(
+                    "NuclearNormPenalty expected finite smoothed Gram eigenvalue; got {lambda}"
+                ));
+            }
+            if lambda < -1.0e-10 * eig_floor {
+                return Err(format!(
+                    "NuclearNormPenalty expected PSD smoothed Gram; eigenvalue {lambda:.3e} \
+                     is below numerical floor {eig_floor:.3e}"
+                ));
+            }
+            lambda = lambda.max(eig_floor);
             if i >= active_start {
                 f[i] = lambda.powf(-0.5);
                 df[i] = -0.5 * lambda.powf(-1.5);
@@ -9435,7 +9444,10 @@ mod tests {
         let t = array![0.5_f64, 1.0, 2.0, -1.0, 0.3, -0.7, 1.4, -0.2];
         let rho = array![0.4_f64, -0.6];
         let worst = value_grad_fd_max_abs_error(&ard, t.view(), rho.view(), 1.0e-6);
-        assert!(worst <= 1.0e-7, "ARD value↔grad FD max abs error = {worst:.3e}");
+        assert!(
+            worst <= 1.0e-7,
+            "ARD value↔grad FD max abs error = {worst:.3e}"
+        );
     }
 
     #[test]
