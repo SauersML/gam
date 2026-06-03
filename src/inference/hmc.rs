@@ -2088,6 +2088,162 @@ mod tests {
         assert!((grad[0] - expected_score).abs() < 1e-12);
     }
 
+    /// Gamma observed information at the mode, `Xᵀ diag(w·ν·y/μ) X`, where the
+    /// per-point curvature `w·ν·y/μ` is exactly `−∂/∂η` of the analytic score
+    /// slot `w·ν·(y/μ − 1)` used by `gamma_log_logp_and_grad`.
+    fn gamma_log_observed_information(
+        x: &Array2<f64>,
+        mode: &Array1<f64>,
+        y: &Array1<f64>,
+        weights: &Array1<f64>,
+        shape: f64,
+    ) -> Array2<f64> {
+        let p = x.ncols();
+        let eta = x.dot(mode);
+        let mut h = Array2::<f64>::zeros((p, p));
+        for i in 0..x.nrows() {
+            let mu = eta[i].exp();
+            let wt = weights[i] * shape * y[i] / mu;
+            for a in 0..p {
+                for b in 0..p {
+                    h[[a, b]] += wt * x[[i, a]] * x[[i, b]];
+                }
+            }
+        }
+        h
+    }
+
+    /// Regression for #680: the whitened GammaLog NUTS target must reproduce
+    /// the #679 coefficient-covariance contract `Vb = H⁻¹` (scale `1.0`), NOT
+    /// the dispersion-double-counted `(1/ν)(XᵀΛX + S)⁻¹`.
+    ///
+    /// We set the stored Hessian to the *true* penalized curvature of the
+    /// target at the mode, `H = Xᵀ diag(w·ν·y/μ) X + S` (Gamma observed
+    /// information + the penalty added **unscaled** — exactly the #679 `H`).
+    /// The whitened target's curvature in z at the mode is `Lᵀ Hβ L`. The fix
+    /// makes `L Lᵀ = H⁻¹` and `Hβ = H`, so this is the identity. The pre-fix
+    /// code scaled the penalty by `ν` and the whitening by `√φ`, turning the
+    /// z-curvature into `φ·(I + (ν−1)·L_H⁻¹ S L_H⁻ᵀ) ≠ I` (for ν=4 the
+    /// diagonal collapses toward ~0.25, never 1).
+    #[test]
+    fn gamma_log_nuts_target_curvature_matches_unscaled_hessian_issue_680() {
+        let x = array![
+            [1.0, -0.7],
+            [1.0, 0.3],
+            [1.0, 1.1],
+            [1.0, -0.2],
+            [1.0, 0.8],
+        ];
+        let mode = array![0.4_f64, -0.6_f64];
+        let y = array![1.2_f64, 0.7, 2.3, 0.9, 1.6];
+        let weights = array![1.0_f64, 1.5, 0.8, 1.2, 1.0];
+        // ν = 1/φ = 4 ⇒ φ = 0.25: a large, easily-detectable double-count.
+        let shape = 4.0_f64;
+        let p = x.ncols();
+
+        let h_data = gamma_log_observed_information(&x, &mode, &y, &weights, shape);
+        // A genuine PD smoothing penalty so the ×ν double-count is detectable.
+        let s = array![[0.5_f64, 0.1], [0.1, 0.9]];
+        let hessian = &h_data + &s;
+
+        let target = NutsPosterior::new(
+            x.view(),
+            y.view(),
+            weights.view(),
+            s.view(),
+            mode.view(),
+            hessian.view(),
+            NutsFamily::GammaLog,
+            shape,
+            crate::estimate::Dispersion::Estimated(1.0 / shape),
+            false,
+        )
+        .expect("GammaLog NUTS target builds");
+
+        // z-space precision at the mode (z = 0) via central differences of the
+        // analytic gradient: `−∂(∇_z logp)/∂z = Lᵀ Hβ L`. Correct value: I.
+        let eps = 1e-6;
+        let z0 = Array1::<f64>::zeros(p);
+        let mut hz = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            let mut zp = z0.clone();
+            let mut zm = z0.clone();
+            zp[j] += eps;
+            zm[j] -= eps;
+            let (_, gp) = target.compute_logp_and_grad_nd(&zp);
+            let (_, gm) = target.compute_logp_and_grad_nd(&zm);
+            for a in 0..p {
+                hz[[a, j]] = -(gp[a] - gm[a]) / (2.0 * eps);
+            }
+        }
+
+        for a in 0..p {
+            for b in 0..p {
+                let expected = if a == b { 1.0 } else { 0.0 };
+                assert!(
+                    (hz[[a, b]] - expected).abs() < 1e-4,
+                    "z-curvature[{a},{b}] = {} (expected {expected}); a non-identity \
+                     value means the GammaLog target re-introduced the #680 dispersion \
+                     double-count (penalty ×ν and/or whitening ×√φ)",
+                    hz[[a, b]]
+                );
+            }
+        }
+        // Trace = p (identity) rejects the φ-scaled `φ·tr(...)` signature.
+        let trace: f64 = (0..p).map(|i| hz[[i, i]]).sum();
+        assert!(
+            (trace - p as f64).abs() < 1e-3,
+            "z-curvature trace {trace} ≠ {p}: dispersion double-count signature"
+        );
+    }
+
+    /// Regression for #680 (whitening half, isolated): for a weight-carries-
+    /// dispersion family the whitening must satisfy `L Lᵀ = H⁻¹` — i.e.
+    /// `cov_scale = 1` — so the sampler whitens against the same `H⁻¹` it
+    /// targets. The pre-fix Gamma path scaled `L` by `√φ`, giving
+    /// `L Lᵀ = φ·H⁻¹` and `chol·cholᵀ·H = φ·I ≠ I`.
+    #[test]
+    fn gamma_log_nuts_whitening_targets_unscaled_inverse_hessian_issue_680() {
+        let x = array![[1.0, -0.4], [1.0, 0.6], [1.0, 0.1], [1.0, 1.3]];
+        let mode = array![0.2_f64, 0.3_f64];
+        let y = array![0.8_f64, 1.7, 1.1, 2.2];
+        let weights = array![1.0_f64, 1.0, 1.5, 0.7];
+        let shape = 6.25_f64; // φ = 0.16
+        let p = x.ncols();
+        let s = array![[0.3_f64, 0.0], [0.0, 0.7]];
+        let hessian = &gamma_log_observed_information(&x, &mode, &y, &weights, shape) + &s;
+
+        let target = NutsPosterior::new(
+            x.view(),
+            y.view(),
+            weights.view(),
+            s.view(),
+            mode.view(),
+            hessian.view(),
+            NutsFamily::GammaLog,
+            shape,
+            crate::estimate::Dispersion::Estimated(1.0 / shape),
+            false,
+        )
+        .expect("GammaLog NUTS target builds");
+
+        // chol = L with L Lᵀ = H⁻¹  ⇒  (L Lᵀ) H = I.
+        let l = target.chol();
+        let llt = l.dot(&l.t());
+        let prod = llt.dot(&hessian);
+        for a in 0..p {
+            for b in 0..p {
+                let expected = if a == b { 1.0 } else { 0.0 };
+                assert!(
+                    (prod[[a, b]] - expected).abs() < 1e-8,
+                    "L Lᵀ H[{a},{b}] = {} (expected {expected}); a φ·I result means \
+                     the Gamma whitening still scales by √φ (#680)",
+                    prod[[a, b]]
+                );
+            }
+        }
+    }
+
     #[test]
     fn firth_jeffreys_logit_is_finite_for_rank_deficient_design() {
         let x = array![
