@@ -135,22 +135,19 @@ fn conditional_prediction_backend<'a>(
     }
     if let Some(hessian) = usable_penalized_hessian(fit, expected_dim, label) {
         // The penalized Hessian is the *unscaled* precision `H = X'WX + S`,
-        // but the conditional covariance the predict path expects is
-        // `Vb = φ · H^{-1}` (matches the stored `beta_covariance()` route
-        // above). Without this scale the Hessian fallback would silently
-        // drop dispersion. For families with `φ = 1` (Binomial / Poisson)
-        // this collapses to the original behavior.
-        let phi = fit
-            .dispersion()
-            .map(|d| {
-                use crate::inference::dispersion_cov::DispersionExt as _;
-                let inv_phi = d.inv_phi();
-                if inv_phi > 0.0 { 1.0 / inv_phi } else { 1.0 }
-            })
-            .unwrap_or(1.0);
+        // and the conditional covariance the predict path expects is
+        // `Vb = coefficient_covariance_scale · H^{-1}` — exactly the scale the
+        // stored `beta_covariance()` route above applies. For the scale-free
+        // profiled Gaussian this is `σ̂²`; for every family whose working weight
+        // already carries `1/φ` (Gamma, Tweedie, Beta, …) it is `1.0`, because
+        // `H` already equals the true penalized Hessian. Using the observation
+        // dispersion `φ̂` here instead would double-count it for those families
+        // and shrink every SE by `√φ̂` (#679). For `φ ≡ 1` families
+        // (Binomial / Poisson) this collapses to the original behavior.
+        let scale = fit.coefficient_covariance_scale();
         match PredictionCovarianceBackend::from_factorized_hessian_scaled(
             SymmetricMatrix::Dense(hessian.clone()),
-            phi,
+            scale,
         ) {
             Ok(backend) => return Some(backend),
             Err(err) => {
