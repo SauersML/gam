@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gamfit"
-version = "0.1.150"
+version = "0.1.151"
 description = "Formula-first generalized additive models with a high-performance Rust core"
 readme = "README_PYPI.md"
 requires-python = ">=3.10"
@@ -50,7 +50,7 @@ dependencies = [
 Homepage = "https://github.com/SauersML/gam"
 Repository = "https://github.com/SauersML/gam"
 Issues = "https://github.com/SauersML/gam/issues"
-Changelog = "https://github.com/SauersML/gam/releases"
+Changelog = "https://gamfit.readthedocs.io/en/latest/changelog/"
 
 [project.optional-dependencies]
 test = [

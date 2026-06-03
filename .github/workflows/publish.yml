@@ -8,7 +8,7 @@ on:
 
 permissions:
   actions: read
-  contents: read
+  contents: write
 
 jobs:
   publish:
@@ -28,14 +28,49 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify version matches tag
+      - name: Verify tag, package versions, and changelog agree
         if: startsWith(github.ref, 'refs/tags/')
         run: |
-          TAG=${GITHUB_REF#refs/tags/v}
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"           # e.g. v0.3.78
+          TAG_VER="${TAG#v}"                         # e.g. 0.3.78
           CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "Tag version ($TAG) does not match Cargo.toml version ($CARGO_VERSION)"
+          PYPROJECT_VERSION=$(grep '^version' pyproject.toml | head -1 | cut -d'"' -f2)
+          if [ "$TAG_VER" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VER) does not match Cargo.toml gam version ($CARGO_VERSION)"
             exit 1
+          fi
+          # The top changelog entry must name this tag and both package versions,
+          # so a release cannot ship without an updated, accurate CHANGELOG.md.
+          TOP=$(grep -m1 '^## ' CHANGELOG.md || true)
+          echo "Top changelog entry: $TOP"
+          for needle in "$TAG" "gam $CARGO_VERSION" "gamfit $PYPROJECT_VERSION"; do
+            case "$TOP" in
+              *"$needle"*) : ;;
+              *) echo "::error::Top CHANGELOG.md entry must mention '$needle' (got: $TOP)"; exit 1 ;;
+            esac
+          done
+
+      - name: Extract release notes from CHANGELOG.md
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          # Emit the first "## " section (the entry for this release).
+          awk '/^## /{n++} n==1{print} n==2{exit}' CHANGELOG.md > RELEASE_NOTES.md
+          echo "----- release notes -----"
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release from changelog
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file RELEASE_NOTES.md --verify-tag
           fi
 
       - name: Publish

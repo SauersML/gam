@@ -191,6 +191,87 @@ fn channel_aware_audit_still_flags_real_aliases_within_one_channel() {
 }
 
 #[test]
+fn channel_aware_audit_accepts_intra_block_rank_deficiency() {
+    // Block A (channel 0) is full-rank.  Block B (channel 1) carries a
+    // genuinely rank-deficient design: column 0 is independent, columns
+    // 1..p are exact copies of column 0 — INTRA-block aliased, NOT
+    // cross-block aliased (channels are disjoint, so no pairwise
+    // cross-block alias can be reported by the channel-aware scan).
+    //
+    // The pre-fix audit treated this as fatal because joint_rank <
+    // joint_cols AND the gauge_priority resolution path only fires when
+    // dropped columns are attributed to a LOWER-priority block of a
+    // detected cross-block alias pair — a condition that pure intra-block
+    // deficiency by construction cannot satisfy.  Canonicalisation
+    // already drops the redundant columns and the fit proceeds on the
+    // reduced basis; the audit must surface this as NON-fatal.
+    //
+    // This mirrors the biobank GAMLSS jointpc failure mode: shared
+    // covariates between the threshold and log-sigma designs leave the
+    // log-sigma block with most columns linearly dependent (after the
+    // scale-deviation reparameterisation residualises against the
+    // threshold span), and the channel-aware view correctly sees that
+    // the deficiency is intra-block — there are no above-threshold
+    // cross-block alias pairs because the two channels are structurally
+    // disjoint by construction.
+    let p_b: usize = 4;
+    let mut design_a = Array2::<f64>::zeros((N, 1));
+    let mut design_b = Array2::<f64>::zeros((N, p_b));
+    for i in 0..N {
+        design_a[[i, 0]] = (i as f64).sin();
+        let v = (i as f64).cos();
+        for j in 0..p_b {
+            design_b[[i, j]] = v;
+        }
+    }
+    let specs = [
+        spec_from_dense("a", design_a.clone()),
+        spec_from_dense("b", design_b.clone()),
+    ];
+    let operators: Vec<Arc<dyn RowJacobianOperator>> = vec![
+        Arc::new(SingleChannelOperator::new(design_a, 0)),
+        Arc::new(SingleChannelOperator::new(design_b, 1)),
+    ];
+    let row_hess = IdentityRowHessian::new(N, 2);
+    let audit = audit_identifiability_channel_aware(&specs, &operators, &row_hess)
+        .expect("channel-aware audit must run");
+    assert!(
+        audit.aliased_pairs.is_empty(),
+        "blocks live in orthogonal channels — no cross-block alias pair \
+         should be reported; got {:?}",
+        audit.aliased_pairs,
+    );
+    // Per-block intra-block redundancy is absorbed by the compiler's
+    // `t_lw` reduction (eigenspace-keep), not surfaced via
+    // `dropped_columns` — the latter only carries trailing-pivot RRQR
+    // drops that fire when the JOINT design (after per-block reduction)
+    // is still rank-deficient. Channel-disjoint blocks have no cross-
+    // block residual mass, so the trailing-pivot RRQR is clean and
+    // `dropped_columns` is empty; the intra-block deficiency lives in
+    // the difference between `b.original_dim` and `b.effective_dim`.
+    let intra_block_reduction: usize = audit
+        .blocks
+        .iter()
+        .map(|b| b.original_dim.saturating_sub(b.effective_dim))
+        .sum();
+    assert!(
+        intra_block_reduction > 0,
+        "block B has 3 redundant copies of column 0; the channel-aware \
+         compiler must reduce its effective_dim below original_dim. \
+         blocks: {:?}",
+        audit.blocks,
+    );
+    assert!(
+        !audit.fatal,
+        "pure intra-block rank deficiency (no cross-block alias above \
+         leverage-based report threshold) must NOT be fatal; the inner \
+         penalised solve uses the reduced basis surfaced via t_lw and \
+         the penalty pull-back. summary: {}",
+        audit.summary,
+    );
+}
+
+#[test]
 fn channel_aware_audit_clean_when_blocks_are_distinct() {
     // Different raw-X, different channels: no aliasing, no drops.
     let mut design_a = Array2::<f64>::zeros((N, 1));
