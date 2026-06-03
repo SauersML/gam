@@ -27,7 +27,7 @@ def _redundant_two_atom_data(n: int = 160, p: int = 6, seed: int = 0) -> np.ndar
     return z - z.mean(axis=0, keepdims=True)
 
 
-def _fit_or_xfail(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int):
+def _fit(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
@@ -47,9 +47,9 @@ def _fit_or_xfail(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int
                 random_state=seed,
             )
     except Exception as exc:
-        pytest.xfail(
-            "decoder_incoherence cross-Gram comparison is guarded until the "
-            "multi-atom solver converges reliably: "
+        pytest.fail(
+            "decoder_incoherence cross-Gram comparison requires the multi-atom "
+            "solver to converge: "
             f"weight={decoder_incoherence_weight}, {type(exc).__name__}: {exc}"
         )
     if (
@@ -57,9 +57,9 @@ def _fit_or_xfail(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int
         or not np.isfinite(fit.reconstruction_r2)
         or fit.reconstruction_r2 < 0.05
     ):
-        pytest.xfail(
-            "decoder_incoherence cross-Gram comparison did not pass the "
-            f"skip-if-not-converged guard for weight={decoder_incoherence_weight}: "
+        pytest.fail(
+            "decoder_incoherence cross-Gram comparison produced a degenerate "
+            f"fit for weight={decoder_incoherence_weight}: "
             f"reconstruction_r2={fit.reconstruction_r2!r}"
         )
     return fit
@@ -78,13 +78,13 @@ def _decoder_cross_gram_energy(fit) -> float:
 def test_decoder_incoherence_reduces_recovered_cross_atom_decoder_cross_gram():
     z = _redundant_two_atom_data()
 
-    fit_off = _fit_or_xfail(z, decoder_incoherence_weight=0.0, seed=33)
-    fit_on = _fit_or_xfail(z, decoder_incoherence_weight=50.0, seed=33)
+    fit_off = _fit(z, decoder_incoherence_weight=0.0, seed=33)
+    fit_on = _fit(z, decoder_incoherence_weight=50.0, seed=33)
 
     off_energy = _decoder_cross_gram_energy(fit_off)
     on_energy = _decoder_cross_gram_energy(fit_on)
     if not (np.isfinite(off_energy) and np.isfinite(on_energy)) or off_energy <= 1e-10:
-        pytest.xfail(
+        pytest.fail(
             "decoder_incoherence cross-Gram comparison produced a degenerate "
             f"off fit: off_energy={off_energy!r}, on_energy={on_energy!r}"
         )
