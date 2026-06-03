@@ -69,6 +69,15 @@ impl LatentRetractionRegistry {
             .map_or_else(|| vec![1.0; fallback_dim], RetractionKind::metric_weights)
     }
 
+    /// Per-ambient-axis periodicity for the override retraction, falling back
+    /// to all-non-periodic (`None`) of length `fallback_dim` when no override
+    /// is installed.
+    pub(crate) fn axis_periods(&self, fallback_dim: usize) -> Vec<Option<f64>> {
+        self.block
+            .as_ref()
+            .map_or_else(|| vec![None; fallback_dim], RetractionKind::axis_periods)
+    }
+
     pub(crate) fn validate_dim(&self, latent_dim: usize, context: &str) -> Result<(), String> {
         let dim = self.ambient_dim(latent_dim);
         if dim != latent_dim {

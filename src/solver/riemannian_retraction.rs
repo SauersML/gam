@@ -133,6 +133,25 @@ impl RetractionKind {
             }
         }
     }
+
+    /// Per-ambient-axis periodicity, mirroring
+    /// [`crate::terms::latent_coord::LatentManifold::axis_periods`]. A `Circle`
+    /// retraction wraps modulo `2π`; an embedded `Sphere` retraction is smooth
+    /// with no cut and is reported non-periodic.
+    pub fn axis_periods(&self) -> Vec<Option<f64>> {
+        match self {
+            Self::Euclidean { dim } => vec![None; *dim],
+            Self::Circle => vec![Some(TWO_PI)],
+            Self::Sphere { dim } => vec![None; *dim],
+            Self::Product(product) => {
+                let mut out = Vec::with_capacity(product.ambient_dim());
+                for part in &product.parts {
+                    out.extend(part.axis_periods());
+                }
+                out
+            }
+        }
+    }
 }
 
 impl Retraction for RetractionKind {
