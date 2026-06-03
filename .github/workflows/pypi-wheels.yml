@@ -82,6 +82,17 @@ jobs:
             echo "should_run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # If this exact commit is also a `v*` release tag, defer to the
+          # tag-triggered run so a coordinated release (version bump pushed to
+          # main together with its tag) publishes the wheels exactly once
+          # instead of racing two identical twine uploads. The standalone
+          # "bump pyproject on main, no tag" quick-fix path is unaffected.
+          git fetch --tags --force --quiet origin 2>/dev/null || true
+          if git tag --points-at HEAD | grep -q '^v'; then
+            echo "Commit is tagged $(git tag --points-at HEAD | grep '^v' | head -n1) — deferring to the tag run."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           # Gate on the file that DRIVES the published wheel: maturin reads the
           # version from `[project].version` in pyproject.toml. The internal
           # crates/gam-pyffi/Cargo.toml version (publish = false) does NOT change
