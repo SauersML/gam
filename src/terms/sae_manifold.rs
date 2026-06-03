@@ -3226,6 +3226,63 @@ impl SaeManifoldTerm {
         Ok(value)
     }
 
+    /// Energy of the decoder-block analytic penalties that have no native
+    /// `SaeManifoldLoss` counterpart, evaluated at the current decoder `β` and
+    /// the converged SAE state. These act on the per-atom decoder coefficient
+    /// matrices: cross-atom decoder incoherence (#671), mechanism
+    /// (feature-group) sparsity, and nuclear-norm embedding rank (#672). Each
+    /// is injected with its live per-atom shape / co-activation before its
+    /// value is taken, mirroring the assemble path.
+    ///
+    /// This is deliberately narrower than [`Self::analytic_penalty_value_total`]:
+    /// it excludes the Psi-tier coordinate / assignment penalties (ARD,
+    /// Isometry, ScadMcp, BlockOrthogonality, IBP/softmax assignment sparsity).
+    /// The SAE already carries its own ARD (`loss.ard`) and assignment sparsity
+    /// (`loss.assignment_sparsity`) energy, so adding the registry ARD /
+    /// assignment value on top would double-count, and the gauge-only
+    /// coordinate penalties are not part of the penalized deviance the
+    /// REML/Laplace criterion scores. The decoder-block penalties, by contrast,
+    /// are real penalized-energy terms with no `loss.*` representative: the
+    /// inner solve minimizes them (they enter `gb`/`hbb`) but they were absent
+    /// from the criterion scalar `v`. This restores that consistency so the
+    /// ρ-sweep ranks the same objective the inner solve descends.
+    pub fn analytic_decoder_penalty_value_total(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> Result<f64, ArrowSchurError> {
+        // Resolve each penalty's rho slice exactly as `analytic_penalty_value_total`
+        // does (registry-local rho at zeros), so a learnable decoder-penalty weight
+        // is honoured rather than indexing into an empty view.
+        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        let layout = registry.rho_layout();
+        let beta = self.flatten_beta();
+        let mut value = 0.0_f64;
+        for (penalty, (rho_slice, _tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
+            let rho_local = rho_global.slice(s![rho_slice.clone()]);
+            match penalty {
+                AnalyticPenaltyKind::DecoderIncoherence(base) => {
+                    if let Some(per_fit) = self.live_decoder_incoherence_penalty(base) {
+                        value += per_fit.value(beta.view(), rho_local);
+                    }
+                }
+                AnalyticPenaltyKind::MechanismSparsity(base) => {
+                    for (per_atom, start, end) in self.live_mechanism_sparsity_penalties(base) {
+                        if start < end {
+                            value += per_atom.value(beta.view(), rho_local);
+                        }
+                    }
+                }
+                AnalyticPenaltyKind::NuclearNorm(base) => {
+                    for (per_atom, start, end) in self.live_nuclear_norm_penalties(base) {
+                        value += per_atom.value(beta.slice(s![start..end]), rho_local);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(value)
+    }
+
     pub fn penalized_objective_total(
         &self,
         target: ArrayView2<'_, f64>,
@@ -4308,7 +4365,22 @@ impl SaeManifoldTerm {
         }
         let occam = 0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth;
 
-        let v = loss.total() + 0.5 * log_det - occam;
+        // Decoder-block analytic-penalty energy (#671/#672). The inner solve
+        // descended this energy (it enters `gb`/`hbb`) but it had no native
+        // `loss.*` representative, so the Laplace criterion `v` was scoring a
+        // different objective than the one minimized. Add the converged
+        // decoder-penalty value so the ρ-sweep ranks the same penalized
+        // deviance. Excludes the Psi-tier ARD/assignment penalties already
+        // accounted for in `loss.total()` (see
+        // `analytic_decoder_penalty_value_total`).
+        let decoder_penalty_energy = match registry {
+            Some(reg) => self
+                .analytic_decoder_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
+            None => 0.0,
+        };
+
+        let v = loss.total() + decoder_penalty_energy + 0.5 * log_det - occam;
         Ok((v, loss, cache))
     }
 
@@ -4343,7 +4415,19 @@ impl SaeManifoldTerm {
         )?;
         let log_det = self.streaming_exact_arrow_log_det(target, rho, registry)?;
         let occam = self.reml_occam_term(rho)?;
-        Ok((loss.total() + 0.5 * log_det - occam, loss))
+        // Decoder-block analytic-penalty energy (#671/#672), matching the
+        // full-batch `reml_criterion_with_cache` path so streaming and dense
+        // criteria rank the identical penalized objective.
+        let decoder_penalty_energy = match registry {
+            Some(reg) => self
+                .analytic_decoder_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
+            None => 0.0,
+        };
+        Ok((
+            loss.total() + decoder_penalty_energy + 0.5 * log_det - occam,
+            loss,
+        ))
     }
 
     pub fn streaming_exact_arrow_log_det(
