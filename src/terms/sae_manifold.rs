@@ -2824,13 +2824,21 @@ pub struct SaeManifoldTerm {
 /// `refresh_basis`-rebuilt basis evaluations (`basis_values`, `basis_jacobian`),
 /// plus the assignment logits and latent coordinates.
 ///
-/// Static fields (atom names, basis kinds, smoothness penalties, basis-evaluator
-/// `Arc`s, assignment mode, temperature schedule) are *not* snapshotted: they
-/// are invariant across an inner Newton line search, so the previous
-/// `self.clone()` per halving re-copied them needlessly. Cloning only the
-/// line-search state keeps the `O(N·M·d)` `basis_jacobian` copy off the
-/// per-halving hot path (one snapshot before the search, one restore per
-/// rejected trial) instead of firing it on every Armijo backtrack.
+/// Static fields (atom names, basis kinds, basis-evaluator `Arc`s, assignment
+/// mode, temperature schedule) are *not* snapshotted: they are invariant across
+/// an inner Newton line search, so the previous `self.clone()` per halving
+/// re-copied them needlessly. Cloning only the line-search state keeps the
+/// `O(N·M·d)` `basis_jacobian` copy off the per-halving hot path (one snapshot
+/// before the search, one restore per rejected trial) instead of firing it on
+/// every Armijo backtrack.
+///
+/// The intrinsic roughness Gram `smooth_penalty` (issue #673) is likewise not
+/// snapshotted: the metric reweight is frozen at the last
+/// [`SaeManifoldTerm::assemble_arrow_schur_scaled`] and is only recomputed at
+/// the *next* assembly, so it is invariant across a line search by
+/// construction — the trial objective must use the same frozen penalty
+/// quadratic the Newton step was built from (lagged diffusivity). The
+/// canonical `smooth_penalty_raw` / `smooth_penalty_order` are static.
 #[derive(Debug)]
 struct SaeManifoldMutableState {
     /// Per-atom `(basis_values, basis_jacobian, decoder_coefficients)`.
@@ -3557,6 +3565,17 @@ impl SaeManifoldTerm {
                 rho.log_ard.len(),
                 self.k_atoms()
             ));
+        }
+        // Reparameterize each atom's roughness Gram into arc length at the
+        // current decoder/coordinates (issue #673). This is the single
+        // chokepoint for both the inner Newton assembly and the undamped
+        // evidence factorization, so freezing the pullback-metric weight here
+        // (lagged-diffusivity) keeps the smoothness value, gradient, Kronecker
+        // Hessian, and REML log-det mutually consistent within each assembly
+        // and makes the converged penalty — hence the topology evidence —
+        // gauge-invariant. Constant-speed (periodic) atoms are unaffected.
+        for atom in &mut self.atoms {
+            atom.refresh_intrinsic_smooth_penalty();
         }
         let n = self.n_obs();
         let p = self.output_dim();
@@ -6388,6 +6407,12 @@ impl SaeManifoldTerm {
                     atom.latent_dim
                 ));
             }
+            // Seed the chunk atom from the *raw* roughness Gram (not the
+            // already arc-length-reweighted `smooth_penalty`), so its
+            // constructor recovers the true operator order and its own
+            // `refresh_intrinsic_smooth_penalty` reweights from the canonical
+            // penalty on the chunk's coordinates rather than double-applying
+            // the metric (issue #673).
             let mut chunk_atom = SaeManifoldAtom::new(
                 atom.name.clone(),
                 atom.basis_kind.clone(),
@@ -6395,7 +6420,7 @@ impl SaeManifoldTerm {
                 phi,
                 jet,
                 atom.decoder_coefficients.clone(),
-                atom.smooth_penalty.clone(),
+                atom.smooth_penalty_raw.clone(),
             )?;
             chunk_atom.basis_evaluator = atom.basis_evaluator.clone();
             chunk_atom.basis_second_jet = atom.basis_second_jet.clone();
