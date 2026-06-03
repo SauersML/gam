@@ -3420,7 +3420,18 @@ impl SaeManifoldTerm {
     /// are real penalized-energy terms with no `loss.*` representative: the
     /// inner solve minimizes them (they enter `gb`/`hbb`) but they were absent
     /// from the criterion scalar `v`. This restores that consistency so the
-    /// ρ-sweep ranks the same objective the inner solve descends.
+    /// ρ-sweep ranks the same objective the inner solve descends — the #671
+    /// incoherence lever in particular now shapes model selection, not just the
+    /// Newton step.
+    ///
+    /// NOTE: the coordinate-block penalties with no native `loss.*` twin
+    /// (`ScadMcp`, `BlockOrthogonality`) carry the same residual inconsistency
+    /// (scored in the line search via `penalized_objective_total`, absent from
+    /// the REML scalar). They are left out here because they share a registry
+    /// dispatch with the always-on `Isometry` gauge, whose inclusion in the
+    /// topology-comparison criterion is a separate design question (#673:
+    /// topology evidence is gauge-conditional). Folding the coord-tier energy in
+    /// is tracked apart from this #671 decoder fix.
     pub fn analytic_decoder_penalty_value_total(
         &self,
         registry: &AnalyticPenaltyRegistry,
@@ -5076,6 +5087,23 @@ impl SaeManifoldTerm {
                                     rho_local,
                                     row_layout,
                                 );
+                                // The isometry penalty value depends on the
+                                // decoder B as well as the latent coords, through
+                                // the pullback metric `g = JᵀWJ` with the model
+                                // Jacobian `J = (∂Φ/∂t)·B`. `add_sae_coord_penalty`
+                                // only routes `∂P/∂t` into `gt`; the matching
+                                // `∂P/∂B` must be accumulated into `gb`, or the
+                                // assembled gradient disagrees with the penalized
+                                // objective on the β block (value path counts the
+                                // isometry energy, which moves with B).
+                                if let AnalyticPenaltyKind::Isometry(corrected) =
+                                    &corrected_kind
+                                {
+                                    self.add_sae_isometry_beta_penalty(
+                                        sys, atom_idx, coord, corrected, rho_local,
+                                    );
+                                    beta_penalty_written = true;
+                                }
                             } else {
                                 self.add_sae_coord_penalty(
                                     sys, atom_idx, off, coord, penalty, rho_local, row_layout,
@@ -5267,6 +5295,51 @@ impl SaeManifoldTerm {
                         sys.rows[row].htt[[row_off + b, row_off + axis]] += hv[row * d + b];
                     }
                 }
+            }
+        }
+    }
+
+    /// Accumulate the isometry penalty's decoder-block gradient `∂P/∂B` into the
+    /// β-tier `gb`. The isometry value
+    ///   `P = ½ μ Σ_n ‖J_nᵀ W J_n − G_ref‖²_F`
+    /// is a function of the model Jacobian `J_n[i, a] = Σ_m (∂Φ/∂t)[n, m, a]·B[m, i]`,
+    /// so it depends on the decoder `B` as well as the latent coords `t`. The
+    /// penalty exposes `∂P/∂J` (shape `(n_obs, p·d)`, layout `[n, i·d + a]`) via
+    /// [`IsometryPenalty::grad_jacobian`]; the chain rule through
+    /// `∂J[n, i·d + a]/∂B[m, i] = (∂Φ/∂t)[n, m, a]` gives
+    ///   `∂P/∂B[m, i] = Σ_n Σ_a (∂P/∂J)[n, i·d + a] · (∂Φ/∂t)[n, m, a]`.
+    /// The flat β layout is `β[beta_offsets[k] + m·p + i] = B_k[m, i]`, so each
+    /// atom's contribution lands in its own decoder span. The isometry penalty is
+    /// unscaled at the row-block (Psi) tier — mirroring its coord-block routing
+    /// and `analytic_penalty_value_total` — so no `penalty_scale` is applied here.
+    fn add_sae_isometry_beta_penalty(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        atom_idx: usize,
+        coord: &LatentCoordValues,
+        corrected: &Arc<IsometryPenalty>,
+        rho_local: ArrayView1<'_, f64>,
+    ) {
+        let atom = &self.atoms[atom_idx];
+        let d = coord.latent_dim();
+        let p = atom.decoder_coefficients.ncols();
+        let m = atom.basis_size();
+        let n_obs = coord.n_obs();
+        let grad_jac = corrected.grad_jacobian(coord.as_flat().view(), rho_local);
+        if grad_jac.dim() != (n_obs, p * d) {
+            return;
+        }
+        let jet = &atom.basis_jacobian;
+        let beta_off = self.beta_offsets()[atom_idx];
+        for basis_col in 0..m {
+            for i in 0..p {
+                let mut acc = 0.0;
+                for n in 0..n_obs {
+                    for a in 0..d {
+                        acc += grad_jac[[n, i * d + a]] * jet[[n, basis_col, a]];
+                    }
+                }
+                sys.gb[beta_off + basis_col * p + i] += acc;
             }
         }
     }
