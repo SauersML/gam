@@ -11931,6 +11931,140 @@ mod tests {
             other => panic!("expected RemlOptimizationFailed, got {other:?}"),
         }
     }
+
+    /// Build a non-periodic 1-D atom with a genuine order-2 finite-difference
+    /// roughness Gram, a non-constant-speed decoder, and explicit
+    /// `(basis_values, basis_jacobian)` so the intrinsic reweighting in
+    /// [`SaeManifoldAtom::refresh_intrinsic_smooth_penalty`] is exercised
+    /// directly. A localized (near-diagonal) basis makes each coefficient's
+    /// representative speed the speed at its own sample.
+    fn intrinsic_test_atom(jacobian_scale: f64) -> SaeManifoldAtom {
+        let m = 5usize;
+        let n = m;
+        let p = 1usize;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, 1));
+        let mut decoder = Array2::<f64>::zeros((m, p));
+        for mu in 0..m {
+            // Localized basis: Φ_μ(t_n) ≈ δ_{nμ}.
+            phi[[mu, mu]] = 1.0;
+            // Per-sample basis derivative (axis 0) grows with μ — a
+            // non-constant-speed curve — scaled by `jacobian_scale` to emulate
+            // a global linear reparameterization t -> t / jacobian_scale.
+            jet[[mu, mu, 0]] = jacobian_scale * (1.0 + mu as f64);
+            decoder[[mu, 0]] = 1.0;
+        }
+        let s_raw = crate::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
+        SaeManifoldAtom::new(
+            "intrinsic-1d",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            s_raw,
+        )
+        .unwrap()
+    }
+
+    /// The roughness operator order is recovered from the raw Gram's null
+    /// space: an order-2 difference penalty annihilates the affine functions,
+    /// so `nullity = 2` and the arc-length exponent is `β = ½ − 2 = −3/2`.
+    #[test]
+    fn intrinsic_penalty_recovers_order_two_from_nullity() {
+        let atom = intrinsic_test_atom(1.0);
+        assert_eq!(atom.smooth_penalty_order, 2);
+    }
+
+    /// Gauge invariance (issue #673): a global reparameterization of the latent
+    /// coordinate scales every per-sample speed by a common factor, which
+    /// cancels in the centered reweighting — so the intrinsic Gram `S̃` (and
+    /// hence the topology evidence `tr(BᵀS̃B)`) is identical across the two
+    /// reparameterizations, even though the basis Jacobian (the metric) differs.
+    #[test]
+    fn intrinsic_penalty_is_invariant_to_speed_rescaling() {
+        let a1 = intrinsic_test_atom(1.0);
+        let a2 = intrinsic_test_atom(7.5);
+        // Same raw Gram and decoder; only the basis Jacobian (speed) differs.
+        assert_abs_diff_eq!(
+            (&a1.smooth_penalty_raw - &a2.smooth_penalty_raw)
+                .mapv(f64::abs)
+                .sum(),
+            0.0,
+            epsilon = 1e-12
+        );
+        // The intrinsic (reweighted) Gram is identical despite the 7.5x speed
+        // rescale: the centered ratios are invariant to a global speed factor.
+        let diff = (&a1.smooth_penalty - &a2.smooth_penalty)
+            .mapv(f64::abs)
+            .sum();
+        assert!(
+            diff < 1e-9,
+            "intrinsic Gram changed under a global speed rescale (gauge leak): {diff}"
+        );
+    }
+
+    /// Non-constant speed genuinely reshapes the penalty: the intrinsic Gram
+    /// must differ from the raw Gram when the decoder curve is not
+    /// constant-speed, otherwise the reweighting is a no-op and the gauge fix
+    /// would be vacuous. The congruence preserves symmetry.
+    #[test]
+    fn intrinsic_penalty_differs_from_raw_under_varying_speed() {
+        let atom = intrinsic_test_atom(1.0);
+        let diff = (&atom.smooth_penalty - &atom.smooth_penalty_raw)
+            .mapv(f64::abs)
+            .sum();
+        assert!(
+            diff > 1e-6,
+            "intrinsic reweighting was a no-op on a non-constant-speed curve: {diff}"
+        );
+        for i in 0..atom.basis_size() {
+            for j in 0..atom.basis_size() {
+                assert_abs_diff_eq!(
+                    atom.smooth_penalty[[i, j]],
+                    atom.smooth_penalty[[j, i]],
+                    epsilon = 1e-12
+                );
+            }
+        }
+    }
+
+    /// Constant-speed atoms are untouched: when every sample shares one speed
+    /// (the periodic sin/cos limit), the centered weights are all `1`, so
+    /// `S̃ = S_raw` exactly and the topology comparison among constant-speed
+    /// atoms is unaffected.
+    #[test]
+    fn intrinsic_penalty_leaves_constant_speed_atom_unchanged() {
+        let m = 6usize;
+        let n = m;
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut jet = Array3::<f64>::zeros((n, m, 1));
+        let mut decoder = Array2::<f64>::zeros((m, 1));
+        for mu in 0..m {
+            phi[[mu, mu]] = 1.0;
+            // Identical derivative magnitude at every sample => constant speed.
+            jet[[mu, mu, 0]] = 2.0;
+            decoder[[mu, 0]] = 1.0;
+        }
+        let s_raw = crate::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
+        let atom = SaeManifoldAtom::new(
+            "constant-speed",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            s_raw,
+        )
+        .unwrap();
+        let diff = (&atom.smooth_penalty - &atom.smooth_penalty_raw)
+            .mapv(f64::abs)
+            .sum();
+        assert!(
+            diff < 1e-9,
+            "constant-speed atom's penalty was reweighted (should be identity): {diff}"
+        );
+    }
 }
 
 /// PCA-based seed for SAE atom latent coordinates. Centers `z`, takes its SVD,
