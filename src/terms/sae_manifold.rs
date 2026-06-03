@@ -1947,35 +1947,57 @@ impl SaeManifoldAtom {
             }
         }
 
-        // Representative squared speed per coefficient. Degeneracy floors (zero
-        // total activation, or zero/near-zero local speed) are set relative to
-        // the geometric-mean center of the positive speeds so a flat or
-        // unsupported coefficient inherits a typical speed rather than a
-        // singular negative power, and the reweighting stays scale-free.
+        // Representative squared speed per coefficient, and the geometric-mean
+        // center of the finite positive speeds. Only finite positive speeds
+        // enter the center so a degenerate (inf/NaN) sample cannot corrupt it.
         let mut speeds = vec![0.0_f64; m];
         let mut log_acc = 0.0_f64;
         let mut log_cnt = 0usize;
         for col in 0..m {
             let s = if act[col] > 0.0 { num[col] / act[col] } else { 0.0 };
             speeds[col] = s;
-            if s > 0.0 {
+            if s > 0.0 && s.is_finite() {
                 log_acc += s.ln();
                 log_cnt += 1;
             }
         }
-        // Geometric-mean center of the positive speeds (1.0 if none are
-        // positive — then every weight floors to the center and S̃ = S_raw).
         let center = if log_cnt > 0 {
             (log_acc / log_cnt as f64).exp()
         } else {
-            1.0
+            0.0
         };
-        let speed_floor = center * 1.0e-6;
+        // Degenerate curve (no finite positive speed anywhere, or a non-finite
+        // center): the pullback metric carries no usable scale, so leave the
+        // penalty at its raw Gram — exactly `S̃ = S_raw`, matching the
+        // constant-speed limit with no spurious magnitude inflation.
+        if !(center > 0.0 && center.is_finite()) {
+            self.smooth_penalty.assign(&self.smooth_penalty_raw);
+            return;
+        }
+
+        // Reweight relative to the center so the congruence is a *scale-free*
+        // shape reweighting: the geometric mean of `w_μ` is 1, so a
+        // constant-speed atom (every `s_μ = center`) gives `w_μ ≡ 1` and hence
+        // `S̃ = S_raw` exactly — periodic atoms are untouched and no overall
+        // magnitude (which `λ` already owns) leaks in. The relative floor keeps
+        // a vanishing-speed coefficient at a small fraction of the typical
+        // speed rather than a singular negative power, and clamps any non-finite
+        // ratio back to a finite weight.
+        const RELATIVE_SPEED_FLOOR: f64 = 1.0e-6;
         let mut root_w = vec![0.0_f64; m];
         for col in 0..m {
-            let s = speeds[col].max(speed_floor);
-            // w_μ = s^β; the congruence uses W^{½}, so store s^{β/2}.
-            root_w[col] = s.powf(0.5 * beta);
+            // Normalised squared speed (ratio to the geometric-mean center),
+            // floored below and treated as the floor when non-finite.
+            let ratio = speeds[col] / center;
+            let ratio = if ratio.is_finite() {
+                ratio.max(RELATIVE_SPEED_FLOOR)
+            } else {
+                // inf/NaN ratio (e.g. an overflowed speed) → cap at 1/floor so
+                // its weight stays finite and the rank is preserved.
+                1.0 / RELATIVE_SPEED_FLOOR
+            };
+            // w_μ = ratio^β; the congruence uses W^{½}, so store ratio^{β/2}.
+            root_w[col] = ratio.powf(0.5 * beta);
         }
 
         // S̃ = W^{½} S_raw W^{½}: scale row i and column j by root_w.
