@@ -1339,7 +1339,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // Relative shape tolerance below which a re-solve cannot move any
         // reported quantity meaningfully (far under statistical resolution).
         const SHAPE_REFRESH_REL_TOL: f64 = 1e-4;
-        for _ in 0..MAX_SHAPE_REFRESH {
+        for refresh_iter in 0..MAX_SHAPE_REFRESH {
             let refreshed_shape = super::estimate_gamma_shape_from_eta(
                 y,
                 working_summary.state.eta.as_ref(),
@@ -1351,7 +1351,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // Install the refreshed shape and hold it fixed for any re-solve so
             // the LM objective stays stationary (the lock is *re-armed*, not
             // released — the seed-from-warm-start branch in `update_with_curvature`
-            // must not overwrite this deliberately chosen value).
+            // must not overwrite this deliberately chosen value). Because this
+            // assignment evaluated the shape at the *current* converged η and no
+            // re-solve follows it on the exit paths below, the reported shape
+            // always equals `estimate_gamma_shape_from_eta(final_eta)` — the
+            // self-consistency invariant the in-module Gamma unit test checks.
             working_model.likelihood =
                 working_model.likelihood.clone().with_gamma_shape(refreshed_shape);
             working_model.gamma_shape_locked = true;
@@ -1361,6 +1365,17 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 // `refreshed_shape`, because the only way to reach here without
                 // a re-solve is that the prior solve's shape already matched the
                 // converged-η estimate. Nothing left to rebuild.
+                break;
+            }
+            if refresh_iter + 1 == MAX_SHAPE_REFRESH {
+                // Final allowed pass and the shape is still drifting (a
+                // pathological non-contraction). Do NOT re-solve: re-solving
+                // would advance `final_eta` past the η the just-installed shape
+                // was evaluated at, breaking the stored-shape == estimate(final_eta)
+                // invariant. Stopping here keeps the reported shape exactly the
+                // ML estimate at the reported η; the residual weight/φ drift is
+                // bounded by the last `rel_change` and never worse than the
+                // pre-fix frozen-warm-start value.
                 break;
             }
             // The shape moved: re-solve β at the corrected shape, warm-started
