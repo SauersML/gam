@@ -4478,38 +4478,75 @@ impl SaeManifoldTerm {
     ///   * decoder β: `beta_dim − tr(λ_smooth · S_β⁻¹ · ⊕_k S_k⊗I_p)`, the
     ///     smoothness effective-dof already assembled for the Fellner-Schall
     ///     step (penalty-shrunk directions do not cost a full parameter);
-    ///   * latent coordinates: the assignment-weighted dimension budget
-    ///     `Σ_i Σ_k a_{ik}·d_k` — each token spends `d_k` of its `p` observed
-    ///     channels locating itself on the atom it is (softly) assigned to.
+    ///   * latent coordinates: the exact ARD-shrunk trace
+    ///     `Σ_k Σ_j (n_active_k − α_{kj}·tr_{kj}(H⁻¹))` — each per-token
+    ///     coordinate is a latent variable whose effective dof is reduced from
+    ///     1 by its ARD prior, so a fully prior-shrunk axis costs ~0 parameters.
     ///
-    /// The coordinate term is an effective-dof approximation (the per-token
-    /// coordinates are latent variables shrunk by their ARD prior, so this is a
-    /// mild over-count and `φ̂` is correspondingly, conservatively, a touch
-    /// wide). In the SAE regime `N·p ≫ edf` the correction is small. The
-    /// residual dof is floored at 1 so `φ̂` stays finite and positive.
+    /// The coordinate term is the **exact** ARD-shrunk effective dof of the
+    /// latent block: along axis `(k,j)` the MacKay/Fellner-Schall edf is
+    /// `n_active_k − α_{kj}·tr_{kj}(H⁻¹)`, the well-determined-direction count
+    /// after the ARD prior `α_{kj}` shrinks each coordinate. `tr_{kj}(H⁻¹)` is
+    /// the same posterior-variance trace [`Self::ard_inverse_traces`] assembles
+    /// for the EFS ARD step (reused here, not recomputed), so the dispersion is
+    /// consistent with the precision update `α_new = n/(‖t‖²+tr(H⁻¹))`. The
+    /// per-axis scalar count `n_active_k` must match the support the trace sums
+    /// over: `n` for the dense full-support layout, or the number of rows where
+    /// atom `k` is active for the compact active-set layout (inactive
+    /// prior-dominated coordinates contribute 0 to both the trace and the
+    /// count, hence 0 edf). The residual dof is floored at 1 so `φ̂` stays
+    /// finite and positive.
     fn reconstruction_dispersion(
         &self,
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
-        lambda_smooth: f64,
+        rho: &SaeManifoldRho,
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let p = self.output_dim();
         let n_scalar = (n * p) as f64;
         let rss = 2.0 * loss.data_fit;
         let smooth_edf = self
-            .decoder_smoothness_effective_dof(cache, lambda_smooth)
+            .decoder_smoothness_effective_dof(cache, rho.lambda_smooth())
             .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?;
         let beta_edf = (self.beta_dim() as f64 - smooth_edf).max(0.0);
-        let assignments = self.assignment.assignments();
+        // Exact ARD-shrunk latent-coordinate edf, reusing the EFS trace cache.
+        let traces = self
+            .ard_inverse_traces(cache)
+            .map_err(|e| format!("reconstruction_dispersion: ARD traces: {e}"))?;
+        if rho.log_ard.len() != self.atoms.len() {
+            return Err(format!(
+                "reconstruction_dispersion: ρ has {} ARD atoms but term has {}",
+                rho.log_ard.len(),
+                self.atoms.len()
+            ));
+        }
         let mut coord_edf = 0.0_f64;
         for (k, atom) in self.atoms.iter().enumerate() {
-            let d_k = atom.latent_dim as f64;
-            let mut mass = 0.0_f64;
-            for row in 0..n {
-                mass += assignments[[row, k]];
+            let d_k = atom.latent_dim;
+            if rho.log_ard[k].len() != d_k || traces[k].len() != d_k {
+                return Err(format!(
+                    "reconstruction_dispersion: ARD shape mismatch at atom {k} \
+                     (log_ard={}, traces={}, d_k={d_k})",
+                    rho.log_ard[k].len(),
+                    traces[k].len()
+                ));
             }
-            coord_edf += mass * d_k;
+            // Scalar count matched to the trace support (see fn doc).
+            let n_active_k = match self.last_row_layout {
+                Some(ref layout) => layout
+                    .active_atoms
+                    .iter()
+                    .filter(|active| active.contains(&k))
+                    .count() as f64,
+                None => n as f64,
+            };
+            for j in 0..d_k {
+                let alpha = rho.log_ard[k][j].exp();
+                // edf_kj ∈ [0, n_active_k]; clamp against numerical drift.
+                let edf_kj = (n_active_k - alpha * traces[k][j]).clamp(0.0, n_active_k);
+                coord_edf += edf_kj;
+            }
         }
         let resid_dof = (n_scalar - beta_edf - coord_edf).max(1.0);
         let phi = rss / resid_dof;
@@ -6594,7 +6631,7 @@ impl SaeManifoldOuterObjective {
         )?;
         let dispersion = self
             .term
-            .reconstruction_dispersion(&loss, &cache, rho.lambda_smooth())?;
+            .reconstruction_dispersion(&loss, &cache, &rho)?;
         self.term.assemble_shape_uncertainty(&cache, dispersion)
     }
 
