@@ -6297,6 +6297,9 @@ impl<'a> RemlState<'a> {
                 &pirls_config,
                 warm_start_ref,
                 adaptive_kkt_tolerance,
+                // REML cost eval: never re-profile the Gamma scale against the
+                // trial λ's residuals (would bias λ selection — see #678).
+                false,
             );
             let pirls_elapsed = pirls_start.elapsed();
             if let Ok((ref res, ref wm)) = result {
@@ -6669,6 +6672,9 @@ impl<'a> RemlState<'a> {
             // owned by the production trajectory and the sigma points are
             // not on it.
             None,
+            // Sigma-point cubature eval: Gamma scale refinement stays OFF (only
+            // the final reported fit refines — see #678).
+            false,
         );
         let pirls_elapsed = pirls_start.elapsed();
         if let Ok((ref res, ref wm)) = result {
