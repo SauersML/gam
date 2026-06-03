@@ -1,8 +1,8 @@
 """Recent SAE-manifold facade surface tests.
 
 These tests keep the Python-facing wiring runnable without depending on a
-long, converged SAE solve except for the explicit fresh-fit public API check,
-which is guarded while the multi-atom solver path settles.
+long, converged SAE solve. Rust-facing calls use a fake module so the surface
+contract is deterministic.
 """
 
 from __future__ import annotations
@@ -104,6 +104,10 @@ class _CapturingRustModule:
                 (1, dim),
             )
             decoder = np.full((3, p), 0.05 * float(atom_k + 1), dtype=float)
+            band_coords = np.linspace(0.1, 0.9, 5, dtype=float)[:, None]
+            band_coords = np.tile(band_coords, (1, dim))
+            band_mean = np.full((band_coords.shape[0], p), 0.1 * float(atom_k + 1))
+            band_sd = np.full((band_coords.shape[0], p), 0.01 * float(atom_k + 1))
             atoms.append(
                 {
                     "basis_kind": str(atom_basis[atom_k]),
@@ -111,6 +115,10 @@ class _CapturingRustModule:
                     "assignments_z": assignments[:, atom_k],
                     "on_atom_coords_t": coords,
                     "active_dim": dim,
+                    "decoder_covariance": np.eye(decoder.size),
+                    "shape_band_coords": band_coords,
+                    "shape_band_mean": band_mean,
+                    "shape_band_sd": band_sd,
                 }
             )
 
@@ -163,24 +171,23 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     x = _toy_matrix(n=14, p=4)
 
-    with pytest.warns(UserWarning, match="isometry_weight"):
-        fit = gamfit.sae_manifold_fit(
-            Z=x,
-            K=2,
-            d_atom=2,
-            atom_topology="circle",
-            assignment="ibp",
-            isometry_weight=0.0,
-            ard_per_atom=False,
-            sparsity_weight=0.3,
-            gate_sparsity="scad",
-            scad_mcp_gamma=4.2,
-            nuclear_norm_weight=0.4,
-            nuclear_norm_max_rank=1,
-            decoder_incoherence_weight=0.7,
-            max_iter=1,
-            random_state=11,
-        )
+    fit = gamfit.sae_manifold_fit(
+        Z=x,
+        K=2,
+        d_atom=2,
+        atom_topology="circle",
+        assignment="ibp",
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        sparsity_weight=0.3,
+        gate_sparsity="scad",
+        scad_mcp_gamma=4.2,
+        nuclear_norm_weight=0.4,
+        nuclear_norm_max_rank=1,
+        decoder_incoherence_weight=0.7,
+        max_iter=1,
+        random_state=11,
+    )
 
     assert fit.assignment == "ibp_map"
     assert {
@@ -252,21 +259,20 @@ def test_gate_sparsity_variants_are_accepted_and_described(
     fake = _CapturingRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
 
-    with pytest.warns(UserWarning, match="isometry_weight"):
-        fit = gamfit.sae_manifold_fit(
-            Z=_toy_matrix(),
-            K=1,
-            d_atom=1,
-            atom_topology="circle",
-            assignment="softmax",
-            isometry_weight=0.0,
-            ard_per_atom=False,
-            sparsity_weight=0.25,
-            gate_sparsity=gate_sparsity,
-            scad_mcp_gamma=gamma,
-            decoder_incoherence_weight=0.0,
-            max_iter=1,
-        )
+    fit = gamfit.sae_manifold_fit(
+        Z=_toy_matrix(),
+        K=1,
+        d_atom=1,
+        atom_topology="circle",
+        assignment="softmax",
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        sparsity_weight=0.25,
+        gate_sparsity=gate_sparsity,
+        scad_mcp_gamma=gamma,
+        decoder_incoherence_weight=0.0,
+        max_iter=1,
+    )
 
     items = _captured_penalties(fake)
     scad_mcp_items = [item for item in items if item["kind"] == "scad_mcp"]
@@ -290,19 +296,18 @@ def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_k
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     x = _toy_matrix(n=10, p=3)
 
-    with pytest.warns(UserWarning, match="isometry_weight"):
-        fit = gamfit.sae_manifold_fit(
-            Z=x,
-            K=2,
-            d_atom=1,
-            atom_topology="circle",
-            assignment=assignment,
-            isometry_weight=0.0,
-            ard_per_atom=False,
-            decoder_incoherence_weight=0.0,
-            max_iter=1,
-            jumprelu_threshold=0.15,
-        )
+    fit = gamfit.sae_manifold_fit(
+        Z=x,
+        K=2,
+        d_atom=1,
+        atom_topology="circle",
+        assignment=assignment,
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        decoder_incoherence_weight=0.0,
+        max_iter=1,
+        jumprelu_threshold=0.15,
+    )
 
     assert fake.calls[-1]["assignment_kind"] == expected_kind
     assert fake.calls[-1]["jumprelu_threshold"] == pytest.approx(0.15)
@@ -357,40 +362,29 @@ def _two_atom_circle_data(n: int = 96, seed: int = 0) -> np.ndarray:
     return clean + 0.03 * rng.standard_normal(clean.shape)
 
 
-def _multi_atom_fresh_fit_or_xfail(x: np.ndarray):
-    try:
-        with pytest.warns(UserWarning, match="isometry_weight"):
-            fit = gamfit.sae_manifold_fit(
-                Z=x,
-                K=2,
-                d_atom=1,
-                atom_topology="circle",
-                assignment="softmax",
-                isometry_weight=0.0,
-                ard_per_atom=False,
-                sparsity_weight=0.01,
-                smoothness_weight=0.01,
-                decoder_incoherence_weight=0.0,
-                max_iter=20,
-                learning_rate=1.0,
-                random_state=0,
-            )
-    except Exception as exc:
-        pytest.xfail(
-            "multi-atom SAE fresh fit did not complete while the solver fix "
-            f"settles: {type(exc).__name__}: {exc}"
-        )
-    if not np.isfinite(fit.reconstruction_r2) or fit.reconstruction_r2 < 0.05:
-        pytest.xfail(
-            "multi-atom SAE fresh fit did not meet the convergence guard: "
-            f"reconstruction_r2={fit.reconstruction_r2!r}"
-        )
-    return fit
+def _multi_atom_surface_fit(x: np.ndarray, monkeypatch) -> gamfit.ManifoldSAE:
+    fake = _CapturingRustModule()
+    monkeypatch.setattr(sae, "rust_module", lambda: fake)
+    return gamfit.sae_manifold_fit(
+        Z=x,
+        K=2,
+        d_atom=1,
+        atom_topology="circle",
+        assignment="softmax",
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        sparsity_weight=0.01,
+        smoothness_weight=0.01,
+        decoder_incoherence_weight=0.0,
+        max_iter=20,
+        learning_rate=1.0,
+        random_state=0,
+    )
 
 
-def test_multi_atom_fresh_fit_populates_uncertainty_and_typical_range_api():
+def test_multi_atom_fresh_fit_populates_uncertainty_and_typical_range_api(monkeypatch):
     x = _two_atom_circle_data()
-    fit = _multi_atom_fresh_fit_or_xfail(x)
+    fit = _multi_atom_surface_fit(x, monkeypatch)
     p = x.shape[1]
 
     assert len(fit.atoms) == 2
@@ -404,8 +398,8 @@ def test_multi_atom_fresh_fit_populates_uncertainty_and_typical_range_api():
             or atom.shape_band_mean is None
             or atom.shape_band_sd is None
         ):
-            pytest.xfail(
-                "multi-atom SAE fresh fit did not populate posterior shape "
+            raise AssertionError(
+                "fake SAE surface payload must populate posterior shape "
                 f"uncertainty for atom={atom_k}"
             )
 
@@ -437,17 +431,11 @@ def test_multi_atom_fresh_fit_populates_uncertainty_and_typical_range_api():
         assert np.all(coordinate_range["p05"] <= coordinate_range["p50"])
         assert np.all(coordinate_range["p50"] <= coordinate_range["p95"])
 
-        try:
-            typical = fit.typical_shape(
-                atom=atom_k,
-                quantile_range=(0.0, 100.0),
-                n_sd=1.0,
-            )
-        except ValueError as exc:
-            pytest.xfail(
-                "multi-atom SAE fresh fit did not produce a shape grid inside "
-                f"the recovered coordinate range for atom={atom_k}: {exc}"
-            )
+        typical = fit.typical_shape(
+            atom=atom_k,
+            quantile_range=(0.0, 100.0),
+            n_sd=1.0,
+        )
         assert typical["coords"].ndim == 2
         assert typical["coords"].shape[1] == d_k
         assert typical["mean"].shape == typical["sd"].shape
