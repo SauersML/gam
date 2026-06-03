@@ -208,16 +208,6 @@ pub fn scatter_batched<T: Send>(
     })
 }
 
-<<<<<<< HEAD
-// Non-linux builds have no CUDA contexts to bind, so there is no device tiling to
-// perform. Some callers (e.g. the SAE decoder-Gram and S·B batched paths) invoke
-// `scatter_batched` unconditionally and rely on it existing on every target, so
-// provide a real cross-platform implementation: run the whole batch as a single
-// CPU tile on the calling thread. The closure's per-item `try_fast_*` shims fall
-// back to CPU when no device is present, so a device-free run still produces
-// correct results, and the caller's `match` takes the same `Some`/`None` paths it
-// would on Linux.
-=======
 /// Non-linux `scatter_batched`: there are no CUDA contexts to bind off Linux,
 /// so device fan-out is unavailable.
 ///
@@ -233,7 +223,6 @@ pub fn scatter_batched<T: Send>(
 /// devices: each tile's closure runs over its own disjoint sub-slice, with no
 /// device binding to perform on this platform (the only step the Linux path
 /// adds).
->>>>>>> 06a79a7be867827d299f9bc100f9ef8a47af1223
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn scatter_batched<T: Send>(
@@ -241,10 +230,6 @@ pub fn scatter_batched<T: Send>(
     items: &mut [T],
     f: impl Fn(usize, &mut [T]) -> Option<()> + Sync,
 ) -> Option<()> {
-<<<<<<< HEAD
-    let ordinal = rt.device_ordinals().first().copied().unwrap_or(0);
-    f(ordinal, items)
-=======
     let tiles = balanced_partition(rt, items.len());
     if tiles.is_empty() {
         return None;
@@ -262,7 +247,6 @@ pub fn scatter_batched<T: Send>(
         consumed = range.end;
     }
     if all_ok { Some(()) } else { None }
->>>>>>> 06a79a7be867827d299f9bc100f9ef8a47af1223
 }
 
 #[cfg(test)]
