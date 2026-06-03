@@ -1433,6 +1433,63 @@ impl GlmLikelihoodSpec {
         self.scale.fixed_phi()
     }
 
+    /// Multiplier converting the stored unscaled inverse penalized Hessian
+    /// `H⁻¹` into the reported coefficient covariance `Vb = H⁻¹ · scale`.
+    ///
+    /// # Invariant
+    ///
+    /// `Vb` is the inverse of the Hessian of the *actual penalized objective the
+    /// inner solver minimizes*. The stored Hessian is always assembled as
+    /// `H = XᵀWX + S_λ`, with the penalty `S_λ` added **unscaled** (see
+    /// `pirls::penalty::add_to_hessian`). Whether `H` is already that true
+    /// objective Hessian — and hence whether any post-hoc dispersion multiply is
+    /// warranted — is decided entirely by what the IRLS working weight `W`
+    /// carries:
+    ///
+    /// * **Working weight already carries the reciprocal dispersion / full
+    ///   Fisher information.** Then `H = Xᵀ(W_sf/φ)X + S_λ` already equals the
+    ///   true penalized Hessian (e.g. mgcv's `XᵀW_sfX/φ + S_λ` for Gamma), so
+    ///   `Vb = H⁻¹` and the scale is exactly `1.0`. This is the case for Gamma
+    ///   (`W = prior·shape = prior/φ`), Tweedie (`W = prior·μ^{2−p}/φ`), Beta
+    ///   and Negative-Binomial (the working weight is the complete fixed-scale
+    ///   Fisher information), and the fixed-scale exponential families
+    ///   Poisson/Binomial (`φ ≡ 1`). Multiplying `H⁻¹` by the dispersion again
+    ///   for any of these double-counts it and shrinks every SE by `√dispersion`.
+    ///
+    /// * **Working weight is scale-free** (`W = priorweights`, the profiled
+    ///   Gaussian convention). Then the data term carries an implicit unit scale
+    ///   and `H = XᵀPX + S_λ` is the Hessian of `½·(scaled deviance)·σ²⁻¹`
+    ///   *without* the `σ²`. The correct covariance restores it:
+    ///   `Vb = H⁻¹ · σ̂²`. Only this branch returns a non-unit scale.
+    ///
+    /// `profiled_gaussian_phi` is the profiled residual variance `σ̂²` and is
+    /// consulted **only** for the scale-free profiled-Gaussian branch; every
+    /// other family ignores it. This deliberately does NOT touch
+    /// `dispersion()` / `dispersion_from_likelihood`, which still report the
+    /// response-level observation noise (`1/shape` for Gamma, `1/(1+φ)` for
+    /// Beta, …) used by predictive-interval construction — a distinct quantity
+    /// from the coefficient-covariance scale defined here.
+    #[inline]
+    pub fn coefficient_covariance_scale(&self, profiled_gaussian_phi: f64) -> f64 {
+        match self.scale {
+            // Scale-free working weight: restore the profiled variance.
+            LikelihoodScaleMetadata::ProfiledGaussian => profiled_gaussian_phi,
+            // Working weight already carries the dispersion / full Fisher
+            // information, so the stored H is the true penalized Hessian and no
+            // further dispersion multiply is warranted.
+            //
+            // FixedDispersion covers the explicitly-scaled Gaussian submodel
+            // (W·=1/φ above), Tweedie, and Negative-Binomial; the Gamma and Beta
+            // variants fold their reciprocal-dispersion / precision into W; and
+            // Unspecified families never expose a separate post-hoc scale.
+            LikelihoodScaleMetadata::FixedDispersion { .. }
+            | LikelihoodScaleMetadata::FixedGammaShape { .. }
+            | LikelihoodScaleMetadata::EstimatedGammaShape { .. }
+            | LikelihoodScaleMetadata::EstimatedBetaPhi { .. }
+            | LikelihoodScaleMetadata::Unspecified => 1.0,
+        }
+    }
+
     #[inline]
     pub fn gamma_shape(&self) -> Option<f64> {
         self.scale.gamma_shape()

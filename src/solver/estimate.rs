@@ -716,14 +716,18 @@ fn dispersion_from_likelihood(
     }
 }
 
-/// Scale a posterior covariance H^{-1} by the dispersion phi.
+/// Scale a posterior covariance `H^{-1}` by the coefficient-covariance scale.
 ///
-/// `Vb = H^{-1} * phi`. For fixed-scale exponential families (Poisson,
-/// Binomial) `phi == 1` and this is a no-op; for Gaussian
-/// (`phi = sigma^2`) and Gamma (`phi = 1 / shape`) the unscaled inverse
-/// Hessian carries the wrong units and must be multiplied in. Centralizing
-/// the scaling here keeps the contract visible at every covariance
-/// construction site instead of being inlined as a bare `cov * phi`.
+/// `Vb = H^{-1} * scale`. The multiplier is supplied by
+/// `GlmLikelihoodSpec::coefficient_covariance_scale`: it is the profiled
+/// residual variance `sigma^2` for the scale-free profiled Gaussian, and `1.0`
+/// for every family whose IRLS working weight already carries the dispersion /
+/// full Fisher information (Gamma, Tweedie, Beta, Negative-Binomial, and the
+/// fixed-scale Poisson/Binomial). For the latter the stored `H = X'WX + S_λ`
+/// is already the true penalized Hessian, so no further dispersion multiply is
+/// applied — multiplying again would double-count the dispersion (#679).
+/// Centralizing the scaling here keeps the contract visible at every covariance
+/// construction site instead of being inlined as a bare `cov * scale`.
 #[inline]
 pub(crate) fn scaled_covariance(cov: Array2<f64>, phi: f64) -> Array2<f64> {
     if (phi - 1.0).abs() <= f64::EPSILON {
@@ -3705,30 +3709,28 @@ where
     let dispersion = dispersion_from_likelihood(&pirls_res.likelihood, standard_deviation);
 
     // Explicit dispersion contract for coefficient covariance matrices:
-    // Vb = H⁻¹ * φ̂.  Fixed-scale likelihoods (Poisson/Binomial) use φ = 1,
-    // Gaussian uses the profiled residual variance, and Gamma uses φ = 1/shape.
-    let dispersion_phi = match &pirls_res.likelihood.spec.response {
-        ResponseFamily::Gaussian => standard_deviation * standard_deviation,
-        ResponseFamily::Gamma => {
-            1.0 / pirls_res
-                .likelihood
-                .gamma_shape()
-                .unwrap_or(1.0)
-                .max(f64::MIN_POSITIVE)
-        }
-        ResponseFamily::Tweedie { .. } => pirls_res
-            .likelihood
-            .fixed_phi()
-            .unwrap_or(1.0)
-            .max(f64::MIN_POSITIVE),
-        ResponseFamily::NegativeBinomial { theta } => pirls_res
-            .likelihood
-            .fixed_phi()
-            .unwrap_or(*theta)
-            .max(f64::MIN_POSITIVE),
-        ResponseFamily::Beta { phi } => 1.0 / (1.0 + phi.max(1e-12)),
-        ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::RoystonParmar => 1.0,
-    };
+    // Vb = H⁻¹ · cov_scale, where the stored penalized Hessian is always
+    // H = XᵀWX + S_λ with the penalty added UNSCALED. The multiplier therefore
+    // restores ONLY the dispersion the working weight W does not already carry:
+    //
+    //   * Profiled Gaussian keeps W scale-free (W = priorweights), so the data
+    //     term has unit implicit scale and Vb = H⁻¹·σ̂².
+    //   * Every other family folds its reciprocal dispersion / full Fisher
+    //     information into W (Gamma W = prior/φ, Tweedie W = prior·μ^{2−p}/φ,
+    //     Beta/NB the complete fixed-scale Fisher info, Poisson/Binomial φ ≡ 1),
+    //     so H already equals the true penalized Hessian (identical to mgcv's
+    //     XᵀW_sfX/φ + S_λ) and Vb = H⁻¹ with NO extra dispersion factor. A
+    //     post-hoc ×φ here would double-count the dispersion and shrink every SE
+    //     by √φ (= 1/√shape for Gamma); see #679.
+    //
+    // The single source of truth for this invariant is
+    // `GlmLikelihoodSpec::coefficient_covariance_scale`; the response-level
+    // observation noise used by predictive intervals stays in `dispersion`
+    // above (a deliberately distinct quantity, e.g. 1/shape for Gamma).
+    let cov_scale = pirls_res
+        .likelihood
+        .coefficient_covariance_scale(standard_deviation * standard_deviation)
+        .max(f64::MIN_POSITIVE);
 
     // Compute gradient norm at final rho for reporting
     let finalgrad = reml_state
@@ -3782,7 +3784,7 @@ where
             // Full inverse available: wrap as phi-scaled covariance, compute
             // frequentist quantities, and pass to smoothing-correction cubature.
             beta_covariance = Some(crate::inference::dispersion_cov::PhiScaledCovariance::wrap(
-                scaled_covariance(h_inv.clone(), dispersion_phi),
+                scaled_covariance(h_inv.clone(), cov_scale),
             ));
 
             // Frequentist covariance Ve = F H⁻¹ φ and influence matrix F = H⁻¹ X'WX.
@@ -3810,7 +3812,7 @@ where
             f_mat -= &h_inv.dot(&s_mat);
             enforce_symmetry(&mut f_mat);
             let mut ve = f_mat.dot(h_inv);
-            ve *= dispersion_phi;
+            ve *= cov_scale;
             enforce_symmetry(&mut ve);
             coefficient_influence = Some(f_mat);
             beta_covariance_frequentist = Some(ve);
@@ -3819,16 +3821,18 @@ where
         // Smoothing-parameter correction (first-order delta + optional cubature).
         // Passes None for large models; compute_smoothing_correction_auto falls
         // back to first-order correction when no base covariance is supplied.
-        // `dispersion_phi` is φ̂ at the optimum (σ̂² for Gaussian, 1 for fixed-scale
-        // families). The cubature path multiplies its dispersion-free curvature
-        // block `E_ρ[H(ρ)⁻¹] − H_opt⁻¹` by this φ̂ so the FULL cubature correction
-        // lands on the same c² variance scale as `Vb = φ̂·H_opt⁻¹` (#582); the
-        // var_beta = Cov_ρ[β̂] block is already on that scale and stays unscaled.
+        // `cov_scale` is the coefficient-covariance multiplier at the optimum
+        // (σ̂² for profiled Gaussian, 1 for every weight-carries-dispersion
+        // family). The cubature path multiplies its dispersion-free curvature
+        // block `E_ρ[H(ρ)⁻¹] − H_opt⁻¹` by this scale so the FULL cubature
+        // correction lands on the same c² variance scale as `Vb = cov_scale·H_opt⁻¹`
+        // (#582); the var_beta = Cov_ρ[β̂] block is already on that scale and
+        // stays unscaled.
         let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
             &final_rho,
             &pirls_res,
             beta_covariance_unscaled.as_ref(),
-            dispersion_phi,
+            cov_scale,
             finalgrad_norm,
         );
         smoothing_correction = smoothing_outcome.into_correction();
@@ -3845,7 +3849,7 @@ where
                 h_inv
                     .diag()
                     .iter()
-                    .map(|&v| (dispersion_phi * v.max(0.0)).sqrt()),
+                    .map(|&v| (cov_scale * v.max(0.0)).sqrt()),
             );
             Some(raw_se)
         } else if let Some(ref factor_t) = edf_factor {
@@ -3882,7 +3886,7 @@ where
                 }
                 col_start = col_end;
             }
-            let se = diag_inv.mapv(|v| (dispersion_phi * v.max(0.0)).sqrt());
+            let se = diag_inv.mapv(|v| (cov_scale * v.max(0.0)).sqrt());
             if se.iter().all(|v| v.is_finite()) {
                 Some(se)
             } else {
@@ -3903,10 +3907,10 @@ where
         // ρ-gradient and ρ-Hessian — hence V_ρ — are dispersion-free), and φ̂ → c²·φ̂.
         // Therefore J·V_ρ·Jᵀ ∝ c · c⁰ · c = c², i.e. the correction is already on
         // the c² variance scale, exactly like Vb = φ̂·H⁻¹ ∝ c². It must be added
-        // directly to Vb. Multiplying it by dispersion_phi
+        // directly to Vb. Multiplying it by cov_scale
         // (≈ c²) again would make the correction scale as c⁴, inflating every
-        // predict() interval for large-magnitude responses (#582). dispersion_phi is
-        // applied once, where it belongs: in Vb = scaled_covariance(H⁻¹, dispersion_phi).
+        // predict() interval for large-magnitude responses (#582). cov_scale is
+        // applied once, where it belongs: in Vb = scaled_covariance(H⁻¹, cov_scale).
         beta_covariance_corrected = match (&beta_covariance, &smoothing_correction) {
             (Some(base_cov), Some(corr)) if base_cov.as_array().dim() == corr.dim() => {
                 let mut corrected = base_cov.as_array().clone();
