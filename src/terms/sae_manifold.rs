@@ -11060,12 +11060,25 @@ pub fn sae_pca_seed_initial_coords(
         match &basis_kinds[atom_idx] {
             SaeAtomBasisKind::Periodic => {
                 if vt_rows >= 2 {
-                    let pc1 = vt.row(0);
-                    let pc2_row = if atom_idx == 0 {
-                        1
+                    // Diversify the per-atom circle seed (issue #671). The
+                    // previous scheme shared PC0 as the first phase axis for
+                    // *every* atom, so all periodic atoms read off nearly the
+                    // same phase coordinate, producing near-duplicate basis
+                    // designs and a severely ill-conditioned joint decoder LSQ
+                    // seed. Give each atom a disjoint pair of principal
+                    // components `(PC_{2k}, PC_{2k+1})` when the spectrum is
+                    // wide enough, wrapping around only when atoms outnumber the
+                    // available PC pairs. This keeps distinct atoms' seed
+                    // coordinates decorrelated so the decoder seed stays
+                    // well-conditioned and the cross-atom Gram starts small.
+                    let pc_pairs = vt_rows / 2;
+                    let (pc1_row, pc2_row) = if pc_pairs >= 1 {
+                        let pair = if pc_pairs > 0 { atom_idx % pc_pairs } else { 0 };
+                        (2 * pair, 2 * pair + 1)
                     } else {
-                        1 + atom_idx % vt_rows.saturating_sub(1).max(1)
+                        (0, 1)
                     };
+                    let pc1 = vt.row(pc1_row.min(vt_rows - 1));
                     let pc2 = vt.row(pc2_row.min(vt_rows - 1));
                     for row in 0..n_obs {
                         let mut a = 0.0_f64;
