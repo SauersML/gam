@@ -10103,12 +10103,16 @@ fn sae_streaming_plan(
 /// This helper runs one EM-style M-then-E step on the seed geometry: it fits
 /// each atom's decoder independently against the *full* response (each atom's
 /// own seed coordinates already give it a distinct `Phi_k`), measures the
-/// per-row reconstruction residual under that fit, and emits logits that prefer
-/// the atom which best explains each row. Rows that every atom explains equally
-/// well receive near-equal logits (the residual ties cancel), so the existing
-/// jitter still breaks those rare ties; rows with a clear best atom get a
-/// decisive — but bounded, hence escapable by the Newton refinement — head
-/// start. The result is a proper responsibility seed rather than a saddle.
+/// per-row reconstruction residual under that fit, and emits mean-centred logits
+/// that prefer the atom which best explains each row. Rows that every atom
+/// explains equally well land at exactly zero logits (the residual ties centre
+/// to the neutral state), so the existing jitter still breaks those rare ties;
+/// rows with a clear best atom get a decisive — but bounded, hence escapable by
+/// the Newton refinement — head start. The mean-centring is translation-identity
+/// for softmax and keeps the IBP-MAP `sigmoid(logit/τ)` gate neutral (0.5) on
+/// ties instead of slamming both gates shut, so the seed is safe for both
+/// assignment maps. The result is a proper responsibility seed rather than a
+/// saddle.
 fn sae_residual_seed_logits(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -10178,11 +10182,22 @@ fn sae_residual_seed_logits(
             resid[[row, atom_idx]] = e;
         }
     }
-    // Convert per-row residuals to logits relative to each row's own scale so
-    // the head start is dimensionless. The best atom (lowest residual) gets the
-    // highest logit; ties cancel. Normalise by the row's mean residual across
-    // atoms (with a floor relative to the dataset to keep near-zero-energy rows
-    // well posed) so the spread is O(gain) regardless of output magnitude.
+    // Convert per-row residuals to mean-centred logits relative to each row's
+    // own scale so the head start is dimensionless. The best atom (lowest
+    // residual) gets a positive logit, the worst a negative one, and a row whose
+    // atoms all explain it equally well lands at exactly zero. Normalise by the
+    // row's mean residual across atoms (with a floor relative to the dataset to
+    // keep near-zero-energy rows well posed) so the spread is O(gain) regardless
+    // of output magnitude.
+    //
+    // The mean-centring is what keeps the seed safe across assignment maps.
+    // Softmax is translation-invariant, so subtracting the per-row mean leaves
+    // it bit-identical to the raw `-gain·r/m` form. IBP-MAP, by contrast, maps
+    // each logit through an unnormalised `sigmoid(logit/τ)`: an *uncentred*
+    // negative-only seed would push *every* gate below 0.5 and slam a tied row
+    // shut (`sigmoid(-gain/τ)≈0`), which is worse than the neutral 0.5/0.5 state
+    // the uniform saddle held. Centring restores `logit=0 ⇒ gate=0.5` on ties
+    // and opens the gate (`logit>0`) only for atoms that beat the row mean.
     let mut global_mean = 0.0_f64;
     for row in 0..n_obs {
         for k in 0..k_atoms {
@@ -10198,7 +10213,7 @@ fn sae_residual_seed_logits(
         }
         row_mean = (row_mean / k_atoms as f64).max(floor);
         for k in 0..k_atoms {
-            logits[[row, k]] = -gain * resid[[row, k]] / row_mean;
+            logits[[row, k]] = -gain * (resid[[row, k]] - row_mean) / row_mean;
         }
     }
     Ok(logits)
@@ -10337,14 +10352,39 @@ fn sae_decoder_lsq_init(
     }
     // Symmetric normal-equations matrix and rhs.
     let mut xtx = fast_ata(&x);
-    // Diagonal jitter: relative to the trace so the conditioning is
-    // dimensionless. The data-fit Newton step adds its own ridge later; this
-    // ridge only needs to keep the seed projection well-posed.
+    // Diagonal Tikhonov ridge for the seed projection (issue #671 multi-atom
+    // conditioning). The cold multi-atom seed places near-identical coordinates
+    // on every atom (the periodic seed shares the leading principal component
+    // across atoms), so the joint design's per-atom column blocks are nearly
+    // collinear and `X^T X` is severely ill-conditioned. A tiny mean-relative
+    // ridge (the historical `mean_diag * 1e-8`) leaves the near-null directions
+    // unregularized, producing decoder coefficients of order 1e5; the
+    // DecoderIncoherence penalty's gradient is cubic in `B`, so those seeds blow
+    // the joint solver up by ~1e15. We instead anchor the ridge to the SPECTRAL
+    // scale (the maximum diagonal, an upper bound on the largest eigenvalue)
+    // with a larger relative floor. This bounds the seed solution norm by
+    // roughly `||X^T Z|| / ridge` while leaving well-conditioned designs
+    // essentially unchanged (the ridge stays negligible against the signal
+    // eigenvalues there). Conditioning the seed is correct here: the inner
+    // data-fit Newton step refines `B` from a sane, bounded starting point
+    // rather than a pathological one.
     let mut trace = 0.0_f64;
+    let mut max_diag = 0.0_f64;
     for i in 0..m_total {
-        trace += xtx[[i, i]];
+        let d = xtx[[i, i]];
+        trace += d;
+        if d > max_diag {
+            max_diag = d;
+        }
     }
-    let jitter = (trace / m_total as f64).max(1.0).max(1.0e-12) * 1.0e-8;
+    let mean_diag = (trace / m_total as f64).max(0.0);
+    // Spectral-scale ridge: tie the floor to the largest diagonal so collinear
+    // column blocks (small eigenvalues) are damped relative to the design's
+    // dominant scale, not its average. `1e-4` is large enough to keep the seed
+    // coefficient norm bounded under near-duplicate atoms yet small enough that
+    // a well-conditioned design recovers essentially the unregularized LSQ fit.
+    let spectral_scale = max_diag.max(mean_diag).max(1.0e-12);
+    let jitter = spectral_scale * 1.0e-4;
     for i in 0..m_total {
         xtx[[i, i]] += jitter;
     }

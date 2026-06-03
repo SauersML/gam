@@ -9399,6 +9399,117 @@ mod tests {
         }
     }
 
+    /// Central-difference `(value(t+ε)−value(t−ε))/2ε` per coordinate against the
+    /// analytic `grad_target`: the single self-consistency check that pins "the
+    /// gradient is the gradient of the value". Returns the worst absolute error.
+    fn value_grad_fd_max_abs_error(
+        pen: &dyn AnalyticPenalty,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        epsilon: f64,
+    ) -> f64 {
+        let grad = pen.grad_target(target, rho);
+        let mut worst = 0.0_f64;
+        let mut tp = target.to_owned();
+        let mut tm = target.to_owned();
+        for i in 0..target.len() {
+            let base = target[i];
+            tp[i] = base + epsilon;
+            tm[i] = base - epsilon;
+            let fd = (pen.value(tp.view(), rho) - pen.value(tm.view(), rho)) / (2.0 * epsilon);
+            tp[i] = base;
+            tm[i] = base;
+            let err = (grad[i] - fd).abs();
+            if err > worst {
+                worst = err;
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn ard_value_grad_self_consistent_fd() {
+        let d = 2;
+        let target = PsiSlice::full(8, Some(d));
+        let ard = ARDPenalty::new(target, d);
+        let t = array![0.5_f64, 1.0, 2.0, -1.0, 0.3, -0.7, 1.4, -0.2];
+        let rho = array![0.4_f64, -0.6];
+        let worst = value_grad_fd_max_abs_error(&ard, t.view(), rho.view(), 1.0e-6);
+        assert!(worst <= 1.0e-7, "ARD value↔grad FD max abs error = {worst:.3e}");
+    }
+
+    #[test]
+    fn scadmcp_value_grad_self_consistent_fd() {
+        // Targets straddle both MCP regimes (|t| ≤ γw active, > γw flat).
+        let n_eff = 6usize;
+        let target = PsiSlice::full(n_eff, Some(1));
+        let pen = ScadMcpPenalty::new(
+            target,
+            0.5,
+            n_eff,
+            3.0,
+            1.0e-4,
+            PenaltyConcavity::Mcp,
+            false,
+        )
+        .unwrap();
+        let t = array![0.02_f64, 0.4, 0.9, 1.6, -1.1, -0.05];
+        let rho = Array1::<f64>::zeros(0);
+        // eps = 1e-4 dominates curvature near t≈0, so use a step well above eps.
+        let worst = value_grad_fd_max_abs_error(&pen, t.view(), rho.view(), 1.0e-3);
+        assert!(
+            worst <= 1.0e-5,
+            "ScadMcp value↔grad FD max abs error = {worst:.3e}"
+        );
+    }
+
+    #[test]
+    fn nuclear_norm_value_grad_self_consistent_fd() {
+        let n_eff = 4usize;
+        let p = 3usize;
+        let target = PsiSlice {
+            range: 0..n_eff * p,
+            latent_dim: Some(p),
+        };
+        let pen = NuclearNormPenalty::new(target, 0.8, n_eff, 1.0e-4, None, false).unwrap();
+        let t = array![
+            1.2_f64, -0.4, 0.3, 0.1, 0.9, -0.7, -0.5, 0.2, 1.1, 0.6, -0.3, 0.8
+        ];
+        let rho = Array1::<f64>::zeros(0);
+        let worst = value_grad_fd_max_abs_error(&pen, t.view(), rho.view(), 1.0e-6);
+        assert!(
+            worst <= 1.0e-5,
+            "NuclearNorm value↔grad FD max abs error = {worst:.3e}"
+        );
+    }
+
+    #[test]
+    fn decoder_incoherence_value_grad_self_consistent_fd() {
+        let p = 3usize;
+        let block_sizes = vec![2usize, 2usize];
+        let total: usize = block_sizes.iter().map(|m| m * p).sum();
+        let target = PsiSlice {
+            range: 0..total,
+            latent_dim: Some(total / p),
+        };
+        let mut coact = Array2::<f64>::from_elem((2, 2), 0.0);
+        coact[[0, 1]] = 0.6;
+        coact[[1, 0]] = 0.6;
+        coact[[0, 0]] = 1.0;
+        coact[[1, 1]] = 1.0;
+        let pen =
+            DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 0.7, false).unwrap();
+        let t = array![
+            0.5_f64, -0.3, 0.2, 0.8, -0.1, 0.4, -0.6, 0.7, 0.1, -0.2, 0.9, 0.3
+        ];
+        let rho = Array1::<f64>::zeros(0);
+        let worst = value_grad_fd_max_abs_error(&pen, t.view(), rho.view(), 1.0e-6);
+        assert!(
+            worst <= 1.0e-5,
+            "DecoderIncoherence value↔grad FD max abs error = {worst:.3e}"
+        );
+    }
+
     #[test]
     fn nested_prefix_rejects_non_monotone_prefixes() {
         let target = PsiSlice::full(12, Some(4));

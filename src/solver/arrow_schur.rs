@@ -4314,7 +4314,10 @@ where
     // objective; in the heavily-damped near-stationary regime, banking any
     // genuine decrease is a valid (relaxed) globalisation, so we retain the
     // best such candidate as a fallback to the strict Armijo accept.
-    let mut best_decrease: Option<(Array1<f64>, Array1<f64>, f64, f64, f64, f64)> = None;
+    // Tuple: (delta_t, delta_beta, trial_value, g_dot_p, ridge_t, ridge_beta,
+    // proximal_ridge) — the full step record for the best attempt so the
+    // returned damping metadata matches the step actually banked.
+    let mut best_decrease: Option<(Array1<f64>, Array1<f64>, f64, f64, f64, f64, f64)> = None;
     // Smallest objective INCREASE observed (over attempts that produced a
     // finite trial value but did not decrease). If even the best attempt only
     // raises the objective, but by no more than the objective resolution, the
@@ -4349,9 +4352,9 @@ where
                         let delta_obj = trial_value - current_objective_value;
                         if delta_obj < -objective_resolution {
                             // Genuine (Armijo-failing) decrease: keep the best.
-                            let improves = best_decrease
-                                .as_ref()
-                                .is_none_or(|(_, _, best_value, _, _, _)| trial_value < *best_value);
+                            let improves = best_decrease.as_ref().is_none_or(
+                                |(_, _, best_value, _, _, _, _)| trial_value < *best_value,
+                            );
                             if improves {
                                 best_decrease = Some((
                                     delta_t.clone(),
@@ -4360,6 +4363,7 @@ where
                                     g_dot_p,
                                     ridge_t,
                                     ridge_beta,
+                                    proximal_ridge,
                                 ));
                             }
                         } else if delta_obj < smallest_increase {
@@ -4388,7 +4392,9 @@ where
     // Re-apply the best decreasing step so `self` (the caller's state, mutated
     // through the `trial_objective` closure) is left exactly at that step; the
     // returned deltas describe the move from the incumbent.
-    if let Some((delta_t, delta_beta, trial_value, g_dot_p, ridge_t, ridge_beta)) = best_decrease {
+    if let Some((delta_t, delta_beta, trial_value, g_dot_p, ridge_t, ridge_beta, best_ridge)) =
+        best_decrease
+    {
         let reapplied = trial_objective(delta_t.view(), delta_beta.view());
         // The closure is deterministic (restore-then-apply), so `reapplied`
         // matches the recorded `trial_value` up to rounding; trust the live
@@ -4403,7 +4409,7 @@ where
             delta_beta,
             ridge_t,
             ridge_beta,
-            proximal_ridge,
+            proximal_ridge: best_ridge,
             objective_value: current_objective_value,
             trial_objective_value: final_value,
             gradient_dot_step: g_dot_p,
