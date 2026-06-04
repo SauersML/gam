@@ -26,7 +26,7 @@ fn dataset() -> EncodedDataset {
     let mut values = Array2::<f64>::zeros((n, 3));
     for i in 0..n {
         let t = i as f64 / (n as f64 - 1.0);
-        values[(i, 0)] = (t * 6.28).sin(); // y
+        values[(i, 0)] = (t * std::f64::consts::TAU).sin(); // y
         values[(i, 1)] = t; // x in [0, 1]
         values[(i, 2)] = t * t; // z in [0, 1], skewed
     }
