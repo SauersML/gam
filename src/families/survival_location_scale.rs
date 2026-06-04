@@ -10162,6 +10162,49 @@ pub(crate) fn fit_survival_location_scale_terms(
         let range = layout.time_range();
         rho0.slice_mut(s![range.start..range.end])
             .assign(&time_rho0);
+
+        // Parametric-AFT regime: strong-smoothing seed for the time-warp
+        // penalty.
+        //
+        // When the scale block carries no penalties (a single constant σ) AND
+        // the location/threshold block carries no penalties (a fixed
+        // parametric mean, e.g. `~ age`), the model is mathematically a
+        // *parametric* AFT: the only role of the monotone I-spline time-warp is
+        // to supply the baseline shape, and the data identifies that shape only
+        // through `z = (h(t) - η)/σ`. With a single global σ and a rigid mean,
+        // the flexible deviation of `h(t)` from its penalty nullspace (the
+        // affine `1 + log t` baseline that IS the parametric AFT transform) is
+        // statistically unidentified: the REML/LAML profile in the time
+        // smoothing parameter is a long flat ridge that climbs monotonically
+        // toward strong smoothing. Seeding the time penalty at the weak default
+        // (`time_smooth_lambda ≈ 1e-2`) drops the exact-joint outer search into
+        // the *interior* of that ridge, where it crawls toward the
+        // strong-smoothing boundary one short, ill-conditioned step at a time
+        // and never terminates in reasonable time (#736, #735, #721).
+        //
+        // Seeding instead at strong smoothing places the search at the
+        // statistically correct end of the ridge — the affine baseline — where
+        // the surface is well conditioned and outer stationarity certifies
+        // immediately. This is a regime-specific *initialization*, not a cap or
+        // a tolerance change: the optimizer is still free to relax the time
+        // penalty if the data genuinely prefers a flexible baseline, and the
+        // I-spline basis dimensions are untouched, so any independent rebuild of
+        // the time basis (predictor reconstruction) is unaffected. The genuinely
+        // flexible regimes — a smooth scale (`noise_formula = s(...)`) or a
+        // smooth mean (`~ s(...)`) — carry penalties on those blocks and are
+        // excluded by the guard below, so they keep the full weak-seed search.
+        let constant_scale = log_sigma_boot_design.penalties.is_empty();
+        let rigid_mean = threshold_boot_design.penalties.is_empty();
+        if constant_scale && rigid_mean {
+            // λ ≈ exp(8) ≈ 3·10³: deep in the strong-smoothing regime (the
+            // outer ρ box bound is 10), but still interior so the optimizer can
+            // move if a flexible improvement exists.
+            const PARAMETRIC_AFT_TIME_RHO_SEED: f64 = 8.0;
+            let mut time_seed = rho0.slice_mut(s![range.start..range.end]);
+            for v in time_seed.iter_mut() {
+                *v = PARAMETRIC_AFT_TIME_RHO_SEED;
+            }
+        }
     }
     // Warm-start: inject converged ρ seeds from a previous fit if supplied. The values are
     // clamped to the outer ρ bounds (±12) so that "dead" coordinates returned at extremes
