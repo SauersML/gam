@@ -232,12 +232,11 @@ fn load_library_names(candidates: &[String]) -> Result<Library, GpuError> {
 }
 
 fn load_static_cuda_driver_library() -> Result<&'static Library, GpuError> {
-    let candidates = cuda_library_candidate_names();
-    let raw = Box::into_raw(Box::new(load_library_names(&candidates)?));
-    // SAFETY: deliberate process-lifetime leak. `raw` was just produced by
-    // `Box::into_raw`, so it is a valid, properly aligned, exclusive pointer
-    // and the reborrow yields a `&'static Library` that no other code holds.
-    Ok(unsafe { &*raw })
+    static LIBRARY: OnceLock<Result<Library, GpuError>> = OnceLock::new();
+    LIBRARY
+        .get_or_init(|| load_library_names(&cuda_library_candidate_names()))
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 pub fn preload_cuda_driver() -> Result<(), String> {
