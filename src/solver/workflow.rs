@@ -8085,6 +8085,129 @@ mod tests {
     }
 
     #[test]
+    fn materialize_bernoulli_marginal_slope_rejects_constrained_redundant_scalar_term() {
+        let data = Dataset {
+            headers: vec![
+                "event".to_string(),
+                "x".to_string(),
+                "constant_spline_col".to_string(),
+                "prs_z".to_string(),
+            ],
+            values: Array2::from_shape_vec(
+                (6, 4),
+                vec![
+                    0.0, -2.0, 1.0, -1.2, 1.0, -1.0, 1.0, -0.4, 0.0, 0.0, 1.0, 0.1, 1.0,
+                    1.0, 1.0, 0.5, 0.0, 2.0, 1.0, 1.1, 1.0, 3.0, 1.0, 1.7,
+                ],
+            )
+            .expect("BMS constrained redundant scalar test data shape"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "event".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "constant_spline_col".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "prs_z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Binary,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        };
+        let config = FitConfig {
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("prs_z".to_string()),
+            ..FitConfig::default()
+        };
+        let err = match materialize(
+            "event ~ x + linear(constant_spline_col, min=0.0)",
+            &data,
+            &config,
+        ) {
+            Ok(_) => panic!("constrained duplicate scalar term must be rejected, not pruned"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("constrained linear term 'constant_spline_col' is redundant"),
+            "error should explain that the constrained duplicate scalar cannot be pruned: {msg}"
+        );
+    }
+
+    #[test]
+    fn bernoulli_marginal_slope_prune_rejects_penalized_redundant_scalar_term() {
+        let data = Dataset {
+            headers: vec!["event".to_string(), "constant_spline_col".to_string()],
+            values: Array2::from_shape_vec(
+                (4, 2),
+                vec![0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
+            )
+            .expect("BMS penalized redundant scalar test data shape"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "event".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "constant_spline_col".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![ColumnKindTag::Binary, ColumnKindTag::Continuous],
+        };
+        let mut spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "constant_spline_col".to_string(),
+                feature_col: 1,
+                feature_cols: vec![1],
+                double_penalty: true,
+                coefficient_geometry: crate::smooth::LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        };
+        let mut notes = Vec::new();
+        let err = prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+            &mut spec,
+            &data,
+            "test BMS formula",
+            &mut notes,
+        )
+        .expect_err("explicitly penalized duplicate scalar term must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("explicitly penalized linear term 'constant_spline_col' is redundant"),
+            "error should reject ridge-identification of duplicate scalar directions: {msg}"
+        );
+        assert_eq!(spec.linear_terms.len(), 1);
+        assert!(notes.is_empty());
+    }
+
+    #[test]
     fn materialize_bernoulli_marginal_slope_names_constant_z_column() {
         let data = Dataset {
             headers: vec!["event".to_string(), "bmi".to_string(), "prs_z".to_string()],
