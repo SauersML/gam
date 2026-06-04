@@ -4295,7 +4295,10 @@ impl BernoulliMarginalSlopeFamily {
                 }
                 drop(heartbeat_guard);
                 return Ok(RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
-                    n, r, tiles,
+                    n,
+                    r,
+                    BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS,
+                    tiles,
                 )));
             }
             if log_exact_work(n) {
