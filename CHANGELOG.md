@@ -18,6 +18,12 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.95 — gam 0.3.95 / gamfit 0.1.167 (2026-06-04)
+
+### Fixed
+
+- **Probit BMS marginal-slope: release the marginal/logslope overlap ridge (#754, completing the fix).** The #754 nullspace-shrinkage ridge (shipped in 0.1.165/0.1.166) bounds the marginal block's *unpenalized* directions, but a production-scale run (`duchon(PC1,PC2,PC3,centers=20)`, n≈195k, 1:1 balanced) showed the runaway coefficient (β≈61) actually lives on a **penalized smooth** direction that is degenerate with the score-weighted logslope surface — the marginal↔logslope confound — which the nullspace ridge does not touch. This release ships the additional fixed **overlap ridge** that shrinks exactly those cross-channel directions, plus the production-shaped hypertension BMS regression test. The nullspace ridge alone was necessary but not sufficient at scale; the two ridges together bound both the null-space and the confound directions.
+
 ## v0.3.94 — gam 0.3.94 / gamfit 0.1.166 (2026-06-04)
 
 ### Fixed
