@@ -1501,6 +1501,7 @@ fn validate_binomial_location_scale_termspec(
     validate_term_offset(spec.y.len(), &spec.threshold_offset, "threshold_offset")?;
     validate_term_offset(spec.y.len(), &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
+    validate_binomial_log_sigma_identifiable(&spec.log_sigmaspec, context)?;
     Ok(())
 }
 
@@ -1514,12 +1515,32 @@ fn validate_binomial_location_scalewiggle_termspec(
     validate_term_offset(n, &spec.threshold_offset, "threshold_offset")?;
     validate_term_offset(n, &spec.log_sigma_offset, "log_sigma_offset")?;
     validate_binomial_response(&spec.y, context)?;
+    validate_binomial_log_sigma_identifiable(&spec.log_sigmaspec, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
     crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
         &spec.link_kind,
         context,
     )?;
     validate_wiggle_degree_and_knots(context, spec.wiggle_degree, spec.wiggle_knots.len())
+}
+
+fn validate_binomial_log_sigma_identifiable(
+    log_sigmaspec: &TermCollectionSpec,
+    context: &str,
+) -> Result<(), String> {
+    if log_sigmaspec.linear_terms.is_empty()
+        && log_sigmaspec.random_effect_terms.is_empty()
+        && log_sigmaspec.smooth_terms.is_empty()
+    {
+        return Ok(());
+    }
+
+    Err(GamlssError::UnsupportedConfiguration {
+        reason: format!(
+            "{context}: Bernoulli binomial location-scale data identify only the composite q = -threshold / sigma; log_sigma must be intercept-only/fixed, not a free linear, random-effect, or smooth formula"
+        ),
+    }
+    .into())
 }
 
 fn initial_log_lambdas_orzeros(block: &ParameterBlockInput) -> Result<Array1<f64>, String> {
@@ -25526,6 +25547,14 @@ mod tests {
         }
     }
 
+    fn empty_term_collection() -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: Vec::new(),
+        }
+    }
+
     fn spatial_kappa_options() -> SpatialLengthScaleOptimizationOptions {
         SpatialLengthScaleOptimizationOptions {
             enabled: true,
@@ -26353,6 +26382,33 @@ mod tests {
     }
 
     #[test]
+    fn binomial_location_scale_terms_reject_free_log_sigma_terms_early() {
+        let n = 8usize;
+        let data = Array2::<f64>::zeros((n, 2));
+        let spec = BinomialLocationScaleTermSpec {
+            y: Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 0.0 } else { 1.0 })),
+            weights: Array1::from_elem(n, 1.0),
+            link_kind: InverseLink::Standard(StandardLink::Logit),
+            thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
+            log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
+            threshold_offset: Array1::zeros(n),
+            log_sigma_offset: Array1::zeros(n),
+        };
+
+        let err = match fit_binomial_location_scale_terms(
+            data.view(),
+            spec,
+            &BlockwiseFitOptions::default(),
+            &spatial_kappa_options(),
+        ) {
+            Ok(_) => panic!("Bernoulli free log_sigma terms must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.contains("identify only the composite q = -threshold / sigma"));
+        assert!(err.contains("log_sigma must be intercept-only/fixed"));
+    }
+
+    #[test]
     fn binomial_location_scale_terms_reject_datarow_mismatch_early() {
         let n = 8usize;
         let data = Array2::<f64>::zeros((n - 1, 2));
@@ -26516,7 +26572,7 @@ mod tests {
             weights,
             link_kind: InverseLink::Standard(StandardLink::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.4),
-            log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.75),
+            log_sigmaspec: empty_term_collection(),
             threshold_offset: Array1::zeros(n),
             log_sigma_offset: Array1::zeros(n),
         };
@@ -26556,7 +26612,7 @@ mod tests {
             weights,
             link_kind: InverseLink::Standard(StandardLink::Probit),
             thresholdspec: simple_matern_term_collection(&[0, 1], 0.45),
-            log_sigmaspec: simple_matern_term_collection(&[0, 1], 0.8),
+            log_sigmaspec: empty_term_collection(),
             threshold_offset: Array1::zeros(n),
             log_sigma_offset: Array1::zeros(n),
             wiggle_knots: knots,

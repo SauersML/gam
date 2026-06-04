@@ -4577,6 +4577,67 @@ pub fn resolve_weight_column(
     Ok(values)
 }
 
+const MARGINAL_SLOPE_Z_WEIGHTED_SD_FLOOR: f64 = 1e-12;
+
+fn validate_bernoulli_marginal_slope_z_column_variance(
+    z_column: &str,
+    z: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<(), WorkflowError> {
+    if z.len() != weights.len() {
+        return Err(WorkflowError::SchemaMismatch {
+            reason: format!(
+                "z_column '{z_column}' length mismatch for bernoulli-marginal-slope: z={}, weights={}",
+                z.len(),
+                weights.len()
+            ),
+        });
+    }
+    let n = z.len();
+    let weight_sum = weights.iter().copied().sum::<f64>();
+    if !(weight_sum.is_finite() && weight_sum > 0.0) {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "z_column '{z_column}' cannot be weighted for bernoulli-marginal-slope because the fit data have non-positive or non-finite total weight"
+            ),
+        });
+    }
+    let mean = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi)
+        .sum::<f64>()
+        / weight_sum;
+    let var = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * (zi - mean) * (zi - mean))
+        .sum::<f64>()
+        / weight_sum;
+    let weighted_sd = var.sqrt();
+    if weighted_sd.is_finite() && weighted_sd > MARGINAL_SLOPE_Z_WEIGHTED_SD_FLOOR {
+        return Ok(());
+    }
+
+    let mut sorted = z.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.dedup_by(|a, b| (*a - *b).abs() <= MARGINAL_SLOPE_Z_WEIGHTED_SD_FLOOR);
+    let unique_count = sorted.len();
+    let value_summary = match sorted.as_slice() {
+        [] => "no observed finite values".to_string(),
+        [only] => format!("all {n} values ~= {only:.6}"),
+        [first, second] => format!("{unique_count} near-unique values, e.g. {first:.6}, {second:.6}"),
+        [first, second, ..] => {
+            format!("{unique_count} near-unique values, e.g. {first:.6}, {second:.6}, ...")
+        }
+    };
+    Err(WorkflowError::InvalidConfig {
+        reason: format!(
+            "z_column '{z_column}' has zero weighted variance on the fit data ({value_summary}; weighted_sd={weighted_sd:.6e}, n={n}); bernoulli-marginal-slope cannot identify a covariate-varying slope from a constant score. Check the score column and fit population."
+        ),
+    })
+}
+
 #[derive(Clone)]
 enum LatentInitSpec {
     Pca,
@@ -5723,7 +5784,13 @@ fn materialize_bernoulli_marginal_slope<'a>(
                 // No recipe ⇒ a raw z_column is required (guarded above) and read here.
                 let z_column = z_column.expect("z_column presence checked when ctn_stage1 is None");
                 let z_idx = resolve_role_col(col_map, z_column, "z")?;
-                (data.values.column(z_idx).to_owned(), None)
+                let z = data.values.column(z_idx).to_owned();
+                validate_bernoulli_marginal_slope_z_column_variance(
+                    z_column,
+                    z.view(),
+                    weights.view(),
+                )?;
+                (z, None)
             }
         };
 

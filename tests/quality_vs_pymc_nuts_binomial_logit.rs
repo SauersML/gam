@@ -209,15 +209,11 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated() {
 
     // Seed identically to PyMC (42). Enough draws for stable per-point quantiles
     // on a ~p-dimensional posterior; multiple chains so R-hat is meaningful.
-    // The real prostate design is much larger than the synthetic calibration
-    // case above. Keep this arm sized as a CI quality gate, not a sampler
-    // benchmark, while retaining multiple chains for R-hat and the identical
-    // PyMC baseline below.
     let adaptive = NutsConfig::for_dimension(p);
     let nuts_cfg = NutsConfig {
-        n_samples: REAL_DATA_POSTERIOR_SAMPLES,
-        nwarmup: REAL_DATA_POSTERIOR_WARMUP,
-        n_chains: REAL_DATA_POSTERIOR_CHAINS,
+        n_samples: 1500,
+        nwarmup: 1500,
+        n_chains: 4,
         seed: 42,
         ..adaptive
     };
@@ -605,11 +601,15 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated_on_real_data() {
     );
 
     let train_col = train_ds.column_map();
+    // The real prostate design is much larger than the synthetic calibration
+    // case above. Keep this arm sized as a CI quality gate, not a sampler
+    // benchmark, while retaining multiple chains for R-hat and the identical
+    // PyMC baseline below.
     let adaptive = NutsConfig::for_dimension(p);
     let nuts_cfg = NutsConfig {
-        n_samples: 1500,
-        nwarmup: 1500,
-        n_chains: 4,
+        n_samples: REAL_DATA_POSTERIOR_SAMPLES,
+        nwarmup: REAL_DATA_POSTERIOR_WARMUP,
+        n_chains: REAL_DATA_POSTERIOR_CHAINS,
         seed: 42,
         ..adaptive
     };

@@ -7645,6 +7645,61 @@ mod tests {
     }
 
     #[test]
+    fn bernoulli_value_cell_moments_use_shared_lru() {
+        let family = BernoulliMarginalSlopeFamily {
+            cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(16 * 1024 * 1024)),
+            cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+            ..default_test_family()
+        };
+        let cell = exact_kernel::DenestedCubicCell {
+            left: -1.25,
+            right: 0.75,
+            c0: 0.15,
+            c1: -0.35,
+            c2: 0.08,
+            c3: -0.015,
+        };
+
+        let before = family.cell_moment_cache_stats.snapshot();
+        let first = family
+            .evaluate_cell_moments_lru(cell, 4)
+            .expect("cold value moments");
+        let (hits, misses, _) = family.cell_moment_cache_stats.hit_rate_delta(before);
+        assert_eq!(hits, 0, "first value-moment call should be cold");
+        assert_eq!(misses, 1, "first value-moment call should record one miss");
+
+        let second = family
+            .evaluate_cell_moments_lru(cell, 4)
+            .expect("warm value moments");
+        assert_eq!(second, first);
+        let (hits, misses, _) = family.cell_moment_cache_stats.hit_rate_delta(before);
+        assert_eq!(hits, 1, "second value-moment call should hit the LRU");
+        assert_eq!(
+            misses, 1,
+            "warm value-moment call must not record another miss"
+        );
+
+        let derivative = family
+            .evaluate_cell_derivative_moments_lru(cell, 4)
+            .expect("cold derivative moments after value moments");
+        let derivative_again = family
+            .evaluate_cell_derivative_moments_lru(cell, 4)
+            .expect("warm derivative moments");
+        assert_eq!(derivative_again, derivative);
+
+        let third = family
+            .evaluate_cell_moments_lru(cell, 4)
+            .expect("value moments preserved beside derivative moments");
+        assert_eq!(third, first);
+        let (hits, misses, _) = family.cell_moment_cache_stats.hit_rate_delta(before);
+        assert_eq!(
+            (hits, misses),
+            (3, 2),
+            "value and derivative moments should share one LRU entry without evicting each other"
+        );
+    }
+
+    #[test]
     fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
         use crate::families::marginal_slope_shared::OuterScoreSubsample;
 
