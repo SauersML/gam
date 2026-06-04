@@ -1045,13 +1045,12 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Per-row uncontracted third-derivative tensor in the rigid path.
     ///
-    /// Empirical-grid rows pay the heavy `empirical_rigid_neglog_jet` once
-    /// (with six identity directions: three `e_q` plus three `e_g`, giving
-    /// a 64-coefficient jet from which the four distinct symmetric components
-    /// `T_qqq`, `T_qqg`, `T_qgg`, `T_ggg` are read directly). The `rank`-many
-    /// ψ-axis directions are then folded in with a cheap 2×2 bilinear
-    /// `[contract_third_full]` per call, replacing the previous
-    /// `rank` separate 5-direction jets per row.
+    /// The standard-normal latent measure uses the analytic
+    /// `rigid_transformed_third_full`; empirical-grid rows use the closed-form
+    /// implicit-function-theorem tensor `empirical_rigid_third_full_closed_form`.
+    /// Both yield the four distinct symmetric components `T_mmm, T_mmg, T_mgg,
+    /// T_ggg`; the `rank`-many ψ-axis directions are folded in later by a cheap
+    /// `contract_third_full` bilinear per call.
     pub(super) fn rigid_row_third_full(
         &self,
         row: usize,
@@ -1082,18 +1081,13 @@ impl BernoulliMarginalSlopeFamily {
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path.
     ///
-    /// Closed-form path drops straight out of [`rigid_transformed_fourth_full`]
-    /// with five primary-space components computed from the
-    /// `rigid_internal_third_components` quantities and the link's higher
-    /// derivatives — all axis-invariant, so the previous design that re-ran
-    /// these for every (u, v) ψ-axis pair was paying `O(rank²)` redundancy.
-    ///
-    /// Empirical-grid path widens [`empirical_rigid_neglog_jet`] to eight
-    /// identity directions (`[e_q, e_g] × 4`), giving a 256-coefficient jet
-    /// from which the five distinct symmetric components `T_qqqq, T_qqqg,
-    /// T_qqgg, T_qggg, T_gggg` are read directly. The (u, v) directions are
-    /// folded in afterwards via the cheap [`contract_fourth_full`] bilinear
-    /// — at most one jet per row total, instead of `(rank²+rank)/2` per row.
+    /// The standard-normal latent measure drops out of
+    /// `rigid_transformed_fourth_full` (five axis-invariant primary-space
+    /// components). Empirical-grid rows use the closed-form implicit-function-
+    /// theorem tensor `empirical_rigid_fourth_full_closed_form`, yielding the
+    /// five distinct symmetric components `T_mmmm, T_mmmg, T_mmgg, T_mggg,
+    /// T_gggg`. The (u, v) ψ-axis directions are folded in afterwards via the
+    /// cheap `contract_fourth_full` bilinear — one tensor build per row.
     pub(super) fn rigid_row_fourth_full(
         &self,
         row: usize,
