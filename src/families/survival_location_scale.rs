@@ -4054,9 +4054,19 @@ fn prepare_survival_location_scale_model(
             .map(PenaltyMatrix::Dense)
             .collect(),
         nullspace_dims: time_prepared.nullspace_dims.clone(),
+        // A caller-supplied per-penalty time seed is indexed by the ORIGINAL
+        // (un-reduced) penalty set. When the constant-scale-AFT reduction
+        // dropped those penalties (`time_prepared.penalties` empty / shorter
+        // than the original), that seed no longer matches and is irrelevant —
+        // the reduced affine block is unpenalized — so fall back to the empty
+        // seed for the (zero) retained penalties.
         initial_log_lambdas: initial_log_lambdas(
             &time_prepared.penalties,
-            spec.time_block.initial_log_lambdas.clone(),
+            if time_prepared.penalties.len() == spec.time_block.penalties.len() {
+                spec.time_block.initial_log_lambdas.clone()
+            } else {
+                None
+            },
         )?,
         initial_beta: time_prepared.initial_beta.clone(),
         // Canonical-gauge ownership for the location-scale joint design.
@@ -4394,7 +4404,13 @@ fn prepare_survival_location_scale_model(
         threshold_full_ncols,
         log_sigma_fixed_cols,
         log_sigma_full_ncols,
-        k_time: spec.time_block.penalties.len(),
+        // The reduced constant-scale-AFT time block is unpenalized, so
+        // `time_prepared.penalties` is empty and `k_time` is 0 — the block
+        // contributes no smoothing parameter. The flexible regime keeps one ρ
+        // per retained time penalty. This must match the OUTER ρ layout
+        // (`survival_time_rho_count`) so the inner blockwise λ slicing and the
+        // outer REML search agree on the time coordinate count.
+        k_time: time_prepared.penalties.len(),
         k_threshold: threshold_penalties.len(),
         k_log_sigma: log_sigma_penalties.len(),
         k_wiggle: spec
@@ -5101,6 +5117,52 @@ fn time_parametric_null_space_basis(penalties: &[Array2<f64>], p: usize) -> Opti
     Some(evecs.select(ndarray::Axis(1), &null_cols))
 }
 
+/// Does the constant-scale-AFT regime actually reduce the time block to its
+/// unpenalized affine parametric null space?
+///
+/// This is the single predicate that both the inner block preparation
+/// (`prepare_identified_time_block`) and the OUTER ρ layout
+/// (`SurvivalLambdaLayout`) consult so they agree on the reduced time block's
+/// smoothing-parameter count. The reduction fires only when the regime is
+/// constant-scale with no monotone timewiggle reintroducing flexibility AND the
+/// time penalty actually has an affine null space to collapse onto. When it
+/// fires the reduced block is genuinely unpenalized (`zᵀ S z ≈ 0` on the
+/// null space), so it carries ZERO smoothing parameters and must contribute no
+/// ρ coordinate to the outer REML search — exactly like the constant `log_sigma`
+/// and rigid `threshold` blocks (issue #736/#735/#721).
+fn time_block_reduces_to_parametric(
+    time_penalties: &[Array2<f64>],
+    time_ncols: usize,
+    constant_scale: bool,
+    protected_timewiggle_cols: usize,
+) -> bool {
+    constant_scale
+        && protected_timewiggle_cols == 0
+        && time_parametric_null_space_basis(time_penalties, time_ncols).is_some()
+}
+
+/// Number of time-warp smoothing parameters (outer ρ coordinates) the survival
+/// location-scale model exposes. The flexible regime keeps one ρ per time
+/// penalty; the reduced constant-scale-AFT regime drops them all because the
+/// affine parametric block it collapses to is unpenalized.
+fn survival_time_rho_count(
+    time_penalties: &[Array2<f64>],
+    time_ncols: usize,
+    constant_scale: bool,
+    protected_timewiggle_cols: usize,
+) -> usize {
+    if time_block_reduces_to_parametric(
+        time_penalties,
+        time_ncols,
+        constant_scale,
+        protected_timewiggle_cols,
+    ) {
+        0
+    } else {
+        time_penalties.len()
+    }
+}
+
 fn prepare_identified_time_block(
     input: &TimeBlockInput,
     derivative_guard: f64,
@@ -5147,20 +5209,20 @@ fn prepare_identified_time_block(
         let reduced_entry = design_entry.dot(&z);
         let reduced_exit = design_exit.dot(&z);
         let reduced_derivative_exit = design_derivative_exit.dot(&z);
-        let reduced_penalties: Vec<Array2<f64>> = input
-            .penalties
-            .iter()
-            .map(|s_mat| z.t().dot(s_mat).dot(&z))
-            .collect();
         // `z` spans the penalty null space, so every `zᵀ S z` is (numerically)
-        // the zero `r×r` matrix and its structural null-space dimension is the
-        // full reduced rank `r`. Compute it from the projected penalty so the
-        // REML log-det accounting stays honest even if a future penalty retains
-        // residual curvature on the affine subspace.
-        let reduced_nullspace_dims: Vec<usize> = reduced_penalties
-            .iter()
-            .map(|s_mat| symmetric_null_space_dim(s_mat))
-            .collect();
+        // the zero `r×r` matrix: the reduced affine block has NO curvature left
+        // to penalize. An unpenalized parametric block has no smoothing
+        // parameter to select, so we drop the projected-to-zero penalties (and
+        // their null-space-dimension bookkeeping) entirely rather than carry a
+        // list of zero matrices. This is what makes the reduced time block
+        // contribute ZERO ρ coordinates to the outer REML search — identical to
+        // the constant `log_sigma` and rigid `threshold` blocks — so the outer
+        // optimizer no longer crawls a flat, irrelevant time-smoothing ridge
+        // (issue #736/#735/#721). The parametric design and the row-wise
+        // monotonicity guard below carry all the time-warp structure; the
+        // dropped penalties were exactly zero and contributed nothing.
+        let reduced_penalties: Vec<Array2<f64>> = Vec::new();
+        let reduced_nullspace_dims: Vec<usize> = Vec::new();
         let reduced_derivative_design =
             DesignMatrix::Dense(DenseDesignMatrix::from(reduced_derivative_exit.clone()));
         // Pointwise monotonicity in the reduced affine space: enforce the
@@ -10352,13 +10414,35 @@ pub(crate) fn fit_survival_location_scale_terms(
         .as_ref()
         .and_then(|w| w.initial_log_lambdas.clone())
         .unwrap_or_else(|| Array1::zeros(0));
-    let time_rho0 = spec
-        .time_block
-        .initial_log_lambdas
-        .clone()
-        .unwrap_or_else(|| Array1::zeros(spec.time_block.penalties.len()));
+    // Outer time-warp ρ count. In the reduced constant-scale-AFT regime the
+    // time block collapses to its unpenalized affine null space (see
+    // `prepare_identified_time_block`), so it carries NO smoothing parameter and
+    // must contribute no ρ coordinate to the outer REML search — otherwise the
+    // outer optimizer spends a full inner blockwise fit per step crawling a
+    // dead-flat time-smoothing dimension until `outer_max_iter` (issue
+    // #736/#735/#721). `survival_time_rho_count` is the single source of truth
+    // shared with the inner block preparation so the two layouts always agree.
+    let constant_scale = log_sigma_boot_design.penalties.is_empty();
+    let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
+    let k_time = survival_time_rho_count(
+        &spec.time_block.penalties,
+        spec.time_block.design_exit.ncols(),
+        constant_scale,
+        protected_timewiggle_cols,
+    );
+    let time_rho0 = if k_time == 0 {
+        // Reduced parametric AFT: the time block is unpenalized, so any caller-
+        // supplied per-penalty time seed is irrelevant and the outer search
+        // carries no time coordinate.
+        Array1::<f64>::zeros(0)
+    } else {
+        spec.time_block
+            .initial_log_lambdas
+            .clone()
+            .unwrap_or_else(|| Array1::zeros(k_time))
+    };
     let layout = SurvivalLambdaLayout::new(
-        spec.time_block.penalties.len(),
+        k_time,
         threshold_boot_design.penalties.len(),
         log_sigma_boot_design.penalties.len(),
         wiggle_rho0.len(),
@@ -10444,7 +10528,14 @@ pub(crate) fn fit_survival_location_scale_terms(
         // fits carry log_sigma penalties and keep the full weak-seed search.
         // Smooth-mean penalties on the threshold block are still selected
         // normally — only the TIME-WARP block's seed changes here.
-        let constant_scale = log_sigma_boot_design.penalties.is_empty();
+        //
+        // NOTE: reaching here with `constant_scale == true` already implies the
+        // affine reduction did NOT fire (otherwise `k_time == 0` and this whole
+        // `if layout.k_time > 0` arm is skipped — the reduced block is
+        // unpenalized and carries no ρ at all). This seed therefore only covers
+        // the residual constant-scale case where the time penalty has no affine
+        // null space to collapse onto (or a timewiggle keeps the flexibility),
+        // pinning that surviving time ρ at the strong-smoothing limit.
         if constant_scale {
             // ρ = 10 == the inner blockwise solver's per-coordinate ρ box bound
             // (`custom_family.rs` `with_rho_bound(10.0)`). Seeding AT the bound
@@ -12138,11 +12229,20 @@ mod tests {
         assert_eq!(prepared.design_exit.ncols(), 2);
         assert_eq!(prepared.design_derivative_exit.ncols(), 2);
         assert!(prepared.coefficient_lower_bounds.is_none());
-        assert_eq!(prepared.penalties.len(), 1);
+        // The reduced block lives on the penalty null space, so `zᵀ S z` is
+        // exactly zero: there is no curvature left to penalize. An unpenalized
+        // parametric block has no smoothing parameter, so the projected-to-zero
+        // penalties are dropped entirely — the block carries ZERO penalties and
+        // therefore contributes no ρ coordinate to the outer REML search
+        // (issue #736/#735/#721).
         assert!(
-            prepared.penalties[0].iter().all(|v| v.abs() <= 1e-10),
-            "parametric nullspace penalty should collapse to zero: {:?}",
-            prepared.penalties[0]
+            prepared.penalties.is_empty(),
+            "reduced parametric time block must be unpenalized (no smoothing parameter), got {} penalties",
+            prepared.penalties.len()
+        );
+        assert!(
+            prepared.nullspace_dims.is_empty(),
+            "reduced parametric time block carries no penalty null-space bookkeeping"
         );
     }
 
