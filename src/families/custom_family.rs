@@ -15549,15 +15549,47 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // here and projected out of the KKT residual by the outer IFT
             // pseudo-inverse `U_S·H_proj⁻¹·U_Sᵀ` before the envelope correction
             // (see the gam#553 note and `projected_residual_range_space_inf`), so
-            // it cannot bias the outer gradient. Requiring the step to be
-            // exhausted (`step_inf ≤ step_tol`) proves we are AT the
+            // it cannot bias the outer gradient.
+            //
+            // The remaining requirement is to prove we are AT the
             // range-restricted optimum rather than mid-descent, so this does not
             // short-circuit a genuinely nonlinear CTM fit that is still moving β.
+            // There are two independent, equally-rigorous proofs of that, and
+            // EITHER suffices once `range_residual ≤ residual_tol` has fired:
+            //   (a) the full Newton step is exhausted (`step_inf ≤ step_tol`):
+            //       the well-identified case, where the range-restricted step
+            //       collapses to zero and the leftover ker(H_pen) component is
+            //       already dropped by the spectral step, so the FULL step is
+            //       small too; OR
+            //   (b) the objective has stopped changing
+            //       (`objective_change ≤ objective_tol`): the joint objective
+            //       (−loglik + ½βᵀSβ) is a function of the IDENTIFIED coordinates
+            //       ONLY — moving β along an unidentified direction in ker(H_pen)
+            //       = ker(H_L) ∩ ker(S) changes neither the likelihood nor the
+            //       penalty by construction — so a flat objective proves no
+            //       identified-direction descent remains regardless of how large
+            //       the FULL step is.
+            // Proof (b) is the certificate that the constant-scale AFT (#736) and
+            // the degenerate CTM (#733/#734) need: their unidentified cross-block
+            // null (the time_transform polynomial/affine deviation aliased into
+            // threshold/log_sigma) keeps the Levenberg-damped, trust-region-clamped
+            // FULL step perpetually nonzero — `step_inf` never reaches `step_tol`
+            // — even though the identified fit is exactly at its optimum (zero
+            // range-space residual, frozen objective). Tying the certificate ONLY
+            // to the full step (proof (a)) therefore burned the entire 200/84-cycle
+            // budget on an iterate that is already optimal on every identifiable
+            // direction, and the inner solve was rejected by the FULL-residual KKT
+            // check. Adding proof (b) certifies on the identified subspace without
+            // loosening anything for a genuinely-identified fit: there
+            // `projected_residual_range_space_inf` returns `None` (nullity == 0 ⇒
+            // range == whole space), so this branch is dormant and the strict
+            // full-residual path above governs unchanged.
+            //
             // Unlike the constrained-stationary path below, this fires on a pure
             // identifiability null without requiring the `linearized_rel ≥ 0.5`
             // constraint-multiplier signature, which a structural rank-deficiency
             // need not produce.
-            if step_inf <= step_tol
+            if (step_inf <= step_tol || objective_change <= objective_tol)
                 && let Some(range_residual) = projected_residual_range_space_inf(
                     &projected_residual_vec,
                     &joint_hessian_source,
@@ -15570,7 +15602,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 && range_residual <= residual_tol
             {
                 log::info!(
-                    "[PIRLS/joint-Newton convergence] cycle {:>3} | identified-subspace KKT certificate: total residual={:.3e} > tol={:.3e} but its range-space (identified-subspace) component={:.3e} ≤ tol={:.3e}, step_inf={:.3e} ≤ step_tol={:.3e}; the leftover residual lies in the unidentified penalized-Hessian null space ker(H_pen) (dropped by the range-restricted spectral step and projected out by the outer IFT pseudo-inverse) — the iterate is stationary on the entire identifiable subspace.",
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | identified-subspace KKT certificate: total residual={:.3e} > tol={:.3e} but its range-space (identified-subspace) component={:.3e} ≤ tol={:.3e}, step_inf={:.3e} (step_tol={:.3e}), |Δobjective|={:.3e} (obj_tol={:.3e}); the leftover residual lies in the unidentified penalized-Hessian null space ker(H_pen) (dropped by the range-restricted spectral step and projected out by the outer IFT pseudo-inverse) — the iterate is stationary on the entire identifiable subspace (proof: {}).",
                     cycle,
                     residual,
                     residual_tol,
@@ -15578,6 +15610,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     residual_tol,
                     step_inf,
                     step_tol,
+                    objective_change,
+                    objective_tol,
+                    if step_inf <= step_tol {
+                        "full Newton step exhausted"
+                    } else {
+                        "objective frozen on the identified subspace while the unidentified null keeps the full step nonzero"
+                    },
                 );
                 converged = true;
                 break;
