@@ -5336,24 +5336,25 @@ impl BernoulliMarginalSlopeFamily {
         found
     }
 
-    /// Lazily build (once per β-cache) the per-row axis-projected third/fourth
-    /// tensors backing the FLEX outer-derivative fast paths (gam#683), and
-    /// return the requested row's tensors. `None` on the rigid path (rigid rows
-    /// use `rigid_{third,fourth}_full`).
+    /// Lazily build the requested row's axis-projected third/fourth tensors
+    /// backing the FLEX outer-derivative fast paths (gam#683), reused across
+    /// every ψ-axis pair. `None` on the rigid path (rigid rows use
+    /// `rigid_{third,fourth}_full`).
     ///
     /// Each row's tensors are produced by the *slow* cell-walk workers
     /// (`row_primary_third_contracted_recompute_with_moments` and
     /// `row_primary_fourth_contracted_recompute_ordered`) evaluated at the two
     /// primary-axis basis vectors `e_q`, `e_g` — so the cached values are the
     /// very contractions the per-pair path used to recompute, just computed
-    /// once and reused across every ψ-axis pair. The fourth tensor is
-    /// symmetrized exactly as `row_primary_fourth_contracted_recompute` does
-    /// (`½(ordered + swapped)`).
+    /// once and reused. The fourth tensor is symmetrized exactly as
+    /// `row_primary_fourth_contracted_recompute` does (`½(ordered + swapped)`).
     ///
-    /// `RayonSafeOnce::get_or_compute` runs the (nested-`into_par_iter`) build
-    /// without holding a lock, which is what keeps this safe to first-touch
-    /// from inside an outer Rayon row fold — identical pattern to
-    /// `rigid_fourth_full_cached`.
+    /// Two-level lazy: the outer `RayonSafeOnce` allocates a per-row slot table
+    /// on first touch; each inner per-row `RayonSafeOnce` then builds that row
+    /// on demand. Both inits run lock-free (`get_or_compute`), so first-touch
+    /// from inside an outer Rayon row fold is safe, and the per-row build is
+    /// serial (no nested `into_par_iter`). Because outer derivative passes are
+    /// row-subsampled, only the consumed rows are ever built.
     pub(super) fn flex_axis_tensors_for_row<'a>(
         &self,
         block_states: &[ParameterBlockState],
@@ -5363,73 +5364,75 @@ impl BernoulliMarginalSlopeFamily {
         if !self.effective_flex_active(block_states)? {
             return Ok(None);
         }
-        let stored = cache.flex_axis_tensors.get_or_compute(|| {
+        // Allocate the per-row slot table once (one inner RayonSafeOnce per
+        // global row), then build only the requested row on first touch.
+        let slots = cache.flex_axis_tensors.get_or_compute(|| {
+            (0..self.y.len())
+                .map(|_| crate::resource::RayonSafeOnce::new())
+                .collect::<Vec<_>>()
+        });
+        let stored = slots[row].get_or_compute(|| -> Result<FlexAxisRowTensors, String> {
             let r = cache.primary.total;
             let mut e_q = Array1::<f64>::zeros(r);
             e_q[cache.primary.q] = 1.0;
             let mut e_g = Array1::<f64>::zeros(r);
             e_g[cache.primary.logslope] = 1.0;
-            (0..self.y.len())
-                .into_par_iter()
-                .map(|build_row| {
-                    let row_ctx = Self::row_ctx(cache, build_row);
-                    let t3_q = self.row_primary_third_contracted_recompute_with_moments(
-                        build_row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &e_q,
-                    )?;
-                    let t3_g = self.row_primary_third_contracted_recompute_with_moments(
-                        build_row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &e_g,
-                    )?;
-                    let t4_qq = self.row_primary_fourth_contracted_recompute_ordered(
-                        build_row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &e_q,
-                        &e_q,
-                    )?;
-                    let t4_gg = self.row_primary_fourth_contracted_recompute_ordered(
-                        build_row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &e_g,
-                        &e_g,
-                    )?;
-                    let t4_qg_ordered = self.row_primary_fourth_contracted_recompute_ordered(
-                        build_row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &e_q,
-                        &e_g,
-                    )?;
-                    let t4_qg_swapped = self.row_primary_fourth_contracted_recompute_ordered(
-                        build_row,
-                        block_states,
-                        cache,
-                        row_ctx,
-                        &e_g,
-                        &e_q,
-                    )?;
-                    let mut t4_qg = t4_qg_ordered;
-                    t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
-                    Ok(FlexAxisRowTensors {
-                        third: [t3_q, t3_g],
-                        fourth: [[t4_qq, t4_qg.clone()], [t4_qg, t4_gg]],
-                    })
-                })
-                .collect::<Result<Vec<_>, String>>()
+            let row_ctx = Self::row_ctx(cache, row);
+            let t3_q = self.row_primary_third_contracted_recompute_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_q,
+            )?;
+            let t3_g = self.row_primary_third_contracted_recompute_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_g,
+            )?;
+            let t4_qq = self.row_primary_fourth_contracted_recompute_ordered(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_q,
+                &e_q,
+            )?;
+            let t4_gg = self.row_primary_fourth_contracted_recompute_ordered(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_g,
+                &e_g,
+            )?;
+            let t4_qg_ordered = self.row_primary_fourth_contracted_recompute_ordered(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_q,
+                &e_g,
+            )?;
+            let t4_qg_swapped = self.row_primary_fourth_contracted_recompute_ordered(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_g,
+                &e_q,
+            )?;
+            let mut t4_qg = t4_qg_ordered;
+            t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
+            Ok(FlexAxisRowTensors {
+                third: [t3_q, t3_g],
+                fourth: [[t4_qq, t4_qg.clone()], [t4_qg, t4_gg]],
+            })
         });
-        let table = stored.as_ref().map_err(|err| err.clone())?;
-        Ok(Some(&table[row]))
+        let tensors = stored.as_ref().map_err(|err| err.clone())?;
+        Ok(Some(tensors))
     }
 
     /// Third-derivative tensor contracted with direction `dir`:

@@ -38,14 +38,22 @@ fn profile_683_full_outer() {
                 timing.outer_converged,
                 out.fit.beta.len()
             );
-        }
-        Err(e) => {
-            eprintln!(
-                "[PROFILE-683] n={} ERR elapsed_s={:.3} err={}",
-                n,
-                elapsed.as_secs_f64(),
-                e
+            // Regression gate for #683: the full-outer FLEX fit must finish
+            // (with finite coefficients) well inside the wall budget — the bug
+            // was an unbounded BMS row-cell-moment hang under `linkwiggle()`.
+            assert!(
+                out.fit.beta.iter().all(|v| v.is_finite()),
+                "non-finite beta from full-outer FLEX fit"
+            );
+            assert!(
+                elapsed.as_secs_f64() < 600.0,
+                "full-outer FLEX fit exceeded 600s wall budget at n={n} (possible #683 regression): {:.3}s",
+                elapsed.as_secs_f64()
             );
         }
+        Err(e) => panic!(
+            "[PROFILE-683] n={n} full-outer FLEX fit errored after {:.3}s: {e}",
+            elapsed.as_secs_f64()
+        ),
     }
 }

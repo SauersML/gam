@@ -7496,6 +7496,86 @@ mod tests {
         (family, states)
     }
 
+    /// gam#683: the axis-projected fast path inside
+    /// `row_primary_{third,fourth}_contracted_recompute` must reproduce the
+    /// slow per-(row, direction) cell-walk workers it replaces, for the
+    /// single-axis directions every outer-derivative consumer builds. Equality
+    /// holds by (bi)linearity of the contraction; the tolerance only absorbs
+    /// the float reassociation of pulling the scalar outside the cell sum.
+    #[test]
+    fn bernoulli_flex_axis_tensor_cache_matches_slow_recompute() {
+        let (family, states) = make_flex_hvp_cache_test_family(24);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("flex exact eval cache");
+        let r = cache.primary.total;
+        let q = cache.primary.q;
+        let g = cache.primary.logslope;
+        let mut max_rel_third = 0.0_f64;
+        let mut max_rel_fourth = 0.0_f64;
+        for row in 0..family.y.len() {
+            let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
+            // Third: each primary axis, several scalars including negative.
+            for &axis in &[q, g] {
+                for &s in &[1.0_f64, -0.7, 2.3] {
+                    let mut dir = Array1::<f64>::zeros(r);
+                    dir[axis] = s;
+                    let fast = family
+                        .row_primary_third_contracted_recompute(row, &states, &cache, row_ctx, &dir)
+                        .expect("fast third");
+                    let slow = family
+                        .row_primary_third_contracted_recompute_with_moments(
+                            row, &states, &cache, row_ctx, &dir,
+                        )
+                        .expect("slow third");
+                    assert_eq!(fast.dim(), (r, r));
+                    for (a, b) in fast.iter().zip(slow.iter()) {
+                        let denom = a.abs().max(b.abs()).max(1.0);
+                        max_rel_third = max_rel_third.max((a - b).abs() / denom);
+                    }
+                }
+            }
+            // Fourth: every ordered pair of single axes, distinct scalars. The
+            // slow reference symmetrizes `ordered` exactly as `_recompute` does.
+            for &(au, su) in &[(q, 1.3_f64), (g, -0.9)] {
+                for &(av, sv) in &[(q, 0.8_f64), (g, 1.7)] {
+                    let mut du = Array1::<f64>::zeros(r);
+                    du[au] = su;
+                    let mut dv = Array1::<f64>::zeros(r);
+                    dv[av] = sv;
+                    let fast = family
+                        .row_primary_fourth_contracted_recompute(
+                            row, &states, &cache, row_ctx, &du, &dv,
+                        )
+                        .expect("fast fourth");
+                    let ordered = family
+                        .row_primary_fourth_contracted_recompute_ordered(
+                            row, &states, &cache, row_ctx, &du, &dv,
+                        )
+                        .expect("slow fourth ordered");
+                    let swapped = family
+                        .row_primary_fourth_contracted_recompute_ordered(
+                            row, &states, &cache, row_ctx, &dv, &du,
+                        )
+                        .expect("slow fourth swapped");
+                    for ((f, o), w) in fast.iter().zip(ordered.iter()).zip(swapped.iter()) {
+                        let slow = 0.5 * (o + w);
+                        let denom = f.abs().max(slow.abs()).max(1.0);
+                        max_rel_fourth = max_rel_fourth.max((f - slow).abs() / denom);
+                    }
+                }
+            }
+        }
+        assert!(
+            max_rel_third <= 1e-9,
+            "third axis-cache vs slow recompute drift too large: {max_rel_third:.3e}"
+        );
+        assert!(
+            max_rel_fourth <= 1e-9,
+            "fourth axis-cache vs slow recompute drift too large: {max_rel_fourth:.3e}"
+        );
+    }
+
     #[test]
     fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
         use crate::families::marginal_slope_shared::OuterScoreSubsample;
