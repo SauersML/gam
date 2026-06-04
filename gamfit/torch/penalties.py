@@ -233,7 +233,13 @@ class _RustPenaltyModule(nn.Module):
 
 
 class IsometryPenalty(_RustPenaltyModule):
-    """Pull a decoder Jacobian's metric toward the Euclidean metric."""
+    """Penalize variation of a decoder Jacobian's pullback metric across tokens.
+
+    The Rust isometry penalty uses a scale-free, mean-profiled reference (the
+    per-row mean pullback metric), so this drives the metric toward a *constant*
+    (token-independent) metric rather than a fixed Euclidean one — a period-1
+    circle ``JᵀJ = (2π)² I`` is not fought by a hard identity target.
+    """
 
     def __init__(self, weight: float = 1.0, *, target: str = "t") -> None:
         super().__init__()

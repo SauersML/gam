@@ -9144,7 +9144,7 @@ const SAE_SPHERE_BASIS_SIZE: usize = 7;
 const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 
 fn seed_oos_softmax_logits_from_projection_residuals(
-    term: &mut SaeManifoldTerm,
+    term: &mut gam::terms::sae_manifold::SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
     tau: f64,
 ) {
