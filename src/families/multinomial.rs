@@ -82,15 +82,31 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Mild full-rank Gaussian-prior precision used by the formula-driven
-/// multinomial REML path.
+/// Numerical stabilization ridge for the formula-driven multinomial REML path.
 ///
-/// The smoothing penalties are rank-deficient by design, so deterministic or
-/// near-separable hard labels can still drive null-space coefficients toward
-/// infinity while the outer lambda optimizer searches. A small explicit ridge
-/// gives every coefficient a finite posterior mode without changing the
-/// reported unpenalized deviance.
-const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-2;
+/// The smoothing penalties are rank-deficient by design (each smooth carries an
+/// unpenalized polynomial null space), and the formula may add an unpenalized
+/// parametric term (`x3` / `body_mass`). On near-separable hard labels those
+/// directions can drift large while the outer lambda optimizer searches, so the
+/// inner joint-Newton solve needs the joint Hessian lifted strictly
+/// positive-definite. This floor is the magnitude to which
+/// `exact_newton_stabilizing_shift` raises the smallest Hessian eigenvalue —
+/// purely a numerical lift that keeps every Newton step finite and the
+/// objective finite (so the outer optimizer accepts well-posed REML seeds
+/// instead of rejecting a NaN-divergent one).
+///
+/// It is deliberately the same order as the scalar PIRLS stabilization ridge
+/// (`crate::solver::pirls::FIXED_STABILIZATION_RIDGE = 1e-8`), NOT a meaningful
+/// Gaussian prior. A large floor (e.g. `1e-2`) is the wrong tool: under the
+/// `explicit_stabilization_pospart` ridge policy it also enters the penalized
+/// objective as `½·δ·‖β‖²` AND the REML penalty log-determinant, so it shrinks
+/// every identified coefficient (including the smooth wiggle directions already
+/// governed by their REML λ) and biases the smoothing-parameter selection —
+/// over-smoothing the recovered class-probability surface (#715). A `1e-8`
+/// floor stabilizes the linear algebra without measurably perturbing the
+/// REML-optimal fit, so gam recovers the true softmax field rather than a
+/// ridge-shrunk one.
+const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-8;
 
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
 /// still worth paying for multinomial formula fits.

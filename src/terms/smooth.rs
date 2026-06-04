@@ -4937,9 +4937,9 @@ fn build_tensor_bspline_basis(
         // systematically over-smooths the recovered surface; mgcv's `te`/`ti`
         // carry no such global ridge. Penalizing the null subspace alone keeps
         // the interaction range governed solely by the per-margin λ's.
-        if let Some(shrink) = crate::terms::basis::build_nullspace_shrinkage_penalty(
-            &marginal_kron_sum,
-        )? {
+        if let Some(shrink) =
+            crate::terms::basis::build_nullspace_shrinkage_penalty(&marginal_kron_sum)?
+        {
             let (matrix, normalization_scale) =
                 normalize_penalty_in_constrained_space(&shrink.sym_penalty);
             candidates.push(PenaltyCandidate {
