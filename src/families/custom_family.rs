@@ -2156,13 +2156,13 @@ pub trait CustomFamily {
     /// lacks an explicit callback, so the audit routes channel-aware
     /// automatically. The total channel count is `channels.iter().max() + 1`.
     ///
-    /// Default `None`: the family is single-output (or has already wired its
-    /// own multi-output callbacks); the flat audit is used unchanged.
+    /// Default: every block drives output channel 0. `wire_output_channels`
+    /// recognizes this as the single-output flat route and leaves specs unchanged.
     ///
     /// When `Some`, the returned vector MUST have length equal to the number
     /// of blocks; `fit_custom_family` surfaces a structured error otherwise.
-    fn output_channel_assignment(&self, _specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
-        None
+    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        Some(vec![0; specs.len()])
     }
 
     /// Optional dynamic geometry hook for blocks whose design/offset depend on
@@ -18569,9 +18569,9 @@ fn joint_penalty_subspace_trace_parts(
             let h_times_u = build_h_times_u()?;
             let mut h_proj = fast_atb(&u_s, &h_times_u);
             symmetrize_dense_in_place(&mut h_proj);
-            let (h_evals, h_evecs) = h_proj.eigh(Side::Lower).map_err(|e| {
-                format!("joint projected Hessian eigendecomposition failed: {e}")
-            })?;
+            let (h_evals, h_evecs) = h_proj
+                .eigh(Side::Lower)
+                .map_err(|e| format!("joint projected Hessian eigendecomposition failed: {e}"))?;
             let h_threshold = positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
             let logdet = exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_threshold);
             let mut h_proj_inverse = Array2::<f64>::zeros((rank, rank));
@@ -18583,7 +18583,8 @@ fn joint_penalty_subspace_trace_parts(
                 let inv = 1.0 / sigma;
                 for i in 0..rank {
                     for j in 0..rank {
-                        h_proj_inverse[[i, j]] += inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
+                        h_proj_inverse[[i, j]] +=
+                            inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
                     }
                 }
             }
