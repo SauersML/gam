@@ -8143,17 +8143,16 @@ fn apply_global_smooth_identifiability(
         local_penaltyinfo[idx] = penaltyinfo_constrained;
         local_linear_constraints[idx] = linear_constraints_constrained;
         let realized_transform = match (term.joint_null_rotation.as_ref(), z_opt.as_ref()) {
-            (Some(rotation), Some(z)) => {
-                Some(crate::linalg::faer_ndarray::fast_ab(&rotation.rotation, z))
-            }
+            (Some(rotation), Some(z)) => Some(crate::linalg::faer_ndarray::fast_ab(
+                &rotation.rotation,
+                z,
+            )),
             (Some(rotation), None) => Some(rotation.rotation.clone()),
             (None, Some(z)) => Some(z.clone()),
             (None, None) => None,
         };
-        local_metadata[idx] = Some(with_identifiability_transform(
-            &term.metadata,
-            realized_transform.as_ref(),
-        )?);
+        local_metadata[idx] =
+            Some(with_identifiability_transform(&term.metadata, realized_transform.as_ref())?);
     }
 
     let total_p: usize = local_dims.iter().sum();

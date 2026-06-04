@@ -18,6 +18,52 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.93 — gam 0.3.93 / gamfit 0.1.165 (2026-06-04)
+
+### Fixed
+
+- **Probit Bernoulli marginal-slope outer REML no longer diverges (#754).** The marginal-surface block left its parametric + smooth-nullspace directions fully unpenalized, so on a balanced steep-gradient probit sample a near-separating direction's coefficient ran to ~50 and the outer ARC solve hit max-iter / rejected every seed (`phantom_multiplier_with_well_conditioned_H`) — basis-independent (Matérn and Duchon both hit it). A small **fixed** nullspace-shrinkage ridge (`Z·Zᵀ` over the null space of the aggregate marginal smooth penalties), pinned out of REML at `log λ = ln(1e-2)` so it cannot be driven to zero, now bounds the flat direction and gives the outer solve a finite optimum — negligible against the n-scaled probit Fisher information of any identified direction.
+
+## v0.3.92 — gam 0.3.92 / gamfit 0.1.164 (2026-06-04)
+
+### Changed
+
+- Release bump to force a fresh wheel build/publish. No engine changes since 0.1.163; in-progress fixes for the Bernoulli marginal-slope outer-REML non-convergence (#754) and Matérn over-parameterization (#755) will follow in a later release.
+
+## v0.3.91 — gam 0.3.91 / gamfit 0.1.163 (2026-06-04)
+
+### Fixed
+
+- **Hypertension-style Bernoulli marginal-slope Matérn fits now have full audit-level regression coverage.** The release includes a formula-to-fit test for the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout, proving the scalar-pruned model passes the actual pre-fit identifiability audit and produces finite coefficients.
+
+## v0.3.90 — gam 0.3.90 / gamfit 0.1.162 (2026-06-04)
+
+### Fixed
+
+- **Hypertension-style Bernoulli marginal-slope formulas now have an exact regression for scalar-alias pruning.** The release includes a materialization test matching the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout and proves the local-column-3 scalar alias is removed before the identifiability audit while the Matérn blocks remain intact.
+
+## v0.3.89 — gam 0.3.89 / gamfit 0.1.161 (2026-06-04)
+
+### Fixed
+
+- **Bernoulli marginal-slope redundant-scalar handling now has fail-closed
+  regression coverage.** Tests now lock in that constrained or explicitly
+  penalized duplicate scalar columns are rejected rather than pruned, preserving
+  the hardened identifiability audit contract for hypertension-style BMS
+  formulas with redundant scalar covariates.
+
+## v0.3.88 — gam 0.3.88 / gamfit 0.1.160 (2026-06-04)
+
+### Fixed
+
+- **Release metadata for the Bernoulli marginal-slope identifiability fix is now complete.** The PyPI wheel crate and lockfile now carry the same `gamfit` version as `pyproject.toml`, satisfying the hardened release scanner for the BMS redundant-scalar audit fix shipped in the previous commit.
+
+## v0.3.87 — gam 0.3.87 / gamfit 0.1.159 (2026-06-04)
+
+### Fixed
+
+- **Bernoulli marginal-slope Matérn fits with redundant scalar covariates no longer fail the identifiability audit.** The workflow now removes unpenalized scalar columns that add no direction beyond the implicit intercept and earlier scalar terms before BMS block construction, and rejects constrained or explicitly-penalized duplicates instead of using a ridge or constraint to mask non-identifiability. This keeps the hardened audit fail-closed while allowing biobank hypertension-style `matern(...) + scalar covariates` fits whose precomputed scalar spline column is constant or redundant.
+
 ## v0.3.86 — gam 0.3.86 / gamfit 0.1.158 (2026-06-04)
 
 ### Fixed
