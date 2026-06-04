@@ -9893,14 +9893,25 @@ mod tests {
             [0.45, -0.05, 0.10, 0.30],
         ];
         let rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1)]);
+        let baseline = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
         let sys = term
             .assemble_arrow_schur(target.view(), &rho, Some(&registry))
             .unwrap();
 
         assert_eq!(sys.gb.len(), m * p, "gb should match flatten_beta length");
+        assert_eq!(
+            baseline.gb.len(),
+            m * p,
+            "baseline gb should match flatten_beta length"
+        );
         let mut absmax = 0.0_f64;
-        for v in sys.gb.iter().copied() {
+        let mut penalty_grad = Array1::<f64>::zeros(m * p);
+        for j in 0..m * p {
+            let v = sys.gb[j] - baseline.gb[j];
             assert!(v.is_finite());
+            penalty_grad[j] = v;
             absmax = absmax.max(v.abs());
         }
         assert!(
@@ -9909,9 +9920,9 @@ mod tests {
              arrow-Schur gb; absmax={absmax:.3e}"
         );
 
-        // The gb gradient must equal the analytic spectral gradient of the
-        // per-atom `(M, p)` block (penalty_scale defaults to 1.0 in
-        // assemble_arrow_schur). Reconstruct the reference directly.
+        // The penalty contribution to gb must equal the analytic spectral
+        // gradient of the per-atom `(M, p)` block (penalty_scale defaults to
+        // 1.0 in assemble_arrow_schur). Reconstruct the reference directly.
         let per_atom = NuclearNormPenalty::new(
             PsiSlice {
                 range: 0..m * p,
@@ -9928,9 +9939,9 @@ mod tests {
         let ref_grad = per_atom.grad_target(beta.view(), Array1::<f64>::zeros(0).view());
         for j in 0..m * p {
             assert!(
-                (sys.gb[j] - ref_grad[j]).abs() <= 1.0e-9,
-                "gb[{j}]={:.12e} must equal analytic spectral grad {:.12e}",
-                sys.gb[j],
+                (penalty_grad[j] - ref_grad[j]).abs() <= 1.0e-9,
+                "penalty gb[{j}]={:.12e} must equal analytic spectral grad {:.12e}",
+                penalty_grad[j],
                 ref_grad[j]
             );
         }
@@ -9942,7 +9953,7 @@ mod tests {
         let mut shrunk = decoder.clone();
         for row in 0..m {
             for feat in 0..p {
-                shrunk[[row, feat]] -= step * sys.gb[row * p + feat];
+                shrunk[[row, feat]] -= step * penalty_grad[row * p + feat];
             }
         }
         let shrunk_norm = smoothed_nuclear_norm(&shrunk, eps);
