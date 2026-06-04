@@ -5540,11 +5540,17 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv = Array2::<f64>::zeros((r, r));
         let mut f_uv_dir = Array2::<f64>::zeros((r, r));
 
+        let cached_d21 = self
+            .bundle_for_degree(block_states, cache, 21)?
+            .and_then(|bundle| bundle.row(row, 15));
+        let cached_d15 = if cached_d21.is_some() {
+            None
+        } else {
+            self.bundle_for_degree(block_states, cache, 15)?
+                .and_then(|bundle| bundle.row(row, 15))
+        };
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
-            .bundle_for_degree(block_states, cache, 15)?
-            .and_then(|bundle| bundle.row(row, 15))
-        {
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cached_d21.or(cached_d15) {
             cached
         } else {
             let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
