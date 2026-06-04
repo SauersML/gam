@@ -2724,8 +2724,42 @@ pub trait CustomFamily {
         } else if self.has_explicit_joint_hessian() {
             self.exact_newton_joint_hessian(block_states)
         } else {
-            Ok(None)
+            // Multi-block coupled family that did NOT set the explicit marker.
+            // The marker exists because the trait cannot reflect on whether
+            // `exact_newton_joint_hessian` was overridden — its *default* impl
+            // assembles a strictly block-diagonal matrix from per-block exact
+            // blocks, which would silently drop cross-block ∂²L/∂β_a∂β_b
+            // curvature for a coupled likelihood. But the marker is not the
+            // only available signal: a family that genuinely overrides the
+            // joint Hessian with true coupled curvature produces a matrix with
+            // *nonzero off-diagonal blocks*, which the block-diagonal default
+            // can never produce. Detect that structurally and trust it. A
+            // returned matrix that is block-diagonal is indistinguishable from
+            // the default for a coupled family, so it stays gated to None.
+            match self.exact_newton_joint_hessian(block_states)? {
+                Some(hessian) if joint_hessian_has_cross_block_coupling(&hessian, block_states) => {
+                    Ok(Some(hessian))
+                }
+                _ => Ok(None),
+            }
         }
+    }
+
+    /// Structural-coupling probe shared by the `_with_specs` joint dispatch
+    /// gates: is the family's `exact_newton_joint_hessian` a genuinely coupled
+    /// matrix (nonzero off-diagonal blocks), as opposed to the trait's
+    /// block-diagonal default? This is the marker-free signal that lets the
+    /// engine trust a coupled multi-block family that overrode the joint
+    /// Hessian without hand-setting `has_explicit_joint_hessian()`. Returns
+    /// `false` when no joint Hessian is available or it is block-diagonal.
+    fn joint_hessian_is_structurally_coupled(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<bool, String> {
+        Ok(match self.exact_newton_joint_hessian(block_states)? {
+            Some(hessian) => joint_hessian_has_cross_block_coupling(&hessian, block_states),
+            None => false,
+        })
     }
 
     /// Whether the family's log-likelihood Hessian is block-diagonal in the
@@ -2889,7 +2923,12 @@ pub trait CustomFamily {
                     d_beta_flat,
                 ),
             }
-        } else if self.has_explicit_joint_hessian() {
+        } else if self.has_explicit_joint_hessian()
+            || self.joint_hessian_is_structurally_coupled(block_states)?
+        {
+            // Marked, or structurally detected coupled (see
+            // `exact_newton_joint_hessian_with_specs`): the family's own
+            // directional derivative is the trusted cross-block `D_β H[u]`.
             self.exact_newton_joint_hessian_directional_derivative(block_states, d_beta_flat)
         } else {
             Ok(None)
@@ -2931,7 +2970,13 @@ pub trait CustomFamily {
         // outer trace assembly on coupled families.  Unlike the lower-order
         // paths, there is no working-sets fallback — both trusted branches
         // call the same delegate, so a single helper predicate suffices.
-        if !self.outer_default_trustworthy_for_joint_hessian(specs) {
+        // The marker predicate is supplemented by the marker-free structural
+        // probe so an auto-routed coupled family (one that returns a genuinely
+        // off-diagonal joint Hessian without setting the explicit marker) is
+        // trusted consistently across all three derivative orders.
+        if !self.outer_default_trustworthy_for_joint_hessian(specs)
+            && !self.joint_hessian_is_structurally_coupled(block_states)?
+        {
             return Ok(None);
         }
         self.exact_newton_joint_hessiansecond_directional_derivative(
@@ -9581,6 +9626,51 @@ fn validate_flat_direction_length(
         .into());
     }
     Ok::<(), _>(())
+}
+
+/// Does a joint Hessian carry genuine cross-block (off-diagonal) coupling?
+///
+/// The trait's default `exact_newton_joint_hessian` assembles a strictly
+/// block-diagonal matrix (per-block `Xᵀ W X` on the diagonal, zeros off-block).
+/// A family that overrides it with the true coupled curvature of a multi-block
+/// likelihood (GAMLSS μ-σ, Beta-logit `α`/`β`, Dirichlet K-block via the shared
+/// concentration sum, …) necessarily fills in nonzero off-diagonal blocks. This
+/// is the only structural signal — independent of any hand-set marker — that
+/// distinguishes a trusted coupled joint Hessian from the block-diagonal
+/// default. The block boundaries come from the per-block β widths.
+fn joint_hessian_has_cross_block_coupling(
+    hessian: &Array2<f64>,
+    block_states: &[ParameterBlockState],
+) -> bool {
+    let total = block_states
+        .iter()
+        .map(|state| state.beta.len())
+        .sum::<usize>();
+    if hessian.nrows() != total || hessian.ncols() != total {
+        // Shape disagreement is handled (loudly) by the symmetrizer/consumers;
+        // here we only answer the coupling question and must not claim coupling
+        // for a malformed matrix.
+        return false;
+    }
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(block_states.len());
+    let mut start = 0usize;
+    for state in block_states {
+        let end = start + state.beta.len();
+        ranges.push((start, end));
+        start = end;
+    }
+    for (a, (ra_start, ra_end)) in ranges.iter().copied().enumerate() {
+        for (rb_start, rb_end) in ranges.iter().copied().skip(a + 1) {
+            for i in ra_start..ra_end {
+                for j in rb_start..rb_end {
+                    if hessian[[i, j]] != 0.0 || hessian[[j, i]] != 0.0 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn exact_newton_joint_hessian_from_exact_blocks<F: CustomFamily + ?Sized>(
