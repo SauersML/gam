@@ -16660,11 +16660,27 @@ pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> O
 ///
 /// This is the single canonical freezer — every model-save path should call
 /// this rather than rolling ad-hoc freezing logic.
-fn freeze_inner_smooth_basis_from_metadata(
+/// Freeze a smooth basis spec from its fit-time metadata so that predict-time
+/// rebuilds reproduce the exact fitted geometry instead of recomputing any
+/// data-dependent construction (knot selection, radial reparameterization,
+/// eigen-truncation, identifiability constraint) on the prediction rows.
+///
+/// This is the SINGLE source of truth for freezing, shared by stand-alone
+/// terms and by `by=`-wrapped / factor-sum-to-zero inner smooths. The wrapper
+/// arms recurse into this same function, so every inner basis kind is frozen
+/// with identical logic. A previous split implementation froze only B-spline
+/// inners, leaving spatial inner bases (`bs='tp'`/`matern`/`duchon`/`sos`)
+/// unfrozen and recomputed on the prediction grid (#704).
+fn freeze_smooth_basis_from_metadata(
     basis: &mut SmoothBasisSpec,
     metadata: &BasisMetadata,
-) -> Result<(), String> {
-    match (basis, metadata) {
+    term_name: &str,
+) -> Result<(), EstimationError> {
+    match (&mut *basis, metadata) {
+        (SmoothBasisSpec::ByVariable { inner, .. }, meta)
+        | (SmoothBasisSpec::FactorSumToZero { inner, .. }, meta) => {
+            freeze_smooth_basis_from_metadata(inner, meta, term_name)?;
+        }
         (
             SmoothBasisSpec::BSpline1D { spec: s, .. },
             BasisMetadata::BSpline1D {
@@ -16675,12 +16691,9 @@ fn freeze_inner_smooth_basis_from_metadata(
                 ..
             },
         ) => {
-            // Issue #340: when fit-time auto-shrink lowered the effective
-            // degree, persist it into the frozen spec so reload / predict
-            // sees the same `(degree, knots)` geometry that was actually
-            // fitted. Without this, a serialized cubic-spec + linear-knots
-            // pair would mismatch and downstream Cox-de Boor would index
-            // off the end of the clamped knot vector.
+            // Issue #340: bake the fit-time effective degree into the
+            // frozen spec so reload sees a self-consistent
+            // (degree, knots) pair.
             if let Some(d) = meta_degree {
                 s.degree = *d;
             }
@@ -16692,21 +16705,339 @@ fn freeze_inner_smooth_basis_from_metadata(
                     },
                 )
                 .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
-            s.identifiability = identifiability_transform
-                .as_ref()
-                .map(|z| BSplineIdentifiability::FrozenTransform {
+            s.identifiability = match identifiability_transform {
+                Some(z) => BSplineIdentifiability::FrozenTransform {
                     transform: z.clone(),
-                })
-                .unwrap_or(BSplineIdentifiability::None);
+                },
+                None => BSplineIdentifiability::None,
+            };
+            // Boundary projections are folded into `identifiability_transform`
+            // by `build_bspline_basis_1d`. A frozen prediction spec must
+            // rebuild the same raw knot basis and apply the captured
+            // transform exactly once; keeping the original boundary
+            // conditions would project the raw basis a second time and
+            // shrink its width before `FrozenTransform` is applied.
             s.boundary_conditions = Default::default();
-            Ok(())
         }
-        (SmoothBasisSpec::ByVariable { inner, .. }, meta)
-        | (SmoothBasisSpec::FactorSumToZero { inner, .. }, meta) => {
-            freeze_inner_smooth_basis_from_metadata(inner, meta)
+        (
+            SmoothBasisSpec::ThinPlate {
+                spec: s,
+                input_scales,
+                ..
+            },
+            BasisMetadata::ThinPlate {
+                centers,
+                length_scale,
+                periodic: meta_periodic,
+                identifiability_transform,
+                input_scales: meta_scales,
+                radial_reparam,
+            },
+        ) => {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.length_scale = *length_scale;
+            s.identifiability = match identifiability_transform {
+                Some(z) => SpatialIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => match &s.identifiability {
+                    SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
+                    _ => SpatialIdentifiability::None,
+                },
+            };
+            s.radial_reparam = radial_reparam.clone();
+            s.periodic = meta_periodic.clone();
+            *input_scales = meta_scales.clone();
         }
-        _ => Ok(()),
+        (
+            SmoothBasisSpec::ThinPlate { feature_cols, .. },
+            BasisMetadata::Duchon {
+                centers,
+                length_scale,
+                periodic: meta_periodic,
+                power,
+                nullspace_order,
+                identifiability_transform,
+                input_scales: meta_scales,
+                aniso_log_scales: meta_aniso,
+                ..
+            },
+        ) => {
+            // Auto-promotion path: the basis builder rewrote a canonical-TPS
+            // request to a pure Duchon spline because k < polynomial-nullspace
+            // size at this dimension. Bake the resolved Duchon parameters into
+            // the spec so predict-time goes through the same Duchon code path.
+            let identifiability = match identifiability_transform {
+                Some(z) => SpatialIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => SpatialIdentifiability::None,
+            };
+            *basis = SmoothBasisSpec::Duchon {
+                feature_cols: feature_cols.clone(),
+                spec: DuchonBasisSpec {
+                    periodic: meta_periodic.clone(),
+                    center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
+                    length_scale: *length_scale,
+                    power: *power,
+                    nullspace_order: *nullspace_order,
+                    identifiability,
+                    aniso_log_scales: meta_aniso.clone(),
+                    operator_penalties: Default::default(),
+                    boundary: OneDimensionalBoundary::Open,
+                },
+                input_scales: meta_scales.clone(),
+            };
+        }
+        (
+            SmoothBasisSpec::Sphere { spec: s, .. },
+            BasisMetadata::Sphere {
+                centers,
+                penalty_order,
+                method,
+                max_degree,
+                wahba_kernel,
+                constraint_transform,
+            },
+        ) => {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.penalty_order = *penalty_order;
+            s.method = *method;
+            s.max_degree = *max_degree;
+            s.wahba_kernel = *wahba_kernel;
+            // #532: freeze the realized-design transform (the composed
+            // `z · z_parametric` captured at fit time) so the predict-time
+            // rebuild reuses it verbatim instead of recomputing the
+            // center-space `z`, which would drop the parametric
+            // orthogonalization and resurrect the intercept collision. The
+            // Harmonic method never carries a constraint transform.
+            s.identifiability = match constraint_transform {
+                Some(z) => SphericalSplineIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => SphericalSplineIdentifiability::CenterSumToZero,
+            };
+        }
+        (
+            SmoothBasisSpec::Matern {
+                spec: s,
+                input_scales,
+                ..
+            },
+            BasisMetadata::Matern {
+                centers,
+                length_scale,
+                periodic: meta_periodic,
+                nu,
+                include_intercept,
+                identifiability_transform,
+                input_scales: meta_scales,
+                aniso_log_scales: meta_aniso,
+            },
+        ) => {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.length_scale = *length_scale;
+            s.nu = *nu;
+            s.include_intercept = *include_intercept;
+            s.identifiability = match identifiability_transform {
+                Some(z) => MaternIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => MaternIdentifiability::None,
+            };
+            s.aniso_log_scales = meta_aniso.clone();
+            s.periodic = meta_periodic.clone();
+            *input_scales = meta_scales.clone();
+        }
+        (
+            SmoothBasisSpec::Duchon {
+                spec: s,
+                input_scales,
+                ..
+            },
+            BasisMetadata::Duchon {
+                centers,
+                length_scale,
+                periodic: meta_periodic,
+                power,
+                nullspace_order,
+                identifiability_transform,
+                input_scales: meta_scales,
+                aniso_log_scales: meta_aniso,
+                ..
+            },
+        ) => {
+            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.length_scale = *length_scale;
+            s.power = *power;
+            s.nullspace_order = *nullspace_order;
+            s.identifiability = match identifiability_transform {
+                Some(z) => SpatialIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => match &s.identifiability {
+                    // If the spec already carries a frozen transform but the
+                    // metadata lost it (e.g. raw rebuild stripped it), keep
+                    // the existing frozen transform rather than downgrading.
+                    SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
+                    _ => SpatialIdentifiability::None,
+                },
+            };
+            s.aniso_log_scales = meta_aniso.clone();
+            s.periodic = meta_periodic.clone();
+            *input_scales = meta_scales.clone();
+        }
+        (
+            SmoothBasisSpec::Sphere { spec: s, .. },
+            BasisMetadata::SphereHarmonics {
+                max_degree,
+                radians,
+            },
+        ) => {
+            s.max_degree = Some(*max_degree);
+            s.radians = *radians;
+        }
+        (
+            SmoothBasisSpec::TensorBSpline {
+                feature_cols,
+                spec: s,
+            },
+            BasisMetadata::TensorBSpline {
+                feature_cols: fitted_cols,
+                knots,
+                degrees,
+                periods,
+                identifiability_transform,
+            },
+        ) => {
+            if s.marginalspecs.len() != knots.len() || s.marginalspecs.len() != degrees.len() {
+                crate::bail_invalid_estim!(
+                    "tensor freeze mismatch for '{}': marginalspecs={}, knots={}, degrees={}",
+                    term_name,
+                    s.marginalspecs.len(),
+                    knots.len(),
+                    degrees.len()
+                );
+            }
+            *feature_cols = fitted_cols.clone();
+            for i in 0..s.marginalspecs.len() {
+                s.marginalspecs[i].degree = degrees[i];
+                s.marginalspecs[i].knotspec = match (periods[i], knots[i].len()) {
+                    (Some(period), num_basis) if num_basis >= 1 => {
+                        // Periodic uniform reconstructs the open
+                        // `[start, start + period)` data range from the
+                        // first knot and the saved period. `knots[i].len()`
+                        // is the periodic control-site count.
+                        let domain_start = knots[i][0];
+                        BSplineKnotSpec::PeriodicUniform {
+                            data_range: (domain_start, domain_start + period),
+                            num_basis,
+                        }
+                    }
+                    _ => BSplineKnotSpec::Provided(knots[i].clone()),
+                };
+            }
+            s.periods = periods.clone();
+            s.identifiability = match identifiability_transform {
+                Some(z) => TensorBSplineIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => TensorBSplineIdentifiability::None,
+            };
+        }
+        (
+            SmoothBasisSpec::FactorSmooth { spec: s },
+            BasisMetadata::FactorSmooth {
+                knots,
+                degree,
+                periodic,
+                group_levels,
+                ..
+            },
+        ) => {
+            s.marginal.knotspec = periodic
+                .map(
+                    |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                        data_range: (domain_start, domain_start + period),
+                        num_basis,
+                    },
+                )
+                .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
+            // Restore the FROZEN marginal degree (#555 predict-replay). With
+            // a `Provided(knots)` knotspec the per-margin basis count is
+            // `knots.len() - (degree + 1)`, so if fit-time auto-shrink
+            // lowered the marginal degree (small per-group n: cubic →
+            // quadratic/linear), rebuilding with the original spec degree
+            // would yield a different per-level `p` and corrupt the
+            // block-diagonal replay. Mirror the sibling BySmooth arm, which
+            // restores `inner.degree = *degree` for exactly this reason.
+            s.marginal.degree = *degree;
+            s.group_frozen_levels = Some(group_levels.clone());
+        }
+        (
+            SmoothBasisSpec::BySmooth { smooth, by_kind },
+            BasisMetadata::FactorSmooth {
+                knots,
+                degree,
+                periodic,
+                group_levels,
+                ..
+            },
+        ) => {
+            if let ByVarKind::Factor { frozen_levels, .. } = by_kind {
+                *frozen_levels = Some(group_levels.clone());
+            }
+            if let SmoothBasisSpec::BSpline1D { spec: inner, .. } = smooth.as_mut() {
+                // Issue #340: FactorSmooth metadata records the per-axis
+                // spline degree directly (not optional); reflect it on
+                // the inner spec so reload sees a self-consistent
+                // (degree, knots) pair after fit-time auto-shrink.
+                inner.degree = *degree;
+                inner.knotspec = periodic
+                    .map(
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                            data_range: (domain_start, domain_start + period),
+                            num_basis,
+                        },
+                    )
+                    .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
+                inner.identifiability = BSplineIdentifiability::None;
+            }
+        }
+        (
+            SmoothBasisSpec::BySmooth { smooth, by_kind },
+            BasisMetadata::BySmooth { inner, levels, .. },
+        ) => {
+            // A `by=` smooth whose metadata is wrapped in `BySmooth`:
+            // restore the frozen grouping levels, then recurse so the inner
+            // basis is frozen with EXACTLY the same logic used for a
+            // stand-alone term.
+            if let ByVarKind::Factor { frozen_levels, .. } = by_kind
+                && let Some(levels) = levels
+            {
+                *frozen_levels = Some(levels.clone());
+            }
+            freeze_smooth_basis_from_metadata(smooth, inner, term_name)?;
+        }
+        (SmoothBasisSpec::BySmooth { smooth, .. }, metadata) => {
+            // `by=` wrapper carrying the inner basis metadata directly
+            // (numeric `by`, or a factor `by` lowered to one gated block).
+            // Recurse so a spatial inner basis (thin-plate, Matern, Duchon,
+            // sphere, tensor, …) is frozen identically to a stand-alone
+            // term. Previously only a B-spline inner was frozen here, so a
+            // `s(x, by=g, bs='tp')` smooth left its data-dependent kernel
+            // and eigen-truncation to be recomputed on the prediction grid,
+            // crashing the predict-time design rebuild (#704).
+            freeze_smooth_basis_from_metadata(smooth, metadata, term_name)?;
+        }
+        _ => {
+            crate::bail_invalid_estim!(
+                "smooth metadata/spec type mismatch while freezing term '{}'",
+                term_name
+            );
+        }
     }
+    Ok(())
 }
 
 pub fn freeze_term_collection_from_design(
@@ -16744,374 +17075,7 @@ pub fn freeze_term_collection_from_design(
         // rotation). Without this propagation, models reloaded from disk
         // produce wrong η at predict-time for any smooth with `Some(Q)`.
         term.joint_null_rotation = fitted.joint_null_rotation.clone();
-        match (&mut term.basis, &fitted.metadata) {
-            (SmoothBasisSpec::ByVariable { inner, .. }, meta)
-            | (SmoothBasisSpec::FactorSumToZero { inner, .. }, meta) => {
-                freeze_inner_smooth_basis_from_metadata(inner, meta)
-                    .map_err(BasisError::InvalidInput)?;
-            }
-            (
-                SmoothBasisSpec::BSpline1D { spec: s, .. },
-                BasisMetadata::BSpline1D {
-                    knots,
-                    identifiability_transform,
-                    periodic,
-                    degree: meta_degree,
-                    ..
-                },
-            ) => {
-                // Issue #340: bake the fit-time effective degree into the
-                // frozen spec so reload sees a self-consistent
-                // (degree, knots) pair.
-                if let Some(d) = meta_degree {
-                    s.degree = *d;
-                }
-                s.knotspec = periodic
-                    .map(
-                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                            data_range: (domain_start, domain_start + period),
-                            num_basis,
-                        },
-                    )
-                    .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
-                s.identifiability = match identifiability_transform {
-                    Some(z) => BSplineIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => BSplineIdentifiability::None,
-                };
-                // Boundary projections are folded into `identifiability_transform`
-                // by `build_bspline_basis_1d`. A frozen prediction spec must
-                // rebuild the same raw knot basis and apply the captured
-                // transform exactly once; keeping the original boundary
-                // conditions would project the raw basis a second time and
-                // shrink its width before `FrozenTransform` is applied.
-                s.boundary_conditions = Default::default();
-            }
-            (
-                SmoothBasisSpec::ThinPlate {
-                    spec: s,
-                    input_scales,
-                    ..
-                },
-                BasisMetadata::ThinPlate {
-                    centers,
-                    length_scale,
-                    periodic: meta_periodic,
-                    identifiability_transform,
-                    input_scales: meta_scales,
-                    radial_reparam,
-                },
-            ) => {
-                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-                s.length_scale = *length_scale;
-                s.identifiability = match identifiability_transform {
-                    Some(z) => SpatialIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => match &s.identifiability {
-                        SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
-                        _ => SpatialIdentifiability::None,
-                    },
-                };
-                s.radial_reparam = radial_reparam.clone();
-                s.periodic = meta_periodic.clone();
-                *input_scales = meta_scales.clone();
-            }
-            (
-                SmoothBasisSpec::ThinPlate { feature_cols, .. },
-                BasisMetadata::Duchon {
-                    centers,
-                    length_scale,
-                    periodic: meta_periodic,
-                    power,
-                    nullspace_order,
-                    identifiability_transform,
-                    input_scales: meta_scales,
-                    aniso_log_scales: meta_aniso,
-                    ..
-                },
-            ) => {
-                // Auto-promotion path: the basis builder rewrote a canonical-TPS
-                // request to a pure Duchon spline because k < polynomial-nullspace
-                // size at this dimension. Bake the resolved Duchon parameters into
-                // the spec so predict-time goes through the same Duchon code path.
-                let identifiability = match identifiability_transform {
-                    Some(z) => SpatialIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => SpatialIdentifiability::None,
-                };
-                term.basis = SmoothBasisSpec::Duchon {
-                    feature_cols: feature_cols.clone(),
-                    spec: DuchonBasisSpec {
-                        periodic: meta_periodic.clone(),
-                        center_strategy: crate::basis::CenterStrategy::UserProvided(
-                            centers.clone(),
-                        ),
-                        length_scale: *length_scale,
-                        power: *power,
-                        nullspace_order: *nullspace_order,
-                        identifiability,
-                        aniso_log_scales: meta_aniso.clone(),
-                        operator_penalties: Default::default(),
-                        boundary: OneDimensionalBoundary::Open,
-                    },
-                    input_scales: meta_scales.clone(),
-                };
-            }
-            (
-                SmoothBasisSpec::Sphere { spec: s, .. },
-                BasisMetadata::Sphere {
-                    centers,
-                    penalty_order,
-                    method,
-                    max_degree,
-                    wahba_kernel,
-                    constraint_transform,
-                },
-            ) => {
-                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-                s.penalty_order = *penalty_order;
-                s.method = *method;
-                s.max_degree = *max_degree;
-                s.wahba_kernel = *wahba_kernel;
-                // #532: freeze the realized-design transform (the composed
-                // `z · z_parametric` captured at fit time) so the predict-time
-                // rebuild reuses it verbatim instead of recomputing the
-                // center-space `z`, which would drop the parametric
-                // orthogonalization and resurrect the intercept collision. The
-                // Harmonic method never carries a constraint transform.
-                s.identifiability = match constraint_transform {
-                    Some(z) => SphericalSplineIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => SphericalSplineIdentifiability::CenterSumToZero,
-                };
-            }
-            (
-                SmoothBasisSpec::Matern {
-                    spec: s,
-                    input_scales,
-                    ..
-                },
-                BasisMetadata::Matern {
-                    centers,
-                    length_scale,
-                    periodic: meta_periodic,
-                    nu,
-                    include_intercept,
-                    identifiability_transform,
-                    input_scales: meta_scales,
-                    aniso_log_scales: meta_aniso,
-                },
-            ) => {
-                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-                s.length_scale = *length_scale;
-                s.nu = *nu;
-                s.include_intercept = *include_intercept;
-                s.identifiability = match identifiability_transform {
-                    Some(z) => MaternIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => MaternIdentifiability::None,
-                };
-                s.aniso_log_scales = meta_aniso.clone();
-                s.periodic = meta_periodic.clone();
-                *input_scales = meta_scales.clone();
-            }
-            (
-                SmoothBasisSpec::Duchon {
-                    spec: s,
-                    input_scales,
-                    ..
-                },
-                BasisMetadata::Duchon {
-                    centers,
-                    length_scale,
-                    periodic: meta_periodic,
-                    power,
-                    nullspace_order,
-                    identifiability_transform,
-                    input_scales: meta_scales,
-                    aniso_log_scales: meta_aniso,
-                    ..
-                },
-            ) => {
-                s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
-                s.length_scale = *length_scale;
-                s.power = *power;
-                s.nullspace_order = *nullspace_order;
-                s.identifiability = match identifiability_transform {
-                    Some(z) => SpatialIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => match &s.identifiability {
-                        // If the spec already carries a frozen transform but the
-                        // metadata lost it (e.g. raw rebuild stripped it), keep
-                        // the existing frozen transform rather than downgrading.
-                        SpatialIdentifiability::FrozenTransform { .. } => s.identifiability.clone(),
-                        _ => SpatialIdentifiability::None,
-                    },
-                };
-                s.aniso_log_scales = meta_aniso.clone();
-                s.periodic = meta_periodic.clone();
-                *input_scales = meta_scales.clone();
-            }
-            (
-                SmoothBasisSpec::Sphere { spec: s, .. },
-                BasisMetadata::SphereHarmonics {
-                    max_degree,
-                    radians,
-                },
-            ) => {
-                s.max_degree = Some(*max_degree);
-                s.radians = *radians;
-            }
-            (
-                SmoothBasisSpec::TensorBSpline {
-                    feature_cols,
-                    spec: s,
-                },
-                BasisMetadata::TensorBSpline {
-                    feature_cols: fitted_cols,
-                    knots,
-                    degrees,
-                    periods,
-                    identifiability_transform,
-                },
-            ) => {
-                if s.marginalspecs.len() != knots.len() || s.marginalspecs.len() != degrees.len() {
-                    crate::bail_invalid_estim!(
-                        "tensor freeze mismatch for '{}': marginalspecs={}, knots={}, degrees={}",
-                        term.name,
-                        s.marginalspecs.len(),
-                        knots.len(),
-                        degrees.len()
-                    );
-                }
-                *feature_cols = fitted_cols.clone();
-                for i in 0..s.marginalspecs.len() {
-                    s.marginalspecs[i].degree = degrees[i];
-                    s.marginalspecs[i].knotspec = match (periods[i], knots[i].len()) {
-                        (Some(period), num_basis) if num_basis >= 1 => {
-                            // Periodic uniform reconstructs the open
-                            // `[start, start + period)` data range from the
-                            // first knot and the saved period. `knots[i].len()`
-                            // is the periodic control-site count.
-                            let domain_start = knots[i][0];
-                            BSplineKnotSpec::PeriodicUniform {
-                                data_range: (domain_start, domain_start + period),
-                                num_basis,
-                            }
-                        }
-                        _ => BSplineKnotSpec::Provided(knots[i].clone()),
-                    };
-                }
-                s.periods = periods.clone();
-                s.identifiability = match identifiability_transform {
-                    Some(z) => TensorBSplineIdentifiability::FrozenTransform {
-                        transform: z.clone(),
-                    },
-                    None => TensorBSplineIdentifiability::None,
-                };
-            }
-            (
-                SmoothBasisSpec::FactorSmooth { spec: s },
-                BasisMetadata::FactorSmooth {
-                    knots,
-                    degree,
-                    periodic,
-                    group_levels,
-                    ..
-                },
-            ) => {
-                s.marginal.knotspec = periodic
-                    .map(
-                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                            data_range: (domain_start, domain_start + period),
-                            num_basis,
-                        },
-                    )
-                    .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
-                // Restore the FROZEN marginal degree (#555 predict-replay). With
-                // a `Provided(knots)` knotspec the per-margin basis count is
-                // `knots.len() - (degree + 1)`, so if fit-time auto-shrink
-                // lowered the marginal degree (small per-group n: cubic →
-                // quadratic/linear), rebuilding with the original spec degree
-                // would yield a different per-level `p` and corrupt the
-                // block-diagonal replay. Mirror the sibling BySmooth arm, which
-                // restores `inner.degree = *degree` for exactly this reason.
-                s.marginal.degree = *degree;
-                s.group_frozen_levels = Some(group_levels.clone());
-            }
-            (
-                SmoothBasisSpec::BySmooth { smooth, by_kind },
-                BasisMetadata::FactorSmooth {
-                    knots,
-                    degree,
-                    periodic,
-                    group_levels,
-                    ..
-                },
-            ) => {
-                if let ByVarKind::Factor { frozen_levels, .. } = by_kind {
-                    *frozen_levels = Some(group_levels.clone());
-                }
-                if let SmoothBasisSpec::BSpline1D { spec: inner, .. } = smooth.as_mut() {
-                    // Issue #340: FactorSmooth metadata records the per-axis
-                    // spline degree directly (not optional); reflect it on
-                    // the inner spec so reload sees a self-consistent
-                    // (degree, knots) pair after fit-time auto-shrink.
-                    inner.degree = *degree;
-                    inner.knotspec = periodic
-                        .map(
-                            |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                                data_range: (domain_start, domain_start + period),
-                                num_basis,
-                            },
-                        )
-                        .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
-                    inner.identifiability = BSplineIdentifiability::None;
-                }
-            }
-            (SmoothBasisSpec::BySmooth { smooth, .. }, metadata) => {
-                if let SmoothBasisSpec::BSpline1D { spec: inner, .. } = smooth.as_mut()
-                    && let BasisMetadata::BSpline1D {
-                        knots,
-                        periodic,
-                        identifiability_transform,
-                        degree: meta_degree,
-                        ..
-                    } = metadata
-                {
-                    // Issue #340: persist auto-shrunk effective degree.
-                    if let Some(d) = meta_degree {
-                        inner.degree = *d;
-                    }
-                    inner.knotspec = periodic
-                        .map(
-                            |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                                data_range: (domain_start, domain_start + period),
-                                num_basis,
-                            },
-                        )
-                        .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
-                    inner.identifiability = match identifiability_transform {
-                        Some(z) => BSplineIdentifiability::FrozenTransform {
-                            transform: z.clone(),
-                        },
-                        None => BSplineIdentifiability::None,
-                    };
-                }
-            }
-            _ => {
-                crate::bail_invalid_estim!(
-                    "smooth metadata/spec type mismatch while freezing term '{}'",
-                    term.name
-                );
-            }
-        }
+        freeze_smooth_basis_from_metadata(&mut term.basis, &fitted.metadata, &term.name)?;
     }
 
     // ── random-effect terms ─────────────────────────────────────────────
