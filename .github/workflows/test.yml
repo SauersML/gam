@@ -111,12 +111,12 @@ jobs:
           # `collect2: fatal error: ld terminated with signal 7 [Bus error]`.
           # Build/link the test binaries serially below; test execution stays
           # under Cargo's normal harness once each binary exists.
-          # Rust 1.93 injects `-fuse-ld=lld` for this target. Even one
-          # serialized `gam` integration-test link still crashes rust-lld in
-          # `llvm::parallelFor` on the 16-GB runner, so choose GNU bfd for the
-          # CI test link. It is slower, but it avoids lld's peak allocator
-          # behavior and keeps the verification on standard GitHub runners.
-          RUSTFLAGS: "-C link-arg=-fuse-ld=bfd"
+          # Rust 1.93 injects `-fuse-ld=lld` for this target. Pin lld to one
+          # worker so the linker does not oversubscribe the runner while Cargo
+          # serializes test-binary links below. The test command also disables
+          # dev debuginfo, which removes the largest non-executable payload from
+          # these huge integration-test links.
+          RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
         run: |
           set -uo pipefail
           # cargo test captures stdout/stderr by default and only re-prints
@@ -136,8 +136,7 @@ jobs:
           # The CI assertions need line numbers from panic output, not full DWARF
           # debug sections in every integration-test binary. Dropping dev
           # debuginfo removes the largest non-executable payload from the link
-          # and keeps the bfd fallback from turning the suite into an hours-long
-          # serial link job.
+          # and keeps the serialized link job practical on standard runners.
           cargo test --config profile.dev.debug=0 --all-features --jobs 1 2>&1 | tee /tmp/cargo-test.log
           test_status=${PIPESTATUS[0]}
 
