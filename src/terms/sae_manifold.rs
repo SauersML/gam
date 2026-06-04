@@ -7594,13 +7594,65 @@ impl SaeManifoldOuterObjective {
     /// Consume the objective, returning the inner-fitted term, the last ρ the
     /// engine evaluated, and the inner loss breakdown at that ρ.
     pub fn into_fitted(self) -> (SaeManifoldTerm, SaeManifoldRho, SaeManifoldLoss) {
-        let loss = self.last_loss.unwrap_or_else(|| SaeManifoldLoss {
+        let Self {
+            term,
+            mut baseline_term,
+            target,
+            registry,
+            current_rho,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            last_loss,
+            ..
+        } = self;
+        let loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
             data_fit: 0.0,
             assignment_sparsity: 0.0,
             smoothness: 0.0,
             ard: 0.0,
         });
-        (self.term, self.current_rho, loss)
+        // Basin guard against the multi-atom routing-collapse failure mode
+        // (#629 #630). The outer ρ cascade mutates `term` cumulatively across
+        // candidate ρ evaluations and never restores it between evals, so a
+        // single ill-conditioned ρ poll can drag the per-row routing off the
+        // decisive seed basin (the EM routing-seed / decoder-projection start)
+        // into the near-uniform saddle. The settled `term` then reports that
+        // collapsed routing even though the seed basin reconstructs the planted
+        // disjoint atoms far better. `baseline_term` preserves the pristine
+        // seeded geometry; re-solve the inner joint fit from it at the SAME
+        // settled ρ the engine selected (smoothing choice is untouched) and
+        // keep whichever converged state attains the lower penalized objective.
+        // For an already-routed fit the two coincide (the seed basin is the
+        // optimum), so this is a no-op there and never weakens the criterion;
+        // for a drifted fit it recovers the routed solution the seed reached.
+        let settled_objective =
+            term.penalized_objective_total(target.view(), &current_rho, registry.as_ref(), 1.0);
+        let mut rho_seed = current_rho.clone();
+        let seed_solve = baseline_term.run_joint_fit_arrow_schur(
+            target.view(),
+            &mut rho_seed,
+            registry.as_ref(),
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+        );
+        if let (Ok(settled_total), Ok(seed_loss)) = (settled_objective, seed_solve) {
+            let seed_total = baseline_term.penalized_objective_total(
+                target.view(),
+                &current_rho,
+                registry.as_ref(),
+                1.0,
+            );
+            if let Ok(seed_total) = seed_total {
+                if seed_total.is_finite() && seed_total < settled_total {
+                    return (baseline_term, current_rho, seed_loss);
+                }
+            }
+        }
+        (term, current_rho, loss)
     }
 
     /// Posterior shape uncertainty of the fitted atoms — per-atom decoder
