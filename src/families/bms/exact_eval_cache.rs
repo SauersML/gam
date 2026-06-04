@@ -169,12 +169,28 @@ pub(super) struct RowPrimaryEvalTile {
 pub(crate) struct RowPrimaryEvalTiles {
     pub(super) n_rows: usize,
     pub(super) r: usize,
+    /// Uniform row stride the tiles were built at (every tile except possibly
+    /// the last holds exactly `tile_rows` rows). Lets `tile_for_row` resolve a
+    /// global row to its tile by a single division instead of a linear scan —
+    /// the lookup is on the per-row hot path of the fused gradient / dense / HVP
+    /// passes, which call it once or twice for every one of the `n` rows.
+    pub(super) tile_rows: usize,
     pub(super) tiles: Vec<RowPrimaryEvalTile>,
 }
 
 impl RowPrimaryEvalTiles {
-    pub(super) fn new(n_rows: usize, r: usize, tiles: Vec<RowPrimaryEvalTile>) -> Self {
-        Self { n_rows, r, tiles }
+    pub(super) fn new(
+        n_rows: usize,
+        r: usize,
+        tile_rows: usize,
+        tiles: Vec<RowPrimaryEvalTile>,
+    ) -> Self {
+        Self {
+            n_rows,
+            r,
+            tile_rows,
+            tiles,
+        }
     }
 
     #[inline]
@@ -184,6 +200,21 @@ impl RowPrimaryEvalTiles {
 
     #[inline]
     pub(super) fn tile_for_row(&self, row: usize) -> Option<(&RowPrimaryEvalTile, usize)> {
+        // Tiles are built at a uniform `tile_rows` stride starting at row 0, so
+        // the owning tile index is `row / tile_rows`. Resolve it directly and
+        // confirm the row falls inside the tile's actual length (the final tile
+        // may be shorter). Fall back to a linear scan only if the arithmetic
+        // guess does not contain the row — a defensive path for any future
+        // non-uniform tiling rather than a hot-path cost.
+        if self.tile_rows > 0 {
+            let guess = row / self.tile_rows;
+            if let Some(tile) = self.tiles.get(guess) {
+                let len = tile.rows.neglog().len();
+                if row >= tile.row_start && row < tile.row_start + len {
+                    return Some((tile, row - tile.row_start));
+                }
+            }
+        }
         for tile in &self.tiles {
             let len = tile.rows.neglog().len();
             if row >= tile.row_start && row < tile.row_start + len {

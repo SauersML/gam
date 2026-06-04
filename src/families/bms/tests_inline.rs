@@ -8041,6 +8041,7 @@ mod tests {
             row_primary_hessians: RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
                 family.y.len(),
                 r,
+                5,
                 tiles,
             )),
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
