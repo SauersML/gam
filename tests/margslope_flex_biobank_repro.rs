@@ -34,6 +34,7 @@ use std::time::Duration;
 
 const DEFAULT_SMOKE_N: usize = 2_000;
 const DEFAULT_WALL_BOUND: Duration = Duration::from_secs(300);
+const FULL_OUTER_SMOKE_INNER_CYCLES: usize = 20;
 
 #[derive(Clone, Debug)]
 struct BetaDiff {
@@ -191,7 +192,7 @@ fn margslope_flex_beta_equivalence_smoke() {
 /// hanging (the outer LAML Hessian re-walked every cubic partition cell per
 /// `(ρ-axis i, ρ-axis j)` pair, O(D²·n·cells·r²) per outer step). The
 /// axis-projected per-row tensor cache collapses that to one O(n·cells·r²)
-/// build reused across all pairs. `inner_max_cycles` is capped at cycle 0 and
+/// build reused across all pairs. `inner_max_cycles` uses a small fixed cap and
 /// the outer derivative passes use a fixed row mask, so the debug regression
 /// covers the hang surface without spending the full production convergence
 /// tail or making CI pay every row.
@@ -202,7 +203,7 @@ fn flex_full_outer_completes_under_budget_683() {
     let problem = build_biobank_shape_problem(n);
     let outer_mask = (0..16usize).collect::<Vec<_>>();
     let options = BlockwiseFitOptions {
-        inner_max_cycles: 1,
+        inner_max_cycles: FULL_OUTER_SMOKE_INNER_CYCLES,
         outer_max_iter: 3,
         compute_covariance: false,
         screen_initial_rho: false,
@@ -216,8 +217,9 @@ fn flex_full_outer_completes_under_budget_683() {
     match result {
         Ok((out, timing)) => {
             eprintln!(
-                "[MS-FLEX-683] n={} inner_max_cycles=1 elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
+                "[MS-FLEX-683] n={} inner_max_cycles={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
                 n,
+                FULL_OUTER_SMOKE_INNER_CYCLES,
                 elapsed.as_secs_f64(),
                 timing.outer_iterations,
                 timing.inner_cycles,
