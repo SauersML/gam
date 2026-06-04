@@ -88,10 +88,9 @@ impl DriverApi {
 /// (`cublasCreate_v2`, `cusolverDnCreate`, `cusparseCreate`) attach to
 /// the same context instead of building their own.
 pub struct CudaWorkingState {
-    /// Resolved CUDA driver entry points. The underlying dlopen'd
-    /// `libcuda` is `Box::leak`'d inside [`load_static_library`], so the
-    /// fn pointers in `api` stay valid for the process lifetime without
-    /// any owning field here.
+    /// Resolved CUDA driver entry points. The underlying dlopen'd `libcuda`
+    /// is retained by the static loader, so the fn pointers in `api` stay
+    /// valid for the process lifetime without any owning field here.
     pub api: DriverApi,
     /// Primary CUDA context for the selected device. Library runtimes
     /// must `cuCtxSetCurrent` on it before issuing work.
@@ -254,12 +253,12 @@ pub fn preload_cuda_driver() -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn preload_cuda_userspace_libraries() -> Result<(), String> {
-    static PRELOAD: OnceLock<Result<(), String>> = OnceLock::new();
+    static PRELOAD: OnceLock<Result<Vec<UnixLibrary>, String>> = OnceLock::new();
     PRELOAD
         .get_or_init(|| {
             let paths = cuda_userspace_preload_paths();
             if paths.is_empty() {
-                return Ok(());
+                return Ok(Vec::new());
             }
             let mut loaded = Vec::new();
             for path in paths {
@@ -278,12 +277,11 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
                     }
                 }
             }
-            // Keep handles process-live; dropping them would dlclose the
-            // libraries before cudarc's own lazy SONAME loads run.
-            Box::leak(Box::new(loaded));
-            Ok(())
+            Ok(loaded)
         })
-        .clone()
+        .as_ref()
+        .map(|_| ())
+        .map_err(Clone::clone)
 }
 
 /// Returns whether the platform loader can open the named CUDA compute
@@ -304,7 +302,9 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
 pub fn cuda_compute_library_present(stem: &str) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let _ = preload_cuda_userspace_libraries();
+        if preload_cuda_userspace_libraries().is_err() {
+            return false;
+        }
     }
     load_library_names(&cuda_compute_library_candidate_names(stem)).is_ok()
 }
@@ -466,12 +466,6 @@ fn nvidia_component_for_stem(stem: &str) -> String {
 #[cfg(target_os = "linux")]
 fn nvidia_package_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        collect_python_nvidia_roots(Path::new(&home).join(".local/lib"), &mut roots);
-    }
-    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
-        collect_python_nvidia_roots(Path::new(&venv).join("lib"), &mut roots);
-    }
     collect_python_nvidia_roots(Path::new("/usr/local/lib").to_path_buf(), &mut roots);
     collect_python_nvidia_roots(Path::new("/usr/lib").to_path_buf(), &mut roots);
     dedup_paths(roots)
