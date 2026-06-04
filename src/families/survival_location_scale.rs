@@ -5048,29 +5048,6 @@ fn validate_linear_constraints(
     Ok(())
 }
 
-/// Structural null-space dimension of a symmetric PSD penalty, using the same
-/// relative eigenvalue threshold the I-spline builder applies when it reports
-/// `nullspace_dims`. Returns the full dimension on an eigendecomposition
-/// failure (the conservative answer for a fully-collapsed parametric penalty).
-fn symmetric_null_space_dim(s_mat: &Array2<f64>) -> usize {
-    let p = s_mat.nrows();
-    if p == 0 {
-        return 0;
-    }
-    match s_mat.eigh(faer::Side::Lower) {
-        Ok((evals, _)) => {
-            let max_ev = evals
-                .iter()
-                .copied()
-                .fold(0.0_f64, |a, b| a.max(b.abs()))
-                .max(1.0);
-            let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
-            evals.iter().filter(|&&e| e <= threshold).count()
-        }
-        Err(_) => p,
-    }
-}
-
 /// Orthonormal basis `z` (raw `p` × reduced `r`) of the penalty null space —
 /// the affine `{1, log t}` AFT baseline an I-spline 2nd-order difference penalty
 /// leaves unpenalized. The penalized (curvature) directions are exactly the
