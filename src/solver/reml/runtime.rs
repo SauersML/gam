@@ -110,6 +110,24 @@ const ALO_TAU: f64 = 0.5;
 // so the leverage barrier and the predictive-deviance term enter on equal
 // conservative footing; neither dominates.
 const ALO_GAMMA: f64 = 0.5;
+// Saturation cap (in units of φ) on each observation's standardized squared
+// leave-one-out deviance contribution w_i·(y_i − η̃_i)²/φ. PSIS bounds the
+// *variance* of the importance weights but NOT the per-observation squared LOO
+// residual, which for an isolated near-unit-leverage point is (y_i − η̂_i)/(1 −
+// h_i): as 1 − h_i → 0 it explodes, dominating Σ D_ALO and dragging the
+// selected λ upward (global over-smoothing) just to suppress a residual that is
+// driven by basis geometry, not by model misfit — the model with that isolated
+// point removed has no support there and its LOO prediction is intrinsically
+// hopeless no matter how λ is chosen. We therefore pass each contribution
+// through the smooth saturator g(d) = cap·tanh(d/cap): for a well-fit point d ≈
+// 1 ≪ cap so g(d) ≈ d (the criterion is the ordinary LOO deviance), while a
+// geometry-driven d ≫ cap saturates to ≈ cap so no single hopeless point can
+// dominate the λ selection. cap = 9 is a robust 3-σ² cutoff on a standardized
+// squared residual — well above the ~6.63 chi-square(1) 99th percentile, so
+// every genuine bulk point is left untouched and only the pathological isolated
+// rows are bounded. This bounds the *influence* of high-leverage points on the
+// criterion (the stated design goal) without globally inflating λ.
+const ALO_DEVIANCE_SATURATION: f64 = 9.0;
 // Cap on n·p work for the analytic first-order gradient. Above this the dense
 // H⁻¹Xᵀ solve is too expensive to justify per outer evaluation, so the
 // stabilizer falls back to value-only augmentation (still bit-preserving the
@@ -129,9 +147,30 @@ fn alo_leverage_barrier_derivative(h: f64) -> f64 {
     }
 }
 
-fn gaussian_alo_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
+/// Raw standardized leave-one-out deviance contribution
+/// d = w·(y − η̃)²/φ for one observation, before saturation.
+fn gaussian_alo_raw_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
     let residual = y - eta_loo;
     prior_weight * residual * residual / phi.max(f64::MIN_POSITIVE)
+}
+
+/// Saturated per-observation Gaussian ALO deviance contribution
+/// g(d) = cap·tanh(d/cap) with d the raw standardized squared LOO residual.
+/// `g(d) ≈ d` for d ≪ cap and `g(d) → cap` for d ≫ cap, so an isolated
+/// near-unit-leverage point whose LOO residual explodes from basis geometry
+/// (not model misfit) contributes a bounded amount to the λ-selection
+/// criterion instead of dragging λ up via global over-smoothing.
+fn gaussian_alo_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
+    let raw = gaussian_alo_raw_deviance(y, eta_loo, prior_weight, phi);
+    ALO_DEVIANCE_SATURATION * (raw / ALO_DEVIANCE_SATURATION).tanh()
+}
+
+/// Saturator derivative g'(d) = 1 − tanh²(d/cap) evaluated at the raw
+/// standardized squared LOO residual `raw`. Used to chain-rule the analytic
+/// ρ-gradient of the saturated deviance term: ∂g(d_i)/∂η̃_i = g'(d_i)·∂d_i/∂η̃_i.
+fn gaussian_alo_deviance_saturation_factor(raw: f64) -> f64 {
+    let t = (raw / ALO_DEVIANCE_SATURATION).tanh();
+    1.0 - t * t
 }
 
 fn transformed_penalty_matvec(
@@ -9034,7 +9073,22 @@ impl<'a> RemlState<'a> {
         let mut grad = Array1::<f64>::zeros(k);
         for i in 0..nrows {
             let h_i = alo.leverage[i];
-            let dev_eta_grad = -2.0 * self.weights[i] * (self.y[i] - alo.eta_tilde[i]) / phi_safe;
+            // ∂d_i/∂η̃_i for the raw standardized squared LOO residual d_i.
+            let raw_dev_eta_grad =
+                -2.0 * self.weights[i] * (self.y[i] - alo.eta_tilde[i]) / phi_safe;
+            // Chain the smooth saturator: ∂g(d_i)/∂η̃_i = g'(d_i)·∂d_i/∂η̃_i so
+            // the gradient matches the saturated cost used in the value path. A
+            // saturated (geometry-driven) high-leverage point has g'(d_i) → 0,
+            // so it stops pulling λ up — the analytic correlate of bounding its
+            // influence on the criterion.
+            let raw_dev = gaussian_alo_raw_deviance(
+                self.y[i],
+                alo.eta_tilde[i],
+                self.weights[i],
+                phi_safe,
+            );
+            let dev_eta_grad =
+                gaussian_alo_deviance_saturation_factor(raw_dev) * raw_dev_eta_grad;
             let b_prime = alo_leverage_barrier_derivative(h_i);
             for kk in 0..k {
                 let u_ik = deta_loo[[i, kk]];
