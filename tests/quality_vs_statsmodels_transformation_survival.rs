@@ -365,7 +365,15 @@ for a, bcoord in zip(gx1, gx2):
         surv.append(np.exp(-(s / scale_i) ** shape))
 emit("surv", surv)
 emit("shape", [shape])
-emit("converged", [1.0 if res.success else 0.0])
+# Convergence = a VALID fit (finite params + finite objective), NOT the BFGS
+# `success` flag. With gtol=1e-10 (a gradient tolerance far tighter than any
+# survival NLL realistically attains) the polish step reports success=False
+# even when the Nelder-Mead + BFGS estimate is sound, so keying the baseline's
+# validity on that flag is a false negative. This matches both the module
+# header ("NOT ... matching another tool's noisy [optimizer] flag") and the
+# real-data PHReg arm, which already validates via finite params.
+_ok = np.all(np.isfinite(np.asarray(res.x, dtype=float))) and np.isfinite(negloglik(res.x))
+emit("converged", [1.0 if _ok else 0.0])
 "#
         ),
     );
