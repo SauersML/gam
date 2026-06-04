@@ -16,6 +16,23 @@ The two packages are versioned independently — `gam` tracks the Rust engine,
 `gamfit` the Python wheel — but released together. Each entry is headed with the
 git tag and both package versions.
 
+## v0.3.85 — gam 0.3.85 / gamfit 0.1.157 (2026-06-04)
+
+### Fixed
+
+- **Survival marginal-slope left-truncated `matern(...)` fits no longer reject
+  every REML seed through a phantom time-block multiplier** (#751). The
+  marginal-slope baseline time basis now anchors at the median exit time instead
+  of the minimum entry time, so left truncation no longer turns the centered
+  I-spline null-space column into a dominant one-sided time trend. The time block
+  also installs an explicit null-space shrinkage penalty for structural
+  unpenalized directions, giving REML a real precision parameter instead of an
+  unidentifiable phantom multiplier.
+- **Invalid survival marginal-slope custom-family block specs now return a typed
+  error instead of panicking in Rust** (#751). Output-channel wiring validates the
+  block specs before probing family channel assignments, and the default
+  assignment hook is only defined for empty specs.
+
 ## v0.3.84 — gam 0.3.84 / gamfit 0.1.156 (2026-06-04)
 
 This release lands a large batch of correctness, convergence, and quality fixes
