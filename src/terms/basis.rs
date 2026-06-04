@@ -23350,8 +23350,17 @@ fn duchon_native_penalty_candidates(
         .assign(&omega);
     let primary = symmetrize(&project_penalty_matrix(&primary_pre, outer_identifiability));
 
+    let shrink = if poly_cols > 1 {
+        let mut shrink_pre = Array2::<f64>::zeros((n_pre, n_pre));
+        for col in (n_kernel + 1)..n_pre {
+            shrink_pre[[col, col]] = 1.0;
+        }
+        let shrink = symmetrize(&project_penalty_matrix(&shrink_pre, outer_identifiability));
+        Some(shrink)
+    } else {
+        None
+    };
     let mut out = Vec::new();
-    let shrink = build_nullspace_shrinkage_penalty(&primary)?;
     out.push(normalize_penalty_candidate(
         primary,
         0,
@@ -23359,7 +23368,7 @@ fn duchon_native_penalty_candidates(
     ));
     if let Some(shrink) = shrink {
         out.push(normalize_penalty_candidate(
-            shrink.sym_penalty,
+            shrink,
             0,
             PenaltySource::DoublePenaltyNullspace,
         ));
@@ -33504,10 +33513,7 @@ mod tests {
             "Duchon Hilbert scale must emit native curvature plus lower-order penalties"
         );
         let mut joint = Array2::<f64>::zeros((p, p));
-        for (s, info) in out.penalties.iter().zip(out.penaltyinfo.iter()) {
-            if matches!(info.source, PenaltySource::DoublePenaltyNullspace) {
-                continue;
-            }
+        for s in out.penalties.iter() {
             joint.scaled_add(1.0, s);
         }
         let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
