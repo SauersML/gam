@@ -15679,38 +15679,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if cycles_done >= inner_max_cycles {
-            let penalty_value = total_quadratic_penalty(
-                &states,
-                &s_lambdas,
-                ridge,
-                options.ridge_policy,
-                joint_bundle,
-                Some(specs),
-            );
-            let (block_logdet_h, block_logdet_s) = blockwise_logdet_terms_with_workspace(
-                family,
-                specs,
-                &mut states,
-                block_log_lambdas,
-                options,
-                cached_joint_workspace.clone(),
-            )?;
-            return Ok(BlockwiseInnerResult {
-                block_states: states,
-                active_sets: normalize_active_sets(cached_active_sets),
-                log_likelihood: current_log_likelihood,
-                penalty_value,
-                cycles: cycles_done,
-                converged,
-                block_logdet_h,
-                block_logdet_s,
-                s_lambdas,
-                joint_workspace: cached_joint_workspace.clone(),
-                kkt_residual: None,
-                active_constraints: None,
-            });
-        }
-        if cycles_done >= inner_max_cycles {
             if !converged {
                 // Engine-level diagnostic. Emit measured quantities only:
                 // objective movement, coefficient scale, per-block dimensions,
@@ -15793,7 +15761,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     })
                     .unwrap_or_else(|| "last_newton_math=<none>".to_string());
                 log::warn!(
-                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective_start={:.6e} objective_end={:.6e} objective_drop={:+.3e} beta_inf={:.3e} exit_unprojected_kkt_inf={:.3e} total_p={} total_n={} block_widths={:?} block_beta_inf={:?} block_grad_inf={:?} block_diag_hessian_default={} {}; returning non-converged warm-start iterate and rejecting this outer REML/LAML evaluation",
+                    "[PIRLS/joint-Newton] cycle={} budget-exhausted without KKT: objective_start={:.6e} objective_end={:.6e} objective_drop={:+.3e} beta_inf={:.3e} exit_unprojected_kkt_inf={:.3e} total_p={} total_n={} block_widths={:?} block_beta_inf={:?} block_grad_inf={:?} block_diag_hessian_default={} {}; rejecting this outer REML/LAML evaluation",
                     cycles_done,
                     initial_joint_objective,
                     lastobjective,
@@ -15808,6 +15776,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     block_diag_default,
                     last_math_summary,
                 );
+                if coupled_exact_joint_required {
+                    let block_diag = match last_kkt_refusal_report.as_ref() {
+                        Some(report) => report.format_bubbled_error(),
+                        None => block_residual_diagnostic_string(
+                            cached_joint_gradient.as_ref(),
+                            &states,
+                            specs,
+                            &s_lambdas,
+                            ridge,
+                            options.ridge_policy,
+                        ),
+                    };
+                    return Err(format!(
+                        "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}"
+                    ));
+                }
             }
             let penalty_value = total_quadratic_penalty(
                 &states,
@@ -26076,6 +26060,54 @@ mod tests {
                 a: array![[1.0]],
                 b: array![0.0],
             }))
+        }
+    }
+
+    #[derive(Clone)]
+    struct TwoBlockPersistentGradientFamily;
+
+    impl CustomFamily for TwoBlockPersistentGradientFamily {
+        fn evaluate(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<FamilyEvaluation, String> {
+            let beta0 = block_states[0].beta[0];
+            let beta1 = block_states[1].beta[0];
+            Ok(FamilyEvaluation {
+                log_likelihood: beta0 + beta1,
+                blockworking_sets: vec![
+                    BlockWorkingSet::ExactNewton {
+                        gradient: array![1.0],
+                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    },
+                    BlockWorkingSet::ExactNewton {
+                        gradient: array![1.0],
+                        hessian: SymmetricMatrix::Dense(array![[1.0]]),
+                    },
+                ],
+            })
+        }
+
+        fn exact_newton_joint_hessian(
+            &self,
+            block_states: &[ParameterBlockState],
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert!(block_states.len() <= isize::MAX as usize);
+            Ok(Some(array![[1.0, 0.25], [0.25, 1.0]]))
+        }
+
+        fn exact_newton_joint_hessian_directional_derivative(
+            &self,
+            block_states: &[ParameterBlockState],
+            arr: &Array1<f64>,
+        ) -> Result<Option<Array2<f64>>, String> {
+            assert!(block_states.len() <= isize::MAX as usize);
+            assert!(arr.iter().all(|v| !v.is_nan()));
+            Ok(Some(Array2::zeros((2, 2))))
+        }
+
+        fn has_explicit_joint_hessian(&self) -> bool {
+            true
         }
     }
 
