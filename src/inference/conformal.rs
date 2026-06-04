@@ -40,12 +40,29 @@
 //! # Where the calibration lives, and how it is wired
 //!
 //! Conformal calibration is a *post-fit* operation: a single scalar `q̂` is
-//! derived once from the fitted model and its training data (via the
-//! approximate-leave-one-out diagnostics in [`crate::inference::alo`], whose
-//! `eta_tilde` gives genuine held-out linear predictors and whose `se_bayes`
-//! gives the per-point posterior SE used as the scale `s_i`), then applied per
-//! prediction. [`ConformalCalibrator::from_fit`] computes `q̂`; the predict
-//! path consumes it through the opt-in `conformal_level` field on
+//! derived once and then applied per prediction. There are two ways to build
+//! it, matching the two exchangeability regimes:
+//!
+//! * **Held-out fold (the predict-path default).** When the calibration data
+//!   were NOT used to fit the model — a genuinely held-out, labeled fold — the
+//!   fitted predictor is already independent of every calibration point, so no
+//!   leave-one-out correction is needed. The score is the plain held-out
+//!   residual `r_i = y_cal_i − μ̂(x_cal_i)` normalized by the model's
+//!   predict-time response-scale SE `s(x_cal_i)`. This is
+//!   [`ConformalCalibrator::from_held_out_fold`], driven by
+//!   [`crate::inference::predict::predict_full_uncertainty_conformal`] over a
+//!   [`crate::inference::predict::ConformalCalibrationFold`]. The fold carries
+//!   its own design and may be of ANY size, fully decoupled from the training
+//!   rows.
+//! * **In-sample (no held-out fold available).** When the only data are the
+//!   training set, [`ConformalCalibrator::from_fit`] uses the
+//!   approximate-leave-one-out diagnostics in [`crate::inference::alo`] (whose
+//!   `eta_tilde` gives genuine held-out linear predictors and whose `se_bayes`
+//!   gives the per-point posterior SE) to manufacture leave-one-out residuals
+//!   from the training rows.
+//!
+//! Either way the predict path consumes `q̂` through the opt-in
+//! `conformal_level` field on
 //! [`crate::inference::predict::PredictUncertaintyOptions`], which calls
 //! [`ConformalCalibrator::apply_to_uncertainty_result`] to overwrite the
 //! model-based response-scale bounds with the conformal ones.
