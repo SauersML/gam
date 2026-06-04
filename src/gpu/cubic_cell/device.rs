@@ -1,23 +1,16 @@
 //! Device-resident dispatcher for the cubic-cell derivative-moment substrate.
 //!
-//! Stage-1 scope:
+//! Device-resident scope:
 //!
-//! * **NonAffineFinite** cells are evaluated on the GPU by NVRTC-compiling the
-//!   384-point Gauss–Legendre kernel emitted by [`super::kernel_src`] (the
-//!   `cubic_deriv_moments_d{degree}` specialization). One warp processes one
-//!   cell; results land in the same row-major `[n_cells, max_degree+1]` host
-//!   buffer the host substrate produces.
-//! * **Affine** and **AffineTail** cells stay on CPU for Stage-1: the device
-//!   kernel already contains closed-form branches for them, but Stage-1 keeps
-//!   the dispatcher conservative and bit-equal to the CPU parity reference for
-//!   those buckets. The closed-form device port lands with Stage-2.
+//! * **Affine**, **NonAffineFinite**, and **AffineTail** cells are evaluated by
+//!   one NVRTC-compiled kernel emitted by [`super::kernel_src`] (the
+//!   `cubic_deriv_moments_d{degree}` specialization).
+//! * One warp processes one cell; results stay in the row-major
+//!   `[n_cells, max_degree+1]` device buffer that downstream GPU kernels consume.
 //!
-//! No silent fallback: cells are pre-bucketed on the host. The GPU launch is
-//! issued only on the NonAffineFinite bucket; CPU evaluation is issued only on
-//! the Affine / AffineTail buckets. Both contribute to the same host output
-//! buffer. Cells with non-OK classifier status receive zeroed rows and the
-//! corresponding [`super::CubicCellMomentStatus`] code, exactly like the host
-//! substrate.
+//! The host classifier still validates each cell up front. Cells with non-OK
+//! classifier status receive zeroed rows and the corresponding
+//! [`super::CubicCellMomentStatus`] code, exactly like the host substrate.
 
 #[cfg(target_os = "linux")]
 use crate::gpu::cubic_cell::{
@@ -37,11 +30,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 
-/// Linux-only: launch the same Stage-1 dispatcher but return the moments
-/// buffer in device memory (`CudaSlice<f64>`) instead of downloading to host.
-/// Caller may pass the returned slice directly to any kernel launch on the
-/// same default stream (e.g. `bms_flex_row_kernel`). Returns `Ok(None)` if no
-/// CUDA runtime is available.
+/// Linux-only: launch the cubic-cell kernel and keep the moments buffer in
+/// device memory (`CudaSlice<f64>`). Caller may pass the returned slice
+/// directly to any kernel launch on the same default stream (e.g.
+/// `bms_flex_row_kernel`). Returns `Ok(None)` if no CUDA runtime is available.
 #[cfg(target_os = "linux")]
 pub(crate) fn try_device_moments_resident(
     view: &CubicCellDerivativeMomentHostView<'_>,
@@ -268,9 +260,9 @@ impl CubicCellGpuBackend {
             .arg(&mut d_moments)
             .arg(&mut d_status)
             .arg(&n_cells_u32);
-        // SAFETY: layout contract identical to `launch_nonaffine_bucket`,
-        // and the kernel's lane-0 validator rejects unrecognized branch
-        // codes (255 sentinel) by zeroing the row and writing
+        // SAFETY: arguments match the full row-major device-resident kernel
+        // signature, and the kernel's lane-0 validator rejects unrecognized
+        // branch codes (255 sentinel) by zeroing the row and writing
         // STATUS_INVALID, so classifier-rejected slots are safe.
         unsafe { builder.launch(cfg) }.gpu_ctx("cubic_cell device-resident kernel launch")?;
 
