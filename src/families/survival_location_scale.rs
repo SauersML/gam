@@ -4158,7 +4158,24 @@ fn prepare_survival_location_scale_model(
     let non_intercept_start =
         infer_non_intercept_start_design(&log_sigma_prep.design_exit, &spec.weights)?;
     let log_sigma_full_ncols = log_sigma_prep.design_exit.ncols();
-    let log_sigma_fixed_cols = non_intercept_start.min(log_sigma_full_ncols);
+    // The scale channel enters the survival location-scale likelihood as
+    // `z = (h(t) - eta_t(x)) / exp(eta_sigma)`: `eta_sigma` is MULTIPLICATIVE,
+    // not an additive predictor. The constant (intercept) direction of the
+    // scale block is therefore the free overall sigma parameter — it is NOT
+    // aliased with the additive location/time constant that `time_transform`
+    // and `threshold` share, so no higher-priority block owns the scale-block
+    // gauge direction. The only genuine alias the scale block can carry is
+    // between its NON-intercept covariate columns and the location predictor,
+    // and that aliasing is already removed by the scale-deviation
+    // reparameterisation below (which residualises columns from
+    // `non_intercept_start` onward against the primary location design).
+    // Hence the scale block drops NO leading columns: dropping its lone
+    // intercept (the constant-sigma case, `non_intercept_start == full_ncols`)
+    // would canonicalise a genuinely identifiable free parameter to width 0
+    // and refuse the coupled three-block startup certification (#736), and
+    // over-reducing it desynchronises the raw/active block widths at the
+    // covariance-lift boundary (#735).
+    let log_sigma_fixed_cols = 0usize;
     let scale_transform = build_scale_deviation_transform_design(
         &survival_primary_design,
         &log_sigma_prep.design_exit,
