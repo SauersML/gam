@@ -213,8 +213,19 @@ jobs:
           # The run step then EXECUTES each built binary DIRECTLY (globbed from
           # target/debug/deps) — invoking `cargo test` per target re-did
           # freshness/link work 141× and blew the timeout (the all-TIMEOUT bug).
+          #
+          # `cargo build --keep-going` (NOT `cargo test --no-run`, which rejects
+          # --keep-going): `--test <name>` compiles each named test target to the
+          # same target/debug/deps/<name>-<hash> binary the run step globs, so the
+          # output is identical to --no-run. `--keep-going` is the point — without
+          # it the FIRST target that fails to compile aborts the whole build, so
+          # every still-unbuilt binary is missing and the run step files it as
+          # BUILDFAIL: one real compile error masquerades as dozens (the
+          # "1 defect + 54 collateral BUILDFAILs" cascade). With it, cargo builds
+          # every target it can and only the genuinely-broken ones lack a binary,
+          # so BUILDFAIL counts the real compile defects and nothing else.
           args=(); for t in "${files[@]}"; do args+=(--test "$t"); done
-          cargo test --no-run "${args[@]}" 2>&1 | tail -120 \
+          cargo build --keep-going "${args[@]}" 2>&1 | tail -120 \
             || echo "build reported errors; missing binaries are flagged BUILDFAIL in the run step"
 
       - name: Run quality suite (resilient + streaming; full per-test capture)
@@ -312,7 +323,12 @@ jobs:
             # First panic: "<thread> panicked at <file:line>:" then the message.
             panicmsg=$(awk '/panicked at/{loc=$0; getline; print loc " :: " $0; exit}' "$log")
             # gam-side fit errors (the fit crashed/refused/failed to converge).
-            gamfit_re='IntegrationFailed|InvalidConfig|IdentifiabilityFailure|Invalid input|could not broadcast|Newton step|transformation fit failed|workflow survival baseline failed|RemlOptimizationFailed|REML smoothing optimization'
+            # `LayoutError`/`identifiability audit` are gam's OWN model-layout /
+            # identifiability verdicts — they must classify as GAM_ERROR even
+            # though their message contains the phrase "rows, expected" (which
+            # used to be matched by the broader TEST_ERROR rule below and stole
+            # them; that rule is now harness-origin-only).
+            gamfit_re='IntegrationFailed|InvalidConfig|IdentifiabilityFailure|LayoutError|identifiability audit|Invalid input|could not broadcast|Newton step|transformation fit failed|workflow survival baseline failed|RemlOptimizationFailed|REML smoothing optimization'
             if [ "$outcome" = BUILDFAIL ]; then
               cause=build; reason=$(head -1 "$log"); bf=$((bf+1))
             elif [ "$rc" -eq 0 ]; then
@@ -321,8 +337,14 @@ jobs:
               outcome=TIMEOUT; cause=timeout; reason="exceeded ${cap}s wall-clock"; tmo=$((tmo+1))
             elif [ -n "$refmarker" ]; then
               outcome=REF_ERROR; cause=reference_tool; reason="$refmarker"; referr=$((referr+1))
-            elif printf '%s' "$panicmsg" | grep -qaE 'src/test_support/reference\.rs|No such file or directory|rows, expected|reference column'; then
-              # Test/harness setup defect (bad data, missing fixture, length mismatch).
+            elif printf '%s' "$panicmsg" | grep -qaE 'src/test_support/reference\.rs|No such file or directory'; then
+              # Test/harness setup defect (bad data, missing fixture, length
+              # mismatch). Gated on the panic ORIGINATING in the harness
+              # (src/test_support/reference.rs — where write_columns_csv asserts
+              # equal column lengths) rather than on the bare phrases
+              # "rows, expected"/"reference column", which also appear in gam's
+              # own identifiability/layout error messages and were misfiling
+              # genuine GAM_ERRORs as TEST_ERROR.
               outcome=TEST_ERROR; cause=test_setup; reason="$panicmsg"; testerr=$((testerr+1))
             elif printf '%s' "$panicmsg" | grep -qaE "$gamfit_re" || printf '%s' "$panicmsg" | grep -qaE 'panicked at src/'; then
               outcome=GAM_ERROR; cause=gam_fit_failed; reason="$panicmsg"; gamerr=$((gamerr+1))

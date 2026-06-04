@@ -145,18 +145,23 @@ fn gam_matern_gp_recovers_truth_and_beats_sklearn() {
     // length-scale, amplitude, and noise. We predict its posterior mean on
     // x_grid: this is the BASELINE-TO-BEAT for truth-recovery accuracy. We also
     // report sklearn's effective DoF, trace(K (K+σ²I)⁻¹), purely for context.
+    // One rectangular CSV ⇒ all columns share a row count. The dense grid
+    // (`grid_n`) is LONGER than the training set (`n`), so it sets the row
+    // count: the n training rows ride along right-padded up to `grid_n` and are
+    // sliced back to the first `n` in the body (the padded tail is never fit).
     let r = run_python(
         &[
-            Column::new("x", &x),
-            Column::new("y", &y),
+            Column::new("x", &pad_to(&x, grid_n)),
+            Column::new("y", &pad_to(&y, grid_n)),
             Column::new("xg", &x_grid),
         ],
-        r#"
+        &format!(
+            r#"
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel, WhiteKernel
 
-x = np.asarray(df["x"], dtype=float).reshape(-1, 1)
-y = np.asarray(df["y"], dtype=float).reshape(-1)
+x = np.asarray(df["x"], dtype=float).reshape(-1, 1)[:{n}]
+y = np.asarray(df["y"], dtype=float).reshape(-1)[:{n}]
 xg = np.asarray(df["xg"], dtype=float).reshape(-1, 1)
 
 kernel = (ConstantKernel(1.0, (1e-3, 1e3))
@@ -182,7 +187,8 @@ n = x.shape[0]
 A = Ksig + sigma2 * np.eye(n)
 S = Ksig @ np.linalg.solve(A, np.eye(n))   # smoother (hat) matrix
 emit("edf", np.trace(S))
-"#,
+"#
+        ),
     );
     let sk_grid = r.vector("grid_fit");
     let sk_edf = r.scalar("edf");

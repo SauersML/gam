@@ -33,6 +33,29 @@ pub(super) fn bms_row_primary_hessian_pinned_bytes() -> &'static AtomicU64 {
     PINNED.get_or_init(|| AtomicU64::new(0))
 }
 
+/// Process-global high-water mark of available RAM ever observed at a cache
+/// decision. The single-cache *worthwhileness* budget (is this shape large
+/// enough relative to memory to be worth materializing) is derived from this
+/// monotone floor rather than the instantaneous `available_memory()` so that
+/// the same `(n, r)` shape cannot flip from `materialize` to `stream` partway
+/// through a fit just because transient available RAM dipped — a flip that
+/// sends the BMS flex inner solve off the fast dense route and onto the
+/// catastrophically slower matrix-free CG path. Live `available_memory()` is
+/// still consulted for the global-pin OOM guard, which is the actual safety
+/// valve against over-committing co-resident caches.
+pub(super) fn bms_row_primary_hessian_capacity_floor() -> &'static AtomicU64 {
+    static FLOOR: OnceLock<AtomicU64> = OnceLock::new();
+    FLOOR.get_or_init(|| AtomicU64::new(0))
+}
+
+/// Fold the latest observed available-RAM reading into the monotone capacity
+/// floor and return the resulting stable budget basis (`max(floor, observed)`).
+pub(super) fn observe_capacity_floor(runtime_available_bytes: u64) -> u64 {
+    bms_row_primary_hessian_capacity_floor()
+        .fetch_max(runtime_available_bytes, Ordering::AcqRel)
+        .max(runtime_available_bytes)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RowPrimaryHessianCacheReason {
     ReuseTooLow,
@@ -56,6 +79,7 @@ impl RowPrimaryHessianCacheReason {
 pub(super) struct RowPrimaryHessianCachePlan {
     pub(super) materialize: bool,
     pub(super) bytes: u64,
+    pub(super) stable_capacity_bytes: u64,
     pub(super) runtime_available_bytes: u64,
     pub(super) workspace_pinned_bytes: u64,
     pub(super) single_cache_budget_bytes: u64,
@@ -70,6 +94,12 @@ pub(super) fn decide_row_primary_hessian_cache(
     n: usize,
     r: usize,
     expected_reuse_passes: usize,
+    // Stable, monotone capacity floor (`max` of available RAM ever observed
+    // this process). Drives the per-shape single-cache budget so the decision
+    // does not flip mid-fit on a transient available-memory dip.
+    stable_capacity_bytes: u64,
+    // Instantaneous available RAM. Drives only the global-pin OOM guard, the
+    // genuine safety valve against over-committing co-resident caches.
     runtime_available_bytes: u64,
     workspace_pinned_bytes: u64,
 ) -> RowPrimaryHessianCachePlan {
@@ -82,9 +112,13 @@ pub(super) fn decide_row_primary_hessian_cache(
     let bytes = (n as u64)
         .saturating_mul(floats_per_row)
         .saturating_mul(std::mem::size_of::<f64>() as u64);
-    let single_cache_budget_bytes = runtime_available_bytes
+    // Worthwhileness gate keys off the stable floor: a shape that fits the
+    // capacity budget once stays materializable for the whole fit.
+    let single_cache_budget_bytes = stable_capacity_bytes
         .saturating_mul(BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_NUM)
         / BMS_ROW_PRIMARY_HESSIAN_SINGLE_FRACTION_DEN.max(1);
+    // OOM guard keys off live available RAM: never pin more than the live
+    // fraction across all co-resident caches.
     let global_pin_budget_bytes = runtime_available_bytes
         .saturating_mul(BMS_ROW_PRIMARY_HESSIAN_GLOBAL_FRACTION_NUM)
         / BMS_ROW_PRIMARY_HESSIAN_GLOBAL_FRACTION_DEN.max(1);
@@ -102,6 +136,7 @@ pub(super) fn decide_row_primary_hessian_cache(
     RowPrimaryHessianCachePlan {
         materialize: matches!(reason, RowPrimaryHessianCacheReason::ReuseAmortizesBuild),
         bytes,
+        stable_capacity_bytes,
         runtime_available_bytes,
         workspace_pinned_bytes,
         single_cache_budget_bytes,

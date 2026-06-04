@@ -253,7 +253,7 @@ for d in sorted(set(int(x) for x in dim_arr)):
         # closed-form ground truth: phi = tanh(s)/s, s = nv (k = 1).
         s = nv
         phi = (np.tanh(s) / s) if s > 0.0 else 1.0
-        closed_maxabs.append(np.max(np.abs(Y[idx[r], :d] - phi * v)))
+        closed_maxabs.append(np.max(np.abs(Y[r, :d] - phi * v)))
 
 emit("exp_flat", exp_flat.reshape(-1))
 emit("self_l2_max", [float(np.max(self_l2))])

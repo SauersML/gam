@@ -379,14 +379,19 @@ fn gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone() 
             h <- {fd_step:.17e}
 
             # Penalized generalized survival model: penalized cubic splines s(.)
-            # on the covariates plus a penalized log-time baseline, REML smoothing.
-            # `link.type = "PH"` (rstpm2's argument is link.type, not link) gives
-            # g(S) = log(-log S) = log Λ, the transformation estimand. The baseline
-            # is an explicit penalized spline of log(t) to mirror gam's penalized
-            # I-spline log-time baseline rather than relying on the package default.
-            m <- pstpm2(Surv(t, event) ~ s(Age) + s(x_continuous), data = df,
-                        smooth.formula = ~ s(log(t)),
-                        link.type = "PH", criterion = "REML")
+            # on the covariates plus a penalized log-time baseline, automatic
+            # smoothing selection. rstpm2 places ALL penalized s() terms (the
+            # covariate smooths AND the log-time baseline) in `smooth.formula`,
+            # not the main formula (the main formula carries only parametric
+            # terms), and supplies its own mgcv-backed s() there. `link.type =
+            # "PH"` (rstpm2's argument is link.type, not link) gives g(S) =
+            # log(-log S) = log Λ, the transformation estimand. pstpm2's penalized
+            # smoothing criterion is GCV (its automatic smoothness selector; this
+            # rstpm2 build does not expose REML for the penalized path), passed via
+            # control = list(criterion = ...).
+            m <- pstpm2(Surv(t, event) ~ 1, data = df,
+                        smooth.formula = ~ s(log(t)) + s(Age) + s(x_continuous),
+                        link.type = "PH", control = list(criterion = "GCV"))
 
             # Total effective degrees of freedom of the penalized fit (baseline
             # spline + both covariate splines + parametric terms), the REML-selected

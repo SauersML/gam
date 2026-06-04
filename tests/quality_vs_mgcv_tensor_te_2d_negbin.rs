@@ -323,11 +323,18 @@ fn gam_tensor_te_2d_negbin_matches_mgcv_on_real_data() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         th <- df$theta[1]
-        # badh is binary {0,1} so its margin holds at most k=2; age is continuous.
-        m <- gam(numvisit ~ te(age, badh, k = c(5, 2)), data = df,
+        # badh is binary {0,1}: a tensor te(age, badh) margin on badh is not
+        # constructible (mgcv resets its k=2 up to a default > 2 unique values
+        # and then errors / fails the inner loop). The mgcv-idiomatic encoding of
+        # the SAME age x badh interaction that gam's te(age, badh) represents over
+        # a binary margin is a smooth-by-factor: a separate s(age) curve per badh
+        # level plus the badh main effect.
+        df$badhf <- factor(df$badh)
+        m <- gam(numvisit ~ s(age, by = badhf) + badhf, data = df,
                  family = negbin(theta = th), method = "REML")
         k <- df$test_n[1]
-        newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
+        newd <- data.frame(age = df$test_age[1:k],
+                           badhf = factor(df$test_badh[1:k], levels = levels(df$badhf)))
         emit("test_mu", as.numeric(predict(m, newdata = newd, type = "response")))
         emit("edf", sum(m$edf))
         "#,

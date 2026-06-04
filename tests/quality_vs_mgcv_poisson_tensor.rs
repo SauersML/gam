@@ -346,11 +346,20 @@ fn gam_poisson_tensor_recovers_true_mean_surface_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(numvisit ~ te(age, badh, bs = "ps"), data = df,
+        # badh is binary {0,1}: a tensor te(age, badh) P-spline margin on badh is
+        # larger than its 2 unique values, so mgcv's inner loop "can't correct
+        # step size" / fails to converge. The mgcv-idiomatic encoding of the SAME
+        # age x badh interaction that gam's te(age, badh) represents over a binary
+        # margin is a smooth-by-factor: a separate s(age) curve per badh level
+        # plus the badh main effect (the age margin keeps the ps basis to match
+        # gam's cubic-B-spline + 2nd-order-penalty construction).
+        df$badhf <- factor(df$badh)
+        m <- gam(numvisit ~ s(age, bs = "ps", by = badhf) + badhf, data = df,
                  family = poisson(link = "log"), method = "REML")
         emit("edf", sum(m$edf))
         k <- df$test_n[1]
-        newd <- data.frame(age = df$test_age[1:k], badh = df$test_badh[1:k])
+        newd <- data.frame(age = df$test_age[1:k],
+                           badhf = factor(df$test_badh[1:k], levels = levels(df$badhf)))
         emit("test_pred", as.numeric(predict(m, newdata = newd, type = "response")))
         "#,
     );

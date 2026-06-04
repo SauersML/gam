@@ -432,7 +432,12 @@ fn gam_factor_smooth_fs_recovers_truth_on_real_data() {
         r#"
         suppressPackageStartupMessages(library(mgcv))
         df$Subject <- factor(df$Subject)
-        m <- gam(Reaction ~ s(Days, Subject, bs = "fs"), data = df, method = "REML")
+        # Holding out Days 3 and 8 leaves only 8 distinct Days in train, so the
+        # fs marginal smooth's default basis dim (k = 10) exceeds the unique
+        # covariate values and mgcv errors ("fewer unique covariate combinations
+        # than specified maximum degrees of freedom"). Cap k at the 8 the split
+        # supports; the shared per-subject Days curve is still a rich smooth.
+        m <- gam(Reaction ~ s(Days, Subject, bs = "fs", k = 8), data = df, method = "REML")
         k <- df$test_n[1]
         newd <- data.frame(
           Days = df$test_Days[1:k],

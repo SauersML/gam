@@ -856,6 +856,20 @@ fn audit_identifiability_impl(
     };
     let pairwise_block_heartbeat = (n.saturating_mul(p_total) >= 1_000_000)
         .then(crate::util::heartbeat::Heartbeat::default_interval);
+    // Precompute the full joint Gram G = Xᵀ·X once with a blocked, parallel
+    // crossproduct (faer). Every cross-block column dot product below then
+    // becomes an O(1) lookup `joint_gram[[ja, jb]]` instead of an O(n) scalar
+    // pass, collapsing the pairwise scan from O(n·p²) scalar work to a single
+    // cache-friendly GEMM plus O(p²) scalar bookkeeping. Mathematically
+    // identical: G[[ja, jb]] = Σ_i X[i, ja]·X[i, jb] = caᵀcb.
+    let joint_gram = {
+        let unit_weights = Array1::<f64>::ones(n);
+        crate::linalg::faer_ndarray::fast_xt_diag_x_with_parallelism(
+            &x_joint,
+            &unit_weights,
+            faer::get_global_parallelism(),
+        )
+    };
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
     let n_block_pairs = specs.len().saturating_mul(specs.len().saturating_sub(1)) / 2;
     for a_block_idx in 0..specs.len() {
@@ -882,14 +896,13 @@ fn audit_identifiability_impl(
                 if na == 0.0 {
                     continue;
                 }
-                let ca = x_joint.column(ja);
                 for jb in b_start..b_end {
                     let nb = col_norms[jb];
                     if nb == 0.0 {
                         continue;
                     }
-                    let cb = x_joint.column(jb);
-                    let dot: f64 = ca.iter().zip(cb.iter()).map(|(a, b)| a * b).sum();
+                    // Precomputed Gram entry caᵀcb (see joint_gram above).
+                    let dot = joint_gram[[ja, jb]];
                     // Signed cosine: preserves direction for bias-shift test.
                     let cosine = signed_cosine(dot, na, nb);
                     let s2_ja = col_s2[ja];
