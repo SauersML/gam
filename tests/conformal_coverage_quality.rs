@@ -26,7 +26,7 @@ use gam::estimate::{FitOptions, fit_gam};
 use gam::inference::predict::interval_policy::ResponseBounds;
 use gam::matrix::DesignMatrix;
 use gam::predict::{
-    ConformalTrainingData, PredictInput, PredictUncertaintyOptions, StandardPredictor,
+    ConformalCalibrationFold, PredictInput, PredictUncertaintyOptions, StandardPredictor,
     predict_full_uncertainty_conformal,
 };
 use gam::smooth::BlockwisePenalty;
@@ -132,12 +132,26 @@ fn fit_cubic(x: &Array1<f64>, y: &Array1<f64>) -> (gam::estimate::UnifiedFitResu
     (fit, design)
 }
 
+/// Build a [`PredictInput`] over a design with a zero offset.
+fn predict_input_for(design: &Array2<f64>) -> PredictInput {
+    PredictInput {
+        design: DesignMatrix::from(design.clone()),
+        offset: Array1::<f64>::zeros(design.nrows()),
+        design_noise: None,
+        offset_noise: None,
+        auxiliary_scalar: None,
+        auxiliary_matrix: None,
+    }
+}
+
 /// Build the predict path for a test design, returning the model-based and
-/// (optionally) conformal-calibrated full-uncertainty results.
+/// (optionally) conformal-calibrated full-uncertainty results. The conformal
+/// calibration uses a genuinely HELD-OUT fold (`cal_design`, `cal_y`) that is
+/// distinct from the training data and may be of a DIFFERENT size.
 fn predict_with_conformal(
     fit: &gam::estimate::UnifiedFitResult,
-    train_design: &Array2<f64>,
-    train_y: &Array1<f64>,
+    cal_design: &Array2<f64>,
+    cal_y: &Array1<f64>,
     test_design: &Array2<f64>,
     conformal_level: Option<f64>,
 ) -> gam::predict::PredictUncertaintyResult {
@@ -149,15 +163,7 @@ fn predict_with_conformal(
         link_wiggle: None,
     };
 
-    let offset_test = Array1::<f64>::zeros(test_design.nrows());
-    let input = PredictInput {
-        design: DesignMatrix::from(test_design.clone()),
-        offset: offset_test,
-        design_noise: None,
-        offset_noise: None,
-        auxiliary_scalar: None,
-        auxiliary_matrix: None,
-    };
+    let input = predict_input_for(test_design);
 
     let mut options = PredictUncertaintyOptions {
         confidence_level: 0.90,
@@ -171,20 +177,21 @@ fn predict_with_conformal(
     };
     options.conformal_level = conformal_level;
 
-    // Training data for the conformal calibrator (same quantities ALO needs).
-    let train_offset = Array1::<f64>::zeros(train_design.nrows());
-    let train_eta = train_design.dot(&fit.blocks[0].beta) + &train_offset;
-    let phi = (fit.standard_deviation * fit.standard_deviation).max(1e-12);
-    let train = ConformalTrainingData {
-        design: train_design,
-        eta: &train_eta,
-        offset: &train_offset,
-        y: train_y.view(),
-        phi,
+    // Genuinely held-out calibration fold (its own design + labeled response).
+    let calibration = ConformalCalibrationFold {
+        input: predict_input_for(cal_design),
+        y: cal_y.view(),
     };
 
-    predict_full_uncertainty_conformal(&predictor, &input, fit, &gaussian_spec(), &options, &train)
-        .expect("conformal full-uncertainty predict")
+    predict_full_uncertainty_conformal(
+        &predictor,
+        &input,
+        fit,
+        &gaussian_spec(),
+        &options,
+        &calibration,
+    )
+    .expect("conformal full-uncertainty predict")
 }
 
 /// Fraction of held-out responses inside `[lower, upper]`.
@@ -204,18 +211,22 @@ fn conformal_covers_under_heteroscedastic_misspecification_while_plain_undercove
     // Train on a heteroscedastic draw the homoscedastic Gaussian likelihood
     // cannot represent.
     let (x_train, y_train) = draw(600, 0.6, true, &mut rng);
-    let (fit, train_design) = fit_cubic(&x_train, &y_train);
+    let (fit, _train_design) = fit_cubic(&x_train, &y_train);
+
+    // Genuinely held-out calibration fold of a DIFFERENT size than training.
+    let (x_cal, y_cal) = draw(300, 0.6, true, &mut rng);
+    let cal_design = poly_design(&x_cal);
 
     // Fresh held-out test set from the SAME (misspecified-for-the-model) DGP.
     let (x_test, y_test) = draw(2000, 0.6, true, &mut rng);
     let test_design = poly_design(&x_test);
 
     // Conformal-calibrated interval.
-    let conf = predict_with_conformal(&fit, &train_design, &y_train, &test_design, Some(nominal));
+    let conf = predict_with_conformal(&fit, &cal_design, &y_cal, &test_design, Some(nominal));
     let conformal_cov = coverage(&y_test, &conf.mean_lower, &conf.mean_upper);
 
     // Plain model-based interval (no conformal).
-    let plain = predict_with_conformal(&fit, &train_design, &y_train, &test_design, None);
+    let plain = predict_with_conformal(&fit, &cal_design, &y_cal, &test_design, None);
     let plain_cov = coverage(&y_test, &plain.mean_lower, &plain.mean_upper);
 
     // The conformal interval must achieve at least nominal coverage (small
@@ -248,12 +259,15 @@ fn conformal_covers_in_well_specified_homoscedastic_case() {
     let mut rng = StdRng::seed_from_u64(7);
 
     let (x_train, y_train) = draw(600, 0.5, false, &mut rng);
-    let (fit, train_design) = fit_cubic(&x_train, &y_train);
+    let (fit, _train_design) = fit_cubic(&x_train, &y_train);
+
+    let (x_cal, y_cal) = draw(300, 0.5, false, &mut rng);
+    let cal_design = poly_design(&x_cal);
 
     let (x_test, y_test) = draw(2000, 0.5, false, &mut rng);
     let test_design = poly_design(&x_test);
 
-    let conf = predict_with_conformal(&fit, &train_design, &y_train, &test_design, Some(nominal));
+    let conf = predict_with_conformal(&fit, &cal_design, &y_cal, &test_design, Some(nominal));
     let conformal_cov = coverage(&y_test, &conf.mean_lower, &conf.mean_upper);
 
     assert!(

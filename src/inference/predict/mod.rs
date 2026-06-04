@@ -5676,22 +5676,24 @@ where
     })
 }
 
-/// Training data needed to calibrate a conformal predictor: the in-sample
-/// design, fitted linear predictor `Xβ̂ + offset`, offset, response, and the
-/// dispersion `phi`. These are exactly the quantities
-/// [`crate::inference::alo::compute_alo_diagnostics_from_unified`] requires;
-/// the caller already holds them at fit time.
-pub struct ConformalTrainingData<'a> {
-    /// Dense training design matrix (n × p).
-    pub design: &'a Array2<f64>,
-    /// Fitted in-sample linear predictor `Xβ̂ + offset` (length n).
-    pub eta: &'a Array1<f64>,
-    /// Training offset (length n).
-    pub offset: &'a Array1<f64>,
-    /// Training response (length n).
+/// A genuinely held-out calibration fold for distribution-free split-conformal
+/// calibration: a [`PredictInput`] over the calibration design (so the model's
+/// own predict engine produces the response mean `μ̂(x_cal)` and the
+/// response-scale SE `s(x_cal)` at exactly those points, identically to the
+/// test path) together with the held-out, labeled response `y_cal`.
+///
+/// The fold is NOT bound to the training rows: it carries its own design and
+/// can be of any size, independent of the training set. Because the fitted
+/// predictor is independent of every calibration point, split-conformal needs
+/// no leave-one-out correction — the nonconformity score is the plain held-out
+/// residual `r_i = y_cal_i − μ̂(x_cal_i)`, normalized by `s(x_cal_i)`. See
+/// [`crate::inference::conformal::ConformalCalibrator::from_held_out_fold`].
+pub struct ConformalCalibrationFold<'a> {
+    /// Predict input over the held-out calibration design (design + offset, and
+    /// any noise/auxiliary blocks the model needs).
+    pub input: PredictInput,
+    /// Held-out, labeled calibration response `y_cal` (length = calibration rows).
     pub y: ArrayView1<'a, f64>,
-    /// Dispersion `phi` used to scale the conditional posterior SE.
-    pub phi: f64,
 }
 
 /// Full-uncertainty prediction with opt-in distribution-free conformal
@@ -5701,12 +5703,25 @@ pub struct ConformalTrainingData<'a> {
 /// It always runs the model's own [`PredictableModel::predict_full_uncertainty`]
 /// (so the point predictions, η/mean SEs, observation interval, and provenance
 /// are exactly the model-based ones). Then, when `options.conformal_level` is
-/// `Some(level)`, it builds a [`ConformalCalibrator`] from `train` + `fit` at
-/// miscoverage `α = 1 − level` and OVERWRITES the response-scale
-/// `mean_lower` / `mean_upper` with the conformal interval `μ̂(x) ± q̂·s(x)`,
-/// using the result's own response-scale SE as the per-point scale `s(x)` —
-/// the same scale source the calibration residuals were normalized by. When
-/// `conformal_level` is `None` the model-based interval is returned unchanged.
+/// `Some(level)`, it calibrates a split-conformal multiplier `q̂` from the
+/// genuinely held-out `calibration` fold at miscoverage `α = 1 − level` and
+/// OVERWRITES the response-scale `mean_lower` / `mean_upper` with the conformal
+/// interval `μ̂(x) ± q̂·s(x)`, using the result's own response-scale SE as the
+/// per-point scale `s(x)`. When `conformal_level` is `None` the model-based
+/// interval is returned unchanged.
+///
+/// # Held-out calibration, not in-sample ALO
+///
+/// The `calibration` fold is labeled data NOT used to fit the model, so it is
+/// independent of the fitted predictor and split-conformal needs no
+/// leave-one-out correction. We obtain the calibration scores by running the
+/// model's OWN predict engine on the calibration design — yielding the
+/// response means `μ̂(x_cal)` and response-scale SEs `s(x_cal)` from exactly
+/// the same source used for the test points — and form the plain held-out
+/// residuals `r_i = y_cal_i − μ̂(x_cal_i)` normalized by `s(x_cal_i)`. The
+/// calibration fold therefore carries its OWN design and may be of any size,
+/// fully decoupled from the training rows; nothing here binds the fold to the
+/// training-fit geometry.
 ///
 /// The conformal interval carries finite-sample marginal coverage `≥ level`
 /// regardless of model misspecification; see the module docs of
@@ -5718,7 +5733,7 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
     fit: &UnifiedFitResult,
     family: &LikelihoodSpec,
     options: &PredictUncertaintyOptions,
-    train: &ConformalTrainingData<'_>,
+    calibration: &ConformalCalibrationFold<'_>,
 ) -> Result<PredictUncertaintyResult, EstimationError> {
     let mut result = model.predict_full_uncertainty(input, fit, options)?;
     let Some(level) = options.conformal_level else {
@@ -5730,14 +5745,30 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
         )));
     }
     let alpha = 1.0 - level;
-    let calibrator = crate::inference::conformal::ConformalCalibrator::from_fit(
-        fit,
-        family,
-        train.design,
-        train.eta,
-        train.offset,
-        train.y,
-        train.phi,
+
+    // Run the model's own predict engine on the held-out calibration fold to
+    // obtain the response mean μ̂(x_cal) and the response-scale SE s(x_cal)
+    // from exactly the source used at test time. Conformal calibration itself
+    // is disabled on this inner call (`conformal_level: None`) so it returns
+    // the plain model-based mean/SE without recursing.
+    let cal_options = PredictUncertaintyOptions {
+        conformal_level: None,
+        includeobservation_interval: false,
+        ..options.clone()
+    };
+    let cal_result = model.predict_full_uncertainty(&calibration.input, fit, &cal_options)?;
+    if cal_result.mean.len() != calibration.y.len() {
+        return Err(EstimationError::InvalidInput(format!(
+            "conformal calibration: predicted {} calibration means but y_cal has length {}",
+            cal_result.mean.len(),
+            calibration.y.len()
+        )));
+    }
+
+    let calibrator = crate::inference::conformal::ConformalCalibrator::from_held_out_fold(
+        calibration.y,
+        cal_result.mean.view(),
+        cal_result.mean_standard_error.view(),
         alpha,
     )?;
     let bounds = ResponseBounds::for_family(&family.response);
