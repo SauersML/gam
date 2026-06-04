@@ -12295,6 +12295,21 @@ impl KktRefusalDiagnosis {
 /// penalty-rank machinery uses for "structurally zero".
 const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
 
+/// Self-vanishing Levenberg–Marquardt damping factor for the range-restricted
+/// spectral Newton step (`solve_joint_newton_step_on_spectral_range`). The
+/// per-cycle damping is `μ = JOINT_SPECTRAL_LEVENBERG_FACTOR · ‖∇L − Sβ‖∞`:
+/// proportional to the current stationarity residual so it is large enough to
+/// cap the unbounded `component/λ` step along near-singular (ill-conditioned but
+/// above-`KKT_REFUSAL_RANK_TOL`) eigen-directions of a degenerate small-n
+/// Hessian — the modes that make the undamped step oscillate and prevent the
+/// inner solve from settling — yet `→ 0` as the iterate converges, recovering
+/// the exact Moore–Penrose Newton step so the KKT fixed point and the
+/// well-identified fast path are unchanged. `1e-3` keeps the damping two to
+/// three orders below the dominant curvature on a well-conditioned problem (so
+/// it never perturbs a healthy quadratic Newton step) while still dominating the
+/// near-zero curvatures that drive the degenerate-design oscillation.
+const JOINT_SPECTRAL_LEVENBERG_FACTOR: f64 = 1.0e-3;
+
 #[derive(Clone, Debug)]
 struct JointSpectralNewtonStep {
     delta: Array1<f64>,
@@ -14165,8 +14180,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             joint_mode_diagonal_ridge,
                             joint_bundle,
                         );
+                        // Self-vanishing Levenberg–Marquardt damping for the
+                        // range-restricted spectral step. Scaled to the current
+                        // stationarity-residual magnitude ‖∇L − Sβ‖∞ so it is
+                        // dimensionally consistent with the eigenvalues it floors
+                        // (μ = JOINT_SPECTRAL_LEVENBERG_FACTOR · ‖rhs‖∞). As the
+                        // inner solve converges (‖rhs‖∞ → 0) μ → 0 and the step
+                        // collapses to the exact range-restricted Newton step, so
+                        // the KKT fixed point and the well-identified #720 fast
+                        // path are unchanged; far from the optimum on a
+                        // near-singular degenerate design it caps the otherwise
+                        // unbounded component/λ step along ill-conditioned modes
+                        // and stops the oscillation that prevented the n=23
+                        // binary-covariate CTM from settling (#733/#734).
                         let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                        let spectral_levenberg_mu = 1.0e-3 * rhs_inf;
+                        let spectral_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
                         let spectral_step = solve_joint_newton_step_on_spectral_range(
                             &lhs_true,
                             &rhs,
@@ -30218,17 +30246,30 @@ mod tests {
     }
 
     #[test]
-    fn spectral_joint_newton_step_rejects_nonzero_null_gradient() {
+    fn spectral_joint_newton_step_range_projects_nonzero_null_gradient() {
+        // A nonzero stationarity component inside ker(H_pen) is an *unidentified*
+        // direction: the quadratic model is flat there, so no finite Newton/KKT
+        // step can reduce it and it contributes nothing to the fit. The
+        // principled response (the #720/#733 range-projection repair) is NOT to
+        // error — that aborts an otherwise well-posed degenerate small-n fit —
+        // but to return the range-restricted (Moore–Penrose) Newton step that
+        // leaves the null direction untouched, while reporting the leftover null
+        // residual so the caller's identified-subspace KKT certificate can fire.
         let h = array![[4.0, 0.0], [0.0, 0.0]];
         let rhs = array![8.0, 0.25];
-        let err = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
-            .expect_err("nonzero null RHS means no stationary quadratic minimizer");
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
+            .expect("nonzero null RHS must range-project, not error");
 
-        assert!(
-            err.contains("nonzero gradient in Hessian nullspace"),
-            "unexpected error: {err}"
-        );
-        assert!(err.contains("|P0 rhs|"));
+        // Identified direction [1,0] (λ=4): 8/4 = 2. Null direction [0,1] (λ=0):
+        // dropped, so the step leaves coordinate 1 unchanged at 0.
+        assert_relative_eq!(step.delta[0], 2.0, epsilon = 1.0e-12);
+        assert_relative_eq!(step.delta[1], 0.0, epsilon = 1.0e-12);
+        assert_eq!(step.nullity, 1);
+        // The unidentified null mass is surfaced (not silently zeroed) so the
+        // caller can distinguish "stationary on the identified subspace" from a
+        // genuine non-stationarity in the curved subspace.
+        assert_relative_eq!(step.null_rhs_inf, 0.25, epsilon = 1.0e-12);
+        assert!(step.delta.iter().all(|v| v.is_finite()));
     }
 
     #[test]
