@@ -250,8 +250,11 @@ class Model:
         calibration : table-like
             Held-out *labeled* calibration fold (not used in fitting). Must
             contain the response column in addition to the predictors; the
-            conformal multiplier ``q_hat`` is computed from this fold's
-            approximate-leave-one-out residuals.
+            conformal multiplier ``q_hat`` is computed from this fold's plain
+            held-out residuals ``y_cal - mu_hat(x_cal)`` (normalized by the
+            response-scale SE). The fold may be of any size, independent of the
+            training set — no leave-one-out correction is applied because a
+            held-out fold is already independent of the fitted model.
         conformal_level : float
             Target marginal coverage in ``(0, 1)`` (e.g. ``0.9``).
         covariance_mode : {"conditional", "smoothing", "required"}, optional
