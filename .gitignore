@@ -141,3 +141,8 @@ docs/images/geometric_shapes_demo.mp4
 
 # local scratch notes, not part of the repo's source
 todo_history.txt
+
+# local SAE exploration scratch scripts + stray scp artifacts (not source)
+run2_solver_independent.py
+run3_harness.py
+azuser@/
