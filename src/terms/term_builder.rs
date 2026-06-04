@@ -1634,7 +1634,14 @@ pub fn build_smooth_basis(
                 spec: ThinPlateBasisSpec {
                     center_strategy,
                     periodic: parse_periodic_axes_option(options, cols.len())?,
-                    length_scale: option_f64(options, "length_scale").unwrap_or(1.0),
+                    // Sentinel: leave at 0.0 when the user didn't pass an
+                    // explicit length_scale so `auto_init_length_scale_in_place`
+                    // can replace it with a data-derived initialization. The
+                    // old hard-coded 1.0 was the documented basin (see
+                    // smooth.rs `auto_init_length_scale_in_place`) that the
+                    // spatial optimizer could not escape, leaving TPS terms
+                    // initialized off the data scale.
+                    length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
                     double_penalty: smooth_double_penalty,
                     identifiability: parse_spatial_identifiability(options)
                         .map_err(|e| e.to_string())?,

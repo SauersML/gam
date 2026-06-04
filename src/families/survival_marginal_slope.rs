@@ -20354,14 +20354,18 @@ pub fn fit_survival_marginal_slope_terms(
                 .design
                 .try_to_dense_by_chunks("smgs phase-4b preflight logslope")?;
             // Channel-aware per-subject Fisher Gram (T8). Pilot primary
-            // state at β=0: q0 = offset_entry, q1 = offset_exit +
-            // marginal_offset, qd1 = derivative_offset_exit, g =
-            // logslope_offset. All offsets are available before the
-            // inner Newton, so the pilot-H is fully determined at
-            // preflight time without waiting for a converged β.
-            let q0_pf = spec.time_block.offset_entry.clone();
+            // state at β=0: q0 = offset_entry + marginal_offset, q1 =
+            // offset_exit + marginal_offset, qd1 = derivative_offset_exit,
+            // g = logslope_offset. The marginal predictor enters BOTH the
+            // entry and exit channels (see `row_dynamic_q_values`, which adds
+            // `block_states[1].eta` to q0 and q1 alike); at β=0 that predictor
+            // is `marginal_offset`. All offsets are available before the inner
+            // Newton, so the pilot-H is fully determined at preflight time
+            // without waiting for a converged β.
+            let mut q0_pf = spec.time_block.offset_entry.clone();
             let mut q1_pf = spec.time_block.offset_exit.clone();
             for i in 0..n_rows {
+                q0_pf[i] += spec.marginal_offset[i];
                 q1_pf[i] += spec.marginal_offset[i];
             }
             let qd1_pf = spec.time_block.derivative_offset_exit.clone();
