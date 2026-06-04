@@ -237,14 +237,16 @@ fn flex_full_outer_completes_under_budget_683() {
         }
         Err(err) => {
             eprintln!(
-                "[MS-FLEX-683] n={} inner_max_cycles=1 elapsed_s={:.3} bounded_err={}",
+                "[MS-FLEX-683] n={} inner_max_cycles={} elapsed_s={:.3} bounded_err={}",
                 n,
+                FULL_OUTER_SMOKE_INNER_CYCLES,
                 elapsed.as_secs_f64(),
                 err
             );
             assert!(
-                err.contains("exhausted the joint Newton budget")
-                    || err.contains("no candidate seeds passed outer startup validation"),
+                err.contains("outer smoothing optimization did not converge")
+                    && !err.contains("exhausted the joint Newton budget")
+                    && !err.contains("no candidate seeds passed outer startup validation"),
                 "unexpected full-outer FLEX error: {err}"
             );
         }
