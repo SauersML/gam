@@ -10809,6 +10809,13 @@ impl BernoulliMarginalSlopeFamily {
             &self.policy,
         )?;
 
+        // FLEX: prewarm the degree-21 cell-moment bundle so per-row third/
+        // fourth recompute reuses prebuilt moments rather than recomputing
+        // them per row on every operator application. The fourth-order
+        // recompute reads degree-21 cells, and a degree-21 bundle also serves
+        // the third-order (degree-15) lookups (gam#683).
+        self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
+
         let weighted_rows = outer_weighted_rows(options, n);
         let block_acc = weighted_rows
             .into_par_iter()
@@ -10943,6 +10950,13 @@ impl BernoulliMarginalSlopeFamily {
             psi_label,
             &self.policy,
         )?;
+
+        // FLEX: prewarm the degree-21 cell-moment bundle so per-row third/
+        // fourth recompute reuses prebuilt moments rather than recomputing
+        // them per row on every operator application. The fourth-order
+        // recompute reads degree-21 cells, and a degree-21 bundle also serves
+        // the third-order (degree-15) lookups (gam#683).
+        self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
         let weighted_rows = outer_weighted_rows(options, n);
         let block_acc = weighted_rows
@@ -11091,6 +11105,11 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(Some(block_acc.to_dense(slices)));
         }
 
+        // FLEX: prewarm the degree-15 cell-moment bundle so the per-row
+        // third-order recompute reuses prebuilt moments rather than
+        // recomputing them per row on every operator application (gam#683).
+        self.prewarm_flex_cell_bundle(block_states, cache, 15)?;
+
         let block_acc = weighted_rows
             .into_par_iter()
             .try_fold(
@@ -11176,6 +11195,11 @@ impl BernoulliMarginalSlopeFamily {
                 Arc::new(block_acc.into_operator(slices)) as Arc<dyn HyperOperator>
             ));
         }
+
+        // FLEX: prewarm the degree-15 cell-moment bundle so the per-row
+        // third-order recompute reuses prebuilt moments rather than
+        // recomputing them per row on every operator application (gam#683).
+        self.prewarm_flex_cell_bundle(block_states, cache, 15)?;
 
         let block_acc = weighted_rows
             .into_par_iter()
@@ -11296,6 +11320,12 @@ impl BernoulliMarginalSlopeFamily {
                 warmed,
                 "compute_gradient_and_hessian_via_psi_axes rigid third-cache warm-up",
             )?;
+        }
+        // FLEX analogue: prewarm the degree-15 cell-moment bundle once, serially,
+        // so the per-row third-order recompute reuses prebuilt moments instead
+        // of recomputing them per row across all directions/chunks (gam#683).
+        if flex_active && n > 0 {
+            self.prewarm_flex_cell_bundle(block_states, cache, 15)?;
         }
         if n > 0 {
             let warm_marg = Array1::<f64>::zeros(slices.marginal.end - slices.marginal.start);
@@ -11598,6 +11628,11 @@ impl BernoulliMarginalSlopeFamily {
                 "exact_newton_joint_hessiansecond_directional_derivative_from_cache rigid fourth-cache warm-up",
             )?;
         }
+        // FLEX analogue: prewarm the degree-21 cell-moment bundle so the per-row
+        // fourth-order recompute reuses prebuilt moments rather than recomputing
+        // them per row on every operator application. The fourth-order recompute
+        // reads degree-21 cells (gam#683).
+        self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
         // ── Rigid closed-form: 4th-order scalar kernel ───────────────
         if !self.effective_flex_active(block_states)? {
@@ -11695,6 +11730,11 @@ impl BernoulliMarginalSlopeFamily {
                 "exact_newton_joint_hessiansecond_directional_derivative_operator_from_cache rigid fourth-cache warm-up",
             )?;
         }
+        // FLEX analogue: prewarm the degree-21 cell-moment bundle so the per-row
+        // fourth-order recompute reuses prebuilt moments rather than recomputing
+        // them per row on every operator application. The fourth-order recompute
+        // reads degree-21 cells (gam#683).
+        self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
         if !self.effective_flex_active(block_states)? {
             let block_acc = weighted_rows
@@ -11834,6 +11874,13 @@ impl BernoulliMarginalSlopeFamily {
                 warmed,
                 "exact_newton_joint_hessiansecond_directional_derivative_operators_from_cache rigid fourth-cache warm-up",
             )?;
+        }
+        // FLEX analogue: prewarm the degree-21 cell-moment bundle once, serially,
+        // so the per-row fourth-order recompute reuses prebuilt moments instead
+        // of recomputing them per row across all direction pairs. The
+        // fourth-order recompute reads degree-21 cells (gam#683).
+        if flex_active && n > 0 {
+            self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
         }
         const ROW_PAR_MIN_ROWS: usize = 4_096;
         let run_rows_serial = rayon::current_thread_index().is_some()
