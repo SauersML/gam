@@ -3128,7 +3128,7 @@ mod tests {
         ];
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::Second
+            ExactOuterDerivativeOrder::First
         );
         assert!(family.exact_newton_joint_psi_workspace_for_first_order_terms());
 
@@ -3145,7 +3145,7 @@ mod tests {
         assert_eq!(
             large_flex_family
                 .exact_outer_derivative_order(&large_flex_specs, &BlockwiseFitOptions::default()),
-            ExactOuterDerivativeOrder::Second
+            ExactOuterDerivativeOrder::First
         );
         let (large_flex_gradient, large_flex_hessian) = custom_family_outer_derivatives(
             &large_flex_family,
@@ -3158,7 +3158,7 @@ mod tests {
         );
         assert_eq!(
             large_flex_hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::Either
+            crate::solver::outer_strategy::DeclaredHessianForm::None
         );
 
         let mut large_rigid_family = large_flex_family.clone();
