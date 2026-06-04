@@ -13452,13 +13452,12 @@ mod tests {
         // Directly test the CSV output for Gaussian location-scale predictions.
         // This model class now always goes through the unified PredictableModel path.
         let beta_mu: f64 = 12.0;
-        let beta_log_sigma: f64 = (0.5f64).ln();
-        let response_scale: f64 = 10.0;
+        let beta_log_sigma: f64 = (5.0f64).ln();
         let td = tempdir().expect("tempdir");
         let out_path = td.path().join("pred.csv");
         let eta = array![beta_mu];
         let mean = eta.clone();
-        let sigma = array![beta_log_sigma.exp() * response_scale];
+        let sigma = array![beta_log_sigma.exp()];
         write_gaussian_location_scale_prediction_csv(
             &out_path,
             eta.view(),
