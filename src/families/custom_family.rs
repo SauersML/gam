@@ -12318,6 +12318,7 @@ fn solve_joint_newton_step_on_spectral_range(
     rhs: &Array1<f64>,
     rank_tol: f64,
     null_tol: f64,
+    levenberg_mu: f64,
 ) -> Result<JointSpectralNewtonStep, String> {
     let p = h_pen.nrows();
     if h_pen.ncols() != p || rhs.len() != p {
@@ -12393,6 +12394,30 @@ fn solve_joint_newton_step_on_spectral_range(
     // fallback) then validates the actual decrease, so no curvature guarantee
     // is weakened — an indefinite model yields a safe descent step rather than
     // a hard failure, and a PSD model still gets the exact Newton step.
+    //
+    // `levenberg_mu` is a self-vanishing Levenberg–Marquardt damping added to
+    // each range-space curvature: the per-direction step is
+    // `(u_kᵀ rhs)/(|λ_k| + μ)` rather than `(u_kᵀ rhs)/|λ_k|`. It is chosen by
+    // the caller proportional to the current stationarity-residual norm
+    // (μ = c·‖∇L − Sβ‖∞), so it has two regimes that make the inner solve
+    // converge on a genuinely ill-conditioned degenerate design WITHOUT moving
+    // the KKT fixed point:
+    //   * Far from the optimum (residual O(1)), a direction whose curvature
+    //     `|λ_k|` is tiny-but-above-`cutoff` (a near-singular but not-quite-null
+    //     mode of the n=23 binary-covariate CTM Hessian) would otherwise take an
+    //     enormous `component/λ_k` step. Those modes are exactly what makes the
+    //     undamped range-restricted Newton step oscillate: the trust region
+    //     clips a huge proposal every cycle and the residual along that mode
+    //     never settles, so neither `step_inf ≤ step_tol` nor the identified-
+    //     subspace residual ever reaches tolerance and the solve burns its
+    //     cycle budget. Adding μ caps the component at ≈ `component/μ`, turning
+    //     the proposal into a bounded, stable descent step.
+    //   * At the optimum (residual → 0 ⇒ μ → 0), the damping vanishes and the
+    //     step is exactly the undamped range-restricted (Moore–Penrose) Newton
+    //     step, so the converged β and the KKT certificate are identical to the
+    //     undamped solve. A well-identified problem (e.g. the #720 continuous
+    //     fast path) sits at small residual quickly, so μ is negligible there
+    //     and quadratic Newton convergence is preserved.
     for k in 0..p {
         let lambda = evals[k];
         let u_k = evecs.column(k);
@@ -12411,7 +12436,12 @@ fn solve_joint_newton_step_on_spectral_range(
         };
         range_rhs_inf = range_rhs_inf.max(component.abs());
         lambda_min_positive = lambda_min_positive.min(curvature);
-        let scale = component / curvature;
+        // Self-vanishing Levenberg–Marquardt damping on the range-space
+        // curvature. `μ ≥ 0` and `curvature > cutoff > 0`, so the denominator
+        // stays strictly positive and the descent property
+        // (∇L − Sβ)·δ = Σ_k (u_kᵀ rhs)²/(|λ_k| + μ) > 0 is preserved.
+        let damped_curvature = curvature + levenberg_mu.max(0.0);
+        let scale = component / damped_curvature;
         for i in 0..p {
             delta[i] += scale * u_k[i];
         }
@@ -14135,11 +14165,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             joint_mode_diagonal_ridge,
                             joint_bundle,
                         );
+                        let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                        let spectral_levenberg_mu = 1.0e-3 * rhs_inf;
                         let spectral_step = solve_joint_newton_step_on_spectral_range(
                             &lhs_true,
                             &rhs,
                             KKT_REFUSAL_RANK_TOL,
                             residual_tol_for_solve,
+                            spectral_levenberg_mu,
                         )?;
                         spectral_nullity_for_step = spectral_step.nullity;
                         if spectral_step.reflected_negative_modes > 0 {
@@ -30133,7 +30166,7 @@ mod tests {
     fn spectral_joint_newton_step_uses_pseudoinverse_when_null_gradient_is_zero() {
         let h = array![[4.0, 0.0], [0.0, 0.0]];
         let rhs = array![8.0, 0.0];
-        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12)
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
             .expect("range-only RHS should have a minimum-norm Newton step");
 
         assert_relative_eq!(step.delta[0], 2.0, epsilon = 1.0e-12);
@@ -30160,7 +30193,7 @@ mod tests {
         // trust region then globalizes.
         let h = array![[4.0, 0.0], [0.0, -1.0]];
         let rhs = array![8.0, 3.0];
-        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12)
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
             .expect("indefinite model must yield a modified-Newton step, not an error");
 
         // Exactly one negative-curvature mode was reflected.
@@ -30188,7 +30221,7 @@ mod tests {
     fn spectral_joint_newton_step_rejects_nonzero_null_gradient() {
         let h = array![[4.0, 0.0], [0.0, 0.0]];
         let rhs = array![8.0, 0.25];
-        let err = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12)
+        let err = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
             .expect_err("nonzero null RHS means no stationary quadratic minimizer");
 
         assert!(
