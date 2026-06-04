@@ -3456,8 +3456,9 @@ mod tests {
         evaluate_survival_marginal_slope_baseline, marginal_slope_baseline_chain_rule_gradient,
         marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
         optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
-        optimize_survival_baseline_config_with_gradient_only, survival_baseline_config_from_theta,
-        survival_baseline_theta_from_config, resolve_survival_marginal_slope_time_anchor_value,
+        optimize_survival_baseline_config_with_gradient_only,
+        resolve_survival_marginal_slope_time_anchor_value, survival_baseline_config_from_theta,
+        survival_baseline_theta_from_config,
     };
     use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
@@ -3489,9 +3490,8 @@ mod tests {
     fn marginal_slope_time_anchor_defaults_to_median_exit() {
         let age_entry = array![9.0, 1.0, 4.0, 6.0];
         let age_exit = array![20.0, 12.0, 18.0, 30.0];
-        let anchor =
-            resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, None)
-                .expect("resolve marginal-slope default time anchor");
+        let anchor = resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, None)
+            .expect("resolve marginal-slope default time anchor");
 
         assert!(
             (anchor - 19.0).abs() <= 1e-12,
