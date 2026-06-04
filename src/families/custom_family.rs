@@ -15136,6 +15136,65 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 converged = true;
                 break;
             }
+            // Identified-subspace (range-space) KKT certificate.
+            //
+            // The strict certificate above tests the FULL stationarity residual
+            // ‖∇L − Sβ‖∞. On a genuinely rank-deficient penalized inner problem
+            // — a degenerate small-n transformation-normal CTM/Box-Cox fit whose
+            // joint Hessian carries an *unidentified* direction the
+            // canonical-gauge pass cannot attribute to a single block (the same
+            // structural null root-caused for the joint-Newton panic at
+            // `solve_joint_newton_step_on_spectral_range`) — the stationarity
+            // gradient keeps a fixed nonzero component inside ker(H_pen). The
+            // spectral Newton step drops exactly that component (range-restricted
+            // Moore–Penrose step: every null direction hits the `continue` branch
+            // in the accumulation loop), so β converges on the identified
+            // subspace and the step exhausts, yet the FULL residual never reaches
+            // `residual_tol`. The strict test then runs the whole cycle budget
+            // "non-converged" on an iterate that is, in fact, the optimum on the
+            // only identifiable directions.
+            //
+            // The principled certificate is stationarity on range(H_pen): the
+            // residual restricted to the curved (identified) subspace is at
+            // tolerance while the leftover mass is provably confined to
+            // ker(H_pen) — an unidentified direction with neither curvature nor
+            // constraint. That null component is dropped by the spectral step
+            // here and projected out of the KKT residual by the outer IFT
+            // pseudo-inverse `U_S·H_proj⁻¹·U_Sᵀ` before the envelope correction
+            // (see the gam#553 note and `projected_residual_range_space_inf`), so
+            // it cannot bias the outer gradient. Requiring the step to be
+            // exhausted (`step_inf ≤ step_tol`) proves we are AT the
+            // range-restricted optimum rather than mid-descent, so this does not
+            // short-circuit a genuinely nonlinear CTM fit that is still moving β.
+            // Unlike the constrained-stationary path below, this fires on a pure
+            // identifiability null without requiring the `linearized_rel ≥ 0.5`
+            // constraint-multiplier signature, which a structural rank-deficiency
+            // need not produce.
+            if step_inf <= step_tol
+                && let Some(range_residual) = projected_residual_range_space_inf(
+                    &projected_residual_vec,
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    ridge,
+                    options.ridge_policy,
+                    total_p,
+                )
+                && range_residual <= residual_tol
+            {
+                log::info!(
+                    "[PIRLS/joint-Newton convergence] cycle {:>3} | identified-subspace KKT certificate: total residual={:.3e} > tol={:.3e} but its range-space (identified-subspace) component={:.3e} ≤ tol={:.3e}, step_inf={:.3e} ≤ step_tol={:.3e}; the leftover residual lies in the unidentified penalized-Hessian null space ker(H_pen) (dropped by the range-restricted spectral step and projected out by the outer IFT pseudo-inverse) — the iterate is stationary on the entire identifiable subspace.",
+                    cycle,
+                    residual,
+                    residual_tol,
+                    range_residual,
+                    residual_tol,
+                    step_inf,
+                    step_tol,
+                );
+                converged = true;
+                break;
+            }
             // Noise-floor KKT certificate.
             //
             // Reading the joint stationarity residual ‖∇L(β) − Sβ‖_∞ at finite
