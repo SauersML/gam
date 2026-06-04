@@ -9523,6 +9523,75 @@ mod tests {
     }
 
     #[test]
+    fn decoder_incoherence_separability_semantics() {
+        // Two atoms, each a single decoder column in ℝ^{p_out=2}: atom 0 = first
+        // column, atom 1 = second. β layout is [B_0[:,0]=t0,t1 ; B_1[:,0]=t2,t3].
+        let p = 2usize;
+        let block_sizes = vec![1usize, 1usize];
+        let total: usize = block_sizes.iter().map(|m| m * p).sum();
+        let target = PsiSlice {
+            range: 0..total,
+            latent_dim: Some(total / p),
+        };
+        let full_coact = || {
+            let mut c = Array2::<f64>::zeros((2, 2));
+            c[[0, 1]] = 1.0;
+            c[[1, 0]] = 1.0;
+            c
+        };
+        let rho = Array1::<f64>::zeros(0);
+
+        // Orthogonal column-spaces ⇒ B_0^T B_1 = 0 ⇒ P ≈ 0.
+        let pen_ortho =
+            DecoderIncoherencePenalty::new(target.clone(), block_sizes.clone(), p, full_coact(), 1.0, false)
+                .unwrap();
+        let t_ortho = array![1.0_f64, 0.0, 0.0, 1.0];
+        let p_ortho = pen_ortho.value(t_ortho.view(), rho.view());
+        assert!(
+            p_ortho.abs() <= 1.0e-12,
+            "orthogonal decoder blocks must give P≈0, got {p_ortho:.3e}"
+        );
+
+        // Coincident column-spaces ⇒ B_0^T B_1 large ⇒ P large.
+        let pen_coinc =
+            DecoderIncoherencePenalty::new(target.clone(), block_sizes.clone(), p, full_coact(), 1.0, false)
+                .unwrap();
+        let t_coinc = array![1.0_f64, 0.0, 1.0, 0.0];
+        let p_coinc = pen_coinc.value(t_coinc.view(), rho.view());
+        // ½·w·W·‖B_0^T B_1‖_F² = ½·1·1·(1)² = 0.5.
+        assert!(
+            (p_coinc - 0.5).abs() <= 1.0e-12,
+            "coincident decoder blocks must give large P (=0.5 here), got {p_coinc:.3e}"
+        );
+        assert!(
+            p_coinc > p_ortho + 1.0e-3,
+            "coincident P must exceed orthogonal P"
+        );
+
+        // Co-activation weight 0 zeroes the pair's contribution even when the
+        // blocks are coincident.
+        let pen_zero = DecoderIncoherencePenalty::new(
+            target,
+            block_sizes,
+            p,
+            Array2::<f64>::zeros((2, 2)),
+            1.0,
+            false,
+        )
+        .unwrap();
+        let p_zero = pen_zero.value(t_coinc.view(), rho.view());
+        assert!(
+            p_zero.abs() <= 1.0e-12,
+            "zero co-activation must zero the pair contribution, got {p_zero:.3e}"
+        );
+        let g_zero = pen_zero.grad_target(t_coinc.view(), rho.view());
+        assert!(
+            g_zero.iter().all(|v| v.abs() <= 1.0e-12),
+            "zero co-activation must zero the pair gradient"
+        );
+    }
+
+    #[test]
     fn nested_prefix_rejects_non_monotone_prefixes() {
         let target = PsiSlice::full(12, Some(4));
         let err = NestedPrefixPenalty::new(
