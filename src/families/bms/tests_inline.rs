@@ -8069,6 +8069,39 @@ mod tests {
             .expect("tiled diag");
         let rel_diag = rel_diff_array1(&diag_host, &diag_tiled);
         assert!(rel_diag < 5e-11, "tiled diag drift rel {rel_diag}");
+
+        // Batched multi-RHS apply over the tiled cache must reproduce, column
+        // for column, the single-vector HVP applied to each column. Build a
+        // small (total x n_rhs) block of distinct directions, apply it both
+        // ways, and require exact agreement.
+        let total = tiled_cache.slices.total;
+        let n_rhs = 3usize;
+        let mut v_cols = Array2::<f64>::zeros((total, n_rhs));
+        for col in 0..n_rhs {
+            for idx in 0..total {
+                v_cols[[idx, col]] = 0.013 * ((idx % (5 + col)) as f64 - 2.0) + 0.001 * col as f64;
+            }
+        }
+        let mut batched = Array2::<f64>::zeros((total, n_rhs));
+        family
+            .exact_newton_joint_hessian_matvec_mat_from_cache_into(
+                &v_cols,
+                &states,
+                &tiled_cache,
+                &mut batched,
+            )
+            .expect("tiled batched Hv");
+        for col in 0..n_rhs {
+            let col_dir = v_cols.column(col).to_owned();
+            let hv_col = family
+                .exact_newton_joint_hessian_matvec_from_cache(&col_dir, &states, &tiled_cache)
+                .expect("tiled per-column Hv");
+            let rel_col = rel_diff_array1(&hv_col, &batched.column(col).to_owned());
+            assert!(
+                rel_col < 5e-11,
+                "tiled batched apply column {col} drift rel {rel_col}"
+            );
+        }
     }
 
     #[test]
