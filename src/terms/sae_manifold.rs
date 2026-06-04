@@ -359,36 +359,6 @@ impl SaeAtomBasisKind {
 /// Mackay/Fellner–Schall `α ← n / (Σ sq_equiv + tr H⁻¹)` fixed point must use so
 /// that the prior energy it implies stays consistent with `ard_value`.
 #[derive(Clone, Copy, Debug)]
-/// Modified Bessel function of the first kind, order zero, `I0(x)`.
-///
-/// Abramowitz & Stegun 9.8.1 (|x| <= 3.75) and 9.8.2 (|x| > 3.75) polynomial
-/// approximations; relative error < 1.6e-7 / 1.9e-7 respectively, which is far
-/// below the precision tolerance the ARD normaliser is read at. `I0` is even,
-/// so only `|x|` enters. Used for the exact von-Mises precision log-partition.
-fn bessel_i0(x: f64) -> f64 {
-    let ax = x.abs();
-    if ax < 3.75 {
-        let t = x / 3.75;
-        let t2 = t * t;
-        1.0 + t2
-            * (3.5156229
-                + t2 * (3.0899424
-                    + t2 * (1.2067492
-                        + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
-    } else {
-        let y = 3.75 / ax;
-        let poly = 0.39894228
-            + y * (0.01328592
-                + y * (0.00225319
-                    + y * (-0.00157565
-                        + y * (0.00916281
-                            + y * (-0.02057706
-                                + y * (0.02635537
-                                    + y * (-0.01647633 + y * 0.00392377)))))));
-        (ax.exp() / ax.sqrt()) * poly
-    }
-}
-
 struct ArdAxisPrior {
     value: f64,
     grad: f64,
@@ -420,6 +390,36 @@ impl ArdAxisPrior {
                 }
             }
         }
+    }
+}
+
+/// Modified Bessel function of the first kind, order zero, `I0(x)`.
+///
+/// Abramowitz & Stegun 9.8.1 (|x| <= 3.75) and 9.8.2 (|x| > 3.75) polynomial
+/// approximations; relative error < 1.6e-7 / 1.9e-7 respectively, which is far
+/// below the precision tolerance the ARD normaliser is read at. `I0` is even,
+/// so only `|x|` enters. Used for the exact von-Mises precision log-partition.
+fn bessel_i0(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 3.75 {
+        let t = x / 3.75;
+        let t2 = t * t;
+        1.0 + t2
+            * (3.5156229
+                + t2 * (3.0899424
+                    + t2 * (1.2067492
+                        + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
+    } else {
+        let y = 3.75 / ax;
+        let poly = 0.39894228
+            + y * (0.01328592
+                + y * (0.00225319
+                    + y * (-0.00157565
+                        + y * (0.00916281
+                            + y * (-0.02057706
+                                + y * (0.02635537
+                                    + y * (-0.01647633 + y * 0.00392377)))))));
+        (ax.exp() / ax.sqrt()) * poly
     }
 }
 
