@@ -1,22 +1,21 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
-    BasisWorkspace,
-    BasisOptions, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
-    CenterStrategyKind, Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
-    KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
-    OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo, PenaltySource, SpatialIdentifiability,
-    SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
-    apply_sum_to_zero_constraint, build_bspline_basis_1d, build_duchon_basis,
-    build_duchon_basis_log_kappa_derivatives, build_duchon_basiswithworkspace, build_matern_basis,
-    build_matern_basis_log_kappa_aniso_derivatives, build_matern_basis_log_kappa_derivatives,
-    build_matern_basiswithworkspace, build_matern_collocation_operator_matrices,
-    build_spherical_spline_basis, build_thin_plate_basis,
-    build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto, center_strategy_kind,
-    center_strategy_num_centers, center_strategy_with_num_centers, estimate_penalty_nullity,
-    filter_active_penalty_candidates, filter_active_penalty_candidates_with_ops,
-    initial_aniso_contrasts, orthogonality_transform_for_design, pairwise_distance_bounds,
-    pairwise_distance_bounds_sampled, points_in_aniso_y_space, select_centers_by_strategy,
+    BasisOptions, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, BasisWorkspace,
+    CenterStrategy, CenterStrategyKind, Dense, DuchonBasisSpec, KnotSource, KroneckerFactoredBasis,
+    MaternBasisSpec, MaternIdentifiability, OneDimensionalBoundary, PenaltyCandidate, PenaltyInfo,
+    PenaltySource, SpatialIdentifiability, SphericalSplineBasisSpec,
+    SphericalSplineIdentifiability, ThinPlateBasisSpec, apply_sum_to_zero_constraint,
+    build_bspline_basis_1d, build_duchon_basis, build_duchon_basiswithworkspace,
+    build_matern_basis, build_matern_basis_log_kappa_aniso_derivatives,
+    build_matern_basis_log_kappa_derivatives, build_matern_basiswithworkspace,
+    build_matern_collocation_operator_matrices, build_spherical_spline_basis,
+    build_thin_plate_basis, build_thin_plate_basis_log_kappa_derivatives, center_strategy_is_auto,
+    center_strategy_kind, center_strategy_num_centers, center_strategy_with_num_centers,
+    estimate_penalty_nullity, filter_active_penalty_candidates,
+    filter_active_penalty_candidates_with_ops, initial_aniso_contrasts,
+    orthogonality_transform_for_design, pairwise_distance_bounds, pairwise_distance_bounds_sampled,
+    points_in_aniso_y_space, select_centers_by_strategy,
 };
 use crate::construction::{
     kronecker_logdet_and_derivatives, kronecker_marginal_eigensystems, kronecker_product,
@@ -9873,18 +9872,19 @@ fn extract_spatial_operator_runtime_caches(
                         (Some(ls), None) => Some(*ls),
                         (None, _) => None,
                     };
-                    let ops = crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
-                        centers.view(),
-                        collocation_points.view(),
-                        None,
-                        collocation_length_scale,
-                        *power,
-                        *nullspace_order,
-                        aniso_log_scales.as_deref(),
-                        identifiability_transform.as_ref().map(|z| z.view()),
-                        2,
-                        &mut BasisWorkspace::default(),
-                    )?;
+                    let ops =
+                        crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
+                            centers.view(),
+                            collocation_points.view(),
+                            None,
+                            collocation_length_scale,
+                            *power,
+                            *nullspace_order,
+                            aniso_log_scales.as_deref(),
+                            identifiability_transform.as_ref().map(|z| z.view()),
+                            2,
+                            &mut BasisWorkspace::default(),
+                        )?;
                     (
                         feature_cols.clone(),
                         ops.d0,
@@ -14258,10 +14258,13 @@ fn try_build_spatial_term_log_kappa_derivative(
             input_scales,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            let mut spec_local = spec.clone();
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
+                spec_local.length_scale =
+                    compensate_length_scale_for_standardization(spec.length_scale, s);
             }
-            build_thin_plate_basis_log_kappa_derivatives(x.view(), spec)
+            build_thin_plate_basis_log_kappa_derivatives(x.view(), &spec_local)
                 .map_err(EstimationError::from)?
         }
         SmoothBasisSpec::Sphere { .. } => return Ok(None),
@@ -14271,10 +14274,13 @@ fn try_build_spatial_term_log_kappa_derivative(
             input_scales,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            let mut spec_local = spec.clone();
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
+                spec_local.length_scale =
+                    compensate_length_scale_for_standardization(spec.length_scale, s);
             }
-            build_matern_basis_log_kappa_derivatives(x.view(), spec)
+            build_matern_basis_log_kappa_derivatives(x.view(), &spec_local)
                 .map_err(EstimationError::from)?
         }
         SmoothBasisSpec::Duchon {
@@ -14283,11 +14289,32 @@ fn try_build_spatial_term_log_kappa_derivative(
             input_scales,
         } => {
             let mut x = select_columns(data, feature_cols).map_err(EstimationError::from)?;
+            let mut spec_local = spec.clone();
             if let Some(s) = input_scales {
                 apply_input_standardization(&mut x, s);
+                spec_local.length_scale =
+                    compensate_optional_length_scale_for_standardization(spec.length_scale, s);
             }
-            build_duchon_basis_log_kappa_derivatives(x.view(), spec)
-                .map_err(EstimationError::from)?
+            let BasisMetadata::Duchon {
+                centers,
+                identifiability_transform,
+                operator_collocation_points,
+                ..
+            } = &smooth_term.metadata
+            else {
+                return Ok(None);
+            };
+            crate::basis::build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
+                x.view(),
+                &spec_local,
+                centers.view(),
+                identifiability_transform.as_ref(),
+                operator_collocation_points
+                    .as_ref()
+                    .map(|points| points.view()),
+                &mut BasisWorkspace::default(),
+            )
+            .map_err(EstimationError::from)?
         }
         SmoothBasisSpec::BSpline1D { .. }
         | SmoothBasisSpec::TensorBSpline { .. }
@@ -14299,19 +14326,56 @@ fn try_build_spatial_term_log_kappa_derivative(
             return Ok(None);
         }
     };
-    let implicit_operator = derivative_bundle.implicit_operator.map(std::sync::Arc::new);
+    let mut implicit_operator = derivative_bundle.implicit_operator;
     let BasisPsiDerivativeResult {
-        design_derivative: local_x_psi,
-        penalties_derivative: local_s_psi,
+        design_derivative: mut local_x_psi,
+        penalties_derivative: mut local_s_psi,
         implicit_operator: local_implicit_first_unused,
     } = derivative_bundle.first;
     let BasisPsiSecondDerivativeResult {
-        designsecond_derivative: local_x_psi_psi,
-        penaltiessecond_derivative: local_s_psi_psi,
+        designsecond_derivative: mut local_x_psi_psi,
+        penaltiessecond_derivative: mut local_s_psi_psi,
         implicit_operator: local_implicit_second_unused,
     } = derivative_bundle.second;
     assert!(local_implicit_first_unused.is_none());
     assert!(local_implicit_second_unused.is_none());
+
+    if let Some(rotation) = smooth_term.joint_null_rotation.as_ref() {
+        let q = &rotation.rotation;
+        if let Some(op) = implicit_operator.take() {
+            implicit_operator = Some(op.append_full_transform(q).map_err(EstimationError::from)?);
+        } else {
+            if local_x_psi.ncols() != q.nrows() || local_x_psi_psi.ncols() != q.nrows() {
+                return Ok(None);
+            }
+            local_x_psi = fast_ab(&local_x_psi, q);
+            local_x_psi_psi = fast_ab(&local_x_psi_psi, q);
+        }
+        let rotate_penalty = |s_local: Array2<f64>| -> Option<Array2<f64>> {
+            if s_local.nrows() != q.nrows() || s_local.ncols() != q.nrows() {
+                return None;
+            }
+            let qt_s = crate::linalg::faer_ndarray::fast_atb(q, &s_local);
+            Some(crate::linalg::faer_ndarray::fast_ab(&qt_s, q))
+        };
+        let Some(rotated_s_psi) = local_s_psi
+            .into_iter()
+            .map(|s| rotate_penalty(s))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        local_s_psi = rotated_s_psi;
+        let Some(rotated_s_psi_psi) = local_s_psi_psi
+            .into_iter()
+            .map(|s| rotate_penalty(s))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        local_s_psi_psi = rotated_s_psi_psi;
+    }
+    let implicit_operator = implicit_operator.map(std::sync::Arc::new);
 
     if let Some(ref op) = implicit_operator {
         if op.p_out() != smooth_term.coeff_range.len() {
@@ -16676,51 +16740,6 @@ pub fn freeze_term_collection_from_design(
         // rotation). Without this propagation, models reloaded from disk
         // produce wrong η at predict-time for any smooth with `Some(Q)`.
         term.joint_null_rotation = fitted.joint_null_rotation.clone();
-        // Auto-promotion: when canonical TPS is mathematically infeasible at
-        // the requested (d, k), `build_thin_plate_basis_with_workspace`
-        // delegates to `build_duchon_basis_with_workspace` and returns
-        // `BasisMetadata::Duchon`. The user's spec, however, is still
-        // `SmoothBasisSpec::ThinPlate`. Without a rewrite the freezer's
-        // type-paired match would land on the catch-all error arm and the
-        // entire fit would fail at serialization time — even though the fit
-        // itself succeeded against the promoted Duchon basis. Rewrite the
-        // term's basis variant to Duchon so the standard (Duchon, Duchon)
-        // arm below stores the captured Duchon parameters and predict-time
-        // takes the Duchon path directly with the frozen centers/power.
-        if matches!(&term.basis, SmoothBasisSpec::ThinPlate { .. })
-            && matches!(&fitted.metadata, BasisMetadata::Duchon { .. })
-        {
-            let (feature_cols, original_identifiability) = match &term.basis {
-                SmoothBasisSpec::ThinPlate {
-                    feature_cols, spec, ..
-                } => (feature_cols.clone(), spec.identifiability.clone()),
-                _ => {
-                    crate::bail_invalid_estim!(
-                        "internal: TPS-to-Duchon rewrite guard saw non-ThinPlate basis variant"
-                            .to_string(),
-                    );
-                }
-            };
-            term.basis = SmoothBasisSpec::Duchon {
-                feature_cols,
-                spec: DuchonBasisSpec {
-                    // Center strategy / length_scale / power / nullspace_order
-                    // are placeholders — the (Duchon, Duchon) arm below
-                    // overwrites them with the frozen values from the metadata
-                    // captured during the actual basis build.
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 0 },
-                    periodic: None,
-                    length_scale: None,
-                    power: 0.0,
-                    nullspace_order: DuchonNullspaceOrder::Zero,
-                    identifiability: original_identifiability,
-                    aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::default(),
-                    boundary: OneDimensionalBoundary::Open,
-                },
-                input_scales: None,
-            };
-        }
         match (&mut term.basis, &fitted.metadata) {
             (SmoothBasisSpec::ByVariable { inner, .. }, meta)
             | (SmoothBasisSpec::FactorSumToZero { inner, .. }, meta) => {
@@ -23932,18 +23951,37 @@ mod tests {
 
         // Build derivative at psi=0.
         let psi_eval = 0.0_f64;
-        let duchon_spec =
-            if let SmoothBasisSpec::Duchon { spec: ref s, .. } = frozen.smooth_terms[0].basis {
-                s.clone()
-            } else {
-                panic!("expected Duchon");
-            };
+        let (duchon_spec, input_scales) = if let SmoothBasisSpec::Duchon {
+            spec: ref s,
+            ref input_scales,
+            ..
+        } = frozen.smooth_terms[0].basis
+        {
+            (s.clone(), input_scales.clone())
+        } else {
+            panic!("expected Duchon");
+        };
         let mut duchon_spec_at = duchon_spec.clone();
         duchon_spec_at.length_scale = Some((-psi_eval).exp());
-        let bundle =
-            crate::basis::build_duchon_basis_log_kappa_derivatives(data.view(), &duchon_spec_at)
-                .expect("derivatives");
-        let op = bundle.implicit_operator.expect("implicit operator");
+        let mut derivative_data = data.clone();
+        if let Some(scales) = input_scales.as_deref() {
+            apply_input_standardization(&mut derivative_data, scales);
+            duchon_spec_at.length_scale = compensate_optional_length_scale_for_standardization(
+                duchon_spec_at.length_scale,
+                scales,
+            );
+        }
+        let bundle = crate::basis::build_duchon_basis_log_kappa_derivatives(
+            derivative_data.view(),
+            &duchon_spec_at,
+        )
+        .expect("derivatives");
+        let mut op = bundle.implicit_operator.expect("implicit operator");
+        if let Some(rotation) = frozen.smooth_terms[0].joint_null_rotation.as_ref() {
+            op = op
+                .append_full_transform(&rotation.rotation)
+                .expect("append joint-null rotation to derivative operator");
+        }
         let p = op.p_out();
 
         // FD reference.
@@ -25213,7 +25251,7 @@ mod tests {
             } => {
                 let x =
                     select_columns(data.view(), feature_cols).expect("select Duchon feature cols");
-                build_duchon_basis_log_kappa_derivatives(x.view(), spec)
+                crate::basis::build_duchon_basis_log_kappa_derivatives(x.view(), spec)
                     .expect("direct Duchon derivative bundle should build")
             }
             _ => panic!("expected Duchon term"),
@@ -27701,7 +27739,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_spatial_adaptive_high_center_duchon_fit_no_longer_fails_in_outer_solver() {
+    fn high_center_duchon_fit_ignores_unavailable_spatial_adaptive_overlay() {
         let n = 320usize;
         let mut data = Array2::<f64>::zeros((n, 1));
         let mut y = Array1::<f64>::zeros(n);
@@ -27760,13 +27798,10 @@ mod tests {
         assert!(fit.fit.beta.iter().all(|v| v.is_finite()));
         assert!(fit.fit.deviance.is_finite());
         assert!(fit.fit.edf_total().is_some_and(f64::is_finite));
-        let diag = fit
-            .adaptive_diagnostics
-            .as_ref()
-            .expect("adaptive diagnostics should be present");
-        assert!(diag.epsilon_0.is_finite() && diag.epsilon_0 > 0.0);
-        assert!(diag.epsilon_g.is_finite() && diag.epsilon_g > 0.0);
-        assert!(diag.epsilon_c.is_finite() && diag.epsilon_c > 0.0);
+        assert!(
+            fit.adaptive_diagnostics.is_none(),
+            "Duchon does not expose the complete operator triplet required by the runtime adaptive overlay"
+        );
     }
 
     #[test]
