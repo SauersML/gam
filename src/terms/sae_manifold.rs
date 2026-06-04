@@ -9908,10 +9908,14 @@ mod tests {
         );
         let mut absmax = 0.0_f64;
         let mut penalty_grad = Array1::<f64>::zeros(m * p);
-        for j in 0..m * p {
-            let v = sys.gb[j] - baseline.gb[j];
+        for ((dst, sys_g), baseline_g) in penalty_grad
+            .iter_mut()
+            .zip(sys.gb.iter())
+            .zip(baseline.gb.iter())
+        {
+            let v = *sys_g - *baseline_g;
             assert!(v.is_finite());
-            penalty_grad[j] = v;
+            *dst = v;
             absmax = absmax.max(v.abs());
         }
         assert!(
@@ -9951,10 +9955,8 @@ mod tests {
         let base_norm = smoothed_nuclear_norm(&decoder, eps);
         let step = 1.0e-2;
         let mut shrunk = decoder.clone();
-        for row in 0..m {
-            for feat in 0..p {
-                shrunk[[row, feat]] -= step * penalty_grad[row * p + feat];
-            }
+        for ((row, feat), value) in shrunk.indexed_iter_mut() {
+            *value -= step * penalty_grad[row * p + feat];
         }
         let shrunk_norm = smoothed_nuclear_norm(&shrunk, eps);
         assert!(
