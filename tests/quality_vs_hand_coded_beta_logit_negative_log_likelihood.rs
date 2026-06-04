@@ -139,6 +139,10 @@ impl CustomFamily for BetaLogitCustomFamily {
         Some((0..specs.len()).collect())
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != 2 {
             return Err(format!(
