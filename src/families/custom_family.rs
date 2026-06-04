@@ -12725,6 +12725,25 @@ fn solve_joint_newton_step_on_spectral_range(
     //     undamped solve. A well-identified problem (e.g. the #720 continuous
     //     fast path) sits at small residual quickly, so μ is negligible there
     //     and quadratic Newton convergence is preserved.
+    //
+    // The damping is only ever needed when `H_pen` carries a numerical
+    // nullspace (`nullity > 0`): that is when near-singular-but-above-cutoff
+    // modes exist whose undamped `component/λ` step oscillates. On a FULLY
+    // IDENTIFIED Hessian (`nullity == 0`, e.g. the post-reduction
+    // constant-scale AFT, #736/#735/#721/#733/#734) every range curvature is a
+    // genuine non-degenerate eigenvalue and the exact Newton step converges
+    // quadratically; applying even the self-vanishing μ then throttles the
+    // step by the geometric ratio λ/(λ+μ) per cycle and stalls the small-
+    // curvature blocks (an unpenalized intercept at small n) at a residual
+    // plateau orders above `residual_tol`. So count the nullity first and use
+    // μ only when the model is genuinely rank-deficient.
+    let spectral_nullity =
+        evals.iter().filter(|v| !v.is_finite() || v.abs() <= cutoff).count();
+    let effective_mu = if spectral_nullity > 0 {
+        levenberg_mu.max(0.0)
+    } else {
+        0.0
+    };
     for k in 0..p {
         let lambda = evals[k];
         let u_k = evecs.column(k);
@@ -12744,10 +12763,12 @@ fn solve_joint_newton_step_on_spectral_range(
         range_rhs_inf = range_rhs_inf.max(component.abs());
         lambda_min_positive = lambda_min_positive.min(curvature);
         // Self-vanishing Levenberg–Marquardt damping on the range-space
-        // curvature. `μ ≥ 0` and `curvature > cutoff > 0`, so the denominator
-        // stays strictly positive and the descent property
+        // curvature, applied only when the Hessian is genuinely rank-deficient
+        // (`effective_mu` is `0.0` on a full-rank identified model — see the
+        // `spectral_nullity` gate above). `μ ≥ 0` and `curvature > cutoff > 0`,
+        // so the denominator stays strictly positive and the descent property
         // (∇L − Sβ)·δ = Σ_k (u_kᵀ rhs)²/(|λ_k| + μ) > 0 is preserved.
-        let damped_curvature = curvature + levenberg_mu.max(0.0);
+        let damped_curvature = curvature + effective_mu;
         let scale = component / damped_curvature;
         for i in 0..p {
             delta[i] += scale * u_k[i];
@@ -12807,6 +12828,36 @@ fn solve_joint_newton_step_on_spectral_range(
         reflected_negative_modes,
         most_negative_eigenvalue: most_negative,
     })
+}
+
+/// Numerical nullity of a symmetric penalized Hessian at the shared
+/// `KKT_REFUSAL_RANK_TOL` relative cutoff (the same threshold the spectral
+/// range solve and the REML penalty-rank machinery use). Returns `None` only
+/// when the eigendecomposition fails or the matrix is the zero matrix (no
+/// finite curvature scale to normalize against); callers treat a `None` as
+/// "could not certify full rank" and fall back to the conservative (damped)
+/// path.
+///
+/// This exists so the CONSTRAINED active-set QP branch can decide whether the
+/// joint design is genuinely rank-deficient (`nullity > 0` ⇒ an unidentified
+/// gauge direction that needs the self-vanishing Levenberg floor to make the
+/// QP minimizer unique) or fully identified (`nullity == 0` ⇒ the exact,
+/// undamped Newton/KKT step is well-posed and converges quadratically). The
+/// spectral-range branch already gets this for free via
+/// `JointSpectralNewtonStep::nullity`; the constrained branch never runs the
+/// eigensolve otherwise, so it computes it here on the already-penalized `lhs`.
+fn symmetric_penalized_hessian_nullity(lhs: &Array2<f64>) -> Option<usize> {
+    let p = lhs.nrows();
+    if p == 0 || lhs.ncols() != p {
+        return Some(0);
+    }
+    let (evals, _) = FaerEigh::eigh(lhs, Side::Lower).ok()?;
+    let max_abs = evals.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max);
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+    Some(evals.iter().filter(|x| x.abs() < cutoff).count())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14321,9 +14372,40 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // time-warp IS identified and H_pen is non-singular) are
                     // unchanged — a genuinely flexible survival-LS fit still
                     // performs its full search.
+                    //
+                    // CRITICAL: the floor is only correct on a genuinely
+                    // rank-deficient `H_pen`. Gate it strictly on
+                    // `nullity > 0`. On a FULLY IDENTIFIED constrained fit
+                    // (e.g. the post-reduction constant-scale loglogistic AFT,
+                    // #736/#735/#721/#733/#734 — a 3-parameter model with
+                    // block_widths = [1,1,1] and an empty `ker(H_pen)`) the QP
+                    // minimizer is already unique, so the floor adds nothing it
+                    // is needed for but everything it costs: with residual r and
+                    // factor 1e-3 the floor is μ≈1e-3·r, and on an unpenalized
+                    // location intercept whose likelihood curvature H is small
+                    // at n=23 the damped Newton component shrinks the residual
+                    // only by the GEOMETRIC ratio H/(H+μ) per cycle instead of
+                    // quadratically. With μ≈1e-6 and a small H that ratio is far
+                    // from 1, so the threshold-block stationarity residual
+                    // plateaus at ~1e-3–1e-4 and the inner solve burns its whole
+                    // cycle budget without ever reaching `residual_tol`. The
+                    // self-vanishing μ→0 is too slow because it vanishes only as
+                    // fast as the residual it is throttling. Disabling the floor
+                    // when `nullity == 0` makes the constrained QP solve the
+                    // EXACT undamped Newton/KKT system, recovering quadratic
+                    // convergence to `residual_tol` in a handful of cycles. The
+                    // rank-deficient case (`nullity > 0`, the pre-reduction
+                    // unidentified time-warp gauge) keeps the floor and its hang
+                    // fix unchanged. `None` (eigensolve failed / zero Hessian)
+                    // falls back to the damped path conservatively.
+                    let hpen_nullity = symmetric_penalized_hessian_nullity(&lhs);
+                    let apply_constrained_floor = hpen_nullity.map(|n| n > 0).unwrap_or(true);
                     let rhs_inf = rhs_step.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
                     let constrained_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
-                    if constrained_levenberg_mu > 0.0 && constrained_levenberg_mu.is_finite() {
+                    if apply_constrained_floor
+                        && constrained_levenberg_mu > 0.0
+                        && constrained_levenberg_mu.is_finite()
+                    {
                         for d in 0..lhs.nrows() {
                             lhs[[d, d]] += constrained_levenberg_mu;
                         }
