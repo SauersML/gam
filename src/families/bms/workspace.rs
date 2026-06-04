@@ -401,12 +401,10 @@ impl BernoulliMarginalSlopeFamily {
 
         // ℓ_ijk = u3·η_iη_jη_k + u2·(η_ijη_k + η_ikη_j + η_jkη_i) + u1·η_ijk.
         let t_mmm = u3 * eta_m * eta_m * eta_m + u2 * 3.0 * eta_m * a_mm + u1 * a_mmm;
-        let t_mmg = u3 * eta_m * eta_m * eta_g
-            + u2 * (eta_g * a_mm + 2.0 * eta_m * a_mg)
-            + u1 * a_mmg;
-        let t_mgg = u3 * eta_m * eta_g * eta_g
-            + u2 * (eta_m * a_gg + 2.0 * eta_g * a_mg)
-            + u1 * a_mgg;
+        let t_mmg =
+            u3 * eta_m * eta_m * eta_g + u2 * (eta_g * a_mm + 2.0 * eta_m * a_mg) + u1 * a_mmg;
+        let t_mgg =
+            u3 * eta_m * eta_g * eta_g + u2 * (eta_m * a_gg + 2.0 * eta_g * a_mg) + u1 * a_mgg;
         let t_ggg = u3 * eta_g * eta_g * eta_g + u2 * 3.0 * eta_g * a_gg + u1 * a_ggg;
         Ok(third_full_from_symmetric_components(
             t_mmm, t_mmg, t_mgg, t_ggg,
@@ -555,8 +553,10 @@ impl BernoulliMarginalSlopeFamily {
 
         // ℓ_ijkl via Faà di Bruno: u4·(4 η's) + u3·(η_ij + 2 singles, 6 terms)
         // + u2·(3 pair-pair + 4 triple-single) + u1·η_ijkl.
-        let t_mmmm =
-            u4 * em * em * em * em + u3 * 6.0 * a_mm * em * em + u2 * (3.0 * a_mm * a_mm + 4.0 * a_mmm * em) + u1 * a_mmmm;
+        let t_mmmm = u4 * em * em * em * em
+            + u3 * 6.0 * a_mm * em * em
+            + u2 * (3.0 * a_mm * a_mm + 4.0 * a_mmm * em)
+            + u1 * a_mmmm;
         let t_mmmg = u4 * em * em * em * eg
             + u3 * (3.0 * a_mm * em * eg + 3.0 * a_mg * em * em)
             + u2 * (3.0 * a_mm * a_mg + a_mmm * eg + 3.0 * a_mmg * em)
@@ -569,8 +569,10 @@ impl BernoulliMarginalSlopeFamily {
             + u3 * (3.0 * a_mg * eg * eg + 3.0 * a_gg * em * eg)
             + u2 * (3.0 * a_mg * a_gg + 3.0 * a_mgg * eg + a_ggg * em)
             + u1 * a_mggg;
-        let t_gggg =
-            u4 * eg * eg * eg * eg + u3 * 6.0 * a_gg * eg * eg + u2 * (3.0 * a_gg * a_gg + 4.0 * a_ggg * eg) + u1 * a_gggg;
+        let t_gggg = u4 * eg * eg * eg * eg
+            + u3 * 6.0 * a_gg * eg * eg
+            + u2 * (3.0 * a_gg * a_gg + 4.0 * a_ggg * eg)
+            + u1 * a_gggg;
         Ok(fourth_full_from_symmetric_components(
             t_mmmm, t_mmmg, t_mmgg, t_mggg, t_gggg,
         ))
@@ -1022,6 +1024,12 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         required_degree: usize,
     ) -> Result<Option<&'a RowCellMomentsBundle>, String> {
+        if let Some(bundle) = cache.row_cell_moments.as_ref()
+            && bundle.max_degree >= required_degree
+            && bundle.covers_all_rows()
+        {
+            return Ok(Some(bundle));
+        }
         let slot = match required_degree {
             15 => &cache.row_cell_moments_d15,
             21 => &cache.row_cell_moments_d21,
@@ -1031,6 +1039,22 @@ impl BernoulliMarginalSlopeFamily {
         // the closure returns that same type (it IS T).  The outer `?` then
         // unwraps the stored Result on every access.
         let stored = slot.get_or_compute(|| {
+            if required_degree == 21 {
+                if let Some(stored_d15) = cache.row_cell_moments_d15.get() {
+                    match stored_d15 {
+                        Ok(Some(d15)) if d15.covers_all_rows() => {
+                            return self.extend_row_cell_moments_bundle(d15, required_degree);
+                        }
+                        Err(err) => return Err(err.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(base) = cache.row_cell_moments.as_ref()
+                && base.covers_all_rows()
+            {
+                return self.extend_row_cell_moments_bundle(base, required_degree);
+            }
             // No subsample mask for the outer-derivative trace bundles: they
             // must cover all rows so that every row lookup succeeds.
             self.build_row_cell_moments_bundle(
@@ -1041,6 +1065,45 @@ impl BernoulliMarginalSlopeFamily {
             )
         });
         Ok(stored.as_ref().map_err(|e| e.clone())?.as_ref())
+    }
+
+    fn existing_bundle_for_degree<'a>(
+        &self,
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        required_degree: usize,
+    ) -> Result<Option<&'a RowCellMomentsBundle>, String> {
+        if let Some(bundle) = cache.row_cell_moments.as_ref()
+            && bundle.max_degree >= required_degree
+            && bundle.covers_all_rows()
+        {
+            return Ok(Some(bundle));
+        }
+        let stored = match required_degree {
+            15 => cache.row_cell_moments_d15.get(),
+            21 => cache.row_cell_moments_d21.get(),
+            _ => None,
+        };
+        match stored {
+            Some(Ok(Some(bundle))) => Ok(Some(bundle)),
+            Some(Ok(None)) | None => Ok(None),
+            Some(Err(err)) => Err(err.clone()),
+        }
+    }
+
+    fn row_cell_moments_for_third_degree15<'a>(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Result<Option<&'a [CachedDenestedCellMoments]>, String> {
+        if let Some(bundle) = self.existing_bundle_for_degree(cache, 21)?
+            && let Some(cells) = bundle.row(row, 15)
+        {
+            return Ok(Some(cells));
+        }
+        Ok(self
+            .bundle_for_degree(block_states, cache, 15)?
+            .and_then(|bundle| bundle.row(row, 15)))
     }
 
     /// Per-row uncontracted third-derivative tensor in the rigid path.
@@ -3224,14 +3287,20 @@ impl BernoulliMarginalSlopeFamily {
                 let moments = cells
                     .into_iter()
                     .map(|partition_cell| {
-                        // Use the per-family LRU here too so the bundle build
-                        // benefits from cross-row cell-moment reuse and keeps
-                        // the LRU's hit-rate accounting consistent.
-                        self.evaluate_cell_derivative_moments_lru(partition_cell.cell, max_degree)
-                            .map(|state| CachedDenestedCellMoments {
-                                partition_cell,
-                                state,
-                            })
+                        // Bundle rows are already the reusable state for this
+                        // beta snapshot. Under linkwiggle the bit-exact
+                        // cross-row LRU key is row-specific, so probing the
+                        // fit-lifetime LRU here just adds lock/eviction churn
+                        // without reuse. Evaluate directly and let the bundle
+                        // carry the reusable moments.
+                        exact_kernel::evaluate_cell_derivative_moments_uncached(
+                            partition_cell.cell,
+                            max_degree,
+                        )
+                        .map(|state| CachedDenestedCellMoments {
+                            partition_cell,
+                            state,
+                        })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
                 Ok((row, moments))
@@ -3384,7 +3453,101 @@ impl BernoulliMarginalSlopeFamily {
             );
         }
         drop(heartbeat_guard);
-        Ok(Some(RowCellMomentsBundle { max_degree, rows }))
+        Ok(Some(RowCellMomentsBundle {
+            max_degree,
+            selected_rows: selected_n,
+            rows,
+        }))
+    }
+
+    fn extend_row_cell_moments_bundle(
+        &self,
+        base: &RowCellMomentsBundle,
+        required_degree: usize,
+    ) -> Result<Option<RowCellMomentsBundle>, String> {
+        if base.max_degree >= required_degree {
+            return Ok(Some(base.clone()));
+        }
+        if !base.covers_all_rows() {
+            return Ok(None);
+        }
+        let n = self.y.len();
+        if base.rows.len() != n {
+            return Err(format!(
+                "BMS row-cell-moments upgrade row-count mismatch: bundle rows={} expected={n}",
+                base.rows.len()
+            ));
+        }
+        let n_cells = base
+            .rows
+            .iter()
+            .map(|row| row.as_ref().map_or(0, Vec::len))
+            .sum::<usize>();
+        let estimated_bytes =
+            RowCellMomentsBundle::estimated_resident_bytes(n, n_cells, required_degree);
+        let limit_bytes = self.policy.max_operator_cache_bytes;
+        if estimated_bytes > limit_bytes {
+            log::info!(
+                "[BMS row-cell-moments] skip upgrade n={} selected_rows={} cells={} from_degree={} degree={} estimated_bytes={} limit_bytes={}",
+                n,
+                base.selected_rows,
+                n_cells,
+                base.max_degree,
+                required_degree,
+                estimated_bytes,
+                limit_bytes
+            );
+            return Ok(None);
+        }
+
+        let started = std::time::Instant::now();
+        let heartbeat_guard = crate::heartbeat::scope(format!(
+            "BMS row-cell-moments upgrade n={n} degree={}->{required_degree}",
+            base.max_degree
+        ));
+        let rows = base
+            .rows
+            .par_iter()
+            .map(|row| {
+                row.as_ref()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| {
+                                exact_kernel::evaluate_cell_derivative_moments_uncached(
+                                    entry.partition_cell.cell,
+                                    required_degree,
+                                )
+                                .map(|state| {
+                                    CachedDenestedCellMoments {
+                                        partition_cell: entry.partition_cell,
+                                        state,
+                                    }
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if log_exact_work(n) {
+            log::info!(
+                "[BMS row-cell-moments] upgraded n={} selected_rows={} cells={} from_degree={} degree={} estimated_bytes={} elapsed={:.3}s",
+                n,
+                base.selected_rows,
+                n_cells,
+                base.max_degree,
+                required_degree,
+                estimated_bytes,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        drop(heartbeat_guard);
+        Ok(Some(RowCellMomentsBundle {
+            max_degree: required_degree,
+            selected_rows: base.selected_rows,
+            rows,
+        }))
     }
 
     /// BMS-FLEX GPU milestone 1: pack the row-primary Hessian inputs for the
@@ -5316,6 +5479,9 @@ impl BernoulliMarginalSlopeFamily {
     /// cell-walk path unchanged. Backs the gam#683 fast path.
     #[inline]
     fn single_primary_axis(dir: &Array1<f64>, primary: &PrimarySlices) -> Option<(usize, f64)> {
+        if dir.len() != primary.total {
+            return None;
+        }
         let mut found: Option<(usize, f64)> = None;
         for (idx, &value) in dir.iter().enumerate() {
             if value == 0.0 {
@@ -5378,20 +5544,6 @@ impl BernoulliMarginalSlopeFamily {
             let mut e_g = Array1::<f64>::zeros(r);
             e_g[cache.primary.logslope] = 1.0;
             let row_ctx = Self::row_ctx(cache, row);
-            let t3_q = self.row_primary_third_contracted_recompute_with_moments(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_q,
-            )?;
-            let t3_g = self.row_primary_third_contracted_recompute_with_moments(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_g,
-            )?;
             let t4_qq = self.row_primary_fourth_contracted_recompute_ordered(
                 row,
                 block_states,
@@ -5426,6 +5578,20 @@ impl BernoulliMarginalSlopeFamily {
             )?;
             let mut t4_qg = t4_qg_ordered;
             t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
+            let t3_q = self.row_primary_third_contracted_recompute_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_q,
+            )?;
+            let t3_g = self.row_primary_third_contracted_recompute_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_g,
+            )?;
             Ok(FlexAxisRowTensors {
                 third: [t3_q, t3_g],
                 fourth: [[t4_qq, t4_qg.clone()], [t4_qg, t4_gg]],
@@ -5540,24 +5706,17 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv = Array2::<f64>::zeros((r, r));
         let mut f_uv_dir = Array2::<f64>::zeros((r, r));
 
-        let cached_d21 = self
-            .bundle_for_degree(block_states, cache, 21)?
-            .and_then(|bundle| bundle.row(row, 15));
-        let cached_d15 = if cached_d21.is_some() {
-            None
-        } else {
-            self.bundle_for_degree(block_states, cache, 15)?
-                .and_then(|bundle| bundle.row(row, 15))
-        };
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = cached_d21.or(cached_d15) {
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
+            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
+        {
             cached
         } else {
             let partitions = self.denested_partition_cells(a, b, beta_h, beta_w)?;
             owned_cells = partitions
                 .into_iter()
                 .map(|partition_cell| {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
+                    exact_kernel::evaluate_cell_derivative_moments_uncached(partition_cell.cell, 15)
                         .map(|state| CachedDenestedCellMoments {
                             partition_cell,
                             state,
@@ -6285,9 +6444,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv = Array2::<f64>::zeros((r, r));
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
-            .bundle_for_degree(block_states, cache, 15)?
-            .and_then(|bundle| bundle.row(row, 15))
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
+            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
         {
             cached
         } else {
@@ -6295,7 +6453,7 @@ impl BernoulliMarginalSlopeFamily {
             owned_cells = partitions
                 .into_iter()
                 .map(|partition_cell| {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
+                    exact_kernel::evaluate_cell_derivative_moments_uncached(partition_cell.cell, 15)
                         .map(|state| CachedDenestedCellMoments {
                             partition_cell,
                             state,
@@ -6974,7 +7132,6 @@ impl BernoulliMarginalSlopeFamily {
     /// accumulators. The two call sites previously inlined byte-identical
     /// copies differing only in the diagnostic `score_label` / `link_label`
     /// strings threaded into the deviation-basis iterators.
-    #[allow(clippy::too_many_arguments)]
     fn accumulate_primary_third_cell_moments(
         cells: &[CachedDenestedCellMoments],
         a: f64,
@@ -7337,9 +7494,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = vec![0.0; n_dirs * r * r];
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
-            .bundle_for_degree(block_states, cache, 15)?
-            .and_then(|bundle| bundle.row(row, 15))
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
+            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
         {
             cached
         } else {
@@ -7347,7 +7503,7 @@ impl BernoulliMarginalSlopeFamily {
             owned_cells = partitions
                 .into_iter()
                 .map(|partition_cell| {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
+                    exact_kernel::evaluate_cell_derivative_moments_uncached(partition_cell.cell, 15)
                         .map(|state| CachedDenestedCellMoments {
                             partition_cell,
                             state,
@@ -7707,11 +7863,12 @@ impl BernoulliMarginalSlopeFamily {
             owned_cells = partitions
                 .into_iter()
                 .map(|partition_cell| {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 21)
-                        .map(|state| CachedDenestedCellMoments {
+                    exact::evaluate_cell_derivative_moments_uncached(partition_cell.cell, 21).map(
+                        |state| CachedDenestedCellMoments {
                             partition_cell,
                             state,
-                        })
+                        },
+                    )
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             &owned_cells
@@ -9518,8 +9675,7 @@ impl BernoulliMarginalSlopeFamily {
                             let marginal_eta = block_states[0].eta[row];
                             let marginal = self.marginal_link_map(marginal_eta)?;
                             let g = block_states[1].eta[row];
-                            let (_, _, h) =
-                                self.rigid_row_kernel_eval(row, marginal, g)?;
+                            let (_, _, h) = self.rigid_row_kernel_eval(row, marginal, g)?;
                             let v_q = self
                                 .marginal_design
                                 .dot_row_view(row, direction.slice(s![slices.marginal.clone()]));
@@ -9740,8 +9896,7 @@ impl BernoulliMarginalSlopeFamily {
                             let marginal_eta = block_states[0].eta[row];
                             let marginal = self.marginal_link_map(marginal_eta)?;
                             let g = block_states[1].eta[row];
-                            let (_, _, h) =
-                                self.rigid_row_kernel_eval(row, marginal, g)?;
+                            let (_, _, h) = self.rigid_row_kernel_eval(row, marginal, g)?;
                             {
                                 let mut m = chunk_diag.slice_mut(s![slices.marginal.clone()]);
                                 self.marginal_design
@@ -10860,13 +11015,7 @@ impl BernoulliMarginalSlopeFamily {
                         let dg = self
                             .logslope_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                        let t = self.rigid_row_third_contracted(
-                            row,
-                            marginal,
-                            g,
-                            dq,
-                            dg,
-                        )?;
+                        let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
                         acc.add_pullback_rigid_2x2(self, row, &t, w);
                         Ok(acc)
                     },
@@ -10950,13 +11099,7 @@ impl BernoulliMarginalSlopeFamily {
                         let dg = self
                             .logslope_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                        let t = self.rigid_row_third_contracted(
-                            row,
-                            marginal,
-                            g,
-                            dq,
-                            dg,
-                        )?;
+                        let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
                         acc.add_pullback_rigid_2x2(self, row, &t, w);
                         Ok(acc)
                     },
@@ -11138,13 +11281,7 @@ impl BernoulliMarginalSlopeFamily {
                         let dg = self
                             .logslope_design
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                        let t = self.rigid_row_third_contracted(
-                            row,
-                            marginal,
-                            g,
-                            dq,
-                            dg,
-                        )?;
+                        let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
                         accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
                     }
                     bump_progress(&progress);
@@ -11167,13 +11304,7 @@ impl BernoulliMarginalSlopeFamily {
                             let dg = self
                                 .logslope_design
                                 .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
-                            let t = self.rigid_row_third_contracted(
-                                row,
-                                marginal,
-                                g,
-                                dq,
-                                dg,
-                            )?;
+                            let t = self.rigid_row_third_contracted(row, marginal, g, dq, dg)?;
                             accs[idx].add_pullback_rigid_2x2(self, row, &t, w);
                         }
                         bump_progress(&progress);
@@ -11864,8 +11995,7 @@ impl BernoulliMarginalSlopeFamily {
                         let marginal_eta = block_states[0].eta[row];
                         let marginal = self.marginal_link_map(marginal_eta)?;
                         let g = block_states[1].eta[row];
-                        let (neglog, grad, h) =
-                            self.rigid_row_kernel_eval(row, marginal, g)?;
+                        let (neglog, grad, h) = self.rigid_row_kernel_eval(row, marginal, g)?;
                         ll -= neglog;
                         gm_w[local_row] =
                             Self::exact_newton_score_component_from_objective_gradient(grad[0]);
@@ -13471,9 +13601,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut f_uv_dir = vec![0.0; n_dirs * r * r];
 
         let owned_cells;
-        let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
-            .bundle_for_degree(block_states, cache, 15)?
-            .and_then(|bundle| bundle.row(row, 15))
+        let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
+            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
         {
             cached
         } else {
@@ -13481,7 +13610,7 @@ impl BernoulliMarginalSlopeFamily {
             owned_cells = partitions
                 .into_iter()
                 .map(|partition_cell| {
-                    self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 15)
+                    exact_kernel::evaluate_cell_derivative_moments_uncached(partition_cell.cell, 15)
                         .map(|state| CachedDenestedCellMoments {
                             partition_cell,
                             state,

@@ -6434,13 +6434,25 @@ mod tests {
         let third = |row: usize, m: f64, g: f64| {
             let marginal = family.marginal_link_map(m).expect("link map");
             family
-                .empirical_rigid_third_full_closed_form(row, marginal, g, &grid.nodes, &grid.weights)
+                .empirical_rigid_third_full_closed_form(
+                    row,
+                    marginal,
+                    g,
+                    &grid.nodes,
+                    &grid.weights,
+                )
                 .expect("third closed form")
         };
         let fourth = |row: usize, m: f64, g: f64| {
             let marginal = family.marginal_link_map(m).expect("link map");
             family
-                .empirical_rigid_fourth_full_closed_form(row, marginal, g, &grid.nodes, &grid.weights)
+                .empirical_rigid_fourth_full_closed_form(
+                    row,
+                    marginal,
+                    g,
+                    &grid.nodes,
+                    &grid.weights,
+                )
                 .expect("fourth closed form")
         };
         let h = 1e-4;
@@ -7574,6 +7586,62 @@ mod tests {
             max_rel_fourth <= 1e-9,
             "fourth axis-cache vs slow recompute drift too large: {max_rel_fourth:.3e}"
         );
+    }
+
+    #[test]
+    fn bernoulli_row_cell_moment_upgrade_reuses_base_partitions_without_lru() {
+        let (family, states) = make_flex_hvp_cache_test_family(12);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("flex exact eval cache");
+        let base = cache
+            .row_cell_moments
+            .as_ref()
+            .expect("degree-9 base row-cell bundle");
+        assert_eq!(base.max_degree, 9);
+        assert!(base.covers_all_rows());
+        assert_eq!(base.selected_rows, family.y.len());
+
+        let stats_before = family.cell_moment_cache_stats.snapshot();
+        let d15 = family
+            .bundle_for_degree(&states, &cache, 15)
+            .expect("degree-15 bundle result")
+            .expect("degree-15 bundle");
+        let stats_after_d15 = family.cell_moment_cache_stats.snapshot();
+        assert_eq!(
+            stats_before, stats_after_d15,
+            "high-degree bundle upgrade must not probe the row-unique fit-lifetime LRU"
+        );
+        assert_eq!(d15.max_degree, 15);
+        assert!(d15.covers_all_rows());
+        assert_eq!(d15.selected_rows, base.selected_rows);
+
+        for row in 0..family.y.len() {
+            let base_row = base.row(row, 9).expect("base row moments");
+            let high_row = d15.row(row, 15).expect("degree-15 row moments");
+            assert_eq!(base_row.len(), high_row.len());
+            for (base_cell, high_cell) in base_row.iter().zip(high_row.iter()) {
+                assert_eq!(base_cell.partition_cell, high_cell.partition_cell);
+                assert_eq!(high_cell.state.moments.len(), 16);
+                for k in 0..=9 {
+                    let denom = base_cell.state.moments[k].abs().max(1.0);
+                    let rel =
+                        (base_cell.state.moments[k] - high_cell.state.moments[k]).abs() / denom;
+                    assert!(
+                        rel <= 1e-12,
+                        "prefix moment drift row={row} k={k} rel={rel:e}"
+                    );
+                }
+            }
+        }
+
+        let d21 = family
+            .bundle_for_degree(&states, &cache, 21)
+            .expect("degree-21 bundle result")
+            .expect("degree-21 bundle");
+        assert_eq!(family.cell_moment_cache_stats.snapshot(), stats_after_d15);
+        assert_eq!(d21.max_degree, 21);
+        assert!(d21.covers_all_rows());
     }
 
     #[test]

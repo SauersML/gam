@@ -724,6 +724,7 @@ pub(super) struct CachedDenestedCellMoments {
 #[derive(Clone)]
 pub(super) struct RowCellMomentsBundle {
     pub(super) max_degree: usize,
+    pub(super) selected_rows: usize,
     pub(super) rows: Vec<Option<Vec<CachedDenestedCellMoments>>>,
 }
 
@@ -746,6 +747,11 @@ impl RowCellMomentsBundle {
             .get(row)
             .and_then(Option::as_ref)
             .map(Vec::as_slice)
+    }
+
+    #[inline]
+    pub(super) fn covers_all_rows(&self) -> bool {
+        self.rows.iter().all(Option::is_some)
     }
 
     pub(super) fn estimated_resident_bytes(
