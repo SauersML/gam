@@ -1978,34 +1978,16 @@ pub fn build_smooth_basis(
                     // `power=0` is handled above and is honored as the s=0 Duchon
                     // kernel (r²·log r ≡ the thin-plate kernel in even d) — the magic
                     // default lives here, not in the basis builder.
-                    let (default_order, default_power) =
-                        crate::basis::duchon_cubic_default(cols.len());
-                    // The cubic structural default is a *scale-free* (fractional-`s`)
-                    // kernel. The hybrid Duchon-Matern path (`length_scale=Some`) is
-                    // integer-only: a fractional `s` would be silently truncated to
-                    // `s=0` downstream (`power_as_usize`), collapsing the spectral
-                    // smoothness to `2(p+0)` and producing a kernel that is not finite
-                    // at the origin whenever `2p ≤ d` (e.g. p=2, d=4), which poisons
-                    // the constraint-projection Gram with non-finite entries and
-                    // crashes the self-adjoint eigendecomposition during basis
-                    // generation. No integer `s` reproduces the cubic exactly in even
-                    // `d` at the affine null space, so we cannot magic a substitute;
-                    // reject up front with the same actionable message as the explicit
-                    // fractional+hybrid case rather than failing cryptically at fit
-                    // time. (Mirrors the `Explicit` branch above.)
-                    if length_scale.is_some() && default_power.fract() != 0.0 {
-                        return Err(TermBuilderError::incompatible_config(format!(
-                            "hybrid Duchon-Matern smooth '{}' (length_scale=...) requires an integer power, \
-                             but the structural cubic default resolves to power={} (= (d-1)/2 in {}D); \
-                             pass an explicit integer power (e.g. power=2) for the hybrid kernel, \
-                             or drop length_scale to use the scale-free structural cubic kernel.",
-                            vars.join(", "),
-                            default_power,
-                            cols.len(),
-                        ))
-                        .to_string());
-                    }
-                    (default_order, default_power)
+                    //
+                    // For the hybrid Matérn-blended kernel (`length_scale=Some`) this
+                    // fractional cubic `s` is truncated to an integer by the basis
+                    // builder (`power_as_usize`); the well-posedness gate
+                    // `validate_duchon_kernel_orders` runs on that realized integer
+                    // and rejects the non-finite-at-origin case (e.g. d≥4 with the
+                    // truncated s=0) with a clear message at fit time. 1D/2D hybrid
+                    // defaults stay finite and build, so no request-layer rejection
+                    // is needed here.
+                    crate::basis::duchon_cubic_default(cols.len())
                 }
             };
             let plan = plan_spatial_basis(
