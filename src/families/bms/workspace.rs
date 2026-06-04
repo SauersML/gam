@@ -10440,7 +10440,12 @@ impl BernoulliMarginalSlopeFamily {
         // duplicate full-`n` degree-21 builds on first touch.
         let prewarmed_bundle = self.bundle_for_degree(block_states, cache, 21)?;
         if let Some(bundle) = prewarmed_bundle {
-            debug_assert!(bundle.max_degree >= 21);
+            if bundle.max_degree < 21 {
+                return Err(format!(
+                    "BMS row-cell-moments prewarm returned degree {} for required degree 21",
+                    bundle.max_degree
+                ));
+            }
         }
 
         // Block-local accumulator path for second-order psi terms
