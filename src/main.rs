@@ -2177,8 +2177,11 @@ fn run_fitwith_predict_noise(
     let mean_offset = resolve_offset_column(ds, col_map, args.offset_column.as_deref())?;
     let noise_offset = resolve_offset_column(ds, col_map, args.noise_offset_column.as_deref())?;
     if family == LikelihoodSpec::gaussian_identity() {
-        let response_scale = sample_std(y.view()).max(1e-6);
-        let y_scaled = y.mapv(|v| v / response_scale);
+        // Response standardization (and the inverse remap back to raw units) now
+        // lives in the single Gaussian location-scale model entry point
+        // (`fit_gaussian_location_scale_model`), so the CLI hands it the RAW
+        // response and receives coefficients/covariance/summary already in raw
+        // response units — there is no CLI-side prefit or post-fit rescaling.
         let options = blockwise_options_from_fit_args()?;
         progress.set_stage("fit", "optimizing gaussian location-scale model");
         let phase_start = std::time::Instant::now();
@@ -2190,7 +2193,7 @@ fn run_fitwith_predict_noise(
             GaussianLocationScaleFitRequest {
                 data: ds.values.view(),
                 spec: GaussianLocationScaleTermSpec {
-                    y: y_scaled,
+                    y: y.clone(),
                     weights: weights.clone(),
                     meanspec: meanspec.clone(),
                     log_sigmaspec: noisespec.clone(),
@@ -2258,30 +2261,21 @@ fn run_fitwith_predict_noise(
         print_spatial_aniso_scales(&noisespec_resolved);
         if let Some(out) = args.out.as_ref() {
             progress.set_stage("fit", "writing gaussian location-scale model");
-            let mut blocks = fit.blocks.clone();
-            for block in &mut blocks {
-                let factor = gaussian_saved_fit_scale_for_role(block.role.clone(), response_scale);
-                if factor != 1.0 {
-                    block.beta.mapv_inplace(|value| value * factor);
-                }
-            }
-            let beta_covariance = fit
-                .covariance_conditional
-                .as_ref()
-                .map(|cov| scale_covariance_by_block_role(cov, &blocks, response_scale));
-            let beta_covariance_corrected = fit
-                .covariance_corrected
-                .as_ref()
-                .map(|cov| scale_covariance_by_block_role(cov, &blocks, response_scale));
+            // `fit` already carries raw-unit coefficients, covariance, and a
+            // raw-unit residual-scale summary (the standardization and its
+            // inverse remap live in `fit_gaussian_location_scale_model`), so the
+            // save path persists them verbatim and records
+            // `gaussian_response_scale = 1.0` — predict reconstructs raw σ as
+            // `0.01 + exp(Xβ)` with no further multiply, applying the response
+            // scale exactly once (inside the fit).
             let fit_result = compact_saved_multiblock_fit_result(
-                blocks,
+                fit.blocks.clone(),
                 fit.lambdas.clone(),
                 1.0,
-                beta_covariance,
-                beta_covariance_corrected,
+                fit.covariance_conditional.clone(),
+                fit.covariance_corrected.clone(),
                 fit.geometry.clone(),
-                SavedFitSummary::from_blockwise_fit(&fit)?
-                    .rescaled_gaussian_location_scale(response_scale, y.len())?,
+                SavedFitSummary::from_blockwise_fit(&fit)?,
             );
             let resolved_base_link = link_choice
                 .map(|choice| {
@@ -2289,15 +2283,11 @@ fn run_fitwith_predict_noise(
                         .map(InverseLink::Standard)
                 })
                 .transpose()?;
-            // The Gaussian save path rescales the link-wiggle knots/beta back to
-            // the original response units before persisting them.
+            // Knots/coefficients are already in raw response units.
             let wiggle = wiggle_meta.map(|(knots, degree, beta_link_wiggle)| LocationScaleWiggle {
-                knots: knots.mapv(|v| v * response_scale).to_vec(),
+                knots: knots.to_vec(),
                 degree,
-                beta_link_wiggle: beta_link_wiggle
-                    .into_iter()
-                    .map(|coef| coef * response_scale)
-                    .collect(),
+                beta_link_wiggle,
             });
             let payload = assemble_location_scale_payload(
                 LocationScaleInputs {
@@ -2313,7 +2303,7 @@ fn run_fitwith_predict_noise(
                     wiggle,
                 },
                 LocationScaleResponse::Gaussian {
-                    response_scale,
+                    response_scale: 1.0,
                     base_link: resolved_base_link,
                 },
                 SavedModelSourceMetadata {

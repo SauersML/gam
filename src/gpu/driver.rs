@@ -12,9 +12,13 @@
 //! of re-initializing the driver and creating another context.
 
 use libloading::Library;
+#[cfg(target_os = "linux")]
+use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
 use ndarray::{Array2, ArrayBase, Data, Ix2};
 use std::borrow::Cow;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use super::error::GpuError;
@@ -248,6 +252,40 @@ pub fn preload_cuda_driver() -> Result<(), String> {
         .clone()
 }
 
+#[cfg(target_os = "linux")]
+fn preload_cuda_userspace_libraries() -> Result<(), String> {
+    static PRELOAD: OnceLock<Result<(), String>> = OnceLock::new();
+    PRELOAD
+        .get_or_init(|| {
+            let paths = cuda_userspace_preload_paths();
+            if paths.is_empty() {
+                return Ok(());
+            }
+            let mut loaded = Vec::new();
+            for path in paths {
+                // SAFETY: these candidates are CUDA userspace libraries found
+                // in canonical toolkit directories or pip's nvidia-*-cu12
+                // wheel layout. RTLD_GLOBAL is required so transitive deps
+                // such as libcusolver -> libnvJitLink resolve without an
+                // LD_LIBRARY_PATH mutation.
+                match unsafe { UnixLibrary::open(Some(&path), RTLD_NOW | RTLD_GLOBAL) } {
+                    Ok(library) => loaded.push(library),
+                    Err(err) => {
+                        return Err(format!(
+                            "could not preload CUDA userspace library {}: {err}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            // Keep handles process-live; dropping them would dlclose the
+            // libraries before cudarc's own lazy SONAME loads run.
+            Box::leak(Box::new(loaded));
+            Ok(())
+        })
+        .clone()
+}
+
 /// Returns whether the platform loader can open the named CUDA compute
 /// library (`cublas`, `cusolver`, `cusparse`).
 ///
@@ -264,7 +302,30 @@ pub fn preload_cuda_driver() -> Result<(), String> {
 /// keeps the panic completely off the call path.
 #[must_use]
 pub fn cuda_compute_library_present(stem: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = preload_cuda_userspace_libraries();
+    }
     load_library_names(&cuda_compute_library_candidate_names(stem)).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn cuda_userspace_preload_paths() -> Vec<PathBuf> {
+    let system_dirs = cuda_system_library_dirs();
+    for dir in &system_dirs {
+        if let Some(stack) = complete_system_cuda_stack(dir) {
+            return dedup_paths(stack);
+        }
+        if let Some(stack) = system_cuda_stack_with_packaged_nvjitlink(dir) {
+            return dedup_paths(stack);
+        }
+    }
+    for root in nvidia_package_roots() {
+        if let Some(stack) = complete_nvidia_cuda_stack(&root) {
+            return dedup_paths(stack);
+        }
+    }
+    Vec::new()
 }
 
 fn cuda_compute_library_candidate_names(stem: &str) -> Vec<String> {
@@ -279,19 +340,183 @@ fn cuda_compute_library_candidate_names(stem: &str) -> Vec<String> {
     for major in (9..=13).rev() {
         out.push(format!("{base}.so.{major}"));
     }
-    if cfg!(target_os = "linux") {
-        for dir in [
-            "/usr/local/cuda/lib64",
-            "/usr/local/cuda/targets/x86_64-linux/lib",
-            "/usr/lib/x86_64-linux-gnu",
-            "/usr/lib64",
-            "/opt/cuda/lib64",
-        ] {
+    #[cfg(target_os = "linux")]
+    {
+        for dir in cuda_system_library_dirs() {
             out.push(format!("{dir}/{base}.so"));
             for major in (9..=13).rev() {
                 out.push(format!("{dir}/{base}.so.{major}"));
             }
             append_versioned_linux_so_candidates(&mut out, Path::new(dir), &base);
+        }
+        for root in nvidia_package_roots() {
+            let lib_dir = root.join(nvidia_component_for_stem(stem)).join("lib");
+            out.push(format!("{}/{}.so", lib_dir.display(), base));
+            for major in (9..=13).rev() {
+                out.push(format!("{}/{}.so.{major}", lib_dir.display(), base));
+            }
+            append_versioned_linux_so_candidates(&mut out, &lib_dir, &base);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn cuda_system_library_dirs() -> Vec<&'static str> {
+    vec![
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda/lib",
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib/wsl/lib",
+        "/opt/cuda/lib64",
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn complete_system_cuda_stack(dir: &str) -> Option<Vec<PathBuf>> {
+    let dir = Path::new(dir);
+    let stack = vec![
+        first_existing(dir, &["libcudart.so.12", "libcudart.so"])?,
+        first_existing(dir, &["libnvJitLink.so.12", "libnvJitLink.so"])?,
+        first_existing(dir, &["libcublasLt.so.12", "libcublasLt.so"])?,
+        first_existing(dir, &["libcublas.so.12", "libcublas.so"])?,
+        first_existing(dir, &["libcusparse.so.12", "libcusparse.so"])?,
+        first_existing(
+            dir,
+            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
+        )?,
+    ];
+    Some(stack)
+}
+
+#[cfg(target_os = "linux")]
+fn system_cuda_stack_with_packaged_nvjitlink(dir: &str) -> Option<Vec<PathBuf>> {
+    let dir = Path::new(dir);
+    let nvjitlink = packaged_nvjitlink_library()?;
+    let stack = vec![
+        first_existing(dir, &["libcudart.so.12", "libcudart.so"])?,
+        nvjitlink,
+        first_existing(dir, &["libcublasLt.so.12", "libcublasLt.so"])?,
+        first_existing(dir, &["libcublas.so.12", "libcublas.so"])?,
+        first_existing(dir, &["libcusparse.so.12", "libcusparse.so"])?,
+        first_existing(
+            dir,
+            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
+        )?,
+    ];
+    Some(stack)
+}
+
+#[cfg(target_os = "linux")]
+fn complete_nvidia_cuda_stack(root: &Path) -> Option<Vec<PathBuf>> {
+    let stack = vec![
+        first_existing(
+            &root.join("cuda_runtime").join("lib"),
+            &["libcudart.so.12", "libcudart.so"],
+        )?,
+        first_existing(
+            &root.join("nvjitlink").join("lib"),
+            &["libnvJitLink.so.12", "libnvJitLink.so"],
+        )?,
+        first_existing(
+            &root.join("cublas").join("lib"),
+            &["libcublasLt.so.12", "libcublasLt.so"],
+        )?,
+        first_existing(
+            &root.join("cublas").join("lib"),
+            &["libcublas.so.12", "libcublas.so"],
+        )?,
+        first_existing(
+            &root.join("cusparse").join("lib"),
+            &["libcusparse.so.12", "libcusparse.so"],
+        )?,
+        first_existing(
+            &root.join("cusolver").join("lib"),
+            &["libcusolver.so.12", "libcusolver.so.11", "libcusolver.so"],
+        )?,
+    ];
+    Some(stack)
+}
+
+#[cfg(target_os = "linux")]
+fn packaged_nvjitlink_library() -> Option<PathBuf> {
+    for root in nvidia_package_roots() {
+        let lib_dir = root.join("nvjitlink").join("lib");
+        if let Some(path) = first_existing(&lib_dir, &["libnvJitLink.so.12", "libnvJitLink.so"]) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn nvidia_component_for_stem(stem: &str) -> String {
+    match stem {
+        "cublas" => "cublas".to_string(),
+        "cusolver" => "cusolver".to_string(),
+        "cusparse" => "cusparse".to_string(),
+        "nvJitLink" | "nvjitlink" => "nvjitlink".to_string(),
+        "cudart" | "cuda_runtime" => "cuda_runtime".to_string(),
+        _ => stem.to_string(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn nvidia_package_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        collect_python_nvidia_roots(Path::new(&home).join(".local/lib"), &mut roots);
+    }
+    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
+        collect_python_nvidia_roots(Path::new(&venv).join("lib"), &mut roots);
+    }
+    collect_python_nvidia_roots(Path::new("/usr/local/lib").to_path_buf(), &mut roots);
+    collect_python_nvidia_roots(Path::new("/usr/lib").to_path_buf(), &mut roots);
+    dedup_paths(roots)
+}
+
+#[cfg(target_os = "linux")]
+fn collect_python_nvidia_roots(base: PathBuf, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("python") {
+            continue;
+        }
+        for site_dir in ["site-packages", "dist-packages"] {
+            let root = path.join(site_dir).join("nvidia");
+            if root.exists() {
+                out.push(root);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn first_existing(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    for name in names {
+        let path = dir.join(name);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for path in paths {
+        let canonical = path.canonicalize().unwrap_or(path);
+        if !out.iter().any(|existing| existing == &canonical) {
+            out.push(canonical);
         }
     }
     out

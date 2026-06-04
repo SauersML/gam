@@ -1389,6 +1389,11 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
             wiggle_knots: None,
             wiggle_degree: None,
             beta_link_wiggle: None,
+            // The wiggle-pilot workflow fits in standardized response units; the
+            // Gaussian model wrapper (`fit_gaussian_location_scale_model`) maps
+            // the coefficients back to raw units and overwrites this with the
+            // applied factor. `1.0` here is the identity (no standardization).
+            response_scale: 1.0,
         }
     }
 
@@ -1403,6 +1408,9 @@ impl LocationScaleWorkflowAdapter for GaussianLocationScaleWorkflow {
             wiggle_knots: Some(wiggle_knots),
             wiggle_degree: Some(wiggle_degree),
             beta_link_wiggle,
+            // See `assemble_plain`: raw-unit remapping happens in the Gaussian
+            // model wrapper, which overwrites this with the applied factor.
+            response_scale: 1.0,
         }
     }
 }
@@ -1514,10 +1522,181 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
     }
 }
 
+/// Population standard deviation of a response column.
+///
+/// Matches the CLI prefit helper exactly (divide by `n`, not `n-1`), so the
+/// standardized fit is identical whether the request arrives from the library
+/// (`materialize_location_scale`), the FFI marshaller, or the CLI.
+fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let n = v.len() as f64;
+    let mean = v.iter().copied().sum::<f64>() / n;
+    let var = v
+        .iter()
+        .copied()
+        .map(|x| {
+            let d = x - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / n.max(1.0);
+    var.max(0.0).sqrt()
+}
+
+/// Map a Gaussian location-scale fit fitted in *standardized* response units
+/// (`y / response_scale`) back to **raw** response units, in place.
+///
+/// The internal fit solves with `y_internal = y / s` where `s = response_scale`.
+/// Reconstructing raw outputs requires
+///
+///   μ_raw  = s · μ_internal           ⇒ scale every Location/Mean coefficient by `s`,
+///   σ_raw  = s · σ_internal           ⇒ since σ = 0.01 + exp(η_σ), shifting the
+///                                         log-σ **intercept** by `+ln(s)` turns
+///                                         `0.01 + exp(η)` into `0.01 + s·exp(η)`
+///                                         = s·σ_internal − 0.01·(s−1); the residual
+///                                         floor error `0.01·(s−1)` is negligible
+///                                         because σ ≫ floor in every realistic fit.
+///
+/// The link-wiggle lives on the mean (identity) channel, so its knots and
+/// coefficients scale by `s` exactly like the Location block. Doing the remap
+/// here — once, inside the single Gaussian model entry point — makes every
+/// caller (library `fit_from_formula`, the FFI marshaller, the CLI save path)
+/// observe raw-unit coefficients with **no** additional per-call rescaling,
+/// which is what keeps the σ-floor scale-relative (κ ≈ 1) without leaving the
+/// reconstruction half-applied in any one path.
+fn rescale_gaussian_location_scale_to_raw(
+    result: &mut GaussianLocationScaleFitResult,
+    response_scale: f64,
+) {
+    use crate::estimate::BlockRole;
+
+    let s = response_scale;
+    let ln_s = s.ln();
+    // Intercept columns of the log-σ (Scale) design, expressed as offsets into
+    // the Scale block's coefficient vector (the block β is laid out in noise
+    // design column order). These are the only constant directions in η_σ
+    // (smooths are sum-to-zero), so shifting them adds `ln(s)` to η_σ uniformly.
+    let scale_intercept_range = result.fit.noise_design.intercept_range.clone();
+
+    // Per-block coefficient surgery. `blocks` is authoritative for
+    // `block_by_role` (predict, the FFI payload, and the reference tests all
+    // read it), and the joint `beta` / `block_states` mirror it.
+    let mut joint_offset = 0usize;
+    for (block_idx, block) in result.fit.fit.blocks.iter_mut().enumerate() {
+        let block_len = block.beta.len();
+        match block.role {
+            BlockRole::Mean | BlockRole::Location | BlockRole::LinkWiggle => {
+                block.beta.mapv_inplace(|v| v * s);
+                if result.fit.fit.beta.len() >= joint_offset + block_len {
+                    for i in 0..block_len {
+                        result.fit.fit.beta[joint_offset + i] *= s;
+                    }
+                }
+                if let Some(state) = result.fit.fit.block_states.get_mut(block_idx) {
+                    state.beta.mapv_inplace(|v| v * s);
+                }
+            }
+            BlockRole::Scale => {
+                for col in scale_intercept_range.clone() {
+                    if col < block.beta.len() {
+                        block.beta[col] += ln_s;
+                    }
+                    let joint_col = joint_offset + col;
+                    if joint_col < result.fit.fit.beta.len() {
+                        result.fit.fit.beta[joint_col] += ln_s;
+                    }
+                    if let Some(state) = result.fit.fit.block_states.get_mut(block_idx)
+                        && col < state.beta.len()
+                    {
+                        state.beta[col] += ln_s;
+                    }
+                }
+            }
+            BlockRole::Time | BlockRole::Threshold => {
+                // Survival-only roles are never produced by the Gaussian
+                // location-scale path; leave them untouched if ever present.
+            }
+        }
+        joint_offset += block_len;
+    }
+
+    // The link-wiggle knots/coefficients live on the mean (identity) channel.
+    if let Some(knots) = result.wiggle_knots.as_mut() {
+        knots.mapv_inplace(|v| v * s);
+    }
+    if let Some(beta_w) = result.beta_link_wiggle.as_mut() {
+        for coef in beta_w.iter_mut() {
+            *coef *= s;
+        }
+    }
+
+    // Conditional/corrected covariances were computed in standardized units.
+    // Var(s·β_loc) = s²·Var(β_loc); the Scale block only had a constant added to
+    // its intercept, which does not change its (co)variance. Cross terms between
+    // a Location and the Scale block pick up one factor of `s`. This is exactly
+    // a per-coefficient diagonal scaling D·Σ·D with D = s on Location/Mean/Wiggle
+    // rows and D = 1 on Scale rows.
+    let mut row_factors: Vec<f64> = Vec::new();
+    for block in &result.fit.fit.blocks {
+        let f = match block.role {
+            BlockRole::Mean | BlockRole::Location | BlockRole::LinkWiggle => s,
+            BlockRole::Scale | BlockRole::Time | BlockRole::Threshold => 1.0,
+        };
+        row_factors.extend(std::iter::repeat_n(f, block.beta.len()));
+    }
+    let rescale_cov = |cov: &mut Array2<f64>| {
+        let m = cov.nrows().min(cov.ncols()).min(row_factors.len());
+        for i in 0..m {
+            for j in 0..m {
+                cov[[i, j]] *= row_factors[i] * row_factors[j];
+            }
+        }
+    };
+    if let Some(cov) = result.fit.fit.covariance_conditional.as_mut() {
+        rescale_cov(cov);
+    }
+    if let Some(cov) = result.fit.fit.covariance_corrected.as_mut() {
+        rescale_cov(cov);
+    }
+
+    // The residual-scale summary `standard_deviation` is a response-units
+    // quantity; the internal fit reports it in standardized units, so map it
+    // back. `max_abs_eta` is the mean-channel η magnitude (raw μ = s·μ_internal).
+    result.fit.fit.standard_deviation *= s;
+    result.fit.fit.max_abs_eta *= s;
+
+    result.response_scale = s;
+}
+
 fn fit_gaussian_location_scale_model(
-    request: GaussianLocationScaleFitRequest<'_>,
+    mut request: GaussianLocationScaleFitRequest<'_>,
 ) -> Result<GaussianLocationScaleFitResult, String> {
-    fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)
+    // Standardize the response so the fixed log-σ soft floor
+    // `LOGB_SIGMA_FLOOR = 0.01` is scale-relative (≈ 1 % of the response
+    // spread) rather than absolute. Without this the link σ = 0.01 + exp(η)
+    // gives κ = dlogσ/dη = exp(η)/(0.01+exp(η)) < 1 whenever the raw σ is small,
+    // and the scale-block Fisher information 2κ²a is strictly below gamlss's
+    // floorless 2a, systematically over-smoothing the log-σ envelope
+    // (#686 #688 #684 #685 #687). Fitting on y/s restores κ ≈ 1.
+    let response_scale = gaussian_response_sample_std(request.spec.y.view()).max(1e-6);
+    if response_scale != 1.0 {
+        request.spec.y.mapv_inplace(|v| v / response_scale);
+        // The mean (identity-link) offset rides in the same units as y; the
+        // log-σ offset is on the log-scale axis and is unaffected by the
+        // multiplicative response rescale.
+        request
+            .spec
+            .mean_offset
+            .mapv_inplace(|v| v / response_scale);
+    }
+
+    let mut result =
+        fit_location_scale_with_optional_wiggle::<GaussianLocationScaleWorkflow>(request)?;
+
+    rescale_gaussian_location_scale_to_raw(&mut result, response_scale);
+    Ok(result)
 }
 
 fn fit_binomial_location_scale_model(

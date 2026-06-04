@@ -7096,11 +7096,14 @@ fn lift_conditional_covariance(
     // `*_fixed_cols + reduced == full`; this is the matching guard for the one
     // time block whose map is a dense matrix rather than a fixed-column offset.
     if p_time_reduced > p_time_full {
-        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
-            "survival location-scale covariance lift time map is wider than tall: \
+        return Err(SurvivalLocationScaleError::DimensionMismatch {
+            reason: format!(
+                "survival location-scale covariance lift time map is wider than tall: \
              active(reduced)={p_time_reduced} exceeds raw(full)={p_time_full}; \
              the time identifiability transform `z` must map reduced→raw"
-        ) }.into());
+            ),
+        }
+        .into());
     }
 
     let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle;
