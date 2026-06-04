@@ -144,6 +144,7 @@ impl BernoulliMarginalSlopeFamily {
         Ok(root)
     }
 
+    #[cfg(test)]
     pub(super) fn empirical_rigid_calibration_jets(
         &self,
         intercept: &MultiDirJet,
@@ -229,6 +230,14 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
+    /// Forward-mode-AD reference for the rigid empirical-grid kernel. Retained
+    /// **solely as the exact validation oracle** for the implicit-function-theorem
+    /// closed forms (`empirical_rigid_primary_grad_hess_closed_form`,
+    /// `empirical_rigid_third_full_closed_form`,
+    /// `empirical_rigid_fourth_full_closed_form`), which fully replaced it on the
+    /// production paths (`rigid_row_kernel_eval`, `rigid_row_third_full`,
+    /// `rigid_row_fourth_full`). No production caller remains.
+    #[cfg(test)]
     pub(super) fn empirical_rigid_neglog_jet(
         &self,
         row: usize,
