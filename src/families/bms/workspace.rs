@@ -5,8 +5,6 @@ use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
 
-static ROW_CELL_MOMENTS_BUNDLE_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Fill one deviation-basis column of the *score-warp* coefficient jet.
 ///
 /// Shared body of the many `for_each_deviation_basis_cubic_at` visitor
@@ -1012,15 +1010,11 @@ impl BernoulliMarginalSlopeFamily {
     /// Return the lazily-built row-cell-moments bundle at `required_degree`
     /// (15 or 21) for outer dH/d²H trace paths.
     ///
-    /// On the first call the full-`n` bundle is built at `required_degree` and
-    /// stored in the appropriate `RayonSafeOnce` slot.  Because
-    /// `RayonSafeOnce` computes outside its internal lock, the build closure
-    /// takes a separate bundle-build mutex and rechecks the slot before doing
-    /// work; concurrent Rayon row workers then wait for the first builder and
-    /// clone its stored result instead of thundering-herding the same
-    /// degree-21 upgrade. If the FLEX path is inactive or the memory budget is
-    /// exceeded the slot stores `Ok(None)` and callers use their per-row
-    /// on-demand path.
+    /// This is an explicit prewarm/build helper: callers invoke it from serial
+    /// setup code before parallel row folds that would benefit from a full-row
+    /// high-degree bundle. Row-local kernels only read already-built bundles via
+    /// `existing_bundle_for_degree`; they never trigger this full-`n` build from
+    /// inside a Rayon worker.
     ///
     /// Returns `Ok(None)` for any `required_degree` outside {15, 21}; callers
     /// handle that the same way as a missing bundle.
@@ -1045,12 +1039,6 @@ impl BernoulliMarginalSlopeFamily {
         // the closure returns that same type (it IS T).  The outer `?` then
         // unwraps the stored Result on every access.
         let stored = slot.get_or_compute(|| {
-            let _build_guard = ROW_CELL_MOMENTS_BUNDLE_BUILD_LOCK
-                .lock()
-                .map_err(|_| "BMS row-cell-moments bundle build lock poisoned".to_string())?;
-            if let Some(stored) = slot.get() {
-                return stored.clone();
-            }
             if required_degree == 21 {
                 if let Some(stored_d15) = cache.row_cell_moments_d15.get() {
                     match stored_d15 {
@@ -1104,7 +1092,6 @@ impl BernoulliMarginalSlopeFamily {
 
     fn row_cell_moments_for_third_degree15<'a>(
         &self,
-        block_states: &[ParameterBlockState],
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Result<Option<&'a [CachedDenestedCellMoments]>, String> {
@@ -1114,7 +1101,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(Some(cells));
         }
         Ok(self
-            .bundle_for_degree(block_states, cache, 15)?
+            .existing_bundle_for_degree(cache, 15)?
             .and_then(|bundle| bundle.row(row, 15)))
     }
 
@@ -5720,7 +5707,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
+            self.row_cell_moments_for_third_degree15(cache, row)?
         {
             cached
         } else {
@@ -6457,7 +6444,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
+            self.row_cell_moments_for_third_degree15(cache, row)?
         {
             cached
         } else {
@@ -7507,7 +7494,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
+            self.row_cell_moments_for_third_degree15(cache, row)?
         {
             cached
         } else {
@@ -7866,7 +7853,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) = self
-            .bundle_for_degree(block_states, cache, 21)?
+            .existing_bundle_for_degree(cache, 21)?
             .and_then(|bundle| bundle.row(row, 21))
         {
             cached
@@ -10443,6 +10430,11 @@ impl BernoulliMarginalSlopeFamily {
         } else {
             None
         };
+
+        // Prewarm the high-degree full-row bundle from serial setup code. Row
+        // kernels only read existing bundles, so parallel workers never launch
+        // duplicate full-`n` degree-21 builds on first touch.
+        let _ = self.bundle_for_degree(block_states, cache, 21)?;
 
         // Block-local accumulator path for second-order psi terms
         let weighted_rows = outer_weighted_rows(options, n);
@@ -13614,7 +13606,7 @@ impl BernoulliMarginalSlopeFamily {
 
         let owned_cells;
         let cells: &[CachedDenestedCellMoments] = if let Some(cached) =
-            self.row_cell_moments_for_third_degree15(block_states, cache, row)?
+            self.row_cell_moments_for_third_degree15(cache, row)?
         {
             cached
         } else {
