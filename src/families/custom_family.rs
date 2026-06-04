@@ -11652,44 +11652,6 @@ pub(crate) fn strict_inverse_spd_with_lm_continuation(
     )
 }
 
-fn strict_logdet_spd(matrix: &Array2<f64>) -> Result<f64, String> {
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let chol = sym
-        .cholesky(Side::Lower)
-        .map_err(|_| "strict pseudo-laplace SPD logdet failed".to_string())?;
-    Ok(2.0 * chol.diag().mapv(f64::ln).sum())
-}
-
-/// Strict-mode logdet with the same Levenberg-Marquardt δ-ridge continuation
-/// schedule as [`strict_solve_spd_with_lm_continuation`]: when the bare
-/// Cholesky on `H` rejects, we factor `H + δI` with δ escalated geometrically
-/// until success.  Returns `log|H + δI|` and the δ used.
-///
-/// The mathematical content is the regularized pseudo-Laplace logdet,
-/// `log|H + δI|`, not the bare `log|H|` — but this is precisely the quantity
-/// the controller needs at indefinite seeds to make a step decision.  Without
-/// continuation, every seed where H_β has a marginally-non-positive eigenvalue
-/// is rejected, the spatial-adaptive pilot loses its entire seed budget, and
-/// the controller fall-opens into a full-data path that was never gated for
-/// it (the Matern adaptive seed-failure → 14.56 GiB OOM in the recovery
-/// branch).  The δ that finally factors is recorded in `StrictSpdLmStats`
-/// so the outer controller can detect a recurring need for nontrivial ridges
-/// and react (e.g. tighten step length, fall through to a sparse path, or
-/// surface a structural diagnostic to the user).
-pub(crate) fn strict_logdet_spd_with_lm_continuation(
-    matrix: &Array2<f64>,
-) -> Result<(f64, StrictSpdLmStats), String> {
-    strict_spd_lm_engine(
-        matrix,
-        "strict pseudo-laplace SPD logdet",
-        0.0,
-        strict_logdet_spd,
-        |chol| 2.0 * chol.diag().mapv(f64::ln).sum(),
-        |evals, _evecs, eps_floor| evals.iter().map(|&ev| ev.max(eps_floor).ln()).sum(),
-    )
-}
-
 /// Exact pseudo-Laplace log-determinant `log|H + S_λ|` of the REML/LAML
 /// objective, computed from the eigenspectrum with **no δ-ridge** so the value
 /// stays on the same objective as the analytic gradient `tr((H+S_λ)⁻¹ ·)`
@@ -28057,22 +28019,20 @@ mod tests {
     }
 
     #[test]
-    fn pseudo_laplace_exact_newton_lm_continuation_recovers_marginal_indefiniteness() {
-        // Marginally-indefinite Hessian (here a 1×1 block with H=-1) used to
-        // be rejected outright by the strict pseudo-Laplace path; the
-        // adaptive-seed pilot would lose its entire seed budget and the
-        // controller fall-opened into an unguarded full-data path. With
-        // `strict_logdet_spd_with_lm_continuation` the strict-mode logdet
-        // factors `H + δI` along the same δ-ridge schedule the strict solve
-        // already uses, so a marginally-indefinite block is saved by a
-        // small, principled regularization and the seed proceeds.
-        //
-        // For the 1×1 H=[[-1]] family below: trace_scale=1, δ₀=1e-12,
-        // δ grows ×10 per escalation, so δ=10 (escalation 14) lifts H to
-        // H+δI=[[9]] which Cholesky factors cleanly (logdet=log 9≈2.197).
-        // The fit therefore succeeds where it formerly errored.
+    fn pseudo_laplace_exact_newton_rejects_indefinite_hessian() {
+        // #748: an indefinite joint coefficient Hessian (here a 1×1 block with
+        // H=-1) is a real defect — a mis-signed / non-convex curvature, or a β
+        // that is not at the inner block optimum. The strict pseudo-Laplace
+        // REML logdet must REJECT such a ρ-trial, not mask it. The earlier path
+        // returned `log|H + δI|` with δ escalated to 10 (so H+δI=[[9]],
+        // logdet=log 9) and let the fit "succeed" — but the analytic REML
+        // gradient still used `tr((H+S_λ)⁻¹·)` on the un-ridged H, so value and
+        // gradient described two different objectives. Rejecting is the honest
+        // signal: the outer optimizer steps back instead of optimizing a biased,
+        // δ-shifted surface. The fit therefore now ERRORS where it formerly
+        // returned a masked result.
         let spec = ParameterBlockSpec {
-            name: "marginally_indefinite".to_string(),
+            name: "indefinite".to_string(),
             design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
             offset: array![0.0],
             penalties: vec![],
@@ -28093,52 +28053,15 @@ mod tests {
                 ..BlockwiseFitOptions::default()
             },
         );
+        let err = result
+            .expect_err(
+                "strict pseudo-Laplace must reject the indefinite Hessian H=[[-1]], not δ-ridge mask it",
+            )
+            .to_string();
         assert!(
-            result.is_ok(),
-            "LM δ-ridge continuation should save the marginally-indefinite \
-             Hessian H=[[-1]]; got error: {:?}",
-            result.err(),
+            err.contains("indefinite") || err.contains("below -tol"),
+            "rejection error should name the indefiniteness; got: {err}",
         );
-    }
-
-    #[test]
-    fn strict_logdet_lm_continuation_accepts_marginal_indefiniteness() {
-        // Direct test of the continuation primitive: H=[[-1]] is rejected
-        // by bare Cholesky but the LM δ-ridge schedule lifts it to
-        // H+δI=[[9]] at δ=10, yielding logdet=log(9). The reported stats
-        // must show a non-trivial escalation count so a recurring need
-        // for nontrivial ridges is detectable by the controller.
-        let h = array![[-1.0_f64]];
-        let (logdet, stats) = strict_logdet_spd_with_lm_continuation(&h)
-            .expect("LM continuation must save 1×1 marginally-indefinite H");
-        assert!(
-            (logdet - (9.0_f64).ln()).abs() < 1e-12,
-            "logdet={logdet}, expected log(9)={}",
-            (9.0_f64).ln(),
-        );
-        assert!(stats.escalations > 0, "δ-ridge escalation must have fired");
-        assert!(
-            stats.delta_used >= 1.0,
-            "δ_used={} must exceed |min_eig|=1",
-            stats.delta_used,
-        );
-    }
-
-    #[test]
-    fn strict_logdet_lm_continuation_passes_through_when_h_is_already_spd() {
-        // When H is already SPD the bare strict logdet succeeds and the
-        // continuation must report no escalation (δ_used=0) — i.e. callers
-        // pay no extra cost on the well-conditioned hot path.
-        let h = array![[2.0_f64, 0.5], [0.5, 3.0]];
-        let (logdet, stats) = strict_logdet_spd_with_lm_continuation(&h)
-            .expect("strict logdet must succeed on SPD H");
-        let expected = (2.0_f64 * 3.0 - 0.5 * 0.5).ln();
-        assert!(
-            (logdet - expected).abs() < 1e-12,
-            "logdet={logdet}, expected={expected}",
-        );
-        assert_eq!(stats.escalations, 0);
-        assert_eq!(stats.delta_used, 0.0);
     }
 
     #[test]
@@ -29768,39 +29691,6 @@ mod tests {
                 x[i],
             );
         }
-    }
-
-    /// Companion regression check for `strict_logdet_spd_with_lm_continuation`:
-    /// on a strongly negative-definite matrix the LM δ-ridge schedule cannot
-    /// factor `H + δI` (`|λ_min|` exceeds the terminal δ), so the eigen-floor
-    /// fallback must return `Σ log Λ̃_i` with `Λ̃_i = max(Λ_i, ε λ_max)`.
-    #[test]
-    fn strict_logdet_spd_falls_back_to_eigen_floor_on_indefinite_matrix() {
-        let p = 4usize;
-        let mut h = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            h[[i, i]] = -1e32 - (i as f64) * 1e30;
-        }
-        let (logdet, stats) = strict_logdet_spd_with_lm_continuation(&h)
-            .expect("eigen-floor logdet fallback must succeed");
-        assert!(
-            stats.escalations > 16,
-            "expected eigen-floor terminal fallback for logdet, got escalations={}",
-            stats.escalations,
-        );
-        let mut sym = h.clone();
-        symmetrize_dense_in_place(&mut sym);
-        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
-        let max_abs_eval = evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let eps_floor = (CUSTOM_FAMILY_EVAL_FLOOR * max_abs_eval).max(1e-300);
-        let want: f64 = evals.iter().map(|&ev| ev.max(eps_floor).ln()).sum();
-        let tol = 1e-10 * want.abs().max(1.0) + 1e-10;
-        assert!(
-            (want - logdet).abs() <= tol,
-            "eigen-floor logdet: want={:.6e}, got={:.6e}",
-            want,
-            logdet,
-        );
     }
 
     // ---------- eta_backup heterogeneous-shape regression tests ----------
