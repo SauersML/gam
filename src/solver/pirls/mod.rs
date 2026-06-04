@@ -6512,35 +6512,72 @@ pub fn dense_block_xtwx(
     }
     let p_out = shape[1];
     let dim = k * p_out;
-    let mut out = Array2::<f64>::zeros((dim, dim));
-    for row in 0..n {
-        let rw = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);
-        for a in 0..p_out {
-            for b in 0..p_out {
-                let wab = rw * fisher_blocks[[row, a, b]];
-                if !wab.is_finite() {
-                    crate::bail_invalid_estim!(
-                        "dense block Fisher entry ({row},{a},{b}) is not finite"
-                    );
-                }
-                if wab == 0.0 {
-                    continue;
-                }
-                let row_a = a * k;
-                let row_b = b * k;
-                for i in 0..k {
-                    let xi = design[[row, i]];
-                    if xi == 0.0 {
-                        continue;
-                    }
-                    let scaled = wab * xi;
-                    for j in 0..k {
-                        out[[row_a + i, row_b + j]] += scaled * design[[row, j]];
+    // Coupled multi-output Gram `Σ_row (W_row ⊗ x_row x_rowᵀ)` of dimension
+    // `(M·k) × (M·k)`. For the multinomial softmax family this `X^T W X` is
+    // rebuilt at every inner Newton cycle of every outer smoothing-parameter
+    // trial, so its `O(n · M² · k²)` accumulation is the dominant inner cost
+    // (#722). The per-row contributions are an independent sum, so fan the row
+    // loop across the rayon pool with per-thread dense accumulators reduced by
+    // addition — the arithmetic is identical to the serial accumulation,
+    // bit-for-bit up to the associativity of the row partition.
+    //
+    // Finiteness is validated up front in a cheap `O(n · M²)` parallel scan so
+    // the hot accumulation stays branch-light and the error is reported with
+    // the offending `(row, a, b)` index, preserving the serial contract.
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let nonfinite = (0..n)
+        .into_par_iter()
+        .filter_map(|row| {
+            let rw = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);
+            for a in 0..p_out {
+                for b in 0..p_out {
+                    if !(rw * fisher_blocks[[row, a, b]]).is_finite() {
+                        return Some((row, a, b));
                     }
                 }
             }
-        }
+            None
+        })
+        .min();
+    if let Some((row, a, b)) = nonfinite {
+        crate::bail_invalid_estim!("dense block Fisher entry ({row},{a},{b}) is not finite");
     }
+    let mut out = (0..n)
+        .into_par_iter()
+        .fold(
+            || Array2::<f64>::zeros((dim, dim)),
+            |mut acc, row| {
+                let rw = row_weights.as_ref().map(|w| w[row]).unwrap_or(1.0);
+                for a in 0..p_out {
+                    for b in 0..p_out {
+                        let wab = rw * fisher_blocks[[row, a, b]];
+                        if wab == 0.0 {
+                            continue;
+                        }
+                        let row_a = a * k;
+                        let row_b = b * k;
+                        for i in 0..k {
+                            let xi = design[[row, i]];
+                            if xi == 0.0 {
+                                continue;
+                            }
+                            let scaled = wab * xi;
+                            for j in 0..k {
+                                acc[[row_a + i, row_b + j]] += scaled * design[[row, j]];
+                            }
+                        }
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || Array2::<f64>::zeros((dim, dim)),
+            |mut a, b| {
+                a += &b;
+                a
+            },
+        );
     for i in 0..dim {
         for j in (i + 1)..dim {
             let avg = 0.5 * (out[[i, j]] + out[[j, i]]);
