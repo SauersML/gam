@@ -1141,6 +1141,52 @@ fn rank_seeds_with_screening(
         }
     }
 
+    // Demote over-smoothing boundary seeds below every interior seed.
+    //
+    // The seed-screening cost is a *marginal-likelihood* proxy fit at a
+    // capped inner-iteration budget. For a separation-stability seed pinned
+    // at the ρ upper bound (`Array1::from_elem(k, bounds.1)`), that proxy is
+    // systematically the cheapest: the penalized coefficients are shrunk
+    // into the penalty null space, the capped inner solve converges
+    // trivially, and the LAML/REML value is locally flat. So screening
+    // ranks the boundary seed *first*. But the boundary is a degenerate
+    // descent origin: ∂V/∂ρ → 0 there (nothing left to penalize), so a
+    // trust-region / Newton outer solver started at the boundary certifies
+    // box-constraint stationarity at iteration 0 and never reaches the
+    // interior — which, for a location-scale model, is frequently
+    // *anisotropic* (the well-determined mean wants heavy shrinkage while
+    // the second-moment scale block wants far less). Starting the descent
+    // from any interior seed instead lets the optimizer climb back up to
+    // the bound coordinate-wise when the data truly want it, while still
+    // resolving the coordinates whose optimum is interior. The boundary is
+    // reachable by ascent but inescapable once it is the start, so it must
+    // never out-rank an interior seed. We keep it at the tail as a
+    // stability fallback: if every interior seed fails its full-budget
+    // solve (genuine separation), the seed loop still falls through to it.
+    // (#686/#687/#688: Gaussian location-scale was pinned at ρ=bound,
+    // over-smoothing the log-σ envelope and wrecking held-out calibration.)
+    let rho_dim = obj.capability().theta_layout().rho_dim();
+    if rho_dim > 0 && ordered.len() > 1 {
+        let upper: Vec<f64> = match config.bounds.as_ref() {
+            Some((_, hi)) => hi.to_vec(),
+            None => vec![config.rho_bound; rho_dim],
+        };
+        let (interior, boundary): (Vec<Array1<f64>>, Vec<Array1<f64>>) = ordered
+            .into_iter()
+            .partition(|seed| !seed_is_oversmoothing_boundary(seed, rho_dim, &upper));
+        if !interior.is_empty() && !boundary.is_empty() {
+            log::info!(
+                "[OUTER] {context}: demoted {} over-smoothing boundary seed(s) below {} \
+                 interior seed(s) so the outer descent does not originate on the flat \
+                 ρ=bound plateau",
+                boundary.len(),
+                interior.len(),
+            );
+        }
+        ordered = interior;
+        ordered.extend(boundary);
+    }
+
     log::debug!(
         "[OUTER] {context}: seed screening ranked {}/{} candidates at cap={} \
          (initial cap={}, stages used={}); rejected={}",
@@ -1157,6 +1203,31 @@ fn rank_seeds_with_screening(
     );
 
     ordered
+}
+
+/// ρ margin (in log-λ units) within which a smoothing coordinate counts as
+/// sitting on the over-smoothing upper bound. The separation-stability seed is
+/// generated *exactly* at the bound, so a small margin suffices; it is kept
+/// loose enough to absorb a `project_to_bounds` round-trip without catching a
+/// genuinely interior candidate (the next-densest generated seed is several
+/// log-λ units below any realistic bound).
+const OVERSMOOTH_BOUNDARY_MARGIN: f64 = 0.5;
+
+/// Whether `seed` is pinned at the over-smoothing ρ upper bound in *every*
+/// smoothing coordinate — the degenerate plateau where the penalized
+/// coefficients collapse into the penalty null space and the REML/LAML
+/// gradient ∂V/∂ρ vanishes. Only the leading `rho_dim` (smoothing) coordinates
+/// are inspected; trailing ψ/auxiliary coordinates have their own geometry and
+/// never make ρ a flat plateau. Used to keep such seeds from becoming the outer
+/// optimizer's descent origin (see `rank_seeds_with_screening`).
+fn seed_is_oversmoothing_boundary(seed: &Array1<f64>, rho_dim: usize, upper: &[f64]) -> bool {
+    if rho_dim == 0 || seed.len() < rho_dim {
+        return false;
+    }
+    (0..rho_dim).all(|i| {
+        let hi = upper.get(i).copied().unwrap_or(f64::INFINITY);
+        hi.is_finite() && seed[i] >= hi - OVERSMOOTH_BOUNDARY_MARGIN
+    })
 }
 
 #[inline]
