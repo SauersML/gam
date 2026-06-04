@@ -1751,17 +1751,29 @@ pub enum CenterStrategyKind {
 /// Adaptive default center count for spatial smooths (TPS, Duchon, Matérn).
 ///
 /// Use this when the user has not explicitly specified a knot/center count.
-/// The formula `min(2000, max(200, ceil(8 * d_factor * n^0.4)))` scales
-/// sub-linearly with sample size and gives a mild boost for higher input
-/// dimensionality:
+/// The basis size is the sub-linear `ceil(8 * d_factor * n^0.4)`, clamped above
+/// at `K_MAX = 2000` and below at a *data-proportional* floor `min(200, n/8)` so
+/// the floor only engages once there are enough observations to support a rich
+/// basis. The result is additionally capped at `n/4` so the penalty matrices
+/// stay well-conditioned relative to the data:
 ///
 /// | n      | d=1  | d=2  | d=5  |
 /// |--------|------|------|------|
-/// | 1 000  | 200  | 200  | 200  |
-/// | 10 000 | 320  | 368  | 512  |
-/// | 100 000| 800  | 920  | 1280 |
-/// | 400 000| 1240 | 1426 | 1984 |
-/// | 1 000 000| 1600 | 1840 | 2000 |
+/// | 800    | 116  | 134  | 186  |
+/// | 1 000  | 127  | 146  | 200  |
+/// | 2 000  | 200  | 200  | 268  |
+/// | 10 000 | 319  | 367  | 510  |
+/// | 100 000| 801  | 921  | 1281 |
+/// | 400 000| 1393 | 1602 | 2000 |
+/// | 1 000 000| 2000 | 2000 | 2000 |
+///
+/// The flat `200` floor used to inflate moderate-`n` spatial smooths (a few
+/// hundred to ~2000 rows) up to a dense 200-column design even though the raw
+/// sub-linear count — and the mesh/knot density that mgcv and R-INLA use on the
+/// same data — is far smaller. On ~800 rows that turned a single 2-D thin-plate
+/// REML fit into an `O(n·p² + p³)` grind at `p ≈ 200` (#718). Smoothness is
+/// already controlled by REML's penalty weight λ, not by the center count, so a
+/// data-proportional floor recovers the same surface at a fraction of the cost.
 ///
 /// # Arguments
 /// * `n` - sample size (number of observations)
@@ -1774,12 +1786,16 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
 
     let d_factor = 1.0 + 0.15 * (d.max(1) - 1) as f64;
     let raw = (C * d_factor * (n as f64).powf(ALPHA)).ceil() as usize;
-    let k = raw.clamp(K_MIN, K_MAX);
 
-    // Never exceed n itself; on small datasets cap at n/4 to keep
-    // penalty matrices well-conditioned relative to data.
-    let small_data_cap = if n < 800 { n / 4 } else { n };
-    k.min(n).min(small_data_cap)
+    // Data-proportional floor: never inflate beyond n/8, so the 200-center
+    // floor only takes effect once n is large enough (~1600) to genuinely
+    // support that many basis columns.
+    let floor = K_MIN.min(n / 8);
+    let k = raw.clamp(floor, K_MAX);
+
+    // Never exceed n itself; cap at n/4 to keep the penalty matrices
+    // well-conditioned relative to the data.
+    k.min(n).min(n / 4)
 }
 
 /// Conservative center count for a *secondary* (distributional) predictor's
