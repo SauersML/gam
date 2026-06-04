@@ -5622,6 +5622,9 @@ fn body_has_noop_sentinel_control_flow(body: &str) -> bool {
     if whole_predicate_then_trivial_sentinel(s) {
         return true;
     }
+    if contains_predicate_then_trivial_sentinel_return(s) {
+        return true;
+    }
     false
 }
 
@@ -5697,6 +5700,11 @@ fn whole_predicate_then_trivial_sentinel(s: &str) -> bool {
     if let Some(stripped) = expr.strip_suffix(';') {
         expr = stripped.trim_end();
     }
+    predicate_then_trivial_sentinel_expr(expr)
+}
+
+fn predicate_then_trivial_sentinel_expr(expr: &str) -> bool {
+    let expr = expr.trim();
     for method in [".then(", ".then_some("] {
         let Some((predicate, arg)) = split_whole_method_call_arg(expr, method) else {
             continue;
@@ -5704,6 +5712,31 @@ fn whole_predicate_then_trivial_sentinel(s: &str) -> bool {
         if predicate_is_read_only_empty_check(predicate) && then_arg_is_trivial_sentinel(arg) {
             return true;
         }
+    }
+    false
+}
+
+fn contains_predicate_then_trivial_sentinel_return(s: &str) -> bool {
+    let mut search_from = 0usize;
+    while let Some(rel) = s[search_from..].find("return") {
+        let pos = search_from + rel;
+        let before = if pos == 0 {
+            None
+        } else {
+            s.as_bytes().get(pos - 1).copied()
+        };
+        let after = s.as_bytes().get(pos + "return".len()).copied();
+        if before.map_or(true, |b| !is_ident_byte(b))
+            && after.is_some_and(|b| b.is_ascii_whitespace())
+        {
+            let expr_start = pos + "return".len();
+            if let Some((expr, _)) = split_leading_statement(&s[expr_start..])
+                && predicate_then_trivial_sentinel_expr(expr)
+            {
+                return true;
+            }
+        }
+        search_from = pos + "return".len();
     }
     false
 }
