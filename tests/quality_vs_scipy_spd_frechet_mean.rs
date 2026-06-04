@@ -31,6 +31,7 @@
 //! measured with gam's metric). It is no longer the pass gate; the axioms are.
 //! `rel_l2` between the two centers is printed for context but never asserted.
 
+use gam::geometry::spd::spd_frechet_mean;
 use gam::test_support::reference::{Column, relative_l2, run_python};
 use gam::{RiemannianManifold, SpdManifold, load_csvwith_inferred_schema};
 use ndarray::{Array1, Array2, ArrayView1};
@@ -64,29 +65,23 @@ fn unflat(v: &Array1<f64>) -> Array2<f64> {
     Array2::from_shape_vec((N, N), v.to_vec()).expect("reshape N*N -> NxN")
 }
 
-/// Karcher-mean fixed point of `samples` at base point `init`, using gam's
-/// `exp_map`/`log_map` (`P ← exp_P((1/M) Σ_i log_P(X_i))`). The synthetic arm
-/// uses the stationarity residual as the stopping rule because that is the
-/// Fréchet-mean axiom this test verifies.
-fn gam_frechet_mean(
-    spd: &SpdManifold,
-    samples: &[Array1<f64>],
-    init: &Array1<f64>,
-) -> (Array1<f64>, usize) {
-    let mut p = init.clone();
-    for iter in 0..MAX_ITERS {
-        let mut acc = Array1::<f64>::zeros(N * N);
-        for x in samples {
-            let lg = spd.log_map(p.view(), x.view()).expect("gam log_map");
-            acc += &lg;
+/// Riemannian center of mass of `samples` via gam's own SPD Fréchet-mean
+/// primitive `spd_frechet_mean`, which performs affine-invariant Riemannian
+/// gradient descent (`P ← exp_P(t·Σ_i w_i log_P(X_i))`) with an Armijo line
+/// search and stops on the stationarity residual `‖Σ_i w_i log_P(X_i)‖_P`. The
+/// line search is what lets it reach the stationarity tolerance on the spread,
+/// ill-conditioned synthetic SPD inputs where the bare unit-step fixed point
+/// stalls above tol within a fixed budget. Stacks the flat samples into the
+/// `M×N²` matrix the primitive consumes (uniform weights).
+fn gam_frechet_mean(samples: &[Array1<f64>]) -> Array1<f64> {
+    let mut stacked = Array2::<f64>::zeros((samples.len(), N * N));
+    for (i, x) in samples.iter().enumerate() {
+        for (k, &v) in x.iter().enumerate() {
+            stacked[[i, k]] = v;
         }
-        acc /= M as f64;
-        if gam_tangent_sq_norm(spd, p.view(), acc.view()).sqrt() < KARCHER_GRAD_TOL {
-            return (p, iter);
-        }
-        p = spd.exp_map(p.view(), acc.view()).expect("gam exp_map");
     }
-    (p, MAX_ITERS)
+    spd_frechet_mean(N, stacked.view(), None, KARCHER_GRAD_TOL, MAX_ITERS)
+        .expect("gam spd_frechet_mean")
 }
 
 /// Squared affine-invariant geodesic distance `d²(P, X) = ‖log_P(X)‖²_P`,
@@ -138,9 +133,9 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass() {
     let spd = SpdManifold::new(N);
     let flat_samples: Vec<Array1<f64>> = samples.iter().map(flat).collect();
 
-    // Initialize at the first sample (any SPD point works; the Karcher mean of
-    // a Hadamard space is unique and the descent converges from anywhere).
-    let (p, karcher_iters) = gam_frechet_mean(&spd, &flat_samples, &flat_samples[0]);
+    // The Karcher mean of a Hadamard space is unique and gam's descent converges
+    // from its order-independent Euclidean-mean start.
+    let p = gam_frechet_mean(&flat_samples);
     let gam_mean = unflat(&p);
 
     // =====================================================================
@@ -161,7 +156,7 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass() {
     let grad_norm = grad_sq_norm.sqrt();
 
     eprintln!(
-        "SPD Fréchet mean (4x4, M={M}, {karcher_iters} Karcher iters): Riemannian gradient norm ‖(1/M)Σ log_P(X_i)‖_P = {grad_norm:.3e}"
+        "SPD Fréchet mean (4x4, M={M}): Riemannian gradient norm ‖(1/M)Σ log_P(X_i)‖_P = {grad_norm:.3e}"
     );
     assert!(
         grad_norm < 1e-7,
@@ -379,28 +374,20 @@ fn group_covariance_flat(meas: &[Vec<f64>; SPD_DIM], rows: &[usize]) -> Array1<f
     Array1::from_iter(cov.iter().copied())
 }
 
-/// Karcher-mean fixed point of `samples` (flat `SPD_DIM*SPD_DIM` vectors) at base
-/// point `init`, using gam's `exp_map`/`log_map`. Dimension-parameterized twin
-/// of the synthetic `gam_frechet_mean` so the synthetic arm stays untouched.
-fn gam_frechet_mean_dim(
-    spd: &SpdManifold,
-    samples: &[Array1<f64>],
-    init: &Array1<f64>,
-) -> Array1<f64> {
+/// Riemannian center of mass of `samples` (flat `SPD_DIM*SPD_DIM` vectors) via
+/// gam's `spd_frechet_mean` primitive — the same line-searched affine-invariant
+/// gradient descent the synthetic arm exercises, at the 5×5 ambient size. Stacks
+/// the flat covariances into the `G×SPD_DIM²` matrix the primitive consumes.
+fn gam_frechet_mean_dim(samples: &[Array1<f64>]) -> Array1<f64> {
     let dim2 = SPD_DIM * SPD_DIM;
-    let mut p = init.clone();
-    for _ in 0..REAL_ITERS {
-        let mut acc = Array1::<f64>::zeros(dim2);
-        for x in samples {
-            let lg = spd.log_map(p.view(), x.view()).expect("gam log_map (real)");
-            acc += &lg;
+    let mut stacked = Array2::<f64>::zeros((samples.len(), dim2));
+    for (i, x) in samples.iter().enumerate() {
+        for (k, &v) in x.iter().enumerate() {
+            stacked[[i, k]] = v;
         }
-        acc /= samples.len() as f64;
-        p = spd
-            .exp_map(p.view(), acc.view())
-            .expect("gam exp_map (real)");
     }
-    p
+    spd_frechet_mean(SPD_DIM, stacked.view(), None, 1e-10, REAL_ITERS)
+        .expect("gam spd_frechet_mean (real)")
 }
 
 /// Squared affine-invariant distance via gam (tangent from `log_map`, squared
@@ -486,7 +473,7 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass_on_real_data() {
 
     // ---- gam: Karcher mean of the four TRAIN covariances -------------------
     let spd = SpdManifold::new(SPD_DIM);
-    let p = gam_frechet_mean_dim(&spd, &train_cov, &train_cov[0]);
+    let p = gam_frechet_mean_dim(&train_cov);
 
     // sanity: gam's center is a genuine stationary point on TRAIN — residual
     // Riemannian gradient (tangent mean) vanishes in the affine-invariant norm.

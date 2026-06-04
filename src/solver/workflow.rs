@@ -2262,10 +2262,40 @@ fn fit_cause_specific_survival_transformation_custom(
         &spec.time_build,
         spec.time_anchor,
     );
+    // Recover the FITTED Weibull baseline from the converged linear-time
+    // coefficients, mirroring the single-cause path (issues #689/#690). The
+    // seed `baseline_cfg` carried only the pre-fit pooled scale/shape
+    // (`shape = 1`, `scale = time-seed`), so any caller reading
+    // `fit.baseline_cfg.scale/shape` to reconstruct `H = (t/scale)^shape`
+    // would build the CIF from the uninitialized baseline and collapse it to
+    // null. For Weibull-without-timewiggle the time basis is the 2-column
+    // `[1, log t]` linear basis whose per-cause coefficients carry the full
+    // log-cumulative-hazard, so the fitted scale/shape are recoverable from
+    // each cause's time-beta. The shared `SurvivalBaselineConfig` holds a
+    // single (scale, shape), so we report the first cause's fitted baseline as
+    // the representative shared value — the same pooled-baseline convention the
+    // seed used, but post-fit rather than uninitialized.
+    let fitted_baseline_cfg = if spec.likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && spec.timewiggle.is_none()
+    {
+        let first_block = fit.blocks.first().ok_or_else(|| {
+            "cause-specific survival fit produced no coefficient blocks".to_string()
+        })?;
+        let time_beta = first_block
+            .beta
+            .slice(s![..spec.time_build.x_exit_time.ncols()])
+            .to_owned();
+        fitted_weibull_baseline_from_linear_time_beta(&time_beta).ok_or_else(|| {
+            "failed to recover fitted Weibull scale/shape from the cause-specific linear time coefficients"
+                .to_string()
+        })?
+    } else {
+        baseline_cfg
+    };
     Ok(SurvivalTransformationFitResult {
         fit,
         resolvedspec,
-        baseline_cfg,
+        baseline_cfg: fitted_baseline_cfg,
         likelihood_mode: spec.likelihood_mode,
         time_basis,
         time_base_ncols: spec.time_build.x_exit_time.ncols(),
