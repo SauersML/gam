@@ -9079,11 +9079,14 @@ impl BernoulliMarginalSlopeFamily {
                 self.flex_axis_fourth_tensors_for_row(block_states, cache, row)?
             {
                 let scale = s_u * s_v;
-                let mut out = match (a, b) {
-                    (0, 0) => tensors.qq.clone(),
-                    (1, 1) => tensors.gg.clone(),
-                    (0, 1) | (1, 0) => tensors.qg.clone(),
-                    _ => unreachable!("primary axis index is constrained to q/g"),
+                debug_assert!(a <= 1);
+                debug_assert!(b <= 1);
+                let mut out = if a == 0 && b == 0 {
+                    tensors.qq.clone()
+                } else if a == 1 && b == 1 {
+                    tensors.gg.clone()
+                } else {
+                    tensors.qg.clone()
                 };
                 out.mapv_inplace(|value| value * scale);
                 return Ok(out);
