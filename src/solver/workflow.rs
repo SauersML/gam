@@ -3293,6 +3293,7 @@ fn crossfit_score_calibration(
             &recipe.config,
             min_complement,
             p_cov,
+            response_full.view(),
         );
 
     let mut z_oof = Array1::<f64>::zeros(n);
