@@ -4191,16 +4191,31 @@ fn matern_operator_penalty_triplet_from_metadata(
         include_intercept,
         identifiability_transform,
         aniso_log_scales,
-        ..
+        input_scales,
     } = metadata
     else {
         crate::bail_invalid_basis!("Matérn operator penalties require Matérn metadata");
+    };
+    // The metadata records `length_scale` in *original* (un-standardized) data
+    // coordinates, while `centers` live in the *standardized* coordinate frame
+    // (per-axis division by `input_scales`). The realized design built the
+    // kernel against those standardized centers using the σ_geom-compensated
+    // effective length scale `length_scale / σ_geom`. The collocation operators
+    // here are evaluated on the same standardized centers, so they must use the
+    // SAME effective length scale — otherwise the penalty regularizes a
+    // different RKHS range than the design lives in, leaving rough coefficient
+    // directions effectively unpenalized. That mismatch is benign in 1-D
+    // (no standardization) but produces a catastrophic out-of-sample blow-up in
+    // d ≥ 2 where σ_geom ≠ 1 (#706).
+    let penalty_length_scale = match input_scales.as_deref() {
+        Some(scales) => compensate_length_scale_for_standardization(*length_scale, scales),
+        None => *length_scale,
     };
     let penalty_centers = crate::basis::expand_periodic_centers(centers, periodic.as_deref())?;
     let ops = build_matern_collocation_operator_matrices(
         penalty_centers.view(),
         None,
-        *length_scale,
+        penalty_length_scale,
         *nu,
         *include_intercept,
         identifiability_transform.as_ref().map(|z| z.view()),
