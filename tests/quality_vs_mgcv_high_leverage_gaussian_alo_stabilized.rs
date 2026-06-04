@@ -286,6 +286,27 @@ fn alo_stabilized_reml_matches_or_beats_mgcv_on_high_leverage_gaussian() {
         gam_edf > 1.0 && gam_edf < 30.0,
         "gam effective dof out of sane range: {gam_edf:.3}"
     );
+
+    // ---- (6) NO EDF COLLAPSE: direct guard on the #711 failure mode ---------
+    // The original defect was the ALO stabilization *over-smoothing* under high
+    // leverage — it dragged λ up to suppress the isolated near-unit-leverage
+    // points' geometry-driven LOO residuals, collapsing EDF to 3.895 against
+    // mgcv's 9.043 (a 0.43× ratio). The match-or-beat RMSE check (3) catches the
+    // *predictive* consequence, but only within a 10% band — a subtler
+    // over-smoothing that stays inside that band would slip through. Assert
+    // directly that gam's EDF does not collapse far below the unstabilized mgcv
+    // REML fit: the stabilization must bound the high-leverage points' influence
+    // WITHOUT globally inflating λ. The 0.6× floor fails the original 0.43× bug
+    // with margin while the fixed fit (≈1.07×) clears it comfortably. This is
+    // the direct, diagnostic correlate of the saturated-deviance fix.
+    assert!(
+        gam_edf >= 0.6 * mgcv_edf,
+        "ALO stabilization over-smoothed under high leverage: gam EDF {gam_edf:.3} \
+         collapsed below 0.6 × mgcv EDF {mgcv_edf:.3} (= {:.3}). This is the #711 \
+         failure mode — λ inflated to suppress geometry-driven leverage instead of \
+         bounding the isolated points' influence on the criterion.",
+        0.6 * mgcv_edf
+    );
 }
 
 /// LOW-LEVERAGE CONTROL: a clean, dense design with no isolated points. The ALO
