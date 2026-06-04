@@ -18,6 +18,12 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.91 — gam 0.3.91 / gamfit 0.1.163 (2026-06-04)
+
+### Fixed
+
+- **Hypertension-style Bernoulli marginal-slope Matérn fits now have full audit-level regression coverage.** The release includes a formula-to-fit test for the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout, proving the scalar-pruned model passes the actual pre-fit identifiability audit and produces finite coefficients.
+
 ## v0.3.90 — gam 0.3.90 / gamfit 0.1.162 (2026-06-04)
 
 ### Fixed
