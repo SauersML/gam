@@ -921,6 +921,7 @@ fn hash_isometry_reference(
             hasher.write_str("user-supplied");
             hash_array2(hasher, values.as_ref());
         }
+        IsometryReference::MeanProfiled => hasher.write_str("mean-profiled"),
     }
 }
 
