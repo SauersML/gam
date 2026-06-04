@@ -18441,45 +18441,6 @@ fn joint_penalty_subspace_trace_parts(
         }
     }
 
-    // `(H + Sλ) · U_S`, column by column. Only the budget-exceeded fallback
-    // below needs it (the primary path materialises the full `M = H + Sλ`), so
-    // build it lazily to avoid `rank` redundant operator applies on the common
-    // dense path.
-    let build_h_times_u = || -> Result<Array2<f64>, String> {
-        let mut h_times_u = Array2::<f64>::zeros((total, rank));
-        for col in 0..rank {
-            let basis = u_s.column(col).to_owned();
-            let h_col = match h_joint_unpen {
-                JointHessianSource::Dense(h_joint) => {
-                    let mut out = fast_av(h_joint, &basis);
-                    let penalty = apply_joint_block_penalty(
-                        ranges,
-                        s_lambdas,
-                        &basis,
-                        hessian_diagonal_ridge,
-                        None,
-                    );
-                    out += &penalty;
-                    out
-                }
-                JointHessianSource::Operator { apply, .. } => {
-                    let mut out = apply(&basis)?;
-                    let penalty = apply_joint_block_penalty(
-                        ranges,
-                        s_lambdas,
-                        &basis,
-                        hessian_diagonal_ridge,
-                        None,
-                    );
-                    out += &penalty;
-                    out
-                }
-            };
-            h_times_u.column_mut(col).assign(&h_col);
-        }
-        Ok(h_times_u)
-    };
-
     // ── REML log|H + Sλ|₊ and its trace kernel over the FULL identifiable
     //    subspace range(H + Sλ) ──────────────────────────────────────────────
     //
@@ -18516,82 +18477,42 @@ fn joint_penalty_subspace_trace_parts(
     // since ∂Sλ/∂ρ is supported on range(Sλ). Both are derived from the same
     // materialized `M = H + Sλ` so they cannot drift apart.
     //
-    // Gate the full path on the dense byte budget so a genuine numerical
-    // failure inside materialization (non-finite Hessian) propagates rather than
-    // being silently downgraded to the projected path; only an over-budget
-    // dimension takes the fallback.
-    let full_path_within_budget =
-        ensure_exact_joint_hessian_dense_budget(total, "joint penalty subspace logdet").is_ok();
-    let (logdet, h_proj_inverse) = if full_path_within_budget {
-        let m_dense = materialize_joint_hessian_source(
-            h_joint_unpen,
-            total,
-            "joint penalty subspace logdet",
-        )?;
-        {
-            let mut m = m_dense;
-            add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
-            symmetrize_dense_in_place(&mut m);
-            let (m_evals, m_evecs) = m.eigh(Side::Lower).map_err(|e| {
-                format!("joint penalty subspace full Hessian eigendecomposition failed: {e}")
-            })?;
-            let m_threshold = positive_eigenvalue_threshold(m_evals.as_slice().unwrap());
-            let logdet = exact_pseudo_logdet(m_evals.as_slice().unwrap(), m_threshold);
-            // Full Moore–Penrose pseudo-inverse `M⁺` (drop ker(H+Sλ)), then its
-            // range(Sλ) block `U_Sᵀ M⁺ U_S` as the trace kernel.
-            let mut m_pinv = Array2::<f64>::zeros((total, total));
-            for eig_idx in 0..total {
-                let sigma = m_evals[eig_idx];
-                if sigma <= m_threshold {
-                    continue;
-                }
-                let inv = 1.0 / sigma;
-                for i in 0..total {
-                    let vi = inv * m_evecs[[i, eig_idx]];
-                    for j in 0..total {
-                        m_pinv[[i, j]] += vi * m_evecs[[j, eig_idx]];
-                    }
-                }
-            }
-            symmetrize_dense_in_place(&mut m_pinv);
-            let mut h_proj_inverse = fast_atb(&u_s, &fast_ab(&m_pinv, &u_s));
-            symmetrize_dense_in_place(&mut h_proj_inverse);
-            (logdet, h_proj_inverse)
+    // The #752 fix requires the full identifiable-subspace determinant. There
+    // is no lower-dimensional fallback that preserves that objective: the old
+    // range(Sλ) reduction is exactly the bug, because it drops the penalty-null
+    // likelihood determinant. If the dense path is over budget, fail loudly so
+    // the caller can choose a different Hessian representation instead of
+    // optimizing a different REML surface.
+    ensure_exact_joint_hessian_dense_budget(total, "joint penalty subspace logdet")?;
+    let m_dense =
+        materialize_joint_hessian_source(h_joint_unpen, total, "joint penalty subspace logdet")?;
+    let mut m = m_dense;
+    add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
+    symmetrize_dense_in_place(&mut m);
+    let (m_evals, m_evecs) = m.eigh(Side::Lower).map_err(|e| {
+        format!("joint penalty subspace full Hessian eigendecomposition failed: {e}")
+    })?;
+    let m_threshold = positive_eigenvalue_threshold(m_evals.as_slice().unwrap());
+    let logdet = exact_pseudo_logdet(m_evals.as_slice().unwrap(), m_threshold);
+    // Full Moore-Penrose pseudo-inverse `M+` (drop ker(H+Sλ)), then its
+    // range(Sλ) block `U_S^T M+ U_S` as the trace kernel.
+    let mut m_pinv = Array2::<f64>::zeros((total, total));
+    for eig_idx in 0..total {
+        let sigma = m_evals[eig_idx];
+        if sigma <= m_threshold {
+            continue;
         }
-    } else {
-        // Over the dense byte budget: fall back to the self-consistent range(Sλ)
-        // projection (logdet AND kernel both reduced onto range(Sλ)). This
-        // under-counts the penalty-null determinant, but only fires at a joint
-        // dimension where dense algebra is itself infeasible; the value and its
-        // trace kernel are still mutually consistent (both `M_rr`), so the outer
-        // gradient stays valid.
-        {
-            let h_times_u = build_h_times_u()?;
-            let mut h_proj = fast_atb(&u_s, &h_times_u);
-            symmetrize_dense_in_place(&mut h_proj);
-            let (h_evals, h_evecs) = h_proj
-                .eigh(Side::Lower)
-                .map_err(|e| format!("joint projected Hessian eigendecomposition failed: {e}"))?;
-            let h_threshold = positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
-            let logdet = exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_threshold);
-            let mut h_proj_inverse = Array2::<f64>::zeros((rank, rank));
-            for eig_idx in 0..rank {
-                let sigma = h_evals[eig_idx];
-                if sigma <= h_threshold {
-                    continue;
-                }
-                let inv = 1.0 / sigma;
-                for i in 0..rank {
-                    for j in 0..rank {
-                        h_proj_inverse[[i, j]] +=
-                            inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
-                    }
-                }
+        let inv = 1.0 / sigma;
+        for i in 0..total {
+            let vi = inv * m_evecs[[i, eig_idx]];
+            for j in 0..total {
+                m_pinv[[i, j]] += vi * m_evecs[[j, eig_idx]];
             }
-            symmetrize_dense_in_place(&mut h_proj_inverse);
-            (logdet, h_proj_inverse)
         }
-    };
+    }
+    symmetrize_dense_in_place(&mut m_pinv);
+    let mut h_proj_inverse = fast_atb(&u_s, &fast_ab(&m_pinv, &u_s));
+    symmetrize_dense_in_place(&mut h_proj_inverse);
 
     Ok((
         logdet,
