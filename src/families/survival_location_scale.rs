@@ -1077,21 +1077,25 @@ impl PreparedSurvivalLocationScaleModel {
     /// In this regime the time block has collapsed to its identifiable affine
     /// null space (`reduce_time_to_parametric` fired, so `k_time == 0`), the
     /// scale is a single constant log-σ (`k_log_sigma == 0`), the mean is rigid
-    /// (`k_threshold == 0`), and there is no link-wiggle or monotone time-wiggle
-    /// (`k_wiggle == 0`, `x_link_wiggle == None`, `time_wiggle_ncols == 0`).
-    /// Every block is therefore parametric and UNPENALIZED — zero smoothing
-    /// parameters — so the model is a plain few-parameter AFT MLE (loglogistic /
-    /// lognormal, exactly what `survreg`/`lifelines` fit) and the REML/LAML
-    /// outer search is vacuous. Such fits are routed to a direct, robust
-    /// parametric MLE (`fit_parametric_aft_direct_mle`) instead of the coupled
-    /// exact-joint REML optimizer, which does not converge on this tiny
+    /// or a plain parametric covariate effect whose default shrinkage ridge has
+    /// been dropped by `survival_reduced_parametric_aft_regime` (`k_threshold ==
+    /// 0`), and there is no link-wiggle or monotone time-wiggle (`k_wiggle ==
+    /// 0`, `x_link_wiggle == None`, `time_wiggle_ncols == 0`). Every block is
+    /// therefore parametric and UNPENALIZED — zero smoothing parameters — so the
+    /// model is a plain few-parameter AFT MLE (loglogistic / lognormal, exactly
+    /// what `survreg`/`lifelines` fit, including a parametric `~ age` effect) and
+    /// the REML/LAML outer search is vacuous. Such fits are routed to a direct,
+    /// robust parametric MLE (`fit_parametric_aft_direct_mle`) instead of the
+    /// coupled exact-joint REML optimizer, which does not converge on this tiny
     /// unpenalized likelihood.
     ///
     /// Any genuinely flexible/penalized survival LS fit — smooth scale
-    /// (`noise_formula = s(...)`, log_sigma penalties), smooth mean (threshold
-    /// penalties), a link-wiggle, or an active monotone time-wiggle — has at
-    /// least one nonzero `k_*` (or a wiggle block) and so does NOT match here,
-    /// keeping the full coupled exact-joint path unchanged.
+    /// (`noise_formula = s(...)`, log_sigma smoothing penalties), smooth mean
+    /// (`threshold ~ s(z)` wiggliness penalties), a link-wiggle, or an active
+    /// monotone time-wiggle — keeps at least one nonzero `k_*` (the ridge-drop
+    /// predicate excludes any block carrying a `nullspace_dim > 0` smoothing
+    /// penalty) and so does NOT match here, keeping the full coupled exact-joint
+    /// path unchanged.
     fn is_reduced_parametric_aft(&self) -> bool {
         self.k_time == 0
             && self.k_threshold == 0
@@ -4207,24 +4211,6 @@ fn prepare_survival_location_scale_model(
         } else {
             (None, None)
         };
-    let thresholdspec = ParameterBlockSpec {
-        name: "threshold".to_string(),
-        design: threshold_design.clone(),
-        offset: threshold_prep.offset.clone(),
-        penalties: threshold_penalties.clone(),
-        nullspace_dims: threshold_nullspace_dims.clone(),
-        initial_log_lambdas: threshold_initial_log_lambdas,
-        initial_beta: threshold_initial_beta,
-        // Lower than `time_transform` (200): the location-channel covariate
-        // block yields the shared constant direction to the time baseline.
-        // See the canonical-gauge ownership note on the `time_transform`
-        // spec above (issue #366).
-        gauge_priority: 150,
-        jacobian_callback: None,
-        stacked_design: threshold_stacked_design,
-        stacked_offset: threshold_stacked_offset,
-    };
-
     let survival_primary_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(
         BlockDesignOperator::new(vec![
             DesignBlock::Dense(DenseDesignMatrix::from(shared_dense_arc(
@@ -4315,6 +4301,80 @@ fn prepare_survival_location_scale_model(
         log_sigma_full_ncols,
         "survival location-scale log-sigma",
     )?;
+
+    // Reduced parametric-AFT regime (issue #736/#735/#721): when the time-warp
+    // has collapsed to its affine null space, there is no wiggle, and every
+    // surviving location/scale penalty is a full-rank parametric ridge
+    // (`nullspace_dim == 0` — e.g. the linear-term `LinearTermRidge` on `age`),
+    // drop those ridges. They are NOT wiggliness penalties: a single linear
+    // coefficient has nothing to smooth, so the ridge carries no smoothing
+    // parameter worth a vacuous outer ρ coordinate, and its default λ would only
+    // bias the parametric coefficient away from the unpenalized
+    // `survreg`/`lifelines` MLE this regime must reproduce. Dropping them
+    // (exactly as the reduced time block drops its projected-to-zero penalties)
+    // takes `k_threshold`/`k_log_sigma` to 0, so the dispatch
+    // (`is_reduced_parametric_aft`) routes the fit to the direct unpenalized
+    // parametric-AFT Newton MLE with zero outer coordinates. The OUTER ρ layout
+    // (`fit_survival_location_scale_terms`) applies the SAME predicate to the
+    // same boot-design penalties, so the inner and outer counts stay identical.
+    // Evaluate the regime predicate on the PRE-drop block penalties
+    // (`threshold_prep`/`log_sigma_prep`), which are an exact copy of the boot
+    // designs the OUTER layout (`fit_survival_location_scale_terms`) inspects —
+    // `prepare_cov_block_kind` clones `b.penalties`/`b.nullspace_dims` straight
+    // from the block built off that boot design. Reading the same source on both
+    // sides guarantees the inner and outer ρ counts are computed from identical
+    // penalty/null-space metadata, so they can never diverge (a divergence would
+    // desynchronise `k_threshold` between the layout and the prepared model).
+    let drop_parametric_ridges = survival_reduced_parametric_aft_regime(
+        &spec.time_block.penalties,
+        spec.time_block.design_exit.ncols(),
+        survival_constant_scale(spec),
+        protected_timewiggle_cols,
+        &threshold_prep.nullspace_dims,
+        threshold_prep.penalties.len(),
+        &log_sigma_prep.nullspace_dims,
+        log_sigma_prep.penalties.len(),
+        spec.linkwiggle_block.is_some(),
+    );
+    let (threshold_penalties, threshold_nullspace_dims, threshold_initial_log_lambdas) =
+        if drop_parametric_ridges {
+            (Vec::new(), Vec::new(), Array1::<f64>::zeros(0))
+        } else {
+            (
+                threshold_penalties,
+                threshold_nullspace_dims,
+                threshold_initial_log_lambdas,
+            )
+        };
+    let (log_sigma_penalties, log_sigma_nullspace_dims, log_sigma_initial_log_lambdas) =
+        if drop_parametric_ridges {
+            (Vec::new(), Vec::new(), Array1::<f64>::zeros(0))
+        } else {
+            (
+                log_sigma_penalties,
+                log_sigma_nullspace_dims,
+                log_sigma_initial_log_lambdas,
+            )
+        };
+
+    let thresholdspec = ParameterBlockSpec {
+        name: "threshold".to_string(),
+        design: threshold_design.clone(),
+        offset: threshold_prep.offset.clone(),
+        penalties: threshold_penalties.clone(),
+        nullspace_dims: threshold_nullspace_dims.clone(),
+        initial_log_lambdas: threshold_initial_log_lambdas,
+        initial_beta: threshold_initial_beta,
+        // Lower than `time_transform` (200): the location-channel covariate
+        // block yields the shared constant direction to the time baseline.
+        // See the canonical-gauge ownership note on the `time_transform`
+        // spec above (issue #366).
+        gauge_priority: 150,
+        jacobian_callback: None,
+        stacked_design: threshold_stacked_design,
+        stacked_offset: threshold_stacked_offset,
+    };
+
     // Same canonical-vs-stacked split as the threshold block: time-varying
     // log_sigma stacks `[exit; entry; deriv]` (3*n rows) into
     // `stacked_design`; the canonical `spec.design` is the n-row exit
@@ -5191,6 +5251,81 @@ fn survival_time_rho_count(
     } else {
         time_penalties.len()
     }
+}
+
+/// Whether this fit is the reduced, fully PARAMETRIC constant-scale AFT regime,
+/// in which the location and scale carry no genuine smoothing — only (at most)
+/// full-rank parametric shrinkage ridges (`nullspace_dim == 0`, e.g. the
+/// linear-term `LinearTermRidge` gam places on a non-intercept covariate such as
+/// `age` in `Surv(time,event) ~ age`) — and so must be fit as a plain
+/// few-parameter AFT MLE (loglogistic / lognormal), exactly like
+/// `survreg`/`lifelines` (issue #736/#735/#721).
+///
+/// The conditions are:
+///   * the time-warp has collapsed to its identifiable affine null space
+///     (`survival_time_rho_count == 0`), i.e. constant scale with no protected
+///     timewiggle;
+///   * there is no link-wiggle and no monotone time-wiggle;
+///   * every threshold and every log-σ penalty is a full-rank parametric ridge
+///     (`nullspace_dim == 0`) — NEVER a wiggliness/smoothing penalty, whose
+///     structural null space (the unpenalized polynomial/affine subspace) is
+///     always nonzero.
+///
+/// In this regime those parametric ridges are dropped from BOTH the inner
+/// prepared model and the outer ρ layout (mirroring how the reduced time block
+/// drops its projected-to-zero penalties): the affine time-warp plus the
+/// location intercept already identify the location/scale, the ridge has no
+/// smoothing parameter worth a vacuous outer ρ coordinate (its default λ would
+/// merely bias the parametric coefficient away from the `survreg`/`lifelines`
+/// MLE), so the fit becomes an unpenalized direct parametric-AFT Newton MLE
+/// (`fit_parametric_aft_direct_mle`) with zero outer coordinates — converging in
+/// milliseconds instead of stalling the coupled exact-joint REML optimizer on a
+/// flat, vacuous ρ surface.
+///
+/// Certification is conservative: if either block's `nullspace_dims` metadata is
+/// absent or length-mismatched (so a null space cannot be certified zero) the
+/// regime is NOT recognized and the fit stays on the full coupled path. A
+/// genuinely flexible fit (smooth mean `~ s(z)`, smooth scale
+/// `noise_formula = s(...)`, a link-wiggle, an active timewiggle, or a varying
+/// scale) carries a wiggliness penalty with `nullspace_dim > 0` or a surviving
+/// time ρ, so it never matches here.
+fn survival_reduced_parametric_aft_regime(
+    time_penalties: &[Array2<f64>],
+    time_ncols: usize,
+    constant_scale: bool,
+    protected_timewiggle_cols: usize,
+    threshold_nullspace_dims: &[usize],
+    threshold_npenalties: usize,
+    log_sigma_nullspace_dims: &[usize],
+    log_sigma_npenalties: usize,
+    has_linkwiggle: bool,
+) -> bool {
+    if has_linkwiggle || protected_timewiggle_cols > 0 {
+        return false;
+    }
+    if survival_time_rho_count(
+        time_penalties,
+        time_ncols,
+        constant_scale,
+        protected_timewiggle_cols,
+    ) != 0
+    {
+        return false;
+    }
+    block_penalties_all_parametric_ridges(threshold_nullspace_dims, threshold_npenalties)
+        && block_penalties_all_parametric_ridges(log_sigma_nullspace_dims, log_sigma_npenalties)
+}
+
+/// True iff a block's `npenalties` penalties are all full-rank parametric ridges
+/// — every certified structural null-space dimension is zero. A block with no
+/// penalties trivially passes. When the `nullspace_dims` metadata is absent or
+/// length-mismatched the null space cannot be certified, so this conservatively
+/// returns `false` (treat as potentially smoothing).
+fn block_penalties_all_parametric_ridges(nullspace_dims: &[usize], npenalties: usize) -> bool {
+    if npenalties == 0 {
+        return true;
+    }
+    nullspace_dims.len() == npenalties && nullspace_dims.iter().all(|&d| d == 0)
 }
 
 fn prepare_identified_time_block(
@@ -10589,16 +10724,19 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
 /// Run the direct parametric-AFT MLE for a fully reduced constant-scale model
 /// and assemble the same [`UnifiedFitResult`] the coupled path would produce.
 ///
-/// Every block is unpenalized (zero ρ), so `log_lambdas`/`lambdas` are empty,
-/// the stable penalty term is zero, and the penalized objective is just `−ℓ̂`.
-/// The conditional covariance is the inverse of the observed information `H`
-/// (the joint negative-log-likelihood Hessian at the MLE), and the geometry's
-/// penalized Hessian is `H` itself — matching the exact-Newton joint geometry
-/// the coupled survival path stores (`working_weights`/`working_response` are
-/// the zero-length convention used by exact-Newton joint families). The shared
-/// [`crate::custom_family::blockwise_fit_from_parts`] assembler then computes
-/// EDF (= parameter count, since unpenalized) and the inference block exactly
-/// as for any custom-family fit.
+/// Every block is unpenalized (zero ρ) — the reduced affine time-warp, the
+/// location intercept/covariate, and the constant log-σ identify the AFT MLE
+/// directly, and `survival_reduced_parametric_aft_regime` has already dropped
+/// any default parametric shrinkage ridge — so `log_lambdas`/`lambdas` are
+/// empty, the stable penalty term is zero, and the penalized objective is just
+/// `−ℓ̂`. The conditional covariance is the inverse of the observed information
+/// `H` (the joint negative-log-likelihood Hessian at the MLE), and the
+/// geometry's penalized Hessian is `H` itself — matching the exact-Newton joint
+/// geometry the coupled survival path stores (`working_weights`/`working_response`
+/// are the zero-length convention used by exact-Newton joint families). The
+/// shared [`crate::custom_family::blockwise_fit_from_parts`] assembler then
+/// computes EDF (= parameter count, since unpenalized) and the inference block
+/// exactly as for any custom-family fit.
 fn fit_reduced_parametric_aft(
     prepared: &PreparedSurvivalLocationScaleModel,
     options: &BlockwiseFitOptions,
@@ -10879,10 +11017,40 @@ pub(crate) fn fit_survival_location_scale_terms(
             .clone()
             .unwrap_or_else(|| Array1::zeros(k_time))
     };
+    // Reduced parametric-AFT regime (issue #736/#735/#721): when the location
+    // (and scale) carry only full-rank parametric shrinkage ridges
+    // (`nullspace_dim == 0`, e.g. the linear-term `LinearTermRidge` on `age`)
+    // and the time-warp has reduced to affine with no wiggle, those ridges are
+    // dropped — the inner `prepare_survival_location_scale_model` applies the
+    // IDENTICAL predicate to the same boot-design penalties, so the inner and
+    // outer ρ counts stay provably in lock-step. Dropping them takes the
+    // threshold/log_sigma ρ counts to 0, so the outer search carries ZERO
+    // coordinates and the fit is a single direct unpenalized parametric-AFT MLE
+    // (`fit_parametric_aft_direct_mle`) — milliseconds, and numerically the
+    // `survreg`/`lifelines` MLE — instead of crawling a flat, vacuous ρ surface.
+    let drop_parametric_ridges = survival_reduced_parametric_aft_regime(
+        &spec.time_block.penalties,
+        spec.time_block.design_exit.ncols(),
+        constant_scale,
+        protected_timewiggle_cols,
+        &threshold_boot_design.nullspace_dims,
+        threshold_boot_design.penalties.len(),
+        &log_sigma_boot_design.nullspace_dims,
+        log_sigma_boot_design.penalties.len(),
+        spec.linkwiggle_block.is_some(),
+    );
     let layout = SurvivalLambdaLayout::new(
         k_time,
-        threshold_boot_design.penalties.len(),
-        log_sigma_boot_design.penalties.len(),
+        if drop_parametric_ridges {
+            0
+        } else {
+            threshold_boot_design.penalties.len()
+        },
+        if drop_parametric_ridges {
+            0
+        } else {
+            log_sigma_boot_design.penalties.len()
+        },
         wiggle_rho0.len(),
     );
     let mut rho0 = Array1::<f64>::zeros(layout.total());
@@ -11079,11 +11247,23 @@ pub(crate) fn fit_survival_location_scale_terms(
             time_beta_hint.borrow().as_ref(),
             spec.time_block.design_exit.ncols(),
         );
+        // In the reduced parametric-AFT regime the layout carries no
+        // threshold/log_sigma ρ (`drop_parametric_ridges`), yet the boot design
+        // still carries the parametric ridge as a penalty. Passing the empty
+        // layout slice as the seed would mismatch that penalty count; instead
+        // pass `None` so the block defaults to a length-matched zero seed, which
+        // the inner `prepare_survival_location_scale_model` then drops along with
+        // the ridge. Outside the regime the layout slice length equals the
+        // design penalty count, so `Some(slice)` is exact.
         let threshold_block = build_survival_covariate_block_from_design(
             threshold_design,
             &spec.threshold_template,
             &spec.threshold_offset,
-            Some(layout.threshold_from(rho)),
+            if drop_parametric_ridges {
+                None
+            } else {
+                Some(layout.threshold_from(rho))
+            },
             filtered_initial_beta(
                 threshold_beta_hint.borrow().as_ref(),
                 match &spec.threshold_template {
@@ -11098,7 +11278,11 @@ pub(crate) fn fit_survival_location_scale_terms(
             log_sigma_design,
             &spec.log_sigma_template,
             &spec.log_sigma_offset,
-            Some(layout.log_sigma_from(rho)),
+            if drop_parametric_ridges {
+                None
+            } else {
+                Some(layout.log_sigma_from(rho))
+            },
             filtered_initial_beta(
                 log_sigma_beta_hint.borrow().as_ref(),
                 match &spec.log_sigma_template {
