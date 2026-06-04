@@ -208,7 +208,7 @@ fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
     if base_weight == 0.0 {
         return 0.0;
     }
-    debug_assert!(
+    assert!(
         base_weight.is_finite() && rho.is_finite(),
         "resolve_learnable_weight requires finite inputs; got base_weight={base_weight}, rho={rho}"
     );
