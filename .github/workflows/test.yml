@@ -97,6 +97,8 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
 
       - name: Run tests
         shell: bash
@@ -137,8 +139,32 @@ jobs:
           # debug sections in every integration-test binary. Dropping dev
           # debuginfo removes the largest non-executable payload from the link
           # and keeps the serialized link job practical on standard runners.
-          cargo test --config profile.dev.debug=0 --all-features --jobs 1 2>&1 | tee /tmp/cargo-test.log
-          test_status=${PIPESTATUS[0]}
+          run_cargo_test() {
+            cargo test --config profile.dev.debug=0 --all-features --jobs 1 "$@" 2>&1 | tee -a /tmp/cargo-test.log
+            return "${PIPESTATUS[0]}"
+          }
+
+          test_status=0
+          : > /tmp/cargo-test.log
+
+          if ! run_cargo_test --lib --bins --examples; then
+            test_status=1
+          fi
+
+          if [ "$test_status" -eq 0 ]; then
+            for test_file in tests/*.rs; do
+              test_name="$(basename "$test_file" .rs)"
+              if ! run_cargo_test --test "$test_name"; then
+                test_status=1
+                break
+              fi
+              rm -f "target/debug/deps/${test_name}"-* \
+                    "target/debug/deps/${test_name//-/_}"-* \
+                    "target/debug/incremental/${test_name}"-* \
+                    "target/debug/incremental/${test_name//-/_}"-* || true
+              df -h /
+            done
+          fi
 
           # The patterns here are literal/ERE substrings that match the
           # exact log::warn!/log::error!/Display strings emitted at runtime
