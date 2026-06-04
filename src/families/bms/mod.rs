@@ -52,6 +52,12 @@ pub(crate) mod exact_kernel;
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;
 
+/// Above this size, FLEX spatial length-scale optimization uses the pilot
+/// geometry initializer and skips the iterative joint κ/ψ outer loop. This is
+/// a spatial-optimizer policy only; it must not gate exact outer Hessian
+/// capability or row-cell moment materialization.
+const BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD: usize = 50_000;
+
 #[derive(Clone, Debug)]
 pub struct DeviationBlockConfig {
     pub degree: usize,

@@ -2837,8 +2837,9 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
 }
 
 /// Returns `true` when a spatial term has NO outer optimization axes — i.e.
-/// the user provided an explicit `length_scale` without enabling anisotropy,
-/// so both the scalar κ and per-axis ψ contrasts are fixed.
+/// the user provided an explicit `length_scale` and the term does not enroll
+/// REML-side per-axis ψ contrasts, so both the scalar κ and any fixed geometry
+/// anisotropy are anchored.
 ///
 /// This is the per-term predicate that distinguishes "fixed kernel scale"
 /// from "optimize the kernel scale" within the family entry points that
@@ -2846,12 +2847,8 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
 /// marginal-slope, where the joint-spatial outer solver otherwise spends
 /// ~80 iters stalled on the user's chosen ρ at high gradient).
 pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
-    let aniso = get_spatial_aniso_log_scales(spec, term_idx);
-    let aniso_active = matches!(
-        (aniso.as_ref(), get_spatial_feature_dim(spec, term_idx)),
-        (Some(eta), Some(d)) if eta.len() == d && d > 0
-    );
-    get_spatial_length_scale(spec, term_idx).is_some() && !aniso_active
+    get_spatial_length_scale(spec, term_idx).is_some()
+        && !spatial_term_uses_per_axis_psi(spec, term_idx)
 }
 
 /// Per-term data-derived ψ = log κ bounds.
@@ -25679,6 +25676,48 @@ mod tests {
         assert_eq!(coords.as_array().len(), 1);
         let expected_psi = -opts.min_length_scale.ln();
         assert!((coords.as_array()[0] - expected_psi).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "duchon_fixed_geometry".to_string(),
+                basis: SmoothBasisSpec::Duchon {
+                    feature_cols: vec![0, 1, 2],
+                    spec: DuchonBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::UserProvided(array![
+                            [0.0, 0.0, 0.0],
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ]),
+                        length_scale: Some(1.0),
+                        power: 1.0,
+                        nullspace_order: DuchonNullspaceOrder::Linear,
+                        identifiability: SpatialIdentifiability::None,
+                        aniso_log_scales: Some(vec![0.7, 0.2, 0.1]),
+                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        boundary: OneDimensionalBoundary::Open,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+
+        assert!(
+            spatial_term_has_locked_kappa(&spec, 0),
+            "Duchon anisotropy is fixed geometry and must not force ψ optimization"
+        );
+        assert!(
+            all_spatial_terms_kappa_fixed(&spec),
+            "a Duchon term with explicit length_scale and fixed anisotropy has no REML κ/ψ axis"
+        );
     }
 
     #[test]
