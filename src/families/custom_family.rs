@@ -1426,9 +1426,13 @@ fn assert_states_match_specs(
             spec.design.ncols(),
             "{context}: beta length mismatch in block {block}"
         );
+        // `state.eta` is produced from `solver_design()` (see
+        // `refresh_all_block_etas`), which is `stacked_design` when set
+        // (3·n_obs rows for survival LS time-varying blocks) and `design`
+        // (n_obs rows) otherwise. Use the same accessor here.
         assert_eq!(
             state.eta.len(),
-            spec.design.nrows(),
+            spec.solver_design().nrows(),
             "{context}: eta length mismatch in block {block}"
         );
     }
