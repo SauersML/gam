@@ -42,9 +42,9 @@ use crate::families::transformation_normal::{
 use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{
-    AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, SpatialLengthScaleOptimizationOptions,
-    StandardLatentCoordConfig, TermCollectionDesign, TermCollectionSpec,
-    build_term_collection_design,
+    AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, LinearTermSpec,
+    SpatialLengthScaleOptimizationOptions, StandardLatentCoordConfig, TermCollectionDesign,
+    TermCollectionSpec, build_term_collection_design,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_latent_coord_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization,
@@ -4593,6 +4593,147 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     Ok(spec)
 }
 
+fn linear_term_training_column(
+    data: &Dataset,
+    term: &LinearTermSpec,
+) -> Result<Array1<f64>, WorkflowError> {
+    let cols = term.effective_feature_cols();
+    if cols.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "linear term '{}' has no feature columns; cannot build its training column",
+                term.name
+            ),
+        });
+    }
+    let n = data.values.nrows();
+    let mut out = Array1::<f64>::ones(n);
+    for &col in &cols {
+        if col >= data.values.ncols() {
+            return Err(WorkflowError::SchemaMismatch {
+                reason: format!(
+                    "linear term '{}' feature column {} out of bounds for {} columns",
+                    term.name,
+                    col,
+                    data.values.ncols()
+                ),
+            }
+            .into());
+        }
+        for row in 0..n {
+            out[row] *= data.values[[row, col]];
+        }
+    }
+    Ok(out)
+}
+
+fn residualize_against_orthonormal_basis(
+    column: &Array1<f64>,
+    basis: &[Array1<f64>],
+) -> Array1<f64> {
+    let mut residual = column.clone();
+    for q in basis {
+        let coeff = residual.dot(q);
+        residual.scaled_add(-coeff, q);
+    }
+    residual
+}
+
+fn l2_norm(column: &Array1<f64>) -> f64 {
+    column.iter().map(|v| v * v).sum::<f64>().sqrt()
+}
+
+fn prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+    spec: &mut TermCollectionSpec,
+    data: &Dataset,
+    label: &str,
+    inference_notes: &mut Vec<String>,
+) -> Result<(), WorkflowError> {
+    if spec.linear_terms.is_empty() {
+        return Ok(());
+    }
+
+    let n = data.values.nrows();
+    if n == 0 {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("{label}: cannot rank-check scalar terms on zero rows"),
+        });
+    }
+
+    let mut basis = Vec::<Array1<f64>>::new();
+    let intercept = Array1::<f64>::ones(n);
+    let intercept_norm = l2_norm(&intercept);
+    if intercept_norm == 0.0 || !intercept_norm.is_finite() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("{label}: implicit intercept has invalid norm {intercept_norm}"),
+        });
+    }
+    basis.push(intercept.mapv(|v| v / intercept_norm));
+
+    let rank_alpha = crate::linalg::faer_ndarray::default_rrqr_rank_alpha();
+    let mut scale = intercept_norm.max(1.0);
+    let mut kept = Vec::<LinearTermSpec>::with_capacity(spec.linear_terms.len());
+    let mut dropped = Vec::<String>::new();
+
+    for term in &spec.linear_terms {
+        let column = linear_term_training_column(data, term)?;
+        let norm = l2_norm(&column);
+        if !norm.is_finite() {
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!("{label}: linear term '{}' has non-finite norm", term.name),
+            });
+        }
+        scale = scale.max(norm.max(1.0));
+        let residual = residualize_against_orthonormal_basis(&column, &basis);
+        let residual_norm = l2_norm(&residual);
+        let tol = rank_alpha * f64::EPSILON * ((n + basis.len() + 1).max(1) as f64) * scale;
+        let is_data_redundant = residual_norm <= tol;
+        let has_constraints = term.coefficient_min.is_some() || term.coefficient_max.is_some();
+        if is_data_redundant {
+            if has_constraints {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "{label}: constrained linear term '{}' is redundant with the implicit \
+                         intercept or earlier scalar terms; remove the constraint or the \
+                         redundant term",
+                        term.name
+                    ),
+                });
+            }
+            if term.double_penalty {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "{label}: explicitly penalized linear term '{}' is redundant with the \
+                         implicit intercept or earlier scalar terms; remove the redundant term \
+                         instead of relying on a ridge to identify a duplicate data direction",
+                        term.name
+                    ),
+                });
+            }
+            dropped.push(format!(
+                "{} (residual_norm={:.3e}, tol={:.3e})",
+                term.name, residual_norm, tol
+            ));
+            continue;
+        }
+        if residual_norm > tol {
+            basis.push(residual.mapv(|v| v / residual_norm));
+        }
+        kept.push(term.clone());
+    }
+
+    if !dropped.is_empty() {
+        inference_notes.push(format!(
+            "{label}: removed {} scalar term(s) that add no identifiable \
+             direction beyond the implicit intercept and earlier scalar terms: {}",
+            dropped.len(),
+            dropped.join(", ")
+        ));
+        spec.linear_terms = kept;
+    }
+    Ok(())
+}
+
 fn standard_adaptive_regularization_options(
     config: &FitConfig,
 ) -> Option<AdaptiveRegularizationOptions> {
@@ -5985,7 +6126,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
         Some(z_column) => column_map_with_alias(col_map, "z", z_column),
         None => col_map.clone(),
     };
-    let marginalspec = build_termspec_with_geometry_and_overrides(
+    let mut marginalspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
         &aliased_col_map,
@@ -5994,7 +6135,13 @@ fn materialize_bernoulli_marginal_slope<'a>(
         &policy,
         config.smooth_overrides.as_ref(),
     )?;
-    let logslopespec = build_termspec_with_geometry_and_overrides(
+    prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+        &mut marginalspec,
+        data,
+        "bernoulli marginal-slope marginal formula",
+        &mut inference_notes,
+    )?;
+    let mut logslopespec = build_termspec_with_geometry_and_overrides(
         &parsed_logslope.terms,
         data,
         &aliased_col_map,
@@ -6002,6 +6149,12 @@ fn materialize_bernoulli_marginal_slope<'a>(
         config.scale_dimensions,
         &policy,
         config.smooth_overrides.as_ref(),
+    )?;
+    prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+        &mut logslopespec,
+        data,
+        "bernoulli marginal-slope logslope_formula",
+        &mut inference_notes,
     )?;
     let weights = resolve_weight_column(data, col_map, config.weight_column.as_deref())?;
     let marginal_offset = resolve_offset_column(data, col_map, config.offset_column.as_deref())?;
@@ -7823,6 +7976,112 @@ mod tests {
             materialized.request,
             FitRequest::BernoulliMarginalSlope(_)
         ));
+    }
+
+    #[test]
+    fn materialize_bernoulli_marginal_slope_prunes_redundant_scalar_term() {
+        let data = Dataset {
+            headers: vec![
+                "event".to_string(),
+                "x".to_string(),
+                "constant_spline_col".to_string(),
+                "prs_z".to_string(),
+                "PC1".to_string(),
+                "PC2".to_string(),
+                "PC3".to_string(),
+            ],
+            values: Array2::from_shape_vec(
+                (6, 7),
+                vec![
+                    0.0, -2.0, 1.0, -1.2, -1.0, 0.2, 0.7, 1.0, -1.0, 1.0, -0.4, -0.4, -0.3, 0.5,
+                    0.0, 0.0, 1.0, 0.1, 0.1, 0.4, -0.2, 1.0, 1.0, 1.0, 0.5, 0.7, -0.6, 0.3, 0.0,
+                    2.0, 1.0, 1.1, 1.2, 0.9, 0.0, 1.0, 3.0, 1.0, 1.7, 1.6, -0.8, -0.4,
+                ],
+            )
+            .expect("BMS redundant scalar test data shape"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "event".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "constant_spline_col".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "prs_z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC2".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC3".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Binary,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        };
+        let config = FitConfig {
+            logslope_formula: Some("matern(PC1, PC2, PC3, centers=3)".to_string()),
+            z_column: Some("prs_z".to_string()),
+            ..FitConfig::default()
+        };
+        let materialized = materialize(
+            "event ~ matern(PC1, PC2, PC3, centers=3) + x + constant_spline_col",
+            &data,
+            &config,
+        )
+        .expect("BMS materialization should prune the redundant scalar term");
+        let MaterializedModel {
+            request,
+            inference_notes,
+        } = materialized;
+        let FitRequest::BernoulliMarginalSlope(request) = request else {
+            panic!("expected Bernoulli marginal-slope request");
+        };
+        let kept: Vec<&str> = request
+            .spec
+            .marginalspec
+            .linear_terms
+            .iter()
+            .map(|term| term.name.as_str())
+            .collect();
+        assert_eq!(kept, vec!["x"]);
+        assert_eq!(request.spec.marginalspec.smooth_terms.len(), 1);
+        assert_eq!(request.spec.logslopespec.smooth_terms.len(), 1);
+        assert!(
+            inference_notes
+                .iter()
+                .any(|note| note.contains("constant_spline_col")),
+            "materialization should report the removed redundant scalar term; notes={inference_notes:?}"
+        );
     }
 
     #[test]
