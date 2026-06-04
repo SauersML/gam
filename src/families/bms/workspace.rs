@@ -4235,6 +4235,68 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
         if !plan.materialize {
+            let tiled_budget_bytes = plan
+                .global_pin_budget_bytes
+                .saturating_sub(plan.workspace_pinned_bytes);
+            if plan.expected_reuse_passes >= BMS_ROW_PRIMARY_HESSIAN_MIN_REUSE_PASSES
+                && plan.bytes <= tiled_budget_bytes
+                && n > 0
+            {
+                let started = std::time::Instant::now();
+                let heartbeat_guard = crate::heartbeat::scope(format!(
+                    "BMS row-primary-hessian-tiles n={n} r={r} bytes={} tile_rows={} global_budget={}",
+                    plan.bytes, BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS, plan.global_pin_budget_bytes
+                ));
+                if log_exact_work(n) {
+                    log::info!(
+                        "[BMS row-primary-hessian-cache] decision=tile need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} tile_rows={} n={} r={} expected_reuse_passes={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
+                        plan.bytes,
+                        plan.runtime_available_bytes,
+                        plan.stable_capacity_bytes,
+                        plan.workspace_pinned_bytes,
+                        plan.single_cache_budget_bytes,
+                        plan.global_pin_budget_bytes,
+                        BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS,
+                        n,
+                        r,
+                        plan.expected_reuse_passes,
+                        plan.reason.as_str(),
+                        gpu_decision.policy.as_str(),
+                        gpu_decision.use_gpu,
+                        gpu_decision.reason,
+                    );
+                }
+                let completed_rows = AtomicUsize::new(0);
+                let progress_step = (n / 10).max(1);
+                let mut tiles = Vec::with_capacity(n.div_ceil(BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS));
+                let mut row_start = 0usize;
+                while row_start < n {
+                    let row_end = (row_start + BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS).min(n);
+                    tiles.push(self.build_row_primary_hessian_tile(
+                        block_states,
+                        cache,
+                        row_start..row_end,
+                        &completed_rows,
+                        progress_step,
+                        started,
+                    )?);
+                    row_start = row_end;
+                }
+                if log_exact_work(n) {
+                    log::info!(
+                        "[BMS row-primary-hessian-cache] tiled build done n={} r={} tiles={} bytes={} elapsed={:.3}s",
+                        n,
+                        r,
+                        tiles.len(),
+                        plan.bytes,
+                        started.elapsed().as_secs_f64()
+                    );
+                }
+                drop(heartbeat_guard);
+                return Ok(RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
+                    n, r, tiles,
+                )));
+            }
             if log_exact_work(n) {
                 log::info!(
                     "[BMS row-primary-hessian-cache] decision=stream need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
@@ -4498,6 +4560,92 @@ impl BernoulliMarginalSlopeFamily {
         )))
     }
 
+    fn row_primary_eval_tile_bytes(rows: usize, r: usize) -> u64 {
+        let floats_per_row = (r as u64)
+            .saturating_mul(r as u64)
+            .saturating_add(r as u64)
+            .saturating_add(1);
+        (rows as u64)
+            .saturating_mul(floats_per_row)
+            .saturating_mul(std::mem::size_of::<f64>() as u64)
+    }
+
+    fn build_row_primary_hessian_tile(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        rows: std::ops::Range<usize>,
+        completed_rows: &AtomicUsize,
+        progress_step: usize,
+        started: std::time::Instant,
+    ) -> Result<RowPrimaryEvalTile, String> {
+        let n = self.y.len();
+        let r = cache.primary.total;
+        let tile_len = rows.end - rows.start;
+        let mut packed_neglog = Array1::<f64>::zeros(tile_len);
+        let mut packed_grad = Array2::<f64>::zeros((tile_len, r));
+        let mut packed_hess = Array2::<f64>::zeros((tile_len, r * r));
+        let chunk_evals: Vec<(f64, Vec<f64>, Vec<f64>)> = rows
+            .clone()
+            .into_par_iter()
+            .map(|row| -> Result<(f64, Vec<f64>, Vec<f64>), String> {
+                let row_ctx = Self::row_ctx(cache, row);
+                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
+                let row_moments = cache
+                    .row_cell_moments
+                    .as_ref()
+                    .and_then(|bundle| bundle.row(row, 9));
+                let neglog = self.compute_row_analytic_flex_into_with_moments(
+                    row,
+                    block_states,
+                    &cache.primary,
+                    row_ctx,
+                    row_moments,
+                    true,
+                    &mut scratch,
+                )?;
+                if log_exact_work(n) {
+                    let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
+                    if done == n || done % progress_step == 0 {
+                        log::info!(
+                            "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
+                            done,
+                            n,
+                            started.elapsed().as_secs_f64()
+                        );
+                    }
+                }
+                Ok((
+                    neglog,
+                    scratch.grad.to_vec(),
+                    scratch
+                        .hess
+                        .as_slice()
+                        .expect("hess is contiguous")
+                        .to_vec(),
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (offset, (neglog, grad_flat, hess_flat)) in chunk_evals.into_iter().enumerate() {
+            packed_neglog[offset] = neglog;
+            packed_grad
+                .row_mut(offset)
+                .iter_mut()
+                .zip(grad_flat.iter())
+                .for_each(|(d, s)| *d = *s);
+            packed_hess
+                .row_mut(offset)
+                .iter_mut()
+                .zip(hess_flat.iter())
+                .for_each(|(d, s)| *d = *s);
+        }
+        let bytes = Self::row_primary_eval_tile_bytes(tile_len, r);
+        Ok(RowPrimaryEvalTile {
+            row_start: rows.start,
+            rows: RowPrimaryEvalPin::new(packed_neglog, packed_grad, packed_hess, bytes),
+        })
+    }
+
     /// Look up the cached per-row primary Hessian (`r × r`) materialized at
     /// the workspace β snapshot when `row_primary_hessians` is populated.
     /// Returns `None` when the cache is absent or the row index is out of
@@ -4511,8 +4659,24 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Option<ArrayView2<'a, f64>> {
-        let hess = cache.row_primary_hessians.host_pin()?.hess();
         let r = cache.primary.total;
+        if let Some(pin) = cache.row_primary_hessians.host_pin() {
+            return Self::cached_row_primary_hessian_from_pin(pin, row, r);
+        }
+        if let Some(tiles) = cache.row_primary_hessians.tiles() {
+            let (tile, local_row) = tiles.tile_for_row(row)?;
+            return Self::cached_row_primary_hessian_from_pin(&tile.rows, local_row, r);
+        }
+        None
+    }
+
+    #[inline]
+    fn cached_row_primary_hessian_from_pin<'a>(
+        pin: &'a RowPrimaryEvalPin,
+        row: usize,
+        r: usize,
+    ) -> Option<ArrayView2<'a, f64>> {
+        let hess = pin.hess();
         if row >= hess.nrows() {
             return None;
         }
@@ -4532,10 +4696,25 @@ impl BernoulliMarginalSlopeFamily {
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
     ) -> Option<(f64, ArrayView1<'a, f64>)> {
-        let pin = cache.row_primary_hessians.host_pin()?;
+        let r = cache.primary.total;
+        if let Some(pin) = cache.row_primary_hessians.host_pin() {
+            return Self::cached_row_primary_eval_from_pin(pin, row, r);
+        }
+        if let Some(tiles) = cache.row_primary_hessians.tiles() {
+            let (tile, local_row) = tiles.tile_for_row(row)?;
+            return Self::cached_row_primary_eval_from_pin(&tile.rows, local_row, r);
+        }
+        None
+    }
+
+    #[inline]
+    fn cached_row_primary_eval_from_pin<'a>(
+        pin: &'a RowPrimaryEvalPin,
+        row: usize,
+        r: usize,
+    ) -> Option<(f64, ArrayView1<'a, f64>)> {
         let neglog = pin.neglog();
         let grad = pin.grad();
-        let r = cache.primary.total;
         if row >= neglog.len() || row >= grad.nrows() {
             return None;
         }
@@ -9866,6 +10045,98 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(());
         }
 
+        if let Some(tiles) = cache.row_primary_hessians.tiles() {
+            if tiles.r != primary.total || tiles.n_rows != n {
+                return Err(format!(
+                    "BMS tiled row-primary Hessian shape mismatch: tiles n={} r={}, expected n={} r={}",
+                    tiles.n_rows, tiles.r, n, primary.total
+                ));
+            }
+            if tiles.is_empty() {
+                return Ok(());
+            }
+            if log_exact_work(n) {
+                log::info!(
+                    "[BMS exact-newton HVP] route=tiled-host rows={} r={} tiles={} bytes={}",
+                    n,
+                    tiles.r,
+                    tiles.tiles.len(),
+                    tiles.total_bytes()
+                );
+            }
+            let r_pr = primary.total;
+            let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
+            for tile in &tiles.tiles {
+                let tile_rows = tile.rows.hess().nrows();
+                let mut v_rows = vec![0.0_f64; tile_rows * r_pr];
+                for local in 0..tile_rows {
+                    let row = tile.row_start + local;
+                    self.row_primary_direction_from_flat_into(
+                        row,
+                        slices,
+                        primary,
+                        direction,
+                        &mut row_dir_scratch,
+                    )?;
+                    v_rows[local * r_pr..(local + 1) * r_pr]
+                        .copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
+                }
+                let h_rows_slice = tile
+                    .rows
+                    .hess()
+                    .as_slice()
+                    .expect("tiled row_primary_hessians.hess() is row-major contiguous");
+                let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                    n_rows: tile_rows,
+                    r: r_pr,
+                    h_rows: h_rows_slice,
+                    v_rows: &v_rows,
+                };
+                let y_rows = {
+                    #[cfg(target_os = "linux")]
+                    {
+                        match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
+                            crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                                n_rows: tile_rows,
+                                r: r_pr,
+                                h_rows: h_rows_slice,
+                                v_rows: &v_rows,
+                            },
+                        ) {
+                            Ok(result) => result.y_rows,
+                            Err(err) => {
+                                log::info!(
+                                    "[BMS exact-newton HVP] tiled GPU matvec failed: {err}; \
+                                     falling back to CPU oracle"
+                                );
+                                crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                            }
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                    }
+                };
+                for local in 0..tile_rows {
+                    let row = tile.row_start + local;
+                    let action_slice = &y_rows[local * r_pr..(local + 1) * r_pr];
+                    row_dir_scratch
+                        .iter_mut()
+                        .zip(action_slice.iter())
+                        .for_each(|(dst, &src)| *dst = src);
+                    self.pullback_primary_vector_add_into(
+                        row,
+                        slices,
+                        primary,
+                        &row_dir_scratch,
+                        out,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+
         let partial = (0..n.div_ceil(ROW_CHUNK_SIZE))
             .into_par_iter()
             .try_fold(
@@ -10059,6 +10330,97 @@ impl BernoulliMarginalSlopeFamily {
                     for (local_idx, global_idx) in block_w.clone().enumerate() {
                         let ii = primary_w.start + local_idx;
                         diagonal[global_idx] += d_rows[d_row_base + ii];
+                    }
+                }
+            }
+            return Ok(diagonal);
+        }
+
+        if let Some(tiles) = cache.row_primary_hessians.tiles() {
+            if tiles.r != primary.total || tiles.n_rows != n {
+                return Err(format!(
+                    "BMS tiled row-primary Hessian diagonal shape mismatch: tiles n={} r={}, expected n={} r={}",
+                    tiles.n_rows, tiles.r, n, primary.total
+                ));
+            }
+            if log_exact_work(n) {
+                log::info!(
+                    "[BMS exact-newton diag] route=tiled-host rows={} r={} tiles={} bytes={}",
+                    n,
+                    tiles.r,
+                    tiles.tiles.len(),
+                    tiles.total_bytes()
+                );
+            }
+            let r_pr = primary.total;
+            let mut diagonal = Array1::<f64>::zeros(slices.total);
+            for tile in &tiles.tiles {
+                let tile_rows = tile.rows.hess().nrows();
+                let h_rows_slice = tile
+                    .rows
+                    .hess()
+                    .as_slice()
+                    .expect("tiled row_primary_hessians.hess() is row-major contiguous");
+                let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                    n_rows: tile_rows,
+                    r: r_pr,
+                    h_rows: h_rows_slice,
+                };
+                let d_rows = {
+                    #[cfg(target_os = "linux")]
+                    {
+                        match crate::gpu::row_hessian_ops::launch_row_hessian_diag(
+                            crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                                n_rows: tile_rows,
+                                r: r_pr,
+                                h_rows: h_rows_slice,
+                            },
+                        ) {
+                            Ok(out) => out.d_rows,
+                            Err(err) => {
+                                log::info!(
+                                    "[BMS exact-newton diag] tiled GPU diag failed: {err}; \
+                                     falling back to CPU oracle"
+                                );
+                                crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                            }
+                        }
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                    }
+                };
+                for local in 0..tile_rows {
+                    let row = tile.row_start + local;
+                    let d_row_base = local * r_pr;
+                    let h00 = d_rows[d_row_base];
+                    let h11 = d_rows[d_row_base + 1];
+                    {
+                        let mut marginal_diag = diagonal.slice_mut(s![slices.marginal.clone()]);
+                        self.marginal_design
+                            .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
+                    }
+                    {
+                        let mut logslope_diag = diagonal.slice_mut(s![slices.logslope.clone()]);
+                        self.logslope_design
+                            .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
+                    }
+                    if let (Some(primary_h), Some(block_h)) =
+                        (primary.h.as_ref(), slices.h.as_ref())
+                    {
+                        for (local_idx, global_idx) in block_h.clone().enumerate() {
+                            let ii = primary_h.start + local_idx;
+                            diagonal[global_idx] += d_rows[d_row_base + ii];
+                        }
+                    }
+                    if let (Some(primary_w), Some(block_w)) =
+                        (primary.w.as_ref(), slices.w.as_ref())
+                    {
+                        for (local_idx, global_idx) in block_w.clone().enumerate() {
+                            let ii = primary_w.start + local_idx;
+                            diagonal[global_idx] += d_rows[d_row_base + ii];
+                        }
                     }
                 }
             }
@@ -13390,6 +13752,9 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     /// handful of HVPs, so routing the inner solve through the operator path
     /// beats per-cycle dense reassembly.
     pub(super) fn matrix_free_inner_route(&self) -> bool {
+        if self.cache.row_primary_hessians.is_tiled() {
+            return true;
+        }
         if self.cache.row_primary_hessians.is_some() {
             return false;
         }

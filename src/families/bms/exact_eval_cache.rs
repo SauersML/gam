@@ -161,6 +161,44 @@ pub struct RowPrimaryEvalPin {
     pub(super) bytes: u64,
 }
 
+pub(super) struct RowPrimaryEvalTile {
+    pub(super) row_start: usize,
+    pub(super) rows: RowPrimaryEvalPin,
+}
+
+pub(crate) struct RowPrimaryEvalTiles {
+    pub(super) n_rows: usize,
+    pub(super) r: usize,
+    pub(super) tiles: Vec<RowPrimaryEvalTile>,
+}
+
+impl RowPrimaryEvalTiles {
+    pub(super) fn new(n_rows: usize, r: usize, tiles: Vec<RowPrimaryEvalTile>) -> Self {
+        Self { n_rows, r, tiles }
+    }
+
+    #[inline]
+    pub(super) fn is_empty(&self) -> bool {
+        self.tiles.is_empty()
+    }
+
+    #[inline]
+    pub(super) fn tile_for_row(&self, row: usize) -> Option<(&RowPrimaryEvalTile, usize)> {
+        for tile in &self.tiles {
+            let len = tile.rows.neglog().len();
+            if row >= tile.row_start && row < tile.row_start + len {
+                return Some((tile, row - tile.row_start));
+            }
+        }
+        None
+    }
+
+    #[inline]
+    pub(super) fn total_bytes(&self) -> u64 {
+        self.tiles.iter().map(|tile| tile.rows.bytes).sum()
+    }
+}
+
 impl RowPrimaryEvalPin {
     pub(super) fn new(
         neglog: Array1<f64>,
@@ -216,6 +254,13 @@ impl Drop for RowPrimaryEvalPin {
 pub enum RowPrimaryEvalCache {
     Empty,
     Host(RowPrimaryEvalPin),
+    /// Bounded host-resident row-primary Hessian tiles. This is selected when
+    /// the monolithic `n × (1+r+r²)` host cache is rejected by the single-cache
+    /// worthwhileness gate but the full set of tiles fits under the live global
+    /// pin budget. HVP and diagonal consumers stream tile-by-tile, so peak
+    /// build scratch stays one tile wide and the inner operator never falls
+    /// back to recomputing row Hessians per probe.
+    Tiled(RowPrimaryEvalTiles),
     /// Device-resident row Hessian + designs. HVP / diagonal / dense-block
     /// consumers route through the device-aware GPU entry points.
     #[cfg(target_os = "linux")]
@@ -229,6 +274,19 @@ impl RowPrimaryEvalCache {
         !matches!(self, Self::Empty)
     }
 
+    #[inline]
+    pub(crate) fn is_tiled(&self) -> bool {
+        matches!(self, Self::Tiled(_))
+    }
+
+    #[inline]
+    pub(crate) fn tiles(&self) -> Option<&RowPrimaryEvalTiles> {
+        match self {
+            Self::Tiled(tiles) => Some(tiles),
+            _ => None,
+        }
+    }
+
     /// Returns the host-resident pin when the cache is materialised as a
     /// host pin. Returns `None` for the device-resident variant — callers
     /// that need to read the full `r x r` Hessian per row must either
@@ -238,6 +296,7 @@ impl RowPrimaryEvalCache {
     pub(crate) fn host_pin(&self) -> Option<&RowPrimaryEvalPin> {
         match self {
             Self::Host(pin) => Some(pin),
+            Self::Tiled(_) => None,
             Self::Empty => None,
             #[cfg(target_os = "linux")]
             Self::Device(_) => None,

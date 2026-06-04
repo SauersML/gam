@@ -7941,6 +7941,70 @@ mod tests {
     }
 
     #[test]
+    fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
+        let (family, states) = make_flex_hvp_cache_test_family(14);
+        let mut host_cache = family
+            .build_exact_eval_cache(&states)
+            .expect("host exact eval cache");
+        host_cache.row_primary_hessians = family
+            .build_row_primary_hessian_cache(&states, &host_cache)
+            .expect("host row Hessian cache");
+        let host_pin = host_cache
+            .row_primary_hessians
+            .host_pin()
+            .expect("host row-primary cache");
+        let r = host_cache.primary.total;
+        let mut tiles = Vec::new();
+        for rows in [0..5, 5..10, 10..14] {
+            tiles.push(RowPrimaryEvalTile {
+                row_start: rows.start,
+                rows: RowPrimaryEvalPin::new(
+                    host_pin.neglog().slice(s![rows.clone()]).to_owned(),
+                    host_pin.grad().slice(s![rows.clone(), ..]).to_owned(),
+                    host_pin.hess().slice(s![rows, ..]).to_owned(),
+                    0,
+                ),
+            });
+        }
+        let tiled_cache = BernoulliMarginalSlopeExactEvalCache {
+            slices: host_cache.slices.clone(),
+            primary: host_cache.primary.clone(),
+            row_contexts: host_cache.row_contexts.clone(),
+            row_cell_moments: host_cache.row_cell_moments.clone(),
+            row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+            row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
+            row_primary_hessians: RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
+                family.y.len(),
+                r,
+                tiles,
+            )),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
+            rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
+        };
+        let direction = Array1::from_iter(
+            (0..host_cache.slices.total).map(|idx| 0.015 * ((idx % 7) as f64 - 3.0)),
+        );
+        let hv_host = family
+            .exact_newton_joint_hessian_matvec_from_cache(&direction, &states, &host_cache)
+            .expect("host Hv");
+        let hv_tiled = family
+            .exact_newton_joint_hessian_matvec_from_cache(&direction, &states, &tiled_cache)
+            .expect("tiled Hv");
+        let rel_hv = rel_diff_array1(&hv_host, &hv_tiled);
+        assert!(rel_hv < 5e-11, "tiled Hv drift rel {rel_hv}");
+
+        let diag_host = family
+            .exact_newton_joint_hessian_diagonal_from_cache(&states, &host_cache)
+            .expect("host diag");
+        let diag_tiled = family
+            .exact_newton_joint_hessian_diagonal_from_cache(&states, &tiled_cache)
+            .expect("tiled diag");
+        let rel_diag = rel_diff_array1(&diag_host, &diag_tiled);
+        assert!(rel_diag < 5e-11, "tiled diag drift rel {rel_diag}");
+    }
+
+    #[test]
     fn bernoulli_flex_hvp_cache_timing_biobank_shape_pattern() {
         // Wall-clock micro-benchmark for the per-row primary-Hessian cache
         // (`row_primary_hessians`).  The matrix-free CG / inner-Newton loops
