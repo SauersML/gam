@@ -6762,6 +6762,12 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub hessian_psi_psi_operator: Option<Box<dyn HyperOperator>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JointHessianSourcePreference {
+    Dense,
+    Operator,
+}
+
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Pre-build any per-row jet caches the workspace will hand to the
     /// outer-eval directional-derivative path. Called once when the
@@ -6782,6 +6788,12 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
 
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         Ok(None)
+    }
+
+    /// Preferred representation for callers that can consume either the dense
+    /// coefficient Hessian or the matrix-free HVP source.
+    fn hessian_source_preference(&self) -> JointHessianSourcePreference {
+        JointHessianSourcePreference::Dense
     }
 
     /// Forced dense materialization that bypasses any amortization gate the
@@ -6921,6 +6933,16 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
                     crate::solver::estimate::reml::unified::DenseMatrixHyperOperator { matrix },
                 ) as Arc<dyn HyperOperator>
             }))
+    }
+
+    fn second_directional_derivative_operators(
+        &self,
+        d_beta_pairs: &[(Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        d_beta_pairs
+            .iter()
+            .map(|(u, v)| self.second_directional_derivative_operator(u, v))
+            .collect()
     }
 }
 
@@ -10106,6 +10128,12 @@ fn exact_newton_joint_hessian_source_from_workspace(
     total: usize,
     context: &str,
 ) -> Result<Option<JointHessianSource>, String> {
+    if workspace.hessian_source_preference() == JointHessianSourcePreference::Operator {
+        return exact_newton_joint_hessian_operator_source_from_workspace(
+            workspace, total, context,
+        );
+    }
+
     if let Some(mut hessian) = workspace.hessian_dense()? {
         if hessian.nrows() != total || hessian.ncols() != total {
             return Err(CustomFamilyError::DimensionMismatch {
@@ -10127,7 +10155,23 @@ fn exact_newton_joint_hessian_source_from_workspace(
         return Ok(Some(JointHessianSource::Dense(hessian)));
     }
 
+    exact_newton_joint_hessian_operator_source_from_workspace(workspace, total, context)
+}
+
+fn exact_newton_joint_hessian_operator_source_from_workspace(
+    workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
+    total: usize,
+    context: &str,
+) -> Result<Option<JointHessianSource>, String> {
     let Some(diagonal) = workspace.hessian_diagonal()? else {
+        if workspace.hessian_source_preference() == JointHessianSourcePreference::Operator {
+            return Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: format!(
+                    "{context}: operator-preferred Hessian workspace did not provide a diagonal"
+                ),
+            }
+            .into());
+        }
         return Ok(None);
     };
     if diagonal.len() != total {
@@ -10148,6 +10192,14 @@ fn exact_newton_joint_hessian_source_from_workspace(
     }
 
     if !workspace.hessian_matvec_available() {
+        if workspace.hessian_source_preference() == JointHessianSourcePreference::Operator {
+            return Err(CustomFamilyError::UnsupportedConfiguration {
+                reason: format!(
+                    "{context}: operator-preferred Hessian workspace did not provide HVPs"
+                ),
+            }
+            .into());
+        }
         return Ok(None);
     }
 
@@ -10438,17 +10490,20 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
             1.0,
             hessian_workspace.clone(),
         );
+        let compute_d2h_many = exact_newton_d2h_many_closure(1.0, hessian_workspace.clone());
+        let owned_compute_d2h_many =
+            exact_newton_d2h_many_closure_owned(1.0, hessian_workspace.clone());
         return Ok(Some(JointHessianBundle {
             source: h_joint_unpen,
             beta_flat,
             compute_dh,
             compute_dh_many,
             compute_d2h,
-            compute_d2h_many: None,
+            compute_d2h_many,
             owned_compute_dh: Some(owned_compute_dh),
             owned_compute_dh_many,
             owned_compute_d2h: Some(owned_compute_d2h),
-            owned_compute_d2h_many: None,
+            owned_compute_d2h_many,
             rho_curvature_scale: 1.0,
             hessian_logdet_correction: 0.0,
         }));
@@ -10785,6 +10840,24 @@ fn exact_newton_d2h_closure<'a, F: CustomFamily + Sync>(
     }
 }
 
+fn exact_newton_d2h_many_closure<'a>(
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Option<Box<DriftSecondDerivManyFn<'a>>> {
+    let workspace = workspace?;
+    Some(Box::new(move |pairs: &[(Array1<f64>, Array1<f64>)]| {
+        workspace
+            .second_directional_derivative_operators(pairs)?
+            .into_iter()
+            .map(|maybe_operator| {
+                Ok(maybe_operator.map(|operator| {
+                    scale_drift_deriv_result(DriftDerivResult::Operator(operator), scale)
+                }))
+            })
+            .collect()
+    }))
+}
+
 fn exact_newton_dh_closure_owned<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: F,
     synced_states: Arc<Vec<ParameterBlockState>>,
@@ -10852,6 +10925,30 @@ fn exact_newton_d2h_closure_owned<F: CustomFamily + Clone + Send + Sync + 'stati
             v,
         )
     })
+}
+
+fn exact_newton_d2h_many_closure_owned(
+    scale: f64,
+    workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
+) -> Option<
+    Arc<
+        dyn Fn(&[(Array1<f64>, Array1<f64>)]) -> Result<Vec<Option<DriftDerivResult>>, String>
+            + Send
+            + Sync,
+    >,
+> {
+    let workspace = workspace?;
+    Some(Arc::new(move |pairs: &[(Array1<f64>, Array1<f64>)]| {
+        workspace
+            .second_directional_derivative_operators(pairs)?
+            .into_iter()
+            .map(|maybe_operator| {
+                Ok(maybe_operator.map(|operator| {
+                    scale_drift_deriv_result(DriftDerivResult::Operator(operator), scale)
+                }))
+            })
+            .collect()
+    }))
 }
 
 fn strict_solve_spd(matrix: &Array2<f64>, rhs: &Array1<f64>) -> Result<Array1<f64>, String> {
@@ -19796,6 +19893,16 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             },
             hessian_workspace.clone(),
         );
+        let compute_d2h_many = if use_outer_curvature_derivatives {
+            None
+        } else {
+            exact_newton_d2h_many_closure(rho_curvature_scale, hessian_workspace.clone())
+        };
+        let owned_compute_d2h_many = if use_outer_curvature_derivatives {
+            None
+        } else {
+            exact_newton_d2h_many_closure_owned(rho_curvature_scale, hessian_workspace.clone())
+        };
 
         // Route through the unified path (joint_outer_evaluate → reml_laml_evaluate).
         let eval_result = joint_outer_evaluate(
@@ -19823,11 +19930,11 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             &compute_dh,
             compute_dh_many.as_deref(),
             &compute_d2h,
-            None,
+            compute_d2h_many.as_deref(),
             Some(owned_compute_dh),
             owned_compute_dh_many,
             Some(owned_compute_d2h),
-            None,
+            owned_compute_d2h_many,
             ext_bundle,
             None,
             custom_family_batched_outer_hessian_operator(
@@ -20778,8 +20885,18 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         } else {
             rho_curvature_scale
         },
-        hessian_workspace,
+        hessian_workspace.clone(),
     );
+    let compute_d2h_many = if use_outer_curvature_derivatives {
+        None
+    } else {
+        exact_newton_d2h_many_closure(rho_curvature_scale, hessian_workspace.clone())
+    };
+    let owned_compute_d2h_many = if use_outer_curvature_derivatives {
+        None
+    } else {
+        exact_newton_d2h_many_closure_owned(rho_curvature_scale, hessian_workspace.clone())
+    };
 
     let efs_eval = joint_outer_evaluate_efs(
         &inner,
@@ -20805,11 +20922,11 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         &compute_dh,
         compute_dh_many.as_deref(),
         &compute_d2h,
-        None,
+        compute_d2h_many.as_deref(),
         Some(owned_compute_dh),
         owned_compute_dh_many,
         Some(owned_compute_d2h),
-        None,
+        owned_compute_d2h_many,
         Some(ext_bundle),
     )
     .map_err(CustomFamilyError::from)?;
@@ -24284,12 +24401,17 @@ mod tests {
     struct CountingHessianWorkspace {
         dense_calls: Arc<AtomicUsize>,
         matvec_calls: Arc<AtomicUsize>,
+        source_preference: JointHessianSourcePreference,
     }
 
     impl ExactNewtonJointHessianWorkspace for CountingHessianWorkspace {
         fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
             self.dense_calls.fetch_add(1, Ordering::Relaxed);
             Ok(Some(Array2::eye(2)))
+        }
+
+        fn hessian_source_preference(&self) -> JointHessianSourcePreference {
+            self.source_preference
         }
 
         fn hessian_matvec_available(&self) -> bool {
@@ -24319,6 +24441,7 @@ mod tests {
             Arc::new(CountingHessianWorkspace {
                 dense_calls: Arc::clone(&dense_calls),
                 matvec_calls: Arc::clone(&matvec_calls),
+                source_preference: JointHessianSourcePreference::Dense,
             });
 
         let source =
@@ -24333,6 +24456,40 @@ mod tests {
             JointHessianSource::Operator { .. } => panic!("dense source was not preferred"),
         }
         assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn workspace_hessian_source_honors_operator_preference_before_dense_probe() {
+        let dense_calls = Arc::new(AtomicUsize::new(0));
+        let matvec_calls = Arc::new(AtomicUsize::new(0));
+        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
+            Arc::new(CountingHessianWorkspace {
+                dense_calls: Arc::clone(&dense_calls),
+                matvec_calls: Arc::clone(&matvec_calls),
+                source_preference: JointHessianSourcePreference::Operator,
+            });
+
+        let source = exact_newton_joint_hessian_source_from_workspace(
+            &workspace,
+            2,
+            "operator-preferred counting workspace",
+        )
+        .expect("hessian source should build")
+        .expect("hessian source should be present");
+
+        assert_eq!(
+            dense_calls.load(Ordering::Relaxed),
+            0,
+            "operator-preferred source construction must not probe hessian_dense"
+        );
+        match source {
+            JointHessianSource::Operator { apply, .. } => {
+                let v = array![3.0, -2.0];
+                assert_eq!(apply(&v).expect("operator apply should succeed"), v);
+                assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
+            }
+            JointHessianSource::Dense(_) => panic!("operator source was not preferred"),
+        }
     }
 
     #[test]

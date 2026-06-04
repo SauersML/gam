@@ -1126,6 +1126,13 @@ pub(crate) const HVP_ROWS_PER_CTA: u32 = 256;
 #[cfg(target_os = "linux")]
 pub(crate) const HVP_THREADS: u32 = 128;
 
+/// Maximum RHS columns fused into one row-primary HVP launch. The matching
+/// CUDA source uses fixed shared arrays sized as
+/// `BMS_FLEX_ROW_HVP_MAX_RHS * MAX_R`; increasing this requires updating the
+/// `MAX_MULTI_RHS` define in `HVP_KERNEL_SOURCE`.
+#[cfg(target_os = "linux")]
+pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
+
 /// Device-resident state produced by
 /// [`launch_bms_flex_row_kernel_device_resident`] and consumed by
 /// [`launch_bms_flex_row_hvp`] / [`launch_bms_flex_row_diagonal`].
@@ -1187,6 +1194,8 @@ fn num_hvp_chunks(n: usize) -> usize {
 const HVP_KERNEL_SOURCE: &str = r#"
 // CPU parity reference: cpu_oracle_bms_flex_row_hvp / cpu_oracle_bms_flex_row_diagonal
 // in src/gpu/bms_flex_row.rs.
+
+#define MAX_MULTI_RHS 8
 
 extern "C" __global__ void bms_flex_row_hvp_partial(
     int                  n_rows,
@@ -1319,6 +1328,140 @@ extern "C" __global__ void bms_flex_row_hvp_reduce(
         acc += partial[(size_t)c * (size_t)p_total + (size_t)j];
     }
     out[j] = acc;
+}
+
+extern "C" __global__ void bms_flex_row_hvp_multi_partial(
+    int                  n_rows,
+    int                  r,
+    int                  p_m,
+    int                  p_g,
+    int                  p_total,
+    int                  h_block_start,
+    int                  h_block_len,
+    int                  w_block_start,
+    int                  w_block_len,
+    int                  h_primary_start,
+    int                  w_primary_start,
+    int                  rows_per_cta,
+    int                  rhs_count,
+    const double * __restrict__ row_hessians,    // [n, r*r]
+    const double * __restrict__ marginal_design, // [n, p_m]
+    const double * __restrict__ logslope_design, // [n, p_g]
+    const double * __restrict__ v_rhs,           // [rhs_count, p_total]
+    double       * __restrict__ partial)         // [rhs_count, num_chunks, p_total]
+{
+    int chunk = blockIdx.x;
+    int tid   = threadIdx.x;
+    int row_lo = chunk * rows_per_cta;
+    int row_hi = row_lo + rows_per_cta;
+    if (row_hi > n_rows) row_hi = n_rows;
+
+    int num_chunks = (n_rows + rows_per_cta - 1) / rows_per_cta;
+    for (int idx = tid; idx < rhs_count * p_total; idx += blockDim.x) {
+        int rhs = idx / p_total;
+        int j = idx - rhs * p_total;
+        partial[((size_t)rhs * (size_t)num_chunks + (size_t)chunk) * (size_t)p_total + (size_t)j] = 0.0;
+    }
+    __syncthreads();
+
+    __shared__ double row_dir[MAX_MULTI_RHS * 32];
+    __shared__ double action[MAX_MULTI_RHS * 32];
+    __shared__ double dot_reduce[128];
+
+    for (int row = row_lo; row < row_hi; ++row) {
+        const double *mrow = marginal_design + (size_t)row * (size_t)p_m;
+        const double *grow = logslope_design + (size_t)row * (size_t)p_g;
+        const double *Hrow = row_hessians + (size_t)row * (size_t)r * (size_t)r;
+
+        for (int rhs = 0; rhs < rhs_count; ++rhs) {
+            const double *v = v_rhs + (size_t)rhs * (size_t)p_total;
+
+            double local = 0.0;
+            for (int j = tid; j < p_m; j += blockDim.x) {
+                local += mrow[j] * v[j];
+            }
+            dot_reduce[tid] = local;
+            __syncthreads();
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
+                __syncthreads();
+            }
+            if (tid == 0) row_dir[rhs * 32 + 0] = dot_reduce[0];
+
+            local = 0.0;
+            for (int j = tid; j < p_g; j += blockDim.x) {
+                local += grow[j] * v[p_m + j];
+            }
+            dot_reduce[tid] = local;
+            __syncthreads();
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) dot_reduce[tid] += dot_reduce[tid + stride];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                row_dir[rhs * 32 + 1] = dot_reduce[0];
+                for (int k = 0; k < h_block_len; ++k) {
+                    row_dir[rhs * 32 + h_primary_start + k] = v[h_block_start + k];
+                }
+                for (int k = 0; k < w_block_len; ++k) {
+                    row_dir[rhs * 32 + w_primary_start + k] = v[w_block_start + k];
+                }
+            }
+            __syncthreads();
+        }
+
+        for (int idx = tid; idx < rhs_count * r; idx += blockDim.x) {
+            int rhs = idx / r;
+            int u = idx - rhs * r;
+            double acc = 0.0;
+            const double *dir = row_dir + rhs * 32;
+            for (int vv = 0; vv < r; ++vv) {
+                acc += Hrow[u * r + vv] * dir[vv];
+            }
+            action[rhs * 32 + u] = acc;
+        }
+        __syncthreads();
+
+        for (int rhs = 0; rhs < rhs_count; ++rhs) {
+            double *out = partial + ((size_t)rhs * (size_t)num_chunks + (size_t)chunk) * (size_t)p_total;
+            double a0 = action[rhs * 32 + 0];
+            for (int j = tid; j < p_m; j += blockDim.x) {
+                out[j] += a0 * mrow[j];
+            }
+            double a1 = action[rhs * 32 + 1];
+            for (int j = tid; j < p_g; j += blockDim.x) {
+                out[p_m + j] += a1 * grow[j];
+            }
+            if (tid == 0) {
+                for (int k = 0; k < h_block_len; ++k) {
+                    out[h_block_start + k] += action[rhs * 32 + h_primary_start + k];
+                }
+                for (int k = 0; k < w_block_len; ++k) {
+                    out[w_block_start + k] += action[rhs * 32 + w_primary_start + k];
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+extern "C" __global__ void bms_flex_row_hvp_multi_reduce(
+    int                  num_chunks,
+    int                  p_total,
+    int                  rhs_count,
+    const double * __restrict__ partial,   // [rhs_count, num_chunks, p_total]
+    double       * __restrict__ out)        // [rhs_count, p_total]
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = rhs_count * p_total;
+    if (idx >= total) return;
+    int rhs = idx / p_total;
+    int j = idx - rhs * p_total;
+    double acc = 0.0;
+    for (int c = 0; c < num_chunks; ++c) {
+        acc += partial[((size_t)rhs * (size_t)num_chunks + (size_t)c) * (size_t)p_total + (size_t)j];
+    }
+    out[(size_t)rhs * (size_t)p_total + (size_t)j] = acc;
 }
 
 extern "C" __global__ void bms_flex_row_diag_partial(
@@ -2063,8 +2206,6 @@ pub(crate) fn launch_bms_flex_row_kernel_device_resident(
 enum BmsFlexRowLaunchMode {
     /// `bms_flex_row_hvp_partial`, `H · v` per row, result left on-stream.
     HvpDeviceOut,
-    /// `bms_flex_row_hvp_partial`, `H · v` per row, result downloaded to host.
-    HvpHostOut,
     /// `bms_flex_row_diag_partial`, `diag(H)` per row, downloaded to host.
     DiagonalHostOut,
 }
@@ -2074,9 +2215,7 @@ impl BmsFlexRowLaunchMode {
     /// Name of the partial kernel this mode loads from the HVP module.
     fn partial_kernel_name(self) -> &'static str {
         match self {
-            BmsFlexRowLaunchMode::HvpDeviceOut | BmsFlexRowLaunchMode::HvpHostOut => {
-                "bms_flex_row_hvp_partial"
-            }
+            BmsFlexRowLaunchMode::HvpDeviceOut => "bms_flex_row_hvp_partial",
             BmsFlexRowLaunchMode::DiagonalHostOut => "bms_flex_row_diag_partial",
         }
     }
@@ -2328,6 +2467,233 @@ fn launch_bms_flex_row_host(
         })
 }
 
+#[cfg(target_os = "linux")]
+fn validate_bms_flex_row_hvp_multi_shape(
+    storage: &DeviceResidentRowHess,
+    rhs_count: usize,
+    v_rhs_len: usize,
+    out_len: Option<usize>,
+    ctx: &str,
+) -> Result<usize, GpuError> {
+    if rhs_count == 0 || rhs_count > BMS_FLEX_ROW_HVP_MAX_RHS {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row {ctx}: rhs_count={rhs_count} outside 1..={BMS_FLEX_ROW_HVP_MAX_RHS}"
+            ),
+        });
+    }
+    let p_total = storage.block.p_total;
+    let rhs_elems = rhs_count
+        .checked_mul(p_total)
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row {ctx}: rhs_count({rhs_count})*p_total({p_total}) overflow"
+            ),
+        })?;
+    if v_rhs_len != rhs_elems {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row {ctx}: v_rhs.len()={v_rhs_len} != rhs_count({rhs_count})*p_total({p_total})={rhs_elems}"
+            ),
+        });
+    }
+    if let Some(out_len) = out_len
+        && out_len != rhs_elems
+    {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row {ctx}: out.len()={out_len} != rhs_count({rhs_count})*p_total({p_total})={rhs_elems}"
+            ),
+        });
+    }
+    Ok(rhs_elems)
+}
+
+/// Transient device bytes for a multi-RHS HVP launch, excluding persistent
+/// row-Hessian/design storage. Scratch scales with
+/// `rhs_count * num_chunks * p_total`, not `rhs_count * n * r * r`.
+#[cfg(target_os = "linux")]
+pub fn bms_flex_row_hvp_multi_scratch_bytes_for_shape(
+    n: usize,
+    p_total: usize,
+    rhs_count: usize,
+) -> Result<u64, GpuError> {
+    if rhs_count == 0 || rhs_count > BMS_FLEX_ROW_HVP_MAX_RHS {
+        return Err(GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row hvp_multi_scratch_bytes: rhs_count={rhs_count} outside 1..={BMS_FLEX_ROW_HVP_MAX_RHS}"
+            ),
+        });
+    }
+    let num_chunks = num_hvp_chunks(n);
+    let partial = rhs_count
+        .checked_mul(num_chunks)
+        .and_then(|v| v.checked_mul(p_total))
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row hvp_multi_scratch_bytes: rhs_count({rhs_count})*num_chunks({num_chunks})*p_total({p_total}) overflow"
+            ),
+        })?;
+    let rhs_vectors = rhs_count
+        .checked_mul(p_total)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row hvp_multi_scratch_bytes: 2*rhs_count({rhs_count})*p_total({p_total}) overflow"
+            ),
+        })?;
+    let elems = partial
+        .checked_add(rhs_vectors)
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: "bms_flex_row hvp_multi_scratch_bytes: element count overflow".to_string(),
+        })?;
+    Ok((elems * std::mem::size_of::<f64>()) as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn run_bms_flex_row_multi_partial_reduce(
+    storage: &DeviceResidentRowHess,
+    rhs_count: usize,
+    d_v_rhs: &CudaSlice<f64>,
+    d_out: &mut CudaSlice<f64>,
+    ctx: &str,
+) -> Result<(), GpuError> {
+    let rhs_elems = validate_bms_flex_row_hvp_multi_shape(
+        storage,
+        rhs_count,
+        d_v_rhs.len(),
+        Some(d_out.len()),
+        ctx,
+    )?;
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let args = PreparedBmsFlexRowLaunchArgs::from_storage(storage);
+    let p_total = storage.block.p_total;
+    let partial_len = rhs_count
+        .checked_mul(args.num_chunks)
+        .and_then(|v| v.checked_mul(p_total))
+        .ok_or_else(|| GpuError::DriverCallFailed {
+            reason: format!(
+                "bms_flex_row {ctx}: partial length overflow for rhs_count={rhs_count}, num_chunks={}, p_total={p_total}",
+                args.num_chunks
+            ),
+        })?;
+
+    let mut d_partial =
+        stream
+            .alloc_zeros::<f64>(partial_len)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row {ctx} alloc multi partial: {err}"),
+            })?;
+    let part_func = backend
+        .module
+        .load_function("bms_flex_row_hvp_multi_partial")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row {ctx} load multi partial: {err}"),
+        })?;
+    let red_func = backend
+        .module
+        .load_function("bms_flex_row_hvp_multi_reduce")
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row {ctx} load multi reduce: {err}"),
+        })?;
+
+    let rhs_count_i32 = i32::try_from(rhs_count).map_err(|_| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row {ctx}: rhs_count={rhs_count} exceeds i32 range"),
+    })?;
+    let cfg_part = LaunchConfig {
+        grid_dim: (args.num_chunks as u32, 1, 1),
+        block_dim: (HVP_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = stream.launch_builder(&part_func);
+    builder
+        .arg(&args.n_i32)
+        .arg(&args.r_i32)
+        .arg(&args.p_m_i32)
+        .arg(&args.p_g_i32)
+        .arg(&args.p_total_i32)
+        .arg(&args.h_block_start)
+        .arg(&args.h_block_len)
+        .arg(&args.w_block_start)
+        .arg(&args.w_block_len)
+        .arg(&args.h_primary_start)
+        .arg(&args.w_primary_start)
+        .arg(&args.rows_per_cta)
+        .arg(&rhs_count_i32)
+        .arg(&storage.hess)
+        .arg(&storage.marginal_design)
+        .arg(&storage.logslope_design)
+        .arg(d_v_rhs)
+        .arg(&mut d_partial);
+    // SAFETY: storage buffers were validated at construction; `d_v_rhs` and
+    // `d_out` have rhs_count*p_total elements, `d_partial` has
+    // rhs_count*num_chunks*p_total, and rhs_count is bounded by fixed shared
+    // array sizes in the CUDA source.
+    unsafe { builder.launch(cfg_part) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row {ctx} multi partial launch: {err}"),
+    })?;
+
+    let red_threads: u32 = 256;
+    let red_blocks: u32 = ((rhs_elems as u32) + red_threads - 1) / red_threads;
+    let cfg_red = LaunchConfig {
+        grid_dim: (red_blocks, 1, 1),
+        block_dim: (red_threads, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_chunks_i32 = args.num_chunks as i32;
+    let mut builder = stream.launch_builder(&red_func);
+    builder
+        .arg(&num_chunks_i32)
+        .arg(&args.p_total_i32)
+        .arg(&rhs_count_i32)
+        .arg(&d_partial)
+        .arg(d_out);
+    // SAFETY: the reduce kernel reads the just-populated partial buffer and
+    // writes exactly rhs_count*p_total output entries.
+    unsafe { builder.launch(cfg_red) }.map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("bms_flex_row {ctx} multi reduce launch: {err}"),
+    })?;
+    drop(d_partial);
+    Ok(())
+}
+
+/// Device-resident multi-RHS HVP. `v_rhs` is row-major
+/// `[rhs_count, p_total]`; the returned vector has the same layout.
+#[cfg(target_os = "linux")]
+pub(crate) fn launch_bms_flex_row_hvp_multi(
+    storage: &DeviceResidentRowHess,
+    v_rhs: &[f64],
+    rhs_count: usize,
+) -> Result<Vec<f64>, GpuError> {
+    let rhs_elems =
+        validate_bms_flex_row_hvp_multi_shape(storage, rhs_count, v_rhs.len(), None, "hvp_multi")?;
+    let backend = HvpKernelBackend::probe()?;
+    let stream = backend.stream.clone();
+    let d_v_rhs = stream
+        .clone_htod(v_rhs)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp_multi upload v_rhs: {err}"),
+        })?;
+    let mut d_out =
+        stream
+            .alloc_zeros::<f64>(rhs_elems)
+            .map_err(|err| GpuError::DriverCallFailed {
+                reason: format!("bms_flex_row hvp_multi alloc out: {err}"),
+            })?;
+    run_bms_flex_row_multi_partial_reduce(storage, rhs_count, &d_v_rhs, &mut d_out, "hvp_multi")?;
+    stream
+        .synchronize()
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp_multi synchronize: {err}"),
+        })?;
+    stream
+        .clone_dtoh(&d_out)
+        .map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("bms_flex_row hvp_multi download out: {err}"),
+        })
+}
+
 /// Device-output HVP. Runs `bms_flex_row_hvp_partial(_packed)` +
 /// `bms_flex_row_hvp_reduce` on the storage's stream against caller-supplied
 /// device-resident `d_v` (length `p_total` doubles), writing the result into
@@ -2382,7 +2748,7 @@ pub(crate) fn launch_bms_flex_row_hvp(
     storage: &DeviceResidentRowHess,
     v: &[f64],
 ) -> Result<Vec<f64>, GpuError> {
-    launch_bms_flex_row_host(storage, BmsFlexRowLaunchMode::HvpHostOut, Some(v), "hvp")
+    launch_bms_flex_row_hvp_multi(storage, v, 1)
 }
 
 /// Launch the device-resident diagonal kernel. Returns the host-side joint
@@ -3898,6 +4264,165 @@ mod tests {
                     "diag[{i}]: cpu={} gpu={} |Δ|={ddiff:.3e}",
                     cpu_diag[i],
                     gpu_diag[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bms_flex_row_hvp_multi_scratch_is_bounded_at_biobank_shape() {
+        let n = 195_000_usize;
+        let r = 20_usize;
+        let p_total = 44_usize;
+        let rhs_count = 4_usize;
+        let scratch = bms_flex_row_hvp_multi_scratch_bytes_for_shape(n, p_total, rhs_count)
+            .expect("biobank multi-RHS scratch budget");
+        let per_rhs_full_row_cache =
+            (n * r * r * std::mem::size_of::<f64>()) as u64 * rhs_count as u64;
+        assert!(
+            scratch < per_rhs_full_row_cache / 100,
+            "multi-RHS scratch must tile by row chunks instead of materializing \
+             a row-Hessian copy per RHS: scratch={scratch} full_per_rhs={per_rhs_full_row_cache}"
+        );
+        assert!(
+            bms_flex_row_hvp_multi_scratch_bytes_for_shape(
+                n,
+                p_total,
+                BMS_FLEX_ROW_HVP_MAX_RHS + 1
+            )
+            .is_err(),
+            "multi-RHS launch must reject unbounded RHS counts"
+        );
+    }
+
+    #[test]
+    fn bms_flex_row_hvp_multi_kernel_matches_cpu_oracle_when_cuda_available() {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
+            eprintln!("[bms_flex_row hvp_multi parity] no CUDA runtime — skipping device parity");
+            return;
+        };
+        let n = 5_usize;
+        let r = 4_usize;
+        let p_m = 2_usize;
+        let p_g = 2_usize;
+        let p_h_dim = 1_usize;
+        let p_w_dim = 1_usize;
+        let p_total = p_m + p_g + p_h_dim + p_w_dim;
+        let rhs_count = 3_usize;
+        let block = BmsFlexBlockLayout {
+            p_m,
+            p_g,
+            h: Some(p_m + p_g..p_m + p_g + p_h_dim),
+            w: Some(p_m + p_g + p_h_dim..p_m + p_g + p_h_dim + p_w_dim),
+            p_total,
+        };
+        let primary = BmsFlexPrimaryLayout {
+            h: Some(2..3),
+            w: Some(3..4),
+            r,
+        };
+        let mut row_hessians = vec![0.0_f64; n * r * r];
+        for row in 0..n {
+            for u in 0..r {
+                for v in u..r {
+                    let val = ((row + 1) as f64) * (1.0 + (u as f64) + 2.0 * (v as f64));
+                    row_hessians[row * r * r + u * r + v] = val;
+                    row_hessians[row * r * r + v * r + u] = val;
+                }
+            }
+        }
+        let mut marginal = vec![0.0_f64; n * p_m];
+        let mut logslope = vec![0.0_f64; n * p_g];
+        for row in 0..n {
+            for j in 0..p_m {
+                marginal[row * p_m + j] = 0.5 + (row as f64) * 0.1 - (j as f64) * 0.2;
+            }
+            for j in 0..p_g {
+                logslope[row * p_g + j] = -0.3 + (row as f64) * 0.05 + (j as f64) * 0.15;
+            }
+        }
+        let mut v_rhs = vec![0.0_f64; rhs_count * p_total];
+        for rhs in 0..rhs_count {
+            for j in 0..p_total {
+                let seed = (rhs as f64) * 0.37 + (j as f64) * 0.19 + 0.4;
+                v_rhs[rhs * p_total + j] = seed.sin() * 0.4 + seed.cos() * 0.2;
+            }
+        }
+
+        let backend = match HvpKernelBackend::probe() {
+            Ok(b) => b,
+            Err(err) => {
+                eprintln!("[bms_flex_row hvp_multi parity] backend probe failed: {err}");
+                return;
+            }
+        };
+        let stream = backend.stream.clone();
+        let d_h = match stream.clone_htod(&row_hessians) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[bms_flex_row hvp_multi parity] upload h failed: {err}");
+                return;
+            }
+        };
+        let d_m = match stream.clone_htod(&marginal) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[bms_flex_row hvp_multi parity] upload marg failed: {err}");
+                return;
+            }
+        };
+        let d_g = match stream.clone_htod(&logslope) {
+            Ok(s) => s,
+            Err(err) => {
+                eprintln!("[bms_flex_row hvp_multi parity] upload logslope failed: {err}");
+                return;
+            }
+        };
+        let storage = DeviceResidentRowHess {
+            hess: d_h,
+            marginal_design: d_m,
+            logslope_design: d_g,
+            n,
+            r,
+            block: block.clone(),
+            primary: primary.clone(),
+
+            bytes: ((n * r * r + n * p_m + n * p_g) * std::mem::size_of::<f64>()) as u64,
+        };
+        let scratch = bms_flex_row_hvp_multi_scratch_bytes_for_shape(n, p_total, rhs_count)
+            .expect("storage scratch budget");
+        assert!(
+            scratch < storage.bytes,
+            "multi-RHS scratch should stay below resident cache bytes"
+        );
+        let gpu = launch_bms_flex_row_hvp_multi(&storage, &v_rhs, rhs_count)
+            .expect("multi-RHS HVP kernel must launch on CUDA host");
+        assert_eq!(gpu.len(), rhs_count * p_total);
+        for rhs in 0..rhs_count {
+            let v = &v_rhs[rhs * p_total..(rhs + 1) * p_total];
+            let cpu = cpu_oracle_bms_flex_row_hvp(
+                &row_hessians,
+                &marginal,
+                &logslope,
+                &block,
+                &primary,
+                n,
+                v,
+            );
+            let single = launch_bms_flex_row_hvp(&storage, v)
+                .expect("single-RHS HVP kernel must launch on CUDA host");
+            for j in 0..p_total {
+                let got = gpu[rhs * p_total + j];
+                let diff = (cpu[j] - got).abs();
+                assert!(
+                    diff <= 1e-10,
+                    "multi-RHS HVP rhs={rhs} j={j}: cpu={} gpu={} |diff|={diff:.3e}",
+                    cpu[j],
+                    got
+                );
+                assert_eq!(
+                    got, single[j],
+                    "multi-RHS and single-RHS host launch diverged at rhs={rhs} j={j}"
                 );
             }
         }

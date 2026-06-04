@@ -265,9 +265,11 @@ fn frechet_mean_is_the_aitchison_barycenter() {
         mu <- as.numeric(mean(ac))
         emit("r_unweighted", mu)
         w <- df$w / sum(df$w)
-        L <- log(as.matrix(ac))
-        ml <- as.numeric(colSums(L * w))
+        stopifnot(all(is.finite(X)), all(X > 0), all(is.finite(w)))
+        L <- log(X)
+        ml <- as.numeric(crossprod(w, L))
         wmu <- exp(ml - max(ml)); wmu <- wmu / sum(wmu)
+        stopifnot(all(is.finite(wmu)), all(wmu > 0))
         emit("r_weighted", wmu)
         "#,
     );

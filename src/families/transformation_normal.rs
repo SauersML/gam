@@ -34,9 +34,10 @@ use crate::families::custom_family::{
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    MaterializablePsiDerivativeOperator, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
+    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, ParameterBlockSpec,
+    ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::{
     initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
@@ -8708,6 +8709,10 @@ impl TransformationNormalJointHessianWorkspace {
 impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         Ok(Some(self.dense_hessian()?.clone()))
+    }
+
+    fn hessian_source_preference(&self) -> JointHessianSourcePreference {
+        JointHessianSourcePreference::Operator
     }
 
     fn hessian_matvec_available(&self) -> bool {

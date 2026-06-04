@@ -1381,12 +1381,7 @@ impl IsometryPenalty {
     /// broadcast to every row, making the penalty scale-free: it penalizes
     /// metric VARIATION across tokens rather than absolute scale. For every
     /// other reference it delegates to the data-independent .
-    fn effective_g_ref(
-        &self,
-        g: &Array2<f64>,
-        n_obs: usize,
-        d: usize,
-    ) -> CowArray<'_, f64, Ix2> {
+    fn effective_g_ref(&self, g: &Array2<f64>, n_obs: usize, d: usize) -> CowArray<'_, f64, Ix2> {
         match &self.reference {
             IsometryReference::MeanProfiled => {
                 let dd = d * d;
@@ -3935,8 +3930,17 @@ impl NuclearNormPenalty {
         target.into_shape_with_order((self.n_eff, d)).ok()
     }
 
-    fn rank_limit(&self, rank: usize) -> usize {
-        self.max_rank.unwrap_or(rank).min(rank)
+    fn rank_limit(&self, thin_rank: usize) -> usize {
+        self.max_rank.unwrap_or(thin_rank).min(thin_rank)
+    }
+
+    fn right_filter_active_count(&self, n_rows: usize, n_cols: usize) -> usize {
+        let thin_rank = n_rows.min(n_cols);
+        match self.max_rank {
+            None => n_cols,
+            Some(max_rank) if max_rank >= thin_rank => n_cols,
+            Some(max_rank) => max_rank,
+        }
     }
 
     fn compute_svd_cached(&self, t: ArrayView2<'_, f64>) -> NuclearSvdCache {
@@ -3962,6 +3966,8 @@ impl NuclearNormPenalty {
         // The Fréchet derivative dR uses divided differences in the right
         // singular-vector basis, avoiding any dense Hessian materialization.
         let d = t.ncols();
+        let active_count = self.right_filter_active_count(t.nrows(), d);
+        let active_start = d.saturating_sub(active_count);
         let mut gram = Array2::<f64>::zeros((d, d));
         let mut tangent_gram = Array2::<f64>::zeros((d, d));
         for a in 0..d {
@@ -3975,45 +3981,52 @@ impl NuclearNormPenalty {
                 gram[[a, b]] = g;
                 tangent_gram[[a, b]] = dg;
             }
-            gram[[a, a]] += self.smoothing_eps * self.smoothing_eps;
         }
 
-        let (evals, q) = gram
-            .eigh(Side::Lower)
-            .map_err(|err| format!("NuclearNormPenalty Gram eigendecomposition failed: {err}"))?;
-        let active_start = d.saturating_sub(self.rank_limit(d));
-        if self.max_rank.is_some() && active_start > 0 && active_start < d {
+        let (evals, q) = gram.eigh(Side::Lower).map_err(|err| {
+            format!("NuclearNormPenalty right-Gram eigendecomposition failed: {err}")
+        })?;
+        let trace_scale = evals
+            .iter()
+            .fold(0.0_f64, |acc, &lambda| acc.max(lambda.abs()))
+            .max(1.0);
+        let psd_tol = 1.0e-10 * trace_scale;
+        let mut raw_evals = Array1::<f64>::zeros(d);
+        for i in 0..d {
+            let lambda = evals[i];
+            if !lambda.is_finite() {
+                return Err(format!(
+                    "NuclearNormPenalty expected finite right-Gram eigenvalue; got {lambda}"
+                ));
+            }
+            if lambda < -psd_tol {
+                return Err(format!(
+                    "NuclearNormPenalty expected PSD right Gram; eigenvalue {lambda:.3e} \
+                     is below numerical tolerance {psd_tol:.3e}"
+                ));
+            }
+            raw_evals[i] = lambda.max(0.0);
+        }
+        if self.max_rank.is_some() && active_count < d && active_start > 0 {
             let left = evals[active_start - 1];
             let right = evals[active_start];
             let scale = (left.abs() + right.abs()).max(1.0);
             if (right - left).abs() <= 1.0e-12 * scale {
                 return Err(format!(
                     "NuclearNormPenalty HVP is undefined: max_rank splits a tied \
-                     smoothed Gram eigenvalue at the active/inactive cutoff \
+                     right-Gram eigenvalue at the active/inactive cutoff \
                      ({left:.3e}, {right:.3e})"
                 ));
             }
         }
         let mut f = Array1::<f64>::zeros(d);
         let mut df = Array1::<f64>::zeros(d);
-        let eig_floor = (self.smoothing_eps * self.smoothing_eps).max(1.0e-15);
+        let eps2 = self.smoothing_eps * self.smoothing_eps;
         for i in 0..d {
-            let mut lambda = evals[i];
-            if !lambda.is_finite() {
-                return Err(format!(
-                    "NuclearNormPenalty expected finite smoothed Gram eigenvalue; got {lambda}"
-                ));
-            }
-            if lambda < -1.0e-10 * eig_floor {
-                return Err(format!(
-                    "NuclearNormPenalty expected PSD smoothed Gram; eigenvalue {lambda:.3e} \
-                     is below numerical floor {eig_floor:.3e}"
-                ));
-            }
-            lambda = lambda.max(eig_floor);
             if i >= active_start {
-                f[i] = lambda.powf(-0.5);
-                df[i] = -0.5 * lambda.powf(-1.5);
+                let smoothed = raw_evals[i] + eps2;
+                f[i] = smoothed.powf(-0.5);
+                df[i] = -0.5 * smoothed.powf(-1.5);
             }
         }
 
@@ -4044,8 +4057,8 @@ impl NuclearNormPenalty {
         let mut derivative_basis = Array2::<f64>::zeros((d, d));
         for i in 0..d {
             for j in 0..d {
-                let denom = evals[i] - evals[j];
-                let scale = (evals[i].abs() + evals[j].abs()).max(1.0);
+                let denom = raw_evals[i] - raw_evals[j];
+                let scale = (raw_evals[i].abs() + raw_evals[j].abs()).max(1.0);
                 let divided_difference = if denom.abs() <= 1.0e-12 * scale {
                     let i_active = i >= active_start;
                     let j_active = j >= active_start;
@@ -8636,6 +8649,33 @@ mod tests {
     }
 
     #[test]
+    fn ibp_assignment_extreme_logits_remain_finite() {
+        let pen = IBPAssignmentPenalty::new(3, 1.5, 1.0e-3, false);
+        let t = array![
+            1000.0_f64, -1000.0, 500.0, -500.0, 750.0, -750.0, 250.0, -250.0, 0.0
+        ];
+        let rho = Array1::<f64>::zeros(0);
+
+        let value = pen.value(t.view(), rho.view());
+        assert!(
+            value.is_finite(),
+            "IBP value must remain finite for saturated concrete logits"
+        );
+        let grad = pen.grad_target(t.view(), rho.view());
+        assert!(
+            grad.iter().all(|entry| entry.is_finite()),
+            "IBP gradient must remain finite for saturated concrete logits: {grad:?}"
+        );
+        let diag = pen
+            .hessian_diag(t.view(), rho.view())
+            .expect("IBP assignment exposes a diagonal Hessian");
+        assert!(
+            diag.iter().all(|entry| entry.is_finite()),
+            "IBP Hessian diagonal must remain finite for saturated concrete logits: {diag:?}"
+        );
+    }
+
+    #[test]
     fn ard_grad_target_matches_lambda_t() {
         let d = 2;
         let t = array![0.5_f64, 1.0, 2.0, -1.0];
@@ -9554,6 +9594,78 @@ mod tests {
     }
 
     #[test]
+    fn nuclear_norm_hvp_wide_matrix_max_rank_above_thin_rank_is_uncapped() {
+        // n_eff < latent_dim gives a permanent right-nullspace in T^T T. A
+        // max_rank above the thin SVD rank does not truncate the value/gradient,
+        // so the HVP must be the full smoothed nuclear-norm derivative too. The
+        // old right-Gram-width cap selected three of four right eigenvectors and
+        // split the tied zero-eigenvalue nullspace.
+        let n_eff = 2usize;
+        let p = 4usize;
+        let target = PsiSlice {
+            range: 0..n_eff * p,
+            latent_dim: Some(p),
+        };
+        let capped =
+            NuclearNormPenalty::new(target.clone(), 0.7, n_eff, 1.0e-3, Some(3), false).unwrap();
+        let uncapped = NuclearNormPenalty::new(target, 0.7, n_eff, 1.0e-3, None, false).unwrap();
+        let t = array![2.0_f64, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0];
+        let v = array![0.2_f64, -0.4, 0.6, -0.8, 0.3, -0.5, 0.7, -0.9];
+        let rho = Array1::<f64>::zeros(0);
+
+        let hv_capped = capped.hvp(t.view(), rho.view(), v.view());
+        let hv_uncapped = uncapped.hvp(t.view(), rho.view(), v.view());
+        for i in 0..t.len() {
+            assert!(
+                hv_capped[i].is_finite(),
+                "wide NuclearNorm HVP must stay finite at index {i}"
+            );
+            assert_abs_diff_eq!(hv_capped[i], hv_uncapped[i], epsilon = 1.0e-10);
+        }
+    }
+
+    #[test]
+    fn nuclear_norm_hvp_truncated_rank_matches_gradient_directional_derivative() {
+        let n_eff = 4usize;
+        let p = 3usize;
+        let target = PsiSlice {
+            range: 0..n_eff * p,
+            latent_dim: Some(p),
+        };
+        let pen = NuclearNormPenalty::new(target, 1.1, n_eff, 0.2, Some(2), false).unwrap();
+        let t = array![
+            2.0_f64, 0.1, -0.2, 0.3, 1.5, 0.4, -0.1, 0.2, 0.9, 0.5, -0.4, 0.7
+        ];
+        let v = Array1::from_vec(
+            (0..t.len())
+                .map(|i| 0.25 * ((i as f64) + 0.7).sin())
+                .collect(),
+        );
+        let rho = Array1::<f64>::zeros(0);
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let eps = 1.0e-6;
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        for i in 0..t.len() {
+            tp[i] += eps * v[i];
+            tm[i] -= eps * v[i];
+        }
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        let mut max_err = 0.0_f64;
+        for i in 0..t.len() {
+            let fd = (gp[i] - gm[i]) / (2.0 * eps);
+            let err = (hv[i] - fd).abs();
+            max_err = max_err.max(err);
+            assert_abs_diff_eq!(hv[i], fd, epsilon = 1.0e-5);
+        }
+        assert!(
+            max_err <= 1.0e-5,
+            "truncated NuclearNorm HVP-FD max abs error = {max_err:.3e}"
+        );
+    }
+
+    #[test]
     fn decoder_incoherence_value_grad_self_consistent_fd() {
         let p = 3usize;
         let block_sizes = vec![2usize, 2usize];
@@ -9600,9 +9712,15 @@ mod tests {
         let rho = Array1::<f64>::zeros(0);
 
         // Orthogonal column-spaces ⇒ B_0^T B_1 = 0 ⇒ P ≈ 0.
-        let pen_ortho =
-            DecoderIncoherencePenalty::new(target.clone(), block_sizes.clone(), p, full_coact(), 1.0, false)
-                .unwrap();
+        let pen_ortho = DecoderIncoherencePenalty::new(
+            target.clone(),
+            block_sizes.clone(),
+            p,
+            full_coact(),
+            1.0,
+            false,
+        )
+        .unwrap();
         let t_ortho = array![1.0_f64, 0.0, 0.0, 1.0];
         let p_ortho = pen_ortho.value(t_ortho.view(), rho.view());
         assert!(
@@ -9611,9 +9729,15 @@ mod tests {
         );
 
         // Coincident column-spaces ⇒ B_0^T B_1 large ⇒ P large.
-        let pen_coinc =
-            DecoderIncoherencePenalty::new(target.clone(), block_sizes.clone(), p, full_coact(), 1.0, false)
-                .unwrap();
+        let pen_coinc = DecoderIncoherencePenalty::new(
+            target.clone(),
+            block_sizes.clone(),
+            p,
+            full_coact(),
+            1.0,
+            false,
+        )
+        .unwrap();
         let t_coinc = array![1.0_f64, 0.0, 1.0, 0.0];
         let p_coinc = pen_coinc.value(t_coinc.view(), rho.view());
         // ½·w·W·‖B_0^T B_1‖_F² = ½·1·1·(1)² = 0.5.

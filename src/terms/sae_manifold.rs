@@ -407,8 +407,7 @@ fn bessel_i0(x: f64) -> f64 {
         1.0 + t2
             * (3.5156229
                 + t2 * (3.0899424
-                    + t2 * (1.2067492
-                        + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
+                    + t2 * (1.2067492 + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
     } else {
         let y = 3.75 / ax;
         let poly = 0.39894228
@@ -417,8 +416,7 @@ fn bessel_i0(x: f64) -> f64 {
                     + y * (-0.00157565
                         + y * (0.00916281
                             + y * (-0.02057706
-                                + y * (0.02635537
-                                    + y * (-0.01647633 + y * 0.00392377)))))));
+                                + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377)))))));
         (ax.exp() / ax.sqrt()) * poly
     }
 }
@@ -2503,7 +2501,8 @@ pub struct SaeManifoldRho {
     pub log_lambda_sparse: f64,
     /// `log(lambda_smooth)` shared by the per-atom decoder penalties.
     pub log_lambda_smooth: f64,
-    /// Per-atom, per-axis `log(alpha_kj)` ARD strengths.
+    /// Per-atom, per-axis `log(alpha_kj)` ARD strengths. An empty per-atom
+    /// block disables native coordinate ARD for that atom.
     pub log_ard: Vec<Array1<f64>>,
 }
 
@@ -2528,10 +2527,11 @@ impl SaeManifoldRho {
     /// Flatten ρ into the contiguous outer-coordinate vector the generic
     /// `OuterObjective` engine optimises over.
     ///
-    /// Layout: `[log_lambda_sparse, log_lambda_smooth, <ARD>]`, where the
-    /// ARD tail concatenates each atom `k`'s per-axis `log_ard[k][j]` in
-    /// atom order, axis `j` in `0..d_k`. [`Self::from_flat`] is the exact
-    /// inverse and reads the per-atom dims from `self`.
+    /// Layout: `[log_lambda_sparse, log_lambda_smooth, <ARD>]`, where enabled
+    /// ARD blocks concatenate each atom `k`'s per-axis `log_ard[k][j]` in atom
+    /// order, axis `j` in `0..d_k`. Empty per-atom blocks contribute no outer
+    /// coordinates. [`Self::from_flat`] is the exact inverse and reads this
+    /// fixed per-atom layout from `self`.
     pub fn to_flat(&self) -> Array1<f64> {
         let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
         let mut out = Array1::<f64>::zeros(2 + ard_len);
@@ -2552,7 +2552,7 @@ impl SaeManifoldRho {
     ///
     /// The per-atom dims are taken from `&self` (the ARD layout is a fixed
     /// property of the term shape; the engine only moves the values). The
-    /// flat vector must have length `2 + Σ_k d_k`.
+    /// flat vector must have length `2 + Σ_k len(log_ard[k])`.
     pub fn from_flat(&self, flat: ArrayView1<'_, f64>) -> SaeManifoldRho {
         let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
         assert_eq!(
@@ -3614,15 +3614,12 @@ impl SaeManifoldTerm {
         let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
         let layout = registry.rho_layout();
         let mut value = 0.0_f64;
-        for (penalty, (rho_slice, _tier, _name)) in
-            registry.penalties.iter().zip(layout.iter())
-        {
+        for (penalty, (rho_slice, _tier, _name)) in registry.penalties.iter().zip(layout.iter()) {
             if let AnalyticPenaltyKind::Isometry(iso) = penalty {
                 let rho_local = rho_global.slice(s![rho_slice.clone()]);
                 for atom_idx in 0..self.k_atoms() {
                     let coord = &self.assignment.coords[atom_idx];
-                    let corrected_kind =
-                        self.corrected_isometry_penalty(iso, atom_idx, coord)?;
+                    let corrected_kind = self.corrected_isometry_penalty(iso, atom_idx, coord)?;
                     value += corrected_kind.value(coord.as_flat().view(), rho_local);
                 }
             }
@@ -3683,6 +3680,9 @@ impl SaeManifoldTerm {
         let mut acc = 0.0;
         for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
             let d = coord.latent_dim();
+            if rho.log_ard[atom_idx].is_empty() {
+                continue;
+            }
             if rho.log_ard[atom_idx].len() != d {
                 return Err(format!(
                     "ARD rho atom {atom_idx} has len {} but atom dim is {d}",
@@ -3781,6 +3781,16 @@ impl SaeManifoldTerm {
                 rho.log_ard.len(),
                 self.k_atoms()
             ));
+        }
+        for (atom_idx, coord) in self.assignment.coords.iter().enumerate() {
+            let ard_len = rho.log_ard[atom_idx].len();
+            let d = coord.latent_dim();
+            if ard_len != 0 && ard_len != d {
+                return Err(format!(
+                    "SaeManifoldTerm::assemble_arrow_schur: log_ard atom {atom_idx} \
+                     has len {ard_len}; expected 0 (disabled) or atom dim {d}"
+                ));
+            }
         }
         // Reparameterize each atom's roughness Gram into arc length at the
         // current decoder/coordinates (issue #673). This is the single
@@ -4148,6 +4158,9 @@ impl SaeManifoldTerm {
                 for (j, &k) in active.iter().enumerate() {
                     let coord = &self.assignment.coords[k];
                     let d = coord.latent_dim();
+                    if rho.log_ard[k].is_empty() {
+                        continue;
+                    }
                     if rho.log_ard[k].len() != d {
                         return Err(format!(
                             "ARD rho atom {k} has len {} but atom dim is {d}",
@@ -4187,6 +4200,9 @@ impl SaeManifoldTerm {
                 for atom_idx in 0..k_atoms {
                     let coord = &self.assignment.coords[atom_idx];
                     let d = coord.latent_dim();
+                    if rho.log_ard[atom_idx].is_empty() {
+                        continue;
+                    }
                     if rho.log_ard[atom_idx].len() != d {
                         return Err(format!(
                             "ARD rho atom {atom_idx} has len {} but atom dim is {d}",
@@ -4815,8 +4831,7 @@ impl SaeManifoldTerm {
             None => 0.0,
         };
 
-        let v =
-            loss.total() + decoder_penalty_energy + isometry_energy + 0.5 * log_det - occam;
+        let v = loss.total() + decoder_penalty_energy + isometry_energy + 0.5 * log_det - occam;
         Ok((v, loss, cache))
     }
 
@@ -4861,9 +4876,9 @@ impl SaeManifoldTerm {
             None => 0.0,
         };
         let isometry_energy = match registry {
-            Some(reg) => self.isometry_penalty_value_total(reg).map_err(|err| {
-                format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}")
-            })?,
+            Some(reg) => self
+                .isometry_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
             None => 0.0,
         };
         Ok((
@@ -5097,10 +5112,10 @@ impl SaeManifoldTerm {
     ///   * decoder β: `beta_dim − tr(λ_smooth · S_β⁻¹ · ⊕_k S_k⊗I_p)`, the
     ///     smoothness effective-dof already assembled for the Fellner-Schall
     ///     step (penalty-shrunk directions do not cost a full parameter);
-    ///   * latent coordinates: the exact ARD-shrunk trace
-    ///     `Σ_k Σ_j (n_active_k − α_{kj}·tr_{kj}(H⁻¹))` — each per-token
-    ///     coordinate is a latent variable whose effective dof is reduced from
-    ///     1 by its ARD prior, so a fully prior-shrunk axis costs ~0 parameters.
+    ///   * latent coordinates: enabled ARD axes use the exact ARD-shrunk trace
+    ///     `Σ_k Σ_j (n_active_k − α_{kj}·tr_{kj}(H⁻¹))`; atoms with disabled
+    ///     native ARD charge the full active coordinate count because those
+    ///     latent variables are estimated without an ARD precision.
     ///
     /// The coordinate term is the **exact** ARD-shrunk effective dof of the
     /// latent block: along axis `(k,j)` the MacKay/Fellner-Schall edf is
@@ -5143,12 +5158,18 @@ impl SaeManifoldTerm {
         let mut coord_edf = 0.0_f64;
         for (k, atom) in self.atoms.iter().enumerate() {
             let d_k = atom.latent_dim;
-            if rho.log_ard[k].len() != d_k || traces[k].len() != d_k {
+            if traces[k].len() != d_k {
+                return Err(format!(
+                    "reconstruction_dispersion: trace shape mismatch at atom {k} \
+                     (traces={}, d_k={d_k})",
+                    traces[k].len()
+                ));
+            }
+            let ard_len = rho.log_ard[k].len();
+            if ard_len != 0 && ard_len != d_k {
                 return Err(format!(
                     "reconstruction_dispersion: ARD shape mismatch at atom {k} \
-                     (log_ard={}, traces={}, d_k={d_k})",
-                    rho.log_ard[k].len(),
-                    traces[k].len()
+                     (log_ard={ard_len}, d_k={d_k})"
                 ));
             }
             // Scalar count matched to the trace support (see fn doc).
@@ -5160,6 +5181,10 @@ impl SaeManifoldTerm {
                     .count() as f64,
                 None => n as f64,
             };
+            if ard_len == 0 {
+                coord_edf += n_active_k * d_k as f64;
+                continue;
+            }
             for j in 0..d_k {
                 let alpha = rho.log_ard[k][j].exp();
                 // edf_kj ∈ [0, n_active_k]; clamp against numerical drift.

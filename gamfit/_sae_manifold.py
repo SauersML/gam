@@ -1147,6 +1147,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         initial_logits=logits_init,
         initial_coords=coords_init,
         jumprelu_threshold=float(jumprelu_threshold),
+        native_ard_enabled=bool(ard_per_atom),
     )
     payload_dict = dict(payload)
     return ManifoldSAE.from_payload(

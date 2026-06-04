@@ -21104,13 +21104,7 @@ pub fn fit_survival_marginal_slope_terms(
                 // aliased" — dropping into the dense O(n·K·p) fallback.
                 if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
                     overwrite_timewiggle_time_slots_at_pilot(
-                        &mut dq0,
-                        &mut dq1,
-                        &mut dqd1,
-                        timewiggle,
-                        &q0_pilot,
-                        &q1_pilot,
-                        &qd1_pilot,
+                        &mut dq0, &mut dq1, &mut dqd1, timewiggle, &q0_pilot, &q1_pilot, &qd1_pilot,
                     )?;
                 }
                 let row_hess = SurvivalRowHessian::from_pilot_primary_state(
@@ -23871,10 +23865,9 @@ mod tests {
             channel_hessian: None,
             probit_frailty_scale: 1.0,
         };
-        let jac = crate::custom_family::BlockEffectiveJacobian::effective_jacobian_at(
-            &jac_cb, &state,
-        )
-        .expect("timewiggle time jacobian at beta=0");
+        let jac =
+            crate::custom_family::BlockEffectiveJacobian::effective_jacobian_at(&jac_cb, &state)
+                .expect("timewiggle time jacobian at beta=0");
         assert_eq!(jac.dim(), (3 * n, p_tw));
 
         // q0 rows (0..n) must equal the wiggle basis at the entry pilot

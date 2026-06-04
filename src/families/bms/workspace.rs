@@ -11708,6 +11708,256 @@ impl BernoulliMarginalSlopeFamily {
         ))
     }
 
+    pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_operators_from_cache_with_options(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_pairs: &[(Array1<f64>, Array1<f64>)],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        options: &BlockwiseFitOptions,
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        if d_beta_pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let n = self.y.len();
+        let weighted_rows = outer_weighted_rows(options, n);
+        let mut unique_dirs = Vec::<Array1<f64>>::new();
+        let mut pair_indices = Vec::<(usize, usize)>::with_capacity(d_beta_pairs.len());
+        for (u, v) in d_beta_pairs {
+            let u_idx = Self::find_or_push_unique_direction(&mut unique_dirs, u);
+            let v_idx = Self::find_or_push_unique_direction(&mut unique_dirs, v);
+            pair_indices.push((u_idx, v_idx));
+        }
+        let make_accs = || {
+            (0..d_beta_pairs.len())
+                .map(|_| BernoulliBlockHessianAccumulator::new(slices))
+                .collect::<Vec<_>>()
+        };
+
+        let started = std::time::Instant::now();
+        let n_rows = weighted_rows.len();
+        let n_pairs = d_beta_pairs.len();
+        let n_unique_dirs = unique_dirs.len();
+        let flex_active = self.effective_flex_active(block_states)?;
+        let bundle_present = cache.row_cell_moments.is_some();
+        let heartbeat_guard = crate::heartbeat::scope(format!(
+            "BMS batched d2H n={n} rows={n_rows} p={} pairs={n_pairs} unique_dirs={n_unique_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
+            slices.total
+        ));
+        log::info!(
+            "[BMS batched d2H start] n={} rows={} p={} pairs={} unique_dirs={} flex={} cell_moments_bundle={}",
+            n,
+            n_rows,
+            slices.total,
+            n_pairs,
+            n_unique_dirs,
+            flex_active,
+            bundle_present,
+        );
+        let progress = Arc::new(AtomicUsize::new(0));
+        let progress_step = (n_rows / 8).max(1);
+        let bump_progress = |progress: &AtomicUsize| {
+            let now = progress.fetch_add(1, Ordering::Relaxed) + 1;
+            if now == n_rows || now.is_multiple_of(progress_step) {
+                log::info!(
+                    "[BMS batched d2H progress] rows={}/{} pairs={} unique_dirs={} elapsed={:.3}s",
+                    now,
+                    n_rows,
+                    n_pairs,
+                    n_unique_dirs,
+                    started.elapsed().as_secs_f64(),
+                );
+            }
+        };
+
+        if !flex_active && n > 0 {
+            let warmed = self.rigid_fourth_full_cached(block_states, cache, 0)?;
+            ensure_finite_fourth_full_cache_row(
+                warmed,
+                "exact_newton_joint_hessiansecond_directional_derivative_operators_from_cache rigid fourth-cache warm-up",
+            )?;
+        }
+        const ROW_PAR_MIN_ROWS: usize = 4_096;
+        let run_rows_serial = rayon::current_thread_index().is_some()
+            || rayon::current_num_threads() <= 1
+            || n_rows < ROW_PAR_MIN_ROWS;
+
+        let accs = if !flex_active {
+            if run_rows_serial {
+                let mut accs = make_accs();
+                for wr in weighted_rows.iter() {
+                    let row = wr.index;
+                    let w = wr.weight;
+                    let projections = unique_dirs
+                        .iter()
+                        .map(|direction| {
+                            let q = self
+                                .marginal_design
+                                .dot_row_view(row, direction.slice(s![slices.marginal.clone()]));
+                            let g = self
+                                .logslope_design
+                                .dot_row_view(row, direction.slice(s![slices.logslope.clone()]));
+                            (q, g)
+                        })
+                        .collect::<Vec<_>>();
+                    let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
+                    for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
+                        let (uq, ug) = projections[u_idx];
+                        let (vq, vg) = projections[v_idx];
+                        let f = contract_fourth_full(t, uq, ug, vq, vg);
+                        let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                        if w != 1.0 {
+                            f_arr.mapv_inplace(|value| value * w);
+                        }
+                        accs[idx].add_pullback(self, row, slices, primary, &f_arr);
+                    }
+                    bump_progress(&progress);
+                }
+                accs
+            } else {
+                weighted_rows
+                    .clone()
+                    .into_par_iter()
+                    .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+                        let row = wr.index;
+                        let w = wr.weight;
+                        let projections = unique_dirs
+                            .iter()
+                            .map(|direction| {
+                                let q = self.marginal_design.dot_row_view(
+                                    row,
+                                    direction.slice(s![slices.marginal.clone()]),
+                                );
+                                let g = self.logslope_design.dot_row_view(
+                                    row,
+                                    direction.slice(s![slices.logslope.clone()]),
+                                );
+                                (q, g)
+                            })
+                            .collect::<Vec<_>>();
+                        let t = self.rigid_fourth_full_cached(block_states, cache, row)?;
+                        for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
+                            let (uq, ug) = projections[u_idx];
+                            let (vq, vg) = projections[v_idx];
+                            let f = contract_fourth_full(t, uq, ug, vq, vg);
+                            let mut f_arr = Array2::from_shape_fn((2, 2), |(a, b)| f[a][b]);
+                            if w != 1.0 {
+                                f_arr.mapv_inplace(|value| value * w);
+                            }
+                            accs[idx].add_pullback(self, row, slices, primary, &f_arr);
+                        }
+                        bump_progress(&progress);
+                        Ok(accs)
+                    })
+                    .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
+                        for (l, r) in left.iter_mut().zip(right.iter()) {
+                            l.add(r);
+                        }
+                        Ok(left)
+                    })?
+            }
+        } else if run_rows_serial {
+            let mut accs = make_accs();
+            for wr in weighted_rows.iter() {
+                let row = wr.index;
+                let w = wr.weight;
+                let row_dirs = unique_dirs
+                    .iter()
+                    .map(|direction| {
+                        self.row_primary_direction_from_flat(row, slices, primary, direction)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let row_ctx = Self::row_ctx(cache, row);
+                for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
+                    let mut fourth = self.row_primary_fourth_contracted_recompute(
+                        row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &row_dirs[u_idx],
+                        &row_dirs[v_idx],
+                    )?;
+                    if w != 1.0 {
+                        fourth.mapv_inplace(|value| value * w);
+                    }
+                    accs[idx].add_pullback(self, row, slices, primary, &fourth);
+                }
+                bump_progress(&progress);
+            }
+            accs
+        } else {
+            weighted_rows
+                .clone()
+                .into_par_iter()
+                .try_fold(make_accs, |mut accs, wr| -> Result<_, String> {
+                    let row = wr.index;
+                    let w = wr.weight;
+                    let row_dirs = unique_dirs
+                        .iter()
+                        .map(|direction| {
+                            self.row_primary_direction_from_flat(row, slices, primary, direction)
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
+                    let row_ctx = Self::row_ctx(cache, row);
+                    for (idx, (u_idx, v_idx)) in pair_indices.iter().copied().enumerate() {
+                        let mut fourth = self.row_primary_fourth_contracted_recompute(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            &row_dirs[u_idx],
+                            &row_dirs[v_idx],
+                        )?;
+                        if w != 1.0 {
+                            fourth.mapv_inplace(|value| value * w);
+                        }
+                        accs[idx].add_pullback(self, row, slices, primary, &fourth);
+                    }
+                    bump_progress(&progress);
+                    Ok(accs)
+                })
+                .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
+                    for (l, r) in left.iter_mut().zip(right.iter()) {
+                        l.add(r);
+                    }
+                    Ok(left)
+                })?
+        };
+        log::info!(
+            "[BMS batched d2H done] n={} rows={} p={} pairs={} unique_dirs={} elapsed={:.3}s",
+            n,
+            n_rows,
+            slices.total,
+            n_pairs,
+            n_unique_dirs,
+            started.elapsed().as_secs_f64(),
+        );
+        drop(heartbeat_guard);
+        Ok(accs
+            .into_iter()
+            .map(|acc| Some(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
+            .collect())
+    }
+
+    fn find_or_push_unique_direction(
+        unique_dirs: &mut Vec<Array1<f64>>,
+        candidate: &Array1<f64>,
+    ) -> usize {
+        if let Some(idx) = unique_dirs.iter().position(|existing| {
+            existing.len() == candidate.len()
+                && existing
+                    .iter()
+                    .zip(candidate.iter())
+                    .all(|(left, right)| left == right)
+        }) {
+            return idx;
+        }
+        let idx = unique_dirs.len();
+        unique_dirs.push(candidate.clone());
+        idx
+    }
+
     pub(super) fn evaluate_flex_block_diagonals_from_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -13109,6 +13359,14 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
             .map(|fused| Some(fused.hessian.clone()))
     }
 
+    fn hessian_source_preference(&self) -> crate::custom_family::JointHessianSourcePreference {
+        if self.matrix_free_inner_route() {
+            crate::custom_family::JointHessianSourcePreference::Operator
+        } else {
+            crate::custom_family::JointHessianSourcePreference::Dense
+        }
+    }
+
     fn hessian_dense_forced(&self) -> Result<Option<Array2<f64>>, String> {
         // Callers that genuinely require a dense joint Hessian (e.g. outer
         // batched-gradient assembly that pulls back the dense `H_β`) bypass
@@ -13332,6 +13590,19 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 &self.block_states,
                 d_beta_u_flat,
                 d_beta_v_flat,
+                &self.cache,
+                &self.options,
+            )
+    }
+
+    fn second_directional_derivative_operators(
+        &self,
+        d_beta_pairs: &[(Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        self.family
+            .exact_newton_joint_hessiansecond_directional_derivative_operators_from_cache_with_options(
+                &self.block_states,
+                d_beta_pairs,
                 &self.cache,
                 &self.options,
             )
