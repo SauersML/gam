@@ -11639,6 +11639,16 @@ fn strict_logdet_spd_with_semidefinite_option(
     let eps = f64::EPSILON;
     let eps_np = eps * (accumulation_depth as f64) * (p as f64);
     let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * eps);
+    // Reject ONLY genuine indefiniteness. A matrix that symmetrises to PSD —
+    // including a near-singular-but-positive curvature (smallest eigenvalue just
+    // above the noise floor) or a structural null space (eigenvalues inside the
+    // `[−tol, tol]` band) — is NOT a defect: the bare Cholesky the strict path
+    // historically used accepted every such matrix, and the exact positive-
+    // eigenspace pseudo-logdet `Σ_{λ>tol} log λ` is well defined and matches the
+    // `tr((H+S_λ)⁻¹ ·)` derivative on `range(H+S_λ)`. Only a genuinely negative
+    // eigenvalue (`λ < −tol`) signals an indefinite curvature — a non-stationary
+    // inner β or a mis-signed block — and is rejected so the outer optimizer
+    // steps back instead of δ-ridge masking it (gam#748).
     if evals.iter().any(|&ev| ev < -tol) {
         let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
         let below = evals.iter().filter(|&&ev| ev < -tol).count();
@@ -11647,18 +11657,6 @@ fn strict_logdet_spd_with_semidefinite_option(
                 "strict pseudo-laplace logdet: {below} eigenvalue(s) below -tol \
              (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}, εnp={eps_np:.6e}); \
              indefinite joint coefficient Hessian rejected (no δ-ridge masking, gam#748)"
-            ),
-        }
-        .into());
-    }
-    if !allow_semidefinite && evals.iter().any(|&ev| ev <= tol) {
-        let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
-        let in_band = evals.iter().filter(|&&ev| ev <= tol).count();
-        return Err(CustomFamilyError::NumericalFailure {
-            reason: format!(
-                "strict pseudo-laplace logdet: {in_band} eigenvalue(s) at/below +tol \
-             (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); \
-             rank-deficient joint coefficient Hessian rejected in strict-PD mode (gam#748)"
             ),
         }
         .into());
