@@ -18,6 +18,12 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.90 — gam 0.3.90 / gamfit 0.1.162 (2026-06-04)
+
+### Fixed
+
+- **Hypertension-style Bernoulli marginal-slope formulas now have an exact regression for scalar-alias pruning.** The release includes a materialization test matching the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout and proves the local-column-3 scalar alias is removed before the identifiability audit while the Matérn blocks remain intact.
+
 ## v0.3.89 — gam 0.3.89 / gamfit 0.1.161 (2026-06-04)
 
 ### Fixed
