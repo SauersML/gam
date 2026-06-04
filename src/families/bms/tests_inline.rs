@@ -54,6 +54,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
+        let config = default_test_family().outer_seed_config(6);
+        assert_eq!(
+            config.risk_profile,
+            crate::seeding::SeedRiskProfile::GeneralizedLinear
+        );
+        assert_eq!(config.seed_budget, 1);
+        assert_eq!(config.screen_max_inner_iterations, 2);
+        assert_eq!(config.max_seeds, 6);
+
+        let seeds = crate::seeding::generate_rho_candidates(6, None, &config);
+        for anchor in [2.0, 4.0] {
+            assert!(
+                seeds
+                    .iter()
+                    .any(|seed| seed.iter().all(|rho| (*rho - anchor).abs() < 1e-12)),
+                "missing symmetric GLM startup anchor rho={anchor}"
+            );
+        }
+    }
+
     fn empty_termspec() -> TermCollectionSpec {
         TermCollectionSpec {
             linear_terms: vec![],
@@ -7905,7 +7927,8 @@ mod tests {
             row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         };
         let direction =
             Array1::from_iter((0..cached.slices.total).map(|idx| 0.02 * ((idx % 5) as f64 - 2.0)));
@@ -7980,7 +8003,8 @@ mod tests {
             )),
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         };
         let direction = Array1::from_iter(
             (0..host_cache.slices.total).map(|idx| 0.015 * ((idx % 7) as f64 - 3.0)),
@@ -8028,7 +8052,8 @@ mod tests {
             row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         };
         let directions: Vec<_> = (0..4)
             .map(|rep| {

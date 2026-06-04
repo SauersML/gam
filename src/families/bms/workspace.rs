@@ -3221,7 +3221,8 @@ impl BernoulliMarginalSlopeFamily {
             row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         })
     }
 
@@ -5733,18 +5734,16 @@ impl BernoulliMarginalSlopeFamily {
         found
     }
 
-    /// Lazily build the requested row's axis-projected third/fourth tensors
+    /// Lazily build the requested row's axis-projected third-derivative tensors
     /// backing the FLEX outer-derivative fast paths (gam#683), reused across
-    /// every ψ-axis pair. `None` on the rigid path (rigid rows use
-    /// `rigid_{third,fourth}_full`).
+    /// every ψ-axis. `None` on the rigid path (rigid rows use
+    /// `rigid_third_full`).
     ///
-    /// Each row's tensors are produced by the *slow* cell-walk workers
-    /// (`row_primary_third_contracted_recompute_with_moments` and
-    /// `row_primary_fourth_contracted_recompute_ordered`) evaluated at the two
-    /// primary-axis basis vectors `e_q`, `e_g` — so the cached values are the
-    /// very contractions the per-pair path used to recompute, just computed
-    /// once and reused. The fourth tensor is symmetrized exactly as
-    /// `row_primary_fourth_contracted_recompute` does (`½(ordered + swapped)`).
+    /// Each row's tensors are produced by the *slow* third-order cell-walk
+    /// worker (`row_primary_third_contracted_recompute_with_moments`) evaluated
+    /// at the two primary-axis basis vectors `e_q`, `e_g` — so the cached
+    /// values are the very contractions the per-axis path used to recompute,
+    /// just computed once and reused.
     ///
     /// Two-level lazy: the outer `RayonSafeOnce` allocates a per-row slot table
     /// on first touch; each inner per-row `RayonSafeOnce` then builds that row
@@ -5752,23 +5751,69 @@ impl BernoulliMarginalSlopeFamily {
     /// from inside an outer Rayon row fold is safe, and the per-row build is
     /// serial (no nested `into_par_iter`). Because outer derivative passes are
     /// row-subsampled, only the consumed rows are ever built.
-    pub(super) fn flex_axis_tensors_for_row<'a>(
+    pub(super) fn flex_axis_third_tensors_for_row<'a>(
         &self,
         block_states: &[ParameterBlockState],
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
         row: usize,
-    ) -> Result<Option<&'a FlexAxisRowTensors>, String> {
+    ) -> Result<Option<&'a FlexAxisThirdRowTensors>, String> {
         if !self.effective_flex_active(block_states)? {
             return Ok(None);
         }
         // Allocate the per-row slot table once (one inner RayonSafeOnce per
         // global row), then build only the requested row on first touch.
-        let slots = cache.flex_axis_tensors.get_or_compute(|| {
+        let slots = cache.flex_axis_third_tensors.get_or_compute(|| {
             (0..self.y.len())
                 .map(|_| crate::resource::RayonSafeOnce::new())
                 .collect::<Vec<_>>()
         });
-        let stored = slots[row].get_or_compute(|| -> Result<FlexAxisRowTensors, String> {
+        let stored = slots[row].get_or_compute(|| -> Result<FlexAxisThirdRowTensors, String> {
+            let r = cache.primary.total;
+            let mut e_q = Array1::<f64>::zeros(r);
+            e_q[cache.primary.q] = 1.0;
+            let mut e_g = Array1::<f64>::zeros(r);
+            e_g[cache.primary.logslope] = 1.0;
+            let row_ctx = Self::row_ctx(cache, row);
+            let t3_q = self.row_primary_third_contracted_recompute_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_q,
+            )?;
+            let t3_g = self.row_primary_third_contracted_recompute_with_moments(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &e_g,
+            )?;
+            Ok(FlexAxisThirdRowTensors {
+                third: [t3_q, t3_g],
+            })
+        });
+        let tensors = stored.as_ref().map_err(|err| err.clone())?;
+        Ok(Some(tensors))
+    }
+
+    /// Lazily build the requested row's axis-projected fourth-derivative
+    /// tensors. Kept separate from [`Self::flex_axis_third_tensors_for_row`] so
+    /// first-order outer paths do not force degree-21 fourth-order cell work.
+    pub(super) fn flex_axis_fourth_tensors_for_row<'a>(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Result<Option<&'a FlexAxisFourthRowTensors>, String> {
+        if !self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        let slots = cache.flex_axis_fourth_tensors.get_or_compute(|| {
+            (0..self.y.len())
+                .map(|_| crate::resource::RayonSafeOnce::new())
+                .collect::<Vec<_>>()
+        });
+        let stored = slots[row].get_or_compute(|| -> Result<FlexAxisFourthRowTensors, String> {
             let r = cache.primary.total;
             let mut e_q = Array1::<f64>::zeros(r);
             e_q[cache.primary.q] = 1.0;
@@ -5809,22 +5854,7 @@ impl BernoulliMarginalSlopeFamily {
             )?;
             let mut t4_qg = t4_qg_ordered;
             t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
-            let t3_q = self.row_primary_third_contracted_recompute_with_moments(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_q,
-            )?;
-            let t3_g = self.row_primary_third_contracted_recompute_with_moments(
-                row,
-                block_states,
-                cache,
-                row_ctx,
-                &e_g,
-            )?;
-            Ok(FlexAxisRowTensors {
-                third: [t3_q, t3_g],
+            Ok(FlexAxisFourthRowTensors {
                 fourth: [[t4_qq, t4_qg.clone()], [t4_qg, t4_gg]],
             })
         });
@@ -5854,7 +5884,7 @@ impl BernoulliMarginalSlopeFamily {
         // of re-walking every cubic partition cell on every (ρ-axis, row).
         // Equal to the slow path by linearity: third_contracted(s·e_a) = s·T3[a].
         if let Some((axis, scalar)) = Self::single_primary_axis(dir, &cache.primary) {
-            if let Some(tensors) = self.flex_axis_tensors_for_row(block_states, cache, row)? {
+            if let Some(tensors) = self.flex_axis_third_tensors_for_row(block_states, cache, row)? {
                 let mut out = tensors.third[axis].clone();
                 out.mapv_inplace(|value| value * scalar);
                 return Ok(out);
@@ -9023,7 +9053,7 @@ impl BernoulliMarginalSlopeFamily {
             Self::single_primary_axis(dir_u, &cache.primary),
             Self::single_primary_axis(dir_v, &cache.primary),
         ) {
-            if let Some(tensors) = self.flex_axis_tensors_for_row(block_states, cache, row)? {
+            if let Some(tensors) = self.flex_axis_fourth_tensors_for_row(block_states, cache, row)? {
                 let scale = s_u * s_v;
                 let mut out = tensors.fourth[a][b].clone();
                 out.mapv_inplace(|value| value * scale);
@@ -12887,7 +12917,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         if n_params == 0 {
             return config;
         }
-        config.max_seeds = 1;
+        config.max_seeds = if n_params <= 6 { 6 } else { 4 };
         config.seed_budget = 1;
         config.screen_max_inner_iterations = 2;
         config
@@ -14291,7 +14321,7 @@ impl BernoulliMarginalSlopeFamily {
             .map(|dir| Self::single_primary_axis(dir, primary))
             .collect::<Option<Vec<_>>>()
         {
-            if let Some(tensors) = self.flex_axis_tensors_for_row(block_states, cache, row)? {
+            if let Some(tensors) = self.flex_axis_third_tensors_for_row(block_states, cache, row)? {
                 return Ok(axis_dirs
                     .into_iter()
                     .map(|(axis, scalar)| {
