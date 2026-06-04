@@ -5,6 +5,8 @@ use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
 
+static ROW_CELL_MOMENTS_BUNDLE_BUILD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Fill one deviation-basis column of the *score-warp* coefficient jet.
 ///
 /// Shared body of the many `for_each_deviation_basis_cubic_at` visitor
@@ -1011,10 +1013,14 @@ impl BernoulliMarginalSlopeFamily {
     /// (15 or 21) for outer dH/d²H trace paths.
     ///
     /// On the first call the full-`n` bundle is built at `required_degree` and
-    /// stored in the appropriate `RayonSafeOnce` slot.  Subsequent calls — even
-    /// from concurrent Rayon workers — return the already-built bundle.  If the
-    /// FLEX path is inactive or the memory budget is exceeded the slot stores
-    /// `Ok(None)` and callers must use their per-row on-demand fallback.
+    /// stored in the appropriate `RayonSafeOnce` slot.  Because
+    /// `RayonSafeOnce` computes outside its internal lock, the build closure
+    /// takes a separate bundle-build mutex and rechecks the slot before doing
+    /// work; concurrent Rayon row workers then wait for the first builder and
+    /// clone its stored result instead of thundering-herding the same
+    /// degree-21 upgrade. If the FLEX path is inactive or the memory budget is
+    /// exceeded the slot stores `Ok(None)` and callers use their per-row
+    /// on-demand path.
     ///
     /// Returns `Ok(None)` for any `required_degree` outside {15, 21}; callers
     /// handle that the same way as a missing bundle.
@@ -1039,6 +1045,12 @@ impl BernoulliMarginalSlopeFamily {
         // the closure returns that same type (it IS T).  The outer `?` then
         // unwraps the stored Result on every access.
         let stored = slot.get_or_compute(|| {
+            let _build_guard = ROW_CELL_MOMENTS_BUNDLE_BUILD_LOCK
+                .lock()
+                .map_err(|_| "BMS row-cell-moments bundle build lock poisoned".to_string())?;
+            if let Some(stored) = slot.get() {
+                return stored.clone();
+            }
             if required_degree == 21 {
                 if let Some(stored_d15) = cache.row_cell_moments_d15.get() {
                     match stored_d15 {
