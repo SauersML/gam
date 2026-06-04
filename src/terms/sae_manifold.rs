@@ -427,25 +427,10 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     /// Object-safe forwarder to [`SaeBasisSecondJet::second_jet`] for callers
     /// holding `&dyn SaeBasisEvaluator` / `Arc<dyn SaeBasisEvaluator>`.
     ///
-    /// Default returns `None`, meaning "this evaluator has no analytic second
-    /// jet". Evaluators that also implement [`SaeBasisSecondJet`] override
-    /// this to wrap the typed call in `Some(...)`. This sidesteps the lack of
-    /// dyn-downcasting for non-`Any` traits while keeping `SaeBasisSecondJet`
-    /// as the strongly-typed compile-time bound for tests / generics.
-    ///
-    /// `coords` is part of the trait contract — every override consumes it as
-    /// the evaluation grid for the analytic second jet — so the default
-    /// signature must accept it. The default has no analytic surface to
-    /// evaluate at those points; referencing the grid shape keeps the
-    /// otherwise-unused parameter a lint-clean no-op before reporting None.
-    /// (`drop(coords)` is a no-op on the `Copy` view and trips
-    /// `dropping_copy_types` under `-D warnings`; discard patterns and
-    /// underscore-prefixed parameters are rejected by the source-hygiene gate in
-    /// `build.rs`.)
-    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
-        coords.dim();
-        None
-    }
+    /// Implementations return `Some(result)` only when an analytic second jet
+    /// exists for this evaluator. Returning `None` is an explicit capability
+    /// declaration, not a default sentinel hidden in the trait.
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>>;
 
     /// Object-safe forwarder to the basis third jet
     /// `T[n, m, a, c, e] = ∂³Φ_m / ∂t_a ∂t_c ∂t_e`, for callers holding
@@ -455,18 +440,10 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     /// that exact Hessian silently drops the residual and collapses to
     /// Gauss-Newton (issue #458).
     ///
-    /// Default returns `None`, meaning "this evaluator has no analytic third
-    /// jet". Every evaluator that supplies a closed-form Hessian
-    /// ([`SaeBasisSecondJet`]) also supplies a closed-form third jet
-    /// ([`SaeBasisThirdJet`]) and overrides this to wrap the typed call in
-    /// `Some(...)`, so the exact path is always taken — there is no
-    /// finite-difference fallback. (Mirrors [`Self::second_jet_dyn`]; the
-    /// `coords.dim()` touch keeps the otherwise-unused grid parameter
-    /// lint-clean under the source-hygiene gate, matching that default.)
-    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
-        coords.dim();
-        None
-    }
+    /// Implementations return `Some(result)` only when an analytic third jet
+    /// exists for this evaluator. Evaluators without one return `None`
+    /// explicitly; there is no finite-difference fallback.
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>>;
 
     /// A dense grid of candidate latent coordinates spanning this atom's
     /// manifold, used to *globally* seed the fixed-decoder OOS projection
@@ -487,18 +464,8 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
     /// training coordinates). `resolution` is the target number of points along
     /// each compact axis; implementations cap the total grid for `d > 1`.
     ///
-    /// The default touches `resolution` via a wildcard assignment so the
-    /// otherwise-unused parameter stays lint-clean under the source-hygiene
-    /// gate (mirrors the jet forwarders). `let _ = resolution;` is rejected by
-    /// `scan_for_let_underscore`; `_resolution`, `drop(resolution)` on a `Copy`
-    /// usize, and `hint::black_box(resolution)` are all rejected as dodge-family
-    /// equivalents. The wildcard-assignment form `_ = resolution;` is the
-    /// Rust 2024 idiom for the same effect and is the form the gate recognizes
-    /// by name (see `strip_leading_wildcard_assignment` in `build.rs`).
-    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
-        _ = resolution;
-        None
-    }
+    /// Implementations without a natural compact grid return `None` explicitly.
+    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>>;
 }
 
 /// Bases that expose an analytic second jet
@@ -702,6 +669,28 @@ impl RawPeriodicCircleEvaluator {
 }
 
 impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
+    fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
+        if coords.ncols() != self.latent_dim {
+            return Some(Err(format!(
+                "RawPeriodicCircleEvaluator::second_jet_dyn: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            )));
+        }
+        None
+    }
+
+    fn third_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array5<f64>, String>> {
+        if coords.ncols() != self.latent_dim {
+            return Some(Err(format!(
+                "RawPeriodicCircleEvaluator::third_jet_dyn: expected latent_dim {}, got {}",
+                self.latent_dim,
+                coords.ncols()
+            )));
+        }
+        None
+    }
+
     fn evaluate(&self, coords: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array3<f64>), String> {
         if coords.ncols() != self.latent_dim {
             return Err(format!(
@@ -721,6 +710,18 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
             jet[[row, 1, 0]] = t.cos();
         }
         Ok((phi, jet))
+    }
+
+    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
+        if self.latent_dim != 1 {
+            return (resolution == 0).then(|| Array2::<f64>::zeros((0, self.latent_dim)));
+        }
+        let r = resolution.max(2);
+        let mut grid = Array2::<f64>::zeros((r, 1));
+        for i in 0..r {
+            grid[[i, 0]] = std::f64::consts::TAU * i as f64 / r as f64;
+        }
+        Some(grid)
     }
 }
 
@@ -1424,6 +1425,10 @@ impl SaeBasisEvaluator for AffineCoordinateEvaluator {
         }
         Ok((phi, jet))
     }
+
+    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
+        (resolution == 0).then(|| Array2::<f64>::zeros((0, self.latent_dim)))
+    }
 }
 
 impl SaeBasisSecondJet for AffineCoordinateEvaluator {
@@ -1521,6 +1526,10 @@ impl SaeBasisEvaluator for DuchonCoordinateEvaluator {
         }
         crate::basis::duchon_sae_atom_basis_with_jet(coords, self.centers.view(), self.order)
             .map_err(|err| err.to_string())
+    }
+
+    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
+        (resolution == 0).then(|| Array2::<f64>::zeros((0, self.centers.ncols())))
     }
 }
 
@@ -1626,6 +1635,10 @@ impl SaeBasisEvaluator for EuclideanPatchEvaluator {
             ));
         }
         Ok((phi, jet))
+    }
+
+    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
+        (resolution == 0).then(|| Array2::<f64>::zeros((0, self.latent_dim)))
     }
 }
 
@@ -10034,11 +10047,46 @@ mod tests {
     struct TestPeriodicEvaluator;
 
     impl SaeBasisEvaluator for TestPeriodicEvaluator {
+        fn second_jet_dyn(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<Array4<f64>, String>> {
+            if coords.ncols() != 1 {
+                return Some(Err(format!(
+                    "TestPeriodicEvaluator::second_jet_dyn: expected latent_dim 1, got {}",
+                    coords.ncols()
+                )));
+            }
+            None
+        }
+
+        fn third_jet_dyn(
+            &self,
+            coords: ArrayView2<'_, f64>,
+        ) -> Option<Result<Array5<f64>, String>> {
+            if coords.ncols() != 1 {
+                return Some(Err(format!(
+                    "TestPeriodicEvaluator::third_jet_dyn: expected latent_dim 1, got {}",
+                    coords.ncols()
+                )));
+            }
+            None
+        }
+
         fn evaluate(
             &self,
             coords: ArrayView2<'_, f64>,
         ) -> Result<(Array2<f64>, Array3<f64>), String> {
             Ok(periodic_basis(&coords.to_owned()))
+        }
+
+        fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
+            let r = resolution.max(2);
+            let mut grid = Array2::<f64>::zeros((r, 1));
+            for i in 0..r {
+                grid[[i, 0]] = i as f64 / r as f64;
+            }
+            Some(grid)
         }
     }
 

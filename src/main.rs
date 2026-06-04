@@ -86,9 +86,10 @@ use gam::survival_construction::{
     optimize_survival_baseline_config_with_gradient,
     optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
-    resolved_survival_time_basis_config_from_build, survival_baseline_targetname,
-    survival_derivative_guard_for_likelihood, survival_likelihood_modename,
+    require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
+    resolve_survival_time_anchor_value, resolved_survival_time_basis_config_from_build,
+    survival_baseline_targetname, survival_derivative_guard_for_likelihood,
+    survival_likelihood_modename,
 };
 use gam::survival_location_scale::{
     SurvivalCovariateTermBlockTemplate, SurvivalLocationScalePredictInput,
@@ -4420,7 +4421,22 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let time_anchor = resolve_survival_time_anchor_value(&age_entry, args.survival_time_anchor)?;
+    // Marginal-slope centers the baseline-hazard I-spline at a robust interior
+    // exit-scale time (median exit) instead of the earliest entry age; under
+    // left truncation the earliest entry is a positive left-tail point and
+    // centering there inflates the unpenalized linear-trend column, blowing up
+    // the time-block seed score so REML rejects every seed (issue #751). The
+    // location-scale path keeps the earliest-entry anchor. An explicit
+    // `--survival-time-anchor` is honored by both.
+    let time_anchor = if likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
+        resolve_survival_marginal_slope_time_anchor_value(
+            &age_entry,
+            &age_exit,
+            args.survival_time_anchor,
+        )?
+    } else {
+        resolve_survival_time_anchor_value(&age_entry, args.survival_time_anchor)?
+    };
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(likelihood_mode);
     if likelihood_mode != SurvivalLikelihoodMode::Weibull {
         inference_notes.push(format!(
