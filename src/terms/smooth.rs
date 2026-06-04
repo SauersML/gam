@@ -12250,10 +12250,6 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         ExactNewtonOuterObjective::StrictPseudoLaplace
     }
 
-    fn exact_newton_allows_semidefinitehessian(&self) -> bool {
-        true
-    }
-
     fn exact_newton_joint_hessian(
         &self,
         block_states: &[ParameterBlockState],
