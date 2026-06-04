@@ -331,6 +331,13 @@ const LOGIT_ERFCX_SIGMA_MAX: f64 = 6.0;
 const LOGIT_JET_GHQ_SIGMA_MAX: f64 = 1.0;
 const CLOGLOG_SIGMA_DEGENERATE: f64 = 1e-10;
 const CLOGLOG_SIGMA_TAYLOR_MAX: f64 = 0.25;
+/// Latent SD above which the cloglog integrated jet stops trusting shifted
+/// lognormal-Laplace moment reconstruction for higher derivatives. The moments
+/// `E[u^m exp(-u)]`, `u=exp(eta)`, evaluate the survival term at
+/// `mu + m*sigma^2`; for d3 at sigma=4 that asks for a shift of 48 and loses
+/// the small k3 contribution to cancellation. Directly integrating the stable
+/// pointwise derivatives keeps the location-family jet identity intact.
+const CLOGLOG_JET_MOMENT_SIGMA_MAX: f64 = 1.0;
 const CLOGLOG_RARE_EVENT_LOG_MAX: f64 = -18.0;
 const CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN: f64 = 8.0;
 const CLOGLOG_POSITIVE_SATURATION_EDGE: f64 = 5.0;
@@ -3399,6 +3406,24 @@ fn cloglog_inverse_link_controlled_values(
         1.0
     };
     values[1] = k[1].max(0.0);
+    if sigma > CLOGLOG_JET_MOMENT_SIGMA_MAX {
+        if max_order >= 2 {
+            values[2] = integrate_normal_adaptive(mu, sigma, |x| cloglog_point_jet5(x).2);
+        }
+        if max_order >= 3 {
+            values[3] = integrate_normal_adaptive(mu, sigma, |x| cloglog_point_jet5(x).3);
+        }
+        if max_order >= 4 {
+            values[4] = integrate_normal_adaptive(mu, sigma, |x| cloglog_point_jet5(x).4);
+        }
+        if max_order >= 5 {
+            values[5] = integrate_normal_adaptive(mu, sigma, |x| cloglog_point_jet5(x).5);
+        }
+        return (
+            values,
+            worse_integrated_expectation_mode(mode, IntegratedExpectationMode::QuadratureFallback),
+        );
+    }
     if max_order >= 2 {
         values[2] = k[1] - k[2];
     }
@@ -4946,6 +4971,31 @@ mod tests {
     }
 
     #[test]
+    fn test_integrated_cloglog_wide_sigma_d3_matches_simpson_and_d2_slope() {
+        let ctx = QuadratureContext::new();
+        let cases = [(0.0, 4.0), (-1.0, 4.0), (2.0, 3.0), (3.0, 3.0)];
+        let h = 1e-4;
+
+        for (mu, sigma) in cases {
+            let out = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu, sigma)
+                .expect("wide-sigma cloglog integrated jet should evaluate");
+            let reference = cloglog_reference_jet_highres_simpson(mu, sigma);
+            let plus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu + h, sigma)
+                .expect("wide-sigma cloglog integrated jet should evaluate");
+            let minus = integrated_inverse_link_jet(&ctx, LinkFunction::CLogLog, mu - h, sigma)
+                .expect("wide-sigma cloglog integrated jet should evaluate");
+            let d3fd = (plus.d2 - minus.d2) / (2.0 * h);
+
+            assert_eq!(out.mode, IntegratedExpectationMode::QuadratureFallback);
+            assert_relative_eq!(out.mean, reference.0, epsilon = 4e-8, max_relative = 4e-8);
+            assert_relative_eq!(out.d1, reference.1, epsilon = 4e-8, max_relative = 4e-8);
+            assert_relative_eq!(out.d2, reference.2, epsilon = 2e-9, max_relative = 2e-7);
+            assert_relative_eq!(out.d3, reference.3, epsilon = 2e-9, max_relative = 2e-7);
+            assert_relative_eq!(out.d3, d3fd, epsilon = 2e-7, max_relative = 4e-5);
+        }
+    }
+
+    #[test]
     fn test_latent_cloglog_jet5_matches_higher_order_central_differences() {
         let ctx = QuadratureContext::new();
         let mu = 0.35;
@@ -5071,6 +5121,34 @@ mod tests {
             let eta = mu + sigma * z;
             let (_, _, _, p3) = component_point_jet(LinkComponent::Logit, eta);
             phi(z) * p3
+        });
+        (mean, d1, d2, d3)
+    }
+
+    fn cloglog_reference_jet_highres_simpson(mu: f64, sigma: f64) -> (f64, f64, f64, f64) {
+        let z_max = 14.0;
+        let n_intervals = 16384;
+        let inv_sqrt_2pi = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
+        let phi = |z: f64| inv_sqrt_2pi * (-0.5 * z * z).exp();
+        let mean = simpson_integrate(-z_max, z_max, n_intervals, |z| {
+            let eta = mu + sigma * z;
+            let (g, _, _, _, _, _) = cloglog_point_jet5(eta);
+            phi(z) * g
+        });
+        let d1 = simpson_integrate(-z_max, z_max, n_intervals, |z| {
+            let eta = mu + sigma * z;
+            let (_, g1, _, _, _, _) = cloglog_point_jet5(eta);
+            phi(z) * g1
+        });
+        let d2 = simpson_integrate(-z_max, z_max, n_intervals, |z| {
+            let eta = mu + sigma * z;
+            let (_, _, g2, _, _, _) = cloglog_point_jet5(eta);
+            phi(z) * g2
+        });
+        let d3 = simpson_integrate(-z_max, z_max, n_intervals, |z| {
+            let eta = mu + sigma * z;
+            let (_, _, _, g3, _, _) = cloglog_point_jet5(eta);
+            phi(z) * g3
         });
         (mean, d1, d2, d3)
     }

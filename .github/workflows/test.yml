@@ -133,7 +133,12 @@ jobs:
           # LLVM ERROR: No space left on device" failure mode that this
           # step kept reproducing every time a probe `eprintln!` got added
           # anywhere in the hot solver paths.
-          cargo test --all-features --jobs 1 2>&1 | tee /tmp/cargo-test.log
+          # The CI assertions need line numbers from panic output, not full DWARF
+          # debug sections in every integration-test binary. Dropping dev
+          # debuginfo removes the largest non-executable payload from the link
+          # and keeps the bfd fallback from turning the suite into an hours-long
+          # serial link job.
+          cargo test --config profile.dev.debug=0 --all-features --jobs 1 2>&1 | tee /tmp/cargo-test.log
           test_status=${PIPESTATUS[0]}
 
           # The patterns here are literal/ERE substrings that match the
