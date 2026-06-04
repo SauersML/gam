@@ -7576,6 +7576,79 @@ mod tests {
     }
 
     #[test]
+    fn materialize_bernoulli_marginal_slope_names_constant_z_column() {
+        let data = Dataset {
+            headers: vec![
+                "event".to_string(),
+                "bmi".to_string(),
+                "prs_z".to_string(),
+            ],
+            values: Array2::from_shape_vec(
+                (4, 3),
+                vec![
+                    0.0, 22.0, -0.58, 1.0, 24.0, -0.58, 0.0, 27.0, -0.58, 1.0, 29.0, -0.58,
+                ],
+            )
+            .expect("constant z test data shape"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "event".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "bmi".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "prs_z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Binary,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        };
+        let config = FitConfig {
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("prs_z".to_string()),
+            ..FitConfig::default()
+        };
+
+        let err = materialize("event ~ bmi", &data, &config)
+            .expect_err("constant z_column should be rejected before BMS integration");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("z_column 'prs_z' has zero weighted variance"),
+            "error should name the constant z_column and diagnose weighted variance: {msg}"
+        );
+        assert!(
+            msg.contains("all 4 values ~= -0.580000"),
+            "error should summarize the observed constant value: {msg}"
+        );
+        assert!(
+            msg.contains("weighted_sd=0.000000e0") && msg.contains("n=4"),
+            "error should report weighted_sd and n: {msg}"
+        );
+        assert!(
+            msg.contains(
+                "bernoulli-marginal-slope cannot identify a covariate-varying slope from a constant score"
+            ),
+            "error should explain why the input is invalid: {msg}"
+        );
+        assert!(
+            !msg.contains("requires z with positive finite weighted standard deviation"),
+            "workflow should surface the input-style message instead of the generic BMS normalization error: {msg}"
+        );
+    }
+
+    #[test]
     fn linkwiggle_defaults_are_consistent_across_formula_and_runtime() {
         let parsed = parse_linkwiggle_formulaspec(&Default::default(), "linkwiggle()")
             .expect("default linkwiggle should parse");
