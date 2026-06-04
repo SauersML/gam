@@ -4626,7 +4626,9 @@ fn validate_bernoulli_marginal_slope_z_column_variance(
     let value_summary = match sorted.as_slice() {
         [] => "no observed finite values".to_string(),
         [only] => format!("all {n} values ~= {only:.6}"),
-        [first, second] => format!("{unique_count} near-unique values, e.g. {first:.6}, {second:.6}"),
+        [first, second] => {
+            format!("{unique_count} near-unique values, e.g. {first:.6}, {second:.6}")
+        }
         [first, second, ..] => {
             format!("{unique_count} near-unique values, e.g. {first:.6}, {second:.6}, ...")
         }
@@ -7578,11 +7580,7 @@ mod tests {
     #[test]
     fn materialize_bernoulli_marginal_slope_names_constant_z_column() {
         let data = Dataset {
-            headers: vec![
-                "event".to_string(),
-                "bmi".to_string(),
-                "prs_z".to_string(),
-            ],
+            headers: vec!["event".to_string(), "bmi".to_string(), "prs_z".to_string()],
             values: Array2::from_shape_vec(
                 (4, 3),
                 vec![
