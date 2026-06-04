@@ -23,7 +23,9 @@ mod linux {
     use super::super::error::GpuError;
     use crate::gpu::error::GpuResultExt;
     use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
+    use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::Arc;
 
     /// Power-of-two bucketed free list of f64 device slices.
@@ -111,7 +113,7 @@ mod linux {
             if let Some(existing) = self.module.get() {
                 return Ok(existing);
             }
-            let ptx = cudarc::nvrtc::compile_ptx(source)
+            let ptx = compile_ptx_with_opts(source, nvrtc_compile_options())
                 .gpu_ctx_with(|err| format!("{label} NVRTC compile failed: {err}"))?;
             let module = ctx
                 .load_module(ptx)
@@ -121,6 +123,40 @@ mod linux {
                 .module
                 .get()
                 .expect("module slot populated immediately after set"))
+        }
+    }
+
+    fn nvrtc_compile_options() -> CompileOptions {
+        let mut opts = CompileOptions::default();
+        opts.include_paths = nvrtc_include_paths();
+        opts
+    }
+
+    fn nvrtc_include_paths() -> Vec<String> {
+        let mut paths = Vec::new();
+        push_existing_include_path(&mut paths, Path::new("/usr/local/cuda/include"));
+        push_existing_include_path(&mut paths, Path::new("/usr/include"));
+        push_existing_include_path(&mut paths, Path::new("/usr/include/x86_64-linux-gnu"));
+        push_gcc_include_paths(&mut paths, Path::new("/usr/lib/gcc/x86_64-linux-gnu"));
+        paths
+    }
+
+    fn push_gcc_include_paths(paths: &mut Vec<String>, root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            push_existing_include_path(paths, &entry.path().join("include"));
+        }
+    }
+
+    fn push_existing_include_path(paths: &mut Vec<String>, path: &Path) {
+        if !path.is_dir() {
+            return;
+        }
+        let display = path.to_string_lossy().into_owned();
+        if !paths.iter().any(|existing| existing == &display) {
+            paths.push(display);
         }
     }
 }

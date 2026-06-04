@@ -2,12 +2,11 @@
 //!
 //! Identifiability for cross-block flex anchors lives on the *linearized*
 //! likelihood row map (the family Jacobian), not on raw block columns under a
-//! scalar IRLS-W metric. Survival_marginal_slope's row map has four to five
+//! scalar IRLS-W metric. Survival_marginal_slope's row map has exactly four
 //! coupled primary channels (entry survival index `q0`, exit survival /
-//! event-density index `q1`, exit-time derivative `qd1`, raw log-slope `g`,
-//! and an additive scalar "deviation block" perturbation that score-warp and
-//! link-dev attach to the exit-time index). Bernoulli_marginal_slope has a
-//! single scalar channel that recovers the old IRLS-W path exactly.
+//! event-density index `q1`, exit-time derivative `qd1`, raw log-slope `g`).
+//! Bernoulli_marginal_slope has a single scalar channel that recovers the old
+//! IRLS-W path exactly.
 //!
 //! T1 (this module) only defines the abstraction and the data structures used
 //! to evaluate it. Wiring into the cross-block residualizer happens in T2.
@@ -73,7 +72,7 @@ pub trait BlockPrimaryJacobian {
     fn row_channel_metric(&self) -> Array3<f64>;
 }
 
-// ── Survival marginal-slope (5 channels) ──────────────────────────────
+// ── Survival marginal-slope (4 channels) ──────────────────────────────
 
 /// Survival_marginal_slope primary channels.
 ///
@@ -84,11 +83,11 @@ pub trait BlockPrimaryJacobian {
 ///   eta1 = q1 · c(g) + s_f · g · z       (exit probit index)
 ///   ad1  = qd1 · c(g)                    (positive time derivative at exit)
 ///
-/// `eta_scalar` is an additive scalar perturbation that score-warp /
-/// link-dev attach to the exit index `eta1`. It does not enter `eta0` or
-/// `ad1`, mirroring how those flex blocks attach in the bernoulli analog
-/// and how their per-row designs are concatenated into the joint exit-time
-/// linear predictor.
+/// Score-warp and link-dev do not get a fifth solver channel. At the survival
+/// row-kernel boundary they are ordinary perturbations of `(q0, q1, qd1)`;
+/// representing them as a side-channel changes the metric from the 4x4
+/// Hessian used by `row_primary_closed_form`, the closed-form Gram compiler,
+/// and the GPU identifiability kernel.
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum SurvivalPrimaryChannel {
@@ -96,17 +95,15 @@ pub enum SurvivalPrimaryChannel {
     ExitLocation = 1,
     ExitDerivative = 2,
     Logslope = 3,
-    EtaScalar = 4,
 }
 
 impl SurvivalPrimaryChannel {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 4;
     pub const ALL: [SurvivalPrimaryChannel; Self::COUNT] = [
         Self::EntryLocation,
         Self::ExitLocation,
         Self::ExitDerivative,
         Self::Logslope,
-        Self::EtaScalar,
     ];
     #[inline]
     pub const fn index(self) -> usize {
@@ -138,7 +135,7 @@ impl SurvivalBlock {
 ///
 /// Holds the per-block training-row designs and the per-row pilot Hessian
 /// (built once by the family fit driver via
-/// `survival_marginal_slope::row_state_hessian_5ch`). Channel mappings:
+/// `survival_marginal_slope::row_primary_closed_form`). Channel mappings:
 ///
 ///   - Time block contributes to EntryLocation (`design_entry`),
 ///     ExitLocation (`design_exit`), ExitDerivative
@@ -146,8 +143,9 @@ impl SurvivalBlock {
 ///   - Marginal block contributes to EntryLocation and ExitLocation
 ///     (same design — additive to both q0 and q1).
 ///   - Logslope block contributes to Logslope only (the log-slope basis).
-///   - ScoreWarp and LinkDev each contribute to EtaScalar at their
-///     training-row designs.
+///   - ScoreWarp and LinkDev, when represented here, contribute to the same
+///     `(q0, q1, qd1)` channels as `QChannelBlockOperator`; each therefore
+///     needs both its value design and exit-time derivative design.
 #[derive(Clone, Debug)]
 pub struct SurvivalPrimaryJacobian {
     pub n_rows: usize,
@@ -156,9 +154,11 @@ pub struct SurvivalPrimaryJacobian {
     pub time_design_derivative_exit: DesignMatrix,
     pub marginal_design: DesignMatrix,
     pub logslope_design: DesignMatrix,
-    pub score_warp_design: Option<DesignMatrix>,
-    pub link_dev_design: Option<DesignMatrix>,
-    /// Shape `(n_rows, 5, 5)`. Pilot row-Hessian of `-ℓ` in the channel
+    pub score_warp_q_design: Option<DesignMatrix>,
+    pub score_warp_derivative_design: Option<DesignMatrix>,
+    pub link_dev_q_design: Option<DesignMatrix>,
+    pub link_dev_derivative_design: Option<DesignMatrix>,
+    /// Shape `(n_rows, 4, 4)`. Pilot row-Hessian of `-ℓ` in the channel
     /// ordering of `SurvivalPrimaryChannel`.
     pub row_metric: Array3<f64>,
 }
@@ -196,13 +196,31 @@ impl BlockPrimaryJacobian for SurvivalPrimaryJacobian {
                 out[SurvivalPrimaryChannel::Logslope.index()] = Some(self.logslope_design.clone());
             }
             t if t == SurvivalBlock::ScoreWarp.tag() => {
-                if let Some(d) = self.score_warp_design.as_ref() {
-                    out[SurvivalPrimaryChannel::EtaScalar.index()] = Some(d.clone());
+                assert_eq!(
+                    self.score_warp_q_design.is_some(),
+                    self.score_warp_derivative_design.is_some(),
+                    "SurvivalPrimaryJacobian score_warp requires both q and derivative designs"
+                );
+                if let Some(d) = self.score_warp_q_design.as_ref() {
+                    out[SurvivalPrimaryChannel::EntryLocation.index()] = Some(d.clone());
+                    out[SurvivalPrimaryChannel::ExitLocation.index()] = Some(d.clone());
+                }
+                if let Some(d) = self.score_warp_derivative_design.as_ref() {
+                    out[SurvivalPrimaryChannel::ExitDerivative.index()] = Some(d.clone());
                 }
             }
             t if t == SurvivalBlock::LinkDev.tag() => {
-                if let Some(d) = self.link_dev_design.as_ref() {
-                    out[SurvivalPrimaryChannel::EtaScalar.index()] = Some(d.clone());
+                assert_eq!(
+                    self.link_dev_q_design.is_some(),
+                    self.link_dev_derivative_design.is_some(),
+                    "SurvivalPrimaryJacobian link_dev requires both q and derivative designs"
+                );
+                if let Some(d) = self.link_dev_q_design.as_ref() {
+                    out[SurvivalPrimaryChannel::EntryLocation.index()] = Some(d.clone());
+                    out[SurvivalPrimaryChannel::ExitLocation.index()] = Some(d.clone());
+                }
+                if let Some(d) = self.link_dev_derivative_design.as_ref() {
+                    out[SurvivalPrimaryChannel::ExitDerivative.index()] = Some(d.clone());
                 }
             }
             _ => {}
@@ -212,6 +230,15 @@ impl BlockPrimaryJacobian for SurvivalPrimaryJacobian {
 
     #[inline]
     fn row_channel_metric(&self) -> Array3<f64> {
+        assert_eq!(
+            self.row_metric.shape(),
+            [
+                self.n_rows,
+                SurvivalPrimaryChannel::COUNT,
+                SurvivalPrimaryChannel::COUNT
+            ],
+            "SurvivalPrimaryJacobian row_metric must have shape n_rows x 4 x 4"
+        );
         self.row_metric.clone()
     }
 }
@@ -509,20 +536,89 @@ mod tests {
             time_design_derivative_exit: mk(pt),
             marginal_design: mk(pm),
             logslope_design: mk(pg),
-            score_warp_design: None,
-            link_dev_design: None,
+            score_warp_q_design: None,
+            score_warp_derivative_design: None,
+            link_dev_q_design: None,
+            link_dev_derivative_design: None,
             row_metric,
         };
-        assert_eq!(sj.n_channels(), 5);
+        assert_eq!(sj.n_channels(), 4);
         let time = sj.channel_contributions(SurvivalBlock::Time.tag());
         assert!(time[SurvivalPrimaryChannel::EntryLocation.index()].is_some());
         assert!(time[SurvivalPrimaryChannel::ExitLocation.index()].is_some());
         assert!(time[SurvivalPrimaryChannel::ExitDerivative.index()].is_some());
         assert!(time[SurvivalPrimaryChannel::Logslope.index()].is_none());
-        assert!(time[SurvivalPrimaryChannel::EtaScalar.index()].is_none());
         let marg = sj.channel_contributions(SurvivalBlock::Marginal.tag());
         assert!(marg[SurvivalPrimaryChannel::EntryLocation.index()].is_some());
         assert!(marg[SurvivalPrimaryChannel::ExitLocation.index()].is_some());
         assert!(marg[SurvivalPrimaryChannel::ExitDerivative.index()].is_none());
+    }
+
+    #[test]
+    fn survival_flex_blocks_use_four_channel_q_route() {
+        let n = 3;
+        let p = 2;
+        let mk = |scale: f64| {
+            DesignMatrix::from(ndarray::Array2::<f64>::from_shape_fn((n, p), |(i, j)| {
+                scale + i as f64 + 0.1 * j as f64
+            }))
+        };
+        let zeros = |cols: usize| DesignMatrix::from(ndarray::Array2::<f64>::zeros((n, cols)));
+        let sj = SurvivalPrimaryJacobian {
+            n_rows: n,
+            time_design_entry: zeros(1),
+            time_design_exit: zeros(1),
+            time_design_derivative_exit: zeros(1),
+            marginal_design: zeros(1),
+            logslope_design: zeros(1),
+            score_warp_q_design: Some(mk(10.0)),
+            score_warp_derivative_design: Some(mk(20.0)),
+            link_dev_q_design: Some(mk(30.0)),
+            link_dev_derivative_design: Some(mk(40.0)),
+            row_metric: Array3::<f64>::zeros((
+                n,
+                SurvivalPrimaryChannel::COUNT,
+                SurvivalPrimaryChannel::COUNT,
+            )),
+        };
+
+        let score = sj.channel_contributions(SurvivalBlock::ScoreWarp.tag());
+        assert_eq!(score.len(), SurvivalPrimaryChannel::COUNT);
+        assert!(score[SurvivalPrimaryChannel::EntryLocation.index()].is_some());
+        assert!(score[SurvivalPrimaryChannel::ExitLocation.index()].is_some());
+        assert!(score[SurvivalPrimaryChannel::ExitDerivative.index()].is_some());
+        assert!(score[SurvivalPrimaryChannel::Logslope.index()].is_none());
+
+        let link = sj.channel_contributions(SurvivalBlock::LinkDev.tag());
+        assert_eq!(link.len(), SurvivalPrimaryChannel::COUNT);
+        assert!(link[SurvivalPrimaryChannel::EntryLocation.index()].is_some());
+        assert!(link[SurvivalPrimaryChannel::ExitLocation.index()].is_some());
+        assert!(link[SurvivalPrimaryChannel::ExitDerivative.index()].is_some());
+        assert!(link[SurvivalPrimaryChannel::Logslope.index()].is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "score_warp requires both q and derivative designs")]
+    fn survival_flex_block_rejects_partial_q_route() {
+        let n = 3;
+        let mk = |cols: usize| DesignMatrix::from(ndarray::Array2::<f64>::zeros((n, cols)));
+        let sj = SurvivalPrimaryJacobian {
+            n_rows: n,
+            time_design_entry: mk(1),
+            time_design_exit: mk(1),
+            time_design_derivative_exit: mk(1),
+            marginal_design: mk(1),
+            logslope_design: mk(1),
+            score_warp_q_design: Some(mk(2)),
+            score_warp_derivative_design: None,
+            link_dev_q_design: None,
+            link_dev_derivative_design: None,
+            row_metric: Array3::<f64>::zeros((
+                n,
+                SurvivalPrimaryChannel::COUNT,
+                SurvivalPrimaryChannel::COUNT,
+            )),
+        };
+        let _ = sj.channel_contributions(SurvivalBlock::ScoreWarp.tag());
     }
 }

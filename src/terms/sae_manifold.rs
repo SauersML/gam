@@ -2973,9 +2973,10 @@ pub struct SaeManifoldTerm {
 }
 
 /// Snapshot of exactly the mutable term state that an `apply_newton_step` +
-/// `loss` line-search trial perturbs: per-atom decoder coefficients and the
+/// `loss` line-search trial perturbs: per-atom decoder coefficients, the
 /// `refresh_basis`-rebuilt basis evaluations (`basis_values`, `basis_jacobian`),
-/// plus the assignment logits and latent coordinates.
+/// and the live intrinsic smoothness Gram read by the objective, plus the
+/// assignment logits and latent coordinates.
 ///
 /// Static fields (atom names, basis kinds, basis-evaluator `Arc`s, assignment
 /// mode, temperature schedule) are *not* snapshotted: they are invariant across
@@ -2985,17 +2986,16 @@ pub struct SaeManifoldTerm {
 /// before the search, one restore per rejected trial) instead of firing it on
 /// every Armijo backtrack.
 ///
-/// The intrinsic roughness Gram `smooth_penalty` (issue #673) is likewise not
-/// snapshotted: the metric reweight is frozen at the last
-/// [`SaeManifoldTerm::assemble_arrow_schur_scaled`] and is only recomputed at
-/// the *next* assembly, so it is invariant across a line search by
-/// construction — the trial objective must use the same frozen penalty
-/// quadratic the Newton step was built from (lagged diffusivity). The
-/// canonical `smooth_penalty_raw` / `smooth_penalty_order` are static.
+/// The canonical `smooth_penalty_raw` / `smooth_penalty_order` are static, but
+/// the live intrinsic roughness Gram `smooth_penalty` is mutable state: it is
+/// refreshed by assembly from the current decoder and basis Jacobian, and the
+/// line-search objective reads it directly. Restoring it with the decoder and
+/// basis caches keeps every rejected trial's baseline and nonlinear objective
+/// on the same lagged-diffusivity quadratic.
 #[derive(Debug)]
 struct SaeManifoldMutableState {
-    /// Per-atom `(basis_values, basis_jacobian, decoder_coefficients)`.
-    atoms: Vec<(Array2<f64>, Array3<f64>, Array2<f64>)>,
+    /// Per-atom `(basis_values, basis_jacobian, decoder_coefficients, smooth_penalty)`.
+    atoms: Vec<(Array2<f64>, Array3<f64>, Array2<f64>, Array2<f64>)>,
     logits: Array2<f64>,
     coords: Vec<LatentCoordValues>,
     last_row_layout: Option<SaeRowLayout>,
@@ -6218,6 +6218,7 @@ impl SaeManifoldTerm {
                     atom.basis_values.clone(),
                     atom.basis_jacobian.clone(),
                     atom.decoder_coefficients.clone(),
+                    atom.smooth_penalty.clone(),
                 )
             })
             .collect();
@@ -6233,12 +6234,13 @@ impl SaeManifoldTerm {
     /// Assigns into the existing arrays in place so the restore reuses the
     /// already-allocated buffers rather than reallocating per trial.
     fn restore_mutable_state(&mut self, snapshot: &SaeManifoldMutableState) {
-        for (atom, (basis_values, basis_jacobian, decoder)) in
+        for (atom, (basis_values, basis_jacobian, decoder, smooth_penalty)) in
             self.atoms.iter_mut().zip(snapshot.atoms.iter())
         {
             atom.basis_values.assign(basis_values);
             atom.basis_jacobian.assign(basis_jacobian);
             atom.decoder_coefficients.assign(decoder);
+            atom.smooth_penalty.assign(smooth_penalty);
         }
         self.assignment.logits.assign(&snapshot.logits);
         self.assignment.coords.clone_from(&snapshot.coords);
@@ -12862,6 +12864,43 @@ mod tests {
     fn intrinsic_penalty_recovers_order_two_from_nullity() {
         let atom = intrinsic_test_atom(1.0);
         assert_eq!(atom.smooth_penalty_order, 2);
+    }
+
+    #[test]
+    fn line_search_snapshot_restores_intrinsic_smooth_penalty() {
+        let atom = intrinsic_test_atom(1.0);
+        let n = atom.n_obs();
+        let logits = Array2::<f64>::zeros((n, 1));
+        let coords = vec![Array2::<f64>::zeros((n, 1))];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords,
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let original = term.atoms[0].smooth_penalty.clone();
+        let snapshot = term.snapshot_mutable_state();
+
+        term.atoms[0].decoder_coefficients[[0, 0]] *= 3.0;
+        term.atoms[0].refresh_intrinsic_smooth_penalty();
+        let changed = (&term.atoms[0].smooth_penalty - &original)
+            .mapv(f64::abs)
+            .sum();
+        assert!(
+            changed > 1e-6,
+            "test setup must perturb the live intrinsic smoothness Gram"
+        );
+
+        term.restore_mutable_state(&snapshot);
+        let restored = (&term.atoms[0].smooth_penalty - &original)
+            .mapv(f64::abs)
+            .sum();
+        assert!(
+            restored < 1e-12,
+            "line-search restore left a stale intrinsic smoothness Gram: {restored}"
+        );
     }
 
     /// Gauge invariance (issue #673): a global reparameterization of the latent
