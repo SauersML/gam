@@ -82,39 +82,39 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Numerical stabilization ridge for the formula-driven multinomial REML path.
+/// Solver-only numerical stabilization floor for the formula-driven
+/// multinomial REML inner solve (gam#747).
 ///
-/// Two failure modes set this floor, and it must thread between them:
+/// Installed with [`RidgePolicy::solver_only`](crate::types::RidgePolicy::solver_only)
+/// so it stabilizes the inner joint-Newton **linear solve** but never enters
+/// the REML objective, the penalty log-determinant, or the Laplace Hessian.
 ///
-/// * **Separation divergence → rejected seeds (#715 real-data arm).** The
-///   smoothing penalties are rank-deficient by design (each smooth carries an
-///   unpenalized polynomial null space), and the formula may add a fully
-///   unpenalized parametric term (`x3` / `body_mass`). On near-separable hard
-///   labels (e.g. cleanly-separated penguin species) the softmax MLE drives
-///   those directions toward `±∞`. Each inner joint-Newton step is bounded by
-///   `‖∇‖ / δ` once `exact_newton_stabilizing_shift` lifts the smallest Hessian
-///   eigenvalue to this floor `δ`, so a *too-small* `δ` lets `β` overflow to a
-///   non-finite value within the few screening cycles; the resulting `inf` `η`
-///   makes the softmax `inf − inf = NaN`, every startup seed reports a non-
-///   finite `block_residual_inf`, and the outer optimizer rejects them all
-///   ("no candidate seeds passed outer startup validation"). `δ` must therefore
-///   be large enough to keep `β` comfortably finite across the screening cap.
+/// What it does: the multinomial smoothing penalties are rank-deficient by
+/// design (each smooth carries an unpenalized polynomial null space) and the
+/// formula may add a fully unpenalized parametric term (`x3` / `body_mass`). On
+/// near-separable hard labels the softmax curvature is ill-conditioned along
+/// those directions, so the bare Newton step `H⁻¹∇` is huge. Lifting the
+/// smallest Hessian eigenvalue to `δ` bounds the step (`‖(H+δI)⁻¹∇‖ ≤ ‖∇‖/δ`),
+/// keeping the screening iterates finite without poisoning the softmax with
+/// `inf − inf = NaN`.
 ///
-/// * **Over-smoothing → lost truth recovery (#715 synthetic arm).** Under the
-///   `explicit_stabilization_pospart` ridge policy this floor also enters the
-///   penalized objective as `½·δ·‖β‖²` AND the REML penalty log-determinant, so
-///   a *too-large* `δ` (e.g. `1e-2`) shrinks every identified coefficient —
-///   including the smooth wiggle directions already governed by their own REML
-///   `λ` — and perturbs the smoothing-parameter selection, biasing the fitted
-///   class-probability surface away from the truth and losing the match-or-beat
-///   against VGAM.
+/// What it deliberately does NOT do: it adds no `½·δ·‖β‖²` term to the
+/// objective and no `δ`-shift to the REML log-determinant. The earlier
+/// `explicit_stabilization_pospart` policy folded both into the criterion,
+/// which made `1e-4` a fixed-λ Gaussian prior that shrank every identified
+/// coefficient off the MLE and biased smoothing-parameter selection — a value
+/// that had to be tuned *between* under-stabilization (NaN seeds) and
+/// over-shrinkage (lost VGAM match). As a solver-only floor that tradeoff is
+/// gone: the over-shrinkage failure mode cannot occur (nothing is shrunk), the
+/// optimized objective is the true penalized REML criterion, and the floor
+/// only has to be large enough to keep the linear algebra finite.
 ///
-/// `1e-4` satisfies both: with standardized/centred designs the step bound
-/// `‖∇‖/δ ≈ O(n)/1e-4` keeps `β` finite (no overflow ⇒ no NaN ⇒ seeds accepted),
-/// while `½·δ·‖β‖²` and the `δ`-shift of the REML log-determinant are negligible
-/// against the `O(n)` data log-likelihood and the REML-selected smooth penalties
-/// (no measurable shrinkage of the recovered surface). It is a numerical
-/// stabilizer, not a Gaussian prior.
+/// Caveat (the real upstream defect, tracked separately): if the multinomial
+/// MLE is genuinely at infinity for an unpenalized/null-space direction
+/// (complete/quasi-complete separation, #722), no solver floor makes that
+/// direction's estimate finite — the principled response there is a
+/// model-declared bias-reduction prior (Firth/Jeffreys) or an explicit
+/// separation diagnostic, not a magnitude on this floor.
 const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-4;
 
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
@@ -634,6 +634,19 @@ pub fn fit_penalized_multinomial_formula(
         inner_max_cycles: max_iter,
         inner_tol: tol,
         ridge_floor: MULTINOMIAL_FORMULA_RIDGE_FLOOR,
+        // #747: the stabilization floor is SOLVER-ONLY — it keeps the inner
+        // joint-Newton linear solve finite during screening (bounding the step
+        // `(H+δI)⁻¹∇` away from a near-separable, rank-deficient curvature) but
+        // is excluded from the REML objective, the penalty log-determinant, and
+        // the Laplace Hessian. The earlier default (`explicit_stabilization_pospart`)
+        // folded `½·δ·‖β‖²` and a `δ`-shift of the log-determinant into the
+        // criterion, shrinking every identified coefficient off the MLE and
+        // perturbing smoothing-parameter selection — a fixed-λ prior masking
+        // separation, not a numerical stabilizer. With the floor solver-only the
+        // optimized objective is the true penalized REML criterion (value tracks
+        // its analytic gradient), and the smooth directions remain governed
+        // solely by their own REML-selected `λ`.
+        ridge_policy: crate::types::RidgePolicy::solver_only(),
         use_outer_hessian,
         ..BlockwiseFitOptions::default()
     };
