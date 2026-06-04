@@ -51,7 +51,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, r_package_available, relative_l2, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
@@ -218,6 +218,38 @@ fn gam_binomial_smooth_recovers_true_probability() {
     // random walk f(x, model="rw2", scale.model=TRUE). We score INLA's fitted
     // probability against the SAME ground-truth p_true; INLA is the incumbent
     // accuracy bar, not a target gam must reproduce.
+    if !r_package_available("INLA") {
+        // R-INLA absent: drop the match-or-beat arm but still enforce every
+        // tool-free, gam-side claim on the ground truth p_true, recomputed here
+        // from the pre-run_r values (gam_prob/gam_prob_sd + truth) with the
+        // identical formulas and thresholds used below.
+        let truth_bar = 0.25 * signal_range;
+        let mut covered = 0usize;
+        for i in 0..n {
+            let lo = gam_prob[i] - 2.0 * gam_prob_sd[i];
+            let hi = gam_prob[i] + 2.0 * gam_prob_sd[i];
+            if truth[i] >= lo && truth[i] <= hi {
+                covered += 1;
+            }
+        }
+        let coverage = covered as f64 / n as f64;
+        eprintln!(
+            "R-INLA unavailable — asserting gam's tool-free absolute quality only \
+             (skipping match-or-beat arm): RMSE_to_truth={gam_rmse_truth:.4} \
+             (bound {truth_bar:.4})  +/-2SD coverage of p_true={coverage:.3} (floor 0.80)"
+        );
+        assert!(
+            gam_rmse_truth < truth_bar,
+            "gam failed to recover the true probability curve: \
+             RMSE_to_truth={gam_rmse_truth:.4} (bound {truth_bar:.4} = 0.25*signal_range)"
+        );
+        assert!(
+            coverage >= 0.80,
+            "gam's +/-2SD probability band under-covers the true curve: \
+             coverage={coverage:.3} (floor 0.80)"
+        );
+        return;
+    }
     let r = run_r(
         &[Column::new("age", &ages), Column::new("y", &y)],
         r#"
@@ -512,6 +544,27 @@ fn gam_binomial_smooth_recovers_true_probability_on_real_data() {
         "pooled length mismatch"
     );
 
+    if !r_package_available("INLA") {
+        // R-INLA absent: drop the match-or-beat (held-out log-loss vs INLA) arm
+        // but still enforce every tool-free, gam-side claim, recomputed here from
+        // the pre-run_r values (gam_test_prob + test_y, gam_edf) with the
+        // identical formulas and thresholds used below.
+        let gam_auc = auc(&gam_test_prob, &test_y);
+        eprintln!(
+            "R-INLA unavailable — asserting gam's tool-free absolute quality only \
+             (skipping match-or-beat arm): gam_test_AUC={gam_auc:.4} (floor 0.80)  \
+             gam_edf={gam_edf:.3}"
+        );
+        assert!(
+            gam_auc >= 0.80,
+            "gam's held-out AUC too low: {gam_auc:.4} (< 0.80)"
+        );
+        assert!(
+            gam_edf > 1.0 && gam_edf < 40.0,
+            "gam effective dof out of sane range: {gam_edf:.3}"
+        );
+        return;
+    }
     let r = run_r(
         &[
             Column::new("pc1", &pc1_all),

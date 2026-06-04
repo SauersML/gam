@@ -33,7 +33,7 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, relative_l2, rmse, run_r};
+use gam::test_support::reference::{Column, r_package_available, relative_l2, rmse, run_r};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::io::Write;
@@ -319,6 +319,36 @@ fn gam_credible_intervals_are_calibrated_against_truth() {
     // posterior credible band for the linear predictor, and measure how well it
     // covers the SAME known truth. This is a fair head-to-head on the OBJECTIVE
     // metric (coverage of the truth), not a "reproduce INLA's numbers" check.
+    //
+    // R-INLA is provisioned best-effort in CI and is frequently unavailable.
+    // When it cannot be loaded we still assert gam's tool-free calibration bars
+    // (mean RMSE, coverage of the truth, PIT-vs-Uniform KS) — all computed from
+    // gam's own posterior and the known truth above — and skip only the
+    // match-or-beat-INLA arm.
+    if !r_package_available("INLA") {
+        eprintln!(
+            "R-INLA unavailable — asserting gam's tool-free calibration only \
+             (skipping match-or-beat arm): coverage={coverage:.3} pit_ks={ks:.4} \
+             mean_rmse={mean_rmse:.4}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        // (1) The posterior mean recovers the truth to within the noise level.
+        assert!(
+            mean_rmse <= SIGMA,
+            "gam posterior mean does not recover the truth: mean RMSE {mean_rmse:.4} > sigma {SIGMA}"
+        );
+        // (2) Empirical coverage of the truth is close to the nominal 0.95.
+        assert!(
+            (coverage - 0.95).abs() <= 0.07,
+            "gam 95% credible band is mis-calibrated: empirical coverage {coverage:.3} is outside 0.95 ± 0.07"
+        );
+        // (3) The PIT of the truth under gam's posterior is approximately uniform.
+        assert!(
+            ks <= 0.15,
+            "gam posterior is mis-shaped: PIT-vs-Uniform KS statistic {ks:.4} > 0.15"
+        );
+        return;
+    }
     let r = run_r(
         &[
             Column::new("y", &rep0_y),

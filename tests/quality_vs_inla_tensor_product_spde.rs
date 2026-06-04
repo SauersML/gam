@@ -49,7 +49,9 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, pearson, r_package_available, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -205,6 +207,27 @@ fn gam_tensor_product_predicts_held_out_pc1_better_than_inla_spde() {
         .take(n_train)
         .chain(std::iter::repeat(0.0).take(n_test))
         .collect();
+
+    // Environmental gate (CUDA/DoubleML category): R-INLA is provisioned
+    // best-effort in CI and frequently unavailable, in which case `library(INLA)`
+    // aborts at runtime. When the package can't be loaded we drop only the
+    // match-or-beat-vs-INLA arm; gam's OWN tool-free absolute quality bar — the
+    // held-out R² >= R2_BAR on the unseen test rows — is still recomputed (from
+    // gam's predictions + held-out truth available above, same helper + same
+    // threshold as the primary assertion below) and asserted in full.
+    if !r_package_available("INLA") {
+        const R2_BAR: f64 = 0.60;
+        let gam_r2 = r_squared(&gam_pred, &pc1_test);
+        eprintln!(
+            "R-INLA unavailable — asserting gam's tool-free absolute quality only \
+             (skipping match-or-beat arm): gam_R2={gam_r2:.4} (bar {R2_BAR})"
+        );
+        assert!(
+            gam_r2 >= R2_BAR,
+            "gam held-out R² too low: {gam_r2:.4} < {R2_BAR} (n_test={n_test})"
+        );
+        return;
+    }
 
     let r = run_r(
         &[
