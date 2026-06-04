@@ -4008,6 +4008,17 @@ pub struct BlockwiseFitResultParts {
     pub inner_cycles: usize,
     pub outer_converged: bool,
     pub geometry: Option<FitGeometry>,
+    /// Effective degrees of freedom computed by the caller in the *reduced*
+    /// (canonical) coefficient space, where the penalized Hessian is full rank,
+    /// as `(edf_total, edf_by_penalty, block_edf)`. The trace edf is invariant
+    /// under the canonical reparameterization, so computing it in the reduced
+    /// space and reporting it on the raw fit is exact — and it avoids the
+    /// `tr((H_raw + εI)⁻¹ S_raw)` blow-up that a rank-deficient raw-lifted
+    /// Hessian (zero rows/cols on canonicalization-dropped directions) would
+    /// otherwise inject. `None` when the caller has no reduced geometry (e.g.
+    /// the one-cycle inner probe), in which case `blockwise_fit_from_parts`
+    /// falls back to computing edf from whatever geometry it was handed.
+    pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>)>,
 }
 
 use crate::inference::diagnostics::format_top_abs as format_top_abs_array_entries;
@@ -4098,6 +4109,173 @@ fn validate_lambda_pair_consistency(
     Ok(())
 }
 
+/// Effective degrees of freedom for a converged blockwise custom-family fit,
+/// computed from the joint penalized Hessian `H = X'W_HX + S(λ)` and the
+/// per-penalty matrices `S_k` exactly as the standard GAM path and mgcv do:
+///
+/// ```text
+/// edf_total   = p − Σ_k λ_k · tr(H⁻¹ S_k)
+/// edf_penalty = (rank_k − λ_k · tr(H⁻¹ S_k))   clamped to [0, rank_k]
+/// ```
+///
+/// `S_k` here is the *unscaled* penalty (its `λ_k` factor is applied here), and
+/// each `S_k.to_dense()` is already embedded in the joint `p × p` coefficient
+/// layout (the Blockwise / Kronecker variants place their local block at the
+/// correct column range), so the trace solve runs in the full joint space and
+/// no per-block offset bookkeeping is required.
+///
+/// The custom-family path (CTN transformation-normal, Dirichlet, …) builds its
+/// fit through `blockwise_fit_from_parts` and previously left `inference` at
+/// `None`, so `edf_total` was unavailable for every custom family even though
+/// the converged geometry already carries the penalized Hessian. This mirrors
+/// the survival-path repair (`survival_transformation_edf`, #565) for the
+/// blockwise engine: the same trace formula, factorized with the same
+/// ridge-retry stabilization so a marginally indefinite Hessian at a boundary
+/// optimum still yields a usable trace instead of dropping inference.
+///
+/// `edf_penalty` is returned aligned 1:1 with the flattened `lambdas`
+/// (one entry per penalty across all blocks), matching the
+/// `FitInference::edf_by_block` ↔ `lambdas` length invariant. The per-block
+/// aggregate edf (for `FittedBlock::edf`) is the sum of that block's penalty
+/// edfs, with an unpenalized block contributing its full column count.
+fn custom_family_blockwise_edf(
+    penalized_hessian: &Array2<f64>,
+    specs: &[ParameterBlockSpec],
+    lambdas: &ndarray::ArrayView1<'_, f64>,
+) -> Result<(f64, Vec<f64>, Vec<f64>), String> {
+    let p = penalized_hessian.nrows();
+    let total_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    if penalized_hessian.ncols() != p || total_cols != p {
+        return Err(format!(
+            "custom-family edf: penalized Hessian {}x{} inconsistent with total block width {}",
+            penalized_hessian.nrows(),
+            penalized_hessian.ncols(),
+            total_cols
+        ));
+    }
+    let expected_rho: usize = specs.iter().map(|s| s.penalties.len()).sum();
+    if lambdas.len() != expected_rho {
+        return Err(format!(
+            "custom-family edf: lambdas length {} does not match total penalty count {}",
+            lambdas.len(),
+            expected_rho
+        ));
+    }
+
+    let h_sym = SymmetricMatrix::Dense(penalized_hessian.clone());
+    // Sparse-aware factorization with ridge retry (mirrors estimate.rs and
+    // survival_transformation_edf): a boundary-constrained optimum can leave
+    // the penalized Hessian marginally indefinite, in which case we add the
+    // smallest diagonal shift that restores definiteness so the trace solve
+    // succeeds rather than dropping inference for the whole fit.
+    let factor = {
+        let scale = h_sym.max_abs_diag();
+        let min_step = scale * 1e-10;
+        let mut ridge = 0.0_f64;
+        let mut attempts = 0_usize;
+        loop {
+            let candidate = if ridge > 0.0 {
+                h_sym.addridge(ridge).unwrap_or_else(|_| h_sym.clone())
+            } else {
+                h_sym.clone()
+            };
+            if let Ok(f) = candidate.factorize() {
+                break f;
+            }
+            attempts += 1;
+            if attempts >= 8 {
+                return Err("custom-family edf: penalized Hessian could not be factorized".to_string());
+            }
+            ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
+        }
+    };
+
+    let mut edf_by_penalty = vec![0.0_f64; expected_rho];
+    let mut block_edf = Vec::with_capacity(specs.len());
+    let mut total_trace = 0.0_f64;
+    let mut penalty_offset = 0usize;
+    for spec in specs.iter() {
+        let block_cols = spec.design.ncols();
+        let mut block_edf_acc = block_cols as f64;
+        for (local_k, penalty) in spec.penalties.iter().enumerate() {
+            let global_k = penalty_offset + local_k;
+            let lambda = lambdas[global_k];
+            // rank of S_k bounds its edf contribution from below at 0; we use
+            // the penalty's column count as the conservative dimension cap
+            // (mgcv clamps each block's edf to its column count).
+            let s_dense = penalty.to_dense();
+            if s_dense.nrows() != p || s_dense.ncols() != p {
+                return Err(format!(
+                    "custom-family edf: penalty {global_k} materialized to {}x{}, expected {p}x{p}",
+                    s_dense.nrows(),
+                    s_dense.ncols()
+                ));
+            }
+            // tr(H⁻¹ S_k) via H Z = S_k, summing the diagonal of Z.
+            let z = factor
+                .solvemulti(&s_dense)
+                .map_err(|e| format!("custom-family edf trace solve failed for penalty {global_k}: {e}"))?;
+            let mut trace = 0.0_f64;
+            for d in 0..p {
+                trace += z[[d, d]];
+            }
+            let lam_trace = if lambda > 0.0 { lambda * trace } else { 0.0 };
+            total_trace += lam_trace;
+            // Per-penalty edf is bounded by the penalty's own column count.
+            let penalty_cols = penalty.dim() as f64;
+            let edf_k = (penalty_cols - lam_trace).clamp(0.0, penalty_cols);
+            edf_by_penalty[global_k] = edf_k;
+            // The block's edf is the column count minus the total trace this
+            // block's penalties spend (so multiple penalties on one block
+            // compose), clamped to the block's column count.
+            block_edf_acc -= lam_trace;
+        }
+        block_edf.push(block_edf_acc.clamp(0.0, block_cols as f64));
+        penalty_offset += spec.penalties.len();
+    }
+
+    let edf_total = (p as f64 - total_trace).clamp(0.0, p as f64);
+    if !edf_total.is_finite()
+        || edf_by_penalty.iter().any(|v| !v.is_finite())
+        || block_edf.iter().any(|v| !v.is_finite())
+    {
+        return Err("custom-family edf: non-finite effective degrees of freedom".to_string());
+    }
+    Ok((edf_total, edf_by_penalty, block_edf))
+}
+
+/// Compute reduced-space effective degrees of freedom for a converged fit,
+/// to be carried through `BlockwiseFitResultParts::precomputed_edf`.
+///
+/// The reduced (canonical) geometry's penalized Hessian is full rank and its
+/// `reduced_specs` carry the pulled-back penalties `T_iᵀ S_k T_i`, so the trace
+/// edf is computed exactly here (no rank-deficiency ridge bias). Because the
+/// trace edf is invariant under the canonical reparameterization, the resulting
+/// `edf_total` / per-penalty / per-block values are the same as they would be
+/// in the raw basis and are reported directly on the lifted raw fit. Returns
+/// `None` when no reduced geometry is available, so the caller can leave
+/// `precomputed_edf` unset (and the raw-geometry fallback applies).
+fn reduced_blockwise_edf(
+    reduced_geometry: Option<&FitGeometry>,
+    canonical: &crate::solver::identifiability_canonical::CanonicalSpecs,
+    lambdas: &Array1<f64>,
+) -> Option<(f64, Vec<f64>, Vec<f64>)> {
+    let geom = reduced_geometry?;
+    match custom_family_blockwise_edf(
+        geom.penalized_hessian.as_array(),
+        &canonical.reduced_specs,
+        &lambdas.view(),
+    ) {
+        Ok(triple) => Some(triple),
+        Err(err) => {
+            log::warn!(
+                "[custom-family inference] reduced-space effective degrees of freedom unavailable: {err}"
+            );
+            None
+        }
+    }
+}
+
 /// Build a `UnifiedFitResult` from blockwise-specific fields.
 pub fn blockwise_fit_from_parts(
     parts: BlockwiseFitResultParts,
@@ -4116,6 +4294,7 @@ pub fn blockwise_fit_from_parts(
         inner_cycles,
         outer_converged,
         geometry,
+        precomputed_edf,
     } = parts;
 
     if block_states.is_empty() {
@@ -4229,6 +4408,50 @@ pub fn blockwise_fit_from_parts(
             expected_rho
         ) }.into());
     }
+    // Effective degrees of freedom and the inference block. When the
+    // converged geometry carries the joint penalized Hessian we compute the
+    // mgcv trace edf `p − Σ_k λ_k·tr(H⁻¹ S_k)` here so every custom-family fit
+    // (CTN transformation-normal, Dirichlet, …) reports `edf_total` /
+    // per-block `edf` like the standard GAM path, instead of leaving inference
+    // unpopulated. A factorization failure is non-fatal: the fit still returns
+    // with `edf=0`/`inference=None` rather than aborting, but in practice the
+    // ridge-retry inside `custom_family_blockwise_edf` recovers any boundary
+    // indefiniteness.
+    let (edf_total_opt, edf_by_penalty, block_edf): (Option<f64>, Vec<f64>, Vec<f64>) =
+        match precomputed_edf {
+            // Reduced-space edf supplied by the caller (the principled path:
+            // the trace is computed where the Hessian is full rank, then
+            // reported on the raw fit — exact because the trace edf is
+            // reparameterization-invariant).
+            Some((edf_total, edf_by_penalty, block_edf)) => {
+                (Some(edf_total), edf_by_penalty, block_edf)
+            }
+            // Fallback: compute from whatever geometry we were handed. Used
+            // only when the caller did not precompute (no reduced geometry);
+            // the ridge-retry factorization makes this robust to a marginally
+            // indefinite Hessian.
+            None => match geometry.as_ref() {
+                Some(geom) => {
+                    match custom_family_blockwise_edf(
+                        geom.penalized_hessian.as_array(),
+                        specs,
+                        &lambdas.view(),
+                    ) {
+                        Ok((edf_total, edf_by_penalty, block_edf)) => {
+                            (Some(edf_total), edf_by_penalty, block_edf)
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "[custom-family inference] effective degrees of freedom unavailable: {err}"
+                            );
+                            (None, Vec::new(), vec![0.0; block_states.len()])
+                        }
+                    }
+                }
+                None => (None, Vec::new(), vec![0.0; block_states.len()]),
+            },
+        };
+
     let mut lambda_offset = 0usize;
     let blocks: Vec<FittedBlock> = block_states
         .iter()
@@ -4243,12 +4466,38 @@ pub fn blockwise_fit_from_parts(
             FittedBlock {
                 beta: bs.beta.clone(),
                 role,
-                edf: 0.0,
+                edf: block_edf.get(i).copied().unwrap_or(0.0),
                 lambdas: block_lambdas,
             }
         })
         .collect();
     let deviance = -2.0 * log_likelihood;
+
+    // Assemble the inference block from the converged geometry. CTN and other
+    // custom families estimate their own likelihood scale, so the penalized
+    // Hessian is reported unscaled (dispersion = 1) — the EDF trace is
+    // dispersion-free, and downstream covariance scaling pairs `H` with the
+    // family's own dispersion where needed.
+    let inference = match (edf_total_opt, geometry.as_ref()) {
+        (Some(edf_total), Some(geom)) => Some(crate::solver::estimate::FitInference {
+            edf_by_block: edf_by_penalty,
+            edf_total,
+            smoothing_correction: None,
+            penalized_hessian: geom.penalized_hessian.clone(),
+            working_weights: geom.working_weights.clone(),
+            working_response: geom.working_response.clone(),
+            reparam_qs: None,
+            dispersion: crate::solver::estimate::Dispersion::Known(1.0),
+            beta_covariance: None,
+            beta_standard_errors: None,
+            beta_covariance_corrected: None,
+            beta_standard_errors_corrected: None,
+            beta_covariance_frequentist: None,
+            coefficient_influence: None,
+            bias_correction_beta: None,
+        }),
+        _ => None,
+    };
 
     crate::solver::estimate::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,
@@ -4268,7 +4517,7 @@ pub fn blockwise_fit_from_parts(
         standard_deviation: 1.0,
         covariance_conditional,
         covariance_corrected: None,
-        inference: None,
+        inference,
         fitted_link: FittedLinkState::Standard(None),
         geometry,
         block_states,
@@ -22720,6 +22969,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &warm_start,
         );
         let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
+        let precomputed_edf =
+            reduced_blockwise_edf(geometry.as_ref(), &canonical, &Array1::zeros(0));
         let (covariance_conditional, geometry) =
             lift_fit_geometry_to_raw(&canonical, covariance_conditional, geometry);
         return blockwise_fit_from_parts(
@@ -22737,6 +22988,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 inner_cycles: inner.cycles,
                 outer_converged: inner.converged,
                 geometry,
+                precomputed_edf,
             },
             raw_specs,
         )
@@ -22797,6 +23049,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 inner_cycles: inner.cycles,
                 outer_converged: inner.converged,
                 geometry: None,
+                precomputed_edf: None,
             },
             raw_specs,
         )
@@ -23240,6 +23493,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let lambdas_final = rho_star_physical.mapv(f64::exp);
     let log_lambdas_final = lambdas_final.mapv(|v| v.max(1e-300).ln());
     let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
+    let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), &canonical, &lambdas_final);
     let (covariance_conditional, geometry) =
         lift_fit_geometry_to_raw(&canonical, covariance_conditional, geometry);
     blockwise_fit_from_parts(
@@ -23256,6 +23510,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             inner_cycles: inner.cycles,
             outer_converged: outer_result.converged,
             geometry,
+            precomputed_edf,
         },
         raw_specs,
     )
@@ -23338,6 +23593,11 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
             inner_cycles: inner.cycles,
             outer_converged,
             geometry,
+            // This path passes `specs` directly (no canonicalization/lift), so
+            // the geometry's penalized Hessian is full rank in the same space —
+            // the raw-geometry edf fallback inside `blockwise_fit_from_parts` is
+            // exact here, no reduced-space precompute needed.
+            precomputed_edf: None,
         },
         specs,
     )
