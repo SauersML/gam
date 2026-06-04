@@ -10438,7 +10438,10 @@ impl BernoulliMarginalSlopeFamily {
         // Prewarm the high-degree full-row bundle from serial setup code. Row
         // kernels only read existing bundles, so parallel workers never launch
         // duplicate full-`n` degree-21 builds on first touch.
-        let _ = self.bundle_for_degree(block_states, cache, 21)?;
+        let prewarmed_bundle = self.bundle_for_degree(block_states, cache, 21)?;
+        if let Some(bundle) = prewarmed_bundle {
+            debug_assert!(bundle.max_degree >= 21);
+        }
 
         // Block-local accumulator path for second-order psi terms
         let weighted_rows = outer_weighted_rows(options, n);
