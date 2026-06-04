@@ -7556,20 +7556,6 @@ impl SavedFitSummary {
         .validated()
     }
 
-    fn rescaled_gaussian_location_scale(
-        mut self,
-        response_scale: f64,
-        nobs: usize,
-    ) -> Result<Self, String> {
-        let n = nobs as f64;
-        let log_scale = response_scale.max(1e-12).ln();
-        self.log_likelihood -= n * log_scale;
-        self.deviance += 2.0 * n * log_scale;
-        self.reml_score += n * log_scale;
-        self.max_abs_eta *= response_scale;
-        self.validated()
-    }
-
     fn from_survivalworking_summary(
         summary: &gam::pirls::WorkingModelPirlsResult,
         state: &gam::pirls::WorkingState,
@@ -8128,24 +8114,6 @@ fn load_datasetwith_schema(
     schema: &DataSchema,
 ) -> Result<Dataset, gam::inference::data::DataError> {
     load_dataset_auto_with_schema(path, schema, UnseenCategoryPolicy::Error)
-}
-
-fn sample_std(v: ArrayView1<'_, f64>) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let n = v.len() as f64;
-    let mean = v.iter().copied().sum::<f64>() / n;
-    let var = v
-        .iter()
-        .copied()
-        .map(|x| {
-            let d = x - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / n.max(1.0);
-    var.max(0.0).sqrt()
 }
 
 /// Canonical family name for a CLI `--family` selection.

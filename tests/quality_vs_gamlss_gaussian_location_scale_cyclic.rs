@@ -357,20 +357,6 @@ fn held_out_r2(pred: &[f64], truth: &[f64]) -> f64 {
     1.0 - ss_res / ss_tot.max(1e-300)
 }
 
-/// Population standard deviation (divide by n), replicating gam's fit-time
-/// `response_scale = sample_std(y).max(1e-6)` so the test reconstructs sigma
-/// and the rescaled mean in response (deg F) units exactly as the saved model
-/// would. Defined inline because `sample_std` is private to the binary crate.
-fn population_std(v: &[f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let n = v.len() as f64;
-    let mean = v.iter().sum::<f64>() / n;
-    let var = v.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n.max(1.0);
-    var.max(0.0).sqrt()
-}
-
 /// Right-pad `v` with its last value (or 0.0 when empty) to length `len`, so a
 /// short test column can ride along inside the equal-length reference
 /// data.frame. Only the first `v.len()` entries are read back in the R body.
@@ -474,12 +460,14 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
         beta_noise.len()
     );
 
-    // gam stores its blockwise betas in INTERNAL units (it fits y / response_scale
-    // with response_scale = sample_std(y_train)). Reconstruct response-unit
-    // predictions exactly as the saved model does:
-    //   mu_response    = (X_mu @ beta_mu) * response_scale          (Location scaled)
-    //   sigma_response = logb_sigma(X_noise @ beta_noise) * response_scale
-    let response_scale = population_std(&train_temp).max(1e-6);
+    // gam standardizes the response internally (it fits y / sample_std(y_train)
+    // so the log-σ soft floor is scale-relative) and then maps the fitted blocks
+    // BACK to raw response units before returning them: the Location block is
+    // scaled by response_scale and the log-σ block intercept is shifted by
+    // +ln(response_scale). So the returned `beta_mu` / `beta_noise` are already
+    // in response (deg F) units and the reconstruction needs NO further rescale:
+    //   mu_response    = X_mu @ beta_mu
+    //   sigma_response = logb_sigma(X_noise @ beta_noise)
 
     // ---- gam predictions at the HELD-OUT months ---------------------------
     let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p));
@@ -501,16 +489,11 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
         "noise design columns must match log-sigma coefficient count"
     );
 
-    let gam_test_mean: Vec<f64> = mean_design
-        .design
-        .apply(&beta_mu)
-        .iter()
-        .map(|&m| m * response_scale)
-        .collect();
+    let gam_test_mean: Vec<f64> = mean_design.design.apply(&beta_mu).to_vec();
     let eta_noise: Array1<f64> = noise_design.design.apply(&beta_noise);
     let gam_test_sigma: Vec<f64> = eta_noise
         .iter()
-        .map(|&e| logb_sigma_from_eta_scalar(e) * response_scale)
+        .map(|&e| logb_sigma_from_eta_scalar(e))
         .collect();
 
     // ---- fit the SAME model on TRAIN with gamlss, predict the SAME TEST ----
@@ -572,6 +555,7 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
     // sigma curves. NOT a pass criterion.
     let mean_rel = relative_l2(&gam_test_mean, &gamlss_mean);
     let sigma_rel = relative_l2(&gam_test_sigma, &gamlss_sigma);
+    let response_scale = fit.response_scale;
 
     eprintln!(
         "nottem cyclic location-scale held-out: n_train={} n_test={} \

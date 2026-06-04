@@ -1522,11 +1522,13 @@ impl LocationScaleWorkflowAdapter for BinomialLocationScaleWorkflow {
     }
 }
 
-/// Population standard deviation of a response column.
+/// Population standard deviation of a response column (divide by `n`, not
+/// `n-1`).
 ///
-/// Matches the CLI prefit helper exactly (divide by `n`, not `n-1`), so the
-/// standardized fit is identical whether the request arrives from the library
-/// (`materialize_location_scale`), the FFI marshaller, or the CLI.
+/// This is the single response-standardization factor for the Gaussian
+/// location-scale path, so the standardized fit is identical whether the
+/// request arrives from the library (`fit_from_formula` →
+/// `materialize_location_scale`), the FFI marshaller, or the CLI.
 fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
     if v.is_empty() {
         return 0.0;
@@ -1666,6 +1668,32 @@ fn rescale_gaussian_location_scale_to_raw(
     // back. `max_abs_eta` is the mean-channel η magnitude (raw μ = s·μ_internal).
     result.fit.fit.standard_deviation *= s;
     result.fit.fit.max_abs_eta *= s;
+
+    // Change-of-variables correction for the likelihood-scale summaries. The
+    // internal fit maximizes the density of y_internal = y/s; the raw-response
+    // density is p_raw(y) = p_internal(y/s)/s, so per observation
+    // log p_raw = log p_internal − ln(s). The deviance (−2·loglik) and the
+    // REML/LAML objective (which carries the data log-likelihood) shift
+    // accordingly. This keeps reported log-likelihood / deviance / REML in raw
+    // response units, matching what an un-standardized fit would report.
+    // The number of observations is the fitted eta length for any parameter
+    // block. Use the first block state instead of optional geometry so the
+    // public objective fields stay in one unit system even when covariance or
+    // ALO geometry was not retained.
+    if let Some(n_obs) = result
+        .fit
+        .fit
+        .block_states
+        .first()
+        .map(|state| state.eta.len() as f64)
+        .filter(|&n| n > 0.0)
+    {
+        let ln_s = s.ln();
+        result.fit.fit.log_likelihood -= n_obs * ln_s;
+        result.fit.fit.deviance += 2.0 * n_obs * ln_s;
+        result.fit.fit.reml_score += n_obs * ln_s;
+        result.fit.fit.penalized_objective += n_obs * ln_s;
+    }
 
     result.response_scale = s;
 }

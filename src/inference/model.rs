@@ -2802,11 +2802,9 @@ impl FittedModel {
                 let beta_mu = gaussian_location_scale_mean_beta(fit)?;
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
-                let response_scale = self.gaussian_response_scale.unwrap_or(1.0);
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
-                    response_scale,
                     covariance: fit.beta_covariance().cloned(),
                     link_wiggle: runtime.link_wiggle,
                 }) as Box<dyn PredictableModel>)
