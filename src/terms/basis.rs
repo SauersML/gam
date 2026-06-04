@@ -19556,7 +19556,19 @@ fn build_duchon_basis_designwithworkspace(
     let nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_order: f64 = power;
-    validate_duchon_kernel_orders(length_scale, p_order, s_order, d)?;
+    // Gate on the spectral power the kernel actually evaluates: the scale-free
+    // native Gram uses the literal fractional `power`, but the hybrid
+    // (`length_scale=Some`) partial-fraction kernel reads `s` back through
+    // `duchon_power_to_usize` (truncating a fractional `power`). Validating the
+    // raw fractional power on the hybrid path would desync the `2(p+s) > d`
+    // gate from the realized kernel and let the non-finite-at-origin case
+    // through (gh#750).
+    let validation_power = if length_scale.is_some() {
+        duchon_power_to_usize(s_order) as f64
+    } else {
+        s_order
+    };
+    validate_duchon_kernel_orders(length_scale, p_order, validation_power, d)?;
 
     let poly_block = polynomial_block_from_order(data, nullspace_order);
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
@@ -19718,7 +19730,14 @@ fn build_cyclic_duchon_basis_1dwithworkspace(
     }
     let period = end - start;
     let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Zero);
-    validate_duchon_kernel_orders(spec.length_scale, p_order, spec.power, 1)?;
+    // Hybrid kernel evaluates the truncated integer `s` (`power_as_usize`);
+    // scale-free uses the literal fractional power. Gate on the realized value.
+    let validation_power = if spec.length_scale.is_some() {
+        s_order_usize as f64
+    } else {
+        spec.power
+    };
+    validate_duchon_kernel_orders(spec.length_scale, p_order, validation_power, 1)?;
     let coeffs = spec
         .length_scale
         .map(|ls| duchon_partial_fraction_coeffs(p_order, s_order_usize, 1.0 / ls.max(1e-300)));
