@@ -207,11 +207,16 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
     let body = format!(
         r#"
         suppressPackageStartupMessages(library(gamlss))
-        suppressPackageStartupMessages(library(gamlss.add))
-        m <- gamlss(y ~ ga(~ s(x1, bs = "tp")) + ga(~ s(x2, bs = "tp")),
-                    sigma.formula = ~ ga(~ s(x1, bs = "tp")) + ga(~ s(x2, bs = "tp")),
+        # Two ADDITIVE penalized smooths per block via gamlss's native penalized
+        # B-spline `pb()` (one per covariate, automatic smoothing-parameter
+        # selection). This replaces the gamlss.add/mgcv `ga(~ s(., bs="tp"))`
+        # bridge (unavailable here): `pb(x1) + pb(x2)` is the correct additive
+        # construction and exercises the SAME pair of one-dimensional penalized
+        # smooths in both the mu and the log-sigma predictor.
+        m <- gamlss(y ~ pb(x1) + pb(x2),
+                    sigma.formula = ~ pb(x1) + pb(x2),
                     family = NO(), data = df,
-                    control = gamlss.control(trace = FALSE))
+                    control = gamlss.control(n.cyc = 200, trace = FALSE))
         gx1 <- as.numeric(strsplit("{grid_x1_csv}", ",")[[1]])
         gx2 <- as.numeric(strsplit("{grid_x2_csv}", ",")[[1]])
         nd <- data.frame(x1 = gx1, x2 = gx2)

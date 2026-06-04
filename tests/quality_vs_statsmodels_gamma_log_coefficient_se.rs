@@ -61,7 +61,7 @@ fn gamma_log_coefficient_se_matches_statsmodels_no_double_count() {
     for _ in 0..n {
         let xi = ux.sample(&mut rng);
         let zi = ux.sample(&mut rng);
-        let eta = 1.5 + 0.6 * xi - 0.4 * zi;
+        let eta: f64 = 1.5 + 0.6 * xi - 0.4 * zi;
         let scale = eta.exp() / shape; // shape*scale = exp(eta) = E[y]
         let g = Gamma::new(shape, scale).expect("gamma(shape,scale)");
         let yi = g.sample(&mut rng);

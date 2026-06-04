@@ -5865,6 +5865,7 @@ pub trait LinearOperator {
                 self.ncols()
             ));
         }
+        let p = self.ncols();
         for retry in 0..8 {
             let ridge = if baseridge > 0.0 {
                 baseridge * 10f64.powi(retry)
@@ -5878,17 +5879,53 @@ pub trait LinearOperator {
                 ridge,
             };
             let preconditioner = normal_op.jacobi_preconditioner()?;
+            let attempt_started = std::time::Instant::now();
             let solved = crate::linalg::utils::solve_spd_pcg_with_info(
                 |v| normal_op.apply(v),
                 rhs,
                 &preconditioner,
                 MATRIX_FREE_PCG_REL_TOL,
-                MATRIX_FREE_PCG_MAX_ITER.max(4 * self.ncols()),
+                MATRIX_FREE_PCG_MAX_ITER.max(4 * p),
             );
-            if let Some((solution, info)) = solved
-                && solution.iter().all(|v| v.is_finite())
-            {
-                return Ok((solution, info));
+            let elapsed = attempt_started.elapsed().as_secs_f64();
+            // Progress diagnostics for the matrix-free inner solve. The happy
+            // path (retry==0, converged) logs at debug to stay quiet inside the
+            // inner-Newton loop; any ridge escalation — the trust-region-retry
+            // analog and a strong signal that the operator is ill-conditioned —
+            // logs at info so a slow fit shows whether time is going into CG
+            // iterations, repeated HVPs, or escalation churn.
+            match solved {
+                Some((solution, info)) if solution.iter().all(|v| v.is_finite()) => {
+                    if retry > 0 {
+                        log::info!(
+                            "[matrix-free PCG] converged after ridge escalation: p={p} retry={retry} ridge={ridge:.3e} iters={} converged={} rel_resid={:.3e} elapsed={elapsed:.3}s",
+                            info.iterations,
+                            info.converged,
+                            info.relative_residual_norm,
+                        );
+                    } else {
+                        log::debug!(
+                            "[matrix-free PCG] solved: p={p} iters={} converged={} rel_resid={:.3e} elapsed={elapsed:.3}s",
+                            info.iterations,
+                            info.converged,
+                            info.relative_residual_norm,
+                        );
+                    }
+                    return Ok((solution, info));
+                }
+                Some((_, info)) => {
+                    log::info!(
+                        "[matrix-free PCG] non-finite solution, escalating ridge: p={p} retry={retry} ridge={ridge:.3e} iters={} converged={} rel_resid={:.3e} elapsed={elapsed:.3}s",
+                        info.iterations,
+                        info.converged,
+                        info.relative_residual_norm,
+                    );
+                }
+                None => {
+                    log::info!(
+                        "[matrix-free PCG] CG breakdown (non-SPD/NaN), escalating ridge: p={p} retry={retry} ridge={ridge:.3e} elapsed={elapsed:.3}s",
+                    );
+                }
             }
         }
         Err("matrix-free PCG failed after ridge retries".to_string())

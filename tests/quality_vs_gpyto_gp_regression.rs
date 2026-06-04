@@ -190,18 +190,24 @@ fn gam_gp_regression_recovers_truth() {
     // and Gaussian noise via Adam, then evaluate the latent-function posterior mean
     // on the identical grid. GPyTorch is the strong BASELINE to match-or-beat on
     // truth-recovery accuracy, NOT an answer gam must reproduce.
+    // The harness writes one rectangular CSV, so every column must share a row
+    // count. The dense grid (`grid_n`) is LONGER than the training set (`n`), so
+    // the longest column sets the row count: ride the n training rows along
+    // right-padded up to `grid_n` and slice them back to the first `n` inside
+    // the body (the padded tail is never read for training).
     let py = run_python(
         &[
-            Column::new("x", &x),
-            Column::new("y", &y),
+            Column::new("x", &pad_to(&x, grid_n)),
+            Column::new("y", &pad_to(&y, grid_n)),
             Column::new("xg", &x_grid),
         ],
-        r#"
+        &format!(
+            r#"
 import torch, gpytorch
 torch.manual_seed(0)
 
-xt = torch.as_tensor(np.asarray(df["x"], dtype=float), dtype=torch.float64)
-yt = torch.as_tensor(np.asarray(df["y"], dtype=float), dtype=torch.float64)
+xt = torch.as_tensor(np.asarray(df["x"], dtype=float)[:{n}], dtype=torch.float64)
+yt = torch.as_tensor(np.asarray(df["y"], dtype=float)[:{n}], dtype=torch.float64)
 xg = torch.as_tensor(np.asarray(df["xg"], dtype=float), dtype=torch.float64)
 
 class ExactGP(gpytorch.models.ExactGP):
@@ -240,7 +246,8 @@ with torch.no_grad(), gpytorch.settings.fast_pred_var(False):
 
 emit("grid_fit", mean)
 emit("grid_std", std)
-"#,
+"#
+        ),
     );
     let gpt_grid = py.vector("grid_fit");
     let gpt_std = py.vector("grid_std");

@@ -693,7 +693,10 @@ res = mod.fit()
 # held-out row order; the Rust side computes the same Harrell C.
 sm_risk = test[feat].to_numpy() @ np.asarray(res.params, dtype=float)
 emit("sm_risk", sm_risk.reshape(-1))
-emit("converged", [1.0 if bool(res.converged) else 0.0])
+# PHRegResults exposes no `.converged` flag; a successful `.fit()` returning
+# finite parameter estimates is the validity signal we can actually check.
+converged = 1.0 if np.all(np.isfinite(np.asarray(res.params, dtype=float))) else 0.0
+emit("converged", [converged])
 "#,
     );
     let sm_risk = py.vector("sm_risk");

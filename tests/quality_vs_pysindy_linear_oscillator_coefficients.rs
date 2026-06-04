@@ -161,9 +161,11 @@ Xdot = np.column_stack([
 ])
 
 # Same problem as gam: STLSQ with hard threshold = 0.01 and no ridge (alpha=0).
-# fit_intercept=False because the constant term is an explicit library column,
-# exactly as gam treats it. Solve both derivative outputs jointly.
-opt = STLSQ(threshold=0.01, alpha=0.0, max_iter=20, fit_intercept=False)
+# STLSQ never fits a separate intercept — it solves the thresholded least-squares
+# problem on Theta directly — so the constant term stays an explicit library
+# column exactly as gam treats it (no fit_intercept knob exists or is needed).
+# Solve both derivative outputs jointly.
+opt = STLSQ(threshold=0.01, alpha=0.0, max_iter=20)
 opt.fit(Theta, Xdot)
 coef = np.asarray(opt.coef_, dtype=float)  # shape (d, p) = (2, 3)
 assert coef.shape == (2, 3), coef.shape

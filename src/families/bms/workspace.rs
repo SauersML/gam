@@ -3744,11 +3744,16 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let r = primary.total;
         let runtime_available = runtime_available_memory_bytes();
+        // Fold the live reading into the monotone capacity floor so the
+        // per-shape single-cache budget is stable across workspace rebuilds;
+        // the live reading still drives the global-pin OOM guard.
+        let stable_capacity = observe_capacity_floor(runtime_available);
         let workspace_pinned = bms_row_primary_hessian_pinned_bytes().load(Ordering::Acquire);
         let plan = decide_row_primary_hessian_cache(
             n,
             r,
             BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            stable_capacity,
             runtime_available,
             workspace_pinned,
         );
@@ -3786,9 +3791,10 @@ impl BernoulliMarginalSlopeFamily {
         if !plan.materialize {
             if log_exact_work(n) {
                 log::info!(
-                    "[BMS row-primary-hessian-cache] decision=stream need_bytes={} avail_bytes={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
+                    "[BMS row-primary-hessian-cache] decision=stream need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                     plan.bytes,
                     plan.runtime_available_bytes,
+                    plan.stable_capacity_bytes,
                     plan.workspace_pinned_bytes,
                     plan.single_cache_budget_bytes,
                     plan.global_pin_budget_bytes,
@@ -3812,9 +3818,10 @@ impl BernoulliMarginalSlopeFamily {
         ));
         if log_exact_work(n) {
             log::info!(
-                "[BMS row-primary-hessian-cache] decision=materialize need_bytes={} avail_bytes={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
+                "[BMS row-primary-hessian-cache] decision=materialize need_bytes={} avail_bytes={} stable_capacity={} workspace_pinned={} single_cache_budget={} global_pin_budget={} n={} r={} expected_reuse_passes={} materialized_row_hessian_evals={} streamed_row_hessian_evals={} reason={} gpu_policy={} gpu_selected={} gpu_reason={}",
                 plan.bytes,
                 plan.runtime_available_bytes,
+                plan.stable_capacity_bytes,
                 plan.workspace_pinned_bytes,
                 plan.single_cache_budget_bytes,
                 plan.global_pin_budget_bytes,

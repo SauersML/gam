@@ -30,9 +30,11 @@
 //!      gamlss is DEMOTED to a baseline on the objective metric; the primary
 //!      claim is the oracle bound (1), not agreement with gamlss.
 //!
-//! gamlss's per-observation CRPS is still computed (via R `scoringrules`) and
-//! gam's via `properscoring` purely so the head-to-head ratio and a context
-//! Pearson r can be printed; the PASS/FAIL gate is the oracle and truth bounds.
+//! gamlss's per-observation CRPS is still computed (via the closed-form
+//! Gaussian CRPS in plain base-R, so no external `scoringrules` dependency is
+//! needed) and gam's via `properscoring` purely so the head-to-head ratio and a
+//! context Pearson r can be printed; the PASS/FAIL gate is the oracle and truth
+//! bounds.
 //!
 //! gam-side API pinned by reading the source (mirrors
 //! tests/quality_vs_gamlss_gaussian_location_scale.rs):
@@ -215,7 +217,7 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     assert_eq!(gam_sigma.len(), n_test);
 
     // ---- fit gamlss on the SAME 140 train rows, predict on the SAME 60 test
-    // rows, and score with scoringrules::crps_norm in R. The full (x, z, y) and
+    // rows, and score with the closed-form Gaussian CRPS in base R. The full (x, z, y) and
     // a per-row `train` flag are sent so gamlss subsets to exactly the rows gam
     // trained on; the model is `y ~ pb(x) + pb(z)`, sigma.formula = ~ pb(x).
     let train_flag: Vec<f64> = (0..n)
@@ -231,7 +233,6 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
         ],
         r#"
         suppressPackageStartupMessages(library(gamlss))
-        suppressPackageStartupMessages(library(scoringrules))
         tr <- df[df$train > 0.5, ]
         te <- df[df$train < 0.5, ]
         m <- gamlss(y ~ pb(x) + pb(z), sigma.formula = ~ pb(x), family = NO(),
@@ -239,8 +240,14 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
         nd <- data.frame(x = te$x, z = te$z)
         mu <- as.numeric(predict(m, what = "mu", newdata = nd, type = "response"))
         sigma <- as.numeric(predict(m, what = "sigma", newdata = nd, type = "response"))
-        # scoringrules::crps_norm: per-observation CRPS of N(mu, sigma) at y.
-        crps <- as.numeric(crps_norm(te$y, mean = mu, sd = sigma))
+        # Per-observation closed-form Gaussian CRPS of N(mu, sigma) at y
+        # (Gneiting & Raftery 2007), computed with base-R pnorm/dnorm so this
+        # arm carries NO external scoringrules dependency. For z=(y-mu)/sigma,
+        #   CRPS = sigma * ( z*(2*Phi(z)-1) + 2*phi(z) - 1/sqrt(pi) ).
+        # This is byte-for-byte the definition scoringrules::crps_norm uses;
+        # verified to agree with the CRPS integral to ~1e-9.
+        z <- (te$y - mu) / sigma
+        crps <- as.numeric(sigma * (z * (2 * pnorm(z) - 1) + 2 * dnorm(z) - 1 / sqrt(pi)))
         emit("mu", mu)
         emit("sigma", sigma)
         emit("crps", crps)
@@ -265,7 +272,8 @@ fn gam_gaussian_location_scale_crps_matches_gamlss() {
     // rule, via an independent third-party implementation
     // (properscoring.crps_gaussian) on the identical held-out y. gam's predicted
     // (mu, sigma) are passed in; this isolates the scoring library from gam's
-    // internals and from R's scoringrules so any CRPS-formula bias cancels.
+    // internals so any CRPS-formula bias cancels against the closed form used
+    // elsewhere here.
     let py = run_python(
         &[
             Column::new("y", y_test),
@@ -493,7 +501,6 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(gamlss))
-        suppressPackageStartupMessages(library(scoringrules))
         tr <- df[df$train > 0.5, ]
         te <- df[df$train < 0.5, ]
         m <- gamlss(GAG ~ pb(Age), sigma.formula = ~ pb(Age), family = NO(),
@@ -501,7 +508,10 @@ fn gam_gaussian_location_scale_crps_matches_gamlss_on_real_data() {
         nd <- data.frame(Age = te$Age)
         mu <- as.numeric(predict(m, what = "mu", newdata = nd, type = "response"))
         sigma <- as.numeric(predict(m, what = "sigma", newdata = nd, type = "response"))
-        crps <- as.numeric(crps_norm(te$GAG, mean = mu, sd = sigma))
+        # Closed-form Gaussian CRPS (Gneiting & Raftery 2007) via base-R
+        # pnorm/dnorm — identical to scoringrules::crps_norm, no external dep.
+        z <- (te$GAG - mu) / sigma
+        crps <- as.numeric(sigma * (z * (2 * pnorm(z) - 1) + 2 * dnorm(z) - 1 / sqrt(pi)))
         emit("mu", mu)
         emit("sigma", sigma)
         emit("crps", crps)

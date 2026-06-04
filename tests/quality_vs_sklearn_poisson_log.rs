@@ -146,8 +146,12 @@ fam = sm.families.Poisson(link=sm.families.links.Log())
 
 alpha0 = [1.0, 1.0]
 gam = GLMGam(y, smoother=bs, alpha=alpha0, family=fam)
-# GCV search over the per-smoother penalty weights, then refit at the optimum.
-alpha_opt, _ = gam.select_penweight()
+# select_penweight reads model attributes (e.g. `scale`) that only exist after
+# an initial fit, so fit once at alpha0 to populate them before searching. It
+# then returns (alpha, fit_res, history); take the optimized penalty weights and
+# refit at the optimum so statsmodels performs real smoothing-parameter selection.
+gam.fit()
+alpha_opt = gam.select_penweight()[0]
 gam = GLMGam(y, smoother=bs, alpha=alpha_opt, family=fam)
 res = gam.fit()
 

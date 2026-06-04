@@ -211,11 +211,14 @@ fn gam_cyclic_location_scale_recovers_truth() {
         &[Column::new("x", &xs), Column::new("y", &ys)],
         r#"
         suppressPackageStartupMessages(library(gamlss))
-        suppressPackageStartupMessages(library(gamlss.add))
-        kn <- list(x = c(0, 2*pi))
+        # gamlss's native penalized CYCLIC P-spline `pbc()` (auto smoothing-
+        # parameter selection) is the cyclic analogue of `pb()` and lives in the
+        # base gamlss package; it does NOT need the gamlss.add/mgcv `ga(~ s(.))`
+        # bridge (which is unavailable here). x spans exactly [0, 2*pi], so pbc's
+        # data-range period matches gam's explicit [0, 2*pi] cyclic boundary.
         m <- gamlss(
-            y ~ ga(~ s(x, bs = "cc"), control = list(knots = kn)),
-            sigma.formula = ~ ga(~ s(x, bs = "cc"), control = list(knots = kn)),
+            y ~ pbc(x),
+            sigma.formula = ~ pbc(x),
             family = NO(),
             data = df,
             control = gamlss.control(n.cyc = 200, trace = FALSE)
@@ -525,11 +528,14 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(gamlss))
-        suppressPackageStartupMessages(library(gamlss.add))
-        kn <- list(month = c(0.5, 12.5))
+        # gamlss's native penalized CYCLIC P-spline `pbc()` (auto smoothing-
+        # parameter selection) replaces the gamlss.add/mgcv `ga(~ s(., bs="cc"))`
+        # bridge, which is unavailable here. month is circular over 1..12, so the
+        # cyclic boundary lands at the December/January seam, matching gam's
+        # explicit [0.5, 12.5] period.
         m <- gamlss(
-            temp ~ ga(~ s(month, bs = "cc"), control = list(knots = kn)),
-            sigma.formula = ~ ga(~ s(month, bs = "cc"), control = list(knots = kn)),
+            temp ~ pbc(month),
+            sigma.formula = ~ pbc(month),
             family = NO(),
             data = df,
             control = gamlss.control(n.cyc = 200, trace = FALSE)

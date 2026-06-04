@@ -7377,6 +7377,7 @@ mod tests {
             20,
             BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
             16 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024 * 1024,
             0,
         );
         assert_eq!(plan.bytes, 626_496_000);
@@ -7396,6 +7397,7 @@ mod tests {
             20,
             BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
             2 * 1024 * 1024 * 1024,
+            2 * 1024 * 1024 * 1024,
             0,
         );
         assert!(!plan.materialize);
@@ -7414,6 +7416,7 @@ mod tests {
             20,
             BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
             16 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024 * 1024,
             (15 * 1024 * 1024 * 1024) / 2,
         );
         assert!(!plan.materialize);
@@ -7425,9 +7428,84 @@ mod tests {
 
     #[test]
     fn bernoulli_flex_row_primary_hessian_cache_policy_streams_low_reuse() {
-        let plan = decide_row_primary_hessian_cache(100, 4, 1, 16 * 1024 * 1024 * 1024, 0);
+        let plan = decide_row_primary_hessian_cache(
+            100,
+            4,
+            1,
+            16 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024 * 1024,
+            0,
+        );
         assert!(!plan.materialize);
         assert_eq!(plan.reason, RowPrimaryHessianCacheReason::ReuseTooLow);
+    }
+
+    #[test]
+    fn bernoulli_flex_row_primary_hessian_cache_policy_no_flip_under_memory_pressure() {
+        // Regression for the AoU 16d-flex shape (n=320k, r=20 → 1.08 GB cache)
+        // that flipped materialize→stream mid-fit, dropping the inner solve from
+        // the fast dense route onto the matrix-free CG path that never finished.
+        let n = 320_000usize;
+        let r = 20usize;
+        let bytes = (n as u64) * ((r * r + r + 1) as u64) * 8;
+        assert_eq!(bytes, 1_077_760_000);
+
+        // First decision while RAM is plentiful: 4.15 GiB available establishes
+        // the stable capacity floor; single-cache budget ≈ 1.11 GB > 1.08 GB →
+        // materialize on the dense route.
+        let plentiful = 4_457_512_960u64;
+        let plan_hot = decide_row_primary_hessian_cache(
+            n,
+            r,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            plentiful,
+            plentiful,
+            0,
+        );
+        assert!(plan_hot.materialize);
+        assert_eq!(
+            plan_hot.reason,
+            RowPrimaryHessianCacheReason::ReuseAmortizesBuild
+        );
+
+        // Later in the same fit, live available RAM has dropped to 3.18 GiB but
+        // the stable capacity floor is unchanged. Pre-fix the single-cache
+        // budget would have fallen to ≈0.80 GB and rejected the same 1.08 GB
+        // cache; with the stable floor the decision must NOT flip.
+        let pressured = 3_180_212_224u64;
+        let plan_cold = decide_row_primary_hessian_cache(
+            n,
+            r,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            plentiful,
+            pressured,
+            0,
+        );
+        assert!(
+            plan_cold.materialize,
+            "stable capacity budget must keep the 1.08 GB cache materialized through a transient available-RAM dip"
+        );
+        assert_eq!(
+            plan_cold.reason,
+            RowPrimaryHessianCacheReason::ReuseAmortizesBuild
+        );
+
+        // Sanity: feeding the pressured value as BOTH the stable floor and the
+        // live reading (the pre-fix behaviour) reproduces the bad flip, proving
+        // the floor — not some unrelated slack — is what prevents it.
+        let plan_prefix = decide_row_primary_hessian_cache(
+            n,
+            r,
+            BMS_ROW_PRIMARY_HESSIAN_EXPECTED_REUSE_PASSES,
+            pressured,
+            pressured,
+            0,
+        );
+        assert!(!plan_prefix.materialize);
+        assert_eq!(
+            plan_prefix.reason,
+            RowPrimaryHessianCacheReason::SingleCacheExceedsRamFraction
+        );
     }
 
     #[test]
