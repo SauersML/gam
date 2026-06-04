@@ -7619,8 +7619,10 @@ mod tests {
             ..FitConfig::default()
         };
 
-        let err = materialize("event ~ bmi", &data, &config)
-            .expect_err("constant z_column should be rejected before BMS integration");
+        let err = match materialize("event ~ bmi", &data, &config) {
+            Ok(_) => panic!("constant z_column should be rejected before BMS integration"),
+            Err(err) => err,
+        };
         let msg = err.to_string();
         assert!(
             msg.contains("z_column 'prs_z' has zero weighted variance"),

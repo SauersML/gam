@@ -177,7 +177,7 @@ jobs:
           python -m pip install --upgrade pip
           # Core (must succeed); heavy/optional ones best-effort so one failure
           # does not block the rest.
-          pip install numpy pandas scipy scikit-learn statsmodels
+          pip install "numpy<2" pandas scipy scikit-learn statsmodels
           pip install pygam lifelines scikit-survival properscoring scoringrules || true
           pip install geomstats GPy gpytorch || true
           pip install numpyro arviz pymc || true
