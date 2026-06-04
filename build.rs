@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
@@ -2943,7 +2944,36 @@ fn scan_for_vendor_directories(
     }
 }
 
+struct ScannedFile {
+    rel: PathBuf,
+    content: String,
+}
+
+static SCANNABLE_FILES: OnceLock<Vec<ScannedFile>> = OnceLock::new();
+
 fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
+    let dir_rel = dir
+        .strip_prefix(root)
+        .expect("scanner directory must be under the manifest root");
+    for file in scannable_files(root) {
+        if !dir_rel.as_os_str().is_empty() && !file.rel.starts_with(dir_rel) {
+            continue;
+        }
+        visitor(&file.rel, &file.content);
+    }
+}
+
+fn scannable_files(root: &Path) -> &'static [ScannedFile] {
+    SCANNABLE_FILES
+        .get_or_init(|| {
+            let mut files = Vec::new();
+            collect_scannable_files(root, root, &mut files);
+            files
+        })
+        .as_slice()
+}
+
+fn collect_scannable_files(root: &Path, dir: &Path, files: &mut Vec<ScannedFile>) {
     let read = match fs::read_dir(dir) {
         Ok(r) => r,
         Err(_) => return,
@@ -2973,7 +3003,7 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
             continue;
         }
         if path.is_dir() {
-            visit_files(root, &path, visitor);
+            collect_scannable_files(root, &path, files);
             continue;
         }
         let ext = path.extension().and_then(OsStr::to_str).unwrap_or("");
@@ -2991,8 +3021,11 @@ fn visit_files(root: &Path, dir: &Path, visitor: &mut dyn FnMut(&Path, &str)) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-        visitor(&rel, &content);
+        let rel = path
+            .strip_prefix(root)
+            .expect("scanned file must be under the manifest root")
+            .to_path_buf();
+        files.push(ScannedFile { rel, content });
     }
 }
 
