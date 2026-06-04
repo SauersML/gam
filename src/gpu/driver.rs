@@ -542,6 +542,7 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn append_versioned_linux_so_candidates(out: &mut Vec<String>, dir: &Path, base: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
