@@ -733,10 +733,10 @@ impl<const K: usize, T: RowKernel<K>> HyperOperator
     /// `T_r` matrix only depends on `self.direction` — which is fixed for the
     /// operator — so the rank-many recomputations are pure waste. On the
     /// biobank-shape margslope-aniso-duchon16d shard the
-    /// `BernoulliRigidRowKernel::row_third_contracted` jet (composed of
-    /// `MultiDirJet::compose_unary` + malloc-heavy `empirical_rigid_neglog_jet`)
-    /// dominates the per-axis trace at ~30 s, with `rank≈p≈95` so the redundancy
-    /// factor lands near the observed ~95×.
+    /// `BernoulliRigidRowKernel::row_third_contracted` evaluation (the closed-form
+    /// IFT third-derivative tensor, which re-solves the per-row intercept and
+    /// sweeps the grid moments) dominates the per-axis trace, with `rank≈p≈95`
+    /// so the redundancy factor lands near the observed ~95×.
     ///
     /// Algebra: the operator action is
     /// ```text

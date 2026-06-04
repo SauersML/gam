@@ -13,9 +13,10 @@ pub(super) struct BernoulliRigidRowKernel {
     /// Per-row uncontracted third-derivative tensor, lazily populated in a
     /// single parallel pass on first access. Every ψ-axis directional
     /// derivative operator that consults this kernel shares this cache via
-    /// its `Arc`; the heavy empirical-grid jet (`empirical_rigid_neglog_jet`)
-    /// runs at most once per row across the full ext-dim sweep, instead of
-    /// once per (row, ψ-axis) pair. Per-axis `row_third_contracted` becomes
+    /// its `Arc`; the empirical-grid closed-form third-derivative tensor
+    /// (`empirical_rigid_third_full_closed_form`) runs at most once per row
+    /// across the full ext-dim sweep, instead of once per (row, ψ-axis) pair.
+    /// Per-axis `row_third_contracted` becomes
     /// a 2×2 bilinear contraction against the cached tensor.
     pub(super) third_full_cache: crate::resource::RayonSafeOnce<Vec<[[[f64; 2]; 2]; 2]>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian

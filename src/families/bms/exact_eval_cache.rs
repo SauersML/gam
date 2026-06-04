@@ -295,9 +295,10 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// lazily built on first access. The `build_psi_hyper_coords` row pass
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
     /// row at biobank shape — but the per-row jet is axis-invariant. This
-    /// cache lets the heavy `empirical_rigid_neglog_jet` (or its closed-form
-    /// equivalent) run at most once per row per cache lifetime; per-axis
-    /// callers reduce to a 2×2 [`contract_third_full`].
+    /// cache lets the closed-form third-derivative tensor
+    /// (`empirical_rigid_third_full_closed_form`, or `rigid_transformed_third_full`
+    /// for the standard-normal measure) run at most once per row per cache
+    /// lifetime; per-axis callers reduce to a 2×2 [`contract_third_full`].
     ///
     /// Stored as `Result` because the build is fallible (per-row jet may
     /// surface a non-finite value). `RayonSafeOnce` keeps lazy initialization
