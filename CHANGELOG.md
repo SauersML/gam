@@ -16,6 +16,32 @@ The two packages are versioned independently — `gam` tracks the Rust engine,
 `gamfit` the Python wheel — but released together. Each entry is headed with the
 git tag and both package versions.
 
+## v0.3.83 — gam 0.3.83 / gamfit 0.1.155 (2026-06-04)
+
+### Fixed
+
+- **Anisotropic Duchon spatial terms no longer abort REML with an outer
+  gradient-length mismatch.** Four functions disagreed on how many `ψ` entries a
+  multi-axis `aniso_log_scales` Duchon term contributes to the joint outer
+  hyperparameter vector: the n-block exact-joint spatial optimizer planned a
+  per-axis `θ` layout (`rho_dim + Σ d_term`) while the inner unified evaluator
+  emitted one `ψ` per term, tripping the `OuterThetaLayout` contract and failing
+  every nightly Biobank-scale `duchon16d` shard before the solver even started.
+  A single shared predicate now drives the `ψ` count at all four sites: Duchon
+  anisotropy `η` is a fixed, geometry-derived basis parameter (one isotropic
+  `ψ̄` slot per term), so the outer plan and the inner gradient agree by
+  construction. Matérn anisotropy is unchanged (still per-axis `ψ`).
+- **Manifold SAE fits converge again across all isometry/topology cells,
+  including the circle `d=1` case that regressed in 0.1.154.** The isometry
+  cross-block curvature added for 0.1.152 left the coordinate/decoder Schur
+  complement slightly non-PD — an inconsistent nonzero cross-block that was not
+  paired with diagonals from the same residual Jacobian — so circle `d=1` fits
+  failed where they had recovered `R² ≈ 0.997`. The inconsistent cross-block is
+  removed (PSD diagonals with a zero cross-block stay PSD), and inner
+  stationarity is now judged by the gradient at the step's parameter scale so
+  gauge-like SAE directions are no longer mistaken for non-convergence. All nine
+  isometry × topology × dimension bisection cells now converge.
+
 ## v0.3.82 — gam 0.3.82 / gamfit 0.1.154 (2026-06-03)
 
 ### Fixed
