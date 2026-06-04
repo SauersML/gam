@@ -11690,50 +11690,71 @@ pub(crate) fn strict_logdet_spd_with_lm_continuation(
     )
 }
 
+/// Exact pseudo-Laplace log-determinant `log|H + S_λ|` of the REML/LAML
+/// objective, computed from the eigenspectrum with **no δ-ridge** so the value
+/// stays on the same objective as the analytic gradient `tr((H+S_λ)⁻¹ ·)`
+/// (gam#748).
+///
+/// The earlier `allow_semidefinite=false` path returned `log|H + S_λ + δI|`
+/// with `δ = δ(ρ)` escalated geometrically until factorization succeeded. That
+/// makes `V(ρ)` carry a ρ-dependent, discontinuous `δ(ρ)` the analytic
+/// derivatives ignore — exactly the objective/derivative mismatch the
+/// operator-dense path's own comment forbids ("mixing an approximate
+/// determinant with exact traces gives ARC a Hessian for a different
+/// objective"). Both modes now compute the same honest quantity:
+///
+/// - eigendecompose the symmetrised `H + S_λ`;
+/// - **reject** (return `Err`) when any eigenvalue is genuinely negative
+///   (`λ < −tol`). An indefinite joint coefficient Hessian is a real defect
+///   (a non-stationary inner β or a mis-signed curvature block); rejecting it
+///   tells the outer optimizer to step back, instead of masking it with a
+///   biased finite number;
+/// - sum `Σ_{λ > tol} log λ` — the exact pseudo-logdet on the positive
+///   eigenspace, which is `C∞` in ρ because the positive eigenspace of a PSD
+///   `S(ρ)=Σ e^{ρ_k} S_k` is structurally fixed.
+///
+/// `allow_semidefinite` now only governs the near-zero band `[−tol, tol]`: the
+/// semidefinite mode tolerates a structural null space (those modes are simply
+/// not in `range`, matching the projected `tr` derivative), while the strict
+/// mode additionally **rejects** a rank-deficient `H + S_λ` (any eigenvalue in
+/// the band) because a strict-PD family expects a full-rank coefficient
+/// Hessian and a silent rank drop would again desync value from gradient.
 fn strict_logdet_spd_with_semidefinite_option(
     matrix: &Array2<f64>,
     allow_semidefinite: bool,
     accumulation_depth: usize,
 ) -> Result<f64, String> {
-    if allow_semidefinite {
-        let mut sym = matrix.clone();
-        symmetrize_dense_in_place(&mut sym);
-        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower)
-            .map_err(|e| format!("strict pseudo-laplace PSD eigendecomposition failed: {e}"))?;
-        let p = sym.nrows();
-        let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-        // Bauer-Fike: |δσ| ≤ p·‖δH‖_∞; n-term fma roundoff gives ‖δH‖_∞ ≤ ε·n·‖H‖,
-        // so σ_noise ≤ ε·n·p·‖H‖₂. Tenfold slack absorbs sign cancellations,
-        // and a 100·ε floor handles the ‖H‖→0 limit.
-        let eps = f64::EPSILON;
-        let eps_np = eps * (accumulation_depth as f64) * (p as f64);
-        let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * eps);
-        if evals.iter().any(|&ev| ev < -tol) {
-            let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
-            let below = evals.iter().filter(|&&ev| ev < -tol).count();
-            return Err(CustomFamilyError::NumericalFailure { reason: format!(
-                "strict pseudo-laplace SPD solve failed: {below} eigenvalue(s) below -tol \
-                 (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}, εnp={eps_np:.6e})"
-            ) }.into());
-        }
-        let logdet = evals
-            .iter()
-            .copied()
-            .filter(|&ev| ev > tol)
-            .map(f64::ln)
-            .sum();
-        return Ok(logdet);
+    let mut sym = matrix.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower)
+        .map_err(|e| format!("strict pseudo-laplace eigendecomposition failed: {e}"))?;
+    let p = sym.nrows();
+    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    // Bauer-Fike: |δσ| ≤ p·‖δH‖_∞; n-term fma roundoff gives ‖δH‖_∞ ≤ ε·n·‖H‖,
+    // so σ_noise ≤ ε·n·p·‖H‖₂. Tenfold slack absorbs sign cancellations,
+    // and a 100·ε floor handles the ‖H‖→0 limit.
+    let eps = f64::EPSILON;
+    let eps_np = eps * (accumulation_depth as f64) * (p as f64);
+    let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * eps);
+    if evals.iter().any(|&ev| ev < -tol) {
+        let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        let below = evals.iter().filter(|&&ev| ev < -tol).count();
+        return Err(CustomFamilyError::NumericalFailure { reason: format!(
+            "strict pseudo-laplace logdet: {below} eigenvalue(s) below -tol \
+             (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}, εnp={eps_np:.6e}); \
+             indefinite joint coefficient Hessian rejected (no δ-ridge masking, gam#748)"
+        ) }.into());
     }
-    let (logdet, stats) = strict_logdet_spd_with_lm_continuation(matrix)?;
-    if stats.escalations > 0 {
-        log::debug!(
-            "[strict-spd] logdet δ-ridge continuation: δ={:.3e}, escalations={}, p={}",
-            stats.delta_used,
-            stats.escalations,
-            matrix.nrows(),
-        );
+    if !allow_semidefinite && evals.iter().any(|&ev| ev <= tol) {
+        let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        let in_band = evals.iter().filter(|&&ev| ev <= tol).count();
+        return Err(CustomFamilyError::NumericalFailure { reason: format!(
+            "strict pseudo-laplace logdet: {in_band} eigenvalue(s) at/below +tol \
+             (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); \
+             rank-deficient joint coefficient Hessian rejected in strict-PD mode (gam#748)"
+        ) }.into());
     }
-    Ok(logdet)
+    Ok(evals.iter().copied().filter(|&ev| ev > tol).map(f64::ln).sum())
 }
 
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
