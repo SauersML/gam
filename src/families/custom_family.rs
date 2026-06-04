@@ -1,6 +1,6 @@
 use crate::cache::Fingerprinter;
 use crate::faer_ndarray::FaerEigh;
-use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
+use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atb, fast_av};
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, EmbeddedSquareBlock, LinearOperator, SignedWeightsView,
     SymmetricMatrix, dense_rowwise_kronecker,
@@ -18475,73 +18475,81 @@ fn joint_penalty_subspace_trace_parts(
         }
     }
 
-    let mut h_times_u = Array2::<f64>::zeros((total, rank));
-    for col in 0..rank {
-        let basis = u_s.column(col).to_owned();
-        let h_col = match h_joint_unpen {
-            JointHessianSource::Dense(h_joint) => {
-                let mut out = fast_av(h_joint, &basis);
-                let penalty = apply_joint_block_penalty(
-                    ranges,
-                    s_lambdas,
-                    &basis,
-                    hessian_diagonal_ridge,
-                    None,
-                );
-                out += &penalty;
-                out
-            }
-            JointHessianSource::Operator { apply, .. } => {
-                let mut out = apply(&basis)?;
-                let penalty = apply_joint_block_penalty(
-                    ranges,
-                    s_lambdas,
-                    &basis,
-                    hessian_diagonal_ridge,
-                    None,
-                );
-                out += &penalty;
-                out
-            }
-        };
-        h_times_u.column_mut(col).assign(&h_col);
-    }
+    // `(H + Sλ) · U_S`, column by column. Only the budget-exceeded fallback
+    // below needs it (the primary path materialises the full `M = H + Sλ`), so
+    // build it lazily to avoid `rank` redundant operator applies on the common
+    // dense path.
+    let build_h_times_u = || -> Result<Array2<f64>, String> {
+        let mut h_times_u = Array2::<f64>::zeros((total, rank));
+        for col in 0..rank {
+            let basis = u_s.column(col).to_owned();
+            let h_col = match h_joint_unpen {
+                JointHessianSource::Dense(h_joint) => {
+                    let mut out = fast_av(h_joint, &basis);
+                    let penalty = apply_joint_block_penalty(
+                        ranges,
+                        s_lambdas,
+                        &basis,
+                        hessian_diagonal_ridge,
+                        None,
+                    );
+                    out += &penalty;
+                    out
+                }
+                JointHessianSource::Operator { apply, .. } => {
+                    let mut out = apply(&basis)?;
+                    let penalty = apply_joint_block_penalty(
+                        ranges,
+                        s_lambdas,
+                        &basis,
+                        hessian_diagonal_ridge,
+                        None,
+                    );
+                    out += &penalty;
+                    out
+                }
+            };
+            h_times_u.column_mut(col).assign(&h_col);
+        }
+        Ok(h_times_u)
+    };
 
-    let mut h_proj = fast_atb(&u_s, &h_times_u);
-    symmetrize_dense_in_place(&mut h_proj);
-    let (h_evals, h_evecs) = h_proj
-        .eigh(Side::Lower)
-        .map_err(|e| format!("joint projected Hessian eigendecomposition failed: {e}"))?;
-    let h_threshold = positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
-
-    // ── REML log|H + Sλ|₊ over the FULL identifiable subspace range(H + Sλ) ──
+    // ── REML log|H + Sλ|₊ and its trace kernel over the FULL identifiable
+    //    subspace range(H + Sλ) ──────────────────────────────────────────────
     //
-    // The trace/IFT kernel below legitimately lives on range(Sλ): the logdet
-    // *trace* derivative `tr((H+Sλ)⁻¹ ∂Sλ/∂ρ)` has support only where
-    // ∂Sλ/∂ρ ≠ 0, i.e. range(Sλ). But the REML penalty-determinant term
-    // `½ log|H + Sλ|₊` itself must span range(H + Sλ), NOT range(Sλ).
+    // The REML penalty-determinant term is `½ log|H + Sλ|₊`, and its ρ-gradient
+    // is the trace `½ tr((H + Sλ)⁻¹ ∂Sλ/∂ρ)`. BOTH must be taken over
+    // range(H + Sλ) — the full identifiable subspace — not over range(Sλ).
     //
-    // Projecting the logdet onto range(Sλ) alone computes `log|U_Sᵀ(H+Sλ)U_S|`
-    // = `log|M_rr|`, which DROPS the determinant of the penalty-null block
-    // `M_kk = U_kᵀ H U_k` (on ker(Sλ), Sλ vanishes so this is pure likelihood
-    // curvature) and its Schur coupling. That block is the unpenalized
-    // polynomial trend; on a near-collinear design (admixture-cline PCs at
-    // small n) its curvature is large and GROWS as the smooth part is shrunk.
-    // Omitting it from log|H+Sλ| while `½ log|Sλ|₊` is correctly taken over
-    // range(Sλ) makes the ρ-derivative of the REML criterion inconsistent in
-    // the marginal block: the outer optimizer drives that block's λ → ∞ chasing
-    // a flat-increasing profile (gh#752), the coupled inner joint-Newton can no
+    // The previous code projected onto range(Sλ): it computed
+    // `log|U_Sᵀ(H+Sλ)U_S| = log|M_rr|` and the kernel `M_rr⁻¹`. That DROPS the
+    // determinant of the penalty-null block `M_kk = U_kᵀ H U_k` (on ker(Sλ), Sλ
+    // vanishes, so this is pure likelihood curvature) and the Schur coupling
+    // between the two. `M_kk` is the unpenalized polynomial trend; on a
+    // near-collinear design (admixture-cline PCs at small n) its curvature is
+    // large and GROWS as the smooth part is shrunk. Omitting it from
+    // `log|H+Sλ|` while `½ log|Sλ|₊` is correctly taken over range(Sλ) makes
+    // the ρ-derivative of the REML criterion inconsistent in the marginal
+    // block: the outer optimizer drives that block's λ → ∞ chasing a
+    // flat-increasing profile (gh#752), the coupled inner joint-Newton can no
     // longer certify stationarity on the now-ill-conditioned trend, and the
     // envelope-theorem outer gradient — valid only at a stationary β̂ — diverges
     // on the coupled (logslope) block while the objective stalls, so ARC never
     // reaches a KKT point.
     //
-    // The correct generalized determinant (mgcv's treatment) takes
-    // `log|H + Sλ|₊` over range(H + Sλ): identical to the ordinary log-det when
+    // The correct generalized determinant (mgcv's treatment) takes both terms
+    // over range(H + Sλ): identical to the ordinary log-det / inverse when
     // H + Sλ is non-singular (the well-posed case), and dropping only the truly
     // unidentified directions ker(H) ∩ ker(Sλ) when it is singular — exactly the
-    // directions `½ log|Sλ|₊` also omits, keeping the two terms consistent.
-    let logdet = match materialize_joint_hessian_source(
+    // directions `½ log|Sλ|₊` also omits, keeping value and gradient consistent.
+    //
+    // To preserve value/gradient consistency the trace kernel must be the
+    // range(Sλ) BLOCK of the FULL pseudo-inverse `(H+Sλ)⁺` (its Schur reduction
+    // onto range(Sλ)), NOT `M_rr⁻¹`. Then
+    //   tr(h_proj_inverse · U_Sᵀ ∂Sλ U_S) = tr((H+Sλ)⁺ ∂Sλ) = ∂_ρ log|H+Sλ|₊,
+    // since ∂Sλ/∂ρ is supported on range(Sλ). Both are derived from the same
+    // materialized `M = H + Sλ` so they cannot drift apart.
+    let (logdet, h_proj_inverse) = match materialize_joint_hessian_source(
         h_joint_unpen,
         total,
         "joint penalty subspace logdet",
@@ -18550,35 +18558,64 @@ fn joint_penalty_subspace_trace_parts(
             let mut m = h_dense;
             add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
             symmetrize_dense_in_place(&mut m);
-            let (m_evals, _) = m
-                .eigh(Side::Lower)
-                .map_err(|e| format!("joint penalty subspace full Hessian eigendecomposition failed: {e}"))?;
+            let (m_evals, m_evecs) = m.eigh(Side::Lower).map_err(|e| {
+                format!("joint penalty subspace full Hessian eigendecomposition failed: {e}")
+            })?;
             let m_threshold = positive_eigenvalue_threshold(m_evals.as_slice().unwrap());
-            exact_pseudo_logdet(m_evals.as_slice().unwrap(), m_threshold)
+            let logdet = exact_pseudo_logdet(m_evals.as_slice().unwrap(), m_threshold);
+            // Full Moore–Penrose pseudo-inverse `M⁺` (drop ker(H+Sλ)), then its
+            // range(Sλ) block `U_Sᵀ M⁺ U_S` as the trace kernel.
+            let mut m_pinv = Array2::<f64>::zeros((total, total));
+            for eig_idx in 0..total {
+                let sigma = m_evals[eig_idx];
+                if sigma <= m_threshold {
+                    continue;
+                }
+                let inv = 1.0 / sigma;
+                for i in 0..total {
+                    let vi = inv * m_evecs[[i, eig_idx]];
+                    for j in 0..total {
+                        m_pinv[[i, j]] += vi * m_evecs[[j, eig_idx]];
+                    }
+                }
+            }
+            symmetrize_dense_in_place(&mut m_pinv);
+            let mut h_proj_inverse = fast_atb(&u_s, &fast_ab(&m_pinv, &u_s));
+            symmetrize_dense_in_place(&mut h_proj_inverse);
+            (logdet, h_proj_inverse)
         }
         // Materialization refused (over the dense byte budget): fall back to the
-        // range(Sλ) projection. This under-counts the penalty-null determinant,
-        // but only fires at a joint dimension where dense algebra is itself
-        // infeasible, and never silently — `materialize_joint_hessian_source`
-        // returns the budget error here, which we downgrade to the projected
-        // value rather than aborting the outer evaluation.
-        Err(_) => exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_threshold),
-    };
-
-    let mut h_proj_inverse = Array2::<f64>::zeros((rank, rank));
-    for eig_idx in 0..rank {
-        let sigma = h_evals[eig_idx];
-        if sigma <= h_threshold {
-            continue;
-        }
-        let inv = 1.0 / sigma;
-        for i in 0..rank {
-            for j in 0..rank {
-                h_proj_inverse[[i, j]] += inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
+        // self-consistent range(Sλ) projection (logdet AND kernel both reduced
+        // onto range(Sλ)). This under-counts the penalty-null determinant, but
+        // only fires at a joint dimension where dense algebra is itself
+        // infeasible; the value and its trace kernel are still mutually
+        // consistent (both `M_rr`), so the outer gradient stays valid.
+        Err(_) => {
+            let h_times_u = build_h_times_u()?;
+            let mut h_proj = fast_atb(&u_s, &h_times_u);
+            symmetrize_dense_in_place(&mut h_proj);
+            let (h_evals, h_evecs) = h_proj.eigh(Side::Lower).map_err(|e| {
+                format!("joint projected Hessian eigendecomposition failed: {e}")
+            })?;
+            let h_threshold = positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
+            let logdet = exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_threshold);
+            let mut h_proj_inverse = Array2::<f64>::zeros((rank, rank));
+            for eig_idx in 0..rank {
+                let sigma = h_evals[eig_idx];
+                if sigma <= h_threshold {
+                    continue;
+                }
+                let inv = 1.0 / sigma;
+                for i in 0..rank {
+                    for j in 0..rank {
+                        h_proj_inverse[[i, j]] += inv * h_evecs[[i, eig_idx]] * h_evecs[[j, eig_idx]];
+                    }
+                }
             }
+            symmetrize_dense_in_place(&mut h_proj_inverse);
+            (logdet, h_proj_inverse)
         }
-    }
-    symmetrize_dense_in_place(&mut h_proj_inverse);
+    };
 
     Ok((
         logdet,
