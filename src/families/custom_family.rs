@@ -12072,9 +12072,16 @@ fn block_residual_diagnostic_string(
         }
         Err(_) => (vec![f64::NAN; states.len()], f64::NAN),
     };
+    // Empty / zero-width blocks contribute `f64::NAN` to `block_residual_inf`
+    // above (the `acc >= end` branch). A `max_by` over `partial_cmp` treats
+    // NaN as `Ordering::Equal`, so an empty block can falsely win the max and
+    // be reported as the carrying block even though all finite residual lives
+    // in the active blocks. Restrict the selection to finite residuals so a
+    // genuinely zero-width block can never be named the dominant block.
     let dominant_idx = block_residual_inf
         .iter()
         .enumerate()
+        .filter(|(_, v)| v.is_finite())
         .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i);
     let dominant = if let Some(i) = dominant_idx {
@@ -12465,11 +12472,20 @@ fn compute_kkt_refusal_report(
         Some(residual) => ranges
             .iter()
             .map(|(start, end)| {
-                residual
-                    .slice(ndarray::s![*start..*end])
-                    .iter()
-                    .map(|x: &f64| x.abs())
-                    .fold(0.0_f64, f64::max)
+                // A zero-width block (start == end) has no residual of its own;
+                // an empty `fold` would report a spurious `0.0`. Mark it `NaN`
+                // so the `is_finite()` filter below excludes it from the
+                // carrying-block selection (it cannot carry residual it has no
+                // parameters for).
+                if start >= end {
+                    f64::NAN
+                } else {
+                    residual
+                        .slice(ndarray::s![*start..*end])
+                        .iter()
+                        .map(|x: &f64| x.abs())
+                        .fold(0.0_f64, f64::max)
+                }
             })
             .collect(),
         None => vec![f64::NAN; states.len()],
