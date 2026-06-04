@@ -731,11 +731,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      isometry_weight: float = 1.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      Z: Any = None, sparsity_weight: float = 1.0,
-                     gate_sparsity: str = "l1", scad_mcp_gamma: float | None = None,
+                     gate_sparsity: str = "scad", scad_mcp_gamma: float | None = None,
                      smoothness_weight: float = 1.0,
                      alpha: float | str = 1.0, learning_rate: float | None = None, random_state: int = 0,
                      block_orthogonality_weight: float = 0.0,
-                     nuclear_norm_weight: float = 0.0, nuclear_norm_max_rank: int | None = None,
+                     nuclear_norm_weight: float = 1.0, nuclear_norm_max_rank: int | None = None,
                      decoder_incoherence_weight: float = 1.0,
                      top_k: int | None = None, t_init: Any = None, a_init: Any = None,
                      **kwargs: Any) -> ManifoldSAE:
@@ -1147,7 +1147,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         initial_logits=logits_init,
         initial_coords=coords_init,
         jumprelu_threshold=float(jumprelu_threshold),
-        native_ard_enabled=bool(ard_per_atom),
     )
     payload_dict = dict(payload)
     return ManifoldSAE.from_payload(

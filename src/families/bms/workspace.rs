@@ -1982,8 +1982,12 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellMomentState, String> {
-        self.cell_moment_cache_stats.record_miss();
-        exact_kernel::evaluate_cell_moments_uncached(cell, max_degree)
+        exact_kernel::evaluate_cell_moments_cached(
+            cell,
+            max_degree,
+            &self.cell_moment_lru,
+            Some(&self.cell_moment_cache_stats),
+        )
     }
 
     #[inline]

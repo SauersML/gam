@@ -9625,6 +9625,47 @@ mod tests {
     }
 
     #[test]
+    fn nuclear_norm_wide_block_max_rank_above_true_rank_value_grad_hvp_are_finite() {
+        // Regression for #742: with a 3x10 block and max_rank=4, the active SVD
+        // rank is still the thin rank 3. HVP must not use the right-Gram width
+        // cutoff, which would split the seven-dimensional right nullspace.
+        let n_eff = 3usize;
+        let p = 10usize;
+        let target = PsiSlice {
+            range: 0..n_eff * p,
+            latent_dim: Some(p),
+        };
+        let pen = NuclearNormPenalty::new(target, 0.9, n_eff, 1.0e-3, Some(4), false).unwrap();
+        let t = array![
+            2.0_f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 1.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        ];
+        let v = Array1::from_vec(
+            (0..n_eff * p)
+                .map(|i| 0.2 * ((i as f64) + 0.3).cos())
+                .collect(),
+        );
+        let rho = Array1::<f64>::zeros(0);
+
+        let value = pen.value(t.view(), rho.view());
+        let grad = pen.grad_target(t.view(), rho.view());
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+
+        assert!(value.is_finite(), "wide NuclearNorm value must be finite");
+        for i in 0..t.len() {
+            assert!(
+                grad[i].is_finite(),
+                "wide NuclearNorm gradient must be finite at index {i}"
+            );
+            assert!(
+                hv[i].is_finite(),
+                "wide NuclearNorm HVP must be finite at index {i}"
+            );
+        }
+    }
+
+    #[test]
     fn nuclear_norm_hvp_truncated_rank_matches_gradient_directional_derivative() {
         let n_eff = 4usize;
         let p = 3usize;

@@ -2753,6 +2753,17 @@ fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
 }
 
 fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
+    // Ordinary penalized thin-plate regression splines do not have an
+    // identifiable kernel scale once REML is already learning the smoothing
+    // penalty. Treat the resolved length scale as fixed geometry; enrolling a
+    // scalar TPS kappa axis creates the flat ρ/κ valleys reported in #718,
+    // #721, #731, and #732.
+    if let Some(term) = spec.smooth_terms.get(term_idx)
+        && let SmoothBasisSpec::ThinPlate { .. } = &term.basis
+    {
+        return false;
+    }
+
     // Duchon anisotropy η is a FIXED, geometry-derived basis parameter, NOT a
     // REML hyper axis: the metric is estimated once from the knot-cloud spread
     // (`maybe_initialize_aniso_contrasts`, applied on every basis build) and the
@@ -25456,6 +25467,40 @@ mod tests {
             }
             _ => panic!("expected Duchon term"),
         }
+    }
+
+    #[test]
+    fn thin_plate_terms_anchor_length_scale_and_enroll_no_kappa_axis() {
+        let spec = TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "thin_plate".to_string(),
+                basis: SmoothBasisSpec::ThinPlate {
+                    feature_cols: vec![0, 1],
+                    spec: ThinPlateBasisSpec {
+                        periodic: None,
+                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                        length_scale: 0.75,
+                        double_penalty: false,
+                        identifiability: SpatialIdentifiability::default(),
+                        radial_reparam: None,
+                    },
+                    input_scales: None,
+                },
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        };
+
+        assert!(
+            spatial_length_scale_term_indices(&spec).is_empty(),
+            "penalized thin-plate regression splines must not contribute a redundant isotropic kappa axis"
+        );
+        assert!(
+            all_spatial_terms_kappa_fixed(&spec),
+            "with no TPS kappa axis, all spatial terms are effectively fixed-geometry"
+        );
     }
 
     #[test]

@@ -82,6 +82,30 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+/// Mild full-rank Gaussian-prior precision used by the formula-driven
+/// multinomial REML path.
+///
+/// The smoothing penalties are rank-deficient by design, so deterministic or
+/// near-separable hard labels can still drive null-space coefficients toward
+/// infinity while the outer lambda optimizer searches. A small explicit ridge
+/// gives every coefficient a finite posterior mode without changing the
+/// reported unpenalized deviance.
+const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-2;
+
+/// Largest smoothing-parameter dimension where exact dense outer curvature is
+/// still worth paying for multinomial formula fits.
+///
+/// `D = (K - 1) * n_terms`. Medium-size loaded models (`D <= 6`) benefit from
+/// exact curvature because the first-order route can wander on near-separable
+/// labels. Smooth-by-factor models with one global plus one per-level smooth
+/// already reach `D = 8` for `K = 3`, where the O(D^2) dense outer Hessian
+/// dominates runtime; those stay on the exact-gradient quasi-Newton route.
+const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 6;
+
+fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
+    total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM
+}
+
 /// Inputs to [`fit_penalized_multinomial`].
 ///
 /// The penalty matrix `S` is shared across classes; per-class smoothing
@@ -572,46 +596,19 @@ pub fn fit_penalized_multinomial_formula(
     }
 
     // ── Outer-derivative policy: auto-derived from the smoothing dimension ──
-    // The total smoothing-parameter dimension is `D = (K−1) · n_terms` (one
-    // independent λ_{a,t} per active class `a` and smooth term `t`, the per-term
-    // structure that fixes #561). The generic outer optimizer can run on the
-    // exact REML/LAML *gradient* alone (quasi-Newton/BFGS) or on the exact
-    // gradient *and* an exact dense outer Hessian. The multinomial family's
-    // exact outer Hessian is assembled by the engine's pairwise enumeration:
-    // O(D²) second-directional-derivative evaluations, each forming a
-    // `second_directional_fisher_jet` (O(N·(K−1)²)) and a `dense_block_xtwx` of
-    // dimension `(K−1)·P` (O(N·(K−1)²·P²)) — i.e. the outer-Hessian assembly
-    // cost grows quadratically in `D`. For a small `D` (a single global smooth,
-    // `D = K−1`) that quadratic is trivial and the exact Hessian buys quadratic
-    // outer convergence, so it is worth paying. But a smooth-by-factor model
-    // (`s(x) + s(x, by=group)` ⇒ one global + one-per-group smooth) drives `D`
-    // up multiplicatively (#569): with K=3 classes and 3 groups, D = 2·4 = 8,
-    // and the O(D²) = 64 dense directional-Hessian assemblies *per outer
-    // iteration* dominate the wall clock — the fit times out even though
-    // N·P is small. Above the crossover the exact-gradient BFGS outer converges
-    // in far fewer total FLOPs (O(D) gradient work per step), matching VGAM's
-    // seconds-scale fit. The crossover is governed purely by `D`, so the route
-    // is auto-selected here with no caller flag ("magic by default"): use the
-    // exact outer Hessian only while `D ≤ MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM`,
-    // and fall back to the exact-gradient quasi-Newton outer otherwise. Both
-    // routes optimize the identical REML/LAML objective to the same `outer_tol`
-    // optimum — the choice trades quadratic-but-O(D²)-per-step convergence for
-    // linear-but-O(D)-per-step convergence, which is the correct trade as `D`
-    // grows.
+    // The total smoothing-parameter dimension is `D = (K−1) · n_terms`.
+    // Multinomial exact outer curvature is pairwise in `D`, so smooth-by-factor
+    // `D = 8` models must avoid the O(D²) dense Hessian path (#714). But
+    // medium `D = 6` loaded models with hard labels benefit from exact
+    // curvature because first-order BFGS can wander along separation-induced
+    // ridges (#722). The helper below encodes that crossover explicitly.
     let total_rho_dim = m.saturating_mul(penalties_arc.len());
-    // Largest smoothing-parameter dimension at which the exact dense outer
-    // Hessian's O(D²)-per-iteration assembly is still cheaper than the extra
-    // quasi-Newton outer iterations it would save. At D = 3 the exact path pays
-    // ≤ 9 directional-Hessian assemblies per outer step; by D = 4 the
-    // 16-assembly cost already exceeds the BFGS/EFS trade for these dense softmax
-    // systems, so the smooth-by-factor and multi-term-per-class models route
-    // through the exact-gradient quasi-Newton (Fellner–Schall / BFGS) outer.
-    const MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM: usize = 3;
-    let use_outer_hessian = total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM;
+    let use_outer_hessian = multinomial_formula_use_outer_hessian(total_rho_dim);
 
     let options = BlockwiseFitOptions {
         inner_max_cycles: max_iter,
         inner_tol: tol,
+        ridge_floor: MULTINOMIAL_FORMULA_RIDGE_FLOOR,
         use_outer_hessian,
         ..BlockwiseFitOptions::default()
     };
@@ -779,6 +776,22 @@ mod fisher_override_tests {
         })
         .expect_err("wrong active-block shape must error");
         assert!(format!("{err}").contains("fisher_w_override shape"));
+    }
+
+    #[test]
+    fn formula_outer_route_uses_exact_curvature_for_medium_d() {
+        assert!(
+            multinomial_formula_use_outer_hessian(6),
+            "D=6 loaded multinomial fits need exact curvature to avoid near-separation BFGS wandering"
+        );
+    }
+
+    #[test]
+    fn formula_outer_route_uses_first_order_for_smooth_by_factor_d8() {
+        assert!(
+            !multinomial_formula_use_outer_hessian(8),
+            "D=8 smooth-by-factor multinomial fits must avoid the O(D^2) dense outer Hessian"
+        );
     }
 
     #[test]
