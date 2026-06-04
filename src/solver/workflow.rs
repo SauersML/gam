@@ -3752,7 +3752,8 @@ use crate::families::survival_construction::{
     optimize_survival_baseline_config_with_gradient,
     optimize_survival_baseline_config_with_gradient_only, parse_survival_distribution,
     parse_survival_likelihood_mode, parse_survival_time_basis_config, positive_survival_time_seed,
-    require_structural_survival_time_basis, resolve_survival_time_anchor_value,
+    require_structural_survival_time_basis, resolve_survival_marginal_slope_time_anchor_value,
+    resolve_survival_time_anchor_value,
     resolved_survival_time_basis_config_from_build, survival_derivative_guard_for_likelihood,
 };
 use crate::families::survival_location_scale::{
@@ -6199,7 +6200,17 @@ fn materialize_survival<'a>(
             config.time_smooth_lambda,
         )?
     };
-    let time_anchor = resolve_survival_time_anchor_value(&age_entry, None)?;
+    // Marginal-slope centers the baseline-hazard I-spline at a robust interior
+    // exit-scale time (median exit) rather than the earliest entry age: under
+    // left truncation the earliest entry is a positive left-tail point and
+    // centering there inflates the unpenalized linear-trend column, blowing up
+    // the time-block seed score so REML rejects every seed (issue #751).
+    // Location-scale keeps the earliest-entry anchor.
+    let time_anchor = if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, None)?
+    } else {
+        resolve_survival_time_anchor_value(&age_entry, None)?
+    };
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(survival_mode);
 
     // Build time basis
