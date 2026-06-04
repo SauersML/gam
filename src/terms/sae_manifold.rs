@@ -359,6 +359,36 @@ impl SaeAtomBasisKind {
 /// Mackay/Fellner–Schall `α ← n / (Σ sq_equiv + tr H⁻¹)` fixed point must use so
 /// that the prior energy it implies stays consistent with `ard_value`.
 #[derive(Clone, Copy, Debug)]
+/// Modified Bessel function of the first kind, order zero, `I0(x)`.
+///
+/// Abramowitz & Stegun 9.8.1 (|x| <= 3.75) and 9.8.2 (|x| > 3.75) polynomial
+/// approximations; relative error < 1.6e-7 / 1.9e-7 respectively, which is far
+/// below the precision tolerance the ARD normaliser is read at. `I0` is even,
+/// so only `|x|` enters. Used for the exact von-Mises precision log-partition.
+fn bessel_i0(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 3.75 {
+        let t = x / 3.75;
+        let t2 = t * t;
+        1.0 + t2
+            * (3.5156229
+                + t2 * (3.0899424
+                    + t2 * (1.2067492
+                        + t2 * (0.2659732 + t2 * (0.0360768 + t2 * 0.0045813)))))
+    } else {
+        let y = 3.75 / ax;
+        let poly = 0.39894228
+            + y * (0.01328592
+                + y * (0.00225319
+                    + y * (-0.00157565
+                        + y * (0.00916281
+                            + y * (-0.02057706
+                                + y * (0.02635537
+                                    + y * (-0.01647633 + y * 0.00392377)))))));
+        (ax.exp() / ax.sqrt()) * poly
+    }
+}
+
 struct ArdAxisPrior {
     value: f64,
     grad: f64,
@@ -3569,6 +3599,37 @@ impl SaeManifoldTerm {
         Ok(value)
     }
 
+    /// Energy of the COORDINATE-tier isometry penalty(ies) at the converged
+    /// SAE state. This is the per-atom `½μ Σ_n ‖J_n^T W_n J_n − g_ref‖²`
+    /// summed over atoms, evaluated through `corrected_isometry_penalty` so the
+    /// live decoder/coordinate caches drive the value exactly as the assemble
+    /// path does. It has no `SaeManifoldLoss` twin (the loss carries only
+    /// data-fit / assignment / smoothness / ARD), so the Laplace/REML criterion
+    /// must add it explicitly to score the same penalized objective the inner
+    /// solve descends.
+    pub fn isometry_penalty_value_total(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> Result<f64, ArrowSchurError> {
+        let rho_global = Array1::<f64>::zeros(registry.total_rho_count());
+        let layout = registry.rho_layout();
+        let mut value = 0.0_f64;
+        for (penalty, (rho_slice, _tier, _name)) in
+            registry.penalties.iter().zip(layout.iter())
+        {
+            if let AnalyticPenaltyKind::Isometry(iso) = penalty {
+                let rho_local = rho_global.slice(s![rho_slice.clone()]);
+                for atom_idx in 0..self.k_atoms() {
+                    let coord = &self.assignment.coords[atom_idx];
+                    let corrected_kind =
+                        self.corrected_isometry_penalty(iso, atom_idx, coord)?;
+                    value += corrected_kind.value(coord.as_flat().view(), rho_local);
+                }
+            }
+        }
+        Ok(value)
+    }
+
     pub fn penalized_objective_total(
         &self,
         target: ArrayView2<'_, f64>,
@@ -3642,10 +3703,25 @@ impl SaeManifoldTerm {
                 }
                 // Negative-log prior for precision alpha. The data-dependent
                 // energy is the (Gaussian or von-Mises) coordinate prior; the
-                // `-0.5 n log alpha` normaliser is the precision log-partition,
-                // unchanged because the von-Mises energy matches the Gaussian
-                // curvature `alpha` at the origin (same leading normaliser).
-                acc += energy - 0.5 * (n as f64) * log_alpha;
+                // accompanying normaliser is the precision log-partition.
+                //
+                // Euclidean axes keep the Gaussian normaliser `-0.5 n log α`.
+                // Periodic (von-Mises) axes use the EXACT von-Mises precision
+                // log-partition `n[-η + log I0(η)]`, η = α/κ², κ = 2π/P, rather
+                // than the Gaussian surrogate: the von-Mises partition function
+                // is `2π I0(η)` (up to the κ Jacobian), so the per-observation
+                // normaliser is `-η + log I0(η)` and is exact across the cut.
+                match period {
+                    None => {
+                        acc += energy - 0.5 * (n as f64) * log_alpha;
+                    }
+                    Some(p) => {
+                        let kappa = std::f64::consts::TAU / p;
+                        let eta = alpha / (kappa * kappa);
+                        let log_i0 = bessel_i0(eta).ln();
+                        acc += energy + (n as f64) * (-eta + log_i0);
+                    }
+                }
             }
         }
         Ok(acc)
@@ -4727,7 +4803,20 @@ impl SaeManifoldTerm {
             None => 0.0,
         };
 
-        let v = loss.total() + decoder_penalty_energy + 0.5 * log_det - occam;
+        // Coordinate-tier isometry penalty value (the stated objective's
+        // metric-distortion term). The inner solve descends it (it enters the
+        // coord blocks gt/htt) but it has no `loss.*` twin, so without this the
+        // Laplace criterion would score a different objective than the one
+        // minimized. Add it so the ρ-sweep ranks the full penalized deviance.
+        let isometry_energy = match registry {
+            Some(reg) => self
+                .isometry_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
+            None => 0.0,
+        };
+
+        let v =
+            loss.total() + decoder_penalty_energy + isometry_energy + 0.5 * log_det - occam;
         Ok((v, loss, cache))
     }
 
@@ -4771,8 +4860,14 @@ impl SaeManifoldTerm {
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
             None => 0.0,
         };
+        let isometry_energy = match registry {
+            Some(reg) => self.isometry_penalty_value_total(reg).map_err(|err| {
+                format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}")
+            })?,
+            None => 0.0,
+        };
         Ok((
-            loss.total() + decoder_penalty_energy + 0.5 * log_det - occam,
+            loss.total() + decoder_penalty_energy + isometry_energy + 0.5 * log_det - occam,
             loss,
         ))
     }
