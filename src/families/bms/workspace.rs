@@ -1067,6 +1067,51 @@ impl BernoulliMarginalSlopeFamily {
         Ok(stored.as_ref().map_err(|e| e.clone())?.as_ref())
     }
 
+    /// Prewarm the degree-`required_degree` full-row cell-moment bundle once,
+    /// from serial setup code, before a FLEX outer-derivative row par-fold.
+    ///
+    /// The FLEX third/fourth row recompute kernels
+    /// (`row_primary_{third,fourth}_contracted_recompute*`) read the per-cell
+    /// moments through `row_cell_moments_for_third_degree15`, which only
+    /// consults an *already-built* bundle. Without a serial prewarm, the first
+    /// row to need degree-15 moments finds no bundle and falls back to
+    /// `evaluate_cell_derivative_moments_uncached` — recomputing the
+    /// transcendental cell moments for *every* row on *every* operator
+    /// application (gam#683). Under `linkwiggle()` the cells are non-affine and
+    /// the cross-row LRU key is row-unique, so that fallback never amortizes:
+    /// the outer-REML continuation and post-fit Hessian builds rebuild the
+    /// whole degree-15 moment table from scratch each step.
+    ///
+    /// Building the bundle once here populates `cache.row_cell_moments_d15`
+    /// (a `RayonSafeOnce` tied to the β-cache), so every subsequent per-row
+    /// kernel — across all CG iterations and HVP applications at this β — reads
+    /// the prebuilt moments and only pays the cheap directional contraction.
+    /// Mirrors the rigid `rigid_{third,fourth}_full_cached` prewarm and the
+    /// degree-21 prewarm in the psi-second-order path. No-op (returns `Ok(())`)
+    /// when the FLEX path is inactive, when the bundle build is skipped by the
+    /// resource-byte budget, or for an empirical-grid latent measure that
+    /// bypasses the cell path; in those cases callers fall back exactly as
+    /// before.
+    pub(super) fn prewarm_flex_cell_bundle(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        required_degree: usize,
+    ) -> Result<(), String> {
+        if !self.effective_flex_active(block_states)? {
+            return Ok(());
+        }
+        if let Some(bundle) = self.bundle_for_degree(block_states, cache, required_degree)?
+            && bundle.max_degree < required_degree
+        {
+            return Err(format!(
+                "BMS row-cell-moments prewarm returned degree {} for required degree {}",
+                bundle.max_degree, required_degree
+            ));
+        }
+        Ok(())
+    }
+
     fn existing_bundle_for_degree<'a>(
         &self,
         cache: &'a BernoulliMarginalSlopeExactEvalCache,
@@ -3320,32 +3365,36 @@ impl BernoulliMarginalSlopeFamily {
         // block is `cfg(debug_assertions)`-gated.
         #[cfg(debug_assertions)]
         {
+            use crate::gpu::cubic_cell::branch::classify_cell_for_gpu;
             use crate::gpu::cubic_cell::{
-                CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuCellBranchTag,
-                GpuDenestedCubicCell, try_build_cubic_cell_derivative_moments,
+                CubicCellDerivativeMomentHostView, CubicCellMomentResidency, GpuDenestedCubicCell,
+                try_build_cubic_cell_derivative_moments,
             };
             const PARITY_ROW_BUDGET: usize = 4;
             let mut sample_cells: Vec<GpuDenestedCubicCell> = Vec::new();
-            let mut sample_branches: Vec<GpuCellBranchTag> = Vec::new();
+            let mut sample_branches = Vec::new();
             let mut sample_cpu_moments: Vec<Vec<f64>> = Vec::new();
             for (_, moments) in computed_rows.iter().take(PARITY_ROW_BUDGET) {
                 for cached in moments {
                     let cell = cached.partition_cell.cell;
-                    let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
-                        GpuCellBranchTag::AffineTail
-                    } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
-                        GpuCellBranchTag::Affine
-                    } else {
-                        GpuCellBranchTag::NonAffineFinite
-                    };
-                    sample_cells.push(GpuDenestedCubicCell {
+                    let gpu_cell = GpuDenestedCubicCell {
                         left: cell.left,
                         right: cell.right,
                         c0: cell.c0,
                         c1: cell.c1,
                         c2: cell.c2,
                         c3: cell.c3,
-                    });
+                    };
+                    let branch = classify_cell_for_gpu(gpu_cell).map_err(|status| {
+                        format!(
+                            "BMS row-cell-moments parity classifier rejected CPU-evaluated cell \
+                             row_sample={} cell_sample={} status={}",
+                            sample_cpu_moments.len(),
+                            sample_cells.len(),
+                            status as u8
+                        )
+                    })?;
+                    sample_cells.push(gpu_cell);
                     sample_branches.push(branch);
                     sample_cpu_moments.push(cached.state.moments.to_vec());
                 }
@@ -10216,6 +10265,10 @@ impl BernoulliMarginalSlopeFamily {
                 "run_psi_row_pass_for_axes rigid third-cache warm-up",
             )?;
         }
+        // FLEX analogue: prewarm the degree-15 cell-moment bundle so the
+        // per-row third-order recompute reuses prebuilt moments instead of
+        // recomputing them per row on every operator application (gam#683).
+        self.prewarm_flex_cell_bundle(block_states, cache, 15)?;
 
         // Block-local accumulator path: avoids O(n p^2) dense Hessian
         // materialization by keeping one accumulator per ψ axis in the
@@ -10438,15 +10491,7 @@ impl BernoulliMarginalSlopeFamily {
         // Prewarm the high-degree full-row bundle from serial setup code. Row
         // kernels only read existing bundles, so parallel workers never launch
         // duplicate full-`n` degree-21 builds on first touch.
-        let prewarmed_bundle = self.bundle_for_degree(block_states, cache, 21)?;
-        if let Some(bundle) = prewarmed_bundle {
-            if bundle.max_degree < 21 {
-                return Err(format!(
-                    "BMS row-cell-moments prewarm returned degree {} for required degree 21",
-                    bundle.max_degree
-                ));
-            }
-        }
+        self.prewarm_flex_cell_bundle(block_states, cache, 21)?;
 
         // Block-local accumulator path for second-order psi terms
         let weighted_rows = outer_weighted_rows(options, n);
