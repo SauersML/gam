@@ -24,10 +24,12 @@
 mod margslope_flex_equivalence;
 
 use gam::families::custom_family::BlockwiseFitOptions;
+use gam::families::marginal_slope_shared::OuterScoreSubsample;
 use margslope_flex_equivalence::{
     DEFAULT_REPRO_N, build_biobank_shape_problem, cycle_capped_options, fit_problem,
 };
 use ndarray::Array1;
+use std::sync::Arc;
 use std::time::Duration;
 
 const DEFAULT_SMOKE_N: usize = 2_000;
@@ -189,19 +191,23 @@ fn margslope_flex_beta_equivalence_smoke() {
 /// hanging (the outer LAML Hessian re-walked every cubic partition cell per
 /// `(ρ-axis i, ρ-axis j)` pair, O(D²·n·cells·r²) per outer step). The
 /// axis-projected per-row tensor cache collapses that to one O(n·cells·r²)
-/// build reused across all pairs. `inner_max_cycles` is capped at cycle 0 so
-/// the debug regression covers the hang surface without spending the full
-/// production convergence tail.
+/// build reused across all pairs. `inner_max_cycles` is capped at cycle 0 and
+/// the outer derivative passes use a fixed row mask, so the debug regression
+/// covers the hang surface without spending the full production convergence
+/// tail or making CI pay every row.
 #[test]
 fn flex_full_outer_completes_under_budget_683() {
     gam::init_parallelism();
-    let n = 96usize;
+    let n = 300usize;
     let problem = build_biobank_shape_problem(n);
+    let outer_mask = (0..64usize).collect::<Vec<_>>();
     let options = BlockwiseFitOptions {
         inner_max_cycles: 1,
         outer_max_iter: 3,
         compute_covariance: false,
         screen_initial_rho: false,
+        outer_score_subsample: Some(Arc::new(OuterScoreSubsample::new(outer_mask, n, 683))),
+        auto_outer_subsample: false,
         ..BlockwiseFitOptions::default()
     };
     let start = std::time::Instant::now();
