@@ -9079,12 +9079,16 @@ impl BernoulliMarginalSlopeFamily {
                 self.flex_axis_fourth_tensors_for_row(block_states, cache, row)?
             {
                 let scale = s_u * s_v;
-                let mut out = if a == 0 && b == 0 {
-                    tensors.qq.clone()
-                } else if a == 1 && b == 1 {
-                    tensors.gg.clone()
-                } else {
-                    tensors.qg.clone()
+                let mut out = match (a, b) {
+                    (0, 0) => tensors.qq.clone(),
+                    (1, 1) => tensors.gg.clone(),
+                    (0, 1) | (1, 0) => tensors.qg.clone(),
+                    _ => {
+                        return Err(format!(
+                            "bernoulli marginal-slope FLEX fourth fast path primary axis out of range: a={a}, b={b}, primary_total={}",
+                            cache.primary.total
+                        ));
+                    }
                 };
                 out.mapv_inplace(|value| value * scale);
                 return Ok(out);
