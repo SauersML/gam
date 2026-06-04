@@ -4436,13 +4436,34 @@ fn prepare_survival_location_scale_model(
         threshold_full_ncols,
         log_sigma_fixed_cols,
         log_sigma_full_ncols,
-        // The reduced constant-scale-AFT time block is unpenalized, so
-        // `time_prepared.penalties` is empty and `k_time` is 0 — the block
-        // contributes no smoothing parameter. The flexible regime keeps one ρ
-        // per retained time penalty. This must match the OUTER ρ layout
-        // (`survival_time_rho_count`) so the inner blockwise λ slicing and the
-        // outer REML search agree on the time coordinate count.
-        k_time: time_prepared.penalties.len(),
+        // Time-warp smoothing-parameter count. The reduced constant-scale-AFT
+        // time block is unpenalized (`k_time == 0`); the flexible regime keeps
+        // one ρ per time penalty. This MUST be the same value the OUTER ρ layout
+        // (`fit_survival_location_scale_terms`) computes, otherwise the inner
+        // blockwise λ slicing, the outer REML search, and the reduced-parametric
+        // dispatch (`is_reduced_parametric_aft`) disagree on whether the time
+        // block carries a ρ.
+        //
+        // Source it from `survival_time_rho_count` — the single source of truth
+        // for that decision — evaluated on the SAME un-reduced inputs the outer
+        // layout uses (`spec.time_block.penalties`, the original time width, the
+        // constant-scale/timewiggle regime). Deriving it here from
+        // `time_prepared.penalties.len()` instead made `k_time` depend on whether
+        // the inner reduction branch inside `prepare_identified_time_block`
+        // happened to fire and clear the projected-to-zero penalties; when that
+        // inner collapse did not align with the regime predicate the dispatch saw
+        // a stray `k_time == 1` and routed a genuinely unpenalized parametric AFT
+        // (#736: constant scale, linear mean, loglogistic) down the coupled
+        // exact-joint REML path it cannot certify, instead of the direct MLE
+        // bypass. Tying `k_time` to `survival_time_rho_count` makes the inner and
+        // outer counts provably identical (same function, same arguments) and the
+        // bypass fire exactly when the regime is fully reduced (#736 #735 #721).
+        k_time: survival_time_rho_count(
+            &spec.time_block.penalties,
+            spec.time_block.design_exit.ncols(),
+            survival_constant_scale(spec),
+            protected_timewiggle_cols,
+        ),
         k_threshold: threshold_penalties.len(),
         k_log_sigma: log_sigma_penalties.len(),
         k_wiggle: spec
