@@ -5505,6 +5505,35 @@ impl SaeManifoldTerm {
         let beta_block = m * p;
         let jet = &atom.basis_jacobian;
         let mu = corrected.scalar_weight * rho_local[corrected.rho_index].exp();
+        // A negligible (or non-finite) effective isometry weight contributes a
+        // zero curvature block; writing zeros would still flip the solver onto
+        // the dense-supplement Schur path (and invalidate caches) for no model
+        // change. Skip entirely so `isometry_weight≈0` is bit-identical to the
+        // no-isometry assembly. (`isometry_weight=0` never constructs the
+        // penalty at all; this guards the ρ-sweep driving `exp(ρ)` to ~0.)
+        if !(mu.is_finite() && mu > 0.0) {
+            return;
+        }
+        // Coherence invariant for the coupled Gauss-Newton block. The isometry
+        // residual `r_{ab} = (JᵀWJ − G_ref)_{ab}` yields one residual Jacobian
+        // `A = [A_t | A_β]`, so `[[htt,cross],[crossᵀ,hbb]] = μ AᵀA` is PSD *as a
+        // whole* and its Schur complement is PSD — but ONLY while all three
+        // blocks stay that exact pullback. After assembly the latent blocks pass
+        // through `apply_riemannian_latent_geometry`, which rewrites `htt` with
+        // the (indefinite) Riemannian connection term and column-projects the
+        // `htbeta` cross-block to `T_tM`, while the shared `hbb` is left
+        // untouched. For a non-Euclidean chart that projection breaks the
+        // `μ AᵀA` coherence: the cross-block is then a nonzero coupling NOT paired
+        // with diagonals from the same Jacobian, and the Schur complement
+        // `hbb − Σ crossᵀ htt⁻¹ cross` can go indefinite (the #681 circle/sphere
+        // failure mode flagged in the math review). For a Euclidean chart the
+        // projection is the identity, so the coupled block survives exactly and
+        // we keep the full cross-coupling (faster Newton). For any non-Euclidean
+        // chart we contribute only the PSD `htt` diagonal block and DROP the
+        // cross-block: a block-diagonal `diag(μ A_tᵀA_t, μ A_βᵀA_β)` of two PSD
+        // blocks is still PSD, so the Schur stays PSD by construction while the
+        // gradient (which alone fixes the stationary point) is unchanged.
+        let couple_cross_block = coord.manifold().is_euclidean();
         let mut metric_coord_jac = Array2::<f64>::zeros((d * d, d));
         let mut metric_beta_jac = Array2::<f64>::zeros((d * d, beta_block));
         let mut wrote_dense_cross = false;
@@ -5531,16 +5560,18 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            metric_beta_jac.fill(0.0);
-            for a in 0..d {
-                for b in 0..d {
-                    let metric_row = a * d + b;
-                    for basis_col in 0..m {
-                        let jet_a = jet[[row, basis_col, a]];
-                        let jet_b = jet[[row, basis_col, b]];
-                        for output in 0..p {
-                            metric_beta_jac[[metric_row, basis_col * p + output]] =
-                                jet_a * wj[[output, b]] + wj[[output, a]] * jet_b;
+            if couple_cross_block {
+                metric_beta_jac.fill(0.0);
+                for a in 0..d {
+                    for b in 0..d {
+                        let metric_row = a * d + b;
+                        for basis_col in 0..m {
+                            let jet_a = jet[[row, basis_col, a]];
+                            let jet_b = jet[[row, basis_col, b]];
+                            for output in 0..p {
+                                metric_beta_jac[[metric_row, basis_col * p + output]] =
+                                    jet_a * wj[[output, b]] + wj[[output, a]] * jet_b;
+                            }
                         }
                     }
                 }
@@ -5553,6 +5584,9 @@ impl SaeManifoldTerm {
                             metric_coord_jac[[metric_row, c]] * metric_coord_jac[[metric_row, e]];
                     }
                     sys.rows[row].htt[[row_off + c, row_off + e]] += mu * acc;
+                }
+                if !couple_cross_block {
+                    continue;
                 }
                 for beta_col in 0..beta_block {
                     let mut acc = 0.0;
