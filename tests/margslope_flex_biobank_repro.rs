@@ -23,6 +23,7 @@
 #[path = "test_support/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
 
+use gam::families::custom_family::BlockwiseFitOptions;
 use margslope_flex_equivalence::{
     DEFAULT_REPRO_N, build_biobank_shape_problem, cycle_capped_options, fit_problem,
 };
@@ -177,5 +178,48 @@ fn margslope_flex_beta_equivalence_smoke() {
     eprintln!(
         "[MS-FLEX-EQUIV-SMOKE] PASS beta_len={} max_abs={:.3e} max_rel={:.3e} rel_tol={:.3e}",
         report.len, report.max_abs_diff, report.max_rel_diff, rel_tol
+    );
+}
+
+/// gam#683 regression: the FULL outer REML/continuation loop under
+/// `linkwiggle()` must terminate. Unlike `margslope_flex_biobank_repro_cycle0`
+/// (which caps `outer_max_iter = 1`), this uses `BlockwiseFitOptions::default()`
+/// so the degree-15/21 BMS row-cell-moment derivative path and the outer
+/// continuation pre-warm actually fire — the exact regime #683 reported as
+/// hanging (the outer LAML Hessian re-walked every cubic partition cell per
+/// `(ρ-axis i, ρ-axis j)` pair, O(D²·n·cells·r²) per outer step). The
+/// axis-projected per-row tensor cache collapses that to one O(n·cells·r²)
+/// build reused across all pairs, so the fit now finishes in a few seconds.
+#[test]
+fn flex_full_outer_completes_under_budget_683() {
+    gam::init_parallelism();
+    let n = 300usize;
+    let problem = build_biobank_shape_problem(n);
+    let start = std::time::Instant::now();
+    let (out, timing) = fit_problem(problem, BlockwiseFitOptions::default())
+        .expect("full-outer FLEX margslope fit must complete (gam#683)");
+    let elapsed = start.elapsed();
+    eprintln!(
+        "[MS-FLEX-683] n={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
+        n,
+        elapsed.as_secs_f64(),
+        timing.outer_iterations,
+        timing.inner_cycles,
+        timing.outer_converged,
+        out.fit.beta.len()
+    );
+    assert!(
+        out.fit.beta.iter().all(|v| v.is_finite()),
+        "non-finite beta from full-outer FLEX fit"
+    );
+    assert!(
+        timing.inner_cycles >= 1,
+        "fit did not enter the joint-Newton inner loop"
+    );
+    assert!(
+        elapsed <= DEFAULT_WALL_BOUND,
+        "full-outer FLEX fit exceeded {}s wall budget at n={n} (possible #683 regression): {:.3}s",
+        DEFAULT_WALL_BOUND.as_secs(),
+        elapsed.as_secs_f64()
     );
 }
