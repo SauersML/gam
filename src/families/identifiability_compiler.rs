@@ -1182,6 +1182,119 @@ pub fn compile_from_raw_grams(
     })
 }
 
+impl CompiledMap {
+    /// Raw coefficient width (`p_raw`).
+    pub fn p_raw(&self) -> usize {
+        self.raw_from_compiled.nrows()
+    }
+
+    /// Compiled (reduced) coefficient width (`p_compiled`).
+    pub fn p_compiled(&self) -> usize {
+        self.raw_from_compiled.ncols()
+    }
+
+    /// Lift a fitted compiled-width coefficient vector back to raw width:
+    /// `β_raw = T · β_compiled`. This is the exact inverse direction of the
+    /// quotient reduction — the reduced coordinates are what Newton/REML
+    /// operate in, and this map carries the final estimate (and any linear
+    /// functional of it) back to the original parameterisation so reported
+    /// coefficients and predictions match the raw design.
+    pub fn lift_coefficients(&self, beta_compiled: &Array1<f64>) -> Result<Array1<f64>, String> {
+        if beta_compiled.len() != self.p_compiled() {
+            return Err(format!(
+                "CompiledMap::lift_coefficients: beta_compiled len {} != p_compiled {}",
+                beta_compiled.len(),
+                self.p_compiled()
+            ));
+        }
+        Ok(self.raw_from_compiled.dot(beta_compiled))
+    }
+
+    /// The rows of `T` belonging to raw block `b` (`T[raw_block_ranges[b], :]`,
+    /// shape `p_b_raw × p_compiled`). A raw-block penalty `S_b` acts only on
+    /// these raw columns, so the penalty's reduced-coordinate form depends on
+    /// `T` only through this slice.
+    fn raw_block_rows(&self, block_idx: usize) -> Result<Array2<f64>, String> {
+        let range = self.raw_block_ranges.get(block_idx).ok_or_else(|| {
+            format!(
+                "CompiledMap::raw_block_rows: block {block_idx} out of range {}",
+                self.raw_block_ranges.len()
+            )
+        })?;
+        Ok(self
+            .raw_from_compiled
+            .slice(s![range.start..range.end, ..])
+            .to_owned())
+    }
+}
+
+/// Transform a per-block raw-width penalty into the compiled (reduced)
+/// coordinate frame defined by `map`.
+///
+/// `raw_penalties[b]` is the penalty matrix `S_b` acting on raw block `b`
+/// (shape `p_b_raw × p_b_raw`), or `None` for an unpenalised block. The
+/// returned `reduced[b]` is the **full** `(p_compiled × p_compiled)` penalty
+/// `Tᵀ Ŝ_b T`, where `Ŝ_b` embeds `S_b` into the `p_raw × p_raw` zero matrix
+/// at block `b`'s position. Because `Ŝ_b` is zero outside block `b`'s rows and
+/// columns, this equals `T_bᵀ S_b T_b` with `T_b = T[raw_block_ranges[b], :]`,
+/// so the reduced penalty is computed from the block's lift rows alone — no
+/// dense `p_raw × p_raw` embedding is materialised.
+///
+/// Exactness: for any compiled coefficient `θ` with raw lift `β = T θ`, the raw
+/// penalty energy `βᵀ Ŝ_b β = (T θ)ᵀ Ŝ_b (T θ) = θᵀ (Tᵀ Ŝ_b T) θ`, so the
+/// reduced penalty reproduces the raw penalty energy on every lifted point.
+/// A compiled block that absorbed to zero width simply contributes a zero
+/// column range; its raw penalty (if any) projects onto the surviving
+/// compiled directions through `T_b`, never lost.
+pub fn reduce_penalties_with_map(
+    map: &CompiledMap,
+    raw_penalties: &[Option<Array2<f64>>],
+) -> Result<Vec<Option<Array2<f64>>>, String> {
+    if raw_penalties.len() != map.raw_block_ranges.len() {
+        return Err(format!(
+            "reduce_penalties_with_map: raw_penalties ({}) != blocks ({})",
+            raw_penalties.len(),
+            map.raw_block_ranges.len()
+        ));
+    }
+    let p_compiled = map.p_compiled();
+    let mut reduced: Vec<Option<Array2<f64>>> = Vec::with_capacity(raw_penalties.len());
+    for (block_idx, raw_penalty) in raw_penalties.iter().enumerate() {
+        let Some(s_b) = raw_penalty.as_ref() else {
+            reduced.push(None);
+            continue;
+        };
+        let p_b_raw = map.raw_block_ranges[block_idx].len();
+        if s_b.shape() != [p_b_raw, p_b_raw] {
+            return Err(format!(
+                "reduce_penalties_with_map: block {block_idx} penalty shape {:?} != [{p_b_raw}, {p_b_raw}]",
+                s_b.shape()
+            ));
+        }
+        // T_b = T[raw rows of block b, :]  (p_b_raw × p_compiled)
+        let t_b = map.raw_block_rows(block_idx)?;
+        // S_compiled = T_bᵀ S_b T_b  (p_compiled × p_compiled)
+        let s_t_b = fast_ab(s_b, &t_b); // (p_b_raw × p_compiled)
+        let s_compiled_raw = fast_atb(&t_b, &s_t_b); // (p_compiled × p_compiled)
+        let mut s_compiled = symmetrise(&s_compiled_raw);
+        if s_compiled.shape() != [p_compiled, p_compiled] {
+            return Err(format!(
+                "reduce_penalties_with_map: block {block_idx} reduced penalty shape {:?} != [{p_compiled}, {p_compiled}]",
+                s_compiled.shape()
+            ));
+        }
+        for v in s_compiled.iter_mut() {
+            if !v.is_finite() {
+                return Err(format!(
+                    "reduce_penalties_with_map: block {block_idx} reduced penalty has non-finite entry"
+                ));
+            }
+        }
+        reduced.push(Some(s_compiled));
+    }
+    Ok(reduced)
+}
+
 /// Symmetrise a (nearly-symmetric) matrix by averaging with its transpose.
 fn symmetrise(m: &Array2<f64>) -> Array2<f64> {
     let (r, c) = m.dim();
@@ -2483,5 +2596,120 @@ mod tests {
             .sum();
         assert_eq!(total_abc, total_bac);
         assert_eq!(total_abc, 4);
+    }
+
+    /// Build a K=1 raw `(gram_h, gram_struct)` pair for a single stacked design
+    /// `X` with per-row curvature weights `w`: `gram_struct = Xᵀ X`,
+    /// `gram_h = Xᵀ diag(w) X`. Mirrors the closed-form definitions the
+    /// production Gram builders implement for the scalar-channel case.
+    fn k1_grams(x: &Array2<f64>, w: &Array1<f64>) -> (Array2<f64>, Array2<f64>) {
+        let gram_struct = fast_atb(x, x);
+        let xw = fast_xt_diag_y(x, w, x);
+        (xw, gram_struct)
+    }
+
+    /// Full-rank reduction: when the two blocks are jointly independent the
+    /// compiled width equals the raw width and the lift `T` reproduces a raw
+    /// coefficient exactly from its compiled image `θ = T⁺ β` (here, with no
+    /// aliasing, `lift_coefficients(θ)` of any compiled `θ` lands in the raw
+    /// design's column interpretation: applying `T` then comparing the induced
+    /// raw predictor `X·Tθ` to `X·β_raw` for the `θ` solving `Tθ=β_raw`).
+    #[test]
+    fn compiled_map_lift_coefficients_roundtrips_full_rank() {
+        let n = 21;
+        let p_a = 2;
+        let p_b = 2;
+        let x = Array2::from_shape_fn((n, p_a + p_b), |(i, j)| {
+            ((i as f64 + 1.0) * 0.37 + (j as f64 + 1.0) * 1.7).sin() + 0.11 * (j as f64)
+        });
+        let w = Array1::from_shape_fn(n, |i| 0.5 + 0.5 * ((i as f64) * 0.3).cos().abs());
+        let (gh, gs) = k1_grams(&x, &w);
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+        let map = compile_from_raw_grams(
+            &gh,
+            &gs,
+            &raw_ranges,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("full-rank compile");
+        // Jointly independent ⇒ no columns absorbed.
+        assert_eq!(map.p_compiled(), p_a + p_b);
+        assert_eq!(map.p_raw(), p_a + p_b);
+        // For a target raw coefficient, solve T θ = β_raw (T square invertible
+        // here) and confirm lift_coefficients(θ) == β_raw.
+        let beta_raw = Array1::from_shape_fn(p_a + p_b, |j| 0.4 * (j as f64) - 0.7);
+        // T is (p × p); recover θ by a least-squares solve via the normal
+        // equations TᵀT θ = Tᵀ β.
+        let tt = fast_atb(&map.raw_from_compiled, &map.raw_from_compiled);
+        let tb = map.raw_from_compiled.t().dot(&beta_raw);
+        let theta = solve_psd_system(&tt, &tb.insert_axis(Axis(1)))
+            .expect("normal-equation solve")
+            .column(0)
+            .to_owned();
+        let lifted = map.lift_coefficients(&theta).expect("lift");
+        let max_err = (&lifted - &beta_raw)
+            .iter()
+            .fold(0.0_f64, |a, &v| a.max(v.abs()));
+        assert!(
+            max_err < 1e-8,
+            "lift round-trip error {max_err:e} (full-rank reduction must be exactly invertible)"
+        );
+    }
+
+    /// Penalty-energy preservation: the reduced penalty `Tᵀ Ŝ_b T` reproduces
+    /// the raw penalty energy `βᵀ Ŝ_b β` on every lifted point `β = T θ`. This
+    /// is the exactness contract the lift map must satisfy for REML/inference
+    /// to be invariant to the quotient reparameterisation.
+    #[test]
+    fn reduce_penalties_with_map_preserves_energy_on_lift() {
+        let n = 19;
+        let p_a = 3;
+        let p_b = 2;
+        // Make block B partly aliased with A so the reduction actually drops a
+        // column — the penalty reduction must still preserve energy on the
+        // surviving compiled directions.
+        let mut x = Array2::from_shape_fn((n, p_a + p_b), |(i, j)| {
+            ((i as f64 + 1.0) * 0.29 + (j as f64 + 1.0) * 0.9).cos()
+        });
+        // Column (p_a+0) := column 0 (exact alias) ⇒ B loses one direction.
+        for i in 0..n {
+            x[[i, p_a]] = x[[i, 0]];
+        }
+        let w = Array1::from_shape_fn(n, |i| 0.7 + 0.3 * ((i as f64) * 0.2).sin().abs());
+        let (gh, gs) = k1_grams(&x, &w);
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+        let map = compile_from_raw_grams(
+            &gh,
+            &gs,
+            &raw_ranges,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("compile with alias");
+        assert!(
+            map.p_compiled() < p_a + p_b,
+            "expected at least one absorbed column, got p_compiled={}",
+            map.p_compiled()
+        );
+        // A simple per-block raw penalty: ridge on each block.
+        let s_a = Array2::<f64>::eye(p_a);
+        let s_b = Array2::<f64>::eye(p_b);
+        let reduced = reduce_penalties_with_map(&map, &[Some(s_a.clone()), Some(s_b.clone())])
+            .expect("reduce penalties");
+        // For random compiled θ, raw β = T θ. Raw energy for block b is
+        // β[range_b]ᵀ S_b β[range_b]; reduced energy is θᵀ S_reduced_b θ.
+        let theta =
+            Array1::from_shape_fn(map.p_compiled(), |j| 0.6 * (j as f64) - 0.3 + 0.05 * (j % 2) as f64);
+        let beta = map.lift_coefficients(&theta).expect("lift");
+        for (block_idx, s_raw) in [(0usize, &s_a), (1usize, &s_b)] {
+            let range = &map.raw_block_ranges[block_idx];
+            let beta_b = beta.slice(s![range.start..range.end]).to_owned();
+            let raw_energy = beta_b.dot(&s_raw.dot(&beta_b));
+            let s_reduced = reduced[block_idx].as_ref().expect("reduced penalty present");
+            let reduced_energy = theta.dot(&s_reduced.dot(&theta));
+            assert!(
+                (raw_energy - reduced_energy).abs() < 1e-8 * raw_energy.abs().max(1.0),
+                "block {block_idx} energy mismatch: raw={raw_energy:e} reduced={reduced_energy:e}"
+            );
+        }
     }
 }
