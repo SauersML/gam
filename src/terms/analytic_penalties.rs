@@ -183,6 +183,40 @@ fn stable_softplus(x: f64) -> f64 {
     }
 }
 
+/// Resolve a learnable penalty strength `base_weight · exp(rho)` without ever
+/// overflowing to `inf` or (for a nonzero base weight) underflowing to exact
+/// `0.0`.
+///
+/// For finite `rho ≳ 709` the naive `base_weight * rho.exp()` overflows to
+/// `inf`; the resulting `inf` then poisons the solve via `inf · 0.0 = NaN` or
+/// `inf / inf = NaN` in the value/grad/Hessian. Conversely for `rho ≲ -745`
+/// `rho.exp()` underflows to `0.0`, silently disabling a penalty whose base
+/// weight is strictly positive and reintroducing `0/0` in ratios that divide by
+/// the strength.
+///
+/// The fix is to evaluate the product in log-space and clamp the *log-strength*
+/// into the finite-normal band before exponentiating, so the returned strength
+/// is always finite (and strictly positive whenever `base_weight ≠ 0`). The
+/// clamp band is symmetric in log-strength about zero, matched to the largest /
+/// smallest positive normal `f64`, leaving a safety margin so subsequent
+/// multiplications by `O(1)` factors stay finite.
+fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
+    // Largest / smallest log-magnitude that keeps the strength a finite normal
+    // `f64` with headroom for downstream `O(1)` arithmetic.
+    const MAX_LOG_STRENGTH: f64 = 700.0;
+    const MIN_LOG_STRENGTH: f64 = -700.0;
+    if base_weight == 0.0 {
+        return 0.0;
+    }
+    debug_assert!(
+        base_weight.is_finite() && rho.is_finite(),
+        "resolve_learnable_weight requires finite inputs; got base_weight={base_weight}, rho={rho}"
+    );
+    let log_strength = base_weight.abs().ln() + rho;
+    let clamped = log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH);
+    clamped.exp().copysign(base_weight)
+}
+
 /// Scalar annealing schedule for analytic penalty weights.
 ///
 /// This is the penalty-weight analogue of [`crate::terms::sae_manifold::GumbelTemperatureSchedule`]:
@@ -1218,7 +1252,7 @@ impl IsometryPenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        let mu = self.scalar_weight * rho[self.rho_index].exp();
+        let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let d = state.d;
         let n_obs = state.n_obs;
         let p = state.p;
@@ -1445,7 +1479,7 @@ impl IsometryPenalty {
             return grad;
         };
         let g_ref = self.effective_g_ref(&g, n_obs, d);
-        let mu = self.scalar_weight * rho[self.rho_index].exp();
+        let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         for n in 0..n_obs {
             let Some(wj) = self.weighted_jacobian_row(n, d) else {
                 return Array2::<f64>::zeros((n_obs, p * d));
@@ -1483,7 +1517,7 @@ impl AnalyticPenalty for IsometryPenalty {
             return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
         };
         let g_ref = self.effective_g_ref(&g, n_obs, d);
-        let mu = self.scalar_weight * rho[self.rho_index].exp();
+        let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut acc = 0.0;
         for n in 0..n_obs {
             for k in 0..(d * d) {
@@ -1522,7 +1556,7 @@ impl AnalyticPenalty for IsometryPenalty {
         };
         let g_ref = self.effective_g_ref(&g, n_obs, d);
         let p = self.p_out;
-        let mu = self.scalar_weight * rho[self.rho_index].exp();
+        let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut grad = Array1::<f64>::zeros(target.len());
         let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
             return grad;
@@ -1622,7 +1656,7 @@ impl AnalyticPenalty for IsometryPenalty {
             return Array1::<f64>::zeros(v.len());
         };
         let p = self.p_out;
-        let mu = self.scalar_weight * rho[self.rho_index].exp();
+        let mu = resolve_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut out = Array1::<f64>::zeros(v.len());
         for n in 0..n_obs {
             let Some(wj) = self.weighted_jacobian_row(n, d) else {
@@ -1807,7 +1841,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn value(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> f64 {
-        let lambda = self.weight * rho[0].exp();
+        let lambda = resolve_learnable_weight(self.weight, rho[0]);
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut acc = 0.0;
@@ -1824,7 +1858,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
     }
 
     fn grad_target(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
-        let lambda = self.weight * rho[0].exp();
+        let lambda = resolve_learnable_weight(self.weight, rho[0]);
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
         let mut out = Array1::<f64>::zeros(target.len());
@@ -1869,7 +1903,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         // This matches `hvp(...) . e_k` analytically (see derivation in the
         // bug-fix comment on `hvp`) and gives Newton/Arrow-Schur callers a
         // principled diagonal surrogate without per-row dense factorization.
-        let lambda = self.weight * rho[0].exp();
+        let lambda = resolve_learnable_weight(self.weight, rho[0]);
         let inv_tau = 1.0 / self.temperature;
         let scale = lambda * inv_tau * inv_tau;
         let n = target.len() / self.k_atoms;
@@ -1907,7 +1941,7 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
         below. `hessian_diag` returns the analytic diagonal extracted from
         this HVP by setting v = e_k row-by-row.
         */
-        let lambda = self.weight * rho[0].exp();
+        let lambda = resolve_learnable_weight(self.weight, rho[0]);
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
         let n = target.len() / self.k_atoms;
         let values: Vec<f64> = target.iter().copied().collect();
@@ -2013,7 +2047,7 @@ impl IBPAssignmentPenalty {
 
     fn resolved_alpha(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_alpha {
-            self.alpha * rho[0].exp()
+            resolve_learnable_weight(self.alpha, rho[0])
         } else {
             self.alpha
         }
@@ -2278,9 +2312,14 @@ impl SparsityPenalty {
 
     /// Resolve `(strength, eps_or_delta)` from the current ρ view.
     fn resolved(&self, rho: ArrayView1<'_, f64>) -> (f64, f64) {
-        let strength = self.weight * rho[self.strength_rho_index].exp();
+        let strength = resolve_learnable_weight(self.weight, rho[self.strength_rho_index]);
         let smoothing = match (self.eps_rho_index, self.kind) {
-            (Some(idx), _) => rho[idx].exp(),
+            // A learnable smoothing `exp(rho)` underflows to exact `0.0` for
+            // `rho ≲ -745`, which reintroduces a non-differentiable kink and a
+            // `0/0` at `x = 0` in `sqrt(x² + ε²)` / the Log sparsifier. Floor it
+            // at the smallest positive normal so the smoothing stays strictly
+            // positive while still shrinking arbitrarily close to zero.
+            (Some(idx), _) => rho[idx].exp().max(f64::MIN_POSITIVE),
             (None, SparsityKind::SmoothedL1 { eps }) => eps,
             (None, SparsityKind::Log { delta }) => delta,
             (None, SparsityKind::Hoyer) => 0.0,
@@ -2700,8 +2739,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut acc = 0.0;
         for j in 0..d {
-            let rho_j = rho[self.rho_indices[j]];
-            let lam_j = self.weight * rho_j.exp();
+            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             let mut sq = 0.0;
             for n in 0..n_obs {
                 let v = target[n * d + j];
@@ -2717,7 +2755,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut g = Array1::<f64>::zeros(target.len());
         for j in 0..d {
-            let lam_j = self.weight * rho[self.rho_indices[j]].exp();
+            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             for n in 0..n_obs {
                 g[n * d + j] = lam_j * target[n * d + j];
             }
@@ -2734,7 +2772,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut diag = Array1::<f64>::zeros(target.len());
         for j in 0..d {
-            let lam_j = self.weight * rho[self.rho_indices[j]].exp();
+            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             for n in 0..n_obs {
                 diag[n * d + j] = lam_j;
             }
@@ -2748,7 +2786,7 @@ impl AnalyticPenalty for ARDPenalty {
         let n_obs = target.len() / d;
         let mut out = Array1::<f64>::zeros(self.rho_count());
         for j in 0..d {
-            let lam_j = self.weight * rho[self.rho_indices[j]].exp();
+            let lam_j = resolve_learnable_weight(self.weight, rho[self.rho_indices[j]]);
             let mut sq = 0.0;
             for n in 0..n_obs {
                 let v = target[n * d + j];
@@ -2979,7 +3017,10 @@ impl JumpReLUPenalty {
     impl_with_weight_schedule!(weight);
 
     fn threshold(&self, axis: usize, rho: ArrayView1<'_, f64>) -> f64 {
-        self.thresholds[axis] * rho[axis].exp()
+        // A learnable threshold `θ·exp(rho)` overflows to `inf` for large `rho`;
+        // the downstream gate `σ((l−θ)/τ)` then evaluates `inf·gate = NaN`. Clamp
+        // the log-magnitude so the threshold stays a finite normal.
+        resolve_learnable_weight(self.thresholds[axis], rho[axis])
     }
 
     fn sigmoid_gate(&self, x: f64) -> f64 {
@@ -3245,7 +3286,7 @@ impl TotalVariationPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -3646,7 +3687,7 @@ impl MonotonicityPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -3907,7 +3948,7 @@ impl NuclearNormPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -4317,7 +4358,7 @@ impl BlockSparsityPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -4645,7 +4686,7 @@ impl MechanismSparsityPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -4962,7 +5003,7 @@ impl RowPrecisionPriorPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -5341,7 +5382,7 @@ impl IvaeRidgeMeanGauge {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -5778,7 +5819,7 @@ impl ParametricRowPrecisionPriorPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.weight_offset()].exp()
+            resolve_learnable_weight(self.weight, rho[self.weight_offset()])
         } else {
             self.weight
         }
@@ -6122,7 +6163,7 @@ impl ScadMcpPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -6475,7 +6516,7 @@ impl BlockOrthogonalityPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -6905,7 +6946,7 @@ impl DecoderIncoherencePenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -7190,7 +7231,7 @@ impl OrthogonalityPenalty {
 
     fn resolved_weight(&self, rho: ArrayView1<'_, f64>) -> f64 {
         if self.learnable_weight {
-            self.weight * rho[self.rho_index].exp()
+            resolve_learnable_weight(self.weight, rho[self.rho_index])
         } else {
             self.weight
         }
@@ -8385,7 +8426,7 @@ impl NestedPrefixPenalty {
         self.prefix_sizes
             .iter()
             .enumerate()
-            .map(|(k, _)| self.shell_weights[k] * rho[self.rho_indices[k]].exp())
+            .map(|(k, _)| resolve_learnable_weight(self.shell_weights[k], rho[self.rho_indices[k]]))
             .collect()
     }
 

@@ -2517,11 +2517,24 @@ impl SaeManifoldRho {
     }
 
     pub fn lambda_sparse(&self) -> f64 {
-        self.log_lambda_sparse.exp()
+        // Clamp the log-strength into the finite-normal band before
+        // exponentiating: a raw `exp(log_lambda)` overflows to `inf` for
+        // `log_lambda ≳ 709`, and `inf · 0.0` / `inf / inf` then injects NaN
+        // into the penalty value/grad/Hessian and poisons the solve.
+        Self::stable_exp_strength(self.log_lambda_sparse)
     }
 
     pub fn lambda_smooth(&self) -> f64 {
-        self.log_lambda_smooth.exp()
+        Self::stable_exp_strength(self.log_lambda_smooth)
+    }
+
+    /// Exponentiate a learnable log-strength with the exponent clamped into the
+    /// finite-normal band, so the resulting strength is always a finite,
+    /// strictly-positive `f64` (no overflow to `inf`, no underflow to `0.0`).
+    fn stable_exp_strength(log_strength: f64) -> f64 {
+        const MAX_LOG_STRENGTH: f64 = 700.0;
+        const MIN_LOG_STRENGTH: f64 = -700.0;
+        log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH).exp()
     }
 
     /// Flatten ρ into the contiguous outer-coordinate vector the generic
@@ -8110,12 +8123,20 @@ fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
 /// Beta(α, 1) stick-breaking construction, which is the motivation for the
 /// schedule, but no sticks are drawn here.
 fn ibp_stick_breaking_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
+    // Accumulate the geometric schedule `π_k = ratio^k` in LOG space so the
+    // prior stays a finite *soft* weight even for large `K`. The naive product
+    // `acc *= ratio` underflows to exact `0.0` once `ratio^k < f64::MIN_POSITIVE`
+    // (e.g. `(0.1/1.1)^320`), which would turn the soft shrinkage prior into a
+    // HARD mask: such atoms would receive zero assignment AND zero logit
+    // gradient (the gradient is multiplied by `π_k`), so they could never
+    // reactivate. Working in log-space and flooring the exponentiated weight at
+    // the smallest positive normal keeps every atom's gradient path alive while
+    // preserving the geometric ordering.
     let mut out = Array1::<f64>::zeros(k_atoms);
-    let ratio = alpha / (alpha + 1.0);
-    let mut acc = 1.0;
+    let log_ratio = (alpha / (alpha + 1.0)).ln();
     for k in 0..k_atoms {
-        out[k] = acc;
-        acc *= ratio;
+        let log_pi = (k as f64) * log_ratio;
+        out[k] = log_pi.exp().max(f64::MIN_POSITIVE);
     }
     out
 }
@@ -8401,7 +8422,7 @@ fn assignment_prior_value(assignment: &SaeAssignment, rho: &SaeManifoldRho) -> f
             // prior gradients part of the objective evaluated by line search,
             // while data-fit reconstruction remains hard-gated by
             // `jumprelu_row`.
-            let sparsity_strength = rho.log_lambda_sparse.exp();
+            let sparsity_strength = rho.lambda_sparse();
             let mut acc = 0.0;
             for &logit in target.iter() {
                 if jumprelu_in_optimization_band(logit, threshold, temperature) {
@@ -8470,7 +8491,7 @@ fn assignment_prior_grad_hdiag(
             // (logit > θ − MARGIN·τ) so a gated-off atom near the boundary keeps
             // prior gradient. Data-fit JVP support is narrower and follows the
             // hard forward gate.
-            let sparsity_strength = rho.log_lambda_sparse.exp();
+            let sparsity_strength = rho.lambda_sparse();
             let inv_tau = 1.0 / temperature;
             let inv_tau2 = inv_tau * inv_tau;
             let mut g = Array1::<f64>::zeros(target.len());
