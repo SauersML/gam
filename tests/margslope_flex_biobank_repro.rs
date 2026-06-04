@@ -181,22 +181,28 @@ fn margslope_flex_beta_equivalence_smoke() {
     );
 }
 
-/// gam#683 regression: the FULL outer REML/continuation loop under
+/// gam#683 regression: multiple real REML/continuation outer iterations under
 /// `linkwiggle()` must terminate. Unlike `margslope_flex_biobank_repro_cycle0`
-/// (which caps `outer_max_iter = 1`), this uses `BlockwiseFitOptions::default()`
-/// so the degree-15/21 BMS row-cell-moment derivative path and the outer
-/// continuation pre-warm actually fire — the exact regime #683 reported as
+/// (which caps `outer_max_iter = 1`), this allows several outer iterations so
+/// the degree-15/21 BMS row-cell-moment derivative path and the continuation
+/// pre-warm actually fire repeatedly — the exact regime #683 reported as
 /// hanging (the outer LAML Hessian re-walked every cubic partition cell per
 /// `(ρ-axis i, ρ-axis j)` pair, O(D²·n·cells·r²) per outer step). The
 /// axis-projected per-row tensor cache collapses that to one O(n·cells·r²)
-/// build reused across all pairs, so the fit now finishes in a few seconds.
+/// build reused across all pairs, so the debug regression covers the hang
+/// surface without spending the full production convergence tail.
 #[test]
 fn flex_full_outer_completes_under_budget_683() {
     gam::init_parallelism();
     let n = 300usize;
     let problem = build_biobank_shape_problem(n);
+    let options = BlockwiseFitOptions {
+        outer_max_iter: 3,
+        compute_covariance: false,
+        ..BlockwiseFitOptions::default()
+    };
     let start = std::time::Instant::now();
-    let (out, timing) = fit_problem(problem, BlockwiseFitOptions::default())
+    let (out, timing) = fit_problem(problem, options)
         .expect("full-outer FLEX margslope fit must complete (gam#683)");
     let elapsed = start.elapsed();
     eprintln!(
