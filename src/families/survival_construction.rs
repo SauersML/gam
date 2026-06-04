@@ -3457,7 +3457,7 @@ mod tests {
         marginal_slope_baseline_chain_rule_hessian, marginal_slope_baseline_offset_theta_partials,
         optimize_survival_baseline_config, optimize_survival_baseline_config_with_gradient,
         optimize_survival_baseline_config_with_gradient_only, survival_baseline_config_from_theta,
-        survival_baseline_theta_from_config,
+        survival_baseline_theta_from_config, resolve_survival_marginal_slope_time_anchor_value,
     };
     use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
     use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
@@ -3483,6 +3483,34 @@ mod tests {
         assert_eq!(build.penalties.len(), 3);
         assert_eq!(build.nullspace_dims, vec![1, 2, 3]);
         assert!(build.ncols > 0);
+    }
+
+    #[test]
+    fn marginal_slope_time_anchor_defaults_to_median_exit() {
+        let age_entry = array![9.0, 1.0, 4.0, 6.0];
+        let age_exit = array![20.0, 12.0, 18.0, 30.0];
+        let anchor =
+            resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, None)
+                .expect("resolve marginal-slope default time anchor");
+
+        assert!(
+            (anchor - 19.0).abs() <= 1e-12,
+            "marginal-slope default anchor should be median exit, got {anchor}"
+        );
+    }
+
+    #[test]
+    fn marginal_slope_time_anchor_honors_explicit_value() {
+        let age_entry = array![9.0, 1.0, 4.0, 6.0];
+        let age_exit = array![20.0, 12.0, 18.0, 30.0];
+        let anchor =
+            resolve_survival_marginal_slope_time_anchor_value(&age_entry, &age_exit, Some(7.5))
+                .expect("resolve explicit marginal-slope time anchor");
+
+        assert!(
+            (anchor - 7.5).abs() <= 1e-12,
+            "explicit marginal-slope anchor should round-trip, got {anchor}"
+        );
     }
 
     /// Derivative-contract parity for the three public baseline optimizers.
