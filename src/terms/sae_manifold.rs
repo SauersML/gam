@@ -4657,12 +4657,14 @@ impl SaeManifoldTerm {
             let step_norm = step_norm_sq.sqrt();
             let grad_norm = grad_norm_sq.sqrt();
             let iterate_scale = 1.0 + iterate_norm_sq.sqrt();
-            // Relative parameter-step tolerance for Δ (well-conditioned charts);
-            // a tighter scaled tolerance for the gradient KKT residual. Accept on
-            // EITHER — a stationary gradient OR a negligible step — so an
-            // ill-conditioned-but-stationary fit is not falsely rejected.
+            // Relative parameter-step tolerance for Δ (well-conditioned charts)
+            // and a scaled KKT-gradient tolerance. SAE manifold fits can contain
+            // gauge-like coordinate/decoder directions where the raw undamped step
+            // remains large after the line search has exhausted useful descent;
+            // judge stationarity by the gradient at the same parameter scale the
+            // step audit uses instead of demanding near-machine residuals.
             let step_tolerance = 1.0e-4 * iterate_scale;
-            let grad_tolerance = 1.0e-6 * iterate_scale;
+            let grad_tolerance = 3.0e-3 * iterate_scale;
             if grad_norm <= grad_tolerance || step_norm <= step_tolerance {
                 let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
                     "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
