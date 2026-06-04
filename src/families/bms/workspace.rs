@@ -10443,77 +10443,95 @@ impl BernoulliMarginalSlopeFamily {
                 );
             }
             let r_pr = primary.total;
-            let mut diagonal = Array1::<f64>::zeros(slices.total);
-            for tile in &tiles.tiles {
-                let tile_rows = tile.rows.hess().nrows();
-                let h_rows_slice = tile
-                    .rows
-                    .hess()
-                    .as_slice()
-                    .expect("tiled row_primary_hessians.hess() is row-major contiguous");
-                let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
-                    n_rows: tile_rows,
-                    r: r_pr,
-                    h_rows: h_rows_slice,
-                };
-                let d_rows = {
-                    #[cfg(target_os = "linux")]
-                    {
-                        match crate::gpu::row_hessian_ops::launch_row_hessian_diag(
-                            crate::gpu::row_hessian_ops::RowHessianDiagInputs {
-                                n_rows: tile_rows,
-                                r: r_pr,
-                                h_rows: h_rows_slice,
-                            },
-                        ) {
-                            Ok(out) => out.d_rows,
-                            Err(err) => {
-                                log::info!(
-                                    "[BMS exact-newton diag] tiled GPU diag failed: {err}; \
-                                     falling back to CPU oracle"
-                                );
+            // Fan tiles across rayon with a per-tile private diagonal partial
+            // and a reduce, exactly as the streaming fallback below does over
+            // row chunks. Each tile owns a disjoint row block, so the
+            // accumulation is order-independent up to f.p. reduction; the
+            // partials sum to the same diagonal the serial loop produced.
+            let diagonal = tiles
+                .tiles
+                .par_iter()
+                .try_fold(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut tile_diag, tile| -> Result<_, String> {
+                        let tile_rows = tile.rows.hess().nrows();
+                        let h_rows_slice = tile.rows.hess().as_slice().expect(
+                            "tiled row_primary_hessians.hess() is row-major contiguous",
+                        );
+                        let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                            n_rows: tile_rows,
+                            r: r_pr,
+                            h_rows: h_rows_slice,
+                        };
+                        let d_rows = {
+                            #[cfg(target_os = "linux")]
+                            {
+                                match crate::gpu::row_hessian_ops::launch_row_hessian_diag(
+                                    crate::gpu::row_hessian_ops::RowHessianDiagInputs {
+                                        n_rows: tile_rows,
+                                        r: r_pr,
+                                        h_rows: h_rows_slice,
+                                    },
+                                ) {
+                                    Ok(out) => out.d_rows,
+                                    Err(err) => {
+                                        log::info!(
+                                            "[BMS exact-newton diag] tiled GPU diag failed: {err}; \
+                                             falling back to CPU oracle"
+                                        );
+                                        crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
+                                    }
+                                }
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
                                 crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
                             }
+                        };
+                        for local in 0..tile_rows {
+                            let row = tile.row_start + local;
+                            let d_row_base = local * r_pr;
+                            let h00 = d_rows[d_row_base];
+                            let h11 = d_rows[d_row_base + 1];
+                            {
+                                let mut marginal_diag =
+                                    tile_diag.slice_mut(s![slices.marginal.clone()]);
+                                self.marginal_design
+                                    .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
+                            }
+                            {
+                                let mut logslope_diag =
+                                    tile_diag.slice_mut(s![slices.logslope.clone()]);
+                                self.logslope_design
+                                    .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
+                            }
+                            if let (Some(primary_h), Some(block_h)) =
+                                (primary.h.as_ref(), slices.h.as_ref())
+                            {
+                                for (local_idx, global_idx) in block_h.clone().enumerate() {
+                                    let ii = primary_h.start + local_idx;
+                                    tile_diag[global_idx] += d_rows[d_row_base + ii];
+                                }
+                            }
+                            if let (Some(primary_w), Some(block_w)) =
+                                (primary.w.as_ref(), slices.w.as_ref())
+                            {
+                                for (local_idx, global_idx) in block_w.clone().enumerate() {
+                                    let ii = primary_w.start + local_idx;
+                                    tile_diag[global_idx] += d_rows[d_row_base + ii];
+                                }
+                            }
                         }
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
-                    }
-                };
-                for local in 0..tile_rows {
-                    let row = tile.row_start + local;
-                    let d_row_base = local * r_pr;
-                    let h00 = d_rows[d_row_base];
-                    let h11 = d_rows[d_row_base + 1];
-                    {
-                        let mut marginal_diag = diagonal.slice_mut(s![slices.marginal.clone()]);
-                        self.marginal_design
-                            .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
-                    }
-                    {
-                        let mut logslope_diag = diagonal.slice_mut(s![slices.logslope.clone()]);
-                        self.logslope_design
-                            .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
-                    }
-                    if let (Some(primary_h), Some(block_h)) =
-                        (primary.h.as_ref(), slices.h.as_ref())
-                    {
-                        for (local_idx, global_idx) in block_h.clone().enumerate() {
-                            let ii = primary_h.start + local_idx;
-                            diagonal[global_idx] += d_rows[d_row_base + ii];
-                        }
-                    }
-                    if let (Some(primary_w), Some(block_w)) =
-                        (primary.w.as_ref(), slices.w.as_ref())
-                    {
-                        for (local_idx, global_idx) in block_w.clone().enumerate() {
-                            let ii = primary_w.start + local_idx;
-                            diagonal[global_idx] += d_rows[d_row_base + ii];
-                        }
-                    }
-                }
-            }
+                        Ok(tile_diag)
+                    },
+                )
+                .try_reduce(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut left, right| -> Result<_, String> {
+                        left += &right;
+                        Ok(left)
+                    },
+                )?;
             return Ok(diagonal);
         }
 
