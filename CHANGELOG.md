@@ -18,6 +18,12 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.87 — gam 0.3.87 / gamfit 0.1.159 (2026-06-04)
+
+### Fixed
+
+- **Bernoulli marginal-slope Matérn fits with redundant scalar covariates no longer fail the identifiability audit.** The workflow now removes unpenalized scalar columns that add no direction beyond the implicit intercept and earlier scalar terms before BMS block construction, and rejects constrained or explicitly-penalized duplicates instead of using a ridge or constraint to mask non-identifiability. This keeps the hardened audit fail-closed while allowing biobank hypertension-style `matern(...) + scalar covariates` fits whose precomputed scalar spline column is constant or redundant.
+
 ## v0.3.86 — gam 0.3.86 / gamfit 0.1.158 (2026-06-04)
 
 ### Fixed
