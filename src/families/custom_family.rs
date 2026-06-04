@@ -11588,13 +11588,13 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
 /// stays on the same objective as the analytic gradient `tr((H+S_λ)⁻¹ ·)`
 /// (gam#748).
 ///
-/// The earlier `allow_semidefinite=false` path returned `log|H + S_λ + δI|`
-/// with `δ = δ(ρ)` escalated geometrically until factorization succeeded. That
-/// makes `V(ρ)` carry a ρ-dependent, discontinuous `δ(ρ)` the analytic
-/// derivatives ignore — exactly the objective/derivative mismatch the
+/// The earlier strict path returned `log|H + S_λ + δI|` with `δ = δ(ρ)`
+/// escalated geometrically until factorization succeeded. That makes `V(ρ)`
+/// carry a ρ-dependent, discontinuous `δ(ρ)` the analytic derivatives ignore —
+/// exactly the objective/derivative mismatch the
 /// operator-dense path's own comment forbids ("mixing an approximate
 /// determinant with exact traces gives ARC a Hessian for a different
-/// objective"). Both modes now compute the same honest quantity:
+/// objective"). The strict path now computes one honest quantity:
 ///
 /// - eigendecompose the symmetrised `H + S_λ`;
 /// - **reject** (return `Err`) when any eigenvalue is genuinely negative
