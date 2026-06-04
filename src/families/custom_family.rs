@@ -3424,6 +3424,28 @@ pub struct BlockwiseFitOptions {
     /// `ParameterBlockSpec.penalties`. The per-block path is unchanged.
     /// `None` preserves legacy behaviour for every existing caller.
     pub joint_penalties: Option<Arc<crate::families::joint_penalty::JointPenaltyBundle>>,
+    /// Whether the outer smoothing optimizer screens the explicit
+    /// `initial_rho` seed through the seed-screening cascade before the
+    /// solver starts.
+    ///
+    /// **Default `true`** — the general path benefits from ranking the
+    /// initial seed against the generated exploration seeds via cheap
+    /// capped proxy fits.
+    ///
+    /// A caller sets this `false` when `initial_rho` is already the correct,
+    /// identified optimum for its regime so that re-screening it adds only
+    /// cost. The survival location-scale constant-scale (parametric-AFT)
+    /// path uses this: its time-warp ρ seed is pinned AT the inner ρ box
+    /// bound (the affine-baseline limit), where the REML/LAML profile is a
+    /// dead-flat unidentified ridge. Running the screening cascade there
+    /// drives each proxy fit (and, when every capped stage collapses to
+    /// non-finite cost, the uncapped final stage) into a full inner solve on
+    /// the near-singular flat Hessian — the source of the multi-minute
+    /// no-iteration-log stall (#736, #735, #721). Skipping screening lets the
+    /// already-correct seed flow straight to the outer solver, which certifies
+    /// box-constraint stationarity at iteration 0. Genuinely flexible regimes
+    /// (smooth scale / spatial) leave this `true` and keep full screening.
+    pub screen_initial_rho: bool,
 }
 
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
@@ -3471,6 +3493,7 @@ impl Default for BlockwiseFitOptions {
             cache_session: None,
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
+            screen_initial_rho: true,
         }
     }
 }
@@ -4184,7 +4207,9 @@ fn custom_family_blockwise_edf(
             }
             attempts += 1;
             if attempts >= 8 {
-                return Err("custom-family edf: penalized Hessian could not be factorized".to_string());
+                return Err(
+                    "custom-family edf: penalized Hessian could not be factorized".to_string(),
+                );
             }
             ridge = if ridge <= 0.0 { min_step } else { ridge * 10.0 };
         }
@@ -4214,9 +4239,7 @@ fn custom_family_blockwise_edf(
                 s_full.assign(&s_local);
             } else if s_local.nrows() == block_cols && s_local.ncols() == block_cols {
                 let r = block_col_start..block_col_start + block_cols;
-                s_full
-                    .slice_mut(ndarray::s![r.clone(), r])
-                    .assign(&s_local);
+                s_full.slice_mut(ndarray::s![r.clone(), r]).assign(&s_local);
             } else {
                 return Err(format!(
                     "custom-family edf: penalty {global_k} materialized to {}x{}, expected {p}x{p} or {block_cols}x{block_cols}",
@@ -4225,9 +4248,9 @@ fn custom_family_blockwise_edf(
                 ));
             }
             // tr(H⁻¹ S_k) via H Z = S_k, summing the diagonal of Z.
-            let z = factor
-                .solvemulti(&s_full)
-                .map_err(|e| format!("custom-family edf trace solve failed for penalty {global_k}: {e}"))?;
+            let z = factor.solvemulti(&s_full).map_err(|e| {
+                format!("custom-family edf trace solve failed for penalty {global_k}: {e}")
+            })?;
             let mut trace = 0.0_f64;
             for d in 0..p {
                 trace += z[[d, d]];
@@ -23146,7 +23169,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone())
-        .with_screen_initial_rho(true)
+        .with_screen_initial_rho(options.screen_initial_rho)
         // Tighten the per-coord ρ bound from the OuterConfig default of 30
         // to 10. λ = exp(10) ≈ 22k is already extremely strong shrinkage —
         // any smooth whose data prefers more aggressive shrinkage is

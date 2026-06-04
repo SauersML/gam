@@ -265,7 +265,7 @@ for it in range(MAX_ITERS):
     for X in mats:
         acc = acc + spd_log(P, X)
     acc = acc / M
-    # Affine-invariant tangent norm at P: tr(P^{-1} acc P^{-1} acc).
+    # Affine-invariant tangent norm at P: tr(P^{{-1}} acc P^{{-1}} acc).
     Pinv = np.linalg.inv(P)
     grad_norm = float(np.sqrt(np.trace(Pinv @ acc @ Pinv @ acc)))
     if grad_norm < GRAD_TOL:

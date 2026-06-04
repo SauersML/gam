@@ -3824,6 +3824,27 @@ fn structural_time_initial_beta_guess(
     }
 }
 
+/// Whether the scale block carries no penalties — a single constant `σ`
+/// (the parametric-AFT regime). This is exactly the condition under which
+/// `prepare_survival_location_scale_model` pins the time-warp ρ seed AT the
+/// inner ρ box bound (the affine-baseline limit). On that dead-flat,
+/// statistically-unidentified time ridge the seed-screening cascade has no
+/// useful signal to rank — every capped proxy fit collapses to non-finite
+/// cost and the cascade escalates to its uncapped final stage, paying a full
+/// inner solve per seed on the near-singular Hessian (the multi-minute
+/// no-iteration-log stall, #736/#735/#721). The pinned seed is already the
+/// correct optimum, so screening is pure cost here.
+///
+/// A genuinely flexible scale (`noise_formula = s(...)`) carries log-sigma
+/// penalties, never reaches the seed-pinning branch, and keeps full
+/// screening.
+fn survival_constant_scale(spec: &SurvivalLocationScaleSpec) -> bool {
+    match &spec.log_sigma_block {
+        CovariateBlockKind::Static(block) => block.penalties.is_empty(),
+        CovariateBlockKind::TimeVarying(block) => block.penalties.is_empty(),
+    }
+}
+
 fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> BlockwiseFitOptions {
     BlockwiseFitOptions {
         inner_max_cycles: spec.max_iter,
@@ -3833,6 +3854,11 @@ fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> Blockwise
         compute_covariance: true,
         cache_session: spec.cache_session.clone(),
         cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
+        // Constant-scale (parametric-AFT) fits pin the time-warp ρ seed at the
+        // identified affine-baseline limit; re-screening that already-correct
+        // seed across the flat unidentified time ridge only stalls. Genuinely
+        // flexible scale/spatial fits keep the default `true` and full screening.
+        screen_initial_rho: !survival_constant_scale(spec),
         ..BlockwiseFitOptions::default()
     }
 }
