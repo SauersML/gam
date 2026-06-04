@@ -35066,7 +35066,8 @@ mod tests {
         // The realized basis must be full column rank: no leftover collinear
         // columns for the identifiability audit to FATAL on.
         assert_eq!(
-            rrqr.rank, realized_cols,
+            rrqr.rank,
+            realized_cols,
             "Matérn over-specified centers left {} collinear column(s): realized={realized_cols}, rank={}",
             realized_cols - rrqr.rank,
             rrqr.rank,
