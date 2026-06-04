@@ -21054,10 +21054,12 @@ pub fn fit_survival_marginal_slope_terms(
                     .design
                     .try_to_dense_by_chunks("smgs phase-4b active: logslope")?;
                 // Channel-aware per-subject Fisher Gram (T8). Build the
-                // pilot primary state at β=0: q0 = offset_entry,
-                // q1 = offset_exit + marginal_offset, qd1 =
-                // derivative_offset_exit, g = logslope_offset.  The
-                // resulting 4×4 per-row H couples the logslope g channel
+                // pilot primary state at β=0: q0 = offset_entry +
+                // marginal_offset, q1 = offset_exit + marginal_offset,
+                // qd1 = derivative_offset_exit, g = logslope_offset. The
+                // marginal predictor enters BOTH entry and exit channels
+                // (see `row_dynamic_q_values`); at β=0 it is `marginal_offset`.
+                // The resulting 4×4 per-row H couples the logslope g channel
                 // to the q0/q1 channels through the off-diagonal Fisher
                 // entries (∂²(−ℓ)/∂q1∂g ≠ 0), which prevents the
                 // logslope block from appearing fully aliased by the
@@ -21066,9 +21068,10 @@ pub fn fit_survival_marginal_slope_terms(
                 // zero, causing false "fully aliased" reports for the
                 // logslope block on biobank designs where g_dg and dq1
                 // share column span in raw design space.
-                let q0_pilot = spec.time_block.offset_entry.clone();
+                let mut q0_pilot = spec.time_block.offset_entry.clone();
                 let mut q1_pilot = spec.time_block.offset_exit.clone();
                 for i in 0..n_rows {
+                    q0_pilot[i] += spec.marginal_offset[i];
                     q1_pilot[i] += spec.marginal_offset[i];
                 }
                 let qd1_pilot = spec.time_block.derivative_offset_exit.clone();
