@@ -85,6 +85,24 @@ pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
 /// (separating) direction to `O(√(2·Δℓ/ρ))` instead of letting it run to ~50.
 pub(crate) const MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA: f64 = -4.605_170_185_988_091; // ln(1e-2)
 
+/// Fixed log-λ for the BMS marginal/logslope overlap ridge (gam#754).
+///
+/// The Bernoulli marginal-slope probit index contains both a marginal surface
+/// `f_m(x)` and a score-modulated logslope surface `z·f_s(x)`. When `z`
+/// correlates with the same covariates used by both spatial surfaces, a
+/// component of `f_m(x)` can be explained almost equally well by
+/// `z·f_s(x)`. The ordinary marginal smooth penalty does not target that
+/// cross-channel confounding direction, so REML can keep driving the marginal
+/// smoothest penalty toward the flat basin while the inner solve carries large
+/// marginal coefficients.
+///
+/// The fixed overlap ridge is a PSD penalty on the marginal coefficient
+/// directions whose pilot effective marginal Jacobian lies in the weighted span
+/// of the pilot effective logslope Jacobian. It is pinned out of REML for the
+/// same reason as the nullspace ridge: the failure is a structural finite-
+/// sample confound, not a smoothness parameter to estimate.
+pub(crate) const MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA: f64 = 0.0;
+
 /// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the
 /// latent score `z` itself on the same rows.
 ///

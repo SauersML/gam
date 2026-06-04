@@ -352,3 +352,60 @@ fn hypertension_shape_bms_matern_redundant_centers_are_rank_reduced() {
         }
     }
 }
+
+#[test]
+fn hypertension_shape_bms_shared_matern_prs_pc_confound_starts_outer_solver() {
+    gam::init_parallelism();
+    let mut data = hypertension_shape_dataset();
+    let prs_idx = data
+        .headers
+        .iter()
+        .position(|h| h == "prs_z")
+        .expect("prs_z column");
+    let pc1_idx = data
+        .headers
+        .iter()
+        .position(|h| h == "PC1")
+        .expect("PC1 column");
+    let pc2_idx = data
+        .headers
+        .iter()
+        .position(|h| h == "PC2")
+        .expect("PC2 column");
+    for row in 0..data.values.nrows() {
+        data.values[[row, prs_idx]] =
+            data.values[[row, pc1_idx]] + 0.1 * data.values[[row, pc2_idx]];
+    }
+
+    let cfg = FitConfig {
+        logslope_formula: Some("matern(PC1, PC2, PC3, centers=6, length_scale=1.0)".to_string()),
+        z_column: Some("prs_z".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "event ~ matern(PC1, PC2, PC3, centers=6, length_scale=1.0) + sex + entry_age_z + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4",
+        &data,
+        &cfg,
+    );
+    match result {
+        Ok(FitResult::BernoulliMarginalSlope(out)) => {
+            assert!(
+                out.fit.beta.iter().all(|coef| coef.is_finite()),
+                "PC-confounded Matérn BMS fit should produce finite coefficients, got {:?}",
+                out.fit.beta
+            );
+        }
+        Ok(_) => panic!("PC-confounded Matérn fit returned the wrong family variant"),
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("CertRefused")
+                    && !msg.contains("phantom_multiplier")
+                    && !msg.contains("outer smoothing optimization did not converge")
+                    && !msg.contains("no candidate seeds passed outer startup validation"),
+                "PC-confounded Matérn BMS fit still hit the #754 startup failure: {msg}"
+            );
+            panic!("PC-confounded Matérn BMS fit failed: {msg}");
+        }
+    }
+}

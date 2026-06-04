@@ -3,9 +3,15 @@ use super::gradient_paths::*;
 use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
 use super::*;
-use crate::families::marginal_slope_orthogonal::{
-    INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA, MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
+use crate::faer_ndarray::{
+    FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y,
 };
+use crate::families::marginal_slope_orthogonal::{
+    INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA, MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA,
+    MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
+};
+use crate::matrix::FactorizedSystem;
+use faer::Side;
 
 const BMS_PROBIT_SEPARATION_BETA_INF: f64 = 40.0;
 
@@ -265,8 +271,105 @@ fn widen_marginal_dense_with_influence(
     Ok(Arc::new(widened))
 }
 
+fn marginal_logslope_overlap_penalty(
+    marginal_design: &DesignMatrix,
+    logslope_design: &DesignMatrix,
+    z: &Array1<f64>,
+    row_metric: &Array1<f64>,
+    marginal_offset: &Array1<f64>,
+    logslope_offset: &Array1<f64>,
+    marginal_baseline: f64,
+    logslope_baseline: f64,
+    probit_scale: f64,
+) -> Result<Option<Array2<f64>>, String> {
+    let marginal =
+        marginal_design.try_to_dense_arc("marginal_logslope_overlap_penalty::marginal")?;
+    let logslope =
+        logslope_design.try_to_dense_arc("marginal_logslope_overlap_penalty::logslope")?;
+    let n = marginal.nrows();
+    if logslope.nrows() != n
+        || z.len() != n
+        || row_metric.len() != n
+        || marginal_offset.len() != n
+        || logslope_offset.len() != n
+    {
+        return Err(format!(
+            "marginal/logslope overlap penalty row mismatch: marginal={}, logslope={}, z={}, row_metric={}, marginal_offset={}, logslope_offset={}",
+            marginal.nrows(),
+            logslope.nrows(),
+            z.len(),
+            row_metric.len(),
+            marginal_offset.len(),
+            logslope_offset.len(),
+        ));
+    }
+    let p_m = marginal.ncols();
+    let p_g = logslope.ncols();
+    if p_m == 0 || p_g == 0 {
+        return Ok(None);
+    }
+    if !marginal_baseline.is_finite()
+        || !logslope_baseline.is_finite()
+        || !probit_scale.is_finite()
+        || probit_scale <= 0.0
+        || z.iter().any(|v| !v.is_finite())
+        || row_metric.iter().any(|v| !v.is_finite() || *v < 0.0)
+        || marginal_offset.iter().any(|v| !v.is_finite())
+        || logslope_offset.iter().any(|v| !v.is_finite())
+    {
+        return Err(
+            "marginal/logslope overlap penalty requires finite pilot geometry and finite non-negative row metric"
+                .to_string(),
+        );
+    }
+
+    let mut marginal_effective = Array2::<f64>::zeros((n, p_m));
+    let mut effective_logslope = Array2::<f64>::zeros((n, p_g));
+    for i in 0..n {
+        let q_i = marginal_offset[i] + marginal_baseline;
+        let g_i = logslope_offset[i] + logslope_baseline;
+        let sg = probit_scale * g_i;
+        let c_i = (1.0 + sg * sg).sqrt();
+        let logslope_factor = q_i * probit_scale * probit_scale * g_i / c_i + probit_scale * z[i];
+        for j in 0..p_m {
+            marginal_effective[[i, j]] = c_i * marginal[[i, j]];
+        }
+        for j in 0..p_g {
+            effective_logslope[[i, j]] = logslope_factor * logslope[[i, j]];
+        }
+    }
+    if effective_logslope.iter().all(|v| v.abs() <= f64::EPSILON) {
+        return Ok(None);
+    }
+
+    let mut gram = fast_xt_diag_x(&effective_logslope, row_metric);
+    let gram_scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+    if !gram_scale.is_finite() || gram_scale <= 0.0 {
+        return Ok(None);
+    }
+    let projection_ridge = (gram_scale * 1.0e-10).max(f64::EPSILON);
+    for i in 0..p_g {
+        gram[[i, i]] += projection_ridge;
+    }
+    let cross = fast_xt_diag_y(&effective_logslope, row_metric, &marginal_effective);
+    let gram_view = FaerArrayView::new(&gram);
+    let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
+        .map_err(|e| format!("marginal/logslope overlap Gram factorization failed: {e}"))?;
+    let coeffs = factor
+        .solvemulti(&cross)
+        .map_err(|e| format!("marginal/logslope overlap projection solve failed: {e}"))?;
+    let projected_marginal = fast_ab(&effective_logslope, &coeffs);
+    let mut penalty = fast_xt_diag_y(&marginal_effective, row_metric, &projected_marginal);
+    penalty = (&penalty + &penalty.t()) * 0.5;
+    let max_abs = penalty.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    if !max_abs.is_finite() || max_abs <= 1.0e-12 {
+        return Ok(None);
+    }
+    Ok(Some(penalty))
+}
+
 /// Re-embed the term-collection marginal penalties at the (possibly widened)
-/// block dimension `p_m [+ p₁]`, then append two FIXED-ridge sub-penalties:
+/// block dimension `p_m [+ p₁]`, then append fixed-ridge sub-penalties:
 ///
 ///  1. (gam#754, always) a nullspace-shrinkage ridge `Z·Zᵀ` over the union of
 ///     the unpenalized parametric columns (intercept + linear covariates) and
@@ -276,7 +379,12 @@ fn widen_marginal_dense_with_influence(
 ///     `MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA` for why it is fixed, not
 ///     REML-learned.
 ///
-///  2. (#461, only with influence columns) the fixed-ridge absorber identity on
+///  2. (gam#754, when present) a fixed overlap ridge over marginal directions
+///     whose pilot effective Jacobian lies in the weighted span of the pilot
+///     effective logslope Jacobian. This targets the basis-independent
+///     marginal/logslope confound seen on hypertension.
+///
+///  3. (#461, only with influence columns) the fixed-ridge absorber identity on
 ///     the influence columns `p_m..p_m+p₁`.
 ///
 /// The genuine marginal smooth penalties keep their `col_range` (marginal
@@ -286,10 +394,12 @@ fn widen_marginal_dense_with_influence(
 fn marginal_penalties_with_influence_ridge(
     design: &TermCollectionDesign,
     rho_marginal: &Array1<f64>,
+    overlap_penalty: Option<&Array2<f64>>,
     influence_columns: Option<&Array2<f64>>,
+    overlap_ridge_log_lambda: f64,
     influence_ridge_log_lambda: f64,
     nullspace_ridge_log_lambda: f64,
-) -> (Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>) {
+) -> Result<(Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>), String> {
     let p_m = design.design.ncols();
     let p1 = influence_columns.map(|z| z.ncols()).unwrap_or(0);
     let total_dim = p_m + p1;
@@ -326,29 +436,54 @@ fn marginal_penalties_with_influence_ridge(
                     .for_each(|agg, &value| *agg += value / scale);
             }
         }
-        if let Some(shrinkage) = crate::terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
-            .ok()
-            .flatten()
-        {
-            // `shrinkage.sym_penalty` is `Z·Zᵀ` (p_m × p_m), PSD with unit
-            // eigenvalues on the null directions and zero on the penalized span.
-            // Embed at `total_dim` (identity-zero on any influence tail).
-            let local = if total_dim == p_m {
-                shrinkage.sym_penalty
-            } else {
-                let mut widened = Array2::<f64>::zeros((total_dim, total_dim));
-                widened
-                    .slice_mut(s![..p_m, ..p_m])
-                    .assign(&shrinkage.sym_penalty);
-                widened
-            };
-            penalties.push(PenaltyMatrix::Dense(local));
-            nullspace_dims.push(0);
-            log_lambdas.push(nullspace_ridge_log_lambda);
-        }
+        let shrinkage = crate::terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
+            .map_err(|e| format!("marginal nullspace ridge construction failed: {e}"))?
+            .ok_or_else(|| {
+                "marginal nullspace ridge invariant failed: non-empty BMS marginal block \
+                 had no shrinkable null direction"
+                    .to_string()
+            })?;
+        // `shrinkage.sym_penalty` is `Z·Zᵀ` (p_m × p_m), PSD with unit
+        // eigenvalues on the null directions and zero on the penalized span.
+        // Embed at `total_dim` (identity-zero on any influence tail).
+        let local = if total_dim == p_m {
+            shrinkage.sym_penalty
+        } else {
+            let mut widened = Array2::<f64>::zeros((total_dim, total_dim));
+            widened
+                .slice_mut(s![..p_m, ..p_m])
+                .assign(&shrinkage.sym_penalty);
+            widened
+        };
+        penalties.push(PenaltyMatrix::Dense(local));
+        nullspace_dims.push(0);
+        log_lambdas.push(nullspace_ridge_log_lambda);
     }
 
-    // (2) #461 fixed-ridge absorber: identity on the influence columns only.
+    // (2) gam#754 fixed overlap ridge: shrink only the marginal directions that
+    // are explainable by the score-weighted logslope surface. Embed at
+    // `total_dim`; influence columns retain their own absorber ridge below.
+    if let Some(overlap) = overlap_penalty {
+        if overlap.nrows() != p_m || overlap.ncols() != p_m {
+            return Err(format!(
+                "marginal/logslope overlap penalty shape mismatch: got {}x{}, expected {p_m}x{p_m}",
+                overlap.nrows(),
+                overlap.ncols(),
+            ));
+        }
+        let local = if total_dim == p_m {
+            overlap.clone()
+        } else {
+            let mut widened = Array2::<f64>::zeros((total_dim, total_dim));
+            widened.slice_mut(s![..p_m, ..p_m]).assign(overlap);
+            widened
+        };
+        penalties.push(PenaltyMatrix::Dense(local));
+        nullspace_dims.push(0);
+        log_lambdas.push(overlap_ridge_log_lambda);
+    }
+
+    // (3) #461 fixed-ridge absorber: identity on the influence columns only.
     // Full rank (nullspace 0); its log λ is pinned out of REML by a degenerate
     // ρ box.
     if p1 > 0 {
@@ -361,7 +496,7 @@ fn marginal_penalties_with_influence_ridge(
         log_lambdas.push(influence_ridge_log_lambda);
     }
 
-    (penalties, nullspace_dims, Array1::from_vec(log_lambdas))
+    Ok((penalties, nullspace_dims, Array1::from_vec(log_lambdas)))
 }
 
 /// Widen an optional β warm-start hint to the influence-widened marginal
@@ -607,6 +742,64 @@ mod runaway_tests {
     use super::*;
 
     #[test]
+    fn overlap_penalty_targets_score_weighted_logslope_span() {
+        let marginal = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_shape_vec((4, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap(),
+        ));
+        let logslope = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_shape_vec((4, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap(),
+        ));
+        let z = Array1::from_vec(vec![0.0, 1.0, 2.0, 3.0]);
+        let row_metric = Array1::ones(4);
+        let offsets = Array1::zeros(4);
+
+        let penalty = marginal_logslope_overlap_penalty(
+            &marginal,
+            &logslope,
+            &z,
+            &row_metric,
+            &offsets,
+            &offsets,
+            0.0,
+            0.0,
+            1.0,
+        )
+        .expect("overlap penalty should build")
+        .expect("marginal signal lies in the pilot logslope Jacobian span");
+
+        assert_eq!(penalty.dim(), (1, 1));
+        assert!((penalty[[0, 0]] - 14.0).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn overlap_penalty_skips_weight_orthogonal_channels() {
+        let marginal = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_shape_vec((4, 1), vec![-1.0, 1.0, -1.0, 1.0]).unwrap(),
+        ));
+        let logslope = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            Array2::from_shape_vec((4, 1), vec![1.0, 1.0, 1.0, 1.0]).unwrap(),
+        ));
+        let z = Array1::ones(4);
+        let row_metric = Array1::ones(4);
+        let offsets = Array1::zeros(4);
+
+        let penalty = marginal_logslope_overlap_penalty(
+            &marginal,
+            &logslope,
+            &z,
+            &row_metric,
+            &offsets,
+            &offsets,
+            0.0,
+            0.0,
+            1.0,
+        )
+        .expect("overlap penalty should build");
+
+        assert!(penalty.is_none());
+    }
+
+    #[test]
     fn runaway_diagnostic_names_unpenalized_parametric_direction_first() {
         let msg = bernoulli_marginal_slope_runaway_error_from_argmax(
             Some(("sex".to_string(), 1, 52.0)),
@@ -648,7 +841,9 @@ fn build_marginal_blockspec_bms(
     logslope_offset: &Array1<f64>,
     logslope_baseline: f64,
     p_marginal: usize,
+    overlap_penalty: Option<&Array2<f64>>,
     influence_columns: Option<&Array2<f64>>,
+    overlap_ridge_log_lambda: f64,
     influence_ridge_log_lambda: f64,
     nullspace_ridge_log_lambda: f64,
 ) -> Result<ParameterBlockSpec, String> {
@@ -672,10 +867,12 @@ fn build_marginal_blockspec_bms(
     let (penalties, nullspace_dims, initial_log_lambdas) = marginal_penalties_with_influence_ridge(
         design,
         &rho,
+        overlap_penalty,
         influence_columns,
+        overlap_ridge_log_lambda,
         influence_ridge_log_lambda,
         nullspace_ridge_log_lambda,
-    );
+    )?;
     Ok(ParameterBlockSpec {
         name: "marginal_surface".to_string(),
         design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
@@ -1257,6 +1454,18 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
         out
     };
+    let marginal_logslope_overlap_penalty_matrix = marginal_logslope_overlap_penalty(
+        &marginal_design.design,
+        &logslope_design.design,
+        z.as_ref(),
+        &cross_block_pilot_w_score_warp,
+        &spec.marginal_offset,
+        &spec.logslope_offset,
+        baseline.0,
+        baseline.1,
+        probit_scale,
+    )?;
+
     // Fixed (pinned-out-of-REML) ridge slots appended after the marginal
     // block's genuine smooth penalties, in install order:
     //
@@ -1264,7 +1473,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
     //      marginal block (its aggregate smooth penalty is never full rank: the
     //      parametric intercept column alone guarantees a null direction), so
     //      `build_nullspace_shrinkage_penalty` always returns a shrinkage.
-    //   2. #461 Stage-1 influence absorber ridge — only when influence columns
+    //   2. gam#754 marginal/logslope overlap ridge — present when the pilot
+    //      effective marginal Jacobian has a nonzero projection onto the pilot
+    //      effective logslope Jacobian.
+    //   3. #461 Stage-1 influence absorber ridge — only when influence columns
     //      are present.
     //
     // Each occupies a flat-ρ position (so `marginal_penalty_count` grows) but is
@@ -1272,13 +1484,20 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // REML-optimised. The pinned indices below MUST match the append order in
     // `marginal_penalties_with_influence_ridge`.
     let nullspace_ridge_slots = usize::from(marginal_design.design.ncols() > 0);
+    let overlap_ridge_slots = usize::from(marginal_logslope_overlap_penalty_matrix.is_some());
     let influence_ridge_slots = usize::from(influence_columns.is_some());
-    let marginal_penalty_count =
-        marginal_design.penalties.len() + nullspace_ridge_slots + influence_ridge_slots;
+    let marginal_penalty_count = marginal_design.penalties.len()
+        + nullspace_ridge_slots
+        + overlap_ridge_slots
+        + influence_ridge_slots;
     let mut pinned_rho_slots: Vec<(usize, f64)> = Vec::new();
     let mut pinned_cursor = marginal_design.penalties.len();
     if nullspace_ridge_slots == 1 {
         pinned_rho_slots.push((pinned_cursor, MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA));
+        pinned_cursor += 1;
+    }
+    if overlap_ridge_slots == 1 {
+        pinned_rho_slots.push((pinned_cursor, MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA));
         pinned_cursor += 1;
     }
     if influence_ridge_slots == 1 {
@@ -1326,18 +1545,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // The marginal block owns its term-collection smooth penalties (the
         // genuine REML-learned ρ slots) PLUS trailing FIXED-ridge slots: the
         // gam#754 nullspace-shrinkage ridge (always, for a non-empty marginal
-        // block) and, when the Stage-1 influence absorber is active, the #461
-        // influence ridge. The fixed slots are held at pinned values via outer
-        // bounds, but they still occupy ρ positions so they must be skipped
-        // here. Only the genuine smooth slots feed `rho_marginal`; the fixed
-        // slots' log-λ are appended from constants inside
+        // block), the gam#754 marginal/logslope overlap ridge (when the
+        // realized overlap is nonzero), and, when the Stage-1 influence
+        // absorber is active, the #461 influence ridge. The fixed slots are held
+        // at pinned values via outer bounds, but they still occupy ρ positions
+        // so they must be skipped here. Only the genuine smooth slots feed
+        // `rho_marginal`; the fixed slots' log-λ are appended from constants inside
         // `marginal_penalties_with_influence_ridge`.
         let nullspace_extra = usize::from(marginal_design.design.ncols() > 0);
+        let overlap_extra = usize::from(marginal_logslope_overlap_penalty_matrix.is_some());
         let influence_extra = usize::from(influence_columns.is_some());
         let rho_marginal = rho
             .slice(s![cursor..cursor + marginal_design.penalties.len()])
             .to_owned();
-        cursor += marginal_design.penalties.len() + nullspace_extra + influence_extra;
+        cursor +=
+            marginal_design.penalties.len() + nullspace_extra + overlap_extra + influence_extra;
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
@@ -1355,7 +1577,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &spec.logslope_offset,
                 baseline.1,
                 p_m,
+                marginal_logslope_overlap_penalty_matrix.as_ref(),
                 influence_columns.as_ref(),
+                MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA,
                 INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
                 MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
             )?,
