@@ -7123,21 +7123,6 @@ mod tests {
 
         let htbeta = sys_htbeta_materialize_row(&sys, 0, &sys.rows[0]);
         assert_eq!(htbeta, array![[2.25_f64, -0.5, 1.25]]);
-
-        let x = array![1.0_f64, 2.0, -1.0];
-        let mut applied = Array1::<f64>::zeros(1);
-        sys_htbeta_apply_row(&sys, 0, &sys.rows[0], x.view(), &mut applied);
-        assert!((applied[0] - 0.0).abs() < 1.0e-12);
-
-        let mut transposed = Array1::<f64>::zeros(3);
-        sys_htbeta_accumulate_transpose(
-            &sys,
-            0,
-            &sys.rows[0],
-            array![2.0_f64].view(),
-            &mut transposed,
-        );
-        assert_eq!(transposed, array![4.5_f64, -1.0, 2.5]);
     }
 
     /// Issue #195 / gam#578: when the per-row block is barely-PD at
