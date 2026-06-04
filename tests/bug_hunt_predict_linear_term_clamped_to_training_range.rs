@@ -6,7 +6,7 @@
 //! clips each continuous new-data column to the `(min, max)` observed during
 //! training. It deliberately *excludes* categorical/binary columns and periodic
 //! axes (see the doc comment and `training_periodic_axes`), but it does **not**
-//! exclude columns that feed an ordinary penalized linear term. The clip is
+//! exclude columns that feed an ordinary linear term. The clip is
 //! applied to all continuous columns at `src/inference/predict/input.rs:227`
 //! (`build_predict_input_for_model_inner`), which is the single predict entry
 //! point reached by both the `gam predict` CLI (`src/main.rs:2741`) and the
