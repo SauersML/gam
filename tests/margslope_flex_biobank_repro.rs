@@ -201,6 +201,7 @@ fn flex_full_outer_completes_under_budget_683() {
         inner_max_cycles: 1,
         outer_max_iter: 3,
         compute_covariance: false,
+        screen_initial_rho: false,
         ..BlockwiseFitOptions::default()
     };
     let start = std::time::Instant::now();
