@@ -3911,10 +3911,12 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
 /// `spec` need for their bases to be well-posed.
 ///
 /// Each [`SmoothBasisSpec`] owns its own `min_sample_rows` lower bound — the
-/// B-spline knot count, the tensor-product column product, the PCA matrix
-/// width — so this helper is a thin sum-and-compare: the workflow has no
-/// per-basis-kind knowledge. Adding a new smooth kind extends the basis
-/// `match` in `min_sample_rows`, not this gate.
+/// B-spline knot count, the *penalized* tensor-product floor (the sum of the
+/// per-marginal column counts, not their Kronecker product, because a `te()`
+/// is regularized and its effective dof is a small fraction of the column
+/// count), the PCA matrix width — so this helper is a thin sum-and-compare:
+/// the workflow has no per-basis-kind knowledge. Adding a new smooth kind
+/// extends the basis `match` in `min_sample_rows`, not this gate.
 ///
 /// Catches the README-quickstart failure mode (#309) where `n=4` against
 /// `y ~ s(x)` would otherwise surface as an opaque `cached inner beta has
