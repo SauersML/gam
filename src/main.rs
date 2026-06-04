@@ -969,32 +969,6 @@ fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     };
 }
 
-fn gaussian_saved_fit_scale_for_role(role: BlockRole, response_scale: f64) -> f64 {
-    match role {
-        BlockRole::Mean | BlockRole::Location | BlockRole::LinkWiggle => response_scale,
-        BlockRole::Scale | BlockRole::Time | BlockRole::Threshold => 1.0,
-    }
-}
-
-fn scale_covariance_by_block_role(
-    cov: &Array2<f64>,
-    blocks: &[gam::estimate::FittedBlock],
-    response_scale: f64,
-) -> Array2<f64> {
-    let mut scaled = cov.clone();
-    let mut scales = Vec::with_capacity(cov.nrows());
-    for block in blocks {
-        let factor = gaussian_saved_fit_scale_for_role(block.role.clone(), response_scale);
-        scales.extend(std::iter::repeat_n(factor, block.beta.len()));
-    }
-    for i in 0..scaled.nrows() {
-        for j in 0..scaled.ncols() {
-            scaled[[i, j]] *= scales[i] * scales[j];
-        }
-    }
-    scaled
-}
-
 fn run_fit(args: FitArgs) -> Result<(), String> {
     let formula_text = choose_formula(&args)?;
     let parsed = parse_formula(&formula_text)?;
