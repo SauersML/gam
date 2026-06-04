@@ -1734,6 +1734,70 @@ pub fn resolve_survival_time_anchor_value(
     Ok(anchor.max(SURVIVAL_TIME_FLOOR))
 }
 
+/// Marginal-slope centering anchor: a robust *interior* time on the **exit**
+/// scale rather than the earliest entry age.
+///
+/// `center_survival_time_designs_at_anchor` subtracts the time-basis row at the
+/// anchor from every entry/exit design row, so the anchor sets the origin of
+/// the baseline-hazard I-spline's affine reparameterization. The
+/// location-scale path anchors at the minimum entry age
+/// ([`resolve_survival_time_anchor_value`]); for right-censored-only data that
+/// minimum is ≈ the time origin, so centering is nearly a no-op.
+///
+/// Under **left truncation** the minimum entry age is a genuine positive
+/// *left-tail* point, and centering there leaves the centered linear-trend
+/// column `X(exit) − X(anchor)` large and one-signed across all rows (exit
+/// times sit far to the right of the earliest entry). That column is the
+/// unpenalized polynomial null space of the 2nd-difference time penalty, so the
+/// inflated, one-signed column multiplies the marginal-slope time-block score
+/// at the `γ = 0` monotone-cone seed up by hundreds — the constrained joint
+/// Newton cannot certify KKT on it and REML rejects every seed (issue #751).
+///
+/// Centering instead at a robust interior location on the *exit* scale — the
+/// **median exit age**, where the at-risk mass concentrates — keeps the
+/// centered column small and two-signed (some exits below the median, some
+/// above), so the exit-event likelihood pins the linear trend and the seed
+/// score stays bounded. Re-centering is an exact affine reparameterization of
+/// the baseline offset: the fitted `q(t)` and the REML objective are unchanged,
+/// only the seed conditioning improves. The median is chosen (over the mean)
+/// for robustness to the heavy right tail of survival times.
+///
+/// An explicit `--survival-time-anchor` is honored verbatim (same validation as
+/// the location-scale path) so the user retains full control; the saved
+/// `survival_time_anchor` scalar round-trips to predict unchanged.
+pub fn resolve_survival_marginal_slope_time_anchor_value(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    time_anchor: Option<f64>,
+) -> Result<f64, String> {
+    if age_entry.is_empty() || age_exit.is_empty() {
+        return Err(
+            "survival marginal-slope time anchor requires non-empty entry/exit times".to_string(),
+        );
+    }
+    let anchor = match time_anchor {
+        Some(t_anchor) => {
+            if !t_anchor.is_finite() || t_anchor < 0.0 {
+                return Err(format!(
+                    "survival time anchor must be finite and non-negative, got {t_anchor}"
+                ));
+            }
+            t_anchor
+        }
+        None => {
+            let mut sorted: Vec<f64> = age_exit.iter().copied().collect();
+            sorted.sort_by(f64::total_cmp);
+            let m = sorted.len();
+            if m % 2 == 1 {
+                sorted[m / 2]
+            } else {
+                0.5 * (sorted[m / 2 - 1] + sorted[m / 2])
+            }
+        }
+    };
+    Ok(anchor.max(SURVIVAL_TIME_FLOOR))
+}
+
 pub fn evaluate_survival_time_basis_row(
     age: f64,
     cfg: &SurvivalTimeBasisConfig,

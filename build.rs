@@ -5619,6 +5619,9 @@ fn body_has_noop_sentinel_control_flow(body: &str) -> bool {
     if leading_discard_or_read_then_sentinel(s) {
         return true;
     }
+    if whole_predicate_then_trivial_sentinel(s) {
+        return true;
+    }
     false
 }
 
@@ -5687,6 +5690,110 @@ fn leading_discard_or_read_then_sentinel(s: &str) -> bool {
         .or_else(|| strip_leading_wildcard_assignment(s))
         .or_else(|| strip_leading_read_only_statement(s));
     rest.is_some_and(|tail| trivial_sentinel_key(tail).is_some())
+}
+
+fn whole_predicate_then_trivial_sentinel(s: &str) -> bool {
+    let mut expr = s.trim();
+    if let Some(stripped) = expr.strip_suffix(';') {
+        expr = stripped.trim_end();
+    }
+    for method in [".then(", ".then_some("] {
+        let Some((predicate, arg)) = split_whole_method_call_arg(expr, method) else {
+            continue;
+        };
+        if predicate_is_read_only_empty_check(predicate) && then_arg_is_trivial_sentinel(arg) {
+            return true;
+        }
+    }
+    false
+}
+
+fn split_whole_method_call_arg<'a>(expr: &'a str, method: &str) -> Option<(&'a str, &'a str)> {
+    let call_start = expr.find(method)?;
+    let arg_start = call_start + method.len();
+    let close_rel = find_matching_paren(&expr.as_bytes()[arg_start..])?;
+    if !expr[arg_start + close_rel + 1..].trim().is_empty() {
+        return None;
+    }
+    Some((
+        expr[..call_start].trim(),
+        expr[arg_start..arg_start + close_rel].trim(),
+    ))
+}
+
+fn predicate_is_read_only_empty_check(predicate: &str) -> bool {
+    let p = trim_balanced_outer_parens(predicate.trim());
+    if p.is_empty() || p.contains('!') {
+        return false;
+    }
+    p.ends_with(".is_empty()") || predicate_is_zero_comparison(p)
+}
+
+fn trim_balanced_outer_parens(mut s: &str) -> &str {
+    loop {
+        let trimmed = s.trim();
+        if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
+            return trimmed;
+        }
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if find_matching_paren(inner.as_bytes()).is_some() {
+            return trimmed;
+        }
+        s = inner;
+    }
+}
+
+fn predicate_is_zero_comparison(predicate: &str) -> bool {
+    let Some((left, right)) = predicate.split_once("==") else {
+        return false;
+    };
+    let left = left.trim();
+    let right = right.trim();
+    (right == "0" && read_only_zero_compare_operand(left))
+        || (left == "0" && read_only_zero_compare_operand(right))
+}
+
+fn read_only_zero_compare_operand(operand: &str) -> bool {
+    let op = operand.trim();
+    !op.is_empty()
+        && !op.contains('=')
+        && !op.contains('!')
+        && op
+            .bytes()
+            .all(|b| is_ident_byte(b) || b == b'.' || b == b'(' || b == b')')
+}
+
+fn then_arg_is_trivial_sentinel(arg: &str) -> bool {
+    let a = arg.trim();
+    if a.is_empty() {
+        return false;
+    }
+    if trivial_sentinel_key(a).is_some() || expression_is_empty_array_constructor(a) {
+        return true;
+    }
+    if let Some(body) = a.strip_prefix("||") {
+        let body = body.trim();
+        return trivial_sentinel_key(body).is_some() || expression_is_empty_array_constructor(body);
+    }
+    matches!(
+        a,
+        "Vec::new"
+            | "String::new"
+            | "HashMap::new"
+            | "BTreeMap::new"
+            | "HashSet::new"
+            | "BTreeSet::new"
+            | "VecDeque::new"
+            | "Default::default"
+    )
+}
+
+fn expression_is_empty_array_constructor(expr: &str) -> bool {
+    let compact: String = expr.chars().filter(|c| !c.is_whitespace()).collect();
+    compact.contains("::zeros(0)")
+        || compact.contains("::zeros((0,")
+        || compact.contains("::from_shape_vec((0,")
+        || compact.contains("::from_shape_fn((0,")
 }
 
 fn trivial_sentinel_key(expr: &str) -> Option<String> {
