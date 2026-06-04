@@ -9053,7 +9053,9 @@ impl BernoulliMarginalSlopeFamily {
             Self::single_primary_axis(dir_u, &cache.primary),
             Self::single_primary_axis(dir_v, &cache.primary),
         ) {
-            if let Some(tensors) = self.flex_axis_fourth_tensors_for_row(block_states, cache, row)? {
+            if let Some(tensors) =
+                self.flex_axis_fourth_tensors_for_row(block_states, cache, row)?
+            {
                 let scale = s_u * s_v;
                 let mut out = tensors.fourth[a][b].clone();
                 out.mapv_inplace(|value| value * scale);
