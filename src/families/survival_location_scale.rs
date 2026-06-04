@@ -10217,17 +10217,36 @@ pub(crate) fn fit_survival_location_scale_terms(
         // its exact-joint outer search crawled the flat time ridge forever.
         //
         // Seeding the weak default (`time_smooth_lambda ≈ 1e-2`) drops the
-        // exact-joint outer search into the *interior* of that ridge, where it
-        // crawls toward the strong-smoothing boundary one short, ill-conditioned
-        // step at a time and never terminates in reasonable time (#736, #735,
-        // #721). Seeding instead at strong smoothing places the search at the
-        // statistically correct end of the ridge — the affine baseline — where
-        // the surface is well conditioned and outer stationarity certifies
-        // immediately. This is a regime-specific *initialization*, not a cap or
-        // a tolerance change: the optimizer is still free to relax the time
-        // penalty if the data genuinely prefers a flexible baseline, and the
-        // I-spline basis dimensions are untouched, so any independent rebuild of
-        // the time basis (predictor reconstruction) is unaffected.
+        // inner REML search into the *interior* of that ridge, where it crawls
+        // toward the strong-smoothing boundary one short, ill-conditioned step
+        // at a time and never terminates in reasonable time (#736, #735, #721).
+        //
+        // The previous fix seeded the *interior* point ρ = 8. That did NOT cure
+        // the hang: the inner blockwise REML optimizer re-optimizes ρ_time
+        // freely from its seed against an inner per-coordinate ρ box bound of
+        // ±10 (`fit_custom_family_with_rho_prior`'s `.with_rho_bound(10.0)`).
+        // λ = exp(8) ≈ 3·10³ already sits INSIDE the "dead-flat region" that
+        // very bound exists to fence off (see the `with_rho_bound` rationale in
+        // `custom_family.rs`): with a flat REML gradient and near-singular
+        // curvature there, the optimizer wanders between ρ = 8 and the ρ = 10
+        // boundary one micro-step at a time and the retry-stall detector spins
+        // on the flat surface — producing the >200s no-iteration-log hang. A
+        // seed strictly interior to the box can never certify, because the
+        // unconstrained projected-gradient stationarity test it would need is
+        // exactly the test the flat ridge makes ill-posed.
+        //
+        // Seed instead at the inner ρ box bound itself. At the bound the
+        // box-constraint KKT condition (the REML gradient pushes further into
+        // strong smoothing, against an active bound) certifies stationarity
+        // *immediately* at iteration 0 for the time coordinate — there is no
+        // interior flat region left to wander, because the optimizer is pinned
+        // at the wall. λ = exp(10) ≈ 22k is the affine-nullspace limit (the
+        // bound's own rationale calls this "statistically indistinguishable
+        // from shrunk to nullspace"), i.e. exactly the parametric-AFT affine
+        // baseline. This is a regime-specific *initialization*, not a cap or a
+        // tolerance change: the I-spline basis dimensions are untouched, so any
+        // independent rebuild of the time basis (predictor reconstruction) is
+        // unaffected, and a genuinely flexible regime never reaches this branch.
         //
         // The seed is gated on `constant_scale` ONLY. The genuinely flexible
         // time-warp regime is a smooth scale (`noise_formula = s(...)`): a
@@ -10238,10 +10257,12 @@ pub(crate) fn fit_survival_location_scale_terms(
         // normally — only the TIME-WARP block's seed changes here.
         let constant_scale = log_sigma_boot_design.penalties.is_empty();
         if constant_scale {
-            // λ ≈ exp(8) ≈ 3·10³: deep in the strong-smoothing regime (the
-            // outer ρ box bound is 10), but still interior so the optimizer can
-            // move if a flexible improvement exists.
-            const PARAMETRIC_AFT_TIME_RHO_SEED: f64 = 8.0;
+            // ρ = 10 == the inner blockwise solver's per-coordinate ρ box bound
+            // (`custom_family.rs` `with_rho_bound(10.0)`). Seeding AT the bound
+            // (not interior, as the prior ρ = 8 seed did) makes the box
+            // constraint active from iteration 0, so outer stationarity
+            // certifies immediately instead of crawling the flat ridge.
+            const PARAMETRIC_AFT_TIME_RHO_SEED: f64 = 10.0;
             let mut time_seed = rho0.slice_mut(s![range.start..range.end]);
             for v in time_seed.iter_mut() {
                 *v = PARAMETRIC_AFT_TIME_RHO_SEED;
