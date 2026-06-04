@@ -189,14 +189,16 @@ fn margslope_flex_beta_equivalence_smoke() {
 /// hanging (the outer LAML Hessian re-walked every cubic partition cell per
 /// `(ρ-axis i, ρ-axis j)` pair, O(D²·n·cells·r²) per outer step). The
 /// axis-projected per-row tensor cache collapses that to one O(n·cells·r²)
-/// build reused across all pairs, so the debug regression covers the hang
-/// surface without spending the full production convergence tail.
+/// build reused across all pairs. `inner_max_cycles` is capped so the debug
+/// regression covers the hang surface without spending the full production
+/// convergence tail.
 #[test]
 fn flex_full_outer_completes_under_budget_683() {
     gam::init_parallelism();
     let n = 300usize;
     let problem = build_biobank_shape_problem(n);
     let options = BlockwiseFitOptions {
+        inner_max_cycles: 20,
         outer_max_iter: 3,
         compute_covariance: false,
         ..BlockwiseFitOptions::default()
@@ -206,7 +208,7 @@ fn flex_full_outer_completes_under_budget_683() {
         .expect("full-outer FLEX margslope fit must complete (gam#683)");
     let elapsed = start.elapsed();
     eprintln!(
-        "[MS-FLEX-683] n={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
+        "[MS-FLEX-683] n={} inner_max_cycles=20 elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
         n,
         elapsed.as_secs_f64(),
         timing.outer_iterations,
