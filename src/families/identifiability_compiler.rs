@@ -1193,6 +1193,24 @@ impl CompiledMap {
         self.raw_from_compiled.ncols()
     }
 
+    /// Reparameterise a raw design into compiled coordinates:
+    /// `X_compiled = X_raw · T` (`n × p_compiled`). Because the lift is
+    /// `β_raw = T β_compiled`, the compiled design predicts identically to the
+    /// raw design on every compiled coefficient: `X_compiled · θ = X_raw · (T θ)`.
+    /// Families that build directly in reduced coordinates feed this compiled
+    /// design (and the [`reduce_penalties_with_map`] penalties) to the solver;
+    /// the rank-deficient raw basis never reaches Newton.
+    pub fn reduce_design(&self, raw_design: &Array2<f64>) -> Result<Array2<f64>, String> {
+        if raw_design.ncols() != self.p_raw() {
+            return Err(format!(
+                "CompiledMap::reduce_design: raw_design has {} columns, expected p_raw {}",
+                raw_design.ncols(),
+                self.p_raw()
+            ));
+        }
+        Ok(fast_ab(raw_design, &self.raw_from_compiled))
+    }
+
     /// Lift a fitted compiled-width coefficient vector back to raw width:
     /// `β_raw = T · β_compiled`. This is the exact inverse direction of the
     /// quotient reduction — the reduced coordinates are what Newton/REML
@@ -2653,6 +2671,48 @@ mod tests {
         assert!(
             max_err < 1e-8,
             "lift round-trip error {max_err:e} (full-rank reduction must be exactly invertible)"
+        );
+    }
+
+    /// Design reparameterisation exactness: the compiled design predicts
+    /// identically to the raw design on every lifted coefficient, i.e.
+    /// `X_compiled · θ == X_raw · (T θ)`. This is the contract that lets a
+    /// family fit in reduced coordinates and still produce raw-design
+    /// predictions.
+    #[test]
+    fn compiled_map_reduce_design_matches_lifted_raw_predictor() {
+        let n = 23;
+        let p_a = 3;
+        let p_b = 3;
+        let mut x = Array2::from_shape_fn((n, p_a + p_b), |(i, j)| {
+            ((i as f64 + 1.0) * 0.41 + (j as f64 + 1.0) * 0.7).sin() + 0.05 * (i % 3) as f64
+        });
+        // Alias one B column onto an A column so the reduction is non-trivial.
+        for i in 0..n {
+            x[[i, p_a + 1]] = x[[i, 1]];
+        }
+        let w = Array1::from_shape_fn(n, |i| 0.6 + 0.4 * ((i as f64) * 0.25).cos().abs());
+        let (gh, gs) = k1_grams(&x, &w);
+        let raw_ranges = vec![0..p_a, p_a..(p_a + p_b)];
+        let map = compile_from_raw_grams(
+            &gh,
+            &gs,
+            &raw_ranges,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("compile");
+        let x_compiled = map.reduce_design(&x).expect("reduce_design");
+        assert_eq!(x_compiled.ncols(), map.p_compiled());
+        let theta = Array1::from_shape_fn(map.p_compiled(), |j| 0.3 * (j as f64) - 0.5);
+        let pred_compiled = x_compiled.dot(&theta);
+        let beta_raw = map.lift_coefficients(&theta).expect("lift");
+        let pred_raw = x.dot(&beta_raw);
+        let max_err = (&pred_compiled - &pred_raw)
+            .iter()
+            .fold(0.0_f64, |a, &v| a.max(v.abs()));
+        assert!(
+            max_err < 1e-9,
+            "compiled-design predictor diverges from lifted raw predictor: {max_err:e}"
         );
     }
 
