@@ -541,9 +541,9 @@ impl LatentZNormalization {
 /// pretend the score is N(0,1) anyway would distort the closed-form
 /// probit log-CDF kernel. The historical fallback (local- or
 /// global-empirical latent measure) is *mathematically correct* but
-/// triggers the expensive per-row intercept Newton solve in
-/// `empirical_rigid_neglog_jet` (16 directional jet coefficients × 6
-/// refinement passes per row); at biobank scale that is the dominant
+/// triggers the per-row intercept Newton solve in the empirical-grid
+/// closed-form kernels (`empirical_rigid_primary_grad_hess_closed_form`
+/// and its higher-order siblings); at biobank scale that is the dominant
 /// cost.
 ///
 /// **Rank-INT is exact under monotone re-parameterisation.** The Blom rankit assigns
