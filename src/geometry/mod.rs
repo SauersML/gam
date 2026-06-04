@@ -22,7 +22,7 @@ pub use latent_seed::laplacian_eigenmap_coords;
 pub use manifold::{GeometryError, GeometryResult, ManifoldSpec, RiemannianManifold};
 pub use optimizer::{RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion};
 pub use product::ProductManifold;
-pub use spd::SpdManifold;
+pub use spd::{SpdManifold, spd_frechet_mean};
 pub use sphere::SphereManifold;
 pub use stiefel::StiefelManifold;
 pub use torus::TorusManifold;
