@@ -18549,13 +18549,21 @@ fn joint_penalty_subspace_trace_parts(
     //   tr(h_proj_inverse · U_Sᵀ ∂Sλ U_S) = tr((H+Sλ)⁺ ∂Sλ) = ∂_ρ log|H+Sλ|₊,
     // since ∂Sλ/∂ρ is supported on range(Sλ). Both are derived from the same
     // materialized `M = H + Sλ` so they cannot drift apart.
-    let (logdet, h_proj_inverse) = match materialize_joint_hessian_source(
-        h_joint_unpen,
-        total,
-        "joint penalty subspace logdet",
-    ) {
-        Ok(h_dense) => {
-            let mut m = h_dense;
+    //
+    // Gate the full path on the dense byte budget so a genuine numerical
+    // failure inside materialization (non-finite Hessian) propagates rather than
+    // being silently downgraded to the projected path; only an over-budget
+    // dimension takes the fallback.
+    let full_path_within_budget =
+        ensure_exact_joint_hessian_dense_budget(total, "joint penalty subspace logdet").is_ok();
+    let (logdet, h_proj_inverse) = if full_path_within_budget {
+        let m_dense = materialize_joint_hessian_source(
+            h_joint_unpen,
+            total,
+            "joint penalty subspace logdet",
+        )?;
+        {
+            let mut m = m_dense;
             add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
             symmetrize_dense_in_place(&mut m);
             let (m_evals, m_evecs) = m.eigh(Side::Lower).map_err(|e| {
@@ -24312,7 +24320,12 @@ mod tests {
         let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
         let penalties = vec![s_lambda];
         let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
-        let drift = array![[0.7, -0.4, 11.0], [-0.4, 1.3, -5.0], [11.0, -5.0, 17.0]];
+        // `∂Sλ/∂ρ` is supported on range(Sλ) (here the leading 2×2 block, the
+        // positive-eigenvalue subspace of `S`); the trace kernel differentiates
+        // the FULL `log|H+Sλ|₊` only for such penalty-supported perturbations.
+        // Use a range(Sλ)-supported drift so the FD exercises the same contract
+        // the production `∂Sλ/∂ρ` does.
+        let drift = array![[0.7, -0.4, 0.0], [-0.4, 1.3, 0.0], [0.0, 0.0, 0.0]];
 
         let (logdet, kernel) = joint_penalty_subspace_trace_parts(
             &JointHessianSource::Dense(h.clone()),
@@ -24324,11 +24337,13 @@ mod tests {
         .expect("projection parts build");
         let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
         assert_eq!(kernel.u_s.ncols(), 2);
-        assert_relative_eq!(
-            logdet,
-            (5.0_f64 * 11.0 - 0.2_f64 * 0.2).ln(),
-            epsilon = 1e-12
-        );
+        // logdet is the FULL identifiable-subspace `log|H + Sλ|₊`. Here H + Sλ
+        // is full rank (3), so this is the ordinary log-det of
+        //   M = [[5, 0.2, 7], [0.2, 11, -3], [7, -3, 30]],  det(M) = 1056.4.
+        let m = array![[5.0, 0.2, 7.0], [0.2, 11.0, -3.0], [7.0, -3.0, 30.0]];
+        let (m_evals, _) = m.eigh(faer::Side::Lower).expect("M eigendecomposition");
+        let expected_logdet: f64 = m_evals.iter().map(|&v| v.ln()).sum();
+        assert_relative_eq!(logdet, expected_logdet, epsilon = 1e-10);
 
         let analytic = kernel.trace_projected_logdet(&drift);
         let eps = 1.0e-6;

@@ -4909,7 +4909,16 @@ pub struct PenaltySubspaceTrace {
 
 impl PenaltySubspaceTrace {
     /// Compute `tr(K · A)` where `K = U_S · H_proj⁻¹ · U_Sᵀ` — the
-    /// projected logdet kernel that matches `d log|U_Sᵀ H U_S|/dτ`.
+    /// projected logdet kernel.
+    ///
+    /// `H_proj⁻¹` is the range(Sλ) block of the FULL pseudo-inverse `(H+Sλ)⁺`
+    /// (its Schur reduction onto range(Sλ)). For a penalty-supported `A`
+    /// (`A = ∂Sλ/∂τ`, whose support lies in range(Sλ)), the identity
+    /// `U_S U_Sᵀ A U_S U_Sᵀ = A` gives
+    ///   `tr(K · A) = tr((H+Sλ)⁺ · A) = d log|H + Sλ|₊ / dτ`,
+    /// i.e. the kernel differentiates the FULL identifiable-subspace logdet
+    /// `log|H + Sλ|₊` (not the narrower `log|U_Sᵀ(H+Sλ)U_S|`). See
+    /// `joint_penalty_subspace_trace_parts`.
     ///
     /// Uses the identity `tr(K · A) = tr(H_proj⁻¹ · U_Sᵀ A U_S)` so the
     /// reduction runs on the r × r subspace rather than materializing K.

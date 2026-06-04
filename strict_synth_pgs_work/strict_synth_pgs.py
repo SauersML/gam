@@ -97,34 +97,6 @@ def run_child_fit(target, args: tuple, timeout: int) -> tuple[np.ndarray | None,
     return None, (payload["error_type"], payload["error"], payload["traceback"])
 
 
-def binary_gamfit_worker(train: pd.DataFrame, test: pd.DataFrame, pcs: list[str], centers: int, queue: mp.Queue) -> None:
-    try:
-        pcn = ", ".join(pcs)
-
-        def frame(source: pd.DataFrame, with_y: bool) -> pd.DataFrame:
-            vals = {"prs_z": source["PGS_z"].to_numpy(float)}
-            for pc in pcs:
-                vals[pc] = source[pc].to_numpy(float)
-            if with_y:
-                vals["event"] = source["y_binary"].to_numpy(float)
-            return pd.DataFrame(vals)
-
-        with quiet_native_output():
-            model = gamfit.fit(
-                frame(train, True),
-                f"event ~ matern({pcn}, centers={centers})",
-                family="bernoulli-marginal-slope",
-                link="probit",
-                z_column="prs_z",
-                logslope_formula=f"matern({pcn}, centers={centers})",
-            )
-            pred = model.predict(frame(test, False))
-        values = pred["mean"].to_numpy(float) if hasattr(pred, "columns") else np.asarray(pred).ravel()
-        queue.put({"ok": True, "prediction": values.tolist()})
-    except Exception as exc:
-        queue.put({"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:500], "traceback": traceback.format_exc()[-2000:]})
-
-
 def survival_gamfit_worker(train: pd.DataFrame, test: pd.DataFrame, pcs: list[str], centers: int, queue: mp.Queue) -> None:
     try:
         pcn = ", ".join(pcs)
@@ -388,11 +360,30 @@ def fit_binary_methods(df: pd.DataFrame, centers: int, timeout: int) -> tuple[li
         .predict_proba(test[linear_cols])[:, 1]
     )
 
-    pred, err = run_child_fit(binary_gamfit_worker, (train, test, pcs, centers), timeout)
-    if err is None and pred is not None:
-        predictions["gamfit"] = pred
-    elif err is not None:
-        issue_rows.append(issue_record_parts(df, "binary", "gamfit", *err))
+    pcn = ", ".join(pcs)
+
+    def gf_frame(frame: pd.DataFrame, with_y: bool) -> pd.DataFrame:
+        vals = {"prs_z": frame["PGS_z"].to_numpy(float)}
+        for pc in pcs:
+            vals[pc] = frame[pc].to_numpy(float)
+        if with_y:
+            vals["event"] = frame["y_binary"].to_numpy(float)
+        return pd.DataFrame(vals)
+
+    try:
+        with quiet_native_output():
+            model = gamfit.fit(
+                gf_frame(train, True),
+                f"event ~ matern({pcn}, centers={centers})",
+                family="bernoulli-marginal-slope",
+                link="probit",
+                z_column="prs_z",
+                logslope_formula=f"matern({pcn}, centers={centers})",
+            )
+            pred = model.predict(gf_frame(test, False))
+        predictions["gamfit"] = pred["mean"].to_numpy(float) if hasattr(pred, "columns") else np.asarray(pred).ravel()
+    except Exception as exc:
+        issue_rows.append(issue_record(df, "binary", "gamfit", exc))
 
     for method, prob in predictions.items():
         prob = np.clip(prob, 1e-6, 1 - 1e-6)
