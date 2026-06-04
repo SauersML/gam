@@ -3546,7 +3546,7 @@ mod tests {
         };
         assert!(matches!(
             spec.center_strategy,
-            CenterStrategy::EqualMass { num_centers: 3 }
+            CenterStrategy::FarthestPoint { num_centers: 3 }
         ));
     }
 

@@ -1027,7 +1027,7 @@ mod tests {
 
         // A Duchon descriptor without double_penalty (or with it false) is fine.
         let mut duchon_ok = duchon_spec();
-        apply_duchon(&mut duchon_ok, &obj(json!({"m": 2.0})), "x").unwrap();
+        apply_duchon(&mut duchon_ok, &obj(json!({"m": 2})), "x").unwrap();
     }
 
     #[test]

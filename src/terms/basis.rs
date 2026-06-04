@@ -33230,17 +33230,11 @@ mod tests {
         }
     }
 
-    /// Scale-free Duchon emits a single Primary penalty equal to the
-    /// Scale-free Duchon emits the operator triplet (mass + tension +
-    /// stiffness) with the q=0 mass *centered* so the constant direction
-    /// sits in the joint null space of all three candidates. That is the
-    /// data-density-weighted spring construction: the magnitude penalty
-    /// acts on deviations from the function's row-mean over collocation
-    /// sites rather than on the absolute level, so the intercept is the
-    /// only unpenalized coordinate and no bulk `∫f²` length-scale leaks
-    /// in. Three knobs cover level/slope/wiggle, the polyharmonic basis
-    /// stays scale-free, the equivalent-kernel bandwidth emerges from
-    /// `λ`-vs-data-density.
+    /// Scale-free Duchon emits the fully-wired Hilbert scale: native
+    /// reproducing-norm curvature (`Primary`), null-space shrinkage, and the
+    /// lower-order mass/tension dials. The q=0 mass is centered so the constant
+    /// direction remains in the joint null space; the null-space shrinkage
+    /// penalizes the affine trend while leaving the global mean free.
     #[test]
     fn test_build_scale_free_duchon_basis_centered_spring_triplet() {
         let data = array![
@@ -33262,20 +33256,21 @@ mod tests {
             boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penalties.len(), 3);
-        assert_eq!(out.penaltyinfo.len(), 3);
+        assert_eq!(out.penalties.len(), 4);
+        assert_eq!(out.penaltyinfo.len(), 4);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(
-            out.penaltyinfo[0].source,
-            PenaltySource::OperatorMass
-        ));
+        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
         assert!(matches!(
             out.penaltyinfo[1].source,
-            PenaltySource::OperatorTension
+            PenaltySource::DoublePenaltyNullspace
         ));
         assert!(matches!(
             out.penaltyinfo[2].source,
-            PenaltySource::OperatorStiffness
+            PenaltySource::OperatorMass
+        ));
+        assert!(matches!(
+            out.penaltyinfo[3].source,
+            PenaltySource::OperatorTension
         ));
     }
 
@@ -33319,15 +33314,13 @@ mod tests {
             "v_const must reproduce the constant function (d={}): max |Xv − 1| = {err}",
             data.ncols()
         );
-        let lambdas = [1.0_f64, 1.0_f64, 1.0_f64];
-        assert_eq!(
-            out.penalties.len(),
-            lambdas.len(),
-            "spec must emit exactly the operator triplet"
+        assert!(
+            out.penalties.len() >= 3,
+            "Duchon Hilbert scale must emit native curvature plus lower-order penalties"
         );
         let mut joint = Array2::<f64>::zeros((p, p));
-        for (lam, s) in lambdas.iter().zip(out.penalties.iter()) {
-            joint.scaled_add(*lam, s);
+        for s in out.penalties.iter() {
+            joint.scaled_add(1.0, s);
         }
         let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
         let s_v_norm = s_v.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -33361,13 +33354,13 @@ mod tests {
 
     /// The construction is supposed to deliver exactly *one* unpenalized
     /// direction — the constant function — across the joint penalty
-    /// `λ_0 S_0 + λ_1 S_1 + λ_2 S_2`. This test pins that property
+    /// summed joint penalty. This test pins that property
     /// directly: it computes the basis-coordinate vector `v_const` such
-    /// that `design · v_const ≡ 1`, asserts `(λ_0 S_0 + λ_1 S_1 + λ_2 S_2)
-    /// · v_const` is zero to working precision, and asserts that the joint
+    /// that `design · v_const ≡ 1`, asserts the joint penalty
+    /// maps it to zero to working precision, and asserts that the joint
     /// penalty has rank `p − 1` (so no second unpenalized direction sneaks
     /// in). Without this test we were only checking the cardinality and
-    /// labels of the triplet, not the actual joint-null-space dimension —
+    /// labels of the penalties, not the actual joint-null-space dimension —
     /// the property the centered-mass design exists to deliver.
     #[test]
     fn test_scale_free_duchon_joint_null_space_is_only_the_constant() {
@@ -34154,7 +34147,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_duchon_basis_linear_nullspace_uses_operator_penalty_triplet() {
+    fn test_build_duchon_basis_linear_nullspace_uses_full_hilbert_scale() {
         let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
         let spec = DuchonBasisSpec {
             periodic: None,
@@ -34168,19 +34161,20 @@ mod tests {
             boundary: OneDimensionalBoundary::Open,
         };
         let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
-        assert_eq!(out.penaltyinfo.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 4);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
-        assert!(matches!(
-            out.penaltyinfo[0].source,
-            PenaltySource::OperatorMass
-        ));
+        assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
         assert!(matches!(
             out.penaltyinfo[1].source,
-            PenaltySource::OperatorTension
+            PenaltySource::DoublePenaltyNullspace
         ));
         assert!(matches!(
             out.penaltyinfo[2].source,
-            PenaltySource::OperatorStiffness
+            PenaltySource::OperatorMass
+        ));
+        assert!(matches!(
+            out.penaltyinfo[3].source,
+            PenaltySource::OperatorTension
         ));
     }
 
@@ -34237,8 +34231,42 @@ mod tests {
         };
         let out = build_duchon_basis(data.view(), &spec)
             .expect("Linear-nullspace Duchon basis should build via collocation fallback");
-        assert_eq!(out.penaltyinfo.len(), 3);
+        assert_eq!(out.penaltyinfo.len(), 4);
         assert!(out.penaltyinfo.iter().all(|info| info.active));
+    }
+
+    #[test]
+    fn hybrid_duchon_fractional_default_d4_rejects_realized_nonfinite_kernel() {
+        let data = array![
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 0.0, 0.0],
+            [0.0, 1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ];
+        let spec = DuchonBasisSpec {
+            center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+            length_scale: Some(1.0),
+            power: 1.5,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            periodic: None,
+            boundary: OneDimensionalBoundary::Open,
+        };
+        let err = build_duchon_basis(data.view(), &spec)
+            .expect_err("hybrid d=4 fractional power must reject before non-finite Gram");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Duchon pointwise kernel values require 2*(p+s) > dimension"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
