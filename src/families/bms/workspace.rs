@@ -12863,6 +12863,19 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .max(self.coefficient_gradient_cost(specs));
         let dense_available = self.outer_hyper_hessian_dense_available(specs);
         let hvp_available = self.outer_hyper_hessian_hvp_available(specs);
+        if flex_active {
+            if log_exact_work(self.y.len()) {
+                log::info!(
+                    "[BMS outer-derivative-policy] n={} p={} flex=true order=First reason=flex-outer-hessian-fourth-order-cost dense_available={} outer_hvp_available={} coefficient_work={}",
+                    self.y.len(),
+                    specs.iter().map(|spec| spec.design.ncols()).sum::<usize>(),
+                    dense_available,
+                    hvp_available,
+                    coefficient_work,
+                );
+            }
+            return ExactOuterDerivativeOrder::First;
+        }
         if !dense_available && !hvp_available {
             if log_exact_work(self.y.len()) {
                 log::info!(
