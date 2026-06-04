@@ -3255,16 +3255,6 @@ pub trait CustomFamily {
         Ok(None)
     }
 
-    /// Whether pseudo-Laplace traces and sensitivities may use the positive
-    /// curvature subspace when the exact mode Hessian is only semidefinite.
-    ///
-    /// Families that legitimately optimize to boundary regimes with exact
-    /// zero-curvature directions can opt in; truly indefinite Hessians are
-    /// still rejected.
-    fn exact_newton_allows_semidefinitehessian(&self) -> bool {
-        false
-    }
-
     /// How the penalized Hessian's log-determinant and its derivatives
     /// should handle eigenvalues below the numerical-stability floor.
     ///
@@ -11614,17 +11604,12 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
 ///   biased finite number;
 /// - sum `Σ_{λ > tol} log λ` — the exact pseudo-logdet on the positive
 ///   eigenspace, which is `C∞` in ρ because the positive eigenspace of a PSD
-///   `S(ρ)=Σ e^{ρ_k} S_k` is structurally fixed.
-///
-/// `allow_semidefinite` now only governs the near-zero band `[−tol, tol]`: the
-/// semidefinite mode tolerates a structural null space (those modes are simply
-/// not in `range`, matching the projected `tr` derivative), while the strict
-/// mode additionally **rejects** a rank-deficient `H + S_λ` (any eigenvalue in
-/// the band) because a strict-PD family expects a full-rank coefficient
-/// Hessian and a silent rank drop would again desync value from gradient.
-fn strict_logdet_spd_with_semidefinite_option(
+///   `S(ρ)=Σ e^{ρ_k} S_k` is structurally fixed. A near-zero band `[−tol, tol]`
+///   (a structural null space) is simply not in `range` and contributes no
+///   term, matching the projected `tr` derivative; a near-singular-but-positive
+///   curvature is accepted exactly as the historical Cholesky strict path did.
+fn strict_exact_pseudo_logdet(
     matrix: &Array2<f64>,
-    allow_semidefinite: bool,
     accumulation_depth: usize,
 ) -> Result<f64, String> {
     let mut sym = matrix.clone();
@@ -11786,7 +11771,6 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         return Ok((0.0, 0.0));
     }
     let strict_spd = use_exact_newton_strict_spd(family);
-    let allow_semidefinite = strict_spd && family.exact_newton_allows_semidefinitehessian();
     refresh_all_block_etas(family, specs, states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
@@ -11903,11 +11887,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 .scaled_add(curvature.rho_curvature_scale, s_lambda);
         }
         let logdet_h_scaled = if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(
-                &h_joint,
-                allow_semidefinite,
-                joint_observation_count(states),
-            )?
+            strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
         } else {
             stable_logdet_with_ridge_policy(
                 &h_joint,
@@ -11962,11 +11942,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 .scaled_add(1.0, s_lambda);
         }
         let logdet_h_total = if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(
-                &h_joint,
-                allow_semidefinite,
-                joint_observation_count(states),
-            )?
+            strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
         } else {
             stable_logdet_with_ridge_policy(&h_joint, options.ridge_floor, options.ridge_policy)?
         };
@@ -11989,11 +11965,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 .scaled_add(1.0, s_lambda);
         }
         let logdet_h_total = if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(
-                &h_joint,
-                allow_semidefinite,
-                joint_observation_count(states),
-            )?
+            strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
         } else {
             stable_logdet_with_ridge_policy(&h_joint, options.ridge_floor, options.ridge_policy)?
         };
@@ -12046,11 +12018,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         let mut h = xtwx;
         h += s_lambda;
         logdet_h_total += if strict_spd {
-            strict_logdet_spd_with_semidefinite_option(
-                &h,
-                allow_semidefinite,
-                joint_observation_count(states),
-            )?
+            strict_exact_pseudo_logdet(&h, joint_observation_count(states))?
         } else {
             stable_logdet_with_ridge_policy(&h, options.ridge_floor, options.ridge_policy)?
         };
