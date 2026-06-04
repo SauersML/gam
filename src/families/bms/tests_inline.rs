@@ -6322,211 +6322,177 @@ mod tests {
         assert!((calibrated - target_mu).abs() <= 1e-10);
     }
 
-    /// The §2 implicit-function-theorem closed form for the rigid
-    /// empirical-grid kernel must reproduce — to tight tolerance — the per-row
-    /// negative log-likelihood, primary gradient, and primary Hessian that the
-    /// `empirical_rigid_neglog_jet` `MultiDirJet` path (six Newton
-    /// intercept-refinement passes) produced before it was replaced in
-    /// `rigid_row_kernel_eval`. Pinning the two paths together means a sign or
-    /// algebra regression in the analytic intercept derivatives breaks here.
-    #[test]
-    fn empirical_rigid_closed_form_matches_multidir_jet() {
+    /// Builds a 3-row family on a global empirical latent grid plus a closure
+    /// returning the closed-form `(neglog, grad, hess)` as a function of
+    /// `(m = marginal_eta, g = slope)`. Shared by the finite-difference
+    /// validation tests below.
+    fn empirical_rigid_fd_fixture() -> (
+        BernoulliMarginalSlopeFamily,
+        EmpiricalZGrid,
+        [f64; 3],
+        [f64; 3],
+    ) {
         let grid_nodes = array![-1.15, -1.05, -0.95, -0.8, -0.65, -0.45, 0.1, 0.9, 2.4, 4.7];
         let grid_w = array![1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.5, 0.35, 0.2, 0.1];
-        let grid =
-            build_empirical_z_grid(&grid_nodes, &grid_w, 7, "closed-form vs jet grid").expect("grid");
-
-        // Global empirical latent measure → every row routes through the
-        // empirical path. Three rows span both event labels and a non-unit
-        // observation weight.
-        let row_z = array![0.3, -0.8, 1.6];
+        let grid = build_empirical_z_grid(&grid_nodes, &grid_w, 7, "cf vs fd grid").expect("grid");
         let family = BernoulliMarginalSlopeFamily {
             y: Arc::new(array![1.0, 0.0, 1.0]),
             weights: Arc::new(array![1.0, 0.7, 1.3]),
-            z: Arc::new(row_z.clone()),
+            z: Arc::new(array![0.3, -0.8, 1.6]),
             latent_measure: LatentMeasureKind::GlobalEmpirical { grid: grid.clone() },
             gaussian_frailty_sd: Some(0.82),
             ..default_test_family()
         };
+        (family, grid, [0.25, -0.4, 0.7], [1.35, 0.9, 1.1])
+    }
 
-        let marginal_etas = [0.25, -0.4, 0.7];
-        let slopes = [1.35, 0.9, 1.1];
-        for row in 0..row_z.len() {
-            let marginal_eta = marginal_etas[row];
-            let marginal = family.marginal_link_map(marginal_eta).expect("link map");
-            let slope = slopes[row];
-
-            let (neglog_cf, grad_cf, hess_cf) = family
+    /// Validates the §2 implicit-function-theorem closed form for the rigid
+    /// empirical-grid kernel against central finite differences of its own
+    /// exact row negative log-likelihood (ground truth, not a derivative): FD
+    /// of `nll` reproduces the analytic gradient, and FD of the gradient the
+    /// Hessian. An independent check sharing no derivative-formula code — a
+    /// sign or algebra slip in any intercept derivative breaks it.
+    #[test]
+    fn empirical_rigid_grad_hess_match_finite_differences() {
+        let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
+        let cf = |row: usize, m: f64, g: f64| {
+            let marginal = family.marginal_link_map(m).expect("link map");
+            family
                 .empirical_rigid_primary_grad_hess_closed_form(
                     row,
                     marginal,
-                    slope,
+                    g,
                     &grid.nodes,
                     &grid.weights,
                 )
-                .expect("closed form");
+                .expect("closed form")
+        };
+        let h = 1e-4;
+        for row in 0..3 {
+            let (m, g) = (marginal_etas[row], slopes[row]);
+            let (_, grad_cf, hess_cf) = cf(row, m, g);
 
-            let jet = family
-                .empirical_rigid_neglog_jet(
-                    row,
-                    marginal_eta,
-                    marginal,
-                    slope,
-                    &[[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
-                    &grid.nodes,
-                    &grid.weights,
-                )
-                .expect("jet");
-            let neglog_jet = jet.coeff(0);
-            let grad_jet = [jet.coeff(1), jet.coeff(2)];
-            let hess_jet = [
-                [jet.coeff(1 | 4), jet.coeff(1 | 2)],
-                [jet.coeff(1 | 2), jet.coeff(2 | 8)],
+            // gradient vs FD of nll
+            let grad_fd = [
+                (cf(row, m + h, g).0 - cf(row, m - h, g).0) / (2.0 * h),
+                (cf(row, m, g + h).0 - cf(row, m, g - h).0) / (2.0 * h),
             ];
-
-            assert!(
-                (neglog_cf - neglog_jet).abs() <= 1e-8,
-                "row {row}: neglog closed-form {neglog_cf} vs jet {neglog_jet}"
-            );
             for k in 0..2 {
                 assert!(
-                    (grad_cf[k] - grad_jet[k]).abs() <= 1e-7,
-                    "row {row}: grad[{k}] closed-form {} vs jet {}",
+                    (grad_cf[k] - grad_fd[k]).abs() <= 1e-5 + 1e-4 * grad_cf[k].abs(),
+                    "row {row}: grad[{k}] closed-form {} vs fd {}",
                     grad_cf[k],
-                    grad_jet[k]
+                    grad_fd[k]
                 );
-                for l in 0..2 {
-                    assert!(
-                        (hess_cf[k][l] - hess_jet[k][l]).abs() <= 1e-6,
-                        "row {row}: hess[{k}][{l}] closed-form {} vs jet {}",
-                        hess_cf[k][l],
-                        hess_jet[k][l]
-                    );
-                }
+            }
+            // Hessian vs FD of gradient
+            let (gpm, gmm) = (cf(row, m + h, g).1, cf(row, m - h, g).1);
+            let (gpg, gmg) = (cf(row, m, g + h).1, cf(row, m, g - h).1);
+            for k in 0..2 {
+                let fd0 = (gpm[k] - gmm[k]) / (2.0 * h);
+                let fd1 = (gpg[k] - gmg[k]) / (2.0 * h);
+                assert!(
+                    (hess_cf[0][k] - fd0).abs() <= 1e-5 + 1e-4 * hess_cf[0][k].abs(),
+                    "row {row}: hess[0][{k}] closed-form {} vs fd {}",
+                    hess_cf[0][k],
+                    fd0
+                );
+                assert!(
+                    (hess_cf[1][k] - fd1).abs() <= 1e-5 + 1e-4 * hess_cf[1][k].abs(),
+                    "row {row}: hess[1][{k}] closed-form {} vs fd {}",
+                    hess_cf[1][k],
+                    fd1
+                );
             }
         }
     }
 
-    /// Higher-order analogue of [`empirical_rigid_closed_form_matches_multidir_jet`]:
-    /// the §2 IFT closed forms for the rigid empirical-grid **third** and
-    /// **fourth** derivative tensors must reproduce, component by component, the
-    /// 6- and 8-direction `empirical_rigid_neglog_jet` tensors they replaced in
-    /// `rigid_row_third_full` / `rigid_row_fourth_full`. Reading canonical
-    /// symmetric entries directly (`T[0][0][0]=∂³_mmm`, … `T[1][1][1]=∂³_ggg`)
-    /// makes a sign or algebra slip in any single intercept derivative localise
-    /// to one assertion.
+    /// Higher-order analogue: the §2 IFT closed forms for the rigid
+    /// empirical-grid **third** and **fourth** derivative tensors must equal the
+    /// central finite differences of the analytic level below — FD of the
+    /// Hessian reproduces the third tensor, FD of the third the fourth. Every
+    /// level is thus tied transitively to the exact negative log-likelihood
+    /// (validated in `empirical_rigid_grad_hess_match_finite_differences`); a
+    /// sign or algebra slip in any single intercept derivative localises to one
+    /// component assertion.
     #[test]
-    fn empirical_rigid_higher_order_closed_form_matches_jet() {
-        let grid_nodes = array![-1.15, -1.05, -0.95, -0.8, -0.65, -0.45, 0.1, 0.9, 2.4, 4.7];
-        let grid_w = array![1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.5, 0.35, 0.2, 0.1];
-        let grid = build_empirical_z_grid(&grid_nodes, &grid_w, 7, "higher-order cf vs jet grid")
-            .expect("grid");
-
-        let row_z = array![0.3, -0.8, 1.6];
-        let family = BernoulliMarginalSlopeFamily {
-            y: Arc::new(array![1.0, 0.0, 1.0]),
-            weights: Arc::new(array![1.0, 0.7, 1.3]),
-            z: Arc::new(row_z.clone()),
-            latent_measure: LatentMeasureKind::GlobalEmpirical { grid: grid.clone() },
-            gaussian_frailty_sd: Some(0.82),
-            ..default_test_family()
+    fn empirical_rigid_higher_order_match_finite_differences() {
+        let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
+        let hess = |row: usize, m: f64, g: f64| {
+            let marginal = family.marginal_link_map(m).expect("link map");
+            family
+                .empirical_rigid_primary_grad_hess_closed_form(
+                    row,
+                    marginal,
+                    g,
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("closed form")
+                .2
         };
+        let third = |row: usize, m: f64, g: f64| {
+            let marginal = family.marginal_link_map(m).expect("link map");
+            family
+                .empirical_rigid_third_full_closed_form(row, marginal, g, &grid.nodes, &grid.weights)
+                .expect("third closed form")
+        };
+        let fourth = |row: usize, m: f64, g: f64| {
+            let marginal = family.marginal_link_map(m).expect("link map");
+            family
+                .empirical_rigid_fourth_full_closed_form(row, marginal, g, &grid.nodes, &grid.weights)
+                .expect("fourth closed form")
+        };
+        let h = 1e-4;
+        for row in 0..3 {
+            let (m, g) = (marginal_etas[row], slopes[row]);
 
-        let marginal_etas = [0.25, -0.4, 0.7];
-        let slopes = [1.35, 0.9, 1.1];
-        let dirs6 = [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-        ];
-        let dirs8 = [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 0.0],
-            [0.0, 1.0],
-        ];
-        for row in 0..row_z.len() {
-            let marginal_eta = marginal_etas[row];
-            let marginal = family.marginal_link_map(marginal_eta).expect("link map");
-            let slope = slopes[row];
-
-            // ── Third order ──
-            let cf3 = family
-                .empirical_rigid_third_full_closed_form(
-                    row,
-                    marginal,
-                    slope,
-                    &grid.nodes,
-                    &grid.weights,
-                )
-                .expect("third closed form");
-            let jet3 = family
-                .empirical_rigid_neglog_jet(
-                    row,
-                    marginal_eta,
-                    marginal,
-                    slope,
-                    &dirs6,
-                    &grid.nodes,
-                    &grid.weights,
-                )
-                .expect("third jet");
-            // (component, closed-form entry, jet mask)
-            let third_checks = [
-                ("mmm", cf3[0][0][0], 1 | 4 | 16),
-                ("mmg", cf3[0][0][1], 1 | 4 | 2),
-                ("mgg", cf3[0][1][1], 1 | 2 | 8),
-                ("ggg", cf3[1][1][1], 2 | 8 | 32),
-            ];
-            for (name, cf, mask) in third_checks {
-                let jet = jet3.coeff(mask);
-                assert!(
-                    (cf - jet).abs() <= 1e-5 + 1e-5 * jet.abs(),
-                    "row {row}: third {name} closed-form {cf} vs jet {jet}"
-                );
+            // third[i][j][k] vs ∂_i of hess[j][k]
+            let t_cf = third(row, m, g);
+            let (hpm, hmm) = (hess(row, m + h, g), hess(row, m - h, g));
+            let (hpg, hmg) = (hess(row, m, g + h), hess(row, m, g - h));
+            for j in 0..2 {
+                for k in 0..2 {
+                    let fd0 = (hpm[j][k] - hmm[j][k]) / (2.0 * h);
+                    let fd1 = (hpg[j][k] - hmg[j][k]) / (2.0 * h);
+                    assert!(
+                        (t_cf[0][j][k] - fd0).abs() <= 1e-4 + 1e-4 * t_cf[0][j][k].abs(),
+                        "row {row}: third[0][{j}][{k}] cf {} vs fd {}",
+                        t_cf[0][j][k],
+                        fd0
+                    );
+                    assert!(
+                        (t_cf[1][j][k] - fd1).abs() <= 1e-4 + 1e-4 * t_cf[1][j][k].abs(),
+                        "row {row}: third[1][{j}][{k}] cf {} vs fd {}",
+                        t_cf[1][j][k],
+                        fd1
+                    );
+                }
             }
 
-            // ── Fourth order ──
-            let cf4 = family
-                .empirical_rigid_fourth_full_closed_form(
-                    row,
-                    marginal,
-                    slope,
-                    &grid.nodes,
-                    &grid.weights,
-                )
-                .expect("fourth closed form");
-            let jet4 = family
-                .empirical_rigid_neglog_jet(
-                    row,
-                    marginal_eta,
-                    marginal,
-                    slope,
-                    &dirs8,
-                    &grid.nodes,
-                    &grid.weights,
-                )
-                .expect("fourth jet");
-            let fourth_checks = [
-                ("mmmm", cf4[0][0][0][0], 1 | 4 | 16 | 64),
-                ("mmmg", cf4[0][0][0][1], 1 | 4 | 16 | 2),
-                ("mmgg", cf4[0][0][1][1], 1 | 4 | 2 | 8),
-                ("mggg", cf4[0][1][1][1], 1 | 2 | 8 | 32),
-                ("gggg", cf4[1][1][1][1], 2 | 8 | 32 | 128),
-            ];
-            for (name, cf, mask) in fourth_checks {
-                let jet = jet4.coeff(mask);
-                assert!(
-                    (cf - jet).abs() <= 1e-4 + 1e-4 * jet.abs(),
-                    "row {row}: fourth {name} closed-form {cf} vs jet {jet}"
-                );
+            // fourth[i][j][k][l] vs ∂_i of third[j][k][l]
+            let f_cf = fourth(row, m, g);
+            let (tpm, tmm) = (third(row, m + h, g), third(row, m - h, g));
+            let (tpg, tmg) = (third(row, m, g + h), third(row, m, g - h));
+            for j in 0..2 {
+                for k in 0..2 {
+                    for l in 0..2 {
+                        let fd0 = (tpm[j][k][l] - tmm[j][k][l]) / (2.0 * h);
+                        let fd1 = (tpg[j][k][l] - tmg[j][k][l]) / (2.0 * h);
+                        assert!(
+                            (f_cf[0][j][k][l] - fd0).abs() <= 1e-3 + 1e-3 * f_cf[0][j][k][l].abs(),
+                            "row {row}: fourth[0][{j}][{k}][{l}] cf {} vs fd {}",
+                            f_cf[0][j][k][l],
+                            fd0
+                        );
+                        assert!(
+                            (f_cf[1][j][k][l] - fd1).abs() <= 1e-3 + 1e-3 * f_cf[1][j][k][l].abs(),
+                            "row {row}: fourth[1][{j}][{k}][{l}] cf {} vs fd {}",
+                            f_cf[1][j][k][l],
+                            fd1
+                        );
+                    }
+                }
             }
         }
     }
