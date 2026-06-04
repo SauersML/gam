@@ -486,6 +486,25 @@ pub fn build_termspec(
                 if is_sz {
                     inner_options.remove("bs");
                     inner_options.remove("type");
+                    // mgcv's `bs="sz"` is a SINGLE-penalty smooth: the marginal
+                    // wiggliness penalty is replicated across levels and the
+                    // marginal's polynomial null space (the per-level linear
+                    // trend, once centred) is left UNPENALISED, exactly as the
+                    // default thin-plate marginal leaves its null space free.
+                    // gam's 1-D smooth otherwise defaults to a double penalty
+                    // (an added null-space shrinkage ridge, mgcv `select=TRUE`
+                    // semantics). Replicated across the sz deviation blocks that
+                    // extra ridge shrinks every level's linear-trend deviation
+                    // toward zero — signal that the truth carries (e.g. the
+                    // linear projection of sin(2*pi*x) is non-zero) — so REML
+                    // over-shrinks the per-level deviations and truth recovery
+                    // degrades relative to mgcv's free null space. Force the
+                    // inner marginal to a single penalty so the per-level null
+                    // space stays free, matching mgcv's sz construction. An
+                    // explicit user `double_penalty=` still wins.
+                    inner_options
+                        .entry("double_penalty".to_string())
+                        .or_insert_with(|| "false".to_string());
                 }
                 // Pop the shape constraint before `build_smooth_basis` runs so
                 // it never reaches the per-kind `validate_known_options`
