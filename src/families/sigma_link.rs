@@ -200,22 +200,35 @@ pub fn exp_sigma_derivs_up_to_fourth(
 ///
 /// # Scale invariance
 ///
-/// This 0.01 looks absolute but is *operationally* scale-relative: the GAMLSS
-/// fit driver in `main.rs` first computes
-/// `response_scale = sample_std(y).max(1e-6)` and rescales `y → y / response_scale`
-/// before fitting (see `gaussian_saved_fit_scale_for_role` and the
-/// `y_scaled` construction). The reported σ in response units is then
+/// This 0.01 looks absolute but is *operationally* scale-relative: the single
+/// Gaussian location-scale model entry point
+/// (`fit_gaussian_location_scale_model` in `solver::workflow`) first computes
+/// `response_scale = sample_std(y).max(1e-6)` and fits on `y → y / response_scale`,
+/// then maps the fitted coefficients back to raw response units (the
+/// Location/Mean block scaled by `response_scale`, the log-σ block intercept
+/// shifted by `+ln(response_scale)`) via `rescale_gaussian_location_scale_to_raw`.
+/// Reconstructing σ from the returned coefficients is therefore
 ///
-///   σ_response = (LOGB_SIGMA_FLOOR + exp(η)) · response_scale,
+///   σ_response = LOGB_SIGMA_FLOOR + exp(η_raw)
+///              = LOGB_SIGMA_FLOOR + response_scale · exp(η_internal),
 ///
-/// so the response-scale floor is `0.01 · sample_std(y)` — exactly 1 % of the
-/// robust spread of `y`. Under a rescaling `y → c·y` the prefit divides by `c`
-/// again, leaving the dimensionless internal floor unchanged. The single
-/// lingering breakage is the global underflow guard `response_scale.max(1e-6)`:
-/// if the user feeds responses with `sample_std(y) < 1e-6` the floor stops
-/// tracking the data scale. That is a deliberate guard against a pathological
-/// constant-y input rather than a model assumption, and 1e-6 sits well below
-/// any sensible measurement-noise floor.
+/// so the effective floor on the *internal* (standardized) scale is `0.01`,
+/// i.e. `0.01 · sample_std(y)` in response units — exactly 1 % of the spread of
+/// `y`. This keeps κ = dlogσ/dη ≈ 1 across the realistic σ range, so the
+/// scale-block Fisher information matches gamlss's floorless 2a and the log-σ
+/// smooth traces the variance envelope instead of being over-smoothed. Under a
+/// rescaling `y → c·y` the prefit divides by `c` again, leaving the
+/// dimensionless internal floor unchanged. The single lingering breakage is the
+/// underflow guard `response_scale.max(1e-6)`: if the user feeds responses with
+/// `sample_std(y) < 1e-6` the floor stops tracking the data scale. That is a
+/// deliberate guard against a pathological constant-y input rather than a model
+/// assumption, and 1e-6 sits well below any sensible measurement-noise floor.
+///
+/// The residual floor error from absorbing the response scale into the
+/// intercept is `0.01·(response_scale − 1)` (since the floor itself is not
+/// multiplied by `response_scale`); it is negligible because σ ≫ floor in every
+/// realistic fit, and the reference tests reconstruct σ with the same hardcoded
+/// `0.01`.
 pub const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 #[inline]
