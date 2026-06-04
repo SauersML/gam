@@ -162,13 +162,18 @@ xgrid = np.array([{grid_literal}], dtype=float)
 # smooth by the GCV-selected penalty weight (smoothness, not column count, is
 # the method-comparable knob).
 bs = BSplines(x1.reshape(-1, 1), df=[10], degree=[3])
-# The grid basis must use the SAME knots/degree as the training smoother so the
-# fitted penalized coefficients evaluate correctly off-sample.
-bs_grid = bs.transform(xgrid.reshape(-1, 1))
 
 def fit_mean(link):
     fam = sm.families.Binomial(link=link)
     gam = GLMGam(y, smoother=bs, alpha=[1.0], family=fam)
+    # select_penweight() reads `self.scale` (and re-fits internally to score each
+    # candidate penalty under the chosen criterion). A freshly-constructed GLMGam
+    # has NO `scale` attribute -- it is created only inside `.fit()` via
+    # estimate_scale -- so calling select_penweight() on an unfit model raises
+    # `AttributeError: 'GLMGam' object has no attribute 'scale'`. (For Binomial
+    # the dispersion is fixed at 1.0, but the attribute must still exist.) Fit
+    # once to populate `self.scale` before the penalty search.
+    gam.fit()
     # GCV search over the penalty weight, then refit at the optimum. The return
     # shape of select_penweight() has varied across statsmodels versions (bare
     # alpha array vs (alpha, ...) tuple); normalize to the alpha vector.
@@ -177,10 +182,15 @@ def fit_mean(link):
     alpha_opt = np.asarray(alpha_opt, dtype=float).reshape(-1)
     gam = GLMGam(y, smoother=bs, alpha=list(alpha_opt), family=fam)
     res = gam.fit()
-    # Predict the mean mu = g^{{-1}}(eta) at the grid using the grid basis. The
-    # GLMGam design is [intercept | smoother columns]; predict(exog_smooth=...)
-    # prepends the intercept internally.
-    return np.asarray(res.predict(exog_smooth=bs_grid), dtype=float)
+    # Predict the mean mu = g^{{-1}}(eta) at the grid. With the default
+    # transform=True, predict(exog_smooth=...) expects the RAW covariate values
+    # and builds the smooth basis from them via smoother.transform() using the
+    # SAME knots/degree as the training smoother (so passing a pre-transformed
+    # basis would double-transform). The smoother columns prepend the intercept
+    # internally, returning the mean mu directly.
+    return np.asarray(
+        res.predict(exog_smooth=xgrid.reshape(-1, 1)), dtype=float
+    )
 
 emit("mu_probit", fit_mean(sm.families.links.Probit()))
 emit("mu_logit", fit_mean(sm.families.links.Logit()))
