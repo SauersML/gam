@@ -3158,7 +3158,7 @@ mod tests {
         );
         assert_eq!(
             large_flex_hessian,
-            crate::solver::outer_strategy::DeclaredHessianForm::None
+            crate::solver::outer_strategy::DeclaredHessianForm::Unavailable
         );
 
         let mut large_rigid_family = large_flex_family.clone();
