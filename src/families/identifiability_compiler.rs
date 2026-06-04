@@ -2762,14 +2762,17 @@ mod tests {
             .expect("reduce penalties");
         // For random compiled θ, raw β = T θ. Raw energy for block b is
         // β[range_b]ᵀ S_b β[range_b]; reduced energy is θᵀ S_reduced_b θ.
-        let theta =
-            Array1::from_shape_fn(map.p_compiled(), |j| 0.6 * (j as f64) - 0.3 + 0.05 * (j % 2) as f64);
+        let theta = Array1::from_shape_fn(map.p_compiled(), |j| {
+            0.6 * (j as f64) - 0.3 + 0.05 * (j % 2) as f64
+        });
         let beta = map.lift_coefficients(&theta).expect("lift");
         for (block_idx, s_raw) in [(0usize, &s_a), (1usize, &s_b)] {
             let range = &map.raw_block_ranges[block_idx];
             let beta_b = beta.slice(s![range.start..range.end]).to_owned();
             let raw_energy = beta_b.dot(&s_raw.dot(&beta_b));
-            let s_reduced = reduced[block_idx].as_ref().expect("reduced penalty present");
+            let s_reduced = reduced[block_idx]
+                .as_ref()
+                .expect("reduced penalty present");
             let reduced_energy = theta.dot(&s_reduced.dot(&theta));
             assert!(
                 (raw_energy - reduced_energy).abs() < 1e-8 * raw_energy.abs().max(1.0),

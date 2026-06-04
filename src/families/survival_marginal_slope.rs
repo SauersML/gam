@@ -19745,6 +19745,68 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     Ok(())
 }
 
+fn install_time_nullspace_shrinkage_penalty(
+    time_block: &mut TimeBlockInput,
+) -> Result<bool, String> {
+    let p = time_block.design_exit.ncols();
+    if p == 0 || time_block.penalties.is_empty() {
+        return Ok(false);
+    }
+    if time_block.nullspace_dims.len() != time_block.penalties.len() {
+        return Err(format!(
+            "survival-marginal-slope time_block nullspace_dims length {} does not match penalties {}",
+            time_block.nullspace_dims.len(),
+            time_block.penalties.len(),
+        ));
+    }
+
+    let mut aggregate = Array2::<f64>::zeros((p, p));
+    for (idx, penalty) in time_block.penalties.iter().enumerate() {
+        if penalty.nrows() != p || penalty.ncols() != p {
+            return Err(format!(
+                "survival-marginal-slope time_block penalty {idx} must be {p}x{p}, got {}x{}",
+                penalty.nrows(),
+                penalty.ncols(),
+            ));
+        }
+        let scale = penalty
+            .iter()
+            .try_fold(0.0_f64, |acc, &value| {
+                value.is_finite().then_some(acc.max(value.abs()))
+            })
+            .ok_or_else(|| {
+                format!(
+                    "survival-marginal-slope time_block penalty {idx} contains non-finite values"
+                )
+            })?;
+        if scale > 0.0 {
+            ndarray::Zip::from(&mut aggregate)
+                .and(penalty)
+                .for_each(|agg, &value| *agg += value / scale);
+        }
+    }
+
+    let Some(shrinkage) = crate::terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
+        .map_err(|err| format!("survival-marginal-slope time_block nullspace shrinkage: {err}"))?
+    else {
+        return Ok(false);
+    };
+    if shrinkage.sym_penalty.nrows() != p || shrinkage.sym_penalty.ncols() != p {
+        return Err(format!(
+            "survival-marginal-slope time_block nullspace shrinkage penalty must be {p}x{p}, got {}x{}",
+            shrinkage.sym_penalty.nrows(),
+            shrinkage.sym_penalty.ncols(),
+        ));
+    }
+    time_block.penalties.push(shrinkage.sym_penalty);
+    time_block.nullspace_dims.push(0);
+    log::info!(
+        "[survival-marginal-slope] added time_block nullspace shrinkage penalty (p={p}, penalties={})",
+        time_block.penalties.len(),
+    );
+    Ok(true)
+}
+
 fn concatenate_term_specs(specs: &[TermCollectionSpec]) -> TermCollectionSpec {
     let mut out = TermCollectionSpec {
         linear_terms: Vec::new(),
@@ -20235,6 +20297,7 @@ pub fn fit_survival_marginal_slope_terms(
         }
         .into());
     }
+    install_time_nullspace_shrinkage_penalty(&mut spec.time_block)?;
     let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
@@ -22576,6 +22639,50 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: Some(Array1::zeros(1)),
         }
+    }
+
+    #[test]
+    fn time_nullspace_shrinkage_adds_precision_for_uncontrolled_time_direction() {
+        let mut block = TimeBlockInput {
+            design_entry: DesignMatrix::from(Array2::zeros((3, 2))),
+            design_exit: DesignMatrix::from(Array2::zeros((3, 2))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
+            penalties: vec![array![[1.0, 0.0], [0.0, 0.0]]],
+            nullspace_dims: vec![1],
+            initial_beta: Some(Array1::zeros(2)),
+            ..base_time_block()
+        };
+
+        assert!(
+            install_time_nullspace_shrinkage_penalty(&mut block)
+                .expect("time nullspace shrinkage should build"),
+            "expected a shrinkage penalty to be appended",
+        );
+        assert_eq!(block.penalties.len(), 2);
+        assert_eq!(block.nullspace_dims, vec![1, 0]);
+        assert!((block.penalties[1][[0, 0]]).abs() <= 1e-12);
+        assert!((block.penalties[1][[1, 1]] - 1.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn time_nullspace_shrinkage_is_noop_for_full_rank_time_penalty() {
+        let mut block = TimeBlockInput {
+            design_entry: DesignMatrix::from(Array2::zeros((3, 2))),
+            design_exit: DesignMatrix::from(Array2::zeros((3, 2))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((3, 2))),
+            penalties: vec![Array2::<f64>::eye(2)],
+            nullspace_dims: vec![0],
+            initial_beta: Some(Array1::zeros(2)),
+            ..base_time_block()
+        };
+
+        assert!(
+            !install_time_nullspace_shrinkage_penalty(&mut block)
+                .expect("full-rank time penalty should be accepted"),
+            "full-rank time penalties should not get another penalty",
+        );
+        assert_eq!(block.penalties.len(), 1);
+        assert_eq!(block.nullspace_dims, vec![0]);
     }
 
     fn sparse_design(dense: &Array2<f64>) -> DesignMatrix {

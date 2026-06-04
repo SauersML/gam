@@ -10157,7 +10157,12 @@ impl BernoulliMarginalSlopeFamily {
             let partial = (0..n.div_ceil(ROW_CHUNK_SIZE))
                 .into_par_iter()
                 .try_fold(
-                    || (Array1::<f64>::zeros(slices.total), Array1::<f64>::zeros(r_pr)),
+                    || {
+                        (
+                            Array1::<f64>::zeros(slices.total),
+                            Array1::<f64>::zeros(r_pr),
+                        )
+                    },
                     |(mut chunk_out, mut action_scratch), chunk_idx| -> Result<_, String> {
                         let start = chunk_idx * ROW_CHUNK_SIZE;
                         let end = (start + ROW_CHUNK_SIZE).min(n);
@@ -10679,14 +10684,20 @@ impl BernoulliMarginalSlopeFamily {
                             {
                                 let mut marginal_diag =
                                     chunk_diag.slice_mut(s![slices.marginal.clone()]);
-                                self.marginal_design
-                                    .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
+                                self.marginal_design.squared_axpy_row_into(
+                                    row,
+                                    h00,
+                                    &mut marginal_diag,
+                                )?;
                             }
                             {
                                 let mut logslope_diag =
                                     chunk_diag.slice_mut(s![slices.logslope.clone()]);
-                                self.logslope_design
-                                    .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
+                                self.logslope_design.squared_axpy_row_into(
+                                    row,
+                                    h11,
+                                    &mut logslope_diag,
+                                )?;
                             }
                             if let (Some(primary_h), Some(block_h)) =
                                 (primary.h.as_ref(), slices.h.as_ref())
@@ -10747,9 +10758,10 @@ impl BernoulliMarginalSlopeFamily {
                     || Array1::<f64>::zeros(slices.total),
                     |mut tile_diag, tile| -> Result<_, String> {
                         let tile_rows = tile.rows.hess().nrows();
-                        let h_rows_slice = tile.rows.hess().as_slice().expect(
-                            "tiled row_primary_hessians.hess() is row-major contiguous",
-                        );
+                        let h_rows_slice =
+                            tile.rows.hess().as_slice().expect(
+                                "tiled row_primary_hessians.hess() is row-major contiguous",
+                            );
                         let inputs = crate::gpu::row_hessian_ops::RowHessianDiagInputs {
                             n_rows: tile_rows,
                             r: r_pr,
@@ -10788,14 +10800,20 @@ impl BernoulliMarginalSlopeFamily {
                             {
                                 let mut marginal_diag =
                                     tile_diag.slice_mut(s![slices.marginal.clone()]);
-                                self.marginal_design
-                                    .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
+                                self.marginal_design.squared_axpy_row_into(
+                                    row,
+                                    h00,
+                                    &mut marginal_diag,
+                                )?;
                             }
                             {
                                 let mut logslope_diag =
                                     tile_diag.slice_mut(s![slices.logslope.clone()]);
-                                self.logslope_design
-                                    .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
+                                self.logslope_design.squared_axpy_row_into(
+                                    row,
+                                    h11,
+                                    &mut logslope_diag,
+                                )?;
                             }
                             if let (Some(primary_h), Some(block_h)) =
                                 (primary.h.as_ref(), slices.h.as_ref())
