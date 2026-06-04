@@ -151,6 +151,25 @@ jobs:
             test_status=1
           fi
 
+          # Free the executable test binaries that the lib/bins/examples
+          # phase just linked. They were already executed, will not be rerun,
+          # and each is several hundred MB of ELF (gam + faer + burn + arrow +
+          # …) sitting in target/debug/deps eating runner disk. The .rlib /
+          # .rmeta / .d files stay so cargo can reuse the compiled crates for
+          # the integration-test binaries linked below; that reuse is what
+          # made every integration-test compile fast in the loop. Without
+          # this prune the first integration-test link runs against a nearly
+          # full disk and rust-lld dies with "ld terminated with signal 7
+          # [Bus error]" inside llvm::parallelFor, which has been the
+          # recurring `cargo test --test <name>` failure mode on this job.
+          if [ "$test_status" -eq 0 ]; then
+            find target/debug/deps -maxdepth 1 -type f \
+                  ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' \
+                  ! -name '*.so' ! -name '*.so.*' \
+                  -size +10M -delete || true
+            df -h /
+          fi
+
           if [ "$test_status" -eq 0 ]; then
             for test_file in tests/*.rs; do
               test_name="$(basename "$test_file" .rs)"
