@@ -539,14 +539,36 @@ impl SmoothBasisSpec {
             | Self::Duchon { .. } => RADIAL_FLOOR,
             Self::Pca { basis_matrix, .. } => basis_matrix.ncols().max(1),
             Self::TensorBSpline { spec, .. } => {
-                // Tensor-product column count is the product of per-marginal
-                // column counts; a TensorMarginalSpec::Categorical without a
-                // frozen level list cannot be sized from the spec alone, so
-                // we fall back to the radial floor for that margin.
-                let mut total: usize = 1;
+                // A `te(...)` smooth is *penalized*: each margin carries a
+                // difference (wiggliness) penalty and the tensor inherits a
+                // Kronecker-sum penalty `S = Σ_i I ⊗ … ⊗ S_i ⊗ … ⊗ I`. The raw
+                // column count is the *product* of the per-marginal column
+                // counts, but that product is the lower bound for an
+                // *unpenalized* tensor regression — it is the number of rows you
+                // would need to identify every interaction column with no
+                // regularization. The penalty regularizes all of those
+                // interaction directions; only the combined penalty *null space*
+                // (the tensor product of the per-margin polynomial trends, a
+                // handful of columns) must be identified by the data, and the
+                // smoothing-parameter search shrinks the rest. The effective
+                // degrees of freedom of the fitted `te()` are therefore a small
+                // fraction of the column product, which is exactly why mgcv
+                // fits a default `te(x, y)` on a couple hundred rows.
+                //
+                // The honest *penalized* lower bound is the **sum** of the
+                // per-marginal column counts, not their product: a row floor of
+                // `Σ_i k_i` still guarantees enough data to identify each
+                // margin's additive main-effect (the largest sub-block the
+                // penalty cannot shrink to zero), while no longer conflating
+                // unpenalized column-count identifiability with penalized
+                // well-posedness. This accepts moderate-`n` penalized tensors
+                // (e.g. a 20×20 default basis on n=200) yet still rejects a
+                // genuinely undersized fit where `n < Σ_i k_i` and even the
+                // additive part is rank-deficient.
+                let mut total: usize = 0;
                 for marginal in &spec.marginalspecs {
                     let m = bspline_basis_min_rows(marginal);
-                    total = total.saturating_mul(m.max(1));
+                    total = total.saturating_add(m.max(1));
                 }
                 total.max(RADIAL_FLOOR)
             }
