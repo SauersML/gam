@@ -301,10 +301,22 @@ fn affine_sq_norm(n: usize, pinv: &Array2<f64>, v: ArrayView1<'_, f64>) -> Geome
 ///    consecutive steps we accept the best iterate as stationary to the
 ///    achievable precision rather than spuriously erroring.
 ///
-/// Returns `Ok` once the residual reaches `tol` or stalls at its numerical
-/// floor; returns `Err` only if the budget `max_iter` is exhausted while the
-/// residual is still making genuine first-order progress (a true budget
-/// shortfall, not a precision floor).
+/// Returns `Ok` with the least-residual iterate once the residual reaches
+/// `tol` or stalls (no further `STALL_REL`-relative progress for
+/// `STALL_PATIENCE` steps / no step decreases `V` within round-off). The
+/// stall exit is the correct terminal state of a gradient method: the returned
+/// point minimizes the dispersion to the achievable precision. `Err` is
+/// reserved for a genuine budget shortfall — `max_iter` exhausted while the
+/// residual is still making real first-order progress.
+///
+/// Caveat (first-order rate): convergence is linear with a rate set by the
+/// conditioning of `Hess V`. For well- to moderately-conditioned inputs the
+/// residual reaches its `O(ε)`–`√ε` numerical floor (far below any sane `tol`
+/// gate); for *extremely* ill-conditioned spreads (eigenvalue ratios `≫ 1e3`
+/// across non-commuting samples, where `Hess V` eigenvalues are `≫ 4`) the
+/// linear rate can leave a larger residual within `max_iter` even though the
+/// dispersion itself is minimized — the known limit of a first-order Karcher
+/// iteration, which a second-order (Newton/trust-region) scheme would remove.
 pub fn spd_frechet_mean(
     n: usize,
     points: ArrayView2<'_, f64>,
@@ -466,6 +478,189 @@ mod tangent_basis_tests {
                     gram[[i, j]]
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod frechet_mean_tests {
+    use super::{SpdManifold, spd_frechet_mean};
+    use crate::geometry::manifold::RiemannianManifold;
+    use ndarray::{Array1, Array2};
+
+    /// Row-major flat `n×n` diagonal matrix from its diagonal.
+    fn diag_flat(d: &[f64]) -> Array1<f64> {
+        let n = d.len();
+        let mut m = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            m[[i, i]] = d[i];
+        }
+        Array1::from_iter(m.iter().copied())
+    }
+
+    /// Stack flat samples into the `M×n²` matrix the primitive consumes.
+    fn stack(rows: &[Array1<f64>]) -> Array2<f64> {
+        let m = rows.len();
+        let k = rows[0].len();
+        let mut s = Array2::<f64>::zeros((m, k));
+        for (i, r) in rows.iter().enumerate() {
+            for (j, &v) in r.iter().enumerate() {
+                s[[i, j]] = v;
+            }
+        }
+        s
+    }
+
+    /// Stationarity residual ‖Σ_i w_i log_P(X_i)‖_P via the public maps.
+    fn residual(spd: &SpdManifold, p: &Array1<f64>, rows: &[Array1<f64>], w: &[f64]) -> f64 {
+        let k = p.len();
+        let mut xi = Array1::<f64>::zeros(k);
+        for (x, &wi) in rows.iter().zip(w) {
+            xi.scaled_add(wi, &spd.log_map(p.view(), x.view()).expect("log_map"));
+        }
+        let g = spd.metric_tensor(p.view()).expect("metric_tensor");
+        xi.dot(&g.dot(&xi)).max(0.0).sqrt()
+    }
+
+    /// CLOSED FORM, EXTREME MAGNITUDE. For mutually commuting (here diagonal)
+    /// SPD matrices the affine-invariant Karcher mean is the per-coordinate
+    /// geometric mean of the eigenvalues: `μ_k = (Π_i x_{i,k})^{1/M}`. With
+    /// eigenvalues spanning `1e-6 … 1e6` the geodesic distances (and so the
+    /// `exp`/`log` arguments) are large, stressing the eigendecomposition's
+    /// dynamic range. gam must hit the analytic mean to ~machine precision.
+    #[test]
+    fn spd_frechet_mean_matches_geometric_mean_on_commuting_extreme_magnitudes() {
+        let n = 3;
+        let diags = [
+            [1e6, 1e-6, 1.0],
+            [1e-6, 1.0, 1e6],
+            [1.0, 1e6, 1e-6],
+            [1e2, 1e-2, 1e2],
+        ];
+        let rows: Vec<Array1<f64>> = diags.iter().map(|d| diag_flat(d)).collect();
+        let m = rows.len();
+
+        // Per-coordinate geometric mean (exact Karcher mean for commuting SPD).
+        let mut want = [0.0_f64; 3];
+        for k in 0..n {
+            let mut s = 0.0;
+            for d in &diags {
+                s += d[k].ln();
+            }
+            want[k] = (s / m as f64).exp();
+        }
+
+        let p = spd_frechet_mean(n, stack(&rows).view(), None, 1e-12, 500)
+            .expect("frechet mean converges on commuting extreme-magnitude SPD");
+
+        let spd = SpdManifold::new(n);
+        // Off-diagonals vanish; diagonal matches the geometric mean.
+        for i in 0..n {
+            for j in 0..n {
+                let got = p[i * n + j];
+                let exp = if i == j { want[i] } else { 0.0 };
+                let scale = exp.abs().max(1.0);
+                assert!(
+                    (got - exp).abs() <= 1e-7 * scale,
+                    "commuting mean[{i},{j}] = {got:.6e}, want {exp:.6e}"
+                );
+            }
+        }
+        // And it is a first-order Fréchet stationary point.
+        let w = vec![1.0 / m as f64; m];
+        let r = residual(&spd, &p, &rows, &w);
+        assert!(r < 1e-9, "commuting case residual {r:.3e} not at floor");
+    }
+
+    /// WEIGHTED CLOSED FORM. The weighted affine-invariant Karcher mean of
+    /// commuting SPD matrices is the weighted geometric mean
+    /// `μ_k = Π_i x_{i,k}^{w_i}` (Σ w_i = 1). Verifies the weight plumbing is
+    /// correct, not merely uniform.
+    #[test]
+    fn spd_frechet_mean_weighted_matches_weighted_geometric_mean() {
+        let n = 2;
+        let diags = [[4.0, 0.25], [0.5, 16.0], [9.0, 1.0]];
+        let raw_w = [0.5, 0.3, 0.2];
+        let rows: Vec<Array1<f64>> = diags.iter().map(|d| diag_flat(d)).collect();
+
+        let mut want = [0.0_f64; 2];
+        for k in 0..n {
+            let mut s = 0.0;
+            for (d, &wi) in diags.iter().zip(&raw_w) {
+                s += wi * d[k].ln();
+            }
+            want[k] = s.exp();
+        }
+
+        let wv = Array1::from(raw_w.to_vec());
+        let p = spd_frechet_mean(n, stack(&rows).view(), Some(wv.view()), 1e-12, 500)
+            .expect("weighted frechet mean converges");
+        for k in 0..n {
+            let got = p[k * n + k];
+            assert!(
+                (got - want[k]).abs() <= 1e-9 * want[k].max(1.0),
+                "weighted mean diag[{k}] = {got:.9e}, want {want_k:.9e}",
+                want_k = want[k]
+            );
+        }
+    }
+
+    /// OVERSHOOT SAFEGUARD + SUB-√ε RESIDUAL ON NON-COMMUTING DATA. The samples
+    /// are rotated `diag(a, b)` matrices with distinct rotation angles, so they
+    /// do *not* commute: `V` is genuinely curved (not the trivial commuting
+    /// one-step case), and for this spread `Hess V` carries eigenvalues `> 4`,
+    /// along which a bare unit Karcher step (`= −½ grad V`) would overshoot.
+    /// The backtracking safeguard must keep the descent monotone, and the
+    /// round-off-cushioned line search must drive the first-order residual far
+    /// below the `≈√ε ≈ 1e-7` floor at which a strict Armijo-on-V test stalls
+    /// (the prior code panicked here). This is the direct regression guard for
+    /// #693, from a different angle than the random-Gaussian integration test.
+    #[test]
+    fn spd_frechet_mean_converges_below_sqrt_eps_on_spread_non_commuting() {
+        let n = 2;
+        let angles = [0.0_f64, 0.6, 1.2, 1.9, 2.7];
+        let eig = [(12.0_f64, 0.4_f64), (0.5, 9.0), (3.0, 0.2), (0.3, 6.0), (5.0, 0.7)];
+        let mut rows: Vec<Array1<f64>> = Vec::new();
+        for (&th, &(a, b)) in angles.iter().zip(&eig) {
+            let (c, s) = (th.cos(), th.sin());
+            // R diag(a,b) Rᵀ, R = [[c,-s],[s,c]].
+            let m00 = c * c * a + s * s * b;
+            let m01 = c * s * (a - b);
+            let m11 = s * s * a + c * c * b;
+            rows.push(Array1::from(vec![m00, m01, m01, m11]));
+        }
+        let m = rows.len();
+
+        // Request a tolerance below the achievable floor so success can only
+        // come from the stagnation path, not from `tol` being loose.
+        let p = spd_frechet_mean(n, stack(&rows).view(), None, 1e-14, 1000)
+            .expect("spread non-commuting frechet mean converges via safeguard");
+
+        let spd = SpdManifold::new(n);
+        let w = vec![1.0 / m as f64; m];
+        let r = residual(&spd, &p, &rows, &w);
+        assert!(
+            r < 1e-9,
+            "spread non-commuting residual {r:.3e} did not descend below √ε \
+             (regression of #693: line search stalled at the V round-off floor)"
+        );
+
+        // It must also be the dispersion minimizer: V(P) below V at any sample.
+        let disp = |q: &Array1<f64>| -> f64 {
+            rows.iter()
+                .map(|x| {
+                    let lg = spd.log_map(q.view(), x.view()).expect("log_map");
+                    let g = spd.metric_tensor(q.view()).expect("metric");
+                    lg.dot(&g.dot(&lg)) / m as f64
+                })
+                .sum()
+        };
+        let v_mean = disp(&p);
+        for x in &rows {
+            assert!(
+                v_mean < disp(x),
+                "mean does not minimize dispersion: V(mean)={v_mean:.6e}"
+            );
         }
     }
 }
