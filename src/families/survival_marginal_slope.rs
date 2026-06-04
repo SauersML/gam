@@ -18562,6 +18562,10 @@ pub struct SmsTimewiggleTimeJacobian {
     offset_entry: Arc<Array1<f64>>,
     offset_exit: Arc<Array1<f64>>,
     offset_deriv: Arc<Array1<f64>>,
+    /// Fixed marginal-predictor offset. The full marginal predictor entering
+    /// the entry/exit channels is `design_marginal·β_m + marginal_offset`
+    /// (see `row_dynamic_q_values`); this is the β-independent part.
+    marginal_offset: Arc<Array1<f64>>,
     time_wiggle_knots: Array1<f64>,
     time_wiggle_degree: usize,
     /// Full time block width (= design_entry.ncols()).
@@ -18588,6 +18592,7 @@ impl SmsTimewiggleTimeJacobian {
         offset_entry: Arc<Array1<f64>>,
         offset_exit: Arc<Array1<f64>>,
         offset_deriv: Arc<Array1<f64>>,
+        marginal_offset: Arc<Array1<f64>>,
         time_wiggle_knots: Array1<f64>,
         time_wiggle_degree: usize,
         p_tw: usize,
@@ -18605,6 +18610,7 @@ impl SmsTimewiggleTimeJacobian {
             offset_entry,
             offset_exit,
             offset_deriv,
+            marginal_offset,
             time_wiggle_knots,
             time_wiggle_degree,
             p_time,
@@ -18683,13 +18689,18 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
                 .map(|(j, &b)| self.design_marginal[[i, j]] * b)
                 .sum();
 
+            // The marginal predictor (coefficient part `eta_m` plus the fixed
+            // `marginal_offset`) enters BOTH entry and exit channels but NOT
+            // the derivative channel — see `row_dynamic_q_values`.
             let h0: f64 = self.offset_entry[i]
                 + eta_m
+                + self.marginal_offset[i]
                 + (0..p_base.min(beta_t_base.len()).min(self.design_entry.ncols()))
                     .map(|j| self.design_entry[[i, j]] * beta_t_base[j])
                     .sum::<f64>();
             let h1: f64 = self.offset_exit[i]
                 + eta_m
+                + self.marginal_offset[i]
                 + (0..p_base.min(beta_t_base.len()).min(self.design_exit.ncols()))
                     .map(|j| self.design_exit[[i, j]] * beta_t_base[j])
                     .sum::<f64>();
@@ -18765,6 +18776,9 @@ pub struct SmsTimewiggleMarginalJacobian {
     offset_entry: Arc<Array1<f64>>,
     offset_exit: Arc<Array1<f64>>,
     offset_deriv: Arc<Array1<f64>>,
+    /// Fixed marginal-predictor offset (β-independent part of the marginal
+    /// predictor entering the entry/exit channels; see `row_dynamic_q_values`).
+    marginal_offset: Arc<Array1<f64>>,
     time_wiggle_knots: Array1<f64>,
     time_wiggle_degree: usize,
     p_time: usize,
@@ -18785,6 +18799,7 @@ impl SmsTimewiggleMarginalJacobian {
         offset_entry: Arc<Array1<f64>>,
         offset_exit: Arc<Array1<f64>>,
         offset_deriv: Arc<Array1<f64>>,
+        marginal_offset: Arc<Array1<f64>>,
         time_wiggle_knots: Array1<f64>,
         time_wiggle_degree: usize,
         p_time: usize,
@@ -18801,6 +18816,7 @@ impl SmsTimewiggleMarginalJacobian {
             offset_entry,
             offset_exit,
             offset_deriv,
+            marginal_offset,
             time_wiggle_knots,
             time_wiggle_degree,
             p_time,
@@ -18866,13 +18882,17 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
                 .map(|(j, &b)| self.design_marginal[[i, j]] * b)
                 .sum();
 
+            // Marginal predictor (eta_m + fixed marginal_offset) enters entry
+            // and exit channels alike (see `row_dynamic_q_values`).
             let h0: f64 = self.offset_entry[i]
                 + eta_m
+                + self.marginal_offset[i]
                 + (0..p_base.min(beta_t_base.len()).min(self.design_entry.ncols()))
                     .map(|j| self.design_entry[[i, j]] * beta_t_base[j])
                     .sum::<f64>();
             let h1: f64 = self.offset_exit[i]
                 + eta_m
+                + self.marginal_offset[i]
                 + (0..p_base.min(beta_t_base.len()).min(self.design_exit.ncols()))
                     .map(|j| self.design_exit[[i, j]] * beta_t_base[j])
                     .sum::<f64>();
@@ -21625,6 +21645,7 @@ pub fn fit_survival_marginal_slope_terms(
                         .ok()?;
                     let knots = timewiggle.knots.clone();
                     let degree = timewiggle.degree;
+                    let marginal_offset = Arc::new(spec.marginal_offset.clone());
                     let time_jac = Arc::new(SmsTimewiggleTimeJacobian::new(
                         Arc::clone(&d_entry),
                         Arc::clone(&d_exit),
@@ -21634,6 +21655,7 @@ pub fn fit_survival_marginal_slope_terms(
                         Arc::clone(&offset_entry),
                         Arc::clone(&offset_exit),
                         Arc::clone(&derivative_offset_exit),
+                        Arc::clone(&marginal_offset),
                         knots.clone(),
                         degree,
                         p_tw,
@@ -21651,6 +21673,7 @@ pub fn fit_survival_marginal_slope_terms(
                         Arc::clone(&offset_entry),
                         Arc::clone(&offset_exit),
                         Arc::clone(&derivative_offset_exit),
+                        marginal_offset,
                         knots,
                         degree,
                         design_exit.ncols(),
@@ -23833,6 +23856,7 @@ mod tests {
             Arc::clone(&offset_entry),
             Arc::clone(&offset_exit),
             Arc::clone(&offset_deriv),
+            Arc::new(Array1::<f64>::zeros(n)), // marginal_offset = 0
             knots.clone(),
             degree,
             p_tw,
