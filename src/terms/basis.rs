@@ -13920,6 +13920,25 @@ fn validate_duchon_kernel_orders(
     if !s_order.is_finite() || s_order < 0.0 {
         crate::bail_invalid_basis!("Duchon spectral power must be finite and ≥ 0; got s={s_order}");
     }
+    // The hybrid (Matérn-blended) Duchon kernel is built from the integer
+    // partial-fraction expansion of `(kappa² + ‖w‖²)^s`, so it admits ONLY
+    // integer `s`. The builder reads the spectral power back through
+    // `duchon_power_to_usize`, which silently truncates a fractional `s` to 0.
+    // Validating against the raw fractional `s` while the kernel evaluates the
+    // truncated integer `s` desyncs the well-posedness check from the realized
+    // kernel: e.g. p=2, d=4 with s=1.5 passes the spectral test (2(p+s)=7>4)
+    // here, but the kernel is actually evaluated at s=0 where 2(p+s)=4=d is NOT
+    // finite at the origin, poisoning the constraint-projection Gram with
+    // non-finite entries and crashing the self-adjoint eigendecomposition. Reject
+    // a fractional hybrid power at the kernel-validation boundary so this is
+    // caught uniformly across every front-end (formula/CLI/pyffi-serialized spec)
+    // rather than only at the request layer.
+    if length_scale.is_some() && s_order.fract() != 0.0 {
+        crate::bail_invalid_basis!(
+            "hybrid Duchon-Matern kernel (length_scale set) requires an integer spectral power; got s={s_order}. \
+             Pass an integer power for the hybrid kernel, or drop length_scale for the scale-free fractional kernel."
+        );
+    }
     if length_scale.is_none() && 2.0 * s_order >= k_dim as f64 {
         crate::bail_invalid_basis!(
             "pure Duchon requires power < dimension/2 for nullspace degree < {p_order}; got power={s_order}, dimension={k_dim}"
@@ -17569,8 +17588,10 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
     let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
+    // Validate against the RAW spectral power so a fractional hybrid `s` is
+    // rejected here rather than silently truncated by `power_as_usize`.
+    validate_duchon_kernel_orders(Some(length_scale), p_order, spec.power, 1)?;
     let s_order = spec.power_as_usize();
-    validate_duchon_kernel_orders(Some(length_scale), p_order, s_order as f64, 1)?;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
     let z_kernel = kernel_constraint_nullspace(
         centers.view(),
@@ -22525,8 +22546,10 @@ fn build_periodic_duchon_basis_1d(
     let user_m = duchon_p_from_nullspace_order(spec.nullspace_order);
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
+    // Validate against the RAW spectral power so a fractional hybrid `s` is
+    // rejected here rather than silently truncated by `power_as_usize`.
+    validate_duchon_kernel_orders(spec.length_scale, p_order, spec.power, 1)?;
     let s_order = spec.power_as_usize();
-    validate_duchon_kernel_orders(spec.length_scale, p_order, s_order as f64, 1)?;
     let z = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
