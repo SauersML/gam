@@ -104,7 +104,7 @@ def sinkhorn_barycenter(
     eps: float = 0.01,
     n_iter: int = 20,
 ) -> np.ndarray:
-    """Log-domain entropic Sinkhorn Wasserstein barycenter.
+    r"""Log-domain entropic Sinkhorn Wasserstein barycenter.
 
     Parameters
     ----------

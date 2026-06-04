@@ -738,6 +738,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      nuclear_norm_weight: float = 1.0, nuclear_norm_max_rank: int | None = None,
                      decoder_incoherence_weight: float = 1.0,
                      top_k: int | None = None, t_init: Any = None, a_init: Any = None,
+                     tau: float | None = None, jumprelu_threshold: float = 0.0,
+                     atom_basis: Any = None,
                      **kwargs: Any) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
@@ -844,15 +846,13 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         coordinates. ``converged_latents()``, ``encode()``, and ``project()``
         expose the refined supervision targets.
     tau
-        Alias-only kwarg giving the starting assignment temperature. If omitted,
-        it is inferred from ``schedule``/``gumbel_schedule`` or defaults to
-        ``0.5``.
+        Starting assignment temperature. If ``None`` (the default), it is
+        inferred from ``schedule``/``gumbel_schedule`` or defaults to ``0.5``.
     jumprelu_threshold
-        Alias-only kwarg giving the JumpReLU/gated hard-gate threshold. Must be
-        finite.
+        JumpReLU/gated hard-gate threshold. Must be finite. Defaults to ``0.0``.
     atom_basis
-        Alias-only kwarg for per-atom basis kind(s). If supplied with
-        ``atom_topology``, both must resolve to the same topology.
+        Per-atom basis kind(s). If supplied with ``atom_topology``, both must
+        resolve to the same topology.
 
     Returns
     -------
@@ -896,7 +896,6 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"({int(K)} vs {int(n_atoms_kw)}); pass only one (they are aliases)."
         )
     k_atoms = int(n_atoms_kw if n_atoms_kw is not None else (K if K is not None else 0))
-    atom_basis = kwargs.pop("atom_basis", None)
     atom_dim = kwargs.pop("atom_dim", d_atom)
     assignment_prior = kwargs.pop("assignment_prior", None)
     gumbel_schedule = kwargs.pop("gumbel_schedule", schedule)
@@ -913,8 +912,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         scad_mcp_gamma_value = 3.7 if gate_sparsity_kind == "scad" else 2.5
     else:
         scad_mcp_gamma_value = float(scad_mcp_gamma)
-    tau = float(kwargs.pop("tau", _schedule_tau_start(gumbel_schedule, 0.5)))
-    jumprelu_threshold = float(kwargs.pop("jumprelu_threshold", 0.0))
+    tau = float(tau if tau is not None else _schedule_tau_start(gumbel_schedule, 0.5))
+    jumprelu_threshold = float(jumprelu_threshold)
     if "mechanism_sparsity_groups" in kwargs:
         raise TypeError(
             "sae_manifold_fit: 'mechanism_sparsity_groups' has been removed. "
