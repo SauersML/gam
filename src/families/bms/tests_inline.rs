@@ -7702,6 +7702,7 @@ mod tests {
             row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
         };
         let direction =
             Array1::from_iter((0..cached.slices.total).map(|idx| 0.02 * ((idx % 5) as f64 - 2.0)));
@@ -7763,6 +7764,7 @@ mod tests {
             row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
         };
         let directions: Vec<_> = (0..4)
             .map(|rep| {
