@@ -84,29 +84,38 @@ use std::sync::Arc;
 
 /// Numerical stabilization ridge for the formula-driven multinomial REML path.
 ///
-/// The smoothing penalties are rank-deficient by design (each smooth carries an
-/// unpenalized polynomial null space), and the formula may add an unpenalized
-/// parametric term (`x3` / `body_mass`). On near-separable hard labels those
-/// directions can drift large while the outer lambda optimizer searches, so the
-/// inner joint-Newton solve needs the joint Hessian lifted strictly
-/// positive-definite. This floor is the magnitude to which
-/// `exact_newton_stabilizing_shift` raises the smallest Hessian eigenvalue —
-/// purely a numerical lift that keeps every Newton step finite and the
-/// objective finite (so the outer optimizer accepts well-posed REML seeds
-/// instead of rejecting a NaN-divergent one).
+/// Two failure modes set this floor, and it must thread between them:
 ///
-/// It is deliberately the same order as the scalar PIRLS stabilization ridge
-/// (`crate::solver::pirls::FIXED_STABILIZATION_RIDGE = 1e-8`), NOT a meaningful
-/// Gaussian prior. A large floor (e.g. `1e-2`) is the wrong tool: under the
-/// `explicit_stabilization_pospart` ridge policy it also enters the penalized
-/// objective as `½·δ·‖β‖²` AND the REML penalty log-determinant, so it shrinks
-/// every identified coefficient (including the smooth wiggle directions already
-/// governed by their REML λ) and biases the smoothing-parameter selection —
-/// over-smoothing the recovered class-probability surface (#715). A `1e-8`
-/// floor stabilizes the linear algebra without measurably perturbing the
-/// REML-optimal fit, so gam recovers the true softmax field rather than a
-/// ridge-shrunk one.
-const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-8;
+/// * **Separation divergence → rejected seeds (#715 real-data arm).** The
+///   smoothing penalties are rank-deficient by design (each smooth carries an
+///   unpenalized polynomial null space), and the formula may add a fully
+///   unpenalized parametric term (`x3` / `body_mass`). On near-separable hard
+///   labels (e.g. cleanly-separated penguin species) the softmax MLE drives
+///   those directions toward `±∞`. Each inner joint-Newton step is bounded by
+///   `‖∇‖ / δ` once `exact_newton_stabilizing_shift` lifts the smallest Hessian
+///   eigenvalue to this floor `δ`, so a *too-small* `δ` lets `β` overflow to a
+///   non-finite value within the few screening cycles; the resulting `inf` `η`
+///   makes the softmax `inf − inf = NaN`, every startup seed reports a non-
+///   finite `block_residual_inf`, and the outer optimizer rejects them all
+///   ("no candidate seeds passed outer startup validation"). `δ` must therefore
+///   be large enough to keep `β` comfortably finite across the screening cap.
+///
+/// * **Over-smoothing → lost truth recovery (#715 synthetic arm).** Under the
+///   `explicit_stabilization_pospart` ridge policy this floor also enters the
+///   penalized objective as `½·δ·‖β‖²` AND the REML penalty log-determinant, so
+///   a *too-large* `δ` (e.g. `1e-2`) shrinks every identified coefficient —
+///   including the smooth wiggle directions already governed by their own REML
+///   `λ` — and perturbs the smoothing-parameter selection, biasing the fitted
+///   class-probability surface away from the truth and losing the match-or-beat
+///   against VGAM.
+///
+/// `1e-4` satisfies both: with standardized/centred designs the step bound
+/// `‖∇‖/δ ≈ O(n)/1e-4` keeps `β` finite (no overflow ⇒ no NaN ⇒ seeds accepted),
+/// while `½·δ·‖β‖²` and the `δ`-shift of the REML log-determinant are negligible
+/// against the `O(n)` data log-likelihood and the REML-selected smooth penalties
+/// (no measurable shrinkage of the recovered surface). It is a numerical
+/// stabilizer, not a Gaussian prior.
+const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-4;
 
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
 /// still worth paying for multinomial formula fits.
