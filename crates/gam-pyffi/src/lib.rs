@@ -9426,6 +9426,10 @@ fn sae_manifold_fit<'py>(
         analytic_penalties,
         top_k,
         jumprelu_threshold,
+        // This precomputed-basis entry point hands the term verbatim seeds;
+        // routing-seed refinement is owned by the higher-level `fit_minimal`
+        // auto path, so do not re-seed here.
+        false,
     )
 }
 
@@ -9456,6 +9460,7 @@ fn sae_manifold_fit_inner<'py>(
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
     jumprelu_threshold: f64,
+    seed_refine_routing: bool,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
@@ -9685,6 +9690,28 @@ fn sae_manifold_fit_inner<'py>(
         base_term
             .set_temperature_schedule(schedule)
             .map_err(py_value_error)?;
+    }
+
+    // Cold-start routing seed refinement (#629, #630). The cold residual-logit
+    // seed is computed at the cold (shared-across-atoms) coordinates and cannot
+    // separate planted disjoint atoms, so the joint solve starts in the
+    // near-uniform routing saddle. Alternate the closed-form coordinate
+    // projection (the #628 OOS mechanism) and the weighted LSQ decoder refit a
+    // few times to place each row in the correct atom basin before the joint
+    // Arrow-Schur fit. Gated to cold multi-atom softmax / IBP-MAP fits by the
+    // caller; warm starts and JumpReLU keep their supplied seed.
+    if seed_refine_routing
+        && k_atoms > 1
+        && matches!(assignment_kind.as_str(), "softmax" | "ibp_map")
+    {
+        sae_em_refine_routing_seed(
+            &mut base_term,
+            z_view,
+            &basis_sizes,
+            assignment_kind.as_str(),
+            tau,
+        )
+        .map_err(py_value_error)?;
     }
 
     let log_ard: Vec<Array1<f64>> = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
@@ -10406,6 +10433,114 @@ fn sae_decoder_lsq_init(
         }
     }
     Ok(out)
+}
+
+/// EM-style seed refinement that resolves the cold-start routing collapse of
+/// the training fit (issues #629, #630) before the joint Arrow-Schur solve.
+///
+/// The cold residual-logit seed ([`sae_residual_seed_logits`]) is computed at
+/// the cold latent coordinates (the per-atom PCA/atan2 seed). Those coordinates
+/// are *shared* across atoms (the seed places the same leading component on
+/// every atom), so each atom's independent LSQ fit against the full response is
+/// equally mediocre on every row: the per-row residual barely separates the
+/// atoms and the logit seed stays near the symmetric saddle the random jitter
+/// cannot escape. The joint solver then never routes (the planted disjoint
+/// atoms collapse to a near-uniform mixture, negative R²).
+///
+/// This is the exact dual of the frozen-decoder OOS fix (#628): there, each row
+/// is placed in the correct latent basin by projecting it onto every atom's
+/// *known* decoder over a dense manifold grid
+/// ([`SaeManifoldTerm::seed_coords_by_decoder_projection`]). Here the decoder is
+/// being *learned*, so we alternate the two cheap closed-form steps the OOS path
+/// and the existing seed already provide:
+///
+/// 1. **Coordinate E-step** — project each row's per-atom latent onto the
+///    current decoder over the manifold grid. This separates the atoms'
+///    geometries: a row generated from atom `k` snaps to the coordinate where
+///    atom `k` reconstructs it well, while the off-atoms snap to wherever their
+///    current decoder is least wrong on that row.
+/// 2. **Decoder M-step** — refit every atom's decoder by the same weighted joint
+///    LSQ used for the cold init ([`sae_decoder_lsq_init`]), now at the
+///    *separated* coordinates, so each atom's block specializes toward the rows
+///    it actually explains.
+/// 3. **Routing seed** — recompute the mean-centred residual logits
+///    ([`sae_residual_seed_logits`]) at the refined geometry. With the atoms now
+///    geometrically distinct, the per-row residual is decisive and the seed is
+///    one-hot for the planted disjoint oracle.
+///
+/// A handful of rounds converges this alternation for separable atoms while
+/// leaving an already-routed warm fit at its fixed point (the projection finds
+/// the same basin, the LSQ recovers the same decoder). Atoms whose evaluator has
+/// no projection grid (Duchon / Euclidean patch) are left untouched by step 1,
+/// so the refinement degrades gracefully to the existing cold seed for them.
+///
+/// Only invoked for cold-start multi-atom softmax / IBP-MAP fits; JumpReLU keeps
+/// its margin-above-threshold gate seed and warm starts are respected verbatim.
+fn sae_em_refine_routing_seed(
+    term: &mut gam::terms::sae_manifold::SaeManifoldTerm,
+    z: ArrayView2<'_, f64>,
+    basis_sizes: &[usize],
+    assignment_kind: &str,
+    tau: f64,
+) -> Result<(), String> {
+    const SAE_SEED_REFINE_ROUNDS: usize = 4;
+    const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
+    let k_atoms = basis_sizes.len();
+    let n_obs = z.nrows();
+    if k_atoms <= 1 || n_obs == 0 {
+        return Ok(());
+    }
+    let m_max = basis_sizes.iter().copied().max().unwrap_or(0);
+    if m_max == 0 {
+        return Ok(());
+    }
+    for _ in 0..SAE_SEED_REFINE_ROUNDS {
+        // 1. Coordinate E-step: project each row onto the current decoder.
+        term.seed_coords_by_decoder_projection(z, SAE_OOS_PROJECTION_GRID_RESOLUTION)?;
+        // Snapshot the refreshed per-atom basis `Φ_k(t_k)` as a padded
+        // (K, N, m_max) stack for the closed-form seed helpers.
+        let mut basis3 = Array3::<f64>::zeros((k_atoms, n_obs, m_max));
+        for atom_idx in 0..k_atoms {
+            let phi = &term.atoms[atom_idx].basis_values;
+            let m_k = basis_sizes[atom_idx];
+            if phi.dim() != (n_obs, m_k) {
+                return Err(format!(
+                    "sae_em_refine_routing_seed: atom {atom_idx} basis is {:?}, expected ({n_obs}, {m_k})",
+                    phi.dim()
+                ));
+            }
+            for row in 0..n_obs {
+                for c in 0..m_k {
+                    basis3[[atom_idx, row, c]] = phi[[row, c]];
+                }
+            }
+        }
+        // 2. Decoder M-step: weighted joint LSQ at the refined coordinates,
+        //    using the current routing as the responsibility weights.
+        let decoder = sae_decoder_lsq_init(
+            basis3.view(),
+            basis_sizes,
+            z,
+            term.assignment.logits.view(),
+            assignment_kind,
+            tau,
+        )?;
+        for atom_idx in 0..k_atoms {
+            let m_k = basis_sizes[atom_idx];
+            let p_out = term.atoms[atom_idx].decoder_coefficients.ncols();
+            let dst = &mut term.atoms[atom_idx].decoder_coefficients;
+            for c in 0..m_k {
+                for out_col in 0..p_out {
+                    dst[[c, out_col]] = decoder[[atom_idx, c, out_col]];
+                }
+            }
+        }
+        // 3. Routing seed: mean-centred residual logits at the refined geometry.
+        let logits =
+            sae_residual_seed_logits(basis3.view(), basis_sizes, z, SAE_RESIDUAL_SEED_GAIN)?;
+        term.assignment.logits.assign(&logits);
+    }
+    Ok(())
 }
 
 /// Build (phi, jet, penalty) for a periodic 1-D atom — same math as
@@ -11354,6 +11489,11 @@ fn sae_manifold_fit_minimal<'py>(
         analytic_penalties,
         top_k,
         jumprelu_threshold,
+        // Refine the cold routing seed (alternating coordinate projection +
+        // weighted decoder LSQ) only when BOTH the logits and the coordinates
+        // are cold — i.e. the auto seed is in control. A user-supplied warm
+        // start (amortized encoder, #357) is respected verbatim.
+        logits_are_cold && initial_coords.is_none(),
     )?;
     // Attach per-atom build plans so OOS predict can rebuild design without Python.
     let plans_py = PyList::empty(py);
