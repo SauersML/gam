@@ -14278,15 +14278,29 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         if row_dirs.len() == 1 {
-            return Ok(vec![
-                self.row_primary_third_contracted_recompute_with_moments(
-                    row,
-                    block_states,
-                    cache,
-                    row_ctx,
-                    &row_dirs[0],
-                )?,
-            ]);
+            return Ok(vec![self.row_primary_third_contracted_recompute(
+                row,
+                block_states,
+                cache,
+                row_ctx,
+                &row_dirs[0],
+            )?]);
+        }
+        if let Some(axis_dirs) = row_dirs
+            .iter()
+            .map(|dir| Self::single_primary_axis(dir, primary))
+            .collect::<Option<Vec<_>>>()
+        {
+            if let Some(tensors) = self.flex_axis_tensors_for_row(block_states, cache, row)? {
+                return Ok(axis_dirs
+                    .into_iter()
+                    .map(|(axis, scalar)| {
+                        let mut out = tensors.third[axis].clone();
+                        out.mapv_inplace(|value| value * scalar);
+                        out
+                    })
+                    .collect());
+            }
         }
         if !self.effective_flex_active(block_states)? {
             let t = self.rigid_third_full_cached(block_states, cache, row)?;
