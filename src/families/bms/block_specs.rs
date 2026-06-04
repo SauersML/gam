@@ -3,7 +3,9 @@ use super::gradient_paths::*;
 use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
 use super::*;
-use crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA;
+use crate::families::marginal_slope_orthogonal::{
+    INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA, MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
+};
 
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
@@ -261,30 +263,36 @@ fn widen_marginal_dense_with_influence(
     Ok(Arc::new(widened))
 }
 
-/// Re-embed the term-collection marginal penalties at the widened block
-/// dimension `p_m + p₁` and append the fixed-ridge absorber sub-penalty over
-/// the influence columns (#461). The existing marginal penalties keep their
-/// `col_range` (marginal columns stay in `0..p_m`); the appended ridge is
-/// identity on `p_m..p_m+p₁`. Returns the widened `(penalties, nullspace_dims,
-/// initial_log_lambdas)` to install on the marginal block. With no influence
-/// columns this is the unmodified term-collection penalty set.
+/// Re-embed the term-collection marginal penalties at the (possibly widened)
+/// block dimension `p_m [+ p₁]`, then append two FIXED-ridge sub-penalties:
+///
+///  1. (gam#754, always) a nullspace-shrinkage ridge `Z·Zᵀ` over the union of
+///     the unpenalized parametric columns (intercept + linear covariates) and
+///     each smooth's polynomial null space — the directions the term-collection
+///     penalties leave with zero mass. This bounds a near-separating parametric
+///     coefficient and gives the outer REML a finite optimum. See
+///     `MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA` for why it is fixed, not
+///     REML-learned.
+///
+///  2. (#461, only with influence columns) the fixed-ridge absorber identity on
+///     the influence columns `p_m..p_m+p₁`.
+///
+/// The genuine marginal smooth penalties keep their `col_range` (marginal
+/// columns stay in `0..p_m`). Returns `(penalties, nullspace_dims,
+/// initial_log_lambdas)` to install on the marginal block, plus the count of
+/// trailing FIXED (pinned-out-of-REML) ridge slots appended after the genuine
+/// smooth slots, so the caller can pin exactly those flat-ρ positions.
 fn marginal_penalties_with_influence_ridge(
     design: &TermCollectionDesign,
     rho_marginal: &Array1<f64>,
     influence_columns: Option<&Array2<f64>>,
     influence_ridge_log_lambda: f64,
+    nullspace_ridge_log_lambda: f64,
 ) -> (Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>) {
     let p_m = design.design.ncols();
-    let Some(z_infl) = influence_columns else {
-        return (
-            design.penalties_as_penalty_matrix(),
-            design.nullspace_dims.clone(),
-            rho_marginal.clone(),
-        );
-    };
-    let p1 = z_infl.ncols();
+    let p1 = influence_columns.map(|z| z.ncols()).unwrap_or(0);
     let total_dim = p_m + p1;
-    // Re-embed each marginal penalty at the widened total dimension (col_range
+    // Re-embed each marginal penalty at the (widened) total dimension (col_range
     // unchanged: marginal columns remain 0..p_m).
     let mut penalties: Vec<PenaltyMatrix> = design
         .penalties
@@ -293,15 +301,66 @@ fn marginal_penalties_with_influence_ridge(
         .collect();
     let mut nullspace_dims = design.nullspace_dims.clone();
     let mut log_lambdas = rho_marginal.to_vec();
-    // Fixed-ridge absorber: identity on the influence columns only. Full rank
-    // (nullspace 0); its log λ is pinned out of REML by a degenerate ρ box.
-    penalties.push(PenaltyMatrix::Blockwise {
-        local: Array2::<f64>::eye(p1),
-        col_range: p_m..total_dim,
-        total_dim,
-    });
-    nullspace_dims.push(0);
-    log_lambdas.push(influence_ridge_log_lambda);
+
+    // (1) gam#754 nullspace-shrinkage ridge over the unpenalized directions of
+    // the marginal block (parametric columns + smooth null spaces). Aggregate
+    // the genuine smooth penalties at the marginal dimension `p_m` (NOT the
+    // influence-widened `total_dim`: the influence columns carry their own
+    // fixed ridge below and must not be double-shrunk), normalise each by its
+    // own max-abs so a single smooth cannot dominate the aggregate, and take the
+    // null space of the sum. With no penalties (pure-parametric marginal) the
+    // aggregate is zero and the shrinkage is the identity on all `p_m` columns.
+    if p_m > 0 {
+        let mut aggregate = Array2::<f64>::zeros((p_m, p_m));
+        for bp in &design.penalties {
+            let scale = bp
+                .local
+                .iter()
+                .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+            if scale > 0.0 {
+                let cols = bp.col_range.clone();
+                let mut target = aggregate.slice_mut(s![cols.clone(), cols.clone()]);
+                ndarray::Zip::from(&mut target)
+                    .and(&bp.local)
+                    .for_each(|agg, &value| *agg += value / scale);
+            }
+        }
+        if let Some(shrinkage) =
+            crate::terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
+                .ok()
+                .flatten()
+        {
+            // `shrinkage.sym_penalty` is `Z·Zᵀ` (p_m × p_m), PSD with unit
+            // eigenvalues on the null directions and zero on the penalized span.
+            // Embed at `total_dim` (identity-zero on any influence tail).
+            let local = if total_dim == p_m {
+                shrinkage.sym_penalty
+            } else {
+                let mut widened = Array2::<f64>::zeros((total_dim, total_dim));
+                widened
+                    .slice_mut(s![..p_m, ..p_m])
+                    .assign(&shrinkage.sym_penalty);
+                widened
+            };
+            penalties.push(PenaltyMatrix::Dense(local));
+            nullspace_dims.push(0);
+            log_lambdas.push(nullspace_ridge_log_lambda);
+        }
+    }
+
+    // (2) #461 fixed-ridge absorber: identity on the influence columns only.
+    // Full rank (nullspace 0); its log λ is pinned out of REML by a degenerate
+    // ρ box.
+    if p1 > 0 {
+        penalties.push(PenaltyMatrix::Blockwise {
+            local: Array2::<f64>::eye(p1),
+            col_range: p_m..total_dim,
+            total_dim,
+        });
+        nullspace_dims.push(0);
+        log_lambdas.push(influence_ridge_log_lambda);
+    }
+
     (penalties, nullspace_dims, Array1::from_vec(log_lambdas))
 }
 
@@ -337,6 +396,7 @@ fn build_marginal_blockspec_bms(
     p_marginal: usize,
     influence_columns: Option<&Array2<f64>>,
     influence_ridge_log_lambda: f64,
+    nullspace_ridge_log_lambda: f64,
 ) -> Result<ParameterBlockSpec, String> {
     let offset_m = offset + baseline;
     let offset_s = logslope_offset + logslope_baseline;
@@ -360,6 +420,7 @@ fn build_marginal_blockspec_bms(
         &rho,
         influence_columns,
         influence_ridge_log_lambda,
+        nullspace_ridge_log_lambda,
     );
     Ok(ParameterBlockSpec {
         name: "marginal_surface".to_string(),
@@ -942,22 +1003,36 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
         out
     };
-    // #461 Stage-1 influence absorber: when active, the marginal block carries
-    // one extra fixed-ridge ρ slot appended after its smooth penalties. It
-    // occupies a ρ position (so the marginal penalty count grows by one) but is
-    // pinned to a fixed value rather than REML-optimised.
+    // Fixed (pinned-out-of-REML) ridge slots appended after the marginal
+    // block's genuine smooth penalties, in install order:
+    //
+    //   1. gam#754 nullspace-shrinkage ridge — ALWAYS present for a non-empty
+    //      marginal block (its aggregate smooth penalty is never full rank: the
+    //      parametric intercept column alone guarantees a null direction), so
+    //      `build_nullspace_shrinkage_penalty` always returns a shrinkage.
+    //   2. #461 Stage-1 influence absorber ridge — only when influence columns
+    //      are present.
+    //
+    // Each occupies a flat-ρ position (so `marginal_penalty_count` grows) but is
+    // held at its fixed value via a degenerate outer ρ box rather than being
+    // REML-optimised. The pinned indices below MUST match the append order in
+    // `marginal_penalties_with_influence_ridge`.
+    let nullspace_ridge_slots = usize::from(marginal_design.design.ncols() > 0);
     let influence_ridge_slots = usize::from(influence_columns.is_some());
-    let marginal_penalty_count = marginal_design.penalties.len() + influence_ridge_slots;
-    let pinned_rho_slots: Vec<(usize, f64)> = if influence_columns.is_some() {
-        // Flat ρ index of the pinned ridge: it is the marginal block's trailing
-        // slot, i.e. just past the genuine marginal smooth penalties.
-        vec![(
-            marginal_design.penalties.len(),
-            INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
-        )]
-    } else {
-        Vec::new()
-    };
+    let marginal_penalty_count =
+        marginal_design.penalties.len() + nullspace_ridge_slots + influence_ridge_slots;
+    let mut pinned_rho_slots: Vec<(usize, f64)> = Vec::new();
+    let mut pinned_cursor = marginal_design.penalties.len();
+    if nullspace_ridge_slots == 1 {
+        pinned_rho_slots.push((
+            pinned_cursor,
+            MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
+        ));
+        pinned_cursor += 1;
+    }
+    if influence_ridge_slots == 1 {
+        pinned_rho_slots.push((pinned_cursor, INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA));
+    }
     let setup = joint_setup(
         data_view,
         &marginalspec_boot,
@@ -996,16 +1071,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
      -> Result<Vec<ParameterBlockSpec>, String> {
         let hints = hints.borrow();
         let mut cursor = 0usize;
-        // The marginal block owns its term-collection smooth penalties PLUS,
-        // when the Stage-1 influence absorber is active, one extra pinned ridge
-        // slot (#461). The genuine smooth ρ slots are the REML-learned ones; the
-        // trailing influence-ridge slot is held fixed via pinned outer bounds,
-        // but it still occupies a ρ position so it must be sliced here.
+        // The marginal block owns its term-collection smooth penalties (the
+        // genuine REML-learned ρ slots) PLUS trailing FIXED-ridge slots: the
+        // gam#754 nullspace-shrinkage ridge (always, for a non-empty marginal
+        // block) and, when the Stage-1 influence absorber is active, the #461
+        // influence ridge. The fixed slots are held at pinned values via outer
+        // bounds, but they still occupy ρ positions so they must be skipped
+        // here. Only the genuine smooth slots feed `rho_marginal`; the fixed
+        // slots' log-λ are appended from constants inside
+        // `marginal_penalties_with_influence_ridge`.
+        let nullspace_extra = usize::from(marginal_design.design.ncols() > 0);
         let influence_extra = usize::from(influence_columns.is_some());
         let rho_marginal = rho
             .slice(s![cursor..cursor + marginal_design.penalties.len()])
             .to_owned();
-        cursor += marginal_design.penalties.len() + influence_extra;
+        cursor += marginal_design.penalties.len() + nullspace_extra + influence_extra;
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
@@ -1025,6 +1105,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 p_m,
                 influence_columns.as_ref(),
                 INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
+                MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
             )?,
             build_logslope_blockspec_bms(
                 logslope_design,

@@ -55,6 +55,36 @@ use ndarray::{Array1, Array2, ArrayView2};
 /// the much larger marginal/logslope likelihood curvature dominates the fit.
 pub(crate) const INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA: f64 = 0.0;
 
+/// Fixed (NOT REML-learned) log-λ for the marginal block's nullspace-shrinkage
+/// ridge (gam#754).
+///
+/// The BMS marginal_surface block aggregates an UNPENALIZED parametric span
+/// (intercept + linear covariates: sex, standardized ages, birth-year) with one
+/// or more penalized spatial smooths. The smooths penalize only their wiggle
+/// directions, so the union of (a) the parametric columns and (b) each smooth's
+/// polynomial null space is left with NO penalty mass at all. On a near-balanced
+/// probit sample with a steep covariate→risk gradient the parametric span is
+/// near-separating: an unpenalized direction has a near-flat profile likelihood,
+/// its coefficient drifts toward the separating ray (observed |β|∞≈50, basis-
+/// independent across duchon/matern), the inner joint-Newton cannot satisfy
+/// stationarity, and the outer REML never settles (|g|≈146 at max_iter).
+///
+/// We add a small, FIXED ridge `½·ρ·‖P_null·β‖²` over exactly those null
+/// directions (`P_null = Z·Zᵀ`, `Z` an orthonormal basis of the aggregate
+/// marginal-penalty null space, which spans the parametric columns plus each
+/// smooth's null space). Pinning is deliberate: a REML-LEARNED shrinkage (as the
+/// survival sibling installs on its time block) would be driven λ→0 by the very
+/// near-separation we are bounding, reproducing the pathology. The fixed ridge
+/// gives the outer REML a finite optimum and caps the separating coefficient
+/// without entering the smoothing search.
+///
+/// `log_λ = ln(1e-2)`: `ρ ≈ 0.01` is negligible against the n-scaled probit
+/// Fisher information for any data-identified parametric direction (at biobank
+/// `n` the data curvature on sex/age/birth-year dwarfs 0.01), so a well-
+/// identified fit is not materially biased; yet it bounds a genuinely flat
+/// (separating) direction to `O(√(2·Δℓ/ρ))` instead of letting it run to ~50.
+pub(crate) const MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA: f64 = -4.605_170_185_988_091; // ln(1e-2)
+
 /// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the
 /// latent score `z` itself on the same rows.
 ///
