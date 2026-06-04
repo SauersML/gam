@@ -3987,10 +3987,22 @@ fn prepare_survival_location_scale_model(
     validate_survival_location_scale_spec(spec)?;
     let n = spec.event_target.len();
     let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
+    // Constant-scale AFT regime: a single global σ identifies the time baseline
+    // only through its affine `1 + log t` transform (the parametric AFT), so the
+    // flexible I-spline time-warp's non-affine deviation is statistically
+    // unidentified (issue #736/#735/#721). When there is also no monotone
+    // timewiggle reintroducing flexibility, reduce the time block to its
+    // identifiable parametric (affine null-space) rank so the inner coupled
+    // exact-joint solve has no unconstrained free direction to choke on. A
+    // genuinely flexible scale (`noise_formula = s(...)`, log_sigma penalties
+    // present) or an active timewiggle keeps the full monotone I-spline because
+    // the varying σ / wiggle DOES identify the non-affine baseline shape.
+    let reduce_time_to_parametric = survival_constant_scale(spec) && protected_timewiggle_cols == 0;
     let mut time_prepared = prepare_identified_time_block(
         &spec.time_block,
         spec.derivative_guard,
         protected_timewiggle_cols,
+        reduce_time_to_parametric,
     )?;
 
     if time_prepared.initial_beta.is_none() {
@@ -4041,7 +4053,7 @@ fn prepare_survival_location_scale_model(
             .cloned()
             .map(PenaltyMatrix::Dense)
             .collect(),
-        nullspace_dims: spec.time_block.nullspace_dims.clone(),
+        nullspace_dims: time_prepared.nullspace_dims.clone(),
         initial_log_lambdas: initial_log_lambdas(
             &time_prepared.penalties,
             spec.time_block.initial_log_lambdas.clone(),
@@ -4678,6 +4690,11 @@ struct TimeBlockPrepared {
     coefficient_lower_bounds: Option<Array1<f64>>,
     linear_constraints: Option<LinearInequalityConstraints>,
     penalties: Vec<Array2<f64>>,
+    /// Structural null-space dimension of each (possibly reduced) penalty,
+    /// aligned with `penalties`. Carries the reduced count when the block has
+    /// been collapsed to its identifiable parametric form so the REML log-det
+    /// accounting matches the actual `zᵀ S z` rank rather than the raw basis.
+    nullspace_dims: Vec<usize>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
 }
@@ -5015,10 +5032,80 @@ fn validate_linear_constraints(
     Ok(())
 }
 
+/// Structural null-space dimension of a symmetric PSD penalty, using the same
+/// relative eigenvalue threshold the I-spline builder applies when it reports
+/// `nullspace_dims`. Returns the full dimension on an eigendecomposition
+/// failure (the conservative answer for a fully-collapsed parametric penalty).
+fn symmetric_null_space_dim(s_mat: &Array2<f64>) -> usize {
+    let p = s_mat.nrows();
+    if p == 0 {
+        return 0;
+    }
+    match s_mat.eigh(faer::Side::Lower) {
+        Ok((evals, _)) => {
+            let max_ev = evals
+                .iter()
+                .copied()
+                .fold(0.0_f64, |a, b| a.max(b.abs()))
+                .max(1.0);
+            let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
+            evals.iter().filter(|&&e| e <= threshold).count()
+        }
+        Err(_) => p,
+    }
+}
+
+/// Orthonormal basis `z` (raw `p` × reduced `r`) of the penalty null space —
+/// the affine `{1, log t}` AFT baseline an I-spline 2nd-order difference penalty
+/// leaves unpenalized. The penalized (curvature) directions are exactly the
+/// non-affine deviation the constant-scale data cannot identify, so the
+/// null-space columns are precisely the identifiable parametric subspace.
+///
+/// The basis is the eigenvectors of the summed time penalty whose eigenvalues
+/// sit at the bottom of the spectrum (geometric kernel). `r` is read off the
+/// eigenvalue gap with the same relative threshold the I-spline builder uses to
+/// report `nullspace_dims`, so this is the structural null-space dimension
+/// rather than a hard-coded `2`.
+fn time_parametric_null_space_basis(penalties: &[Array2<f64>], p: usize) -> Option<Array2<f64>> {
+    if p == 0 || penalties.is_empty() {
+        return None;
+    }
+    let mut total = Array2::<f64>::zeros((p, p));
+    for s_mat in penalties {
+        if s_mat.nrows() != p || s_mat.ncols() != p {
+            return None;
+        }
+        total += s_mat;
+    }
+    let (evals, evecs) = total.eigh(faer::Side::Lower).ok()?;
+    let max_ev = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |a, b| a.max(b.abs()))
+        .max(1.0);
+    // Mirror the I-spline builder's null-space threshold (survival_construction).
+    let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
+    // `eigh` returns ascending eigenvalues with eigenvectors as the matching
+    // columns of `evecs`; the kernel is the leading low-eigenvalue block.
+    let null_cols: Vec<usize> = evals
+        .iter()
+        .enumerate()
+        .filter(|&(_, &e)| e <= threshold)
+        .map(|(idx, _)| idx)
+        .collect();
+    if null_cols.is_empty() || null_cols.len() >= p {
+        // No surplus flexibility to remove (or a degenerate all-null penalty):
+        // there is nothing to reduce, keep the full basis.
+        return None;
+    }
+    Some(evecs.select(ndarray::Axis(1), &null_cols))
+}
+
 fn prepare_identified_time_block(
     input: &TimeBlockInput,
     derivative_guard: f64,
     monotone_time_wiggle_ncols: usize,
+    reduce_to_parametric: bool,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
     if !input.time_monotonicity.is_coordinate_cone() {
@@ -5032,6 +5119,81 @@ fn prepare_identified_time_block(
     let design_entry = input.design_entry.to_dense();
     let design_exit = input.design_exit.to_dense();
     let design_derivative_exit = input.design_derivative_exit.to_dense();
+
+    // Constant-scale AFT regime: reduce the unidentified flexible I-spline
+    // time-warp to its identifiable affine parametric form before any
+    // constraint is generated (issue #736/#735/#721).
+    //
+    // `z` (raw `p` × reduced `r`) is an orthonormal basis of the time penalty's
+    // null space — the affine `1 + log t` AFT baseline. Projecting the three
+    // exit/entry/derivative designs onto `X z` leaves a clean `r`-column
+    // parametric block whose every direction is data-identified, so the coupled
+    // exact-joint inner solve has no free penalized-stationarity null space to
+    // choke on. The penalty `zᵀ S z` collapses to (numerically) zero on the
+    // null space — the correct, unpenalized parametric block, exactly like the
+    // constant-scale `log_sigma` block — and the regime's pinned `ρ = 10` time
+    // seed (`build_survival_two_block_exact_joint_setup`) certifies its flat
+    // box-bound KKT immediately rather than crawling the old 12-column ridge.
+    //
+    // Monotonicity is preserved structurally: the per-row derivative guard
+    // `(X' z) β_r + offset ≥ guard` is built from the *reduced* derivative
+    // design, so `h(t)` stays non-decreasing pointwise at every observed time.
+    // (The coordinate-cone per-column `γ ≥ 0` lower bounds are dropped — they
+    // are a property of individual I-spline columns, not of the affine
+    // generators that span their null space — and the row-wise guard takes over
+    // that role exactly.)
+    if reduce_to_parametric && let Some(z) = time_parametric_null_space_basis(&input.penalties, p) {
+        let r = z.ncols();
+        let reduced_entry = design_entry.dot(&z);
+        let reduced_exit = design_exit.dot(&z);
+        let reduced_derivative_exit = design_derivative_exit.dot(&z);
+        let reduced_penalties: Vec<Array2<f64>> = input
+            .penalties
+            .iter()
+            .map(|s_mat| z.t().dot(s_mat).dot(&z))
+            .collect();
+        // `z` spans the penalty null space, so every `zᵀ S z` is (numerically)
+        // the zero `r×r` matrix and its structural null-space dimension is the
+        // full reduced rank `r`. Compute it from the projected penalty so the
+        // REML log-det accounting stays honest even if a future penalty retains
+        // residual curvature on the affine subspace.
+        let reduced_nullspace_dims: Vec<usize> = reduced_penalties
+            .iter()
+            .map(|s_mat| symmetric_null_space_dim(s_mat))
+            .collect();
+        let reduced_derivative_design =
+            DesignMatrix::Dense(DenseDesignMatrix::from(reduced_derivative_exit.clone()));
+        // Pointwise monotonicity in the reduced affine space: enforce the
+        // derivative guard directly via row constraints on `X' z`. There is no
+        // coordinate-cone lower-bound ridge here because the affine generators
+        // are not individually sign-definite I-spline columns.
+        let linear_constraints = time_derivative_guard_constraints(
+            &reduced_derivative_design,
+            &input.derivative_offset_exit,
+            derivative_guard,
+        )?;
+        let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
+            (Some(constraints), Some(beta0)) => Some(project_onto_linear_constraints(
+                r,
+                constraints,
+                Some(&z.t().dot(beta0)),
+            )?),
+            (_, Some(beta0)) => Some(z.t().dot(beta0)),
+            _ => None,
+        };
+        return Ok(TimeBlockPrepared {
+            design_entry: reduced_entry,
+            design_exit: reduced_exit,
+            design_derivative_exit: reduced_derivative_exit,
+            coefficient_lower_bounds: None,
+            linear_constraints,
+            penalties: reduced_penalties,
+            nullspace_dims: reduced_nullspace_dims,
+            initial_beta,
+            transform: TimeIdentifiabilityTransform { z },
+        });
+    }
+
     let penalties = input.penalties.clone();
     let coefficient_lower_bounds = structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         &input.design_derivative_exit,
@@ -5068,6 +5230,7 @@ fn prepare_identified_time_block(
         coefficient_lower_bounds: Some(coefficient_lower_bounds),
         linear_constraints,
         penalties,
+        nullspace_dims: input.nullspace_dims.clone(),
         initial_beta,
         transform: TimeIdentifiabilityTransform { z: Array2::eye(p) },
     })
@@ -11896,7 +12059,7 @@ mod tests {
             initial_beta: None,
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
@@ -11922,7 +12085,7 @@ mod tests {
         };
 
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -11946,6 +12109,41 @@ mod tests {
             "prepared exit design should keep the full anchored basis width"
         );
         assert_eq!(prepared.transform.z, Array2::<f64>::eye(p));
+    }
+
+    #[test]
+    fn identified_time_block_can_reduce_to_parametric_penalty_nullspace() {
+        let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
+        let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
+        let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
+        let time_block = TimeBlockInput {
+            design_entry: DesignMatrix::from(design_entry.clone()),
+            design_exit: DesignMatrix::from(design_exit.clone()),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
+            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            penalties: vec![array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
+            nullspace_dims: vec![],
+            initial_log_lambdas: None,
+            initial_beta: Some(array![0.5, 0.2, 9.0]),
+        };
+
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6, 0, true).expect("prepare time block");
+        assert_eq!(prepared.transform.z.nrows(), 3);
+        assert_eq!(prepared.transform.z.ncols(), 2);
+        assert_eq!(prepared.design_entry.ncols(), 2);
+        assert_eq!(prepared.design_exit.ncols(), 2);
+        assert_eq!(prepared.design_derivative_exit.ncols(), 2);
+        assert!(prepared.coefficient_lower_bounds.is_none());
+        assert_eq!(prepared.penalties.len(), 1);
+        assert!(
+            prepared.penalties[0].iter().all(|v| v.abs() <= 1e-10),
+            "parametric nullspace penalty should collapse to zero: {:?}",
+            prepared.penalties[0]
+        );
     }
 
     #[test]
@@ -11973,7 +12171,7 @@ mod tests {
             initial_beta: Some(array![-0.5, 0.2, -1.5]),
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
         assert_eq!(
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0])
@@ -12019,7 +12217,7 @@ mod tests {
             initial_beta: Some(array![-0.5, 0.2, -1.5, -2.0]),
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 1).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 1, false).expect("prepare time block");
         assert_eq!(
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0, 0.0])
@@ -12051,7 +12249,7 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let err = match prepare_identified_time_block(&time_block, 1e-6, 0) {
+        let err = match prepare_identified_time_block(&time_block, 1e-6, 0, false) {
             Ok(_) => panic!("offsets below the guard must be rejected"),
             Err(err) => err,
         };
@@ -12388,7 +12586,7 @@ mod tests {
             initial_beta: None,
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
