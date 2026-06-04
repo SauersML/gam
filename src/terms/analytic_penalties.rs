@@ -3975,11 +3975,34 @@ impl NuclearNormPenalty {
         self.max_rank.unwrap_or(thin_rank).min(thin_rank)
     }
 
+    /// Number of leading right-Gram eigen-directions (top singular values) the
+    /// HVP keeps active, identical to the rank `value`/`grad` sum over.
+    ///
+    /// The right Gram `TᵀT` is `d×d` but has at most `thin_rank = min(n_rows, d)`
+    /// nonzero eigenvalues (the squared singular values); the remaining
+    /// `d − thin_rank` are an exact, *tied* zero subspace. Capping the active
+    /// count with the Gram width `d` (or any value `> thin_rank`) would push the
+    /// active/inactive cutoff *inside* that tied zero subspace, where the split
+    /// is ill-defined — for a wide block (`n_rows < d`) with
+    /// `max_rank > thin_rank` this previously panicked. We therefore cap with the
+    /// true SVD length `thin_rank`, matching `rank_limit`, so the cutoff always
+    /// lands either between the zero subspace and the nonzero singular values, or
+    /// between distinct nonzero singular values, never bisecting the zero block.
     fn right_filter_active_count(&self, n_rows: usize, n_cols: usize) -> usize {
         let thin_rank = n_rows.min(n_cols);
         match self.max_rank {
+            // No cap: keep every right-Gram direction. The `d − thin_rank` exact
+            // zero directions get a finite smoothed `(0+ε²)^(-1/2)` filter and
+            // contribute nothing to `G(T)` (since `T` has no projection onto
+            // them), so this is consistent with `value`/`grad`'s full sum.
             None => n_cols,
+            // A cap that does not bite (`max_rank ≥ thin_rank`) is likewise a
+            // no-op: keep every direction.
             Some(max_rank) if max_rank >= thin_rank => n_cols,
+            // A genuine cap keeps only the top `max_rank` singular directions —
+            // never more than `thin_rank`, so the active/inactive cutoff lands
+            // strictly inside the nonzero singular block and never bisects the
+            // tied zero subspace of the `d×d` Gram.
             Some(max_rank) => max_rank,
         }
     }
