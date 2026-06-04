@@ -18592,13 +18592,14 @@ fn joint_penalty_subspace_trace_parts(
             symmetrize_dense_in_place(&mut h_proj_inverse);
             (logdet, h_proj_inverse)
         }
-        // Materialization refused (over the dense byte budget): fall back to the
-        // self-consistent range(Sλ) projection (logdet AND kernel both reduced
-        // onto range(Sλ)). This under-counts the penalty-null determinant, but
-        // only fires at a joint dimension where dense algebra is itself
-        // infeasible; the value and its trace kernel are still mutually
-        // consistent (both `M_rr`), so the outer gradient stays valid.
-        Err(_) => {
+    } else {
+        // Over the dense byte budget: fall back to the self-consistent range(Sλ)
+        // projection (logdet AND kernel both reduced onto range(Sλ)). This
+        // under-counts the penalty-null determinant, but only fires at a joint
+        // dimension where dense algebra is itself infeasible; the value and its
+        // trace kernel are still mutually consistent (both `M_rr`), so the outer
+        // gradient stays valid.
+        {
             let h_times_u = build_h_times_u()?;
             let mut h_proj = fast_atb(&u_s, &h_times_u);
             symmetrize_dense_in_place(&mut h_proj);
