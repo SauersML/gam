@@ -18,6 +18,16 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.89 — gam 0.3.89 / gamfit 0.1.161 (2026-06-04)
+
+### Fixed
+
+- **Bernoulli marginal-slope redundant-scalar handling now has fail-closed
+  regression coverage.** Tests now lock in that constrained or explicitly
+  penalized duplicate scalar columns are rejected rather than pruned, preserving
+  the hardened identifiability audit contract for hypertension-style BMS
+  formulas with redundant scalar covariates.
+
 ## v0.3.88 — gam 0.3.88 / gamfit 0.1.160 (2026-06-04)
 
 ### Fixed
