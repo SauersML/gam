@@ -17039,12 +17039,31 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
+    let dim = centers.ncols();
+    let two_pps = 2.0 * (p_order as f64 + spec.power);
+    let mut effective_operator_penalties = spec.operator_penalties.clone();
+    if two_pps <= dim as f64 + 1.0 {
+        effective_operator_penalties.tension = OperatorPenaltySpec::Disabled;
+    }
+    if two_pps <= dim as f64 + 2.0 {
+        effective_operator_penalties.stiffness = OperatorPenaltySpec::Disabled;
+    }
+    let max_derivative_order =
+        duchon_max_active_operator_derivative_order(&effective_operator_penalties);
+    if max_derivative_order == 0
+        && !matches!(
+            effective_operator_penalties.mass,
+            OperatorPenaltySpec::Active { .. }
+        )
+    {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    }
     validate_duchon_collocation_orders(
         Some(length_scale),
         p_order,
         s_order as f64,
-        centers.ncols(),
-        duchon_max_active_operator_derivative_order(&spec.operator_penalties),
+        dim,
+        max_derivative_order,
     )?;
     // Hybrid Matérn partial-fraction expansion requires integer s; the
     // assertion fires here rather than at the spec layer so the
@@ -17053,7 +17072,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     let p = centers.nrows();
-    let d = centers.ncols();
+    let d = dim;
     let kernel_cols = z_kernel.ncols();
 
     let aniso = spec.aniso_log_scales.as_deref();
@@ -17385,6 +17404,10 @@ fn build_duchon_operator_penalty_psi_derivatives(
             op: None,
         },
     ];
+    let candidates = operator_penalty_candidates_from_derivative_candidates(
+        candidates,
+        &effective_operator_penalties,
+    );
 
     let first_derivs = vec![s0_norm_psi, s1_norm_psi, s2_norm_psi];
     let second_derivs = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];
@@ -17404,6 +17427,25 @@ fn build_duchon_operator_penalty_psi_derivatives(
         penalties_derivative,
         penaltiessecond_derivative,
     ))
+}
+
+fn operator_penalty_candidates_from_derivative_candidates(
+    candidates: Vec<PenaltyCandidate>,
+    spec: &DuchonOperatorPenaltySpec,
+) -> Vec<PenaltyCandidate> {
+    candidates
+        .into_iter()
+        .filter(|candidate| match candidate.source {
+            PenaltySource::OperatorMass => matches!(spec.mass, OperatorPenaltySpec::Active { .. }),
+            PenaltySource::OperatorTension => {
+                matches!(spec.tension, OperatorPenaltySpec::Active { .. })
+            }
+            PenaltySource::OperatorStiffness => {
+                matches!(spec.stiffness, OperatorPenaltySpec::Active { .. })
+            }
+            _ => true,
+        })
+        .collect()
 }
 
 fn build_duchon_native_penalty_psi_derivatives(
@@ -33421,27 +33463,33 @@ mod tests {
         data: ArrayView2<'_, f64>,
         spec: &DuchonBasisSpec,
     ) {
-        use crate::faer_ndarray::{FaerCholesky, FaerEigh};
+        use crate::faer_ndarray::FaerEigh;
         let out =
             build_duchon_basis(data, spec).expect("Duchon basis should build for joint-null test");
         let design = out.design.to_dense();
         let (n, p) = design.dim();
+        let BasisMetadata::Duchon {
+            nullspace_order,
+            identifiability_transform,
+            ..
+        } = &out.metadata
+        else {
+            panic!("expected Duchon metadata, got {:?}", out.metadata);
+        };
         assert!(
-            n >= p,
-            "need n ≥ p to recover v_const via least squares: n={n}, p={p}"
+            identifiability_transform.is_none(),
+            "this joint-null test uses the raw Duchon polynomial block; add a transformed-frame check separately"
         );
-        let ones = Array1::<f64>::ones(n);
-        let xtx = crate::faer_ndarray::fast_atb(&design, &design);
-        let xt_ones = crate::faer_ndarray::fast_atv(&design, &ones);
-        let mut xtx_reg = xtx.clone();
-        for i in 0..p {
-            xtx_reg[[i, i]] += 1e-14 * (xtx[[i, i]].abs().max(1.0));
-        }
-        let chol = xtx_reg
-            .cholesky(faer::Side::Lower)
-            .expect("XᵀX SPD with ridge");
-        let v_const = chol.solvevec(&xt_ones);
+        let poly_cols = polynomial_block_from_order(data, *nullspace_order).ncols();
+        assert!(
+            p >= poly_cols,
+            "Duchon design has fewer columns ({p}) than its polynomial block ({poly_cols})"
+        );
+        let kernel_cols = p - poly_cols;
+        let mut v_const = Array1::<f64>::zeros(p);
+        v_const[kernel_cols] = 1.0;
         let recon = crate::faer_ndarray::fast_av(&design, &v_const);
+        let ones = Array1::<f64>::ones(n);
         let err = (&recon - &ones)
             .iter()
             .map(|v| v.abs())
