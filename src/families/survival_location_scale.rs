@@ -10682,7 +10682,28 @@ pub(crate) fn fit_survival_location_scale_terms(
                 time_monotonicity: spec.time_block.time_monotonicity,
                 penalties: spec.time_block.penalties.clone(),
                 nullspace_dims: spec.time_block.nullspace_dims.clone(),
-                initial_log_lambdas: Some(layout.time_from(rho)),
+                // `initial_log_lambdas` is the per-penalty seed for THIS block's
+                // (still un-reduced) `penalties`, validated against that list's
+                // length by `validate_time_block`. In the flexible regime the
+                // outer layout carries one time ρ per penalty, so `time_from`
+                // returns exactly `penalties.len()` entries. In the reduced
+                // constant-scale-AFT regime (`layout.k_time == 0`) the outer
+                // search carries NO time coordinate, so `time_from` is empty —
+                // but `penalties` here is the un-reduced length-`k` list (the
+                // collapse to the unpenalized affine null space happens later,
+                // inside `prepare_identified_time_block`). Emitting the empty
+                // outer slice against the un-reduced penalties would make
+                // `initial_log_lambdas.len() (0) != penalties.len() (k)` and
+                // trip the block's length-consistency check. The downstream
+                // reduction re-derives (and drops) this seed for the collapsed
+                // block, so any length-`k` value is fine here; carry the
+                // caller's original per-penalty seed to stay length-consistent
+                // with the un-reduced penalty list (issue #736/#735/#721).
+                initial_log_lambdas: if layout.k_time > 0 {
+                    Some(layout.time_from(rho))
+                } else {
+                    spec.time_block.initial_log_lambdas.clone()
+                },
                 initial_beta: time_beta,
             },
             threshold_block,
