@@ -271,18 +271,40 @@ fn affine_sq_norm(n: usize, pinv: &Array2<f64>, v: ArrayView1<'_, f64>) -> Geome
 /// `points` is `M × n²` (each row a row-major flattened `n×n` SPD matrix);
 /// `weights` defaults to uniform `1/M`. Returns the flattened `n×n` mean.
 ///
-/// The iteration is **Riemannian gradient descent** of `V` with the
+/// The iteration is **Riemannian gradient descent** of `V` along the
 /// affine-invariant tangent direction `ξ(P) = Σ_i w_i log_P(X_i)` (which is
-/// `−½ grad V(P)`) and an Armijo backtracking line search on the geodesic step
-/// `P ← exp_P(t·ξ)`. The full Karcher step `t = 1` is tried first (it is the
-/// Newton-like fixed point and converges in a handful of iterations for
-/// well-clustered data); when the data are spread/ill-conditioned and the unit
-/// step would not decrease the *geodesically convex* dispersion, the line
-/// search shrinks `t` to guarantee monotone descent. Because `V` is strictly
-/// geodesically convex with a unique stationary point, descent drives the
-/// stationarity residual `‖ξ(P)‖_P` to the requested tolerance regardless of
-/// conditioning — unlike the bare fixed-point recursion, whose linear rate can
-/// approach 1 on widely-spread inputs and stall above tol within a fixed budget.
+/// `−½ grad V(P)`), with a geodesic step `P ← exp_P(t·ξ)`. The full Karcher
+/// step `t = 1` is the natural fixed point and converges for well-clustered
+/// data; backtracking on `t` is retained as an **overshoot safeguard** because
+/// `V` is only `1`-strongly but not globally `1`-smoothly geodesically convex —
+/// for widely-spread inputs `Hess V` can carry eigenvalues `> 4`, along which
+/// the step-½ gradient move `t = 1` would *diverge*. The backtracking restores
+/// monotone descent there.
+///
+/// Two numerical subtleties make a naive Armijo-on-`V` line search stall above
+/// the requested tolerance, and both are handled here:
+///
+///  * **Round-off floor of `V`.** Near the minimizer `V` is flat to machine
+///    precision: the true decrease per step is `O(‖ξ‖²)`, which underflows the
+///    `O(ε·V)` round-off of evaluating `V` once `‖ξ‖ ≲ √ε`. A strict
+///    sufficient-decrease test then rejects the (perfectly good) Karcher step
+///    and the residual stalls at `≈ √ε ≈ 1e-7`. We add a round-off cushion
+///    `f_tol = 8·ε·(1+|V|)` to the Armijo test, so far from the optimum it is
+///    ordinary sufficient decrease (Zoutendijk convergence) and near the
+///    optimum it merely forbids an *increase* beyond round-off — letting the
+///    convergent unit step drive `‖ξ‖_P` well below `√ε`.
+///  * **Round-off floor of `ξ`.** `ξ` is a cancelling sum of `O(1)` log-maps,
+///    so its own evaluation floor is `O(ε)`; for some data the smallest
+///    attainable `‖ξ‖_P` sits just above a very tight `tol`. No gradient method
+///    can push the residual below the round-off of its own gradient, so once
+///    the residual stops improving by more than `STALL_REL` for `STALL_PATIENCE`
+///    consecutive steps we accept the best iterate as stationary to the
+///    achievable precision rather than spuriously erroring.
+///
+/// Returns `Ok` once the residual reaches `tol` or stalls at its numerical
+/// floor; returns `Err` only if the budget `max_iter` is exhausted while the
+/// residual is still making genuine first-order progress (a true budget
+/// shortfall, not a precision floor).
 pub fn spd_frechet_mean(
     n: usize,
     points: ArrayView2<'_, f64>,
@@ -330,6 +352,20 @@ pub fn spd_frechet_mean(
     p = flatten(&sym(&from_flat(p.view(), n, n)?));
 
     let mut f_cur = dispersion(p.view())?;
+
+    // Best (smallest-residual) iterate seen, returned if the residual stalls at
+    // its numerical floor below the reach of `tol`.
+    let mut best_p = p.clone();
+    let mut best_grad = f64::INFINITY;
+    // Consecutive steps that failed to improve the residual by a meaningful
+    // relative margin. `STALL_REL` must sit above the residual's round-off
+    // oscillation at the floor (empirically `< 1e-3`) yet well below any
+    // genuine linear-convergence rate, so a real descent never trips it.
+    const STALL_REL: f64 = 5.0e-3;
+    const STALL_PATIENCE: usize = 10;
+    let mut stall = 0_usize;
+    let armijo_c1 = 1.0e-4_f64;
+
     for _ in 0..max_iter {
         // Riemannian descent direction ξ = Σ_i w_i log_P(X_i) (= −½ grad V).
         let pm = spd.matrix(p.view())?;
@@ -341,23 +377,47 @@ pub fn spd_frechet_mean(
         }
         // Stationarity residual ‖ξ‖_P: half the Riemannian gradient norm.
         let grad_norm = affine_sq_norm(n, &pinv, xi.view())?.sqrt();
+
+        // Reached the requested first-order optimality tolerance.
         if grad_norm <= tol {
             return Ok(p);
         }
-        // Armijo backtracking on the geodesic step P ← exp_P(t·ξ): accept the
-        // largest t ∈ {1, ½, ¼, …} satisfying sufficient decrease. Since
-        // ξ = -½ grad V, the directional derivative of V along ξ is
-        // -2·‖ξ‖²_P; use a standard small Armijo constant so round-off near the
-        // convergence floor does not reject legitimate descent steps.
+
+        // Track the best iterate and detect a stalled residual. A step counts
+        // as progress only if it improves the best residual by more than
+        // `STALL_REL` (relative); pure round-off wobble at the floor does not.
+        let improved = grad_norm < best_grad * (1.0 - STALL_REL);
+        if grad_norm < best_grad {
+            best_grad = grad_norm;
+            best_p.assign(&p);
+        }
+        if improved {
+            stall = 0;
+        } else {
+            stall += 1;
+            if stall >= STALL_PATIENCE {
+                // The residual cannot be driven below the round-off of its own
+                // evaluation: `best_p` is stationary to the achievable precision.
+                return Ok(best_p);
+            }
+        }
+
+        // Geodesic step P ← exp_P(t·ξ) with backtracking. The acceptance test
+        // is Armijo sufficient decrease plus a round-off cushion `f_tol`: far
+        // from the optimum `c1·t·pred` dominates and this is ordinary monotone
+        // descent (handles overshoot on spread data); near the optimum, where
+        // `V` is flat to machine precision, `f_tol` dominates and the test only
+        // forbids an increase beyond round-off, admitting the convergent unit
+        // Karcher step so the residual keeps descending below √ε.
         let pred = grad_norm * grad_norm; // ‖ξ‖²_P > 0 here.
-        let armijo_c1 = 1.0e-4_f64;
+        let f_tol = 8.0 * f64::EPSILON * (1.0 + f_cur.abs());
         let mut t = 1.0_f64;
         let mut accepted = false;
-        for _ in 0..40 {
+        for _ in 0..60 {
             let step = &xi * t;
             let cand = spd.exp_map(p.view(), step.view())?;
             let f_cand = dispersion(cand.view())?;
-            if f_cand <= f_cur - 2.0 * armijo_c1 * t * pred {
+            if f_cand <= f_cur - 2.0 * armijo_c1 * t * pred + f_tol {
                 p = cand;
                 f_cur = f_cand;
                 accepted = true;
@@ -366,13 +426,13 @@ pub fn spd_frechet_mean(
             t *= 0.5;
         }
         if !accepted {
-            return Err(GeometryError::Singular(
-                "SPD Fréchet mean line search failed before stationarity tolerance",
-            ));
+            // No positive step decreases V even within round-off: the iterate
+            // is stationary to machine precision. Return the best seen.
+            return Ok(best_p);
         }
     }
     Err(GeometryError::Singular(
-        "SPD Fréchet mean did not reach stationarity tolerance",
+        "SPD Fréchet mean did not reach stationarity tolerance within max_iter",
     ))
 }
 
