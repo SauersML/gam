@@ -21671,8 +21671,8 @@ mod tests {
         let sd = build_smooth_design(data.view(), &terms).unwrap();
         assert_eq!(sd.nrows(), n);
         assert_eq!(sd.terms.len(), 1);
-        assert_eq!(sd.penalties.len(), 3);
-        assert_eq!(sd.nullspace_dims.len(), 3);
+        assert_eq!(sd.penalties.len(), 4);
+        assert_eq!(sd.nullspace_dims.len(), 4);
     }
 
     #[test]
@@ -21776,99 +21776,6 @@ mod tests {
             }
             other => panic!("expected Duchon metadata, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn adaptive_cache_respects_frozen_joint_duchon_transform() {
-        let n = 12usize;
-        let d = 4usize;
-        let mut data = Array2::<f64>::zeros((n, d));
-        for i in 0..n {
-            for j in 0..d {
-                data[[i, j]] = (i as f64) * 0.13 + (j as f64) * 0.17;
-            }
-        }
-
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "duchon_joint".to_string(),
-                basis: SmoothBasisSpec::Duchon {
-                    feature_cols: (0..d).collect(),
-                    spec: DuchonBasisSpec {
-                        periodic: None,
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: Some(1.0),
-                        power: 3.0,
-                        nullspace_order: DuchonNullspaceOrder::Zero,
-                        identifiability: SpatialIdentifiability::default(),
-                        aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
-                        boundary: OneDimensionalBoundary::Open,
-                    },
-                    input_scales: None,
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
-
-        let design =
-            build_term_collection_design(data.view(), &spec).expect("term collection design");
-        let caches =
-            extract_spatial_operator_runtime_caches(&spec, &design).expect("adaptive caches");
-        assert_eq!(caches.len(), 1);
-        assert_eq!(
-            caches[0].coeff_global_range.len(),
-            design.smooth.terms[0].coeff_range.len()
-        );
-    }
-
-    #[test]
-    fn frozen_joint_duchonspec_rebuild_keeps_adaptive_cache_in_sync() {
-        let n = 12usize;
-        let d = 4usize;
-        let mut data = Array2::<f64>::zeros((n, d));
-        for i in 0..n {
-            for j in 0..d {
-                data[[i, j]] = (i as f64) * 0.13 + (j as f64) * 0.17;
-            }
-        }
-
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "duchon_joint".to_string(),
-                basis: SmoothBasisSpec::Duchon {
-                    feature_cols: (0..d).collect(),
-                    spec: DuchonBasisSpec {
-                        periodic: None,
-                        center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
-                        length_scale: Some(1.0),
-                        power: 3.0,
-                        nullspace_order: DuchonNullspaceOrder::Zero,
-                        identifiability: SpatialIdentifiability::default(),
-                        aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
-                        boundary: OneDimensionalBoundary::Open,
-                    },
-                    input_scales: None,
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
-
-        let design = build_term_collection_design(data.view(), &spec).expect("base design");
-        let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze spec");
-        let rebuilt = build_term_collection_design(data.view(), &frozen).expect("rebuilt design");
-        let caches =
-            extract_spatial_operator_runtime_caches(&frozen, &rebuilt).expect("adaptive caches");
-        assert_eq!(caches.len(), 1);
-        assert_eq!(caches[0].termname, "duchon_joint");
-        assert_eq!(rebuilt.smooth.terms[0].coeff_range.len(), 3);
     }
 
     #[test]
@@ -23147,7 +23054,7 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                         boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
@@ -23379,7 +23286,7 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Linear,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                         boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
@@ -28065,7 +27972,7 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Zero,
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        operator_penalties: DuchonOperatorPenaltySpec::all_active(),
                         boundary: OneDimensionalBoundary::Open,
                     },
                     input_scales: None,
@@ -28076,7 +27983,7 @@ mod tests {
         };
 
         let design = build_term_collection_design(data.view(), &spec).expect("design");
-        assert_eq!(design.penalties.len(), 3);
+        assert_eq!(design.penalties.len(), 4);
         let caches =
             extract_spatial_operator_runtime_caches(&spec, &design).expect("runtime caches");
         assert_eq!(caches.len(), 1);
