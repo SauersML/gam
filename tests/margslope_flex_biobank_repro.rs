@@ -1,11 +1,11 @@
 //! Fast local reproducer for the FLEX bernoulli marginal-slope cycle-0 cost
 //! cliff seen in the biobank-scale lane.
 //!
-//! Manual invocation (intentionally ignored; do not put this in normal CI):
+//! Manual invocation:
 //!
 //! ```text
 //! cargo test --release --test margslope_flex_biobank_repro \
-//!     -- --ignored --nocapture
+//!     -- --nocapture
 //! ```
 //!
 //! The synthetic shape keeps the production code path active: probit

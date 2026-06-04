@@ -7891,10 +7891,7 @@ mod tests {
         // (`row_primary_hessians`).  The matrix-free CG / inner-Newton loops
         // contract the same per-row primary Hessian against many trial
         // directions at the same β, so caching the `r×r` blocks once should
-        // beat rebuilding cell moments + flex jets on every Hv.  Ignored by
-        // default because timing assertions are flaky on shared CI runners;
-        // run locally with `cargo test --release -- --ignored
-        // bernoulli_flex_hvp_cache_timing_biobank_shape_pattern --nocapture`.
+        // beat rebuilding cell moments + flex jets on every Hv.
         let (family, states) = make_flex_hvp_cache_test_family(96);
         let mut cached = family
             .build_exact_eval_cache(&states)
