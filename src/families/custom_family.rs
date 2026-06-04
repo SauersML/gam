@@ -2161,8 +2161,8 @@ pub trait CustomFamily {
     ///
     /// When `Some`, the returned vector MUST have length equal to the number
     /// of blocks; `fit_custom_family` surfaces a structured error otherwise.
-    fn output_channel_assignment(&self, specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
-        specs.is_empty().then(Vec::new)
+    fn output_channel_assignment(&self, _specs: &[ParameterBlockSpec]) -> Option<Vec<usize>> {
+        None
     }
 
     /// Optional dynamic geometry hook for blocks whose design/offset depend on
