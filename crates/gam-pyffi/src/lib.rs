@@ -25065,33 +25065,19 @@ fn predict_columns(
     Ok(columns)
 }
 
-/// Residual dispersion `φ̂` for the conformal calibration scale, mirroring the
-/// CLI/summary convention: Gaussian → σ̂², Gamma → fixed φ (else 1/σ̂ as the
-/// reciprocal-dispersion proxy), every other family → 1.0 (φ fixed at 1).
-fn conformal_dispersion_phi(fit: &gam::estimate::UnifiedFitResult, family: &LikelihoodSpec) -> f64 {
-    match family.response {
-        ResponseFamily::Gaussian => fit.standard_deviation * fit.standard_deviation,
-        ResponseFamily::Gamma => fit.likelihood_scale.fixed_phi().unwrap_or_else(|| {
-            if fit.standard_deviation.is_finite() && fit.standard_deviation > 0.0 {
-                1.0 / fit.standard_deviation
-            } else {
-                1.0
-            }
-        }),
-        _ => 1.0,
-    }
-}
-
-/// Build the held-out calibration data needed by the conformal calibrator: the
-/// calibration design `X_cal`, its linear predictor `η_cal = X_cal·β̂ + offset`,
-/// the offset, and the calibration response `y_cal`. The response column is
-/// resolved from the saved formula and must be present in the calibration
-/// dataset (calibration is *labeled* held-out data, unlike a predict batch).
-fn conformal_calibration_arrays(
+/// Build the held-out calibration fold needed by the conformal calibrator: a
+/// [`PredictInput`] over the calibration design (so the model's own predict
+/// engine produces `μ̂(x_cal)` and `s(x_cal)` at exactly those points,
+/// identically to the test path) and the calibration response `y_cal`. The
+/// response column is resolved from the saved formula and must be present in
+/// the calibration dataset (calibration is *labeled* held-out data, unlike a
+/// predict batch). The fold carries its own design and may be of ANY size,
+/// independent of the training set — it is never bound to the training rows.
+fn conformal_calibration_fold(
     model: &FittedModel,
     fit: &gam::estimate::UnifiedFitResult,
     calibration: EncodedDataset,
-) -> Result<(Array2<f64>, Array1<f64>, Array1<f64>, Array1<f64>), String> {
+) -> Result<(gam::predict::PredictInput, Array1<f64>), String> {
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
             "conformal calibration currently supports only standard GAM models; got '{}'",
@@ -25100,6 +25086,8 @@ fn conformal_calibration_arrays(
     }
     let col_map = calibration.column_map();
     let offset = resolve_offset_column(&calibration, &col_map, model.offset_column.as_deref())?;
+    let offset_noise =
+        resolve_offset_column(&calibration, &col_map, model.noise_offset_column.as_deref())?;
     let response_name = response_column_name(&model.payload().formula).ok_or_else(|| {
         "conformal calibration: could not resolve the response column from the saved formula"
             .to_string()
@@ -25111,19 +25099,27 @@ fn conformal_calibration_arrays(
         )
     })?;
     let y = calibration.values.column(response_col).to_owned();
-    // Design and β̂ define the (on the calibration fold) linear predictor
-    // η = X·β̂ + offset, which `from_fit` maps through ALO into genuine
-    // held-out predictors for the nonconformity scores.
-    let design = design_matrix_dense(model, calibration)?;
-    if design.ncols() != fit.beta.len() {
+    // Build the calibration-fold predict input the same way the test batch is
+    // built, so the predict engine yields μ̂(x_cal) and s(x_cal) from exactly
+    // the same source used at test time.
+    let cal_input = build_predict_input_for_model(
+        model,
+        calibration.values.view(),
+        &col_map,
+        model.training_headers.as_ref(),
+        &offset,
+        &offset_noise,
+        false,
+    )?;
+    let design_cols = cal_input.design.ncols();
+    if design_cols != fit.beta.len() {
         return Err(format!(
             "conformal calibration design has {} columns but the fit has {} coefficients",
-            design.ncols(),
+            design_cols,
             fit.beta.len()
         ));
     }
-    let eta = design.dot(&fit.beta) + &offset;
-    Ok((design, eta, offset, y))
+    Ok((cal_input, y))
 }
 
 /// Conformal-calibrated prediction columns. Runs the model-based full-
@@ -25177,15 +25173,10 @@ fn predict_columns_conformal(
         ..gam::predict::PredictUncertaintyOptions::default()
     };
 
-    let (cal_design, cal_eta, cal_offset, cal_y) =
-        conformal_calibration_arrays(model, &fit, calibration)?;
-    let phi = conformal_dispersion_phi(&fit, &family);
-    let train = gam::predict::ConformalTrainingData {
-        design: &cal_design,
-        eta: &cal_eta,
-        offset: &cal_offset,
+    let (cal_input, cal_y) = conformal_calibration_fold(model, &fit, calibration)?;
+    let calibration_fold = gam::predict::ConformalCalibrationFold {
+        input: cal_input,
         y: cal_y.view(),
-        phi,
     };
     let prediction = gam::predict::predict_full_uncertainty_conformal(
         predictor.as_ref(),
@@ -25193,7 +25184,7 @@ fn predict_columns_conformal(
         &fit,
         &family,
         &uncertainty_options,
-        &train,
+        &calibration_fold,
     )
     .map_err(|err| format!("conformal prediction failed: {err}"))?;
 
