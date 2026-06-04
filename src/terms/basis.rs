@@ -17029,7 +17029,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
     spec: &DuchonBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
-) -> Result<(Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
+) -> Result<(Vec<PenaltySource>, Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
     let length_scale = spec.length_scale.ok_or_else(|| {
         BasisError::InvalidInput(
             "exact Duchon log-kappa derivatives require hybrid Duchon with length_scale"
@@ -17390,11 +17390,126 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let second_derivs = vec![s0_norm_psi_psi, s1_norm_psi_psi, s2_norm_psi_psi];
 
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let active_sources = penaltyinfo
+        .iter()
+        .filter(|info| info.active)
+        .map(|info| info.source.clone())
+        .collect::<Vec<_>>();
     let penalties_derivative =
         active_operator_penalty_derivatives(&penaltyinfo, &first_derivs, "Duchon")?;
     let penaltiessecond_derivative =
         active_operator_penalty_derivatives(&penaltyinfo, &second_derivs, "Duchon")?;
-    Ok((penalties_derivative, penaltiessecond_derivative))
+    Ok((
+        active_sources,
+        penalties_derivative,
+        penaltiessecond_derivative,
+    ))
+}
+
+fn build_duchon_native_penalty_psi_derivatives(
+    centers: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    identifiability_transform: Option<&Array2<f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<(Vec<PenaltySource>, Vec<Array2<f64>>, Vec<Array2<f64>>), BasisError> {
+    let length_scale = spec.length_scale.ok_or_else(|| {
+        BasisError::InvalidInput(
+            "exact Duchon native penalty log-kappa derivatives require hybrid Duchon with length_scale"
+                .to_string(),
+        )
+    })?;
+    let effective_nullspace_order = duchon_effective_nullspace_order(centers, spec.nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
+    let s_order = spec.power_as_usize();
+    let dim = centers.ncols();
+    let z = kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    let kernel_cols = z.ncols();
+    let poly_cols = polynomial_block_from_order(centers, effective_nullspace_order).ncols();
+    let total_cols = kernel_cols + poly_cols;
+    let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale.max(1e-300));
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        Some(length_scale),
+        p_order,
+        s_order,
+        dim,
+        spec.aniso_log_scales.as_deref(),
+        Some(&coeffs),
+        None,
+    );
+    let axis_scales = spec.aniso_log_scales.as_deref().map(aniso_axis_scales);
+    let n_centers = centers.nrows();
+    let mut kernel = Array2::<f64>::zeros((n_centers, n_centers));
+    let mut kernel_psi = Array2::<f64>::zeros((n_centers, n_centers));
+    let mut kernel_psi_psi = Array2::<f64>::zeros((n_centers, n_centers));
+    for i in 0..n_centers {
+        for j in i..n_centers {
+            let r = if let Some(scales) = axis_scales.as_deref() {
+                aniso_distance_rows_with_scales(centers, i, centers, j, scales)
+            } else {
+                euclidean_distance_rows(centers, i, centers, j)
+            };
+            let core =
+                duchon_radial_core_psi_triplet(r, length_scale, p_order, s_order, dim, &coeffs)?;
+            kernel[[i, j]] = core.phi.value;
+            kernel[[j, i]] = core.phi.value;
+            kernel_psi[[i, j]] = core.phi.psi;
+            kernel_psi[[j, i]] = core.phi.psi;
+            kernel_psi_psi[[i, j]] = core.phi.psi_psi;
+            kernel_psi_psi[[j, i]] = core.phi.psi_psi;
+        }
+    }
+
+    let amp2 = kernel_amp * kernel_amp;
+    let project_kernel = |k: &Array2<f64>| fast_ab(&fast_atb(&z, k), &z).mapv(|v| v * amp2);
+    let omega = project_kernel(&kernel);
+    let omega_psi = project_kernel(&kernel_psi);
+    let omega_psi_psi = project_kernel(&kernel_psi_psi);
+
+    let embed = |block: Array2<f64>| {
+        let mut out = Array2::<f64>::zeros((total_cols, total_cols));
+        out.slice_mut(s![..kernel_cols, ..kernel_cols])
+            .assign(&block);
+        symmetrize(&project_penalty_matrix(&out, identifiability_transform))
+    };
+    let primary = embed(omega);
+    let primary_psi = embed(omega_psi);
+    let primary_psi_psi = embed(omega_psi_psi);
+    let (_, primary_psi_norm, primary_psi_psi_norm, _) =
+        normalize_penaltywith_psi_derivatives(&primary, &primary_psi, &primary_psi_psi);
+    let candidates = duchon_native_penalty_candidates(
+        centers,
+        spec.length_scale,
+        spec.power,
+        effective_nullspace_order,
+        spec.aniso_log_scales.as_deref(),
+        &z,
+        identifiability_transform,
+        poly_cols,
+    )?;
+    let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
+    let mut sources = Vec::new();
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for info in penaltyinfo.iter().filter(|info| info.active) {
+        sources.push(info.source.clone());
+        match info.source {
+            PenaltySource::Primary => {
+                first.push(primary_psi_norm.clone());
+                second.push(primary_psi_psi_norm.clone());
+            }
+            PenaltySource::DoublePenaltyNullspace => {
+                first.push(Array2::<f64>::zeros(primary_psi_norm.raw_dim()));
+                second.push(Array2::<f64>::zeros(primary_psi_psi_norm.raw_dim()));
+            }
+            ref other => {
+                crate::bail_invalid_basis!(
+                    "unexpected Duchon native penalty source in derivative path: {other:?}"
+                );
+            }
+        }
+    }
+    Ok((sources, first, second))
 }
 
 fn prepare_duchon_derivative_contextwithworkspace(
@@ -19372,13 +19487,35 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
         identifiability_transform.as_ref(),
         workspace,
     )?;
-    let (penalties_derivative, penaltiessecond_derivative) =
+    let (native_sources, native_first, native_second) =
+        build_duchon_native_penalty_psi_derivatives(
+            centers.view(),
+            spec,
+            identifiability_transform.as_ref(),
+            workspace,
+        )?;
+    let (operator_sources, operator_first, operator_second) =
         build_duchon_operator_penalty_psi_derivatives(
             centers.view(),
             spec,
             identifiability_transform.as_ref(),
             workspace,
         )?;
+    let mut penalties_derivative = Vec::with_capacity(native_first.len() + operator_first.len());
+    penalties_derivative.extend(native_first);
+    penalties_derivative.extend(operator_first);
+    let mut penaltiessecond_derivative =
+        Vec::with_capacity(native_second.len() + operator_second.len());
+    penaltiessecond_derivative.extend(native_second);
+    penaltiessecond_derivative.extend(operator_second);
+    let expected_derivative_count = native_sources.len() + operator_sources.len();
+    if penalties_derivative.len() != expected_derivative_count {
+        crate::bail_invalid_basis!(
+            "Duchon penalty derivative count mismatch: assembled {}, expected {} from active penalty sources",
+            penalties_derivative.len(),
+            expected_derivative_count
+        );
+    }
     Ok(BasisPsiDerivativeBundle {
         first: BasisPsiDerivativeResult {
             design_derivative: design_derivatives.design_first,
@@ -33319,7 +33456,10 @@ mod tests {
             "Duchon Hilbert scale must emit native curvature plus lower-order penalties"
         );
         let mut joint = Array2::<f64>::zeros((p, p));
-        for s in out.penalties.iter() {
+        for (s, info) in out.penalties.iter().zip(out.penaltyinfo.iter()) {
+            if matches!(info.source, PenaltySource::DoublePenaltyNullspace) {
+                continue;
+            }
             joint.scaled_add(1.0, s);
         }
         let s_v = crate::faer_ndarray::fast_av(&joint, &v_const);
