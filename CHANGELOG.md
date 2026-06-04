@@ -18,6 +18,12 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.88 — gam 0.3.88 / gamfit 0.1.160 (2026-06-04)
+
+### Fixed
+
+- **Release metadata for the Bernoulli marginal-slope identifiability fix is now complete.** The PyPI wheel crate and lockfile now carry the same `gamfit` version as `pyproject.toml`, satisfying the hardened release scanner for the BMS redundant-scalar audit fix shipped in the previous commit.
+
 ## v0.3.87 — gam 0.3.87 / gamfit 0.1.159 (2026-06-04)
 
 ### Fixed
