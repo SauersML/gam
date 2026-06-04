@@ -7083,6 +7083,26 @@ fn lift_conditional_covariance(
             log_sigma_fixed_cols, p_log_sigma_reduced, p_log_sigma_full
         ) }.into());
     }
+    // Raw↔canonical reconciliation at the time sub-block. The time
+    // identifiability map `z` lifts the inner solver's ACTIVE (reduced,
+    // canonical-gauge) time coefficients back to the RAW time layout, so it must
+    // be at least as tall as it is wide — the active block can never carry more
+    // columns than the raw block it expands into. If a future canonicalization
+    // ever produces a `z` whose active width exceeds the raw width (the
+    // raw-vs-active drift behind the historical `[N,N] → [N-1,N-1]` finalization
+    // panic, #735), surface it here as a structured DimensionMismatch instead of
+    // letting the downstream block assignment fault with a bare ndarray
+    // broadcast. The threshold/log_sigma offsets are already validated above via
+    // `*_fixed_cols + reduced == full`; this is the matching guard for the one
+    // time block whose map is a dense matrix rather than a fixed-column offset.
+    if p_time_reduced > p_time_full {
+        return Err(SurvivalLocationScaleError::DimensionMismatch { reason: format!(
+            "survival location-scale covariance lift time map is wider than tall: \
+             active(reduced)={p_time_reduced} exceeds raw(full)={p_time_full}; \
+             the time identifiability transform `z` must map reduced→raw"
+        ) }.into());
+    }
+
     let p_reduced = p_time_reduced + p_threshold_reduced + p_log_sigma_reduced + p_linkwiggle;
     let p_full = p_time_full + p_threshold_full + p_log_sigma_full + p_linkwiggle;
     if cov_reduced.nrows() != p_reduced || cov_reduced.ncols() != p_reduced {
@@ -7093,6 +7113,10 @@ fn lift_conditional_covariance(
         ) }.into());
     }
 
+    // The destination slice is sized from `z` itself (`p_time_full` rows,
+    // `p_time_reduced` cols), so the assign cannot broadcast-fault as long as the
+    // guards above hold and `t_map` is at least that large — which `p_full ≥
+    // p_time_full` and `p_reduced ≥ p_time_reduced` guarantee by construction.
     let mut t_map = Array2::<f64>::zeros((p_full, p_reduced));
     t_map
         .slice_mut(s![0..p_time_full, 0..p_time_reduced])
