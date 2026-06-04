@@ -12963,18 +12963,46 @@ pub fn sae_pca_seed_initial_coords(
     if n_obs == 0 || z.ncols() == 0 {
         return Ok(out);
     }
+    // Reject non-finite input up front so a clean error surfaces here rather
+    // than a silent non-finite seed (or an opaque SVD failure) downstream.
+    for ((row, col), &value) in z.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!(
+                "sae_pca_seed: Z must be finite; Z[{row}, {col}] = {value}"
+            ));
+        }
+    }
+    // Accumulate the column mean with Welford's running update
+    // `mean += (x − mean) / count` instead of a plain running sum. The plain
+    // sum overflows to `±inf` for huge finite columns (e.g. two rows of
+    // `1e308` sum to `2e308 = inf`), which poisons the centered matrix and the
+    // SVD. Welford's update keeps the accumulator bounded by the column's data
+    // range, so the mean is finite whenever the inputs are.
     let mut col_means = Array1::<f64>::zeros(z.ncols());
     for col in 0..z.ncols() {
-        let mut acc = 0.0_f64;
-        for row in 0..n_obs {
-            acc += z[[row, col]];
+        let mut mean = 0.0_f64;
+        for (count, row) in (0..n_obs).enumerate() {
+            let x = z[[row, col]];
+            mean += (x - mean) / (count as f64 + 1.0);
         }
-        col_means[col] = acc / n_obs as f64;
+        col_means[col] = mean;
     }
     let mut centered = z.to_owned();
     for row in 0..n_obs {
         for col in 0..z.ncols() {
             centered[[row, col]] -= col_means[col];
+        }
+    }
+    // Centering can still overflow if the data span itself is non-finite
+    // (e.g. `+1e308` and `−1e308` in one column give a finite mean but an
+    // `inf` deviation). Surface that as a clean error rather than feeding a
+    // non-finite matrix to the SVD.
+    for ((row, col), &value) in centered.indexed_iter() {
+        if !value.is_finite() {
+            return Err(format!(
+                "sae_pca_seed: centered Z is non-finite at [{row}, {col}] \
+                 (data span exceeds f64 range); rescale Z before seeding"
+            ));
         }
     }
     let (u_opt, s_vals, vt_opt) = centered
