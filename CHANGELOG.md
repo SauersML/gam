@@ -18,6 +18,12 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.92 — gam 0.3.92 / gamfit 0.1.164 (2026-06-04)
+
+### Changed
+
+- Release bump to force a fresh wheel build/publish. No engine changes since 0.1.163; in-progress fixes for the Bernoulli marginal-slope outer-REML non-convergence (#754) and Matérn over-parameterization (#755) will follow in a later release.
+
 ## v0.3.91 — gam 0.3.91 / gamfit 0.1.163 (2026-06-04)
 
 ### Fixed
