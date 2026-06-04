@@ -23901,8 +23901,11 @@ mod tests {
 
     #[test]
     fn iso_kappa_duchon_dx_dpsi_matches_fd() {
-        // Compare analytic dX/dψ (from build_duchon_basis_log_kappa_derivatives)
-        // against centered FD of X(ψ+h) - X(ψ-h).
+        // Compare the production frozen-spec dX/dψ path against centered FD
+        // of X(ψ+h) - X(ψ-h). This intentionally goes through
+        // `try_build_spatial_term_log_kappa_derivative`: the formula layer owns
+        // the frozen centers, length-scale compensation, and composed
+        // identifiability transform.
         let n = 80usize;
         let mut data = Array2::<f64>::zeros((n, 1));
         for i in 0..n {
@@ -23951,38 +23954,23 @@ mod tests {
 
         // Build derivative at psi=0.
         let psi_eval = 0.0_f64;
-        let (duchon_spec, input_scales) = if let SmoothBasisSpec::Duchon {
-            spec: ref s,
-            ref input_scales,
-            ..
-        } = frozen.smooth_terms[0].basis
-        {
-            (s.clone(), input_scales.clone())
-        } else {
-            panic!("expected Duchon");
-        };
-        let mut duchon_spec_at = duchon_spec.clone();
-        duchon_spec_at.length_scale = Some((-psi_eval).exp());
-        let mut derivative_data = data.clone();
-        if let Some(scales) = input_scales.as_deref() {
-            apply_input_standardization(&mut derivative_data, scales);
-            duchon_spec_at.length_scale = compensate_optional_length_scale_for_standardization(
-                duchon_spec_at.length_scale,
-                scales,
-            );
-        }
-        let bundle = crate::basis::build_duchon_basis_log_kappa_derivatives(
-            derivative_data.view(),
-            &duchon_spec_at,
-        )
-        .expect("derivatives");
-        let mut op = bundle.implicit_operator.expect("implicit operator");
-        if let Some(rotation) = frozen.smooth_terms[0].joint_null_rotation.as_ref() {
-            op = op
-                .append_full_transform(&rotation.rotation)
-                .expect("append joint-null rotation to derivative operator");
-        }
+        let (
+            global_range,
+            p_total,
+            _local_x_psi,
+            _local_s_psi,
+            _local_x_psi_psi,
+            _local_s_psi_psi,
+            _local_s_blocks,
+            _local_s_psi_psi_blocks,
+            implicit_operator,
+        ) = try_build_spatial_term_log_kappa_derivative(data.view(), &frozen, &design, 0)
+            .expect("formula Duchon derivative should build")
+            .expect("Duchon derivative should be available");
+        let op = implicit_operator.expect("Duchon derivative should expose implicit operator");
         let p = op.p_out();
+        assert_eq!(p_total, design.design.ncols());
+        assert_eq!(global_range.end - global_range.start, p);
 
         // FD reference.
         let h = 1e-4_f64;
@@ -24021,7 +24009,7 @@ mod tests {
 
         // Also check transpose_mul: X_tau^T v for v of length n.
         // FD reference: X_tau^T v should be (X(+h)^T - X(-h)^T)/(2h) · v.
-        let smooth_start = 1usize;
+        let smooth_start = global_range.start;
         let v_test = Array1::<f64>::from_shape_fn(n, |i| (i as f64 * 0.07).sin());
         let analytic_tv = op.transpose_mul(0, &v_test.view()).expect("transpose_mul");
         let fd_tv_full = (&x_plus.t() - &x_minus.t()) / (2.0 * h);
