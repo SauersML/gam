@@ -10342,10 +10342,35 @@ pub(crate) fn fit_survival_location_scale_terms(
         } else {
             crate::families::custom_family::ExactOuterDerivativeOrder::First
         };
+        // Honest per-eval work model so the route planner has a real cost
+        // signal for the exact gradient / joint-Hessian routes (#721). The
+        // survival likelihood couples every block, so a single coefficient
+        // Hessian assembly costs `n · (Σ p_b)²` (matching
+        // `joint_coupled_coefficient_hessian_cost`), and each outer
+        // coordinate (every penalty ρ, spatial log-κ, and auxiliary axis)
+        // propagates one analytic directional derivative through the inner
+        // solve. Leaving these at 0 left the planner blind and it never
+        // down-routed the heavyweight exact-joint path.
+        let n_work = data.nrows() as u64;
+        let p_total = (spec.time_block.design_exit.ncols()
+            + threshold_boot_design.design.ncols()
+            + log_sigma_boot_design.design.ncols()
+            + spec
+                .linkwiggle_block
+                .as_ref()
+                .map_or(0, |w| w.design.ncols())) as u64;
+        let hess_cost = n_work.saturating_mul(p_total.saturating_mul(p_total));
+        let grad_cost = hess_cost / 2;
+        let outer_coords = (joint_setup.rho_dim()
+            + joint_setup.log_kappa_dim()
+            + joint_setup.auxiliary_dim())
+        .max(1) as u128;
+        let predicted_hessian_work = (hess_cost as u128).saturating_mul(outer_coords);
+        let predicted_gradient_work = (grad_cost as u128).saturating_mul(outer_coords);
         crate::families::custom_family::OuterDerivativePolicy {
             capability,
-            predicted_gradient_work: 0,
-            predicted_hessian_work: 0,
+            predicted_gradient_work,
+            predicted_hessian_work,
             // Survival location-scale consumes `outer_score_subsample` on its
             // outer-only LL, joint-Hessian, and ψ workspace paths.
             subsample_capable: true,
