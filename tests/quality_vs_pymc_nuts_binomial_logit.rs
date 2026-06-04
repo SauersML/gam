@@ -46,6 +46,9 @@ use std::path::{Path, PathBuf};
 /// asserts OBJECTIVE held-out classification quality (log-loss + AUC) and a
 /// match-or-beat against a PyMC-NUTS baseline fit on the identical design.
 const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
+const REAL_DATA_POSTERIOR_SAMPLES: usize = 300;
+const REAL_DATA_POSTERIOR_WARMUP: usize = 300;
+const REAL_DATA_POSTERIOR_CHAINS: usize = 2;
 
 /// Deterministic splitmix64 stream → uniform(0,1). Keeps the synthetic data
 /// fully reproducible with no external RNG crate, so gam and PyMC see byte-for
@@ -206,11 +209,15 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated() {
 
     // Seed identically to PyMC (42). Enough draws for stable per-point quantiles
     // on a ~p-dimensional posterior; multiple chains so R-hat is meaningful.
+    // The real prostate design is much larger than the synthetic calibration
+    // case above. Keep this arm sized as a CI quality gate, not a sampler
+    // benchmark, while retaining multiple chains for R-hat and the identical
+    // PyMC baseline below.
     let adaptive = NutsConfig::for_dimension(p);
     let nuts_cfg = NutsConfig {
-        n_samples: 1500,
-        nwarmup: 1500,
-        n_chains: 4,
+        n_samples: REAL_DATA_POSTERIOR_SAMPLES,
+        nwarmup: REAL_DATA_POSTERIOR_WARMUP,
+        n_chains: REAL_DATA_POSTERIOR_CHAINS,
         seed: 42,
         ..adaptive
     };
@@ -700,9 +707,9 @@ with pm.Model() as model:
     pm.Potential("smooth_penalty", -0.5 * pm.math.dot(beta, pm.math.dot(S, beta)))
     pm.Bernoulli("obs", logit_p=eta, observed=y)
     idata = pm.sample(
-        draws=1500,
-        tune=1500,
-        chains=4,
+        draws={draws},
+        tune={tune},
+        chains={chains},
         cores=1,
         random_seed=42,
         target_accept=0.9,
@@ -727,6 +734,9 @@ emit("rhat_max", [float(np.nanmax(rhat))])
             xte_flat = xte_flat,
             s_flat = s_flat,
             shape = shape,
+            draws = REAL_DATA_POSTERIOR_SAMPLES,
+            tune = REAL_DATA_POSTERIOR_WARMUP,
+            chains = REAL_DATA_POSTERIOR_CHAINS,
         ),
     );
 
