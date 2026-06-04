@@ -17,8 +17,8 @@ import argparse
 import csv
 import json
 import math
+import multiprocessing as mp
 import os
-import signal
 import time
 import traceback
 from contextlib import contextmanager
@@ -61,24 +61,6 @@ RHO_REGIMES = {
 }
 
 
-class TimeoutError(RuntimeError):
-    pass
-
-
-@contextmanager
-def wall_timeout(seconds: int):
-    def handler(_signum, _frame):
-        raise TimeoutError(f"timed out after {seconds}s")
-
-    old = signal.signal(signal.SIGALRM, handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old)
-
-
 @contextmanager
 def quiet_native_output():
     stdout_fd = os.dup(1)
@@ -93,6 +75,87 @@ def quiet_native_output():
             os.dup2(stderr_fd, 2)
             os.close(stdout_fd)
             os.close(stderr_fd)
+
+
+def run_child_fit(target, args: tuple, timeout: int) -> tuple[np.ndarray | None, tuple[str, str, str] | None]:
+    queue: mp.Queue = mp.Queue()
+    proc = mp.Process(target=target, args=(*args, queue))
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return None, ("TimeoutError", f"gamfit child exceeded {timeout}s wall time", "")
+    if queue.empty():
+        return None, ("RuntimeError", f"gamfit child exited with code {proc.exitcode} without a result", "")
+    payload = queue.get()
+    if payload["ok"]:
+        return np.asarray(payload["prediction"], dtype=float), None
+    return None, (payload["error_type"], payload["error"], payload["traceback"])
+
+
+def binary_gamfit_worker(train: pd.DataFrame, test: pd.DataFrame, pcs: list[str], centers: int, queue: mp.Queue) -> None:
+    try:
+        pcn = ", ".join(pcs)
+
+        def frame(source: pd.DataFrame, with_y: bool) -> pd.DataFrame:
+            vals = {"prs_z": source["PGS_z"].to_numpy(float)}
+            for pc in pcs:
+                vals[pc] = source[pc].to_numpy(float)
+            if with_y:
+                vals["event"] = source["y_binary"].to_numpy(float)
+            return pd.DataFrame(vals)
+
+        with quiet_native_output():
+            model = gamfit.fit(
+                frame(train, True),
+                f"event ~ matern({pcn}, centers={centers})",
+                family="bernoulli-marginal-slope",
+                link="probit",
+                z_column="prs_z",
+                logslope_formula=f"matern({pcn}, centers={centers})",
+            )
+            pred = model.predict(frame(test, False))
+        values = pred["mean"].to_numpy(float) if hasattr(pred, "columns") else np.asarray(pred).ravel()
+        queue.put({"ok": True, "prediction": values.tolist()})
+    except Exception as exc:
+        queue.put({"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:500], "traceback": traceback.format_exc()[-2000:]})
+
+
+def survival_gamfit_worker(train: pd.DataFrame, test: pd.DataFrame, pcs: list[str], centers: int, queue: mp.Queue) -> None:
+    try:
+        pcn = ", ".join(pcs)
+
+        def frame(source: pd.DataFrame, with_y: bool) -> pd.DataFrame:
+            vals = {"prs_z": source["PGS_z"].to_numpy(float)}
+            for pc in pcs:
+                vals[pc] = source[pc].to_numpy(float)
+            if with_y:
+                vals["entry_time"] = source["entry_time"].to_numpy(float)
+                vals["surv_time"] = source["surv_time"].to_numpy(float)
+                vals["event"] = source["surv_event"].to_numpy(float)
+            return pd.DataFrame(vals)
+
+        with quiet_native_output():
+            model = gamfit.fit(
+                frame(train, True),
+                f"Surv(entry_time, surv_time, event) ~ matern({pcn}, centers={centers})",
+                survival_likelihood="marginal-slope",
+                z_column="prs_z",
+                logslope_formula=f"matern({pcn}, centers={centers})",
+            )
+            pred = model.predict(frame(test, False))
+        if hasattr(pred, "columns"):
+            key = next((c for c in ("linear_predictor", "eta", "lp", "log_hazard", "mean") if c in pred.columns), pred.columns[0])
+            values = pred[key].to_numpy(float)
+        else:
+            values = np.asarray(pred).ravel()
+        queue.put({"ok": True, "prediction": values.tolist()})
+    except Exception as exc:
+        queue.put({"ok": False, "error_type": type(exc).__name__, "error": str(exc)[:500], "traceback": traceback.format_exc()[-2000:]})
 
 
 @dataclass(frozen=True)
@@ -325,30 +388,11 @@ def fit_binary_methods(df: pd.DataFrame, centers: int, timeout: int) -> tuple[li
         .predict_proba(test[linear_cols])[:, 1]
     )
 
-    pcn = ", ".join(pcs)
-
-    def gf_frame(frame: pd.DataFrame, with_y: bool) -> pd.DataFrame:
-        vals = {"prs_z": frame["PGS_z"].to_numpy(float)}
-        for pc in pcs:
-            vals[pc] = frame[pc].to_numpy(float)
-        if with_y:
-            vals["event"] = frame["y_binary"].to_numpy(float)
-        return pd.DataFrame(vals)
-
-    try:
-        with wall_timeout(timeout), quiet_native_output():
-            model = gamfit.fit(
-                gf_frame(train, True),
-                f"event ~ matern({pcn}, centers={centers})",
-                family="bernoulli-marginal-slope",
-                link="probit",
-                z_column="prs_z",
-                logslope_formula=f"matern({pcn}, centers={centers})",
-            )
-            pred = model.predict(gf_frame(test, False))
-        predictions["gamfit"] = pred["mean"].to_numpy(float) if hasattr(pred, "columns") else np.asarray(pred).ravel()
-    except Exception as exc:
-        issue_rows.append(issue_record(df, "binary", "gamfit", exc))
+    pred, err = run_child_fit(binary_gamfit_worker, (train, test, pcs, centers), timeout)
+    if err is None and pred is not None:
+        predictions["gamfit"] = pred
+    elif err is not None:
+        issue_rows.append(issue_record_parts(df, "binary", "gamfit", *err))
 
     for method, prob in predictions.items():
         prob = np.clip(prob, 1e-6, 1 - 1e-6)
@@ -388,35 +432,11 @@ def fit_survival_methods(df: pd.DataFrame, centers: int, timeout: int) -> tuple[
     except Exception as exc:
         issue_rows.append(issue_record(df, "survival", "linear-PC", exc))
 
-    pcn = ", ".join(pcs)
-
-    def gf_frame(frame: pd.DataFrame, with_y: bool) -> pd.DataFrame:
-        vals = {"prs_z": frame["PGS_z"].to_numpy(float)}
-        for pc in pcs:
-            vals[pc] = frame[pc].to_numpy(float)
-        if with_y:
-            vals["entry_time"] = frame["entry_time"].to_numpy(float)
-            vals["surv_time"] = frame["surv_time"].to_numpy(float)
-            vals["event"] = frame["surv_event"].to_numpy(float)
-        return pd.DataFrame(vals)
-
-    try:
-        with wall_timeout(timeout), quiet_native_output():
-            model = gamfit.fit(
-                gf_frame(train, True),
-                f"Surv(entry_time, surv_time, event) ~ matern({pcn}, centers={centers})",
-                survival_likelihood="marginal-slope",
-                z_column="prs_z",
-                logslope_formula=f"matern({pcn}, centers={centers})",
-            )
-            pred = model.predict(gf_frame(test, False))
-        if hasattr(pred, "columns"):
-            key = next((c for c in ("linear_predictor", "eta", "lp", "log_hazard", "mean") if c in pred.columns), pred.columns[0])
-            risk["gamfit"] = pred[key].to_numpy(float)
-        else:
-            risk["gamfit"] = np.asarray(pred).ravel()
-    except Exception as exc:
-        issue_rows.append(issue_record(df, "survival", "gamfit", exc))
+    pred, err = run_child_fit(survival_gamfit_worker, (train, test, pcs, centers), timeout)
+    if err is None and pred is not None:
+        risk["gamfit"] = pred
+    elif err is not None:
+        issue_rows.append(issue_record_parts(df, "survival", "gamfit", *err))
 
     for method, score in risk.items():
         pred_rows.extend(row_predictions(df, test, "survival", method, score))
@@ -425,6 +445,10 @@ def fit_survival_methods(df: pd.DataFrame, centers: int, timeout: int) -> tuple[
 
 
 def issue_record(df: pd.DataFrame, outcome: str, method: str, exc: BaseException) -> dict:
+    return issue_record_parts(df, outcome, method, type(exc).__name__, str(exc)[:500], traceback.format_exc()[-2000:])
+
+
+def issue_record_parts(df: pd.DataFrame, outcome: str, method: str, error_type: str, error: str, tb: str) -> dict:
     first = df.iloc[0]
     return {
         "demography": first["demography"],
@@ -433,9 +457,9 @@ def issue_record(df: pd.DataFrame, outcome: str, method: str, exc: BaseException
         "seed": int(first["seed"]),
         "outcome": outcome,
         "method": method,
-        "error_type": type(exc).__name__,
-        "error": str(exc)[:500],
-        "traceback": traceback.format_exc()[-2000:],
+        "error_type": error_type,
+        "error": error[:500],
+        "traceback": tb[-2000:],
     }
 
 
@@ -674,16 +698,6 @@ def append_csv(path: Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def write_csv(path: Path, rows: list[dict]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
-
-
 def run(args: argparse.Namespace) -> None:
     outdir = Path(args.outdir).resolve()
     data_dir = outdir / "data"
@@ -692,10 +706,6 @@ def run(args: argparse.Namespace) -> None:
     for path in (data_dir, results_dir, plots_dir):
         path.mkdir(parents=True, exist_ok=True)
 
-    all_predictions: list[dict] = []
-    all_metrics: list[dict] = []
-    all_issues: list[dict] = []
-    split_rows: list[dict] = []
     sidecars: list[dict] = []
 
     start = time.time()
@@ -708,36 +718,36 @@ def run(args: argparse.Namespace) -> None:
                     dataset = add_phenotypes(core, pheno_mode, seed)
                     data_path = data_dir / f"{dem}_{regime}_{pheno_mode}_seed{seed}.csv"
                     dataset.to_csv(data_path, index=False)
-                    split_rows.extend(split_count_rows(dataset, data_path))
+                    append_csv(results_dir / "split_counts.csv", split_count_rows(dataset, data_path))
 
+                    cell_predictions: list[dict] = []
+                    cell_metrics: list[dict] = []
+                    cell_issues: list[dict] = []
                     pred, metrics, issues = fit_binary_methods(dataset, args.centers, args.timeout)
-                    all_predictions.extend(pred)
-                    all_metrics.extend(metrics)
-                    all_issues.extend(issues)
+                    cell_predictions.extend(pred)
+                    cell_metrics.extend(metrics)
+                    cell_issues.extend(issues)
 
                     pred, metrics, issues = fit_survival_methods(dataset, args.centers, args.timeout)
-                    all_predictions.extend(pred)
-                    all_metrics.extend(metrics)
-                    all_issues.extend(issues)
+                    cell_predictions.extend(pred)
+                    cell_metrics.extend(metrics)
+                    cell_issues.extend(issues)
+                    cell_cal = calibration_rows(pd.DataFrame(cell_predictions)) if cell_predictions else []
+                    cell_comp = comparison_rows(pd.DataFrame(cell_metrics), pd.DataFrame(cell_cal))
+                    append_csv(results_dir / "predictions_test.csv", cell_predictions)
+                    append_csv(results_dir / "metrics_global.csv", cell_metrics)
+                    append_csv(results_dir / "gamfit_issues.csv", cell_issues)
+                    append_csv(results_dir / "calibration.csv", cell_cal)
+                    append_csv(results_dir / "comparisons.csv", cell_comp)
                     print(
                         f"done dem={dem} regime={regime} pheno={pheno_mode} seed={seed} "
                         f"elapsed={time.time() - start:.1f}s",
                         flush=True,
                     )
 
-    write_csv(results_dir / "predictions_test.csv", all_predictions)
-    write_csv(results_dir / "metrics_global.csv", all_metrics)
-    write_csv(results_dir / "split_counts.csv", split_rows)
-    write_csv(results_dir / "gamfit_issues.csv", all_issues)
     with (results_dir / "dataset_sidecars.json").open("w") as handle:
         json.dump(sidecars, handle, indent=2)
 
-    pred_df = pd.DataFrame(all_predictions)
-    cal = calibration_rows(pred_df) if len(pred_df) else []
-    write_csv(results_dir / "calibration.csv", cal)
-
-    comparisons = comparison_rows(pd.DataFrame(all_metrics), pd.DataFrame(cal))
-    write_csv(results_dir / "comparisons.csv", comparisons)
     make_plots(results_dir, plots_dir)
 
 
