@@ -14358,10 +14358,10 @@ impl BernoulliMarginalSlopeFamily {
                 &row_dirs[0],
             )?]);
         }
-        if row_dirs
-            .iter()
-            .all(|dir| Self::primary_direction_is_zero(dir, primary) || Self::single_primary_axis(dir, primary).is_some())
-        {
+        if row_dirs.iter().all(|dir| {
+            Self::primary_direction_is_zero(dir, primary)
+                || Self::single_primary_axis(dir, primary).is_some()
+        }) {
             let zero = || Array2::<f64>::zeros((r, r));
             if row_dirs
                 .iter()

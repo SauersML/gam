@@ -7549,6 +7549,48 @@ mod tests {
         let mut max_rel_fourth = 0.0_f64;
         for row in 0..family.y.len() {
             let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
+            let zero_dir = Array1::<f64>::zeros(r);
+            let zero_third = family
+                .row_primary_third_contracted_recompute(row, &states, &cache, row_ctx, &zero_dir)
+                .expect("zero third fast path");
+            assert!(
+                zero_third.iter().all(|&value| value == 0.0),
+                "zero third direction must return exact zeros"
+            );
+            let mut q_dir = Array1::<f64>::zeros(r);
+            q_dir[q] = 1.25;
+            let zero_fourth = family
+                .row_primary_fourth_contracted_recompute(
+                    row, &states, &cache, row_ctx, &zero_dir, &q_dir,
+                )
+                .expect("zero fourth fast path");
+            assert!(
+                zero_fourth.iter().all(|&value| value == 0.0),
+                "zero fourth direction must return exact zeros"
+            );
+            let batched = family
+                .row_primary_third_contracted_many_with_moments(
+                    row,
+                    &states,
+                    &cache,
+                    row_ctx,
+                    &[zero_dir.clone(), q_dir.clone()],
+                )
+                .expect("batched zero/single-axis third fast path");
+            assert_eq!(batched.len(), 2);
+            assert!(
+                batched[0].iter().all(|&value| value == 0.0),
+                "batched zero third direction must return exact zeros"
+            );
+            let q_single = family
+                .row_primary_third_contracted_recompute(row, &states, &cache, row_ctx, &q_dir)
+                .expect("single q third fast path");
+            for (a, b) in batched[1].iter().zip(q_single.iter()) {
+                assert!(
+                    (a - b).abs() <= 1e-12,
+                    "batched q third differs from single q third: batched={a:.3e} single={b:.3e}"
+                );
+            }
             // Third: each primary axis, several scalars including negative.
             for &axis in &[q, g] {
                 for &s in &[1.0_f64, -0.7, 2.3] {
