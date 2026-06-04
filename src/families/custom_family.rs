@@ -7430,6 +7430,33 @@ impl CustomFamilyWarmStart {
         screened_outer_warm_start(Some(&self.inner), rho).is_some()
     }
 
+    pub(crate) fn block_beta_len(&self, block_idx: usize) -> Option<usize> {
+        self.inner.block_beta.get(block_idx).map(|beta| beta.len())
+    }
+
+    pub(crate) fn block_beta_abs_argmax_in_range(
+        &self,
+        block_idx: usize,
+        range: std::ops::Range<usize>,
+    ) -> Option<(usize, f64)> {
+        let beta = self.inner.block_beta.get(block_idx)?;
+        let end = range.end.min(beta.len());
+        if range.start >= end {
+            return None;
+        }
+        beta.slice(s![range.start..end])
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(idx, value)| (range.start + idx, value.abs()))
+            .filter(|(_, abs)| abs.is_finite())
+            .max_by(|left, right| {
+                left.1
+                    .partial_cmp(&right.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    }
+
     /// Build a warm-start payload from a flat cached β and the per-block
     /// coefficient widths. The returned warm-start carries a zero `rho`
     /// (the outer cache will overwrite it on the next eval) and empty

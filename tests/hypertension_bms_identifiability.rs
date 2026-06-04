@@ -151,6 +151,137 @@ fn hypertension_shape_dataset() -> EncodedDataset {
     }
 }
 
+fn duplicate_pc_hypertension_shape_dataset() -> EncodedDataset {
+    let n = 160usize;
+    let headers = vec![
+        "event",
+        "sex",
+        "entry_age_z",
+        "current_age_ns_1",
+        "current_age_ns_2",
+        "current_age_ns_3",
+        "current_age_ns_4",
+        "prs_z",
+        "PC1",
+        "PC2",
+        "PC3",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let pc_cloud = [
+        [-1.0, -0.5, 0.25],
+        [-0.25, 0.75, -0.5],
+        [0.5, -0.75, 0.75],
+        [1.0, 0.5, -0.25],
+    ];
+    let mut values = Vec::<f64>::with_capacity(n * headers.len());
+    for i in 0..n {
+        let sex = if i % 2 == 0 { 0.0 } else { 1.0 };
+        let entry_age_z = (i as f64 - 79.5) / 30.0;
+        let t = ((i % 29) as f64 - 14.0) / 14.0;
+        let prs_z = (((i * 17) % 131) as f64 - 65.0) / 31.0;
+        let pc = pc_cloud[i % pc_cloud.len()];
+        let eta = -0.05 + 0.12 * sex + 0.08 * entry_age_z + 0.06 * t + 0.05 * prs_z + 0.04 * pc[0];
+        let deterministic_noise = (((i * 11) % 23) as f64 - 11.0) / 10.0;
+        let event = if eta + deterministic_noise > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        values.extend_from_slice(&[
+            event,
+            sex,
+            entry_age_z,
+            t,
+            t * t,
+            t * t * t,
+            t * t * t * t,
+            prs_z,
+            pc[0],
+            pc[1],
+            pc[2],
+        ]);
+    }
+    EncodedDataset {
+        headers,
+        values: Array2::from_shape_vec((n, 11), values)
+            .expect("duplicate-PC hypertension-shape BMS data shape"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "event".to_string(),
+                    kind: ColumnKindTag::Binary,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "sex".to_string(),
+                    kind: ColumnKindTag::Binary,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "entry_age_z".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_1".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_2".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_3".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_4".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "prs_z".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "PC1".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "PC2".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "PC3".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Binary,
+            ColumnKindTag::Binary,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+        ],
+    }
+}
+
 #[test]
 fn hypertension_shape_bms_matern_fit_is_not_refused_by_identifiability_audit() {
     gam::init_parallelism();
@@ -182,6 +313,42 @@ fn hypertension_shape_bms_matern_fit_is_not_refused_by_identifiability_audit() {
                 "hypertension-shape BMS fit was still refused by the identifiability audit: {msg}"
             );
             panic!("hypertension-shape BMS fit failed after passing the audit: {msg}");
+        }
+    }
+}
+
+#[test]
+fn hypertension_shape_bms_matern_redundant_centers_are_rank_reduced() {
+    gam::init_parallelism();
+    let data = duplicate_pc_hypertension_shape_dataset();
+    let cfg = FitConfig {
+        logslope_formula: Some("matern(PC1, PC2, PC3, centers=20, length_scale=1.0)".to_string()),
+        z_column: Some("prs_z".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "event ~ matern(PC1, PC2, PC3, centers=20, length_scale=1.0) + sex + entry_age_z + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4",
+        &data,
+        &cfg,
+    );
+    match result {
+        Ok(FitResult::BernoulliMarginalSlope(out)) => {
+            assert!(
+                out.fit.beta.iter().all(|coef| coef.is_finite()),
+                "rank-reduced Matérn BMS fit should produce finite coefficients, got {:?}",
+                out.fit.beta
+            );
+        }
+        Ok(_) => panic!("rank-reduced Matérn fit returned the wrong family variant"),
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("identifiability audit refused")
+                    && !msg.contains("joint rank")
+                    && !msg.contains("dropped column"),
+                "redundant Matérn centers should be rank-reduced before the joint audit: {msg}"
+            );
+            panic!("rank-reduced Matérn BMS fit failed after passing the audit: {msg}");
         }
     }
 }

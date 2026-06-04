@@ -5,6 +5,8 @@ use super::install_flex::validate_spec;
 use super::*;
 use crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA;
 
+const BMS_PROBIT_SEPARATION_BETA_INF: f64 = 40.0;
+
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
 // BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is
@@ -323,6 +325,260 @@ fn widen_marginal_beta_hint(
             widened
         }
     })
+}
+
+fn argmax_by_abs<I>(values: I) -> Option<(String, usize, f64)>
+where
+    I: IntoIterator<Item = (String, usize, f64)>,
+{
+    values
+        .into_iter()
+        .map(|(label, idx, value)| (label, idx, value.abs()))
+        .filter(|(_, _, abs)| abs.is_finite())
+        .max_by(|left, right| {
+            left.2
+                .partial_cmp(&right.2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn marginal_parametric_argmax_from_beta(
+    beta: &Array1<f64>,
+    design: &TermCollectionDesign,
+    spec: &TermCollectionSpec,
+) -> Option<(String, usize, f64)> {
+    let mut entries = Vec::<(String, usize, f64)>::new();
+    if design.intercept_range.len() == 1 {
+        let idx = design.intercept_range.start;
+        if idx < beta.len() {
+            entries.push(("intercept".to_string(), idx, beta[idx]));
+        }
+    }
+    for (linear, (name, range)) in spec.linear_terms.iter().zip(design.linear_ranges.iter()) {
+        if linear.double_penalty {
+            continue;
+        }
+        for local_col in range.clone() {
+            if local_col < beta.len() {
+                entries.push((name.clone(), local_col, beta[local_col]));
+            }
+        }
+    }
+    argmax_by_abs(entries)
+}
+
+fn marginal_parametric_argmax_from_warm_start(
+    warm_start: &CustomFamilyWarmStart,
+    design: &TermCollectionDesign,
+    spec: &TermCollectionSpec,
+) -> Option<(String, usize, f64)> {
+    let mut entries = Vec::<(String, usize, f64)>::new();
+    if design.intercept_range.len() == 1
+        && let Some((idx, abs)) =
+            warm_start.block_beta_abs_argmax_in_range(0, design.intercept_range.clone())
+    {
+        entries.push(("intercept".to_string(), idx, abs));
+    }
+    for (linear, (name, range)) in spec.linear_terms.iter().zip(design.linear_ranges.iter()) {
+        if linear.double_penalty {
+            continue;
+        }
+        if let Some((idx, abs)) = warm_start.block_beta_abs_argmax_in_range(0, range.clone()) {
+            entries.push((name.clone(), idx, abs));
+        }
+    }
+    argmax_by_abs(entries)
+}
+
+fn marginal_full_argmax_from_beta(
+    beta: &Array1<f64>,
+    design: &TermCollectionDesign,
+) -> Option<(String, usize, f64)> {
+    let mut entries = Vec::<(String, usize, f64)>::new();
+    if design.intercept_range.len() == 1 {
+        let idx = design.intercept_range.start;
+        if idx < beta.len() {
+            entries.push(("intercept".to_string(), idx, beta[idx]));
+        }
+    }
+    for (name, range) in &design.linear_ranges {
+        for local_col in range.clone() {
+            if local_col < beta.len() {
+                entries.push((name.clone(), local_col, beta[local_col]));
+            }
+        }
+    }
+    for (name, range) in &design.random_effect_ranges {
+        for local_col in range.clone() {
+            if local_col < beta.len() {
+                entries.push((name.clone(), local_col, beta[local_col]));
+            }
+        }
+    }
+    let smooth_start = design
+        .design
+        .ncols()
+        .saturating_sub(design.smooth.total_smooth_cols());
+    for term in &design.smooth.terms {
+        let label = format!("smooth '{}'", term.name);
+        let start = smooth_start + term.coeff_range.start;
+        let end = smooth_start + term.coeff_range.end;
+        for local_col in start..end {
+            if local_col < beta.len() {
+                entries.push((label.clone(), local_col, beta[local_col]));
+            }
+        }
+    }
+    for local_col in design.design.ncols()..beta.len() {
+        entries.push((
+            "fixed-ridge influence absorber".to_string(),
+            local_col,
+            beta[local_col],
+        ));
+    }
+    argmax_by_abs(entries)
+}
+
+fn marginal_full_argmax_from_warm_start(
+    warm_start: &CustomFamilyWarmStart,
+    design: &TermCollectionDesign,
+) -> Option<(String, usize, f64)> {
+    let block_width = warm_start.block_beta_len(0)?;
+    let mut entries = Vec::<(String, usize, f64)>::new();
+    if design.intercept_range.len() == 1
+        && let Some((idx, abs)) =
+            warm_start.block_beta_abs_argmax_in_range(0, design.intercept_range.clone())
+    {
+        entries.push(("intercept".to_string(), idx, abs));
+    }
+    for (name, range) in &design.linear_ranges {
+        if let Some((idx, abs)) = warm_start.block_beta_abs_argmax_in_range(0, range.clone()) {
+            entries.push((name.clone(), idx, abs));
+        }
+    }
+    for (name, range) in &design.random_effect_ranges {
+        if let Some((idx, abs)) = warm_start.block_beta_abs_argmax_in_range(0, range.clone()) {
+            entries.push((name.clone(), idx, abs));
+        }
+    }
+    let smooth_start = design
+        .design
+        .ncols()
+        .saturating_sub(design.smooth.total_smooth_cols());
+    for term in &design.smooth.terms {
+        let range = (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
+        if let Some((idx, abs)) = warm_start.block_beta_abs_argmax_in_range(0, range) {
+            entries.push((format!("smooth '{}'", term.name), idx, abs));
+        }
+    }
+    if block_width > design.design.ncols()
+        && let Some((idx, abs)) =
+            warm_start.block_beta_abs_argmax_in_range(0, design.design.ncols()..block_width)
+    {
+        entries.push(("fixed-ridge influence absorber".to_string(), idx, abs));
+    }
+    argmax_by_abs(entries)
+}
+
+fn bernoulli_marginal_slope_runaway_error_from_argmax(
+    parametric_argmax: Option<(String, usize, f64)>,
+    block_argmax: Option<(String, usize, f64)>,
+    inner_status: &str,
+    eval_label: &str,
+) -> Option<String> {
+    let (label, local_col, beta_abs, explanation) =
+        if let Some((label, local_col, beta_abs)) = parametric_argmax
+            && beta_abs >= BMS_PROBIT_SEPARATION_BETA_INF
+        {
+            (
+                label,
+                local_col,
+                beta_abs,
+                "an unpenalized parametric marginal direction has no stable finite probit optimum",
+            )
+        } else if let Some((label, local_col, beta_abs)) = block_argmax
+            && beta_abs >= BMS_PROBIT_SEPARATION_BETA_INF
+        {
+            (
+                label,
+                local_col,
+                beta_abs,
+                "a marginal smooth direction is trading off against the logslope surface; this is the under-constrained marginal/logslope coupling that appears when the score is correlated with the shared surface covariates",
+            )
+        } else {
+            return None;
+        };
+    if beta_abs < BMS_PROBIT_SEPARATION_BETA_INF {
+        return None;
+    }
+    Some(format!(
+        "bernoulli marginal-slope probit marginal/logslope runaway detected in block \
+         'marginal_surface' during {eval_label}: term '{label}' \
+         (local column {local_col}) has \
+         |β|∞={beta_abs:.3e} (diagnostic threshold \
+         {BMS_PROBIT_SEPARATION_BETA_INF:.1}). The joint design is identifiable; \
+         {explanation}. {inner_status}. Reduce or reparameterize the coupled \
+         marginal/logslope surface, use a lower-dimensional logslope interaction, \
+         or fit with an explicit declared separation/bias-reduction prior when \
+         that model is available. This is not a Matérn/Duchon polynomial-nullspace \
+         or cross-block gauge-priority failure."
+    ))
+}
+
+fn bernoulli_marginal_slope_runaway_error(
+    warm_start: &CustomFamilyWarmStart,
+    design: &TermCollectionDesign,
+    spec: &TermCollectionSpec,
+    inner_converged: bool,
+    eval_label: &str,
+) -> Option<String> {
+    let inner_status = if inner_converged {
+        "the inner solve reached a KKT certificate at a separation-scale coefficient"
+    } else {
+        "the inner solve failed while already carrying a separation-scale coefficient"
+    };
+    bernoulli_marginal_slope_runaway_error_from_argmax(
+        marginal_parametric_argmax_from_warm_start(warm_start, design, spec),
+        marginal_full_argmax_from_warm_start(warm_start, design),
+        inner_status,
+        eval_label,
+    )
+}
+
+#[cfg(test)]
+mod runaway_tests {
+    use super::*;
+
+    #[test]
+    fn runaway_diagnostic_names_unpenalized_parametric_direction_first() {
+        let msg = bernoulli_marginal_slope_runaway_error_from_argmax(
+            Some(("sex".to_string(), 1, 52.0)),
+            Some(("smooth 'matern(PC1,PC2,PC3)'".to_string(), 7, 49.0)),
+            "inner status",
+            "unit-test eval",
+        )
+        .expect("parametric runaway should be diagnosed");
+
+        assert!(msg.contains("term 'sex'"));
+        assert!(msg.contains("unpenalized parametric marginal direction"));
+        assert!(msg.contains("not a Matérn/Duchon polynomial-nullspace"));
+    }
+
+    #[test]
+    fn runaway_diagnostic_names_marginal_logslope_coupling_when_smooth_runs_away() {
+        let msg = bernoulli_marginal_slope_runaway_error_from_argmax(
+            Some(("sex".to_string(), 1, 2.0)),
+            Some(("smooth 'marginal_surface[0]'".to_string(), 6, 51.4)),
+            "inner status",
+            "unit-test eval",
+        )
+        .expect("smooth runaway should be diagnosed");
+
+        assert!(msg.contains("marginal/logslope runaway"));
+        assert!(msg.contains("smooth 'marginal_surface[0]'"));
+        assert!(msg.contains("score is correlated with the shared surface covariates"));
+        assert!(msg.contains("not a Matérn/Duchon polynomial-nullspace"));
+    }
 }
 
 fn build_marginal_blockspec_bms(
@@ -979,6 +1235,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     };
     let final_sigma_cell = std::cell::Cell::new(initial_sigma);
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
+    let runaway_error = RefCell::new(None::<String>);
     // Outer ρ-cache β-seed staging slot. On a cache hit the spatial-joint
     // optimizer invokes `seed_inner_beta_fn` before the first eval at the
     // restored ρ: per-block column widths aren't known until the first
@@ -1235,6 +1492,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
         None,
         outer_policy,
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            if let Some(err) = runaway_error.borrow().as_ref().cloned() {
+                return Err(err);
+            }
             assert_eq!(
                 specs.len(),
                 designs.len(),
@@ -1246,6 +1506,17 @@ pub fn fit_bernoulli_marginal_slope_terms(
             final_sigma_cell.set(sigma);
             let family = make_family(&designs[0], &designs[1], sigma);
             let fit = inner_fit(&family, &blocks, options)?;
+            if let Some(block) = fit.block_states.first()
+                && let Some(err) = bernoulli_marginal_slope_runaway_error_from_argmax(
+                    marginal_parametric_argmax_from_beta(&block.beta, &designs[0], &specs[0]),
+                    marginal_full_argmax_from_beta(&block.beta, &designs[0]),
+                    "the final inner solve produced a separation-scale coefficient",
+                    "final fit",
+                )
+            {
+                runaway_error.replace(Some(err.clone()));
+                return Err(err);
+            }
             let mut hints_mut = hints.borrow_mut();
             let mut bidx = 0usize;
             if let Some(block) = fit.block_states.get(bidx) {
@@ -1274,6 +1545,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
+            if let Some(err) = runaway_error.borrow().as_ref().cloned() {
+                return Err(err);
+            }
             use crate::solver::estimate::reml::unified::EvalMode;
             let row_set_rows = match row_set {
                 crate::families::row_kernel::RowSet::All => spec.y.len(),
@@ -1324,6 +1598,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )?;
+            if let Some(err) = bernoulli_marginal_slope_runaway_error(
+                &eval.warm_start,
+                &designs[0],
+                &specs[0],
+                eval.inner_converged,
+                "exact outer evaluation",
+            ) {
+                runaway_error.replace(Some(err.clone()));
+                return Err(err);
+            }
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
                 return Err(
@@ -1340,6 +1624,9 @@ pub fn fit_bernoulli_marginal_slope_terms(
             Ok((eval.objective, eval.gradient, eval.outer_hessian))
         },
         |theta, specs: &[TermCollectionSpec], designs: &[TermCollectionDesign]| {
+            if let Some(err) = runaway_error.borrow().as_ref().cloned() {
+                return Err(err);
+            }
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
             let blocks = build_blocks(&rho, &designs[0], &designs[1])?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
@@ -1367,6 +1654,16 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 derivative_blocks,
                 exact_warm_start.borrow().as_ref(),
             )?;
+            if let Some(err) = bernoulli_marginal_slope_runaway_error(
+                &eval.warm_start,
+                &designs[0],
+                &specs[0],
+                eval.inner_converged,
+                "EFS outer evaluation",
+            ) {
+                runaway_error.replace(Some(err.clone()));
+                return Err(err);
+            }
             exact_warm_start.replace(Some(eval.warm_start.clone()));
             if !eval.inner_converged {
                 return Err(
