@@ -2138,3 +2138,54 @@ impl<'a> Deref for LogSmoothingParamsView<'a> {
         &self.0
     }
 }
+
+#[cfg(test)]
+mod ridge_policy_tests {
+    use super::{RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger};
+
+    #[test]
+    fn solver_only_ridge_policy_stays_off_objective_accounting() {
+        let passport = RidgePassport::scaled_identity(1.0e-4, RidgePolicy::solver_only());
+
+        assert!(
+            !passport.policy.include_quadratic_penalty,
+            "solver-only ridge must not add a quadratic prior"
+        );
+        assert_eq!(
+            passport.penalty_logdet_ridge(),
+            0.0,
+            "solver-only ridge must not shift the penalty logdet"
+        );
+        assert_eq!(
+            passport.laplacehessianridge(),
+            0.0,
+            "solver-only ridge must not shift the Laplace Hessian"
+        );
+
+        let ledger = StabilizationLedger::from_passport(passport);
+        assert!(
+            matches!(
+                ledger.kind,
+                StabilizationKind::NumericalPerturbation {
+                    backward_error_bound: None
+                }
+            ),
+            "solver-only ridge is a numerical perturbation, not an explicit prior"
+        );
+        assert_eq!(
+            ledger.quadratic_delta(),
+            0.0,
+            "solver-only ridge must not contribute to the optimized objective"
+        );
+        assert_eq!(
+            ledger.laplace_hessian_delta(),
+            0.0,
+            "solver-only ridge must not contribute to REML curvature accounting"
+        );
+        assert_eq!(
+            ledger.penalty_logdet_delta(),
+            0.0,
+            "solver-only ridge must not contribute to determinant accounting"
+        );
+    }
+}
