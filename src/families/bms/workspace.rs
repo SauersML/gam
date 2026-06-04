@@ -4969,6 +4969,55 @@ impl BernoulliMarginalSlopeFamily {
         Ok(())
     }
 
+    /// View-accepting twin of [`Self::pullback_primary_vector_add_into`] used by
+    /// the batched multi-RHS apply, where each RHS pulls back into one column
+    /// (`ArrayViewMut1`) of the `(total, n_rhs)` output. The algebra is byte for
+    /// byte the same as the owned-`Array1` form; only the output handle type
+    /// differs so a column view can be written without copying.
+    pub(super) fn pullback_primary_vector_add_into_view(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        primary: &PrimarySlices,
+        primary_vec: &Array1<f64>,
+        out: &mut ArrayViewMut1<'_, f64>,
+    ) -> Result<(), String> {
+        {
+            let mut marginal = out.slice_mut(s![slices.marginal.clone()]);
+            self.marginal_design
+                .axpy_row_into(row, primary_vec[primary.q], &mut marginal)?;
+        }
+        {
+            let mut logslope = out.slice_mut(s![slices.logslope.clone()]);
+            self.logslope_design.axpy_row_into(
+                row,
+                primary_vec[primary.logslope],
+                &mut logslope,
+            )?;
+        }
+        if let Some(primary_h) = primary.h.as_ref()
+            && let Some(block_h) = slices.h.as_ref()
+        {
+            out.slice_mut(s![block_h.clone()]).zip_mut_with(
+                &primary_vec.slice(s![primary_h.start..primary_h.end]),
+                |a, &b| {
+                    *a += b;
+                },
+            );
+        }
+        if let Some(primary_w) = primary.w.as_ref()
+            && let Some(block_w) = slices.w.as_ref()
+        {
+            out.slice_mut(s![block_w.clone()]).zip_mut_with(
+                &primary_vec.slice(s![primary_w.start..primary_w.end]),
+                |a, &b| {
+                    *a += b;
+                },
+            );
+        }
+        Ok(())
+    }
+
     pub(super) fn block_psi_row_from_map(
         &self,
         row: usize,
@@ -10287,6 +10336,191 @@ impl BernoulliMarginalSlopeFamily {
         *out += &partial;
         Ok(())
     }
+
+    /// Batched multi-RHS coefficient-Hessian apply: writes `H · V` into `out`,
+    /// where `V` and `out` are `(total, n_rhs)` and each column is an
+    /// independent direction. Column for column the result is **numerically
+    /// identical** to calling
+    /// [`Self::exact_newton_joint_hessian_matvec_from_cache_into`] on each
+    /// column: the same per-row primary Hessian `Hᵢ`, the same projection and
+    /// pullback algebra, only with the row tiles swept once for all columns.
+    ///
+    /// For the tiled row-primary Hessian cache the win is structural — each
+    /// tile's resident `Hᵢ` block is materialised and consumed once per tile
+    /// pass instead of once per (column × tile). Dense reconstruction of the
+    /// matrix-free joint Hessian (`H = H · I`) is then a single tile sweep of
+    /// width `total` rather than `total` separate sweeps. Every non-tiled cache
+    /// state (rigid closed-form, host-pin, device-resident, matrix-free
+    /// stream) routes column-by-column through the single-vector entry point,
+    /// so those paths are unchanged.
+    pub(crate) fn exact_newton_joint_hessian_matvec_mat_from_cache_into(
+        &self,
+        v_cols: &Array2<f64>,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        out: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        let slices = &cache.slices;
+        let primary = &cache.primary;
+        let total = slices.total;
+        let n = self.y.len();
+        if v_cols.nrows() != total || out.nrows() != total {
+            return Err(format!(
+                "BMS batched HVP: row mismatch v_cols={}x{} out={}x{} expected rows={total}",
+                v_cols.nrows(),
+                v_cols.ncols(),
+                out.nrows(),
+                out.ncols()
+            ));
+        }
+        if v_cols.ncols() != out.ncols() {
+            return Err(format!(
+                "BMS batched HVP: column mismatch v_cols has {} columns, out has {}",
+                v_cols.ncols(),
+                out.ncols()
+            ));
+        }
+        let n_rhs = v_cols.ncols();
+        out.fill(0.0);
+        if n_rhs == 0 {
+            return Ok(());
+        }
+
+        // Fast path: tiled row-primary Hessian. Sweep each tile once and apply
+        // its `Hᵢ` to every RHS column. Tiles own disjoint row blocks, so a
+        // per-tile private `(total, n_rhs)` partial followed by a reduce is
+        // identical (up to f.p. reduction order, by tile) to the serial
+        // single-buffer accumulation — exactly as the single-vector tiled HVP
+        // does for one column.
+        if let Some(tiles) = cache.row_primary_hessians.tiles() {
+            if tiles.r != primary.total || tiles.n_rows != n {
+                return Err(format!(
+                    "BMS tiled row-primary Hessian batched-HVP shape mismatch: tiles n={} r={}, expected n={} r={}",
+                    tiles.n_rows, tiles.r, n, primary.total
+                ));
+            }
+            if tiles.is_empty() {
+                return Ok(());
+            }
+            let r_pr = primary.total;
+            let partial = tiles
+                .tiles
+                .par_iter()
+                .try_fold(
+                    || {
+                        (
+                            Array2::<f64>::zeros((total, n_rhs)),
+                            Array1::<f64>::zeros(total),
+                            Array1::<f64>::zeros(r_pr),
+                        )
+                    },
+                    |(mut tile_out, mut col_scratch, mut row_dir_scratch), tile| -> Result<_, String> {
+                        let tile_rows = tile.rows.hess().nrows();
+                        let h_rows_slice = tile.rows.hess().as_slice().expect(
+                            "tiled row_primary_hessians.hess() is row-major contiguous",
+                        );
+                        // One `v_rows` / `y_rows` buffer reused across all RHS
+                        // columns within this tile so the per-tile working set
+                        // stays one column wide regardless of `n_rhs`.
+                        let mut v_rows = vec![0.0_f64; tile_rows * r_pr];
+                        for col in 0..n_rhs {
+                            col_scratch.assign(&v_cols.column(col));
+                            for local in 0..tile_rows {
+                                let row = tile.row_start + local;
+                                self.row_primary_direction_from_flat_into(
+                                    row,
+                                    slices,
+                                    primary,
+                                    &col_scratch,
+                                    &mut row_dir_scratch,
+                                )?;
+                                v_rows[local * r_pr..(local + 1) * r_pr].copy_from_slice(
+                                    row_dir_scratch.as_slice().expect("contiguous"),
+                                );
+                            }
+                            let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                                n_rows: tile_rows,
+                                r: r_pr,
+                                h_rows: h_rows_slice,
+                                v_rows: &v_rows,
+                            };
+                            let y_rows = {
+                                #[cfg(target_os = "linux")]
+                                {
+                                    match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
+                                        crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                                            n_rows: tile_rows,
+                                            r: r_pr,
+                                            h_rows: h_rows_slice,
+                                            v_rows: &v_rows,
+                                        },
+                                    ) {
+                                        Ok(result) => result.y_rows,
+                                        Err(err) => {
+                                            log::info!(
+                                                "[BMS exact-newton batched-HVP] tiled GPU matvec failed: {err}; \
+                                                 falling back to CPU oracle"
+                                            );
+                                            crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(
+                                                &inputs,
+                                            )
+                                        }
+                                    }
+                                }
+                                #[cfg(not(target_os = "linux"))]
+                                {
+                                    crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                                }
+                            };
+                            let mut tile_out_col = tile_out.column_mut(col);
+                            for local in 0..tile_rows {
+                                let row = tile.row_start + local;
+                                let action_slice = &y_rows[local * r_pr..(local + 1) * r_pr];
+                                row_dir_scratch
+                                    .iter_mut()
+                                    .zip(action_slice.iter())
+                                    .for_each(|(dst, &src)| *dst = src);
+                                self.pullback_primary_vector_add_into_view(
+                                    row,
+                                    slices,
+                                    primary,
+                                    &row_dir_scratch,
+                                    &mut tile_out_col,
+                                )?;
+                            }
+                        }
+                        Ok((tile_out, col_scratch, row_dir_scratch))
+                    },
+                )
+                .map(|res| res.map(|(tile_out, _, _)| tile_out))
+                .try_reduce(
+                    || Array2::<f64>::zeros((total, n_rhs)),
+                    |mut left, right| -> Result<_, String> {
+                        left += &right;
+                        Ok(left)
+                    },
+                )?;
+            *out += &partial;
+            return Ok(());
+        }
+
+        // Every other cache state keeps the single-vector fast paths. Loop the
+        // columns through the single-vector `_into`; the result is identical.
+        let mut col_in = Array1::<f64>::zeros(total);
+        let mut col_out = Array1::<f64>::zeros(total);
+        for col in 0..n_rhs {
+            col_in.assign(&v_cols.column(col));
+            self.exact_newton_joint_hessian_matvec_from_cache_into(
+                &col_in,
+                block_states,
+                cache,
+                &mut col_out,
+            )?;
+            out.column_mut(col).assign(&col_out);
+        }
+        Ok(())
+    }
+
     pub(super) fn exact_newton_joint_hessian_diagonal_from_cache(
         &self,
         block_states: &[ParameterBlockState],
@@ -14090,6 +14324,58 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 call,
                 self.family.y.len(),
                 self.cache.slices.total,
+                self.cache.row_primary_hessians.is_some(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        drop(heartbeat_guard);
+        Ok(true)
+    }
+
+    fn hessian_apply_mat(
+        &self,
+        v_cols: &Array2<f64>,
+        out: &mut Array2<f64>,
+    ) -> Result<bool, String> {
+        let total = self.cache.slices.total;
+        if v_cols.nrows() != total || out.nrows() != total {
+            return Err(format!(
+                "BMS hessian_apply_mat: row mismatch v_cols={}x{} out={}x{} expected rows={total}",
+                v_cols.nrows(),
+                v_cols.ncols(),
+                out.nrows(),
+                out.ncols()
+            ));
+        }
+        if v_cols.ncols() != out.ncols() {
+            return Err(format!(
+                "BMS hessian_apply_mat: column mismatch v_cols has {} columns, out has {}",
+                v_cols.ncols(),
+                out.ncols()
+            ));
+        }
+        let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        let started = std::time::Instant::now();
+        let heartbeat_guard = crate::heartbeat::scope(format!(
+            "BMS Hessian-Hv (mat) call={call} n={} p={} n_rhs={}",
+            self.family.y.len(),
+            total,
+            v_cols.ncols()
+        ));
+        self.family
+            .exact_newton_joint_hessian_matvec_mat_from_cache_into(
+                v_cols,
+                &self.block_states,
+                &self.cache,
+                out,
+            )?;
+        if log_exact_work(self.family.y.len()) && (call <= 3 || call.is_power_of_two()) {
+            log::info!(
+                "[BMS Hessian-Hv] call={} n={} p={} n_rhs={} primary_hessian_cache={} elapsed={:.3}s (mat)",
+                call,
+                self.family.y.len(),
+                total,
+                v_cols.ncols(),
                 self.cache.row_primary_hessians.is_some(),
                 started.elapsed().as_secs_f64()
             );

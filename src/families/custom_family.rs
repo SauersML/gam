@@ -7199,6 +7199,53 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
         }
     }
 
+    /// Batched multi-RHS Hessian apply: writes `H · V` into `out`, where `V`
+    /// and `out` are `(total, n_rhs)` with each column an independent
+    /// direction. Returns `Ok(true)` when the apply was performed and
+    /// `Ok(false)` when the workspace exposes no matrix-free apply (mirroring
+    /// `hessian_matvec_into`).
+    ///
+    /// The default implementation applies `hessian_matvec_into` column by
+    /// column, so every existing workspace gets a correct batched apply for
+    /// free and the batched result is, column for column, **numerically
+    /// identical** to looping the single-vector HVP. Workspaces whose Hessian
+    /// is `Σ_i Jᵢᵀ Hᵢ Jᵢ` over a streamed/tiled per-row primary Hessian `Hᵢ`
+    /// (Bernoulli marginal-slope) override this to sweep each row tile **once**
+    /// and apply its `Hᵢ` to all `n_rhs` columns in that single pass — the
+    /// per-tile `Hᵢ` read and the design-row projection are then amortised
+    /// across every RHS instead of paid once per column. This is the
+    /// representation that makes dense reconstruction of a matrix-free operator
+    /// (`H = H · [e_0 | … | e_{p-1}]`) one tile sweep wide instead of `p`.
+    fn hessian_apply_mat(
+        &self,
+        v_cols: &Array2<f64>,
+        out: &mut Array2<f64>,
+    ) -> Result<bool, String> {
+        if v_cols.nrows() != out.nrows() || v_cols.ncols() != out.ncols() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "hessian_apply_mat: v_cols {}x{} != out {}x{}",
+                    v_cols.nrows(),
+                    v_cols.ncols(),
+                    out.nrows(),
+                    out.ncols()
+                ),
+            }
+            .into());
+        }
+        let total = v_cols.nrows();
+        let mut col_in = Array1::<f64>::zeros(total);
+        let mut col_out = Array1::<f64>::zeros(total);
+        for col in 0..v_cols.ncols() {
+            col_in.assign(&v_cols.column(col));
+            if !self.hessian_matvec_into(&col_in, &mut col_out)? {
+                return Ok(false);
+            }
+            out.column_mut(col).assign(&col_out);
+        }
+        Ok(true)
+    }
+
     fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
         Ok(None)
     }
@@ -10352,6 +10399,14 @@ enum JointHessianSource {
         /// removes thousands of small Vec<f64> allocations from the tightest
         /// loop. Wired from `workspace.hessian_matvec_into`.
         apply_into: Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
+        /// Batched multi-RHS apply: `out = H · V` for `(total, n_rhs)` `V`.
+        /// Wired from `workspace.hessian_apply_mat`, which for the BMS tiled
+        /// row-primary Hessian sweeps each row tile once and applies its `Hᵢ`
+        /// to every column. Column-basis dense reconstruction below uses this
+        /// to materialise the operator in one batched sweep (`H = H · I`)
+        /// rather than `total` single-vector HVPs, each of which re-reads every
+        /// row tile. Numerically identical to looping `apply_into`.
+        apply_mat: Arc<dyn Fn(&Array2<f64>, &mut Array2<f64>) -> Result<(), String> + Send + Sync>,
         diagonal: Array1<f64>,
         /// Forced dense materialization that bypasses the workspace's
         /// `hessian_dense` amortization gate. Returns `Some` when the
@@ -10447,7 +10502,7 @@ fn materialize_joint_hessian_source(
     match source {
         JointHessianSource::Dense(matrix) => Ok(matrix.clone()),
         JointHessianSource::Operator {
-            apply,
+            apply_mat,
             dense_forced,
             ..
         } => {
@@ -10475,29 +10530,19 @@ fn materialize_joint_hessian_source(
                 symmetrize_dense_in_place(&mut matrix);
                 return Ok(matrix);
             }
+            // Column-basis reconstruction `H = H · I`. Driving it through the
+            // batched multi-RHS apply lets a tiled/streamed operator sweep each
+            // row tile exactly once for all `total` columns instead of once per
+            // column (`total` full sweeps). The result is, column for column,
+            // identical to applying the operator to each unit basis vector.
+            let identity = Array2::<f64>::eye(total);
             let mut matrix = Array2::<f64>::zeros((total, total));
-            let mut basis = Array1::<f64>::zeros(total);
-            for col in 0..total {
-                basis[col] = 1.0;
-                let applied = apply(&basis)?;
-                basis[col] = 0.0;
-                if applied.len() != total {
-                    return Err(CustomFamilyError::DimensionMismatch {
-                        reason: format!(
-                            "{context}: operator matvec length mismatch: got {}, expected {}",
-                            applied.len(),
-                            total
-                        ),
-                    }
-                    .into());
+            apply_mat(&identity, &mut matrix)?;
+            if matrix.iter().any(|value| !value.is_finite()) {
+                return Err(CustomFamilyError::NumericalFailure {
+                    reason: format!("{context}: operator matvec returned non-finite values"),
                 }
-                if applied.iter().any(|value| !value.is_finite()) {
-                    return Err(CustomFamilyError::NumericalFailure {
-                        reason: format!("{context}: operator matvec returned non-finite values"),
-                    }
-                    .into());
-                }
-                matrix.column_mut(col).assign(&applied);
+                .into());
             }
             symmetrize_dense_in_place(&mut matrix);
             Ok(matrix)
@@ -10587,9 +10632,11 @@ fn exact_newton_joint_hessian_operator_source_from_workspace(
 
     let workspace_apply = Arc::clone(workspace);
     let workspace_apply_into = Arc::clone(workspace);
+    let workspace_apply_mat = Arc::clone(workspace);
     let workspace_dense_forced = Arc::clone(workspace);
     let context_apply: Arc<str> = Arc::from(context);
     let context_apply_into = Arc::clone(&context_apply);
+    let context_apply_mat = Arc::clone(&context_apply);
     let context_dense_forced = Arc::clone(&context_apply);
     Ok(Some(JointHessianSource::Operator {
         apply: Arc::new(move |v: &Array1<f64>| {
@@ -10653,6 +10700,48 @@ fn exact_newton_joint_hessian_operator_source_from_workspace(
                     reason: format!(
                         "{}: operator matvec returned non-finite values",
                         &*context_apply_into
+                    ),
+                }
+                .into());
+            }
+            Ok(())
+        }),
+        apply_mat: Arc::new(move |v_cols: &Array2<f64>, out: &mut Array2<f64>| {
+            if v_cols.nrows() != total || out.nrows() != total {
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "{}: operator batched apply row mismatch: v_cols={}x{} out={}x{} expected rows={total}",
+                        &*context_apply_mat,
+                        v_cols.nrows(),
+                        v_cols.ncols(),
+                        out.nrows(),
+                        out.ncols()
+                    ),
+                }
+                .into());
+            }
+            if v_cols.ncols() != out.ncols() {
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: format!(
+                        "{}: operator batched apply column mismatch: v_cols has {} columns, out has {}",
+                        &*context_apply_mat,
+                        v_cols.ncols(),
+                        out.ncols()
+                    ),
+                }
+                .into());
+            }
+            if !workspace_apply_mat.hessian_apply_mat(v_cols, out)? {
+                return Err(CustomFamilyError::UnsupportedConfiguration {
+                    reason: "joint exact-newton operator batched apply unavailable".to_string(),
+                }
+                .into());
+            }
+            if out.iter().any(|value| !value.is_finite()) {
+                return Err(CustomFamilyError::NumericalFailure {
+                    reason: format!(
+                        "{}: operator batched apply returned non-finite values",
+                        &*context_apply_mat
                     ),
                 }
                 .into());
