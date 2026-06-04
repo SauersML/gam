@@ -12737,8 +12737,10 @@ fn solve_joint_newton_step_on_spectral_range(
     // curvature blocks (an unpenalized intercept at small n) at a residual
     // plateau orders above `residual_tol`. So count the nullity first and use
     // μ only when the model is genuinely rank-deficient.
-    let spectral_nullity =
-        evals.iter().filter(|v| !v.is_finite() || v.abs() <= cutoff).count();
+    let spectral_nullity = evals
+        .iter()
+        .filter(|v| !v.is_finite() || v.abs() <= cutoff)
+        .count();
     let effective_mu = if spectral_nullity > 0 {
         levenberg_mu.max(0.0)
     } else {
