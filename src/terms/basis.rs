@@ -1,6 +1,6 @@
 use crate::faer_ndarray::{
     FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb,
-    rrqr_nullspace_basis,
+    rrqr_nullspace_basis, rrqr_with_permutation,
 };
 use crate::linalg::utils::KahanSum;
 use crate::matrix::{
@@ -12549,6 +12549,78 @@ fn build_thin_plate_penalty_matrices(
     Ok((penalty_bending, penalty_ridge))
 }
 
+/// Drop redundant Matérn centers when an over-specified `centers=K` exceeds the
+/// kernel's numerical rank on the data cloud (#755).
+///
+/// The Matérn kernel has a fixed `length_scale` (default 1.0 on standardized
+/// inputs), so packing too many centers into a tight data cloud produces
+/// overlapping, near-identical radial basis functions. The realized kernel
+/// design `K(data, centers)` then carries exactly linearly-dependent columns,
+/// which the downstream identifiability audit hard-FATALs as intra-block rank
+/// deficiency. (Duchon is scale-free and never hits this.)
+///
+/// We detect the deficiency on the *realized* kernel design block (the same
+/// matrix the audit RRQRs, before the identifiability transform) via a
+/// column-pivoted rank-revealing QR at the crate-standard rank tolerance, so
+/// the reduction fires exactly when — and only when — the audit would have
+/// FATAL'd. When `rank < K`, we keep the leading `rank` pivoted centers
+/// (restored to ascending original order so the basis layout stays
+/// deterministic) and drop the redundant remainder. Returning a full-rank
+/// center subset keeps the design, penalty, and identifiability machinery
+/// mutually consistent because they are all rebuilt from the same centers.
+fn matern_rank_reduce_centers(
+    data: ArrayView2<'_, f64>,
+    centers: &Array2<f64>,
+    length_scale: f64,
+    nu: MaternNu,
+    aniso_log_scales: Option<&[f64]>,
+) -> Result<Array2<f64>, BasisError> {
+    let k = centers.nrows();
+    let n = data.nrows();
+    // Need at least as many rows as columns for a column rank to be meaningful;
+    // the kernel design is n × K, and a 0/1-center basis can never be deficient.
+    if k <= 1 || n < k {
+        return Ok(centers.clone());
+    }
+    let mut kernel_block = Array2::<f64>::zeros((n, k));
+    let axis_scales = aniso_log_scales.map(aniso_axis_scales);
+    let centers_view = centers.view();
+    kernel_block
+        .axis_iter_mut(Axis(0))
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(i, mut row)| {
+            for j in 0..k {
+                let r = if let Some(scales) = axis_scales.as_deref() {
+                    aniso_distance_rows_with_scales(data, i, centers_view, j, scales)
+                } else {
+                    euclidean_distance_rows(data, i, centers_view, j)
+                };
+                row[j] = matern_kernel_from_distance(r, length_scale, nu)?;
+            }
+            Ok::<(), BasisError>(())
+        })?;
+    let rrqr = rrqr_with_permutation(&kernel_block, default_rrqr_rank_alpha())
+        .map_err(BasisError::LinalgError)?;
+    if rrqr.rank >= k {
+        return Ok(centers.clone());
+    }
+    let mut keep = rrqr.column_permutation[..rrqr.rank].to_vec();
+    keep.sort_unstable();
+    log::info!(
+        "Matérn centers reduced from {k} to {} (data-supported numerical rank): \
+         requested centers exceed the kernel's rank at length_scale={length_scale}, so \
+         {} collinear basis column(s) were dropped to keep the basis full-rank (#755).",
+        rrqr.rank,
+        k - rrqr.rank,
+    );
+    let mut reduced = Array2::<f64>::zeros((keep.len(), centers.ncols()));
+    for (new_row, &old_row) in keep.iter().enumerate() {
+        reduced.row_mut(new_row).assign(&centers.row(old_row));
+    }
+    Ok(reduced)
+}
+
 fn build_matern_kernel_penalty(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -16269,7 +16341,22 @@ pub fn build_matern_basiswithworkspace(
     spec: &MaternBasisSpec,
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
-    let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    let selected_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    // Drop redundant centers when an over-specified `centers=K` exceeds the
+    // Matérn kernel's numerical rank on the data cloud (#755). Reducing the base
+    // (pre-periodic-expansion) center set keeps the stored metadata, the
+    // periodic replication, the identifiability transform, and the penalty all
+    // built from the same full-rank center subset. The contrasts used for the
+    // rank Gram come from the selected centers so anisotropy is honored.
+    let reduce_aniso =
+        maybe_initialize_aniso_contrasts(selected_centers.view(), spec.aniso_log_scales.as_deref());
+    let original_centers = matern_rank_reduce_centers(
+        data,
+        &selected_centers,
+        spec.length_scale,
+        spec.nu,
+        reduce_aniso.as_deref(),
+    )?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
     // Initialize anisotropy contrasts from knot cloud geometry when the caller
     // enabled scale-dimensions but left η at the zero default.
@@ -34934,6 +35021,60 @@ mod tests {
                 PenaltySource::OperatorTension,
                 PenaltySource::OperatorStiffness
             ]
+        );
+    }
+
+    #[test]
+    fn test_matern_overspecified_centers_yield_full_rank_basis() {
+        // #755: pack many centers into a tight standardized cloud so the fixed
+        // length_scale produces overlapping (numerically collinear) radial
+        // basis functions. The realized kernel design then exceeds the kernel's
+        // numerical rank and the identifiability audit would FATAL. The basis
+        // builder must rank-reduce centers so the emitted design is full rank.
+        use crate::linalg::faer_ndarray::rrqr_with_permutation;
+        // Pack K=30 centers far tighter than the fixed length_scale can resolve:
+        // 30 centers crammed into a 0.1-wide interval with length_scale=3.0
+        // makes adjacent radial functions near-identical, so the un-reduced
+        // kernel design collapses to numerical rank 6 (deficient by 24). The
+        // builder must reduce centers so the emitted design is full rank (#755).
+        let k = 30usize;
+        let mut centers = Array2::<f64>::zeros((k, 1));
+        for i in 0..k {
+            centers[[i, 0]] = (i as f64 / (k as f64 - 1.0)) * 0.1;
+        }
+        // Data covers the same tight interval at higher resolution.
+        let n = 120usize;
+        let mut data = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            data[[i, 0]] = (i as f64 / (n as f64 - 1.0)) * 0.1;
+        }
+        let spec = MaternBasisSpec {
+            periodic: None,
+            center_strategy: CenterStrategy::UserProvided(centers),
+            length_scale: 3.0,
+            nu: MaternNu::FiveHalves,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: MaternIdentifiability::None,
+            aniso_log_scales: None,
+        };
+        let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+        let dense = out.design.to_dense();
+        let realized_cols = dense.ncols();
+        let rrqr = rrqr_with_permutation(&dense, default_rrqr_rank_alpha())
+            .expect("RRQR on the realized design should succeed");
+        // The realized basis must be full column rank: no leftover collinear
+        // columns for the identifiability audit to FATAL on.
+        assert_eq!(
+            rrqr.rank, realized_cols,
+            "Matérn over-specified centers left {} collinear column(s): realized={realized_cols}, rank={}",
+            realized_cols - rrqr.rank,
+            rrqr.rank,
+        );
+        // Rank reduction must have actually fired (fewer than the requested K).
+        assert!(
+            realized_cols < k,
+            "expected over-specified K={k} to be reduced below {k}, got {realized_cols}"
         );
     }
 
