@@ -4779,6 +4779,7 @@ pub struct TrainingSupport {
     pub axis_max: Array1<f64>,
 }
 
+#[derive(Clone)]
 pub struct PredictUncertaintyOptions {
     /// Central interval level in (0, 1), e.g. 0.95.
     pub confidence_level: f64,
