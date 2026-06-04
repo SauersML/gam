@@ -263,8 +263,10 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
     // ---- age grid for the conditional-mean / smooth-effect comparison -------
     // Grid resolution for the conditional-mean / truth-recovery comparison.
     // Wall-clock is dominated by the R reference: tram's `predict(type="density")`
-    // is evaluated grid_n × n_y times (30 × 400 = 12 000 calls overran the 360 s
-    // reference-quality budget). The truth target is a single smooth 0.9-amplitude
+    // is evaluated over grid_n × n_y points. The R block now stacks all those
+    // points into ONE vectorized predict call (was grid_n separate calls, each
+    // paying predict.tram's per-call model-matrix setup — 30 × 400 = 12 000 calls
+    // overran the 360 s budget). The truth target is a single smooth 0.9-amplitude
     // sinusoid, so a 24-point covariate grid and a 200-point y-quadrature resolve
     // it to far below the 0.25 RMSE bar; both the gam (Rust) and tram (R)
     // conditional means use these resolutions, so the comparison stays
@@ -378,17 +380,24 @@ fn gam_smooth_transformation_matches_r_tram_on_heart_failure() {
 
             ylo <- min(df$y); yhi <- max(df$y); span <- yhi - ylo
             yq <- seq(ylo - 0.1 * span, yhi + 0.1 * span, length.out = 200)
-            emean <- numeric(length(ag))
-            for (i in seq_along(ag)) {{
-              nd <- gdat[rep(i, length(yq)), , drop = FALSE]
-              nd$y <- yq
-              dens <- predict(m, newdata = nd, type = "density")
-              dens <- as.numeric(dens)
-              # trapezoidal normalization-safe conditional mean
-              w <- rep(1, length(yq)); w[1] <- 0.5; w[length(yq)] <- 0.5
-              dyq <- yq[2] - yq[1]
-              num <- sum(yq * dens * w) * dyq
-              mass <- sum(dens * w) * dyq
+            nrep <- length(ag); ny <- length(yq)
+            # Single vectorized predict over all (age, y) pairs: stack every grid
+            # age replicated across the shared y-grid into one newdata and call
+            # predict.tram ONCE, instead of nrep separate calls each paying the
+            # model-matrix setup cost. Identical densities, identical quadrature.
+            idx_age <- rep(seq_len(nrep), each = ny)
+            big <- gdat[idx_age, , drop = FALSE]
+            big$y <- rep(yq, times = nrep)
+            densall <- as.numeric(predict(m, newdata = big, type = "density"))
+            # column i (= age i) holds the ny densities, in y-grid order
+            densmat <- matrix(densall, nrow = ny, ncol = nrep)
+            w <- rep(1, ny); w[1] <- 0.5; w[ny] <- 0.5
+            dyq <- yq[2] - yq[1]
+            emean <- numeric(nrep)
+            for (i in seq_len(nrep)) {{
+              d <- densmat[, i]
+              num <- sum(yq * d * w) * dyq
+              mass <- sum(d * w) * dyq
               emean[i] <- num / mass
             }}
             emit("emean", emean)
