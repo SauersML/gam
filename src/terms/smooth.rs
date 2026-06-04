@@ -4891,6 +4891,14 @@ fn build_tensor_bspline_basis(
     let mut kronecker_marginal_penalties =
         Vec::<Array2<f64>>::with_capacity(normalized_marginal_penalties.len());
 
+    // Accumulate the Kronecker-sum of the per-margin penalties, `Σ_dim S_dim`,
+    // whose null space is exactly the *joint* null space of all marginal
+    // penalties — the tensor of the marginal polynomial null spaces, i.e. the
+    // bilinear (low-order) directions that no marginal roughness operator
+    // touches. The tensor double penalty (below) shrinks only this joint null,
+    // never the already-penalized interaction range.
+    let mut marginal_kron_sum = Array2::<f64>::zeros((total_cols, total_cols));
+
     for dim in 0..normalized_marginal_penalties.len() {
         let mut s_dim = Array2::<f64>::eye(1);
         let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
@@ -4906,6 +4914,7 @@ fn build_tensor_bspline_basis(
         if dim == kronecker_marginal_penalties.len() {
             kronecker_marginal_penalties.push(normalized_marginal_penalties[dim].0.clone());
         }
+        marginal_kron_sum += &s_dim;
 
         candidates.push(PenaltyCandidate {
             matrix: s_dim,
@@ -4918,16 +4927,30 @@ fn build_tensor_bspline_basis(
     }
 
     if spec.double_penalty {
-        let ridge = Array2::<f64>::eye(total_cols);
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&ridge);
-        candidates.push(PenaltyCandidate {
-            matrix,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::TensorGlobalRidge,
-            normalization_scale,
-            kronecker_factors: None,
-            op: None,
-        });
+        // mgcv `select=TRUE` semantics, mirrored from the 1D double penalty:
+        // the extra penalty shrinks ONLY the directions left unpenalized by the
+        // primary (marginal) penalties — here the joint null space of the
+        // Kronecker-sum `Σ_dim S_dim` (the bilinear tensor null `Z₀ ⊗ Z₁`).
+        // A full identity ridge `I` over *all* tensor coefficients (the prior
+        // behavior) instead penalizes the already-penalized interaction range
+        // as well, and REML/LAML then places positive weight on it and
+        // systematically over-smooths the recovered surface; mgcv's `te`/`ti`
+        // carry no such global ridge. Penalizing the null subspace alone keeps
+        // the interaction range governed solely by the per-margin λ's.
+        if let Some(shrink) = crate::terms::basis::build_nullspace_shrinkage_penalty(
+            &marginal_kron_sum,
+        )? {
+            let (matrix, normalization_scale) =
+                normalize_penalty_in_constrained_space(&shrink.sym_penalty);
+            candidates.push(PenaltyCandidate {
+                matrix,
+                nullspace_dim_hint: 0,
+                source: PenaltySource::TensorGlobalRidge,
+                normalization_scale,
+                kronecker_factors: None,
+                op: None,
+            });
+        }
     }
 
     let z_opt = match &spec.identifiability {
@@ -7428,12 +7451,10 @@ fn build_term_collection_design_inner(
         let bp = if let Some(factors) = localinfo.penalty.kronecker_factors.as_ref() {
             BlockwisePenalty::kronecker(offset_range, bp_smooth.local.clone(), factors.clone())
                 .with_op(bp_smooth.op.clone())
-        } else if matches!(localinfo.penalty.source, PenaltySource::TensorGlobalRidge)
-            || matches!(
-                localinfo.penalty.source,
-                PenaltySource::Other(ref s) if s.starts_with("RandomEffectRidge")
-            )
-        {
+        } else if matches!(
+            localinfo.penalty.source,
+            PenaltySource::Other(ref s) if s.starts_with("RandomEffectRidge")
+        ) {
             BlockwisePenalty::ridge(offset_range, 1.0)
         } else {
             BlockwisePenalty::new(offset_range, bp_smooth.local.clone())
