@@ -275,6 +275,112 @@ impl BernoulliMarginalSlopeFamily {
         )))
     }
 
+    /// Closed-form row-primary negative-log-likelihood, gradient, and Hessian
+    /// for the **rigid** empirical-grid Bernoulli kernel, in primary
+    /// coordinates `(m = marginal_eta, g = slope)`.
+    ///
+    /// Replaces the second-order `empirical_rigid_neglog_jet` path — a 4-slot
+    /// [`MultiDirJet`] driven through six Newton intercept-refinement passes
+    /// per row — with the exact implicit-function-theorem solution. The
+    /// intercept `a(m, g)` is the same scalar fixed point the jet converges to
+    /// ([`Self::empirical_rigid_intercept_for_row`]); its derivatives follow in
+    /// closed form from the grid calibration
+    /// `F(a, m, g) = Σ_k π_k Φ(a + s·g·x_k) − μ(m) = 0`:
+    ///
+    /// ```text
+    ///   D    = F_a = Σ_k π_k φ(η_k)            η_k = a + s·g·x_k
+    ///   F_g        = Σ_k π_k φ(η_k)·(s·x_k)
+    ///   F_aa       = Σ_k π_k (−η_k) φ(η_k)
+    ///   F_ag       = Σ_k π_k (−η_k) φ(η_k)·(s·x_k)
+    ///   F_gg       = Σ_k π_k (−η_k) φ(η_k)·(s·x_k)²
+    ///   a_m  = μ'(m)/D                a_g  = −F_g/D
+    ///   a_mm = (μ''(m) − F_aa·a_m²)/D
+    ///   a_mg = −(F_ag·a_m + F_aa·a_m·a_g)/D
+    ///   a_gg = −(F_gg + 2·F_ag·a_g + F_aa·a_g²)/D
+    /// ```
+    ///
+    /// The marginal target enters only through the link derivatives
+    /// `μ'(m) = marginal.mu1`, `μ''(m) = marginal.mu2`, so this stays correct
+    /// for any marginal link, not just probit. The observed index is
+    /// `η = a + s·g·z`, hence `η_m = a_m`, `η_g = a_g + s·z`, and the
+    /// second-order observed derivatives equal the intercept's (`s·g·z` is
+    /// linear in `g`). The negative-log-likelihood chain reuses the **same**
+    /// signed-probit scalar kernel as the standard-normal rigid path
+    /// ([`signed_probit_neglog_derivatives_up_to_fourth`]) so the two latent
+    /// measures stay numerically consistent on shared terms:
+    /// `ℓ_u = u1·η_u`, `ℓ_uv = u2·η_u·η_v + u1·η_uv`, with `u1 = s·k1`,
+    /// `u2 = k2`.
+    pub(super) fn empirical_rigid_primary_grad_hess_closed_form(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
+        let s = self.probit_frailty_scale();
+        let a =
+            self.empirical_rigid_intercept_for_row(row, marginal, slope, nodes, measure_weights)?;
+        let observed_slope = s * slope;
+
+        // Single grid pass over the calibration moments.
+        let mut d = 0.0f64; // F_a = Σ π φ(η)
+        let mut f_g = 0.0f64;
+        let mut f_aa = 0.0f64;
+        let mut f_ag = 0.0f64;
+        let mut f_gg = 0.0f64;
+        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
+            let eta_k = a + observed_slope * node;
+            let w_phi = weight * normal_pdf(eta_k);
+            let sx = s * node;
+            let neg_eta_w_phi = -eta_k * w_phi;
+            d += w_phi;
+            f_g += w_phi * sx;
+            f_aa += neg_eta_w_phi;
+            f_ag += neg_eta_w_phi * sx;
+            f_gg += neg_eta_w_phi * sx * sx;
+        }
+        if !d.is_finite() || d <= 0.0 {
+            return Err(format!(
+                "empirical rigid closed-form: non-positive calibration denominator D={d} at row {row}"
+            ));
+        }
+
+        // Intercept derivatives via the implicit function theorem.
+        let a_m = marginal.mu1 / d;
+        let a_g = -f_g / d;
+        let a_mm = (marginal.mu2 - f_aa * a_m * a_m) / d;
+        let a_mg = -(f_ag * a_m + f_aa * a_m * a_g) / d;
+        let a_gg = -(f_gg + 2.0 * f_ag * a_g + f_aa * a_g * a_g) / d;
+
+        // Observed-index derivatives at this row's own latent score z.
+        let z = self.z[row];
+        let eta_m = a_m;
+        let eta_g = a_g + s * z;
+
+        // Signed-probit negative-log-likelihood chain (shared scalar kernel).
+        let w = self.weights[row];
+        let sign = 2.0 * self.y[row] - 1.0;
+        let observed_eta = a + observed_slope * z;
+        let m_signed = sign * observed_eta;
+        let (logcdf, _) = signed_probit_logcdf_and_mills_ratio(m_signed);
+        if !logcdf.is_finite() {
+            return Err(format!(
+                "empirical rigid closed-form: non-finite log Φ at row {row}"
+            ));
+        }
+        let (k1, k2, _, _) = signed_probit_neglog_derivatives_up_to_fourth(m_signed, w)?;
+        let u1 = sign * k1;
+        let u2 = k2;
+
+        let neglog = -w * logcdf;
+        let grad = [u1 * eta_m, u1 * eta_g];
+        let h_mm = u2 * eta_m * eta_m + u1 * a_mm;
+        let h_mg = u2 * eta_m * eta_g + u1 * a_mg;
+        let h_gg = u2 * eta_g * eta_g + u1 * a_gg;
+        Ok((neglog, grad, [[h_mm, h_mg], [h_mg, h_gg]]))
+    }
+
     pub(super) fn primary_component_jet(
         n_dirs: usize,
         base: f64,
@@ -604,7 +710,6 @@ impl BernoulliMarginalSlopeFamily {
     pub(super) fn rigid_row_kernel_eval(
         &self,
         row: usize,
-        marginal_eta: f64,
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
@@ -624,25 +729,13 @@ impl BernoulliMarginalSlopeFamily {
                     rigid_transformed_hessian(marginal, &kernel),
                 ))
             }
-            Some(grid) => {
-                let jet = self.empirical_rigid_neglog_jet(
-                    row,
-                    marginal_eta,
-                    marginal,
-                    slope,
-                    &[[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
-                    &grid.nodes,
-                    &grid.weights,
-                )?;
-                Ok((
-                    jet.coeff(0),
-                    [jet.coeff(1), jet.coeff(2)],
-                    [
-                        [jet.coeff(1 | 4), jet.coeff(1 | 2)],
-                        [jet.coeff(1 | 2), jet.coeff(2 | 8)],
-                    ],
-                ))
-            }
+            Some(grid) => self.empirical_rigid_primary_grad_hess_closed_form(
+                row,
+                marginal,
+                slope,
+                &grid.nodes,
+                &grid.weights,
+            ),
         }
     }
 
@@ -4400,7 +4493,7 @@ impl BernoulliMarginalSlopeFamily {
         let marginal_eta = block_states[0].eta[row];
         let marginal = self.marginal_link_map(marginal_eta)?;
         let g = block_states[1].eta[row];
-        let (neglog, grad_pair, h) = self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
+        let (neglog, grad_pair, h) = self.rigid_row_kernel_eval(row, marginal, g)?;
         let mut grad = Array1::<f64>::zeros(2);
         grad[0] = grad_pair[0];
         grad[1] = grad_pair[1];
@@ -9128,7 +9221,7 @@ impl BernoulliMarginalSlopeFamily {
                             let marginal = self.marginal_link_map(marginal_eta)?;
                             let g = block_states[1].eta[row];
                             let (_, _, h) =
-                                self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
+                                self.rigid_row_kernel_eval(row, marginal, g)?;
                             let v_q = self
                                 .marginal_design
                                 .dot_row_view(row, direction.slice(s![slices.marginal.clone()]));
@@ -9350,7 +9443,7 @@ impl BernoulliMarginalSlopeFamily {
                             let marginal = self.marginal_link_map(marginal_eta)?;
                             let g = block_states[1].eta[row];
                             let (_, _, h) =
-                                self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
+                                self.rigid_row_kernel_eval(row, marginal, g)?;
                             {
                                 let mut m = chunk_diag.slice_mut(s![slices.marginal.clone()]);
                                 self.marginal_design
@@ -11478,7 +11571,7 @@ impl BernoulliMarginalSlopeFamily {
                         let marginal = self.marginal_link_map(marginal_eta)?;
                         let g = block_states[1].eta[row];
                         let (neglog, grad, h) =
-                            self.rigid_row_kernel_eval(row, marginal_eta, marginal, g)?;
+                            self.rigid_row_kernel_eval(row, marginal, g)?;
                         ll -= neglog;
                         gm_w[local_row] =
                             Self::exact_newton_score_component_from_objective_gradient(grad[0]);
