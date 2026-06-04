@@ -10132,75 +10132,98 @@ impl BernoulliMarginalSlopeFamily {
                 );
             }
             let r_pr = primary.total;
-            let mut row_dir_scratch = Array1::<f64>::zeros(r_pr);
-            for tile in &tiles.tiles {
-                let tile_rows = tile.rows.hess().nrows();
-                let mut v_rows = vec![0.0_f64; tile_rows * r_pr];
-                for local in 0..tile_rows {
-                    let row = tile.row_start + local;
-                    self.row_primary_direction_from_flat_into(
-                        row,
-                        slices,
-                        primary,
-                        direction,
-                        &mut row_dir_scratch,
-                    )?;
-                    v_rows[local * r_pr..(local + 1) * r_pr]
-                        .copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
-                }
-                let h_rows_slice = tile
-                    .rows
-                    .hess()
-                    .as_slice()
-                    .expect("tiled row_primary_hessians.hess() is row-major contiguous");
-                let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
-                    n_rows: tile_rows,
-                    r: r_pr,
-                    h_rows: h_rows_slice,
-                    v_rows: &v_rows,
-                };
-                let y_rows = {
-                    #[cfg(target_os = "linux")]
-                    {
-                        match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
-                            crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
-                                n_rows: tile_rows,
-                                r: r_pr,
-                                h_rows: h_rows_slice,
-                                v_rows: &v_rows,
-                            },
-                        ) {
-                            Ok(result) => result.y_rows,
-                            Err(err) => {
-                                log::info!(
-                                    "[BMS exact-newton HVP] tiled GPU matvec failed: {err}; \
-                                     falling back to CPU oracle"
-                                );
+            // Fan the tiles across rayon: each tile owns an independent row
+            // block, so a per-tile partial pullback into a private accumulator
+            // followed by a reduce is numerically identical to the serial
+            // single-buffer accumulation (the reduction order differs only by
+            // tile, and each tile contributes a disjoint set of rows). This
+            // mirrors the chunked `try_fold`/`try_reduce` used by the streaming
+            // fallback below and gives every worker its own row-direction /
+            // action scratch, so there is no per-call `v_rows` allocation on a
+            // shared path and no serial bottleneck across the ~`n/tile_rows`
+            // tiles.
+            let partial = tiles
+                .tiles
+                .par_iter()
+                .try_fold(
+                    || (Array1::<f64>::zeros(slices.total), Array1::<f64>::zeros(r_pr)),
+                    |(mut tile_out, mut row_dir_scratch), tile| -> Result<_, String> {
+                        let tile_rows = tile.rows.hess().nrows();
+                        let mut v_rows = vec![0.0_f64; tile_rows * r_pr];
+                        for local in 0..tile_rows {
+                            let row = tile.row_start + local;
+                            self.row_primary_direction_from_flat_into(
+                                row,
+                                slices,
+                                primary,
+                                direction,
+                                &mut row_dir_scratch,
+                            )?;
+                            v_rows[local * r_pr..(local + 1) * r_pr]
+                                .copy_from_slice(row_dir_scratch.as_slice().expect("contiguous"));
+                        }
+                        let h_rows_slice = tile.rows.hess().as_slice().expect(
+                            "tiled row_primary_hessians.hess() is row-major contiguous",
+                        );
+                        let inputs = crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                            n_rows: tile_rows,
+                            r: r_pr,
+                            h_rows: h_rows_slice,
+                            v_rows: &v_rows,
+                        };
+                        let y_rows = {
+                            #[cfg(target_os = "linux")]
+                            {
+                                match crate::gpu::row_hessian_ops::launch_row_hessian_matvec(
+                                    crate::gpu::row_hessian_ops::RowHessianMatvecInputs {
+                                        n_rows: tile_rows,
+                                        r: r_pr,
+                                        h_rows: h_rows_slice,
+                                        v_rows: &v_rows,
+                                    },
+                                ) {
+                                    Ok(result) => result.y_rows,
+                                    Err(err) => {
+                                        log::info!(
+                                            "[BMS exact-newton HVP] tiled GPU matvec failed: {err}; \
+                                             falling back to CPU oracle"
+                                        );
+                                        crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
+                                    }
+                                }
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            {
                                 crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                             }
+                        };
+                        for local in 0..tile_rows {
+                            let row = tile.row_start + local;
+                            let action_slice = &y_rows[local * r_pr..(local + 1) * r_pr];
+                            row_dir_scratch
+                                .iter_mut()
+                                .zip(action_slice.iter())
+                                .for_each(|(dst, &src)| *dst = src);
+                            self.pullback_primary_vector_add_into(
+                                row,
+                                slices,
+                                primary,
+                                &row_dir_scratch,
+                                &mut tile_out,
+                            )?;
                         }
-                    }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
-                    }
-                };
-                for local in 0..tile_rows {
-                    let row = tile.row_start + local;
-                    let action_slice = &y_rows[local * r_pr..(local + 1) * r_pr];
-                    row_dir_scratch
-                        .iter_mut()
-                        .zip(action_slice.iter())
-                        .for_each(|(dst, &src)| *dst = src);
-                    self.pullback_primary_vector_add_into(
-                        row,
-                        slices,
-                        primary,
-                        &row_dir_scratch,
-                        out,
-                    )?;
-                }
-            }
+                        Ok((tile_out, row_dir_scratch))
+                    },
+                )
+                .map(|res| res.map(|(tile_out, _)| tile_out))
+                .try_reduce(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut left, right| -> Result<_, String> {
+                        left += &right;
+                        Ok(left)
+                    },
+                )?;
+            *out += &partial;
             return Ok(());
         }
 
