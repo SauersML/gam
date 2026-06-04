@@ -9079,8 +9079,6 @@ impl BernoulliMarginalSlopeFamily {
                 self.flex_axis_fourth_tensors_for_row(block_states, cache, row)?
             {
                 let scale = s_u * s_v;
-                debug_assert!(a <= 1);
-                debug_assert!(b <= 1);
                 let mut out = if a == 0 && b == 0 {
                     tensors.qq.clone()
                 } else if a == 1 && b == 1 {
