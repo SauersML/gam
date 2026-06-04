@@ -53,7 +53,7 @@ fn gamma_log_coefficient_se_matches_statsmodels_no_double_count() {
     let seed = 781u64;
     let shape = 2.5_f64;
     let mut rng = StdRng::seed_from_u64(seed);
-    let ux = Uniform::new(-1.0, 1.0).expect("uniform -1..1");
+    let ux = Uniform::new(-1.0_f64, 1.0_f64).expect("uniform -1..1");
 
     let mut x = Vec::<f64>::with_capacity(n);
     let mut z = Vec::<f64>::with_capacity(n);
@@ -197,7 +197,7 @@ emit("scale", [res.scale])
     let mut ratios: Vec<f64> = gam_eta_se
         .iter()
         .zip(ref_eta_se.iter())
-        .filter(|(_, &s)| s > 0.0)
+        .filter(|&(_, &s)| s > 0.0)
         .map(|(&g, &s)| g / s)
         .collect();
     assert!(!ratios.is_empty(), "no positive reference SEs to compare");
