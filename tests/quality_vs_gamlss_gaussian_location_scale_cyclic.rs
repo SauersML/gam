@@ -217,6 +217,7 @@ fn gam_cyclic_location_scale_recovers_truth() {
             y ~ ga(~ s(x, bs = "cc"), control = list(knots = kn)),
             sigma.formula = ~ ga(~ s(x, bs = "cc"), control = list(knots = kn)),
             family = NO(),
+            data = df,
             control = gamlss.control(n.cyc = 200, trace = FALSE)
         )
         xg <- seq(0, 2*pi, length.out = 51)[1:50]
@@ -530,6 +531,7 @@ fn gam_cyclic_location_scale_recovers_truth_on_real_data() {
             temp ~ ga(~ s(month, bs = "cc"), control = list(knots = kn)),
             sigma.formula = ~ ga(~ s(month, bs = "cc"), control = list(knots = kn)),
             family = NO(),
+            data = df,
             control = gamlss.control(n.cyc = 200, trace = FALSE)
         )
         k <- df$test_n[1]

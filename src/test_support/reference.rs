@@ -309,6 +309,31 @@ pub fn run_r(columns: &[Column<'_>], body: &str) -> ReferenceResult {
     run_subprocess(&ReferenceKind::r(), columns, body)
 }
 
+/// Probe whether an R package can actually be **loaded** (namespace + any native
+/// `dyn.load`) in the reference interpreter, without raising. Returns `true`
+/// only when `requireNamespace` reports the package is usable.
+///
+/// This is the narrow, documented environmental-gate escape hatch — the same
+/// category as the CUDA hardware gate and the DoubleML/EconML `available` flag,
+/// NOT a general skip path. It exists for the handful of references the
+/// reference-quality CI job provisions only *best-effort* because they are large
+/// and/or native and not reliably installable on a bare runner (notably R-INLA,
+/// whose bundled native binaries `dyn.load` per-OS). A test that gates on this
+/// MUST still assert its tool-free, absolute quality bars unconditionally and
+/// skip only the *match-or-beat-vs-this-tool* arm when the tool is genuinely
+/// absent — never the gam-side claim. Every other reference dependency remains a
+/// hard failure via [`run_r`]/[`run_python`].
+pub fn r_package_available(pkg: &str) -> bool {
+    // `requireNamespace` is contractually non-throwing (returns FALSE and warns
+    // on a failed load), so the probe interpreter always exits zero and this is
+    // never itself a hard failure. `as.numeric(TRUE/FALSE)` -> 1/0.
+    let probe = run_r(
+        &[Column::new("probe", &[0.0])],
+        &format!("emit(\"ok\", as.numeric(requireNamespace(\"{pkg}\", quietly = TRUE)))"),
+    );
+    probe.scalar("ok") != 0.0
+}
+
 /// Run a Python reference body. The columns are exposed as a pandas `df` (or,
 /// when pandas is unavailable, a dict of NumPy arrays). The body calls
 /// `emit("key", iterable)` to return results. Fails the test with captured

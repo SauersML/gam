@@ -161,10 +161,10 @@ fn gam_pspline_generalizes_on_lidar() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        train <- is_test == 0
-        test  <- is_test == 1
-        tr <- data.frame(range = range[train], logratio = logratio[train])
-        te <- data.frame(range = range[test])
+        train <- df$is_test == 0
+        test  <- df$is_test == 1
+        tr <- data.frame(range = df$range[train], logratio = df$logratio[train])
+        te <- data.frame(range = df$range[test])
         m <- gam(logratio ~ s(range, bs = "ps", k = 15, m = c(2, 2)), data = tr, method = "REML")
         emit("test_pred", as.numeric(predict(m, newdata = te)))
         emit("train_fit", as.numeric(fitted(m)))
@@ -336,10 +336,10 @@ fn gam_pspline_generalizes_on_lidar_on_real_data() {
         ],
         r#"
         suppressPackageStartupMessages(library(mgcv))
-        train <- is_test == 0
-        test  <- is_test == 1
-        tr <- data.frame(range = range[train], logratio = logratio[train])
-        te <- data.frame(range = range[test])
+        train <- df$is_test == 0
+        test  <- df$is_test == 1
+        tr <- data.frame(range = df$range[train], logratio = df$logratio[train])
+        te <- data.frame(range = df$range[test])
         m <- gam(logratio ~ s(range, bs = "ps", k = 15, m = c(2, 2)), data = tr, method = "REML")
         emit("test_pred", as.numeric(predict(m, newdata = te)))
         emit("train_fit", as.numeric(fitted(m)))
