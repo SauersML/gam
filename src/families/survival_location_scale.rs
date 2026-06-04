@@ -10361,10 +10361,9 @@ pub(crate) fn fit_survival_location_scale_terms(
                 .map_or(0, |w| w.design.ncols())) as u64;
         let hess_cost = n_work.saturating_mul(p_total.saturating_mul(p_total));
         let grad_cost = hess_cost / 2;
-        let outer_coords = (joint_setup.rho_dim()
-            + joint_setup.log_kappa_dim()
-            + joint_setup.auxiliary_dim())
-        .max(1) as u128;
+        let outer_coords =
+            (joint_setup.rho_dim() + joint_setup.log_kappa_dim() + joint_setup.auxiliary_dim())
+                .max(1) as u128;
         let predicted_hessian_work = (hess_cost as u128).saturating_mul(outer_coords);
         let predicted_gradient_work = (grad_cost as u128).saturating_mul(outer_coords);
         crate::families::custom_family::OuterDerivativePolicy {

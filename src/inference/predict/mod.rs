@@ -773,6 +773,56 @@ impl StandardPredictor {
 }
 
 impl StandardPredictor {
+    /// Full-uncertainty η/mean point and standard errors for the link-wiggle
+    /// path, computed from an arbitrary covariance `backend` (so the caller can
+    /// select conditional vs. smoothing-corrected covariance). Mirrors the
+    /// wiggle SE arm of [`predict_with_uncertainty`] but parameterised on the
+    /// backend instead of the predictor's stored conditional covariance.
+    fn wiggle_state_from_backend(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
+        let runtime = self.link_wiggle.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "standard link-wiggle uncertainty requires a link wiggle".to_string(),
+            )
+        })?;
+        let eta_base = input.design.dot(&self.beta) + &input.offset;
+        let eta = runtime.apply(&eta_base).map_err(EstimationError::from)?;
+        let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
+        let (mean, dmu_deta) = inverse_link_mean_and_d1(&strategy, eta.view())?;
+        let p_main = self.beta.len();
+        let p_w = runtime.beta.len();
+        let p_total = p_main + p_w;
+        if backend.nrows() != p_total {
+            return Err(EstimationError::InvalidInput(format!(
+                "standard link-wiggle covariance dimension mismatch: expected parameter dimension {}, got {}",
+                p_total,
+                backend.nrows()
+            )));
+        }
+        let eta_se = linear_predictor_se_from_backend(backend, eta.len(), |rows| {
+            let q0_chunk = eta_base.slice(ndarray::s![rows.clone()]).to_owned();
+            let x_main = design_row_chunk(&input.design, rows.clone())?;
+            let wiggle_design = runtime.design(&q0_chunk)?;
+            let dq_dq0 = runtime.derivative_q0(&q0_chunk)?;
+            let rows_in_chunk = q0_chunk.len();
+            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+            for i in 0..rows_in_chunk {
+                let dqi = dq_dq0[i];
+                for j in 0..p_main {
+                    grad[[i, j]] = dqi * x_main[[i, j]];
+                }
+            }
+            grad.slice_mut(ndarray::s![.., p_main..p_total])
+                .assign(&wiggle_design);
+            Ok(vec![grad])
+        })?;
+        let mean_se = delta_method_mean_se_from_d1(&dmu_deta, &eta_se);
+        Ok((eta, mean, eta_se, mean_se))
+    }
+
     /// The wiggle-path posterior-mean state: η-scale SE through the link-wiggle
     /// chain rule, then the per-row coefficient-uncertainty-integrated mean.
     /// Only reached when a link wiggle is active; the wiggle-free path is the
@@ -840,6 +890,8 @@ impl StandardPredictor {
             mean,
             eta_se: Some(eta_se),
             mean_se: None,
+            // Posterior-mean integration always uses the conditional posterior.
+            covariance_corrected_used: false,
         })
     }
 }
@@ -858,6 +910,9 @@ impl PredictionTransform for StandardPredictor {
             mean: with_se.mean,
             eta_se: with_se.eta_se,
             mean_se: with_se.mean_se,
+            // Point state is built from the predictor's stored conditional
+            // covariance.
+            covariance_corrected_used: false,
         })
     }
 
@@ -866,29 +921,43 @@ impl PredictionTransform for StandardPredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
         pass: PredictPass,
+        covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         match pass {
             PredictPass::FullUncertainty => {
-                assert!(std::mem::size_of_val(fit) > 0);
-                let state = self.point_state(input)?;
-                let eta_se = state.eta_se.ok_or_else(|| {
+                // Build the SE backend from the requested covariance mode
+                // (conditional vs. smoothing-corrected) rather than the
+                // predictor's stored conditional covariance, so a caller asking
+                // for corrected/full intervals gets the wider SEs and the
+                // provenance flag is honest. Only the link-wiggle path reaches
+                // here; the wiggle-free path is served by the dedicated
+                // `predict_gamwith_uncertainty` engine, which already threads the
+                // mode through `select_uncertainty_backend`.
+                let runtime = self.link_wiggle.as_ref().ok_or_else(|| {
                     EstimationError::InvalidInput(
-                        "standard link-wiggle uncertainty requires covariance".to_string(),
+                        "standard link-wiggle uncertainty requires a link wiggle".to_string(),
                     )
                 })?;
-                let mean_se = state.mean_se.ok_or_else(|| {
-                    EstimationError::InvalidInput(
-                        "standard link-wiggle uncertainty requires covariance".to_string(),
-                    )
-                })?;
+                let p_total = self.beta.len() + runtime.beta.len();
+                let (backend, covariance_corrected_used) = fit.select_uncertainty_backend(
+                    p_total,
+                    covariance_mode,
+                    "standard link-wiggle",
+                )?;
+                let (eta, mean, eta_se, mean_se) =
+                    self.wiggle_state_from_backend(input, &backend)?;
                 Ok(LinearState {
-                    eta: state.eta,
-                    mean: state.mean,
+                    eta,
+                    mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
+                    covariance_corrected_used,
                 })
             }
-            PredictPass::PosteriorMean => self.wiggle_posterior_mean_state(input, fit),
+            PredictPass::PosteriorMean => {
+                assert!(std::mem::size_of_val(&covariance_mode) > 0);
+                self.wiggle_posterior_mean_state(input, fit)
+            }
         }
     }
 
@@ -2949,19 +3018,13 @@ impl BernoulliMarginalSlopePredictor {
         })
     }
 
-    fn eta_standard_error(
+    fn eta_standard_error_from_backend(
         &self,
         input: &PredictInput,
-        fit: &UnifiedFitResult,
+        backend: &PredictionCovarianceBackend<'_>,
     ) -> Result<Array1<f64>, EstimationError> {
         let theta = self.theta();
-        let backend = require_posterior_mean_backend(
-            fit,
-            self.covariance.as_ref(),
-            theta.len(),
-            "bernoulli marginal-slope posterior mean",
-        )?;
-        linear_predictor_se_from_backend(&backend, input.design.nrows(), |rows| {
+        linear_predictor_se_from_backend(backend, input.design.nrows(), |rows| {
             let chunk_input = slice_predict_input(input, rows).map_err(|e| e.to_string())?;
             let (_, grad) = self
                 .final_eta_and_gradient_from_theta(&chunk_input, &theta, true)
@@ -3235,6 +3298,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
             mean,
             eta_se,
             mean_se,
+            covariance_corrected_used: false,
         })
     }
 
@@ -3243,11 +3307,20 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
         pass: PredictPass,
+        covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         let eta = self.final_eta_from_theta(input, &self.theta())?;
-        let eta_se = self.eta_standard_error(input, fit)?;
         match pass {
             PredictPass::FullUncertainty => {
+                // Select the covariance the caller requested (conditional vs.
+                // smoothing-corrected) instead of always using the conditional
+                // backend, and report which was used.
+                let (backend, covariance_corrected_used) = fit.select_uncertainty_backend(
+                    self.theta().len(),
+                    covariance_mode,
+                    "bernoulli marginal-slope",
+                )?;
+                let eta_se = self.eta_standard_error_from_backend(input, &backend)?;
                 let mean = self.mean_from_eta(&eta)?;
                 let mean_se = eta_se.clone() * self.mean_derivative_from_eta(&eta)?;
                 Ok(LinearState {
@@ -3255,9 +3328,18 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: Some(mean_se),
+                    covariance_corrected_used,
                 })
             }
             PredictPass::PosteriorMean => {
+                // Posterior-mean integration uses the conditional posterior.
+                let backend = require_posterior_mean_backend(
+                    fit,
+                    self.covariance.as_ref(),
+                    self.theta().len(),
+                    "bernoulli marginal-slope posterior mean",
+                )?;
+                let eta_se = self.eta_standard_error_from_backend(input, &backend)?;
                 let strategy = strategy_for_family(self.likelihood_family(), Some(&self.base_link));
                 let quadctx = crate::quadrature::QuadratureContext::new();
                 let mean = Array1::from_iter(
@@ -3271,6 +3353,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: None,
+                    covariance_corrected_used: false,
                 })
             }
         }
@@ -3388,34 +3471,6 @@ impl GaussianLocationScalePredictor {
             .mapv(|eta| crate::families::sigma_link::logb_sigma_from_eta_scalar(eta) * scale))
     }
 
-    fn eta_standard_error(
-        &self,
-        input: &PredictInput,
-        fit: &UnifiedFitResult,
-        eta_len: usize,
-    ) -> Result<Array1<f64>, EstimationError> {
-        let backend = require_posterior_mean_backend(
-            fit,
-            self.covariance.as_ref(),
-            self.beta_mu.len()
-                + self.beta_noise.len()
-                + self.link_wiggle.as_ref().map_or(0, |w| w.beta.len()),
-            "gaussian location-scale posterior mean",
-        )?;
-        let p_mu = self.beta_mu.len();
-        let p_sigma = self.beta_noise.len();
-        let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
-        let p_total = p_mu + p_sigma + p_w;
-        if backend.nrows() != p_total {
-            return Err(EstimationError::InvalidInput(format!(
-                "gaussian location-scale covariance mismatch: expected parameter dimension {}, got {}",
-                p_total,
-                backend.nrows()
-            )));
-        }
-        self.eta_standard_error_from_backend(input, &backend, eta_len, p_mu, p_sigma, p_w)
-    }
-
     fn eta_standard_error_from_backend(
         &self,
         input: &PredictInput,
@@ -3507,6 +3562,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
             mean,
             eta_se,
             mean_se,
+            covariance_corrected_used: false,
         })
     }
 
@@ -3515,18 +3571,40 @@ impl PredictionTransform for GaussianLocationScalePredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
         pass: PredictPass,
+        covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         // Both fit-backed passes share the identity-link state: mean == eta and
         // the mean SE equals the η SE, computed from the fit-backed backend.
-        assert!(std::mem::size_of_val(&pass) > 0);
         let eta = self.plugin_eta(input)?;
-        let eta_se = self.eta_standard_error(input, fit, eta.len())?;
+        let p_mu = self.beta_mu.len();
+        let p_sigma = self.beta_noise.len();
+        let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+        let p_total = p_mu + p_sigma + p_w;
+        // Full uncertainty honors the requested covariance mode; posterior-mean
+        // integration uses the conditional posterior.
+        let (backend, covariance_corrected_used) = match pass {
+            PredictPass::FullUncertainty => {
+                fit.select_uncertainty_backend(p_total, covariance_mode, "gaussian location-scale")?
+            }
+            PredictPass::PosteriorMean => (
+                require_posterior_mean_backend(
+                    fit,
+                    self.covariance.as_ref(),
+                    p_total,
+                    "gaussian location-scale posterior mean",
+                )?,
+                false,
+            ),
+        };
+        let eta_se =
+            self.eta_standard_error_from_backend(input, &backend, eta.len(), p_mu, p_sigma, p_w)?;
         let mean = eta.clone();
         Ok(LinearState {
             eta,
             mean,
             eta_se: Some(eta_se.clone()),
             mean_se: Some(eta_se),
+            covariance_corrected_used,
         })
     }
 
@@ -3720,6 +3798,76 @@ impl BinomialLocationScalePredictor {
             mean: with_se.mean,
             eta_se: with_se.mean_se.clone(),
             mean_se: with_se.mean_se,
+            covariance_corrected_used: false,
+        })
+    }
+
+    /// Delta-method response-scale SE for the binomial-LS probability from an
+    /// arbitrary covariance `backend`, via the threshold/scale/wiggle chain
+    /// rule. Shared by the conditional point path and the mode-selecting
+    /// full-uncertainty path.
+    fn mean_se_from_backend(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
+        let (_, _, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
+        let n = eta_t.len();
+        let p_t = self.beta_threshold.len();
+        let p_s = self.beta_noise.len();
+        let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+        let p_total = p_t + p_s + p_w;
+        if backend.nrows() != p_total {
+            return Err(EstimationError::InvalidInput(format!(
+                "covariance dimension mismatch for binomial LS: expected parameter dimension {}, got {}",
+                p_total,
+                backend.nrows()
+            )));
+        }
+        let design_noise = input.design_noise.as_ref().ok_or_else(|| {
+            EstimationError::InvalidInput(
+                "binomial location-scale uncertainty requires noise design matrix".to_string(),
+            )
+        })?;
+        linear_predictor_se_from_backend(backend, n, |rows| {
+            let x_t = design_row_chunk(&input.design, rows.clone())?;
+            let x_s = design_row_chunk(design_noise, rows.clone())?;
+            let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
+            let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
+            let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
+            let dmu_chunk = dmu_deta.slice(ndarray::s![rows.clone()]);
+            let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
+                Some(runtime.design(&q0_chunk)?)
+            } else {
+                None
+            };
+            let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
+                runtime.derivative_q0(&q0_chunk)?
+            } else {
+                Array1::ones(q0_chunk.len())
+            };
+            let rows_in_chunk = q0_chunk.len();
+            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
+            for i in 0..rows_in_chunk {
+                let dphi = dmu_chunk[i];
+                let scale = dq_dq0[i];
+                let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
+                // dq/dη_ls = eta_t / σ for the exact exp link.
+                let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
+                for j in 0..p_t {
+                    grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
+                }
+                for j in 0..p_s {
+                    grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
+                }
+                if let Some(wd) = wiggle_design.as_ref() {
+                    for j in 0..p_w {
+                        grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
+                    }
+                }
+            }
+            Ok(vec![grad])
         })
     }
 
@@ -3727,68 +3875,12 @@ impl BinomialLocationScalePredictor {
         &self,
         input: &PredictInput,
     ) -> Result<PredictionWithSE, EstimationError> {
-        let (q0_base, sigma, eta_t) = self.compute_q0_and_sigma(input)?;
-        let (eta, prob, dmu_deta) = self.apply_link_with_d1(&q0_base)?;
+        let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
+        let (eta, prob, _) = self.apply_link_with_d1(&q0_base)?;
 
         let mean_se = if let Some(ref cov) = self.covariance {
-            let n = eta_t.len();
-            let p_t = self.beta_threshold.len();
-            let p_s = self.beta_noise.len();
-            let p_w = self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
-            let p_total = p_t + p_s + p_w;
             let backend = PredictionCovarianceBackend::from_dense(cov.view());
-            if backend.nrows() != p_total {
-                return Err(EstimationError::InvalidInput(format!(
-                    "covariance dimension mismatch for binomial LS: expected parameter dimension {}, got {}",
-                    p_total,
-                    backend.nrows()
-                )));
-            }
-
-            let design_noise = input.design_noise.as_ref().ok_or_else(|| {
-                EstimationError::InvalidInput(
-                    "binomial location-scale uncertainty requires noise design matrix".to_string(),
-                )
-            })?;
-            Some(linear_predictor_se_from_backend(&backend, n, |rows| {
-                let x_t = design_row_chunk(&input.design, rows.clone())?;
-                let x_s = design_row_chunk(design_noise, rows.clone())?;
-                let q0_chunk = q0_base.slice(ndarray::s![rows.clone()]).to_owned();
-                let sigma_chunk = sigma.slice(ndarray::s![rows.clone()]);
-                let eta_t_chunk = eta_t.slice(ndarray::s![rows.clone()]);
-                let dmu_chunk = dmu_deta.slice(ndarray::s![rows.clone()]);
-                let wiggle_design = if let Some(runtime) = self.link_wiggle.as_ref() {
-                    Some(runtime.design(&q0_chunk)?)
-                } else {
-                    None
-                };
-                let dq_dq0 = if let Some(runtime) = self.link_wiggle.as_ref() {
-                    runtime.derivative_q0(&q0_chunk)?
-                } else {
-                    Array1::ones(q0_chunk.len())
-                };
-                let rows_in_chunk = q0_chunk.len();
-                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_total));
-                for i in 0..rows_in_chunk {
-                    let dphi = dmu_chunk[i];
-                    let scale = dq_dq0[i];
-                    let dprob_deta_t = dphi * scale * (-1.0 / sigma_chunk[i]);
-                    // dq/dη_ls = eta_t / σ for the exact exp link.
-                    let dprob_deta_s = dphi * scale * (eta_t_chunk[i] / sigma_chunk[i]);
-                    for j in 0..p_t {
-                        grad[[i, j]] = dprob_deta_t * x_t[[i, j]];
-                    }
-                    for j in 0..p_s {
-                        grad[[i, p_t + j]] = dprob_deta_s * x_s[[i, j]];
-                    }
-                    if let Some(wd) = wiggle_design.as_ref() {
-                        for j in 0..p_w {
-                            grad[[i, p_t + p_s + j]] = dphi * wd[[i, j]];
-                        }
-                    }
-                }
-                Ok(vec![grad])
-            })?)
+            Some(self.mean_se_from_backend(input, &backend)?)
         } else {
             None
         };
@@ -4048,6 +4140,7 @@ impl BinomialLocationScalePredictor {
             mean,
             eta_se: Some(eta_se),
             mean_se: None,
+            covariance_corrected_used: false,
         })
     }
 }
@@ -4062,23 +4155,38 @@ impl PredictionTransform for BinomialLocationScalePredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
         pass: PredictPass,
+        covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         match pass {
             PredictPass::FullUncertainty => {
-                assert!(std::mem::size_of_val(fit) > 0);
-                // Reuse the plug-in / covariance SE. When no covariance is
-                // available the response SE is zero so the interval collapses.
-                let state = self.plugin_state_from_covariance(input)?;
-                let zeros = Array1::zeros(state.mean.len());
-                let response_se = state.mean_se.unwrap_or(zeros);
+                // Build the response-scale SE from the requested covariance mode
+                // and report which covariance was used. The full-uncertainty
+                // path always has a fit (with at least a conditional backend);
+                // when no covariance can be formed at all this surfaces a clean
+                // error rather than the previous silent zero-SE collapse.
+                let p_total = self.beta_threshold.len()
+                    + self.beta_noise.len()
+                    + self.link_wiggle.as_ref().map_or(0, |w| w.beta.len());
+                let (backend, covariance_corrected_used) = fit.select_uncertainty_backend(
+                    p_total,
+                    covariance_mode,
+                    "binomial location-scale",
+                )?;
+                let (q0_base, _, _) = self.compute_q0_and_sigma(input)?;
+                let (eta, prob) = self.apply_link(&q0_base)?;
+                let response_se = self.mean_se_from_backend(input, &backend)?;
                 Ok(LinearState {
-                    eta: state.eta,
-                    mean: state.mean,
+                    eta,
+                    mean: prob,
                     eta_se: Some(response_se.clone()),
                     mean_se: Some(response_se),
+                    covariance_corrected_used,
                 })
             }
-            PredictPass::PosteriorMean => self.posterior_mean_state(input, fit),
+            PredictPass::PosteriorMean => {
+                assert!(std::mem::size_of_val(&covariance_mode) > 0);
+                self.posterior_mean_state(input, fit)
+            }
         }
     }
 
@@ -4313,67 +4421,84 @@ impl SurvivalPredictor {
         Ok((eta_threshold, eta_log_sigma, design_noise))
     }
 
-    /// Plug-in survival point + (covariance-derived) η/mean standard errors.
-    /// Shared by the `predict_with_uncertainty` point path and the
-    /// full-uncertainty pass of [`PredictionTransform::linear_state`].
+    /// Survival point + η/mean standard errors from an explicit covariance
+    /// `backend` (so the caller can select conditional vs. smoothing-corrected
+    /// covariance). The `covariance_corrected_used` flag is left `false`; the
+    /// caller overrides it according to the backend it selected.
+    fn state_from_backend(
+        &self,
+        input: &PredictInput,
+        backend: &PredictionCovarianceBackend<'_>,
+    ) -> Result<LinearState, EstimationError> {
+        let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
+        let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
+        let n = eta_threshold.len();
+        let p_t = self.beta_threshold.len();
+        let p_s = self.beta_log_sigma.len();
+
+        let eta_se = padded_design_standard_errors_from_backend(
+            &input.design,
+            backend,
+            0,
+            p_s,
+            "survival threshold uncertainty",
+        )?;
+
+        // Delta-method SE for survival probability.
+        let mean_se_vec = linear_predictor_se_from_backend(backend, n, |rows| {
+            let x_t = design_row_chunk(&input.design, rows.clone())?;
+            let x_s = design_row_chunk(design_noise, rows.clone())?;
+            let eta_t_chunk = eta_threshold.slice(ndarray::s![rows.clone()]);
+            let eta_ls_chunk = eta_log_sigma.slice(ndarray::s![rows.clone()]);
+            let rows_in_chunk = eta_t_chunk.len();
+            let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_t + p_s));
+            for i in 0..rows_in_chunk {
+                let (q0, inv_sigma) =
+                    survival_q0_and_inverse_sigma(eta_t_chunk[i], eta_ls_chunk[i]);
+                let (_, failure_density) =
+                    inverse_link_survival_tail_value_and_failure_density(&self.inverse_link, q0)
+                        .map_err(|e| e.to_string())?;
+                let dsurv_deta_t = failure_density * inv_sigma;
+                let dsurv_deta_s = failure_density * q0;
+                for j in 0..p_t {
+                    grad[[i, j]] = dsurv_deta_t * x_t[[i, j]];
+                }
+                for j in 0..p_s {
+                    grad[[i, p_t + j]] = dsurv_deta_s * x_s[[i, j]];
+                }
+            }
+            Ok(vec![grad])
+        })?;
+        Ok(LinearState {
+            eta: eta_threshold,
+            mean: survival_prob,
+            eta_se: Some(eta_se),
+            mean_se: Some(mean_se_vec),
+            covariance_corrected_used: false,
+        })
+    }
+
+    /// Plug-in survival point + conditional-covariance η/mean standard errors,
+    /// used by the `predict_with_uncertainty` point path. Returns zero-SE
+    /// (no interval) state when the predictor carries no covariance.
     fn plugin_state_from_covariance(
         &self,
         input: &PredictInput,
     ) -> Result<LinearState, EstimationError> {
-        let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
-        let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
-        let (eta_se, mean_se) = if let Some(ref cov) = self.covariance {
-            let n = eta_threshold.len();
-            let p_t = self.beta_threshold.len();
-            let p_s = self.beta_log_sigma.len();
+        if let Some(ref cov) = self.covariance {
             let backend = PredictionCovarianceBackend::from_dense(cov.view());
-
-            let eta_se = padded_design_standard_errors_from_backend(
-                &input.design,
-                &backend,
-                0,
-                p_s,
-                "survival threshold uncertainty",
-            )?;
-
-            // Delta-method SE for survival probability.
-            let mean_se_vec = linear_predictor_se_from_backend(&backend, n, |rows| {
-                let x_t = design_row_chunk(&input.design, rows.clone())?;
-                let x_s = design_row_chunk(design_noise, rows.clone())?;
-                let eta_t_chunk = eta_threshold.slice(ndarray::s![rows.clone()]);
-                let eta_ls_chunk = eta_log_sigma.slice(ndarray::s![rows.clone()]);
-                let rows_in_chunk = eta_t_chunk.len();
-                let mut grad = Array2::<f64>::zeros((rows_in_chunk, p_t + p_s));
-                for i in 0..rows_in_chunk {
-                    let (q0, inv_sigma) =
-                        survival_q0_and_inverse_sigma(eta_t_chunk[i], eta_ls_chunk[i]);
-                    let (_, failure_density) =
-                        inverse_link_survival_tail_value_and_failure_density(
-                            &self.inverse_link,
-                            q0,
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let dsurv_deta_t = failure_density * inv_sigma;
-                    let dsurv_deta_s = failure_density * q0;
-                    for j in 0..p_t {
-                        grad[[i, j]] = dsurv_deta_t * x_t[[i, j]];
-                    }
-                    for j in 0..p_s {
-                        grad[[i, p_t + j]] = dsurv_deta_s * x_s[[i, j]];
-                    }
-                }
-                Ok(vec![grad])
-            })?;
-            (Some(eta_se), Some(mean_se_vec))
+            self.state_from_backend(input, &backend)
         } else {
-            (None, None)
-        };
-        Ok(LinearState {
-            eta: eta_threshold,
-            mean: survival_prob,
-            eta_se,
-            mean_se,
-        })
+            let (eta_threshold, eta_log_sigma, _) = self.linear_predictors(input)?;
+            let survival_prob = self.compute_survival(&eta_threshold, &eta_log_sigma)?;
+            Ok(LinearState {
+                eta: eta_threshold,
+                mean: survival_prob,
+                eta_se: None,
+                mean_se: None,
+                covariance_corrected_used: false,
+            })
+        }
     }
 }
 
@@ -4387,13 +4512,21 @@ impl PredictionTransform for SurvivalPredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
         pass: PredictPass,
+        covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         match pass {
             PredictPass::FullUncertainty => {
-                assert!(std::mem::size_of_val(fit) > 0);
-                self.point_state(input)
+                // Select the covariance the caller requested and report which
+                // was used, instead of always using the conditional covariance.
+                let p_total = self.beta_threshold.len() + self.beta_log_sigma.len();
+                let (backend, covariance_corrected_used) =
+                    fit.select_uncertainty_backend(p_total, covariance_mode, "survival")?;
+                let mut state = self.state_from_backend(input, &backend)?;
+                state.covariance_corrected_used = covariance_corrected_used;
+                Ok(state)
             }
             PredictPass::PosteriorMean => {
+                assert!(std::mem::size_of_val(&covariance_mode) > 0);
                 let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
                 // The eta_se here covers only the threshold block. Response-scale
                 // survival intervals also need sigma uncertainty, which is
@@ -4459,6 +4592,7 @@ impl PredictionTransform for SurvivalPredictor {
                     mean,
                     eta_se: Some(eta_se),
                     mean_se: None,
+                    covariance_corrected_used: false,
                 })
             }
         }
@@ -4563,6 +4697,7 @@ impl PredictionTransform for TransformationNormalPredictor {
             mean: h,
             eta_se: Some(zeros.clone()),
             mean_se: Some(zeros),
+            covariance_corrected_used: false,
         })
     }
 
@@ -4571,11 +4706,20 @@ impl PredictionTransform for TransformationNormalPredictor {
         input: &PredictInput,
         fit: &UnifiedFitResult,
         pass: PredictPass,
+        covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
-        // Both passes share the same identity state; `fit`/`pass` are unused.
-        assert!(std::mem::size_of_val(fit) > 0);
-        assert!(std::mem::size_of_val(&pass) > 0);
-        self.point_state(input)
+        // Both passes share the same identity state (η = mean = h, zero SE). The
+        // provenance flag reflects whether the requested covariance mode would
+        // resolve to the smoothing-corrected covariance: corrected is used iff
+        // the caller asked for it and the fit carries it.
+        let mut state = self.point_state(input)?;
+        if matches!(pass, PredictPass::FullUncertainty) {
+            let corrected_requested =
+                !matches!(covariance_mode, InferenceCovarianceMode::Conditional);
+            state.covariance_corrected_used =
+                corrected_requested && fit.covariance_corrected.is_some();
+        }
+        Ok(state)
     }
 
     fn response(&self, eta: &Array1<f64>) -> Result<Array1<f64>, EstimationError> {
@@ -4589,10 +4733,6 @@ impl PredictionTransform for TransformationNormalPredictor {
 
     fn bounds(&self) -> ResponseBounds {
         ResponseBounds::UNBOUNDED
-    }
-
-    fn covariance_corrected_used(&self, fit: &UnifiedFitResult) -> bool {
-        fit.covariance_corrected.is_some()
     }
 }
 

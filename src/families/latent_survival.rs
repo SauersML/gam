@@ -423,7 +423,7 @@ pub fn fit_latent_survival_terms(
         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
     ];
     if latent_sd.is_none() {
-        blocks.push(build_log_sigma_blockspec(0.5));
+        blocks.push(build_log_sigma_blockspec(0.5, mean_design.design.nrows()));
     }
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
@@ -764,14 +764,23 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
     }
 }
 
-fn build_log_sigma_blockspec(initial_sigma: f64) -> ParameterBlockSpec {
+fn build_log_sigma_blockspec(initial_sigma: f64, n_obs: usize) -> ParameterBlockSpec {
     ParameterBlockSpec {
         name: "log_sigma".to_string(),
+        // The frailty/dispersion scale is a single GLOBAL hyperparameter (one free
+        // coefficient), but the identifiability audit — and the canonical-row
+        // architecture generally — require every block's effective Jacobian to carry
+        // `n_obs` rows. A global scalar is realised the same way the survival
+        // location-scale `log_sigma` block is (see `BinomialLocationScaleFamily`): an
+        // `n_obs × 1` constant column of ones, so `eta = design · β` is the same scalar
+        // broadcast to every observation. This keeps it a single free parameter while
+        // exposing the `n_obs`-row shape the audit checks, and `latent_sd` reads
+        // `eta[0]` — identical across rows by construction.
         design: DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(Array2::from_elem(
-            (1, 1),
+            (n_obs, 1),
             1.0,
         )))),
-        offset: Array1::zeros(1),
+        offset: Array1::zeros(n_obs),
         penalties: vec![],
         nullspace_dims: vec![],
         initial_log_lambdas: Array1::zeros(0),
