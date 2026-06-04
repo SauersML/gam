@@ -9081,14 +9081,9 @@ impl<'a> RemlState<'a> {
             // saturated (geometry-driven) high-leverage point has g'(d_i) → 0,
             // so it stops pulling λ up — the analytic correlate of bounding its
             // influence on the criterion.
-            let raw_dev = gaussian_alo_raw_deviance(
-                self.y[i],
-                alo.eta_tilde[i],
-                self.weights[i],
-                phi_safe,
-            );
-            let dev_eta_grad =
-                gaussian_alo_deviance_saturation_factor(raw_dev) * raw_dev_eta_grad;
+            let raw_dev =
+                gaussian_alo_raw_deviance(self.y[i], alo.eta_tilde[i], self.weights[i], phi_safe);
+            let dev_eta_grad = gaussian_alo_deviance_saturation_factor(raw_dev) * raw_dev_eta_grad;
             let b_prime = alo_leverage_barrier_derivative(h_i);
             for kk in 0..k {
                 let u_ik = deta_loo[[i, kk]];
