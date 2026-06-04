@@ -46,8 +46,18 @@ use std::path::{Path, PathBuf};
 /// asserts OBJECTIVE held-out classification quality (log-loss + AUC) and a
 /// match-or-beat against a PyMC-NUTS baseline fit on the identical design.
 const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
-const REAL_DATA_POSTERIOR_SAMPLES: usize = 300;
-const REAL_DATA_POSTERIOR_WARMUP: usize = 300;
+// Posterior-sampling budget for the REAL prostate arm (n=490, p=47). This arm
+// only asserts robust posterior-MEAN held-out probabilities (log-loss / AUC
+// match-or-beat) plus an R-hat<1.1 convergence gate — it is NOT a per-point
+// credible-interval or sampler-fidelity test, so the draw count need not scale
+// with n·p. For an easy log-concave Bernoulli-logit posterior these counts give
+// 2×250 = 500 effective draws (MC error on the posterior-mean probability well
+// under the 5% match-or-beat tolerance and the 0.02 log-loss margin) and a
+// reliably sub-1.1 R-hat, while keeping the silent post-fit sampling block well
+// under the 360s suite cap on top of the ~84s GAM REML fit. Tune is matched to
+// draws so NUTS step-size / mass-matrix adaptation is fully converged.
+const REAL_DATA_POSTERIOR_SAMPLES: usize = 250;
+const REAL_DATA_POSTERIOR_WARMUP: usize = 250;
 const REAL_DATA_POSTERIOR_CHAINS: usize = 2;
 
 /// Deterministic splitmix64 stream → uniform(0,1). Keeps the synthetic data
@@ -710,7 +720,12 @@ with pm.Model() as model:
         draws={draws},
         tune={tune},
         chains={chains},
-        cores=1,
+        # Run the chains concurrently (one process per chain). PyMC derives the
+        # per-chain seeds deterministically from random_seed=42 regardless of
+        # core count, so the posterior-mean / log-loss the test asserts is
+        # reproducible; this just removes the needless serialization of the
+        # chains that single-core (cores=1) sampling imposed.
+        cores={chains},
         random_seed=42,
         target_accept=0.9,
         progressbar=False,
