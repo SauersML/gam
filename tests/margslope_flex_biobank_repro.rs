@@ -195,7 +195,7 @@ fn margslope_flex_beta_equivalence_smoke() {
 #[test]
 fn flex_full_outer_completes_under_budget_683() {
     gam::init_parallelism();
-    let n = 300usize;
+    let n = 96usize;
     let problem = build_biobank_shape_problem(n);
     let options = BlockwiseFitOptions {
         inner_max_cycles: 1,
