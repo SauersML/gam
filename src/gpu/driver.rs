@@ -466,9 +466,35 @@ fn nvidia_component_for_stem(stem: &str) -> String {
 #[cfg(target_os = "linux")]
 fn nvidia_package_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    if let Some(home) = current_user_home_dir() {
+        collect_python_nvidia_roots(home.join(".local/lib"), &mut roots);
+    }
     collect_python_nvidia_roots(Path::new("/usr/local/lib").to_path_buf(), &mut roots);
     collect_python_nvidia_roots(Path::new("/usr/lib").to_path_buf(), &mut roots);
     dedup_paths(roots)
+}
+
+#[cfg(target_os = "linux")]
+fn current_user_home_dir() -> Option<PathBuf> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let uid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?;
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in passwd.lines() {
+        let mut fields = line.split(':');
+        fields.next()?;
+        fields.next()?;
+        if fields.next()? != uid {
+            continue;
+        }
+        fields.next()?;
+        fields.next()?;
+        return Some(PathBuf::from(fields.next()?));
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]

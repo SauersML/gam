@@ -70,6 +70,10 @@ fn offsets() -> (Array1<f64>, Array1<f64>, Array1<f64>) {
     (entry, exit, deriv)
 }
 
+fn marginal_offset() -> Array1<f64> {
+    Array1::zeros(N)
+}
+
 /// B-spline knots for the wiggle basis.  We need enough knots for `ncols = p_tw = 2`.
 /// degree=3, ncols = n_internal_knots + degree - 1; with n_internal = 0 we
 /// get ncols = degree - 1 = 2.
@@ -231,6 +235,7 @@ fn make_time_jac() -> SmsTimewiggleTimeJacobian {
     let dm = design_marginal();
     let dg = design_logslope();
     let (oe, ox, od) = offsets();
+    let mo = marginal_offset();
 
     SmsTimewiggleTimeJacobian::new(
         Arc::new(de),
@@ -241,6 +246,7 @@ fn make_time_jac() -> SmsTimewiggleTimeJacobian {
         Arc::new(oe),
         Arc::new(ox),
         Arc::new(od),
+        Arc::new(mo),
         wiggle_knots(),
         WIGGLE_DEGREE,
         P_TW,
@@ -270,6 +276,7 @@ fn make_marginal_jac() -> SmsTimewiggleMarginalJacobian {
     let dm = design_marginal();
     let dg = design_logslope();
     let (oe, ox, od) = offsets();
+    let mo = marginal_offset();
 
     SmsTimewiggleMarginalJacobian::new(
         Arc::new(de),
@@ -280,6 +287,7 @@ fn make_marginal_jac() -> SmsTimewiggleMarginalJacobian {
         Arc::new(oe),
         Arc::new(ox),
         Arc::new(od),
+        Arc::new(mo),
         wiggle_knots(),
         WIGGLE_DEGREE,
         P_TIME,
