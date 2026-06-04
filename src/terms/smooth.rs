@@ -565,6 +565,25 @@ impl SmoothBasisSpec {
                 // (e.g. a 20×20 default basis on n=200) yet still rejects a
                 // genuinely undersized fit where `n < Σ_i k_i` and even the
                 // additive part is rank-deficient.
+                //
+                // Binary / low-cardinality margins (#724): gam will accept a
+                // `te(x, badh)` whose `badh ∈ {0, 1}` margin nominally requests
+                // more basis columns than `badh` has unique values, where mgcv
+                // refuses the unpenalized term as ill-posed ("badh has
+                // insufficient unique values to support k knots"). This is
+                // correct-by-design, *not* a degenerate fit: the marginal
+                // wiggliness penalty on the `badh` axis has a null space that is
+                // exactly its identifiable trend (the two cell means of a binary
+                // covariate), and the Kronecker-sum penalty shrinks every tensor
+                // column outside that null space toward zero. The resulting fit
+                // is the well-posed "per-level `x` smooth + binary main effect"
+                // that mgcv reaches only after manually collapsing the basis —
+                // gam reaches it automatically because the penalty, not the raw
+                // column count, sets the effective rank. A genuinely
+                // rank-deficient design (penalty null space wider than the data
+                // can support) is still caught downstream by the inner pivoted
+                // factorization, which owns the exact n-vs-rank decision; this
+                // pre-fit gate only refuses the grossly-undersized formula.
                 let mut total: usize = 0;
                 for marginal in &spec.marginalspecs {
                     let m = bspline_basis_min_rows(marginal);
