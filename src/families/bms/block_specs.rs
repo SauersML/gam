@@ -559,10 +559,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
         );
         effective_kappa_options.enabled = false;
     }
-    let flex_spatial_pilot_path = (spec.score_warp.is_some() || spec.link_dev.is_some())
-        && spec.y.len() >= BMS_FLEX_SPATIAL_OUTER_PILOT_ROW_THRESHOLD
-        && effective_kappa_options.enabled;
-    if flex_spatial_pilot_path {
+    let flex_active = spec.score_warp.is_some() || spec.link_dev.is_some();
+    if flex_active && effective_kappa_options.enabled {
         let marginal_terms = spatial_length_scale_term_indices(&spec.marginalspec);
         let logslope_terms = spatial_length_scale_term_indices(&spec.logslopespec);
         let marginal_updates = apply_spatial_anisotropy_pilot_initializer(
@@ -581,7 +579,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         );
         effective_kappa_options.enabled = false;
         log::info!(
-            "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false reason=large-flex-spatial-pilot",
+            "[BMS spatial] n={} flex=true pilot_geometry_updates={} iterative_spatial_outer=false reason=flex-spatial-fixed-geometry",
             spec.y.len(),
             marginal_updates + logslope_updates,
         );
