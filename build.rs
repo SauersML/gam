@@ -1,6 +1,7 @@
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
@@ -3077,45 +3078,46 @@ fn scan_for_underscore_fn_args(
                 idx += 1;
                 continue;
             }
-            let (sig_start, sig_end_line, sig_end_col_excl) = match find_fn_body_at(&lines, idx) {
-                Some((_, (open, _close))) => {
-                    let open_line = &stripped_lines[open];
-                    let col = open_line.find('{').unwrap_or(open_line.len());
-                    (idx, open, col)
-                }
-                None => {
-                    let mut paren: i32 = 0;
-                    let mut brack: i32 = 0;
-                    let mut found: Option<(usize, usize)> = None;
-                    let limit = (idx + 64).min(n);
-                    'outer: for (rel, sj) in stripped_lines[idx..limit].iter().enumerate() {
-                        let j = idx + rel;
-                        for (k, b) in sj.as_bytes().iter().enumerate() {
-                            match *b {
-                                b'(' => paren += 1,
-                                b')' => paren -= 1,
-                                b'[' => brack += 1,
-                                b']' => brack -= 1,
-                                b';' if paren == 0 && brack == 0 => {
-                                    found = Some((j, k));
-                                    break 'outer;
+            let (sig_start, sig_end_line, sig_end_col_excl) =
+                match find_fn_body_at_stripped(&stripped_lines, idx) {
+                    Some((_, (open, _close))) => {
+                        let open_line = &stripped_lines[open];
+                        let col = open_line.find('{').unwrap_or(open_line.len());
+                        (idx, open, col)
+                    }
+                    None => {
+                        let mut paren: i32 = 0;
+                        let mut brack: i32 = 0;
+                        let mut found: Option<(usize, usize)> = None;
+                        let limit = (idx + 64).min(n);
+                        'outer: for (rel, sj) in stripped_lines[idx..limit].iter().enumerate() {
+                            let j = idx + rel;
+                            for (k, b) in sj.as_bytes().iter().enumerate() {
+                                match *b {
+                                    b'(' => paren += 1,
+                                    b')' => paren -= 1,
+                                    b'[' => brack += 1,
+                                    b']' => brack -= 1,
+                                    b';' if paren == 0 && brack == 0 => {
+                                        found = Some((j, k));
+                                        break 'outer;
+                                    }
+                                    b'{' if paren == 0 && brack == 0 => {
+                                        break 'outer;
+                                    }
+                                    _ => {}
                                 }
-                                b'{' if paren == 0 && brack == 0 => {
-                                    break 'outer;
-                                }
-                                _ => {}
+                            }
+                        }
+                        match found {
+                            Some((j, k)) => (idx, j, k),
+                            None => {
+                                idx += 1;
+                                continue;
                             }
                         }
                     }
-                    match found {
-                        Some((j, k)) => (idx, j, k),
-                        None => {
-                            idx += 1;
-                            continue;
-                        }
-                    }
-                }
-            };
+                };
             let mut sig_text = String::new();
             let mut line_offsets: Vec<(usize, usize)> = Vec::new();
             for (rel, stripped_line) in stripped_lines[sig_start..=sig_end_line].iter().enumerate()
@@ -3384,7 +3386,7 @@ fn scan_for_useless_tests(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf,
                 i = j + 1;
                 continue;
             }
-            let Some((_sig, (open, close))) = find_fn_body_at(&lines, j) else {
+            let Some((_sig, (open, close))) = find_fn_body_at_stripped(&stripped_lines, j) else {
                 i = j + 1;
                 continue;
             };
@@ -3605,6 +3607,7 @@ fn collect_git_history_marker_functions(
         }
         let rel = Path::new(&rel_str);
         let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(&content);
         let mask = compute_test_mask(&content, rel);
         for (idx, line) in lines.iter().enumerate() {
             if mask.get(idx).copied().unwrap_or(false) {
@@ -3615,7 +3618,7 @@ fn collect_git_history_marker_functions(
                 if !stripped.contains(marker) {
                     continue;
                 }
-                if let Some((sig, _)) = find_enclosing_fn(&lines, idx) {
+                if let Some((sig, _)) = find_enclosing_fn(&lines, &stripped_lines, idx) {
                     let kind = marker.trim_end_matches('(').to_string();
                     let entry = out.entry((rel_str.clone(), sig)).or_default();
                     if !entry.contains(&kind) {
@@ -3655,6 +3658,7 @@ fn run_unimplemented_history_audit(
         file_contents.insert(rel_str.clone(), content.to_string());
 
         let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
         let mask = compute_test_mask(content, rel);
         for (idx, line) in lines.iter().enumerate() {
             if mask.get(idx).copied().unwrap_or(false) {
@@ -3665,7 +3669,8 @@ fn run_unimplemented_history_audit(
                 if !stripped.contains(marker) {
                     continue;
                 }
-                if let Some((sig, (open, _close))) = find_enclosing_fn(&lines, idx) {
+                if let Some((sig, (open, _close))) = find_enclosing_fn(&lines, &stripped_lines, idx)
+                {
                     let kind = marker.trim_end_matches('(').to_string();
                     let entry = current
                         .entry((rel_str.clone(), sig.clone()))
@@ -3818,14 +3823,18 @@ enum HistoryBodyState {
 /// any `HISTORY_BODY_REJECT_MACROS` macro in the body.
 fn body_state_for_signature(content: &str, target_sig: &str) -> HistoryBodyState {
     let lines: Vec<&str> = content.lines().collect();
+    let stripped_lines = strip_file_lines(content);
     let mut idx = 0;
     while idx < lines.len() {
-        let stripped = strip_strings_and_comments(lines[idx]);
+        let stripped = stripped_lines
+            .get(idx)
+            .map(String::as_str)
+            .unwrap_or(lines[idx]);
         if !line_has_keyword(&stripped, "fn") {
             idx += 1;
             continue;
         }
-        if let Some((sig, (open, close))) = find_fn_body_at(&lines, idx) {
+        if let Some((sig, (open, close))) = find_fn_body_at_stripped(&stripped_lines, idx) {
             if sig == target_sig {
                 let mut code_lines = 0;
                 let mut first_snippet: Option<String> = None;
@@ -3870,15 +3879,22 @@ fn body_state_for_signature(content: &str, target_sig: &str) -> HistoryBodyState
 /// Walk backward from `at_line` looking for the most recent line that bears
 /// a `fn` keyword AND whose resulting body braces enclose `at_line`. Returns
 /// `(normalized_signature, (body_open_line, body_close_line))`.
-fn find_enclosing_fn(lines: &[&str], at_line: usize) -> Option<(String, (usize, usize))> {
+fn find_enclosing_fn(
+    lines: &[&str],
+    stripped_lines: &[String],
+    at_line: usize,
+) -> Option<(String, (usize, usize))> {
     let mut start = at_line + 1;
     while start > 0 {
         start -= 1;
-        let stripped = strip_strings_and_comments(lines[start]);
+        let stripped = stripped_lines
+            .get(start)
+            .map(String::as_str)
+            .unwrap_or(lines[start]);
         if !line_has_keyword(&stripped, "fn") {
             continue;
         }
-        if let Some((sig, (open, close))) = find_fn_body_at(lines, start)
+        if let Some((sig, (open, close))) = find_fn_body_at_stripped(stripped_lines, start)
             && open <= at_line
             && at_line <= close
         {
@@ -3888,35 +3904,13 @@ fn find_enclosing_fn(lines: &[&str], at_line: usize) -> Option<(String, (usize, 
     None
 }
 
-/// Starting at `fn_line` (a line containing the `fn` keyword), find the
-/// function body's opening `{` and matching `}`. Brace counting uses
-/// `strip_strings_and_comments` per line so braces inside string literals
-/// or `//` comments don't perturb depth. Block comments and raw strings
-/// are out of scope (same limitation as the other scanners). Returns the
-/// normalized signature text — everything from `fn_line` up to (and
-/// excluding) the body's opening `{`, whitespace-collapsed.
-fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, usize))> {
-    // Stateful stripping across lines so multi-line raw strings (`r#"..."#`),
-    // raw strings spanning newlines, and plain `"..."` continuations cannot
-    // leak braces into the depth counter and falsely close the body early.
-    let mut stripped: Vec<String> = Vec::with_capacity(lines.len() - fn_line);
-    {
-        let mut in_str = false;
-        let mut quote: u8 = 0;
-        let mut hashes: u8 = 0;
-        for line in &lines[fn_line..] {
-            let (s, ns, nq, nh) =
-                strip_strings_and_comments_stateful_raw(line, in_str, quote, hashes);
-            stripped.push(s);
-            in_str = ns;
-            quote = nq;
-            hashes = nh;
-        }
-    }
+fn find_fn_body_at_stripped(
+    stripped_lines: &[String],
+    fn_line: usize,
+) -> Option<(String, (usize, usize))> {
     let mut depth: i32 = 0;
     let mut body_open: Option<usize> = None;
-    for (rel, s) in stripped.iter().enumerate() {
-        let j = fn_line + rel;
+    for (j, s) in stripped_lines.iter().enumerate().skip(fn_line) {
         for b in s.bytes() {
             match b {
                 b'{' => {
@@ -3931,8 +3925,12 @@ fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, us
                         && let Some(open) = body_open
                     {
                         let mut sig = String::new();
-                        for k in fn_line..=open {
-                            let ss = &stripped[k - fn_line];
+                        for (k, ss) in stripped_lines
+                            .iter()
+                            .enumerate()
+                            .take(open + 1)
+                            .skip(fn_line)
+                        {
                             let cut = if k == open {
                                 ss.find('{').unwrap_or(ss.len())
                             } else {
@@ -3941,8 +3939,7 @@ fn find_fn_body_at(lines: &[&str], fn_line: usize) -> Option<(String, (usize, us
                             sig.push_str(&ss[..cut]);
                             sig.push(' ');
                         }
-                        let normalized: String =
-                            sig.split_whitespace().collect::<Vec<_>>().join(" ");
+                        let normalized = sig.split_whitespace().collect::<Vec<_>>().join(" ");
                         return Some((normalized, (open, j)));
                     }
                 }
@@ -4014,7 +4011,7 @@ fn index_local_fns(lines: &[&str], stripped_lines: &[String]) -> Vec<(String, us
             .map(String::as_str)
             .unwrap_or(lines[i]);
         if line_has_keyword(s, "fn")
-            && let Some((sig, (open, close))) = find_fn_body_at(lines, i)
+            && let Some((sig, (open, close))) = find_fn_body_at_stripped(stripped_lines, i)
             && let Some(name) = fn_name_from_sig(&sig)
         {
             out.push((name, open, close));
@@ -4086,7 +4083,7 @@ fn git_head_files_containing(
         return std::collections::BTreeMap::new();
     }
 
-    let mut out = std::collections::BTreeMap::new();
+    let mut rels = Vec::new();
     for raw in output.stdout.split(|b| *b == 0) {
         if raw.is_empty() {
             continue;
@@ -4102,25 +4099,78 @@ fn git_head_files_containing(
         if rel_path_is_skipped_for_scans(rel_path) || !rel_path_is_scannable(rel_path) {
             continue;
         }
-        if let Some(content) = git_show_head_file(manifest_dir, rel) {
-            out.insert(rel.to_string(), content);
+        rels.push(rel.to_string());
+    }
+    git_show_head_files(manifest_dir, &rels)
+}
+
+fn git_show_head_files(
+    manifest_dir: &Path,
+    rels: &[String],
+) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    if rels.is_empty() {
+        return out;
+    }
+    let mut child = match Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("cat-file")
+        .arg("--batch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return out,
+    };
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .expect("git cat-file stdin must be piped");
+        for rel in rels {
+            writeln!(stdin, "HEAD:{rel}").expect("failed to write git cat-file query");
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(_) => return out,
+    };
+    if !output.status.success() {
+        return out;
+    }
+    let bytes = output.stdout;
+    let mut pos = 0usize;
+    for rel in rels {
+        let Some(header_len) = bytes[pos..].iter().position(|b| *b == b'\n') else {
+            break;
+        };
+        let header_end = pos + header_len;
+        let header = match std::str::from_utf8(&bytes[pos..header_end]) {
+            Ok(header) => header,
+            Err(_) => break,
+        };
+        let Some(size_text) = header.split_whitespace().nth(2) else {
+            break;
+        };
+        let Ok(size) = size_text.parse::<usize>() else {
+            break;
+        };
+        let content_start = header_end + 1;
+        let content_end = content_start + size;
+        if content_end > bytes.len() {
+            break;
+        }
+        if let Ok(content) = String::from_utf8(bytes[content_start..content_end].to_vec()) {
+            out.insert(rel.clone(), content);
+        }
+        pos = content_end;
+        if pos < bytes.len() && bytes[pos] == b'\n' {
+            pos += 1;
         }
     }
     out
-}
-
-fn git_show_head_file(manifest_dir: &Path, rel: &str) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(manifest_dir)
-        .arg("show")
-        .arg(format!("HEAD:{rel}"))
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
 }
 
 fn rel_path_is_skipped_for_scans(rel: &Path) -> bool {
@@ -4279,12 +4329,17 @@ fn collect_todo_history_sites_from_content(
     }
     let is_rust = rel.extension().and_then(OsStr::to_str) == Some("rs");
     let lines: Vec<&str> = content.lines().collect();
+    let stripped_lines = if is_rust {
+        strip_file_lines(content)
+    } else {
+        Vec::new()
+    };
     for (idx, line) in lines.iter().enumerate() {
         if !line.contains(needle) {
             continue;
         }
         let anchor = if is_rust {
-            find_enclosing_fn(&lines, idx)
+            find_enclosing_fn(&lines, &stripped_lines, idx)
                 .map(|(sig, _)| format!("{FN_ANCHOR_PREFIX}{sig}"))
                 .unwrap_or_else(|| FILE_ANCHOR.to_string())
         } else {
@@ -4569,11 +4624,16 @@ fn line_for_history_anchor(content: &str, anchor: &str) -> usize {
         return 1;
     };
     let lines: Vec<&str> = content.lines().collect();
+    let stripped_lines = strip_file_lines(content);
     let mut idx = 0usize;
     while idx < lines.len() {
-        let stripped = strip_strings_and_comments(lines[idx]);
+        let stripped = stripped_lines
+            .get(idx)
+            .map(String::as_str)
+            .unwrap_or(lines[idx]);
         if line_has_keyword(&stripped, "fn")
-            && let Some((found_sig, (open, _close))) = find_fn_body_at(&lines, idx)
+            && let Some((found_sig, (open, _close))) =
+                find_fn_body_at_stripped(&stripped_lines, idx)
             && found_sig == sig
         {
             return open + 1;
@@ -4593,7 +4653,7 @@ fn normalized_fn_body_code_without_comments(content: &str, target_sig: &str) -> 
             .map(String::as_str)
             .unwrap_or(lines[idx]);
         if line_has_keyword(stripped, "fn")
-            && let Some((sig, (open, close))) = find_fn_body_at(&lines, idx)
+            && let Some((sig, (open, close))) = find_fn_body_at_stripped(&stripped_lines, idx)
         {
             if sig == target_sig {
                 let mut body = String::new();
@@ -4908,7 +4968,7 @@ fn scan_for_noop_self_consuming_fns(
                 i += 1;
                 continue;
             }
-            let Some((sig, (open, close))) = find_fn_body_at(&lines, i) else {
+            let Some((sig, (open, close))) = find_fn_body_at_stripped(&stripped_lines, i) else {
                 i += 1;
                 continue;
             };
@@ -5156,7 +5216,7 @@ fn scan_for_stub_function_bodies(
                 i += 1;
                 continue;
             }
-            let Some((sig, (open, close))) = find_fn_body_at(&lines, i) else {
+            let Some((sig, (open, close))) = find_fn_body_at_stripped(&stripped_lines, i) else {
                 i += 1;
                 continue;
             };
