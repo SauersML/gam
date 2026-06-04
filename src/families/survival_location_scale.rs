@@ -8257,14 +8257,14 @@ impl SurvivalLocationScaleFamily {
             row_mask,
         )? + mxtwx(
             &self.x_time_deriv,
-            &(-&q.h_time_d * &q.dqdot_t),
+            &(&q.h_time_d * &q.dqdot_t),
             x_threshold_exit,
             row_mask,
         )?;
         if let Some(x_t_deriv) = x_threshold_deriv {
             h_ht += &mxtwx(
                 &self.x_time_deriv,
-                &(-&q.h_time_d * &q.dqdot_td),
+                &(&q.h_time_d * &q.dqdot_td),
                 x_t_deriv,
                 row_mask,
             )?;
@@ -8283,14 +8283,14 @@ impl SurvivalLocationScaleFamily {
             row_mask,
         )? + mxtwx(
             &self.x_time_deriv,
-            &(-&q.h_time_d * &q.dqdot_ls),
+            &(&q.h_time_d * &q.dqdot_ls),
             x_log_sigma_exit,
             row_mask,
         )?;
         if let Some(x_ls_deriv) = x_log_sigma_deriv {
             h_hl += &mxtwx(
                 &self.x_time_deriv,
-                &(-&q.h_time_d * &q.dqdot_lsd),
+                &(&q.h_time_d * &q.dqdot_lsd),
                 x_ls_deriv,
                 row_mask,
             )?;

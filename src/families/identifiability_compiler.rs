@@ -2637,8 +2637,13 @@ mod tests {
         let n = 21;
         let p_a = 2;
         let p_b = 2;
+        // Distinct per-column frequencies make the four sinusoidal columns
+        // genuinely linearly independent over the sample grid. (A shared phase
+        // offset varying only by column would collapse every column into
+        // span{sin θ, cos θ, 1}, i.e. rank 3, and the compiler would correctly
+        // absorb a column — defeating the full-rank premise of this test.)
         let x = Array2::from_shape_fn((n, p_a + p_b), |(i, j)| {
-            ((i as f64 + 1.0) * 0.37 + (j as f64 + 1.0) * 1.7).sin() + 0.11 * (j as f64)
+            ((i as f64 + 1.0) * (0.21 + 0.17 * j as f64)).sin() + 0.11 * (j as f64)
         });
         let w = Array1::from_shape_fn(n, |i| 0.5 + 0.5 * ((i as f64) * 0.3).cos().abs());
         let (gh, gs) = k1_grams(&x, &w);
