@@ -4221,12 +4221,27 @@ fn matern_operator_penalty_triplet_from_metadata(
         identifiability_transform.as_ref().map(|z| z.view()),
         aniso_log_scales.as_deref(),
     )?;
+    // Gate the operator dials on the Matérn-ν RKHS Sobolev order m = ν + d/2:
+    // mass always, tension when m > 1, stiffness when m > 2. A rough kernel
+    // (ν=1/2 in d=1 ⇒ m=1) thereby drops the tension/stiffness roughness
+    // penalties its own RKHS norm does not control, instead of over-smoothing
+    // the oscillation it is supposed to track (#707). The threshold matches
+    // `DuchonOperatorPenaltySpec::matern_for_smoothness`.
+    let d = penalty_centers.ncols();
+    let m = nu.half_integer_value() + 0.5 * d as f64;
     let mut candidates = Vec::with_capacity(3);
-    for (raw, source) in [
-        (ops.d0.t().dot(&ops.d0), PenaltySource::OperatorMass),
-        (ops.d1.t().dot(&ops.d1), PenaltySource::OperatorTension),
-        (ops.d2.t().dot(&ops.d2), PenaltySource::OperatorStiffness),
+    for (raw, source, min_order) in [
+        (ops.d0.t().dot(&ops.d0), PenaltySource::OperatorMass, 0.0),
+        (ops.d1.t().dot(&ops.d1), PenaltySource::OperatorTension, 1.0),
+        (
+            ops.d2.t().dot(&ops.d2),
+            PenaltySource::OperatorStiffness,
+            2.0,
+        ),
     ] {
+        if m <= min_order {
+            continue;
+        }
         let sym = (&raw + &raw.t()) * 0.5;
         let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
         candidates.push(PenaltyCandidate {
@@ -9788,13 +9803,25 @@ fn extract_spatial_operator_runtime_caches(
                         include_intercept,
                         identifiability_transform,
                         aniso_log_scales,
+                        input_scales,
                         ..
                     },
                 ) => {
+                    // Match the σ_geom-compensated effective length scale the
+                    // design (and shipped penalties) use against the standardized
+                    // centers; the raw metadata length_scale lives in original
+                    // coordinates and would put this overlay on a different kernel
+                    // range than the penalties it scales (#706).
+                    let collocation_length_scale = match input_scales.as_deref() {
+                        Some(scales) => {
+                            compensate_length_scale_for_standardization(*length_scale, scales)
+                        }
+                        None => *length_scale,
+                    };
                     let ops = build_matern_collocation_operator_matrices(
                         centers.view(),
                         None,
-                        *length_scale,
+                        collocation_length_scale,
                         *nu,
                         *include_intercept,
                         identifiability_transform.as_ref().map(|z| z.view()),

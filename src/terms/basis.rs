@@ -1556,6 +1556,19 @@ pub enum MaternNu {
     NineHalves,
 }
 
+impl MaternNu {
+    /// The half-integer smoothness value ν as an `f64` (0.5, 1.5, …).
+    pub const fn half_integer_value(self) -> f64 {
+        match self {
+            MaternNu::Half => 0.5,
+            MaternNu::ThreeHalves => 1.5,
+            MaternNu::FiveHalves => 2.5,
+            MaternNu::SevenHalves => 3.5,
+            MaternNu::NineHalves => 4.5,
+        }
+    }
+}
+
 /// Matérn radial basis and penalties.
 #[derive(Debug, Clone)]
 pub struct MaternSplineBasis {
@@ -2551,6 +2564,51 @@ impl DuchonOperatorPenaltySpec {
             mass: active(),
             tension: active(),
             stiffness: active(),
+        }
+    }
+
+    /// Operator-penalty dials appropriate for a Matérn-ν kernel in dimension `d`.
+    ///
+    /// The Matérn-ν RKHS is the Sobolev space `H^m` with `m = ν + d/2`: its
+    /// squared norm controls the order-`j` derivative in L2 exactly when
+    /// `j ≤ m`. The collocation overlay penalizes the squared L2 norms of the
+    /// value (mass, `D0`, j=0), gradient (tension, `D1`, j=1) and Hessian
+    /// (stiffness, `D2`, j=2). Activating a penalty whose derivative order
+    /// exceeds the RKHS smoothness (`j > m`) imposes a roughness constraint the
+    /// true kernel does NOT — it over-smooths the reduced-rank fit relative to
+    /// the exact GP (mgcv `bs="gp"`, GpGp).
+    ///
+    /// Concretely the roughest Matérn, ν=1/2 in d=1 (`m = 1`), is the
+    /// Ornstein–Uhlenbeck/exponential kernel: an H¹ process whose RKHS norm
+    /// `∫ (f² + ℓ²f'²)` controls the FIRST derivative but not the second. Its
+    /// sample paths are continuous but non-differentiable; penalizing the second
+    /// derivative (`D2`) drives the fit toward the smooth `C²` functions its RKHS
+    /// specifically does not favour, collapsing held-out oscillation (#707). We
+    /// therefore gate each operator on `j ≤ m`: mass always on, tension on for
+    /// `m ≥ 1`, stiffness on for `m ≥ 2`. For ν ≥ 3/2 (or any d ≥ 2) every dial is
+    /// active, recovering `all_active`; only the genuinely rough ν=1/2 (d=1)
+    /// kernel drops the higher operators.
+    pub fn matern_for_smoothness(nu: MaternNu, d: usize) -> Self {
+        let m = nu.half_integer_value() + 0.5 * d as f64;
+        // Tolerance so an exact half-integer Sobolev order (e.g. m = 1.0 for
+        // ν=1/2, d=1) reliably activates the matching-order operator without a
+        // float-equality knife-edge.
+        const ORDER_EPS: f64 = 1e-9;
+        let active = || OperatorPenaltySpec::Active {
+            initial_log_lambda: 0.0,
+            prior: None,
+        };
+        let gate = |order: f64| {
+            if m + ORDER_EPS >= order {
+                active()
+            } else {
+                OperatorPenaltySpec::Disabled
+            }
+        };
+        Self {
+            mass: active(),
+            tension: gate(1.0),
+            stiffness: gate(2.0),
         }
     }
 }
@@ -14824,7 +14882,10 @@ fn build_matern_operator_penalty_candidates(
         z_opt.map(|z| z.view()),
         aniso_log_scales,
     )?;
-    let matern_spec = DuchonOperatorPenaltySpec::all_active();
+    // Gate the operator dials on the Matérn-ν RKHS smoothness so a rough kernel
+    // (e.g. ν=1/2) is not over-smoothed by a higher-order roughness penalty its
+    // own RKHS norm does not control (#707).
+    let matern_spec = DuchonOperatorPenaltySpec::matern_for_smoothness(nu, centers.ncols());
     Ok(operator_penalty_candidates_from_collocation(
         &ops.d0,
         &ops.d1,
@@ -34500,6 +34561,47 @@ mod tests {
         let ones = Array1::<f64>::ones(centers.nrows());
         let residual = ones.dot(&z).mapv(f64::abs).sum();
         assert!(residual < 1e-10, "constant mode not removed: {residual}");
+    }
+
+    #[test]
+    fn test_matern_operator_penalties_follow_rkhs_smoothness() {
+        let data = array![[0.0], [0.2], [0.4], [0.6], [0.8], [1.0]];
+        let centers = data.clone();
+        let sources_for = |nu| {
+            let spec = MaternBasisSpec {
+                periodic: None,
+                center_strategy: CenterStrategy::UserProvided(centers.clone()),
+                length_scale: 0.4,
+                nu,
+                include_intercept: false,
+                double_penalty: false,
+                identifiability: MaternIdentifiability::None,
+                aniso_log_scales: None,
+            };
+            build_matern_basis(data.view(), &spec)
+                .expect("Matérn basis should build")
+                .penaltyinfo
+                .into_iter()
+                .map(|info| info.source)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            sources_for(MaternNu::Half),
+            vec![PenaltySource::OperatorMass]
+        );
+        assert_eq!(
+            sources_for(MaternNu::ThreeHalves),
+            vec![PenaltySource::OperatorMass, PenaltySource::OperatorTension]
+        );
+        assert_eq!(
+            sources_for(MaternNu::FiveHalves),
+            vec![
+                PenaltySource::OperatorMass,
+                PenaltySource::OperatorTension,
+                PenaltySource::OperatorStiffness
+            ]
+        );
     }
 
     #[test]
