@@ -4,16 +4,16 @@
 //!
 //! OBJECTIVE METRIC ASSERTED — held-out concordance (Harrell's C-index).
 //! A quality test must assert gam's objective quality, never that gam reproduces
-//! a reference tool's fitted numbers. "We get the same β_x / log Λ as flexsurv"
-//! proves nothing — flexsurv's 23-subject MLE is itself a noisy fit, and matching
-//! it could mean both are wrong. So instead of comparing fitted coefficients, this
-//! test measures something with an unambiguous right answer: *does the fitted model
-//! rank unseen subjects' survival ordering correctly?*
+//! a reference tool's fitted numbers. "We get the same covariate slope / log Λ as
+//! flexsurv" proves nothing — matching a reference optimizer can still mean both
+//! fits rank patients badly. So instead of comparing fitted coefficients, this
+//! test measures something with an unambiguous right answer: *does the fitted
+//! model rank unseen subjects' survival ordering correctly?*
 //!
-//! We make a deterministic train/test split of the real bone-marrow data, fit
+//! We make a deterministic train/test split of a real survival cohort, fit
 //! gam's Royston-Parmar model on the TRAIN rows only, then on the held-out TEST
 //! rows compute, for each subject, the proportional-hazards linear predictor
-//! η = c(trt, x)·β_cov (a monotone relative-risk score: higher η ⇒ higher hazard
+//! η = c(cov)·β_cov (a monotone relative-risk score: higher η ⇒ higher hazard
 //! ⇒ shorter survival under PH). Harrell's concordance is the fraction of
 //! comparable, orderable test pairs whose risk ranking agrees with the observed
 //! (possibly right-censored) survival ordering. C = 0.5 is random ranking, C = 1.0
@@ -24,8 +24,8 @@
 //! KEPT only as a BASELINE-TO-MATCH-OR-BEAT on the *same* objective metric: fit on
 //! the identical train rows, score the identical test rows, and require gam's
 //! held-out C to be at least flexsurv's minus a small margin. We still compute
-//! flexsurv's fitted β_x and print its closeness for context with eprintln!, but
-//! "close to flexsurv's fit" is no longer a pass/fail criterion.
+//! flexsurv's fitted covariate slope and print its closeness for context with
+//! eprintln!, but "close to flexsurv's fit" is no longer a pass/fail criterion.
 //!
 //! Why flexsurv is the right baseline: `flexsurvspline(..., scale = "hazard")` *is*
 //! the textbook Royston-Parmar model — log Λ(t | covariates) as a restricted-cubic
@@ -37,20 +37,25 @@
 //!
 //! Comparable wiggliness: gam fits a cubic (degree-3) monotone I-spline time basis
 //! with two interior knots (`k = 2`, the minimum its degree-5 knot validation
-//! admits). The flexsurv reference uses an independent interior-knot count
-//! (`FLEXSURV_REF_KNOTS`); on the tiny synthetic split a `k = 2` flexsurv spline is
-//! underdetermined (non-finite optimizer init), so the reference uses `k = 1`, a
-//! genuine restricted-cubic Royston-Parmar spline (richer than a Weibull) that fits
-//! stably. Both engines still fit the SAME flexible PH-on-log-Λ structure plus the
-//! SAME linear covariates and are scored on the SAME held-out concordance metric.
+//! admits), and the flexsurv reference fits the SAME two interior knots
+//! (`FLEXSURV_REF_KNOTS == N_INTERNAL_KNOTS`). Both arms now run on large real
+//! cohorts (heart-failure n=299, veteran n=137) where a `k = 2` `flexsurvspline`
+//! is well-determined and fits stably, so the comparison is MATCHED-complexity
+//! (k = 2 vs k = 2): both engines fit the SAME flexible PH-on-log-Λ structure plus
+//! the SAME linear covariates and are scored on the SAME held-out concordance
+//! metric. (This replaces the original 23-row `bone.csv` arm, which was too small
+//! for a meaningful match-or-beat — issue #725: the RP spline was underdetermined
+//! at k = 2 on ~12 train rows, forcing a k = 2 vs k = 1 mismatch and a held-out
+//! concordance indistinguishable from chance on ~11 test rows.)
 //!
-//! Data: `bone.csv` — 23 bone-marrow-transplant subjects (allo/auto graft),
-//! `t` = days to relapse/last-follow-up, `d` = relapse indicator (1 = event,
-//! 0 = right-censored), `trt` = graft type. We add a fixed-seed continuous
-//! confounder `x ~ N(0, 1)` (a deterministic Box-Muller stream, identical bytes to
-//! both engines). Treatment is coded `auto = 1`, `allo = 0`. The split is fixed
-//! (even row index ⇒ train, odd ⇒ test) so gam and flexsurv see byte-identical
-//! train and test subsets.
+//! Data — FIRST arm: `heart_failure_clinical_records_dataset.csv` — the UCI
+//! heart-failure clinical-records cohort (299 subjects; Chicco & Jurman, BMC Med
+//! Inform Decis Mak 2020). `time` = follow-up days, `DEATH_EVENT` = death
+//! indicator (1 = died, 0 = right-censored), `ejection_fraction` = left-ventricular
+//! ejection fraction (%), a strong, well-established continuous prognostic factor
+//! (lower EF ⇒ higher mortality). SECOND arm: `veteran_lung.csv` (137 subjects).
+//! Both splits are fixed (even original-row index ⇒ train, odd ⇒ test) so gam and
+//! flexsurv see byte-identical train and test subsets.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
@@ -61,11 +66,12 @@ use gam::{
     load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-const BONE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bone.csv");
+const HEART_FAILURE_CSV: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/bench/datasets/heart_failure_clinical_records_dataset.csv"
+);
 
 // Two interior knots (k = 2) plus the two boundary knots flexsurv always places
 // (flexsurv's own `df = k + 1`, i.e. df = 3). gam's cubic (degree-3) I-spline gets
@@ -82,95 +88,28 @@ const BONE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/bone
 const N_INTERNAL_KNOTS: usize = 2;
 const TIME_DEGREE: usize = 3;
 
-// Interior-knot count for the flexsurv REFERENCE Royston-Parmar baseline. This is
-// deliberately DECOUPLED from gam's `N_INTERNAL_KNOTS`: gam's cubic monotone
-// I-spline is forced to k >= 2 by its degree-5 knot validation (see the note
-// above), but `flexsurvspline`'s own `df = k + 1` is an independent quantity and
-// is not bound by gam's basis bookkeeping. On the tiny synthetic bone TRAIN split
-// (~12 rows, 2 covariates, an extra continuous confounder), a k = 2 spline (df = 3,
-// i.e. 5 baseline parameters) is underdetermined and the optimizer's initial value
-// is non-finite (`initial value in 'vmmin' is not finite`). One interior knot
-// (k = 1, df = 2) is still a genuine restricted-cubic Royston-Parmar spline in
-// log-cumulative-hazard — strictly richer than a Weibull (k = 0) — and fits
-// stably and deterministically on this split (verified with flexsurv 2.x). It
-// remains the textbook RP model gam's transformation/net family targets, so the
-// match-or-beat-on-concordance comparison stays fair: both engines fit a flexible
-// PH-on-log-Lambda baseline plus the SAME linear covariates, scored on the SAME
-// held-out subjects with the SAME concordance routine.
-const FLEXSURV_REF_KNOTS: usize = 1;
+// Interior-knot count for the flexsurv REFERENCE Royston-Parmar baseline. Both
+// arms of this file now fit large real survival cohorts (heart-failure n=299,
+// veteran n=137), so the reference uses the SAME two interior knots as gam
+// (`N_INTERNAL_KNOTS`). On these cohorts a k = 2 `flexsurvspline` (df = 3) is
+// well-determined and fits stably, so the two engines compare MATCHED model
+// complexity (gam k = 2 vs flexsurv k = 2) rather than the historical k = 2 vs
+// k = 1 mismatch that the tiny 23-row bone split forced. Matched knots make the
+// held-out concordance match-or-beat an honest like-for-like comparison.
+const FLEXSURV_REF_KNOTS: usize = N_INTERNAL_KNOTS;
 
-/// Parse `bone.csv` into `(t, event, trt)` rows: `t` = days, `event` = relapse
-/// indicator from `d`, `trt` = graft type coded `auto = 1.0`, `allo = 0.0`.
-fn load_bone() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let file = File::open(Path::new(BONE_CSV)).expect("open bone.csv");
-    let mut lines = BufReader::new(file).lines();
-    let header = lines
-        .next()
-        .expect("bone header line")
-        .expect("read bone header");
-    let cols: Vec<String> = header
-        .trim()
-        .split(',')
-        .map(|c| c.trim_matches('"').to_string())
-        .collect();
-    let idx = |name: &str| {
-        cols.iter()
-            .position(|c| c == name)
-            .unwrap_or_else(|| panic!("bone.csv missing column {name}"))
-    };
-    let i_t = idx("t");
-    let i_d = idx("d");
-    let i_trt = idx("trt");
-
-    let (mut time, mut event, mut trt) = (Vec::new(), Vec::new(), Vec::new());
-    for line in lines {
-        let line = line.expect("read bone row");
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let f: Vec<&str> = line.split(',').collect();
-        let t: f64 = f[i_t].trim().parse().expect("parse t");
-        let d: f64 = f[i_d].trim().parse().expect("parse d");
-        let group = f[i_trt].trim().trim_matches('"');
-        let g = match group {
-            "auto" => 1.0,
-            "allo" => 0.0,
-            other => panic!("unexpected trt level {other:?}"),
-        };
-        time.push(t);
-        event.push(d);
-        trt.push(g);
-    }
-    (time, event, trt)
-}
-
-/// Deterministic standard-normal stream (Box-Muller on a fixed 64-bit LCG). The
-/// exact same `x` bytes are written to gam's encoded frame and to the CSV flexsurv
-/// reads, so the confounder is identical across engines.
-fn fixed_seed_normals(n: usize) -> Vec<f64> {
-    // LCG (Numerical Recipes constants) -> uniform (0,1) -> Box-Muller.
-    let mut state: u64 = 0x5DEECE66D ^ 0xA17C0FFEE;
-    let mut next_unit = || {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        // Top 53 bits -> uniform in (0, 1), shifted off zero.
-        let bits = (state >> 11) as f64;
-        (bits + 1.0) / (9007199254740992.0 + 2.0)
-    };
-    let mut out = Vec::with_capacity(n);
-    while out.len() < n {
-        let u1 = next_unit();
-        let u2 = next_unit();
-        let r = (-2.0 * u1.ln()).sqrt();
-        out.push(r * (std::f64::consts::TAU * u2).cos());
-        if out.len() < n {
-            out.push(r * (std::f64::consts::TAU * u2).sin());
-        }
-    }
-    out.truncate(n);
-    out
+/// Load `heart_failure_clinical_records_dataset.csv` into
+/// `(time, event, ejection_fraction)` rows: `time` = follow-up days,
+/// `event` = `DEATH_EVENT` (1 = died, 0 = right-censored), `ef` = left-ventricular
+/// ejection fraction (%), the continuous prognostic covariate.
+fn load_heart_failure() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let raw = load_csvwith_inferred_schema(Path::new(HEART_FAILURE_CSV))
+        .expect("load heart_failure_clinical_records_dataset.csv");
+    let col = raw.column_map();
+    let time = raw.values.column(col["time"]).to_vec();
+    let event = raw.values.column(col["DEATH_EVENT"]).to_vec();
+    let ef = raw.values.column(col["ejection_fraction"]).to_vec();
+    (time, event, ef)
 }
 
 /// Harrell's concordance (C-index) for right-censored data.
@@ -223,62 +162,74 @@ fn concordance(times: &[f64], events: &[f64], risk: &[f64]) -> f64 {
 }
 
 #[test]
-fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone() {
+fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_heart_failure() {
     init_parallelism();
 
-    // ---- load identical real data, then a deterministic train/test split ----
-    let (time, event, trt) = load_bone();
+    // ---- load the real heart-failure clinical-records survival data ---------
+    let (time, event, ef) = load_heart_failure();
     let n = time.len();
-    assert!(n >= 20, "bone should have ~23 rows, got {n}");
+    assert!(n > 250, "heart-failure should have ~299 rows, got {n}");
     let n_events: usize = event.iter().filter(|&&e| e == 1.0).count();
     assert!(
-        n_events >= 8,
-        "expected the bone relapse events, got {n_events}"
+        n_events >= 80,
+        "heart-failure should carry many deaths, got {n_events}"
     );
-    let n_auto: usize = trt.iter().filter(|&&g| g == 1.0).count();
+    // Ejection fraction is a genuine continuous prognostic score spanning a wide
+    // range (clinically ~14-80%); lower EF ⇒ higher mortality.
+    let ef_min = ef.iter().cloned().fold(f64::INFINITY, f64::min);
+    let ef_max = ef.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     assert!(
-        n_auto > 0 && n_auto < n,
-        "both graft arms must be present: auto={n_auto} of {n}"
+        ef_max - ef_min > 40.0,
+        "ejection fraction should span a wide range: [{ef_min}, {ef_max}]"
     );
 
-    // Fixed-seed continuous confounder x ~ N(0,1), shared byte-for-byte.
-    let x = fixed_seed_normals(n);
+    // Standardize EF so the spline-time and covariate blocks are on a comparable
+    // numeric scale (a monotone affine reparametrization; it leaves the PH
+    // ordering, and hence concordance, unchanged for both engines). The identical
+    // standardized values are written to gam and to flexsurv.
+    let ef_mean = ef.iter().sum::<f64>() / n as f64;
+    let ef_sd = {
+        let v = ef
+            .iter()
+            .map(|e| (e - ef_mean) * (e - ef_mean))
+            .sum::<f64>()
+            / (n as f64 - 1.0);
+        v.sqrt().max(1e-12)
+    };
+    let ef_z: Vec<f64> = ef.iter().map(|e| (e - ef_mean) / ef_sd).collect();
 
     // Deterministic split: even original-row index -> train, odd -> test. Fixed,
     // reproducible, and applied identically before either engine sees the data.
     let train_idx: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
     let test_idx: Vec<usize> = (0..n).filter(|i| i % 2 == 1).collect();
     assert!(
-        train_idx.len() >= 8 && test_idx.len() >= 6,
+        train_idx.len() >= 100 && test_idx.len() >= 100,
         "split too small: train={} test={}",
         train_idx.len(),
         test_idx.len()
     );
-    // The held-out set must contain at least a couple of events, or concordance has
-    // no comparable pairs to score.
+    // The held-out set must contain enough events for an informative concordance.
     let test_events: usize = test_idx.iter().filter(|&&i| event[i] == 1.0).count();
     assert!(
-        test_events >= 2,
+        test_events >= 30,
         "held-out set needs events to score concordance, got {test_events}"
     );
 
     let pick = |src: &[f64], idx: &[usize]| -> Vec<f64> { idx.iter().map(|&i| src[i]).collect() };
-    let (train_time, train_event, train_trt, train_x) = (
+    let (train_time, train_event, train_ef) = (
         pick(&time, &train_idx),
         pick(&event, &train_idx),
-        pick(&trt, &train_idx),
-        pick(&x, &train_idx),
+        pick(&ef_z, &train_idx),
     );
-    let (test_time, test_event, test_trt, test_x) = (
+    let (test_time, test_event, test_ef) = (
         pick(&time, &test_idx),
         pick(&event, &test_idx),
-        pick(&trt, &test_idx),
-        pick(&x, &test_idx),
+        pick(&ef_z, &test_idx),
     );
     let n_train = train_idx.len();
 
     // ---- encode the numeric TRAIN survival frame for gam --------------------
-    let headers = ["t", "event", "trt", "x"]
+    let headers = ["t", "event", "ef"]
         .into_iter()
         .map(String::from)
         .collect::<Vec<_>>();
@@ -287,12 +238,12 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
             StringRecord::from(vec![
                 format!("{:.17e}", train_time[i]),
                 format!("{:.1}", train_event[i]),
-                format!("{:.1}", train_trt[i]),
-                format!("{:.17e}", train_x[i]),
+                format!("{:.17e}", train_ef[i]),
             ])
         })
         .collect();
-    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode bone train frame");
+    let ds = encode_recordswith_inferred_schema(headers, rows)
+        .expect("encode heart-failure train frame");
 
     // ---- fit gam on TRAIN: Royston-Parmar net-survival baseline + linear cov -
     let cfg = FitConfig {
@@ -302,8 +253,8 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
         time_num_internal_knots: N_INTERNAL_KNOTS,
         ..FitConfig::default()
     };
-    let result = fit_from_formula("Surv(t, event) ~ trt + x + survmodel(spec=net)", &ds, &cfg)
-        .expect("gam RP-baseline net-survival fit");
+    let result = fit_from_formula("Surv(t, event) ~ ef + survmodel(spec=net)", &ds, &cfg)
+        .expect("gam RP-baseline net-survival fit on heart-failure");
     let FitResult::SurvivalTransformation(fit) = result else {
         panic!("expected a survival-transformation (Royston-Parmar) fit result");
     };
@@ -318,17 +269,15 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
     );
     let beta_cov = beta.slice(ndarray::s![p_time..]).to_owned();
 
-    // Proportional-hazards covariate linear predictor η = c(trt, x)·β_cov, rebuilt
-    // from the frozen spec so column order/basis match β_cov exactly. Under PH the
+    // Proportional-hazards covariate linear predictor η = c(ef)·β_cov, rebuilt from
+    // the frozen spec so column order/basis match β_cov exactly. Under PH the
     // baseline log-Λ is shared across subjects, so η alone is a sufficient
     // relative-risk score for ranking survival (higher η ⇒ higher hazard ⇒ shorter
     // survival). This is the held-out prediction gam itself makes.
-    let trt_idx = ds.column_map()["trt"];
-    let x_idx = ds.column_map()["x"];
-    let cov_eta = |trt_val: f64, x_val: f64| -> f64 {
+    let ef_idx = ds.column_map()["ef"];
+    let cov_eta = |ef_val: f64| -> f64 {
         let mut grid = Array2::<f64>::zeros((1, ds.headers.len()));
-        grid[[0, trt_idx]] = trt_val;
-        grid[[0, x_idx]] = x_val;
+        grid[[0, ef_idx]] = ef_val;
         let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
             .expect("rebuild covariate design");
         assert_eq!(
@@ -340,28 +289,27 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
     };
 
     // Held-out risk score on every TEST subject.
-    let gam_risk: Vec<f64> = (0..test_idx.len())
-        .map(|i| cov_eta(test_trt[i], test_x[i]))
-        .collect();
+    let gam_risk: Vec<f64> = (0..test_idx.len()).map(|i| cov_eta(test_ef[i])).collect();
     let gam_c = concordance(&test_time, &test_event, &gam_risk);
     assert!(
         gam_c.is_finite(),
         "gam held-out concordance is undefined (no comparable pairs)"
     );
 
-    // For context only (NOT a pass criterion): gam's fitted continuous-covariate
-    // slope, the finite difference of η in x at fixed trt (linear ⇒ exact).
-    let gam_beta_x = cov_eta(0.0, 1.0) - cov_eta(0.0, 0.0);
+    // For context only (NOT a pass criterion): gam's fitted EF slope, the finite
+    // difference of η in ef (linear ⇒ exact). Higher EF (healthier) should LOWER
+    // hazard, so we expect β_ef < 0.
+    let gam_beta_ef = cov_eta(1.0) - cov_eta(0.0);
 
     // ---- fit the SAME model with flexsurv on the SAME TRAIN rows, score TEST --
     // flexsurvspline(scale="hazard") is the textbook Royston-Parmar model. The
-    // reference uses k = FLEXSURV_REF_KNOTS interior knots (decoupled from gam's
-    // k = 2; see the constant's note — k = 2 is underdetermined and non-finite on
-    // this ~12-row train split, k = 1 is a stable restricted-cubic RP spline). We
-    // fit on the train subset and emit, for each held-out test subject, the
-    // log-cumulative-hazard at a fixed reference time as its PH relative-risk score
-    // (under PH the ordering of log Λ across subjects is the ordering of the linear
-    // predictor, at any fixed t).
+    // reference uses k = FLEXSURV_REF_KNOTS = N_INTERNAL_KNOTS = 2 interior knots,
+    // MATCHING gam's basis: on this ~150-row train split a k = 2 RP spline is
+    // well-determined and fits stably, so both engines compare like-for-like model
+    // complexity. We fit on the train subset and emit, for each held-out test
+    // subject, the log-cumulative-hazard at a fixed reference time as its PH
+    // relative-risk score (under PH the ordering of log Λ across subjects is the
+    // ordering of the linear predictor, at any fixed t).
     let train_flag: Vec<f64> = (0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }).collect();
     let ref_time = {
         // A reference time inside the observed range; the median observed time.
@@ -373,8 +321,7 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
         &[
             Column::new("t", &time),
             Column::new("event", &event),
-            Column::new("trt", &trt),
-            Column::new("x", &x),
+            Column::new("ef", &ef_z),
             Column::new("train", &train_flag),
         ],
         &format!(
@@ -382,13 +329,13 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
             suppressPackageStartupMessages(library(flexsurv))
             tr <- df[df$train == 1, ]
             te <- df[df$train == 0, ]
-            m <- flexsurvspline(Surv(t, event) ~ trt + x, data = tr,
+            m <- flexsurvspline(Surv(t, event) ~ ef, data = tr,
                                 k = {k}, scale = "hazard")
             # Fitted continuous-covariate slope (context only).
-            emit("beta_x", as.numeric(coef(m)["x"]))
+            emit("beta_ef", as.numeric(coef(m)["ef"]))
             # PH relative-risk score per held-out subject: log Lambda at a fixed
             # reference time. summary(type="cumhaz") returns Lambda(ref | newdata).
-            nd <- data.frame(trt = te$trt, x = te$x)
+            nd <- data.frame(ef = te$ef)
             ch <- summary(m, newdata = nd, type = "cumhaz", t = c({ref_time}), ci = FALSE)
             risk <- sapply(ch, function(s) log(s$est[1]))
             emit("risk", as.numeric(risk))
@@ -397,7 +344,7 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
             ref_time = format!("{ref_time:.10e}"),
         ),
     );
-    let flex_beta_x = r.scalar("beta_x");
+    let flex_beta_ef = r.scalar("beta_ef");
     let flex_risk = r.vector("risk");
     assert_eq!(
         flex_risk.len(),
@@ -413,42 +360,43 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
     );
 
     // Closeness of the fitted slopes, printed for context but NOT asserted.
-    let rel_beta_x = relative_l2(&[gam_beta_x], &[flex_beta_x]);
+    let rel_beta_ef = relative_l2(&[gam_beta_ef], &[flex_beta_ef]);
     eprintln!(
-        "bone RP-baseline held-out concordance: n={n} (train={n_train} test={} test_events={test_events}) \
-         gam_C={gam_c:.4} flex_C={flex_c:.4} | context: gam_beta_x={gam_beta_x:.4} \
-         flex_beta_x={flex_beta_x:.4} rel_l2(beta_x)={rel_beta_x:.4}",
+        "heart-failure RP-baseline held-out concordance: n={n} (train={n_train} test={} test_events={test_events}) \
+         gam_C={gam_c:.4} flex_C={flex_c:.4} | context: gam_beta_ef={gam_beta_ef:.4} \
+         flex_beta_ef={flex_beta_ef:.4} rel_l2(beta_ef)={rel_beta_ef:.4}",
         test_idx.len()
     );
 
     // ---- OBJECTIVE assertion 1 (PRIMARY): gam ranks unseen survival ----------
-    // Held-out concordance strictly above chance. C = 0.5 is a coin flip; a model
-    // that has learned a real survival ordering on data it never saw must clear a
-    // bar meaningfully above it. With a ~11-subject held-out set the estimate is
-    // coarse, so the bar is 0.55 — a genuine signal, not weakened to chance.
+    // Ejection fraction is a strong, well-established prognostic factor in heart
+    // failure, and the held-out set is large (~149 subjects, >=30 events), so a
+    // competent ranker clears a bar comfortably above chance. C >= 0.58 is a
+    // genuine signal on real data, far from the 0.5 coin flip and statistically
+    // informative at this sample size (unlike the original 23-row bone arm).
     assert!(
-        gam_c >= 0.55,
+        gam_c >= 0.58,
         "gam's held-out concordance {gam_c:.4} is no better than chance — the fitted \
-         Royston-Parmar model does not rank unseen survival ordering"
+         Royston-Parmar model does not rank unseen heart-failure survival ordering"
     );
 
     // ---- OBJECTIVE assertion 2 (BASELINE-TO-BEAT): match-or-beat flexsurv -----
-    // Same metric, same train rows, same held-out subjects: gam's ranking quality
-    // must be at least the mature reference's, up to a small tolerance for the
-    // legitimate basis/knot difference between the two engines.
+    // Same metric, same train rows, same held-out subjects, MATCHED knots
+    // (k = 2 vs k = 2): gam's ranking quality must be at least the mature
+    // reference's, up to a small tolerance for residual basis differences.
     assert!(
-        gam_c >= flex_c - 0.05,
+        gam_c >= flex_c - 0.03,
         "gam's held-out concordance {gam_c:.4} trails flexsurv {flex_c:.4} by more than \
-         the basis-difference margin (0.05): gam ranks unseen survival worse than the reference"
+         the basis-difference margin (0.03): gam ranks unseen survival worse than the reference"
     );
 }
 
 // ===========================================================================
-// REAL-DATA ARM
+// SECOND COHORT ARM (veteran lung cancer)
 // ===========================================================================
 //
 // Same gam capability (the Royston-Parmar net-survival flexible-parametric
-// baseline), now exercised on a real, non-synthetic clinical survival dataset
+// baseline), exercised on a second, independent real clinical survival cohort
 // where the truth is unknown. Because there is no ground-truth function to
 // recover, the OBJECTIVE metric is again held-out Harrell's concordance: fit
 // gam's RP model on the TRAIN rows, score the identical held-out TEST rows, and
@@ -463,9 +411,10 @@ fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone()
 // `status` = death indicator (1 = died, 0 = right-censored), `karno` =
 // Karnofsky performance score (0-100; higher = healthier, a strong continuous
 // prognostic factor). The PH covariate is the continuous `karno` score, so the
-// fitted model has the same linear-PH-on-log-Λ structure as the synthetic arm
-// above. Split is fixed (even original-row index ⇒ train, odd ⇒ test) so gam
-// and flexsurv see byte-identical train and test subsets.
+// fitted model has the same linear-PH-on-log-Λ structure as the heart-failure
+// arm above, on a second independent cohort. Split is fixed (even original-row
+// index ⇒ train, odd ⇒ test) so gam and flexsurv see byte-identical train and
+// test subsets.
 
 const VETERAN_CSV: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -473,7 +422,7 @@ const VETERAN_CSV: &str = concat!(
 );
 
 #[test]
-fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_bone_on_real_data() {
+fn gam_rp_baseline_holdout_concordance_matches_or_beats_flexsurvspline_on_veteran() {
     init_parallelism();
 
     // ---- load the real veteran lung-cancer survival data --------------------
