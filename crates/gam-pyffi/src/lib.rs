@@ -9428,8 +9428,9 @@ fn sae_manifold_fit<'py>(
         jumprelu_threshold,
         // This precomputed-basis entry point hands the term verbatim seeds;
         // routing-seed refinement is owned by the higher-level `fit_minimal`
-        // auto path, so do not re-seed here.
+        // auto path, so do not re-seed here (random_state unused when off).
         false,
+        0,
     )
 }
 
@@ -9461,6 +9462,7 @@ fn sae_manifold_fit_inner<'py>(
     top_k: Option<usize>,
     jumprelu_threshold: f64,
     seed_refine_routing: bool,
+    seed_refine_random_state: u64,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
@@ -9710,6 +9712,7 @@ fn sae_manifold_fit_inner<'py>(
             &basis_sizes,
             assignment_kind.as_str(),
             tau,
+            seed_refine_random_state,
         )
         .map_err(py_value_error)?;
     }
@@ -10482,9 +10485,17 @@ fn sae_em_refine_routing_seed(
     basis_sizes: &[usize],
     assignment_kind: &str,
     tau: f64,
+    random_state: u64,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
     const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
+    // Same tiny seed-keyed logit jitter the cold-start path applies (issue
+    // #178): the refined residual logits are decisive (O(gain)), so this 1e-3
+    // perturbation does not change which atom wins, but it keeps distinct
+    // `random_state` values on distinct inner Newton trajectories and fixed
+    // seeds bit-identical. Without it, the deterministic EM seed would erase
+    // the seed-dependence the cold-start jitter installed upstream.
+    const SAE_RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
     let k_atoms = basis_sizes.len();
     let n_obs = z.nrows();
     if k_atoms <= 1 || n_obs == 0 {
@@ -10539,6 +10550,22 @@ fn sae_em_refine_routing_seed(
         let logits =
             sae_residual_seed_logits(basis3.view(), basis_sizes, z, SAE_RESIDUAL_SEED_GAIN)?;
         term.assignment.logits.assign(&logits);
+    }
+    // Re-apply the seed-keyed jitter the deterministic refinement above erased,
+    // so `random_state` keeps perturbing the inner Newton trajectory (#178).
+    let mut state = random_state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    for row in 0..n_obs {
+        for atom_idx in 0..k_atoms {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Map top 53 bits to a double in [0, 1), then to [-1, 1).
+            let u = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
+            let signed = 2.0 * u - 1.0;
+            term.assignment.logits[[row, atom_idx]] += SAE_RANDOM_STATE_LOGIT_JITTER * signed;
+        }
     }
     Ok(())
 }
@@ -11494,6 +11521,7 @@ fn sae_manifold_fit_minimal<'py>(
         // are cold — i.e. the auto seed is in control. A user-supplied warm
         // start (amortized encoder, #357) is respected verbatim.
         logits_are_cold && initial_coords.is_none(),
+        random_state,
     )?;
     // Attach per-atom build plans so OOS predict can rebuild design without Python.
     let plans_py = PyList::empty(py);
