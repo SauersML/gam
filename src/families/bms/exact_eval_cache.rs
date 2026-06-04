@@ -342,9 +342,12 @@ pub(super) struct FlexAxisThirdRowTensors {
 }
 
 pub(super) struct FlexAxisFourthRowTensors {
-    /// Symmetric fourth-derivative tensor contracted with `(e_a, e_b)` for
-    /// `a, b ∈ {q (0), g (1)}`; `fourth[a][b] == fourth[b][a]`.
-    pub(super) fourth: [[Array2<f64>; 2]; 2],
+    /// Symmetric fourth-derivative tensor contracted with `(e_q, e_q)`.
+    pub(super) qq: Array2<f64>,
+    /// Symmetric fourth-derivative tensor contracted with `(e_q, e_g)`.
+    pub(super) qg: Array2<f64>,
+    /// Symmetric fourth-derivative tensor contracted with `(e_g, e_g)`.
+    pub(super) gg: Array2<f64>,
 }
 
 /// Shared precomputed state plus pre-solved per-row contexts. All row

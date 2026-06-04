@@ -5704,11 +5704,11 @@ impl BernoulliMarginalSlopeFamily {
     /// Decompose an outer ψ-axis direction into `(axis, scalar)` when it is
     /// *single-axis* in primary space — nonzero only at `primary.q` (axis `0`,
     /// "q") or `primary.logslope` (axis `1`, "g"). This is the universal shape
-    /// of the directions every outer-derivative consumer builds (a ψ-row dotted
-    /// into one block's β, deposited at that block's primary slot). Returns
-    /// `None` for the all-zero vector and for any genuinely multi-axis
-    /// direction (e.g. finite-difference probes), which take the slow
-    /// cell-walk path unchanged. Backs the gam#683 fast path.
+    /// of the nonzero directions every outer-derivative consumer builds (a
+    /// ψ-row dotted into one block's β, deposited at that block's primary
+    /// slot). Returns `None` for the all-zero vector and for any genuinely
+    /// multi-axis direction (e.g. finite-difference probes); zero directions
+    /// take a separate exact zero fast path. Backs the gam#683 fast path.
     #[inline]
     fn single_primary_axis(dir: &Array1<f64>, primary: &PrimarySlices) -> Option<(usize, f64)> {
         if dir.len() != primary.total {
@@ -5732,6 +5732,11 @@ impl BernoulliMarginalSlopeFamily {
             found = Some((axis, value));
         }
         found
+    }
+
+    #[inline]
+    fn primary_direction_is_zero(dir: &Array1<f64>, primary: &PrimarySlices) -> bool {
+        dir.len() == primary.total && dir.iter().all(|&value| value == 0.0)
     }
 
     /// Lazily build the requested row's axis-projected third-derivative tensors
@@ -5855,7 +5860,9 @@ impl BernoulliMarginalSlopeFamily {
             let mut t4_qg = t4_qg_ordered;
             t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
             Ok(FlexAxisFourthRowTensors {
-                fourth: [[t4_qq, t4_qg.clone()], [t4_qg, t4_gg]],
+                qq: t4_qq,
+                qg: t4_qg,
+                gg: t4_gg,
             })
         });
         let tensors = stored.as_ref().map_err(|err| err.clone())?;
@@ -5879,6 +5886,13 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        // Exact zero by linearity. This matters for mixed-block ψ second-order
+        // terms, where `dir_ij` is structurally zero; without this guard the
+        // FLEX path would re-walk every cubic cell to produce a zero matrix.
+        if Self::primary_direction_is_zero(dir, &cache.primary) {
+            let r = cache.primary.total;
+            return Ok(Array2::<f64>::zeros((r, r)));
+        }
         // FLEX fast path (gam#683): outer-derivative consumers pass single-axis
         // directions, so reuse the per-row axis-projected tensor cache instead
         // of re-walking every cubic partition cell on every (ρ-axis, row).
@@ -9046,6 +9060,14 @@ impl BernoulliMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        // Exact zero by bilinearity. Keep zero directions off the FLEX
+        // cell-walk fallback even when the other side is a valid ψ axis.
+        if Self::primary_direction_is_zero(dir_u, &cache.primary)
+            || Self::primary_direction_is_zero(dir_v, &cache.primary)
+        {
+            let r = cache.primary.total;
+            return Ok(Array2::<f64>::zeros((r, r)));
+        }
         // FLEX fast path (gam#683): both directions single-axis → a scalar
         // scale of the cached symmetric axis-projected fourth tensor, by
         // bilinearity: fourth_contracted(s_u·e_a, s_v·e_b) = s_u·s_v·T4[a][b].
@@ -9057,7 +9079,12 @@ impl BernoulliMarginalSlopeFamily {
                 self.flex_axis_fourth_tensors_for_row(block_states, cache, row)?
             {
                 let scale = s_u * s_v;
-                let mut out = tensors.fourth[a][b].clone();
+                let mut out = match (a, b) {
+                    (0, 0) => tensors.qq.clone(),
+                    (1, 1) => tensors.gg.clone(),
+                    (0, 1) | (1, 0) => tensors.qg.clone(),
+                    _ => unreachable!("primary axis index is constrained to q/g"),
+                };
                 out.mapv_inplace(|value| value * scale);
                 return Ok(out);
             }
@@ -14331,18 +14358,30 @@ impl BernoulliMarginalSlopeFamily {
                 &row_dirs[0],
             )?]);
         }
-        if let Some(axis_dirs) = row_dirs
+        if row_dirs
             .iter()
-            .map(|dir| Self::single_primary_axis(dir, primary))
-            .collect::<Option<Vec<_>>>()
+            .all(|dir| Self::primary_direction_is_zero(dir, primary) || Self::single_primary_axis(dir, primary).is_some())
         {
+            let zero = || Array2::<f64>::zeros((r, r));
+            if row_dirs
+                .iter()
+                .all(|dir| Self::primary_direction_is_zero(dir, primary))
+            {
+                return Ok(row_dirs.iter().map(|_| zero()).collect());
+            }
             if let Some(tensors) = self.flex_axis_third_tensors_for_row(block_states, cache, row)? {
-                return Ok(axis_dirs
-                    .into_iter()
-                    .map(|(axis, scalar)| {
-                        let mut out = tensors.third[axis].clone();
-                        out.mapv_inplace(|value| value * scalar);
-                        out
+                return Ok(row_dirs
+                    .iter()
+                    .map(|dir| {
+                        if Self::primary_direction_is_zero(dir, primary) {
+                            zero()
+                        } else {
+                            let (axis, scalar) = Self::single_primary_axis(dir, primary)
+                                .expect("all directions checked as zero or single-axis");
+                            let mut out = tensors.third[axis].clone();
+                            out.mapv_inplace(|value| value * scalar);
+                            out
+                        }
                     })
                     .collect());
             }
