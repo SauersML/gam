@@ -23167,7 +23167,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_max_iter(outer_max_iter)
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_seed_config(family.outer_seed_config(n_rho))
-        .with_screening_cap(Arc::clone(&screening_cap))
         .with_initial_rho(rho0.clone())
         .with_screen_initial_rho(options.screen_initial_rho)
         // Tighten the per-coord ρ bound from the OuterConfig default of 30
@@ -23184,6 +23183,27 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // cap, but tightening this bound is cheap belt-and-suspenders
         // against any path that bypasses the projected-kernel fix.
         .with_rho_bound(10.0);
+    // Install the seed-screening cap only when initial-rho screening is
+    // wanted. A caller that pins an already-identified `initial_rho` and
+    // opts out (`screen_initial_rho == false`) leaves the OuterConfig
+    // screening cap `None`, so `should_screen_seeds` short-circuits and the
+    // screening cascade never runs. This is the lever the survival
+    // constant-scale (parametric-AFT) regime uses: its time-warp ρ seed is
+    // pinned AT the inner ρ box bound (the affine-baseline limit) on a
+    // dead-flat, statistically-unidentified time ridge where every capped
+    // proxy fit collapses to non-finite cost and the cascade escalates to a
+    // full uncapped inner solve per seed on the near-singular Hessian — the
+    // multi-minute no-iteration-log stall (#736, #735, #721). With the cap
+    // unset, the pinned seed flows straight to the outer solver, which
+    // certifies box-constraint stationarity at iteration 0. Every other
+    // custom-family caller defaults `screen_initial_rho = true` and keeps
+    // full screening; genuinely flexible scale/spatial survival fits carry
+    // log-sigma penalties, never set the flag false, and screen normally.
+    let problem = if options.screen_initial_rho {
+        problem.with_screening_cap(Arc::clone(&screening_cap))
+    } else {
+        problem
+    };
     // Attach the workflow-level warm-start session if one was threaded
     // through. This makes the custom-family outer optimizer (BFGS / ARC
     // depending on derivative capabilities) use the same persistent
