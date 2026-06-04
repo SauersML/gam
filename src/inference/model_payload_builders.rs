@@ -468,8 +468,10 @@ pub enum LocationScaleResponse<'a> {
     },
 }
 
-/// Optional link-wiggle metadata persisted alongside a location-scale model
-/// (the Gaussian CLI path pre-rescales `knots`/`beta` by the response scale).
+/// Optional link-wiggle metadata persisted alongside a location-scale model.
+/// Knots/coefficients are already in raw response units — the Gaussian
+/// standardization and its inverse remap live inside
+/// `fit_gaussian_location_scale_model`, so the save path persists them verbatim.
 pub struct LocationScaleWiggle {
     pub knots: Vec<f64>,
     pub degree: usize,

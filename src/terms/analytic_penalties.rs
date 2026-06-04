@@ -1394,9 +1394,10 @@ impl IsometryPenalty {
                 CowArray::from(a.view())
             }
             // MeanProfiled has no data-independent reference: it must be
-            // resolved from the live pullback metric  via .
-            // Any data-independent call site (none currently) falls back to the
-            // Euclidean identity reference rather than fabricating a metric.
+            // resolved from the live per-row pullback metric `G_n` via
+            // `effective_g_ref`. Any data-independent call site (none currently)
+            // falls back to the Euclidean identity reference rather than
+            // fabricating a metric.
             IsometryReference::MeanProfiled => {
                 let mut out = Array2::<f64>::zeros((n_obs, d * d));
                 for n in 0..n_obs {
@@ -1409,12 +1410,12 @@ impl IsometryPenalty {
         }
     }
 
-    /// Effective reference metric, , resolved against the live
-    /// per-row pullback metric . For  this is the row-mean of
-    ///  (the LS-optimal constant reference, by the envelope theorem)
-    /// broadcast to every row, making the penalty scale-free: it penalizes
-    /// metric VARIATION across tokens rather than absolute scale. For every
-    /// other reference it delegates to the data-independent .
+    /// Effective reference metric `g_ref`, resolved against the live per-row
+    /// pullback metric `G_n`. For `MeanProfiled` this is the row-mean of `G_n`
+    /// (the LS-optimal constant reference, by the envelope theorem) broadcast to
+    /// every row, making the penalty scale-free: it penalizes metric VARIATION
+    /// across tokens rather than absolute scale. For every other reference it
+    /// delegates to the data-independent `reference_metric`.
     fn effective_g_ref(&self, g: &Array2<f64>, n_obs: usize, d: usize) -> CowArray<'_, f64, Ix2> {
         match &self.reference {
             IsometryReference::MeanProfiled => {
@@ -8620,6 +8621,31 @@ mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
     use ndarray::array;
+
+    /// The scale-free isometry penalty (math review #681) defaults to a
+    /// `MeanProfiled` reference: the per-row pullback metric `G_n` is compared
+    /// against its own row-mean, so the penalty charges metric VARIATION across
+    /// tokens rather than absolute scale. Pin that `effective_g_ref` returns the
+    /// column-mean of `G_n` broadcast to every row.
+    #[test]
+    fn mean_profiled_isometry_reference_is_row_mean_broadcast() {
+        let n_obs = 2;
+        let d = 2;
+        let target = PsiSlice::full(n_obs * d, Some(d));
+        let pen = IsometryPenalty::new_euclidean(target, 3)
+            .with_reference(IsometryReference::MeanProfiled);
+
+        // Two per-row pullback metrics, flattened to d·d = 4 columns; the
+        // column means are [2, 3, 4, 5].
+        let g = array![[1.0_f64, 2.0, 3.0, 4.0], [3.0, 4.0, 5.0, 6.0]];
+        let g_ref = pen.effective_g_ref(&g, n_obs, d);
+        let expected = [2.0_f64, 3.0, 4.0, 5.0];
+        for n in 0..n_obs {
+            for k in 0..(d * d) {
+                assert_abs_diff_eq!(g_ref[[n, k]], expected[k], epsilon = 1e-12);
+            }
+        }
+    }
 
     #[test]
     fn ard_value_matches_quadratic_form() {
