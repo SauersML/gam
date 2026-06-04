@@ -495,6 +495,13 @@ macro_rules! impl_learnable_weight_rho_count {
 pub enum IsometryReference {
     Euclidean,
     UserSupplied(Arc<Array2<f64>>), // (n_obs, d*d) row-major flattened
+    /// Scale-free reference: the per-atom MEAN pullback metric, the same row
+    /// broadcast to every observation. By the envelope theorem the LS-optimal
+    /// constant reference is the mean of the per-row metrics, so this penalizes
+    /// metric VARIATION across tokens (constant-speed / isometry up to a single
+    /// global scale) rather than absolute scale. Resolved dynamically from the
+    /// live pullback metric in effective_g_ref, so it carries no stored data.
+    MeanProfiled,
 }
 
 impl std::fmt::Debug for IsometryReference {
@@ -505,6 +512,7 @@ impl std::fmt::Debug for IsometryReference {
                 .debug_tuple("UserSupplied")
                 .field(&format_args!("{}×{}", a.nrows(), a.ncols()))
                 .finish(),
+            IsometryReference::MeanProfiled => f.write_str("MeanProfiled"),
         }
     }
 }
@@ -1187,7 +1195,7 @@ impl IsometryPenalty {
         let jac2 = self.jacobian_second(target.view(), n_obs, d)?;
         let jac3 = self.jacobian_third(target.view(), n_obs, d)?;
         let g = self.pullback_metric(d)?;
-        let g_ref = self.reference_metric(n_obs, d);
+        let g_ref = self.effective_g_ref(&g, n_obs, d);
         let mut wj_rows = Vec::with_capacity(n_obs);
         for n in 0..n_obs {
             wj_rows.push(self.weighted_jacobian_row(n, d)?);
@@ -1351,6 +1359,56 @@ impl IsometryPenalty {
                 assert_eq!(a.ncols(), d * d);
                 CowArray::from(a.view())
             }
+            // MeanProfiled has no data-independent reference: it must be
+            // resolved from the live pullback metric  via .
+            // Any data-independent call site (none currently) falls back to the
+            // Euclidean identity reference rather than fabricating a metric.
+            IsometryReference::MeanProfiled => {
+                let mut out = Array2::<f64>::zeros((n_obs, d * d));
+                for n in 0..n_obs {
+                    for a in 0..d {
+                        out[[n, a * d + a]] = 1.0;
+                    }
+                }
+                CowArray::from(out)
+            }
+        }
+    }
+
+    /// Effective reference metric, , resolved against the live
+    /// per-row pullback metric . For  this is the row-mean of
+    ///  (the LS-optimal constant reference, by the envelope theorem)
+    /// broadcast to every row, making the penalty scale-free: it penalizes
+    /// metric VARIATION across tokens rather than absolute scale. For every
+    /// other reference it delegates to the data-independent .
+    fn effective_g_ref(
+        &self,
+        g: &Array2<f64>,
+        n_obs: usize,
+        d: usize,
+    ) -> CowArray<'_, f64, Ix2> {
+        match &self.reference {
+            IsometryReference::MeanProfiled => {
+                let dd = d * d;
+                let mut mean = vec![0.0_f64; dd];
+                for n in 0..n_obs {
+                    for k in 0..dd {
+                        mean[k] += g[[n, k]];
+                    }
+                }
+                let inv = if n_obs > 0 { 1.0 / n_obs as f64 } else { 0.0 };
+                for v in mean.iter_mut() {
+                    *v *= inv;
+                }
+                let mut out = Array2::<f64>::zeros((n_obs, dd));
+                for n in 0..n_obs {
+                    for k in 0..dd {
+                        out[[n, k]] = mean[k];
+                    }
+                }
+                CowArray::from(out)
+            }
+            _ => self.reference_metric(n_obs, d),
         }
     }
 
@@ -1391,7 +1449,7 @@ impl IsometryPenalty {
         let Some(g) = self.pullback_metric(d) else {
             return grad;
         };
-        let g_ref = self.reference_metric(n_obs, d);
+        let g_ref = self.effective_g_ref(&g, n_obs, d);
         let mu = self.scalar_weight * rho[self.rho_index].exp();
         for n in 0..n_obs {
             let Some(wj) = self.weighted_jacobian_row(n, d) else {
@@ -1429,7 +1487,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let Some(g) = self.pullback_metric(d) else {
             return Self::DEFAULT_VALUE_ON_MISSING_CACHE;
         };
-        let g_ref = self.reference_metric(n_obs, d);
+        let g_ref = self.effective_g_ref(&g, n_obs, d);
         let mu = self.scalar_weight * rho[self.rho_index].exp();
         let mut acc = 0.0;
         for n in 0..n_obs {
@@ -1467,7 +1525,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let Some(g) = self.pullback_metric(d) else {
             return Array1::<f64>::zeros(target.len());
         };
-        let g_ref = self.reference_metric(n_obs, d);
+        let g_ref = self.effective_g_ref(&g, n_obs, d);
         let p = self.p_out;
         let mu = self.scalar_weight * rho[self.rho_index].exp();
         let mut grad = Array1::<f64>::zeros(target.len());
