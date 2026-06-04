@@ -4194,26 +4194,39 @@ fn custom_family_blockwise_edf(
     let mut block_edf = Vec::with_capacity(specs.len());
     let mut total_trace = 0.0_f64;
     let mut penalty_offset = 0usize;
+    let mut block_col_start = 0usize;
     for spec in specs.iter() {
         let block_cols = spec.design.ncols();
         let mut block_edf_acc = block_cols as f64;
         for (local_k, penalty) in spec.penalties.iter().enumerate() {
             let global_k = penalty_offset + local_k;
             let lambda = lambdas[global_k];
-            // rank of S_k bounds its edf contribution from below at 0; we use
-            // the penalty's column count as the conservative dimension cap
-            // (mgcv clamps each block's edf to its column count).
-            let s_dense = penalty.to_dense();
-            if s_dense.nrows() != p || s_dense.ncols() != p {
+            // Embed S_k into the full p×p joint layout. `PenaltyMatrix::to_dense`
+            // returns the *local* block matrix for the `Dense` variant but the
+            // already-embedded full-width matrix for `Blockwise`/`Kronecker`, so
+            // dispatch on the materialized dimension: a local (block_cols-wide)
+            // penalty is placed at this block's column range, a full-width
+            // penalty is used as-is (mirrors `survival_transformation_edf`'s
+            // explicit block placement).
+            let s_local = penalty.to_dense();
+            let mut s_full = Array2::<f64>::zeros((p, p));
+            if s_local.nrows() == p && s_local.ncols() == p {
+                s_full.assign(&s_local);
+            } else if s_local.nrows() == block_cols && s_local.ncols() == block_cols {
+                let r = block_col_start..block_col_start + block_cols;
+                s_full
+                    .slice_mut(ndarray::s![r.clone(), r])
+                    .assign(&s_local);
+            } else {
                 return Err(format!(
-                    "custom-family edf: penalty {global_k} materialized to {}x{}, expected {p}x{p}",
-                    s_dense.nrows(),
-                    s_dense.ncols()
+                    "custom-family edf: penalty {global_k} materialized to {}x{}, expected {p}x{p} or {block_cols}x{block_cols}",
+                    s_local.nrows(),
+                    s_local.ncols()
                 ));
             }
             // tr(H⁻¹ S_k) via H Z = S_k, summing the diagonal of Z.
             let z = factor
-                .solvemulti(&s_dense)
+                .solvemulti(&s_full)
                 .map_err(|e| format!("custom-family edf trace solve failed for penalty {global_k}: {e}"))?;
             let mut trace = 0.0_f64;
             for d in 0..p {
@@ -4221,8 +4234,10 @@ fn custom_family_blockwise_edf(
             }
             let lam_trace = if lambda > 0.0 { lambda * trace } else { 0.0 };
             total_trace += lam_trace;
-            // Per-penalty edf is bounded by the penalty's own column count.
-            let penalty_cols = penalty.dim() as f64;
+            // Per-penalty edf is bounded by the columns this penalty acts on,
+            // i.e. its block's column count (a `Blockwise` penalty reports the
+            // full joint width from `dim()`, so cap at `block_cols`, not `dim()`).
+            let penalty_cols = block_cols as f64;
             let edf_k = (penalty_cols - lam_trace).clamp(0.0, penalty_cols);
             edf_by_penalty[global_k] = edf_k;
             // The block's edf is the column count minus the total trace this
@@ -4232,6 +4247,7 @@ fn custom_family_blockwise_edf(
         }
         block_edf.push(block_edf_acc.clamp(0.0, block_cols as f64));
         penalty_offset += spec.penalties.len();
+        block_col_start += block_cols;
     }
 
     let edf_total = (p as f64 - total_trace).clamp(0.0, p as f64);
