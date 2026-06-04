@@ -144,44 +144,12 @@ impl BernoulliMarginalSlopeFamily {
         Ok(root)
     }
 
-    #[cfg(test)]
-    pub(super) fn empirical_rigid_calibration_jets(
-        &self,
-        intercept: &MultiDirJet,
-        mu: &MultiDirJet,
-        slope: &MultiDirJet,
-        nodes: &[f64],
-        measure_weights: &[f64],
-    ) -> (MultiDirJet, MultiDirJet) {
-        let n_dirs = intercept.coeffs.len().trailing_zeros() as usize;
-        let observed_slope = slope.scale(self.probit_frailty_scale());
-        let mut f = mu.scale(-1.0);
-        let mut f_a = MultiDirJet::zero(n_dirs);
-        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
-            let eta = intercept.add(&observed_slope.scale(node));
-            let cdf = eta.compose_unary(unary_derivatives_normal_cdf(eta.coeff(0)));
-            let pdf = eta.compose_unary(unary_derivatives_normal_pdf(eta.coeff(0)));
-            f = f.add(&cdf.scale(weight));
-            f_a = f_a.add(&pdf.scale(weight));
-        }
-        (f, f_a)
-    }
-
     /// Objective-only fast path for the empirical-grid rigid kernel: returns
-    /// just `-w · log Φ(s · (intercept + s_f·g·z))` evaluated at the
-    /// converged scalar intercept.
-    ///
-    /// **Mathematically identical** to
-    /// `empirical_rigid_neglog_jet(..).coeff(0)`: same scalar fixed point
-    /// (the converged intercept root from `empirical_intercept_from_marginal`),
-    /// same probit log-CDF evaluation. The skipped work is the per-row
-    /// `MultiDirJet` construction + the 6 Newton-refinement passes that
-    /// propagate the intercept through 16 directional coefficient slots;
-    /// the line-search accept/reject decision never reads those coefficients.
-    ///
-    /// Reuses the same `intercept_warm_starts` cache as `empirical_rigid_neglog_jet`,
-    /// so successive line-search trials at nearby intercepts converge in
-    /// `O(1)` Newton iterations per row.
+    /// `-w · log Φ(s · (intercept + s_f·g·z))` at the converged scalar
+    /// intercept (the calibration root from `empirical_intercept_from_marginal`).
+    /// Shares the `intercept_warm_starts` cache with the closed-form
+    /// gradient/Hessian path, so successive line-search trials at nearby
+    /// intercepts converge in `O(1)` Newton iterations per row.
     pub(super) fn empirical_rigid_neglog_only(
         &self,
         row: usize,
@@ -228,60 +196,6 @@ impl BernoulliMarginalSlopeFamily {
                 self.empirical_rigid_neglog_only(row, marginal, slope, &grid.nodes, &grid.weights)
             }
         }
-    }
-
-    /// Forward-mode-AD reference for the rigid empirical-grid kernel. Retained
-    /// **solely as the exact validation oracle** for the implicit-function-theorem
-    /// closed forms (`empirical_rigid_primary_grad_hess_closed_form`,
-    /// `empirical_rigid_third_full_closed_form`,
-    /// `empirical_rigid_fourth_full_closed_form`), which fully replaced it on the
-    /// production paths (`rigid_row_kernel_eval`, `rigid_row_third_full`,
-    /// `rigid_row_fourth_full`). No production caller remains.
-    #[cfg(test)]
-    pub(super) fn empirical_rigid_neglog_jet(
-        &self,
-        row: usize,
-        marginal_eta: f64,
-        marginal: BernoulliMarginalLinkMap,
-        slope: f64,
-        directions: &[[f64; 2]],
-        nodes: &[f64],
-        measure_weights: &[f64],
-    ) -> Result<MultiDirJet, String> {
-        let n_dirs = directions.len();
-        let marginal_first = directions.iter().map(|dir| dir[0]).collect::<Vec<_>>();
-        let slope_first = directions.iter().map(|dir| dir[1]).collect::<Vec<_>>();
-        let marginal_eta_jet = MultiDirJet::linear(n_dirs, marginal_eta, &marginal_first);
-        let mu_jet = marginal_eta_jet.compose_unary([
-            marginal.mu,
-            marginal.mu1,
-            marginal.mu2,
-            marginal.mu3,
-            marginal.mu4,
-        ]);
-        let slope_jet = MultiDirJet::linear(n_dirs, slope, &slope_first);
-        let intercept_root =
-            self.empirical_rigid_intercept_for_row(row, marginal, slope, nodes, measure_weights)?;
-        let mut intercept_jet = MultiDirJet::constant(n_dirs, intercept_root);
-        for _ in 0..6 {
-            let (f, f_a) = self.empirical_rigid_calibration_jets(
-                &intercept_jet,
-                &mu_jet,
-                &slope_jet,
-                nodes,
-                measure_weights,
-            );
-            let inv_f_a = f_a.compose_unary(unary_derivatives_reciprocal(f_a.coeff(0)));
-            intercept_jet = intercept_jet.add(&f.mul(&inv_f_a).scale(-1.0));
-            intercept_jet.coeffs[0] = intercept_root;
-        }
-        let observed_slope = slope_jet.scale(self.probit_frailty_scale());
-        let observed_eta = intercept_jet.add(&observed_slope.scale(self.z[row]));
-        let signed = observed_eta.scale(2.0 * self.y[row] - 1.0);
-        Ok(signed.compose_unary(unary_derivatives_neglog_phi(
-            signed.coeff(0),
-            self.weights[row],
-        )))
     }
 
     /// Closed-form row-primary negative-log-likelihood, gradient, and Hessian
