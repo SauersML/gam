@@ -190,12 +190,6 @@ pub(crate) fn try_build_cubic_cell_derivative_moments(
 
     match input.residency {
         CubicCellMomentResidency::Host => {
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(batch) = device::try_device_moments(&input)? {
-                    return Ok(Some(into_host_output(batch)));
-                }
-            }
             let batch = build_host_moments(&input)
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             Ok(Some(into_host_output(batch)))
