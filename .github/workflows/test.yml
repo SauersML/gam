@@ -111,17 +111,12 @@ jobs:
           # `collect2: fatal error: ld terminated with signal 7 [Bus error]`.
           # Build/link the test binaries serially below; test execution stays
           # under Cargo's normal harness once each binary exists.
-          # rust-lld's internal `llvm::parallelFor` defaults to one worker
-          # per available CPU (4 on ubuntu-latest), and the dep closure
-          # above pushes each lld worker's working set into the multi-GB
-          # range. Multiple concurrent links × four lld workers each creates
-          # enough large allocations in flight to re-OOM lld with
-          # `collect2: fatal error: ld terminated with signal 7 [Bus error]`
-          # at `llvm::parallelFor` (visible in the lld crash backtrace).
-          # `RUSTFLAGS=-C link-arg=-Wl,--threads=1` pins each lld
-          # invocation to a single worker; combined with `--jobs 1`, there is
-          # only one large link in flight.
-          RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
+          # Rust 1.93 injects `-fuse-ld=lld` for this target. Even one
+          # serialized `gam` integration-test link still crashes rust-lld in
+          # `llvm::parallelFor` on the 16-GB runner, so choose GNU bfd for the
+          # CI test link. It is slower, but it avoids lld's peak allocator
+          # behavior and keeps the verification on standard GitHub runners.
+          RUSTFLAGS: "-C link-arg=-fuse-ld=bfd"
         run: |
           set -uo pipefail
           # cargo test captures stdout/stderr by default and only re-prints
