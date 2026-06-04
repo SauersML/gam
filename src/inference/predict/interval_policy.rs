@@ -385,6 +385,14 @@ pub struct LinearState {
     /// Standard error of μ (delta-method, response scale). `None` when no
     /// covariance.
     pub mean_se: Option<Array1<f64>>,
+    /// Whether the standard errors in this state were derived from the
+    /// smoothing-corrected covariance (`true`) rather than the conditional
+    /// covariance (`false`). The full-uncertainty driver propagates this to the
+    /// result's `covariance_corrected_used` provenance flag, so it must reflect
+    /// the covariance actually consumed by `eta_se`/`mean_se` — not merely what
+    /// the caller requested. Point-state (fit-free) construction always reports
+    /// `false`.
+    pub covariance_corrected_used: bool,
 }
 
 /// Family-specific supplier for the shared predict pipeline.
@@ -423,19 +431,26 @@ pub trait PredictionTransform {
 
     /// Compute η, μ, and the standard errors for the requested `pass`. `fit`
     /// carries the posterior covariance / penalized Hessian some predictors
-    /// need.
+    /// need, and `covariance_mode` selects which covariance (conditional vs.
+    /// smoothing-corrected) the full-uncertainty SEs are built from. The
+    /// returned [`LinearState::covariance_corrected_used`] records which
+    /// covariance was actually consumed.
     ///
     /// The default services the full-uncertainty pass from the fit-free
     /// [`point_state`](PredictionTransform::point_state); predictors whose
     /// posterior-mean (or fit-backed full-uncertainty) numerics differ override
-    /// this and branch on `pass`.
+    /// this and branch on `pass`. The posterior-mean pass always integrates the
+    /// conditional posterior, so `covariance_mode` is only consulted for the
+    /// full-uncertainty pass.
     fn linear_state(
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
         pass: PredictPass,
+        covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         assert!(std::mem::size_of_val(fit) > 0);
+        assert!(std::mem::size_of_val(&covariance_mode) > 0);
         match pass {
             PredictPass::FullUncertainty => self.point_state(input),
             PredictPass::PosteriorMean => Err(EstimationError::InvalidInput(
@@ -468,15 +483,6 @@ pub trait PredictionTransform {
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         assert!(std::mem::size_of_val(input) > 0);
         Ok(None)
-    }
-
-    /// Whether the assembled full-uncertainty result should record that a
-    /// smoothing-corrected covariance was used. Most predictors quantify
-    /// uncertainty from the conditional covariance only and report `false`;
-    /// the transformation-normal predictor inherits the flag from the fit.
-    fn covariance_corrected_used(&self, fit: &UnifiedFitResult) -> bool {
-        assert!(std::mem::size_of_val(fit) > 0);
-        false
     }
 }
 
@@ -523,7 +529,13 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
     fit: &UnifiedFitResult,
     options: &PredictUncertaintyOptions,
 ) -> Result<PredictUncertaintyResult, EstimationError> {
-    let state = transform.linear_state(input, fit, PredictPass::FullUncertainty)?;
+    let state = transform.linear_state(
+        input,
+        fit,
+        PredictPass::FullUncertainty,
+        options.covariance_mode,
+    )?;
+    let covariance_corrected_used = state.covariance_corrected_used;
     let eta_se = state.eta_se.ok_or_else(|| {
         EstimationError::InvalidInput(
             "full uncertainty requires covariance (eta_se unavailable)".to_string(),
@@ -554,7 +566,7 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
             .map(|noise_sd| ObservationInterval { noise_sd }),
         UncertaintyProvenance {
             covariance_mode_requested: options.covariance_mode,
-            covariance_corrected_used: transform.covariance_corrected_used(fit),
+            covariance_corrected_used,
         },
     )
 }
@@ -569,7 +581,12 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
     fit: &UnifiedFitResult,
     confidence_level: Option<f64>,
 ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-    let state = transform.linear_state(input, fit, PredictPass::PosteriorMean)?;
+    let state = transform.linear_state(
+        input,
+        fit,
+        PredictPass::PosteriorMean,
+        InferenceCovarianceMode::Conditional,
+    )?;
     let eta_se = state
         .eta_se
         .unwrap_or_else(|| Array1::zeros(state.eta.len()));
