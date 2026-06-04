@@ -41,7 +41,8 @@ use std::path::Path;
 
 const N: usize = 4; // 4x4 SPD matrices
 const M: usize = 10; // number of samples
-const ITERS: usize = 100; // fixed-point iterations (matches the reference)
+const MAX_ITERS: usize = 500;
+const KARCHER_GRAD_TOL: f64 = 1e-10;
 
 /// Symmetrize a square matrix: (A + Aᵀ)/2. SPD points and tangent vectors are
 /// symmetric; we symmetrize defensively to kill round-off asymmetry before
@@ -64,19 +65,28 @@ fn unflat(v: &Array1<f64>) -> Array2<f64> {
 }
 
 /// Karcher-mean fixed point of `samples` at base point `init`, using gam's
-/// `exp_map`/`log_map` (`P ← exp_P((1/M) Σ_i log_P(X_i))`).
-fn gam_frechet_mean(spd: &SpdManifold, samples: &[Array1<f64>], init: &Array1<f64>) -> Array1<f64> {
+/// `exp_map`/`log_map` (`P ← exp_P((1/M) Σ_i log_P(X_i))`). The synthetic arm
+/// uses the stationarity residual as the stopping rule because that is the
+/// Fréchet-mean axiom this test verifies.
+fn gam_frechet_mean(
+    spd: &SpdManifold,
+    samples: &[Array1<f64>],
+    init: &Array1<f64>,
+) -> (Array1<f64>, usize) {
     let mut p = init.clone();
-    for _ in 0..ITERS {
+    for iter in 0..MAX_ITERS {
         let mut acc = Array1::<f64>::zeros(N * N);
         for x in samples {
             let lg = spd.log_map(p.view(), x.view()).expect("gam log_map");
             acc += &lg;
         }
         acc /= M as f64;
+        if gam_tangent_sq_norm(spd, p.view(), acc.view()).sqrt() < KARCHER_GRAD_TOL {
+            return (p, iter);
+        }
         p = spd.exp_map(p.view(), acc.view()).expect("gam exp_map");
     }
-    p
+    (p, MAX_ITERS)
 }
 
 /// Squared affine-invariant geodesic distance `d²(P, X) = ‖log_P(X)‖²_P`,
@@ -130,7 +140,7 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass() {
 
     // Initialize at the first sample (any SPD point works; the Karcher mean of
     // a Hadamard space is unique and the descent converges from anywhere).
-    let p = gam_frechet_mean(&spd, &flat_samples, &flat_samples[0]);
+    let (p, karcher_iters) = gam_frechet_mean(&spd, &flat_samples, &flat_samples[0]);
     let gam_mean = unflat(&p);
 
     // =====================================================================
@@ -151,7 +161,7 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass() {
     let grad_norm = grad_sq_norm.sqrt();
 
     eprintln!(
-        "SPD Fréchet mean (4x4, M={M}, {ITERS} iters): Riemannian gradient norm ‖(1/M)Σ log_P(X_i)‖_P = {grad_norm:.3e}"
+        "SPD Fréchet mean (4x4, M={M}, {karcher_iters} Karcher iters): Riemannian gradient norm ‖(1/M)Σ log_P(X_i)‖_P = {grad_norm:.3e}"
     );
     assert!(
         grad_norm < 1e-7,
@@ -216,7 +226,8 @@ fn spd_frechet_mean_is_the_riemannian_center_of_mass() {
         r#"
 N = {N}
 M = {M}
-ITERS = {ITERS}
+MAX_ITERS = {MAX_ITERS}
+GRAD_TOL = {KARCHER_GRAD_TOL}
 
 # Rebuild the M NxN matrices from the flat columns x0..x{kmax}.
 mats = []
@@ -248,18 +259,27 @@ def spd_exp(P, U):
     return sp @ em @ sp
 
 P = mats[0].copy()
-for _ in range(ITERS):
+iters = 0
+for it in range(MAX_ITERS):
     acc = np.zeros((N, N))
     for X in mats:
         acc = acc + spd_log(P, X)
     acc = acc / M
+    # Affine-invariant tangent norm at P: tr(P^{-1} acc P^{-1} acc).
+    Pinv = np.linalg.inv(P)
+    grad_norm = float(np.sqrt(np.trace(Pinv @ acc @ Pinv @ acc)))
+    if grad_norm < GRAD_TOL:
+        iters = it
+        break
     P = spd_exp(P, acc)
+    iters = it + 1
 
 emit("mean", 0.5 * (P + P.T).reshape(-1))
 "#,
         N = N,
         M = M,
-        ITERS = ITERS,
+        MAX_ITERS = MAX_ITERS,
+        KARCHER_GRAD_TOL = KARCHER_GRAD_TOL,
         kmax = N * N - 1,
     );
 
