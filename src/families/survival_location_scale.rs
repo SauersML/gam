@@ -10166,36 +10166,51 @@ pub(crate) fn fit_survival_location_scale_terms(
         // Parametric-AFT regime: strong-smoothing seed for the time-warp
         // penalty.
         //
-        // When the scale block carries no penalties (a single constant σ) AND
-        // the location/threshold block carries no penalties (a fixed
-        // parametric mean, e.g. `~ age`), the model is mathematically a
-        // *parametric* AFT: the only role of the monotone I-spline time-warp is
-        // to supply the baseline shape, and the data identifies that shape only
-        // through `z = (h(t) - η)/σ`. With a single global σ and a rigid mean,
-        // the flexible deviation of `h(t)` from its penalty nullspace (the
-        // affine `1 + log t` baseline that IS the parametric AFT transform) is
-        // statistically unidentified: the REML/LAML profile in the time
-        // smoothing parameter is a long flat ridge that climbs monotonically
-        // toward strong smoothing. Seeding the time penalty at the weak default
-        // (`time_smooth_lambda ≈ 1e-2`) drops the exact-joint outer search into
-        // the *interior* of that ridge, where it crawls toward the
-        // strong-smoothing boundary one short, ill-conditioned step at a time
-        // and never terminates in reasonable time (#736, #735, #721).
+        // When the scale block carries no penalties (a single constant σ) the
+        // residual distribution `z = (h(t) - η)/σ` is a fixed parametric shape
+        // with a single global spread, so the data identifies the baseline
+        // *only* through the affine `1 + log t` transform that IS the parametric
+        // AFT transform. The flexible deviation of the monotone I-spline
+        // time-warp `h(t)` away from its penalty nullspace (that affine
+        // baseline) is then statistically unidentified, and the REML/LAML
+        // profile in the time smoothing parameter is a long flat ridge that
+        // climbs monotonically toward strong smoothing.
         //
-        // Seeding instead at strong smoothing places the search at the
+        // This unidentifiability is a property of the SCALE block alone, not of
+        // the mean. A smooth mean `~ s(z)` adds flexibility in *covariate*
+        // space — it bends η as a function of the covariates — but it carries no
+        // information about the *time* baseline shape, because the time-warp
+        // enters only through `h(t)` and is identified solely by how the event
+        // times distribute against a single global σ. So whether the mean is
+        // rigid (`~ age`) or smooth (`~ s(z)`), a constant-scale Gaussian AFT
+        // leaves the time-warp's non-affine deviation unidentified and the time
+        // ridge flat. Gating the seed on `rigid_mean` therefore wrongly excluded
+        // the smooth-mean constant-scale case (#735), whose threshold block
+        // carries penalties: it fell through to the weak default time seed and
+        // its exact-joint outer search crawled the flat time ridge forever.
+        //
+        // Seeding the weak default (`time_smooth_lambda ≈ 1e-2`) drops the
+        // exact-joint outer search into the *interior* of that ridge, where it
+        // crawls toward the strong-smoothing boundary one short, ill-conditioned
+        // step at a time and never terminates in reasonable time (#736, #735,
+        // #721). Seeding instead at strong smoothing places the search at the
         // statistically correct end of the ridge — the affine baseline — where
         // the surface is well conditioned and outer stationarity certifies
         // immediately. This is a regime-specific *initialization*, not a cap or
         // a tolerance change: the optimizer is still free to relax the time
         // penalty if the data genuinely prefers a flexible baseline, and the
         // I-spline basis dimensions are untouched, so any independent rebuild of
-        // the time basis (predictor reconstruction) is unaffected. The genuinely
-        // flexible regimes — a smooth scale (`noise_formula = s(...)`) or a
-        // smooth mean (`~ s(...)`) — carry penalties on those blocks and are
-        // excluded by the guard below, so they keep the full weak-seed search.
+        // the time basis (predictor reconstruction) is unaffected.
+        //
+        // The seed is gated on `constant_scale` ONLY. The genuinely flexible
+        // time-warp regime is a smooth scale (`noise_formula = s(...)`): a
+        // varying σ lets the residual spread change with covariates, which DOES
+        // supply identifying information for a non-affine baseline, so those
+        // fits carry log_sigma penalties and keep the full weak-seed search.
+        // Smooth-mean penalties on the threshold block are still selected
+        // normally — only the TIME-WARP block's seed changes here.
         let constant_scale = log_sigma_boot_design.penalties.is_empty();
-        let rigid_mean = threshold_boot_design.penalties.is_empty();
-        if constant_scale && rigid_mean {
+        if constant_scale {
             // λ ≈ exp(8) ≈ 3·10³: deep in the strong-smoothing regime (the
             // outer ρ box bound is 10), but still interior so the optimizer can
             // move if a flexible improvement exists.
