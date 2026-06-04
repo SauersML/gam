@@ -170,7 +170,17 @@ fn gam_factor_smooth_random_slope_matches_lme4() {
         r#"
         suppressPackageStartupMessages(library(lme4))
         df$g <- factor(as.integer(round(df$g)))
-        m <- lmer(y ~ 1 + x + (x | g), data = df,
+        # The DGP has a SHARED fixed intercept (2.0 for every group) and a
+        # per-group RANDOM SLOPE only: y = 2 + (3 + b_g)*x + e, b_g ~ N(0, 1.5^2).
+        # Fitting a correlated random intercept+slope `(x | g)` therefore asks
+        # lme4 to estimate a random-intercept variance that is truly zero plus an
+        # unidentified intercept-slope correlation. With only 6 groups that 2x2
+        # covariance collapses to a singular boundary and lmer returns NaN BLUPs,
+        # making the reference RMSE NaN. Match the DGP instead with a pure random
+        # slope `(0 + x | g)` (no random intercept, one well-identified variance
+        # component): a finite, non-singular REML fit whose per-group slope is the
+        # exact random-slope estimand the test compares against.
+        m <- lmer(y ~ 1 + x + (0 + x | g), data = df, REML = TRUE,
                   control = lmerControl(check.conv.singular = "ignore"))
         cf <- coef(m)$g               # per-group (Intercept) and x columns
         a  <- cf[, "(Intercept)"]     # group-specific intercepts (β0 + b0_g)
