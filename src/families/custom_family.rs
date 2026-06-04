@@ -11594,63 +11594,6 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
     )
 }
 
-fn strict_inverse_spd(matrix: &Array2<f64>) -> Result<Array2<f64>, String> {
-    let mut sym = matrix.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let chol = sym
-        .cholesky(Side::Lower)
-        .map_err(|_| "strict pseudo-laplace SPD inverse failed".to_string())?;
-    let mut ident = Array2::<f64>::eye(matrix.nrows());
-    chol.solve_mat_in_place(&mut ident);
-    Ok(ident)
-}
-
-/// Strict-mode SPD inverse with the same Levenberg-Marquardt δ-ridge
-/// continuation as [`strict_solve_spd_with_lm_continuation`]: when bare
-/// Cholesky on `H` rejects, factor `H + δI` with δ escalated geometrically,
-/// then invert.  If the cap is exhausted, fall back to a symmetric
-/// eigendecomposition with an eigenvalue floor `eps_floor = 1e-12 · max|λ|`
-/// applied uniformly, so the reconstructed inverse equals the
-/// pseudo-Laplace inverse on well-conditioned modes plus a floor-controlled
-/// regularization on rank-deficient directions.
-///
-/// Mirrors [`strict_solve_spd_with_lm_continuation`] for the inverse path:
-/// preserves strict semantics (a valid SPD inverse with bounded, recorded
-/// perturbation) while preventing fragile pilot Hessians from collapsing
-/// the spatial-adaptive seed and routing the optimizer into a cold
-/// full-data run.
-pub(crate) fn strict_inverse_spd_with_lm_continuation(
-    matrix: &Array2<f64>,
-) -> Result<(Array2<f64>, StrictSpdLmStats), String> {
-    let p = matrix.nrows();
-    strict_spd_lm_engine(
-        matrix,
-        "strict pseudo-laplace SPD inverse",
-        Array2::<f64>::zeros((0, 0)),
-        strict_inverse_spd,
-        |chol| {
-            let mut ident = Array2::<f64>::eye(p);
-            chol.solve_mat_in_place(&mut ident);
-            symmetrize_dense_in_place(&mut ident);
-            ident
-        },
-        |evals, evecs, eps_floor| {
-            // V · diag(1/max(λ, eps_floor)) · Vᵀ.
-            let mut inv = Array2::<f64>::zeros((p, p));
-            for (k, &ev) in evals.iter().enumerate() {
-                let inv_ev = 1.0 / ev.max(eps_floor);
-                for i in 0..p {
-                    let vi = evecs[[i, k]];
-                    for j in 0..p {
-                        inv[[i, j]] += inv_ev * vi * evecs[[j, k]];
-                    }
-                }
-            }
-            symmetrize_dense_in_place(&mut inv);
-            inv
-        },
-    )
-}
 
 /// Exact pseudo-Laplace log-determinant `log|H + S_λ|` of the REML/LAML
 /// objective, computed from the eigenspectrum with **no δ-ridge** so the value
@@ -22817,16 +22760,36 @@ fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
     }
     symmetrize_dense_in_place(&mut h);
     if use_exact_newton_strict_spd(family) {
-        let (inv, stats) = strict_inverse_spd_with_lm_continuation(&h)?;
-        if stats.escalations > 0 {
-            log::debug!(
-                "[strict-spd] inverse δ-ridge continuation: δ={:.3e}, escalations={}, p={}",
-                stats.delta_used,
-                stats.escalations,
-                h.nrows(),
-            );
+        // #748: the strict posterior precision is `H + S_λ` AT THE CONVERGED
+        // OPTIMUM. A δ-ridge inverse `(H + S_λ + δI)⁻¹` would mask a genuinely
+        // non-PD curvature and report it as if it were the posterior
+        // covariance, biasing every standard error. Instead: eigendecompose and
+        // **reject** when the precision is genuinely indefinite (a real
+        // fit-quality failure — the mode is not a strict maximum), and on the
+        // PSD case return the honest positive-eigenspace pseudo-inverse (the
+        // structural null space of a penalised model is a flat posterior
+        // direction, not something to ridge away).
+        let p = h.nrows();
+        let (evals, _) = FaerEigh::eigh(&h, Side::Lower)
+            .map_err(|e| format!("strict pseudo-laplace covariance eigendecomposition failed: {e}"))?;
+        let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+        let eps_np = f64::EPSILON * (p as f64) * (p as f64);
+        let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * f64::EPSILON);
+        if let Some(&min_eval) = evals
+            .iter()
+            .filter(|&&ev| ev < -tol)
+            .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            let below = evals.iter().filter(|&&ev| ev < -tol).count();
+            return Err(format!(
+                "strict pseudo-laplace covariance: joint coefficient Hessian is non-PD at the \
+                 converged optimum ({below} eigenvalue(s) below -tol, min(λ)={min_eval:.6e}, \
+                 max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); the mode is not a strict posterior \
+                 maximum, so the reported covariance would be meaningless — fit-quality failure \
+                 surfaced instead of δ-ridge masking (gam#748)"
+            ));
         }
-        Ok(inv)
+        pinv_positive_part(&h, effective_solverridge(options.ridge_floor))
     } else {
         match inverse_spdwith_retry(&h, effective_solverridge(options.ridge_floor), 8) {
             Ok(cov) => Ok(cov),
