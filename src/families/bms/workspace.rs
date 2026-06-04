@@ -10148,16 +10148,45 @@ impl BernoulliMarginalSlopeFamily {
                     crate::gpu::row_hessian_ops::cpu_row_hessian_matvec(&inputs)
                 }
             };
-            // Reuse `row_dir_scratch` as the per-row action buffer (same
-            // length r_pr) to avoid per-row allocation in the pullback loop.
-            for row in 0..n {
-                let action_slice = &y_rows[row * r_pr..(row + 1) * r_pr];
-                row_dir_scratch
-                    .iter_mut()
-                    .zip(action_slice.iter())
-                    .for_each(|(dst, &src)| *dst = src);
-                self.pullback_primary_vector_add_into(row, slices, primary, &row_dir_scratch, out)?;
-            }
+            // Pull back every row's action `y_rows[row]` through its design
+            // rows into the joint-β image. The pullback accumulates into the
+            // shared output, so fan it across rayon row chunks with a private
+            // per-chunk partial + a sum reduce — numerically identical to the
+            // serial single-buffer accumulation, with each worker owning its
+            // own action scratch.
+            let partial = (0..n.div_ceil(ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(
+                    || (Array1::<f64>::zeros(slices.total), Array1::<f64>::zeros(r_pr)),
+                    |(mut chunk_out, mut action_scratch), chunk_idx| -> Result<_, String> {
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        for row in start..end {
+                            let action_slice = &y_rows[row * r_pr..(row + 1) * r_pr];
+                            action_scratch
+                                .iter_mut()
+                                .zip(action_slice.iter())
+                                .for_each(|(dst, &src)| *dst = src);
+                            self.pullback_primary_vector_add_into(
+                                row,
+                                slices,
+                                primary,
+                                &action_scratch,
+                                &mut chunk_out,
+                            )?;
+                        }
+                        Ok((chunk_out, action_scratch))
+                    },
+                )
+                .map(|res| res.map(|(chunk_out, _)| chunk_out))
+                .try_reduce(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut left, right| -> Result<_, String> {
+                        left += &right;
+                        Ok(left)
+                    },
+                )?;
+            *out += &partial;
             return Ok(());
         }
 
@@ -10629,34 +10658,63 @@ impl BernoulliMarginalSlopeFamily {
                     crate::gpu::row_hessian_ops::cpu_row_hessian_diag(&inputs)
                 }
             };
-            let mut diagonal = Array1::<f64>::zeros(slices.total);
-            for row in 0..n {
-                let d_row_base = row * r_pr;
-                let h00 = d_rows[d_row_base];
-                let h11 = d_rows[d_row_base + 1];
-                {
-                    let mut marginal_diag = diagonal.slice_mut(s![slices.marginal.clone()]);
-                    self.marginal_design
-                        .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
-                }
-                {
-                    let mut logslope_diag = diagonal.slice_mut(s![slices.logslope.clone()]);
-                    self.logslope_design
-                        .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
-                }
-                if let (Some(primary_h), Some(block_h)) = (primary.h.as_ref(), slices.h.as_ref()) {
-                    for (local_idx, global_idx) in block_h.clone().enumerate() {
-                        let ii = primary_h.start + local_idx;
-                        diagonal[global_idx] += d_rows[d_row_base + ii];
-                    }
-                }
-                if let (Some(primary_w), Some(block_w)) = (primary.w.as_ref(), slices.w.as_ref()) {
-                    for (local_idx, global_idx) in block_w.clone().enumerate() {
-                        let ii = primary_w.start + local_idx;
-                        diagonal[global_idx] += d_rows[d_row_base + ii];
-                    }
-                }
-            }
+            // The per-row diagonals `d_rows` are already materialised; the
+            // remaining design² accumulation is a reduction over rows (every
+            // row contributes to the same marginal/logslope columns). Fan it
+            // across rayon row chunks with private diagonal partials + a sum
+            // reduce, exactly as the streaming fallback below does — numerically
+            // identical to the serial single-buffer accumulation up to f.p.
+            // reduction order, and removing the serial walk over all `n` rows.
+            let diagonal = (0..n.div_ceil(ROW_CHUNK_SIZE))
+                .into_par_iter()
+                .try_fold(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut chunk_diag, chunk_idx| -> Result<_, String> {
+                        let start = chunk_idx * ROW_CHUNK_SIZE;
+                        let end = (start + ROW_CHUNK_SIZE).min(n);
+                        for row in start..end {
+                            let d_row_base = row * r_pr;
+                            let h00 = d_rows[d_row_base];
+                            let h11 = d_rows[d_row_base + 1];
+                            {
+                                let mut marginal_diag =
+                                    chunk_diag.slice_mut(s![slices.marginal.clone()]);
+                                self.marginal_design
+                                    .squared_axpy_row_into(row, h00, &mut marginal_diag)?;
+                            }
+                            {
+                                let mut logslope_diag =
+                                    chunk_diag.slice_mut(s![slices.logslope.clone()]);
+                                self.logslope_design
+                                    .squared_axpy_row_into(row, h11, &mut logslope_diag)?;
+                            }
+                            if let (Some(primary_h), Some(block_h)) =
+                                (primary.h.as_ref(), slices.h.as_ref())
+                            {
+                                for (local_idx, global_idx) in block_h.clone().enumerate() {
+                                    let ii = primary_h.start + local_idx;
+                                    chunk_diag[global_idx] += d_rows[d_row_base + ii];
+                                }
+                            }
+                            if let (Some(primary_w), Some(block_w)) =
+                                (primary.w.as_ref(), slices.w.as_ref())
+                            {
+                                for (local_idx, global_idx) in block_w.clone().enumerate() {
+                                    let ii = primary_w.start + local_idx;
+                                    chunk_diag[global_idx] += d_rows[d_row_base + ii];
+                                }
+                            }
+                        }
+                        Ok(chunk_diag)
+                    },
+                )
+                .try_reduce(
+                    || Array1::<f64>::zeros(slices.total),
+                    |mut left, right| -> Result<_, String> {
+                        left += &right;
+                        Ok(left)
+                    },
+                )?;
             return Ok(diagonal);
         }
 
