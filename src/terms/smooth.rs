@@ -23954,19 +23954,13 @@ mod tests {
 
         // Build derivative at psi=0.
         let psi_eval = 0.0_f64;
-        let (
-            global_range,
-            p_total,
-            _local_x_psi,
-            _local_s_psi,
-            _local_x_psi_psi,
-            _local_s_psi_psi,
-            _local_s_blocks,
-            _local_s_psi_psi_blocks,
-            implicit_operator,
-        ) = try_build_spatial_term_log_kappa_derivative(data.view(), &frozen, &design, 0)
-            .expect("formula Duchon derivative should build")
-            .expect("Duchon derivative should be available");
+        let derivative_bundle =
+            try_build_spatial_term_log_kappa_derivative(data.view(), &frozen, &design, 0)
+                .expect("formula Duchon derivative should build")
+                .expect("Duchon derivative should be available");
+        let global_range = derivative_bundle.0;
+        let p_total = derivative_bundle.1;
+        let implicit_operator = derivative_bundle.8;
         let op = implicit_operator.expect("Duchon derivative should expose implicit operator");
         let p = op.p_out();
         assert_eq!(p_total, design.design.ncols());
