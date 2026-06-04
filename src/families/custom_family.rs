@@ -11594,7 +11594,6 @@ pub(crate) fn strict_solve_spd_with_lm_continuation(
     )
 }
 
-
 /// Exact pseudo-Laplace log-determinant `log|H + S_λ|` of the REML/LAML
 /// objective, computed from the eigenspectrum with **no δ-ridge** so the value
 /// stays on the same objective as the analytic gradient `tr((H+S_λ)⁻¹ ·)`
@@ -11644,22 +11643,33 @@ fn strict_logdet_spd_with_semidefinite_option(
     if evals.iter().any(|&ev| ev < -tol) {
         let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
         let below = evals.iter().filter(|&&ev| ev < -tol).count();
-        return Err(CustomFamilyError::NumericalFailure { reason: format!(
-            "strict pseudo-laplace logdet: {below} eigenvalue(s) below -tol \
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "strict pseudo-laplace logdet: {below} eigenvalue(s) below -tol \
              (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}, εnp={eps_np:.6e}); \
              indefinite joint coefficient Hessian rejected (no δ-ridge masking, gam#748)"
-        ) }.into());
+            ),
+        }
+        .into());
     }
     if !allow_semidefinite && evals.iter().any(|&ev| ev <= tol) {
         let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
         let in_band = evals.iter().filter(|&&ev| ev <= tol).count();
-        return Err(CustomFamilyError::NumericalFailure { reason: format!(
-            "strict pseudo-laplace logdet: {in_band} eigenvalue(s) at/below +tol \
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "strict pseudo-laplace logdet: {in_band} eigenvalue(s) at/below +tol \
              (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}); \
              rank-deficient joint coefficient Hessian rejected in strict-PD mode (gam#748)"
-        ) }.into());
+            ),
+        }
+        .into());
     }
-    Ok(evals.iter().copied().filter(|&ev| ev > tol).map(f64::ln).sum())
+    Ok(evals
+        .iter()
+        .copied()
+        .filter(|&ev| ev > tol)
+        .map(f64::ln)
+        .sum())
 }
 
 fn pinv_positive_part(matrix: &Array2<f64>, ridge_floor: f64) -> Result<Array2<f64>, String> {
@@ -22770,8 +22780,9 @@ fn compute_joint_covariance<F: CustomFamily + Clone + Send + Sync + 'static>(
         // structural null space of a penalised model is a flat posterior
         // direction, not something to ridge away).
         let p = h.nrows();
-        let (evals, _) = FaerEigh::eigh(&h, Side::Lower)
-            .map_err(|e| format!("strict pseudo-laplace covariance eigendecomposition failed: {e}"))?;
+        let (evals, _) = FaerEigh::eigh(&h, Side::Lower).map_err(|e| {
+            format!("strict pseudo-laplace covariance eigendecomposition failed: {e}")
+        })?;
         let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
         let eps_np = f64::EPSILON * (p as f64) * (p as f64);
         let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * f64::EPSILON);
@@ -23015,6 +23026,7 @@ fn wire_output_channels<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
 ) -> Result<Option<Vec<ParameterBlockSpec>>, CustomFamilyError> {
+    validate_blockspecs(specs)?;
     let Some(channels) = family.output_channel_assignment(specs) else {
         return Ok(None);
     };
@@ -26518,6 +26530,38 @@ mod tests {
                 }],
             })
         }
+    }
+
+    #[test]
+    fn fit_custom_family_rejects_invalid_blockspec_before_output_channel_probe() {
+        let spec = ParameterBlockSpec {
+            name: "bad_penalty".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+                [1.0],
+                [2.0],
+            ])),
+            offset: Array1::zeros(2),
+            penalties: vec![PenaltyMatrix::Dense(Array2::<f64>::eye(2))],
+            nullspace_dims: vec![0],
+            initial_log_lambdas: array![0.0],
+            initial_beta: Some(array![0.0]),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+
+        let err = fit_custom_family(
+            &OneBlockIdentityFamily,
+            &[spec],
+            &BlockwiseFitOptions::default(),
+        )
+        .expect_err("invalid block spec should return a typed error");
+        let message = err.to_string();
+        assert!(
+            message.contains("block 0 penalty 0 must be 1x1, got 2x2"),
+            "unexpected error: {message}",
+        );
     }
 
     #[derive(Clone)]
