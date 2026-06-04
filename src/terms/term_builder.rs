@@ -1405,9 +1405,7 @@ pub fn build_smooth_basis(
             // its linear null space. Never drop below `degree + 2`, which keeps
             // exactly the linear span plus a single curvature direction — the
             // minimal smoother that can still bend if the data demand it.
-            let basis_cap = min_group_resolution
-                .saturating_sub(2)
-                .max(degree + 2);
+            let basis_cap = min_group_resolution.saturating_sub(2).max(degree + 2);
             let internal_cap = basis_cap.saturating_sub(degree + 1);
             pooled_internal.min(internal_cap.max(1))
         };

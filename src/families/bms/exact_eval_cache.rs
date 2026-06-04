@@ -315,12 +315,12 @@ impl RowPrimaryEvalCache {
     }
 }
 
-/// Per-row axis-projected FLEX third/fourth-derivative tensors backing the
-/// outer-derivative fast path (gam#683). Every outer-derivative consumer
-/// (gradient, Hessian, HVP, diagonal, ψ-second-order) contracts the per-row
-/// third/fourth tensors against ψ-axis directions that are *single-axis* in
-/// primary space — nonzero only at `primary.q` (block 0, "q") or
-/// `primary.logslope` (block 1, "g"). By the (bi)linearity of the contraction,
+/// Per-row axis-projected FLEX third/fourth-derivative tensor algebra backing
+/// the outer-derivative fast path (gam#683). Every outer-derivative consumer
+/// contracts the per-row third/fourth tensors against ψ-axis directions that
+/// are *single-axis* in primary space — nonzero only at `primary.q` (block 0,
+/// "q") or `primary.logslope` (block 1, "g"). By the (bi)linearity of the
+/// contraction,
 ///
 /// ```text
 ///   third_contracted(s·e_a)              = s·T3[a]
@@ -331,10 +331,17 @@ impl RowPrimaryEvalCache {
 /// β-cache turns each `(ρ-axis i, ρ-axis j)` pair into a scalar×matrix scale of
 /// a precomputed tensor instead of re-walking every cubic partition cell. All
 /// matrices are `r×r` with `r = primary.total`.
-pub(super) struct FlexAxisRowTensors {
+///
+/// The third and fourth caches are intentionally separate: first-order outer
+/// derivative paths need only degree-15 T3 tensors and must not accidentally
+/// force degree-21 fourth-order cell work.
+pub(super) struct FlexAxisThirdRowTensors {
     /// Third-derivative tensor contracted with the q-axis basis vector
     /// (`third[0]`) and the logslope-axis basis vector (`third[1]`).
     pub(super) third: [Array2<f64>; 2],
+}
+
+pub(super) struct FlexAxisFourthRowTensors {
     /// Symmetric fourth-derivative tensor contracted with `(e_a, e_b)` for
     /// `a, b ∈ {q (0), g (1)}`; `fourth[a][b] == fourth[b][a]`.
     pub(super) fourth: [[Array2<f64>; 2]; 2],
@@ -401,10 +408,9 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     pub(super) rigid_fourth_full:
         crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 
-    /// Flexible-path per-row axis-projected third/fourth-derivative tensors,
-    /// reused across all `(ρ-axis i, j)` pairs. See [`FlexAxisRowTensors`] for
-    /// the contraction algebra. Only consulted on the FLEX path — rigid rows
-    /// keep their own `rigid_{third,fourth}_full` caches.
+    /// Flexible-path per-row axis-projected third-derivative tensors. See
+    /// [`FlexAxisThirdRowTensors`] for the contraction algebra. Only consulted
+    /// on the FLEX path — rigid rows keep their own `rigid_third_full` cache.
     ///
     /// Two-level lazy: the outer `RayonSafeOnce` allocates a per-row slot table
     /// (one inner `RayonSafeOnce` per global row) on first touch; each row's
@@ -412,7 +418,14 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// derivative passes are row-subsampled, so per-row laziness builds (and
     /// risks erroring on) only the rows actually consumed, not all `n`. Each
     /// inner build is fallible and sticky (same contract as `rigid_third_full`).
-    pub(super) flex_axis_tensors: crate::resource::RayonSafeOnce<
-        Vec<crate::resource::RayonSafeOnce<Result<FlexAxisRowTensors, String>>>,
+    pub(super) flex_axis_third_tensors: crate::resource::RayonSafeOnce<
+        Vec<crate::resource::RayonSafeOnce<Result<FlexAxisThirdRowTensors, String>>>,
+    >,
+
+    /// Flexible-path per-row axis-projected fourth-derivative tensors. Built
+    /// independently from `flex_axis_third_tensors` so first-order outer work
+    /// never forces degree-21 fourth-order cell moments.
+    pub(super) flex_axis_fourth_tensors: crate::resource::RayonSafeOnce<
+        Vec<crate::resource::RayonSafeOnce<Result<FlexAxisFourthRowTensors, String>>>,
     >,
 }
