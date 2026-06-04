@@ -1070,6 +1070,38 @@ struct PreparedSurvivalLocationScaleModel {
     k_wiggle: usize,
 }
 
+impl PreparedSurvivalLocationScaleModel {
+    /// Whether this prepared model is the fully reduced, unpenalized
+    /// constant-scale PARAMETRIC AFT regime (issue #736/#735/#721).
+    ///
+    /// In this regime the time block has collapsed to its identifiable affine
+    /// null space (`reduce_time_to_parametric` fired, so `k_time == 0`), the
+    /// scale is a single constant log-σ (`k_log_sigma == 0`), the mean is rigid
+    /// (`k_threshold == 0`), and there is no link-wiggle or monotone time-wiggle
+    /// (`k_wiggle == 0`, `x_link_wiggle == None`, `time_wiggle_ncols == 0`).
+    /// Every block is therefore parametric and UNPENALIZED — zero smoothing
+    /// parameters — so the model is a plain few-parameter AFT MLE (loglogistic /
+    /// lognormal, exactly what `survreg`/`lifelines` fit) and the REML/LAML
+    /// outer search is vacuous. Such fits are routed to a direct, robust
+    /// parametric MLE (`fit_parametric_aft_direct_mle`) instead of the coupled
+    /// exact-joint REML optimizer, which does not converge on this tiny
+    /// unpenalized likelihood.
+    ///
+    /// Any genuinely flexible/penalized survival LS fit — smooth scale
+    /// (`noise_formula = s(...)`, log_sigma penalties), smooth mean (threshold
+    /// penalties), a link-wiggle, or an active monotone time-wiggle — has at
+    /// least one nonzero `k_*` (or a wiggle block) and so does NOT match here,
+    /// keeping the full coupled exact-joint path unchanged.
+    fn is_reduced_parametric_aft(&self) -> bool {
+        self.k_time == 0
+            && self.k_threshold == 0
+            && self.k_log_sigma == 0
+            && self.k_wiggle == 0
+            && self.family.x_link_wiggle.is_none()
+            && self.family.time_wiggle_ncols == 0
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SurvivalLambdaLayout {
     k_time: usize,
@@ -7371,6 +7403,298 @@ fn lift_conditional_covariance(
 }
 
 impl SurvivalLocationScaleFamily {
+    /// Recompute every block's linear predictor `η_b = D_b · β_b + o_b` from
+    /// the joint coefficient vector `theta` (block-concatenated) and the block
+    /// specs, returning freshly populated [`ParameterBlockState`]s.
+    ///
+    /// This mirrors the static-geometry branch of the inner solver's
+    /// `refresh_all_block_etas`: in the reduced constant-scale parametric-AFT
+    /// regime there is no link-wiggle and no monotone time-wiggle, so the
+    /// family geometry is static and `solver_design()`/`solver_offset()`
+    /// (the stacked `[entry; exit; deriv]` channels) map β to η directly. Each
+    /// block's β is passed through `post_update_block_beta` so the time-warp
+    /// monotonicity constraints are validated exactly as the coupled path does.
+    fn parametric_aft_states_from_theta(
+        &self,
+        theta: &Array1<f64>,
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Vec<ParameterBlockState>, String> {
+        let offsets = self.joint_block_offsets();
+        if theta.len() != *offsets.last().unwrap_or(&0) {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "parametric-AFT direct MLE theta length mismatch: got {}, expected {}",
+                    theta.len(),
+                    offsets.last().copied().unwrap_or(0)
+                ),
+            }
+            .into());
+        }
+        let mut states = Vec::with_capacity(specs.len());
+        for (b, spec) in specs.iter().enumerate() {
+            let beta = theta.slice(s![offsets[b]..offsets[b + 1]]).to_owned();
+            let eta = spec.solver_design().matrixvectormultiply(&beta) + spec.solver_offset();
+            states.push(ParameterBlockState { beta, eta });
+        }
+        // Validate (and, for any family that projects, project) each block's β
+        // against its constraints — the time block's monotone-derivative guard.
+        for b in 0..specs.len() {
+            let raw = states[b].beta.clone();
+            let projected = self.post_update_block_beta(&states, b, &specs[b], raw)?;
+            if projected != states[b].beta {
+                states[b].beta.assign(&projected);
+                states[b].eta = specs[b]
+                    .solver_design()
+                    .matrixvectormultiply(&states[b].beta)
+                    + specs[b].solver_offset();
+            }
+        }
+        Ok(states)
+    }
+
+    /// Direct, robust maximum-likelihood fit of the fully reduced constant-scale
+    /// parametric AFT (affine time-warp + location intercept/covariates +
+    /// constant log-σ).
+    ///
+    /// In this regime every block is UNPENALIZED — there are no smoothing
+    /// parameters and the REML/LAML outer search is vacuous — so the coupled
+    /// exact-joint REML machinery is the wrong tool (issue #736/#735/#721): it
+    /// runs an outer ρ search around an inner per-block trust-region Newton that
+    /// oscillates and never certifies stationarity on this tiny unpenalized
+    /// likelihood. Instead we run a damped, line-searched joint Newton directly
+    /// on the negative log-likelihood `−ℓ(θ)`, converging to the gradient-norm
+    /// tolerance in a handful of iterations exactly like `survreg`/`lifelines`.
+    ///
+    /// The step is `δ = H⁻¹ g` with `g = ∇ℓ` (the block-concatenated
+    /// log-likelihood gradient) and `H = −∇²ℓ` (the exact joint Hessian, all
+    /// cross-blocks included). When `H` is not positive definite at the current
+    /// iterate we add Levenberg damping `τ·I` (escalating geometrically) until
+    /// the Cholesky factorization succeeds, giving a guaranteed ascent
+    /// direction. The step length is first capped to keep the monotone
+    /// time-warp feasible (`max_feasible_step_size`) and then Armijo-backtracked
+    /// on `−ℓ`, so the time derivative stays `≥ guard` at every observed time
+    /// and `ℓ` increases monotonically.
+    ///
+    /// Returns the converged block states, the log-likelihood at the MLE, and
+    /// the joint negative-log-likelihood Hessian `H` (the observed information),
+    /// whose inverse is the conditional covariance the caller assembles.
+    fn fit_parametric_aft_direct_mle(
+        &self,
+        specs: &[ParameterBlockSpec],
+        max_iter: usize,
+        grad_tol: f64,
+    ) -> Result<(Vec<ParameterBlockState>, f64, Array2<f64>), String> {
+        use crate::faer_ndarray::FaerCholesky;
+
+        self.validate_joint_specs(
+            specs,
+            "SurvivalLocationScaleFamily direct parametric-AFT MLE",
+        )?;
+        let offsets = self.joint_block_offsets();
+        let p_total = *offsets.last().unwrap_or(&0);
+        if p_total == 0 {
+            return Err(SurvivalLocationScaleError::InvalidConfiguration {
+                reason: "direct parametric-AFT MLE has no free coefficients".to_string(),
+            }
+            .into());
+        }
+
+        // Cold-start θ from the block specs' (feasible) initial β, falling back
+        // to zeros. `parametric_aft_states_from_theta` re-validates feasibility.
+        let mut theta = Array1::<f64>::zeros(p_total);
+        for (b, spec) in specs.iter().enumerate() {
+            if let Some(beta0) = spec.initial_beta.as_ref() {
+                if beta0.len() != offsets[b + 1] - offsets[b] {
+                    return Err(SurvivalLocationScaleError::DimensionMismatch {
+                        reason: format!(
+                            "direct parametric-AFT MLE block {b} initial_beta length {} != block width {}",
+                            beta0.len(),
+                            offsets[b + 1] - offsets[b]
+                        ),
+                    }
+                    .into());
+                }
+                theta
+                    .slice_mut(s![offsets[b]..offsets[b + 1]])
+                    .assign(beta0);
+            }
+        }
+
+        let mut states = self.parametric_aft_states_from_theta(&theta, specs)?;
+        // Resync θ to any constraint projection the state builder applied.
+        for (b, state) in states.iter().enumerate() {
+            theta
+                .slice_mut(s![offsets[b]..offsets[b + 1]])
+                .assign(&state.beta);
+        }
+        let mut ll = self.log_likelihood_only(&states)?;
+        if !ll.is_finite() {
+            return Err(SurvivalLocationScaleError::NumericalFailure {
+                reason: format!(
+                    "direct parametric-AFT MLE: non-finite initial log-likelihood {ll}"
+                ),
+            }
+            .into());
+        }
+
+        // Newton iterations on −ℓ(θ).
+        for _ in 0..max_iter {
+            let (ll_now, block_gradients) =
+                self.evaluate_log_likelihood_and_block_gradients(&states)?;
+            ll = ll_now;
+            // Concatenate the block log-likelihood gradients g = ∇ℓ.
+            let mut g = Array1::<f64>::zeros(p_total);
+            if block_gradients.len() != specs.len() {
+                return Err(SurvivalLocationScaleError::DimensionMismatch {
+                    reason: format!(
+                        "direct parametric-AFT MLE gradient block count mismatch: gradients={}, specs={}",
+                        block_gradients.len(),
+                        specs.len()
+                    ),
+                }
+                .into());
+            }
+            for (b, gb) in block_gradients.iter().enumerate() {
+                if gb.len() != offsets[b + 1] - offsets[b] {
+                    return Err(SurvivalLocationScaleError::DimensionMismatch {
+                        reason: format!(
+                            "direct parametric-AFT MLE block {b} gradient length {} != block width {}",
+                            gb.len(),
+                            offsets[b + 1] - offsets[b]
+                        ),
+                    }
+                    .into());
+                }
+                g.slice_mut(s![offsets[b]..offsets[b + 1]]).assign(gb);
+            }
+            if !g.iter().all(|v| v.is_finite()) {
+                return Err(SurvivalLocationScaleError::NumericalFailure {
+                    reason: "direct parametric-AFT MLE: non-finite gradient".to_string(),
+                }
+                .into());
+            }
+            let grad_norm = g.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            if grad_norm <= grad_tol {
+                break;
+            }
+
+            // H = −∇²ℓ (positive (semi)definite near the optimum). The exact
+            // joint Hessian assembly returns it directly, symmetrized.
+            let h = self.exact_newton_joint_hessian(&states)?.ok_or_else(|| {
+                SurvivalLocationScaleError::NumericalFailure {
+                    reason: "direct parametric-AFT MLE: joint Hessian assembly failed".to_string(),
+                }
+            })?;
+            if !h.iter().all(|v| v.is_finite()) {
+                return Err(SurvivalLocationScaleError::NumericalFailure {
+                    reason: "direct parametric-AFT MLE: non-finite joint Hessian".to_string(),
+                }
+                .into());
+            }
+
+            // Newton direction δ solving H δ = g (ascent on ℓ). When H is not
+            // positive definite, escalate Levenberg damping τ·I until the
+            // Cholesky factorization succeeds, guaranteeing an ascent direction.
+            let h_scale = h
+                .diag()
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                .max(1.0);
+            let mut tau = 0.0_f64;
+            let delta = loop {
+                let mut damped = h.clone();
+                if tau > 0.0 {
+                    for i in 0..p_total {
+                        damped[[i, i]] += tau;
+                    }
+                }
+                match damped.cholesky(faer::Side::Lower) {
+                    Ok(chol) => break chol.solvevec(&g),
+                    Err(_) => {
+                        tau = if tau == 0.0 {
+                            1e-8 * h_scale
+                        } else {
+                            tau * 10.0
+                        };
+                        if tau > 1e8 * h_scale {
+                            return Err(SurvivalLocationScaleError::NumericalFailure {
+                                reason:
+                                    "direct parametric-AFT MLE: Hessian not factorizable even with maximal damping"
+                                        .to_string(),
+                            }
+                            .into());
+                        }
+                    }
+                }
+            };
+            if !delta.iter().all(|v| v.is_finite()) {
+                return Err(SurvivalLocationScaleError::NumericalFailure {
+                    reason: "direct parametric-AFT MLE: non-finite Newton step".to_string(),
+                }
+                .into());
+            }
+
+            // Cap the step to keep the monotone time-warp feasible: the family's
+            // per-block feasibility barrier reports the largest α that keeps the
+            // derivative guard satisfied (only the time block constrains it).
+            let mut alpha = 1.0_f64;
+            for (b, spec_offset) in offsets.iter().take(specs.len()).enumerate() {
+                let block_delta = delta.slice(s![*spec_offset..offsets[b + 1]]).to_owned();
+                if let Some(a_max) = self.max_feasible_step_size(&states, b, &block_delta)? {
+                    alpha = alpha.min(a_max);
+                }
+            }
+
+            // Armijo backtracking on −ℓ along the (feasibility-capped) Newton
+            // ascent direction. `g·δ > 0` because δ is an ascent direction, so a
+            // sufficient-increase condition on ℓ is well posed.
+            let directional = g.dot(&delta);
+            const ARMIJO_C: f64 = 1e-4;
+            const BACKTRACK: f64 = 0.5;
+            const MIN_ALPHA: f64 = 1e-12;
+            let mut accepted: Option<(Array1<f64>, Vec<ParameterBlockState>, f64)> = None;
+            while alpha >= MIN_ALPHA {
+                let trial_theta = &theta + &(alpha * &delta);
+                if let Ok(cand_states) = self.parametric_aft_states_from_theta(&trial_theta, specs)
+                    && let Ok(cand_ll) = self.log_likelihood_only(&cand_states)
+                    && cand_ll.is_finite()
+                    && cand_ll >= ll + ARMIJO_C * alpha * directional
+                {
+                    accepted = Some((trial_theta, cand_states, cand_ll));
+                    break;
+                }
+                alpha *= BACKTRACK;
+            }
+            match accepted {
+                Some((new_theta, new_states, new_ll)) => {
+                    theta = new_theta;
+                    states = new_states;
+                    ll = new_ll;
+                }
+                // No further increase achievable along this direction: the
+                // current iterate is (numerically) stationary. Stop here.
+                None => break,
+            }
+        }
+
+        // Observed information at the MLE: the joint negative-log-likelihood
+        // Hessian. This is the conditional precision; its inverse is the
+        // covariance the caller lifts to the raw coordinate system.
+        let h_final = self.exact_newton_joint_hessian(&states)?.ok_or_else(|| {
+            SurvivalLocationScaleError::NumericalFailure {
+                reason: "direct parametric-AFT MLE: final joint Hessian assembly failed"
+                    .to_string(),
+            }
+        })?;
+        if !h_final.iter().all(|v| v.is_finite()) {
+            return Err(SurvivalLocationScaleError::NumericalFailure {
+                reason: "direct parametric-AFT MLE: non-finite final joint Hessian".to_string(),
+            }
+            .into());
+        }
+        Ok((states, ll, h_final))
+    }
+
     /// Block-diagonal-only assembly: returns the four (or three, when no
     /// link-wiggle is configured) principal diagonal blocks of the joint
     /// Hessian without ever materializing the cross blocks. Used by
@@ -10241,6 +10565,108 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
     }
 }
 
+/// Run the direct parametric-AFT MLE for a fully reduced constant-scale model
+/// and assemble the same [`UnifiedFitResult`] the coupled path would produce.
+///
+/// Every block is unpenalized (zero ρ), so `log_lambdas`/`lambdas` are empty,
+/// the stable penalty term is zero, and the penalized objective is just `−ℓ̂`.
+/// The conditional covariance is the inverse of the observed information `H`
+/// (the joint negative-log-likelihood Hessian at the MLE), and the geometry's
+/// penalized Hessian is `H` itself — matching the exact-Newton joint geometry
+/// the coupled survival path stores (`working_weights`/`working_response` are
+/// the zero-length convention used by exact-Newton joint families). The shared
+/// [`crate::custom_family::blockwise_fit_from_parts`] assembler then computes
+/// EDF (= parameter count, since unpenalized) and the inference block exactly
+/// as for any custom-family fit.
+fn fit_reduced_parametric_aft(
+    prepared: &PreparedSurvivalLocationScaleModel,
+    options: &BlockwiseFitOptions,
+) -> Result<UnifiedFitResult, String> {
+    use crate::faer_ndarray::FaerCholesky;
+
+    let specs = &prepared.blockspecs;
+    let (states, log_likelihood, h) = prepared.family.fit_parametric_aft_direct_mle(
+        specs,
+        options.inner_max_cycles.max(1),
+        options.inner_tol.max(1e-8),
+    )?;
+
+    let p_total = h.nrows();
+    // Conditional covariance Var(θ | λ) = H⁻¹ in the reduced coordinate system.
+    // `finalize_survival_location_scale_fit` lifts it back to the raw block
+    // coordinates (time null-space expansion + leading-fixed-column padding).
+    let identity = Array2::<f64>::eye(p_total);
+    let covariance_conditional = match h.cholesky(faer::Side::Lower) {
+        Ok(chol) => {
+            let cov = chol.solve_mat(&identity);
+            if cov.iter().all(|v| v.is_finite()) {
+                // Symmetrize away round-off so the lifted covariance is exactly
+                // symmetric, as the conditional covariance must be.
+                let mut symm = cov.clone();
+                for i in 0..p_total {
+                    for j in (i + 1)..p_total {
+                        let avg = 0.5 * (cov[[i, j]] + cov[[j, i]]);
+                        symm[[i, j]] = avg;
+                        symm[[j, i]] = avg;
+                    }
+                }
+                Some(symm)
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+
+    let geometry = Some(FitGeometry {
+        penalized_hessian: h.into(),
+        working_weights: Array1::<f64>::zeros(0),
+        working_response: Array1::<f64>::zeros(0),
+    });
+
+    // The block states carry their η in the family's native row layout — the
+    // stacked `[exit; entry; deriv]` channels (`solver_design().nrows()` rows)
+    // for the time block, exactly as `refresh_all_block_etas` produces and as
+    // the family's `validate_joint_states` / `offset_channel_geometry` require.
+    // `blockwise_fit_from_parts` validates each block's `η.len()` against
+    // `spec.design.nrows()`, so present it the row-matching `solver_design()`
+    // as `design` (same coefficients, penalties, name, role — only the row
+    // count differs). All other fields are unchanged, so the assembled result
+    // is identical to the coupled path's.
+    let assembly_specs: Vec<ParameterBlockSpec> = specs
+        .iter()
+        .map(|spec| {
+            let mut s = spec.clone();
+            s.design = spec.solver_design().clone();
+            s.offset = spec.solver_offset().clone();
+            s.stacked_design = None;
+            s.stacked_offset = None;
+            s
+        })
+        .collect();
+
+    crate::custom_family::blockwise_fit_from_parts(
+        crate::custom_family::BlockwiseFitResultParts {
+            block_states: states,
+            log_likelihood,
+            log_lambdas: Array1::<f64>::zeros(0),
+            lambdas: Array1::<f64>::zeros(0),
+            covariance_conditional,
+            stable_penalty_term: 0.0,
+            // No penalties and no smoothing parameters: the reported objective
+            // is the plain negative log-likelihood at the MLE.
+            penalized_objective: -log_likelihood,
+            outer_iterations: 0,
+            outer_gradient_norm: Some(0.0),
+            inner_cycles: 0,
+            outer_converged: true,
+            geometry,
+            precomputed_edf: None,
+        },
+        &assembly_specs,
+    )
+}
+
 /// Variant that also returns the offset-channel residuals + curvatures at the
 /// converged β̂. We have to extract these *before* `finalize_survival_location_scale_fit`
 /// runs, because the location-scale finalizer empties `UnifiedFitResult::block_states`
@@ -10257,7 +10683,21 @@ fn fit_survival_location_scale_with_geometry(
 > {
     let prepared = prepare_survival_location_scale_model(&spec)?;
     let options = survival_blockwise_fit_options(&spec);
-    let fit = fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?;
+    // Fully reduced constant-scale PARAMETRIC AFT regime (issue #736/#735/#721):
+    // every block is parametric and unpenalized, so REML/LAML smoothing
+    // selection is vacuous and the coupled exact-joint REML optimizer is the
+    // wrong tool — it oscillates and never certifies stationarity on this tiny
+    // unpenalized likelihood. Route directly to a damped, line-searched joint
+    // Newton MLE (converges in a handful of iterations like survreg/lifelines),
+    // then assemble the identical `UnifiedFitResult` so finalize / predict /
+    // CRPS / the `offset_channel_geometry` consumer all work unchanged. Any
+    // genuinely flexible or penalized survival LS fit keeps the full coupled
+    // path below.
+    let fit = if prepared.is_reduced_parametric_aft() {
+        fit_reduced_parametric_aft(&prepared, &options)?
+    } else {
+        fit_custom_family(&prepared.family, &prepared.blockspecs, &options)?
+    };
     // Defensive: `fit_custom_family`'s degraded-plan path (after an ARC
     // deterministic-replay stall) can return a fit whose `block_states`
     // were cleared. `offset_channel_geometry` already tolerates this case
