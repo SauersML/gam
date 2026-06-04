@@ -1096,6 +1096,86 @@ pub fn build_survival_time_basis(
         }
     }
 
+    /// Cap the requested monotone-baseline internal-knot count to what the
+    /// observed time resolution can actually support.
+    ///
+    /// The survival location-scale baseline is a degree-`d` I-spline with
+    /// `num_internal_knots + d` shape-varying columns. Its smoothing parameter
+    /// is informed *only* by the distinct interior log-time points: with fewer
+    /// distinct interior times than requested knots the baseline is
+    /// rank-deficient, and the REML/LAML profile in the time smoothing
+    /// parameter becomes a flat ridge — the exact-joint outer search then
+    /// probes that ridge indefinitely (each inner constrained Newton burns its
+    /// whole cycle budget without certifying convergence) and the fit never
+    /// terminates. This is the survival analogue of the standard
+    /// "df must not exceed the data resolution" guard (`mgcv` caps `k` at the
+    /// number of unique covariate values; `flexsurv`/`rstpm2` use a handful of
+    /// baseline knots): we never place more interior knots than there are
+    /// distinct interior points, and we keep the total baseline dimension a
+    /// bounded fraction of the sample so the smoothing profile stays curved.
+    ///
+    /// This clamp lives in the shared knot-inference routine so the fit and any
+    /// independent rebuild of the time basis (e.g. a predictor reconstructing
+    /// `design · β` at fresh covariates) resolve to the *same* knot vector from
+    /// the same data — there is no raw/active dimension drift.
+    fn data_capped_internal_knots(
+        combined: &Array1<f64>,
+        degree: usize,
+        requested_internal_knots: usize,
+    ) -> usize {
+        if requested_internal_knots == 0 {
+            return 0;
+        }
+        let mut sorted: Vec<f64> = combined.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        let minval = sorted.first().copied().unwrap_or(0.0);
+        let maxval = sorted.last().copied().unwrap_or(minval);
+        if minval == maxval {
+            // Degenerate (single distinct time): no interior structure to fit.
+            return 1.min(requested_internal_knots);
+        }
+        let scale = (maxval - minval).abs().max(1.0);
+        let tol = 1e-12 * scale;
+        // Count distinct strictly-interior points (knots can only live strictly
+        // between the data extremes).
+        let mut distinct_interior = 0usize;
+        let mut last: Option<f64> = None;
+        for &x in &sorted {
+            if x <= minval + tol || x >= maxval - tol {
+                continue;
+            }
+            if last.is_some_and(|prev| (x - prev).abs() <= tol) {
+                continue;
+            }
+            distinct_interior += 1;
+            last = Some(x);
+        }
+        // Distinct-point ceiling: cannot place more interior knots than there
+        // are distinct interior values.
+        let mut cap = requested_internal_knots.min(distinct_interior.max(1));
+        // Dimension-vs-resolution ceiling: keep the total baseline column count
+        // `cap + degree` below ~1/4 of the distinct sample points so the
+        // smoothing-parameter profile retains curvature (the data must be able
+        // to identify the baseline shape, not just interpolate it). `n_distinct`
+        // counts all distinct points (interior + the two extremes).
+        let n_distinct = {
+            let mut count = 0usize;
+            let mut last: Option<f64> = None;
+            for &x in &sorted {
+                if last.is_some_and(|prev| (x - prev).abs() <= tol) {
+                    continue;
+                }
+                count += 1;
+                last = Some(x);
+            }
+            count
+        };
+        let dim_budget = n_distinct / 4;
+        let dim_cap = dim_budget.saturating_sub(degree);
+        cap = cap.min(dim_cap.max(1));
+        cap.max(1)
+    }
+
     fn infer_survival_time_knots(
         combined: &Array1<f64>,
         knot_degree: usize,
@@ -1103,6 +1183,14 @@ pub fn build_survival_time_basis(
         num_internal_knots: usize,
         basis_options: BasisOptions,
     ) -> Result<Array1<f64>, String> {
+        // Identifiability/termination guard: never request more baseline
+        // internal knots than the observed time resolution supports. See
+        // `data_capped_internal_knots` for the full rationale (a flat smoothing
+        // ridge on an over-parameterized baseline is what makes the survival
+        // location-scale exact-joint outer search fail to terminate).
+        let num_internal_knots =
+            data_capped_internal_knots(combined, validation_degree, num_internal_knots);
+
         fn quantile_knot_inference_needs_uniform_fallback(
             combined: &Array1<f64>,
             num_internal_knots: usize,
