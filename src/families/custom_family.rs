@@ -14286,6 +14286,44 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_bundle,
                     );
                     let rhs_step = &grad_joint - &penalty_beta_joint;
+                    // Self-vanishing Levenberg–Marquardt damping for the
+                    // CONSTRAINED active-set QP, mirroring the spectral-range
+                    // branch below (μ = JOINT_SPECTRAL_LEVENBERG_FACTOR·‖rhs‖∞).
+                    //
+                    // When the joint design carries inequality constraints
+                    // (the monotone I-spline time-warp of a survival
+                    // location-scale / AFT fit) the spectral range step that
+                    // drops ker(H_pen) is NOT taken — this dense active-set QP
+                    // runs instead. On a constant-scale AFT the 12-col monotone
+                    // time-warp's non-affine deviation is statistically
+                    // UNIDENTIFIED, so H_pen is rank-deficient along that gauge
+                    // direction. An undamped QP then has a continuum of optima
+                    // differing only by the free gauge component, and the
+                    // active set slides along the monotone constraint face
+                    // taking an O(1) proposal step in that direction every
+                    // cycle. The proposal `step_inf` never exhausts, so the
+                    // identified-subspace KKT certificate (gated on
+                    // `step_inf ≤ step_tol`) never fires and the inner
+                    // joint-Newton grinds the full `inner_max_cycles` on EVERY
+                    // outer ρ-eval — the survival-LS AFT "hang" (#736/#735/#721).
+                    //
+                    // Adding μ·I to the QP Hessian gives ker(H_pen) a tiny
+                    // positive curvature, so the constrained minimizer is unique
+                    // and its gauge component is driven toward zero; the proposal
+                    // step then exhausts at the identified-subspace optimum and
+                    // the certificate fires in a handful of cycles. Because
+                    // μ ∝ ‖∇L − Sβ‖∞ → 0 at the KKT fixed point, the converged β
+                    // and the well-identified flexible-scale fast path (where the
+                    // time-warp IS identified and H_pen is non-singular) are
+                    // unchanged — a genuinely flexible survival-LS fit still
+                    // performs its full search.
+                    let rhs_inf = rhs_step.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                    let constrained_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
+                    if constrained_levenberg_mu > 0.0 && constrained_levenberg_mu.is_finite() {
+                        for d in 0..lhs.nrows() {
+                            lhs[[d, d]] += constrained_levenberg_mu;
+                        }
+                    }
                     let rhs_beta = &lhs.dot(&beta_joint) + &rhs_step;
                     let solve_result = if let Some(bounds) = lower_bounds.as_ref() {
                         solve_quadratic_with_simple_lower_bounds(
