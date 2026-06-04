@@ -8435,7 +8435,7 @@ impl SurvivalLocationScaleFamily {
 
             let h_hw = mxtwx(&self.x_time_entry, &(-&q.h_time_h0), xw_entry, row_mask)?
                 + mxtwx(&self.x_time_exit, &(-&q.h_time_h1), xw_exit, row_mask)?
-                + mxtwx(&self.x_time_deriv, &(-&q.h_time_d), xw_qdot, row_mask)?;
+                + mxtwx(&self.x_time_deriv, &q.h_time_d, xw_qdot, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &h_hw);
         }
 
