@@ -7735,11 +7735,8 @@ mod tests {
             panic!("expected Duchon smooth");
         };
         assert_eq!(spec.length_scale, None);
-        assert!(matches!(
-            spec.nullspace_order,
-            DuchonNullspaceOrder::Degree(2)
-        ));
-        assert_eq!(spec.power, 0.0);
+        assert!(matches!(spec.nullspace_order, DuchonNullspaceOrder::Linear));
+        assert_eq!(spec.power, 0.5);
     }
 
     #[test]
@@ -7758,8 +7755,8 @@ mod tests {
             panic!("expected Duchon smooth");
         };
         assert_eq!(spec.length_scale, Some(1.0));
-        assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Zero);
-        assert_eq!(spec.power, 2.0);
+        assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Linear);
+        assert_eq!(spec.power, 0.5);
     }
 
     #[test]
