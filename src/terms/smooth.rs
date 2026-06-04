@@ -32,7 +32,7 @@ use crate::estimate::{
     UnifiedFitResult, UnifiedFitResultParts, fit_gamwith_heuristic_lambdas,
     reml::DirectionalHyperParam,
 };
-use crate::faer_ndarray::{fast_ab, fast_atb, fast_atv};
+use crate::faer_ndarray::{FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_atb, fast_atv};
 use crate::families::strategy::{FamilyStrategy, strategy_for_spec};
 use crate::matrix::{
     BlockDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignBlock,
@@ -8398,6 +8398,95 @@ fn design_frobenius_norm(design: &DesignMatrix) -> Result<f64, BasisError> {
     Ok(sumsq.sqrt())
 }
 
+fn design_gram(design: &DesignMatrix) -> Result<Array2<f64>, BasisError> {
+    let n = design.nrows();
+    let p = design.ncols();
+    let mut gram = Array2::<f64>::zeros((p, p));
+    const CHUNK: usize = 1024;
+    for start in (0..n).step_by(CHUNK) {
+        let end = (start + CHUNK).min(n);
+        let chunk = design
+            .try_row_chunk(start..end)
+            .map_err(|e| BasisError::InvalidInput(e.to_string()))?;
+        gram += &fast_atb(&chunk, &chunk);
+    }
+    Ok((&gram + &gram.t()) * 0.5)
+}
+
+fn realized_rank_reduction_from_gram(
+    gram: &Array2<f64>,
+    termname: &str,
+) -> Result<Option<Array2<f64>>, BasisError> {
+    let p = gram.nrows();
+    if gram.ncols() != p {
+        crate::bail_dim_basis!(
+            "Matérn realized-rank check for term '{termname}' expected a square Gram, got {}x{}",
+            gram.nrows(),
+            gram.ncols()
+        );
+    }
+    if p == 0 {
+        return Ok(None);
+    }
+    let (evals, evecs) =
+        FaerEigh::eigh(gram, faer::Side::Lower).map_err(BasisError::LinalgError)?;
+    let max_eval = evals.iter().copied().fold(0.0_f64, f64::max);
+    if !max_eval.is_finite() || max_eval <= 0.0 {
+        crate::bail_invalid_basis!(
+            "Matérn term '{termname}' has zero realized rank on the training rows; \
+             the requested centers/length_scale emit no identifiable basis direction"
+        );
+    }
+    let tol = default_rrqr_rank_alpha() * f64::EPSILON * (gram.nrows().max(1) as f64) * max_eval;
+    let keep = evals.iter().filter(|&&value| value > tol).count();
+    if keep == p {
+        return Ok(None);
+    }
+    if keep == 0 {
+        crate::bail_invalid_basis!(
+            "Matérn term '{termname}' has zero realized rank on the training rows; \
+             reduce centers or change length_scale"
+        );
+    }
+    let mut reduction = Array2::<f64>::zeros((p, keep));
+    let mut out_col = 0usize;
+    for col in 0..p {
+        if evals[col] > tol {
+            reduction.column_mut(out_col).assign(&evecs.column(col));
+            out_col += 1;
+        }
+    }
+    log::info!(
+        "[Matérn rank reduction] term='{termname}' realized design rank {keep}/{p}; \
+         redundant center-derived columns removed before identifiability audit"
+    );
+    Ok(Some(reduction))
+}
+
+fn smooth_needs_realized_rank_reduction(termspec: &SmoothTermSpec) -> bool {
+    match &termspec.basis {
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            smooth_needs_realized_rank_reduction(&SmoothTermSpec {
+                name: termspec.name.clone(),
+                basis: (**inner).clone(),
+                shape: termspec.shape,
+                joint_null_rotation: None,
+            })
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            smooth_needs_realized_rank_reduction(&SmoothTermSpec {
+                name: termspec.name.clone(),
+                basis: (**smooth).clone(),
+                shape: termspec.shape,
+                joint_null_rotation: None,
+            })
+        }
+        SmoothBasisSpec::Matern { .. } => true,
+        _ => false,
+    }
+}
+
 fn maybe_smooth_identifiability_transform(
     termspec: &SmoothTermSpec,
     design_local: &DesignMatrix,
@@ -8416,18 +8505,32 @@ fn maybe_smooth_identifiability_transform(
         return Ok(Some(transform.clone()));
     }
 
-    let Some(c) = constraint_block else {
-        return Ok(None);
+    let base_transform = if let Some(c) = constraint_block {
+        if c.ncols() == 0 {
+            None
+        } else {
+            Some(orthogonality_transform_for_design(
+                design_local,
+                c,
+                None, // fixed subspace: do not use iteration-varying PIRLS weights
+            )?)
+        }
+    } else {
+        None
     };
-    if c.ncols() == 0 {
-        return Ok(None);
+
+    if !smooth_needs_realized_rank_reduction(termspec) {
+        return Ok(base_transform);
     }
-    let z = orthogonality_transform_for_design(
-        design_local,
-        c,
-        None, // fixed subspace: do not use iteration-varying PIRLS weights
-    )?;
-    Ok(Some(z))
+
+    let reduced_design = if let Some(z) = base_transform.as_ref() {
+        apply_smooth_transform_to_design(design_local.clone(), z, &termspec.name)?
+    } else {
+        design_local.clone()
+    };
+    let rank_transform =
+        realized_rank_reduction_from_gram(&design_gram(&reduced_design)?, &termspec.name)?;
+    compose_identifiability_transforms(base_transform.as_ref(), rank_transform.as_ref())
 }
 
 fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialIdentifiability> {
