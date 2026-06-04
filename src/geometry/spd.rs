@@ -619,7 +619,13 @@ mod frechet_mean_tests {
     fn spd_frechet_mean_converges_below_sqrt_eps_on_spread_non_commuting() {
         let n = 2;
         let angles = [0.0_f64, 0.6, 1.2, 1.9, 2.7];
-        let eig = [(12.0_f64, 0.4_f64), (0.5, 9.0), (3.0, 0.2), (0.3, 6.0), (5.0, 0.7)];
+        let eig = [
+            (12.0_f64, 0.4_f64),
+            (0.5, 9.0),
+            (3.0, 0.2),
+            (0.3, 6.0),
+            (5.0, 0.7),
+        ];
         let mut rows: Vec<Array1<f64>> = Vec::new();
         for (&th, &(a, b)) in angles.iter().zip(&eig) {
             let (c, s) = (th.cos(), th.sin());
