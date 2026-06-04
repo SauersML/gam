@@ -3110,6 +3110,7 @@ impl BernoulliMarginalSlopeFamily {
             row_primary_hessians: RowPrimaryEvalCache::Empty,
             rigid_third_full: crate::resource::RayonSafeOnce::new(),
             rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+            flex_axis_tensors: crate::resource::RayonSafeOnce::new(),
         })
     }
 
@@ -5305,6 +5306,132 @@ impl BernoulliMarginalSlopeFamily {
         )
     }
 
+    /// Decompose an outer ψ-axis direction into `(axis, scalar)` when it is
+    /// *single-axis* in primary space — nonzero only at `primary.q` (axis `0`,
+    /// "q") or `primary.logslope` (axis `1`, "g"). This is the universal shape
+    /// of the directions every outer-derivative consumer builds (a ψ-row dotted
+    /// into one block's β, deposited at that block's primary slot). Returns
+    /// `None` for the all-zero vector and for any genuinely multi-axis
+    /// direction (e.g. finite-difference probes), which take the slow
+    /// cell-walk path unchanged. Backs the gam#683 fast path.
+    #[inline]
+    fn single_primary_axis(dir: &Array1<f64>, primary: &PrimarySlices) -> Option<(usize, f64)> {
+        let mut found: Option<(usize, f64)> = None;
+        for (idx, &value) in dir.iter().enumerate() {
+            if value == 0.0 {
+                continue;
+            }
+            let axis = if idx == primary.q {
+                0usize
+            } else if idx == primary.logslope {
+                1usize
+            } else {
+                return None;
+            };
+            if found.is_some() {
+                return None;
+            }
+            found = Some((axis, value));
+        }
+        found
+    }
+
+    /// Lazily build (once per β-cache) the per-row axis-projected third/fourth
+    /// tensors backing the FLEX outer-derivative fast paths (gam#683), and
+    /// return the requested row's tensors. `None` on the rigid path (rigid rows
+    /// use `rigid_{third,fourth}_full`).
+    ///
+    /// Each row's tensors are produced by the *slow* cell-walk workers
+    /// (`row_primary_third_contracted_recompute_with_moments` and
+    /// `row_primary_fourth_contracted_recompute_ordered`) evaluated at the two
+    /// primary-axis basis vectors `e_q`, `e_g` — so the cached values are the
+    /// very contractions the per-pair path used to recompute, just computed
+    /// once and reused across every ψ-axis pair. The fourth tensor is
+    /// symmetrized exactly as `row_primary_fourth_contracted_recompute` does
+    /// (`½(ordered + swapped)`).
+    ///
+    /// `RayonSafeOnce::get_or_compute` runs the (nested-`into_par_iter`) build
+    /// without holding a lock, which is what keeps this safe to first-touch
+    /// from inside an outer Rayon row fold — identical pattern to
+    /// `rigid_fourth_full_cached`.
+    pub(super) fn flex_axis_tensors_for_row<'a>(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &'a BernoulliMarginalSlopeExactEvalCache,
+        row: usize,
+    ) -> Result<Option<&'a FlexAxisRowTensors>, String> {
+        if !self.effective_flex_active(block_states)? {
+            return Ok(None);
+        }
+        let stored = cache.flex_axis_tensors.get_or_compute(|| {
+            let r = cache.primary.total;
+            let mut e_q = Array1::<f64>::zeros(r);
+            e_q[cache.primary.q] = 1.0;
+            let mut e_g = Array1::<f64>::zeros(r);
+            e_g[cache.primary.logslope] = 1.0;
+            (0..self.y.len())
+                .into_par_iter()
+                .map(|build_row| {
+                    let row_ctx = Self::row_ctx(cache, build_row);
+                    let t3_q = self.row_primary_third_contracted_recompute_with_moments(
+                        build_row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &e_q,
+                    )?;
+                    let t3_g = self.row_primary_third_contracted_recompute_with_moments(
+                        build_row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &e_g,
+                    )?;
+                    let t4_qq = self.row_primary_fourth_contracted_recompute_ordered(
+                        build_row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &e_q,
+                        &e_q,
+                    )?;
+                    let t4_gg = self.row_primary_fourth_contracted_recompute_ordered(
+                        build_row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &e_g,
+                        &e_g,
+                    )?;
+                    let t4_qg_ordered = self.row_primary_fourth_contracted_recompute_ordered(
+                        build_row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &e_q,
+                        &e_g,
+                    )?;
+                    let t4_qg_swapped = self.row_primary_fourth_contracted_recompute_ordered(
+                        build_row,
+                        block_states,
+                        cache,
+                        row_ctx,
+                        &e_g,
+                        &e_q,
+                    )?;
+                    let mut t4_qg = t4_qg_ordered;
+                    t4_qg.zip_mut_with(&t4_qg_swapped, |a, &b| *a = 0.5 * (*a + b));
+                    Ok(FlexAxisRowTensors {
+                        third: [t3_q, t3_g],
+                        fourth: [[t4_qq, t4_qg.clone()], [t4_qg, t4_gg]],
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()
+        });
+        let table = stored.as_ref().map_err(|err| err.clone())?;
+        Ok(Some(&table[row]))
+    }
+
     /// Third-derivative tensor contracted with direction `dir`:
     ///   out[k,l] = sum_m f_{klm} dir[m]
     /// Rigid path uses the closed-form kernel. The flexible de-nested
@@ -5322,6 +5449,17 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        // FLEX fast path (gam#683): outer-derivative consumers pass single-axis
+        // directions, so reuse the per-row axis-projected tensor cache instead
+        // of re-walking every cubic partition cell on every (ρ-axis, row).
+        // Equal to the slow path by linearity: third_contracted(s·e_a) = s·T3[a].
+        if let Some((axis, scalar)) = Self::single_primary_axis(dir, &cache.primary) {
+            if let Some(tensors) = self.flex_axis_tensors_for_row(block_states, cache, row)? {
+                let mut out = tensors.third[axis].clone();
+                out.mapv_inplace(|value| value * scalar);
+                return Ok(out);
+            }
+        }
         self.row_primary_third_contracted_recompute_with_moments(
             row,
             block_states,
@@ -8481,6 +8619,20 @@ impl BernoulliMarginalSlopeFamily {
         dir_u: &Array1<f64>,
         dir_v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
+        // FLEX fast path (gam#683): both directions single-axis → a scalar
+        // scale of the cached symmetric axis-projected fourth tensor, by
+        // bilinearity: fourth_contracted(s_u·e_a, s_v·e_b) = s_u·s_v·T4[a][b].
+        if let (Some((a, s_u)), Some((b, s_v))) = (
+            Self::single_primary_axis(dir_u, &cache.primary),
+            Self::single_primary_axis(dir_v, &cache.primary),
+        ) {
+            if let Some(tensors) = self.flex_axis_tensors_for_row(block_states, cache, row)? {
+                let scale = s_u * s_v;
+                let mut out = tensors.fourth[a][b].clone();
+                out.mapv_inplace(|value| value * scale);
+                return Ok(out);
+            }
+        }
         let ordered = self.row_primary_fourth_contracted_recompute_ordered(
             row,
             block_states,

@@ -256,6 +256,31 @@ impl RowPrimaryEvalCache {
     }
 }
 
+/// Per-row axis-projected FLEX third/fourth-derivative tensors backing the
+/// outer-derivative fast path (gam#683). Every outer-derivative consumer
+/// (gradient, Hessian, HVP, diagonal, ψ-second-order) contracts the per-row
+/// third/fourth tensors against ψ-axis directions that are *single-axis* in
+/// primary space — nonzero only at `primary.q` (block 0, "q") or
+/// `primary.logslope` (block 1, "g"). By the (bi)linearity of the contraction,
+///
+/// ```text
+///   third_contracted(s·e_a)              = s·T3[a]
+///   fourth_contracted(s_u·e_a, s_v·e_b)  = s_u·s_v·T4[a][b]
+/// ```
+///
+/// so caching `T3[a]` for `a ∈ {q, g}` and the symmetric `T4[a][b]` once per
+/// β-cache turns each `(ρ-axis i, ρ-axis j)` pair into a scalar×matrix scale of
+/// a precomputed tensor instead of re-walking every cubic partition cell. All
+/// matrices are `r×r` with `r = primary.total`.
+pub(super) struct FlexAxisRowTensors {
+    /// Third-derivative tensor contracted with the q-axis basis vector
+    /// (`third[0]`) and the logslope-axis basis vector (`third[1]`).
+    pub(super) third: [Array2<f64>; 2],
+    /// Symmetric fourth-derivative tensor contracted with `(e_a, e_b)` for
+    /// `a, b ∈ {q (0), g (1)}`; `fourth[a][b] == fourth[b][a]`.
+    pub(super) fourth: [[Array2<f64>; 2]; 2],
+}
+
 /// Shared precomputed state plus pre-solved per-row contexts. All row
 /// intercepts are solved once during cache construction so that workspace
 /// calls (matvec, diagonal, psi, directional derivatives) never redundantly
@@ -316,4 +341,13 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// bilinear instead of a fresh 8-direction empirical jet.
     pub(super) rigid_fourth_full:
         crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+
+    /// Flexible-path per-row axis-projected third/fourth-derivative tensors,
+    /// lazily built once per β-cache and reused across all `(ρ-axis i, j)`
+    /// pairs. See [`FlexAxisRowTensors`] for the contraction algebra. Indexed
+    /// by global row. Only consulted on the FLEX path — rigid rows keep their
+    /// own `rigid_{third,fourth}_full` caches. The build is fallible and
+    /// sticky (same propagation contract as `rigid_third_full`).
+    pub(super) flex_axis_tensors:
+        crate::resource::RayonSafeOnce<Result<Vec<FlexAxisRowTensors>, String>>,
 }
