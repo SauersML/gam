@@ -39,30 +39,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaStream};
 
-/// Try to dispatch the substrate through the GPU.
-///
-/// On Linux+CUDA with a usable runtime this returns `Ok(Some(_))` after
-/// launching the NonAffineFinite kernel and CPU-evaluating the affine
-/// buckets. Returns `Ok(None)` when no GPU runtime is available (caller
-/// should fall back to the host substrate). Returns `Err` on a genuine
-/// driver / NVRTC / shape failure that the caller must surface.
-#[cfg(target_os = "linux")]
-pub(crate) fn try_device_moments(
-    view: &CubicCellDerivativeMomentHostView<'_>,
-) -> Result<Option<HostMomentBatch>, GpuError> {
-    let backend = match CubicCellGpuBackend::probe() {
-        Ok(b) => b,
-        Err(GpuError::DriverLibraryUnavailable { .. }) => return Ok(None),
-        Err(other) => return Err(other),
-    };
-    backend.dispatch(view).map(Some)
-}
-
 /// Linux-only: launch the same Stage-1 dispatcher but return the moments
 /// buffer in device memory (`CudaSlice<f64>`) instead of downloading to host.
 /// Caller may pass the returned slice directly to any kernel launch on the
 /// same default stream (e.g. `bms_flex_row_kernel`). Returns `Ok(None)` if no
-/// CUDA runtime is available, just like [`try_device_moments`].
+/// CUDA runtime is available.
 #[cfg(target_os = "linux")]
 pub(crate) fn try_device_moments_resident(
     view: &CubicCellDerivativeMomentHostView<'_>,
@@ -78,7 +59,7 @@ pub(crate) fn try_device_moments_resident(
 /// Process-wide cubic-cell GPU backend. Mirrors the
 /// `BmsFlexGpuBackend` / `SurvivalFlexGpuBackend` shape so future
 /// device-residency residencies can swap in without churn. Linux-only:
-/// non-Linux builds skip [`try_device_moments`] at the call site
+/// non-Linux builds skip [`try_device_moments_resident`] at the call site
 /// (`super::try_build_cubic_cell_derivative_moments`) via
 /// `#[cfg(target_os = "linux")]`, so this backend is never referenced.
 #[cfg(target_os = "linux")]
@@ -646,89 +627,6 @@ mod tests {
                 c3: -0.07,
             },
         ]
-    }
-
-    /// V100-only: end-to-end CPU↔GPU parity on a NonAffineFinite batch.
-    /// Skipped on hosts without a usable CUDA runtime so this still passes
-    /// on the Mac builder.
-    #[test]
-    fn cubic_cell_gpu_nonaffine_matches_cpu_within_tol() {
-        let Some(runtime) = GpuRuntime::global() else {
-            eprintln!(
-                "[cubic_cell_gpu test] no CUDA runtime — skipping NonAffineFinite parity test"
-            );
-            return;
-        };
-        eprintln!(
-            "[cubic_cell_gpu test] runtime selected device ordinal={}",
-            runtime.selected_device().ordinal
-        );
-
-        let cells = make_nonaffine_cells();
-        let branches = vec![GpuCellBranchTag::NonAffineFinite; cells.len()];
-        let max_degree = 9;
-        let view = CubicCellDerivativeMomentHostView {
-            cells: &cells,
-            branches: &branches,
-            max_degree,
-            residency: CubicCellMomentResidency::Host,
-        };
-
-        // GPU path.
-        let gpu_batch = try_device_moments(&view)
-            .expect("device dispatch must succeed on a host with CUDA")
-            .expect("Some(_) from device dispatch when GPU is present");
-
-        // CPU parity reference.
-        let cpu_batch = crate::gpu::cubic_cell::host_substrate::build_host_moments(&view)
-            .expect("host substrate produces parity reference");
-
-        assert_eq!(gpu_batch.stride, cpu_batch.stride);
-        assert_eq!(gpu_batch.status, cpu_batch.status);
-        let stride = gpu_batch.stride;
-        for cell_idx in 0..cells.len() {
-            assert_eq!(
-                gpu_batch.status[cell_idx],
-                CubicCellMomentStatus::Ok as u8,
-                "cell {cell_idx} must classify Ok"
-            );
-            let gpu_row = &gpu_batch.moments[cell_idx * stride..(cell_idx + 1) * stride];
-            let cpu_row = &cpu_batch.moments[cell_idx * stride..(cell_idx + 1) * stride];
-            for (k, (&got, &want)) in gpu_row.iter().zip(cpu_row.iter()).enumerate() {
-                let denom = want.abs().max(1.0);
-                let rel = (got - want).abs() / denom;
-                assert!(
-                    rel <= 1e-8,
-                    "cell={cell_idx} k={k} gpu={got:.17e} cpu={want:.17e} rel={rel:.3e}"
-                );
-            }
-        }
-    }
-
-    /// Static (no-device) smoke test: when no CUDA runtime is present
-    /// `try_device_moments` must return `Ok(None)` so the caller knows to
-    /// fall back to the host substrate.
-    #[test]
-    fn cubic_cell_gpu_returns_none_when_runtime_absent() {
-        if GpuRuntime::global().is_some() {
-            eprintln!(
-                "[cubic_cell_gpu test] CUDA runtime present — skipping the absent-runtime case"
-            );
-            return;
-        }
-        let cells = make_nonaffine_cells();
-        let branches = vec![GpuCellBranchTag::NonAffineFinite; cells.len()];
-        let view = CubicCellDerivativeMomentHostView {
-            cells: &cells,
-            branches: &branches,
-            max_degree: 9,
-            residency: CubicCellMomentResidency::Host,
-        };
-        let out = try_device_moments(&view).expect("clean Ok on hosts without CUDA");
-        assert!(
-            out.is_none(),
-            "expected Ok(None) on a host without a usable CUDA runtime"
-        );
     }
 
     /// Phase 4 parity test: device-resident moments must match the CPU
