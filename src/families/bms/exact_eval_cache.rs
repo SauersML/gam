@@ -343,11 +343,17 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
         crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 
     /// Flexible-path per-row axis-projected third/fourth-derivative tensors,
-    /// lazily built once per β-cache and reused across all `(ρ-axis i, j)`
-    /// pairs. See [`FlexAxisRowTensors`] for the contraction algebra. Indexed
-    /// by global row. Only consulted on the FLEX path — rigid rows keep their
-    /// own `rigid_{third,fourth}_full` caches. The build is fallible and
-    /// sticky (same propagation contract as `rigid_third_full`).
-    pub(super) flex_axis_tensors:
-        crate::resource::RayonSafeOnce<Result<Vec<FlexAxisRowTensors>, String>>,
+    /// reused across all `(ρ-axis i, j)` pairs. See [`FlexAxisRowTensors`] for
+    /// the contraction algebra. Only consulted on the FLEX path — rigid rows
+    /// keep their own `rigid_{third,fourth}_full` caches.
+    ///
+    /// Two-level lazy: the outer `RayonSafeOnce` allocates a per-row slot table
+    /// (one inner `RayonSafeOnce` per global row) on first touch; each row's
+    /// tensors are then built **on demand** when that row is first read. Outer
+    /// derivative passes are row-subsampled, so per-row laziness builds (and
+    /// risks erroring on) only the rows actually consumed, not all `n`. Each
+    /// inner build is fallible and sticky (same contract as `rigid_third_full`).
+    pub(super) flex_axis_tensors: crate::resource::RayonSafeOnce<
+        Vec<crate::resource::RayonSafeOnce<Result<FlexAxisRowTensors, String>>>,
+    >,
 }
