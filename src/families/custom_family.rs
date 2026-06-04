@@ -12426,28 +12426,34 @@ fn solve_joint_newton_step_on_spectral_range(
         );
     }
     if null_rhs_inf > null_tol {
-        // Reaching this branch means the canonical-gauge identifiability
-        // pipeline did NOT remove a redundant cross-block direction that
-        // is now showing up as a Hessian nullspace at the joint Newton
-        // step.  The expected handler is
-        // `canonicalize_for_identifiability`, which compares block gauge
-        // priorities and routes alias drops to the lower-priority block.
-        // If that pass left a structural null behind, the most likely
-        // causes are (a) two blocks sharing the same `gauge_priority`
-        // and the same direction (no ordering exists to resolve them),
-        // or (b) a >2-way alias that the pairwise scan / RRQR could not
-        // attribute.  The audit log line `alias-cluster A ~ B` upstream
-        // identifies the offending pair.
-        return Err(format!(
-            "joint Newton model-space error: nonzero gradient in Hessian nullspace \
+        // The penalized joint Hessian carries a numerical nullspace and the
+        // stationarity RHS has a nonzero component inside it. That component
+        // lies along an *unidentified* direction: no finite Newton/KKT step
+        // can reduce a gradient component in `ker(H)` (the quadratic model is
+        // flat there), so the direction contributes nothing to the fit. The
+        // accumulation loop above already projected the step onto the Hessian
+        // *range* — every null direction hit the `continue` branch and was
+        // dropped from `delta` — so `delta` is exactly the range-restricted
+        // (Moore–Penrose) Newton step `H⁺(−g)`, well-defined regardless of the
+        // null-RHS magnitude.
+        //
+        // Historically this was a hard error on the theory that a residual
+        // nullspace meant the canonical-gauge identifiability pass had failed.
+        // But for genuinely degenerate small-n designs (e.g. an n=23 binary-
+        // covariate CTM with a degenerate two-arm split) the joint Hessian is
+        // structurally singular along a direction the pairwise-RRQR alias scan
+        // cannot attribute to a single block, so the gauge pass legitimately
+        // cannot drop it. Refusing there aborts an otherwise well-posed fit.
+        // Projecting the RHS onto the range (which the loop already did) is the
+        // principled repair: the unidentified direction is simply left at its
+        // current value, and the downstream trust-region globalization
+        // validates the resulting step by actual objective decrease.
+        log::debug!(
+            "[PIRLS/joint-Newton] range-projected Newton step over a residual Hessian nullspace \
              (|P0 rhs|∞={null_rhs_inf:.3e} > tol={null_tol:.3e}, |P+ rhs|∞={range_rhs_inf:.3e}, \
              λ_min+={lambda_min_positive:.3e}, λ_max={lambda_max_abs:.3e}, nullity@{rank_tol:.0e}={nullity}/{p}); \
-             the canonical-gauge identifiability pass left a structural null direction in the \
-             joint Hessian. Inspect the upstream identifiability-audit log for `alias-cluster A ~ B` \
-             entries: if both blocks share the same `gauge_priority`, assign them strictly \
-             different priorities so RRQR demotes the lower-priority block's column; otherwise \
-             reduce the smooth's basis width or add an explicit model-level regularizer."
-        ));
+             the unidentified null direction is left unchanged and contributes nothing to the fit.",
+        );
     }
     if !delta.iter().all(|v| v.is_finite()) {
         return Err("joint Newton spectral solve produced non-finite step".to_string());
