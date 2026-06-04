@@ -1,0 +1,187 @@
+//! Regression for the hypertension Bernoulli marginal-slope audit refusal.
+//!
+//! The production failure had the marginal formula
+//!
+//!   event ~ matern(PC1, PC2, PC3, centers=10)
+//!       + sex + entry_age_z
+//!       + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4
+//!
+//! with a Matérn log-slope surface over the same PCs. The pre-fit
+//! identifiability audit reported `marginal_surface` rank 14/15 and attributed
+//! the dropped local column to the scalar prefix (`local column 3`), before the
+//! Matérn basis columns. In the real pipeline `current_age_ns_1` can be the
+//! constant natural-spline basis column, duplicating the implicit intercept
+//! inside the BMS marginal block.
+//!
+//! This test drives the full formula-to-fit path so the pre-fit audit runs; it
+//! is not just a materialization check.
+
+use gam::data::EncodedDataset;
+use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+use gam::{FitConfig, FitResult, fit_from_formula};
+use ndarray::Array2;
+
+fn hypertension_shape_dataset() -> EncodedDataset {
+    let n = 96usize;
+    let headers = vec![
+        "event",
+        "sex",
+        "entry_age_z",
+        "current_age_ns_1",
+        "current_age_ns_2",
+        "current_age_ns_3",
+        "current_age_ns_4",
+        "prs_z",
+        "PC1",
+        "PC2",
+        "PC3",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    let mut values = Vec::<f64>::with_capacity(n * headers.len());
+    for i in 0..n {
+        let sex = if i % 2 == 0 { 0.0 } else { 1.0 };
+        let entry_age_z = (i as f64 - 47.5) / 18.0;
+        let t = ((i % 19) as f64 - 9.0) / 9.0;
+        let current_age_ns_1 = 1.0;
+        let current_age_ns_2 = t;
+        let current_age_ns_3 = t * t;
+        let current_age_ns_4 = t * t * t;
+        let prs_z = (((i * 37) % 101) as f64 - 50.0) / 22.0;
+        let pc1 = ((i as f64) * 0.17).sin();
+        let pc2 = ((i as f64) * 0.23).cos();
+        let pc3 = ((i as f64) * 0.31).sin() * ((i as f64) * 0.07).cos();
+        let eta = -0.15 + 0.25 * sex + 0.18 * entry_age_z + 0.16 * t + 0.10 * prs_z + 0.08 * pc1;
+        let deterministic_noise = (((i * 13) % 17) as f64 - 8.0) / 11.0;
+        let event = if eta + deterministic_noise > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        values.extend_from_slice(&[
+            event,
+            sex,
+            entry_age_z,
+            current_age_ns_1,
+            current_age_ns_2,
+            current_age_ns_3,
+            current_age_ns_4,
+            prs_z,
+            pc1,
+            pc2,
+            pc3,
+        ]);
+    }
+    EncodedDataset {
+        headers,
+        values: Array2::from_shape_vec((n, 11), values).expect("hypertension-shape BMS data shape"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "event".to_string(),
+                    kind: ColumnKindTag::Binary,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "sex".to_string(),
+                    kind: ColumnKindTag::Binary,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "entry_age_z".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_1".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_2".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_3".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "current_age_ns_4".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "prs_z".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "PC1".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "PC2".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "PC3".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Binary,
+            ColumnKindTag::Binary,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+        ],
+    }
+}
+
+#[test]
+fn hypertension_shape_bms_matern_fit_is_not_refused_by_identifiability_audit() {
+    gam::init_parallelism();
+    let data = hypertension_shape_dataset();
+    let cfg = FitConfig {
+        logslope_formula: Some("matern(PC1, PC2, PC3, centers=4)".to_string()),
+        z_column: Some("prs_z".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "event ~ matern(PC1, PC2, PC3, centers=4) + sex + entry_age_z + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4",
+        &data,
+        &cfg,
+    );
+    match result {
+        Ok(FitResult::BernoulliMarginalSlope(out)) => {
+            assert!(
+                out.fit.beta.iter().all(|coef| coef.is_finite()),
+                "hypertension-shape BMS fit should produce finite coefficients, got {:?}",
+                out.fit.beta
+            );
+        }
+        Ok(_) => panic!("hypertension-shape fit returned the wrong family variant"),
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("identifiability audit refused")
+                    && !msg.contains("pre-fit identifiability audit"),
+                "hypertension-shape BMS fit was still refused by the identifiability audit: {msg}"
+            );
+            panic!("hypertension-shape BMS fit failed after passing the audit: {msg}");
+        }
+    }
+}
