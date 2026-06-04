@@ -1356,7 +1356,42 @@ pub fn build_smooth_basis(
         } else {
             option_usize(options, "degree").unwrap_or(3)
         };
-        let default_internal = heuristic_knots_for_column(ds.values.column(c));
+        // For a factor smooth every group's curve is fit from THAT group's rows
+        // alone, so the marginal's flexibility must respect the least-resolved
+        // group, not the pooled column. The pooled heuristic can hand the marginal
+        // a basis that saturates (or exceeds) a small group's sample — e.g. the
+        // sleepstudy panel has 8 training days per subject, and a default cubic
+        // basis of 8 functions interpolates each subject's 8 points, leaving no
+        // room for the wiggliness penalty to collapse the curve toward the
+        // per-subject line. The factor smooth then fits within-group noise and
+        // extrapolates badly (held-out forecast worse than the population mean).
+        //
+        // Cap the marginal basis below the minimum per-group covariate resolution
+        // so the penalty always retains residual degrees of freedom to shrink each
+        // group's curvature toward its linear null space (the random-slope
+        // estimand). Groups with ample data (e.g. 40 points each) keep the full
+        // pooled flexibility; only small-sample groups are protected. The cap is
+        // skipped for the explicit `re` random-effect form, whose degree-1 marginal
+        // carries no curvature to over-fit.
+        let pooled_internal = heuristic_knots_for_column(ds.values.column(c));
+        let default_internal = if type_opt == "re" {
+            pooled_internal
+        } else {
+            let min_group_resolution =
+                min_per_group_unique_count(ds.values.column(c), ds.values.column(cols[group_idx]));
+            // Per-group basis dim = degree + 1 + internal. Hold it well below the
+            // smallest group's resolution (leave at least two residual points per
+            // group) so the smooth cannot interpolate that group and the
+            // wiggliness penalty retains the room to collapse each curve toward
+            // its linear null space. Never drop below `degree + 2`, which keeps
+            // exactly the linear span plus a single curvature direction — the
+            // minimal smoother that can still bend if the data demand it.
+            let basis_cap = min_group_resolution
+                .saturating_sub(2)
+                .max(degree + 2);
+            let internal_cap = basis_cap.saturating_sub(degree + 1);
+            pooled_internal.min(internal_cap.max(1))
+        };
         let (n_knots, _) = parse_ps_internal_knots(options, degree, default_internal)?;
         let marginal = BSplineBasisSpec {
             degree,
@@ -2304,6 +2339,34 @@ pub fn unique_count_column(col: ArrayView1<'_, f64>) -> usize {
         set.insert(norm.to_bits());
     }
     set.len().max(1)
+}
+
+/// Smallest number of distinct covariate values seen within any single group
+/// of `group_col`. For a factor smooth this is the resolution that bounds the
+/// marginal basis: a group with `m` distinct covariate values can only inform
+/// `m` basis coefficients, so a marginal richer than that interpolates the
+/// group instead of estimating a penalized trend. Bits are compared exactly so
+/// integer-valued covariates (days, dose levels) collapse to their true count.
+fn min_per_group_unique_count(
+    feature_col: ArrayView1<'_, f64>,
+    group_col: ArrayView1<'_, f64>,
+) -> usize {
+    use std::collections::{HashMap, HashSet};
+    let mut per_group: HashMap<u64, HashSet<u64>> = HashMap::new();
+    for (xi, gi) in feature_col.iter().zip(group_col.iter()) {
+        let xnorm = if *xi == 0.0 { 0.0 } else { *xi };
+        let gnorm = if *gi == 0.0 { 0.0 } else { *gi };
+        per_group
+            .entry(gnorm.to_bits())
+            .or_default()
+            .insert(xnorm.to_bits());
+    }
+    per_group
+        .values()
+        .map(|s| s.len())
+        .min()
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Per-column knot count from the unique-value count, with the same n^(1/3)
