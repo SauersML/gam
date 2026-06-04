@@ -1,6 +1,7 @@
 use crate::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,
     BSplineIdentifiability, BSplineKnotSpec, BasisBuildResult, BasisError, BasisMetadata,
+    BasisWorkspace,
     BasisOptions, BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy,
     CenterStrategyKind, Dense, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     KnotSource, KroneckerFactoredBasis, MaternBasisSpec, MaternIdentifiability,
@@ -50,7 +51,7 @@ use crate::types::{
 };
 use crate::util::quantile::quantile_from_sorted;
 use faer::sparse::{SparseColMat, Triplet};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, s};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::f64;
@@ -4173,6 +4174,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             identifiability_transform: None,
             input_scales,
             aniso_log_scales,
+            operator_collocation_points,
         } => BasisMetadata::Duchon {
             centers,
             length_scale,
@@ -4182,6 +4184,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             identifiability_transform: Some(Array2::eye(raw_cols)),
             input_scales,
             aniso_log_scales,
+            operator_collocation_points,
         },
         other => other,
     }
@@ -8646,6 +8649,7 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scales,
             aniso_log_scales,
+            operator_collocation_points,
         } => Ok(BasisMetadata::Duchon {
             centers: centers.clone(),
             length_scale: *length_scale,
@@ -8654,6 +8658,7 @@ fn with_identifiability_transform(
             nullspace_order: *nullspace_order,
             input_scales: input_scales.clone(),
             aniso_log_scales: aniso_log_scales.clone(),
+            operator_collocation_points: operator_collocation_points.clone(),
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
@@ -9802,7 +9807,7 @@ fn extract_spatial_operator_runtime_caches(
         let tension_global_idx = global_base_idx + tension_local;
         let stiffness_global_idx = global_base_idx + stiffness_local;
 
-        let (feature_cols, mut d0, mut d1, mut d2, collocation_points, dim) =
+        let (feature_cols, mut d0, mut d1, mut d2, collocation_points, dim, center_mass_rows) =
             match (&termspec.basis, &term_fit.metadata) {
                 (
                     SmoothBasisSpec::Matern { feature_cols, .. },
@@ -9844,17 +9849,60 @@ fn extract_spatial_operator_runtime_caches(
                         ops.d2,
                         ops.collocation_points,
                         centers.ncols(),
+                        false,
                     )
                 }
-                // The redesigned non-periodic/periodic/cyclic Duchon bases ship a
-                // single native reproducing-norm penalty (`Primary`) plus a
-                // null-space shrinkage ridge — never the mass/tension/stiffness
-                // operator triplet the Charbonnier spatial-adaptive overlay
-                // requires. A Duchon term therefore never reaches this match (the
-                // operator-penalty lookup above `continue`s for it), so there is
-                // no Duchon arm here; only Matérn carries the operator triplet.
+                (
+                    SmoothBasisSpec::Duchon { feature_cols, .. },
+                    BasisMetadata::Duchon {
+                        centers,
+                        length_scale,
+                        power,
+                        nullspace_order,
+                        identifiability_transform,
+                        input_scales,
+                        aniso_log_scales,
+                        operator_collocation_points: Some(collocation_points),
+                        ..
+                    },
+                ) => {
+                    let collocation_length_scale = match (length_scale, input_scales.as_deref()) {
+                        (Some(ls), Some(scales)) => {
+                            Some(compensate_length_scale_for_standardization(*ls, scales))
+                        }
+                        (Some(ls), None) => Some(*ls),
+                        (None, _) => None,
+                    };
+                    let ops = crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
+                        centers.view(),
+                        collocation_points.view(),
+                        None,
+                        collocation_length_scale,
+                        *power,
+                        *nullspace_order,
+                        aniso_log_scales.as_deref(),
+                        identifiability_transform.as_ref().map(|z| z.view()),
+                        2,
+                        &mut BasisWorkspace::default(),
+                    )?;
+                    (
+                        feature_cols.clone(),
+                        ops.d0,
+                        ops.d1,
+                        ops.d2,
+                        ops.collocation_points,
+                        centers.ncols(),
+                        true,
+                    )
+                }
                 _ => continue,
             };
+        if center_mass_rows && d0.nrows() > 0 && d0.ncols() > 0 {
+            let means = d0.sum_axis(Axis(0)).mapv(|v| v / d0.nrows() as f64);
+            for mut row in d0.rows_mut() {
+                row -= &means;
+            }
+        }
 
         // Runtime operator caches must live on the same normalized penalty scale as the
         // shipped design penalties. The basis builders normalize S0=D0'D0, S1=D1'D1, and
@@ -16758,6 +16806,7 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                     input_scales: meta_scales,
                     aniso_log_scales: meta_aniso,
+                    ..
                 },
             ) => {
                 // Auto-promotion path: the basis builder rewrote a canonical-TPS
@@ -16863,6 +16912,7 @@ pub fn freeze_term_collection_from_design(
                     identifiability_transform,
                     input_scales: meta_scales,
                     aniso_log_scales: meta_aniso,
+                    ..
                 },
             ) => {
                 s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
