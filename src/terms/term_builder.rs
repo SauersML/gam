@@ -337,7 +337,9 @@ pub fn build_termspec(
                         name: name.clone(),
                         feature_col: col,
                         feature_cols: vec![col],
-                        double_penalty: true,
+                        // Parametric linear terms are unpenalized by default
+                        // (MLE, matching mgcv/glm); see #749.
+                        double_penalty: false,
                         coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                         coefficient_min: *coefficient_min,
                         coefficient_max: *coefficient_max,
@@ -349,7 +351,8 @@ pub fn build_termspec(
                                 name: name.clone(),
                                 feature_col: col,
                                 feature_cols: vec![col],
-                                double_penalty: true,
+                                // Unpenalized parametric effect by default (#749).
+                                double_penalty: false,
                                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                                 coefficient_min: *coefficient_min,
                                 coefficient_max: *coefficient_max,
@@ -652,7 +655,9 @@ pub fn build_termspec(
                     name: label,
                     feature_col: cols[0],
                     feature_cols: cols,
-                    double_penalty: true,
+                    // Parametric `:` interaction column is unpenalized by
+                    // default, same as any other linear term (#749).
+                    double_penalty: false,
                     coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                     coefficient_min: None,
                     coefficient_max: None,
