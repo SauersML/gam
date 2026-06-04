@@ -26766,6 +26766,60 @@ mod tests {
         assert_eq!(result.active_sets, vec![None, None]);
     }
 
+    #[test]
+    fn joint_newton_budget_exhaustion_refuses_coupled_exact_inner() {
+        let spec0 = ParameterBlockSpec {
+            name: "block0".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let spec1 = ParameterBlockSpec {
+            name: "block1".to_string(),
+            design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+            offset: array![0.0],
+            penalties: vec![],
+            nullspace_dims: vec![],
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: Some(array![0.0]),
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        };
+        let options = BlockwiseFitOptions {
+            inner_max_cycles: 1,
+            inner_tol: 1e-12,
+            ridge_floor: CUSTOM_FAMILY_RIDGE_FLOOR,
+            ..BlockwiseFitOptions::default()
+        };
+        let per_block = vec![Array1::zeros(0), Array1::zeros(0)];
+
+        let err = inner_blockwise_fit(
+            &TwoBlockPersistentGradientFamily,
+            &[spec0, spec1],
+            &per_block,
+            &options,
+            None,
+        )
+        .expect_err("coupled exact-joint max-budget exhaustion must fail loudly");
+        assert!(
+            err.contains("exhausted the joint Newton budget without KKT convergence"),
+            "budget exhaustion should be named explicitly: {err}"
+        );
+        assert!(
+            err.contains("block_residual_inf"),
+            "error should carry per-block residual diagnostics: {err}"
+        );
+    }
+
     /// Independent derivation and direct numerical proof of the
     /// ρ ≈ 2 inner-PIRLS pathology pinned by the biobank saturated-probit
     /// failure trace.
