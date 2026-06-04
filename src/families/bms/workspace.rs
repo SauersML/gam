@@ -3961,64 +3961,79 @@ impl BernoulliMarginalSlopeFamily {
         }
         let completed_rows = AtomicUsize::new(0);
         let progress_step = (n / 10).max(1);
-        // Collect (neglog, grad_flat, hess_flat) per row in parallel, then
-        // assemble into the three packed arrays. Using par_iter collect avoids
-        // unsafe pointer aliasing while writing disjoint row slices.
-        let row_evals: Vec<(f64, Vec<f64>, Vec<f64>)> = (0..n)
-            .into_par_iter()
-            .map(|row| -> Result<(f64, Vec<f64>, Vec<f64>), String> {
-                let row_ctx = Self::row_ctx(cache, row);
-                let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
-                let row_moments = cache
-                    .row_cell_moments
-                    .as_ref()
-                    .and_then(|bundle| bundle.row(row, 9));
-                let neglog = self.compute_row_analytic_flex_into_with_moments(
-                    row,
-                    block_states,
-                    primary,
-                    row_ctx,
-                    row_moments,
-                    true,
-                    &mut scratch,
-                )?;
-                if log_exact_work(n) {
-                    let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
-                    if done == n || done % progress_step == 0 {
-                        log::info!(
-                            "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
-                            done,
-                            n,
-                            started.elapsed().as_secs_f64()
-                        );
-                    }
-                }
-                Ok((
-                    neglog,
-                    scratch.grad.to_vec(),
-                    scratch
-                        .hess
-                        .as_slice()
-                        .expect("hess is contiguous")
-                        .to_vec(),
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        // Allocate the three packed arrays up front, then fill them one row
+        // chunk at a time: each chunk is computed in parallel into a small
+        // `Vec<(f64, Vec, Vec)>` (safe disjoint-row collect) and copied into the
+        // packed arrays before the next chunk's scratch is allocated. This caps
+        // transient overhead at one chunk (~tens of MiB) instead of holding a
+        // second full `n×r²` copy alongside the packed arrays — the old
+        // collect-all-then-copy form peaked at ~2× the planned cache size, so
+        // the byte estimate the materialize/stream policy budgets against
+        // (`plan.bytes`) now actually bounds peak memory.
         let mut packed_neglog = Array1::<f64>::zeros(n);
         let mut packed_grad = Array2::<f64>::zeros((n, r));
         let mut packed_hess = Array2::<f64>::zeros((n, r * r));
-        for (row, (neglog, grad_flat, hess_flat)) in row_evals.into_iter().enumerate() {
-            packed_neglog[row] = neglog;
-            packed_grad
-                .row_mut(row)
-                .iter_mut()
-                .zip(grad_flat.iter())
-                .for_each(|(d, s)| *d = *s);
-            packed_hess
-                .row_mut(row)
-                .iter_mut()
-                .zip(hess_flat.iter())
-                .for_each(|(d, s)| *d = *s);
+        // ~tens of MiB of transient per-chunk scratch at r=20 (8192 * 421 * 8 ≈
+        // 27 MiB) regardless of n.
+        const ROW_PRIMARY_BUILD_CHUNK: usize = 8192;
+        let mut chunk_start = 0usize;
+        while chunk_start < n {
+            let chunk_end = (chunk_start + ROW_PRIMARY_BUILD_CHUNK).min(n);
+            let chunk_evals: Vec<(f64, Vec<f64>, Vec<f64>)> = (chunk_start..chunk_end)
+                .into_par_iter()
+                .map(|row| -> Result<(f64, Vec<f64>, Vec<f64>), String> {
+                    let row_ctx = Self::row_ctx(cache, row);
+                    let mut scratch = BernoulliMarginalSlopeFlexRowScratch::new(r);
+                    let row_moments = cache
+                        .row_cell_moments
+                        .as_ref()
+                        .and_then(|bundle| bundle.row(row, 9));
+                    let neglog = self.compute_row_analytic_flex_into_with_moments(
+                        row,
+                        block_states,
+                        primary,
+                        row_ctx,
+                        row_moments,
+                        true,
+                        &mut scratch,
+                    )?;
+                    if log_exact_work(n) {
+                        let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
+                        if done == n || done % progress_step == 0 {
+                            log::info!(
+                                "[BMS row-primary-hessian-cache] progress rows={}/{} elapsed={:.3}s",
+                                done,
+                                n,
+                                started.elapsed().as_secs_f64()
+                            );
+                        }
+                    }
+                    Ok((
+                        neglog,
+                        scratch.grad.to_vec(),
+                        scratch
+                            .hess
+                            .as_slice()
+                            .expect("hess is contiguous")
+                            .to_vec(),
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            for (offset, (neglog, grad_flat, hess_flat)) in chunk_evals.into_iter().enumerate() {
+                let row = chunk_start + offset;
+                packed_neglog[row] = neglog;
+                packed_grad
+                    .row_mut(row)
+                    .iter_mut()
+                    .zip(grad_flat.iter())
+                    .for_each(|(d, s)| *d = *s);
+                packed_hess
+                    .row_mut(row)
+                    .iter_mut()
+                    .zip(hess_flat.iter())
+                    .for_each(|(d, s)| *d = *s);
+            }
+            chunk_start = chunk_end;
         }
         if log_exact_work(n) {
             log::info!(
