@@ -714,7 +714,7 @@ impl SaeBasisEvaluator for RawPeriodicCircleEvaluator {
 
     fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
         if self.latent_dim != 1 {
-            return (resolution == 0).then(|| Array2::<f64>::zeros((0, self.latent_dim)));
+            return None;
         }
         let r = resolution.max(2);
         let mut grid = Array2::<f64>::zeros((r, 1));
@@ -1426,8 +1426,8 @@ impl SaeBasisEvaluator for AffineCoordinateEvaluator {
         Ok((phi, jet))
     }
 
-    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
-        (resolution == 0).then(|| Array2::<f64>::zeros((0, self.latent_dim)))
+    fn projection_seed_grid(&self, _resolution: usize) -> Option<Array2<f64>> {
+        None
     }
 }
 
@@ -1528,8 +1528,8 @@ impl SaeBasisEvaluator for DuchonCoordinateEvaluator {
             .map_err(|err| err.to_string())
     }
 
-    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
-        (resolution == 0).then(|| Array2::<f64>::zeros((0, self.centers.ncols())))
+    fn projection_seed_grid(&self, _resolution: usize) -> Option<Array2<f64>> {
+        None
     }
 }
 
@@ -1637,8 +1637,8 @@ impl SaeBasisEvaluator for EuclideanPatchEvaluator {
         Ok((phi, jet))
     }
 
-    fn projection_seed_grid(&self, resolution: usize) -> Option<Array2<f64>> {
-        (resolution == 0).then(|| Array2::<f64>::zeros((0, self.latent_dim)))
+    fn projection_seed_grid(&self, _resolution: usize) -> Option<Array2<f64>> {
+        None
     }
 }
 
