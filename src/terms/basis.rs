@@ -5542,6 +5542,24 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
+    pub(crate) fn append_full_transform(
+        mut self,
+        transform: &Array2<f64>,
+    ) -> Result<Self, BasisError> {
+        if transform.nrows() != self.p_out() {
+            crate::bail_dim_basis!(
+                "implicit psi derivative transform has {} rows but operator has {} output columns",
+                transform.nrows(),
+                self.p_out()
+            );
+        }
+        self.full_ident_transform = Some(match self.full_ident_transform.take() {
+            Some(existing) => fast_ab(&existing, transform),
+            None => transform.clone(),
+        });
+        Ok(self)
+    }
+
     /// Dimension after kernel constraint + polynomial padding (before full ident).
     fn p_after_pad(&self) -> usize {
         let p_constrained = self.p_constrained();
@@ -17053,7 +17071,7 @@ impl DuchonRawPenaltyPsiDerivativeBlocks {
 }
 
 fn build_duchon_operator_penalty_psi_derivatives(
-    data: ArrayView2<'_, f64>,
+    collocation_points: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
     identifiability_transform: Option<&Array2<f64>>,
@@ -17101,10 +17119,13 @@ fn build_duchon_operator_penalty_psi_derivatives(
     let z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     let n_basis = centers.nrows();
-    let n = data.nrows();
-    let m = (DUCHON_COLLOCATION_OVERSAMPLE * n_basis).min(n);
-    let sample = select_thin_plate_knots(data, m)?;
-    let p_colloc = sample.nrows();
+    if collocation_points.ncols() != dim {
+        crate::bail_dim_basis!(
+            "Duchon psi-derivative collocation dim {} != centers dim {dim}",
+            collocation_points.ncols()
+        );
+    }
+    let p_colloc = collocation_points.nrows();
     let d = dim;
     let kernel_cols = z_kernel.ncols();
 
@@ -17133,13 +17154,15 @@ fn build_duchon_operator_penalty_psi_derivatives(
                 for i in start..end {
                     for j in 0..n_basis {
                         let r = if let Some(eta) = aniso {
-                            let row_i: Vec<f64> = (0..d).map(|a| sample[[i, a]]).collect();
+                            let row_i: Vec<f64> =
+                                (0..d).map(|a| collocation_points[[i, a]]).collect();
                             let row_j: Vec<f64> = (0..d).map(|a| centers[[j, a]]).collect();
                             let (r, _) = aniso_distance_and_components(&row_i, &row_j, eta);
                             r
                         } else {
                             stable_euclidean_norm(
-                                (0..d).map(|axis| sample[[i, axis]] - centers[[j, axis]]),
+                                (0..d)
+                                    .map(|axis| collocation_points[[i, axis]] - centers[[j, axis]]),
                             )
                         };
                         let core = duchon_radial_core_psi_triplet(
@@ -17167,7 +17190,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
                                 jets.t, jets.t_r, jets.t_rr, t_exponent, r,
                             );
                             for axis in 0..d {
-                                let delta = sample[[i, axis]] - centers[[j, axis]];
+                                let delta = collocation_points[[i, axis]] - centers[[j, axis]];
                                 let axis_scale = metric_weights
                                     .as_ref()
                                     .map(|weights| weights[axis])
@@ -17184,13 +17207,15 @@ fn build_duchon_operator_penalty_psi_derivatives(
                             for col in 0..kernel_cols {
                                 let z_jc = z_kernel[[j, col]];
                                 for axis_b in 0..d {
-                                    let h_b = sample[[i, axis_b]] - centers[[j, axis_b]];
+                                    let h_b =
+                                        collocation_points[[i, axis_b]] - centers[[j, axis_b]];
                                     let w_b = metric_weights
                                         .as_ref()
                                         .map(|weights| weights[axis_b])
                                         .unwrap_or(1.0);
                                     for axis_c in 0..d {
-                                        let h_c = sample[[i, axis_c]] - centers[[j, axis_c]];
+                                        let h_c =
+                                            collocation_points[[i, axis_c]] - centers[[j, axis_c]];
                                         let w_c = metric_weights
                                             .as_ref()
                                             .map(|weights| weights[axis_c])
@@ -19487,6 +19512,12 @@ pub fn build_duchon_basis_log_kappa_derivatives(
     build_duchon_basis_log_kappa_derivativeswithworkspace(data, spec, &mut workspace)
 }
 
+fn duchon_operator_penalties_requested(spec: &DuchonOperatorPenaltySpec) -> bool {
+    matches!(spec.mass, OperatorPenaltySpec::Active { .. })
+        || matches!(spec.tension, OperatorPenaltySpec::Active { .. })
+        || matches!(spec.stiffness, OperatorPenaltySpec::Active { .. })
+}
+
 pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -19499,28 +19530,65 @@ pub fn build_duchon_basis_log_kappa_derivativeswithworkspace(
     }
     let (centers, identifiability_transform) =
         prepare_duchon_derivative_contextwithworkspace(data, spec, workspace)?;
+    let operator_collocation_points =
+        if duchon_operator_penalties_requested(&spec.operator_penalties) {
+            let m = (DUCHON_COLLOCATION_OVERSAMPLE * centers.nrows()).min(data.nrows());
+            Some(select_thin_plate_knots(data, m)?)
+        } else {
+            None
+        };
+    build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
+        data,
+        spec,
+        centers.view(),
+        identifiability_transform.as_ref(),
+        operator_collocation_points
+            .as_ref()
+            .map(|points| points.view()),
+        workspace,
+    )
+}
+
+pub(crate) fn build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
+    data: ArrayView2<'_, f64>,
+    spec: &DuchonBasisSpec,
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    operator_collocation_points: Option<ArrayView2<'_, f64>>,
+    workspace: &mut BasisWorkspace,
+) -> Result<BasisPsiDerivativeBundle, BasisError> {
     let design_derivatives = build_duchon_design_psi_derivativeswithworkspace(
         data,
-        centers.view(),
+        centers,
         spec,
-        identifiability_transform.as_ref(),
+        identifiability_transform,
         workspace,
     )?;
     let (native_sources, native_first, native_second) =
         build_duchon_native_penalty_psi_derivatives(
-            centers.view(),
+            centers,
             spec,
-            identifiability_transform.as_ref(),
+            identifiability_transform,
             workspace,
         )?;
-    let (operator_sources, operator_first, operator_second) =
+    let (operator_sources, operator_first, operator_second) = if duchon_operator_penalties_requested(
+        &spec.operator_penalties,
+    ) {
+        let Some(collocation_points) = operator_collocation_points else {
+            crate::bail_invalid_basis!(
+                "Duchon log-kappa operator penalty derivatives require realized collocation points"
+            );
+        };
         build_duchon_operator_penalty_psi_derivatives(
-            data,
-            centers.view(),
+            collocation_points,
+            centers,
             spec,
-            identifiability_transform.as_ref(),
+            identifiability_transform,
             workspace,
-        )?;
+        )?
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    };
     let mut penalties_derivative = Vec::with_capacity(native_first.len() + operator_first.len());
     penalties_derivative.extend(native_first);
     penalties_derivative.extend(operator_first);
@@ -23399,7 +23467,7 @@ const DUCHON_COLLOCATION_OVERSAMPLE: usize = 3;
 /// their `η`-gradient identically zero, so the REML anisotropy optimization
 /// stays consistent without per-axis operator derivatives.
 fn duchon_operator_penalty_candidates(
-    data: ArrayView2<'_, f64>,
+    collocation_points: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
     operator_penalties: &DuchonOperatorPenaltySpec,
     length_scale: Option<f64>,
@@ -23444,13 +23512,9 @@ fn duchon_operator_penalty_candidates(
         effective_spec.stiffness = OperatorPenaltySpec::Disabled;
     }
     let max_op = duchon_max_active_operator_derivative_order(&effective_spec);
-    let n_basis = centers.nrows();
-    let n = data.nrows();
-    let m = (DUCHON_COLLOCATION_OVERSAMPLE * n_basis).min(n);
-    let sample = select_thin_plate_knots(data, m)?;
     let ops = build_duchon_collocation_operator_matriceswithworkspace(
         centers,
-        sample.view(),
+        collocation_points,
         None,
         length_scale,
         power,
@@ -23784,17 +23848,19 @@ pub fn build_duchon_basiswithworkspace(
         identifiability_transform.as_ref(),
         poly_cols,
     )?;
-    candidates.extend(duchon_operator_penalty_candidates(
-        data,
-        centers.view(),
-        &spec.operator_penalties,
-        spec.length_scale,
-        spec.power,
-        effective_nullspace_order,
-        aniso.is_some(),
-        identifiability_transform.as_ref(),
-        workspace,
-    )?);
+    if let Some(points) = operator_collocation_points.as_ref() {
+        candidates.extend(duchon_operator_penalty_candidates(
+            points.view(),
+            centers.view(),
+            &spec.operator_penalties,
+            spec.length_scale,
+            spec.power,
+            effective_nullspace_order,
+            aniso.is_some(),
+            identifiability_transform.as_ref(),
+            workspace,
+        )?);
+    }
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
     Ok(BasisBuildResult {
