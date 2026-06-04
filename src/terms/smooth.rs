@@ -6943,18 +6943,15 @@ fn build_single_local_smooth_term(
     let linear_constraints_local =
         merge_linear_constraints_global(shape_linear_constraints, boundary_linear_constraints);
 
-    // Joint-null absorption rotation. On the fit path `term.joint_null_rotation`
-    // is `None` and we compute Q from the final per-smooth penalty set
-    // (after all in-smooth reparameterizations have already been applied).
-    // On the predict path the resolved `TermCollectionSpec` was frozen from
-    // the fitted `SmoothTerm` via `freeze_term_collection_from_design`, so
-    // `term.joint_null_rotation` carries the *exact* fit-time Q — reuse it
-    // verbatim. Recomputing would produce a Q' that's mathematically
-    // equivalent only up to sign flips on eigenvectors of degenerate
-    // eigenvalues, which would silently break bit-equivalent save → load →
-    // predict because the fitted β lives in the fit-time γ-coordinates.
+    // Joint-null absorption rotation. Fresh fit specs compute Q from the final
+    // per-smooth penalty set (after all in-smooth reparameterizations have
+    // already been applied). Frozen specs already carry the complete realized
+    // coefficient chart in their `FrozenTransform`; recomputing Q there would
+    // rotate an already-frozen chart a second time and desynchronize value
+    // rebuilds from derivative operators.
     let joint_null_rotation = match term.joint_null_rotation.clone() {
         Some(persisted) => Some(persisted),
+        None if smooth_has_frozen_identifiability(term) => None,
         None => crate::terms::basis::compute_joint_null_rotation(&penalties_t)?,
     };
 
@@ -8145,10 +8142,17 @@ fn apply_global_smooth_identifiability(
         local_nullspaces[idx] = nullspace_constrained;
         local_penaltyinfo[idx] = penaltyinfo_constrained;
         local_linear_constraints[idx] = linear_constraints_constrained;
-        local_metadata[idx] = Some(with_identifiability_transform(
-            &term.metadata,
-            z_opt.as_ref(),
-        )?);
+        let realized_transform = match (term.joint_null_rotation.as_ref(), z_opt.as_ref()) {
+            (Some(rotation), Some(z)) => Some(crate::linalg::faer_ndarray::fast_ab(
+                &rotation.rotation,
+                z,
+            )),
+            (Some(rotation), None) => Some(rotation.rotation.clone()),
+            (None, Some(z)) => Some(z.clone()),
+            (None, None) => None,
+        };
+        local_metadata[idx] =
+            Some(with_identifiability_transform(&term.metadata, realized_transform.as_ref())?);
     }
 
     let total_p: usize = local_dims.iter().sum();
@@ -8216,13 +8220,11 @@ fn apply_global_smooth_identifiability(
             linear_constraints_local: local_linear_constraints[idx].clone(),
             // Global orthogonality transforms break Kronecker structure.
             kronecker_factored: None,
-            // Joint-null absorption rotation: the global orthogonality
-            // rebuild path above re-applies an orthogonalizing transform to
-            // `local_penalties`/`local_designs`, which would compose with
-            // any previously-applied joint-null Q in a non-trivial way.
-            // Stage-2 scope drops the cached Q on this path; rebuild-time
-            // re-application is a Stage-3+ follow-up and rebuilt models
-            // skip absorption-based prediction replay until then.
+            // The final raw-basis → coefficient chart, including any
+            // stage-2 joint-null Q and global orthogonality Z, is embedded in
+            // `metadata` above. Keeping Q separately here would apply it twice
+            // on frozen rebuilds and would put derivative operators in a
+            // different chart from the value path.
             joint_null_rotation: None,
         });
         if let Some(lin_local) = &local_linear_constraints[idx] {
