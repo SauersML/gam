@@ -342,21 +342,22 @@ pub fn spd_frechet_mean(
         // Stationarity residual ‖ξ‖_P: half the Riemannian gradient norm.
         let grad_norm = affine_sq_norm(n, &pinv, xi.view())?.sqrt();
         if grad_norm <= tol {
-            break;
+            return Ok(p);
         }
         // Armijo backtracking on the geodesic step P ← exp_P(t·ξ): accept the
-        // largest t ∈ {1, ½, ¼, …} that strictly decreases V (sufficient-
-        // decrease constant ½·‖ξ‖²_P, the first-order predicted descent). The
-        // unit step is the Karcher fixed point; smaller steps recover descent
-        // on spread/ill-conditioned data where the full step overshoots.
+        // largest t ∈ {1, ½, ¼, …} satisfying sufficient decrease. Since
+        // ξ = -½ grad V, the directional derivative of V along ξ is
+        // -2·‖ξ‖²_P; use a standard small Armijo constant so round-off near the
+        // convergence floor does not reject legitimate descent steps.
         let pred = grad_norm * grad_norm; // ‖ξ‖²_P > 0 here.
+        let armijo_c1 = 1.0e-4_f64;
         let mut t = 1.0_f64;
         let mut accepted = false;
         for _ in 0..40 {
             let step = &xi * t;
             let cand = spd.exp_map(p.view(), step.view())?;
             let f_cand = dispersion(cand.view())?;
-            if f_cand <= f_cur - 0.5 * t * pred {
+            if f_cand <= f_cur - 2.0 * armijo_c1 * t * pred {
                 p = cand;
                 f_cur = f_cand;
                 accepted = true;
@@ -365,12 +366,14 @@ pub fn spd_frechet_mean(
             t *= 0.5;
         }
         if !accepted {
-            // No positive step decreases V beyond round-off: ξ is at the noise
-            // floor, so P is stationary to machine precision. Stop cleanly.
-            break;
+            return Err(GeometryError::Singular(
+                "SPD Fréchet mean line search failed before stationarity tolerance",
+            ));
         }
     }
-    Ok(p)
+    Err(GeometryError::Singular(
+        "SPD Fréchet mean did not reach stationarity tolerance",
+    ))
 }
 
 #[cfg(test)]
