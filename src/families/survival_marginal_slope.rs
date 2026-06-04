@@ -18629,10 +18629,22 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
         // β_t = joint β[0 .. p_time]
         let beta_t = if beta.len() >= p { &beta[..p] } else { beta };
         let beta_t_base = &beta_t[..p_base.min(beta_t.len())];
-        let beta_tw = if beta_t.len() > p_base {
-            &beta_t[p_base..]
+        // β_tw must always be a length-`p_tw` vector. The timewiggle block
+        // exists whenever `self.p_tw > 0`, independent of how many coefficients
+        // the caller supplied: the identifiability canonicaliser calls this at
+        // the β=0 linearisation point with `beta = &[]` (see
+        // `BlockJacobianAsRowOp::from_callback`), so inferring "no wiggle block"
+        // from an empty slice — the old behaviour — wrongly drove `beta_tw`
+        // empty, made `sms_tw_first_order_geom` return `None`, and zeroed the
+        // wiggle tail columns. That made the time block look structurally
+        // aliased ("block 0 fully aliased") even though ∂q/∂β_tw[j] = B_j(h) ≠ 0
+        // at β=0. Zero-pad to `self.p_tw` so the basis is always evaluated.
+        let zero_tw: Vec<f64>;
+        let beta_tw: &[f64] = if beta_t.len() >= p_base + self.p_tw {
+            &beta_t[p_base..p_base + self.p_tw]
         } else {
-            &[][..]
+            zero_tw = vec![0.0; self.p_tw];
+            &zero_tw
         };
         // β_m = joint β[p_time .. p_time + p_m]
         let beta_m = {
@@ -18943,6 +18955,69 @@ fn sms_tw_first_order_geom(
         dq_dq0,
         d2q_dq02,
     }))
+}
+
+/// Overwrite the timewiggle tail columns of the dense time-channel
+/// primary-Jacobian slots with their analytic value at the β=0 pilot primary
+/// state, in place.
+///
+/// When `timewiggle(...)` is active the workflow disables the base time basis
+/// and appends the wiggle coefficient slots as **zero placeholder** columns
+/// (the design width is a coefficient-layout convention, not the Jacobian).
+/// Feeding those zeros into the identifiability compiler makes the whole time
+/// block look structurally zero ("block 0 fully aliased") — a bad-Jacobian
+/// artifact, not a real alias. The true primary-channel derivative of the time
+/// channels w.r.t. wiggle coefficient `j`, at the linearisation point β=0, is
+/// the monotone-wiggle basis value at the pilot coordinate:
+///
+/// ```text
+///   ∂q0  / ∂β_tw[j] = B_j(h0)          h0    = q0_pilot  = offset_entry
+///   ∂q1  / ∂β_tw[j] = B_j(h1)          h1    = q1_pilot  = offset_exit + marginal_offset
+///   ∂qd1 / ∂β_tw[j] = B'_j(h1)·d_raw   d_raw = qd1_pilot = derivative_offset_exit
+/// ```
+///
+/// Base columns (`j < p_base`) reduce to the raw design at β=0 (dq/dh = 1,
+/// d²q/dh² = 0) and are left untouched. The logslope-curvature factor `c_i` is
+/// **not** applied here; it enters the Fisher Gram through
+/// [`SurvivalRowHessian`], matching the raw-design convention for base columns.
+fn overwrite_timewiggle_time_slots_at_pilot(
+    dq0: &mut Array2<f64>,
+    dq1: &mut Array2<f64>,
+    dqd1: &mut Array2<f64>,
+    timewiggle: &TimeWiggleBlockInput,
+    h0: &Array1<f64>,
+    h1: &Array1<f64>,
+    d_raw: &Array1<f64>,
+) -> Result<(), String> {
+    let p_tw = timewiggle.ncols;
+    if p_tw == 0 {
+        return Ok(());
+    }
+    let p_time = dq0.ncols();
+    let p_base = p_time.saturating_sub(p_tw);
+    let n = dq0.nrows();
+    let knots = &timewiggle.knots;
+    let degree = timewiggle.degree;
+    let b0 = monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?;
+    let b1 = monotone_wiggle_basis_with_derivative_order(h1.view(), knots, degree, 0)?;
+    let b1d = monotone_wiggle_basis_with_derivative_order(h1.view(), knots, degree, 1)?;
+    if b0.ncols() != p_tw || b1.ncols() != p_tw || b1d.ncols() != p_tw {
+        return Err(format!(
+            "overwrite_timewiggle_time_slots_at_pilot: basis width B/B/B'={}/{}/{} != p_tw={p_tw}",
+            b0.ncols(),
+            b1.ncols(),
+            b1d.ncols(),
+        ));
+    }
+    for i in 0..n {
+        for j in 0..p_tw {
+            let col = p_base + j;
+            dq0[[i, col]] = b0[[i, j]];
+            dq1[[i, col]] = b1[[i, j]];
+            dqd1[[i, col]] = b1d[[i, j]] * d_raw[i];
+        }
+    }
+    Ok(())
 }
 
 // ── Building block specs ──────────────────────────────────────────────
@@ -20259,15 +20334,15 @@ pub fn fit_survival_marginal_slope_terms(
         };
         let n_rows = spec.time_block.design_entry.nrows();
         let preflight = (|| -> Result<(), String> {
-            let dq0 = spec
+            let mut dq0 = spec
                 .time_block
                 .design_entry
                 .try_to_dense_by_chunks("smgs phase-4b preflight time_entry")?;
-            let dq1 = spec
+            let mut dq1 = spec
                 .time_block
                 .design_exit
                 .try_to_dense_by_chunks("smgs phase-4b preflight time_exit")?;
-            let dqd1 = spec
+            let mut dqd1 = spec
                 .time_block
                 .design_derivative_exit
                 .try_to_dense_by_chunks("smgs phase-4b preflight time_deriv")?;
@@ -20291,6 +20366,15 @@ pub fn fit_survival_marginal_slope_terms(
             }
             let qd1_pf = spec.time_block.derivative_offset_exit.clone();
             let g_pf = spec.logslope_offset.clone();
+            // Replace the zero placeholder timewiggle tail columns with the
+            // analytic basis-derived time Jacobian at the β=0 pilot state, so
+            // the compiler sees the real time block instead of a structural
+            // zero (see `overwrite_timewiggle_time_slots_at_pilot`).
+            if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
+                overwrite_timewiggle_time_slots_at_pilot(
+                    &mut dq0, &mut dq1, &mut dqd1, timewiggle, &q0_pf, &q1_pf, &qd1_pf,
+                )?;
+            }
             let row_hess = SurvivalRowHessian::from_pilot_primary_state(
                 &q0_pf,
                 &q1_pf,
@@ -20946,15 +21030,15 @@ pub fn fit_survival_marginal_slope_terms(
                 let logslope_partition =
                     extract_term_partition_from_penalty_ranges(p_log, &log_penalty_ranges);
                 // Densify the operator-side designs once.
-                let dq0 = spec
+                let mut dq0 = spec
                     .time_block
                     .design_entry
                     .try_to_dense_by_chunks("smgs phase-4b active: time_entry")?;
-                let dq1 = spec
+                let mut dq1 = spec
                     .time_block
                     .design_exit
                     .try_to_dense_by_chunks("smgs phase-4b active: time_exit")?;
-                let dqd1 = spec
+                let mut dqd1 = spec
                     .time_block
                     .design_derivative_exit
                     .try_to_dense_by_chunks("smgs phase-4b active: time_deriv")?;
@@ -20985,6 +21069,23 @@ pub fn fit_survival_marginal_slope_terms(
                 }
                 let qd1_pilot = spec.time_block.derivative_offset_exit.clone();
                 let g_pilot = spec.logslope_offset.clone();
+                // Replace the zero placeholder timewiggle tail columns with the
+                // analytic basis-derived time Jacobian at the β=0 pilot state.
+                // Without this, the time-channel slots are structurally zero
+                // when `timewiggle(...)` disables the base time basis, and
+                // `compile_from_raw_grams` falsely reports "block 0 fully
+                // aliased" — dropping into the dense O(n·K·p) fallback.
+                if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
+                    overwrite_timewiggle_time_slots_at_pilot(
+                        &mut dq0,
+                        &mut dq1,
+                        &mut dqd1,
+                        timewiggle,
+                        &q0_pilot,
+                        &q1_pilot,
+                        &qd1_pilot,
+                    )?;
+                }
                 let row_hess = SurvivalRowHessian::from_pilot_primary_state(
                     &q0_pilot,
                     &q1_pilot,
@@ -23691,6 +23792,82 @@ mod tests {
         assert_eq!(
             family.exact_outer_derivative_order(&specs, &BlockwiseFitOptions::default()),
             ExactOuterDerivativeOrder::Second
+        );
+    }
+
+    #[test]
+    fn timewiggle_time_jacobian_nonzero_at_zero_beta_linearization() {
+        // Regression: when `timewiggle(...)` disables the base time basis the
+        // time block's coefficient slots are zero placeholder columns. The
+        // identifiability canonicaliser linearises every block at β=0 by
+        // calling `effective_jacobian_at` with `beta = &[]`. Previously the
+        // timewiggle callback inferred block existence from the (empty)
+        // coefficient slice, drove `beta_tw` empty, and returned an all-zero
+        // time Jacobian — so the compiler reported "block 0 fully aliased:
+        // structural residual Gram has no positive eigenspace". The true
+        // derivative ∂q/∂β_tw[j] = B_j(h) at β=0 is the wiggle basis value and
+        // is nonzero.
+        let (knots, degree, p_tw) = standard_test_time_wiggle();
+        assert!(p_tw > 0);
+        let n = 3usize;
+        // Base time basis disabled: p_base = 0, every column is a wiggle slot,
+        // densified as zeros (the placeholder tail the workflow appends).
+        let zeros = Arc::new(Array2::<f64>::zeros((n, p_tw)));
+        // Pilot coordinates in the interior of the knot span [0, 1].
+        let offset_entry = Arc::new(array![0.2, 0.4, 0.6]);
+        let offset_exit = Arc::new(array![0.5, 0.7, 0.9]);
+        let offset_deriv = Arc::new(array![1.0, 1.0, 1.0]);
+        let jac_cb = SmsTimewiggleTimeJacobian::new(
+            Arc::clone(&zeros),
+            Arc::clone(&zeros),
+            Arc::clone(&zeros),
+            Arc::new(Array2::<f64>::zeros((n, 0))), // p_m = 0
+            Arc::new(Array2::<f64>::zeros((n, 0))), // p_g = 0
+            Arc::clone(&offset_entry),
+            Arc::clone(&offset_exit),
+            Arc::clone(&offset_deriv),
+            knots.clone(),
+            degree,
+            p_tw,
+            0,
+            0,
+            1.0,
+        );
+        let empty: Vec<f64> = Vec::new();
+        let state = crate::custom_family::FamilyLinearizationState {
+            beta: &empty,
+            family_scalars: None,
+            channel_hessian: None,
+            probit_frailty_scale: 1.0,
+        };
+        let jac = crate::custom_family::BlockEffectiveJacobian::effective_jacobian_at(
+            &jac_cb, &state,
+        )
+        .expect("timewiggle time jacobian at beta=0");
+        assert_eq!(jac.dim(), (3 * n, p_tw));
+
+        // q0 rows (0..n) must equal the wiggle basis at the entry pilot
+        // coordinate (c_i = 1 at β_g = 0), not the broken all-zero placeholder.
+        let basis_entry =
+            monotone_wiggle_basis_with_derivative_order(offset_entry.view(), &knots, degree, 0)
+                .expect("entry basis");
+        for i in 0..n {
+            for j in 0..p_tw {
+                assert_close(
+                    jac[[i, j]],
+                    basis_entry[[i, j]],
+                    1e-12,
+                    &format!("q0 wiggle col ({i},{j})"),
+                );
+            }
+        }
+        // The time block must carry a positive structural eigenspace: its Gram
+        // Jᵀ J is not the zero matrix.
+        let gram = jac.t().dot(&jac);
+        let trace: f64 = (0..p_tw).map(|j| gram[[j, j]]).sum();
+        assert!(
+            trace > 1e-6,
+            "time block Gram is structurally zero (fully-aliased artifact): trace={trace}"
         );
     }
 
