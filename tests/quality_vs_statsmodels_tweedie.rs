@@ -355,7 +355,10 @@ fn tweedie_profile_loglik(pred_mu: &[f64], obs: &[f64], p: f64) -> f64 {
 /// construction of its search domain, is the principled object to test.
 fn recover_power_exponent(pred_mu: &[f64], obs: &[f64]) -> f64 {
     assert_eq!(pred_mu.len(), obs.len(), "power-exponent length mismatch");
-    assert!(!obs.is_empty(), "need at least one row for power estimation");
+    assert!(
+        !obs.is_empty(),
+        "need at least one row for power estimation"
+    );
     // Golden-section maximisation of ℓ(p) on the open interval (1,2). The bracket
     // is kept strictly interior so p̂ never reaches a degenerate endpoint.
     let inv_phi = 0.5 * (5.0_f64.sqrt() - 1.0); // 1/φ_golden ≈ 0.618

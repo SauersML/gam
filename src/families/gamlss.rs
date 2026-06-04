@@ -2352,6 +2352,21 @@ pub struct GaussianLocationScaleFitResult {
     pub wiggle_knots: Option<Array1<f64>>,
     pub wiggle_degree: Option<usize>,
     pub beta_link_wiggle: Option<Vec<f64>>,
+    /// Response standardization factor applied internally during fitting.
+    ///
+    /// The Gaussian location-scale path fits on `y / response_scale` so the
+    /// fixed log-σ soft floor `LOGB_SIGMA_FLOOR = 0.01` is *operationally*
+    /// scale-relative (1 % of the response spread) rather than absolute,
+    /// keeping κ = dlogσ/dη ≈ 1 across the realistic σ range and informing the
+    /// scale block like gamlss. The returned coefficient `blocks`, `beta`, and
+    /// link-wiggle knots/coefficients are already mapped back to **raw response
+    /// units** (the Location/Mean block scaled by `response_scale`, the Scale
+    /// block intercept shifted by `+ln(response_scale)`), so downstream
+    /// reconstruction `μ = X_mean·β` and `σ = 0.01 + exp(X_scale·β)` come out in
+    /// raw units with no further rescaling. This field records the factor that
+    /// was applied for transparency and covariance bookkeeping; it is `1.0`
+    /// when no standardization was needed (degenerate constant response).
+    pub response_scale: f64,
 }
 
 fn fit_binomial_mean_wiggle(
