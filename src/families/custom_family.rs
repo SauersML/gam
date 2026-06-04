@@ -15606,6 +15606,54 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // ── end timing-driven adaptive early-exit ────────────────────────
         }
 
+        // Explicit terminal verdict for the joint-Newton inner solve.
+        //
+        // The per-cycle `[PIRLS/JN] cyc=N/MAX … resid=… (tol=…)` line prints
+        // the KKT/step/objective gaps at every cycle but never states which
+        // criterion *terminated* the loop, so the final visible line on a
+        // budget-exhausted solve looks identical to an ordinary mid-run cycle
+        // (gam#744). A reader scanning a sweep log cannot tell a fit that
+        // reached a stationary point from one that simply ran out of cycles
+        // with the residual still orders of magnitude above tolerance and only
+        // the objective stalled. Emit one authoritative line, on every exit
+        // path, naming the terminating condition: `converged` is the honest
+        // status the result carries downstream, `budget_exhausted` distinguishes
+        // "ran the full cap" from an early certificate/divergence exit, and the
+        // residual/step/objective stall flags say *why*. A budget-exhausted,
+        // non-converged exit is logged at WARN so it is impossible to miss even
+        // when per-cycle INFO is filtered out; a clean convergence is INFO.
+        {
+            let budget_exhausted = cycles_done >= inner_max_cycles;
+            let terminator = if converged {
+                "KKT/certificate-converged"
+            } else if budget_exhausted {
+                "budget-exhausted (max cycles reached)"
+            } else {
+                "early-exit non-converged (divergence/stall guard)"
+            };
+            let verdict = format!(
+                "[PIRLS/joint-Newton terminal] converged={} terminator={} cycles={}/{} \
+                 best_residual_inf={:.3e} (tol={:.3e}) last_residual_below_tol={} \
+                 last_obj_change_below_tol={} objective={:.6e}; this is the status the inner \
+                 solve reports to the outer REML/LAML evaluation — a non-converged exit \
+                 (residual ≫ tol with only the objective stalled) is rejected, not accepted",
+                converged,
+                terminator,
+                cycles_done,
+                inner_max_cycles,
+                best_residual_seen,
+                last_residual_tol,
+                last_cycle_residual_below_tol,
+                last_cycle_obj_change_below_tol,
+                lastobjective,
+            );
+            if converged {
+                log::info!("{verdict}");
+            } else {
+                log::warn!("{verdict}");
+            }
+        }
+
         // If joint Newton converged, skip the blockwise loop entirely.
         if converged {
             let penalty_value = total_quadratic_penalty(
