@@ -16,10 +16,14 @@
 //! at the call site.
 //!
 //! The struct also drives the seed-loop's structural early-exit: when
-//! every observed failure carries the same `(diagnosis, carrying_block)`
-//! pair, every remaining ρ candidate will fail the same way, so the
-//! outer skips them instead of paying a full joint-Newton inner solve
-//! per duplicate.
+//! every observed failure carries the same genuinely structural
+//! `(diagnosis, carrying_block)` pair, every remaining ρ candidate will
+//! fail the same way, so the outer skips them instead of paying a full
+//! joint-Newton inner solve per duplicate. Numerical certificate
+//! refusals, such as a phantom multiplier with well-conditioned
+//! `H_pen`, are deliberately excluded: continuation treats them as
+//! recoverable by changing the ρ path, so startup must not infer that
+//! sibling seeds are impossible.
 
 use std::fmt::Write;
 
@@ -115,11 +119,11 @@ impl StartupStats {
     }
 }
 
-/// `(diagnosis, carrying_block)` key shared by all CertRefused
+/// `(diagnosis, carrying_block)` key shared by genuinely structural
 /// rejections. When every observed rejection carries the same key, the
 /// outer seed loop short-circuits — there is no point burning a full
 /// inner solve on each remaining ρ candidate just to watch the same
-/// structural rank deficiency reject it.
+/// structural rank/alias/active-set defect reject it.
 pub(crate) type StructuralKey = (KktRefusalDiagnosis, Option<String>);
 
 pub(crate) fn structural_key(failure: &InnerFailure) -> Option<StructuralKey> {
@@ -128,16 +132,23 @@ pub(crate) fn structural_key(failure: &InnerFailure) -> Option<StructuralKey> {
             diagnosis,
             carrying_block,
             ..
-        } => Some((*diagnosis, carrying_block.clone())),
+        } => match diagnosis {
+            KktRefusalDiagnosis::RankDeficientHPen
+            | KktRefusalDiagnosis::ActiveSetIncomplete
+            | KktRefusalDiagnosis::AliasingDetectedAtFit => {
+                Some((*diagnosis, carrying_block.clone()))
+            }
+            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => None,
+        },
         _ => None,
     }
 }
 
-/// `Some(key)` when every rejection in `rejections` is a CertRefused
-/// failure with an identical `(diagnosis, carrying_block)` pair, and
-/// the cascade has produced at least `min_count` observations. The
-/// caller uses this to break the seed loop early and to format the
-/// structural-cause diagnosis in the final error.
+/// `Some(key)` when every rejection in `rejections` is a genuinely
+/// structural failure with an identical `(diagnosis, carrying_block)`
+/// pair, and the cascade has produced at least `min_count`
+/// observations. The caller uses this to break the seed loop early and
+/// to format the structural-cause diagnosis in the final error.
 pub(crate) fn uniform_structural_key(
     rejections: &[SeedRejection],
     min_count: usize,
@@ -279,6 +290,20 @@ mod tests {
         )
     }
 
+    fn phantom_refused(seed_idx: usize, block: &str) -> SeedRejection {
+        SeedRejection::from_message(
+            seed_idx,
+            "validation",
+            format!(
+                "cycle=7 cert REFUSED: residual=5.0e+00 > 4·tol=4.0e-06; \
+                 carrying-block: {block} (idx=0, |g|=5.0e+00, |Sβ|=1.0e-03, \
+                 |∇L-Sβ|=5.0e+00, |β|=5.0e+01, width=20); \
+                 H_pen spectrum: λ_max=1.0e+03, λ_min=1.0e+00, cond=1.0e+03; \
+                 diagnosis: phantom_multiplier_with_well_conditioned_H"
+            ),
+        )
+    }
+
     #[test]
     fn structural_key_extracts_diagnosis_only_for_cert_refused() {
         let cert = cert_refused(0, "time_surface").failure;
@@ -295,6 +320,12 @@ mod tests {
         assert!(
             structural_key(&domain).is_none(),
             "non-cert-refused failures must not present a structural key"
+        );
+
+        let phantom = phantom_refused(0, "marginal_surface").failure;
+        assert!(
+            structural_key(&phantom).is_none(),
+            "well-conditioned phantom multipliers are rho-local certificate refusals, not structural seed-loop keys"
         );
     }
 
@@ -339,6 +370,37 @@ mod tests {
             "likelihood evaluation failed: NaN response".to_string(),
         );
         assert!(uniform_structural_key(&[cert, domain], 2).is_none());
+    }
+
+    #[test]
+    fn uniform_structural_key_ignores_repeated_phantom_multiplier_refusals() {
+        let rejections = vec![
+            phantom_refused(0, "marginal_surface"),
+            phantom_refused(1, "marginal_surface"),
+            phantom_refused(2, "marginal_surface"),
+        ];
+        assert!(
+            uniform_structural_key(&rejections, 2).is_none(),
+            "phantom_multiplier_with_well_conditioned_H is recoverable by trying another rho seed; startup must not skip sibling seeds"
+        );
+    }
+
+    #[test]
+    fn no_seeds_payload_does_not_call_phantom_refusals_structural() {
+        let rejections = vec![
+            phantom_refused(0, "marginal_surface"),
+            phantom_refused(1, "marginal_surface"),
+        ];
+        let stats = StartupStats::from_rejections(5, 5, 2, 0, &rejections);
+        let key = uniform_structural_key(&rejections, 2);
+        let msg = format_no_seeds_passed("custom family", &stats, &rejections, key.as_ref(), "");
+        assert!(msg.contains("rejected_by_kkt=2"));
+        assert!(!msg.contains("uniform CertRefused"));
+        assert!(!msg.contains("early-exit triggered"));
+        assert!(
+            msg.contains("phantom_multiplier_with_well_conditioned_H"),
+            "per-seed diagnostics must still preserve the actual refusal"
+        );
     }
 
     /// Simulates the outer seed loop's iterative behaviour: failures

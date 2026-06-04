@@ -5475,25 +5475,22 @@ fn run_outer_with_plan(
     let mut seed_rejections: Vec<SeedRejection> = Vec::new();
     let mut last_classified_reason_idx: usize = 0;
     // Set to `Some(key)` when every observed rejection so far carries
-    // the same `(KktRefusalDiagnosis, carrying_block)` pair AND we've
-    // seen at least `STRUCTURAL_EARLY_EXIT_MIN_COUNT` consistent
-    // failures. Once set, the remaining ρ candidates are skipped.
+    // the same genuinely structural `(KktRefusalDiagnosis,
+    // carrying_block)` pair AND we've seen at least
+    // `STRUCTURAL_EARLY_EXIT_MIN_COUNT` consistent failures. Once set,
+    // the remaining ρ candidates are skipped.
     let mut structural_early_exit_key: Option<(
         crate::families::custom_family::KktRefusalDiagnosis,
         Option<String>,
     )> = None;
-    // Two matching uniform CertRefused observations are enough to call
-    // the failure structural and break the loop. A single observation
-    // could be transient noise — an exploration seed in a degenerate
-    // ρ corner, a one-off domain excursion that happens to surface at
-    // the cert site. Requiring k=2 across DIFFERENT seeds is the
-    // smallest sample size that distinguishes noise from a structural
-    // rank deficiency of the penalized Hessian; raising k=3+ would only
-    // burn additional full joint-Newton inner solves for no extra
-    // discriminative power because uniform CertRefused is itself a
-    // strong signal once you've seen it twice on independent ρ
-    // candidates that landed at the same `(diagnosis, carrying_block)`
-    // pair.
+    // Two matching structural observations are enough to break the
+    // loop. A single observation could be transient noise — an
+    // exploration seed in a degenerate ρ corner, a one-off domain
+    // excursion that happens to surface at the cert site. Requiring
+    // k=2 across DIFFERENT seeds is the smallest sample size that
+    // distinguishes noise from a structural rank/alias/active-set
+    // defect; recoverable cert refusals such as phantom multipliers are
+    // not eligible for this key.
     const STRUCTURAL_EARLY_EXIT_MIN_COUNT: usize = 2;
 
     'seed_attempts: for (seed_idx, seed) in seeds.iter().enumerate() {
@@ -5514,7 +5511,7 @@ fn run_outer_with_plan(
                 uniform_structural_key(&seed_rejections, STRUCTURAL_EARLY_EXIT_MIN_COUNT)
             {
                 log::warn!(
-                    "[OUTER] {context}: structural early-exit after {} uniform CertRefused \
+                    "[OUTER] {context}: structural early-exit after {} uniform structural \
                      rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
                     seed_rejections.len(),
                     key.0.as_str(),
@@ -6570,7 +6567,7 @@ fn run_outer_with_plan(
             .clone()
             .or_else(|| uniform_structural_key(&seed_rejections, 1));
         let early_exit_note = if structural_early_exit_key.is_some() {
-            "early-exit triggered: every observed seed reported the same structural CertRefused"
+            "early-exit triggered: every observed seed reported the same structural rejection"
                 .to_string()
         } else if stopped_early_due_to_limit {
             format!(
