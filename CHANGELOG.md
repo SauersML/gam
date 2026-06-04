@@ -16,6 +16,17 @@ The two packages are versioned independently — `gam` tracks the Rust engine,
 `gamfit` the Python wheel — but released together. Each entry is headed with the
 git tag and both package versions.
 
+## v0.3.86 — gam 0.3.86 / gamfit 0.1.158 (2026-06-04)
+
+### Fixed
+
+- **The #751 survival marginal-slope release is now build-gate clean and wired
+  through PyPI metadata.** The release lockfile now carries the current
+  `gamfit` version, custom-family output-channel defaults use the real
+  single-output channel map instead of a sentinel empty-spec shortcut, and SAE
+  fixed-decoder projection grids are selected from the atom basis kind rather
+  than mandatory evaluator methods with no-op `None` implementations.
+
 ## v0.3.85 — gam 0.3.85 / gamfit 0.1.157 (2026-06-04)
 
 ### Fixed
