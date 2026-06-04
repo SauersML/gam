@@ -25066,7 +25066,7 @@ fn predict_columns(
 }
 
 /// Build the held-out calibration fold needed by the conformal calibrator: a
-/// [`PredictInput`] over the calibration design (so the model's own predict
+/// `PredictInput` over the calibration design (so the model's own predict
 /// engine produces `μ̂(x_cal)` and `s(x_cal)` at exactly those points,
 /// identically to the test path) and the calibration response `y_cal`. The
 /// response column is resolved from the saved formula and must be present in
