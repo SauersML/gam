@@ -16,11 +16,38 @@ use std::hint::black_box;
 use std::time::Duration;
 
 const BENCH_INNER_CYCLES: usize = 1;
+#[cfg(target_os = "linux")]
+const BENCH_MULTI_RHS_PROBE: usize = 4;
+#[cfg(target_os = "linux")]
+const BIOBANK_HVP_PRIMARY_R: usize = 20;
+#[cfg(target_os = "linux")]
+const BIOBANK_HVP_P_TOTAL: usize = 44;
 
 fn bench_margslope_flex_biobank_cycle0(c: &mut Criterion) {
     gam::init_parallelism();
     let n = DEFAULT_REPRO_N;
     let inner_cycles = BENCH_INNER_CYCLES;
+    #[cfg(target_os = "linux")]
+    {
+        let scratch = gam::gpu::bms_flex_row::bms_flex_row_hvp_multi_scratch_bytes_for_shape(
+            n,
+            BIOBANK_HVP_P_TOTAL,
+            BENCH_MULTI_RHS_PROBE,
+        )
+        .expect("biobank-shape multi-RHS HVP scratch budget");
+        let per_rhs_full_row_cache =
+            (n * BIOBANK_HVP_PRIMARY_R * BIOBANK_HVP_PRIMARY_R * std::mem::size_of::<f64>()) as u64
+                * BENCH_MULTI_RHS_PROBE as u64;
+        eprintln!(
+            "[MS-FLEX-BIOBANK-BENCH-HVP-MULTI-RHS] n={} p={} r={} rhs={} scratch_mib={:.3} full_row_cache_per_rhs_mib={:.3}",
+            n,
+            BIOBANK_HVP_P_TOTAL,
+            BIOBANK_HVP_PRIMARY_R,
+            BENCH_MULTI_RHS_PROBE,
+            scratch as f64 / (1024.0 * 1024.0),
+            per_rhs_full_row_cache as f64 / (1024.0 * 1024.0),
+        );
+    }
     let mut group = c.benchmark_group("margslope_flex_biobank_hv_pattern");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(30));

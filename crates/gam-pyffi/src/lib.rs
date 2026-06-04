@@ -9142,6 +9142,34 @@ const SAE_SPHERE_BASIS_SIZE: usize = 7;
 /// (`O(K·N·256·p)` for periodic atoms). See
 /// [`gam::terms::sae_manifold::SaeManifoldTerm::seed_coords_by_decoder_projection`].
 const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
+
+fn seed_oos_softmax_logits_from_projection_residuals(
+    term: &mut SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+    tau: f64,
+) {
+    let (n_obs, p_out) = target.dim();
+    let k_atoms = term.k_atoms();
+    let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    let mut decoded = vec![0.0_f64; p_out];
+    for row in 0..n_obs {
+        for atom_idx in 0..k_atoms {
+            term.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
+            let mut err = 0.0_f64;
+            for out_col in 0..p_out {
+                let diff = target[[row, out_col]] - decoded[out_col];
+                err += diff * diff;
+            }
+            seeded_logits[[row, atom_idx]] = -err / tau;
+        }
+        let reference = seeded_logits[[row, k_atoms - 1]];
+        for atom_idx in 0..k_atoms {
+            seeded_logits[[row, atom_idx]] -= reference;
+        }
+    }
+    term.assignment.logits.assign(&seeded_logits);
+}
+
 /// Duchon nullspace knob `m` for a SAE-manifold atom of latent dimension
 /// `dim`, sized so the native reproducing-norm Gram (`PenaltySource::Primary`)
 /// on the scale-free polyharmonic basis is well-posed in every dimension.
@@ -9426,6 +9454,7 @@ fn sae_manifold_fit<'py>(
         analytic_penalties,
         top_k,
         jumprelu_threshold,
+        true,
         // This precomputed-basis entry point hands the term verbatim seeds;
         // routing-seed refinement is owned by the higher-level `fit_minimal`
         // auto path, so do not re-seed here (random_state unused when off).
@@ -9461,6 +9490,7 @@ fn sae_manifold_fit_inner<'py>(
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
     jumprelu_threshold: f64,
+    native_ard_enabled: bool,
     seed_refine_routing: bool,
     seed_refine_random_state: u64,
 ) -> PyResult<Py<PyDict>> {
@@ -9717,7 +9747,16 @@ fn sae_manifold_fit_inner<'py>(
         .map_err(py_value_error)?;
     }
 
-    let log_ard: Vec<Array1<f64>> = atom_dim.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
+    let log_ard: Vec<Array1<f64>> = atom_dim
+        .iter()
+        .map(|&d| {
+            if native_ard_enabled {
+                Array1::<f64>::zeros(d)
+            } else {
+                Array1::<f64>::zeros(0)
+            }
+        })
+        .collect();
     // Drive ρ (sparsity / smoothing λ's + per-atom ARD precisions) through the
     // one generic outer cascade — the same engine the GAM REML path uses
     // (`OuterProblem::run` → `plan()` → derivative-free / FD outer strategy).
@@ -11263,6 +11302,7 @@ fn sae_build_atom_plans(
     initial_logits = None,
     initial_coords = None,
     jumprelu_threshold = 0.0,
+    native_ard_enabled = true,
 ))]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
@@ -11286,6 +11326,7 @@ fn sae_manifold_fit_minimal<'py>(
     initial_logits: Option<PyReadonlyArray2<'py, f64>>,
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
     jumprelu_threshold: f64,
+    native_ard_enabled: bool,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -11516,6 +11557,7 @@ fn sae_manifold_fit_minimal<'py>(
         analytic_penalties,
         top_k,
         jumprelu_threshold,
+        native_ard_enabled,
         // Refine the cold routing seed (alternating coordinate projection +
         // weighted decoder LSQ) only when BOTH the logits and the coordinates
         // are cold — i.e. the auto seed is in control. A user-supplied warm
@@ -11911,24 +11953,7 @@ fn sae_manifold_predict_oos<'py>(
             .map_err(py_value_error)?;
     }
     if !logits_are_warm && assignment_kind == "softmax" {
-        let mut seeded_logits = Array2::<f64>::zeros((n_obs, k_atoms));
-        let mut decoded = vec![0.0_f64; p_out];
-        for row in 0..n_obs {
-            for atom_idx in 0..k_atoms {
-                term.atoms[atom_idx].fill_decoded_row(row, &mut decoded);
-                let mut err = 0.0_f64;
-                for out_col in 0..p_out {
-                    let diff = x_view[[row, out_col]] - decoded[out_col];
-                    err += diff * diff;
-                }
-                seeded_logits[[row, atom_idx]] = -err / tau;
-            }
-            let reference = seeded_logits[[row, k_atoms - 1]];
-            for atom_idx in 0..k_atoms {
-                seeded_logits[[row, atom_idx]] -= reference;
-            }
-        }
-        term.assignment.logits.assign(&seeded_logits);
+        seed_oos_softmax_logits_from_projection_residuals(&mut term, x_view, tau);
     }
     let log_ard: Vec<Array1<f64>> = effective_atom_dim
         .iter()
@@ -11946,6 +11971,9 @@ fn sae_manifold_predict_oos<'py>(
         )
         .map_err(py_value_error)?;
 
+    if !logits_are_warm && assignment_kind == "softmax" {
+        seed_oos_softmax_logits_from_projection_residuals(&mut term, x_view, tau);
+    }
     let mut assignments = term.assignment.assignments();
     let mut fitted = term.fitted();
     if let Some(k_top) = top_k {

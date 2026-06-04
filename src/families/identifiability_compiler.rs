@@ -336,12 +336,22 @@ pub fn compile_with_dual_metric(
         let g_s_trace: f64 = (0..p_b).map(|i| g_s[[i, i]].max(0.0)).sum();
         let d = keep_positive_eigenspace(&g_s, n, k, g_s_trace)?;
         if d.ncols() == 0 {
-            return Err(CompilerError::FullyAliased {
-                block_idx: idx,
-                reason: format!(
-                    "structural residual Gram has no positive eigenspace (block of width {p_b} fully aliased by cumulative structural anchor)"
-                ),
+            if anchor_h.ncols() == 0 {
+                return Err(CompilerError::FullyAliased {
+                    block_idx: idx,
+                    reason: format!(
+                        "structural residual Gram has no positive eigenspace (block of width {p_b} has zero structural span before any anchor exists)"
+                    ),
+                });
+            }
+            compiled.push(CompiledBlock {
+                t_lw: Array2::<f64>::zeros((p_b, 0)),
+                anchor_correction: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
+                r_lw: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
+                anchor_evaluator: None,
             });
+            raw_anchor_h = concat_cols(&raw_anchor_h, w_h);
+            continue;
         }
 
         // Pass 2 (curvature): form W^H_b · D and residualise against the
@@ -357,12 +367,22 @@ pub fn compile_with_dual_metric(
         let g_h_trace: f64 = (0..p_d).map(|i| g_h[[i, i]].max(0.0)).sum();
         let t_inner = keep_positive_eigenspace(&g_h, n, k, g_h_trace)?;
         if t_inner.ncols() == 0 {
-            return Err(CompilerError::FullyAliased {
-                block_idx: idx,
-                reason: format!(
-                    "curvature residual Gram has no positive eigenspace within structurally-kept basis (block of width {p_b}, structural-kept {p_d})"
-                ),
+            if anchor_h.ncols() == 0 {
+                return Err(CompilerError::FullyAliased {
+                    block_idx: idx,
+                    reason: format!(
+                        "curvature residual Gram has no positive eigenspace within structurally-kept basis (block of width {p_b}, structural-kept {p_d}) before any anchor exists"
+                    ),
+                });
+            }
+            compiled.push(CompiledBlock {
+                t_lw: Array2::<f64>::zeros((p_b, 0)),
+                anchor_correction: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
+                r_lw: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
+                anchor_evaluator: None,
             });
+            raw_anchor_h = concat_cols(&raw_anchor_h, w_h);
+            continue;
         }
 
         // Compose V = D · T_inner (raw-block → kept).
@@ -992,9 +1012,10 @@ pub struct CompiledMap {
 ///    and keep positive eigvecs `U`. Then `T_b = E · U`.
 /// 3. Append: `T ← [T, T_b]`.
 ///
-/// Returns [`CompilerError::FullyAliased`] when any block's `Q+` has zero
-/// columns (block fully structurally aliased) or its `U` has zero
-/// columns (block fully curvature-aliased within structurally-kept span).
+/// Returns [`CompilerError::FullyAliased`] only when the first block has no
+/// usable structural/curvature span. Later fully absorbed blocks compile to a
+/// zero-width block range, which is the reduced-coordinate representation of
+/// the lower-priority block owning no degrees of freedom.
 pub fn compile_from_raw_grams(
     gram_h: &Array2<f64>,
     gram_struct: &Array2<f64>,
@@ -1073,12 +1094,17 @@ pub fn compile_from_raw_grams(
         // p_raw stands in as the "n*K" scale for the closed-form tolerance.
         let q_plus = keep_positive_eigenspace(&g_s_res, p_raw, 1, g_s_bb_trace)?;
         if q_plus.ncols() == 0 {
-            return Err(CompilerError::FullyAliased {
-                block_idx: idx,
-                reason: format!(
-                    "structural residual Gram has no positive eigenspace (block of width {p_b} fully aliased by cumulative anchor in K^S)"
-                ),
-            });
+            if t_cum.ncols() == 0 {
+                return Err(CompilerError::FullyAliased {
+                    block_idx: idx,
+                    reason: format!(
+                        "structural residual Gram has no positive eigenspace (block of width {p_b} has zero structural span before any anchor exists)"
+                    ),
+                });
+            }
+            let at = t_cum.ncols();
+            compiled_block_ranges.push(at..at);
+            continue;
         }
         // D = (P_b − T R_S) · Q+ (p_raw × k_kept). Build (P_b − T R_S)
         // explicitly as a p_raw × p_b matrix: columns of P_b are columns
@@ -1114,12 +1140,17 @@ pub fn compile_from_raw_grams(
         let g_h_dd_trace: f64 = (0..k_kept).map(|i| d_t_kh_d[[i, i]].max(0.0)).sum();
         let u_mat = keep_positive_eigenspace(&g_h_res, p_raw, 1, g_h_dd_trace)?;
         if u_mat.ncols() == 0 {
-            return Err(CompilerError::FullyAliased {
-                block_idx: idx,
-                reason: format!(
-                    "curvature residual Gram has no positive eigenspace within structurally-kept basis (block of width {p_b}, structural-kept {k_kept})"
-                ),
-            });
+            if t_cum.ncols() == 0 {
+                return Err(CompilerError::FullyAliased {
+                    block_idx: idx,
+                    reason: format!(
+                        "curvature residual Gram has no positive eigenspace within structurally-kept basis (block of width {p_b}, structural-kept {k_kept}) before any anchor exists"
+                    ),
+                });
+            }
+            let at = t_cum.ncols();
+            compiled_block_ranges.push(at..at);
+            continue;
         }
         // E = D − T · R_H (p_raw × k_kept); T_b = E · U.
         let mut e_mat = d_mat.clone();
@@ -2194,7 +2225,8 @@ mod tests {
     }
 
     /// Block B is a column-duplicate of block A in the structural metric
-    /// → `compile_from_raw_grams` must return FullyAliased on block 1.
+    /// → the lower-priority block compiles to zero width instead of making
+    /// callers skip reduced-coordinate construction.
     #[test]
     fn compile_from_raw_grams_full_structural_alias() {
         let n = 10;
@@ -2209,13 +2241,75 @@ mod tests {
             &gram_struct,
             &raw_ranges,
             &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("lower-priority full alias should compile to zero width");
+        assert_eq!(res.compiled_block_ranges[0].len(), 2);
+        assert_eq!(res.compiled_block_ranges[1].len(), 0);
+        assert_eq!(res.raw_from_compiled.dim(), (4, 2));
+        assert!(
+            res.raw_from_compiled
+                .slice(s![raw_ranges[1].clone(), ..])
+                .iter()
+                .all(|v| v.abs() <= 1.0e-12),
+            "zero-width block must not retain raw coefficient directions in T"
         );
-        match res {
-            Err(CompilerError::FullyAliased { block_idx, .. }) => {
-                assert_eq!(block_idx, 1, "alias should fire on block 1, not 0");
-            }
-            other => panic!("expected FullyAliased on block 1, got {other:?}"),
-        }
+    }
+
+    #[test]
+    fn compile_from_raw_grams_three_block_full_logslope_alias_keeps_fast_path() {
+        let n = 24;
+        let time = Array2::from_shape_fn((n, 2), |(i, j)| {
+            ((i + 1) as f64 * (j + 2) as f64 * 0.17).sin()
+        });
+        let marginal = Array2::from_shape_fn((n, 1), |(i, _)| ((i + 3) as f64 * 0.11).cos());
+        let logslope = marginal.clone();
+        let p_time = time.ncols();
+        let p_marg = marginal.ncols();
+        let p_log = logslope.ncols();
+        let raw_ranges = vec![
+            0..p_time,
+            p_time..(p_time + p_marg),
+            (p_time + p_marg)..(p_time + p_marg + p_log),
+        ];
+        let channel_blocks = PrimaryChannelBlocks {
+            blocks: vec![
+                vec![Some(time.clone())],
+                vec![Some(marginal.clone())],
+                vec![Some(logslope.clone())],
+            ],
+        };
+        let row_hess = DiagonalScalarRowHessian::new(Array1::ones(n));
+        let gram_h =
+            build_raw_grams_from_channel_blocks(&channel_blocks, &row_hess, &raw_ranges).unwrap();
+        let gram_struct = build_raw_grams_structural(&channel_blocks, &raw_ranges);
+
+        let map = compile_from_raw_grams(
+            &gram_h,
+            &gram_struct,
+            &raw_ranges,
+            &[BlockOrder::Time, BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("fully aliased logslope block should not skip the compiled-map path");
+
+        assert_eq!(map.compiled_block_ranges[0].len(), p_time);
+        assert_eq!(map.compiled_block_ranges[1].len(), p_marg);
+        assert_eq!(map.compiled_block_ranges[2].len(), 0);
+        assert_eq!(
+            map.raw_from_compiled.dim(),
+            (p_time + p_marg + p_log, p_time + p_marg)
+        );
+        let x_raw = {
+            let mut out = Array2::<f64>::zeros((n, p_time + p_marg + p_log));
+            out.slice_mut(s![.., raw_ranges[0].clone()]).assign(&time);
+            out.slice_mut(s![.., raw_ranges[1].clone()])
+                .assign(&marginal);
+            out.slice_mut(s![.., raw_ranges[2].clone()])
+                .assign(&logslope);
+            out
+        };
+        let x_compiled = fast_ab(&x_raw, &map.raw_from_compiled);
+        let rrqr = rrqr_with_permutation(&x_compiled, default_rrqr_rank_alpha()).unwrap();
+        assert_eq!(rrqr.rank, x_compiled.ncols());
     }
 
     /// Partial alias: block B's first column duplicates A; second column is

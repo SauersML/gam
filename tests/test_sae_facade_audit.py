@@ -206,6 +206,16 @@ def _diagnostics(n_atoms: int, trust: list[float] | None = None) -> dict[str, ob
 
 
 class _FakeRustModule:
+    def build_info(self) -> dict[str, list[str]]:
+        return {
+            "sae_row_block_penalties": [
+                "ard",
+                "isometry",
+                "block_orthogonality",
+                "scad_mcp",
+            ],
+        }
+
     def sae_manifold_reconstruction_r2(self, observed, fitted) -> float:
         observed = np.asarray(observed, dtype=float)
         fitted = np.asarray(fitted, dtype=float)
@@ -234,7 +244,9 @@ class _FakeRustModule:
         initial_logits,
         initial_coords,
         jumprelu_threshold,
+        native_ard_enabled,
     ):
+        self.last_native_ard_enabled = bool(native_ard_enabled)
         z = np.asarray(z, dtype=float)
         n_obs, p_out = z.shape
         k_atoms = len(atom_basis)
@@ -426,3 +438,35 @@ def test_mixed_basis_topology_e2e(monkeypatch):
     )
     assert fit.atom_topology == "mixed"
     assert fit.atom_topologies == ["circle", "sphere"]
+
+
+def test_ard_per_atom_controls_native_ard_plumbing(monkeypatch):
+    fake = _FakeRustModule()
+    monkeypatch.setattr(sae, "rust_module", lambda: fake)
+    x = np.random.default_rng(3).standard_normal((24, 3))
+
+    sae.sae_manifold_fit(
+        Z=x,
+        K=2,
+        d_atom=1,
+        n_iter=2,
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        gate_sparsity="l1",
+        nuclear_norm_weight=0.0,
+        decoder_incoherence_weight=0.0,
+    )
+    assert fake.last_native_ard_enabled is False
+
+    sae.sae_manifold_fit(
+        Z=x,
+        K=2,
+        d_atom=1,
+        n_iter=2,
+        isometry_weight=0.0,
+        ard_per_atom=True,
+        gate_sparsity="l1",
+        nuclear_norm_weight=0.0,
+        decoder_incoherence_weight=0.0,
+    )
+    assert fake.last_native_ard_enabled is True

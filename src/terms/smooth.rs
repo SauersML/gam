@@ -14987,10 +14987,7 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
 /// and the hyper_dirs builder `try_build_spatial_log_kappa_derivativeinfo_list`
 /// all consult it, so the outer optimizer's `n_params = rho_dim + Σ ψ_per_term`
 /// always matches the gradient length produced by the inner unified evaluator.
-fn spatial_term_uses_per_axis_psi(
-    resolvedspec: &TermCollectionSpec,
-    term_idx: usize,
-) -> bool {
+fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_idx: usize) -> bool {
     let Some(d) = get_spatial_feature_dim(resolvedspec, term_idx) else {
         return false;
     };
