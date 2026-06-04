@@ -325,51 +325,6 @@ mod tests {
         Ok(host)
     }
 
-    fn make_nonaffine_cells() -> Vec<GpuDenestedCubicCell> {
-        vec![
-            GpuDenestedCubicCell {
-                left: -1.25,
-                right: -0.2,
-                c0: -0.35,
-                c1: 0.85,
-                c2: 0.4,
-                c3: 0.0,
-            },
-            GpuDenestedCubicCell {
-                left: -0.5,
-                right: 1.7,
-                c0: 0.2,
-                c1: -0.6,
-                c2: 0.25,
-                c3: 0.18,
-            },
-            GpuDenestedCubicCell {
-                left: 0.1,
-                right: 0.9,
-                c0: 0.05,
-                c1: 0.0,
-                c2: -0.3,
-                c3: 0.12,
-            },
-            GpuDenestedCubicCell {
-                left: -2.0,
-                right: 2.0,
-                c0: 0.0,
-                c1: 0.0,
-                c2: 0.5,
-                c3: 0.0,
-            },
-            GpuDenestedCubicCell {
-                left: -0.8,
-                right: 0.4,
-                c0: 0.1,
-                c1: -0.25,
-                c2: 0.05,
-                c3: -0.07,
-            },
-        ]
-    }
-
     /// Phase 4 parity test: device-resident moments must match the CPU
     /// `evaluate_cell_derivative_moments_uncached` reference across all
     /// three branches (`Affine`, `NonAffineFinite`, `AffineTail`) at the
