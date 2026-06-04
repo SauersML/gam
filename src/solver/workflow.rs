@@ -8085,6 +8085,151 @@ mod tests {
     }
 
     #[test]
+    fn materialize_bernoulli_marginal_slope_prunes_hypertension_style_scalar_alias() {
+        let data = Dataset {
+            headers: vec![
+                "event".to_string(),
+                "sex".to_string(),
+                "entry_age_z".to_string(),
+                "current_age_ns_1".to_string(),
+                "current_age_ns_2".to_string(),
+                "current_age_ns_3".to_string(),
+                "current_age_ns_4".to_string(),
+                "prs_z".to_string(),
+                "PC1".to_string(),
+                "PC2".to_string(),
+                "PC3".to_string(),
+            ],
+            values: Array2::from_shape_vec(
+                (8, 11),
+                vec![
+                    0.0, 0.0, -1.4, 1.0, -0.6, 0.36, -0.216, -1.3, -1.0, 0.2, 0.7, 1.0, 1.0, -0.9,
+                    1.0, -0.2, 0.04, -0.008, -0.8, -0.5, -0.3, 0.5, 0.0, 0.0, -0.5, 1.0, 0.1, 0.01,
+                    0.001, -0.2, 0.1, 0.4, -0.2, 1.0, 1.0, -0.1, 1.0, 0.4, 0.16, 0.064, 0.3, 0.7,
+                    -0.6, 0.3, 0.0, 0.0, 0.3, 1.0, 0.7, 0.49, 0.343, 0.8, 1.2, 0.9, 0.0, 1.0, 1.0,
+                    0.7, 1.0, 1.0, 1.0, 1.0, 1.2, 1.6, -0.8, -0.4, 0.0, 0.0, 1.1, 1.0, 1.3, 1.69,
+                    2.197, 1.6, -1.4, 0.8, -0.9, 1.0, 1.0, 1.5, 1.0, 1.6, 2.56, 4.096, 2.0, 0.3,
+                    -1.1, 0.6,
+                ],
+            )
+            .expect("hypertension-style BMS scalar-alias test data shape"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "event".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "sex".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "entry_age_z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "current_age_ns_1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "current_age_ns_2".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "current_age_ns_3".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "current_age_ns_4".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "prs_z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC2".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC3".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Binary,
+                ColumnKindTag::Binary,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+            ],
+        };
+        let config = FitConfig {
+            logslope_formula: Some("matern(PC1, PC2, PC3, centers=3)".to_string()),
+            z_column: Some("prs_z".to_string()),
+            ..FitConfig::default()
+        };
+        let materialized = materialize(
+            "event ~ matern(PC1, PC2, PC3, centers=3) + sex + entry_age_z + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4",
+            &data,
+            &config,
+        )
+        .expect("BMS materialization should prune the local-column-3 scalar alias");
+        let FitRequest::BernoulliMarginalSlope(request) = materialized.request else {
+            panic!("expected Bernoulli marginal-slope request");
+        };
+        let kept: Vec<&str> = request
+            .spec
+            .marginalspec
+            .linear_terms
+            .iter()
+            .map(|term| term.name.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                "sex",
+                "entry_age_z",
+                "current_age_ns_2",
+                "current_age_ns_3",
+                "current_age_ns_4"
+            ]
+        );
+        assert_eq!(request.spec.marginalspec.smooth_terms.len(), 1);
+        assert_eq!(request.spec.logslopespec.smooth_terms.len(), 1);
+        assert!(
+            materialized
+                .inference_notes
+                .iter()
+                .any(|note| note.contains("current_age_ns_1")),
+            "materialization should report the removed hypertension-style scalar alias; notes={:?}",
+            materialized.inference_notes
+        );
+    }
+
+    #[test]
     fn materialize_bernoulli_marginal_slope_rejects_constrained_redundant_scalar_term() {
         let data = Dataset {
             headers: vec![
@@ -8096,8 +8241,8 @@ mod tests {
             values: Array2::from_shape_vec(
                 (6, 4),
                 vec![
-                    0.0, -2.0, 1.0, -1.2, 1.0, -1.0, 1.0, -0.4, 0.0, 0.0, 1.0, 0.1, 1.0,
-                    1.0, 1.0, 0.5, 0.0, 2.0, 1.0, 1.1, 1.0, 3.0, 1.0, 1.7,
+                    0.0, -2.0, 1.0, -1.2, 1.0, -1.0, 1.0, -0.4, 0.0, 0.0, 1.0, 0.1, 1.0, 1.0, 1.0,
+                    0.5, 0.0, 2.0, 1.0, 1.1, 1.0, 3.0, 1.0, 1.7,
                 ],
             )
             .expect("BMS constrained redundant scalar test data shape"),
@@ -8156,11 +8301,8 @@ mod tests {
     fn bernoulli_marginal_slope_prune_rejects_penalized_redundant_scalar_term() {
         let data = Dataset {
             headers: vec!["event".to_string(), "constant_spline_col".to_string()],
-            values: Array2::from_shape_vec(
-                (4, 2),
-                vec![0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0],
-            )
-            .expect("BMS penalized redundant scalar test data shape"),
+            values: Array2::from_shape_vec((4, 2), vec![0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0])
+                .expect("BMS penalized redundant scalar test data shape"),
             schema: DataSchema {
                 columns: vec![
                     SchemaColumn {
