@@ -22954,6 +22954,13 @@ fn compute_joint_geometry<F: CustomFamily + Clone + Send + Sync + 'static>(
             let s_dense = s.as_dense_cow();
             h.scaled_add(lambdas[k], &*s_dense);
         }
+        // Exact-Newton families may return a Hessian assembled from directional
+        // callbacks whose off-diagonal entries differ by floating-point order
+        // or, for pseudo-Laplace tests, by a deliberately non-symmetric input
+        // that is accepted only after symmetrization. Export the same symmetric
+        // penalized Hessian used by the determinant/covariance path instead of
+        // letting result assembly reject an otherwise valid fit geometry.
+        symmetrize_dense_in_place(&mut h);
         return Ok(Some(FitGeometry {
             penalized_hessian: h.into(),
             working_weights,
