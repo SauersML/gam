@@ -59,8 +59,7 @@ impl BernoulliRigidRowKernel {
                         let marginal_eta = self.block_states[0].eta[row];
                         let marginal = self.family.marginal_link_map(marginal_eta)?;
                         let slope = self.block_states[1].eta[row];
-                        self.family
-                            .rigid_row_third_full(row, marginal_eta, marginal, slope)
+                        self.family.rigid_row_third_full(row, marginal, slope)
                     })
                     .collect::<Result<Vec<_>, String>>()
                     .expect(
@@ -87,8 +86,7 @@ impl BernoulliRigidRowKernel {
                         let marginal_eta = self.block_states[0].eta[row];
                         let marginal = self.family.marginal_link_map(marginal_eta)?;
                         let slope = self.block_states[1].eta[row];
-                        self.family
-                            .rigid_row_fourth_full(row, marginal_eta, marginal, slope)
+                        self.family.rigid_row_fourth_full(row, marginal, slope)
                     })
                     .collect::<Result<Vec<_>, String>>()
                     .expect(

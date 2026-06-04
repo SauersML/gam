@@ -6407,6 +6407,130 @@ mod tests {
         }
     }
 
+    /// Higher-order analogue of [`empirical_rigid_closed_form_matches_multidir_jet`]:
+    /// the §2 IFT closed forms for the rigid empirical-grid **third** and
+    /// **fourth** derivative tensors must reproduce, component by component, the
+    /// 6- and 8-direction `empirical_rigid_neglog_jet` tensors they replaced in
+    /// `rigid_row_third_full` / `rigid_row_fourth_full`. Reading canonical
+    /// symmetric entries directly (`T[0][0][0]=∂³_mmm`, … `T[1][1][1]=∂³_ggg`)
+    /// makes a sign or algebra slip in any single intercept derivative localise
+    /// to one assertion.
+    #[test]
+    fn empirical_rigid_higher_order_closed_form_matches_jet() {
+        let grid_nodes = array![-1.15, -1.05, -0.95, -0.8, -0.65, -0.45, 0.1, 0.9, 2.4, 4.7];
+        let grid_w = array![1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.5, 0.35, 0.2, 0.1];
+        let grid = build_empirical_z_grid(&grid_nodes, &grid_w, 7, "higher-order cf vs jet grid")
+            .expect("grid");
+
+        let row_z = array![0.3, -0.8, 1.6];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![1.0, 0.0, 1.0]),
+            weights: Arc::new(array![1.0, 0.7, 1.3]),
+            z: Arc::new(row_z.clone()),
+            latent_measure: LatentMeasureKind::GlobalEmpirical { grid: grid.clone() },
+            gaussian_frailty_sd: Some(0.82),
+            ..default_test_family()
+        };
+
+        let marginal_etas = [0.25, -0.4, 0.7];
+        let slopes = [1.35, 0.9, 1.1];
+        let dirs6 = [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ];
+        let dirs8 = [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+        ];
+        for row in 0..row_z.len() {
+            let marginal_eta = marginal_etas[row];
+            let marginal = family.marginal_link_map(marginal_eta).expect("link map");
+            let slope = slopes[row];
+
+            // ── Third order ──
+            let cf3 = family
+                .empirical_rigid_third_full_closed_form(
+                    row,
+                    marginal,
+                    slope,
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("third closed form");
+            let jet3 = family
+                .empirical_rigid_neglog_jet(
+                    row,
+                    marginal_eta,
+                    marginal,
+                    slope,
+                    &dirs6,
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("third jet");
+            // (component, closed-form entry, jet mask)
+            let third_checks = [
+                ("mmm", cf3[0][0][0], 1 | 4 | 16),
+                ("mmg", cf3[0][0][1], 1 | 4 | 2),
+                ("mgg", cf3[0][1][1], 1 | 2 | 8),
+                ("ggg", cf3[1][1][1], 2 | 8 | 32),
+            ];
+            for (name, cf, mask) in third_checks {
+                let jet = jet3.coeff(mask);
+                assert!(
+                    (cf - jet).abs() <= 1e-5 + 1e-5 * jet.abs(),
+                    "row {row}: third {name} closed-form {cf} vs jet {jet}"
+                );
+            }
+
+            // ── Fourth order ──
+            let cf4 = family
+                .empirical_rigid_fourth_full_closed_form(
+                    row,
+                    marginal,
+                    slope,
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("fourth closed form");
+            let jet4 = family
+                .empirical_rigid_neglog_jet(
+                    row,
+                    marginal_eta,
+                    marginal,
+                    slope,
+                    &dirs8,
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("fourth jet");
+            let fourth_checks = [
+                ("mmmm", cf4[0][0][0][0], 1 | 4 | 16 | 64),
+                ("mmmg", cf4[0][0][0][1], 1 | 4 | 16 | 2),
+                ("mmgg", cf4[0][0][1][1], 1 | 4 | 2 | 8),
+                ("mggg", cf4[0][1][1][1], 1 | 2 | 8 | 32),
+                ("gggg", cf4[1][1][1][1], 2 | 8 | 32 | 128),
+            ];
+            for (name, cf, mask) in fourth_checks {
+                let jet = jet4.coeff(mask);
+                assert!(
+                    (cf - jet).abs() <= 1e-4 + 1e-4 * jet.abs(),
+                    "row {row}: fourth {name} closed-form {cf} vs jet {jet}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn gaussian_rigid_intercept_miscalibrates_skewed_empirical_law() {
         let nodes = vec![-0.95, -0.7, -0.45, -0.2, 0.4, 1.3, 3.1];

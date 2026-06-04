@@ -381,6 +381,278 @@ impl BernoulliMarginalSlopeFamily {
         Ok((neglog, grad, [[h_mm, h_mg], [h_mg, h_gg]]))
     }
 
+    /// Closed-form uncontracted **third**-derivative tensor of the rigid
+    /// empirical-grid row negative log-likelihood, in primary coordinates
+    /// `(m = marginal_eta, g = slope)`. Replaces the 6-direction
+    /// `empirical_rigid_neglog_jet` (a 64-coefficient `MultiDirJet` driven
+    /// through six Newton intercept passes) used by [`Self::rigid_row_third_full`].
+    ///
+    /// Continues the implicit-function-theorem program of
+    /// [`Self::empirical_rigid_primary_grad_hess_closed_form`] one order higher.
+    /// Writing the grid calibration as `G(a, g) = μ(m)` with
+    /// `G_{p,r} = Σ_k π_k Φ^{(p+r)}(η_k)·(s·x_k)^r` and `η_k = a + s·g·x_k`,
+    /// the higher intercept derivatives follow by repeatedly applying the total
+    /// operators `Dm(G_{p,r}) = G_{p+1,r}·a_m` and
+    /// `Dg(G_{p,r}) = G_{p+1,r}·a_g + G_{p,r+1}` to the order-`n−1` identity and
+    /// solving for the top term `D·a_{(i,j)}` (`D = G_a`). The needed CDF
+    /// derivatives are `Φ' = φ`, `Φ'' = −η·φ`, `Φ''' = (η²−1)·φ`. The marginal
+    /// link enters only as `μ', μ'', μ'''` (`marginal.mu1/mu2/mu3`), so this is
+    /// correct for any marginal link. The negative-log-likelihood chain reuses
+    /// the standard-normal signed-probit scalar kernel (`u1=s·k1`, `u2=k2`,
+    /// `u3=s·k3`).
+    pub(super) fn empirical_rigid_third_full_closed_form(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<[[[f64; 2]; 2]; 2], String> {
+        let s = self.probit_frailty_scale();
+        let a =
+            self.empirical_rigid_intercept_for_row(row, marginal, slope, nodes, measure_weights)?;
+        let observed_slope = s * slope;
+
+        // Single grid pass: calibration moments through third CDF order.
+        // `c2 = Φ''·π = −η·π·φ`, `c3 = Φ'''·π = (η²−1)·π·φ`.
+        let (mut d, mut g_g) = (0.0f64, 0.0f64);
+        let (mut g_aa, mut g_ag, mut g_gg) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut g_aaa, mut g_aag, mut g_agg, mut g_ggg) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
+            let eta_k = a + observed_slope * node;
+            let w_phi = weight * normal_pdf(eta_k);
+            let sx = s * node;
+            let c2 = -eta_k * w_phi;
+            let c3 = (eta_k * eta_k - 1.0) * w_phi;
+            d += w_phi;
+            g_g += w_phi * sx;
+            g_aa += c2;
+            g_ag += c2 * sx;
+            g_gg += c2 * sx * sx;
+            g_aaa += c3;
+            g_aag += c3 * sx;
+            g_agg += c3 * sx * sx;
+            g_ggg += c3 * sx * sx * sx;
+        }
+        if !d.is_finite() || d <= 0.0 {
+            return Err(format!(
+                "empirical rigid third-full: non-positive calibration denominator D={d} at row {row}"
+            ));
+        }
+
+        // Intercept derivatives a_{(i,j)} via the implicit function theorem.
+        let a_m = marginal.mu1 / d;
+        let a_g = -g_g / d;
+        let a_mm = (marginal.mu2 - g_aa * a_m * a_m) / d;
+        let coup = g_aa * a_g + g_ag; // recurring d/dg coupling factor on `a`
+        let a_mg = -coup * a_m / d;
+        let a_gg = -(g_aa * a_g * a_g + 2.0 * g_ag * a_g + g_gg) / d;
+        let a_mmm = (marginal.mu3 - 3.0 * g_aa * a_m * a_mm - g_aaa * a_m * a_m * a_m) / d;
+        let a_mmg =
+            -(coup * a_mm + (g_aaa * a_g + g_aag) * a_m * a_m + 2.0 * g_aa * a_m * a_mg) / d;
+        let a_mgg = -(2.0 * coup * a_mg
+            + (g_aaa * a_g * a_g + 2.0 * g_aag * a_g + g_aa * a_gg + g_agg) * a_m)
+            / d;
+        let a_ggg = -(3.0 * a_gg * coup
+            + g_aaa * a_g * a_g * a_g
+            + 3.0 * g_aag * a_g * a_g
+            + 3.0 * g_agg * a_g
+            + g_ggg)
+            / d;
+
+        // Observed-index derivatives at this row's z. All second-and-higher
+        // derivatives equal the intercept's (`s·g·z` is linear in `g`); only
+        // the first g-derivative carries the extra `s·z`.
+        let z = self.z[row];
+        let eta_m = a_m;
+        let eta_g = a_g + s * z;
+
+        // Signed-probit chain to third order (shared scalar kernel).
+        let w = self.weights[row];
+        let sign = 2.0 * self.y[row] - 1.0;
+        let m_signed = sign * (a + observed_slope * z);
+        let (k1, k2, k3, _) = signed_probit_neglog_derivatives_up_to_fourth(m_signed, w)?;
+        let u1 = sign * k1;
+        let u2 = k2;
+        let u3 = sign * k3;
+
+        // ℓ_ijk = u3·η_iη_jη_k + u2·(η_ijη_k + η_ikη_j + η_jkη_i) + u1·η_ijk.
+        let t_mmm = u3 * eta_m * eta_m * eta_m + u2 * 3.0 * eta_m * a_mm + u1 * a_mmm;
+        let t_mmg = u3 * eta_m * eta_m * eta_g
+            + u2 * (eta_g * a_mm + 2.0 * eta_m * a_mg)
+            + u1 * a_mmg;
+        let t_mgg = u3 * eta_m * eta_g * eta_g
+            + u2 * (eta_m * a_gg + 2.0 * eta_g * a_mg)
+            + u1 * a_mgg;
+        let t_ggg = u3 * eta_g * eta_g * eta_g + u2 * 3.0 * eta_g * a_gg + u1 * a_ggg;
+        Ok(third_full_from_symmetric_components(
+            t_mmm, t_mmg, t_mgg, t_ggg,
+        ))
+    }
+
+    /// Closed-form uncontracted **fourth**-derivative tensor of the rigid
+    /// empirical-grid row negative log-likelihood, in primary coordinates
+    /// `(m = marginal_eta, g = slope)`. Replaces the 8-direction
+    /// `empirical_rigid_neglog_jet` (a 256-coefficient `MultiDirJet` through six
+    /// Newton intercept passes) used by [`Self::rigid_row_fourth_full`].
+    ///
+    /// Same implicit-function-theorem program as
+    /// [`Self::empirical_rigid_third_full_closed_form`], one order higher.
+    /// Intercept derivatives `a_{(i,j)}` (i m's, j g's, i+j≤4) come from
+    /// differentiating the order-`n−1` identity of `G(a, g) = μ(m)` via the
+    /// total operators `Dm(G_{p,r}) = G_{p+1,r}·a_m` and
+    /// `Dg(G_{p,r}) = G_{p+1,r}·a_g + G_{p,r+1}` and isolating `D·a_{(i,j)}`.
+    /// Needed CDF derivatives: `Φ'=φ`, `Φ''=−ηφ`, `Φ'''=(η²−1)φ`,
+    /// `Φ''''=(3η−η³)φ`. The marginal link enters only as `μ'..μ''''`
+    /// (`marginal.mu1..mu4`). The ℓ-chain uses the shared signed-probit kernel
+    /// (`u1=s·k1, u2=k2, u3=s·k3, u4=k4`).
+    pub(super) fn empirical_rigid_fourth_full_closed_form(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
+        let s = self.probit_frailty_scale();
+        let a =
+            self.empirical_rigid_intercept_for_row(row, marginal, slope, nodes, measure_weights)?;
+        let observed_slope = s * slope;
+
+        // Single grid pass: calibration moments through fourth CDF order.
+        let (mut d, mut g_g) = (0.0f64, 0.0f64);
+        let (mut g_aa, mut g_ag, mut g_gg) = (0.0f64, 0.0f64, 0.0f64);
+        let (mut g_aaa, mut g_aag, mut g_agg, mut g_ggg) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        let (mut g_aaaa, mut g_aaag, mut g_aagg, mut g_aggg, mut g_gggg) =
+            (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
+            let eta_k = a + observed_slope * node;
+            let w_phi = weight * normal_pdf(eta_k);
+            let sx = s * node;
+            let eta2 = eta_k * eta_k;
+            let c2 = -eta_k * w_phi; // Φ''·π
+            let c3 = (eta2 - 1.0) * w_phi; // Φ'''·π
+            let c4 = (3.0 * eta_k - eta_k * eta2) * w_phi; // Φ''''·π
+            let sx2 = sx * sx;
+            let sx3 = sx2 * sx;
+            let sx4 = sx3 * sx;
+            d += w_phi;
+            g_g += w_phi * sx;
+            g_aa += c2;
+            g_ag += c2 * sx;
+            g_gg += c2 * sx2;
+            g_aaa += c3;
+            g_aag += c3 * sx;
+            g_agg += c3 * sx2;
+            g_ggg += c3 * sx3;
+            g_aaaa += c4;
+            g_aaag += c4 * sx;
+            g_aagg += c4 * sx2;
+            g_aggg += c4 * sx3;
+            g_gggg += c4 * sx4;
+        }
+        if !d.is_finite() || d <= 0.0 {
+            return Err(format!(
+                "empirical rigid fourth-full: non-positive calibration denominator D={d} at row {row}"
+            ));
+        }
+
+        // Intercept derivatives via the implicit function theorem.
+        let (mu1, mu2, mu3, mu4) = (marginal.mu1, marginal.mu2, marginal.mu3, marginal.mu4);
+        let a_m = mu1 / d;
+        let a_g = -g_g / d;
+        // P = Dg(D) = G_aa·a_g + G_ag, with its g-derivatives Pg, Pgg.
+        let p = g_aa * a_g + g_ag;
+        let a_mm = (mu2 - g_aa * a_m * a_m) / d;
+        let a_mg = -p * a_m / d;
+        let a_gg = -(g_aa * a_g * a_g + 2.0 * g_ag * a_g + g_gg) / d;
+        let pg = g_aaa * a_g * a_g + 2.0 * g_aag * a_g + g_aa * a_gg + g_agg;
+        let aag = g_aaa * a_g + g_aag; // Dg(G_aa)
+        let a_mmm = (mu3 - 3.0 * g_aa * a_m * a_mm - g_aaa * a_m * a_m * a_m) / d;
+        let a_mmg = -(p * a_mm + aag * a_m * a_m + 2.0 * g_aa * a_m * a_mg) / d;
+        let a_mgg = -(2.0 * p * a_mg + pg * a_m) / d;
+        let a_ggg = -(3.0 * a_gg * p
+            + g_aaa * a_g * a_g * a_g
+            + 3.0 * g_aag * a_g * a_g
+            + 3.0 * g_agg * a_g
+            + g_ggg)
+            / d;
+        // Pgg = Dg(Pg); R1 = Dg(G_aaa·a_g + G_aag) = Dg(aag).
+        let pgg = g_aaaa * a_g * a_g * a_g
+            + 3.0 * g_aaag * a_g * a_g
+            + 3.0 * g_aaa * a_g * a_gg
+            + 3.0 * g_aagg * a_g
+            + 3.0 * g_aag * a_gg
+            + g_aggg;
+        let r1 = g_aaaa * a_g * a_g + 2.0 * g_aaag * a_g + g_aaa * a_gg + g_aagg;
+        let aaag = g_aaaa * a_g + g_aaag; // Dg(G_aaa)
+        let a_mmmm = (mu4
+            - g_aa * (4.0 * a_m * a_mmm + 3.0 * a_mm * a_mm)
+            - 6.0 * g_aaa * a_m * a_m * a_mm
+            - g_aaaa * a_m * a_m * a_m * a_m)
+            / d;
+        let a_mmmg = -(p * a_mmm
+            + 3.0 * aag * a_m * a_mm
+            + 3.0 * g_aa * a_mg * a_mm
+            + 3.0 * g_aa * a_m * a_mmg
+            + aaag * a_m * a_m * a_m
+            + 3.0 * g_aaa * a_m * a_m * a_mg)
+            / d;
+        let a_mmgg = -(2.0 * p * a_mmg
+            + pg * a_mm
+            + r1 * a_m * a_m
+            + 4.0 * aag * a_m * a_mg
+            + 2.0 * g_aa * a_mg * a_mg
+            + 2.0 * g_aa * a_m * a_mgg)
+            / d;
+        let a_mggg = -(3.0 * p * a_mgg + 3.0 * pg * a_mg + pgg * a_m) / d;
+        let a_gggg = -(4.0 * p * a_ggg
+            + 6.0 * g_aaa * a_g * a_g * a_gg
+            + 12.0 * g_aag * a_g * a_gg
+            + 6.0 * g_agg * a_gg
+            + 3.0 * g_aa * a_gg * a_gg
+            + g_aaaa * a_g * a_g * a_g * a_g
+            + 4.0 * g_aaag * a_g * a_g * a_g
+            + 6.0 * g_aagg * a_g * a_g
+            + 4.0 * g_aggg * a_g
+            + g_gggg)
+            / d;
+
+        // Observed-index derivatives (only η_g carries the extra s·z).
+        let z = self.z[row];
+        let em = a_m;
+        let eg = a_g + s * z;
+
+        // Signed-probit chain to fourth order (shared scalar kernel).
+        let w = self.weights[row];
+        let sign = 2.0 * self.y[row] - 1.0;
+        let (k1, k2, k3, k4) =
+            signed_probit_neglog_derivatives_up_to_fourth(sign * (a + observed_slope * z), w)?;
+        let (u1, u2, u3, u4) = (sign * k1, k2, sign * k3, k4);
+
+        // ℓ_ijkl via Faà di Bruno: u4·(4 η's) + u3·(η_ij + 2 singles, 6 terms)
+        // + u2·(3 pair-pair + 4 triple-single) + u1·η_ijkl.
+        let t_mmmm =
+            u4 * em * em * em * em + u3 * 6.0 * a_mm * em * em + u2 * (3.0 * a_mm * a_mm + 4.0 * a_mmm * em) + u1 * a_mmmm;
+        let t_mmmg = u4 * em * em * em * eg
+            + u3 * (3.0 * a_mm * em * eg + 3.0 * a_mg * em * em)
+            + u2 * (3.0 * a_mm * a_mg + a_mmm * eg + 3.0 * a_mmg * em)
+            + u1 * a_mmmg;
+        let t_mmgg = u4 * em * em * eg * eg
+            + u3 * (a_mm * eg * eg + 4.0 * a_mg * em * eg + a_gg * em * em)
+            + u2 * (a_mm * a_gg + 2.0 * a_mg * a_mg + 2.0 * a_mmg * eg + 2.0 * a_mgg * em)
+            + u1 * a_mmgg;
+        let t_mggg = u4 * em * eg * eg * eg
+            + u3 * (3.0 * a_mg * eg * eg + 3.0 * a_gg * em * eg)
+            + u2 * (3.0 * a_mg * a_gg + 3.0 * a_mgg * eg + a_ggg * em)
+            + u1 * a_mggg;
+        let t_gggg =
+            u4 * eg * eg * eg * eg + u3 * 6.0 * a_gg * eg * eg + u2 * (3.0 * a_gg * a_gg + 4.0 * a_ggg * eg) + u1 * a_gggg;
+        Ok(fourth_full_from_symmetric_components(
+            t_mmmm, t_mmmg, t_mmgg, t_mggg, t_gggg,
+        ))
+    }
+
     pub(super) fn primary_component_jet(
         n_dirs: usize,
         base: f64,
@@ -742,13 +1014,12 @@ impl BernoulliMarginalSlopeFamily {
     pub(super) fn rigid_row_third_contracted(
         &self,
         row: usize,
-        marginal_eta: f64,
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
         dir_q: f64,
         dir_g: f64,
     ) -> Result<[[f64; 2]; 2], String> {
-        let full = self.rigid_row_third_full(row, marginal_eta, marginal, slope)?;
+        let full = self.rigid_row_third_full(row, marginal, slope)?;
         Ok(contract_third_full(&full, dir_q, dir_g))
     }
 
@@ -775,7 +1046,7 @@ impl BernoulliMarginalSlopeFamily {
                     let marginal_eta = block_states[0].eta[r];
                     let marginal = self.marginal_link_map(marginal_eta)?;
                     let slope = block_states[1].eta[r];
-                    self.rigid_row_third_full(r, marginal_eta, marginal, slope)
+                    self.rigid_row_third_full(r, marginal, slope)
                 })
                 .collect::<Result<Vec<_>, String>>()
         });
@@ -803,7 +1074,7 @@ impl BernoulliMarginalSlopeFamily {
                     let marginal_eta = block_states[0].eta[r];
                     let marginal = self.marginal_link_map(marginal_eta)?;
                     let slope = block_states[1].eta[r];
-                    self.rigid_row_fourth_full(r, marginal_eta, marginal, slope)
+                    self.rigid_row_fourth_full(r, marginal, slope)
                 })
                 .collect::<Result<Vec<_>, String>>()
         });
@@ -861,7 +1132,6 @@ impl BernoulliMarginalSlopeFamily {
     pub(super) fn rigid_row_third_full(
         &self,
         row: usize,
-        marginal_eta: f64,
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<[[[f64; 2]; 2]; 2], String> {
@@ -877,36 +1147,13 @@ impl BernoulliMarginalSlopeFamily {
                 )?;
                 Ok(rigid_transformed_third_full(marginal, &kernel))
             }
-            Some(grid) => {
-                // Six identity directions: positions 0, 2, 4 are `e_q`,
-                // positions 1, 3, 5 are `e_g`. The mask encoding for
-                // `MultiDirJet::coeff` is `Σ 2^position`, so a 3-element
-                // subset like {0, 2, 4} (three `e_q`s) becomes mask
-                // 1 | 4 | 16 = 21 = 0b010101 — the partial `∂³f/∂q∂q∂q`.
-                let jet = self.empirical_rigid_neglog_jet(
-                    row,
-                    marginal_eta,
-                    marginal,
-                    slope,
-                    &[
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                    ],
-                    &grid.nodes,
-                    &grid.weights,
-                )?;
-                let t_qqq = jet.coeff(1 | 4 | 16); // {0, 2, 4}: e_q × e_q × e_q
-                let t_qqg = jet.coeff(1 | 4 | 2); // {0, 2, 1}: e_q × e_q × e_g
-                let t_qgg = jet.coeff(1 | 2 | 8); // {0, 1, 3}: e_q × e_g × e_g
-                let t_ggg = jet.coeff(2 | 8 | 32); // {1, 3, 5}: e_g × e_g × e_g
-                Ok(third_full_from_symmetric_components(
-                    t_qqq, t_qqg, t_qgg, t_ggg,
-                ))
-            }
+            Some(grid) => self.empirical_rigid_third_full_closed_form(
+                row,
+                marginal,
+                slope,
+                &grid.nodes,
+                &grid.weights,
+            ),
         }
     }
 
@@ -927,7 +1174,6 @@ impl BernoulliMarginalSlopeFamily {
     pub(super) fn rigid_row_fourth_full(
         &self,
         row: usize,
-        marginal_eta: f64,
         marginal: BernoulliMarginalLinkMap,
         slope: f64,
     ) -> Result<[[[[f64; 2]; 2]; 2]; 2], String> {
@@ -943,39 +1189,13 @@ impl BernoulliMarginalSlopeFamily {
                 )?;
                 Ok(rigid_transformed_fourth_full(marginal, &kernel))
             }
-            Some(grid) => {
-                // Eight identity directions: positions 0, 2, 4, 6 are `e_q`,
-                // positions 1, 3, 5, 7 are `e_g`. The mask encoding for
-                // `MultiDirJet::coeff` is `Σ 2^position`, so a 4-element
-                // subset like {0, 2, 4, 6} (four `e_q`s) becomes mask
-                // 1 | 4 | 16 | 64 = 85 — the partial `∂⁴f/∂q∂q∂q∂q`.
-                let jet = self.empirical_rigid_neglog_jet(
-                    row,
-                    marginal_eta,
-                    marginal,
-                    slope,
-                    &[
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                        [1.0, 0.0],
-                        [0.0, 1.0],
-                    ],
-                    &grid.nodes,
-                    &grid.weights,
-                )?;
-                let t_qqqq = jet.coeff(1 | 4 | 16 | 64); // {0, 2, 4, 6}: 4× e_q
-                let t_qqqg = jet.coeff(1 | 4 | 16 | 2); // {0, 2, 4, 1}: 3× e_q + 1× e_g
-                let t_qqgg = jet.coeff(1 | 4 | 2 | 8); // {0, 2, 1, 3}: 2× e_q + 2× e_g
-                let t_qggg = jet.coeff(1 | 2 | 8 | 32); // {0, 1, 3, 5}: 1× e_q + 3× e_g
-                let t_gggg = jet.coeff(2 | 8 | 32 | 128); // {1, 3, 5, 7}: 4× e_g
-                Ok(fourth_full_from_symmetric_components(
-                    t_qqqq, t_qqqg, t_qqgg, t_qggg, t_gggg,
-                ))
-            }
+            Some(grid) => self.empirical_rigid_fourth_full_closed_form(
+                row,
+                marginal,
+                slope,
+                &grid.nodes,
+                &grid.weights,
+            ),
         }
     }
 
@@ -10564,7 +10784,6 @@ impl BernoulliMarginalSlopeFamily {
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
                         let t = self.rigid_row_third_contracted(
                             row,
-                            marginal_eta,
                             marginal,
                             g,
                             dq,
@@ -10655,7 +10874,6 @@ impl BernoulliMarginalSlopeFamily {
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
                         let t = self.rigid_row_third_contracted(
                             row,
-                            marginal_eta,
                             marginal,
                             g,
                             dq,
@@ -10844,7 +11062,6 @@ impl BernoulliMarginalSlopeFamily {
                             .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
                         let t = self.rigid_row_third_contracted(
                             row,
-                            marginal_eta,
                             marginal,
                             g,
                             dq,
@@ -10874,7 +11091,6 @@ impl BernoulliMarginalSlopeFamily {
                                 .dot_row_view(row, d_beta_flat.slice(s![slices.logslope.clone()]));
                             let t = self.rigid_row_third_contracted(
                                 row,
-                                marginal_eta,
                                 marginal,
                                 g,
                                 dq,
