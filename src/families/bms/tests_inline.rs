@@ -6322,6 +6322,91 @@ mod tests {
         assert!((calibrated - target_mu).abs() <= 1e-10);
     }
 
+    /// The §2 implicit-function-theorem closed form for the rigid
+    /// empirical-grid kernel must reproduce — to tight tolerance — the per-row
+    /// negative log-likelihood, primary gradient, and primary Hessian that the
+    /// `empirical_rigid_neglog_jet` `MultiDirJet` path (six Newton
+    /// intercept-refinement passes) produced before it was replaced in
+    /// `rigid_row_kernel_eval`. Pinning the two paths together means a sign or
+    /// algebra regression in the analytic intercept derivatives breaks here.
+    #[test]
+    fn empirical_rigid_closed_form_matches_multidir_jet() {
+        let grid_nodes = array![-1.15, -1.05, -0.95, -0.8, -0.65, -0.45, 0.1, 0.9, 2.4, 4.7];
+        let grid_w = array![1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.5, 0.35, 0.2, 0.1];
+        let grid =
+            build_empirical_z_grid(&grid_nodes, &grid_w, 7, "closed-form vs jet grid").expect("grid");
+
+        // Global empirical latent measure → every row routes through the
+        // empirical path. Three rows span both event labels and a non-unit
+        // observation weight.
+        let row_z = array![0.3, -0.8, 1.6];
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(array![1.0, 0.0, 1.0]),
+            weights: Arc::new(array![1.0, 0.7, 1.3]),
+            z: Arc::new(row_z.clone()),
+            latent_measure: LatentMeasureKind::GlobalEmpirical { grid: grid.clone() },
+            gaussian_frailty_sd: Some(0.82),
+            ..default_test_family()
+        };
+
+        let marginal_etas = [0.25, -0.4, 0.7];
+        let slopes = [1.35, 0.9, 1.1];
+        for row in 0..row_z.len() {
+            let marginal_eta = marginal_etas[row];
+            let marginal = family.marginal_link_map(marginal_eta).expect("link map");
+            let slope = slopes[row];
+
+            let (neglog_cf, grad_cf, hess_cf) = family
+                .empirical_rigid_primary_grad_hess_closed_form(
+                    row,
+                    marginal,
+                    slope,
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("closed form");
+
+            let jet = family
+                .empirical_rigid_neglog_jet(
+                    row,
+                    marginal_eta,
+                    marginal,
+                    slope,
+                    &[[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]],
+                    &grid.nodes,
+                    &grid.weights,
+                )
+                .expect("jet");
+            let neglog_jet = jet.coeff(0);
+            let grad_jet = [jet.coeff(1), jet.coeff(2)];
+            let hess_jet = [
+                [jet.coeff(1 | 4), jet.coeff(1 | 2)],
+                [jet.coeff(1 | 2), jet.coeff(2 | 8)],
+            ];
+
+            assert!(
+                (neglog_cf - neglog_jet).abs() <= 1e-8,
+                "row {row}: neglog closed-form {neglog_cf} vs jet {neglog_jet}"
+            );
+            for k in 0..2 {
+                assert!(
+                    (grad_cf[k] - grad_jet[k]).abs() <= 1e-7,
+                    "row {row}: grad[{k}] closed-form {} vs jet {}",
+                    grad_cf[k],
+                    grad_jet[k]
+                );
+                for l in 0..2 {
+                    assert!(
+                        (hess_cf[k][l] - hess_jet[k][l]).abs() <= 1e-6,
+                        "row {row}: hess[{k}][{l}] closed-form {} vs jet {}",
+                        hess_cf[k][l],
+                        hess_jet[k][l]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn gaussian_rigid_intercept_miscalibrates_skewed_empirical_law() {
         let nodes = vec![-0.95, -0.7, -0.45, -0.2, 0.4, 1.3, 3.1];

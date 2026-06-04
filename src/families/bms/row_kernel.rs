@@ -112,8 +112,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         let marginal_eta = self.block_states[0].eta[row];
         let marginal = self.family.marginal_link_map(marginal_eta)?;
         let g = self.block_states[1].eta[row];
-        self.family
-            .rigid_row_kernel_eval(row, marginal_eta, marginal, g)
+        self.family.rigid_row_kernel_eval(row, marginal, g)
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 2] {
