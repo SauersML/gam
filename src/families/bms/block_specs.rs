@@ -326,10 +326,9 @@ fn marginal_penalties_with_influence_ridge(
                     .for_each(|agg, &value| *agg += value / scale);
             }
         }
-        if let Some(shrinkage) =
-            crate::terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
-                .ok()
-                .flatten()
+        if let Some(shrinkage) = crate::terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
+            .ok()
+            .flatten()
         {
             // `shrinkage.sym_penalty` is `Z·Zᵀ` (p_m × p_m), PSD with unit
             // eigenvalues on the null directions and zero on the penalized span.
@@ -544,28 +543,28 @@ fn bernoulli_marginal_slope_runaway_error_from_argmax(
     inner_status: &str,
     eval_label: &str,
 ) -> Option<String> {
-    let (label, local_col, beta_abs, explanation) =
-        if let Some((label, local_col, beta_abs)) = parametric_argmax
-            && beta_abs >= BMS_PROBIT_SEPARATION_BETA_INF
-        {
-            (
-                label,
-                local_col,
-                beta_abs,
-                "an unpenalized parametric marginal direction has no stable finite probit optimum",
-            )
-        } else if let Some((label, local_col, beta_abs)) = block_argmax
-            && beta_abs >= BMS_PROBIT_SEPARATION_BETA_INF
-        {
-            (
-                label,
-                local_col,
-                beta_abs,
-                "a marginal smooth direction is trading off against the logslope surface; this is the under-constrained marginal/logslope coupling that appears when the score is correlated with the shared surface covariates",
-            )
-        } else {
-            return None;
-        };
+    let (label, local_col, beta_abs, explanation) = if let Some((label, local_col, beta_abs)) =
+        parametric_argmax
+        && beta_abs >= BMS_PROBIT_SEPARATION_BETA_INF
+    {
+        (
+            label,
+            local_col,
+            beta_abs,
+            "an unpenalized parametric marginal direction has no stable finite probit optimum",
+        )
+    } else if let Some((label, local_col, beta_abs)) = block_argmax
+        && beta_abs >= BMS_PROBIT_SEPARATION_BETA_INF
+    {
+        (
+            label,
+            local_col,
+            beta_abs,
+            "a marginal smooth direction is trading off against the logslope surface; this is the under-constrained marginal/logslope coupling that appears when the score is correlated with the shared surface covariates",
+        )
+    } else {
+        return None;
+    };
     if beta_abs < BMS_PROBIT_SEPARATION_BETA_INF {
         return None;
     }
@@ -1279,10 +1278,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let mut pinned_rho_slots: Vec<(usize, f64)> = Vec::new();
     let mut pinned_cursor = marginal_design.penalties.len();
     if nullspace_ridge_slots == 1 {
-        pinned_rho_slots.push((
-            pinned_cursor,
-            MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
-        ));
+        pinned_rho_slots.push((pinned_cursor, MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA));
         pinned_cursor += 1;
     }
     if influence_ridge_slots == 1 {
