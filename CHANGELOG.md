@@ -18,6 +18,12 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.93 — gam 0.3.93 / gamfit 0.1.165 (2026-06-04)
+
+### Fixed
+
+- **Probit Bernoulli marginal-slope outer REML no longer diverges (#754).** The marginal-surface block left its parametric + smooth-nullspace directions fully unpenalized, so on a balanced steep-gradient probit sample a near-separating direction's coefficient ran to ~50 and the outer ARC solve hit max-iter / rejected every seed (`phantom_multiplier_with_well_conditioned_H`) — basis-independent (Matérn and Duchon both hit it). A small **fixed** nullspace-shrinkage ridge (`Z·Zᵀ` over the null space of the aggregate marginal smooth penalties), pinned out of REML at `log λ = ln(1e-2)` so it cannot be driven to zero, now bounds the flat direction and gives the outer solve a finite optimum — negligible against the n-scaled probit Fisher information of any identified direction.
+
 ## v0.3.92 — gam 0.3.92 / gamfit 0.1.164 (2026-06-04)
 
 ### Changed
