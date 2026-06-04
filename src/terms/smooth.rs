@@ -3745,7 +3745,23 @@ fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) 
 /// was left at the auto sentinel (`0.0`), overwrite it with
 /// [`auto_initial_length_scale`].
 fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothTermSpec) {
-    match &mut term.basis {
+    auto_init_length_scale_in_basis(data, &mut term.basis);
+}
+
+/// Replace the `0.0` auto-init length-scale sentinel with a data-derived value
+/// for any Matern / thin-plate kernel reachable from this basis — including the
+/// inner kernel of a `by=`/factor-smooth wrapper.
+///
+/// `by=<factor>` and the sum-to-zero factor smooth wrap a spatial kernel inside
+/// `SmoothBasisSpec::ByVariable` / `SmoothBasisSpec::FactorSumToZero` /
+/// `SmoothBasisSpec::BySmooth`, so the wrapper variant is what the planner sees.
+/// Without recursing into the wrapped basis the inner ThinPlate/Matern keeps the
+/// `0.0` sentinel (the post-`1605b3a6e` builder default), which makes the kernel
+/// distance divide by `length_scale² = 0`, producing a non-finite design at both
+/// fit and predict time. Recurse so the inner kernel is initialized identically
+/// to a top-level one.
+fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut SmoothBasisSpec) {
+    match basis {
         SmoothBasisSpec::Matern {
             feature_cols, spec, ..
         } => {
@@ -3759,6 +3775,13 @@ fn auto_init_length_scale_in_place(data: ArrayView2<'_, f64>, term: &mut SmoothT
             if spec.length_scale == 0.0 {
                 spec.length_scale = auto_initial_length_scale(data, feature_cols);
             }
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            auto_init_length_scale_in_basis(data, inner);
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            auto_init_length_scale_in_basis(data, smooth);
         }
         _ => {}
     }
