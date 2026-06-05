@@ -6883,9 +6883,9 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
 /// Lives on the β tier and targets the flat SAE decoder coefficient block. The
 /// β layout concatenates the per-atom decoder blocks in atom order: atom `k`
 /// owns `M_k · p_out` coefficients, stored as
-/// `β[off_k + a·p_out + o]` for basis column `a` and output feature `o`.
-/// Mathematically it is convenient to view each atom as
-/// `B_k ∈ ℝ^{p_out × M_k}` with columns `B_k[o, a]`.
+/// `β[off_k + a·p_out + o]` for basis row `a` and output feature `o`.
+/// The stored block is `B_k ∈ ℝ^{M_k × p_out}` with rows `B_k[a, :]`
+/// representing decoder directions in output space.
 ///
 /// The penalty is the co-activation-masked cross-column-space overlap
 ///
@@ -8604,7 +8604,7 @@ impl AnalyticPenalty for NestedPrefixPenalty {
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
-    use ndarray::array;
+    use ndarray::{array, s};
 
     /// The scale-free isometry penalty (math review #681) defaults to a
     /// `MeanProfiled` reference: the per-row pullback metric `G_n` is compared
@@ -8747,6 +8747,90 @@ mod tests {
             diag.iter().all(|entry| entry.is_finite()),
             "IBP Hessian diagonal must remain finite for saturated concrete logits: {diag:?}"
         );
+    }
+
+    #[test]
+    fn ibp_assignment_high_k_prior_keeps_positive_gradient_path() {
+        let k = 400usize;
+        let pen = IBPAssignmentPenalty::new(k, 0.1, 1.0, false);
+        let t = Array1::<f64>::zeros(k);
+        let rho = Array1::<f64>::zeros(0);
+
+        let value = pen.value(t.view(), rho.view());
+        assert!(value.is_finite(), "high-K IBP value must stay finite");
+        let grad = pen.grad_target(t.view(), rho.view());
+        assert_eq!(grad.len(), k);
+        assert!(
+            grad.iter().all(|entry| entry.is_finite()),
+            "high-K IBP gradient must stay finite: {grad:?}"
+        );
+        assert!(
+            grad.slice(s![320..]).iter().any(|entry| entry.abs() > 0.0),
+            "late high-K atoms must retain a strictly positive gradient path"
+        );
+    }
+
+    #[test]
+    fn learnable_weights_stay_finite_at_extreme_rho() {
+        for rho in [1000.0_f64, -1000.0] {
+            let resolved = resolve_learnable_weight(0.7, rho);
+            assert!(
+                resolved.is_finite() && resolved > 0.0,
+                "resolved learnable weight must be finite-positive at rho={rho}: {resolved}"
+            );
+        }
+
+        let softmax = SoftmaxAssignmentSparsityPenalty::new(3, 0.8);
+        let logits = array![0.2_f64, -0.1, 0.4];
+        for rho in [array![1000.0_f64], array![-1000.0_f64]] {
+            let value = softmax.value(logits.view(), rho.view());
+            let grad = softmax.grad_target(logits.view(), rho.view());
+            let diag = softmax
+                .hessian_diag(logits.view(), rho.view())
+                .expect("softmax entropy exposes a diagonal Hessian");
+            assert!(value.is_finite(), "softmax value non-finite at rho={rho:?}");
+            assert!(grad.iter().all(|entry| entry.is_finite()));
+            assert!(diag.iter().all(|entry| entry.is_finite()));
+        }
+
+        let jump =
+            JumpReLUPenalty::new(PsiSlice::full(2, Some(1)), array![1.0_f64], 0.5, 0.1).unwrap();
+        let jump_target = array![0.0_f64, 0.2];
+        for rho in [array![1000.0_f64], array![-1000.0_f64]] {
+            let value = jump.value(jump_target.view(), rho.view());
+            let grad = jump.grad_target(jump_target.view(), rho.view());
+            let diag = jump
+                .hessian_diag(jump_target.view(), rho.view())
+                .expect("JumpReLU exposes a diagonal Hessian");
+            assert!(
+                value.is_finite(),
+                "JumpReLU value non-finite at rho={rho:?}"
+            );
+            assert!(grad.iter().all(|entry| entry.is_finite()));
+            assert!(diag.iter().all(|entry| entry.is_finite()));
+        }
+
+        let target = PsiSlice {
+            range: 0..4,
+            latent_dim: Some(2),
+        };
+        let block_sizes = vec![1usize, 1usize];
+        let p = 2usize;
+        let coact = Array2::<f64>::ones((2, 2));
+        let decoder =
+            DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 0.7, true).unwrap();
+        let beta = Array1::<f64>::zeros(4);
+        for rho in [array![1000.0_f64], array![-1000.0_f64]] {
+            let value = decoder.value(beta.view(), rho.view());
+            let grad = decoder.grad_target(beta.view(), rho.view());
+            let hv = decoder.hvp(beta.view(), rho.view(), beta.view());
+            assert!(
+                value.is_finite(),
+                "DecoderIncoherence value non-finite at rho={rho:?}"
+            );
+            assert!(grad.iter().all(|entry| entry.is_finite()));
+            assert!(hv.iter().all(|entry| entry.is_finite()));
+        }
     }
 
     #[test]
