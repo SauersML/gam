@@ -4368,7 +4368,7 @@ pub(crate) fn run_nuts_sampling(
 /// indefinite or non-smooth LAML objective — the driver no longer dead-ends
 /// with an `Err`. Instead it lands here: the *same* penalized objective's
 /// curvature (its penalized joint Hessian `H = −∇²log L + Σ_k λ_k S_k`,
-/// augmented with the proper Jeffreys/PC term when `firth_general` is armed)
+/// augmented with the proper (unconditional) Jeffreys/PC term)
 /// is used as the precision of a proper Gaussian posterior `N(β̂, H⁻¹)` about
 /// the best mode `β̂` the inner solve reached. Sampling a multivariate normal
 /// cannot fail: in the worst case (a poorly conditioned `H`) the intervals come

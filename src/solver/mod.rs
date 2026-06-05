@@ -21,7 +21,6 @@ pub mod protocol;
 pub mod reml_compare;
 pub mod riemannian;
 pub mod riemannian_retraction;
-pub mod robust_identification;
 pub mod row_measure;
 pub mod seeding;
 pub mod sindy;
