@@ -1643,7 +1643,6 @@ mod tests {
 
         let m = family.active_classes();
         let total = m * p;
-        let specs = family.build_block_specs();
 
         // Drive the iterate well out along the separating slope, the regime the
         // screening floor would otherwise leave un-bounded. Large per-class
