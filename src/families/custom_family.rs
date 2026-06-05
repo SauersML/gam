@@ -19121,7 +19121,8 @@ fn joint_outer_evaluate(
     batched_outer_hessian_operator: Option<
         Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     >,
-    // Universal under-identification robustness (flag-gated, default OFF). The
+    // Universal under-identification robustness (always armed when the family can
+    // expose an exact joint Hessian). The
     // outer REML logdet AND its trace derivatives must run on the same
     // Jeffreys-augmented Hessian `H + S_λ + H_Φ` the inner Newton converged on,
     // or the LAML value and its analytic gradient describe different objectives.
@@ -19129,8 +19130,10 @@ fn joint_outer_evaluate(
     // NOT by itself sufficient: `H_Φ` depends on ρ THROUGH β̂, so the trace
     // contraction also needs its mode-response drift `D_β H_Φ[v_k]` — supplied
     // separately via `jeffreys_hphi_drift` and folded into the first-order trace
-    // by `JeffreysHphiAwareJointDerivatives`. `None` ⇒ byte-identical released
-    // outer REML.
+    // by `JeffreysHphiAwareJointDerivatives`. `None` means this evaluation has
+    // no active Jeffreys curvature (empty system, unavailable exact derivatives,
+    // or the conditioning gate proved the term zero), not a user-selected
+    // robustness-off mode.
     robust_jeffreys_hphi: Option<Array2<f64>>,
     // Companion mode-response drift `D_β H_Φ[δβ]` for the outer gradient's trace
     // identity. `Some` exactly when `robust_jeffreys_hphi` is `Some` (same
@@ -21287,7 +21290,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // a single streaming pass. Runs in both `ValueAndGradient` and
     // `ValueGradientHessian` modes; in VGH the Hessian still flows through the
     // standard joint_outer_evaluate path below and only the gradient is
-    // replaced. See `BatchedOuterGradientTerms`.
+    // replaced. See `BatchedOuterGradientTerms`. The replacement is permitted
+    // only when it differentiates the same objective: if robust Jeffreys
+    // curvature is nonzero, the unified H_phi-aware evaluator owns the gradient.
     let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
     let robust_jeffreys_hphi =
         custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
