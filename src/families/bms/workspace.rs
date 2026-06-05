@@ -1936,9 +1936,12 @@ impl BernoulliMarginalSlopeFamily {
         if logslope_ncols > 0 && logslope.beta.len() != logslope_ncols {
             // SAFETY: temporary debug instrumentation to capture the backtrace.
             panic!(
-                "DEBUG bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}\n{}",
+                "DEBUG logslope beta got {}, expected {}; marginal beta {} design {}; logslope design {}\n{}",
                 logslope.beta.len(),
                 logslope_ncols,
+                block_states[0].beta.len(),
+                self.marginal_design.ncols(),
+                self.logslope_design.ncols(),
                 std::backtrace::Backtrace::force_capture(),
             );
         }
