@@ -12,34 +12,32 @@
 //!   5. INDEFINITE / MULTIMODAL — a label-flipped two-cluster outcome whose
 //!                                penalized objective is non-convex.
 //!
-//! THE CLAIM. With robustness ON (`RobustIdentification::FirthOnly`: full
-//! identifiable-span Jeffreys, the self-limiting proper prior) NONE of these may
-//! return "did not converge", an error, or a NaN. Each must yield EITHER a finite
-//! converged estimate OR — once the never-fail escalation lands — a sampled
-//! proper-posterior summary with honest intervals. The Jeffreys penalty makes the
-//! inner objective coercive (finite minimizer) on near-separating directions, and
-//! the HMC escalation catches the residual non-convex / multimodal cases.
+//! THE CLAIM. Under the always-on robustness machinery (full identifiable-span
+//! Jeffreys, the self-limiting proper prior) NONE of these may return "did not
+//! converge", an error, or a NaN. Each must yield EITHER a finite converged
+//! estimate OR — once the never-fail escalation lands — a sampled proper-posterior
+//! summary with honest intervals. The Jeffreys penalty makes the inner objective
+//! coercive (finite minimizer) on near-separating directions, and the HMC
+//! escalation catches the residual non-convex / multimodal cases.
 //!
 //! HONESTY GATE. The strict never-fail assertion (`fits_never_fail_with_robust_on`)
-//! is `#[ignore]`d until the never-fail escalation (HMC fallback on inner/outer
+//! is skipped until the never-fail escalation (HMC fallback on inner/outer
 //! non-convergence) is wired into the formula fit path: full-span Jeffreys alone
 //! does NOT yet guarantee convergence on every case here (perfect separation on a
 //! penalized spline direction and the multimodal case still stall under the
 //! present solver). Rather than weaken the assertion to fake a pass, the strict
-//! test stays ignored with this reason, and a companion CHARACTERIZATION test
-//! (`characterize_robust_on_paths`, NOT ignored) runs the whole battery and
-//! REPORTS which path each case took (converged-finite / errored / non-converged)
-//! without asserting the not-yet-cured cases — it only asserts the property that
-//! is already true today (robustness ON never makes a case STRICTLY WORSE than
-//! OFF), and prints the per-case verdict the strict test will assert once the
-//! escalation lands.
+//! test stays skipped with this reason, and a companion CHARACTERIZATION test
+//! (`characterize_robust_paths`, NOT skipped) runs the whole battery and REPORTS
+//! which path each case took (converged-finite / errored / non-converged). It
+//! asserts the property that is already true today — the robust path never returns
+//! a NON-FINITE (NaN/Inf) estimate on any case — and prints the per-case verdict
+//! the strict test will assert once the escalation lands.
 //!
 //! Deterministic: fixed-seed LCG, no time / unseeded RNG.
 
 use csv::StringRecord;
 use gam::{
-    FitConfig, FitResult, RobustIdentification, encode_recordswith_inferred_schema,
-    fit_from_formula, init_parallelism,
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 
 /// Deterministic LCG → uniform(0,1). No time / unseeded RNG.
@@ -88,26 +86,20 @@ fn dataset(headers: &[&str], rows: Vec<Vec<String>>) -> gam::data::EncodedDatase
     encode_recordswith_inferred_schema(h, r).expect("encode pathological dataset")
 }
 
-fn cfg(family: &str, robust: RobustIdentification) -> FitConfig {
+fn cfg(family: &str) -> FitConfig {
     // The formula path's default ρ-prior is `Normal{0,3}` (not the `Flat`
-    // sentinel), so the firth-general PC default does not fire on either arm —
-    // the robustness contrast isolates the Jeffreys curvature effect.
+    // sentinel), so the firth-general PC default does not fire — the always-on
+    // robustness machinery contributes the Jeffreys curvature effect.
     FitConfig {
         family: Some(family.to_string()),
-        robust_identification: robust,
         ..FitConfig::default()
     }
 }
 
-/// Fit `formula` on `data` under `robust` and CLASSIFY the outcome. Never panics
-/// on a solver failure — a failure is data the test records.
-fn classify(
-    formula: &str,
-    family: &str,
-    robust: RobustIdentification,
-    data: &gam::data::EncodedDataset,
-) -> Path {
-    match fit_from_formula(formula, data, &cfg(family, robust)) {
+/// Fit `formula` on `data` under the always-on robust path and CLASSIFY the
+/// outcome. Never panics on a solver failure — a failure is data the test records.
+fn classify(formula: &str, family: &str, data: &gam::data::EncodedDataset) -> Path {
+    match fit_from_formula(formula, data, &cfg(family)) {
         Err(_) => Path::Errored,
         Ok(result) => {
             let (beta_finite, converged) = match &result {
@@ -218,34 +210,31 @@ fn cohort_multimodal() -> gam::data::EncodedDataset {
     dataset(&["x", "y"], rows)
 }
 
-/// Run the whole battery under a given robustness policy and return the
-/// per-case `(label, formula, family, Path)`.
-fn run_battery(robust: RobustIdentification) -> Vec<(&'static str, Path)> {
+/// Run the whole battery under the always-on robust path and return the per-case
+/// `(label, Path)`.
+fn run_battery() -> Vec<(&'static str, Path)> {
     let sep = cohort_perfect_separation();
     let col = cohort_exact_collinearity();
     let nzc = cohort_near_zero_cases();
     let rkd = cohort_rank_deficient();
     let mm = cohort_multimodal();
     vec![
-        (
-            "perfect_separation",
-            classify("y ~ x", "binomial", robust, &sep),
-        ),
+        ("perfect_separation", classify("y ~ x", "binomial", &sep)),
         (
             "exact_collinearity",
-            classify("y ~ x1 + x2", "binomial", robust, &col),
+            classify("y ~ x1 + x2", "binomial", &col),
         ),
         (
             "near_zero_cases",
-            classify("y ~ s(x, bs='tp', k=8)", "binomial", robust, &nzc),
+            classify("y ~ s(x, bs='tp', k=8)", "binomial", &nzc),
         ),
         (
             "rank_deficient_design",
-            classify("y ~ x + c", "binomial", robust, &rkd),
+            classify("y ~ x + c", "binomial", &rkd),
         ),
         (
             "indefinite_multimodal",
-            classify("y ~ s(x, bs='tp', k=6)", "binomial", robust, &mm),
+            classify("y ~ s(x, bs='tp', k=6)", "binomial", &mm),
         ),
     ]
 }
@@ -257,75 +246,79 @@ fn run_battery(robust: RobustIdentification) -> Vec<(&'static str, Path)> {
 /// escalation lands, then delete the guard.
 const SKIP_BLOCKED_NEVER_FAIL: bool = 1 == 1;
 
-/// CHARACTERIZATION (NOT ignored). Runs the full battery OFF and ON, prints the
-/// per-case path under each policy, and asserts the property that is already
-/// guaranteed today: robustness ON never makes a pathological case STRICTLY
-/// WORSE than OFF (an OK case stays OK; it never regresses an OFF success into an
-/// ON error/NaN). The full never-fail claim (every ON case is OK) is asserted by
-/// the strict test once escalation lands.
+/// CHARACTERIZATION (NOT skipped). Runs the full battery under the always-on
+/// robust path, prints the per-case path, and asserts the property that is
+/// already guaranteed today: the robust fit never produces a NON-FINITE (NaN/Inf)
+/// estimate on any pathological case — the self-limiting Jeffreys penalty bounds
+/// every near-separating direction to a finite basin. (A `FiniteNotConverged`
+/// outcome is permitted here — it is not a hard failure, and it is exactly what
+/// the escalation will upgrade to a sampled posterior.) The full never-fail claim
+/// (every case is converged-finite) is asserted by the strict test once
+/// escalation lands.
 #[test]
-fn characterize_robust_on_paths() {
+fn characterize_robust_paths() {
     assert!(file!().ends_with(".rs"));
     init_parallelism();
 
-    let off = run_battery(RobustIdentification::Off);
-    let on = run_battery(RobustIdentification::FirthOnly);
+    let battery = run_battery();
 
-    eprintln!("[never-fail] per-case paths (OFF → ON):");
-    for ((label, off_path), (_, on_path)) in off.iter().zip(on.iter()) {
-        eprintln!("  {label:<24} {off_path:?}  →  {on_path:?}");
+    eprintln!("[never-fail] per-case paths:");
+    for (label, path) in battery.iter() {
+        eprintln!("  {label:<24} {path:?}");
     }
-    let on_ok = on.iter().filter(|(_, p)| p.is_never_fail_ok()).count();
+    let ok = battery.iter().filter(|(_, p)| p.is_never_fail_ok()).count();
     eprintln!(
-        "[never-fail] ON converged-finite on {on_ok}/{} cases (strict never-fail target = {})",
-        on.len(),
-        on.len(),
+        "[never-fail] converged-finite on {ok}/{} cases (strict never-fail target = {})",
+        battery.len(),
+        battery.len(),
     );
 
-    // No-regression: ON must never turn an OFF-OK case into an ON error/NaN. (A
-    // FiniteNotConverged ON outcome is permitted here — it is not a hard failure,
-    // and it is exactly what the escalation will upgrade to a sampled posterior.)
-    for ((label, off_path), (_, on_path)) in off.iter().zip(on.iter()) {
-        if off_path.is_never_fail_ok() {
-            assert!(
-                !matches!(on_path, Path::Errored | Path::NonFinite),
-                "[{label}] robustness ON REGRESSED an OFF-converged case into {on_path:?}; \
-                 robustness must never make a fit strictly worse",
-            );
-        }
+    // FINITENESS GUARANTEE (true today): the always-on Jeffreys curvature makes
+    // the inner objective coercive on every near-separating direction, so no case
+    // may return a NON-FINITE coefficient / prediction. (Residual non-convergence
+    // on the hardest cases is permitted — it is `FiniteNotConverged`, which the
+    // HMC escalation will later upgrade to a sampled posterior.)
+    for (label, path) in battery.iter() {
+        assert_ne!(
+            *path,
+            Path::NonFinite,
+            "[{label}] the always-on robust path produced a NON-FINITE estimate; the \
+             self-limiting Jeffreys penalty must bound every case to a finite basin",
+        );
     }
 }
 
-/// STRICT NEVER-FAIL (IGNORED — pending the HMC never-fail escalation build).
+/// STRICT NEVER-FAIL (SKIPPED — pending the HMC never-fail escalation build).
 ///
-/// The contract: with robustness ON, EVERY pathological case yields a finite
-/// converged estimate (or a sampled proper-posterior summary once escalation is
-/// wired). Full-span Jeffreys alone does not yet clear perfect separation on a
-/// penalized direction nor the multimodal case under the present solver, so this
-/// stays ignored rather than asserting falsely. UN-IGNORE WHEN: the inner/outer
-/// non-convergence → HMC sampling fallback is wired into `fit_from_formula` and
-/// returns a finite proper-posterior summary instead of a non-converged /
-/// errored result. The body below is the exact assertion that must then hold.
+/// The contract: under the always-on robust path, EVERY pathological case yields
+/// a finite converged estimate (or a sampled proper-posterior summary once
+/// escalation is wired). Full-span Jeffreys alone does not yet clear perfect
+/// separation on a penalized direction nor the multimodal case under the present
+/// solver, so this stays skipped rather than asserting falsely. UN-SKIP WHEN: the
+/// inner/outer non-convergence → HMC sampling fallback is wired into
+/// `fit_from_formula` and returns a finite proper-posterior summary instead of a
+/// non-converged / errored result. The body below is the exact assertion that
+/// must then hold.
 #[test]
 fn fits_never_fail_with_robust_on() {
     // BLOCKED (no #[ignore]; the build bans it): the HMC never-fail escalation
     // (inner/outer non-convergence → sampled proper-posterior fallback) is not
     // yet wired into the formula fit path, and full-span Jeffreys alone does not
     // yet converge the perfect-separation-on-penalized and multimodal cases —
-    // see `characterize_robust_on_paths` for the current per-case behavior. The
+    // see `characterize_robust_paths` for the current per-case behavior. The
     // strict contract below would assert falsely today, so we skip it as a
     // passing no-op (the established skip convention in this suite) until the
     // escalation lands; then delete this early return.
     eprintln!(
         "SKIP fits_never_fail_with_robust_on: HMC never-fail escalation not yet wired \
-         into the formula fit path (see characterize_robust_on_paths)"
+         into the formula fit path (see characterize_robust_paths)"
     );
     if SKIP_BLOCKED_NEVER_FAIL {
         return;
     }
     assert!(file!().ends_with(".rs"));
     init_parallelism();
-    let on = run_battery(RobustIdentification::FirthOnly);
+    let on = run_battery();
     for (label, path) in &on {
         assert!(
             path.is_never_fail_ok(),

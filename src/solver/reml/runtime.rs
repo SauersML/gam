@@ -1523,23 +1523,15 @@ fn firth_default_pc_prior() -> RhoPrior {
     }
 }
 
-/// Resolve the *effective* outer ρ prior under the firth-general default policy.
+/// Resolve the *effective* outer ρ prior under the (unconditional) firth-general
+/// default policy.
 ///
-/// When `firth_general == false` the configured prior is returned verbatim (the
-/// released, byte-identical path: a `Flat` configured prior stays `Flat`, cost
-/// /grad/hess all zero, so the outer objective is bare REML/LAML). When
-/// `firth_general == true` an *unset* prior (the `Flat` sentinel — whole-prior,
-/// or any `Flat` coordinate of an `Independent`) is filled with the weakly-
-/// informative [`firth_default_pc_prior`]; any explicitly-configured prior is
-/// honored unchanged. Pulled out as a free function so the decision is unit-
-/// testable without constructing a full `RemlState`.
-fn resolve_effective_rho_prior(
-    firth_general: bool,
-    configured: &RhoPrior,
-) -> std::borrow::Cow<'_, RhoPrior> {
-    if !firth_general {
-        return std::borrow::Cow::Borrowed(configured);
-    }
+/// An *unset* prior (the `Flat` sentinel — whole-prior, or any `Flat` coordinate
+/// of an `Independent`) is filled with the weakly-informative
+/// [`firth_default_pc_prior`]; any explicitly-configured prior is honored
+/// unchanged. Pulled out as a free function so the decision is unit-testable
+/// without constructing a full `RemlState`.
+fn resolve_effective_rho_prior(configured: &RhoPrior) -> std::borrow::Cow<'_, RhoPrior> {
     match configured {
         // Whole prior unset → fill every coordinate with the weak PC default.
         RhoPrior::Flat => std::borrow::Cow::Owned(firth_default_pc_prior()),
@@ -4239,14 +4231,11 @@ impl<'a> RemlState<'a> {
     }
 
     /// Resolve the *effective* outer prior on the log-precision ρ, applying the
-    /// firth-general default-hyperprior policy.
+    /// (unconditional) firth-general default-hyperprior policy.
     ///
-    /// Without robustness (`firth_general == false`) this returns the configured
-    /// [`self.rho_prior`] verbatim, so every released path is byte-identical: a
-    /// `Flat` configured prior stays `Flat` (cost/grad/hess all zero) and the
-    /// outer objective is bare REML/LAML. Under `firth_general` an *unset* prior
-    /// (the `Flat` sentinel, i.e. the caller did not configure a hyperprior on a
-    /// coordinate) is replaced by the weakly-informative penalized-complexity
+    /// An *unset* prior (the `Flat` sentinel, i.e. the caller did not configure a
+    /// hyperprior on a coordinate) is replaced by the weakly-informative
+    /// penalized-complexity
     /// (PC) prior [`firth_default_pc_prior`], turning the outer REML point into a
     /// proper marginal posterior over λ. A PC prior is reparameterization-
     /// invariant and shrinks only toward the simpler (more-smoothing) base model,
@@ -4261,7 +4250,7 @@ impl<'a> RemlState<'a> {
     /// leaving clean λ-selection unbiased (the zero-downside / information-limit
     /// reduction to plain REML).
     fn effective_rho_prior(&self) -> std::borrow::Cow<'_, RhoPrior> {
-        resolve_effective_rho_prior(self.config.firth_general(), &self.rho_prior)
+        resolve_effective_rho_prior(&self.rho_prior)
     }
 
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
@@ -10133,32 +10122,25 @@ mod tk_math_tests {
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
 
     #[test]
-    fn firth_default_pc_prior_fills_flat_only_when_armed() {
+    fn firth_default_pc_prior_fills_flat_holes() {
         let pc = firth_default_pc_prior();
-        // OFF: every configured prior is returned verbatim — released byte-identity.
-        assert_eq!(
-            *resolve_effective_rho_prior(false, &RhoPrior::Flat),
-            RhoPrior::Flat
-        );
         let configured = RhoPrior::Normal {
             mean: 0.1,
             sd: 2.0,
         };
-        assert_eq!(*resolve_effective_rho_prior(false, &configured), configured);
-
-        // ON: a whole `Flat` prior becomes the weak PC default.
-        assert_eq!(*resolve_effective_rho_prior(true, &RhoPrior::Flat), pc);
-        // ON: an explicitly-configured prior is honored unchanged (no override).
-        assert_eq!(*resolve_effective_rho_prior(true, &configured), configured);
-        // ON: only the `Flat` coordinates of an Independent prior inherit the PC.
+        // A whole `Flat` prior becomes the weak PC default.
+        assert_eq!(*resolve_effective_rho_prior(&RhoPrior::Flat), pc);
+        // An explicitly-configured prior is honored unchanged (no override).
+        assert_eq!(*resolve_effective_rho_prior(&configured), configured);
+        // Only the `Flat` coordinates of an Independent prior inherit the PC.
         let indep = RhoPrior::Independent(vec![RhoPrior::Flat, configured.clone()]);
         assert_eq!(
-            *resolve_effective_rho_prior(true, &indep),
+            *resolve_effective_rho_prior(&indep),
             RhoPrior::Independent(vec![pc.clone(), configured.clone()])
         );
-        // ON: an Independent prior with no Flat holes is left untouched.
+        // An Independent prior with no Flat holes is left untouched.
         let no_holes = RhoPrior::Independent(vec![configured.clone(), configured.clone()]);
-        assert_eq!(*resolve_effective_rho_prior(true, &no_holes), no_holes);
+        assert_eq!(*resolve_effective_rho_prior(&no_holes), no_holes);
     }
 
     #[test]
