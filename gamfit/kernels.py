@@ -23,8 +23,7 @@ Projections for Regularized Transportation Problems", SIAM J. Sci.
 Comput., 37(2), A1111-A1138.
 
 Cuturi, Peyre (2019), "Computational Optimal Transport", Foundations
-and Trends in Machine Learning, 11(5-6), Chapter 9 (for the implicit
-function theorem / adjoint-iteration approach used by the VJP).
+and Trends in Machine Learning, 11(5-6), Chapter 9.
 """
 
 from __future__ import annotations
@@ -140,11 +139,10 @@ def sinkhorn_barycenter(
 
     Differentiability is provided by the companion VJP
     :func:`sinkhorn_barycenter_vjp` (used by the torch / JAX adapters
-    in ``gamfit.kernels_torch`` / ``gamfit.kernels_jax``). The VJP is
-    computed at the converged fixed point via adjoint iteration
-    (Cuturi-Peyre, COT, Section 9.1.4) -- never by unrolling autograd
-    through the Sinkhorn loop, so memory is ``O(K * M^2)`` and
-    independent of ``n_iter``.
+    in ``gamfit.kernels_torch`` / ``gamfit.kernels_jax``). The VJP
+    differentiates the same finite-iteration map computed here, so it
+    remains correct even when ``n_iter`` has not reached the fixed
+    point.
 
     References
     ----------
@@ -178,8 +176,8 @@ def sinkhorn_barycenter_vjp(
     """Vector-Jacobian product for :func:`sinkhorn_barycenter`.
 
     Returns ``(d_atoms, d_weights)`` of shapes ``(K, M)`` and ``(K,)``
-    respectively, computed via adjoint iteration at the converged
-    fixed point (Cuturi-Peyre, COT, Section 9.1.4).
+    respectively, for the same finite ``n_iter`` computation used by
+    :func:`sinkhorn_barycenter`.
     """
     atoms_arr = _as_f64_2d("atoms", atoms)
     k, m = atoms_arr.shape

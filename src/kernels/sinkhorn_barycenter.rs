@@ -33,13 +33,12 @@
 //!
 //! ## Differentiability
 //!
-//! The forward pass returns the converged log-barycenter. The
-//! companion [`sinkhorn_barycenter_vjp`] computes the
-//! vector-Jacobian product at the converged fixed point using
-//! **adjoint iterations** (Cuturi & Peyré, "Computational Optimal
-//! Transport", §9.1.4) — never by unrolling autograd through the
-//! Sinkhorn loop. This avoids the `O(n_iter * M^2)` memory blowup of
-//! naive unrolled differentiation.
+//! The forward pass returns the log-barycenter after exactly `n_iter`
+//! Sinkhorn updates. The companion [`sinkhorn_barycenter_vjp`] computes
+//! the vector-Jacobian product of that same finite-iteration map by a
+//! reverse sweep through the recorded dual trajectory. This keeps the
+//! autograd contract exact even when the public default `n_iter` has
+//! not reached the fixed point.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -283,9 +282,8 @@ fn normalize_weights(weights: ArrayView1<'_, f64>) -> Vec<f64> {
     weights.iter().map(|w| w / total).collect()
 }
 
-/// Output of [`sinkhorn_barycenter_forward_state`] — exposes the full
-/// converged dual state so [`sinkhorn_barycenter_vjp`] can operate at
-/// the fixed point without re-running the forward pass.
+/// Output of [`sinkhorn_barycenter_forward_state`] — exposes the final
+/// dual state after the requested finite Sinkhorn iteration count.
 pub struct SinkhornState {
     /// `(K, M)` log dual potentials on the "data-fit" side.
     pub log_u: Array2<f64>,
@@ -429,15 +427,16 @@ pub struct SinkhornVjp {
     pub d_weights: Array1<f64>,
 }
 
-/// Vector-Jacobian product of the Sinkhorn-barycenter map at its
-/// converged fixed point.
+/// Vector-Jacobian product of the finite-iteration Sinkhorn-barycenter map.
 ///
 /// Given a cotangent `cotangent` of shape `(M,)` (the upstream
 /// gradient of a scalar loss w.r.t. the output barycenter), this
-/// returns `(dL/d_atoms, dL/d_weights)` computed by adjoint iteration
-/// of the Sinkhorn map. The adjoint iteration is run for the same
-/// `n_iter` as the forward pass, which is sufficient for matching the
-/// forward convergence (Cuturi & Peyré, COT §9.1.4).
+/// returns `(dL/d_atoms, dL/d_weights)` for the same truncated
+/// `n_iter` computation that [`sinkhorn_barycenter`] returns. This is
+/// intentionally not the fixed-point / IFT adjoint: at small `eps` the
+/// public default `n_iter` can be far from convergence, so differentiating
+/// the converged fixed point would produce the gradient of a different
+/// function than the one used in the forward pass.
 pub fn sinkhorn_barycenter_vjp(
     atoms: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -446,8 +445,10 @@ pub fn sinkhorn_barycenter_vjp(
     n_iter: usize,
     cotangent: ArrayView1<'_, f64>,
 ) -> Result<SinkhornVjp, String> {
-    let state = sinkhorn_barycenter_forward_state(atoms, weights, cost, eps, n_iter)?;
-    let (k, m) = state.log_u.dim();
+    validate_inputs(atoms, weights, cost, eps, n_iter)?;
+    let atoms_norm = normalize_atoms(atoms)?;
+    let weights_norm = normalize_weights(weights);
+    let (k, m) = atoms_norm.dim();
     if cotangent.len() != m {
         return Err(format!(
             "cotangent length {} does not match barycenter size {}",
@@ -456,9 +457,90 @@ pub fn sinkhorn_barycenter_vjp(
         ));
     }
 
+    let mut log_kernel = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..m {
+            log_kernel[[i, j]] = -cost[[i, j]] / eps;
+        }
+    }
+
+    let mut log_atoms = Array2::<f64>::zeros((k, m));
+    for ki in 0..k {
+        let row = safe_log_simplex(atoms_norm.row(ki));
+        for j in 0..m {
+            log_atoms[[ki, j]] = row[j];
+        }
+    }
+
+    let inv_m = (1.0_f64 / m as f64).ln();
+    let mut log_u = Array2::<f64>::zeros((k, m));
+    let mut log_a = Array1::<f64>::from_elem(m, inv_m);
+    let mut log_u_hist: Vec<Array2<f64>> = Vec::with_capacity(n_iter + 1);
+    let mut log_a_hist: Vec<Array1<f64>> = Vec::with_capacity(n_iter + 1);
+    let mut log_v_hist: Vec<Array2<f64>> = Vec::with_capacity(n_iter);
+    log_u_hist.push(log_u.clone());
+    log_a_hist.push(log_a.clone());
+
+    let mut scratch = Array2::<f64>::zeros((m, m));
+    for _ in 0..n_iter {
+        let mut log_v = Array2::<f64>::zeros((k, m));
+        for ki in 0..k {
+            for i in 0..m {
+                let off = log_u[[ki, i]];
+                for j in 0..m {
+                    scratch[[i, j]] = log_kernel[[i, j]] + off;
+                }
+            }
+            let lse = logsumexp_axis0(scratch.view());
+            for j in 0..m {
+                log_v[[ki, j]] = log_a[j] - lse[j];
+            }
+        }
+
+        let mut next_log_u = Array2::<f64>::zeros((k, m));
+        for ki in 0..k {
+            for j in 0..m {
+                let off = log_v[[ki, j]];
+                for i in 0..m {
+                    scratch[[i, j]] = log_kernel[[i, j]] + off;
+                }
+            }
+            let lse = logsumexp_axis1(scratch.view());
+            for i in 0..m {
+                next_log_u[[ki, i]] = log_atoms[[ki, i]] - lse[i];
+            }
+        }
+
+        let mut next_log_a = Array1::<f64>::zeros(m);
+        for ki in 0..k {
+            for i_prime in 0..m {
+                let off = next_log_u[[ki, i_prime]];
+                for j in 0..m {
+                    scratch[[i_prime, j]] = log_kernel[[i_prime, j]] + off;
+                }
+            }
+            let lse = logsumexp_axis0(scratch.view());
+            for j in 0..m {
+                next_log_a[j] += weights_norm[ki] * lse[j];
+            }
+        }
+
+        log_v_hist.push(log_v);
+        log_u = next_log_u;
+        log_a = next_log_a;
+        log_u_hist.push(log_u.clone());
+        log_a_hist.push(log_a.clone());
+    }
+
     // Step A: pull the cotangent through the softmax(log_a) -> a mapping.
     // d(softmax(z))/dz = diag(p) - p p^T, so g_log_a = p .* (cot - sum(cot * p)).
-    let bary = softmax_1d(state.log_a.view())?;
+    if log_vector_is_sentinel_saturated(log_a.view()) {
+        return Err(
+            "sinkhorn barycenter degenerated: all log_a saturated to sentinel -- try larger eps or check cost matrix"
+                .to_string(),
+        );
+    }
+    let bary = softmax_1d(log_a.view())?;
     let mut g_log_a = Array1::<f64>::zeros(m);
     let mut weighted = 0.0_f64;
     for i in 0..m {
@@ -468,167 +550,81 @@ pub fn sinkhorn_barycenter_vjp(
         g_log_a[i] = bary[i] * (cotangent[i] - weighted);
     }
 
-    // Adjoint iteration.
-    //
-    // The forward fixed-point identity, with symmetric kernel, is
-    //   log_u[k, i] = log_atoms[k, i] - LSE_j(log_kernel[i, j] + log_v[k, j])
-    //   log_v[k, j] = log_a[j]        - LSE_i(log_kernel[i, j] + log_u[k, i])
-    //   log_a[j]    = sum_k w_k       * LSE_i(log_kernel[i, j] + log_u[k, i])
-    //
-    // Let P_k[i, j] = exp(log_kernel[i, j] + log_u[k, i] + log_v[k, j] - log_a[j])
-    // be the row-stochastic transport coupling (columns sum to 1
-    // because log_v enforces the column-marginal constraint b_k = a).
-    // Likewise Q_k[i, j] = exp(log_kernel[i, j] + log_u[k, i] + log_v[k, j] - log_atoms[k, i])
-    // is row-stochastic (rows sum to 1 by data-fit constraint).
-    //
-    // Adjoint sweep (one iteration), with g_log_v, g_log_u
-    // accumulators initialized to zero:
-    //   g_log_u[k] += -Q_k^T @ <something>; g_log_v[k] += -P_k @ <something>; ...
-    //
-    // The principled derivation: each Sinkhorn step is a closed-form
-    // map, so we propagate cotangents through each step in reverse.
-    // We approximate by iterating the forward map once more with
-    // adjoints — equivalent in the limit to the IFT linear-system
-    // solve and standard in OT libraries (POT, OTT-JAX).
-
-    let mut g_log_u = Array2::<f64>::zeros((k, m));
-    let mut g_log_v = Array2::<f64>::zeros((k, m));
+    let mut g_log_u_next = Array2::<f64>::zeros((k, m));
+    let mut g_log_a_next = g_log_a;
     let mut g_log_atoms = Array2::<f64>::zeros((k, m));
     let mut g_weights = Array1::<f64>::zeros(k);
 
-    // Precompute couplings P_k[i, j] = exp(log_kernel + log_u[k, i] + log_v[k, j] - log_a[j]).
-    let mut p_couplings: Vec<Array2<f64>> = Vec::with_capacity(k);
-    let mut q_couplings: Vec<Array2<f64>> = Vec::with_capacity(k);
-    for ki in 0..k {
-        let mut p_mat = Array2::<f64>::zeros((m, m));
-        let mut q_mat = Array2::<f64>::zeros((m, m));
-        for i in 0..m {
-            for j in 0..m {
-                let logp = state.log_kernel[[i, j]] + state.log_u[[ki, i]] + state.log_v[[ki, j]];
-                let p_val = (logp - state.log_a[j]).exp();
-                let q_val = (logp - state.log_atoms[[ki, i]]).exp();
-                p_mat[[i, j]] = p_val;
-                q_mat[[i, j]] = q_val;
-            }
-        }
-        p_couplings.push(p_mat);
-        q_couplings.push(q_mat);
-    }
+    for iter in (0..n_iter).rev() {
+        let log_u_prev = &log_u_hist[iter];
+        let log_a_prev = &log_a_hist[iter];
+        let log_v_new = &log_v_hist[iter];
+        let log_u_new = &log_u_hist[iter + 1];
 
-    // First propagate cotangent through Step 3:
-    //   log_a[j] = sum_k w_k * LSE_i(log_kernel[i, j] + log_u[k, i])
-    // Let s_k[j] = LSE_i(log_kernel[i, j] + log_u[k, i]).
-    // ∂s_k[j]/∂log_u[k, i] = P_k[i, j]    (axis-0 softmax weights)
-    // ∂log_a[j]/∂w_k = s_k[j]
-    // ∂log_a[j]/∂log_u[k, i] = w_k * P_k[i, j]
-    let mut s_per_k: Vec<Array1<f64>> = Vec::with_capacity(k);
-    {
-        let mut scratch = Array2::<f64>::zeros((m, m));
+        let mut g_log_u_new = g_log_u_next;
+        let mut g_log_v_new = Array2::<f64>::zeros((k, m));
+        let mut g_log_a_prev = Array1::<f64>::zeros(m);
+        let mut g_log_u_prev = Array2::<f64>::zeros((k, m));
+
+        // Step 3 backward:
+        //   log_a_new[j] = sum_k w_k * LSE_i(log_kernel[i,j] + log_u_new[k,i]).
         for ki in 0..k {
-            for i_prime in 0..m {
-                let off = state.log_u[[ki, i_prime]];
+            for i in 0..m {
+                let off = log_u_new[[ki, i]];
                 for j in 0..m {
-                    scratch[[i_prime, j]] = state.log_kernel[[i_prime, j]] + off;
+                    scratch[[i, j]] = log_kernel[[i, j]] + off;
                 }
             }
-            s_per_k.push(logsumexp_axis0(scratch.view()));
-        }
-    }
-    for ki in 0..k {
-        // d g_log_u
-        for i in 0..m {
-            let mut acc = 0.0_f64;
+            let s = logsumexp_axis0(scratch.view());
             for j in 0..m {
-                acc += g_log_a[j] * state.weights[ki] * p_couplings[ki][[i, j]];
-            }
-            g_log_u[[ki, i]] += acc;
-        }
-        // d g_weights (raw weights, then deconvolved through normalization)
-        let mut acc_w = 0.0_f64;
-        for j in 0..m {
-            acc_w += g_log_a[j] * s_per_k[ki][j];
-        }
-        g_weights[ki] += acc_w;
-    }
-
-    // Adjoint Sinkhorn sweeps. Iterate the linearized fixed-point map
-    // n_iter times to propagate cotangents back to (log_atoms, log_a-seed)
-    // — but since log_a is the output and was already absorbed above,
-    // we now want to propagate g_log_u through the Sinkhorn equations
-    // to g_log_atoms and (recursively) back to g_log_a, which would
-    // feed back into the loop. After convergence, the adjoint iteration
-    // is itself a fixed point.
-    //
-    // Iterate the adjoint map:
-    //   Step 2 backward: log_u[k, i] = log_atoms[k, i] - LSE_j(log_kernel[i, j] + log_v[k, j])
-    //     g_log_atoms[k, i] += g_log_u[k, i]
-    //     g_log_v[k, j] += -g_log_u[k, i] * Q_k[i, j]   summed over i
-    //   Step 1 backward: log_v[k, j] = log_a[j] - LSE_i(log_kernel[i, j] + log_u[k, i])
-    //     g_log_a_pre[j] += g_log_v[k, j]
-    //     g_log_u[k, i] += -g_log_v[k, j] * P_k[i, j]   summed over j
-
-    let mut g_log_a_in = Array1::<f64>::zeros(m);
-    for _ in 0..n_iter {
-        // Step 2 adjoint.
-        for ki in 0..k {
-            for i in 0..m {
-                g_log_atoms[[ki, i]] += g_log_u[[ki, i]];
-            }
-            for i in 0..m {
-                let gu = g_log_u[[ki, i]];
-                if gu == 0.0 {
-                    continue;
-                }
-                for j in 0..m {
-                    g_log_v[[ki, j]] -= gu * q_couplings[ki][[i, j]];
-                }
-            }
-            // Reset g_log_u for this k — it's been fully consumed.
-            for i in 0..m {
-                g_log_u[[ki, i]] = 0.0;
-            }
-        }
-
-        // Step 1 adjoint.
-        for ki in 0..k {
-            for j in 0..m {
-                g_log_a_in[j] += g_log_v[[ki, j]];
-            }
-            for j in 0..m {
-                let gv = g_log_v[[ki, j]];
-                if gv == 0.0 {
+                let ga = g_log_a_next[j];
+                g_weights[ki] += ga * s[j];
+                if ga == 0.0 {
                     continue;
                 }
                 for i in 0..m {
-                    g_log_u[[ki, i]] -= gv * p_couplings[ki][[i, j]];
+                    let soft = (log_kernel[[i, j]] + log_u_new[[ki, i]] - s[j]).exp();
+                    g_log_u_new[[ki, i]] += ga * weights_norm[ki] * soft;
                 }
-            }
-            // Reset g_log_v.
-            for j in 0..m {
-                g_log_v[[ki, j]] = 0.0;
             }
         }
 
-        // Feed the accumulated g_log_a_in back into the Step 3 backward
-        // (this closes the loop and is what makes the adjoint
-        // iteration a fixed point at convergence).
+        // Step 2 backward:
+        //   log_u_new[k,i] = log_atoms[k,i] - LSE_j(log_kernel[i,j] + log_v_new[k,j]).
         for ki in 0..k {
             for i in 0..m {
-                let mut acc = 0.0_f64;
-                for j in 0..m {
-                    acc += g_log_a_in[j] * state.weights[ki] * p_couplings[ki][[i, j]];
+                let gu = g_log_u_new[[ki, i]];
+                g_log_atoms[[ki, i]] += gu;
+                if gu == 0.0 {
+                    continue;
                 }
-                g_log_u[[ki, i]] += acc;
+                let lse = log_atoms[[ki, i]] - log_u_new[[ki, i]];
+                for j in 0..m {
+                    let soft = (log_kernel[[i, j]] + log_v_new[[ki, j]] - lse).exp();
+                    g_log_v_new[[ki, j]] -= gu * soft;
+                }
             }
-            let mut acc_w = 0.0_f64;
+        }
+
+        // Step 1 backward:
+        //   log_v_new[k,j] = log_a_prev[j] - LSE_i(log_kernel[i,j] + log_u_prev[k,i]).
+        for ki in 0..k {
             for j in 0..m {
-                acc_w += g_log_a_in[j] * s_per_k[ki][j];
+                let gv = g_log_v_new[[ki, j]];
+                g_log_a_prev[j] += gv;
+                if gv == 0.0 {
+                    continue;
+                }
+                let lse = log_a_prev[j] - log_v_new[[ki, j]];
+                for i in 0..m {
+                    let soft = (log_kernel[[i, j]] + log_u_prev[[ki, i]] - lse).exp();
+                    g_log_u_prev[[ki, i]] -= gv * soft;
+                }
             }
-            g_weights[ki] += acc_w;
         }
-        for j in 0..m {
-            g_log_a_in[j] = 0.0;
-        }
+
+        g_log_u_next = g_log_u_prev;
+        g_log_a_next = g_log_a_prev;
     }
 
     // Now convert g_log_atoms (gradient w.r.t. log of normalized atoms)
@@ -670,16 +666,15 @@ pub fn sinkhorn_barycenter_vjp(
 
     // Convert g_weights (raw, un-normalized) similarly:
     // w_norm[k] = w_raw[k] / W, W = sum_l w_raw[l].
-    // ∂log_a depends on w_norm only — but g_weights above was computed
-    // against w_norm[ki] directly (we used state.weights[ki] which is
-    // already normalized). So convert: ∂w_norm[k]/∂w_raw[l] =
+    // ∂log_a depends on w_norm only, and g_weights above was computed
+    // against w_norm[ki] directly. So convert: ∂w_norm[k]/∂w_raw[l] =
     // (k == l) / W - w_raw[k] / W^2 = (1/W) * ((k == l) - w_norm[k]).
     let mut d_weights = Array1::<f64>::zeros(k);
     let w_total: f64 = weights.iter().sum();
     if w_total > 0.0 {
         let mut sum_norm_g = 0.0_f64;
         for ki in 0..k {
-            sum_norm_g += g_weights[ki] * state.weights[ki];
+            sum_norm_g += g_weights[ki] * weights_norm[ki];
         }
         for ki in 0..k {
             d_weights[ki] = (g_weights[ki] - sum_norm_g) / w_total;
@@ -1022,10 +1017,9 @@ mod tests {
 
     #[test]
     fn vjp_matches_finite_differences_small() {
-        // Tiny problem, large eps, modest n_iter — finite-difference
-        // gradient of a linear functional of the barycenter should
-        // match the VJP within a few percent (the adjoint iteration
-        // converges to the IFT solution).
+        // Tiny problem, large eps, modest n_iter: the finite-difference
+        // gradient of a linear functional of the finite-iteration barycenter
+        // should match the VJP of that same truncated computation.
         let m = 6;
         let k = 2;
         let atoms = Array2::<f64>::from_shape_fn((k, m), |(ki, j)| {
@@ -1075,14 +1069,78 @@ mod tests {
             fd += r[i] * (b_plus[i] - b_minus[i]) / (2.0 * h);
         }
         let analytic = vjp.d_atoms[[ki, j]];
-        // Adjoint iteration is exact at the fixed point only in the
-        // limit; with n_iter=100 and eps=0.3 we expect agreement to a
-        // few percent. Use a generous relative tolerance.
         let denom = analytic.abs().max(fd.abs()).max(1.0e-6);
         let rel = (analytic - fd).abs() / denom;
         assert!(
-            rel < 0.05,
+            rel < 1.0e-5,
             "VJP/FD mismatch: analytic={analytic}, fd={fd}, rel={rel}"
+        );
+    }
+
+    #[test]
+    fn vjp_matches_truncated_forward_finite_differences_at_default_small_eps() {
+        let m = 6;
+        let k = 3;
+        let atoms = Array2::<f64>::from_shape_fn((k, m), |(ki, j)| {
+            let centre = match ki {
+                0 => 0.8,
+                1 => 2.6,
+                _ => 4.3,
+            };
+            (-((j as f64 - centre).powi(2)) / 0.7).exp()
+        });
+        let weights = array![0.25, 0.35, 0.40];
+        let cost = circular_cost(m);
+        let eps = 0.01;
+        let n_iter = 20;
+        let r = Array1::<f64>::from_shape_fn(m, |j| j as f64 - (m as f64 - 1.0) / 2.0);
+
+        let vjp = sinkhorn_barycenter_vjp(
+            atoms.view(),
+            weights.view(),
+            cost.view(),
+            eps,
+            n_iter,
+            r.view(),
+        )
+        .unwrap();
+
+        let h = 1.0e-5;
+        for ki in 0..k {
+            let mut weights_plus = weights.clone();
+            let mut weights_minus = weights.clone();
+            weights_plus[ki] += h;
+            weights_minus[ki] -= h;
+            let b_plus =
+                sinkhorn_barycenter(atoms.view(), weights_plus.view(), cost.view(), eps, n_iter)
+                    .unwrap();
+            let b_minus =
+                sinkhorn_barycenter(atoms.view(), weights_minus.view(), cost.view(), eps, n_iter)
+                    .unwrap();
+            let fd = r.dot(&(b_plus - b_minus)) / (2.0 * h);
+            let analytic = vjp.d_weights[ki];
+            assert!(
+                (analytic - fd).abs() < 1.0e-3,
+                "weight {ki} VJP/FD mismatch at truncated default regime: analytic={analytic}, fd={fd}"
+            );
+        }
+
+        let (ki, j) = (1usize, 3usize);
+        let mut atoms_plus = atoms.clone();
+        let mut atoms_minus = atoms.clone();
+        atoms_plus[[ki, j]] += h;
+        atoms_minus[[ki, j]] -= h;
+        let b_plus =
+            sinkhorn_barycenter(atoms_plus.view(), weights.view(), cost.view(), eps, n_iter)
+                .unwrap();
+        let b_minus =
+            sinkhorn_barycenter(atoms_minus.view(), weights.view(), cost.view(), eps, n_iter)
+                .unwrap();
+        let fd = r.dot(&(b_plus - b_minus)) / (2.0 * h);
+        let analytic = vjp.d_atoms[[ki, j]];
+        assert!(
+            (analytic - fd).abs() < 1.0e-3,
+            "atom ({ki},{j}) VJP/FD mismatch at truncated default regime: analytic={analytic}, fd={fd}"
         );
     }
 }

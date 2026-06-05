@@ -1,8 +1,8 @@
 """PyTorch adapter for the Sinkhorn-barycenter kernel.
 
 Exposes a :class:`torch.autograd.Function` whose backward pass calls
-the Rust adjoint VJP (no autograd unroll, ``O(K * M^2)`` memory
-independent of ``n_iter``).
+the Rust VJP for the same finite-iteration Sinkhorn map used in the
+forward pass.
 
 Importing this module raises a clear :class:`ImportError` if PyTorch
 is not installed.
@@ -29,7 +29,7 @@ class _SinkhornBarycenterFn(torch.autograd.Function):
     """Differentiable Sinkhorn-barycenter ``torch.autograd.Function``.
 
     Forward: ``(K, M) atoms, (K,) weights -> (M,) barycenter``.
-    Backward: adjoint-iteration VJP from the Rust extension.
+    Backward: finite-iteration VJP from the Rust extension.
     """
 
     @staticmethod
@@ -73,8 +73,8 @@ def sinkhorn_barycenter(
     """Differentiable Sinkhorn Wasserstein barycenter (PyTorch).
 
     Same semantics as :func:`gamfit.kernels.sinkhorn_barycenter` with
-    PyTorch tensors. Backward uses the Rust adjoint VJP, so memory is
-    ``O(K * M^2)`` and independent of ``n_iter``.
+    PyTorch tensors. Backward uses the Rust finite-iteration VJP, so
+    gradients match the forward result at the same ``n_iter``.
     """
     if not isinstance(atoms, torch.Tensor):
         raise TypeError("atoms must be a torch.Tensor")
