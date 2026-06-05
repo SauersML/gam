@@ -1236,6 +1236,15 @@ fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
         EstimationError::PerfectSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
+        EstimationError::PrefitPerfectSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
+        EstimationError::PrefitLinearSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
+        EstimationError::MultinomialSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
         EstimationError::HessianNotPositiveDefinite { .. } => {
             HessianNotPositiveDefiniteError::new_err(message)
         }
@@ -1243,6 +1252,9 @@ fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
         EstimationError::GradientUnavailable { .. } => GradientUnavailableError::new_err(message),
         EstimationError::LayoutError(_) => LayoutError::new_err(message),
         EstimationError::ModelOverparameterized { .. } => {
+            ModelOverparameterizedError::new_err(message)
+        }
+        EstimationError::PrefitRankDeficientDesignDetected { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
         EstimationError::ModelIsIllConditioned { .. } => IllConditionedError::new_err(message),
