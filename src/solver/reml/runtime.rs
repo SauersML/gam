@@ -1465,9 +1465,9 @@ fn reml_supports_firth(likelihood: &GlmLikelihoodSpec) -> bool {
         && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
 }
 
-/// Standard link of a Binomial family for which a closed-form Fisher-weight jet
+/// Standard link of a Binomial family for which a Fisher-weight jet
 /// (`fisher_weight_jet5`) exists, i.e. the links the link-general Jeffreys term
-/// can regularize. Currently `{Logit, Probit}`. Returns `None` for any other
+/// can regularize. Currently `{Logit, Probit, CLogLog}`. Returns `None` for any other
 /// response or link.
 #[inline]
 fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<StandardLink> {
@@ -1477,7 +1477,8 @@ fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<Standa
     }
     match spec.link {
         InverseLink::Standard(link @ StandardLink::Logit)
-        | InverseLink::Standard(link @ StandardLink::Probit) => Some(link),
+        | InverseLink::Standard(link @ StandardLink::Probit)
+        | InverseLink::Standard(link @ StandardLink::CLogLog) => Some(link),
         _ => None,
     }
 }

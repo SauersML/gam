@@ -278,13 +278,11 @@ fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
 /// `logit_inverse_link_jet5`'s `d1..d5` byte-for-byte so the existing Firth
 /// logit path is numerically unchanged.
 ///
-/// For the probit link `mu = Phi(eta)`, `mu' = phi(eta)`, with Bernoulli
-/// variance `V = mu(1 - mu)`, so `W = phi^2 / (Phi (1 - Phi))`. Its eta-jet is
-/// assembled by truncated Taylor-series division of the exact Gaussian
-/// derivative series (`phi' = -eta phi`, etc.), which is algebraically exact and
-/// avoids hand-deriving the quotient four times. As `|eta| -> inf` the
-/// denominator `Phi (1 - Phi)` underflows; there the weight and all its
-/// derivatives saturate to zero, matching the inverse-link jet convention.
+/// Noncanonical Bernoulli links use the same truncated Taylor-series quotient:
+/// assemble the inverse-link jet through `mu^(5)`, square the `mu'` series, and
+/// divide by the Bernoulli variance series `mu(1-mu)`. As the variance
+/// denominator saturates to zero in either tail, the weight and all derivatives
+/// saturate to zero, matching the inverse-link jet convention.
 pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
     match link {
         StandardLink::Logit => {
@@ -292,14 +290,62 @@ pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64
             (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
         }
         StandardLink::Probit => probit_fisher_weight_jet5(eta),
-        StandardLink::CLogLog | StandardLink::Identity | StandardLink::Log => {
-            // Closed-form Fisher-weight jets for these links are not yet
-            // implemented; the robustness gate only advertises links present in
-            // `fisher_weight_jet5`, so this arm is never reached on the live
-            // path. Saturate to zero rather than emit a spurious weight.
-            (0.0, 0.0, 0.0, 0.0, 0.0)
-        }
+        StandardLink::CLogLog => component_fisher_weight_jet5(LinkComponent::CLogLog, eta),
+        StandardLink::Identity | StandardLink::Log => (0.0, 0.0, 0.0, 0.0, 0.0),
     }
+}
+
+#[inline]
+fn component_fisher_weight_jet5(component: LinkComponent, eta: f64) -> (f64, f64, f64, f64, f64) {
+    let jet = component_inverse_link_jet(component, eta);
+    let d4 = component_inverse_link_pdfthird_derivative(component, eta);
+    let d5 = component_inverse_link_pdffourth_derivative(component, eta);
+    fisher_weight_jet5_from_inverse_link_derivatives(jet.mu, jet.d1, jet.d2, jet.d3, d4, d5)
+}
+
+#[inline]
+fn fisher_weight_jet5_from_inverse_link_derivatives(
+    mu: f64,
+    d1: f64,
+    d2: f64,
+    d3: f64,
+    d4: f64,
+    d5: f64,
+) -> (f64, f64, f64, f64, f64) {
+    if [mu, d1, d2, d3, d4, d5].iter().any(|v| v.is_nan()) {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    let variance = mu * (1.0 - mu);
+    if !(variance > 0.0) || !variance.is_finite() {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let factorial = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
+    let mu_d = [mu, d1, d2, d3, d4];
+    let one_minus_mu_d = [1.0 - mu, -d1, -d2, -d3, -d4];
+    let dmu_d = [d1, d2, d3, d4, d5];
+    let mut mu_t = [0.0_f64; 5];
+    let mut one_minus_mu_t = [0.0_f64; 5];
+    let mut dmu_t = [0.0_f64; 5];
+    for k in 0..5 {
+        let inv_fact = 1.0 / factorial[k];
+        mu_t[k] = mu_d[k] * inv_fact;
+        one_minus_mu_t[k] = one_minus_mu_d[k] * inv_fact;
+        dmu_t[k] = dmu_d[k] * inv_fact;
+    }
+    let num_t = taylor5_mul(&dmu_t, &dmu_t);
+    let den_t = taylor5_mul(&mu_t, &one_minus_mu_t);
+    if !(den_t[0] > 0.0) || !den_t[0].is_finite() {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    let w_t = taylor5_mul(&num_t, &taylor5_inv(&den_t));
+    (
+        canonicalzero(w_t[0] * factorial[0]),
+        canonicalzero(w_t[1] * factorial[1]),
+        canonicalzero(w_t[2] * factorial[2]),
+        canonicalzero(w_t[3] * factorial[3]),
+        canonicalzero(w_t[4] * factorial[4]),
+    )
 }
 
 /// Probit Bernoulli Fisher-weight 5-jet `W = phi^2 / (Phi (1 - Phi))` and its
@@ -2827,6 +2873,54 @@ mod tests {
             jet.mu,
             stable_mu
         );
+    }
+
+    #[test]
+    fn cloglog_fisher_weight_jet_matches_finite_differences() {
+        fn rel_err(a: f64, b: f64) -> f64 {
+            (a - b).abs() / a.abs().max(b.abs()).max(1.0e-8)
+        }
+
+        for eta in [-3.0_f64, -0.5, 0.4, 1.5] {
+            let (w, w1, w2, w3, w4) = fisher_weight_jet5(StandardLink::CLogLog, eta);
+            let jet = component_inverse_link_jet(LinkComponent::CLogLog, eta);
+            let expected = jet.d1 * jet.d1 / (jet.mu * (1.0 - jet.mu));
+            assert!(
+                rel_err(w, expected) < 1.0e-12,
+                "CLogLog Fisher weight mismatch at eta={eta}: got {w}, expected {expected}"
+            );
+
+            let h = 1.0e-4;
+            let fd1 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).0
+                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).0)
+                / (2.0 * h);
+            let fd2 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).1
+                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).1)
+                / (2.0 * h);
+            let fd3 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).2
+                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).2)
+                / (2.0 * h);
+            let fd4 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).3
+                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).3)
+                / (2.0 * h);
+
+            assert!(
+                rel_err(w1, fd1) < 1.0e-5,
+                "W' mismatch at eta={eta}: {w1} vs {fd1}"
+            );
+            assert!(
+                rel_err(w2, fd2) < 1.0e-5,
+                "W'' mismatch at eta={eta}: {w2} vs {fd2}"
+            );
+            assert!(
+                rel_err(w3, fd3) < 5.0e-5,
+                "W''' mismatch at eta={eta}: {w3} vs {fd3}"
+            );
+            assert!(
+                rel_err(w4, fd4) < 5.0e-4,
+                "W'''' mismatch at eta={eta}: {w4} vs {fd4}"
+            );
+        }
     }
 
     #[test]
