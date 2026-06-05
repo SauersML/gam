@@ -71,6 +71,8 @@ TopologyName: TypeAlias = Literal[
 ]
 TopologyScoreScale: TypeAlias = Literal["per_effective_dim", "per_observation"]
 TopologyAutoSelectorRank: TypeAlias = tuple[str, float, float, float, int, Any]
+_TOPOLOGY_SCREEN_OUTER_MAX_ITER = 4
+_TOPOLOGY_SCREEN_SURVIVORS = 2
 
 _DEFAULT_TOPOLOGY_NAMES: tuple[TopologyName, ...] = (
     "euclidean",
@@ -88,6 +90,21 @@ _NULL_HESSIAN_LOGDET_KEYS: tuple[str, ...] = (
 )
 
 
+def _fit_kwargs_with_outer_max_iter(fit_kwargs: Mapping[str, Any], cap: int) -> dict[str, Any]:
+    if cap < 1:
+        raise ValueError(f"outer_max_iter cap must be >= 1, got {cap}")
+    out = dict(fit_kwargs)
+    cfg = dict(cast(Mapping[str, Any], out.get("config") or {}))
+    existing = cfg.get("outer_max_iter")
+    cfg["outer_max_iter"] = min(int(existing), cap) if existing is not None else cap
+    out["config"] = cfg
+    return out
+
+
+def _survivor_count(n_candidates: int) -> int:
+    return min(n_candidates, _TOPOLOGY_SCREEN_SURVIVORS)
+
+
 @dataclass(frozen=True, slots=True)
 class SelectTopologyResult:
     """Result returned by :func:`select_topology`.
@@ -99,7 +116,8 @@ class SelectTopologyResult:
     winner_fit:
         Fitted model object for ``winner_name``.
     scores:
-        Selected score for every candidate after applying ``score_scale``.
+        Selected score for every fully refit survivor after applying
+        ``score_scale``.
     rankings:
         Candidate names ordered best-first with their selected scores.
     score_kind, score_scale:
@@ -114,7 +132,8 @@ class SelectTopologyResult:
         Cross-score disagreement warnings; empty when rankings agree or cannot
         be compared.
     fits:
-        All fitted models when ``return_fits=True``; otherwise ``None``.
+        Fully refit survivor models when ``return_fits=True``; otherwise
+        ``None``.
     """
 
     winner_name: str
@@ -190,11 +209,13 @@ def select_topology(
     normalized = _normalize_candidates(candidates, feature_dim=feature_dim)
     auto = _find_auto_smooth_call(formula)
 
-    fits: dict[str, Any] = {}
-    names: list[str] = []
-    fit_list: list[Any] = []
-
-    for candidate in normalized:
+    screen_kwargs = _fit_kwargs_with_outer_max_iter(
+        fit_kwargs,
+        _TOPOLOGY_SCREEN_OUTER_MAX_ITER,
+    )
+    screened: list[tuple[float, int, _Candidate]] = []
+    screen_errors: dict[str, str] = {}
+    for idx, candidate in enumerate(normalized):
         candidate_formula = _formula_for_candidate(
             formula,
             auto,
@@ -203,11 +224,46 @@ def select_topology(
         )
         if candidate_formula is None:  # defensive; strict_dimension=True raises.
             raise ValueError(f"candidate {candidate.name!r} is not constructible")
+        try:
+            model = fit(data, candidate_formula, **screen_kwargs)
+            reml_score = _extract_reml_score_raw(model)
+            if not math.isfinite(reml_score):
+                raise ValueError(f"degenerate REML score {reml_score!r}")
+            basis_size = _basis_size(model)
+            null_dim = _fitted_or_candidate_null_dim(model, candidate, basis_size)
+            raw_score = _score_for_kind(model, score_kind, n_obs, basis_size, null_dim)
+            screen_score = _scale_score(raw_score, score_scale_kind, n_obs, _effective_dim(model))
+            screened.append((_comparison_score(screen_score, score_kind), idx, candidate))
+        except Exception as exc:
+            screen_errors[candidate.name] = str(exc)
+
+    if not screened:
+        detail = "; ".join(f"{name}: {err}" for name, err in screen_errors.items())
+        raise ValueError(
+            "select_topology: no candidate produced a finite screening score"
+            + (f" ({detail})" if detail else "")
+        )
+
+    screened.sort(key=lambda row: (row[0], row[1]))
+    survivors = [row[2] for row in screened[:_survivor_count(len(screened))]]
+
+    fits: dict[str, Any] = {}
+    names: list[str] = []
+    fit_list: list[Any] = []
+    for candidate in survivors:
+        candidate_formula = _formula_for_candidate(
+            formula,
+            auto,
+            candidate,
+            strict_dimension=True,
+        )
+        if candidate_formula is None:
+            raise ValueError(f"candidate {candidate.name!r} is not constructible")
         model = fit(data, candidate_formula, **fit_kwargs)
         reml_score = _extract_reml_score_raw(model)
         if not math.isfinite(reml_score):
             raise ValueError(
-                f"select_topology: candidate {candidate.name!r} produced "
+                f"select_topology: survivor {candidate.name!r} produced "
                 f"degenerate REML score {reml_score!r}"
             )
         fits[candidate.name] = model
@@ -226,7 +282,7 @@ def select_topology(
             candidate,
             basis_sizes[candidate.name],
         )
-        for candidate in normalized
+        for candidate in survivors
         if candidate.name in fits
     }
     raw_scores = {
@@ -613,6 +669,34 @@ def _tk_normalizer_for_fit(fit_obj: Any, null_dim: float) -> float:
     return _tierney_kadane_normalizer_from_null_dim(
         null_dim,
         _extract_null_hessian_logdet(fit_obj),
+    )
+
+
+def _tk_score_from_parts(
+    raw_reml: float,
+    null_dim: float,
+    null_hessian_logdet: float | None,
+    effective_dim: float,
+    n_obs: int,
+    score_scale: TopologyScoreScale,
+) -> float:
+    raw_tk = raw_reml + _tierney_kadane_normalizer_from_null_dim(
+        null_dim,
+        null_hessian_logdet,
+    )
+    if score_scale == "per_observation":
+        if n_obs <= 0:
+            raise ValueError("TopologyAutoSelector requires n_obs > 0")
+        return raw_tk / n_obs
+    if score_scale == "per_effective_dim":
+        if not math.isfinite(effective_dim) or effective_dim <= 0.0:
+            raise ValueError(
+                "TopologyAutoSelector requires finite positive effective_dim"
+            )
+        return raw_tk / effective_dim
+    raise ValueError(
+        "TopologyAutoSelector score_scale must be 'per_effective_dim' "
+        "or 'per_observation'"
     )
 
 
@@ -1008,13 +1092,59 @@ class TopologyAutoSelector:
         auto = _maybe_auto_smooth(formula)
         normalized = _normalize_selector_candidates(self.candidates, latent.d)
 
+        screen_kwargs = _fit_kwargs_with_outer_max_iter(
+            fit_kwargs,
+            _TOPOLOGY_SCREEN_OUTER_MAX_ITER,
+        )
+        screened: list[tuple[float, int, _Candidate]] = []
+        screen_errors: dict[str, str] = {}
+        for idx, candidate in enumerate(normalized):
+            try:
+                candidate_formula = _candidate_formula(formula, auto, candidate)
+                candidate_latent = _latent_for_topology(latent, candidate.name)
+                model = fit(
+                    data,
+                    candidate_formula,
+                    latents={latent_name: candidate_latent},
+                    penalties=penalties,
+                    **screen_kwargs,
+                )
+                raw_reml = _extract_reml_score_raw(model)
+                effective_dim = _effective_dim(model)
+                null_dim = _extract_null_dim(model)
+                if null_dim is None:
+                    raise ValueError(
+                        "TopologyAutoSelector requires TK null-dimension metadata; "
+                        "fit summary is missing null_dim"
+                    )
+                tk_score = _tk_score_from_parts(
+                    float(raw_reml),
+                    float(null_dim),
+                    _extract_null_hessian_logdet(model),
+                    float(effective_dim),
+                    int(n_obs),
+                    self.score_scale,
+                )
+                screened.append((tk_score, idx, candidate))
+            except Exception as exc:
+                screen_errors[candidate.name] = str(exc)
+
+        if not screened:
+            detail = "; ".join(f"{name}: {err}" for name, err in screen_errors.items())
+            raise ValueError(
+                "TopologyAutoSelector found no fittable topology candidates during screening"
+                + (f" ({detail})" if detail else "")
+            )
+        screened.sort(key=lambda row: (row[0], row[1]))
+        survivors = [row[2] for row in screened[:_survivor_count(len(screened))]]
+
         evidence_inputs: list[dict[str, Any]] = []
         models_by_name: dict[str, Any] = {}
         raw_reml_by_name: dict[str, float] = {}
         effective_dim_by_name: dict[str, float] = {}
         errors: dict[str, str] = {}
 
-        for candidate in normalized:
+        for candidate in survivors:
             try:
                 candidate_formula = _candidate_formula(formula, auto, candidate)
                 candidate_latent = _latent_for_topology(latent, candidate.name)

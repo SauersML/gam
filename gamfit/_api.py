@@ -939,7 +939,9 @@ def fit(
                        constraints={"s(x)": "monotone_increasing"})
     config:
         Escape-hatch dict of extra pipeline keys. Any key already set via a
-        dedicated kwarg wins over the same key in ``config``.
+        dedicated kwarg wins over the same key in ``config``. Standard formula
+        fits also accept ``outer_max_iter`` as a positive integer cap on outer
+        smoothing-parameter iterations.
     latents:
         Mapping from formula symbol to :class:`gamfit.LatentCoord`. This is
         the standard fit API surface for per-row latent coordinates. The Rust

@@ -193,6 +193,7 @@ struct PyFitConfig {
     noise_offset: Option<String>,
 
     firth: Option<bool>,
+    outer_max_iter: Option<usize>,
     gpu: Option<String>,
     device: Option<String>,
 
@@ -4981,7 +4982,7 @@ fn ordered_prediction_columns(columns_json: &str) -> PyResult<String> {
 ///  ]}
 /// ```
 /// Output JSON: `{"ranked": [...], "winner_index": 0}` with entries sorted
-/// descending by `tk_score`.
+/// ascending by `tk_score`.
 #[pyfunction]
 fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
     #[derive(Deserialize)]
@@ -5023,8 +5024,8 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
             "rank_topology_candidates: at least one candidate is required".to_string(),
         ));
     }
-    let mut ranked: Vec<serde_json::Value> = Vec::with_capacity(bundle.candidates.len());
-    for entry in &bundle.candidates {
+    let mut ranked: Vec<(usize, serde_json::Value)> = Vec::with_capacity(bundle.candidates.len());
+    for (idx, entry) in bundle.candidates.iter().enumerate() {
         let tk = gam::solver::topology_selector::tk_normalized_score(
             entry.raw_reml,
             entry.null_dim,
@@ -5034,27 +5035,34 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
             score_scale,
         )
         .map_err(PyValueError::new_err)?;
-        ranked.push(serde_json::json!({
-            "name": entry.name,
-            "tk_score": tk,
-            "raw_reml": entry.raw_reml,
-            "effective_dim": entry.effective_dim,
-            "n_obs": entry.n_obs,
-        }));
+        ranked.push((
+            idx,
+            serde_json::json!({
+                "name": entry.name,
+                "tk_score": tk,
+                "raw_reml": entry.raw_reml,
+                "effective_dim": entry.effective_dim,
+                "n_obs": entry.n_obs,
+            }),
+        ));
     }
     ranked.sort_by(|lhs, rhs| {
         let l = lhs
+            .1
             .get("tk_score")
             .and_then(|v| v.as_f64())
-            .unwrap_or(f64::NEG_INFINITY);
+            .unwrap_or(f64::INFINITY);
         let r = rhs
+            .1
             .get("tk_score")
             .and_then(|v| v.as_f64())
-            .unwrap_or(f64::NEG_INFINITY);
-        r.partial_cmp(&l).unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(f64::INFINITY);
+        l.partial_cmp(&r)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| lhs.0.cmp(&rhs.0))
     });
     let out = serde_json::json!({
-        "ranked": ranked,
+        "ranked": ranked.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
         "winner_index": 0_usize,
     });
     serde_json::to_string(&out)
@@ -28390,6 +28398,12 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<(FitConfig, Option<Stri
     }
     if let Some(flag) = py_config.firth {
         fit_config.firth = flag;
+    }
+    if let Some(value) = py_config.outer_max_iter {
+        if value == 0 {
+            return Err("outer_max_iter must be >= 1".to_string());
+        }
+        fit_config.outer_max_iter = Some(value);
     }
     if let Some(raw_gpu) = py_config.gpu {
         fit_config.gpu_policy = gam::gpu::GpuPolicy::parse(&raw_gpu).ok_or_else(|| {
