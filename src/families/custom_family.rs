@@ -18812,6 +18812,13 @@ fn joint_outer_evaluate(
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
 
+    // Pre-scale the outer-REML Jeffreys curvature into the same rescaled space as
+    // the penalties so the projected-logdet path and the operator agree. `None`
+    // (flag OFF / no under-identified span) keeps the released outer REML exact.
+    let scaled_robust_jeffreys_hphi: Option<Array2<f64>> = robust_jeffreys_hphi
+        .as_ref()
+        .map(|hphi| hphi.mapv(|value| rho_curvature_scale * value));
+
     // Build derivative provider from the caller-supplied closures.
     let provider_box: Box<dyn HessianDerivativeProvider + '_> =
         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
@@ -18951,6 +18958,7 @@ fn joint_outer_evaluate(
             &scaled_s_lambdas,
             total,
             scaled_joint_trace_diagonal_ridge,
+            scaled_robust_jeffreys_hphi.as_ref(),
         )?;
         let correction = projected_logdet - hessian_op.logdet();
         if kernel.is_some() {
@@ -19277,6 +19285,7 @@ fn joint_outer_evaluate_efs(
             &scaled_s_lambdas,
             total,
             scaled_joint_trace_diagonal_ridge,
+            None,
         )?;
         let correction = projected_logdet - hessian_op.logdet();
         if kernel.is_some() {
@@ -20909,6 +20918,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 hessian_workspace.clone(),
                 eval_mode,
             )?,
+            custom_family_outer_jeffreys_hphi(
+                family,
+                &inner.block_states,
+                specs,
+                &ranges,
+                options,
+            )?,
         )?;
 
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
@@ -21042,6 +21058,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         None,
                         None,
                         None,
+                        custom_family_outer_jeffreys_hphi(
+                            family,
+                            &inner.block_states,
+                            specs,
+                            &ranges,
+                            options,
+                        )?,
                     )?;
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
@@ -21120,6 +21143,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 rho_current,
                 inner.joint_workspace.clone(),
                 eval_mode,
+            )?,
+            custom_family_outer_jeffreys_hphi(
+                family,
+                &inner.block_states,
+                specs,
+                &ranges,
+                options,
             )?,
         )?;
 
@@ -21430,6 +21460,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             rho_current,
             inner.joint_workspace.clone(),
             eval_mode,
+        )?,
+        custom_family_outer_jeffreys_hphi(
+            family,
+            &inner.block_states,
+            specs,
+            &ranges,
+            options,
         )?,
     )?;
 
@@ -24654,6 +24691,7 @@ mod tests {
             &penalties,
             3,
             0.0,
+            None,
         )
         .expect("projection parts build");
         let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
@@ -24676,6 +24714,7 @@ mod tests {
             &penalties,
             3,
             0.0,
+            None,
         )
         .expect("plus projection parts build");
         let (logdet_minus, _) = joint_penalty_subspace_trace_parts(
@@ -24684,6 +24723,7 @@ mod tests {
             &penalties,
             3,
             0.0,
+            None,
         )
         .expect("minus projection parts build");
         let finite_difference = (logdet_plus - logdet_minus) / (2.0 * eps);
@@ -24826,6 +24866,7 @@ mod tests {
             std::slice::from_ref(&s_lambda),
             3,
             0.0,
+            None,
         )
         .expect("projection kernel builds");
         let projected_trace = kernel
