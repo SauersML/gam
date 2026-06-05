@@ -24095,9 +24095,35 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     .filter(|e| e.inner_converged && e.objective.is_finite())
                     .map(|e| e.objective)
                 };
+                // Line-search consistency probe: the cost the Wolfe line search
+                // actually sees is the WARM-started, inner-capped ValueOnly path.
+                // Compare it to the COLD ValueAndGradient cost at the SAME rho:
+                // the gap is the inner-solve cost inconsistency that a Strong-Wolfe
+                // bracket treats as objective noise.
+                let warm_cost_here = {
+                    let wr = screened_outer_warm_start(outer.warm_cache.as_ref(), rho);
+                    outerobjectivegradienthessian_labeled(
+                        family,
+                        specs,
+                        &outer_options,
+                        &label_layout,
+                        rho,
+                        wr,
+                        &rho_prior,
+                        EvalMode::ValueOnly,
+                    )
+                    .ok()
+                    .map(|e| e.objective)
+                };
+                let cold_cost_here = cost_at(rho);
+                let warm_cold_gap = match (warm_cost_here, cold_cost_here) {
+                    (Some(w), Some(c)) => (w - c).abs(),
+                    _ => f64::NAN,
+                };
                 let mut report = format!(
                     "[CF-OUTER-FD-PROBE] eval#{probe_idx} firth_armed={firth_armed} robust={:?} \
-                     rho_dim={rho_dim} objective={:.8e} |g_analytic|={:.6e} rho={:?}\n",
+                     rho_dim={rho_dim} objective={:.8e} |g_analytic|={:.6e} \
+                     warm_cold_cost_gap={warm_cold_gap:.4e} rho={:?}\n",
                     outer_options.robust_identification,
                     eval_result.objective,
                     g_analytic.iter().map(|v| v * v).sum::<f64>().sqrt(),
