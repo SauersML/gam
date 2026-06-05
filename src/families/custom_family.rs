@@ -14432,8 +14432,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_bundle,
                 ),
             };
+            // Fold the Firth/Jeffreys score `∇Φ` into the head-of-cycle KKT
+            // residual when the term is armed, for the same reason as the
+            // post-step residual below: the inner objective is `−ℓ + ½βᵀSβ − Φ`,
+            // so the certifiable stationarity is `∇L − Sβ + ∇Φ = 0`. Without
+            // this the head-of-cycle KKT exit (`current_stationarity_residual ≤
+            // residual_tol`) can never fire on the near-separating span, even
+            // when the iterate is the Firth optimum. No-op when the flag is OFF.
+            let head_kkt_gradient: Option<Array1<f64>> =
+                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                    match custom_family_joint_jeffreys_term(
+                        family, &states, specs, &ranges, z_joint,
+                    )? {
+                        Some((_phi, grad_phi, _hphi)) if grad_phi.len() == grad_joint.len() => {
+                            Some(&grad_joint + &grad_phi)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
-                &grad_joint,
+                head_kkt_gradient.as_ref().unwrap_or(&grad_joint),
                 &states,
                 specs,
                 &s_lambdas,
