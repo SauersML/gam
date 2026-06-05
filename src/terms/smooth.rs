@@ -22793,7 +22793,6 @@ mod tests {
             80,
             LikelihoodSpec::binomial_probit(),
             false,
-            false,
         );
         assert!(
             pass,
@@ -22811,7 +22810,6 @@ mod tests {
         label: &str,
         n: usize,
         family: LikelihoodSpec,
-        use_thinplate: bool,
         skip_psi: bool,
     ) -> (bool, f64, Vec<String>) {
         let mut data = Array2::<f64>::zeros((n, 1));
@@ -22831,35 +22829,24 @@ mod tests {
         }
         let weights = Array1::ones(n);
         let offset = Array1::zeros(n);
-        let basis = if use_thinplate {
-            SmoothBasisSpec::ThinPlate {
-                feature_cols: vec![0],
-                spec: ThinPlateBasisSpec {
-                    periodic: None,
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: 1.0,
-                    double_penalty: false,
-                    identifiability: SpatialIdentifiability::default(),
-                    radial_reparam: None,
-                },
-                input_scales: None,
-            }
-        } else {
-            SmoothBasisSpec::Duchon {
-                feature_cols: vec![0],
-                spec: DuchonBasisSpec {
-                    periodic: None,
-                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
-                    length_scale: Some(1.0),
-                    power: 1.0,
-                    nullspace_order: DuchonNullspaceOrder::Linear,
-                    identifiability: SpatialIdentifiability::default(),
-                    aniso_log_scales: None,
-                    operator_penalties: DuchonOperatorPenaltySpec::default(),
-                    boundary: OneDimensionalBoundary::Open,
-                },
-                input_scales: None,
-            }
+        // Every active caller is a Duchon-iso-κ FD probe. Thin-plate is
+        // deliberately excluded from the spatial κ-axis enrollment (see
+        // `spatial_term_supports_hyper_optimization`), so the driver only
+        // needs to build the Duchon basis.
+        let basis = SmoothBasisSpec::Duchon {
+            feature_cols: vec![0],
+            spec: DuchonBasisSpec {
+                periodic: None,
+                center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
+                length_scale: Some(1.0),
+                power: 1.0,
+                nullspace_order: DuchonNullspaceOrder::Linear,
+                identifiability: SpatialIdentifiability::default(),
+                aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
+                boundary: OneDimensionalBoundary::Open,
+            },
+            input_scales: None,
         };
         let spec = TermCollectionSpec {
             linear_terms: vec![],
@@ -23034,7 +23021,6 @@ mod tests {
             "duchon_gaussian",
             80,
             LikelihoodSpec::gaussian_identity(),
-            false,
             false,
         );
         assert!(
@@ -23214,7 +23200,6 @@ mod tests {
             80,
             LikelihoodSpec::binomial_logit(),
             false,
-            false,
         );
         assert!(
             pass,
@@ -23223,21 +23208,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn iso_kappa_thinplate_binomial_probit_fd() {
-        let (pass, worst, violations) = iso_kappa_fd_variant_driver(
-            "tps_probit",
-            80,
-            LikelihoodSpec::binomial_probit(),
-            true,
-            false,
-        );
-        assert!(
-            pass,
-            "ThinPlate Probit FD failed; worst_psi_rel={worst:.3e}\n  {}",
-            violations.join("\n  ")
-        );
-    }
+    // No `iso_kappa_thinplate_*_fd` companion to the Duchon FD tests above:
+    // thin-plate is deliberately excluded from the spatial κ-axis enrollment
+    // by `spatial_term_supports_hyper_optimization` (a scalar TPS κ creates
+    // the flat ρ/κ valleys tracked in #718 / #721 / #731 / #732), so there
+    // is no analytic κ-gradient on which an FD comparison could land.
 
     #[test]
     fn iso_kappa_duchon_n_smaller_fd() {
@@ -23245,7 +23220,6 @@ mod tests {
             "duchon_probit_n20",
             20,
             LikelihoodSpec::binomial_probit(),
-            false,
             false,
         );
         assert!(
@@ -23261,7 +23235,6 @@ mod tests {
             "duchon_probit_rho_only",
             80,
             LikelihoodSpec::binomial_probit(),
-            false,
             true,
         );
         assert!(
