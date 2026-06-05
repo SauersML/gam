@@ -794,6 +794,17 @@ impl RemlConfig {
         self
     }
 
+    /// Whether the family-general Firth/Jeffreys robustness mechanism is armed
+    /// for this fit. Resolves the user-facing tri-state
+    /// [`RobustIdentification`](crate::solver::workflow::RobustIdentification)
+    /// policy through [`RobustConfig`](crate::solver::robust_identification::RobustConfig);
+    /// `Off` ⇒ `false` (released, byte-identical path), `Auto`/`Force`/`FirthOnly`
+    /// ⇒ `true`. Used to gate the outer PC hyperprior default on λ.
+    pub(crate) fn firth_general(&self) -> bool {
+        crate::solver::robust_identification::RobustConfig::from_policy(self.robust_identification)
+            .firth_general
+    }
+
     fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }
