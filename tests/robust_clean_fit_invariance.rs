@@ -236,19 +236,19 @@ fn full_span_jeffreys_coefficient_gap_shrinks_with_n() {
             .zip(on.beta.iter())
             .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()))
     };
-    let g_small = gap(300);
-    let g_large = gap(2400);
+    let g_small = gap(600);
+    let g_large = gap(3000);
     eprintln!(
-        "[clean-invariance] Firth nudge max|Δβ|: n=300 → {g_small:.3e}, n=2400 → {g_large:.3e} \
+        "[clean-invariance] Firth nudge max|Δβ|: n=600 → {g_small:.3e}, n=3000 → {g_large:.3e} \
          (ratio {:.2})",
         g_small / g_large.max(1e-12),
     );
-    // O(1/n): an 8× larger n should shrink the nudge substantially. Require it to
+    // O(1/n): a 5× larger n should shrink the nudge substantially. Require it to
     // at least halve (allowing for the non-asymptotic regime and basis effects).
     assert!(
         g_large < g_small * 0.6,
-        "full-span Jeffreys coefficient gap did not shrink with n (n=300 → {g_small:.3e}, \
-         n=2400 → {g_large:.3e}); the nudge is not behaving like the self-limiting O(1/n) \
+        "full-span Jeffreys coefficient gap did not shrink with n (n=600 → {g_small:.3e}, \
+         n=3000 → {g_large:.3e}); the nudge is not behaving like the self-limiting O(1/n) \
          Firth correction",
     );
 }
