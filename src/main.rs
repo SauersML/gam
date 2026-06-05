@@ -9445,8 +9445,8 @@ mod tests {
         write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
-        Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs,
-        run_fit, run_predict, run_sample, write_model_json,
+        Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs, run_fit,
+        run_predict, run_sample, write_model_json,
     };
     use clap::Parser;
     use csv::StringRecord;
