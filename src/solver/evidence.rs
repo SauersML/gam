@@ -1038,7 +1038,7 @@ pub fn select_topology(
             .enumerate()
             .map(|(idx, row)| {
                 let score = topology_selection_score(&row, options.score_scale);
-                let tie_break = row.kind.complexity_rank();
+                let tie_break = usize::from(row.kind.complexity_rank());
                 PriorityCandidate::new(row, idx, score, tie_break)
             })
             .collect(),
