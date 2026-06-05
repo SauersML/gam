@@ -1699,7 +1699,7 @@ pub enum EstimationError {
     PerfectSeparationDetected { iteration: usize, max_abs_eta: f64 },
 
     #[error(
-        "Pre-fit perfect separation detected in the realized binomial-logit design: column {column_index} \
+        "Pre-fit perfect separation detected in the realized binomial inverse-link design: column {column_index} \
         has a threshold {threshold:.6e} that separates the binary outcomes \
         (positive_above_threshold={positive_above_threshold}). The unpenalized MLE is not finite; \
         enable Firth/Jeffreys bias reduction or remove/reparameterize the separating column."
@@ -2287,7 +2287,7 @@ fn separator_from_column_extrema(
     None
 }
 
-fn detect_prefit_binomial_logit_single_column_separation(
+fn detect_prefit_binomial_single_column_separation(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: ndarray::ArrayView2<'_, f64>,
@@ -2330,7 +2330,7 @@ fn detect_prefit_binomial_logit_single_column_separation(
     separator_from_column_extrema(unpenalized_columns, &min_pos, &max_pos, &min_neg, &max_neg)
 }
 
-fn detect_prefit_binomial_logit_single_column_separation_in_design(
+fn detect_prefit_binomial_single_column_separation_in_design(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
     x: &DesignMatrix,
@@ -2363,7 +2363,7 @@ fn detect_prefit_binomial_logit_single_column_separation_in_design(
         x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
             .map_err(|err| {
                 EstimationError::LayoutError(format!(
-                    "pre-fit binomial-logit separation check failed to stream design rows: {err}"
+                    "pre-fit binomial separation check failed to stream design rows: {err}"
                 ))
             })?;
         for local_row in 0..rows {
@@ -2398,7 +2398,18 @@ fn detect_prefit_binomial_logit_single_column_separation_in_design(
     ))
 }
 
-fn reject_prefit_binomial_logit_separation(
+fn prefit_binomial_separation_supported_link(link: &InverseLink) -> bool {
+    matches!(
+        link,
+        InverseLink::Standard(StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_)
+    )
+}
+
+fn reject_prefit_binomial_separation(
     cfg: &RemlConfig,
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -2406,13 +2417,13 @@ fn reject_prefit_binomial_logit_separation(
     penalties: &[CanonicalPenalty],
 ) -> Result<(), EstimationError> {
     if !matches!(cfg.likelihood.spec.response, ResponseFamily::Binomial)
-        || cfg.link_function() != LinkFunction::Logit
+        || !prefit_binomial_separation_supported_link(&cfg.link_kind)
         || cfg.firth_bias_reduction
     {
         return Ok(());
     }
     let unpenalized_columns = canonical_unpenalized_column_mask(penalties, x_fit.ncols());
-    if let Some(diagnostic) = detect_prefit_binomial_logit_single_column_separation_in_design(
+    if let Some(diagnostic) = detect_prefit_binomial_single_column_separation_in_design(
         y,
         w,
         x_fit,
@@ -3187,7 +3198,7 @@ where
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
     reject_prefit_unpenalized_rank_deficiency(w, &x_fit, &canonical)?;
-    reject_prefit_binomial_logit_separation(&cfg, y, w, &x_fit, &canonical)?;
+    reject_prefit_binomial_separation(&cfg, y, w, &x_fit, &canonical)?;
 
     let design_kind = match &x {
         DesignMatrix::Dense(_) => "dense",
@@ -7299,11 +7310,11 @@ mod estimate_policy_tests {
     }
 
     #[test]
-    fn prefit_binomial_logit_detects_unpenalized_realized_design_separator() {
+    fn prefit_binomial_detects_unpenalized_realized_design_separator() {
         let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
         let y = array![0.0, 0.0, 1.0, 1.0];
         let w = Array1::ones(y.len());
-        let diagnostic = detect_prefit_binomial_logit_single_column_separation(
+        let diagnostic = detect_prefit_binomial_single_column_separation(
             y.view(),
             w.view(),
             x.view(),
@@ -7317,14 +7328,14 @@ mod estimate_policy_tests {
     }
 
     #[test]
-    fn prefit_binomial_logit_screen_respects_penalties_and_fractional_responses() {
+    fn prefit_binomial_screen_respects_penalties_and_fractional_responses() {
         let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
         let binary_y = array![0.0, 0.0, 1.0, 1.0];
         let fractional_y = array![0.0, 0.25, 0.75, 1.0];
         let w = Array1::ones(binary_y.len());
 
         assert_eq!(
-            detect_prefit_binomial_logit_single_column_separation(
+            detect_prefit_binomial_single_column_separation(
                 binary_y.view(),
                 w.view(),
                 x.view(),
@@ -7334,7 +7345,7 @@ mod estimate_policy_tests {
             "a separating column with effective quadratic penalty should not be pre-fit rejected"
         );
         assert_eq!(
-            detect_prefit_binomial_logit_single_column_separation(
+            detect_prefit_binomial_single_column_separation(
                 fractional_y.view(),
                 w.view(),
                 x.view(),
@@ -7359,7 +7370,34 @@ mod estimate_policy_tests {
             1e-7,
             false,
         );
-        let err = reject_prefit_binomial_logit_separation(&cfg, y.view(), w.view(), &design, &[])
+        let err = reject_prefit_binomial_separation(&cfg, y.view(), w.view(), &design, &[])
+            .expect_err("unpenalized exact separator should fail before REML/PIRLS");
+
+        assert!(matches!(
+            err,
+            EstimationError::PrefitPerfectSeparationDetected {
+                column_index: 1,
+                positive_above_threshold: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prefit_binomial_probit_rejects_before_outer_solver() {
+        let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let w = Array1::ones(y.len());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Probit),
+            )),
+            1e-7,
+            false,
+        );
+        let err = reject_prefit_binomial_separation(&cfg, y.view(), w.view(), &design, &[])
             .expect_err("unpenalized exact separator should fail before REML/PIRLS");
 
         assert!(matches!(
