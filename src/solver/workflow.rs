@@ -4124,6 +4124,7 @@ pub fn materialize<'a>(
         // auxiliary-formula rejection in `validate_auxiliary_formula_controls`.
         reject_survival_only_terms_for_nonsurvival(&parsed)?;
         if config.transformation_normal {
+            reject_marginal_slope_controls_for_transformation_normal(config)?;
             if config.noise_formula.is_some() {
                 return Err(WorkflowError::InvalidConfig {
                     reason: "transformation_normal cannot be combined with noise_formula"
@@ -4139,6 +4140,26 @@ pub fn materialize<'a>(
             materialize_standard(&parsed, data, &col_map, config)
         }
     }
+}
+
+fn reject_marginal_slope_controls_for_transformation_normal(
+    config: &FitConfig,
+) -> Result<(), WorkflowError> {
+    let family_requests_marginal_slope = config.family.as_deref().is_some_and(|family| {
+        let canonical = family.to_ascii_lowercase().replace('_', "-");
+        canonical == "bernoulli-marginal-slope" || canonical == "binary-marginal-slope"
+    });
+    if family_requests_marginal_slope
+        || config.logslope_formula.is_some()
+        || config.z_column.is_some()
+        || config.ctn_stage1.is_some()
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "transformation_normal cannot be combined with marginal-slope family controls"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Reject `timewiggle(...)` / `survmodel(...)` in a formula whose response is
@@ -7993,6 +8014,45 @@ mod tests {
                 ColumnKindTag::Continuous,
             ],
         }
+    }
+
+    #[test]
+    fn transformation_normal_rejects_marginal_slope_controls_before_family_dispatch() {
+        let data = workflow_test_dataset();
+        let config = FitConfig {
+            transformation_normal: true,
+            family: Some("bernoulli-marginal-slope".to_string()),
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            ..FitConfig::default()
+        };
+
+        let err = materialize("event ~ bmi", &data, &config)
+            .err()
+            .expect("transformation_normal must not steal marginal-slope fits");
+
+        assert!(
+            err.to_string()
+                .contains("transformation_normal cannot be combined with marginal-slope")
+        );
+    }
+
+    #[test]
+    fn survival_marginal_slope_rejects_zero_event_data_before_fit() {
+        let mut data = workflow_test_dataset();
+        data.values.column_mut(2).fill(0.0);
+        let config = FitConfig {
+            survival_likelihood: "marginal-slope".to_string(),
+            logslope_formula: Some("1".to_string()),
+            z_column: Some("z".to_string()),
+            ..FitConfig::default()
+        };
+
+        let err = materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config)
+            .err()
+            .expect("zero-event survival marginal-slope data must fail before optimization");
+
+        assert!(err.to_string().contains("at least one target event"));
     }
 
     fn workflow_test_outer_result(converged: bool, rho: Array1<f64>) -> OuterResult {
