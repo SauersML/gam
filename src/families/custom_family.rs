@@ -18623,6 +18623,12 @@ fn joint_penalty_subspace_trace_parts(
     s_lambdas: &[Array2<f64>],
     total: usize,
     hessian_diagonal_ridge: f64,
+    // Pre-scaled outer-REML Jeffreys curvature (already multiplied by
+    // `rho_curvature_scale` to live in the same scaled space as `s_lambdas`).
+    // Folded into `M = H + Sλ (+ H_Φ)` so the projected logdet AND its trace
+    // kernel `(H+Sλ+H_Φ)⁺` match the Jeffreys-augmented operator the LAML score
+    // runs on. `None` ⇒ byte-identical released projected logdet.
+    scaled_jeffreys_hphi: Option<&Array2<f64>>,
 ) -> Result<(f64, Option<PenaltySubspaceTrace>), String> {
     if total == 0 {
         return Ok((0.0, None));
@@ -18694,6 +18700,9 @@ fn joint_penalty_subspace_trace_parts(
         materialize_joint_hessian_source(h_joint_unpen, total, "joint penalty subspace logdet")?;
     let mut m = m_dense;
     add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
+    if let Some(hphi) = scaled_jeffreys_hphi {
+        m += hphi;
+    }
     symmetrize_dense_in_place(&mut m);
     let (m_evals, m_evecs) = m.eigh(Side::Lower).map_err(|e| {
         format!("joint penalty subspace full Hessian eigendecomposition failed: {e}")
@@ -18791,6 +18800,14 @@ fn joint_outer_evaluate(
     batched_outer_hessian_operator: Option<
         Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     >,
+    // Universal under-identification robustness (flag-gated, default OFF). The
+    // outer REML logdet AND its trace derivatives must run on the same
+    // Jeffreys-augmented Hessian `H + S_λ + H_Φ` the inner Newton converged on,
+    // or the LAML value and its analytic gradient describe different objectives.
+    // `H_Φ` carries no ρ-dependence, so folding it into the operator's matvec
+    // leaves every existing derivative closure correct and only augments the
+    // inverse/logdet. `None` ⇒ byte-identical released outer REML.
+    robust_jeffreys_hphi: Option<Array2<f64>>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
@@ -18839,6 +18856,8 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
+                    let apply_hphi = robust_jeffreys_hphi.clone();
+                    let hphi_scale = rho_curvature_scale;
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
                         total,
                         move |v| {
@@ -18851,6 +18870,10 @@ fn joint_outer_evaluate(
                                 None,
                             );
                             out += &penalty;
+                            if let Some(hphi) = apply_hphi.as_ref() {
+                                let jeffreys = hphi.dot(v);
+                                out.scaled_add(hphi_scale, &jeffreys);
+                            }
                             out
                         },
                         pseudo_logdet_mode,
@@ -18860,6 +18883,8 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
+                    let apply_hphi = robust_jeffreys_hphi.clone();
+                    let hphi_scale = rho_curvature_scale;
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
                         total,
                         move |v| {
@@ -18880,6 +18905,10 @@ fn joint_outer_evaluate(
                                 None,
                             );
                             out += &penalty;
+                            if let Some(hphi) = apply_hphi.as_ref() {
+                                let jeffreys = hphi.dot(v);
+                                out.scaled_add(hphi_scale, &jeffreys);
+                            }
                             out
                         },
                         pseudo_logdet_mode,
@@ -18899,6 +18928,9 @@ fn joint_outer_evaluate(
                 scaled_joint_trace_diagonal_ridge,
                 None,
             );
+            if let Some(hphi) = robust_jeffreys_hphi.as_ref() {
+                j_for_traces.scaled_add(rho_curvature_scale, hphi);
+            }
             Arc::new(
                 BlockCoupledOperator::from_joint_hessian_with_mode(
                     &j_for_traces,
@@ -22095,6 +22127,42 @@ fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'st
         },
     )?;
     Ok(Some(term))
+}
+
+/// Outer-REML Jeffreys curvature `H_Φ` for the coupled joint Hessian, scoped to
+/// the under-identified span `Z_J`. Returns `None` when the robust flag is OFF,
+/// the policy does not arm the family-general Firth term, there is no
+/// under-identified direction, or the family exposes no exact joint Hessian — in
+/// every such case the outer REML stays byte-identical to the released solver.
+///
+/// This is the OUTER-path companion to the inner-Newton wiring: the LAML score
+/// uses `log|H + S_λ + H_Φ|` and its analytic ρ-derivatives `tr((H+S_λ+H_Φ)⁻¹ ∂(H+S_λ)/∂ρ)`.
+/// Because `H_Φ` carries no ρ-dependence, the existing first/second derivative
+/// closures stay exactly correct; only the inverse used in the trace identity
+/// (and the operator's own `logdet()`) must reflect the augmented curvature, so
+/// the value and its gradient describe the SAME penalized objective. Folding
+/// `H_Φ` directly into the `HessianOperator` here is what keeps the outer score
+/// consistent with the inner-converged stationary system on the now-PD problem.
+fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+    options: &BlockwiseFitOptions,
+) -> Result<Option<Array2<f64>>, String> {
+    let robust_firth_armed =
+        crate::solver::robust_identification::RobustConfig::from_policy(options.robust_identification)
+            .firth_general;
+    if !robust_firth_armed {
+        return Ok(None);
+    }
+    let z_joint = match build_joint_jeffreys_subspace(specs, ranges)? {
+        Some(z) => z,
+        None => return Ok(None),
+    };
+    let hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
+        .map(|(_phi, _grad, hphi)| hphi);
+    Ok(hphi)
 }
 
 const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;

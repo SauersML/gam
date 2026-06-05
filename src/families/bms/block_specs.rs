@@ -1685,7 +1685,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // Built lazily against THESE designs (the frozen ones the solver fits).
         let reparam = confound_reparam_for(marginal_design, logslope_design)?;
         if robust.orthogonalize_confounds {
-            eprintln!(
+            log::warn!(
                 "[DBG build_blocks] marginal_ncols={} logslope_ncols={} reparam_pc={:?}",
                 marginal_design.design.ncols(),
                 logslope_design.design.ncols(),
@@ -1772,7 +1772,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             .as_ref()
             .and_then(|c| c.clone());
         if robust.orthogonalize_confounds {
-            eprintln!(
+            log::warn!(
                 "[DBG make_family] logslope_ncols={} reparam_pc={:?}",
                 logslope_design.design.ncols(),
                 reparam.as_ref().map(|r| r.confound_cols()),
