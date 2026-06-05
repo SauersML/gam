@@ -804,6 +804,17 @@ impl RemlConfig {
         self
     }
 
+    /// Whether the family-general Firth/Jeffreys robustness mechanism is armed
+    /// for this fit. Resolves the user-facing tri-state
+    /// [`RobustIdentification`](crate::solver::workflow::RobustIdentification)
+    /// policy through [`RobustConfig`](crate::solver::robust_identification::RobustConfig);
+    /// `Off` ⇒ `false` (released, byte-identical path), `Auto`/`Force`/`FirthOnly`
+    /// ⇒ `true`. Used to gate the outer PC hyperprior default on λ.
+    pub(crate) fn firth_general(&self) -> bool {
+        crate::solver::robust_identification::RobustConfig::from_policy(self.robust_identification)
+            .firth_general
+    }
+
     fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }
@@ -1881,14 +1892,12 @@ fn resolve_external_family(
         (&family.response, &family.link),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(
-                StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog
-            ),
+            InverseLink::Standard(StandardLink::Logit),
         ),
     );
     if firth_override == Some(true) && !supports_firth {
         crate::bail_invalid_estim!(
-            "firth_bias_reduction is currently implemented only for standard Binomial Logit, Probit, and CLogLog links; {} does not support it",
+            "firth_bias_reduction is currently implemented only for Binomial Logit; {} does not support it",
             family.pretty_name(),
         );
     }
@@ -3504,10 +3513,13 @@ where
         },
         None,
         None,
-        // Final, reported fit at the REML-selected λ: refine the Gamma
-        // dispersion shape at the converged η so `dispersion_phi()` and every
-        // SE / interval derived from it reflect the conditional noise, not the
-        // spread of μ (#678). λ is fixed here, so there is no scale↔λ feedback.
+        // Final, reported fit at the REML-selected λ: refine the family's
+        // estimated dispersion nuisance at the converged η. For Gamma this
+        // re-estimates the shape so `dispersion_phi()` and every SE / interval
+        // reflect the conditional noise, not the spread of μ (#678); for Beta
+        // it drives the precision φ and the mean β̂ to their joint fixed point,
+        // undoing the slope attenuation from a φ frozen at the null predictor
+        // (#769). λ is fixed here, so there is no scale↔λ feedback.
         true,
     )?;
 
