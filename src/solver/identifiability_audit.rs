@@ -506,29 +506,11 @@ fn audit_identifiability_impl(
             .map_err(|e| EstimationError::LayoutError(format!("identifiability audit: {e}")))?;
         dense_blocks.push(dense);
     }
-    // The per-observation row count is the count shared by the linear-predictor
-    // blocks (`n`, or `n·k` for multi-output families). A GLOBAL-SCALAR parameter
-    // — e.g. the lognormal frailty log-SD (#723), which parameterises the
-    // integrated-out frailty distribution rather than any per-observation linear
-    // predictor — honestly contributes a 1-row effective Jacobian and cannot
-    // row-align with the per-observation blocks. Take `n` as the max row count
-    // (the per-obs count) and admit blocks with FEWER rows as global-scalar: they
-    // are audited for within-block rank below (identified iff their small
-    // Jacobian has full column rank) and zero-padded into the joint cross-block
-    // design, where their disjoint row support keeps them from aliasing a
-    // per-observation column. For the homogeneous case (every block has `n` rows,
-    // the historical invariant) `n` equals the old `dense_blocks[0].nrows()` and
-    // every block fills all `n` rows, so this is bit-identical to the prior
-    // equality check + assembly.
-    let n = dense_blocks
-        .iter()
-        .map(|d| d.nrows())
-        .max()
-        .expect("dense_blocks is non-empty: specs.is_empty() returned early above");
+    let n = dense_blocks[0].nrows();
     for (idx, dense) in dense_blocks.iter().enumerate() {
-        if dense.nrows() == 0 || dense.nrows() > n {
+        if dense.nrows() != n {
             return Err(EstimationError::LayoutError(format!(
-                "identifiability audit: block {} ({}) has {} effective-Jacobian rows, expected 1..={}",
+                "identifiability audit: block {} ({}) has {} effective-Jacobian rows, expected {}",
                 idx,
                 specs[idx].name,
                 dense.nrows(),
@@ -646,14 +628,7 @@ fn audit_identifiability_impl(
         let start = col_offsets[idx];
         let end = col_offsets[idx + 1];
         if end > start {
-            // Global-scalar blocks (rows < n) occupy only their own leading rows;
-            // the remaining rows stay zero so their disjoint support keeps them
-            // from aliasing per-observation columns. Per-obs blocks have br == n
-            // and fill the whole column span exactly as before.
-            let br = block.nrows();
-            x_joint
-                .slice_mut(ndarray::s![..br, start..end])
-                .assign(block);
+            x_joint.slice_mut(ndarray::s![.., start..end]).assign(block);
         }
     }
 

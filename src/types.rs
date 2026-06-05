@@ -1201,7 +1201,6 @@ impl LikelihoodSpec {
             // a free `phi`, so it too defaults to fixed unit dispersion.
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
-            | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => {
                 LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
             }
