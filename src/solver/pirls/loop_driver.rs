@@ -1438,6 +1438,80 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         }
     }
 
+    // ── Tweedie dispersion φ: re-estimate at the *converged* η (#771) ─────────
+    //
+    // Identical in spirit to the Gamma-shape refresh above: the inner LM solve
+    // estimates φ **once** from the warm-start η and freezes it (the
+    // `tweedie_phi_locked` lock), keeping the product φ·λ — and hence β̂ — a
+    // stationary LM target. φ enters only the working weight `prior·μ^{2−p}/φ`
+    // and not the working response, so (like the Gamma shape, and unlike the
+    // Beta precision which couples through the digamma mean score) the mean
+    // surface is essentially scale-free and β̂ barely moves when φ is corrected.
+    // But the frozen warm-start φ is the value that survives into
+    // `FitInference::dispersion` and the covariance `Vb = H⁻¹` (whose √φ scaling
+    // lives in the weight); at a cold-started η ≈ 0 the Pearson residuals carry
+    // the *marginal* spread of y, biasing the estimate. Re-estimating at the
+    // converged η — re-solving β only if φ moved materially — drives (β, φ) to
+    // their joint fixed point, so the reported φ is the converged-mean Pearson
+    // estimate and the final weights/Hessian/SE are internally consistent with
+    // it. Held OFF inside the REML λ search (the flag), φ is refreshed only at
+    // the reported fit, so it cannot couple to the smoothing parameter.
+    if refine_dispersion_at_converged_eta
+        && working_model.likelihood.scale.tweedie_phi_is_estimated()
+    {
+        if let ResponseFamily::Tweedie { p } = working_model.likelihood.spec.response {
+            // The converged-η Pearson map is a strong contraction (β̂ scale-free
+            // here), so cold starts settle in 1–2 re-solves and warm starts in
+            // zero.
+            const MAX_PHI_REFRESH: usize = 5;
+            // Relative φ tolerance below which a re-solve cannot move any reported
+            // quantity meaningfully (far under statistical resolution).
+            const PHI_REFRESH_REL_TOL: f64 = 1e-4;
+            for refresh_iter in 0..MAX_PHI_REFRESH {
+                let refreshed_phi = super::estimate_tweedie_phi_from_eta(
+                    y,
+                    working_summary.state.eta.as_ref(),
+                    priorweights,
+                    p,
+                );
+                let prior_phi = working_model.likelihood.fixed_phi().unwrap_or(1.0);
+                let rel_change =
+                    (refreshed_phi - prior_phi).abs() / prior_phi.max(f64::MIN_POSITIVE);
+                // Install the refreshed φ (the scale metadata the working weight
+                // reads via `fixed_phi()`) and re-arm the lock so a following
+                // re-solve does not overwrite this converged-η value. Because the
+                // exit paths below evaluate φ at the *current* η with no following
+                // re-solve, the reported φ always equals
+                // `estimate_tweedie_phi_from_eta(final_eta)`.
+                working_model.likelihood = working_model
+                    .likelihood
+                    .clone()
+                    .with_tweedie_phi(refreshed_phi);
+                working_model.tweedie_phi_locked = true;
+                if rel_change <= PHI_REFRESH_REL_TOL {
+                    // Converged: the working state already reflects a φ within
+                    // tolerance of `refreshed_phi`. Nothing left to rebuild.
+                    break;
+                }
+                if refresh_iter + 1 == MAX_PHI_REFRESH {
+                    // Final allowed pass and φ is still drifting. Do NOT re-solve:
+                    // re-solving would advance η past the point φ was evaluated at,
+                    // breaking the stored-φ == estimate(final_eta) invariant.
+                    break;
+                }
+                // φ moved materially: re-solve β at the corrected φ, warm-started
+                // at the converged β, so the final working state is rebuilt with
+                // the refreshed φ.
+                working_summary = runworking_model_pirls(
+                    &mut working_model,
+                    working_summary.beta.clone(),
+                    &options,
+                    &mut iteration_logger,
+                )?;
+            }
+        }
+    }
+
     // ── Beta precision φ: re-estimate at the *converged* η and drive (β, φ) to
     //    their joint fixed point (#769) ──────────────────────────────────────
     //

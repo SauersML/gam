@@ -702,7 +702,17 @@ fn dispersion_from_likelihood(
             }
         }
         ResponseFamily::Tweedie { .. } => {
-            Dispersion::Known(likelihood.fixed_phi().unwrap_or(1.0).max(1e-300))
+            // `Var(y) = phi · mu^p`, so the response-level dispersion is `phi`
+            // itself, read from the scale metadata (now the converged-η Pearson
+            // estimate, issue #771). Reported as `Estimated` when the default
+            // estimate-phi metadata is in force so downstream consumers know the
+            // scale came from the data, not a frozen seed.
+            let phi = likelihood.fixed_phi().unwrap_or(1.0).max(1e-300);
+            if likelihood.scale.tweedie_phi_is_estimated() {
+                Dispersion::Estimated(phi)
+            } else {
+                Dispersion::Known(phi)
+            }
         }
         ResponseFamily::NegativeBinomial { theta } => {
             Dispersion::Known(likelihood.fixed_phi().unwrap_or(*theta).max(1e-300))
@@ -4540,7 +4550,8 @@ fn validate_likelihood_scale_estimation(
     match scale {
         LikelihoodScaleMetadata::ProfiledGaussian | LikelihoodScaleMetadata::Unspecified => Ok(()),
         LikelihoodScaleMetadata::FixedDispersion { phi }
-        | LikelihoodScaleMetadata::EstimatedBetaPhi { phi } => {
+        | LikelihoodScaleMetadata::EstimatedBetaPhi { phi }
+        | LikelihoodScaleMetadata::EstimatedTweediePhi { phi } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.phi", phi)?;
             if phi > 0.0 {
                 Ok(())
