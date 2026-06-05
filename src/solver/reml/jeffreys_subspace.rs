@@ -700,10 +700,11 @@ mod tests {
 
     #[test]
     fn conditioning_gate_fires_only_below_threshold() {
-        // Bracket the gate: a ratio just ABOVE the threshold is skipped (zero
-        // term), a ratio just BELOW it falls through to the active path and
-        // produces a NONZERO value/curvature. This pins the "no cost on easy
-        // fits, full term on hard ones" boundary.
+        // Bracket the COMBINED relative+absolute gate. To be SKIPPED a fit must be
+        // well-conditioned both relatively (ratio ≥ 1e-8) AND absolutely
+        // (λ_min ≥ 1); if EITHER fails the term fires. This pins the "no cost on a
+        // genuinely well-conditioned large-n fit, full term on a (relatively OR
+        // absolutely) near-separating one" boundary.
         let p = 2usize;
         let z = Array2::<f64>::eye(p);
         let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
@@ -712,26 +713,59 @@ mod tests {
             hd[[1, 1]] = d[1];
             Ok(Some(hd))
         };
-        // lambda_max = 1.0; choose lambda_min on either side of CONDITIONING_GATE_RELATIVE.
+        // λ_max = 1.0 (h[[0,0]]); λ_min = the closure argument (h[[1,1]]).
         let mk = |lmin: f64| {
             let mut h = Array2::<f64>::zeros((p, p));
             h[[0, 0]] = 1.0;
             h[[1, 1]] = lmin;
             h
         };
-        // Above threshold (well-conditioned) ⇒ gated.
-        let above = mk(CONDITIONING_GATE_RELATIVE * 10.0);
+        // Genuinely well-conditioned (large-n): ratio 0.5 ≥ 1e-8 AND λ_min = 50 ≫ 1
+        // ⇒ gated. NOTE the second arg of `mk` is λ_min while `h[[0,0]]` is fixed
+        // at 1.0 in the closure above; we override it here to a large λ_max.
+        let mut above = mk(50.0);
+        above[[0, 0]] = 100.0;
         let (phi_a, grad_a, _) = joint_jeffreys_term(above.view(), z.view(), hdir).unwrap();
         assert_eq!(phi_a, 0.0);
         assert!(grad_a.iter().all(|v| *v == 0.0));
-        // Below threshold (ill-conditioned) ⇒ active, nonzero contribution.
-        let below = mk(CONDITIONING_GATE_RELATIVE * 0.1);
-        let (phi_b, _grad_b, hphi_b) = joint_jeffreys_term(below.view(), z.view(), hdir).unwrap();
-        assert!(phi_b != 0.0, "below-gate must produce a nonzero Jeffreys value");
+        // Relatively near-separating (ratio < 1e-8, λ_max = 1.0) ⇒ fires.
+        let below_rel = mk(CONDITIONING_GATE_RELATIVE * 0.1);
+        let (phi_r, _g, hphi_r) = joint_jeffreys_term(below_rel.view(), z.view(), hdir).unwrap();
+        assert!(phi_r != 0.0, "relatively near-separating must fire");
+        assert!(hphi_r.iter().any(|v| v.abs() > 0.0));
+        // ABSOLUTELY near-separating at SMALL n: λ_max = 1.0, λ_min = 0.05 ⇒ ratio
+        // 0.05 ≥ 1e-8 (the relative gate alone would WRONGLY skip), but λ_min < 1
+        // ⇒ the n-aware ABSOLUTE gate fires the stabilising term. This is exactly
+        // the FIX-C small-n admixture-cline regime the relative-only gate missed.
+        let below_abs = mk(0.05);
+        let (phi_b, _grad_b, hphi_b) = joint_jeffreys_term(below_abs.view(), z.view(), hdir).unwrap();
+        assert!(
+            phi_b != 0.0,
+            "absolutely near-separating (small-n) must fire even though the relative ratio clears the gate",
+        );
         assert!(
             hphi_b.iter().any(|v| v.abs() > 0.0),
-            "below-gate must produce nonzero bounding curvature"
+            "absolute-gate firing must produce nonzero bounding curvature",
         );
+    }
+
+    #[test]
+    fn conditioning_gate_predicate_relative_and_absolute() {
+        // Unit coverage of the shared predicate's two-sided logic.
+        // Well-conditioned (both gates pass) ⇒ skip.
+        assert!(conditioning_gate_skips(50.0, 100.0));
+        // Relatively ill-conditioned ⇒ do not skip.
+        assert!(!conditioning_gate_skips(CONDITIONING_GATE_RELATIVE * 0.1, 1.0));
+        // Absolutely near-separating at small n (ratio fine, λ_min < 1) ⇒ do not skip.
+        assert!(!conditioning_gate_skips(0.05, 1.0));
+        // Boundary: λ_min exactly at the absolute gate with a fine ratio ⇒ skip.
+        assert!(conditioning_gate_skips(
+            CONDITIONING_GATE_ABSOLUTE,
+            CONDITIONING_GATE_ABSOLUTE
+        ));
+        // Non-positive / non-finite spectra ⇒ never skip.
+        assert!(!conditioning_gate_skips(0.0, 0.0));
+        assert!(!conditioning_gate_skips(f64::NAN, 100.0));
     }
 
     #[test]
