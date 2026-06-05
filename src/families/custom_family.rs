@@ -24074,17 +24074,21 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             if !guard.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 let g_analytic = eval_result.gradient.clone();
                 let rho_dim = rho.len();
+                // Control: evaluate the cost via the SAME ValueAndGradient path
+                // (not ValueOnly) and with a COLD inner solve (no warm cache), to
+                // rule out (a) ValueOnly vs ValueAndGradient computing different
+                // objectives and (b) warm-start landing the inner at a different
+                // local beta-hat than the analytic-gradient eval used.
                 let cost_at = |rho_pert: &Array1<f64>| -> Option<f64> {
-                    let wr = screened_outer_warm_start(outer.warm_cache.as_ref(), rho_pert);
                     outerobjectivegradienthessian_labeled(
                         family,
                         specs,
                         &outer_options,
                         &label_layout,
                         rho_pert,
-                        wr,
+                        None,
                         &rho_prior,
-                        EvalMode::ValueOnly,
+                        EvalMode::ValueAndGradient,
                     )
                     .ok()
                     .filter(|e| e.inner_converged && e.objective.is_finite())
