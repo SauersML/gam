@@ -24821,6 +24821,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("projected outer evaluation succeeds");
 
@@ -24849,6 +24850,7 @@ mod tests {
             &no_dh,
             None,
             &no_d2h,
+            None,
             None,
             None,
             None,
@@ -25000,6 +25002,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("projected eval ok");
 
@@ -25029,6 +25032,7 @@ mod tests {
                 &no_dh,
                 None,
                 &no_d2h,
+                None,
                 None,
                 None,
                 None,
@@ -25371,6 +25375,7 @@ mod tests {
             &compute_dh,
             None,
             &no_d2h,
+            None,
             None,
             None,
             None,
