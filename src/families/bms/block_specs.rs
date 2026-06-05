@@ -603,7 +603,26 @@ fn build_reduced_logslope_reparam(
         .map_err(|e| format!("reduced logslope reparam: eigendecomposition failed: {e:?}"))?;
     {
         use std::io::Write;
-        let gee_evals = gee.eigh(Side::Lower).map(|(e, _)| e).unwrap_or_else(|_| Array1::zeros(0));
+        // Generalized confounding fractions γ: eigenvalues of Gee^{-1/2} Gtt Gee^{-1/2}.
+        // γ ∈ [0,1]; γ≈1 ⇒ direction W-orthogonal to marginal; γ≈0 ⇒ fully confounded.
+        let (gee_vals, gee_vecs) = gee.eigh(Side::Lower).unwrap_or((Array1::zeros(0), Array2::zeros((0, 0))));
+        let gamma = if gee_vals.len() == p_g {
+            let mut inv_sqrt = Array2::<f64>::zeros((p_g, p_g));
+            for k in 0..p_g {
+                let d = gee_vals[k].max(1e-300).sqrt();
+                let col = gee_vecs.column(k);
+                for i in 0..p_g {
+                    for j in 0..p_g {
+                        inv_sqrt[[i, j]] += col[i] * col[j] / d;
+                    }
+                }
+            }
+            let m1 = fast_ab(&inv_sqrt, &gtt);
+            let whitened = fast_ab(&m1, &inv_sqrt);
+            whitened.eigh(Side::Lower).map(|(e, _)| e).unwrap_or_else(|_| Array1::zeros(0))
+        } else {
+            Array1::zeros(0)
+        };
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -611,9 +630,9 @@ fn build_reduced_logslope_reparam(
         {
             writeln!(
                 f,
-                "SPECTRUM p_g={p_g}\n  gtt(asc)={:?}\n  gee(asc)={:?}",
+                "SPECTRUM p_g={p_g}\n  gtt(asc)={:?}\n  gamma(asc)={:?}",
                 evals.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>(),
-                gee_evals.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>(),
+                gamma.iter().map(|v| format!("{v:.4f}")).collect::<Vec<_>>(),
             )
             .ok();
         }
