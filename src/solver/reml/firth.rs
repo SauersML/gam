@@ -1,6 +1,7 @@
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
-use crate::mixture_link::logit_inverse_link_jet5;
+use crate::mixture_link::fisher_weight_jet5;
+use crate::types::StandardLink;
 use ndarray::Zip;
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
@@ -74,10 +75,13 @@ impl<'a> RemlState<'a> {
         super::assembly::row_scale_dense_in_place_by_inverse_positive_or_zero(out, scale);
     }
 
+    /// GLM Fisher working-weight 5-jet for the requested standard link. For
+    /// `StandardLink::Logit` this is byte-identical to the historical
+    /// `logit_inverse_link_jet5(eta).d1..d5` path that the Firth operator used
+    /// before the weights were generalized to arbitrary standard links.
     #[inline]
-    fn logit_fisher_weight_derivatives(eta: f64) -> (f64, f64, f64, f64, f64) {
-        let jet = logit_inverse_link_jet5(eta);
-        (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
+    fn fisher_weight_derivatives(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
+        fisher_weight_jet5(link, eta)
     }
 
     #[inline]
@@ -152,7 +156,8 @@ impl<'a> RemlState<'a> {
         Ok((k_reduced, half_log_det))
     }
 
-    fn fill_logit_fisher_weight_derivative_arrays(
+    fn fill_fisher_weight_derivative_arrays(
+        link: StandardLink,
         eta: &Array1<f64>,
         w: &mut Array1<f64>,
         w1: &mut Array1<f64>,
@@ -175,7 +180,7 @@ impl<'a> RemlState<'a> {
                 .and(eta.view())
                 .par_for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
                     let (value, first, second, third, fourth) =
-                        Self::logit_fisher_weight_derivatives(ei);
+                        Self::fisher_weight_derivatives(link, ei);
                     *wi = value;
                     *wi1 = first;
                     *wi2 = second;
@@ -191,7 +196,7 @@ impl<'a> RemlState<'a> {
                 .and(eta.view())
                 .for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
                     let (value, first, second, third, fourth) =
-                        Self::logit_fisher_weight_derivatives(ei);
+                        Self::fisher_weight_derivatives(link, ei);
                     *wi = value;
                     *wi1 = first;
                     *wi2 = second;
@@ -200,6 +205,7 @@ impl<'a> RemlState<'a> {
                 });
         }
     }
+
 
     pub(crate) fn weighted_cross(
         left: &Array2<f64>,
@@ -406,7 +412,7 @@ impl FirthDenseOperator {
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
-        Self::build_with_observation_weights_impl(x_dense, eta, None)
+        Self::build_with_observation_weights_impl(StandardLink::Logit, x_dense, eta, None)
     }
 
     pub(crate) fn build_with_observation_weights(
@@ -414,7 +420,36 @@ impl FirthDenseOperator {
         eta: &Array1<f64>,
         observation_weights: ndarray::ArrayView1<'_, f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
-        Self::build_with_observation_weights_impl(x_dense, eta, Some(observation_weights))
+        Self::build_with_observation_weights_impl(
+            StandardLink::Logit,
+            x_dense,
+            eta,
+            Some(observation_weights),
+        )
+    }
+
+    /// Link-general constructor (no fixed observation weights). The Fisher
+    /// working weight `W(eta)` and its eta-derivatives are taken from
+    /// `fisher_weight_jet5(link, ·)`; passing `StandardLink::Logit` reproduces
+    /// [`FirthDenseOperator::build`] byte-for-byte.
+    pub(crate) fn build_for_link(
+        link: StandardLink,
+        x_dense: &Array2<f64>,
+        eta: &Array1<f64>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
+        Self::build_with_observation_weights_impl(link, x_dense, eta, None)
+    }
+
+    /// Link-general constructor with fixed nonnegative observation weights.
+    /// Passing `StandardLink::Logit` reproduces
+    /// [`FirthDenseOperator::build_with_observation_weights`] byte-for-byte.
+    pub(crate) fn build_with_observation_weights_for_link(
+        link: StandardLink,
+        x_dense: &Array2<f64>,
+        eta: &Array1<f64>,
+        observation_weights: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
+        Self::build_with_observation_weights_impl(link, x_dense, eta, Some(observation_weights))
     }
 
     #[inline]
@@ -423,6 +458,7 @@ impl FirthDenseOperator {
     }
 
     fn build_with_observation_weights_impl(
+        link: StandardLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: Option<ndarray::ArrayView1<'_, f64>>,
@@ -514,8 +550,8 @@ impl FirthDenseOperator {
         let mut w2 = Array1::<f64>::zeros(n);
         let mut w3 = Array1::<f64>::zeros(n);
         let mut w4 = Array1::<f64>::zeros(n);
-        RemlState::fill_logit_fisher_weight_derivative_arrays(
-            eta, &mut w, &mut w1, &mut w2, &mut w3, &mut w4,
+        RemlState::fill_fisher_weight_derivative_arrays(
+            link, eta, &mut w, &mut w1, &mut w2, &mut w3, &mut w4,
         );
         let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
             RemlState::row_scale(x_dense, scale)
@@ -2651,6 +2687,7 @@ impl FirthDenseOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mixture_link::logit_inverse_link_jet5;
     use ndarray::{Array1, Array2, array};
 
     fn logisticweight(eta: f64) -> f64 {
@@ -3521,5 +3558,81 @@ mod tests {
             got,
             stable
         );
+    }
+
+    #[test]
+    fn fisher_weight_jet5_logit_is_byte_identical_to_inverse_link_jet() {
+        // The generalized Firth weight jet for the canonical logit link must
+        // reproduce the historical `logit_inverse_link_jet5().d1..d5` path
+        // exactly so the released logit Firth fits stay numerically unchanged.
+        for &eta in &[
+            -40.0, -8.0, -3.0, -1.0, -0.25, 0.0, 0.25, 1.0, 3.0, 8.0, 40.0,
+        ] {
+            let jet = logit_inverse_link_jet5(eta);
+            let (w, w1, w2, w3, w4) =
+                crate::mixture_link::fisher_weight_jet5(StandardLink::Logit, eta);
+            assert!(
+                w == jet.d1 && w1 == jet.d2 && w2 == jet.d3 && w3 == jet.d4 && w4 == jet.d5,
+                "logit Fisher-weight jet must equal inverse-link jet derivatives at eta={eta}: \
+                 got ({w}, {w1}, {w2}, {w3}, {w4}) vs ({}, {}, {}, {}, {})",
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                jet.d4,
+                jet.d5
+            );
+        }
+    }
+
+    #[test]
+    fn fisher_weight_jet5_probit_matches_finite_difference() {
+        // Probit Bernoulli Fisher weight W(eta) = phi^2 / (Phi (1 - Phi)).
+        // Validate the closed-form jet against central finite differences of
+        // the reference scalar weight.
+        fn reference_probit_weight(eta: f64) -> f64 {
+            let p = crate::probability::normal_cdf(eta);
+            let q = 1.0 - p;
+            let phi = crate::probability::normal_pdf(eta);
+            if p <= 0.0 || q <= 0.0 {
+                return 0.0;
+            }
+            phi * phi / (p * q)
+        }
+        let h = 1e-4_f64;
+        for &eta in &[-3.0, -1.5, -0.5, 0.0, 0.3, 1.5, 3.0] {
+            let (w, w1, w2, _w3, _w4) =
+                crate::mixture_link::fisher_weight_jet5(StandardLink::Probit, eta);
+            let ref_w = reference_probit_weight(eta);
+            let fd1 = (reference_probit_weight(eta + h) - reference_probit_weight(eta - h))
+                / (2.0 * h);
+            let fd2 = (reference_probit_weight(eta + h) - 2.0 * reference_probit_weight(eta)
+                + reference_probit_weight(eta - h))
+                / (h * h);
+            assert!(
+                (w - ref_w).abs() < 1e-10,
+                "probit W mismatch at eta={eta}: jet {w} vs ref {ref_w}"
+            );
+            assert!(
+                (w1 - fd1).abs() < 1e-5,
+                "probit W' mismatch at eta={eta}: jet {w1} vs fd {fd1}"
+            );
+            assert!(
+                (w2 - fd2).abs() < 1e-3,
+                "probit W'' mismatch at eta={eta}: jet {w2} vs fd {fd2}"
+            );
+        }
+    }
+
+    #[test]
+    fn fisher_weight_jet5_probit_saturates_to_zero_in_tails() {
+        for &eta in &[12.0_f64, -12.0, 40.0, -40.0] {
+            let (w, w1, w2, w3, w4) =
+                crate::mixture_link::fisher_weight_jet5(StandardLink::Probit, eta);
+            assert!(
+                w == 0.0 && w1 == 0.0 && w2 == 0.0 && w3 == 0.0 && w4 == 0.0,
+                "probit Fisher weight jet must saturate to zero at eta={eta}; got \
+                 ({w}, {w1}, {w2}, {w3}, {w4})"
+            );
+        }
     }
 }
