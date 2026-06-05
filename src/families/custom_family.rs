@@ -24369,20 +24369,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             Ok(_) => {
                 outer.last_error =
                     Some("custom-family outer objective/derivatives became non-finite".to_string());
-                if escalation_armed {
-                    // Recoverable (data-driven): the objective/derivatives became
-                    // non-finite at this trial rho (e.g. separation / near-singular
-                    // information), so the outer optimizer should retreat from this
-                    // infeasible point rather than the whole run hard-erroring. When
-                    // the search ultimately reports `converged == false`, the post-run
-                    // rung samples the proper posterior (never-fail). Without this, the
-                    // hard Err propagated out of `problem.run` and bypassed the
-                    // escalation rung entirely.
-                    return Ok(OuterEval::infeasible(rho.len()));
-                }
-                return Err(EstimationError::RemlOptimizationFailed(
-                    "custom-family outer objective/derivatives became non-finite".to_string(),
-                ));
+                // Recoverable (data-driven): the objective/derivatives became
+                // non-finite at this trial rho (e.g. separation / near-singular
+                // information), so the outer optimizer retreats from this infeasible
+                // point rather than the whole run hard-erroring. When the search
+                // ultimately reports `converged == false`, the post-run rung samples
+                // the proper posterior (never-fail).
+                return Ok(OuterEval::infeasible(rho.len()));
             }
             Err(e) => {
                 // Genuine eval-error (internal computation failure: linalg error,
@@ -24438,21 +24431,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                         "custom-family value-only inner solve did not converge or objective was non-finite"
                             .to_string(),
                     );
-                    if escalation_armed {
-                        // Recoverable (data-driven): this value-only probe is the
-                        // line-search cost the outer optimizer calls most often. A
-                        // non-converged inner solve / non-finite objective at this
-                        // trial rho means the point is infeasible — return an infinite
-                        // cost so the line search retreats, rather than hard-erroring
-                        // out of `problem.run` and bypassing the post-run escalation
-                        // (sampling) rung. When the search reports `converged == false`
-                        // the never-fail rung samples the proper posterior.
-                        return Ok(f64::INFINITY);
-                    }
-                    Err(EstimationError::RemlOptimizationFailed(
-                        "custom-family value-only inner solve did not converge or objective was non-finite"
-                            .to_string(),
-                    ))
+                    // Recoverable (data-driven): this value-only probe is the
+                    // line-search cost the outer optimizer calls most often. A
+                    // non-converged inner solve / non-finite objective at this trial
+                    // rho means the point is infeasible — return an infinite cost so
+                    // the line search retreats, rather than hard-erroring out of
+                    // `problem.run` and bypassing the post-run escalation (sampling)
+                    // rung. When the search reports `converged == false` the never-fail
+                    // rung samples the proper posterior.
+                    Ok(f64::INFINITY)
                 }
                 Err(e) => {
                     // Genuine eval-error (internal computation failure) — NOT
@@ -24589,36 +24576,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         )
     })?;
     // Geometry-driven terminal escalation. When the outer smoothing optimizer
-    // cannot certify convergence, the historical behavior is a hard dead-end
-    // (`custom_outer_nonconvergence_error`). Under the `firth_general` robustness
-    // gate the objective has been made *proper* (Jeffreys/PC term armed), so a
-    // non-convergence here is a geometry signal (indefinite / non-smooth LAML
-    // landscape that stalled Strong-Wolfe) — not a reason to fail. Instead we
-    // AUTO-ESCALATE to sampling the proper posterior about the best mode the
-    // inner solve reached (the never-fail bottom rung; see
-    // `hmc::sample_gaussian_mode_posterior`). The fast Arc/EFS path is untouched:
-    // this branch is only reached after the optimizer reports non-convergence,
-    // so nice landscapes never pay any sampling cost.
-    //
-    // The trigger is purely geometry/optimizer-derived (`outer_result.converged`
-    // plus the optimizer's own gradient/curvature cascade upstream), never a
-    // user flag. Flag-OFF (`firth_general == false`) preserves byte-identical
-    // behavior: the original error is returned unchanged.
-    let robust_escalation_armed = crate::solver::robust_identification::RobustConfig::from_policy(
-        options.robust_identification,
-    )
-    .firth_general;
-    let nonconvergence_escalation = !outer_result.converged && robust_escalation_armed;
-    if !outer_result.converged && !nonconvergence_escalation {
-        return Err(CustomFamilyError::Optimization {
-            context: "fit_custom_family outer smoothing",
-            reason: custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
-        });
-    }
+    // cannot certify convergence, the objective is always *proper* (Jeffreys/PC
+    // term unconditionally armed), so a non-convergence here is a geometry signal
+    // (indefinite / non-smooth LAML landscape that stalled Strong-Wolfe) — not a
+    // reason to fail. Instead we AUTO-ESCALATE to sampling the proper posterior
+    // about the best mode the inner solve reached (the never-fail bottom rung;
+    // see `hmc::sample_gaussian_mode_posterior`). The fast Arc/EFS path is
+    // untouched: this branch is only reached after the optimizer reports
+    // non-convergence, so nice landscapes never pay any sampling cost. The
+    // trigger is purely geometry/optimizer-derived (`outer_result.converged`),
+    // never a user flag — robustness is the unconditional default, so the legacy
+    // hard-`Err` dead-end is deleted.
+    let nonconvergence_escalation = !outer_result.converged;
     if nonconvergence_escalation {
         log::info!(
             "[robust] outer smoothing did not certify convergence (plan={} iters={} |g|={}); \
-             firth_general armed → AUTO-ESCALATE to never-fail posterior sampling about the best mode",
+             AUTO-ESCALATE to never-fail posterior sampling about the best mode",
             outer_result.plan_used,
             outer_result.iterations,
             outer_result.final_grad_norm_report(),
