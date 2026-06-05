@@ -1171,14 +1171,15 @@ mod tests {
     #[test]
     fn cheap_precheck_skips_clearly_well_conditioned_large_p() {
         // A wide (p ≥ threshold) well-conditioned spectrum: every eigenvalue in
-        // [40, 100], so λ_min = 40 ≫ 8·1 (absolute margin) and the ratio 0.4 ≫
-        // 8·1e-8 (relative margin). The conservative Lanczos bounds must still
-        // clear both gates ⇒ skippable. This is the common large-p fast path the
-        // pre-check exists to make matrix-free-free of any dense formation.
+        // [200, 250], so λ_min = 200 clears the 8x margin on the smooth absolute
+        // clear knot (16) and the ratio 0.8 clears the relative margin. The
+        // conservative Lanczos bounds must still clear both gates ⇒ skippable.
+        // This is the common large-p fast path the pre-check exists to make
+        // matrix-free-free of any dense formation.
         let p = 200usize;
-        let mut diag = vec![70.0; p];
-        diag[0] = 40.0; // λ_min
-        diag[1] = 100.0; // λ_max
+        let mut diag = vec![220.0; p];
+        diag[0] = 200.0; // λ_min
+        diag[1] = 250.0; // λ_max
         let skippable = jeffreys_term_skippable_via_matvec(diag_hv(diag), p).unwrap();
         assert!(skippable, "clearly well-conditioned wide fit must be skippable");
     }
