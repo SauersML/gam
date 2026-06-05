@@ -1656,6 +1656,19 @@ impl<S: Data<Elem = f64>> FaerQr for ArrayBase<S, Ix2> {
 /// This is intended for tall/skinny matrices where `a ∈ R^{m×n}` with `m >= n`.
 /// If `A P^T = Q R`, then the trailing `m-rank(A)` columns of `Q` span
 /// `null(A^T)`.
+///
+/// The trailing columns of `Q` are reconstructed by applying the stored
+/// Householder reflector sequence to canonical basis vectors. When `A` is
+/// numerically rank zero (e.g. an entirely unpenalized block penalty in a
+/// parametric-only GLM), *every* reflector is degenerate — the Householder
+/// vector of a zero column has zero norm, so faer's coefficients become
+/// non-finite and the reconstructed basis is filled with `NaN`. Mathematically
+/// a rank-zero `m×n` matrix has `null(A^T) = R^m`, whose canonical orthonormal
+/// basis is the identity, so we return `I_m` directly instead of routing through
+/// the (undefined) reflectors. This keeps every downstream consumer — REML
+/// null-space log-determinants, identifiability audits — finite and exact for
+/// the fully-unpenalized case. For `rank >= 1` at least one well-defined
+/// reflector seeds the block, and the reconstruction stays finite.
 pub fn rrqr_nullspace_basis<S: Data<Elem = f64>>(
     a: &ArrayBase<S, Ix2>,
     rank_alpha: f64,
@@ -1672,6 +1685,11 @@ pub fn rrqr_nullspace_basis<S: Data<Elem = f64>>(
     let rank = (0..diag_len).filter(|&i| r[(i, i)].abs() > tol).count();
     let z = if rank >= a.nrows() {
         Array2::<f64>::zeros((a.nrows(), 0))
+    } else if rank == 0 {
+        // Numerically rank-zero input: the whole space is the null space.
+        // Return the canonical orthonormal basis directly; the Householder
+        // reflectors of a zero matrix are degenerate and would yield NaN.
+        Array2::<f64>::eye(a.nrows())
     } else {
         let nullity = a.nrows() - rank;
         let mut selector = Mat::<f64>::zeros(a.nrows(), nullity);
@@ -1827,6 +1845,27 @@ mod tests {
     fn rrqr_with_permutation_rejects_zero_rows() {
         let a = Array2::<f64>::zeros((0, 3));
         assert!(rrqr_with_permutation(&a, default_rrqr_rank_alpha()).is_err());
+    }
+
+    #[test]
+    fn rrqr_nullspace_basis_square_zero_matrix_is_finite_identity() {
+        // Square zero matrix (the parametric-only penalty case): null(A^T) is
+        // the whole space, so the basis must be a finite orthonormal 3x3 set.
+        let a = Array2::<f64>::zeros((3, 3));
+        let (z, rank) =
+            rrqr_nullspace_basis(&a, default_rrqr_rank_alpha()).expect("RRQR should succeed");
+        assert_eq!(rank, 0);
+        assert_eq!(z.dim(), (3, 3));
+        assert!(
+            z.iter().all(|v| v.is_finite()),
+            "square zero matrix produced a non-finite null basis: {z:?}"
+        );
+        let gram = z.t().dot(&z);
+        let ident = Array2::<f64>::eye(3);
+        let gram_err = (&gram - &ident)
+            .iter()
+            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(gram_err < 1e-10, "Z is not orthonormal: {gram_err:e}");
     }
 
     #[test]
