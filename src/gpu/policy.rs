@@ -1,9 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
-use crate::cache::Fingerprint;
-use crate::gpu::device::GpuDeviceInfo;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MixedPrecisionPolicy {
     /// Always use fp64 factorization; no refinement attempted.
@@ -38,19 +32,23 @@ pub struct GpuDispatchPolicy {
     pub mixed_precision: MixedPrecisionPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct GpuStartupCalibration {
-    pub gemm_crossover_flops: Option<usize>,
-}
-
 impl Default for GpuDispatchPolicy {
+    /// Auto-dispatch thresholds tuned for biobank-scale workloads:
+    ///
+    /// * `gemm_min_flops = 1e8` — generic dense GEMM / GEMV is only worth a
+    ///   device hop when the kernel is at least 10⁸ flops (e.g. a 320×320×320
+    ///   product). Below that, the launch + PCIe round-trip dominates.
+    /// * `xtwx_n_min = 50_000`, `xtwx_use_fused_below_p = 256` —
+    ///   `Xᵀ·diag(w)·X` requires both `n > 50k` rows AND `p > 256` columns
+    ///   before the device wins; the row threshold ensures we stream-amortize
+    ///   the weight broadcast and the column threshold rules out tiny GLM-style
+    ///   designs that are bandwidth-bound on CPU already.
+    /// * `fused_kernel_min_n = 100_000` — the 2×2 joint-Hessian kernel only
+    ///   runs on device when `n > 100k`; below that the CPU streaming pass
+    ///   keeps the entire working set resident in L3.
+    /// * Cholesky / SyEVD live on device whenever the design is large enough
+    ///   that the factorization itself dominates (`p ≥ 512` and `p ≥ 256`).
     fn default() -> Self {
-        Self::startup_baseline()
-    }
-}
-
-impl GpuDispatchPolicy {
-    fn startup_baseline() -> Self {
         Self {
             xtwx_n_min: 50_000,
             xtwx_flops_min: 100_000_000,
@@ -68,142 +66,9 @@ impl GpuDispatchPolicy {
             mixed_precision: MixedPrecisionPolicy::Refinement,
         }
     }
+}
 
-    /// Build the automatic dispatch policy for a probed device.
-    ///
-    /// The old policy used one set of biobank-scale constants for every CUDA
-    /// adapter. Runtime initialization now keys the startup calibration on the
-    /// selected device fingerprint and caches the resulting policy in-process,
-    /// so mixed workstations and multi-GPU hosts do not share stale crossover
-    /// points.
-    pub fn calibrated_for_device(device: &GpuDeviceInfo) -> Self {
-        Self::calibrated_for_device_with_startup(device, GpuStartupCalibration::default())
-    }
-
-    pub fn calibrated_for_device_with_startup(
-        device: &GpuDeviceInfo,
-        startup: GpuStartupCalibration,
-    ) -> Self {
-        let fingerprint = device.fingerprint();
-        let cache = calibrated_policy_cache();
-        if let Some(policy) = cache
-            .lock()
-            .expect("GPU dispatch policy calibration cache poisoned")
-            .get(&fingerprint)
-            .cloned()
-        {
-            return policy;
-        }
-        let policy = Self::derive_startup_calibration(device, startup);
-        cache
-            .lock()
-            .expect("GPU dispatch policy calibration cache poisoned")
-            .insert(fingerprint, policy.clone());
-        policy
-    }
-
-    /// Return the structural fingerprint that keyed a device policy.
-    pub fn calibration_fingerprint(device: &GpuDeviceInfo) -> Fingerprint {
-        device.fingerprint()
-    }
-
-    fn derive_startup_calibration(device: &GpuDeviceInfo, startup: GpuStartupCalibration) -> Self {
-        let mut policy = Self::startup_baseline();
-        let compute_units = usize::try_from(device.sm_count.max(1)).unwrap_or(1);
-        let threads_per_sm = usize::try_from(device.max_threads_per_sm.max(32)).unwrap_or(32);
-        let parallel_lanes = compute_units.saturating_mul(threads_per_sm).max(32);
-        let memory_gib = device.total_mem_bytes / (1024 * 1024 * 1024);
-        let l2_mib = device.l2_cache_bytes / (1024 * 1024);
-
-        let compute_scale = if parallel_lanes >= 200_000 {
-            4
-        } else if parallel_lanes >= 100_000 {
-            3
-        } else if parallel_lanes >= 50_000 {
-            2
-        } else {
-            1
-        };
-        let memory_scale = if memory_gib >= 48 {
-            3
-        } else if memory_gib >= 20 {
-            2
-        } else {
-            1
-        };
-        let cache_scale = if l2_mib >= 48 {
-            3
-        } else if l2_mib >= 16 {
-            2
-        } else {
-            1
-        };
-        let calibration_score = compute_scale + memory_scale + cache_scale;
-
-        policy.gemm_min_flops = calibrated_floor(
-            policy.gemm_min_flops,
-            calibration_score,
-            device.integrated,
-            25_000_000,
-            250_000_000,
-        );
-        policy.xtwx_flops_min = calibrated_floor(
-            policy.xtwx_flops_min,
-            calibration_score,
-            device.integrated,
-            25_000_000,
-            250_000_000,
-        );
-        policy.xtwx_n_min = calibrated_floor(
-            policy.xtwx_n_min,
-            calibration_score,
-            device.integrated,
-            12_500,
-            125_000,
-        );
-        policy.row_kernel_min_n = calibrated_floor(
-            policy.row_kernel_min_n,
-            calibration_score,
-            device.integrated,
-            12_500,
-            125_000,
-        );
-        policy.fused_kernel_min_n = calibrated_floor(
-            policy.fused_kernel_min_n,
-            calibration_score,
-            device.integrated,
-            25_000,
-            250_000,
-        );
-        policy.potrf_min_p = calibrated_floor(
-            policy.potrf_min_p,
-            calibration_score,
-            device.integrated,
-            128,
-            1024,
-        )
-        .max(Self::REFINEMENT_MIN_P);
-        policy.prefer_gpu_factorization_min_p = policy.potrf_min_p;
-        policy.syevd_min_p = calibrated_floor(
-            policy.syevd_min_p,
-            calibration_score,
-            device.integrated,
-            128,
-            768,
-        );
-        policy.keep_design_resident_min_bytes = calibrated_floor(
-            policy.keep_design_resident_min_bytes,
-            calibration_score,
-            device.integrated,
-            8 * 1024 * 1024,
-            96 * 1024 * 1024,
-        );
-        if let Some(gemm_crossover_flops) = startup.gemm_crossover_flops {
-            policy.gemm_min_flops = gemm_crossover_flops.clamp(8_000_000, 500_000_000);
-        }
-        policy
-    }
-
+impl GpuDispatchPolicy {
     /// Minimum problem dimension for the fp32+refinement path.
     ///
     /// Below this threshold the fp64 GEMV needed for the residual check costs
@@ -261,34 +126,6 @@ impl GpuDispatchPolicy {
     pub const fn potrf_target_is_gpu(&self, p: usize, h_resident: bool) -> bool {
         h_resident && p >= self.potrf_min_p
     }
-}
-
-fn calibrated_policy_cache() -> &'static Mutex<HashMap<Fingerprint, GpuDispatchPolicy>> {
-    static CACHE: OnceLock<Mutex<HashMap<Fingerprint, GpuDispatchPolicy>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn calibrated_floor(
-    baseline: usize,
-    calibration_score: usize,
-    integrated: bool,
-    min_floor: usize,
-    max_floor: usize,
-) -> usize {
-    let numerator = if integrated {
-        3
-    } else {
-        match calibration_score {
-            0..=3 => 5,
-            4..=5 => 4,
-            6..=7 => 3,
-            _ => 2,
-        }
-    };
-    baseline
-        .saturating_mul(numerator)
-        .saturating_div(4)
-        .clamp(min_floor, max_floor)
 }
 
 /// Operation discriminator used by the dispatch decision API. Mirrors
@@ -436,104 +273,6 @@ impl GpuDispatchPolicy {
 #[cfg(test)]
 mod refinement_policy_tests {
     use super::*;
-
-    fn device(
-        name: &str,
-        sm_count: i32,
-        max_threads_per_sm: i32,
-        l2_cache_bytes: usize,
-        total_mem_bytes: usize,
-        integrated: bool,
-    ) -> GpuDeviceInfo {
-        GpuDeviceInfo {
-            ordinal: 0,
-            name: name.to_string(),
-            capability: crate::gpu::device::GpuCapability::from_compute_capability(8, 0),
-            sm_count,
-            max_threads_per_sm,
-            max_shared_mem_per_block: 99_840,
-            l2_cache_bytes,
-            total_mem_bytes,
-            free_mem_bytes: total_mem_bytes / 2,
-            ecc_enabled: false,
-            integrated,
-            mig_mode: false,
-        }
-    }
-
-    #[test]
-    fn calibrated_policy_is_keyed_by_device_fingerprint() {
-        let small = device(
-            "small",
-            20,
-            1024,
-            6 * 1024 * 1024,
-            8 * 1024 * 1024 * 1024,
-            false,
-        );
-        let large = device(
-            "large",
-            140,
-            2048,
-            64 * 1024 * 1024,
-            80 * 1024 * 1024 * 1024,
-            false,
-        );
-        assert_ne!(
-            GpuDispatchPolicy::calibration_fingerprint(&small),
-            GpuDispatchPolicy::calibration_fingerprint(&large)
-        );
-        let small_policy = GpuDispatchPolicy::calibrated_for_device(&small);
-        let large_policy = GpuDispatchPolicy::calibrated_for_device(&large);
-        assert_ne!(small_policy.gemm_min_flops, large_policy.gemm_min_flops);
-        assert_eq!(
-            small_policy,
-            GpuDispatchPolicy::calibrated_for_device(&small)
-        );
-    }
-
-    #[test]
-    fn integrated_device_uses_conservative_crossover() {
-        let discrete = device(
-            "discrete",
-            80,
-            2048,
-            32 * 1024 * 1024,
-            24 * 1024 * 1024 * 1024,
-            false,
-        );
-        let integrated = device(
-            "integrated",
-            80,
-            2048,
-            32 * 1024 * 1024,
-            24 * 1024 * 1024 * 1024,
-            true,
-        );
-        let discrete_policy = GpuDispatchPolicy::calibrated_for_device(&discrete);
-        let integrated_policy = GpuDispatchPolicy::calibrated_for_device(&integrated);
-        assert!(integrated_policy.gemm_min_flops >= discrete_policy.gemm_min_flops);
-        assert!(integrated_policy.xtwx_n_min >= discrete_policy.xtwx_n_min);
-    }
-
-    #[test]
-    fn measured_startup_gemm_crossover_overrides_structural_floor() {
-        let gpu = device(
-            "measured",
-            80,
-            2048,
-            32 * 1024 * 1024,
-            24 * 1024 * 1024 * 1024,
-            false,
-        );
-        let measured = GpuDispatchPolicy::calibrated_for_device_with_startup(
-            &gpu,
-            GpuStartupCalibration {
-                gemm_crossover_flops: Some(12_000_000),
-            },
-        );
-        assert_eq!(measured.gemm_min_flops, 12_000_000);
-    }
 
     #[test]
     fn refinement_policy_admits_large_p() {

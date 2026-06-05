@@ -116,7 +116,6 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, Cow
 use std::sync::{Arc, RwLock};
 
 use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
-use crate::linalg::lanczos::{lanczos_log_quadrature, symmetric_lanczos_eigh};
 use crate::terms::basis::{BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative};
 use crate::terms::penalties::PenaltyManifest;
 use crate::terms::penalty_op::PenaltyOp;
@@ -8187,31 +8186,98 @@ impl FrozenAnalyticPenaltyOp {
     fn lanczos_log_quadrature(
         &self,
         lambda: f64,
-        q: Array1<f64>,
+        mut q: Array1<f64>,
         max_steps: usize,
     ) -> Result<f64, String> {
         let n = self.dim();
-        let decomp = symmetric_lanczos_eigh(
-            n,
-            q.to_vec(),
-            max_steps,
-            1e-12,
-            "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i SLQ",
-            |q, out| {
-                let q_view = ArrayView1::from(q);
-                let mut out_view = ArrayViewMut1::from(out);
-                self.matvec(q_view, out_view.view_mut());
-                for i in 0..n {
-                    out_view[i] += lambda * q[i];
+        let mut q_prev = Array1::<f64>::zeros(n);
+        let mut alphas = Vec::<f64>::with_capacity(max_steps);
+        let mut betas = Vec::<f64>::with_capacity(max_steps.saturating_sub(1));
+        let mut beta_prev = 0.0;
+        let tol = 1e-12_f64;
+
+        for step in 0..max_steps {
+            let mut w = Array1::<f64>::zeros(n);
+            self.matvec(q.view(), w.view_mut());
+            for i in 0..n {
+                w[i] += lambda * q[i];
+                if step > 0 {
+                    w[i] -= beta_prev * q_prev[i];
                 }
-                Ok(())
-            },
-        )?;
-        lanczos_log_quadrature(
-            &decomp,
-            "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i SLQ",
-        )
+            }
+            let alpha = dot(&q, &w);
+            if !alpha.is_finite() {
+                return Err(
+                    "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i SLQ produced non-finite alpha"
+                        .to_string(),
+                );
+            }
+            for i in 0..n {
+                w[i] -= alpha * q[i];
+            }
+            let beta = norm2(&w);
+            alphas.push(alpha);
+            if step + 1 == max_steps || beta <= tol {
+                break;
+            }
+            if !beta.is_finite() {
+                return Err(
+                    "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i SLQ produced non-finite beta"
+                        .to_string(),
+                );
+            }
+            betas.push(beta);
+            q_prev = q;
+            q = w;
+            for i in 0..n {
+                q[i] /= beta;
+            }
+            beta_prev = beta;
+        }
+
+        let k = alphas.len();
+        let mut tri = Array2::<f64>::zeros((k, k));
+        for i in 0..k {
+            tri[[i, i]] = alphas[i];
+            if i + 1 < k {
+                tri[[i, i + 1]] = betas[i];
+                tri[[i + 1, i]] = betas[i];
+            }
+        }
+        let (evals, evecs) = tri.eigh(Side::Lower).map_err(|e| {
+            format!(
+                "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i SLQ eigendecomposition failed: {e}"
+            )
+        })?;
+        let mut quad = 0.0;
+        for j in 0..k {
+            let theta = evals[j];
+            if !theta.is_finite() || theta <= 0.0 {
+                return Err(format!(
+                    "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i expected SPD S+λI, \
+                     Lanczos Ritz value {j} is {theta:.3e}"
+                ));
+            }
+            let weight = evecs[[0, j]] * evecs[[0, j]];
+            quad += weight * theta.ln();
+        }
+        Ok(quad)
     }
+}
+
+#[inline]
+fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let mut s = 0.0;
+    for i in 0..a.len() {
+        s += a[i] * b[i];
+    }
+    s
+}
+
+#[inline]
+fn norm2(a: &Array1<f64>) -> f64 {
+    dot(a, a).sqrt()
 }
 
 fn rademacher_unit_probe_into(mut z: ArrayViewMut1<'_, f64>, probe: u64, scale: f64) {
