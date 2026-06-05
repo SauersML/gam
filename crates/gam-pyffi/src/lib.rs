@@ -5024,46 +5024,56 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
             "rank_topology_candidates: at least one candidate is required".to_string(),
         ));
     }
-    let mut ranked: Vec<(usize, serde_json::Value)> = Vec::with_capacity(bundle.candidates.len());
-    for (idx, entry) in bundle.candidates.iter().enumerate() {
-        let tk = gam::solver::topology_selector::tk_normalized_score(
-            entry.raw_reml,
-            entry.null_dim,
-            entry.null_space_logdet,
-            entry.effective_dim,
-            entry.n_obs,
-            score_scale,
-        )
-        .map_err(PyValueError::new_err)?;
-        ranked.push((
-            idx,
-            serde_json::json!({
-                "name": entry.name,
-                "tk_score": tk,
-                "raw_reml": entry.raw_reml,
-                "effective_dim": entry.effective_dim,
-                "n_obs": entry.n_obs,
-            }),
-        ));
+
+    let mut candidate_kinds = Vec::with_capacity(bundle.candidates.len());
+    let mut evidence_by_kind = HashMap::with_capacity(bundle.candidates.len());
+    for entry in bundle.candidates {
+        let kind = gam::solver::AutoTopologyKind::parse(&entry.name)
+            .map_err(|err| py_value_error(format!("rank_topology_candidates: {err}")))?;
+        if evidence_by_kind.insert(kind, entry).is_some() {
+            return Err(py_value_error(format!(
+                "rank_topology_candidates: duplicate topology candidate {:?}",
+                kind.as_str()
+            )));
+        }
+        candidate_kinds.push(kind);
     }
-    ranked.sort_by(|lhs, rhs| {
-        let l = lhs
-            .1
-            .get("tk_score")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(f64::INFINITY);
-        let r = rhs
-            .1
-            .get("tk_score")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(f64::INFINITY);
-        l.partial_cmp(&r)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| lhs.0.cmp(&rhs.0))
-    });
+    let selector = gam::solver::TopologyAutoSelector {
+        candidates: candidate_kinds,
+        score_scale,
+        latent: None,
+    };
+    let ranked = gam::solver::select_topology_with_fit(&selector, |kind| {
+        let entry = evidence_by_kind
+            .get(&kind)
+            .ok_or_else(|| format!("missing evidence for topology {:?}", kind.as_str()))?;
+        Ok::<_, String>(gam::solver::TopologyAutoFitEvidence {
+            topology_name: entry.name.clone(),
+            raw_reml: entry.raw_reml,
+            null_dim: entry.null_dim,
+            null_space_logdet: entry.null_space_logdet,
+            effective_dim: entry.effective_dim,
+            n_obs: entry.n_obs,
+            fit_handle: (),
+        })
+    })
+    .map_err(PyValueError::new_err)?;
+    let ranked_rows: Vec<serde_json::Value> = ranked
+        .ranked
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({
+                "name": row.topology_name,
+                "tk_score": row.tk_score,
+                "raw_reml": row.raw_reml,
+                "effective_dim": row.effective_dim,
+                "n_obs": row.n_obs,
+            })
+        })
+        .collect();
     let out = serde_json::json!({
-        "ranked": ranked.into_iter().map(|(_, row)| row).collect::<Vec<_>>(),
-        "winner_index": 0_usize,
+        "ranked": ranked_rows,
+        "winner_index": ranked.winner_index,
     });
     serde_json::to_string(&out)
         .map_err(|err| py_value_error(format!("rank_topology_candidates: serialise: {err}")))
