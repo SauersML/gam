@@ -12,11 +12,18 @@
 //! This test fits a clean, non-separating Bernoulli marginal-slope (BMS) probit
 //! cohort — the SAME custom-family joint-Newton path the full-span change
 //! touches (`build_joint_jeffreys_subspace` → `joint_jeffreys_term`) — with the
-//! flag OFF and with `RobustIdentification::Force` (ON), and asserts that the
+//! flag OFF and with `RobustIdentification::FirthOnly` (full identifiable-span
+//! Jeffreys, NO orthogonalization design surgery), and asserts that the
 //! coefficients, the additive predictor (`η = M·β_m + diag(z)·G·β_s` proxied by
 //! the full joint `β`), the log-likelihood, and the effective degrees of freedom
 //! match to a tight tolerance. That is the proof that full-span Jeffreys does
 //! NOT bias genuine smooth fits.
+//!
+//! We deliberately isolate `FirthOnly` (not `Force`): `Force` ALSO arms
+//! `orthogonalize_confounds`, whose reduced-basis reparameterization drops
+//! design columns and is NOT coefficient-invariant even on a clean cohort. The
+//! zero-downside claim is about the Jeffreys penalty specifically, so the gate
+//! exercises Jeffreys alone.
 //!
 //! Deterministic: fixed-seed `StdRng`, no time / unseeded RNG.
 
@@ -210,7 +217,7 @@ fn run_clean_fit(robust: RobustIdentification) -> CleanFit {
 }
 
 /// THE ZERO-DOWNSIDE GATE. On a clean, well-identified BMS-probit cohort with no
-/// separation, full-span Jeffreys (`RobustIdentification::Force`) must reproduce
+/// separation, full-span Jeffreys (`RobustIdentification::FirthOnly`) must reproduce
 /// the released (OFF) fit: coefficients, additive predictor (joint `β`),
 /// log-likelihood, and effective degrees of freedom all match to a tight
 /// tolerance. This is the proof that applying Jeffreys to the FULL identifiable
@@ -220,7 +227,7 @@ fn full_span_jeffreys_is_invisible_on_clean_well_identified_bms_fit() {
     assert!(file!().ends_with(".rs"));
 
     let off = run_clean_fit(RobustIdentification::Off);
-    let on = run_clean_fit(RobustIdentification::Force);
+    let on = run_clean_fit(RobustIdentification::FirthOnly);
 
     assert!(off.all_finite && on.all_finite, "non-finite β on a clean fit");
     assert!(
