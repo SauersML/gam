@@ -18,11 +18,10 @@
 //! makes the *joint* design rank-soft: the inner Newton sees a near-singular
 //! cross-block Hessian and the outer REML never settles.
 //!
-//! The released solver papers over this with two *pinned* ridges
-//! (`MARGINAL_NULLSPACE_RIDGE` / `MARGINAL_LOGSLOPE_OVERLAP`, see
-//! [`crate::families::marginal_slope_orthogonal`]): a penalty mass aimed at the
-//! confounded direction. That *penalizes* the confound. This module instead
-//! *resolves* it by construction: it reparameterizes the confound block so its
+//! An earlier solver papered over this with pinned ridges (a penalty mass aimed
+//! at the confounded direction, now deleted). That *penalizes* the confound.
+//! This module instead *resolves* it by construction: it reparameterizes the
+//! confound block so its
 //! columns are **exactly** orthogonal (in a chosen row metric `W`) to the
 //! primary block's column span. After the transform the cross-block Gram is
 //! exactly zero, so no ridge is needed for identification — and the transform is
