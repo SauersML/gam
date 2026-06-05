@@ -1685,12 +1685,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // Built lazily against THESE designs (the frozen ones the solver fits).
         let reparam = confound_reparam_for(marginal_design, logslope_design)?;
         if robust.orthogonalize_confounds {
-            log::warn!(
-                "[DBG build_blocks] marginal_ncols={} logslope_ncols={} reparam_pc={:?}",
-                marginal_design.design.ncols(),
-                logslope_design.design.ncols(),
-                reparam.as_ref().map(|r| r.confound_cols()),
-            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/bms_dbg.log")
+            {
+                writeln!(
+                    f,
+                    "build_blocks marginal_ncols={} logslope_ncols={} reparam_pc={:?}",
+                    marginal_design.design.ncols(),
+                    logslope_design.design.ncols(),
+                    reparam.as_ref().map(|r| r.confound_cols()),
+                )
+                .ok();
+            }
         }
         let logslope_design_swapped =
             apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
@@ -1772,11 +1781,20 @@ pub fn fit_bernoulli_marginal_slope_terms(
             .as_ref()
             .and_then(|c| c.clone());
         if robust.orthogonalize_confounds {
-            log::warn!(
-                "[DBG make_family] logslope_ncols={} reparam_pc={:?}",
-                logslope_design.design.ncols(),
-                reparam.as_ref().map(|r| r.confound_cols()),
-            );
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/bms_dbg.log")
+            {
+                writeln!(
+                    f,
+                    "make_family logslope_ncols={} reparam_pc={:?}",
+                    logslope_design.design.ncols(),
+                    reparam.as_ref().map(|r| r.confound_cols()),
+                )
+                .ok();
+            }
         }
         let logslope_design_swapped =
             apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
