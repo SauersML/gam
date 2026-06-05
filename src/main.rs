@@ -7517,7 +7517,14 @@ fn core_saved_fit_result(
 
 fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodSpec) -> Option<f64> {
     match family.response {
-        ResponseFamily::Tweedie { p } => Some(p),
+        // The generative `gaussian_scale` slot carries the *dispersion* φ for
+        // Tweedie; the variance power `p` is already read from the family spec by
+        // `NoiseModel::from_likelihood`, so emitting `p` here drew responses with
+        // φ = p (≈1.5) regardless of the data. φ is estimated jointly with the
+        // mean (issue #771), so the authoritative value is the fit's scale
+        // metadata, falling back to a unit dispersion only if the fit recorded
+        // none.
+        ResponseFamily::Tweedie { .. } => fit.likelihood_scale.fixed_phi().or(Some(1.0)),
         ResponseFamily::NegativeBinomial { theta } => Some(theta),
         // Beta precision φ is estimated jointly with the mean (issue #567), so
         // the authoritative value is the fit's scale metadata, not the seed φ on

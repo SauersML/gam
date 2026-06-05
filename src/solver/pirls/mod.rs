@@ -208,6 +208,69 @@ fn estimate_beta_phi_from_eta(
     (one_plus_phi - 1.0).clamp(PHI_MIN, PHI_MAX)
 }
 
+/// Pearson moment estimate of the Tweedie dispersion `phi` from the current
+/// linear predictor `eta` (log link, `mu = exp(eta)`).
+///
+/// A Tweedie response has `Var(yᵢ) = phi · V(μᵢ) / wᵢ` with unit variance
+/// function `V(μ) = μ^p` and prior weight `wᵢ`, so the prior-weighted Pearson
+/// statistic `Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p` has expectation `phi · (Σwᵢ − edf)`.
+/// Equating it to its expectation and normalising by the total prior weight
+/// gives the moment estimator
+///
+/// ```text
+/// phî = Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p   /   Σ wᵢ.
+/// ```
+///
+/// This is the standard Pearson dispersion estimator (statsmodels' Tweedie and
+/// mgcv's fixed-`p` `Tweedie()` use the same statistic). We normalise by `Σwᵢ`
+/// rather than the residual df `Σwᵢ − edf` to match the sibling Gamma-shape /
+/// Beta-precision moment estimators in this module, which also estimate at the
+/// converged η without an edf correction; the `O(edf/n)` difference is far
+/// below statistical resolution at any `n` for which a Tweedie fit is
+/// meaningful, and the iterate-to-self-consistency contract (reported `phi` ==
+/// `estimate_tweedie_phi_from_eta(final_eta)`) is what the covariance scale and
+/// the prediction SE both consume. Threading `phî` into the working weight
+/// `prior·μ^{2−p}/phi` is what makes `SE(η̂) ∝ √phi` (issue #771); freezing
+/// `phi = 1` made every Tweedie SE / interval / generate draw ignore the data's
+/// dispersion. The estimate is clamped to a wide strictly-positive band so a
+/// transient degenerate residual sum cannot push `phi` non-positive or
+/// non-finite.
+fn estimate_tweedie_phi_from_eta(
+    y: ArrayView1<'_, f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    p: f64,
+) -> f64 {
+    const PHI_MIN: f64 = 1e-6;
+    const PHI_MAX: f64 = 1e12;
+    const MU_EPS: f64 = 1e-300;
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    let (weighted_pearson, total_weight) = (0..eta.len())
+        .into_par_iter()
+        .map(|i| {
+            let wi = priorweights[i].max(0.0);
+            if wi == 0.0 {
+                return (0.0_f64, 0.0_f64);
+            }
+            let mui = eta[i].clamp(-ETA_CLAMP, ETA_CLAMP).exp().max(MU_EPS);
+            let resid = y[i] - mui;
+            // Unit variance function V(mu) = mu^p with the dispersion factored
+            // out; the prior-weighted Pearson contribution is wᵢ·resid²/V(μᵢ).
+            let var_unit = mui.powf(p).max(MU_EPS);
+            (wi * resid * resid / var_unit, wi)
+        })
+        .reduce(
+            || (0.0_f64, 0.0_f64),
+            |(p1, w1), (p2, w2)| (p1 + p2, w1 + w2),
+        );
+
+    if total_weight <= 0.0 || !weighted_pearson.is_finite() || weighted_pearson <= 0.0 {
+        return 1.0;
+    }
+    (weighted_pearson / total_weight).clamp(PHI_MIN, PHI_MAX)
+}
+
 #[derive(Clone, Debug)]
 pub struct SparsePirlsDecision {
     pub path: PirlsLinearSolvePath,
@@ -1327,6 +1390,15 @@ pub(super) struct GamWorkingModel<'a> {
     /// and held fixed within the inner solve, refreshing across outer iterations
     /// (a fresh working model is built per inner solve). Issue #567.
     beta_phi_locked: bool,
+    /// Whether the Tweedie dispersion `phi` has been estimated and frozen for the
+    /// duration of this inner P-IRLS solve. Like the Gamma shape, `phi` is a
+    /// nuisance scale entering only the working weight (`prior·μ^{2−p}/phi`) and
+    /// not the working response, so re-estimating it per Newton/LM iterate would
+    /// move the product `φ·λ` the penalized argmin β̂ depends on and stall the LM
+    /// gain ratio. It is therefore estimated once from the warm-start η and held
+    /// fixed within the inner solve, refreshing across outer iterations (a fresh
+    /// working model is built per inner solve). Issue #771.
+    tweedie_phi_locked: bool,
     quadctx: crate::quadrature::QuadratureContext,
 }
 
@@ -1416,6 +1488,7 @@ impl<'a> GamWorkingModel<'a> {
             covariate_se: None,
             gamma_shape_locked: false,
             beta_phi_locked: false,
+            tweedie_phi_locked: false,
             quadctx,
         }
     }
@@ -1863,6 +1936,26 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 estimate_beta_phi_from_eta(self.y, &self.workspace.eta_buf, self.priorweights);
             self.likelihood = self.likelihood.clone().with_beta_phi(phi);
             self.beta_phi_locked = true;
+        }
+
+        // Estimate the Tweedie dispersion φ once from the warm-start η and freeze
+        // it for this inner solve (issue #771). φ enters the IRLS weight
+        // `prior·μ^{2−p}/φ` (and so the covariance Vb = H⁻¹, giving SE ∝ √φ);
+        // holding it fixed within the inner solve keeps the product φ·λ — hence
+        // the penalized argmin β̂ — a stationary LM target (mirroring the Gamma
+        // shape and Beta φ locks above), and it refreshes across outer iterations
+        // as a fresh working model is built per inner solve.
+        if self.likelihood.scale.tweedie_phi_is_estimated() && !self.tweedie_phi_locked {
+            if let ResponseFamily::Tweedie { p } = self.likelihood.spec.response {
+                let phi = estimate_tweedie_phi_from_eta(
+                    self.y,
+                    &self.workspace.eta_buf,
+                    self.priorweights,
+                    p,
+                );
+                self.likelihood = self.likelihood.clone().with_tweedie_phi(phi);
+                self.tweedie_phi_locked = true;
+            }
         }
 
         // Use integrated (GHQ) likelihood if per-observation SE is available.

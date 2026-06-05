@@ -1195,11 +1195,23 @@ impl LikelihoodSpec {
         match &self.response {
             ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
             ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
+            // Binomial and Poisson have `phi ≡ 1` (variance fully pinned by the
+            // mean), so a fixed unit dispersion is correct. NegativeBinomial's
+            // overdispersion lives in `theta` (a separate parameter / flag), not
+            // a free `phi`, so it too defaults to fixed unit dispersion.
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
-            | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => {
                 LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+            }
+            // Tweedie's dispersion `phi` is a genuine free parameter
+            // (`Var(y) = phi · mu^p`) and is estimated jointly with the mean by
+            // default, exactly like the Gamma shape and Beta precision. The seed
+            // `phi = 1` is refined from the converged-η Pearson residuals during
+            // fitting (issue #771). Freezing it at 1 made every variance-derived
+            // output (SEs, intervals, generate draws) ignore the data's spread.
+            ResponseFamily::Tweedie { .. } => {
+                LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 1.0 }
             }
             // Beta precision is estimated jointly with the mean by default
             // (magic-by-default, issue #567): the family-variant `phi` is the
@@ -1355,6 +1367,15 @@ pub enum LikelihoodScaleMetadata {
     /// from the working residuals after each mean fit and refreshed across outer
     /// iterations, exactly like the Gamma shape (issue #567).
     EstimatedBetaPhi { phi: f64 },
+    /// Tweedie exponential-dispersion `phi` estimated jointly with the mean
+    /// model. `Var(y) = phi · mu^p` with `phi` a genuine free parameter (unlike
+    /// Binomial/Poisson, where `phi ≡ 1`). Estimated by the Pearson moment
+    /// estimator `phî = Σ wᵢ (yᵢ − μᵢ)² / μᵢ^p / Σ wᵢ` at the converged η and
+    /// refreshed across outer iterations, exactly like the Gamma shape and the
+    /// Beta precision. `phi` enters the IRLS working weight `prior·μ^{2−p}/phi`,
+    /// so the coefficient covariance `Vb = H⁻¹` already scales as `phi` and the
+    /// reported SEs track `√phi` (issue #771).
+    EstimatedTweediePhi { phi: f64 },
     /// The engine does not expose fixed-scale semantics for this family.
     Unspecified,
 }
@@ -1363,7 +1384,9 @@ impl LikelihoodScaleMetadata {
     #[inline]
     pub const fn fixed_phi(self) -> Option<f64> {
         match self {
-            Self::FixedDispersion { phi } | Self::EstimatedBetaPhi { phi } => Some(phi),
+            Self::FixedDispersion { phi }
+            | Self::EstimatedBetaPhi { phi }
+            | Self::EstimatedTweediePhi { phi } => Some(phi),
             Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => {
                 Some(1.0 / shape)
             }
@@ -1375,6 +1398,12 @@ impl LikelihoodScaleMetadata {
     #[inline]
     pub const fn beta_phi_is_estimated(self) -> bool {
         matches!(self, Self::EstimatedBetaPhi { .. })
+    }
+
+    /// Whether the Tweedie exponential-dispersion `phi` is estimated from data.
+    #[inline]
+    pub const fn tweedie_phi_is_estimated(self) -> bool {
+        matches!(self, Self::EstimatedTweediePhi { .. })
     }
 
     #[inline]
@@ -1479,13 +1508,15 @@ impl GlmLikelihoodSpec {
             // further dispersion multiply is warranted.
             //
             // FixedDispersion covers the explicitly-scaled Gaussian submodel
-            // (W·=1/φ above), Tweedie, and Negative-Binomial; the Gamma and Beta
-            // variants fold their reciprocal-dispersion / precision into W; and
+            // (W·=1/φ above) and Negative-Binomial; the Gamma, Beta and Tweedie
+            // variants fold their reciprocal-dispersion / precision / φ into W
+            // (Tweedie W = prior·μ^{2−p}/φ, so the SE already scales as √φ); and
             // Unspecified families never expose a separate post-hoc scale.
             LikelihoodScaleMetadata::FixedDispersion { .. }
             | LikelihoodScaleMetadata::FixedGammaShape { .. }
             | LikelihoodScaleMetadata::EstimatedGammaShape { .. }
             | LikelihoodScaleMetadata::EstimatedBetaPhi { .. }
+            | LikelihoodScaleMetadata::EstimatedTweediePhi { .. }
             | LikelihoodScaleMetadata::Unspecified => 1.0,
         }
     }
@@ -1533,6 +1564,27 @@ impl GlmLikelihoodSpec {
         if let ResponseFamily::Beta { phi: family_phi } = &mut self.spec.response {
             *family_phi = phi;
             self.scale = LikelihoodScaleMetadata::EstimatedBetaPhi { phi };
+        }
+        self
+    }
+
+    /// Whether the Tweedie exponential-dispersion `phi` is estimated from data.
+    #[inline]
+    pub fn tweedie_phi_is_estimated(&self) -> bool {
+        self.scale.tweedie_phi_is_estimated()
+    }
+
+    /// Mutate the Tweedie dispersion `phi` in place. Unlike Beta, the Tweedie
+    /// power `p` (not `phi`) is what is carried on the `ResponseFamily::Tweedie`
+    /// variant; the dispersion lives purely in the scale metadata and is read by
+    /// the IRLS weight (`prior·μ^{2−p}/phi`) through `fixed_phi()`. So updating
+    /// the metadata here is sufficient to thread the estimated `phi` into every
+    /// weight / covariance expression. No-op for non-Tweedie families (issue
+    /// #771).
+    #[inline]
+    pub fn with_tweedie_phi(mut self, phi: f64) -> Self {
+        if matches!(self.spec.response, ResponseFamily::Tweedie { .. }) {
+            self.scale = LikelihoodScaleMetadata::EstimatedTweediePhi { phi };
         }
         self
     }
