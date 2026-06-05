@@ -31,8 +31,14 @@
 //! a well-conditioned fit) is the only "apply where needed" mechanism.
 
 use crate::linalg::faer_ndarray::FaerEigh;
+use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
+
+#[inline]
+fn norm2_slice(a: &[f64]) -> f64 {
+    a.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
 
 /// Relative floor on a reduced-information eigenvalue, as a fraction of the
 /// dominant (identified) curvature `λ_max`. Negligible on data-identified
@@ -262,88 +268,75 @@ where
     // gives a deterministic, reproducible (no RNG in the hot path) start that has
     // a non-zero component along every eigenvector for any realistic operator, so
     // the extreme Ritz pairs are resolved and the trust gate below is meaningful.
-    let mut q = Array1::<f64>::zeros(p);
+    let mut q0 = vec![0.0_f64; p];
     let golden = 0.618_033_988_749_894_8_f64; // frac(golden ratio)
-    for i in 0..p {
+    for (i, qi) in q0.iter_mut().enumerate() {
         let frac = ((i as f64 + 1.0) * golden).fract();
-        q[i] = frac - 0.5;
+        *qi = frac - 0.5;
     }
-    let q_norm = q.dot(&q).sqrt();
+    let q_norm = norm2_slice(&q0);
     if !(q_norm.is_finite() && q_norm > 0.0) {
         return Ok(None);
     }
-    q.mapv_inplace(|x| x / q_norm);
-    let mut q_prev = Array1::<f64>::zeros(p);
-    // Full reorthogonalization basis (small: p×steps, steps ≤ 12). Cheap and
-    // keeps β_k a faithful residual norm so the bound stays valid at small k.
-    let mut basis: Vec<Array1<f64>> = Vec::with_capacity(steps);
-    let mut alphas: Vec<f64> = Vec::with_capacity(steps);
-    let mut betas: Vec<f64> = Vec::with_capacity(steps); // off-diagonals β_1..
-    let mut beta_prev = 0.0_f64;
-    let mut last_residual_norm = 0.0_f64;
-    for j in 0..steps {
-        basis.push(q.clone());
-        let mut w = hv(&q)?;
-        if w.iter().any(|x| !x.is_finite()) {
-            return Ok(None);
-        }
-        // w = H q_j − β_{j-1} q_{j-1}
-        if j > 0 {
-            w.scaled_add(-beta_prev, &q_prev);
-        }
-        let alpha = q.dot(&w);
-        if !alpha.is_finite() {
-            return Ok(None);
-        }
-        w.scaled_add(-alpha, &q);
-        // Full reorthogonalization against the accumulated basis (classical
-        // Gram–Schmidt, applied twice for numerical robustness at this tiny
-        // scale). `pass` indexes the two sweeps explicitly so there is no
-        // discarded loop binding.
-        let mut pass = 0usize;
-        while pass < 2 {
-            for qi in basis.iter() {
-                let proj = qi.dot(&w);
-                w.scaled_add(-proj, qi);
+    // Single shared matrix-free Lanczos primitive with FULL reorthogonalization,
+    // so `H Q_k = Q_k T_k + β_k q_{k+1} e_kᵀ` holds exactly and the per-Ritz-pair
+    // residual `β_k·|e_kᵀ y_i|` (read from `residual_norm` and the last row of the
+    // Ritz vectors below) is a SHARP eigenvalue bound. A matvec/HVP failure or a
+    // non-finite iterate surfaces as `None` (caller falls through to the exact
+    // dense path), preserving the conservative "never authorise a skip on an
+    // unconverged check" contract.
+    let mut hv_failed: Option<String> = None;
+    let eigen = match symmetric_lanczos_eigenpairs(
+        p,
+        &q0,
+        SymmetricLanczosOptions {
+            max_steps: steps,
+            // Lucky-breakdown floor: stop (β_k reported as 0 ⇒ EXACT Ritz
+            // spectrum, tight bounds) once the next Lanczos vector is at the
+            // machine-precision noise floor of a unit-norm start, before any
+            // divide-by-≈0 can pollute the basis. Conservative: a non-breakdown
+            // small residual still propagates as a faithful (small) bound below.
+            residual_tol: f64::EPSILON,
+            local_reorthogonalize: false,
+            full_reorthogonalize: true,
+        },
+        |q, out| {
+            let qv = Array1::from_vec(q.to_vec());
+            let w = match hv(&qv) {
+                Ok(w) => w,
+                Err(e) => {
+                    hv_failed = Some(e);
+                    return Err("cheap_conditioning_bounds: HVP failed".to_string());
+                }
+            };
+            if w.len() != p || w.iter().any(|x| !x.is_finite()) {
+                return Err("cheap_conditioning_bounds: HVP produced non-finite/ill-sized output"
+                    .to_string());
             }
-            pass += 1;
-        }
-        alphas.push(alpha);
-        let beta = w.dot(&w).sqrt();
-        last_residual_norm = beta;
-        if !beta.is_finite() {
+            out.copy_from_slice(w.as_slice().ok_or_else(|| {
+                "cheap_conditioning_bounds: HVP output not contiguous".to_string()
+            })?);
+            Ok(())
+        },
+    ) {
+        Ok(eigen) => eigen,
+        Err(_) => {
+            // Propagate a genuine HVP error to the caller; treat a Lanczos
+            // numerical degeneracy (zero-start collapse, non-finite iterate) as
+            // an untrusted estimate and fall through to the exact path.
+            if let Some(e) = hv_failed {
+                return Err(e);
+            }
             return Ok(None);
         }
-        if j + 1 >= steps {
-            break;
-        }
-        // Lucky breakdown: the Krylov space is exhausted, T_k spectrum is EXACT
-        // (β_k = 0 ⇒ bounds are tight). Stop; the residual norm is ~0.
-        if beta <= f64::EPSILON * (alpha.abs().max(1.0)) {
-            last_residual_norm = 0.0;
-            break;
-        }
-        betas.push(beta);
-        beta_prev = beta;
-        q_prev = std::mem::replace(&mut q, w / beta);
-    }
-    let k = alphas.len();
+    };
+    let ritz = eigen.eigenvalues;
+    let ritz_vecs = eigen.eigenvectors;
+    let last_residual_norm = eigen.residual_norm;
+    let k = ritz.len();
     if k == 0 {
         return Ok(None);
     }
-    // Build the k×k symmetric tridiagonal T_k and take its extreme eigenvalues.
-    // k ≤ 12, so this eigh is negligible (and dense only at the k-scale, never p).
-    let mut t = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        t[[i, i]] = alphas[i];
-        if i + 1 < k {
-            t[[i, i + 1]] = betas[i];
-            t[[i + 1, i]] = betas[i];
-        }
-    }
-    let (ritz, ritz_vecs) = t
-        .eigh(Side::Lower)
-        .map_err(|e| format!("cheap_conditioning_bounds: tridiagonal eigendecomposition failed: {e}"))?;
     // Index of the smallest / largest Ritz value and the eigenvector last
     // components, which give the SHARP per-pair residual `β_k·|e_kᵀ y_i|` ≤ β_k.
     let mut idx_min = 0usize;
