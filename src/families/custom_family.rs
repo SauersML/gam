@@ -11890,14 +11890,10 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     // LAML logdet consistent with the inner solve (which also gated the term off
     // on the same well-conditioned geometry) while preserving the matrix-free path
     // at outer-eval scale. Returns `false`/unsure ⇒ exact formation below.
-    let outer_jeffreys_precheck_skips = include_logdet_h
-        && preferred_workspace
-            .as_ref()
-            .map(|ws| ws.hessian_matvec_available())
-            .unwrap_or(false)
-        && total >= crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM
-        && {
-            let ws = preferred_workspace.as_ref().expect("checked Some above");
+    let outer_precheck_eligible = include_logdet_h
+        && total >= crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM;
+    let outer_jeffreys_precheck_skips = match preferred_workspace.as_ref() {
+        Some(ws) if outer_precheck_eligible && ws.hessian_matvec_available() => {
             let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
                 match ws.hessian_matvec(v)? {
                     Some(out) if out.len() == total => Ok(out),
@@ -11909,7 +11905,9 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
             };
             crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(hv, total)
                 .unwrap_or(false)
-        };
+        }
+        _ => false,
+    };
     let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h
         && !outer_jeffreys_precheck_skips
     {
