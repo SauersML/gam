@@ -632,7 +632,7 @@ fn build_reduced_logslope_reparam(
                 f,
                 "SPECTRUM p_g={p_g}\n  gtt(asc)={:?}\n  gamma(asc)={:?}",
                 evals.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>(),
-                gamma.iter().map(|v| format!("{v:.4f}")).collect::<Vec<_>>(),
+                gamma.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>(),
             )
             .ok();
         }
