@@ -15583,12 +15583,38 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .fold(0.0_f64, f64::max);
             cycles_done = cycle + 1;
 
-            // Check convergence via joint stationarity
+            // Check convergence via joint stationarity. When the family-general
+            // Firth/Jeffreys term is armed, the penalized objective the inner
+            // Newton actually optimizes is `−ℓ + ½βᵀSβ − Φ`, so its KKT
+            // stationarity is `∇L − Sβ + ∇Φ = 0`. The Newton STEP already folds
+            // `∇Φ` into its RHS (`spectral_rhs += grad_phi`), but the bare
+            // `exact_newton_joint_stationarity_*` residual omits it — at the
+            // Firth fixed point `∇L − Sβ = −∇Φ`, so the certificate floors at
+            // `‖∇Φ‖∞` and never certifies, stalling the inner solve on exactly
+            // the near-separating span Firth is meant to bound (the residual the
+            // outer REML then rejects). Fold `∇Φ` into the gradient used for the
+            // KKT residual so the convergence criterion matches the augmented
+            // objective the step descends. No-op (byte-identical) when the flag
+            // is OFF: `joint_jeffreys_subspace` is `None`.
             let Some(gradient) = cached_joint_gradient.as_ref() else {
                 break;
             };
+            let jeffreys_augmented_gradient: Option<Array1<f64>> =
+                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                    match custom_family_joint_jeffreys_term(
+                        family, &states, specs, &ranges, z_joint,
+                    )? {
+                        Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
+                            Some(gradient + &grad_phi)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+            let residual_gradient = jeffreys_augmented_gradient.as_ref().unwrap_or(gradient);
             let residual = exact_newton_joint_stationarity_inf_norm_from_gradient(
-                gradient,
+                residual_gradient,
                 &states,
                 specs,
                 &s_lambdas,
