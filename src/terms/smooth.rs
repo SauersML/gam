@@ -8150,10 +8150,27 @@ fn apply_global_smooth_identifiability(
             (None, Some(z)) => Some(z.clone()),
             (None, None) => None,
         };
-        local_metadata[idx] = Some(with_identifiability_transform(
-            &term.metadata,
-            realized_transform.as_ref(),
-        )?);
+        // Block-replicated factor smooths (`bs="sz"` → `FactorSumToZero`) carry a
+        // PER-MARGINAL metadata (predict rebuilds the single inner marginal then
+        // re-stacks the `L-1` sum-to-zero deviation blocks). Their realized
+        // transform — the joint-null absorption rotation `Q` (and any global
+        // orthogonality `Z`) — lives in the FULL `p·(L-1)`-column design space, so
+        // it cannot be folded into the per-marginal metadata (the dimensions don't
+        // compose: `existing pxr` vs `extra (p·(L-1))x(p·(L-1))`). The raw design
+        // builder already applies `Q` to the re-stacked design and recomputes it
+        // deterministically from the (frozen) penalties at predict time, so the
+        // per-marginal metadata must be left untouched here; folding it in both
+        // crashed basis generation and would double-count `Q` on rebuild (#700).
+        let metadata_is_per_marginal_block =
+            matches!(termspec.basis, SmoothBasisSpec::FactorSumToZero { .. });
+        local_metadata[idx] = if metadata_is_per_marginal_block {
+            Some(term.metadata.clone())
+        } else {
+            Some(with_identifiability_transform(
+                &term.metadata,
+                realized_transform.as_ref(),
+            )?)
+        };
     }
 
     let total_p: usize = local_dims.iter().sum();
