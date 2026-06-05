@@ -590,7 +590,9 @@ fn build_reduced_logslope_reparam(
         transform.column_mut(out_col).assign(&evecs.column(src));
     }
     if transform.iter().any(|v| !v.is_finite()) {
-        return Err("reduced logslope reparam: reduced transform produced non-finite entries".to_string());
+        return Err(
+            "reduced logslope reparam: reduced transform produced non-finite entries".to_string(),
+        );
     }
     Ok(Some(ReducedLogslopeReparam { transform }))
 }
@@ -645,8 +647,7 @@ fn reparameterize_logslope_design_reduced(
         new_nullspace_dims.push(nullspace_dim);
     }
 
-    let new_design =
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(g_reduced));
+    let new_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(g_reduced));
     // The reduced logslope block is a single dense smooth-like surface over the
     // reparameterized coordinates; it carries no parametric/random-effect/
     // intercept structure of its own (those live in the marginal block), so the
@@ -1853,22 +1854,22 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // `build_blocks` / `make_family`, and inverted at fit-result assembly so the
     // reported logslope β is in the original basis. Flag OFF ⇒ `None` ⇒ raw
     // design used everywhere ⇒ byte-identical to the released solver.
-    let logslope_reduced_reparam: Option<ReducedLogslopeReparam> =
-        if robust.orthogonalize_confounds {
-            build_reduced_logslope_reparam(
-                &marginal_design,
-                &logslope_design,
-                z.as_ref(),
-                &cross_block_pilot_w_score_warp,
-                &spec.marginal_offset,
-                &spec.logslope_offset,
-                baseline.0,
-                baseline.1,
-                probit_scale,
-            )?
-        } else {
-            None
-        };
+    let logslope_reduced_reparam: Option<ReducedLogslopeReparam> = if robust.orthogonalize_confounds
+    {
+        build_reduced_logslope_reparam(
+            &marginal_design,
+            &logslope_design,
+            z.as_ref(),
+            &cross_block_pilot_w_score_warp,
+            &spec.marginal_offset,
+            &spec.logslope_offset,
+            baseline.0,
+            baseline.1,
+            probit_scale,
+        )?
+    } else {
+        None
+    };
     // Apply the reduced reparam to a logslope `TermCollectionDesign`, or return
     // the raw design clone when the reparam is absent (flag off / nothing to
     // reduce). Used by both `build_blocks` and `make_family` so the family's

@@ -44,12 +44,12 @@ use crate::families::custom_family::{
 use crate::families::identifiability_compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
 };
-use crate::solver::robust_identification::RobustConfig;
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::identifiability_audit::{
     IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
 };
+use crate::solver::robust_identification::RobustConfig;
 
 /// A [`RowJacobianOperator`] built from a [`BlockEffectiveJacobian`] callback.
 ///
@@ -1038,7 +1038,8 @@ fn try_orthogonalize_blocks(
     // this should produce a clean (identity-T) verdict; if a *residual* rank
     // deficiency survives orthogonalisation, the fail-closed gate still
     // refuses with an actionable diagnostic.
-    let inner = canonicalize_for_identifiability_with_robust(&ortho_specs, RobustConfig::default())?;
+    let inner =
+        canonicalize_for_identifiability_with_robust(&ortho_specs, RobustConfig::default())?;
 
     // Compose the round-trip transform: β_raw = V_b · (T_inner · θ).
     // `inner.per_block_transform[b]` is T_inner (selection/identity from the
@@ -1458,17 +1459,22 @@ mod tests {
 
         // Block b shed exactly one direction (the x alias): V_b is 2×1.
         let v_b = &canon.per_block_transform[1];
-        assert_eq!(v_b.ncols(), 1, "overlap block must keep exactly one direction");
-        assert_eq!(v_b.nrows(), 2, "overlap block transform maps from raw width 2");
+        assert_eq!(
+            v_b.ncols(),
+            1,
+            "overlap block must keep exactly one direction"
+        );
+        assert_eq!(
+            v_b.nrows(),
+            2,
+            "overlap block transform maps from raw width 2"
+        );
         // Anchor block keeps both directions (square rotation).
         assert_eq!(canon.per_block_transform[0].ncols(), 2);
 
         // Round-trip: a reduced fit θ lifts to raw β = V·θ and predicts
         // identically through the raw designs.
-        let theta = vec![
-            Array1::from(vec![0.7, -0.3]),
-            Array1::from(vec![1.4]),
-        ];
+        let theta = vec![Array1::from(vec![0.7, -0.3]), Array1::from(vec![1.4])];
         let raw = canon.lift_block_betas_to_raw(&theta);
         assert_eq!(raw[0].len(), 2);
         assert_eq!(raw[1].len(), 2);
@@ -1540,18 +1546,23 @@ mod tests {
             overlap[[i, 1]] = x[i] * x[i] * x[i];
         }
         let weight = vec![1.0_f64; n];
-        let res = orthogonalize_design_blocks(
-            &[anchor.clone(), overlap.clone()],
-            &[150, 120],
-            &weight,
-        )
-        .expect("orthogonalisation must succeed");
-        assert_eq!(res.block_transforms[0].ncols(), 2, "anchor keeps full width");
+        let res =
+            orthogonalize_design_blocks(&[anchor.clone(), overlap.clone()], &[150, 120], &weight)
+                .expect("orthogonalisation must succeed");
+        assert_eq!(
+            res.block_transforms[0].ncols(),
+            2,
+            "anchor keeps full width"
+        );
         assert_eq!(
             res.block_transforms[1].ncols(),
             1,
             "overlap block sheds exactly the aliased direction",
         );
-        assert_eq!(res.dropped, vec![(1, 1)], "one direction dropped from block 1");
+        assert_eq!(
+            res.dropped,
+            vec![(1, 1)],
+            "one direction dropped from block 1"
+        );
     }
 }

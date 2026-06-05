@@ -17294,8 +17294,7 @@ fn build_duchon_operator_penalty_psi_derivatives(
                             );
                             if need_d1 {
                                 for axis in 0..d {
-                                    let delta =
-                                        collocation_points[[i, axis]] - centers[[j, axis]];
+                                    let delta = collocation_points[[i, axis]] - centers[[j, axis]];
                                     let axis_scale = metric_weights
                                         .as_ref()
                                         .map(|weights| weights[axis])
@@ -17333,14 +17332,12 @@ fn build_duchon_operator_penalty_psi_derivatives(
                                                 q, jets.t, h_b, h_c, w_b, w_c, axis_b, axis_c,
                                             ) * z_jc;
                                             local.d2_psi[[row, col]] += hessian_operator_entry(
-                                                q_psi, t_psi, h_b, h_c, w_b, w_c, axis_b,
+                                                q_psi, t_psi, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                                            ) * z_jc;
+                                            local.d2_psi_psi[[row, col]] += hessian_operator_entry(
+                                                q_psi_psi, t_psi_psi, h_b, h_c, w_b, w_c, axis_b,
                                                 axis_c,
                                             ) * z_jc;
-                                            local.d2_psi_psi[[row, col]] +=
-                                                hessian_operator_entry(
-                                                    q_psi_psi, t_psi_psi, h_b, h_c, w_b, w_c,
-                                                    axis_b, axis_c,
-                                                ) * z_jc;
                                         }
                                     }
                                 }

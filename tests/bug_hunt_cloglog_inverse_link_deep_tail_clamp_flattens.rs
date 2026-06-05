@@ -130,7 +130,16 @@ fn cloglog_inverse_link_positive_tail_saturates_to_one_without_overflow() {
     // form saturates to exactly 1.0 once exp(η) overflows to +∞ (η ≳ 709.8),
     // with no NaN/inf leaking out. μ must be non-decreasing into the far tail
     // and never exceed 1.
-    let eta = vec![10.0_f64, 50.0, 100.0, 500.0, 709.0, 710.0, 1000.0, f64::INFINITY];
+    let eta = vec![
+        10.0_f64,
+        50.0,
+        100.0,
+        500.0,
+        709.0,
+        710.0,
+        1000.0,
+        f64::INFINITY,
+    ];
     let mu = apply_inverse_link_vec(&eta, "cloglog").expect("cloglog dispatch succeeds");
 
     for (&e, &got) in eta.iter().zip(mu.iter()) {

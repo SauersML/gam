@@ -326,11 +326,13 @@ mod tests {
             Ok(Some(hd))
         };
         let h = h_at(&beta);
-        let (phi, grad, hphi) =
-            joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
+        let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
         // Phi = 1/2 log(exp(b0) * (1 + b1^2)).
         let expected_phi = 0.5 * (beta[0].exp() * (1.0 + beta[1] * beta[1])).ln();
-        assert!((phi - expected_phi).abs() < 1e-10, "phi {phi} vs {expected_phi}");
+        assert!(
+            (phi - expected_phi).abs() < 1e-10,
+            "phi {phi} vs {expected_phi}"
+        );
         // Finite-difference the gradient.
         let eps = 1e-6;
         for k in 0..p {
