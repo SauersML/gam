@@ -13003,6 +13003,35 @@ fn exact_bounded_edf(
     Ok((edf_by_block, edf_total))
 }
 
+fn transform_bounded_latent_precision_to_user_internal(
+    latent_precision: &Array2<f64>,
+    jac_diag: &Array1<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    let p = latent_precision.nrows();
+    if latent_precision.ncols() != p || jac_diag.len() != p {
+        crate::bail_invalid_estim!(
+            "bounded precision transform dimension mismatch: precision is {}x{}, jacobian has {} entries",
+            latent_precision.nrows(),
+            latent_precision.ncols(),
+            jac_diag.len()
+        );
+    }
+    let mut out = latent_precision.clone();
+    for i in 0..p {
+        let scale = jac_diag[i];
+        if !scale.is_finite() || scale <= 0.0 {
+            crate::bail_invalid_estim!(
+                "bounded precision transform requires a positive finite coefficient jacobian; column {i} has {scale}"
+            );
+        }
+        if scale != 1.0 {
+            out.row_mut(i).mapv_inplace(|v| v / scale);
+            out.column_mut(i).mapv_inplace(|v| v / scale);
+        }
+    }
+    Ok(out)
+}
+
 fn fit_bounded_term_collection_with_design(
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -13195,6 +13224,8 @@ fn fit_bounded_term_collection_with_design(
     }
     let mut penalized_hessian = h_data.clone();
     penalized_hessian += &s_lambda_internal;
+    let penalized_hessian =
+        transform_bounded_latent_precision_to_user_internal(&penalized_hessian, &jac_diag)?;
     let penalized_hessian =
         conditioning.transform_penalized_hessian_to_original(&penalized_hessian);
     let s_lambda_original = weighted_blockwise_penalty_sum(
@@ -26460,6 +26491,90 @@ mod tests {
             estimate > 0.1,
             "bounded coefficient should move into the positive interior, got {estimate}"
         );
+    }
+
+    #[test]
+    fn bounded_fit_geometry_precision_is_on_user_scale() {
+        use crate::faer_ndarray::FaerCholesky;
+
+        let n = 72usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64);
+            let x = -1.0 + 2.0 * t;
+            let z = (4.0 * std::f64::consts::PI * t).sin();
+            data[[i, 0]] = x;
+            data[[i, 1]] = z;
+            y[i] = 0.2 + 0.35 * x - 0.15 * z;
+        }
+        let spec = TermCollectionSpec {
+            linear_terms: vec![
+                LinearTermSpec {
+                    name: "x".to_string(),
+                    feature_col: 0,
+                    feature_cols: vec![0],
+                    double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Bounded {
+                        min: -0.5,
+                        max: 0.5,
+                        prior: BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 },
+                    },
+                    coefficient_min: None,
+                    coefficient_max: None,
+                },
+                LinearTermSpec {
+                    name: "z".to_string(),
+                    feature_col: 1,
+                    feature_cols: vec![1],
+                    double_penalty: false,
+                    coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                    coefficient_min: None,
+                    coefficient_max: None,
+                },
+            ],
+            random_effect_terms: vec![],
+            smooth_terms: vec![],
+        };
+
+        let fitted = fit_term_collection_forspec(
+            data.view(),
+            y.view(),
+            Array1::ones(n).view(),
+            Array1::zeros(n).view(),
+            &spec,
+            LikelihoodSpec::gaussian_identity(),
+            &FitOptions {
+                max_iter: 40,
+                penalty_shrinkage_floor: None,
+                ..FitOptions::default()
+            },
+        )
+        .expect("bounded gaussian fit");
+        let precision = &fitted
+            .fit
+            .geometry
+            .as_ref()
+            .expect("bounded fit geometry")
+            .penalized_hessian;
+        let covariance = fitted
+            .fit
+            .beta_covariance()
+            .expect("bounded user covariance");
+        let chol = precision
+            .cholesky(faer::Side::Lower)
+            .expect("bounded user precision cholesky");
+        let solved = chol.solvemulti(&Array2::eye(covariance.nrows()));
+        for i in 0..solved.nrows() {
+            for j in 0..solved.ncols() {
+                assert!(
+                    (solved[[i, j]] - covariance[[i, j]]).abs() < 1e-5,
+                    "user-scale precision/covariance mismatch at ({i},{j}): inverse {}, covariance {}",
+                    solved[[i, j]],
+                    covariance[[i, j]]
+                );
+            }
+        }
     }
 
     #[test]
