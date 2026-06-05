@@ -300,7 +300,7 @@ mod tests {
     fn full_rank_penalty_has_empty_under_identified_span() {
         let s = Array2::<f64>::eye(4) * 2.0;
         let z = jeffreys_subspace_from_penalty(s.view(), Some(0)).unwrap();
-        assert!(z.is_empty());
+        assert!(JeffreysSubspace::is_empty(&z));
         assert_eq!(z.span_dim(), 0);
     }
 
@@ -318,7 +318,7 @@ mod tests {
             h
         };
         // Hdot[d] = d/d eps H(beta + eps d): diag(exp(b0) d0, 2 b1 d1).
-        let beta = array![0.3, -0.4];
+        let beta: Array1<f64> = array![0.3, -0.4];
         let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
             let mut hd = Array2::<f64>::zeros((p, p));
             hd[[0, 0]] = beta[0].exp() * d[0];
