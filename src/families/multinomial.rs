@@ -61,7 +61,9 @@
 //! [`crate::families::binomial_multi`] is the same engine with a row-diagonal
 //! Fisher block instead.
 
-use crate::families::custom_family::{BlockwiseFitOptions, fit_custom_family_with_rho_prior};
+use crate::families::custom_family::{
+    BlockwiseFitOptions, ParameterBlockState, fit_custom_family_with_rho_prior,
+};
 use crate::families::multinomial_reml::MultinomialFamily;
 use crate::families::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
 use crate::families::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
@@ -154,6 +156,30 @@ fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
 /// its iteration budget at this scale, the returned iterate is a separation
 /// artifact, not a finite MLE.
 const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
+
+fn max_abs_eta_from_block_states(block_states: &[ParameterBlockState]) -> f64 {
+    block_states
+        .iter()
+        .flat_map(|state| state.eta.iter())
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+}
+
+fn multinomial_formula_separation_diagnostic(
+    outer_converged: bool,
+    inner_cycles: usize,
+    outer_iterations: usize,
+    block_states: &[ParameterBlockState],
+) -> Option<EstimationError> {
+    let max_abs_eta = max_abs_eta_from_block_states(block_states);
+    if !outer_converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
+        Some(EstimationError::PerfectSeparationDetected {
+            iteration: inner_cycles.max(outer_iterations),
+            max_abs_eta,
+        })
+    } else {
+        None
+    }
+}
 
 /// Inputs to [`fit_penalized_multinomial`].
 ///
@@ -688,6 +714,14 @@ pub fn fit_penalized_multinomial_formula(
     let fit =
         fit_custom_family_with_rho_prior(&family, &blocks, &options, crate::types::RhoPrior::Flat)
             .map_err(|err| EstimationError::InvalidInput(format!("multinomial REML: {err}")))?;
+    if let Some(err) = multinomial_formula_separation_diagnostic(
+        fit.outer_converged,
+        fit.inner_cycles,
+        fit.outer_iterations,
+        &fit.block_states,
+    ) {
+        return Err(err);
+    }
 
     // ── Repack coefficients (P, K-1) from per-block β vectors ─────────────
     if fit.blocks.len() != m {
@@ -906,6 +940,47 @@ mod fisher_override_tests {
         assert!(
             err.to_string().contains("separation"),
             "diagnostic should mention separation, got {err}"
+        );
+    }
+
+    #[test]
+    fn formula_multinomial_reports_saturated_nonconvergence_as_separation() {
+        let block_states = vec![
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![1.0, 2.0]),
+                eta: Array1::from_vec(vec![0.2, 4.0, -7.0]),
+            },
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![-1.0, 3.0]),
+                eta: Array1::from_vec(vec![1.0, 25.5, -0.1]),
+            },
+        ];
+
+        let err = multinomial_formula_separation_diagnostic(false, 17, 9, &block_states)
+            .expect("nonconverged formula fit at saturated logits must be diagnostic");
+        assert!(
+            matches!(
+                err,
+                EstimationError::PerfectSeparationDetected {
+                    iteration: 17,
+                    max_abs_eta
+                } if (max_abs_eta - 25.5).abs() <= f64::EPSILON
+            ),
+            "expected typed separation diagnostic with final max|eta|, got {err:?}"
+        );
+
+        assert!(
+            multinomial_formula_separation_diagnostic(true, 17, 9, &block_states).is_none(),
+            "a converged robust/Firth formula fit is a finite fit, not a separation diagnostic"
+        );
+
+        let finite_states = vec![ParameterBlockState {
+            beta: Array1::from_vec(vec![0.0]),
+            eta: Array1::from_vec(vec![24.9]),
+        }];
+        assert!(
+            multinomial_formula_separation_diagnostic(false, 3, 11, &finite_states).is_none(),
+            "nonconvergence below the saturation threshold should remain a convergence failure"
         );
     }
 
