@@ -1648,7 +1648,7 @@ mod tests {
         // screening floor would otherwise leave un-bounded. Large per-class
         // slopes ⇒ near-saturated softmax ⇒ near-singular joint information.
         let betas: Vec<Array1<f64>> = (0..m)
-            .map(|a| Array1::from_vec(vec![0.0, 8.0 * ((a as f64) - 0.5)]))
+            .map(|a| Array1::from_vec(vec![-300.0, 600.0 * ((a as f64) - 0.5)]))
             .collect();
         let states = states_at_betas(&family, &betas);
 
