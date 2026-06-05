@@ -3468,6 +3468,13 @@ pub struct BlockwiseFitOptions {
     /// box-constraint stationarity at iteration 0. Genuinely flexible regimes
     /// (smooth scale / spatial) leave this `true` and keep full screening.
     pub screen_initial_rho: bool,
+    /// Universal under-identification robustness policy threaded from the
+    /// workflow `FitConfig`. `Off` (default) is byte-identical to the released
+    /// solver: every pinned BMS ridge stays installed and no Firth/orthogonal
+    /// reparameterization machinery runs. `Auto`/`Force` arm the structural
+    /// cure on supported custom-family paths (BMS-probit). The struct's
+    /// `Default` keeps this `Off` so no existing caller changes behavior.
+    pub robust_identification: crate::solver::workflow::RobustIdentification,
 }
 
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
@@ -3516,6 +3523,7 @@ impl Default for BlockwiseFitOptions {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         }
     }
 }
@@ -27386,6 +27394,7 @@ mod tests {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -27439,6 +27448,7 @@ mod tests {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -27495,6 +27505,7 @@ mod tests {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
             .expect("inner blockwise fit should succeed");

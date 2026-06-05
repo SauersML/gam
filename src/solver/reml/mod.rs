@@ -324,8 +324,8 @@ pub(crate) fn firth_problem_scale_allows(n_obs: usize, p_coeff: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirectionalHyperParam, EvalCacheManager, EvalShared, FirthDenseOperator,
-        HyperDesignDerivative, HyperPenaltyDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
+        DirectionalHyperParam, EvalCacheManager, EvalShared, HyperDesignDerivative,
+        HyperPenaltyDerivative, ImplicitDerivLevel, RemlConfig, RemlState,
     };
     use crate::estimate::EstimationError;
     use crate::faer_ndarray::{FaerCholesky, FaerEigh};

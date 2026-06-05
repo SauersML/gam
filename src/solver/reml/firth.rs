@@ -2852,6 +2852,260 @@ mod tests {
         }
     }
 
+    // ----------------------------------------------------------------------
+    // Link-general (probit) finite-difference proof of the Jeffreys/Firth
+    // Φ(β) = ½ log|I_r(β)|, its β-gradient ∂Φ/∂β, and the β-Hessian
+    // derivative D H_φ[u] exposed via `hphi_direction`. Logit is used as a
+    // regression guard against the historical logit-pinned build.
+    // ----------------------------------------------------------------------
+
+    fn build_link_firth_op(
+        link: StandardLink,
+        x: &Array2<f64>,
+        beta: &Array1<f64>,
+    ) -> FirthDenseOperator {
+        let eta = x.dot(beta);
+        FirthDenseOperator::build_with_observation_weights_impl(link, x, &eta, None)
+            .expect("link-general firth operator")
+    }
+
+    fn link_firth_phi(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
+        build_link_firth_op(link, x, beta).jeffreys_logdet()
+    }
+
+    fn link_firth_grad(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
+        build_link_firth_op(link, x, beta).jeffreys_beta_gradient()
+    }
+
+    /// Central-difference Jacobian of the *analytic* Firth gradient, i.e. a
+    /// numerical realization of the β-Hessian H_φ = ∂g/∂β. The Newton/REML
+    /// path consumes H_φ (and its directional derivative) so this is the
+    /// matrix the analytic curvature must reproduce.
+    fn numeric_firth_hessian(
+        link: StandardLink,
+        x: &Array2<f64>,
+        beta: &Array1<f64>,
+        h: f64,
+    ) -> Array2<f64> {
+        let p = beta.len();
+        let mut hess = Array2::<f64>::zeros((p, p));
+        for j in 0..p {
+            let mut bp = beta.clone();
+            bp[j] += h;
+            let mut bm = beta.clone();
+            bm[j] -= h;
+            let gp = link_firth_grad(link, x, &bp);
+            let gm = link_firth_grad(link, x, &bm);
+            let col = (&gp - &gm) / (2.0 * h);
+            hess.column_mut(j).assign(&col);
+        }
+        hess
+    }
+
+    /// A fixed, well-conditioned full-rank design (deterministic, no RNG).
+    fn fixed_design_5x3() -> Array2<f64> {
+        array![
+            [1.0, -1.10, 0.35],
+            [1.0, -0.40, -0.65],
+            [1.0, 0.15, 0.20],
+            [1.0, 0.80, -0.45],
+            [1.0, 1.25, 0.70],
+        ]
+    }
+
+    #[test]
+    fn link_general_logit_path_reproduces_historical_logit_build() {
+        // Guard: the StandardLink::Logit path through the link-general builder
+        // must be byte-identical to the historical logit-pinned operator for
+        // Φ, the β-gradient, the PIRLS hat diagonal, and the cached weight
+        // jets w, w'..w''''.
+        let x = fixed_design_5x3();
+        let beta = array![0.20, -0.55, 0.30];
+        let eta = x.dot(&beta);
+
+        let historical = build_logit_firth_dense_operator(&x, &eta).expect("historical logit");
+        let link_general =
+            FirthDenseOperator::build_with_observation_weights_impl(StandardLink::Logit, &x, &eta, None)
+                .expect("link-general logit");
+
+        assert_eq!(
+            historical.jeffreys_logdet(),
+            link_general.jeffreys_logdet(),
+            "logit Φ must be bit-identical through the link-general path"
+        );
+        let g_hist = historical.jeffreys_beta_gradient();
+        let g_link = link_general.jeffreys_beta_gradient();
+        for j in 0..g_hist.len() {
+            assert_eq!(
+                g_hist[j], g_link[j],
+                "logit gradient component {j} must be bit-identical"
+            );
+        }
+        let hat_hist = historical.pirls_hat_diag();
+        let hat_link = link_general.pirls_hat_diag();
+        for i in 0..hat_hist.len() {
+            assert_eq!(
+                hat_hist[i], hat_link[i],
+                "logit PIRLS hat diagonal {i} must be bit-identical"
+            );
+        }
+        for i in 0..eta.len() {
+            assert_eq!(historical.w[i], link_general.w[i]);
+            assert_eq!(historical.w1[i], link_general.w1[i]);
+            assert_eq!(historical.w2[i], link_general.w2[i]);
+            assert_eq!(historical.w3[i], link_general.w3[i]);
+            assert_eq!(historical.w4[i], link_general.w4[i]);
+        }
+    }
+
+    #[test]
+    fn link_general_probit_jeffreys_gradient_matches_finite_difference() {
+        // PROBIT correctness: ∂Φ/∂β from `jeffreys_beta_gradient` must match a
+        // central finite difference of Φ(β) on a well-conditioned design.
+        let x = fixed_design_5x3();
+        let beta = array![0.10, -0.40, 0.25];
+        let grad = link_firth_grad(StandardLink::Probit, &x, &beta);
+        let h = 1e-6_f64;
+        let mut max_rel = 0.0_f64;
+        for j in 0..beta.len() {
+            let mut bp = beta.clone();
+            bp[j] += h;
+            let mut bm = beta.clone();
+            bm[j] -= h;
+            let fd = (link_firth_phi(StandardLink::Probit, &x, &bp)
+                - link_firth_phi(StandardLink::Probit, &x, &bm))
+                / (2.0 * h);
+            let denom = grad[j].abs().max(fd.abs()).max(1e-8);
+            let rel = (grad[j] - fd).abs() / denom;
+            max_rel = max_rel.max(rel);
+            assert!(
+                rel < 1e-6,
+                "probit Firth gradient mismatch at {j}: analytic={}, fd={}, rel={:e}",
+                grad[j],
+                fd,
+                rel
+            );
+        }
+        assert!(
+            max_rel < 1e-6,
+            "probit gradient worst relative error {max_rel:e} exceeds 1e-6"
+        );
+    }
+
+    #[test]
+    fn link_general_probit_hphi_direction_matches_finite_difference_of_hessian() {
+        // PROBIT Hessian: `hphi_direction(direction_from_deta(X·u))` is the
+        // analytic directional derivative D H_φ[u] of the β-Hessian. Verify it
+        // against the central finite difference of the (numerically realized)
+        // β-Hessian H_φ along u. The numeric H_φ at each shifted β is itself a
+        // finite difference of the *analytic* gradient, so the base operand is
+        // analytic at first order; only the directional step is differenced
+        // here.
+        let x = fixed_design_5x3();
+        let beta = array![0.10, -0.40, 0.25];
+        let p = beta.len();
+
+        // Probe several directions, including non-axis-aligned ones.
+        let directions = [
+            array![1.0, 0.0, 0.0],
+            array![0.0, 1.0, 0.0],
+            array![0.0, 0.0, 1.0],
+            array![0.7, -0.5, 0.3],
+        ];
+
+        let h_inner = 1e-4_f64; // step for the numeric Hessian (FD of analytic grad)
+        let h_dir = 1e-4_f64; // step for the directional derivative of the Hessian
+        let mut worst = 0.0_f64;
+        for u in directions.iter() {
+            let op = build_link_firth_op(StandardLink::Probit, &x, &beta);
+            let deta = x.dot(u);
+            let dir = op.direction_from_deta(deta);
+            let analytic = op.hphi_direction(&dir);
+
+            let beta_plus = &beta + &(u * h_dir);
+            let beta_minus = &beta - &(u * h_dir);
+            let hess_plus = numeric_firth_hessian(StandardLink::Probit, &x, &beta_plus, h_inner);
+            let hess_minus = numeric_firth_hessian(StandardLink::Probit, &x, &beta_minus, h_inner);
+            let fd = (&hess_plus - &hess_minus) / (2.0 * h_dir);
+
+            let mut scale = 1e-6_f64;
+            for r in 0..p {
+                for c in 0..p {
+                    scale = scale.max(analytic[[r, c]].abs()).max(fd[[r, c]].abs());
+                }
+            }
+            for r in 0..p {
+                for c in 0..p {
+                    let rel = (analytic[[r, c]] - fd[[r, c]]).abs() / scale;
+                    worst = worst.max(rel);
+                    assert!(
+                        rel < 5e-3,
+                        "probit D H_φ[u] mismatch at ({r},{c}) for u={u:?}: analytic={}, fd={}, rel={:e}",
+                        analytic[[r, c]],
+                        fd[[r, c]],
+                        rel
+                    );
+                }
+            }
+        }
+        assert!(
+            worst < 5e-3,
+            "probit Hessian-derivative worst relative error {worst:e} exceeds 5e-3"
+        );
+    }
+
+    #[test]
+    fn link_general_probit_jeffreys_finite_on_rank_deficient_design() {
+        // Identifiable-subspace behavior: a rank-deficient design (column 3 =
+        // column 1 + column 2) must yield a finite Φ = ½ log|Uᵀ W U|, a finite
+        // gradient, and agree with the explicit reduced two-column design.
+        let x_full = array![
+            [1.0, -1.20, -0.20],
+            [1.0, -0.40, 0.60],
+            [1.0, 0.10, 1.10],
+            [1.0, 0.70, 1.70],
+            [1.0, 1.30, 2.30],
+        ];
+        let x_reduced = array![
+            [1.0, -1.20],
+            [1.0, -0.40],
+            [1.0, 0.10],
+            [1.0, 0.70],
+            [1.0, 1.30],
+        ];
+        let beta_full = array![0.25, -0.50, 0.15];
+        let beta_reduced = array![beta_full[0] + beta_full[2], beta_full[1] + beta_full[2]];
+
+        let phi_full = link_firth_phi(StandardLink::Probit, &x_full, &beta_full);
+        let phi_reduced = link_firth_phi(StandardLink::Probit, &x_reduced, &beta_reduced);
+        assert!(
+            phi_full.is_finite(),
+            "probit Φ on rank-deficient design must be finite, got {phi_full}"
+        );
+        assert!(
+            (phi_full - phi_reduced).abs() < 1e-12,
+            "probit reduced |Uᵀ W U| form mismatch: full={phi_full}, reduced={phi_reduced}"
+        );
+
+        let op_full = build_link_firth_op(StandardLink::Probit, &x_full, &beta_full);
+        let grad_full = op_full.jeffreys_beta_gradient();
+        assert!(
+            grad_full.iter().all(|v| v.is_finite()),
+            "probit gradient on rank-deficient design must be finite: {grad_full:?}"
+        );
+        let hat_full = op_full.pirls_hat_diag();
+        let hat_reduced =
+            build_link_firth_op(StandardLink::Probit, &x_reduced, &beta_reduced).pirls_hat_diag();
+        for i in 0..hat_full.len() {
+            assert!(
+                (hat_full[i] - hat_reduced[i]).abs() < 1e-12,
+                "probit hat diagonal {i} mismatch on rank-deficient design: full={}, reduced={}",
+                hat_full[i],
+                hat_reduced[i]
+            );
+        }
+    }
+
     #[test]
     fn rank_deficient_and_explicit_reduced_designs_share_same_jeffreys_objective() {
         // Column 3 is exactly column 1 + column 2, so the original design is
@@ -3633,12 +3887,33 @@ mod tests {
 
     #[test]
     fn fisher_weight_jet5_probit_saturates_to_zero_in_tails() {
-        for &eta in &[12.0_f64, -12.0, 40.0, -40.0] {
+        // Past the point where the denominator Phi(1-Phi) underflows to zero,
+        // the weight and all derivatives are exactly zero (the saturated-tail
+        // convention shared with the inverse-link jet).
+        for &eta in &[40.0_f64, -40.0, 80.0, -80.0] {
             let (w, w1, w2, w3, w4) =
                 crate::mixture_link::fisher_weight_jet5(StandardLink::Probit, eta);
             assert!(
                 w == 0.0 && w1 == 0.0 && w2 == 0.0 && w3 == 0.0 && w4 == 0.0,
                 "probit Fisher weight jet must saturate to zero at eta={eta}; got \
+                 ({w}, {w1}, {w2}, {w3}, {w4})"
+            );
+        }
+        // In the moderate tail the denominator is still representable (the
+        // complement is taken as Phi(-eta), not the cancellation-prone
+        // `1 - Phi(eta)`), so the weight is a tiny strictly-positive finite
+        // number with finite derivatives. It must NOT prematurely round to zero.
+        for &eta in &[12.0_f64, -12.0] {
+            let (w, w1, w2, w3, w4) =
+                crate::mixture_link::fisher_weight_jet5(StandardLink::Probit, eta);
+            assert!(
+                w > 0.0
+                    && w.is_finite()
+                    && w1.is_finite()
+                    && w2.is_finite()
+                    && w3.is_finite()
+                    && w4.is_finite(),
+                "probit Fisher weight jet must be tiny-positive and finite at eta={eta}; got \
                  ({w}, {w1}, {w2}, {w3}, {w4})"
             );
         }
