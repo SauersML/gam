@@ -512,16 +512,6 @@ fn build_reduced_logslope_reparam(
     if p_m == 0 || p_g == 0 {
         return Ok(None);
     }
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/reduce_diag.txt")
-        {
-            writeln!(f, "ENTER p_m={p_m} p_g={p_g}").ok();
-        }
-    }
     if !marginal_baseline.is_finite()
         || !logslope_baseline.is_finite()
         || !probit_scale.is_finite()
@@ -576,21 +566,6 @@ fn build_reduced_logslope_reparam(
     let (evals, evecs) = stt
         .eigh(Side::Lower)
         .map_err(|e| format!("reduced logslope reparam: eigendecomposition failed: {e:?}"))?;
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/reduce_diag.txt")
-        {
-            writeln!(
-                f,
-                "SPECTRUM p_g={p_g} raw_scale={raw_scale:.4e}\n  stt(asc)={:?}",
-                evals.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>(),
-            )
-            .ok();
-        }
-    }
     // Tolerance relative to the RAW logslope self-Gram scale: a `C̃`-Gram
     // eigenvalue far below the raw logslope energy scale means that direction's
     // logslope column was almost entirely W-explained by the marginal span.
