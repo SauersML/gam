@@ -39,6 +39,8 @@ pub enum SurvivalError {
     NumericalFailure { reason: String },
     #[error("{reason}")]
     EventCodeInvalid { reason: String },
+    #[error("{reason}")]
+    EventDegenerate { reason: String },
     #[error("cause-specific survival block {block}: {source}")]
     CauseSpecificBlock {
         block: usize,
@@ -1478,6 +1480,13 @@ impl WorkingModelSurvival {
             return Err(SurvivalError::EventCodeInvalid {
                 reason: "a row cannot be simultaneously a target event and a competing event"
                     .to_string(),
+            });
+        }
+        if !event_target.iter().any(|&event| event > 0) {
+            return Err(SurvivalError::EventDegenerate {
+                reason:
+                    "single-hazard survival engine requires at least one target event; all rows are censored, so the likelihood has no event score and cannot identify the hazard"
+                        .to_string(),
             });
         }
         if age_entry
