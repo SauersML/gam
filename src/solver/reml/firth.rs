@@ -313,12 +313,24 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    pub(super) fn build_firth_dense_operator(
+    /// Link-aware wrapper around
+    /// [`FirthDenseOperator::build_with_observation_weights_for_link`]. The REML
+    /// callsites resolve the Fisher-weight link via `reml_robust_jeffreys_link`
+    /// and pass it here; `StandardLink::Logit` reproduces the historical
+    /// logit-pinned build byte-for-byte, and the link-general Jeffreys path
+    /// (probit, …) flows through with the resolved link.
+    pub(super) fn build_firth_dense_operator_for_link(
+        link: StandardLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: ndarray::ArrayView1<'_, f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
-        FirthDenseOperator::build_with_observation_weights(x_dense, eta, observation_weights)
+        FirthDenseOperator::build_with_observation_weights_for_link(
+            link,
+            x_dense,
+            eta,
+            observation_weights,
+        )
     }
 
     pub(super) fn firth_exact_tau_kernel(

@@ -52,16 +52,33 @@ use std::cell::RefCell;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-/// Only Binomial Logit supports Firth bias reduction.
+/// Binomial families whose standard link has a closed-form Fisher-weight jet
+/// (`fisher_weight_jet5`) support the Jeffreys/Firth term. This is the
+/// link-general set `{Logit, Probit}`; the canonical logit case is unchanged.
 #[inline]
 fn likelihood_spec_supports_firth(spec: &LikelihoodSpec) -> bool {
     matches!(
         (&spec.response, &spec.link),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::Logit)
+                | InverseLink::Standard(StandardLink::Probit),
         )
     )
+}
+
+/// Standard link to evaluate the Fisher working weight with for the Jeffreys
+/// term, for the families that support it (`{Logit, Probit}` binomial). Returns
+/// `None` for unsupported specs.
+#[inline]
+fn likelihood_spec_jeffreys_link(spec: &LikelihoodSpec) -> Option<StandardLink> {
+    match (&spec.response, &spec.link) {
+        (ResponseFamily::Binomial, InverseLink::Standard(link @ StandardLink::Logit))
+        | (ResponseFamily::Binomial, InverseLink::Standard(link @ StandardLink::Probit)) => {
+            Some(*link)
+        }
+        _ => None,
+    }
 }
 
 /// Typed error variants for the HMC / NUTS sampling module.
@@ -975,10 +992,19 @@ fn firth_jeffreys_logp_and_grad(
         return Ok((0.0, Array1::zeros(data.dim)));
     }
 
+    let jeffreys_link = likelihood_spec_jeffreys_link(&family.likelihood_spec()).ok_or_else(|| {
+        HmcError::FirthUnsupported {
+            reason: format!(
+                "Firth Jeffreys term has no Fisher-weight jet for {}",
+                family.likelihood_spec().pretty_name()
+            ),
+        }
+    })?;
     let op = if data.weights.iter().all(|&w| w == 1.0) {
-        FirthDenseOperator::build(data.x.as_ref(), eta)
+        FirthDenseOperator::build_for_link(jeffreys_link, data.x.as_ref(), eta)
     } else {
-        FirthDenseOperator::build_with_observation_weights(
+        FirthDenseOperator::build_with_observation_weights_for_link(
+            jeffreys_link,
             data.x.as_ref(),
             eta,
             data.weights.view(),
