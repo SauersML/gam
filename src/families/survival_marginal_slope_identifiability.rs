@@ -1850,17 +1850,41 @@ pub fn apply_compiled_map_to_designs(
             .collect()
     };
 
+    let time_penalties = pull_set(time_penalties, &v_time, "time")?;
+    let marginal_penalties = pull_set(marginal_penalties, &v_marg, "marginal")?;
+    let logslope_penalties = pull_set(logslope_penalties, &v_log, "logslope")?;
+    validate_block_penalty_shapes("time", time_exit_out.ncols(), &time_penalties)?;
+    validate_block_penalty_shapes("marginal", marg_out.ncols(), &marginal_penalties)?;
+    validate_block_penalty_shapes("logslope", log_out.ncols(), &logslope_penalties)?;
+
     Ok(CompiledSurvivalDesignsVMExact {
         time_design_entry: time_entry_out,
         time_design_exit: time_exit_out,
         time_design_derivative_exit: time_deriv_out,
         marginal_design: marg_out,
         logslope_design: log_out,
-        time_penalties: pull_set(time_penalties, &v_time, "time")?,
-        marginal_penalties: pull_set(marginal_penalties, &v_marg, "marginal")?,
-        logslope_penalties: pull_set(logslope_penalties, &v_log, "logslope")?,
+        time_penalties,
+        marginal_penalties,
+        logslope_penalties,
         t_full: t.clone(),
     })
+}
+
+fn validate_block_penalty_shapes(
+    block: &str,
+    width: usize,
+    penalties: &[PenaltyMatrix],
+) -> Result<(), String> {
+    for (idx, penalty) in penalties.iter().enumerate() {
+        let shape = penalty.shape();
+        if shape != (width, width) {
+            return Err(format!(
+                "apply_compiled_map_to_designs: {block} penalty {idx} must be {width}x{width}, got {}x{}",
+                shape.0, shape.1
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Run the identifiability compiler on the three survival parametric

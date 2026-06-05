@@ -577,6 +577,32 @@ pub fn canonicalize_for_identifiability_with_robust(
         return Err(CustomFamilyError::IdentifiabilityFailure { audit });
     }
 
+    let family_owned_geometry = specs.iter().any(|spec| spec.jacobian_callback.is_some());
+    if family_owned_geometry && !audit.dropped_columns.is_empty() {
+        let per_block_transform: Vec<Array2<f64>> = specs
+            .iter()
+            .map(|spec| Array2::<f64>::eye(spec.design.ncols()))
+            .collect();
+        let dropped_summary = audit
+            .dropped_columns
+            .iter()
+            .map(|drop| format!("{}[{}]", drop.block, drop.column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        log::info!(
+            "[CANON] width-preserving callback-owned geometry path: audit attributed \
+             dropped columns [{dropped_summary}], but at least one block owns its \
+             effective geometry via jacobian_callback; keeping raw block widths and \
+             deferring curvature on the weak directions to the robust/Firth path"
+        );
+        return Ok(CanonicalSpecs {
+            reduced_specs: specs.to_vec(),
+            per_block_transform,
+            audit,
+            used_channel_aware_audit: use_channel_aware,
+        });
+    }
+
     let mut per_block_transform: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
     let mut reduced_specs: Vec<ParameterBlockSpec> = Vec::with_capacity(specs.len());
 
