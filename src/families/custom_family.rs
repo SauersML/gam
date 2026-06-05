@@ -4018,6 +4018,28 @@ fn update_custom_outer_inner_cap_from_warm_start(
         return;
     };
     let full_budget = options.inner_max_cycles.max(1);
+    // Under the universal under-identification robustness (Firth/Jeffreys armed,
+    // i.e. `RobustIdentification::Force`/`Auto`), the H_Φ-augmented outer surface
+    // is steeper, so the outer optimizer's first proposed step lands farther from
+    // the previous iterate. The adaptive cap below sizes line-search trial inner
+    // solves at roughly the PREVIOUS accepted iterate's cycle count; a far trial
+    // ρ then needs more cycles than that to re-converge β̂(ρ), so it returns a
+    // non-converged β whose outer cost is off by O(0.1–1) — orders of magnitude
+    // above the Strong-Wolfe sufficient-decrease tolerance. The line search reads
+    // that inner-solve inconsistency as objective noise and stalls at iteration 1
+    // (FD-verified: the analytic outer gradient is exact at every ACCEPTED iterate
+    // to ~1e-8, ON and OFF alike; the residual is purely line-search cost
+    // inconsistency from a too-tight trial inner cap). Give the robust path the
+    // full inner budget at every trial so line-search costs are consistent. No-op
+    // when robustness is OFF (released path keeps the adaptive cap byte-for-byte).
+    let firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
+        options.robust_identification,
+    )
+    .firth_general;
+    if firth_armed {
+        outer_cap.store(full_budget, Ordering::Relaxed);
+        return;
+    }
     let Some(cached_inner) = warm_start.cached_inner.as_ref() else {
         outer_cap.store(full_budget, Ordering::Relaxed);
         return;
