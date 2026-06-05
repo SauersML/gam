@@ -26,9 +26,20 @@
 //! is gated upstream by `RobustConfig` (default OFF), so it never runs in the
 //! released solver until a caller opts in.
 
-use crate::linalg::faer_ndarray::FaerCholesky;
+use crate::linalg::faer_ndarray::FaerEigh;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
+
+/// Relative floor on a reduced-information eigenvalue, as a fraction of the
+/// dominant (identified) curvature `λ_max`. Negligible on data-identified
+/// directions (whose curvature is `O(n) · λ_max`-scale), positive on separating
+/// directions, keeping the Jeffreys log-det finite even when the observed
+/// information is indefinite at an off-mode trial point.
+const REDUCED_INFO_RELATIVE_FLOOR: f64 = 1e-10;
+
+/// Absolute floor for the degenerate case where every reduced eigenvalue is
+/// (near) zero, so `λ_max ≈ 0` cannot scale the relative floor.
+const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 
 /// Orthonormal basis of one block's Jeffreys span.
 ///
@@ -143,27 +154,47 @@ where
     if m == 0 {
         return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
     }
-    // H_id = Z_J^T H Z_J  (m x m reduced Fisher information).
+    // H_id = Z_J^T H Z_J  (m x m reduced information on the Jeffreys span).
     let hz = h_joint.dot(&z_j);
     let h_id = z_j.t().dot(&hz);
-    // Symmetrize defensively; the reduced curvature should be SPD on the
-    // under-identified span (that is the whole point — Jeffreys supplies the
-    // missing curvature), but observed-information round-off can break exact
-    // symmetry.
+    // Symmetrize defensively (observed-information round-off can break exact
+    // symmetry).
     let mut h_id_sym = Array2::<f64>::zeros((m, m));
     for i in 0..m {
         for j in 0..m {
             h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
         }
     }
-    let chol = h_id_sym.cholesky(Side::Lower).map_err(|e| {
-        format!("joint_jeffreys_term: reduced Fisher information not SPD on under-identified span ({e}); orthogonalization should remove any structural confound before Jeffreys is applied")
-    })?;
-    // Phi = 1/2 log|H_id| = sum_i ln L_ii.
-    let phi = chol.diag().iter().map(|d| d.abs().ln()).sum::<f64>();
-    // H_id^{-1} via Cholesky solve against the identity.
-    let eye = Array2::<f64>::eye(m);
-    let h_id_inv = chol.solve_mat(&eye);
+    // FULL-SPAN ROBUSTNESS. With the Jeffreys span equal to the FULL identifiable
+    // coefficient space, `H_id` is the (reduced) observed information over every
+    // direction. For non-canonical links (e.g. probit) the observed information
+    // need NOT be PSD away from the mode, so a plain Cholesky would fail at
+    // off-mode trial points and reject every outer seed. The Jeffreys prior is
+    // `Φ = ½ log det I(β)` with `I` the EXPECTED (PSD) Fisher information; we
+    // realise that here through the symmetric eigendecomposition, flooring each
+    // eigenvalue at a tiny absolute ridge so `Φ` is the log-volume of the
+    // POSITIVE curvature and the reduced inverse is the floored (pseudo-)inverse.
+    // On an identified direction the data's O(n) curvature dwarfs the floor, so
+    // the value, gradient and curvature are the exact Jeffreys quantities there;
+    // a genuinely separating direction has near-zero curvature, where the floor
+    // simply keeps `Φ` finite while the `H_Φ` curvature below grows to bound it.
+    let (evals, evecs) = h_id_sym
+        .eigh(Side::Lower)
+        .map_err(|e| format!("joint_jeffreys_term: reduced-information eigendecomposition failed: {e}"))?;
+    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+    // Absolute floor relative to the dominant identified curvature: negligible on
+    // identified directions (O(n)), positive on separating ones.
+    let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
+    let mut phi = 0.0_f64;
+    // h_id_inv = V diag(1/max(λ,floor)) Vᵀ  (floored symmetric pseudo-inverse).
+    let mut inv_diag = Array1::<f64>::zeros(m);
+    for (i, &lam) in evals.iter().enumerate() {
+        let lam_floored = lam.max(floor);
+        phi += 0.5 * lam_floored.ln();
+        inv_diag[i] = 1.0 / lam_floored;
+    }
+    let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
+    let h_id_inv = scaled.dot(&evecs.t());
 
     // Gradient: grad[k] = 1/2 tr(H_id^{-1} Z_J^T Hdot[e_k] Z_J).
     // For the inner-Newton dense path the Hessian is beta-dependent through the
