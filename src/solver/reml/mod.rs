@@ -19,6 +19,7 @@ pub(crate) mod eval;
 mod firth;
 pub(super) mod hyper;
 mod inner_strategy;
+pub(crate) mod jeffreys_subspace;
 pub(crate) mod penalty_logdet;
 pub(crate) mod rho_prior_eval;
 pub(crate) mod runtime;

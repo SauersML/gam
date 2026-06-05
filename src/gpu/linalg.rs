@@ -299,52 +299,6 @@ fn stitch_batched<L>(
     Some(out)
 }
 
-#[cfg(target_os = "linux")]
-#[must_use]
-pub(crate) fn startup_calibrate_gemm_crossover_flops(ordinal: usize) -> Option<usize> {
-    use std::time::Instant;
-
-    const SIZES: [usize; 5] = [64, 96, 128, 192, 256];
-    for size in SIZES {
-        let a = Array2::<f64>::from_shape_fn((size, size), |(i, j)| {
-            ((i * 17 + j * 31 + 1) % 97) as f64 / 97.0
-        });
-        let b = Array2::<f64>::from_shape_fn((size, size), |(i, j)| {
-            ((i * 19 + j * 23 + 3) % 89) as f64 / 89.0
-        });
-
-        let cpu_start = Instant::now();
-        let cpu = a.dot(&b);
-        let cpu_elapsed = cpu_start.elapsed();
-        if cpu_elapsed.is_zero() {
-            continue;
-        }
-
-        let gpu_start = Instant::now();
-        let gpu = super::blas::gemm_on_ordinal_cuda(ordinal, a.view(), b.view(), false, false)?;
-        let gpu_elapsed = gpu_start.elapsed();
-        if gpu_elapsed.is_zero() || gpu.dim() != cpu.dim() {
-            continue;
-        }
-        let center = (size / 2, size / 2);
-        if (gpu[center] - cpu[center]).abs() > 1.0e-8 * cpu[center].abs().max(1.0) {
-            continue;
-        }
-        if gpu_elapsed < cpu_elapsed {
-            return Some(
-                (DispatchOp::Gemm {
-                    m: size,
-                    n: size,
-                    k: size,
-                })
-                .flops()
-                .min(usize::MAX as u128) as usize,
-            );
-        }
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Dispatch entry points. Each takes views to keep the call site allocation-
 // free and returns Some(result) iff the GPU actually produced one. The CPU

@@ -68,7 +68,6 @@ pub struct TopologyAutoSelector {
     pub candidates: Vec<AutoTopologyKind>,
     pub score_scale: TopologyScoreScale,
     pub latent: Option<String>,
-    pub screen_survivor_count: usize,
 }
 
 impl TopologyAutoSelector {
@@ -77,7 +76,6 @@ impl TopologyAutoSelector {
             candidates: candidates.unwrap_or_else(AutoTopologyKind::all),
             score_scale: TopologyScoreScale::PerEffectiveDim,
             latent: None,
-            screen_survivor_count: 2,
         }
     }
 
@@ -141,40 +139,12 @@ impl TopologyAutoSelector {
                     .ok_or_else(|| "topology_auto_selector.latent must be a string".to_string())
             })
             .transpose()?;
-        let screen_survivor_count = match obj.get("screen_survivor_count") {
-            None => 2,
-            Some(value) => {
-                let raw = value.as_u64().ok_or_else(|| {
-                    "topology_auto_selector.screen_survivor_count must be a positive integer"
-                        .to_string()
-                })?;
-                if raw == 0 {
-                    return Err(
-                        "topology_auto_selector.screen_survivor_count must be positive".to_string(),
-                    );
-                }
-                usize::try_from(raw).map_err(|_| {
-                    "topology_auto_selector.screen_survivor_count is too large".to_string()
-                })?
-            }
-        };
         Ok(Self {
             candidates,
             score_scale,
             latent,
-            screen_survivor_count,
         })
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct TopologyAutoScreeningEvidence {
-    pub topology_name: String,
-    pub raw_reml: f64,
-    pub null_dim: f64,
-    pub null_space_logdet: Option<f64>,
-    pub effective_dim: f64,
-    pub n_obs: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -199,24 +169,6 @@ pub struct TopologyAutoRankedFit<FitHandle> {
 }
 
 #[derive(Debug, Clone)]
-pub struct TopologyAutoRankedScreen {
-    pub candidate_order: usize,
-    pub kind: AutoTopologyKind,
-    pub topology_name: String,
-    pub tk_score: f64,
-    pub raw_reml: f64,
-    pub effective_dim: f64,
-    pub n_obs: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct TopologyAutoScreeningResult {
-    pub ranked: Vec<TopologyAutoRankedScreen>,
-    pub survivor_kinds: Vec<AutoTopologyKind>,
-    pub errors: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct TopologyAutoSelectorResult<FitHandle> {
     pub ranked: Vec<TopologyAutoRankedFit<FitHandle>>,
     pub winner_index: usize,
@@ -228,17 +180,17 @@ impl<FitHandle> TopologyAutoSelectorResult<FitHandle> {
     }
 }
 
-pub fn screen_topology_candidates<ScreenErr>(
+pub fn select_topology_with_fit<FitHandle, FitErr>(
     selector: &TopologyAutoSelector,
-    mut screen_one: impl FnMut(AutoTopologyKind) -> Result<TopologyAutoScreeningEvidence, ScreenErr>,
-) -> Result<TopologyAutoScreeningResult, String>
+    mut fit_one: impl FnMut(AutoTopologyKind) -> Result<TopologyAutoFitEvidence<FitHandle>, FitErr>,
+) -> Result<TopologyAutoSelectorResult<FitHandle>, String>
 where
-    ScreenErr: ToString,
+    FitErr: ToString,
 {
     let mut ranked = Vec::with_capacity(selector.candidates.len());
     let mut errors = Vec::new();
-    for (candidate_order, candidate) in selector.candidates.iter().enumerate() {
-        match screen_one(*candidate) {
+    for candidate in &selector.candidates {
+        match fit_one(*candidate) {
             Ok(evidence) => {
                 let tk_score = tk_normalized_score(
                     evidence.raw_reml,
@@ -248,14 +200,13 @@ where
                     evidence.n_obs,
                     selector.score_scale,
                 )?;
-                ranked.push(TopologyAutoRankedScreen {
-                    candidate_order,
-                    kind: *candidate,
+                ranked.push(TopologyAutoRankedFit {
                     topology_name: evidence.topology_name,
                     tk_score,
                     raw_reml: evidence.raw_reml,
                     effective_dim: evidence.effective_dim,
                     n_obs: evidence.n_obs,
+                    fit_handle: evidence.fit_handle,
                 });
             }
             Err(err) => errors.push(format!("{}: {}", candidate.as_str(), err.to_string())),
@@ -263,7 +214,7 @@ where
     }
     if ranked.is_empty() {
         return Err(format!(
-            "TopologyAutoSelector found no screenable topology candidates{}",
+            "TopologyAutoSelector found no fittable topology candidates{}",
             if errors.is_empty() {
                 String::new()
             } else {
@@ -271,126 +222,22 @@ where
             }
         ));
     }
+    // Sign convention (issue #396, see `solver::reml_compare`): `tk_score` is a
+    // minimised TK / REML cost (penalised negative log marginal likelihood plus
+    // the null-space Laplace correction), so LOWER is better. Sort ASCENDING and
+    // take index 0 as the winner — the sibling selector in `solver::evidence`
+    // and the REML comparator both sort ascending for the same reason. The
+    // previous descending sort here treated the cost as a log-evidence and
+    // therefore selected the WORST-fitting topology.
     ranked.sort_by(|lhs, rhs| {
-        crate::solver::priority_search::compare_min_finite_scores(
-            lhs.tk_score,
-            rhs.tk_score,
-            || lhs.candidate_order.cmp(&rhs.candidate_order),
-        )
+        lhs.tk_score
+            .partial_cmp(&rhs.tk_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let survivor_count = selector.screen_survivor_count.min(ranked.len()).max(1);
-    let survivor_kinds = ranked
-        .iter()
-        .take(survivor_count)
-        .map(|candidate| candidate.kind)
-        .collect();
-    Ok(TopologyAutoScreeningResult {
-        ranked,
-        survivor_kinds,
-        errors,
-    })
-}
-
-fn rank_topology_fits<FitHandle>(
-    selector: &TopologyAutoSelector,
-    evidence_rows: Vec<TopologyAutoFitEvidence<FitHandle>>,
-) -> Result<TopologyAutoSelectorResult<FitHandle>, String> {
-    let mut ranked_with_order = Vec::with_capacity(evidence_rows.len());
-    for (candidate_order, evidence) in evidence_rows.into_iter().enumerate() {
-        let tk_score = tk_normalized_score(
-            evidence.raw_reml,
-            evidence.null_dim,
-            evidence.null_space_logdet,
-            evidence.effective_dim,
-            evidence.n_obs,
-            selector.score_scale,
-        )?;
-        ranked_with_order.push((
-            candidate_order,
-            TopologyAutoRankedFit {
-                topology_name: evidence.topology_name,
-                tk_score,
-                raw_reml: evidence.raw_reml,
-                effective_dim: evidence.effective_dim,
-                n_obs: evidence.n_obs,
-                fit_handle: evidence.fit_handle,
-            },
-        ));
-    }
-    ranked_with_order.sort_by(|(lhs_order, lhs), (rhs_order, rhs)| {
-        crate::solver::priority_search::compare_min_finite_scores(
-            lhs.tk_score,
-            rhs.tk_score,
-            || lhs_order.cmp(&rhs_order),
-        )
-    });
-    let ranked = ranked_with_order
-        .into_iter()
-        .map(|(_, ranked)| ranked)
-        .collect();
     Ok(TopologyAutoSelectorResult {
         ranked,
         winner_index: 0,
     })
-}
-
-pub fn select_topology_with_screening<FitHandle, ScreenErr, FitErr>(
-    selector: &TopologyAutoSelector,
-    screen_one: impl FnMut(AutoTopologyKind) -> Result<TopologyAutoScreeningEvidence, ScreenErr>,
-    mut fit_one: impl FnMut(AutoTopologyKind) -> Result<TopologyAutoFitEvidence<FitHandle>, FitErr>,
-) -> Result<TopologyAutoSelectorResult<FitHandle>, String>
-where
-    ScreenErr: ToString,
-    FitErr: ToString,
-{
-    let screen = screen_topology_candidates(selector, screen_one)?;
-    let mut evidence_rows = Vec::with_capacity(screen.survivor_kinds.len());
-    let mut errors = screen.errors;
-    for candidate in screen.survivor_kinds {
-        match fit_one(candidate) {
-            Ok(evidence) => evidence_rows.push(evidence),
-            Err(err) => errors.push(format!("{}: {}", candidate.as_str(), err.to_string())),
-        }
-    }
-    if evidence_rows.is_empty() {
-        return Err(format!(
-            "TopologyAutoSelector found no fittable topology candidates{}",
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", errors.join("; "))
-            }
-        ));
-    }
-    rank_topology_fits(selector, evidence_rows)
-}
-
-pub fn select_topology_with_fit<FitHandle, FitErr>(
-    selector: &TopologyAutoSelector,
-    mut fit_one: impl FnMut(AutoTopologyKind) -> Result<TopologyAutoFitEvidence<FitHandle>, FitErr>,
-) -> Result<TopologyAutoSelectorResult<FitHandle>, String>
-where
-    FitErr: ToString,
-{
-    let mut evidence_rows = Vec::with_capacity(selector.candidates.len());
-    let mut errors = Vec::new();
-    for candidate in &selector.candidates {
-        match fit_one(*candidate) {
-            Ok(evidence) => evidence_rows.push(evidence),
-            Err(err) => errors.push(format!("{}: {}", candidate.as_str(), err.to_string())),
-        }
-    }
-    if evidence_rows.is_empty() {
-        return Err(format!(
-            "TopologyAutoSelector found no fittable topology candidates{}",
-            if errors.is_empty() {
-                String::new()
-            } else {
-                format!(" ({})", errors.join("; "))
-            }
-        ));
-    }
-    rank_topology_fits(selector, evidence_rows)
 }
 
 pub fn tk_normalized_score(
