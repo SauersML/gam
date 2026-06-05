@@ -19685,6 +19685,7 @@ mod tests {
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
+    use crate::matrix::FactorizedSystem;
     use ndarray::{Axis, array};
     use rand::RngExt;
     use rand::SeedableRng;
