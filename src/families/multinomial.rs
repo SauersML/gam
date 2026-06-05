@@ -131,6 +131,12 @@ fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
     total_rho_dim <= MULTINOMIAL_EXACT_OUTER_HESSIAN_MAX_DIM
 }
 
+/// Logit magnitude beyond which fitted probabilities are saturated at ordinary
+/// double precision diagnostic scale. If a multinomial Newton solve exhausts
+/// its iteration budget at this scale, the returned iterate is a separation
+/// artifact, not a finite MLE.
+const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
+
 /// Inputs to [`fit_penalized_multinomial`].
 ///
 /// The penalty matrix `S` is shared across classes; per-class smoothing
@@ -288,6 +294,17 @@ pub fn fit_penalized_multinomial(
         &likelihood,
         "fit_penalized_multinomial",
     )?;
+
+    let max_abs_eta = fit
+        .eta
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    if !fit.converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
+        return Err(EstimationError::PerfectSeparationDetected {
+            iteration: fit.iterations,
+            max_abs_eta,
+        });
+    }
 
     let fitted_probabilities = likelihood.probabilities(fit.eta.view());
 
@@ -829,6 +846,48 @@ mod fisher_override_tests {
         assert!(
             !multinomial_formula_use_outer_hessian(8),
             "D=8 smooth-by-factor multinomial fits must avoid the O(D^2) dense outer Hessian"
+        );
+    }
+
+    #[test]
+    fn fixed_lambda_multinomial_reports_complete_separation() {
+        let n = 90;
+        let design = Array2::<f64>::from_shape_fn((n, 2), |(row, col)| match col {
+            0 => 1.0,
+            _ => -3.0 + 6.0 * (row as f64) / ((n - 1) as f64),
+        });
+        let mut y = Array2::<f64>::zeros((n, 3));
+        for row in 0..n {
+            let x = design[[row, 1]];
+            let class = if x < -1.0 {
+                0
+            } else if x > 1.0 {
+                1
+            } else {
+                2
+            };
+            y[[row, class]] = 1.0;
+        }
+        let penalty = Array2::<f64>::zeros((2, 2));
+        let lambdas = Array1::<f64>::zeros(2);
+        let err = fit_penalized_multinomial(MultinomialFitInputs {
+            design: design.view(),
+            y_one_hot: y.view(),
+            penalty: penalty.view(),
+            lambdas: lambdas.view(),
+            row_weights: None,
+            fisher_w_override: None,
+            max_iter: 80,
+            tol: 1.0e-12,
+        })
+        .expect_err("complete softmax separation must be a hard diagnostic");
+        assert!(
+            matches!(err, EstimationError::PerfectSeparationDetected { .. }),
+            "expected PerfectSeparationDetected, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("separation"),
+            "diagnostic should mention separation, got {err}"
         );
     }
 
