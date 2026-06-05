@@ -22400,6 +22400,60 @@ fn build_joint_jeffreys_subspace(
     Ok(Some(z_joint))
 }
 
+/// CHEAP, matrix-free conditioning pre-check: can the always-on Jeffreys term be
+/// PROVABLY skipped at this working point WITHOUT forming the dense joint Hessian
+/// `H` or running the `O(p³)` reduced eigendecomposition?
+///
+/// This is the perf gate in front of the expensive `custom_family_joint_jeffreys_*`
+/// formation. On the FULL span (`Z_J = I`) the reduced information is `H_id = H`,
+/// so the conditioning gate only needs `H`'s extreme eigenvalues — and those can
+/// be bounded conservatively from a few Hessian-vector products against the SAME
+/// `joint_hessian_source` operator the inner Newton already built (matrix-free on
+/// the large-`p` path, dense otherwise). When the conservative bounds clear both
+/// gates with a safe margin (see `jeffreys_term_skippable_via_matvec`), the exact
+/// gate is CERTAIN to return the zero term, so the caller skips the dense `H`
+/// materialization, the `Z_JᵀHZ_J` build, the eigendecomposition, the `∇Φ`/`H_Φ`
+/// assembly, and the Q1 outer drift entirely — returning the EXACT-ZERO term,
+/// byte-identical to the gated-off dense path. Returns `false` (never skip)
+/// whenever the cheap bounds are unresolved or merely near the gate, so any fit
+/// where the term might bite still flows to the exact formation.
+///
+/// Matrix-free preservation: the pre-check issues only `O(p·k)` (`k≤12`) matvecs
+/// through `source` and forms nothing dense at `p`-scale; on a well-conditioned
+/// large-`p` matrix-free fit (the common case) it returns `true` and NOTHING
+/// dense is ever built — preserving the matrix-free path the dense `H_id`
+/// formation was defeating. Only on a genuinely near-separating large-`p` fit
+/// (rare) does it return `false` and fall through to the inherent `O(p²)` dense
+/// `H_id`/`H_Φ` formation, where that cost is justified.
+fn jeffreys_term_skippable_for_source(
+    source: &JointHessianSource,
+    total_p: usize,
+    diagonal_ridge: f64,
+) -> Result<bool, String> {
+    // Below the dense-eigh-is-cheap threshold the inner `jeffreys_term_skippable_via_matvec`
+    // short-circuits to `false` anyway; bail early so small fits (e.g. BMS p≈51)
+    // pay nothing for the pre-check and run the exact dense path unchanged.
+    if total_p < crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM {
+        return Ok(false);
+    }
+    // Matrix-free Hessian-vector product against the SAME observed information
+    // the inner Newton uses. The `joint_jeffreys_term` reduced information is
+    // `Z_JᵀHZ_J` with `Z_J = I`, i.e. exactly `H`, so this matvec IS the
+    // reduced-information apply the gate's eigendecomposition would otherwise
+    // consume. The tiny `diagonal_ridge` the inner solver adds to keep `H` apply
+    // well-posed is NOT folded in here: it can only RAISE eigenvalues, so the
+    // unridged `H` is a lower bound on the ridged spectrum — skipping on the
+    // unridged bounds is conservative w.r.t. the ridged operator the solver runs.
+    let _ = diagonal_ridge;
+    let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
+        match source {
+            JointHessianSource::Dense(matrix) => Ok(matrix.dot(v)),
+            JointHessianSource::Operator { apply, .. } => apply(v),
+        }
+    };
+    crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(hv, total_p)
+}
+
 /// Evaluate ONLY the Jeffreys objective value `Phi = 1/2 log|Z_J^T H Z_J|` at
 /// the current working point. Cheaper than the full term (no directional
 /// derivatives), used to keep the trust-region accept/reject objective
