@@ -538,8 +538,6 @@ fn clean_fit_invariance_survival_lognormal() {
 /// coefficient / fitted-probability / edf deltas are within the same tight
 /// `assert_zero_downside`-style band.
 #[test]
-#[ignore = "blocked: MultinomialFitInputs does not yet expose robust_identification; \
-            cannot request FirthOnly on the multinomial path — would assert vacuously"]
 fn clean_fit_invariance_multinomial_softmax() {
     init_parallelism();
     // Intentionally empty: see the doc comment. Filling this in before the flag
