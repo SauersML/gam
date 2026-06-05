@@ -400,17 +400,17 @@ fn clean_fit_invariance_gamlss_location_scale() {
         for i in 0..n {
             tg[[i, x_idx]] = xs[i];
         }
-        let mean_d = build_term_collection_design(tg.view(), &ls.meanspec_resolved)
+        let mean_d = build_term_collection_design(tg.view(), &ls.fit.meanspec_resolved)
             .expect("rebuild mean design");
-        let scale_d = build_term_collection_design(tg.view(), &ls.noisespec_resolved)
+        let scale_d = build_term_collection_design(tg.view(), &ls.fit.noisespec_resolved)
             .expect("rebuild log-sigma design");
         let beta_mean = unified
-            .block_by_role(gam::types::BlockRole::Location)
+            .block_by_role(gam::estimate::BlockRole::Location)
             .expect("location block")
             .beta
             .clone();
         let beta_scale = unified
-            .block_by_role(gam::types::BlockRole::Scale)
+            .block_by_role(gam::estimate::BlockRole::Scale)
             .expect("scale block")
             .beta
             .clone();
