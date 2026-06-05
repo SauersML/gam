@@ -3182,9 +3182,7 @@ impl<'a> RemlState<'a> {
             };
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
-            let firth_op = if let Some(jeffreys_link) =
-                reml_robust_jeffreys_link(&self.config)
-            {
+            let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
                 } else {

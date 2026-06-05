@@ -98,7 +98,9 @@ fn make_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let b = 0.7 * rng.normal();
         let eta = (B0 + B1 * a + B2 * b).clamp(-2.2, 2.2);
         let mu = logistic(eta);
-        let yi = rng.beta(mu * PHI, (1.0 - mu) * PHI).clamp(1.0e-6, 1.0 - 1.0e-6);
+        let yi = rng
+            .beta(mu * PHI, (1.0 - mu) * PHI)
+            .clamp(1.0e-6, 1.0 - 1.0e-6);
         x1.push(a);
         x2.push(b);
         y.push(yi);
@@ -110,11 +112,7 @@ fn encode(y: &[f64], x1: &[f64], x2: &[f64]) -> gam::inference::data::EncodedDat
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows: Vec<csv::StringRecord> = (0..y.len())
         .map(|i| {
-            csv::StringRecord::from(vec![
-                y[i].to_string(),
-                x1[i].to_string(),
-                x2[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![y[i].to_string(), x1[i].to_string(), x2[i].to_string()])
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode beta dataset")
@@ -172,8 +170,8 @@ fn beta_reported_phi_is_estimated_at_the_fitted_mean_not_the_null_predictor() {
         family: Some("beta".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ x1 + x2", &ds, &cfg).expect("beta-regression parametric fit succeeds");
+    let result = fit_from_formula("y ~ x1 + x2", &ds, &cfg)
+        .expect("beta-regression parametric fit succeeds");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the beta family");
     };

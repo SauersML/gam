@@ -1472,8 +1472,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // re-solve, so the reported φ (which flows into `EstimatedBetaPhi`, the
     // embedded `Beta { phi }`, `dispersion`, and every SE) always equals
     // `estimate_beta_phi_from_eta(final_eta)`.
-    if refine_dispersion_at_converged_eta
-        && working_model.likelihood.scale.beta_phi_is_estimated()
+    if refine_dispersion_at_converged_eta && working_model.likelihood.scale.beta_phi_is_estimated()
     {
         // The mean moves between passes (φ feeds back through the digamma
         // score), so allow a few more passes than the scale-free Gamma case;
@@ -1489,15 +1488,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 priorweights,
             );
             let prior_phi = working_model.likelihood.fixed_phi().unwrap_or(1.0);
-            let rel_change =
-                (refreshed_phi - prior_phi).abs() / prior_phi.max(f64::MIN_POSITIVE);
+            let rel_change = (refreshed_phi - prior_phi).abs() / prior_phi.max(f64::MIN_POSITIVE);
             // Install the refreshed φ (updates BOTH the `Beta { phi }` family
             // variant every weight/deviance expression reads and the
             // `EstimatedBetaPhi` scale metadata) and re-arm the lock so a
             // following re-solve's `update_with_curvature` does not overwrite
             // this deliberately chosen value with a fresh cold estimate.
-            working_model.likelihood =
-                working_model.likelihood.clone().with_beta_phi(refreshed_phi);
+            working_model.likelihood = working_model
+                .likelihood
+                .clone()
+                .with_beta_phi(refreshed_phi);
             working_model.beta_phi_locked = true;
             if rel_change <= PHI_REFRESH_REL_TOL {
                 // Converged: the just-installed φ matches (to tolerance) the φ

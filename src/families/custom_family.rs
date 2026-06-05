@@ -14137,9 +14137,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // first trust-region accept/reject compares like-for-like against the
         // Jeffreys-augmented trial objectives below. No-op when the flag is OFF.
         if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-            let phi0 = custom_family_joint_jeffreys_value(
-                family, &states, specs, &ranges, z_joint,
-            );
+            let phi0 = custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             current_penalty += phi0;
             lastobjective = -current_log_likelihood + current_penalty;
         }
@@ -14439,19 +14437,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // this the head-of-cycle KKT exit (`current_stationarity_residual ≤
             // residual_tol`) can never fire on the near-separating span, even
             // when the iterate is the Firth optimum. No-op when the flag is OFF.
-            let head_kkt_gradient: Option<Array1<f64>> =
-                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                    match custom_family_joint_jeffreys_term(
-                        family, &states, specs, &ranges, z_joint,
-                    )? {
-                        Some((_phi, grad_phi, _hphi)) if grad_phi.len() == grad_joint.len() => {
-                            Some(&grad_joint + &grad_phi)
-                        }
-                        _ => None,
+            let head_kkt_gradient: Option<Array1<f64>> = if let Some(z_joint) =
+                joint_jeffreys_subspace.as_ref()
+            {
+                match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
+                    Some((_phi, grad_phi, _hphi)) if grad_phi.len() == grad_joint.len() => {
+                        Some(&grad_joint + &grad_phi)
                     }
-                } else {
-                    None
-                };
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
                 head_kkt_gradient.as_ref().unwrap_or(&grad_joint),
                 &states,
@@ -14784,11 +14781,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // byte-identical to the released solver.
                         let mut spectral_rhs = rhs.clone();
                         if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                            if let Some((_phi, grad_phi, hphi)) =
-                                custom_family_joint_jeffreys_term(
-                                    family, &states, specs, &ranges, z_joint,
-                                )?
-                            {
+                            if let Some((_phi, grad_phi, hphi)) = custom_family_joint_jeffreys_term(
+                                family, &states, specs, &ranges, z_joint,
+                            )? {
                                 lhs_true += &hphi;
                                 spectral_rhs += &grad_phi;
                             }
@@ -15585,9 +15580,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // post-accept baseline matches the augmented objective the next
             // cycle's trial points are compared against. No-op when flag OFF.
             if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                current_penalty += custom_family_joint_jeffreys_value(
-                    family, &states, specs, &ranges, z_joint,
-                );
+                current_penalty +=
+                    custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             }
             lastobjective = -current_log_likelihood + current_penalty;
             let accepted_step_inf = states
@@ -15619,19 +15613,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let Some(gradient) = cached_joint_gradient.as_ref() else {
                 break;
             };
-            let jeffreys_augmented_gradient: Option<Array1<f64>> =
-                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                    match custom_family_joint_jeffreys_term(
-                        family, &states, specs, &ranges, z_joint,
-                    )? {
-                        Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
-                            Some(gradient + &grad_phi)
-                        }
-                        _ => None,
+            let jeffreys_augmented_gradient: Option<Array1<f64>> = if let Some(z_joint) =
+                joint_jeffreys_subspace.as_ref()
+            {
+                match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
+                    Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
+                        Some(gradient + &grad_phi)
                     }
-                } else {
-                    None
-                };
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let residual_gradient = jeffreys_augmented_gradient.as_ref().unwrap_or(gradient);
             let residual = exact_newton_joint_stationarity_inf_norm_from_gradient(
                 residual_gradient,
@@ -21507,13 +21500,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             inner.joint_workspace.clone(),
             eval_mode,
         )?,
-        custom_family_outer_jeffreys_hphi(
-            family,
-            &inner.block_states,
-            specs,
-            &ranges,
-            options,
-        )?,
+        custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges, options)?,
     )?;
 
     Ok(eval_result)
@@ -22233,9 +22220,10 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     ranges: &[(usize, usize)],
     options: &BlockwiseFitOptions,
 ) -> Result<Option<Array2<f64>>, String> {
-    let robust_firth_armed =
-        crate::solver::robust_identification::RobustConfig::from_policy(options.robust_identification)
-            .firth_general;
+    let robust_firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
+        options.robust_identification,
+    )
+    .firth_general;
     if !robust_firth_armed {
         return Ok(None);
     }

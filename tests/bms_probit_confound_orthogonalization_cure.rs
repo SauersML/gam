@@ -497,7 +497,10 @@ fn force_on_reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
         let coords = rest.split_once(']').map(|(c, _)| c).unwrap_or("");
         let max_log_lambda = coords
             .split(',')
-            .filter_map(|tok| tok.split_once(':').and_then(|(_, v)| v.trim().parse::<f64>().ok()))
+            .filter_map(|tok| {
+                tok.split_once(':')
+                    .and_then(|(_, v)| v.trim().parse::<f64>().ok())
+            })
             .fold(0.0_f64, |acc, v| acc.max(v.abs()));
         assert!(
             max_log_lambda > 0.0 && max_log_lambda < 9.0,
@@ -515,7 +518,8 @@ fn force_on_reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
             on.all_finite && on.max_abs_marginal_beta < 6.0,
             "Force converged but did not bound the marginal coefficients: \
              max|β_m|={:.4e} finite={} (cure requires bounded O(1) β)",
-            on.max_abs_marginal_beta, on.all_finite,
+            on.max_abs_marginal_beta,
+            on.all_finite,
         );
         assert!(
             on.outer_gradient_norm.map(|g| g < 1e-2).unwrap_or(true),

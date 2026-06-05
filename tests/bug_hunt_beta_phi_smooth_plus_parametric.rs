@@ -103,11 +103,7 @@ fn beta_smooth_plus_parametric_recovers_slope_and_precision() {
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows: Vec<csv::StringRecord> = (0..N)
         .map(|i| {
-            csv::StringRecord::from(vec![
-                y[i].to_string(),
-                x1[i].to_string(),
-                x2[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![y[i].to_string(), x1[i].to_string(), x2[i].to_string()])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode beta dataset");
