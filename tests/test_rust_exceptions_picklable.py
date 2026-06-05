@@ -1,4 +1,5 @@
 import pickle
+from concurrent.futures import ProcessPoolExecutor
 
 import pytest
 
@@ -12,6 +13,12 @@ def _rust_module():
         if exc.__class__.__name__ == "RustExtensionUnavailableError":
             pytest.skip(str(exc))
         raise
+
+
+def _rust_exception_instance(name):
+    rust = _rust_module()
+    cls = getattr(rust, name)
+    return cls(f"{name} payload")
 
 
 @pytest.mark.parametrize(
@@ -48,3 +55,14 @@ def test_rust_exception_instances_are_importably_picklable(name):
 
     assert type(restored) is cls
     assert restored.args == original.args
+
+
+def test_rust_exception_instance_crosses_process_pool_boundary():
+    rust = _rust_module()
+    cls = getattr(rust, "IntegrationError")
+
+    with ProcessPoolExecutor(max_workers=1) as pool:
+        restored = pool.submit(_rust_exception_instance, "IntegrationError").result(timeout=10)
+
+    assert type(restored) is cls
+    assert restored.args == ("IntegrationError payload",)
