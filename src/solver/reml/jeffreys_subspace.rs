@@ -223,13 +223,17 @@ where
             return Ok(None);
         }
         w.scaled_add(-alpha, &q);
-        // Full reorthogonalization against the accumulated basis (classical GS,
-        // twice for numerical robustness at this tiny scale).
-        for _ in 0..2 {
+        // Full reorthogonalization against the accumulated basis (classical
+        // Gram–Schmidt, applied twice for numerical robustness at this tiny
+        // scale). `pass` indexes the two sweeps explicitly so there is no
+        // discarded loop binding.
+        let mut pass = 0usize;
+        while pass < 2 {
             for qi in basis.iter() {
                 let proj = qi.dot(&w);
                 w.scaled_add(-proj, qi);
             }
+            pass += 1;
         }
         alphas.push(alpha);
         let beta = w.dot(&w).sqrt();
@@ -984,5 +988,118 @@ mod tests {
         assert_eq!(phi, 0.0);
         assert!(grad.iter().all(|v| *v == 0.0));
         assert!(hphi.iter().all(|v| *v == 0.0));
+    }
+
+    // ---- cheap matrix-free conditioning pre-check ----
+
+    /// Build a diagonal-matvec closure for a synthetic spectrum (the joint
+    /// information on the full span is `H` itself, so a diagonal `H` exercises the
+    /// Lanczos bound against a known `[λ_min, λ_max]`).
+    fn diag_hv(diag: Vec<f64>) -> impl FnMut(&Array1<f64>) -> Result<Array1<f64>, String> {
+        move |v: &Array1<f64>| {
+            let mut out = Array1::<f64>::zeros(v.len());
+            for (i, &d) in diag.iter().enumerate() {
+                out[i] = d * v[i];
+            }
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn cheap_precheck_skips_clearly_well_conditioned_large_p() {
+        // A wide (p ≥ threshold) well-conditioned spectrum: every eigenvalue in
+        // [40, 100], so λ_min = 40 ≫ 8·1 (absolute margin) and the ratio 0.4 ≫
+        // 8·1e-8 (relative margin). The conservative Lanczos bounds must still
+        // clear both gates ⇒ skippable. This is the common large-p fast path the
+        // pre-check exists to make matrix-free-free of any dense formation.
+        let p = 200usize;
+        let mut diag = vec![70.0; p];
+        diag[0] = 40.0; // λ_min
+        diag[1] = 100.0; // λ_max
+        let skippable = jeffreys_term_skippable_via_matvec(diag_hv(diag), p).unwrap();
+        assert!(skippable, "clearly well-conditioned wide fit must be skippable");
+    }
+
+    #[test]
+    fn cheap_precheck_does_not_skip_near_separating() {
+        // One near-zero eigenvalue (λ_min = 1e-3) below the absolute gate (1.0):
+        // the term is genuinely needed here. The conservative bounds must NOT
+        // certify skippable, so the caller falls through to the exact formation.
+        let p = 200usize;
+        let mut diag = vec![50.0; p];
+        diag[7] = 1e-3; // near-separating direction
+        let skippable = jeffreys_term_skippable_via_matvec(diag_hv(diag), p).unwrap();
+        assert!(
+            !skippable,
+            "a near-separating direction must NOT be skipped (term is needed)"
+        );
+    }
+
+    #[test]
+    fn cheap_precheck_does_not_skip_below_size_threshold() {
+        // Small p: even a perfectly-conditioned spectrum is never pre-checked
+        // (the exact dense eigh is already cheap there). Guarantees the small-p
+        // BMS-style fits keep running the exact dense path unchanged.
+        let p = CHEAP_CONDITIONING_PRECHECK_MIN_DIM - 1;
+        let diag = vec![100.0; p];
+        let skippable = jeffreys_term_skippable_via_matvec(diag_hv(diag), p).unwrap();
+        assert!(!skippable, "below the size threshold the pre-check never skips");
+    }
+
+    #[test]
+    fn cheap_precheck_does_not_skip_marginal_absolute() {
+        // Absolutely marginal: λ_min = 2.0 clears the bare absolute gate (1.0) but
+        // NOT the 8× safety margin (needs ≥ 8). The conservative pre-check must
+        // refuse to skip even though the EXACT gate would skip — the asymmetric
+        // safety bias (false fall-through is cheap, false skip is fatal).
+        let p = 200usize;
+        let mut diag = vec![50.0; p];
+        diag[3] = 2.0;
+        let skippable = jeffreys_term_skippable_via_matvec(diag_hv(diag), p).unwrap();
+        assert!(
+            !skippable,
+            "λ_min within the 8× absolute margin must conservatively fall through"
+        );
+    }
+
+    #[test]
+    fn cheap_precheck_skip_implies_exact_gate_skips() {
+        // CONSISTENCY: wherever the cheap pre-check declares skippable, the EXACT
+        // conditioning gate on the same spectrum must also skip (return the zero
+        // term). This is the byte-identical-on-skip guarantee. Sweep a range of
+        // well-conditioned spectra and assert the implication.
+        let p = 150usize;
+        let z = Array2::<f64>::eye(p);
+        let hdir = |_d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(Array2::<f64>::zeros((p, p))))
+        };
+        for &lmin in &[10.0_f64, 25.0, 80.0, 200.0] {
+            let mut diag = vec![lmin * 4.0; p];
+            diag[0] = lmin;
+            let cheap_skip =
+                jeffreys_term_skippable_via_matvec(diag_hv(diag.clone()), p).unwrap();
+            if cheap_skip {
+                // The exact path on the same dense H must produce the zero term.
+                let mut h = Array2::<f64>::zeros((p, p));
+                for (i, &d) in diag.iter().enumerate() {
+                    h[[i, i]] = d;
+                }
+                let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
+                assert_eq!(phi, 0.0, "cheap-skip ⇒ exact phi must be zero (byte-identical)");
+                assert!(grad.iter().all(|v| *v == 0.0));
+                assert!(hphi.iter().all(|v| *v == 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn cheap_precheck_bails_on_nonfinite_matvec() {
+        // A matvec that returns non-finite values cannot certify conditioning ⇒
+        // the pre-check must return false (never skip on an unresolved estimate).
+        let p = 200usize;
+        let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
+            Ok(Array1::from_elem(v.len(), f64::NAN))
+        };
+        assert!(!jeffreys_term_skippable_via_matvec(hv, p).unwrap());
     }
 }
