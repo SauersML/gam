@@ -3895,7 +3895,6 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         &col_map,
         "resolved_termspec",
     )?;
-    let has_bounded_terms = termspec_has_bounded_terms(&spec);
     progress.set_stage("diagnose", "building diagnostic design");
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -3941,45 +3940,50 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             kronecker_penalty_system: None,
             kronecker_factored: None,
         };
-        let alo_result = if has_bounded_terms {
-            let fitted = fit_term_collection_forspec(
-                ds.values.view(),
-                y.view(),
-                weights.view(),
-                offset.view(),
-                &spec,
-                family,
-                &fit_options,
-            )
-            .map_err(|e| {
-                format!("fit_term_collection_forspec failed during diagnose refit: {e}")
-            })?;
-            let eta = &fitted.design.design.dot(&fitted.fit.beta) + &offset;
-            let dense_alo_design = fitted.design.design.to_dense();
-            gam::alo::compute_alo_diagnostics_from_unified(
-                &fitted.fit,
-                &dense_alo_design,
-                &eta,
-                &offset,
-                link,
-                1.0,
-            )
-            .map_err(|e| {
-                format!("compute_alo_diagnostics_from_unified failed during diagnose refit: {e}")
-            })
-        } else {
-            let fit = fit_gam(
-                design.design.clone(),
-                y.view(),
-                weights.view(),
-                offset.view(),
-                &design.penalties,
-                family,
-                &fit_options,
-            )
-            .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
-            compute_alo_diagnostics_from_fit(&fit, y.view(), link)
-                .map_err(|e| format!("compute_alo_diagnostics_from_fit failed: {e}"))
+        let alo_result = match alo_refit_route_for_termspec(&spec) {
+            AloRefitRoute::UnifiedTermCollection => {
+                let fitted = fit_term_collection_forspec(
+                    ds.values.view(),
+                    y.view(),
+                    weights.view(),
+                    offset.view(),
+                    &spec,
+                    family,
+                    &fit_options,
+                )
+                .map_err(|e| {
+                    format!("fit_term_collection_forspec failed during diagnose refit: {e}")
+                })?;
+                let eta = &fitted.design.design.dot(&fitted.fit.beta) + &offset;
+                let dense_alo_design = fitted.design.design.to_dense();
+                gam::alo::compute_alo_diagnostics_from_unified(
+                    &fitted.fit,
+                    &dense_alo_design,
+                    &eta,
+                    &offset,
+                    link,
+                    1.0,
+                )
+                .map_err(|e| {
+                    format!(
+                        "compute_alo_diagnostics_from_unified failed during diagnose refit: {e}"
+                    )
+                })
+            }
+            AloRefitRoute::StandardGam => {
+                let fit = fit_gam(
+                    design.design.clone(),
+                    y.view(),
+                    weights.view(),
+                    offset.view(),
+                    &design.penalties,
+                    family,
+                    &fit_options,
+                )
+                .map_err(|e| format!("fit_gam failed during diagnose refit: {e}"))?;
+                compute_alo_diagnostics_from_fit(&fit, y.view(), link)
+                    .map_err(|e| format!("compute_alo_diagnostics_from_fit failed: {e}"))
+            }
         };
 
         progress.advance_workflow(4);
@@ -7617,6 +7621,20 @@ fn termspec_has_bounded_terms(spec: &TermCollectionSpec) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AloRefitRoute {
+    StandardGam,
+    UnifiedTermCollection,
+}
+
+fn alo_refit_route_for_termspec(spec: &TermCollectionSpec) -> AloRefitRoute {
+    if termspec_has_bounded_terms(spec) {
+        AloRefitRoute::UnifiedTermCollection
+    } else {
+        AloRefitRoute::StandardGam
+    }
+}
+
 fn spatial_basiswarning_family_and_cols(term: &SmoothTermSpec) -> Option<(&'static str, &[usize])> {
     spatial_basiswarning_family_and_cols_basis(&term.basis)
 }
@@ -9427,8 +9445,8 @@ mod tests {
         write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
-        Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, run_fit,
-        run_predict, write_model_json,
+        Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs,
+        run_fit, run_predict, run_sample, write_model_json,
     };
     use clap::Parser;
     use csv::StringRecord;
@@ -9531,6 +9549,48 @@ mod tests {
             random_effect_terms: vec![],
             smooth_terms: vec![],
         }
+    }
+
+    fn bounded_cli_schema() -> DataSchema {
+        DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "y".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+            ],
+        }
+    }
+
+    fn bounded_cli_dataset() -> Dataset {
+        Dataset {
+            headers: vec!["x".to_string(), "y".to_string()],
+            values: array![[0.0, 0.0], [0.5, 1.0], [1.0, 1.0], [1.5, 2.0]],
+            schema: bounded_cli_schema(),
+            column_kinds: vec![ColumnKindTag::Continuous, ColumnKindTag::Continuous],
+        }
+    }
+
+    fn bounded_cli_termspec() -> TermCollectionSpec {
+        let parsed =
+            parse_formula("y ~ bounded(x, min=-2, max=2) + link(type=logit)").expect("formula");
+        let ds = bounded_cli_dataset();
+        let col_map = HashMap::from([("x".to_string(), 0usize), ("y".to_string(), 1usize)]);
+        let mut inference_notes = Vec::<String>::new();
+        super::build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut inference_notes,
+            &gam::resource::ResourcePolicy::default_library(),
+        )
+        .expect("bounded term spec")
     }
 
     fn saved_fit_summary_fixture() -> SavedFitSummary {
