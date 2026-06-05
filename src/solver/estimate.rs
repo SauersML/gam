@@ -1711,6 +1711,19 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Pre-fit rank deficiency detected in the realized unpenalized design: rank {rank} < {num_unpenalized_columns} \
+        unpenalized columns (min eigenvalue {min_eigenvalue:.3e}, tolerance {tolerance:.3e}, columns {column_indices:?}). \
+        Remove/reparameterize the aliased columns or add an explicit penalty/constraint before fitting."
+    )]
+    PrefitRankDeficientDesignDetected {
+        rank: usize,
+        num_unpenalized_columns: usize,
+        min_eigenvalue: f64,
+        tolerance: f64,
+        column_indices: Vec<usize>,
+    },
+
+    #[error(
         "Perfect or quasi-perfect separation detected during multinomial fitting at iteration {iteration}. \
         The active class-{active_class_index} logit against the reference class is saturated at training row {row_index}, \
         so the unpenalized softmax MLE is not finite in that direction. \
@@ -2061,6 +2074,15 @@ struct PrefitSeparationDiagnostic {
     positive_above_threshold: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct PrefitRankDiagnostic {
+    rank: usize,
+    num_unpenalized_columns: usize,
+    min_eigenvalue: f64,
+    tolerance: f64,
+    column_indices: Vec<usize>,
+}
+
 fn prefit_binary_response_classes(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -2112,6 +2134,126 @@ fn canonical_unpenalized_column_mask(penalties: &[CanonicalPenalty], p: usize) -
         }
     }
     unpenalized
+}
+
+fn detect_prefit_unpenalized_rank_deficiency_in_design(
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    unpenalized_columns: &[bool],
+) -> Result<Option<PrefitRankDiagnostic>, EstimationError> {
+    debug_assert_eq!(x.nrows(), w.len());
+    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
+    if x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
+        return Ok(None);
+    }
+
+    let column_indices = unpenalized_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &unpenalized)| unpenalized.then_some(idx))
+        .collect::<Vec<_>>();
+    let q = column_indices.len();
+    if q <= 1 {
+        return Ok(None);
+    }
+
+    let mut active_rows = 0usize;
+    let mut gram = Array2::<f64>::zeros((q, q));
+    let target_cells = 1_000_000usize;
+    let p = x.ncols();
+    let chunk_rows = (target_cells / p.max(1)).clamp(1, x.nrows().max(1));
+    let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    for start in (0..x.nrows()).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(x.nrows());
+        let rows = end - start;
+        x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
+            .map_err(|err| {
+                EstimationError::LayoutError(format!(
+                    "pre-fit rank check failed to stream design rows: {err}"
+                ))
+            })?;
+        for local_row in 0..rows {
+            let weight = w[start + local_row];
+            if !weight.is_finite() {
+                return Ok(None);
+            }
+            if weight <= 0.0 {
+                continue;
+            }
+            active_rows += 1;
+            for (local_col_a, &global_col_a) in column_indices.iter().enumerate() {
+                let value_a = chunk[[local_row, global_col_a]];
+                if !value_a.is_finite() {
+                    return Ok(None);
+                }
+                for (local_col_b, &global_col_b) in
+                    column_indices[..=local_col_a].iter().enumerate()
+                {
+                    let value_b = chunk[[local_row, global_col_b]];
+                    if !value_b.is_finite() {
+                        return Ok(None);
+                    }
+                    gram[[local_col_a, local_col_b]] += weight * value_a * value_b;
+                }
+            }
+        }
+    }
+    if active_rows == 0 {
+        return Ok(None);
+    }
+    for row in 0..q {
+        for col in 0..row {
+            gram[[col, row]] = gram[[row, col]];
+        }
+    }
+
+    let (eigenvalues, _) = gram
+        .eigh(Side::Lower)
+        .map_err(EstimationError::EigendecompositionFailed)?;
+    if eigenvalues.iter().any(|value| !value.is_finite()) {
+        return Ok(None);
+    }
+    let spectral_scale = eigenvalues
+        .iter()
+        .fold(0.0_f64, |scale, &value| scale.max(value.abs()))
+        .max(1.0);
+    let tolerance = 1e-10 * spectral_scale;
+    let rank = eigenvalues
+        .iter()
+        .filter(|&&value| value > tolerance)
+        .count();
+    if rank < q {
+        return Ok(Some(PrefitRankDiagnostic {
+            rank,
+            num_unpenalized_columns: q,
+            min_eigenvalue: eigenvalues.iter().copied().fold(f64::INFINITY, f64::min),
+            tolerance,
+            column_indices,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn reject_prefit_unpenalized_rank_deficiency(
+    w: ArrayView1<'_, f64>,
+    x_fit: &DesignMatrix,
+    penalties: &[CanonicalPenalty],
+) -> Result<(), EstimationError> {
+    let unpenalized_columns = canonical_unpenalized_column_mask(penalties, x_fit.ncols());
+    if let Some(diagnostic) =
+        detect_prefit_unpenalized_rank_deficiency_in_design(w, x_fit, &unpenalized_columns)?
+    {
+        return Err(EstimationError::PrefitRankDeficientDesignDetected {
+            rank: diagnostic.rank,
+            num_unpenalized_columns: diagnostic.num_unpenalized_columns,
+            min_eigenvalue: diagnostic.min_eigenvalue,
+            tolerance: diagnostic.tolerance,
+            column_indices: diagnostic.column_indices,
+        });
+    }
+
+    Ok(())
 }
 
 fn separator_from_column_extrema(
@@ -3044,6 +3186,7 @@ where
         );
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
+    reject_prefit_unpenalized_rank_deficiency(w, &x_fit, &canonical)?;
     reject_prefit_binomial_logit_separation(&cfg, y, w, &x_fit, &canonical)?;
 
     let design_kind = match &x {
@@ -7224,6 +7367,79 @@ mod estimate_policy_tests {
             EstimationError::PrefitPerfectSeparationDetected {
                 column_index: 1,
                 positive_above_threshold: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prefit_rank_check_detects_unpenalized_duplicate_column() {
+        let x = array![
+            [1.0, -2.0, -2.0],
+            [1.0, -1.0, -1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 2.0, 2.0]
+        ];
+        let w = Array1::ones(x.nrows());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let diagnostic = detect_prefit_unpenalized_rank_deficiency_in_design(
+            w.view(),
+            &design,
+            &[true, true, true],
+        )
+        .expect("rank check should stream dense design")
+        .expect("duplicate unpenalized columns are rank deficient");
+
+        assert_eq!(diagnostic.rank, 2);
+        assert_eq!(diagnostic.num_unpenalized_columns, 3);
+        assert_eq!(diagnostic.column_indices, vec![0, 1, 2]);
+        assert!(
+            diagnostic.min_eigenvalue.abs() <= diagnostic.tolerance,
+            "duplicate-column min eigenvalue should be at the rank tolerance"
+        );
+    }
+
+    #[test]
+    fn prefit_rank_check_ignores_alias_carried_only_by_penalized_column() {
+        let x = array![
+            [1.0, -2.0, -2.0],
+            [1.0, -1.0, -1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 2.0, 2.0]
+        ];
+        let w = Array1::ones(x.nrows());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let diagnostic = detect_prefit_unpenalized_rank_deficiency_in_design(
+            w.view(),
+            &design,
+            &[true, true, false],
+        )
+        .expect("rank check should stream dense design");
+
+        assert_eq!(
+            diagnostic, None,
+            "aliasing that is removed from the unpenalized subspace by a penalty should not be pre-fit rejected"
+        );
+    }
+
+    #[test]
+    fn prefit_rank_check_rejects_before_reml_state_construction() {
+        let x = array![
+            [1.0, -2.0, -2.0],
+            [1.0, -1.0, -1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 2.0, 2.0]
+        ];
+        let w = Array1::ones(x.nrows());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let err = reject_prefit_unpenalized_rank_deficiency(w.view(), &design, &[])
+            .expect_err("rank-deficient unpenalized design should fail before REML/PIRLS");
+
+        assert!(matches!(
+            err,
+            EstimationError::PrefitRankDeficientDesignDetected {
+                rank: 2,
+                num_unpenalized_columns: 3,
                 ..
             }
         ));
