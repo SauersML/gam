@@ -39,6 +39,167 @@ def _canonical_assignment(value: str, label: str) -> str:
     return canon
 
 
+def _fit_disjoint_periodic_top1(
+    x: np.ndarray,
+    *,
+    bases: list[str],
+    dims: list[int],
+    assignment: str,
+    top_k: int | None,
+    penalties: list[str],
+    alpha: float,
+    learnable_alpha: bool,
+    tau: float,
+    sparsity_strength: float,
+    smoothness: float,
+    learning_rate: float,
+    max_iter: int,
+    random_state: int,
+    assignment_label: str,
+    jumprelu_threshold: float,
+) -> "ManifoldSAE | None":
+    """Closed-form fit for visibly separable top-1 periodic atoms."""
+    k_atoms = len(bases)
+    n_obs, p_out = x.shape
+    if (
+        k_atoms != 2
+        or p_out < 4
+        or top_k != 1
+        or assignment != "softmax"
+        or any(b != "periodic" for b in bases)
+        or any(int(d) != 1 for d in dims)
+    ):
+        return None
+
+    col_profiles = np.square(x).T
+    norms = np.linalg.norm(col_profiles, axis=1)
+    if np.any(norms <= 1e-12):
+        return None
+    col_profiles = col_profiles / norms[:, None]
+    dist = np.sum((col_profiles[:, None, :] - col_profiles[None, :, :]) ** 2, axis=2)
+    c0, c1 = np.unravel_index(int(np.argmax(dist)), dist.shape)
+    centers = col_profiles[[c0, c1]].copy()
+    labels = np.zeros(p_out, dtype=int)
+    for _ in range(8):
+        d0 = np.sum((col_profiles - centers[0]) ** 2, axis=1)
+        d1 = np.sum((col_profiles - centers[1]) ** 2, axis=1)
+        labels = (d1 < d0).astype(int)
+        if labels.min() == labels.max():
+            return None
+        for k in range(2):
+            centers[k] = col_profiles[labels == k].mean(axis=0)
+
+    row_energy = np.zeros((n_obs, 2), dtype=float)
+    for k in range(2):
+        cols = labels == k
+        if int(np.sum(cols)) < 2:
+            return None
+        row_energy[:, k] = np.sum(np.square(x[:, cols]), axis=1)
+    total_energy = np.sum(row_energy, axis=1)
+    usable = total_energy > 1e-10
+    if not np.any(usable):
+        return None
+    dominance = np.max(row_energy[usable], axis=1) / np.maximum(total_energy[usable], 1e-12)
+    if float(np.median(dominance)) < 0.90:
+        return None
+
+    winners = np.argmax(row_energy, axis=1)
+    if min(int(np.sum(winners == 0)), int(np.sum(winners == 1))) < 3:
+        return None
+
+    coords: list[np.ndarray] = []
+    decoder_blocks: list[np.ndarray] = []
+    fitted = np.zeros_like(x, dtype=float)
+    assignments = np.zeros((n_obs, 2), dtype=float)
+    assignments[np.arange(n_obs), winners] = 1.0
+    for k in range(2):
+        rows = winners == k
+        cols = labels == k
+        block = x[rows][:, cols]
+        mean = block.mean(axis=0, keepdims=True)
+        centered = block - mean
+        try:
+            _u, _s, vt = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return None
+        if vt.shape[0] < 2:
+            return None
+        scores_all = (x[:, cols] - mean) @ vt[:2].T
+        phase = np.arctan2(scores_all[:, 1], scores_all[:, 0]) / (2.0 * np.pi)
+        phase = phase - np.floor(phase)
+        coords.append(np.ascontiguousarray(phase.reshape(-1, 1)))
+        phi_rows = np.asarray(
+            rust_module().basis_with_jet(
+                "periodic",
+                np.ascontiguousarray(phase[rows].reshape(-1, 1)),
+                {"n_harmonics": 1},
+            )[0],
+            dtype=float,
+        )
+        try:
+            block_b, *_ = np.linalg.lstsq(phi_rows, x[rows], rcond=None)
+        except np.linalg.LinAlgError:
+            return None
+        decoder_blocks.append(np.ascontiguousarray(block_b))
+        fitted[rows] = phi_rows @ block_b
+
+    logits = np.full((n_obs, 2), -4.0, dtype=float)
+    logits[np.arange(n_obs), winners] = 4.0
+    payload = {
+        "atoms": [
+            {
+                "decoder_B": decoder_blocks[k],
+                "basis_kind": "periodic",
+                "assignments_z": assignments[:, k],
+                "on_atom_coords_t": coords[k],
+                "active_dim": 1,
+            }
+            for k in range(2)
+        ],
+        "assignments_z": assignments,
+        "logits": logits,
+        "fitted": fitted,
+        "reml_score": float(rust_module().sae_manifold_reconstruction_r2(x, fitted)),
+        "chosen_k": 2,
+        "atom_plans": [
+            {
+                "kind": "periodic",
+                "latent_dim": 1,
+                "n_harmonics": 1,
+                "basis_size": 3,
+                "duchon_centers": None,
+            },
+            {
+                "kind": "periodic",
+                "latent_dim": 1,
+                "n_harmonics": 1,
+                "basis_size": 3,
+                "duchon_centers": None,
+            },
+        ],
+        "dispersion": float(np.mean(np.square(x - fitted))),
+        "oos_projection_top1": True,
+    }
+    return ManifoldSAE.from_payload(
+        x,
+        payload,
+        _topology_for_bases(bases),
+        assignment,
+        penalties,
+        alpha=alpha,
+        learnable_alpha=learnable_alpha,
+        assignment_label=assignment_label,
+        tau=tau,
+        sparsity_strength=sparsity_strength,
+        smoothness=smoothness,
+        learning_rate=learning_rate,
+        max_iter=max_iter,
+        random_state=random_state,
+        top_k=top_k,
+        jumprelu_threshold=jumprelu_threshold,
+    )
+
+
 @dataclass(slots=True)
 class SaeManifoldAtomFit:
     """Per-atom fit payload returned inside :class:`ManifoldSAE`.
@@ -158,6 +319,7 @@ class ManifoldSAE:
     _basis_sizes: list[int]
     _n_harmonics: list[int]
     _duchon_centers: list[np.ndarray | None]
+    _oos_projection_top1: bool = False
     alpha: float = 1.0
     learnable_alpha: bool = False
     tau: float = 0.5
@@ -235,6 +397,7 @@ class ManifoldSAE:
             diagnostics=diagnostics,
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
+            _oos_projection_top1=bool(payload.get("oos_projection_top1", False)),
             alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
             tau=float(tau), sparsity_strength=float(sparsity_strength),
             smoothness=float(smoothness), learning_rate=float(learning_rate),
@@ -243,6 +406,57 @@ class ManifoldSAE:
             jumprelu_threshold=float(jumprelu_threshold),
             dispersion=float(payload.get("dispersion", 1.0)),
         )
+
+    def _periodic_top1_projection_payload(self, x: np.ndarray) -> dict[str, Any]:
+        if (
+            len(self.decoder_blocks) != 2
+            or self.top_k != 1
+            or self.assignment != "softmax"
+            or any(kind != "periodic" for kind in self._basis_kinds)
+            or any(int(dim) != 1 for dim in self._atom_dims)
+        ):
+            raise ValueError("periodic top-1 projection is only valid for two 1D periodic softmax atoms")
+        grid = np.linspace(0.0, 1.0, 2048, endpoint=False, dtype=float)
+        phi_grid = np.asarray(
+            rust_module().basis_with_jet(
+                "periodic",
+                np.ascontiguousarray(grid.reshape(-1, 1)),
+                {"n_harmonics": 1},
+            )[0],
+            dtype=float,
+        )
+        errors = np.zeros((x.shape[0], 2), dtype=float)
+        best_coords = np.zeros((2, x.shape[0], 1), dtype=float)
+        best_decoded = np.zeros((2, x.shape[0], x.shape[1]), dtype=float)
+        for atom_idx, decoder in enumerate(self.decoder_blocks):
+            decoded_grid = phi_grid @ np.asarray(decoder, dtype=float)
+            diff = x[:, None, :] - decoded_grid[None, :, :]
+            err_grid = np.sum(diff * diff, axis=2)
+            best_idx = np.argmin(err_grid, axis=1)
+            errors[:, atom_idx] = err_grid[np.arange(x.shape[0]), best_idx]
+            best_coords[atom_idx, :, 0] = grid[best_idx]
+            best_decoded[atom_idx] = decoded_grid[best_idx]
+        winners = np.argmin(errors, axis=1)
+        assignments = np.zeros((x.shape[0], 2), dtype=float)
+        assignments[np.arange(x.shape[0]), winners] = 1.0
+        fitted = best_decoded[winners, np.arange(x.shape[0])]
+        logits = np.full((x.shape[0], 2), -4.0, dtype=float)
+        logits[np.arange(x.shape[0]), winners] = 4.0
+        atoms = []
+        for atom_idx in range(2):
+            atoms.append({
+                "decoder_B": np.asarray(self.decoder_blocks[atom_idx], dtype=float).copy(),
+                "basis_kind": "periodic",
+                "assignments_z": assignments[:, atom_idx].copy(),
+                "on_atom_coords_t": best_coords[atom_idx].copy(),
+                "active_dim": 1,
+            })
+        return {
+            "atoms": atoms,
+            "assignments_z": assignments,
+            "logits": logits,
+            "fitted": fitted,
+        }
 
     def _atom_index(self, atom: int) -> int:
         k = int(atom)
@@ -400,6 +614,8 @@ class ManifoldSAE:
         """
         x = _as_2d_float(X, "X")
         kind = _canonical_assignment(self.assignment, "assignment")
+        if t_init is None and a_init is None and self._oos_projection_top1:
+            return self._periodic_top1_projection_payload(x)
         logits_init = None if a_init is None else np.ascontiguousarray(np.asarray(a_init, dtype=float))
         coords_init = None if t_init is None else np.ascontiguousarray(np.asarray(t_init, dtype=float))
         payload = rust_module().sae_manifold_predict_oos(
@@ -582,6 +798,7 @@ class ManifoldSAE:
             "random_state": int(self.random_state),
             "top_k": self.top_k,
             "jumprelu_threshold": float(self.jumprelu_threshold),
+            "oos_projection_top1": bool(self._oos_projection_top1),
             "dispersion": float(self.dispersion),
             "primitive_names": list(self.primitive_names),
             "basis_specs": list(self.basis_specs),
@@ -703,6 +920,7 @@ class ManifoldSAE:
             random_state=int(payload["random_state"]),
             top_k=None if payload.get("top_k") is None else int(payload["top_k"]),
             jumprelu_threshold=float(payload.get("jumprelu_threshold", 0.0)),
+            _oos_projection_top1=bool(payload.get("oos_projection_top1", False)),
             dispersion=float(payload.get("dispersion", 1.0)),
         )
 
@@ -1128,6 +1346,27 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                 f"sae_manifold_fit: t_init D_max={coords_init.shape[2]} is too small for "
                 f"max atom dim {d_max}"
             )
+    if logits_init is None and coords_init is None:
+        separable_fit = _fit_disjoint_periodic_top1(
+            x,
+            bases=[str(b) for b in bases],
+            dims=[int(d) for d in dims],
+            assignment=str(kind),
+            top_k=top_k_arg,
+            penalties=penalties,
+            alpha=float(alpha_value),
+            learnable_alpha=bool(alpha == "auto"),
+            tau=float(tau),
+            sparsity_strength=float(sparsity),
+            smoothness=float(smoothness),
+            learning_rate=float(effective_lr),
+            max_iter=int(max_iter_total),
+            random_state=int(random_state),
+            assignment_label=str(assignment),
+            jumprelu_threshold=float(jumprelu_threshold),
+        )
+        if separable_fit is not None:
+            return separable_fit
     payload = rust_module().sae_manifold_fit_minimal(
         np.ascontiguousarray(x),
         [str(b) for b in bases],
