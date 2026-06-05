@@ -2896,49 +2896,85 @@ mod tests {
     }
 
     #[test]
-    fn cloglog_fisher_weight_jet_matches_finite_differences() {
+    fn non_logit_probit_fisher_weight_jets_match_finite_differences() {
         fn rel_err(a: f64, b: f64) -> f64 {
             (a - b).abs() / a.abs().max(b.abs()).max(1.0e-8)
         }
 
-        for eta in [-3.0_f64, -0.5, 0.4, 1.5] {
-            let (w, w1, w2, w3, w4) = fisher_weight_jet5(StandardLink::CLogLog, eta);
-            let jet = component_inverse_link_jet(LinkComponent::CLogLog, eta);
-            let expected = jet.d1 * jet.d1 / (jet.mu * (1.0 - jet.mu));
-            assert!(
-                rel_err(w, expected) < 1.0e-12,
-                "CLogLog Fisher weight mismatch at eta={eta}: got {w}, expected {expected}"
-            );
+        let cases = [
+            (LinkComponent::CLogLog, [-3.0_f64, -0.5, 0.4, 1.5]),
+            (LinkComponent::LogLog, [-1.5_f64, -0.4, 0.5, 3.0]),
+            (LinkComponent::Cauchit, [-3.0_f64, -0.7, 0.6, 3.0]),
+        ];
+        for (component, etas) in cases {
+            for eta in etas {
+                let (w, w1, w2, w3, w4) = component_fisher_weight_jet5(component, eta);
+                let jet = component_inverse_link_jet(component, eta);
+                let expected = jet.d1 * jet.d1 / (jet.mu * (1.0 - jet.mu));
+                assert!(
+                    rel_err(w, expected) < 1.0e-12,
+                    "{component:?} Fisher weight mismatch at eta={eta}: got {w}, expected {expected}"
+                );
 
-            let h = 1.0e-4;
-            let fd1 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).0
-                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).0)
-                / (2.0 * h);
-            let fd2 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).1
-                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).1)
-                / (2.0 * h);
-            let fd3 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).2
-                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).2)
-                / (2.0 * h);
-            let fd4 = (fisher_weight_jet5(StandardLink::CLogLog, eta + h).3
-                - fisher_weight_jet5(StandardLink::CLogLog, eta - h).3)
-                / (2.0 * h);
+                let h = 1.0e-4;
+                let fd1 = (component_fisher_weight_jet5(component, eta + h).0
+                    - component_fisher_weight_jet5(component, eta - h).0)
+                    / (2.0 * h);
+                let fd2 = (component_fisher_weight_jet5(component, eta + h).1
+                    - component_fisher_weight_jet5(component, eta - h).1)
+                    / (2.0 * h);
+                let fd3 = (component_fisher_weight_jet5(component, eta + h).2
+                    - component_fisher_weight_jet5(component, eta - h).2)
+                    / (2.0 * h);
+                let fd4 = (component_fisher_weight_jet5(component, eta + h).3
+                    - component_fisher_weight_jet5(component, eta - h).3)
+                    / (2.0 * h);
 
+                assert!(
+                    rel_err(w1, fd1) < 1.0e-5,
+                    "{component:?} W' mismatch at eta={eta}: {w1} vs {fd1}"
+                );
+                assert!(
+                    rel_err(w2, fd2) < 1.0e-5,
+                    "{component:?} W'' mismatch at eta={eta}: {w2} vs {fd2}"
+                );
+                assert!(
+                    rel_err(w3, fd3) < 5.0e-5,
+                    "{component:?} W''' mismatch at eta={eta}: {w3} vs {fd3}"
+                );
+                assert!(
+                    rel_err(w4, fd4) < 5.0e-4,
+                    "{component:?} W'''' mismatch at eta={eta}: {w4} vs {fd4}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mixture_fisher_weight_jet_covers_loglog_and_cauchit_components() {
+        let state = state_fromspec(&MixtureLinkSpec {
+            components: vec![
+                LinkComponent::CLogLog,
+                LinkComponent::LogLog,
+                LinkComponent::Cauchit,
+            ],
+            initial_rho: Array1::from_vec(vec![0.3, -0.2]),
+        })
+        .expect("mixture state");
+        let link = InverseLink::Mixture(state);
+
+        for eta in [-2.0_f64, -0.25, 0.75, 2.5] {
+            let (w, w1, w2, w3, w4) =
+                fisher_weight_jet5_for_inverse_link(&link, eta).expect("mixture Fisher jet");
+            for value in [w, w1, w2, w3, w4] {
+                assert!(
+                    value.is_finite(),
+                    "mixture Fisher weight jet should be finite at eta={eta}; got {value}"
+                );
+            }
             assert!(
-                rel_err(w1, fd1) < 1.0e-5,
-                "W' mismatch at eta={eta}: {w1} vs {fd1}"
-            );
-            assert!(
-                rel_err(w2, fd2) < 1.0e-5,
-                "W'' mismatch at eta={eta}: {w2} vs {fd2}"
-            );
-            assert!(
-                rel_err(w3, fd3) < 5.0e-5,
-                "W''' mismatch at eta={eta}: {w3} vs {fd3}"
-            );
-            assert!(
-                rel_err(w4, fd4) < 5.0e-4,
-                "W'''' mismatch at eta={eta}: {w4} vs {fd4}"
+                w > 0.0,
+                "mixture Fisher working weight should be positive away from saturated tails at eta={eta}; got {w}"
             );
         }
     }
