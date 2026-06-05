@@ -4071,56 +4071,6 @@ pub struct BlockwiseFitResultParts {
     pub precomputed_edf: Option<(f64, Vec<f64>, Vec<f64>)>,
 }
 
-use crate::inference::diagnostics::format_top_abs as format_top_abs_array_entries;
-
-fn format_penalty_coord_labels(specs: &[ParameterBlockSpec]) -> String {
-    let mut labels = Vec::new();
-    for spec in specs {
-        for penalty_idx in 0..spec.penalties.len() {
-            labels.push(format!("{}[{penalty_idx}]", spec.name));
-        }
-    }
-    if labels.is_empty() {
-        "penalty_coords=<none>".to_string()
-    } else {
-        format!("penalty_coords=[{}]", labels.join(", "))
-    }
-}
-
-fn custom_outer_nonconvergence_error(
-    outer_result: &crate::solver::outer_strategy::OuterResult,
-    specs: &[ParameterBlockSpec],
-    last_error_detail: &str,
-) -> String {
-    let gradient_detail = outer_result
-        .final_gradient
-        .as_ref()
-        .map(|gradient| format_top_abs_array_entries(gradient, "top_abs_gradient", 8))
-        .unwrap_or_else(|| "top_abs_gradient=<unavailable>".to_string());
-    let lambdas = outer_result.rho.mapv(f64::exp);
-    let objective_error_detail = if last_error_detail.is_empty() {
-        String::new()
-    } else {
-        format!(" {last_error_detail}")
-    };
-    format!(
-        "outer smoothing optimization did not converge; plan={} iterations={} \
-         final_objective={:.6e} |g|={} {} {} {}.{}",
-        outer_result.plan_used,
-        outer_result.iterations,
-        outer_result.final_value,
-        outer_result.final_grad_norm_report(),
-        format_top_abs_array_entries(&outer_result.rho, "top_abs_log_lambda", 8),
-        format_top_abs_array_entries(&lambdas, "top_abs_lambda", 8),
-        gradient_detail,
-        format!(
-            " {}{}",
-            format_penalty_coord_labels(specs),
-            objective_error_detail
-        ),
-    )
-}
-
 fn validate_parameter_block_state_finiteness(
     label: &str,
     state: &ParameterBlockState,
