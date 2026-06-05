@@ -13,7 +13,7 @@
 //! and treated the cost as a log-evidence, so the worst model won and every
 //! Bayes factor was inverted — see issue #396.
 
-use std::cmp::Ordering;
+use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 
 /// One candidate fit in a REML model comparison.
 #[derive(Clone, Debug)]
@@ -89,13 +89,20 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
         return Err("compare_models requires at least one fit".to_string());
     }
 
-    // Lowest-cost model wins: `RemlCandidate::score` is the optimiser's
-    // minimised cost (issue #396 was the wrong direction here).
-    candidates.sort_by(|left, right| {
-        left.score
-            .partial_cmp(&right.score)
-            .unwrap_or(Ordering::Equal)
-    });
+    // Lowest-cost model wins through the shared priority-selection contract.
+    candidates = rank_priority_candidates(
+        candidates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let score = row.score;
+                PriorityCandidate::new(row, idx, score, 0)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|row| row.item)
+    .collect();
 
     let best_score = candidates[0].score;
     let winner = candidates[0].name.clone();
