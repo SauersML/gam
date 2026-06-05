@@ -650,7 +650,8 @@ fn reparameterize_logslope_design_reduced(
 
     // Reparameterize each penalty: embed its local block at full width p_g, then
     // form S_reduced = Tᵀ S T (r × r) over the whole reduced column range.
-    let mut new_penalties: Vec<BlockwisePenalty> = Vec::with_capacity(logslope_design.penalties.len());
+    let mut new_penalties: Vec<crate::terms::smooth::BlockwisePenalty> =
+        Vec::with_capacity(logslope_design.penalties.len());
     let mut new_nullspace_dims: Vec<usize> = Vec::with_capacity(logslope_design.penalties.len());
     for bp in &logslope_design.penalties {
         let mut full = Array2::<f64>::zeros((p_g, p_g));
@@ -668,7 +669,7 @@ fn reparameterize_logslope_design_reduced(
         let pen_tol = (max_eval * 1.0e-12).max(f64::EPSILON);
         let rank = evals.iter().filter(|&&v| v.abs() > pen_tol).count();
         let nullspace_dim = r.saturating_sub(rank);
-        new_penalties.push(BlockwisePenalty::new(0..r, s_reduced));
+        new_penalties.push(crate::terms::smooth::BlockwisePenalty::new(0..r, s_reduced));
         new_nullspace_dims.push(nullspace_dim);
     }
 
@@ -2384,6 +2385,31 @@ pub fn fit_bernoulli_marginal_slope_terms(
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
+    // Reduced-basis round-trip (robust cure). When the logslope design was
+    // orthogonalised to a reduced basis `G·T`, the fitted logslope coefficient
+    // `β'` lives in the reduced coordinates (width `r`). The returned
+    // `logslope_design` / `logslopespec_resolved` are the ORIGINAL full-width
+    // basis (prediction rebuilds full `G` from the resolved spec), so map the
+    // reported logslope coefficients back to the original basis `β_logslope =
+    // T·β'` (predictor-identical: `G·(T·β') = (G·T)·β'`). The marginal block,
+    // aux blocks, and the internal reduced-width flat β/geometry are untouched;
+    // only the per-block reported logslope coefficients (blocks[1] and
+    // block_states[1]) — which prediction/reporting consume against the full
+    // design — are lifted to full width.
+    let mut solved_fit = solved.fit;
+    if let Some(reparam) = logslope_reduced_reparam.as_ref() {
+        let r = reparam.reduced_cols();
+        if let Some(block) = solved_fit.blocks.get_mut(1)
+            && block.beta.len() == r
+        {
+            block.beta = reparam.recover_original_logslope_beta(&block.beta)?;
+        }
+        if let Some(state) = solved_fit.block_states.get_mut(1)
+            && state.beta.len() == r
+        {
+            state.beta = reparam.recover_original_logslope_beta(&state.beta)?;
+        }
+    }
     let latent_z_rank_int_calibration = match latent_z_calibration {
         LatentMeasureCalibration::None => None,
         LatentMeasureCalibration::RankInverseNormal(cal) => Some(cal),
@@ -2401,7 +2427,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // that truncation; it must record p_m (= marginal_design.design.ncols())
     // and slice the persisted marginal β to it. Survival mirrors this seam.
     Ok(BernoulliMarginalSlopeFitResult {
-        fit: solved.fit,
+        fit: solved_fit,
         marginalspec_resolved: resolved_specs.remove(0),
         logslopespec_resolved: resolved_specs.remove(0),
         marginal_design: designs.remove(0),
