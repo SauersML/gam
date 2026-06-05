@@ -10100,14 +10100,17 @@ mod tests {
     fn cli_firth_validation_accepts_binomial_cloglog() {
         let link_choice =
             parse_link_choice(Some("binomial-cloglog"), false).expect("parse cloglog link");
-        validate_cli_firth_configuration(CliFirthValidation {
+        let validation = validate_cli_firth_configuration(CliFirthValidation {
             enabled: true,
             family: LikelihoodSpec::binomial_cloglog(),
             predict_noise: false,
             is_survival: false,
             link_choice: Some(&link_choice),
-        })
-        .expect("CLogLog has a Fisher-weight jet and must reach the Firth path");
+        });
+        assert!(
+            validation.is_ok(),
+            "CLogLog has a Fisher-weight jet and must reach the Firth path: {validation:?}"
+        );
     }
 
     #[test]
