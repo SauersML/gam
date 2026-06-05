@@ -1973,6 +1973,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
         let mut firth = FirthDiagnostics::Inactive;
         if self.firth_bias_reduction {
+            // Standard link whose Fisher working weight drives the Jeffreys
+            // term. The firth gate only activates for links with a closed-form
+            // Fisher-weight jet (`{Logit, Probit}`); any other link here is a
+            // construction-time inconsistency, so fall back to logit rather than
+            // silently mis-weighting.
+            let jeffreys_link = match &self.link_kind {
+                InverseLink::Standard(link @ StandardLink::Logit)
+                | InverseLink::Standard(link @ StandardLink::Probit) => *link,
+                _ => StandardLink::Logit,
+            };
             // IMPORTANT: Jeffreys/Firth bias reduction must be computed in the
             // *same coefficient basis* as the inner objective being optimized by PIRLS.
             //
@@ -2003,6 +2013,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             )
                         })?;
                         compute_jeffreys_pirls_diagnostics_sparse(
+                            jeffreys_link,
                             csr,
                             self.workspace.eta_buf.view(),
                             self.priorweights,
@@ -2010,6 +2021,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     } else {
                         let x_dense_cow = x_transformed.to_dense_cow();
                         compute_jeffreys_pirls_diagnostics(
+                            jeffreys_link,
                             x_dense_cow.view(),
                             self.workspace.eta_buf.view(),
                             self.priorweights,
@@ -2024,6 +2036,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                     let x_t_dense =
                         fast_ab(&self.x_original.to_dense(), &transform.materialize_dense());
                     compute_jeffreys_pirls_diagnostics(
+                        jeffreys_link,
                         x_t_dense.view(),
                         self.workspace.eta_buf.view(),
                         self.priorweights,
@@ -2038,6 +2051,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             )
                         })?;
                         compute_jeffreys_pirls_diagnostics_sparse(
+                            jeffreys_link,
                             csr,
                             self.workspace.eta_buf.view(),
                             self.priorweights,
@@ -2050,6 +2064,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                             )
                             .map_err(EstimationError::InvalidInput)?;
                         compute_jeffreys_pirls_diagnostics(
+                            jeffreys_link,
                             x_dense.view(),
                             self.workspace.eta_buf.view(),
                             self.priorweights,
@@ -2621,6 +2636,7 @@ fn accumulate_outer_upper(
 }
 
 pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
+    link: StandardLink,
     x_design_csr: &SparseRowMat<usize, f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
@@ -2641,10 +2657,11 @@ pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
             x_dense[[i, col.unbound()]] = vals[idx];
         }
     }
-    compute_jeffreys_pirls_diagnostics(x_dense.view(), eta, observation_weights)
+    compute_jeffreys_pirls_diagnostics(link, x_dense.view(), eta, observation_weights)
 }
 
 pub(super) fn compute_jeffreys_pirls_diagnostics(
+    link: StandardLink,
     x_design: ArrayView2<f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
@@ -2653,8 +2670,11 @@ pub(super) fn compute_jeffreys_pirls_diagnostics(
     // outer REML code:
     //   Φ(β) = 0.5 log|Xᵀ W(η) X|_+.
     // The operator below is the single source of truth for both the Jeffreys
-    // scalar value and the PIRLS hat-diagonal correction derived from it.
-    let op = FirthDenseOperator::build_with_observation_weights(
+    // scalar value and the PIRLS hat-diagonal correction derived from it. The
+    // Fisher working weight `W(η)` is evaluated for the resolved standard link;
+    // `StandardLink::Logit` reproduces the released logit diagnostics exactly.
+    let op = FirthDenseOperator::build_with_observation_weights_for_link(
+        link,
         &x_design.to_owned(),
         &eta.to_owned(),
         observation_weights,

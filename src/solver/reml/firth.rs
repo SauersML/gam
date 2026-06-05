@@ -420,6 +420,11 @@ impl FirthDenseOperator {
         kahan_sum((0..diag.len()).map(|i| diag[i] * matrix[[i, i]]))
     }
 
+    /// Logit-pinned convenience constructors retained for the unit tests, which
+    /// assert the link-general `build_*_for_link` path reproduces the historical
+    /// logit operator. Production callers always resolve a `StandardLink` and use
+    /// the `*_for_link` constructors directly.
+    #[cfg(test)]
     pub(crate) fn build(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
@@ -427,6 +432,7 @@ impl FirthDenseOperator {
         Self::build_with_observation_weights_impl(StandardLink::Logit, x_dense, eta, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn build_with_observation_weights(
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
