@@ -7444,51 +7444,6 @@ mod estimate_policy_tests {
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
-    /// Realized-design single-column separation probe used only by the prefit
-    /// separation tests below. The production path uses the operator-backed
-    /// `_in_design` variant; this densified wrapper keeps the test inputs
-    /// readable. Lives in the test module so it is not a `#[cfg(test)]` free
-    /// function at `src/` scope.
-    fn detect_prefit_binomial_single_column_separation(
-        y: ArrayView1<'_, f64>,
-        w: ArrayView1<'_, f64>,
-        x: ndarray::ArrayView2<'_, f64>,
-        unpenalized_columns: &[bool],
-    ) -> Option<PrefitSeparationDiagnostic> {
-        if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
-            return None;
-        }
-        let class = prefit_binary_response_classes(y, w)?;
-        let p = x.ncols();
-        let mut min_pos = vec![f64::INFINITY; p];
-        let mut max_pos = vec![f64::NEG_INFINITY; p];
-        let mut min_neg = vec![f64::INFINITY; p];
-        let mut max_neg = vec![f64::NEG_INFINITY; p];
-        for col in 0..x.ncols() {
-            if !unpenalized_columns[col] {
-                continue;
-            }
-            for row in 0..x.nrows() {
-                let Some(is_positive) = class[row] else {
-                    continue;
-                };
-                let value = x[[row, col]];
-                if !value.is_finite() {
-                    return None;
-                }
-                if is_positive {
-                    min_pos[col] = min_pos[col].min(value);
-                    max_pos[col] = max_pos[col].max(value);
-                } else {
-                    min_neg[col] = min_neg[col].min(value);
-                    max_neg[col] = max_neg[col].max(value);
-                }
-            }
-        }
-
-        separator_from_column_extrema(unpenalized_columns, &min_pos, &max_pos, &min_neg, &max_neg)
-    }
-
     #[test]
     fn gaussian_external_reml_uses_single_seed_policy() {
         let cfg = external_reml_seed_config(2, LinkFunction::Identity);
