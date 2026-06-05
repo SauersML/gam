@@ -6233,6 +6233,11 @@ fn materialize_bernoulli_marginal_slope<'a>(
             spec,
             options: BlockwiseFitOptions {
                 compute_covariance: true,
+                // Honor the user's robustness policy so the (now inner-step
+                // plumbed) Firth/Jeffreys stabilizer is actually reachable for
+                // bernoulli marginal-slope via robust_identification (#774).
+                // Default stays `Off`, so the common path is unchanged.
+                robust_identification: config.robust_identification,
                 ..Default::default()
             },
             kappa_options: SpatialLengthScaleOptimizationOptions::default(),
@@ -7005,6 +7010,11 @@ fn materialize_survival<'a>(
                 },
                 options: BlockwiseFitOptions {
                     compute_covariance: false,
+                    // Honor the user's robustness policy so the inner-step
+                    // plumbed Firth/Jeffreys stabilizer is reachable for
+                    // survival marginal-slope via robust_identification (#774).
+                    // Default stays `Off`, so the common path is unchanged.
+                    robust_identification: config.robust_identification,
                     ..Default::default()
                 },
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
