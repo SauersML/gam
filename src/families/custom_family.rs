@@ -23220,7 +23220,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         canonical_n_cols_raw,
     );
     let canonical =
-        crate::solver::identifiability_canonical::canonicalize_for_identifiability(raw_specs)?;
+        crate::solver::identifiability_canonical::canonicalize_for_identifiability_with_robust(
+            raw_specs,
+            crate::solver::robust_identification::RobustConfig::from_policy(
+                options.robust_identification,
+            ),
+        )?;
     let canonical_n_cols_red: usize = canonical
         .reduced_specs
         .iter()
