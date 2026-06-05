@@ -6288,6 +6288,22 @@ fn materialize_survival<'a>(
     }
 
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    // Fail fast on all-censored (zero-event) survival data in the marginal-slope
+    // path (#789B). The single-hazard / marginal-slope likelihood has no event
+    // score when no row is an event, so the inner/outer solve cannot identify the
+    // hazard and the optimizer spins without termination. The standard survival
+    // engine rejects this inside `WorkingModelSurvival`, but the marginal-slope
+    // construction does not necessarily build that working model, so the
+    // degenerate config must be caught here before any heavy construction.
+    if matches!(survival_mode, SurvivalLikelihoodMode::MarginalSlope)
+        && !event_codes.iter().any(|&code| code > 0)
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: "survival marginal-slope requires at least one observed event; all rows are \
+                     censored, so the likelihood has no event score and cannot identify the hazard"
+                .to_string(),
+        });
+    }
     let cause_count =
         crate::survival::cause_count_from_event_codes(event_codes.view()).into_workflow_result()?;
     if cause_count > 1
