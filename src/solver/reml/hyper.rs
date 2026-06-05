@@ -1321,8 +1321,8 @@ impl<'a> RemlState<'a> {
         // to β = Z β_free, the Jeffreys objects for τ/ψ derivatives must use
         // the projected design X_eff = X Z rather than the cached full-basis
         // operator from the unconstrained transformed space.
-        let firth_logit_active = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let firth_jeffreys_link = super::runtime::reml_robust_jeffreys_link(&self.config);
+        let firth_logit_active = firth_jeffreys_link.is_some();
 
         // --- Implicit operator activation ---
         // Check whether any tau direction has an implicit design derivative and
@@ -1385,20 +1385,22 @@ impl<'a> RemlState<'a> {
                 None
             };
 
-        let firth_op = if firth_logit_active {
+        let firth_op = if let Some(jeffreys_link) = firth_jeffreys_link {
             let x_dense = x_dense.expect("Firth hyper terms require dense active-basis design");
             if free_basis_opt.is_none() {
                 if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                     Some(cached.as_ref().clone())
                 } else {
-                    Some(Self::build_firth_dense_operator(
+                    Some(Self::build_firth_dense_operator_for_link(
+                        jeffreys_link,
                         x_dense,
                         &pirls_result.final_eta,
                         self.weights,
                     )?)
                 }
             } else {
-                Some(Self::build_firth_dense_operator(
+                Some(Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
                     x_dense,
                     &pirls_result.final_eta,
                     self.weights,
@@ -1786,9 +1788,8 @@ impl<'a> RemlState<'a> {
             .map(|dir| dir.transformed_x_tau(&reparam_result.qs, free_basis_opt.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let firth_logit_active = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
-        let firth_op = if firth_logit_active {
+        let firth_jeffreys_link = super::runtime::reml_robust_jeffreys_link(&self.config);
+        let firth_op = if let Some(jeffreys_link) = firth_jeffreys_link {
             let x_dense_arc = pirls_result
                 .x_transformed
                 .try_to_dense_arc("build_tau_fixed_drift_deriv requires dense transformed design for Firth operator")
@@ -1805,14 +1806,20 @@ impl<'a> RemlState<'a> {
                 if let Some(cached) = bundle.firth_dense_operator.as_ref() {
                     cached.as_ref().clone()
                 } else {
-                    Self::build_firth_dense_operator(
+                    Self::build_firth_dense_operator_for_link(
+                        jeffreys_link,
                         x_dense,
                         &pirls_result.final_eta,
                         self.weights,
                     )?
                 }
             } else {
-                Self::build_firth_dense_operator(x_dense, &pirls_result.final_eta, self.weights)?
+                Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
+                    x_dense,
+                    &pirls_result.final_eta,
+                    self.weights,
+                )?
             };
             Some(std::sync::Arc::new(op))
         } else {
@@ -1889,9 +1896,8 @@ impl<'a> RemlState<'a> {
         let x_design = self.x().clone();
 
         let is_gaussian_identity = matches!(self.config.link_function(), LinkFunction::Identity);
-        let firth_logit_active = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
-        let firth_op_original = if firth_logit_active {
+        let firth_jeffreys_link = super::runtime::reml_robust_jeffreys_link(&self.config);
+        let firth_op_original = if let Some(jeffreys_link) = firth_jeffreys_link {
             if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                 Some(cached.as_ref().clone())
             } else {
@@ -1901,7 +1907,8 @@ impl<'a> RemlState<'a> {
                         "sparse exact tau coords require dense design for Firth operator",
                     )
                     .map_err(EstimationError::InvalidInput)?;
-                Some(Self::build_firth_dense_operator(
+                Some(Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
                     x_dense_arc.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -2027,9 +2034,8 @@ impl<'a> RemlState<'a> {
             .map(DirectionalHyperParam::x_tau_dense)
             .collect();
 
-        let firth_logit_active = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
-        let firth_op = if firth_logit_active {
+        let firth_jeffreys_link = super::runtime::reml_robust_jeffreys_link(&self.config);
+        let firth_op = if let Some(jeffreys_link) = firth_jeffreys_link {
             let op = if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                 cached.as_ref().clone()
             } else {
@@ -2039,7 +2045,8 @@ impl<'a> RemlState<'a> {
                         "build_tau_fixed_drift_deriv_original_basis requires dense design for Firth operator",
                     )
                     .map_err(EstimationError::InvalidInput)?;
-                Self::build_firth_dense_operator(
+                Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
                     x_dense_arc.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -2167,9 +2174,10 @@ impl<'a> RemlState<'a> {
         //  Firth-pair wiring: require dense X_τ designs.  `None` entries mean
         //  the design is `Implicit` — Firth pair terms drop to zero for that
         //  direction (matches single-τ Firth support: dense-only).
-        let firth_logit_active = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
-        let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
+        let firth_jeffreys_link = super::runtime::reml_robust_jeffreys_link(&self.config);
+        let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if let Some(jeffreys_link) =
+            firth_jeffreys_link
+        {
             let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> =
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(std::sync::Arc::new(cached.as_ref().clone()))
@@ -2180,7 +2188,8 @@ impl<'a> RemlState<'a> {
                         "original-basis tau pair callbacks require dense design for Firth operator",
                     )
                     .map_err(EstimationError::InvalidInput)?;
-                    Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+                    Some(std::sync::Arc::new(Self::build_firth_dense_operator_for_link(
+                        jeffreys_link,
                         x_dense_arc.as_ref(),
                         &pirls_result.final_eta,
                         self.weights,
@@ -2408,8 +2417,8 @@ impl<'a> RemlState<'a> {
         let ds_k_dtau_j_mats = Arc::new(ds_k_dtau_j_mats);
 
         //  Firth-pair wiring — mirrors the original-basis builder.
-        let firth_logit_active = self.config.firth_bias_reduction
-            && matches!(self.config.link_function(), LinkFunction::Logit);
+        let firth_logit_active =
+            super::runtime::reml_robust_jeffreys_link(&self.config).is_some();
         let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
             let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = bundle
                 .firth_dense_operator

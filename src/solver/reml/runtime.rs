@@ -1465,6 +1465,47 @@ fn reml_supports_firth(likelihood: &GlmLikelihoodSpec) -> bool {
         && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
 }
 
+/// Standard link of a Binomial family for which a closed-form Fisher-weight jet
+/// (`fisher_weight_jet5`) exists, i.e. the links the link-general Jeffreys term
+/// can regularize. Currently `{Logit, Probit}`. Returns `None` for any other
+/// response or link.
+#[inline]
+fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<StandardLink> {
+    let spec = reml_spec(likelihood);
+    if !matches!(spec.response, ResponseFamily::Binomial) {
+        return None;
+    }
+    match spec.link {
+        InverseLink::Standard(link @ StandardLink::Logit)
+        | InverseLink::Standard(link @ StandardLink::Probit) => Some(link),
+        _ => None,
+    }
+}
+
+/// Resolve whether the Jeffreys/Firth term should be assembled on the REML path
+/// and, if so, the standard link to evaluate the Fisher weight with.
+///
+/// `Off` reproduces the released gate exactly: active only for the legacy
+/// `firth_bias_reduction` flag on Binomial-Logit. Under `Auto`/`Force` the gate
+/// broadens to every Binomial link with a closed-form Fisher-weight jet (adds
+/// probit), keeping the released path byte-identical when the flag is `Off`.
+#[inline]
+pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<StandardLink> {
+    let robust_on = !matches!(
+        config.robust_identification,
+        crate::solver::workflow::RobustIdentification::Off
+    );
+    if robust_on {
+        if let Some(link) = reml_jeffreys_supported_link(&config.likelihood) {
+            return Some(link);
+        }
+    }
+    if config.firth_bias_reduction && reml_supports_firth(&config.likelihood) {
+        return Some(StandardLink::Logit);
+    }
+    None
+}
+
 #[inline]
 fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     let spec = reml_spec(likelihood);
@@ -3075,7 +3116,7 @@ impl<'a> RemlState<'a> {
                 hessian: None,
             });
         }
-        if !self.config.firth_bias_reduction {
+        if reml_robust_jeffreys_link(&self.config).is_none() {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
@@ -3141,17 +3182,20 @@ impl<'a> RemlState<'a> {
             };
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
-            let firth_op = if self.config.firth_bias_reduction
-                && reml_supports_firth(&self.config.likelihood)
+            let firth_op = if let Some(jeffreys_link) =
+                reml_robust_jeffreys_link(&self.config)
             {
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
                 } else {
-                    Some(std::sync::Arc::new(Self::build_firth_dense_operator(
-                        x_dense.as_ref(),
-                        &pirls_result.final_eta,
-                        self.weights,
-                    )?))
+                    Some(std::sync::Arc::new(
+                        Self::build_firth_dense_operator_for_link(
+                            jeffreys_link,
+                            x_dense.as_ref(),
+                            &pirls_result.final_eta,
+                            self.weights,
+                        )?,
+                    ))
                 }
             } else {
                 None
@@ -3289,16 +3333,18 @@ impl<'a> RemlState<'a> {
         } else {
             pirls_result.beta_transformed.as_ref().clone()
         };
-        let firth_op =
-            if self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood) {
-                Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+        let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
+            Some(std::sync::Arc::new(
+                Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
                     &x_eff_dense,
                     &pirls_result.final_eta,
                     self.weights,
-                )?))
-            } else {
-                None
-            };
+                )?,
+            ))
+        } else {
+            None
+        };
 
         self.tierney_kadane_analytic_core(
             &x_eff_dense,
@@ -3324,7 +3370,7 @@ impl<'a> RemlState<'a> {
         ext_coords: &[super::unified::HyperCoord],
     ) -> Result<(), EstimationError> {
         if reml_is_gaussian_identity(&self.config.likelihood)
-            || !self.config.firth_bias_reduction
+            || reml_robust_jeffreys_link(&self.config).is_none()
             || !compute_gradient_for_tk(mode)
         {
             return Ok(());
@@ -5915,7 +5961,7 @@ impl<'a> RemlState<'a> {
         let pirls_result = self.execute_pirls_if_needed(rho)?;
         let (mut h_total, ridge_passport) = self.effectivehessian(pirls_result.as_ref())?;
         let mut firth_dense_operator: Option<Arc<FirthDenseOperator>> = None;
-        if self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood) {
+        if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
             let firth_n = pirls_result.x_transformed.nrows();
             let firth_p = pirls_result.x_transformed.ncols();
             if !super::firth_problem_scale_allows(firth_n, firth_p) {
@@ -5935,7 +5981,8 @@ impl<'a> RemlState<'a> {
                 )
                 .map_err(EstimationError::InvalidInput)?;
                 let firth_build_start = std::time::Instant::now();
-                let firth_op = Arc::new(Self::build_firth_dense_operator(
+                let firth_op = Arc::new(Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
                     x_dense.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -6070,8 +6117,8 @@ impl<'a> RemlState<'a> {
         )?;
         let (penalty_rank, logdet_s_pos, det1_values) =
             self.sparse_penalty_logdet_runtime(rho, penalty_blocks.as_ref());
-        let firth_dense_operator_original = if self.config.firth_bias_reduction
-            && reml_supports_firth(&self.config.likelihood)
+        let firth_dense_operator_original = if let Some(jeffreys_link) =
+            reml_robust_jeffreys_link(&self.config)
         {
             let firth_n = self.x().nrows();
             let firth_p = self.x().ncols();
@@ -6092,7 +6139,8 @@ impl<'a> RemlState<'a> {
                         "sparse exact REML runtime requires dense design for Firth operator",
                     )
                     .map_err(EstimationError::InvalidInput)?;
-                Some(Arc::new(Self::build_firth_dense_operator(
+                Some(Arc::new(Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
                     x_dense.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -7849,9 +7897,9 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         free_basis_opt: &Option<Array2<f64>>,
     ) -> Result<Option<std::sync::Arc<super::FirthDenseOperator>>, EstimationError> {
-        if !(self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood)) {
+        let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) else {
             return Ok(None);
-        }
+        };
 
         if let Some(z) = free_basis_opt.as_ref() {
             let x_projected = pirls_result.x_transformed.to_dense().dot(z);
@@ -7869,11 +7917,14 @@ impl<'a> RemlState<'a> {
                 );
                 return Ok(None);
             }
-            return Ok(Some(std::sync::Arc::new(Self::build_firth_dense_operator(
-                &x_projected,
-                &pirls_result.final_eta,
-                self.weights,
-            )?)));
+            return Ok(Some(std::sync::Arc::new(
+                Self::build_firth_dense_operator_for_link(
+                    jeffreys_link,
+                    &x_projected,
+                    &pirls_result.final_eta,
+                    self.weights,
+                )?,
+            )));
         }
 
         if let Some(cached) = bundle.firth_dense_operator.clone() {
@@ -7881,11 +7932,14 @@ impl<'a> RemlState<'a> {
         }
 
         let x_dense = pirls_result.x_transformed.to_dense();
-        Ok(Some(std::sync::Arc::new(Self::build_firth_dense_operator(
-            &x_dense,
-            &pirls_result.final_eta,
-            self.weights,
-        )?)))
+        Ok(Some(std::sync::Arc::new(
+            Self::build_firth_dense_operator_for_link(
+                jeffreys_link,
+                &x_dense,
+                &pirls_result.final_eta,
+                self.weights,
+            )?,
+        )))
     }
 
     /// Build the derivative provider, dispersion handling, zeroed TK placeholders,
@@ -8011,26 +8065,28 @@ impl<'a> RemlState<'a> {
 
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
-        let firth_op =
-            if self.config.firth_bias_reduction && reml_supports_firth(&self.config.likelihood) {
-                if let Some(cached) = bundle.firth_dense_operator_original.clone() {
-                    Some(cached)
-                } else {
-                    let x_dense = self
-                        .x()
-                        .try_to_dense_arc(
-                            "sparse exact REML runtime requires dense design for Firth operator",
-                        )
-                        .map_err(EstimationError::InvalidInput)?;
-                    Some(std::sync::Arc::new(Self::build_firth_dense_operator(
+        let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
+            if let Some(cached) = bundle.firth_dense_operator_original.clone() {
+                Some(cached)
+            } else {
+                let x_dense = self
+                    .x()
+                    .try_to_dense_arc(
+                        "sparse exact REML runtime requires dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                Some(std::sync::Arc::new(
+                    Self::build_firth_dense_operator_for_link(
+                        jeffreys_link,
                         x_dense.as_ref(),
                         &pirls_result.final_eta,
                         self.weights,
-                    )?))
-                }
-            } else {
-                None
-            };
+                    )?,
+                ))
+            }
+        } else {
+            None
+        };
 
         // Dispersion and derivative provider depend on family.
         let (dispersion, deriv_provider): (_, Box<dyn super::unified::HessianDerivativeProvider>) =
@@ -9771,9 +9827,9 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Check that Firth is not active (incompatible with link ext_coords).
+    /// Check that Firth/Jeffreys is not active (incompatible with link ext_coords).
     fn reject_firth_link_ext(&self) -> Result<(), EstimationError> {
-        if self.config.firth_bias_reduction {
+        if reml_robust_jeffreys_link(&self.config).is_some() {
             crate::bail_invalid_estim!(
                 "link-parameter ext_coord optimization is incompatible with \
                  Firth-adjusted outer gradients"

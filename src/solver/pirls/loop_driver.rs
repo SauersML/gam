@@ -1205,10 +1205,15 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         workspace,
         config.likelihood.clone(),
         config.link_kind.clone(),
-        config.firth_bias_reduction
+        (config.firth_bias_reduction
+            || !matches!(
+                config.robust_identification,
+                crate::solver::workflow::RobustIdentification::Off
+            ))
             && matches!(
                 &config.link_kind,
                 InverseLink::Standard(StandardLink::Logit)
+                    | InverseLink::Standard(StandardLink::Probit)
             ),
         transform_active.clone(),
         quadctx,
@@ -1257,7 +1262,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     } else {
         initial_beta
     };
-    let firth_active = config.firth_bias_reduction && matches!(link_function, LinkFunction::Logit);
+    let robust_on = !matches!(
+        config.robust_identification,
+        crate::solver::workflow::RobustIdentification::Off
+    );
+    // Inner P-IRLS Firth activation. The released path is the legacy
+    // `firth_bias_reduction` flag restricted to logit; under the robustness
+    // flag it broadens to every link with a closed-form Fisher-weight jet
+    // (currently `{Logit, Probit}`). With the flag `Off` this is byte-identical.
+    let firth_active = (config.firth_bias_reduction || robust_on)
+        && matches!(link_function, LinkFunction::Logit | LinkFunction::Probit);
     let base_max_step_halving = if firth_active { 60 } else { 30 };
     let options = WorkingModelPirlsOptions {
         // Firth logit fits often need more inner iterations to settle.
@@ -1548,6 +1562,10 @@ pub struct PirlsConfig {
     pub max_iterations: usize,
     pub convergence_tolerance: f64,
     pub firth_bias_reduction: bool,
+    /// Universal under-identification robustness policy. `Off` (default) leaves
+    /// the inner P-IRLS Firth activation byte-identical to released behavior
+    /// (legacy `firth_bias_reduction` on Binomial-Logit only).
+    pub robust_identification: crate::solver::workflow::RobustIdentification,
     /// Optional warm-start hint for `WorkingModelPirlsOptions::initial_lm_lambda`.
     /// Forwarded directly when `fit_model_for_fixed_rho` builds its
     /// internal options. See the field doc on `WorkingModelPirlsOptions`

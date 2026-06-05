@@ -805,6 +805,7 @@ impl RemlConfig {
             max_iterations: self.max_iterations,
             convergence_tolerance: self.pirls_convergence_tolerance,
             firth_bias_reduction: self.firth_bias_reduction,
+            robust_identification: self.robust_identification,
             // Caller (the REML runtime) populates this hint just before
             // each `execute_pirls_if_needed` call from the cached final
             // λ of the previous successful PIRLS solve.
