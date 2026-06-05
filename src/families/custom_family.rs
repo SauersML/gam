@@ -23567,10 +23567,10 @@ fn wire_output_channels<F: CustomFamily + ?Sized>(
 // TEMP FD-PROBE (remove before final): one-shot guards so the outer-gradient
 // consistency probe fires once per firth setting (OFF and Force) per process,
 // at the first finite value+gradient eval.
-static CF_OUTER_FD_PROBE_DONE_OFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static CF_OUTER_FD_PROBE_DONE_ON: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static CF_OUTER_FD_PROBE_DONE_OFF: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static CF_OUTER_FD_PROBE_DONE_ON: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -24071,7 +24071,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             } else {
                 &CF_OUTER_FD_PROBE_DONE_OFF
             };
-            if !guard.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let probe_idx = guard.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if probe_idx < 6 {
                 let g_analytic = eval_result.gradient.clone();
                 let rho_dim = rho.len();
                 // Control: evaluate the cost via the SAME ValueAndGradient path
@@ -24095,8 +24096,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     .map(|e| e.objective)
                 };
                 let mut report = format!(
-                    "[CF-OUTER-FD-PROBE] firth_armed={firth_armed} robust={:?} rho_dim={rho_dim} \
-                     objective={:.8e} |g_analytic|={:.6e} rho={:?}\n",
+                    "[CF-OUTER-FD-PROBE] eval#{probe_idx} firth_armed={firth_armed} robust={:?} \
+                     rho_dim={rho_dim} objective={:.8e} |g_analytic|={:.6e} rho={:?}\n",
                     outer_options.robust_identification,
                     eval_result.objective,
                     g_analytic.iter().map(|v| v * v).sum::<f64>().sqrt(),
