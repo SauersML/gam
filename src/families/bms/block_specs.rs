@@ -455,7 +455,8 @@ fn marginal_penalties_with_influence_ridge(
                 .assign(&shrinkage.sym_penalty);
             widened
         };
-        penalties.push(PenaltyMatrix::Dense(local));
+        penalties
+            .push(PenaltyMatrix::Dense(local).with_fixed_log_lambda(nullspace_ridge_log_lambda));
         nullspace_dims.push(0);
         log_lambdas.push(nullspace_ridge_log_lambda);
     }
@@ -478,7 +479,7 @@ fn marginal_penalties_with_influence_ridge(
             widened.slice_mut(s![..p_m, ..p_m]).assign(overlap);
             widened
         };
-        penalties.push(PenaltyMatrix::Dense(local));
+        penalties.push(PenaltyMatrix::Dense(local).with_fixed_log_lambda(overlap_ridge_log_lambda));
         nullspace_dims.push(0);
         log_lambdas.push(overlap_ridge_log_lambda);
     }
@@ -487,11 +488,14 @@ fn marginal_penalties_with_influence_ridge(
     // Full rank (nullspace 0); its log λ is pinned out of REML by a degenerate
     // ρ box.
     if p1 > 0 {
-        penalties.push(PenaltyMatrix::Blockwise {
-            local: Array2::<f64>::eye(p1),
-            col_range: p_m..total_dim,
-            total_dim,
-        });
+        penalties.push(
+            PenaltyMatrix::Blockwise {
+                local: Array2::<f64>::eye(p1),
+                col_range: p_m..total_dim,
+                total_dim,
+            }
+            .with_fixed_log_lambda(influence_ridge_log_lambda),
+        );
         nullspace_dims.push(0);
         log_lambdas.push(influence_ridge_log_lambda);
     }
@@ -1039,7 +1043,14 @@ fn inner_fit(
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, String> {
-    fit_custom_family(family, blocks, options).map_err(|e| e.to_string())
+    let mut options = options.clone();
+    // BMS carries fixed physical ridge penalties that regularize coefficient
+    // geometry but are not REML coordinates. The exact hyper-Hessian route can
+    // stall after that projection; the family has a dedicated exact-gradient
+    // path with full-data polish, so make it the primary nested smoother.
+    options.use_outer_hessian = false;
+    options.outer_tol = options.outer_tol.max(2.0e-5);
+    fit_custom_family(family, blocks, &options).map_err(|e| e.to_string())
 }
 
 pub fn fit_bernoulli_marginal_slope_terms(

@@ -881,14 +881,18 @@ fn build_reduced_design(
 
 fn pull_back_penalty(penalty: &PenaltyMatrix, kept: &[usize]) -> PenaltyMatrix {
     let label = penalty.precision_label().map(|s| s.to_string());
+    let fixed_log_lambda = penalty.fixed_log_lambda();
     let dense = penalty.as_dense_cow();
     let reduced =
         Array2::<f64>::from_shape_fn((kept.len(), kept.len()), |(i, j)| dense[[kept[i], kept[j]]]);
-    let base = PenaltyMatrix::Dense(reduced);
-    match label {
-        Some(lbl) => base.with_precision_label(lbl),
-        None => base,
+    let mut base = PenaltyMatrix::Dense(reduced);
+    if let Some(lbl) = label {
+        base = base.with_precision_label(lbl);
     }
+    if let Some(value) = fixed_log_lambda {
+        base = base.with_fixed_log_lambda(value);
+    }
+    base
 }
 
 #[cfg(test)]

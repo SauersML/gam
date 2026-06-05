@@ -3517,6 +3517,18 @@ fn drop_leading_penalty_columns(
                     .with_precision_label(label.clone()),
                 )
             }
+            PenaltyMatrix::Fixed { log_lambda, inner } => {
+                structural_nullspace_exact = false;
+                let dense = inner.to_dense();
+                Some(
+                    PenaltyMatrix::Dense(
+                        dense
+                            .slice(s![fixed_cols..full_dim, fixed_cols..full_dim])
+                            .to_owned(),
+                    )
+                    .with_fixed_log_lambda(*log_lambda),
+                )
+            }
         };
 
         if let Some(reduced) = reduced {
