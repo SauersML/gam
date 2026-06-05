@@ -1711,6 +1711,19 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Pre-fit linear separation detected in the realized binomial inverse-link design: \
+        {num_unpenalized_columns} effectively unpenalized columns admit a separating direction \
+        with minimum signed margin {min_signed_margin:.6e} (columns {column_indices:?}). \
+        The unpenalized MLE is not finite; enable Firth/Jeffreys bias reduction or \
+        remove/reparameterize/penalize the separating columns."
+    )]
+    PrefitLinearSeparationDetected {
+        min_signed_margin: f64,
+        num_unpenalized_columns: usize,
+        column_indices: Vec<usize>,
+    },
+
+    #[error(
         "Pre-fit rank deficiency detected in the realized unpenalized design: rank {rank} < {num_unpenalized_columns} \
         unpenalized columns (min eigenvalue {min_eigenvalue:.3e}, tolerance {tolerance:.3e}, columns {column_indices:?}). \
         Remove/reparameterize the aliased columns or add an explicit penalty/constraint before fitting."
@@ -2075,6 +2088,13 @@ struct PrefitSeparationDiagnostic {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct PrefitLinearSeparationDiagnostic {
+    min_signed_margin: f64,
+    num_unpenalized_columns: usize,
+    column_indices: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct PrefitRankDiagnostic {
     rank: usize,
     num_unpenalized_columns: usize,
@@ -2136,6 +2156,14 @@ fn canonical_unpenalized_column_mask(penalties: &[CanonicalPenalty], p: usize) -
     unpenalized
 }
 
+fn unpenalized_column_indices(unpenalized_columns: &[bool]) -> Vec<usize> {
+    unpenalized_columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &unpenalized)| unpenalized.then_some(idx))
+        .collect()
+}
+
 fn detect_prefit_unpenalized_rank_deficiency_in_design(
     w: ArrayView1<'_, f64>,
     x: &DesignMatrix,
@@ -2145,11 +2173,7 @@ fn detect_prefit_unpenalized_rank_deficiency_in_design(
         return Ok(None);
     }
 
-    let column_indices = unpenalized_columns
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &unpenalized)| unpenalized.then_some(idx))
-        .collect::<Vec<_>>();
+    let column_indices = unpenalized_column_indices(unpenalized_columns);
     let q = column_indices.len();
     if q <= 1 {
         return Ok(None);
@@ -2250,7 +2274,6 @@ fn reject_prefit_unpenalized_rank_deficiency(
             column_indices: diagnostic.column_indices,
         });
     }
-
     Ok(())
 }
 
@@ -2390,6 +2413,161 @@ fn detect_prefit_binomial_single_column_separation_in_design(
     ))
 }
 
+fn certify_prefit_binomial_linear_separator(
+    class: &[Option<bool>],
+    x: &DesignMatrix,
+    column_indices: &[usize],
+    direction: &[f64],
+) -> Result<Option<PrefitLinearSeparationDiagnostic>, EstimationError> {
+    debug_assert_eq!(x.nrows(), class.len());
+    debug_assert_eq!(column_indices.len(), direction.len());
+    if x.nrows() != class.len() || column_indices.len() != direction.len() {
+        return Ok(None);
+    }
+    let direction_norm = direction
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
+    if !direction_norm.is_finite() || direction_norm <= 0.0 {
+        return Ok(None);
+    }
+
+    let p = x.ncols();
+    let target_cells = 1_000_000usize;
+    let chunk_rows = (target_cells / p.max(1)).clamp(1, x.nrows().max(1));
+    let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    let mut min_signed_margin = f64::INFINITY;
+    for start in (0..x.nrows()).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(x.nrows());
+        let rows = end - start;
+        x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
+            .map_err(|err| {
+                EstimationError::LayoutError(format!(
+                    "pre-fit binomial linear-separation certification failed to stream design rows: {err}"
+                ))
+            })?;
+        for local_row in 0..rows {
+            let Some(is_positive) = class[start + local_row] else {
+                continue;
+            };
+            let mut dot = 0.0;
+            let mut row_norm_sq = 0.0;
+            for (local_col, &global_col) in column_indices.iter().enumerate() {
+                let value = chunk[[local_row, global_col]];
+                if !value.is_finite() {
+                    return Ok(None);
+                }
+                dot += direction[local_col] * value;
+                row_norm_sq += value * value;
+            }
+            let row_norm = row_norm_sq.sqrt();
+            if !row_norm.is_finite() {
+                return Ok(None);
+            }
+            let signed_margin = if is_positive { dot } else { -dot };
+            let tolerance = 1e-12 * direction_norm * row_norm.max(1.0);
+            if signed_margin <= tolerance {
+                return Ok(None);
+            }
+            min_signed_margin = min_signed_margin.min(signed_margin / direction_norm);
+        }
+    }
+    if !min_signed_margin.is_finite() {
+        return Ok(None);
+    }
+
+    Ok(Some(PrefitLinearSeparationDiagnostic {
+        min_signed_margin,
+        num_unpenalized_columns: column_indices.len(),
+        column_indices: column_indices.to_vec(),
+    }))
+}
+
+fn detect_prefit_binomial_linear_combination_separation_in_design(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    unpenalized_columns: &[bool],
+) -> Result<Option<PrefitLinearSeparationDiagnostic>, EstimationError> {
+    debug_assert_eq!(x.nrows(), y.len());
+    debug_assert_eq!(x.nrows(), w.len());
+    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
+    if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
+        return Ok(None);
+    }
+    let Some(class) = prefit_binary_response_classes(y, w) else {
+        return Ok(None);
+    };
+    let column_indices = unpenalized_column_indices(unpenalized_columns);
+    let q = column_indices.len();
+    if q == 0 {
+        return Ok(None);
+    }
+
+    let p = x.ncols();
+    let target_cells = 1_000_000usize;
+    let chunk_rows = (target_cells / p.max(1)).clamp(1, x.nrows().max(1));
+    let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    let mut direction = vec![0.0_f64; q];
+    let max_passes = (8 * q.max(1)).clamp(16, 128);
+    for _ in 0..max_passes {
+        let mut mistakes = 0usize;
+        for start in (0..x.nrows()).step_by(chunk_rows) {
+            let end = (start + chunk_rows).min(x.nrows());
+            let rows = end - start;
+            x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
+                .map_err(|err| {
+                    EstimationError::LayoutError(format!(
+                        "pre-fit binomial linear-separation check failed to stream design rows: {err}"
+                    ))
+                })?;
+            for local_row in 0..rows {
+                let Some(is_positive) = class[start + local_row] else {
+                    continue;
+                };
+                let sign = if is_positive { 1.0 } else { -1.0 };
+                let mut dot = 0.0;
+                let mut row_norm_sq = 0.0;
+                for (local_col, &global_col) in column_indices.iter().enumerate() {
+                    let value = chunk[[local_row, global_col]];
+                    if !value.is_finite() {
+                        return Ok(None);
+                    }
+                    dot += direction[local_col] * value;
+                    row_norm_sq += value * value;
+                }
+                if !row_norm_sq.is_finite() {
+                    return Ok(None);
+                }
+                let signed_margin = sign * dot;
+                let margin_tolerance = 1e-12 * row_norm_sq.sqrt().max(1.0);
+                if signed_margin > margin_tolerance {
+                    continue;
+                }
+                mistakes += 1;
+                if row_norm_sq <= 0.0 {
+                    continue;
+                }
+                let update_scale = sign / row_norm_sq;
+                for (local_col, &global_col) in column_indices.iter().enumerate() {
+                    direction[local_col] += update_scale * chunk[[local_row, global_col]];
+                }
+            }
+        }
+        if mistakes == 0 {
+            return certify_prefit_binomial_linear_separator(
+                &class,
+                x,
+                &column_indices,
+                &direction,
+            );
+        }
+    }
+
+    certify_prefit_binomial_linear_separator(&class, x, &column_indices, &direction)
+}
+
 fn prefit_binomial_separation_supported_link(link: &InverseLink) -> bool {
     matches!(
         link,
@@ -2425,6 +2603,18 @@ fn reject_prefit_binomial_separation(
             column_index: diagnostic.column_index,
             threshold: diagnostic.threshold,
             positive_above_threshold: diagnostic.positive_above_threshold,
+        });
+    }
+    if let Some(diagnostic) = detect_prefit_binomial_linear_combination_separation_in_design(
+        y,
+        w,
+        x_fit,
+        &unpenalized_columns,
+    )? {
+        return Err(EstimationError::PrefitLinearSeparationDetected {
+            min_signed_margin: diagnostic.min_signed_margin,
+            num_unpenalized_columns: diagnostic.num_unpenalized_columns,
+            column_indices: diagnostic.column_indices,
         });
     }
 
@@ -7397,6 +7587,37 @@ mod estimate_policy_tests {
             EstimationError::PrefitPerfectSeparationDetected {
                 column_index: 1,
                 positive_above_threshold: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prefit_binomial_rejects_linear_combination_separator() {
+        let x = array![
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, -1.0, 0.0],
+            [1.0, 0.0, -1.0]
+        ];
+        let y = array![1.0, 1.0, 0.0, 0.0];
+        let w = Array1::ones(y.len());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+            1e-7,
+            false,
+        );
+        let err = reject_prefit_binomial_separation(&cfg, y.view(), w.view(), &design, &[])
+            .expect_err("x1 + x2 separates although neither coordinate separates alone");
+
+        assert!(matches!(
+            err,
+            EstimationError::PrefitLinearSeparationDetected {
+                num_unpenalized_columns: 3,
                 ..
             }
         ));
