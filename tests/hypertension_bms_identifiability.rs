@@ -454,16 +454,16 @@ fn hypertension_shape_bms_matern_fit_is_not_refused_by_identifiability_audit() {
 }
 
 #[test]
-fn hypertension_shape_bms_matern_redundant_centers_are_rank_reduced() {
+fn hypertension_shape_bms_matern_centers60_are_rank_reduced() {
     gam::init_parallelism();
     let data = duplicate_pc_hypertension_shape_dataset();
     let cfg = FitConfig {
-        logslope_formula: Some("matern(PC1, PC2, PC3, centers=20, length_scale=1.0)".to_string()),
+        logslope_formula: Some("matern(PC1, PC2, PC3, centers=60, length_scale=1.0)".to_string()),
         z_column: Some("prs_z".to_string()),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        "event ~ matern(PC1, PC2, PC3, centers=20, length_scale=1.0) + sex + entry_age_z + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4",
+        "event ~ matern(PC1, PC2, PC3, centers=60, length_scale=1.0) + sex + entry_age_z + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4",
         &data,
         &cfg,
     );
