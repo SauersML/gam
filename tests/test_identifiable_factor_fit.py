@@ -55,6 +55,42 @@ def _toy_dataset(seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
     return x, aux
 
 
+def _issue_790_dataset(seed: int = 3) -> tuple[np.ndarray, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    n, d, k = 240, 32, 4
+    t = rng.normal(size=(n, k))
+    w = rng.normal(size=(d, k))
+    x = t @ w.T + 0.01 * rng.normal(size=(n, d))
+    aux = t[:, :2] + 0.02 * rng.normal(size=(n, 2))
+    return x, aux
+
+
+def _mean_best_abscorr(t: np.ndarray, aux: np.ndarray) -> float:
+    tc = t - t.mean(axis=0, keepdims=True)
+    ac = aux - aux.mean(axis=0, keepdims=True)
+    t_std = tc.std(axis=0, keepdims=True) + 1.0e-12
+    a_std = ac.std(axis=0, keepdims=True) + 1.0e-12
+    corr = np.abs((tc / t_std).T @ (ac / a_std) / t.shape[0])
+    return float(corr.max(axis=1).mean())
+
+
+def test_identifiable_factor_fit_default_auto_weights_issue_790() -> None:
+    x, aux = _issue_790_dataset()
+    result = gamfit.identifiable_factor_fit(
+        x,
+        aux=aux,
+        n_supervised=2,
+        n_free=2,
+        max_iter=400,
+        random_state=0,
+        check_identifiability=False,
+    )
+    corr_sup = _mean_best_abscorr(result.T_supervised, aux)
+    assert result.mech_sparsity_weight == pytest.approx(1.0e-4)
+    assert result.aux_prior_weight == pytest.approx(2.0)
+    assert corr_sup > 0.9
+
+
 def test_identifiable_factor_fit_smoke() -> None:
     x, aux = _toy_dataset()
     result = gamfit.identifiable_factor_fit(
