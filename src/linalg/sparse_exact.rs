@@ -1313,33 +1313,25 @@ impl TakahashiInverse {
         let (symbolic, values) = s.parts();
         let s_col_ptr = symbolic.col_ptr();
         let s_row_idx = symbolic.row_idx();
-        // tr(Z S) = Σ_diag Z[i,i] S[i,i] + 2 Σ_{i<j} Z[i,j] S[i,j]. Each column's
-        // contribution is independent of every other column's, so the outer loop
-        // is a pure associative reduction — fan it across rayon. `self.get` takes
-        // `&self`, and its on-demand exact-inverse-column cache is Mutex-guarded,
-        // so concurrent lookups (including cache-miss column solves) are sound.
-        (0..s.ncols())
-            .into_par_iter()
-            .map(|col| {
-                let col_start = s_col_ptr[col];
-                let col_end = s_col_ptr[col + 1];
-                let mut partial = 0.0;
-                for idx in col_start..col_end {
-                    let row = s_row_idx[idx];
-                    if row > col {
-                        continue; // skip lower triangle (handled via its mirror)
-                    }
-                    let val = values[idx];
-                    let z_ij = self.get(row, col);
-                    if row == col {
-                        partial += z_ij * val;
-                    } else {
-                        partial += 2.0 * z_ij * val;
-                    }
+        let mut trace = 0.0;
+        for col in 0..s.ncols() {
+            let col_start = s_col_ptr[col];
+            let col_end = s_col_ptr[col + 1];
+            for idx in col_start..col_end {
+                let row = s_row_idx[idx];
+                if row > col {
+                    continue; // skip lower triangle (handled via its mirror)
                 }
-                partial
-            })
-            .sum()
+                let val = values[idx];
+                let z_ij = self.get(row, col);
+                if row == col {
+                    trace += z_ij * val;
+                } else {
+                    trace += 2.0 * z_ij * val;
+                }
+            }
+        }
+        trace
     }
 }
 
