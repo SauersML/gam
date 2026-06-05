@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::device::GpuDeviceInfo;
 use super::error::GpuError;
-use super::policy::{GpuDispatchPolicy, GpuStartupCalibration};
+use super::policy::GpuDispatchPolicy;
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, result, sys};
 
@@ -186,12 +186,7 @@ impl GpuRuntime {
                 return Ok(None);
             };
 
-            let startup = GpuStartupCalibration {
-                gemm_crossover_flops: crate::gpu::linalg::startup_calibrate_gemm_crossover_flops(
-                    device.ordinal,
-                ),
-            };
-            let policy = GpuDispatchPolicy::calibrated_for_device_with_startup(&device, startup);
+            let policy = GpuDispatchPolicy::default();
             let memory_budget_bytes = device.free_mem_bytes.min(device.total_mem_bytes / 2);
             diagnostics::log_cuda_enabled(&device, &policy);
             diagnostics::log_cuda_pool(&devices);
