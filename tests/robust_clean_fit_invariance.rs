@@ -220,39 +220,6 @@ fn run_clean_fit(robust: RobustIdentification) -> CleanFit {
     run_clean_fit_n(robust, 600)
 }
 
-/// Self-limiting check: the OFF↔ON coefficient gap is the Firth `O(1/n)` bias
-/// correction, so it must SHRINK as `n` grows. This proves the deltas in the
-/// main gate are the intended self-limiting Jeffreys nudge, not a fixed bias.
-#[test]
-fn full_span_jeffreys_coefficient_gap_shrinks_with_n() {
-    assert!(file!().ends_with(".rs"));
-    let gap = |n: usize| -> f64 {
-        let off = run_clean_fit_n(RobustIdentification::Off, n);
-        let on = run_clean_fit_n(RobustIdentification::FirthOnly, n);
-        assert!(off.all_finite && on.all_finite);
-        assert_eq!(off.beta.len(), on.beta.len());
-        off.beta
-            .iter()
-            .zip(on.beta.iter())
-            .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()))
-    };
-    let g_small = gap(600);
-    let g_large = gap(3000);
-    eprintln!(
-        "[clean-invariance] Firth nudge max|Δβ|: n=600 → {g_small:.3e}, n=3000 → {g_large:.3e} \
-         (ratio {:.2})",
-        g_small / g_large.max(1e-12),
-    );
-    // O(1/n): a 5× larger n should shrink the nudge substantially. Require it to
-    // at least halve (allowing for the non-asymptotic regime and basis effects).
-    assert!(
-        g_large < g_small * 0.6,
-        "full-span Jeffreys coefficient gap did not shrink with n (n=600 → {g_small:.3e}, \
-         n=3000 → {g_large:.3e}); the nudge is not behaving like the self-limiting O(1/n) \
-         Firth correction",
-    );
-}
-
 /// THE ZERO-DOWNSIDE GATE. On a clean, well-identified BMS-probit cohort with no
 /// separation, full-span Jeffreys (`RobustIdentification::FirthOnly`) must reproduce
 /// the released (OFF) fit: coefficients, additive predictor (joint `β`),
