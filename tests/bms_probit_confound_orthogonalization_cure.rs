@@ -15,8 +15,8 @@
 //! span; the cross-block Gram vanishes, the pinned overlap ridge is retired, and
 //! the original-basis coefficients are recovered exactly. We assert:
 //!
-//!   1. Flag ON yields bounded marginal β (max|β_m| below a sane O(1) bound) AND
-//!      outer REML convergence, materially better than OFF.
+//!   1. The always-on robust path yields bounded marginal β (max|β_m| below a
+//!      sane O(1) bound) AND outer REML convergence.
 //!   2. The orthogonalization is exact: MᵀW·G̃ < 1e-10 in the pilot metric.
 //!   3. The coefficient round-trip (β_m = β̃_m − B·β_s) is exact (< 1e-12) and
 //!      the additive predictor M·β̃_m + G̃·β_s ≡ M·β_m + G·β_s is invariant.
@@ -28,7 +28,6 @@ use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::resource::ResourcePolicy;
 use gam::solver::orthogonal_reparam::OrthogonalReparam;
-use gam::solver::robust_identification::RobustConfig;
 use gam::terms::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineKnotSpec, OneDimensionalBoundary,
 };
@@ -276,17 +275,11 @@ fn orthogonalization_is_exact_and_round_trip_is_lossless() {
         w[i] = 0.25 + 0.75 * rng.random_range(0.0..1.0);
     }
 
-    let reparam = OrthogonalReparam::build(
-        RobustConfig {
-            firth_general: true,
-            orthogonalize_confounds: true,
-        },
-        m.view(),
-        g.view(),
-        &w,
-    )
-    .expect("orthogonal reparam build should succeed")
-    .expect("orthogonalize_confounds armed ⇒ Some");
+    // Robustness is now unconditional/always-on: the orthogonalizing reparam is
+    // built directly (no config flag), and `build_unconditional` returns the
+    // reparam object straight (`Result<Self, _>`, no inner `Option`).
+    let reparam = OrthogonalReparam::build_unconditional(m.view(), g.view(), &w)
+        .expect("orthogonal reparam build should succeed");
 
     // 1. MᵀW·G̃ ≈ 0.
     let g_tilde = reparam.reparameterized_confound().to_owned();
