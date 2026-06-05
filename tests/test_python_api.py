@@ -644,9 +644,11 @@ def _require_extension() -> None:
 
 
 def _pc_duchon(centers: int = 6) -> str:
+    # 4-PC joint Duchon: with order=0 (p_order=1), the kernel's 2nd derivative
+    # at origin exists iff 2*(1+power) > dim+2 = 6, i.e. power >= 3.
     return (
         f"duchon(pc1, pc2, pc3, pc4, centers={centers}, "
-        "order=0, power=2, length_scale=1)"
+        "order=0, power=3, length_scale=1)"
     )
 
 
