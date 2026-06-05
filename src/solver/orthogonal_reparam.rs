@@ -73,14 +73,9 @@
 //! the shear `B·β_c`. [`OrthogonalReparam::recover_original`] performs exactly
 //! this map, and [`OrthogonalReparam::reparameterized_confound`] returns `C̃`.
 //!
-//! # Flag gating
-//!
-//! Everything here is reached only when
-//! [`RobustConfig::orthogonalize_confounds`](crate::solver::robust_identification::RobustConfig)
-//! is `true`. The construction entry point [`OrthogonalReparam::build`] takes the
-//! config and returns `Ok(None)` when the flag is off, so a flag-off caller gets
-//! a clean no-op (no allocation, no design change) and behavior is byte-identical
-//! to the released solver.
+//! Robustness is unconditional: the construction entry point
+//! [`OrthogonalReparam::build_unconditional`] always builds the exact reparam.
+//! The caller decides whether there is a confound block to orthogonalize.
 
 use ndarray::{Array1, Array2, ArrayView2};
 
@@ -88,7 +83,6 @@ use crate::faer_ndarray::{
     FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y,
 };
 use crate::matrix::FactorizedSystem;
-use crate::solver::robust_identification::RobustConfig;
 use faer::Side;
 
 /// Relative ridge (vs. the largest weighted primary-Gram diagonal) added to
@@ -111,7 +105,7 @@ pub const ORTHOGONAL_PROJECTION_RIDGE_FLOOR: f64 = 1.0e-12;
 /// it is fully described by `B`; `C̃` is cached because the solver needs the new
 /// design and recomputing it is wasteful.
 ///
-/// Build with [`OrthogonalReparam::build`] (flag-gated). The round-trip
+/// Build with [`OrthogonalReparam::build_unconditional`]. The round-trip
 /// [`recover_original`](Self::recover_original) maps fitted reparameterized
 /// coefficients back to the original basis exactly.
 #[derive(Debug, Clone)]
@@ -124,14 +118,14 @@ pub struct OrthogonalReparam {
 
 impl OrthogonalReparam {
     /// Build the exact orthogonal reparameterization of the `confound` block
-    /// against the `primary` block's column span in the `w_metric` row metric,
-    /// **iff** `config.orthogonalize_confounds` is set.
+    /// against the `primary` block's column span in the `w_metric` row metric.
+    ///
+    /// Robustness is unconditional, so this always constructs the reparam (the
+    /// caller decides whether there is anything to orthogonalize; an empty span
+    /// `p_m == 0` or `p_c == 0` yields an identity-on-confound transform).
     ///
     /// Returns:
-    ///   - `Ok(None)` when the flag is off (no-op; the caller keeps the raw
-    ///     design — byte-identical to released behavior), OR when there is no
-    ///     span to project out (`p_m == 0` or `p_c == 0`).
-    ///   - `Ok(Some(reparam))` with `C̃` exactly W-orthogonal to `span(primary)`.
+    ///   - `Ok(reparam)` with `C̃` exactly W-orthogonal to `span(primary)`.
     ///   - `Err` on a dimension mismatch, a non-finite/negative metric, or a
     ///     non-finite result.
     ///
@@ -139,23 +133,6 @@ impl OrthogonalReparam {
     /// with `w_i ≥ 0` (the PIRLS row inner product at the pilot, so the resulting
     /// orthogonality holds in the metric the penalized joint solve actually sees;
     /// pass all-ones for the plain Euclidean metric).
-    pub fn build(
-        config: RobustConfig,
-        primary: ArrayView2<f64>,
-        confound: ArrayView2<f64>,
-        w_metric: &Array1<f64>,
-    ) -> Result<Option<Self>, String> {
-        if !config.orthogonalize_confounds {
-            // Flag off: pure no-op. The caller must use the raw confound design.
-            return Ok(None);
-        }
-        Self::build_unconditional(primary, confound, w_metric).map(Some)
-    }
-
-    /// The flag-independent construction. Exposed for callers that have already
-    /// decided to orthogonalize (e.g. a family-internal path that gated on the
-    /// flag itself) and for the unit tests. Prefer [`build`](Self::build) at the
-    /// flag boundary.
     pub fn build_unconditional(
         primary: ArrayView2<f64>,
         confound: ArrayView2<f64>,
@@ -324,12 +301,7 @@ impl OrthogonalReparam {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::workflow::RobustIdentification;
     use ndarray::{Array1, Array2};
-
-    fn config_on() -> RobustConfig {
-        RobustConfig::from_policy(RobustIdentification::Force)
-    }
 
     /// Build a primary design `M` and a confound `C` that genuinely overlaps it
     /// (a couple of `C`'s columns are `M` columns plus small noise), and verify
@@ -349,9 +321,8 @@ mod tests {
             c[[i, 1]] = (t * 3.0).cos();
         }
         let w = Array1::<f64>::from_elem(n, 1.0);
-        let reparam = OrthogonalReparam::build(config_on(), m.view(), c.view(), &w)
-            .expect("build should succeed")
-            .expect("flag on ⇒ Some");
+        let reparam = OrthogonalReparam::build_unconditional(m.view(), c.view(), &w)
+            .expect("build should succeed");
 
         let c_tilde = reparam.reparameterized_confound().to_owned();
         // MᵀW C̃ should be ~0.
@@ -417,20 +388,6 @@ mod tests {
             .iter()
             .fold(0.0_f64, |a, v| a.max(v.abs()));
         assert!(fdiff < 1e-10, "forward/inverse mismatch: {fdiff:e}");
-    }
-
-    /// When the flag is OFF the builder is a pure no-op: it returns `None` and the
-    /// caller keeps the raw design (byte-identical to released behavior).
-    #[test]
-    fn flag_off_is_noop() {
-        let n = 10;
-        let m = Array2::<f64>::ones((n, 2));
-        let c = Array2::<f64>::ones((n, 2));
-        let w = Array1::<f64>::from_elem(n, 1.0);
-        let off = RobustConfig::from_policy(RobustIdentification::Off);
-        let out =
-            OrthogonalReparam::build(off, m.view(), c.view(), &w).expect("build should succeed");
-        assert!(out.is_none(), "flag off must yield None (no reparam)");
     }
 
     /// When the confound does NOT overlap the primary span, predictions are
