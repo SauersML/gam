@@ -6923,7 +6923,7 @@ mod tests {
                     LinkComponent::LogLog,
                     LinkComponent::Cauchit,
                 ],
-                logits: vec![0.2, -0.4],
+                initial_rho: array![0.2, -0.4],
             })
             .expect("valid mixture spec"),
         );
