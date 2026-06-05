@@ -289,10 +289,10 @@ fn clean_fit_invariance_binomial_logit() {
 // ───────────────────────── GAMLSS (Gaussian location-scale) ─────────────────────────
 
 /// Clean Gaussian location-scale (GAMLSS) fit: a smooth mean and a smooth
-/// log-σ, both well-identified on ample data. This routes the robustness flag
-/// through the custom-family joint-Newton path (two coupled predictors). The
-/// Jeffreys term is scoped to the joint under-identified span, which is empty on
-/// this well-identified cohort, so ON must reproduce OFF.
+/// log-σ, both well-identified on ample data. This routes the always-on
+/// robustness machinery through the custom-family joint-Newton path (two coupled
+/// predictors). The Jeffreys term is scoped to the joint under-identified span,
+/// which is empty on this well-identified cohort, so the fit lands clean.
 #[test]
 fn clean_fit_invariance_gamlss_location_scale() {
     init_parallelism();
@@ -370,8 +370,8 @@ fn clean_fit_invariance_gamlss_location_scale() {
 
 /// Clean lognormal AFT survival fit with a parametric covariate and a smooth
 /// covariate, light censoring, ample events — well-identified. Routes the
-/// robustness flag through the survival custom-family path. ON must reproduce
-/// OFF.
+/// always-on robustness machinery through the survival custom-family path; the
+/// fit must land clean.
 #[test]
 fn clean_fit_invariance_survival_lognormal() {
     init_parallelism();
@@ -447,7 +447,7 @@ fn clean_fit_invariance_survival_lognormal() {
 //
 // The multinomial-softmax clean-fit gate was a pure flag-gating test: its only
 // assertion was that the public multinomial entrypoint did NOT expose the
-// (now-deleted) `robust_identification` knob, so an OFF-vs-ON comparison could
-// not be authored. With robustness unconditional there is no flag to gate on and
-// no OFF/ON contrast to author, so the test (and its `false`-returning capability
+// (now-deleted) robustness toggle, so an OFF-vs-ON comparison could not be
+// authored. With robustness unconditional there is no flag to gate on and no
+// OFF/ON contrast to author, so the test (and its `false`-returning capability
 // probe) carried no remaining value and was removed.
