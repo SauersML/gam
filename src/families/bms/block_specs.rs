@@ -238,32 +238,6 @@ impl BlockEffectiveJacobian for BmsLogslopeJacobian {
     }
 }
 
-/// Apply the structural confound reparameterization to a logslope design block:
-/// replace its dense design with the W-orthogonal `G̃ = G − M·B` carried by
-/// `reparam`. The penalty topology, null-space accounting and every range field
-/// are left untouched — only the realized column values are sheared (a
-/// coordinate change on the same penalized basis). Returns the design unchanged
-/// when `reparam` is `None` (flag off) or when the column count does not match
-/// the reparam's confound width (a defensive guard against a design rebuild that
-/// produced a different logslope basis than the one `B` was computed against, in
-/// which case the structural swap is skipped and the pinned ridges remain).
-fn apply_logslope_confound_reparam<'a>(
-    design: &'a TermCollectionDesign,
-    reparam: Option<&crate::solver::orthogonal_reparam::OrthogonalReparam>,
-) -> std::borrow::Cow<'a, TermCollectionDesign> {
-    let Some(reparam) = reparam else {
-        return std::borrow::Cow::Borrowed(design);
-    };
-    if design.design.ncols() != reparam.confound_cols() {
-        return std::borrow::Cow::Borrowed(design);
-    }
-    let mut swapped = design.clone();
-    swapped.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-        reparam.reparameterized_confound().to_owned(),
-    ));
-    std::borrow::Cow::Owned(swapped)
-}
-
 /// Horizontally stack the absorbed influence columns `Z̃_infl` onto the raw
 /// marginal design `M`, yielding the widened additive marginal-index design
 /// `[M | Z̃_infl]` (#461). When `influence_columns` is `None` the original
@@ -1322,97 +1296,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let cross_block_pilot_w_score_warp =
         pilot_irls_hessian_row_metric_at_eta(&rigid_pilot_eta, &spec.weights);
 
-    // ── Structural confound cure (robust.orthogonalize_confounds) ────────────
-    //
-    // When the universal-robustness `orthogonalize_confounds` flag is armed we
-    // resolve the marginal/logslope confound *by construction* instead of with
-    // the pinned overlap ridge: reparameterize the logslope design block so its
-    // columns are exactly W-orthogonal (in the rigid-pilot IRLS row metric the
-    // joint penalised Hessian sees) to the marginal block's column span.
-    //
-    // The confound is structural: the exposure `z` correlates with the same PC
-    // smooths both `M` (marginal surface) and `G` (logslope surface) are built
-    // from, so a component of the marginal index `M·β_m` can be explained almost
-    // equally well by the score-weighted logslope `diag(s·z)·G·β_s`. After
-    // `G̃ = G − M·B` (with `B = (MᵀW M)⁻¹ MᵀW G` at the rigid pilot) the
-    // cross-block Gram `MᵀW G̃` is exactly zero, so the joint penalised Hessian
-    // is block-orthogonal between the marginal and logslope spans at the pilot
-    // and no ridge is needed for identification. The reparameterization is a
-    // pure change of basis of the logslope columns; the fitted logslope
-    // coefficients `β_s` are unchanged and the original-basis marginal
-    // coefficients are recovered exactly at result assembly via
-    // `recover_original` (`β_m = β̃_m − B·β_s`).
-    //
-    // SCOPING: applied as a one-shot construction-time swap of `logslope_design.
-    // design`. This is exact in the fixed-design regime (κ disabled or no
-    // spatial terms), where `optimize_spatial_length_scale_exact_joint` builds
-    // the joint designs once and every `build_blocks` call sees this same
-    // reparameterized `logslope_design`. When spatial κ-learning is active the
-    // optimizer rebuilds designs per κ from its own bootstrap, so the swap is
-    // NOT installed there (the pinned ridges stay) — the reproducible
-    // production confound is κ-locked (`length_scale=…`), which this path
-    // covers. Flag OFF ⇒ `OrthogonalReparam::build` returns `None` ⇒ raw
-    // logslope design, overlap ridge stays ⇒ byte-identical to released.
-    let fixed_design_regime = !effective_kappa_options.enabled
-        || (spatial_length_scale_term_indices(&marginalspec_boot).is_empty()
-            && spatial_length_scale_term_indices(&logslopespec_boot).is_empty());
-    // The reparam `B = (MᵀW M)⁻¹ MᵀW G` (W = rigid-pilot IRLS row metric) is
-    // built LAZILY against the ACTUAL marginal/logslope designs the inner solver
-    // fits — NOT the pre-freeze probe designs. The spatial optimizer rebuilds
-    // designs from the frozen `*_boot` specs (the freeze can drop aliased
-    // logslope columns, so the fitted logslope width differs from the probe),
-    // and every `build_blocks` / `make_family` call passes those frozen designs.
-    // In the fixed-design regime those designs are identical across calls, so we
-    // cache the reparam after the first build (keyed implicitly by the constant
-    // design). `None` when the flag is off / the build found nothing to project /
-    // we are not in the fixed-design regime — byte-identical to released.
-    //
-    // The metric `W` is row-aligned with the data, so it is valid regardless of
-    // the column basis; capturing it here keeps the orthogonality in the inner
-    // product the joint Hessian actually uses.
-    let confound_reparam_cache: RefCell<
-        Option<Option<crate::solver::orthogonal_reparam::OrthogonalReparam>>,
-    > = RefCell::new(None);
-    let confound_reparam_for = |marginal_design: &TermCollectionDesign,
-                                logslope_design: &TermCollectionDesign|
-     -> Result<Option<crate::solver::orthogonal_reparam::OrthogonalReparam>, String> {
-        if !(robust.orthogonalize_confounds && fixed_design_regime) {
-            return Ok(None);
-        }
-        // Reuse the cached reparam ONLY when it matches the current design
-        // dimensions (the probe-vs-frozen design rebuild can change the marginal
-        // and/or logslope column count; a stale reparam keyed on the probe must
-        // not be applied to the frozen design). `OrthogonalReparam::primary_cols`
-        // is `p_m` and `confound_cols` is `p_c`, so a match on both is exact.
-        let want_pm = marginal_design.design.ncols();
-        let want_pc = logslope_design.design.ncols();
-        if let Some(cached) = confound_reparam_cache.borrow().as_ref() {
-            let matches = match cached {
-                Some(rp) => rp.primary_cols() == want_pm && rp.confound_cols() == want_pc,
-                // A cached `None` (build found nothing to project) is reusable
-                // only when dims are unchanged; otherwise fall through to rebuild.
-                None => true,
-            };
-            if matches {
-                return Ok(cached.clone());
-            }
-        }
-        let marginal_dense = marginal_design
-            .design
-            .try_to_dense_arc("bms confound-orthogonalization::marginal")?;
-        let logslope_dense = logslope_design
-            .design
-            .try_to_dense_arc("bms confound-orthogonalization::logslope")?;
-        let reparam = crate::solver::orthogonal_reparam::OrthogonalReparam::build(
-            robust,
-            marginal_dense.view(),
-            logslope_dense.view(),
-            &cross_block_pilot_w_score_warp,
-        )?;
-        confound_reparam_cache.replace(Some(reparam.clone()));
-        Ok(reparam)
-    };
-
     // Absorbed Stage-1 influence columns (#461, design §3). When the workflow
     // chained a CTN Stage-1 into this marginal-slope fit, `spec.score_influence_
     // jacobian` carries the out-of-fold `J = ∂z/∂θ₁`; the realized leakage
@@ -1747,34 +1630,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
                        logslope_design: &TermCollectionDesign,
                        sigma: Option<f64>|
      -> BernoulliMarginalSlopeFamily {
-        // Structural confound cure: the family kernel must see the SAME
-        // W-orthogonalized logslope design `G̃` the block spec was built against,
-        // so its (logslope_design, β_s) pair stays matched. The cache was
-        // populated by the preceding `build_blocks` call in this eval; a clean
-        // read keeps `make_family` infallible. No-op when off / cache empty.
-        let reparam = confound_reparam_cache
-            .borrow()
-            .as_ref()
-            .and_then(|c| c.clone());
-        if robust.orthogonalize_confounds {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/bms_dbg.log")
-            {
-                writeln!(
-                    f,
-                    "make_family logslope_ncols={} reparam_pc={:?}",
-                    logslope_design.design.ncols(),
-                    reparam.as_ref().map(|r| r.confound_cols()),
-                )
-                .ok();
-            }
-        }
-        let logslope_design_swapped =
-            apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
-        let logslope_design: &TermCollectionDesign = &logslope_design_swapped;
         // The kernel reads the marginal index from a matched (self.marginal_
         // design, β_m) pair. When the Stage-1 influence absorber is active the
         // marginal β is widened to [β_m; γ], so the family's marginal design
@@ -1938,7 +1793,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
     let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
-    let mut solved = optimize_spatial_length_scale_exact_joint(
+    let solved = optimize_spatial_length_scale_exact_joint(
         data_view,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
         &[marginal_terms.clone(), logslope_terms.clone()],
@@ -2133,33 +1988,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         },
         crate::families::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     )?;
-
-    // ── Structural confound cure: report the fit in the orthogonalized basis ──
-    //
-    // The fit ran with the logslope design sheared to the W-orthogonal basis
-    // `G̃ = G − M·B`, so the fitted (β̃_m, β_s) and the reported designs must
-    // agree on that basis for the BMS bilinear predictor
-    //   η_i = q_i·c_i + s·z_i·g_i,  q_i = M_i·β̃_m + offset_m,  g_i = G̃_i·β_s + offset_s
-    // to be reproduced. The spatial optimizer returns the ORIGINAL logslope
-    // design in `solved.designs[1]` (it rebuilds designs from the frozen specs,
-    // unaware of the construction-time shear), so we overwrite it with `G̃` here
-    // so reporting/prediction use the matched (β_s, G̃) pair. The marginal
-    // coefficients are left exactly as fit (β̃_m): the shear lives entirely in
-    // the logslope columns, and because `g` enters η nonlinearly, NO additive
-    // back-shear of β_m is applied (the additive `recover_original` identity
-    // does not transfer to the bilinear BMS predictor). `G̃` at predict rows is
-    // `G_pred − M_pred·B`; the shear `B` is the training-fit property the
-    // predict seam carries, mirroring the #461 influence-absorber seam below.
-    // No-op when the flag is off / no reparam installed (byte-identical).
-    let final_confound_reparam = confound_reparam_cache.borrow().as_ref().and_then(|c| c.clone());
-    if let Some(reparam) = final_confound_reparam.as_ref()
-        && let Some(design) = solved.designs.get_mut(1)
-        && design.design.ncols() == reparam.confound_cols()
-    {
-        design.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
-            reparam.reparameterized_confound().to_owned(),
-        ));
-    }
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
