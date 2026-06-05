@@ -22402,13 +22402,20 @@ fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'st
 /// every such case the outer REML stays byte-identical to the released solver.
 ///
 /// This is the OUTER-path companion to the inner-Newton wiring: the LAML score
-/// uses `log|H + S_λ + H_Φ|` and its analytic ρ-derivatives `tr((H+S_λ+H_Φ)⁻¹ ∂(H+S_λ)/∂ρ)`.
-/// Because `H_Φ` carries no ρ-dependence, the existing first/second derivative
-/// closures stay exactly correct; only the inverse used in the trace identity
-/// (and the operator's own `logdet()`) must reflect the augmented curvature, so
-/// the value and its gradient describe the SAME penalized objective. Folding
-/// `H_Φ` directly into the `HessianOperator` here is what keeps the outer score
-/// consistent with the inner-converged stationary system on the now-PD problem.
+/// uses `log|H + S_λ + H_Φ|` and its analytic ρ-derivatives
+/// `tr((H+S_λ+H_Φ)⁻¹ ∂_ρ(H+S_λ+H_Φ))`.
+///
+/// CORRECTNESS NOTE (was a bug — see `custom_family_outer_jeffreys_hphi_drift`).
+/// `H_Φ` has no EXPLICIT ρ-dependence, but it DOES depend on ρ implicitly through
+/// the mode β̂(ρ): `H_Φ = H_Φ(β̂(ρ))` because it is built from `H_id = Z_Jᵀ H Z_J`
+/// and `D_a = Z_Jᵀ ∂_a H Z_J`, both functions of β̂. So the exact outer gradient
+/// of `½ log|H+S_λ+H_Φ|` carries a `½ tr[(·)⁻¹ D_β H_Φ[v_k]]` drift term ALONGSIDE
+/// the likelihood drift `D_β H[v_k]`. Folding `H_Φ` into the `HessianOperator`
+/// (the `(·)⁻¹` kernel and `logdet()`) is necessary but NOT sufficient: the
+/// trace contraction must ALSO include `D_β H_Φ[v_k]`, supplied by the companion
+/// drift wrapper. Without it the analytic gradient describes a DIFFERENT objective
+/// than the value, breaking the line search / KKT certification exactly in the
+/// near-separating regime where the Jeffreys term is active.
 fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     states: &[ParameterBlockState],
