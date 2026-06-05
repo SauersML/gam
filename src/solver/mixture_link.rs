@@ -2221,7 +2221,7 @@ pub fn sas_inverse_link_jetwith_param_partials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{InverseLink, LinkComponent, MixtureLinkSpec, SasLinkState};
+    use crate::types::{InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, SasLinkState};
 
     #[test]
     fn softmax_jacobian_matchesfd() {
@@ -2974,6 +2974,14 @@ mod tests {
         })
         .expect("mixture state");
         let link = InverseLink::Mixture(state);
+        assert!(
+            inverse_link_has_fisher_weight_jet(&link),
+            "anchored mixtures with loglog/cauchit components must remain eligible for Firth"
+        );
+        assert!(
+            LikelihoodSpec::new(ResponseFamily::Binomial, link.clone()).supports_firth(),
+            "Firth support should use the mixture inverse-link Fisher jet, not standalone LinkFunction coverage"
+        );
 
         for eta in [-2.0_f64, -0.25, 0.75, 2.5] {
             let (w, w1, w2, w3, w4) =
