@@ -31,8 +31,8 @@ use gam::smooth::{SmoothBasisSpec, TermCollectionSpec};
 use gam::terms::term_builder::build_termspec;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal};
 
 /// `p = m` (polynomial null space contains all polynomials of degree `< m`).
@@ -87,7 +87,10 @@ fn resolve_hybrid_default_spec(n: usize, d: usize) -> TermCollectionSpec {
     let ds = dataset_with_covariates(n, d);
     let cmap = ds.column_map();
     let vars: Vec<String> = (0..d).map(|j| format!("x{}", j + 1)).collect();
-    let formula = format!("y ~ duchon({}, centers=12, length_scale=1.0)", vars.join(", "));
+    let formula = format!(
+        "y ~ duchon({}, centers=12, length_scale=1.0)",
+        vars.join(", ")
+    );
     let parsed = parse_formula(&formula).unwrap_or_else(|e| panic!("{formula}: {e}"));
     let mut notes = Vec::new();
     build_termspec(
@@ -162,7 +165,10 @@ fn hybrid_duchon_4d_default_builds_and_fits_via_formula() {
     let ds = dataset_with_covariates(n, d);
     let cmap = ds.column_map();
     let vars: Vec<String> = (0..d).map(|j| format!("x{}", j + 1)).collect();
-    let formula = format!("y ~ duchon({}, centers=10, length_scale=1.0)", vars.join(", "));
+    let formula = format!(
+        "y ~ duchon({}, centers=10, length_scale=1.0)",
+        vars.join(", ")
+    );
     let parsed = parse_formula(&formula).unwrap();
     let mut notes = Vec::new();
     let spec = build_termspec(

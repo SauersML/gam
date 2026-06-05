@@ -2001,10 +2001,9 @@ pub fn build_smooth_basis(
                             // `m = p + s = ⌊d/2⌋ + 1` for the hybrid kernel and agrees
                             // with the fractional cubic default for odd `d` (where the
                             // collocation floor already forces `s = (d-1)/2`).
-                            let max_op =
-                                crate::basis::duchon_max_active_operator_derivative_order(
-                                    &DuchonOperatorPenaltySpec::default(),
-                                );
+                            let max_op = crate::basis::duchon_max_active_operator_derivative_order(
+                                &DuchonOperatorPenaltySpec::default(),
+                            );
                             let (ns, s) = crate::basis::resolve_duchon_orders(
                                 cols.len(),
                                 requested_nullspace_order,
