@@ -13248,6 +13248,73 @@ mod tests {
     }
 
     #[test]
+    fn prepare_model_keeps_intercept_only_log_sigma_width() {
+        let n = 4usize;
+        let derivative_guard = 1e-6;
+        let spec = SurvivalLocationScaleSpec {
+            age_entry: Array1::from_elem(n, 1.0),
+            age_exit: Array1::from_iter((0..n).map(|i| 5.0 + i as f64)),
+            event_target: array![1.0, 0.0, 1.0, 1.0],
+            weights: Array1::ones(n),
+            inverse_link: residual_distribution_inverse_link(ResidualDistribution::Logistic),
+            derivative_guard,
+            max_iter: 4,
+            tol: 1e-8,
+            time_block: TimeBlockInput {
+                design_entry: DesignMatrix::from(Array2::zeros((n, 1))),
+                design_exit: DesignMatrix::from(Array2::zeros((n, 1))),
+                design_derivative_exit: DesignMatrix::from(Array2::ones((n, 1))),
+                offset_entry: Array1::zeros(n),
+                offset_exit: Array1::zeros(n),
+                derivative_offset_exit: Array1::from_elem(n, 2e-6),
+                time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                penalties: vec![Array2::zeros((1, 1))],
+                nullspace_dims: vec![1],
+                initial_log_lambdas: None,
+                initial_beta: None,
+            },
+            threshold_block: CovariateBlockKind::Static(ParameterBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            log_sigma_block: CovariateBlockKind::Static(ParameterBlockInput {
+                design: DesignMatrix::from(Array2::ones((n, 1))),
+                offset: Array1::zeros(n),
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_log_lambdas: None,
+                initial_beta: None,
+            }),
+            timewiggle_block: None,
+            linkwiggle_block: None,
+            cache_session: None,
+            cache_mirror_sessions: Vec::new(),
+        };
+
+        let prepared =
+            prepare_survival_location_scale_model(&spec).expect("location-scale model prepares");
+        assert_eq!(
+            prepared.log_sigma_fixed_cols, 0,
+            "constant log-sigma is a multiplicative free scale parameter and must not be dropped as an additive gauge"
+        );
+        assert_eq!(prepared.log_sigma_full_ncols, 1);
+        let log_sigma = prepared
+            .blockspecs
+            .iter()
+            .find(|block| block.name == "log_sigma")
+            .expect("prepared model should contain log_sigma block");
+        assert_eq!(
+            log_sigma.design.ncols(),
+            1,
+            "intercept-only log_sigma must stay width 1 rather than canonicalizing to a zero-width block"
+        );
+    }
+
+    #[test]
     fn prepare_model_joint_audit_resolves_via_gauge_ownership() {
         // End-to-end exercise of the #366 root cause: build the three coupled
         // location-scale blocks with mutually-aliased intercept directions
@@ -13750,6 +13817,19 @@ mod tests {
         )
         .expect("survival probability");
         assert!((survival - (1.0 - failure)).abs() <= 1e-14);
+    }
+
+    #[test]
+    fn lift_conditional_covariance_rejects_time_map_wider_than_raw() {
+        let z = array![[1.0, 0.0]];
+        let cov_reduced = Array2::<f64>::eye(2);
+        let err = lift_conditional_covariance(&cov_reduced, &z, 0, 0, 0, 0, 0, 0, 0).expect_err(
+            "a reduced time block wider than the raw time map must fail before ndarray assignment",
+        );
+        assert!(
+            err.contains("time map is wider than tall"),
+            "unexpected covariance-lift error: {err}"
+        );
     }
 
     #[test]
