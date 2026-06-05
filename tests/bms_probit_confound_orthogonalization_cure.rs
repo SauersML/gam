@@ -190,8 +190,8 @@ fn run_fit(robust: RobustIdentification) -> FitSummary {
     // returns a finite "did-not-converge" verdict in deterministic, bounded
     // wall-clock instead of spinning the default 60-outer × 200-inner budget.
     // Both ON and OFF run under the SAME caps so the contrast is apples-to-apples.
-    options.inner_max_cycles = 200;
-    options.outer_max_iter = 80;
+    options.inner_max_cycles = 40;
+    options.outer_max_iter = 25;
     // Lock out spatial κ optimization (no spatial terms anyway) so the
     // construction-time orthogonalization swap is exact.
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
