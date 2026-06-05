@@ -111,10 +111,6 @@ fn fit(
     (result.lambdas[0], result.beta.clone())
 }
 
-fn l2(v: &Array1<f64>) -> f64 {
-    v.dot(v).sqrt()
-}
-
 /// The firth-general default is *exactly* the explicit weakly-informative PC
 /// prior: turning robustness ON with an unset (`Flat`) prior must reproduce, to
 /// the bit, fitting with robustness OFF and that PC prior configured explicitly.
