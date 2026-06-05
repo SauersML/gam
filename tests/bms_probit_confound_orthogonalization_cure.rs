@@ -528,3 +528,13 @@ fn force_on_reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
         );
     }
 }
+
+#[test]
+fn scratch_firth_only_on_confounded_cohort() {
+    let on = run_fit(RobustIdentification::FirthOnly);
+    eprintln!(
+        "[SCRATCH firth-only] max|β_m|={:.4e} conv={} |g|={:?} finite={} err={:?}",
+        on.max_abs_marginal_beta, on.outer_converged, on.outer_gradient_norm, on.all_finite,
+        on.err_text.as_ref().map(|e| &e[..e.len().min(600)]),
+    );
+}
