@@ -24181,11 +24181,41 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             "outer smoothing optimization failed after exhausting strategy fallbacks: {e}.{last_error_detail}"
         )
     })?;
-    if !outer_result.converged {
+    // Geometry-driven terminal escalation. When the outer smoothing optimizer
+    // cannot certify convergence, the historical behavior is a hard dead-end
+    // (`custom_outer_nonconvergence_error`). Under the `firth_general` robustness
+    // gate the objective has been made *proper* (Jeffreys/PC term armed), so a
+    // non-convergence here is a geometry signal (indefinite / non-smooth LAML
+    // landscape that stalled Strong-Wolfe) — not a reason to fail. Instead we
+    // AUTO-ESCALATE to sampling the proper posterior about the best mode the
+    // inner solve reached (the never-fail bottom rung; see
+    // `hmc::sample_gaussian_mode_posterior`). The fast Arc/EFS path is untouched:
+    // this branch is only reached after the optimizer reports non-convergence,
+    // so nice landscapes never pay any sampling cost.
+    //
+    // The trigger is purely geometry/optimizer-derived (`outer_result.converged`
+    // plus the optimizer's own gradient/curvature cascade upstream), never a
+    // user flag. Flag-OFF (`firth_general == false`) preserves byte-identical
+    // behavior: the original error is returned unchanged.
+    let robust_escalation_armed = crate::solver::robust_identification::RobustConfig::from_policy(
+        options.robust_identification,
+    )
+    .firth_general;
+    let nonconvergence_escalation = !outer_result.converged && robust_escalation_armed;
+    if !outer_result.converged && !nonconvergence_escalation {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family outer smoothing",
             reason: custom_outer_nonconvergence_error(&outer_result, specs, &last_error_detail),
         });
+    }
+    if nonconvergence_escalation {
+        log::info!(
+            "[robust] outer smoothing did not certify convergence (plan={} iters={} |g|={}); \
+             firth_general armed → AUTO-ESCALATE to never-fail posterior sampling about the best mode",
+            outer_result.plan_used,
+            outer_result.iterations,
+            outer_result.final_grad_norm_report(),
+        );
     }
     let outer_grad_norm = outer_result.final_grad_norm;
     let rho_star = outer_result.rho;
@@ -24209,7 +24239,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                      {e}.{last_error_detail}"
         )
     })?;
-    if !inner.converged {
+    if !inner.converged && !nonconvergence_escalation {
         return Err(CustomFamilyError::Optimization {
             context: "fit_custom_family final inner refit",
             reason: format!(
@@ -24217,6 +24247,16 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 inner.cycles, last_error_detail
             ),
         });
+    }
+    if !inner.converged && nonconvergence_escalation {
+        // The mode the inner solve reached is still the seed for the proper
+        // posterior; a marginal inner non-convergence only widens the sampled
+        // intervals (honest, not wrong). Proceed to assemble + sample.
+        log::info!(
+            "[robust] final inner refit did not fully converge ({} cycles) under escalation; \
+             sampling the proper posterior about the reached mode",
+            inner.cycles,
+        );
     }
     let final_warm_start = constrained_warm_start_from_inner(&rho_star, &inner);
     store_persistent_custom_family_warm_start(
@@ -24230,7 +24270,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
              {e}.{last_error_detail}"
         )
     })?;
-    let covariance_conditional =
+    let mut covariance_conditional =
         compute_joint_covariance_required(family, specs, &inner.block_states, &per_block, options)?;
 
     let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block).map_err(
@@ -24257,6 +24297,78 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         context: "fit_custom_family penalized objective",
         reason,
     })?;
+    // Never-fail terminal rung. Under escalation, sample the proper posterior
+    // `N(β̂, H⁻¹)` whose precision `H` is the SAME penalized (Jeffreys-augmented)
+    // joint Hessian the inner solve produced at the reached mode `β̂`, and report
+    // its honest covariance in place of the optimizer-conditional one. Both `H`
+    // and `β̂` are in the reduced (canonical) coordinate space here; the joint
+    // lift below (`lift_fit_geometry_to_raw`) carries the sampled covariance back
+    // to raw space exactly like the conditional covariance it replaces.
+    //
+    // Sampling a multivariate normal cannot dead-end: `sample_gaussian_mode_posterior`
+    // jitters and Cholesky-factors `H`, so a marginally indefinite boundary
+    // Hessian only widens the intervals. If that structural factorization is
+    // genuinely impossible (e.g. a non-PSD precision after symmetrization) the
+    // sampler returns `Err`; rather than re-introducing the dead-end we then keep
+    // the optimizer-conditional covariance (a finite point with its existing SEs)
+    // and still return a fit — never an `Err` for non-convergence.
+    if nonconvergence_escalation {
+        if let Some(geom) = geometry.as_ref() {
+            let joint_mode: Array1<f64> = {
+                let mut mode = Vec::new();
+                for state in &inner.block_states {
+                    mode.extend(state.beta.iter().copied());
+                }
+                Array1::from(mode)
+            };
+            let precision = geom.penalized_hessian.as_array();
+            if joint_mode.len() == precision.nrows()
+                && precision.nrows() == precision.ncols()
+                && joint_mode.iter().all(|v| v.is_finite())
+            {
+                let sampling_config =
+                    crate::inference::hmc::NutsConfig::for_dimension(joint_mode.len());
+                match crate::inference::hmc::sample_gaussian_mode_posterior(
+                    joint_mode.view(),
+                    precision.view(),
+                    &sampling_config,
+                ) {
+                    Ok(posterior) => {
+                        let dim = joint_mode.len();
+                        let n = posterior.samples.nrows();
+                        if n > 1 {
+                            // Sample posterior covariance about the posterior mean
+                            // (honest intervals; not the Laplace inverse-Hessian).
+                            let mean = &posterior.posterior_mean;
+                            let mut cov = Array2::<f64>::zeros((dim, dim));
+                            for row in posterior.samples.rows() {
+                                let centered = &row.to_owned() - mean;
+                                for a in 0..dim {
+                                    for b in 0..dim {
+                                        cov[[a, b]] += centered[a] * centered[b];
+                                    }
+                                }
+                            }
+                            cov.mapv_inplace(|v| v / (n as f64 - 1.0));
+                            log::info!(
+                                "[robust] never-fail posterior sampling succeeded: dim={dim} \
+                                 draws={n} rhat={:.3} ess={:.0}; reporting sampled covariance",
+                                posterior.rhat,
+                                posterior.ess,
+                            );
+                            covariance_conditional = Some(cov);
+                        }
+                    }
+                    Err(reason) => {
+                        log::warn!(
+                            "[robust] never-fail posterior sampling could not factor the precision \
+                             ({reason}); retaining optimizer-conditional covariance (still no dead-end)",
+                        );
+                    }
+                }
+            }
+        }
+    }
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
     let lambdas_final = rho_star_physical.mapv(f64::exp);
     let log_lambdas_final = lambdas_final.mapv(|v| v.max(1e-300).ln());

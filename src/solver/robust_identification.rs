@@ -48,28 +48,63 @@ impl RobustConfig {
     /// struct the solver consumes.
     ///
     /// `Off` ⇒ every mechanism disabled (byte-identical to the released
-    /// solver). `Auto` and `Force` both request the full machinery; the
-    /// distinction between "enable only where a pathology is detected" (`Auto`)
-    /// and "enable unconditionally" (`Force`) is applied at the detection sites,
-    /// not here, so both map to all mechanisms armed.
+    /// solver).
+    ///
+    /// `Auto` ⇒ "apply robustness where the conditioning needs it." Both
+    /// mechanisms are armed, but each is *intrinsically conditioning-gated* at
+    /// its application site, so arming them is a no-op on a well-conditioned
+    /// fit:
+    ///   * `firth_general` is the full-identifiable-span Jeffreys penalty
+    ///     `Φ = ½ log|I(β)|`, which is SELF-LIMITING: its score is `O(1)`
+    ///     against the data's `O(n)` Fisher information. On a data-identified
+    ///     direction its only effect is the `O(1/n)` bias correction; it bites
+    ///     (supplies the missing `O(1)`-bounding curvature) ONLY where the
+    ///     information is near-singular, i.e. a near-separating direction. The
+    ///     conditioning gate is therefore built into the math — no detector
+    ///     threshold to tune.
+    ///   * `orthogonalize_confounds` runs the exact W-metric overlap removal in
+    ///     [`crate::solver::identifiability_canonical::canonicalize_for_identifiability_with_robust`],
+    ///     which falls through byte-identically when the structural-overlap
+    ///     detector finds nothing to drop (`ortho.dropped.is_empty()`). The
+    ///     conditioning gate is the overlap detector itself.
+    ///
+    /// `Force` ⇒ request the machinery unconditionally on supported families.
+    /// Identical arming to `Auto` today because both mechanisms self-gate; the
+    /// variant is retained as the explicit "do not rely on detection" escape
+    /// hatch for diagnostics and as a distinct knob if a future mechanism is
+    /// added whose application is NOT intrinsically conditioning-gated (such a
+    /// mechanism would branch on `policy == Force` here).
+    ///
+    /// `FirthOnly` ⇒ the principled, zero-downside cure: full identifiable-span
+    /// Jeffreys ONLY, no orthogonal-reparameterization design surgery. Jeffreys
+    /// is self-limiting, so it cures near-separation (in `ker(S)` OR `range(S)`)
+    /// by making the inner objective coercive without dropping any identifiable
+    /// design direction.
+    ///
+    /// Flipping the crate default to always-on robustness is a ONE-PLACE change:
+    /// set the `#[default]` on [`crate::solver::workflow::RobustIdentification`]
+    /// to `Auto`. Because `Auto`'s mechanisms self-gate, that flip cannot change
+    /// a well-conditioned fit; it only arms the cures where the conditioning
+    /// needs them. No call site reads the policy directly — every consumer goes
+    /// through this resolver — so the flip needs no other edit.
     #[inline]
     pub fn from_policy(policy: crate::solver::workflow::RobustIdentification) -> Self {
+        use crate::solver::workflow::RobustIdentification as P;
         match policy {
-            crate::solver::workflow::RobustIdentification::Off => Self {
+            P::Off => Self {
                 firth_general: false,
                 orthogonalize_confounds: false,
             },
-            crate::solver::workflow::RobustIdentification::Auto
-            | crate::solver::workflow::RobustIdentification::Force => Self {
+            // Auto and Force arm the same mechanisms; the "only where a
+            // pathology is detected" (Auto) vs "unconditionally" (Force)
+            // distinction is realised at each mechanism's conditioning-gated
+            // application site (self-limiting Jeffreys score; overlap detector),
+            // not by dropping a mechanism here.
+            P::Auto | P::Force => Self {
                 firth_general: true,
                 orthogonalize_confounds: true,
             },
-            // The principled, zero-downside cure: full identifiable-span Jeffreys
-            // ONLY, no orthogonal-reparameterization design surgery. Jeffreys is
-            // self-limiting, so it cures near-separation (in `ker(S)` OR
-            // `range(S)`) by making the inner objective coercive without dropping
-            // any identifiable design direction.
-            crate::solver::workflow::RobustIdentification::FirthOnly => Self {
+            P::FirthOnly => Self {
                 firth_general: true,
                 orthogonalize_confounds: false,
             },
