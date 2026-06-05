@@ -104,6 +104,24 @@ const CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
 /// log-det finite once the term fires.
 const CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
 
+/// Upper knot of the SMOOTH absolute conditioning ramp. Below
+/// `CONDITIONING_GATE_ABSOLUTE` (one observation-equivalent of curvature) the
+/// direction is near-separating and the Jeffreys weight is `1` (full term);
+/// above this value it is comfortably identified and the weight is `0` (skip).
+/// Between the two knots the weight is a C¹ cubic-smoothstep blend, so the outer
+/// LAML objective `Φ(ρ)` is CONTINUOUS as `β̂(ρ)` carries the spectrum across the
+/// boundary. A BINARY gate makes `Φ(ρ)` jump there, which the gradient-based
+/// outer smoother (BFGS) cannot optimize across — the root cause of the #787
+/// "outer smoothing did not converge" regression. `16` ≈ a handful of
+/// observation-equivalents: comfortably past "identified by the data".
+const CONDITIONING_GATE_ABSOLUTE_CLEAR: f64 = 16.0;
+
+/// Upper knot of the SMOOTH relative conditioning ramp (ramped in `log10` space
+/// since conditioning ratios span orders of magnitude). At
+/// `λ_min/λ_max ≥ CONDITIONING_GATE_RELATIVE_CLEAR` the relative sub-weight is
+/// `0`; at `≤ CONDITIONING_GATE_RELATIVE` it is `1`; smooth in between.
+const CONDITIONING_GATE_RELATIVE_CLEAR: f64 = 1e-6;
+
 /// Shared conditioning-gate predicate for the Jeffreys term, evaluated from the
 /// reduced-information spectrum (`λ_min`, `λ_max`). Returns `true` when the term
 /// should be SKIPPED (zero contribution) because the reduced information is
@@ -113,18 +131,56 @@ const CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
 /// fires. Centralised so every call site (objective value, gradient/curvature,
 /// and the `H_Φ` directional derivative) uses byte-identical gating — any
 /// divergence would reintroduce the value/derivative mismatch the term removes.
+///
+/// Returns a SMOOTH (C¹) weight in `[0, 1]`: `1` when the reduced information is
+/// under-identified (the term is fully active and supplies the `O(1)`-bounding
+/// curvature), `0` when comfortably well-conditioned (the term is skipped,
+/// preserving the clean-fit guarantee), and a cubic-smoothstep blend across each
+/// transition band so `Φ(ρ)`, `∇Φ` and `H_Φ` are continuous in the smoothing
+/// parameters. The term fires when EITHER criterion reports under-identification,
+/// so the weight is the MAX of the absolute and relative sub-weights.
 #[inline]
-fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
+fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
     if lambda_max <= 0.0 {
-        // Degenerate / non-positive spectrum: not well-conditioned, never skip.
-        return false;
+        // Degenerate / non-positive spectrum: not well-conditioned, fully active.
+        return 1.0;
     }
     if !lambda_min.is_finite() {
-        return false;
+        return 1.0;
     }
-    let relative_ok = lambda_min / lambda_max >= CONDITIONING_GATE_RELATIVE;
-    let absolute_ok = lambda_min >= CONDITIONING_GATE_ABSOLUTE;
-    relative_ok && absolute_ok
+    // `ramp_down(x, under, clear)`: the still-active weight, `1` for `x ≤ under`,
+    // `0` for `x ≥ clear`, C¹ cubic smoothstep `1 − (3t² − 2t³)` between.
+    #[inline]
+    fn ramp_down(x: f64, under: f64, clear: f64) -> f64 {
+        if x <= under {
+            return 1.0;
+        }
+        if x >= clear {
+            return 0.0;
+        }
+        let t = (x - under) / (clear - under);
+        1.0 - t * t * (3.0 - 2.0 * t)
+    }
+    let w_abs = ramp_down(
+        lambda_min,
+        CONDITIONING_GATE_ABSOLUTE,
+        CONDITIONING_GATE_ABSOLUTE_CLEAR,
+    );
+    let ratio = (lambda_min / lambda_max).max(f64::MIN_POSITIVE);
+    let w_rel = ramp_down(
+        ratio.log10(),
+        CONDITIONING_GATE_RELATIVE.log10(),
+        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
+    );
+    w_abs.max(w_rel)
+}
+
+/// Shared conditioning-gate predicate: `true` when the term is fully skippable
+/// (smooth weight is exactly `0`). Used by the cheap matrix-free pre-check, which
+/// must clear the UPPER (`*_CLEAR`) knots to certify a full skip.
+#[inline]
+fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
+    conditioning_gate_weight(lambda_min, lambda_max) == 0.0
 }
 
 /// Below this joint dimension the dense reduced eigendecomposition in
@@ -329,10 +385,14 @@ where
     if lambda_min_lb <= 0.0 || lambda_max_ub <= 0.0 {
         return Ok(false);
     }
+    // A full skip now requires the SMOOTH weight to be exactly 0, i.e. the
+    // spectrum must clear the UPPER (`*_CLEAR`) knots of both ramps — not merely
+    // the lower (firing) thresholds. The conservative bounds must clear those
+    // upper knots by the safety margin.
     let absolute_clears =
-        lambda_min_lb >= CHEAP_PRECHECK_SAFETY_MARGIN * CONDITIONING_GATE_ABSOLUTE;
+        lambda_min_lb >= CHEAP_PRECHECK_SAFETY_MARGIN * CONDITIONING_GATE_ABSOLUTE_CLEAR;
     let relative_clears = lambda_min_lb / lambda_max_ub
-        >= CHEAP_PRECHECK_SAFETY_MARGIN * CONDITIONING_GATE_RELATIVE;
+        >= CHEAP_PRECHECK_SAFETY_MARGIN * CONDITIONING_GATE_RELATIVE_CLEAR;
     Ok(absolute_clears && relative_clears)
 }
 
@@ -490,11 +550,12 @@ where
     // direction at small `n` that the scale-free relative ratio alone would miss
     // — we fall through to the floored log-det term below, the `O(1)`-bounding
     // curvature this machinery exists to supply.
-    {
+    let gate_weight = {
         let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        if conditioning_gate_skips(lambda_min, lambda_max) {
-            return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
-        }
+        conditioning_gate_weight(lambda_min, lambda_max)
+    };
+    if gate_weight == 0.0 {
+        return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
     }
     // Absolute floor relative to the dominant identified curvature: negligible on
     // identified directions (O(n)), positive on separating ones.
@@ -531,7 +592,7 @@ where
                 // Jeffreys gradient/curvature degenerate to zero (objective
                 // still well-defined). This keeps the term safe rather than
                 // wrong.
-                return Ok((phi, Array1::zeros(p), Array2::zeros((p, p))));
+                return Ok((gate_weight * phi, Array1::zeros(p), Array2::zeros((p, p))));
             }
         };
         if hdot.nrows() != p || hdot.ncols() != p {
@@ -578,7 +639,11 @@ where
             hphi[[b, a]] = value;
         }
     }
-    Ok((phi, grad, hphi))
+    // Scale the (value, gradient, curvature) triple by the smooth gate weight.
+    // `gate_weight == 1` in the fully-active (under-identified) regime, so this is
+    // identity there (byte-identical to the binary-gate term); it only tapers the
+    // term to 0 across the transition band, making Φ/∇Φ/H_Φ continuous in ρ.
+    Ok((gate_weight * phi, grad * gate_weight, hphi * gate_weight))
 }
 
 /// Exact directional derivative `D_β H_Φ[δ]` of the Tier-B Gauss-Newton Jeffreys
@@ -664,16 +729,19 @@ where
         format!("joint_jeffreys_hphi_directional_derivative: eigendecomposition failed: {e}")
     })?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-    {
-        // Same combined relative+absolute gate as the value/gradient path, via the
-        // shared predicate, so the derivative is byte-identically consistent with
-        // the `H_Φ` the objective uses (any divergence reintroduces the
-        // value/derivative mismatch this term exists to remove).
+    let gate_weight = {
+        // Same SMOOTH gate weight as the value/gradient path, so the drift is
+        // consistent with the (now smoothly-tapered) `H_Φ` the objective uses.
+        // The weight is treated as locally constant along `δ`: its own first-order
+        // variation feeds only the exact outer-Newton Hessian, not the BFGS outer
+        // gradient the smoother actually consumes, and tapering `H_Φ` smoothly is
+        // what removes the discontinuity that broke outer convergence (#787).
         let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        if conditioning_gate_skips(lambda_min, lambda_max) {
-            // Gated out ⇒ H_Φ ≡ 0 in a neighborhood ⇒ its drift vanishes.
-            return Ok(Array2::zeros((p, p)));
-        }
+        conditioning_gate_weight(lambda_min, lambda_max)
+    };
+    if gate_weight == 0.0 {
+        // Fully gated out ⇒ H_Φ ≡ 0 in a neighborhood ⇒ its drift vanishes.
+        return Ok(Array2::zeros((p, p)));
     }
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
     let mut inv_diag = Array1::<f64>::zeros(m);
@@ -764,7 +832,7 @@ where
             out[[b, a]] = value;
         }
     }
-    Ok(out)
+    Ok(out * gate_weight)
 }
 
 #[cfg(test)]
@@ -892,8 +960,8 @@ mod tests {
         let p = 2usize;
         let z = Array2::<f64>::eye(p);
         let mut h = Array2::<f64>::zeros((p, p));
-        h[[0, 0]] = 2.0;
-        h[[1, 1]] = 1.0; // ratio 0.5 ≫ 1e-8 ⇒ gated
+        h[[0, 0]] = 200.0;
+        h[[1, 1]] = 100.0; // λ_min=100 ≫ 16 (upper knot), ratio 0.5 ⇒ fully skipped
         let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
             // Nonzero derivative; would yield a nonzero gradient if not gated.
             let mut hd = Array2::<f64>::zeros((p, p));
@@ -967,14 +1035,53 @@ mod tests {
         assert!(!conditioning_gate_skips(CONDITIONING_GATE_RELATIVE * 0.1, 1.0));
         // Absolutely near-separating at small n (ratio fine, λ_min < 1) ⇒ do not skip.
         assert!(!conditioning_gate_skips(0.05, 1.0));
-        // Boundary: λ_min exactly at the absolute gate with a fine ratio ⇒ skip.
-        assert!(conditioning_gate_skips(
+        // SMOOTH boundary: λ_min at the lower (firing) knot is still fully active,
+        // and anywhere inside the ramp band is only partially tapered — NOT a full
+        // skip. A full skip requires clearing the UPPER (`*_CLEAR`) knot.
+        assert!(!conditioning_gate_skips(
             CONDITIONING_GATE_ABSOLUTE,
             CONDITIONING_GATE_ABSOLUTE
         ));
-        // Non-positive / non-finite spectra ⇒ never skip.
+        assert!(!conditioning_gate_skips(4.0, 100.0));
+        // Comfortably identified (λ_min past the upper knot, fine ratio) ⇒ skip.
+        assert!(conditioning_gate_skips(
+            CONDITIONING_GATE_ABSOLUTE_CLEAR,
+            CONDITIONING_GATE_ABSOLUTE_CLEAR
+        ));
+        // Non-positive / non-finite spectra ⇒ never skip (fully active).
         assert!(!conditioning_gate_skips(0.0, 0.0));
         assert!(!conditioning_gate_skips(f64::NAN, 100.0));
+    }
+
+    #[test]
+    fn conditioning_gate_weight_is_continuous_and_monotone() {
+        // The whole point of the smooth gate (#787): the weight is C⁰/C¹ across the
+        // absolute transition band [1, 16], so the outer LAML objective does not
+        // jump as β̂(ρ) carries λ_min across the boundary. Sweep λ_min upward with a
+        // fixed large λ_max (relative sub-weight pinned to 0 throughout) and assert
+        // the weight is 1 at/below the lower knot, 0 at/above the upper knot,
+        // strictly decreasing inside, and never jumps by more than a small step.
+        let lambda_max = 1.0e6; // ratio ≪ knots, so the absolute ramp dominates
+        let w = |lmin: f64| conditioning_gate_weight(lmin, lambda_max);
+        assert_eq!(w(CONDITIONING_GATE_ABSOLUTE), 1.0);
+        assert_eq!(w(0.1), 1.0);
+        assert_eq!(w(CONDITIONING_GATE_ABSOLUTE_CLEAR), 0.0);
+        assert_eq!(w(100.0), 0.0);
+        let mut prev = 1.0;
+        let n = 200usize;
+        for k in 0..=n {
+            let lmin = CONDITIONING_GATE_ABSOLUTE
+                + (CONDITIONING_GATE_ABSOLUTE_CLEAR - CONDITIONING_GATE_ABSOLUTE)
+                    * (k as f64 / n as f64);
+            let cur = w(lmin);
+            assert!((0.0..=1.0).contains(&cur));
+            assert!(cur <= prev + 1e-12, "weight must be non-increasing");
+            assert!(
+                (prev - cur).abs() < 0.1,
+                "no large jumps across the smooth band (continuity)"
+            );
+            prev = cur;
+        }
     }
 
     #[test]
