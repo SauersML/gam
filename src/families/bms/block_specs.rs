@@ -679,23 +679,19 @@ fn reparameterize_logslope_design_reduced(
 }
 
 /// Re-embed the term-collection marginal penalties at the (possibly widened)
-/// block dimension `p_m [+ p₁]`, then append fixed-ridge sub-penalties:
+/// block dimension `p_m [+ p₁]`, then append the #461 fixed-ridge absorber:
 ///
-///  1. (gam#754, always) a nullspace-shrinkage ridge `Z·Zᵀ` over the union of
-///     the unpenalized parametric columns (intercept + linear covariates) and
-///     each smooth's polynomial null space — the directions the term-collection
-///     penalties leave with zero mass. This bounds a near-separating parametric
-///     coefficient and gives the outer REML a finite optimum. See
-///     `MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA` for why it is fixed, not
-///     REML-learned.
+///  (#461, only with influence columns) the fixed-ridge absorber identity on
+///  the influence columns `p_m..p_m+p₁`.
 ///
-///  2. (gam#754, when present) a fixed overlap ridge over marginal directions
-///     whose pilot effective Jacobian lies in the weighted span of the pilot
-///     effective logslope Jacobian. This targets the basis-independent
-///     marginal/logslope confound seen on hypertension.
-///
-///  3. (#461, only with influence columns) the fixed-ridge absorber identity on
-///     the influence columns `p_m..p_m+p₁`.
+/// The two former gam#754 pinned ridges — the marginal nullspace-shrinkage ridge
+/// and the marginal↔logslope overlap ridge — are DELETED: robustness is now
+/// unconditional, so the full-identifiable-span Jeffreys term (`Z_J = I`, see
+/// `jeffreys_subspace_from_penalty`) supplies automatic O(n)-scaled curvature on
+/// every under-identified direction (subsuming the nullspace ridge), and the
+/// exact orthogonal reparameterization of the logslope design (now unconditional,
+/// see `build_reduced_logslope_reparam`) resolves the marginal↔logslope confound
+/// by construction (subsuming the overlap ridge).
 ///
 /// The genuine marginal smooth penalties keep their `col_range` (marginal
 /// columns stay in `0..p_m`). Returns `(penalties, nullspace_dims,
@@ -705,12 +701,8 @@ fn reparameterize_logslope_design_reduced(
 fn marginal_penalties_with_influence_ridge(
     design: &TermCollectionDesign,
     rho_marginal: &Array1<f64>,
-    overlap_penalty: Option<&Array2<f64>>,
     influence_columns: Option<&Array2<f64>>,
-    overlap_ridge_log_lambda: f64,
     influence_ridge_log_lambda: f64,
-    nullspace_ridge_log_lambda: f64,
-    robust: crate::solver::robust_identification::RobustConfig,
 ) -> Result<(Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>), String> {
     let p_m = design.design.ncols();
     let p1 = influence_columns.map(|z| z.ncols()).unwrap_or(0);
@@ -725,105 +717,7 @@ fn marginal_penalties_with_influence_ridge(
     let mut nullspace_dims = design.nullspace_dims.clone();
     let mut log_lambdas = rho_marginal.to_vec();
 
-    // (1) gam#754 nullspace-shrinkage ridge over the unpenalized directions of
-    // the marginal block (parametric columns + smooth null spaces). Aggregate
-    // the genuine smooth penalties at the marginal dimension `p_m` (NOT the
-    // influence-widened `total_dim`: the influence columns carry their own
-    // fixed ridge below and must not be double-shrunk), normalise each by its
-    // own max-abs so a single smooth cannot dominate the aggregate, and take the
-    // null space of the sum. With no penalties (pure-parametric marginal) the
-    // aggregate is zero and the shrinkage is the identity on all `p_m` columns.
-    //
-    // RETIRED under `robust.firth_general` (subsumed by full-span Jeffreys).
-    // This pinned ridge supplied curvature on the marginal block's polynomial
-    // nullspace (the unpenalized directions the term-collection penalties leave
-    // with zero mass). The full-identifiable-span Jeffreys term (`Z_J = I`, see
-    // `jeffreys_subspace_from_penalty`) now supplies automatic O(n)-scaled
-    // curvature on EVERY under-identified direction — including exactly that
-    // polynomial nullspace — so the hand-pinned ridge is redundant when Firth is
-    // armed. (An earlier attempt to retire it left REML non-convergent, but that
-    // was under the OLD `ker(S)`-scoped Jeffreys span, which by construction
-    // overlapped the same nullspace the ridge covered and so could not add
-    // independent curvature; full-span Jeffreys reaches every direction.)
-    // The Firth-armed convergence on the confounded cohort is gated by the
-    // `bms_probit_confound_orthogonalization_cure` / `robust_clean_fit_invariance`
-    // tests (Force / FirthOnly paths); if either regresses, drop the
-    // `&& !robust.firth_general` guard to reinstate the ridge — the retirement is
-    // a single, reversible condition. When `firth_general` is OFF (the released
-    // default) the ridge stays installed and the block specs are byte-identical
-    // to the released solver, so no baseline can move.
-    // The OVERLAP ridge (2) below is likewise retired, but under
-    // `orthogonalize_confounds`, since it addresses the distinct
-    // marginal↔logslope structural confound resolved by reparameterization.
-    if p_m > 0 && !robust.firth_general {
-        let mut aggregate = Array2::<f64>::zeros((p_m, p_m));
-        for bp in &design.penalties {
-            let scale = bp
-                .local
-                .iter()
-                .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
-            if scale > 0.0 {
-                let cols = bp.col_range.clone();
-                let mut target = aggregate.slice_mut(s![cols.clone(), cols.clone()]);
-                ndarray::Zip::from(&mut target)
-                    .and(&bp.local)
-                    .for_each(|agg, &value| *agg += value / scale);
-            }
-        }
-        let shrinkage = crate::terms::basis::build_nullspace_shrinkage_penalty(&aggregate)
-            .map_err(|e| format!("marginal nullspace ridge construction failed: {e}"))?
-            .ok_or_else(|| {
-                "marginal nullspace ridge invariant failed: non-empty BMS marginal block \
-                 had no shrinkable null direction"
-                    .to_string()
-            })?;
-        // `shrinkage.sym_penalty` is `Z·Zᵀ` (p_m × p_m), PSD with unit
-        // eigenvalues on the null directions and zero on the penalized span.
-        // Embed at `total_dim` (identity-zero on any influence tail).
-        let local = if total_dim == p_m {
-            shrinkage.sym_penalty
-        } else {
-            let mut widened = Array2::<f64>::zeros((total_dim, total_dim));
-            widened
-                .slice_mut(s![..p_m, ..p_m])
-                .assign(&shrinkage.sym_penalty);
-            widened
-        };
-        penalties
-            .push(PenaltyMatrix::Dense(local).with_fixed_log_lambda(nullspace_ridge_log_lambda));
-        nullspace_dims.push(0);
-        log_lambdas.push(nullspace_ridge_log_lambda);
-    }
-
-    // (2) gam#754 fixed overlap ridge: shrink only the marginal directions that
-    // are explainable by the score-weighted logslope surface. Embed at
-    // `total_dim`; influence columns retain their own absorber ridge below.
-    //
-    // When `robust.orthogonalize_confounds` is armed the logslope↔marginal
-    // confound is resolved exactly by construction (orthogonal reparameter-
-    // ization), so this pinned overlap ridge is retired (skip the penalty AND
-    // its `nullspace_dims`/`log_lambdas` slot to keep accounting consistent).
-    if let (false, Some(overlap)) = (robust.orthogonalize_confounds, overlap_penalty) {
-        if overlap.nrows() != p_m || overlap.ncols() != p_m {
-            return Err(format!(
-                "marginal/logslope overlap penalty shape mismatch: got {}x{}, expected {p_m}x{p_m}",
-                overlap.nrows(),
-                overlap.ncols(),
-            ));
-        }
-        let local = if total_dim == p_m {
-            overlap.clone()
-        } else {
-            let mut widened = Array2::<f64>::zeros((total_dim, total_dim));
-            widened.slice_mut(s![..p_m, ..p_m]).assign(overlap);
-            widened
-        };
-        penalties.push(PenaltyMatrix::Dense(local).with_fixed_log_lambda(overlap_ridge_log_lambda));
-        nullspace_dims.push(0);
-        log_lambdas.push(overlap_ridge_log_lambda);
-    }
-
-    // (3) #461 fixed-ridge absorber: identity on the influence columns only.
+    // (#461) fixed-ridge absorber: identity on the influence columns only.
     // Full rank (nullspace 0); its log λ is pinned out of REML by a degenerate
     // ρ box.
     if p1 > 0 {
@@ -1209,12 +1103,8 @@ fn build_marginal_blockspec_bms(
     logslope_offset: &Array1<f64>,
     logslope_baseline: f64,
     p_marginal: usize,
-    overlap_penalty: Option<&Array2<f64>>,
     influence_columns: Option<&Array2<f64>>,
-    overlap_ridge_log_lambda: f64,
     influence_ridge_log_lambda: f64,
-    nullspace_ridge_log_lambda: f64,
-    robust: crate::solver::robust_identification::RobustConfig,
 ) -> Result<ParameterBlockSpec, String> {
     let offset_m = offset + baseline;
     let offset_s = logslope_offset + logslope_baseline;
@@ -1236,12 +1126,8 @@ fn build_marginal_blockspec_bms(
     let (penalties, nullspace_dims, initial_log_lambdas) = marginal_penalties_with_influence_ridge(
         design,
         &rho,
-        overlap_penalty,
         influence_columns,
-        overlap_ridge_log_lambda,
         influence_ridge_log_lambda,
-        nullspace_ridge_log_lambda,
-        robust,
     )?;
     Ok(ParameterBlockSpec {
         name: "marginal_surface".to_string(),
@@ -1840,9 +1726,21 @@ pub fn fit_bernoulli_marginal_slope_terms(
         }
         out
     };
-    let marginal_logslope_overlap_penalty_matrix = marginal_logslope_overlap_penalty(
-        &marginal_design.design,
-        &logslope_design.design,
+    // Reduced-basis orthogonalisation of the logslope design through the BMS
+    // family's OWN internal `logslope_design` geometry (robust cure for the
+    // marginal↔logslope structural confound). Robustness is unconditional, so we
+    // always reparameterize the logslope coordinate space to a full-rank reduced
+    // basis `T` whose effective weighted columns are W-orthogonal to the marginal
+    // span at the rigid pilot — removing the rank-soft confounded direction the
+    // former pinned overlap ridge merely penalised. The transform is
+    // β/ρ-independent (pilot geometry only), so it is a one-shot construction-
+    // time map applied to every per-iteration logslope design inside
+    // `build_blocks` / `make_family`, and inverted at fit-result assembly so the
+    // reported logslope β is in the original basis. `None` ⇒ nothing to reduce
+    // (no rank-soft confounded direction) ⇒ raw design used everywhere.
+    let logslope_reduced_reparam: Option<ReducedLogslopeReparam> = build_reduced_logslope_reparam(
+        &marginal_design,
+        &logslope_design,
         z.as_ref(),
         &cross_block_pilot_w_score_warp,
         &spec.marginal_offset,
@@ -1851,35 +1749,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         baseline.1,
         probit_scale,
     )?;
-
-    // Reduced-basis orthogonalisation of the logslope design through the BMS
-    // family's OWN internal `logslope_design` geometry (robust cure for the
-    // marginal↔logslope structural confound). When `orthogonalize_confounds`
-    // is armed we reparameterize the logslope coordinate space to a full-rank
-    // reduced basis `T` whose effective weighted columns are W-orthogonal to
-    // the marginal span at the rigid pilot — removing the rank-soft confounded
-    // direction the pinned overlap ridge merely penalised. The transform is
-    // β/ρ-independent (pilot geometry only), so it is a one-shot construction-
-    // time map applied to every per-iteration logslope design inside
-    // `build_blocks` / `make_family`, and inverted at fit-result assembly so the
-    // reported logslope β is in the original basis. Flag OFF ⇒ `None` ⇒ raw
-    // design used everywhere ⇒ byte-identical to the released solver.
-    let logslope_reduced_reparam: Option<ReducedLogslopeReparam> = if robust.orthogonalize_confounds
-    {
-        build_reduced_logslope_reparam(
-            &marginal_design,
-            &logslope_design,
-            z.as_ref(),
-            &cross_block_pilot_w_score_warp,
-            &spec.marginal_offset,
-            &spec.logslope_offset,
-            baseline.0,
-            baseline.1,
-            probit_scale,
-        )?
-    } else {
-        None
-    };
     // Apply the reduced reparam to a logslope `TermCollectionDesign`, or return
     // the raw design clone when the reparam is absent (flag off / nothing to
     // reduce). Used by both `build_blocks` and `make_family` so the family's
@@ -1965,12 +1834,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 &spec.logslope_offset,
                 baseline.1,
                 p_m,
-                marginal_logslope_overlap_penalty_matrix.as_ref(),
                 influence_columns.as_ref(),
-                MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA,
                 INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
-                MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
-                robust,
             )?,
             build_logslope_blockspec_bms(
                 logslope_design,

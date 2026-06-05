@@ -18162,6 +18162,19 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
         true
     }
 
+    fn outer_hessian_derivative_kernel(
+        &self,
+    ) -> Option<crate::solver::estimate::reml::unified::OuterHessianDerivativeKernel> {
+        // Delegate to the inner provider so the matrix-free outer-HESSIAN route
+        // (the `Callback { first, second }` kernel) is preserved. This kernel
+        // feeds ONLY the outer Hessian, never the gradient (the gradient's
+        // first-order trace flows through `hessian_derivative_correction_result`,
+        // which IS wrapped above). The H_Φ SECOND-order drift is the documented
+        // residual gap; routing the kernel unchanged keeps the Hessian a
+        // consistent PD curvature surrogate without forcing dense assembly.
+        self.inner.outer_hessian_derivative_kernel()
+    }
+
     fn family_outer_hessian_operator(
         &self,
     ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
@@ -19085,7 +19098,7 @@ fn joint_outer_evaluate(
         .map(|hphi| hphi.mapv(|value| rho_curvature_scale * value));
 
     // Build derivative provider from the caller-supplied closures.
-    let provider_box: Box<dyn HessianDerivativeProvider + '_> =
+    let base_provider_box: Box<dyn HessianDerivativeProvider + '_> =
         if let (Some(owned_dh), Some(owned_d2h)) = (owned_compute_dh, owned_compute_d2h) {
             Box::new(OwnedJointDerivProvider {
                 compute_dh: owned_dh,
@@ -19103,6 +19116,21 @@ fn joint_outer_evaluate(
                 family_outer_hessian_operator: batched_outer_hessian_operator.clone(),
             })
         };
+
+    // Install the Jeffreys-`H_Φ` mode-response drift on top of the likelihood
+    // drift whenever the Jeffreys term is active. This is the term that makes the
+    // analytic outer gradient match the augmented objective `½ log|H+S_λ+H_Φ|`;
+    // without it the gradient omits `D_β H_Φ[v_k]` and the line search / KKT
+    // certification drifts in exactly the near-separating regime this machinery
+    // exists for. `None` ⇒ provider used unwrapped (byte-identical released path).
+    let provider_box: Box<dyn HessianDerivativeProvider + '_> = match jeffreys_hphi_drift {
+        Some(drift) => Box::new(JeffreysHphiAwareJointDerivatives::new(
+            base_provider_box,
+            drift,
+            total,
+        )),
+        None => base_provider_box,
+    };
 
     let scaled_s_lambdas: Vec<Array2<f64>> = inner
         .s_lambdas
@@ -21189,6 +21217,12 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 specs,
                 &ranges,
             )?,
+            custom_family_outer_jeffreys_hphi_drift(
+                family,
+                &inner.block_states,
+                specs,
+                &ranges,
+            )?,
         )?;
 
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
@@ -21328,6 +21362,10 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             specs,
                             &ranges,
                         )?,
+                        // ValueOnly: the gradient is supplied separately below, so
+                        // the H_Φ mode-response drift (a gradient-only term) is not
+                        // needed here.
+                        None,
                     )?;
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
@@ -21408,6 +21446,12 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 eval_mode,
             )?,
             custom_family_outer_jeffreys_hphi(
+                family,
+                &inner.block_states,
+                specs,
+                &ranges,
+            )?,
+            custom_family_outer_jeffreys_hphi_drift(
                 family,
                 &inner.block_states,
                 specs,
@@ -21724,6 +21768,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             eval_mode,
         )?,
         custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
+        custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
     )?;
 
     Ok(eval_result)
