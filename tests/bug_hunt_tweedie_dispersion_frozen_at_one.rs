@@ -1,5 +1,5 @@
-//! Tweedie regression freezes the dispersion `φ` at 1.0 instead of estimating
-//! it from the data.
+//! Regression lock for issue #771: Tweedie regression must estimate the
+//! dispersion `φ` from the data rather than freezing it at 1.0.
 //!
 //! For a Tweedie GLM the response variance is `Var(y) = φ · μ^p` with `φ` a
 //! genuine free dispersion parameter (this is the whole point of the family —
@@ -8,11 +8,11 @@
 //! must be estimated, exactly as Gamma's shape and the Gaussian residual
 //! variance are. mgcv's `tw()` / statsmodels' Tweedie both estimate it.
 //!
-//! `LikelihoodSpec::default_scale_metadata` (src/types.rs) lumps `Tweedie` in
-//! with `Binomial | Poisson` and returns `FixedDispersion { phi: 1.0 }`, so the
-//! fitted coefficient covariance `Vb = φ · H⁻¹` uses `φ = 1` no matter how
-//! over-dispersed the data are. The user-visible consequence: prediction
-//! standard errors do **not** scale with the data's dispersion.
+//! The original bug was rooted in `LikelihoodSpec::default_scale_metadata`
+//! (src/types.rs), which lumped `Tweedie` in with `Binomial | Poisson` and
+//! returned `FixedDispersion { phi: 1.0 }`. The fix makes Tweedie use
+//! `EstimatedTweediePhi`, refreshed from converged-η Pearson residuals, so the
+//! IRLS weight and fitted coefficient covariance reflect the data's dispersion.
 //!
 //! This test fits two Tweedie datasets that share the *same covariate values*
 //! and the *same mean structure* but very different true dispersions
