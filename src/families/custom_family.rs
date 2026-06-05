@@ -23564,6 +23564,14 @@ fn wire_output_channels<F: CustomFamily + ?Sized>(
     Ok(Some(wired))
 }
 
+// TEMP FD-PROBE (remove before final): one-shot guards so the outer-gradient
+// consistency probe fires once per firth setting (OFF and Force) per process,
+// at the first finite value+gradient eval.
+static CF_OUTER_FD_PROBE_DONE_OFF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CF_OUTER_FD_PROBE_DONE_ON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -24047,6 +24055,97 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 return Err(EstimationError::RemlOptimizationFailed(e));
             }
         };
+        // ── TEMP FD-PROBE (remove before final) ──────────────────────────────
+        // One-shot central-difference check of the analytic outer LAML gradient
+        // against the SAME objective the optimizer minimizes, re-invoking
+        // `outerobjectivegradienthessian_labeled` in ValueOnly mode at rho ±
+        // h·e_i. Fires once per firth setting (OFF vs Force) per process, at the
+        // first finite value+gradient eval (the optimizer's seed rho).
+        {
+            let firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
+                outer_options.robust_identification,
+            )
+            .firth_general;
+            let guard = if firth_armed {
+                &CF_OUTER_FD_PROBE_DONE_ON
+            } else {
+                &CF_OUTER_FD_PROBE_DONE_OFF
+            };
+            if !guard.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                let g_analytic = eval_result.gradient.clone();
+                let rho_dim = rho.len();
+                let cost_at = |rho_pert: &Array1<f64>| -> Option<f64> {
+                    let wr = screened_outer_warm_start(outer.warm_cache.as_ref(), rho_pert);
+                    outerobjectivegradienthessian_labeled(
+                        family,
+                        specs,
+                        &outer_options,
+                        &label_layout,
+                        rho_pert,
+                        wr,
+                        &rho_prior,
+                        EvalMode::ValueOnly,
+                    )
+                    .ok()
+                    .filter(|e| e.inner_converged && e.objective.is_finite())
+                    .map(|e| e.objective)
+                };
+                let mut report = format!(
+                    "[CF-OUTER-FD-PROBE] firth_armed={firth_armed} robust={:?} rho_dim={rho_dim} \
+                     objective={:.8e} |g_analytic|={:.6e} rho={:?}\n",
+                    outer_options.robust_identification,
+                    eval_result.objective,
+                    g_analytic.iter().map(|v| v * v).sum::<f64>().sqrt(),
+                    rho.as_slice().unwrap_or(&[]),
+                );
+                for &h in &[1e-4_f64, 1e-5, 1e-6] {
+                    let mut max_abs = 0.0_f64;
+                    let mut max_rel = 0.0_f64;
+                    let mut worst = 0usize;
+                    for i in 0..rho_dim {
+                        let mut rp = rho.clone();
+                        let mut rm = rho.clone();
+                        rp[i] += h;
+                        rm[i] -= h;
+                        let (lp, lm) = match (cost_at(&rp), cost_at(&rm)) {
+                            (Some(a), Some(b)) => (a, b),
+                            _ => {
+                                report.push_str(&format!("  h={h:.0e} i={i} FD eval failed\n"));
+                                continue;
+                            }
+                        };
+                        let g_fd = (lp - lm) / (2.0 * h);
+                        let ga = if i < g_analytic.len() { g_analytic[i] } else { 0.0 };
+                        let abs = (ga - g_fd).abs();
+                        let rel = abs / ga.abs().max(g_fd.abs()).max(1e-12);
+                        if abs > max_abs {
+                            max_abs = abs;
+                            worst = i;
+                        }
+                        max_rel = max_rel.max(rel);
+                        report.push_str(&format!(
+                            "  h={h:.0e} i={i:2} g_analytic={ga:+.6e} g_fd={g_fd:+.6e} \
+                             abs={abs:.3e} rel={rel:.3e}\n",
+                        ));
+                    }
+                    report.push_str(&format!(
+                        "[CF-OUTER-FD-PROBE] firth_armed={firth_armed} h={h:.0e} SUMMARY \
+                         max_abs={max_abs:.4e} (i={worst}) max_rel={max_rel:.4e}\n",
+                    ));
+                }
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/bms_fd_probe.log")
+                {
+                    if f.write_all(report.as_bytes()).is_err() {
+                        log::warn!("[CF-OUTER-FD-PROBE] probe log write failed");
+                    }
+                }
+                log::warn!("{report}");
+            }
+        }
         let inner_beta_hint = Some(Array1::from_iter(
             eval_result
                 .warm_start

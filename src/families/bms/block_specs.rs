@@ -14,14 +14,6 @@ use crate::families::marginal_slope_orthogonal::{
 use crate::matrix::FactorizedSystem;
 use faer::Side;
 
-// TEMP FD-PROBE (remove before final): one-shot guards so the outer-gradient
-// consistency probe fires once per robust setting (OFF and Force) per process,
-// at the optimizer's seed rho.
-static BMS_OUTER_FD_PROBE_DONE_OFF: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static BMS_OUTER_FD_PROBE_DONE_ON: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
 const BMS_PROBIT_SEPARATION_BETA_INF: f64 = 40.0;
 
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
@@ -2307,117 +2299,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 return Err(
                     "exact bernoulli marginal-slope inner solve did not converge".to_string(),
                 );
-            }
-            // ── TEMP FD-PROBE (remove before final) ──────────────────────────
-            // One-shot finite-difference check of the analytic outer LAML
-            // gradient against a central difference of the SAME objective the
-            // optimizer minimizes (re-invoking this exact evaluator cost-only at
-            // rho ± h·e_i). Runs once per process at the seed rho, for ANY robust
-            // setting, so we can compare ON (Force) vs OFF. The Force/firth flag
-            // is read from `options.robust_identification`.
-            {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/bms_fd_probe.log")
-                {
-                    if writeln!(
-                        f,
-                        "[BMS-FD-PROBE TRACE] vg-closure eval_mode={:?} robust={:?}",
-                        eval_mode, options.robust_identification
-                    )
-                    .is_err()
-                    {
-                        log::warn!("[BMS-FD-PROBE] trace write failed");
-                    }
-                }
-            }
-            let firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
-                options.robust_identification,
-            )
-            .firth_general;
-            let probe_guard = if firth_armed {
-                &BMS_OUTER_FD_PROBE_DONE_ON
-            } else {
-                &BMS_OUTER_FD_PROBE_DONE_OFF
-            };
-            if matches!(eval_mode, EvalMode::ValueAndGradient | EvalMode::ValueGradientHessian)
-                && !probe_guard.swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                let robust = options.robust_identification;
-                let g_analytic = eval.gradient.clone();
-                let rho_dim = rho.len();
-                let cost_at = |rho_pert: &Array1<f64>| -> Option<f64> {
-                    let dblocks = get_derivative_blocks(theta, specs, designs).ok()?;
-                    let e = evaluate_custom_family_joint_hyper_shared(
-                        &family,
-                        &blocks,
-                        &joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol),
-                        rho_pert,
-                        dblocks,
-                        exact_warm_start.borrow().as_ref(),
-                        EvalMode::ValueOnly,
-                    )
-                    .ok()?;
-                    Some(e.objective)
-                };
-                let mut report = String::new();
-                let g_norm = g_analytic
-                    .slice(s![..rho_dim])
-                    .dot(&g_analytic.slice(s![..rho_dim]))
-                    .sqrt();
-                report.push_str(&format!(
-                    "[BMS-FD-PROBE] robust={robust:?} rho_dim={rho_dim} objective={:.8e} \
-                     |g_analytic|={g_norm:.6e}\n",
-                    eval.objective,
-                ));
-                for &h in &[1e-4_f64, 1e-5, 1e-6] {
-                    let mut max_abs = 0.0_f64;
-                    let mut max_rel = 0.0_f64;
-                    let mut worst = 0usize;
-                    for i in 0..rho_dim {
-                        let mut rp = rho.clone();
-                        let mut rm = rho.clone();
-                        rp[i] += h;
-                        rm[i] -= h;
-                        let (lp, lm) = match (cost_at(&rp), cost_at(&rm)) {
-                            (Some(a), Some(b)) => (a, b),
-                            _ => {
-                                report.push_str(&format!("  h={h:.0e} i={i} FD eval failed\n"));
-                                continue;
-                            }
-                        };
-                        let g_fd = (lp - lm) / (2.0 * h);
-                        let ga = g_analytic[i];
-                        let abs = (ga - g_fd).abs();
-                        let rel = abs / ga.abs().max(g_fd.abs()).max(1e-12);
-                        if abs > max_abs {
-                            max_abs = abs;
-                            worst = i;
-                        }
-                        max_rel = max_rel.max(rel);
-                        report.push_str(&format!(
-                            "  h={h:.0e} i={i:2} g_analytic={ga:+.6e} g_fd={g_fd:+.6e} \
-                             abs={abs:.3e} rel={rel:.3e}\n",
-                        ));
-                    }
-                    report.push_str(&format!(
-                        "[BMS-FD-PROBE] robust={robust:?} h={h:.0e} SUMMARY max_abs={max_abs:.4e} \
-                         (i={worst}) max_rel={max_rel:.4e}\n",
-                    ));
-                }
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/bms_fd_probe.log")
-                {
-                    if f.write_all(report.as_bytes()).is_err() {
-                        log::warn!("[BMS-FD-PROBE] failed to write probe log file");
-                    }
-                }
-                log::warn!("{report}");
             }
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
