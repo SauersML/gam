@@ -2188,14 +2188,12 @@ impl<'a> RemlState<'a> {
                         "original-basis tau pair callbacks require dense design for Firth operator",
                     )
                     .map_err(EstimationError::InvalidInput)?;
-                    Some(std::sync::Arc::new(
-                        Self::build_firth_dense_operator_for_link(
-                            jeffreys_link,
-                            x_dense_arc.as_ref(),
-                            &pirls_result.final_eta,
-                            self.weights,
-                        )?,
-                    ))
+                    Some(std::sync::Arc::new(Self::build_firth_dense_operator_for_link(
+                        jeffreys_link,
+                        x_dense_arc.as_ref(),
+                        &pirls_result.final_eta,
+                        self.weights,
+                    )?))
                 };
             let dense_list: Vec<Option<Array2<f64>>> = x_tau_terms
                 .iter()
@@ -2419,7 +2417,8 @@ impl<'a> RemlState<'a> {
         let ds_k_dtau_j_mats = Arc::new(ds_k_dtau_j_mats);
 
         //  Firth-pair wiring — mirrors the original-basis builder.
-        let firth_logit_active = super::runtime::reml_robust_jeffreys_link(&self.config).is_some();
+        let firth_logit_active =
+            super::runtime::reml_robust_jeffreys_link(&self.config).is_some();
         let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if firth_logit_active {
             let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = bundle
                 .firth_dense_operator
