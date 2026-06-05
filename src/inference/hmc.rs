@@ -2469,9 +2469,7 @@ mod tests {
         };
 
         assert!(
-            err.contains(
-                "NUTS with Firth requires a Binomial inverse link with a Fisher-weight jet"
-            ),
+            err.contains("NUTS with Firth is only supported for Binomial Logit"),
             "unexpected error: {err}"
         );
     }
