@@ -22522,15 +22522,15 @@ fn jeffreys_term_skippable_for_source(
     if total_p < crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM {
         return Ok(false);
     }
-    // Matrix-free Hessian-vector product against the SAME observed information
-    // the inner Newton uses. The `joint_jeffreys_term` reduced information is
-    // `Z_JᵀHZ_J` with `Z_J = I`, i.e. exactly `H`, so this matvec IS the
-    // reduced-information apply the gate's eigendecomposition would otherwise
-    // consume. The tiny diagonal ridge the inner solver adds to keep the `H`
-    // apply well-posed is deliberately NOT folded in here: it can only RAISE
-    // eigenvalues, so the unridged `H` is a lower bound on the ridged spectrum —
-    // skipping on the unridged bounds is conservative w.r.t. the ridged operator
-    // the solver actually runs.
+    // Matrix-free Hessian-vector product against the SAME observed information the
+    // exact gate sees. `joint_jeffreys_term`'s reduced information is `Z_JᵀHZ_J`
+    // with `Z_J = I`, i.e. exactly the UNRIDGED likelihood joint Hessian `H` that
+    // `exact_newton_joint_hessian_with_specs` materializes; the `Operator::apply`
+    // / `Dense` here is that SAME `H` (the workspace's `hessian_matvec`, which the
+    // dense source also reconstructs). So the pre-check estimates the spectrum of
+    // precisely the matrix the dense path eigendecomposes — the skip decision and
+    // the exact gate are consistent by construction, with no ridge discrepancy
+    // (the solver's separate ridged solve operator is not involved here).
     let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
         match source {
             JointHessianSource::Dense(matrix) => Ok(matrix.dot(v)),
