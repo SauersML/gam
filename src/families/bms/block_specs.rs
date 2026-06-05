@@ -733,12 +733,18 @@ fn marginal_penalties_with_influence_ridge(
     // null space of the sum. With no penalties (pure-parametric marginal) the
     // aggregate is zero and the shrinkage is the identity on all `p_m` columns.
     //
-    // When `robust.firth_general` is armed, the identifiable-subspace Firth/
-    // Jeffreys prior supplies the proper-prior curvature on these unpenalized
-    // directions, so this pinned nullspace-shrinkage ridge is retired (skip the
-    // penalty AND its `nullspace_dims`/`log_lambdas` slot to keep accounting
-    // consistent).
-    if p_m > 0 && !robust.firth_general {
+    // This nullspace-shrinkage ridge stays ACTIVE even under `robust.firth_general`.
+    // The marginal duchon surface's polynomial nullspace is a DISTINCT pathology
+    // from the marginal↔logslope confound: the identifiable-subspace Firth/Jeffreys
+    // prior supplies proper-prior curvature on the *identifiable* directions, but it
+    // does not fully constrain the marginal smooth's polynomial null space (the
+    // directions the term-collection penalties leave with zero mass). Retiring this
+    // ridge under Firth left the outer REML non-convergent (gam#754): the named
+    // `marginal_surface` block carried the residual along its unconstrained
+    // polynomial nullspace. The OVERLAP ridge (2) below IS correctly retired under
+    // `orthogonalize_confounds` (the reduced-basis orthogonalization replaces it),
+    // but the nullspace ridge addresses an orthogonal pathology and must remain.
+    if p_m > 0 {
         let mut aggregate = Array2::<f64>::zeros((p_m, p_m));
         for bp in &design.penalties {
             let scale = bp
