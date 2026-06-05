@@ -29,7 +29,7 @@ use std::fmt;
 use std::time::Instant;
 
 // Crate-level imports
-use crate::construction::ReparamInvariant;
+use crate::construction::{CanonicalPenalty, ReparamInvariant};
 use crate::inference::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
@@ -1699,6 +1699,18 @@ pub enum EstimationError {
     PerfectSeparationDetected { iteration: usize, max_abs_eta: f64 },
 
     #[error(
+        "Pre-fit perfect separation detected in the realized binomial-logit design: column {column_index} \
+        has a threshold {threshold:.6e} that separates the binary outcomes \
+        (positive_above_threshold={positive_above_threshold}). The unpenalized MLE is not finite; \
+        enable Firth/Jeffreys bias reduction or remove/reparameterize the separating column."
+    )]
+    PrefitPerfectSeparationDetected {
+        column_index: usize,
+        threshold: f64,
+        positive_above_threshold: bool,
+    },
+
+    #[error(
         "Perfect or quasi-perfect separation detected during multinomial fitting at iteration {iteration}. \
         The active class-{active_class_index} logit against the reference class is saturated at training row {row_index}, \
         so the unpenalized softmax MLE is not finite in that direction. \
@@ -2039,6 +2051,238 @@ fn validate_penalty_specs(
             }
         }
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PrefitSeparationDiagnostic {
+    column_index: usize,
+    threshold: f64,
+    positive_above_threshold: bool,
+}
+
+fn prefit_binary_response_classes(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+) -> Option<Vec<Option<bool>>> {
+    let mut class = Vec::with_capacity(y.len());
+    let mut active_rows = 0usize;
+    let mut has_negative = false;
+    let mut has_positive = false;
+    for (&yi, &wi) in y.iter().zip(w.iter()) {
+        if !wi.is_finite() || wi <= 0.0 {
+            class.push(None);
+            continue;
+        }
+        if !yi.is_finite() {
+            return None;
+        }
+        active_rows += 1;
+        if yi <= f64::EPSILON {
+            has_negative = true;
+            class.push(Some(false));
+        } else if yi >= 1.0 - f64::EPSILON {
+            has_positive = true;
+            class.push(Some(true));
+        } else {
+            return None;
+        }
+    }
+    if active_rows == 0 || !has_negative || !has_positive {
+        return None;
+    }
+    Some(class)
+}
+
+fn canonical_unpenalized_column_mask(penalties: &[CanonicalPenalty], p: usize) -> Vec<bool> {
+    let mut unpenalized = vec![true; p];
+    for penalty in penalties {
+        let scale = penalty
+            .local
+            .diag()
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+            .max(1.0);
+        let tol = 1e-12 * scale;
+        for local_col in 0..penalty.col_range.len() {
+            let global_col = penalty.col_range.start + local_col;
+            if global_col < p && penalty.local[[local_col, local_col]].abs() > tol {
+                unpenalized[global_col] = false;
+            }
+        }
+    }
+    unpenalized
+}
+
+fn separator_from_column_extrema(
+    unpenalized_columns: &[bool],
+    min_pos: &[f64],
+    max_pos: &[f64],
+    min_neg: &[f64],
+    max_neg: &[f64],
+) -> Option<PrefitSeparationDiagnostic> {
+    const GAP_TOL: f64 = 1e-12;
+    for col in 0..unpenalized_columns.len() {
+        if !unpenalized_columns[col] {
+            continue;
+        }
+        if min_pos[col] > max_neg[col] + GAP_TOL {
+            return Some(PrefitSeparationDiagnostic {
+                column_index: col,
+                threshold: 0.5 * (min_pos[col] + max_neg[col]),
+                positive_above_threshold: true,
+            });
+        }
+        if min_neg[col] > max_pos[col] + GAP_TOL {
+            return Some(PrefitSeparationDiagnostic {
+                column_index: col,
+                threshold: 0.5 * (min_neg[col] + max_pos[col]),
+                positive_above_threshold: false,
+            });
+        }
+    }
+
+    None
+}
+
+fn detect_prefit_binomial_logit_single_column_separation(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: ndarray::ArrayView2<'_, f64>,
+    unpenalized_columns: &[bool],
+) -> Option<PrefitSeparationDiagnostic> {
+    debug_assert_eq!(x.nrows(), y.len());
+    debug_assert_eq!(x.nrows(), w.len());
+    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
+    if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
+        return None;
+    }
+    let class = prefit_binary_response_classes(y, w)?;
+    let p = x.ncols();
+    let mut min_pos = vec![f64::INFINITY; p];
+    let mut max_pos = vec![f64::NEG_INFINITY; p];
+    let mut min_neg = vec![f64::INFINITY; p];
+    let mut max_neg = vec![f64::NEG_INFINITY; p];
+    for col in 0..x.ncols() {
+        if !unpenalized_columns[col] {
+            continue;
+        }
+        for row in 0..x.nrows() {
+            let Some(is_positive) = class[row] else {
+                continue;
+            };
+            let value = x[[row, col]];
+            if !value.is_finite() {
+                return None;
+            }
+            if is_positive {
+                min_pos[col] = min_pos[col].min(value);
+                max_pos[col] = max_pos[col].max(value);
+            } else {
+                min_neg[col] = min_neg[col].min(value);
+                max_neg[col] = max_neg[col].max(value);
+            }
+        }
+    }
+
+    separator_from_column_extrema(unpenalized_columns, &min_pos, &max_pos, &min_neg, &max_neg)
+}
+
+fn detect_prefit_binomial_logit_single_column_separation_in_design(
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x: &DesignMatrix,
+    unpenalized_columns: &[bool],
+) -> Result<Option<PrefitSeparationDiagnostic>, EstimationError> {
+    debug_assert_eq!(x.nrows(), y.len());
+    debug_assert_eq!(x.nrows(), w.len());
+    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
+    if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
+        return Ok(None);
+    }
+    let Some(class) = prefit_binary_response_classes(y, w) else {
+        return Ok(None);
+    };
+    let p = x.ncols();
+    if p == 0 {
+        return Ok(None);
+    }
+
+    let mut min_pos = vec![f64::INFINITY; p];
+    let mut max_pos = vec![f64::NEG_INFINITY; p];
+    let mut min_neg = vec![f64::INFINITY; p];
+    let mut max_neg = vec![f64::NEG_INFINITY; p];
+    let target_cells = 1_000_000usize;
+    let chunk_rows = (target_cells / p.max(1)).clamp(1, x.nrows().max(1));
+    let mut chunk = Array2::<f64>::zeros((chunk_rows, p));
+    for start in (0..x.nrows()).step_by(chunk_rows) {
+        let end = (start + chunk_rows).min(x.nrows());
+        let rows = end - start;
+        x.row_chunk_into(start..end, chunk.slice_mut(s![0..rows, ..]))
+            .map_err(|err| {
+                EstimationError::LayoutError(format!(
+                    "pre-fit binomial-logit separation check failed to stream design rows: {err}"
+                ))
+            })?;
+        for local_row in 0..rows {
+            let Some(is_positive) = class[start + local_row] else {
+                continue;
+            };
+            for col in 0..p {
+                if !unpenalized_columns[col] {
+                    continue;
+                }
+                let value = chunk[[local_row, col]];
+                if !value.is_finite() {
+                    return Ok(None);
+                }
+                if is_positive {
+                    min_pos[col] = min_pos[col].min(value);
+                    max_pos[col] = max_pos[col].max(value);
+                } else {
+                    min_neg[col] = min_neg[col].min(value);
+                    max_neg[col] = max_neg[col].max(value);
+                }
+            }
+        }
+    }
+
+    Ok(separator_from_column_extrema(
+        unpenalized_columns,
+        &min_pos,
+        &max_pos,
+        &min_neg,
+        &max_neg,
+    ))
+}
+
+fn reject_prefit_binomial_logit_separation(
+    cfg: &RemlConfig,
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    x_fit: &DesignMatrix,
+    penalties: &[CanonicalPenalty],
+) -> Result<(), EstimationError> {
+    if !matches!(cfg.likelihood.spec.response, ResponseFamily::Binomial)
+        || cfg.link_function() != LinkFunction::Logit
+        || cfg.firth_bias_reduction
+    {
+        return Ok(());
+    }
+    let unpenalized_columns = canonical_unpenalized_column_mask(penalties, x_fit.ncols());
+    if let Some(diagnostic) = detect_prefit_binomial_logit_single_column_separation_in_design(
+        y,
+        w,
+        x_fit,
+        &unpenalized_columns,
+    )? {
+        return Err(EstimationError::PrefitPerfectSeparationDetected {
+            column_index: diagnostic.column_index,
+            threshold: diagnostic.threshold,
+            positive_above_threshold: diagnostic.positive_above_threshold,
+        });
+    }
+
     Ok(())
 }
 
@@ -2800,6 +3044,7 @@ where
         );
     }
     let (cfg, effective_sas_link) = resolved_external_config(opts)?;
+    reject_prefit_binomial_logit_separation(&cfg, y, w, &x_fit, &canonical)?;
 
     let design_kind = match &x {
         DesignMatrix::Dense(_) => "dense",
@@ -6908,6 +7153,80 @@ mod estimate_policy_tests {
         assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
         assert!(cfg.max_seeds > 1);
         assert_eq!(cfg.seed_budget, 1);
+    }
+
+    #[test]
+    fn prefit_binomial_logit_detects_unpenalized_realized_design_separator() {
+        let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let w = Array1::ones(y.len());
+        let diagnostic = detect_prefit_binomial_logit_single_column_separation(
+            y.view(),
+            w.view(),
+            x.view(),
+            &[true, true],
+        )
+        .expect("second column exactly separates the binary response");
+
+        assert_eq!(diagnostic.column_index, 1);
+        assert!(diagnostic.positive_above_threshold);
+        assert_eq!(diagnostic.threshold, 0.0);
+    }
+
+    #[test]
+    fn prefit_binomial_logit_screen_respects_penalties_and_fractional_responses() {
+        let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
+        let binary_y = array![0.0, 0.0, 1.0, 1.0];
+        let fractional_y = array![0.0, 0.25, 0.75, 1.0];
+        let w = Array1::ones(binary_y.len());
+
+        assert_eq!(
+            detect_prefit_binomial_logit_single_column_separation(
+                binary_y.view(),
+                w.view(),
+                x.view(),
+                &[true, false],
+            ),
+            None,
+            "a separating column with effective quadratic penalty should not be pre-fit rejected"
+        );
+        assert_eq!(
+            detect_prefit_binomial_logit_single_column_separation(
+                fractional_y.view(),
+                w.view(),
+                x.view(),
+                &[true, true],
+            ),
+            None,
+            "fractional binomial proportions are not exact binary separation"
+        );
+    }
+
+    #[test]
+    fn prefit_binomial_logit_rejects_before_outer_solver() {
+        let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let w = Array1::ones(y.len());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let cfg = RemlConfig::external(
+            GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::Logit),
+            )),
+            1e-7,
+            false,
+        );
+        let err = reject_prefit_binomial_logit_separation(&cfg, y.view(), w.view(), &design, &[])
+            .expect_err("unpenalized exact separator should fail before REML/PIRLS");
+
+        assert!(matches!(
+            err,
+            EstimationError::PrefitPerfectSeparationDetected {
+                column_index: 1,
+                positive_above_threshold: true,
+                ..
+            }
+        ));
     }
 
     #[test]
