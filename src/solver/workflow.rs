@@ -3790,6 +3790,15 @@ pub enum RobustIdentification {
     Auto,
     /// Request robustness unconditionally on supported families.
     Force,
+    /// Request ONLY the family-general Firth/Jeffreys penalty (full
+    /// identifiable-span `Φ = ½ log|I_r(β)|`), WITHOUT the orthogonal-
+    /// reparameterization design surgery. This is the principled, zero-downside
+    /// cure: Jeffreys is self-limiting (its score is `O(1)` vs the data's
+    /// `O(n)`), so on identified directions its only effect is the `O(1/n)` bias
+    /// correction, while on near-separating directions (whether in `ker(S)` or
+    /// `range(S)`) it supplies the missing curvature that makes the inner
+    /// objective coercive — all without touching the design or the optimizer.
+    FirthOnly,
 }
 
 impl RobustIdentification {
@@ -3798,6 +3807,7 @@ impl RobustIdentification {
             "off" | "false" | "0" | "" => Some(Self::Off),
             "auto" => Some(Self::Auto),
             "force" | "on" | "true" | "1" => Some(Self::Force),
+            "firth" | "firth-only" | "firthonly" | "jeffreys" => Some(Self::FirthOnly),
             _ => None,
         }
     }
@@ -3808,6 +3818,7 @@ impl RobustIdentification {
             Self::Off => "off",
             Self::Auto => "auto",
             Self::Force => "force",
+            Self::FirthOnly => "firth-only",
         }
     }
 }
