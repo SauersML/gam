@@ -358,3 +358,10 @@ fn orthogonalization_is_exact_and_round_trip_is_lossless() {
         "log-slope coefficients changed under round-trip: {max_dbetas:e}"
     );
 }
+
+#[test]
+fn debug_force_on_runs() {
+    assert!(file!().ends_with(".rs"));
+    let on = run_fit(RobustIdentification::Force);
+    eprintln!("[debug-force] {on:?}");
+}
