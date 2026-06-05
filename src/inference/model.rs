@@ -26,7 +26,7 @@ use crate::types::{
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
@@ -3040,6 +3040,21 @@ impl FittedModel {
             })
     }
 
+    pub fn random_effect_group_columns(&self) -> HashSet<String> {
+        let Some(training_headers) = self.training_headers.as_ref() else {
+            return HashSet::new();
+        };
+        let mut out = HashSet::<String>::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.random_effect_terms {
+                if let Some(name) = training_headers.get(term.feature_col) {
+                    out.insert(name.clone());
+                }
+            }
+        }
+        out
+    }
+
     pub fn validate_for_persistence(&self) -> Result<(), FittedModelError> {
         // Hard version gate. The struct's ~40 Option<T> fields carry
         // `#[serde(default)]`, which is by design forward-compatible: old
@@ -3930,6 +3945,11 @@ mod tests {
             });
         group_payload.resolved_termspec = Some(group_spec);
         let group_model = FittedModel::from_payload(group_payload);
+
+        assert_eq!(
+            group_model.random_effect_group_columns(),
+            HashSet::from(["g".to_string()])
+        );
 
         assert_eq!(
             group_model.axis_clip_to_training_ranges(data.view(), &col_map),

@@ -2737,9 +2737,8 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
         phase_start.elapsed().as_secs_f64()
     );
     progress.advance_workflow(1);
-    let schema = model.require_data_schema()?;
     progress.set_stage("predict", "loading new data");
-    let ds = load_datasetwith_schema(&args.new_data, schema)?;
+    let ds = load_datasetwith_model_schema(&args.new_data, &model)?;
     require_dataset_rows("predict", &args.new_data, ds.values.nrows())?;
     log::info!(
         "[PHASE] predict load-data done elapsed={:.3}s n={}",
@@ -3877,9 +3876,8 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             model_class = model.predict_model_class()
         ));
     }
-    let schema = model.require_data_schema()?;
     progress.set_stage("diagnose", "loading diagnostic dataset");
-    let ds = load_datasetwith_schema(&args.data, schema)?;
+    let ds = load_datasetwith_model_schema(&args.data, &model)?;
     require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
@@ -6006,9 +6004,8 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     progress.set_stage("sample", "loading fitted model");
     let model = SavedModel::load_from_path(&args.model)?;
     progress.advance_workflow(1);
-    let schema = model.require_data_schema()?;
     progress.set_stage("sample", "loading sampling data");
-    let ds = load_datasetwith_schema(&args.data, schema)?;
+    let ds = load_datasetwith_model_schema(&args.data, &model)?;
     require_dataset_rows("sample", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
@@ -6169,9 +6166,8 @@ fn run_generate(args: GenerateArgs) -> Result<(), String> {
         );
     }
 
-    let schema = model.require_data_schema()?;
     progress.set_stage("generate", "loading conditioning data");
-    let ds = load_datasetwith_schema(&args.data, schema)?;
+    let ds = load_datasetwith_model_schema(&args.data, &model)?;
     require_dataset_rows("generate", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
@@ -6383,8 +6379,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
 
     if let Some(data_path) = args.data.as_ref() {
         progress.set_stage("report", "loading report dataset");
-        let schema = model.require_data_schema()?;
-        let ds = load_datasetwith_schema(data_path, schema)?;
+        let ds = load_datasetwith_model_schema(data_path, &model)?;
         require_dataset_rows("report", data_path, ds.values.nrows())?;
         progress.advance_workflow(2);
 
@@ -8151,11 +8146,11 @@ fn load_dataset_projected(
     load_dataset_auto_projected(path, requested_columns)
 }
 
-fn load_datasetwith_schema(
-    path: &Path,
-    schema: &DataSchema,
-) -> Result<Dataset, gam::inference::data::DataError> {
-    load_dataset_auto_with_schema(path, schema, UnseenCategoryPolicy::Error)
+fn load_datasetwith_model_schema(path: &Path, model: &SavedModel) -> Result<Dataset, String> {
+    let schema = model.require_data_schema()?;
+    let policy =
+        UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
+    load_dataset_auto_with_schema(path, schema, policy).map_err(String::from)
 }
 
 /// Canonical family name for a CLI `--family` selection.

@@ -28979,12 +28979,9 @@ fn dataset_with_model_schema(
     }
     let schema = model.require_data_schema()?;
     let records = string_records_from_rows(headers, rows)?;
-    encode_recordswith_schema(
-        headers.to_vec(),
-        records,
-        schema,
-        UnseenCategoryPolicy::Error,
-    )
+    let policy =
+        UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
+    encode_recordswith_schema(headers.to_vec(), records, schema, policy)
 }
 
 fn dataset_from_xy_arrays(
@@ -29240,12 +29237,9 @@ fn schema_check(
 
     if issues.is_empty() {
         let records = string_records_from_rows(headers, rows)?;
-        if let Err(message) = encode_recordswith_schema(
-            headers.to_vec(),
-            records,
-            schema,
-            UnseenCategoryPolicy::Error,
-        ) {
+        let policy =
+            UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
+        if let Err(message) = encode_recordswith_schema(headers.to_vec(), records, schema, policy) {
             issues.push(SchemaIssue {
                 kind: "schema_error".to_string(),
                 message,

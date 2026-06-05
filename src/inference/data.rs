@@ -162,9 +162,29 @@ impl From<DataError> for String {
 // Public types
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnseenCategoryPolicy {
     Error,
+    EncodeUnknownForColumns(HashSet<String>),
+}
+
+impl UnseenCategoryPolicy {
+    pub fn encode_unknown_for_columns(columns: HashSet<String>) -> Self {
+        if columns.is_empty() {
+            Self::Error
+        } else {
+            Self::EncodeUnknownForColumns(columns)
+        }
+    }
+
+    fn unseen_code_for(&self, column_name: &str, level_count: usize) -> Option<f64> {
+        match self {
+            Self::Error => None,
+            Self::EncodeUnknownForColumns(columns) => {
+                columns.contains(column_name).then_some(level_count as f64)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -887,7 +907,7 @@ fn load_delimited_with_schema(
                     &col_meta[j],
                     total_rows,
                     &headers[j],
-                    unseen_policy,
+                    &unseen_policy,
                 )?;
                 col_vecs[j].push(val);
             }
@@ -1011,7 +1031,7 @@ fn parse_cell_with_schema(
     meta: &ColMeta,
     row: usize,
     col_name: &str,
-    unseen_policy: UnseenCategoryPolicy,
+    unseen_policy: &UnseenCategoryPolicy,
 ) -> Result<f64, DataError> {
     let val = match meta.kind {
         ColumnKindTag::Continuous => raw.parse::<f64>().map_err(|err| {
@@ -1050,16 +1070,14 @@ fn parse_cell_with_schema(
                 })?;
             match map.get(raw) {
                 Some(v) => *v,
-                None => match unseen_policy {
-                    UnseenCategoryPolicy::Error => {
-                        return Err(DataError::SchemaMismatch {
-                            reason: format!(
-                                "unseen level '{}' in categorical column '{}' at row {}",
-                                raw, col_name, row
-                            ),
-                        });
-                    }
-                },
+                None => unseen_policy
+                    .unseen_code_for(col_name, meta.schema_col.levels.len())
+                    .ok_or_else(|| DataError::SchemaMismatch {
+                        reason: format!(
+                            "unseen level '{}' in categorical column '{}' at row {}",
+                            raw, col_name, row
+                        ),
+                    })?,
             }
         }
     };
@@ -1536,30 +1554,34 @@ fn load_parquet_with_schema(
                         .levels
                         .iter()
                         .map(|lv| {
-                            schema_level_map.get(lv.as_str()).copied().ok_or_else(|| {
-                                DataError::SchemaMismatch {
+                            schema_level_map
+                                .get(lv.as_str())
+                                .copied()
+                                .or_else(|| unseen_policy.unseen_code_for(name, sc.levels.len()))
+                                .ok_or_else(|| DataError::SchemaMismatch {
                                     reason: format!(
                                         "unseen level '{}' in categorical column '{}'",
                                         lv, name
                                     ),
-                                }
-                            })
+                                })
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     for i in 0..n {
                         let old_code = values[[i, j]] as usize;
                         if old_code >= inferred_to_schema.len() {
-                            match unseen_policy {
-                                UnseenCategoryPolicy::Error => {
-                                    return Err(DataError::SchemaMismatch {
-                                        reason: format!(
-                                            "unseen categorical code at row {}, column '{}'",
-                                            i + 1,
-                                            name
-                                        ),
-                                    });
-                                }
-                            }
+                            let Some(unseen_code) =
+                                unseen_policy.unseen_code_for(name, sc.levels.len())
+                            else {
+                                return Err(DataError::SchemaMismatch {
+                                    reason: format!(
+                                        "unseen categorical code at row {}, column '{}'",
+                                        i + 1,
+                                        name
+                                    ),
+                                });
+                            };
+                            values[[i, j]] = unseen_code;
+                            continue;
                         }
                         values[[i, j]] = inferred_to_schema[old_code];
                     }
@@ -1732,9 +1754,10 @@ pub fn encode_recordswith_schema(
                     })?;
                     match map.get(raw) {
                         Some(v) => *v,
-                        None => match unseen_policy {
-                            UnseenCategoryPolicy::Error => {
-                                return Err(DataError::SchemaMismatch {
+                        None => unseen_policy
+                            .unseen_code_for(name, col_schema.levels.len())
+                            .ok_or_else(|| {
+                                String::from(DataError::SchemaMismatch {
                                     reason: format!(
                                         "unseen level '{}' in categorical column '{}' at row {}; allowed levels: {}",
                                         raw,
@@ -1742,10 +1765,8 @@ pub fn encode_recordswith_schema(
                                         i + 1,
                                         col_schema.levels.join(",")
                                     ),
-                                }
-                                .into());
-                            }
-                        },
+                                })
+                            })?,
                     }
                 }
             };
@@ -1850,5 +1871,60 @@ mod tests {
             encode_recordswith_schema(headers, Vec::new(), &schema, UnseenCategoryPolicy::Error)
                 .expect_err("empty schema-guided records should error");
         assert_eq!(err, "table data cannot be empty");
+    }
+
+    #[test]
+    fn encode_records_can_encode_unseen_named_categorical_column() {
+        let schema = DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "g".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".to_string(), "b".to_string()],
+                },
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["low".to_string(), "high".to_string()],
+                },
+            ],
+        };
+        let headers = vec!["g".to_string(), "x".to_string()];
+        let records = vec![StringRecord::from(vec!["new-group", "low"])];
+        let policy =
+            UnseenCategoryPolicy::encode_unknown_for_columns(HashSet::from(["g".to_string()]));
+
+        let ds =
+            encode_recordswith_schema(headers, records, &schema, policy).expect("encoded dataset");
+
+        assert_eq!(ds.values[[0, 0]], 2.0);
+        assert_eq!(ds.values[[0, 1]], 0.0);
+    }
+
+    #[test]
+    fn encode_records_keeps_unlisted_categorical_columns_strict() {
+        let schema = DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "g".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".to_string(), "b".to_string()],
+                },
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["low".to_string(), "high".to_string()],
+                },
+            ],
+        };
+        let headers = vec!["g".to_string(), "x".to_string()];
+        let records = vec![StringRecord::from(vec!["a", "new-level"])];
+        let policy =
+            UnseenCategoryPolicy::encode_unknown_for_columns(HashSet::from(["g".to_string()]));
+
+        let err = encode_recordswith_schema(headers, records, &schema, policy)
+            .expect_err("ordinary categorical column should stay strict");
+
+        assert!(err.contains("unseen level 'new-level' in categorical column 'x'"));
     }
 }
