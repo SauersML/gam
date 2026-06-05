@@ -3,14 +3,14 @@
 //! Constructs a deterministic, confounded Bernoulli marginal-slope (BMS) probit
 //! cohort: a shared smooth covariate `x` drives BOTH the marginal surface and a
 //! log-slope surface, and the exposure `z` is built to correlate strongly with
-//! that same smooth covariate (the structural confound). Under the released
-//! solver (robust flag OFF) the marginal index `M·β_m` and the score-weighted
-//! log-slope `diag(s·z)·G·β_s` overlap in the same column span, leaving the
-//! joint penalised Hessian rank-soft and the outer REML poorly conditioned —
-//! the marginal coefficients drift large.
+//! that same smooth covariate (the structural confound). Without the robustness
+//! machinery the marginal index `M·β_m` and the score-weighted log-slope
+//! `diag(s·z)·G·β_s` overlap in the same column span, leaving the joint penalised
+//! Hessian rank-soft and the outer REML poorly conditioned — the marginal
+//! coefficients drift large.
 //!
-//! With `RobustIdentification::Force` the `orthogonalize_confounds` mechanism
-//! reparameterizes the log-slope design `G̃ = G − M·B` so its columns are
+//! The (now unconditional) `orthogonalize_confounds` mechanism reparameterizes
+//! the log-slope design `G̃ = G − M·B` so its columns are
 //! exactly W-orthogonal (in the rigid-pilot IRLS row metric) to the marginal
 //! span; the cross-block Gram vanishes, the pinned overlap ridge is retired, and
 //! the original-basis coefficients are recovered exactly. We assert:
@@ -37,9 +37,7 @@ use gam::terms::smooth::{
     TermCollectionSpec,
 };
 use gam::types::{InverseLink, StandardLink};
-use gam::{
-    BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, RobustIdentification, fit_model,
-};
+use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -181,15 +179,13 @@ struct FitSummary {
     err_text: Option<String>,
 }
 
-fn run_fit(robust: RobustIdentification) -> FitSummary {
+fn run_fit() -> FitSummary {
     gam::init_parallelism();
     let (data, spec) = build_confounded_cohort(400);
     let mut options = BlockwiseFitOptions::default();
-    options.robust_identification = robust;
     // Bound the joint-Newton / outer budgets so a non-converging configuration
     // returns a finite "did-not-converge" verdict in deterministic, bounded
     // wall-clock instead of spinning the default 60-outer × 200-inner budget.
-    // Both ON and OFF run under the SAME caps so the contrast is apples-to-apples.
     options.inner_max_cycles = 40;
     options.outer_max_iter = 25;
     // Lock out spatial κ optimization (no spatial terms anyway) so the
@@ -208,10 +204,9 @@ fn run_fit(robust: RobustIdentification) -> FitSummary {
         Ok(FitResult::BernoulliMarginalSlope(out)) => out,
         Ok(_) => panic!("wrong FitResult variant"),
         Err(e) => {
-            // A hard runaway/refusal under OFF is itself the ill-conditioning
-            // signal; surface it as an "unbounded / non-converged" summary so
-            // the ON-vs-OFF contrast still holds.
-            eprintln!("[confound-cure] robust={robust:?} fit returned Err: {e}");
+            // A hard runaway/refusal is itself an ill-conditioning signal;
+            // surface it as an "unbounded / non-converged" summary.
+            eprintln!("[confound-cure] fit returned Err: {e}");
             return FitSummary {
                 max_abs_marginal_beta: f64::INFINITY,
                 outer_converged: false,
@@ -232,7 +227,7 @@ fn run_fit(robust: RobustIdentification) -> FitSummary {
         .fold(0.0_f64, |acc, v| acc.max(v.abs()));
     let all_finite = out.fit.beta.iter().all(|v| v.is_finite());
     eprintln!(
-        "[confound-cure] robust={robust:?} max|β_m|={max_abs_marginal_beta:.4e} \
+        "[confound-cure] max|β_m|={max_abs_marginal_beta:.4e} \
          outer_converged={} |g|={:?} all_finite={all_finite}",
         out.fit.outer_converged, out.fit.outer_gradient_norm,
     );

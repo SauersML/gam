@@ -3773,66 +3773,6 @@ use crate::term_builder::{
     smooth_type_uses_spatial_center_heuristic,
 };
 
-/// User-facing policy for the universal under-identification robustness layer
-/// (link-general Jeffreys/Firth on the under-identified span + exact
-/// orthogonalization of structural confounds).
-///
-/// `Off` is the default and leaves every solver path byte-identical to the
-/// released behavior: no new branch reads a non-`Off` value yet. `Auto` enables
-/// the robustness only where a pathology is detected; `Force` requests it
-/// unconditionally on supported families.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum RobustIdentification {
-    /// Disabled: existing behavior, byte-unchanged.
-    #[default]
-    Off,
-    /// Enable robustness only where an under-identified direction is detected.
-    Auto,
-    /// Request robustness unconditionally on supported families.
-    Force,
-    /// Request ONLY the family-general Firth/Jeffreys penalty (full
-    /// identifiable-span `Φ = ½ log|I_r(β)|`), WITHOUT the orthogonal-
-    /// reparameterization design surgery. This is the principled, zero-downside
-    /// cure: Jeffreys is self-limiting (its score is `O(1)` vs the data's
-    /// `O(n)`), so on identified directions its only effect is the `O(1/n)` bias
-    /// correction, while on near-separating directions (whether in `ker(S)` or
-    /// `range(S)`) it supplies the missing curvature that makes the inner
-    /// objective coercive — all without touching the design or the optimizer.
-    FirthOnly,
-}
-
-impl RobustIdentification {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "off" | "false" | "0" | "" => Some(Self::Off),
-            "auto" => Some(Self::Auto),
-            "force" | "on" | "true" | "1" => Some(Self::Force),
-            "firth" | "firth-only" | "firthonly" | "jeffreys" => Some(Self::FirthOnly),
-            _ => None,
-        }
-    }
-
-    #[inline]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Auto => "auto",
-            Self::Force => "force",
-            Self::FirthOnly => "firth-only",
-        }
-    }
-}
-
-#[inline]
-fn marginal_slope_robust_identification_policy(
-    configured: RobustIdentification,
-) -> RobustIdentification {
-    match configured {
-        RobustIdentification::Off => RobustIdentification::FirthOnly,
-        other => other,
-    }
-}
-
 /// Non-formula configuration for model fitting. All fields have sensible defaults.
 #[derive(Clone, Debug)]
 pub struct FitConfig {
@@ -3917,11 +3857,6 @@ pub struct FitConfig {
 
     /// Enable Firth bias reduction for standard single-parameter families.
     pub firth: bool,
-
-    /// Universal under-identification robustness policy. `Off` (default) leaves
-    /// every solver path byte-identical to released behavior; `Auto`/`Force`
-    /// enable the link-general Jeffreys/Firth + orthogonalization layer.
-    pub robust_identification: RobustIdentification,
 
     /// GPU backend selection policy. `Auto` uses supported device kernels for
     /// large workloads, `Off` pins execution to CPU kernels, and `Force` fails
@@ -4015,7 +3950,6 @@ impl Default for FitConfig {
             ridge_lambda: 1e-6,
             transformation_normal: false,
             firth: false,
-            robust_identification: RobustIdentification::Off,
             gpu_policy: crate::gpu::GpuPolicy::Auto,
             device: crate::solver::gpu::Device::Cpu,
             resource_policy: None,
@@ -6073,7 +6007,6 @@ fn materialize_standard<'a>(
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: config.firth,
-        robust_identification: config.robust_identification,
         adaptive_regularization: standard_adaptive_regularization_options(config),
         penalty_shrinkage_floor: Some(1e-6),
         rho_prior: Default::default(),
@@ -6300,9 +6233,6 @@ fn materialize_bernoulli_marginal_slope<'a>(
             spec,
             options: BlockwiseFitOptions {
                 compute_covariance: true,
-                robust_identification: marginal_slope_robust_identification_policy(
-                    config.robust_identification,
-                ),
                 ..Default::default()
             },
             kappa_options: SpatialLengthScaleOptimizationOptions::default(),
@@ -7059,9 +6989,6 @@ fn materialize_survival<'a>(
                 },
                 options: BlockwiseFitOptions {
                     compute_covariance: false,
-                    robust_identification: marginal_slope_robust_identification_policy(
-                        config.robust_identification,
-                    ),
                     ..Default::default()
                 },
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
