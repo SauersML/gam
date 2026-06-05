@@ -22688,7 +22688,6 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
     // joint Hessian at that point for each mode-response direction.
     let family_owned = family.clone();
     let states_owned: Vec<ParameterBlockState> = states.to_vec();
-    let specs_owned: Vec<ParameterBlockSpec> = specs.to_vec();
     let z_columns = z_joint.clone();
     let drift: JeffreysHphiDriftFn = Arc::new(move |delta: &Array1<f64>| {
         crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative(
