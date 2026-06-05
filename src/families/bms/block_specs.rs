@@ -876,6 +876,7 @@ mod runaway_tests {
     use crate::faer_ndarray::{
         FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_y,
     };
+    use crate::matrix::FactorizedSystem;
 
     // The marginal↔logslope overlap penalty is no longer installed as a pinned
     // ridge (subsumed by the now-unconditional exact logslope orthogonalisation in
