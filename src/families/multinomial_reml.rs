@@ -71,10 +71,8 @@ use crate::families::vector_response::{
 };
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::dense_block_xtwx;
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::Arc;
-
-const MULTINOMIAL_SEPARATION_TOL: f64 = 1.0e-12;
 
 /// Joint-coupled multinomial-logit family with shared design and shared
 /// smoothing penalty across active classes.
@@ -132,108 +130,6 @@ pub struct MultinomialFamily {
     /// Cached likelihood evaluator. Constructed once with the same row
     /// weights as `weights` and reused across every `evaluate` call.
     likelihood: MultinomialLogitLikelihood,
-}
-
-fn multinomial_unpenalized_columns(p: usize, dense_penalties: &[Array2<f64>]) -> Vec<usize> {
-    if dense_penalties.is_empty() {
-        return (0..p).collect();
-    }
-    (0..p)
-        .filter(|&col| {
-            dense_penalties.iter().all(|penalty| {
-                (0..p).all(|j| {
-                    penalty[[col, j]].abs() <= MULTINOMIAL_SEPARATION_TOL
-                        && penalty[[j, col]].abs() <= MULTINOMIAL_SEPARATION_TOL
-                })
-            })
-        })
-        .collect()
-}
-
-fn multinomial_hard_label_classes(
-    y_one_hot: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-) -> Option<Vec<Option<usize>>> {
-    let (n, k) = y_one_hot.dim();
-    let mut classes = vec![None; n];
-    for row in 0..n {
-        if weights[row] <= 0.0 {
-            continue;
-        }
-        let mut class = None;
-        for c in 0..k {
-            let value = y_one_hot[[row, c]];
-            if (value - 1.0).abs() <= MULTINOMIAL_SEPARATION_TOL {
-                if class.is_some() {
-                    return None;
-                }
-                class = Some(c);
-            } else if value.abs() > MULTINOMIAL_SEPARATION_TOL {
-                return None;
-            }
-        }
-        classes[row] = Some(class?);
-    }
-    Some(classes)
-}
-
-fn multinomial_unpenalized_separation_diagnostic(
-    y_one_hot: ArrayView2<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    design: ArrayView2<'_, f64>,
-    dense_penalties: &[Array2<f64>],
-) -> Option<String> {
-    let (n, k) = y_one_hot.dim();
-    let p = design.ncols();
-    let classes = multinomial_hard_label_classes(y_one_hot, weights)?;
-    let unpenalized_columns = multinomial_unpenalized_columns(p, dense_penalties);
-    if unpenalized_columns.is_empty() {
-        return None;
-    }
-
-    for &col in &unpenalized_columns {
-        for class in 0..k {
-            let mut n_class = 0usize;
-            let mut n_other = 0usize;
-            let mut min_class = f64::INFINITY;
-            let mut max_class = f64::NEG_INFINITY;
-            let mut min_other = f64::INFINITY;
-            let mut max_other = f64::NEG_INFINITY;
-            for row in 0..n {
-                let Some(row_class) = classes[row] else {
-                    continue;
-                };
-                let value = design[[row, col]];
-                if row_class == class {
-                    n_class += 1;
-                    min_class = min_class.min(value);
-                    max_class = max_class.max(value);
-                } else {
-                    n_other += 1;
-                    min_other = min_other.min(value);
-                    max_other = max_other.max(value);
-                }
-            }
-            if n_class == 0 || n_other == 0 {
-                continue;
-            }
-            if max_other <= min_class + MULTINOMIAL_SEPARATION_TOL
-                && max_class > min_other + MULTINOMIAL_SEPARATION_TOL
-            {
-                return Some(format!(
-                    "MultinomialFamily: complete or quasi-complete separation detected before solve: unpenalized design column {col} separates class {class} above the remaining classes (class range [{min_class:.6e}, {max_class:.6e}], other range [{min_other:.6e}, {max_other:.6e}]); add a model-declared bias-reduction prior or remove/constrain the separated direction"
-                ));
-            }
-            if max_class <= min_other + MULTINOMIAL_SEPARATION_TOL
-                && max_other > min_class + MULTINOMIAL_SEPARATION_TOL
-            {
-                return Some(format!(
-                    "MultinomialFamily: complete or quasi-complete separation detected before solve: unpenalized design column {col} separates class {class} below the remaining classes (class range [{min_class:.6e}, {max_class:.6e}], other range [{min_other:.6e}, {max_other:.6e}]); add a model-declared bias-reduction prior or remove/constrain the separated direction"
-                ));
-            }
-        }
-    }
-    None
 }
 
 impl MultinomialFamily {
@@ -319,7 +215,6 @@ impl MultinomialFamily {
                 penalties.len()
             ));
         }
-        let mut dense_penalties = Vec::with_capacity(penalties.len());
         for (t, penalty) in penalties.iter().enumerate() {
             if penalty.shape() != (p, p) {
                 return Err(format!(
@@ -327,15 +222,13 @@ impl MultinomialFamily {
                     penalty.shape()
                 ));
             }
-            let dense = penalty.to_dense();
-            for ((i, j), &v) in dense.indexed_iter() {
+            for ((i, j), &v) in penalty.to_dense().indexed_iter() {
                 if !v.is_finite() {
                     return Err(format!(
                         "MultinomialFamily: penalties[{t}][{i},{j}] must be finite (got {v})"
                     ));
                 }
             }
-            dense_penalties.push(dense);
         }
         validate_multinomial_simplex(y_one_hot.view(), "MultinomialFamily")
             .map_err(|e| e.to_string())?;
@@ -345,14 +238,6 @@ impl MultinomialFamily {
                     "MultinomialFamily: design[{i},{j}] must be finite (got {v})"
                 ));
             }
-        }
-        if let Some(reason) = multinomial_unpenalized_separation_diagnostic(
-            y_one_hot.view(),
-            weights.view(),
-            design.view(),
-            &dense_penalties,
-        ) {
-            return Err(reason);
         }
 
         // Likelihood owns its own copy of the row weights so the family is
@@ -1058,49 +943,6 @@ mod tests {
     //!    `class_levels` order survives unchanged.
     use super::*;
     use ndarray::array;
-
-    #[test]
-    fn unpenalized_separation_diagnostic_ignores_constant_intercept() {
-        let y = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let weights = array![1.0, 1.0, 1.0];
-        let design = array![[1.0], [1.0], [1.0]];
-
-        let diagnostic = multinomial_unpenalized_separation_diagnostic(
-            y.view(),
-            weights.view(),
-            design.view(),
-            &[],
-        );
-
-        assert!(
-            diagnostic.is_none(),
-            "constant intercept must not be reported as class separation"
-        );
-    }
-
-    #[test]
-    fn unpenalized_separation_diagnostic_names_separating_column() {
-        let y = array![
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0]
-        ];
-        let weights = array![1.0, 1.0, 1.0, 1.0];
-        let design = array![[1.0, 2.0], [1.0, 3.0], [1.0, -1.0], [1.0, 0.0]];
-
-        let diagnostic = multinomial_unpenalized_separation_diagnostic(
-            y.view(),
-            weights.view(),
-            design.view(),
-            &[],
-        )
-        .expect("column 1 separates class 0 above the other classes");
-
-        assert!(diagnostic.contains("column 1"));
-        assert!(diagnostic.contains("class 0"));
-        assert!(diagnostic.contains("above"));
-    }
 
     fn toy_family(n_obs: usize, p: usize, k: usize) -> MultinomialFamily {
         let y = {
