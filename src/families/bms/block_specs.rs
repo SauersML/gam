@@ -2344,16 +2344,20 @@ pub fn fit_bernoulli_marginal_slope_terms(
                     .ok()?;
                     Some(e.objective)
                 };
+                let mut report = String::new();
+                let g_norm = g_analytic
+                    .slice(s![..rho_dim])
+                    .dot(&g_analytic.slice(s![..rho_dim]))
+                    .sqrt();
+                report.push_str(&format!(
+                    "[BMS-FD-PROBE] robust={robust:?} rho_dim={rho_dim} objective={:.8e} \
+                     |g_analytic|={g_norm:.6e}\n",
+                    eval.objective,
+                ));
                 for &h in &[1e-4_f64, 1e-5, 1e-6] {
                     let mut max_abs = 0.0_f64;
                     let mut max_rel = 0.0_f64;
                     let mut worst = 0usize;
-                    log::warn!(
-                        "[BMS-FD-PROBE] robust={robust:?} h={h:.0e} rho_dim={rho_dim} \
-                         objective={:.8e} |g_analytic|={:.6e}",
-                        eval.objective,
-                        g_analytic.slice(s![..rho_dim]).dot(&g_analytic.slice(s![..rho_dim])).sqrt(),
-                    );
                     for i in 0..rho_dim {
                         let mut rp = rho.clone();
                         let mut rm = rho.clone();
@@ -2362,7 +2366,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                         let (lp, lm) = match (cost_at(&rp), cost_at(&rm)) {
                             (Some(a), Some(b)) => (a, b),
                             _ => {
-                                log::warn!("[BMS-FD-PROBE]   i={i} FD eval failed");
+                                report.push_str(&format!("  h={h:.0e} i={i} FD eval failed\n"));
                                 continue;
                             }
                         };
@@ -2375,16 +2379,27 @@ pub fn fit_bernoulli_marginal_slope_terms(
                             worst = i;
                         }
                         max_rel = max_rel.max(rel);
-                        log::warn!(
-                            "[BMS-FD-PROBE]   i={i:2} g_analytic={ga:+.6e} g_fd={g_fd:+.6e} \
-                             abs={abs:.3e} rel={rel:.3e}",
-                        );
+                        report.push_str(&format!(
+                            "  h={h:.0e} i={i:2} g_analytic={ga:+.6e} g_fd={g_fd:+.6e} \
+                             abs={abs:.3e} rel={rel:.3e}\n",
+                        ));
                     }
-                    log::warn!(
+                    report.push_str(&format!(
                         "[BMS-FD-PROBE] robust={robust:?} h={h:.0e} SUMMARY max_abs={max_abs:.4e} \
-                         (i={worst}) max_rel={max_rel:.4e}",
-                    );
+                         (i={worst}) max_rel={max_rel:.4e}\n",
+                    ));
                 }
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/bms_fd_probe.log")
+                {
+                    if f.write_all(report.as_bytes()).is_err() {
+                        log::warn!("[BMS-FD-PROBE] failed to write probe log file");
+                    }
+                }
+                log::warn!("{report}");
             }
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
                 && analytic_joint_hessian_available
