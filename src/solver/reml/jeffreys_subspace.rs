@@ -8,12 +8,15 @@
 //! would double-regularize and bias the smooth fit. This module produces the
 //! orthonormal basis `Z_J` of that span for one parameter block.
 //!
-//! For a block with aggregate penalty `S = sum_k S_k`, the under-identified
-//! span is exactly `ker(S)` — the penalty null space, which always contains the
-//! parametric (unpenalized) part and the structural null space of every smooth
-//! penalty (the polynomial/affine basis a difference/curvature penalty cannot
-//! see). A block with no penalties at all (a pure parametric block) is entirely
-//! under-identified, so `Z_J = I`.
+//! The under-identified span is the FULL identifiable coefficient span of the
+//! (post-rank-deficiency-removal) reduced block — `Z_J = I_p` — NOT the penalty
+//! null space `ker(S)`. The Jeffreys penalty is self-limiting (its `O(1)` score
+//! is dominated by the data's `O(n)` Fisher information), so on a data-identified
+//! direction (penalized OR not) its only effect is the `O(1/n)` Firth bias
+//! correction; it bites only where the information is near-singular. Using the
+//! full span — rather than scoping to `ker(S)` — lets it reach a near-separation
+//! on a penalized spline direction too (the residual BMS-probit pathology). The
+//! aggregate penalty is consulted only to pick up the block dimension `p`.
 //!
 //! Both tiers of the robustness machinery consume the SAME `Z_J`:
 //!   * Tier A (single-eta GLM via `FirthDenseOperator`) scopes the Fisher
@@ -22,9 +25,10 @@
 //!     restricts the joint-Hessian Jeffreys term `Phi_J = 1/2 log|Z_J^T H Z_J|`
 //!     to the same span.
 //!
-//! Everything here is pure linear algebra on the block's penalty matrices and
-//! is gated upstream by `RobustConfig` (default OFF), so it never runs in the
-//! released solver until a caller opts in.
+//! Everything here is pure linear algebra on the block's penalty matrices.
+//! Robustness is the unconditional default; the conditioning gate in
+//! [`joint_jeffreys_term`] (self-limiting, returns the exact zero contribution on
+//! a well-conditioned fit) is the only "apply where needed" mechanism.
 
 use crate::linalg::faer_ndarray::FaerEigh;
 use faer::Side;
