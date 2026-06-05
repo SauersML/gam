@@ -1330,39 +1330,51 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let fixed_design_regime = !effective_kappa_options.enabled
         || (spatial_length_scale_term_indices(&marginalspec_boot).is_empty()
             && spatial_length_scale_term_indices(&logslopespec_boot).is_empty());
-    let logslope_confound_reparam: Option<crate::solver::orthogonal_reparam::OrthogonalReparam> =
-        if robust.orthogonalize_confounds && fixed_design_regime {
-            let marginal_dense = marginal_design
-                .design
-                .try_to_dense_arc("bms confound-orthogonalization::marginal")?;
-            let logslope_dense = logslope_design
-                .design
-                .try_to_dense_arc("bms confound-orthogonalization::logslope")?;
-            // Build against the rigid-pilot IRLS row metric so orthogonality
-            // holds in the inner product the joint Hessian actually uses.
-            let reparam = crate::solver::orthogonal_reparam::OrthogonalReparam::build(
-                robust,
-                marginal_dense.view(),
-                logslope_dense.view(),
-                &cross_block_pilot_w_score_warp,
-            )?;
-            if let Some(ref rp) = reparam {
+    // `(reparam, original_logslope_dense)` — both `None` when the flag is off
+    // (byte-identical to released) or when the build found nothing to project.
+    // The original-basis logslope dense is captured BEFORE the swap so the
+    // reported fit result (and hence prediction) is restored to the original
+    // basis: `recover_original` shears the fitted β̃_m back to the original
+    // marginal coordinates and leaves β_s untouched, so the original (M, G)
+    // designs paired with the recovered (β_m, β_s) reproduce the predictor.
+    let (logslope_confound_reparam, original_logslope_dense_for_restore): (
+        Option<crate::solver::orthogonal_reparam::OrthogonalReparam>,
+        Option<Array2<f64>>,
+    ) = if robust.orthogonalize_confounds && fixed_design_regime {
+        let marginal_dense = marginal_design
+            .design
+            .try_to_dense_arc("bms confound-orthogonalization::marginal")?;
+        let logslope_dense = logslope_design
+            .design
+            .try_to_dense_arc("bms confound-orthogonalization::logslope")?;
+        // Build against the rigid-pilot IRLS row metric so orthogonality holds
+        // in the inner product the joint Hessian actually uses.
+        let reparam = crate::solver::orthogonal_reparam::OrthogonalReparam::build(
+            robust,
+            marginal_dense.view(),
+            logslope_dense.view(),
+            &cross_block_pilot_w_score_warp,
+        )?;
+        match reparam {
+            Some(rp) => {
+                let original_dense = logslope_dense.as_ref().clone();
                 // Swap the logslope design's dense block for the W-orthogonal
                 // reparameterized confound `G̃`. The penalty topology, null-space
                 // accounting, intercept/linear/smooth ranges and every other
                 // field of `logslope_design` are unchanged — only the realized
-                // column values are sheared, which is a coordinate change on the
-                // same penalized basis.
-                logslope_design.design = DesignMatrix::Dense(
-                    crate::matrix::DenseDesignMatrix::from(
+                // column values are sheared, a coordinate change on the same
+                // penalized basis.
+                logslope_design.design =
+                    DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
                         rp.reparameterized_confound().to_owned(),
-                    ),
-                );
+                    ));
+                (Some(rp), Some(original_dense))
             }
-            reparam
-        } else {
-            None
-        };
+            None => (None, None),
+        }
+    } else {
+        (None, None)
+    };
 
     // Absorbed Stage-1 influence columns (#461, design §3). When the workflow
     // chained a CTN Stage-1 into this marginal-slope fit, `spec.score_influence_
@@ -1861,7 +1873,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
     let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
-    let solved = optimize_spatial_length_scale_exact_joint(
+    let mut solved = optimize_spatial_length_scale_exact_joint(
         data_view,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
         &[marginal_terms.clone(), logslope_terms.clone()],
@@ -2056,6 +2068,79 @@ pub fn fit_bernoulli_marginal_slope_terms(
         },
         crate::families::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     )?;
+
+    // ── Structural confound cure: recover original-basis coefficients ────────
+    //
+    // The fit ran in the W-orthogonalized logslope basis `G̃ = G − M·B`. The
+    // fitted block layout is [marginal (β̃_m [+ γ_influence]), logslope (β_s),
+    // …]. Recover the original-basis marginal coefficients `β_m = β̃_m − B·β_s`
+    // (the influence-absorber tail γ, when present, is untouched: it indexes
+    // training-only columns appended AFTER the p_m marginal columns), restore
+    // the reported logslope design to the original basis, and rebuild the
+    // flattened joint β so every downstream consumer (prediction, reporting,
+    // covariance) sees original-basis (M, G) coordinates. β_s is unchanged by
+    // construction. No-op when the flag is off / no reparam was installed.
+    if let (Some(reparam), Some(original_logslope_dense)) = (
+        logslope_confound_reparam.as_ref(),
+        original_logslope_dense_for_restore.as_ref(),
+    ) {
+        let p_m = reparam.primary_cols();
+        let p_c = reparam.confound_cols();
+        let beta_s = solved
+            .fit
+            .blocks
+            .get(1)
+            .map(|b| b.beta.clone())
+            .ok_or_else(|| {
+                "bms confound-orthogonalization: fitted result is missing the logslope block"
+                    .to_string()
+            })?;
+        if beta_s.len() != p_c {
+            return Err(format!(
+                "bms confound-orthogonalization: logslope β has length {} but reparam expects {p_c}",
+                beta_s.len()
+            ));
+        }
+        let shear_beta_s = reparam.shear().dot(&beta_s);
+        // Shear only the leading p_m marginal entries of the (possibly widened)
+        // marginal block β in both `blocks` and `block_states`.
+        let recover_marginal = |beta_m_widened: &mut Array1<f64>| -> Result<(), String> {
+            if beta_m_widened.len() < p_m {
+                return Err(format!(
+                    "bms confound-orthogonalization: marginal β length {} < p_m {p_m}",
+                    beta_m_widened.len()
+                ));
+            }
+            for j in 0..p_m {
+                beta_m_widened[j] -= shear_beta_s[j];
+            }
+            Ok(())
+        };
+        if let Some(block) = solved.fit.blocks.get_mut(0) {
+            recover_marginal(&mut block.beta)?;
+        }
+        if let Some(state) = solved.fit.block_states.get_mut(0) {
+            recover_marginal(&mut state.beta)?;
+        }
+        // Restore the reported logslope design to the original basis so
+        // prediction pairs the recovered (β_m, β_s) with the original (M, G).
+        if let Some(design) = solved.designs.get_mut(1) {
+            design.design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                original_logslope_dense.clone(),
+            ));
+        }
+        // Rebuild the flattened joint β vector from the (now original-basis)
+        // per-block coefficients in block order.
+        let total: usize = solved.fit.blocks.iter().map(|b| b.beta.len()).sum();
+        let mut joint = Array1::<f64>::zeros(total);
+        let mut cursor = 0usize;
+        for block in &solved.fit.blocks {
+            let p = block.beta.len();
+            joint.slice_mut(s![cursor..cursor + p]).assign(&block.beta);
+            cursor += p;
+        }
+        solved.fit.beta = joint;
+    }
 
     let mut resolved_specs = solved.resolved_specs;
     let mut designs = solved.designs;
