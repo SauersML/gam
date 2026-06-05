@@ -26492,10 +26492,14 @@ mod tests {
     }
 
     #[test]
-    fn linear_termspec_defaults_to_penalizedwhen_field_is_omitted() {
+    fn linear_termspec_defaults_to_unpenalizedwhen_field_is_omitted() {
+        // Parametric/linear terms are unpenalized by default — mature tools
+        // (mgcv/glm/survreg/VGAM) leave parametric terms unpenalized and gam
+        // matches that, reporting the MLE rather than a ridge-shrunk estimate.
+        // See `default_linear_term_double_penalty`.
         let json = r#"{"name":"x","feature_col":0}"#;
         let term: LinearTermSpec = serde_json::from_str(json).expect("deserialize linear term");
-        assert!(term.double_penalty);
+        assert!(!term.double_penalty);
         assert!(matches!(
             term.coefficient_geometry,
             LinearCoefficientGeometry::Unconstrained

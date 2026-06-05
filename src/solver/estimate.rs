@@ -52,8 +52,7 @@ use crate::types::{MixtureLinkSpec, SasLinkSpec};
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 // faer: high-performance dense solvers
 use crate::faer_ndarray::{
-    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab,
-    fast_atb, rrqr_with_permutation,
+    FaerArrayView, FaerCholesky, FaerEigh, FaerLinalgError, fast_ab, fast_atb,
 };
 use faer::{MatRef, Side};
 use rayon::prelude::*;
@@ -67,11 +66,6 @@ use serde::{Deserialize, Serialize};
 
 use std::ops::Range;
 use std::sync::Arc;
-
-const PREFIT_REGULARITY_MAX_DENSE_CELLS: usize = 5_000_000;
-const PREFIT_BINOMIAL_RESPONSE_TOL: f64 = 1.0e-12;
-const PREFIT_SEPARATION_MARGIN_TOL: f64 = 1.0e-12;
-const PREFIT_REGULARITY_MAX_REPORTED_COLUMNS: usize = 12;
 
 /// Programmatic prior mean for a coefficient penalty block.
 ///
@@ -808,6 +802,23 @@ impl RemlConfig {
     pub(crate) fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
+    }
+
+    /// Whether the family-general Firth/Jeffreys robustness mechanism is armed
+    /// for this fit. Resolves the user-facing tri-state
+    /// [`RobustIdentification`](crate::solver::workflow::RobustIdentification)
+    /// policy through [`RobustConfig`](crate::solver::robust_identification::RobustConfig);
+    /// `Off` ⇒ `false` (released, byte-identical path), `Auto`/`Force`/`FirthOnly`
+    /// ⇒ `true`. Used to gate the outer PC hyperprior default on λ.
+    pub(crate) fn firth_general(&self) -> bool {
+        crate::solver::robust_identification::RobustConfig::from_policy(self.robust_identification)
+            .firth_general
+    }
+
+    pub(crate) fn robust_identification_debug(
+        &self,
+    ) -> crate::solver::workflow::RobustIdentification {
+        self.robust_identification
     }
 
     fn link_function(&self) -> LinkFunction {
@@ -1887,14 +1898,12 @@ fn resolve_external_family(
         (&family.response, &family.link),
         (
             ResponseFamily::Binomial,
-            InverseLink::Standard(
-                StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog
-            ),
+            InverseLink::Standard(StandardLink::Logit),
         ),
     );
     if firth_override == Some(true) && !supports_firth {
         crate::bail_invalid_estim!(
-            "firth_bias_reduction is currently implemented only for standard Binomial Logit, Probit, and CLogLog links; {} does not support it",
+            "firth_bias_reduction is currently implemented only for Binomial Logit; {} does not support it",
             family.pretty_name(),
         );
     }
@@ -1996,184 +2005,6 @@ fn resolved_external_config(
         effective_sas_link,
     )?;
     Ok((cfg, effective_sas_link))
-}
-
-#[derive(Clone, Debug)]
-struct PrefitSeparationColumn {
-    column: usize,
-    direction: &'static str,
-    margin: f64,
-}
-
-fn prefit_univariate_binomial_separation_columns(
-    x: &DesignMatrix,
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-) -> Vec<PrefitSeparationColumn> {
-    let n = x.nrows();
-    let p = x.ncols();
-    let mut row_classes = vec![None; n];
-    let mut n0 = 0usize;
-    let mut n1 = 0usize;
-
-    for i in 0..n {
-        if w[i] <= 0.0 {
-            continue;
-        }
-        let yi = y[i];
-        let class = if yi.abs() <= PREFIT_BINOMIAL_RESPONSE_TOL {
-            0u8
-        } else if (yi - 1.0).abs() <= PREFIT_BINOMIAL_RESPONSE_TOL {
-            1u8
-        } else {
-            return Vec::new();
-        };
-        if class == 0 {
-            n0 += 1;
-        } else {
-            n1 += 1;
-        }
-        row_classes[i] = Some(class);
-    }
-
-    if n0 == 0 || n1 == 0 {
-        return Vec::new();
-    }
-
-    let mut separated = Vec::new();
-    for j in 0..p {
-        let col = x.extract_column(j);
-        let mut min0 = f64::INFINITY;
-        let mut max0 = f64::NEG_INFINITY;
-        let mut min1 = f64::INFINITY;
-        let mut max1 = f64::NEG_INFINITY;
-        for i in 0..n {
-            match row_classes[i] {
-                Some(0) => {
-                    min0 = min0.min(col[i]);
-                    max0 = max0.max(col[i]);
-                }
-                Some(1) => {
-                    min1 = min1.min(col[i]);
-                    max1 = max1.max(col[i]);
-                }
-                _ => {}
-            }
-        }
-        if max0 <= min1 + PREFIT_SEPARATION_MARGIN_TOL {
-            separated.push(PrefitSeparationColumn {
-                column: j,
-                direction: "y=1 above y=0",
-                margin: min1 - max0,
-            });
-        } else if max1 <= min0 + PREFIT_SEPARATION_MARGIN_TOL {
-            separated.push(PrefitSeparationColumn {
-                column: j,
-                direction: "y=0 above y=1",
-                margin: min0 - max1,
-            });
-        }
-    }
-    separated
-}
-
-fn emit_prefit_regularity_diagnostics(
-    x: &DesignMatrix,
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    likelihood: &LikelihoodSpec,
-    context: &str,
-) {
-    let n = x.nrows();
-    let p = x.ncols();
-    if n == 0 || p == 0 {
-        return;
-    }
-
-    let Some(cells) = n.checked_mul(p) else {
-        log::warn!(
-            "[PREFIT-REGULARITY] {context}: skipped dense rank scan because n={n} p={p} overflows cell count"
-        );
-        if matches!(&likelihood.response, ResponseFamily::Binomial) {
-            emit_prefit_binomial_separation_diagnostic(x, y, w, context);
-        }
-        return;
-    };
-
-    if cells > PREFIT_REGULARITY_MAX_DENSE_CELLS {
-        log::warn!(
-            "[PREFIT-REGULARITY] {context}: skipped dense rank scan for n={n} p={p} cells={cells} above cap={}",
-            PREFIT_REGULARITY_MAX_DENSE_CELLS
-        );
-    } else {
-        let dense = match x.try_to_dense_arc(context) {
-            Ok(dense) => dense.as_ref().clone(),
-            Err(err) => {
-                log::warn!(
-                    "[PREFIT-REGULARITY] {context}: skipped dense rank scan because design materialization failed: {err}"
-                );
-                if matches!(&likelihood.response, ResponseFamily::Binomial) {
-                    emit_prefit_binomial_separation_diagnostic(x, y, w, context);
-                }
-                return;
-            }
-        };
-
-        match rrqr_with_permutation(&dense, default_rrqr_rank_alpha()) {
-            Ok(rrqr) => {
-                if rrqr.rank < p {
-                    let demoted: Vec<usize> = rrqr.column_permutation[rrqr.rank..]
-                        .iter()
-                        .copied()
-                        .take(PREFIT_REGULARITY_MAX_REPORTED_COLUMNS)
-                        .collect();
-                    log::warn!(
-                        "[PREFIT-REGULARITY] {context}: design is rank-deficient before solve: rank={}/{} rank_tol={:.3e} leading_diag_abs={:.3e} demoted_columns_first{}={:?}; remove or reparameterize redundant columns, or add explicit identifiability constraints",
-                        rrqr.rank,
-                        p,
-                        rrqr.rank_tol,
-                        rrqr.leading_diag_abs,
-                        demoted.len(),
-                        demoted
-                    );
-                }
-            }
-            Err(err) => {
-                log::warn!("[PREFIT-REGULARITY] {context}: RRQR rank scan failed: {err:?}");
-            }
-        }
-    }
-
-    if matches!(&likelihood.response, ResponseFamily::Binomial) {
-        emit_prefit_binomial_separation_diagnostic(x, y, w, context);
-    }
-}
-
-fn emit_prefit_binomial_separation_diagnostic(
-    x: &DesignMatrix,
-    y: ArrayView1<'_, f64>,
-    w: ArrayView1<'_, f64>,
-    context: &str,
-) {
-    let separated = prefit_univariate_binomial_separation_columns(x, y, w);
-    if !separated.is_empty() {
-        let reported: Vec<String> = separated
-            .iter()
-            .take(PREFIT_REGULARITY_MAX_REPORTED_COLUMNS)
-            .map(|entry| {
-                format!(
-                    "col={} direction={} margin={:.3e}",
-                    entry.column, entry.direction, entry.margin
-                )
-            })
-            .collect();
-        log::warn!(
-            "[PREFIT-REGULARITY] {context}: binomial design has single-column complete or quasi separation before solve: {} of {} separated columns [{}]; enable Firth/Jeffreys bias reduction or revise the separated terms",
-            reported.len(),
-            separated.len(),
-            reported.join(", ")
-        );
-    }
 }
 
 fn validate_penalty_specs(
@@ -2999,7 +2830,6 @@ where
         opts.max_iter,
         cfg.firth_bias_reduction
     );
-    emit_prefit_regularity_diagnostics(&x_fit, y, w, &opts.family, "optimize_external_design");
 
     // Own the external arrays once; the conditioned design is shared through `reml_state`.
     let y_o = y.to_owned();
@@ -3689,10 +3519,13 @@ where
         },
         None,
         None,
-        // Final, reported fit at the REML-selected λ: refine the Gamma
-        // dispersion shape at the converged η so `dispersion_phi()` and every
-        // SE / interval derived from it reflect the conditional noise, not the
-        // spread of μ (#678). λ is fixed here, so there is no scale↔λ feedback.
+        // Final, reported fit at the REML-selected λ: refine the family's
+        // estimated dispersion nuisance at the converged η. For Gamma this
+        // re-estimates the shape so `dispersion_phi()` and every SE / interval
+        // reflect the conditional noise, not the spread of μ (#678); for Beta
+        // it drives the precision φ and the mean β̂ to their joint fixed point,
+        // undoing the slope attenuation from a φ frozen at the null predictor
+        // (#769). λ is fixed here, so there is no scale↔λ feedback.
         true,
     )?;
 
@@ -7073,33 +6906,6 @@ mod estimate_policy_tests {
     use ndarray::{Array1, Array2, array};
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
-
-    #[test]
-    fn prefit_binomial_separation_scan_reports_single_column_gap() {
-        let x = array![[0.0, 3.0], [0.5, 1.0], [2.0, 2.0], [3.0, 4.0]];
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
-        let y = array![0.0, 0.0, 1.0, 1.0];
-        let w = array![1.0, 1.0, 1.0, 1.0];
-
-        let separated = prefit_univariate_binomial_separation_columns(&design, y.view(), w.view());
-
-        assert_eq!(separated.len(), 1);
-        assert_eq!(separated[0].column, 0);
-        assert_eq!(separated[0].direction, "y=1 above y=0");
-        assert!((separated[0].margin - 1.5).abs() < 1.0e-12);
-    }
-
-    #[test]
-    fn prefit_binomial_separation_scan_skips_fractional_binomial_response() {
-        let x = array![[0.0], [1.0], [2.0]];
-        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
-        let y = array![0.0, 0.5, 1.0];
-        let w = array![1.0, 1.0, 1.0];
-
-        let separated = prefit_univariate_binomial_separation_columns(&design, y.view(), w.view());
-
-        assert!(separated.is_empty());
-    }
 
     #[test]
     fn gaussian_external_reml_uses_single_seed_policy() {
