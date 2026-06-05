@@ -1528,6 +1528,43 @@ fn firth_default_pc_prior() -> RhoPrior {
     }
 }
 
+/// Resolve the *effective* outer ρ prior under the firth-general default policy.
+///
+/// When `firth_general == false` the configured prior is returned verbatim (the
+/// released, byte-identical path: a `Flat` configured prior stays `Flat`, cost
+/// /grad/hess all zero, so the outer objective is bare REML/LAML). When
+/// `firth_general == true` an *unset* prior (the `Flat` sentinel — whole-prior,
+/// or any `Flat` coordinate of an `Independent`) is filled with the weakly-
+/// informative [`firth_default_pc_prior`]; any explicitly-configured prior is
+/// honored unchanged. Pulled out as a free function so the decision is unit-
+/// testable without constructing a full `RemlState`.
+fn resolve_effective_rho_prior(
+    firth_general: bool,
+    configured: &RhoPrior,
+) -> std::borrow::Cow<'_, RhoPrior> {
+    if !firth_general {
+        return std::borrow::Cow::Borrowed(configured);
+    }
+    match configured {
+        // Whole prior unset → fill every coordinate with the weak PC default.
+        RhoPrior::Flat => std::borrow::Cow::Owned(firth_default_pc_prior()),
+        // Per-coordinate priors: only the `Flat` (unset) coordinates inherit the
+        // PC default; explicitly configured coordinates are preserved.
+        RhoPrior::Independent(priors) if priors.iter().any(|p| matches!(p, RhoPrior::Flat)) => {
+            let filled = priors
+                .iter()
+                .map(|p| match p {
+                    RhoPrior::Flat => firth_default_pc_prior(),
+                    other => other.clone(),
+                })
+                .collect();
+            std::borrow::Cow::Owned(RhoPrior::Independent(filled))
+        }
+        // Any explicitly configured prior is honored as-is.
+        other => std::borrow::Cow::Borrowed(other),
+    }
+}
+
 #[inline]
 fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     let spec = reml_spec(likelihood);
@@ -4229,27 +4266,7 @@ impl<'a> RemlState<'a> {
     /// leaving clean λ-selection unbiased (the zero-downside / information-limit
     /// reduction to plain REML).
     fn effective_rho_prior(&self) -> std::borrow::Cow<'_, RhoPrior> {
-        if !self.config.firth_general() {
-            return std::borrow::Cow::Borrowed(&self.rho_prior);
-        }
-        match &self.rho_prior {
-            // Whole prior unset → fill every coordinate with the weak PC default.
-            RhoPrior::Flat => std::borrow::Cow::Owned(firth_default_pc_prior()),
-            // Per-coordinate priors: only the `Flat` (unset) coordinates inherit
-            // the PC default; explicitly configured coordinates are preserved.
-            RhoPrior::Independent(priors) if priors.iter().any(|p| matches!(p, RhoPrior::Flat)) => {
-                let filled = priors
-                    .iter()
-                    .map(|p| match p {
-                        RhoPrior::Flat => firth_default_pc_prior(),
-                        other => other.clone(),
-                    })
-                    .collect();
-                std::borrow::Cow::Owned(RhoPrior::Independent(filled))
-            }
-            // Any explicitly configured prior is honored as-is.
-            configured => std::borrow::Cow::Borrowed(configured),
-        }
+        resolve_effective_rho_prior(self.config.firth_general(), &self.rho_prior)
     }
 
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
