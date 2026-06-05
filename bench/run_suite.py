@@ -2558,52 +2558,61 @@ def main() -> None:
                             ),
                         ),
                     )
-            rust_gamlss_row = (
-                run_rust_gamlss_scenario_cv(
+            # Route the rust_gamlss family of contenders through the same
+            # helper used by the rust_gam contenders above. The helper turns
+            # per-contender harness errors (notably the formula-construction
+            # RuntimeError emitted by `_emit_joint_pc_term` when a Duchon
+            # joint-PC smooth is structurally infeasible at the requested k)
+            # into a failed result row instead of letting the exception
+            # unwind through `main` and tear down the entire benchmark
+            # shard before its output JSON is written.
+            _append_contender_result_if_enabled(
+                results,
+                s_cfg,
+                "rust_gamlss",
+                lambda: run_rust_gamlss_scenario_cv(
                     s_cfg,
                     contender_name="rust_gamlss",
                     ds=ds,
                     folds=folds,
                     shared_fold_artifacts=shared_fold_artifacts,
-                )
-                if _is_contender_enabled(s_cfg, "rust_gamlss")
-                else None
+                ),
             )
-            if rust_gamlss_row is not None:
-                results.append(rust_gamlss_row)
-                if ds["family"] == "binomial" and _is_contender_enabled(
-                    s_cfg, "rust_gamlss_flexible"
-                ):
-                    results.append(
-                        run_rust_gamlss_scenario_cv(
-                            s_cfg,
-                            contender_name="rust_gamlss_flexible",
-                            binomial_cli_family=_flexible_link_name("probit"),
-                            ds=ds,
-                            folds=folds,
-                            shared_fold_artifacts=shared_fold_artifacts,
-                        )
-                    )
-                if ds["family"] == "binomial":
-                    _ms_cfg = _effective_scenario_fit_mapping(s_cfg["name"]) or {}
-                    _ms_extra = (
-                        ["--scale-dimensions"] if _ms_cfg.get("scale_dimensions") else None
-                    )
-                    _ms_contender = (
-                        "rust_gamlss_marginal_slope_aniso"
-                        if _ms_cfg.get("scale_dimensions")
-                        else "rust_gamlss_marginal_slope"
-                    )
-                    if _is_contender_enabled(s_cfg, _ms_contender):
-                        results.append(
-                            run_rust_gamlss_marginal_slope_cv(
-                                s_cfg,
-                                contender_name=_ms_contender,
-                                ds=ds,
-                                folds=folds,
-                                rust_fit_extra_args=_ms_extra,
-                            )
-                        )
+            if _is_contender_enabled(s_cfg, "rust_gamlss") and ds["family"] == "binomial":
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    "rust_gamlss_flexible",
+                    lambda: run_rust_gamlss_scenario_cv(
+                        s_cfg,
+                        contender_name="rust_gamlss_flexible",
+                        binomial_cli_family=_flexible_link_name("probit"),
+                        ds=ds,
+                        folds=folds,
+                        shared_fold_artifacts=shared_fold_artifacts,
+                    ),
+                )
+                _ms_cfg = _effective_scenario_fit_mapping(s_cfg["name"]) or {}
+                _ms_extra = (
+                    ["--scale-dimensions"] if _ms_cfg.get("scale_dimensions") else None
+                )
+                _ms_contender = (
+                    "rust_gamlss_marginal_slope_aniso"
+                    if _ms_cfg.get("scale_dimensions")
+                    else "rust_gamlss_marginal_slope"
+                )
+                _append_contender_result_if_enabled(
+                    results,
+                    s_cfg,
+                    _ms_contender,
+                    lambda: run_rust_gamlss_marginal_slope_cv(
+                        s_cfg,
+                        contender_name=_ms_contender,
+                        ds=ds,
+                        folds=folds,
+                        rust_fit_extra_args=_ms_extra,
+                    ),
+                )
             rust_gamlss_surv_row = (
                 run_rust_gamlss_survival_cv(s_cfg, ds=ds, folds=folds)
                 if _is_contender_enabled(s_cfg, "rust_gamlss_survival")
