@@ -1245,9 +1245,15 @@ impl LikelihoodSpec {
     ///
     /// - `Gaussian` and `Gamma` profile/estimate the scale jointly with the
     ///   mean, so no fixed `phi` is exposed here.
-    /// - `Binomial`, `Poisson`, `Tweedie`, and `NegativeBinomial` are
-    ///   unit-scale exponential-family fits (overdispersion in NB is encoded
-    ///   in `theta`, not in `phi`), so the contract is `Some(1.0)`.
+    /// - `Binomial` and `Poisson` are unit-scale exponential-family fits, so the
+    ///   contract is `Some(1.0)`. NegativeBinomial's overdispersion lives in
+    ///   `theta` (a separate parameter / flag), not in a free `phi`, so it also
+    ///   returns `Some(1.0)`.
+    /// - `Tweedie { p }` carries its variance power on the family variant. Its
+    ///   free dispersion `phi` lives in `LikelihoodScaleMetadata` and is
+    ///   estimated by default (`EstimatedTweediePhi`, issue #771), so this
+    ///   family-level contract only exposes the unit seed used when callers ask
+    ///   the response family without scale metadata.
     /// - `Beta { phi }` carries its precision parameter directly on the family
     ///   variant; the contract returns that exact value rather than the
     ///   placeholder used elsewhere for unit-scale GLMs.
