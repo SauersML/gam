@@ -98,18 +98,10 @@ pub(crate) const MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA: f64 = -4.605_170_185
 ///
 /// The fixed overlap ridge is a PSD penalty on the marginal coefficient
 /// directions whose pilot effective marginal Jacobian lies in the weighted span
-/// of the pilot effective logslope Jacobian. The matrix itself is built on the
-/// same weighted Fisher scale as the pilot Jacobians, so `λ = 1` would add a
-/// full second copy of the local data curvature on the coupled subspace. Keep
-/// the penalty as a small relative damping term: enough to make the confounded
-/// finite-sample optimum proper, but not enough to flatten ordinary Matérn
-/// signal and make the outer smoothness search reject every seed.
-///
-/// It is pinned out of REML for the same reason as the nullspace ridge: the
-/// failure is a structural finite-sample confound, not a smoothness parameter to
-/// estimate.
-pub(crate) const MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA: f64 =
-    MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA;
+/// of the pilot effective logslope Jacobian. It is pinned out of REML for the
+/// same reason as the nullspace ridge: the failure is a structural finite-
+/// sample confound, not a smoothness parameter to estimate.
+pub(crate) const MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA: f64 = 0.0;
 
 /// Per-row, per-θ₁ score-influence Jacobian `∂z/∂θ₁` for a fitted CTN, plus the
 /// latent score `z` itself on the same rows.
