@@ -6399,8 +6399,9 @@ impl<'a> RemlState<'a> {
                 &pirls_config,
                 warm_start_ref,
                 adaptive_kkt_tolerance,
-                // REML cost eval: never re-profile the Gamma scale against the
-                // trial λ's residuals (would bias λ selection — see #678).
+                // REML cost eval: never re-profile the family dispersion (Gamma
+                // shape / Beta precision) against the trial λ's residuals — that
+                // would couple the scale to λ and bias selection (#678, #769).
                 false,
             );
             let pirls_elapsed = pirls_start.elapsed();
