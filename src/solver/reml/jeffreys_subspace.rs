@@ -41,6 +41,24 @@ const REDUCED_INFO_RELATIVE_FLOOR: f64 = 1e-10;
 /// (near) zero, so `λ_max ≈ 0` cannot scale the relative floor.
 const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 
+/// Conditioning gate. When the reduced information `H_id = Z_J^T H Z_J` is
+/// well-conditioned — every direction's curvature is within this relative
+/// factor of the dominant `λ_max` — the data identifies the WHOLE span at
+/// `O(n)` strength and the self-limiting `O(1)` Jeffreys term is negligible
+/// there (its only effect would be the `O(1/n)` Firth bias correction, which is
+/// not what this machinery exists to supply). We therefore SKIP the term
+/// entirely and return the zero contribution, so a clean/easy fit pays no cost
+/// and stays byte-identical to the un-penalized inner Newton. The gate fires
+/// only on the OTHER side: an ill-conditioned / near-separating reduced
+/// information (`λ_min/λ_max` below this threshold), where the floored log-det
+/// curvature below is exactly the `O(1)`-bounding term Firth supplies.
+///
+/// The threshold sits far from machine precision: at `1e-8` the worst-
+/// conditioned direction is still 8 orders of magnitude from the absolute floor
+/// (`REDUCED_INFO_RELATIVE_FLOOR = 1e-10`), i.e. comfortably identified rather
+/// than separating, so nothing the term would actually bound is gated out.
+const CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
+
 /// Orthonormal basis of one block's Jeffreys span.
 ///
 /// `columns` is `p x m` with orthonormal columns spanning `ker(S_aggregate)`
@@ -182,6 +200,21 @@ where
         .eigh(Side::Lower)
         .map_err(|e| format!("joint_jeffreys_term: reduced-information eigendecomposition failed: {e}"))?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+    // CONDITIONING GATE ("no cost on easy fits"). The eigendecomposition we just
+    // computed gives the full reduced spectrum; the worst-conditioned direction
+    // is `λ_min`. When `λ_min/λ_max` is above the gate, every direction is
+    // identified by the data at comparable `O(n)` strength, the self-limiting
+    // Jeffreys term is negligible, and we skip it outright (zero value, gradient
+    // and curvature) so a clean/well-conditioned fit stays byte-identical to the
+    // un-penalized inner Newton. Only an ill-conditioned / near-separating
+    // reduced information falls through to the floored log-det term below, which
+    // is the `O(1)`-bounding curvature this machinery exists to supply.
+    if lambda_max > 0.0 {
+        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        if lambda_min.is_finite() && lambda_min / lambda_max >= CONDITIONING_GATE_RELATIVE {
+            return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
+        }
+    }
     // Absolute floor relative to the dominant identified curvature: negligible on
     // identified directions (O(n)), positive on separating ones.
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
@@ -312,33 +345,40 @@ mod tests {
     #[test]
     fn joint_jeffreys_term_matches_finite_difference_gradient() {
         // A 2x2 quadratic-form Hessian whose log-determinant has a known
-        // gradient. Build a beta-dependent H(beta) = diag(exp(beta0), 1+beta1^2)
-        // restricted to the full span (Z_J = I) and finite-difference Phi.
+        // gradient. The SECOND direction is scaled by `ill` so the reduced
+        // information is ILL-conditioned (`λ_min/λ_max ≈ 8.6e-10`, below the
+        // conditioning gate) — this exercises the active Jeffreys path rather
+        // than the gate, while both eigenvalues stay comfortably above the
+        // floored ridge so `Φ` and `grad` are the exact log-det quantities.
+        // H(beta) = diag(exp(beta0), ill*(1+beta1^2)), Z_J = I.
         let p = 2usize;
+        let ill = 1e-9_f64;
         let z = Array2::<f64>::eye(p);
         let h_at = |b: &Array1<f64>| -> Array2<f64> {
             let mut h = Array2::<f64>::zeros((p, p));
             h[[0, 0]] = b[0].exp();
-            h[[1, 1]] = 1.0 + b[1] * b[1];
+            h[[1, 1]] = ill * (1.0 + b[1] * b[1]);
             h
         };
-        // Hdot[d] = d/d eps H(beta + eps d): diag(exp(b0) d0, 2 b1 d1).
+        // Hdot[d] = d/d eps H(beta + eps d): diag(exp(b0) d0, ill*2 b1 d1).
         let beta: Array1<f64> = array![0.3, -0.4];
         let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
             let mut hd = Array2::<f64>::zeros((p, p));
             hd[[0, 0]] = beta[0].exp() * d[0];
-            hd[[1, 1]] = 2.0 * beta[1] * d[1];
+            hd[[1, 1]] = ill * 2.0 * beta[1] * d[1];
             Ok(Some(hd))
         };
         let h = h_at(&beta);
         let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
-        // Phi = 1/2 log(exp(b0) * (1 + b1^2)).
-        let expected_phi = 0.5 * (beta[0].exp() * (1.0 + beta[1] * beta[1])).ln();
+        // Phi = 1/2 log(exp(b0) * ill*(1 + b1^2)).
+        let expected_phi = 0.5 * (beta[0].exp() * ill * (1.0 + beta[1] * beta[1])).ln();
         assert!(
             (phi - expected_phi).abs() < 1e-10,
             "phi {phi} vs {expected_phi}"
         );
-        // Finite-difference the gradient.
+        // Finite-difference the gradient. Note ∂/∂β of log|H| is scale-free in
+        // the constant `ill` factor (it differentiates the log), so the gradient
+        // matches the un-scaled form exactly.
         let eps = 1e-6;
         for k in 0..p {
             let mut bp = beta.clone();
@@ -366,6 +406,67 @@ mod tests {
         for e in evals.iter() {
             assert!(*e >= -1e-10, "H_Phi must be PSD, got eigenvalue {e}");
         }
+    }
+
+    #[test]
+    fn conditioning_gate_skips_well_conditioned_information() {
+        // A WELL-conditioned reduced information (`λ_min/λ_max = 0.5`, far above
+        // the gate) must skip the Jeffreys term entirely: zero value, gradient
+        // and curvature, so an easy fit pays no cost. The directional-derivative
+        // closure here is deliberately NONZERO; the gate must short-circuit
+        // before it would otherwise produce a nonzero gradient.
+        let p = 2usize;
+        let z = Array2::<f64>::eye(p);
+        let mut h = Array2::<f64>::zeros((p, p));
+        h[[0, 0]] = 2.0;
+        h[[1, 1]] = 1.0; // ratio 0.5 ≫ 1e-8 ⇒ gated
+        let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            // Nonzero derivative; would yield a nonzero gradient if not gated.
+            let mut hd = Array2::<f64>::zeros((p, p));
+            hd[[0, 0]] = 3.0 * d[0];
+            hd[[1, 1]] = 5.0 * d[1];
+            Ok(Some(hd))
+        };
+        let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
+        assert_eq!(phi, 0.0, "well-conditioned ⇒ no Jeffreys value");
+        assert!(grad.iter().all(|v| *v == 0.0), "well-conditioned ⇒ zero grad");
+        assert!(hphi.iter().all(|v| *v == 0.0), "well-conditioned ⇒ zero curvature");
+    }
+
+    #[test]
+    fn conditioning_gate_fires_only_below_threshold() {
+        // Bracket the gate: a ratio just ABOVE the threshold is skipped (zero
+        // term), a ratio just BELOW it falls through to the active path and
+        // produces a NONZERO value/curvature. This pins the "no cost on easy
+        // fits, full term on hard ones" boundary.
+        let p = 2usize;
+        let z = Array2::<f64>::eye(p);
+        let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            let mut hd = Array2::<f64>::zeros((p, p));
+            hd[[0, 0]] = d[0];
+            hd[[1, 1]] = d[1];
+            Ok(Some(hd))
+        };
+        // lambda_max = 1.0; choose lambda_min on either side of CONDITIONING_GATE_RELATIVE.
+        let mk = |lmin: f64| {
+            let mut h = Array2::<f64>::zeros((p, p));
+            h[[0, 0]] = 1.0;
+            h[[1, 1]] = lmin;
+            h
+        };
+        // Above threshold (well-conditioned) ⇒ gated.
+        let above = mk(CONDITIONING_GATE_RELATIVE * 10.0);
+        let (phi_a, grad_a, _) = joint_jeffreys_term(above.view(), z.view(), hdir).unwrap();
+        assert_eq!(phi_a, 0.0);
+        assert!(grad_a.iter().all(|v| *v == 0.0));
+        // Below threshold (ill-conditioned) ⇒ active, nonzero contribution.
+        let below = mk(CONDITIONING_GATE_RELATIVE * 0.1);
+        let (phi_b, _grad_b, hphi_b) = joint_jeffreys_term(below.view(), z.view(), hdir).unwrap();
+        assert!(phi_b != 0.0, "below-gate must produce a nonzero Jeffreys value");
+        assert!(
+            hphi_b.iter().any(|v| v.abs() > 0.0),
+            "below-gate must produce nonzero bounding curvature"
+        );
     }
 
     #[test]
