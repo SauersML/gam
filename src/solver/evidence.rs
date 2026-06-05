@@ -48,6 +48,7 @@ use crate::linalg::faer_ndarray::FaerEigh;
 use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
 use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
+use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 
 pub const ANALYTIC_LOGDET_DENSE_DIM_THRESHOLD: usize = 1024;
 const EVIDENCE_LOGDET_SLQ_PROBES: usize = 16;
@@ -1028,13 +1029,23 @@ pub fn select_topology(
     );
 
     // Sort by normalized negative log evidence (ascending = best first),
-    // breaking ties by complexity_rank (smaller wins).
-    valid.sort_by(|a, b| {
-        topology_selection_score(a, options.score_scale)
-            .partial_cmp(&topology_selection_score(b, options.score_scale))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.kind.complexity_rank().cmp(&b.kind.complexity_rank()))
-    });
+    // breaking ties by complexity_rank (smaller wins). The shared selector is
+    // the single lower-is-better ordering contract used by topology ranking,
+    // seed screening, and REML model comparison (#782).
+    valid = rank_priority_candidates(
+        valid
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let score = topology_selection_score(&row, options.score_scale);
+                let tie_break = row.kind.complexity_rank();
+                PriorityCandidate::new(row, idx, score, tie_break)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|row| row.item)
+    .collect();
 
     // Detect numerical tie at the top.
     let tie = if valid.len() >= 2 {

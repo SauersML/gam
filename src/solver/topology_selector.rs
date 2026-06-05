@@ -13,6 +13,7 @@
 //! is winner-take-all with deterministic score ordering.
 
 use crate::solver::evidence::TopologyScoreScale;
+use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use serde_json::Value as JsonValue;
 
 const TK_LOG_2PI: f64 = 1.8378770664093453_f64;
@@ -223,17 +224,22 @@ where
         ));
     }
     // Sign convention (issue #396, see `solver::reml_compare`): `tk_score` is a
-    // minimised TK / REML cost (penalised negative log marginal likelihood plus
-    // the null-space Laplace correction), so LOWER is better. Sort ASCENDING and
-    // take index 0 as the winner — the sibling selector in `solver::evidence`
-    // and the REML comparator both sort ascending for the same reason. The
-    // previous descending sort here treated the cost as a log-evidence and
-    // therefore selected the WORST-fitting topology.
-    ranked.sort_by(|lhs, rhs| {
-        lhs.tk_score
-            .partial_cmp(&rhs.tk_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // minimised TK / REML cost, so LOWER is better. Route through the shared
+    // priority selector so topology ranking, seed screening, and model
+    // comparison share one deterministic ordering contract (#782).
+    ranked = rank_priority_candidates(
+        ranked
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let score = row.tk_score;
+                PriorityCandidate::new(row, idx, score, 0)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|row| row.item)
+    .collect();
     Ok(TopologyAutoSelectorResult {
         ranked,
         winner_index: 0,

@@ -16,6 +16,9 @@
 use crate::cache::{LoadSource, Session as CacheSession};
 use crate::estimate::EstimationError;
 use crate::solver::estimate::reml::unified::BarrierConfig;
+use crate::solver::priority_selection::{
+    PriorityBudgetStage, PriorityStageSummary, rank_indices_with_budget_cascade,
+};
 use crate::solver::startup_stats::{
     SeedRejection, StartupStats, format_no_seeds_passed, uniform_structural_key,
 };
@@ -987,16 +990,20 @@ fn rank_seeds_with_screening(
     // only `21 × initial` extra inner iterations before the uncapped
     // fallback.
     let cascade_caps = [
-        initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[0]),
-        initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[1]),
-        initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[2]),
-        SEED_SCREENING_UNCAPPED,
+        PriorityBudgetStage {
+            cap: initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[0]),
+        },
+        PriorityBudgetStage {
+            cap: initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[1]),
+        },
+        PriorityBudgetStage {
+            cap: initial_cap.saturating_mul(SEED_SCREENING_CASCADE_MULTIPLIERS[2]),
+        },
+        PriorityBudgetStage {
+            cap: SEED_SCREENING_UNCAPPED,
+        },
     ];
 
-    let mut ranked: Vec<(usize, f64)> = Vec::with_capacity(seeds.len());
-    let mut rejected = 0usize;
-    let mut final_cap_used = initial_cap;
-    let mut stages_consumed = 0usize;
     let cascade_start = std::time::Instant::now();
     log::info!(
         "[STAGE] {context}: seed screening cascade start seeds={} initial_cap={} stages={}",
@@ -1005,16 +1012,15 @@ fn rank_seeds_with_screening(
         cascade_caps.len(),
     );
 
-    for (stage, &cap) in cascade_caps.iter().enumerate() {
-        screening_cap.store(cap, Ordering::Relaxed);
-        ranked.clear();
-        rejected = 0;
-        let stage_started = std::time::Instant::now();
-        for (idx, seed) in seeds.iter().enumerate() {
+    let cascade_result = rank_indices_with_budget_cascade(
+        seeds.len(),
+        &cascade_caps,
+        |stage, cap, idx| {
+            screening_cap.store(cap, Ordering::Relaxed);
             obj.reset();
             screening_cap.store(cap, Ordering::Relaxed);
             let seed_started = std::time::Instant::now();
-            let result = obj.eval_screening_proxy(seed);
+            let result = obj.eval_screening_proxy(&seeds[idx]);
             let seed_elapsed = seed_started.elapsed().as_secs_f64();
             match result {
                 Ok(cost) if cost.is_finite() => {
@@ -1031,7 +1037,7 @@ fn rank_seeds_with_screening(
                         seed_elapsed,
                         cost,
                     );
-                    ranked.push((idx, cost));
+                    Ok(cost)
                 }
                 Ok(cost) => {
                     log::info!(
@@ -1047,7 +1053,7 @@ fn rank_seeds_with_screening(
                         seed_elapsed,
                         cost,
                     );
-                    rejected += 1;
+                    Ok(cost)
                 }
                 Err(_) => {
                     log::info!(
@@ -1062,42 +1068,50 @@ fn rank_seeds_with_screening(
                         },
                         seed_elapsed,
                     );
-                    rejected += 1;
+                    Err(())
                 }
             }
-        }
-        log::info!(
-            "[STAGE] {context}: seed-screen stage={} cap={} elapsed={:.3}s ranked={} rejected={}",
-            stage,
-            if cap == 0 {
-                "uncapped".to_string()
-            } else {
-                cap.to_string()
-            },
-            stage_started.elapsed().as_secs_f64(),
-            ranked.len(),
-            rejected,
-        );
-        final_cap_used = cap;
-        stages_consumed = stage + 1;
-        if !ranked.is_empty() {
-            if stage > 0 {
+        },
+        |PriorityStageSummary {
+             stage,
+             cap,
+             ranked,
+             rejected,
+         }| {
+            log::info!(
+                "[STAGE] {context}: seed-screen stage={} cap={} elapsed={:.3}s ranked={} rejected={}",
+                stage,
+                if cap == 0 {
+                    "uncapped".to_string()
+                } else {
+                    cap.to_string()
+                },
+                cascade_start.elapsed().as_secs_f64(),
+                ranked,
+                rejected,
+            );
+            if ranked > 0 && stage > 0 {
+                let final_cap = if cap == 0 {
+                    "uncapped".to_string()
+                } else {
+                    cap.to_string()
+                };
                 log::info!(
                     "[OUTER] {context}: seed screening cap escalated from {} to {} \
                      (initial cap was too shallow for this problem; {}/{} seeds ranked)",
                     initial_cap,
-                    if cap == 0 {
-                        "uncapped".to_string()
-                    } else {
-                        cap.to_string()
-                    },
-                    ranked.len(),
+                    final_cap,
+                    ranked,
                     seeds.len(),
                 );
             }
-            break;
-        }
-    }
+        },
+    );
+
+    let rejected = cascade_result.rejected;
+    let final_cap_used = cascade_result.final_cap;
+    let stages_consumed = cascade_result.stages_consumed;
+    let ranked = cascade_result.ranked_indices;
 
     screening_cap.store(previous_cap, Ordering::Relaxed);
     obj.reset();
@@ -1125,13 +1139,9 @@ fn rank_seeds_with_screening(
         return seeds.to_vec();
     }
 
-    ranked.sort_by(|(idx_a, cost_a), (idx_b, cost_b)| {
-        cost_a.total_cmp(cost_b).then_with(|| idx_a.cmp(idx_b))
-    });
-
     let mut ordered = Vec::with_capacity(seeds.len());
     let mut seen = vec![false; seeds.len()];
-    for (idx, _) in ranked {
+    for idx in ranked {
         seen[idx] = true;
         ordered.push(seeds[idx].clone());
     }
