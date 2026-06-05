@@ -225,7 +225,7 @@ const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
 /// dimension `p`, WITHOUT ever forming the dense `H_id` or its eigendecomposition.
 ///
 /// METHOD. `k`-step Lanczos with FULL reorthogonalization builds a symmetric
-/// tridiagonal `T_k` from a dense (all-ones) start vector. With full reorth the
+/// tridiagonal `T_k` from a dense aperiodic start vector. With full reorth the
 /// factorization `H Q_k = Q_k T_k + β_k q_{k+1} e_kᵀ` holds exactly, so each Ritz
 /// pair `(θ_i, y_i)` has the SHARP residual `‖H(Q_k y_i) − θ_i (Q_k y_i)‖ =
 /// β_k·|e_kᵀ y_i| =: res_i` (Saad, *Numerical Methods for Large Eigenvalue
