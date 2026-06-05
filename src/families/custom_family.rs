@@ -22564,7 +22564,9 @@ fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'st
         h_joint.view(),
         z_joint.view(),
         |direction: &Array1<f64>| {
-            family.exact_newton_joint_hessian_directional_derivative(states, direction)
+            family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                states, specs, direction,
+            )
         },
     )?;
     Ok(Some(term))
@@ -22663,6 +22665,7 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
     // joint Hessian at that point for each mode-response direction.
     let family_owned = family.clone();
     let states_owned: Vec<ParameterBlockState> = states.to_vec();
+    let specs_owned: Vec<ParameterBlockSpec> = specs.to_vec();
     let z_columns = z_joint.clone();
     let drift: JeffreysHphiDriftFn = Arc::new(move |delta: &Array1<f64>| {
         crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative(
@@ -22670,12 +22673,16 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
             z_columns.view(),
             delta,
             |direction: &Array1<f64>| {
-                family_owned
-                    .exact_newton_joint_hessian_directional_derivative(&states_owned, direction)
+                family_owned.exact_newton_joint_hessian_directional_derivative_with_specs(
+                    &states_owned,
+                    &specs_owned,
+                    direction,
+                )
             },
             |u: &Array1<f64>, v: &Array1<f64>| {
-                family_owned.exact_newton_joint_hessiansecond_directional_derivative(
+                family_owned.exact_newton_joint_hessian_second_directional_derivative_with_specs(
                     &states_owned,
+                    &specs_owned,
                     u,
                     v,
                 )

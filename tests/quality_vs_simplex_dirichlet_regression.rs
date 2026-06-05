@@ -422,6 +422,31 @@ impl CustomFamily for DirichletCommonFamily {
         Ok(Some(joint))
     }
 
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        if block_states.len() != K || specs.len() != K {
+            return Err(format!(
+                "DirichletCommonFamily expects {K} blocks/specs, got {}/{}",
+                block_states.len(),
+                specs.len()
+            ));
+        }
+        if d_beta_u_flat.len() != total || d_beta_v_flat.len() != total {
+            return Err(format!(
+                "DirichletCommonFamily second directional derivative lengths {}/{} != joint beta width {total}",
+                d_beta_u_flat.len(),
+                d_beta_v_flat.len()
+            ));
+        }
+        Ok(None)
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != K {
             return Err(format!(
