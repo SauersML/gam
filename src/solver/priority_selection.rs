@@ -140,7 +140,7 @@ mod tests {
         let out = rank_indices_with_budget_cascade(
             3,
             &stages,
-            |_, cap, idx| {
+            |_, cap, idx| -> Result<f64, ()> {
                 if cap < 8 {
                     Ok(f64::NAN)
                 } else {
