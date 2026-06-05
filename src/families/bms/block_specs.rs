@@ -999,24 +999,6 @@ fn build_logslope_blockspec_bms(
     let logslope_dense = design
         .design
         .try_to_dense_arc("build_logslope_blockspec_bms::logslope")?;
-    {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/bms_dbg.log")
-        {
-            writeln!(
-                f,
-                "build_logslope_blockspec design.ncols={} dense.ncols={} penalties={} nullspace_dims={:?}",
-                design.design.ncols(),
-                logslope_dense.ncols(),
-                design.penalties.len(),
-                design.nullspace_dims,
-            )
-            .ok();
-        }
-    }
     let callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(BmsLogslopeJacobian {
         marginal_dense,
         logslope_dense: Arc::clone(&logslope_dense),
@@ -1698,30 +1680,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
                         marginal_design: &TermCollectionDesign,
                         logslope_design: &TermCollectionDesign|
      -> Result<Vec<ParameterBlockSpec>, String> {
-        // Structural confound cure: shear the logslope design columns to the
-        // W-orthogonal basis `G̃` when the robust flag is armed. No-op otherwise.
-        // Built lazily against THESE designs (the frozen ones the solver fits).
-        let reparam = confound_reparam_for(marginal_design, logslope_design)?;
-        if robust.orthogonalize_confounds {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/bms_dbg.log")
-            {
-                writeln!(
-                    f,
-                    "build_blocks marginal_ncols={} logslope_ncols={} reparam_pc={:?}",
-                    marginal_design.design.ncols(),
-                    logslope_design.design.ncols(),
-                    reparam.as_ref().map(|r| r.confound_cols()),
-                )
-                .ok();
-            }
-        }
-        let logslope_design_swapped =
-            apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
-        let logslope_design: &TermCollectionDesign = &logslope_design_swapped;
         let hints = hints.borrow();
         let mut cursor = 0usize;
         // Fixed #754/#461 ridges are appended inside
