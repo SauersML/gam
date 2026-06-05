@@ -102,7 +102,9 @@ fn make_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let b = 0.7 * rng.normal();
         let eta = (0.4 + 0.8 * a - 0.5 * b).clamp(-2.2, 2.2);
         let mu = logistic(eta);
-        let yi = rng.beta(mu * PHI, (1.0 - mu) * PHI).clamp(1.0e-6, 1.0 - 1.0e-6);
+        let yi = rng
+            .beta(mu * PHI, (1.0 - mu) * PHI)
+            .clamp(1.0e-6, 1.0 - 1.0e-6);
         x1.push(a);
         x2.push(b);
         y.push(yi);
