@@ -2035,6 +2035,11 @@ impl FittedModel {
         // credible intervals stop widening with distance from the data. This
         // mirrors how periodic axes are exempted just above.
         let linear_axes = self.training_linear_axes(training_headers.len());
+        // Random-effect grouping axes are categorical even when their source
+        // column is numeric. Clipping them would remap an unseen group label to
+        // a boundary training level instead of letting the random-effect block
+        // encode it as the prior-mean zero effect.
+        let random_effect_axes = self.training_random_effect_axes(training_headers.len());
         // Sphere latitude is a closed-manifold coordinate: its clip bounds are
         // the manifold's intrinsic domain ([-π/2, π/2] or [-90, 90]), not the
         // sampled range, so a pole prediction reaches the true pole instead of
@@ -2064,6 +2069,9 @@ impl FittedModel {
             if linear_axes.contains(&col_in_training) {
                 continue;
             }
+            if random_effect_axes.contains(&col_in_training) {
+                continue;
+            }
             let Some(&col_idx) = col_map.get(header) else {
                 continue;
             };
@@ -2084,6 +2092,21 @@ impl FittedModel {
             }
         }
         if any_clipped { Some(clipped) } else { None }
+    }
+
+    fn saved_term_specs(&self) -> Vec<&TermCollectionSpec> {
+        let mut specs: Vec<&TermCollectionSpec> = [
+            self.resolved_termspec.as_ref(),
+            self.resolved_termspec_noise.as_ref(),
+            self.resolved_termspec_logslope.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if let Some(logslopes) = self.resolved_termspec_logslopes.as_ref() {
+            specs.extend(logslopes.iter());
+        }
+        specs
     }
 
     /// Collect the set of training-column indices that are periodic axes —
@@ -2154,23 +2177,32 @@ impl FittedModel {
     /// interactions contribute every column in their `feature_cols` product.
     fn training_linear_axes(&self, n_training_headers: usize) -> std::collections::HashSet<usize> {
         let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let mut single_specs: Vec<&TermCollectionSpec> = [
-            self.resolved_termspec.as_ref(),
-            self.resolved_termspec_noise.as_ref(),
-            self.resolved_termspec_logslope.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if let Some(specs) = self.resolved_termspec_logslopes.as_ref() {
-            single_specs.extend(specs.iter());
-        }
-        for spec in single_specs {
+        for spec in self.saved_term_specs() {
             for term in &spec.linear_terms {
                 for col in term.effective_feature_cols() {
                     if col < n_training_headers {
                         out.insert(col);
                     }
+                }
+            }
+        }
+        out
+    }
+
+    /// Collect the set of training-column indices that feed random-effect
+    /// grouping terms. These columns are categorical model axes regardless of
+    /// the ingest schema's scalar storage type, so prediction must leave them
+    /// untouched and let the frozen random-effect levels decide whether a row is
+    /// a seen level or the zero-effect unseen-level fallback.
+    fn training_random_effect_axes(
+        &self,
+        n_training_headers: usize,
+    ) -> std::collections::HashSet<usize> {
+        let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.random_effect_terms {
+                if term.feature_col < n_training_headers {
+                    out.insert(term.feature_col);
                 }
             }
         }
@@ -3719,6 +3751,22 @@ mod tests {
         }
     }
 
+    fn standard_gaussian_payload() -> FittedModelPayload {
+        FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "y ~ 1".to_string(),
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: LikelihoodSpec::gaussian_identity(),
+                link: Some(StandardLink::Identity),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            "gaussian".to_string(),
+        )
+    }
+
     fn anchored_runtime(basis_dim: usize) -> SavedCompiledFlexBlock {
         SavedCompiledFlexBlock {
             kernel: ANCHORED_DEVIATION_KERNEL.to_string(),
@@ -3846,6 +3894,48 @@ mod tests {
         payload.logslope_baseline = Some(0.0);
         payload.link = Some(InverseLink::Standard(StandardLink::Probit));
         payload
+    }
+
+    #[test]
+    fn axis_clip_leaves_numeric_random_effect_group_axis_unclipped() {
+        let data = array![[100.0], [-100.0]];
+        let col_map = HashMap::from([("g".to_string(), 0usize)]);
+
+        let mut plain_payload = standard_gaussian_payload();
+        plain_payload.data_schema = Some(DataSchema {
+            columns: vec![SchemaColumn {
+                name: "g".to_string(),
+                kind: ColumnKindTag::Continuous,
+                levels: vec![],
+            }],
+        });
+        plain_payload.set_training_feature_metadata(vec!["g".to_string()], vec![(0.0, 7.0)]);
+        plain_payload.resolved_termspec = Some(empty_termspec());
+        let plain = FittedModel::from_payload(plain_payload.clone());
+        let clipped = plain
+            .axis_clip_to_training_ranges(data.view(), &col_map)
+            .expect("ordinary continuous axis should clip outside the training range");
+        assert_eq!(clipped.column(0).to_vec(), vec![7.0, 0.0]);
+
+        let mut group_payload = plain_payload;
+        let mut group_spec = empty_termspec();
+        group_spec
+            .random_effect_terms
+            .push(crate::smooth::RandomEffectTermSpec {
+                name: "g".to_string(),
+                feature_col: 0,
+                drop_first_level: false,
+                penalized: true,
+                frozen_levels: Some(vec![0.0_f64.to_bits(), 7.0_f64.to_bits()]),
+            });
+        group_payload.resolved_termspec = Some(group_spec);
+        let group_model = FittedModel::from_payload(group_payload);
+
+        assert_eq!(
+            group_model.axis_clip_to_training_ranges(data.view(), &col_map),
+            None,
+            "numeric group labels must reach RandomEffectOperator as unseen levels, not be clipped to boundary seen levels"
+        );
     }
 
     #[test]
