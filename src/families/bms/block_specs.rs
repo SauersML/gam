@@ -429,7 +429,7 @@ fn marginal_penalties_with_influence_ridge(
     // directions, so this pinned nullspace-shrinkage ridge is retired (skip the
     // penalty AND its `nullspace_dims`/`log_lambdas` slot to keep accounting
     // consistent).
-    if p_m > 0 || robust.firth_general /* DBG force-keep nullspace ridge always */ {
+    if p_m > 0 && !robust.firth_general {
         let mut aggregate = Array2::<f64>::zeros((p_m, p_m));
         for bp in &design.penalties {
             let scale = bp
