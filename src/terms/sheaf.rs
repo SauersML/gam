@@ -484,6 +484,7 @@ impl SheafConsistencyPenalty {
                 max_steps: k,
                 residual_tol: 1e-12,
                 local_reorthogonalize: true,
+                full_reorthogonalize: false,
             },
             |q, out| {
                 let w = self.laplacian_apply(ArrayView1::from(q));

@@ -438,6 +438,7 @@ fn lanczos_log_quadrature_hvp(
             max_steps,
             residual_tol: 1e-12,
             local_reorthogonalize: false,
+            full_reorthogonalize: false,
         },
         |q, out| {
             let applied = (hvp.apply)(q);
