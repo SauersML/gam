@@ -676,27 +676,17 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     )
 }
 
-/// `refine_dispersion_at_converged_eta`: when `true`, after the inner P-IRLS
-/// solve converges, re-estimate the family's estimated dispersion nuisance — the
-/// Gamma shape ν = 1/φ or the Beta precision φ — at the *converged* linear
-/// predictor and iterate the (β, dispersion) pair to its joint fixed point at the
-/// current λ (see the in-body comments at each refresh loop). This is ON only for
-/// the single final, reported fit at the REML-selected λ (#678 for Gamma, #769
-/// for Beta). It is deliberately OFF for every REML cost / sigma-point evaluation:
-/// re-profiling the dispersion against each trial λ's converged residuals would
-/// couple the scale to the smoothing parameter (a flat over-smoothed μ inflates
-/// the deviance ⇒ a smaller effective precision ⇒ a smaller `deviance/(2φ)` REML
-/// term), perversely rewarding over-smoothing and biasing λ selection. mgcv
-/// likewise estimates the scale at the converged fit, not inside the λ search.
-///
-/// The Gamma and Beta cases differ in what the re-solve buys. For Gamma the shape
-/// is a pure nuisance — β̂ is essentially scale-free — so the re-solve only keeps
-/// the reported dispersion and SEs self-consistent. For Beta the precision φ
-/// enters the *mean* score through the digamma terms
-/// `μ*ᵢ = ψ(μᵢφ) − ψ((1−μᵢ)φ)`, so a φ measured at the cold null predictor
-/// (μ ≈ 0.5) attenuates every slope toward zero; here the fixed point is
-/// load-bearing — it is what recovers the correct mean coefficients (the betareg
-/// alternating mean-fit ↔ φ-estimate scheme).
+/// `refine_gamma_dispersion`: when `true`, after the inner P-IRLS solve
+/// converges, re-estimate the Gamma dispersion shape ν = 1/φ at the *converged*
+/// linear predictor and iterate (β, ν) to their joint fixed point at the current
+/// λ (see the in-body comment at the refresh loop). This is ON only for the
+/// single final, reported fit at the REML-selected λ (#678). It is deliberately
+/// OFF for every REML cost / sigma-point evaluation: re-profiling ν against each
+/// trial λ's converged residuals would couple the scale to the smoothing
+/// parameter (a flat over-smoothed μ inflates the Gamma deviance ⇒ smaller ν ⇒
+/// larger φ ⇒ a smaller `deviance/(2φ)` REML term), perversely rewarding
+/// over-smoothing and biasing λ selection. mgcv likewise estimates the Gamma
+/// scale at the converged fit, not inside the λ search.
 pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix> + Clone>(
     rho: LogSmoothingParamsView<'_>,
     problem: PirlsProblem<'a, X>,
@@ -704,7 +694,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
     adaptive_kkt_tolerance: Option<AdaptiveKktTolerance>,
-    refine_dispersion_at_converged_eta: bool,
+    refine_gamma_dispersion: bool,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
     let PirlsProblem {
         x,
@@ -1375,9 +1365,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // Warm-started solves (every REML cost eval) already sit near the converged
     // η, so the first refresh check confirms ν and exits without a re-solve; the
     // added cost there is a single O(n) shape evaluation.
-    if refine_dispersion_at_converged_eta
-        && working_model.likelihood.scale.gamma_shape_is_estimated()
-    {
+    if refine_gamma_dispersion && working_model.likelihood.scale.gamma_shape_is_estimated() {
         // A few passes suffice: the converged-η shape map is a strong
         // contraction (β̂ barely moves once the mean is captured), so cold
         // starts settle in 1–2 re-solves and warm starts in zero.
