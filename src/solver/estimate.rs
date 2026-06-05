@@ -511,30 +511,17 @@ impl ParametricColumnConditioning {
     /// ```
     ///
     /// The RHS `b` is unchanged, so [`Self::transform_linear_constraints_to_internal`]
-    /// carries it through verbatim. The previous implementation multiplied by
-    /// `scale_j` (the back-transform factor) instead of dividing — its transpose —
-    /// which let a box constraint escape its interval by exactly `1/scale_j²`, and
-    /// also mixed the intercept column with the wrong sign (harmless only because a
-    /// single-coefficient box has a zero intercept entry).
+    /// carries it through verbatim. `A_orig · M` is precisely `M` applied to the
+    /// columns of `A_orig`, which is the canonical back-transform primitive
+    /// [`Self::transform_matrix_columnswith_a`] already used by
+    /// [`Self::backtransform_covariance`] — so delegate to it rather than carry a
+    /// second copy of the per-column algebra. The previous hand-rolled body applied
+    /// the *inverse* conditioning map ([`Self::transform_matrix_columnswith_b`]:
+    /// `+mean`, `×scale`) instead, which let a box constraint escape its interval
+    /// by exactly `1/scale_j²` (and mixed the intercept column with the wrong sign,
+    /// harmless only because a single-coefficient box has a zero intercept entry).
     fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
-        let mut out = a_original.clone();
-        // The intercept column of M is `e_intercept`, so `A_orig[:, intercept]`
-        // is never rewritten; capture it once from the untouched input.
-        let intercept_col = self
-            .intercept_idx
-            .map(|idx| a_original.column(idx).to_owned());
-        for &(j, mean, scale) in &self.columns {
-            let mut target = out.column_mut(j);
-            if mean != 0.0
-                && let Some(intercept_col) = intercept_col.as_ref()
-            {
-                target -= &(intercept_col * mean);
-            }
-            if scale != 1.0 {
-                target.mapv_inplace(|v| v / scale);
-            }
-        }
-        out
+        self.transform_matrix_columnswith_a(a_original)
     }
 
     fn transform_linear_constraints_to_internal(
@@ -7457,6 +7444,11 @@ mod estimate_policy_tests {
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
+    /// Realized-design single-column separation probe used only by the prefit
+    /// separation tests below. The production path uses the operator-backed
+    /// `_in_design` variant; this densified wrapper keeps the test inputs
+    /// readable. Lives in the test module so it is not a `#[cfg(test)]` free
+    /// function at `src/` scope.
     fn detect_prefit_binomial_single_column_separation(
         y: ArrayView1<'_, f64>,
         w: ArrayView1<'_, f64>,
