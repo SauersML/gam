@@ -4,7 +4,8 @@ use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cach
 use super::install_flex::validate_spec;
 use super::*;
 use crate::faer_ndarray::{
-    FaerArrayView, factorize_symmetricwith_fallback, fast_ab, fast_xt_diag_x, fast_xt_diag_y,
+    FaerArrayView, FaerEigh, factorize_symmetricwith_fallback, fast_ab, fast_atb, fast_xt_diag_x,
+    fast_xt_diag_y,
 };
 use crate::families::marginal_slope_orthogonal::{
     INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA, MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA,
