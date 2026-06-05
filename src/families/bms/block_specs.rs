@@ -1684,6 +1684,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
         // W-orthogonal basis `G̃` when the robust flag is armed. No-op otherwise.
         // Built lazily against THESE designs (the frozen ones the solver fits).
         let reparam = confound_reparam_for(marginal_design, logslope_design)?;
+        if robust.orthogonalize_confounds {
+            eprintln!(
+                "[DBG build_blocks] marginal_ncols={} logslope_ncols={} reparam_pc={:?}",
+                marginal_design.design.ncols(),
+                logslope_design.design.ncols(),
+                reparam.as_ref().map(|r| r.confound_cols()),
+            );
+        }
         let logslope_design_swapped =
             apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
         let logslope_design: &TermCollectionDesign = &logslope_design_swapped;
@@ -1763,6 +1771,13 @@ pub fn fit_bernoulli_marginal_slope_terms(
             .borrow()
             .as_ref()
             .and_then(|c| c.clone());
+        if robust.orthogonalize_confounds {
+            eprintln!(
+                "[DBG make_family] logslope_ncols={} reparam_pc={:?}",
+                logslope_design.design.ncols(),
+                reparam.as_ref().map(|r| r.confound_cols()),
+            );
+        }
         let logslope_design_swapped =
             apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
         let logslope_design: &TermCollectionDesign = &logslope_design_swapped;
