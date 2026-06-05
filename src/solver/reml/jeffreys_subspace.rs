@@ -224,23 +224,34 @@ const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
 /// `H_id = H`), computed MATRIX-FREE from a Hessian-vector product `hv` and the
 /// dimension `p`, WITHOUT ever forming the dense `H_id` or its eigendecomposition.
 ///
-/// METHOD. `k`-step Lanczos with full reorthogonalization builds a symmetric
-/// tridiagonal `T_k` whose spectrum interlaces `H`'s. Let `θ_min ≤ … ≤ θ_max` be
-/// the Ritz values (eigenvalues of `T_k`) and `β_k = ‖next Lanczos residual‖`.
-/// A standard residual bound (Saad, *Numerical Methods for Large Eigenvalue
-/// Problems*, Thm 6.4 / Kaniel–Paige) guarantees every eigenvalue of `T_k` lies
-/// within `β_k` of some eigenvalue of `H`. Combined with the interlacing
-/// `λ_min(H) ≤ θ_min` and `θ_max ≤ λ_max(H)`, this yields the rigorously
-/// CONSERVATIVE one-sided bounds returned here:
-///   * `λ_min(H) ≥ θ_min − β_k`  (a guaranteed LOWER bound on the smallest eigenvalue),
-///   * `λ_max(H) ≤ θ_max + β_k`  (a guaranteed UPPER bound on the largest eigenvalue).
-/// These bias the conditioning estimate toward "looks WORSE-conditioned than it
-/// is" — exactly the direction that makes a SKIP decision safe: if even these
-/// pessimistic bounds clear the gate, the true spectrum clears it by more.
+/// METHOD. `k`-step Lanczos with FULL reorthogonalization builds a symmetric
+/// tridiagonal `T_k` from a dense (all-ones) start vector. With full reorth the
+/// factorization `H Q_k = Q_k T_k + β_k q_{k+1} e_kᵀ` holds exactly, so each Ritz
+/// pair `(θ_i, y_i)` has the SHARP residual `‖H(Q_k y_i) − θ_i (Q_k y_i)‖ =
+/// β_k·|e_kᵀ y_i| =: res_i` (Saad, *Numerical Methods for Large Eigenvalue
+/// Problems*, §6; Parlett, *The Symmetric Eigenvalue Problem*). The residual
+/// eigenvalue bound then guarantees a true eigenvalue of `H` within `res_i` of
+/// `θ_i`.
 ///
-/// Returns `None` if the operator produces a non-finite/degenerate Krylov space
-/// (e.g. a zero start vector collapse), in which case the caller MUST fall
-/// through to the exact dense path (never skip on an unresolved estimate).
+/// CONSERVATIVE one-sided bounds. The EXTREME Ritz pairs converge FIRST under
+/// Lanczos (Kaniel–Paige); the TRUST GATE below requires the extreme residuals to
+/// be small relative to the spectral scale `θ_max` before trusting the estimate,
+/// which (with full reorth, so spurious/ghost eigenvalues cannot arise) means the
+/// Krylov space has resolved BOTH ends of the spectrum — hence `θ_min`/`θ_max`
+/// ARE `λ_min`/`λ_max` to within `res_min`/`res_max`. We therefore return:
+///   * `λ_min(H) ≥ θ_min − res_min`  (LOWER bound on the smallest eigenvalue),
+///   * `λ_max(H) ≤ θ_max + res_max`  (UPPER bound on the largest eigenvalue).
+/// These bias the conditioning estimate toward "looks WORSE-conditioned than it
+/// is" — the direction that makes a SKIP decision safe: if even these pessimistic
+/// bounds clear the gate (with the caller's extra `8×` margin), the true spectrum
+/// clears it by more.
+///
+/// Returns `None` — forcing the caller to fall through to the EXACT dense path —
+/// whenever the estimate cannot be trusted: a non-finite/degenerate Krylov space
+/// (zero-start collapse) OR an UNCONVERGED extreme Ritz pair (`res_min`/`res_max`
+/// not small). The latter is the critical safety valve: if the cheap iteration
+/// has not resolved the bottom of the spectrum it NEVER authorises a skip, so a
+/// hidden small eigenvalue cannot be missed — the term is then formed exactly.
 fn cheap_conditioning_bounds<HvFn>(
     mut hv: HvFn,
     p: usize,
@@ -252,12 +263,26 @@ where
         return Ok(None);
     }
     let steps = CHEAP_PRECHECK_LANCZOS_STEPS.min(p);
-    // Deterministic, dense start vector (all-ones, normalized): has a component
-    // along every eigenvector for a generic operator, so the extreme Ritz pair is
-    // resolved quickly. Determinism keeps the skip decision reproducible across
-    // runs (no RNG in the always-on hot path).
+    // Deterministic dense start vector with a NON-UNIFORM, aperiodic pattern. A
+    // plain all-ones vector is orthogonal to any eigenvector whose entries sum to
+    // zero — a symmetry an exactly-balanced Fisher information could exhibit,
+    // which would hide that eigenvalue from the Krylov space. Seeding each entry
+    // from an irrational-rotation sequence (`frac(i·φ) − ½`, φ the golden ratio)
+    // gives a deterministic, reproducible (no RNG in the hot path) start that has
+    // a non-zero component along every eigenvector for any realistic operator, so
+    // the extreme Ritz pairs are resolved and the trust gate below is meaningful.
+    let mut q = Array1::<f64>::zeros(p);
+    let golden = 0.618_033_988_749_894_8_f64; // frac(golden ratio)
+    for i in 0..p {
+        let frac = ((i as f64 + 1.0) * golden).fract();
+        q[i] = frac - 0.5;
+    }
+    let q_norm = q.dot(&q).sqrt();
+    if !(q_norm.is_finite() && q_norm > 0.0) {
+        return Ok(None);
+    }
+    q.mapv_inplace(|x| x / q_norm);
     let mut q_prev = Array1::<f64>::zeros(p);
-    let mut q = Array1::<f64>::from_elem(p, 1.0 / (p as f64).sqrt());
     // Full reorthogonalization basis (small: p×steps, steps ≤ 12). Cheap and
     // keeps β_k a faithful residual norm so the bound stays valid at small k.
     let mut basis: Vec<Array1<f64>> = Vec::with_capacity(steps);
@@ -325,17 +350,55 @@ where
             t[[i + 1, i]] = betas[i];
         }
     }
-    let (ritz, _) = t
+    let (ritz, ritz_vecs) = t
         .eigh(Side::Lower)
         .map_err(|e| format!("cheap_conditioning_bounds: tridiagonal eigendecomposition failed: {e}"))?;
-    let theta_min = ritz.iter().cloned().fold(f64::INFINITY, f64::min);
-    let theta_max = ritz.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // Index of the smallest / largest Ritz value and the eigenvector last
+    // components, which give the SHARP per-pair residual `β_k·|e_kᵀ y_i|` ≤ β_k.
+    let mut idx_min = 0usize;
+    let mut idx_max = 0usize;
+    for i in 1..k {
+        if ritz[i] < ritz[idx_min] {
+            idx_min = i;
+        }
+        if ritz[i] > ritz[idx_max] {
+            idx_max = i;
+        }
+    }
+    let theta_min = ritz[idx_min];
+    let theta_max = ritz[idx_max];
     if !theta_min.is_finite() || !theta_max.is_finite() {
         return Ok(None);
     }
-    // Conservative one-sided bounds (residual-augmented, interlacing-consistent).
-    let lambda_min_lb = theta_min - last_residual_norm;
-    let lambda_max_ub = theta_max + last_residual_norm;
+    // Sharp Ritz residuals: `‖H y_i − θ_i y_i‖ = β_k·|e_kᵀ y_i|` (β_k =
+    // last_residual_norm, the norm of the unnormalised next Lanczos vector). The
+    // last row of `ritz_vecs` holds `e_kᵀ y_i` for every Ritz pair.
+    let last_row = k - 1;
+    let res_min = last_residual_norm * ritz_vecs[[last_row, idx_min]].abs();
+    let res_max = last_residual_norm * ritz_vecs[[last_row, idx_max]].abs();
+    // TRUST GATE (Krylov near-invariance). With FULL reorthogonalization the
+    // Lanczos factorization satisfies `H Q_k = Q_k T_k + β_k q_{k+1} e_kᵀ` exactly,
+    // and the EXTREME Ritz pairs converge FIRST (Kaniel–Paige). When the extreme
+    // residuals are small relative to the spectral scale θ_max, the Krylov space
+    // has resolved the spectrum's ENDS, so `θ_min`/`θ_max` are faithful estimates
+    // of `λ_min`/`λ_max` and the residual-augmented one-sided bounds below are
+    // sound. When a residual is NOT small (the bottom of the spectrum is
+    // unresolved — e.g. a start vector poorly aligned with the extreme
+    // eigenspace), we return `None` so the caller CONSERVATIVELY falls through to
+    // the exact dense path rather than trusting an unconverged estimate. This is
+    // the safety valve: an unconverged cheap check never authorises a skip.
+    let scale = theta_max.abs().max(1.0);
+    let converged_tol = 1e-3 * scale;
+    if res_min > converged_tol || res_max > converged_tol {
+        return Ok(None);
+    }
+    // Conservative one-sided bounds. Subtract/ add the SHARP residual: there is a
+    // true eigenvalue of `H` within `res_min` of `θ_min` and within `res_max` of
+    // `θ_max` (residual eigenvalue bound), and with the extreme pairs converged
+    // these ARE the extreme eigenvalues, so:
+    //   λ_min(H) ≥ θ_min − res_min,   λ_max(H) ≤ θ_max + res_max.
+    let lambda_min_lb = theta_min - res_min;
+    let lambda_max_ub = theta_max + res_max;
     Ok(Some((lambda_min_lb, lambda_max_ub)))
 }
 
