@@ -35,8 +35,8 @@ use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
-    InverseLinkKernel, LinkParamPartials, inverse_link_has_fisher_weight_jet,
-    inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
+    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link,
+    softmax_last_fixedzero,
 };
 use crate::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
@@ -59,8 +59,7 @@ use std::sync::{Arc, Mutex};
 /// logit case is unchanged.
 #[inline]
 fn likelihood_spec_supports_firth(spec: &LikelihoodSpec) -> bool {
-    matches!(spec.response, ResponseFamily::Binomial)
-        && inverse_link_has_fisher_weight_jet(&spec.link)
+    spec.supports_firth()
 }
 
 /// Inverse link to evaluate the Fisher working weight with for the Jeffreys
@@ -2469,7 +2468,9 @@ mod tests {
         };
 
         assert!(
-            err.contains("NUTS with Firth is only supported for Binomial Logit"),
+            err.contains(
+                "NUTS with Firth requires a Binomial inverse link with a Fisher-weight jet"
+            ),
             "unexpected error: {err}"
         );
     }
@@ -4606,14 +4607,9 @@ pub fn run_nuts_sampling_flattened_family(
         && glm.firth_bias_reduction
         && !likelihood_spec_supports_firth(&likelihood)
     {
-        let binomial_logit = LikelihoodSpec {
-            response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(StandardLink::Logit),
-        };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
-                "NUTS with Firth is only supported for {}; {} does not support it",
-                binomial_logit.pretty_name(),
+                "NUTS with Firth requires a Binomial inverse link with a Fisher-weight jet; {} does not support it",
                 likelihood.pretty_name()
             ),
         }
