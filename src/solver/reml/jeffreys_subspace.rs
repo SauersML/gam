@@ -127,6 +127,211 @@ fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
     relative_ok && absolute_ok
 }
 
+/// Below this joint dimension the dense reduced eigendecomposition in
+/// [`joint_jeffreys_term`] is itself cheap (`O(p³)` with `p` in the tens — e.g.
+/// the BMS-probit `p≈51` fit), so the matrix-free pre-check below would only add
+/// `O(p·k)` matvecs for no asymptotic win and a (tiny) chance of a conservative
+/// false-fall-through. We therefore run the exact path directly for small joint
+/// systems and reserve the cheap pre-check for the wide systems whose `O(p³)`
+/// eigendecomposition (and the dense `H_id` it needs) is the cost we want to
+/// avoid on a well-conditioned fit. This threshold matches the matrix-free joint
+/// path's `JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N` so the pre-check exists exactly
+/// where the dense formation is the regression.
+pub const CHEAP_CONDITIONING_PRECHECK_MIN_DIM: usize = 128;
+
+/// Safety factor by which the CONSERVATIVE spectral bounds must clear each
+/// conditioning gate before the cheap pre-check is allowed to declare the term
+/// skippable. The Lanczos bounds below are already one-sided-conservative
+/// (`λ_min` is bounded from BELOW, `λ_max` from ABOVE — see
+/// [`cheap_conditioning_bounds`]), so a clearance factor of `1` would already be
+/// correct; we demand an extra `8×` margin purely as defense-in-depth against
+/// round-off in the bound arithmetic and against a `k`-step subspace that has not
+/// yet resolved the extreme Ritz pair. The cost of being wrong is asymmetric:
+/// a false SKIP omits the curvature that prevents non-convergence (unacceptable),
+/// whereas a false FALL-THROUGH merely pays the exact dense path we would have
+/// paid anyway. The margin is therefore set firmly on the safe side.
+const CHEAP_PRECHECK_SAFETY_MARGIN: f64 = 8.0;
+
+/// Number of Lanczos steps for the cheap conditioning pre-check. A handful of
+/// steps with full reorthogonalization resolves the extreme Ritz pair to far
+/// better than the `8×` safety margin on the realistic spectra here (a
+/// well-conditioned joint information whose `λ_min` we only need to certify is
+/// `≳ 8` and whose ratio we only need to certify is `≳ 8e-8`), while keeping the
+/// pre-check at `O(p·k)` matvecs — negligible against the `O(p³)`/dense-`H_id`
+/// path it guards. Capped at `p` for tiny systems (which the size gate already
+/// routes to the exact path anyway).
+const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
+
+/// Conservative extreme-eigenvalue bounds `(λ_min_lower, λ_max_upper)` for the
+/// reduced information `H_id = Z_Jᵀ H Z_J` on the FULL span (`Z_J = I`, so
+/// `H_id = H`), computed MATRIX-FREE from a Hessian-vector product `hv` and the
+/// dimension `p`, WITHOUT ever forming the dense `H_id` or its eigendecomposition.
+///
+/// METHOD. `k`-step Lanczos with full reorthogonalization builds a symmetric
+/// tridiagonal `T_k` whose spectrum interlaces `H`'s. Let `θ_min ≤ … ≤ θ_max` be
+/// the Ritz values (eigenvalues of `T_k`) and `β_k = ‖next Lanczos residual‖`.
+/// A standard residual bound (Saad, *Numerical Methods for Large Eigenvalue
+/// Problems*, Thm 6.4 / Kaniel–Paige) guarantees every eigenvalue of `T_k` lies
+/// within `β_k` of some eigenvalue of `H`. Combined with the interlacing
+/// `λ_min(H) ≤ θ_min` and `θ_max ≤ λ_max(H)`, this yields the rigorously
+/// CONSERVATIVE one-sided bounds returned here:
+///   * `λ_min(H) ≥ θ_min − β_k`  (a guaranteed LOWER bound on the smallest eigenvalue),
+///   * `λ_max(H) ≤ θ_max + β_k`  (a guaranteed UPPER bound on the largest eigenvalue).
+/// These bias the conditioning estimate toward "looks WORSE-conditioned than it
+/// is" — exactly the direction that makes a SKIP decision safe: if even these
+/// pessimistic bounds clear the gate, the true spectrum clears it by more.
+///
+/// Returns `None` if the operator produces a non-finite/degenerate Krylov space
+/// (e.g. a zero start vector collapse), in which case the caller MUST fall
+/// through to the exact dense path (never skip on an unresolved estimate).
+fn cheap_conditioning_bounds<HvFn>(
+    mut hv: HvFn,
+    p: usize,
+) -> Result<Option<(f64, f64)>, String>
+where
+    HvFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
+{
+    if p == 0 {
+        return Ok(None);
+    }
+    let steps = CHEAP_PRECHECK_LANCZOS_STEPS.min(p);
+    // Deterministic, dense start vector (all-ones, normalized): has a component
+    // along every eigenvector for a generic operator, so the extreme Ritz pair is
+    // resolved quickly. Determinism keeps the skip decision reproducible across
+    // runs (no RNG in the always-on hot path).
+    let mut q_prev = Array1::<f64>::zeros(p);
+    let mut q = Array1::<f64>::from_elem(p, 1.0 / (p as f64).sqrt());
+    // Full reorthogonalization basis (small: p×steps, steps ≤ 12). Cheap and
+    // keeps β_k a faithful residual norm so the bound stays valid at small k.
+    let mut basis: Vec<Array1<f64>> = Vec::with_capacity(steps);
+    let mut alphas: Vec<f64> = Vec::with_capacity(steps);
+    let mut betas: Vec<f64> = Vec::with_capacity(steps); // off-diagonals β_1..
+    let mut beta_prev = 0.0_f64;
+    let mut last_residual_norm = 0.0_f64;
+    for j in 0..steps {
+        basis.push(q.clone());
+        let mut w = hv(&q)?;
+        if w.iter().any(|x| !x.is_finite()) {
+            return Ok(None);
+        }
+        // w = H q_j − β_{j-1} q_{j-1}
+        if j > 0 {
+            w.scaled_add(-beta_prev, &q_prev);
+        }
+        let alpha = q.dot(&w);
+        if !alpha.is_finite() {
+            return Ok(None);
+        }
+        w.scaled_add(-alpha, &q);
+        // Full reorthogonalization against the accumulated basis (classical GS,
+        // twice for numerical robustness at this tiny scale).
+        for _ in 0..2 {
+            for qi in basis.iter() {
+                let proj = qi.dot(&w);
+                w.scaled_add(-proj, qi);
+            }
+        }
+        alphas.push(alpha);
+        let beta = w.dot(&w).sqrt();
+        last_residual_norm = beta;
+        if !beta.is_finite() {
+            return Ok(None);
+        }
+        if j + 1 >= steps {
+            break;
+        }
+        // Lucky breakdown: the Krylov space is exhausted, T_k spectrum is EXACT
+        // (β_k = 0 ⇒ bounds are tight). Stop; the residual norm is ~0.
+        if beta <= f64::EPSILON * (alpha.abs().max(1.0)) {
+            last_residual_norm = 0.0;
+            break;
+        }
+        betas.push(beta);
+        beta_prev = beta;
+        q_prev = std::mem::replace(&mut q, w / beta);
+    }
+    let k = alphas.len();
+    if k == 0 {
+        return Ok(None);
+    }
+    // Build the k×k symmetric tridiagonal T_k and take its extreme eigenvalues.
+    // k ≤ 12, so this eigh is negligible (and dense only at the k-scale, never p).
+    let mut t = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        t[[i, i]] = alphas[i];
+        if i + 1 < k {
+            t[[i, i + 1]] = betas[i];
+            t[[i + 1, i]] = betas[i];
+        }
+    }
+    let (ritz, _) = t
+        .eigh(Side::Lower)
+        .map_err(|e| format!("cheap_conditioning_bounds: tridiagonal eigendecomposition failed: {e}"))?;
+    let theta_min = ritz.iter().cloned().fold(f64::INFINITY, f64::min);
+    let theta_max = ritz.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if !theta_min.is_finite() || !theta_max.is_finite() {
+        return Ok(None);
+    }
+    // Conservative one-sided bounds (residual-augmented, interlacing-consistent).
+    let lambda_min_lb = theta_min - last_residual_norm;
+    let lambda_max_ub = theta_max + last_residual_norm;
+    Ok(Some((lambda_min_lb, lambda_max_ub)))
+}
+
+/// Cheap MATRIX-FREE pre-check answering "is the Jeffreys term provably
+/// SKIPPABLE here?" using only Hessian-vector products against the full-span
+/// reduced information `H_id = H` — WITHOUT forming the dense `H_id` or running
+/// the `O(p³)` eigendecomposition in [`joint_jeffreys_term`].
+///
+/// Returns `true` ONLY when the CONSERVATIVE spectral bounds from
+/// [`cheap_conditioning_bounds`] clear BOTH conditioning gates with the
+/// [`CHEAP_PRECHECK_SAFETY_MARGIN`] safety factor, i.e. the fit is so clearly
+/// well-conditioned that the exact gate is certain to skip too. In that case the
+/// caller may return the EXACT-ZERO term (byte-identical to the gated-off dense
+/// path) without forming anything dense. Returns `false` (the conservative
+/// default) whenever the cheap bounds are unresolved, non-positive, or merely
+/// close to the gate — the caller then falls through to the exact dense
+/// formation + gate, so the term is still computed exactly wherever it might be
+/// needed.
+///
+/// CORRECTNESS. `cheap_conditioning_bounds` returns `λ_min_lb ≤ λ_min(H)` and
+/// `λ_max_ub ≥ λ_max(H)`. Hence
+///   `λ_min(H) ≥ λ_min_lb` and `λ_min(H)/λ_max(H) ≥ λ_min_lb/λ_max_ub`,
+/// so when `λ_min_lb ≥ MARGIN·CONDITIONING_GATE_ABSOLUTE` and
+/// `λ_min_lb/λ_max_ub ≥ MARGIN·CONDITIONING_GATE_RELATIVE` the TRUE spectrum
+/// satisfies the exact `conditioning_gate_skips` predicate by at least `MARGIN×`
+/// — the exact path would skip, so skipping cheaply is byte-identical. The
+/// converse cases never skip, preserving exactness where the term bites.
+pub fn jeffreys_term_skippable_via_matvec<HvFn>(
+    hv: HvFn,
+    p: usize,
+) -> Result<bool, String>
+where
+    HvFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
+{
+    if p < CHEAP_CONDITIONING_PRECHECK_MIN_DIM {
+        // Small systems: the exact dense eigh is already cheap; do not pre-check.
+        return Ok(false);
+    }
+    let (lambda_min_lb, lambda_max_ub) = match cheap_conditioning_bounds(hv, p)? {
+        Some(bounds) => bounds,
+        None => return Ok(false),
+    };
+    if !(lambda_min_lb.is_finite() && lambda_max_ub.is_finite()) {
+        return Ok(false);
+    }
+    // The conservative lower bound must itself be positive (and large) — a
+    // non-positive `λ_min_lb` cannot certify SPD/well-conditioned, so never skip.
+    if lambda_min_lb <= 0.0 || lambda_max_ub <= 0.0 {
+        return Ok(false);
+    }
+    let absolute_clears =
+        lambda_min_lb >= CHEAP_PRECHECK_SAFETY_MARGIN * CONDITIONING_GATE_ABSOLUTE;
+    let relative_clears = lambda_min_lb / lambda_max_ub
+        >= CHEAP_PRECHECK_SAFETY_MARGIN * CONDITIONING_GATE_RELATIVE;
+    Ok(absolute_clears && relative_clears)
+}
+
 /// Orthonormal basis of one block's Jeffreys span.
 ///
 /// `columns` is `p x m` with orthonormal columns spanning `ker(S_aggregate)`
