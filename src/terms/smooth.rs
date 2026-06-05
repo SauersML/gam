@@ -4818,6 +4818,14 @@ fn build_tensor_bspline_basis(
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
     let mut marginal_designs = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
+    // Per-margin effective period: either user-set via `spec.periods` (forcing
+    // the Fourier path) or implied by a `PeriodicUniform` marginal knotspec
+    // (which the 1D B-spline builder already realizes as a periodic basis).
+    // Captured here so freeze→reload round-trips both routes back to a
+    // `PeriodicUniform` marginal knotspec; otherwise a `PeriodicUniform`
+    // margin specified without `spec.periods` would freeze as a plain
+    // `Provided(knots)` open spline and lose its wrap-around at predict time.
+    let mut marginal_effective_periods = Vec::<Option<f64>>::with_capacity(feature_cols.len());
     // Per-marginal sparse representation, populated when the 1D builder returned
     // a `DesignMatrix::Sparse`. Used to assemble the Khatri-Rao tensor product
     // sparsely (only ∏(degree+1) nonzeros per row) instead of densifying to
@@ -4866,6 +4874,7 @@ fn build_tensor_bspline_basis(
             // is available, so record `None` and force the dense fall-back
             // for the tensor product if any dimension is periodic.
             marginal_sparse.push(None);
+            marginal_effective_periods.push(Some(period));
         } else {
             let mut marginal_unconstrained = marginalspec.clone();
             marginal_unconstrained.identifiability = BSplineIdentifiability::None;
@@ -4908,6 +4917,20 @@ fn build_tensor_bspline_basis(
                     "internal TensorBSpline error at dim {dim}: missing marginal nullspace dim"
                 ))
             })?;
+            // A `PeriodicUniform` marginal knotspec implies the margin is
+            // wrap-around: the 1D builder already realized it as a periodic
+            // basis, so the tensor product inherits that periodicity. Record
+            // the period derived from the knotspec's data range so freeze
+            // restores `PeriodicUniform` on the marginal — otherwise the
+            // round-trip downgrades it to `Provided(knots)` (an open spline)
+            // and predict-time wraps disappear.
+            let implied_period = match marginalspec.knotspec {
+                BSplineKnotSpec::PeriodicUniform { data_range, .. } => {
+                    Some(data_range.1 - data_range.0)
+                }
+                _ => None,
+            };
+            marginal_effective_periods.push(implied_period);
         }
     }
 
@@ -5133,11 +5156,13 @@ fn build_tensor_bspline_basis(
             feature_cols: feature_cols.to_vec(),
             knots: marginal_knots,
             degrees: marginal_degrees,
-            periods: if spec.periods.is_empty() {
-                vec![None; feature_cols.len()]
-            } else {
-                spec.periods.clone()
-            },
+            // Prefer the per-margin effective period derived in the loop —
+            // it captures both the explicit `spec.periods` route and the
+            // implied period from a `PeriodicUniform` marginal knotspec.
+            // Falling back to `spec.periods` when populated keeps any
+            // user-supplied explicit period authoritative even if the
+            // marginal knotspec carried no periodicity hint.
+            periods: marginal_effective_periods,
             identifiability_transform: z_opt,
         },
         kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None) {
@@ -16985,7 +17010,16 @@ fn freeze_smooth_basis_from_metadata(
                     _ => BSplineKnotSpec::Provided(knots[i].clone()),
                 };
             }
-            s.periods = periods.clone();
+            // Do NOT overwrite `s.periods` from `periods`: `frozen = spec.clone()`
+            // already preserves the user's original `spec.periods`. The metadata
+            // `periods` slot captures the effective per-margin period for
+            // restoring `PeriodicUniform` knotspecs, but it may also reflect
+            // periodicity implied by a `PeriodicUniform` knotspec on a margin
+            // for which the user left `spec.periods` empty (intending the
+            // periodic B-spline path, not the Fourier path). Overwriting
+            // `s.periods` here would silently flip such a margin onto the
+            // Fourier path at predict time and produce a basis distinct from
+            // the one used at fit time.
             s.identifiability = match identifiability_transform {
                 Some(z) => TensorBSplineIdentifiability::FrozenTransform {
                     transform: z.clone(),
