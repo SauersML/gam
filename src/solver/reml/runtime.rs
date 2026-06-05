@@ -1506,25 +1506,52 @@ pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLi
     None
 }
 
-/// Weakly-informative penalized-complexity (PC) hyperprior on the log-precision
-/// ρ, used as the firth-general default outer prior on any smoothing coordinate
-/// the caller left unset (`RhoPrior::Flat`).
+/// `upper`/`tail_prob` calibrating the firth-general default barrier on an unset
+/// smoothing coordinate. The tail statement `P(d > upper) = tail_prob` on the
+/// marginal-SD distance scale `d = exp(−ρ/2)` calibrates the exponential rate
+/// `θ = −ln(tail_prob)/upper`. We use `upper = 10`, `tail_prob = 0.01`
+/// ⇒ `θ = −ln(0.01)/10 ≈ 0.4605`.
+const FIRTH_DEFAULT_PC_UPPER: f64 = 10.0;
+const FIRTH_DEFAULT_PC_TAIL_PROB: f64 = 0.01;
+
+/// Weakly-informative DEFAULT outer ρ prior used by the firth-general policy on
+/// any smoothing coordinate the caller left unset (`RhoPrior::Flat`).
 ///
-/// The tail statement `P(d > upper) = tail_prob` on the marginal-SD distance
-/// scale `d = exp(−ρ/2)` calibrates the exponential rate `θ = −ln(tail_prob)/upper`.
-/// We choose `upper = 10`, `tail_prob = 0.01` ⇒ `θ = −ln(0.01)/10 ≈ 0.4605`: the
-/// prior allows a marginal coefficient SD of up to 10 with 1% tail mass beyond
-/// it, i.e. it is essentially flat over any plausible identified scale and only
-/// asserts itself as a gentle Occam pull (gradient → 1/2 as ρ → +∞, an
-/// exponential wall against the ρ → −∞ / λ → 0 under-smoothing degeneracy). Its
-/// O(1) contribution is dominated by the O(n) REML curvature wherever the data
-/// identify λ, so well-determined smoothing is left unbiased — the zero-downside
-/// reduction to plain REML in the information limit.
+/// The *value* returned here is a [`RhoPrior::PenalizedComplexity`] so that
+/// downstream consumers that round-trip the resolved prior (serialization, the
+/// joint-HMC refinement at `effective_rho_prior().into_owned()`) see a
+/// well-defined prior family. Its *outer-objective contribution*, however, is NOT
+/// the plain PC term: the REML/LAML runtime evaluates firth-default coordinates
+/// through the SELF-GATED, one-sided barrier
+/// [`rho_prior_eval::firth_default_barrier_terms`], which is byte-identically
+/// flat (cost/grad/hess = 0) on the identified side `ρ ≥ −2 ln(upper)` and only a
+/// convex wall against the `λ → 0` / `ρ → −∞` under-smoothing degeneracy below
+/// it. This restores STRICT zero-downside (a clean / well-conditioned fit is
+/// byte-identical to plain REML, mirroring the Jeffreys conditioning gate)
+/// instead of the plain PC term's persistent `+1/2` Occam pull, which would
+/// shift every identified `λ` by an `O(1/n)` amount on every fit.
 #[inline]
 fn firth_default_pc_prior() -> RhoPrior {
     RhoPrior::PenalizedComplexity {
-        upper: 10.0,
-        tail_prob: 0.01,
+        upper: FIRTH_DEFAULT_PC_UPPER,
+        tail_prob: FIRTH_DEFAULT_PC_TAIL_PROB,
+    }
+}
+
+/// Per-coordinate `true` where the firth-general default barrier (rather than an
+/// explicitly-configured prior) governs that smoothing coordinate. A coordinate
+/// is a firth default exactly when the caller left it `Flat`: the whole prior is
+/// `Flat` (every coordinate defaulted) or it is an `Independent` with `Flat`
+/// holes. Returned per-`ρ`-coordinate so the runtime can override just those
+/// coordinates' objective contribution with the self-gated barrier.
+fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
+    match configured {
+        RhoPrior::Flat => vec![true; len],
+        RhoPrior::Independent(priors) if priors.len() == len => priors
+            .iter()
+            .map(|p| matches!(p, RhoPrior::Flat))
+            .collect(),
+        _ => vec![false; len],
     }
 }
 

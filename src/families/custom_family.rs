@@ -17988,6 +17988,187 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
     }
 }
 
+/// Drift closure producing the Tier-B Jeffreys-curvature drift
+/// `D_β H_Φ[δβ]` for a mode-response direction `δβ = dβ̂/dρ_k`.
+///
+/// The closure already expects the actual perturbation direction `δβ` (NOT the
+/// raw `v_k` the trait hands the provider); the wrapper negates `v_k → δβ = −v_k`
+/// before calling, exactly mirroring `BorrowedJointDerivProvider`'s sign
+/// convention and the inner `compute_dh` it composes with. Returns `None` when
+/// the Jeffreys term is gated out or the family lacks the exact derivatives, so
+/// the wrapper falls back to the inner provider's drift unchanged.
+type JeffreysHphiDriftFn =
+    Arc<dyn Fn(&Array1<f64>) -> Result<Option<Array2<f64>>, String> + Send + Sync>;
+
+/// Jeffreys-`H_Φ`-aware joint derivative provider.
+///
+/// Wraps an inner Tier-B joint provider (which supplies the likelihood-Hessian
+/// drift `D_β H_L[v_k]`) and ADDS the Jeffreys-curvature drift `D_β H_Φ[v_k]` to
+/// the first-order trace corrections. This closes the bug where the Tier-B outer
+/// LAML gradient omitted `H_Φ`'s ρ-dependence (through β̂): the objective folds
+/// `H_Φ` into `½ log|H + S_λ + H_Φ|`, so its exact gradient
+///   `½ tr[(H+S_λ+H_Φ)⁻¹ (∂_ρ S_λ + D_β H_L[v_k] + D_β H_Φ[v_k])]`
+/// MUST include the `D_β H_Φ[v_k]` term. It is the exact analogue of the Tier-A
+/// `FirthAwareGlmDerivatives` (`unified.rs`) `−D(Hφ)[B_k]` first-order term, and
+/// of `BarrierDerivativeProvider`'s additive-correction composition pattern.
+///
+/// SIGN. The trait passes `v_k = H⁻¹(A_kβ̂)`; the mode response is `δβ = −v_k`.
+/// We negate before invoking the drift closure, so `corr = + D_β H_Φ[δβ]` is
+/// added on top of the inner provider's already-correct likelihood drift.
+struct JeffreysHphiAwareJointDerivatives<'a> {
+    inner: Box<dyn HessianDerivativeProvider + 'a>,
+    drift: JeffreysHphiDriftFn,
+    p: usize,
+}
+
+impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
+    fn new(inner: Box<dyn HessianDerivativeProvider + 'a>, drift: JeffreysHphiDriftFn, p: usize) -> Self {
+        Self { inner, drift, p }
+    }
+
+    /// `D_β H_Φ[δβ]` with the trait's `v_k → δβ = −v_k` mode-response convention.
+    fn hphi_drift(&self, v_k: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+        let delta = v_k.mapv(|value| -value);
+        (self.drift)(&delta)
+    }
+}
+
+impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
+    fn hessian_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let inner = self.inner.hessian_derivative_correction(v_k)?;
+        let drift = self.hphi_drift(v_k)?;
+        Ok(match (inner, drift) {
+            (Some(mut ic), Some(d)) => {
+                ic += &d;
+                Some(ic)
+            }
+            (Some(ic), None) => Some(ic),
+            (None, Some(d)) => Some(d),
+            (None, None) => None,
+        })
+    }
+
+    fn hessian_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        let inner = self.inner.hessian_derivative_correction_result(v_k)?;
+        let drift = self.hphi_drift(v_k)?;
+        Ok(match (inner, drift) {
+            (Some(DriftDerivResult::Dense(mut dense)), Some(d)) => {
+                dense += &d;
+                Some(DriftDerivResult::Dense(dense))
+            }
+            (Some(DriftDerivResult::Operator(operator)), Some(d)) => {
+                Some(DriftDerivResult::Operator(Arc::new(
+                    crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                        dense: Some(d),
+                        operators: vec![operator],
+                        dim_hint: self.p,
+                    },
+                )))
+            }
+            (Some(other), None) => Some(other),
+            (None, Some(d)) => Some(DriftDerivResult::Dense(d)),
+            (None, None) => None,
+        })
+    }
+
+    fn hessian_derivative_corrections_result(
+        &self,
+        v_ks: &[Array1<f64>],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        // Delegate the (possibly batched) inner walk, then fold the per-direction
+        // H_Φ drift into each result so the batched path stays consistent with the
+        // singular one.
+        let inner = self.inner.hessian_derivative_corrections_result(v_ks)?;
+        inner
+            .into_iter()
+            .zip(v_ks.iter())
+            .map(|(inner_result, v_k)| {
+                let drift = self.hphi_drift(v_k)?;
+                Ok(match (inner_result, drift) {
+                    (Some(DriftDerivResult::Dense(mut dense)), Some(d)) => {
+                        dense += &d;
+                        Some(DriftDerivResult::Dense(dense))
+                    }
+                    (Some(DriftDerivResult::Operator(operator)), Some(d)) => {
+                        Some(DriftDerivResult::Operator(Arc::new(
+                            crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                                dense: Some(d),
+                                operators: vec![operator],
+                                dim_hint: self.p,
+                            },
+                        )))
+                    }
+                    (Some(other), None) => Some(other),
+                    (None, Some(d)) => Some(DriftDerivResult::Dense(d)),
+                    (None, None) => None,
+                })
+            })
+            .collect()
+    }
+
+    fn has_batched_hessian_derivative_corrections(&self) -> bool {
+        self.inner.has_batched_hessian_derivative_corrections()
+    }
+
+    // SECOND-ORDER (outer Hessian) RESIDUAL GAP. The full second-order Jeffreys
+    // drift `D²_β H_Φ[v_k, v_l]` (the analogue of Tier-A's
+    // `−D(Hφ)[B_{kl}] − D²(Hφ)[B_k, B_l]`) is NOT yet folded in here: the
+    // second-derivative methods delegate to the inner likelihood drift only. This
+    // leaves the OUTER HESSIAN's Jeffreys contribution first-order-incomplete, but
+    // the FIRST-ORDER outer GRADIENT — the term the line search and KKT
+    // certification actually consume — is now exact. ARC/Newton on the outer
+    // problem still gets a consistent gradient; the Hessian is a (PD) curvature
+    // surrogate as before.
+    fn hessian_second_derivative_correction(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        self.inner
+            .hessian_second_derivative_correction(v_k, v_l, u_kl)
+    }
+
+    fn hessian_second_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+        v_l: &Array1<f64>,
+        u_kl: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        self.inner
+            .hessian_second_derivative_correction_result(v_k, v_l, u_kl)
+    }
+
+    fn hessian_second_derivative_corrections_result(
+        &self,
+        triples: &[(Array1<f64>, Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<DriftDerivResult>>, String> {
+        self.inner
+            .hessian_second_derivative_corrections_result(triples)
+    }
+
+    fn has_batched_hessian_second_derivative_corrections(&self) -> bool {
+        self.inner
+            .has_batched_hessian_second_derivative_corrections()
+    }
+
+    fn has_corrections(&self) -> bool {
+        true
+    }
+
+    fn family_outer_hessian_operator(
+        &self,
+    ) -> Option<Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>> {
+        self.inner.family_outer_hessian_operator()
+    }
+}
+
 /// Optional bundle of extended (ψ) hyperparameter coordinate data to attach
 /// to an `InnerSolution` before calling the unified evaluator.
 struct ExtCoordBundle {
