@@ -24029,11 +24029,27 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             Ok(_) => {
                 outer.last_error =
                     Some("custom-family outer objective/derivatives became non-finite".to_string());
+                if escalation_armed {
+                    // Recoverable (data-driven): the objective/derivatives became
+                    // non-finite at this trial rho (e.g. separation / near-singular
+                    // information), so the outer optimizer should retreat from this
+                    // infeasible point rather than the whole run hard-erroring. When
+                    // the search ultimately reports `converged == false`, the post-run
+                    // rung samples the proper posterior (never-fail). Without this, the
+                    // hard Err propagated out of `problem.run` and bypassed the
+                    // escalation rung entirely.
+                    return Ok(OuterEval::infeasible(rho.len()));
+                }
                 return Err(EstimationError::RemlOptimizationFailed(
                     "custom-family outer objective/derivatives became non-finite".to_string(),
                 ));
             }
             Err(e) => {
+                // Genuine eval-error (internal computation failure: linalg error,
+                // etc.) — NOT data-driven. Leave as a hard Err even when escalation
+                // is armed: a real bug must surface, not be silently sampled over.
+                // Only the "did not converge" / "non-finite objective" data-driven
+                // paths above convert to infeasible-when-armed.
                 outer.last_error = Some(e.clone());
                 return Err(EstimationError::RemlOptimizationFailed(e));
             }
@@ -24082,12 +24098,26 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                         "custom-family value-only inner solve did not converge or objective was non-finite"
                             .to_string(),
                     );
+                    if escalation_armed {
+                        // Recoverable (data-driven): this value-only probe is the
+                        // line-search cost the outer optimizer calls most often. A
+                        // non-converged inner solve / non-finite objective at this
+                        // trial rho means the point is infeasible — return an infinite
+                        // cost so the line search retreats, rather than hard-erroring
+                        // out of `problem.run` and bypassing the post-run escalation
+                        // (sampling) rung. When the search reports `converged == false`
+                        // the never-fail rung samples the proper posterior.
+                        return Ok(f64::INFINITY);
+                    }
                     Err(EstimationError::RemlOptimizationFailed(
                         "custom-family value-only inner solve did not converge or objective was non-finite"
                             .to_string(),
                     ))
                 }
                 Err(e) => {
+                    // Genuine eval-error (internal computation failure) — NOT
+                    // data-driven. Leave as a hard Err even when escalation is armed
+                    // so a real bug surfaces instead of being silently sampled over.
                     outer.last_error = Some(e.clone());
                     Err(EstimationError::RemlOptimizationFailed(e))
                 }
@@ -24136,11 +24166,28 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     outer.warm_cache = Some(warm);
                     outer.last_error =
                         Some("custom-family EFS inner solve did not converge".to_string());
+                    // Intentionally LEFT as a hard Err even when escalation is armed.
+                    // Unlike the BFGS/value-only paths above, an EFS error does NOT
+                    // dead-end the run: it surfaces as a recoverable objective-eval
+                    // error at the fixed-point bridge (outer_strategy.rs:2409-2410
+                    // `into_objective_error` -> `ObjectiveEvalError::recoverable`),
+                    // so the EFS seed is rejected / the FixedPoint run returns Err,
+                    // and `run_outer`'s fallback cascade (outer_strategy.rs:5297) routes
+                    // to the fixed-point-disabled analytic-gradient BFGS attempt. That
+                    // attempt is always present here because custom-family declares an
+                    // analytic outer gradient (custom_family.rs:11826), so
+                    // `automatic_fallback_attempts` (outer_strategy.rs:1502) adds it.
+                    // BFGS then evaluates via `eval_outer` / the value-only cost
+                    // closure, both of which now retreat-when-armed, so the run reaches
+                    // `Ok(converged == false)` and the post-run sampling rung. No
+                    // analogous infeasible sentinel is needed at this site.
                     Err(EstimationError::RemlOptimizationFailed(
                         "custom-family EFS inner solve did not converge".to_string(),
                     ))
                 }
                 Err(e) => {
+                    // Genuine eval-error (internal computation failure) — NOT
+                    // data-driven. Hard Err so a real bug surfaces.
                     outer.last_error = Some(e.clone());
                     Err(EstimationError::RemlOptimizationFailed(e))
                 }
