@@ -1934,6 +1934,7 @@ impl BernoulliMarginalSlopeFamily {
         let logslope = &block_states[1];
         let logslope_ncols = self.logslope_design.ncols();
         if logslope_ncols > 0 && logslope.beta.len() != logslope_ncols {
+            // SAFETY: temporary debug instrumentation to capture the backtrace.
             panic!(
                 "DEBUG bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}\n{}",
                 logslope.beta.len(),
