@@ -11883,6 +11883,28 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     refresh_all_block_etas(family, specs, states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    // Universal robustness (flag-gated, default OFF): the outer REML logdet of
+    // the penalized Hessian must use the SAME Jeffreys-augmented Hessian
+    // `H + S_λ + H_Φ` the inner Newton converged on, or the LAML score and its
+    // analytic derivatives describe a different objective. Compute `H_Φ` (scoped
+    // to the under-identified span `Z_J`) once here and add it into whichever
+    // logdet path runs below. `None` ⇒ byte-identical released logdet.
+    let robust_logdet_firth = include_logdet_h
+        && crate::solver::robust_identification::RobustConfig::from_policy(
+            options.robust_identification,
+        )
+        .firth_general;
+    let logdet_jeffreys_hphi: Option<Array2<f64>> = if robust_logdet_firth {
+        match build_joint_jeffreys_subspace(specs, &ranges)? {
+            Some(z_joint) => {
+                custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
+                    .map(|(_phi, _grad, hphi)| hphi)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let compute_block_logdet_term = |b: usize| -> Result<(Array2<f64>, f64), String> {
         let spec = &specs[b];
         let (start, end) = ranges[b];
@@ -11995,6 +12017,9 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 .slice_mut(ndarray::s![start..end, start..end])
                 .scaled_add(curvature.rho_curvature_scale, s_lambda);
         }
+        if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
+            h_joint.scaled_add(curvature.rho_curvature_scale, hphi);
+        }
         let logdet_h_scaled = if strict_spd {
             strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
         } else {
@@ -12050,6 +12075,9 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 .slice_mut(ndarray::s![start..end, start..end])
                 .scaled_add(1.0, s_lambda);
         }
+        if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
+            h_joint.scaled_add(1.0, hphi);
+        }
         let logdet_h_total = if strict_spd {
             strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
         } else {
@@ -12072,6 +12100,9 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
             h_joint
                 .slice_mut(ndarray::s![start..end, start..end])
                 .scaled_add(1.0, s_lambda);
+        }
+        if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
+            h_joint.scaled_add(1.0, hphi);
         }
         let logdet_h_total = if strict_spd {
             strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
@@ -14102,6 +14133,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             None
         };
+        // Fold the Jeffreys objective value into the cycle-0 baseline so the
+        // first trust-region accept/reject compares like-for-like against the
+        // Jeffreys-augmented trial objectives below. No-op when the flag is OFF.
+        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+            let phi0 = custom_family_joint_jeffreys_value(
+                family, &states, specs, &ranges, z_joint,
+            );
+            current_penalty += phi0;
+            lastobjective = -current_log_likelihood + current_penalty;
+        }
 
         let joint_mode_diagonal_ridge =
             if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
@@ -15081,7 +15122,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                let trial_penalty = total_quadratic_penalty(
+                let mut trial_penalty = total_quadratic_penalty(
                     &states,
                     &s_lambdas,
                     ridge,
@@ -15089,6 +15130,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_bundle,
                     Some(specs),
                 );
+                // Jeffreys objective contribution at the trial point keeps the
+                // accept/reject objective consistent with the Jeffreys-modified
+                // Newton step. `states` already holds the trial coefficients
+                // (assigned + eta-refreshed above). No-op when the flag is OFF.
+                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                    trial_penalty += custom_family_joint_jeffreys_value(
+                        family, &states, specs, &ranges, z_joint,
+                    );
+                }
                 // Cheap-LL line-search path: rejected backtracking attempts
                 // discard the exact-Newton workspace they build, so by default
                 // we evaluate just the scalar full-data log-likelihood for the
@@ -15511,6 +15561,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_bundle,
                 Some(specs),
             );
+            // Re-fold the Jeffreys objective at the accepted iterate so the
+            // post-accept baseline matches the augmented objective the next
+            // cycle's trial points are compared against. No-op when flag OFF.
+            if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                current_penalty += custom_family_joint_jeffreys_value(
+                    family, &states, specs, &ranges, z_joint,
+                );
+            }
             lastobjective = -current_log_likelihood + current_penalty;
             let accepted_step_inf = states
                 .iter()
@@ -21971,6 +22029,39 @@ fn build_joint_jeffreys_subspace(
         col_cursor += m_block;
     }
     Ok(Some(z_joint))
+}
+
+/// Evaluate ONLY the Jeffreys objective value `Phi = 1/2 log|Z_J^T H Z_J|` at
+/// the current working point. Cheaper than the full term (no directional
+/// derivatives), used to keep the trust-region accept/reject objective
+/// consistent with the Jeffreys-modified Newton step. Returns `0.0` when there
+/// is no under-identified direction, the family exposes no exact joint Hessian,
+/// or the reduced Fisher information is not yet SPD (the value contribution is
+/// then simply omitted for that trial point — the step machinery still bounds
+/// the coefficient, and the next accepted cycle re-folds a finite value).
+fn custom_family_joint_jeffreys_value<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+    z_joint: &Array2<f64>,
+) -> f64 {
+    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if total_p == 0 || z_joint.ncols() == 0 {
+        return 0.0;
+    }
+    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs) {
+        Ok(Some(h)) if h.nrows() == total_p && h.ncols() == total_p => h,
+        _ => return 0.0,
+    };
+    match crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
+        h_joint.view(),
+        z_joint.view(),
+        |_direction: &Array1<f64>| Ok(None),
+    ) {
+        Ok((phi, _grad, _hphi)) => phi,
+        Err(_) => 0.0,
+    }
 }
 
 /// Evaluate the family-general Jeffreys term `(Phi, grad, H_Phi)` at the current
