@@ -4266,7 +4266,13 @@ impl<'a> RemlState<'a> {
     /// leaving clean λ-selection unbiased (the zero-downside / information-limit
     /// reduction to plain REML).
     fn effective_rho_prior(&self) -> std::borrow::Cow<'_, RhoPrior> {
-        resolve_effective_rho_prior(self.config.firth_general(), &self.rho_prior)
+        // DIAGNOSTIC (temporary): force-arm the gate (still reading the real
+        // `firth_general()` so its value is exercised) to confirm the injection
+        // reaches the objective end-to-end and isolate whether the runtime
+        // `firth_general` is the false input. Revert the `.max(true)` once
+        // localized.
+        let armed = [self.config.firth_general(), true].into_iter().any(|b| b);
+        resolve_effective_rho_prior(armed, &self.rho_prior)
     }
 
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
