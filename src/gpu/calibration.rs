@@ -394,3 +394,86 @@ impl Measurement {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::device::GpuCapability;
+
+    fn measurement(
+        operation: &'static str,
+        rows: usize,
+        cols: usize,
+        flops: usize,
+        cpu_seconds: f64,
+        gpu_seconds: f64,
+    ) -> Measurement {
+        Measurement {
+            operation,
+            rows,
+            cols,
+            inner: cols,
+            flops,
+            cpu_seconds,
+            gpu_seconds,
+        }
+    }
+
+    #[test]
+    fn calibration_crossover_uses_first_measured_gpu_win() {
+        let measurements = vec![
+            measurement("gemm", 64, 64, 524_288, 0.001, 0.004),
+            measurement("gemm", 128, 128, 4_194_304, 0.010, 0.009),
+            measurement("gemm", 256, 256, 33_554_432, 0.080, 0.010),
+        ];
+
+        assert_eq!(
+            crossover_flops(&measurements, "gemm", 100_000_000),
+            Some(4_194_304)
+        );
+    }
+
+    #[test]
+    fn calibration_crossover_raises_threshold_when_gpu_never_wins() {
+        let measurements = vec![
+            measurement("xtwx", 2_048, 32, 4_194_304, 0.001, 0.004),
+            measurement("xtwx", 4_096, 64, 33_554_432, 0.010, 0.040),
+            measurement("xtwx", 8_192, 96, 150_994_944, 0.080, 0.400),
+        ];
+
+        assert_eq!(
+            crossover_flops(&measurements, "xtwx", 100_000_000),
+            Some(301_989_888)
+        );
+        assert_eq!(crossover_rows(&measurements, "xtwx", 50_000), Some(50_000));
+    }
+
+    #[test]
+    fn calibration_cache_key_tracks_device_fingerprint() {
+        let device = GpuDeviceInfo {
+            ordinal: 0,
+            name: "unit-test GPU".to_string(),
+            capability: GpuCapability::from_compute_capability(8, 0),
+            sm_count: 108,
+            max_threads_per_sm: 2048,
+            max_shared_mem_per_block: 99_328,
+            l2_cache_bytes: 40 * 1024 * 1024,
+            total_mem_bytes: 80 * 1024 * 1024 * 1024,
+            free_mem_bytes: 70 * 1024 * 1024 * 1024,
+            ecc_enabled: true,
+            integrated: false,
+            mig_mode: false,
+        };
+
+        let fingerprint = device_fingerprint(&device);
+        let path = cache_path(fingerprint);
+        assert!(path.ends_with(format!("{}.json", fingerprint.to_hex())));
+        assert!(
+            path.components()
+                .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .windows(CACHE_ROOT_COMPONENTS.len())
+                .any(|window| window == CACHE_ROOT_COMPONENTS)
+        );
+    }
+}

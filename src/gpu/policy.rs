@@ -35,21 +35,14 @@ pub struct GpuDispatchPolicy {
 }
 
 impl Default for GpuDispatchPolicy {
-    /// Auto-dispatch thresholds tuned for biobank-scale workloads:
+    /// Conservative seed thresholds used before device calibration and when
+    /// calibration cannot run on the current host.
     ///
-    /// * `gemm_min_flops = 1e8` — generic dense GEMM / GEMV is only worth a
-    ///   device hop when the kernel is at least 10⁸ flops (e.g. a 320×320×320
-    ///   product). Below that, the launch + PCIe round-trip dominates.
-    /// * `xtwx_n_min = 50_000`, `xtwx_use_fused_below_p = 256` —
-    ///   `Xᵀ·diag(w)·X` requires both `n > 50k` rows AND `p > 256` columns
-    ///   before the device wins; the row threshold ensures we stream-amortize
-    ///   the weight broadcast and the column threshold rules out tiny GLM-style
-    ///   designs that are bandwidth-bound on CPU already.
-    /// * `fused_kernel_min_n = 100_000` — the 2×2 joint-Hessian kernel only
-    ///   runs on device when `n > 100k`; below that the CPU streaming pass
-    ///   keeps the entire working set resident in L3.
-    /// * Cholesky / SyEVD live on device whenever the design is large enough
-    ///   that the factorization itself dominates (`p ≥ 512` and `p ≥ 256`).
+    /// The production runtime replaces these with
+    /// [`crate::gpu::calibration::calibrated_policy_for_device`] after the CUDA
+    /// probe selects a concrete device. Keep these values conservative: they
+    /// are the typed baseline for CPU-only builds, failed calibration, and unit
+    /// tests that exercise policy predicates without initializing CUDA.
     fn default() -> Self {
         Self {
             xtwx_n_min: 50_000,
