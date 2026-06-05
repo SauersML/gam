@@ -58,6 +58,7 @@ use crate::construction::{KroneckerReparamResult, ReparamResult};
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::fast_ab;
 use crate::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
+use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use crate::probability::standard_normal_quantile;
 use crate::solver::active_set;
 use crate::types::{
@@ -1216,12 +1217,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         config.likelihood.clone(),
         config.link_kind.clone(),
         // Robustness is unconditionally on: the inner Firth/Jeffreys activation
-        // covers every closed-form Fisher-weight link (logit + probit).
-        matches!(
-            &config.link_kind,
-            InverseLink::Standard(StandardLink::Logit)
-                | InverseLink::Standard(StandardLink::Probit)
-        ),
+        // covers every binomial inverse link with a Fisher-weight jet.
+        matches!(config.likelihood.spec.response, ResponseFamily::Binomial)
+            && inverse_link_has_fisher_weight_jet(&config.link_kind),
         transform_active.clone(),
         quadctx,
     );
@@ -1270,9 +1268,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         initial_beta
     };
     // Inner P-IRLS Firth activation. Robustness is unconditionally on, so the
-    // family-general Jeffreys/Firth term is armed on every link with a closed-
-    // form Fisher-weight jet (currently `{Logit, Probit}`).
-    let firth_active = matches!(link_function, LinkFunction::Logit | LinkFunction::Probit);
+    // family-general Jeffreys/Firth term is armed on every binomial inverse link
+    // with a Fisher-weight jet.
+    let firth_active = matches!(config.likelihood.spec.response, ResponseFamily::Binomial)
+        && inverse_link_has_fisher_weight_jet(&config.link_kind);
     let base_max_step_halving = if firth_active { 60 } else { 30 };
     let options = WorkingModelPirlsOptions {
         // Firth logit fits often need more inner iterations to settle.

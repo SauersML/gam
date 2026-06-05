@@ -7,6 +7,7 @@ use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{
     boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
 };
+use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use crate::pirls::PirlsWorkspace;
 use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 use crate::solver::outer_strategy::{HessianResult, OuterEval};
@@ -1469,15 +1470,10 @@ fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<Invers
     if !matches!(spec.response, ResponseFamily::Binomial) {
         return None;
     }
-    match &spec.link {
-        InverseLink::Standard(
-            StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,
-        )
-        | InverseLink::LatentCLogLog(_)
-        | InverseLink::Sas(_)
-        | InverseLink::BetaLogistic(_)
-        | InverseLink::Mixture(_) => Some(spec.link.clone()),
-        _ => None,
+    if inverse_link_has_fisher_weight_jet(&spec.link) {
+        Some(spec.link.clone())
+    } else {
+        None
     }
 }
 
@@ -1533,10 +1529,9 @@ fn firth_default_pc_prior() -> RhoPrior {
 fn firth_default_coord_mask(configured: &RhoPrior, len: usize) -> Vec<bool> {
     match configured {
         RhoPrior::Flat => vec![true; len],
-        RhoPrior::Independent(priors) if priors.len() == len => priors
-            .iter()
-            .map(|p| matches!(p, RhoPrior::Flat))
-            .collect(),
+        RhoPrior::Independent(priors) if priors.len() == len => {
+            priors.iter().map(|p| matches!(p, RhoPrior::Flat)).collect()
+        }
         _ => vec![false; len],
     }
 }
@@ -10186,10 +10181,7 @@ mod tk_math_tests {
     #[test]
     fn firth_default_pc_prior_fills_flat_holes() {
         let pc = firth_default_pc_prior();
-        let configured = RhoPrior::Normal {
-            mean: 0.1,
-            sd: 2.0,
-        };
+        let configured = RhoPrior::Normal { mean: 0.1, sd: 2.0 };
         // A whole `Flat` prior becomes the weak PC default.
         assert_eq!(*resolve_effective_rho_prior(&RhoPrior::Flat), pc);
         // An explicitly-configured prior is honored unchanged (no override).
@@ -10215,10 +10207,7 @@ mod tk_math_tests {
             RhoPrior::Normal { mean: 0.0, sd: 1.0 },
             RhoPrior::Flat,
         ]);
-        assert_eq!(
-            firth_default_coord_mask(&indep, 3),
-            vec![true, false, true]
-        );
+        assert_eq!(firth_default_coord_mask(&indep, 3), vec![true, false, true]);
         // An explicitly-configured scalar prior defaults nothing.
         assert_eq!(
             firth_default_coord_mask(&RhoPrior::Normal { mean: 0.0, sd: 1.0 }, 2),
@@ -10252,7 +10241,10 @@ mod tk_math_tests {
 
         // C⁰ continuity at the gate: cost → 0 as ρ ↑ ρ_gate.
         let (c_below, _, _) = firth_default_barrier_terms(theta, upper, rho_gate - 1e-6);
-        assert!(c_below.abs() < 1e-9, "cost continuous at the gate, got {c_below}");
+        assert!(
+            c_below.abs() < 1e-9,
+            "cost continuous at the gate, got {c_below}"
+        );
 
         // Finite-difference check of grad and (diagonal) Hessian below the gate.
         let r = rho_gate - 2.0;

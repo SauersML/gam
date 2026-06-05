@@ -35,7 +35,8 @@ use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
-    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
+    InverseLinkKernel, LinkParamPartials, inverse_link_has_fisher_weight_jet,
+    inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
 use crate::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
@@ -52,35 +53,24 @@ use std::cell::RefCell;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-/// Binomial families whose standard link has a closed-form Fisher-weight jet
+/// Binomial families whose inverse link has a Fisher-weight jet
 /// (`fisher_weight_jet5`) support the Jeffreys/Firth term. This is the
-/// link-general set `{Logit, Probit, CLogLog}`; the canonical logit case is
-/// unchanged.
+/// link-general set shared with the REML/PIRLS Firth operator; the canonical
+/// logit case is unchanged.
 #[inline]
 fn likelihood_spec_supports_firth(spec: &LikelihoodSpec) -> bool {
-    matches!(
-        (&spec.response, &spec.link),
-        (
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit)
-                | InverseLink::Standard(StandardLink::Probit)
-                | InverseLink::Standard(StandardLink::CLogLog),
-        )
-    )
+    matches!(spec.response, ResponseFamily::Binomial)
+        && inverse_link_has_fisher_weight_jet(&spec.link)
 }
 
-/// Standard link to evaluate the Fisher working weight with for the Jeffreys
-/// term, for the families that support it (`{Logit, Probit, CLogLog}`
-/// binomial). Returns `None` for unsupported specs.
+/// Inverse link to evaluate the Fisher working weight with for the Jeffreys
+/// term. Returns `None` for unsupported specs.
 #[inline]
-fn likelihood_spec_jeffreys_link(spec: &LikelihoodSpec) -> Option<StandardLink> {
-    match (&spec.response, &spec.link) {
-        (ResponseFamily::Binomial, InverseLink::Standard(link @ StandardLink::Logit))
-        | (ResponseFamily::Binomial, InverseLink::Standard(link @ StandardLink::Probit))
-        | (ResponseFamily::Binomial, InverseLink::Standard(link @ StandardLink::CLogLog)) => {
-            Some(*link)
-        }
-        _ => None,
+fn likelihood_spec_jeffreys_link(spec: &LikelihoodSpec) -> Option<InverseLink> {
+    if likelihood_spec_supports_firth(spec) {
+        Some(spec.link.clone())
+    } else {
+        None
     }
 }
 
@@ -892,14 +882,9 @@ fn log_ndtr(x: f64) -> f64 {
 fn validate_firth_support(family: NutsFamily, firth_enabled: bool) -> Result<(), HmcError> {
     let spec = family.likelihood_spec();
     if firth_enabled && !likelihood_spec_supports_firth(&spec) {
-        let binomial_logit = LikelihoodSpec {
-            response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(StandardLink::Logit),
-        };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
-                "NUTS with Firth is only supported for {}; {} does not support it",
-                binomial_logit.pretty_name(),
+                "NUTS with Firth requires a Binomial inverse link with a Fisher-weight jet; {} does not support it",
                 spec.pretty_name()
             ),
         });
@@ -913,14 +898,9 @@ fn validate_firth_likelihood_support(
     firth_enabled: bool,
 ) -> Result<(), HmcError> {
     if firth_enabled && !likelihood_spec_supports_firth(likelihood) {
-        let binomial_logit = LikelihoodSpec {
-            response: ResponseFamily::Binomial,
-            link: InverseLink::Standard(StandardLink::Logit),
-        };
         return Err(HmcError::FirthUnsupported {
             reason: format!(
-                "Joint HMC with Firth is only supported for {}; {} does not support it",
-                binomial_logit.pretty_name(),
+                "Joint HMC with Firth requires a Binomial inverse link with a Fisher-weight jet; {} does not support it",
                 likelihood.pretty_name()
             ),
         });
@@ -1004,12 +984,11 @@ fn firth_jeffreys_logp_and_grad(
                 ),
             }
         })?;
-    let jeffreys_inverse_link = InverseLink::Standard(jeffreys_link);
     let op = if data.weights.iter().all(|&w| w == 1.0) {
-        FirthDenseOperator::build_for_link(&jeffreys_inverse_link, data.x.as_ref(), eta)
+        FirthDenseOperator::build_for_link(&jeffreys_link, data.x.as_ref(), eta)
     } else {
         FirthDenseOperator::build_with_observation_weights_for_link(
-            &jeffreys_inverse_link,
+            &jeffreys_link,
             data.x.as_ref(),
             eta,
             data.weights.view(),
@@ -2452,7 +2431,7 @@ mod tests {
     }
 
     #[test]
-    fn family_dispatch_rejects_nonlogit_firth_family() {
+    fn family_dispatch_rejects_nonbinomial_firth_family() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 2.0, 0.0, 3.0];
         let w = array![1.0, 1.0, 1.0, 1.0];
@@ -2490,7 +2469,9 @@ mod tests {
         };
 
         assert!(
-            err.contains("NUTS with Firth is only supported for Binomial Logit"),
+            err.contains(
+                "NUTS with Firth requires a Binomial inverse link with a Fisher-weight jet"
+            ),
             "unexpected error: {err}"
         );
     }
@@ -2736,7 +2717,7 @@ mod tests {
     }
 
     #[test]
-    fn joint_hmc_boundary_rejects_nonlogit_firth_family() {
+    fn joint_hmc_boundary_rejects_nonbinomial_firth_family() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 2.0, 0.0, 3.0];
         let w = array![1.0, 1.0, 1.0, 1.0];
@@ -2779,7 +2760,9 @@ mod tests {
         };
 
         assert!(
-            err.contains("Joint HMC with Firth is only supported for Binomial Logit"),
+            err.contains(
+                "Joint HMC with Firth requires a Binomial inverse link with a Fisher-weight jet"
+            ),
             "unexpected error: {err}"
         );
     }
