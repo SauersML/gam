@@ -376,7 +376,7 @@ fn marginal_logslope_overlap_penalty(
 /// ~0 eigenvalue in `Gtt` (see [`build_reduced_logslope_reparam`]); this keeps
 /// the cut well above floating-point noise but well below any genuine surviving
 /// logslope curvature.
-const LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL: f64 = 1.0e-9;
+const LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL: f64 = 1.0e-6;
 
 /// An exact reduced-basis reparameterization of the BMS logslope design through
 /// the family's OWN internal `logslope_design` geometry, expressed as a single
