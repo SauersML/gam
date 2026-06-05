@@ -6082,6 +6082,17 @@ mod tests {
         beta_noise: Array1<f64>,
         covariance: Array2<f64>,
     ) -> UnifiedFitResult {
+        gaussian_location_scale_fit_with_covariance_and_corrected(
+            beta_mu, beta_noise, covariance, None,
+        )
+    }
+
+    fn gaussian_location_scale_fit_with_covariance_and_corrected(
+        beta_mu: Array1<f64>,
+        beta_noise: Array1<f64>,
+        covariance: Array2<f64>,
+        covariance_corrected: Option<Array2<f64>>,
+    ) -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![
                 FittedBlock {
@@ -6112,7 +6123,7 @@ mod tests {
             outer_gradient_norm: None,
             standard_deviation: 1.0,
             covariance_conditional: Some(covariance),
-            covariance_corrected: None,
+            covariance_corrected,
             inference: None,
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -6768,6 +6779,60 @@ mod tests {
             .predict_posterior_mean(&input, &fit, None)
             .expect("gaussian location-scale posterior mean");
         assert!((out.eta_standard_error[0] - 2.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn gaussian_location_scale_required_corrected_covariance_uses_corrected_backend() {
+        let predictor = GaussianLocationScalePredictor {
+            beta_mu: array![0.0],
+            beta_noise: array![0.0],
+            covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
+            link_wiggle: None,
+        };
+        let input = PredictInput {
+            design: DesignMatrix::from(array![[1.0]]),
+            offset: array![0.0],
+            design_noise: Some(DesignMatrix::from(array![[1.0]])),
+            offset_noise: None,
+            auxiliary_scalar: None,
+            auxiliary_matrix: None,
+        };
+        let options = PredictUncertaintyOptions {
+            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
+            includeobservation_interval: false,
+            apply_bias_correction: false,
+            edgeworth_one_sided: false,
+            boundary_correction: false,
+            ood_inflation: false,
+            multi_point_joint: false,
+            ..PredictUncertaintyOptions::default()
+        };
+        let corrected_fit = gaussian_location_scale_fit_with_covariance_and_corrected(
+            array![0.0],
+            array![0.0],
+            array![[1.0, 0.0], [0.0, 0.0]],
+            Some(array![[9.0, 0.0], [0.0, 0.0]]),
+        );
+
+        let out = predictor
+            .predict_full_uncertainty(&input, &corrected_fit, &options)
+            .expect("required corrected covariance should be available");
+        assert!((out.eta_standard_error[0] - 3.0).abs() <= 1e-12);
+        assert!(out.covariance_corrected_used);
+
+        let missing_fit = gaussian_location_scale_fit_with_covariance(
+            array![0.0],
+            array![0.0],
+            array![[1.0, 0.0], [0.0, 0.0]],
+        );
+        let err = predictor
+            .predict_full_uncertainty(&input, &missing_fit, &options)
+            .expect_err("required corrected covariance must error when unavailable")
+            .to_string();
+        assert!(
+            err.contains("smoothing-corrected covariance"),
+            "unexpected required-covariance error: {err}"
+        );
     }
 
     #[test]
