@@ -1506,6 +1506,28 @@ pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<StandardL
     None
 }
 
+/// Weakly-informative penalized-complexity (PC) hyperprior on the log-precision
+/// ρ, used as the firth-general default outer prior on any smoothing coordinate
+/// the caller left unset (`RhoPrior::Flat`).
+///
+/// The tail statement `P(d > upper) = tail_prob` on the marginal-SD distance
+/// scale `d = exp(−ρ/2)` calibrates the exponential rate `θ = −ln(tail_prob)/upper`.
+/// We choose `upper = 10`, `tail_prob = 0.01` ⇒ `θ = −ln(0.01)/10 ≈ 0.4605`: the
+/// prior allows a marginal coefficient SD of up to 10 with 1% tail mass beyond
+/// it, i.e. it is essentially flat over any plausible identified scale and only
+/// asserts itself as a gentle Occam pull (gradient → 1/2 as ρ → +∞, an
+/// exponential wall against the ρ → −∞ / λ → 0 under-smoothing degeneracy). Its
+/// O(1) contribution is dominated by the O(n) REML curvature wherever the data
+/// identify λ, so well-determined smoothing is left unbiased — the zero-downside
+/// reduction to plain REML in the information limit.
+#[inline]
+fn firth_default_pc_prior() -> RhoPrior {
+    RhoPrior::PenalizedComplexity {
+        upper: 10.0,
+        tail_prob: 0.01,
+    }
+}
+
 #[inline]
 fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     let spec = reml_spec(likelihood);
@@ -4175,12 +4197,59 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> super::rho_prior_eval::RhoPriorEval {
+        let effective = self.effective_rho_prior();
         super::rho_prior_eval::evaluate(
-            &self.rho_prior,
+            effective.as_ref(),
             rho,
             super::rho_prior_eval::InvalidPriorPolicy::Saturate,
         )
         .expect("Saturate policy never errors")
+    }
+
+    /// Resolve the *effective* outer prior on the log-precision ρ, applying the
+    /// firth-general default-hyperprior policy.
+    ///
+    /// Without robustness (`firth_general == false`) this returns the configured
+    /// [`self.rho_prior`] verbatim, so every released path is byte-identical: a
+    /// `Flat` configured prior stays `Flat` (cost/grad/hess all zero) and the
+    /// outer objective is bare REML/LAML. Under `firth_general` an *unset* prior
+    /// (the `Flat` sentinel, i.e. the caller did not configure a hyperprior on a
+    /// coordinate) is replaced by the weakly-informative penalized-complexity
+    /// (PC) prior [`firth_default_pc_prior`], turning the outer REML point into a
+    /// proper marginal posterior over λ. A PC prior is reparameterization-
+    /// invariant and shrinks only toward the simpler (more-smoothing) base model,
+    /// so it removes the λ→0 degeneracy without ever walling off complexity the
+    /// data actually buys. Any explicitly configured prior (Normal, Gamma, an
+    /// already-PC coordinate, ...) is respected unchanged — the default only
+    /// fills `Flat` holes.
+    ///
+    /// The default is *weakly* informative by construction: its calibrated rate
+    /// `θ = −ln(tail_prob)/upper` is small, so its O(1) cost/gradient is
+    /// dominated by the O(n) REML curvature wherever λ is well identified,
+    /// leaving clean λ-selection unbiased (the zero-downside / information-limit
+    /// reduction to plain REML).
+    fn effective_rho_prior(&self) -> std::borrow::Cow<'_, RhoPrior> {
+        if !self.config.firth_general() {
+            return std::borrow::Cow::Borrowed(&self.rho_prior);
+        }
+        match &self.rho_prior {
+            // Whole prior unset → fill every coordinate with the weak PC default.
+            RhoPrior::Flat => std::borrow::Cow::Owned(firth_default_pc_prior()),
+            // Per-coordinate priors: only the `Flat` (unset) coordinates inherit
+            // the PC default; explicitly configured coordinates are preserved.
+            RhoPrior::Independent(priors) if priors.iter().any(|p| matches!(p, RhoPrior::Flat)) => {
+                let filled = priors
+                    .iter()
+                    .map(|p| match p {
+                        RhoPrior::Flat => firth_default_pc_prior(),
+                        other => other.clone(),
+                    })
+                    .collect();
+                std::borrow::Cow::Owned(RhoPrior::Independent(filled))
+            }
+            // Any explicitly configured prior is honored as-is.
+            configured => std::borrow::Cow::Borrowed(configured),
+        }
     }
 
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
@@ -6397,8 +6466,9 @@ impl<'a> RemlState<'a> {
                 &pirls_config,
                 warm_start_ref,
                 adaptive_kkt_tolerance,
-                // REML cost eval: never re-profile the Gamma scale against the
-                // trial λ's residuals (would bias λ selection — see #678).
+                // REML cost eval: never re-profile the family dispersion (Gamma
+                // shape / Beta precision) against the trial λ's residuals — that
+                // would couple the scale to λ and bias selection (#678, #769).
                 false,
             );
             let pirls_elapsed = pirls_start.elapsed();

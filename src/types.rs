@@ -1245,11 +1245,9 @@ impl LikelihoodSpec {
     ///
     /// - `Gaussian` and `Gamma` profile/estimate the scale jointly with the
     ///   mean, so no fixed `phi` is exposed here.
-    /// - `Binomial`, `Poisson`, and `NegativeBinomial` are unit-scale
-    ///   exponential-family fits (overdispersion in NB is encoded in `theta`,
-    ///   not in `phi`), so the contract is `Some(1.0)`.
-    /// - `Tweedie` estimates `phi` from the fitted unit deviance; the seed
-    ///   contract is `Some(1.0)` until the final fit installs the estimate.
+    /// - `Binomial`, `Poisson`, `Tweedie`, and `NegativeBinomial` are
+    ///   unit-scale exponential-family fits (overdispersion in NB is encoded
+    ///   in `theta`, not in `phi`), so the contract is `Some(1.0)`.
     /// - `Beta { phi }` carries its precision parameter directly on the family
     ///   variant; the contract returns that exact value rather than the
     ///   placeholder used elsewhere for unit-scale GLMs.
@@ -1262,8 +1260,8 @@ impl LikelihoodSpec {
             }
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
+            | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => Some(1.0),
-            ResponseFamily::Tweedie { .. } => Some(1.0),
             ResponseFamily::Beta { phi } => Some(phi),
         }
     }
@@ -1481,8 +1479,8 @@ impl GlmLikelihoodSpec {
     ///   Fisher information.** Then `H = Xᵀ(W_sf/φ)X + S_λ` already equals the
     ///   true penalized Hessian (e.g. mgcv's `XᵀW_sfX/φ + S_λ` for Gamma), so
     ///   `Vb = H⁻¹` and the scale is exactly `1.0`. This is the case for Gamma
-    ///   (`W = prior·shape = prior/φ`), Beta and Negative-Binomial (the working
-    ///   weight is the complete fixed-scale
+    ///   (`W = prior·shape = prior/φ`), Tweedie (`W = prior·μ^{2−p}/φ`), Beta
+    ///   and Negative-Binomial (the working weight is the complete fixed-scale
     ///   Fisher information), and the fixed-scale exponential families
     ///   Poisson/Binomial (`φ ≡ 1`). Multiplying `H⁻¹` by the dispersion again
     ///   for any of these double-counts it and shrinks every SE by `√dispersion`.
@@ -2195,33 +2193,7 @@ impl<'a> Deref for LogSmoothingParamsView<'a> {
 
 #[cfg(test)]
 mod ridge_policy_tests {
-    use super::{
-        GlmLikelihoodSpec, LikelihoodScaleMetadata, LikelihoodSpec, RidgePassport, RidgePolicy,
-        StabilizationKind, StabilizationLedger,
-    };
-
-    #[test]
-    fn tweedie_defaults_to_estimated_dispersion_scale() {
-        let spec = LikelihoodSpec::tweedie_log(1.5);
-        assert_eq!(
-            spec.default_scale_metadata(),
-            LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 1.0 },
-            "Tweedie phi is a fitted dispersion, not a structural unit scale"
-        );
-    }
-
-    #[test]
-    fn estimated_tweedie_phi_is_already_in_working_weights() {
-        let glm = GlmLikelihoodSpec {
-            spec: LikelihoodSpec::tweedie_log(1.5),
-            scale: LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 8.0 },
-        };
-        assert_eq!(
-            glm.coefficient_covariance_scale(1.0),
-            1.0,
-            "Tweedie working weights carry fitted phi, so Vb is not scaled again"
-        );
-    }
+    use super::{RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger};
 
     #[test]
     fn solver_only_ridge_policy_stays_off_objective_accounting() {
