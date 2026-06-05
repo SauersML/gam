@@ -316,6 +316,18 @@ pub(crate) fn fisher_weight_jet5_for_inverse_link(
 }
 
 #[inline]
+pub(crate) fn inverse_link_has_fisher_weight_jet(link: &InverseLink) -> bool {
+    matches!(
+        link,
+        InverseLink::Standard(StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_)
+    )
+}
+
+#[inline]
 fn component_fisher_weight_jet5(component: LinkComponent, eta: f64) -> (f64, f64, f64, f64, f64) {
     let jet = component_inverse_link_jet(component, eta);
     let d4 = component_inverse_link_pdfthird_derivative(component, eta);

@@ -37,7 +37,10 @@ use crate::linalg::utils::{
     row_mismatch_message,
 };
 use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
-use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use crate::mixture_link::{
+    inverse_link_has_fisher_weight_jet, state_from_beta_logisticspec, state_from_sasspec,
+    state_fromspec,
+};
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::terms::smooth::BlockwisePenalty;
@@ -1869,16 +1872,11 @@ fn resolve_external_family(
         );
     }
 
-    let supports_firth = matches!(
-        (&family.response, &family.link),
-        (
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit),
-        ),
-    );
+    let supports_firth = matches!(family.response, ResponseFamily::Binomial)
+        && inverse_link_has_fisher_weight_jet(&family.link);
     if firth_override == Some(true) && !supports_firth {
         crate::bail_invalid_estim!(
-            "firth_bias_reduction is currently implemented only for Binomial Logit; {} does not support it",
+            "firth_bias_reduction requires a Binomial inverse link with a Fisher-weight jet; {} does not support it",
             family.pretty_name(),
         );
     }
@@ -7042,9 +7040,22 @@ mod estimate_policy_tests {
         .expect_err("Poisson fitting should reject unsupported Firth requests explicitly");
         assert!(
             err.to_string()
-                .contains("firth_bias_reduction is currently implemented only for"),
+                .contains("requires a Binomial inverse link with a Fisher-weight jet"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_external_family_accepts_supported_nonlogit_firth_request() {
+        let (_, firth) = resolve_external_family(
+            &LikelihoodSpec::new(
+                ResponseFamily::Binomial,
+                InverseLink::Standard(StandardLink::CLogLog),
+            ),
+            Some(true),
+        )
+        .expect("CLogLog has a Fisher-weight jet");
+        assert!(firth);
     }
 
     #[test]
