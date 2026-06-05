@@ -750,7 +750,6 @@ struct CliFirthValidation<'a> {
     enabled: bool,
     family: LikelihoodSpec,
     predict_noise: bool,
-    has_bounded_terms: bool,
     is_survival: bool,
     link_choice: Option<&'a LinkChoice>,
 }
@@ -769,11 +768,6 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), C
         return Err(CliError::IncompatibleConfig {
             reason: "--firth is not supported with --predict-noise location-scale fitting"
                 .to_string(),
-        });
-    }
-    if ctx.has_bounded_terms {
-        return Err(CliError::IncompatibleConfig {
-            reason: "--firth is not yet supported with bounded() coefficients".to_string(),
         });
     }
     if ctx.family.supports_firth() {
@@ -993,7 +987,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             enabled: args.firth,
             family: LikelihoodSpec::royston_parmar(),
             predict_noise: args.predict_noise.is_some(),
-            has_bounded_terms: false,
             is_survival: true,
             link_choice: None,
         })?;
@@ -1357,7 +1350,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         enabled: args.firth,
         family: family.clone(),
         predict_noise: args.predict_noise.is_some(),
-        has_bounded_terms,
         is_survival: false,
         link_choice: link_choice.as_ref(),
     })?;
@@ -3919,12 +3911,6 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         &col_map,
         "resolved_termspec",
     )?;
-    if termspec_has_bounded_terms(&spec) {
-        return Err(
-            "diagnose --alo is not yet supported for models with bounded() coefficients"
-                .to_string(),
-        );
-    }
     progress.set_stage("diagnose", "building diagnostic design");
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -6254,21 +6240,6 @@ fn run_generate_unified(
     noise_offset_supplied: bool,
 ) -> Result<gam::generative::GenerativeSpec, String> {
     progress.set_stage("generate", "building unified generation design");
-
-    // Bounded-coefficient check: resolve the primary termspec just for this
-    // guard (build_predict_input_for_model resolves it again internally, but
-    // this keeps the error path clean and avoids leaking the spec).
-    let primary_spec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    if termspec_has_bounded_terms(&primary_spec) {
-        return Err(
-            "sample is not yet supported for models with bounded() coefficients".to_string(),
-        );
-    }
 
     let pred_input = build_predict_input_for_model(
         model,
@@ -10041,7 +10012,6 @@ mod tests {
             enabled: true,
             family: LikelihoodSpec::poisson_log(),
             predict_noise: false,
-            has_bounded_terms: false,
             is_survival: false,
             link_choice: None,
         })
@@ -10367,7 +10337,6 @@ mod tests {
             enabled: true,
             family: LikelihoodSpec::binomial_logit(),
             predict_noise: false,
-            has_bounded_terms: false,
             is_survival: false,
             link_choice: Some(&choice),
         })
@@ -10380,7 +10349,6 @@ mod tests {
             enabled: true,
             family: LikelihoodSpec::royston_parmar(),
             predict_noise: false,
-            has_bounded_terms: false,
             is_survival: true,
             link_choice: None,
         })
