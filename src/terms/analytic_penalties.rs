@@ -203,7 +203,7 @@ fn stable_softplus(x: f64) -> f64 {
 /// clamp band is symmetric in log-strength about zero, matched to the largest /
 /// smallest positive normal `f64`, leaving a safety margin so subsequent
 /// multiplications by `O(1)` factors stay finite.
-fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
+pub(crate) fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
     // Largest / smallest log-magnitude that keeps the strength a finite normal
     // `f64` with headroom for downstream `O(1)` arithmetic.
     const MAX_LOG_STRENGTH: f64 = 700.0;
@@ -218,6 +218,26 @@ fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
     let log_strength = base_weight.abs().ln() + rho;
     let clamped = log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH);
     clamped.exp().copysign(base_weight)
+}
+
+/// Exponentiate a learnable log-precision `exp(log_alpha)` with the exponent
+/// clamped into the finite-normal band, returning a finite, strictly-positive
+/// precision.
+///
+/// A raw `log_alpha.exp()` overflows to `inf` for `log_alpha ≳ 709` (an `inf`
+/// precision then poisons the ARD value/grad/Hessian via `inf · 0.0 = NaN`) and
+/// underflows to exact `0.0` for `log_alpha ≲ -745` (a zero precision drops a
+/// prior the term still expects to be positive). Clamping the exponent and
+/// flooring at the smallest positive normal keeps the precision a finite,
+/// strictly-positive `f64` while still spanning arbitrarily small / large
+/// values within range (#742, Issue 4).
+pub(crate) fn stable_exp_log_precision(log_alpha: f64) -> f64 {
+    const MAX_LOG_STRENGTH: f64 = 700.0;
+    const MIN_LOG_STRENGTH: f64 = -700.0;
+    log_alpha
+        .clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH)
+        .exp()
+        .max(f64::MIN_POSITIVE)
 }
 
 /// Scalar annealing schedule for analytic penalty weights.
@@ -5853,7 +5873,7 @@ impl ParametricRowPrecisionPriorPenalty {
     }
 
     fn lambda_at(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
-        let alpha = self.active_log_alpha(k, rho).exp();
+        let alpha = stable_exp_log_precision(self.active_log_alpha(k, rho));
         let beta = stable_softplus(self.active_raw_beta(k, rho));
         MIN_CONDITIONAL_PRECISION + alpha + beta * self.dist2(n, k, rho)
     }
@@ -5996,7 +6016,7 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
         let mut grad_weight_direct = 0.0;
         for k in 0..d {
             let log_alpha = self.active_log_alpha(k, rho);
-            let alpha = log_alpha.exp();
+            let alpha = stable_exp_log_precision(log_alpha);
             let raw_beta = self.active_raw_beta(k, rho);
             let beta = stable_softplus(raw_beta);
             let beta_jac = crate::linalg::utils::stable_logistic(raw_beta);
@@ -8203,6 +8223,7 @@ impl FrozenAnalyticPenaltyOp {
                 max_steps,
                 residual_tol: 1e-12,
                 local_reorthogonalize: false,
+                full_reorthogonalize: false,
             },
             |q, out| {
                 self.matvec(ArrayView1::from(q), ArrayViewMut1::from(&mut *out));
