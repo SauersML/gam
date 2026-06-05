@@ -804,17 +804,6 @@ impl RemlConfig {
         self
     }
 
-    /// Whether the family-general Firth/Jeffreys robustness mechanism is armed
-    /// for this fit. Resolves the user-facing tri-state
-    /// [`RobustIdentification`](crate::solver::workflow::RobustIdentification)
-    /// policy through [`RobustConfig`](crate::solver::robust_identification::RobustConfig);
-    /// `Off` ⇒ `false` (released, byte-identical path), `Auto`/`Force`/`FirthOnly`
-    /// ⇒ `true`. Used to gate the outer PC hyperprior default on λ.
-    pub(crate) fn firth_general(&self) -> bool {
-        crate::solver::robust_identification::RobustConfig::from_policy(self.robust_identification)
-            .firth_general
-    }
-
     fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }
@@ -3513,13 +3502,10 @@ where
         },
         None,
         None,
-        // Final, reported fit at the REML-selected λ: refine the family's
-        // estimated dispersion nuisance at the converged η. For Gamma this
-        // re-estimates the shape so `dispersion_phi()` and every SE / interval
-        // reflect the conditional noise, not the spread of μ (#678); for Beta
-        // it drives the precision φ and the mean β̂ to their joint fixed point,
-        // undoing the slope attenuation from a φ frozen at the null predictor
-        // (#769). λ is fixed here, so there is no scale↔λ feedback.
+        // Final, reported fit at the REML-selected λ: refine the Gamma
+        // dispersion shape at the converged η so `dispersion_phi()` and every
+        // SE / interval derived from it reflect the conditional noise, not the
+        // spread of μ (#678). λ is fixed here, so there is no scale↔λ feedback.
         true,
     )?;
 
@@ -3739,7 +3725,26 @@ where
         | ResponseFamily::Poisson
         | ResponseFamily::RoystonParmar => 1.0,
     };
-    let dispersion = dispersion_from_likelihood(&pirls_res.likelihood, standard_deviation);
+    let mut final_likelihood = pirls_res.likelihood.clone();
+    if matches!(
+        final_likelihood.spec.response,
+        ResponseFamily::Tweedie { .. }
+    ) {
+        let denom = if opts.compute_inference {
+            (n - edf_total).max(1.0)
+        } else {
+            (n - p_dim as f64).max(1.0)
+        };
+        let phi = (pirls_res.deviance / denom).max(f64::MIN_POSITIVE);
+        final_likelihood.scale = LikelihoodScaleMetadata::EstimatedDispersion { phi };
+    }
+    let final_deviance = crate::pirls::calculate_deviance(
+        y_o.view(),
+        &pirls_res.finalmu,
+        &final_likelihood,
+        w_o.view(),
+    );
+    let dispersion = dispersion_from_likelihood(&final_likelihood, standard_deviation);
 
     // Explicit dispersion contract for coefficient covariance matrices:
     // Vb = H⁻¹ · cov_scale, where the stored penalized Hessian is always
@@ -3760,8 +3765,7 @@ where
     // `GlmLikelihoodSpec::coefficient_covariance_scale`; the response-level
     // observation noise used by predictive intervals stays in `dispersion`
     // above (a deliberately distinct quantity, e.g. 1/shape for Gamma).
-    let cov_scale = pirls_res
-        .likelihood
+    let cov_scale = final_likelihood
         .coefficient_covariance_scale(standard_deviation * standard_deviation)
         .max(f64::MIN_POSITIVE);
 
@@ -3982,11 +3986,11 @@ where
     });
 
     let pirls_status = pirls_res.status;
-    let likelihood_scale_field = pirls_res.likelihood.scale;
+    let likelihood_scale_field = final_likelihood.scale;
     let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
         y_o.view(),
         &pirls_res.finalmu,
-        &pirls_res.likelihood,
+        &final_likelihood,
         w_o.view(),
     );
 
@@ -4002,7 +4006,7 @@ where
         finalgrad_norm,
         outer_converged: outer_result.converged,
         pirls_status,
-        deviance: pirls_res.deviance,
+        deviance: final_deviance,
         stable_penalty_term: pirls_res.stable_penalty_term,
         max_abs_eta: pirls_res.max_abs_eta,
         constraint_kkt: pirls_res.constraint_kkt.clone(),
