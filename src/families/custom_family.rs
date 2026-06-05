@@ -4018,28 +4018,6 @@ fn update_custom_outer_inner_cap_from_warm_start(
         return;
     };
     let full_budget = options.inner_max_cycles.max(1);
-    // Under the universal under-identification robustness (Firth/Jeffreys armed,
-    // i.e. `RobustIdentification::Force`/`Auto`), the H_Φ-augmented outer surface
-    // is steeper, so the outer optimizer's first proposed step lands farther from
-    // the previous iterate. The adaptive cap below sizes line-search trial inner
-    // solves at roughly the PREVIOUS accepted iterate's cycle count; a far trial
-    // ρ then needs more cycles than that to re-converge β̂(ρ), so it returns a
-    // non-converged β whose outer cost is off by O(0.1–1) — orders of magnitude
-    // above the Strong-Wolfe sufficient-decrease tolerance. The line search reads
-    // that inner-solve inconsistency as objective noise and stalls at iteration 1
-    // (FD-verified: the analytic outer gradient is exact at every ACCEPTED iterate
-    // to ~1e-8, ON and OFF alike; the residual is purely line-search cost
-    // inconsistency from a too-tight trial inner cap). Give the robust path the
-    // full inner budget at every trial so line-search costs are consistent. No-op
-    // when robustness is OFF (released path keeps the adaptive cap byte-for-byte).
-    let firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
-        options.robust_identification,
-    )
-    .firth_general;
-    if firth_armed {
-        outer_cap.store(full_budget, Ordering::Relaxed);
-        return;
-    }
     let Some(cached_inner) = warm_start.cached_inner.as_ref() else {
         outer_cap.store(full_budget, Ordering::Relaxed);
         return;
@@ -24137,15 +24115,50 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     .ok()
                     .map(|e| e.objective)
                 };
-                let cold_cost_here = cost_at(rho);
+                // Cold full result at this rho: compare its inner beta-hat to the
+                // ACCEPTED eval's beta-hat. If they differ materially the inner
+                // augmented objective is multimodal/path-dependent at this rho
+                // (cold vs warm land in different basins), so the outer cost L(rho)
+                // is multivalued and BFGS cannot line-search it.
+                let cold_full = outerobjectivegradienthessian_labeled(
+                    family,
+                    specs,
+                    &outer_options,
+                    &label_layout,
+                    rho,
+                    None,
+                    &rho_prior,
+                    EvalMode::ValueAndGradient,
+                )
+                .ok();
+                let cold_cost_here = cold_full.as_ref().map(|e| e.objective);
                 let warm_cold_gap = match (warm_cost_here, cold_cost_here) {
                     (Some(w), Some(c)) => (w - c).abs(),
                     _ => f64::NAN,
                 };
+                let beta_basin_diff = match cold_full.as_ref() {
+                    Some(cold) => {
+                        let mut d = 0.0_f64;
+                        for (wb, cb) in eval_result
+                            .warm_start
+                            .block_beta
+                            .iter()
+                            .zip(cold.warm_start.block_beta.iter())
+                        {
+                            let m = wb.len().min(cb.len());
+                            for k in 0..m {
+                                d = d.max((wb[k] - cb[k]).abs());
+                            }
+                        }
+                        d
+                    }
+                    None => f64::NAN,
+                };
                 let mut report = format!(
                     "[CF-OUTER-FD-PROBE] eval#{probe_idx} firth_armed={firth_armed} robust={:?} \
                      rho_dim={rho_dim} objective={:.8e} |g_analytic|={:.6e} \
-                     warm_cold_cost_gap={warm_cold_gap:.4e} rho={:?}\n",
+                     warm_cold_cost_gap={warm_cold_gap:.4e} \
+                     warm_cold_beta_basin_diff={beta_basin_diff:.4e} rho={:?}\n",
                     outer_options.robust_identification,
                     eval_result.objective,
                     g_analytic.iter().map(|v| v * v).sum::<f64>().sqrt(),
