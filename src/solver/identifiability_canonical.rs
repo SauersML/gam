@@ -931,12 +931,11 @@ fn try_orthogonalize_blocks(
     // internal design width — leaving the inner solve's reduced β (e.g. 8) out
     // of sync with the family's full design (e.g. 12) and tripping the family's
     // own shape validation. Such families are robustified by the Tier-B
-    // joint-Newton Jeffreys/Firth term (firth_general), which adds curvature on
-    // the under-identified span WITHOUT any design surgery and keeps every
-    // block β at full width. Defer here so they take that path. (Single-channel,
-    // plain-design blocks — `jacobian_callback: None` — are still reparam'd
-    // exactly as before, so the OFF path and existing orthogonalize users are
-    // byte-identical.)
+    // joint-Newton Jeffreys/Firth term, which adds curvature on the
+    // under-identified span WITHOUT any design surgery and keeps every block β at
+    // full width. Defer here so they take that path. (Single-channel, plain-design
+    // blocks — `jacobian_callback: None` — are reparam'd here; a clean design with
+    // no overlap to remove falls through to the audit gate byte-identically.)
     let family_owned_geometry = specs.iter().any(|s| s.jacobian_callback.is_some());
     if family_owned_geometry {
         return Ok(None);
