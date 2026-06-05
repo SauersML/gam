@@ -3468,13 +3468,6 @@ pub struct BlockwiseFitOptions {
     /// box-constraint stationarity at iteration 0. Genuinely flexible regimes
     /// (smooth scale / spatial) leave this `true` and keep full screening.
     pub screen_initial_rho: bool,
-    /// Universal under-identification robustness policy threaded from the
-    /// workflow `FitConfig`. `Off` (default) is byte-identical to the released
-    /// solver: every pinned BMS ridge stays installed and no Firth/orthogonal
-    /// reparameterization machinery runs. `Auto`/`Force` arm the structural
-    /// cure on supported custom-family paths (BMS-probit). The struct's
-    /// `Default` keeps this `Off` so no existing caller changes behavior.
-    pub robust_identification: crate::solver::workflow::RobustIdentification,
 }
 
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
@@ -3523,7 +3516,6 @@ impl Default for BlockwiseFitOptions {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
-            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         }
     }
 }
@@ -11883,18 +11875,13 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     refresh_all_block_etas(family, specs, states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    // Universal robustness (flag-gated, default OFF): the outer REML logdet of
-    // the penalized Hessian must use the SAME Jeffreys-augmented Hessian
+    // Universal robustness (unconditional): the outer REML logdet of the
+    // penalized Hessian must use the SAME Jeffreys-augmented Hessian
     // `H + S_λ + H_Φ` the inner Newton converged on, or the LAML score and its
     // analytic derivatives describe a different objective. Compute `H_Φ` (scoped
     // to the under-identified span `Z_J`) once here and add it into whichever
-    // logdet path runs below. `None` ⇒ byte-identical released logdet.
-    let robust_logdet_firth = include_logdet_h
-        && crate::solver::robust_identification::RobustConfig::from_policy(
-            options.robust_identification,
-        )
-        .firth_general;
-    let logdet_jeffreys_hphi: Option<Array2<f64>> = if robust_logdet_firth {
+    // logdet path runs below. `None` ⇒ no logdet-H contribution (logdet-S only).
+    let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h {
         match build_joint_jeffreys_subspace(specs, &ranges)? {
             Some(z_joint) => {
                 custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
@@ -14116,26 +14103,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         };
         let total_p: usize = ranges.last().map_or(0, |r| r.1);
 
-        // Universal under-identification robustness (flag-gated, default OFF).
-        // When armed, build the joint penalty-null basis `Z_J` once: it scopes
-        // the family-general Jeffreys/Firth term to the under-identified span so
-        // a near-separating coefficient is bounded to O(1) with automatic
-        // strength inside the coupled joint Newton, while penalized smooth
-        // directions keep their wiggliness prior untouched. `None` (no
-        // under-identified direction, or unsupported policy) leaves every step
-        // and objective byte-identical to the released solver.
-        let robust_firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
-            options.robust_identification,
-        )
-        .firth_general;
-        let joint_jeffreys_subspace = if robust_firth_armed {
-            build_joint_jeffreys_subspace(specs, &ranges)?
-        } else {
-            None
-        };
+        // Universal under-identification robustness (unconditional). Build the
+        // joint penalty-null basis `Z_J` once: it scopes the family-general
+        // Jeffreys/Firth term to the under-identified span so a near-separating
+        // coefficient is bounded to O(1) with automatic strength inside the
+        // coupled joint Newton, while penalized smooth directions keep their
+        // wiggliness prior untouched. `None` (no under-identified direction)
+        // leaves every step and objective at the un-augmented inner Newton.
+        let joint_jeffreys_subspace = build_joint_jeffreys_subspace(specs, &ranges)?;
         // Fold the Jeffreys objective value into the cycle-0 baseline so the
         // first trust-region accept/reject compares like-for-like against the
-        // Jeffreys-augmented trial objectives below. No-op when the flag is OFF.
+        // Jeffreys-augmented trial objectives below. No-op when there is no
+        // under-identified span.
         if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
             let phi0 = custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             current_penalty += phi0;
@@ -20962,7 +20941,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 &inner.block_states,
                 specs,
                 &ranges,
-                options,
             )?,
         )?;
 
@@ -21102,7 +21080,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             &inner.block_states,
                             specs,
                             &ranges,
-                            options,
                         )?,
                     )?;
                     return Ok(OuterObjectiveEvalResult {
@@ -21188,7 +21165,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 &inner.block_states,
                 specs,
                 &ranges,
-                options,
             )?,
         )?;
 
@@ -21500,7 +21476,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             inner.joint_workspace.clone(),
             eval_mode,
         )?,
-        custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges, options)?,
+        custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
     )?;
 
     Ok(eval_result)
@@ -22201,15 +22177,7 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
-    options: &BlockwiseFitOptions,
 ) -> Result<Option<Array2<f64>>, String> {
-    let robust_firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
-        options.robust_identification,
-    )
-    .firth_general;
-    if !robust_firth_armed {
-        return Ok(None);
-    }
     let z_joint = match build_joint_jeffreys_subspace(specs, ranges)? {
         Some(z) => z,
         None => return Ok(None),
@@ -27949,7 +27917,6 @@ mod tests {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
-            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         };
 
         let result = fit_custom_family(&OneBlockIdentityFamily, &[spec], &options)
@@ -28003,7 +27970,6 @@ mod tests {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
-            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         };
         let per_block_log_lambdas = vec![array![10.0_f64.ln()]];
         let inner = inner_blockwise_fit(&family, &[spec], &per_block_log_lambdas, &options, None)
@@ -28060,7 +28026,6 @@ mod tests {
             cache_mirror_sessions: Vec::new(),
             joint_penalties: None,
             screen_initial_rho: true,
-            robust_identification: crate::solver::workflow::RobustIdentification::Off,
         };
         let inner = inner_blockwise_fit(&family, &[spec], &[Array1::zeros(0)], &options, None)
             .expect("inner blockwise fit should succeed");
