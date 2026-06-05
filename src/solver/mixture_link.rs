@@ -236,6 +236,125 @@ fn probit_pdffourth_derivative(eta: f64) -> f64 {
     canonicalzero((x * x * x * x - 6.0 * x * x + 3.0) * phi)
 }
 
+/// Multiply two 5-term truncated Taylor series (coefficients `a_k = g^(k)/k!`,
+/// `k = 0..=4`) and return the truncated product coefficients.
+#[inline]
+fn taylor5_mul(a: &[f64; 5], b: &[f64; 5]) -> [f64; 5] {
+    let mut c = [0.0_f64; 5];
+    for i in 0..5 {
+        let ai = a[i];
+        if ai == 0.0 {
+            continue;
+        }
+        for j in 0..(5 - i) {
+            c[i + j] += ai * b[j];
+        }
+    }
+    c
+}
+
+/// Reciprocal of a 5-term truncated Taylor series with nonzero constant term.
+#[inline]
+fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
+    let mut b = [0.0_f64; 5];
+    b[0] = 1.0 / a[0];
+    for k in 1..5 {
+        let mut s = 0.0_f64;
+        for j in 1..=k {
+            s += a[j] * b[k - j];
+        }
+        b[k] = -s * b[0];
+    }
+    b
+}
+
+/// 5-jet (value + four eta-derivatives) of the GLM Fisher working weight
+/// `W(eta) = mu'(eta)^2 / V(mu(eta))` for the requested standard link, returned
+/// as `(W, W', W'', W''', W'''')`.
+///
+/// For the canonical logit link this is exactly the binomial weight
+/// `W = mu(1 - mu) = mu'`, whose eta-derivatives are the higher derivatives of
+/// the inverse-link jet (`W^(k) = mu^(k+1)`); the dispatch returns
+/// `logit_inverse_link_jet5`'s `d1..d5` byte-for-byte so the existing Firth
+/// logit path is numerically unchanged.
+///
+/// For the probit link `mu = Phi(eta)`, `mu' = phi(eta)`, with Bernoulli
+/// variance `V = mu(1 - mu)`, so `W = phi^2 / (Phi (1 - Phi))`. Its eta-jet is
+/// assembled by truncated Taylor-series division of the exact Gaussian
+/// derivative series (`phi' = -eta phi`, etc.), which is algebraically exact and
+/// avoids hand-deriving the quotient four times. As `|eta| -> inf` the
+/// denominator `Phi (1 - Phi)` underflows; there the weight and all its
+/// derivatives saturate to zero, matching the inverse-link jet convention.
+pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
+    match link {
+        StandardLink::Logit => {
+            let jet = logit_inverse_link_jet5(eta);
+            (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
+        }
+        StandardLink::Probit => probit_fisher_weight_jet5(eta),
+        StandardLink::CLogLog | StandardLink::Identity | StandardLink::Log => {
+            // Closed-form Fisher-weight jets for these links are not yet
+            // implemented; the robustness gate only advertises links present in
+            // `fisher_weight_jet5`, so this arm is never reached on the live
+            // path. Saturate to zero rather than emit a spurious weight.
+            (0.0, 0.0, 0.0, 0.0, 0.0)
+        }
+    }
+}
+
+/// Probit Bernoulli Fisher-weight 5-jet `W = phi^2 / (Phi (1 - Phi))` and its
+/// first four eta-derivatives. See [`fisher_weight_jet5`].
+#[inline]
+fn probit_fisher_weight_jet5(eta: f64) -> (f64, f64, f64, f64, f64) {
+    if eta.is_nan() {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    if !eta.is_finite() {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    let x = eta;
+    let p = normal_cdf(x);
+    let q = 1.0 - p;
+    let phi = normal_pdf(x);
+    // Saturated tail: the denominator Phi(1-Phi) has underflowed to zero (or
+    // would divide by zero); the working weight and all derivatives go to zero.
+    if !(p > 0.0) || !(q > 0.0) || p * q <= 0.0 {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    // Gaussian derivative ladder: phi^(k) for k = 0..=4 using phi' = -x phi.
+    let phi1 = -x * phi;
+    let phi2 = (x * x - 1.0) * phi;
+    let phi3 = -(x * x * x - 3.0 * x) * phi;
+    let phi4 = (x * x * x * x - 6.0 * x * x + 3.0) * phi;
+    // Derivative arrays (d^k/deta^k) for f = phi, p = Phi, q = 1 - Phi.
+    // p^(0) = Phi, p^(k>=1) = phi^(k-1); q is the negated complement.
+    let f_d = [phi, phi1, phi2, phi3, phi4];
+    let p_d = [p, phi, phi1, phi2, phi3];
+    let q_d = [q, -phi, -phi1, -phi2, -phi3];
+    // Convert derivative arrays to Taylor coefficients a_k = g^(k)/k!.
+    let factorial = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
+    let mut f_t = [0.0_f64; 5];
+    let mut p_t = [0.0_f64; 5];
+    let mut q_t = [0.0_f64; 5];
+    for k in 0..5 {
+        let inv_fact = 1.0 / factorial[k];
+        f_t[k] = f_d[k] * inv_fact;
+        p_t[k] = p_d[k] * inv_fact;
+        q_t[k] = q_d[k] * inv_fact;
+    }
+    let num_t = taylor5_mul(&f_t, &f_t);
+    let den_t = taylor5_mul(&p_t, &q_t);
+    let w_t = taylor5_mul(&num_t, &taylor5_inv(&den_t));
+    // Back to derivatives W^(k) = w_t[k] * k!.
+    (
+        canonicalzero(w_t[0] * factorial[0]),
+        canonicalzero(w_t[1] * factorial[1]),
+        canonicalzero(w_t[2] * factorial[2]),
+        canonicalzero(w_t[3] * factorial[3]),
+        canonicalzero(w_t[4] * factorial[4]),
+    )
+}
+
 #[inline]
 fn chain_inverse_link_jet(base: InverseLinkJet, z1: f64, z2: f64, z3: f64) -> InverseLinkJet {
     InverseLinkJet {
