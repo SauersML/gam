@@ -6361,50 +6361,46 @@ impl SurvivalMarginalSlopeFamily {
         // the same scaling the constraint builder applied so that "the solver
         // calls this feasible" and "this validator calls this feasible" coincide.
         let derivative_dense = self.design_derivative_exit.to_dense_cow();
-        let (worst_scaled_violation, worst_row, worst_qd1, worst_scale) = (0..n_rows)
-            .into_par_iter()
-            .map(|row| -> Result<(f64, usize, f64, f64), String> {
-                let offset = self.derivative_offset_exit[row];
-                let qd1 = qd_design[row] + offset;
-                if !qd1.is_finite() || !offset.is_finite() {
-                    return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                        reason: format!(
-                            "survival marginal-slope time-block {label} produced non-finite baseline \
-                             derivative at row {row}: qd1={qd1:.3e}, offset={offset:.3e}"
-                        ),
-                    }
-                    .into());
+        let mut worst_scaled_violation = 0.0_f64;
+        let mut worst_row = 0usize;
+        let mut worst_qd1 = f64::INFINITY;
+        let mut worst_scale = 1.0_f64;
+        for row in 0..n_rows {
+            let offset = self.derivative_offset_exit[row];
+            let qd1 = qd_design[row] + offset;
+            if !qd1.is_finite() || !offset.is_finite() {
+                return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                    reason: format!(
+                        "survival marginal-slope time-block {label} produced non-finite baseline \
+                         derivative at row {row}: qd1={qd1:.3e}, offset={offset:.3e}"
+                    ),
                 }
-                // Per-row normalization identical to the constraint builder.
-                let mut row_norm_sq = 0.0_f64;
-                for col in 0..derivative_dense.ncols() {
-                    let v = derivative_dense[[row, col]];
-                    row_norm_sq += v * v;
+                .into());
+            }
+            // Per-row normalization identical to the constraint builder.
+            let mut row_norm_sq = 0.0_f64;
+            for col in 0..derivative_dense.ncols() {
+                let v = derivative_dense[[row, col]];
+                row_norm_sq += v * v;
+            }
+            let row_norm = row_norm_sq.sqrt();
+            let rhs = guard - offset;
+            let scale = row_norm.max(rhs.abs()).max(1.0);
+            // Scaled violation = max(0, (guard - qd1) / scale); zero rows of the
+            // design contribute no constraint (the bound is then carried by the
+            // offset alone and checked at constraint-build time), so they cannot
+            // be repaired by `beta` and are excluded from the scaled metric.
+            let shortfall = guard - qd1;
+            if shortfall > 0.0 && row_norm_sq > 1e-24 {
+                let scaled = shortfall / scale;
+                if scaled > worst_scaled_violation {
+                    worst_scaled_violation = scaled;
+                    worst_row = row;
+                    worst_qd1 = qd1;
+                    worst_scale = scale;
                 }
-                let row_norm = row_norm_sq.sqrt();
-                let rhs = guard - offset;
-                let scale = row_norm.max(rhs.abs()).max(1.0);
-                // Scaled violation = max(0, (guard - qd1) / scale); zero rows of the
-                // design contribute no constraint (the bound is then carried by the
-                // offset alone and checked at constraint-build time), so they cannot
-                // be repaired by `beta` and are excluded from the scaled metric.
-                let shortfall = guard - qd1;
-                if shortfall > 0.0 && row_norm_sq > 1e-24 {
-                    Ok((shortfall / scale, row, qd1, scale))
-                } else {
-                    Ok((0.0, row, qd1, scale))
-                }
-            })
-            .try_reduce(
-                || (0.0, 0usize, f64::INFINITY, 1.0),
-                |left, right| -> Result<_, String> {
-                    if right.0 > left.0 {
-                        Ok(right)
-                    } else {
-                        Ok(left)
-                    }
-                },
-            )?;
+            }
+        }
         // A safety factor of 4 absorbs accumulation of the solver's per-row
         // tolerance and the small projection drift in the unconstrained
         // re-evaluation of `qd1` here versus the scaled constraint residual;
@@ -14252,16 +14248,9 @@ impl SurvivalMarginalSlopeFamily {
         // Per-row q-values reuse the canonical `row_dynamic_q_values`
         // helper so the GPU descriptor sees exactly the same q-geometry
         // the CPU per-row primary path consumes (timewiggle-aware when
-        // active). Each row is independent; only the final descriptor layout
-        // is order-sensitive.
-        let q_rows = (0..n)
-            .into_par_iter()
-            .map(|row| {
-                self.row_dynamic_q_values(row, block_states)
-                    .map(|qv| (row, qv))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        for (row, qv) in q_rows {
+        // active).
+        for row in 0..n {
+            let qv = self.row_dynamic_q_values(row, block_states)?;
             q0[row] = qv.q0;
             q1[row] = qv.q1;
             qd1[row] = qv.qd1;
@@ -21275,10 +21264,6 @@ pub fn fit_survival_marginal_slope_terms(
                 })();
                     match closed_form {
                         Ok(Some((map, (wt, wm, wl)))) => {
-                            let annotations = map.penalized_direction_annotations();
-                            let time_relation = annotations[0].relation;
-                            let marginal_relation = annotations[1].relation;
-                            let logslope_relation = annotations[2].relation;
                             let drops = (
                                 p_time.saturating_sub(wt),
                                 p_marg.saturating_sub(wm),
@@ -21315,7 +21300,6 @@ pub fn fit_survival_marginal_slope_terms(
                                 log::info!(
                                     "[smgs phase-4b compiled-map] compile_from_raw_grams ok with no drops \
                                  (time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl}); \
-                                 relations time={time_relation:?}, marginal={marginal_relation:?}, logslope={logslope_relation:?}; \
                                  production path = compiled_map, skipping apply"
                                 );
                                 return Ok(None);
@@ -21324,7 +21308,6 @@ pub fn fit_survival_marginal_slope_terms(
                                 "[smgs phase-4b compiled-map] applying CompiledMap T: \
                              time {p_time}→{wt}, marginal {p_marg}→{wm}, logslope {p_log}→{wl} \
                              (drops time={}, marginal={}, logslope={}); \
-                             relations time={time_relation:?}, marginal={marginal_relation:?}, logslope={logslope_relation:?}; \
                              production path = compiled_map",
                                 drops.0,
                                 drops.1,
