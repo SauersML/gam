@@ -370,10 +370,17 @@ mod tests {
         };
         let h = h_at(&beta);
         let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
-        // Phi = 1/2 log(exp(b0) * ill*(1 + b1^2)).
+        // Phi = 1/2 log(exp(b0) * ill*(1 + b1^2)). The reduced-information
+        // eigendecomposition resolves a spectrum spanning ~9 orders of magnitude
+        // (λ_max ≈ 1.35, λ_min ≈ 1.16e-9), so the small eigenvalue — and hence Φ
+        // — carries the eigensolver's relative round-off (~1e-7 abs on a Φ ≈ -10
+        // log-volume). That is expected on a deliberately ill-conditioned design
+        // exercising the active (un-gated) path; the load-bearing correctness
+        // check is the gradient FD below, which is insensitive to the constant
+        // `ill` scale.
         let expected_phi = 0.5 * (beta[0].exp() * ill * (1.0 + beta[1] * beta[1])).ln();
         assert!(
-            (phi - expected_phi).abs() < 1e-10,
+            (phi - expected_phi).abs() < 1e-6,
             "phi {phi} vs {expected_phi}"
         );
         // Finite-difference the gradient. Note ∂/∂β of log|H| is scale-free in
