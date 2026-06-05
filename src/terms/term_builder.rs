@@ -1978,16 +1978,42 @@ pub fn build_smooth_basis(
                     // `power=0` is handled above and is honored as the s=0 Duchon
                     // kernel (r²·log r ≡ the thin-plate kernel in even d) — the magic
                     // default lives here, not in the basis builder.
-                    //
-                    // For the hybrid Matérn-blended kernel (`length_scale=Some`) this
-                    // fractional cubic `s` is truncated to an integer by the basis
-                    // builder (`power_as_usize`); the well-posedness gate
-                    // `validate_duchon_kernel_orders` runs on that realized integer
-                    // and rejects the non-finite-at-origin case (e.g. d≥4 with the
-                    // truncated s=0) with a clear message at fit time. 1D/2D hybrid
-                    // defaults stay finite and build, so no request-layer rejection
-                    // is needed here.
-                    crate::basis::duchon_cubic_default(cols.len())
+                    match length_scale {
+                        None => crate::basis::duchon_cubic_default(cols.len()),
+                        Some(_) => {
+                            // The hybrid Matérn-blended kernel (`length_scale=Some`)
+                            // requires an INTEGER spectral power `s` (the partial-
+                            // fraction split `1/(ρ^{2p}(κ²+ρ²)^s)` is only defined for
+                            // integer `s`). The fractional cubic default `s=(d-1)/2` is
+                            // a half-integer for even `d`, and the basis builder's
+                            // `power_as_usize` maps a NON-integer to `0` (not its
+                            // floor) — so for even `d ≥ 4` the realized kernel has
+                            // `2(p+s) = 2p = 4 ≤ d`, which is non-finite at the origin
+                            // and crashes the fit (historically a non-finite
+                            // eigendecomposition; now a fit-time validation error).
+                            //
+                            // Rather than emit the fractional cubic and let it truncate
+                            // into an inadmissible kernel, resolve the SMALLEST
+                            // admissible integer `(nullspace, s)` at the requested
+                            // nullspace order, honoring the collocation order of the
+                            // default operator penalties (mass + tension ⇒ D1). This
+                            // recovers the canonical thin-plate smoothness order
+                            // `m = p + s = ⌊d/2⌋ + 1` for the hybrid kernel and agrees
+                            // with the fractional cubic default for odd `d` (where the
+                            // collocation floor already forces `s = (d-1)/2`).
+                            let max_op =
+                                crate::basis::duchon_max_active_operator_derivative_order(
+                                    &DuchonOperatorPenaltySpec::default(),
+                                );
+                            let (ns, s) = crate::basis::resolve_duchon_orders(
+                                cols.len(),
+                                requested_nullspace_order,
+                                max_op,
+                                length_scale,
+                            );
+                            (ns, s as f64)
+                        }
+                    }
                 }
             };
             let plan = plan_spatial_basis(
