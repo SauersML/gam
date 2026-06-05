@@ -428,30 +428,6 @@ impl FirthDenseOperator {
         )
     }
 
-    /// Link-general constructor (no fixed observation weights). The Fisher
-    /// working weight `W(eta)` and its eta-derivatives are taken from
-    /// `fisher_weight_jet5(link, ·)`; passing `StandardLink::Logit` reproduces
-    /// [`FirthDenseOperator::build`] byte-for-byte.
-    pub(crate) fn build_for_link(
-        link: StandardLink,
-        x_dense: &Array2<f64>,
-        eta: &Array1<f64>,
-    ) -> Result<FirthDenseOperator, EstimationError> {
-        Self::build_with_observation_weights_impl(link, x_dense, eta, None)
-    }
-
-    /// Link-general constructor with fixed nonnegative observation weights.
-    /// Passing `StandardLink::Logit` reproduces
-    /// [`FirthDenseOperator::build_with_observation_weights`] byte-for-byte.
-    pub(crate) fn build_with_observation_weights_for_link(
-        link: StandardLink,
-        x_dense: &Array2<f64>,
-        eta: &Array1<f64>,
-        observation_weights: ndarray::ArrayView1<'_, f64>,
-    ) -> Result<FirthDenseOperator, EstimationError> {
-        Self::build_with_observation_weights_impl(link, x_dense, eta, Some(observation_weights))
-    }
-
     #[inline]
     pub(crate) fn pirls_hat_diag(&self) -> Array1<f64> {
         &self.w * &self.h_diag
