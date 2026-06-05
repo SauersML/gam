@@ -140,11 +140,10 @@ def sinkhorn_barycenter(
 
     Differentiability is provided by the companion VJP
     :func:`sinkhorn_barycenter_vjp` (used by the torch / JAX adapters
-    in ``gamfit.kernels_torch`` / ``gamfit.kernels_jax``). The VJP is
-    computed at the converged fixed point via adjoint iteration
-    (Cuturi-Peyre, COT, Section 9.1.4) -- never by unrolling autograd
-    through the Sinkhorn loop, so memory is ``O(K * M^2)`` and
-    independent of ``n_iter``.
+    in ``gamfit.kernels_torch`` / ``gamfit.kernels_jax``). The VJP
+    differentiates the same finite ``n_iter`` Sinkhorn loop that the
+    forward pass evaluates, using a compact Rust reverse pass over the
+    log-dual traces rather than a Python autograd unroll.
 
     References
     ----------
@@ -178,8 +177,8 @@ def sinkhorn_barycenter_vjp(
     """Vector-Jacobian product for :func:`sinkhorn_barycenter`.
 
     Returns ``(d_atoms, d_weights)`` of shapes ``(K, M)`` and ``(K,)``
-    respectively, computed via adjoint iteration at the converged
-    fixed point (Cuturi-Peyre, COT, Section 9.1.4).
+    respectively, computed as the vector-Jacobian product of the
+    finite ``n_iter`` forward map at the same arguments.
     """
     atoms_arr = _as_f64_2d("atoms", atoms)
     k, m = atoms_arr.shape

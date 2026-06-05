@@ -278,13 +278,14 @@ fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
 /// `logit_inverse_link_jet5`'s `d1..d5` byte-for-byte so the existing Firth
 /// logit path is numerically unchanged.
 ///
-/// For the probit link `mu = Phi(eta)`, `mu' = phi(eta)`, with Bernoulli
-/// variance `V = mu(1 - mu)`, so `W = phi^2 / (Phi (1 - Phi))`. Its eta-jet is
-/// assembled by truncated Taylor-series division of the exact Gaussian
-/// derivative series (`phi' = -eta phi`, etc.), which is algebraically exact and
-/// avoids hand-deriving the quotient four times. As `|eta| -> inf` the
-/// denominator `Phi (1 - Phi)` underflows; there the weight and all its
-/// derivatives saturate to zero, matching the inverse-link jet convention.
+/// Noncanonical probability links use Bernoulli variance `V = mu(1 - mu)`, so
+/// `W = mu'^2 / (mu (1 - mu))`. Their eta-jets are assembled by truncated
+/// Taylor-series division of the inverse-link derivative series through
+/// `mu'''''`, which is algebraically exact and avoids hand-deriving the quotient
+/// four times. Probit keeps its specialised complement calculation for Gaussian
+/// tail accuracy; CLogLog uses the same quotient algebra over its closed-form
+/// inverse-link 5-jet. In saturated tails, the weight and all derivatives go to
+/// zero, matching the inverse-link jet convention.
 pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
     match link {
         StandardLink::Logit => {
@@ -292,14 +293,78 @@ pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64
             (jet.d1, jet.d2, jet.d3, jet.d4, jet.d5)
         }
         StandardLink::Probit => probit_fisher_weight_jet5(eta),
-        StandardLink::CLogLog | StandardLink::Identity | StandardLink::Log => {
-            // Closed-form Fisher-weight jets for these links are not yet
-            // implemented; the robustness gate only advertises links present in
-            // `fisher_weight_jet5`, so this arm is never reached on the live
-            // path. Saturate to zero rather than emit a spurious weight.
-            (0.0, 0.0, 0.0, 0.0, 0.0)
+        StandardLink::CLogLog => component_fisher_weight_jet5(LinkComponent::CLogLog, eta),
+        StandardLink::Identity | StandardLink::Log => (0.0, 0.0, 0.0, 0.0, 0.0),
+    }
+}
+
+#[inline]
+fn component_inverse_link_derivatives5(component: LinkComponent, eta: f64) -> [f64; 6] {
+    match component {
+        LinkComponent::Logit => {
+            let jet = logit_inverse_link_jet5(eta);
+            [jet.mu, jet.d1, jet.d2, jet.d3, jet.d4, jet.d5]
+        }
+        _ => {
+            let jet = component_inverse_link_jet(component, eta);
+            [
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                component_inverse_link_pdfthird_derivative(component, eta),
+                component_inverse_link_pdffourth_derivative(component, eta),
+            ]
         }
     }
+}
+
+#[inline]
+fn bernoulli_fisher_weight_jet5_from_mu_derivatives(mu_d: [f64; 6]) -> (f64, f64, f64, f64, f64) {
+    if mu_d.iter().any(|v| v.is_nan()) {
+        return (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
+    }
+    if !mu_d.iter().all(|v| v.is_finite()) {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let p = mu_d[0];
+    let q = 1.0 - p;
+    if !(p > 0.0) || !(q > 0.0) || p * q <= 0.0 {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    let factorial = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
+    let mut p_t = [0.0_f64; 5];
+    let mut q_t = [0.0_f64; 5];
+    let mut dmu_t = [0.0_f64; 5];
+    for k in 0..5 {
+        let inv_fact = 1.0 / factorial[k];
+        p_t[k] = mu_d[k] * inv_fact;
+        q_t[k] = if k == 0 { q } else { -mu_d[k] * inv_fact };
+        dmu_t[k] = mu_d[k + 1] * inv_fact;
+    }
+
+    let num_t = taylor5_mul(&dmu_t, &dmu_t);
+    let den_t = taylor5_mul(&p_t, &q_t);
+    if !(den_t[0] > 0.0) {
+        return (0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    let w_t = taylor5_mul(&num_t, &taylor5_inv(&den_t));
+    (
+        canonicalzero(w_t[0] * factorial[0]),
+        canonicalzero(w_t[1] * factorial[1]),
+        canonicalzero(w_t[2] * factorial[2]),
+        canonicalzero(w_t[3] * factorial[3]),
+        canonicalzero(w_t[4] * factorial[4]),
+    )
+}
+
+#[inline]
+fn component_fisher_weight_jet5(component: LinkComponent, eta: f64) -> (f64, f64, f64, f64, f64) {
+    bernoulli_fisher_weight_jet5_from_mu_derivatives(component_inverse_link_derivatives5(
+        component, eta,
+    ))
 }
 
 /// Probit Bernoulli Fisher-weight 5-jet `W = phi^2 / (Phi (1 - Phi))` and its
@@ -2385,6 +2450,63 @@ mod tests {
         assert!((j0.d1 - d1fd).abs() < 5e-5);
         assert!((j0.d2 - d2fd).abs() < 5e-5);
         assert!((j0.d3 - d3fd).abs() < 2e-4);
+    }
+
+    fn bernoulli_fisher_weight_for_component(component: LinkComponent, eta: f64) -> f64 {
+        let jet = component_inverse_link_jet(component, eta);
+        jet.d1 * jet.d1 / (jet.mu * (1.0 - jet.mu))
+    }
+
+    #[test]
+    fn cloglog_fisher_weight_jet5_is_live_and_matches_local_taylor_series() {
+        let points = [-1.4, -0.2, 0.8];
+        let h = 1e-4_f64;
+
+        for &eta in &points {
+            let (w0, w1, w2, w3, w4) = fisher_weight_jet5(StandardLink::CLogLog, eta);
+            assert!(
+                w0.is_finite() && w0 > 0.0,
+                "dead CLogLog weight at eta={eta}: {w0}"
+            );
+            assert!(w1.is_finite());
+            assert!(w2.is_finite());
+            assert!(w3.is_finite());
+            assert!(w4.is_finite());
+            assert!(
+                (w0 - bernoulli_fisher_weight_for_component(LinkComponent::CLogLog, eta)).abs()
+                    < 1e-14,
+                "CLogLog Fisher weight value should equal mu'^2 / (mu(1-mu)) at eta={eta}"
+            );
+
+            let actual = bernoulli_fisher_weight_for_component(LinkComponent::CLogLog, eta + h);
+            let predicted =
+                w0 + w1 * h + 0.5 * w2 * h * h + w3 * h.powi(3) / 6.0 + w4 * h.powi(4) / 24.0;
+            assert!(
+                (actual - predicted).abs() < 1e-10,
+                "CLogLog Fisher-weight Taylor jet mismatch at eta={eta}: actual={actual} predicted={predicted}"
+            );
+        }
+    }
+
+    #[test]
+    fn component_fisher_weight_jet5_covers_probability_link_components() {
+        for component in [
+            LinkComponent::CLogLog,
+            LinkComponent::LogLog,
+            LinkComponent::Cauchit,
+        ] {
+            let eta = 0.3;
+            let (w0, w1, w2, w3, w4) = component_fisher_weight_jet5(component, eta);
+            assert!(w0.is_finite() && w0 > 0.0, "{component:?} weight was {w0}");
+            assert!(w1.is_finite());
+            assert!(w2.is_finite());
+            assert!(w3.is_finite());
+            assert!(w4.is_finite());
+            assert!(
+                (w0 - bernoulli_fisher_weight_for_component(component, eta)).abs() < 1e-14,
+                "{component:?} Fisher weight value should equal mu'^2 / (mu(1-mu))"
+            );
+        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub mod orthogonal_reparam;
 pub mod outer_strategy;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
+pub(crate) mod priority_search;
 pub mod protocol;
 pub mod reml_compare;
 pub mod riemannian;
@@ -38,8 +39,10 @@ pub use evidence::{
     laplace_evidence, select_topology,
 };
 pub use topology_selector::{
-    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
-    TopologyAutoSelectorResult, select_topology_with_fit, tk_normalized_score,
+    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoRankedScreen,
+    TopologyAutoScreeningEvidence, TopologyAutoScreeningResult, TopologyAutoSelector,
+    TopologyAutoSelectorResult, screen_topology_candidates, select_topology_with_fit,
+    select_topology_with_screening, tk_normalized_score,
 };
 
 /// Process-wide counter of smoothing-corrections that took the sigma-cubature
