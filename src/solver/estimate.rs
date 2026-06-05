@@ -815,6 +815,12 @@ impl RemlConfig {
             .firth_general
     }
 
+    pub(crate) fn robust_identification_debug(
+        &self,
+    ) -> crate::solver::workflow::RobustIdentification {
+        self.robust_identification
+    }
+
     fn link_function(&self) -> LinkFunction {
         self.link_kind.link_function()
     }

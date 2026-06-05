@@ -4266,6 +4266,12 @@ impl<'a> RemlState<'a> {
     /// leaving clean λ-selection unbiased (the zero-downside / information-limit
     /// reduction to plain REML).
     fn effective_rho_prior(&self) -> std::borrow::Cow<'_, RhoPrior> {
+        eprintln!(
+            "DBG_EFF_RHO firth_general={} rho_prior={:?} robust={:?}",
+            self.config.firth_general(),
+            self.rho_prior,
+            self.config.robust_identification_debug()
+        );
         resolve_effective_rho_prior(self.config.firth_general(), &self.rho_prior)
     }
 

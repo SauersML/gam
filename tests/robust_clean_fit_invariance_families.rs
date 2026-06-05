@@ -509,6 +509,8 @@ fn clean_fit_invariance_survival_lognormal() {
 /// coefficient / fitted-probability / edf deltas are within the same tight
 /// `assert_zero_downside`-style band.
 #[test]
+#[ignore = "multinomial robustness flag not yet wired (no `robust_identification` on \
+            MultinomialFitInputs); un-ignore when the policy is threaded — see doc comment above"]
 fn clean_fit_invariance_multinomial_softmax() {
     init_parallelism();
     // Intentionally empty: see the doc comment. Filling this in before the flag
