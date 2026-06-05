@@ -206,7 +206,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-
     pub(crate) fn weighted_cross(
         left: &Array2<f64>,
         right: &Array2<f64>,
@@ -2825,12 +2824,8 @@ mod tests {
         let beta = array![0.2, -0.45, 0.25];
         let observation_weights = array![1.0, 0.5, 2.0, 1.5, 0.75];
         let eta = x.dot(&beta);
-        let op = build_weighted_logit_firth_dense_operator(
-            &x,
-            &eta,
-            observation_weights.view(),
-        )
-        .expect("weighted firth operator");
+        let op = build_weighted_logit_firth_dense_operator(&x, &eta, observation_weights.view())
+            .expect("weighted firth operator");
         let grad = op.jeffreys_beta_gradient();
         let h = 1e-6;
 
@@ -2924,9 +2919,13 @@ mod tests {
         let eta = x.dot(&beta);
 
         let historical = build_logit_firth_dense_operator(&x, &eta).expect("historical logit");
-        let link_general =
-            FirthDenseOperator::build_with_observation_weights_impl(StandardLink::Logit, &x, &eta, None)
-                .expect("link-general logit");
+        let link_general = FirthDenseOperator::build_with_observation_weights_impl(
+            StandardLink::Logit,
+            &x,
+            &eta,
+            None,
+        )
+        .expect("link-general logit");
 
         assert_eq!(
             historical.jeffreys_logdet(),
@@ -3195,12 +3194,8 @@ mod tests {
             );
         }
 
-        let op = build_weighted_logit_firth_dense_operator(
-            &x,
-            &eta,
-            observation_weights.view(),
-        )
-        .expect("original firth operator");
+        let op = build_weighted_logit_firth_dense_operator(&x, &eta, observation_weights.view())
+            .expect("original firth operator");
         let op_reparameterized = build_weighted_logit_firth_dense_operator(
             &x_reparameterized,
             &eta_reparameterized,
@@ -3233,12 +3228,8 @@ mod tests {
         let beta = array![0.25, -0.5];
         let eta = x.dot(&beta);
         let observation_weights = array![1.0, 0.5, 1.75, 0.9, 1.2];
-        let op = build_weighted_logit_firth_dense_operator(
-            &x,
-            &eta,
-            observation_weights.view(),
-        )
-        .expect("firth operator");
+        let op = build_weighted_logit_firth_dense_operator(&x, &eta, observation_weights.view())
+            .expect("firth operator");
 
         let reduced_metric = fast_atb(&op.x_reduced, &op.x_reduced);
         for i in 0..reduced_metric.nrows() {
@@ -3634,7 +3625,8 @@ mod tests {
         let h = 1e-5_f64;
         let fd_block = |x_eval: &Array2<f64>| -> Array2<f64> {
             let eta_e = x_eval.dot(&beta);
-            let op_e = build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed firth operator");
+            let op_e =
+                build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed firth operator");
             let x_tau_i_r = op_e.reduce_explicit_design(&x_tau_i);
             let deta_i_e = x_tau_i.dot(&beta);
             let (dot_i_i_e, dot_h_i_e) = op_e.dot_i_and_h_from_reduced(&x_tau_i_r, &deta_i_e);
@@ -3664,7 +3656,8 @@ mod tests {
         // double-cover the primitive.
         let fd_block_j = |x_eval: &Array2<f64>| -> Array2<f64> {
             let eta_e = x_eval.dot(&beta);
-            let op_e = build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed firth operator");
+            let op_e =
+                build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed firth operator");
             let x_tau_j_r = op_e.reduce_explicit_design(&x_tau_j);
             let deta_j_e = x_tau_j.dot(&beta);
             let (dot_i_j_e, dot_h_j_e) = op_e.dot_i_and_h_from_reduced(&x_tau_j_r, &deta_j_e);
@@ -3774,7 +3767,8 @@ mod tests {
         let h = 1e-5_f64;
         let single_tau_apply = |beta_eval: &Array1<f64>| -> Array2<f64> {
             let eta_e = x.dot(beta_eval);
-            let op_e = build_logit_firth_dense_operator(&x, &eta_e).expect("perturbed firth operator");
+            let op_e =
+                build_logit_firth_dense_operator(&x, &eta_e).expect("perturbed firth operator");
             let x_tau_r = op_e.reduce_explicit_design(&x_tau);
             let deta_e = x_tau.dot(beta_eval);
             let (dot_i_e, dot_h_e) = op_e.dot_i_and_h_from_reduced(&x_tau_r, &deta_e);
@@ -3865,8 +3859,8 @@ mod tests {
             let (w, w1, w2, _w3, _w4) =
                 crate::mixture_link::fisher_weight_jet5(StandardLink::Probit, eta);
             let ref_w = reference_probit_weight(eta);
-            let fd1 = (reference_probit_weight(eta + h) - reference_probit_weight(eta - h))
-                / (2.0 * h);
+            let fd1 =
+                (reference_probit_weight(eta + h) - reference_probit_weight(eta - h)) / (2.0 * h);
             let fd2 = (reference_probit_weight(eta + h) - 2.0 * reference_probit_weight(eta)
                 + reference_probit_weight(eta - h))
                 / (h * h);
