@@ -487,18 +487,51 @@ impl ParametricColumnConditioning {
         )))
     }
 
+    /// Map a constraint matrix from original (user-scale) coefficients to the
+    /// internally-conditioned coordinates the solver actually optimizes.
+    ///
+    /// Constraints are authored on the *original* design-column coefficients:
+    /// `A_orig · β_orig {≥,≤} b` (e.g. a `linear(x, min, max)` box pushes rows
+    /// `β_col ≥ min` and `β_col ≤ max`). The inner solve works with the
+    /// conditioned coefficients `β_int`, where the back-transform `β_orig = M·β_int`
+    /// is exactly the one implemented by [`Self::backtransform_beta`]:
+    ///
+    /// ```text
+    ///   β_orig[j]         = β_int[j] / scale_j                         (conditioned col j)
+    ///   β_orig[intercept] = β_int[intercept] − Σ_j (mean_j / scale_j) · β_int[j]
+    /// ```
+    ///
+    /// so `M[j][j] = 1/scale_j`, `M[intercept][j] = −mean_j/scale_j`, and `M` is
+    /// the identity elsewhere. Substituting into `A_orig · β_orig` gives the
+    /// equivalent internal constraint `A_int · β_int {≥,≤} b` with `A_int = A_orig·M`.
+    /// Only the conditioned columns of `A_int` differ from `A_orig`:
+    ///
+    /// ```text
+    ///   A_int[:, j] = (A_orig[:, j] − mean_j · A_orig[:, intercept]) / scale_j
+    /// ```
+    ///
+    /// The RHS `b` is unchanged, so [`Self::transform_linear_constraints_to_internal`]
+    /// carries it through verbatim. The previous implementation multiplied by
+    /// `scale_j` (the back-transform factor) instead of dividing — its transpose —
+    /// which let a box constraint escape its interval by exactly `1/scale_j²`, and
+    /// also mixed the intercept column with the wrong sign (harmless only because a
+    /// single-coefficient box has a zero intercept entry).
     fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
         let mut out = a_original.clone();
+        // The intercept column of M is `e_intercept`, so `A_orig[:, intercept]`
+        // is never rewritten; capture it once from the untouched input.
+        let intercept_col = self
+            .intercept_idx
+            .map(|idx| a_original.column(idx).to_owned());
         for &(j, mean, scale) in &self.columns {
-            let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
             let mut target = out.column_mut(j);
             if mean != 0.0
-                && let Some(intercept_col) = intercept_col
+                && let Some(intercept_col) = intercept_col.as_ref()
             {
-                target += &(intercept_col * mean);
+                target -= &(intercept_col * mean);
             }
             if scale != 1.0 {
-                target.mapv_inplace(|v| v * scale);
+                target.mapv_inplace(|v| v / scale);
             }
         }
         out
@@ -7484,6 +7517,65 @@ mod estimate_policy_tests {
         assert_eq!(cfg.risk_profile, SeedRiskProfile::GeneralizedLinear);
         assert!(cfg.max_seeds > 1);
         assert_eq!(cfg.seed_budget, 1);
+    }
+
+    #[test]
+    fn constraint_matrix_internal_transform_equals_backtransform_composition() {
+        // Conditioning: intercept at col 0, a centered+scaled col 1
+        // (mean=0.37, scale=2.5), and a plain unconditioned col 2.
+        let conditioning = ParametricColumnConditioning {
+            intercept_idx: Some(0),
+            columns: vec![(1, 0.37, 2.5)],
+        };
+
+        // Constraint matrix authored on the ORIGINAL (user-scale) coefficients.
+        // Row 0/1 are a pure box on β1 (β1 ≥ ·, β1 ≤ ·) with a *zero* intercept
+        // entry — the case the old `+mean·scale` bug still mangled via the scale
+        // power. Row 2 genuinely touches the intercept column, exercising the
+        // mean-mixing term that a single-coefficient box leaves at zero (so it
+        // also pins the sign of that term).
+        let a_orig = array![
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [1.0, 0.5, -3.0],
+        ];
+        let a_int = conditioning.transform_constraint_matrix_to_internal(&a_orig);
+
+        // The defining invariant: A_int·β_int must equal A_orig·β_orig for the
+        // β_orig the solver will actually report, i.e. A_int = A_orig·M where
+        // β_orig = M·β_int = backtransform_beta(β_int). Anything else lets the
+        // user-scale coefficient escape the box it satisfies internally.
+        for beta_int in [
+            array![0.3, 2.0, -1.5],
+            array![-1.1, 4.7, 0.9],
+            array![0.0, 1.0, 0.0],
+        ] {
+            let beta_orig = conditioning.backtransform_beta(&beta_int);
+            let lhs_int = a_int.dot(&beta_int);
+            let lhs_orig = a_orig.dot(&beta_orig);
+            for k in 0..lhs_int.len() {
+                assert!(
+                    (lhs_int[k] - lhs_orig[k]).abs() < 1e-12,
+                    "row {k}: internal constraint value {} != original-at-backtransform {} \
+                     — A_int must equal A_orig·M",
+                    lhs_int[k],
+                    lhs_orig[k]
+                );
+            }
+        }
+
+        // Pin the box-escape mechanism directly: a pure `β1 ≤ ub` becomes
+        // `(1/scale)·β1_int ≤ ub` internally, so the active-set row entry is
+        // 1/scale (= 0.4), NOT scale (= 2.5, the old `1/scale²` escape).
+        assert!(
+            (a_int[[1, 1]] - (-1.0 / 2.5)).abs() < 1e-12,
+            "internal box row entry is {}, expected -1/scale = -0.4",
+            a_int[[1, 1]]
+        );
+        // The intercept column (M's identity column) and plain column are
+        // carried through untouched.
+        assert_eq!(a_int[[2, 0]], 1.0);
+        assert_eq!(a_int[[2, 2]], -3.0);
     }
 
     #[test]
