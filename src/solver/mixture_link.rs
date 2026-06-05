@@ -295,6 +295,26 @@ pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64
     }
 }
 
+pub(crate) fn fisher_weight_jet5_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<(f64, f64, f64, f64, f64), EstimationError> {
+    match link {
+        InverseLink::Standard(link) => Ok(fisher_weight_jet5(*link, eta)),
+        InverseLink::LatentCLogLog(_)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => {
+            let jet = link.jet(eta)?;
+            let d4 = inverse_link_pdfthird_derivative_for_inverse_link(link, eta)?;
+            let d5 = inverse_link_pdffourth_derivative_for_inverse_link(link, eta)?;
+            Ok(fisher_weight_jet5_from_inverse_link_derivatives(
+                jet.mu, jet.d1, jet.d2, jet.d3, d4, d5,
+            ))
+        }
+    }
+}
+
 #[inline]
 fn component_fisher_weight_jet5(component: LinkComponent, eta: f64) -> (f64, f64, f64, f64, f64) {
     let jet = component_inverse_link_jet(component, eta);

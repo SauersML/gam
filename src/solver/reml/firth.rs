@@ -1,7 +1,7 @@
 use super::*;
 use crate::linalg::utils::enforce_symmetry;
-use crate::mixture_link::fisher_weight_jet5;
-use crate::types::StandardLink;
+use crate::mixture_link::fisher_weight_jet5_for_inverse_link;
+use crate::types::InverseLink;
 use ndarray::Zip;
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
@@ -75,13 +75,16 @@ impl<'a> RemlState<'a> {
         super::assembly::row_scale_dense_in_place_by_inverse_positive_or_zero(out, scale);
     }
 
-    /// GLM Fisher working-weight 5-jet for the requested standard link. For
-    /// `StandardLink::Logit` this is byte-identical to the historical
+    /// GLM Fisher working-weight 5-jet for the requested inverse link. For
+    /// standard Logit this is byte-identical to the historical
     /// `logit_inverse_link_jet5(eta).d1..d5` path that the Firth operator used
-    /// before the weights were generalized to arbitrary standard links.
+    /// before the weights were generalized to arbitrary inverse links.
     #[inline]
-    fn fisher_weight_derivatives(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
-        fisher_weight_jet5(link, eta)
+    fn fisher_weight_derivatives(
+        link: &InverseLink,
+        eta: f64,
+    ) -> Result<(f64, f64, f64, f64, f64), EstimationError> {
+        fisher_weight_jet5_for_inverse_link(link, eta)
     }
 
     #[inline]
@@ -157,14 +160,14 @@ impl<'a> RemlState<'a> {
     }
 
     fn fill_fisher_weight_derivative_arrays(
-        link: StandardLink,
+        link: &InverseLink,
         eta: &Array1<f64>,
         w: &mut Array1<f64>,
         w1: &mut Array1<f64>,
         w2: &mut Array1<f64>,
         w3: &mut Array1<f64>,
         w4: &mut Array1<f64>,
-    ) {
+    ) -> Result<(), EstimationError> {
         assert_eq!(eta.len(), w.len());
         assert_eq!(eta.len(), w1.len());
         assert_eq!(eta.len(), w2.len());
@@ -172,38 +175,36 @@ impl<'a> RemlState<'a> {
         assert_eq!(eta.len(), w4.len());
 
         if Self::parallelize_firth_derivative_rows(eta.len()) {
-            Zip::from(w)
-                .and(w1)
-                .and(w2)
-                .and(w3)
-                .and(w4)
-                .and(eta.view())
-                .par_for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
-                    let (value, first, second, third, fourth) =
-                        Self::fisher_weight_derivatives(link, ei);
-                    *wi = value;
-                    *wi1 = first;
-                    *wi2 = second;
-                    *wi3 = third;
-                    *wi4 = fourth;
-                });
-        } else {
-            Zip::from(w)
-                .and(w1)
-                .and(w2)
-                .and(w3)
-                .and(w4)
-                .and(eta.view())
-                .for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
-                    let (value, first, second, third, fourth) =
-                        Self::fisher_weight_derivatives(link, ei);
-                    *wi = value;
-                    *wi1 = first;
-                    *wi2 = second;
-                    *wi3 = third;
-                    *wi4 = fourth;
-                });
+            let values: Result<Vec<_>, EstimationError> = eta
+                .par_iter()
+                .map(|&ei| Self::fisher_weight_derivatives(link, ei))
+                .collect();
+            for (i, (value, first, second, third, fourth)) in values?.into_iter().enumerate() {
+                w[i] = value;
+                w1[i] = first;
+                w2[i] = second;
+                w3[i] = third;
+                w4[i] = fourth;
+            }
+            return Ok(());
         }
+        Zip::from(w)
+            .and(w1)
+            .and(w2)
+            .and(w3)
+            .and(w4)
+            .and(eta.view())
+            .try_for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
+                let (value, first, second, third, fourth) =
+                    Self::fisher_weight_derivatives(link, ei)?;
+                *wi = value;
+                *wi1 = first;
+                *wi2 = second;
+                *wi3 = third;
+                *wi4 = fourth;
+                Ok::<(), EstimationError>(())
+            })?;
+        Ok(())
     }
 
     pub(crate) fn weighted_cross(
@@ -314,11 +315,10 @@ impl<'a> RemlState<'a> {
 
     /// Link-aware dense Firth/Jeffreys builder. The REML callsites resolve the
     /// Fisher-weight link via `reml_robust_jeffreys_link` and pass it here;
-    /// `StandardLink::Logit` reproduces the historical logit-pinned build
-    /// byte-for-byte, and the link-general Jeffreys path (probit, ...) flows
-    /// through with the resolved link.
+    /// standard Logit reproduces the historical logit-pinned build byte-for-byte,
+    /// and stateful links flow through the same inverse-link derivative path.
     pub(super) fn build_firth_dense_operator_for_link(
-        link: StandardLink,
+        link: &InverseLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: ndarray::ArrayView1<'_, f64>,
@@ -419,7 +419,7 @@ impl FirthDenseOperator {
     }
 
     pub(crate) fn build_for_link(
-        link: StandardLink,
+        link: &InverseLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
@@ -427,7 +427,7 @@ impl FirthDenseOperator {
     }
 
     pub(crate) fn build_with_observation_weights_for_link(
-        link: StandardLink,
+        link: &InverseLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: ndarray::ArrayView1<'_, f64>,
@@ -441,7 +441,7 @@ impl FirthDenseOperator {
     }
 
     fn build_with_observation_weights_impl(
-        link: StandardLink,
+        link: &InverseLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: Option<ndarray::ArrayView1<'_, f64>>,
@@ -535,7 +535,7 @@ impl FirthDenseOperator {
         let mut w4 = Array1::<f64>::zeros(n);
         RemlState::fill_fisher_weight_derivative_arrays(
             link, eta, &mut w, &mut w1, &mut w2, &mut w3, &mut w4,
-        );
+        )?;
         let basis_design = if let Some(scale) = observation_weight_sqrt.as_ref() {
             RemlState::row_scale(x_dense, scale)
         } else {
@@ -2671,6 +2671,7 @@ impl FirthDenseOperator {
 mod tests {
     use super::*;
     use crate::mixture_link::logit_inverse_link_jet5;
+    use crate::types::StandardLink;
     use ndarray::{Array1, Array2, array};
 
     fn build_logit_firth_dense_operator(
@@ -2678,7 +2679,7 @@ mod tests {
         eta: &Array1<f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
         FirthDenseOperator::build_with_observation_weights_impl(
-            StandardLink::Logit,
+            &InverseLink::Standard(StandardLink::Logit),
             x_dense,
             eta,
             None,
@@ -2691,7 +2692,7 @@ mod tests {
         observation_weights: ndarray::ArrayView1<'_, f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
         FirthDenseOperator::build_with_observation_weights_impl(
-            StandardLink::Logit,
+            &InverseLink::Standard(StandardLink::Logit),
             x_dense,
             eta,
             Some(observation_weights),
@@ -2860,8 +2861,13 @@ mod tests {
         beta: &Array1<f64>,
     ) -> FirthDenseOperator {
         let eta = x.dot(beta);
-        FirthDenseOperator::build_with_observation_weights_impl(link, x, &eta, None)
-            .expect("link-general firth operator")
+        FirthDenseOperator::build_with_observation_weights_impl(
+            &InverseLink::Standard(link),
+            x,
+            &eta,
+            None,
+        )
+        .expect("link-general firth operator")
     }
 
     fn link_firth_phi(link: StandardLink, x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
@@ -2920,7 +2926,7 @@ mod tests {
 
         let historical = build_logit_firth_dense_operator(&x, &eta).expect("historical logit");
         let link_general = FirthDenseOperator::build_with_observation_weights_impl(
-            StandardLink::Logit,
+            &InverseLink::Standard(StandardLink::Logit),
             &x,
             &eta,
             None,

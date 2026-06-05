@@ -1392,7 +1392,7 @@ impl<'a> RemlState<'a> {
                     Some(cached.as_ref().clone())
                 } else {
                     Some(Self::build_firth_dense_operator_for_link(
-                        jeffreys_link,
+                        &jeffreys_link,
                         x_dense,
                         &pirls_result.final_eta,
                         self.weights,
@@ -1400,7 +1400,7 @@ impl<'a> RemlState<'a> {
                 }
             } else {
                 Some(Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     x_dense,
                     &pirls_result.final_eta,
                     self.weights,
@@ -1807,7 +1807,7 @@ impl<'a> RemlState<'a> {
                     cached.as_ref().clone()
                 } else {
                     Self::build_firth_dense_operator_for_link(
-                        jeffreys_link,
+                        &jeffreys_link,
                         x_dense,
                         &pirls_result.final_eta,
                         self.weights,
@@ -1815,7 +1815,7 @@ impl<'a> RemlState<'a> {
                 }
             } else {
                 Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     x_dense,
                     &pirls_result.final_eta,
                     self.weights,
@@ -1908,7 +1908,7 @@ impl<'a> RemlState<'a> {
                     )
                     .map_err(EstimationError::InvalidInput)?;
                 Some(Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     x_dense_arc.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -2046,7 +2046,7 @@ impl<'a> RemlState<'a> {
                     )
                     .map_err(EstimationError::InvalidInput)?;
                 Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     x_dense_arc.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -2190,7 +2190,7 @@ impl<'a> RemlState<'a> {
                     .map_err(EstimationError::InvalidInput)?;
                     Some(std::sync::Arc::new(
                         Self::build_firth_dense_operator_for_link(
-                            jeffreys_link,
+                            &jeffreys_link,
                             x_dense_arc.as_ref(),
                             &pirls_result.final_eta,
                             self.weights,
@@ -2909,7 +2909,7 @@ mod tests {
 
         let firth_op = Arc::new(
             super::super::RemlState::build_firth_dense_operator_for_link(
-                crate::types::StandardLink::Logit,
+                &crate::types::InverseLink::Standard(crate::types::StandardLink::Logit),
                 &x,
                 &eta,
                 ndarray::Array1::ones(x.nrows()).view(),
@@ -2995,7 +2995,7 @@ mod tests {
         let eta = x.dot(&beta);
         let firth_op = Arc::new(
             super::super::RemlState::build_firth_dense_operator_for_link(
-                crate::types::StandardLink::Logit,
+                &crate::types::InverseLink::Standard(crate::types::StandardLink::Logit),
                 &x,
                 &eta,
                 ndarray::Array1::ones(x.nrows()).view(),

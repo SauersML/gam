@@ -1465,38 +1465,43 @@ fn reml_supports_firth(likelihood: &GlmLikelihoodSpec) -> bool {
         && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
 }
 
-/// Standard link of a Binomial family for which a Fisher-weight jet
-/// (`fisher_weight_jet5`) exists, i.e. the links the link-general Jeffreys term
-/// can regularize. Currently `{Logit, Probit, CLogLog}`. Returns `None` for any other
-/// response or link.
+/// Inverse link of a Binomial family for which a Fisher-weight jet exists, i.e.
+/// the links the link-general Jeffreys term can regularize. This includes
+/// standard `{Logit, Probit, CLogLog}` and stateful links whose fourth/fifth
+/// inverse-link derivatives are available, including mixture LogLog/Cauchit
+/// components. Returns `None` for any other response or link.
 #[inline]
-fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<StandardLink> {
+fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<InverseLink> {
     let spec = reml_spec(likelihood);
     if !matches!(spec.response, ResponseFamily::Binomial) {
         return None;
     }
-    match spec.link {
-        InverseLink::Standard(link @ StandardLink::Logit)
-        | InverseLink::Standard(link @ StandardLink::Probit)
-        | InverseLink::Standard(link @ StandardLink::CLogLog) => Some(link),
+    match &spec.link {
+        InverseLink::Standard(
+            StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,
+        )
+        | InverseLink::LatentCLogLog(_)
+        | InverseLink::Sas(_)
+        | InverseLink::BetaLogistic(_)
+        | InverseLink::Mixture(_) => Some(spec.link.clone()),
         _ => None,
     }
 }
 
 /// Resolve whether the Jeffreys/Firth term should be assembled on the REML path
-/// and, if so, the standard link to evaluate the Fisher weight with.
+/// and, if so, the inverse link to evaluate the Fisher weight with.
 ///
-/// Robustness is unconditionally on, so the gate covers every Binomial link with
-/// a closed-form Fisher-weight jet (logit + probit). The legacy
+/// Robustness is unconditionally on, so the gate covers every Binomial inverse
+/// link with a Fisher-weight jet. The legacy
 /// `firth_bias_reduction` flag remains a fallback for any Firth-supporting
 /// likelihood the closed-form jet does not yet cover (resolved on Logit).
 #[inline]
-pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<StandardLink> {
+pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLink> {
     if let Some(link) = reml_jeffreys_supported_link(&config.likelihood) {
         return Some(link);
     }
     if config.firth_bias_reduction && reml_supports_firth(&config.likelihood) {
-        return Some(StandardLink::Logit);
+        return Some(InverseLink::Standard(StandardLink::Logit));
     }
     None
 }
@@ -3234,7 +3239,7 @@ impl<'a> RemlState<'a> {
                 } else {
                     Some(std::sync::Arc::new(
                         Self::build_firth_dense_operator_for_link(
-                            jeffreys_link,
+                            &jeffreys_link,
                             x_dense.as_ref(),
                             &pirls_result.final_eta,
                             self.weights,
@@ -3380,7 +3385,7 @@ impl<'a> RemlState<'a> {
         let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
             Some(std::sync::Arc::new(
                 Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     &x_eff_dense,
                     &pirls_result.final_eta,
                     self.weights,
@@ -6050,7 +6055,7 @@ impl<'a> RemlState<'a> {
                 .map_err(EstimationError::InvalidInput)?;
                 let firth_build_start = std::time::Instant::now();
                 let firth_op = Arc::new(Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     x_dense.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -6208,7 +6213,7 @@ impl<'a> RemlState<'a> {
                     )
                     .map_err(EstimationError::InvalidInput)?;
                 Some(Arc::new(Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     x_dense.as_ref(),
                     &pirls_result.final_eta,
                     self.weights,
@@ -7988,7 +7993,7 @@ impl<'a> RemlState<'a> {
             }
             return Ok(Some(std::sync::Arc::new(
                 Self::build_firth_dense_operator_for_link(
-                    jeffreys_link,
+                    &jeffreys_link,
                     &x_projected,
                     &pirls_result.final_eta,
                     self.weights,
@@ -8003,7 +8008,7 @@ impl<'a> RemlState<'a> {
         let x_dense = pirls_result.x_transformed.to_dense();
         Ok(Some(std::sync::Arc::new(
             Self::build_firth_dense_operator_for_link(
-                jeffreys_link,
+                &jeffreys_link,
                 &x_dense,
                 &pirls_result.final_eta,
                 self.weights,
@@ -8146,7 +8151,7 @@ impl<'a> RemlState<'a> {
                     .map_err(EstimationError::InvalidInput)?;
                 Some(std::sync::Arc::new(
                     Self::build_firth_dense_operator_for_link(
-                        jeffreys_link,
+                        &jeffreys_link,
                         x_dense.as_ref(),
                         &pirls_result.final_eta,
                         self.weights,

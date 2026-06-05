@@ -19861,7 +19861,7 @@ mod tests {
         let eta = array![0.0, 0.4, -0.2];
         let firth_op = std::sync::Arc::new(
             super::super::RemlState::build_firth_dense_operator_for_link(
-                crate::types::StandardLink::Logit,
+                &crate::types::InverseLink::Standard(crate::types::StandardLink::Logit),
                 &x,
                 &eta,
                 ndarray::Array1::ones(x.nrows()).view(),
