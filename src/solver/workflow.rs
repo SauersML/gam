@@ -7864,55 +7864,71 @@ mod tests {
                 ColumnKindTag::Binary,
             ],
         };
-        let config = FitConfig {
-            survival_likelihood: "marginal-slope".to_string(),
-            logslope_formula: Some("matern(PC1, PC2, PC3, centers=6)".to_string()),
-            z_column: Some("z".to_string()),
-            ..FitConfig::default()
-        };
-
-        let materialized = materialize(
-            "Surv(t0, t1, event) ~ matern(PC1, PC2, PC3, centers=6) + sex",
-            &data,
-            &config,
-        )
-        .expect("survival marginal-slope materialization should keep block-local penalties");
-        let FitRequest::SurvivalMarginalSlope(request) = materialized.request else {
-            panic!("expected survival marginal-slope request");
-        };
-        let specs = vec![
-            request.spec.marginalspec.clone(),
-            request.spec.logslopespec.clone(),
-        ];
-        let (designs, frozen_specs) =
-            crate::smooth::build_term_collection_designs_and_freeze_joint(
-                data.values.view(),
-                &specs,
-            )
-            .expect("joint freeze should preserve per-block penalty geometry");
-        let (rebuilt, _) = crate::smooth::build_term_collection_designs_and_freeze_joint(
-            data.values.view(),
-            &frozen_specs,
-        )
-        .expect("frozen rebuild should preserve per-block penalty geometry");
-
-        for (label, design) in [
-            ("raw marginal", &designs[0]),
-            ("raw logslope", &designs[1]),
-            ("frozen marginal", &rebuilt[0]),
-            ("frozen logslope", &rebuilt[1]),
+        for (case, formula) in [
+            (
+                "with parametric sex term",
+                "Surv(t0, t1, event) ~ matern(PC1, PC2, PC3, centers=6) + sex",
+            ),
+            (
+                "without parametric sex term",
+                "Surv(t0, t1, event) ~ matern(PC1, PC2, PC3, centers=6)",
+            ),
         ] {
-            let width = design.design.ncols();
-            assert!(
-                width > 2,
-                "{label} design should be surface-width, not sex/intercept-width; width={width}"
-            );
-            for (idx, penalty) in design.penalties_as_penalty_matrix().iter().enumerate() {
-                assert_eq!(
-                    penalty.shape(),
-                    (width, width),
-                    "{label} penalty {idx} must be block-local at the surface width"
+            let config = FitConfig {
+                survival_likelihood: "marginal-slope".to_string(),
+                logslope_formula: Some("matern(PC1, PC2, PC3, centers=6)".to_string()),
+                z_column: Some("z".to_string()),
+                ..FitConfig::default()
+            };
+
+            let materialized = materialize(formula, &data, &config).unwrap_or_else(|err| {
+                panic!(
+                    "survival marginal-slope materialization should keep block-local penalties \
+                     {case}: {err}"
+                )
+            });
+            let FitRequest::SurvivalMarginalSlope(request) = materialized.request else {
+                panic!("expected survival marginal-slope request for {case}");
+            };
+            let specs = vec![
+                request.spec.marginalspec.clone(),
+                request.spec.logslopespec.clone(),
+            ];
+            let (designs, frozen_specs) =
+                crate::smooth::build_term_collection_designs_and_freeze_joint(
+                    data.values.view(),
+                    &specs,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("joint freeze should preserve per-block penalty geometry {case}: {err}")
+                });
+            let (rebuilt, _) = crate::smooth::build_term_collection_designs_and_freeze_joint(
+                data.values.view(),
+                &frozen_specs,
+            )
+            .unwrap_or_else(|err| {
+                panic!("frozen rebuild should preserve per-block penalty geometry {case}: {err}")
+            });
+
+            for (label, design) in [
+                ("raw marginal", &designs[0]),
+                ("raw logslope", &designs[1]),
+                ("frozen marginal", &rebuilt[0]),
+                ("frozen logslope", &rebuilt[1]),
+            ] {
+                let width = design.design.ncols();
+                assert!(
+                    width > 2,
+                    "{case}: {label} design should be surface-width, not sex/intercept-width; \
+                     width={width}"
                 );
+                for (idx, penalty) in design.penalties_as_penalty_matrix().iter().enumerate() {
+                    assert_eq!(
+                        penalty.shape(),
+                        (width, width),
+                        "{case}: {label} penalty {idx} must be block-local at the surface width"
+                    );
+                }
             }
         }
     }
