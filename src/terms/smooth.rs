@@ -19685,7 +19685,6 @@ mod tests {
     };
     use crate::estimate::AdaptiveRegularizationOptions;
     use crate::faer_ndarray::{FaerEigh, FaerSvd};
-    use crate::matrix::FactorizedSystem;
     use ndarray::{Axis, array};
     use rand::RngExt;
     use rand::SeedableRng;
@@ -26565,7 +26564,7 @@ mod tests {
         let chol = precision
             .cholesky(faer::Side::Lower)
             .expect("bounded user precision cholesky");
-        let solved = chol.solvemulti(&Array2::eye(covariance.nrows()));
+        let solved = chol.solve_mat(&Array2::eye(covariance.nrows()));
         for i in 0..solved.nrows() {
             for j in 0..solved.ncols() {
                 assert!(
