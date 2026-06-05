@@ -11858,19 +11858,18 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         }
         _ => false,
     };
-    let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h
-        && !outer_jeffreys_precheck_skips
-    {
-        match build_joint_jeffreys_subspace(specs, &ranges)? {
-            Some(z_joint) => {
-                custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
-                    .map(|(_phi, _grad, hphi)| hphi)
+    let logdet_jeffreys_hphi: Option<Array2<f64>> =
+        if include_logdet_h && !outer_jeffreys_precheck_skips {
+            match build_joint_jeffreys_subspace(specs, &ranges)? {
+                Some(z_joint) => {
+                    custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
+                        .map(|(_phi, _grad, hphi)| hphi)
+                }
+                None => None,
             }
-            None => None,
-        }
-    } else {
-        None
-    };
+        } else {
+            None
+        };
     let compute_block_logdet_term = |b: usize| -> Result<(Array2<f64>, f64), String> {
         let spec = &specs[b];
         let (start, end) = ranges[b];
@@ -14388,13 +14387,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // and trial-value calls; the conditioning changes slowly across cycles
             // so re-estimating per cycle (one `O(p·k)` burst) is already cheap
             // against the work it guards.
-            let jeffreys_skippable_this_cycle: bool =
-                if joint_jeffreys_subspace.is_some() {
-                    jeffreys_term_skippable_for_source(&joint_hessian_source, total_p)
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
+            let jeffreys_skippable_this_cycle: bool = if joint_jeffreys_subspace.is_some() {
+                jeffreys_term_skippable_for_source(&joint_hessian_source, total_p).unwrap_or(false)
+            } else {
+                false
+            };
             let joint_trust_metric_diag = match &joint_hessian_source {
                 JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                     &h_joint.diag().to_owned(),
@@ -15696,7 +15693,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let Some(gradient) = cached_joint_gradient.as_ref() else {
                 break;
             };
-            let jeffreys_augmented_gradient: Option<Array1<f64>> = if jeffreys_skippable_this_cycle {
+            let jeffreys_augmented_gradient: Option<Array1<f64>> = if jeffreys_skippable_this_cycle
+            {
                 // Well-conditioned ⇒ ∇Φ = 0, so the KKT residual is the bare
                 // stationarity (and floors at 0, not ‖∇Φ‖) — matching the step,
                 // which folded H_Φ=0/∇Φ=0 this cycle. Avoids the dense H/eigh.
@@ -18073,7 +18071,11 @@ struct JeffreysHphiAwareJointDerivatives<'a> {
 }
 
 impl<'a> JeffreysHphiAwareJointDerivatives<'a> {
-    fn new(inner: Box<dyn HessianDerivativeProvider + 'a>, drift: JeffreysHphiDriftFn, p: usize) -> Self {
+    fn new(
+        inner: Box<dyn HessianDerivativeProvider + 'a>,
+        drift: JeffreysHphiDriftFn,
+        p: usize,
+    ) -> Self {
         Self { inner, drift, p }
     }
 
@@ -21262,18 +21264,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 hessian_workspace.clone(),
                 eval_mode,
             )?,
-            custom_family_outer_jeffreys_hphi(
-                family,
-                &inner.block_states,
-                specs,
-                &ranges,
-            )?,
-            custom_family_outer_jeffreys_hphi_drift(
-                family,
-                &inner.block_states,
-                specs,
-                &ranges,
-            )?,
+            custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
+            custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
         )?;
 
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
@@ -21297,8 +21289,13 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
     // standard joint_outer_evaluate path below and only the gradient is
     // replaced. See `BatchedOuterGradientTerms`.
     let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
+    let robust_jeffreys_hphi =
+        custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
+    let batched_gradient_contract_allows_override =
+        batched_outer_gradient_contract_allows_override(robust_jeffreys_hphi.as_ref());
     let mut batched_gradient_override: Option<Array1<f64>> = None;
     if !has_configured_rho_prior
+        && batched_gradient_contract_allows_override
         && (eval_mode == EvalMode::ValueAndGradient || eval_mode == EvalMode::ValueGradientHessian)
     {
         let beta_flat_for_batch = flatten_state_betas(&inner.block_states, specs);
@@ -21407,12 +21404,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         None,
                         None,
                         None,
-                        custom_family_outer_jeffreys_hphi(
-                            family,
-                            &inner.block_states,
-                            specs,
-                            &ranges,
-                        )?,
+                        robust_jeffreys_hphi.clone(),
                         // ValueOnly: the gradient is supplied separately below, so
                         // the H_Φ mode-response drift (a gradient-only term) is not
                         // needed here.
@@ -21496,18 +21488,8 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 inner.joint_workspace.clone(),
                 eval_mode,
             )?,
-            custom_family_outer_jeffreys_hphi(
-                family,
-                &inner.block_states,
-                specs,
-                &ranges,
-            )?,
-            custom_family_outer_jeffreys_hphi_drift(
-                family,
-                &inner.block_states,
-                specs,
-                &ranges,
-            )?,
+            custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
+            custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
         )?;
 
         let mut eval_result = eval_result;
@@ -21818,7 +21800,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             inner.joint_workspace.clone(),
             eval_mode,
         )?,
-        custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?,
+        robust_jeffreys_hphi,
         custom_family_outer_jeffreys_hphi_drift(family, &inner.block_states, specs, &ranges)?,
     )?;
 
@@ -22588,6 +22570,15 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     Ok(hphi)
 }
 
+fn batched_outer_gradient_contract_allows_override(
+    robust_jeffreys_hphi: Option<&Array2<f64>>,
+) -> bool {
+    match robust_jeffreys_hphi {
+        None => true,
+        Some(hphi) => hphi.iter().all(|value| *value == 0.0),
+    }
+}
+
 /// Build the Tier-B Jeffreys-curvature drift closure `D_β H_Φ[δβ]` for the outer
 /// gradient, evaluated at the current outer point (states = β̂(ρ)).
 ///
@@ -22645,10 +22636,8 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
             z_columns.view(),
             delta,
             |direction: &Array1<f64>| {
-                family_owned.exact_newton_joint_hessian_directional_derivative(
-                    &states_owned,
-                    direction,
-                )
+                family_owned
+                    .exact_newton_joint_hessian_directional_derivative(&states_owned, direction)
             },
             |u: &Array1<f64>, v: &Array1<f64>| {
                 family_owned.exact_newton_joint_hessiansecond_directional_derivative(
@@ -25229,6 +25218,26 @@ mod tests {
         assert!(
             not_selected.is_none(),
             "batched Hessian terms must not run for gradient-only evaluations"
+        );
+    }
+
+    #[test]
+    fn batched_outer_gradient_override_rejected_when_jeffreys_curvature_is_active() {
+        assert!(
+            batched_outer_gradient_contract_allows_override(None),
+            "released objective without robust Jeffreys curvature may use a family-owned batched gradient"
+        );
+
+        let zero_hphi = Array2::<f64>::zeros((2, 2));
+        assert!(
+            batched_outer_gradient_contract_allows_override(Some(&zero_hphi)),
+            "a gated zero Jeffreys curvature leaves the batched gradient contract unchanged"
+        );
+
+        let active_hphi = array![[0.0, 0.0], [0.0, 1.0e-6]];
+        assert!(
+            !batched_outer_gradient_contract_allows_override(Some(&active_hphi)),
+            "nonzero H_phi changes the logdet operator and needs the unified H_phi-aware gradient"
         );
     }
 
