@@ -1245,9 +1245,11 @@ impl LikelihoodSpec {
     ///
     /// - `Gaussian` and `Gamma` profile/estimate the scale jointly with the
     ///   mean, so no fixed `phi` is exposed here.
-    /// - `Binomial`, `Poisson`, `Tweedie`, and `NegativeBinomial` are
-    ///   unit-scale exponential-family fits (overdispersion in NB is encoded
-    ///   in `theta`, not in `phi`), so the contract is `Some(1.0)`.
+    /// - `Binomial`, `Poisson`, and `NegativeBinomial` are unit-scale
+    ///   exponential-family fits (overdispersion in NB is encoded in `theta`,
+    ///   not in `phi`), so the contract is `Some(1.0)`.
+    /// - `Tweedie` estimates `phi` from the fitted unit deviance; the seed
+    ///   contract is `Some(1.0)` until the final fit installs the estimate.
     /// - `Beta { phi }` carries its precision parameter directly on the family
     ///   variant; the contract returns that exact value rather than the
     ///   placeholder used elsewhere for unit-scale GLMs.
@@ -1260,8 +1262,8 @@ impl LikelihoodSpec {
             }
             ResponseFamily::Binomial
             | ResponseFamily::Poisson
-            | ResponseFamily::Tweedie { .. }
             | ResponseFamily::NegativeBinomial { .. } => Some(1.0),
+            ResponseFamily::Tweedie { .. } => Some(1.0),
             ResponseFamily::Beta { phi } => Some(phi),
         }
     }
@@ -1358,6 +1360,10 @@ pub enum LikelihoodScaleMetadata {
     ProfiledGaussian,
     /// Fixed exponential-dispersion parameter `phi`.
     FixedDispersion { phi: f64 },
+    /// Exponential-dispersion parameter `phi` estimated from fitted residual
+    /// deviance, used by families such as Tweedie where `phi` is a genuine
+    /// free dispersion rather than a structural constant.
+    EstimatedDispersion { phi: f64 },
     /// Fixed Gamma shape `k`, equivalent to `phi = 1 / k`.
     FixedGammaShape { shape: f64 },
     /// Gamma shape `k` estimated jointly with the mean model.
@@ -1479,8 +1485,8 @@ impl GlmLikelihoodSpec {
     ///   Fisher information.** Then `H = Xᵀ(W_sf/φ)X + S_λ` already equals the
     ///   true penalized Hessian (e.g. mgcv's `XᵀW_sfX/φ + S_λ` for Gamma), so
     ///   `Vb = H⁻¹` and the scale is exactly `1.0`. This is the case for Gamma
-    ///   (`W = prior·shape = prior/φ`), Tweedie (`W = prior·μ^{2−p}/φ`), Beta
-    ///   and Negative-Binomial (the working weight is the complete fixed-scale
+    ///   (`W = prior·shape = prior/φ`), Beta and Negative-Binomial (the working
+    ///   weight is the complete fixed-scale
     ///   Fisher information), and the fixed-scale exponential families
     ///   Poisson/Binomial (`φ ≡ 1`). Multiplying `H⁻¹` by the dispersion again
     ///   for any of these double-counts it and shrinks every SE by `√dispersion`.
@@ -1518,6 +1524,10 @@ impl GlmLikelihoodSpec {
             | LikelihoodScaleMetadata::EstimatedBetaPhi { .. }
             | LikelihoodScaleMetadata::EstimatedTweediePhi { .. }
             | LikelihoodScaleMetadata::Unspecified => 1.0,
+            // Estimated Tweedie dispersion is installed after the final
+            // unit-scale solve. The Hessian was not rebuilt with W/phi, so the
+            // covariance must be widened by phi here.
+            LikelihoodScaleMetadata::EstimatedDispersion { phi } => phi,
         }
     }
 
@@ -2193,7 +2203,33 @@ impl<'a> Deref for LogSmoothingParamsView<'a> {
 
 #[cfg(test)]
 mod ridge_policy_tests {
-    use super::{RidgePassport, RidgePolicy, StabilizationKind, StabilizationLedger};
+    use super::{
+        GlmLikelihoodSpec, LikelihoodScaleMetadata, LikelihoodSpec, RidgePassport, RidgePolicy,
+        StabilizationKind, StabilizationLedger,
+    };
+
+    #[test]
+    fn tweedie_defaults_to_estimated_dispersion_scale() {
+        let spec = LikelihoodSpec::tweedie_log(1.5);
+        assert_eq!(
+            spec.default_scale_metadata(),
+            LikelihoodScaleMetadata::EstimatedDispersion { phi: 1.0 },
+            "Tweedie phi is a fitted dispersion, not a structural unit scale"
+        );
+    }
+
+    #[test]
+    fn estimated_dispersion_scales_unit_hessian_covariance() {
+        let glm = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::tweedie_log(1.5),
+            scale: LikelihoodScaleMetadata::EstimatedDispersion { phi: 8.0 },
+        };
+        assert_eq!(
+            glm.coefficient_covariance_scale(1.0),
+            8.0,
+            "Tweedie final Hessian is built at unit scale, so estimated phi widens Vb"
+        );
+    }
 
     #[test]
     fn solver_only_ridge_policy_stays_off_objective_accounting() {
