@@ -452,7 +452,6 @@ fn clean_fit_invariance_survival_lognormal() {
     let run = |robust: RobustIdentification| -> CleanFit {
         let cfg = FitConfig {
             robust_identification: robust,
-            rho_prior: shared_rho_prior(),
             ..FitConfig::default()
         };
         let result =

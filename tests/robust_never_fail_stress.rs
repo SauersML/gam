@@ -37,7 +37,6 @@
 //! Deterministic: fixed-seed LCG, no time / unseeded RNG.
 
 use csv::StringRecord;
-use gam::types::RhoPrior;
 use gam::{
     FitConfig, FitResult, RobustIdentification, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
@@ -90,15 +89,12 @@ fn dataset(headers: &[&str], rows: Vec<Vec<String>>) -> gam::data::EncodedDatase
 }
 
 fn cfg(family: &str, robust: RobustIdentification) -> FitConfig {
+    // The formula path's default ρ-prior is `Normal{0,3}` (not the `Flat`
+    // sentinel), so the firth-general PC default does not fire on either arm —
+    // the robustness contrast isolates the Jeffreys curvature effect.
     FitConfig {
         family: Some(family.to_string()),
         robust_identification: robust,
-        // Explicit flat prior so the firth-general PC default does not confound
-        // the robustness contrast; we want the Jeffreys curvature effect alone.
-        rho_prior: RhoPrior::GammaPrecision {
-            shape: 1.0,
-            rate: 0.0,
-        },
         ..FitConfig::default()
     }
 }

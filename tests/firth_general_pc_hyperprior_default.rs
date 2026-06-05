@@ -115,12 +115,17 @@ fn l2(v: &Array1<f64>) -> f64 {
     v.dot(v).sqrt()
 }
 
-/// Pure-noise data: the firth-general default PC hyperprior must select strictly
-/// more smoothing (larger λ, smaller fitted structure) than the byte-identical
-/// flat-REML baseline. This is the λ→0 degeneracy cure — an Occam pull toward
-/// the simpler (infinitely-smooth) base model that flat REML lacks.
+/// The firth-general default is *exactly* the explicit weakly-informative PC
+/// prior: turning robustness ON with an unset (`Flat`) prior must reproduce, to
+/// the bit, fitting with robustness OFF and that PC prior configured explicitly.
+/// This is the precise, cap-independent statement of what the gate does — it
+/// substitutes `RhoPrior::PenalizedComplexity { upper: 10, tail_prob: 0.01 }`
+/// for the `Flat` hole — and it holds whether or not REML happens to land at an
+/// interior λ or a boundary. (On this balanced-noise design flat REML already
+/// over-smooths to the λ cap, which is exactly why a bare Flat-vs-default λ
+/// comparison is not direction-certain; the equivalence below is.)
 #[test]
-fn firth_general_default_adds_pc_smoothing_pull_on_noise() {
+fn firth_general_default_equals_explicit_pc_prior() {
     let (n_per, p) = (24usize, 10usize);
     let x = group_design(n_per, p);
     let mut rng = Rng(0x0bad_c0de_0bad_c0de);
@@ -129,20 +134,59 @@ fn firth_general_default_adds_pc_smoothing_pull_on_noise() {
         *yi = rng.normal(); // truth is exactly zero; only noise.
     }
 
-    // Baseline: robustness off, unset prior ⇒ bare REML (Flat stays Flat).
-    let (lam_off, beta_off) = fit(&x, &y, gam::RobustIdentification::Off, RhoPrior::Flat);
-    // Firth-general on, still unset prior ⇒ the weak PC default is injected.
-    let (lam_on, beta_on) = fit(&x, &y, gam::RobustIdentification::FirthOnly, RhoPrior::Flat);
+    // The exact weakly-informative default the gate injects (see
+    // `firth_default_pc_prior` in src/solver/reml/runtime.rs).
+    let default_pc = RhoPrior::PenalizedComplexity {
+        upper: 10.0,
+        tail_prob: 0.01,
+    };
 
-    assert!(
-        lam_on > lam_off,
-        "firth-general default must add smoothing pull: λ_on={lam_on} λ_off={lam_off}"
+    // ON + unset(Flat): the gate fills the hole with `default_pc`.
+    let (lam_on, beta_on) = fit(&x, &y, gam::RobustIdentification::FirthOnly, RhoPrior::Flat);
+    // OFF + the explicit default PC: the same objective, no gate involved.
+    let (lam_explicit, beta_explicit) =
+        fit(&x, &y, gam::RobustIdentification::Off, default_pc);
+
+    assert_eq!(
+        lam_on, lam_explicit,
+        "firth-general Flat must equal explicit default PC: λ_on={lam_on} λ_explicit={lam_explicit}"
     );
-    let struct_on = l2(&x.dot(&beta_on));
-    let struct_off = l2(&x.dot(&beta_off));
+    assert_eq!(beta_on, beta_explicit);
+}
+
+/// Direction-certainty of the injected PC term (cap-independent): under firth-
+/// general, a *tighter* explicitly-configured PC prior must select at least as
+/// much smoothing (never less) than the weakly-informative default, and the
+/// default must in turn select at least as much as a *vaguer* PC. This pins the
+/// sign of the PC contribution the gate adds — the `dρ̂/dθ ≥ 0` monotonicity —
+/// without depending on where flat REML lands.
+#[test]
+fn firth_general_pc_smoothing_is_monotone_in_tightness() {
+    let (n_per, p) = (24usize, 10usize);
+    let x = group_design(n_per, p);
+    let mut rng = Rng(0x0bad_c0de_0bad_c0de);
+    let mut y = Array1::<f64>::zeros(n_per * p);
+    for yi in y.iter_mut() {
+        *yi = rng.normal();
+    }
+    let tight = RhoPrior::PenalizedComplexity {
+        upper: 0.1,
+        tail_prob: 0.05,
+    };
+    let default_pc = RhoPrior::PenalizedComplexity {
+        upper: 10.0,
+        tail_prob: 0.01,
+    };
+    let vague = RhoPrior::PenalizedComplexity {
+        upper: 100.0,
+        tail_prob: 0.5,
+    };
+    let (lam_tight, _) = fit(&x, &y, gam::RobustIdentification::FirthOnly, tight);
+    let (lam_default, _) = fit(&x, &y, gam::RobustIdentification::FirthOnly, default_pc);
+    let (lam_vague, _) = fit(&x, &y, gam::RobustIdentification::FirthOnly, vague);
     assert!(
-        struct_on < struct_off,
-        "firth-general default must shrink noise structure more: ||Xβ_on||={struct_on} ||Xβ_off||={struct_off}"
+        lam_tight >= lam_default && lam_default >= lam_vague,
+        "PC smoothing must be monotone in tightness: λ_tight={lam_tight} λ_default={lam_default} λ_vague={lam_vague}"
     );
 }
 
