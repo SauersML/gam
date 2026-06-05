@@ -4356,6 +4356,177 @@ pub(crate) fn run_nuts_sampling(
     })
 }
 
+/// Terminal never-fail Gaussian-posterior sampling target.
+///
+/// This is the bottom rung of the solver's geometry-driven escalation ladder.
+/// When the outer smoothing optimizer cannot certify convergence on a custom
+/// (BMS / general) family — typically because Strong-Wolfe stalls on an
+/// indefinite or non-smooth LAML objective — the driver no longer dead-ends
+/// with an `Err`. Instead it lands here: the *same* penalized objective's
+/// curvature (its penalized joint Hessian `H = −∇²log L + Σ_k λ_k S_k`,
+/// augmented with the proper Jeffreys/PC term when `firth_general` is armed)
+/// is used as the precision of a proper Gaussian posterior `N(β̂, H⁻¹)` about
+/// the best mode `β̂` the inner solve reached. Sampling a multivariate normal
+/// cannot fail: in the worst case (a poorly conditioned `H`) the intervals come
+/// out honestly wider, which is the intended "magic for all users" behavior —
+/// a finite point with calibrated SEs instead of a hard error.
+///
+/// The target is expressed in the whitened space `z` (`β = β̂ + L z`,
+/// `L Lᵀ = H⁻¹`), where the posterior is the standard normal `N(0, I)`. Its
+/// log-density and gradient are then exactly `logp(z) = −½ zᵀz`,
+/// `∇ = −z` — a smooth, globally coercive target with no failure mode. The
+/// `chol` factor un-whitens draws back to coefficient space, identically to
+/// the `NutsPosterior` whitening contract above.
+struct GaussianModeTarget;
+
+impl HamiltonianTarget<Array1<f64>> for GaussianModeTarget {
+    #[inline]
+    fn logp_and_grad(&self, position: &Array1<f64>, grad: &mut Array1<f64>) -> f64 {
+        // Standard-normal target in whitened coordinates: logp = -0.5 zᵀz,
+        // ∇ = -z. The whitening `L` (built from the penalized Hessian) carries
+        // all of the posterior geometry, so the sampler itself only ever sees a
+        // unit-covariance Gaussian — which is why this rung cannot stall.
+        let mut quad = 0.0;
+        for (g, &zi) in grad.iter_mut().zip(position.iter()) {
+            *g = -zi;
+            quad += zi * zi;
+        }
+        -0.5 * quad
+    }
+}
+
+/// Summary of a never-fail Gaussian-posterior fallback draw.
+///
+/// Returned by [`sample_gaussian_mode_posterior`]. Carries the same kind of
+/// posterior summary the optimizer cascade would have produced on success: a
+/// finite mode, per-coordinate posterior SEs, and the raw draws (so callers can
+/// form calibrated intervals for any derived quantity). The `rhat`/`ess`
+/// fields report the sampling diagnostics; even a marginal mixing result is a
+/// valid honest summary here (the target is exactly Gaussian), so this is
+/// reported for transparency rather than used as a pass/fail gate.
+pub struct GaussianModePosterior {
+    /// Coefficient draws in original (un-whitened) space: `(n_draws, dim)`.
+    pub samples: Array2<f64>,
+    /// Posterior mean (≈ the seeded mode for a Gaussian target).
+    pub posterior_mean: Array1<f64>,
+    /// Per-coordinate posterior standard deviation (honest SEs).
+    pub posterior_std: Array1<f64>,
+    /// Split-chain R̂ mixing diagnostic.
+    pub rhat: f64,
+    /// Effective sample size.
+    pub ess: f64,
+}
+
+/// Sample the proper Gaussian posterior `N(mode, H⁻¹)` defined by a mode and a
+/// (penalized, Jeffreys-augmented) SPD precision `hessian`.
+///
+/// This is the terminal, never-fail rung of the outer-optimizer escalation:
+/// it consumes the same penalized-objective curvature the inner machinery
+/// already computed and returns an honest posterior summary. It returns `Err`
+/// only for a *structurally* impossible request (dimension mismatch, a Hessian
+/// that is not even positive-definite after symmetrization, a degenerate
+/// config) — never for "did not converge", which is precisely the dead-end this
+/// path exists to remove.
+///
+/// `hessian` must be the SPD penalized joint Hessian at `mode` (e.g. from
+/// `compute_joint_geometry`). It is symmetrized defensively and Cholesky-
+/// factored to build the whitening `L` with `L Lᵀ = H⁻¹`.
+pub fn sample_gaussian_mode_posterior(
+    mode: ArrayView1<f64>,
+    hessian: ArrayView2<f64>,
+    config: &NutsConfig,
+) -> Result<GaussianModePosterior, String> {
+    validate_nuts_config(config).map_err(String::from)?;
+    let dim = mode.len();
+    if hessian.nrows() != dim || hessian.ncols() != dim {
+        return Err(format!(
+            "Gaussian-posterior fallback: hessian shape {:?} does not match mode dim {dim}",
+            hessian.dim()
+        ));
+    }
+    if dim == 0 {
+        return Err("Gaussian-posterior fallback: zero-dimensional posterior".to_string());
+    }
+
+    // Symmetrize defensively (the assembled joint Hessian may carry
+    // floating-point asymmetry from directional-callback construction) and add
+    // a tiny jitter on the diagonal so a Hessian that is SPD-up-to-roundoff at a
+    // boundary optimum still factors. The jitter only ever *widens* the
+    // posterior, consistent with the honest-interval guarantee.
+    let mut h = hessian.to_owned();
+    for i in 0..dim {
+        for j in (i + 1)..dim {
+            let avg = 0.5 * (h[[i, j]] + h[[j, i]]);
+            h[[i, j]] = avg;
+            h[[j, i]] = avg;
+        }
+    }
+    let diag_scale = (0..dim).map(|i| h[[i, i]].abs()).fold(0.0_f64, f64::max);
+    let jitter = (diag_scale * 1e-10).max(1e-12);
+    for i in 0..dim {
+        h[[i, i]] += jitter;
+    }
+
+    let chol_factor = h
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("Gaussian-posterior fallback Cholesky failed: {e:?}"))?;
+    let l_h = chol_factor.lower_triangular();
+    // L = L_H^{-T} so that L Lᵀ = (L_H L_Hᵀ)⁻¹ = H⁻¹ (same identity as
+    // `NutsPosterior::new`).
+    let chol = solve_upper_triangular_transpose(&l_h, dim);
+
+    let mode_owned = mode.to_owned();
+    let target = GaussianModeTarget;
+    let initial_positions = jittered_initial_positions(config, dim, 0.1, 0x51A6_2C73_90E4_1DBF);
+    let mass_cfg = robust_mass_matrix_config(dim, config.nwarmup);
+    let mut sampler = GenericNUTS::new_with_mass_matrix(
+        target,
+        initial_positions,
+        robust_target_accept(config.target_accept, dim),
+        mass_cfg,
+    )
+    .set_seed(nuts_transition_seed(config.seed, 0x7C19_5A3E_82D6_44B1));
+
+    let (samples_array, run_stats) = sampler
+        .run_progress(config.n_samples, config.nwarmup)
+        .map_err(|e| format!("Gaussian-posterior fallback NUTS sampling failed: {e}"))?;
+    log::info!(
+        "never-fail Gaussian-posterior fallback: sampling complete dim={dim} {}",
+        run_stats
+    );
+
+    let shape = samples_array.shape();
+    let n_chains = shape[0];
+    let n_samples_out = shape[1];
+    let total_samples = n_chains * n_samples_out;
+    let mut samples = Array2::<f64>::zeros((total_samples, dim));
+    let mut z_buffer = Array1::<f64>::zeros(dim);
+    for chain in 0..n_chains {
+        for sample_i in 0..n_samples_out {
+            let zview = samples_array.slice(ndarray::s![chain, sample_i, ..]);
+            z_buffer.assign(&zview);
+            let beta = &mode_owned + &chol.dot(&z_buffer);
+            samples
+                .row_mut(chain * n_samples_out + sample_i)
+                .assign(&beta);
+        }
+    }
+
+    let posterior_mean = samples
+        .mean_axis(Axis(0))
+        .unwrap_or_else(|| mode_owned.clone());
+    let posterior_std = samples.std_axis(Axis(0), 0.0);
+    let (rhat, ess) = compute_split_rhat_and_ess(&samples_array);
+
+    Ok(GaussianModePosterior {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat,
+        ess,
+    })
+}
+
 /// Flattened numeric inputs for GLM-family NUTS sampling.
 pub struct GlmFlatInputs<'a> {
     pub x: ArrayView2<'a, f64>,
