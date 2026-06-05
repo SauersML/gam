@@ -1934,24 +1934,6 @@ impl BernoulliMarginalSlopeFamily {
         let logslope = &block_states[1];
         let logslope_ncols = self.logslope_design.ncols();
         if logslope_ncols > 0 && logslope.beta.len() != logslope_ncols {
-            {
-                use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/bms_dbg.log")
-                {
-                    let widths: Vec<usize> = block_states.iter().map(|b| b.beta.len()).collect();
-                    writeln!(
-                        f,
-                        "MISMATCH logslope_design.ncols={} marginal_design.ncols={} block_beta_lens={:?}",
-                        logslope_ncols,
-                        self.marginal_design.ncols(),
-                        widths,
-                    )
-                    .ok();
-                }
-            }
             return Err(format!(
                 "bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}",
                 logslope.beta.len(),
