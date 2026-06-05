@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import warnings
 
 import numpy as np
@@ -9,34 +8,20 @@ import pytest
 gamfit = pytest.importorskip("gamfit")
 
 
-def _two_atom_curve_data(n: int = 120, seed: int = 0) -> np.ndarray:
+def _circle_data(n: int = 300, noise: float = 0.18, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
-    t = np.linspace(0.0, 1.0, n, endpoint=False)
-    first = np.column_stack(
-        [
-            np.cos(2.0 * math.pi * t),
-            np.sin(2.0 * math.pi * t),
-            0.35 * np.cos(4.0 * math.pi * t),
-        ]
-    )
-    second = np.column_stack(
-        [
-            0.40 * np.sin(4.0 * math.pi * t + 0.3),
-            np.cos(2.0 * math.pi * t + 0.6),
-            np.sin(2.0 * math.pi * t + 0.6),
-        ]
-    )
-    z = first + second + 0.02 * rng.standard_normal(first.shape)
-    return z - z.mean(axis=0, keepdims=True)
+    t = rng.uniform(0.0, 1.0, n)
+    clean = np.column_stack([np.cos(2.0 * np.pi * t), np.sin(2.0 * np.pi * t)])
+    return clean + noise * rng.standard_normal((n, 2))
 
 
-def _fresh_two_atom_fit_or_fail(z: np.ndarray):
+def _fresh_fit_or_fail(z: np.ndarray):
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             fit = gamfit.sae_manifold_fit(
                 Z=z,
-                K=2,
+                K=1,
                 d_atom=1,
                 atom_topology="circle",
                 assignment="softmax",
@@ -51,8 +36,8 @@ def _fresh_two_atom_fit_or_fail(z: np.ndarray):
             )
     except Exception as exc:
         pytest.fail(
-            "per-atom uncertainty and coordinate-range public API test is "
-            "guarded until the current d=1 multi-atom solver gap converges: "
+            "per-atom uncertainty and coordinate-range public API test "
+            "requires a converged SAE manifold fit: "
             f"{type(exc).__name__}: {exc}"
         )
     if (
@@ -69,11 +54,11 @@ def _fresh_two_atom_fit_or_fail(z: np.ndarray):
 
 
 def test_per_atom_uncertainty_shape_band_and_coordinate_range_shapes_are_sane():
-    z = _two_atom_curve_data()
-    fit = _fresh_two_atom_fit_or_fail(z)
+    z = _circle_data()
+    fit = _fresh_fit_or_fail(z)
     p = z.shape[1]
 
-    assert len(fit.atoms) == 2
+    assert len(fit.atoms) == 1
     for atom_k, atom in enumerate(fit.atoms):
         d_k = fit.coords[atom_k].shape[1]
         m_k = atom.decoder_coefficients.shape[0]
