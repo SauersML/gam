@@ -270,7 +270,6 @@ def _build_fit_payload(
     scale_dimensions: bool | None,
     adaptive_regularization: bool | None,
     firth: bool | None,
-    robust_identification: str | None,
     noise_formula: str | None,
     noise_offset: str | None,
     flexible_link: bool | None,
@@ -305,7 +304,6 @@ def _build_fit_payload(
         "scale_dimensions": scale_dimensions,
         "adaptive_regularization": adaptive_regularization,
         "firth": firth,
-        "robust_identification": robust_identification,
         "noise_formula": noise_formula,
         "noise_offset": noise_offset,
         "flexible_link": flexible_link,
@@ -701,7 +699,6 @@ def fit(
     scale_dimensions: bool | None = ...,
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
-    robust_identification: str | None = ...,
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
@@ -744,7 +741,6 @@ def fit(
     scale_dimensions: bool | None = ...,
     adaptive_regularization: bool | None = ...,
     firth: bool | None = ...,
-    robust_identification: str | None = ...,
     noise_formula: str | None = ...,
     noise_offset: str | None = ...,
     flexible_link: bool | None = ...,
@@ -786,7 +782,6 @@ def fit(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
-    robust_identification: str | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
@@ -907,13 +902,6 @@ def fit(
         it off unless explicitly requested.
     firth:
         Enable Firth bias-reduced estimation. Corresponds to ``--firth``.
-    robust_identification:
-        Universal under-identification robustness policy: ``"off"`` (default),
-        ``"auto"``, or ``"force"``. When set, the solver applies link-general
-        Jeffreys/Firth regularization on the under-identified span and exact
-        orthogonalization of structural confounds. ``"off"`` leaves behavior
-        byte-identical to the released solver. Corresponds to
-        ``--robust-identification``.
     noise_formula:
         Wilkinson-style formula for the log-scale (dispersion) component,
         turning the fit into a location-scale GAMLSS where both the mean and
@@ -1039,7 +1027,6 @@ def fit(
             "scale_dimensions": scale_dimensions,
             "adaptive_regularization": adaptive_regularization,
             "firth": firth,
-            "robust_identification": robust_identification,
             "noise_formula": noise_formula,
             "noise_offset": noise_offset,
             "flexible_link": flexible_link,
@@ -1134,7 +1121,6 @@ def fit(
                 "scale_dimensions": scale_dimensions,
                 "adaptive_regularization": adaptive_regularization,
                 "firth": firth,
-                "robust_identification": robust_identification,
                 "precision_hyperpriors": precision_hyperpriors,
                 "fisher_rao_w": fisher_rao_w,
                 "latents": latents,
@@ -1226,7 +1212,6 @@ def fit(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
-        robust_identification=robust_identification,
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
@@ -1270,7 +1255,6 @@ def fit_array(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
-    robust_identification: str | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
@@ -1336,7 +1320,6 @@ def fit_array(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
-        robust_identification=robust_identification,
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
@@ -1465,7 +1448,6 @@ def validate_formula(
     scale_dimensions: bool | None = None,
     adaptive_regularization: bool | None = None,
     firth: bool | None = None,
-    robust_identification: str | None = None,
     noise_formula: str | None = None,
     noise_offset: str | None = None,
     flexible_link: bool | None = None,
@@ -1514,7 +1496,6 @@ def validate_formula(
         scale_dimensions=scale_dimensions,
         adaptive_regularization=adaptive_regularization,
         firth=firth,
-        robust_identification=robust_identification,
         noise_formula=noise_formula,
         noise_offset=noise_offset,
         flexible_link=flexible_link,
