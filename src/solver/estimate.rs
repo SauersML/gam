@@ -758,6 +758,9 @@ pub(crate) struct RemlConfig {
     max_iterations: usize,
     reml_convergence_tolerance: f64,
     firth_bias_reduction: bool,
+    /// Universal under-identification robustness policy. `Off` (default) leaves
+    /// the REML path byte-identical to released behavior.
+    robust_identification: crate::solver::workflow::RobustIdentification,
     /// Forwarded to `pirls::PirlsConfig::geodesic_acceleration`. Off by default.
     geodesic_acceleration: bool,
 }
@@ -780,6 +783,7 @@ impl RemlConfig {
             max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
             geodesic_acceleration: false,
         }
         .with_max_iterations(300)
@@ -1836,6 +1840,9 @@ pub struct ExternalOptimOptions {
     /// - `Some(false)`: force Firth off
     /// - `None`: use family default behavior
     pub firth_bias_reduction: Option<bool>,
+    /// Universal under-identification robustness policy. `Off` (default) leaves
+    /// the external optimization path byte-identical to released behavior.
+    pub robust_identification: crate::solver::workflow::RobustIdentification,
     /// Relative shrinkage floor for penalized block eigenvalues.
     /// See [`FitOptions::penalty_shrinkage_floor`] for details.
     pub penalty_shrinkage_floor: Option<f64>,
