@@ -979,6 +979,21 @@ fn try_orthogonalize_blocks(
         return Ok(None);
     }
 
+    for annotation in ortho
+        .direction_annotations
+        .iter()
+        .filter(|annotation| annotation.absorbed_width > 0)
+    {
+        log::info!(
+            "[IDENT] structural direction annotation: block={} raw_width={} kept_width={} absorbed_width={} kind={:?}",
+            annotation.block_idx,
+            annotation.raw_width,
+            annotation.kept_width,
+            annotation.absorbed_width,
+            annotation.kind,
+        );
+    }
+
     // Build orthogonalised specs: design ← X_b · V_b (via
     // CoefficientTransformOperator), penalties ← V_bᵀ S V_b, initial_beta ←
     // V_bᵀ β₀ (least-squares image; V_b has orthonormal columns so V_bᵀ is the
