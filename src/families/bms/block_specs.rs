@@ -537,92 +537,47 @@ fn build_reduced_logslope_reparam(
         );
     }
 
-    // Effective marginal/logslope Jacobians at the rigid pilot (same per-row
-    // factors the joint Hessian sees during PIRLS — c_i on the marginal block,
-    // f_i on the logslope block).
-    let mut marginal_effective = Array2::<f64>::zeros((n, p_m));
-    let mut effective_logslope = Array2::<f64>::zeros((n, p_g));
-    for i in 0..n {
-        let q_i = marginal_offset[i] + marginal_baseline;
-        let g_i = logslope_offset[i] + logslope_baseline;
-        let sg = probit_scale * g_i;
-        let c_i = (1.0 + sg * sg).sqrt();
-        let logslope_factor = q_i * probit_scale * probit_scale * g_i / c_i + probit_scale * z[i];
-        for j in 0..p_m {
-            marginal_effective[[i, j]] = c_i * marginal[[i, j]];
-        }
-        for j in 0..p_g {
-            effective_logslope[[i, j]] = logslope_factor * logslope[[i, j]];
-        }
-    }
-    // If the effective logslope design carries no mass there is no channel to
-    // reduce; keep the raw design.
-    if effective_logslope.iter().all(|v| v.abs() <= f64::EPSILON) {
-        return Ok(None);
-    }
+    // W-orthogonalize the RAW logslope design `G` against the RAW marginal
+    // design `M` in the PIRLS row metric `W` (the metric the joint Hessian
+    // sees), via the shared-solver primitive. `C̃ = G − M·B` with `Mᵀ W C̃ = 0`
+    // exactly — the released solver's pinned overlap ridge merely penalised this
+    // shared direction; here it is removed by construction. `C̃` is the SAME
+    // width `p_g` but rank-deficient by exactly the dimension of the
+    // marginal-overlapping subspace of `G`.
+    let reparam = crate::solver::orthogonal_reparam::OrthogonalReparam::build_unconditional(
+        marginal.view(),
+        logslope.view(),
+        row_metric,
+    )?;
+    let c_tilde = reparam.reparameterized_confound().to_owned(); // n × p_g
 
-    // Gtt = Geeᵀ W Gee − Gemᵀ (Mee + εI)⁻¹ Gem, the raw-coordinate Gram of the
-    // W-orthogonal component of the effective logslope design (W-orthogonal to
-    // span(M_eff)). PSD by construction (a Schur complement of a PSD joint
-    // Gram).
-    let gee = fast_xt_diag_x(&effective_logslope, row_metric); // p_g × p_g
-    let mut mee = fast_xt_diag_x(&marginal_effective, row_metric); // p_m × p_m
-    let mee_scale = (0..p_m).map(|i| mee[[i, i]]).fold(0.0_f64, f64::max);
-    let eps = (mee_scale
-        * crate::solver::orthogonal_reparam::ORTHOGONAL_PROJECTION_RELATIVE_RIDGE)
-        .max(crate::solver::orthogonal_reparam::ORTHOGONAL_PROJECTION_RIDGE_FLOOR);
-    for i in 0..p_m {
-        mee[[i, i]] += eps;
+    // Build a FULL-RANK reduced basis `T` (p_g × r) of the column space of the
+    // raw-coordinate shear `(I − B-projection)` that produced `C̃`. Concretely
+    // `C̃ = G·E` where `E = I − Bᵀ·(Mᵀ ... )`… rather than reconstruct `E`
+    // algebraically, recover the raw-coordinate reduced basis directly from the
+    // W-Gram of `C̃` expressed in raw logslope coordinates:
+    //
+    //   Stt = C̃ᵀ W C̃   (p_g × p_g, PSD), the raw-coordinate Gram of the
+    //   W-orthogonal component of the logslope design.
+    //
+    // Its range = the logslope directions surviving the marginal-overlap
+    // removal; its null space = the directions `G` shares with `span_W(M)`. A
+    // direction `v` with `Stt v ≈ 0` is one whose raw logslope column `G·v` is
+    // (W-)explained by the marginal span — exactly the confounded direction the
+    // joint Hessian is rank-soft along. The reduced transform is the orthonormal
+    // eigenbasis of `Stt` for eigenvalues above a relative tolerance.
+    let stt = fast_xt_diag_x(&c_tilde, row_metric);
+    let stt = (&stt + &stt.t()) * 0.5;
+    if stt.iter().any(|v| !v.is_finite()) {
+        return Err("reduced logslope reparam: C̃ W-Gram produced non-finite entries".to_string());
     }
-    // gem = M_effᵀ W G_eff   (p_m × p_g)
-    let gem = fast_xt_diag_y(&marginal_effective, row_metric, &effective_logslope);
-    let mee_view = FaerArrayView::new(&mee);
-    let mee_factor = factorize_symmetricwith_fallback(mee_view.as_ref(), Side::Lower)
-        .map_err(|e| format!("reduced logslope reparam: marginal Gram factorization failed: {e:?}"))?;
-    // proj = (Mee + εI)⁻¹ gem   (p_m × p_g)
-    let proj = mee_factor
-        .solvemulti(&gem)
-        .map_err(|e| format!("reduced logslope reparam: marginal projection solve failed: {e}"))?;
-    // schur = gemᵀ · proj   (p_g × p_g)
-    let schur = fast_atb(&gem, &proj);
-    let mut gtt = &gee - &schur;
-    // Symmetrize (kill round-off asymmetry before the self-adjoint eigensolve).
-    gtt = (&gtt + &gtt.t()) * 0.5;
-
-    if gtt.iter().any(|v| !v.is_finite()) {
-        return Err("reduced logslope reparam: Schur-complement Gram produced non-finite entries".to_string());
-    }
-
-    // Eigenbasis of Gtt (ascending eigenvalues). Keep directions above a
-    // relative tolerance vs. the dominant eigenvalue: those are the logslope
-    // directions that survive the confound removal. The dropped (near-zero)
-    // directions are the ones whose effective image is W-explained by the
-    // marginal span.
-    let (evals, evecs) = gtt
+    let raw_gram = fast_xt_diag_x(&logslope, row_metric);
+    let raw_scale = (0..p_g).map(|i| raw_gram[[i, i]]).fold(0.0_f64, f64::max);
+    let (evals, evecs) = stt
         .eigh(Side::Lower)
         .map_err(|e| format!("reduced logslope reparam: eigendecomposition failed: {e:?}"))?;
     {
         use std::io::Write;
-        // Generalized confounding fractions γ: eigenvalues of Gee^{-1/2} Gtt Gee^{-1/2}.
-        // γ ∈ [0,1]; γ≈1 ⇒ direction W-orthogonal to marginal; γ≈0 ⇒ fully confounded.
-        let (gee_vals, gee_vecs) = gee.eigh(Side::Lower).unwrap_or((Array1::zeros(0), Array2::zeros((0, 0))));
-        let gamma = if gee_vals.len() == p_g {
-            let mut inv_sqrt = Array2::<f64>::zeros((p_g, p_g));
-            for k in 0..p_g {
-                let d = gee_vals[k].max(1e-300).sqrt();
-                let col = gee_vecs.column(k);
-                for i in 0..p_g {
-                    for j in 0..p_g {
-                        inv_sqrt[[i, j]] += col[i] * col[j] / d;
-                    }
-                }
-            }
-            let m1 = fast_ab(&inv_sqrt, &gtt);
-            let whitened = fast_ab(&m1, &inv_sqrt);
-            whitened.eigh(Side::Lower).map(|(e, _)| e).unwrap_or_else(|_| Array1::zeros(0))
-        } else {
-            Array1::zeros(0)
-        };
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -630,23 +585,19 @@ fn build_reduced_logslope_reparam(
         {
             writeln!(
                 f,
-                "SPECTRUM p_g={p_g}\n  gtt(asc)={:?}\n  gamma(asc)={:?}",
+                "SPECTRUM p_g={p_g} raw_scale={raw_scale:.4e}\n  stt(asc)={:?}",
                 evals.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>(),
-                gamma.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>(),
             )
             .ok();
         }
     }
-    let max_eval = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
-    if !max_eval.is_finite() || max_eval <= 0.0 {
-        // The entire effective logslope channel is W-explained by the marginal
-        // span (or numerically null). Nothing identifiable remains; fall back to
-        // the raw design rather than collapse to width zero.
+    // Tolerance relative to the RAW logslope self-Gram scale: a `C̃`-Gram
+    // eigenvalue far below the raw logslope energy scale means that direction's
+    // logslope column was almost entirely W-explained by the marginal span.
+    if !raw_scale.is_finite() || raw_scale <= 0.0 {
         return Ok(None);
     }
-    let tol = max_eval * LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL;
-    // faer returns eigenvalues ascending; collect the retained columns (highest
-    // curvature first for a stable, deterministic ordering).
+    let tol = raw_scale * LOGSLOPE_REDUCED_BASIS_RELATIVE_TOL;
     let mut kept: Vec<usize> = (0..evals.len()).filter(|&i| evals[i] > tol).collect();
     kept.sort_by(|&a, &b| {
         evals[b]
