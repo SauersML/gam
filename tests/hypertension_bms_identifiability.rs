@@ -591,3 +591,52 @@ fn production_like_hypertension_shared_matern_centers10_confound_starts_outer_so
         }
     }
 }
+
+#[test]
+fn production_like_hypertension_shared_matern_learned_kappa_starts_outer_solver() {
+    gam::init_parallelism();
+    let data = production_like_pc_confound_dataset();
+    let cfg = FitConfig {
+        logslope_formula: Some("matern(PC1, PC2, PC3, centers=6)".to_string()),
+        z_column: Some("prs_z".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "event ~ matern(PC1, PC2, PC3, centers=6) + sex + entry_age_z + current_age_ns_1 + current_age_ns_2 + current_age_ns_3 + current_age_ns_4",
+        &data,
+        &cfg,
+    );
+    match result {
+        Ok(FitResult::BernoulliMarginalSlope(out)) => {
+            assert!(
+                out.fit.beta.iter().all(|coef| coef.is_finite()),
+                "learned-kappa production-like PC-confounded Matérn BMS fit should produce finite coefficients, got {:?}",
+                out.fit.beta
+            );
+            assert!(
+                out.fit
+                    .log_lambdas
+                    .iter()
+                    .any(|rho| (*rho + 4.605_170_185_988_091).abs() < 1.0e-8),
+                "learned-kappa BMS fit must carry the pinned marginal nullspace ridge at ln(1e-2); got log_lambdas={:?}",
+                out.fit.log_lambdas
+            );
+        }
+        Ok(_) => {
+            panic!("learned-kappa production-like Matérn fit returned the wrong family variant")
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                !msg.contains("identifiability audit refused")
+                    && !msg.contains("CertRefused")
+                    && !msg.contains("phantom_multiplier")
+                    && !msg.contains("outer smoothing optimization did not converge")
+                    && !msg.contains("joint hyper rho dimension mismatch")
+                    && !msg.contains("no candidate seeds passed outer startup validation"),
+                "learned-kappa production-like Matérn BMS fit still hit the #754 failure signature: {msg}"
+            );
+            panic!("learned-kappa production-like Matérn BMS fit failed: {msg}");
+        }
+    }
+}
