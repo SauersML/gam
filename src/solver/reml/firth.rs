@@ -2,7 +2,6 @@ use super::*;
 use crate::linalg::utils::enforce_symmetry;
 use crate::mixture_link::fisher_weight_jet5_for_inverse_link;
 use crate::types::InverseLink;
-use ndarray::Zip;
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 
@@ -188,22 +187,15 @@ impl<'a> RemlState<'a> {
             }
             return Ok(());
         }
-        Zip::from(w)
-            .and(w1)
-            .and(w2)
-            .and(w3)
-            .and(w4)
-            .and(eta.view())
-            .try_for_each(|wi, wi1, wi2, wi3, wi4, &ei| {
-                let (value, first, second, third, fourth) =
-                    Self::fisher_weight_derivatives(link, ei)?;
-                *wi = value;
-                *wi1 = first;
-                *wi2 = second;
-                *wi3 = third;
-                *wi4 = fourth;
-                Ok::<(), EstimationError>(())
-            })?;
+        for i in 0..eta.len() {
+            let (value, first, second, third, fourth) =
+                Self::fisher_weight_derivatives(link, eta[i])?;
+            w[i] = value;
+            w1[i] = first;
+            w2[i] = second;
+            w3[i] = third;
+            w4[i] = fourth;
+        }
         Ok(())
     }
 

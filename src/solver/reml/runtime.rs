@@ -1458,13 +1458,6 @@ fn reml_is_gaussian_identity(likelihood: &GlmLikelihoodSpec) -> bool {
     reml_spec(likelihood).is_gaussian_identity()
 }
 
-#[inline]
-fn reml_supports_firth(likelihood: &GlmLikelihoodSpec) -> bool {
-    let spec = reml_spec(likelihood);
-    matches!(spec.response, ResponseFamily::Binomial)
-        && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
-}
-
 /// Inverse link of a Binomial family for which a Fisher-weight jet exists, i.e.
 /// the links the link-general Jeffreys term can regularize. This includes
 /// standard `{Logit, Probit, CLogLog}` and stateful links whose fourth/fifth
@@ -1492,18 +1485,11 @@ fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<Invers
 /// and, if so, the inverse link to evaluate the Fisher weight with.
 ///
 /// Robustness is unconditionally on, so the gate covers every Binomial inverse
-/// link with a Fisher-weight jet. The legacy
-/// `firth_bias_reduction` flag remains a fallback for any Firth-supporting
-/// likelihood the closed-form jet does not yet cover (resolved on Logit).
+/// link with a Fisher-weight jet. Unsupported links return `None` instead of
+/// pretending they are Logit.
 #[inline]
 pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLink> {
-    if let Some(link) = reml_jeffreys_supported_link(&config.likelihood) {
-        return Some(link);
-    }
-    if config.firth_bias_reduction && reml_supports_firth(&config.likelihood) {
-        return Some(InverseLink::Standard(StandardLink::Logit));
-    }
-    None
+    reml_jeffreys_supported_link(&config.likelihood)
 }
 
 /// `upper`/`tail_prob` calibrating the firth-general default barrier on an unset
