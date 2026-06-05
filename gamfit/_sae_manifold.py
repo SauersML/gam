@@ -890,6 +890,7 @@ class ManifoldSAE:
         return cls(
             atoms=atoms,
             atom_topology=str(payload["atom_topology"]),
+            atom_topologies=list(payload["atom_topologies"]),
             assignment=canonical_assignment,
             assignment_label=str(payload.get("assignment_label", raw_assignment)),
             primitive_names=list(payload["primitive_names"]),
