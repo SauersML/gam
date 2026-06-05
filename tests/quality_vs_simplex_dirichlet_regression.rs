@@ -113,6 +113,21 @@ fn trigamma(mut x: f64) -> f64 {
                                 + inv2 * (-1.0 / 30.0 + inv2 * (1.0 / 42.0 - inv2 / 30.0)))))
 }
 
+/// Tetragamma ψ''(x) = d/dx ψ'(x), x > 0. This is the derivative of the
+/// `trigamma` approximation above, with the matching recurrence
+/// ψ''(x) = ψ''(x+1) - 2/x³.
+fn tetragamma(mut x: f64) -> f64 {
+    let mut value = 0.0;
+    while x < 6.0 {
+        value -= 2.0 / (x * x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    -inv2 - inv2 * inv - 0.5 * inv2 * inv2
+        + inv2 * inv2 * inv2 * (1.0 / 6.0 + inv2 * (-1.0 / 6.0 + inv2 * 0.3))
+}
+
 /// True smooth log-α surfaces η_k(x), k = 0..K-1, in the Dirichlet common
 /// parameterization. Distinct shapes so the location (ALR) and concentration
 /// (Σα) both genuinely vary with x.
@@ -285,6 +300,111 @@ impl CustomFamily for DirichletCommonFamily {
                         aa * aa * (trigamma(aa) - trigamma(a0)) - aa * residual
                     } else {
                         -aa * ab * trigamma(a0)
+                    };
+                }
+                let weighted_xb = &designs[b] * &weights.view().insert_axis(ndarray::Axis(1));
+                let block = designs[a].t().dot(&weighted_xb);
+                let ra = starts[a]..starts[a] + widths[a];
+                let rb = starts[b]..starts[b] + widths[b];
+                joint
+                    .slice_mut(ndarray::s![ra.clone(), rb.clone()])
+                    .assign(&block);
+                if a != b {
+                    joint.slice_mut(ndarray::s![rb, ra]).assign(&block.t());
+                }
+            }
+        }
+        Ok(Some(joint))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != K || specs.len() != K {
+            return Err(format!(
+                "DirichletCommonFamily expects {K} blocks/specs, got {}/{}",
+                block_states.len(),
+                specs.len()
+            ));
+        }
+        let n = self.log_y[0].len();
+        let widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
+        let total = widths.iter().sum::<usize>();
+        if d_beta_flat.len() != total {
+            return Err(format!(
+                "DirichletCommonFamily directional derivative length {} != joint beta width {total}",
+                d_beta_flat.len()
+            ));
+        }
+
+        let mut starts = Vec::with_capacity(K);
+        let mut start = 0usize;
+        for (k, (&width, state)) in widths.iter().zip(block_states.iter()).enumerate() {
+            if state.beta.len() != width {
+                return Err(format!(
+                    "DirichletCommonFamily block {k} beta length {} != design cols {width}",
+                    state.beta.len()
+                ));
+            }
+            if state.eta.len() != n || specs[k].design.nrows() != n {
+                return Err(format!(
+                    "DirichletCommonFamily block {k} shape mismatch: eta={} design_rows={} expected {n}",
+                    state.eta.len(),
+                    specs[k].design.nrows()
+                ));
+            }
+            starts.push(start);
+            start += width;
+        }
+
+        let designs: Vec<Array2<f64>> = specs
+            .iter()
+            .map(|spec| spec.design.solver_design().to_dense())
+            .collect();
+        let mut alpha: Vec<Array1<f64>> = Vec::with_capacity(K);
+        let mut d_alpha: Vec<Array1<f64>> = Vec::with_capacity(K);
+        for k in 0..K {
+            let eta_alpha = block_states[k].eta.mapv(f64::exp);
+            let direction = d_beta_flat
+                .slice(ndarray::s![starts[k]..starts[k] + widths[k]])
+                .to_owned();
+            let d_eta = designs[k].dot(&direction);
+            d_alpha.push(&eta_alpha * &d_eta);
+            alpha.push(eta_alpha);
+        }
+        let mut alpha0 = Array1::<f64>::zeros(n);
+        let mut d_alpha0 = Array1::<f64>::zeros(n);
+        for k in 0..K {
+            alpha0 += &alpha[k];
+            d_alpha0 += &d_alpha[k];
+        }
+
+        let mut joint = Array2::<f64>::zeros((total, total));
+        for a in 0..K {
+            for b in a..K {
+                let mut weights = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let aa = alpha[a][i];
+                    let da = d_alpha[a][i];
+                    let a0 = alpha0[i];
+                    let da0 = d_alpha0[i];
+                    let trig_a0 = trigamma(a0);
+                    let tetr_a0 = tetragamma(a0);
+                    weights[i] = if a == b {
+                        let residual = digamma(a0) - digamma(aa) + self.log_y[a][i];
+                        let trig_aa = trigamma(aa);
+                        let d_residual = trig_a0 * da0 - trig_aa * da;
+                        2.0 * aa * da * (trig_aa - trig_a0)
+                            + aa * aa * (tetragamma(aa) * da - tetr_a0 * da0)
+                            - da * residual
+                            - aa * d_residual
+                    } else {
+                        let ab = alpha[b][i];
+                        let db = d_alpha[b][i];
+                        -(da * ab + aa * db) * trig_a0 - aa * ab * tetr_a0 * da0
                     };
                 }
                 let weighted_xb = &designs[b] * &weights.view().insert_axis(ndarray::Axis(1));
