@@ -54,6 +54,24 @@ impl JeffreysSubspace {
     }
 }
 
+/// How wide a Jeffreys subspace `Z_J` to build for a block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JeffreysSpan {
+    /// Legacy scoping: `Z_J = ker(S_aggregate)` — only the penalty null space
+    /// (parametric + smooth-structural-null directions). Jeffreys never touches
+    /// a penalized smooth direction. This CANNOT reach a near-separation that
+    /// lives in `range(S)` (a penalized spline direction).
+    PenaltyNullspace,
+    /// PRINCIPLED scoping: `Z_J = I` — the FULL identifiable coefficient span of
+    /// the (post-rank-deficiency-removal) reduced block design. Jeffreys then
+    /// supplies invariant, self-limiting curvature on EVERY direction; on a
+    /// data-identified direction (penalized or not) it is the `O(1/n)` Firth
+    /// bias correction, and on a near-separating direction (in `ker(S)` OR
+    /// `range(S)`) it supplies the missing `O(1)`-bounding curvature. This makes
+    /// the inner objective coercive with a finite unique minimizer.
+    FullIdentifiable,
+}
+
 /// Build `Z_J` for a block from its aggregate (unit-weight) penalty matrix.
 ///
 /// `aggregate_penalty` is `p x p` and PSD: pass `sum_k S_k` (any positive
@@ -63,12 +81,20 @@ impl JeffreysSubspace {
 /// numerical eigenvalue threshold. When `None`, a relative eigenvalue cutoff is
 /// used.
 ///
-/// Returns the bottom-`m0` eigenvectors of the aggregate penalty (its null
-/// space) as an orthonormal `p x m0` basis. For an all-zero penalty (pure
-/// parametric block) this is the full identity, as required.
+/// `span` selects the scoping:
+///   * [`JeffreysSpan::PenaltyNullspace`] returns the bottom-`m0` eigenvectors
+///     of the aggregate penalty (its null space) as an orthonormal `p x m0`
+///     basis. For an all-zero penalty (pure parametric block) this is the full
+///     identity.
+///   * [`JeffreysSpan::FullIdentifiable`] returns the full identity `I_p` — the
+///     entire reduced (post-rank-deficiency-removal) coefficient span — so the
+///     `|UᵀI U|½` machinery defines `Φ` over every direction. The penalty is
+///     irrelevant to the span in this mode (rank-softness, if any, is absorbed
+///     by the reduced-Fisher Cholesky in [`joint_jeffreys_term`]).
 pub fn jeffreys_subspace_from_penalty(
     aggregate_penalty: ArrayView2<'_, f64>,
     structural_nullity: Option<usize>,
+    span: JeffreysSpan,
 ) -> Result<JeffreysSubspace, String> {
     let p = aggregate_penalty.nrows();
     if aggregate_penalty.ncols() != p {
@@ -81,6 +107,15 @@ pub fn jeffreys_subspace_from_penalty(
     if p == 0 {
         return Ok(JeffreysSubspace {
             columns: Array2::zeros((0, 0)),
+        });
+    }
+    if span == JeffreysSpan::FullIdentifiable {
+        // The full identifiable span of the reduced block design is the entire
+        // reduced coefficient space. Jeffreys is self-limiting, so applying it
+        // here is harmless on identified directions and curative on separating
+        // ones — irrespective of whether those directions are penalized.
+        return Ok(JeffreysSubspace {
+            columns: Array2::eye(p),
         });
     }
     let frobenius = aggregate_penalty.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -267,7 +302,8 @@ mod tests {
         // A block with a zero penalty (pure parametric) is fully
         // under-identified: Z_J must be the identity.
         let s = Array2::<f64>::zeros((3, 3));
-        let z = jeffreys_subspace_from_penalty(s.view(), None).unwrap();
+        let z =
+            jeffreys_subspace_from_penalty(s.view(), None, JeffreysSpan::PenaltyNullspace).unwrap();
         assert_eq!(z.span_dim(), 3);
         assert_eq!(z.columns.nrows(), 3);
         // Columns orthonormal and spanning the whole space.
@@ -286,7 +322,8 @@ mod tests {
         // first two axes (the null space), dimension 2.
         let mut s = Array2::<f64>::zeros((3, 3));
         s[[2, 2]] = 5.0;
-        let z = jeffreys_subspace_from_penalty(s.view(), Some(2)).unwrap();
+        let z = jeffreys_subspace_from_penalty(s.view(), Some(2), JeffreysSpan::PenaltyNullspace)
+            .unwrap();
         assert_eq!(z.span_dim(), 2);
         // The span must be orthogonal to the penalized direction e3.
         let e3 = array![0.0, 0.0, 1.0];
@@ -299,9 +336,15 @@ mod tests {
     #[test]
     fn full_rank_penalty_has_empty_under_identified_span() {
         let s = Array2::<f64>::eye(4) * 2.0;
-        let z = jeffreys_subspace_from_penalty(s.view(), Some(0)).unwrap();
+        let z = jeffreys_subspace_from_penalty(s.view(), Some(0), JeffreysSpan::PenaltyNullspace)
+            .unwrap();
         assert_eq!(z.span_dim(), 0);
         assert_eq!(z.columns.ncols(), 0);
+        // Full-identifiable span ignores the penalty and returns the identity.
+        let z_full =
+            jeffreys_subspace_from_penalty(s.view(), Some(0), JeffreysSpan::FullIdentifiable)
+                .unwrap();
+        assert_eq!(z_full.span_dim(), 4);
     }
 
     #[test]
