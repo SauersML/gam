@@ -7909,7 +7909,12 @@ mod tests {
         };
         assert_eq!(spec.length_scale, Some(1.0));
         assert_eq!(spec.nullspace_order, DuchonNullspaceOrder::Linear);
-        assert_eq!(spec.power, 0.5);
+        // The hybrid Matérn-blended kernel requires an INTEGER power. The cubic
+        // structural default's fractional s=(d-1)/2 = 0.5 (d=2) is resolved at the
+        // request layer to the smallest admissible integer (here s=0, the d=2
+        // thin-plate order) rather than carried in as 0.5 and silently truncated
+        // to 0 by the basis builder (#750). The pure path above still keeps 0.5.
+        assert_eq!(spec.power, 0.0);
     }
 
     #[test]
