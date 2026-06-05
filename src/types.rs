@@ -1309,7 +1309,7 @@ impl std::fmt::Display for UnsupportedLinkError {
 impl std::error::Error for UnsupportedLinkError {}
 
 #[inline]
-fn inverse_link_diagnostic_name(link: &InverseLink) -> String {
+pub(crate) fn inverse_link_diagnostic_name(link: &InverseLink) -> String {
     match link {
         InverseLink::Standard(lf) => lf.name().to_string(),
         InverseLink::LatentCLogLog(_) => "latent-cloglog".to_string(),
