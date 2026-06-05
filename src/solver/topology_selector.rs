@@ -230,9 +230,11 @@ where
     // previous descending sort here treated the cost as a log-evidence and
     // therefore selected the WORST-fitting topology.
     ranked.sort_by(|lhs, rhs| {
-        lhs.tk_score
-            .partial_cmp(&rhs.tk_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        crate::solver::priority_search::compare_min_finite_scores(
+            lhs.tk_score,
+            rhs.tk_score,
+            || lhs.topology_name.cmp(&rhs.topology_name),
+        )
     });
     Ok(TopologyAutoSelectorResult {
         ranked,
