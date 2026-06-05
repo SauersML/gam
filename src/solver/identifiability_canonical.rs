@@ -1408,4 +1408,143 @@ mod tests {
             }
         }
     }
+
+    fn spec_from_dense_with_priority(
+        name: &str,
+        design: Array2<f64>,
+        gauge_priority: u8,
+    ) -> ParameterBlockSpec {
+        let mut s = spec_from_dense(name, design);
+        s.gauge_priority = gauge_priority;
+        s
+    }
+
+    /// Two single-channel blocks with an exact shared column (anchor block
+    /// `a` has column [1, x]; block `b` has [x, x²]). The `x` direction is
+    /// shared. With the orthogonalisation flag ON, block `b` (lower priority)
+    /// must shed exactly one direction, the joint reduced design must be
+    /// full-rank, and the round-trip lift must reproduce the raw prediction.
+    #[test]
+    fn orthogonalize_removes_exact_cross_block_overlap_and_round_trips() {
+        let n = 48;
+        let x = linspace(n);
+        // Block a (high priority): [1, x].
+        let mut a = Array2::<f64>::zeros((n, 2));
+        // Block b (low priority): [x, x²]  → its first column aliases a's x.
+        let mut b = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            a[[i, 0]] = 1.0;
+            a[[i, 1]] = x[i];
+            b[[i, 0]] = x[i];
+            b[[i, 1]] = x[i] * x[i];
+        }
+        let specs = [
+            spec_from_dense_with_priority("anchor", a.clone(), 150),
+            spec_from_dense_with_priority("overlap", b.clone(), 120),
+        ];
+        let robust = RobustConfig {
+            firth_general: false,
+            orthogonalize_confounds: true,
+        };
+        let canon = canonicalize_for_identifiability_with_robust(&specs, robust)
+            .expect("orthogonalisation must resolve the overlap, not refuse");
+
+        // Block b shed exactly one direction (the x alias): V_b is 2×1.
+        let v_b = &canon.per_block_transform[1];
+        assert_eq!(v_b.ncols(), 1, "overlap block must keep exactly one direction");
+        assert_eq!(v_b.nrows(), 2, "overlap block transform maps from raw width 2");
+        // Anchor block keeps both directions (square rotation).
+        assert_eq!(canon.per_block_transform[0].ncols(), 2);
+
+        // Round-trip: a reduced fit θ lifts to raw β = V·θ and predicts
+        // identically through the raw designs.
+        let theta = vec![
+            Array1::from(vec![0.7, -0.3]),
+            Array1::from(vec![1.4]),
+        ];
+        let raw = canon.lift_block_betas_to_raw(&theta);
+        assert_eq!(raw[0].len(), 2);
+        assert_eq!(raw[1].len(), 2);
+        // Raw prediction = a·β_a + b·β_b.
+        let pred_a = a.dot(&raw[0]);
+        let pred_b = b.dot(&raw[1]);
+        // Reduced prediction = (a·V_a)·θ_a + (b·V_b)·θ_b must equal it.
+        let v_a = &canon.per_block_transform[0];
+        let red_a = a.dot(v_a).dot(&theta[0]);
+        let red_b = b.dot(v_b).dot(&theta[1]);
+        for i in 0..n {
+            let raw_pred = pred_a[i] + pred_b[i];
+            let red_pred = red_a[i] + red_b[i];
+            assert!(
+                (raw_pred - red_pred).abs() < 1e-9,
+                "row {i}: raw prediction {raw_pred} != reduced prediction {red_pred}",
+            );
+        }
+    }
+
+    /// Flag OFF ⇒ orthogonalisation never runs: a clean two-block design must
+    /// canonicalise identically to the released gate (identity transforms,
+    /// raw-width preserved).
+    #[test]
+    fn orthogonalize_off_is_byte_identical_to_released_gate() {
+        let n = 32;
+        let x = linspace(n);
+        let mut p = Array2::<f64>::zeros((n, 2));
+        let mut s = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            p[[i, 0]] = 1.0;
+            p[[i, 1]] = x[i];
+            s[[i, 0]] = x[i] * x[i];
+            s[[i, 1]] = x[i] * x[i] * x[i];
+        }
+        let specs = [
+            spec_from_dense_with_priority("p", p, 150),
+            spec_from_dense_with_priority("s", s, 120),
+        ];
+        let off = RobustConfig::default();
+        let canon_off = canonicalize_for_identifiability_with_robust(&specs, off)
+            .expect("clean design canonicalises with flag off");
+        let canon_default =
+            canonicalize_for_identifiability(&specs).expect("default entry must match flag-off");
+        assert_eq!(
+            canon_off.per_block_transform[0].dim(),
+            canon_default.per_block_transform[0].dim(),
+        );
+        // Identity transforms (no orthogonalisation) on the clean design.
+        assert_eq!(canon_off.per_block_transform[0].dim(), (2, 2));
+        assert_eq!(canon_off.per_block_transform[1].dim(), (2, 2));
+    }
+
+    /// Direct unit test of the compiler primitive: a block whose columns are
+    /// fully spanned by a higher-priority anchor must shed all overlapping
+    /// directions, and a non-overlapping configuration must keep full width.
+    #[test]
+    fn orthogonalize_design_blocks_drops_only_overlap() {
+        use crate::families::identifiability_compiler::orthogonalize_design_blocks;
+        let n = 40;
+        let x = linspace(n);
+        let mut anchor = Array2::<f64>::zeros((n, 2));
+        let mut overlap = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            anchor[[i, 0]] = 1.0;
+            anchor[[i, 1]] = x[i];
+            // First column is exactly anchor's x; second is genuinely new.
+            overlap[[i, 0]] = x[i];
+            overlap[[i, 1]] = x[i] * x[i] * x[i];
+        }
+        let weight = vec![1.0_f64; n];
+        let res = orthogonalize_design_blocks(
+            &[anchor.clone(), overlap.clone()],
+            &[150, 120],
+            &weight,
+        )
+        .expect("orthogonalisation must succeed");
+        assert_eq!(res.block_transforms[0].ncols(), 2, "anchor keeps full width");
+        assert_eq!(
+            res.block_transforms[1].ncols(),
+            1,
+            "overlap block sheds exactly the aliased direction",
+        );
+        assert_eq!(res.dropped, vec![(1, 1)], "one direction dropped from block 1");
+    }
 }
