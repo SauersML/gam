@@ -18,6 +18,27 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.97 — gam 0.3.97 / gamfit 0.1.170 (2026-06-05)
+
+Universal under-identification robustness — unified, always-on, no flag.
+
+### Added
+- Robustness is now an unconditional solver property, self-limiting so it is
+  byte-identical on well-identified fits and only acts where the data is
+  near-separating / under-identified: a conditioning-gated full-span
+  Jeffreys/Firth prior on the identifiable subspace (finite estimates under
+  separation), a self-gating penalized-complexity prior on the smoothing
+  parameters, and exact orthogonalization of confounded design blocks. A cheap
+  matrix-free (Lanczos) conditioning pre-check keeps it ~zero-cost and
+  matrix-free-preserving on well-conditioned and large-`p` fits.
+- Never-fail inference: when the smoothing optimizer cannot certify convergence,
+  the fit escalates to sampling the proper posterior (HMC) — guarded by R-hat /
+  ESS so it returns honest (never false-confident) uncertainty instead of erroring.
+
+### Changed
+- The `RobustIdentification` flag and the pinned BMS nullspace / overlap ridges
+  are removed; robustness is a single always-on path with no user knob.
+
 ## v0.3.96 — gam 0.3.96 / gamfit 0.1.169 (2026-06-05)
 
 First crates.io release of the `gam` engine since v0.3.91, bringing the Rust
