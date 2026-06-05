@@ -3857,6 +3857,9 @@ pub struct FitConfig {
 
     /// Enable Firth bias reduction for standard single-parameter families.
     pub firth: bool,
+    /// Optional cap on the REML/LAML outer smoothing-parameter iterations for
+    /// standard formula fits. `None` uses the production default.
+    pub outer_max_iter: Option<usize>,
 
     /// GPU backend selection policy. `Auto` uses supported device kernels for
     /// large workloads, `Off` pins execution to CPU kernels, and `Force` fails
@@ -3950,6 +3953,7 @@ impl Default for FitConfig {
             ridge_lambda: 1e-6,
             transformation_normal: false,
             firth: false,
+            outer_max_iter: None,
             gpu_policy: crate::gpu::GpuPolicy::Auto,
             device: crate::solver::gpu::Device::Cpu,
             resource_policy: None,
@@ -6008,7 +6012,7 @@ fn materialize_standard<'a>(
         sas_link: None,
         optimize_sas: false,
         compute_inference: true,
-        max_iter: 200,
+        max_iter: config.outer_max_iter.unwrap_or(200),
         tol: 1e-7,
         nullspace_dims: vec![],
         linear_constraints: None,
