@@ -222,7 +222,6 @@ where
     })?;
     let elapsed = start.elapsed().as_secs_f64();
     let checksum = out.iter().fold(0.0, |acc, value| acc + value.abs());
-    std::hint::black_box(checksum);
     if elapsed.is_finite() && elapsed > 0.0 && checksum.is_finite() {
         Ok(elapsed)
     } else {
