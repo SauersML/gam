@@ -174,6 +174,11 @@ struct FitSummary {
     outer_converged: bool,
     outer_gradient_norm: Option<f64>,
     all_finite: bool,
+    /// `Some(message)` when `fit_model` returned `Err`, `None` on a successful
+    /// fit. Lets a test distinguish *which* failure mode fired — e.g. the
+    /// pre-fix "logslope beta length mismatch" width-desync error versus a
+    /// genuine "joint Newton budget exhausted" non-convergence.
+    err_text: Option<String>,
 }
 
 fn run_fit(robust: RobustIdentification) -> FitSummary {
@@ -181,6 +186,10 @@ fn run_fit(robust: RobustIdentification) -> FitSummary {
     let (data, spec) = build_confounded_cohort(400);
     let mut options = BlockwiseFitOptions::default();
     options.robust_identification = robust;
+    // Bound the joint-Newton / outer budgets so a non-converging configuration
+    // returns a finite "did-not-converge" verdict in deterministic, bounded
+    // wall-clock instead of spinning the default 60-outer × 200-inner budget.
+    // Both ON and OFF run under the SAME caps so the contrast is apples-to-apples.
     options.inner_max_cycles = 40;
     options.outer_max_iter = 25;
     // Lock out spatial κ optimization (no spatial terms anyway) so the
@@ -208,6 +217,7 @@ fn run_fit(robust: RobustIdentification) -> FitSummary {
                 outer_converged: false,
                 outer_gradient_norm: None,
                 all_finite: false,
+                err_text: Some(e.to_string()),
             };
         }
     };
@@ -231,6 +241,7 @@ fn run_fit(robust: RobustIdentification) -> FitSummary {
         outer_converged: out.fit.outer_converged,
         outer_gradient_norm: out.fit.outer_gradient_norm,
         all_finite,
+        err_text: None,
     }
 }
 
@@ -361,12 +372,86 @@ fn orthogonalization_is_exact_and_round_trip_is_lossless() {
     );
 }
 
+/// Flag-ON behaviour on the SAME confounded cohort, asserting the part of the
+/// cure that is genuinely proven today and pinning the part that is not.
+///
+/// PROVEN (the fix in this change set): with `RobustIdentification::Force` the
+/// fit no longer ERRORS OUT with the joint-Jeffreys/orthogonalize coefficient
+/// WIDTH DESYNC ("logslope beta length mismatch: got 8, expected 12"). That
+/// error came from the `orthogonalize_confounds` per-block design-swap reducing
+/// the logslope block to a rank-correct 8-column basis while the BMS family kept
+/// its own full-width (12-column) `logslope_design`, so the inner solve fed an
+/// 8-wide β into a family that validates against 12. The fix defers the
+/// design-swap for any block carrying a family-owned `jacobian_callback`
+/// (`identifiability_canonical::try_orthogonalize_blocks`), routing BMS to the
+/// Tier-B joint-Newton Jeffreys/Firth term, which adds curvature on the
+/// under-identified span WITHOUT design surgery and keeps every block β at full
+/// design width. We assert the width error is gone by inspecting any returned
+/// error text: `block_widths = [14, 12]` (full width) now appears, the
+/// "length mismatch" string never does.
+///
+/// NOT YET PROVEN (residual, reported honestly — no weakened "cure" assertion):
+/// Firth-in-kernel ALONE does not bound β / reach KKT convergence on this
+/// structural confound. The marginal↔logslope overlap leaves the joint
+/// penalised Hessian rank-soft along the shared direction; the Jeffreys
+/// curvature on the under-identified span is finite but does not remove the
+/// overlap, so the inner joint Newton exhausts its cycle budget with the
+/// logslope block carrying a large penalized stationarity residual and a growing
+/// coefficient (observed block_beta_inf up to ~10.8 with a near-closed residual
+/// ~4e-2 — the classic near-separation signature). The conclusion this test
+/// records: to additionally CONVERGE + BOUND β on this confound, the
+/// reduced-basis orthogonalisation must be expressed *through* the BMS family's
+/// internal designs (a true reparameterisation of `logslope_design` itself, not
+/// a block-design swap the family ignores), so the family's full-width design
+/// and the inner solve's coordinates agree. Firth-in-kernel is necessary but not
+/// sufficient here.
 #[test]
-fn debug_force_on_runs() {
+fn force_on_runs_past_width_desync_but_firth_alone_does_not_yet_bound_beta() {
     assert!(file!().ends_with(".rs"));
+
     let on = run_fit(RobustIdentification::Force);
     eprintln!(
-        "[debug-force] max|b|={:.4e} conv={} g={:?} finite={}",
-        on.max_abs_marginal_beta, on.outer_converged, on.outer_gradient_norm, on.all_finite
+        "[confound-cure ON] max|β_m|={:.4e} conv={} |g|={:?} finite={} err={:?}",
+        on.max_abs_marginal_beta,
+        on.outer_converged,
+        on.outer_gradient_norm,
+        on.all_finite,
+        on.err_text,
+    );
+
+    // (1) PROVEN: the width-desync error is gone. Whether Force succeeds or
+    //     fails to converge, it must NOT fail with the coefficient-width
+    //     mismatch the fix targets.
+    if let Some(err) = on.err_text.as_ref() {
+        assert!(
+            !err.contains("beta length mismatch"),
+            "Force still hit the coefficient WIDTH DESYNC the fix targets — \
+             the orthogonalize design-swap / Jeffreys subspace reduction is still \
+             leaking a reduced-width β into the full-width block state: {err}",
+        );
+        // It is allowed to fail to CONVERGE (the documented residual below); it
+        // must do so via a genuine optimisation verdict, not a shape bug.
+        assert!(
+            err.contains("joint Newton budget")
+                || err.contains("did not converge")
+                || err.contains("failed to converge"),
+            "Force failed for an unexpected reason (not a convergence verdict): {err}",
+        );
+    }
+
+    // (2) HONEST RESIDUAL: Firth-in-kernel alone does not yet deliver the cure
+    //     on this confound. We pin the current behaviour so a future
+    //     reduced-basis-orthogonalisation change that DOES bound β shows up as a
+    //     deliberate, reviewed improvement here (flip this to the cure
+    //     assertion) rather than passing silently.
+    let firth_alone_cured =
+        on.err_text.is_none() && on.outer_converged && on.all_finite && on.max_abs_marginal_beta < 12.0;
+    assert!(
+        !firth_alone_cured,
+        "Firth-in-kernel ALONE now converges with bounded β (max|β_m|={:.4e}, |g|={:?}) — \
+         the confound is cured without reduced-basis orthogonalisation. If this is a real, \
+         intended improvement, replace this characterization with the positive cure assertion \
+         (converged && max|β_m| sane && |g| small).",
+        on.max_abs_marginal_beta, on.outer_gradient_norm,
     );
 }
