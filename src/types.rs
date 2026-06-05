@@ -252,17 +252,6 @@ impl InverseLink {
     }
 
     #[inline]
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Self::Standard(link) => link.name(),
-            Self::LatentCLogLog(_) => "latent-cloglog",
-            Self::Sas(_) => "sas",
-            Self::BetaLogistic(_) => "beta-logistic",
-            Self::Mixture(_) => "mixture",
-        }
-    }
-
-    #[inline]
     pub const fn mixture_state(&self) -> Option<&MixtureLinkState> {
         match self {
             Self::Mixture(state) => Some(state),
