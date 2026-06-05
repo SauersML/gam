@@ -20100,6 +20100,42 @@ enum FlexActivation {
     On,
 }
 
+/// Which coordinate system the `marginal`/`logslope` designs handed to
+/// `build_blocks` live in — and therefore whether the side-bound V+M-exact
+/// pulled-back penalties (`*_penalties_vm`) apply.
+///
+/// The V+M-exact cutover compiles the marginal/logslope designs into a reduced
+/// (column-dropped, reparameterised) coordinate system and pulls each block's
+/// penalty back through that block's own `V_b` to a matching compiled-width
+/// `Vᵀ S V`. Those pulled-back penalties are valid **only** against the
+/// compiled designs they were derived from. Two distinct callers reach
+/// `build_blocks` with structurally different designs:
+///
+/// * [`BlockDesignCoords::PostCutover`] — the construction-site calls (rigid
+///   warm-start pilot, initial derivative probe) pass the post-cutover designs
+///   the `*_penalties_vm` were pulled back through. The compiled penalties are
+///   authoritative here and must replace the raw-width penalties that
+///   `build_*_blockspec` derives from `TermCollectionDesign.penalties` (which
+///   the cutover intentionally leaves at raw width for predict-time consumers).
+/// * [`BlockDesignCoords::RematerializedRaw`] — the outer spatial-length-scale
+///   optimizer re-materialises *raw*-width marginal/logslope designs from the
+///   boot `TermCollectionSpec`s on every κ probe and routes them here. The raw
+///   design-derived penalties are authoritative; the compiled `*_penalties_vm`
+///   are at the wrong width/parametrisation and must NOT be installed (doing so
+///   is the #788 `block i penalty 0 must be NxN, got KxK` shape mismatch — and,
+///   in the no-column-drop-but-`V≠I` case where widths happen to coincide, a
+///   silent installation of a `Vᵀ S V` penalty onto a raw design).
+///
+/// Distinguishing by an explicit, named coordinate tag — rather than guessing
+/// from a `penalty.shape() == design.shape()` width coincidence — makes the
+/// provenance an auditable property of each call site and lets the compiled
+/// path assert width agreement loudly instead of relying on it holding.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum BlockDesignCoords {
+    PostCutover,
+    RematerializedRaw,
+}
+
 /// One block in the joint training-row design layout consumed by
 /// [`joint_training_design_preflight`]. Holds a dense `(n x p_block)`
 /// slice and the block tag used in the failure diagnostic.
@@ -21507,7 +21543,8 @@ pub fn fit_survival_marginal_slope_terms(
     let build_blocks = |rho: &Array1<f64>,
                         marginal_design: &TermCollectionDesign,
                         logslope_design: &TermCollectionDesign,
-                        flex: FlexActivation|
+                        flex: FlexActivation,
+                        coords: BlockDesignCoords|
      -> Result<Vec<ParameterBlockSpec>, String> {
         let hints = hints.borrow();
         let mut cursor = 0usize;
@@ -21593,35 +21630,49 @@ pub fn fit_survival_marginal_slope_terms(
         // `*_penalties_vm` side bindings carry per-block-width Dense
         // penalty matrices pulled back through each block's OWN diagonal
         // reparameterisation V_b (V_bᵀ S_b V_b), sized
-        // `w_b_compiled × w_b_compiled`. Substitute them in for each
-        // block's per-block-converted Blockwise penalties so the inner
-        // solver sees the exact compiled-coord penalties. The penalty
-        // count is invariant under the pullback so cursor accounting based
-        // on `design.penalties.len()` (raw widths) still matches. The
-        // cross-block residualisation R_{a→b} is carried by the
-        // residualised compiled *design* columns, not the penalty, so
-        // each block's penalty stays per-block-width — matching the
+        // `w_b_compiled × w_b_compiled`. They substitute for each block's
+        // raw-width Blockwise penalties so the inner solver sees the exact
+        // compiled-coord penalties. The penalty count is invariant under the
+        // pullback so cursor accounting based on `design.penalties.len()` (raw
+        // widths) still matches. The cross-block residualisation R_{a→b} is
+        // carried by the residualised compiled *design* columns, not the
+        // penalty, so each block's penalty stays per-block-width — matching the
         // `ParameterBlockSpec` p_b × p_b validation contract.
-        // The `*_penalties_vm` side bindings are sized at the *compiled* (V+M
-        // reduced) block widths captured once at construction; they are only
-        // valid when the design fed into this `build_blocks` call is that same
-        // compiled design (the construction-time `initial_blocks`/`rigid_blocks`).
-        // The spatial-length-scale optimizer re-materialises *raw*-width
-        // marginal/logslope designs on every kappa probe and routes them here;
-        // for those calls the design-derived penalties just installed by
-        // `build_*_blockspec` (Blockwise at the raw design width) are already
-        // correct, and substituting a narrow compiled-width penalty onto a wide
-        // raw design pairs a KxK design with a 2x2 penalty (#788). Apply each
-        // `_vm` override only when its width matches the block's realised design
-        // width; otherwise keep the design-consistent penalties.
-        for (block_idx, pens_vm) in [
-            (0usize, &time_penalties_vm),
-            (1, &marginal_penalties_vm),
-            (2, &logslope_penalties_vm),
-        ] {
-            if let Some(pens) = pens_vm {
-                let w = blocks[block_idx].design.ncols();
-                if pens.iter().all(|p| p.shape() == (w, w)) {
+        //
+        // These pulled-back penalties are valid ONLY against the compiled
+        // designs they were derived from. The `coords` tag — set by each call
+        // site, not inferred from a width coincidence — says whether the
+        // designs handed to this call ARE those compiled designs:
+        //
+        //   * `PostCutover`: the construction-site designs the `_vm` were
+        //     pulled back through. Install them, and assert width agreement —
+        //     a mismatch here means the compiled designs and compiled penalties
+        //     have desynced (a construction-site wiring bug), which we surface
+        //     loudly rather than letting `validate_blockspecs` reject it later
+        //     with a less actionable message.
+        //   * `RematerializedRaw`: the κ-probe re-materialises *raw*-width
+        //     marginal/logslope designs from the boot specs and routes them
+        //     here. The raw design-derived penalties already installed by
+        //     `build_*_blockspec` are authoritative; installing the compiled
+        //     `_vm` here is the #788 shape mismatch (and, when widths happen to
+        //     coincide with no column drop but `V≠I`, a silent `Vᵀ S V`-on-raw
+        //     corruption). Keep the raw penalties.
+        if coords == BlockDesignCoords::PostCutover {
+            for (block_idx, pens_vm) in [
+                (0usize, &time_penalties_vm),
+                (1, &marginal_penalties_vm),
+                (2, &logslope_penalties_vm),
+            ] {
+                if let Some(pens) = pens_vm {
+                    let w = blocks[block_idx].design.ncols();
+                    if !pens.iter().all(|p| p.shape() == (w, w)) {
+                        return Err(format!(
+                            "survival marginal-slope: compiled V+M penalty/design width desync at \
+                             block {block_idx} (compiled design width {w}, penalty shapes {:?}); \
+                             the post-cutover compiled designs and `*_penalties_vm` must agree",
+                            pens.iter().map(|p| p.shape()).collect::<Vec<_>>()
+                        ));
+                    }
                     blocks[block_idx].penalties = pens.clone();
                 }
             }
@@ -21815,6 +21866,9 @@ pub fn fit_survival_marginal_slope_terms(
             &marginal_design,
             &logslope_design,
             FlexActivation::OffForRigidPilot,
+            // Construction-site designs: the post-cutover compiled marginal/
+            // logslope designs the `*_penalties_vm` were pulled back through.
+            BlockDesignCoords::PostCutover,
         )?;
         let rigid_family = make_family(
             &marginal_design,
@@ -21943,6 +21997,9 @@ pub fn fit_survival_marginal_slope_terms(
         &marginal_design,
         &logslope_design,
         FlexActivation::On,
+        // Construction-site designs: the post-cutover compiled marginal/
+        // logslope designs the `*_penalties_vm` were pulled back through.
+        BlockDesignCoords::PostCutover,
     )?;
     // Validate the assembled block specs at the construction boundary so any
     // design/penalty width inconsistency (e.g. a compiled-map penalty that
@@ -22101,7 +22158,16 @@ pub fn fit_survival_marginal_slope_terms(
                 theta.len(),
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let blocks = build_blocks(&rho, &designs[0], &designs[1], FlexActivation::On)?;
+            // Outer κ-probe / eval: `designs` are re-materialised RAW-width
+            // designs from the boot specs, so the compiled `*_penalties_vm` do
+            // not apply — keep the raw design-derived penalties (#788).
+            let blocks = build_blocks(
+                &rho,
+                &designs[0],
+                &designs[1],
+                FlexActivation::On,
+                BlockDesignCoords::RematerializedRaw,
+            )?;
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
             let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
@@ -22151,7 +22217,16 @@ pub fn fit_survival_marginal_slope_terms(
                 row_set_rows,
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let blocks = build_blocks(&rho, &designs[0], &designs[1], FlexActivation::On)?;
+            // Outer κ-probe / eval: `designs` are re-materialised RAW-width
+            // designs from the boot specs, so the compiled `*_penalties_vm` do
+            // not apply — keep the raw design-derived penalties (#788).
+            let blocks = build_blocks(
+                &rho,
+                &designs[0],
+                &designs[1],
+                FlexActivation::On,
+                BlockDesignCoords::RematerializedRaw,
+            )?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
                 let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
@@ -22226,7 +22301,16 @@ pub fn fit_survival_marginal_slope_terms(
                 theta.len(),
             );
             let rho = theta.slice(s![..setup.rho_dim()]).to_owned();
-            let blocks = build_blocks(&rho, &designs[0], &designs[1], FlexActivation::On)?;
+            // Outer κ-probe / eval: `designs` are re-materialised RAW-width
+            // designs from the boot specs, so the compiled `*_penalties_vm` do
+            // not apply — keep the raw design-derived penalties (#788).
+            let blocks = build_blocks(
+                &rho,
+                &designs[0],
+                &designs[1],
+                FlexActivation::On,
+                BlockDesignCoords::RematerializedRaw,
+            )?;
             if let Some(beta_seed) = pending_beta_seed.borrow_mut().take() {
                 let widths: Vec<usize> = blocks.iter().map(|b| b.design.ncols()).collect();
                 match CustomFamilyWarmStart::from_cached_beta(&widths, &beta_seed) {
