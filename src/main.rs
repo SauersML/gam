@@ -750,7 +750,6 @@ struct CliFirthValidation<'a> {
     enabled: bool,
     family: LikelihoodSpec,
     predict_noise: bool,
-    has_bounded_terms: bool,
     is_survival: bool,
     link_choice: Option<&'a LinkChoice>,
 }
@@ -769,11 +768,6 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), C
         return Err(CliError::IncompatibleConfig {
             reason: "--firth is not supported with --predict-noise location-scale fitting"
                 .to_string(),
-        });
-    }
-    if ctx.has_bounded_terms {
-        return Err(CliError::IncompatibleConfig {
-            reason: "--firth is not yet supported with bounded() coefficients".to_string(),
         });
     }
     if ctx.family.supports_firth() {
@@ -961,6 +955,23 @@ fn blockwise_options_from_fit_args()
     Ok(options)
 }
 
+fn parse_cli_robust_identification(raw: &str) -> Result<gam::RobustIdentification, String> {
+    gam::RobustIdentification::parse(raw).ok_or_else(|| {
+        format!("invalid --robust-identification '{raw}'; expected off, auto, or force")
+    })
+}
+
+fn marginal_slope_robust_identification_from_args(
+    args: &FitArgs,
+) -> Result<gam::RobustIdentification, String> {
+    let configured = parse_cli_robust_identification(&args.robust_identification)?;
+    if args.firth {
+        Ok(gam::RobustIdentification::Force)
+    } else {
+        Ok(configured)
+    }
+}
+
 fn compact_fit_result_for_batch(fit: &mut UnifiedFitResult) {
     if let Some(inf) = fit.inference.as_mut() {
         // Keep working_weights/response on inference too — `diagnose --alo`
@@ -993,7 +1004,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             enabled: args.firth,
             family: LikelihoodSpec::royston_parmar(),
             predict_noise: args.predict_noise.is_some(),
-            has_bounded_terms: false,
             is_survival: true,
             link_choice: None,
         })?;
@@ -1357,7 +1367,6 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         enabled: args.firth,
         family: family.clone(),
         predict_noise: args.predict_noise.is_some(),
-        has_bounded_terms,
         is_survival: false,
         link_choice: link_choice.as_ref(),
     })?;
@@ -1720,9 +1729,6 @@ fn run_fit_bernoulli_marginal_slope(
             "bernoulli marginal-slope fitting requires a binary {0,1} response".to_string(),
         );
     }
-    if args.firth {
-        return Err("--firth is not supported for the bernoulli marginal-slope family".to_string());
-    }
     if args.predict_noise.is_some() {
         return Err(
             "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
@@ -1848,6 +1854,13 @@ fn run_fit_bernoulli_marginal_slope(
     }
     let mut options = blockwise_options_from_fit_args()?;
     options.compute_covariance = true;
+    options.robust_identification = marginal_slope_robust_identification_from_args(args)?;
+    if args.firth {
+        inference_notes.push(
+            "bernoulli marginal-slope --firth requests robust-identification=force for the supported marginal/logslope confound controls"
+                .to_string(),
+        );
+    }
     let kappa_options = {
         let mut opts = SpatialLengthScaleOptimizationOptions::default();
         opts.pilot_subsample_threshold = args.pilot_subsample_threshold;
@@ -3919,12 +3932,6 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         &col_map,
         "resolved_termspec",
     )?;
-    if termspec_has_bounded_terms(&spec) {
-        return Err(
-            "diagnose --alo is not yet supported for models with bounded() coefficients"
-                .to_string(),
-        );
-    }
     progress.set_stage("diagnose", "building diagnostic design");
     let design = build_term_collection_design(ds.values.view(), &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -4909,6 +4916,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         let mut options = gam::families::custom_family::BlockwiseFitOptions::default();
         options.compute_covariance = true;
+        options.robust_identification = marginal_slope_robust_identification_from_args(args)?;
+        if args.firth {
+            inference_notes.push(
+                "survival marginal-slope --firth requests robust-identification=force for the supported marginal/logslope confound controls"
+                    .to_string(),
+            );
+        }
         let buildspec = |prepared: &PreparedSurvivalTimeStack| {
             SurvivalMarginalSlopeTermSpec {
             age_entry: age_entry.clone(),
@@ -6255,21 +6269,6 @@ fn run_generate_unified(
 ) -> Result<gam::generative::GenerativeSpec, String> {
     progress.set_stage("generate", "building unified generation design");
 
-    // Bounded-coefficient check: resolve the primary termspec just for this
-    // guard (build_predict_input_for_model resolves it again internally, but
-    // this keeps the error path clean and avoids leaking the spec).
-    let primary_spec = resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        training_headers,
-        col_map,
-        "resolved_termspec",
-    )?;
-    if termspec_has_bounded_terms(&primary_spec) {
-        return Err(
-            "sample is not yet supported for models with bounded() coefficients".to_string(),
-        );
-    }
-
     let pred_input = build_predict_input_for_model(
         model,
         data,
@@ -6764,9 +6763,6 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
             return Err(
                 "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
             );
-        }
-        if args.firth {
-            return Err("--firth is not supported for marginal-slope fitting".to_string());
         }
         if args.adaptive_regularization {
             return Err(
@@ -10041,7 +10037,6 @@ mod tests {
             enabled: true,
             family: LikelihoodSpec::poisson_log(),
             predict_noise: false,
-            has_bounded_terms: false,
             is_survival: false,
             link_choice: None,
         })
@@ -10367,7 +10362,6 @@ mod tests {
             enabled: true,
             family: LikelihoodSpec::binomial_logit(),
             predict_noise: false,
-            has_bounded_terms: false,
             is_survival: false,
             link_choice: Some(&choice),
         })
@@ -10380,7 +10374,6 @@ mod tests {
             enabled: true,
             family: LikelihoodSpec::royston_parmar(),
             predict_noise: false,
-            has_bounded_terms: false,
             is_survival: true,
             link_choice: None,
         })
