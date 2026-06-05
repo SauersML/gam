@@ -512,6 +512,7 @@ fn build_reduced_logslope_reparam(
     if p_m == 0 || p_g == 0 {
         return Ok(None);
     }
+    eprintln!("[REDUCE-DIAG] ENTER p_m={p_m} p_g={p_g}");
     if !marginal_baseline.is_finite()
         || !logslope_baseline.is_finite()
         || !probit_scale.is_finite()
@@ -591,6 +592,14 @@ fn build_reduced_logslope_reparam(
     let (evals, evecs) = gtt
         .eigh(Side::Lower)
         .map_err(|e| format!("reduced logslope reparam: eigendecomposition failed: {e:?}"))?;
+    {
+        let gee_diag: Vec<f64> = (0..p_g).map(|i| gee[[i, i]]).collect();
+        let gee_scale = gee_diag.iter().cloned().fold(0.0_f64, f64::max);
+        eprintln!(
+            "[REDUCE-DIAG] p_g={p_g} gee_scale={gee_scale:.4e} gtt_evals(asc)={:?}",
+            evals.iter().map(|v| format!("{v:.3e}")).collect::<Vec<_>>()
+        );
+    }
     let max_eval = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
     if !max_eval.is_finite() || max_eval <= 0.0 {
         // The entire effective logslope channel is W-explained by the marginal
