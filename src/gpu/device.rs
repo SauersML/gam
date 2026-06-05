@@ -42,39 +42,6 @@ pub struct GpuDeviceInfo {
 }
 
 impl GpuDeviceInfo {
-    pub fn fingerprint(&self) -> crate::cache::Fingerprint {
-        let mut fp = crate::cache::Fingerprinter::new();
-        fp.absorb_str(b"gpu-policy-calibration-schema", "v1");
-        fp.absorb_str(b"name", &self.name);
-        fp.absorb_u64(b"ordinal", self.ordinal as u64);
-        fp.absorb_u64(
-            b"compute-major",
-            u64::try_from(self.capability.compute_major.max(0)).unwrap_or(0),
-        );
-        fp.absorb_u64(
-            b"compute-minor",
-            u64::try_from(self.capability.compute_minor.max(0)).unwrap_or(0),
-        );
-        fp.absorb_u64(
-            b"sm-count",
-            u64::try_from(self.sm_count.max(0)).unwrap_or(0),
-        );
-        fp.absorb_u64(
-            b"threads-per-sm",
-            u64::try_from(self.max_threads_per_sm.max(0)).unwrap_or(0),
-        );
-        fp.absorb_u64(
-            b"shared-mem-per-block",
-            self.max_shared_mem_per_block as u64,
-        );
-        fp.absorb_u64(b"l2-cache-bytes", self.l2_cache_bytes as u64);
-        fp.absorb_u64(b"total-mem-bytes", self.total_mem_bytes as u64);
-        fp.absorb_u64(b"ecc-enabled", u64::from(self.ecc_enabled));
-        fp.absorb_u64(b"integrated", u64::from(self.integrated));
-        fp.absorb_u64(b"mig-mode", u64::from(self.mig_mode));
-        fp.finalize()
-    }
-
     pub fn score(&self) -> f64 {
         let fp64_bonus = if self.capability.has_fp64_tensor_cores {
             100.0
