@@ -18,6 +18,23 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.96 — gam 0.3.96 / gamfit 0.1.169 (2026-06-05)
+
+First crates.io release of the `gam` engine since v0.3.91, bringing the Rust
+crate current with the gamfit 0.1.164–0.1.168 wheel line and adding the new
+under-identification robustness layer (off by default).
+
+### Added
+
+- **Universal under-identification robustness (`robust_identification`, preview — off by default).** A new, family-general layer that makes robustness to non-identification a property of the *solver* rather than a per-family patch: a link-general Jeffreys/Firth penalty on the under-identified subspace (bounding near-separating coefficients) plus exact orthogonal reparameterisation of overlapping design blocks (resolving structural confounds rather than penalising them). Exposed as `gamfit.fit(..., robust_identification=...)` and the `--robust-identification` CLI flag with policies `"off"` (default), `"auto"`, and `"force"`. **`"off"` is byte-identical to the previous solver**, so existing fits are unchanged; the machinery is opt-in while it is hardened.
+
+### Fixed
+
+- **Smooth-free (purely parametric) fits no longer crash.** An ordinary linear model — `gamfit.fit(df, "y ~ x1 + x2")`, any family, with no `s()`/`te()`/`matern()` term — aborted in the post-fit null-space metadata step with `null-space Hessian is not positive definite: Cholesky factorization failed: NonPositivePivot { index: 0 }`, even though the fit converged and the CLI fit the same data fine. Root cause: a smooth-free design has an all-zero penalty matrix, and the rank-revealing QR returned a NaN null-space basis for rank-0 input (faer's column-pivoted QR produces degenerate Householder reflectors when the first pivot column has zero norm). The null space of a zero matrix is the whole space, so its basis is now returned as the exact identity. This also unblocked learned-length-scale Matérn BMS fits, whose outer optimiser was being poisoned by the same NaN at degenerate penalty configurations.
+- **`bs="sz"` factor smooths fit and predict (#700).** A sum-to-zero factor smooth `s(g, x, bs="sz")` crashed at fit time with an identifiability-transform dimension mismatch and was non-functional; the full-design joint-null rotation is no longer folded into the per-marginal `sz` metadata, so `sz` smooths now fit and reproduce their fitted values on frozen replay.
+- **Hybrid Duchon smooths with an explicit `length_scale` build for every covariate dimension (#750).** `duchon(...)` with a `length_scale` but no explicit `power=` crashed at basis generation for even covariate dimensions `d ≥ 4`; the cubic structural default now resolves to an admissible integer spectral power.
+- **BMS spatial-`rho` startup and convergence hardening (#754, #461).** Fixed `#754`/`#461` ridges are carried as physical `PenaltyMatrix::Fixed` penalties (excluded from the REML/outer `rho` vector), the startup no longer mis-classifies a phantom seed, and production-shaped Matérn BMS fits start and converge.
+
 ## gamfit 0.1.168 — gam 0.3.95 / gamfit 0.1.168 (2026-06-05)
 
 ### Fixed
