@@ -215,6 +215,93 @@ impl CustomFamily for DirichletCommonFamily {
         Some((0..specs.len()).collect())
     }
 
+    fn has_explicit_joint_hessian(&self) -> bool {
+        true
+    }
+
+    fn exact_newton_joint_hessian_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Array2<f64>>, String> {
+        if block_states.len() != K || specs.len() != K {
+            return Err(format!(
+                "DirichletCommonFamily expects {K} blocks/specs, got {}/{}",
+                block_states.len(),
+                specs.len()
+            ));
+        }
+        let n = self.log_y[0].len();
+        let mut alpha: Vec<Array1<f64>> = Vec::with_capacity(K);
+        for (k, state) in block_states.iter().enumerate() {
+            if state.eta.len() != n {
+                return Err(format!(
+                    "DirichletCommonFamily block {k} eta length {} != {n}",
+                    state.eta.len()
+                ));
+            }
+            alpha.push(state.eta.mapv(f64::exp));
+        }
+        let mut alpha0 = Array1::<f64>::zeros(n);
+        for a in &alpha {
+            alpha0 += a;
+        }
+
+        let widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
+        let total = widths.iter().sum::<usize>();
+        let mut starts = Vec::with_capacity(K);
+        let mut start = 0usize;
+        for (k, (&width, state)) in widths.iter().zip(block_states.iter()).enumerate() {
+            if state.beta.len() != width {
+                return Err(format!(
+                    "DirichletCommonFamily block {k} beta length {} != design cols {width}",
+                    state.beta.len()
+                ));
+            }
+            if specs[k].design.nrows() != n {
+                return Err(format!(
+                    "DirichletCommonFamily block {k} design rows {} != {n}",
+                    specs[k].design.nrows()
+                ));
+            }
+            starts.push(start);
+            start += width;
+        }
+
+        let designs: Vec<Array2<f64>> = specs
+            .iter()
+            .map(|spec| spec.design.solver_design().to_dense())
+            .collect();
+        let mut joint = Array2::<f64>::zeros((total, total));
+        for a in 0..K {
+            for b in a..K {
+                let mut weights = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let aa = alpha[a][i];
+                    let ab = alpha[b][i];
+                    let a0 = alpha0[i];
+                    weights[i] = if a == b {
+                        let residual = digamma(a0) - digamma(aa) + self.log_y[a][i];
+                        aa * aa * (trigamma(aa) - trigamma(a0)) - aa * residual
+                    } else {
+                        -aa * ab * trigamma(a0)
+                    };
+                }
+                let weighted_xb = &designs[b] * &weights.view().insert_axis(ndarray::Axis(1));
+                let block = designs[a].t().dot(&weighted_xb);
+                let ra = starts[a]..starts[a] + widths[a];
+                let rb = starts[b]..starts[b] + widths[b];
+                joint
+                    .slice_mut(ndarray::s![ra.clone(), rb.clone()])
+                    .assign(&block);
+                if a != b {
+                    joint.slice_mut(ndarray::s![rb, ra]).assign(&block.t());
+                }
+            }
+        }
+        Ok(Some(joint))
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         if block_states.len() != K {
             return Err(format!(
