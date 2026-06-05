@@ -11881,7 +11881,38 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     // analytic derivatives describe a different objective. Compute `H_Φ` once
     // over the full-span basis `Z_J` and add it into whichever
     // logdet path runs below. `None` ⇒ no logdet-H contribution (logdet-S only).
-    let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h {
+    // Cheap matrix-free conditioning pre-check for the OUTER logdet H_Φ. When a
+    // matrix-free workspace exposes the Hessian-vector product, bound the joint
+    // information's spectrum from a few matvecs (no dense H, no O(p³) eigh): if it
+    // certifies well-conditioned the exact gate is certain to return H_Φ = 0, so
+    // we skip the whole dense formation and use `None` (no logdet-H Jeffreys
+    // contribution), byte-identical to the gated-off path. This keeps the outer
+    // LAML logdet consistent with the inner solve (which also gated the term off
+    // on the same well-conditioned geometry) while preserving the matrix-free path
+    // at outer-eval scale. Returns `false`/unsure ⇒ exact formation below.
+    let outer_jeffreys_precheck_skips = include_logdet_h
+        && preferred_workspace
+            .as_ref()
+            .map(|ws| ws.hessian_matvec_available())
+            .unwrap_or(false)
+        && total >= crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM
+        && {
+            let ws = preferred_workspace.as_ref().expect("checked Some above");
+            let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
+                match ws.hessian_matvec(v)? {
+                    Some(out) if out.len() == total => Ok(out),
+                    // Workspace declined this matvec ⇒ cannot certify ⇒ do not skip.
+                    // Return a non-finite sentinel so the cheap estimator bails to
+                    // the conservative `false` (never skip on an unresolved apply).
+                    _ => Ok(Array1::from_elem(total, f64::NAN)),
+                }
+            };
+            crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(hv, total)
+                .unwrap_or(false)
+        };
+    let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h
+        && !outer_jeffreys_precheck_skips
+    {
         match build_joint_jeffreys_subspace(specs, &ranges)? {
             Some(z_joint) => {
                 custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
@@ -14411,12 +14442,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // against the work it guards.
             let jeffreys_skippable_this_cycle: bool =
                 if joint_jeffreys_subspace.is_some() {
-                    jeffreys_term_skippable_for_source(
-                        &joint_hessian_source,
-                        total_p,
-                        joint_solver_diagonal_ridge,
-                    )
-                    .unwrap_or(false)
+                    jeffreys_term_skippable_for_source(&joint_hessian_source, total_p)
+                        .unwrap_or(false)
                 } else {
                     false
                 };
@@ -15721,9 +15748,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let Some(gradient) = cached_joint_gradient.as_ref() else {
                 break;
             };
-            let jeffreys_augmented_gradient: Option<Array1<f64>> = if let Some(z_joint) =
-                joint_jeffreys_subspace.as_ref()
-            {
+            let jeffreys_augmented_gradient: Option<Array1<f64>> = if jeffreys_skippable_this_cycle {
+                // Well-conditioned ⇒ ∇Φ = 0, so the KKT residual is the bare
+                // stationarity (and floors at 0, not ‖∇Φ‖) — matching the step,
+                // which folded H_Φ=0/∇Φ=0 this cycle. Avoids the dense H/eigh.
+                None
+            } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                 match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
                     Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
                         Some(gradient + &grad_phi)
@@ -22485,7 +22515,6 @@ fn build_joint_jeffreys_subspace(
 fn jeffreys_term_skippable_for_source(
     source: &JointHessianSource,
     total_p: usize,
-    diagonal_ridge: f64,
 ) -> Result<bool, String> {
     // Below the dense-eigh-is-cheap threshold the inner `jeffreys_term_skippable_via_matvec`
     // short-circuits to `false` anyway; bail early so small fits (e.g. BMS p≈51)
@@ -22497,11 +22526,11 @@ fn jeffreys_term_skippable_for_source(
     // the inner Newton uses. The `joint_jeffreys_term` reduced information is
     // `Z_JᵀHZ_J` with `Z_J = I`, i.e. exactly `H`, so this matvec IS the
     // reduced-information apply the gate's eigendecomposition would otherwise
-    // consume. The tiny `diagonal_ridge` the inner solver adds to keep `H` apply
-    // well-posed is NOT folded in here: it can only RAISE eigenvalues, so the
-    // unridged `H` is a lower bound on the ridged spectrum — skipping on the
-    // unridged bounds is conservative w.r.t. the ridged operator the solver runs.
-    let _ = diagonal_ridge;
+    // consume. The tiny diagonal ridge the inner solver adds to keep the `H`
+    // apply well-posed is deliberately NOT folded in here: it can only RAISE
+    // eigenvalues, so the unridged `H` is a lower bound on the ridged spectrum —
+    // skipping on the unridged bounds is conservative w.r.t. the ridged operator
+    // the solver actually runs.
     let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
         match source {
             JointHessianSource::Dense(matrix) => Ok(matrix.dot(v)),
