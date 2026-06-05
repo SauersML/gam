@@ -987,18 +987,19 @@ impl FamilySpecKind {
         matches!(self, Self::BinomialBetaLogistic(_))
     }
 
+    /// Coarse kind-level Firth eligibility: every binomial inverse link this
+    /// enum can represent (Logit/Probit/CLogLog and the stateful
+    /// LatentCLogLog/SAS/Beta-Logistic/Mixture links) carries a Fisher-weight
+    /// jet, so kind-level Firth support is exactly binomial membership.
+    ///
+    /// The authoritative, link-resolved gate is
+    /// [`LikelihoodSpec::supports_firth`], which routes through
+    /// `inverse_link_has_fisher_weight_jet`. Keep this in agreement with that
+    /// predicate: a future binomial link without a Fisher-weight jet would make
+    /// this approximation diverge and must be handled at both sites.
     #[inline]
     pub const fn supports_firth(&self) -> bool {
-        matches!(
-            self,
-            Self::BinomialLogit
-                | Self::BinomialProbit
-                | Self::BinomialCLogLog
-                | Self::BinomialLatentCLogLog(_)
-                | Self::BinomialSas(_)
-                | Self::BinomialBetaLogistic(_)
-                | Self::BinomialMixture(_)
-        )
+        self.is_binomial()
     }
 }
 

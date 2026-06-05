@@ -38,8 +38,7 @@ use crate::linalg::utils::{
 };
 use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
 use crate::mixture_link::{
-    inverse_link_has_fisher_weight_jet, state_from_beta_logisticspec, state_from_sasspec,
-    state_fromspec,
+    state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
@@ -1944,8 +1943,7 @@ fn resolve_external_family(
         );
     }
 
-    let supports_firth = matches!(family.response, ResponseFamily::Binomial)
-        && inverse_link_has_fisher_weight_jet(&family.link);
+    let supports_firth = family.supports_firth();
     if firth_override == Some(true) && !supports_firth {
         crate::bail_invalid_estim!(
             "firth_bias_reduction requires a Binomial inverse link with a Fisher-weight jet; {} does not support it",
