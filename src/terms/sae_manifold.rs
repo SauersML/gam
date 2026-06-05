@@ -9464,7 +9464,7 @@ mod tests {
         .unwrap()
         .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-            Array2::<f64>::zeros((n, 0)),
+            Array2::<f64>::zeros((n, 1)),
             vec![coords],
             vec![LatentManifold::Circle { period: 1.0 }],
             AssignmentMode::softmax(1.0),
