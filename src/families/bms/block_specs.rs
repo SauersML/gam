@@ -873,10 +873,7 @@ fn bernoulli_marginal_slope_runaway_error(
 #[cfg(test)]
 mod runaway_tests {
     use super::*;
-    use crate::faer_ndarray::{
-        FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_y,
-    };
-    use crate::matrix::FactorizedSystem;
+    use crate::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_y};
 
     // The marginal↔logslope overlap penalty is no longer installed as a pinned
     // ridge (subsumed by the now-unconditional exact logslope orthogonalisation in
@@ -968,9 +965,9 @@ mod runaway_tests {
         let gram_view = FaerArrayView::new(&gram);
         let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
             .map_err(|e| format!("marginal/logslope overlap Gram factorization failed: {e}"))?;
-        let coeffs = factor
-            .solvemulti(&cross)
-            .map_err(|e| format!("marginal/logslope overlap projection solve failed: {e}"))?;
+        let rhsview = FaerArrayView::new(&cross);
+        let coeffs_mat = factor.solve(rhsview.as_ref());
+        let coeffs = Array2::from_shape_fn((p_g, p_m), |(i, j)| coeffs_mat[(i, j)]);
         let projected_marginal = fast_ab(&effective_logslope, &coeffs);
         let mut penalty = fast_xt_diag_y(&marginal_effective, row_metric, &projected_marginal);
         penalty = (&penalty + &penalty.t()) * 0.5;
