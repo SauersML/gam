@@ -18,7 +18,7 @@ pub struct SymmetricLanczosEigenpairs {
 
 #[inline]
 fn dot(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
+    assert_eq!(a.len(), b.len());
     let mut sum = 0.0;
     for i in 0..a.len() {
         sum += a[i] * b[i];
