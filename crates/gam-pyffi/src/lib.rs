@@ -28400,7 +28400,7 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<(FitConfig, Option<Stri
         fit_config.robust_identification =
             gam::RobustIdentification::parse(&raw).ok_or_else(|| {
                 format!(
-                    "invalid robust_identification '{}'; expected off, auto, or force",
+                    "invalid robust_identification '{}'; expected off, auto, force, or firth-only",
                     raw
                 )
             })?;

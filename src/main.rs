@@ -1410,7 +1410,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     let robust_identification = gam::RobustIdentification::parse(&args.robust_identification)
         .ok_or_else(|| {
             format!(
-                "invalid --robust-identification '{}'; expected off, auto, or force",
+                "invalid --robust-identification '{}'; expected off, auto, force, or firth-only",
                 args.robust_identification
             )
         })?;

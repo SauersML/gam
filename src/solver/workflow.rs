@@ -3823,6 +3823,16 @@ impl RobustIdentification {
     }
 }
 
+#[inline]
+fn marginal_slope_robust_identification_policy(
+    configured: RobustIdentification,
+) -> RobustIdentification {
+    match configured {
+        RobustIdentification::Off => RobustIdentification::FirthOnly,
+        other => other,
+    }
+}
+
 /// Non-formula configuration for model fitting. All fields have sensible defaults.
 #[derive(Clone, Debug)]
 pub struct FitConfig {
@@ -4699,7 +4709,7 @@ fn l2_norm(column: &Array1<f64>) -> f64 {
     column.iter().map(|v| v * v).sum::<f64>().sqrt()
 }
 
-fn prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+fn prune_unidentified_linear_terms_for_marginal_slope(
     spec: &mut TermCollectionSpec,
     data: &Dataset,
     label: &str,
@@ -6192,7 +6202,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
         &policy,
         config.smooth_overrides.as_ref(),
     )?;
-    prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+    prune_unidentified_linear_terms_for_marginal_slope(
         &mut marginalspec,
         data,
         "bernoulli marginal-slope marginal formula",
@@ -6207,7 +6217,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
         &policy,
         config.smooth_overrides.as_ref(),
     )?;
-    prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+    prune_unidentified_linear_terms_for_marginal_slope(
         &mut logslopespec,
         data,
         "bernoulli marginal-slope logslope_formula",
@@ -6269,7 +6279,9 @@ fn materialize_bernoulli_marginal_slope<'a>(
             spec,
             options: BlockwiseFitOptions {
                 compute_covariance: true,
-                robust_identification: config.robust_identification,
+                robust_identification: marginal_slope_robust_identification_policy(
+                    config.robust_identification,
+                ),
                 ..Default::default()
             },
             kappa_options: SpatialLengthScaleOptimizationOptions::default(),
@@ -6486,7 +6498,7 @@ fn materialize_survival<'a>(
         None
     };
     let termspec_col_map = marginal_slope_aliased_col_map.as_ref().unwrap_or(col_map);
-    let termspec = build_termspec_with_geometry_and_overrides(
+    let mut termspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,
         data,
         termspec_col_map,
@@ -6495,6 +6507,14 @@ fn materialize_survival<'a>(
         &policy,
         config.smooth_overrides.as_ref(),
     )?;
+    if survival_mode == SurvivalLikelihoodMode::MarginalSlope {
+        prune_unidentified_linear_terms_for_marginal_slope(
+            &mut termspec,
+            data,
+            "survival marginal-slope marginal formula",
+            &mut inference_notes,
+        )?;
+    }
 
     let residual_dist = parse_survival_distribution(&config.survival_distribution)?;
     let survival_inverse_link = residual_distribution_inverse_link(residual_dist);
@@ -6640,7 +6660,7 @@ fn materialize_survival<'a>(
                             .into(),
                     );
                 }
-                let spec = build_termspec_with_geometry_and_overrides(
+                let mut spec = build_termspec_with_geometry_and_overrides(
                     &ls_parsed.terms,
                     data,
                     col_map,
@@ -6648,6 +6668,12 @@ fn materialize_survival<'a>(
                     config.scale_dimensions,
                     &policy,
                     config.smooth_overrides.as_ref(),
+                )?;
+                prune_unidentified_linear_terms_for_marginal_slope(
+                    &mut spec,
+                    data,
+                    "survival marginal-slope logslope_formula",
+                    &mut inference_notes,
                 )?;
                 let routing = route_marginal_slope_deviation_blocks(
                     parsed.linkwiggle.as_ref(),
@@ -6706,7 +6732,7 @@ fn materialize_survival<'a>(
                 let z_idx = resolve_role_col(col_map, &surface.z_column, "z")?;
                 z.column_mut(surface_idx).assign(&data.values.column(z_idx));
                 let aliased_col_map = column_map_with_alias(col_map, "z", &surface.z_column);
-                specs.push(build_termspec_with_geometry_and_overrides(
+                let mut spec = build_termspec_with_geometry_and_overrides(
                     &surface.terms,
                     data,
                     &aliased_col_map,
@@ -6714,7 +6740,14 @@ fn materialize_survival<'a>(
                     config.scale_dimensions,
                     &policy,
                     config.smooth_overrides.as_ref(),
-                )?);
+                )?;
+                prune_unidentified_linear_terms_for_marginal_slope(
+                    &mut spec,
+                    data,
+                    "survival marginal-slope logslope_formula",
+                    &mut inference_notes,
+                )?;
+                specs.push(spec);
             }
             (
                 Some(z),
@@ -7005,6 +7038,9 @@ fn materialize_survival<'a>(
                 },
                 options: BlockwiseFitOptions {
                     compute_covariance: false,
+                    robust_identification: marginal_slope_robust_identification_policy(
+                        config.robust_identification,
+                    ),
                     ..Default::default()
                 },
                 kappa_options: SpatialLengthScaleOptimizationOptions::default(),
@@ -7768,6 +7804,141 @@ mod tests {
         assert!(err.to_string().contains("main formula"));
     }
 
+    #[test]
+    fn survival_marginal_slope_matern_logslope_penalties_keep_surface_width() {
+        let n = 24usize;
+        let mut values = Array2::<f64>::zeros((n, 8));
+        for i in 0..n {
+            let u = i as f64 / (n - 1) as f64;
+            values[[i, 0]] = 0.0;
+            values[[i, 1]] = 0.25 + 8.0 * u;
+            values[[i, 2]] = if i % 3 == 0 { 1.0 } else { 0.0 };
+            values[[i, 3]] = ((i * 17 % 23) as f64 - 11.0) / 7.0;
+            values[[i, 4]] = (2.0 * std::f64::consts::PI * u).sin();
+            values[[i, 5]] = (2.0 * std::f64::consts::PI * u).cos();
+            values[[i, 6]] = 2.0 * u - 1.0;
+            values[[i, 7]] = if i % 2 == 0 { 0.0 } else { 1.0 };
+        }
+        let data = Dataset {
+            headers: vec![
+                "t0".to_string(),
+                "t1".to_string(),
+                "event".to_string(),
+                "z".to_string(),
+                "PC1".to_string(),
+                "PC2".to_string(),
+                "PC3".to_string(),
+                "sex".to_string(),
+            ],
+            values,
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "t0".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "t1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "event".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "z".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC1".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC2".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "PC3".to_string(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "sex".to_string(),
+                        kind: ColumnKindTag::Binary,
+                        levels: vec![],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Binary,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Binary,
+            ],
+        };
+        let config = FitConfig {
+            survival_likelihood: "marginal-slope".to_string(),
+            logslope_formula: Some("matern(PC1, PC2, PC3, centers=6)".to_string()),
+            z_column: Some("z".to_string()),
+            ..FitConfig::default()
+        };
+
+        let materialized = materialize(
+            "Surv(t0, t1, event) ~ matern(PC1, PC2, PC3, centers=6) + sex",
+            &data,
+            &config,
+        )
+        .expect("survival marginal-slope materialization should keep block-local penalties");
+        let FitRequest::SurvivalMarginalSlope(request) = materialized.request else {
+            panic!("expected survival marginal-slope request");
+        };
+        let specs = vec![
+            request.spec.marginalspec.clone(),
+            request.spec.logslopespec.clone(),
+        ];
+        let (designs, frozen_specs) =
+            crate::smooth::build_term_collection_designs_and_freeze_joint(
+                data.values.view(),
+                &specs,
+            )
+            .expect("joint freeze should preserve per-block penalty geometry");
+        let (rebuilt, _) = crate::smooth::build_term_collection_designs_and_freeze_joint(
+            data.values.view(),
+            &frozen_specs,
+        )
+        .expect("frozen rebuild should preserve per-block penalty geometry");
+
+        for (label, design) in [
+            ("raw marginal", &designs[0]),
+            ("raw logslope", &designs[1]),
+            ("frozen marginal", &rebuilt[0]),
+            ("frozen logslope", &rebuilt[1]),
+        ] {
+            let width = design.design.ncols();
+            assert!(
+                width > 2,
+                "{label} design should be surface-width, not sex/intercept-width; width={width}"
+            );
+            for (idx, penalty) in design.penalties_as_penalty_matrix().iter().enumerate() {
+                assert_eq!(
+                    penalty.shape(),
+                    (width, width),
+                    "{label} penalty {idx} must be block-local at the surface width"
+                );
+            }
+        }
+    }
+
     fn workflow_test_dataset() -> Dataset {
         Dataset {
             headers: vec![
@@ -8396,7 +8567,7 @@ mod tests {
             smooth_terms: vec![],
         };
         let mut notes = Vec::new();
-        let err = prune_unidentified_linear_terms_for_bernoulli_marginal_slope(
+        let err = prune_unidentified_linear_terms_for_marginal_slope(
             &mut spec,
             &data,
             "test BMS formula",
