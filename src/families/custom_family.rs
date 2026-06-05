@@ -14598,7 +14598,50 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_mode_diagonal_ridge,
                         joint_bundle,
                     );
-                    let rhs = &grad_joint - &penalty_beta;
+                    let mut rhs = &grad_joint - &penalty_beta;
+                    // Universal robustness (flag-gated): fold the family-general
+                    // Jeffreys/Firth curvature `H_Φ` and score `∇Φ` into BOTH the
+                    // matrix-free PCG step AND the dense spectral fallback below,
+                    // scoped to the under-identified span `Z_J`. Computed ONCE here
+                    // so the matvec closure and the RHS share the SAME term and the
+                    // fallback does not recompute it. The inner objective is
+                    // `−ℓ + ½βᵀSβ − Φ`, so the Newton system the step must solve is
+                    //   (H + S_λ + H_Φ) δ = (∇ℓ − S_λβ) + ∇Φ.
+                    // Previously the PCG matvec applied only `H + S_λ` and its RHS
+                    // omitted `∇Φ`, so on the matrix-free path (large p / large n)
+                    // Firth was a SILENT NO-OP: the proper-prior never reached the
+                    // step that actually moves β, leaving separation/under-
+                    // identification uncured exactly where the dense route is not
+                    // taken. The dense route (small p, e.g. BMS p≈51) was already
+                    // correct. `H_Φ` is the full-span Gauss-Newton surrogate
+                    // `½ J H_id⁻¹ Jᵀ` (Z_J = identity ⇒ p×p, not low-rank), but the
+                    // conditioning gate in `joint_jeffreys_term` returns the EXACT
+                    // zero term on every well-conditioned fit, so this stays
+                    // byte-identical there and only arms on the near-separating span
+                    // — and `hphi` is materialized once per cycle regardless, so the
+                    // matvec adds only one O(p²) HVP, preserving the matrix-free
+                    // path's asymptotics where Firth is negligible (term = `None`).
+                    let inner_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
+                        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                            match custom_family_joint_jeffreys_term(
+                                family, &states, specs, &ranges, z_joint,
+                            )? {
+                                Some((_phi, grad_phi, hphi))
+                                    if grad_phi.len() == rhs.len()
+                                        && hphi.nrows() == total_p
+                                        && hphi.ncols() == total_p =>
+                                {
+                                    rhs += &grad_phi;
+                                    Some((grad_phi, hphi))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                    let inner_jeffreys_hphi: Option<Arc<Array2<f64>>> = inner_jeffreys_term
+                        .as_ref()
+                        .map(|(_grad_phi, hphi)| Arc::new(hphi.clone()));
                     let grad_inf_for_solve = grad_joint
                         .iter()
                         .map(|x: &f64| x.abs())
@@ -14641,6 +14684,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // borrow of captures) and we need interior mutability
                         // to write into the workspace.
                         let penalty_workspace = RefCell::new(Array1::<f64>::zeros(total_p));
+                        // Capture the Jeffreys/Firth curvature for the matvec. When
+                        // armed (and nonzero past the conditioning gate) the PCG
+                        // operator becomes `H + S_λ + H_Φ`, matching the augmented
+                        // RHS `(∇ℓ − S_λβ) + ∇Φ` set above and the dense spectral
+                        // fallback. `None` ⇒ byte-identical released matvec.
+                        let pcg_hphi_dense = inner_jeffreys_hphi.clone();
+                        let pcg_hphi_op = inner_jeffreys_hphi.clone();
                         match &joint_hessian_source {
                             JointHessianSource::Dense(h_joint) => {
                                 crate::linalg::utils::solve_spd_pcg_with_info_into(
@@ -14661,6 +14711,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                             joint_bundle,
                                         );
                                         *out += &*pen;
+                                        if let Some(hphi) = pcg_hphi_dense.as_ref() {
+                                            *out += &hphi.dot(v);
+                                        }
                                     },
                                     &rhs,
                                     &preconditioner_diag,
@@ -14698,6 +14751,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                             joint_bundle,
                                         );
                                         *out += &*pen;
+                                        if let Some(hphi) = pcg_hphi_op.as_ref() {
+                                            *out += &hphi.dot(v);
+                                        }
                                     },
                                     &rhs,
                                     &preconditioner_diag,
@@ -14750,22 +14806,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         );
                         // Universal robustness (flag-gated): add the
                         // family-general Jeffreys curvature `H_Phi` to the
-                        // penalized Hessian and the Jeffreys score `+∇Φ` to the
-                        // stationarity RHS, both scoped to the under-identified
-                        // span `Z_J`. This is the Tier-B coupled-Newton form of
-                        // Firth: the reduced Fisher information `Z_J^T H Z_J`
+                        // penalized Hessian. This is the Tier-B coupled-Newton form
+                        // of Firth: the reduced Fisher information `Z_J^T H Z_J`
                         // supplies the missing O(n) curvature that bounds a
                         // near-separating coefficient to O(1). When the flag is
-                        // OFF `joint_jeffreys_subspace` is `None` and the step is
+                        // OFF `inner_jeffreys_term` is `None` and the step is
                         // byte-identical to the released solver.
-                        let mut spectral_rhs = rhs.clone();
-                        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                            if let Some((_phi, grad_phi, hphi)) = custom_family_joint_jeffreys_term(
-                                family, &states, specs, &ranges, z_joint,
-                            )? {
-                                lhs_true += &hphi;
-                                spectral_rhs += &grad_phi;
-                            }
+                        //
+                        // `∇Φ` is NOT re-added here: `rhs` (and thus `spectral_rhs`)
+                        // already carries `+∇Φ` from the single shared computation
+                        // above, and we REUSE that same `H_Φ` here rather than
+                        // recomputing the (O(p) directional-derivative) term — the
+                        // dense fallback and the matrix-free PCG step now solve the
+                        // SAME Jeffreys-augmented Newton system.
+                        let spectral_rhs = rhs.clone();
+                        if let Some((_grad_phi, hphi)) = inner_jeffreys_term.as_ref() {
+                            lhs_true += hphi;
                         }
                         // Self-vanishing Levenberg–Marquardt damping for the
                         // range-restricted spectral step. Scaled to the current
