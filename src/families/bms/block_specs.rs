@@ -2315,6 +2315,24 @@ pub fn fit_bernoulli_marginal_slope_terms(
             // rho ± h·e_i). Runs once per process at the seed rho, for ANY robust
             // setting, so we can compare ON (Force) vs OFF. The Force/firth flag
             // is read from `options.robust_identification`.
+            {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/bms_fd_probe.log")
+                {
+                    if writeln!(
+                        f,
+                        "[BMS-FD-PROBE TRACE] vg-closure eval_mode={:?} robust={:?}",
+                        eval_mode, options.robust_identification
+                    )
+                    .is_err()
+                    {
+                        log::warn!("[BMS-FD-PROBE] trace write failed");
+                    }
+                }
+            }
             let firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
                 options.robust_identification,
             )
