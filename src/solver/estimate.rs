@@ -1699,6 +1699,19 @@ pub enum EstimationError {
     PerfectSeparationDetected { iteration: usize, max_abs_eta: f64 },
 
     #[error(
+        "Perfect or quasi-perfect separation detected during multinomial fitting at iteration {iteration}. \
+        The active class-{active_class_index} logit against the reference class is saturated at training row {row_index}, \
+        so the unpenalized softmax MLE is not finite in that direction. \
+        (Diagnostic: max|eta| = {max_abs_eta:.2e})."
+    )]
+    MultinomialSeparationDetected {
+        iteration: usize,
+        max_abs_eta: f64,
+        active_class_index: usize,
+        row_index: usize,
+    },
+
+    #[error(
         "Hessian matrix is not positive definite (minimum eigenvalue: {min_eigenvalue:.4e}). This indicates a numerical instability."
     )]
     HessianNotPositiveDefinite { min_eigenvalue: f64 },
@@ -1780,6 +1793,7 @@ impl EstimationError {
             self,
             EstimationError::ModelIsIllConditioned { .. }
                 | EstimationError::PerfectSeparationDetected { .. }
+                | EstimationError::MultinomialSeparationDetected { .. }
                 | EstimationError::PirlsDidNotConverge { .. }
         )
     }

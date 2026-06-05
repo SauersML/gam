@@ -133,8 +133,8 @@ use std::sync::Arc;
 /// converges to FINITE Firth-reduced coefficients rather than drifting to the
 /// screening cap. The bare fixed-λ inner driver [`fit_penalized_multinomial`]
 /// (no outer REML, no Jeffreys term) instead surfaces the explicit
-/// `PerfectSeparationDetected` diagnostic — the same #753 acceptance, option
-/// (b), for the path that has no proper prior to lean on.
+/// `MultinomialSeparationDetected` diagnostic — the same #753 acceptance,
+/// option (b), for the path that has no proper prior to lean on.
 const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-4;
 
 /// Largest smoothing-parameter dimension where exact dense outer curvature is
@@ -157,11 +157,30 @@ fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
 /// artifact, not a finite MLE.
 const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 
-fn max_abs_eta_from_block_states(block_states: &[ParameterBlockState]) -> f64 {
-    block_states
-        .iter()
-        .flat_map(|state| state.eta.iter())
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
+fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
+    let mut best = (0.0_f64, 0usize, 0usize);
+    for ((row, active_class), &value) in eta.indexed_iter() {
+        let abs = value.abs();
+        if abs > best.0 {
+            best = (abs, row, active_class);
+        }
+    }
+    best
+}
+
+fn max_abs_eta_location_from_block_states(
+    block_states: &[ParameterBlockState],
+) -> (f64, usize, usize) {
+    let mut best = (0.0_f64, 0usize, 0usize);
+    for (active_class, state) in block_states.iter().enumerate() {
+        for (row, &value) in state.eta.iter().enumerate() {
+            let abs = value.abs();
+            if abs > best.0 {
+                best = (abs, row, active_class);
+            }
+        }
+    }
+    best
 }
 
 fn multinomial_formula_separation_diagnostic(
@@ -170,11 +189,14 @@ fn multinomial_formula_separation_diagnostic(
     outer_iterations: usize,
     block_states: &[ParameterBlockState],
 ) -> Option<EstimationError> {
-    let max_abs_eta = max_abs_eta_from_block_states(block_states);
+    let (max_abs_eta, row_index, active_class_index) =
+        max_abs_eta_location_from_block_states(block_states);
     if !outer_converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
-        Some(EstimationError::PerfectSeparationDetected {
+        Some(EstimationError::MultinomialSeparationDetected {
             iteration: inner_cycles.max(outer_iterations),
             max_abs_eta,
+            active_class_index,
+            row_index,
         })
     } else {
         None
@@ -339,14 +361,13 @@ pub fn fit_penalized_multinomial(
         "fit_penalized_multinomial",
     )?;
 
-    let max_abs_eta = fit
-        .eta
-        .iter()
-        .fold(0.0_f64, |acc, &value| acc.max(value.abs()));
+    let (max_abs_eta, row_index, active_class_index) = max_abs_eta_location(fit.eta.view());
     if !fit.converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
-        return Err(EstimationError::PerfectSeparationDetected {
+        return Err(EstimationError::MultinomialSeparationDetected {
             iteration: fit.iterations,
             max_abs_eta,
+            active_class_index,
+            row_index,
         });
     }
 
@@ -934,12 +955,20 @@ mod fisher_override_tests {
         })
         .expect_err("complete softmax separation must be a hard diagnostic");
         assert!(
-            matches!(err, EstimationError::PerfectSeparationDetected { .. }),
-            "expected PerfectSeparationDetected, got {err:?}"
+            matches!(err, EstimationError::MultinomialSeparationDetected { .. }),
+            "expected MultinomialSeparationDetected, got {err:?}"
         );
         assert!(
             err.to_string().contains("separation"),
             "diagnostic should mention separation, got {err}"
+        );
+        assert!(
+            err.to_string().contains("active class-"),
+            "diagnostic should name the separated active class logit, got {err}"
+        );
+        assert!(
+            !err.to_string().contains("binary outcomes"),
+            "multinomial diagnostic must not reuse the binary separation text, got {err}"
         );
     }
 
@@ -961,12 +990,14 @@ mod fisher_override_tests {
         assert!(
             matches!(
                 err,
-                EstimationError::PerfectSeparationDetected {
+                EstimationError::MultinomialSeparationDetected {
                     iteration: 17,
-                    max_abs_eta
+                    max_abs_eta,
+                    active_class_index: 1,
+                    row_index: 1,
                 } if (max_abs_eta - 25.5).abs() <= f64::EPSILON
             ),
-            "expected typed separation diagnostic with final max|eta|, got {err:?}"
+            "expected typed multinomial separation diagnostic with final max|eta| and channel location, got {err:?}"
         );
 
         assert!(
