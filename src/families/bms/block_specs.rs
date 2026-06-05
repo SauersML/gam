@@ -389,8 +389,9 @@ fn marginal_logslope_overlap_penalty(
 ///
 /// The genuine marginal smooth penalties keep their `col_range` (marginal
 /// columns stay in `0..p_m`). Returns `(penalties, nullspace_dims,
-/// initial_log_lambdas)` to install on the marginal block; the caller pins the
-/// trailing FIXED ridge slots by mirroring the append order documented above.
+/// initial_log_lambdas)` to install on the marginal block. Fixed ridges remain
+/// in this physical penalty layout and are removed from every REML/outer
+/// coordinate vector by [`PenaltyMatrix::Fixed`].
 fn marginal_penalties_with_influence_ridge(
     design: &TermCollectionDesign,
     rho_marginal: &Array1<f64>,
@@ -744,6 +745,31 @@ fn bernoulli_marginal_slope_runaway_error(
 #[cfg(test)]
 mod runaway_tests {
     use super::*;
+
+    #[test]
+    fn spatial_joint_setup_counts_only_learned_penalties_in_rho() {
+        let data = Array2::<f64>::zeros((3, 1));
+        let empty_terms = TermCollectionSpec {
+            linear_terms: Vec::new(),
+            random_effect_terms: Vec::new(),
+            smooth_terms: Vec::new(),
+        };
+        let setup = joint_setup(
+            data.view(),
+            &empty_terms,
+            &empty_terms,
+            2,
+            3,
+            &[0.4],
+            &SpatialLengthScaleOptimizationOptions::default(),
+        );
+
+        assert_eq!(
+            setup.rho_dim(),
+            6,
+            "BMS spatial setup rho must contain only learned marginal/logslope/auxiliary penalties; fixed physical ridges are carried by PenaltyMatrix::Fixed"
+        );
+    }
 
     #[test]
     fn overlap_penalty_targets_score_weighted_logslope_span() {
@@ -1477,43 +1503,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         probit_scale,
     )?;
 
-    // Fixed (pinned-out-of-REML) ridge slots appended after the marginal
-    // block's genuine smooth penalties, in install order:
-    //
-    //   1. gam#754 nullspace-shrinkage ridge — ALWAYS present for a non-empty
-    //      marginal block (its aggregate smooth penalty is never full rank: the
-    //      parametric intercept column alone guarantees a null direction), so
-    //      `build_nullspace_shrinkage_penalty` always returns a shrinkage.
-    //   2. gam#754 marginal/logslope overlap ridge — present when the pilot
-    //      effective marginal Jacobian has a nonzero projection onto the pilot
-    //      effective logslope Jacobian.
-    //   3. #461 Stage-1 influence absorber ridge — only when influence columns
-    //      are present.
-    //
-    // Each occupies a flat-ρ position (so `marginal_penalty_count` grows) but is
-    // held at its fixed value via a degenerate outer ρ box rather than being
-    // REML-optimised. The pinned indices below MUST match the append order in
-    // `marginal_penalties_with_influence_ridge`.
-    let nullspace_ridge_slots = usize::from(marginal_design.design.ncols() > 0);
-    let overlap_ridge_slots = usize::from(marginal_logslope_overlap_penalty_matrix.is_some());
-    let influence_ridge_slots = usize::from(influence_columns.is_some());
-    let marginal_penalty_count = marginal_design.penalties.len()
-        + nullspace_ridge_slots
-        + overlap_ridge_slots
-        + influence_ridge_slots;
-    let mut pinned_rho_slots: Vec<(usize, f64)> = Vec::new();
-    let mut pinned_cursor = marginal_design.penalties.len();
-    if nullspace_ridge_slots == 1 {
-        pinned_rho_slots.push((pinned_cursor, MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA));
-        pinned_cursor += 1;
-    }
-    if overlap_ridge_slots == 1 {
-        pinned_rho_slots.push((pinned_cursor, MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA));
-        pinned_cursor += 1;
-    }
-    if influence_ridge_slots == 1 {
-        pinned_rho_slots.push((pinned_cursor, INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA));
-    }
+    let marginal_penalty_count = marginal_design.penalties.len();
     let setup = joint_setup(
         data_view,
         &marginalspec_boot,
@@ -1522,7 +1512,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         logslope_design.penalties.len(),
         &extra_rho0,
         &effective_kappa_options,
-        &pinned_rho_slots,
     );
     let setup = if sigma_learnable {
         setup.with_auxiliary(
@@ -1553,24 +1542,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
      -> Result<Vec<ParameterBlockSpec>, String> {
         let hints = hints.borrow();
         let mut cursor = 0usize;
-        // The marginal block owns its term-collection smooth penalties (the
-        // genuine REML-learned ρ slots) PLUS trailing FIXED-ridge slots: the
-        // gam#754 nullspace-shrinkage ridge (always, for a non-empty marginal
-        // block), the gam#754 marginal/logslope overlap ridge (when the
-        // realized overlap is nonzero), and, when the Stage-1 influence
-        // absorber is active, the #461 influence ridge. The fixed slots are held
-        // at pinned values via outer bounds, but they still occupy ρ positions
-        // so they must be skipped here. Only the genuine smooth slots feed
-        // `rho_marginal`; the fixed slots' log-λ are appended from constants inside
-        // `marginal_penalties_with_influence_ridge`.
-        let nullspace_extra = usize::from(marginal_design.design.ncols() > 0);
-        let overlap_extra = usize::from(marginal_logslope_overlap_penalty_matrix.is_some());
-        let influence_extra = usize::from(influence_columns.is_some());
+        // Fixed #754/#461 ridges are appended inside
+        // `marginal_penalties_with_influence_ridge` as physical penalties and
+        // are excluded from `rho`; only genuine REML-learned smooth penalties
+        // appear in the spatial joint setup.
         let rho_marginal = rho
             .slice(s![cursor..cursor + marginal_design.penalties.len()])
             .to_owned();
-        cursor +=
-            marginal_design.penalties.len() + nullspace_extra + overlap_extra + influence_extra;
+        cursor += marginal_design.penalties.len();
         let rho_logslope = rho
             .slice(s![cursor..cursor + logslope_design.penalties.len()])
             .to_owned();
