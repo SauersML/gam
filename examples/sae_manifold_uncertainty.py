@@ -16,22 +16,26 @@ import gamfit
 
 def main() -> None:
     rng = np.random.default_rng(674)
-    n = 180
-    theta = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
-    x = np.c_[
-        np.cos(theta),
-        np.sin(theta),
-        0.25 * np.cos(2.0 * theta),
-    ]
-    x += 0.035 * rng.standard_normal(x.shape)
+    n = 300
+    theta = rng.uniform(0.0, 1.0, n)
+    x = np.column_stack([
+        np.cos(2.0 * np.pi * theta),
+        np.sin(2.0 * np.pi * theta),
+    ])
+    x += 0.14 * rng.standard_normal(x.shape)
 
     fit = gamfit.sae_manifold_fit(
         x,
         K=1,
         d_atom=1,
         atom_topology="circle",
-        assignment="ibp",
-        n_iter=18,
+        assignment="softmax",
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        sparsity_weight=0.01,
+        smoothness_weight=0.01,
+        max_iter=40,
+        learning_rate=1.0,
         random_state=674,
     )
 
