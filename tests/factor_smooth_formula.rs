@@ -1,5 +1,6 @@
 use ndarray::Array2;
 
+use gam::basis::BSplineKnotSpec;
 use gam::inference::data::EncodedDataset;
 use gam::inference::formula_dsl::{ParsedTerm, parse_formula};
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
@@ -80,6 +81,49 @@ fn tiny_dataset() -> EncodedDataset {
             ColumnKindTag::Continuous,
             ColumnKindTag::Categorical,
             ColumnKindTag::Continuous,
+        ],
+    }
+}
+
+fn sleepstudy_shaped_dataset() -> EncodedDataset {
+    let n_subjects = 18usize;
+    let n_days = 8usize;
+    let mut values = Array2::<f64>::zeros((n_subjects * n_days, 3));
+    let mut row = 0usize;
+    for subject in 0..n_subjects {
+        for day in 0..n_days {
+            values[[row, 0]] = 250.0 + 10.0 * day as f64 + 2.0 * subject as f64;
+            values[[row, 1]] = day as f64;
+            values[[row, 2]] = subject as f64;
+            row += 1;
+        }
+    }
+    EncodedDataset {
+        headers: vec!["y".into(), "x".into(), "fac".into()],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "fac".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: (0..n_subjects).map(|s| s.to_string()).collect(),
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
         ],
     }
 }
@@ -182,6 +226,39 @@ fn factor_smooth_forms_route_to_new_termspec_variants() {
             }
         }
     ));
+}
+
+#[test]
+fn fs_default_basis_is_capped_by_least_resolved_group() {
+    let ds = sleepstudy_shaped_dataset();
+    let parsed = parse_formula("y ~ s(x, fac, bs=\"fs\")").unwrap();
+    let mut notes = Vec::new();
+    let spec = build_termspec(
+        &parsed.terms,
+        &ds,
+        &ds.column_map(),
+        &mut notes,
+        &ResourcePolicy::default_library(),
+    )
+    .unwrap();
+
+    let SmoothBasisSpec::FactorSmooth { spec } = &spec.smooth_terms[0].basis else {
+        panic!("expected FactorSmooth term");
+    };
+    assert!(matches!(spec.flavour, FactorSmoothFlavour::Fs { .. }));
+    assert!(spec.marginal.double_penalty);
+    assert_eq!(spec.marginal.degree, 3);
+    match &spec.marginal.knotspec {
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        } => {
+            assert_eq!(
+                *num_internal_knots, 2,
+                "8 observations per group with cubic fs must build a 6-column marginal, not a pooled 8-column interpolator"
+            );
+        }
+        other => panic!("expected generated factor-smooth knots, got {other:?}"),
+    }
 }
 
 #[test]
