@@ -116,11 +116,7 @@ fn encode(y: &[f64], x1: &[f64], x2: &[f64]) -> gam::inference::data::EncodedDat
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows: Vec<csv::StringRecord> = (0..y.len())
         .map(|i| {
-            csv::StringRecord::from(vec![
-                y[i].to_string(),
-                x1[i].to_string(),
-                x2[i].to_string(),
-            ])
+            csv::StringRecord::from(vec![y[i].to_string(), x1[i].to_string(), x2[i].to_string()])
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode beta dataset")
