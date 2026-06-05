@@ -1486,20 +1486,14 @@ fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<Standa
 /// Resolve whether the Jeffreys/Firth term should be assembled on the REML path
 /// and, if so, the standard link to evaluate the Fisher weight with.
 ///
-/// `Off` reproduces the released gate exactly: active only for the legacy
-/// `firth_bias_reduction` flag on Binomial-Logit. Under `Auto`/`Force` the gate
-/// broadens to every Binomial link with a closed-form Fisher-weight jet (adds
-/// probit), keeping the released path byte-identical when the flag is `Off`.
+/// Robustness is unconditionally on, so the gate covers every Binomial link with
+/// a closed-form Fisher-weight jet (logit + probit). The legacy
+/// `firth_bias_reduction` flag remains a fallback for any Firth-supporting
+/// likelihood the closed-form jet does not yet cover (resolved on Logit).
 #[inline]
 pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<StandardLink> {
-    let robust_on = !matches!(
-        config.robust_identification,
-        crate::solver::workflow::RobustIdentification::Off
-    );
-    if robust_on {
-        if let Some(link) = reml_jeffreys_supported_link(&config.likelihood) {
-            return Some(link);
-        }
+    if let Some(link) = reml_jeffreys_supported_link(&config.likelihood) {
+        return Some(link);
     }
     if config.firth_bias_reduction && reml_supports_firth(&config.likelihood) {
         return Some(StandardLink::Logit);

@@ -3957,6 +3957,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
                 firth_bias_reduction: false,
+                robust_identification: Default::default(),
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: Some(1e-6),
                 rho_prior: Default::default(),
