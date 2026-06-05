@@ -13,6 +13,8 @@
 //! and treated the cost as a log-evidence, so the worst model won and every
 //! Bayes factor was inverted — see issue #396.
 
+use std::cmp::Ordering;
+
 /// One candidate fit in a REML model comparison.
 #[derive(Clone, Debug)]
 pub struct RemlCandidate {
@@ -86,26 +88,13 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     if candidates.is_empty() {
         return Err("compare_models requires at least one fit".to_string());
     }
-    let rejected = crate::solver::priority_search::rank_min_finite_scores(
-        candidates
-            .iter()
-            .enumerate()
-            .map(|(pos, candidate)| (pos, candidate.score)),
-    )
-    .rejected_indices;
-    if let Some(pos) = rejected.first() {
-        return Err(format!(
-            "compare_models candidate '{}' has non-finite REML score {}",
-            candidates[*pos].name, candidates[*pos].score
-        ));
-    }
 
     // Lowest-cost model wins: `RemlCandidate::score` is the optimiser's
     // minimised cost (issue #396 was the wrong direction here).
     candidates.sort_by(|left, right| {
-        crate::solver::priority_search::compare_min_finite_scores(left.score, right.score, || {
-            left.index.cmp(&right.index)
-        })
+        left.score
+            .partial_cmp(&right.score)
+            .unwrap_or(Ordering::Equal)
     });
 
     let best_score = candidates[0].score;

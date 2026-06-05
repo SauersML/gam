@@ -17,7 +17,6 @@ pub mod orthogonal_reparam;
 pub mod outer_strategy;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
-pub(crate) mod priority_search;
 pub mod protocol;
 pub mod reml_compare;
 pub mod riemannian;
