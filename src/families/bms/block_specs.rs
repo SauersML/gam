@@ -842,11 +842,14 @@ fn bernoulli_marginal_slope_runaway_error_from_argmax(
          (local column {local_col}) has \
          |β|∞={beta_abs:.3e} (diagnostic threshold \
          {BMS_PROBIT_SEPARATION_BETA_INF:.1}). The joint design is identifiable; \
-         {explanation}. {inner_status}. Reduce or reparameterize the coupled \
-         marginal/logslope surface, use a lower-dimensional logslope interaction, \
-         or fit with an explicit declared separation/bias-reduction prior when \
-         that model is available. This is not a Matérn/Duchon polynomial-nullspace \
-         or cross-block gauge-priority failure."
+         {explanation}. {inner_status}. The robust Jeffreys curvature path is \
+         already installed for this fit, so this diagnostic means the current \
+         coupled surface still exposes a separation-scale direction rather than \
+         a request for an external bias-reduction prior. Reduce or \
+         reparameterize the coupled marginal/logslope surface, or use a \
+         lower-dimensional logslope interaction. This is not a \
+         Matérn/Duchon polynomial-nullspace or cross-block gauge-priority \
+         failure."
     ))
 }
 
@@ -1073,6 +1076,8 @@ mod runaway_tests {
 
         assert!(msg.contains("term 'sex'"));
         assert!(msg.contains("unpenalized parametric marginal direction"));
+        assert!(msg.contains("robust Jeffreys curvature path is already installed"));
+        assert!(!msg.contains("explicit declared separation/bias-reduction prior"));
         assert!(msg.contains("not a Matérn/Duchon polynomial-nullspace"));
     }
 
