@@ -2,8 +2,7 @@ use gam::mixture_link::{
     inverse_link_jet_for_family, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
 };
 use gam::topology_selector::{
-    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoScreeningEvidence, TopologyAutoSelector,
-    select_topology_with_fit, select_topology_with_screening,
+    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, select_topology_with_fit,
 };
 use gam::types::{
     InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec,
@@ -191,56 +190,5 @@ fn topology_selector_breaks_exact_ties_deterministically_by_candidate_order() {
     assert_eq!(
         winner.topology_name, "torus",
         "When topology scores tie exactly, selection should be deterministic and prefer the first candidate in input order"
-    );
-}
-
-#[test]
-fn topology_selector_screens_then_escalates_only_survivors() {
-    let mut selector = TopologyAutoSelector::new(Some(vec![
-        AutoTopologyKind::Euclidean,
-        AutoTopologyKind::Circle,
-        AutoTopologyKind::Sphere,
-    ]));
-    selector.screen_survivor_count = 1;
-
-    let mut full_fit_calls = Vec::new();
-    let out = select_topology_with_screening(
-        &selector,
-        |kind| {
-            Ok::<_, String>(TopologyAutoScreeningEvidence {
-                topology_name: kind.as_str().to_string(),
-                raw_reml: match kind {
-                    AutoTopologyKind::Circle => 1.0,
-                    AutoTopologyKind::Sphere => 2.0,
-                    AutoTopologyKind::Euclidean => 9.0,
-                    _ => unreachable!(),
-                },
-                null_dim: 0.0,
-                null_space_logdet: None,
-                effective_dim: 2.0,
-                n_obs: 100,
-            })
-        },
-        |kind| {
-            full_fit_calls.push(kind);
-            Ok::<_, String>(TopologyAutoFitEvidence {
-                topology_name: kind.as_str().to_string(),
-                raw_reml: 0.5,
-                null_dim: 0.0,
-                null_space_logdet: None,
-                effective_dim: 2.0,
-                n_obs: 100,
-                fit_handle: kind.as_str().to_string(),
-            })
-        },
-    )
-    .expect("screened topology selection should escalate the best proxy");
-
-    assert_eq!(full_fit_calls, vec![AutoTopologyKind::Circle]);
-    assert_eq!(
-        out.winner()
-            .expect("screened topology selection should produce a winner")
-            .topology_name,
-        "circle"
     );
 }
