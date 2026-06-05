@@ -999,6 +999,24 @@ fn build_logslope_blockspec_bms(
     let logslope_dense = design
         .design
         .try_to_dense_arc("build_logslope_blockspec_bms::logslope")?;
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/bms_dbg.log")
+        {
+            writeln!(
+                f,
+                "build_logslope_blockspec design.ncols={} dense.ncols={} penalties={} nullspace_dims={:?}",
+                design.design.ncols(),
+                logslope_dense.ncols(),
+                design.penalties.len(),
+                design.nullspace_dims,
+            )
+            .ok();
+        }
+    }
     let callback: Arc<dyn BlockEffectiveJacobian> = Arc::new(BmsLogslopeJacobian {
         marginal_dense,
         logslope_dense: Arc::clone(&logslope_dense),
