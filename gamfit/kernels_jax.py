@@ -1,8 +1,9 @@
 """JAX adapter for the Sinkhorn-barycenter kernel.
 
 Exposes :func:`sinkhorn_barycenter` as a :func:`jax.custom_vjp` whose
-backward pass calls the Rust adjoint VJP. Importing this module
-raises a clear :class:`ImportError` if JAX is not installed.
+backward pass calls the Rust VJP for the same finite-iteration
+Sinkhorn map used in the forward pass. Importing this module raises a
+clear :class:`ImportError` if JAX is not installed.
 
 All numerics live in Rust; this file is purely a JAX-autograd shim
 and host/device marshalling.
@@ -41,7 +42,7 @@ def _vjp_host(atoms_np, weights_np, cost_np, eps, n_iter, cot_np):
 def sinkhorn_barycenter(atoms, weights, cost, eps=0.01, n_iter=20):
     """Differentiable Sinkhorn Wasserstein barycenter (JAX).
 
-    Backward via Rust adjoint VJP (``O(K * M^2)`` memory).
+    Backward via Rust finite-iteration VJP at the same ``n_iter``.
     """
     atoms_np = np.asarray(atoms, dtype=np.float64)
     weights_np = np.asarray(weights, dtype=np.float64)
