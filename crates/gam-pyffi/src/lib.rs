@@ -140,7 +140,7 @@ use pyo3::IntoPyObjectExt;
 type PyObject = pyo3::Py<pyo3::PyAny>;
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::de::{MapAccess, Visitor};
@@ -23130,29 +23130,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         "IntegrationError",
         module.py().get_type::<IntegrationError>(),
     )?;
-
-    // #773: `create_exception!` stamps every gamfit exception with
-    // `__module__ = "_rust"`, but the compiled extension is importable only as
-    // `gamfit._rust` (see `gamfit._binding.rust_module`). Pickle records a class
-    // by `(__module__, __qualname__)` and reconstructs it with `import _rust;
-    // getattr(...)`, which fails — so any `_rust.*` exception raised inside a
-    // `ProcessPoolExecutor` worker is masked by an opaque `PicklingError` that
-    // hides the real failure and takes down the whole pool. Repoint each
-    // exception class at its true importable module so the type round-trips
-    // through pickle. Walking the module dict for `GamError` subclasses keeps
-    // this correct as exceptions are added — no parallel name list to drift.
-    {
-        let gam_error = module.py().get_type::<GamError>();
-        for (_name, value) in module.dict().iter() {
-            let Ok(ty) = value.downcast::<PyType>() else {
-                continue;
-            };
-            if ty.is_subclass(gam_error.as_any())? {
-                ty.as_any().setattr("__module__", "gamfit._rust")?;
-            }
-        }
-    }
-
     module.add_class::<EuclideanManifold>()?;
     module.add_class::<CircleManifold>()?;
     module.add_class::<SphereManifold>()?;
