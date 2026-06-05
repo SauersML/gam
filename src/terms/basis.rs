@@ -17226,19 +17226,6 @@ fn build_duchon_operator_penalty_psi_derivatives(
         );
     }
     let metric_weights: Option<Vec<f64>> = aniso.map(centered_aniso_metric_weights);
-    // Only assemble derivative-order blocks that the *enabled* operator
-    // penalties actually consume. `max_derivative_order` is computed from
-    // `effective_operator_penalties`, which has tension/stiffness already
-    // disabled when the kernel is too rough to admit them (the
-    // `two_pps <= dim + k` guards above). Computing higher-order blocks
-    // anyway is not just wasted work — the d2 collision branch calls
-    // `duchonphi_rr_collision_psi_triplet`, which requires
-    // `2(p+s) > dim + 2` and aborts the whole fit when the upstream
-    // auto-disable has correctly recognized the boundary case. Gating the
-    // accumulators here keeps the contract between the operator-spec
-    // validator and the per-pair worker consistent.
-    let need_d1 = max_derivative_order >= 1;
-    let need_d2 = max_derivative_order >= 2;
     let chunk_count = rayon::current_num_threads().max(1);
     let chunk_size = p_colloc.div_ceil(chunk_count).max(1);
     let chunks: Vec<(usize, usize)> = (0..p_colloc)
@@ -17279,9 +17266,6 @@ fn build_duchon_operator_penalty_psi_derivatives(
                             local.d0_psi[[i, col]] += core.phi.psi * z_jc;
                             local.d0_psi_psi[[i, col]] += core.phi.psi_psi * z_jc;
                         }
-                        if !need_d1 && !need_d2 {
-                            continue;
-                        }
                         if r > 1e-10 {
                             let jets =
                                 duchon_radial_jets(r, length_scale, p_order, s_order, d, &coeffs)?;
@@ -17292,57 +17276,52 @@ fn build_duchon_operator_penalty_psi_derivatives(
                             let (t_psi, t_psi_psi) = scaled_log_kappa_derivatives(
                                 jets.t, jets.t_r, jets.t_rr, t_exponent, r,
                             );
-                            if need_d1 {
-                                for axis in 0..d {
-                                    let delta = collocation_points[[i, axis]] - centers[[j, axis]];
-                                    let axis_scale = metric_weights
-                                        .as_ref()
-                                        .map(|weights| weights[axis])
-                                        .unwrap_or(1.0);
-                                    let row = i * d + axis;
-                                    for col in 0..kernel_cols {
-                                        let z_jc = z_kernel[[j, col]];
-                                        local.d1[[row, col]] += q * axis_scale * delta * z_jc;
-                                        local.d1_psi[[row, col]] +=
-                                            q_psi * axis_scale * delta * z_jc;
-                                        local.d1_psi_psi[[row, col]] +=
-                                            q_psi_psi * axis_scale * delta * z_jc;
-                                    }
-                                }
-                            }
-                            if need_d2 {
+                            for axis in 0..d {
+                                let delta = collocation_points[[i, axis]] - centers[[j, axis]];
+                                let axis_scale = metric_weights
+                                    .as_ref()
+                                    .map(|weights| weights[axis])
+                                    .unwrap_or(1.0);
+                                let row = i * d + axis;
                                 for col in 0..kernel_cols {
                                     let z_jc = z_kernel[[j, col]];
-                                    for axis_b in 0..d {
-                                        let h_b =
-                                            collocation_points[[i, axis_b]] - centers[[j, axis_b]];
-                                        let w_b = metric_weights
+                                    local.d1[[row, col]] += q * axis_scale * delta * z_jc;
+                                    local.d1_psi[[row, col]] += q_psi * axis_scale * delta * z_jc;
+                                    local.d1_psi_psi[[row, col]] +=
+                                        q_psi_psi * axis_scale * delta * z_jc;
+                                }
+                            }
+                            for col in 0..kernel_cols {
+                                let z_jc = z_kernel[[j, col]];
+                                for axis_b in 0..d {
+                                    let h_b =
+                                        collocation_points[[i, axis_b]] - centers[[j, axis_b]];
+                                    let w_b = metric_weights
+                                        .as_ref()
+                                        .map(|weights| weights[axis_b])
+                                        .unwrap_or(1.0);
+                                    for axis_c in 0..d {
+                                        let h_c =
+                                            collocation_points[[i, axis_c]] - centers[[j, axis_c]];
+                                        let w_c = metric_weights
                                             .as_ref()
-                                            .map(|weights| weights[axis_b])
+                                            .map(|weights| weights[axis_c])
                                             .unwrap_or(1.0);
-                                        for axis_c in 0..d {
-                                            let h_c = collocation_points[[i, axis_c]]
-                                                - centers[[j, axis_c]];
-                                            let w_c = metric_weights
-                                                .as_ref()
-                                                .map(|weights| weights[axis_c])
-                                                .unwrap_or(1.0);
-                                            let row = (i * d + axis_b) * d + axis_c;
-                                            local.d2[[row, col]] += hessian_operator_entry(
-                                                q, jets.t, h_b, h_c, w_b, w_c, axis_b, axis_c,
-                                            ) * z_jc;
-                                            local.d2_psi[[row, col]] += hessian_operator_entry(
-                                                q_psi, t_psi, h_b, h_c, w_b, w_c, axis_b, axis_c,
-                                            ) * z_jc;
-                                            local.d2_psi_psi[[row, col]] += hessian_operator_entry(
-                                                q_psi_psi, t_psi_psi, h_b, h_c, w_b, w_c, axis_b,
-                                                axis_c,
-                                            ) * z_jc;
-                                        }
+                                        let row = (i * d + axis_b) * d + axis_c;
+                                        local.d2[[row, col]] += hessian_operator_entry(
+                                            q, jets.t, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                                        ) * z_jc;
+                                        local.d2_psi[[row, col]] += hessian_operator_entry(
+                                            q_psi, t_psi, h_b, h_c, w_b, w_c, axis_b, axis_c,
+                                        ) * z_jc;
+                                        local.d2_psi_psi[[row, col]] += hessian_operator_entry(
+                                            q_psi_psi, t_psi_psi, h_b, h_c, w_b, w_c, axis_b,
+                                            axis_c,
+                                        ) * z_jc;
                                     }
                                 }
                             }
-                        } else if need_d2 {
+                        } else {
                             let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
                                 duchonphi_rr_collision_psi_triplet(
                                     length_scale,
