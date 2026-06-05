@@ -13,6 +13,8 @@
 //! and treated the cost as a log-evidence, so the worst model won and every
 //! Bayes factor was inverted — see issue #396.
 
+use std::cmp::Ordering;
+
 /// One candidate fit in a REML model comparison.
 #[derive(Clone, Debug)]
 pub struct RemlCandidate {
@@ -59,36 +61,6 @@ pub struct ScoreRow {
     pub effective_dof: Option<f64>,
 }
 
-pub fn screen_reml_candidate_indices(
-    candidates: &[RemlCandidate],
-    survivor_count: usize,
-) -> Result<Vec<usize>, String> {
-    if candidates.is_empty() {
-        return Err("screen_reml_candidate_indices requires at least one fit".to_string());
-    }
-    if survivor_count == 0 {
-        return Err("screen_reml_candidate_indices requires a positive survivor_count".to_string());
-    }
-    let ranking = crate::solver::priority_search::rank_min_finite_scores(
-        candidates
-            .iter()
-            .enumerate()
-            .map(|(pos, candidate)| (pos, candidate.score)),
-    );
-    if let Some(pos) = ranking.rejected_indices.first() {
-        return Err(format!(
-            "screen_reml_candidate_indices candidate '{}' has non-finite REML score {}",
-            candidates[*pos].name, candidates[*pos].score
-        ));
-    }
-    Ok(ranking
-        .ranked_indices
-        .into_iter()
-        .take(survivor_count.min(candidates.len()))
-        .map(|pos| candidates[pos].index)
-        .collect())
-}
-
 /// Log Bayes factor of model `a` over model `b`, computed from the minimised
 /// REML/LAML costs the optimiser stores on each fit.
 ///
@@ -116,26 +88,13 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     if candidates.is_empty() {
         return Err("compare_models requires at least one fit".to_string());
     }
-    let rejected = crate::solver::priority_search::rank_min_finite_scores(
-        candidates
-            .iter()
-            .enumerate()
-            .map(|(pos, candidate)| (pos, candidate.score)),
-    )
-    .rejected_indices;
-    if let Some(pos) = rejected.first() {
-        return Err(format!(
-            "compare_models candidate '{}' has non-finite REML score {}",
-            candidates[*pos].name, candidates[*pos].score
-        ));
-    }
 
     // Lowest-cost model wins: `RemlCandidate::score` is the optimiser's
     // minimised cost (issue #396 was the wrong direction here).
     candidates.sort_by(|left, right| {
-        crate::solver::priority_search::compare_min_finite_scores(left.score, right.score, || {
-            left.index.cmp(&right.index)
-        })
+        left.score
+            .partial_cmp(&right.score)
+            .unwrap_or(Ordering::Equal)
     });
 
     let best_score = candidates[0].score;
@@ -237,9 +196,7 @@ pub fn format_three_significant(value: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        RemlCandidate, compare_reml_fits, log_bayes_factor, screen_reml_candidate_indices,
-    };
+    use super::{RemlCandidate, compare_reml_fits, log_bayes_factor};
 
     /// The cost→Bayes-factor convention: `reml_score` is a minimised cost, so
     /// the log BF of `a` over `b` is `score_b - score_a`, which is `> 0`
@@ -315,36 +272,6 @@ mod tests {
             (comparison.score_table[1].bayes_factor_best_over_model - 3.0_f64.exp()).abs() < 1e-12
         );
         assert!(comparison.evidence_summary.contains("low_cost"));
-    }
-
-    #[test]
-    fn screening_returns_original_indices_for_lowest_cost_survivors() {
-        let survivors = screen_reml_candidate_indices(
-            &[
-                RemlCandidate {
-                    index: 20,
-                    name: "expensive_bad_proxy".to_string(),
-                    score: 9.0,
-                    edf: None,
-                },
-                RemlCandidate {
-                    index: 10,
-                    name: "cheap_best_proxy".to_string(),
-                    score: 1.0,
-                    edf: None,
-                },
-                RemlCandidate {
-                    index: 30,
-                    name: "cheap_second_proxy".to_string(),
-                    score: 2.0,
-                    edf: None,
-                },
-            ],
-            2,
-        )
-        .expect("finite proxy candidates should screen");
-
-        assert_eq!(survivors, vec![10, 30]);
     }
 
     /// Regression for issue #396: pre-fix this exact configuration declared

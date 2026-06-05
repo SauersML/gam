@@ -1125,10 +1125,13 @@ fn rank_seeds_with_screening(
         return seeds.to_vec();
     }
 
-    let priority = crate::solver::priority_search::rank_min_finite_scores(ranked.iter().copied());
+    ranked.sort_by(|(idx_a, cost_a), (idx_b, cost_b)| {
+        cost_a.total_cmp(cost_b).then_with(|| idx_a.cmp(idx_b))
+    });
+
     let mut ordered = Vec::with_capacity(seeds.len());
     let mut seen = vec![false; seeds.len()];
-    for idx in priority.ranked_indices {
+    for (idx, _) in ranked {
         seen[idx] = true;
         ordered.push(seeds[idx].clone());
     }
@@ -1231,12 +1234,8 @@ fn seed_is_oversmoothing_boundary(seed: &Array1<f64>, rho_dim: usize, upper: &[f
 fn candidate_improves_best(candidate: &OuterResult, best: Option<&OuterResult>) -> bool {
     match best {
         None => true,
-        Some(best) => crate::solver::priority_search::candidate_improves_min_score(
-            candidate.final_value,
-            candidate.converged,
-            best.final_value,
-            best.converged,
-        ),
+        Some(best) if candidate.converged != best.converged => candidate.converged,
+        Some(best) => candidate.final_value < best.final_value,
     }
 }
 
