@@ -222,6 +222,7 @@ fn standard_fit_options(max_iter: usize) -> FitOptions {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
+        robust_identification: gam::RobustIdentification::Off,
         adaptive_regularization: Some(AdaptiveRegularizationOptions {
             enabled: false,
             ..Default::default()

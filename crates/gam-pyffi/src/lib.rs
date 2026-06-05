@@ -193,6 +193,7 @@ struct PyFitConfig {
     noise_offset: Option<String>,
 
     firth: Option<bool>,
+    robust_identification: Option<String>,
     gpu: Option<String>,
     device: Option<String>,
 
@@ -28367,6 +28368,15 @@ fn parse_fit_config(config_json: Option<&str>) -> Result<(FitConfig, Option<Stri
     }
     if let Some(flag) = py_config.firth {
         fit_config.firth = flag;
+    }
+    if let Some(raw) = py_config.robust_identification {
+        fit_config.robust_identification =
+            gam::RobustIdentification::parse(&raw).ok_or_else(|| {
+                format!(
+                    "invalid robust_identification '{}'; expected off, auto, or force",
+                    raw
+                )
+            })?;
     }
     if let Some(raw_gpu) = py_config.gpu {
         fit_config.gpu_policy = gam::gpu::GpuPolicy::parse(&raw_gpu).ok_or_else(|| {

@@ -1969,6 +1969,7 @@ fn resolved_external_config(
         resolve_external_family(&opts.family, opts.firth_bias_reduction)?;
     let link = likelihood.link_function();
     let mut cfg = RemlConfig::external(likelihood, opts.tol, firth_active);
+    cfg.robust_identification = opts.robust_identification;
     cfg.link_kind = resolved_external_inverse_link(
         link,
         opts.latent_cloglog,
@@ -4032,6 +4033,9 @@ pub struct FitOptions {
     /// evaluator so baseline fits, spatial hyperparameter evaluations, outer
     /// line searches, final refits, and inference all optimize the same target.
     pub firth_bias_reduction: bool,
+    /// Universal under-identification robustness policy. `Off` (default) leaves
+    /// every objective evaluation byte-identical to released behavior.
+    pub robust_identification: crate::solver::workflow::RobustIdentification,
     pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
     /// Relative shrinkage floor for penalized block eigenvalues.
     ///
@@ -4076,6 +4080,7 @@ impl Default for FitOptions {
             nullspace_dims: Vec::new(),
             linear_constraints: None,
             firth_bias_reduction: false,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
             adaptive_regularization: None,
             penalty_shrinkage_floor: Some(1e-6),
             rho_prior: crate::types::RhoPrior::default(),
@@ -6307,6 +6312,7 @@ where
         nullspace_dims,
         linear_constraints: opts.linear_constraints.clone(),
         firth_bias_reduction: Some(opts.firth_bias_reduction),
+        robust_identification: opts.robust_identification,
         penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
         // Propagate caller's rho_prior so inner outer-REML minimizes the
         // same objective as paths that build ExternalOptimOptions directly.
@@ -7206,6 +7212,7 @@ mod estimate_policy_tests {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
@@ -7431,6 +7438,7 @@ mod estimate_policy_tests {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
             kronecker_penalty_system: None,
@@ -7599,6 +7607,7 @@ mod estimate_policy_tests {
             nullspace_dims: vec![1],
             linear_constraints: None,
             firth_bias_reduction: None,
+            robust_identification: crate::solver::workflow::RobustIdentification::Off,
             penalty_shrinkage_floor: None,
             rho_prior: Default::default(),
             kronecker_penalty_system: None,

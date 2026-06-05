@@ -43,18 +43,34 @@ impl RobustConfig {
     pub fn enabled(&self) -> bool {
         self.firth_general || self.orthogonalize_confounds
     }
+
+    /// Resolve the user-facing tri-state policy into the per-mechanism gate
+    /// struct the solver consumes.
+    ///
+    /// `Off` ⇒ every mechanism disabled (byte-identical to the released
+    /// solver). `Auto` and `Force` both request the full machinery; the
+    /// distinction between "enable only where a pathology is detected" (`Auto`)
+    /// and "enable unconditionally" (`Force`) is applied at the detection sites,
+    /// not here, so both map to all mechanisms armed.
+    #[inline]
+    pub fn from_policy(policy: crate::solver::workflow::RobustIdentification) -> Self {
+        match policy {
+            crate::solver::workflow::RobustIdentification::Off => Self {
+                firth_general: false,
+                orthogonalize_confounds: false,
+            },
+            crate::solver::workflow::RobustIdentification::Auto
+            | crate::solver::workflow::RobustIdentification::Force => Self {
+                firth_general: true,
+                orthogonalize_confounds: true,
+            },
+        }
+    }
 }
 
-// TODO(wf_bcad67c6): link-general Jeffreys penalty `Phi = 1/2 log|I(beta)|`, its
-//   beta-gradient `tr(I^{-1} dI/dbeta)`, and Hessian contribution `-d^2 Phi/dbeta^2`
-//   for a general inverse link (probit explicit; reuse `FirthDenseOperator`; lift
-//   the `(Binomial, Logit)` gates in estimate.rs / hmc.rs / pirls/loop_driver.rs).
-// TODO(wf_bcad67c6): scope the Jeffreys term to the unpenalized / under-identified
-//   span only (parametric + each smooth's polynomial null space); penalized smooth
-//   directions keep their wiggliness prior. Reuse the HMC identifiable-subspace term.
-// TODO(wf_bcad67c6): general exact orthogonalization pass for overlapping design
-//   blocks via rank-revealing QR/SVD, with an exact coefficient round-trip for
-//   reporting.
-// TODO(wf_bcad67c6): wire into the SHARED custom-family inner Newton + outer REML so
-//   every family inherits it; retire the BMS pinned ridges
-//   (`marginal_penalties_with_influence_ridge`) behind this flag, kept as a fallback.
+impl From<crate::solver::workflow::RobustIdentification> for RobustConfig {
+    #[inline]
+    fn from(policy: crate::solver::workflow::RobustIdentification) -> Self {
+        Self::from_policy(policy)
+    }
+}

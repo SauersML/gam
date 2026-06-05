@@ -422,6 +422,13 @@ struct FitArgs {
     /// non-binomial families.
     #[arg(long = "firth", default_value_t = false)]
     firth: bool,
+    /// Universal under-identification robustness policy: `off` (default),
+    /// `auto`, or `force`. When set, the solver applies link-general
+    /// Jeffreys/Firth regularization on the under-identified span and exact
+    /// orthogonalization of structural confounds. `off` leaves behavior
+    /// byte-identical to the released solver.
+    #[arg(long = "robust-identification", default_value = "off")]
+    robust_identification: String,
     /// Explicit response family. Use `auto` to infer the family.
     #[arg(long = "family", value_enum, default_value_t = FamilyArg::Auto)]
     family: FamilyArg,
@@ -1400,6 +1407,13 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         }
         None
     };
+    let robust_identification = gam::RobustIdentification::parse(&args.robust_identification)
+        .ok_or_else(|| {
+            format!(
+                "invalid --robust-identification '{}'; expected off, auto, or force",
+                args.robust_identification
+            )
+        })?;
     let base_fit_options = FitOptions {
         latent_cloglog: latent_cloglog_state,
         mixture_link: mixture_linkspec.clone(),
@@ -1423,6 +1437,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: false,
+        robust_identification,
         adaptive_regularization: adaptive_opts,
         penalty_shrinkage_floor: Some(1e-6),
         rho_prior: Default::default(),
@@ -1500,6 +1515,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
                 firth_bias_reduction: Some(true),
+                robust_identification,
                 penalty_shrinkage_floor: Some(1e-6),
                 rho_prior: Default::default(),
                 kronecker_penalty_system: None,
@@ -3955,6 +3971,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 nullspace_dims: design.nullspace_dims.clone(),
                 linear_constraints: design.linear_constraints.clone(),
                 firth_bias_reduction: false,
+                robust_identification: gam::RobustIdentification::Off,
                 adaptive_regularization: None,
                 penalty_shrinkage_floor: Some(1e-6),
                 rho_prior: Default::default(),
@@ -9968,6 +9985,7 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            robust_identification: "off".to_string(),
             family: FamilyArg::Auto,
             negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
@@ -10434,6 +10452,7 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            robust_identification: "off".to_string(),
             family: FamilyArg::Auto,
             negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
@@ -10633,6 +10652,7 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            robust_identification: "off".to_string(),
             family: FamilyArg::Auto,
             negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
@@ -10715,6 +10735,7 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            robust_identification: "off".to_string(),
             family: FamilyArg::Auto,
             negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
@@ -10764,6 +10785,7 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            robust_identification: "off".to_string(),
             family: FamilyArg::Auto,
             negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
@@ -11018,6 +11040,7 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: false,
+            robust_identification: "off".to_string(),
             family: FamilyArg::Auto,
             negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
@@ -11111,6 +11134,7 @@ mod tests {
             hazard_loading: None,
             transformation_normal: false,
             firth: true,
+            robust_identification: "off".to_string(),
             family: FamilyArg::Auto,
             negative_binomial_theta: None,
             survival_likelihood: "transformation".to_string(),
