@@ -1356,32 +1356,46 @@ pub fn fit_bernoulli_marginal_slope_terms(
     let fixed_design_regime = !effective_kappa_options.enabled
         || (spatial_length_scale_term_indices(&marginalspec_boot).is_empty()
             && spatial_length_scale_term_indices(&logslopespec_boot).is_empty());
-    // Build the reparam ONCE against the rigid-pilot IRLS row metric (the inner
-    // product the joint Hessian actually uses). It is `None` when the flag is
-    // off (byte-identical to released) or when the build found nothing to
-    // project. The shear `B` is a pure basis transform of the logslope columns;
-    // the spatial optimizer rebuilds designs from the frozen `*_boot` specs each
-    // call, so in the fixed-design regime those rebuilt logslope columns are
-    // identical to the ones `B` was computed against and the swap applies
-    // consistently inside `build_blocks` / `make_family` below. `apply_logslope_
-    // confound_reparam` performs the swap on the design a closure receives.
-    let logslope_confound_reparam: Option<
-        crate::solver::orthogonal_reparam::OrthogonalReparam,
-    > = if robust.orthogonalize_confounds && fixed_design_regime {
+    // The reparam `B = (MᵀW M)⁻¹ MᵀW G` (W = rigid-pilot IRLS row metric) is
+    // built LAZILY against the ACTUAL marginal/logslope designs the inner solver
+    // fits — NOT the pre-freeze probe designs. The spatial optimizer rebuilds
+    // designs from the frozen `*_boot` specs (the freeze can drop aliased
+    // logslope columns, so the fitted logslope width differs from the probe),
+    // and every `build_blocks` / `make_family` call passes those frozen designs.
+    // In the fixed-design regime those designs are identical across calls, so we
+    // cache the reparam after the first build (keyed implicitly by the constant
+    // design). `None` when the flag is off / the build found nothing to project /
+    // we are not in the fixed-design regime — byte-identical to released.
+    //
+    // The metric `W` is row-aligned with the data, so it is valid regardless of
+    // the column basis; capturing it here keeps the orthogonality in the inner
+    // product the joint Hessian actually uses.
+    let confound_reparam_cache: RefCell<
+        Option<Option<crate::solver::orthogonal_reparam::OrthogonalReparam>>,
+    > = RefCell::new(None);
+    let confound_reparam_for = |marginal_design: &TermCollectionDesign,
+                                logslope_design: &TermCollectionDesign|
+     -> Result<Option<crate::solver::orthogonal_reparam::OrthogonalReparam>, String> {
+        if !(robust.orthogonalize_confounds && fixed_design_regime) {
+            return Ok(None);
+        }
+        if let Some(cached) = confound_reparam_cache.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
         let marginal_dense = marginal_design
             .design
             .try_to_dense_arc("bms confound-orthogonalization::marginal")?;
         let logslope_dense = logslope_design
             .design
             .try_to_dense_arc("bms confound-orthogonalization::logslope")?;
-        crate::solver::orthogonal_reparam::OrthogonalReparam::build(
+        let reparam = crate::solver::orthogonal_reparam::OrthogonalReparam::build(
             robust,
             marginal_dense.view(),
             logslope_dense.view(),
             &cross_block_pilot_w_score_warp,
-        )?
-    } else {
-        None
+        )?;
+        confound_reparam_cache.replace(Some(reparam.clone()));
+        Ok(reparam)
     };
 
     // Absorbed Stage-1 influence columns (#461, design §3). When the workflow
@@ -1653,8 +1667,10 @@ pub fn fit_bernoulli_marginal_slope_terms(
      -> Result<Vec<ParameterBlockSpec>, String> {
         // Structural confound cure: shear the logslope design columns to the
         // W-orthogonal basis `G̃` when the robust flag is armed. No-op otherwise.
+        // Built lazily against THESE designs (the frozen ones the solver fits).
+        let reparam = confound_reparam_for(marginal_design, logslope_design)?;
         let logslope_design_swapped =
-            apply_logslope_confound_reparam(logslope_design, logslope_confound_reparam.as_ref());
+            apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
         let logslope_design: &TermCollectionDesign = &logslope_design_swapped;
         let hints = hints.borrow();
         let mut cursor = 0usize;
@@ -1725,9 +1741,15 @@ pub fn fit_bernoulli_marginal_slope_terms(
      -> BernoulliMarginalSlopeFamily {
         // Structural confound cure: the family kernel must see the SAME
         // W-orthogonalized logslope design `G̃` the block spec was built against,
-        // so its (logslope_design, β_s) pair stays matched. No-op when off.
+        // so its (logslope_design, β_s) pair stays matched. The cache was
+        // populated by the preceding `build_blocks` call in this eval; a clean
+        // read keeps `make_family` infallible. No-op when off / cache empty.
+        let reparam = confound_reparam_cache
+            .borrow()
+            .as_ref()
+            .and_then(|c| c.clone());
         let logslope_design_swapped =
-            apply_logslope_confound_reparam(logslope_design, logslope_confound_reparam.as_ref());
+            apply_logslope_confound_reparam(logslope_design, reparam.as_ref());
         let logslope_design: &TermCollectionDesign = &logslope_design_swapped;
         // The kernel reads the marginal index from a matched (self.marginal_
         // design, β_m) pair. When the Stage-1 influence absorber is active the
@@ -2105,7 +2127,8 @@ pub fn fit_bernoulli_marginal_slope_terms(
     // `G_pred − M_pred·B`; the shear `B` is the training-fit property the
     // predict seam carries, mirroring the #461 influence-absorber seam below.
     // No-op when the flag is off / no reparam installed (byte-identical).
-    if let Some(reparam) = logslope_confound_reparam.as_ref()
+    let final_confound_reparam = confound_reparam_cache.borrow().as_ref().and_then(|c| c.clone());
+    if let Some(reparam) = final_confound_reparam.as_ref()
         && let Some(design) = solved.designs.get_mut(1)
         && design.design.ncols() == reparam.confound_cols()
     {
