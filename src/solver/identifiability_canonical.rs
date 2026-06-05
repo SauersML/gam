@@ -893,17 +893,24 @@ fn try_orthogonalize_blocks(
     if specs.len() < 2 {
         return Ok(None);
     }
-    // Multi-channel families (BMS, survival LS) are handled by the Tier-B
-    // joint-Newton Jeffreys term, not by a per-block design reparam: their
-    // coupled multi-output kernel does not factor as `X_b · V_b`. Detect and
-    // defer.
-    let multi_channel = specs.iter().any(|s| {
-        s.jacobian_callback
-            .as_ref()
-            .map(|cb| cb.n_outputs() > 1)
-            .unwrap_or(false)
-    });
-    if multi_channel {
+    // Families whose blocks carry a `jacobian_callback` (BMS marginal-slope,
+    // survival LS, …) own their effective geometry: the family reconstructs the
+    // additive predictor from internal full-width designs (e.g. BMS reads its
+    // own `marginal_design`/`logslope_design` per row), and the block `design`
+    // here is only the *raw* basis the callback consumes. A per-block reparam
+    // `X_b · V_b` that drops the callback does NOT change what the family
+    // computes, but it shrinks the block coefficient width below the family's
+    // internal design width — leaving the inner solve's reduced β (e.g. 8) out
+    // of sync with the family's full design (e.g. 12) and tripping the family's
+    // own shape validation. Such families are robustified by the Tier-B
+    // joint-Newton Jeffreys/Firth term (firth_general), which adds curvature on
+    // the under-identified span WITHOUT any design surgery and keeps every
+    // block β at full width. Defer here so they take that path. (Single-channel,
+    // plain-design blocks — `jacobian_callback: None` — are still reparam'd
+    // exactly as before, so the OFF path and existing orthogonalize users are
+    // byte-identical.)
+    let family_owned_geometry = specs.iter().any(|s| s.jacobian_callback.is_some());
+    if family_owned_geometry {
         return Ok(None);
     }
 
