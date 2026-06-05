@@ -100,13 +100,13 @@ def test_posterior_shape_band_is_tighter_than_data_deviation():
 
 
 def test_more_data_tightens_the_posterior_band():
-    """Quadrupling the sample size shrinks the posterior shape band (the band is
+    """Increasing the sample size shrinks the posterior shape band (the band is
     an honest 1/sqrt(N)-style posterior, not a fixed cosmetic ribbon)."""
     fit_small, _ = _fit_circle(n=120, noise=0.18, seed=3)
-    fit_big, _ = _fit_circle(n=480, noise=0.18, seed=3)
+    fit_big, _ = _fit_circle(n=400, noise=0.18, seed=3)
     sd_small = float(np.median(fit_small.shape_band(0)["sd"]))
     sd_big = float(np.median(fit_big.shape_band(0)["sd"]))
     assert sd_big < sd_small, (
         f"posterior band did not shrink with more data: "
-        f"median sd {sd_small:.4f} (n=120) -> {sd_big:.4f} (n=480)"
+        f"median sd {sd_small:.4f} (n=120) -> {sd_big:.4f} (n=400)"
     )
