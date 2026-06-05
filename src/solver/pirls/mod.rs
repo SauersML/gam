@@ -2068,13 +2068,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         if self.firth_bias_reduction {
             // Standard link whose Fisher working weight drives the Jeffreys
             // term. The firth gate only activates for links with a closed-form
-            // Fisher-weight jet (`{Logit, Probit}`); any other link here is a
-            // construction-time inconsistency, so fall back to logit rather than
-            // silently mis-weighting.
+            // Fisher-weight jet; any other link here is a construction-time
+            // inconsistency.
             let jeffreys_link = match &self.link_kind {
                 InverseLink::Standard(link @ StandardLink::Logit)
-                | InverseLink::Standard(link @ StandardLink::Probit) => *link,
-                _ => StandardLink::Logit,
+                | InverseLink::Standard(link @ StandardLink::Probit)
+                | InverseLink::Standard(link @ StandardLink::CLogLog) => *link,
+                _ => crate::bail_invalid_estim!(
+                    "Firth bias reduction requires a standard Binomial Logit, Probit, or CLogLog link; got {}",
+                    self.link_kind.name()
+                ),
             };
             // IMPORTANT: Jeffreys/Firth bias reduction must be computed in the
             // *same coefficient basis* as the inner objective being optimized by PIRLS.
