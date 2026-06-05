@@ -24,6 +24,7 @@ fn opts(nullspace_dims: Vec<usize>) -> ExternalOptimOptions {
         nullspace_dims,
         linear_constraints: None,
         firth_bias_reduction: None,
+        robust_identification: gam::RobustIdentification::Off,
         penalty_shrinkage_floor: None,
         rho_prior: Default::default(),
         kronecker_penalty_system: None,

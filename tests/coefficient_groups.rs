@@ -26,6 +26,7 @@ fn fit_options(rho_prior: RhoPrior) -> FitOptions {
         nullspace_dims: Vec::new(),
         linear_constraints: None,
         firth_bias_reduction: false,
+        robust_identification: gam::RobustIdentification::Off,
         adaptive_regularization: None,
         penalty_shrinkage_floor: None,
         rho_prior,

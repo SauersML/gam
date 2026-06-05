@@ -6031,6 +6031,7 @@ fn materialize_standard<'a>(
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: config.firth,
+        robust_identification: config.robust_identification,
         adaptive_regularization: standard_adaptive_regularization_options(config),
         penalty_shrinkage_floor: Some(1e-6),
         rho_prior: Default::default(),
