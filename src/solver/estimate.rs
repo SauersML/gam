@@ -2141,8 +2141,6 @@ fn detect_prefit_unpenalized_rank_deficiency_in_design(
     x: &DesignMatrix,
     unpenalized_columns: &[bool],
 ) -> Result<Option<PrefitRankDiagnostic>, EstimationError> {
-    debug_assert_eq!(x.nrows(), w.len());
-    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
     if x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
         return Ok(None);
     }
@@ -2293,9 +2291,6 @@ fn detect_prefit_binomial_single_column_separation(
     x: ndarray::ArrayView2<'_, f64>,
     unpenalized_columns: &[bool],
 ) -> Option<PrefitSeparationDiagnostic> {
-    debug_assert_eq!(x.nrows(), y.len());
-    debug_assert_eq!(x.nrows(), w.len());
-    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
     if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
         return None;
     }
@@ -2336,9 +2331,6 @@ fn detect_prefit_binomial_single_column_separation_in_design(
     x: &DesignMatrix,
     unpenalized_columns: &[bool],
 ) -> Result<Option<PrefitSeparationDiagnostic>, EstimationError> {
-    debug_assert_eq!(x.nrows(), y.len());
-    debug_assert_eq!(x.nrows(), w.len());
-    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
     if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
         return Ok(None);
     }
