@@ -14,6 +14,7 @@ pub mod inner_status;
 pub(crate) mod latent_cache;
 pub mod latent_inner;
 pub mod mixture_link;
+pub mod orthogonal_reparam;
 pub mod outer_strategy;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
