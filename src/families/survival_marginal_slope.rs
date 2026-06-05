@@ -21602,14 +21602,29 @@ pub fn fit_survival_marginal_slope_terms(
         // residualised compiled *design* columns, not the penalty, so
         // each block's penalty stays per-block-width — matching the
         // `ParameterBlockSpec` p_b × p_b validation contract.
-        if let Some(ref pens) = time_penalties_vm {
-            blocks[0].penalties = pens.clone();
-        }
-        if let Some(ref pens) = marginal_penalties_vm {
-            blocks[1].penalties = pens.clone();
-        }
-        if let Some(ref pens) = logslope_penalties_vm {
-            blocks[2].penalties = pens.clone();
+        // The `*_penalties_vm` side bindings are sized at the *compiled* (V+M
+        // reduced) block widths captured once at construction; they are only
+        // valid when the design fed into this `build_blocks` call is that same
+        // compiled design (the construction-time `initial_blocks`/`rigid_blocks`).
+        // The spatial-length-scale optimizer re-materialises *raw*-width
+        // marginal/logslope designs on every kappa probe and routes them here;
+        // for those calls the design-derived penalties just installed by
+        // `build_*_blockspec` (Blockwise at the raw design width) are already
+        // correct, and substituting a narrow compiled-width penalty onto a wide
+        // raw design pairs a KxK design with a 2x2 penalty (#788). Apply each
+        // `_vm` override only when its width matches the block's realised design
+        // width; otherwise keep the design-consistent penalties.
+        for (block_idx, pens_vm) in [
+            (0usize, &time_penalties_vm),
+            (1, &marginal_penalties_vm),
+            (2, &logslope_penalties_vm),
+        ] {
+            if let Some(pens) = pens_vm {
+                let w = blocks[block_idx].design.ncols();
+                if pens.iter().all(|p| p.shape() == (w, w)) {
+                    blocks[block_idx].penalties = pens.clone();
+                }
+            }
         }
         if let Some(prepared) = score_warp_active {
             let rho_h = rho
