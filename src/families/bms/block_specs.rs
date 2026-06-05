@@ -7,10 +7,7 @@ use crate::faer_ndarray::{
     FaerArrayView, FaerEigh, factorize_symmetricwith_fallback, fast_ab, fast_atb, fast_xt_diag_x,
     fast_xt_diag_y,
 };
-use crate::families::marginal_slope_orthogonal::{
-    INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA, MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA,
-    MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
-};
+use crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA;
 use crate::matrix::FactorizedSystem;
 use faer::Side;
 
@@ -272,6 +269,12 @@ fn widen_marginal_dense_with_influence(
     Ok(Arc::new(widened))
 }
 
+// The marginal↔logslope overlap penalty is no longer installed as a pinned
+// ridge (subsumed by the now-unconditional exact logslope orthogonalisation in
+// `build_reduced_logslope_reparam`). The geometry helper is retained under
+// `cfg(test)` because the basis-independence/weight-orthogonality unit tests
+// below exercise it directly as the canonical overlap-direction reference.
+#[cfg(test)]
 fn marginal_logslope_overlap_penalty(
     marginal_design: &DesignMatrix,
     logslope_design: &DesignMatrix,
@@ -1314,14 +1317,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
     let data_view = data;
-    // Resolve the universal-robustness policy threaded from the workflow into
-    // the per-mechanism gate the BMS block construction consumes. `Off`
-    // (default) yields `RobustConfig { firth_general: false,
-    // orthogonalize_confounds: false }`, so every pinned ridge stays installed
-    // and the block specs are byte-identical to the released solver.
-    let robust = crate::solver::robust_identification::RobustConfig::from_policy(
-        options.robust_identification,
-    );
     validate_spec(data_view, &spec)?;
     let mut effective_kappa_options = kappa_options.clone();
     // Honor explicit `length_scale=X` in the user's formula: when every

@@ -24760,13 +24760,80 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                                 }
                             }
                             cov.mapv_inplace(|v| v / (n as f64 - 1.0));
-                            log::info!(
-                                "[robust] never-fail posterior sampling succeeded: dim={dim} \
-                                 draws={n} rhat={:.3} ess={:.0}; reporting sampled covariance",
-                                posterior.rhat,
-                                posterior.ess,
-                            );
-                            covariance_conditional = Some(cov);
+                            // DIAGNOSTIC GUARD (no false-confident intervals).
+                            // The sampler NEVER fails, so without checking its
+                            // mixing diagnostics a divergent (R̂ ≫ 1) / near-zero-
+                            // ESS draw would be reported as an "honest" covariance.
+                            // That is especially dangerous here: the seed `H` is
+                            // the Jeffreys-AUGMENTED precision evaluated at β̂, which
+                            // may be NON-converged on a flat (unidentified) joint
+                            // direction — so a poorly-mixed chain can report a
+                            // FINITE, NARROW interval around an arbitrary point on
+                            // that flat direction (the prior's interval), masquer-
+                            // ading as data-driven. We therefore only accept the
+                            // sampled covariance as honest when the chain actually
+                            // mixed; otherwise we INFLATE it to reflect the non-
+                            // convergence and flag it low-confidence rather than
+                            // silently reporting a Jeffreys-narrowed interval.
+                            //
+                            // R̂ ≤ 1.05 is the standard "mixed" gate (stricter than
+                            // the 1.1 used for a coarse converged/not flag, because
+                            // this covariance is reported as honest uncertainty).
+                            // The ESS floor scales with dimension (≥ 10 effective
+                            // draws per parameter, absolute floor 50) so a chain
+                            // that produced essentially no independent information
+                            // about the posterior is caught independent of model
+                            // size.
+                            const RHAT_MIXED_MAX: f64 = 1.05;
+                            let ess_floor = (10.0 * dim as f64).max(50.0);
+                            let rhat = posterior.rhat;
+                            let ess = posterior.ess;
+                            let diagnostics_ok = rhat.is_finite()
+                                && ess.is_finite()
+                                && rhat <= RHAT_MIXED_MAX
+                                && ess >= ess_floor;
+                            if diagnostics_ok {
+                                log::info!(
+                                    "[robust] never-fail posterior sampling mixed: dim={dim} \
+                                     draws={n} rhat={rhat:.3} ess={ess:.0}; reporting sampled \
+                                     covariance as honest intervals",
+                                );
+                                covariance_conditional = Some(cov);
+                            } else {
+                                // Non-converged: do NOT report the narrow sampled
+                                // covariance as data-driven. Inflate it so the
+                                // reported uncertainty reflects the failure to
+                                // resolve the posterior — widen by the R̂ excess (a
+                                // divergent chain widens hard) and an ESS-deficit
+                                // factor (too few independent draws ⇒ the sample
+                                // covariance is itself unreliable / too narrow). The
+                                // result is a clearly-flagged LOW-CONFIDENCE summary,
+                                // never an artificially tight interval, and we still
+                                // return a fit (the never-fail guarantee stands).
+                                let rhat_factor = if rhat.is_finite() {
+                                    rhat.max(1.0)
+                                } else {
+                                    // R̂ unestimable (too few chains/samples) ⇒
+                                    // treat as maximally unresolved.
+                                    RHAT_MIXED_MAX
+                                };
+                                let ess_factor = if ess.is_finite() && ess > 0.0 {
+                                    (ess_floor / ess).sqrt().max(1.0)
+                                } else {
+                                    ess_floor.sqrt()
+                                };
+                                let inflation = (rhat_factor * rhat_factor) * ess_factor;
+                                cov.mapv_inplace(|v| v * inflation);
+                                log::warn!(
+                                    "[robust] never-fail posterior sampling DID NOT MIX: dim={dim} \
+                                     draws={n} rhat={rhat:.3} (>{RHAT_MIXED_MAX}) ess={ess:.0} \
+                                     (<{ess_floor:.0}); reporting LOW-CONFIDENCE inflated covariance \
+                                     (x{inflation:.2}) instead of a possibly false-confident \
+                                     Jeffreys-narrowed interval (intervals are prior-dominated on \
+                                     any unidentified joint direction, NOT data-driven)",
+                                );
+                                covariance_conditional = Some(cov);
+                            }
                         }
                     }
                     Err(reason) => {
@@ -25361,6 +25428,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("projected outer evaluation succeeds");
 
@@ -25389,6 +25457,7 @@ mod tests {
             &no_dh,
             None,
             &no_d2h,
+            None,
             None,
             None,
             None,
@@ -25542,6 +25611,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .expect("projected eval ok");
 
@@ -25571,6 +25641,7 @@ mod tests {
                 &no_dh,
                 None,
                 &no_d2h,
+                None,
                 None,
                 None,
                 None,
@@ -25914,6 +25985,7 @@ mod tests {
             &compute_dh,
             None,
             &no_d2h,
+            None,
             None,
             None,
             None,
