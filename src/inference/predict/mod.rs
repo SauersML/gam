@@ -6825,10 +6825,10 @@ mod tests {
             array![0.0],
             array![[1.0, 0.0], [0.0, 0.0]],
         );
-        let err = predictor
-            .predict_full_uncertainty(&input, &missing_fit, &options)
-            .expect_err("required corrected covariance must error when unavailable")
-            .to_string();
+        let err = match predictor.predict_full_uncertainty(&input, &missing_fit, &options) {
+            Ok(_) => panic!("required corrected covariance must error when unavailable"),
+            Err(err) => err.to_string(),
+        };
         assert!(
             err.contains("smoothing-corrected covariance"),
             "unexpected required-covariance error: {err}"

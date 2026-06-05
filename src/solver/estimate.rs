@@ -2308,6 +2308,7 @@ fn separator_from_column_extrema(
     None
 }
 
+#[cfg(test)]
 fn detect_prefit_binomial_single_column_separation(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -2419,8 +2420,6 @@ fn certify_prefit_binomial_linear_separator(
     column_indices: &[usize],
     direction: &[f64],
 ) -> Result<Option<PrefitLinearSeparationDiagnostic>, EstimationError> {
-    debug_assert_eq!(x.nrows(), class.len());
-    debug_assert_eq!(column_indices.len(), direction.len());
     if x.nrows() != class.len() || column_indices.len() != direction.len() {
         return Ok(None);
     }
@@ -2490,9 +2489,6 @@ fn detect_prefit_binomial_linear_combination_separation_in_design(
     x: &DesignMatrix,
     unpenalized_columns: &[bool],
 ) -> Result<Option<PrefitLinearSeparationDiagnostic>, EstimationError> {
-    debug_assert_eq!(x.nrows(), y.len());
-    debug_assert_eq!(x.nrows(), w.len());
-    debug_assert_eq!(x.ncols(), unpenalized_columns.len());
     if x.nrows() != y.len() || x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
         return Ok(None);
     }
