@@ -2068,13 +2068,16 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         if self.firth_bias_reduction {
             // Standard link whose Fisher working weight drives the Jeffreys
             // term. The firth gate only activates for links with a closed-form
-            // Fisher-weight jet (`{Logit, Probit}`); any other link here is a
-            // construction-time inconsistency, so fall back to logit rather than
-            // silently mis-weighting.
+            // Fisher-weight jet; any other link here is a construction-time
+            // inconsistency.
             let jeffreys_link = match &self.link_kind {
                 InverseLink::Standard(link @ StandardLink::Logit)
-                | InverseLink::Standard(link @ StandardLink::Probit) => *link,
-                _ => StandardLink::Logit,
+                | InverseLink::Standard(link @ StandardLink::Probit)
+                | InverseLink::Standard(link @ StandardLink::CLogLog) => *link,
+                _ => crate::bail_invalid_estim!(
+                    "Firth bias reduction requires a standard Binomial Logit, Probit, or CLogLog link; got {}",
+                    self.link_kind.name()
+                ),
             };
             // IMPORTANT: Jeffreys/Firth bias reduction must be computed in the
             // *same coefficient basis* as the inner objective being optimized by PIRLS.
@@ -6865,20 +6868,21 @@ mod tests {
         LinearInequalityConstraints, PenaltyConfig, PirlsConfig, PirlsLinearSolvePath,
         PirlsProblem, PirlsWorkspace, WorkingDerivativeBuffersMut, bernoulli_geometry_from_jet,
         calculate_deviance, compute_constraint_kkt_diagnostics,
-        compute_observed_hessian_curvature_arrays, fit_model_for_fixed_rho,
-        select_active_set_release, should_log_pirls_decision_summary,
-        should_use_sparse_native_pirls, solve_newton_directionwith_linear_constraints,
-        solve_newton_directionwith_lower_bounds, tweedie_log_weight_mu_power, update_glmvectors,
-        write_gamma_log_working_state, write_negative_binomial_log_working_state,
-        write_poisson_log_working_state, write_tweedie_log_working_state,
+        compute_observed_hessian_curvature_arrays, estimate_tweedie_phi_from_eta,
+        fit_model_for_fixed_rho, fixed_glm_dispersion, select_active_set_release,
+        should_log_pirls_decision_summary, should_use_sparse_native_pirls,
+        solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
+        tweedie_log_weight_mu_power, update_glmvectors, write_gamma_log_working_state,
+        write_negative_binomial_log_working_state, write_poisson_log_working_state,
+        write_tweedie_log_working_state,
     };
     use crate::matrix::DesignMatrix;
     use crate::mixture_link::InverseLinkJet as MixtureInverseLinkJet;
     use crate::probability::standard_normal_quantile;
     use crate::solver::active_set;
     use crate::types::{
-        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction,
-        LogSmoothingParamsView, ResponseFamily, StandardLink,
+        Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodScaleMetadata, LikelihoodSpec,
+        LinkFunction, LogSmoothingParamsView, ResponseFamily, StandardLink,
     };
     use approx::assert_relative_eq;
     use faer::sparse::{SparseColMat, Triplet};
@@ -7263,6 +7267,37 @@ mod tests {
         let mut without = LogLinkWorkingOutputs::zeros(n);
         write(&mut without.mu, &mut without.weights, &mut without.z, None);
         (with, without)
+    }
+
+    #[test]
+    fn tweedie_phi_estimator_recovers_weighted_pearson_dispersion() {
+        let p = 1.5;
+        let mu = array![1.0_f64, 4.0, 9.0];
+        let eta = mu.mapv(f64::ln);
+        let phi = 2.75_f64;
+        let y = Array1::from_iter(mu.iter().map(|&mui| mui + (phi * mui.powf(p)).sqrt()));
+        let prior = array![1.0, 2.0, 3.0];
+
+        let estimated = estimate_tweedie_phi_from_eta(y.view(), &eta, prior.view(), p);
+
+        assert!(
+            (estimated - phi).abs() < 1.0e-12,
+            "Tweedie Pearson dispersion estimator should recover the weighted unit-variance residual scale; got {estimated}, expected {phi}"
+        );
+    }
+
+    #[test]
+    fn tweedie_working_weight_reads_estimated_phi_metadata() {
+        let likelihood = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::tweedie_log(1.5),
+            scale: LikelihoodScaleMetadata::EstimatedTweediePhi { phi: 8.0 },
+        };
+
+        assert_eq!(
+            fixed_glm_dispersion(&likelihood),
+            8.0,
+            "PIRLS must read fitted Tweedie phi from scale metadata, not fall back to unit dispersion"
+        );
     }
 
     #[test]
