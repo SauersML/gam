@@ -11883,28 +11883,6 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     refresh_all_block_etas(family, specs, states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    // Universal robustness (flag-gated, default OFF): the outer REML logdet of
-    // the penalized Hessian must use the SAME Jeffreys-augmented Hessian
-    // `H + S_λ + H_Φ` the inner Newton converged on, or the LAML score and its
-    // analytic derivatives describe a different objective. Compute `H_Φ` (scoped
-    // to the under-identified span `Z_J`) once here and add it into whichever
-    // logdet path runs below. `None` ⇒ byte-identical released logdet.
-    let robust_logdet_firth = include_logdet_h
-        && crate::solver::robust_identification::RobustConfig::from_policy(
-            options.robust_identification,
-        )
-        .firth_general;
-    let logdet_jeffreys_hphi: Option<Array2<f64>> = if robust_logdet_firth {
-        match build_joint_jeffreys_subspace(specs, &ranges)? {
-            Some(z_joint) => {
-                custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
-                    .map(|(_phi, _grad, hphi)| hphi)
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
     let compute_block_logdet_term = |b: usize| -> Result<(Array2<f64>, f64), String> {
         let spec = &specs[b];
         let (start, end) = ranges[b];
@@ -12017,9 +11995,6 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 .slice_mut(ndarray::s![start..end, start..end])
                 .scaled_add(curvature.rho_curvature_scale, s_lambda);
         }
-        if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
-            h_joint.scaled_add(curvature.rho_curvature_scale, hphi);
-        }
         let logdet_h_scaled = if strict_spd {
             strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
         } else {
@@ -12075,9 +12050,6 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 .slice_mut(ndarray::s![start..end, start..end])
                 .scaled_add(1.0, s_lambda);
         }
-        if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
-            h_joint.scaled_add(1.0, hphi);
-        }
         let logdet_h_total = if strict_spd {
             strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
         } else {
@@ -12100,9 +12072,6 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
             h_joint
                 .slice_mut(ndarray::s![start..end, start..end])
                 .scaled_add(1.0, s_lambda);
-        }
-        if let Some(hphi) = logdet_jeffreys_hphi.as_ref() {
-            h_joint.scaled_add(1.0, hphi);
         }
         let logdet_h_total = if strict_spd {
             strict_exact_pseudo_logdet(&h_joint, joint_observation_count(states))?
@@ -14116,32 +14085,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         };
         let total_p: usize = ranges.last().map_or(0, |r| r.1);
 
-        // Universal under-identification robustness (flag-gated, default OFF).
-        // When armed, build the joint penalty-null basis `Z_J` once: it scopes
-        // the family-general Jeffreys/Firth term to the under-identified span so
-        // a near-separating coefficient is bounded to O(1) with automatic
-        // strength inside the coupled joint Newton, while penalized smooth
-        // directions keep their wiggliness prior untouched. `None` (no
-        // under-identified direction, or unsupported policy) leaves every step
-        // and objective byte-identical to the released solver.
-        let robust_firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
-            options.robust_identification,
-        )
-        .firth_general;
-        let joint_jeffreys_subspace = if robust_firth_armed {
-            build_joint_jeffreys_subspace(specs, &ranges)?
-        } else {
-            None
-        };
-        // Fold the Jeffreys objective value into the cycle-0 baseline so the
-        // first trust-region accept/reject compares like-for-like against the
-        // Jeffreys-augmented trial objectives below. No-op when the flag is OFF.
-        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-            let phi0 = custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
-            current_penalty += phi0;
-            lastobjective = -current_log_likelihood + current_penalty;
-        }
-
         let joint_mode_diagonal_ridge =
             if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
                 ridge
@@ -14430,27 +14373,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_bundle,
                 ),
             };
-            // Fold the Firth/Jeffreys score `∇Φ` into the head-of-cycle KKT
-            // residual when the term is armed, for the same reason as the
-            // post-step residual below: the inner objective is `−ℓ + ½βᵀSβ − Φ`,
-            // so the certifiable stationarity is `∇L − Sβ + ∇Φ = 0`. Without
-            // this the head-of-cycle KKT exit (`current_stationarity_residual ≤
-            // residual_tol`) can never fire on the near-separating span, even
-            // when the iterate is the Firth optimum. No-op when the flag is OFF.
-            let head_kkt_gradient: Option<Array1<f64>> = if let Some(z_joint) =
-                joint_jeffreys_subspace.as_ref()
-            {
-                match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
-                    Some((_phi, grad_phi, _hphi)) if grad_phi.len() == grad_joint.len() => {
-                        Some(&grad_joint + &grad_phi)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
             let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
-                head_kkt_gradient.as_ref().unwrap_or(&grad_joint),
+                &grad_joint,
                 &states,
                 specs,
                 &s_lambdas,
@@ -14769,25 +14693,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             joint_mode_diagonal_ridge,
                             joint_bundle,
                         );
-                        // Universal robustness (flag-gated): add the
-                        // family-general Jeffreys curvature `H_Phi` to the
-                        // penalized Hessian and the Jeffreys score `+∇Φ` to the
-                        // stationarity RHS, both scoped to the under-identified
-                        // span `Z_J`. This is the Tier-B coupled-Newton form of
-                        // Firth: the reduced Fisher information `Z_J^T H Z_J`
-                        // supplies the missing O(n) curvature that bounds a
-                        // near-separating coefficient to O(1). When the flag is
-                        // OFF `joint_jeffreys_subspace` is `None` and the step is
-                        // byte-identical to the released solver.
-                        let mut spectral_rhs = rhs.clone();
-                        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                            if let Some((_phi, grad_phi, hphi)) = custom_family_joint_jeffreys_term(
-                                family, &states, specs, &ranges, z_joint,
-                            )? {
-                                lhs_true += &hphi;
-                                spectral_rhs += &grad_phi;
-                            }
-                        }
                         // Self-vanishing Levenberg–Marquardt damping for the
                         // range-restricted spectral step. Scaled to the current
                         // stationarity-residual magnitude ‖∇L − Sβ‖∞ so it is
@@ -14801,11 +14706,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // unbounded component/λ step along ill-conditioned modes
                         // and stops the oscillation that prevented the n=23
                         // binary-covariate CTM from settling (#733/#734).
-                        let rhs_inf = spectral_rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                        let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
                         let spectral_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
                         let spectral_step = solve_joint_newton_step_on_spectral_range(
                             &lhs_true,
-                            &spectral_rhs,
+                            &rhs,
                             KKT_REFUSAL_RANK_TOL,
                             residual_tol_for_solve,
                             spectral_levenberg_mu,
@@ -15137,7 +15042,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     states[b].beta.assign(&projected);
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
-                let mut trial_penalty = total_quadratic_penalty(
+                let trial_penalty = total_quadratic_penalty(
                     &states,
                     &s_lambdas,
                     ridge,
@@ -15145,15 +15050,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_bundle,
                     Some(specs),
                 );
-                // Jeffreys objective contribution at the trial point keeps the
-                // accept/reject objective consistent with the Jeffreys-modified
-                // Newton step. `states` already holds the trial coefficients
-                // (assigned + eta-refreshed above). No-op when the flag is OFF.
-                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                    trial_penalty += custom_family_joint_jeffreys_value(
-                        family, &states, specs, &ranges, z_joint,
-                    );
-                }
                 // Cheap-LL line-search path: rejected backtracking attempts
                 // discard the exact-Newton workspace they build, so by default
                 // we evaluate just the scalar full-data log-likelihood for the
@@ -15576,13 +15472,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_bundle,
                 Some(specs),
             );
-            // Re-fold the Jeffreys objective at the accepted iterate so the
-            // post-accept baseline matches the augmented objective the next
-            // cycle's trial points are compared against. No-op when flag OFF.
-            if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                current_penalty +=
-                    custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
-            }
             lastobjective = -current_log_likelihood + current_penalty;
             let accepted_step_inf = states
                 .iter()
@@ -15597,37 +15486,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .fold(0.0_f64, f64::max);
             cycles_done = cycle + 1;
 
-            // Check convergence via joint stationarity. When the family-general
-            // Firth/Jeffreys term is armed, the penalized objective the inner
-            // Newton actually optimizes is `−ℓ + ½βᵀSβ − Φ`, so its KKT
-            // stationarity is `∇L − Sβ + ∇Φ = 0`. The Newton STEP already folds
-            // `∇Φ` into its RHS (`spectral_rhs += grad_phi`), but the bare
-            // `exact_newton_joint_stationarity_*` residual omits it — at the
-            // Firth fixed point `∇L − Sβ = −∇Φ`, so the certificate floors at
-            // `‖∇Φ‖∞` and never certifies, stalling the inner solve on exactly
-            // the near-separating span Firth is meant to bound (the residual the
-            // outer REML then rejects). Fold `∇Φ` into the gradient used for the
-            // KKT residual so the convergence criterion matches the augmented
-            // objective the step descends. No-op (byte-identical) when the flag
-            // is OFF: `joint_jeffreys_subspace` is `None`.
+            // Check convergence via joint stationarity
             let Some(gradient) = cached_joint_gradient.as_ref() else {
                 break;
             };
-            let jeffreys_augmented_gradient: Option<Array1<f64>> = if let Some(z_joint) =
-                joint_jeffreys_subspace.as_ref()
-            {
-                match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
-                    Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
-                        Some(gradient + &grad_phi)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let residual_gradient = jeffreys_augmented_gradient.as_ref().unwrap_or(gradient);
             let residual = exact_newton_joint_stationarity_inf_norm_from_gradient(
-                residual_gradient,
+                gradient,
                 &states,
                 specs,
                 &s_lambdas,
@@ -18662,12 +18526,6 @@ fn joint_penalty_subspace_trace_parts(
     s_lambdas: &[Array2<f64>],
     total: usize,
     hessian_diagonal_ridge: f64,
-    // Pre-scaled outer-REML Jeffreys curvature (already multiplied by
-    // `rho_curvature_scale` to live in the same scaled space as `s_lambdas`).
-    // Folded into `M = H + Sλ (+ H_Φ)` so the projected logdet AND its trace
-    // kernel `(H+Sλ+H_Φ)⁺` match the Jeffreys-augmented operator the LAML score
-    // runs on. `None` ⇒ byte-identical released projected logdet.
-    scaled_jeffreys_hphi: Option<&Array2<f64>>,
 ) -> Result<(f64, Option<PenaltySubspaceTrace>), String> {
     if total == 0 {
         return Ok((0.0, None));
@@ -18739,9 +18597,6 @@ fn joint_penalty_subspace_trace_parts(
         materialize_joint_hessian_source(h_joint_unpen, total, "joint penalty subspace logdet")?;
     let mut m = m_dense;
     add_joint_penalty_to_matrix(&mut m, ranges, s_lambdas, hessian_diagonal_ridge, None);
-    if let Some(hphi) = scaled_jeffreys_hphi {
-        m += hphi;
-    }
     symmetrize_dense_in_place(&mut m);
     let (m_evals, m_evecs) = m.eigh(Side::Lower).map_err(|e| {
         format!("joint penalty subspace full Hessian eigendecomposition failed: {e}")
@@ -18839,24 +18694,9 @@ fn joint_outer_evaluate(
     batched_outer_hessian_operator: Option<
         Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
     >,
-    // Universal under-identification robustness (flag-gated, default OFF). The
-    // outer REML logdet AND its trace derivatives must run on the same
-    // Jeffreys-augmented Hessian `H + S_λ + H_Φ` the inner Newton converged on,
-    // or the LAML value and its analytic gradient describe different objectives.
-    // `H_Φ` carries no ρ-dependence, so folding it into the operator's matvec
-    // leaves every existing derivative closure correct and only augments the
-    // inverse/logdet. `None` ⇒ byte-identical released outer REML.
-    robust_jeffreys_hphi: Option<Array2<f64>>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
-
-    // Pre-scale the outer-REML Jeffreys curvature into the same rescaled space as
-    // the penalties so the projected-logdet path and the operator agree. `None`
-    // (flag OFF / no under-identified span) keeps the released outer REML exact.
-    let scaled_robust_jeffreys_hphi: Option<Array2<f64>> = robust_jeffreys_hphi
-        .as_ref()
-        .map(|hphi| hphi.mapv(|value| rho_curvature_scale * value));
 
     // Build derivative provider from the caller-supplied closures.
     let provider_box: Box<dyn HessianDerivativeProvider + '_> =
@@ -18902,8 +18742,6 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(&h_joint);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    let apply_hphi = robust_jeffreys_hphi.clone();
-                    let hphi_scale = rho_curvature_scale;
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
                         total,
                         move |v| {
@@ -18916,10 +18754,6 @@ fn joint_outer_evaluate(
                                 None,
                             );
                             out += &penalty;
-                            if let Some(hphi) = apply_hphi.as_ref() {
-                                let jeffreys = hphi.dot(v);
-                                out.scaled_add(hphi_scale, &jeffreys);
-                            }
                             out
                         },
                         pseudo_logdet_mode,
@@ -18929,8 +18763,6 @@ fn joint_outer_evaluate(
                     let apply_h = Arc::clone(apply);
                     let apply_ranges = ranges_vec.clone();
                     let apply_s = Arc::clone(&s_lambdas);
-                    let apply_hphi = robust_jeffreys_hphi.clone();
-                    let hphi_scale = rho_curvature_scale;
                     Arc::new(MatrixFreeSpdOperator::new_with_mode(
                         total,
                         move |v| {
@@ -18951,10 +18783,6 @@ fn joint_outer_evaluate(
                                 None,
                             );
                             out += &penalty;
-                            if let Some(hphi) = apply_hphi.as_ref() {
-                                let jeffreys = hphi.dot(v);
-                                out.scaled_add(hphi_scale, &jeffreys);
-                            }
                             out
                         },
                         pseudo_logdet_mode,
@@ -18974,9 +18802,6 @@ fn joint_outer_evaluate(
                 scaled_joint_trace_diagonal_ridge,
                 None,
             );
-            if let Some(hphi) = robust_jeffreys_hphi.as_ref() {
-                j_for_traces.scaled_add(rho_curvature_scale, hphi);
-            }
             Arc::new(
                 BlockCoupledOperator::from_joint_hessian_with_mode(
                     &j_for_traces,
@@ -18997,7 +18822,6 @@ fn joint_outer_evaluate(
             &scaled_s_lambdas,
             total,
             scaled_joint_trace_diagonal_ridge,
-            scaled_robust_jeffreys_hphi.as_ref(),
         )?;
         let correction = projected_logdet - hessian_op.logdet();
         if kernel.is_some() {
@@ -19324,7 +19148,6 @@ fn joint_outer_evaluate_efs(
             &scaled_s_lambdas,
             total,
             scaled_joint_trace_diagonal_ridge,
-            None,
         )?;
         let correction = projected_logdet - hessian_op.logdet();
         if kernel.is_some() {
@@ -20957,13 +20780,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 hessian_workspace.clone(),
                 eval_mode,
             )?,
-            custom_family_outer_jeffreys_hphi(
-                family,
-                &inner.block_states,
-                specs,
-                &ranges,
-                options,
-            )?,
         )?;
 
         // The unified evaluator produces gradient/Hessian of size (rho_dim + psi_dim),
@@ -21097,13 +20913,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         None,
                         None,
                         None,
-                        custom_family_outer_jeffreys_hphi(
-                            family,
-                            &inner.block_states,
-                            specs,
-                            &ranges,
-                            options,
-                        )?,
                     )?;
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
@@ -21182,13 +20991,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 rho_current,
                 inner.joint_workspace.clone(),
                 eval_mode,
-            )?,
-            custom_family_outer_jeffreys_hphi(
-                family,
-                &inner.block_states,
-                specs,
-                &ranges,
-                options,
             )?,
         )?;
 
@@ -21500,7 +21302,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             inner.joint_workspace.clone(),
             eval_mode,
         )?,
-        custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges, options)?,
     )?;
 
     Ok(eval_result)
@@ -22054,169 +21855,6 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
         .iter()
         .map(|r| (r.start, r.end))
         .collect()
-}
-
-/// Build the joint Jeffreys/Firth basis `Z_J` (block-diagonal stack of each
-/// block's per-block span) for the universal robustness term.
-///
-/// Each block contributes its FULL reduced coefficient span (`I_p` per block) —
-/// the principled cure. Because the Jeffreys score is `O(1)` against the data's
-/// `O(n)` Fisher information, applying it on the full span is the `O(1/n)` Firth
-/// bias correction on data-identified directions (no bias on genuine smooth
-/// fits) and the missing `O(1)`-bounding curvature on ANY near-separating
-/// direction — penalized (`range(S)`) or not (`ker(S)`) — so the inner objective
-/// becomes coercive with a finite unique minimizer. The previous `ker(S)`-only
-/// scoping could not reach a near-separation on a penalized spline direction,
-/// which was the residual BMS-probit pathology.
-///
-/// The per-block bases are embedded block-diagonally into the joint
-/// `total_p x m_total` matrix. Returns `None` only for an empty system.
-///
-/// Gated by the caller on `robust_identification != Off`; never runs in the
-/// released solver.
-fn build_joint_jeffreys_subspace(
-    specs: &[ParameterBlockSpec],
-    ranges: &[(usize, usize)],
-) -> Result<Option<Array2<f64>>, String> {
-    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    if total_p == 0 {
-        return Ok(None);
-    }
-    let mut per_block: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
-    let mut m_total = 0usize;
-    for (b, _spec) in specs.iter().enumerate() {
-        let (start, end) = ranges[b];
-        let p_block = end - start;
-        // Full identifiable-span Jeffreys: `Z_J = I_{p_block}` over the entire
-        // reduced block coefficient space. The aggregate penalty only fixes the
-        // block dimension; the span no longer depends on `ker(S)`.
-        let aggregate = Array2::<f64>::zeros((p_block, p_block));
-        let subspace = crate::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
-            aggregate.view(),
-        )?;
-        m_total += subspace.span_dim();
-        per_block.push(subspace.columns);
-    }
-    if m_total == 0 {
-        return Ok(None);
-    }
-    let mut z_joint = Array2::<f64>::zeros((total_p, m_total));
-    let mut col_cursor = 0usize;
-    for (b, columns) in per_block.iter().enumerate() {
-        let (start, _) = ranges[b];
-        let m_block = columns.ncols();
-        let p_block = columns.nrows();
-        for j in 0..m_block {
-            for i in 0..p_block {
-                z_joint[[start + i, col_cursor + j]] = columns[[i, j]];
-            }
-        }
-        col_cursor += m_block;
-    }
-    Ok(Some(z_joint))
-}
-
-/// Evaluate ONLY the Jeffreys objective value `Phi = 1/2 log|Z_J^T H Z_J|` at
-/// the current working point. Cheaper than the full term (no directional
-/// derivatives), used to keep the trust-region accept/reject objective
-/// consistent with the Jeffreys-modified Newton step. Returns `0.0` when there
-/// is no under-identified direction, the family exposes no exact joint Hessian,
-/// or the reduced Fisher information is not yet SPD (the value contribution is
-/// then simply omitted for that trial point — the step machinery still bounds
-/// the coefficient, and the next accepted cycle re-folds a finite value).
-fn custom_family_joint_jeffreys_value<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    states: &[ParameterBlockState],
-    specs: &[ParameterBlockSpec],
-    ranges: &[(usize, usize)],
-    z_joint: &Array2<f64>,
-) -> f64 {
-    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    if total_p == 0 || z_joint.ncols() == 0 {
-        return 0.0;
-    }
-    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs) {
-        Ok(Some(h)) if h.nrows() == total_p && h.ncols() == total_p => h,
-        _ => return 0.0,
-    };
-    match crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
-        h_joint.view(),
-        z_joint.view(),
-        |_direction: &Array1<f64>| Ok(None),
-    ) {
-        Ok((phi, _grad, _hphi)) => phi,
-        Err(_) => 0.0,
-    }
-}
-
-/// Evaluate the family-general Jeffreys term `(Phi, grad, H_Phi)` at the current
-/// working point from the coupled joint Hessian (Tier-B path). Returns `None`
-/// when there is no under-identified direction or the family does not expose an
-/// exact joint Hessian (in which case the term is inapplicable and the caller
-/// proceeds unchanged).
-fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    states: &[ParameterBlockState],
-    specs: &[ParameterBlockSpec],
-    ranges: &[(usize, usize)],
-    z_joint: &Array2<f64>,
-) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, String> {
-    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    if total_p == 0 || z_joint.ncols() == 0 {
-        return Ok(None);
-    }
-    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs)? {
-        Some(h) => h,
-        None => return Ok(None),
-    };
-    if h_joint.nrows() != total_p || h_joint.ncols() != total_p {
-        return Ok(None);
-    }
-    let term = crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
-        h_joint.view(),
-        z_joint.view(),
-        |direction: &Array1<f64>| {
-            family.exact_newton_joint_hessian_directional_derivative(states, direction)
-        },
-    )?;
-    Ok(Some(term))
-}
-
-/// Outer-REML Jeffreys curvature `H_Φ` for the coupled joint Hessian, scoped to
-/// the under-identified span `Z_J`. Returns `None` when the robust flag is OFF,
-/// the policy does not arm the family-general Firth term, there is no
-/// under-identified direction, or the family exposes no exact joint Hessian — in
-/// every such case the outer REML stays byte-identical to the released solver.
-///
-/// This is the OUTER-path companion to the inner-Newton wiring: the LAML score
-/// uses `log|H + S_λ + H_Φ|` and its analytic ρ-derivatives `tr((H+S_λ+H_Φ)⁻¹ ∂(H+S_λ)/∂ρ)`.
-/// Because `H_Φ` carries no ρ-dependence, the existing first/second derivative
-/// closures stay exactly correct; only the inverse used in the trace identity
-/// (and the operator's own `logdet()`) must reflect the augmented curvature, so
-/// the value and its gradient describe the SAME penalized objective. Folding
-/// `H_Φ` directly into the `HessianOperator` here is what keeps the outer score
-/// consistent with the inner-converged stationary system on the now-PD problem.
-fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'static>(
-    family: &F,
-    states: &[ParameterBlockState],
-    specs: &[ParameterBlockSpec],
-    ranges: &[(usize, usize)],
-    options: &BlockwiseFitOptions,
-) -> Result<Option<Array2<f64>>, String> {
-    let robust_firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
-        options.robust_identification,
-    )
-    .firth_general;
-    if !robust_firth_armed {
-        return Ok(None);
-    }
-    let z_joint = match build_joint_jeffreys_subspace(specs, ranges)? {
-        Some(z) => z,
-        None => return Ok(None),
-    };
-    let hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
-        .map(|(_phi, _grad, hphi)| hphi);
-    Ok(hphi)
 }
 
 const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
@@ -23582,12 +23220,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         canonical_n_cols_raw,
     );
     let canonical =
-        crate::solver::identifiability_canonical::canonicalize_for_identifiability_with_robust(
-            raw_specs,
-            crate::solver::robust_identification::RobustConfig::from_policy(
-                options.robust_identification,
-            ),
-        )?;
+        crate::solver::identifiability_canonical::canonicalize_for_identifiability(raw_specs)?;
     let canonical_n_cols_red: usize = canonical
         .reduced_specs
         .iter()
@@ -24708,7 +24341,6 @@ mod tests {
             &penalties,
             3,
             0.0,
-            None,
         )
         .expect("projection parts build");
         let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
@@ -24731,7 +24363,6 @@ mod tests {
             &penalties,
             3,
             0.0,
-            None,
         )
         .expect("plus projection parts build");
         let (logdet_minus, _) = joint_penalty_subspace_trace_parts(
@@ -24740,7 +24371,6 @@ mod tests {
             &penalties,
             3,
             0.0,
-            None,
         )
         .expect("minus projection parts build");
         let finite_difference = (logdet_plus - logdet_minus) / (2.0 * eps);
@@ -24838,7 +24468,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .expect("projected outer evaluation succeeds");
 
@@ -24875,7 +24504,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         )
         .expect("unprojected outer evaluation succeeds");
 
@@ -24885,7 +24513,6 @@ mod tests {
             std::slice::from_ref(&s_lambda),
             3,
             0.0,
-            None,
         )
         .expect("projection kernel builds");
         let projected_trace = kernel
@@ -25019,7 +24646,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             )
             .expect("projected eval ok");
 
@@ -25049,7 +24675,6 @@ mod tests {
                 &no_dh,
                 None,
                 &no_d2h,
-                None,
                 None,
                 None,
                 None,
@@ -25392,7 +25017,6 @@ mod tests {
             &compute_dh,
             None,
             &no_d2h,
-            None,
             None,
             None,
             None,
