@@ -47,9 +47,8 @@ pub mod transformation_normal;
 pub mod vector_response;
 
 pub use identifiability_compiler::{
-    AnchorRowEvaluator, BlockOrder, CompiledBlock, CompiledBlocks, CompilerError,
-    PenalizedDirectionAnnotation, PenalizedDirectionRelation, RowHessian, RowJacobianOperator,
-    compile,
+    AnchorRowEvaluator, BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian,
+    RowJacobianOperator, compile,
 };
 pub use vector_response::{
     GaussianVectorLikelihood, MultinomialLogitLikelihood, VectorLikelihood, VectorNoise,
