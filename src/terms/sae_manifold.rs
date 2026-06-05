@@ -3574,6 +3574,17 @@ impl SaeManifoldTerm {
         Ok(value)
     }
 
+    /// Extra analytic-penalty energy that has no native `SaeManifoldLoss`
+    /// component but is part of the penalized objective ranked by the SAE
+    /// Laplace/REML criterion.
+    pub fn reml_extra_penalty_value_total(
+        &self,
+        registry: &AnalyticPenaltyRegistry,
+    ) -> Result<f64, ArrowSchurError> {
+        Ok(self.analytic_decoder_penalty_value_total(registry)?
+            + self.isometry_penalty_value_total(registry)?)
+    }
+
     pub fn penalized_objective_total(
         &self,
         target: ArrayView2<'_, f64>,
@@ -4764,26 +4775,18 @@ impl SaeManifoldTerm {
         // deviance. Excludes the Psi-tier ARD/assignment penalties already
         // accounted for in `loss.total()` (see
         // `analytic_decoder_penalty_value_total`).
-        let decoder_penalty_energy = match registry {
+        // Extra analytic-penalty energy (#671/#737). Decoder-block penalties and
+        // coordinate-tier isometry enter the inner solve but have no `loss.*`
+        // representative, so the Laplace criterion must add them explicitly to
+        // rank the same penalized deviance the Newton solve descends.
+        let extra_penalty_energy = match registry {
             Some(reg) => self
-                .analytic_decoder_penalty_value_total(reg)
+                .reml_extra_penalty_value_total(reg)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
             None => 0.0,
         };
 
-        // Coordinate-tier isometry penalty value (the stated objective's
-        // metric-distortion term). The inner solve descends it (it enters the
-        // coord blocks gt/htt) but it has no `loss.*` twin, so without this the
-        // Laplace criterion would score a different objective than the one
-        // minimized. Add it so the ρ-sweep ranks the full penalized deviance.
-        let isometry_energy = match registry {
-            Some(reg) => self
-                .isometry_penalty_value_total(reg)
-                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
-            None => 0.0,
-        };
-
-        let v = loss.total() + decoder_penalty_energy + isometry_energy + 0.5 * log_det - occam;
+        let v = loss.total() + extra_penalty_energy + 0.5 * log_det - occam;
         Ok((v, loss, cache))
     }
 
@@ -4818,23 +4821,17 @@ impl SaeManifoldTerm {
         )?;
         let log_det = self.streaming_exact_arrow_log_det(target, rho, registry)?;
         let occam = self.reml_occam_term(rho)?;
-        // Decoder-block analytic-penalty energy (#671/#672), matching the
-        // full-batch `reml_criterion_with_cache` path so streaming and dense
-        // criteria rank the identical penalized objective.
-        let decoder_penalty_energy = match registry {
+        // Extra analytic-penalty energy (#671/#737), matching the full-batch
+        // `reml_criterion_with_cache` path so streaming and dense criteria rank
+        // the identical penalized objective.
+        let extra_penalty_energy = match registry {
             Some(reg) => self
-                .analytic_decoder_penalty_value_total(reg)
-                .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
-            None => 0.0,
-        };
-        let isometry_energy = match registry {
-            Some(reg) => self
-                .isometry_penalty_value_total(reg)
+                .reml_extra_penalty_value_total(reg)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion_streaming_exact: {err}"))?,
             None => 0.0,
         };
         Ok((
-            loss.total() + decoder_penalty_energy + isometry_energy + 0.5 * log_det - occam,
+            loss.total() + extra_penalty_energy + 0.5 * log_det - occam,
             loss,
         ))
     }
@@ -10761,6 +10758,38 @@ mod tests {
             all_blocks_match,
             "SAE assembled gradient does not match central FD of the penalized objective"
         );
+    }
+
+    #[test]
+    fn sae_reml_extra_penalty_energy_counts_live_isometry_once() {
+        let p_out = 3usize;
+        let (term, _target, _rho, slice) = sae_pen_term(SaePenCaseKind::PeriodicD1);
+        let registry = sae_pen_registry(
+            SaePenKind::Isometry,
+            &slice,
+            term.n_obs(),
+            term.assignment.coords[0].latent_dim(),
+            term.beta_dim(),
+            p_out,
+        );
+
+        let isometry_energy = term
+            .isometry_penalty_value_total(&registry)
+            .expect("live isometry value");
+        assert!(
+            isometry_energy > 0.0,
+            "fixture must carry nonzero isometry energy"
+        );
+
+        let decoder_energy = term
+            .analytic_decoder_penalty_value_total(&registry)
+            .expect("decoder penalty value");
+        assert_abs_diff_eq!(decoder_energy, 0.0, epsilon = 1.0e-12);
+
+        let extra_energy = term
+            .reml_extra_penalty_value_total(&registry)
+            .expect("REML extra penalty value");
+        assert_abs_diff_eq!(extra_energy, isometry_energy, epsilon = 1.0e-12);
     }
 
     #[test]
