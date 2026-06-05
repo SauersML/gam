@@ -45,7 +45,6 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::FaerEigh;
-use crate::linalg::lanczos::{lanczos_log_quadrature, symmetric_lanczos_eigh};
 use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
 
@@ -424,22 +423,78 @@ fn stochastic_hvp_log_det(hvp: EvidenceHvpLogDet<'_>) -> Result<f64, String> {
 
 fn lanczos_log_quadrature_hvp(
     hvp: EvidenceHvpLogDet<'_>,
-    q: Vec<f64>,
+    mut q: Vec<f64>,
     max_steps: usize,
 ) -> Result<f64, String> {
     let n = hvp.dim;
-    let decomp = symmetric_lanczos_eigh(n, q, max_steps, 1e-12, "evidence HVP SLQ", |q, out| {
-        let applied = (hvp.apply)(q);
+    let mut q_prev = vec![0.0_f64; n];
+    let mut alphas = Vec::<f64>::with_capacity(max_steps);
+    let mut betas = Vec::<f64>::with_capacity(max_steps.saturating_sub(1));
+    let mut beta_prev = 0.0_f64;
+    let tol = 1e-12_f64;
+
+    for step in 0..max_steps {
+        let applied = (hvp.apply)(&q);
         if applied.len() != n || applied.iter().any(|v| !v.is_finite()) {
             return Err(format!(
                 "evidence HVP SLQ expected finite vector of length {n}, got {}",
                 applied.len()
             ));
         }
-        out.copy_from_slice(&applied);
-        Ok(())
-    })?;
-    lanczos_log_quadrature(&decomp, "evidence HVP SLQ Hessian")
+        let mut w = applied;
+        if step > 0 {
+            for i in 0..n {
+                w[i] -= beta_prev * q_prev[i];
+            }
+        }
+        let alpha = dot_slice(&q, &w);
+        if !alpha.is_finite() {
+            return Err("evidence HVP SLQ produced non-finite alpha".to_string());
+        }
+        for i in 0..n {
+            w[i] -= alpha * q[i];
+        }
+        let beta = norm2_slice(&w);
+        alphas.push(alpha);
+        if step + 1 == max_steps || beta <= tol {
+            break;
+        }
+        if !beta.is_finite() {
+            return Err("evidence HVP SLQ produced non-finite beta".to_string());
+        }
+        betas.push(beta);
+        q_prev = q;
+        q = w;
+        for v in q.iter_mut() {
+            *v /= beta;
+        }
+        beta_prev = beta;
+    }
+
+    let k = alphas.len();
+    let mut tri = Array2::<f64>::zeros((k, k));
+    for i in 0..k {
+        tri[[i, i]] = alphas[i];
+        if i + 1 < k {
+            tri[[i, i + 1]] = betas[i];
+            tri[[i + 1, i]] = betas[i];
+        }
+    }
+    let (evals, evecs) = tri
+        .eigh(Side::Lower)
+        .map_err(|e| format!("evidence HVP SLQ eigendecomposition failed: {e}"))?;
+    let mut quad = 0.0_f64;
+    for j in 0..k {
+        let theta = evals[j];
+        if !theta.is_finite() || theta <= 0.0 {
+            return Err(format!(
+                "evidence HVP SLQ expected SPD Hessian, Lanczos Ritz value {j} is {theta:.3e}"
+            ));
+        }
+        let weight = evecs[[0, j]] * evecs[[0, j]];
+        quad += weight * theta.ln();
+    }
+    Ok(quad)
 }
 
 #[inline]
