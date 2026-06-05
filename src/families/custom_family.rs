@@ -12488,6 +12488,12 @@ fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
 }
 
+fn generic_kkt_refusal_guidance() -> &'static str {
+    "check whether the named block has an unpenalized or weakly identified direction \
+     (penalty null space, marginal/logslope coupling, or callback-owned geometry), \
+     or whether a constrained fit has an incomplete active set"
+}
+
 /// Format a one-line diagnostic naming which block carries the dominant
 /// unresolved KKT residual when the joint Newton refuses to certify
 /// convergence. This is the actionable signal a user needs to recognise
@@ -12573,10 +12579,8 @@ fn block_residual_diagnostic_string(
     format!(
         "{dominant}; |∇L − Sβ|∞ = {exit_kkt_inf:.3e}, block_widths = {block_widths:?}, \
          block_names = {names:?}, block_beta_inf = {block_beta_inf:?}, \
-         block_residual_inf = {block_residual_inf:?}; check whether the named block's \
-         penalty has a polynomial null space not constrained by the data \
-         (reduce knots, add identifiability constraint, or use a basis whose \
-         null space is absorbed into the parametric block)"
+         block_residual_inf = {block_residual_inf:?}; {}",
+        generic_kkt_refusal_guidance()
     )
 }
 
@@ -12673,6 +12677,33 @@ impl KktRefusalDiagnosis {
             "active_set_incomplete" => Some(KktRefusalDiagnosis::ActiveSetIncomplete),
             "aliasing_detected_at_fit" => Some(KktRefusalDiagnosis::AliasingDetectedAtFit),
             _ => None,
+        }
+    }
+
+    fn guidance(self) -> &'static str {
+        match self {
+            KktRefusalDiagnosis::RankDeficientHPen => {
+                "check whether the named block has a structural or numerical null direction \
+                 not identified by the likelihood/penalty combination; for Duchon-style \
+                 smooths this may be a polynomial null space, while marginal-slope fits can \
+                 also expose callback-owned weak directions"
+            }
+            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
+                "check whether the named block has a near-separated or weakly identified \
+                 direction despite a well-conditioned penalized Hessian; in marginal-slope \
+                 fits this often indicates marginal/logslope coupling rather than a \
+                 Matérn/Duchon polynomial-nullspace failure"
+            }
+            KktRefusalDiagnosis::ActiveSetIncomplete => {
+                "check whether the named block's linear constraints need an additional \
+                 active row or a tighter constrained re-solve; this is an active-set \
+                 certification failure, not a polynomial-nullspace diagnosis"
+            }
+            KktRefusalDiagnosis::AliasingDetectedAtFit => {
+                "check whether the named block aliases another block after runtime \
+                 constraints or callbacks materialize; drop or reparameterize the aliased \
+                 direction before fitting"
+            }
         }
     }
 }
@@ -13311,10 +13342,7 @@ impl KktRefusalReport {
              free-null diagnostic: {}; \
              cert math: linearized_rel={:.3e}, scalar_relerr={:.3e}, |Δobj|={:.3e}, \
              accepted_step_inf={:.3e}, proposal_step_inf={:.3e}, trust_radius={:.3e}, \
-             |β|∞={:.3e}, active_set_rows_total={}; diagnosis: {}; \
-             check whether the named block's penalty has a polynomial null space not \
-             constrained by the data (reduce knots, add identifiability constraint, or \
-             use a basis whose null space is absorbed into the parametric block)",
+             |β|∞={:.3e}, active_set_rows_total={}; diagnosis: {}; {}",
             self.cycle,
             self.projected_residual_inf,
             4.0 * self.residual_tol,
@@ -13340,6 +13368,7 @@ impl KktRefusalReport {
             self.beta_inf(),
             self.active_set_rows_total,
             self.diagnosis.as_str(),
+            self.diagnosis.guidance(),
         )
     }
 }
@@ -32502,6 +32531,12 @@ mod tests {
                 .contains("block_c_rank_deficient"),
             "bubbled error must name the carrying block by spec.name",
         );
+        assert!(
+            report
+                .format_bubbled_error()
+                .contains("structural or numerical null direction"),
+            "rank-deficient refusals should no longer emit the old polynomial-only guidance",
+        );
     }
 
     /// Round-trip: every variant's `as_str()` output, when embedded in the
@@ -32517,6 +32552,7 @@ mod tests {
             KktRefusalDiagnosis::RankDeficientHPen,
             KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
             KktRefusalDiagnosis::ActiveSetIncomplete,
+            KktRefusalDiagnosis::AliasingDetectedAtFit,
         ] {
             let label = diagnosis.as_str();
             // Mimic the trailing slot exactly as `format_bubbled_error`
@@ -32534,6 +32570,21 @@ mod tests {
                 parsed,
             );
         }
+    }
+
+    #[test]
+    fn kkt_refusal_guidance_distinguishes_marginal_slope_coupling_from_polynomial_nullspace() {
+        let phantom = KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH.guidance();
+        assert!(phantom.contains("marginal/logslope coupling"));
+        assert!(phantom.contains("rather than a"));
+        assert!(phantom.contains("Matérn/Duchon polynomial-nullspace failure"));
+
+        let active = KktRefusalDiagnosis::ActiveSetIncomplete.guidance();
+        assert!(active.contains("active-set certification failure"));
+        assert!(active.contains("not a polynomial-nullspace diagnosis"));
+
+        let alias = KktRefusalDiagnosis::AliasingDetectedAtFit.guidance();
+        assert!(alias.contains("drop or reparameterize"));
     }
 
     /// Regression canary: a synthetic 3-block fixture chosen to mimic the
@@ -32665,6 +32716,10 @@ mod tests {
             KktRefusalDiagnosis::parse_from_error(&bubbled),
             Some(KktRefusalDiagnosis::RankDeficientHPen),
             "canary's bubbled-error string must parse back via the classifier's parser",
+        );
+        assert!(
+            bubbled.contains("marginal-slope fits can also expose callback-owned weak directions"),
+            "BMS-shaped refusal should mention the callback-owned weak-direction mechanism"
         );
     }
 
