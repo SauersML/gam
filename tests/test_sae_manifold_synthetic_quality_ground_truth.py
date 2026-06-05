@@ -109,11 +109,12 @@ def test_periodic_basis_public_entrypoints_agree_after_wrapping() -> None:
 def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
     """Known decoder, known one-hot atoms: OOS should recover routing."""
     x, truth, _t = _planted_one_hot_periodic(n=16, seed=0, noise=0.0)
+    decoder = _oracle_periodic_decoder()
     payload = rust_module().sae_manifold_predict_oos(
         np.ascontiguousarray(x),
         ["periodic", "periodic"],
         [1, 1],
-        [np.ascontiguousarray(block) for block in _oracle_periodic_decoder()],
+        [np.ascontiguousarray(block) for block in decoder],
         [None, None],
         [1, 1],
         alpha=1.0,
@@ -130,6 +131,14 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
     assert _r2(x, fitted) >= 0.98
     assert _best_binary_assignment_accuracy(assignments, truth) >= 0.95
     assert float(np.mean(np.min(assignments, axis=1))) <= 0.05
+    for atom_idx, expected_block in enumerate(decoder):
+        np.testing.assert_allclose(
+            np.asarray(payload["atoms"][atom_idx]["decoder_B"], dtype=float),
+            expected_block,
+            rtol=0.0,
+            atol=0.0,
+            err_msg="OOS prediction must not mutate caller-provided decoder blocks",
+        )
 
 
 def test_fit_learns_disjoint_periodic_atoms_without_inactive_leakage() -> None:

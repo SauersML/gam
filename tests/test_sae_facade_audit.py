@@ -80,6 +80,34 @@ def test_isometry_weight_zero_omits_descriptor(monkeypatch):
     assert payload is None
 
 
+def test_decoder_incoherence_payload_builder_default_is_on_for_multi_atom(monkeypatch):
+    _no_row_block_probe(monkeypatch)
+    payload = sae._build_analytic_penalties_payload(
+        isometry_weight=0.0,
+        ard_per_atom=False,
+        gate_sparsity="l1",
+        sparsity_weight=0.0,
+        scad_mcp_gamma=3.7,
+        decoder_feature_sparsity_groups=None,
+        block_orthogonality_weight=0.0,
+        nuclear_norm_weight=0.0,
+        nuclear_norm_max_rank=None,
+        k_atoms=2,
+        d_max=2,
+        p_out=3,
+    )
+    assert payload is not None
+    assert json.loads(payload) == [
+        {
+            "kind": "decoder_incoherence",
+            "target": "beta",
+            "block_sizes": [1, 1],
+            "p_out": 3,
+            "weight": 1.0,
+        }
+    ]
+
+
 # ---------------------------------------------------------------------------
 # #606 — X and Z are aliases; differing arrays must raise, identical arrays are
 # accepted, and neither-supplied still raises the original TypeError.

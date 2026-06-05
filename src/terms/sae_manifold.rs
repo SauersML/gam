@@ -4169,7 +4169,8 @@ impl SaeManifoldTerm {
                         // branch above for why `max(V'', 0)` is required to keep
                         // `htt` PD (the exact `V'' = α·cos κt` is indefinite past a
                         // quarter period and breaks the Schur/log-det Cholesky).
-                        let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom_idx][axis]);
+                        let alpha =
+                            SaeManifoldRho::stable_exp_strength(rho.log_ard[atom_idx][axis]);
                         let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                         block.gt[off + axis] += prior.grad;
                         block.htt[[off + axis, off + axis]] += prior.hess.max(0.0);
@@ -6733,7 +6734,7 @@ impl SaeManifoldTerm {
                     armijo_c1: SAE_MANIFOLD_ARMIJO_C1,
                     ..ArrowProximalCorrectionOptions::default()
                 };
-                let accepted_step = solve_arrow_newton_step_with_proximal_correction(
+                let accepted_step = match solve_arrow_newton_step_with_proximal_correction(
                     &sys,
                     ridge_ext_coord,
                     ridge_beta,
@@ -6748,11 +6749,13 @@ impl SaeManifoldTerm {
                             })
                             .unwrap_or(f64::INFINITY)
                     },
-                )
-                .map_err(|err| {
-                    self.restore_mutable_state(&snapshot);
-                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
-                })?;
+                ) {
+                    Ok(step) => step,
+                    Err(_err) => {
+                        self.restore_mutable_state(&snapshot);
+                        break;
+                    }
+                };
                 if !(accepted_step.trial_objective_value.is_finite()
                     && accepted_step.trial_objective_value < pre_step_total)
                 {
@@ -9441,6 +9444,75 @@ mod tests {
             .unwrap();
         assert_abs_diff_eq!(stream_cost, full_cost, epsilon = 1.0e-8);
         assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
+    }
+
+    #[test]
+    fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
+        let n = 24usize;
+        let p = 2usize;
+        let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.25) / n as f64);
+        let (phi, jet) = periodic_basis(&coords);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            array![[0.30, -0.10], [0.20, 0.40], [-0.35, 0.15]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 0)),
+            vec![coords],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = Array2::from_shape_fn((n, p), |(row, col)| {
+            let x = (row as f64 + 0.5) / n as f64;
+            if col == 0 {
+                0.45 * (std::f64::consts::TAU * x).sin() + 0.07
+            } else {
+                -0.20 * (std::f64::consts::TAU * x).cos() + 0.03 * row as f64
+            }
+        });
+        let alpha = 250.0_f64;
+        let rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![alpha.ln()]]);
+        let loss = term.loss(target.view(), &rho).unwrap();
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
+        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        let (_delta_t, _delta_beta, cache) =
+            solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options).unwrap();
+
+        let dispersion = term.reconstruction_dispersion(&loss, &cache, &rho).unwrap();
+        let smooth_edf = term
+            .decoder_smoothness_effective_dof(&cache, rho.lambda_smooth())
+            .unwrap();
+        let beta_edf = (term.beta_dim() as f64 - smooth_edf).max(0.0);
+        let traces = term.ard_inverse_traces(&cache).unwrap();
+        let coord_edf = (n as f64 - alpha * traces[0][0]).clamp(0.0, n as f64);
+        let rss = 2.0 * loss.data_fit;
+        let expected = rss / ((n * p) as f64 - beta_edf - coord_edf).max(1.0);
+        assert_abs_diff_eq!(dispersion, expected, epsilon = 1.0e-10);
+
+        let old_full_coordinate_edf = n as f64;
+        let old_full_coordinate_dispersion =
+            rss / ((n * p) as f64 - beta_edf - old_full_coordinate_edf).max(1.0);
+        assert!(
+            coord_edf < 0.25 * old_full_coordinate_edf,
+            "test setup must put the coordinate axis in an ARD-shrunk regime; \
+             coord_edf={coord_edf}, old_full_coordinate_edf={old_full_coordinate_edf}"
+        );
+        assert!(
+            dispersion < 0.75 * old_full_coordinate_dispersion,
+            "φ̂ must use the ARD-shrunk coordinate edf, not the old full \
+             coordinate count: got {dispersion}, old formula {old_full_coordinate_dispersion}"
+        );
     }
 
     #[test]

@@ -70,7 +70,9 @@ def _decoder_cross_gram_energy(fit) -> float:
     total = 0.0
     for left in range(len(blocks)):
         for right in range(left + 1, len(blocks)):
-            cross = blocks[left].T @ blocks[right]
+            # Stored blocks are (basis_rows, p_out). Cross-atom decoder
+            # directions live in output space, so compare row-space overlap.
+            cross = blocks[left] @ blocks[right].T
             total += float(np.sum(cross * cross))
     return total
 
