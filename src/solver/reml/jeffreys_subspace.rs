@@ -270,7 +270,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linalg::faer_ndarray::FaerEigh;
     use ndarray::array;
 
     #[test]
