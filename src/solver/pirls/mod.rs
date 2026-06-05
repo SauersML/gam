@@ -2767,7 +2767,7 @@ pub(super) fn compute_jeffreys_pirls_diagnostics(
     // Fisher working weight `W(η)` is evaluated for the resolved standard link;
     // `StandardLink::Logit` reproduces the released logit diagnostics exactly.
     let op = FirthDenseOperator::build_with_observation_weights_for_link(
-        link,
+        &InverseLink::Standard(link),
         &x_design.to_owned(),
         &eta.to_owned(),
         observation_weights,

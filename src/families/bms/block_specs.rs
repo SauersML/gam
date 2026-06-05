@@ -3,12 +3,8 @@ use super::gradient_paths::*;
 use super::hessian_paths::{new_cell_moment_cache_stats, new_cell_moment_lru_cache};
 use super::install_flex::validate_spec;
 use super::*;
-use crate::faer_ndarray::{
-    FaerArrayView, FaerEigh, factorize_symmetricwith_fallback, fast_ab, fast_atb, fast_xt_diag_x,
-    fast_xt_diag_y,
-};
+use crate::faer_ndarray::{FaerEigh, fast_ab, fast_atb, fast_xt_diag_x};
 use crate::families::marginal_slope_orthogonal::INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA;
-use crate::matrix::FactorizedSystem;
 use faer::Side;
 
 const BMS_PROBIT_SEPARATION_BETA_INF: f64 = 40.0;
@@ -877,6 +873,9 @@ fn bernoulli_marginal_slope_runaway_error(
 #[cfg(test)]
 mod runaway_tests {
     use super::*;
+    use crate::faer_ndarray::{
+        FaerArrayView, factorize_symmetricwith_fallback, fast_xt_diag_y,
+    };
 
     // The marginal↔logslope overlap penalty is no longer installed as a pinned
     // ridge (subsumed by the now-unconditional exact logslope orthogonalisation in
