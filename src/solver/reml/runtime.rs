@@ -3182,7 +3182,9 @@ impl<'a> RemlState<'a> {
             };
             let lambdas: Vec<f64> = rho.iter().map(|r| r.exp()).collect();
             let beta = self.sparse_exact_beta_original(pirls_result);
-            let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
+            let firth_op = if let Some(jeffreys_link) =
+                reml_robust_jeffreys_link(&self.config)
+            {
                 if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
                     Some(cached.clone())
                 } else {
@@ -6397,9 +6399,8 @@ impl<'a> RemlState<'a> {
                 &pirls_config,
                 warm_start_ref,
                 adaptive_kkt_tolerance,
-                // REML cost eval: never re-profile the family dispersion (Gamma
-                // shape / Beta precision) against the trial λ's residuals — that
-                // would couple the scale to λ and bias selection (#678, #769).
+                // REML cost eval: never re-profile the Gamma scale against the
+                // trial λ's residuals (would bias λ selection — see #678).
                 false,
             );
             let pirls_elapsed = pirls_start.elapsed();
