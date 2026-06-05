@@ -1313,6 +1313,164 @@ pub fn reduce_penalties_with_map(
     Ok(reduced)
 }
 
+/// Per-block exact orthogonal reparameterisation of structural confounds.
+///
+/// `block_transforms[b]` is a dense `(p_b × r_b)` reparam `V_b` mapping raw
+/// block-`b` coefficients to reduced coordinates: the orthogonalised block
+/// design is `X_b · V_b`, and a fitted reduced coefficient lifts back to raw
+/// space exactly via `β_b_raw = V_b · θ_b`. `r_b ≤ p_b`; `r_b < p_b` exactly
+/// when block `b` carries `p_b − r_b` directions already spanned (in the
+/// pilot W-metric) by the cumulative anchor of all higher-priority blocks —
+/// those directions are removed (not penalised), so the joint design
+/// `[X_0 V_0 | X_1 V_1 | …]` has the overlap excised exactly.
+pub struct BlockOrthogonalization {
+    /// `block_transforms[b]`: the `(p_b × r_b)` reparam `V_b` for raw block `b`,
+    /// in the **original block order** (parallel to the `block_designs` input).
+    pub block_transforms: Vec<Array2<f64>>,
+    /// `(block_idx, local_raw_col_count_dropped)` for every block whose
+    /// reduced width is strictly smaller than its raw width — i.e. the blocks
+    /// that shed overlap directions against the anchor. Empty when no block
+    /// overlapped (every `V_b` is then a `p_b × p_b` rotation/identity).
+    pub dropped: Vec<(usize, usize)>,
+}
+
+/// Build per-block exact W-metric orthogonalising reparameterisations.
+///
+/// `block_designs[b]` is the raw `(n × p_b)` design of block `b`.
+/// `priority[b]` is the block's gauge priority — blocks are residualised in
+/// **descending** priority order, so the highest-priority block keeps its full
+/// column span and lower-priority blocks shed only the directions already
+/// explained by the cumulative higher-priority anchor. `weight` is the pilot
+/// W-metric row weight `w_i ≥ 0` (the diagonal of the working GLM/GAM Hessian
+/// at the pilot β); pass an all-ones vector for the plain Euclidean metric.
+///
+/// The returned `block_transforms` are in the **original** block order. For a
+/// block whose columns are all W-orthogonal to the anchor, `V_b` is a square
+/// `p_b × p_b` orthonormal rotation (rank preserved, round-trip exact). For a
+/// block with an overlap of dimension `d`, `V_b` is `p_b × (p_b − d)` and the
+/// `d` overlap directions are removed exactly.
+///
+/// Exactness / round-trip: `X_b · V_b` is the reduced design and
+/// `β_b_raw = V_b · θ_b` lifts a reduced fit back to raw coordinates. `V_b` has
+/// orthonormal columns (eigenvectors of the residual Gram), so the lift is the
+/// minimum-norm raw representative of the reduced fit.
+pub fn orthogonalize_design_blocks(
+    block_designs: &[Array2<f64>],
+    priority: &[u32],
+    weight: &[f64],
+) -> Result<BlockOrthogonalization, CompilerError> {
+    if block_designs.len() != priority.len() {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "block_designs ({}) and priority ({}) length mismatch",
+            block_designs.len(),
+            priority.len()
+        )));
+    }
+    if block_designs.is_empty() {
+        return Ok(BlockOrthogonalization {
+            block_transforms: Vec::new(),
+            dropped: Vec::new(),
+        });
+    }
+    let n = block_designs[0].nrows();
+    for (b, x) in block_designs.iter().enumerate() {
+        if x.nrows() != n {
+            return Err(CompilerError::DimensionMismatch(format!(
+                "block {b} design has {} rows but block 0 has {n}",
+                x.nrows()
+            )));
+        }
+    }
+    if weight.len() != n {
+        return Err(CompilerError::DimensionMismatch(format!(
+            "weight length {} != n {n}",
+            weight.len()
+        )));
+    }
+    // sqrt(W) row scale (clamp tiny-negative to zero — the pilot Hessian
+    // diagonal is PSD-clamped upstream, but guard against round-off).
+    let mut sqrt_w = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let wi = weight[i].max(0.0);
+        sqrt_w[i] = wi.sqrt();
+    }
+
+    // Descending-priority visitation order over the original block indices.
+    // Stable on ties (preserves input order) so the anchor build is
+    // deterministic.
+    let mut order: Vec<usize> = (0..block_designs.len()).collect();
+    order.sort_by(|&a, &b| priority[b].cmp(&priority[a]));
+
+    // Cumulative weighted anchor `A = sqrt(W) · [kept block designs]`.
+    let mut anchor: Array2<f64> = Array2::<f64>::zeros((n, 0));
+
+    // Output transforms indexed by ORIGINAL block index (filled out of order).
+    let mut block_transforms: Vec<Option<Array2<f64>>> = vec![None; block_designs.len()];
+    let mut dropped: Vec<(usize, usize)> = Vec::new();
+
+    for &b in order.iter() {
+        let x_b = &block_designs[b];
+        let p_b = x_b.ncols();
+        // Weighted block design `W_b = sqrt(W) · X_b`.
+        let mut w_b = x_b.clone();
+        for i in 0..n {
+            let s = sqrt_w[i];
+            for j in 0..p_b {
+                w_b[[i, j]] *= s;
+            }
+        }
+        // Residualise `W_b` against the cumulative anchor in the W-metric and
+        // eigendecompose the residual Gram. Eigenvectors with positive
+        // eigenvalues span block `b`'s W-orthogonal-to-anchor column space;
+        // the zero-eigenvalue directions are exactly the overlap with the
+        // anchor and are removed.
+        let (residual, _correction) = residualise_in_metric(&anchor, &w_b)?;
+        let g_res = symmetrise(&fast_atb(&residual, &residual));
+        let g_bb_trace: f64 = (0..p_b).map(|i| g_res[[i, i]].max(0.0)).sum();
+        let v_b = keep_positive_eigenspace(&g_res, n, 1, g_bb_trace)?;
+        let r_b = v_b.ncols();
+        if r_b < p_b {
+            dropped.push((b, p_b - r_b));
+        }
+        // Append this block's kept, W-orthogonalised weighted columns to the
+        // anchor so lower-priority blocks residualise against them too. The
+        // residual (already anchor-orthogonal) projected onto the kept basis
+        // is `residual · V_b` — these are mutually orthogonal in the W-metric
+        // by construction of `keep_positive_eigenspace`.
+        let kept_weighted = fast_ab(&residual, &v_b);
+        anchor = concat_cols(&anchor, &kept_weighted);
+        block_transforms[b] = Some(v_b);
+    }
+
+    let block_transforms: Vec<Array2<f64>> = block_transforms
+        .into_iter()
+        .enumerate()
+        .map(|(b, t)| {
+            t.ok_or_else(|| {
+                CompilerError::LinalgFailure(format!(
+                    "orthogonalize_design_blocks: block {b} transform was never assigned"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Finite check on every transform.
+    for (b, v) in block_transforms.iter().enumerate() {
+        for value in v.iter() {
+            if !value.is_finite() {
+                return Err(CompilerError::LinalgFailure(format!(
+                    "orthogonalize_design_blocks: block {b} transform has a non-finite entry"
+                )));
+            }
+        }
+    }
+
+    Ok(BlockOrthogonalization {
+        block_transforms,
+        dropped,
+    })
+}
+
 /// Symmetrise a (nearly-symmetric) matrix by averaging with its transpose.
 fn symmetrise(m: &Array2<f64>) -> Array2<f64> {
     let (r, c) = m.dim();

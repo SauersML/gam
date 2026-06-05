@@ -7,19 +7,16 @@ use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn log_cuda_enabled(device: &GpuDeviceInfo, policy: &GpuDispatchPolicy) {
-    let fingerprint = GpuDispatchPolicy::calibration_fingerprint(device).to_hex();
     log::info!(
-        "[GPU] CUDA acceleration enabled\n  device: {} '{}' | memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch-calibration: key={} xtwx_rows>={} gemm>={}flop spmv_nnz>={} chol_p>={} syevd_p>={} row_n>={}",
+        "[GPU] CUDA acceleration enabled\n  device: {} '{}' | memory={}\n  libraries: CUDA driver ready; cuBLAS/cuSOLVER/cuSPARSE load on first use\n  dispatch: xtwx_rows>={} gemm>={}flop spmv_nnz>={} chol_p>={} syevd_p>={}",
         device.ordinal,
         device.name,
         format_bytes(device.total_mem_bytes),
-        &fingerprint[..16],
         policy.xtwx_n_min,
         format_count(policy.gemm_min_flops as u64),
         format_count(policy.sparse_min_nnz as u64),
         policy.potrf_min_p,
         policy.syevd_min_p,
-        policy.row_kernel_min_n,
     );
 }
 
