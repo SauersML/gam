@@ -143,7 +143,11 @@ fn reported_slope(dir: &Path, label: &str, formula: &str) -> f64 {
     run_or_panic(predict_cmd, &format!("gam predict `{formula}`"));
 
     let preds = read_predictions(&out_path);
-    assert_eq!(preds.len(), 2, "expected two prediction rows for `{formula}`");
+    assert_eq!(
+        preds.len(),
+        2,
+        "expected two prediction rows for `{formula}`"
+    );
     preds[1] - preds[0]
 }
 

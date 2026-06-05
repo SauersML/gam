@@ -249,10 +249,7 @@ const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
 /// not small). The latter is the critical safety valve: if the cheap iteration
 /// has not resolved the bottom of the spectrum it NEVER authorises a skip, so a
 /// hidden small eigenvalue cannot be missed — the term is then formed exactly.
-fn cheap_conditioning_bounds<HvFn>(
-    mut hv: HvFn,
-    p: usize,
-) -> Result<Option<(f64, f64)>, String>
+fn cheap_conditioning_bounds<HvFn>(mut hv: HvFn, p: usize) -> Result<Option<(f64, f64)>, String>
 where
     HvFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
 {
@@ -310,8 +307,10 @@ where
                 }
             };
             if w.len() != p || w.iter().any(|x| !x.is_finite()) {
-                return Err("cheap_conditioning_bounds: HVP produced non-finite/ill-sized output"
-                    .to_string());
+                return Err(
+                    "cheap_conditioning_bounds: HVP produced non-finite/ill-sized output"
+                        .to_string(),
+                );
             }
             out.copy_from_slice(w.as_slice().ok_or_else(|| {
                 "cheap_conditioning_bounds: HVP output not contiguous".to_string()
@@ -410,10 +409,7 @@ where
 /// satisfies the exact `conditioning_gate_skips` predicate by at least `MARGIN×`
 /// — the exact path would skip, so skipping cheaply is byte-identical. The
 /// converse cases never skip, preserving exactness where the term bites.
-pub fn jeffreys_term_skippable_via_matvec<HvFn>(
-    hv: HvFn,
-    p: usize,
-) -> Result<bool, String>
+pub fn jeffreys_term_skippable_via_matvec<HvFn>(hv: HvFn, p: usize) -> Result<bool, String>
 where
     HvFn: FnMut(&Array1<f64>) -> Result<Array1<f64>, String>,
 {
@@ -581,9 +577,9 @@ where
     // the value, gradient and curvature are the exact Jeffreys quantities there;
     // a genuinely separating direction has near-zero curvature, where the floor
     // simply keeps `Φ` finite while the `H_Φ` curvature below grows to bound it.
-    let (evals, evecs) = h_id_sym
-        .eigh(Side::Lower)
-        .map_err(|e| format!("joint_jeffreys_term: reduced-information eigendecomposition failed: {e}"))?;
+    let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
+        format!("joint_jeffreys_term: reduced-information eigendecomposition failed: {e}")
+    })?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
     // CONDITIONING GATE ("no cost on easy fits"). The eigendecomposition we just
     // computed gives the full reduced spectrum; the worst-conditioned direction
@@ -903,13 +899,13 @@ mod tests {
         // space. Jeffreys is self-limiting, so this does not bias identified
         // directions; it only bounds near-separating ones.
         for s in [
-            Array2::<f64>::zeros((3, 3)),            // pure parametric
+            Array2::<f64>::zeros((3, 3)), // pure parametric
             {
                 let mut s = Array2::<f64>::zeros((3, 3));
-                s[[2, 2]] = 5.0;                     // rank-deficient (ker dim 2)
+                s[[2, 2]] = 5.0; // rank-deficient (ker dim 2)
                 s
             },
-            Array2::<f64>::eye(4) * 2.0,             // full-rank penalty
+            Array2::<f64>::eye(4) * 2.0, // full-rank penalty
         ] {
             let p = s.nrows();
             let z = jeffreys_subspace_from_penalty(s.view()).unwrap();
@@ -1027,8 +1023,14 @@ mod tests {
         };
         let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
         assert_eq!(phi, 0.0, "well-conditioned ⇒ no Jeffreys value");
-        assert!(grad.iter().all(|v| *v == 0.0), "well-conditioned ⇒ zero grad");
-        assert!(hphi.iter().all(|v| *v == 0.0), "well-conditioned ⇒ zero curvature");
+        assert!(
+            grad.iter().all(|v| *v == 0.0),
+            "well-conditioned ⇒ zero grad"
+        );
+        assert!(
+            hphi.iter().all(|v| *v == 0.0),
+            "well-conditioned ⇒ zero curvature"
+        );
     }
 
     #[test]
@@ -1071,7 +1073,8 @@ mod tests {
         // ⇒ the n-aware ABSOLUTE gate fires the stabilising term. This is exactly
         // the FIX-C small-n admixture-cline regime the relative-only gate missed.
         let below_abs = mk(0.05);
-        let (phi_b, _grad_b, hphi_b) = joint_jeffreys_term(below_abs.view(), z.view(), hdir).unwrap();
+        let (phi_b, _grad_b, hphi_b) =
+            joint_jeffreys_term(below_abs.view(), z.view(), hdir).unwrap();
         assert!(
             phi_b != 0.0,
             "absolutely near-separating (small-n) must fire even though the relative ratio clears the gate",
@@ -1088,7 +1091,10 @@ mod tests {
         // Well-conditioned (both gates pass) ⇒ skip.
         assert!(conditioning_gate_skips(50.0, 100.0));
         // Relatively ill-conditioned ⇒ do not skip.
-        assert!(!conditioning_gate_skips(CONDITIONING_GATE_RELATIVE * 0.1, 1.0));
+        assert!(!conditioning_gate_skips(
+            CONDITIONING_GATE_RELATIVE * 0.1,
+            1.0
+        ));
         // Absolutely near-separating at small n (ratio fine, λ_min < 1) ⇒ do not skip.
         assert!(!conditioning_gate_skips(0.05, 1.0));
         // SMOOTH boundary: λ_min at the lower (firing) knot is still fully active,
@@ -1181,7 +1187,10 @@ mod tests {
         diag[0] = 200.0; // λ_min
         diag[1] = 250.0; // λ_max
         let skippable = jeffreys_term_skippable_via_matvec(diag_hv(diag), p).unwrap();
-        assert!(skippable, "clearly well-conditioned wide fit must be skippable");
+        assert!(
+            skippable,
+            "clearly well-conditioned wide fit must be skippable"
+        );
     }
 
     #[test]
@@ -1207,7 +1216,10 @@ mod tests {
         let p = CHEAP_CONDITIONING_PRECHECK_MIN_DIM - 1;
         let diag = vec![100.0; p];
         let skippable = jeffreys_term_skippable_via_matvec(diag_hv(diag), p).unwrap();
-        assert!(!skippable, "below the size threshold the pre-check never skips");
+        assert!(
+            !skippable,
+            "below the size threshold the pre-check never skips"
+        );
     }
 
     #[test]
@@ -1240,8 +1252,7 @@ mod tests {
         for &lmin in &[10.0_f64, 25.0, 80.0, 200.0] {
             let mut diag = vec![lmin * 4.0; p];
             diag[0] = lmin;
-            let cheap_skip =
-                jeffreys_term_skippable_via_matvec(diag_hv(diag.clone()), p).unwrap();
+            let cheap_skip = jeffreys_term_skippable_via_matvec(diag_hv(diag.clone()), p).unwrap();
             if cheap_skip {
                 // The exact path on the same dense H must produce the zero term.
                 let mut h = Array2::<f64>::zeros((p, p));
@@ -1249,7 +1260,10 @@ mod tests {
                     h[[i, i]] = d;
                 }
                 let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
-                assert_eq!(phi, 0.0, "cheap-skip ⇒ exact phi must be zero (byte-identical)");
+                assert_eq!(
+                    phi, 0.0,
+                    "cheap-skip ⇒ exact phi must be zero (byte-identical)"
+                );
                 assert!(grad.iter().all(|v| *v == 0.0));
                 assert!(hphi.iter().all(|v| *v == 0.0));
             }
