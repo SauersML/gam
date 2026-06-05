@@ -7481,11 +7481,7 @@ mod estimate_policy_tests {
         // power. Row 2 genuinely touches the intercept column, exercising the
         // mean-mixing term that a single-coefficient box leaves at zero (so it
         // also pins the sign of that term).
-        let a_orig = array![
-            [0.0, 1.0, 0.0],
-            [0.0, -1.0, 0.0],
-            [1.0, 0.5, -3.0],
-        ];
+        let a_orig = array![[0.0, 1.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.5, -3.0],];
         let a_int = conditioning.transform_constraint_matrix_to_internal(&a_orig);
 
         // The defining invariant: A_int·β_int must equal A_orig·β_orig for the
