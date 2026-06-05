@@ -6258,6 +6258,7 @@ fn materialize_bernoulli_marginal_slope<'a>(
             spec,
             options: BlockwiseFitOptions {
                 compute_covariance: true,
+                robust_identification: config.robust_identification,
                 ..Default::default()
             },
             kappa_options: SpatialLengthScaleOptimizationOptions::default(),

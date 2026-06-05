@@ -400,6 +400,7 @@ fn marginal_penalties_with_influence_ridge(
     overlap_ridge_log_lambda: f64,
     influence_ridge_log_lambda: f64,
     nullspace_ridge_log_lambda: f64,
+    robust: crate::solver::robust_identification::RobustConfig,
 ) -> Result<(Vec<PenaltyMatrix>, Vec<usize>, Array1<f64>), String> {
     let p_m = design.design.ncols();
     let p1 = influence_columns.map(|z| z.ncols()).unwrap_or(0);
@@ -422,7 +423,13 @@ fn marginal_penalties_with_influence_ridge(
     // own max-abs so a single smooth cannot dominate the aggregate, and take the
     // null space of the sum. With no penalties (pure-parametric marginal) the
     // aggregate is zero and the shrinkage is the identity on all `p_m` columns.
-    if p_m > 0 {
+    //
+    // When `robust.firth_general` is armed, the identifiable-subspace Firth/
+    // Jeffreys prior supplies the proper-prior curvature on these unpenalized
+    // directions, so this pinned nullspace-shrinkage ridge is retired (skip the
+    // penalty AND its `nullspace_dims`/`log_lambdas` slot to keep accounting
+    // consistent).
+    if p_m > 0 && !robust.firth_general {
         let mut aggregate = Array2::<f64>::zeros((p_m, p_m));
         for bp in &design.penalties {
             let scale = bp
@@ -465,7 +472,12 @@ fn marginal_penalties_with_influence_ridge(
     // (2) gam#754 fixed overlap ridge: shrink only the marginal directions that
     // are explainable by the score-weighted logslope surface. Embed at
     // `total_dim`; influence columns retain their own absorber ridge below.
-    if let Some(overlap) = overlap_penalty {
+    //
+    // When `robust.orthogonalize_confounds` is armed the logslope↔marginal
+    // confound is resolved exactly by construction (orthogonal reparameter-
+    // ization), so this pinned overlap ridge is retired (skip the penalty AND
+    // its `nullspace_dims`/`log_lambdas` slot to keep accounting consistent).
+    if let (false, Some(overlap)) = (robust.orthogonalize_confounds, overlap_penalty) {
         if overlap.nrows() != p_m || overlap.ncols() != p_m {
             return Err(format!(
                 "marginal/logslope overlap penalty shape mismatch: got {}x{}, expected {p_m}x{p_m}",
@@ -876,6 +888,7 @@ fn build_marginal_blockspec_bms(
     overlap_ridge_log_lambda: f64,
     influence_ridge_log_lambda: f64,
     nullspace_ridge_log_lambda: f64,
+    robust: crate::solver::robust_identification::RobustConfig,
 ) -> Result<ParameterBlockSpec, String> {
     let offset_m = offset + baseline;
     let offset_s = logslope_offset + logslope_baseline;
@@ -902,6 +915,7 @@ fn build_marginal_blockspec_bms(
         overlap_ridge_log_lambda,
         influence_ridge_log_lambda,
         nullspace_ridge_log_lambda,
+        robust,
     )?;
     Ok(ParameterBlockSpec {
         name: "marginal_surface".to_string(),
@@ -1088,6 +1102,14 @@ pub fn fit_bernoulli_marginal_slope_terms(
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
     let data_view = data;
+    // Resolve the universal-robustness policy threaded from the workflow into
+    // the per-mechanism gate the BMS block construction consumes. `Off`
+    // (default) yields `RobustConfig { firth_general: false,
+    // orthogonalize_confounds: false }`, so every pinned ridge stays installed
+    // and the block specs are byte-identical to the released solver.
+    let robust = crate::solver::robust_identification::RobustConfig::from_policy(
+        options.robust_identification,
+    );
     validate_spec(data_view, &spec)?;
     let mut effective_kappa_options = kappa_options.clone();
     // Honor explicit `length_scale=X` in the user's formula: when every
@@ -1572,6 +1594,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 MARGINAL_LOGSLOPE_OVERLAP_FIXED_LOG_LAMBDA,
                 INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA,
                 MARGINAL_NULLSPACE_RIDGE_FIXED_LOG_LAMBDA,
+                robust,
             )?,
             build_logslope_blockspec_bms(
                 logslope_design,

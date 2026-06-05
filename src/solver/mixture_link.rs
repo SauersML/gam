@@ -314,7 +314,10 @@ fn probit_fisher_weight_jet5(eta: f64) -> (f64, f64, f64, f64, f64) {
     }
     let x = eta;
     let p = normal_cdf(x);
-    let q = 1.0 - p;
+    // Compute the complement directly via Phi(-x) rather than `1 - Phi(x)`:
+    // in the positive tail `Phi(x)` rounds to 1.0 and `1 - Phi(x)` cancels to
+    // zero, whereas `Phi(-x)` retains the accurate (tiny) tail mass.
+    let q = normal_cdf(-x);
     let phi = normal_pdf(x);
     // Saturated tail: the denominator Phi(1-Phi) has underflowed to zero (or
     // would divide by zero); the working weight and all derivatives go to zero.
