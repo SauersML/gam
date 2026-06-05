@@ -47,22 +47,10 @@ pub struct JeffreysSubspace {
 }
 
 impl JeffreysSubspace {
-    /// Block dimension `p` (rows of the basis).
-    #[inline]
-    pub fn block_dim(&self) -> usize {
-        self.columns.nrows()
-    }
-
     /// Dimension `m` of the under-identified span (columns of the basis).
     #[inline]
     pub fn span_dim(&self) -> usize {
         self.columns.ncols()
-    }
-
-    /// True when the block has no under-identified direction (fully penalized).
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.columns.ncols() == 0
     }
 }
 
