@@ -7744,6 +7744,7 @@ fn penalty_diag_scale(penalty: &PenaltyMatrix) -> f64 {
             matrix_diag_mean_abs(local).max(matrix_frobenius_rms(local))
         }
         PenaltyMatrix::Labeled { inner, .. } => penalty_diag_scale(inner),
+        PenaltyMatrix::Fixed { inner, .. } => penalty_diag_scale(inner),
     }
 }
 
@@ -10575,10 +10576,12 @@ fn build_tensor_penalties_kronecker(
     // shifts and leaves h(Y|x) calibrated only marginally instead of
     // conditionally.
     for s_cov in covariate_penalties {
+        let fixed_log_lambda = s_cov.fixed_log_lambda();
         let right = match s_cov {
             PenaltyMatrix::Dense(right) => right,
             penalty @ PenaltyMatrix::Blockwise { .. } => penalty.to_dense(),
             PenaltyMatrix::Labeled { inner, .. } => inner.to_dense(),
+            PenaltyMatrix::Fixed { inner, .. } => inner.to_dense(),
             PenaltyMatrix::KroneckerFactored { .. } => {
                 return Err(
                     "transformation covariate penalties must be single-block, not already Kronecker-factored"
@@ -10586,9 +10589,13 @@ fn build_tensor_penalties_kronecker(
                 )
             }
         };
-        penalties.push(PenaltyMatrix::KroneckerFactored {
+        let penalty = PenaltyMatrix::KroneckerFactored {
             left: shape_resp.clone(),
             right,
+        };
+        penalties.push(match fixed_log_lambda {
+            Some(value) => penalty.with_fixed_log_lambda(value),
+            None => penalty,
         });
     }
 
@@ -14791,6 +14798,7 @@ fn extract_covariate_penalty_factor(penalty: &PenaltyMatrix) -> Result<Array2<f6
         PenaltyMatrix::Dense(matrix) => Ok(matrix.clone()),
         PenaltyMatrix::Blockwise { .. } => Ok(penalty.to_dense()),
         PenaltyMatrix::Labeled { inner, .. } => extract_covariate_penalty_factor(inner),
+        PenaltyMatrix::Fixed { inner, .. } => extract_covariate_penalty_factor(inner),
         PenaltyMatrix::KroneckerFactored { .. } => Err(
             "transformation covariate psi penalties must be single-block, not already Kronecker-factored"
                 .to_string(),

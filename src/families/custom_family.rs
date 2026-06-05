@@ -72,6 +72,13 @@ pub enum PenaltyMatrix {
         label: String,
         inner: Box<PenaltyMatrix>,
     },
+    /// Wrapper fixing this penalty component at a physical log-precision.
+    /// Fixed components remain in the block-local physical penalty layout but
+    /// are removed from the REML outer coordinate vector.
+    Fixed {
+        log_lambda: f64,
+        inner: Box<PenaltyMatrix>,
+    },
 }
 
 impl PenaltyMatrix {
@@ -81,7 +88,7 @@ impl PenaltyMatrix {
             Self::Dense(m) => m.nrows(),
             Self::KroneckerFactored { left, right } => left.nrows() * right.nrows(),
             Self::Blockwise { total_dim, .. } => *total_dim,
-            Self::Labeled { inner, .. } => inner.dim(),
+            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => inner.dim(),
         }
     }
 
@@ -111,7 +118,7 @@ impl PenaltyMatrix {
                 .assign(local);
                 g
             }
-            Self::Labeled { inner, .. } => inner.to_dense(),
+            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => inner.to_dense(),
         }
     }
 
@@ -119,9 +126,10 @@ impl PenaltyMatrix {
     pub fn as_dense_cow(&self) -> std::borrow::Cow<'_, Array2<f64>> {
         match self {
             Self::Dense(m) => std::borrow::Cow::Borrowed(m),
-            Self::KroneckerFactored { .. } | Self::Blockwise { .. } | Self::Labeled { .. } => {
-                std::borrow::Cow::Owned(self.to_dense())
-            }
+            Self::KroneckerFactored { .. }
+            | Self::Blockwise { .. }
+            | Self::Labeled { .. }
+            | Self::Fixed { .. } => std::borrow::Cow::Owned(self.to_dense()),
         }
     }
 
@@ -138,6 +146,7 @@ impl PenaltyMatrix {
     pub fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         match self {
             Self::Dense(m) => Some(m),
+            Self::Fixed { inner, .. } => inner.as_dense_ref(),
             Self::KroneckerFactored { .. } | Self::Blockwise { .. } | Self::Labeled { .. } => None,
         }
     }
@@ -152,6 +161,22 @@ impl PenaltyMatrix {
     pub fn precision_label(&self) -> Option<&str> {
         match self {
             Self::Labeled { label, .. } => Some(label.as_str()),
+            Self::Fixed { .. } => None,
+            _ => None,
+        }
+    }
+
+    pub fn with_fixed_log_lambda(self, log_lambda: f64) -> Self {
+        Self::Fixed {
+            log_lambda,
+            inner: Box::new(self),
+        }
+    }
+
+    pub fn fixed_log_lambda(&self) -> Option<f64> {
+        match self {
+            Self::Fixed { log_lambda, .. } => Some(*log_lambda),
+            Self::Labeled { inner, .. } => inner.fixed_log_lambda(),
             _ => None,
         }
     }
@@ -186,7 +211,7 @@ impl PenaltyMatrix {
                     .assign(&result_block);
                 out
             }
-            Self::Labeled { inner, .. } => inner.dot(v),
+            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => inner.dot(v),
         }
     }
 
@@ -223,7 +248,9 @@ impl PenaltyMatrix {
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(lambda, local);
             }
-            Self::Labeled { inner, .. } => inner.add_scaled_to(lambda, target),
+            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => {
+                inner.add_scaled_to(lambda, target)
+            }
         }
     }
 
@@ -260,7 +287,9 @@ impl PenaltyMatrix {
                     target[col_range.start + local_idx] += lambda * local[[local_idx, local_idx]];
                 }
             }
-            Self::Labeled { inner, .. } => inner.add_scaled_diag_to(lambda, target),
+            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => {
+                inner.add_scaled_diag_to(lambda, target)
+            }
         }
     }
 
@@ -279,7 +308,7 @@ impl PenaltyMatrix {
                 let sv = local.dot(&beta_block);
                 beta_block.dot(&sv)
             }
-            Self::Labeled { inner, .. } => inner.quadratic_form(beta),
+            Self::Labeled { inner, .. } | Self::Fixed { inner, .. } => inner.quadratic_form(beta),
         }
     }
 
@@ -3771,6 +3800,11 @@ fn hash_cf_penalty(hasher: &mut Fingerprinter, penalty: &PenaltyMatrix) {
         PenaltyMatrix::Labeled { label, inner } => {
             hasher.write_str("labeled");
             hasher.write_str(label);
+            hash_cf_penalty(hasher, inner);
+        }
+        PenaltyMatrix::Fixed { log_lambda, inner } => {
+            hasher.write_str("fixed");
+            hasher.write_u64(log_lambda.to_bits());
             hash_cf_penalty(hasher, inner);
         }
     }
@@ -7634,7 +7668,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for OwnedDenseOuterHess
 
 struct LabeledOuterHessianOperator {
     base: Arc<dyn crate::solver::outer_strategy::OuterHessianOperator>,
-    physical_to_outer: Vec<usize>,
+    physical_to_outer: Vec<Option<usize>>,
     outer_dim: usize,
     /// Scratch buffers reused across `apply_into` calls to avoid
     /// per-call allocation of the permuted input and output vectors.
@@ -7674,8 +7708,8 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
             ));
         }
         let mut physical = Array1::<f64>::zeros(self.physical_to_outer.len());
-        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
-            physical[physical_idx] = v[outer_idx];
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            physical[physical_idx] = outer_idx.map(|idx| v[idx]).unwrap_or(0.0);
         }
         let physical_out = self.base.matvec(&physical)?;
         if physical_out.len() != self.physical_to_outer.len() {
@@ -7686,8 +7720,10 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
             ));
         }
         let mut out = Array1::<f64>::zeros(self.outer_dim);
-        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
-            out[outer_idx] += physical_out[physical_idx];
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                out[outer_idx] += physical_out[physical_idx];
+            }
         }
         Ok(out)
     }
@@ -7718,8 +7754,8 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
             .lock()
             .map_err(|_| "labeled outer Hessian scratch lock poisoned".to_string())?;
         let (physical_in, physical_out) = &mut *guard;
-        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
-            physical_in[physical_idx] = v[outer_idx];
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            physical_in[physical_idx] = outer_idx.map(|idx| v[idx]).unwrap_or(0.0);
         }
         self.base.apply_into(physical_in, physical_out)?;
         if physical_out.len() != self.physical_to_outer.len() {
@@ -7730,8 +7766,10 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
             ));
         }
         out.fill(0.0);
-        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
-            out[outer_idx] += physical_out[physical_idx];
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                out[outer_idx] += physical_out[physical_idx];
+            }
         }
         Ok(())
     }
@@ -7746,10 +7784,12 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
         }
         let mut physical_factor =
             Array2::<f64>::zeros((self.physical_to_outer.len(), factor.ncols()));
-        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
-            physical_factor
-                .row_mut(physical_idx)
-                .assign(&factor.row(outer_idx));
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                physical_factor
+                    .row_mut(physical_idx)
+                    .assign(&factor.row(outer_idx));
+            }
         }
         let physical_out = self.base.mul_mat(physical_factor.view())?;
         if physical_out.nrows() != self.physical_to_outer.len() {
@@ -7760,9 +7800,11 @@ impl crate::solver::outer_strategy::OuterHessianOperator for LabeledOuterHessian
             ));
         }
         let mut out = Array2::<f64>::zeros((self.outer_dim, factor.ncols()));
-        for (physical_idx, &outer_idx) in self.physical_to_outer.iter().enumerate() {
-            let physical_row = physical_out.row(physical_idx);
-            out.row_mut(outer_idx).scaled_add(1.0, &physical_row);
+        for (physical_idx, outer_idx) in self.physical_to_outer.iter().enumerate() {
+            if let Some(outer_idx) = *outer_idx {
+                let physical_row = physical_out.row(physical_idx);
+                out.row_mut(outer_idx).scaled_add(1.0, &physical_row);
+            }
         }
         Ok(out)
     }
@@ -8144,7 +8186,8 @@ fn flatten_log_lambdas(specs: &[ParameterBlockSpec]) -> Array1<f64> {
 #[derive(Clone, Debug)]
 struct PenaltyLabelLayout {
     penalty_counts: Vec<usize>,
-    physical_to_outer: Vec<usize>,
+    physical_to_outer: Vec<Option<usize>>,
+    fixed_log_lambdas: Vec<Option<f64>>,
     initial_rho: Array1<f64>,
 }
 
@@ -8163,11 +8206,25 @@ fn penalty_label_layout(
     penalty_counts: Vec<usize>,
 ) -> Result<PenaltyLabelLayout, String> {
     let mut label_to_outer = BTreeMap::<String, usize>::new();
-    let mut physical_to_outer = Vec::<usize>::new();
+    let mut physical_to_outer = Vec::<Option<usize>>::new();
+    let mut fixed_log_lambdas = Vec::<Option<f64>>::new();
     let mut initial = Vec::<f64>::new();
 
     for (block_idx, spec) in specs.iter().enumerate() {
         for penalty_idx in 0..spec.penalties.len() {
+            if let Some(fixed) = spec.penalties[penalty_idx].fixed_log_lambda() {
+                if !fixed.is_finite() {
+                    return Err(CustomFamilyError::ConstraintViolation {
+                        reason: format!(
+                            "block {block_idx} penalty {penalty_idx} fixed log-precision is non-finite: {fixed}"
+                        ),
+                    }
+                    .into());
+                }
+                physical_to_outer.push(None);
+                fixed_log_lambdas.push(Some(fixed));
+                continue;
+            }
             let label = spec.penalties[penalty_idx]
                 .precision_label()
                 .map(str::to_owned)
@@ -8187,13 +8244,15 @@ fn penalty_label_layout(
                 initial.push(rho0);
                 outer
             };
-            physical_to_outer.push(outer);
+            physical_to_outer.push(Some(outer));
+            fixed_log_lambdas.push(None);
         }
     }
 
     Ok(PenaltyLabelLayout {
         penalty_counts,
         physical_to_outer,
+        fixed_log_lambdas,
         initial_rho: Array1::from_vec(initial),
     })
 }
@@ -8213,8 +8272,18 @@ fn expand_labeled_log_lambdas(
         .into());
     }
     let mut expanded = Array1::<f64>::zeros(layout.physical_count());
-    for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
-        expanded[physical] = rho[outer];
+    for (physical, outer) in layout.physical_to_outer.iter().enumerate() {
+        expanded[physical] = match *outer {
+            Some(outer) => rho[outer],
+            None => layout.fixed_log_lambdas[physical].ok_or_else(|| {
+                CustomFamilyError::ConstraintViolation {
+                    reason: format!(
+                        "fixed penalty layout missing value at physical slot {physical}"
+                    ),
+                }
+                .to_string()
+            })?,
+        };
     }
     Ok(expanded)
 }
@@ -8242,8 +8311,10 @@ fn aggregate_labeled_gradient(
         .into());
     }
     let mut out = Array1::<f64>::zeros(layout.initial_rho.len());
-    for (physical, &outer) in layout.physical_to_outer.iter().enumerate() {
-        out[outer] += gradient[physical];
+    for (physical, outer) in layout.physical_to_outer.iter().enumerate() {
+        if let Some(outer) = *outer {
+            out[outer] += gradient[physical];
+        }
     }
     Ok(out)
 }
@@ -8265,9 +8336,12 @@ fn aggregate_labeled_hessian(
         .into());
     }
     let mut out = Array2::<f64>::zeros((layout.initial_rho.len(), layout.initial_rho.len()));
-    for (i, &oi) in layout.physical_to_outer.iter().enumerate() {
-        for (j, &oj) in layout.physical_to_outer.iter().enumerate() {
-            out[[oi, oj]] += hessian[[i, j]];
+    for (i, oi) in layout.physical_to_outer.iter().enumerate() {
+        let Some(oi) = *oi else { continue };
+        for (j, oj) in layout.physical_to_outer.iter().enumerate() {
+            if let Some(oj) = *oj {
+                out[[oi, oj]] += hessian[[i, j]];
+            }
         }
     }
     Ok(out)
@@ -23222,10 +23296,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len());
 
     if rho0.is_empty() {
+        let physical_rho0 = expand_labeled_log_lambdas(&rho0, &label_layout)?;
+        let per_block = split_labeled_log_lambdas(&rho0, &label_layout)?;
         let mut inner = inner_blockwise_fit(
             family,
             specs,
-            &vec![Array1::zeros(0); specs.len()],
+            &per_block,
             options,
             persistent_warm_start.as_ref(),
         )?;
@@ -23234,7 +23310,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             family,
             specs,
             &inner.block_states,
-            &vec![Array1::zeros(0); specs.len()],
+            &per_block,
             options,
         )?;
         let reml_term = if options.use_remlobjective {
@@ -23242,8 +23318,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         } else {
             0.0
         };
-        let no_pen = vec![Array1::zeros(0); specs.len()];
-        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &no_pen)
+        let geometry = compute_joint_geometry(family, specs, &inner.block_states, &per_block)
             .map_err(|reason| CustomFamilyError::Optimization {
                 context: "fit_custom_family no-smoothing joint geometry",
                 reason,
@@ -23265,16 +23340,17 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &warm_start,
         );
         let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
-        let precomputed_edf =
-            reduced_blockwise_edf(geometry.as_ref(), &canonical, &Array1::zeros(0));
+        let lambdas = physical_rho0.mapv(f64::exp);
+        let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+        let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), &canonical, &lambdas);
         let (covariance_conditional, geometry) =
             lift_fit_geometry_to_raw(&canonical, covariance_conditional, geometry);
         return blockwise_fit_from_parts(
             BlockwiseFitResultParts {
                 block_states: block_states_raw,
                 log_likelihood: inner.log_likelihood,
-                log_lambdas: Array1::zeros(0),
-                lambdas: Array1::zeros(0),
+                log_lambdas,
+                lambdas,
                 covariance_conditional,
                 stable_penalty_term: 2.0 * inner.penalty_value,
                 penalized_objective,
@@ -23302,7 +23378,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         log::info!(
             "[OUTER] custom family: skipping smoothing outer solve for explicit one-cycle inner probe"
         );
-        let per_block = split_log_lambdas(&rho0, &penalty_counts)?;
+        let per_block = split_labeled_log_lambdas(&rho0, &label_layout)?;
         let mut inner = inner_blockwise_fit(family, specs, &per_block, options, None)?;
         refresh_all_block_etas(family, specs, &mut inner.block_states).map_err(|reason| {
             CustomFamilyError::Optimization {
@@ -23328,7 +23404,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             context: "fit_custom_family one-cycle penalized objective",
             reason,
         })?;
-        let lambdas = rho0.mapv(f64::exp);
+        let physical_rho0 = expand_labeled_log_lambdas(&rho0, &label_layout)?;
+        let lambdas = physical_rho0.mapv(f64::exp);
         let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
         let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
         return blockwise_fit_from_parts(

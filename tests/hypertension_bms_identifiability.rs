@@ -567,6 +567,14 @@ fn production_like_hypertension_shared_matern_centers10_confound_starts_outer_so
                 "production-like PC-confounded Matérn BMS fit should produce finite coefficients, got {:?}",
                 out.fit.beta
             );
+            assert!(
+                out.fit
+                    .log_lambdas
+                    .iter()
+                    .any(|rho| (*rho + 4.605_170_185_988_091).abs() < 1.0e-8),
+                "production-like BMS fit must carry the pinned marginal nullspace ridge at ln(1e-2); got log_lambdas={:?}",
+                out.fit.log_lambdas
+            );
         }
         Ok(_) => panic!("production-like Matérn fit returned the wrong family variant"),
         Err(err) => {
