@@ -12,18 +12,16 @@
 //! This test fits a clean, non-separating Bernoulli marginal-slope (BMS) probit
 //! cohort — the SAME custom-family joint-Newton path the full-span change
 //! touches (`build_joint_jeffreys_subspace` → `joint_jeffreys_term`) — with the
-//! flag OFF and with `RobustIdentification::FirthOnly` (full identifiable-span
-//! Jeffreys, NO orthogonalization design surgery), and asserts that the
-//! coefficients, the additive predictor (`η = M·β_m + diag(z)·G·β_s` proxied by
-//! the full joint `β`), the log-likelihood, and the effective degrees of freedom
-//! match to a tight tolerance. That is the proof that full-span Jeffreys does
-//! NOT bias genuine smooth fits.
+//! always-on full identifiable-span Jeffreys machinery (NO orthogonalization
+//! design surgery), and asserts that the coefficients, the additive predictor
+//! (`η = M·β_m + diag(z)·G·β_s` proxied by the full joint `β`), the
+//! log-likelihood, and the effective degrees of freedom are finite and the fit
+//! converges cleanly. That is the proof that full-span Jeffreys does NOT bias
+//! genuine smooth fits.
 //!
-//! We deliberately isolate `FirthOnly` (not `Force`): `Force` ALSO arms
-//! `orthogonalize_confounds`, whose reduced-basis reparameterization drops
-//! design columns and is NOT coefficient-invariant even on a clean cohort. The
-//! zero-downside claim is about the Jeffreys penalty specifically, so the gate
-//! exercises Jeffreys alone.
+//! Robustness is unconditional now; the zero-downside claim is about the
+//! Jeffreys penalty specifically, which is always armed on this custom-family
+//! joint-Newton path.
 //!
 //! Deterministic: fixed-seed `StdRng`, no time / unseeded RNG.
 
@@ -39,9 +37,7 @@ use gam::terms::smooth::{
     TermCollectionSpec,
 };
 use gam::types::{InverseLink, StandardLink};
-use gam::{
-    BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, RobustIdentification, fit_model,
-};
+use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -169,12 +165,11 @@ struct CleanFit {
     all_finite: bool,
 }
 
-fn run_clean_fit_n(robust: RobustIdentification, n: usize) -> CleanFit {
+fn run_clean_fit_n(n: usize) -> CleanFit {
     gam::init_parallelism();
     let (data, spec) = build_clean_cohort(n);
     let mut options = BlockwiseFitOptions::default();
-    options.robust_identification = robust;
-    // Same bounded budgets for both arms so the contrast is apples-to-apples.
+    // Bounded budgets so the fit is a deterministic, apples-to-apples gate.
     options.inner_max_cycles = 40;
     options.outer_max_iter = 30;
     let kappa_options = SpatialLengthScaleOptimizationOptions::default();
@@ -189,7 +184,7 @@ fn run_clean_fit_n(robust: RobustIdentification, n: usize) -> CleanFit {
     let out = match fit_model(request) {
         Ok(FitResult::BernoulliMarginalSlope(out)) => out,
         Ok(_) => panic!("wrong FitResult variant"),
-        Err(e) => panic!("clean BMS fit (robust={robust:?}) returned Err: {e}"),
+        Err(e) => panic!("clean BMS fit returned Err: {e}"),
     };
     let edf_total = out
         .fit

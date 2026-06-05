@@ -132,7 +132,6 @@ fn fit_at_rho(
         max_iterations: 200,
         convergence_tolerance: 1e-12,
         firth_bias_reduction: false,
-        robust_identification: gam::RobustIdentification::Off,
         initial_lm_lambda: None,
         geodesic_acceleration: false,
         arrow_schur: None,
