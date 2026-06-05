@@ -23941,6 +23941,17 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         problem
     };
 
+    // Hoisted so the inner-non-convergence branch inside `eval_outer` can mark a
+    // trial rho *infeasible* (recoverable) rather than hard-erroring when robust
+    // escalation is armed — letting the outer optimizer retreat and the run reach
+    // the terminal HMC sampling rung instead of dead-ending before it (the gap
+    // `verify` located at this site). Mirrors the `robust_escalation_armed`
+    // computation at the post-run escalation rung below.
+    let escalation_armed = crate::solver::robust_identification::RobustConfig::from_policy(
+        options.robust_identification,
+    )
+    .firth_general;
+
     let eval_outer = |outer: &mut CustomOuterState,
                       rho: &Array1<f64>,
                       order: OuterEvalOrder|
@@ -23965,6 +23976,15 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             Ok(eval) if !eval.inner_converged => {
                 outer.warm_cache = Some(eval.warm_start.clone());
                 outer.last_error = Some("custom-family inner solve did not converge".to_string());
+                if escalation_armed {
+                    // Recoverable: this trial rho is infeasible (inner solve did not
+                    // converge), so the outer optimizer should retreat rather than the
+                    // whole run hard-erroring. When the search ultimately reports
+                    // `converged == false`, the post-run rung samples the proper
+                    // posterior (never-fail). Without this, the hard Err propagated out
+                    // of `problem.run` and bypassed the escalation rung entirely.
+                    return Ok(OuterEval::infeasible(rho.len()));
+                }
                 return Err(EstimationError::RemlOptimizationFailed(
                     "custom-family inner solve did not converge".to_string(),
                 ));
