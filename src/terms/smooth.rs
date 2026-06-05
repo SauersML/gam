@@ -11163,7 +11163,6 @@ fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign
         nullspace_dims: design.nullspace_dims.clone(),
         linear_constraints: design.linear_constraints.clone(),
         firth_bias_reduction: options.firth_bias_reduction,
-        robust_identification: options.robust_identification,
         adaptive_regularization: None,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
         // Propagate user-supplied rho_prior so the baseline/refit and the
@@ -13845,7 +13844,6 @@ fn external_opts_for_design(
         nullspace_dims: design.nullspace_dims.clone(),
         linear_constraints: design.linear_constraints.clone(),
         firth_bias_reduction: Some(options.firth_bias_reduction),
-        robust_identification: options.robust_identification,
         penalty_shrinkage_floor: options.penalty_shrinkage_floor,
         rho_prior: options.rho_prior.clone(),
         // Propagate Kronecker structure so the joint optimizer minimizes the
