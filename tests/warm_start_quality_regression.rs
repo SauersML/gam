@@ -120,6 +120,7 @@ fn fit_at_rho_full(
         // 200-iter cap is comfortable.
         convergence_tolerance: 1e-10,
         firth_bias_reduction: false,
+        robust_identification: gam::RobustIdentification::Off,
         initial_lm_lambda,
         geodesic_acceleration: false,
         arrow_schur: None,
@@ -317,6 +318,7 @@ fn pirls_result_exposes_final_accept_rho_in_unit_interval() {
         max_iterations: 200,
         convergence_tolerance: 1e-10,
         firth_bias_reduction: false,
+        robust_identification: gam::RobustIdentification::Off,
         initial_lm_lambda: None,
         geodesic_acceleration: false,
         arrow_schur: None,

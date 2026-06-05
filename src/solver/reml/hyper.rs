@@ -2907,7 +2907,13 @@ mod tests {
         let eta = x.dot(&beta);
 
         let firth_op = Arc::new(
-            super::super::FirthDenseOperator::build(&x, &eta).expect("Firth dense operator"),
+            super::super::RemlState::build_firth_dense_operator_for_link(
+                crate::types::StandardLink::Logit,
+                &x,
+                &eta,
+                ndarray::Array1::ones(x.nrows()).view(),
+            )
+            .expect("Firth dense operator"),
         );
         // Spatial-coordinate τ-direction design (same shape as X by contract).
         let x_tau = array![
@@ -2987,7 +2993,13 @@ mod tests {
         let beta = array![0.10, -0.30, 0.20];
         let eta = x.dot(&beta);
         let firth_op = Arc::new(
-            super::super::FirthDenseOperator::build(&x, &eta).expect("Firth dense operator"),
+            super::super::RemlState::build_firth_dense_operator_for_link(
+                crate::types::StandardLink::Logit,
+                &x,
+                &eta,
+                ndarray::Array1::ones(x.nrows()).view(),
+            )
+            .expect("Firth dense operator"),
         );
 
         let x_tau = array![
