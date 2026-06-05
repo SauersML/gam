@@ -300,6 +300,188 @@ where
     Ok((phi, grad, hphi))
 }
 
+/// Exact directional derivative `D_β H_Φ[δ]` of the Tier-B Gauss-Newton Jeffreys
+/// curvature surrogate along a coefficient-space direction `δ` (`delta`).
+///
+/// CONTEXT (the outer-REML drift this exists to supply). The Tier-B outer LAML
+/// score folds the joint Jeffreys curvature `H_Φ` into the joint Hessian logdet:
+/// `½ log|H + S_λ + H_Φ|`. Its exact ρ-gradient is
+///   `½ tr[(H+S_λ+H_Φ)⁻¹ (∂_ρ S_λ + D_β H[v_k] + D_β H_Φ[v_k])]`,
+/// where `v_k = dβ̂/dρ_k` is the mode response and `D_β·[v_k]` is the total
+/// (through β̂) derivative of the curvature along the mode response. The
+/// likelihood-Hessian drift `D_β H[v_k]` is already supplied by the family's
+/// joint directional-derivative provider; `H_Φ` ALSO moves with β̂ (it is built
+/// from `H_id = Z_Jᵀ H Z_J` and `D_a = Z_Jᵀ ∂_a H Z_J`, both β-dependent), so its
+/// drift `D_β H_Φ[δ]` is a real, non-zero term whenever the Jeffreys term is
+/// active (near-separation). This function returns exactly that `p×p` term so the
+/// outer gradient matches the objective the inner Newton converged on.
+///
+/// DERIVATION. With `K = H_id⁻¹` (the floored symmetric pseudo-inverse used as
+/// the analytic inverse on the floored spectrum), `M_a = K D_a`,
+/// `H_Φ[a,b] = ½⟨vec(M_a), vec(M_b)⟩`, and `δ` the direction:
+///   * `δ_δ H_id = Ḋ := Z_Jᵀ Hdot[δ] Z_J`,   so `δ_δ K = −K Ḋ K`.
+///   * `δ_δ D_a = Z_Jᵀ H²dot[δ, e_a] Z_J =: D_a^δ` (the second directional
+///     derivative of the joint Hessian along `(δ, e_a)`).
+///   * `δ_δ M_a = (δ_δ K) D_a + K (δ_δ D_a) = −K Ḋ M_a + K D_a^δ`.
+///   * `δ_δ H_Φ[a,b] = ½[⟨vec(δ_δ M_a), vec(M_b)⟩ + ⟨vec(M_a), vec(δ_δ M_b)⟩]`.
+///
+/// `hessian_dir` returns `Hdot[d] = ∂_d H` and `hessian_second_dir` returns
+/// `H²dot[u, v] = ∂_u ∂_v H`. When EITHER is unavailable (the family does not
+/// expose the needed exact derivatives) or the conditioning gate skips the term
+/// (so `H_Φ ≡ 0` in a neighborhood, hence `D_β H_Φ ≡ 0`), this returns the zero
+/// matrix — the safe value that leaves the existing `D_β H[v_k]`-only gradient
+/// unchanged rather than wrong.
+pub fn joint_jeffreys_hphi_directional_derivative<DirFn, Dir2Fn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    delta: &Array1<f64>,
+    mut hessian_dir: DirFn,
+    mut hessian_second_dir: Dir2Fn,
+) -> Result<Array2<f64>, String>
+where
+    DirFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    Dir2Fn: FnMut(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+{
+    let p = h_joint.nrows();
+    if h_joint.ncols() != p {
+        return Err(format!(
+            "joint_jeffreys_hphi_directional_derivative: H must be square, got {}x{}",
+            h_joint.nrows(),
+            h_joint.ncols()
+        ));
+    }
+    if z_j.nrows() != p {
+        return Err(format!(
+            "joint_jeffreys_hphi_directional_derivative: Z_J has {} rows, expected {p}",
+            z_j.nrows()
+        ));
+    }
+    if delta.len() != p {
+        return Err(format!(
+            "joint_jeffreys_hphi_directional_derivative: delta has {} entries, expected {p}",
+            delta.len()
+        ));
+    }
+    let m = z_j.ncols();
+    if m == 0 || p == 0 {
+        return Ok(Array2::zeros((p, p)));
+    }
+
+    // Reproduce EXACTLY the value-path reduced information, conditioning gate, and
+    // floored pseudo-inverse so the derivative is consistent with the `H_Φ` the
+    // objective uses. Any divergence here would reintroduce the value/gradient
+    // mismatch this whole term exists to remove.
+    let hz0 = h_joint.dot(&z_j);
+    let h_id = z_j.t().dot(&hz0);
+    let mut h_id_sym = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..m {
+            h_id_sym[[i, j]] = 0.5 * (h_id[[i, j]] + h_id[[j, i]]);
+        }
+    }
+    let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
+        format!("joint_jeffreys_hphi_directional_derivative: eigendecomposition failed: {e}")
+    })?;
+    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+    if lambda_max > 0.0 {
+        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        if lambda_min.is_finite() && lambda_min / lambda_max >= CONDITIONING_GATE_RELATIVE {
+            // Gated out ⇒ H_Φ ≡ 0 in a neighborhood ⇒ its drift vanishes.
+            return Ok(Array2::zeros((p, p)));
+        }
+    }
+    let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
+    let mut inv_diag = Array1::<f64>::zeros(m);
+    for (i, &lam) in evals.iter().enumerate() {
+        inv_diag[i] = 1.0 / lam.max(floor);
+    }
+    let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
+    let h_id_inv = scaled.dot(&evecs.t());
+
+    // Ḋ = Z_Jᵀ Hdot[δ] Z_J, the directional derivative of the reduced information
+    // along the mode-response direction δ. δ_δ K = −K Ḋ K.
+    let hdot_delta = match hessian_dir(delta)? {
+        Some(hd) => hd,
+        // No exact first directional derivative ⇒ drift undefined ⇒ safe zero.
+        None => return Ok(Array2::zeros((p, p))),
+    };
+    if hdot_delta.nrows() != p || hdot_delta.ncols() != p {
+        return Err(format!(
+            "joint_jeffreys_hphi_directional_derivative: Hdot[δ] shape {}x{} != {p}x{p}",
+            hdot_delta.nrows(),
+            hdot_delta.ncols()
+        ));
+    }
+    let dbar = z_j.t().dot(&hdot_delta.dot(&z_j)); // m x m
+    let k_dbar = h_id_inv.dot(&dbar); // K Ḋ
+
+    // For each canonical axis e_a: M_a = K D_a and its drift δM_a.
+    // We assemble flattened vec(M_a) and vec(δM_a) so the final contraction is a
+    // pair of m·m inner products per (a,b).
+    let mut m_rows = Array2::<f64>::zeros((p, m * m)); // vec(M_a)
+    let mut dm_rows = Array2::<f64>::zeros((p, m * m)); // vec(δM_a)
+    let mut axis = Array1::<f64>::zeros(p);
+    for a in 0..p {
+        axis.fill(0.0);
+        axis[a] = 1.0;
+        let hdot_a = match hessian_dir(&axis)? {
+            Some(hd) => hd,
+            None => return Ok(Array2::zeros((p, p))),
+        };
+        if hdot_a.nrows() != p || hdot_a.ncols() != p {
+            return Err(format!(
+                "joint_jeffreys_hphi_directional_derivative: Hdot[e_a] shape {}x{} != {p}x{p}",
+                hdot_a.nrows(),
+                hdot_a.ncols()
+            ));
+        }
+        let d_a = z_j.t().dot(&hdot_a.dot(&z_j)); // Z_Jᵀ ∂_a H Z_J
+        let m_a = h_id_inv.dot(&d_a); // K D_a
+
+        // D_a^δ = Z_Jᵀ H²dot[δ, e_a] Z_J  (second directional derivative).
+        let h2dot = match hessian_second_dir(delta, &axis)? {
+            Some(h2) => h2,
+            // No exact second directional derivative ⇒ drift undefined ⇒ safe zero.
+            None => return Ok(Array2::zeros((p, p))),
+        };
+        if h2dot.nrows() != p || h2dot.ncols() != p {
+            return Err(format!(
+                "joint_jeffreys_hphi_directional_derivative: H²dot[δ,e_a] shape {}x{} != {p}x{p}",
+                h2dot.nrows(),
+                h2dot.ncols()
+            ));
+        }
+        let d_a_delta = z_j.t().dot(&h2dot.dot(&z_j)); // Z_Jᵀ ∂_δ∂_a H Z_J
+
+        // δM_a = −K Ḋ M_a + K D_a^δ.
+        let dm_a = &h_id_inv.dot(&d_a_delta) - &k_dbar.dot(&m_a);
+
+        let mut col = 0usize;
+        for i in 0..m {
+            for j in 0..m {
+                m_rows[[a, col]] = m_a[[i, j]];
+                dm_rows[[a, col]] = dm_a[[i, j]];
+                col += 1;
+            }
+        }
+    }
+
+    // D_β H_Φ[δ][a,b] = ½ (⟨vec δM_a, vec M_b⟩ + ⟨vec M_a, vec δM_b⟩). Symmetric.
+    let mut out = Array2::<f64>::zeros((p, p));
+    for a in 0..p {
+        for b in a..p {
+            let mut acc = 0.0;
+            for col in 0..(m * m) {
+                acc += dm_rows[[a, col]] * m_rows[[b, col]] + m_rows[[a, col]] * dm_rows[[b, col]];
+            }
+            let value = 0.5 * acc;
+            out[[a, b]] = value;
+            out[[b, a]] = value;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

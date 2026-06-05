@@ -313,18 +313,26 @@ impl CanonicalSpecs {
 pub fn canonicalize_for_identifiability(
     specs: &[ParameterBlockSpec],
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
-    // Default entry: robustness off ⇒ byte-identical to the released audit
-    // gate. The flag-gated orthogonalisation pass is reached only via
-    // `canonicalize_for_identifiability_with_robust`.
-    canonicalize_for_identifiability_with_robust(specs, RobustConfig::default())
+    // Robustness is unconditional: always attempt the exact W-metric
+    // orthogonalisation pass before the fail-closed audit. `try_orthogonalize_
+    // blocks` is self-gating (it returns `None` — and the audit runs unchanged —
+    // unless there are ≥2 plain single-channel dense blocks with an actual
+    // structural overlap to remove, deferring on any family-owned-geometry block
+    // and on clean designs), so this is byte-identical wherever there is nothing
+    // to orthogonalise.
+    canonicalize_for_identifiability_inner(specs, true)
 }
 
-/// Robustness-aware variant of [`canonicalize_for_identifiability`].
+/// Core canonicalisation worker.
 ///
-/// When `robust.orthogonalize_confounds` is set, a general exact W-metric
-/// orthogonalisation pass runs *before* the fail-closed audit: overlapping
-/// design blocks (e.g. a logslope surface confounded with the marginal
-/// surface) are reparameterised so the lower-priority block's overlap with the
+/// `orthogonalize` is an INTERNAL recursion-control flag (NOT a user knob): the
+/// public entry passes `true` to attempt the exact orthogonalisation pass; the
+/// post-orthogonalisation recursion below passes `false` so the already-reduced
+/// specs are audited without re-orthogonalising.
+///
+/// When orthogonalisation runs, a general exact W-metric pass reparameterises
+/// overlapping design blocks (e.g. a logslope surface confounded with the
+/// marginal surface) so the lower-priority block's overlap with the
 /// higher-priority anchor is removed exactly, rather than being penalised by a
 /// hand-tuned ridge. The reparam `V_b` is folded into each block's design via
 /// [`CoefficientTransformOperator`], penalties are pulled back as `V_bᵀ S V_b`,
@@ -333,22 +341,17 @@ pub fn canonicalize_for_identifiability(
 /// [`CanonicalSpecs::lift_joint_matrix_to_raw`] machinery maps the reduced
 /// fit back to raw coordinates unchanged (the lift is `β_raw = V_b · θ`,
 /// already supported for dense transforms).
-///
-/// When `robust.orthogonalize_confounds` is **off** the function is identical
-/// to the released selection-only audit gate (no orthogonalisation, identity-
-/// on-clean / fail-closed-on-fatal).
-pub fn canonicalize_for_identifiability_with_robust(
+fn canonicalize_for_identifiability_inner(
     specs: &[ParameterBlockSpec],
-    robust: RobustConfig,
+    orthogonalize: bool,
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
-    // Flag-gated exact orthogonalisation of structural confounds. Runs only
-    // when requested AND the design is single-channel dense (the general
-    // multi-channel coupled path is handled by the Tier-B joint-Newton
-    // Jeffreys term, not by a per-block design reparam). On any structural
-    // condition that the orthogonaliser cannot express as a per-block
-    // transform, it falls through to the unmodified audit gate below — never
-    // worse than today.
-    if robust.orthogonalize_confounds {
+    // Exact orthogonalisation of structural confounds. Runs only on the top-
+    // level entry AND only where the design is single-channel dense (the general
+    // multi-channel coupled path is handled by the Tier-B joint-Newton Jeffreys
+    // term, not by a per-block design reparam). On any structural condition that
+    // the orthogonaliser cannot express as a per-block transform, it falls
+    // through to the unmodified audit gate below — never worse than today.
+    if orthogonalize {
         if let Some(canon) = try_orthogonalize_blocks(specs)? {
             return Ok(canon);
         }
@@ -1064,8 +1067,7 @@ fn try_orthogonalize_blocks(
     // this should produce a clean (identity-T) verdict; if a *residual* rank
     // deficiency survives orthogonalisation, the fail-closed gate still
     // refuses with an actionable diagnostic.
-    let inner =
-        canonicalize_for_identifiability_with_robust(&ortho_specs, RobustConfig::default())?;
+    let inner = canonicalize_for_identifiability_inner(&ortho_specs, false)?;
 
     // Compose the round-trip transform: β_raw = V_b · (T_inner · θ).
     // `inner.per_block_transform[b]` is T_inner (selection/identity from the
