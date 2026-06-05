@@ -203,8 +203,10 @@ impl OrthogonalReparam {
         let cross = fast_xt_diag_y(&primary, w_metric, &confound.to_owned());
 
         let gram_view = FaerArrayView::new(&gram);
-        let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
-            .map_err(|e| format!("orthogonal_reparam: weighted primary Gram factorization failed: {e:?}"))?;
+        let factor =
+            factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower).map_err(|e| {
+                format!("orthogonal_reparam: weighted primary Gram factorization failed: {e:?}")
+            })?;
         // B = (MᵀWM + εI)⁻¹ MᵀW C   (p_m × p_c)
         let shear = factor
             .solvemulti(&cross)
@@ -402,7 +404,9 @@ mod tests {
             "predictor changed under round-trip: max |Δη| = {max_diff:e}"
         );
         // Confound coefficients are untouched by the reparameterization.
-        let cdiff = (&beta_c_out - &beta_c).iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        let cdiff = (&beta_c_out - &beta_c)
+            .iter()
+            .fold(0.0_f64, |a, v| a.max(v.abs()));
         assert!(cdiff == 0.0, "confound coeffs changed: {cdiff:e}");
 
         // Forward map is the exact inverse of recover_original.
@@ -424,8 +428,8 @@ mod tests {
         let c = Array2::<f64>::ones((n, 2));
         let w = Array1::<f64>::from_elem(n, 1.0);
         let off = RobustConfig::from_policy(RobustIdentification::Off);
-        let out = OrthogonalReparam::build(off, m.view(), c.view(), &w)
-            .expect("build should succeed");
+        let out =
+            OrthogonalReparam::build(off, m.view(), c.view(), &w).expect("build should succeed");
         assert!(out.is_none(), "flag off must yield None (no reparam)");
     }
 
@@ -455,8 +459,7 @@ mod tests {
         let quad = Array1::from_vec(raw_quad);
         let cross = m.t().dot(&quad);
         let gview = FaerArrayView::new(&gram);
-        let factor =
-            factorize_symmetricwith_fallback(gview.as_ref(), Side::Lower).expect("factor");
+        let factor = factorize_symmetricwith_fallback(gview.as_ref(), Side::Lower).expect("factor");
         let b = FactorizedSystem::solve(&factor, &cross).expect("solve");
         let resid = &quad - &m.dot(&b);
         let mut c = Array2::<f64>::zeros((n, 1));
