@@ -834,7 +834,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Cross-atom decoder column-space incoherence weight (#671). It is on by
         default (``1.0``) and applies when ``K >= 2``. The penalty uses the
         empirical co-activation ``mean_n gate_j * gate_k`` and penalizes
-        ``||B_j.T @ B_k||_F^2`` for co-firing atom pairs.
+        ``||B_j @ B_k.T||_F^2`` for stored ``(M_k, p_out)`` decoder blocks on
+        co-firing atom pairs.
     top_k
         Optional final assignment support projection. ``None`` and ``0``
         disable it; integers in ``[1, K]`` keep only the top-k assignment masses
@@ -1194,7 +1195,7 @@ def _build_analytic_penalties_payload(
     scad_mcp_gamma: float = 3.7,
     nuclear_norm_weight: float = 0.0,
     nuclear_norm_max_rank: int | None = None,
-    decoder_incoherence_weight: float = 0.0,
+    decoder_incoherence_weight: float = 1.0,
     k_atoms: int = 1,
 ) -> str | None:
     """Translate the SAE regularizer knobs into the analytic-penalty JSON

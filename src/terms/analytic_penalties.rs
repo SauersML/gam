@@ -54,8 +54,9 @@
 //!     extension-coordinate latent blocks. Tapers the shrinkage derivative to
 //!     zero beyond the SCAD/MCP cutoff so large coefficients are not L¹-biased.
 //!   * [`DecoderIncoherencePenalty`] — β-tier SAE decoder penalty
-//!     `½·w·Σ_{j<k} W[j,k]·‖B_j^T B_k‖²_F`, with `W[j,k]` coming from
-//!     co-activation. Pushes co-firing atom decoder column spaces apart.
+//!     `½·w·Σ_{j<k} W[j,k]·‖B_j B_k^T‖²_F` for stored decoder blocks
+//!     `B_k ∈ R^{M_k×p_out}`, with `W[j,k]` coming from co-activation.
+//!     Pushes co-firing atom decoder column spaces apart.
 //!
 //! All shipped primitives are **analytic**: no autograd, no finite differencing. Each
 //! exposes:
@@ -4107,14 +4108,21 @@ impl NuclearNormPenalty {
                 ));
             }
         }
+        let eps2 = self.smoothing_eps * self.smoothing_eps;
+        let eig_floor = eps2.max(1.0e-15);
+        let mut regularized_evals = Array1::<f64>::zeros(d);
         let mut f = Array1::<f64>::zeros(d);
         let mut df = Array1::<f64>::zeros(d);
-        let eps2 = self.smoothing_eps * self.smoothing_eps;
         for i in 0..d {
+            regularized_evals[i] = (raw_evals[i] + eps2).max(eig_floor);
             if i >= active_start {
-                let smoothed = raw_evals[i] + eps2;
-                f[i] = smoothed.powf(-0.5);
-                df[i] = -0.5 * smoothed.powf(-1.5);
+                // Keep the value filter and Fréchet derivative on the same
+                // regularized spectrum. This preserves the PSD-roundoff floor
+                // without letting divided differences observe stale raw
+                // eigenvalues near zero.
+                let lambda = regularized_evals[i];
+                f[i] = lambda.powf(-0.5);
+                df[i] = -0.5 * lambda.powf(-1.5);
             }
         }
 
@@ -4145,8 +4153,8 @@ impl NuclearNormPenalty {
         let mut derivative_basis = Array2::<f64>::zeros((d, d));
         for i in 0..d {
             for j in 0..d {
-                let denom = raw_evals[i] - raw_evals[j];
-                let scale = (raw_evals[i].abs() + raw_evals[j].abs()).max(1.0);
+                let denom = regularized_evals[i] - regularized_evals[j];
+                let scale = (regularized_evals[i].abs() + regularized_evals[j].abs()).max(1.0);
                 let divided_difference = if denom.abs() <= 1.0e-12 * scale {
                     let i_active = i >= active_start;
                     let j_active = j >= active_start;
@@ -6880,7 +6888,7 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
 /// The penalty is the co-activation-masked cross-column-space overlap
 ///
 /// ```text
-///   P = ½ · w · Σ_{j<k} W[j,k] · ‖B_j^T B_k‖²_F,
+///   P = ½ · w · Σ_{j<k} W[j,k] · ‖B_j B_k^T‖²_F,
 ///   W[j,k] = ½ · (coactivation[j,k] + coactivation[k,j]).
 /// ```
 ///
@@ -6898,8 +6906,10 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
 ///
 /// Gotchas:
 ///
-/// * `block_sizes` are decoder basis-column counts `M_k`, not output widths;
-///   every atom shares the same `p_out`.
+/// * `block_sizes` are decoder basis-row counts `M_k`, not output widths;
+///   every atom shares the same `p_out`. Stored decoder blocks are
+///   `(M_k, p_out)`, so `B_j B_k^T` is the cross-Gram of decoder directions in
+///   output space and remains well-defined for heterogeneous `M_k`.
 /// * The descriptor path builds a placeholder penalty; live SAE wiring replaces
 ///   the co-activation matrix with the current mean gate products.
 /// * Offsets are interpreted against the vector passed to this penalty. In the
@@ -6957,13 +6967,22 @@ impl DecoderIncoherencePenalty {
                 coactivation.dim()
             ));
         }
-        if !coactivation.iter().all(|value| value.is_finite()) {
+        if !coactivation
+            .iter()
+            .all(|value| value.is_finite() && *value >= 0.0)
+        {
             return Err(
-                "DecoderIncoherencePenalty::new requires finite coactivation entries".to_string(),
+                "DecoderIncoherencePenalty::new requires finite non-negative coactivation entries"
+                    .to_string(),
             );
         }
         let mut total = 0usize;
-        for &m in &block_sizes {
+        for (atom_idx, &m) in block_sizes.iter().enumerate() {
+            if m == 0 {
+                return Err(format!(
+                    "DecoderIncoherencePenalty::new block_sizes[{atom_idx}] must be > 0"
+                ));
+            }
             let span = m.checked_mul(p_out).ok_or_else(|| {
                 "DecoderIncoherencePenalty::new block span overflows usize".to_string()
             })?;
@@ -7017,7 +7036,7 @@ impl DecoderIncoherencePenalty {
         0.5 * (self.coactivation[[j, k]] + self.coactivation[[k, j]])
     }
 
-    /// Cross-Gram `C[a, b] = Σ_o B_j[o, a]·B_k[o, b]`, shape `(M_j, M_k)`.
+    /// Cross-Gram `C[a, b] = Σ_o B_j[a, o]·B_k[b, o]`, shape `(M_j, M_k)`.
     fn cross_gram(
         target: ArrayView1<'_, f64>,
         off_j: usize,
@@ -9719,6 +9738,40 @@ mod tests {
     }
 
     #[test]
+    fn nuclear_norm_right_gram_divided_difference_uses_eigen_floor() {
+        let n_eff = 2usize;
+        let p = 2usize;
+        let target = PsiSlice {
+            range: 0..n_eff * p,
+            latent_dim: Some(p),
+        };
+        let smoothing_eps = 1.0e-10_f64;
+        let pen = NuclearNormPenalty::new(target, 0.9, n_eff, smoothing_eps, None, false).unwrap();
+        let a = 1.0e-10_f64;
+        let b = 2.0e-7_f64;
+        let t = array![[a, 0.0_f64], [0.0, b]];
+        let v = array![[0.0_f64, 1.0], [0.0, 0.0]];
+
+        let (_right_filter, right_filter_derivative) = pen
+            .right_spectral_inverse_sqrt_derivative(t.view(), v.view())
+            .expect("right-Gram derivative");
+
+        let eps2 = smoothing_eps * smoothing_eps;
+        let eig_floor = eps2.max(1.0e-15);
+        let lambda0 = (a * a + eps2).max(eig_floor);
+        let lambda1 = (b * b + eps2).max(eig_floor);
+        let f0 = lambda0.powf(-0.5);
+        let f1 = lambda1.powf(-0.5);
+        let expected = ((f0 - f1) / (lambda0 - lambda1)) * a;
+
+        assert_abs_diff_eq!(
+            right_filter_derivative[[0, 1]],
+            expected,
+            epsilon = expected.abs() * 1.0e-12
+        );
+    }
+
+    #[test]
     fn nuclear_norm_hvp_truncated_rank_matches_gradient_directional_derivative() {
         let n_eff = 4usize;
         let p = 3usize;
@@ -9787,6 +9840,47 @@ mod tests {
     }
 
     #[test]
+    fn decoder_incoherence_heterogeneous_blocks_use_output_space_cross_gram() {
+        let p = 3usize;
+        let block_sizes = vec![2usize, 1usize];
+        let total: usize = block_sizes.iter().map(|m| m * p).sum();
+        let target = PsiSlice {
+            range: 0..total,
+            latent_dim: Some(total / p),
+        };
+        let mut coact = Array2::<f64>::zeros((2, 2));
+        coact[[0, 1]] = 0.2;
+        coact[[1, 0]] = 0.6;
+        let pen =
+            DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 2.0, false).unwrap();
+        // Stored decoder blocks are B0 = [[1,0,0], [0,2,0]] and
+        // B1 = [[3,0,4]]. The output-space cross-Gram is B0·B1^T = [[3], [0]],
+        // so ||B0·B1^T||_F^2 = 9. The symmetrized coactivation is 0.4.
+        let beta = array![1.0_f64, 0.0, 0.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0];
+        let rho = Array1::<f64>::zeros(0);
+        let value = pen.value(beta.view(), rho.view());
+        assert_abs_diff_eq!(value, 3.6, epsilon = 1.0e-12);
+    }
+
+    #[test]
+    fn decoder_incoherence_rejects_negative_coactivation() {
+        let p = 2usize;
+        let block_sizes = vec![1usize, 1usize];
+        let target = PsiSlice {
+            range: 0..4,
+            latent_dim: Some(2),
+        };
+        let mut coact = Array2::<f64>::zeros((2, 2));
+        coact[[0, 1]] = -0.1;
+        let err = DecoderIncoherencePenalty::new(target, block_sizes, p, coact, 1.0, false)
+            .expect_err("negative coactivation must be rejected");
+        assert_eq!(
+            err,
+            "DecoderIncoherencePenalty::new requires finite non-negative coactivation entries"
+        );
+    }
+
+    #[test]
     fn decoder_incoherence_separability_semantics() {
         // Two atoms, each a single decoder column in ℝ^{p_out=2}: atom 0 = first
         // column, atom 1 = second. β layout is [B_0[:,0]=t0,t1 ; B_1[:,0]=t2,t3].
@@ -9805,7 +9899,7 @@ mod tests {
         };
         let rho = Array1::<f64>::zeros(0);
 
-        // Orthogonal column-spaces ⇒ B_0^T B_1 = 0 ⇒ P ≈ 0.
+        // Orthogonal output-space decoder directions ⇒ B_0·B_1^T = 0 ⇒ P ≈ 0.
         let pen_ortho = DecoderIncoherencePenalty::new(
             target.clone(),
             block_sizes.clone(),
@@ -9822,7 +9916,7 @@ mod tests {
             "orthogonal decoder blocks must give P≈0, got {p_ortho:.3e}"
         );
 
-        // Coincident column-spaces ⇒ B_0^T B_1 large ⇒ P large.
+        // Coincident output-space decoder directions ⇒ B_0·B_1^T large ⇒ P large.
         let pen_coinc = DecoderIncoherencePenalty::new(
             target.clone(),
             block_sizes.clone(),
@@ -9834,7 +9928,7 @@ mod tests {
         .unwrap();
         let t_coinc = array![1.0_f64, 0.0, 1.0, 0.0];
         let p_coinc = pen_coinc.value(t_coinc.view(), rho.view());
-        // ½·w·W·‖B_0^T B_1‖_F² = ½·1·1·(1)² = 0.5.
+        // ½·w·W·‖B_0·B_1^T‖_F² = ½·1·1·(1)² = 0.5.
         assert!(
             (p_coinc - 0.5).abs() <= 1.0e-12,
             "coincident decoder blocks must give large P (=0.5 here), got {p_coinc:.3e}"

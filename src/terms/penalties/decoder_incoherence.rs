@@ -2,8 +2,9 @@
 //!
 //! The implementation lives in [`DecoderIncoherencePenalty`]. It is a β-tier,
 //! co-activation-masked cross-atom penalty,
-//! `½·w·Σ_{j<k} W[j,k]·||B_j^T B_k||_F^2`, used as the SAE separability lever
-//! for decoder atoms that co-fire on the same observations.
+//! `½·w·Σ_{j<k} W[j,k]·||B_j B_k^T||_F^2` for stored `(M_k, p_out)` decoder
+//! blocks, used as the SAE separability lever for decoder atoms that co-fire
+//! on the same observations.
 
 use crate::terms::analytic_penalties::DecoderIncoherencePenalty;
 
