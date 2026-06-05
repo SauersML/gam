@@ -787,6 +787,8 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                         "weight",
                         "learnable",
                         "weight_schedule",
+                        "coactivation",
+                        "coactivation_shape",
                     ],
                 )?;
                 // Parse the per-atom decoder basis-function counts M_k. These are
@@ -822,13 +824,24 @@ pub fn build_analytic_penalty_registry_from_descriptors(
                     range: 0..total,
                     latent_dim: Some(block_sizes.len()),
                 };
-                // Uniform off-diagonal placeholder co-activation (1.0 off-diag,
-                // 0.0 diag); overwritten with the live mean gate product at fit.
                 let k = block_sizes.len();
-                let mut coactivation = Array2::<f64>::from_elem((k, k), 1.0);
-                for d in 0..k {
-                    coactivation[[d, d]] = 0.0;
-                }
+                let coactivation = if descriptor.contains_key("coactivation") {
+                    descriptor_array2_flat(
+                        descriptor,
+                        "coactivation",
+                        "coactivation_shape",
+                        &context,
+                    )?
+                } else {
+                    // Uniform off-diagonal placeholder co-activation (1.0
+                    // off-diag, 0.0 diag); overwritten with the live mean gate
+                    // product at SAE fit time.
+                    let mut placeholder = Array2::<f64>::from_elem((k, k), 1.0);
+                    for d in 0..k {
+                        placeholder[[d, d]] = 0.0;
+                    }
+                    placeholder
+                };
                 let penalty = DecoderIncoherencePenalty::new(
                     decoder_slice,
                     block_sizes,
@@ -1422,6 +1435,14 @@ mod tests {
                 "target": "z",
                 "groups": [[0, 1], [2]]
             },
+            {
+                "kind": "decoder_incoherence",
+                "target": "z",
+                "block_sizes": [2, 1],
+                "p_out": 3,
+                "coactivation": [0.0, 0.25, 0.75, 0.0],
+                "coactivation_shape": [2, 2]
+            },
             { "kind": "monotonicity", "target": "z", "direction": -1.0 },
             { "kind": "total_variation", "target": "z" },
             {
@@ -1442,6 +1463,7 @@ mod tests {
                 "scad_mcp",
                 "orthogonality",
                 "block_orthogonality",
+                "decoder_incoherence",
                 "monotonicity",
                 "total_variation",
                 "nested_prefix",
@@ -1542,6 +1564,24 @@ mod tests {
         assert_eq!(
             reject(&penalties),
             "penalties[0].shell_weights length 1 must equal prefix_sizes length 2"
+        );
+    }
+
+    #[test]
+    fn decoder_incoherence_rejects_negative_coactivation_descriptor() {
+        let penalties = json!([
+            {
+                "kind": "decoder_incoherence",
+                "target": "z",
+                "block_sizes": [1, 1],
+                "p_out": 3,
+                "coactivation": [0.0, -0.1, 0.0, 0.0],
+                "coactivation_shape": [2, 2]
+            }
+        ]);
+        assert_eq!(
+            reject(&penalties),
+            "penalties[0]: DecoderIncoherencePenalty::new requires finite non-negative coactivation entries"
         );
     }
 
