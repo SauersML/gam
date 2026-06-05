@@ -21960,6 +21960,79 @@ mod tests {
     }
 
     #[test]
+    fn tensor_binary_margin_is_penalized_factor_smooth_not_unidentified_raw_tensor() {
+        let n = 18usize;
+        let mut data = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            data[[i, 0]] = i as f64 / (n as f64 - 1.0);
+            data[[i, 1]] = if i % 2 == 0 { 0.0 } else { 1.0 };
+        }
+
+        let age_margin = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 1,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        };
+        let binary_margin = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 1,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        };
+        let terms = vec![SmoothTermSpec {
+            name: "te_age_binary".to_string(),
+            basis: SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    periods: Vec::new(),
+                    marginalspecs: vec![age_margin, binary_margin],
+                    double_penalty: false,
+                    identifiability: TensorBSplineIdentifiability::None,
+                },
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }];
+
+        let design = build_smooth_design(data.view(), &terms).expect("binary-margin tensor");
+        let kron = design.terms[0]
+            .kronecker_factored
+            .as_ref()
+            .expect("tensor term should preserve Kronecker marginal metadata");
+
+        assert_eq!(kron.marginal_dims, vec![5, 5]);
+        assert_eq!(
+            numerical_rank(&kron.marginal_designs[1]),
+            2,
+            "a binary tensor margin has two data-supported levels even when its raw spline margin has five columns"
+        );
+        assert_eq!(
+            numerical_rank(&kron.marginal_penalties[1]),
+            3,
+            "the binary margin's second-difference roughness penalty must shrink the three unsupported spline-range directions"
+        );
+        assert_eq!(design.penalties.len(), 2);
+        assert!(design.penalties.iter().all(|penalty| {
+            penalty.local.nrows() == 25
+                && penalty.local.ncols() == 25
+                && penalty.local.iter().all(|value| value.is_finite())
+        }));
+    }
+
+    #[test]
     fn centered_tensor_penalties_canonicalize_in_transformed_basis_width() {
         let n = 16usize;
         let mut data = Array2::<f64>::zeros((n, 2));
