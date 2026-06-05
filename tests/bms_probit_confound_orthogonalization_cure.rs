@@ -240,47 +240,13 @@ fn run_fit() -> FitSummary {
     }
 }
 
-/// Characterization of the structural confound under the RELEASED solver
-/// (robust flag OFF): on this deliberately confounded cohort the joint
-/// penalised Hessian is rank-soft and the outer REML does NOT settle — the
-/// exact ill-conditioning the structural cure targets. This is a real,
-/// deterministic baseline: it pins the OFF pathology so any future ON cure has
-/// a concrete "materially better" bar to clear, and it guards against the OFF
-/// path silently starting to converge (which would invalidate the cohort).
-///
-/// NOTE ON THE ON CURE: the W-orthogonal logslope reparameterization is proven
-/// exact at the primitive level (see
-/// `orthogonalization_is_exact_and_round_trip_is_lossless`). Wiring it into the
-/// BMS *fit* via a dense logslope-design swap is NOT viable as-is: `G̃ = G −
-/// M·B` is rank-deficient by construction (it removes the marginal-overlapping
-/// directions — the whole point), so the fixed-width custom-family block
-/// machinery sees `rank(G̃) < ncols(G̃)` and the inner solve's identifiable-
-/// subspace reduction desynchronises the logslope coefficient width from the
-/// stored design width. A rank-correct cure must express `G̃` in a reduced
-/// full-rank basis with the penalty projected accordingly (a proper
-/// reparameterisation), or take the Firth/Jeffreys escalation that adds joint-
-/// Hessian curvature on the under-identified span without any design surgery.
-/// This test therefore asserts ONLY the OFF pathology, which is what is
-/// presently provable on a clean tree; it does not assert an ON cure that is
-/// not yet wired end-to-end.
-#[test]
-fn confounded_bms_probit_is_ill_conditioned_under_released_solver() {
-    assert!(file!().ends_with(".rs"));
-
-    let off = run_fit(RobustIdentification::Off);
-
-    // The released solver must exhibit the pathology on this cohort: either the
-    // outer REML fails to converge, or it drives a large/non-finite marginal β.
-    let off_is_ill_conditioned =
-        !off.outer_converged || !off.all_finite || off.max_abs_marginal_beta >= 12.0;
-    assert!(
-        off_is_ill_conditioned,
-        "released solver unexpectedly produced a well-conditioned fit on the confounded \
-         cohort (conv={}, finite={}, max|β_m|={:.4e}, |g|={:?}); the cohort no longer \
-         exercises the structural confound the cure targets",
-        off.outer_converged, off.all_finite, off.max_abs_marginal_beta, off.outer_gradient_norm,
-    );
-}
+// REMOVED: `confounded_bms_probit_is_ill_conditioned_under_released_solver`.
+// It was a pure OFF-arm characterization test — it ran the fit with robustness
+// OFF and asserted the *released, non-robust* solver was ill-conditioned on the
+// confounded cohort, serving only as the OFF baseline for the ON cure contrast.
+// With robustness unconditional there is no OFF/released path to characterize, so
+// the test carried no remaining value and was deleted. The ON cure itself is
+// still pinned by the three tests below.
 
 /// Exactness of the structural reparameterization on a design pair that mirrors
 /// the cohort's overlap: build a marginal block `M` and a log-slope block `G`
@@ -311,13 +277,16 @@ fn orthogonalization_is_exact_and_round_trip_is_lossless() {
     }
 
     let reparam = OrthogonalReparam::build(
-        RobustConfig::from_policy(RobustIdentification::Force),
+        RobustConfig {
+            firth_general: true,
+            orthogonalize_confounds: true,
+        },
         m.view(),
         g.view(),
         &w,
     )
     .expect("orthogonal reparam build should succeed")
-    .expect("Force flag ⇒ Some");
+    .expect("orthogonalize_confounds armed ⇒ Some");
 
     // 1. MᵀW·G̃ ≈ 0.
     let g_tilde = reparam.reparameterized_confound().to_owned();
@@ -389,8 +358,8 @@ fn parse_block_diagnostics(err: &str) -> Option<(usize, f64, f64)> {
 }
 
 /// THE CURE (reduced-basis orthogonalisation through the BMS family's own
-/// logslope geometry, this change set). With `RobustIdentification::Force` the
-/// logslope design is reparameterised to a FULL-RANK REDUCED BASIS `G·T` whose
+/// logslope geometry, this change set). Under the always-on robustness machinery
+/// the logslope design is reparameterised to a FULL-RANK REDUCED BASIS `G·T` whose
 /// columns are W-orthogonalised (in the rigid-pilot IRLS row metric) against the
 /// marginal span and whose marginal-overlapping directions are dropped — the
 /// structural confound the released solver merely penalised with a pinned ridge
@@ -431,10 +400,10 @@ fn parse_block_diagnostics(err: &str) -> Option<(usize, f64, f64)> {
 /// sane λ); the remaining outer non-convergence is documented here rather than
 /// asserted away.
 #[test]
-fn force_on_reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
+fn reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
     assert!(file!().ends_with(".rs"));
 
-    let on = run_fit(RobustIdentification::Force);
+    let on = run_fit();
     eprintln!(
         "[confound-cure ON] max|β_m|={:.4e} conv={} |g|={:?} finite={} err={:?}",
         on.max_abs_marginal_beta,
