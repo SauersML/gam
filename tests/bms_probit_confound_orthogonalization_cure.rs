@@ -495,86 +495,57 @@ fn reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
 
 /// THE BMS CURE PROOF (positive, never-fail form).
 ///
-/// On the SAME deliberately-confounded BMS-probit cohort, contrast the released
-/// solver (`Off`) against the principled zero-downside cure
-/// (`RobustIdentification::FirthOnly` — full identifiable-span Jeffreys, NO
-/// orthogonalization design surgery):
-///
-///   * OFF GENUINELY FAILS. The released solver exhibits the structural-confound
-///     pathology: the outer REML does not certify convergence, or it drives a
-///     large / non-finite marginal coefficient. (Pinned independently by
-///     `confounded_bms_probit_is_ill_conditioned_under_released_solver`; re-checked
-///     here so the ON-vs-OFF contrast is self-contained.)
-///
-///   * ON NEVER FAILS. With `FirthOnly` the self-limiting Jeffreys curvature makes
-///     the joint inner objective coercive on the under-identified marginal↔logslope
-///     overlap, so the fit returns a FINITE, BOUNDED estimate — it does NOT return
-///     an error (no width-desync, no runaway/refusal) and does NOT produce a NaN.
-///     The marginal coefficient is bounded to a sane O(1)–O(10) scale, materially
-///     below the released separation-scale runaway. This is the never-fail
-///     guarantee: a finite converged estimate, or (once the HMC escalation lands)
-///     a sampled proper-posterior summary — but NEVER an error.
+/// On the deliberately-confounded BMS-probit cohort, the principled zero-downside
+/// cure (full identifiable-span Jeffreys + the always-on robustness machinery)
+/// NEVER FAILS. The self-limiting Jeffreys curvature makes the joint inner
+/// objective coercive on the under-identified marginal↔logslope overlap, so the
+/// fit returns a FINITE, BOUNDED estimate — it does NOT return an error (no
+/// width-desync, no runaway/refusal) and does NOT produce a NaN. The marginal
+/// coefficient is bounded to a sane O(1)–O(10) scale, materially below the
+/// separation-scale runaway a non-robust solver would drive on this cohort. This
+/// is the never-fail guarantee: a finite converged estimate, or (once the HMC
+/// escalation lands) a sampled proper-posterior summary — but NEVER an error.
 ///
 /// HONESTY NOTE. We assert the never-fail-no-error + finite + bounded-β property,
 /// which the present full-span-Jeffreys build supports. We do NOT assert a strict
 /// outer-KKT certificate: on this adversarial cohort the marginal block retains a
 /// near-separation on a penalised spline direction whose residual the outer BFGS
 /// does not yet drive to the KKT floor (documented in
-/// `force_on_reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope`).
+/// `reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope`).
 /// Convergence and |g| are REPORTED for the record; the load-bearing positive
-/// claim is "ON returns a finite bounded estimate and never errors", flipped from
-/// the prior characterization-only scratch.
+/// claim is "the robust fit returns a finite bounded estimate and never errors".
 #[test]
-fn firth_only_cures_confounded_bms_never_fails_with_bounded_beta() {
+fn robust_cures_confounded_bms_never_fails_with_bounded_beta() {
     assert!(file!().ends_with(".rs"));
 
-    let off = run_fit(RobustIdentification::Off);
-    let on = run_fit(RobustIdentification::FirthOnly);
+    let on = run_fit();
 
     eprintln!(
-        "[bms-cure ON-vs-OFF] OFF: max|β_m|={:.4e} conv={} |g|={:?} finite={} err={} || \
-         ON: max|β_m|={:.4e} conv={} |g|={:?} finite={} err={}",
-        off.max_abs_marginal_beta, off.outer_converged, off.outer_gradient_norm, off.all_finite,
-        off.err_text.is_some(),
+        "[bms-cure] max|β_m|={:.4e} conv={} |g|={:?} finite={} err={}",
         on.max_abs_marginal_beta, on.outer_converged, on.outer_gradient_norm, on.all_finite,
         on.err_text.is_some(),
     );
 
-    // OFF genuinely fails on this cohort: non-convergence, non-finite, or a
-    // separation-scale marginal runaway (or a hard Err, surfaced as an INFINITY
-    // max|β_m| by `run_fit`).
-    let off_failed = !off.outer_converged
-        || !off.all_finite
-        || off.err_text.is_some()
-        || off.max_abs_marginal_beta >= 12.0;
-    assert!(
-        off_failed,
-        "released (OFF) solver unexpectedly produced a well-conditioned fit on the confounded \
-         cohort (conv={}, finite={}, max|β_m|={:.4e}); the cohort no longer exercises the \
-         structural confound the cure targets",
-        off.outer_converged, off.all_finite, off.max_abs_marginal_beta,
-    );
-
-    // ON NEVER FAILS — the positive cure assertion.
-    // (a) No error: FirthOnly must not return Err (no width-desync, no refusal).
+    // NEVER FAILS — the positive cure assertion.
+    // (a) No error: the robust fit must not return Err (no width-desync, no refusal).
     assert!(
         on.err_text.is_none(),
-        "FirthOnly returned an error on the confounded cohort — the never-fail guarantee is \
+        "robust fit returned an error on the confounded cohort — the never-fail guarantee is \
          violated: {:?}",
         on.err_text,
     );
     // (b) Finite: every joint coefficient is finite (no NaN/Inf).
     assert!(
         on.all_finite,
-        "FirthOnly produced a non-finite coefficient on the confounded cohort (max|β_m|={:.4e})",
+        "robust fit produced a non-finite coefficient on the confounded cohort (max|β_m|={:.4e})",
         on.max_abs_marginal_beta,
     );
     // (c) Bounded: the marginal coefficient stays at a sane O(1)–O(10) scale,
-    //     materially below the released separation-scale runaway (~10–60+ / Inf).
+    //     materially below the separation-scale runaway a non-robust solver drives.
     assert!(
         on.max_abs_marginal_beta.is_finite() && on.max_abs_marginal_beta < 50.0,
-        "FirthOnly did not bound the marginal coefficient: max|β_m|={:.4e} (cure requires a \
-         finite, bounded estimate well below the released runaway)",
+        "robust fit did not bound the marginal coefficient: max|β_m|={:.4e} (cure requires a \
+         finite, bounded estimate well below the non-robust runaway)",
         on.max_abs_marginal_beta,
     );
 }
