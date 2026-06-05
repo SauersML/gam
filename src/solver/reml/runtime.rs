@@ -4254,12 +4254,56 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> super::rho_prior_eval::RhoPriorEval {
         let effective = self.effective_rho_prior();
-        super::rho_prior_eval::evaluate(
+        let mut eval = super::rho_prior_eval::evaluate(
             effective.as_ref(),
             rho,
             super::rho_prior_eval::InvalidPriorPolicy::Saturate,
         )
-        .expect("Saturate policy never errors")
+        .expect("Saturate policy never errors");
+        // FIRTH-DEFAULT SELF-GATE (strict zero-downside). The shared engine
+        // evaluated every firth-default-filled coordinate as a plain PC term,
+        // whose gradient carries the persistent `+1/2` Occam pull that perturbs
+        // even a well-identified λ by O(1/n). Replace those coordinates'
+        // contribution with the SELF-GATED one-sided barrier
+        // `firth_default_barrier_terms`, which is byte-identically flat on the
+        // identified side (ρ ≥ −2 ln upper) and only a convex wall against the
+        // λ → 0 degeneracy below it — so a clean/well-conditioned fit stays
+        // byte-identical to plain REML. Explicitly-configured priors (including a
+        // user-supplied PenalizedComplexity) are left exactly as the engine
+        // produced them. If the saturating policy already flagged a malformed
+        // prior (non-finite cost), leave it untouched so the repulsion stands.
+        if eval.cost.is_finite() {
+            let mask = firth_default_coord_mask(&self.rho_prior, rho.len());
+            if mask.iter().any(|&d| d) {
+                let theta = super::rho_prior_eval::pc_prior_rate(
+                    FIRTH_DEFAULT_PC_UPPER,
+                    FIRTH_DEFAULT_PC_TAIL_PROB,
+                );
+                let mut hess = eval
+                    .hessian
+                    .take()
+                    .unwrap_or_else(|| Array2::<f64>::zeros((rho.len(), rho.len())));
+                for (idx, &is_default) in mask.iter().enumerate() {
+                    if !is_default {
+                        continue;
+                    }
+                    let r = rho[idx];
+                    // Remove the plain PC contribution the engine added for this
+                    // defaulted coordinate, then add the self-gated barrier.
+                    let (pc_c, pc_g, pc_h) = super::rho_prior_eval::pc_prior_terms(theta, r);
+                    let (b_c, b_g, b_h) = super::rho_prior_eval::firth_default_barrier_terms(
+                        theta,
+                        FIRTH_DEFAULT_PC_UPPER,
+                        r,
+                    );
+                    eval.cost += b_c - pc_c;
+                    eval.gradient[idx] += b_g - pc_g;
+                    hess[[idx, idx]] += b_h - pc_h;
+                }
+                eval.hessian = hess.iter().any(|&v| v != 0.0).then_some(hess);
+            }
+        }
+        eval
     }
 
     /// Resolve the *effective* outer prior on the log-precision ρ, applying the
@@ -10173,6 +10217,66 @@ mod tk_math_tests {
         // An Independent prior with no Flat holes is left untouched.
         let no_holes = RhoPrior::Independent(vec![configured.clone(), configured.clone()]);
         assert_eq!(*resolve_effective_rho_prior(&no_holes), no_holes);
+    }
+
+    #[test]
+    fn firth_default_coord_mask_marks_only_flat_coordinates() {
+        // Whole-Flat → every coordinate is a firth default.
+        assert_eq!(firth_default_coord_mask(&RhoPrior::Flat, 3), vec![true; 3]);
+        // Independent → only the Flat holes are defaults.
+        let indep = RhoPrior::Independent(vec![
+            RhoPrior::Flat,
+            RhoPrior::Normal { mean: 0.0, sd: 1.0 },
+            RhoPrior::Flat,
+        ]);
+        assert_eq!(
+            firth_default_coord_mask(&indep, 3),
+            vec![true, false, true]
+        );
+        // An explicitly-configured scalar prior defaults nothing.
+        assert_eq!(
+            firth_default_coord_mask(&RhoPrior::Normal { mean: 0.0, sd: 1.0 }, 2),
+            vec![false; 2]
+        );
+    }
+
+    #[test]
+    fn firth_default_barrier_is_byte_zero_on_identified_side() {
+        use super::super::rho_prior_eval::{firth_default_barrier_terms, pc_prior_rate};
+        let upper = FIRTH_DEFAULT_PC_UPPER;
+        let theta = pc_prior_rate(upper, FIRTH_DEFAULT_PC_TAIL_PROB);
+        let rho_gate = -2.0 * upper.ln();
+
+        // Identified side (ρ ≥ ρ_gate, distance d = e^{-ρ/2} ≤ upper): the barrier
+        // contributes EXACTLY zero — strict zero-downside, no Occam pull. This is
+        // the whole point of FIX B: the plain PC gradient would be ≈ +1/2 here.
+        for &r in &[rho_gate, rho_gate + 1e-9, 0.0, 5.0, 50.0] {
+            let (c, g, h) = firth_default_barrier_terms(theta, upper, r);
+            assert_eq!((c, g, h), (0.0, 0.0, 0.0), "must be byte-zero at ρ={r}");
+        }
+
+        // Degenerate side (ρ < ρ_gate, λ → 0): a convex wall that pushes ρ UP
+        // (negative gradient) with positive curvature, and is C⁰ at the gate.
+        for &r in &[rho_gate - 1.0, rho_gate - 5.0, -20.0] {
+            let (c, g, h) = firth_default_barrier_terms(theta, upper, r);
+            assert!(c > 0.0, "cost must be positive below the gate at ρ={r}");
+            assert!(g < 0.0, "gradient must push ρ up (away from λ→0) at ρ={r}");
+            assert!(h > 0.0, "curvature must be positive at ρ={r}");
+        }
+
+        // C⁰ continuity at the gate: cost → 0 as ρ ↑ ρ_gate.
+        let (c_below, _, _) = firth_default_barrier_terms(theta, upper, rho_gate - 1e-6);
+        assert!(c_below.abs() < 1e-9, "cost continuous at the gate, got {c_below}");
+
+        // Finite-difference check of grad and (diagonal) Hessian below the gate.
+        let r = rho_gate - 2.0;
+        let cost_at = |dr: f64| firth_default_barrier_terms(theta, upper, r + dr).0;
+        let grad_at = |dr: f64| firth_default_barrier_terms(theta, upper, r + dr).1;
+        let (_, g, h) = firth_default_barrier_terms(theta, upper, r);
+        let fd_g = (cost_at(1e-6) - cost_at(-1e-6)) / 2e-6;
+        let fd_h = (grad_at(1e-5) - grad_at(-1e-5)) / 2e-5;
+        assert!((fd_g - g).abs() < 1e-6, "grad FD {fd_g} vs {g}");
+        assert!((fd_h - h).abs() < 1e-5, "hess FD {fd_h} vs {h}");
     }
 
     #[test]

@@ -19059,10 +19059,20 @@ fn joint_outer_evaluate(
     // outer REML logdet AND its trace derivatives must run on the same
     // Jeffreys-augmented Hessian `H + S_λ + H_Φ` the inner Newton converged on,
     // or the LAML value and its analytic gradient describe different objectives.
-    // `H_Φ` carries no ρ-dependence, so folding it into the operator's matvec
-    // leaves every existing derivative closure correct and only augments the
-    // inverse/logdet. `None` ⇒ byte-identical released outer REML.
+    // Folding `H_Φ` into the operator's matvec augments the inverse/logdet, but is
+    // NOT by itself sufficient: `H_Φ` depends on ρ THROUGH β̂, so the trace
+    // contraction also needs its mode-response drift `D_β H_Φ[v_k]` — supplied
+    // separately via `jeffreys_hphi_drift` and folded into the first-order trace
+    // by `JeffreysHphiAwareJointDerivatives`. `None` ⇒ byte-identical released
+    // outer REML.
     robust_jeffreys_hphi: Option<Array2<f64>>,
+    // Companion mode-response drift `D_β H_Φ[δβ]` for the outer gradient's trace
+    // identity. `Some` exactly when `robust_jeffreys_hphi` is `Some` (same
+    // under-identified span); installing it wraps the derivative provider so the
+    // first-order trace gains the `½ tr[(H+S_λ+H_Φ)⁻¹ D_β H_Φ[v_k]]` term that
+    // makes the analytic gradient match the augmented objective. `None` ⇒ the
+    // provider is used unwrapped.
+    jeffreys_hphi_drift: Option<JeffreysHphiDriftFn>,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
@@ -22429,6 +22439,82 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     let hphi = custom_family_joint_jeffreys_term(family, states, specs, ranges, &z_joint)?
         .map(|(_phi, _grad, hphi)| hphi);
     Ok(hphi)
+}
+
+/// Build the Tier-B Jeffreys-curvature drift closure `D_β H_Φ[δβ]` for the outer
+/// gradient, evaluated at the current outer point (states = β̂(ρ)).
+///
+/// THE FIX. The outer LAML objective folds `H_Φ` into `½ log|H + S_λ + H_Φ|`;
+/// because `H_Φ` depends on ρ through β̂, the exact gradient's trace contraction
+/// must include `½ tr[(H+S_λ+H_Φ)⁻¹ D_β H_Φ[v_k]]`. The released Tier-B path
+/// supplied ONLY the likelihood-Hessian drift `D_β H[v_k]`, so the analytic
+/// gradient omitted `H_Φ`'s mode-response drift — wrong precisely when Jeffreys
+/// is active. This returns the missing drift as a `Send + Sync + 'static` closure
+/// the `JeffreysHphiAwareJointDerivatives` wrapper folds into the first-order
+/// trace, mirroring Tier-A's `FirthAwareGlmDerivatives` `−D(Hφ)[B_k]` term.
+///
+/// The closure takes the mode-response direction `δβ = dβ̂/dρ_k` (the wrapper
+/// performs `v_k → δβ = −v_k`) and returns `D_β H_Φ[δβ]`. Returns `None` (so the
+/// wrapper is not installed and behavior is byte-identical) when there is no
+/// under-identified span — i.e. exactly when `custom_family_outer_jeffreys_hphi`
+/// itself returns `None`. The per-direction conditioning gate and floored
+/// pseudo-inverse inside `joint_jeffreys_hphi_directional_derivative` reproduce
+/// the value path's, so when the value's `H_Φ` is zero (gated/clean fit) the
+/// drift is identically zero too.
+fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+) -> Result<Option<JeffreysHphiDriftFn>, String> {
+    let z_joint = match build_joint_jeffreys_subspace(specs, ranges)? {
+        Some(z) => z,
+        None => return Ok(None),
+    };
+    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if total_p == 0 || z_joint.ncols() == 0 {
+        return Ok(None);
+    }
+    // Snapshot the joint Hessian H(β̂) at the current outer point. If the family
+    // exposes no exact joint Hessian the Jeffreys term is inapplicable (matching
+    // `custom_family_joint_jeffreys_term`), so no drift is installed.
+    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs)? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    if h_joint.nrows() != total_p || h_joint.ncols() != total_p {
+        return Ok(None);
+    }
+    // Own everything the closure needs so it is `'static + Send + Sync`. β̂ is
+    // fixed across the single outer evaluation, so capturing the snapshot states
+    // is correct; the closure recomputes the exact directional derivatives of the
+    // joint Hessian at that point for each mode-response direction.
+    let family_owned = family.clone();
+    let states_owned: Vec<ParameterBlockState> = states.to_vec();
+    let specs_owned: Vec<ParameterBlockSpec> = specs.to_vec();
+    let z_columns = z_joint.clone();
+    let drift: JeffreysHphiDriftFn = Arc::new(move |delta: &Array1<f64>| {
+        crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative(
+            h_joint.view(),
+            z_columns.view(),
+            delta,
+            |direction: &Array1<f64>| {
+                family_owned.exact_newton_joint_hessian_directional_derivative(
+                    &states_owned,
+                    direction,
+                )
+            },
+            |u: &Array1<f64>, v: &Array1<f64>| {
+                family_owned.exact_newton_joint_hessiansecond_directional_derivative(
+                    &states_owned,
+                    u,
+                    v,
+                )
+            },
+        )
+        .map(Some)
+    });
+    Ok(Some(drift))
 }
 
 const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
