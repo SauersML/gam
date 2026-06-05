@@ -15243,8 +15243,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // accept/reject objective consistent with the Jeffreys-modified
                 // Newton step. `states` already holds the trial coefficients
                 // (assigned + eta-refreshed above). No-op when the Jeffreys term
-                // is unavailable or condition-gated to zero.
-                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                // is unavailable or condition-gated to zero. When the cheap pre-
+                // check certified this cycle well-conditioned, the step used H_Φ=0
+                // / ∇Φ=0, so the consistent accept/reject objective also uses Φ=0:
+                // skipping here keeps value and step on the SAME objective (the
+                // value/step consistency the term exists to enforce) and avoids the
+                // dense H/eigh at the trial point. The 8× conditioning margin makes
+                // a single damped Newton step incapable of crossing the gate.
+                if !jeffreys_skippable_this_cycle
+                    && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
+                {
                     trial_penalty += custom_family_joint_jeffreys_value(
                         family, &states, specs, &ranges, z_joint,
                     );
@@ -15674,8 +15682,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Re-fold the Jeffreys objective at the accepted iterate so the
             // post-accept baseline matches the augmented objective the next
             // cycle's trial points are compared against. No-op when the
-            // Jeffreys term is unavailable or condition-gated to zero.
-            if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+            // Jeffreys term is unavailable or condition-gated to zero, or when the
+            // cheap pre-check certified this cycle well-conditioned (Φ=0, matching
+            // the H_Φ=0 the step used — keeps the baseline on the same objective).
+            if !jeffreys_skippable_this_cycle
+                && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
+            {
                 current_penalty +=
                     custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             }
