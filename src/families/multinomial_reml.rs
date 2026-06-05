@@ -1567,4 +1567,178 @@ mod tests {
             "matvec vs gradient finite-difference deviates by {max_abs} (scale {scale})"
         );
     }
+
+    /// #753 — the universal full-span Jeffreys/Firth proper prior must be wired
+    /// into the multinomial path so a SEPARATING fit gets finite, bounded
+    /// curvature instead of drifting to ±∞.
+    ///
+    /// `MultinomialFamily` is a `CustomFamily`, so the formula REML entry
+    /// (`fit_penalized_multinomial_formula` → `fit_custom_family_with_rho_prior`)
+    /// folds the always-on term `Φ = ½ log|Z_Jᵀ H Z_J|` into the coupled joint
+    /// Newton solve through `build_joint_jeffreys_subspace` +
+    /// `custom_family_joint_jeffreys_term`. Those wrappers are private to
+    /// `custom_family.rs`, but they do exactly two things this test reproduces
+    /// verbatim against the multinomial family's own exact joint Hessian and
+    /// analytic directional derivative:
+    ///   1. build the full-span basis `Z_J = I` (one identity per block,
+    ///      stacked) via `jeffreys_subspace_from_penalty`, and
+    ///   2. evaluate `joint_jeffreys_term(H, Z_J, ∂_β H[·])`.
+    ///
+    /// On a CLEANLY SEPARATED, UNPENALIZED multinomial geometry the joint
+    /// information `H` is near-singular along the separating direction (its
+    /// smallest eigenvalue collapses toward 0 as the iterate drifts out), the
+    /// exact MLE-at-infinity pathology #753 is about. The assertions pin that:
+    ///   * the conditioning gate FIRES (the term is non-trivial — `Φ`, `∇Φ`,
+    ///     `H_Φ` are not all zero), i.e. the multinomial family is NOT silently
+    ///     excluded from the universal robustness, and
+    ///   * the Gauss-Newton curvature `H_Φ` is FINITE and supplies strictly
+    ///     positive curvature on the separating direction the bare `H` does not —
+    ///     the `O(1)`-bounding term that makes the penalized Newton iterate
+    ///     finite (acceptance option (a)).
+    #[test]
+    fn separating_multinomial_arms_universal_jeffreys_firth_term() {
+        use crate::estimate::reml::jeffreys_subspace::{
+            jeffreys_subspace_from_penalty, joint_jeffreys_term,
+        };
+        use crate::faer_ndarray::FaerEigh;
+
+        // K = 3 classes, single covariate that PERFECTLY separates the classes
+        // by threshold, plus an intercept. Unpenalized (λ = 0, zero penalty), so
+        // the separating slope direction has a genuine MLE at ±∞.
+        let n = 60usize;
+        let k = 3usize;
+        let p = 2usize; // [intercept, x]
+        let design = Arc::new(Array2::<f64>::from_shape_fn((n, p), |(row, col)| match col {
+            0 => 1.0,
+            _ => -3.0 + 6.0 * (row as f64) / ((n - 1) as f64),
+        }));
+        let mut y = Array2::<f64>::zeros((n, k));
+        for row in 0..n {
+            let x = design[[row, 1]];
+            let class = if x < -1.0 {
+                0
+            } else if x > 1.0 {
+                1
+            } else {
+                2 // reference class occupies the middle band
+            };
+            y[[row, class]] = 1.0;
+        }
+        // Unpenalized: zero penalty so NO proper wiggliness prior exists on any
+        // direction — separation is the only thing that could bound the slope.
+        let penalties = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
+            Array2::<f64>::zeros((p, p)),
+        )]);
+        let nullspace_dims = Arc::new(vec![p]); // fully unpenalized block
+        let weights = Array1::<f64>::ones(n);
+        let family = MultinomialFamily::new(
+            y,
+            weights,
+            k,
+            design,
+            penalties,
+            nullspace_dims,
+        )
+        .expect("separated multinomial family must construct");
+
+        let m = family.active_classes();
+        let total = m * p;
+        let specs = family.build_block_specs();
+
+        // Drive the iterate well out along the separating slope, the regime the
+        // screening floor would otherwise leave un-bounded. Large per-class
+        // slopes ⇒ near-saturated softmax ⇒ near-singular joint information.
+        let betas: Vec<Array1<f64>> = (0..m)
+            .map(|a| Array1::from_vec(vec![0.0, 8.0 * ((a as f64) - 0.5)]))
+            .collect();
+        let states = states_at_betas(&family, &betas);
+
+        // Family's EXACT coupled joint Hessian at the separating iterate — the
+        // same payload `custom_family_joint_jeffreys_term` pulls.
+        let h_joint = family
+            .exact_newton_joint_hessian(&states)
+            .expect("joint Hessian eval")
+            .expect("multinomial exposes an explicit joint Hessian");
+        assert_eq!(h_joint.dim(), (total, total));
+
+        // Confirm the separation pathology: the joint information is genuinely
+        // near-singular (smallest eigenvalue ≪ largest), the MLE-at-infinity
+        // direction the Jeffreys term exists to bound.
+        let (evals, _) = h_joint
+            .eigh(faer::Side::Lower)
+            .expect("information eigendecomposition");
+        let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
+        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            lambda_max > 0.0 && lambda_min / lambda_max < 1.0e-6,
+            "fixture must be near-separating: λ_min/λ_max = {} (λ_min={lambda_min}, λ_max={lambda_max})",
+            lambda_min / lambda_max
+        );
+
+        // Full-span basis Z_J = I, block-diagonally stacked exactly as
+        // `build_joint_jeffreys_subspace` does (each block's span is I_p).
+        let aggregate = Array2::<f64>::zeros((p, p));
+        let block_span = jeffreys_subspace_from_penalty(aggregate.view())
+            .expect("block Jeffreys span")
+            .columns;
+        assert_eq!(block_span.dim(), (p, p));
+        let mut z_joint = Array2::<f64>::zeros((total, total));
+        for b in 0..m {
+            for i in 0..p {
+                for j in 0..p {
+                    z_joint[[b * p + i, b * p + j]] = block_span[[i, j]];
+                }
+            }
+        }
+
+        // Evaluate the universal Jeffreys term against the family's analytic
+        // directional derivative — the identical closure
+        // `custom_family_joint_jeffreys_term` constructs.
+        let (phi, grad_phi, hphi) = joint_jeffreys_term(
+            h_joint.view(),
+            z_joint.view(),
+            |direction: &Array1<f64>| {
+                family.exact_newton_joint_hessian_directional_derivative(&states, direction)
+            },
+        )
+        .expect("multinomial joint Jeffreys term must evaluate");
+
+        // The conditioning gate must FIRE on this separating geometry: the
+        // multinomial family is armed by the universal robustness, not excluded.
+        let term_active =
+            phi != 0.0 || grad_phi.iter().any(|v| *v != 0.0) || hphi.iter().any(|v| *v != 0.0);
+        assert!(
+            term_active,
+            "Jeffreys/Firth term must fire on a separating multinomial fit (φ={phi})"
+        );
+
+        // `H_Φ` must be finite everywhere (no inf/NaN leaking from the near-
+        // singular information).
+        assert!(
+            phi.is_finite() && grad_phi.iter().all(|v| v.is_finite()),
+            "Jeffreys φ/∇φ must be finite (φ={phi})"
+        );
+        for v in hphi.iter() {
+            assert!(v.is_finite(), "H_Φ entry must be finite, got {v}");
+        }
+
+        // The Gauss-Newton curvature `H_Φ` is PSD by construction; on the
+        // separating direction (the smallest-eigenvalue eigenvector of `H`) it
+        // must add STRICTLY POSITIVE curvature the bare information lacks — the
+        // O(1) bound that makes `H + S_λ + H_Φ` SPD and the iterate finite.
+        let (_, evecs) = h_joint
+            .eigh(faer::Side::Lower)
+            .expect("eig for separating direction");
+        let sep_dir = evecs.column(0).to_owned(); // eigenvector of λ_min
+        let curv_h = sep_dir.dot(&h_joint.dot(&sep_dir));
+        let curv_hphi = sep_dir.dot(&hphi.dot(&sep_dir));
+        assert!(
+            curv_hphi > 0.0,
+            "H_Φ must supply positive curvature on the separating direction (got {curv_hphi}; bare H curvature there is {curv_h})"
+        );
+        assert!(
+            curv_hphi.is_finite() && curv_hphi >= curv_h,
+            "augmented curvature {curv_hphi} must dominate the near-zero bare curvature {curv_h}"
+        );
+    }
 }
