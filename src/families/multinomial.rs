@@ -109,12 +109,30 @@ use std::sync::Arc;
 /// optimized objective is the true penalized REML criterion, and the floor
 /// only has to be large enough to keep the linear algebra finite.
 ///
-/// Caveat (the real upstream defect, tracked separately): if the multinomial
-/// MLE is genuinely at infinity for an unpenalized/null-space direction
-/// (complete/quasi-complete separation, #722), no solver floor makes that
-/// direction's estimate finite — the principled response there is a
-/// model-declared bias-reduction prior (Firth/Jeffreys) or an explicit
-/// separation diagnostic, not a magnitude on this floor.
+/// The separation defect (#753) is no longer this floor's job. If the
+/// multinomial MLE is genuinely at infinity for an unpenalized/null-space
+/// direction (complete/quasi-complete separation), no solver floor makes that
+/// direction's estimate finite — the principled response is a model-declared
+/// bias-reduction prior, not a magnitude on this floor. The formula REML path
+/// below supplies exactly that: because `MultinomialFamily` is a `CustomFamily`
+/// routed through [`fit_custom_family_with_rho_prior`], it inherits the
+/// UNIVERSAL, always-on full-span Jeffreys/Firth proper prior
+/// `Φ = ½ log|Z_Jᵀ H Z_J|` that the joint-Newton path folds into every coupled
+/// custom-family inner solve (see
+/// [`crate::solver::reml::jeffreys_subspace::joint_jeffreys_term`] and
+/// `build_joint_jeffreys_subspace` / `custom_family_joint_jeffreys_term` in
+/// `custom_family.rs`). The conditioning gate keeps it byte-identical to the
+/// un-penalized Newton on an identified fit and supplies the missing
+/// `O(1)`-bounding curvature only on a separating direction, where the
+/// multinomial family's exact joint Hessian and its analytic directional
+/// derivatives (`exact_newton_joint_hessian{,_directional_derivative}` in
+/// [`crate::families::multinomial_reml`]) drive both the score `∇Φ` and the
+/// Gauss-Newton curvature `H_Φ`. So a separating multinomial REML fit now
+/// converges to FINITE Firth-reduced coefficients rather than drifting to the
+/// screening cap. The bare fixed-λ inner driver [`fit_penalized_multinomial`]
+/// (no outer REML, no Jeffreys term) instead surfaces the explicit
+/// `PerfectSeparationDetected` diagnostic — the same #753 acceptance, option
+/// (b), for the path that has no proper prior to lean on.
 const MULTINOMIAL_FORMULA_RIDGE_FLOOR: f64 = 1.0e-4;
 
 /// Largest smoothing-parameter dimension where exact dense outer curvature is

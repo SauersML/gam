@@ -42,6 +42,7 @@ use crate::terms::analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     DecoderIncoherencePenalty, IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty,
     NuclearNormPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, WeightField,
+    resolve_learnable_weight,
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
@@ -2464,7 +2465,7 @@ impl SaeManifoldRho {
     /// Exponentiate a learnable log-strength with the exponent clamped into the
     /// finite-normal band, so the resulting strength is always a finite,
     /// strictly-positive `f64` (no overflow to `inf`, no underflow to `0.0`).
-    fn stable_exp_strength(log_strength: f64) -> f64 {
+    pub(crate) fn stable_exp_strength(log_strength: f64) -> f64 {
         const MAX_LOG_STRENGTH: f64 = 700.0;
         const MIN_LOG_STRENGTH: f64 = -700.0;
         log_strength.clamp(MIN_LOG_STRENGTH, MAX_LOG_STRENGTH).exp()
@@ -3640,7 +3641,11 @@ impl SaeManifoldTerm {
             let periods = coord.effective_axis_periods();
             for axis in 0..d {
                 let log_alpha = rho.log_ard[atom_idx][axis];
-                let alpha = log_alpha.exp();
+                // Clamp the log-precision before exponentiating: a raw
+                // `exp(log_ard)` overflows to `inf` for `log_ard ≳ 709`, and the
+                // `inf` precision then poisons the ARD energy / curvature with
+                // `inf · 0.0 = NaN` (#742, Issue 4).
+                let alpha = SaeManifoldRho::stable_exp_strength(log_alpha);
                 let period = periods[axis];
                 let mut energy = 0.0;
                 for row in 0..n {
@@ -4136,7 +4141,7 @@ impl SaeManifoldTerm {
                         // a fixed prior only damps the Newton step — it does not
                         // move the stationary point (the gradient, which sets the
                         // fixed point, stays the exact `V'`).
-                        let alpha = rho.log_ard[k][axis].exp();
+                        let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][axis]);
                         let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                         block.gt[starts[j] + axis] += prior.grad;
                         block.htt[[starts[j] + axis, starts[j] + axis]] += prior.hess.max(0.0);
@@ -4164,7 +4169,7 @@ impl SaeManifoldTerm {
                         // branch above for why `max(V'', 0)` is required to keep
                         // `htt` PD (the exact `V'' = α·cos κt` is indefinite past a
                         // quarter period and breaks the Schur/log-det Cholesky).
-                        let alpha = rho.log_ard[atom_idx][axis].exp();
+                        let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom_idx][axis]);
                         let prior = ArdAxisPrior::eval(alpha, row_t[axis], periods[axis]);
                         block.gt[off + axis] += prior.grad;
                         block.htt[[off + axis, off + axis]] += prior.hess.max(0.0);
@@ -5132,7 +5137,7 @@ impl SaeManifoldTerm {
                 continue;
             }
             for j in 0..d_k {
-                let alpha = rho.log_ard[k][j].exp();
+                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[k][j]);
                 // edf_kj ∈ [0, n_active_k]; clamp against numerical drift.
                 let edf_kj = (n_active_k - alpha * traces[k][j]).clamp(0.0, n_active_k);
                 coord_edf += edf_kj;
@@ -5577,7 +5582,12 @@ impl SaeManifoldTerm {
         let beta_off = self.beta_offsets()[atom_idx];
         let beta_block = m * p;
         let jet = &atom.basis_jacobian;
-        let mu = corrected.scalar_weight * rho_local[corrected.rho_index].exp();
+        // Resolve the learnable isometry strength `scalar_weight · exp(rho)` in
+        // log-space with a clamped exponent: the naive `scalar_weight *
+        // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
+        // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
+        // block and β-penalty, poisoning the joint solve (#742, Issue 4).
+        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
         // A negligible (or non-finite) effective isometry weight contributes a
         // zero curvature block; writing zeros would still flip the solver onto
         // the dense-supplement Schur path (and invalidate caches) for no model
@@ -5786,7 +5796,12 @@ impl SaeManifoldTerm {
             };
             weighted_jacobian_rows.push(wj);
         }
-        let mu = corrected.scalar_weight * rho_local[corrected.rho_index].exp();
+        // Resolve the learnable isometry strength `scalar_weight · exp(rho)` in
+        // log-space with a clamped exponent: the naive `scalar_weight *
+        // rho.exp()` overflows to `inf` for `rho ≳ 709`, and the downstream
+        // `inf · jacobian` / `inf · 0.0` then injects NaN into the GN curvature
+        // block and β-penalty, poisoning the joint solve (#742, Issue 4).
+        let mu = resolve_learnable_weight(corrected.scalar_weight, rho_local[corrected.rho_index]);
         let mut metric_jvp = Array2::<f64>::zeros((d, d));
         let mut jac_hvp = Array2::<f64>::zeros((p, d));
         let mut beta_hvp = Array2::<f64>::zeros((m, p));
