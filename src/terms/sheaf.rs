@@ -39,6 +39,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::linalg::faer_ndarray::FaerEigh;
+use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
 use crate::terms::analytic_penalties::{AnalyticPenalty, PenaltyTier};
 
 /// Threshold above which `harmonic_modes` switches from a dense faer eigen
@@ -465,8 +466,7 @@ impl SheafConsistencyPenalty {
         let n = self.total_dim();
         let k = n.min(64).max(1);
         // Deterministic pseudo-random start to keep the bound reproducible.
-        let mut q_prev = Array1::<f64>::zeros(n);
-        let mut q_curr = Array1::<f64>::zeros(n);
+        let mut q0 = vec![0.0_f64; n];
         for i in 0..n {
             // Splitmix-style scrambling of i: deterministic, dependency-free.
             let mut z = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -475,58 +475,28 @@ impl SheafConsistencyPenalty {
             z ^= z >> 27;
             z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
             z ^= z >> 31;
-            q_curr[i] = (z as f64 / u64::MAX as f64) - 0.5;
+            q0[i] = (z as f64 / u64::MAX as f64) - 0.5;
         }
-        let nrm = (q_curr.iter().map(|x| x * x).sum::<f64>())
-            .sqrt()
-            .max(1e-300);
-        q_curr.mapv_inplace(|x| x / nrm);
-
-        let mut alphas = Vec::with_capacity(k);
-        let mut betas = Vec::with_capacity(k);
-        let mut beta_prev: f64 = 0.0;
-        for _ in 0..k {
-            let mut w = self.laplacian_apply(q_curr.view());
-            let alpha = q_curr.iter().zip(w.iter()).map(|(a, b)| a * b).sum::<f64>();
-            // w := w − α q_curr − β_prev q_prev
-            w.scaled_add(-alpha, &q_curr);
-            if beta_prev != 0.0 {
-                w.scaled_add(-beta_prev, &q_prev);
-            }
-            // Full reorthogonalisation against (q_prev, q_curr) — small k, cheap.
-            let proj_curr = q_curr.iter().zip(w.iter()).map(|(a, b)| a * b).sum::<f64>();
-            w.scaled_add(-proj_curr, &q_curr);
-            let proj_prev = q_prev.iter().zip(w.iter()).map(|(a, b)| a * b).sum::<f64>();
-            w.scaled_add(-proj_prev, &q_prev);
-
-            let beta = (w.iter().map(|x| x * x).sum::<f64>()).sqrt();
-            alphas.push(alpha);
-            betas.push(beta);
-            if beta < 1e-12 {
-                break;
-            }
-            q_prev = q_curr.clone();
-            q_curr = w.mapv(|x| x / beta);
-            beta_prev = beta;
-        }
-        // Eigendecompose the small tridiagonal T (size = alphas.len()).
-        let m = alphas.len();
-        let mut t = Array2::<f64>::zeros((m, m));
-        for i in 0..m {
-            t[[i, i]] = alphas[i];
-            if i + 1 < m {
-                t[[i, i + 1]] = betas[i];
-                t[[i + 1, i]] = betas[i];
-            }
-        }
-        match t.eigh(Side::Lower) {
-            Ok((evals, _)) => evals.iter().filter(|&&e| e < tol).count(),
-            // SAFETY: t is built as a symmetric tridiagonal matrix from Lanczos coefficients
-            // (alphas on diagonal, betas on first sub/superdiagonal); eigh on a real symmetric
-            // tridiagonal cannot fail by construction in finite arithmetic, so this is unreachable
-            // outside of corrupted inputs and panicking is the right action.
+        match symmetric_lanczos_eigenpairs(
+            n,
+            &q0,
+            SymmetricLanczosOptions {
+                max_steps: k,
+                residual_tol: 1e-12,
+                local_reorthogonalize: true,
+            },
+            |q, out| {
+                let w = self.laplacian_apply(ArrayView1::from(q));
+                out.copy_from_slice(w.as_slice().ok_or_else(|| {
+                    "SheafConsistencyPenalty::harmonic_modes Lanczos matvec produced non-contiguous output"
+                        .to_string()
+                })?);
+                Ok(())
+            },
+        ) {
+            Ok(eigen) => eigen.eigenvalues.iter().filter(|&&e| e < tol).count(),
             Err(err) => {
-                panic!("SheafConsistencyPenalty::harmonic_modes Lanczos eigh failed: {err:?}")
+                panic!("SheafConsistencyPenalty::harmonic_modes Lanczos failed: {err}")
             }
         }
     }
