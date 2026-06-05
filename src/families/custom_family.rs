@@ -8573,13 +8573,6 @@ fn buildblock_states<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
 ) -> Result<Vec<ParameterBlockState>, String> {
-    log::error!(
-        "DBG buildblock_states START: {:?}",
-        specs
-            .iter()
-            .map(|s| (s.name.clone(), s.design.ncols(), s.initial_beta.as_ref().map(|b| b.len())))
-            .collect::<Vec<_>>()
-    );
     let mut states = Vec::with_capacity(specs.len());
     for (b, spec) in specs.iter().enumerate() {
         let p = spec.design.ncols();
@@ -8612,14 +8605,6 @@ fn buildblock_states<F: CustomFamily + Clone + Send + Sync + 'static>(
     // `max_feasible_step_size` guards on iteration 1.  The warm-start
     // path (5925-5938) projects on entry for exactly this reason; this
     // extends the invariant to the cold-start path too.
-    log::error!(
-        "DBG buildblock_states: {:?}",
-        specs
-            .iter()
-            .zip(states.iter())
-            .map(|(s, st)| (s.name.clone(), s.design.ncols(), st.beta.len(), s.initial_beta.as_ref().map(|b| b.len())))
-            .collect::<Vec<_>>()
-    );
     for b in 0..specs.len() {
         let raw = states[b].beta.clone();
         let projected = family.post_update_block_beta(&states, b, &specs[b], raw)?;

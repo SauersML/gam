@@ -1934,16 +1934,11 @@ impl BernoulliMarginalSlopeFamily {
         let logslope = &block_states[1];
         let logslope_ncols = self.logslope_design.ncols();
         if logslope_ncols > 0 && logslope.beta.len() != logslope_ncols {
-            // SAFETY: temporary debug instrumentation to capture the backtrace.
-            panic!(
-                "DEBUG logslope beta got {}, expected {}; marginal beta {} design {}; logslope design {}\n{}",
+            return Err(format!(
+                "bernoulli marginal-slope logslope beta length mismatch: got {}, expected {}",
                 logslope.beta.len(),
-                logslope_ncols,
-                block_states[0].beta.len(),
-                self.marginal_design.ncols(),
-                self.logslope_design.ncols(),
-                std::backtrace::Backtrace::force_capture(),
-            );
+                logslope_ncols
+            ));
         }
         if logslope.eta.len() != n_rows {
             return Err(format!(
