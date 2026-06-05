@@ -14392,6 +14392,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options.ridge_floor,
                 joint_bundle,
             );
+            // CHEAP CONDITIONING PRE-CHECK (always-on robustness, zero-cost on
+            // easy/large fits). Before paying for the dense joint-Hessian
+            // materialization + `O(p³)` reduced eigendecomposition inside the
+            // Jeffreys term, ask whether the term is PROVABLY skippable from a few
+            // matrix-free Hessian-vector products against the source we just built.
+            // When `true`, the exact conditioning gate is certain to return the
+            // zero term, so every Jeffreys call this cycle short-circuits to the
+            // exact-zero contribution WITHOUT forming anything dense — byte-
+            // identical to the gated-off path, and preserving the matrix-free path
+            // on wide well-conditioned fits. Only runs the estimate when a Jeffreys
+            // subspace exists and `total_p` is wide enough that the dense eigh is
+            // the cost we want to avoid (the helper itself gates on the size
+            // threshold and conservatively returns `false` if unsure). Computed
+            // once per inner cycle and reused across the cycle's head-KKT, step,
+            // and trial-value calls; the conditioning changes slowly across cycles
+            // so re-estimating per cycle (one `O(p·k)` burst) is already cheap
+            // against the work it guards.
+            let jeffreys_skippable_this_cycle: bool =
+                if joint_jeffreys_subspace.is_some() {
+                    jeffreys_term_skippable_for_source(
+                        &joint_hessian_source,
+                        total_p,
+                        joint_solver_diagonal_ridge,
+                    )
+                    .unwrap_or(false)
+                } else {
+                    false
+                };
             let joint_trust_metric_diag = match &joint_hessian_source {
                 JointHessianSource::Dense(h_joint) => joint_penalty_preconditioner_diag(
                     &h_joint.diag().to_owned(),
@@ -14416,9 +14444,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // residual_tol`) can never fire on the near-separating span, even
             // when the iterate is the Firth optimum. No-op when the Jeffreys
             // term is unavailable or condition-gated to zero.
-            let head_kkt_gradient: Option<Array1<f64>> = if let Some(z_joint) =
-                joint_jeffreys_subspace.as_ref()
-            {
+            let head_kkt_gradient: Option<Array1<f64>> = if jeffreys_skippable_this_cycle {
+                // Pre-check certified well-conditioned ⇒ exact term is the zero
+                // contribution ⇒ ∇Φ = 0, so the head-KKT gradient is unchanged.
+                None
+            } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                 match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
                     Some((_phi, grad_phi, _hphi)) if grad_phi.len() == grad_joint.len() => {
                         Some(&grad_joint + &grad_phi)
@@ -14497,7 +14527,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_bundle,
                     );
                     let mut rhs_step = &grad_joint - &penalty_beta_joint;
-                    if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                    if !jeffreys_skippable_this_cycle
+                        && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
+                    {
+                        // Skipped when the cheap pre-check certifies well-
+                        // conditioning: ∇Φ = 0 and H_Φ = 0 there, so neither
+                        // rhs_step nor lhs change — byte-identical to the gated-off
+                        // dense path, without forming dense H/H_Φ.
                         match custom_family_joint_jeffreys_term(
                             family, &states, specs, &ranges, z_joint,
                         )? {
@@ -14636,8 +14672,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // — and `hphi` is materialized once per cycle regardless, so the
                     // matvec adds only one O(p²) HVP, preserving the matrix-free
                     // path's asymptotics where Firth is negligible (term = `None`).
+                    // Cheap pre-check certified well-conditioned ⇒ the exact term
+                    // is the zero contribution (∇Φ = 0, H_Φ = 0). Short-circuit to
+                    // `None` WITHOUT materializing the dense joint Hessian or running
+                    // the O(p³) reduced eigendecomposition — this is the matrix-free
+                    // PCG hot path, where forming a dense p×p H_Φ every cycle was the
+                    // regression. Byte-identical to the gated-off dense path: `rhs`
+                    // is left as `∇ℓ − S_λβ` and no H_Φ is folded into the matvec.
                     let inner_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
-                        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                        if jeffreys_skippable_this_cycle {
+                            None
+                        } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                             match custom_family_joint_jeffreys_term(
                                 family, &states, specs, &ranges, z_joint,
                             )? {
