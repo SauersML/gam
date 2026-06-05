@@ -15,14 +15,14 @@ import gamfit
 
 
 def main() -> None:
-    rng = np.random.default_rng(674)
-    n = 300
+    rng = np.random.default_rng(0)
+    n = 400
     theta = rng.uniform(0.0, 1.0, n)
     x = np.column_stack([
         np.cos(2.0 * np.pi * theta),
         np.sin(2.0 * np.pi * theta),
     ])
-    x += 0.14 * rng.standard_normal(x.shape)
+    x += 0.18 * rng.standard_normal(x.shape)
 
     fit = gamfit.sae_manifold_fit(
         x,
@@ -36,7 +36,7 @@ def main() -> None:
         smoothness_weight=0.01,
         max_iter=40,
         learning_rate=1.0,
-        random_state=674,
+        random_state=0,
     )
 
     atom = 0
