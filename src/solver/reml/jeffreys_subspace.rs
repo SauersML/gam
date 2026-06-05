@@ -57,7 +57,71 @@ const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 /// conditioned direction is still 8 orders of magnitude from the absolute floor
 /// (`REDUCED_INFO_RELATIVE_FLOOR = 1e-10`), i.e. comfortably identified rather
 /// than separating, so nothing the term would actually bound is gated out.
+///
+/// NOTE: a relative ratio is SCALE-FREE in `n` — it cannot, on its own, tell a
+/// near-separating direction (absolute curvature `O(1)`) from a well-identified
+/// one (absolute curvature `O(n)`). At small `n` an absolutely-near-separating
+/// direction can still clear this relative gate (if `λ_max` is also small), so it
+/// is paired with the ABSOLUTE gate below; the term fires when EITHER gate
+/// reports under-identification (see [`conditioning_gate_skips`]).
 const CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
+
+/// Absolute-curvature conditioning gate (the `n`-aware half of the gate).
+///
+/// Separation is an ABSOLUTE statement about curvature, not a relative one: a
+/// direction is near-separating when the data place `O(1)` Fisher information on
+/// it — a handful of near-boundary observations — REGARDLESS of the sample size
+/// `n`. A well-identified direction instead accumulates `O(n)` information (each
+/// of `n` observations contributes `O(1)` curvature). The reduced information
+/// `H_id = Z_Jᵀ H Z_J` here IS that observed/expected Fisher information (an
+/// un-normalised sum over observations, NOT a per-observation average), so its
+/// smallest eigenvalue `λ_min` is `O(n)` on an identified direction and `O(1)`
+/// on a separating one — the two regimes are separated by an absolute `O(1)`
+/// scale that does not move with `n`.
+///
+/// We therefore ALSO fire the Jeffreys term whenever `λ_min` falls below this
+/// absolute scale, independent of the relative ratio. This catches the
+/// small-`n` admixture-cline / near-separation regime the relative gate misses,
+/// where `λ_max` is itself modest so a near-zero `λ_min` can still satisfy
+/// `λ_min/λ_max ≥ 1e-8`.
+///
+/// THRESHOLD CHOICE. One observation contributes at most `O(1)` curvature to a
+/// unit-scale direction (e.g. a binomial Fisher weight `p(1−p) ≤ 1/4`, a
+/// Gaussian unit weight `1`), so a direction carrying less than a single
+/// observation's worth of information is, by construction, not identified by the
+/// data and is the regime Firth exists to stabilise. We set the gate at `1.0`:
+/// `λ_min < 1` ⇒ the direction holds under one observation-equivalent of
+/// curvature ⇒ treat as near-separating and fire the term. This is conservative
+/// (it never fires on a genuinely well-conditioned large-`n` fit, whose
+/// `λ_min = O(n) ≫ 1`, so the byte-identical clean-fit guarantee is preserved)
+/// while catching absolute near-separation at any `n`. The design is assumed to
+/// be on a standardized/O(1)-column scale, which the upstream reduction already
+/// enforces; the floor below (`REDUCED_INFO_ABSOLUTE_FLOOR = 1e-12`) keeps the
+/// log-det finite once the term fires.
+const CONDITIONING_GATE_ABSOLUTE: f64 = 1.0;
+
+/// Shared conditioning-gate predicate for the Jeffreys term, evaluated from the
+/// reduced-information spectrum (`λ_min`, `λ_max`). Returns `true` when the term
+/// should be SKIPPED (zero contribution) because the reduced information is
+/// well-conditioned — both relatively (`λ_min/λ_max ≥ CONDITIONING_GATE_RELATIVE`)
+/// AND absolutely (`λ_min ≥ CONDITIONING_GATE_ABSOLUTE`). If EITHER test reports
+/// under-identification the gate does NOT skip and the floored log-det term
+/// fires. Centralised so every call site (objective value, gradient/curvature,
+/// and the `H_Φ` directional derivative) uses byte-identical gating — any
+/// divergence would reintroduce the value/derivative mismatch the term removes.
+#[inline]
+fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
+    if lambda_max <= 0.0 {
+        // Degenerate / non-positive spectrum: not well-conditioned, never skip.
+        return false;
+    }
+    if !lambda_min.is_finite() {
+        return false;
+    }
+    let relative_ok = lambda_min / lambda_max >= CONDITIONING_GATE_RELATIVE;
+    let absolute_ok = lambda_min >= CONDITIONING_GATE_ABSOLUTE;
+    relative_ok && absolute_ok
+}
 
 /// Orthonormal basis of one block's Jeffreys span.
 ///
@@ -202,16 +266,20 @@ where
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
     // CONDITIONING GATE ("no cost on easy fits"). The eigendecomposition we just
     // computed gives the full reduced spectrum; the worst-conditioned direction
-    // is `λ_min`. When `λ_min/λ_max` is above the gate, every direction is
-    // identified by the data at comparable `O(n)` strength, the self-limiting
-    // Jeffreys term is negligible, and we skip it outright (zero value, gradient
-    // and curvature) so a clean/well-conditioned fit stays byte-identical to the
-    // un-penalized inner Newton. Only an ill-conditioned / near-separating
-    // reduced information falls through to the floored log-det term below, which
-    // is the `O(1)`-bounding curvature this machinery exists to supply.
-    if lambda_max > 0.0 {
+    // is `λ_min`. We skip the term (zero value, gradient and curvature) only when
+    // the reduced information is well-conditioned BOTH relatively
+    // (`λ_min/λ_max ≥ CONDITIONING_GATE_RELATIVE`) AND absolutely
+    // (`λ_min ≥ CONDITIONING_GATE_ABSOLUTE`, the `n`-aware criterion): every
+    // direction is then identified by the data at `O(n)` strength, the
+    // self-limiting Jeffreys term is negligible, and a clean/well-conditioned fit
+    // stays byte-identical to the un-penalized inner Newton. If EITHER gate
+    // reports under-identification — including an absolutely-near-separating
+    // direction at small `n` that the scale-free relative ratio alone would miss
+    // — we fall through to the floored log-det term below, the `O(1)`-bounding
+    // curvature this machinery exists to supply.
+    {
         let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        if lambda_min.is_finite() && lambda_min / lambda_max >= CONDITIONING_GATE_RELATIVE {
+        if conditioning_gate_skips(lambda_min, lambda_max) {
             return Ok((0.0, Array1::zeros(p), Array2::zeros((p, p))));
         }
     }
@@ -383,9 +451,13 @@ where
         format!("joint_jeffreys_hphi_directional_derivative: eigendecomposition failed: {e}")
     })?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-    if lambda_max > 0.0 {
+    {
+        // Same combined relative+absolute gate as the value/gradient path, via the
+        // shared predicate, so the derivative is byte-identically consistent with
+        // the `H_Φ` the objective uses (any divergence reintroduces the
+        // value/derivative mismatch this term exists to remove).
         let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        if lambda_min.is_finite() && lambda_min / lambda_max >= CONDITIONING_GATE_RELATIVE {
+        if conditioning_gate_skips(lambda_min, lambda_max) {
             // Gated out ⇒ H_Φ ≡ 0 in a neighborhood ⇒ its drift vanishes.
             return Ok(Array2::zeros((p, p)));
         }

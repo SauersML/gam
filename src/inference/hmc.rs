@@ -4405,9 +4405,14 @@ impl HamiltonianTarget<Array1<f64>> for GaussianModeTarget {
 /// posterior summary the optimizer cascade would have produced on success: a
 /// finite mode, per-coordinate posterior SEs, and the raw draws (so callers can
 /// form calibrated intervals for any derived quantity). The `rhat`/`ess`
-/// fields report the sampling diagnostics; even a marginal mixing result is a
-/// valid honest summary here (the target is exactly Gaussian), so this is
-/// reported for transparency rather than used as a pass/fail gate.
+/// fields report the sampling diagnostics. The target is exactly Gaussian, so a
+/// well-mixed chain is an honest summary — but the seed precision can be a
+/// Jeffreys-augmented Hessian at a NON-converged mode, where a divergent
+/// (`rhat ≫ 1`) / near-zero-`ess` chain would otherwise produce a finite, narrow
+/// interval around an arbitrary point on an unidentified direction. Callers MUST
+/// therefore gate on `rhat`/`ess` before treating the sampled covariance as
+/// data-driven (see `fit_custom_family`, which checks `rhat ≤ 1.05` and an
+/// ESS floor and inflates / flags the result as low-confidence otherwise).
 pub struct GaussianModePosterior {
     /// Coefficient draws in original (un-whitened) space: `(n_draws, dim)`.
     pub samples: Array2<f64>,
