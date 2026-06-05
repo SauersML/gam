@@ -778,8 +778,7 @@ fn validate_cli_firth_configuration(ctx: CliFirthValidation<'_>) -> Result<(), C
 
     Err(CliError::IncompatibleConfig {
         reason: format!(
-            "--firth currently requires {}; resolved family is {}",
-            LikelihoodSpec::binomial_logit().pretty_name(),
+            "--firth currently requires a Binomial inverse link with a Fisher-weight jet; resolved family is {}",
             ctx.family.pretty_name()
         ),
     })
@@ -10092,9 +10091,23 @@ mod tests {
 
         let err = err.to_string();
         assert!(
-            err.contains("Binomial Logit"),
+            err.contains("Binomial inverse link with a Fisher-weight jet"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[test]
+    fn cli_firth_validation_accepts_binomial_cloglog() {
+        let link_choice =
+            parse_link_choice(Some("binomial-cloglog"), false).expect("parse cloglog link");
+        validate_cli_firth_configuration(CliFirthValidation {
+            enabled: true,
+            family: LikelihoodSpec::binomial_cloglog(),
+            predict_noise: false,
+            is_survival: false,
+            link_choice: Some(&link_choice),
+        })
+        .expect("CLogLog has a Fisher-weight jet and must reach the Firth path");
     }
 
     #[test]

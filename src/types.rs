@@ -989,7 +989,16 @@ impl FamilySpecKind {
 
     #[inline]
     pub const fn supports_firth(&self) -> bool {
-        matches!(self, Self::BinomialLogit)
+        matches!(
+            self,
+            Self::BinomialLogit
+                | Self::BinomialProbit
+                | Self::BinomialCLogLog
+                | Self::BinomialLatentCLogLog(_)
+                | Self::BinomialSas(_)
+                | Self::BinomialBetaLogistic(_)
+                | Self::BinomialMixture(_)
+        )
     }
 }
 
@@ -1235,7 +1244,8 @@ impl LikelihoodSpec {
 
     #[inline]
     pub fn supports_firth(&self) -> bool {
-        self.kind().supports_firth()
+        matches!(self.response, ResponseFamily::Binomial)
+            && crate::mixture_link::inverse_link_has_fisher_weight_jet(&self.link)
     }
 
     /// Family-level fixed-dispersion contract. Returns the dispersion parameter
