@@ -64,6 +64,15 @@ impl RobustConfig {
                 firth_general: true,
                 orthogonalize_confounds: true,
             },
+            // The principled, zero-downside cure: full identifiable-span Jeffreys
+            // ONLY, no orthogonal-reparameterization design surgery. Jeffreys is
+            // self-limiting, so it cures near-separation (in `ker(S)` OR
+            // `range(S)`) by making the inner objective coercive without dropping
+            // any identifiable design direction.
+            crate::solver::workflow::RobustIdentification::FirthOnly => Self {
+                firth_general: true,
+                orthogonalize_confounds: false,
+            },
         }
     }
 }
