@@ -116,7 +116,9 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayViewMut1, Cow
 use std::sync::{Arc, RwLock};
 
 use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
-use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
+use crate::linalg::lanczos::{
+    SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
+};
 use crate::terms::basis::{BasisError, DuchonNullspaceOrder, radial_basis_cartesian_derivative};
 use crate::terms::penalties::PenaltyManifest;
 use crate::terms::penalty_op::PenaltyOp;
@@ -8213,20 +8215,10 @@ impl FrozenAnalyticPenaltyOp {
         .map_err(|e| {
             format!("FrozenAnalyticPenaltyOp::log_det_plus_lambda_i SLQ Lanczos failed: {e}")
         })?;
-        let k = eigen.eigenvalues.len();
-        let mut quad = 0.0;
-        for j in 0..k {
-            let theta = eigen.eigenvalues[j];
-            if !theta.is_finite() || theta <= 0.0 {
-                return Err(format!(
-                    "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i expected SPD S+λI, \
-                     Lanczos Ritz value {j} is {theta:.3e}"
-                ));
-            }
-            let weight = eigen.eigenvectors[[0, j]] * eigen.eigenvectors[[0, j]];
-            quad += weight * theta.ln();
-        }
-        Ok(quad)
+        symmetric_lanczos_log_quadrature(
+            &eigen,
+            "FrozenAnalyticPenaltyOp::log_det_plus_lambda_i expected SPD S+λI",
+        )
     }
 }
 

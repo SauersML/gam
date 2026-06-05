@@ -45,7 +45,9 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::FaerEigh;
-use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
+use crate::linalg::lanczos::{
+    SymmetricLanczosOptions, symmetric_lanczos_eigenpairs, symmetric_lanczos_log_quadrature,
+};
 use crate::linalg::triangular::cholesky_solve_vector;
 use crate::solver::arrow_schur::{ArrowFactorCache, ArrowSchurSystem};
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
@@ -450,19 +452,7 @@ fn lanczos_log_quadrature_hvp(
         },
     )
     .map_err(|e| format!("evidence HVP SLQ Lanczos failed: {e}"))?;
-    let k = eigen.eigenvalues.len();
-    let mut quad = 0.0_f64;
-    for j in 0..k {
-        let theta = eigen.eigenvalues[j];
-        if !theta.is_finite() || theta <= 0.0 {
-            return Err(format!(
-                "evidence HVP SLQ expected SPD Hessian, Lanczos Ritz value {j} is {theta:.3e}"
-            ));
-        }
-        let weight = eigen.eigenvectors[[0, j]] * eigen.eigenvectors[[0, j]];
-        quad += weight * theta.ln();
-    }
-    Ok(quad)
+    symmetric_lanczos_log_quadrature(&eigen, "evidence HVP SLQ expected SPD Hessian")
 }
 
 #[inline]
