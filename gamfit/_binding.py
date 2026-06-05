@@ -27,6 +27,22 @@ class RustExtensionUnavailableError(ImportError):
     """
 
 
+def _normalize_rust_exception_modules(module: ModuleType) -> None:
+    """Make Rust-defined exception classes import-addressable for pickle."""
+    gam_error = getattr(module, "GamError", None)
+    if not isinstance(gam_error, type):
+        return
+    for value in vars(module).values():
+        if not isinstance(value, type):
+            continue
+        try:
+            is_gam_error = issubclass(value, gam_error)
+        except TypeError:
+            continue
+        if is_gam_error:
+            value.__module__ = "gamfit._rust"
+
+
 @lru_cache(maxsize=1)
 def rust_module() -> ModuleType:
     prepare_cuda_libraries()
@@ -37,6 +53,7 @@ def rust_module() -> ModuleType:
         raise RustExtensionUnavailableError(
             "gamfit._rust is not available. Build or install the package with maturin first."
         ) from exc
+    _normalize_rust_exception_modules(module)
     assert_no_cuda_library_conflicts("using gamfit._rust")
     return module
 
