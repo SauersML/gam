@@ -76,6 +76,21 @@ mod cuda {
 
     pub(super) fn cholesky_lower(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
         let (_, stream) = context_and_stream()?;
+        cholesky_lower_on_stream(hessian, &stream)
+    }
+
+    pub(super) fn cholesky_lower_on_ordinal(
+        ordinal: usize,
+        hessian: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let (_, stream) = context_and_stream_for(ordinal)?;
+        cholesky_lower_on_stream(hessian, &stream)
+    }
+
+    fn cholesky_lower_on_stream(
+        hessian: ArrayView2<'_, f64>,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    ) -> Result<Array2<f64>, String> {
         let (p, p2) = hessian.dim();
         if p == 0 || p != p2 {
             return Err("Cholesky factorization dimension mismatch".to_string());
@@ -971,4 +986,12 @@ pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, S
         }
         cuda::cholesky_lower(hessian)
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn cholesky_lower_on_ordinal_gpu(
+    ordinal: usize,
+    hessian: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    cuda::cholesky_lower_on_ordinal(ordinal, hessian)
 }
