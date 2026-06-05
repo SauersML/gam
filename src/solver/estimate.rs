@@ -7575,12 +7575,14 @@ mod estimate_policy_tests {
         let x = array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]];
         let y = array![0.0, 0.0, 1.0, 1.0];
         let w = Array1::ones(y.len());
-        let diagnostic = detect_prefit_binomial_single_column_separation(
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let diagnostic = detect_prefit_binomial_single_column_separation_in_design(
             y.view(),
             w.view(),
-            x.view(),
+            &design,
             &[true, true],
         )
+        .expect("separation screen must complete without a layout error")
         .expect("second column exactly separates the binary response");
 
         assert_eq!(diagnostic.column_index, 1);
@@ -7594,24 +7596,27 @@ mod estimate_policy_tests {
         let binary_y = array![0.0, 0.0, 1.0, 1.0];
         let fractional_y = array![0.0, 0.25, 0.75, 1.0];
         let w = Array1::ones(binary_y.len());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
 
         assert_eq!(
-            detect_prefit_binomial_single_column_separation(
+            detect_prefit_binomial_single_column_separation_in_design(
                 binary_y.view(),
                 w.view(),
-                x.view(),
+                &design,
                 &[true, false],
-            ),
+            )
+            .expect("separation screen must complete without a layout error"),
             None,
             "a separating column with effective quadratic penalty should not be pre-fit rejected"
         );
         assert_eq!(
-            detect_prefit_binomial_single_column_separation(
+            detect_prefit_binomial_single_column_separation_in_design(
                 fractional_y.view(),
                 w.view(),
-                x.view(),
+                &design,
                 &[true, true],
-            ),
+            )
+            .expect("separation screen must complete without a layout error"),
             None,
             "fractional binomial proportions are not exact binary separation"
         );
