@@ -19860,7 +19860,13 @@ mod tests {
         let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, -1.0]];
         let eta = array![0.0, 0.4, -0.2];
         let firth_op = std::sync::Arc::new(
-            super::super::FirthDenseOperator::build(&x, &eta).expect("firth operator"),
+            super::super::RemlState::build_firth_dense_operator_for_link(
+                crate::types::StandardLink::Logit,
+                &x,
+                &eta,
+                ndarray::Array1::ones(x.nrows()).view(),
+            )
+            .expect("firth operator"),
         );
         let firth_value = firth_op.jeffreys_logdet();
 

@@ -313,23 +313,22 @@ impl<'a> RemlState<'a> {
         out
     }
 
-    /// Link-aware wrapper around
-    /// [`FirthDenseOperator::build_with_observation_weights_for_link`]. The REML
-    /// callsites resolve the Fisher-weight link via `reml_robust_jeffreys_link`
-    /// and pass it here; `StandardLink::Logit` reproduces the historical
-    /// logit-pinned build byte-for-byte, and the link-general Jeffreys path
-    /// (probit, …) flows through with the resolved link.
+    /// Link-aware dense Firth/Jeffreys builder. The REML callsites resolve the
+    /// Fisher-weight link via `reml_robust_jeffreys_link` and pass it here;
+    /// `StandardLink::Logit` reproduces the historical logit-pinned build
+    /// byte-for-byte, and the link-general Jeffreys path (probit, ...) flows
+    /// through with the resolved link.
     pub(super) fn build_firth_dense_operator_for_link(
         link: StandardLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: ndarray::ArrayView1<'_, f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
-        FirthDenseOperator::build_with_observation_weights_for_link(
+        FirthDenseOperator::build_with_observation_weights_impl(
             link,
             x_dense,
             eta,
-            observation_weights,
+            Some(observation_weights),
         )
     }
 
@@ -420,30 +419,21 @@ impl FirthDenseOperator {
         kahan_sum((0..diag.len()).map(|i| diag[i] * matrix[[i, i]]))
     }
 
-    /// Logit-pinned convenience constructors retained for the unit tests, which
-    /// assert the link-general `build_*_for_link` path reproduces the historical
-    /// logit operator. Production callers always resolve a `StandardLink` and use
-    /// the `*_for_link` constructors directly.
-    #[cfg(test)]
-    pub(crate) fn build(
+    pub(crate) fn build_for_link(
+        link: StandardLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
-        Self::build_with_observation_weights_impl(StandardLink::Logit, x_dense, eta, None)
+        Self::build_with_observation_weights_impl(link, x_dense, eta, None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn build_with_observation_weights(
+    pub(crate) fn build_with_observation_weights_for_link(
+        link: StandardLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
         observation_weights: ndarray::ArrayView1<'_, f64>,
     ) -> Result<FirthDenseOperator, EstimationError> {
-        Self::build_with_observation_weights_impl(
-            StandardLink::Logit,
-            x_dense,
-            eta,
-            Some(observation_weights),
-        )
+        Self::build_with_observation_weights_impl(link, x_dense, eta, Some(observation_weights))
     }
 
     #[inline]
@@ -2684,19 +2674,44 @@ mod tests {
     use crate::mixture_link::logit_inverse_link_jet5;
     use ndarray::{Array1, Array2, array};
 
+    fn build_logit_firth_dense_operator(
+        x_dense: &Array2<f64>,
+        eta: &Array1<f64>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
+        FirthDenseOperator::build_with_observation_weights_impl(
+            StandardLink::Logit,
+            x_dense,
+            eta,
+            None,
+        )
+    }
+
+    fn build_weighted_logit_firth_dense_operator(
+        x_dense: &Array2<f64>,
+        eta: &Array1<f64>,
+        observation_weights: ndarray::ArrayView1<'_, f64>,
+    ) -> Result<FirthDenseOperator, EstimationError> {
+        FirthDenseOperator::build_with_observation_weights_impl(
+            StandardLink::Logit,
+            x_dense,
+            eta,
+            Some(observation_weights),
+        )
+    }
+
     fn logisticweight(eta: f64) -> f64 {
         logit_inverse_link_jet5(eta).d1
     }
 
     fn firthphivalue(x: &Array2<f64>, beta: &Array1<f64>) -> f64 {
         let eta = x.dot(beta);
-        let op = FirthDenseOperator::build(x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(x, &eta).expect("firth operator");
         op.jeffreys_logdet()
     }
 
     fn firthgradphi(x: &Array2<f64>, beta: &Array1<f64>) -> Array1<f64> {
         let eta = x.dot(beta);
-        let op = FirthDenseOperator::build(x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(x, &eta).expect("firth operator");
         op.jeffreys_beta_gradient()
     }
 
@@ -2706,9 +2721,8 @@ mod tests {
         observation_weights: &Array1<f64>,
     ) -> f64 {
         let eta = x.dot(beta);
-        let op =
-            FirthDenseOperator::build_with_observation_weights(x, &eta, observation_weights.view())
-                .expect("weighted firth operator");
+        let op = build_weighted_logit_firth_dense_operator(x, &eta, observation_weights.view())
+            .expect("weighted firth operator");
         op.jeffreys_logdet()
     }
 
@@ -2766,7 +2780,7 @@ mod tests {
         ];
         let beta = array![0.15, -0.6, 0.35];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
 
         let h = 1e-2_f64;
         let w = |z: f64| logisticweight(z);
@@ -2811,7 +2825,7 @@ mod tests {
         let beta = array![0.2, -0.45, 0.25];
         let observation_weights = array![1.0, 0.5, 2.0, 1.5, 0.75];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build_with_observation_weights(
+        let op = build_weighted_logit_firth_dense_operator(
             &x,
             &eta,
             observation_weights.view(),
@@ -2866,13 +2880,13 @@ mod tests {
             );
         }
 
-        let op_full = FirthDenseOperator::build_with_observation_weights(
+        let op_full = build_weighted_logit_firth_dense_operator(
             &x_full,
             &eta_full,
             observation_weights.view(),
         )
         .expect("full firth operator");
-        let op_reduced = FirthDenseOperator::build_with_observation_weights(
+        let op_reduced = build_weighted_logit_firth_dense_operator(
             &x_reduced,
             &eta_reduced,
             observation_weights.view(),
@@ -2927,13 +2941,13 @@ mod tests {
             );
         }
 
-        let op = FirthDenseOperator::build_with_observation_weights(
+        let op = build_weighted_logit_firth_dense_operator(
             &x,
             &eta,
             observation_weights.view(),
         )
         .expect("original firth operator");
-        let op_reparameterized = FirthDenseOperator::build_with_observation_weights(
+        let op_reparameterized = build_weighted_logit_firth_dense_operator(
             &x_reparameterized,
             &eta_reparameterized,
             observation_weights.view(),
@@ -2965,7 +2979,7 @@ mod tests {
         let beta = array![0.25, -0.5];
         let eta = x.dot(&beta);
         let observation_weights = array![1.0, 0.5, 1.75, 0.9, 1.2];
-        let op = FirthDenseOperator::build_with_observation_weights(
+        let op = build_weighted_logit_firth_dense_operator(
             &x,
             &eta,
             observation_weights.view(),
@@ -2999,7 +3013,7 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
 
         let u = array![0.3, -0.2, 0.4];
         let v = array![-0.5, 0.1, 0.25];
@@ -3039,7 +3053,7 @@ mod tests {
         ];
         let beta = array![0.08, -0.22, 0.27];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
         let u = Array1::from_vec(vec![0.25, -0.4, 0.35]);
         let dir = op.direction_from_deta(x.dot(&u));
 
@@ -3079,7 +3093,7 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
         let analytic = op.exact_tau_kernel(&x_tau, &beta, false).phi_tau_partial;
 
         let h = 1e-6;
@@ -3113,7 +3127,7 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
         let analytic = op.exact_tau_kernel(&x_tau, &beta, false).gphi_tau;
 
         let h = 1e-6;
@@ -3160,7 +3174,7 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
 
         let analytic = op
             .exact_tau_tau_kernel(&x_tau_i, &x_tau_j, None, &beta, false)
@@ -3169,7 +3183,7 @@ mod tests {
         let h = 1e-5_f64;
         let eval_phi_tau_i = |x_eval: &Array2<f64>| -> f64 {
             let eta_e = x_eval.dot(&beta);
-            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed op");
+            let op_e = build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed op");
             op_e.exact_tau_kernel(&x_tau_i, &beta, false)
                 .phi_tau_partial
         };
@@ -3216,7 +3230,7 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
 
         let analytic = op
             .exact_tau_tau_kernel(&x_tau_i, &x_tau_j, None, &beta, false)
@@ -3225,7 +3239,7 @@ mod tests {
         let h = 1e-5_f64;
         let eval_gphi_tau_i = |x_eval: &Array2<f64>| -> Array1<f64> {
             let eta_e = x_eval.dot(&beta);
-            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed op");
+            let op_e = build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed op");
             op_e.exact_tau_kernel(&x_tau_i, &beta, false).gphi_tau
         };
         let x_plus = &x + &(h * &x_tau_j);
@@ -3296,7 +3310,7 @@ mod tests {
         ];
         let beta = array![0.1, -0.25, 0.2];
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
         let p = x.ncols();
 
         // Reproducible small rhs block (p × m).
@@ -3366,7 +3380,7 @@ mod tests {
         let h = 1e-5_f64;
         let fd_block = |x_eval: &Array2<f64>| -> Array2<f64> {
             let eta_e = x_eval.dot(&beta);
-            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed firth operator");
+            let op_e = build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed firth operator");
             let x_tau_i_r = op_e.reduce_explicit_design(&x_tau_i);
             let deta_i_e = x_tau_i.dot(&beta);
             let (dot_i_i_e, dot_h_i_e) = op_e.dot_i_and_h_from_reduced(&x_tau_i_r, &deta_i_e);
@@ -3396,7 +3410,7 @@ mod tests {
         // double-cover the primitive.
         let fd_block_j = |x_eval: &Array2<f64>| -> Array2<f64> {
             let eta_e = x_eval.dot(&beta);
-            let op_e = FirthDenseOperator::build(x_eval, &eta_e).expect("perturbed firth operator");
+            let op_e = build_logit_firth_dense_operator(x_eval, &eta_e).expect("perturbed firth operator");
             let x_tau_j_r = op_e.reduce_explicit_design(&x_tau_j);
             let deta_j_e = x_tau_j.dot(&beta);
             let (dot_i_j_e, dot_h_j_e) = op_e.dot_i_and_h_from_reduced(&x_tau_j_r, &deta_j_e);
@@ -3464,7 +3478,7 @@ mod tests {
         let v = array![0.3, 0.2, -0.15];
 
         let eta = x.dot(&beta);
-        let op = FirthDenseOperator::build(&x, &eta).expect("firth operator");
+        let op = build_logit_firth_dense_operator(&x, &eta).expect("firth operator");
         let p = x.ncols();
 
         // Reproducible small rhs block (p × m).
@@ -3506,7 +3520,7 @@ mod tests {
         let h = 1e-5_f64;
         let single_tau_apply = |beta_eval: &Array1<f64>| -> Array2<f64> {
             let eta_e = x.dot(beta_eval);
-            let op_e = FirthDenseOperator::build(&x, &eta_e).expect("perturbed firth operator");
+            let op_e = build_logit_firth_dense_operator(&x, &eta_e).expect("perturbed firth operator");
             let x_tau_r = op_e.reduce_explicit_design(&x_tau);
             let deta_e = x_tau.dot(beta_eval);
             let (dot_i_e, dot_h_e) = op_e.dot_i_and_h_from_reduced(&x_tau_r, &deta_e);
