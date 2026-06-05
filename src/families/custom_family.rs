@@ -11895,7 +11895,11 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         )
         .firth_general;
     let logdet_jeffreys_hphi: Option<Array2<f64>> = if robust_logdet_firth {
-        match build_joint_jeffreys_subspace(specs, &ranges)? {
+        match build_joint_jeffreys_subspace(
+            specs,
+            &ranges,
+            crate::estimate::reml::jeffreys_subspace::JeffreysSpan::FullIdentifiable,
+        )? {
             Some(z_joint) => {
                 custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
                     .map(|(_phi, _grad, hphi)| hphi)
@@ -14129,7 +14133,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         )
         .firth_general;
         let joint_jeffreys_subspace = if robust_firth_armed {
-            build_joint_jeffreys_subspace(specs, &ranges)?
+            build_joint_jeffreys_subspace(
+                specs,
+                &ranges,
+                crate::estimate::reml::jeffreys_subspace::JeffreysSpan::FullIdentifiable,
+            )?
         } else {
             None
         };
@@ -22056,22 +22064,33 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
         .collect()
 }
 
-/// Build the joint under-identified basis `Z_J` (block-diagonal stack of each
-/// block's penalty-null span) for the universal Jeffreys/Firth robustness term.
+/// Build the joint Jeffreys/Firth basis `Z_J` (block-diagonal stack of each
+/// block's per-block span) for the universal robustness term.
 ///
-/// Each block contributes the null space of its aggregate (unit-weight) penalty
-/// `sum_k S_k` — the parametric + smooth-structural-null directions that carry
-/// neither data information nor a proper wiggliness prior. Penalized smooth
-/// directions are excluded (they already have a proper prior). The per-block
-/// bases are embedded block-diagonally into the joint `total_p x m_total`
-/// matrix. Returns `None` when no block has an under-identified direction (the
-/// system is already proper; no Jeffreys term is needed).
+/// `span` selects what each block contributes:
+///   * [`JeffreysSpan::PenaltyNullspace`] (legacy): the null space of the
+///     aggregate penalty `sum_k S_k` only — the parametric + smooth-structural-
+///     null directions. Penalized smooth directions are excluded. This CANNOT
+///     reach a near-separation living in `range(S)` (a penalized spline
+///     direction), which is exactly the residual BMS-probit pathology.
+///   * [`JeffreysSpan::FullIdentifiable`] (PRINCIPLED cure): the FULL reduced
+///     coefficient span (`I_p` per block). Because the Jeffreys score is `O(1)`
+///     against the data's `O(n)` Fisher information, applying it on the full
+///     span is the `O(1/n)` Firth bias correction on data-identified directions
+///     (no bias on genuine smooth fits) and the missing `O(1)`-bounding
+///     curvature on ANY near-separating direction — penalized or not — so the
+///     inner objective becomes coercive with a finite unique minimizer.
+///
+/// The per-block bases are embedded block-diagonally into the joint
+/// `total_p x m_total` matrix. Returns `None` when no block contributes a span
+/// (the system is already proper; no Jeffreys term is needed).
 ///
 /// Gated by the caller on `robust_identification != Off`; never runs in the
 /// released solver.
 fn build_joint_jeffreys_subspace(
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
+    span: crate::estimate::reml::jeffreys_subspace::JeffreysSpan,
 ) -> Result<Option<Array2<f64>>, String> {
     let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
     if total_p == 0 {
@@ -22110,6 +22129,7 @@ fn build_joint_jeffreys_subspace(
         let subspace = crate::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
             aggregate.view(),
             structural,
+            span,
         )?;
         m_total += subspace.span_dim();
         per_block.push(subspace.columns);
@@ -22227,7 +22247,11 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     if !robust_firth_armed {
         return Ok(None);
     }
-    let z_joint = match build_joint_jeffreys_subspace(specs, ranges)? {
+    let z_joint = match build_joint_jeffreys_subspace(
+        specs,
+        ranges,
+        crate::estimate::reml::jeffreys_subspace::JeffreysSpan::FullIdentifiable,
+    )? {
         Some(z) => z,
         None => return Ok(None),
     };
