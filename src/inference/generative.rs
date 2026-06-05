@@ -114,15 +114,13 @@ impl NoiseModel {
                 }
                 Ok(NoiseModel::NegativeBinomial { theta })
             }
-            ResponseFamily::Beta { phi } => {
-                let phi = *phi;
-                if !(phi.is_finite() && phi > 0.0) {
-                    crate::bail_invalid_estim!(
-                        "beta-regression phi must be finite and > 0; got {phi}"
-                    );
-                }
-                Ok(NoiseModel::Beta { phi })
-            }
+            ResponseFamily::Beta { .. } => Ok(NoiseModel::Beta {
+                phi: Self::require_positive_noise_parameter(
+                    likelihood,
+                    "Beta precision phi",
+                    gaussian_scale,
+                )?,
+            }),
             ResponseFamily::Gamma => Ok(NoiseModel::Gamma {
                 shape: Self::require_positive_noise_parameter(
                     likelihood,
@@ -441,8 +439,8 @@ mod tests {
             ),
             (
                 LikelihoodSpec::beta_logit(3.0),
-                None,
-                NoiseModel::Beta { phi: 3.0 },
+                Some(11.0),
+                NoiseModel::Beta { phi: 11.0 },
             ),
             (
                 LikelihoodSpec::gamma_log(),
