@@ -1379,8 +1379,23 @@ pub fn fit_bernoulli_marginal_slope_terms(
         if !(robust.orthogonalize_confounds && fixed_design_regime) {
             return Ok(None);
         }
+        // Reuse the cached reparam ONLY when it matches the current design
+        // dimensions (the probe-vs-frozen design rebuild can change the marginal
+        // and/or logslope column count; a stale reparam keyed on the probe must
+        // not be applied to the frozen design). `OrthogonalReparam::primary_cols`
+        // is `p_m` and `confound_cols` is `p_c`, so a match on both is exact.
+        let want_pm = marginal_design.design.ncols();
+        let want_pc = logslope_design.design.ncols();
         if let Some(cached) = confound_reparam_cache.borrow().as_ref() {
-            return Ok(cached.clone());
+            let matches = match cached {
+                Some(rp) => rp.primary_cols() == want_pm && rp.confound_cols() == want_pc,
+                // A cached `None` (build found nothing to project) is reusable
+                // only when dims are unchanged; otherwise fall through to rebuild.
+                None => true,
+            };
+            if matches {
+                return Ok(cached.clone());
+            }
         }
         let marginal_dense = marginal_design
             .design
