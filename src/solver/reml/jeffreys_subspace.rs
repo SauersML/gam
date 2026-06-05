@@ -67,7 +67,7 @@ const REDUCED_INFO_ABSOLUTE_FLOOR: f64 = 1e-12;
 /// one (absolute curvature `O(n)`). At small `n` an absolutely-near-separating
 /// direction can still clear this relative gate (if `λ_max` is also small), so it
 /// is paired with the ABSOLUTE gate below; the term fires when EITHER gate
-/// reports under-identification (see [`conditioning_gate_skips`]).
+/// reports under-identification (see [`conditioning_gate_weight`]).
 const CONDITIONING_GATE_RELATIVE: f64 = 1e-8;
 
 /// Absolute-curvature conditioning gate (the `n`-aware half of the gate).
@@ -175,10 +175,11 @@ fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
     w_abs.max(w_rel)
 }
 
-/// Shared conditioning-gate predicate: `true` when the term is fully skippable
-/// (smooth weight is exactly `0`). Used by the cheap matrix-free pre-check, which
-/// must clear the UPPER (`*_CLEAR`) knots to certify a full skip.
-#[inline]
+/// Test-only convenience predicate: `true` when the smooth gate weight is exactly
+/// `0` (the term is fully skippable). Non-test code uses `conditioning_gate_weight`
+/// directly so the transition band stays continuous; the cheap matrix-free
+/// pre-check certifies a full skip by clearing the UPPER (`*_CLEAR`) knots.
+#[cfg(test)]
 fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
     conditioning_gate_weight(lambda_min, lambda_max) == 0.0
 }
