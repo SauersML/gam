@@ -175,15 +175,6 @@ fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
     w_abs.max(w_rel)
 }
 
-/// Test-only convenience predicate: `true` when the smooth gate weight is exactly
-/// `0` (the term is fully skippable). Non-test code uses `conditioning_gate_weight`
-/// directly so the transition band stays continuous; the cheap matrix-free
-/// pre-check certifies a full skip by clearing the UPPER (`*_CLEAR`) knots.
-#[cfg(test)]
-fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
-    conditioning_gate_weight(lambda_min, lambda_max) == 0.0
-}
-
 /// Below this joint dimension the dense reduced eigendecomposition in
 /// [`joint_jeffreys_term`] is itself cheap (`O(p³)` with `p` in the tens — e.g.
 /// the BMS-probit `p≈51` fit), so the matrix-free pre-check below would only add
@@ -903,6 +894,14 @@ where
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// Test-only convenience predicate: `true` when the smooth gate weight is exactly
+    /// `0` (the term is fully skippable). Non-test code uses `conditioning_gate_weight`
+    /// directly so the transition band stays continuous; the cheap matrix-free
+    /// pre-check certifies a full skip by clearing the UPPER (`*_CLEAR`) knots.
+    fn conditioning_gate_skips(lambda_min: f64, lambda_max: f64) -> bool {
+        conditioning_gate_weight(lambda_min, lambda_max) == 0.0
+    }
 
     #[test]
     fn full_span_is_identity_regardless_of_penalty() {

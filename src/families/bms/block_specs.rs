@@ -269,109 +269,6 @@ fn widen_marginal_dense_with_influence(
     Ok(Arc::new(widened))
 }
 
-// The marginal↔logslope overlap penalty is no longer installed as a pinned
-// ridge (subsumed by the now-unconditional exact logslope orthogonalisation in
-// `build_reduced_logslope_reparam`). The geometry helper is retained under
-// `cfg(test)` because the basis-independence/weight-orthogonality unit tests
-// below exercise it directly as the canonical overlap-direction reference.
-#[cfg(test)]
-fn marginal_logslope_overlap_penalty(
-    marginal_design: &DesignMatrix,
-    logslope_design: &DesignMatrix,
-    z: &Array1<f64>,
-    row_metric: &Array1<f64>,
-    marginal_offset: &Array1<f64>,
-    logslope_offset: &Array1<f64>,
-    marginal_baseline: f64,
-    logslope_baseline: f64,
-    probit_scale: f64,
-) -> Result<Option<Array2<f64>>, String> {
-    let marginal =
-        marginal_design.try_to_dense_arc("marginal_logslope_overlap_penalty::marginal")?;
-    let logslope =
-        logslope_design.try_to_dense_arc("marginal_logslope_overlap_penalty::logslope")?;
-    let n = marginal.nrows();
-    if logslope.nrows() != n
-        || z.len() != n
-        || row_metric.len() != n
-        || marginal_offset.len() != n
-        || logslope_offset.len() != n
-    {
-        return Err(format!(
-            "marginal/logslope overlap penalty row mismatch: marginal={}, logslope={}, z={}, row_metric={}, marginal_offset={}, logslope_offset={}",
-            marginal.nrows(),
-            logslope.nrows(),
-            z.len(),
-            row_metric.len(),
-            marginal_offset.len(),
-            logslope_offset.len(),
-        ));
-    }
-    let p_m = marginal.ncols();
-    let p_g = logslope.ncols();
-    if p_m == 0 || p_g == 0 {
-        return Ok(None);
-    }
-    if !marginal_baseline.is_finite()
-        || !logslope_baseline.is_finite()
-        || !probit_scale.is_finite()
-        || probit_scale <= 0.0
-        || z.iter().any(|v| !v.is_finite())
-        || row_metric.iter().any(|v| !v.is_finite() || *v < 0.0)
-        || marginal_offset.iter().any(|v| !v.is_finite())
-        || logslope_offset.iter().any(|v| !v.is_finite())
-    {
-        return Err(
-            "marginal/logslope overlap penalty requires finite pilot geometry and finite non-negative row metric"
-                .to_string(),
-        );
-    }
-
-    let mut marginal_effective = Array2::<f64>::zeros((n, p_m));
-    let mut effective_logslope = Array2::<f64>::zeros((n, p_g));
-    for i in 0..n {
-        let q_i = marginal_offset[i] + marginal_baseline;
-        let g_i = logslope_offset[i] + logslope_baseline;
-        let sg = probit_scale * g_i;
-        let c_i = (1.0 + sg * sg).sqrt();
-        let logslope_factor = q_i * probit_scale * probit_scale * g_i / c_i + probit_scale * z[i];
-        for j in 0..p_m {
-            marginal_effective[[i, j]] = c_i * marginal[[i, j]];
-        }
-        for j in 0..p_g {
-            effective_logslope[[i, j]] = logslope_factor * logslope[[i, j]];
-        }
-    }
-    if effective_logslope.iter().all(|v| v.abs() <= f64::EPSILON) {
-        return Ok(None);
-    }
-
-    let mut gram = fast_xt_diag_x(&effective_logslope, row_metric);
-    let gram_scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
-    if !gram_scale.is_finite() || gram_scale <= 0.0 {
-        return Ok(None);
-    }
-    let projection_ridge = (gram_scale * 1.0e-10).max(f64::EPSILON);
-    for i in 0..p_g {
-        gram[[i, i]] += projection_ridge;
-    }
-    let cross = fast_xt_diag_y(&effective_logslope, row_metric, &marginal_effective);
-    let gram_view = FaerArrayView::new(&gram);
-    let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
-        .map_err(|e| format!("marginal/logslope overlap Gram factorization failed: {e}"))?;
-    let coeffs = factor
-        .solvemulti(&cross)
-        .map_err(|e| format!("marginal/logslope overlap projection solve failed: {e}"))?;
-    let projected_marginal = fast_ab(&effective_logslope, &coeffs);
-    let mut penalty = fast_xt_diag_y(&marginal_effective, row_metric, &projected_marginal);
-    penalty = (&penalty + &penalty.t()) * 0.5;
-    let max_abs = penalty.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    if !max_abs.is_finite() || max_abs <= 1.0e-12 {
-        return Ok(None);
-    }
-    Ok(Some(penalty))
-}
-
 /// Tolerance (relative to the dominant retained eigenvalue) below which a
 /// reduced-basis direction of the W-orthogonalised effective logslope Gram is
 /// treated as a confounded null direction and dropped. Directions whose
@@ -980,6 +877,109 @@ fn bernoulli_marginal_slope_runaway_error(
 #[cfg(test)]
 mod runaway_tests {
     use super::*;
+
+    // The marginal↔logslope overlap penalty is no longer installed as a pinned
+    // ridge (subsumed by the now-unconditional exact logslope orthogonalisation in
+    // `build_reduced_logslope_reparam`). The geometry helper is retained here under
+    // the test module because the basis-independence/weight-orthogonality unit tests
+    // below exercise it directly as the canonical overlap-direction reference.
+    fn marginal_logslope_overlap_penalty(
+        marginal_design: &DesignMatrix,
+        logslope_design: &DesignMatrix,
+        z: &Array1<f64>,
+        row_metric: &Array1<f64>,
+        marginal_offset: &Array1<f64>,
+        logslope_offset: &Array1<f64>,
+        marginal_baseline: f64,
+        logslope_baseline: f64,
+        probit_scale: f64,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let marginal =
+            marginal_design.try_to_dense_arc("marginal_logslope_overlap_penalty::marginal")?;
+        let logslope =
+            logslope_design.try_to_dense_arc("marginal_logslope_overlap_penalty::logslope")?;
+        let n = marginal.nrows();
+        if logslope.nrows() != n
+            || z.len() != n
+            || row_metric.len() != n
+            || marginal_offset.len() != n
+            || logslope_offset.len() != n
+        {
+            return Err(format!(
+                "marginal/logslope overlap penalty row mismatch: marginal={}, logslope={}, z={}, row_metric={}, marginal_offset={}, logslope_offset={}",
+                marginal.nrows(),
+                logslope.nrows(),
+                z.len(),
+                row_metric.len(),
+                marginal_offset.len(),
+                logslope_offset.len(),
+            ));
+        }
+        let p_m = marginal.ncols();
+        let p_g = logslope.ncols();
+        if p_m == 0 || p_g == 0 {
+            return Ok(None);
+        }
+        if !marginal_baseline.is_finite()
+            || !logslope_baseline.is_finite()
+            || !probit_scale.is_finite()
+            || probit_scale <= 0.0
+            || z.iter().any(|v| !v.is_finite())
+            || row_metric.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || marginal_offset.iter().any(|v| !v.is_finite())
+            || logslope_offset.iter().any(|v| !v.is_finite())
+        {
+            return Err(
+                "marginal/logslope overlap penalty requires finite pilot geometry and finite non-negative row metric"
+                    .to_string(),
+            );
+        }
+
+        let mut marginal_effective = Array2::<f64>::zeros((n, p_m));
+        let mut effective_logslope = Array2::<f64>::zeros((n, p_g));
+        for i in 0..n {
+            let q_i = marginal_offset[i] + marginal_baseline;
+            let g_i = logslope_offset[i] + logslope_baseline;
+            let sg = probit_scale * g_i;
+            let c_i = (1.0 + sg * sg).sqrt();
+            let logslope_factor =
+                q_i * probit_scale * probit_scale * g_i / c_i + probit_scale * z[i];
+            for j in 0..p_m {
+                marginal_effective[[i, j]] = c_i * marginal[[i, j]];
+            }
+            for j in 0..p_g {
+                effective_logslope[[i, j]] = logslope_factor * logslope[[i, j]];
+            }
+        }
+        if effective_logslope.iter().all(|v| v.abs() <= f64::EPSILON) {
+            return Ok(None);
+        }
+
+        let mut gram = fast_xt_diag_x(&effective_logslope, row_metric);
+        let gram_scale = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+        if !gram_scale.is_finite() || gram_scale <= 0.0 {
+            return Ok(None);
+        }
+        let projection_ridge = (gram_scale * 1.0e-10).max(f64::EPSILON);
+        for i in 0..p_g {
+            gram[[i, i]] += projection_ridge;
+        }
+        let cross = fast_xt_diag_y(&effective_logslope, row_metric, &marginal_effective);
+        let gram_view = FaerArrayView::new(&gram);
+        let factor = factorize_symmetricwith_fallback(gram_view.as_ref(), Side::Lower)
+            .map_err(|e| format!("marginal/logslope overlap Gram factorization failed: {e}"))?;
+        let coeffs = factor
+            .solvemulti(&cross)
+            .map_err(|e| format!("marginal/logslope overlap projection solve failed: {e}"))?;
+        let projected_marginal = fast_ab(&effective_logslope, &coeffs);
+        let mut penalty = fast_xt_diag_y(&marginal_effective, row_metric, &projected_marginal);
+        penalty = (&penalty + &penalty.t()) * 0.5;
+        let max_abs = penalty.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+        if !max_abs.is_finite() || max_abs <= 1.0e-12 {
+            return Ok(None);
+        }
+        Ok(Some(penalty))
+    }
 
     #[test]
     fn spatial_joint_setup_counts_only_learned_penalties_in_rho() {
