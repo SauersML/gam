@@ -745,9 +745,13 @@ fn marginal_penalties_with_influence_ridge(
     // was under the OLD `ker(S)`-scoped Jeffreys span, which by construction
     // overlapped the same nullspace the ridge covered and so could not add
     // independent curvature; full-span Jeffreys reaches every direction.)
-    // Validated empirically: retiring it leaves the bms/firth/hypertension
-    // baselines unchanged. When `firth_general` is OFF (default) the ridge stays
-    // installed and the block specs are byte-identical to the released solver.
+    // The Firth-armed convergence on the confounded cohort is gated by the
+    // `bms_probit_confound_orthogonalization_cure` / `robust_clean_fit_invariance`
+    // tests (Force / FirthOnly paths); if either regresses, drop the
+    // `&& !robust.firth_general` guard to reinstate the ridge — the retirement is
+    // a single, reversible condition. When `firth_general` is OFF (the released
+    // default) the ridge stays installed and the block specs are byte-identical
+    // to the released solver, so no baseline can move.
     // The OVERLAP ridge (2) below is likewise retired, but under
     // `orthogonalize_confounds`, since it addresses the distinct
     // marginal↔logslope structural confound resolved by reparameterization.
