@@ -992,15 +992,14 @@ fn firth_jeffreys_logp_and_grad(
         return Ok((0.0, Array1::zeros(data.dim)));
     }
 
-    let jeffreys_link =
-        likelihood_spec_jeffreys_link(&family.likelihood_spec()).ok_or_else(|| {
-            HmcError::FirthUnsupported {
-                reason: format!(
-                    "Firth Jeffreys term has no Fisher-weight jet for {}",
-                    family.likelihood_spec().pretty_name()
-                ),
-            }
-        })?;
+    let jeffreys_link = likelihood_spec_jeffreys_link(&family.likelihood_spec()).ok_or_else(|| {
+        HmcError::FirthUnsupported {
+            reason: format!(
+                "Firth Jeffreys term has no Fisher-weight jet for {}",
+                family.likelihood_spec().pretty_name()
+            ),
+        }
+    })?;
     let op = if data.weights.iter().all(|&w| w == 1.0) {
         FirthDenseOperator::build_for_link(jeffreys_link, data.x.as_ref(), eta)
     } else {
