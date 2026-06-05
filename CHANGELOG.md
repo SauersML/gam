@@ -18,6 +18,16 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## gamfit 0.1.168 — gam 0.3.95 / gamfit 0.1.168 (2026-06-05)
+
+### Fixed
+
+- **Publish the post-0.1.167 BMS spatial/kappa rho fix to PyPI (#754).** The
+  0.1.167 wheel was built before the follow-up fix that removed fixed physical
+  BMS ridges from the learned spatial/kappa REML `rho` layout. This wheel bump
+  publishes the already-merged code needed by the AoU Workbench driver, whose
+  `uv --with gamfit --upgrade-package gamfit` path resolves from PyPI.
+
 ## v0.3.95 — gam 0.3.95 / gamfit 0.1.167 (2026-06-04)
 
 ### Fixed
