@@ -49,7 +49,6 @@ use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, Des
 use crate::solver::identifiability_audit::{
     IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
 };
-use crate::solver::robust_identification::RobustConfig;
 
 /// A [`RowJacobianOperator`] built from a [`BlockEffectiveJacobian`] callback.
 ///
@@ -1457,7 +1456,7 @@ mod tests {
 
     /// Two single-channel blocks with an exact shared column (anchor block
     /// `a` has column [1, x]; block `b` has [x, x²]). The `x` direction is
-    /// shared. With the orthogonalisation flag ON, block `b` (lower priority)
+    /// shared. Orthogonalisation is unconditional, so block `b` (lower priority)
     /// must shed exactly one direction, the joint reduced design must be
     /// full-rank, and the round-trip lift must reproduce the raw prediction.
     #[test]
@@ -1478,11 +1477,7 @@ mod tests {
             spec_from_dense_with_priority("anchor", a.clone(), 150),
             spec_from_dense_with_priority("overlap", b.clone(), 120),
         ];
-        let robust = RobustConfig {
-            firth_general: false,
-            orthogonalize_confounds: true,
-        };
-        let canon = canonicalize_for_identifiability_with_robust(&specs, robust)
+        let canon = canonicalize_for_identifiability(&specs)
             .expect("orthogonalisation must resolve the overlap, not refuse");
 
         // Block b shed exactly one direction (the x alias): V_b is 2×1.
@@ -1523,11 +1518,12 @@ mod tests {
         }
     }
 
-    /// Flag OFF ⇒ orthogonalisation never runs: a clean two-block design must
-    /// canonicalise identically to the released gate (identity transforms,
-    /// raw-width preserved).
+    /// A clean (non-overlapping) two-block design must canonicalise to identity
+    /// transforms even though orthogonalisation runs unconditionally: with no
+    /// cross-block overlap to remove, `try_orthogonalize_blocks` finds nothing to
+    /// drop and the audit gate produces raw-width identity transforms.
     #[test]
-    fn orthogonalize_off_is_byte_identical_to_released_gate() {
+    fn orthogonalize_clean_design_yields_identity_transforms() {
         let n = 32;
         let x = linspace(n);
         let mut p = Array2::<f64>::zeros((n, 2));
@@ -1542,18 +1538,11 @@ mod tests {
             spec_from_dense_with_priority("p", p, 150),
             spec_from_dense_with_priority("s", s, 120),
         ];
-        let off = RobustConfig::default();
-        let canon_off = canonicalize_for_identifiability_with_robust(&specs, off)
-            .expect("clean design canonicalises with flag off");
-        let canon_default =
-            canonicalize_for_identifiability(&specs).expect("default entry must match flag-off");
-        assert_eq!(
-            canon_off.per_block_transform[0].dim(),
-            canon_default.per_block_transform[0].dim(),
-        );
-        // Identity transforms (no orthogonalisation) on the clean design.
-        assert_eq!(canon_off.per_block_transform[0].dim(), (2, 2));
-        assert_eq!(canon_off.per_block_transform[1].dim(), (2, 2));
+        let canon = canonicalize_for_identifiability(&specs)
+            .expect("clean design canonicalises");
+        // Identity transforms (nothing to orthogonalise) on the clean design.
+        assert_eq!(canon.per_block_transform[0].dim(), (2, 2));
+        assert_eq!(canon.per_block_transform[1].dim(), (2, 2));
     }
 
     /// Direct unit test of the compiler primitive: a block whose columns are
