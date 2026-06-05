@@ -13087,6 +13087,30 @@ mod tests {
             "constant-speed atom's penalty was reweighted (should be identity): {diff}"
         );
     }
+
+    #[test]
+    fn pca_seed_handles_huge_equal_finite_columns_without_mean_overflow() {
+        let z = array![[1.0e308_f64, 1.0e308], [1.0e308, 1.0e308]];
+        let coords =
+            sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1]).unwrap();
+        assert_eq!(coords.dim(), (1, 2, 1));
+        assert!(
+            coords.iter().all(|value| value.is_finite()),
+            "huge finite equal columns must not overflow the PCA seed mean: {coords:?}"
+        );
+    }
+
+    #[test]
+    fn pca_seed_rejects_huge_finite_span_that_overflows_centering() {
+        let z = array![[1.0e308_f64, 0.0], [-1.0e308, 0.0]];
+        let err =
+            sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1])
+                .expect_err("opposite huge finite values exceed f64 centering range");
+        assert!(
+            err.contains("centered Z is non-finite") || err.contains("SVD failed"),
+            "unexpected PCA seed error: {err}"
+        );
+    }
 }
 
 /// PCA-based seed for SAE atom latent coordinates. Centers `z`, takes its SVD,
