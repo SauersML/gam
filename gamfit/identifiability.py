@@ -113,6 +113,14 @@ _IVAE_AUX_SCALE_LOG_AMPLITUDE = 0.4
 # amplitude ``A`` is small enough to keep `σ` well-conditioned (σ ∈ [e^−A, e^A])
 # yet large enough that the ``tanh`` curvature gives `log σ` an SVD direction
 # genuinely independent of the affine `μ` columns.
+_AUTO_AUX_PRIOR_WEIGHT = 2.0
+_AUTO_MECH_SPARSITY_WEIGHT = 1.0e-4
+# The torch encoder used by this recipe is not wired into the Rust REML
+# engine, so there is no exact marginal-likelihood optimizer for these two
+# weights. The previous "auto" path ran a 5x5 Laplace-proxy grid centred at
+# 1.0; on clean planted-factor problems it missed the useful
+# mechanism-sparsity scale and paid 25 inner fits for a worse answer. "auto"
+# now means these calibrated one-fit recipe weights.
 
 
 @dataclass(slots=True)
@@ -533,15 +541,11 @@ def _build_encoder(
     return nn.Sequential(*layers)
 
 
-def _resolve_weight(
-    weight: Any, name: str
-) -> tuple[float, bool]:
-    """Return (numeric_weight, auto_flag).
+def _resolve_weight(weight: Any, name: str) -> float:
+    """Return the numeric penalty weight.
 
-    ``"auto"`` resolves to ``(1.0, True)`` — REML wiring for an arbitrary
-    custom torch encoder is not in scope here, so ``"auto"`` triggers a
-    coarse golden-section search instead. Numeric values must be positive
-    and finite.
+    ``"auto"`` resolves to the calibrated recipe default for ``name``.
+    Numeric values must be positive and finite.
     """
 
     if isinstance(weight, str):
@@ -549,7 +553,11 @@ def _resolve_weight(
             raise ValueError(
                 f"{name}: only 'auto' is accepted as a string; got {weight!r}"
             )
-        return 1.0, True
+        if name == "aux_prior_weight":
+            return _AUTO_AUX_PRIOR_WEIGHT
+        if name == "mech_sparsity_weight":
+            return _AUTO_MECH_SPARSITY_WEIGHT
+        raise ValueError(f"unknown identifiable-factor weight name {name!r}")
     try:
         w = float(weight)
     except (TypeError, ValueError) as exc:
@@ -560,7 +568,7 @@ def _resolve_weight(
         raise ValueError(
             f"{name} must be positive and finite; got {w}"
         )
-    return w, False
+    return w
 
 
 def _derive_aux_scale(aux_np: np.ndarray) -> np.ndarray:
@@ -761,79 +769,6 @@ def _one_fit(
     return encoder, decoder, rss, total_pen
 
 
-def _auto_weight_search(
-    x_t: Any,
-    aux_t: Any,
-    n_supervised: int,
-    n_free: int,
-    hidden_widths: list[int],
-    auto_aux: bool,
-    auto_mech: bool,
-    aux_w0: float,
-    mech_w0: float,
-    max_iter: int,
-    learning_rate: float,
-    seed: int,
-    torch_mod: Any,
-) -> tuple[float, float, Any, Any, float, float, float]:
-    """Coarse log-grid search over the ``"auto"`` weights.
-
-    For each weight set to ``"auto"`` we sweep a 5-point log-spaced grid
-    centred on the seed value. Python's only responsibility is to evaluate
-    ``(rss, penalty)`` at each grid cell by running ``_one_fit`` (the torch
-    encoder loop is the legitimate Python escape). The argmax / evidence
-    formula / tie-breaking is delegated to Rust via
-    ``rust_module().identifiable_factor_select_weights_array``.
-    """
-
-    aux_grid = (
-        [aux_w0 * 10 ** e for e in (-2.0, -1.0, 0.0, 1.0, 2.0)] if auto_aux else [aux_w0]
-    )
-    mech_grid = (
-        [mech_w0 * 10 ** e for e in (-2.0, -1.0, 0.0, 1.0, 2.0)]
-        if auto_mech
-        else [mech_w0]
-    )
-
-    n_obs = int(x_t.shape[0])
-    g1 = len(aux_grid)
-    g2 = len(mech_grid)
-    rss_grid = np.zeros((g1, g2), dtype=np.float64)
-    pen_grid = np.zeros((g1, g2), dtype=np.float64)
-    cells: list[list[tuple[Any, Any] | None]] = [[None] * g2 for _ in range(g1)]
-    for i, aw in enumerate(aux_grid):
-        for j, mw in enumerate(mech_grid):
-            encoder, decoder, rss, pen = _one_fit(
-                x_t, aux_t, n_supervised, n_free, hidden_widths,
-                aw, mw, max_iter, learning_rate, seed, torch_mod,
-            )
-            rss_grid[i, j] = rss
-            pen_grid[i, j] = pen
-            cells[i][j] = (encoder, decoder)
-
-    selection = rust_module().identifiable_factor_select_weights_array(
-        np.ascontiguousarray(rss_grid),
-        np.ascontiguousarray(pen_grid),
-        np.ascontiguousarray(np.asarray(aux_grid, dtype=np.float64)),
-        np.ascontiguousarray(np.asarray(mech_grid, dtype=np.float64)),
-        int(n_obs),
-    )
-    bi = int(selection["best_i"])
-    bj = int(selection["best_j"])
-    best_cell = cells[bi][bj]
-    assert best_cell is not None  # populated above
-    encoder, decoder = best_cell
-    return (
-        float(selection["best_lam1"]),
-        float(selection["best_lam2"]),
-        encoder,
-        decoder,
-        float(rss_grid[bi, bj]),
-        float(pen_grid[bi, bj]),
-        float(selection["best_evidence"]),
-    )
-
-
 def identifiable_factor_fit(
     X: Any,
     aux: Any,
@@ -854,8 +789,9 @@ def identifiable_factor_fit(
     split. ``T_sup`` is supervised by ``aux`` via an iVAE-style Gaussian
     auxiliary-conditional prior; ``T_free`` is unsupervised and constrained
     by a mechanism-sparsity penalty on its decoder rows. Both penalty
-    weights default to ``"auto"`` and are selected by a coarse log-grid
-    search over a Laplace-style log marginal-likelihood proxy.
+    weights default to ``"auto"``, which resolves to calibrated recipe
+    weights. The resulting single fit is scored with a Laplace-style log
+    marginal-likelihood proxy.
 
     Parameters
     ----------
@@ -870,9 +806,8 @@ def identifiable_factor_fit(
         forcing the user to make the split explicit avoids silent
         identifiability surprises.
     mech_sparsity_weight, aux_prior_weight : ``"auto"`` or positive float
-        Penalty weights. ``"auto"`` triggers a 5-point log-grid search per
-        ``"auto"`` flag and selects the weight maximizing the Laplace
-        evidence proxy.
+        Penalty weights. ``"auto"`` resolves to the recipe defaults
+        ``mech_sparsity_weight=1e-4`` and ``aux_prior_weight=2.0``.
     encoder : str
         ``"linear"`` for a single-Linear encoder, or ``"mlp[w1, w2, ...]"``
         for an MLP of widths ``w_i`` with GELU activations and a Linear
@@ -890,10 +825,10 @@ def identifiable_factor_fit(
     -----
     The ``evidence`` sign convention is "log evidence" — *higher is better*.
     The proxy is approximate: REML wiring for arbitrary custom torch
-    encoders is not yet plumbed through the Rust engine, so ``"auto"``
-    uses a coarse Laplace-style log marginal-likelihood proxy with a
-    log-grid search rather than the exact REML score that
-    :func:`gamfit.fit` returns for formula-based smooths.
+    encoders is not yet plumbed through the Rust engine. ``"auto"`` therefore
+    uses calibrated recipe weights rather than treating the Laplace proxy as
+    an exact REML selector like :func:`gamfit.fit` returns for formula-based
+    smooths.
     """
 
     x_np, aux_np = _validate_inputs(X, aux, int(n_supervised), int(n_free))
@@ -906,39 +841,29 @@ def identifiable_factor_fit(
             "identifiable_factor_fit requires PyTorch; install gamfit[torch]"
         ) from exc
 
-    aux_w0, auto_aux = _resolve_weight(aux_prior_weight, "aux_prior_weight")
-    mech_w0, auto_mech = _resolve_weight(mech_sparsity_weight, "mech_sparsity_weight")
+    aux_w = _resolve_weight(aux_prior_weight, "aux_prior_weight")
+    mech_w = _resolve_weight(mech_sparsity_weight, "mech_sparsity_weight")
 
     torch_mod.manual_seed(int(random_state))
     x_t = torch_mod.as_tensor(x_np, dtype=torch_mod.float64)
     aux_t = torch_mod.as_tensor(aux_np, dtype=torch_mod.float64)
 
-    if auto_aux or auto_mech:
-        aux_w, mech_w, encoder_module, decoder_module, _rss, _pen, evidence = (
-            _auto_weight_search(
-                x_t, aux_t, int(n_supervised), int(n_free), hidden_widths,
-                auto_aux, auto_mech, aux_w0, mech_w0,
-                int(max_iter), float(learning_rate), int(random_state), torch_mod,
-            )
-        )
-    else:
-        encoder_module, decoder_module, rss_val, pen_val = _one_fit(
-            x_t, aux_t, int(n_supervised), int(n_free), hidden_widths,
-            aux_w0, mech_w0, int(max_iter), float(learning_rate),
-            int(random_state), torch_mod,
-        )
-        aux_w, mech_w = aux_w0, mech_w0
-        # Route the single-pair evidence through the same Rust primitive as
-        # the grid search so the Laplace evidence formula has a single
-        # source of truth in ``src/identifiability.rs``.
-        selection = rust_module().identifiable_factor_select_weights_array(
-            np.ascontiguousarray(np.array([[rss_val]], dtype=np.float64)),
-            np.ascontiguousarray(np.array([[pen_val]], dtype=np.float64)),
-            np.ascontiguousarray(np.array([aux_w], dtype=np.float64)),
-            np.ascontiguousarray(np.array([mech_w], dtype=np.float64)),
-            int(x_t.shape[0]),
-        )
-        evidence = float(selection["best_evidence"])
+    encoder_module, decoder_module, rss_val, pen_val = _one_fit(
+        x_t, aux_t, int(n_supervised), int(n_free), hidden_widths,
+        aux_w, mech_w, int(max_iter), float(learning_rate),
+        int(random_state), torch_mod,
+    )
+    # Route the single-pair evidence through the Rust primitive used by
+    # Rust-side weight-selection tests so the Laplace evidence formula has a
+    # single source of truth in ``src/identifiability.rs``.
+    selection = rust_module().identifiable_factor_select_weights_array(
+        np.ascontiguousarray(np.array([[rss_val]], dtype=np.float64)),
+        np.ascontiguousarray(np.array([[pen_val]], dtype=np.float64)),
+        np.ascontiguousarray(np.array([aux_w], dtype=np.float64)),
+        np.ascontiguousarray(np.array([mech_w], dtype=np.float64)),
+        int(x_t.shape[0]),
+    )
+    evidence = float(selection["best_evidence"])
 
     with torch_mod.no_grad():
         t = encoder_module(x_t)
