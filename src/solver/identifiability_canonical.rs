@@ -1,4 +1,4 @@
-// Cross-block identifiability canonicalisation — fail-closed safety gate.
+// Cross-block identifiability canonicalisation.
 //
 // The pre-fit `audit_identifiability` (see `identifiability_audit.rs`)
 // runs a joint RRQR on `[X_block_0 | X_block_1 | ...]` and reports per-
@@ -19,19 +19,19 @@
 // blockwise inner-solve callers unwrap via `.expect(...)` — a panic
 // later in the pipeline, masking the audit's diagnostic.
 //
-// Until the family contract is updated to consume reduced specs
-// (Phase 4b of `identifiability_compiler` — see
-// `src/families/identifiability_compiler.rs`), this module's
-// `canonicalize_for_identifiability` is a **fail-closed audit gate**:
-//   - clean audit (`!fatal`)             → identity transforms, raw specs returned as-is;
-//   - fatal audit (any cause)            → `CustomFamilyError::IdentifiabilityFailure`.
+// This module has two safe behaviors:
+//   - plain single-channel dense blocks may be exactly orthogonalized with a
+//     per-block transform, then lifted back to raw coordinates after fitting;
+//   - callback-owned blocks keep raw block widths even when the audit attributes
+//     weak columns, because their effective geometry is owned by the family
+//     callback rather than by the placeholder `ParameterBlockSpec.design`.
 //
-// The identity-on-clean path keeps `lift_block_states_to_raw` and
-// `lift_fit_geometry_to_raw` cheap no-ops in the outer-fit code path
-// without altering its surface API. The fail-closed-on-fatal path
-// converts what was a latent panic into an immediate, actionable
-// `Err` naming the offending blocks and a reparameterisation hint —
-// in milliseconds rather than minutes of singular Newton.
+// Fatal audit results still fail closed with an immediate
+// `CustomFamilyError::IdentifiabilityFailure`, naming the offending blocks and a
+// reparameterization hint in milliseconds rather than after a singular Newton
+// solve. Clean or safely canonicalized results carry explicit per-block
+// transforms so `lift_block_states_to_raw` and `lift_fit_geometry_to_raw` map
+// the fit back to the raw coordinate system.
 
 use std::sync::Arc;
 
@@ -1205,6 +1205,7 @@ fn pull_back_penalty(penalty: &PenaltyMatrix, kept: &[usize]) -> PenaltyMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::families::custom_family::AdditiveBlockJacobian;
     use crate::linalg::matrix::DenseDesignMatrix;
     use ndarray::Array2;
 
@@ -1468,6 +1469,76 @@ mod tests {
         s
     }
 
+    #[test]
+    fn callback_owned_geometry_keeps_raw_width_after_audit_drop() {
+        let n = 48;
+        let x = linspace(n);
+        let mut anchor = Array2::<f64>::zeros((n, 2));
+        let mut callback_owned = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            anchor[[i, 0]] = 1.0;
+            anchor[[i, 1]] = x[i];
+            callback_owned[[i, 0]] = x[i];
+            callback_owned[[i, 1]] = x[i] * x[i];
+        }
+
+        let anchor_spec = spec_from_dense_with_priority("marginal_surface", anchor, 150);
+        let mut callback_spec =
+            spec_from_dense_with_priority("logslope_surface", callback_owned.clone(), 120);
+        callback_spec.jacobian_callback = Some(Arc::new(AdditiveBlockJacobian {
+            design: callback_owned,
+            own_output: 0,
+            n_family_outputs: 1,
+        }));
+        let specs = [anchor_spec, callback_spec];
+
+        let canon = canonicalize_for_identifiability(&specs).expect(
+            "callback-owned overlap should be audit-attributed but width-preserving (#772)",
+        );
+
+        assert!(
+            !canon.audit.fatal,
+            "priority-owned overlap should be non-fatal; got {}",
+            canon.audit.summary,
+        );
+        assert!(
+            canon
+                .audit
+                .dropped_columns
+                .iter()
+                .any(|drop| drop.block == "logslope_surface"),
+            "test must exercise an attributed logslope drop; got {:?}",
+            canon.audit.dropped_columns,
+        );
+        assert_eq!(
+            canon.reduced_specs[0].design.ncols(),
+            2,
+            "anchor block keeps raw width"
+        );
+        assert_eq!(
+            canon.reduced_specs[1].design.ncols(),
+            2,
+            "callback-owned block keeps raw width instead of applying design-column surgery"
+        );
+        for (block, transform) in canon.per_block_transform.iter().enumerate() {
+            assert_eq!(
+                transform.dim(),
+                (2, 2),
+                "block {block} transform must be raw-width identity"
+            );
+            for row in 0..2 {
+                for col in 0..2 {
+                    let expected = if row == col { 1.0 } else { 0.0 };
+                    assert_eq!(
+                        transform[[row, col]],
+                        expected,
+                        "block {block} transform must be identity"
+                    );
+                }
+            }
+        }
+    }
+
     /// Two single-channel blocks with an exact shared column (anchor block
     /// `a` has column [1, x]; block `b` has [x, x²]). The `x` direction is
     /// shared. Orthogonalisation is unconditional, so block `b` (lower priority)
@@ -1552,8 +1623,7 @@ mod tests {
             spec_from_dense_with_priority("p", p, 150),
             spec_from_dense_with_priority("s", s, 120),
         ];
-        let canon = canonicalize_for_identifiability(&specs)
-            .expect("clean design canonicalises");
+        let canon = canonicalize_for_identifiability(&specs).expect("clean design canonicalises");
         // Identity transforms (nothing to orthogonalise) on the clean design.
         assert_eq!(canon.per_block_transform[0].dim(), (2, 2));
         assert_eq!(canon.per_block_transform[1].dim(), (2, 2));
