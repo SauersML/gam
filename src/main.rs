@@ -10098,6 +10098,85 @@ mod tests {
     }
 
     #[test]
+    fn cli_firth_validation_accepts_bounded_binomial_logit_terms() {
+        let spec = bounded_cli_termspec();
+        assert!(
+            super::termspec_has_bounded_terms(&spec),
+            "fixture must exercise bounded coefficient geometry"
+        );
+
+        let link_choice =
+            parse_link_choice(Some("binomial-logit"), false).expect("parse logit link");
+        validate_cli_firth_configuration(CliFirthValidation {
+            enabled: true,
+            family: LikelihoodSpec::binomial_logit(),
+            predict_noise: false,
+            is_survival: false,
+            link_choice: Some(&link_choice),
+        })
+        .expect("--firth is a likelihood policy, not a bounded-term policy");
+    }
+
+    #[test]
+    fn cli_diagnose_alo_routes_bounded_terms_through_unified_refit() {
+        let bounded = bounded_cli_termspec();
+        assert_eq!(
+            super::alo_refit_route_for_termspec(&bounded),
+            super::AloRefitRoute::UnifiedTermCollection
+        );
+        assert_eq!(
+            super::alo_refit_route_for_termspec(&empty_termspec()),
+            super::AloRefitRoute::StandardGam
+        );
+    }
+
+    #[test]
+    fn cli_sample_bounded_model_reaches_sampler_config_validation() {
+        let td = tempdir().expect("tempdir");
+        let model_path = td.path().join("bounded.model.json");
+        let data_path = td.path().join("bounded.csv");
+        let out_path = td.path().join("draws.csv");
+
+        fs::write(&data_path, "x,y\n0.0,0.0\n0.5,1.0\n1.0,1.0\n").expect("write data");
+
+        let mut payload = test_payload(
+            "y ~ bounded(x, min=-2, max=2)",
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: LikelihoodSpec::gaussian_identity(),
+                link: Some(StandardLink::Identity),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            LikelihoodSpec::gaussian_identity().name(),
+        );
+        payload.data_schema = Some(bounded_cli_schema());
+        payload.resolved_termspec = Some(bounded_cli_termspec());
+        write_model_json(&model_path, &SavedModel::from_payload(payload)).expect("write model");
+
+        let err = run_sample(SampleArgs {
+            model: model_path,
+            data: data_path,
+            chains: Some(1),
+            samples: Some(1),
+            warmup: Some(1),
+            seed: Some(760),
+            out: Some(out_path),
+        })
+        .expect_err("invalid draw count should fail inside sampler validation");
+
+        assert!(
+            err.contains("NUTS n_samples"),
+            "bounded sample dispatch should reach sampler validation, got {err}"
+        );
+        assert!(
+            !err.to_ascii_lowercase().contains("bounded"),
+            "sample must not reject bounded() coefficients before sampler dispatch: {err}"
+        );
+    }
+
+    #[test]
     fn required_columns_for_fit_includes_auxiliary_formula_columns() {
         let parsed = parse_formula("y ~ x + s(pc1, pc2, type=tensor)").expect("parse main formula");
         let mut args = location_scale_fit_args(
