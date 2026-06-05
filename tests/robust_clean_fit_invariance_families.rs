@@ -444,44 +444,10 @@ fn clean_fit_invariance_survival_lognormal() {
 }
 
 // ───────────────────────── MULTINOMIAL (softmax) ─────────────────────────
-
-/// Clean multinomial-logit (softmax) zero-downside gate.
-///
-/// IGNORED — BLOCKED ON BUILD. The public multinomial entrypoint
-/// (`fit_penalized_multinomial` / `MultinomialFitInputs`) does NOT yet expose a
-/// `robust_identification` field: it hard-codes `RhoPrior::Flat` and constructs
-/// its `BlockwiseFitOptions` with the default (`Off`) robustness policy when it
-/// routes through `fit_custom_family_with_rho_prior`. There is therefore no way
-/// to request `FirthOnly` on a multinomial fit through the supported API, so an
-/// ON-vs-OFF comparison cannot be authored without asserting falsely (both arms
-/// would be byte-identical OFF runs, which would be a vacuous "pass").
-///
-/// UN-IGNORE WHEN: `MultinomialFitInputs` gains a `robust_identification` field
-/// (or `fit_penalized_multinomial` threads the policy into its
-/// `BlockwiseFitOptions`). At that point this body becomes: build a clean,
-/// well-separated 3-class softmax cohort, fit OFF and ON, and assert the
-/// coefficient / fitted-probability / edf deltas are within the same tight
-/// `assert_zero_downside`-style band.
-#[test]
-fn clean_fit_invariance_multinomial_softmax() {
-    // BLOCKED (no #[ignore]; the build bans it): the public multinomial
-    // entrypoint (`MultinomialFitInputs` / `fit_penalized_multinomial`) does not
-    // yet expose `robust_identification`, so an ON-vs-OFF comparison cannot be
-    // authored without comparing two OFF runs and falsely reporting zero-downside.
-    // Until the policy is threaded, assert the precondition that keeps this test
-    // blocked, so the test verifies something concrete and flips to a real
-    // ON-vs-OFF comparison the moment the flag lands (then delete this guard).
-    assert!(
-        !multinomial_inputs_expose_robust_identification(),
-        "MultinomialFitInputs now exposes robust_identification — wire the real \
-         clean-fit ON-vs-OFF invariance comparison (see doc comment) and remove this guard"
-    );
-}
-
-/// Whether the public multinomial entrypoint yet exposes a
-/// `robust_identification` knob. Hard-coded `false` today (the flag is not
-/// threaded); flip to a real capability probe — or just delete it together with
-/// the guard above — when `MultinomialFitInputs` gains the field.
-fn multinomial_inputs_expose_robust_identification() -> bool {
-    false
-}
+//
+// The multinomial-softmax clean-fit gate was a pure flag-gating test: its only
+// assertion was that the public multinomial entrypoint did NOT expose the
+// (now-deleted) `robust_identification` knob, so an OFF-vs-ON comparison could
+// not be authored. With robustness unconditional there is no flag to gate on and
+// no OFF/ON contrast to author, so the test (and its `false`-returning capability
+// probe) carried no remaining value and was removed.

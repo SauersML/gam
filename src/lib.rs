@@ -122,7 +122,7 @@ pub use solver::workflow::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
     CtnStage1Recipe, FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest,
     LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel,
-    PreparedSurvivalTimeStack, RobustIdentification, StandardBinomialWiggleConfig,
+    PreparedSurvivalTimeStack, StandardBinomialWiggleConfig,
     StandardFitRequest, StandardFitResult, SurvivalLocationScaleFitRequest,
     SurvivalLocationScaleFitResult, SurvivalMarginalSlopeFitRequest,
     SurvivalTransformationFitRequest, SurvivalTransformationFitResult,

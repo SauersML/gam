@@ -768,9 +768,6 @@ pub(crate) struct RemlConfig {
     max_iterations: usize,
     reml_convergence_tolerance: f64,
     firth_bias_reduction: bool,
-    /// Universal under-identification robustness policy. `Off` (default) leaves
-    /// the REML path byte-identical to released behavior.
-    robust_identification: crate::solver::workflow::RobustIdentification,
     /// Forwarded to `pirls::PirlsConfig::geodesic_acceleration`. Off by default.
     geodesic_acceleration: bool,
 }
@@ -793,7 +790,6 @@ impl RemlConfig {
             max_iterations: 0,
             reml_convergence_tolerance: reml_tol,
             firth_bias_reduction,
-            robust_identification: crate::solver::workflow::RobustIdentification::Off,
             geodesic_acceleration: false,
         }
         .with_max_iterations(300)
@@ -802,17 +798,6 @@ impl RemlConfig {
     pub(crate) fn with_max_iterations(mut self, max_iterations: usize) -> Self {
         self.max_iterations = max_iterations;
         self
-    }
-
-    /// Whether the family-general Firth/Jeffreys robustness mechanism is armed
-    /// for this fit. Resolves the user-facing tri-state
-    /// [`RobustIdentification`](crate::solver::workflow::RobustIdentification)
-    /// policy through [`RobustConfig`](crate::solver::robust_identification::RobustConfig);
-    /// `Off` ⇒ `false` (released, byte-identical path), `Auto`/`Force`/`FirthOnly`
-    /// ⇒ `true`. Used to gate the outer PC hyperprior default on λ.
-    pub(crate) fn firth_general(&self) -> bool {
-        crate::solver::robust_identification::RobustConfig::from_policy(self.robust_identification)
-            .firth_general
     }
 
     fn link_function(&self) -> LinkFunction {
@@ -826,7 +811,6 @@ impl RemlConfig {
             max_iterations: self.max_iterations,
             convergence_tolerance: self.pirls_convergence_tolerance,
             firth_bias_reduction: self.firth_bias_reduction,
-            robust_identification: self.robust_identification,
             // Caller (the REML runtime) populates this hint just before
             // each `execute_pirls_if_needed` call from the cached final
             // λ of the previous successful PIRLS solve.
@@ -1862,9 +1846,6 @@ pub struct ExternalOptimOptions {
     /// - `Some(false)`: force Firth off
     /// - `None`: use family default behavior
     pub firth_bias_reduction: Option<bool>,
-    /// Universal under-identification robustness policy. `Off` (default) leaves
-    /// the external optimization path byte-identical to released behavior.
-    pub robust_identification: crate::solver::workflow::RobustIdentification,
     /// Relative shrinkage floor for penalized block eigenvalues.
     /// See [`FitOptions::penalty_shrinkage_floor`] for details.
     pub penalty_shrinkage_floor: Option<f64>,
@@ -1991,7 +1972,6 @@ fn resolved_external_config(
         resolve_external_family(&opts.family, opts.firth_bias_reduction)?;
     let link = likelihood.link_function();
     let mut cfg = RemlConfig::external(likelihood, opts.tol, firth_active);
-    cfg.robust_identification = opts.robust_identification;
     cfg.link_kind = resolved_external_inverse_link(
         link,
         opts.latent_cloglog,
@@ -4058,9 +4038,6 @@ pub struct FitOptions {
     /// evaluator so baseline fits, spatial hyperparameter evaluations, outer
     /// line searches, final refits, and inference all optimize the same target.
     pub firth_bias_reduction: bool,
-    /// Universal under-identification robustness policy. `Off` (default) leaves
-    /// every objective evaluation byte-identical to released behavior.
-    pub robust_identification: crate::solver::workflow::RobustIdentification,
     pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
     /// Relative shrinkage floor for penalized block eigenvalues.
     ///
