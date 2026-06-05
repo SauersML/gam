@@ -269,7 +269,7 @@ mod tests {
         let s = Array2::<f64>::zeros((3, 3));
         let z = jeffreys_subspace_from_penalty(s.view(), None).unwrap();
         assert_eq!(z.span_dim(), 3);
-        assert_eq!(z.block_dim(), 3);
+        assert_eq!(z.columns.nrows(), 3);
         // Columns orthonormal and spanning the whole space.
         let gram = z.columns.t().dot(&z.columns);
         for i in 0..3 {
@@ -300,8 +300,8 @@ mod tests {
     fn full_rank_penalty_has_empty_under_identified_span() {
         let s = Array2::<f64>::eye(4) * 2.0;
         let z = jeffreys_subspace_from_penalty(s.view(), Some(0)).unwrap();
-        assert!(JeffreysSubspace::is_empty(&z));
         assert_eq!(z.span_dim(), 0);
+        assert_eq!(z.columns.ncols(), 0);
     }
 
     #[test]
