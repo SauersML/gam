@@ -41,7 +41,10 @@ use crate::families::custom_family::{
     BlockEffectiveJacobian, CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec,
     PenaltyMatrix,
 };
-use crate::families::identifiability_compiler::{IdentityRowHessian, RowJacobianOperator};
+use crate::families::identifiability_compiler::{
+    IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
+};
+use crate::solver::robust_identification::RobustConfig;
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::identifiability_audit::{
@@ -310,6 +313,46 @@ impl CanonicalSpecs {
 pub fn canonicalize_for_identifiability(
     specs: &[ParameterBlockSpec],
 ) -> Result<CanonicalSpecs, CustomFamilyError> {
+    // Default entry: robustness off ⇒ byte-identical to the released audit
+    // gate. The flag-gated orthogonalisation pass is reached only via
+    // `canonicalize_for_identifiability_with_robust`.
+    canonicalize_for_identifiability_with_robust(specs, RobustConfig::default())
+}
+
+/// Robustness-aware variant of [`canonicalize_for_identifiability`].
+///
+/// When `robust.orthogonalize_confounds` is set, a general exact W-metric
+/// orthogonalisation pass runs *before* the fail-closed audit: overlapping
+/// design blocks (e.g. a logslope surface confounded with the marginal
+/// surface) are reparameterised so the lower-priority block's overlap with the
+/// higher-priority anchor is removed exactly, rather than being penalised by a
+/// hand-tuned ridge. The reparam `V_b` is folded into each block's design via
+/// [`CoefficientTransformOperator`], penalties are pulled back as `V_bᵀ S V_b`,
+/// and `per_block_transform[b] = V_b` so the existing
+/// [`CanonicalSpecs::lift_block_betas_to_raw`] /
+/// [`CanonicalSpecs::lift_joint_matrix_to_raw`] machinery maps the reduced
+/// fit back to raw coordinates unchanged (the lift is `β_raw = V_b · θ`,
+/// already supported for dense transforms).
+///
+/// When `robust.orthogonalize_confounds` is **off** the function is identical
+/// to the released selection-only audit gate (no orthogonalisation, identity-
+/// on-clean / fail-closed-on-fatal).
+pub fn canonicalize_for_identifiability_with_robust(
+    specs: &[ParameterBlockSpec],
+    robust: RobustConfig,
+) -> Result<CanonicalSpecs, CustomFamilyError> {
+    // Flag-gated exact orthogonalisation of structural confounds. Runs only
+    // when requested AND the design is single-channel dense (the general
+    // multi-channel coupled path is handled by the Tier-B joint-Newton
+    // Jeffreys term, not by a per-block design reparam). On any structural
+    // condition that the orthogonaliser cannot express as a per-block
+    // transform, it falls through to the unmodified audit gate below — never
+    // worse than today.
+    if robust.orthogonalize_confounds {
+        if let Some(canon) = try_orthogonalize_blocks(specs)? {
+            return Ok(canon);
+        }
+    }
     if specs.is_empty() {
         return Ok(CanonicalSpecs {
             reduced_specs: Vec::new(),
@@ -833,6 +876,221 @@ pub fn canonicalize_for_identifiability(
         audit,
         used_channel_aware_audit: use_channel_aware,
     })
+}
+
+/// Flag-gated exact orthogonalisation of structural confounds across blocks.
+///
+/// Returns `Ok(Some(canon))` when an overlap was found and removed by exact
+/// W-metric reparameterisation; `Ok(None)` when orthogonalisation is not
+/// applicable (multi-channel families, sparse/operator-backed designs, or no
+/// cross-block overlap detected) so the caller falls through to the unmodified
+/// audit gate. Never returns a *worse* result than today: a clean design
+/// yields `None` (byte-identical fall-through), and an unrepresentable
+/// structural condition also yields `None`.
+fn try_orthogonalize_blocks(
+    specs: &[ParameterBlockSpec],
+) -> Result<Option<CanonicalSpecs>, CustomFamilyError> {
+    if specs.len() < 2 {
+        return Ok(None);
+    }
+    // Multi-channel families (BMS, survival LS) are handled by the Tier-B
+    // joint-Newton Jeffreys term, not by a per-block design reparam: their
+    // coupled multi-output kernel does not factor as `X_b · V_b`. Detect and
+    // defer.
+    let multi_channel = specs.iter().any(|s| {
+        s.jacobian_callback
+            .as_ref()
+            .map(|cb| cb.n_outputs() > 1)
+            .unwrap_or(false)
+    });
+    if multi_channel {
+        return Ok(None);
+    }
+
+    // Densify every block design. Any non-densifiable (large/lazy operator)
+    // block makes the per-block reparam non-representable here → defer.
+    let n_rows = specs[0].design.nrows();
+    let mut block_designs: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
+    for spec in specs.iter() {
+        if spec.design.nrows() != n_rows {
+            return Ok(None);
+        }
+        let dense = match spec
+            .design
+            .try_to_dense_arc("orthogonalize_design_blocks densify")
+        {
+            Ok(arc) => arc.as_ref().clone(),
+            Err(_) => return Ok(None),
+        };
+        block_designs.push(dense);
+    }
+
+    // Pilot W-metric: the released structural audit runs in the unweighted
+    // (Euclidean) row metric, and structural rank-overlap removal is exact in
+    // that metric. Use uniform weights so the reparam matches the audit's
+    // geometry; the family-curvature W-metric refinement belongs to the
+    // Tier-B coupled path.
+    let weight = vec![1.0_f64; n_rows];
+    let priority: Vec<u32> = specs.iter().map(|s| s.gauge_priority as u32).collect();
+
+    let ortho = orthogonalize_design_blocks(&block_designs, &priority, &weight).map_err(|e| {
+        CustomFamilyError::DimensionMismatch {
+            reason: format!("orthogonalize_design_blocks failed: {e}"),
+        }
+    })?;
+
+    // No overlap removed ⇒ nothing to do; fall through to the standard gate so
+    // behaviour is byte-identical to today on clean / square-rotation designs.
+    if ortho.dropped.is_empty() {
+        return Ok(None);
+    }
+
+    // Build orthogonalised specs: design ← X_b · V_b (via
+    // CoefficientTransformOperator), penalties ← V_bᵀ S V_b, initial_beta ←
+    // V_bᵀ β₀ (least-squares image; V_b has orthonormal columns so V_bᵀ is the
+    // pseudo-inverse), and remember V_b for the round-trip composition.
+    let mut ortho_specs: Vec<ParameterBlockSpec> = Vec::with_capacity(specs.len());
+    for (spec, v_b) in specs.iter().zip(ortho.block_transforms.iter()) {
+        let p_b = spec.design.ncols();
+        if v_b.nrows() != p_b {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "orthogonalize: block '{}' transform has {} rows but design has {p_b} columns",
+                    spec.name,
+                    v_b.nrows(),
+                ),
+            });
+        }
+        let inner_dense = match &spec.design {
+            DesignMatrix::Dense(d) => d.clone(),
+            DesignMatrix::Sparse(_) => {
+                let dense = spec
+                    .design
+                    .try_to_dense_arc("orthogonalize reduced-design densify")
+                    .map_err(|reason| CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "orthogonalize: densify block '{}' failed: {reason}",
+                            spec.name,
+                        ),
+                    })?;
+                DenseDesignMatrix::from(dense)
+            }
+        };
+        let op = CoefficientTransformOperator::new(inner_dense, v_b.clone()).map_err(|reason| {
+            CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "orthogonalize: build CoefficientTransformOperator for block '{}': {reason}",
+                    spec.name,
+                ),
+            }
+        })?;
+        let reduced_design = DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(op)));
+
+        let reduced_penalties: Vec<PenaltyMatrix> = spec
+            .penalties
+            .iter()
+            .map(|p| pull_back_penalty_dense(p, v_b))
+            .collect();
+
+        let reduced_initial_beta = match &spec.initial_beta {
+            Some(beta_raw) => {
+                if beta_raw.len() != p_b {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "orthogonalize: block '{}' initial_beta length {} != design ncols {p_b}",
+                            spec.name,
+                            beta_raw.len(),
+                        ),
+                    });
+                }
+                Some(v_b.t().dot(beta_raw))
+            }
+            None => None,
+        };
+
+        // The orthogonalised design no longer matches the raw-width
+        // jacobian_callback / stacked_design; single-channel blocks here carry
+        // neither (multi-channel was deferred above), so drop them defensively.
+        ortho_specs.push(ParameterBlockSpec {
+            name: spec.name.clone(),
+            design: reduced_design,
+            offset: spec.offset.clone(),
+            penalties: reduced_penalties,
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: spec.initial_log_lambdas.clone(),
+            initial_beta: reduced_initial_beta,
+            gauge_priority: spec.gauge_priority,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        });
+    }
+
+    // Run the standard (non-orthogonalising) audit + post-T invariant + MAP
+    // uniqueness checks on the orthogonalised specs. With the overlap removed,
+    // this should produce a clean (identity-T) verdict; if a *residual* rank
+    // deficiency survives orthogonalisation, the fail-closed gate still
+    // refuses with an actionable diagnostic.
+    let inner = canonicalize_for_identifiability_with_robust(&ortho_specs, RobustConfig::default())?;
+
+    // Compose the round-trip transform: β_raw = V_b · (T_inner · θ).
+    // `inner.per_block_transform[b]` is T_inner (selection/identity from the
+    // audit gate); the full raw lift is `V_b · T_inner`.
+    let mut composed_transform: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
+    for (v_b, t_inner) in ortho
+        .block_transforms
+        .iter()
+        .zip(inner.per_block_transform.iter())
+    {
+        if v_b.ncols() != t_inner.nrows() {
+            return Err(CustomFamilyError::DimensionMismatch {
+                reason: format!(
+                    "orthogonalize: transform composition shape mismatch — V_b is {:?}, \
+                     T_inner is {:?}",
+                    v_b.dim(),
+                    t_inner.dim(),
+                ),
+            });
+        }
+        composed_transform.push(v_b.dot(t_inner));
+    }
+
+    log::info!(
+        "[CANON] orthogonalisation applied: {} block(s) shed overlap directions {:?}; \
+         p_raw={} → p_reduced={}",
+        ortho.dropped.len(),
+        ortho.dropped,
+        specs.iter().map(|s| s.design.ncols()).sum::<usize>(),
+        composed_transform.iter().map(|t| t.ncols()).sum::<usize>(),
+    );
+
+    Ok(Some(CanonicalSpecs {
+        reduced_specs: inner.reduced_specs,
+        per_block_transform: composed_transform,
+        audit: inner.audit,
+        used_channel_aware_audit: inner.used_channel_aware_audit,
+    }))
+}
+
+/// Pull a penalty back through a dense reparam `V` as `Vᵀ S V`, preserving the
+/// precision label and fixed-λ pin. Companion to [`pull_back_penalty`] (which
+/// pulls back through a column *selection*); this handles the dense
+/// orthogonalisation transform.
+fn pull_back_penalty_dense(penalty: &PenaltyMatrix, v: &Array2<f64>) -> PenaltyMatrix {
+    let label = penalty.precision_label().map(|s| s.to_string());
+    let fixed_log_lambda = penalty.fixed_log_lambda();
+    let dense = penalty.as_dense_cow();
+    // Vᵀ S V  (r × r).
+    let s_v = dense.dot(v);
+    let reduced = v.t().dot(&s_v);
+    let mut base = PenaltyMatrix::Dense(reduced);
+    if let Some(lbl) = label {
+        base = base.with_precision_label(lbl);
+    }
+    if let Some(value) = fixed_log_lambda {
+        base = base.with_fixed_log_lambda(value);
+    }
+    base
 }
 
 fn build_reduced_design(
