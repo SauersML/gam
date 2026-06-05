@@ -1211,7 +1211,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     )
     .map_err(|e| format!("failed to rebuild frozen probe BMS joint designs: {e}"))?;
     let marginal_design = joint_designs.remove(0);
-    let logslope_design = joint_designs.remove(0);
+    let mut logslope_design = joint_designs.remove(0);
     let (latent_measure, latent_z_calibration) =
         build_latent_measure_with_geometry(&spec.z, &spec.weights, &spec.latent_z_policy)?;
     if latent_measure.is_empirical() && sigma_learnable {
@@ -1295,6 +1295,75 @@ pub fn fit_bernoulli_marginal_slope_terms(
     )?;
     let cross_block_pilot_w_score_warp =
         pilot_irls_hessian_row_metric_at_eta(&rigid_pilot_eta, &spec.weights);
+
+    // ── Structural confound cure (robust.orthogonalize_confounds) ────────────
+    //
+    // When the universal-robustness `orthogonalize_confounds` flag is armed we
+    // resolve the marginal/logslope confound *by construction* instead of with
+    // the pinned overlap ridge: reparameterize the logslope design block so its
+    // columns are exactly W-orthogonal (in the rigid-pilot IRLS row metric the
+    // joint penalised Hessian sees) to the marginal block's column span.
+    //
+    // The confound is structural: the exposure `z` correlates with the same PC
+    // smooths both `M` (marginal surface) and `G` (logslope surface) are built
+    // from, so a component of the marginal index `M·β_m` can be explained almost
+    // equally well by the score-weighted logslope `diag(s·z)·G·β_s`. After
+    // `G̃ = G − M·B` (with `B = (MᵀW M)⁻¹ MᵀW G` at the rigid pilot) the
+    // cross-block Gram `MᵀW G̃` is exactly zero, so the joint penalised Hessian
+    // is block-orthogonal between the marginal and logslope spans at the pilot
+    // and no ridge is needed for identification. The reparameterization is a
+    // pure change of basis of the logslope columns; the fitted logslope
+    // coefficients `β_s` are unchanged and the original-basis marginal
+    // coefficients are recovered exactly at result assembly via
+    // `recover_original` (`β_m = β̃_m − B·β_s`).
+    //
+    // SCOPING: applied as a one-shot construction-time swap of `logslope_design.
+    // design`. This is exact in the fixed-design regime (κ disabled or no
+    // spatial terms), where `optimize_spatial_length_scale_exact_joint` builds
+    // the joint designs once and every `build_blocks` call sees this same
+    // reparameterized `logslope_design`. When spatial κ-learning is active the
+    // optimizer rebuilds designs per κ from its own bootstrap, so the swap is
+    // NOT installed there (the pinned ridges stay) — the reproducible
+    // production confound is κ-locked (`length_scale=…`), which this path
+    // covers. Flag OFF ⇒ `OrthogonalReparam::build` returns `None` ⇒ raw
+    // logslope design, overlap ridge stays ⇒ byte-identical to released.
+    let fixed_design_regime = !effective_kappa_options.enabled
+        || (spatial_length_scale_term_indices(&marginalspec_boot).is_empty()
+            && spatial_length_scale_term_indices(&logslopespec_boot).is_empty());
+    let logslope_confound_reparam: Option<crate::solver::orthogonal_reparam::OrthogonalReparam> =
+        if robust.orthogonalize_confounds && fixed_design_regime {
+            let marginal_dense = marginal_design
+                .design
+                .try_to_dense_arc("bms confound-orthogonalization::marginal")?;
+            let logslope_dense = logslope_design
+                .design
+                .try_to_dense_arc("bms confound-orthogonalization::logslope")?;
+            // Build against the rigid-pilot IRLS row metric so orthogonality
+            // holds in the inner product the joint Hessian actually uses.
+            let reparam = crate::solver::orthogonal_reparam::OrthogonalReparam::build(
+                robust,
+                marginal_dense.view(),
+                logslope_dense.view(),
+                &cross_block_pilot_w_score_warp,
+            )?;
+            if let Some(ref rp) = reparam {
+                // Swap the logslope design's dense block for the W-orthogonal
+                // reparameterized confound `G̃`. The penalty topology, null-space
+                // accounting, intercept/linear/smooth ranges and every other
+                // field of `logslope_design` are unchanged — only the realized
+                // column values are sheared, which is a coordinate change on the
+                // same penalized basis.
+                logslope_design.design = DesignMatrix::Dense(
+                    crate::matrix::DenseDesignMatrix::from(
+                        rp.reparameterized_confound().to_owned(),
+                    ),
+                );
+            }
+            reparam
+        } else {
+            None
+        };
+
     // Absorbed Stage-1 influence columns (#461, design §3). When the workflow
     // chained a CTN Stage-1 into this marginal-slope fit, `spec.score_influence_
     // jacobian` carries the out-of-fold `J = ∂z/∂θ₁`; the realized leakage
