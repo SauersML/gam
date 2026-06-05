@@ -4058,6 +4058,12 @@ pub fn materialize<'a>(
         // auxiliary-formula rejection in `validate_auxiliary_formula_controls`.
         reject_survival_only_terms_for_nonsurvival(&parsed)?;
         if config.transformation_normal {
+            // Issue #789A: a Bernoulli marginal-slope request with
+            // `transformation_normal=true` used to dispatch as a CTN fit while
+            // retaining marginal-slope controls, leaving the transformation path
+            // in a non-advancing loop. CTN score calibration now uses the
+            // explicit `ctn_stage1` recipe instead, so the legacy boolean is a
+            // hard configuration error for marginal-slope requests.
             reject_marginal_slope_controls_for_transformation_normal(config)?;
             if config.noise_formula.is_some() {
                 return Err(WorkflowError::InvalidConfig {
@@ -7964,7 +7970,7 @@ mod tests {
     }
 
     #[test]
-    fn transformation_normal_rejects_marginal_slope_controls_before_family_dispatch() {
+    fn issue_789_transformation_normal_rejects_marginal_slope_controls_before_dispatch() {
         let data = workflow_test_dataset();
         let config = FitConfig {
             transformation_normal: true,
