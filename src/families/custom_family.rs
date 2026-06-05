@@ -14085,6 +14085,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         };
         let total_p: usize = ranges.last().map_or(0, |r| r.1);
 
+        // Universal under-identification robustness (flag-gated, default OFF).
+        // When armed, build the joint penalty-null basis `Z_J` once: it scopes
+        // the family-general Jeffreys/Firth term to the under-identified span so
+        // a near-separating coefficient is bounded to O(1) with automatic
+        // strength inside the coupled joint Newton, while penalized smooth
+        // directions keep their wiggliness prior untouched. `None` (no
+        // under-identified direction, or unsupported policy) leaves every step
+        // and objective byte-identical to the released solver.
+        let robust_firth_armed = crate::solver::robust_identification::RobustConfig::from_policy(
+            options.robust_identification,
+        )
+        .firth_general;
+        let joint_jeffreys_subspace = if robust_firth_armed {
+            build_joint_jeffreys_subspace(specs, &ranges)?
+        } else {
+            None
+        };
+
         let joint_mode_diagonal_ridge =
             if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
                 ridge
@@ -14693,6 +14711,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             joint_mode_diagonal_ridge,
                             joint_bundle,
                         );
+                        // Universal robustness (flag-gated): add the
+                        // family-general Jeffreys curvature `H_Phi` to the
+                        // penalized Hessian and the Jeffreys score `+∇Φ` to the
+                        // stationarity RHS, both scoped to the under-identified
+                        // span `Z_J`. This is the Tier-B coupled-Newton form of
+                        // Firth: the reduced Fisher information `Z_J^T H Z_J`
+                        // supplies the missing O(n) curvature that bounds a
+                        // near-separating coefficient to O(1). When the flag is
+                        // OFF `joint_jeffreys_subspace` is `None` and the step is
+                        // byte-identical to the released solver.
+                        let mut spectral_rhs = rhs.clone();
+                        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                            if let Some((_phi, grad_phi, hphi)) =
+                                custom_family_joint_jeffreys_term(
+                                    family, &states, specs, &ranges, z_joint,
+                                )?
+                            {
+                                lhs_true += &hphi;
+                                spectral_rhs += &grad_phi;
+                            }
+                        }
                         // Self-vanishing Levenberg–Marquardt damping for the
                         // range-restricted spectral step. Scaled to the current
                         // stationarity-residual magnitude ‖∇L − Sβ‖∞ so it is
@@ -14706,11 +14745,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // unbounded component/λ step along ill-conditioned modes
                         // and stops the oscillation that prevented the n=23
                         // binary-covariate CTM from settling (#733/#734).
-                        let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                        let rhs_inf = spectral_rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
                         let spectral_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
                         let spectral_step = solve_joint_newton_step_on_spectral_range(
                             &lhs_true,
-                            &rhs,
+                            &spectral_rhs,
                             KKT_REFUSAL_RANK_TOL,
                             residual_tol_for_solve,
                             spectral_levenberg_mu,
@@ -21855,6 +21894,116 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
         .iter()
         .map(|r| (r.start, r.end))
         .collect()
+}
+
+/// Build the joint under-identified basis `Z_J` (block-diagonal stack of each
+/// block's penalty-null span) for the universal Jeffreys/Firth robustness term.
+///
+/// Each block contributes the null space of its aggregate (unit-weight) penalty
+/// `sum_k S_k` — the parametric + smooth-structural-null directions that carry
+/// neither data information nor a proper wiggliness prior. Penalized smooth
+/// directions are excluded (they already have a proper prior). The per-block
+/// bases are embedded block-diagonally into the joint `total_p x m_total`
+/// matrix. Returns `None` when no block has an under-identified direction (the
+/// system is already proper; no Jeffreys term is needed).
+///
+/// Gated by the caller on `robust_identification != Off`; never runs in the
+/// released solver.
+fn build_joint_jeffreys_subspace(
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+) -> Result<Option<Array2<f64>>, String> {
+    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if total_p == 0 {
+        return Ok(None);
+    }
+    let mut per_block: Vec<Array2<f64>> = Vec::with_capacity(specs.len());
+    let mut m_total = 0usize;
+    for (b, spec) in specs.iter().enumerate() {
+        let (start, end) = ranges[b];
+        let p_block = end - start;
+        let aggregate = if spec.penalties.is_empty() {
+            Array2::<f64>::zeros((p_block, p_block))
+        } else {
+            let mut acc = Array2::<f64>::zeros((p_block, p_block));
+            for penalty in &spec.penalties {
+                let dense = penalty.to_dense();
+                if dense.nrows() == p_block && dense.ncols() == p_block {
+                    acc += &dense;
+                }
+            }
+            acc
+        };
+        let structural = if !spec.nullspace_dims.is_empty()
+            && spec.nullspace_dims.len() == spec.penalties.len()
+            && !spec.penalties.is_empty()
+        {
+            let penalties_dense: Vec<Array2<f64>> =
+                spec.penalties.iter().map(|p| p.to_dense()).collect();
+            Some(crate::estimate::reml::unified::exact_intersection_nullity(
+                &penalties_dense,
+                &spec.nullspace_dims,
+            ))
+        } else {
+            None
+        };
+        let subspace = crate::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
+            aggregate.view(),
+            structural,
+        )?;
+        m_total += subspace.span_dim();
+        per_block.push(subspace.columns);
+    }
+    if m_total == 0 {
+        return Ok(None);
+    }
+    let mut z_joint = Array2::<f64>::zeros((total_p, m_total));
+    let mut col_cursor = 0usize;
+    for (b, columns) in per_block.iter().enumerate() {
+        let (start, _) = ranges[b];
+        let m_block = columns.ncols();
+        let p_block = columns.nrows();
+        for j in 0..m_block {
+            for i in 0..p_block {
+                z_joint[[start + i, col_cursor + j]] = columns[[i, j]];
+            }
+        }
+        col_cursor += m_block;
+    }
+    Ok(Some(z_joint))
+}
+
+/// Evaluate the family-general Jeffreys term `(Phi, grad, H_Phi)` at the current
+/// working point from the coupled joint Hessian (Tier-B path). Returns `None`
+/// when there is no under-identified direction or the family does not expose an
+/// exact joint Hessian (in which case the term is inapplicable and the caller
+/// proceeds unchanged).
+fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'static>(
+    family: &F,
+    states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    ranges: &[(usize, usize)],
+    z_joint: &Array2<f64>,
+) -> Result<Option<(f64, Array1<f64>, Array2<f64>)>, String> {
+    let total_p = ranges.last().map(|(_, e)| *e).unwrap_or(0);
+    if total_p == 0 || z_joint.ncols() == 0 {
+        return Ok(None);
+    }
+    let h_joint = match family.exact_newton_joint_hessian_with_specs(states, specs)? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+    if h_joint.nrows() != total_p || h_joint.ncols() != total_p {
+        return Ok(None);
+    }
+    let term = crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
+        h_joint.view(),
+        z_joint.view(),
+        |direction: &Array1<f64>| {
+            family.exact_newton_joint_hessian_directional_derivative(states, direction)
+        },
+    )?;
+    Ok(Some(term))
 }
 
 const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
