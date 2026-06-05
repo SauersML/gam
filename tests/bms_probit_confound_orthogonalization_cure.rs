@@ -363,5 +363,8 @@ fn orthogonalization_is_exact_and_round_trip_is_lossless() {
 fn debug_force_on_runs() {
     assert!(file!().ends_with(".rs"));
     let on = run_fit(RobustIdentification::Force);
-    eprintln!("[debug-force] {on:?}");
+    eprintln!(
+        "[debug-force] max|b|={:.4e} conv={} g={:?} finite={}",
+        on.max_abs_marginal_beta, on.outer_converged, on.outer_gradient_norm, on.all_finite
+    );
 }
