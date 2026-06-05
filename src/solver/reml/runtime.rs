@@ -10132,6 +10132,35 @@ mod tk_math_tests {
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};
 
     #[test]
+    fn firth_default_pc_prior_fills_flat_only_when_armed() {
+        let pc = firth_default_pc_prior();
+        // OFF: every configured prior is returned verbatim — released byte-identity.
+        assert_eq!(
+            *resolve_effective_rho_prior(false, &RhoPrior::Flat),
+            RhoPrior::Flat
+        );
+        let configured = RhoPrior::Normal {
+            mean: 0.1,
+            sd: 2.0,
+        };
+        assert_eq!(*resolve_effective_rho_prior(false, &configured), configured);
+
+        // ON: a whole `Flat` prior becomes the weak PC default.
+        assert_eq!(*resolve_effective_rho_prior(true, &RhoPrior::Flat), pc);
+        // ON: an explicitly-configured prior is honored unchanged (no override).
+        assert_eq!(*resolve_effective_rho_prior(true, &configured), configured);
+        // ON: only the `Flat` coordinates of an Independent prior inherit the PC.
+        let indep = RhoPrior::Independent(vec![RhoPrior::Flat, configured.clone()]);
+        assert_eq!(
+            *resolve_effective_rho_prior(true, &indep),
+            RhoPrior::Independent(vec![pc.clone(), configured.clone()])
+        );
+        // ON: an Independent prior with no Flat holes is left untouched.
+        let no_holes = RhoPrior::Independent(vec![configured.clone(), configured.clone()]);
+        assert_eq!(*resolve_effective_rho_prior(true, &no_holes), no_holes);
+    }
+
+    #[test]
     fn penalty_rank_uses_actual_positive_eigenspace_not_root_rows() {
         let e = array![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 0.0],];
         let s = e.t().dot(&e);

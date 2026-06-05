@@ -137,12 +137,23 @@ fn firth_general_default_equals_explicit_pc_prior() {
         tail_prob: 0.01,
     };
 
-    // ON + unset(Flat): the gate fills the hole with `default_pc`.
-    let (lam_on, beta_on) = fit(&x, &y, gam::RobustIdentification::FirthOnly, RhoPrior::Flat);
-    // OFF + the explicit default PC: the same objective, no gate involved.
-    let (lam_explicit, beta_explicit) =
-        fit(&x, &y, gam::RobustIdentification::Off, default_pc);
+    // (A) Prior consumption is firth-invariant on Gaussian-identity: the
+    // link-general Jeffreys term is Binomial-only, so for a Gaussian fit the
+    // ON and OFF objectives differ *only* by the configured rho prior. The same
+    // explicit PC prior must therefore give the same λ under ON and OFF.
+    let (lam_pc_on, _) =
+        fit(&x, &y, gam::RobustIdentification::FirthOnly, default_pc.clone());
+    let (lam_pc_off, _) = fit(&x, &y, gam::RobustIdentification::Off, default_pc.clone());
+    assert_eq!(
+        lam_pc_on, lam_pc_off,
+        "explicit PC must be firth-invariant on Gaussian: λ_pc_on={lam_pc_on} λ_pc_off={lam_pc_off}"
+    );
 
+    // (B) The gate fills the Flat hole under firth-general with exactly that PC:
+    // ON + unset(Flat) must equal ON + the explicit default PC.
+    let (lam_on, beta_on) = fit(&x, &y, gam::RobustIdentification::FirthOnly, RhoPrior::Flat);
+    let (lam_explicit, beta_explicit) =
+        fit(&x, &y, gam::RobustIdentification::FirthOnly, default_pc);
     assert_eq!(
         lam_on, lam_explicit,
         "firth-general Flat must equal explicit default PC: λ_on={lam_on} λ_explicit={lam_explicit}"
