@@ -11875,11 +11875,11 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     refresh_all_block_etas(family, specs, states)?;
     let ranges = block_param_ranges(specs);
     let total = ranges.last().map(|(_, e)| *e).unwrap_or(0);
-    // Universal robustness (unconditional): the outer REML logdet of the
+    // Universal full-span robustness: the outer REML logdet of the
     // penalized Hessian must use the SAME Jeffreys-augmented Hessian
     // `H + S_λ + H_Φ` the inner Newton converged on, or the LAML score and its
-    // analytic derivatives describe a different objective. Compute `H_Φ` (scoped
-    // to the under-identified span `Z_J`) once here and add it into whichever
+    // analytic derivatives describe a different objective. Compute `H_Φ` once
+    // over the full-span basis `Z_J` and add it into whichever
     // logdet path runs below. `None` ⇒ no logdet-H contribution (logdet-S only).
     let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h {
         match build_joint_jeffreys_subspace(specs, &ranges)? {
@@ -14103,18 +14103,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         };
         let total_p: usize = ranges.last().map_or(0, |r| r.1);
 
-        // Universal under-identification robustness (unconditional). Build the
-        // joint penalty-null basis `Z_J` once: it scopes the family-general
-        // Jeffreys/Firth term to the under-identified span so a near-separating
-        // coefficient is bounded to O(1) with automatic strength inside the
-        // coupled joint Newton, while penalized smooth directions keep their
-        // wiggliness prior untouched. `None` (no under-identified direction)
-        // leaves every step and objective at the un-augmented inner Newton.
+        // Universal full-span Jeffreys/Firth robustness. Build `Z_J` once and
+        // use the same term in the coupled Newton step, objective value, and
+        // stationarity checks so a near-separating coefficient is bounded by
+        // the likelihood's own Fisher geometry instead of an ad-hoc ridge.
+        // `None` (empty coefficient system) leaves every step and objective at
+        // the un-augmented inner Newton.
         let joint_jeffreys_subspace = build_joint_jeffreys_subspace(specs, &ranges)?;
         // Fold the Jeffreys objective value into the cycle-0 baseline so the
         // first trust-region accept/reject compares like-for-like against the
         // Jeffreys-augmented trial objectives below. No-op when there is no
-        // under-identified span.
+        // coefficient system or the term is condition-gated to zero.
         if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
             let phi0 = custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             current_penalty += phi0;
@@ -14415,7 +14414,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // so the certifiable stationarity is `∇L − Sβ + ∇Φ = 0`. Without
             // this the head-of-cycle KKT exit (`current_stationarity_residual ≤
             // residual_tol`) can never fire on the near-separating span, even
-            // when the iterate is the Firth optimum. No-op when the flag is OFF.
+            // when the iterate is the Firth optimum. No-op when the Jeffreys
+            // term is unavailable or condition-gated to zero.
             let head_kkt_gradient: Option<Array1<f64>> = if let Some(z_joint) =
                 joint_jeffreys_subspace.as_ref()
             {
@@ -14496,7 +14496,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_mode_diagonal_ridge,
                         joint_bundle,
                     );
-                    let rhs_step = &grad_joint - &penalty_beta_joint;
+                    let mut rhs_step = &grad_joint - &penalty_beta_joint;
+                    if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                        match custom_family_joint_jeffreys_term(
+                            family, &states, specs, &ranges, z_joint,
+                        )? {
+                            Some((_phi, grad_phi, hphi))
+                                if grad_phi.len() == rhs_step.len()
+                                    && hphi.nrows() == total_p
+                                    && hphi.ncols() == total_p =>
+                            {
+                                rhs_step += &grad_phi;
+                                lhs += &hphi;
+                            }
+                            _ => {}
+                        }
+                    }
                     // Self-vanishing Levenberg–Marquardt damping for the
                     // CONSTRAINED active-set QP, mirroring the spectral-range
                     // branch below (μ = JOINT_SPECTRAL_LEVENBERG_FACTOR·‖rhs‖∞).
@@ -14599,10 +14614,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_bundle,
                     );
                     let mut rhs = &grad_joint - &penalty_beta;
-                    // Universal robustness (flag-gated): fold the family-general
+                    // Universal robustness: fold the family-general
                     // Jeffreys/Firth curvature `H_Φ` and score `∇Φ` into BOTH the
                     // matrix-free PCG step AND the dense spectral fallback below,
-                    // scoped to the under-identified span `Z_J`. Computed ONCE here
+                    // scoped to the full-span basis `Z_J`. Computed ONCE here
                     // so the matvec closure and the RHS share the SAME term and the
                     // fallback does not recompute it. The inner objective is
                     // `−ℓ + ½βᵀSβ − Φ`, so the Newton system the step must solve is
@@ -14615,9 +14630,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // taken. The dense route (small p, e.g. BMS p≈51) was already
                     // correct. `H_Φ` is the full-span Gauss-Newton surrogate
                     // `½ J H_id⁻¹ Jᵀ` (Z_J = identity ⇒ p×p, not low-rank), but the
-                    // conditioning gate in `joint_jeffreys_term` returns the EXACT
-                    // zero term on every well-conditioned fit, so this stays
-                    // byte-identical there and only arms on the near-separating span
+                    // conditioning gate in `joint_jeffreys_term` returns the zero
+                    // term on every well-conditioned fit, so this only arms on the
+                    // near-separating span
                     // — and `hphi` is materialized once per cycle regardless, so the
                     // matvec adds only one O(p²) HVP, preserving the matrix-free
                     // path's asymptotics where Firth is negligible (term = `None`).
@@ -14688,7 +14703,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // armed (and nonzero past the conditioning gate) the PCG
                         // operator becomes `H + S_λ + H_Φ`, matching the augmented
                         // RHS `(∇ℓ − S_λβ) + ∇Φ` set above and the dense spectral
-                        // fallback. `None` ⇒ byte-identical released matvec.
+                        // fallback. `None` keeps the unaugmented matvec.
                         let pcg_hphi_dense = inner_jeffreys_hphi.clone();
                         let pcg_hphi_op = inner_jeffreys_hphi.clone();
                         match &joint_hessian_source {
@@ -14804,14 +14819,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             joint_mode_diagonal_ridge,
                             joint_bundle,
                         );
-                        // Universal robustness (flag-gated): add the
+                        // Universal robustness: add the
                         // family-general Jeffreys curvature `H_Phi` to the
                         // penalized Hessian. This is the Tier-B coupled-Newton form
                         // of Firth: the reduced Fisher information `Z_J^T H Z_J`
                         // supplies the missing O(n) curvature that bounds a
-                        // near-separating coefficient to O(1). When the flag is
-                        // OFF `inner_jeffreys_term` is `None` and the step is
-                        // byte-identical to the released solver.
+                        // near-separating coefficient to O(1). When the Jeffreys
+                        // term is unavailable, the step stays unaugmented.
                         //
                         // `∇Φ` is NOT re-added here: `rhs` (and thus `spectral_rhs`)
                         // already carries `+∇Φ` from the single shared computation
@@ -15183,7 +15197,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // Jeffreys objective contribution at the trial point keeps the
                 // accept/reject objective consistent with the Jeffreys-modified
                 // Newton step. `states` already holds the trial coefficients
-                // (assigned + eta-refreshed above). No-op when the flag is OFF.
+                // (assigned + eta-refreshed above). No-op when the Jeffreys term
+                // is unavailable or condition-gated to zero.
                 if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                     trial_penalty += custom_family_joint_jeffreys_value(
                         family, &states, specs, &ranges, z_joint,
@@ -15613,7 +15628,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             );
             // Re-fold the Jeffreys objective at the accepted iterate so the
             // post-accept baseline matches the augmented objective the next
-            // cycle's trial points are compared against. No-op when flag OFF.
+            // cycle's trial points are compared against. No-op when the
+            // Jeffreys term is unavailable or condition-gated to zero.
             if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                 current_penalty +=
                     custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
@@ -15643,8 +15659,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // the near-separating span Firth is meant to bound (the residual the
             // outer REML then rejects). Fold `∇Φ` into the gradient used for the
             // KKT residual so the convergence criterion matches the augmented
-            // objective the step descends. No-op (byte-identical) when the flag
-            // is OFF: `joint_jeffreys_subspace` is `None`.
+            // objective the step descends. No-op when the Jeffreys term is
+            // unavailable or condition-gated to zero.
             let Some(gradient) = cached_joint_gradient.as_ref() else {
                 break;
             };
@@ -22340,8 +22356,8 @@ fn block_param_ranges(specs: &[ParameterBlockSpec]) -> Vec<(usize, usize)> {
 /// The per-block bases are embedded block-diagonally into the joint
 /// `total_p x m_total` matrix. Returns `None` only for an empty system.
 ///
-/// Gated by the caller on `robust_identification != Off`; never runs in the
-/// released solver.
+/// The Jeffreys conditioning gate, not the smoothing penalty null space,
+/// decides whether this basis contributes at the current iterate.
 fn build_joint_jeffreys_subspace(
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
@@ -22388,7 +22404,7 @@ fn build_joint_jeffreys_subspace(
 /// the current working point. Cheaper than the full term (no directional
 /// derivatives), used to keep the trust-region accept/reject objective
 /// consistent with the Jeffreys-modified Newton step. Returns `0.0` when there
-/// is no under-identified direction, the family exposes no exact joint Hessian,
+/// is no coefficient system, the family exposes no exact joint Hessian,
 /// or the reduced Fisher information is not yet SPD (the value contribution is
 /// then simply omitted for that trial point — the step machinery still bounds
 /// the coefficient, and the next accepted cycle re-folds a finite value).
@@ -22419,7 +22435,7 @@ fn custom_family_joint_jeffreys_value<F: CustomFamily + Clone + Send + Sync + 's
 
 /// Evaluate the family-general Jeffreys term `(Phi, grad, H_Phi)` at the current
 /// working point from the coupled joint Hessian (Tier-B path). Returns `None`
-/// when there is no under-identified direction or the family does not expose an
+/// when there is no coefficient system or the family does not expose an
 /// exact joint Hessian (in which case the term is inapplicable and the caller
 /// proceeds unchanged).
 fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -22450,11 +22466,9 @@ fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send + Sync + 'st
     Ok(Some(term))
 }
 
-/// Outer-REML Jeffreys curvature `H_Φ` for the coupled joint Hessian, scoped to
-/// the under-identified span `Z_J`. Returns `None` when the robust flag is OFF,
-/// the policy does not arm the family-general Firth term, there is no
-/// under-identified direction, or the family exposes no exact joint Hessian — in
-/// every such case the outer REML stays byte-identical to the released solver.
+/// Outer-REML full-span Jeffreys curvature `H_Φ` for the coupled joint Hessian.
+/// Returns `None` when there is no coefficient system or the family exposes no
+/// exact joint Hessian.
 ///
 /// This is the OUTER-path companion to the inner-Newton wiring: the LAML score
 /// uses `log|H + S_λ + H_Φ|` and its analytic ρ-derivatives
@@ -22499,10 +22513,10 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
 /// trace, mirroring Tier-A's `FirthAwareGlmDerivatives` `−D(Hφ)[B_k]` term.
 ///
 /// The closure takes the mode-response direction `δβ = dβ̂/dρ_k` (the wrapper
-/// performs `v_k → δβ = −v_k`) and returns `D_β H_Φ[δβ]`. Returns `None` (so the
-/// wrapper is not installed and behavior is byte-identical) when there is no
-/// under-identified span — i.e. exactly when `custom_family_outer_jeffreys_hphi`
-/// itself returns `None`. The per-direction conditioning gate and floored
+/// performs `v_k → δβ = −v_k`) and returns `D_β H_Φ[δβ]`. Returns `None` when
+/// there is no coefficient system — i.e. exactly when
+/// `custom_family_outer_jeffreys_hphi` itself returns `None`. The per-direction
+/// conditioning gate and floored
 /// pseudo-inverse inside `joint_jeffreys_hphi_directional_derivative` reproduce
 /// the value path's, so when the value's `H_Φ` is zero (gated/clean fit) the
 /// drift is identically zero too.
