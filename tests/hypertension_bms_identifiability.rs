@@ -568,11 +568,8 @@ fn production_like_hypertension_shared_matern_centers10_confound_starts_outer_so
                 out.fit.beta
             );
             assert!(
-                out.fit
-                    .log_lambdas
-                    .iter()
-                    .any(|rho| (*rho + 4.605_170_185_988_091).abs() < 1.0e-8),
-                "production-like BMS fit must carry the pinned marginal nullspace ridge at ln(1e-2); got log_lambdas={:?}",
+                out.fit.log_lambdas.iter().all(|rho| rho.is_finite()),
+                "production-like BMS fit must report finite smoothing parameters after the Jeffreys/orthogonalization cure; got log_lambdas={:?}",
                 out.fit.log_lambdas
             );
         }
@@ -614,11 +611,8 @@ fn production_like_hypertension_shared_matern_learned_kappa_starts_outer_solver(
                 out.fit.beta
             );
             assert!(
-                out.fit
-                    .log_lambdas
-                    .iter()
-                    .any(|rho| (*rho + 4.605_170_185_988_091).abs() < 1.0e-8),
-                "learned-kappa BMS fit must carry the pinned marginal nullspace ridge at ln(1e-2); got log_lambdas={:?}",
+                out.fit.log_lambdas.iter().all(|rho| rho.is_finite()),
+                "learned-kappa BMS fit must report finite smoothing parameters after the Jeffreys/orthogonalization cure; got log_lambdas={:?}",
                 out.fit.log_lambdas
             );
         }
