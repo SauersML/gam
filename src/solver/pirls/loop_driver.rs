@@ -677,26 +677,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 }
 
 /// `refine_dispersion_at_converged_eta`: when `true`, after the inner P-IRLS
-/// solve converges, re-estimate the family's estimated dispersion nuisance — the
-/// Gamma shape ν = 1/φ or the Beta precision φ — at the *converged* linear
-/// predictor and iterate the (β, dispersion) pair to its joint fixed point at the
-/// current λ (see the in-body comments at each refresh loop). This is ON only for
-/// the single final, reported fit at the REML-selected λ (#678 for Gamma, #769
-/// for Beta). It is deliberately OFF for every REML cost / sigma-point evaluation:
-/// re-profiling the dispersion against each trial λ's converged residuals would
-/// couple the scale to the smoothing parameter (a flat over-smoothed μ inflates
-/// the deviance ⇒ a smaller effective precision ⇒ a smaller `deviance/(2φ)` REML
-/// term), perversely rewarding over-smoothing and biasing λ selection. mgcv
-/// likewise estimates the scale at the converged fit, not inside the λ search.
-///
-/// The Gamma and Beta cases differ in what the re-solve buys. For Gamma the shape
-/// is a pure nuisance — β̂ is essentially scale-free — so the re-solve only keeps
-/// the reported dispersion and SEs self-consistent. For Beta the precision φ
-/// enters the *mean* score through the digamma terms
-/// `μ*ᵢ = ψ(μᵢφ) − ψ((1−μᵢ)φ)`, so a φ measured at the cold null predictor
-/// (μ ≈ 0.5) attenuates every slope toward zero; here the fixed point is
-/// load-bearing — it is what recovers the correct mean coefficients (the betareg
-/// alternating mean-fit ↔ φ-estimate scheme).
+/// solve converges, re-estimate estimated dispersion nuisances at the
+/// *converged* linear predictor and iterate the pair to its fixed point at the
+/// current λ. This is ON only for the final, reported fit at the REML-selected
+/// λ (#678, #769, #771). It is deliberately OFF for every REML cost /
+/// sigma-point evaluation so trial λ scores cannot be biased by re-profiling
+/// scale against each trial fit.
 pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix> + Clone>(
     rho: LogSmoothingParamsView<'_>,
     problem: PirlsProblem<'a, X>,
