@@ -115,7 +115,20 @@ impl NoiseModel {
                 Ok(NoiseModel::NegativeBinomial { theta })
             }
             ResponseFamily::Beta { phi } => {
-                let phi = *phi;
+                // The Beta precision φ is estimated jointly with the mean
+                // (issue #567), so the authoritative value after fitting is the
+                // dispersion handed in as `gaussian_scale` — exactly as Gamma's
+                // shape and Tweedie's φ already take theirs. The `phi` embedded
+                // in the response spec is only the construction-time *seed* (left
+                // at its original value, e.g. 1.0, after the fit refreshes the
+                // estimate in `likelihood_scale`), so it serves solely as a
+                // fallback for fit-free construction where no fitted dispersion
+                // is supplied. Reading the seed instead of `gaussian_scale` was
+                // issue #770: the generative/observation path drew Beta responses
+                // with φ = 1.0 regardless of the data — nearly uniform on (0,1),
+                // ~20× too much variance — even though the fit estimated φ and
+                // the caller forwarded it here.
+                let phi = gaussian_scale.unwrap_or(*phi);
                 if !(phi.is_finite() && phi > 0.0) {
                     crate::bail_invalid_estim!(
                         "beta-regression phi must be finite and > 0; got {phi}"

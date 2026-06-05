@@ -102,9 +102,7 @@ fn make_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
         let b = 0.7 * rng.normal();
         let eta = (0.4 + 0.8 * a - 0.5 * b).clamp(-2.2, 2.2);
         let mu = logistic(eta);
-        let yi = rng
-            .beta(mu * PHI, (1.0 - mu) * PHI)
-            .clamp(1.0e-6, 1.0 - 1.0e-6);
+        let yi = rng.beta(mu * PHI, (1.0 - mu) * PHI).clamp(1.0e-6, 1.0 - 1.0e-6);
         x1.push(a);
         x2.push(b);
         y.push(yi);
@@ -116,7 +114,11 @@ fn encode(y: &[f64], x1: &[f64], x2: &[f64]) -> gam::inference::data::EncodedDat
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows: Vec<csv::StringRecord> = (0..y.len())
         .map(|i| {
-            csv::StringRecord::from(vec![y[i].to_string(), x1[i].to_string(), x2[i].to_string()])
+            csv::StringRecord::from(vec![
+                y[i].to_string(),
+                x1[i].to_string(),
+                x2[i].to_string(),
+            ])
         })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode beta dataset")
