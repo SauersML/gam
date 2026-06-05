@@ -734,18 +734,24 @@ fn marginal_penalties_with_influence_ridge(
     // null space of the sum. With no penalties (pure-parametric marginal) the
     // aggregate is zero and the shrinkage is the identity on all `p_m` columns.
     //
-    // This nullspace-shrinkage ridge stays ACTIVE even under `robust.firth_general`.
-    // The marginal duchon surface's polynomial nullspace is a DISTINCT pathology
-    // from the marginal↔logslope confound: the identifiable-subspace Firth/Jeffreys
-    // prior supplies proper-prior curvature on the *identifiable* directions, but it
-    // does not fully constrain the marginal smooth's polynomial null space (the
-    // directions the term-collection penalties leave with zero mass). Retiring this
-    // ridge under Firth left the outer REML non-convergent (gam#754): the named
-    // `marginal_surface` block carried the residual along its unconstrained
-    // polynomial nullspace. The OVERLAP ridge (2) below IS correctly retired under
-    // `orthogonalize_confounds` (the reduced-basis orthogonalization replaces it),
-    // but the nullspace ridge addresses an orthogonal pathology and must remain.
-    if p_m > 0 {
+    // RETIRED under `robust.firth_general` (subsumed by full-span Jeffreys).
+    // This pinned ridge supplied curvature on the marginal block's polynomial
+    // nullspace (the unpenalized directions the term-collection penalties leave
+    // with zero mass). The full-identifiable-span Jeffreys term (`Z_J = I`, see
+    // `jeffreys_subspace_from_penalty`) now supplies automatic O(n)-scaled
+    // curvature on EVERY under-identified direction — including exactly that
+    // polynomial nullspace — so the hand-pinned ridge is redundant when Firth is
+    // armed. (An earlier attempt to retire it left REML non-convergent, but that
+    // was under the OLD `ker(S)`-scoped Jeffreys span, which by construction
+    // overlapped the same nullspace the ridge covered and so could not add
+    // independent curvature; full-span Jeffreys reaches every direction.)
+    // Validated empirically: retiring it leaves the bms/firth/hypertension
+    // baselines unchanged. When `firth_general` is OFF (default) the ridge stays
+    // installed and the block specs are byte-identical to the released solver.
+    // The OVERLAP ridge (2) below is likewise retired, but under
+    // `orthogonalize_confounds`, since it addresses the distinct
+    // marginal↔logslope structural confound resolved by reparameterization.
+    if p_m > 0 && !robust.firth_general {
         let mut aggregate = Array2::<f64>::zeros((p_m, p_m));
         for bp in &design.penalties {
             let scale = bp
