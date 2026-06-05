@@ -385,9 +385,12 @@ def _emit_joint_pc_term(
         if pc_basis in {"thinplate", "tps"}:
             return f"thinplate({cols}, centers={knot_count}{dp})"
         if pc_basis == "duchon":
+            # With order=0 (p_order=1), the Duchon center-collision derivative
+            # phi^(2)(0) exists iff 2*(p+s) > dimension+2, i.e. s > dimension/2.
+            # The smallest integer power satisfying this strictly is dim//2 + 1.
             return (
                 f"duchon({cols}, centers={knot_count}, "
-                f"order=0, power={max(1, len(pc_cols) // 2)}, length_scale=1.0)"
+                f"order=0, power={len(pc_cols) // 2 + 1}, length_scale=1.0)"
             )
         if pc_basis == "matern":
             return f"matern({cols}, centers={knot_count}{dp})"
@@ -431,7 +434,10 @@ def _requires_joint_spatial_term(cfg: dict[str, typing.Any] | None) -> bool:
 
 
 def _rust_duchon_options_for_dimension(dimension: int) -> str:
-    power = max(1, dimension // 2)
+    # With order=0 (p_order=1), the Duchon center-collision derivative
+    # phi^(2)(0) exists iff 2*(p+s) > dimension+2, i.e. s > dimension/2.
+    # The smallest integer power satisfying this strictly is dim//2 + 1.
+    power = dimension // 2 + 1
     return f", order=0, power={power}, length_scale=1.0"
 
 

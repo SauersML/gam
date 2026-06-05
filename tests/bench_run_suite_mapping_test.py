@@ -356,7 +356,9 @@ class RunSuiteMappingTests(unittest.TestCase):
             ", double_penalty=true",
         )
         self.assertIn("order=0", term)
-        self.assertIn("power=8", term)
+        # Joint 16-PC Duchon needs power=dim//2+1=9 so phi^(2)(0) exists
+        # strictly (2*(1+9)=20 > 16+2=18).
+        self.assertIn("power=9", term)
         self.assertIn("length_scale=1.0", term)
         self.assertNotIn("double_penalty", term)
 

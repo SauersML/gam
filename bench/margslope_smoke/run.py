@@ -1,7 +1,7 @@
 """Biobank-shape margslope-Duchon perf probe.
 
 Mirrors the failing biobank shard `rust_margslope_aniso_duchon16d_rigid`
-exactly (16 PCs, 24 centers, order=0, power=8, length_scale=1, with
+exactly (16 PCs, 24 centers, order=0, power=9, length_scale=1, with
 --scale-dimensions for anisotropy). Runs at multiple sizes with a hard
 per-fit wall budget so we can locate the dominant cost without burning
 hours.
@@ -42,7 +42,7 @@ GEN_PY = Path(__file__).resolve().parent / "gen.py"
 DUCHON_TERM = (
     "duchon(pc1_std, pc2_std, pc3_std, pc4_std, pc5_std, pc6_std, pc7_std, "
     "pc8_std, pc9_std, pc10_std, pc11_std, pc12_std, pc13_std, pc14_std, "
-    "pc15_std, pc16_std, centers=24, order=0, power=8, length_scale=1)"
+    "pc15_std, pc16_std, centers=24, order=0, power=9, length_scale=1)"
 )
 MEAN_FORMULA = (
     f"phenotype ~ link(type=probit) + sex + smooth(age_entry_std) + {DUCHON_TERM}"
