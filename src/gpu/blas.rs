@@ -147,6 +147,16 @@ mod cuda_impl {
         weights: ArrayView1<'_, f64>,
         right: ArrayView2<'_, f64>,
     ) -> Option<Array2<f64>> {
+        weighted_crossprod_for(runtime.device.ordinal, left, weights, right)
+    }
+
+    #[inline]
+    fn weighted_crossprod_for(
+        ordinal: usize,
+        left: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        right: ArrayView2<'_, f64>,
+    ) -> Option<Array2<f64>> {
         let (rows, left_cols) = left.dim();
         let (right_rows, right_cols) = right.dim();
         if rows == 0
@@ -158,7 +168,7 @@ mod cuda_impl {
             return None;
         }
 
-        let (stream, blas) = stream_and_blas(runtime)?;
+        let (stream, blas) = stream_and_blas_for(ordinal)?;
         let left_col = to_col_major(&left);
         let right_col = to_col_major(&right);
         let weights_host = vector_values(weights);
@@ -444,6 +454,19 @@ mod cuda_impl {
     }
 
     #[inline]
+    pub(crate) fn xt_diag_x_on_ordinal_cuda(
+        ordinal: usize,
+        x: ArrayView2<'_, f64>,
+        w: ArrayView1<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        let (rows, cols) = x.dim();
+        if rows == 0 || cols == 0 || rows != w.len() {
+            return None;
+        }
+        weighted_crossprod_for(ordinal, x, w, x)
+    }
+
+    #[inline]
     pub(crate) fn xt_diag_y_cuda(
         runtime: &GpuRuntime,
         x: ArrayView2<'_, f64>,
@@ -548,5 +571,6 @@ mod cuda_impl {
 #[cfg(target_os = "linux")]
 pub(crate) use cuda_impl::{
     gemm_abt_strided_batched_cuda, gemm_broadcast_b_batched_cuda, gemm_cuda, gemm_on_ordinal_cuda,
-    gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda, xt_diag_y_cuda,
+    gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda, xt_diag_x_on_ordinal_cuda,
+    xt_diag_y_cuda,
 };

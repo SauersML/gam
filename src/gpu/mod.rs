@@ -12,6 +12,8 @@ pub mod backend_probe;
 pub mod blas;
 pub mod bms_flex;
 pub mod bms_flex_row;
+#[cfg(target_os = "linux")]
+pub mod calibration;
 pub mod common;
 pub mod cpu_traits;
 pub mod cubic_bspline_moments;

@@ -186,7 +186,7 @@ impl GpuRuntime {
                 return Ok(None);
             };
 
-            let policy = GpuDispatchPolicy::default();
+            let policy = crate::gpu::calibration::calibrated_policy_for_device(&device);
             let memory_budget_bytes = device.free_mem_bytes.min(device.total_mem_bytes / 2);
             diagnostics::log_cuda_enabled(&device, &policy);
             diagnostics::log_cuda_pool(&devices);
