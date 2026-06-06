@@ -48,6 +48,8 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
         mean: array![0.2, 0.8],
         mean_lower: None,
         mean_upper: None,
+        observation_lower: None,
+        observation_upper: None,
     };
     enrich_posterior_mean_bounds(
         &mut beta_result,
@@ -70,6 +72,8 @@ fn enrich_posterior_mean_bounds_clamps_domains_for_probability_and_count_familie
         mean: array![0.0, 0.0],
         mean_lower: None,
         mean_upper: None,
+        observation_lower: None,
+        observation_upper: None,
     };
     enrich_posterior_mean_bounds(
         &mut pois_result,

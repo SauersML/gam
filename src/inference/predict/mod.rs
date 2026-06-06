@@ -710,16 +710,20 @@ pub trait PredictableModel {
     /// This is the canonical response-scale prediction path for nonlinear
     /// models and the default semantics exposed by the CLI.
     ///
-    /// When `confidence_level` is `Some(α)` with α ∈ (0, 1), the result
+    /// When `options.confidence_level` is `Some(α)` with α ∈ (0, 1), the result
     /// includes `mean_lower` / `mean_upper` confidence bounds.  Each predictor
     /// computes bounds using the method natural to its parameterisation
     /// (TransformEta for eta-scale SE, response-scale Delta for probability-
-    /// scale SE).
+    /// scale SE). `options.covariance_mode` selects the covariance source for the
+    /// reported SE / bounds / observation band (the point itself always
+    /// integrates the conditional posterior; issue #398), and
+    /// `options.include_observation_interval` additionally emits the response-
+    /// scale observation (prediction) band for families that support it.
     fn predict_posterior_mean(
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        confidence_level: Option<f64>,
+        options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError>;
 
     /// Number of coefficient blocks in the model.
@@ -992,6 +996,10 @@ impl PredictionTransform for StandardPredictor {
         let spec = spec_from_family_link(self.family.clone(), self.link_kind.as_ref());
         ResponseBounds::for_family(&spec.response)
     }
+
+    fn response_family(&self) -> ResponseFamily {
+        self.family.response.clone()
+    }
 }
 
 impl PredictableModel for StandardPredictor {
@@ -1134,12 +1142,18 @@ impl PredictableModel for StandardPredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        confidence_level: Option<f64>,
+        options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Wiggle-free standard fits use the dedicated posterior-mean engine
         // (bias correction via the fit-derived strategy); the link-wiggle path
         // shares the generic posterior-mean driver.
         if self.link_wiggle.is_none() {
+            // POINT: the posterior mean `E[g⁻¹(η)]` integrates the *conditional*
+            // posterior. This is the single reported point estimate regardless of
+            // whether (or how) uncertainty is requested (issue #398), so it is
+            // always built from the conditional covariance — never the
+            // smoothing-widened one. `covariance_mode` only shapes the
+            // uncertainty attached below.
             let backend = posterior_mean_backend_or_warn(
                 fit,
                 self.covariance.as_ref(),
@@ -1163,17 +1177,64 @@ impl PredictableModel for StandardPredictor {
                 "standard posterior mean",
                 fit.bias_correction_beta().map(|b| b.view()),
             )?;
-            if let Some(level) = confidence_level {
-                enrich_posterior_mean_bounds(
-                    &mut result,
-                    level,
+            if let Some(level) = options.confidence_level {
+                // UNCERTAINTY: the reported SE, credible bounds and observation
+                // band honour `covariance_mode`. We borrow the SE / TransformEta
+                // mean bounds / mean-scale SE from the shared full-uncertainty
+                // engine (which threads the mode through `select_uncertainty_
+                // backend` and resolves any fitted adaptive-link state), but keep
+                // the posterior-mean point above and re-centre the observation
+                // band on it — so the point is unchanged while the bands widen to
+                // include smoothing-parameter uncertainty exactly as for the
+                // non-posterior-mean families. (Issues #811/#812: this dispatch
+                // arm previously ignored both `observation_interval` and
+                // `covariance_mode`.)
+                let unc_options = PredictUncertaintyOptions {
+                    confidence_level: level,
+                    covariance_mode: options.covariance_mode,
+                    mean_interval_method: MeanIntervalMethod::TransformEta,
+                    // The observation band is recomputed below, centred on the
+                    // posterior-mean point rather than the plug-in point.
+                    includeobservation_interval: false,
+                    // The point already carries any bias correction; asking the
+                    // engine to re-apply it would double-count and shift the SE
+                    // basis. We only consume its SE / bounds.
+                    apply_bias_correction: false,
+                    ..PredictUncertaintyOptions::default()
+                };
+                let unc = predict_gamwith_uncertainty(
+                    input.design.clone(),
+                    self.beta.view(),
+                    input.offset.view(),
                     self.family.clone(),
-                    self.link_kind.as_ref(),
+                    fit,
+                    &unc_options,
                 )?;
+                result.eta_standard_error = unc.eta_standard_error;
+                result.mean_lower = Some(unc.mean_lower);
+                result.mean_upper = Some(unc.mean_upper);
+                if options.include_observation_interval {
+                    let z = standard_normal_quantile(0.5 + 0.5 * level)
+                        .map_err(EstimationError::InvalidInput)?;
+                    let z_row = Array1::from_elem(result.eta.len(), z);
+                    let etavar = result.eta_standard_error.mapv(|s| s * s);
+                    let (obs_lower, obs_upper) = family_observation_band(
+                        &self.family.response,
+                        &result.eta,
+                        &etavar,
+                        &result.mean,
+                        &unc.mean_standard_error,
+                        &z_row,
+                        &z_row,
+                        fit,
+                    );
+                    result.observation_lower = obs_lower;
+                    result.observation_upper = obs_upper;
+                }
             }
             return Ok(result);
         }
-        predict_posterior_mean_generic(self, input, fit, confidence_level)
+        predict_posterior_mean_generic(self, input, fit, options)
     }
 
     fn n_blocks(&self) -> usize {
@@ -3382,6 +3443,10 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
     fn bounds(&self) -> ResponseBounds {
         ResponseBounds::for_family(&self.likelihood_family().response)
     }
+
+    fn response_family(&self) -> ResponseFamily {
+        self.likelihood_family().response.clone()
+    }
 }
 
 impl PredictableModel for BernoulliMarginalSlopePredictor {
@@ -3420,9 +3485,9 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        confidence_level: Option<f64>,
+        options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        predict_posterior_mean_generic(self, input, fit, confidence_level)
+        predict_posterior_mean_generic(self, input, fit, options)
     }
 
     fn n_blocks(&self) -> usize {
@@ -3626,6 +3691,10 @@ impl PredictionTransform for GaussianLocationScalePredictor {
         ResponseBounds::UNBOUNDED
     }
 
+    fn response_family(&self) -> ResponseFamily {
+        ResponseFamily::Gaussian
+    }
+
     fn observation_noise(
         &self,
         input: &PredictInput,
@@ -3683,9 +3752,9 @@ impl PredictableModel for GaussianLocationScalePredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        confidence_level: Option<f64>,
+        options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        predict_posterior_mean_generic(self, input, fit, confidence_level)
+        predict_posterior_mean_generic(self, input, fit, options)
     }
 
     fn n_blocks(&self) -> usize {
@@ -4214,6 +4283,10 @@ impl PredictionTransform for BinomialLocationScalePredictor {
     fn bounds(&self) -> ResponseBounds {
         ResponseBounds::UNIT_PROBABILITY
     }
+
+    fn response_family(&self) -> ResponseFamily {
+        ResponseFamily::Binomial
+    }
 }
 
 impl PredictableModel for BinomialLocationScalePredictor {
@@ -4254,9 +4327,9 @@ impl PredictableModel for BinomialLocationScalePredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        confidence_level: Option<f64>,
+        options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        predict_posterior_mean_generic(self, input, fit, confidence_level)
+        predict_posterior_mean_generic(self, input, fit, options)
     }
 
     fn n_blocks(&self) -> usize {
@@ -4627,6 +4700,13 @@ impl PredictionTransform for SurvivalPredictor {
     fn bounds(&self) -> ResponseBounds {
         ResponseBounds::UNIT_PROBABILITY
     }
+
+    fn response_family(&self) -> ResponseFamily {
+        // Survival reports the survival probability `S(t)`; its observation noise
+        // is handled by the survival-specific interval path, so the GLM-style
+        // observation band is intentionally absent (`RoystonParmar` ⇒ no band).
+        ResponseFamily::RoystonParmar
+    }
 }
 
 impl PredictableModel for SurvivalPredictor {
@@ -4665,9 +4745,9 @@ impl PredictableModel for SurvivalPredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        confidence_level: Option<f64>,
+        options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
-        predict_posterior_mean_generic(self, input, fit, confidence_level)
+        predict_posterior_mean_generic(self, input, fit, options)
     }
 
     fn n_blocks(&self) -> usize {
@@ -4739,6 +4819,12 @@ impl PredictionTransform for TransformationNormalPredictor {
     fn bounds(&self) -> ResponseBounds {
         ResponseBounds::UNBOUNDED
     }
+
+    fn response_family(&self) -> ResponseFamily {
+        // The transformed scale `h(y)` is modelled as Gaussian; the identity-η
+        // observation band uses the residual SD.
+        ResponseFamily::Gaussian
+    }
 }
 
 impl PredictableModel for TransformationNormalPredictor {
@@ -4784,14 +4870,20 @@ impl PredictableModel for TransformationNormalPredictor {
         &self,
         input: &PredictInput,
         fit: &UnifiedFitResult,
-        confidence_level: Option<f64>,
+        options: &PosteriorMeanOptions,
     ) -> Result<PredictPosteriorMeanResult, EstimationError> {
         // Bounds are only defined once a fit covariance exists; the SE is zero,
         // so the engine's identity-η path collapses the bounds onto `h`.
         let has_fit_covariance =
             fit.covariance_corrected.is_some() || fit.covariance_conditional.is_some();
-        let bound_level = has_fit_covariance.then_some(confidence_level).flatten();
-        predict_posterior_mean_generic(self, input, fit, bound_level)
+        let bound_level = has_fit_covariance
+            .then_some(options.confidence_level)
+            .flatten();
+        let bounded_options = PosteriorMeanOptions {
+            confidence_level: bound_level,
+            ..*options
+        };
+        predict_posterior_mean_generic(self, input, fit, &bounded_options)
     }
 
     fn n_blocks(&self) -> usize {
@@ -4861,6 +4953,64 @@ pub struct PredictPosteriorMeanResult {
     /// Response-scale upper confidence bound (set by
     /// [`enrich_posterior_mean_bounds`]).
     pub mean_upper: Option<Array1<f64>>,
+    /// Response-scale observation (prediction) interval lower bound. `Some` only
+    /// when the caller set [`PosteriorMeanOptions::include_observation_interval`]
+    /// *and* the response family exposes a closed-form conditional variance; the
+    /// band is `μ ± z·√(Var(μ̂) + Var(Y|μ))` clamped to the response support
+    /// (built via [`family_observation_band`]).
+    pub observation_lower: Option<Array1<f64>>,
+    /// Response-scale observation (prediction) interval upper bound; companion of
+    /// [`PredictPosteriorMeanResult::observation_lower`].
+    pub observation_upper: Option<Array1<f64>>,
+}
+
+/// Options for the posterior-mean prediction path
+/// ([`PredictableModel::predict_posterior_mean`]).
+///
+/// The posterior-mean *point* `E[g⁻¹(η)]` always integrates the **conditional**
+/// posterior, so the reported point is invariant to whether — and how — an
+/// interval is requested (issue #398). These options shape only the
+/// *uncertainty* attached on top of that fixed point:
+///
+///   * `confidence_level` — `Some(level)` adds the η-scale SE and the
+///     response-scale credible bounds; `None` returns point predictions only
+///     (and `covariance_mode` / `include_observation_interval` are ignored).
+///   * `covariance_mode` — covariance source for the reported SE, credible
+///     bounds and observation band (conditional `H⁻¹` vs. smoothing-corrected
+///     `H⁻¹ + J·Var(ρ̂)·Jᵀ`), exactly as for [`PredictUncertaintyOptions`]. The
+///     posterior-mean point is unaffected.
+///   * `include_observation_interval` — emit the response-scale observation
+///     (prediction) band `μ ± z·√(Var(μ̂) + Var(Y|μ))` for families that expose
+///     a conditional response variance (Binomial `p(1−p)`, Poisson `μ`, …).
+#[derive(Clone, Copy, Debug)]
+pub struct PosteriorMeanOptions {
+    pub confidence_level: Option<f64>,
+    pub covariance_mode: InferenceCovarianceMode,
+    pub include_observation_interval: bool,
+}
+
+impl PosteriorMeanOptions {
+    /// Point predictions only — no SE, credible bounds, or observation interval.
+    pub fn point_only() -> Self {
+        Self {
+            confidence_level: None,
+            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            include_observation_interval: false,
+        }
+    }
+
+    /// Credible bounds at `level` with the default smoothing-preferred
+    /// covariance and no observation interval — the common default request. The
+    /// smoothing-preferred default matches [`PredictUncertaintyOptions`] so the
+    /// posterior-mean families (binomial, link-wiggle) include the same
+    /// smoothing-parameter uncertainty every other family does by default.
+    pub fn with_level(level: f64) -> Self {
+        Self {
+            confidence_level: Some(level),
+            covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            include_observation_interval: false,
+        }
+    }
 }
 
 /// Compute and attach TransformEta confidence bounds to a posterior-mean result.
@@ -5257,6 +5407,8 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
         mean: Array1::from_vec(means?),
         mean_lower: None,
         mean_upper: None,
+        observation_lower: None,
+        observation_upper: None,
     })
 }
 
@@ -5424,6 +5576,138 @@ where
 /// Exact analytic representation (Mellin-Barnes) for I(λ):
 ///   I(λ) = (1/(2πi)) ∫_{c-i∞}^{c+i∞} Γ(z) λ^{-z} exp(-μ z + 0.5 σ² z²) dz, c>0.
 /// This Mellin-Barnes integral is mathematically exact.
+/// Build the response-scale observation (prediction) interval band
+/// `μ ± z·√(Var(μ̂) + Var(Y|μ))`, clamped to the family's response support.
+///
+/// `Var(μ̂)` is the squared mean-scale SE (estimation uncertainty); `Var(Y|μ)`
+/// is the family's conditional response variance evaluated at the point mean
+/// (Poisson `μ`, Binomial `p(1−p)`, Gamma `φμ²`, NegBin `μ+μ²/θ`, Beta
+/// `μ(1−μ)/(1+φ)`). The Gaussian identity-link arm instead widens on the η scale
+/// directly with the residual SD. Returns `(None, None)` for families without a
+/// closed-form conditional response variance (`RoystonParmar`).
+///
+/// For a bounded or half-bounded response (a count, a positive value, a
+/// proportion) the symmetric band crosses the support edge for a small/extreme
+/// fitted mean, reporting impossible values — so it is floored/capped at the
+/// family's response support. This is distinct from the *mean*-interval clamp
+/// (`ResponseBounds::for_family`), which is `None` for the non-negative-real
+/// families because their default mean interval rides a positive inverse-link
+/// transform.
+///
+/// Shared by [`predict_gamwith_uncertainty`] and the posterior-mean drivers so
+/// the per-family observation-noise definition has a single source of truth.
+pub(crate) fn family_observation_band<S>(
+    response: &ResponseFamily,
+    eta: &Array1<f64>,
+    etavar: &Array1<f64>,
+    mean: &Array1<f64>,
+    mean_standard_error: &Array1<f64>,
+    z_lower_per_row: &Array1<f64>,
+    z_upper_per_row: &Array1<f64>,
+    source: &S,
+) -> (Option<Array1<f64>>, Option<Array1<f64>>)
+where
+    S: UncertaintyCovarianceSource + ?Sized,
+{
+    let observation_support = ResponseBounds::response_support(response);
+    let clamp_to_support = |mut lower: Array1<f64>, mut upper: Array1<f64>| {
+        observation_support.clamp_in_place(&mut lower);
+        observation_support.clamp_in_place(&mut upper);
+        (Some(lower), Some(upper))
+    };
+    let response_observation_bounds = |response_var: Array1<f64>| {
+        let obs_se = Array1::from_iter(
+            mean_standard_error
+                .iter()
+                .zip(response_var.iter())
+                .map(|(&mean_se, &obsvar)| (mean_se.powi(2) + obsvar).max(0.0).sqrt()),
+        );
+        let lower = Array1::from_iter(
+            mean.iter()
+                .zip(obs_se.iter())
+                .zip(z_lower_per_row.iter())
+                .map(|((&m, &s), &zl)| m - zl * s),
+        );
+        let upper = Array1::from_iter(
+            mean.iter()
+                .zip(obs_se.iter())
+                .zip(z_upper_per_row.iter())
+                .map(|((&m, &s), &zu)| m + zu * s),
+        );
+        clamp_to_support(lower, upper)
+    };
+
+    match response {
+        ResponseFamily::Gaussian => {
+            let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
+            let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
+            let lower = Array1::from_iter(
+                eta.iter()
+                    .zip(obs_se.iter())
+                    .zip(z_lower_per_row.iter())
+                    .map(|((&e, &s), &zl)| e - zl * s),
+            );
+            let upper = Array1::from_iter(
+                eta.iter()
+                    .zip(obs_se.iter())
+                    .zip(z_upper_per_row.iter())
+                    .map(|((&e, &s), &zu)| e + zu * s),
+            );
+            clamp_to_support(lower, upper)
+        }
+        ResponseFamily::Poisson => {
+            let response_var = mean.mapv(|mu| mu.max(0.0));
+            response_observation_bounds(response_var)
+        }
+        ResponseFamily::NegativeBinomial { theta } => {
+            // `theta` is estimated jointly with the mean (#802) and recorded
+            // in `likelihood_scale` (`EstimatedNegBinTheta`). Read the fitted
+            // value via `observation_theta()` (the saved family variant also
+            // carries it post-fit); fall back to the enum seed only for
+            // raw-covariance sources that expose no fitted scale. Using the
+            // seed `theta = 1` made the predictive variance `mu + mu^2`
+            // ignore the data's overdispersion.
+            let theta = source.observation_theta().unwrap_or(*theta);
+            let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
+            response_observation_bounds(response_var)
+        }
+        ResponseFamily::Tweedie { p } => {
+            let phi = source.observation_phi().unwrap_or(1.0);
+            let response_var = mean.mapv(|mu| phi * mu.powf(*p));
+            response_observation_bounds(response_var)
+        }
+        ResponseFamily::Gamma => {
+            let phi = source.observation_phi().unwrap_or(1.0);
+            let response_var = mean.mapv(|mu| phi * mu.powi(2));
+            response_observation_bounds(response_var)
+        }
+        ResponseFamily::Beta { phi } => {
+            // Beta's precision is estimated jointly with the mean (#567/#769)
+            // and recorded in `likelihood_scale` (`EstimatedBetaPhi`), NOT on
+            // this family enum (whose `phi` stays at the construction seed).
+            // Read the fitted precision via `observation_phi()` like the
+            // Tweedie/Gamma arms above; fall back to the enum seed only when
+            // no fitted scale is available (raw-covariance sources). Using the
+            // seed made the response-noise term `μ(1−μ)/2` — for high-precision
+            // data the interval was `√((1+φ̂)/2)` too wide (#801, companion of
+            // the #770 generate-path fix).
+            let phi = source.observation_phi().unwrap_or(*phi);
+            let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
+            response_observation_bounds(response_var)
+        }
+        ResponseFamily::Binomial => {
+            // Prediction returns probability/proportion means; trial counts are not in this API.
+            // Beta-logistic and mixture links use the closest conditional Bernoulli variance.
+            let response_var = mean.mapv(|mu| {
+                let p = mu.clamp(0.0, 1.0);
+                p * (1.0 - p)
+            });
+            response_observation_bounds(response_var)
+        }
+        ResponseFamily::RoystonParmar => (None, None),
+    }
+}
+
 pub fn predict_gamwith_uncertainty<X, S>(
     x: X,
     beta: ArrayView1<'_, f64>,
@@ -5729,112 +6013,16 @@ where
     response_bounds.clamp_in_place(&mut mean_upper);
 
     let (observation_lower, observation_upper) = if options.includeobservation_interval {
-        // The observation (prediction) interval is the symmetric response-scale
-        // band `μ ± z·σ_pred`. For a bounded or half-bounded response (a count,
-        // a positive value, a proportion) that band crosses the support edge for
-        // a small/extreme fitted mean, reporting impossible values — so it is
-        // floored/capped at the family's response support. This is distinct from
-        // the *mean*-interval clamp (`ResponseBounds::for_family`), which is
-        // `None` for the non-negative-real families because their default mean
-        // interval rides a positive inverse-link transform; see
-        // `ResponseFamily::response_support_bounds`.
-        let observation_support = ResponseBounds::response_support(&spec.response);
-        let clamp_to_support = |mut lower: Array1<f64>, mut upper: Array1<f64>| {
-            observation_support.clamp_in_place(&mut lower);
-            observation_support.clamp_in_place(&mut upper);
-            (Some(lower), Some(upper))
-        };
-        let response_observation_bounds = |response_var: Array1<f64>| {
-            let obs_se = Array1::from_iter(
-                mean_standard_error
-                    .iter()
-                    .zip(response_var.iter())
-                    .map(|(&mean_se, &obsvar)| (mean_se.powi(2) + obsvar).max(0.0).sqrt()),
-            );
-            let lower = Array1::from_iter(
-                mean.iter()
-                    .zip(obs_se.iter())
-                    .zip(z_lower_per_row.iter())
-                    .map(|((&m, &s), &zl)| m - zl * s),
-            );
-            let upper = Array1::from_iter(
-                mean.iter()
-                    .zip(obs_se.iter())
-                    .zip(z_upper_per_row.iter())
-                    .map(|((&m, &s), &zu)| m + zu * s),
-            );
-            clamp_to_support(lower, upper)
-        };
-
-        match &spec.response {
-            ResponseFamily::Gaussian => {
-                let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
-                let obs_se = etavar.mapv(|v| (v + obsvar).max(0.0).sqrt());
-                let lower = Array1::from_iter(
-                    eta.iter()
-                        .zip(obs_se.iter())
-                        .zip(z_lower_per_row.iter())
-                        .map(|((&e, &s), &zl)| e - zl * s),
-                );
-                let upper = Array1::from_iter(
-                    eta.iter()
-                        .zip(obs_se.iter())
-                        .zip(z_upper_per_row.iter())
-                        .map(|((&e, &s), &zu)| e + zu * s),
-                );
-                clamp_to_support(lower, upper)
-            }
-            ResponseFamily::Poisson => {
-                let response_var = mean.mapv(|mu| mu.max(0.0));
-                response_observation_bounds(response_var)
-            }
-            ResponseFamily::NegativeBinomial { theta } => {
-                // `theta` is estimated jointly with the mean (#802) and recorded
-                // in `likelihood_scale` (`EstimatedNegBinTheta`). Read the fitted
-                // value via `observation_theta()` (the saved family variant also
-                // carries it post-fit); fall back to the enum seed only for
-                // raw-covariance sources that expose no fitted scale. Using the
-                // seed `theta = 1` made the predictive variance `mu + mu^2`
-                // ignore the data's overdispersion.
-                let theta = source.observation_theta().unwrap_or(*theta);
-                let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
-                response_observation_bounds(response_var)
-            }
-            ResponseFamily::Tweedie { p } => {
-                let phi = source.observation_phi().unwrap_or(1.0);
-                let response_var = mean.mapv(|mu| phi * mu.powf(*p));
-                response_observation_bounds(response_var)
-            }
-            ResponseFamily::Gamma => {
-                let phi = source.observation_phi().unwrap_or(1.0);
-                let response_var = mean.mapv(|mu| phi * mu.powi(2));
-                response_observation_bounds(response_var)
-            }
-            ResponseFamily::Beta { phi } => {
-                // Beta's precision is estimated jointly with the mean (#567/#769)
-                // and recorded in `likelihood_scale` (`EstimatedBetaPhi`), NOT on
-                // this family enum (whose `phi` stays at the construction seed).
-                // Read the fitted precision via `observation_phi()` like the
-                // Tweedie/Gamma arms above; fall back to the enum seed only when
-                // no fitted scale is available (raw-covariance sources). Using the
-                // seed made the response-noise term `μ(1−μ)/2` — for high-precision
-                // data the interval was `√((1+φ̂)/2)` too wide (#801, companion of
-                // the #770 generate-path fix).
-                let phi = source.observation_phi().unwrap_or(*phi);
-                let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
-                response_observation_bounds(response_var)
-            }
-            ResponseFamily::Binomial => {
-                // Prediction returns probability/proportion means; trial counts are not in this API.
-                // Beta-logistic and mixture links use the closest conditional Bernoulli variance.
-                let response_var = mean.mapv(|mu| {
-                    let p = mu.clamp(0.0, 1.0);
-                    p * (1.0 - p)
-                });
-                response_observation_bounds(response_var)
-            }
-            ResponseFamily::RoystonParmar => (None, None),
-        }
+        family_observation_band(
+            &spec.response,
+            &eta,
+            &etavar,
+            &mean,
+            &mean_standard_error,
+            &z_lower_per_row,
+            &z_upper_per_row,
+            source,
+        )
     } else {
         (None, None)
     };
@@ -6820,7 +7008,7 @@ mod tests {
         };
 
         let out = predictor
-            .predict_posterior_mean(&input, &fit, None)
+            .predict_posterior_mean(&input, &fit, &PosteriorMeanOptions::point_only())
             .expect("gaussian location-scale posterior mean");
         assert!((out.eta_standard_error[0] - 2.0).abs() <= 1e-12);
     }
@@ -6955,7 +7143,7 @@ mod tests {
             .predict_plugin_response(&input)
             .expect("cloglog survival point prediction");
         let posterior = predictor
-            .predict_posterior_mean(&input, &fit, None)
+            .predict_posterior_mean(&input, &fit, &PosteriorMeanOptions::point_only())
             .expect("cloglog survival posterior mean");
 
         assert!((posterior.mean[0] - point.mean[0]).abs() <= 1e-12);

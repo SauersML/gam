@@ -8,7 +8,7 @@ use gam::alo::compute_alo_diagnostics_from_fit;
 use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
-    ParametricTermSummary, PredictInput, SmoothTermSummary, UnifiedFitResult,
+    ParametricTermSummary, PosteriorMeanOptions, PredictInput, SmoothTermSummary, UnifiedFitResult,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
@@ -2618,8 +2618,16 @@ fn run_predict_unified(
             Some(pred.mean_upper),
         )
     } else if nonlinear && args.mode == PredictModeArg::PosteriorMean {
+        // Mirror the `--uncertainty` arm's covariance-mode handling so the
+        // posterior-mean credible interval includes smoothing-parameter
+        // uncertainty by default (issue #812), instead of the bare conditional.
+        let pm_options = PosteriorMeanOptions {
+            confidence_level: Some(args.level),
+            covariance_mode: infer_covariance_mode(args.covariance_mode),
+            include_observation_interval: false,
+        };
         let pm = predictor
-            .predict_posterior_mean(pred_input, &fit_for_predict, Some(args.level))
+            .predict_posterior_mean(pred_input, &fit_for_predict, &pm_options)
             .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
         (
             pm.eta,
@@ -3629,16 +3637,17 @@ fn run_predict_survival(
             Option<Array1<f64>>,
             Option<Array1<f64>>,
         ) = if args.mode == PredictModeArg::PosteriorMean {
+            let pm_options = PosteriorMeanOptions {
+                confidence_level: if args.uncertainty {
+                    Some(args.level)
+                } else {
+                    None
+                },
+                covariance_mode: infer_covariance_mode(args.covariance_mode),
+                include_observation_interval: false,
+            };
             let pred = predictor
-                .predict_posterior_mean(
-                    &pred_input,
-                    &predictor_fit,
-                    if args.uncertainty {
-                        Some(args.level)
-                    } else {
-                        None
-                    },
-                )
+                .predict_posterior_mean(&pred_input, &predictor_fit, &pm_options)
                 .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
             let eta = pred.eta;
             let eta_se = pred.eta_standard_error;
@@ -11588,7 +11597,11 @@ mod tests {
             auxiliary_matrix: None,
         };
         let out = predictor
-            .predict_posterior_mean(&input, &fit, Some(0.95))
+            .predict_posterior_mean(
+                &input,
+                &fit,
+                &super::PosteriorMeanOptions::with_level(0.95),
+            )
             .expect("predict standard binomial wiggle");
         assert_eq!(out.eta.len(), 3);
         assert_eq!(
