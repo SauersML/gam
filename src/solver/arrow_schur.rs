@@ -1551,6 +1551,23 @@ fn factor_one_row(
                 ridge_eff = next;
             }
             Err(e) => {
+                // Evidence/log-det callers (`tolerate_ill_conditioning = true`)
+                // consume the returned factor's diagonal as the exact
+                // log|H_tt + ridge_t·I|. Silently lifting ridge past the
+                // caller's base would shift that determinant by Σ d·log(1+δ/λ)
+                // while returning Ok, corrupting the reported evidence. A
+                // genuinely non-PD block at the base ridge must surface as
+                // an error here, not be quietly conditioned.
+                if tolerate_ill_conditioning {
+                    return Err(ArrowSchurError::PerRowFactorFailed {
+                        row: row_idx,
+                        reason: format!(
+                            "row {row_idx} H_tt is non-PD at base ridge {ridge_t:e}; \
+                             evidence mode preserves the genuine Cholesky of \
+                             H_tt and does not condition non-PD blocks: {e}"
+                        ),
+                    });
+                }
                 let next = if ridge_eff > 0.0 {
                     ridge_eff * 10.0
                 } else {
