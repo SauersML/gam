@@ -1429,7 +1429,18 @@ pub fn build_smooth_basis(
                 degree,
                 n_knots,
             )?,
-            double_penalty: true,
+            // mgcv's `bs="fs"` is a random-effect-style smooth: EVERY per-level
+            // coefficient, including the marginal null space, is penalized so
+            // unobserved groups can be predicted — so `fs` keeps the null-space
+            // (double) penalty. mgcv's `bs="sz"` is a pure across-level
+            // *deviation* smooth that, under the default `select=FALSE`, leaves
+            // the per-level null space UNPENALIZED; carrying the double penalty
+            // there shrinks the genuine deviation signal and over-smooths the
+            // recovered curves relative to mgcv (gam#700). `re` carries its own
+            // identity ridge below and ignores this flag. Honour an explicit
+            // user `double_penalty=` either way.
+            double_penalty: option_bool(options, "double_penalty")
+                .unwrap_or(type_opt.as_str() != "sz"),
             identifiability: BSplineIdentifiability::None,
             boundary_conditions: Default::default(),
             boundary: OneDimensionalBoundary::Open,
