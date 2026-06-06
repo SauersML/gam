@@ -18,6 +18,47 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.100 — gam 0.3.100 / gamfit 0.1.174 (2026-06-06)
+
+Correctness fixes to response-scale prediction intervals, survival fitting, and
+the REML/LAML evidence path.
+
+### Fixed
+- **Observation (prediction) intervals are clamped to the response support
+  (#800).** `predict(..., observation_interval=True)` builds the response-scale
+  predictive band as the symmetric `μ ± z·σ_pred`. For a bounded or
+  half-bounded response — a count (Poisson, Negative-Binomial, Tweedie), a
+  positive value (Gamma), or a proportion (Beta, Binomial) — that band crossed
+  the support edge at a small or extreme fitted mean and reported impossible
+  values (a Poisson predictive lower bound going negative). The band is now
+  floored/capped at the family's response support in both interval-assembly
+  paths. The *mean* (confidence) interval was already correct and is unchanged.
+  A new `ResponseFamily::response_support_bounds` exposes the closed support
+  bounds, kept in lockstep with the existing support-membership check.
+- **Beta prediction intervals use the estimated precision φ̂ (#801).** The
+  observation-interval builder's Beta arm read precision off the family-enum
+  construction seed (default `1.0`) instead of the precision estimated jointly
+  with the mean, so on high-precision data the band was `√((1+φ̂)/2)` too wide.
+  It now routes through the same fitted-dispersion accessor the Tweedie/Gamma
+  arms already use, falling back to the seed only for raw-covariance sources
+  that carry no fitted scale.
+- **Survival fits no longer over-reject censored rows.** The per-row
+  monotonicity guard in the survival working-model update rejected any row whose
+  stabilized exit derivative fell below a numerical floor, but only event rows
+  evaluate `ln(deriv)` / `1/deriv` downstream. The guard is now gated on event
+  rows (`d > 0`), matching the residual-channel loop, so a censored row with a
+  zero collocation derivative at, e.g., β = 0 is no longer a false-positive
+  monotonicity violation.
+- **REML/LAML evidence integrity on indefinite per-row blocks.** In evidence
+  (log-determinant) mode the arrow–Schur per-row factorization silently lifted
+  the ridge on a non-positive-definite `H_tt` until it became PD, then summed
+  the lifted factor's diagonal into the exact arrow log-determinant — reporting
+  `log|H_tt + ridge_eff·I|` where `log|H_tt + ridge_t·I|` was intended and
+  corrupting the evidence with no error surfaced. Evidence mode now returns a
+  typed error on a genuinely non-PD block instead of accepting a ridge-lifted
+  surrogate; the strict Newton-step path, which wants the regularising lift, is
+  unchanged.
+
 ## v0.3.99 — gam 0.3.99 / gamfit 0.1.173 (2026-06-06)
 
 Completes the link-general Firth work from 0.3.98.
