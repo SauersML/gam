@@ -10100,7 +10100,7 @@ mod tests {
             family: LikelihoodSpec::binomial_cloglog(),
             predict_noise: false,
             is_survival: false,
-            link_choice: Some(&link_choice),
+            link_choice: link_choice.as_ref(),
         });
         assert!(
             validation.is_ok(),
@@ -10123,7 +10123,7 @@ mod tests {
             family: LikelihoodSpec::binomial_logit(),
             predict_noise: false,
             is_survival: false,
-            link_choice: Some(&link_choice),
+            link_choice: link_choice.as_ref(),
         })
         .expect("--firth is a likelihood policy, not a bounded-term policy");
     }

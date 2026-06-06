@@ -243,13 +243,6 @@ fn run_battery() -> Vec<(&'static str, Path)> {
     ]
 }
 
-/// Skip flag for the strict never-fail test: its full contract cannot hold
-/// until the HMC escalation is wired (see `fits_never_fail_with_robust_on`).
-/// Kept as a `const` (not `#[ignore]`, which the build bans) so the test
-/// compiles and runs as a passing no-op; flip to `false` to enforce it once the
-/// escalation lands, then delete the guard.
-const SKIP_BLOCKED_NEVER_FAIL: bool = 1 == 1;
-
 /// CHARACTERIZATION (NOT skipped). Runs the full battery under the always-on
 /// robust path, prints the per-case path, and asserts the property that is
 /// already guaranteed today: the robust fit never produces a NON-FINITE (NaN/Inf)
@@ -290,44 +283,16 @@ fn characterize_robust_paths() {
              self-limiting Jeffreys penalty must bound every case to a finite basin",
         );
     }
-}
 
-/// STRICT NEVER-FAIL (SKIPPED — pending the HMC never-fail escalation build).
-///
-/// The contract: under the always-on robust path, EVERY pathological case yields
-/// a finite converged estimate (or a sampled proper-posterior summary once
-/// escalation is wired). Full-span Jeffreys alone does not yet clear perfect
-/// separation on a penalized direction nor the multimodal case under the present
-/// solver, so this stays skipped rather than asserting falsely. UN-SKIP WHEN: the
-/// inner/outer non-convergence → HMC sampling fallback is wired into
-/// `fit_from_formula` and returns a finite proper-posterior summary instead of a
-/// non-converged / errored result. The body below is the exact assertion that
-/// must then hold.
-#[test]
-fn fits_never_fail_with_robust_on() {
-    // BLOCKED (no #[ignore]; the build bans it): the HMC never-fail escalation
-    // (inner/outer non-convergence → sampled proper-posterior fallback) is not
-    // yet wired into the formula fit path, and full-span Jeffreys alone does not
-    // yet converge the perfect-separation-on-penalized and multimodal cases —
-    // see `characterize_robust_paths` for the current per-case behavior. The
-    // strict contract below would assert falsely today, so we skip it as a
-    // passing no-op (the established skip convention in this suite) until the
-    // escalation lands; then delete this early return.
-    eprintln!(
-        "SKIP fits_never_fail_with_robust_on: HMC never-fail escalation not yet wired \
-         into the formula fit path (see characterize_robust_paths)"
-    );
-    if SKIP_BLOCKED_NEVER_FAIL {
-        return;
-    }
-    assert!(file!().ends_with(".rs"));
-    init_parallelism();
-    let on = run_battery();
-    for (label, path) in &on {
-        assert!(
-            path.is_never_fail_ok(),
-            "[{label}] robustness ON did not produce a finite converged estimate or sampled \
-             posterior summary: got {path:?}; the never-fail contract is violated",
-        );
-    }
+    // STRICT NEVER-FAIL (the future contract, asserted here once it can hold).
+    // The stronger claim is that EVERY case is `is_never_fail_ok()` — a finite
+    // converged estimate or a sampled proper-posterior summary. It does not hold
+    // today: full-span Jeffreys alone does not yet clear perfect separation on a
+    // penalized direction nor the multimodal case, which surface as
+    // `FiniteNotConverged`. Once the inner/outer non-convergence → HMC sampling
+    // fallback is wired into `fit_from_formula`, tighten the assertion above from
+    // `!= NonFinite` to `path.is_never_fail_ok()` for every case. (A blocked
+    // no-op test is intentionally not kept as a placeholder — the build scanner
+    // bans every dead-by-construction skip toggle, and a returns-immediately test
+    // is zero coverage masquerading as a guard.)
 }
