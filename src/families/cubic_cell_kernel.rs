@@ -3053,10 +3053,10 @@ fn exp_neg_half_square(x: f64) -> f64 {
 /// difference of two saturated values is exactly zero even though the
 /// integral is a strictly positive number well inside the f64 normal range
 /// (e.g. `∫_{-12}^{-10} ≈ 1.9e-23`). The fix is to reduce the erf difference
-/// to complementary tail probabilities — `statrs::erfc` evaluates these with
-/// a dedicated tail series, *not* as `1 − erf` — and to pick, by the sign of
-/// the endpoints, the algebraically-equivalent form whose terms do not
-/// cancel against one another:
+/// to complementary tail probabilities — `erfc` is evaluated with a dedicated
+/// tail series, *not* as `1 − erf` — and to pick, by the sign of the
+/// endpoints, the algebraically-equivalent form whose terms do not cancel
+/// against one another:
 ///
 /// ```text
 /// both ≥ 0 (upper tail):  erf(b/√2) − erf(a/√2) = erfc(a/√2) − erfc(b/√2)
@@ -3069,17 +3069,29 @@ fn exp_neg_half_square(x: f64) -> f64 {
 /// large quantities cancel and full f64 precision survives down to the
 /// underflow boundary in either tail. Infinite endpoints fall out via the
 /// `erfc` limits (`erfc(+∞)=0`, `erfc(−∞)=2`) with no special casing.
+///
+/// Uses `libm::erfc` (msun double-precision implementation, ≤ 1 ulp) rather
+/// than `statrs::function::erf::erfc` (a 6-term rational approximation that
+/// carries ~3·10⁻¹¹ relative error around `|x| ≈ 1/√2` — see the existing
+/// `libm::erfc` consumer at `inference::polya_gamma_core::normal_cdf`). That
+/// statrs error propagates directly into `T_0`, then through every higher
+/// moment `T_n` (the recurrence `T_n = a^{n-1}e^{-a²/2} − b^{n-1}e^{-b²/2}
+/// + (n-1)·T_{n-2}` walks `T_0` up two steps at a time), then through every
+/// affine-cell moment via `affine_anchor_moment_vector` (whose `out[n]` is a
+/// linear combination of `T_0..=T_n`), and is the dominant source of error
+/// in the affine-cell branch of the cubic-cell substrate (CPU/GPU parity
+/// reference for transformation-normal, bernoulli-marginal-slope, and the
+/// BMS flex-row higher-derivative reuse path).
 fn truncated_gaussian_zeroth_moment(a: f64, b: f64) -> f64 {
     let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
     let za = a * inv_sqrt2;
     let zb = b * inv_sqrt2;
-    let erfc = statrs::function::erf::erfc;
     let erf_diff = if za >= 0.0 {
-        erfc(za) - erfc(zb)
+        libm::erfc(za) - libm::erfc(zb)
     } else if zb <= 0.0 {
-        erfc(-zb) - erfc(-za)
+        libm::erfc(-zb) - libm::erfc(-za)
     } else {
-        2.0 - erfc(zb) - erfc(-za)
+        2.0 - libm::erfc(zb) - libm::erfc(-za)
     };
     // √(2π)·½ = √(π/2).
     (std::f64::consts::PI / 2.0).sqrt() * erf_diff
