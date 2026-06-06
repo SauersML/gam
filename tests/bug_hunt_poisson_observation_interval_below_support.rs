@@ -28,6 +28,7 @@
 //! Poisson / NegBin / Tweedie, the lower edge of `response_support`), this test
 //! passes unchanged.
 
+use csv::StringRecord;
 use gam::predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
@@ -37,7 +38,6 @@ use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;

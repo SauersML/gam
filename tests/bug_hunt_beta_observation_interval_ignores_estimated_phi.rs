@@ -151,8 +151,7 @@ fn beta_observation_interval_uses_estimated_phi_not_seed() {
         let one_plus_phi = (mu * (1.0 - mu) / response_var).max(1e-9);
         implied_phis.push(one_plus_phi - 1.0);
     }
-    let implied_phi =
-        implied_phis.iter().sum::<f64>() / implied_phis.len() as f64;
+    let implied_phi = implied_phis.iter().sum::<f64>() / implied_phis.len() as f64;
 
     eprintln!(
         "[beta-obs] estimated φ̂={phi_hat:.3} (true {TRUE_PHI}); observation-interval \
