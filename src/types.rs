@@ -1243,13 +1243,20 @@ impl LikelihoodSpec {
             ResponseFamily::Gaussian => LikelihoodScaleMetadata::ProfiledGaussian,
             ResponseFamily::Gamma => LikelihoodScaleMetadata::EstimatedGammaShape { shape: 1.0 },
             // Binomial and Poisson have `phi ≡ 1` (variance fully pinned by the
-            // mean), so a fixed unit dispersion is correct. NegativeBinomial's
-            // overdispersion lives in `theta` (a separate parameter / flag), not
-            // a free `phi`, so it too defaults to fixed unit dispersion.
-            ResponseFamily::Binomial
-            | ResponseFamily::Poisson
-            | ResponseFamily::NegativeBinomial { .. } => {
+            // mean), so a fixed unit dispersion is correct.
+            ResponseFamily::Binomial | ResponseFamily::Poisson => {
                 LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 }
+            }
+            // Negative-Binomial's overdispersion `theta` (`Var(y)=mu+mu^2/theta`)
+            // is a genuine free parameter estimated jointly with the mean by
+            // default — the family-variant `theta` is only the seed, refined from
+            // the converged-η ML score during fitting, exactly like the Gamma
+            // shape / Beta precision / Tweedie φ. Freezing it at the seed made
+            // every variance-derived output (coefficient/η SEs, Wald and credible
+            // intervals, predictive intervals, `generate` draws) ignore the
+            // data's overdispersion (issue #802). `phi` itself stays `≡ 1`.
+            ResponseFamily::NegativeBinomial { theta } => {
+                LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: *theta }
             }
             // Tweedie's dispersion `phi` is a genuine free parameter
             // (`Var(y) = phi · mu^p`) and is estimated jointly with the mean by
@@ -1430,6 +1437,23 @@ pub enum LikelihoodScaleMetadata {
     /// so the coefficient covariance `Vb = H⁻¹` already scales as `phi` and the
     /// reported SEs track `√phi` (issue #771).
     EstimatedTweediePhi { phi: f64 },
+    /// Negative-Binomial overdispersion `theta` estimated jointly with the mean
+    /// model. `Var(y) = mu + mu^2 / theta`; larger `theta` means less
+    /// overdispersion (the Poisson limit is `theta → ∞`). Estimated by the
+    /// maximum-likelihood `theta` score
+    /// `Σ wᵢ[ψ(yᵢ+θ) − ψ(θ) + lnθ + 1 − ln(θ+μᵢ) − (yᵢ+θ)/(μᵢ+θ)] = 0` at the
+    /// converged η (MASS `glm.nb`'s `theta.ml`) and refreshed across outer
+    /// iterations, exactly like the Gamma shape / Beta precision / Tweedie φ.
+    /// Unlike those, `theta` is *not* a dispersion scale `phi`: it enters only
+    /// the IRLS working weight `W = μθ/(θ+μ)` (the full NB2 Fisher information),
+    /// so the stored penalized Hessian is already the true one and the
+    /// coefficient covariance `Vb = H⁻¹` takes no post-hoc multiply — `phi ≡ 1`
+    /// for NB, the overdispersion lives in the variance function. The `theta`
+    /// carried here mirrors `ResponseFamily::NegativeBinomial { theta }` (the
+    /// canonical store every weight/deviance expression reads), kept in sync by
+    /// `with_negbin_theta`, exactly as `EstimatedBetaPhi` mirrors `Beta { phi }`
+    /// (issue #802).
+    EstimatedNegBinTheta { theta: f64 },
     /// The engine does not expose fixed-scale semantics for this family.
     Unspecified,
 }
@@ -1444,7 +1468,28 @@ impl LikelihoodScaleMetadata {
             Self::FixedGammaShape { shape } | Self::EstimatedGammaShape { shape } => {
                 Some(1.0 / shape)
             }
+            // NB's dispersion scale is `phi ≡ 1` (the overdispersion is carried
+            // by `theta` inside the variance function, not a scale multiply), so
+            // the fixed-`phi` contract is `Some(1.0)` — NOT `theta`.
+            Self::EstimatedNegBinTheta { .. } => Some(1.0),
             Self::ProfiledGaussian | Self::Unspecified => None,
+        }
+    }
+
+    /// Whether the Negative-Binomial overdispersion `theta` is estimated from
+    /// data (the default for NB families, issue #802).
+    #[inline]
+    pub const fn negbin_theta_is_estimated(self) -> bool {
+        matches!(self, Self::EstimatedNegBinTheta { .. })
+    }
+
+    /// The estimated Negative-Binomial `theta` carried in the scale metadata,
+    /// or `None` for non-NB families.
+    #[inline]
+    pub const fn negbin_theta(self) -> Option<f64> {
+        match self {
+            Self::EstimatedNegBinTheta { theta } => Some(theta),
+            _ => None,
         }
     }
 
@@ -1571,6 +1616,13 @@ impl GlmLikelihoodSpec {
             | LikelihoodScaleMetadata::EstimatedGammaShape { .. }
             | LikelihoodScaleMetadata::EstimatedBetaPhi { .. }
             | LikelihoodScaleMetadata::EstimatedTweediePhi { .. }
+            // Negative-Binomial folds `theta` into the working weight
+            // `W = μθ/(θ+μ)` (the full NB2 Fisher information), so the stored
+            // `H = XᵀWX + S_λ` is already the true penalized Hessian and the
+            // covariance scale is `1.0` (`phi ≡ 1`). The reported SEs respond to
+            // the data's overdispersion entirely through that `theta`-dependent
+            // weight (issue #802) — multiplying again would double-count it.
+            | LikelihoodScaleMetadata::EstimatedNegBinTheta { .. }
             | LikelihoodScaleMetadata::Unspecified => 1.0,
         }
     }
@@ -1641,6 +1693,45 @@ impl GlmLikelihoodSpec {
             self.scale = LikelihoodScaleMetadata::EstimatedTweediePhi { phi };
         }
         self
+    }
+
+    /// Whether the Negative-Binomial overdispersion `theta` is estimated from
+    /// data (issue #802).
+    #[inline]
+    pub fn negbin_theta_is_estimated(&self) -> bool {
+        self.scale.negbin_theta_is_estimated()
+    }
+
+    /// Mutate the Negative-Binomial overdispersion `theta` in place, on BOTH the
+    /// family variant (where every PIRLS weight / deviance / log-likelihood
+    /// expression reads it via `ResponseFamily::NegativeBinomial { theta }`) and
+    /// the scale metadata (the estimated-vs-fixed contract). No-op for non-NB
+    /// families. The inner solver calls this once per inner solve after a
+    /// maximum-likelihood estimate of `theta` from the working residuals, so the
+    /// IRLS weight `W = μθ/(θ+μ)` and the variance `Var(y)=mu+mu^2/theta` reflect
+    /// the data's overdispersion rather than the seed `theta` (issue #802). This
+    /// mirrors `with_beta_phi` exactly — both keep the family variant and the
+    /// scale metadata as two synchronized views of one estimated parameter.
+    #[inline]
+    pub fn with_negbin_theta(mut self, theta: f64) -> Self {
+        if let ResponseFamily::NegativeBinomial {
+            theta: family_theta,
+        } = &mut self.spec.response
+        {
+            *family_theta = theta;
+            self.scale = LikelihoodScaleMetadata::EstimatedNegBinTheta { theta };
+        }
+        self
+    }
+
+    /// The estimated Negative-Binomial `theta`, read from the family variant
+    /// (the canonical store), or `None` for non-NB families.
+    #[inline]
+    pub fn negbin_theta(&self) -> Option<f64> {
+        match self.spec.response {
+            ResponseFamily::NegativeBinomial { theta } => Some(theta),
+            _ => None,
+        }
     }
 }
 
