@@ -2261,12 +2261,28 @@ pub fn build_smooth_basis(
             } else {
                 Vec::new()
             };
+            // Tensor smooths (`te`/`ti`/`t2`) must match mgcv's DEFAULT
+            // `select = FALSE`: the joint null space of the per-margin
+            // penalties — the bilinear, low-order interaction directions that
+            // no marginal roughness operator can see — is left UNPENALIZED.
+            // mgcv only adds a null-space shrinkage penalty there under the
+            // opt-in `select = TRUE` (which gam exposes as `double_penalty`).
+            //
+            // The general smooth default (`smooth_double_penalty`, true) is
+            // calibrated for 1-D `s()` terms; carrying it into tensors silently
+            // shrinks the genuinely-present bilinear interaction signal, so
+            // REML places positive weight on the extra ridge and systematically
+            // OVER-SMOOTHS the recovered surface relative to mgcv's plain
+            // `te`/`ti` (gam#700/#701/#702/#703). Default tensors to no extra
+            // null-space penalty; an explicit user `double_penalty=`/`select=`
+            // still wins.
+            let tensor_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
             Ok(SmoothBasisSpec::TensorBSpline {
                 feature_cols: cols.to_vec(),
                 spec: TensorBSplineSpec {
                     marginalspecs: margins,
                     periods: periods_vec,
-                    double_penalty: smooth_double_penalty,
+                    double_penalty: tensor_double_penalty,
                     identifiability: parse_tensor_identifiability(options, kind)?,
                 },
             })
