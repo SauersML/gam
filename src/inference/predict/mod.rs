@@ -5777,7 +5777,17 @@ where
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Beta { phi } => {
-                let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + *phi));
+                // Beta's precision is estimated jointly with the mean (#567/#769)
+                // and recorded in `likelihood_scale` (`EstimatedBetaPhi`), NOT on
+                // this family enum (whose `phi` stays at the construction seed).
+                // Read the fitted precision via `observation_phi()` like the
+                // Tweedie/Gamma arms above; fall back to the enum seed only when
+                // no fitted scale is available (raw-covariance sources). Using the
+                // seed made the response-noise term `μ(1−μ)/2` — for high-precision
+                // data the interval was `√((1+φ̂)/2)` too wide (#801, companion of
+                // the #770 generate-path fix).
+                let phi = source.observation_phi().unwrap_or(*phi);
+                let response_var = mean.mapv(|mu| mu * (1.0 - mu) / (1.0 + phi));
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Binomial => {
