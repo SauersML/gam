@@ -342,6 +342,22 @@ const CLOGLOG_RARE_EVENT_LOG_MAX: f64 = -18.0;
 const CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN: f64 = 8.0;
 const CLOGLOG_POSITIVE_SATURATION_EDGE: f64 = 5.0;
 const CLOGLOG_POSITIVE_SATURATION_SIGMAS: f64 = 8.0;
+// Universal η-interval for the Gumbel-mixing survival quadrature. The mixing
+// density g(η) = exp(η − e^η) carries < 4e-18 of its mass outside [−40, 6] (its
+// left tail decays like e^η, its right tail like exp(−e^η)), so the same
+// truncation resolves S(μ,σ) for every (μ,σ): only the bounded factor
+// Φ((η−μ)/σ) depends on the parameters.
+const CLOGLOG_GUMBEL_QUAD_ETA_LO: f64 = -40.0;
+const CLOGLOG_GUMBEL_QUAD_ETA_HI: f64 = 6.0;
+// Clenshaw–Curtis node floor for the Gumbel survival quadrature (σ ≥ 8, where
+// the Φ transition is at least as wide as the node spacing). At n = 97 the
+// log-space result is converged to ~1e-8 in ln S across the σ ≥ 8 band.
+const CLOGLOG_GUMBEL_QUAD_MIN_NODES: usize = 97;
+// Node-density scale: below σ = 8 the Φ transition narrows to width σ, so the
+// node count grows like SCALE / σ to keep the transition resolved on the
+// σ < 8 value-underflow fallback. Bounded by MAX_NODES.
+const CLOGLOG_GUMBEL_QUAD_NODE_SCALE: f64 = 320.0;
+const CLOGLOG_GUMBEL_QUAD_MAX_NODES: usize = 513;
 const SERIES_CONSECUTIVE_SMALL_TERMS: usize = 6;
 const LOGIT_MAX_TERMS: usize = 160;
 /// Documented absolute-accuracy contract of the erfcx logistic-normal
@@ -1278,56 +1294,16 @@ fn log_normal_cdf_stable(x: f64) -> f64 {
 }
 
 #[inline]
-fn cloglog_large_sigma_transition_tail(mu: f64, sigma: f64) -> f64 {
-    let b = (mu + sigma * sigma) / sigma;
-    let log_tail = mu + 0.5 * sigma * sigma + log_normal_cdf_stable(-b);
-    if !log_tail.is_finite() {
-        if log_tail.is_sign_negative() {
-            0.0
-        } else {
-            1.0
-        }
-    } else if log_tail <= -745.0 {
-        0.0
-    } else {
-        safe_exp(log_tail).clamp(0.0, 1.0)
-    }
-}
-
-#[inline]
-fn cloglog_large_sigma_transition_approx(mu: f64, sigma: f64) -> IntegratedMeanDerivative {
-    // Transition-region split for very broad Gaussian latents.
-    //
-    // Let z* solve exp(mu + sigma z*) ~= 1, i.e. z* = -mu / sigma. Below that
-    // threshold the inverse link is well-approximated by exp(eta); above it
-    // the inverse link is essentially saturated at 1. This gives
-    //
-    //   E[mu_link] ~= Phi(mu / sigma)
-    //                + exp(mu + sigma^2 / 2) * Phi(-(mu + sigma^2) / sigma),
-    //
-    // and differentiating with respect to mu collapses to the truncated
-    // lognormal tail term itself.
-    let a = mu / sigma;
-    let tail = cloglog_large_sigma_transition_tail(mu, sigma);
-    IntegratedMeanDerivative {
-        mean: (crate::probability::normal_cdf(a) + tail).clamp(0.0, 1.0),
-        dmean_dmu: tail.clamp(0.0, 1.0 / std::f64::consts::E),
-        mode: IntegratedExpectationMode::ControlledAsymptotic,
-    }
-}
-
-#[inline]
 fn cloglog_extreme_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDerivative> {
     // Extreme-input ladder for the cloglog mean and its location derivative.
     //
     // Regimes:
     // - mu + sigma^2 / 2 << 0: rare-event tail, where 1 - exp(-exp(eta)) ~= exp(eta)
     // - mu - 8 sigma >> 0: survival term is numerically indistinguishable from 0
-    // - sigma very large: split at the transition eta ~= 0 and use the closed
-    //   form truncated-lognormal approximation above
     //
-    // The thresholds intentionally leave overlap with the Taylor/Miles/Gamma
-    // branches so neighboring formulas still cover the transition band.
+    // The large-σ regime is intentionally NOT handled here (see the trailing
+    // comment); the thresholds otherwise leave overlap with the Taylor/Miles/
+    // Gamma branches so neighboring formulas still cover the transition band.
     let rare_log = mu + 0.5 * sigma * sigma;
     if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
         let mean = safe_exp(rare_log);
@@ -1344,9 +1320,11 @@ fn cloglog_extreme_asymptotic(mu: f64, sigma: f64) -> Option<IntegratedMeanDeriv
             mode: IntegratedExpectationMode::ControlledAsymptotic,
         });
     }
-    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
-        return Some(cloglog_large_sigma_transition_approx(mu, sigma));
-    }
+    // The large-σ regime (σ ≥ CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN) is handled
+    // upstream in cloglog_posterior_meanwith_deriv_controlled via the accurate
+    // log-space Gumbel survival quadrature, so this ladder no longer carries the
+    // leading-order "sharp transition" split (it was biased low by 2–7%, #799,
+    // and zeroed the derivative through value-space underflow, #798).
     None
 }
 
@@ -1364,15 +1342,131 @@ fn cloglog_survival_extreme_asymptotic(
         ));
     }
     if mu - CLOGLOG_POSITIVE_SATURATION_SIGMAS * sigma >= CLOGLOG_POSITIVE_SATURATION_EDGE {
+        // For σ < CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN this deep in the positive
+        // tail S is below ~1e-300, so the value path's hard zero is exact to
+        // f64. The genuine log-magnitude (needed by the kernel derivative path)
+        // is recovered separately by cloglog_log_survival_term_controlled.
         return Some((0.0, IntegratedExpectationMode::ControlledAsymptotic));
     }
-    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
-        let a = mu / sigma;
-        let tail = cloglog_large_sigma_transition_tail(mu, sigma);
-        let survival = (crate::probability::normal_cdf(-a) - tail).clamp(0.0, 1.0);
-        return Some((survival, IntegratedExpectationMode::ControlledAsymptotic));
-    }
+    // σ ≥ CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN is handled by the caller via the
+    // accurate log-space Gumbel quadrature (replaces the biased step-model
+    // split, #799).
     None
+}
+
+/// Clenshaw–Curtis node count for the Gumbel survival quadrature at `sigma`.
+///
+/// Above σ = 8 the Φ((η−μ)/σ) transition is at least as wide as the node
+/// spacing, so the floor `CLOGLOG_GUMBEL_QUAD_MIN_NODES` suffices. Below it the
+/// transition narrows to width σ, so the count grows like SCALE/σ to keep it
+/// resolved. An odd count is used so the rule has an even number of intervals
+/// and a symmetric, gap-free grid.
+#[inline]
+fn cloglog_gumbel_quad_nodes(sigma: f64) -> usize {
+    let target = (CLOGLOG_GUMBEL_QUAD_NODE_SCALE / sigma.min(CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN))
+        .ceil() as usize;
+    let n = target
+        .max(CLOGLOG_GUMBEL_QUAD_MIN_NODES)
+        .min(CLOGLOG_GUMBEL_QUAD_MAX_NODES);
+    if n % 2 == 0 { n + 1 } else { n }
+}
+
+/// Log-space survival transform via the Gumbel-mixing representation.
+///
+/// ```text
+///   S(μ,σ) = E[exp(−e^η)],  η ~ N(μ,σ²)
+///          = ∫ g(η) Φ((η−μ)/σ) dη,   g(η) = exp(η − e^η),
+/// ```
+///
+/// obtained by integrating `S = ∫ exp(−e^η) f_N(η) dη` by parts using
+/// `d/dη exp(−e^η) = −e^η exp(−e^η) = −g(η)`; the boundary terms vanish because
+/// `exp(−e^η)` runs from 1 to 0 while the Gaussian CDF runs from 0 to 1. Here
+/// `g` is the standard Gumbel-min density (it is `log U` for `U ~ Exp(1)`, with
+/// mean `−γ` and variance `π²/6`). Crucially `g` does **not** depend on
+/// `(μ,σ)` — those enter only through the smooth, bounded factor `Φ((η−μ)/σ)` —
+/// so one Clenshaw–Curtis panel on the universal interval
+/// `[CLOGLOG_GUMBEL_QUAD_ETA_LO, CLOGLOG_GUMBEL_QUAD_ETA_HI]` resolves the
+/// integrand for every `(μ,σ)`.
+///
+/// The result is `ln S`, accumulated with a streaming log-sum-exp over
+/// `ln Φ` (via [`log_normal_cdf_stable`]), so it stays finite and accurate even
+/// when `S` is far below the f64 underflow threshold — exactly the regime where
+/// the value-space evaluator collapses to a hard zero and discards the
+/// log-magnitude that the `exp(kμ + ½k²σ²)` kernel prefixes rely on (#798).
+fn cloglog_log_survival_gumbel_quadrature(ctx: &QuadratureContext, mu: f64, sigma: f64) -> f64 {
+    let a = CLOGLOG_GUMBEL_QUAD_ETA_LO;
+    let b = CLOGLOG_GUMBEL_QUAD_ETA_HI;
+    let half = 0.5 * (b - a);
+    let mid = 0.5 * (a + b);
+    let rule = ctx.clenshaw_curtis_n(cloglog_gumbel_quad_nodes(sigma));
+    // Streaming log-sum-exp of ln(W_i · g(η_i) · Φ((η_i−μ)/σ)). Clenshaw–Curtis
+    // weights are positive, so ln(W_i) is finite; ln g(η_i) = η_i − e^{η_i}.
+    let mut running_max = f64::NEG_INFINITY;
+    let mut running_sum = 0.0_f64;
+    for (&node, &weight) in rule.nodes.iter().zip(rule.weights.iter()) {
+        let eta = half * node + mid;
+        let summand = (weight * half).ln() + (eta - safe_exp(eta))
+            + log_normal_cdf_stable((eta - mu) / sigma);
+        if !summand.is_finite() {
+            continue;
+        }
+        if summand > running_max {
+            running_sum = running_sum * (running_max - summand).exp() + 1.0;
+            running_max = summand;
+        } else {
+            running_sum += (summand - running_max).exp();
+        }
+    }
+    if running_max == f64::NEG_INFINITY {
+        f64::NEG_INFINITY
+    } else {
+        running_max + running_sum.ln()
+    }
+}
+
+/// Canonical log-space survival evaluator: returns `ln S(μ,σ)` with its routing
+/// mode. This is the log-domain twin of [`cloglog_survival_term_controlled`].
+///
+/// Every kernel quantity that multiplies `S` by an `exp(kμ + ½k²σ²)` prefix —
+/// the integrated cloglog derivative, the latent-cloglog jet, the lognormal
+/// kernel bundle — must form the product in log space through this function, so
+/// the genuine (but f64-unrepresentable) magnitude of `S` is preserved instead
+/// of underflowing to a hard zero that zeroes the derivative (#798).
+pub(crate) fn cloglog_log_survival_term_controlled(
+    ctx: &QuadratureContext,
+    mu: f64,
+    sigma: f64,
+) -> (f64, IntegratedExpectationMode) {
+    if !(mu.is_finite() && sigma.is_finite()) || sigma <= CLOGLOG_SIGMA_DEGENERATE {
+        // S = exp(−e^μ); ln S = −e^μ (→ −∞ only when e^μ overflows, i.e. S = 0).
+        return (-safe_exp(mu), IntegratedExpectationMode::ExactClosedForm);
+    }
+    let rare_log = mu + 0.5 * sigma * sigma;
+    if rare_log <= CLOGLOG_RARE_EVENT_LOG_MAX {
+        // S = 1 − E[1−exp(−e^η)] ≈ 1 − e^{rare_log}; ln S = ln1p(−e^{rare_log})
+        // retains full precision when S is extremely close to 1.
+        return (
+            (-safe_exp(rare_log)).ln_1p(),
+            IntegratedExpectationMode::ControlledAsymptotic,
+        );
+    }
+    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
+        return (
+            cloglog_log_survival_gumbel_quadrature(ctx, mu, sigma),
+            IntegratedExpectationMode::ControlledAsymptotic,
+        );
+    }
+    let (value, mode) = cloglog_survival_term_controlled(ctx, mu, sigma);
+    if value > 0.0 {
+        (value.ln(), mode)
+    } else {
+        // Value-space underflow (deep positive tail at moderate σ): recover the
+        // log-magnitude from the Gumbel quadrature rather than collapsing to −∞.
+        (
+            cloglog_log_survival_gumbel_quadrature(ctx, mu, sigma),
+            IntegratedExpectationMode::QuadratureFallback,
+        )
+    }
 }
 
 // ── Exact Gumbel survival primitives ─────────────────────────────────────
@@ -1716,6 +1810,19 @@ fn cloglog_survival_term_controlled(
     if let Some(out) = cloglog_survival_extreme_asymptotic(mu, sigma) {
         return out;
     }
+    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
+        // Accurate large-σ survival from the log-space Gumbel-mixing quadrature,
+        // replacing the leading-order "sharp transition" split that was biased
+        // low by 2–7% across σ ∈ [8, 20] (#799). Exponentiating ln S here loses
+        // nothing on the value path (S is consumed as a probability); the
+        // log-magnitude that the kernel derivative path needs is taken straight
+        // from cloglog_log_survival_term_controlled.
+        let log_s = cloglog_log_survival_gumbel_quadrature(ctx, mu, sigma);
+        return (
+            safe_exp(log_s).clamp(0.0, 1.0),
+            IntegratedExpectationMode::ControlledAsymptotic,
+        );
+    }
     if cloglog_survival_miles_is_reliable(mu, sigma)
         && let Ok(out) = cloglog_survival_miles(mu, sigma)
     {
@@ -1791,14 +1898,16 @@ pub(crate) fn lognormal_laplace_unit_term_shared(
     cloglog_survival_term_controlled(ctx, shifted_mu, sigma)
 }
 
+/// Log-space twin of [`lognormal_laplace_unit_term_shared`]: returns
+/// `ln L(1; shifted_mu, σ) = ln S(shifted_mu, σ)`. Used by the lognormal kernel
+/// bundle so kernel log-magnitudes survive value-space underflow (#798).
 #[inline]
-pub(crate) fn lognormal_laplace_term_shared(
+pub(crate) fn lognormal_laplace_unit_log_term_shared(
     ctx: &QuadratureContext,
-    z: f64,
-    mu: f64,
+    shifted_mu: f64,
     sigma: f64,
 ) -> (f64, IntegratedExpectationMode) {
-    lognormal_laplace_term_controlled(ctx, z, mu, sigma)
+    cloglog_log_survival_term_controlled(ctx, shifted_mu, sigma)
 }
 
 #[inline]
@@ -1942,9 +2051,28 @@ fn cloglog_shift_identity_derivative(mu: f64, sigma: f64, shifted_survival: f64)
     if !(mu.is_finite() && sigma.is_finite()) || shifted_survival <= 0.0 {
         return 0.0;
     }
-    let log_derivative = mu + 0.5 * sigma * sigma + shifted_survival.ln();
+    cloglog_shift_identity_derivative_log(mu, sigma, shifted_survival.ln())
+}
+
+/// Log-domain form of [`cloglog_shift_identity_derivative`] that takes
+/// `ln S(mu + sigma^2, sigma)` directly.
+///
+/// This is the underflow-safe path: when the shifted survival `S(mu+σ²,σ)` is
+/// below the f64 floor (large σ, #798), the value form above sees
+/// `shifted_survival == 0` and returns a spurious zero slope, whereas the
+/// genuine derivative `exp(mu + σ²/2) · S(mu+σ², σ)` is finite and O(1) because
+/// the huge prefix exactly compensates the tiny survival. Carrying the survival
+/// as a log keeps that cancellation exact.
+#[inline]
+fn cloglog_shift_identity_derivative_log(mu: f64, sigma: f64, log_shifted_survival: f64) -> f64 {
+    if !(mu.is_finite() && sigma.is_finite()) || log_shifted_survival == f64::NEG_INFINITY {
+        return 0.0;
+    }
+    let log_derivative = mu + 0.5 * sigma * sigma + log_shifted_survival;
     let upper = 1.0 / std::f64::consts::E;
     if !log_derivative.is_finite() {
+        // Mathematically bounded by sup_x x·e^{−x} = e^{−1}; any overflow here
+        // is purely numerical (the exp(mu+σ²/2) prefix), so cap at the bound.
         return upper;
     }
     safe_exp(log_derivative).clamp(0.0, upper)
@@ -2458,6 +2586,24 @@ pub(crate) fn cloglog_posterior_meanwith_deriv_controlled(
             // intermediate exp overflow and returns 0.0 (correct limit).
             dmean_dmu: cloglog_mean_d1_exact(mu),
             mode: IntegratedExpectationMode::ExactClosedForm,
+        };
+    }
+    if sigma >= CLOGLOG_LARGE_SIGMA_ASYMPTOTIC_MIN {
+        // Large-σ regime: form both the mean and the location derivative from the
+        // accurate, underflow-safe log-space survival. This replaces the biased
+        // step-model split (mean too low by 2–7%, #799) and, because the
+        // derivative is exp(μ + σ²/2)·S(μ+σ², σ) carried entirely in log space,
+        // it no longer collapses to zero when S(μ+σ², σ) underflows (#798).
+        let (log_base, base_mode) = cloglog_log_survival_term_controlled(ctx, mu, sigma);
+        let (log_shift, shift_mode) =
+            cloglog_log_survival_term_controlled(ctx, mu + sigma * sigma, sigma);
+        // mean = 1 − S = −expm1(ln S), stable for S near both 0 and 1.
+        let mean = (-log_base.exp_m1()).clamp(0.0, 1.0);
+        let dmean = cloglog_shift_identity_derivative_log(mu, sigma, log_shift);
+        return IntegratedMeanDerivative {
+            mean,
+            dmean_dmu: dmean.max(0.0),
+            mode: worse_integrated_expectation_mode(base_mode, shift_mode),
         };
     }
     let candidate = if sigma < CLOGLOG_SIGMA_TAYLOR_MAX {
@@ -3488,17 +3634,24 @@ fn latent_cloglog_kernel_terms(
     for (order, out) in k.iter_mut().enumerate().take(max_order + 1) {
         let kf = order as f64;
         let shifted_mu = mu + kf * sigma2;
-        let (survival, term_mode) = lognormal_laplace_term_shared(ctx, 1.0, shifted_mu, sigma);
+        // Carry the survival S(μ + kσ², σ) as a log so the kernel
+        //   K_{k,1} = exp(kμ + ½k²σ²) · S(μ + kσ², σ)
+        // keeps its true magnitude when S underflows in value space: at large σ
+        // the k=1 shifted location μ + σ² drives S below the f64 floor, and the
+        // old value-space `survival <= 0.0 → 0` collapse zeroed K_{1,1} (the
+        // IRLS working slope), even though the huge exp(½σ²) prefix makes the
+        // product finite and O(1) (#798).
+        let (log_survival, term_mode) =
+            cloglog_log_survival_term_controlled(ctx, shifted_mu, sigma);
         mode = worse_integrated_expectation_mode(mode, term_mode);
 
-        if survival <= 0.0 {
-            *out = 0.0;
-            continue;
-        }
-
-        let log_value = kf * mu + 0.5 * kf * kf * sigma2 + survival.ln();
+        let log_value = kf * mu + 0.5 * kf * kf * sigma2 + log_survival;
         if order == 0 {
             log_k0 = log_value;
+        }
+        if !log_value.is_finite() {
+            *out = 0.0;
+            continue;
         }
         let upper = if order == 0 {
             1.0

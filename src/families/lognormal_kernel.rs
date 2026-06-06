@@ -15,7 +15,7 @@ use crate::estimate::EstimationError;
 use crate::probability::signed_log_sum_exp;
 use crate::quadrature::{
     IntegratedExpectationMode, IntegratedInverseLinkJet, QuadratureContext,
-    latent_cloglog_inverse_link_jet5_controlled, lognormal_laplace_unit_term_shared,
+    latent_cloglog_inverse_link_jet5_controlled, lognormal_laplace_unit_log_term_shared,
     validate_latent_cloglog_inputs,
 };
 use serde::{Deserialize, Serialize};
@@ -279,11 +279,12 @@ pub fn log_kernel_term(
         );
     }
     let shifted_mu = mu + kf * sigma2 + log_m;
-    let (laplace, mode) = lognormal_laplace_unit_term_shared(quadctx, shifted_mu, sigma);
-    if laplace <= 0.0 {
-        return Ok((f64::NEG_INFINITY, mode));
-    }
-    Ok((prefix + laplace.ln(), mode))
+    // Survival carried in log space: prefix + ln S(shifted_mu, σ). This keeps the
+    // kernel's true magnitude when S underflows in value space at large σ — the
+    // old `laplace <= 0.0 → −∞` collapse discarded a large-but-finite log-value
+    // (#798) and the value-space asymptotic was biased low at σ ≥ 8 (#799).
+    let (log_laplace, mode) = lognormal_laplace_unit_log_term_shared(quadctx, shifted_mu, sigma);
+    Ok((prefix + log_laplace, mode))
 }
 
 /// Kernel bundle storing `log K_{k,m}` values instead of `K_{k,m}`.
@@ -352,9 +353,10 @@ pub fn log_kernel_bundle(
     let mut prefix = 0.0;
     let mut mode = IntegratedExpectationMode::ExactClosedForm;
     for k in 0..=max_k {
-        let (laplace, val_mode) = lognormal_laplace_unit_term_shared(quadctx, shifted_mu, sigma);
-        log_values.push(if laplace > 0.0 {
-            prefix + laplace.ln()
+        let (log_laplace, val_mode) =
+            lognormal_laplace_unit_log_term_shared(quadctx, shifted_mu, sigma);
+        log_values.push(if log_laplace.is_finite() {
+            prefix + log_laplace
         } else {
             f64::NEG_INFINITY
         });
