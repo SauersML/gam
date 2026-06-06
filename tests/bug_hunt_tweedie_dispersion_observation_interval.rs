@@ -138,16 +138,20 @@ fn fit_tweedie(x: &[f64], y: &[f64], eval: &[f64]) -> TweedieFit {
     )
     .expect("tweedie predict with observation interval");
 
-    let lower = pred
-        .observation_lower
-        .expect("observation interval requested");
     let upper = pred
         .observation_upper
         .expect("observation interval requested");
-    let obs_halfwidth: Vec<f64> = lower
+    // Recover the response-noise half-width `z·√(SE(μ̂)² + φ̂·μ̂^p)` from the
+    // *upper* endpoint, `upper − μ̂`. The lower endpoint is floored at the
+    // Tweedie support `y ≥ 0` (a small mean with a wide band would otherwise
+    // dip below zero — see #800), so `0.5·(upper − lower)` would understate the
+    // band for those rows; the upper endpoint is never clamped (support is
+    // unbounded above) and equals `μ̂ + z·σ` exactly, which is what this test's
+    // φ-scaling check needs.
+    let obs_halfwidth: Vec<f64> = upper
         .iter()
-        .zip(upper.iter())
-        .map(|(&lo, &hi)| 0.5 * (hi - lo))
+        .zip(pred.mean.iter())
+        .map(|(&hi, &mu)| hi - mu)
         .collect();
 
     TweedieFit {

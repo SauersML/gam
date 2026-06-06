@@ -5718,6 +5718,21 @@ where
     response_bounds.clamp_in_place(&mut mean_upper);
 
     let (observation_lower, observation_upper) = if options.includeobservation_interval {
+        // The observation (prediction) interval is the symmetric response-scale
+        // band `μ ± z·σ_pred`. For a bounded or half-bounded response (a count,
+        // a positive value, a proportion) that band crosses the support edge for
+        // a small/extreme fitted mean, reporting impossible values — so it is
+        // floored/capped at the family's response support. This is distinct from
+        // the *mean*-interval clamp (`ResponseBounds::for_family`), which is
+        // `None` for the non-negative-real families because their default mean
+        // interval rides a positive inverse-link transform; see
+        // `ResponseFamily::response_support_bounds`.
+        let observation_support = ResponseBounds::response_support(&spec.response);
+        let clamp_to_support = |mut lower: Array1<f64>, mut upper: Array1<f64>| {
+            observation_support.clamp_in_place(&mut lower);
+            observation_support.clamp_in_place(&mut upper);
+            (Some(lower), Some(upper))
+        };
         let response_observation_bounds = |response_var: Array1<f64>| {
             let obs_se = Array1::from_iter(
                 mean_standard_error
@@ -5737,7 +5752,7 @@ where
                     .zip(z_upper_per_row.iter())
                     .map(|((&m, &s), &zu)| m + zu * s),
             );
-            (Some(lower), Some(upper))
+            clamp_to_support(lower, upper)
         };
 
         match &spec.response {
@@ -5756,7 +5771,7 @@ where
                         .zip(z_upper_per_row.iter())
                         .map(|((&e, &s), &zu)| e + zu * s),
                 );
-                (Some(lower), Some(upper))
+                clamp_to_support(lower, upper)
             }
             ResponseFamily::Poisson => {
                 let response_var = mean.mapv(|mu| mu.max(0.0));

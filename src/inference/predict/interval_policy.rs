@@ -56,6 +56,17 @@ impl ResponseBounds {
         Self(response.mean_clamp_bounds())
     }
 
+    /// The clamp applied to the **observation (prediction) interval** of a
+    /// [`ResponseFamily`], matching [`ResponseFamily::response_support_bounds`].
+    ///
+    /// Distinct from [`Self::for_family`] (the *mean*-interval clamp): the
+    /// observation band is the symmetric `μ ± z·σ_pred`, which crosses the
+    /// support floor for a small fitted mean even when the mean-interval clamp
+    /// is `None`. See [`ResponseFamily::response_support_bounds`].
+    pub fn response_support(response: &ResponseFamily) -> Self {
+        Self(response.response_support_bounds())
+    }
+
     /// Clamp a single value into the support, leaving it untouched when the
     /// response is unbounded.
     #[inline]
@@ -234,6 +245,10 @@ impl EtaInterval {
 pub struct ObservationInterval<'a> {
     /// Per-row response-scale noise standard deviation.
     pub noise_sd: &'a Array1<f64>,
+    /// Response-support clamp applied to the predictive band `μ ± z·σ` so it
+    /// cannot report values outside the family support. [`ResponseBounds::UNBOUNDED`]
+    /// for real-line responses (the band is passed through unchanged).
+    pub bounds: ResponseBounds,
 }
 
 /// Static metadata threaded into every [`PredictUncertaintyResult`].
@@ -274,7 +289,14 @@ pub fn assemble_uncertainty_result(
     let (observation_lower, observation_upper) = match observation {
         Some(obs) => {
             let half = obs.noise_sd.mapv(|s| z * s);
-            (Some(&mean - &half), Some(&mean + &half))
+            let mut lower = &mean - &half;
+            let mut upper = &mean + &half;
+            // The predictive band must lie within the response support; a
+            // symmetric band on a bounded/half-bounded response otherwise
+            // reports impossible values (a count band going negative).
+            obs.bounds.clamp_in_place(&mut lower);
+            obs.bounds.clamp_in_place(&mut upper);
+            (Some(lower), Some(upper))
         }
         None => (None, None),
     };
@@ -561,9 +583,14 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
         mean_se.clone(),
         eta_interval_for(&policy),
         mean_bound_method_for(transform, &policy, &response_map, &mean_se),
-        observation
-            .as_ref()
-            .map(|noise_sd| ObservationInterval { noise_sd }),
+        observation.as_ref().map(|noise_sd| ObservationInterval {
+            noise_sd,
+            // The transform's response-scale support is exactly the clamp the
+            // observation band must respect (unbounded for the Gaussian
+            // location-scale identity link, `[0, 1]` for threshold-scale
+            // probability families).
+            bounds: transform.bounds(),
+        }),
         UncertaintyProvenance {
             covariance_mode_requested: options.covariance_mode,
             covariance_corrected_used,
@@ -784,7 +811,10 @@ mod parity_tests {
             eta_se.clone(),
             EtaInterval::Symmetric,
             MeanBoundMethod::IdentityEta,
-            Some(ObservationInterval { noise_sd: &sigma }),
+            Some(ObservationInterval {
+                noise_sd: &sigma,
+                bounds: ResponseBounds::UNBOUNDED,
+            }),
             UncertaintyProvenance {
                 covariance_mode_requested: InferenceCovarianceMode::Conditional,
                 covariance_corrected_used: false,
