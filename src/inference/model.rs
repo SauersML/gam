@@ -1995,6 +1995,65 @@ impl FittedFamily {
     }
 }
 
+/// Recursively collect the feature columns of a smooth basis whose out-of-hull
+/// evaluation is bounded, so they can be exempted from the predict-time axis
+/// clip (see [`FittedModel::training_smooth_extrapolation_axes`]). Wrapper bases
+/// (`by=`, factor-smooth, sum-to-zero) delegate to their inner smooth; `Sphere`
+/// and `Pca` are intentionally not collected.
+fn collect_smooth_extrapolation_axes(
+    basis: &crate::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    use crate::smooth::SmoothBasisSpec;
+    let push = |col: usize, out: &mut std::collections::HashSet<usize>| {
+        if col < n_training_headers {
+            out.insert(col);
+        }
+    };
+    match basis {
+        // 1D B-spline: first-order linear extension off the boundary slope.
+        SmoothBasisSpec::BSpline1D { feature_col, .. } => push(*feature_col, out),
+        // Tensor B-spline: each margin linear-extends independently. Periodic
+        // margins are additionally (and harmlessly) exempted via the periodic set.
+        SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+            for &c in feature_cols {
+                push(c, out);
+            }
+        }
+        // Radial bases with a bounded out-of-hull contract: Duchon / thin-plate
+        // are linear outside the data span (natural-spline boundary conditions),
+        // Matérn reverts to its mean as the kernel decays.
+        SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::Duchon { feature_cols, .. } => {
+            for &c in feature_cols {
+                push(c, out);
+            }
+        }
+        // Factor-smooth: the continuous marginal axes are B-splines that
+        // linear-extend; the group column is categorical and is left to the
+        // random-effect / level-lookup machinery.
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            for &c in &spec.continuous_cols {
+                push(c, out);
+            }
+        }
+        // Wrappers delegate to the inner smooth they modulate / replicate.
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_smooth_extrapolation_axes(inner, n_training_headers, out)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            collect_smooth_extrapolation_axes(smooth, n_training_headers, out)
+        }
+        // Sphere: latitude is clipped to manifold bounds, longitude is periodic —
+        // both handled elsewhere with non-plateau semantics. Pca: no extrapolation
+        // contract, stays clipped.
+        SmoothBasisSpec::Sphere { .. } | SmoothBasisSpec::Pca { .. } => {}
+    }
+}
+
 impl FittedModel {
     /// Axis-clip each continuous new-data column to the (min, max) range
     /// observed in training. Categorical and binary columns are left
@@ -2040,6 +2099,15 @@ impl FittedModel {
         // a boundary training level instead of letting the random-effect block
         // encode it as the prior-mean zero effect.
         let random_effect_axes = self.training_random_effect_axes(training_headers.len());
+        // Non-parametric smooth axes whose basis extrapolates boundedly on its
+        // own (B-spline linear extension, Duchon/thin-plate natural-spline linear
+        // tail, Matérn kernel decay). Clamping their input to the training extreme
+        // hands the basis an already-clamped coordinate, so its extrapolation
+        // never fires and predict freezes at a boundary plateau — diverging from
+        // the raw design path, which does not clip. Exempt them so both paths go
+        // through the single basis-layer extrapolation. See the method doc.
+        let smooth_extrapolation_axes =
+            self.training_smooth_extrapolation_axes(training_headers.len());
         // Sphere latitude is a closed-manifold coordinate: its clip bounds are
         // the manifold's intrinsic domain ([-π/2, π/2] or [-90, 90]), not the
         // sampled range, so a pole prediction reaches the true pole instead of
@@ -2070,6 +2138,9 @@ impl FittedModel {
                 continue;
             }
             if random_effect_axes.contains(&col_in_training) {
+                continue;
+            }
+            if smooth_extrapolation_axes.contains(&col_in_training) {
                 continue;
             }
             let Some(&col_idx) = col_map.get(header) else {
@@ -2204,6 +2275,51 @@ impl FittedModel {
                 if term.feature_col < n_training_headers {
                     out.insert(term.feature_col);
                 }
+            }
+        }
+        out
+    }
+
+    /// Collect the set of training-column indices that feed a non-parametric
+    /// smooth whose basis performs its own *bounded* extrapolation outside the
+    /// training hull — on any modelled surface (mean, noise/scale, log-slope).
+    ///
+    /// These columns must be exempt from the predict-time axis clip for the same
+    /// reason periodic/linear/random-effect axes are: the clip clamps a new value
+    /// to the training extreme *before* the design is built, so the basis is
+    /// handed an already-clamped coordinate and its extrapolation machinery never
+    /// fires. The result is a piecewise-constant plateau frozen at the boundary
+    /// fitted value (with a prediction SE frozen at the hull edge), and — worse —
+    /// a model that yields *different* predictions through the `FittedModel`
+    /// predict pipeline than through the raw `build_term_collection_design` path,
+    /// which does not clip. Exempting these axes routes both entry points through
+    /// the single basis-layer extrapolation, restoring internal consistency.
+    ///
+    /// Only bases with a *bounded* out-of-hull contract are listed, so removing
+    /// the clip cannot reintroduce the wild basis blow-up the clip guards against:
+    ///   - B-spline 1D / tensor margins: first-order linear extension off the
+    ///     boundary slope (`apply_linear_extension_from_first_derivative`) — grows
+    ///     at most linearly.
+    ///   - Duchon / thin-plate: the natural-spline boundary conditions make the
+    ///     fit linear outside the data span — also at most linear growth.
+    ///   - Matérn: the kernel decays with distance, so the fit reverts smoothly to
+    ///     its (low-order polynomial / constant) mean far from the data — bounded.
+    /// `sphere()` axes are deliberately *not* listed: latitude is a closed-manifold
+    /// coordinate clipped to its intrinsic bounds (`training_sphere_latitude_bounds`)
+    /// and longitude is periodic (`training_periodic_axes`); both already have the
+    /// correct, non-plateau handling. `Pca` projections have no extrapolation
+    /// contract and stay clipped.
+    ///
+    /// Returned indices reference `self.training_headers` (training-time layout),
+    /// matching the iteration in `axis_clip_to_training_ranges`.
+    fn training_smooth_extrapolation_axes(
+        &self,
+        n_training_headers: usize,
+    ) -> std::collections::HashSet<usize> {
+        let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_smooth_extrapolation_axes(&term.basis, n_training_headers, &mut out);
             }
         }
         out
