@@ -100,7 +100,9 @@ fn lcg_vec(len: usize, seed: u64) -> Array1<f64> {
     let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
     let mut out = Array1::<f64>::zeros(len);
     for x in out.iter_mut() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // map the top 53 bits into (-1, 1)
         let u = ((state >> 11) as f64) / ((1u64 << 53) as f64);
         *x = 2.0 * u - 1.0;
@@ -158,7 +160,10 @@ fn majorizer_is_symmetric_positive_semidefinite() {
             max_asym = max_asym.max((b[[p, q]] - b[[q, p]]).abs());
         }
     }
-    assert!(max_asym < 1e-12, "GN majorizer must be symmetric: max|B-Bᵀ| = {max_asym:.3e}");
+    assert!(
+        max_asym < 1e-12,
+        "GN majorizer must be symmetric: max|B-Bᵀ| = {max_asym:.3e}"
+    );
 
     // PSD: vᵀ B v ≥ 0 for many directions (the operator is JᵀJ scaled by W ≥ 0).
     let mut min_quad = f64::INFINITY;
@@ -168,7 +173,10 @@ fn majorizer_is_symmetric_positive_semidefinite() {
         let quad = v.iter().zip(bv.iter()).map(|(a, c)| a * c).sum::<f64>();
         min_quad = min_quad.min(quad);
     }
-    assert!(min_quad > -1e-10, "GN majorizer must be PSD: min vᵀBv = {min_quad:.3e}");
+    assert!(
+        min_quad > -1e-10,
+        "GN majorizer must be PSD: min vᵀBv = {min_quad:.3e}"
+    );
 }
 
 #[test]

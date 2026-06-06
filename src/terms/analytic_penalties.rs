@@ -7523,7 +7523,11 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        assert_eq!(target.len(), v.len(), "psd_majorizer_hvp dimension mismatch");
+        assert_eq!(
+            target.len(),
+            v.len(),
+            "psd_majorizer_hvp dimension mismatch"
+        );
         self.hvp_impl(target, rho, v, /* include_residual = */ false)
     }
 
