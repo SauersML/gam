@@ -173,55 +173,16 @@ impl From<RemlError> for String {
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Debug stash: thread-local capture of (op_total, U) from the ext-grad path,
-//  used by the iso-κ Duchon FD investigation test. Empty in production runs.
+//  used by the iso-κ Duchon FD investigation test. The stash type itself and
+//  the per-thread TLS live in `crate::test_support::debug_stash` so that the
+//  test reader (`take_terms`) and the production writer (`store_terms`)
+//  share a single source of truth — a previous incomplete refactor left
+//  duplicate `TermStash` definitions in this module and in `test_support`,
+//  routing writes to one TLS and reads to the other so the diagnostic tests
+//  always saw empty captures.
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub mod debug_stash {
-    use std::cell::RefCell;
-
-    #[derive(Clone, Debug, Default)]
-    pub struct TermStash {
-        /// Per-row diagonal of term4: `c · X_τβ̂` (n-vector).
-        pub c_x_tau_beta_diag: Option<ndarray::Array1<f64>>,
-        /// `X · v_ψ` per row, where v_ψ = hop⁻¹·stored_g. The correction
-        /// matrix is `−X' diag(c · X · v_ψ) X`, so multiplying this by c
-        /// (from PIRLS) gives the diagonal entering the correction sandwich.
-        pub c_x_v_psi_diag: Option<ndarray::Array1<f64>>,
-    }
-
-    // Thread-local storage keyed on the THREAD THAT CALLED `reml_laml_evaluate`
-    // (i.e. the test thread). The diagnostic block inside the function is
-    // physically computed by a rayon worker for `ext_idx == 0`, but the
-    // worker's stash is plumbed back through the par_iter return value
-    // and `store_terms` is invoked on the calling thread after the
-    // parallel loop completes. That makes thread-local correct again —
-    // each test thread reads its own captures, even when `cargo test`
-    // runs the suite at full parallelism and many tests are inside
-    // `reml_laml_evaluate` simultaneously.
-    //
-    // A previous attempt to share a single process-global `Mutex<TermStash>`
-    // deterministically corrupted concurrent tests: thread A would call
-    // `take_terms()` after its own evaluate returned, but if thread B's
-    // evaluate had stored a stash in between, A read B's data. Routing
-    // the write back to the calling thread's thread-local is the only
-    // arrangement that keeps the per-test capture intact under parallel
-    // testing.
-    thread_local! {
-        static TERMS: RefCell<TermStash> = const { RefCell::new(TermStash {
-            c_x_tau_beta_diag: None,
-            c_x_v_psi_diag: None,
-        }) };
-    }
-
-    /// Replace the calling thread's `TermStash` with `stash`. Called by
-    /// `reml_laml_evaluate` from the calling thread AFTER its ext-coord
-    /// par_iter has produced the stash on a rayon worker and returned
-    /// it via the closure's tuple. Tests read the stored stash via
-    /// `take_terms()` from the same thread.
-    pub fn store_terms(stash: TermStash) {
-        TERMS.with(|cell| *cell.borrow_mut() = stash);
-    }
-}
+pub use crate::test_support::debug_stash;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Core traits
@@ -8198,6 +8159,17 @@ pub fn reml_laml_evaluate(
             // does not capture — see the `c_nontrivial` gate in
             // `build_dense_assembly` / `build_dense_original_assembly`).
             // Drops into the `None` arm below in that branch.
+            // Diagnostic stash for the iso-κ Duchon FD investigation. Filled
+            // only for the first extended coordinate (`ext_idx == 0`) and only
+            // when the log|H| contribution is included; pushed back to the
+            // calling thread via the per-call sink after the par_iter loop.
+            let mut diag_stash: Option<debug_stash::TermStash> =
+                if incl_logdet_h && ext_idx == 0 {
+                    Some(debug_stash::TermStash::default())
+                } else {
+                    None
+                };
+
             let trace_logdet_i = if !incl_logdet_h {
                 0.0
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
@@ -8223,27 +8195,48 @@ pub fn reml_laml_evaluate(
                 }
             };
 
+            // For the iso-κ Duchon FD investigation, capture the production
+            // trace plus the unprojected full-space counterpart so the
+            // `_pins_trace` test can verify that the projection kernel
+            // changes the trace by an order of magnitude relative to
+            // `G_ε(H)`. The drift for `ext_idx == 0` is recomputed here
+            // regardless of which precomputed-trace branch fed
+            // `trace_logdet_i`; this is cheap (a single coord) and lets the
+            // diagnostic survive whether the gradient took the
+            // `projected_trace_values` batched path or the per-coord
+            // `else` fallback.
+            if let Some(stash) = diag_stash.as_mut() {
+                stash.projection_active = Some(solution.penalty_subspace_trace.is_some());
+                stash.production_tr = Some(trace_logdet_i);
+                let correction = ext_corrections[ext_idx].as_ref();
+                let drift = hyper_coord_total_drift_result(&coord.drift, correction, hop.dim());
+                let unprojected = match &drift {
+                    DriftDerivResult::Dense(matrix) => hop.trace_logdet_h_k(matrix, None),
+                    DriftDerivResult::Operator(op) => hop.trace_logdet_operator(op.as_ref()),
+                };
+                stash.unprojected_tr = Some(unprojected);
+            }
+
             // Per-row diagnostic stash: captures term4's `c · X_τβ̂` diagonal
             // plus `X · v_ψ` per row, where v_ψ = ext_v_is[ext_idx] = hop⁻¹·coord.g.
             // The diagonal entering the correction sandwich is `c · X · v_ψ`;
             // multiplying by the test's known c recovers that diagonal.
-            if incl_logdet_h && ext_idx == 0 {
+            if let Some(mut stash) = diag_stash.take() {
                 if let Some(op_arc) = coord.drift.operator.as_ref()
                     && let Some(sd) = op_arc.as_sparse_directional()
                 {
-                    let mut stash = debug_stash::TermStash::default();
                     stash.c_x_tau_beta_diag = sd.c_x_tau_beta.clone();
                     let v_i = &ext_v_is[ext_idx];
                     stash.c_x_v_psi_diag = Some(sd.x_design.matrixvectormultiply(v_i));
-                    // Hand the stash back through the per-call sink. The
-                    // calling thread copies it into its own thread-local
-                    // after the par_iter completes, so concurrent tests
-                    // each end up reading their OWN ext_idx==0 capture
-                    // rather than racing on a shared global slot.
-                    *ext_stash_sink_for_closure
-                        .lock()
-                        .expect("EIG-DECOMP stash sink mutex poisoned") = Some(stash);
                 }
+                // Hand the stash back through the per-call sink. The
+                // calling thread copies it into its own thread-local
+                // after the par_iter completes, so concurrent tests
+                // each end up reading their OWN ext_idx==0 capture
+                // rather than racing on a shared global slot.
+                *ext_stash_sink_for_closure
+                    .lock()
+                    .expect("EIG-DECOMP stash sink mutex poisoned") = Some(stash);
             }
 
             let value = outer_gradient_entry(

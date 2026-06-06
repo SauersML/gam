@@ -222,4 +222,13 @@ pub mod debug_stash {
     pub fn take_terms() -> TermStash {
         TERMS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
     }
+
+    /// Replace the calling thread's `TermStash` with `stash`. Called by
+    /// `reml_laml_evaluate` from the calling thread AFTER its ext-coord
+    /// par_iter has produced the stash on a rayon worker and returned
+    /// it via a per-call mutex sink. Tests read the stored stash via
+    /// `take_terms()` from the same thread.
+    pub fn store_terms(stash: TermStash) {
+        TERMS.with(|cell| *cell.borrow_mut() = stash);
+    }
 }
