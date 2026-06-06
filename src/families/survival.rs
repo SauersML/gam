@@ -1888,17 +1888,24 @@ impl WorkingModelSurvival {
             let deriv = self
                 .stabilized_structural_derivative(derivative_raw[i])
                 .unwrap_or(derivative_raw[i]);
-            if !deriv.is_finite() {
-                return Err(EstimationError::ParameterConstraintViolation(format!(
-                    "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
-                    i, deriv, derivative_guard
-                )));
-            }
-            if deriv < derivative_guard_numerical {
-                return Err(EstimationError::ParameterConstraintViolation(format!(
-                    "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
-                    i, deriv, derivative_guard
-                )));
+            // Gate the monotonicity guard on `d > 0`: only event rows reach
+            // `deriv.ln()` and `1.0 / deriv` below, so censored rows have no
+            // numerical reason to reject a zero or negative derivative. The
+            // matching loop in `offset_channel_residuals` already restricts
+            // its identical check to `d > 0.0`.
+            if d > 0.0 {
+                if !deriv.is_finite() {
+                    return Err(EstimationError::ParameterConstraintViolation(format!(
+                        "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
+                        i, deriv, derivative_guard
+                    )));
+                }
+                if deriv < derivative_guard_numerical {
+                    return Err(EstimationError::ParameterConstraintViolation(format!(
+                        "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
+                        i, deriv, derivative_guard
+                    )));
+                }
             }
             if has_entry_interval {
                 let increment_guard = self.interval_increment_guard(h_s_scaled, h_e_scaled);
