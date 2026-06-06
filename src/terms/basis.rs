@@ -8177,10 +8177,15 @@ pub fn build_bspline_basis_1d(
             joint_null_rotation: None,
         });
     }
-    let prefer_sparse_design = matches!(
-        spec.identifiability,
-        BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
-    );
+    // The sparse branch below routes only through `apply_bspline_identifiability_policy`
+    // and never threads `apply_bspline_boundary_conditions`, so taking it for non-free
+    // endpoints silently drops the user's Clamped/Anchored constraint and lets a
+    // non-zero anchor through unchecked.  Require free endpoints to use the sparse path.
+    let prefer_sparse_design = spec.boundary_conditions.is_free()
+        && matches!(
+            spec.identifiability,
+            BSplineIdentifiability::None | BSplineIdentifiability::WeightedSumToZero { .. }
+        );
     let (design_sparse_opt, design_dense_opt, knots) = if prefer_sparse_design {
         match &spec.knotspec {
             BSplineKnotSpec::Generate {
