@@ -266,8 +266,16 @@ mod tests {
         };
         assert_eq!(stride, 10);
         assert_eq!(status, vec![CubicCellMomentStatus::Ok as u8]);
-        // M_0 for η ≡ 0 over [-1, 1] is sqrt(2π) · (Φ(1) − Φ(−1)).
-        assert!((moments[0] - 1.7112488348667447).abs() < 1e-12);
+        // M_0(η ≡ 0, [-1, 1]) = ∫_{-1}^{1} exp(-z²/2) dz
+        //                     = √(2π) · (Φ(1) − Φ(−1))
+        //                     = √(2π) · erf(1/√2)
+        //                     ≈ 2.5066282746310002 · 0.6826894921370859
+        //                     ≈ 1.7112487837842974
+        assert!(
+            (moments[0] - 1.711_248_783_784_297_4).abs() < 1e-13,
+            "M_0 should match the closed-form √(2π)·erf(1/√2): got {}",
+            moments[0]
+        );
     }
 
     #[test]
