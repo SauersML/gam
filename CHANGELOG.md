@@ -18,6 +18,10 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.101 — gam 0.3.101 / gamfit 0.1.175 (2026-06-06)
+
+- gamfit: survival marginal-slope baseline-hazard conditioning + monotonicity-domain tolerance fixes (#788, #797 inner barrier) reach PyPI; bernoulli marginal-slope inner trust-region noise-floor fix. Plus mainline fixes #798–#805.
+
 ## v0.3.100 — gam 0.3.100 / gamfit 0.1.174 (2026-06-06)
 
 Correctness fixes to response-scale prediction intervals, survival fitting, and
