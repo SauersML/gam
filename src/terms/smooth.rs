@@ -1301,6 +1301,90 @@ impl TermCollectionSpec {
 
         Ok(())
     }
+
+    /// Re-resolve every stored feature-column index through `remap`, returning a
+    /// spec that addresses a different column layout.
+    ///
+    /// A frozen `TermCollectionSpec` stores feature columns as *absolute indices
+    /// into the training table*. To replay it on a fresh dataset whose columns
+    /// sit at different positions — the common case at prediction time, where
+    /// the response column is unknown and may be absent entirely — every index
+    /// must be re-resolved against the new layout. `remap` receives each
+    /// training-table index and returns its position in the runtime table;
+    /// callers typically implement it as "look the name up in the training
+    /// headers, then resolve that name against the prediction dataset".
+    ///
+    /// This is the single authority on *which* fields carry a column index
+    /// across every basis variant (linear, random-effect, the `by=` column of
+    /// `ByVariable`/`FactorSumToZero`/`BySmooth`, the continuous and group
+    /// columns of a `FactorSmooth`, and the multi-axis `feature_cols` of every
+    /// spatial/tensor basis), so a predict-time realignment cannot silently miss
+    /// one and dereference a stale training index.
+    pub fn remap_feature_columns<E, F>(&self, mut remap: F) -> Result<TermCollectionSpec, E>
+    where
+        F: FnMut(usize) -> Result<usize, E>,
+    {
+        let mut out = self.clone();
+        for lt in &mut out.linear_terms {
+            lt.feature_col = remap(lt.feature_col)?;
+        }
+        for rt in &mut out.random_effect_terms {
+            rt.feature_col = remap(rt.feature_col)?;
+        }
+        for st in &mut out.smooth_terms {
+            remap_smooth_basis_feature_columns(&mut st.basis, &mut remap)?;
+        }
+        Ok(out)
+    }
+}
+
+/// Walk a `SmoothBasisSpec` tree, re-resolving every column index through
+/// `remap`. Shared by all predict-time column realignment (see
+/// [`TermCollectionSpec::remap_feature_columns`]); kept exhaustive so a newly
+/// added index-bearing variant fails to compile until it is handled here.
+fn remap_smooth_basis_feature_columns<E, F>(
+    basis: &mut SmoothBasisSpec,
+    remap: &mut F,
+) -> Result<(), E>
+where
+    F: FnMut(usize) -> Result<usize, E>,
+{
+    match basis {
+        SmoothBasisSpec::ByVariable { inner, by_col, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
+            *by_col = remap(*by_col)?;
+            remap_smooth_basis_feature_columns(inner, remap)?;
+        }
+        SmoothBasisSpec::BSpline1D { feature_col, .. } => {
+            *feature_col = remap(*feature_col)?;
+        }
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            let by_feature_col = match by_kind {
+                ByVarKind::Numeric { feature_col } | ByVarKind::Factor { feature_col, .. } => {
+                    feature_col
+                }
+            };
+            *by_feature_col = remap(*by_feature_col)?;
+            remap_smooth_basis_feature_columns(smooth, remap)?;
+        }
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            for fc in spec.continuous_cols.iter_mut() {
+                *fc = remap(*fc)?;
+            }
+            spec.group_col = remap(spec.group_col)?;
+        }
+        SmoothBasisSpec::ThinPlate { feature_cols, .. }
+        | SmoothBasisSpec::Sphere { feature_cols, .. }
+        | SmoothBasisSpec::Matern { feature_cols, .. }
+        | SmoothBasisSpec::Duchon { feature_cols, .. }
+        | SmoothBasisSpec::Pca { feature_cols, .. }
+        | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+            for fc in feature_cols.iter_mut() {
+                *fc = remap(*fc)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
