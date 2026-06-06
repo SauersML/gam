@@ -2017,7 +2017,32 @@ impl<'a> RemlState<'a> {
             );
             return false;
         }
+        // The analytic outer Hessian for a Firth fit folds in the Tierney-Kadane
+        // curvature, whose c/d/e/f derivative arrays are implemented only for the
+        // canonical Binomial Logit jet. #758 widened Firth to other Binomial
+        // inverse links (Probit, CLogLog, SAS, …); those fits have no analytic TK
+        // Hessian, so decline the analytic path and let BFGS drive the outer loop
+        // off the (link-general) plain-Laplace gradient. Non-Firth fits are
+        // unaffected — they never use the TK correction.
+        if reml_robust_jeffreys_link(&self.config).is_some()
+            && !self.tk_correction_is_canonical_logit()
+        {
+            return false;
+        }
         true
+    }
+
+    /// Whether the Tierney-Kadane outer correction (its value, ρ-gradient, and
+    /// ρ-Hessian) applies to this fit. It is implemented only for canonical
+    /// Binomial Logit Firth fits because its c/d/e/f derivative arrays consume
+    /// the logit 5th-derivative jet (`logit_inverse_link_jet5`). Non-logit Firth
+    /// fits skip the TK refinement and use plain Laplace REML, which is
+    /// link-general; logit fits keep the full higher-order correction.
+    fn tk_correction_is_canonical_logit(&self) -> bool {
+        let spec = reml_spec(&self.config.likelihood);
+        matches!(spec.response, ResponseFamily::Binomial)
+            && matches!(spec.link, InverseLink::Standard(StandardLink::Logit))
+            && self.runtime_mixture_link_state.is_none()
     }
 
     pub(super) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -3176,6 +3201,21 @@ impl<'a> RemlState<'a> {
             });
         }
         if reml_robust_jeffreys_link(&self.config).is_none() {
+            return Ok(TkCorrectionTerms {
+                value: 0.0,
+                gradient: None,
+                hessian: None,
+            });
+        }
+        // The TK correction's c/d/e/f derivative arrays use the logit
+        // 5th-derivative jet and are implemented only for canonical Binomial
+        // Logit Firth fits. #758 widened Firth to other Binomial inverse links;
+        // those fits skip the higher-order TK refinement (zero correction) and
+        // fall back to plain Laplace REML rather than erroring inside
+        // `hessian_cdef_arrays`. The Firth/Jeffreys bias reduction itself lives in
+        // the inner PIRLS solve, so it is fully retained — only the outer
+        // marginal-likelihood refinement is dropped for non-logit links.
+        if !self.tk_correction_is_canonical_logit() {
             return Ok(TkCorrectionTerms {
                 value: 0.0,
                 gradient: None,
