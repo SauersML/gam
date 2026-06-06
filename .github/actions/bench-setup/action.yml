@@ -56,4 +56,27 @@ runs:
         Rscript --version
         python3 -m pip install --upgrade pip setuptools wheel
         python3 -m pip install numpy pandas scikit-learn lifelines scikit-survival xgboost
-        Rscript -e 'install.packages(c("mgcv","jsonlite","survival","glmnet","gamlss","gamlss.dist","gamboostLSS","mboost","bamlss","brms"), repos="https://cloud.r-project.org", lib=Sys.getenv("R_LIBS_USER"), Ncpus=max(1L, parallel::detectCores()-1L))'
+        # Prefer Posit's binary CRAN mirror (set by r-lib/actions/setup-r as
+        # RSPM) for fast, reliable Linux binary installs. Source builds from
+        # cloud.r-project.org regularly fail on the runner for packages with
+        # heavy system dependencies (mboost/gamboostLSS/bamlss/brms), and
+        # install.packages does NOT error when individual packages fail —
+        # leaving a corrupt runtime cache that breaks every shard for days.
+        # Verify every required package is loadable and fail the job
+        # otherwise so the cache is not saved with missing pieces.
+        Rscript -e '
+          rspm <- Sys.getenv("RSPM")
+          repos <- if (nzchar(rspm)) c(CRAN = rspm) else c(CRAN = "https://cloud.r-project.org")
+          required <- c("mgcv","jsonlite","survival","glmnet","gamlss",
+                        "gamlss.dist","gamboostLSS","mboost","bamlss","brms")
+          install.packages(required, repos = repos,
+                           lib = Sys.getenv("R_LIBS_USER"),
+                           Ncpus = max(1L, parallel::detectCores() - 1L))
+          installed <- rownames(installed.packages(lib.loc = Sys.getenv("R_LIBS_USER")))
+          missing <- setdiff(required, installed)
+          if (length(missing) > 0L) {
+            stop("install.packages failed to install: ",
+                 paste(missing, collapse = ", "))
+          }
+          cat("R packages installed:", paste(required, collapse = ", "), "\n")
+        '

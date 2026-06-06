@@ -19,7 +19,7 @@ env:
   PIP_NO_PYTHON_VERSION_WARNING: "1"
   R_LIBS_USER: ${{ github.workspace }}/.r-lib
   BENCH_R_VERSION: "4.4.3"
-  BENCH_RUNTIME_CACHE_VERSION: v2
+  BENCH_RUNTIME_CACHE_VERSION: v3
 
 jobs:
   prepare:
