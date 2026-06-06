@@ -18,6 +18,60 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.98 — gam 0.3.98 / gamfit 0.1.172 (2026-06-06)
+
+First published release carrying the universal under-identification robustness
+work staged in 0.3.97 (which was version-bumped but never published to
+crates.io / PyPI), together with a batch of correctness fixes across the
+binomial-link, separation-diagnostic, SAE-penalty, and constraint paths.
+
+### Fixed
+- **Link-general Firth / Jeffreys (#758).** Firth bias reduction and the
+  Jeffreys prior now apply to every Binomial inverse link that carries a
+  Fisher-weight jet (Probit, CLogLog, Latent-CLogLog, SAS, Beta-Logistic, and
+  anchored Mixture links), not only Logit. The actual inverse link is preserved
+  through the Firth/Jeffreys and PIRLS-diagnostic paths instead of silently
+  collapsing to a bare logit, and the CLI gate and the NUTS/HMC Firth guards
+  accept the full set with an accurate message (was a stale "only supported for
+  Binomial Logit").
+- **Pre-fit regularity screen (#775).** Designs that are perfectly separated
+  (single-column *or* linear-combination separators) or rank-deficient in their
+  unpenalized block are now rejected up front with a typed, actionable error
+  instead of diverging inside the solver.
+- **Multinomial separation diagnostics (#753).** Separating multinomial fits
+  raise a dedicated `MultinomialSeparationDetected` error naming the offending
+  class/row instead of reusing the binary-outcome message.
+- **Tweedie sampling dispersion (#771).** Posterior sampling draws Tweedie
+  responses with the fitted dispersion φ rather than mis-using the variance
+  power as the noise scale.
+- **Picklable Rust exceptions (#773).** `gamfit`'s Rust-originated exceptions
+  carry an importable module, so they survive pickling across a
+  `ProcessPoolExecutor` / `multiprocessing` boundary.
+- **SAE-penalty curvature correctness (#794).** `MonotonicityPenalty::hvp` no
+  longer inflates curvature by `1/smoothing_eps`, and `JumpReLUPenalty`'s PSD
+  majorizer now genuinely dominates the exact (indefinite) Hessian for inactive
+  coordinates instead of under-estimating it ~7×.
+- **SAE numerical robustness (#742).** Learnable penalty/SAE exponents are
+  clamped to a finite-normal band so extreme ρ can no longer overflow to
+  inf/NaN.
+- **Box-constraint scaling (#791).** CLI box constraints are transformed by
+  `1/scale` (not `scale`), fixing constraint escape under non-unit scaling.
+- **Random-effect group axes (#792).** Unseen string random-effect group levels
+  are admitted at predict time and group axes are no longer clipped.
+- **Coupled Dirichlet joint Hessian (#729)** and spec-aware joint-Hessian drifts
+  that keep batched marginal-slope / Jeffreys fits Hφ-consistent (#787).
+- **Periodic tensor B-splines (#629).** Tensor B-spline periodicity is preserved
+  through freeze→reload, with a separable periodic top-1 fit path and a restored
+  manifold-SAE serialization roundtrip.
+- **Guidance fixes:** correct per-diagnosis marginal-slope refusal guidance
+  (#754) and survival marginal-slope penalty-width provenance (#788).
+
+### Internal
+- Unified the four matrix-free Lanczos paths onto one primitive (#766),
+  collapsed the duplicated Firth-support predicates onto a single source of
+  truth, synced the `gam-pyffi` lockfile version, and made the release tree
+  rustfmt-clean.
+
 ## v0.3.97 — gam 0.3.97 / gamfit 0.1.171 (2026-06-05)
 
 Universal under-identification robustness — unified, always-on, no flag.
