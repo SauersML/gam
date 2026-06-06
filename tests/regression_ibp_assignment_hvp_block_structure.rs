@@ -111,7 +111,10 @@ fn ibp_hvp_reproduces_full_hessian_and_is_block_diagonal() {
             max_asym = max_asym.max((hv_mat[[p, q]] - hv_mat[[q, p]]).abs());
         }
     }
-    assert!(max_asym < 1e-12, "hvp operator must be symmetric: max|H-Hᵀ| = {max_asym:.3e}");
+    assert!(
+        max_asym < 1e-12,
+        "hvp operator must be symmetric: max|H-Hᵀ| = {max_asym:.3e}"
+    );
 
     // (3) Cross-column entries are exactly zero (block-diagonal per column).
     let mut max_cross = 0.0_f64;
@@ -138,7 +141,8 @@ fn ibp_hvp_reproduces_full_hessian_and_is_block_diagonal() {
         .expect("IBPAssignmentPenalty exposes an analytic hessian_diag");
     for j in 0..total {
         assert_eq!(
-            hv_mat[[j, j]], diag[j],
+            hv_mat[[j, j]],
+            diag[j],
             "hvp diagonal entry {j} must equal hessian_diag[{j}] exactly"
         );
     }
