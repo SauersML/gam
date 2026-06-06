@@ -60,8 +60,13 @@ fn jumprelu_psd_majorizer_dominates_exact_hessian_below_threshold() {
     let tau = 1.0_f64;
 
     // latent_dim = 1; four coordinates spanning below / at / above threshold.
-    let p = JumpReLUPenalty::new(PsiSlice::full(4, Some(1)), Array1::from(vec![tau]), weight, eps)
-        .expect("construct JumpReLU penalty");
+    let p = JumpReLUPenalty::new(
+        PsiSlice::full(4, Some(1)),
+        Array1::from(vec![tau]),
+        weight,
+        eps,
+    )
+    .expect("construct JumpReLU penalty");
     // rho_count == latent_dim; rho = 0 keeps the threshold at its base `tau`.
     let rho = Array1::from(vec![0.0_f64]);
     let target = Array1::from(vec![0.0, 0.7, 1.0, 2.0]);
