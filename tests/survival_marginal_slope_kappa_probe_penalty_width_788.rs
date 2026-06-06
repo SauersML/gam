@@ -216,7 +216,10 @@ fn survival_marginal_slope_kappa_probe_keeps_raw_penalty_widths_788() {
     if let Ok(FitResult::SurvivalMarginalSlope(result)) = &outcome {
         for (idx, block) in result.fit.blocks.iter().enumerate() {
             for (j, &coef) in block.beta.iter().enumerate() {
-                assert!(coef.is_finite(), "β block {idx} coef {j} non-finite: {coef}");
+                assert!(
+                    coef.is_finite(),
+                    "β block {idx} coef {j} non-finite: {coef}"
+                );
             }
         }
     }

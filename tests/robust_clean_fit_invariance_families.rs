@@ -412,9 +412,8 @@ fn clean_fit_invariance_survival_lognormal() {
 
     let run = || -> CleanFit {
         let cfg = FitConfig::default();
-        let result =
-            fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=6)"#, &data, &cfg)
-                .unwrap_or_else(|e| panic!("clean survival fit returned Err: {e}"));
+        let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=6)"#, &data, &cfg)
+            .unwrap_or_else(|e| panic!("clean survival fit returned Err: {e}"));
         let FitResult::SurvivalLocationScale(fit) = result else {
             panic!("expected SurvivalLocationScale");
         };

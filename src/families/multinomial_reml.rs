@@ -1608,10 +1608,13 @@ mod tests {
         let n = 60usize;
         let k = 3usize;
         let p = 2usize; // [intercept, x]
-        let design = Arc::new(Array2::<f64>::from_shape_fn((n, p), |(row, col)| match col {
-            0 => 1.0,
-            _ => -3.0 + 6.0 * (row as f64) / ((n - 1) as f64),
-        }));
+        let design = Arc::new(Array2::<f64>::from_shape_fn(
+            (n, p),
+            |(row, col)| match col {
+                0 => 1.0,
+                _ => -3.0 + 6.0 * (row as f64) / ((n - 1) as f64),
+            },
+        ));
         let mut y = Array2::<f64>::zeros((n, k));
         for row in 0..n {
             let x = design[[row, 1]];
@@ -1626,20 +1629,17 @@ mod tests {
         }
         // Unpenalized: zero penalty so NO proper wiggliness prior exists on any
         // direction — separation is the only thing that could bound the slope.
-        let penalties = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(
-            Array2::<f64>::zeros((p, p)),
-        )]);
+        let penalties = Arc::new(vec![crate::custom_family::PenaltyMatrix::Dense(Array2::<
+            f64,
+        >::zeros(
+            (
+            p, p,
+        )
+        ))]);
         let nullspace_dims = Arc::new(vec![p]); // fully unpenalized block
         let weights = Array1::<f64>::ones(n);
-        let family = MultinomialFamily::new(
-            y,
-            weights,
-            k,
-            design,
-            penalties,
-            nullspace_dims,
-        )
-        .expect("separated multinomial family must construct");
+        let family = MultinomialFamily::new(y, weights, k, design, penalties, nullspace_dims)
+            .expect("separated multinomial family must construct");
 
         let m = family.active_classes();
         let total = m * p;
@@ -1693,14 +1693,11 @@ mod tests {
         // Evaluate the universal Jeffreys term against the family's analytic
         // directional derivative — the identical closure
         // `custom_family_joint_jeffreys_term` constructs.
-        let (phi, grad_phi, hphi) = joint_jeffreys_term(
-            h_joint.view(),
-            z_joint.view(),
-            |direction: &Array1<f64>| {
+        let (phi, grad_phi, hphi) =
+            joint_jeffreys_term(h_joint.view(), z_joint.view(), |direction: &Array1<f64>| {
                 family.exact_newton_joint_hessian_directional_derivative(&states, direction)
-            },
-        )
-        .expect("multinomial joint Jeffreys term must evaluate");
+            })
+            .expect("multinomial joint Jeffreys term must evaluate");
 
         // The conditioning gate must FIRE on this separating geometry: the
         // multinomial family is armed by the universal robustness, not excluded.

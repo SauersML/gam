@@ -35,8 +35,7 @@ use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{
-    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link,
-    softmax_last_fixedzero,
+    InverseLinkKernel, LinkParamPartials, inverse_link_jet_for_inverse_link, softmax_last_fixedzero,
 };
 use crate::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink, is_valid_tweedie_power,
