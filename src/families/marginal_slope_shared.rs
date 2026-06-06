@@ -1565,13 +1565,27 @@ pub fn feasible_step_fraction<E>(
             constraints.a.ncols(),
         ));
     }
+    // Feasibility-violation tolerance for the *current* iterate, kept consistent
+    // with the QP entry gate `check_linear_feasibility` (called at 1e-8) and the
+    // residual left by `project_onto_linear_constraints` (per-row violation <= 1e-10
+    // on the working vector, accumulating up to O(1e-9) on the final beta through
+    // its sequential Dykstra corrections). Rejecting at -1e-10 here re-classified a
+    // beta the QP had already accepted as feasible as a hard error (gam#797: the
+    // projected survival time-block seed lands at slack ~ -1.1e-9 on a binding
+    // derivative-guard row, so every trust-region attempt errored out before any
+    // step). A slack within this band is numerically AT the boundary; treat it as
+    // active (slack = 0) rather than a violation.
+    const FEASIBLE_STEP_VIOLATION_TOL: f64 = 1e-8;
     let mut alpha = 1.0f64;
     for row in 0..constraints.a.nrows() {
         let a_row = constraints.a.row(row);
-        let slack = a_row.dot(beta) - constraints.b[row];
-        if slack < -1e-10 {
-            return Err(map_violation_err(row, slack));
+        let raw_slack = a_row.dot(beta) - constraints.b[row];
+        if raw_slack < -FEASIBLE_STEP_VIOLATION_TOL {
+            return Err(map_violation_err(row, raw_slack));
         }
+        // Clamp boundary round-off to the boundary so a tiny negative slack cannot
+        // produce a spurious negative/zero step fraction below.
+        let slack = raw_slack.max(0.0);
         let drift = a_row.dot(direction);
         if drift < 0.0 {
             alpha = alpha.min((slack / -drift).clamp(0.0, 1.0));

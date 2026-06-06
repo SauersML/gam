@@ -12254,14 +12254,23 @@ fn update_joint_trust_region_radius(
     let noise_floor = objective_scale.abs().max(1.0) * 1e-14;
     let predicted_finite_positive =
         predicted_reduction > noise_floor && predicted_reduction.is_finite();
-    let rho = if predicted_finite_positive {
-        actual_reduction / predicted_reduction
-    } else if actual_reduction.abs() <= noise_floor {
-        // Both predicted and actual reductions are at noise level —
-        // treat as a neutral step (rho = 1) so a numerically converged
-        // iterate is not rejected merely because round-off flipped the
-        // sign of `actual_reduction`.
+    let rho = if actual_reduction.abs() <= noise_floor {
+        // The realized objective change is at the floating-point round-off floor:
+        // the step neither helped nor hurt beyond noise, so it is a numerically
+        // neutral (converged) step. Treat it as `rho = 1` REGARDLESS of whether
+        // `predicted_reduction` happens to sit just above the floor. The previous
+        // form only took this branch when `!predicted_finite_positive`; when a
+        // tiny-but-valid Newton step near a flat-objective optimum produced
+        // `predicted_reduction` marginally above `noise_floor` while
+        // `actual_reduction` was within it, it divided two round-off-level
+        // quantities and got a spurious negative `rho`, rejecting the step and
+        // ratcheting the trust radius to the floor — pinning the solve far below
+        // the (small, valid) Newton step it needed (gam#797 last-mile; same
+        // pinning family observed on clustered bernoulli). Keying neutrality on the
+        // *actual* reduction is the correct round-off guard.
         1.0
+    } else if predicted_finite_positive {
+        actual_reduction / predicted_reduction
     } else {
         f64::NEG_INFINITY
     };
@@ -13724,7 +13733,19 @@ fn constrained_stationary_certificate_decision(
     // small tolerance band is intentionally tied to the inner residual
     // tolerance, because this branch is allowed to certify convergence only
     // when the active-set projection has actually captured the multiplier.
-    let cert_residual_factor = 1.0;
+    //
+    // The band is a small MULTIPLE of `residual_tol`, not exactly `1x`: this
+    // branch fires only once the iterate is already proven stationary (objective
+    // exhausted, step exhausted, `linearized_rel >= 0.5` so the residual is
+    // multiplier/null mass not a gradient defect, `scalar_relerr <= 1e-3` so the
+    // quadratic model is exact). There the active-projected residual stalls at the
+    // conditioning/round-off floor — for the survival baseline-hazard block
+    // (well-conditioned after the data-seeded baseline, gam#797) it floors a hair
+    // above the scale-relative `residual_tol`, so demanding exactly `<= tol` leaves
+    // a fully-stationary iterate uncertified. A `4x` band certifies the genuinely
+    // converged iterate while still rejecting a residual orders of magnitude above
+    // tolerance (a real defect), the only case this guard must catch.
+    let cert_residual_factor = 4.0;
     if residual.is_finite() && residual <= cert_residual_factor * residual_tol {
         ConstrainedStationaryCertificate::Accept
     } else {
@@ -16304,6 +16325,101 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         );
                         converged = true;
                         break;
+                    }
+                    // Constrained exact-fixed-point acceptance (gam#797).
+                    //
+                    // We reach here only with the iterate ALREADY proven stationary
+                    // (objective + step exhausted, `linearized_rel >= 0.5` so the
+                    // residual is multiplier/null mass, `scalar_relerr <= 1e-3` so
+                    // the quadratic model is exact), the strict/range-space/noise
+                    // certificates having declined. For a CONSTRAINED block the
+                    // remaining residual can be a genuine active-constraint Lagrange
+                    // multiplier that the active-set QP under-identified (it reports
+                    // only rows it drove tight during a non-degenerate step, so a
+                    // monotone derivative-guard row tight at the optimum but never
+                    // explicitly stepped is missing), leaving the cone projection
+                    // unable to decompose `r = A_activeᵀ λ` and the residual stuck
+                    // far above tol on an iterate that is EXACTLY the constrained
+                    // optimum (the `active_set_incomplete` refusal; gam#797 survival
+                    // marginal/logslope/time blocks).
+                    //
+                    // When (a) the joint Newton has reached a numerical FIXED POINT
+                    // — the accepted step and objective change are both at the
+                    // machine-epsilon floor relative to the iterate, so no further
+                    // progress is mathematically possible — (b) the local quadratic
+                    // model is exact (`scalar_relerr` tiny), and (c) the design
+                    // carries linear inequality constraints AND `H_pen` has NO
+                    // numerical null space (so the residual is an active-constraint
+                    // multiplier, NOT an H-null/rank-deficient defect, which the
+                    // range-space certificate above already handles), the iterate is
+                    // a bona fide constrained KKT point. The active-constraint
+                    // multiplier mass is projected out of the KKT residual by the
+                    // unified evaluator's active-constraint-aware IFT correction
+                    // before the envelope gradient, exactly as for an explicitly
+                    // captured multiplier, so certifying here is correct. Gated
+                    // strictly on a fixed point with no H-null, so a genuinely
+                    // non-converged or rank-deficient iterate is never accepted.
+                    let any_block_constrained =
+                        block_constraints.iter().any(|c| c.is_some());
+                    let beta_scale = states
+                        .iter()
+                        .flat_map(|s| s.beta.iter().copied())
+                        .map(f64::abs)
+                        .fold(0.0_f64, f64::max)
+                        .max(1.0);
+                    let fixed_point_floor = 64.0 * f64::EPSILON * beta_scale;
+                    let objective_floor =
+                        64.0 * f64::EPSILON * (1.0 + lastobjective.abs());
+                    let at_numerical_fixed_point = accepted_step_inf.is_finite()
+                        && accepted_step_inf <= fixed_point_floor
+                        && objective_change <= objective_floor
+                        && scalar_model_relerr <= 1e-3;
+                    if any_block_constrained && at_numerical_fixed_point {
+                        // Materialize H_pen = H + S(λ) (+ model ridge) and count its
+                        // numerical null space at the shared rank tolerance: nullity == 0
+                        // ⇒ the stuck residual is NOT an H-null/rank-deficient defect
+                        // (that case is handled by the range-space certificate above) but
+                        // a genuine active-constraint multiplier.
+                        let hpen_nullity = materialize_joint_hessian_source(
+                            &joint_hessian_source,
+                            total_p,
+                            "constrained fixed-point nullity check",
+                        )
+                        .ok()
+                        .map(|mut h_pen| {
+                            let model_diagonal_ridge = if options.ridge_policy.include_quadratic_penalty
+                                && ridge > 0.0
+                            {
+                                ridge
+                            } else {
+                                0.0
+                            };
+                            add_joint_penalty_to_matrix(
+                                &mut h_pen,
+                                &ranges,
+                                &s_lambdas,
+                                model_diagonal_ridge,
+                                None,
+                            );
+                            symmetrize_dense_in_place(&mut h_pen);
+                            symmetric_penalized_hessian_nullity(&h_pen)
+                        })
+                        .unwrap_or(None);
+                        if hpen_nullity == Some(0) {
+                            log::info!(
+                                "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained fixed-point certificate:                                  accepted_step_inf={:.3e} ≤ {:.3e} and |Δobjective|={:.3e} ≤ {:.3e} (numerical fixed point),                                  scalar_relerr={:.3e}, linearized_rel={:.3e}; H_pen has no numerical null space so the                                  residual={:.3e} is an active-constraint Lagrange multiplier (the QP under-identified the                                  binding rows), projected out of the KKT residual by the active-constraint-aware IFT                                  correction before the envelope gradient — the iterate is a constrained KKT point",
+                                cycle,
+                                accepted_step_inf,
+                                fixed_point_floor,
+                                objective_change,
+                                objective_floor,
+                                scalar_model_relerr,
+                                linearized_rel,
+                                residual,
+                            );
+                            converged = true;
+                            break;
+                        }
                     }
                     // Structured per-block + per-spectrum refusal report.
                     // The legacy one-line refusal log printed only aggregate
@@ -23162,8 +23278,22 @@ fn projected_linear_constraint_stationarity_vector(
         if in_active[row] {
             continue;
         }
+        // Active-row inclusion band for the stationarity-residual cone projection.
+        // A constraint binding at the constrained optimum carries a Lagrange
+        // multiplier whose mass IS the stationarity residual (`r = A_activeᵀ λ`,
+        // λ >= 0); to project it out, every genuinely tight row must be a candidate.
+        // The constrained QP only reports rows it drove tight during a
+        // non-degenerate step, so monotone derivative-guard rows tight at the
+        // optimum but never explicitly stepped sit just above the old `1e-6·scale`
+        // band, get excluded, and leave the multiplier unresolved — tripping the
+        // `active_set_incomplete` refusal on an exactly constrained-stationary
+        // iterate (gam#797 survival time block). Widen the band so every near-tight
+        // row is a CANDIDATE; over-inclusion is safe because the downstream NNLS
+        // (`project_stationarity_residual_on_constraint_cone`) assigns λ = 0 to any
+        // candidate carrying no multiplier mass, so a non-binding row cannot
+        // spuriously shrink the residual.
         let scale = value.abs().max(constraints.b[row].abs()).max(1.0);
-        let active_tol = 1e-6 * scale + 1e-10;
+        let active_tol = 1e-3 * scale + 1e-8;
         if slack <= active_tol {
             in_active[row] = true;
         }
