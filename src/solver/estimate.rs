@@ -4534,10 +4534,33 @@ where
         w_o.view(),
     );
 
+    // Report the fitted Negative-Binomial overdispersion `theta` on the family
+    // variant (issue #802). Unlike the Gamma shape / Tweedie φ (which live only
+    // in `likelihood_scale`) and the Beta φ (whose estimate downstream consumers
+    // read from `likelihood_scale` via a separate override), NB `theta` is the
+    // *canonical* parameter on `ResponseFamily::NegativeBinomial { theta }` that
+    // every NB predictive consumer (prediction-interval variance, quadrature,
+    // sampling, `generate` draws) reads directly off the saved family. The fit
+    // updated it in lock-step with the `EstimatedNegBinTheta` scale metadata via
+    // `with_negbin_theta`, so threading that fitted `theta` back onto the reported
+    // family is what makes those consumers see the data's overdispersion instead
+    // of the seed. Non-NB families keep `opts.family` (their estimates live in the
+    // scale metadata), preserving the existing seed-in-family convention.
+    let mut reported_family = opts.family.clone();
+    if let (
+        ResponseFamily::NegativeBinomial { theta },
+        LikelihoodScaleMetadata::EstimatedNegBinTheta {
+            theta: fitted_theta,
+        },
+    ) = (&mut reported_family.response, likelihood_scale_field)
+    {
+        *theta = fitted_theta;
+    }
+
     let result = ExternalOptimResult {
         beta: beta_orig_internal,
         lambdas: lambdas.to_owned(),
-        likelihood_family: opts.family.clone(),
+        likelihood_family: reported_family,
         likelihood_scale: likelihood_scale_field,
         log_likelihood_normalization: LogLikelihoodNormalization::OmittingResponseConstants,
         log_likelihood,

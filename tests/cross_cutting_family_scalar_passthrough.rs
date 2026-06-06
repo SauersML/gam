@@ -78,33 +78,58 @@ fn cross_cutting_tweedie_negbin_beta_scalars_passthrough() {
         "Tweedie REML score should change with p"
     );
 
+    // Negative-Binomial `theta` is now ESTIMATED jointly with the mean (issue
+    // #802), exactly like the Beta precision below — and unlike the Tweedie
+    // variance power `p` above, which is a genuine *fixed structural* scalar. So
+    // the construction-time `theta` is only a *seed* that must NOT leak into the
+    // converged fit: the SAME data fit with two very different seed thetas must
+    // yield an identical converged fit (coefficients, deviance, REML score) and
+    // the same data-driven `theta_hat`. (Asserting "deviance changes with the
+    // seed theta" — as this block previously did — is exactly the frozen-`theta`
+    // behaviour #802 fixed: both seeds now converge to the same estimated theta.)
     let nb_y = array![0.0, 1.0, 1.0, 2.0, 3.0, 2.0, 5.0, 7.0];
-    let nb_20 = fit_small(
-        nb_y.clone(),
+    let nb_spec_seed = |seed| {
         LikelihoodSpec::new(
-            ResponseFamily::NegativeBinomial { theta: 2.0 },
+            ResponseFamily::NegativeBinomial { theta: seed },
             InverseLink::Standard(StandardLink::Log),
-        ),
-    );
-    let nb_80 = fit_small(
-        nb_y,
-        LikelihoodSpec::new(
-            ResponseFamily::NegativeBinomial { theta: 8.0 },
-            InverseLink::Standard(StandardLink::Log),
-        ),
+        )
+    };
+    let nb_seed2 = fit_small(nb_y.clone(), nb_spec_seed(2.0));
+    let nb_seed8 = fit_small(nb_y.clone(), nb_spec_seed(8.0));
+
+    let nb_beta_delta = (&nb_seed2.beta - &nb_seed8.beta).mapv(f64::abs).sum();
+    assert!(
+        nb_beta_delta < 1e-6,
+        "NegBin fit must be independent of the seed theta (theta is estimated, #802); \
+         coefficient delta={nb_beta_delta}"
     );
     assert!(
-        (nb_20.deviance - nb_80.deviance).abs() > 1e-8,
-        "NegBin deviance should change with theta"
+        (nb_seed2.deviance - nb_seed8.deviance).abs() < 1e-6,
+        "NegBin deviance must be independent of the seed theta (theta is estimated); \
+         {} vs {}",
+        nb_seed2.deviance,
+        nb_seed8.deviance
     );
     assert!(
-        (nb_20.reml_score - nb_80.reml_score).abs() > 1e-8,
-        "NegBin REML score should change with theta"
+        (nb_seed2.reml_score - nb_seed8.reml_score).abs() < 1e-6,
+        "NegBin REML score must be independent of the seed theta (theta is estimated)"
+    );
+    let theta_seed2 = nb_seed2
+        .likelihood_scale
+        .negbin_theta()
+        .expect("NegBin fit must carry an estimated theta");
+    let theta_seed8 = nb_seed8
+        .likelihood_scale
+        .negbin_theta()
+        .expect("NegBin fit must carry an estimated theta");
+    assert!(
+        (theta_seed2 - theta_seed8).abs() / theta_seed2.max(1e-12) < 1e-4,
+        "estimated NegBin theta must be seed-independent; got {theta_seed2} vs {theta_seed8}"
     );
 
-    // Beta is the asymmetric case. Unlike the Tweedie variance power `p` and the
-    // Negative-Binomial `theta` above — genuine *fixed structural* scalars that
-    // change the fitted model — the Beta precision `phi` is now ESTIMATED jointly
+    // Beta is the analogous estimated case. Like the Negative-Binomial `theta`
+    // above and unlike the Tweedie variance power `p` (a genuine *fixed
+    // structural* scalar), the Beta precision `phi` is ESTIMATED jointly
     // with the mean (issues #567/#769/#770, all closed). The construction-time
     // `phi` is therefore only a *seed*: it must NOT leak into the converged fit
     // (a leaked seed was the #769 slope-bias bug), and the reported precision must
