@@ -228,7 +228,20 @@ const SURVIVAL_INTERCEPT_LOG_TAIL_THRESHOLD: f64 = 1e-8;
 
 #[inline]
 fn survival_derivative_guard_tolerance(qd1: f64, derivative_guard: f64) -> f64 {
-    256.0 * f64::EPSILON * (1.0 + qd1.abs().max(derivative_guard.abs()))
+    // The monotonicity bound q'(t) >= derivative_guard is enforced by the inner
+    // active-set solver against SCALED constraint rows (each scaled by
+    // max(||row||, |guard-offset|, 1) >= 1) to ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+    // so a converged active constraint legitimately sits up to that tolerance on
+    // the infeasible side of the exact bound. The likelihood-domain predicate must
+    // admit the same band the solver can certify -- matching validate_time_qd1_feasible
+    // -- otherwise boundary-feasible oversmoothed iterates are spuriously rejected and
+    // every outer seed fails (#788). log(c*qd1) is finite for any qd1 > 0, so this
+    // admits no numerically unsafe iterate; it only stops rejecting boundary-feasible
+    // points. The raw 256*eps band remains as a floor.
+    let magnitude = 1.0 + qd1.abs().max(derivative_guard.abs());
+    let solver_band = 4.0 * crate::pirls::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL * magnitude;
+    let eps_floor = 256.0 * f64::EPSILON * magnitude;
+    solver_band.max(eps_floor)
 }
 
 #[inline]
