@@ -9445,7 +9445,8 @@ mod tests {
         fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
         parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
-        required_columns_for_fit, resolve_family, summarizewiggle_domain,
+        required_columns_for_fit, required_columns_for_formula, resolve_family,
+        summarizewiggle_domain,
         validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
         write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
@@ -16380,6 +16381,32 @@ mod tests {
         assert_eq!(options.get("type").map(String::as_str), Some("duchon"));
         assert_eq!(options.get("power").map(String::as_str), Some("0"));
         assert_eq!(options.get("order").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn required_columns_include_the_by_smooth_grouping_variable() {
+        // Regression for #807: a `by=` smooth carries its grouping/scaling
+        // variable in options["by"], not in the positional `vars`. The CLI's
+        // required-column set must still list it, or the data file loads without
+        // that column and the fit aborts before any numerics. Covers the factor
+        // (`s(x, by=g)`), numeric varying-coefficient, and tensor (`te(..., by=w)`)
+        // forms — all share the ParsedTerm::Smooth representation.
+        let factor = parse_formula("y ~ s(x, by=g)").expect("parse factor by-smooth");
+        let cols = required_columns_for_formula(&factor).expect("required columns");
+        assert!(
+            cols.contains(&"g".to_string()),
+            "by= grouping column 'g' must be required, got {cols:?}"
+        );
+        assert!(cols.contains(&"x".to_string()) && cols.contains(&"y".to_string()));
+
+        let tensor = parse_formula("y ~ te(x, z, by=w)").expect("parse tensor by-smooth");
+        let tcols = required_columns_for_formula(&tensor).expect("required columns");
+        for needed in ["x", "y", "z", "w"] {
+            assert!(
+                tcols.contains(&needed.to_string()),
+                "te(x, z, by=w) must require '{needed}', got {tcols:?}"
+            );
+        }
     }
 
     #[test]
