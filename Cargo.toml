@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.3.98"
+version = "0.3.99"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
