@@ -6325,6 +6325,48 @@ impl ScadMcpPenalty {
         }
     }
 
+    /// Diagonal of the **PSD majorizer** for a single coordinate.
+    ///
+    /// SCAD/MCP are nonconvex: within their active region the penalty splits
+    /// into a convex smoothed-ℓ¹ part (`λr`, resp. `γλr/(γ−1)`) and a concave
+    /// quadratic taper (`−t²/(2γ)`, resp. `−t²/(2(γ−1))`). The exact Hessian
+    /// [`Self::hess_one`] adds the concave constant (`−1/γ`, `−1/(γ−1)`) and is
+    /// therefore negative across most of the active region.
+    ///
+    /// The MM/LLA majorizer keeps the convex part's reweighted-ℓ² curvature and
+    /// majorizes the concave quadratic by its tangent line (zero curvature):
+    /// this is exactly [`Self::hess_one`] with the concave constant dropped.
+    /// Beyond the active cutoff the penalty is flat (Hessian `0`), so the
+    /// majorizer is `0`. The result satisfies both legs of the trait contract:
+    ///
+    /// * `B ⪰ 0`: `λε²/r³ ≥ 0` and the constant `0` branch are nonnegative.
+    /// * `B ⪰ ∂²P`: it exceeds the exact Hessian by exactly the dropped
+    ///   concave constant (`1/γ` for MCP, `1/(γ−1)` for SCAD's middle region)
+    ///   and equals it in the convex first SCAD region and the flat tail.
+    fn psd_majorizer_one(&self, t: f64, weight: f64) -> f64 {
+        let r = self.smooth_abs(t);
+        let eps2 = self.smoothing_eps * self.smoothing_eps;
+        match self.variant {
+            PenaltyConcavity::Mcp => {
+                if r <= self.gamma * weight {
+                    weight * eps2 / (r * r * r)
+                } else {
+                    0.0
+                }
+            }
+            PenaltyConcavity::Scad => {
+                let denom = self.gamma - 1.0;
+                if r <= weight {
+                    weight * eps2 / (r * r * r)
+                } else if r <= self.gamma * weight {
+                    self.gamma * weight * eps2 / (denom * r * r * r)
+                } else {
+                    0.0
+                }
+            }
+        }
+    }
+
     fn grad_log_weight_one(&self, t: f64, weight: f64) -> f64 {
         let r = self.smooth_abs(t);
         let d_p_d_weight = match self.variant {
@@ -6434,6 +6476,25 @@ impl AnalyticPenalty for ScadMcpPenalty {
             out[i] = diag[i] * v[i];
         }
         out
+    }
+
+    /// PSD majorizer diagonal (see [`Self::psd_majorizer_one`]). SCAD/MCP are
+    /// nonconvex, so this overrides the convex-only trait default — which would
+    /// otherwise return the exact, negative [`Self::hessian_diag`] — with the
+    /// reweighted-ℓ² MM surrogate. Coordinate-separable, so the inherited
+    /// [`AnalyticPenalty::psd_majorizer_hvp`] correctly applies this as a
+    /// diagonal operator.
+    fn psd_majorizer_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        let weight = self.resolved_weight(rho);
+        let mut out = Array1::<f64>::zeros(target.len());
+        for (i, &t) in target.iter().enumerate() {
+            out[i] = self.psd_majorizer_one(t, weight);
+        }
+        Some(out)
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
