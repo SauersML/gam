@@ -1858,6 +1858,48 @@ impl SoftmaxAssignmentSparsityPenalty {
         }
         out
     }
+
+    /// Absolute row sums of the exact per-row dense entropy Hessian, used as a
+    /// Gershgorin / diagonal-dominance PSD majorizer.
+    ///
+    /// The exact per-row Hessian wrt logits (symmetric, dense) is
+    ///
+    /// ```text
+    ///   H_kj = (λ/τ²)·a_k·[ δ_kj·(m − L_k − 1) + a_j·(L_k + L_j + 1 − 2m) ],
+    ///   L_k = ln a_k + 1,   m = Σ_j a_j L_j,
+    /// ```
+    ///
+    /// whose diagonal coincides with [`AnalyticPenalty::hessian_diag`]. Entropy
+    /// is concave in assignment space, so this block is indefinite (negative on
+    /// near-uniform rows). Setting `D_kk = Σ_j |H_kj|` makes `D − H` symmetric
+    /// with nonnegative diagonal and diagonally dominant
+    /// (`D_kk − H_kk = |H_kk| − H_kk + Σ_{j≠k}|H_kj| ≥ Σ_{j≠k}|(D−H)_kj|`),
+    /// hence PSD: `D ⪰ H` and `D ⪰ 0` both hold. `D` is a genuine PSD diagonal
+    /// operator that dominates the dense Hessian's quadratic form — unlike the
+    /// raw indefinite diagonal, which is neither PSD nor a faithful stand-in for
+    /// the dense operator.
+    fn psd_majorizer_abs_row_sums(&self, row: &[f64], scale: f64) -> Vec<f64> {
+        let a = self.softmax_row(row);
+        let k = self.k_atoms;
+        let l: Vec<f64> = (0..k).map(|i| a[i].max(1e-300).ln() + 1.0).collect();
+        let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
+        let mut d = vec![0.0_f64; k];
+        for kk in 0..k {
+            // Diagonal entry H_kk.
+            let h_kk = scale * a[kk] * ((m - l[kk] - 1.0) + a[kk] * (2.0 * l[kk] + 1.0 - 2.0 * m));
+            let mut acc = h_kk.abs();
+            // Off-diagonal entries H_kj, j ≠ k.
+            for jj in 0..k {
+                if jj == kk {
+                    continue;
+                }
+                let h_kj = scale * a[kk] * a[jj] * (l[kk] + l[jj] + 1.0 - 2.0 * m);
+                acc += h_kj.abs();
+            }
+            d[kk] = acc;
+        }
+        d
+    }
 }
 
 impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
@@ -1997,6 +2039,41 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             }
         }
         out
+    }
+
+    fn psd_majorizer_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        assert_eq!(rho.len(), 1, "softmax entropy expects one rho parameter");
+        assert_eq!(
+            target.len() % self.k_atoms,
+            0,
+            "softmax entropy target length must be divisible by k_atoms"
+        );
+        // Entropy minimization is nonconvex: the exact per-row Hessian is dense
+        // and indefinite, so the convex-only trait default (which returns the
+        // raw indefinite `hessian_diag`) violates the `B ⪰ 0` contract and is a
+        // diagonal masquerading as a dense operator. Replace it with the
+        // Gershgorin / diagonal-dominance majorizer of the dense per-row block
+        // (see `psd_majorizer_abs_row_sums`): a genuine PSD diagonal with
+        // `D ⪰ H` and `D ⪰ 0`. Coordinate-indexed, so the inherited
+        // `psd_majorizer_hvp` applies `D` as a diagonal operator consistently.
+        let lambda = resolve_learnable_weight(self.weight, rho[0]);
+        let inv_tau = 1.0 / self.temperature;
+        let scale = lambda * inv_tau * inv_tau;
+        let n = target.len() / self.k_atoms;
+        let values: Vec<f64> = target.iter().copied().collect();
+        let mut out = Array1::<f64>::zeros(target.len());
+        for row in 0..n {
+            let start = row * self.k_atoms;
+            let d = self.psd_majorizer_abs_row_sums(&values[start..start + self.k_atoms], scale);
+            for k in 0..self.k_atoms {
+                out[start + k] = d[k];
+            }
+        }
+        Some(out)
     }
 
     fn grad_rho(&self, target: ArrayView1<'_, f64>, rho: ArrayView1<'_, f64>) -> Array1<f64> {
