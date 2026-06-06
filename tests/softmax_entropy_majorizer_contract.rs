@@ -46,7 +46,11 @@ fn majorizer_dominates_dense_hessian_in_loewner_order() {
         |k| vec![0.0; k],
         |k| (0..k).map(|i| if i == 0 { 6.0 } else { 0.0 }).collect(),
         |k| (0..k).map(|i| i as f64 * 0.7).collect(),
-        |k| (0..k).map(|i| ((i as f64) - (k as f64) / 2.0) * 1.1).collect(),
+        |k| {
+            (0..k)
+                .map(|i| ((i as f64) - (k as f64) / 2.0) * 1.1)
+                .collect()
+        },
     ];
 
     for &(k, tau) in configs {

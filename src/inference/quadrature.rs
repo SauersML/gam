@@ -1405,7 +1405,8 @@ fn cloglog_log_survival_gumbel_quadrature(ctx: &QuadratureContext, mu: f64, sigm
     let mut running_sum = 0.0_f64;
     for (&node, &weight) in rule.nodes.iter().zip(rule.weights.iter()) {
         let eta = half * node + mid;
-        let summand = (weight * half).ln() + (eta - safe_exp(eta))
+        let summand = (weight * half).ln()
+            + (eta - safe_exp(eta))
             + log_normal_cdf_stable((eta - mu) / sigma);
         if !summand.is_finite() {
             continue;

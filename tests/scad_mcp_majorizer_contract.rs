@@ -12,9 +12,7 @@
 //! plus that `psd_majorizer_hvp` is the diagonal `B ⊙ v` (coordinate
 //! separability) rather than the indefinite exact HVP.
 
-use gam::terms::analytic_penalties::{
-    AnalyticPenalty, PenaltyConcavity, PsiSlice, ScadMcpPenalty,
-};
+use gam::terms::analytic_penalties::{AnalyticPenalty, PenaltyConcavity, PsiSlice, ScadMcpPenalty};
 use ndarray::{Array1, ArrayView1};
 
 fn sweep() -> Vec<f64> {
@@ -42,9 +40,8 @@ fn majorizer_dominates_and_is_psd_across_all_regions() {
                 let probe = Array1::from(sweep());
                 let n = probe.len();
                 let target = PsiSlice::full(n, Some(1));
-                let pen =
-                    ScadMcpPenalty::new(target, weight, n, gamma, eps, variant, learnable)
-                        .expect("valid penalty");
+                let pen = ScadMcpPenalty::new(target, weight, n, gamma, eps, variant, learnable)
+                    .expect("valid penalty");
                 // Learnable weight resolves through rho: λ = weight·exp(rho).
                 let rho: Array1<f64> = if learnable {
                     Array1::from(vec![0.3_f64])
@@ -67,9 +64,7 @@ fn majorizer_dominates_and_is_psd_across_all_regions() {
                 for i in 0..n {
                     let t = probe[i];
                     let r = (t * t + eps * eps).sqrt();
-                    let tag = format!(
-                        "{variant:?} eps={eps} learnable={learnable} t={t} r={r}"
-                    );
+                    let tag = format!("{variant:?} eps={eps} learnable={learnable} t={t} r={r}");
 
                     // Leg 1: B ⪰ 0.
                     assert!(maj[i] >= -1e-12, "B<0 ({}): {}", tag, maj[i]);

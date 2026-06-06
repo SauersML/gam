@@ -23,10 +23,8 @@
 //! (e.g. the positive reweighted-ℓ² curvature `weight·eps²/r³`, dropping the
 //! concave `−1/γ` term). No edits to this test should be needed for it to pass.
 
-use gam::terms::analytic_penalties::{
-    AnalyticPenalty, PenaltyConcavity, PsiSlice, ScadMcpPenalty,
-};
-use ndarray::{array, Array1};
+use gam::terms::analytic_penalties::{AnalyticPenalty, PenaltyConcavity, PsiSlice, ScadMcpPenalty};
+use ndarray::{Array1, array};
 
 #[test]
 fn scad_mcp_psd_majorizer_is_actually_psd() {
