@@ -3457,6 +3457,21 @@ impl SaeManifoldTerm {
                                 let corrected_kind =
                                     self.corrected_isometry_penalty(iso, atom_idx, coord)?;
                                 value += corrected_kind.value(coord.as_flat().view(), rho_local);
+                            } else if sae_coord_penalty_is_origin_anchored_magnitude(penalty) {
+                                // Origin-anchored magnitude shrinkage (SCAD/MCP) is
+                                // restricted to the Euclidean axes; periodic axes have
+                                // no chart origin and would make this energy
+                                // period-discontinuous (issue #795). This must mirror
+                                // the gradient/curvature assembly in
+                                // `add_sae_coord_penalty` exactly.
+                                match sae_coord_penalty_euclidean_restriction(coord) {
+                                    Some((_axes, compacted)) => {
+                                        value += penalty.value(compacted.view(), rho_local);
+                                    }
+                                    None => {
+                                        value += penalty.value(coord.as_flat().view(), rho_local);
+                                    }
+                                }
                             } else {
                                 value += penalty.value(coord.as_flat().view(), rho_local);
                             }
@@ -5507,6 +5522,38 @@ impl SaeManifoldTerm {
     ) {
         let n = coord.n_obs();
         let d = coord.latent_dim();
+        // Origin-anchored magnitude shrinkage (SCAD/MCP) is restricted to the
+        // Euclidean axes: a periodic chart axis has no origin, and folding a
+        // raw-|t| energy there is period-discontinuous and breaks the joint
+        // Newton solve (issue #795). Evaluate the axis-separable penalty on the
+        // Euclidean-only compacted coordinate and scatter its gradient / PSD
+        // curvature back to those axis slots — periodic axes get nothing. This
+        // mirrors the value accounting in `analytic_penalty_value_total` exactly,
+        // so the assembled gradient stays the gradient of the line-search
+        // objective.
+        if sae_coord_penalty_is_origin_anchored_magnitude(penalty) {
+            if let Some((euclidean_axes, compacted)) =
+                sae_coord_penalty_euclidean_restriction(coord)
+            {
+                let de = euclidean_axes.len();
+                let grad = penalty.grad_target(compacted.view(), rho_local);
+                let diag = penalty.psd_majorizer_diag(compacted.view(), rho_local);
+                for row in 0..n {
+                    if let Some(row_off) =
+                        sae_coord_penalty_offset(row_layout, dense_off, row, atom_idx)
+                    {
+                        for (j, &axis) in euclidean_axes.iter().enumerate() {
+                            sys.rows[row].gt[row_off + axis] += grad[row * de + j];
+                            if let Some(diag) = diag.as_ref() {
+                                sys.rows[row].htt[[row_off + axis, row_off + axis]] +=
+                                    diag[row * de + j];
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let target = coord.as_flat().view();
         let grad = penalty.grad_target(target, rho_local);
         for row in 0..n {
@@ -8543,6 +8590,69 @@ fn sae_penalty_is_row_block_supported(penalty: &AnalyticPenaltyKind) -> bool {
     )
 }
 
+/// Whether a row-block coordinate penalty is an *origin-anchored, axis-separable
+/// magnitude shrinkage* — its energy is `Σ_axis Σ_row f(|t|)` with a fixed zero,
+/// evaluated independently per flat entry.
+///
+/// Such a penalty is only well-posed on a **Euclidean** chart axis, which has a
+/// distinguished origin. On a **periodic** chart axis (a `Circle`/`Torus`
+/// coordinate) the latent is a homogeneous angle defined only modulo its period:
+/// there is no rotation-invariant "zero" to shrink toward, and the raw `|t|` is
+/// *discontinuous across the retraction branch cut* (a coordinate just below the
+/// period wraps to just above zero). Folding such an energy into the joint
+/// Newton objective makes the line-search value jump by an `O(1)` amount under a
+/// near-zero coordinate step, so Armijo rejects otherwise-valid steps and the
+/// inner solve never reaches stationarity (issue #795; the same failure mode the
+/// ARD prior avoids by switching to the periodic von-Mises energy on these axes).
+///
+/// For these penalties [`sae_coord_penalty_euclidean_restriction`] restricts the
+/// energy to the Euclidean axes, where it is both meaningful and continuous;
+/// periodic axes contribute nothing. The restriction is exact only because the
+/// energy is axis-separable, so this matcher is deliberately narrow: non-separable
+/// shrinkage (e.g. the Hoyer ℓ¹/ℓ² ratio) is excluded.
+fn sae_coord_penalty_is_origin_anchored_magnitude(penalty: &AnalyticPenaltyKind) -> bool {
+    matches!(penalty, AnalyticPenaltyKind::ScadMcp(_))
+}
+
+/// Restrict an origin-anchored, axis-separable coordinate shrinkage penalty (see
+/// [`sae_coord_penalty_is_origin_anchored_magnitude`]) to the **Euclidean**
+/// (non-periodic) axes of a latent coordinate block.
+///
+/// Returns `Some((euclidean_axes, compacted_target))` where `compacted_target` is
+/// the row-major `(n_obs × euclidean_axes.len())` flat vector holding only the
+/// Euclidean-axis coordinates, in the axis order given by `euclidean_axes`. The
+/// caller evaluates the (axis-separable) penalty on this compacted target and
+/// scatters its per-entry gradient / curvature back to the Euclidean axis slots,
+/// leaving every periodic axis untouched (zero contribution). Because the penalty
+/// is a sum of independent per-entry terms, evaluating it on the compacted target
+/// is *exactly* the full energy with the periodic axes dropped — value, gradient,
+/// and curvature stay mutually consistent.
+///
+/// Returns `None` when every axis is Euclidean: there is nothing to restrict, so
+/// the caller uses the full target unchanged (zero overhead on the common path).
+/// When every axis is periodic the returned `euclidean_axes` is empty and the
+/// compacted target has length zero, so the penalty contributes nothing at all.
+fn sae_coord_penalty_euclidean_restriction(
+    coord: &LatentCoordValues,
+) -> Option<(Vec<usize>, Array1<f64>)> {
+    let periods = coord.effective_axis_periods();
+    let d = periods.len();
+    let euclidean_axes: Vec<usize> = (0..d).filter(|&axis| periods[axis].is_none()).collect();
+    if euclidean_axes.len() == d {
+        return None;
+    }
+    let n = coord.n_obs();
+    let de = euclidean_axes.len();
+    let flat = coord.as_flat();
+    let mut compacted = Array1::<f64>::zeros(n * de);
+    for row in 0..n {
+        for (j, &axis) in euclidean_axes.iter().enumerate() {
+            compacted[row * de + j] = flat[row * d + axis];
+        }
+    }
+    Some((euclidean_axes, compacted))
+}
+
 /// The JSON descriptor `kind` strings for the SAE row-block analytic penalties
 /// this build supports (i.e. those `sae_penalty_is_row_block_supported`
 /// accepts). Co-located with that matcher so the two cannot drift. The FFI
@@ -9210,6 +9320,141 @@ mod tests {
             (obj_after - obj_before).abs() < 1.0e-2,
             "line-search objective jumped across the cut: before={obj_before}, after={obj_after}"
         );
+    }
+
+    /// Issue #795: `gate_sparsity="scad"` emits a `ScadMcpPenalty` on the "t"
+    /// coordinate block. SCAD's energy `Σ f(√(t²+ε²))` is a magnitude shrinkage
+    /// with a fixed origin at `t=0`. On a **periodic** (Circle) axis the latent
+    /// is an angle defined only modulo its period, so the raw `|t|` is BOTH
+    /// ill-posed (no rotation-invariant origin) and *discontinuous across the
+    /// retraction branch cut*: a coordinate just below the period wraps to just
+    /// above zero, and `f(|t|)` jumps from the flat tail to ≈0. Folded into the
+    /// line-search objective, that jump made a near-zero coordinate Newton step
+    /// change the objective by an O(weight) amount, so Armijo rejected
+    /// otherwise-valid steps and the inner joint solve never reached
+    /// stationarity (`reml_criterion: inner solve did not converge`).
+    ///
+    /// The fix restricts the SCAD/MCP shrinkage to the Euclidean axes, so on a
+    /// pure Circle atom it contributes nothing — the objective with the SCAD
+    /// registry must equal the registry-free objective, and must stay continuous
+    /// across the cut.
+    #[test]
+    fn scad_coord_penalty_inert_and_continuous_on_periodic_axis() {
+        use crate::terms::analytic_penalties::{PenaltyConcavity, ScadMcpPenalty};
+
+        let coords0 = array![[0.999_f64]];
+        let (phi0, jet0) = periodic_basis(&coords0);
+        let atom = SaeManifoldAtom::new(
+            "periodic",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi0,
+            jet0,
+            array![[0.2], [-0.3], [0.4]],
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((1, 1)),
+            vec![coords0],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::ibp_map(0.7, 1.0, true),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let target = array![[0.1_f64]];
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.0_f64]]);
+
+        // Registry with a single SCAD shrinkage on the coordinate block, with a
+        // large weight so the OLD (unrestricted) energy would dominate.
+        let coord = &term.assignment.coords[0];
+        let mut registry = AnalyticPenaltyRegistry::new();
+        let scad = ScadMcpPenalty::new(
+            PsiSlice::full(coord.len(), Some(coord.latent_dim())),
+            5.0,
+            coord.n_obs(),
+            3.7,
+            1.0e-3,
+            PenaltyConcavity::Scad,
+            false,
+        )
+        .unwrap();
+        registry.push(AnalyticPenaltyKind::ScadMcp(Arc::new(scad)));
+
+        // Inert on a pure Circle: the SCAD registry adds zero energy because the
+        // sole axis is periodic.
+        let with_scad = term
+            .penalized_objective_total(target.view(), &rho, Some(&registry), 1.0)
+            .unwrap();
+        let without = term
+            .penalized_objective_total(target.view(), &rho, None, 1.0)
+            .unwrap();
+        assert!(
+            (with_scad - without).abs() < 1.0e-12,
+            "SCAD coord penalty must be inert on a pure periodic axis: \
+             with={with_scad}, without={without}"
+        );
+
+        // Continuous across the period cut: stepping 0.999 -> 1.001 (wraps to
+        // 0.001) must not jump the objective. The OLD unrestricted SCAD energy
+        // jumped by ≈ weight·(|0.999| − |0.001|) ≈ 5.
+        let obj_before = with_scad;
+        let q = term.assignment.row_block_dim();
+        let beta_dim = term.beta_dim();
+        let mut delta_ext = Array1::<f64>::zeros(q);
+        delta_ext[q - 1] = 0.002;
+        let delta_beta = Array1::<f64>::zeros(beta_dim);
+        term.apply_newton_step(delta_ext.view(), delta_beta.view(), 1.0)
+            .unwrap();
+        let wrapped = term.assignment.coords[0].row(0)[0];
+        assert!(
+            wrapped < 0.01,
+            "coordinate should have wrapped across the cut, got {wrapped}"
+        );
+        let obj_after = term
+            .penalized_objective_total(target.view(), &rho, Some(&registry), 1.0)
+            .unwrap();
+        assert!(
+            (obj_after - obj_before).abs() < 1.0e-2,
+            "SCAD line-search objective jumped across the periodic cut: \
+             before={obj_before}, after={obj_after}"
+        );
+    }
+
+    /// Guard against over-broad exclusion: on a **Euclidean** chart axis the SCAD
+    /// magnitude shrinkage is well-posed (`t=0` is a genuine origin) and must
+    /// remain active. `sae_coord_penalty_euclidean_restriction` returns `None`
+    /// (nothing to restrict) for an all-Euclidean coord and the full-support
+    /// `Some` carrier for a periodic coord, so value/gradient/curvature all see
+    /// the same axis set.
+    #[test]
+    fn scad_coord_penalty_active_on_euclidean_axis() {
+        let euclid = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((3, 1)),
+            vec![array![[0.5_f64], [-0.7], [1.3]]],
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        // All axes Euclidean: no restriction (the penalty applies in full).
+        assert!(
+            sae_coord_penalty_euclidean_restriction(&euclid.coords[0]).is_none(),
+            "Euclidean coord must not be restricted"
+        );
+
+        let circle = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((3, 1)),
+            vec![array![[0.1_f64], [0.4], [0.9]]],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(0.7),
+        )
+        .unwrap();
+        // Pure periodic axis: restricted to an empty Euclidean carrier.
+        let (axes, compacted) = sae_coord_penalty_euclidean_restriction(&circle.coords[0])
+            .expect("periodic coord must be restricted");
+        assert!(axes.is_empty(), "circle has no Euclidean axes, got {axes:?}");
+        assert_eq!(compacted.len(), 0, "compacted target must be empty");
     }
 
     /// The von-Mises coordinate-prior curvature `V'' = α·cos(κt)` is indefinite
