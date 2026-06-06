@@ -6311,7 +6311,7 @@ fn materialize_survival<'a>(
         && !event_codes.iter().any(|&code| code > 0)
     {
         return Err(WorkflowError::InvalidConfig {
-            reason: "survival marginal-slope requires at least one observed event; all rows are \
+            reason: "survival marginal-slope requires at least one target event; all rows are \
                      censored, so the likelihood has no event score and cannot identify the hazard"
                 .to_string(),
         });
@@ -6362,6 +6362,33 @@ fn materialize_survival<'a>(
             ),
         }
         .into());
+    }
+    // Hoist the survival marginal-slope z-column exclusion check above the
+    // time-basis / termspec construction below.  Those downstream steps fail
+    // fast on small or tightly-spaced time data (e.g. an I-spline of degree 3
+    // cannot be supported by a 2-row fixture), which would otherwise swallow
+    // the z-column misuse error and surface a knot-count error instead.
+    // Checking here keeps the user-visible error tied to the actual config
+    // problem the caller can fix (rename `z` or remove the alias) rather than
+    // to an unrelated basis-shape failure further downstream.
+    if matches!(survival_mode, SurvivalLikelihoodMode::MarginalSlope)
+        && let Some(z_column) = config.z_column.as_deref()
+    {
+        let logslope_parsed_for_check = match config.logslope_formula.as_deref() {
+            Some(ls_formula) => Some(
+                parse_matching_auxiliary_formula(ls_formula, &parsed.response, "logslope_formula")?
+                    .1,
+            ),
+            None => None,
+        };
+        let logslope_ref = logslope_parsed_for_check.as_ref().unwrap_or(parsed);
+        validate_marginal_slope_z_column_exclusion(
+            parsed,
+            logslope_ref,
+            z_column,
+            "survival marginal-slope",
+            "logslope_formula",
+        )?;
     }
     let effective_timewiggle = parsed.timewiggle.clone();
     let baseline_target_raw = match survival_mode {
