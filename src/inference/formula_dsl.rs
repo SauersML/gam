@@ -951,6 +951,22 @@ mod tests {
     }
 
     #[test]
+    fn parsed_terms_reference_column_sees_the_by_smooth_variable() {
+        // Regression for #807: the by= grouping variable lives in
+        // options["by"], not the smooth's positional vars. The reference
+        // predicate must still recognise it, both so the CLI loads the column
+        // and so the marginal-slope z-column exclusion check (which reuses this
+        // predicate) cannot be fooled into aliasing a reserved z onto a by=.
+        let parsed = parse_formula("y ~ s(x, by=g)").expect("parse by-smooth");
+        assert!(
+            parsed_terms_reference_column(&parsed.terms, "g"),
+            "s(x, by=g) references column g via options[\"by\"]"
+        );
+        assert!(parsed_terms_reference_column(&parsed.terms, "x"));
+        assert!(!parsed_terms_reference_column(&parsed.terms, "absent"));
+    }
+
+    #[test]
     fn marginal_slope_z_column_validator_detects_linear_and_smooth_reuse() {
         let main = parse_formula("y ~ x + z").expect("parse main");
         let logslope = parse_formula("y ~ s(z, type=duchon, centers=6)").expect("parse logslope");
