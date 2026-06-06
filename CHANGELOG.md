@@ -18,6 +18,23 @@ git tag and both package versions.
 Failed or unpublished version-bump tags are intentionally omitted; package
 releases without local semver tags are included under their published version.
 
+## v0.3.99 — gam 0.3.99 / gamfit 0.1.173 (2026-06-06)
+
+Completes the link-general Firth work from 0.3.98.
+
+### Fixed
+- **Non-logit Firth fits no longer crash (#758).** 0.3.98 opened the CLI/HMC
+  Firth gate to every Binomial inverse link with a Fisher-weight jet (Probit,
+  CLogLog, Latent-CLogLog, SAS, Beta-Logistic, Mixture), but the REML outer
+  loop's Tierney-Kadane correction is implemented only for the canonical
+  Binomial Logit jet — so `gam fit --firth --family binomial-probit` (or
+  cloglog) aborted every outer seed with "Tierney-Kadane outer Hessian is
+  implemented for canonical Binomial Logit Firth fits only". Non-logit Firth
+  fits now skip the higher-order TK refinement and fall back to plain Laplace
+  REML driven by BFGS off the link-general gradient; the Firth/Jeffreys bias
+  reduction itself (the inner PIRLS Jeffreys penalty) is fully retained. Logit
+  Firth fits are byte-unchanged and keep the full analytic TK path.
+
 ## v0.3.98 — gam 0.3.98 / gamfit 0.1.172 (2026-06-06)
 
 First published release carrying the universal under-identification robustness
