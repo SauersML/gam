@@ -2818,6 +2818,30 @@ pub trait CustomFamily {
         false
     }
 
+    /// Whether the family's inner/outer solves need the full-span Jeffreys
+    /// curvature `H_Φ` and score `∇Φ`.
+    ///
+    /// Default `true` to preserve the existing separation/near-singular
+    /// robustness on every family the term was historically armed for
+    /// (probit/binomial, GAMLSS location-scale, BMS, survival marginal-slope).
+    ///
+    /// A family overrides this to `false` when it has no
+    /// separation/under-identification regime by construction — the
+    /// canonical case is a continuous-response monotone-transformation
+    /// family like `TransformationNormalFamily`, where the Fisher information
+    /// is `O(n)` on every identified direction at every working point and
+    /// the Jeffreys gate would always smooth-step to zero anyway. There the
+    /// term is pure overhead: each evaluation runs `p` directional
+    /// derivatives of the joint Hessian (`O(n·p²)` per call for the SCOP
+    /// directional derivative), called multiple times per inner cycle and
+    /// once per outer evaluation. At biobank scale (`p=144`, `n=20000`) the
+    /// overhead is the dominant per-cycle cost and exhausts the CI budget
+    /// long before the inner Newton converges, while contributing
+    /// essentially zero to the converged gradient and curvature.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
     /// Internal helper: do the outer-REML `_with_specs` defaults trust the
     /// inner-fit's block-diagonal-from-blocks output for this family?
     ///
@@ -11859,7 +11883,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         _ => false,
     };
     let logdet_jeffreys_hphi: Option<Array2<f64>> =
-        if include_logdet_h && !outer_jeffreys_precheck_skips {
+        if include_logdet_h && !outer_jeffreys_precheck_skips && family.joint_jeffreys_term_required() {
             match build_joint_jeffreys_subspace(specs, &ranges)? {
                 Some(z_joint) => {
                     custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
@@ -14137,7 +14161,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // the likelihood's own Fisher geometry instead of an ad-hoc ridge.
         // `None` (empty coefficient system) leaves every step and objective at
         // the un-augmented inner Newton.
-        let joint_jeffreys_subspace = build_joint_jeffreys_subspace(specs, &ranges)?;
+        //
+        // Continuous-response families (the canonical example: transformation-
+        // normal h(Y|x) ~ N(0,1)) opt out via
+        // `joint_jeffreys_term_required() = false`. They have no separation
+        // regime, the Fisher information is `O(n)` on every identified
+        // direction by construction, and each Jeffreys evaluation costs
+        // `p` directional-derivative calls into the family's exact joint
+        // Hessian — at biobank scale (CTN duchon16d, p=144, n=20000) that
+        // is the dominant per-cycle cost (~200 s/cycle on three calls per
+        // cycle), exhausting the inner budget before the algorithm converges
+        // while contributing essentially zero to the gradient/curvature.
+        let joint_jeffreys_subspace = if family.joint_jeffreys_term_required() {
+            build_joint_jeffreys_subspace(specs, &ranges)?
+        } else {
+            None
+        };
         // Fold the Jeffreys objective value into the cycle-0 baseline so the
         // first trust-region accept/reject compares like-for-like against the
         // Jeffreys-augmented trial objectives below. No-op when there is no
@@ -22713,6 +22752,9 @@ fn custom_family_outer_jeffreys_hphi<F: CustomFamily + Clone + Send + Sync + 'st
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
 ) -> Result<Option<Array2<f64>>, String> {
+    if !family.joint_jeffreys_term_required() {
+        return Ok(None);
+    }
     let z_joint = match build_joint_jeffreys_subspace(specs, ranges)? {
         Some(z) => z,
         None => return Ok(None),
@@ -22757,6 +22799,9 @@ fn custom_family_outer_jeffreys_hphi_drift<F: CustomFamily + Clone + Send + Sync
     specs: &[ParameterBlockSpec],
     ranges: &[(usize, usize)],
 ) -> Result<Option<JeffreysHphiDriftFn>, String> {
+    if !family.joint_jeffreys_term_required() {
+        return Ok(None);
+    }
     let z_joint = match build_joint_jeffreys_subspace(specs, ranges)? {
         Some(z) => z,
         None => return Ok(None),

@@ -8063,6 +8063,28 @@ impl CustomFamily for TransformationNormalFamily {
         true
     }
 
+    fn joint_jeffreys_term_required(&self) -> bool {
+        // CTN models a continuous response through a monotone transformation
+        // `h(Y|x) ~ N(0,1)`; there is no separation/under-identification
+        // regime to bound. The Fisher information is `O(n)` on every
+        // identified direction at every working point, so the conditioning
+        // gate inside `joint_jeffreys_term` smooth-steps the contribution to
+        // zero as soon as `λ_min ≥ 16`. The construction up to that gate is
+        // not free though: each evaluation runs `p` SCOP directional
+        // derivatives of the joint Hessian, called three times per inner
+        // cycle (head-KKT gradient, joint Newton step RHS, post-step KKT
+        // residual) and once per outer evaluation. At biobank scale —
+        // `bench/biobank_scale` `rust_margslope_aniso_duchon16d_*` with
+        // `p=144`, `n=20000` — that single source dominates each inner
+        // cycle (~230 s/cycle observed in CI; ~5 700 cycles × 5.7 min
+        // ⇒ multi-hour hang) and exhausts the 40-minute CI budget before
+        // the inner solve converges. Disabling the term here keeps the
+        // un-augmented inner Newton path (still consistent with the
+        // outer LAML logdet, which also drops the `H_Φ` contribution
+        // through the same family gate).
+        false
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Khatri–Rao tensor design: the coefficient block is X = R ⊙ C with
         // rows length p_resp · p_cov. Two regimes:
