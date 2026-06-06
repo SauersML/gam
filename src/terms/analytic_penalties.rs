@@ -7217,6 +7217,89 @@ impl DecoderIncoherencePenalty {
         }
         out
     }
+
+    /// Shared kernel for the two curvature operators. Accumulates, per penalized
+    /// atom pair `(j, k)`, the Gauss-Newton term `W·Σ_b dC[a,b]·B_k[b,o]` (and
+    /// its `_k` transpose) always, and the residual term `W·Σ_b C[a,b]·V_k[b,o]`
+    /// (and `_k` transpose) only when `include_residual`. With the residual the
+    /// result is the exact `∂²P·v` ([`AnalyticPenalty::hvp`]); without it the
+    /// result is the PSD Gauss-Newton surrogate
+    /// ([`AnalyticPenalty::psd_majorizer_hvp`]).
+    fn hvp_impl(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+        include_residual: bool,
+    ) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(target.len());
+        if target.len() != self.target.len() {
+            return out;
+        }
+        let offsets = self.block_offsets();
+        let k_atoms = self.block_sizes.len();
+        let weight = self.resolved_weight(rho);
+        let p_out = self.p_out;
+        for j in 0..k_atoms {
+            for k in (j + 1)..k_atoms {
+                let w_pair = self.pair_weight(j, k) * weight;
+                if w_pair == 0.0 {
+                    continue;
+                }
+                let off_j = offsets[j];
+                let off_k = offsets[k];
+                let m_j = self.block_sizes[j];
+                let m_k = self.block_sizes[k];
+                // Directional Gram derivative driving the Gauss-Newton term:
+                //   dC[a, b] = Σ_o (Vj[a, o]·Bk[b, o] + Bj[a, o]·Vk[b, o]).
+                let mut d_c = Array2::<f64>::zeros((m_j, m_k));
+                for a in 0..m_j {
+                    for b in 0..m_k {
+                        let mut s = 0.0;
+                        for o in 0..p_out {
+                            s += v[off_j + a * p_out + o] * target[off_k + b * p_out + o]
+                                + target[off_j + a * p_out + o] * v[off_k + b * p_out + o];
+                        }
+                        d_c[[a, b]] = s;
+                    }
+                }
+                // Cross-Gram C[a, b] = Σ_o Bj[a, o]·Bk[b, o] feeds the residual
+                // term; only materialized for the exact Hessian path.
+                let c = if include_residual {
+                    Some(Self::cross_gram(target, off_j, m_j, off_k, m_k, p_out))
+                } else {
+                    None
+                };
+                // out_j[a, o] += w · Σ_b ( dC[a, b]·Bk[b, o] + C[a, b]·Vk[b, o] )
+                for a in 0..m_j {
+                    for o in 0..p_out {
+                        let mut s = 0.0;
+                        for b in 0..m_k {
+                            s += d_c[[a, b]] * target[off_k + b * p_out + o];
+                            if let Some(c) = &c {
+                                s += c[[a, b]] * v[off_k + b * p_out + o];
+                            }
+                        }
+                        out[off_j + a * p_out + o] += w_pair * s;
+                    }
+                }
+                // out_k[b, o] += w · Σ_a ( dC[a, b]·Bj[a, o] + C[a, b]·Vj[a, o] )
+                for b in 0..m_k {
+                    for o in 0..p_out {
+                        let mut s = 0.0;
+                        for a in 0..m_j {
+                            s += d_c[[a, b]] * target[off_j + a * p_out + o];
+                            if let Some(c) = &c {
+                                s += c[[a, b]] * v[off_j + a * p_out + o];
+                            }
+                        }
+                        out[off_k + b * p_out + o] += w_pair * s;
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl AnalyticPenalty for DecoderIncoherencePenalty {
@@ -7299,6 +7382,21 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
         grad
     }
 
+    /// Exact Hessian-vector product `H v = (∂²P/∂target²) v`.
+    ///
+    /// `P = ½ w Σ_{j<k} w_{jk} ‖C_{jk}‖²_F` is biquadratic (quartic) in the
+    /// decoder blocks, so the second derivative of the nonlinear-least-squares
+    /// objective carries **two** pieces along a direction `V` (per pair, with
+    /// `W = w·w_{jk}`):
+    ///
+    /// ```text
+    ///   (H v)_j[a,o] = W [ Σ_b dC[a,b]·B_k[b,o]   +   Σ_b C[a,b]·V_k[b,o] ]
+    /// ```
+    ///
+    /// the Gauss-Newton term `Σ dC·B` and the residual term `Σ C·V`, with
+    /// `dC[a,b] = Σ_o (V_j[a,o]·B_k[b,o] + B_j[a,o]·V_k[b,o])` (and the symmetric
+    /// `_k` block). The residual term is what makes the exact Hessian indefinite;
+    /// the GN-only surrogate lives in [`Self::psd_majorizer_hvp`].
     fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
@@ -7306,66 +7404,35 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        let mut out = Array1::<f64>::zeros(target.len());
-        if target.len() != self.target.len() {
-            return out;
-        }
-        let offsets = self.block_offsets();
-        let k_atoms = self.block_sizes.len();
-        let weight = self.resolved_weight(rho);
-        for j in 0..k_atoms {
-            for k in (j + 1)..k_atoms {
-                let w_pair = self.pair_weight(j, k) * weight;
-                if w_pair == 0.0 {
-                    continue;
-                }
-                let off_j = offsets[j];
-                let off_k = offsets[k];
-                let m_j = self.block_sizes[j];
-                let m_k = self.block_sizes[k];
-                // Gauss-Newton directional Gram derivative:
-                //   dC[a, b] = Σ_o (Vj[a, o]·Bk[b, o] + Bj[a, o]·Vk[b, o]).
-                let mut d_c = Array2::<f64>::zeros((m_j, m_k));
-                for a in 0..m_j {
-                    for b in 0..m_k {
-                        let mut s = 0.0;
-                        for o in 0..self.p_out {
-                            s += v[off_j + a * self.p_out + o] * target[off_k + b * self.p_out + o]
-                                + target[off_j + a * self.p_out + o]
-                                    * v[off_k + b * self.p_out + o];
-                        }
-                        d_c[[a, b]] = s;
-                    }
-                }
-                // out_j[a, o] += w · Σ_b dC[a, b] · Bk[b, o]
-                for a in 0..m_j {
-                    for o in 0..self.p_out {
-                        let mut s = 0.0;
-                        for b in 0..m_k {
-                            s += d_c[[a, b]] * target[off_k + b * self.p_out + o];
-                        }
-                        out[off_j + a * self.p_out + o] += w_pair * s;
-                    }
-                }
-                // out_k[b, o] += w · Σ_a dC[a, b] · Bj[a, o]
-                for b in 0..m_k {
-                    for o in 0..self.p_out {
-                        let mut s = 0.0;
-                        for a in 0..m_j {
-                            s += d_c[[a, b]] * target[off_j + a * self.p_out + o];
-                        }
-                        out[off_k + b * self.p_out + o] += w_pair * s;
-                    }
-                }
-            }
-        }
-        out
+        self.hvp_impl(target, rho, v, /* include_residual = */ true)
+    }
+
+    /// PSD majorizer-vector product `B_GN(target; ρ) v` for the **nonconvex**
+    /// decoder-incoherence penalty.
+    ///
+    /// Dropping the indefinite residual term `W·Σ C·V` from the exact
+    /// [`Self::hvp`] leaves the Gauss-Newton block `W·Jᵀ(J v)` with
+    /// `J = ∂vec(C)/∂vec(B)`. That block is PSD by construction — a sum of
+    /// `W ≥ 0` (`weight > 0`, `coactivation ≥ 0`) times rank-structured Gram
+    /// products `JᵀJ` — and coincides with the exact Hessian as the cross-Gram
+    /// `C → 0`. The inner Newton / PIRLS curvature block must stay
+    /// positive-definite, so the GN block is the correct operator here, mirroring
+    /// the other nonconvex penalties (sparsity, JumpReLU, isometry) that override
+    /// the majorizer rather than hand back the indefinite true Hessian.
+    fn psd_majorizer_hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(target.len(), v.len(), "psd_majorizer_hvp dimension mismatch");
+        self.hvp_impl(target, rho, v, /* include_residual = */ false)
     }
 
     // `hessian_diag` is intentionally left at the trait default (returns `None`
-    // for a non-empty target): the Gauss-Newton Hessian of the cross-Gram
-    // Frobenius objective is dense, not diagonal, so curvature is supplied via
-    // the closed-form `hvp` / `psd_majorizer_hvp` path above.
+    // for a non-empty target): the Hessian of the cross-Gram Frobenius objective
+    // is dense, not diagonal, so curvature is supplied via the closed-form
+    // `hvp` / `psd_majorizer_hvp` path above.
 
     impl_learnable_weight_grad_rho!();
 
