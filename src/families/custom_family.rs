@@ -11882,18 +11882,20 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         }
         _ => false,
     };
-    let logdet_jeffreys_hphi: Option<Array2<f64>> =
-        if include_logdet_h && !outer_jeffreys_precheck_skips && family.joint_jeffreys_term_required() {
-            match build_joint_jeffreys_subspace(specs, &ranges)? {
-                Some(z_joint) => {
-                    custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
-                        .map(|(_phi, _grad, hphi)| hphi)
-                }
-                None => None,
+    let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h
+        && !outer_jeffreys_precheck_skips
+        && family.joint_jeffreys_term_required()
+    {
+        match build_joint_jeffreys_subspace(specs, &ranges)? {
+            Some(z_joint) => {
+                custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
+                    .map(|(_phi, _grad, hphi)| hphi)
             }
-        } else {
-            None
-        };
+            None => None,
+        }
+    } else {
+        None
+    };
     let compute_block_logdet_term = |b: usize| -> Result<(Array2<f64>, f64), String> {
         let spec = &specs[b];
         let (start, end) = ranges[b];
@@ -16398,8 +16400,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // captured multiplier, so certifying here is correct. Gated
                     // strictly on a fixed point with no H-null, so a genuinely
                     // non-converged or rank-deficient iterate is never accepted.
-                    let any_block_constrained =
-                        block_constraints.iter().any(|c| c.is_some());
+                    let any_block_constrained = block_constraints.iter().any(|c| c.is_some());
                     let beta_scale = states
                         .iter()
                         .flat_map(|s| s.beta.iter().copied())
@@ -16407,8 +16408,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         .fold(0.0_f64, f64::max)
                         .max(1.0);
                     let fixed_point_floor = 64.0 * f64::EPSILON * beta_scale;
-                    let objective_floor =
-                        64.0 * f64::EPSILON * (1.0 + lastobjective.abs());
+                    let objective_floor = 64.0 * f64::EPSILON * (1.0 + lastobjective.abs());
                     let at_numerical_fixed_point = accepted_step_inf.is_finite()
                         && accepted_step_inf <= fixed_point_floor
                         && objective_change <= objective_floor
@@ -16426,13 +16426,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         )
                         .ok()
                         .map(|mut h_pen| {
-                            let model_diagonal_ridge = if options.ridge_policy.include_quadratic_penalty
-                                && ridge > 0.0
-                            {
-                                ridge
-                            } else {
-                                0.0
-                            };
+                            let model_diagonal_ridge =
+                                if options.ridge_policy.include_quadratic_penalty && ridge > 0.0 {
+                                    ridge
+                                } else {
+                                    0.0
+                                };
                             add_joint_penalty_to_matrix(
                                 &mut h_pen,
                                 &ranges,

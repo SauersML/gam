@@ -64,8 +64,8 @@ fn decoder_incoherence_hvp_equals_true_hessian_vector_product() {
     let total = block_sizes.iter().map(|m| m * p_out).sum::<usize>(); // = 8
 
     // Pairwise coactivation: only the (0,1) atom pair is penalized, weight 1.
-    let coactivation = Array2::from_shape_vec((2, 2), vec![0.0, 1.0, 1.0, 0.0])
-        .expect("2x2 coactivation");
+    let coactivation =
+        Array2::from_shape_vec((2, 2), vec![0.0, 1.0, 1.0, 0.0]).expect("2x2 coactivation");
 
     let penalty = DecoderIncoherencePenalty::new(
         PsiSlice::full(total, None),

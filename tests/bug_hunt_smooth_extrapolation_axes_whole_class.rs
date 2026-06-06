@@ -41,7 +41,9 @@ fn read_predictions(path: &Path) -> Vec<f64> {
         .iter()
         .position(|h| h == "mean")
         .or_else(|| headers.iter().position(|h| h == "linear_predictor"))
-        .unwrap_or_else(|| panic!("predict csv has neither `mean` nor `linear_predictor`: {headers:?}"));
+        .unwrap_or_else(|| {
+            panic!("predict csv has neither `mean` nor `linear_predictor`: {headers:?}")
+        });
     reader
         .records()
         .map(|rec| {
@@ -67,7 +69,11 @@ fn fit(train: &Path, formula: &str, model: &Path) {
 
 fn predict(model: &Path, data: &Path, out: &Path) -> Vec<f64> {
     let mut cmd = Command::new(gam_binary());
-    cmd.arg("predict").arg(model).arg(data).arg("--out").arg(out);
+    cmd.arg("predict")
+        .arg(model)
+        .arg(data)
+        .arg("--out")
+        .arg(out);
     run_or_panic(cmd, "gam predict");
     read_predictions(out)
 }
@@ -163,7 +169,8 @@ fn radial_matern_reverts_to_mean_instead_of_freezing_at_the_boundary() {
         let mut w = csv::Writer::from_path(&pred_in).expect("pred csv");
         w.write_record(["x", "y"]).unwrap();
         for &x in &probes {
-            w.write_record([format!("{x:.12}"), "0.0".to_string()]).unwrap();
+            w.write_record([format!("{x:.12}"), "0.0".to_string()])
+                .unwrap();
         }
         w.flush().unwrap();
     }

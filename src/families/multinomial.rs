@@ -824,9 +824,8 @@ pub fn predict_multinomial_formula(
     // does. The response column is simply never referenced by any term, so its
     // absence is a non-issue once resolution is by name (issue #803).
     let predict_columns = data.column_map();
-    let realigned = model
-        .resolved_termspec
-        .remap_feature_columns(|index| -> Result<usize, EstimationError> {
+    let realigned = model.resolved_termspec.remap_feature_columns(
+        |index| -> Result<usize, EstimationError> {
             let name = model.training_headers.get(index).ok_or_else(|| {
                 EstimationError::InvalidInput(format!(
                     "multinomial predict: saved training column index {index} is out of bounds \
@@ -836,7 +835,8 @@ pub fn predict_multinomial_formula(
             })?;
             resolve_role_col(&predict_columns, name, "feature")
                 .map_err(|err| EstimationError::InvalidInput(err.to_string()))
-        })?;
+        },
+    )?;
     let design = build_term_collection_design(data.values.view(), &realigned).map_err(|err| {
         EstimationError::InvalidInput(format!(
             "multinomial predict: rebuild design from saved termspec: {err}"
