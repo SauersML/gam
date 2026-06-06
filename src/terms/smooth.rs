@@ -4315,13 +4315,12 @@ fn matern_operator_penalty_triplet_from_metadata(
         aniso_log_scales.as_deref(),
     )?;
     // Gate the operator dials on the Matérn-ν RKHS Sobolev order m = ν + d/2:
-    // the order-j derivative is controlled in L2 iff j ≤ m, so mass (j=0) is
-    // always on, tension (j=1) on for m ≥ 1, stiffness (j=2) on for m ≥ 2. The
-    // roughest kernel ν=1/2 in d=1 (m=1, the exponential/OU H¹ process) thereby
-    // keeps mass+tension but DROPS stiffness — whose 2nd-derivative roughness
-    // its RKHS norm does not control — instead of over-smoothing the oscillation
-    // it is meant to track (#707). The threshold matches
-    // `DuchonOperatorPenaltySpec::matern_for_smoothness`.
+    // mass (j=0) is always on, tension (j=1) is on for m > 1, stiffness (j=2)
+    // is on for m > 2. The threshold is strict so the roughest kernel ν=1/2 in
+    // d=1 (m=1, the exponential/OU H¹ process) sheds both higher operators —
+    // its kernel already encodes the H¹ control, so adding an extra tension
+    // dial over-smooths the oscillation it is meant to track (#707). The
+    // matching gate lives at `DuchonOperatorPenaltySpec::matern_for_smoothness`.
     const ORDER_EPS: f64 = 1e-9;
     let d = penalty_centers.ncols();
     let m = nu.half_integer_value() + 0.5 * d as f64;
@@ -4335,7 +4334,7 @@ fn matern_operator_penalty_triplet_from_metadata(
             2.0,
         ),
     ] {
-        if m + ORDER_EPS < min_order {
+        if min_order > 0.0 && m <= min_order + ORDER_EPS {
             continue;
         }
         let sym = (&raw + &raw.t()) * 0.5;
