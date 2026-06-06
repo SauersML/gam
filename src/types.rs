@@ -430,10 +430,9 @@ impl ResponseFamily {
     #[inline]
     pub fn response_support_bounds(&self) -> Option<(f64, f64)> {
         match self {
-            Self::Gamma
-            | Self::Poisson
-            | Self::NegativeBinomial { .. }
-            | Self::Tweedie { .. } => Some((0.0, f64::INFINITY)),
+            Self::Gamma | Self::Poisson | Self::NegativeBinomial { .. } | Self::Tweedie { .. } => {
+                Some((0.0, f64::INFINITY))
+            }
             Self::Beta { .. } | Self::Binomial => Some((0.0, 1.0)),
             Self::Gaussian | Self::RoystonParmar => None,
         }
