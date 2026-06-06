@@ -285,7 +285,7 @@ impl CustomFamily for DirichletCommonFamily {
 
         let designs: Vec<Array2<f64>> = specs
             .iter()
-            .map(|spec| spec.design.solver_design().to_dense())
+            .map(|spec| spec.solver_design().to_dense())
             .collect();
         let mut joint = Array2::<f64>::zeros((total, total));
         for a in 0..K {
@@ -362,7 +362,7 @@ impl CustomFamily for DirichletCommonFamily {
 
         let designs: Vec<Array2<f64>> = specs
             .iter()
-            .map(|spec| spec.design.solver_design().to_dense())
+            .map(|spec| spec.solver_design().to_dense())
             .collect();
         let mut alpha: Vec<Array1<f64>> = Vec::with_capacity(K);
         let mut d_alpha: Vec<Array1<f64>> = Vec::with_capacity(K);
