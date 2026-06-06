@@ -23026,8 +23026,15 @@ mod tests {
     }
 
     fn dummy_blockspec(cols: usize) -> ParameterBlockSpec {
+        // `validate_blockspecs` enforces unique block names so coefficient
+        // labels stay unambiguous. A monotonic per-process counter keeps
+        // each call's name distinct even when multiple specs are stacked
+        // into one `Vec`.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let idx = SEQ.fetch_add(1, Ordering::Relaxed);
         ParameterBlockSpec {
-            name: "dummy".to_string(),
+            name: format!("dummy_{idx}"),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((1, cols)))),
             offset: Array1::zeros(1),
             penalties: Vec::new(),
