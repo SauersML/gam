@@ -3063,8 +3063,25 @@ impl JumpReLUPenalty {
     }
 
     fn psd_hessian_diag_entry(&self, tau: f64, gate: f64) -> f64 {
+        // Genuine PSD majorizer of the indefinite exact diagonal Hessian
+        //   h(g) = λτ·g(1−g)(1−2g)/ε².
+        // The bare re-weighted-ℓ₂ surrogate λτ·[g(1−g)]²/ε² is ≥ 0 but only
+        // dominates h in the concave region g > ½. For g < (3−√5)/2 ≈ 0.382 the
+        // exact curvature is positive and strictly larger, so the square alone
+        // is NOT an upper bound — the `B ⪰ ∂²P` contract is violated for exactly
+        // the comfortably-below-threshold (inactive) coordinates JumpReLU is
+        // meant to suppress, costing the MM step its monotone-decrease guarantee.
+        //
+        // Take the elementwise max of that surrogate and the absolute exact
+        // Hessian |h| = λτ·g(1−g)|1−2g|/ε². Since |h| ≥ h everywhere and ≥ 0, the
+        // max is a true PSD upper bound; it equals |h| in the wings (tight where
+        // the bare square failed) and keeps the surrogate's strictly-positive
+        // floor near the inflection g ≈ ½ (where h ≈ 0) so the curvature block
+        // never collapses to zero.
         let slope = gate * (1.0 - gate);
-        self.weight * tau * slope * slope / (self.smoothing_eps * self.smoothing_eps)
+        let reweighted_l2 = slope * slope;
+        let abs_exact = slope * (1.0 - 2.0 * gate).abs();
+        self.weight * tau * reweighted_l2.max(abs_exact) / (self.smoothing_eps * self.smoothing_eps)
     }
 }
 
@@ -3828,11 +3845,15 @@ impl AnalyticPenalty for MonotonicityPenalty {
                     ez / (1.0 + ez)
                 };
                 // d²P/d(target_a)d(target_b) follows from the chain rule on
-                // z = -dir * (target_b - target_a) / eps. Second derivative of
-                // softplus(z) is sigma(z)(1 - sigma(z)); the (dz/dtarget)²
-                // factor is 1/eps². Off-diagonal entries carry an extra minus
-                // sign from the difference.
-                let h = weight * sigma * (1.0 - sigma) / (eps * eps);
+                // z = -dir * (target_b - target_a) / eps. The penalty value is
+                // `softplus(z) * eps` (note the outer eps from `edge_value`).
+                // softplus''(z) = sigma(z)(1 - sigma(z)) and the (dz/dtarget)²
+                // factor is 1/eps², but the value's outer `* eps` cancels one of
+                // those, leaving `sigma(1 - sigma) / eps` — exactly the eps power
+                // that keeps `hvp` consistent with the finite difference of
+                // `grad_target` (whose own eps already cancelled). Off-diagonal
+                // entries carry an extra minus sign from the difference.
+                let h = weight * sigma * (1.0 - sigma) / eps;
                 let dv = v[b * d + j] - v[a * d + j];
                 out[a * d + j] -= h * dv;
                 out[b * d + j] += h * dv;
@@ -9080,23 +9101,40 @@ mod tests {
     fn jumprelu_psd_majorizer_diag_is_psd_over_logit_sweep() {
         let (pen, target_values, rho, scaled_thresholds, eps, weight) = jumprelu_sweep_fixture();
         let latent_dim = scaled_thresholds.len();
-        // The PSD majorizer is a DISTINCT operator from the true Hessian:
-        //   B(z) = wτ·[g(1 − g)]²/ε² ⪰ 0.
-        // The Newton / PIRLS curvature block consumes this, not `hessian_diag`.
+        // The PSD majorizer is a DISTINCT operator from the true Hessian. The
+        // bare re-weighted-ℓ₂ surrogate wτ·[g(1−g)]²/ε² is ≥ 0 but does NOT
+        // dominate the indefinite exact Hessian wτ·g(1−g)(1−2g)/ε² for gates
+        // g < (3−√5)/2 (where the exact curvature is positive and larger). The
+        // majorizer is therefore the elementwise max of that surrogate and the
+        // absolute exact Hessian |h| = wτ·g(1−g)|1−2g|/ε²: PSD, finite, and a
+        // genuine upper bound `B ⪰ ∂²P` everywhere. The Newton / PIRLS curvature
+        // block consumes this, not `hessian_diag`.
         let diag = pen
             .psd_majorizer_diag(target_values.view(), rho.view())
             .expect("JumpReLU exposes a PSD diagonal majorizer");
+        let exact = pen
+            .hessian_diag(target_values.view(), rho.view())
+            .expect("JumpReLU exposes a closed-form diagonal Hessian");
 
         for (idx, &entry) in diag.iter().enumerate() {
             let axis = idx % latent_dim;
             let gate = pen.sigmoid_gate((target_values[idx] - scaled_thresholds[axis]) / eps);
             let slope = gate * (1.0 - gate);
-            let expected = weight * scaled_thresholds[axis] * slope * slope / (eps * eps);
+            let reweighted_l2 = slope * slope;
+            let abs_exact = slope * (1.0 - 2.0 * gate).abs();
+            let expected =
+                weight * scaled_thresholds[axis] * reweighted_l2.max(abs_exact) / (eps * eps);
             assert!(
                 entry.is_finite() && entry >= 0.0,
                 "JumpReLU psd_majorizer_diag must be finite and PSD at index {idx}; entry={entry}"
             );
             assert_abs_diff_eq!(entry, expected, epsilon = 1e-12);
+            // The defining contract: the majorizer dominates the exact Hessian.
+            assert!(
+                entry + 1e-12 >= exact[idx],
+                "majorizer {entry} must dominate exact Hessian {} at index {idx}",
+                exact[idx]
+            );
         }
     }
 
