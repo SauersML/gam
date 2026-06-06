@@ -1590,6 +1590,89 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         }
     }
 
+    // ── Negative-Binomial overdispersion θ: re-estimate at the *converged* η and
+    //    drive (β, θ) to their joint fixed point (#802) ───────────────────────
+    //
+    // Identical in spirit to the Beta-precision refresh above. The inner LM solve
+    // estimates θ **once** from the warm-start η and freezes it (the
+    // `negbin_theta_locked` lock), keeping the penalized argmin β̂ a stationary LM
+    // target. But that lock pins θ to whatever η the solve started from, and for
+    // the final dedicated fit at the converged ρ the warm-start is the cold
+    // default guess (η ≈ 0). At the null predictor the Pearson residuals carry
+    // the *marginal* spread of y rather than its *conditional* spread, biasing
+    // the moment seed — and the frozen θ is what survives into the working weight
+    // `W = μθ/(θ+μ)`, the covariance `Vb = H⁻¹` (whose overdispersion scaling
+    // lives in that weight, not a post-hoc multiply), and every reported SE /
+    // interval / `generate` draw.
+    //
+    // Like the Beta precision — and unlike the scale-free Gamma shape / Tweedie φ
+    // — θ enters the NB2 working *response*, not only the weight, so re-solving β
+    // under the corrected θ is not cosmetic: it recovers the mean under the right
+    // variance function. Re-estimating at the converged η, re-solving β
+    // (warm-started), and repeating drives (β, θ) to their joint maximum-
+    // likelihood fixed point. Held OFF inside the REML λ search (the flag), θ is
+    // refreshed only here at the reported fit, so it cannot couple to the
+    // smoothing parameter. Every exit path installs θ evaluated at the *current*
+    // η with no following re-solve, so the reported θ (which flows into the
+    // embedded `NegativeBinomial { theta }`, the `EstimatedNegBinTheta` scale
+    // metadata, the predictive-interval variance, and every SE) always equals
+    // `estimate_negbin_theta_from_eta(final_eta)`.
+    if refine_dispersion_at_converged_eta
+        && working_model.likelihood.scale.negbin_theta_is_estimated()
+    {
+        // θ feeds back through the working response, so allow a few more passes
+        // than the scale-free Gamma case; the alternation is a strong contraction
+        // and warm-started re-solves are cheap.
+        const MAX_THETA_REFRESH: usize = 30;
+        // Relative θ tolerance below which a re-solve cannot move β̂ — and hence
+        // any reported quantity — by a statistically meaningful amount.
+        const THETA_REFRESH_REL_TOL: f64 = 1e-4;
+        for refresh_iter in 0..MAX_THETA_REFRESH {
+            let refreshed_theta = super::estimate_negbin_theta_from_eta(
+                y,
+                working_summary.state.eta.as_ref(),
+                priorweights,
+            );
+            let prior_theta = working_model.likelihood.negbin_theta().unwrap_or(1.0);
+            let rel_change =
+                (refreshed_theta - prior_theta).abs() / prior_theta.max(f64::MIN_POSITIVE);
+            // Install the refreshed θ (updates BOTH the `NegativeBinomial { theta }`
+            // family variant every weight/deviance expression reads and the
+            // `EstimatedNegBinTheta` scale metadata) and re-arm the lock so a
+            // following re-solve's `update_with_curvature` does not overwrite this
+            // deliberately chosen value with a fresh cold estimate.
+            working_model.likelihood = working_model
+                .likelihood
+                .clone()
+                .with_negbin_theta(refreshed_theta);
+            working_model.negbin_theta_locked = true;
+            if rel_change <= THETA_REFRESH_REL_TOL {
+                // Converged: the just-installed θ matches (to tolerance) the θ the
+                // current working state was solved at, so β̂, the weights, the
+                // Hessian and the deviance are already self-consistent with the
+                // reported θ. Nothing left to rebuild.
+                break;
+            }
+            if refresh_iter + 1 == MAX_THETA_REFRESH {
+                // Final allowed pass and θ is still drifting. Do NOT re-solve:
+                // re-solving would advance η past the point the just-installed θ
+                // was evaluated at, breaking the stored-θ == estimate(final_eta)
+                // invariant. Stop here so the reported θ is exactly the ML
+                // estimate at the reported η.
+                break;
+            }
+            // θ moved materially: re-solve β at the corrected θ, warm-started at
+            // the converged β, so the mean is refit under the better variance
+            // function and the final working state is rebuilt consistently.
+            working_summary = runworking_model_pirls(
+                &mut working_model,
+                working_summary.beta.clone(),
+                &options,
+                &mut iteration_logger,
+            )?;
+        }
+    }
+
     // Extract workspace before consuming working_model so we can reuse
     // the pre-allocated buffers in calculate_edfwithworkspace_with_penalty.
     // into_final_state() drops the workspace field anyway (it uses `..` in

@@ -5112,6 +5112,16 @@ fn validate_likelihood_scale_estimation(
                 )))
             }
         }
+        LikelihoodScaleMetadata::EstimatedNegBinTheta { theta } => {
+            ensure_finite_scalar_estimation("fit_result.likelihood_scale.theta", theta)?;
+            if theta > 0.0 {
+                Ok(())
+            } else {
+                Err(EstimationError::InvalidInput(format!(
+                    "fit_result.likelihood_scale.theta must be > 0, got {theta}"
+                )))
+            }
+        }
     }
 }
 
