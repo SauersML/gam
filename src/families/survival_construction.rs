@@ -4285,10 +4285,13 @@ mod tests {
     }
 
     fn assert_close(actual: f64, expected: f64, tol: f64, what: &str) {
+        // `<=` so that bit-equal values satisfy tol = 0. With `<`, |a−e| < 0
+        // is unsatisfiable and a zero-tolerance "must match exactly" call
+        // would reject identical numbers.
         let ok = if expected.abs() < 1.0 {
-            (actual - expected).abs() < tol
+            (actual - expected).abs() <= tol
         } else {
-            (actual - expected).abs() < tol * expected.abs().max(1.0)
+            (actual - expected).abs() <= tol * expected.abs().max(1.0)
         };
         assert!(
             ok,
