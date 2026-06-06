@@ -8018,7 +8018,18 @@ fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
             | ParsedTerm::RandomEffect { name } => {
                 out.insert(name.clone());
             }
-            ParsedTerm::Smooth { vars, .. } | ParsedTerm::Interaction { vars } => {
+            ParsedTerm::Smooth { vars, options, .. } => {
+                out.extend(vars.iter().cloned());
+                // A `by=` smooth (`s(x, by=g)`, factor or numeric varying
+                // coefficient) consumes the grouping/scaling variable from
+                // `options["by"]` (see `term_builder.rs` `options.get("by")`),
+                // but it is not among the positional `vars`. It must still be
+                // loaded from the data file, so list it as required.
+                if let Some(by) = options.get("by") {
+                    out.insert(by.clone());
+                }
+            }
+            ParsedTerm::Interaction { vars } => {
                 out.extend(vars.iter().cloned());
             }
             ParsedTerm::LinkWiggle { .. }
