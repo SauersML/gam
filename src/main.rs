@@ -9446,9 +9446,9 @@ mod tests {
         parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
         parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
         required_columns_for_fit, required_columns_for_formula, resolve_family,
-        summarizewiggle_domain,
-        validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-        write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
+        summarizewiggle_domain, validate_cli_firth_configuration,
+        write_gaussian_location_scale_prediction_csv, write_prediction_csv,
+        write_survival_binary_prediction_csv, write_survival_prediction_csv,
     };
     use super::{
         Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs, run_fit,
