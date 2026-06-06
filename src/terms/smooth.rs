@@ -19821,6 +19821,177 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
+    /// A minimal frozen 1-D B-spline basis at `feature_col`, used to exercise
+    /// the column-remap walk without standing up a full fit.
+    fn remap_test_bspline(feature_col: usize) -> SmoothBasisSpec {
+        SmoothBasisSpec::BSpline1D {
+            feature_col,
+            spec: BSplineBasisSpec {
+                degree: 3,
+                penalty_order: 2,
+                knotspec: BSplineKnotSpec::Generate {
+                    data_range: (0.0, 1.0),
+                    num_internal_knots: 4,
+                },
+                double_penalty: false,
+                identifiability: BSplineIdentifiability::None,
+                boundary_conditions: BSplineBoundaryConditions::default(),
+                boundary: OneDimensionalBoundary::Open,
+            },
+        }
+    }
+
+    #[test]
+    fn remap_feature_columns_rewrites_every_index_bearing_field() {
+        // Exhaustively verify that TermCollectionSpec::remap_feature_columns
+        // re-resolves *every* stored column index across every basis variant —
+        // including the two that the old survival-only walk silently skipped
+        // (BySmooth's by_kind.feature_col and FactorSmooth's
+        // continuous_cols/group_col). This is the predict-time realignment
+        // contract (#803): a stale training index that survives the walk would
+        // dereference the wrong predict column.
+        let spec = TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "lin".to_string(),
+                feature_col: 1,
+                feature_cols: vec![1],
+                double_penalty: false,
+                coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
+                coefficient_min: None,
+                coefficient_max: None,
+            }],
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "re".to_string(),
+                feature_col: 2,
+                drop_first_level: false,
+                penalized: true,
+                frozen_levels: Some(vec![0, 1]),
+            }],
+            smooth_terms: vec![
+                SmoothTermSpec {
+                    name: "bspline".to_string(),
+                    basis: remap_test_bspline(3),
+                    shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
+                },
+                SmoothTermSpec {
+                    name: "by_variable".to_string(),
+                    basis: SmoothBasisSpec::ByVariable {
+                        inner: Box::new(remap_test_bspline(4)),
+                        by_col: 5,
+                        kind: BySmoothKind::Numeric,
+                        by: ByVariableSpec::Numeric,
+                    },
+                    shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
+                },
+                SmoothTermSpec {
+                    name: "by_smooth".to_string(),
+                    basis: SmoothBasisSpec::BySmooth {
+                        smooth: Box::new(remap_test_bspline(6)),
+                        by_kind: ByVarKind::Numeric { feature_col: 7 },
+                    },
+                    shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
+                },
+                SmoothTermSpec {
+                    name: "factor_smooth".to_string(),
+                    basis: SmoothBasisSpec::FactorSmooth {
+                        spec: FactorSmoothSpec {
+                            continuous_cols: vec![8],
+                            group_col: 9,
+                            marginal: match remap_test_bspline(0) {
+                                SmoothBasisSpec::BSpline1D { spec, .. } => spec,
+                                _ => unreachable!(),
+                            },
+                            flavour: FactorSmoothFlavour::Sz,
+                            group_frozen_levels: Some(vec![0, 1]),
+                        },
+                    },
+                    shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
+                },
+                SmoothTermSpec {
+                    name: "thin_plate".to_string(),
+                    basis: SmoothBasisSpec::ThinPlate {
+                        feature_cols: vec![10, 11],
+                        spec: ThinPlateBasisSpec {
+                            periodic: None,
+                            center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
+                            length_scale: 1.0,
+                            double_penalty: true,
+                            identifiability: SpatialIdentifiability::default(),
+                            radial_reparam: None,
+                        },
+                        input_scales: None,
+                    },
+                    shape: ShapeConstraint::None,
+                    joint_null_rotation: None,
+                },
+            ],
+        };
+
+        // Remap every index by +100 (injective, so any missed field stays < 100
+        // and is caught below).
+        let remapped: TermCollectionSpec = spec
+            .remap_feature_columns(|i| Ok::<usize, String>(i + 100))
+            .expect("remap must succeed");
+
+        assert_eq!(remapped.linear_terms[0].feature_col, 101);
+        assert_eq!(remapped.random_effect_terms[0].feature_col, 102);
+
+        let collected = collect_feature_columns(&remapped);
+        let mut expected: Vec<usize> = (3..=11).map(|i| i + 100).collect();
+        expected.sort_unstable();
+        assert_eq!(
+            collected, expected,
+            "every smooth-basis column index must be remapped exactly once"
+        );
+
+        // The remap closure's error must short-circuit the whole walk.
+        let err = spec.remap_feature_columns(|_| Err::<usize, String>("boom".to_string()));
+        assert_eq!(err.unwrap_err(), "boom");
+    }
+
+    /// Gather every column index referenced by the smooth bases of a spec, sorted.
+    fn collect_feature_columns(spec: &TermCollectionSpec) -> Vec<usize> {
+        fn walk(basis: &SmoothBasisSpec, out: &mut Vec<usize>) {
+            match basis {
+                SmoothBasisSpec::ByVariable { inner, by_col, .. }
+                | SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
+                    out.push(*by_col);
+                    walk(inner, out);
+                }
+                SmoothBasisSpec::BSpline1D { feature_col, .. } => out.push(*feature_col),
+                SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+                    match by_kind {
+                        ByVarKind::Numeric { feature_col }
+                        | ByVarKind::Factor { feature_col, .. } => out.push(*feature_col),
+                    }
+                    walk(smooth, out);
+                }
+                SmoothBasisSpec::FactorSmooth { spec } => {
+                    out.extend(spec.continuous_cols.iter().copied());
+                    out.push(spec.group_col);
+                }
+                SmoothBasisSpec::ThinPlate { feature_cols, .. }
+                | SmoothBasisSpec::Sphere { feature_cols, .. }
+                | SmoothBasisSpec::Matern { feature_cols, .. }
+                | SmoothBasisSpec::Duchon { feature_cols, .. }
+                | SmoothBasisSpec::Pca { feature_cols, .. }
+                | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
+                    out.extend(feature_cols.iter().copied())
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for st in &spec.smooth_terms {
+            walk(&st.basis, &mut out);
+        }
+        out.sort_unstable();
+        out
+    }
+
     #[test]
     fn bspline_boundary_conditions_emit_paired_equality_constraints() {
         let x = Array1::linspace(0.0, 1.0, 25);
