@@ -124,8 +124,13 @@ fn tetragamma(mut x: f64) -> f64 {
     }
     let inv = 1.0 / x;
     let inv2 = inv * inv;
-    -inv2 - inv2 * inv - 0.5 * inv2 * inv2
-        + inv2 * inv2 * inv2 * (1.0 / 6.0 + inv2 * (-1.0 / 6.0 + inv2 * 0.3))
+    // ψ''(x_init) = Σ_{k=0}^{shift-1} -2/(x_init+k)³  +  ψ''(x_shifted);
+    // the recurrence accumulator must be added back to the asymptotic tail.
+    value
+        + (-inv2
+            - inv2 * inv
+            - 0.5 * inv2 * inv2
+            + inv2 * inv2 * inv2 * (1.0 / 6.0 + inv2 * (-1.0 / 6.0 + inv2 * 0.3)))
 }
 
 /// True smooth log-α surfaces η_k(x), k = 0..K-1, in the Dirichlet common
