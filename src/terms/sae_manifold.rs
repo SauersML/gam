@@ -1820,12 +1820,18 @@ impl SaeManifoldAtom {
     }
 
     pub fn refresh_basis(&mut self, coords: ArrayView2<'_, f64>) -> Result<(), String> {
-        let evaluator = self.basis_evaluator.as_ref().ok_or_else(|| {
-            format!(
-                "SaeManifoldAtom {} has no basis evaluator; caller must rebuild the term after each coordinate step",
-                self.name
-            )
-        })?;
+        // No installed evaluator means the caller is managing the basis
+        // out-of-band (the construction-time `phi` / `jet` are authoritative).
+        // The contract for that mode is documented in the constructor: the
+        // caller takes responsibility for rebuilding the term after a
+        // coordinate change. We must NOT fail here, because driver entry
+        // points (`run_joint_fit_arrow_schur`, the inner Newton loop, …)
+        // unconditionally call `refresh_basis_from_current_coords` to keep
+        // the auto-refresh path correct, and that prelude has to pass through
+        // unchanged for caller-managed atoms.
+        let Some(evaluator) = self.basis_evaluator.as_ref() else {
+            return Ok(());
+        };
         let (phi, jet) = evaluator.evaluate(coords)?;
         if phi.dim() != self.basis_values.dim() {
             return Err(format!(
