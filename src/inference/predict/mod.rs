@@ -267,6 +267,14 @@ pub trait UncertaintyCovarianceSource {
     fn observation_phi(&self) -> Option<f64> {
         None
     }
+    /// Estimated Negative-Binomial overdispersion `theta` used to widen
+    /// observation intervals (`Var = mu + mu^2/theta`, issue #802). Read from the
+    /// fitted `likelihood_scale` (`EstimatedNegBinTheta`) so the interval tracks
+    /// the data's overdispersion rather than the family-enum seed. Raw-covariance
+    /// sources return `None`, which falls back to the family-variant `theta`.
+    fn observation_theta(&self) -> Option<f64> {
+        None
+    }
 }
 
 impl UncertaintyCovarianceSource for UnifiedFitResult {
@@ -289,6 +297,9 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     }
     fn observation_phi(&self) -> Option<f64> {
         self.likelihood_scale.fixed_phi()
+    }
+    fn observation_theta(&self) -> Option<f64> {
+        self.likelihood_scale.negbin_theta()
     }
 }
 
@@ -5778,7 +5789,15 @@ where
                 response_observation_bounds(response_var)
             }
             ResponseFamily::NegativeBinomial { theta } => {
-                let response_var = mean.mapv(|mu| mu + mu.powi(2) / *theta);
+                // `theta` is estimated jointly with the mean (#802) and recorded
+                // in `likelihood_scale` (`EstimatedNegBinTheta`). Read the fitted
+                // value via `observation_theta()` (the saved family variant also
+                // carries it post-fit); fall back to the enum seed only for
+                // raw-covariance sources that expose no fitted scale. Using the
+                // seed `theta = 1` made the predictive variance `mu + mu^2`
+                // ignore the data's overdispersion.
+                let theta = source.observation_theta().unwrap_or(*theta);
+                let response_var = mean.mapv(|mu| mu + mu.powi(2) / theta);
                 response_observation_bounds(response_var)
             }
             ResponseFamily::Tweedie { p } => {
