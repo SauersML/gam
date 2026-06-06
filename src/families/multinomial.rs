@@ -807,18 +807,41 @@ pub fn fit_penalized_multinomial_formula(
 }
 
 /// Replay the saved termspec to build the predict-time design on a fresh
-/// dataset, then evaluate softmax probabilities. The predict dataset must
-/// carry the same feature columns the training data did (matched by name).
+/// dataset, then evaluate softmax probabilities. The predict dataset must carry
+/// the same feature columns the training data did, matched **by name** — it need
+/// not reproduce the training column order, and in particular need not carry the
+/// response column (prediction is for label-free new data).
 pub fn predict_multinomial_formula(
     model: &MultinomialSavedModel,
     data: &EncodedDataset,
 ) -> Result<Array2<f64>, EstimationError> {
-    let design = build_term_collection_design(data.values.view(), &model.resolved_termspec)
-        .map_err(|err| {
-            EstimationError::InvalidInput(format!(
-                "multinomial predict: rebuild design from saved termspec: {err}"
-            ))
+    // The saved termspec stores feature columns as absolute indices into the
+    // *training* table `[response, features...]`. Replaying it verbatim only
+    // works if the predict frame reproduces that exact layout — i.e. carries the
+    // (unknown, at predict time) response column in the same position. Realign
+    // the indices onto this dataset's columns by name instead, so prediction
+    // works on label-free new data exactly as every other family's predict path
+    // does. The response column is simply never referenced by any term, so its
+    // absence is a non-issue once resolution is by name (issue #803).
+    let predict_columns = data.column_map();
+    let realigned = model
+        .resolved_termspec
+        .remap_feature_columns(|index| -> Result<usize, EstimationError> {
+            let name = model.training_headers.get(index).ok_or_else(|| {
+                EstimationError::InvalidInput(format!(
+                    "multinomial predict: saved training column index {index} is out of bounds \
+                     for {} training headers",
+                    model.training_headers.len()
+                ))
+            })?;
+            resolve_role_col(&predict_columns, name, "feature")
+                .map_err(|err| EstimationError::InvalidInput(err.to_string()))
         })?;
+    let design = build_term_collection_design(data.values.view(), &realigned).map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "multinomial predict: rebuild design from saved termspec: {err}"
+        ))
+    })?;
     let x_dense = design
         .design
         .try_to_dense_by_chunks("multinomial predict design")

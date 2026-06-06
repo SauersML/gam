@@ -2087,59 +2087,16 @@ fn remap_term_collectionspec_columns(
     training_headers: &[String],
     prediction_column_map: &HashMap<String, usize>,
 ) -> Result<TermCollectionSpec, SurvivalPredictError> {
-    use crate::terms::smooth::SmoothBasisSpec;
-
-    let mut remapped = spec.clone();
-    let resolve_training_index = |index: usize| -> Result<usize, SurvivalPredictError> {
+    // Delegate the (variant-exhaustive, easy-to-miss-a-field) walk to the
+    // single shared authority on TermCollectionSpec; supply the survival
+    // train→predict resolution as the per-index remap closure.
+    spec.remap_feature_columns(|index| -> Result<usize, SurvivalPredictError> {
         let name = training_headers
             .get(index)
             .ok_or_else(|| format!("saved training column index {index} is out of bounds"))?;
         resolve_role_col(prediction_column_map, name, "prediction")
             .map_err(SurvivalPredictError::from)
-    };
-    for linear_term in &mut remapped.linear_terms {
-        linear_term.feature_col = resolve_training_index(linear_term.feature_col)?;
-    }
-    for random_effect_term in &mut remapped.random_effect_terms {
-        random_effect_term.feature_col = resolve_training_index(random_effect_term.feature_col)?;
-    }
-    fn remap_smooth_basis<F>(
-        basis: &mut SmoothBasisSpec,
-        resolve_training_index: &F,
-    ) -> Result<(), SurvivalPredictError>
-    where
-        F: Fn(usize) -> Result<usize, SurvivalPredictError>,
-    {
-        match basis {
-            SmoothBasisSpec::ByVariable { inner, by_col, .. }
-            | SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
-                *by_col = resolve_training_index(*by_col)?;
-                remap_smooth_basis(inner, resolve_training_index)?;
-            }
-            SmoothBasisSpec::BSpline1D { feature_col, .. } => {
-                *feature_col = resolve_training_index(*feature_col)?;
-            }
-            SmoothBasisSpec::ThinPlate { feature_cols, .. }
-            | SmoothBasisSpec::Sphere { feature_cols, .. }
-            | SmoothBasisSpec::Matern { feature_cols, .. }
-            | SmoothBasisSpec::Duchon { feature_cols, .. }
-            | SmoothBasisSpec::Pca { feature_cols, .. }
-            | SmoothBasisSpec::TensorBSpline { feature_cols, .. } => {
-                for feature_col in feature_cols.iter_mut() {
-                    *feature_col = resolve_training_index(*feature_col)?;
-                }
-            }
-            SmoothBasisSpec::BySmooth { smooth, .. } => {
-                remap_smooth_basis(smooth, resolve_training_index)?;
-            }
-            SmoothBasisSpec::FactorSmooth { .. } => {}
-        }
-        Ok(())
-    }
-    for smooth_term in &mut remapped.smooth_terms {
-        remap_smooth_basis(&mut smooth_term.basis, &resolve_training_index)?;
-    }
-    Ok(remapped)
+    })
 }
 
 /// Canonical saved fit result for prediction.
