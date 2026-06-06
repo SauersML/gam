@@ -102,27 +102,81 @@ fn cross_cutting_tweedie_negbin_beta_scalars_passthrough() {
         "NegBin REML score should change with theta"
     );
 
-    let beta_y = array![0.10, 0.15, 0.25, 0.35, 0.52, 0.63, 0.78, 0.88];
-    let be_10 = fit_small(
-        beta_y.clone(),
+    // Beta is the asymmetric case. Unlike the Tweedie variance power `p` and the
+    // Negative-Binomial `theta` above — genuine *fixed structural* scalars that
+    // change the fitted model — the Beta precision `phi` is now ESTIMATED jointly
+    // with the mean (issues #567/#769/#770, all closed). The construction-time
+    // `phi` is therefore only a *seed*: it must NOT leak into the converged fit
+    // (a leaked seed was the #769 slope-bias bug), and the reported precision must
+    // instead track the DATA's dispersion. So the correct passthrough contract for
+    // Beta is the opposite of the fixed-scalar one: seed-independence of the fit,
+    // plus a data-driven `phî`. (Asserting "deviance changes with the seed phi"
+    // is what this block previously got wrong — both seeds converge to the same
+    // estimated phi, hence the same deviance.)
+    let beta_spec = || {
         LikelihoodSpec::new(
             ResponseFamily::Beta { phi: 10.0 },
             InverseLink::Standard(StandardLink::Logit),
-        ),
-    );
-    let be_30 = fit_small(
-        beta_y,
+        )
+    };
+    let beta_spec_seed = |seed| {
         LikelihoodSpec::new(
-            ResponseFamily::Beta { phi: 30.0 },
+            ResponseFamily::Beta { phi: seed },
             InverseLink::Standard(StandardLink::Logit),
-        ),
+        )
+    };
+
+    // (a) Seed-independence: the SAME data fit with two very different seed phis
+    // must yield an identical converged fit — same coefficients, same deviance,
+    // same REML score, and the same estimated precision.
+    let beta_y = array![0.10, 0.15, 0.25, 0.35, 0.52, 0.63, 0.78, 0.88];
+    let be_seed10 = fit_small(beta_y.clone(), beta_spec_seed(10.0));
+    let be_seed30 = fit_small(beta_y.clone(), beta_spec_seed(30.0));
+
+    let beta_delta = (&be_seed10.beta - &be_seed30.beta).mapv(f64::abs).sum();
+    assert!(
+        beta_delta < 1e-6,
+        "Beta fit must be independent of the seed phi (phi is estimated, #769); \
+         coefficient delta={beta_delta}"
     );
     assert!(
-        (be_10.deviance - be_30.deviance).abs() > 1e-8,
-        "Beta deviance should change with phi"
+        (be_seed10.deviance - be_seed30.deviance).abs() < 1e-6,
+        "Beta deviance must be independent of the seed phi (phi is estimated); \
+         {} vs {}",
+        be_seed10.deviance,
+        be_seed30.deviance
     );
     assert!(
-        (be_10.reml_score - be_30.reml_score).abs() > 1e-8,
-        "Beta REML score should change with phi"
+        (be_seed10.reml_score - be_seed30.reml_score).abs() < 1e-6,
+        "Beta REML score must be independent of the seed phi (phi is estimated)"
+    );
+    let phi_seed10 = be_seed10
+        .likelihood_scale
+        .fixed_phi()
+        .expect("Beta fit must carry an estimated precision");
+    let phi_seed30 = be_seed30
+        .likelihood_scale
+        .fixed_phi()
+        .expect("Beta fit must carry an estimated precision");
+    assert!(
+        (phi_seed10 - phi_seed30).abs() / phi_seed10.max(1e-12) < 1e-4,
+        "estimated Beta phi must be seed-independent; got {phi_seed10} vs {phi_seed30}"
+    );
+
+    // (b) The estimated precision tracks the DATA's dispersion: responses tightly
+    // concentrated about their (near-constant) mean carry far less Beta noise
+    // (Var = mu(1-mu)/(1+phi)), so the estimated precision phî must be markedly
+    // LARGER than for the widely-spread responses above. This is the data-driven
+    // analogue of "the scale parameter feeds through to the fit".
+    let beta_y_tight = array![0.46, 0.48, 0.49, 0.50, 0.51, 0.52, 0.53, 0.55];
+    let be_tight = fit_small(beta_y_tight, beta_spec());
+    let phi_tight = be_tight
+        .likelihood_scale
+        .fixed_phi()
+        .expect("Beta fit must carry an estimated precision");
+    assert!(
+        phi_tight > 2.0 * phi_seed10,
+        "estimated Beta phi must track the data's dispersion: tight-data phî={phi_tight} \
+         should far exceed spread-data phî={phi_seed10}"
     );
 }
