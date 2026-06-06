@@ -6974,9 +6974,22 @@ fn build_single_local_smooth_term(
     // coefficient chart in their `FrozenTransform`; recomputing Q there would
     // rotate an already-frozen chart a second time and desynchronize value
     // rebuilds from derivative operators.
+    //
+    // Kronecker-factored smooths (tensor B-splines under `TensorBSplineIdentifiability::None`)
+    // carry their joint penalty as `Σ_d S_d` with `S_d = I ⊗ … ⊗ S_d^{1D} ⊗ … ⊗ I`.
+    // The joint null space is the tensor of marginal nulls and is handled directly
+    // by the REML runtime's `kronecker_penalty_system` path (see
+    // `runtime.rs:8334-8344`). Applying a dense (p × p) Q here would densify
+    // `X_raw = mx ⊗ my` into `X_raw · Q`, destroying the Kronecker product
+    // structure that the runtime relies on for fast log-det/derivative
+    // assembly — and the rotation block at the wrapper site also unconditionally
+    // wipes `kronecker_factored`, leaving the runtime to fall back to the
+    // dense per-block log-det. Skip the rotation for Kronecker-factored terms
+    // so the factored representation survives end-to-end.
     let joint_null_rotation = match term.joint_null_rotation.clone() {
         Some(persisted) => Some(persisted),
         None if smooth_has_frozen_identifiability(term) => None,
+        None if kron_factored.is_some() => None,
         None => crate::terms::basis::compute_joint_null_rotation(&penalties_t)?,
     };
 
