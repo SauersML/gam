@@ -25390,11 +25390,25 @@ fn predict_columns(
         (Some(confidence_level), true) => {
             // Curved inverse link + interval: the canonical posterior-mean path
             // returns the η-scale SE and the inverse-link-transformed credible
-            // bounds in one pass — the exact computation the CLI runs for these
-            // families — so `interval` just surfaces those extra columns on top
-            // of the same posterior-mean point as the no-interval branch.
+            // bounds in one pass, on top of the same posterior-mean point as the
+            // no-interval branch. The `covariance_mode` and `observation_interval`
+            // knobs are threaded through here exactly as the sibling
+            // full-uncertainty arm does for the plug-in families: previously this
+            // arm ignored both, so binomial intervals silently dropped the
+            // observation band (#811) and the smoothing-parameter correction
+            // (#812). The posterior-mean *point* stays conditional regardless of
+            // mode (issue #398); only the reported uncertainty responds.
+            let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
+                .unwrap_or(
+                    gam::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                );
+            let posterior_options = gam::predict::PosteriorMeanOptions {
+                confidence_level: Some(confidence_level),
+                covariance_mode,
+                include_observation_interval: options.observation_interval.unwrap_or(false),
+            };
             let prediction = predictor
-                .predict_posterior_mean(&predict_input, &fit, Some(confidence_level))
+                .predict_posterior_mean(&predict_input, &fit, &posterior_options)
                 .map_err(|err| {
                     format!("posterior-mean prediction with uncertainty failed: {err}")
                 })?;
@@ -25412,6 +25426,16 @@ fn predict_columns(
             );
             columns.insert("mean_lower".to_string(), mean_lower.to_vec());
             columns.insert("mean_upper".to_string(), mean_upper.to_vec());
+            // Observation (prediction) interval: present only when the request
+            // was made AND the family exposes a conditional response variance
+            // (Binomial `p(1−p)`). Emitting separate columns keeps the standard
+            // schema untouched when off and never overwrites the credible bounds.
+            if let (Some(obs_lower), Some(obs_upper)) =
+                (prediction.observation_lower, prediction.observation_upper)
+            {
+                columns.insert("observation_lower".to_string(), obs_lower.to_vec());
+                columns.insert("observation_upper".to_string(), obs_upper.to_vec());
+            }
         }
         (Some(confidence_level), false) => {
             // Effectively-linear model + interval: plug-in == posterior mean, so
@@ -25465,7 +25489,11 @@ fn predict_columns(
         }
         (None, true) => {
             let prediction = predictor
-                .predict_posterior_mean(&predict_input, &fit, None)
+                .predict_posterior_mean(
+                    &predict_input,
+                    &fit,
+                    &gam::predict::PosteriorMeanOptions::point_only(),
+                )
                 .map_err(|err| format!("posterior-mean prediction failed: {err}"))?;
             columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
             columns.insert("mean".to_string(), prediction.mean.to_vec());
