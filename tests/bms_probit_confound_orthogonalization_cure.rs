@@ -515,7 +515,10 @@ fn robust_cures_confounded_bms_never_fails_with_bounded_beta() {
 
     eprintln!(
         "[bms-cure] max|β_m|={:.4e} conv={} |g|={:?} finite={} err={}",
-        on.max_abs_marginal_beta, on.outer_converged, on.outer_gradient_norm, on.all_finite,
+        on.max_abs_marginal_beta,
+        on.outer_converged,
+        on.outer_gradient_norm,
+        on.all_finite,
         on.err_text.is_some(),
     );
 

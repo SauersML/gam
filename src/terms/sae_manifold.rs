@@ -13132,9 +13132,8 @@ mod tests {
     #[test]
     fn pca_seed_rejects_huge_finite_span_that_overflows_centering() {
         let z = array![[1.0e308_f64, 0.0], [-1.0e308, 0.0]];
-        let err =
-            sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1])
-                .expect_err("opposite huge finite values exceed f64 centering range");
+        let err = sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1])
+            .expect_err("opposite huge finite values exceed f64 centering range");
         assert!(
             err.contains("centered Z is non-finite") || err.contains("SVD failed"),
             "unexpected PCA seed error: {err}"

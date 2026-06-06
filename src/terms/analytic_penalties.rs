@@ -4154,9 +4154,8 @@ impl NuclearNormPenalty {
         for i in 0..d {
             for j in 0..d {
                 let denom = regularized_evals[i] - regularized_evals[j];
-                let scale =
-                    (regularized_evals[i].abs() + regularized_evals[j].abs())
-                        .max(f64::MIN_POSITIVE);
+                let scale = (regularized_evals[i].abs() + regularized_evals[j].abs())
+                    .max(f64::MIN_POSITIVE);
                 let divided_difference = if denom.abs() <= 1.0e-12 * scale {
                     let i_active = i >= active_start;
                     let j_active = j >= active_start;

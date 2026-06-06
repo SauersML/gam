@@ -37,9 +37,7 @@ use crate::linalg::utils::{
     row_mismatch_message,
 };
 use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
-use crate::mixture_link::{
-    state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
-};
+use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::pirls::{self, PirlsResult};
 use crate::seeding::{SeedConfig, SeedRiskProfile};
 use crate::terms::smooth::BlockwisePenalty;

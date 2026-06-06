@@ -153,7 +153,11 @@ fn cohort_exact_collinearity() -> gam::data::EncodedDataset {
         let p = 1.0 / (1.0 + (-eta).exp());
         let y = if rng.unit() < p { 1.0 } else { 0.0 };
         // x2 is an EXACT copy of x1 (perfect collinearity).
-        rows.push(vec![format!("{x1:.17e}"), format!("{x1:.17e}"), format!("{y}")]);
+        rows.push(vec![
+            format!("{x1:.17e}"),
+            format!("{x1:.17e}"),
+            format!("{y}"),
+        ]);
     }
     dataset(&["x1", "x2", "y"], rows)
 }

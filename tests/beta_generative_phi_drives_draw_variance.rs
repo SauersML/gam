@@ -42,7 +42,11 @@ fn implied_phi(mu: f64, var: f64) -> f64 {
 /// Draw `n_draws × n_rows` Beta replicates at a constant mean `mu` from the
 /// generative spec built with the given `gaussian_scale`, and return the
 /// pooled empirical (population) variance of every drawn value.
-fn empirical_draw_variance(seed_spec: &LikelihoodSpec, gaussian_scale: Option<f64>, mu: f64) -> f64 {
+fn empirical_draw_variance(
+    seed_spec: &LikelihoodSpec,
+    gaussian_scale: Option<f64>,
+    mu: f64,
+) -> f64 {
     const N_ROWS: usize = 4_000;
     const N_DRAWS: usize = 25;
 
