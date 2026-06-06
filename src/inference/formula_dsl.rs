@@ -1150,7 +1150,10 @@ pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) ->
         ParsedTerm::Linear { name, .. }
         | ParsedTerm::BoundedLinear { name, .. }
         | ParsedTerm::RandomEffect { name } => name == column_name,
-        ParsedTerm::Smooth { vars, .. } => vars.iter().any(|var| var == column_name),
+        ParsedTerm::Smooth { vars, options, .. } => {
+            vars.iter().any(|var| var == column_name)
+                || options.get("by").is_some_and(|by| by == column_name)
+        }
         ParsedTerm::Interaction { vars } => vars.iter().any(|var| var == column_name),
         ParsedTerm::LinkWiggle { .. }
         | ParsedTerm::TimeWiggle { .. }
