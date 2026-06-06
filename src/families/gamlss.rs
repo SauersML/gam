@@ -8310,6 +8310,25 @@ impl CustomFamily for GaussianLocationScaleFamily {
         true
     }
 
+    /// The Gaussian location-scale likelihood has no separation /
+    /// under-identification regime that the full-span Jeffreys curvature `H_Φ`
+    /// is meant to regularize: with the soft floor `σ ≥ b > 0` the per-row
+    /// Fisher information `diag(a/σ², 2κ²a)` is bounded and `O(n)` on every
+    /// identified direction at every working point, so the well-conditioned-`H`
+    /// Jeffreys gate smooth-steps `H_Φ` to ~0 — yet the matching score `∇Φ`
+    /// kept leaking a *phantom* penalized-stationarity residual into the inner
+    /// joint-Newton (a nonzero `|∇L − Sβ|` paired with a numerically null `H_Φ`
+    /// and a full-rank `H_pen`), so the KKT certificate refused every iterate
+    /// and the outer REML rejected all seeds — aborting heteroscedastic
+    /// location-scale fits (#684–#688). This is the same opt-out
+    /// `TransformationNormalFamily` takes for the same structural reason
+    /// (continuous response, `O(n)` Fisher information everywhere); it removes
+    /// the phantom residual and drops the per-cycle `O(n·p²)` Jeffreys
+    /// directional-derivative overhead.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        false
+    }
+
     fn exact_newton_joint_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
