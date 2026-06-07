@@ -1493,6 +1493,36 @@ pub fn build_smooth_basis(
 
     match type_opt.as_str() {
         "cyclic" | "cc" | "cp" | "cyclic-ps" => {
+            validate_known_options(
+                "cyclic",
+                options,
+                &[
+                    "type",
+                    "bs",
+                    "by",
+                    "k",
+                    "basis_dim",
+                    "basis-dim",
+                    "basisdim",
+                    "degree",
+                    "penalty_order",
+                    "period",
+                    "periods",
+                    "period_start",
+                    "period_end",
+                    "start",
+                    "end",
+                    "origin",
+                    "origins",
+                    "period_origin",
+                    "period-origin",
+                    "domain_origin",
+                    "double_penalty",
+                    "id",
+                    "__by_col",
+                    "identifiability",
+                ],
+            )?;
             if cols.len() != 1 {
                 return Err(format!(
                     "periodic smooth expects one variable, got {}",
@@ -1517,7 +1547,24 @@ pub fn build_smooth_basis(
                     degree + 1
                 ));
             }
-            let (domain_start, period) = parse_periodic_domain_1d(options, minv, maxv)?;
+            // The cyclic arm is periodic on its single axis by construction, so
+            // resolve the period exactly the way the `s()`/`ps` arm does: honour
+            // `period=`/`periods=` first (with `origin=` setting the domain
+            // start), and fall back to the `period_start`/`period_end` endpoint
+            // form only when `period=` is absent. Previously this arm jumped
+            // straight to `parse_periodic_domain_1d`, so a `period=<v>`
+            // declaration was silently dropped and the smooth wrapped at the
+            // data range (#816). All three helpers route through
+            // `parse_numeric_expr`, so `period=2*pi` and `period_end=2*pi` parse
+            // identically (#815).
+            let periodic_axes = [true];
+            let periods = parse_periods(options, &periodic_axes)?;
+            let origins = parse_period_origins(options, &periodic_axes)?;
+            let (domain_start, period) = if let Some(p) = periods[0] {
+                (origins[0].unwrap_or(minv), p)
+            } else {
+                parse_periodic_domain_1d(options, minv, maxv)?
+            };
             Ok(SmoothBasisSpec::BSpline1D {
                 feature_col: c,
                 spec: BSplineBasisSpec {
