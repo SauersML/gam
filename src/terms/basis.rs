@@ -1446,73 +1446,67 @@ fn bspline_raw_row_chunk(
     }
 }
 
-fn is_effectively_uniform_knot_geometry(knot_vector: &Array1<f64>, degree: usize) -> bool {
-    if knot_vector.len() <= degree + 2 {
-        return true;
-    }
-
-    let min_k = knot_vector[0];
-    let max_k = knot_vector[knot_vector.len() - 1];
-    let scale = (max_k - min_k).abs().max(1.0);
-    let tol = 1e-10 * scale;
-
-    // Any repeated interior knot (beyond clamped boundaries) implies irregular geometry.
-    let mut left = 0usize;
-    while left + 1 < knot_vector.len() && (knot_vector[left + 1] - min_k).abs() <= tol {
-        left += 1;
-    }
-    let mut right = knot_vector.len() - 1;
-    while right > 0 && (knot_vector[right - 1] - max_k).abs() <= tol {
-        right -= 1;
-    }
-    if right > left + 1 {
-        for i in (left + 1)..=right {
-            if (knot_vector[i] - knot_vector[i - 1]).abs() <= tol {
-                return false;
-            }
-        }
-    }
-
-    let mut breakpoints = Vec::<f64>::with_capacity(knot_vector.len());
-    for &k in knot_vector {
-        if breakpoints
-            .last()
-            .map(|last| (k - *last).abs() > tol)
-            .unwrap_or(true)
-        {
-            breakpoints.push(k);
-        }
-    }
-
-    if breakpoints.len() <= 2 {
-        return true;
-    }
-
-    let h0 = breakpoints[1] - breakpoints[0];
-    for i in 2..breakpoints.len() {
-        let hi = breakpoints[i] - breakpoints[i - 1];
-        if (hi - h0).abs() > 1e-8 * scale {
-            return false;
-        }
-    }
-    true
-}
-
-/// Selects Greville abscissae for difference-penalty scaling when knot geometry is non-uniform.
+/// Selects Greville abscissae for difference-penalty scaling.
 ///
-/// For regular, uniformly spaced breakpoint grids this returns `None` to preserve
-/// classical P-spline integer-difference penalties. For irregular grids (including
-/// repeated interior knots), this returns `Some(Greville)` so divided-difference
-/// scaling is applied by [`create_difference_penalty_matrix`].
+/// The classical P-spline integer-difference penalty `D'D` penalizes the squared
+/// `m`-th differences of the *coefficients*. Those differences represent the
+/// squared `m`-th derivative of the *function* — with the correct polynomial null
+/// space `{1, x, …, x^{m-1}}` — only when the basis has *evenly spaced Greville
+/// abscissae*, because a coefficient sequence that is linear in its index then
+/// reproduces a function linear in `x` (B-spline linear precision, `Σ ξ_i B_i(x)
+/// = x`).
+///
+/// Equally spaced *breakpoints* are **not** sufficient. gam's B-splines are
+/// clamped (boundary knots repeated `degree + 1` times), so even on a uniform
+/// interior grid the Greville abscissae `ξ_i = (1/m)·Σ_{k=1}^{degree} t_{i+k}`
+/// cluster toward the ends. With such a basis the integer-difference null space
+/// is a *rotated approximation* of the polynomial space rather than the exact
+/// `{1, x, …}`. That tilts the direction REML shrinks toward as `λ → ∞`, so the
+/// recovered surface is biased and the selected smoothing parameters land off
+/// the true optimum (e.g. anisotropic tensor `te`/`ti` recovery degrades).
+///
+/// We therefore gate the integer-difference fast path on uniformity of the
+/// **Greville abscissae** and otherwise return them, so divided-difference
+/// scaling in [`create_difference_penalty_matrix`] restores the exact polynomial
+/// null space for any knot geometry (clamped, quantile, or otherwise). When the
+/// abscissae are already uniform (e.g. a non-clamped Eilers–Marx grid), the
+/// divided differences reduce to the integer differences up to an overall scale,
+/// so returning `None` there is exact and cheaper.
 pub fn penalty_greville_abscissae_for_knots(
     knot_vector: &Array1<f64>,
     degree: usize,
 ) -> Result<Option<Array1<f64>>, BasisError> {
-    if is_effectively_uniform_knot_geometry(knot_vector, degree) {
+    // Degenerate / too-short knot vectors have no meaningful divided-difference
+    // scaling (and `compute_greville_abscissae` rejects them); fall back to the
+    // plain integer-difference penalty exactly as before.
+    let greville = match compute_greville_abscissae(knot_vector, degree) {
+        Ok(g) => g,
+        Err(_) => return Ok(None),
+    };
+    if is_uniformly_spaced_sequence(greville.view()) {
         Ok(None)
     } else {
-        Ok(Some(compute_greville_abscissae(knot_vector, degree)?))
+        Ok(Some(greville))
     }
+}
+
+/// True when the entries of `values` are (numerically) evenly spaced. Used to
+/// decide whether classical integer-difference penalties coincide with the
+/// geometry-correct divided-difference penalty for a basis.
+fn is_uniformly_spaced_sequence(values: ArrayView1<'_, f64>) -> bool {
+    let n = values.len();
+    if n <= 2 {
+        return true;
+    }
+    let span = (values[n - 1] - values[0]).abs().max(1.0);
+    let h0 = values[1] - values[0];
+    for i in 2..n {
+        let hi = values[i] - values[i - 1];
+        if (hi - h0).abs() > 1e-8 * span {
+            return false;
+        }
+    }
+    true
 }
 
 /// Thin-plate regression spline basis and penalty (order m=2).
@@ -31426,11 +31420,112 @@ mod tests {
     }
 
     #[test]
-    fn test_penalty_greville_selectornone_for_uniform_breakpoints() {
+    fn test_penalty_greville_selected_for_clamped_uniform_breakpoints() {
+        // A clamped B-spline with a *uniform interior breakpoint grid* still has
+        // non-uniform Greville abscissae (they cluster toward the clamped ends),
+        // so the geometry-correct divided-difference penalty must be selected.
+        // Selecting the classical integer-difference penalty here would give the
+        // curvature penalty a null space that is only an approximation of
+        // {1, x}, biasing every shrink-toward-linear and the REML smoothing
+        // selection (root cause of the tensor te/ti over-smoothing regression).
         let degree = 3usize;
         let knots = internal::generate_full_knot_vector((0.0, 1.0), 5, degree).unwrap();
-        let g = penalty_greville_abscissae_for_knots(&knots, degree).unwrap();
-        assert!(g.is_none());
+        let g = penalty_greville_abscissae_for_knots(&knots, degree)
+            .unwrap()
+            .expect("clamped uniform breakpoints have non-uniform Greville abscissae");
+        // Sanity: the abscissae really are non-uniform (clustered at the ends).
+        let gaps: Vec<f64> = g.windows(2).into_iter().map(|w| w[1] - w[0]).collect();
+        let max_gap = gaps.iter().cloned().fold(f64::MIN, f64::max);
+        let min_gap = gaps.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(
+            max_gap - min_gap > 1e-6,
+            "Greville abscissae for a clamped basis should be non-uniform: gaps={gaps:?}"
+        );
+    }
+
+    #[test]
+    fn test_penalty_greville_none_for_uniform_greville() {
+        // When the abscissae are genuinely uniform (a non-clamped, evenly spaced
+        // grid), integer differences coincide with divided differences up to an
+        // overall scale, so the cheaper integer-difference path is selected.
+        let degree = 3usize;
+        let n_basis = 8usize;
+        let knots: Array1<f64> =
+            Array1::from_iter((0..(n_basis + degree + 1)).map(|i| i as f64));
+        let g = compute_greville_abscissae(&knots, degree).unwrap();
+        assert!(
+            is_uniformly_spaced_sequence(g.view()),
+            "evenly spaced knot vector should yield uniform Greville abscissae: {g:?}"
+        );
+        assert!(penalty_greville_abscissae_for_knots(&knots, degree).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_clamped_bspline_curvature_penalty_null_space_is_exactly_linear() {
+        // End-to-end guard on the root cause: the curvature penalty of a clamped
+        // uniform B-spline must annihilate exactly the functions linear in x.
+        // Build the (unconstrained) marginal basis + penalty the way a tensor
+        // margin does, then verify every null-space coefficient vector maps to a
+        // function with zero deviation from its best linear-in-x fit.
+        let x = Array1::<f64>::linspace(0.0, 1.0, 50);
+        let spec = BSplineBasisSpec {
+            degree: 3,
+            penalty_order: 2,
+            knotspec: BSplineKnotSpec::Generate {
+                data_range: (0.0, 1.0),
+                num_internal_knots: 4,
+            },
+            double_penalty: false,
+            identifiability: BSplineIdentifiability::None,
+            boundary: OneDimensionalBoundary::Open,
+            boundary_conditions: BSplineBoundaryConditions::default(),
+        };
+        let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
+        let design = built.design.to_dense();
+        let s = &built.penalties[0];
+        // Null space of S (curvature penalty): eigenvectors with ~zero eigenvalue.
+        let (evals, evecs) = FaerEigh::eigh(s, Side::Lower).unwrap();
+        let max_ev = evals.iter().cloned().fold(f64::MIN, f64::max);
+        let mut worst_rel_dev = 0.0_f64;
+        let n = x.len();
+        // Least-squares onto span{1, x} via the 2x2 normal equations.
+        let sx: f64 = x.sum();
+        let sxx: f64 = x.iter().map(|v| v * v).sum();
+        let nn = n as f64;
+        let det = nn * sxx - sx * sx;
+        let mut null_count = 0usize;
+        for (idx, &ev) in evals.iter().enumerate() {
+            if ev > 1e-9 * max_ev {
+                continue;
+            }
+            null_count += 1;
+            let coef = evecs.column(idx).to_owned();
+            let f = design.dot(&coef);
+            let sf: f64 = f.sum();
+            let sxf: f64 = x.iter().zip(f.iter()).map(|(xi, fi)| xi * fi).sum();
+            // beta = (A'A)^{-1} A'f for A = [1, x]
+            let b0 = (sxx * sf - sx * sxf) / det;
+            let b1 = (nn * sxf - sx * sf) / det;
+            let mut resid = 0.0_f64;
+            let mut amp = 0.0_f64;
+            for i in 0..n {
+                let fit = b0 + b1 * x[i];
+                resid += (f[i] - fit) * (f[i] - fit);
+                amp += f[i] * f[i];
+            }
+            let rel = (resid.sqrt()) / amp.sqrt().max(1e-30);
+            worst_rel_dev = worst_rel_dev.max(rel);
+        }
+        assert!(
+            null_count >= 2,
+            "curvature penalty should have a 2-D (const+linear) null space, found {null_count}"
+        );
+        assert!(
+            worst_rel_dev < 1e-8,
+            "clamped B-spline curvature penalty null space deviates from linear-in-x \
+             by rel {worst_rel_dev:.3e} (must be ~0; integer-difference penalties on a \
+             clamped basis contaminate the null space)"
+        );
     }
 
     #[test]
