@@ -65,7 +65,6 @@ use crate::families::custom_family::{
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, JointHessianSourcePreference,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
-use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::vector_response::{
     MultinomialLogitLikelihood, VectorLikelihood, validate_multinomial_simplex,
 };
@@ -136,33 +135,6 @@ impl MultinomialFamily {
     /// Total number of active blocks, `M = K − 1`.
     pub const fn active_classes(&self) -> usize {
         self.total_classes - 1
-    }
-
-    /// Per-class parameter labels used in user-facing diagnostics. Returned
-    /// as a fresh `Vec` because `K` is only known at construction time.
-    pub fn parameter_names(&self) -> Vec<String> {
-        (0..self.active_classes())
-            .map(|a| format!("class_{a}"))
-            .collect()
-    }
-
-    /// All active blocks use the identity link at the η level — the
-    /// softmax inverse-link is applied jointly across classes by the
-    /// likelihood and is not a per-block parameter link.
-    pub fn parameter_links(&self) -> Vec<ParameterLink> {
-        vec![ParameterLink::Identity; self.active_classes()]
-    }
-
-    /// Static-friendly metadata snapshot. The parameter-name strings live
-    /// on the returned `FamilyMetadata` indirectly through `'static` slices;
-    /// since the count is data-dependent, we embed the constant family
-    /// label and rely on per-call accessors above for the per-class names.
-    pub fn metadata() -> FamilyMetadata {
-        FamilyMetadata {
-            name: "multinomial_logit",
-            parameternames: &[],
-            parameter_links: &[],
-        }
     }
 
     /// Validate inputs and construct the family.
@@ -1327,14 +1299,6 @@ mod tests {
         for (a, b) in mf_diag.iter().zip(dense_diag.iter()) {
             assert!((a - b).abs() < 1.0e-9, "matrix-free diag {a} != dense {b}");
         }
-    }
-
-    #[test]
-    fn parameter_names_emit_one_label_per_active_class() {
-        let family = toy_family(2, 1, 4);
-        let names = family.parameter_names();
-        assert_eq!(names, vec!["class_0", "class_1", "class_2"]);
-        assert_eq!(family.parameter_links().len(), names.len());
     }
 
     #[test]
