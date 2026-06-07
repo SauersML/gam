@@ -991,15 +991,20 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
         IBP/Gumbel assignment path. Alias kwarg: ``gumbel_schedule``.
     isometry_weight
-        Weight for ``IsometryPenalty`` on the latent coordinate block. It is on
-        by default (``1.0``). Issue #673 (resolved): the decoder smoothness
-        penalty is now reparameterized by the pulled-back metric ``g = JᵀJ`` in
-        the Rust core, so the roughness — and the ``reml_score`` topology
-        evidence — is gauge-invariant under reparameterization of the latent
-        coordinate ``t`` even without the isometry penalty. ``IsometryPenalty``
-        remains a useful complementary regularizer (it drives ``g → I`` for an
-        interpretable, near-arc-length chart), but is no longer a precondition
-        for comparing ``reml_score`` across topologies.
+        Weight for ``IsometryPenalty`` on the latent coordinate block. Defaults
+        to ``0.0`` (off): the MeanProfiled isometry energy is not
+        scale-invariant (it scales as ``decoder⁴``) and can saturate the
+        arrow-Schur proximal ridge during the joint solve, raising
+        ``RemlConvergenceError`` even on a single planted circle (issue #795);
+        pass ``isometry_weight > 0`` to opt in once you know your decoder scale
+        is well conditioned. Issue #673 (resolved): the decoder smoothness
+        penalty is reparameterized by the pulled-back metric ``g = JᵀJ`` in the
+        Rust core, so the roughness — and the ``reml_score`` topology evidence —
+        is gauge-invariant under reparameterization of the latent coordinate
+        ``t`` even with the isometry penalty off. ``IsometryPenalty`` is purely
+        a complementary regularizer when enabled (it drives ``g → I`` for an
+        interpretable, near-arc-length chart); it is not a precondition for
+        comparing ``reml_score`` across topologies.
     ard_per_atom
         If true, adds per-atom ARD row-block regularization on the latent
         coordinate block to select active intrinsic coordinates.
@@ -1206,14 +1211,16 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # and therefore the REML Occam / joint-log-det terms that enter
     # `reml_score` — is invariant under reparameterizing the latent coordinate
     # t. Topology comparison (e.g. circle vs euclidean) is thus well posed
-    # NOTE(#795): isometry defaults to 0.0 (off) — the MeanProfiled isometry
-    # energy is not scale-invariant (scales as decoder^4), exploding to ~1e13
-    # during the joint solve and saturating the arrow-Schur ridge at 1e15
-    # (RemlConvergenceError). Re-enable once the residual is scale-normalized.
-    # regardless of `isometry_weight`. `IsometryPenalty` (on by default) is now
-    # purely a complementary regularizer that drives g -> I for an
-    # interpretable near-arc-length chart; turning it off no longer makes
-    # `reml_score` gauge-dependent, so there is nothing to warn about.
+    # regardless of `isometry_weight`. `IsometryPenalty` is purely a
+    # complementary regularizer that drives g -> I for an interpretable
+    # near-arc-length chart; turning it off does not make `reml_score`
+    # gauge-dependent, so there is nothing to warn about.
+    # NOTE(#795): isometry defaults to 0.0 (OFF). The MeanProfiled isometry
+    # energy is not scale-invariant (it scales as decoder^4), so during the
+    # joint solve it explodes (~1e13) and saturates the arrow-Schur proximal
+    # ridge at 1e15 — every trial step is rejected and the fit raises
+    # RemlConvergenceError even on the single-planted-circle quickstart.
+    # Re-enable by default once the isometry residual is scale-normalized.
     # Eager nuclear_norm_weight validation (issue #672). `0.0` is the canonical
     # "no rank penalty" baseline; reject negative / non-finite values so the
     # descriptor builder does not surface a cryptic Rust error.
