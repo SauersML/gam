@@ -16920,21 +16920,6 @@ fn smgs_deleted_required_channel_reason(
 }
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
-    /// Engage the inner self-vanishing Levenberg–Marquardt damping on a
-    /// full-rank-but-ill-conditioned penalized Hessian (#808). On clustered-PC
-    /// designs the marginal-mean and log-slope channels share the same matern PC
-    /// basis, so the coupled-joint `H_pen` is full rank (`nullity == 0`) yet
-    /// numerically ill-conditioned (cond ≈ 5.8e6); the nullity-only `μ` gate
-    /// leaves the trust-region Newton to oscillate on the near-singular mode and
-    /// burn its cycle budget (the frozen time-block stationarity residual). The
-    /// damping is self-vanishing (`μ ∝ ‖∇L − Sβ‖∞ → 0` at the fixed point) so the
-    /// converged β is the exact unconditioned solution — no bias, the log-slope
-    /// target is conditioned NOT reduced. Survival-local: binary and other
-    /// families keep the default (rank-deficiency-only) gate, byte-identical.
-    fn levenberg_on_ill_conditioning(&self) -> bool {
-        true
-    }
-
     fn persistent_warm_start_fingerprint(
         &self,
         specs: &[ParameterBlockSpec],

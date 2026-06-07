@@ -2851,28 +2851,6 @@ pub trait CustomFamily {
         true
     }
 
-    /// Whether the coupled-joint inner Newton should engage its self-vanishing
-    /// Levenberg–Marquardt damping `μ` on a FULL-RANK-but-ILL-CONDITIONED
-    /// penalized Hessian (cond > `COND_NEWTON_SAFETY`), not only on a
-    /// rank-deficient one (`nullity > 0`).
-    ///
-    /// Default `false`: families whose inner Hessian is either well-conditioned
-    /// or genuinely rank-deficient (the cases the `nullity > 0` gate already
-    /// handles) are byte-identical. A family overrides this to `true` when it
-    /// has a full-rank-but-numerically-ill-conditioned inner regime that makes
-    /// the undamped range-restricted Newton step oscillate without ever reaching
-    /// tol — the survival marginal-slope clustered-PC case (#808: the marginal
-    /// and log-slope channels share a matern PC basis, so `H_pen` is full rank
-    /// but cond ≈ 5.8e6, `nullity == 0`). The `μ` engaged here is the SAME
-    /// self-vanishing damping (`μ ∝ ‖∇L − Sβ‖∞ → 0` at the KKT fixed point), so
-    /// it shapes only the convergence trajectory, not the fixed point — the
-    /// converged β is the exact unconditioned solution (zero bias; the log-slope
-    /// target is preserved, NOT reduced away). Survival-local by trait override
-    /// so binary / other families are untouched.
-    fn levenberg_on_ill_conditioning(&self) -> bool {
-        false
-    }
-
     /// Internal helper: do the outer-REML `_with_specs` defaults trust the
     /// inner-fit's block-diagonal-from-blocks output for this family?
     ///
@@ -12754,7 +12732,6 @@ fn solve_joint_newton_step_on_spectral_range(
     rank_tol: f64,
     null_tol: f64,
     levenberg_mu: f64,
-    engage_ill_conditioned_levenberg: bool,
 ) -> Result<JointSpectralNewtonStep, String> {
     let p = h_pen.nrows();
     if h_pen.ncols() != p || rhs.len() != p {
@@ -12912,18 +12889,18 @@ fn solve_joint_newton_step_on_spectral_range(
     // so it needs the same self-vanishing damping, but the nullity-only gate
     // leaves `μ = 0` and the solve burns its cycle budget at a frozen residual.
     //
-    // When the caller opts in (`engage_ill_conditioned_levenberg`, set ONLY on
-    // the survival marginal-slope inner path so binary / other families are
-    // byte-identical), also engage μ when the range spectrum is numerically
-    // ill-conditioned for Newton (cond > COND_NEWTON_SAFETY), via a cheap pre-pass
-    // over the already-computed `evals` for the smallest positive (above-null)
-    // curvature. This is SOUND and SELF-VANISHING: μ ∝ ‖∇L − Sβ‖∞ → 0 at the KKT
-    // fixed point, so the damping shapes only the TRAJECTORY (oscillation →
-    // bounded descent), NOT the fixed point — the converged β is the EXACT
-    // unconditioned solution, zero bias, the log-slope target fully intact. And
-    // it does NOT throttle genuinely well-conditioned fits (the doc's concern)
-    // because those have cond ≪ COND_NEWTON_SAFETY so the clause stays off.
-    let ill_conditioned_for_newton = if engage_ill_conditioned_levenberg {
+    // So also engage μ when the range spectrum is numerically ill-conditioned for
+    // Newton (cond > COND_NEWTON_SAFETY), via a cheap pre-pass over the already-
+    // computed `evals` for the smallest positive (above-null) curvature. This is
+    // SOUND and SELF-VANISHING: μ ∝ ‖∇L − Sβ‖∞ → 0 at the KKT fixed point, so the
+    // damping shapes only the TRAJECTORY (oscillation → bounded descent), NOT the
+    // fixed point — the converged β is the EXACT unconditioned solution, zero
+    // bias. It is BINARY-SAFE / no-op where μ is already on: a near-separating
+    // rank-deficient fit (binary c12) has nullity > 0 → μ already engaged → the
+    // cond clause adds nothing; and it does NOT throttle genuinely well-
+    // conditioned fits (the doc's concern) because those have cond ≪
+    // COND_NEWTON_SAFETY so the clause stays off.
+    let ill_conditioned_for_newton = {
         let mut lmax = 0.0_f64;
         let mut lmin = f64::INFINITY;
         for &lambda in evals.iter() {
@@ -12943,8 +12920,6 @@ fn solve_joint_newton_step_on_spectral_range(
             0.0
         };
         range_cond > COND_NEWTON_SAFETY
-    } else {
-        false
     };
     let effective_mu = if spectral_nullity > 0 || ill_conditioned_for_newton {
         levenberg_mu.max(0.0)
@@ -15073,7 +15048,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             KKT_REFUSAL_RANK_TOL,
                             residual_tol_for_solve,
                             spectral_levenberg_mu,
-                            family.levenberg_on_ill_conditioning(),
                         )?;
                         spectral_nullity_for_step = spectral_step.nullity;
                         if spectral_step.reflected_negative_modes > 0 {
@@ -32532,9 +32506,8 @@ mod tests {
     fn spectral_joint_newton_step_uses_pseudoinverse_when_null_gradient_is_zero() {
         let h = array![[4.0, 0.0], [0.0, 0.0]];
         let rhs = array![8.0, 0.0];
-        let step =
-            solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
-                .expect("range-only RHS should have a minimum-norm Newton step");
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
+            .expect("range-only RHS should have a minimum-norm Newton step");
 
         assert_relative_eq!(step.delta[0], 2.0, epsilon = 1.0e-12);
         assert_relative_eq!(step.delta[1], 0.0, epsilon = 1.0e-12);
@@ -32560,9 +32533,8 @@ mod tests {
         // trust region then globalizes.
         let h = array![[4.0, 0.0], [0.0, -1.0]];
         let rhs = array![8.0, 3.0];
-        let step =
-            solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
-                .expect("indefinite model must yield a modified-Newton step, not an error");
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
+            .expect("indefinite model must yield a modified-Newton step, not an error");
 
         // Exactly one negative-curvature mode was reflected.
         assert_eq!(step.reflected_negative_modes, 1);
@@ -32597,9 +32569,8 @@ mod tests {
         // residual so the caller's identified-subspace KKT certificate can fire.
         let h = array![[4.0, 0.0], [0.0, 0.0]];
         let rhs = array![8.0, 0.25];
-        let step =
-            solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
-                .expect("nonzero null RHS must range-project, not error");
+        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0)
+            .expect("nonzero null RHS must range-project, not error");
 
         // Identified direction [1,0] (λ=4): 8/4 = 2. Null direction [0,1] (λ=0):
         // dropped, so the step leaves coordinate 1 unchanged at 0.
