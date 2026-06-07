@@ -1,6 +1,5 @@
 use crate::custom_family::{
-    BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix, fit_custom_family,
-    fit_custom_family_with_rho_prior,
+    BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix, fit_custom_family_with_rho_prior,
 };
 use crate::estimate::{
     AdaptiveRegularizationOptions, EstimationError, FitOptions, FittedLinkState, UnifiedFitResult,
@@ -2260,12 +2259,8 @@ fn fit_cause_specific_survival_transformation_custom(
     };
     let rho_prior =
         cause_specific_survival_rho_prior(penalty_blocks.len(), penalty_block_gamma_priors)?;
-    let mut fit = if matches!(rho_prior, crate::types::RhoPrior::Flat) {
-        fit_custom_family(&family, &block_specs, &fit_options)
-    } else {
-        fit_custom_family_with_rho_prior(&family, &block_specs, &fit_options, rho_prior)
-    }
-    .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
+    let mut fit = fit_custom_family_with_rho_prior(&family, &block_specs, &fit_options, rho_prior)
+        .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
     fit.likelihood_family = Some(LikelihoodSpec::royston_parmar());
     let time_basis = crate::families::survival_construction::SavedSurvivalTimeBasis::from_build(
         &spec.time_build,
