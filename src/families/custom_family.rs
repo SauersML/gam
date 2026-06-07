@@ -1407,10 +1407,19 @@ impl ExactOuterDerivativeOrder {
 /// the outer optimizer should see the exact second-order objective. Runtime
 /// representation choices (dense vs operator) belong below this declaration,
 /// not in a first-order downgrade.
+/// Precondition check for the family capability / operator hooks (e.g.
+/// `batched_outer_hessian_terms`, `outer_hyper_hessian_operator`).
+///
+/// These hooks operate on whatever block geometry the caller has assembled and
+/// must validate the *consistency* of the specs they are handed — never the
+/// fit-level "at least one block" precondition, which belongs to the fit entry
+/// points (`validate_blockspecs`). An empty, self-consistent argument set is a
+/// valid no-op probe of the operator path (the operator may ignore the specs
+/// entirely), so it must not panic here.
 fn assert_valid_blockspecs(specs: &[ParameterBlockSpec], context: &str) {
     assert!(
-        validate_blockspecs(specs).is_ok(),
-        "{context}: invalid parameter block specs"
+        validate_blockspec_consistency(specs).is_ok(),
+        "{context}: inconsistent parameter block specs"
     );
 }
 
@@ -7986,12 +7995,32 @@ impl From<CustomFamilyError> for String {
 }
 
 pub(crate) fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
+    // `fit_custom_family` is a fit entry point and genuinely requires at least
+    // one parameter block — an empty model has nothing to estimate. This is a
+    // *fit-level precondition*, distinct from the *consistency* of the block
+    // specs themselves, which is checked by `validate_blockspec_consistency`.
     if specs.is_empty() {
         return Err(CustomFamilyError::UnsupportedConfiguration {
             reason: "fit_custom_family requires at least one parameter block".to_string(),
         }
         .into());
     }
+    validate_blockspec_consistency(specs)
+}
+
+/// Validate the *internal consistency* of a slice of parameter block specs
+/// (unique names; design/offset/initial_beta/penalty dimensions agree) without
+/// imposing the fit-level "at least one block" precondition.
+///
+/// An empty slice is vacuously consistent and returns an empty penalty-count
+/// vector. The non-empty fit precondition lives in [`validate_blockspecs`];
+/// pure operator-materialization hooks (e.g. `batched_outer_hessian_terms`)
+/// must use this consistency check instead, so they can be probed with an
+/// empty, self-consistent argument set without tripping a fit precondition
+/// that does not apply to them.
+pub(crate) fn validate_blockspec_consistency(
+    specs: &[ParameterBlockSpec],
+) -> Result<Vec<usize>, String> {
     let mut seen_names = BTreeMap::<String, usize>::new();
     for (b, spec) in specs.iter().enumerate() {
         if let Some(prev) = seen_names.insert(spec.name.clone(), b) {
@@ -12836,7 +12865,37 @@ fn solve_joint_newton_step_on_spectral_range(
         ));
     }
 
+    // Two distinct thresholds on the eigenvalue magnitude:
+    //
+    //   * `cutoff = rank_tol · λ_max` is the caller's relative near-singularity
+    //     tol. Directions at or below it are "small curvature" — historically
+    //     they were *dropped* as null.
+    //   * `numerical_floor = λ_max · √p · f64::EPSILON` is the genuine numerical
+    //     rank floor: a curvature below it is indistinguishable from zero given
+    //     the matrix's own working precision.
+    //
+    // The two coincide when the spectrum has moderate dynamic range, but they
+    // diverge by many orders of magnitude at the oversmoothed-ρ operating point
+    // of a coupled location-scale inner solve (#826): there `λ_max` is dominated
+    // by the huge `S_λ` eigenvalues (`λ ~ exp(2·EXACT_JOINT_RHO_BOUND)`), so the
+    // RELATIVE `cutoff = 1e-10·λ_max` rises into the regime of the GENUINE
+    // likelihood curvature of the penalty-null (trend/mean) directions. Dropping
+    // those as null is the bug: they are identified by the data (curvature > 0),
+    // their Newton component is finite, and silently zeroing it freezes the
+    // block's stationarity residual at the unpenalized gradient while β stays at
+    // 0 — the "non-descent / frozen residual" stall the issue describes.
+    //
+    // Fix: only directions below the TRUE numerical floor are dropped as null.
+    // Directions in the band `(numerical_floor, cutoff]` carry small-but-real
+    // curvature; they are solved (range branch below) with the self-vanishing LM
+    // damping `effective_mu` that already caps the `component/λ` step on the
+    // near-singular modes the relative `cutoff` was meant to tame. Because μ ∝
+    // ‖∇L − Sβ‖∞ → 0 at the KKT fixed point, the converged β and the
+    // well-identified fast path are unchanged; far from the optimum the band is
+    // a bounded descent step instead of a discarded gradient component.
     let cutoff = rank_tol * lambda_max_abs;
+    let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
+    let null_cutoff = cutoff.min(numerical_floor);
     let mut delta = Array1::<f64>::zeros(p);
     let mut range_rhs_inf = 0.0_f64;
     let mut null_rhs_inf = 0.0_f64;
@@ -12911,7 +12970,11 @@ fn solve_joint_newton_step_on_spectral_range(
         let lambda = evals[k];
         let u_k = evecs.column(k);
         let component = u_k.iter().zip(rhs.iter()).map(|(u, r)| u * r).sum::<f64>();
-        if !lambda.is_finite() || lambda.abs() <= cutoff {
+        // Drop ONLY directions at the true numerical floor (genuine rank
+        // deficiency). Directions in the small-but-real band
+        // `(numerical_floor, cutoff]` are identified and solved below with the
+        // self-vanishing LM damping — see the threshold derivation above (#826).
+        if !lambda.is_finite() || lambda.abs() <= null_cutoff {
             nullity += 1;
             null_rhs_inf = null_rhs_inf.max(component.abs());
             continue;
@@ -31638,6 +31701,9 @@ mod tests {
         let step_tol = 1.0e-6;
         let residual_tol = 2.707e-2;
 
+        // Inside the certification band (`residual <= 4x residual_tol`, the
+        // documented gam#797 conditioning/round-off allowance) a fully
+        // stationary iterate is accepted.
         assert_eq!(
             constrained_stationary_certificate_decision(
                 &math,
@@ -31657,7 +31723,25 @@ mod tests {
                 objective_tol,
                 step_tol,
                 None,
+                // Still within 4x: a residual a hair above 1x must remain
+                // accepted, because the active-projected residual genuinely
+                // floors just above the scale-relative tolerance.
                 residual_tol + 1.0e-12,
+                residual_tol,
+            ),
+            ConstrainedStationaryCertificate::Accept,
+        );
+        // Beyond the 4x band the residual is too large to be a mere
+        // conditioning floor: the certificate must refuse the phantom
+        // multiplier rather than fake convergence.
+        assert_eq!(
+            constrained_stationary_certificate_decision(
+                &math,
+                objective_change,
+                objective_tol,
+                step_tol,
+                None,
+                4.0 * residual_tol + 1.0e-6,
                 residual_tol,
             ),
             ConstrainedStationaryCertificate::RefusePhantomMultiplier,
