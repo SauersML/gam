@@ -62,8 +62,8 @@
 
 use crate::families::custom_family::{
     AdditiveBlockJacobian, BlockWorkingSet, CustomFamily, ExactNewtonJointGradientEvaluation,
-    ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
-    PenaltyMatrix,
+    ExactNewtonJointHessianWorkspace, FamilyEvaluation, JointHessianSourcePreference,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
 use crate::families::gamlss::{FamilyMetadata, ParameterLink};
 use crate::families::vector_response::{
@@ -326,6 +326,21 @@ impl MultinomialFamily {
         self.active_classes() * self.design.ncols()
     }
 
+    fn specs_match_workspace_shape(&self, specs: &[ParameterBlockSpec]) -> bool {
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        specs.len() == self.active_classes()
+            && specs.iter().all(|spec| {
+                spec.design.nrows() == n
+                    && spec.design.ncols() == p
+                    && spec.offset.len() == n
+                    && spec.stacked_design.is_none()
+                    && spec.stacked_offset.is_none()
+                    && spec.initial_log_lambdas.len() == self.penalties.len()
+                    && spec.penalties.len() == self.penalties.len()
+            })
+    }
+
     /// Reshape the K-1 per-block `ParameterBlockState.eta` slices into the
     /// `(N, M)` matrix the likelihood expects. Validates lengths.
     fn collect_eta_matrix(
@@ -460,6 +475,57 @@ impl MultinomialFamily {
             }
         }
         out
+    }
+
+    /// Joint log-likelihood and stacked gradient evaluated from cached softmax
+    /// probabilities, without re-collecting η or re-running the row kernels.
+    ///
+    /// `probs_full` is the `(N, K)` softmax matrix at the workspace's frozen β.
+    /// The weighted multinomial log-likelihood is `Σ_n w_n Σ_k y_{n,k} log p_{n,k}`
+    /// and the gradient of `log L` wrt the active blocks is
+    /// `∂log L/∂β_a = X^T (w ⊙ (y − p))_a`, laid out output-major to match
+    /// [`Self::assemble_joint_hessian`]. Reused by the frozen-β workspace so the
+    /// inner joint-Newton gradient load and line-search log-likelihood reads
+    /// share the same cached probabilities as the matrix-free `H·v` contraction.
+    fn joint_loglik_and_gradient_from_probs(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+    ) -> (f64, Array1<f64>) {
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let k = self.total_classes;
+        let design_view = self.design.view();
+        let mut log_lik = 0.0_f64;
+        for row in 0..n {
+            let w = self.weights[row];
+            if w == 0.0 {
+                continue;
+            }
+            for c in 0..k {
+                let y = self.y_one_hot[[row, c]];
+                if y != 0.0 {
+                    // Mirror `MultinomialLogitLikelihood::log_lik`: clamp the
+                    // probability away from zero by 1e-300 to guard log(0) on
+                    // underflow (the residual still drives the gradient).
+                    let pc = probs_full[[row, c]].max(1.0e-300);
+                    log_lik += w * y * pc.ln();
+                }
+            }
+        }
+        let mut grad = Array1::<f64>::zeros(m * p);
+        for a in 0..m {
+            for i in 0..p {
+                let mut acc = 0.0_f64;
+                for row in 0..n {
+                    let resid =
+                        self.weights[row] * (self.y_one_hot[[row, a]] - probs_full[[row, a]]);
+                    acc += design_view[[row, i]] * resid;
+                }
+                grad[a * p + i] = acc;
+            }
+        }
+        (log_lik, grad)
     }
 
     /// Apply a coefficient-space direction `d_β` to the design to obtain
@@ -783,6 +849,39 @@ impl CustomFamily for MultinomialFamily {
         true
     }
 
+    fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        // The softmax joint curvature `H = block(X^T W(β) X)` with the rank-M
+        // per-row Fisher block `W_{n,a,b} = w_n (δ_ab p_a − p_a p_b)` admits an
+        // exact matrix-free `H·v` contraction in `O(N·(K−1)·P)` via
+        // [`MultinomialHessianWorkspace::hessian_matvec_into`] (issue #347,
+        // bit-identical to the dense path per #846). Advertising it routes the
+        // inner joint-Newton through the operator/PCG source instead of
+        // assembling and factorizing the dense `(K−1)P × (K−1)P` Hessian on
+        // EVERY inner cycle of EVERY outer trial. Without this flag
+        // `joint_workspace_requested` is false, so a smooth-by-factor model
+        // (`D=8`, `(K−1)P ≈ 80`) — below `use_joint_matrix_free_path`'s 512 /
+        // 128@50k / 4M-linear-work thresholds — silently fell to the dense
+        // inner build, the O(bad) cost behind #714's 329s fit and #722's
+        // grind. The family already wires the full operator workspace
+        // (matvec + diagonal + directional derivatives); this flag is the
+        // missing declaration that makes the engine use it.
+        self.specs_match_workspace_shape(specs)
+    }
+
+    fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        // The frozen-β workspace also serves the joint log-likelihood gradient
+        // `∂log L/∂β_a = X^T(y − p)_a` from the SAME cached softmax
+        // probabilities, so the inner gradient load reuses the workspace
+        // instead of re-collecting η and recomputing the row kernels.
+        self.specs_match_workspace_shape(specs)
+    }
+
+    fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        // Line-search accept/reject reads the trial log-likelihood straight
+        // from the workspace's cached probabilities — no separate `evaluate`.
+        self.specs_match_workspace_shape(specs)
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // Every row contributes a rank-M outer product across the joint
         // (Σ p_b)² = (M · P)² space — the canonical joint-coupled cost.
@@ -901,6 +1000,35 @@ struct MultinomialHessianWorkspace {
 impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         self.family.exact_newton_joint_hessian(&self.block_states)
+    }
+
+    fn hessian_source_preference(&self) -> JointHessianSourcePreference {
+        // The dense joint Hessian is `(K−1)P × (K−1)P` and the per-row Fisher
+        // block is rank-M with a closed-form `H·v` contraction, so the
+        // operator/PCG source is strictly cheaper than assembling and
+        // factorizing the dense matrix every inner cycle. Prefer it so the
+        // workspace-routed inner Newton never materializes the dense Hessian
+        // (#714 / #722 inner cost).
+        JointHessianSourcePreference::Operator
+    }
+
+    fn joint_log_likelihood_evaluation(&self) -> Result<Option<f64>, String> {
+        let (log_lik, _) = self
+            .family
+            .joint_loglik_and_gradient_from_probs(self.probs.view());
+        Ok(Some(log_lik))
+    }
+
+    fn joint_gradient_evaluation(
+        &self,
+    ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
+        let (log_likelihood, gradient) = self
+            .family
+            .joint_loglik_and_gradient_from_probs(self.probs.view());
+        Ok(Some(ExactNewtonJointGradientEvaluation {
+            log_likelihood,
+            gradient,
+        }))
     }
 
     fn hessian_matvec_available(&self) -> bool {
@@ -1451,6 +1579,72 @@ mod tests {
         assert!(
             max_abs <= 1.0e-10 * scale + 1.0e-13,
             "zero-weight matvec deviates from dense by {max_abs} (scale {scale})"
+        );
+    }
+
+    #[test]
+    fn workspace_gradient_and_loglik_match_family_evaluation_and_prefer_operator() {
+        // The frozen-β workspace must serve the joint log-likelihood and the
+        // stacked −logL gradient from its cached probabilities, bit-consistent
+        // with the family's `exact_newton_joint_gradient_evaluation`, and it
+        // must declare the Operator source preference so the inner joint-Newton
+        // routes through the matrix-free H·v contraction instead of assembling
+        // and factorizing the dense (K−1)P×(K−1)P Hessian every cycle
+        // (#714 / #722 inner cost).
+        let n = 11;
+        let p = 4;
+        let k = 3;
+        let family = family_with_weights(n, p, k, Array1::<f64>::ones(n));
+        let m = family.active_classes();
+        let states = states_at_betas(&family, &sample_betas(m, p, 0.9));
+        let specs = family.build_block_specs();
+
+        let family_eval = family
+            .exact_newton_joint_gradient_evaluation(&states, &specs)
+            .expect("family joint gradient eval")
+            .expect("family joint gradient present");
+
+        let ws = family
+            .exact_newton_joint_hessian_workspace(&states, &specs)
+            .expect("workspace build")
+            .expect("workspace present");
+
+        assert_eq!(
+            ws.hessian_source_preference(),
+            JointHessianSourcePreference::Operator,
+            "multinomial workspace must prefer the operator (matrix-free) source"
+        );
+
+        let ws_loglik = ws
+            .joint_log_likelihood_evaluation()
+            .expect("workspace loglik")
+            .expect("workspace loglik present");
+        assert!(
+            (ws_loglik - family_eval.log_likelihood).abs()
+                <= 1e-12 * (1.0 + family_eval.log_likelihood.abs()),
+            "workspace loglik {ws_loglik} != family loglik {}",
+            family_eval.log_likelihood
+        );
+
+        let ws_grad_eval = ws
+            .joint_gradient_evaluation()
+            .expect("workspace gradient eval")
+            .expect("workspace gradient present");
+        assert!(
+            (ws_grad_eval.log_likelihood - family_eval.log_likelihood).abs()
+                <= 1e-12 * (1.0 + family_eval.log_likelihood.abs()),
+            "workspace gradient-eval loglik mismatch"
+        );
+        assert_eq!(ws_grad_eval.gradient.len(), family_eval.gradient.len());
+        let mut max_abs = 0.0_f64;
+        let mut scale = 1.0e-300_f64;
+        for idx in 0..family_eval.gradient.len() {
+            max_abs = max_abs.max((ws_grad_eval.gradient[idx] - family_eval.gradient[idx]).abs());
+            scale = scale.max(family_eval.gradient[idx].abs());
+        }
+        assert!(
+            max_abs <= 1e-10 * scale + 1e-13,
+            "workspace gradient deviates from family gradient by {max_abs} (scale {scale})"
         );
     }
 
