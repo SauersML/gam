@@ -18674,6 +18674,22 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     problem
 }
 
+/// True iff a κ-phase (`n-block exact-joint spatial`) optimizer failure is a
+/// NUMERICAL pathology of the length-scale search that the fixed-κ fallback can
+/// recover from (gam#787/#860), rather than a structural failure that must
+/// propagate.
+///
+/// By the time the κ optimizer runs, the structural identifiability audits have
+/// already passed upstream, so an all-seeds-rejected / rho-dimension-mismatch
+/// here means a κ-driven design-rebuild penalty-topology flip starved the
+/// startup validation — recoverable by fitting at the bootstrap κ. Any other
+/// optimizer error (a genuine solver contract violation) still propagates.
+fn kappa_phase_failure_is_fixed_kappa_recoverable(message: &str) -> bool {
+    message.contains("no candidate seeds passed outer startup validation")
+        || message.contains("joint hyper rho dimension mismatch")
+        || message.contains("objective returned a non-finite cost")
+}
+
 pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEfsFn, SeedFn>(
     data: ArrayView2<'_, f64>,
     block_specs: &[TermCollectionSpec],
@@ -19213,9 +19229,60 @@ where
             },
         );
 
-        problem
-            .run(&mut obj, "n-block exact-joint spatial")
-            .map_err(|e| e.to_string())?
+        match problem.run(&mut obj, "n-block exact-joint spatial") {
+            Ok(result) => result,
+            Err(e) => {
+                let message = e.to_string();
+                // Kappa-phase graceful degradation (gam#787/#860). The
+                // length-scale (κ) optimizer rebuilds the spatial design at each
+                // trial κ; a κ-driven matern penalty-topology flip (the
+                // FrozenTransform spectral-tolerance crossing in
+                // `build_nullspace_shrinkage_penalty`) can make the rebuilt
+                // design's learned-penalty count disagree with the frozen
+                // joint-setup ρ dimension, so EVERY κ seed fails startup
+                // validation ("joint hyper rho dimension mismatch" → all seeds
+                // rejected → "no candidate seeds passed outer startup
+                // validation"). That is a NUMERICAL pathology of the κ search on
+                // a structurally-well-posed design (the structural audits already
+                // passed upstream) — NOT a reason to fail the whole fit. Fall
+                // back to a FIXED κ (the bootstrap length-scale, skipping κ
+                // optimization): build + freeze the joint designs at the initial
+                // κ and fit there. We lose κ tuning but return a REAL, valid
+                // model — graceful degradation, exactly mirroring the
+                // `kappa_options.enabled == false` fixed-κ path above. Only the
+                // startup-validation / mismatch class is caught; any other κ
+                // optimizer error still propagates.
+                if kappa_phase_failure_is_fixed_kappa_recoverable(&message) {
+                    drop(obj);
+                    log::warn!(
+                        "[KAPPA-PHASE] length-scale optimization could not validate any seed \
+                         ({message}); falling back to a FIXED bootstrap κ (skipping κ \
+                         optimization) and fitting there — a real model at the initial \
+                         length-scale rather than raising (gam#787/#860)."
+                    );
+                    let (designs, resolved_specs) =
+                        build_term_collection_designs_and_freeze_joint(data, block_specs).map_err(
+                            |build_err| {
+                                format!(
+                                    "fixed-κ fallback failed to build and freeze joint block \
+                                     designs after κ optimization could not validate a seed \
+                                     ({message}): {build_err}"
+                                )
+                            },
+                        )?;
+                    let fixed_theta0 = joint_setup.theta0();
+                    let spec_refs: Vec<TermCollectionSpec> = resolved_specs.clone();
+                    let design_refs: Vec<TermCollectionDesign> = designs.clone();
+                    let fit = fit_fn(&fixed_theta0, &spec_refs, &design_refs)?;
+                    return Ok(SpatialLengthScaleOptimizationResult {
+                        resolved_specs,
+                        designs,
+                        fit,
+                    });
+                }
+                return Err(message);
+            }
+        }
     }; // obj dropped here, releasing mutable borrow on state
 
     // ── κ-optimization scaling summary ──
