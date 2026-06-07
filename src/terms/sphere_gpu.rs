@@ -24,7 +24,6 @@ use crate::gpu::error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuResultExt;
 use crate::gpu::{GpuDecision, GpuKernel, decide};
-use crate::gpu_err;
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
