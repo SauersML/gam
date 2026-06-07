@@ -1869,6 +1869,7 @@ mod sphere_gpu_tests {
     /// fitted-value delta ≤ 1e-9. `#[ignore = "requires CUDA"]` so the
     /// V100 bench runner unignores in their harness.
     #[test]
+    #[ignore = "requires CUDA runtime; V100 bench harness unignores"]
     fn sphere_gpu_end_to_end_fit_parity_vs_cpu_truncated() {
         use crate::basis::{
             select_spherical_farthest_point_centers, sphere_area_weights,
