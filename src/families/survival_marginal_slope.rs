@@ -16900,6 +16900,25 @@ fn time_wiggle_basis_ncols(knots: &Array1<f64>, degree: usize) -> Result<usize, 
     Ok(monotone_wiggle_basis_with_derivative_order(h0.view(), knots, degree, 0)?.ncols())
 }
 
+fn smgs_deleted_required_channel_reason(
+    p_time: usize,
+    p_marginal: usize,
+    p_logslope: usize,
+    w_time: usize,
+    w_marginal: usize,
+    w_logslope: usize,
+) -> Option<&'static str> {
+    if p_time > 0 && w_time == 0 {
+        Some("time")
+    } else if p_marginal > 0 && w_marginal == 0 {
+        Some("marginal")
+    } else if p_logslope > 0 && w_logslope == 0 {
+        Some("logslope")
+    } else {
+        None
+    }
+}
+
 impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn persistent_warm_start_fingerprint(
         &self,
@@ -21383,32 +21402,33 @@ pub fn fit_survival_marginal_slope_terms(
                     let w_time = map.compiled_block_ranges[0].len();
                     let w_marg = map.compiled_block_ranges[1].len();
                     let w_log = map.compiled_block_ranges[2].len();
-                    // #808 DISABLED: do NOT apply the rawstack reduction. It is a
-                    // REGRESSION on this path — on clustered-PC designs marginal
-                    // and logslope share the matern basis, so this [Time, Marginal,
-                    // Logslope] cross-block carry zeroes the entire logslope block
-                    // (logslope {p_log}→{w_log}=0), which deletes the log-slope
-                    // channel the marginal-slope model exists to estimate and makes
-                    // the inner solve DIVERGE (objective → −∞, NaN residual). The
-                    // raw-column marginal↔logslope collinearity is NOT a true model
-                    // unidentifiability (the full η-Jacobian is rank-complete:
-                    // marginal enters η via q1·c(g), logslope via the slope channel
-                    // — distinguishable; the η₁-Jacobian probe measured rank
-                    // 26/26). The inner stall is a CONDITIONING problem (H_pen =
-                    // JᵀWJ + S is full-rank but ill-conditioned, cond≈5.8e6 /
-                    // near-null at the g≈0 pilot), to be fixed by an inner Jeffreys/
-                    // ridge conditioning of the near-null direction (the same cure
-                    // as the bernoulli #787 inner), NOT by a rank reduction. Until
-                    // that lands, fall through to the unreduced design (the benign
-                    // time-block stall) — never apply this block-killing reduction.
-                    // The compile + DIAG above are kept for observability of what
-                    // the (disabled) reduction WOULD do.
-                    log::info!(
-                        "[smgs phase-4b compiled-map] rawstack reduction DISABLED (#808 regression): \
-                         would have applied time {p_time}→{w_time}, marginal {p_marg}→{w_marg}, \
-                         logslope {p_log}→{w_log}; falling through to the unreduced design instead",
-                    );
-                    Ok(None)
+                    // #808 root guard: rawstack reduction is only a valid
+                    // identifiability cleanup when it preserves the physical
+                    // model channels. Clustered-PC SMGS can make the raw
+                    // marginal/logslope columns identical even though the full
+                    // nonlinear η-Jacobian still distinguishes them. Applying
+                    // the map in that case zeroes the entire lower-priority
+                    // logslope block and deletes the model's slope channel,
+                    // turning a conditioning problem into a misspecified fit.
+                    //
+                    // Keep non-destructive partial reductions: they remove
+                    // redundant raw coordinates while retaining at least one
+                    // degree of freedom in each required channel. Reject only
+                    // maps that collapse a required channel to zero width.
+                    if let Some(channel) = smgs_deleted_required_channel_reason(
+                        p_time, p_marg, p_log, w_time, w_marg, w_log,
+                    ) {
+                        log::warn!(
+                            "[smgs phase-4b compiled-map] rejected destructive rawstack reduction \
+                             for #808: channel {channel} would be deleted \
+                             (time {p_time}→{w_time}, marginal {p_marg}→{w_marg}, \
+                             logslope {p_log}→{w_log}); using the unreduced design and \
+                             leaving the near-null direction to Jeffreys conditioning",
+                        );
+                        Ok(None)
+                    } else {
+                        Ok(Some((map, (w_time, w_marg, w_log))))
+                    }
                 })();
                     match closed_form {
                         Ok(Some((map, (wt, wm, wl)))) => {
@@ -22834,6 +22854,25 @@ mod tests {
                 "expected 'length mismatch' in error, got: {msg}",
             ),
         }
+    }
+
+    #[test]
+    fn smgs_rawstack_reduction_rejects_required_channel_deletion() {
+        assert_eq!(
+            super::smgs_deleted_required_channel_reason(12, 7, 7, 12, 7, 0),
+            Some("logslope"),
+            "the #808 clustered-PC rawstack map must not delete the log-slope channel"
+        );
+        assert_eq!(
+            super::smgs_deleted_required_channel_reason(12, 7, 7, 12, 6, 7),
+            None,
+            "partial reductions that preserve all physical channels remain valid"
+        );
+        assert_eq!(
+            super::smgs_deleted_required_channel_reason(12, 7, 7, 0, 7, 7),
+            Some("time"),
+            "the baseline/time channel is also required"
+        );
     }
 
     fn empty_termspec() -> TermCollectionSpec {
