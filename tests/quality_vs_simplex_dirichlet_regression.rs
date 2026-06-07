@@ -131,6 +131,27 @@ fn tetragamma(mut x: f64) -> f64 {
             + inv2 * inv2 * inv2 * (1.0 / 6.0 + inv2 * (-1.0 / 6.0 + inv2 * 0.3)))
 }
 
+/// Pentagamma ψ'''(x) = d/dx ψ''(x), x > 0. Derivative of the `tetragamma`
+/// approximation above, with the matching recurrence ψ'''(x) = ψ'''(x+1) + 6/x⁴.
+/// Needed for the exact second β-directional derivative of the Dirichlet joint
+/// Hessian (the `ψ''(α_a)` / `ψ'(α₀)` curvature weights differentiate to ψ''').
+fn pentagamma(mut x: f64) -> f64 {
+    let mut value = 0.0;
+    while x < 6.0 {
+        value += 6.0 / (x * x * x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    // ψ'''(x) = d/dx ψ''(x); differentiate the tetragamma asymptotic tail
+    //   ψ''(x) ≈ −1/x² − 1/x³ − 1/(2x⁴) + 1/(6x⁶) − 1/(6x⁸) + 3/(10x¹⁰)
+    // term-by-term: ψ'''(x) ≈ 2/x³ + 3/x⁴ + 2/x⁵ − 1/x⁷ + 4/(3x⁹) − 3/x¹¹.
+    let inv3 = inv2 * inv;
+    value + 2.0 * inv3 + 3.0 * inv2 * inv2 + 2.0 * inv2 * inv3 - inv3 * inv2 * inv2
+        + (4.0 / 3.0) * inv3 * inv3 * inv3
+        - 3.0 * inv3 * inv3 * inv3 * inv2
+}
+
 /// True smooth log-α surfaces η_k(x), k = 0..K-1, in the Dirichlet common
 /// parameterization. Distinct shapes so the location (ALR) and concentration
 /// (Σα) both genuinely vary with x.
@@ -447,7 +468,154 @@ impl CustomFamily for DirichletCommonFamily {
                 d_beta_v_flat.len()
             ));
         }
-        Ok(None)
+        let n = self.log_y[0].len();
+        let widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
+        let mut starts = Vec::with_capacity(K);
+        let mut start = 0usize;
+        for (k, (&width, state)) in widths.iter().zip(block_states.iter()).enumerate() {
+            if state.beta.len() != width {
+                return Err(format!(
+                    "DirichletCommonFamily block {k} beta length {} != design cols {width}",
+                    state.beta.len()
+                ));
+            }
+            if state.eta.len() != n || specs[k].design.nrows() != n {
+                return Err(format!(
+                    "DirichletCommonFamily block {k} shape mismatch: eta={} design_rows={} expected {n}",
+                    state.eta.len(),
+                    specs[k].design.nrows()
+                ));
+            }
+            starts.push(start);
+            start += width;
+        }
+
+        let designs: Vec<Array2<f64>> = specs
+            .iter()
+            .map(|spec| spec.solver_design().to_dense())
+            .collect();
+
+        // Per-block η-space directions du_k = X_k·u_k, dv_k = X_k·v_k (the
+        // direction of β does not depend on β, so the second mixed derivative
+        // of α_k = exp(η_k) is α_k·du_k·dv_k).
+        let mut alpha: Vec<Array1<f64>> = Vec::with_capacity(K);
+        let mut du_alpha: Vec<Array1<f64>> = Vec::with_capacity(K); // d_u α_k = α_k du_k
+        let mut dv_alpha: Vec<Array1<f64>> = Vec::with_capacity(K); // d_v α_k = α_k dv_k
+        let mut duv_alpha: Vec<Array1<f64>> = Vec::with_capacity(K); // d_u d_v α_k = α_k du_k dv_k
+        for k in 0..K {
+            let alpha_k = block_states[k].eta.mapv(f64::exp);
+            let u_dir = d_beta_u_flat
+                .slice(ndarray::s![starts[k]..starts[k] + widths[k]])
+                .to_owned();
+            let v_dir = d_beta_v_flat
+                .slice(ndarray::s![starts[k]..starts[k] + widths[k]])
+                .to_owned();
+            let du_eta = designs[k].dot(&u_dir);
+            let dv_eta = designs[k].dot(&v_dir);
+            du_alpha.push(&alpha_k * &du_eta);
+            dv_alpha.push(&alpha_k * &dv_eta);
+            duv_alpha.push(&alpha_k * &(&du_eta * &dv_eta));
+            alpha.push(alpha_k);
+        }
+        let mut alpha0 = Array1::<f64>::zeros(n);
+        let mut du_alpha0 = Array1::<f64>::zeros(n);
+        let mut dv_alpha0 = Array1::<f64>::zeros(n);
+        let mut duv_alpha0 = Array1::<f64>::zeros(n);
+        for k in 0..K {
+            alpha0 += &alpha[k];
+            du_alpha0 += &du_alpha[k];
+            dv_alpha0 += &dv_alpha[k];
+            duv_alpha0 += &duv_alpha[k];
+        }
+
+        let mut joint = Array2::<f64>::zeros((total, total));
+        for a in 0..K {
+            for b in a..K {
+                let mut weights = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let a0 = alpha0[i];
+                    let du0 = du_alpha0[i];
+                    let dv0 = dv_alpha0[i];
+                    let duv0 = duv_alpha0[i];
+                    let trig0 = trigamma(a0);
+                    let tetr0 = tetragamma(a0);
+                    let pent0 = pentagamma(a0);
+                    weights[i] = if a == b {
+                        // w_aa = α_a²(ψ'(α_a) − ψ'(α₀)) − α_a·R_a,
+                        //   R_a = ψ(α₀) − ψ(α_a) + log_y_a.
+                        let aa = alpha[a][i];
+                        let dua = du_alpha[a][i];
+                        let dva = dv_alpha[a][i];
+                        let duva = duv_alpha[a][i];
+                        let trig_a = trigamma(aa);
+                        let tetr_a = tetragamma(aa);
+                        let pent_a = pentagamma(aa);
+
+                        // A² and its mixed second derivative.
+                        let d_uv_a2 = 2.0 * dva * dua + 2.0 * aa * duva;
+                        let du_a2 = 2.0 * aa * dua;
+                        let dv_a2 = 2.0 * aa * dva;
+                        let a2 = aa * aa;
+
+                        // G = ψ'(α_a) − ψ'(α₀).
+                        let g = trig_a - trig0;
+                        let du_g = tetr_a * dua - tetr0 * du0;
+                        let dv_g = tetr_a * dva - tetr0 * dv0;
+                        let duv_g =
+                            pent_a * dua * dva + tetr_a * duva - (pent0 * du0 * dv0 + tetr0 * duv0);
+
+                        let duv_t1 = d_uv_a2 * g + du_a2 * dv_g + dv_a2 * du_g + a2 * duv_g;
+
+                        // R = ψ(α₀) − ψ(α_a) + log_y_a (digamma value at base β).
+                        let r = digamma(a0) - digamma(aa) + self.log_y[a][i];
+                        let du_r = trig0 * du0 - trig_a * dua;
+                        let dv_r = trig0 * dv0 - trig_a * dva;
+                        let duv_r =
+                            tetr0 * du0 * dv0 + trig0 * duv0 - (tetr_a * dua * dva + trig_a * duva);
+
+                        // T2 = −α_a·R.
+                        let duv_t2 = -(duva * r + dua * dv_r + dva * du_r + aa * duv_r);
+
+                        duv_t1 + duv_t2
+                    } else {
+                        // w_ab = −α_a α_b ψ'(α₀), a ≠ b.
+                        let aa = alpha[a][i];
+                        let ab = alpha[b][i];
+                        let dua = du_alpha[a][i];
+                        let dva = dv_alpha[a][i];
+                        let duva = duv_alpha[a][i];
+                        let dub = du_alpha[b][i];
+                        let dvb = dv_alpha[b][i];
+                        let duvb = duv_alpha[b][i];
+
+                        // P = α_a α_b.
+                        let p = aa * ab;
+                        let du_p = dua * ab + aa * dub;
+                        let dv_p = dva * ab + aa * dvb;
+                        let duv_p = duva * ab + dva * dub + dua * dvb + aa * duvb;
+
+                        // Q = ψ'(α₀).
+                        let q = trig0;
+                        let du_q = tetr0 * du0;
+                        let dv_q = tetr0 * dv0;
+                        let duv_q = pent0 * du0 * dv0 + tetr0 * duv0;
+
+                        -(duv_p * q + du_p * dv_q + dv_p * du_q + p * duv_q)
+                    };
+                }
+                let weighted_xb = &designs[b] * &weights.view().insert_axis(ndarray::Axis(1));
+                let block = designs[a].t().dot(&weighted_xb);
+                let ra = starts[a]..starts[a] + widths[a];
+                let rb = starts[b]..starts[b] + widths[b];
+                joint
+                    .slice_mut(ndarray::s![ra.clone(), rb.clone()])
+                    .assign(&block);
+                if a != b {
+                    joint.slice_mut(ndarray::s![rb, ra]).assign(&block.t());
+                }
+            }
+        }
+        Ok(Some(joint))
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
