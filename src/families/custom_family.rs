@@ -25795,6 +25795,36 @@ mod tests {
     }
 
     #[test]
+    fn startup_validation_failure_routes_to_never_fail_escalation() {
+        use crate::estimate::EstimationError;
+
+        let all_seeds_rejected = EstimationError::RemlOptimizationFailed(
+            "no candidate seeds passed outer startup validation (custom family):\n  generated=4"
+                .to_string(),
+        );
+        assert!(
+            outer_startup_failure_is_escalatable(&all_seeds_rejected),
+            "post-audit all-seeds startup rejection must reach the never-fail escalation net"
+        );
+
+        let non_finite_eval = EstimationError::RemlOptimizationFailed(
+            "outer eval failed: objective returned a non-finite cost".to_string(),
+        );
+        assert!(
+            outer_startup_failure_is_escalatable(&non_finite_eval),
+            "non-finite startup evals are the same post-audit numerical pathology"
+        );
+
+        let structural_input = EstimationError::InvalidInput(
+            "zero-event survival marginal-slope input remains structurally invalid".to_string(),
+        );
+        assert!(
+            !outer_startup_failure_is_escalatable(&structural_input),
+            "structural input errors must not be converted into sampled fits"
+        );
+    }
+
+    #[test]
     fn joint_penalty_subspace_trace_matches_projected_logdet_derivative() {
         let ranges = vec![(0, 3)];
         let s_lambda = array![[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 0.0]];
