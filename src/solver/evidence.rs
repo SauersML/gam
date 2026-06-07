@@ -175,6 +175,199 @@ pub enum TopologyScoreScale {
     PerEffectiveDim,
 }
 
+/// Convergence controls for stacking retained topology predictive densities.
+#[derive(Debug, Clone, Copy)]
+pub struct StackingConfig {
+    pub max_iter: usize,
+    pub weight_tol: f64,
+}
+
+impl Default for StackingConfig {
+    fn default() -> Self {
+        Self {
+            max_iter: 1000,
+            weight_tol: 1e-10,
+        }
+    }
+}
+
+/// Simplex weights for retained topology candidates plus the achieved held-out
+/// mean log-score.
+#[derive(Debug, Clone)]
+pub struct StackingWeights {
+    pub weights: Array1<f64>,
+    pub mean_log_score: f64,
+    pub iterations: usize,
+}
+
+/// Solve the stacking-of-predictive-distributions weight problem from a
+/// per-observation held-out log-density table `log_density[i, k] = log p_k(y_i)`.
+///
+/// This belongs on the evidence surface rather than in a separate solver: it is
+/// the topology/evidence consumer that replaces winner-take-all only when the
+/// caller has retained candidate fits and per-point held-out densities.
+pub fn solve_stacking_weights(
+    log_density: ArrayView2<'_, f64>,
+    config: StackingConfig,
+) -> Result<StackingWeights, String> {
+    let n_obs = log_density.nrows();
+    let n_cand = log_density.ncols();
+    if n_cand == 0 {
+        return Err("stacking requires at least one candidate column".to_string());
+    }
+    if n_obs == 0 {
+        return Err("stacking requires at least one held-out observation row".to_string());
+    }
+
+    let kept_cols: Vec<usize> = (0..n_cand)
+        .filter(|&k| (0..n_obs).any(|i| log_density[[i, k]].is_finite()))
+        .collect();
+    if kept_cols.is_empty() {
+        return Err("stacking found no candidate with any finite held-out density".to_string());
+    }
+    let rows: Vec<usize> = (0..n_obs)
+        .filter(|&i| kept_cols.iter().any(|&k| log_density[[i, k]].is_finite()))
+        .collect();
+    if rows.is_empty() {
+        return Err("stacking found no held-out row with a finite density".to_string());
+    }
+
+    let kept = kept_cols.len();
+    let mut weights = Array1::<f64>::from_elem(kept, 1.0 / kept as f64);
+    let mut next = Array1::<f64>::zeros(kept);
+    let mut iterations = 0usize;
+    for _ in 0..config.max_iter {
+        iterations += 1;
+        next.fill(0.0);
+        let mut active_rows = 0usize;
+        for &row in &rows {
+            let mut row_max = f64::NEG_INFINITY;
+            for (local_col, &source_col) in kept_cols.iter().enumerate() {
+                let log_p = log_density[[row, source_col]];
+                if log_p.is_finite() && weights[local_col] > 0.0 {
+                    row_max = row_max.max(weights[local_col].ln() + log_p);
+                }
+            }
+            if !row_max.is_finite() {
+                continue;
+            }
+            let mut denom = 0.0_f64;
+            for (local_col, &source_col) in kept_cols.iter().enumerate() {
+                let log_p = log_density[[row, source_col]];
+                if log_p.is_finite() && weights[local_col] > 0.0 {
+                    denom += (weights[local_col].ln() + log_p - row_max).exp();
+                }
+            }
+            if denom <= 0.0 {
+                continue;
+            }
+            active_rows += 1;
+            let log_mix = row_max + denom.ln();
+            for (local_col, &source_col) in kept_cols.iter().enumerate() {
+                let log_p = log_density[[row, source_col]];
+                if log_p.is_finite() && weights[local_col] > 0.0 {
+                    next[local_col] += (weights[local_col].ln() + log_p - log_mix).exp();
+                }
+            }
+        }
+        if active_rows == 0 {
+            break;
+        }
+        next.mapv_inplace(|value| value / active_rows as f64);
+        let total = next.sum();
+        if total > 0.0 {
+            next.mapv_inplace(|value| value / total);
+        }
+        let delta = next
+            .iter()
+            .zip(weights.iter())
+            .fold(0.0_f64, |acc, (a, b)| acc.max((a - b).abs()));
+        weights.assign(&next);
+        if delta <= config.weight_tol {
+            break;
+        }
+    }
+
+    let mean_log_score = stacking_mean_log_score(log_density, &rows, &kept_cols, weights.view());
+    let mut full = Array1::<f64>::zeros(n_cand);
+    for (local_col, &source_col) in kept_cols.iter().enumerate() {
+        full[source_col] = weights[local_col];
+    }
+    Ok(StackingWeights {
+        weights: full,
+        mean_log_score,
+        iterations,
+    })
+}
+
+fn stacking_mean_log_score(
+    log_density: ArrayView2<'_, f64>,
+    rows: &[usize],
+    kept_cols: &[usize],
+    weights: ArrayView1<'_, f64>,
+) -> f64 {
+    let mut score_sum = 0.0_f64;
+    let mut counted = 0usize;
+    for &row in rows {
+        let mut row_max = f64::NEG_INFINITY;
+        for (local_col, &source_col) in kept_cols.iter().enumerate() {
+            let log_p = log_density[[row, source_col]];
+            if log_p.is_finite() && weights[local_col] > 0.0 {
+                row_max = row_max.max(weights[local_col].ln() + log_p);
+            }
+        }
+        if !row_max.is_finite() {
+            continue;
+        }
+        let mut denom = 0.0_f64;
+        for (local_col, &source_col) in kept_cols.iter().enumerate() {
+            let log_p = log_density[[row, source_col]];
+            if log_p.is_finite() && weights[local_col] > 0.0 {
+                denom += (weights[local_col].ln() + log_p - row_max).exp();
+            }
+        }
+        if denom > 0.0 {
+            score_sum += row_max + denom.ln();
+            counted += 1;
+        }
+    }
+    if counted == 0 {
+        f64::NEG_INFINITY
+    } else {
+        score_sum / counted as f64
+    }
+}
+
+/// Combine retained candidate response-scale means with stacking weights.
+pub fn stacked_predictive_mean(
+    weights: &Array1<f64>,
+    candidate_means: &[Array1<f64>],
+) -> Result<Array1<f64>, String> {
+    if candidate_means.len() != weights.len() {
+        return Err(format!(
+            "stacked_predictive_mean: {} weights but {} candidate mean vectors",
+            weights.len(),
+            candidate_means.len()
+        ));
+    }
+    let Some(first) = candidate_means.first() else {
+        return Err("stacked_predictive_mean requires at least one candidate".to_string());
+    };
+    let n_rows = first.len();
+    if candidate_means.iter().any(|means| means.len() != n_rows) {
+        return Err(
+            "stacked_predictive_mean: candidate mean vectors disagree on row count".to_string(),
+        );
+    }
+    let mut out = Array1::<f64>::zeros(n_rows);
+    for (weight, means) in weights.iter().zip(candidate_means) {
+        if *weight != 0.0 {
+            out.scaled_add(*weight, means);
+        }
+    }
+    Ok(out)
+}
+
 impl Default for TopologySelectOptions {
     fn default() -> Self {
         Self {

@@ -2,8 +2,7 @@
 
 These exercise the Python-side held-out density-table assembly, the binding
 contract, and the stacked-mean combination with stubbed candidate fits and a
-stubbed Rust binding, so they run without the compiled extension. The stacking
-weight math itself is covered by the Rust unit tests in solver::stacking.
+stubbed Rust binding, so they run without the compiled extension.
 """
 
 import json

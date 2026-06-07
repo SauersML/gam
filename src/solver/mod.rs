@@ -22,7 +22,6 @@ pub mod riemannian_retraction;
 pub mod row_measure;
 pub mod seeding;
 pub mod sindy;
-pub mod stacking;
 pub(crate) mod startup_stats;
 pub mod topology_formula;
 pub mod topology_selector;

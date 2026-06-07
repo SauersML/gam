@@ -5074,7 +5074,8 @@ fn stacking_weights_from_log_density(
 ) -> PyResult<String> {
     if names.is_empty() {
         return Err(py_value_error(
-            "stacking_weights_from_log_density: at least one candidate name is required".to_string(),
+            "stacking_weights_from_log_density: at least one candidate name is required"
+                .to_string(),
         ));
     }
     let n_cand = names.len();
@@ -5096,9 +5097,9 @@ fn stacking_weights_from_log_density(
             table[[i, k]] = value;
         }
     }
-    let solved = gam::solver::stacking::solve_stacking_weights(
+    let solved = gam::solver::evidence::solve_stacking_weights(
         table.view(),
-        gam::solver::stacking::StackingConfig::default(),
+        gam::solver::evidence::StackingConfig::default(),
     )
     .map_err(py_value_error)?;
     let weights_by_name: serde_json::Map<String, serde_json::Value> = names
