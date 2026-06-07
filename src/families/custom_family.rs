@@ -12552,12 +12552,6 @@ fn joint_inner_kkt_converged(residual: f64, residual_tol: f64) -> bool {
     residual.is_finite() && residual_tol.is_finite() && residual <= residual_tol
 }
 
-fn generic_kkt_refusal_guidance() -> &'static str {
-    "check whether the named block has an unpenalized or weakly identified direction \
-     (penalty null space, marginal/logslope coupling, or callback-owned geometry), \
-     or whether a constrained fit has an incomplete active set"
-}
-
 /// Per-iterate diagnostic snapshot assembled when the joint Newton inner solve
 /// refuses to certify constrained-stationarity. The report breaks the failure
 /// down by block (so the offending smooth can be named), records the H_pen
@@ -12701,6 +12695,18 @@ const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
 /// it never perturbs a healthy quadratic Newton step) while still dominating the
 /// near-zero curvatures that drive the degenerate-design oscillation.
 const JOINT_SPECTRAL_LEVENBERG_FACTOR: f64 = 1.0e-3;
+
+/// Condition number above which the range-restricted spectral Newton step is
+/// numerically unsafe (the small-curvature modes oscillate under the trust
+/// region) and the self-vanishing Levenberg–Marquardt damping `μ` must engage
+/// even on a FULL-RANK Hessian (`nullity == 0`). Set well above the conditioning
+/// of any healthy quadratic-Newton fit (whose range spectrum is comfortably
+/// `O(1e2)`–`O(1e4)`) so the damping never perturbs a well-conditioned solve,
+/// but below the `~5.8e6` cond of the #808 clustered-PC survival marginal-slope
+/// inner that this gate exists to stabilise. Because `μ ∝ ‖∇L − Sβ‖∞ → 0` at the
+/// fixed point, engaging it here changes the convergence PATH (oscillation →
+/// bounded descent) but not the converged β / KKT certificate.
+const COND_NEWTON_SAFETY: f64 = 1.0e5;
 
 #[derive(Clone, Debug)]
 struct JointSpectralNewtonStep {
@@ -12871,7 +12877,48 @@ fn solve_joint_newton_step_on_spectral_range(
         .iter()
         .filter(|v| !v.is_finite() || v.abs() <= cutoff)
         .count();
-    let effective_mu = if spectral_nullity > 0 {
+    // The `nullity > 0` gate above (which engages the self-vanishing μ) was too
+    // narrow: it assumes `nullity == 0 ⇒ well-conditioned ⇒ exact Newton
+    // converges quadratically`. That misses the FULL-RANK-but-ILL-CONDITIONED
+    // regime (#808: the clustered-PC survival marginal-slope inner has
+    // `λ_min ≈ 17`, `λ_max ≈ 4.5e8`, cond ≈ 5.8e6, nullity == 0 because every
+    // mode is above the rank cutoff). That spectrum is EXACTLY the first regime
+    // the μ doc above describes — a tiny-but-above-cutoff curvature whose
+    // undamped `component/λ` step makes the trust-region Newton oscillate and
+    // never settle — so it needs the same self-vanishing damping, but the
+    // nullity-only gate leaves `μ = 0` and the solve burns its cycle budget at a
+    // frozen residual. Extend the gate to also fire when the range spectrum is
+    // numerically ill-conditioned for Newton (cond > COND_NEWTON_SAFETY), via a
+    // cheap pre-pass over the already-computed `evals` for the smallest positive
+    // (above-null) curvature. This is SOUND and self-limiting: μ ∝ ‖∇L − Sβ‖∞ →
+    // 0 at the KKT fixed point, so the converged β / certificate are unchanged
+    // (no bias to the log-slope target on the survival path); and it does NOT
+    // throttle genuinely well-conditioned fits (the doc's concern) because those
+    // have cond ≪ COND_NEWTON_SAFETY so the clause stays off. It is a no-op for
+    // the near-separating rank-deficient fits the original gate already caught
+    // (nullity > 0 ⇒ μ already engaged ⇒ the cond clause adds nothing).
+    let range_cond = {
+        let mut lmax = 0.0_f64;
+        let mut lmin = f64::INFINITY;
+        for &lambda in evals.iter() {
+            if !lambda.is_finite() {
+                continue;
+            }
+            let a = lambda.abs();
+            if a <= null_cutoff {
+                continue;
+            }
+            lmax = lmax.max(a);
+            lmin = lmin.min(a);
+        }
+        if lmin.is_finite() && lmin > 0.0 && lmax > 0.0 {
+            lmax / lmin
+        } else {
+            0.0
+        }
+    };
+    let ill_conditioned_for_newton = range_cond > COND_NEWTON_SAFETY;
+    let effective_mu = if spectral_nullity > 0 || ill_conditioned_for_newton {
         levenberg_mu.max(0.0)
     } else {
         0.0
@@ -16986,34 +17033,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let block_diag = last_kkt_refusal_report
                         .as_ref()
                         .map(KktRefusalReport::format_bubbled_error)
-                        .or_else(|| {
-                            last_joint_math.as_ref().map(|math| {
-                                compute_kkt_refusal_report(
-                                    cycles_done,
-                                    &states,
-                                    specs,
-                                    &s_lambdas,
-                                    &ranges,
-                                    cached_joint_gradient.as_ref(),
-                                    &cached_active_sets,
-                                    &block_constraints,
-                                    &joint_hessian_source,
-                                    total_p,
-                                    ridge,
-                                    options.ridge_policy,
-                                    math.step_inf,
-                                    math.proposal_inf,
-                                    joint_trust_radius,
-                                    residual_tol,
-                                    objective_tol,
-                                    step_tol,
-                                    math.actual_reduction.abs(),
-                                    exit_unprojected_kkt_inf,
-                                    math,
-                                )
-                                .format_bubbled_error()
-                            })
-                        })
                         .unwrap_or_else(|| {
                             "structured KKT refusal report unavailable: no joint Newton math snapshot"
                                 .to_string()
@@ -17079,34 +17098,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let block_diag = last_kkt_refusal_report
                 .as_ref()
                 .map(KktRefusalReport::format_bubbled_error)
-                .or_else(|| {
-                    last_joint_math.as_ref().map(|math| {
-                        compute_kkt_refusal_report(
-                            cycles_done,
-                            &states,
-                            specs,
-                            &s_lambdas,
-                            &ranges,
-                            cached_joint_gradient.as_ref(),
-                            &cached_active_sets,
-                            &block_constraints,
-                            &joint_hessian_source,
-                            total_p,
-                            ridge,
-                            options.ridge_policy,
-                            math.step_inf,
-                            math.proposal_inf,
-                            joint_trust_radius,
-                            residual_tol,
-                            objective_tol,
-                            step_tol,
-                            math.actual_reduction.abs(),
-                            math.old_kkt_inf,
-                            math,
-                        )
-                        .format_bubbled_error()
-                    })
-                })
                 .unwrap_or_else(|| {
                     "structured KKT refusal report unavailable: no joint Newton math snapshot"
                         .to_string()
