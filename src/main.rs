@@ -3887,7 +3887,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         ));
     }
     progress.set_stage("diagnose", "loading diagnostic dataset");
-    let ds = load_datasetwith_model_schema(&args.data, &model)?;
+    let ds = load_datasetwith_model_schema_extra(&args.data, &model, &[parsed.response.clone()])?;
     require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
