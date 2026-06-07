@@ -29,9 +29,8 @@ gamfit.fit(df, "y ~ s(x)", family="poisson", link="log")  # explicit
 
 The `family=` kwarg accepts `"gaussian"`, `"binomial"` (aliases
 `"binomial-logit"`, `"binomial-probit"`, `"binomial-cloglog"`),
-`"latent-cloglog-binomial"`, `"poisson"`, `"negative-binomial"`
-(aliases `"nb"`, `"negbin"`), `"beta"` (alias `"beta-regression"`),
-and `"gamma"`. Omitting
+`"latent-cloglog-binomial"`, `"poisson"`, `"negative-binomial"`,
+`"beta"`, and `"gamma"`. Omitting
 `family=` triggers auto-detection. Survival, transformation-normal,
 and Bernoulli marginal-slope families are selected via `Surv(...)` or
 dedicated fit options (Python: `transformation_normal=True`,
