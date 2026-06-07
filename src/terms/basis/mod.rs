@@ -30,6 +30,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod polylog;
 mod sphere_spectral;
 
 /// Wrapper to send a raw pointer across thread boundaries for parallel buffer fills.
@@ -2194,6 +2195,7 @@ pub use sphere_spectral::{
     pseudo_s2_truncated_coefficients, sobolev_s2_truncated_coefficients,
     sphere_truncated_spectral_eval,
 };
+pub(crate) use polylog::{dilog_unit, trilog_unit};
 pub(crate) use sphere_spectral::sphere_truncated_spectral_derivative_eval;
 
 /// Intrinsic S² (sphere) smooth configuration.
@@ -14957,54 +14959,6 @@ fn validate_lat_lon_matrix(
     Ok(())
 }
 
-/// True Wahba / Sobolev spectral reproducing kernel on S² for general m.
-///
-/// Direct power series with early exit. For `z ∈ [0, 0.5]` ~50 terms
-/// reach 1e-15; for `z ∈ (0.5, 1)` we raise the cap to 5000, which gives
-/// > 13 digits even at `z = 0.999`. The standard Landen identity
-/// > `Li_3(z) + Li_3(1−z) + Li_3(z/(z−1)) = ζ(3) + ...`
-/// > is *not* useful in `(0, 1)` because `z/(z−1) ∈ (−∞, 0)` lies outside
-/// > the radius of convergence for the direct series at `Li_3(z/(z−1))`.
-/// > A previous attempt at a Landen-shifted identity (using `−(1−z)/z`
-/// > instead of `z/(z−1)`) was numerically incorrect — direct verification
-/// > against high-term direct series showed errors of order 1 at
-/// > `z = 0.7..0.9`. The plain direct-series approach below has been
-/// > validated against tabulated `Li_3(1/2) = 7ζ(3)/8 − π²/12·ln 2 +
-/// ln³ 2 / 6 ≈ 0.5372131936` to 15 digits, and against scipy's
-/// > `spence`-based Li₃ on a sweep of `z ∈ {0.1, ..., 0.99}` to ≤ 1e-13.
-/// > Dilogarithm `Li_2(z) = Σ_{k≥1} z^k / k²` for `z ∈ [0, 1]`.
-#[inline]
-fn dilog_unit(z: f64) -> f64 {
-    if !z.is_finite() {
-        return f64::NAN;
-    }
-    let z = z.clamp(0.0, 1.0);
-    if z == 0.0 {
-        return 0.0;
-    }
-    if z >= 1.0 {
-        return std::f64::consts::PI * std::f64::consts::PI / 6.0;
-    }
-    if z <= 0.5 {
-        let mut sum = 0.0_f64;
-        let mut zk = z;
-        for k in 1..=200 {
-            let kf = k as f64;
-            let term = zk / (kf * kf);
-            sum += term;
-            if term < 1e-18 {
-                break;
-            }
-            zk *= z;
-        }
-        sum
-    } else {
-        let one_minus_z = 1.0 - z;
-        let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
-        pi2_6 - z.ln() * one_minus_z.ln() - dilog_unit(one_minus_z)
-    }
-}
-
 /// Pseudo-spline Wahba kernel on S² (mgcv `makeR`-style closed form).
 #[inline]
 fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
@@ -15115,34 +15069,6 @@ fn wahba_sphere_kernel_pseudo_derivative_dcos(cos_gamma: f64, m: usize) -> f64 {
     };
     // dw/d(cos γ) = −1/2.
     dk_dw * (-0.5)
-}
-
-#[inline]
-fn trilog_unit(z: f64) -> f64 {
-    const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
-    if !z.is_finite() {
-        return f64::NAN;
-    }
-    let z = z.clamp(0.0, 1.0);
-    if z == 0.0 {
-        return 0.0;
-    }
-    if z >= 1.0 {
-        return ZETA3;
-    }
-    let max_terms: usize = if z <= 0.5 { 200 } else { 5000 };
-    let mut sum = 0.0_f64;
-    let mut zk = z;
-    for k in 1..=max_terms {
-        let kf = k as f64;
-        let term = zk / (kf * kf * kf);
-        sum += term;
-        if term < 1e-18 {
-            break;
-        }
-        zk *= z;
-    }
-    sum
 }
 
 // ============================================================================
