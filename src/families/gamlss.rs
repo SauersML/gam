@@ -1902,6 +1902,172 @@ fn append_binomial_log_sigma_shrinkage_penalty_design(design: &mut TermCollectio
     });
 }
 
+/// Build the (mean, log-σ) parameter-block pair for a Gaussian location-scale
+/// family. Shared verbatim by the non-wiggle and wiggle Gaussian builders so the
+/// scale-block construction — prepared log-σ design, the REML-selected full-span
+/// shrinkage penalty on the scale nullspace, and the joint Gaussian warm start —
+/// lives in exactly one place. Callers supply the per-block log-λ vectors sliced
+/// from their own layout (two-block vs with-wiggle) and append any extra blocks.
+#[allow(clippy::too_many_arguments)]
+fn build_gaussian_mean_and_scale_blocks(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    mean_design: &TermCollectionDesign,
+    noise_design: &TermCollectionDesign,
+    mean_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+    mean_log_lambdas: Array1<f64>,
+    noise_log_lambdas: Array1<f64>,
+    mean_beta_hint: Option<Array1<f64>>,
+    noise_beta_hint: Option<Array1<f64>>,
+    context: &str,
+) -> Result<(ParameterBlockSpec, ParameterBlockSpec), String> {
+    let mut meanspec = build_location_scale_block(
+        "mu",
+        mean_design.design.clone(),
+        mean_offset.clone(),
+        mean_design.penalties_as_penalty_matrix(),
+        mean_design.nullspace_dims.clone(),
+        mean_log_lambdas,
+        mean_beta_hint,
+        0,
+        LOCATION_SCALE_N_OUTPUTS,
+        &format!("{context}: mu"),
+    )?;
+    let prepared_noise_design =
+        prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
+    let p_noise = prepared_noise_design.ncols();
+    let mut log_sigma_penalty_matrices = noise_design.penalties_as_penalty_matrix();
+    log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
+    let mut log_sigma_nullspace_dims = noise_design.nullspace_dims.clone();
+    // Identity penalty penalizes the full log-sigma space -> nullspace 0.
+    log_sigma_nullspace_dims.push(0);
+    let mut noisespec = build_location_scale_block(
+        "log_sigma",
+        prepared_noise_design,
+        noise_offset.clone(),
+        log_sigma_penalty_matrices,
+        log_sigma_nullspace_dims,
+        noise_log_lambdas,
+        noise_beta_hint,
+        1,
+        LOCATION_SCALE_N_OUTPUTS,
+        &format!("{context}: log_sigma"),
+    )?;
+    if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
+        let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
+            y,
+            weights,
+            &meanspec,
+            &noisespec,
+            1e-10,
+            meanspec.initial_beta.as_ref(),
+            noisespec.initial_beta.as_ref(),
+        )?;
+        if meanspec.initial_beta.is_none() {
+            meanspec.initial_beta = Some(betamu0);
+        }
+        if noisespec.initial_beta.is_none() {
+            noisespec.initial_beta = Some(beta_ls0);
+        }
+    }
+    Ok((meanspec, noisespec))
+}
+
+/// Build the (threshold, log-σ) parameter-block pair for a Binomial
+/// location-scale family. Shared by the non-wiggle and wiggle Binomial builders;
+/// mirrors [`build_gaussian_mean_and_scale_blocks`] but with the binomial-
+/// identified log-σ design, the link-aware joint warm start, and the same
+/// REML-selected full-span scale shrinkage penalty.
+#[allow(clippy::too_many_arguments)]
+fn build_binomial_threshold_and_scale_blocks(
+    y: &Array1<f64>,
+    weights: &Array1<f64>,
+    link_kind: &InverseLink,
+    mean_design: &TermCollectionDesign,
+    noise_design: &TermCollectionDesign,
+    mean_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+    mean_log_lambdas: Array1<f64>,
+    noise_log_lambdas: Array1<f64>,
+    mean_beta_hint: Option<Array1<f64>>,
+    noise_beta_hint: Option<Array1<f64>>,
+    context: &str,
+) -> Result<(ParameterBlockSpec, ParameterBlockSpec), String> {
+    let identifiednoise_design =
+        identified_binomial_log_sigma_design(mean_design, noise_design, weights)?;
+    let p_noise = identifiednoise_design.ncols();
+    let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
+        noise_design.penalties_as_penalty_matrix();
+    log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
+    let mut thresholdspec = build_location_scale_block(
+        "threshold",
+        mean_design.design.clone(),
+        mean_offset.clone(),
+        mean_design.penalties_as_penalty_matrix(),
+        vec![],
+        mean_log_lambdas,
+        mean_beta_hint,
+        0,
+        LOCATION_SCALE_N_OUTPUTS,
+        &format!("{context}: threshold"),
+    )?;
+    let mut log_sigmaspec = build_location_scale_block(
+        "log_sigma",
+        identifiednoise_design,
+        noise_offset.clone(),
+        log_sigma_penalty_matrices,
+        vec![],
+        noise_log_lambdas,
+        noise_beta_hint,
+        1,
+        LOCATION_SCALE_N_OUTPUTS,
+        &format!("{context}: log_sigma"),
+    )?;
+    if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
+        let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
+            y,
+            weights,
+            link_kind,
+            &thresholdspec,
+            &log_sigmaspec,
+            thresholdspec.initial_beta.as_ref(),
+            log_sigmaspec.initial_beta.as_ref(),
+        )?;
+        if thresholdspec.initial_beta.is_none() {
+            thresholdspec.initial_beta = Some(beta_t0);
+        }
+        if log_sigmaspec.initial_beta.is_none() {
+            log_sigmaspec.initial_beta = Some(beta_ls0);
+        }
+    }
+    Ok((thresholdspec, log_sigmaspec))
+}
+
+/// Convert a wiggle block's `PenaltySpec`s into the `PenaltyMatrix` list the
+/// location-scale wiggle block expects. Shared by the Gaussian and Binomial
+/// wiggle builders, which previously inlined the identical match.
+fn wiggle_block_penalty_matrices(wiggle_block: &ParameterBlockInput) -> Vec<PenaltyMatrix> {
+    let p_wiggle = wiggle_block.design.ncols();
+    wiggle_block
+        .penalties
+        .iter()
+        .map(|spec| match spec {
+            crate::solver::estimate::PenaltySpec::Block {
+                local, col_range, ..
+            } => PenaltyMatrix::Blockwise {
+                local: local.clone(),
+                col_range: col_range.clone(),
+                total_dim: p_wiggle,
+            },
+            crate::solver::estimate::PenaltySpec::Dense(m)
+            | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                PenaltyMatrix::Dense(m.clone())
+            }
+        })
+        .collect()
+}
+
 fn binomial_location_scale_link_eta_from_probability(
     link_kind: &InverseLink,
     probability: f64,
@@ -2990,57 +3156,19 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             self.noise_penalty_count(noise_design),
         );
         layout.validate_theta_len(theta.len(), "gaussian location-scale")?;
-        let mean_log_lambdas = layout.mean_from(theta);
-        let noise_log_lambdas = layout.noise_from(theta);
-        let mut meanspec = build_location_scale_block(
-            "mu",
-            mean_design.design.clone(),
-            self.mean_offset.clone(),
-            mean_design.penalties_as_penalty_matrix(),
-            mean_design.nullspace_dims.clone(),
-            mean_log_lambdas,
+        let (meanspec, noisespec) = build_gaussian_mean_and_scale_blocks(
+            &self.y,
+            &self.weights,
+            mean_design,
+            noise_design,
+            &self.mean_offset,
+            &self.noise_offset,
+            layout.mean_from(theta),
+            layout.noise_from(theta),
             mean_beta_hint,
-            0,
-            LOCATION_SCALE_N_OUTPUTS,
-            "GaussianLocationScale::build_blocks: mu",
-        )?;
-        let prepared_noise_design =
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
-        let p_noise = prepared_noise_design.ncols();
-        let mut log_sigma_penalty_matrices = noise_design.penalties_as_penalty_matrix();
-        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
-        let mut log_sigma_nullspace_dims = noise_design.nullspace_dims.clone();
-        // Identity penalty penalizes the full log-sigma space -> nullspace 0.
-        log_sigma_nullspace_dims.push(0);
-        let mut noisespec = build_location_scale_block(
-            "log_sigma",
-            prepared_noise_design,
-            self.noise_offset.clone(),
-            log_sigma_penalty_matrices,
-            log_sigma_nullspace_dims,
-            noise_log_lambdas,
             noise_beta_hint,
-            1,
-            LOCATION_SCALE_N_OUTPUTS,
-            "GaussianLocationScale::build_blocks: log_sigma",
+            "GaussianLocationScale::build_blocks",
         )?;
-        if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
-            let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
-                &self.y,
-                &self.weights,
-                &meanspec,
-                &noisespec,
-                1e-10,
-                meanspec.initial_beta.as_ref(),
-                noisespec.initial_beta.as_ref(),
-            )?;
-            if meanspec.initial_beta.is_none() {
-                meanspec.initial_beta = Some(betamu0);
-            }
-            if noisespec.initial_beta.is_none() {
-                noisespec.initial_beta = Some(beta_ls0);
-            }
-        }
         Ok(vec![meanspec, noisespec])
     }
 
@@ -3158,78 +3286,25 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "gaussian location-scale wiggle")?;
-        let mut meanspec = build_location_scale_block(
-            "mu",
-            mean_design.design.clone(),
-            self.mean_offset.clone(),
-            mean_design.penalties_as_penalty_matrix(),
-            vec![],
+        let (meanspec, noisespec) = build_gaussian_mean_and_scale_blocks(
+            &self.y,
+            &self.weights,
+            mean_design,
+            noise_design,
+            &self.mean_offset,
+            &self.noise_offset,
             layout.mean_from(theta),
-            mean_beta_hint,
-            0,
-            LOCATION_SCALE_N_OUTPUTS,
-            "GaussianLocationScaleWiggle::build_blocks: mu",
-        )?;
-        let prepared_noise_design =
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
-        let p_noise = prepared_noise_design.ncols();
-        let mut log_sigma_penalty_matrices = noise_design.penalties_as_penalty_matrix();
-        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
-        let mut noisespec = build_location_scale_block(
-            "log_sigma",
-            prepared_noise_design,
-            self.noise_offset.clone(),
-            log_sigma_penalty_matrices,
-            vec![],
             layout.noise_from(theta),
+            mean_beta_hint,
             noise_beta_hint,
-            1,
-            LOCATION_SCALE_N_OUTPUTS,
-            "GaussianLocationScaleWiggle::build_blocks: log_sigma",
+            "GaussianLocationScaleWiggle::build_blocks",
         )?;
-        if meanspec.initial_beta.is_none() || noisespec.initial_beta.is_none() {
-            let (betamu0, beta_ls0, _) = gaussian_location_scalewarm_start(
-                &self.y,
-                &self.weights,
-                &meanspec,
-                &noisespec,
-                1e-10,
-                meanspec.initial_beta.as_ref(),
-                noisespec.initial_beta.as_ref(),
-            )?;
-            if meanspec.initial_beta.is_none() {
-                meanspec.initial_beta = Some(betamu0);
-            }
-            if noisespec.initial_beta.is_none() {
-                noisespec.initial_beta = Some(beta_ls0);
-            }
-        }
         let n_rows = meanspec.design.nrows();
-        let wiggle_penalties: Vec<PenaltyMatrix> = {
-            let p_wiggle = self.wiggle_block.design.ncols();
-            self.wiggle_block
-                .penalties
-                .iter()
-                .map(|spec| match spec {
-                    crate::solver::estimate::PenaltySpec::Block {
-                        local, col_range, ..
-                    } => PenaltyMatrix::Blockwise {
-                        local: local.clone(),
-                        col_range: col_range.clone(),
-                        total_dim: p_wiggle,
-                    },
-                    crate::solver::estimate::PenaltySpec::Dense(m)
-                    | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
-                        PenaltyMatrix::Dense(m.clone())
-                    }
-                })
-                .collect()
-        };
         let wigglespec = build_location_scale_wiggle_block(
             "wiggle",
             self.wiggle_block.design.clone(),
             self.wiggle_block.offset.clone(),
-            wiggle_penalties,
+            wiggle_block_penalty_matrices(&self.wiggle_block),
             self.wiggle_block.nullspace_dims.clone(),
             layout.wiggle_from(theta),
             self.wiggle_block.initial_beta.clone(),
@@ -3345,53 +3420,20 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             self.noise_penalty_count(noise_design),
         );
         layout.validate_theta_len(theta.len(), "binomial location-scale")?;
-        let identifiednoise_design =
-            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let p_noise = identifiednoise_design.ncols();
-        let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
-            noise_design.penalties_as_penalty_matrix();
-        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
-        let mut thresholdspec = build_location_scale_block(
-            "threshold",
-            mean_design.design.clone(),
-            self.mean_offset.clone(),
-            mean_design.penalties_as_penalty_matrix(),
-            vec![],
+        let (thresholdspec, log_sigmaspec) = build_binomial_threshold_and_scale_blocks(
+            &self.y,
+            &self.weights,
+            &self.link_kind,
+            mean_design,
+            noise_design,
+            &self.mean_offset,
+            &self.noise_offset,
             layout.mean_from(theta),
-            mean_beta_hint,
-            0,
-            LOCATION_SCALE_N_OUTPUTS,
-            "BinomialLocationScale::build_blocks: threshold",
-        )?;
-        let mut log_sigmaspec = build_location_scale_block(
-            "log_sigma",
-            identifiednoise_design,
-            self.noise_offset.clone(),
-            log_sigma_penalty_matrices,
-            vec![],
             layout.noise_from(theta),
+            mean_beta_hint,
             noise_beta_hint,
-            1,
-            LOCATION_SCALE_N_OUTPUTS,
-            "BinomialLocationScale::build_blocks: log_sigma",
+            "BinomialLocationScale::build_blocks",
         )?;
-        if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
-            let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
-                &self.y,
-                &self.weights,
-                &self.link_kind,
-                &thresholdspec,
-                &log_sigmaspec,
-                thresholdspec.initial_beta.as_ref(),
-                log_sigmaspec.initial_beta.as_ref(),
-            )?;
-            if thresholdspec.initial_beta.is_none() {
-                thresholdspec.initial_beta = Some(beta_t0);
-            }
-            if log_sigmaspec.initial_beta.is_none() {
-                log_sigmaspec.initial_beta = Some(beta_ls0);
-            }
-        }
         Ok(vec![thresholdspec, log_sigmaspec])
     }
 
@@ -3504,79 +3546,26 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "wiggle location-scale")?;
-        let identifiednoise_design =
-            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)?;
-        let p_noise = identifiednoise_design.ncols();
-        let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
-            noise_design.penalties_as_penalty_matrix();
-        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
-        let mut thresholdspec = build_location_scale_block(
-            "threshold",
-            mean_design.design.clone(),
-            self.mean_offset.clone(),
-            mean_design.penalties_as_penalty_matrix(),
-            vec![],
+        let (thresholdspec, log_sigmaspec) = build_binomial_threshold_and_scale_blocks(
+            &self.y,
+            &self.weights,
+            &self.link_kind,
+            mean_design,
+            noise_design,
+            &self.mean_offset,
+            &self.noise_offset,
             layout.mean_from(theta),
-            mean_beta_hint,
-            0,
-            LOCATION_SCALE_N_OUTPUTS,
-            "BinomialLocationScaleWiggle::build_blocks: threshold",
-        )?;
-        let mut log_sigmaspec = build_location_scale_block(
-            "log_sigma",
-            identifiednoise_design,
-            self.noise_offset.clone(),
-            log_sigma_penalty_matrices,
-            vec![],
             layout.noise_from(theta),
+            mean_beta_hint,
             noise_beta_hint,
-            1,
-            LOCATION_SCALE_N_OUTPUTS,
-            "BinomialLocationScaleWiggle::build_blocks: log_sigma",
+            "BinomialLocationScaleWiggle::build_blocks",
         )?;
-        if thresholdspec.initial_beta.is_none() || log_sigmaspec.initial_beta.is_none() {
-            let (beta_t0, beta_ls0) = binomial_location_scalewarm_start(
-                &self.y,
-                &self.weights,
-                &self.link_kind,
-                &thresholdspec,
-                &log_sigmaspec,
-                thresholdspec.initial_beta.as_ref(),
-                log_sigmaspec.initial_beta.as_ref(),
-            )?;
-            if thresholdspec.initial_beta.is_none() {
-                thresholdspec.initial_beta = Some(beta_t0);
-            }
-            if log_sigmaspec.initial_beta.is_none() {
-                log_sigmaspec.initial_beta = Some(beta_ls0);
-            }
-        }
         let n_rows = thresholdspec.design.nrows();
-        let wiggle_penalties: Vec<PenaltyMatrix> = {
-            let p_wiggle = self.wiggle_block.design.ncols();
-            self.wiggle_block
-                .penalties
-                .iter()
-                .map(|spec| match spec {
-                    crate::solver::estimate::PenaltySpec::Block {
-                        local, col_range, ..
-                    } => PenaltyMatrix::Blockwise {
-                        local: local.clone(),
-                        col_range: col_range.clone(),
-                        total_dim: p_wiggle,
-                    },
-                    crate::solver::estimate::PenaltySpec::Dense(m)
-                    | crate::solver::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => {
-                        PenaltyMatrix::Dense(m.clone())
-                    }
-                })
-                .collect()
-        };
         let wigglespec = build_location_scale_wiggle_block(
             "wiggle",
             self.wiggle_block.design.clone(),
             self.wiggle_block.offset.clone(),
-            wiggle_penalties,
+            wiggle_block_penalty_matrices(&self.wiggle_block),
             vec![],
             layout.wiggle_from(theta),
             self.wiggle_block.initial_beta.clone(),
