@@ -44,7 +44,7 @@ use gam::inference::data::{
     EncodedDataset, UnseenCategoryPolicy, encode_recordswith_inferred_schema,
     encode_recordswith_schema,
 };
-use gam::inference::formula_dsl::{ParsedTerm, parse_formula, parse_surv_response};
+use gam::inference::formula_dsl::{parse_formula, parse_surv_response};
 use gam::inference::model::{
     ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
     MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedDeploymentExtension,
@@ -29348,64 +29348,22 @@ fn prediction_model_class_label(model: &FittedModel) -> String {
     }
 }
 
+/// The columns a prediction frame *must* carry for this model. Delegates to the
+/// single shared authority on the formula→columns contract
+/// (`FittedModel::prediction_required_columns`) so the CLI and PyFFI predict
+/// paths agree exactly (including a smooth's `by=` grouping column).
 fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, String> {
-    let payload = model.payload();
-    let parsed = parse_formula(payload.formula.as_str())?;
-    let mut required = BTreeSet::<String>::new();
-    add_formula_term_columns(&mut required, &parsed.terms);
-
-    if let Some((entry, exit, _event)) = parse_surv_response(parsed.response.as_str())? {
-        if let Some(entry) = entry {
-            required.insert(entry);
-        }
-        required.insert(exit);
-    } else if matches!(
-        model.predict_model_class(),
-        PredictModelClass::TransformationNormal
-    ) {
-        if let Some(response) = response_column_name(payload.formula.as_str()) {
-            required.insert(response);
-        }
-    }
-
-    if let Some(offset) = payload.offset_column.as_ref() {
-        required.insert(offset.clone());
-    }
-    if let Some(noise_offset) = payload.noise_offset_column.as_ref() {
-        required.insert(noise_offset.clone());
-    }
-    if matches!(
-        model.predict_model_class(),
-        PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
-    ) {
-        if let Some(z_column) = payload.z_column.as_ref() {
-            required.remove("z");
-            required.insert(z_column.clone());
-        }
-    }
-    if let Some(noise_formula) = payload.formula_noise.as_ref() {
-        add_auxiliary_formula_columns(&mut required, noise_formula, parsed.response.as_str())?;
-    }
-    if let Some(logslope_formula) = payload.formula_logslope.as_ref() {
-        if logslope_formula != "same-as-main" {
-            add_auxiliary_formula_columns(
-                &mut required,
-                logslope_formula,
-                parsed.response.as_str(),
-            )?;
-        }
-    }
-    Ok(required)
+    model.prediction_required_columns()
 }
 
 /// Columns a fitted model can legitimately consume from a prediction frame.
 ///
 /// This is the model's *input contract*: every variable the formula names
-/// (features, interaction margins, random-effect grouping columns), plus the
-/// offset / noise-offset / latent-`z` / survival entry-exit columns surfaced
-/// by [`required_prediction_columns`], plus the response column (needed for
-/// the conformal-calibration fold and for survival / transformation-normal
-/// label-bearing frames).
+/// (features, interaction margins, random-effect grouping columns, a smooth's
+/// `by=` column), plus the offset / noise-offset / latent-`z` / survival
+/// entry-exit columns surfaced by [`required_prediction_columns`], plus the
+/// response column (needed for the conformal-calibration fold and for survival
+/// / transformation-normal label-bearing frames).
 ///
 /// Any column *not* in this set is irrelevant to the model — a row ID, a
 /// grouping/label column carried for bookkeeping, an auxiliary measurement —
@@ -29465,51 +29423,6 @@ fn project_frame_to_model_columns(
         .map(|row| keep.iter().map(|&i| row[i].clone()).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     Ok((filtered_headers, filtered_rows))
-}
-
-fn add_auxiliary_formula_columns(
-    required: &mut BTreeSet<String>,
-    formula_or_rhs: &str,
-    response: &str,
-) -> Result<(), String> {
-    let trimmed = formula_or_rhs.trim();
-    if trimmed.is_empty() || trimmed == "1" {
-        return Ok(());
-    }
-    let formula = if trimmed.contains('~') {
-        trimmed.to_string()
-    } else {
-        format!("{response} ~ {trimmed}")
-    };
-    let parsed = parse_formula(formula.as_str())?;
-    add_formula_term_columns(required, &parsed.terms);
-    Ok(())
-}
-
-fn add_formula_term_columns(required: &mut BTreeSet<String>, terms: &[ParsedTerm]) {
-    for term in terms {
-        match term {
-            ParsedTerm::Linear { name, .. }
-            | ParsedTerm::BoundedLinear { name, .. }
-            | ParsedTerm::RandomEffect { name } => {
-                required.insert(name.clone());
-            }
-            ParsedTerm::Smooth { vars, .. } => {
-                required.extend(vars.iter().cloned());
-            }
-            ParsedTerm::Interaction { vars } => {
-                required.extend(vars.iter().cloned());
-            }
-            ParsedTerm::LinkWiggle { .. }
-            | ParsedTerm::TimeWiggle { .. }
-            | ParsedTerm::LinkConfig { .. }
-            | ParsedTerm::SurvivalConfig { .. } => {}
-            ParsedTerm::LogSlopeSurface { z_column, terms } => {
-                required.insert(z_column.clone());
-                add_formula_term_columns(required, terms);
-            }
-        }
-    }
 }
 
 fn string_records_from_rows(
