@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub mod deviation_runtime;
 pub(crate) mod exact_kernel;
+pub mod gpu;
 pub use deviation_runtime::DeviationRuntime;
 pub use deviation_runtime::ParametricAnchorBlock;
 
@@ -1097,12 +1098,10 @@ pub(crate) mod hessian_paths;
 pub(crate) mod install_flex;
 pub(crate) mod row_kernel;
 #[cfg(test)]
-mod tests_inline;
+#[path = "../../../tests/src_modules/families_bms_tests.rs"]
+mod tests;
 pub(crate) mod workspace;
 
-// ---------------------------------------------------------------------------
-// Public re-exports — preserve the original module path's public surface.
-// ---------------------------------------------------------------------------
 pub use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use gradient_paths::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,

@@ -27545,7 +27545,9 @@ mod tests {
             let observed = 2.0 * k * k * n + kp * (a - n);
             fisher - observed
         });
-        let ls_correction = x_ls.t().dot(&Array2::from_diag(&fisher_minus_observed).dot(&x_ls));
+        let ls_correction = x_ls
+            .t()
+            .dot(&Array2::from_diag(&fisher_minus_observed).dot(&x_ls));
         for a in 0..p_ls {
             for b in 0..p_ls {
                 reference[[pmu + a, pmu + b]] += ls_correction[[a, b]];

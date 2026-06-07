@@ -123,16 +123,6 @@ impl GpuDispatchPolicy {
     }
 }
 
-/// Operation discriminator used by the dispatch decision API. Mirrors
-/// `super::GpuOperation` at the policy layer.
-#[derive(Clone, Copy, Debug)]
-pub enum Operation {
-    Gemm,
-    Gemv,
-    XtDiagX,
-    XtDiagY,
-}
-
 /// Which `(response, link)` family the Stage 3.3 device-resident PIRLS loop
 /// can evaluate without going through the Level-B raw-body NVRTC path.
 ///

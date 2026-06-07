@@ -7,7 +7,7 @@ use crate::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
 use crate::estimate::{BlockRole, PredictInput};
-use crate::families::bernoulli_marginal_slope::LatentMeasureKind;
+use crate::families::bms::LatentMeasureKind;
 use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
 use crate::families::survival_predict::SurvivalPredictError;
 use crate::families::survival_predict::{

@@ -30,7 +30,7 @@ use ndarray::Array2;
 
 /// Skip the test body with a one-line message when no CUDA runtime is
 /// available. Matches the pattern used in
-/// `gam::gpu::bms_flex_row::tests::bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available`.
+/// `gam::families::bms::gpu::row::tests::bms_flex_row_kernel_matches_cpu_oracle_when_cuda_available`.
 macro_rules! skip_without_cuda {
     ($label:expr) => {{
         #[cfg(not(target_os = "linux"))]

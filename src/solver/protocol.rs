@@ -1,4 +1,4 @@
-use crate::families::bernoulli_marginal_slope::{
+use crate::families::bms::{
     DEFAULT_EMPIRICAL_LATENT_GRID_SIZE, DeviationBlockConfig, LatentMeasureSpec, LatentZCheckMode,
     LatentZNormalizationMode, LatentZPolicy,
 };

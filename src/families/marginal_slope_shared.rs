@@ -237,9 +237,9 @@ fn zero_local_span_cubic() -> LocalSpanCubic {
 pub(crate) fn build_denested_partition_cells(
     a: f64,
     b: f64,
-    score_warp: Option<&crate::families::bernoulli_marginal_slope::DeviationRuntime>,
+    score_warp: Option<&crate::families::bms::DeviationRuntime>,
     beta_h: Option<&Array1<f64>>,
-    link_dev: Option<&crate::families::bernoulli_marginal_slope::DeviationRuntime>,
+    link_dev: Option<&crate::families::bms::DeviationRuntime>,
     beta_w: Option<&Array1<f64>>,
     scale: f64,
 ) -> Result<Vec<DenestedPartitionCell>, String> {
@@ -298,9 +298,9 @@ pub(crate) fn observed_denested_cell_partials(
     z_obs: f64,
     a: f64,
     b: f64,
-    score_warp: Option<&crate::families::bernoulli_marginal_slope::DeviationRuntime>,
+    score_warp: Option<&crate::families::bms::DeviationRuntime>,
     beta_h: Option<&Array1<f64>>,
-    link_dev: Option<&crate::families::bernoulli_marginal_slope::DeviationRuntime>,
+    link_dev: Option<&crate::families::bms::DeviationRuntime>,
     beta_w: Option<&Array1<f64>>,
     scale: f64,
 ) -> Result<ObservedDenestedCellPartials, String> {

@@ -84,7 +84,7 @@
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
-use super::error::GpuError;
+use crate::gpu::error::GpuError;
 
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -816,9 +816,12 @@ impl RowKernelBackend {
         static BACKEND: OnceLock<Result<RowKernelBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
-                super::backend_probe::probe_backend_with_compile("bms_flex_row", |parts| {
-                    let row_kernel_source =
-                        [super::numerics_device::PROBIT_NUMERICS_CU, ROW_KERNEL_BODY].concat();
+                crate::gpu::backend_probe::probe_backend_with_compile("bms_flex_row", |parts| {
+                    let row_kernel_source = [
+                        crate::gpu::numerics_device::PROBIT_NUMERICS_CU,
+                        ROW_KERNEL_BODY,
+                    ]
+                    .concat();
                     let ptx = cudarc::nvrtc::compile_ptx(row_kernel_source).map_err(|err| {
                         GpuError::DriverCallFailed {
                             reason: format!("bms_flex_row NVRTC compile failed: {err}"),
@@ -1193,7 +1196,7 @@ fn num_hvp_chunks(n: usize) -> usize {
 #[cfg(target_os = "linux")]
 const HVP_KERNEL_SOURCE: &str = r#"
 // CPU parity reference: cpu_oracle_bms_flex_row_hvp / cpu_oracle_bms_flex_row_diagonal
-// in src/gpu/bms_flex_row.rs.
+// in this module.
 
 #define MAX_MULTI_RHS 8
 
@@ -1894,7 +1897,7 @@ impl HvpKernelBackend {
         static BACKEND: OnceLock<Result<HvpKernelBackend, GpuError>> = OnceLock::new();
         BACKEND
             .get_or_init(|| {
-                super::backend_probe::probe_backend_with_compile("bms_flex_row hvp", |parts| {
+                crate::gpu::backend_probe::probe_backend_with_compile("bms_flex_row hvp", |parts| {
                     let ptx = cudarc::nvrtc::compile_ptx(HVP_KERNEL_SOURCE).map_err(|err| {
                         GpuError::DriverCallFailed {
                             reason: format!("bms_flex_row hvp NVRTC compile failed: {err}"),
@@ -4806,7 +4809,7 @@ mod tests {
     }
 
     /// Block 9 Phase 6 — small-fixture parity for the dense-block kernel
-    /// against the CPU pullback in `crate::gpu::bms_flex::accumulate_row_hessian_pullback`.
+    /// against the CPU pullback in `crate::families::bms::gpu::flex::accumulate_row_hessian_pullback`.
     /// Verifies bit-equality (modulo reduction-order f.p. noise) between
     /// the device-resident dense build and the host accumulator over the
     /// same per-row Hessian + designs + P_i pullback.

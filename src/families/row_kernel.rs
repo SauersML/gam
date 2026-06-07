@@ -21,17 +21,17 @@ use crate::custom_family::{ExactNewtonJointGradientEvaluation, ExactNewtonJointH
 use crate::solver::estimate::reml::unified::{
     HyperOperator, ProjectedFactorCache, ProjectedFactorKey,
 };
-use crate::util::heartbeat::Heartbeat;
+use crate::util::loop_progress::LoopProgress;
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-/// Minimum row count that justifies a periodic heartbeat from
+/// Minimum row count that justifies periodic loop-progress logging from
 /// `build_row_kernel_cache`. Below this, the cache build finishes in
-/// well under a second on biobank-scale hardware and the heartbeat
+/// well under a second on biobank-scale hardware and the progress ticker
 /// machinery is pure noise. Above this, a silent multi-minute build is
-/// the documented failure mode the heartbeat exists to expose.
-const ROW_KERNEL_CACHE_HEARTBEAT_MIN_ROWS: usize = 100_000;
+/// the documented failure mode this logging exists to expose.
+const ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS: usize = 100_000;
 
 // ── Row selector ─────────────────────────────────────────────────────
 //
@@ -362,16 +362,16 @@ pub fn build_row_kernel_cache<const K: usize>(
         RowSet::All => n,
         RowSet::Subsample { rows: list, .. } => list.len(),
     };
-    let heartbeat =
-        (work_count >= ROW_KERNEL_CACHE_HEARTBEAT_MIN_ROWS).then(Heartbeat::default_interval);
+    let progress_ticker =
+        (work_count >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS).then(LoopProgress::default_interval);
     match rows {
         RowSet::All => {
             let evaluated: Vec<(f64, [f64; K], [[f64; K]; K])> = (0..n)
                 .into_par_iter()
                 .map(|row| {
                     let out = kern.row_kernel(row);
-                    if let Some(hb) = heartbeat.as_ref() {
-                        hb.tick(1, |progress, elapsed| {
+                    if let Some(ticker) = progress_ticker.as_ref() {
+                        ticker.tick(1, |progress, elapsed| {
                             log::info!(
                                 "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
                                 progress.min(n),
@@ -399,8 +399,8 @@ pub fn build_row_kernel_cache<const K: usize>(
                 .par_iter()
                 .map(|r| {
                     let out = kern.row_kernel(r.index).map(|out| (r.index, out));
-                    if let Some(hb) = heartbeat.as_ref() {
-                        hb.tick(1, |progress, elapsed| {
+                    if let Some(ticker) = progress_ticker.as_ref() {
+                        ticker.tick(1, |progress, elapsed| {
                             log::info!(
                                 "[STAGE] row-kernel cache (subsample) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
                                 progress.min(total),

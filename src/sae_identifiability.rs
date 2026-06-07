@@ -1,30 +1,4 @@
-//! Identifiability primitives — frontier 2026 unification.
-//!
-//! Two analytic primitives that compose with the SAE-manifold infrastructure,
-//! formalising the supervised-block plus free-discovery-block gauge-fix recipe
-//! (a small number of supervised axes alongside additional free axes that
-//! unsupervisedly align with downstream semantics):
-//!
-//! * `MechanismSparsityJacobian` — column-2-norm penalty on the decoder
-//!   Jacobian: `Σ_k ||J_dec[:, k]||_2`. For an affine decoder `x = W t + b`,
-//!   `J_dec = W` so this reduces to `Σ_k ||W[:, k]||_2`. Implements the
-//!   mechanism-sparsity-identifiability theorem of Lachapelle (2401.04890).
-//!   The penalty is smoothed by an `epsilon` to keep gradients defined at the
-//!   origin: `ψ_k(W) = √(||W[:, k]||² + ε²) − ε`.
-//!
-//! * `ConditionalPriorIvae` — auxiliary-conditional Gaussian log-prior on the
-//!   latent (Khemakhem iVAE, 2107.10098). Given per-row mean `μ_i(u_n)` and
-//!   scale `σ_i(u_n)` evaluated at auxiliaries `u_n`, evaluates
-//!   `−log p(t_n | u_n) = ½ Σ_{n,i} [ ((t_{n,i} − μ_{n,i}) / σ_{n,i})²
-//!                                    + 2 log σ_{n,i} + log 2π ]`
-//!   and returns its analytic gradient w.r.t. `t`.
-//!
-//! Both primitives are pure compute helpers — they take dense arrays and
-//! return `(value, grad)` so they can be summed into any external optimiser
-//! (PyTorch, JAX, the existing gam solver via a custom term, etc.) without
-//! plumbing through the full dispatch registry. They are intentionally
-//! standalone to keep the patch surface tight while parallel agents are
-//! editing `analytic_penalties.rs`.
+//! SAE identifiability primitives and partial-supervision gauge fixing.
 
 use crate::linalg::faer_ndarray::{FaerEigh, FaerQr, FaerSvd};
 use faer::Side;
@@ -467,10 +441,6 @@ pub fn thin_svd_scores(x: ArrayView2<f64>, k: usize) -> Result<Array2<f64>, Stri
     }
     Ok(out)
 }
-
-// ---------------------------------------------------------------------------
-// Partial-supervision gauge-fix solver
-// ---------------------------------------------------------------------------
 
 /// Method for tying the supervised block to the auxiliary signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

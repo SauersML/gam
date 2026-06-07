@@ -44,9 +44,6 @@ pub enum DataError {
     /// name, available columns, and similarity suggestions as attributes —
     /// not as a parsed-back-out substring of the human display text.
     ///
-    /// `Display` still produces the exact same string as the legacy
-    /// `missing_column_message(...)` so CLI and stringified-error consumers
-    /// see identical text.
     ColumnNotFound {
         /// The missing column name, exactly as the user wrote it.
         name: String,
@@ -122,9 +119,6 @@ impl fmt::Display for DataError {
                     Some(r) => format!("{r} column '{name}'"),
                     None => format!("column '{name}'"),
                 };
-                // Match the legacy `missing_column_message` text exactly so
-                // CLI scripts and existing log scrapers that pattern-match
-                // human prose stay byte-compatible.
                 let tsv_suffix = if *tsv_hint {
                     " — your file appears to be tab-separated; gam expects comma-separated CSV. \
          Replace tabs with commas, or pre-convert with `tr '\\t' ',' < file.tsv > file.csv`."
@@ -237,24 +231,6 @@ impl EncodedDataset {
             })
             .collect()
     }
-}
-
-/// Thin compatibility shim around `DataError::column_not_found(...)`.
-///
-/// New code should construct the typed `DataError::ColumnNotFound` variant
-/// directly so the FFI boundary can read its structured fields (column name,
-/// available headers, similarity suggestions, role label, TSV hint flag) and
-/// surface them as attributes on the Python-side `ColumnNotFoundError`
-/// exception. This stringification helper exists for the in-module
-/// multi-missing aggregator that joins several missing-column messages into
-/// one `DataError::SchemaMismatch` reason; it produces text byte-identical
-/// to the variant's `Display` implementation.
-pub fn missing_column_message(
-    col_map: &HashMap<String, usize>,
-    name: &str,
-    role: Option<&str>,
-) -> String {
-    DataError::column_not_found(col_map, name, role).to_string()
 }
 
 fn shared_prefix(a: &str, b: &str) -> usize {
@@ -384,7 +360,9 @@ fn resolve_requested_columns(
         let missing = requested_columns
             .iter()
             .filter(|name| !available_map.contains_key(name.as_str()))
-            .map(|name| missing_column_message(&available_map, name, Some("requested")))
+            .map(|name| {
+                DataError::column_not_found(&available_map, name, Some("requested")).to_string()
+            })
             .collect::<Vec<_>>();
         return Err(DataError::SchemaMismatch {
             reason: missing.join("; "),

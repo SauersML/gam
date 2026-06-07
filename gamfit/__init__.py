@@ -175,7 +175,6 @@ from . import kernels  # noqa: F401  expose gamfit.kernels.sinkhorn_barycenter, 
 from ._basis_descriptors import Fourier, PeriodicHarmonic
 from ._composite_penalty import CompositePenalty
 from ._smooth import Smooth, SmoothSum  # compositional Smooth(latent=..., basis=..., penalty=...)
-ComposedSmooth = Smooth  # explicit alias for callers preferring the descriptive name
 from ._penalty_descriptors import (
     ARDPenalty as _ARDPenaltyDescriptor,
     BlockOrthogonalityDescriptor,

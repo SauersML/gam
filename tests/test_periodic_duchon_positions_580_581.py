@@ -49,9 +49,9 @@ def _circle_truth(n: int = 600, embed_dim: int = 16, seed: int = 1):
 
 def _min_penalty_eig(period: float | None) -> float:
     """Smallest eigenvalue of the periodic Duchon function-norm penalty."""
-    centers = np.linspace(0.0, 1.0, 16, endpoint=False)
+    centers = np.linspace(0.0, 1.0, 16, endpoint=False).reshape(-1, 1)
     penalty = gamfit.duchon_function_norm_penalty(
-        centers, m=2, periodic=True, period=period
+        centers, m=2, periodic_per_axis=(True,), period=period
     )
     penalty = np.asarray(penalty, dtype=float)
     # Symmetric Gram: use the symmetric eigensolver.
@@ -70,9 +70,11 @@ def test_periodic_duchon_penalty_is_psd(period: float | None) -> None:
     """
     min_eig = _min_penalty_eig(period)
     # Scale-relative tolerance: the penalty's largest eigenvalue sets the scale.
-    centers = np.linspace(0.0, 1.0, 16, endpoint=False)
+    centers = np.linspace(0.0, 1.0, 16, endpoint=False).reshape(-1, 1)
     penalty = np.asarray(
-        gamfit.duchon_function_norm_penalty(centers, m=2, periodic=True, period=period),
+        gamfit.duchon_function_norm_penalty(
+            centers, m=2, periodic_per_axis=(True,), period=period
+        ),
         dtype=float,
     )
     scale = float(np.linalg.eigvalsh(0.5 * (penalty + penalty.T)).max())

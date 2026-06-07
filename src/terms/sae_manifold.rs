@@ -12525,8 +12525,7 @@ mod tests {
         // moderate prior weight keeps the sparsity pressure honest while letting
         // the LSQ-seeded reconstruction hold both real atoms active — the
         // realistic operating point this recovery test pins.
-        let mut rho =
-            SaeManifoldRho::new((0.02_f64).ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
+        let mut rho = SaeManifoldRho::new((0.02_f64).ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
 
         let mut prev_total = f64::INFINITY;
         for _ in 0..30 {

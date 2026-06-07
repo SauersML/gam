@@ -37,9 +37,7 @@
 //!   - rigid:  empty log-slope smooth + constant offset  (≈ `logslope_formula="1"`)
 //!   - flex:   + score_warp / link_dev deviation blocks   (≈ `linkwiggle(...)`)
 
-use gam::families::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy,
-};
+use gam::families::bms::{BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::resource::ResourcePolicy;
@@ -170,7 +168,7 @@ fn build_problem(
 fn run_fit(
     flex: bool,
     logslope_offset_value: f64,
-) -> gam::families::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult {
+) -> gam::families::bms::BernoulliMarginalSlopeFitResult {
     gam::init_parallelism();
     let (data, spec) = build_problem(400, flex, logslope_offset_value);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {

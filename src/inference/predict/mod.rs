@@ -3,7 +3,7 @@ pub mod interval_policy;
 pub mod linalg;
 
 use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::{EmpiricalZGrid, LatentMeasureKind};
+use crate::families::bms::{EmpiricalZGrid, LatentMeasureKind};
 use crate::families::bms::{bernoulli_marginal_link_map, empirical_intercept_from_marginal};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
@@ -1284,8 +1284,7 @@ pub struct BernoulliMarginalSlopePredictor {
     /// so the calibrated sample is N(0,1) by construction. `None` means
     /// training-time z already passed the strict normality check and no
     /// transform was applied.
-    pub(crate) latent_z_calibration:
-        Option<crate::families::bernoulli_marginal_slope::LatentZRankIntCalibration>,
+    pub(crate) latent_z_calibration: Option<crate::families::bms::LatentZRankIntCalibration>,
 }
 
 /// Per-runtime predict-time anchor correction matrices.
@@ -1842,10 +1841,8 @@ impl BernoulliMarginalSlopePredictor {
         beta_link_dev: Option<&Array1<f64>>,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<
-        Vec<crate::families::bernoulli_marginal_slope::exact_kernel::DenestedPartitionCell>,
-        EstimationError,
-    > {
+    ) -> Result<Vec<crate::families::bms::exact_kernel::DenestedPartitionCell>, EstimationError>
+    {
         let score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
             runtime.breakpoints().map_err(EstimationError::from)?
         } else {
@@ -1856,59 +1853,60 @@ impl BernoulliMarginalSlopePredictor {
         } else {
             Vec::new()
         };
-        let mut cells = crate::families::bernoulli_marginal_slope::exact_kernel::build_denested_partition_cells_with_tails(
-            a,
-            b,
-            &score_breaks,
-            &link_breaks,
-            |z| {
-                if let (Some(runtime), Some(beta)) =
-                    (self.score_warp_runtime.as_ref(), beta_score_warp)
-                {
-                    let mut span = runtime.local_cubic_at(beta, z)?;
-                    // `local_cubic_at`'s c0 is `Σ_j basis_c0[span][j] · beta[j]`.
-                    // The cross-block residual replaces basis_c0 by
-                    // basis_c0 − n_row · M, contributing a row-constant
-                    // `correction.dot(beta)` to c0. Higher coefficients
-                    // (c1..c3) depend on derivatives of the basis w.r.t.
-                    // its own argument and are untouched.
-                    if let Some(corr) = score_warp_correction_for_row {
-                        span.c0 -= corr.dot(beta);
+        let mut cells =
+            crate::families::bms::exact_kernel::build_denested_partition_cells_with_tails(
+                a,
+                b,
+                &score_breaks,
+                &link_breaks,
+                |z| {
+                    if let (Some(runtime), Some(beta)) =
+                        (self.score_warp_runtime.as_ref(), beta_score_warp)
+                    {
+                        let mut span = runtime.local_cubic_at(beta, z)?;
+                        // `local_cubic_at`'s c0 is `Σ_j basis_c0[span][j] · beta[j]`.
+                        // The cross-block residual replaces basis_c0 by
+                        // basis_c0 − n_row · M, contributing a row-constant
+                        // `correction.dot(beta)` to c0. Higher coefficients
+                        // (c1..c3) depend on derivatives of the basis w.r.t.
+                        // its own argument and are untouched.
+                        if let Some(corr) = score_warp_correction_for_row {
+                            span.c0 -= corr.dot(beta);
+                        }
+                        Ok(span)
+                    } else {
+                        Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+                            left: 0.0,
+                            right: 1.0,
+                            c0: 0.0,
+                            c1: 0.0,
+                            c2: 0.0,
+                            c3: 0.0,
+                        })
                     }
-                    Ok(span)
-                } else {
-                    Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                        left: 0.0,
-                        right: 1.0,
-                        c0: 0.0,
-                        c1: 0.0,
-                        c2: 0.0,
-                        c3: 0.0,
-                    })
-                }
-            },
-            |u| {
-                if let (Some(runtime), Some(beta)) =
-                    (self.link_deviation_runtime.as_ref(), beta_link_dev)
-                {
-                    let mut span = runtime.local_cubic_at(beta, u)?;
-                    if let Some(corr) = link_dev_correction_for_row {
-                        span.c0 -= corr.dot(beta);
+                },
+                |u| {
+                    if let (Some(runtime), Some(beta)) =
+                        (self.link_deviation_runtime.as_ref(), beta_link_dev)
+                    {
+                        let mut span = runtime.local_cubic_at(beta, u)?;
+                        if let Some(corr) = link_dev_correction_for_row {
+                            span.c0 -= corr.dot(beta);
+                        }
+                        Ok(span)
+                    } else {
+                        Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+                            left: 0.0,
+                            right: 1.0,
+                            c0: 0.0,
+                            c1: 0.0,
+                            c2: 0.0,
+                            c3: 0.0,
+                        })
                     }
-                    Ok(span)
-                } else {
-                    Ok(crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                        left: 0.0,
-                        right: 1.0,
-                        c0: 0.0,
-                        c1: 0.0,
-                        c2: 0.0,
-                        c3: 0.0,
-                    })
-                }
-            },
-        )
-        .map_err(EstimationError::InvalidInput)?;
+                },
+            )
+            .map_err(EstimationError::InvalidInput)?;
         let scale = self.probit_frailty_scale();
         if scale != 1.0 {
             for partition_cell in &mut cells {
@@ -1947,18 +1945,20 @@ impl BernoulliMarginalSlopePredictor {
         let mut f_aa = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            let (dc_da_raw, _) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                slope,
-            );
-            let (d2c_da2_raw, _, _) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_second_partials(
-                partition_cell.score_span,
-                partition_cell.link_span,
-                a,
-                slope,
-            );
+            let (dc_da_raw, _) =
+                crate::families::bms::exact_kernel::denested_cell_coefficient_partials(
+                    partition_cell.score_span,
+                    partition_cell.link_span,
+                    a,
+                    slope,
+                );
+            let (d2c_da2_raw, _, _) =
+                crate::families::bms::exact_kernel::denested_cell_second_partials(
+                    partition_cell.score_span,
+                    partition_cell.link_span,
+                    a,
+                    slope,
+                );
             let dc_da = scale_coeff4(dc_da_raw, scale);
             let d2c_da2 = scale_coeff4(d2c_da2_raw, scale);
             // Derive the moment `max_degree` from the contractions consumed
@@ -1966,23 +1966,19 @@ impl BernoulliMarginalSlopePredictor {
             // derivative contraction dominates the first-derivative one, so
             // its required degree is the binding bound. Hardcoding 7 here
             // produced 8 moments while the contraction needs 10 (#321).
-            let max_degree = crate::families::bernoulli_marginal_slope::exact_kernel::cell_second_derivative_required_max_degree(
-                &dc_da,
-                &dc_da,
-                &d2c_da2,
-            );
-            let state =
-                crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
-                    cell, max_degree,
-                )
+            let max_degree =
+                crate::families::bms::exact_kernel::cell_second_derivative_required_max_degree(
+                    &dc_da, &dc_da, &d2c_da2,
+                );
+            let state = crate::families::bms::exact_kernel::evaluate_cell_moments(cell, max_degree)
                 .map_err(EstimationError::InvalidInput)?;
             f += state.value;
-            f_a += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
+            f_a += crate::families::bms::exact_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
             )
             .map_err(EstimationError::InvalidInput)?;
-            f_aa += crate::families::bernoulli_marginal_slope::exact_kernel::cell_second_derivative_from_moments(
+            f_aa += crate::families::bms::exact_kernel::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -2148,9 +2144,7 @@ impl BernoulliMarginalSlopePredictor {
         frailty: FrailtySpec,
         score_warp_runtime: Option<SavedCompiledFlexBlock>,
         link_deviation_runtime: Option<SavedCompiledFlexBlock>,
-        latent_z_calibration: Option<
-            crate::families::bernoulli_marginal_slope::LatentZRankIntCalibration,
-        >,
+        latent_z_calibration: Option<crate::families::bms::LatentZRankIntCalibration>,
     ) -> Result<Self, String> {
         let gaussian_frailty_sd = match frailty {
             FrailtySpec::None => None,
@@ -2700,7 +2694,7 @@ impl BernoulliMarginalSlopePredictor {
             // OnceLock / lazy init lives inside the par closure (per the
             // OnceLock + nested rayon deadlock rule).
             let global_score_basis_table: Option<
-                Vec<Vec<crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic>>,
+                Vec<Vec<crate::families::bms::exact_kernel::LocalSpanCubic>>,
             > = if let (LatentMeasureKind::GlobalEmpirical { grid }, Some(runtime)) =
                 (&self.latent_measure, self.score_warp_runtime.as_ref())
             {
@@ -2822,7 +2816,7 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = score_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
+                                    let coeffs = crate::families::bms::exact_kernel::score_basis_cell_coefficients(
                                         basis_span,
                                         slope,
                                     );
@@ -2839,7 +2833,7 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = link_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
+                                    let coeffs = crate::families::bms::exact_kernel::link_basis_cell_coefficients(
                                         basis_span,
                                         intercept,
                                         slope,
@@ -2861,11 +2855,11 @@ impl BernoulliMarginalSlopePredictor {
                         for partition_cell in cells {
                             let cell = partition_cell.cell;
                             let state =
-                                crate::families::bernoulli_marginal_slope::exact_kernel::evaluate_cell_moments(
+                                crate::families::bms::exact_kernel::evaluate_cell_moments(
                                     cell, 9,
                                 )
                                 .map_err(EstimationError::InvalidInput)?;
-                            let (_, dc_db_raw) = crate::families::bernoulli_marginal_slope::exact_kernel::denested_cell_coefficient_partials(
+                            let (_, dc_db_raw) = crate::families::bms::exact_kernel::denested_cell_coefficient_partials(
                                 partition_cell.score_span,
                                 partition_cell.link_span,
                                 intercept,
@@ -2875,7 +2869,7 @@ impl BernoulliMarginalSlopePredictor {
                             // Gaussian frailty, so every coefficient partial of
                             // F(a, theta) must carry the same probit scale as F_a.
                             let dc_db = scale_coeff4(dc_db_raw, scale);
-                            f_b += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
+                            f_b += crate::families::bms::exact_kernel::cell_first_derivative_from_moments(
                                 &dc_db,
                                 &state.moments,
                             )
@@ -2890,11 +2884,11 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = score_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::score_basis_cell_coefficients(
+                                    let coeffs = crate::families::bms::exact_kernel::score_basis_cell_coefficients(
                                         basis_span, slope,
                                     );
                                     let coeffs = scale_coeff4(coeffs, scale);
-                                    f_h_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
+                                    f_h_row[j] += crate::families::bms::exact_kernel::cell_first_derivative_from_moments(
                                         &coeffs,
                                         &state.moments,
                                     )
@@ -2910,13 +2904,13 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = link_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::bernoulli_marginal_slope::exact_kernel::link_basis_cell_coefficients(
+                                    let coeffs = crate::families::bms::exact_kernel::link_basis_cell_coefficients(
                                         basis_span,
                                         intercept,
                                         slope,
                                     );
                                     let coeffs = scale_coeff4(coeffs, scale);
-                                    f_w_row[j] += crate::families::bernoulli_marginal_slope::exact_kernel::cell_first_derivative_from_moments(
+                                    f_w_row[j] += crate::families::bms::exact_kernel::cell_first_derivative_from_moments(
                                         &coeffs,
                                         &state.moments,
                                     )
@@ -6315,12 +6309,10 @@ mod tests {
     use ndarray::{Array1, Array2, array};
 
     fn saved_runtime_from_deviation_runtime(
-        runtime: &crate::families::bernoulli_marginal_slope::DeviationRuntime,
+        runtime: &crate::families::bms::DeviationRuntime,
     ) -> SavedCompiledFlexBlock {
         SavedCompiledFlexBlock {
-            kernel:
-                crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-                    .to_string(),
+            kernel: crate::families::bms::exact_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
             breakpoints: runtime.breakpoints().to_vec(),
             basis_dim: runtime.basis_dim(),
             span_c0: runtime
@@ -6554,7 +6546,7 @@ mod tests {
         let seed = array![-1.5, -0.2, 0.6, 1.4];
         let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+            &crate::families::bms::DeviationBlockConfig {
                 degree: 3,
                 num_internal_knots: 3,
                 ..Default::default()
@@ -6593,7 +6585,7 @@ mod tests {
 
         let err = crate::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+            &crate::families::bms::DeviationBlockConfig {
                 degree: 2,
                 num_internal_knots: 3,
                 ..Default::default()
@@ -6616,7 +6608,7 @@ mod tests {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
         let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+            &crate::families::bms::DeviationBlockConfig {
                 num_internal_knots: 4,
                 ..Default::default()
             },
@@ -6666,7 +6658,7 @@ mod tests {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
         let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+            &crate::families::bms::DeviationBlockConfig {
                 num_internal_knots: 4,
                 ..Default::default()
             },
@@ -6900,7 +6892,7 @@ mod tests {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
         let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bernoulli_marginal_slope::DeviationBlockConfig {
+            &crate::families::bms::DeviationBlockConfig {
                 num_internal_knots: 4,
                 ..Default::default()
             },

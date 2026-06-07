@@ -235,8 +235,8 @@ def sae_supervised(
     SaeSupervisedFit
         Uniform recipe result with ``.sae``, ``.model``, ``.report()``, and
         ``.predict(X)``. Inspect ``fit.sae.assignments`` for the learned
-        assignment matrix and ``fit.sae.atoms[i].decoder_covariance`` /
-        ``fit.sae.shape_band(i)`` for per-atom shape uncertainty when present.
+        assignment matrix, ``fit.sae.atoms[i].decoder_covariance``, and
+        ``fit.sae.shape_uncertainty(atom=i)`` when present.
 
     Raises
     ------

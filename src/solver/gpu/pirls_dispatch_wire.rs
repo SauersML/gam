@@ -19,6 +19,7 @@ mod linux_impl {
     use ndarray::{Array1, ArrayView1, ArrayView2};
 
     use crate::construction::ReparamResult;
+    use crate::gpu::cuda_selected;
     use crate::gpu::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::gpu::runtime::GpuRuntime;
@@ -27,7 +28,6 @@ mod linux_impl {
     use crate::solver::active_set::{
         LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
     };
-    use crate::solver::gpu::cuda_selected;
     use crate::solver::gpu::pirls_dispatch::admission_for;
     use crate::solver::gpu::pirls_gpu::{self, cuda};
     use crate::solver::pirls::{
@@ -125,7 +125,7 @@ mod linux_impl {
     /// Cheap pre-materialization admission gate. Returns `true` only when
     /// all of the following hold without touching any O(N·p) work:
     ///
-    /// - The active solver `Device` is `Cuda` (`cuda_selected()`).
+    /// - The global GPU policy selects CUDA (`cuda_selected()`).
     /// - A live `GpuRuntime` is present.
     /// - The (family, curvature) pair is in the JIT-cached set
     ///   (`admission_for` succeeds).
@@ -158,8 +158,8 @@ mod linux_impl {
     pub fn try_gpu_pirls_loop_dispatch(
         input: GpuPirlsDispatchInput<'_>,
     ) -> Option<Result<(PirlsResult, WorkingModelPirlsResult), String>> {
-        // Honor the documented Device::Cpu selection — never route to the
-        // GPU loop when the caller has explicitly selected the CPU device.
+        // Honor the documented GPU policy: never route to the GPU loop when
+        // the caller has explicitly selected CPU execution.
         if !cuda_selected() {
             return None;
         }
@@ -657,7 +657,7 @@ mod linux_impl {
     /// Returns `true` iff cuda_selected(), runtime available, and the likelihood
     /// is Gaussian-identity.
     pub fn try_gpu_gaussian_pls_admit(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
-        if !crate::solver::gpu::cuda_selected() {
+        if !crate::gpu::cuda_selected() {
             return false;
         }
         if crate::gpu::runtime::GpuRuntime::global().is_none() {

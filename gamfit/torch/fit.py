@@ -494,7 +494,7 @@ def _fit_single_constrained(
     return FitResult(
         coefficients=out.coefficients,
         fitted=out.fitted,
-        lambdas=out.lam,
+        lambdas=out.lambdas,
         reml_score=out.reml_score,
         edf=out.edf,
         smooths=[smooth],
@@ -709,7 +709,7 @@ def fit(
         return FitResult(
             coefficients=out.coefficients,
             fitted=out.fitted,
-            lambdas=out.lam,
+            lambdas=out.lambdas,
             reml_score=out.reml_score,
             edf=out.edf,
             smooths=[smooths],
@@ -771,7 +771,7 @@ def fit(
     return FitResult(
         coefficients=list(add_out.coefficients),
         fitted=add_out.fitted,
-        lambdas=add_out.lam,
+        lambdas=add_out.lambdas,
         reml_score=add_out.reml_score,
         edf=add_out.edf,
         smooths=smooths_list,

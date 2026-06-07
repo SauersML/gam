@@ -1,39 +1,19 @@
-//! GPU device backend for Bernoulli marginal-slope FLEX row primitives.
+//! Bernoulli marginal-slope FLEX GPU row pullback.
 //!
-//! Roadmap (issue #210):
-//!   1. **Scaffolding** (landed earlier): NVRTC-compiling host backend, PTX
-//!      module cache, per-process device arena, three entry points
-//!      (`gpu_gradient`, `gpu_hessian_matvec`, `gpu_hessian_dense`).
-//!   2. **Rigid row kernel** (landed earlier): probe kernel exercises the
-//!      full NVRTC → cuModuleLoadData → cuModuleGetFunction → cuLaunchKernel
-//!      path so the scaffolding catches host-side issues before the real
-//!      row kernel lands.
-//!   3. **Stage-3 row-kernel wiring** (this commit): the three entry points
-//!      forward to the Stage-2 row kernel
-//!      ([`crate::gpu::bms_flex_row::launch_bms_flex_row_kernel`]) and
-//!      pull the per-row outputs back into joint-β shape using the row's
-//!      `P_i = block_diag(X_i, G_i, I_h, I_w)` design rows (spec §14).
-//!      The caller is responsible for preparing the per-row FLEX cell
-//!      partition (cubic predictor coefficients, A_c / R_c / S families)
-//!      and the observed-point evaluations (`chi_obs`, `xi_obs`, `rho_u`,
-//!      `tau_u`, `r_uv`) — those host-side prep helpers land alongside the
-//!      CPU↔GPU dispatcher hook-up that consumes this module.
-//!   4. **Optimisation hill-climb**: profile-driven shared-mem tile reduces,
-//!      warp shuffles, persistent kernels for HVP sweeps, etc., until the
-//!      biobank-shape (n=195k, p=44, r=20) wall-time targets are met.
+//! This module adapts the BMS row kernel to the joint-β gradient, HVP, and
+//! dense-Hessian surfaces. Generic CUDA runtime and policy plumbing stays in
+//! [`crate::gpu`].
 
 use std::sync::OnceLock;
 
 use ndarray::Array2;
 
-use super::error::GpuError;
+use crate::gpu::error::GpuError;
 #[cfg(target_os = "linux")]
-use super::error::GpuResultExt;
-use super::{GpuDecision, GpuKernel, decide};
+use crate::gpu::error::GpuResultExt;
+use crate::gpu::{GpuDecision, GpuKernel, decide};
 
-use super::bms_flex_row::{
-    BmsFlexRowKernelInputs, BmsFlexRowKernelOutputs, launch_bms_flex_row_kernel,
-};
+use super::row::{BmsFlexRowKernelInputs, BmsFlexRowKernelOutputs, launch_bms_flex_row_kernel};
 
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -41,22 +21,17 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use cudarc::driver::CudaModule;
 
-// ────────────────────────────────────────────────────────────────────────
-// Public policy entry points (preserved from the previous policy-only
-// implementation so call sites stay source-compatible).
-// ────────────────────────────────────────────────────────────────────────
-
 /// Decide whether the GPU row-primary Hessian path is eligible for this
 /// fit's `(n, r)`. Always-`use_gpu=false` for `r == 0` (no flex jets to
 /// process) and below the runtime row-kernel threshold.
 #[must_use]
 pub fn row_primary_hessian_decision(n: usize, r: usize) -> GpuDecision {
-    let large_enough = super::runtime::GpuRuntime::global()
+    let large_enough = crate::gpu::runtime::GpuRuntime::global()
         .map(|runtime| n >= runtime.policy().row_kernel_min_n && r > 0)
         .unwrap_or(false);
     decide(
         GpuKernel::MarginalSlopeRows,
-        super::GpuEligibility::from_flags(BmsFlexGpuBackend::compiled(), large_enough),
+        crate::gpu::GpuEligibility::from_flags(BmsFlexGpuBackend::compiled(), large_enough),
     )
 }
 
@@ -68,10 +43,6 @@ pub fn require_row_primary_hessian_supported(n: usize, r: usize) -> Result<GpuDe
     decision.require_supported()?;
     Ok(decision)
 }
-
-// ────────────────────────────────────────────────────────────────────────
-// Device-arena and PTX-cache backend.
-// ────────────────────────────────────────────────────────────────────────
 
 /// Per-fit row + cell payload the device row kernel consumes, plus the
 /// per-row design rows the joint pullback `P_i^T H_i P_i` needs.
@@ -86,7 +57,7 @@ pub fn require_row_primary_hessian_supported(n: usize, r: usize) -> Result<GpuDe
 /// ```
 ///
 /// Per-row `r`-vector index conventions (mirror
-/// [`crate::gpu::bms_flex_row`]):
+/// [`crate::families::bms::gpu::row`]):
 ///   * `u = 0`        → `a` (marginal-link / `q`) block — pulled back via `X_i`.
 ///   * `u = 1`        → `b` (log-slope) block       — pulled back via `G_i`.
 ///   * `u ∈ [2, 2+p_h)` → score-warp block          — identity pullback into `β_h`.
@@ -268,7 +239,9 @@ impl<'a> BmsFlexGpuRowInputs<'a> {
             cell_sbb: self.cell_sbb,
             cell_sbh: self.cell_sbh,
             cell_sbw: self.cell_sbw,
-            cell_moments: crate::gpu::bms_flex_row::CellMomentsSource::Host(self.cell_moments),
+            cell_moments: crate::families::bms::gpu::row::CellMomentsSource::Host(
+                self.cell_moments,
+            ),
             chi_obs: self.chi_obs,
             xi_obs: self.xi_obs,
             rho_u: self.rho_u,
@@ -297,7 +270,7 @@ extern "C" __global__ void bms_flex_probe() {
 #[must_use]
 pub struct BmsFlexGpuBackend {
     #[cfg(target_os = "linux")]
-    inner: super::backend_probe::CudaBackendContext,
+    inner: crate::gpu::backend_probe::CudaBackendContext,
 }
 
 impl BmsFlexGpuBackend {
@@ -334,9 +307,9 @@ impl BmsFlexGpuBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let parts = super::backend_probe::probe_cuda_backend("bms_flex")?;
+        let parts = crate::gpu::backend_probe::probe_cuda_backend("bms_flex")?;
         let backend = BmsFlexGpuBackend {
-            inner: super::backend_probe::CudaBackendContext::from_parts(parts),
+            inner: crate::gpu::backend_probe::CudaBackendContext::from_parts(parts),
         };
         // Eagerly compile the probe kernel so any NVRTC failure surfaces
         // here, not at first dispatch.
@@ -1053,7 +1026,7 @@ mod bms_flex_gpu_tests {
     /// usable device so the test still passes on the CI/mac builders.
     #[test]
     fn bms_flex_gpu_context_initialises_when_device_present() {
-        let Some(runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[bms_flex_gpu test] no CUDA runtime — skipping device-side init smoketest");
             return;
         };

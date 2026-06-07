@@ -3461,7 +3461,7 @@ pub fn solve_gaussian_pls_gpu(
 pub struct DeviceResidentPcgInput<'a> {
     /// Per-fit row-Hessian + design storage. The PCG operator is
     /// `v ↦ launch_bms_flex_row_hvp_into_device(storage, ...)`.
-    pub storage: &'a crate::gpu::bms_flex_row::DeviceResidentRowHess,
+    pub storage: &'a crate::families::bms::gpu::row::DeviceResidentRowHess,
     /// Right-hand-side `b`, length `storage.block.p_total`. Uploaded once.
     pub b: &'a [f64],
     /// Convergence tolerance on relative residual `‖r‖₂ / ‖b‖₂`.
@@ -3565,8 +3565,8 @@ mod pcg_device {
     use super::DeviceResidentPcgInput;
     use super::DeviceResidentPcgOutput;
     use super::PCG_KERNEL_SOURCE;
-    use crate::gpu::bms_flex_row::launch_bms_flex_row_diagonal;
-    use crate::gpu::bms_flex_row::launch_bms_flex_row_hvp_into_device;
+    use crate::families::bms::gpu::row::launch_bms_flex_row_diagonal;
+    use crate::families::bms::gpu::row::launch_bms_flex_row_hvp_into_device;
     use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use std::sync::{Arc, OnceLock};
 
@@ -4057,10 +4057,10 @@ pub fn run_pcg_against_row_hessian_device(
 /// CPU fallback for the PIRLS-step GPU primitives.  When this build has no
 /// CUDA runtime probed, the GPU entry points must still return numerically
 /// correct results so that callers can route a single code path through
-/// `*_gpu` and rely on `solver::gpu::dense_pirls_dispatch` telemetry to
-/// distinguish device-resident vs. host-resident execution.  Returning `Err`
-/// here would silently force every caller to grow an `if cuda { .. } else
-/// { .. }` branch and risk drifting away from the GPU formula.
+/// `*_gpu` while the canonical policy layer in `crate::gpu` records whether
+/// device execution was selected. Returning `Err` here would silently force
+/// every caller to grow an `if cuda { .. } else { .. }` branch and risk
+/// drifting away from the GPU formula.
 mod cpu_fallback {
     use super::{PirlsGpuInput, PirlsGpuStep};
     use crate::linalg::faer_ndarray::FaerCholesky;
@@ -4506,7 +4506,7 @@ mod stream_device_parity_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod pcg_device_parity_tests {
     use super::*;
-    use crate::gpu::bms_flex_row::{
+    use crate::families::bms::gpu::row::{
         BmsFlexBlockLayout, BmsFlexPrimaryLayout, DeviceResidentRowHess,
     };
     use ndarray::Array2;

@@ -8,10 +8,8 @@ use gam::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
     DuchonOperatorPenaltySpec, SpatialIdentifiability,
 };
-use gam::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy,
-};
 use gam::custom_family::BlockwiseFitOptions;
+use gam::families::bms::{BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy};
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
@@ -200,7 +198,7 @@ fn build_problem(n: usize) -> BiobankProblem {
 fn fit_biobank_problem(
     n: usize,
     options: BlockwiseFitOptions,
-) -> gam::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult {
+) -> gam::families::bms::BernoulliMarginalSlopeFitResult {
     let problem = build_problem(n);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
         data: problem.data.view(),

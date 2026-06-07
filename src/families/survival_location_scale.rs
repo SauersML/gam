@@ -12257,13 +12257,13 @@ mod tests {
         let n = 3usize;
         let mut family = survival_exact_newton_test_family();
         family.x_threshold =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::<f64>::zeros(
-                (n, p),
-            )));
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((n, p)),
+            ));
         family.x_log_sigma =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::<f64>::zeros(
-                (n, p),
-            )));
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+                Array2::<f64>::zeros((n, p)),
+            ));
         family.x_time_entry = Arc::new(Array2::<f64>::zeros((n, p)));
         family.x_time_exit = Arc::new(Array2::<f64>::zeros((n, p)));
         family.x_time_deriv = Arc::new(Array2::<f64>::zeros((n, p)));

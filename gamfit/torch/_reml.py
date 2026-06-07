@@ -62,12 +62,6 @@ class AdditiveRemlOutput:
     reml_score: torch.Tensor
     edf: torch.Tensor
 
-    @property
-    def lam(self) -> torch.Tensor:
-        """Backward-compatible alias for :attr:`lambdas`."""
-        return self.lambdas
-
-
 def _gaussian_reml_fit_blocks_orthogonal(
     design_blocks: list[torch.Tensor],
     penalty_blocks: list[torch.Tensor],

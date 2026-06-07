@@ -1,23 +1,7 @@
-//! Identifiability-theorem precondition checks as runnable diagnostics.
+//! Runnable identifiability-theorem precondition checks.
 //!
-//! Principle (f) of the gam project: every identifiability guarantee a recipe
-//! claims is checked at fit-time and reported as structured output. This
-//! module is the *single source of truth* for the numerical part of those
-//! checks — Python, the CLI, and any future R/Julia binding all consume the
-//! same `Vec<TheoremResult>` produced here.
-//!
-//! Three theorems are implemented today:
-//!
-//! * **iVAE** (Khemakhem 2107.10098 Theorem 1): aux row-variation, aux
-//!   column-rank `>= n_supervised`, encoder depth `>= 2`.
-//! * **MechanismSparsity** (Lachapelle 2401.04890): decoder Jacobian
-//!   zero-fraction on the free block, positive sparsity weight, free-block
-//!   full rank, optional `state_dim >= ground_truth_dim`.
-//! * **RandomProjection** (Khemakhem App. A.3 / Hyvärinen-Pajunen 1999):
-//!   bounded encoder activation variance.
-//!
-//! Numerical thresholds are paper-cited module constants. Callers override
-//! per call via the `Thresholds` struct — no env vars, no CLI flags.
+//! Python, the CLI, and other bindings consume the same `Vec<TheoremResult>`
+//! from this module. Thresholds are explicit call inputs via [`Thresholds`].
 
 use std::collections::BTreeMap;
 
@@ -25,10 +9,6 @@ use ndarray::{Array2, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 
 use crate::linalg::faer_ndarray::FaerSvd;
-
-// ---------------------------------------------------------------------------
-// Paper-cited default thresholds.
-// ---------------------------------------------------------------------------
 
 /// Below this std the aux column is "constant" (Khemakhem 2107.10098 Thm. 1
 /// — a constant column carries zero conditioning information).
@@ -58,10 +38,6 @@ pub const DEFAULT_RANDPROJ_VAR_CEILING: f64 = 1.0e6;
 /// Variances above this floor (but below the ceiling) downgrade the random
 /// projection check to a warn — encoder is large but not yet unbounded.
 pub const DEFAULT_RANDPROJ_VAR_WARN: f64 = 1.0e3;
-
-// ---------------------------------------------------------------------------
-// Data structures.
-// ---------------------------------------------------------------------------
 
 /// Tunable thresholds — every field has a paper-backed default and can be
 /// overridden per call (constructor kwargs in Python, struct literal here).
@@ -150,10 +126,6 @@ pub struct FitSummary {
     pub thresholds: Option<Thresholds>,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers.
-// ---------------------------------------------------------------------------
-
 fn rows_to_array(rows: &[Vec<f64>]) -> Result<Array2<f64>, String> {
     if rows.is_empty() {
         return Ok(Array2::<f64>::zeros((0, 0)));
@@ -215,10 +187,6 @@ fn matrix_rank(mat: ArrayView2<f64>, rtol: f64) -> Result<usize, String> {
     let cutoff = smax * rtol;
     Ok(sigma.iter().filter(|s| **s > cutoff).count())
 }
-
-// ---------------------------------------------------------------------------
-// Per-theorem checks.
-// ---------------------------------------------------------------------------
 
 /// Khemakhem 2107.10098 Theorem 1 preconditions.
 pub fn check_ivae(summary: &FitSummary, thr: &Thresholds) -> TheoremResult {

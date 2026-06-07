@@ -1,5 +1,4 @@
-//! GPU NVRTC Wahba intrinsic-S² kernel matrix construction
-//! (Block 4, math team spec).
+//! GPU NVRTC Wahba intrinsic-S2 kernel matrix construction.
 //!
 //! This module owns the device-side construction of the Wahba reproducing
 //! kernel basis matrix on the 2-sphere using the **finite truncated
@@ -13,37 +12,18 @@
 //! `SphereWahbaKernel::PseudoTruncated { lmax }` variant added to
 //! `src/terms/basis.rs` (single source: same recurrence, same c_ℓ).
 //!
-//! Phases (per Block 4 spec):
-//!
-//!   1. **Raw kernel matrix** — NVRTC `s2_wahba_legendre_colmajor`
-//!      produces the `(n × m)` design matrix col-major on device.
-//!   2. **Center-center penalty C + constraint S = Zᵀ C Z** — same
-//!      kernel with `n = m`; constraint on host while m ≤ 200.
-//!   3. **Fused Householder-constrained kernel**
-//!      `s2_wahba_householder_constrained_colmajor` collapses raw B +
-//!      dense BZ GEMM into a single launch by emitting the
-//!      Householder-reflected, first-column-dropped design directly.
-//!   4. **Device-resident cuSOLVER QR penalised solve** keeps the
-//!      design on device through `[√W·X_s ; √λ·R_S]` GEQRF/ORMQR/TRSM.
-//!   5. **Dispatch policy + parity tests** wire it into the spec
-//!      consumer based on `n·m·L` and device memory budget.
-//!
-//! All math constraints from the spec:
-//!   * `f64` throughout. No `--use_fast_math`.
-//!   * `t = clamp(x_i · z_j, -1, +1)` before the recurrence.
-//!   * `c_0 = 0` (mean-zero penalised component).
-//!   * Column-major store `out[(size_t)j * (size_t)ld + (size_t)i] = acc`.
-//!   * `sin/cos` are pre-computed on host (lat/lon → unit vectors).
-//!   * Coefficient array `c_ℓ` is pre-computed on host and uploaded once.
+//! The device path evaluates the raw column-major kernel matrix with `f64`
+//! Legendre recurrence math. Host code owns centering, constraints, and solver
+//! assembly in `basis.rs`.
 
 use std::sync::OnceLock;
 
 use ndarray::{Array2, ArrayView2};
 
-use super::error::GpuError;
-use super::{GpuDecision, GpuKernel, decide};
+use crate::gpu::error::GpuError;
 #[cfg(target_os = "linux")]
 use crate::gpu::error::GpuResultExt;
+use crate::gpu::{GpuDecision, GpuKernel, decide};
 
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
@@ -52,10 +32,6 @@ use std::sync::{Arc, Mutex};
 
 #[cfg(target_os = "linux")]
 use cudarc::driver::{CudaContext, CudaModule, CudaSlice, CudaStream};
-
-// ────────────────────────────────────────────────────────────────────────
-// Public types
-// ────────────────────────────────────────────────────────────────────────
 
 /// Which truncated-spectral Wahba kernel to evaluate on device. Matches
 /// the CPU `SphereWahbaKernel::{SobolevTruncated, PseudoTruncated}` so
@@ -450,7 +426,7 @@ pub const fn sphere_gpu_compiled() -> bool {
 ///     `ld = ((n + 31) / 32) * 32`.
 #[must_use]
 pub fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> GpuDecision {
-    let large_enough = if let Some(runtime) = super::runtime::GpuRuntime::global() {
+    let large_enough = if let Some(runtime) = crate::gpu::runtime::GpuRuntime::global() {
         let ld = ((n + 31) / 32) * 32;
         let needed_bytes = ld
             .saturating_mul(m)
@@ -462,7 +438,7 @@ pub fn sphere_kernel_decision(n: usize, m: usize, lmax: usize) -> GpuDecision {
     };
     decide(
         GpuKernel::SpatialKernelOperator,
-        super::GpuEligibility::from_flags(sphere_gpu_compiled(), large_enough),
+        crate::gpu::GpuEligibility::from_flags(sphere_gpu_compiled(), large_enough),
     )
 }
 
@@ -505,7 +481,7 @@ impl SphereGpuBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let parts = super::backend_probe::probe_cuda_backend("sphere")?;
+        let parts = crate::gpu::backend_probe::probe_cuda_backend("sphere")?;
         Ok(SphereGpuBackend {
             inner: SphereGpuContext {
                 ctx: parts.ctx,
@@ -1477,7 +1453,7 @@ mod sphere_gpu_tests {
     /// a small grid. Skips cleanly on hosts with no CUDA runtime.
     #[test]
     fn sphere_gpu_raw_kernel_parity_vs_cpu_truncated() {
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping raw-kernel parity");
             return;
         };
@@ -1548,7 +1524,7 @@ mod sphere_gpu_tests {
     /// ≤ 1e-9 implies fit parity at the same tolerance.
     #[test]
     fn sphere_gpu_end_to_end_dispatch_parity_vs_cpu_truncated() {
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping end-to-end dispatch parity");
             return;
         };
@@ -1631,7 +1607,7 @@ mod sphere_gpu_tests {
     /// (raw kernel) · Z evaluated on host.
     #[test]
     fn sphere_gpu_householder_parity_vs_raw_dot_z() {
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping householder parity");
             return;
         };
@@ -1701,7 +1677,7 @@ mod sphere_gpu_tests {
     /// Skips silently when no CUDA runtime is available.
     #[test]
     fn sphere_gpu_kernel_matrix_hill_climb_20x_vs_cpu() {
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu hill-climb] no CUDA runtime — skipping");
             return;
         };
@@ -1775,7 +1751,7 @@ mod sphere_gpu_tests {
     /// kernel build dominates PIRLS.
     #[test]
     fn sphere_gpu_end_to_end_fit_hill_climb_10x_vs_cpu() {
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!("[sphere_gpu hill-climb fit] no CUDA runtime — skipping");
             return;
         };
@@ -1877,7 +1853,7 @@ mod sphere_gpu_tests {
         use crate::linalg::faer_ndarray::FaerCholesky;
         use faer::Side;
 
-        let Some(_runtime) = super::super::runtime::GpuRuntime::global() else {
+        let Some(_runtime) = crate::gpu::runtime::GpuRuntime::global() else {
             eprintln!(
                 "[sphere gpu parity] no CUDA runtime — skipping device parity \
                  (CPU oracle exercised by sibling tests)"

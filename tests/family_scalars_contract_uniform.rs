@@ -20,7 +20,7 @@
 //!   - BMS marginal block  (`BmsMarginalJacobian`)
 //!   - BMS logslope block  (`BmsLogslopeJacobian`)
 
-use gam::families::bernoulli_marginal_slope::{BmsLogslopeJacobian, BmsMarginalJacobian};
+use gam::families::bms::{BmsLogslopeJacobian, BmsMarginalJacobian};
 use gam::families::custom_family::{BlockEffectiveJacobian, FamilyLinearizationState};
 use ndarray::{Array1, Array2};
 use std::sync::Arc;

@@ -119,7 +119,7 @@ pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 /// sigma executor needs available in this build/runtime?
 ///
 /// Returns `true` when both of the following hold:
-///   * The active solver device is `Cuda` (`cuda_selected()`).
+///   * The global GPU policy selects CUDA (`cuda_selected()`).
 ///   * A live [`crate::gpu::runtime::GpuRuntime`] is present, confirming
 ///     that CUDA is initialised and the JIT row-kernel cache is warm.
 ///
@@ -134,7 +134,7 @@ pub(crate) type SigmaPointResult = Option<(Array2<f64>, Array1<f64>)>;
 /// properties that determine correctness.
 #[inline]
 fn device_pirls_stage3_ready() -> bool {
-    crate::solver::gpu::cuda_selected() && crate::gpu::runtime::GpuRuntime::global().is_some()
+    crate::gpu::cuda_selected() && crate::gpu::runtime::GpuRuntime::global().is_some()
 }
 
 /// Sigma-cubature executor dispatch — the swap site between the CPU Rayon

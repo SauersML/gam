@@ -8,7 +8,7 @@
 //! mod margslope_flex_equivalence;
 //! ```
 
-use gam::families::bernoulli_marginal_slope::{
+use gam::families::bms::{
     BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, DeviationBlockConfig,
     LatentZPolicy,
 };

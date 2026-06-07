@@ -55,7 +55,7 @@
 //! `gam ≈ reference output`. The DML library is a match-or-beat baseline, not
 //! ground truth. No tolerance here may be weakened to make code pass.
 
-use gam::families::bernoulli_marginal_slope::BernoulliMarginalSlopeFitResult;
+use gam::families::bms::BernoulliMarginalSlopeFitResult;
 use gam::families::marginal_slope_orthogonal::{influence_block_design, score_influence_jacobian};
 use gam::terms::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, dml_partial_linear_reference, rmse};

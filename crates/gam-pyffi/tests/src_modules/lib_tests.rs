@@ -1,0 +1,1451 @@
+use super::*;
+use ndarray::{array, s};
+
+#[test]
+fn symmetric_curvature_solve_preserves_negative_modes() {
+    let matrix = array![[2.0, 0.0, 0.0], [0.0, -4.0, 0.0], [0.0, 0.0, -1.0e-15]];
+    let rhs = array![8.0, -8.0, 1.0];
+    let solved = gam::linalg::utils::solve_symmetric_vector_with_floor(&matrix, &rhs, 1.0e-3)
+        .expect("indefinite symmetric curvature solve");
+
+    assert!((solved[0] - 4.0).abs() <= 1.0e-12);
+    assert!((solved[1] - 2.0).abs() <= 1.0e-12);
+    assert!((solved[2] + 250.0).abs() <= 1.0e-9);
+}
+
+#[test]
+fn model_version_matches_canonical_payload_version() {
+    assert_eq!(MODEL_VERSION, MODEL_PAYLOAD_VERSION);
+}
+
+/// Builds a deterministic formula-table dataset for the shared-tangent
+/// Gaussian REML path with two unpenalized parametric columns plus one
+/// smooth: `~ x + z + s(w)` over `D = 2` outputs.
+fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>) {
+    let n = 80usize;
+    let headers = vec!["x".to_string(), "z".to_string(), "w".to_string()];
+    let mut rows = Vec::with_capacity(n);
+    let mut y = Array2::<f64>::zeros((n, 2));
+    for row in 0..n {
+        let t = (row as f64 - 39.5) / 20.0;
+        let x = (0.7 * t).sin() + 0.05 * t;
+        let z = (1.1 * t).cos() - 0.1 * t * t;
+        let w = t;
+        rows.push(vec![format!("{x}"), format!("{z}"), format!("{w}")]);
+        // Two distinct tangent signals: each a parametric trend plus a
+        // genuinely wiggly component that the smooth must absorb.
+        y[[row, 0]] = 0.4 * x - 0.3 * z + 0.6 * (1.8 * w).sin() + 0.02 * t;
+        y[[row, 1]] = -0.2 * x + 0.5 * z + 0.4 * (2.3 * w).cos() - 0.03 * t;
+    }
+    (headers, rows, y)
+}
+
+/// Regression for issue #381 adversarial review (flaw #2): the per-output
+/// residual-variance denominator must count the FULL effective df of each
+/// tangent coordinate's columns — unpenalized columns (intercept + the
+/// parametric `x`, `z`) included — matching the canonical Gaussian scale
+/// `n - edf_total`. The pre-fix denominator used only the penalized
+/// `edf_by_block`, overstating residual df by the unpenalized count and
+/// biasing sigma2 low.
+#[test]
+fn shared_tangent_sigma2_counts_unpenalized_columns() {
+    let (headers, rows, y) = shared_tangent_formula_table();
+    let fit = gaussian_reml_fit_formula_table_impl(
+        headers,
+        rows,
+        "~ x + z + s(w)".to_string(),
+        y.view(),
+        None,
+        None,
+    )
+    .expect("shared-tangent REML must fit ~ x + z + s(w)");
+
+    let d = y.ncols();
+    let n = y.nrows() as f64;
+    assert_eq!(fit.sigma2.len(), d);
+    assert_eq!(fit.edf.nrows(), d);
+    assert!(fit.lambdas.iter().all(|v| v.is_finite()));
+    assert!(fit.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
+
+    // `~ x + z + s(w)` has exactly three unpenalized columns per output:
+    // the intercept plus the two parametric terms `x` and `z`. The smooth
+    // `s(w)` is fully penalized, so each coordinate's effective df is
+    //   edf_output = 3 (unpenalized) + Σ_block edf_by_block.
+    const UNPENALIZED_COLS: f64 = 3.0;
+    for output in 0..d {
+        let penalized_edf: f64 = fit.edf.row(output).iter().sum();
+        let edf_output = UNPENALIZED_COLS + penalized_edf;
+        let mut ss = 0.0;
+        for row in 0..y.nrows() {
+            let resid = y[[row, output]] - fit.fitted[[row, output]];
+            ss += resid * resid;
+        }
+        let expected = ss / (n - edf_output);
+        assert!(
+            (fit.sigma2[output] - expected).abs() <= 1.0e-9 * expected.max(1.0),
+            "sigma2[{output}] = {} but residual scale with full effective df is {expected} \
+                 (edf_output = {edf_output}, penalized_edf = {penalized_edf})",
+            fit.sigma2[output]
+        );
+        // The buggy denominator omitted the unpenalized columns; pinning the
+        // strict gap guards against a regression back to it.
+        let buggy = ss / (n - penalized_edf);
+        assert!(
+            fit.sigma2[output] > buggy * (1.0 + 1.0e-9),
+            "sigma2[{output}] = {} must exceed the unpenalized-omitting estimate {buggy}",
+            fit.sigma2[output]
+        );
+    }
+}
+
+/// Regression for issue #381 adversarial review (flaws #1/#3): per-output
+/// λ/edf diagnostics must be reported per tangent coordinate in a
+/// well-formed `(D, M)` grid. Each coordinate replicates the same penalty
+/// structure, so when no block canonicalizes away the grid is fully finite
+/// and every coordinate carries the same number of active smoothing
+/// parameters. (The fix also length-checks the canonical-compacted
+/// `lambdas`/`edf_by_block` against the surviving-block count so a dropped
+/// rank-0 block can never silently misalign the stride.)
+#[test]
+fn shared_tangent_lambda_edf_grid_is_per_coordinate() {
+    let (headers, rows, y) = shared_tangent_formula_table();
+    let fit = gaussian_reml_fit_formula_table_impl(
+        headers,
+        rows,
+        "~ x + z + s(w)".to_string(),
+        y.view(),
+        None,
+        None,
+    )
+    .expect("shared-tangent REML must fit ~ x + z + s(w)");
+
+    let d = y.ncols();
+    assert_eq!(fit.lambdas.nrows(), d);
+    assert_eq!(fit.edf.nrows(), d);
+    assert_eq!(fit.lambdas.ncols(), fit.edf.ncols());
+    assert!(
+        fit.lambdas.ncols() >= 2,
+        "an s() smooth expands to >= 2 blocks"
+    );
+    assert!(
+        fit.lambdas.iter().all(|v| v.is_finite()),
+        "no grid cell may be NaN-padded by an off-the-end stride"
+    );
+    // Every tangent coordinate fits the identical replicated design, so
+    // each row must carry the same count of active (nonzero-λ) blocks.
+    let active_per_row: Vec<usize> = (0..d)
+        .map(|output| fit.lambdas.row(output).iter().filter(|v| **v > 0.0).count())
+        .collect();
+    assert!(
+        active_per_row.iter().all(|c| *c == active_per_row[0]),
+        "per-coordinate active-block counts diverged: {active_per_row:?}"
+    );
+}
+
+#[test]
+fn load_model_rejects_payload_version_mismatch() {
+    let model = FittedModel::from_payload(FittedModelPayload::new(
+        MODEL_VERSION + 1,
+        "y ~ x".to_string(),
+        ModelKind::Standard,
+        FittedFamily::Standard {
+            likelihood: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            link: Some(StandardLink::Identity),
+            latent_cloglog_state: None,
+            mixture_state: None,
+            sas_state: None,
+        },
+        "gaussian".to_string(),
+    ));
+    let mismatched_bytes = serde_json::to_vec(&model).expect("mismatched model should serialize");
+
+    let err = match load_model_impl(&mismatched_bytes) {
+        Ok(_) => panic!("load_model_impl should reject mismatched payload versions"),
+        Err(e) => e,
+    };
+    assert!(
+        err.contains("saved model payload schema mismatch"),
+        "unexpected error: {err}"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RemlForwardScalar {
+    Lambda,
+    RemlScore,
+    Coefficient(usize, usize),
+    Fitted(usize, usize),
+}
+
+fn by_gate_fd_design() -> Array2<f64> {
+    Array2::from_shape_fn((20, 5), |(row, col)| {
+        let t = (row as f64 - 9.5) / 8.0;
+        match col {
+            0 => 1.0,
+            1 => t,
+            2 => t * t - 0.45,
+            3 => (0.9 * t).sin() + 0.05 * t,
+            4 => (1.2 * t).cos() - 0.15 * t * t,
+            _ => unreachable!(),
+        }
+    })
+}
+
+fn by_gate_fd_response() -> Array2<f64> {
+    // The truth must NOT lie (essentially) in span(X). The design here is
+    // {1, t, t² - 0.45, sin(0.9t) + 0.05t, cos(1.2t) - 0.15t²}; a smooth
+    // polynomial plus low-frequency cos would be fit nearly to machine
+    // precision, driving σ² → 0 and ∂(score)/∂y ≈ ν w r / dp → ∞, at which
+    // point central FD with Richardson extrapolation cannot resolve the
+    // (analytic, exact) gradient at 1e-6 relative because the truncation
+    // term scales with f⁽⁵⁾(y). The high-frequency sin term below lies
+    // outside that span on t ∈ [-1.19, 1.31] and leaves a genuine residual
+    // so the analytic-vs-FD comparison is meaningful at strict tolerance.
+    Array2::from_shape_fn((20, 3), |(row, output)| {
+        let t = (row as f64 - 9.5) / 8.0;
+        let phase = output as f64 + 1.0;
+        0.2 + 0.35 * phase * t
+            + 0.18 * t * t
+            + (0.4 + 0.1 * phase) * (0.8 * t + 0.25 * phase).cos()
+            + 0.07 * (6.5 * t + 0.4 * phase).sin()
+    })
+}
+
+fn by_gate_fd_values() -> Array1<f64> {
+    Array1::from_shape_fn(20, |row| {
+        let t = (row as f64 - 9.5) / 8.0;
+        0.85 + 0.12 * (0.7 * t).sin() + 0.03 * t
+    })
+}
+
+fn by_gate_fd_weights() -> Array1<f64> {
+    Array1::from_shape_fn(20, |row| {
+        let t = (row as f64 - 9.5) / 8.0;
+        1.0 + 0.07 * (1.3 * t).cos() + 0.025 * t
+    })
+}
+
+fn by_gate_fd_penalty() -> Array2<f64> {
+    Array2::from_diag(&array![0.0, 0.4, 1.1, 1.9, 3.0])
+}
+
+fn by_gate_objective(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    by: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    target: RemlForwardScalar,
+    init_lambda: Option<f64>,
+) -> f64 {
+    let gated_x = apply_by_gate(x, by, 1).expect("by-gated design");
+    let fit = gaussian_reml_multi_closed_form_with_cache(
+        gated_x.view(),
+        y,
+        penalty,
+        Some(weights),
+        init_lambda,
+        None,
+    )
+    .expect("by-gated finite-difference forward fit");
+    match target {
+        RemlForwardScalar::Lambda => fit.lambda,
+        RemlForwardScalar::RemlScore => fit.reml_score,
+        RemlForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
+        RemlForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
+    }
+}
+
+fn by_gate_backward(
+    x: ArrayView2<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    by: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    target: RemlForwardScalar,
+) -> (Array2<f64>, Array2<f64>, Array1<f64>, Array1<f64>) {
+    let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+    let mut grad_fitted = Array2::<f64>::zeros(y.dim());
+    let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
+        RemlForwardScalar::Lambda => (1.0, 0.0, None, None),
+        RemlForwardScalar::RemlScore => (0.0, 1.0, None, None),
+        RemlForwardScalar::Coefficient(row, col) => {
+            grad_coefficients[[row, col]] = 1.0;
+            (0.0, 0.0, Some(grad_coefficients.view()), None)
+        }
+        RemlForwardScalar::Fitted(row, col) => {
+            grad_fitted[[row, col]] = 1.0;
+            (0.0, 0.0, None, Some(grad_fitted.view()))
+        }
+    };
+    let gated_x = apply_by_gate(x, by, 1).expect("by-gated design");
+    let backward = gaussian_reml_multi_closed_form_backward(
+        gated_x.view(),
+        y,
+        penalty,
+        Some(weights),
+        Some(0.85),
+        grad_lambda,
+        coefficient_upstream,
+        fitted_upstream,
+        grad_score,
+        0.0,
+    )
+    .expect("by-gated analytic backward");
+    let (grad_x, grad_by) =
+        apply_by_gate_backward(x, by, 1, backward.grad_x.view()).expect("by-gate backward");
+    (grad_x, backward.grad_y, grad_by, backward.grad_weights)
+}
+
+fn assert_fd_estimate_close(
+    label: &str,
+    analytic: f64,
+    finite_difference: f64,
+    finite_difference_error: f64,
+) {
+    let rel_tol = 1.0e-6_f64;
+    let abs_tol = 1.0e-6_f64;
+    // Loosen the tolerance by the caller's own FD-error estimate so the
+    // assertion does not flag differences that the FD discretization
+    // itself cannot resolve. The base abs/rel envelope handles
+    // analytic-side rounding; `finite_difference_error` covers
+    // truncation error from the FD stencil.
+    let tol = abs_tol
+        .max(rel_tol * analytic.abs().max(finite_difference.abs()))
+        .max(finite_difference_error.abs());
+    let diff = (analytic - finite_difference).abs();
+    assert!(
+        diff <= tol,
+        "{label}: analytic={analytic:.12e}, finite_difference={finite_difference:.12e}, diff={diff:.3e}, tol={tol:.3e}"
+    );
+}
+
+fn adaptive_finite_difference<F>(center: f64, step: f64, mut objective: F) -> (f64, f64)
+where
+    F: FnMut(f64) -> f64,
+{
+    let multipliers = [100.0_f64, 50.0, 25.0, 12.5, 6.25];
+    let scale = step * center.abs().max(1.0);
+    let mut best = f64::NAN;
+    let mut best_delta = f64::INFINITY;
+    let mut previous: Option<f64> = None;
+    for multiplier in multipliers {
+        let h = multiplier * scale;
+        let coarse = (objective(center + h) - objective(center - h)) / (2.0 * h);
+        let half_h = 0.5 * h;
+        let fine = (objective(center + half_h) - objective(center - half_h)) / (2.0 * half_h);
+        let estimate = fine + (fine - coarse) / 3.0;
+        if let Some(prev) = previous {
+            let delta = (estimate - prev).abs();
+            if delta < best_delta {
+                best_delta = delta;
+                best = estimate;
+            }
+        } else {
+            best = estimate;
+        }
+        previous = Some(estimate);
+    }
+    (best, best_delta)
+}
+
+fn blocks_reml_sign_inputs() -> (Vec<Array2<f64>>, Vec<Array2<f64>>, Array1<f64>, Array1<f64>) {
+    let n = 18;
+    let x1 = Array2::from_shape_fn((n, 3), |(row, col)| {
+        let t = (row as f64 + 0.5) / n as f64;
+        match col {
+            0 => 1.0,
+            1 => t - 0.45,
+            2 => (4.3 * t).sin() + 0.2 * t,
+            _ => unreachable!(),
+        }
+    });
+    let x2 = Array2::from_shape_fn((n, 2), |(row, col)| {
+        let t = (row as f64 + 0.5) / n as f64;
+        match col {
+            0 => (2.1 * t).cos() - 0.1,
+            1 => (7.7 * t + 0.3).sin(),
+            _ => unreachable!(),
+        }
+    });
+    let s1 = array![[0.7, 0.08, 0.02], [0.08, 1.3, -0.04], [0.02, -0.04, 2.1],];
+    let s2 = array![[0.9, -0.06], [-0.06, 1.8]];
+    let y = Array1::from_shape_fn(n, |row| {
+        let t = (row as f64 + 0.5) / n as f64;
+        0.25 + 0.35 * t + 0.18 * (5.0 * t).sin() + 0.09 * (11.0 * t + 0.2).cos()
+    });
+    let weights = Array1::from_shape_fn(n, |row| {
+        let t = (row as f64 + 0.5) / n as f64;
+        0.9 + 0.16 * (1.7 * t).cos()
+    });
+    (vec![x1, x2], vec![s1, s2], y, weights)
+}
+
+fn gaussian_reml_fit_blocks_forward_native(
+    designs: &[Array2<f64>],
+    penalties: &[Array2<f64>],
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    init_rhos: &[f64],
+) -> Result<
+    (
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        Array1<f64>,
+        f64,
+        Array1<f64>,
+    ),
+    EstimationError,
+> {
+    let n_rows = designs[0].nrows();
+    let mut col_offsets = vec![0usize];
+    for design in designs {
+        col_offsets.push(col_offsets.last().copied().unwrap() + design.ncols());
+    }
+    let p_total = *col_offsets.last().unwrap();
+    let mut joint_x = Array2::<f64>::zeros((n_rows, p_total));
+    for (block, design) in designs.iter().enumerate() {
+        joint_x
+            .slice_mut(s![.., col_offsets[block]..col_offsets[block + 1]])
+            .assign(design);
+    }
+    let s_list = penalties
+        .iter()
+        .enumerate()
+        .map(|(block, penalty)| {
+            gam::smooth::BlockwisePenalty::new(
+                col_offsets[block]..col_offsets[block + 1],
+                penalty.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let heuristic_lambdas = init_rhos.iter().map(|rho| rho.exp()).collect::<Vec<_>>();
+    let opts = gam::estimate::FitOptions {
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        sas_link: None,
+        optimize_sas: false,
+        compute_inference: true,
+        max_iter: 200,
+        tol: 1.0e-9,
+        nullspace_dims: vec![0; s_list.len()],
+        linear_constraints: None,
+        firth_bias_reduction: false,
+        adaptive_regularization: None,
+        penalty_shrinkage_floor: None,
+        rho_prior: Default::default(),
+        kronecker_penalty_system: None,
+        kronecker_factored: None,
+    };
+    let offset = Array1::<f64>::zeros(n_rows);
+    let fit = gam::estimate::fit_gamwith_heuristic_lambdas(
+        joint_x.clone(),
+        y,
+        weights,
+        offset.view(),
+        &s_list,
+        Some(heuristic_lambdas.as_slice()),
+        LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ),
+        &opts,
+    )?;
+    let beta = fit.beta.clone();
+    let fitted = joint_x.dot(&beta);
+    let lambdas = fit.lambdas.clone();
+    let log_lambdas = lambdas.mapv(|lambda| lambda.max(1.0e-300).ln());
+    let edf_vec = fit
+        .inference
+        .as_ref()
+        .map(|inference| inference.edf_by_block.clone())
+        .unwrap_or_else(|| vec![0.0; lambdas.len()]);
+    let edf = if edf_vec.len() == lambdas.len() {
+        Array1::from_vec(edf_vec)
+    } else {
+        Array1::zeros(lambdas.len())
+    };
+    Ok((beta, fitted, lambdas, log_lambdas, fit.reml_score, edf))
+}
+
+fn blocks_profile_reml_score(
+    designs: &[Array2<f64>],
+    penalties: &[Array2<f64>],
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    init_rhos: &[f64],
+) -> f64 {
+    let (_, _, _, _, reml_score, _) =
+        gaussian_reml_fit_blocks_forward_native(designs, penalties, y, weights, init_rhos)
+            .expect("multi-block Gaussian REML profile score");
+    reml_score
+}
+
+#[test]
+fn blocks_negative_reml_score_backward_sign_matches_profile_perturbations() {
+    assert!(file!().ends_with(".rs"));
+    let (designs, penalties, y, weights) = blocks_reml_sign_inputs();
+    let init_rhos = vec![0.2, -0.4];
+    let (_, _, _, log_lambdas, _, _) = gaussian_reml_fit_blocks_forward_native(
+        &designs,
+        &penalties,
+        y.view(),
+        weights.view(),
+        init_rhos.as_slice(),
+    )
+    .expect("base multi-block Gaussian REML fit");
+    let rhos = log_lambdas.to_vec();
+    let backward = gam::solver::gaussian_reml::gaussian_reml_fit_blocks_backward_analytic(
+        &designs,
+        &penalties,
+        y.view(),
+        weights.view(),
+        rhos.as_slice(),
+        None,
+        None,
+        None,
+        None,
+        1.0,
+        None,
+    )
+    .expect("negative REML score analytic VJP");
+    let eps = 1.0e-5;
+
+    for row in [2_usize, 11] {
+        let (fd, fd_error) = adaptive_finite_difference(y[row], eps, |candidate| {
+            let mut yp = y.clone();
+            yp[row] = candidate;
+            blocks_profile_reml_score(
+                &designs,
+                &penalties,
+                yp.view(),
+                weights.view(),
+                rhos.as_slice(),
+            )
+        });
+        assert_fd_estimate_close(
+            &format!("negative REML y[{row}] sign"),
+            backward.grad_y[[row, 0]],
+            fd,
+            fd_error,
+        );
+    }
+
+    for (block, row, col) in [(0_usize, 5_usize, 2_usize), (1, 12, 1)] {
+        let center = designs[block][[row, col]];
+        let (fd, fd_error) = adaptive_finite_difference(center, eps, |candidate| {
+            let mut xp = designs.clone();
+            xp[block][[row, col]] = candidate;
+            blocks_profile_reml_score(&xp, &penalties, y.view(), weights.view(), rhos.as_slice())
+        });
+        assert_fd_estimate_close(
+            &format!("negative REML X{block}[{row},{col}] sign"),
+            backward.grad_designs[block][[row, col]],
+            fd,
+            fd_error,
+        );
+    }
+
+    for (block, row, col) in [(0_usize, 1_usize, 1_usize), (1, 0, 1)] {
+        let center = penalties[block][[row, col]];
+        let (fd, fd_error) = adaptive_finite_difference(center, eps, |candidate| {
+            let mut sp = penalties.clone();
+            sp[block][[row, col]] = candidate;
+            sp[block][[col, row]] = candidate;
+            blocks_profile_reml_score(&designs, &sp, y.view(), weights.view(), rhos.as_slice())
+        });
+        let analytic = if row == col {
+            backward.grad_penalties[block][[row, col]]
+        } else {
+            backward.grad_penalties[block][[row, col]] + backward.grad_penalties[block][[col, row]]
+        };
+        assert_fd_estimate_close(
+            &format!("negative REML S{block}[{row},{col}] sign"),
+            analytic,
+            fd,
+            fd_error,
+        );
+    }
+
+    for row in [3_usize, 14] {
+        let (fd, fd_error) = adaptive_finite_difference(weights[row], eps, |candidate| {
+            let mut wp = weights.clone();
+            wp[row] = candidate;
+            blocks_profile_reml_score(&designs, &penalties, y.view(), wp.view(), rhos.as_slice())
+        });
+        assert_fd_estimate_close(
+            &format!("negative REML weight[{row}] sign"),
+            backward.grad_weights[row],
+            fd,
+            fd_error,
+        );
+    }
+}
+
+fn position_fd_inputs() -> (
+    Array1<f64>,
+    Array2<f64>,
+    Array1<f64>,
+    Array2<f64>,
+    Array1<f64>,
+    Array1<f64>,
+) {
+    let t = Array1::linspace(0.07, 0.93, 18);
+    // The truth must NOT lie in the span of the 6-basis periodic B-spline.
+    // A smooth low-frequency component alone would be fit to near machine
+    // precision (σ² → 0), at which point the FD comparison cannot resolve
+    // 1e-6 relative agreement against the analytic ∂(score)/∂y ∝ 1/dp. The
+    // high-frequency component below leaves a genuine residual.
+    let y = Array2::from_shape_fn((18, 2), |(row, col)| {
+        let x = t[row];
+        let phase = col as f64 + 1.0;
+        0.1 + 0.4 * phase * x
+            + (1.2 * x + 0.3 * phase).sin() * 0.25
+            + 0.05 * (9.0 * x + 0.4 * phase).sin()
+    });
+    let knots = Array1::linspace(0.0, 1.0, 7);
+    let penalty = Array2::from_diag(&array![0.0, 0.8, 1.1, 1.5, 2.0, 2.8]);
+    let by = Array1::from_shape_fn(18, |row| 0.9 + 0.1 * (2.0 * t[row]).cos());
+    let weights = Array1::from_shape_fn(18, |row| 1.0 + 0.06 * (1.4 * t[row]).sin());
+    (t, y, knots, penalty, by, weights)
+}
+
+fn position_objective(
+    t: ArrayView1<'_, f64>,
+    y: ArrayView2<'_, f64>,
+    by: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    knots: ArrayView1<'_, f64>,
+    penalty: ArrayView2<'_, f64>,
+    grad_lambda: f64,
+    grad_coefficients: ArrayView2<'_, f64>,
+    grad_fitted: ArrayView2<'_, f64>,
+    grad_reml_score: f64,
+) -> f64 {
+    let x = position_basis_design(t, knots, "bspline", 3, true, Some(1.0)).expect("position basis");
+    let gated_x = apply_by_gate(x.view(), by, 0).expect("by gate");
+    let fit = gaussian_reml_multi_closed_form_with_cache(
+        gated_x.view(),
+        y,
+        penalty,
+        Some(weights),
+        Some(0.7),
+        None,
+    )
+    .expect("position finite-difference fit");
+    grad_lambda * fit.lambda
+        + grad_reml_score * fit.reml_score
+        + (&fit.coefficients * &grad_coefficients).sum()
+        + (&fit.fitted * &grad_fitted).sum()
+}
+
+#[test]
+fn position_batched_forward_matches_prebuilt_by_gated_design() {
+    let (t, y, knots, penalty, by, _weights) = position_fd_inputs();
+    let offsets = array![0_usize, 9_usize, 18_usize];
+    let x = position_basis_design(t.view(), knots.view(), "bspline", 3, true, Some(1.0))
+        .expect("position basis");
+    let gated_x = apply_by_gate(x.view(), by.view(), 0).expect("by gate");
+
+    let expected = gaussian_reml_fit_batched_impl(
+        gated_x.view(),
+        y.view(),
+        offsets.view(),
+        penalty.view(),
+        None,
+        Some(0.7),
+    )
+    .expect("prebuilt batched fit");
+    let actual = gaussian_reml_fit_positions_batched_impl(
+        t.view(),
+        y.view(),
+        offsets.view(),
+        knots.view(),
+        "bspline",
+        3,
+        true,
+        Some(1.0),
+        penalty.view(),
+        None,
+        Some(0.7),
+        Some(by.view()),
+        0,
+    )
+    .expect("position batched fit");
+
+    assert_eq!(actual.statuses, expected.statuses);
+    for b in 0..2 {
+        assert!((actual.lambdas[b] - expected.lambdas[b]).abs() < 1.0e-12);
+        assert!((actual.reml_scores[b] - expected.reml_scores[b]).abs() < 1.0e-12);
+    }
+    for (actual, expected) in actual.coefficients.iter().zip(expected.coefficients.iter()) {
+        assert!((*actual - *expected).abs() < 1.0e-12);
+    }
+    for (actual, expected) in actual.fitted.iter().zip(expected.fitted.iter()) {
+        assert!((*actual - *expected).abs() < 1.0e-12);
+    }
+}
+
+#[test]
+fn position_batched_duchon_forward_matches_prebuilt_design() {
+    let t = Array1::linspace(0.05, 0.95, 16);
+    let y = Array2::from_shape_fn((t.len(), 2), |(row, output)| {
+        let u = t[row];
+        let scale = output as f64 + 1.0;
+        0.2 + 0.35 * scale * u + 0.12 * (5.0 * u + scale).sin()
+    });
+    let offsets = array![0_usize, 6_usize, 16_usize];
+    let centers = Array1::linspace(0.0, 1.0, 6);
+    let x = position_basis_design(t.view(), centers.view(), "duchon", 2, false, None)
+        .expect("Duchon position basis");
+    let penalty = Array2::from_diag(&Array1::from_shape_fn(x.ncols(), |col| {
+        0.2 + 0.15 * col as f64
+    }));
+
+    let expected = gaussian_reml_fit_batched_impl(
+        x.view(),
+        y.view(),
+        offsets.view(),
+        penalty.view(),
+        None,
+        Some(0.8),
+    )
+    .expect("prebuilt Duchon batched fit");
+    let actual = gaussian_reml_fit_positions_batched_impl(
+        t.view(),
+        y.view(),
+        offsets.view(),
+        centers.view(),
+        "duchon",
+        2,
+        false,
+        None,
+        penalty.view(),
+        None,
+        Some(0.8),
+        None,
+        0,
+    )
+    .expect("streamed Duchon position batched fit");
+
+    assert_eq!(actual.statuses, expected.statuses);
+    for b in 0..2 {
+        assert!((actual.lambdas[b] - expected.lambdas[b]).abs() < 1.0e-11);
+        assert!((actual.reml_scores[b] - expected.reml_scores[b]).abs() < 1.0e-10);
+    }
+    for (actual, expected) in actual.coefficients.iter().zip(expected.coefficients.iter()) {
+        assert!((*actual - *expected).abs() < 1.0e-10);
+    }
+    for (actual, expected) in actual.fitted.iter().zip(expected.fitted.iter()) {
+        assert!((*actual - *expected).abs() < 1.0e-10);
+    }
+}
+
+#[test]
+fn position_backward_grad_t_y_by_and_weight_match_finite_difference() {
+    assert!(file!().ends_with(".rs"));
+    let (t, y, knots, penalty, by, weights) = position_fd_inputs();
+    let x = position_basis_design(t.view(), knots.view(), "bspline", 3, true, Some(1.0))
+        .expect("position basis");
+    let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
+    grad_coefficients[[3, 1]] = -0.25;
+    let grad_fitted = Array2::from_shape_fn(y.dim(), |(row, col)| {
+        0.02 * (row as f64 + 1.0) - 0.03 * (col as f64 + 1.0)
+    });
+    let grad_lambda = 0.17;
+    let grad_reml_score = -0.11;
+    let backward = gaussian_reml_fit_positions_backward_impl(
+        t.view(),
+        y.view(),
+        knots.view(),
+        "bspline",
+        3,
+        true,
+        Some(1.0),
+        penalty.view(),
+        Some(weights.view()),
+        Some(0.7),
+        grad_lambda,
+        Some(grad_coefficients.view()),
+        Some(grad_fitted.view()),
+        grad_reml_score,
+        0.0,
+        Some(by.view()),
+        0,
+        None,
+    )
+    .expect("position analytic backward");
+    let grad_by = backward.grad_by.expect("by gradient");
+    let eps = 1.0e-5;
+
+    for row in [2_usize, 8, 15] {
+        let (fd, fd_error) = adaptive_finite_difference(t[row], eps, |candidate| {
+            let mut perturbed = t.clone();
+            perturbed[row] = candidate;
+            position_objective(
+                perturbed.view(),
+                y.view(),
+                by.view(),
+                weights.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )
+        });
+        assert_fd_estimate_close(
+            &format!("position t[{row}]"),
+            backward.grad_t[row],
+            fd,
+            fd_error,
+        );
+    }
+
+    for (row, col) in [(1_usize, 0_usize), (10, 1)] {
+        let (fd, fd_error) = adaptive_finite_difference(y[[row, col]], eps, |candidate| {
+            let mut perturbed = y.clone();
+            perturbed[[row, col]] = candidate;
+            position_objective(
+                t.view(),
+                perturbed.view(),
+                by.view(),
+                weights.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )
+        });
+        assert_fd_estimate_close(
+            &format!("position y[{row},{col}]"),
+            backward.grad_y[[row, col]],
+            fd,
+            fd_error,
+        );
+    }
+
+    for row in [0_usize, 9, 17] {
+        let (fd, fd_error) = adaptive_finite_difference(by[row], eps, |candidate| {
+            let mut perturbed = by.clone();
+            perturbed[row] = candidate;
+            position_objective(
+                t.view(),
+                y.view(),
+                perturbed.view(),
+                weights.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )
+        });
+        assert_fd_estimate_close(&format!("position by[{row}]"), grad_by[row], fd, fd_error);
+    }
+
+    for row in [1_usize, 7, 13] {
+        let (fd, fd_error) = adaptive_finite_difference(weights[row], eps, |candidate| {
+            let mut perturbed = weights.clone();
+            perturbed[row] = candidate;
+            position_objective(
+                t.view(),
+                y.view(),
+                by.view(),
+                perturbed.view(),
+                knots.view(),
+                penalty.view(),
+                grad_lambda,
+                grad_coefficients.view(),
+                grad_fitted.view(),
+                grad_reml_score,
+            )
+        });
+        assert_fd_estimate_close(
+            &format!("position weights[{row}]"),
+            backward.grad_weights[row],
+            fd,
+            fd_error,
+        );
+    }
+}
+
+#[test]
+fn by_gate_backward_matches_forward_finite_difference_for_all_x_y_gate_and_weight_entries() {
+    assert!(file!().ends_with(".rs"));
+    let x = by_gate_fd_design();
+    let y = by_gate_fd_response();
+    let by = by_gate_fd_values();
+    let weights = by_gate_fd_weights();
+    let penalty = by_gate_fd_penalty();
+    let targets = [
+        RemlForwardScalar::Lambda,
+        RemlForwardScalar::RemlScore,
+        RemlForwardScalar::Coefficient(4, 2),
+        RemlForwardScalar::Fitted(11, 1),
+    ];
+    let eps = 1.0e-5;
+    let gated_x = apply_by_gate(x.view(), by.view(), 1).expect("by-gated design");
+    let base_fit = gaussian_reml_multi_closed_form_with_cache(
+        gated_x.view(),
+        y.view(),
+        penalty.view(),
+        Some(weights.view()),
+        Some(0.85),
+        None,
+    )
+    .expect("base by-gated finite-difference fit");
+    let fd_init_lambda = Some(base_fit.lambda);
+
+    for target in targets {
+        let fd_scale = 1.0_f64;
+        let (grad_x, grad_y, grad_by, grad_weights) = by_gate_backward(
+            x.view(),
+            y.view(),
+            by.view(),
+            weights.view(),
+            penalty.view(),
+            target,
+        );
+
+        for row in 0..x.nrows() {
+            for col in 0..x.ncols() {
+                let (fd, fd_error) = adaptive_finite_difference(x[[row, col]], eps, |candidate| {
+                    let mut perturbed = x.clone();
+                    perturbed[[row, col]] = candidate;
+                    by_gate_objective(
+                        perturbed.view(),
+                        y.view(),
+                        by.view(),
+                        weights.view(),
+                        penalty.view(),
+                        target,
+                        fd_init_lambda,
+                    )
+                });
+                assert_fd_estimate_close(
+                    &format!("target={target:?} x[{row},{col}]"),
+                    grad_x[[row, col]],
+                    fd_scale * fd,
+                    fd_scale.abs() * fd_error,
+                );
+            }
+        }
+
+        for row in 0..y.nrows() {
+            for col in 0..y.ncols() {
+                let (fd, fd_error) = adaptive_finite_difference(y[[row, col]], eps, |candidate| {
+                    let mut perturbed = y.clone();
+                    perturbed[[row, col]] = candidate;
+                    by_gate_objective(
+                        x.view(),
+                        perturbed.view(),
+                        by.view(),
+                        weights.view(),
+                        penalty.view(),
+                        target,
+                        fd_init_lambda,
+                    )
+                });
+                assert_fd_estimate_close(
+                    &format!("target={target:?} y[{row},{col}]"),
+                    grad_y[[row, col]],
+                    fd_scale * fd,
+                    fd_scale.abs() * fd_error,
+                );
+            }
+        }
+
+        for row in 0..by.len() {
+            let (fd, fd_error) = adaptive_finite_difference(by[row], eps, |candidate| {
+                let mut perturbed = by.clone();
+                perturbed[row] = candidate;
+                by_gate_objective(
+                    x.view(),
+                    y.view(),
+                    perturbed.view(),
+                    weights.view(),
+                    penalty.view(),
+                    target,
+                    fd_init_lambda,
+                )
+            });
+            assert_fd_estimate_close(
+                &format!("target={target:?} by[{row}]"),
+                grad_by[row],
+                fd_scale * fd,
+                fd_scale.abs() * fd_error,
+            );
+        }
+
+        for row in 0..weights.len() {
+            let (fd, fd_error) = adaptive_finite_difference(weights[row], eps, |candidate| {
+                let mut perturbed = weights.clone();
+                perturbed[row] = candidate;
+                by_gate_objective(
+                    x.view(),
+                    y.view(),
+                    by.view(),
+                    perturbed.view(),
+                    penalty.view(),
+                    target,
+                    fd_init_lambda,
+                )
+            });
+            assert_fd_estimate_close(
+                &format!("target={target:?} weights[{row}]"),
+                grad_weights[row],
+                fd_scale * fd,
+                fd_scale.abs() * fd_error,
+            );
+        }
+    }
+}
+
+#[test]
+fn batched_state_round_trip_matches_refit() {
+    // Document the Task 3 state round-trip contract on the BATCHED
+    // pyffi entry: backward called with `forward_state` set to the dict
+    // returned by the matching forward must produce gradients that are
+    // bit-exact identical to backward called without `forward_state`
+    // (which refits internally). Guards against drift between
+    // `_from_fit` and `_backward` for the batched path under any future
+    // change to either branch.
+    use ndarray::{array, s};
+
+    let x = array![
+        [1.0, -1.0],
+        [1.0, -0.5],
+        [1.0, 0.0],
+        [1.0, 0.5],
+        [1.0, 1.0],
+        [1.0, -0.8],
+        [1.0, -0.2],
+        [1.0, 0.3],
+        [1.0, 0.7],
+        [1.0, 1.2],
+    ];
+    let y = array![
+        [0.4, -0.2],
+        [0.6, 0.1],
+        [0.9, 0.3],
+        [1.3, 0.4],
+        [1.8, 0.6],
+        [0.5, -0.1],
+        [0.7, 0.2],
+        [1.0, 0.3],
+        [1.4, 0.5],
+        [1.9, 0.7]
+    ];
+    let weights = array![1.0, 0.95, 1.05, 1.0, 0.98, 1.02, 0.99, 1.0, 1.01, 0.97];
+    let row_offsets = array![0usize, 5, 10];
+    let penalty = array![[0.0, 0.0], [0.0, 1.0]];
+    let init_lambda = Some(0.85_f64);
+
+    let forward = gaussian_reml_fit_batched_impl(
+        x.view(),
+        y.view(),
+        row_offsets.view(),
+        penalty.view(),
+        Some(weights.view()),
+        init_lambda,
+    )
+    .expect("batched forward");
+    let prebuilt_fits = (0..(row_offsets.len() - 1))
+        .map(|b| {
+            let start = row_offsets[b];
+            let end = row_offsets[b + 1];
+            let cache = gam::gaussian_reml::GaussianRemlEigenCache {
+                penalty_eigenvalues: forward
+                    .cache_penalty_eigenvalues
+                    .slice(s![b, ..])
+                    .to_owned(),
+                eigenvectors: forward.cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
+                coefficient_basis: forward
+                    .cache_coefficient_basis
+                    .slice(s![b, .., ..])
+                    .to_owned(),
+                xtwx_fingerprint: forward.cache_xtwx_fingerprints[b],
+                penalty_fingerprint: forward.cache_penalty_fingerprints[b],
+                logdet_xtwx: forward.cache_logdet_xtwx[b],
+                logdet_penalty_positive: forward.cache_logdet_penalty_positive[b],
+                penalty_rank: forward.cache_penalty_ranks[b] as usize,
+                nullity: forward.cache_nullities[b] as usize,
+            };
+            Some(gam::gaussian_reml::GaussianRemlMultiResult {
+                lambda: forward.lambdas[b],
+                rho: forward.rhos[b],
+                coefficients: forward.coefficients.slice(s![b, .., ..]).to_owned(),
+                fitted: forward.fitted.slice(s![start..end, ..]).to_owned(),
+                reml_score: forward.reml_scores[b],
+                reml_grad_lambda: forward.reml_grad_lambdas[b],
+                reml_hess_lambda: forward.reml_hess_lambdas[b],
+                reml_grad_rho: forward.reml_grad_rhos[b],
+                reml_hess_rho: forward.reml_hess_rhos[b],
+                edf: forward.edf[b],
+                sigma2: forward.sigma2.slice(s![b, ..]).to_owned(),
+                cache,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let grad_lambda = array![0.2, -0.1];
+    let grad_reml_score = array![-0.05, 0.08];
+
+    let refit = gaussian_reml_fit_batched_backward_impl(
+        x.view(),
+        y.view(),
+        row_offsets.view(),
+        penalty.view(),
+        Some(weights.view()),
+        init_lambda,
+        Some(grad_lambda.view()),
+        None,
+        None,
+        Some(grad_reml_score.view()),
+        None,
+        None,
+    )
+    .expect("refit backward");
+    let from_fits = gaussian_reml_fit_batched_backward_impl(
+        x.view(),
+        y.view(),
+        row_offsets.view(),
+        penalty.view(),
+        Some(weights.view()),
+        init_lambda,
+        Some(grad_lambda.view()),
+        None,
+        None,
+        Some(grad_reml_score.view()),
+        None,
+        Some(&prebuilt_fits),
+    )
+    .expect("from_fits backward");
+
+    for (a, b) in refit.grad_x.iter().zip(from_fits.grad_x.iter()) {
+        assert!((a - b).abs() <= 1.0e-12);
+    }
+    for (a, b) in refit.grad_y.iter().zip(from_fits.grad_y.iter()) {
+        assert!((a - b).abs() <= 1.0e-12);
+    }
+    for (a, b) in refit.grad_weights.iter().zip(from_fits.grad_weights.iter()) {
+        assert!((a - b).abs() <= 1.0e-12);
+    }
+}
+
+/// Regression test for issue #174: the joint LSQ seed for K=2 IBP-MAP
+/// must produce a non-zero decoder and a residual smaller than the
+/// trivial zero-decoder baseline. Without this seed the joint Newton
+/// driver collapses A → 0 before any data signal accumulates.
+#[test]
+fn sae_decoder_lsq_init_produces_nontrivial_seed() {
+    use ndarray::Array3;
+    let n = 50usize;
+    let p = 4usize;
+    let k = 2usize;
+    let m = 3usize;
+    let mut z = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let a = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+        z[[i, 0]] = a.sin();
+        z[[i, 1]] = a.cos();
+        z[[i, 2]] = (2.0 * a).sin();
+        z[[i, 3]] = (2.0 * a).cos();
+    }
+    // Build padded basis_values (K, N, M_max=m).
+    let mut basis = Array3::<f64>::zeros((k, n, m));
+    for atom_idx in 0..k {
+        let shift = (atom_idx as f64) * 0.21;
+        for i in 0..n {
+            let a = 2.0 * std::f64::consts::PI * ((i as f64) / (n as f64) + shift);
+            basis[[atom_idx, i, 0]] = 1.0;
+            basis[[atom_idx, i, 1]] = a.sin();
+            basis[[atom_idx, i, 2]] = a.cos();
+        }
+    }
+    let basis_sizes = vec![m; k];
+    let logits = Array2::<f64>::zeros((n, k));
+    let decoder = sae_decoder_lsq_init(
+        basis.view(),
+        &basis_sizes,
+        z.view(),
+        logits.view(),
+        "ibp_map",
+        0.7,
+    )
+    .expect("LSQ seed must succeed");
+    assert_eq!(decoder.shape(), &[k, m, p]);
+    let mut max_abs = 0.0_f64;
+    for v in decoder.iter() {
+        assert!(v.is_finite());
+        if v.abs() > max_abs {
+            max_abs = v.abs();
+        }
+    }
+    assert!(
+        max_abs > 1.0e-3,
+        "LSQ-seeded decoder should be non-trivial; max |B| = {max_abs:.6}"
+    );
+
+    // The seeded reconstruction must explain at least some of Z. With
+    // IBP-MAP iter-0 weights a_k = 0.5 for every k, fitted[i,:] =
+    // 0.5 * Σ_k Phi_k[i,:] · B_k.
+    let mut fitted = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        for j in 0..p {
+            let mut acc = 0.0;
+            for atom_idx in 0..k {
+                let mut atom_out = 0.0;
+                for col in 0..m {
+                    atom_out += basis[[atom_idx, i, col]] * decoder[[atom_idx, col, j]];
+                }
+                acc += 0.5 * atom_out;
+            }
+            fitted[[i, j]] = acc;
+        }
+    }
+    let mut ssr = 0.0;
+    let mut sst = 0.0;
+    for i in 0..n {
+        for j in 0..p {
+            let r = z[[i, j]] - fitted[[i, j]];
+            ssr += r * r;
+            sst += z[[i, j]] * z[[i, j]];
+        }
+    }
+    let r2 = 1.0 - ssr / sst.max(1.0e-12);
+    assert!(
+        r2 > 0.5,
+        "LSQ-seeded iter-0 reconstruction R² = {r2:.4} should explain most of the signal"
+    );
+}
+
+/// Regression test for issue #629: the cold-start residual seed must break
+/// the symmetric saddle of a uniform logit init by preferring, per row, the
+/// atom whose seed geometry best reconstructs that row. Planted: two
+/// periodic atoms with distinct seed phases driving disjoint output blocks
+/// with known one-hot routing. The seed logits must (a) not be uniform and
+/// (b) argmax-route most rows to their generating atom.
+#[test]
+fn sae_residual_seed_logits_breaks_symmetry_and_routes() {
+    use ndarray::Array3;
+    let n = 64usize;
+    let p = 4usize;
+    let k = 2usize;
+    let m = 3usize;
+    let two_pi = std::f64::consts::TAU;
+    // Distinct seed phase per atom — mimics the PCA seed handing each
+    // periodic atom a different coordinate frame.
+    let phase = [0.0_f64, 0.3_f64];
+    // Deterministic pseudo-random latent + balanced shuffled routing.
+    let mut t = vec![0.0_f64; n];
+    let mut assign = vec![0usize; n];
+    let mut state = 0x1234_5678_9abc_def0_u64;
+    for i in 0..n {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        t[i] = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
+        assign[i] = if i < n / 2 { 0 } else { 1 };
+    }
+    for i in (1..n).rev() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let j = (state >> 33) as usize % (i + 1);
+        assign.swap(i, j);
+    }
+    // Per-atom seed basis (N, m) padded into (K, N, m).
+    let mut basis = Array3::<f64>::zeros((k, n, m));
+    for atom_idx in 0..k {
+        for i in 0..n {
+            let a = two_pi * (t[i] + phase[atom_idx]);
+            basis[[atom_idx, i, 0]] = 1.0;
+            basis[[atom_idx, i, 1]] = a.sin();
+            basis[[atom_idx, i, 2]] = a.cos();
+        }
+    }
+    // Disjoint decoder blocks: atom 0 -> cols [0,1], atom 1 -> cols [2,3].
+    let mut blocks = vec![Array2::<f64>::zeros((m, p)); k];
+    blocks[0][[1, 0]] = 1.5;
+    blocks[0][[2, 1]] = -1.2;
+    blocks[1][[1, 2]] = 1.3;
+    blocks[1][[2, 3]] = 0.9;
+    let mut z = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let kk = assign[i];
+        for j in 0..p {
+            let mut acc = 0.0;
+            for col in 0..m {
+                acc += basis[[kk, i, col]] * blocks[kk][[col, j]];
+            }
+            z[[i, j]] = acc;
+        }
+    }
+    let basis_sizes = vec![m; k];
+    let logits = sae_residual_seed_logits(basis.view(), &basis_sizes, z.view(), 4.0)
+        .expect("residual seed must succeed");
+    assert_eq!(logits.shape(), &[n, k]);
+    assert!(logits.iter().all(|v| v.is_finite()));
+
+    // (a) Symmetry must be broken: at least one row has a non-trivial gap.
+    let max_gap = (0..n)
+        .map(|i| (logits[[i, 0]] - logits[[i, 1]]).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_gap > 0.3,
+        "residual seed left a near-symmetric logit field (max gap {max_gap:.4}); \
+             the uniform saddle would not be escaped"
+    );
+
+    // (b) The seed must route most rows to their generating atom, up to
+    // the trivial atom-label permutation.
+    let mut acc_direct = 0usize;
+    for i in 0..n {
+        let winner = if logits[[i, 0]] >= logits[[i, 1]] {
+            0
+        } else {
+            1
+        };
+        if winner == assign[i] {
+            acc_direct += 1;
+        }
+    }
+    let acc = (acc_direct.max(n - acc_direct)) as f64 / n as f64;
+    assert!(
+        acc >= 0.9,
+        "residual seed routing accuracy {acc:.3} (up to permutation) is too low; \
+             the E-step seed should recover the planted one-hot assignment"
+    );
+}
+
+/// CV-fold partitioning contract used by the benchmark suite:
+/// every row appears in exactly one test fold and not in its own
+/// train set, both partitions are non-empty per fold, and the
+/// stratified path balances class counts across folds.
+#[test]
+fn make_folds_indices_kfold_partitions_unstratified() {
+    let n = 50usize;
+    let y: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let folds = make_folds_indices(y, 5, 7, false).expect("5-fold should succeed");
+    assert_eq!(folds.len(), 5);
+
+    let mut seen = vec![0usize; n];
+    for (train, test) in &folds {
+        assert!(!train.is_empty(), "every fold has a non-empty train set");
+        assert!(!test.is_empty(), "every fold has a non-empty test set");
+        let train_set: std::collections::HashSet<usize> = train.iter().copied().collect();
+        for &i in test {
+            assert!(
+                !train_set.contains(&i),
+                "row {i} appears in both train and test of a fold"
+            );
+            seen[i] += 1;
+        }
+        assert_eq!(
+            train.len() + test.len(),
+            n,
+            "train + test must cover the full row set"
+        );
+    }
+    for (i, &count) in seen.iter().enumerate() {
+        assert_eq!(count, 1, "row {i} must appear in exactly one test fold");
+    }
+}
+
+#[test]
+fn make_folds_indices_stratified_balances_classes() {
+    // 30 positives, 20 negatives.
+    let mut y = vec![1.0; 30];
+    y.extend(std::iter::repeat(0.0).take(20));
+    let folds = make_folds_indices(y, 5, 11, true).expect("stratified 5-fold");
+    assert_eq!(folds.len(), 5);
+
+    for (_, test) in &folds {
+        let positives = test.iter().filter(|&&i| i < 30).count();
+        let negatives = test.iter().filter(|&&i| i >= 30).count();
+        // 30 / 5 = 6 positives per fold, 20 / 5 = 4 negatives.
+        assert_eq!(positives, 6, "stratified fold positive count");
+        assert_eq!(negatives, 4, "stratified fold negative count");
+    }
+}
+
+#[test]
+fn make_folds_indices_holdout_partitions_with_split() {
+    let n = 25usize;
+    let y: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let folds = make_folds_indices(y, 1, 42, false).expect("holdout split");
+    assert_eq!(folds.len(), 1);
+    let (train, test) = &folds[0];
+    assert!(!train.is_empty());
+    assert!(!test.is_empty());
+    assert_eq!(train.len() + test.len(), n);
+    // 1/5 holdout convention: n/5 = 5 rows in test.
+    assert_eq!(test.len(), 5);
+    // Train and test must be disjoint.
+    let train_set: std::collections::HashSet<usize> = train.iter().copied().collect();
+    assert!(test.iter().all(|&i| !train_set.contains(&i)));
+}
+
+#[test]
+fn make_folds_indices_seed_determinism_and_variation() {
+    let n = 40usize;
+    let y: Vec<f64> = (0..n).map(|i| i as f64).collect();
+    let a = make_folds_indices(y.clone(), 5, 17, false).expect("seed=17");
+    let b = make_folds_indices(y.clone(), 5, 17, false).expect("seed=17 (repeat)");
+    let c = make_folds_indices(y, 5, 18, false).expect("seed=18");
+    assert_eq!(a, b, "same seed must reproduce the same fold layout");
+    assert_ne!(a, c, "different seeds should produce different layouts");
+}
+
+#[test]
+fn gaussian_log_loss_value_matches_closed_form() {
+    // log-loss = mean of 0.5·log(2π σ²) + 0.5·((y-μ)/σ)²
+    // With y = μ everywhere, the squared-residual term vanishes and the
+    // loss is exactly 0.5·log(2π σ²).
+    let y = vec![1.0, 2.0, 3.0, 4.0];
+    let mu = vec![1.0, 2.0, 3.0, 4.0];
+    let sigma_scalar = vec![1.5];
+    let got = gaussian_log_loss_value(&y, &mu, &sigma_scalar, 1.0e-12).expect("log-loss");
+    let expected = 0.5 * (std::f64::consts::TAU * 1.5 * 1.5).ln();
+    assert!(
+        (got - expected).abs() < 1.0e-12,
+        "log-loss with y=μ should equal 0.5·log(2π σ²) = {expected}, got {got}"
+    );
+
+    // Per-row σ matches the scalar broadcast when all entries agree.
+    let sigma_vec = vec![1.5; y.len()];
+    let got_vec = gaussian_log_loss_value(&y, &mu, &sigma_vec, 1.0e-12).expect("vec sigma");
+    assert!((got_vec - got).abs() < 1.0e-12);
+}
+
+#[test]
+fn gaussian_log_loss_value_rejects_invalid_sigma_length() {
+    let y = vec![0.0, 1.0, 2.0];
+    let mu = vec![0.0, 1.0, 2.0];
+    let bad_sigma = vec![1.0, 2.0]; // length 2 with n=3
+    assert!(gaussian_log_loss_value(&y, &mu, &bad_sigma, 1.0e-12).is_err());
+}
+
+#[test]
+fn make_folds_indices_rejects_invalid_inputs() {
+    // n_splits == 0
+    assert!(make_folds_indices(vec![0.0, 1.0], 0, 0, false).is_err());
+    // empty y
+    assert!(make_folds_indices(Vec::<f64>::new(), 5, 0, false).is_err());
+    // n < n_splits (kfold)
+    assert!(make_folds_indices(vec![0.0, 1.0], 5, 0, false).is_err());
+    // non-finite y
+    assert!(make_folds_indices(vec![0.0, f64::NAN, 1.0], 2, 0, false).is_err());
+    assert!(make_folds_indices(vec![0.0, f64::INFINITY, 1.0], 2, 0, false).is_err());
+}

@@ -1,93 +1,14 @@
-//! GPU device backend for survival marginal-slope FLEX row primitives.
+//! Survival marginal-slope FLEX GPU row primitives.
 //!
-//! Block 8 roadmap (math team — `SurvivalMarginalSlope` analogue of
-//! `bms_flex`):
-//!
-//!   1. **Rigid row kernel (this commit)**: NVRTC source covering the
-//!      flex=false 4-primary subset `(q_0, q_1, q̇_1, g)`.  Mirrors
-//!      `row_primary_closed_form` in `src/families/survival_marginal_slope.rs`
-//!      term-for-term:
-//!         η_0 = q_0·c + s·g·z      c   = √(1 + (s·g)²)
-//!         η_1 = q_1·c + s·g·z      c₁  = s²·g/c
-//!         a_1 = q̇_1·c              c₂  = s²/c³
-//!      The row NLL is the standard probit survival kernel
-//!         ℓ = w[(1-d)·(-log Φ(-η_1)) + log Φ(-η_0)
-//!               - d·log φ(η_1) - d·log(a_1)],
-//!      and the row gradient / Hessian come from the chain rule through
-//!      `(η_0, η_1, a_1)`.  Sign convention matches the CPU: the host
-//!      accumulator adds `+H_i` for the (positive-NLL) observed-information
-//!      curvature and `+grad_i` for the NLL gradient.
-//!   2. **Device cubic-cell runtime**: breakpoint union, finite-cell cubic
-//!      coefficients, 384-pt Gauss-Legendre moment evaluator.  Validated
-//!      against CPU moments before assembling the row likelihood.
-//!   3. **Device intercept solve**: warm-started monotone root for the
-//!      flex calibration equation `F(a) = ⟨Φ(-η(z;a))⟩ - Φ(-q) = 0`.
-//!   4. **Full timepoint jet**: `a_u`, `a_uv` and the total η/χ
-//!      derivatives needed for the row gradient & Hessian.
-//!   5. **Row-primary G, H assembly** using Mills ratio λ and log Φ
-//!      derivatives in the form `A(η) = log Φ(-η)`, `B(η) = -log Φ(-η)`.
-//!   6. **Three GPU entry points** (`try_survival_flex_gradient`,
-//!      `try_survival_flex_hvp`, `try_survival_flex_dense_hessian`) that
-//!      all share the same per-row primitive.  Each returns `Ok(None)` for
-//!      unsupported shapes (vector score, timewiggle, missing CUDA) so the
-//!      dispatcher can fall through to CPU; only `gpu=force` against an
-//!      unsupported route returns `Err`.
-//!   7. **Hill-climb** (warp-cooperative GL loop, persistent warm-start,
-//!      specialized dense-H kernel for m ≤ 64).
-//!
-//! Until later steps land the flex / aggregator code paths stay on CPU;
-//! the rigid kernel from Step 1 is exposed for direct parity testing and
-//! reused by the higher-level steps once they wire the host orchestration
-//! around it.
-//!
-//! #461 absorber (additive Stage-1 influence block) — survival path differs
-//! from the BMS A2 (widened-marginal) realization. The survival linear
-//! predictor is `η₀ = q₀·c(g) + s_f·g·z`, `η₁ = q₁·c(g) + s_f·g·z`: the
-//! marginal/location index enters through the time-quantiles `q₀`/`q₁`, each
-//! **scaled by `c(g)`**. A plain-additive absorber (chain factor `∂η/∂γ = 1`,
-//! NOT `×c`) therefore cannot be folded into `q₀`/`q₁`; the CPU path
-//! (`survival_marginal_slope.rs`) realizes it as a **dedicated additive η
-//! channel** `o_infl` — a single trailing primary scalar appended to
-//! `FlexPrimarySlices` after the link-deviation `w` block, so the primary
-//! vector becomes `[q₀, q₁, q̇₁, g, h…, w…, o_infl]` and `r = primary.total`
-//! grows by 1 when the absorber is active. Per row `o_infl = Z̃_infl[row,:]·γ`
-//! (the `n×p₁` design `Z̃_infl` projects `p₁` coeffs → the scalar), and it is
-//! added to **both** `η₀` and `η₁`. It is a pure additive shift of the
-//! OBSERVED index: it does NOT enter the de-nesting calibration integral, so
-//! `∂a/∂o_infl = 0` and `χ₁ = ∂η₁/∂a`, `d`, and the cell coefficients are all
-//! unchanged. The absorber is **flex-only** (active only under
-//! `FlexActivation::On`). Block-Hessian order is
-//! `[Time, Marginal, Logslope, ScoreWarp, LinkDev, Influence]` (Influence
-//! LAST); the host `ParameterBlockSpec` carries gauge 130 + a fixed ridge
-//! (`INFLUENCE_ABSORBER_FIXED_LOG_LAMBDA = 0.0`, not REML) — both host-side
-//! concerns, not GPU. Authoritative CPU reference: `add_pullback` in
-//! `survival_marginal_slope.rs` (commit `36f373be7`).
-//!
-//! When the flex GPU kernels land, they must carry the `infl` primary coord in
-//! the per-row jet exactly as the CPU does: in flex-jet terms set `rho[infl] =
-//! 1` so `eta_u[infl] = chi·a_u[infl] + rho[infl] = 1` at BOTH timepoints, and
-//! ZERO everything else for the coord — `eta_uv[infl,·] = 0`, `chi_u[infl] =
-//! chi_uv[infl,·] = 0`, `d_u[infl] = d_uv[infl,·] = 0`, and the cell-coeff
-//! partials `coeff_u[infl] = 0` (`o_infl` never enters cells). The block-Hessian
-//! pullback then projects the `infl` primary through the `Z̃_infl` design
-//! (`n×p₁`) EXACTLY like the scalar `g` primary projects through
-//! `logslope_design`: `H(infl,infl) = primary_hessian[infl,infl]·Z̃[row]⊗Z̃[row]`,
-//! and cross `H(blk,infl) = primary_hessian[blk_primary, infl]·design_blk[row]
-//! ⊗ Z̃[row]` (time uses primaries {0,1,2}, marginal {0,1}, logslope {3},
-//! score_warp/link_dev their ranges). The RIGID GPU kernel below stays a fixed
-//! 4-primary `(q₀,q₁,q̇₁,g)` kernel — it is the `flex=false` path and never
-//! sees an absorber. Until the flex GPU kernels carry `infl`, the host
-//! `build_survival_flex_gpu_row_batch` must fall back to CPU (`Ok(None)`)
-//! whenever the absorber is active, so the 4-primary batch
-//! never silently drops `o_infl`. The block is dropped at predict (the
-//! absorber is training-only).
+//! The kernels here are domain math for `SurvivalMarginalSlope`; CUDA runtime,
+//! memory, and policy ownership stays in [`crate::gpu`].
 
 use std::sync::OnceLock;
 
 use ndarray::{Array1, Array2};
 
-use super::error::GpuError;
-use super::{GpuDecision, GpuKernel, decide};
+use crate::gpu::error::GpuError;
+use crate::gpu::{GpuDecision, GpuKernel, decide};
 
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
@@ -95,21 +16,17 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use cudarc::driver::CudaModule;
 
-// ────────────────────────────────────────────────────────────────────────
-// Policy entry points (parallels `bms_flex::row_primary_hessian_decision`).
-// ────────────────────────────────────────────────────────────────────────
-
 /// Decide whether the survival-flex GPU row primary path is eligible for
 /// this fit's `(n, r)`.  `r == 0` (no primary jets to process) and below
 /// the runtime row-kernel threshold force CPU.
 #[must_use]
 pub fn row_primary_hessian_decision(n: usize, r: usize) -> GpuDecision {
-    let large_enough = super::runtime::GpuRuntime::global()
+    let large_enough = crate::gpu::runtime::GpuRuntime::global()
         .map(|runtime| n >= runtime.policy().row_kernel_min_n && r > 0)
         .unwrap_or(false);
     decide(
         GpuKernel::MarginalSlopeRows,
-        super::GpuEligibility::from_flags(SurvivalFlexGpuBackend::compiled(), large_enough),
+        crate::gpu::GpuEligibility::from_flags(SurvivalFlexGpuBackend::compiled(), large_enough),
     )
 }
 
@@ -475,7 +392,7 @@ extern "C" __global__ void survival_flex_rigid_rows(
 #[must_use]
 pub struct SurvivalFlexGpuBackend {
     #[cfg(target_os = "linux")]
-    inner: super::backend_probe::CudaBackendContext,
+    inner: crate::gpu::backend_probe::CudaBackendContext,
 }
 
 impl SurvivalFlexGpuBackend {
@@ -509,9 +426,9 @@ impl SurvivalFlexGpuBackend {
 
     #[cfg(target_os = "linux")]
     fn probe_linux() -> Result<Self, GpuError> {
-        let parts = super::backend_probe::probe_cuda_backend("survival_flex")?;
+        let parts = crate::gpu::backend_probe::probe_cuda_backend("survival_flex")?;
         let backend = SurvivalFlexGpuBackend {
-            inner: super::backend_probe::CudaBackendContext::from_parts(parts),
+            inner: crate::gpu::backend_probe::CudaBackendContext::from_parts(parts),
         };
         backend.compile_rigid_module()?;
         Ok(backend)
@@ -528,7 +445,7 @@ impl SurvivalFlexGpuBackend {
     #[cfg(target_os = "linux")]
     fn compile_rigid_module(&self) -> Result<&Arc<CudaModule>, GpuError> {
         let source = [
-            super::numerics_device::PROBIT_NUMERICS_CU,
+            crate::gpu::numerics_device::PROBIT_NUMERICS_CU,
             SURVIVAL_FLEX_RIGID_BODY,
             SURVIVAL_FLEX_PRIMARY_BODY,
         ]
@@ -1789,13 +1706,13 @@ impl<'a> SurvivalFlexRowCellsBatch<'a> {
                 });
             }
         }
-        if self.max_degree > super::cubic_cell::MAX_SUPPORTED_DEGREE {
+        if self.max_degree > crate::gpu::cubic_cell::MAX_SUPPORTED_DEGREE {
             return Err(GpuError::DriverCallFailed {
                 reason: format!(
                     "survival_flex row-cells batch: max_degree={} exceeds substrate \
                      MAX_SUPPORTED_DEGREE={}",
                     self.max_degree,
-                    super::cubic_cell::MAX_SUPPORTED_DEGREE
+                    crate::gpu::cubic_cell::MAX_SUPPORTED_DEGREE
                 ),
             });
         }
@@ -1833,7 +1750,7 @@ pub fn try_row_batched_cell_moments(
     let mut branches = Vec::with_capacity(batch.n_cells);
     let mut prelim_status = Vec::with_capacity(batch.n_cells);
     for k in 0..batch.n_cells {
-        let cell = super::cubic_cell::GpuDenestedCubicCell {
+        let cell = crate::gpu::cubic_cell::GpuDenestedCubicCell {
             left: batch.left[k],
             right: batch.right[k],
             c0: batch.c0[k],
@@ -1841,11 +1758,11 @@ pub fn try_row_batched_cell_moments(
             c2: batch.c2[k],
             c3: batch.c3[k],
         };
-        match super::cubic_cell::branch::classify_cell_for_gpu(cell) {
+        match crate::gpu::cubic_cell::branch::classify_cell_for_gpu(cell) {
             Ok(tag) => {
                 cells.push(cell);
                 branches.push(tag);
-                prelim_status.push(super::cubic_cell::CubicCellMomentStatus::Ok as u8);
+                prelim_status.push(crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8);
             }
             Err(code) => {
                 // Substrate would also reject this cell.  Keep a placeholder
@@ -1857,37 +1774,36 @@ pub fn try_row_batched_cell_moments(
                 // substrate's "host_tag != caller_tag" path also routes to
                 // an error code, and the substrate's *own* classification
                 // is the one that wins.  Use the cheapest stable tag.
-                branches.push(super::cubic_cell::GpuCellBranchTag::Affine);
+                branches.push(crate::gpu::cubic_cell::GpuCellBranchTag::Affine);
                 prelim_status.push(code as u8);
             }
         }
     }
 
-    let view = super::cubic_cell::CubicCellDerivativeMomentHostView {
+    let view = crate::gpu::cubic_cell::CubicCellDerivativeMomentHostView {
         cells: &cells,
         branches: &branches,
         max_degree: batch.max_degree,
-        residency: super::cubic_cell::CubicCellMomentResidency::Host,
+        residency: crate::gpu::cubic_cell::CubicCellMomentResidency::Host,
     };
-    let out =
-        super::cubic_cell::try_build_cubic_cell_derivative_moments(view)?.ok_or_else(|| {
-            GpuError::DriverCallFailed {
-                reason: format!(
-                    "survival_flex row-cells batch: substrate returned None for n_cells={} > 0 \
+    let out = crate::gpu::cubic_cell::try_build_cubic_cell_derivative_moments(view)?.ok_or_else(
+        || GpuError::DriverCallFailed {
+            reason: format!(
+                "survival_flex row-cells batch: substrate returned None for n_cells={} > 0 \
                  (unexpected)",
-                    batch.n_cells
-                ),
-            }
-        })?;
+                batch.n_cells
+            ),
+        },
+    )?;
 
     let (moments, mut status, stride) = match out {
-        super::cubic_cell::CubicCellDerivativeMomentOutput::Host {
+        crate::gpu::cubic_cell::CubicCellDerivativeMomentOutput::Host {
             moments,
             status,
             stride,
         } => (moments, status, stride),
         #[cfg(target_os = "linux")]
-        super::cubic_cell::CubicCellDerivativeMomentOutput::Device { .. } => {
+        crate::gpu::cubic_cell::CubicCellDerivativeMomentOutput::Device { .. } => {
             return Err(GpuError::DriverCallFailed {
                 reason: "survival_flex row-cells batch: substrate returned device-resident output \
                          but the survival-flex host pipeline consumes Host residency only"
@@ -1901,8 +1817,8 @@ pub fn try_row_batched_cell_moments(
     // re-runs the classifier — but keeping this explicit guards against
     // a future substrate that trusts caller tags).
     for k in 0..batch.n_cells {
-        if prelim_status[k] != super::cubic_cell::CubicCellMomentStatus::Ok as u8
-            && status[k] == super::cubic_cell::CubicCellMomentStatus::Ok as u8
+        if prelim_status[k] != crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8
+            && status[k] == crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8
         {
             status[k] = prelim_status[k];
         }
@@ -2795,7 +2711,7 @@ pub fn try_device_evaluate_calibration(
             ),
         });
     }
-    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -3137,7 +3053,7 @@ pub fn try_device_layer_b_jet(
             reason: format!("layer_b: substrate returned stride={stride} < 10"),
         });
     }
-    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -3554,7 +3470,7 @@ pub fn try_device_layer_c_jet(
             reason: format!("layer_c: substrate returned stride={stride} < 10"),
         });
     }
-    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -4048,7 +3964,7 @@ pub fn try_device_layer_c_beta_d_uv(
             reason: format!("layer_c_beta: substrate returned stride={stride} < 17"),
         });
     }
-    let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+    let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
     if mom.status.iter().any(|&s| s != ok_byte) {
         return Ok(None);
     }
@@ -4586,7 +4502,7 @@ pub fn try_survival_flex_dense_hessian(
             Some(out) => out,
             None => return Ok(None),
         };
-        let ok_byte = super::cubic_cell::CubicCellMomentStatus::Ok as u8;
+        let ok_byte = crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8;
         if out.status.iter().any(|&b| b != ok_byte) {
             // Any cell that failed the substrate classifier or kernel
             // is a CPU fallback for this fit — Step 4/5/6 assembly is
@@ -6019,7 +5935,7 @@ mod survival_flex_gpu_tests {
         for k in 0..4 {
             assert_eq!(
                 out.status[k],
-                super::super::cubic_cell::CubicCellMomentStatus::Ok as u8,
+                crate::gpu::cubic_cell::CubicCellMomentStatus::Ok as u8,
                 "cell {k}: non-OK status 0x{:02x}",
                 out.status[k]
             );

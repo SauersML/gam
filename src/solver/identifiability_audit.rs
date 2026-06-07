@@ -23,7 +23,7 @@
 //
 // # BMS flex-block path
 //
-// `crate::families::bernoulli_marginal_slope::install_compiled_flex_block_into_runtime`
+// `crate::families::bms::install_compiled_flex_block_into_runtime`
 // is now a thin spec-builder → audit → compile → install wrapper:
 //
 //   1. `build_bms_flex_block_context` densifies anchors, stacks N_train, and
@@ -577,8 +577,8 @@ fn audit_identifiability_impl(
     let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
     col_offsets.push(0);
     let block_phase_started = std::time::Instant::now();
-    let block_heartbeat = (n.saturating_mul(specs.len()) >= 1_000_000)
-        .then(crate::util::heartbeat::Heartbeat::default_interval);
+    let block_progress_ticker = (n.saturating_mul(specs.len()) >= 1_000_000)
+        .then(crate::util::loop_progress::LoopProgress::default_interval);
     for (idx, spec) in specs.iter().enumerate() {
         // Effective Jacobians were pre-materialised above so the row-count
         // invariant could be checked against the audit-visible rows.
@@ -597,8 +597,8 @@ fn audit_identifiability_impl(
         });
         let next_offset = col_offsets[col_offsets.len() - 1] + p_block;
         col_offsets.push(next_offset);
-        if let Some(hb) = block_heartbeat.as_ref() {
-            hb.tick(1, |progress, elapsed| {
+        if let Some(ticker) = block_progress_ticker.as_ref() {
+            ticker.tick(1, |progress, elapsed| {
                 log::info!(
                     "[STAGE] identifiability audit: per-block QR progress={}/{} elapsed={:.1}s (overall={:.1}s)",
                     progress.min(specs.len()),
@@ -610,7 +610,7 @@ fn audit_identifiability_impl(
         }
         // Per-block summary on the last iteration so the user always
         // sees one waypoint between "audit start" and the dense joint
-        // assembly even if no heartbeat fires.
+        // assembly even if no progress tick fires.
         if idx + 1 == specs.len() {
             log::info!(
                 "[STAGE] identifiability audit: per-block QR complete blocks={} elapsed={:.3}s",
@@ -907,8 +907,8 @@ fn audit_identifiability_impl(
         }
         cnt.max(1)
     };
-    let pairwise_block_heartbeat = (n.saturating_mul(p_total) >= 1_000_000)
-        .then(crate::util::heartbeat::Heartbeat::default_interval);
+    let pairwise_block_progress_ticker = (n.saturating_mul(p_total) >= 1_000_000)
+        .then(crate::util::loop_progress::LoopProgress::default_interval);
     // Precompute the full joint Gram G = Xᵀ·X once with a blocked, parallel
     // crossproduct (faer). Every cross-block column dot product below then
     // becomes an O(1) lookup `joint_gram[[ja, jb]]` instead of an O(n) scalar
@@ -983,8 +983,8 @@ fn audit_identifiability_impl(
                     }
                 }
             }
-            if let Some(hb) = pairwise_block_heartbeat.as_ref() {
-                hb.tick(1, |done, secs| {
+            if let Some(ticker) = pairwise_block_progress_ticker.as_ref() {
+                ticker.tick(1, |done, secs| {
                     log::info!(
                         "[STAGE] identifiability audit: pairwise overlap progress {done}/{n_block_pairs} block pairs in {secs:.1}s",
                     );

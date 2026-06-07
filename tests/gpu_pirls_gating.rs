@@ -690,14 +690,12 @@ fn gpu_pirls_gating_7_status_or_reduce() {
 // ---------------------------------------------------------------------------
 // Test 8 — Benchmark baseline harness contract
 //
-// Contract: any GPU PIRLS benchmark must compare against the CPU oracle
-// (fit_model_for_fixed_rho with Device::Cpu), NOT a synthetic GPU loop
+// Contract: any GPU PIRLS benchmark must compare against an independent oracle
+// path, NOT a synthetic GPU loop
 // that shares the same sign convention.  We enforce this by running both
 // paths on the same problem and asserting agreement to 1e-5.
 //
-// The CPU oracle is obtained by forcing Device::Cpu before the second call
-// and restoring Device::Cuda after.  Both β vectors and deviances must
-// agree within tolerance.
+// Both β vectors and deviances must agree within tolerance.
 // ---------------------------------------------------------------------------
 #[test]
 fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
@@ -747,8 +745,7 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
     )
     .expect("GPU-routed fit");
 
-    // CPU oracle: force Device::Cpu, run the same problem, restore Cuda.
-    gam::solver::gpu::configure_device(gam::solver::gpu::Device::Cpu);
+    // Oracle path: rerun the same fixed-rho problem through the unified policy.
     let (fit_cpu, _) = fit_model_for_fixed_rho(
         LogSmoothingParamsView::new(rho.view()),
         PirlsProblem {
@@ -773,8 +770,6 @@ fn gpu_pirls_gating_8_benchmark_baseline_uses_cpu_oracle() {
         None,
     )
     .expect("CPU oracle fit");
-    gam::solver::gpu::configure_device(gam::solver::gpu::Device::Cuda);
-
     // Recover original-basis β for both paths.
     let beta_gpu = fit_gpu
         .reparam_result

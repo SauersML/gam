@@ -15623,12 +15623,14 @@ fn try_build_truncated_sphere_design_gpu(
     radians: bool,
 ) -> Option<Array2<f64>> {
     let (lmax_u16, kind) = match kernel {
-        SphereWahbaKernel::SobolevTruncated { lmax } => {
-            (lmax, crate::gpu::sphere::SphereSpectralKernelKind::Sobolev)
-        }
-        SphereWahbaKernel::PseudoTruncated { lmax } => {
-            (lmax, crate::gpu::sphere::SphereSpectralKernelKind::Pseudo)
-        }
+        SphereWahbaKernel::SobolevTruncated { lmax } => (
+            lmax,
+            crate::terms::sphere_gpu::SphereSpectralKernelKind::Sobolev,
+        ),
+        SphereWahbaKernel::PseudoTruncated { lmax } => (
+            lmax,
+            crate::terms::sphere_gpu::SphereSpectralKernelKind::Pseudo,
+        ),
         SphereWahbaKernel::Sobolev | SphereWahbaKernel::Pseudo => return None,
     };
     let lmax = lmax_u16 as usize;
@@ -15637,14 +15639,14 @@ fn try_build_truncated_sphere_design_gpu(
     }
     let n = data.nrows();
     let m = centers.nrows();
-    let decision = crate::gpu::sphere::sphere_kernel_decision(n, m, lmax);
+    let decision = crate::terms::sphere_gpu::sphere_kernel_decision(n, m, lmax);
     if !decision.use_gpu {
         return None;
     }
-    let data_xyz = crate::gpu::sphere::latlon_to_xyz_host(data, radians).ok()?;
-    let centers_xyz = crate::gpu::sphere::latlon_to_xyz_host(centers, radians).ok()?;
+    let data_xyz = crate::terms::sphere_gpu::latlon_to_xyz_host(data, radians).ok()?;
+    let centers_xyz = crate::terms::sphere_gpu::latlon_to_xyz_host(centers, radians).ok()?;
     let coeffs = kind.coefficients(lmax, penalty_order);
-    let inputs = crate::gpu::sphere::S2KernelBuildInputs {
+    let inputs = crate::terms::sphere_gpu::S2KernelBuildInputs {
         n,
         m,
         lmax,
@@ -15652,9 +15654,9 @@ fn try_build_truncated_sphere_design_gpu(
         centers_xyz: &centers_xyz,
         coeffs: &coeffs,
         kind,
-        layout: crate::gpu::sphere::DeviceMatrixLayout::ColumnMajor,
+        layout: crate::terms::sphere_gpu::DeviceMatrixLayout::ColumnMajor,
     };
-    let dev = match crate::gpu::sphere::build_kernel_matrix_device(inputs) {
+    let dev = match crate::terms::sphere_gpu::build_kernel_matrix_device(inputs) {
         Ok(d) => d,
         Err(err) => {
             log::warn!(

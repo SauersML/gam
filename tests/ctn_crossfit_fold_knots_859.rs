@@ -41,7 +41,9 @@ fn synth(n: usize) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     // deterministic LCG so the test is reproducible without an rng dependency
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut unif = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 11) as f64) / ((1u64 << 53) as f64)
     };
     let mut x = Vec::with_capacity(n);

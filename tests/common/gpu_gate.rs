@@ -21,15 +21,15 @@
 //!
 //! ## CI enforcement
 //!
-//! On GPU runners, `configure_device(Device::Cuda)` is called before the
-//! test suite starts. Because `gpu_gate` returns `GpuGate::Run` whenever
+//! On GPU runners, the unified GPU policy selects CUDA when the runtime probe
+//! finds a usable device. Because `gpu_gate` returns `GpuGate::Run` whenever
 //! `cuda_selected()` is true, no `SKIP` lines appear on those runners.
 //! The companion test `gpu_required_tests_did_not_skip` in
 //! `tests/gpu_required_tests_did_not_skip.rs` asserts that a CUDA runtime
 //! present on the host implies `cuda_selected()` is true — failing loudly
-//! if the runner forgot to configure the device before running tests.
+//! if policy selection stops matching runtime availability.
 
-use gam::solver::gpu::cuda_selected;
+use gam::gpu::cuda_selected;
 
 /// Result of the GPU gate check.
 pub enum GpuGate {
