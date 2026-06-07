@@ -12,8 +12,9 @@ use super::{
     parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
     parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
     required_columns_for_fit, required_columns_for_formula, resolve_family, summarizewiggle_domain,
-    validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
-    write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
+    validate_cli_firth_configuration, validate_fit_args_preflight,
+    write_gaussian_location_scale_prediction_csv, write_prediction_csv,
+    write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
     Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs, run_fit,
@@ -1099,6 +1100,25 @@ fn cli_firth_validation_rejects_survival_models() {
 }
 
 #[test]
+fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
+    let parsed = parse_formula("Surv(t0, t1, event) ~ x").expect("parse survival formula");
+    let mut args = location_scale_fit_args(
+        PathBuf::from("train.csv"),
+        PathBuf::from("model.json"),
+        "Surv(t0, t1, event) ~ x",
+        "unused",
+    );
+    args.predict_noise = None;
+    args.logslope_formula = Some("1".to_string());
+    args.z_column = Some("z".to_string());
+    args.survival_likelihood = "marginal-slope".to_string();
+    args.firth = true;
+
+    validate_fit_args_preflight(&args, &parsed)
+        .expect("--firth is redundant, not rejected, for marginal-slope");
+}
+
+#[test]
 fn cli_predict_noise_without_explicit_link_uses_binomial_logit_base_link() {
     let td = tempdir().expect("tempdir");
     let train_path = td.path().join("train.csv");
@@ -1363,7 +1383,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         frailty_sd: None,
         hazard_loading: None,
         transformation_normal: false,
-        firth: false,
+        firth: true,
         family: FamilyArg::Auto,
         negative_binomial_theta: None,
         survival_likelihood: "transformation".to_string(),
