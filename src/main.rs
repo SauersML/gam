@@ -346,7 +346,6 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// Fit a model from a dataset + formula and persist it to disk.
-    #[command(alias = "train")]
     Fit(FitArgs),
     /// Build an HTML report (coefficients, smooths, optional diagnostics).
     Report(ReportArgs),
@@ -357,7 +356,6 @@ enum Command {
     /// Posterior-sample (NUTS where available, Laplace fallback otherwise).
     Sample(SampleArgs),
     /// Draw synthetic responses from the fitted model for given covariates.
-    #[command(alias = "simulate")]
     Generate(GenerateArgs),
 }
 
@@ -378,7 +376,7 @@ struct FitArgs {
     /// location-scale mode. Pass terms like `smooth(x)` or `1`, not `y ~ ...`.
     /// This does not change the base mean link; use `link(type=...)` when you
     /// want a non-default binomial link.
-    #[arg(long = "predict-noise", alias = "predict-variance")]
+    #[arg(long = "predict-noise")]
     predict_noise: Option<String>,
     /// Secondary RHS-only formula for ancestry-varying log-slope surface(s)
     /// in the Bernoulli marginal-slope family. Pass terms only, not `y ~ ...`.
@@ -426,7 +424,7 @@ struct FitArgs {
     #[arg(long = "family", value_enum, default_value_t = FamilyArg::Auto)]
     family: FamilyArg,
     /// Fixed size/overdispersion parameter for `--family negative-binomial`.
-    #[arg(long = "negative-binomial-theta", alias = "nb-theta", value_parser = parse_positive_f64_cli)]
+    #[arg(long = "negative-binomial-theta", value_parser = parse_positive_f64_cli)]
     negative_binomial_theta: Option<f64>,
     /// Survival likelihood mode for Surv(...) formulas.
     #[arg(long = "survival-likelihood", default_value = "transformation", value_parser = parse_survival_likelihood_cli)]
@@ -1335,6 +1333,28 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         is_survival: false,
         link_choice: link_choice.as_ref(),
     })?;
+    // `--firth` with `bounded()` is genuinely unsupported (not merely
+    // "not yet wired at the CLI"). The Firth branch below fits through
+    // `optimize_external_design`, which operates on the raw linear design
+    // and has no notion of the bounded interval reparameterization. Bounded
+    // terms instead fit through the custom-family blockwise solver
+    // (`fit_bounded_term_collection_with_design` -> `fit_custom_family`),
+    // whose inner coefficient Newton has no Firth/Jeffreys penalty hook
+    // exposed through `BlockwiseFitOptions`. Routing `--firth` down the
+    // external-design path would silently drop the bounds and fit an
+    // unconstrained coefficient, producing a wrong answer with no warning.
+    // Until the bounded inner solve grows an exact Firth-penalty term we
+    // refuse the combination loudly rather than compute the wrong model.
+    if args.firth && has_bounded_terms {
+        return Err(
+            "--firth is not supported with bounded() coefficients: the Firth bias-reduction \
+             path fits the raw unconstrained design, while bounded() terms fit through the \
+             custom-family solver, which has no exact Firth/Jeffreys penalty. Drop --firth for \
+             bounded() models (the bounded transform already regularizes the coefficient toward \
+             the interior), or drop bounded() to use Firth."
+                .to_string(),
+        );
+    }
     let fit_max_iter = 200usize;
     let fit_tol = 1e-6f64;
     let weights = resolve_weight_column(&ds, &col_map, args.weights_column.as_deref())?;

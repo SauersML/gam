@@ -1255,6 +1255,9 @@ fn estimation_error_to_pyerr(err: EstimationError) -> PyErr {
         EstimationError::PrefitRankDeficientDesignDetected { .. } => {
             ModelOverparameterizedError::new_err(message)
         }
+        EstimationError::PrefitNearDegenerateDesignDetected { .. } => {
+            IllConditionedError::new_err(message)
+        }
         EstimationError::ModelIsIllConditioned { .. } => IllConditionedError::new_err(message),
         EstimationError::InvalidInput(_) => InvalidInputError::new_err(message),
         EstimationError::MonotoneRoot(_) => MonotoneRootError::new_err(message),
@@ -2154,17 +2157,11 @@ fn marginal_slope_clip_probabilities(values: Vec<f64>) -> PyResult<Vec<f64>> {
 fn transformation_normal_z_from_columns(columns_json: &str) -> PyResult<Vec<f64>> {
     let columns: BTreeMap<String, Vec<f64>> = serde_json::from_str(columns_json)
         .map_err(|err| py_value_error(format!("invalid prediction columns json: {err}")))?;
-    // Fallback chain of column names that a transformation-normal payload
-    // may use for the per-row z-score. The first matching key wins. The
-    // legacy "eta" name was renamed to "linear_predictor" (issue #310);
-    // tracker on the renamed name only.
-    for key in ["z", "z_score", "transformed", "linear_predictor", "mean"] {
-        if let Some(values) = columns.get(key) {
-            return Ok(values.clone());
-        }
+    if let Some(values) = columns.get("linear_predictor") {
+        return Ok(values.clone());
     }
     Err(PyKeyError::new_err(
-        "transformation-normal prediction payload is missing a z-score column",
+        "transformation-normal prediction payload is missing linear_predictor",
     ))
 }
 

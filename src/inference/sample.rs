@@ -37,7 +37,9 @@ use crate::inference::model::{
     FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
 };
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
-use crate::smooth::{build_term_collection_design, weighted_blockwise_penalty_sum};
+use crate::smooth::{
+    LinearCoefficientGeometry, build_term_collection_design, weighted_blockwise_penalty_sum,
+};
 use crate::survival::{MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalSpec};
 use crate::survival_construction::{
     SurvivalLikelihoodMode, add_survival_time_derivative_guard_offset, build_survival_time_basis,
@@ -447,6 +449,28 @@ fn sample_standard(
         col_map,
         "resolved_termspec",
     )?;
+    // Bounded() coefficients are not sampled by the exact GLM-NUTS path. That
+    // path runs the Hamiltonian over the *raw* linear design with the saved
+    // user-scale mode, treating every coefficient as an unconstrained,
+    // Gaussian-penalized parameter. Bounded terms are fit through a custom
+    // family that drives eta via an interval transform with the design column
+    // zeroed (the user-scale coefficient enters as beta_user * x), and whose
+    // penalty/curvature live on the bounded latent scale. Replaying that fit
+    // with the raw design + unconstrained Gaussian penalty would sample the
+    // wrong posterior geometry (and could leave the interval entirely). The
+    // bounded fit *does* export a correct user-scale mode and user-scale
+    // penalized Hessian (see `transform_bounded_latent_precision_to_user_internal`
+    // in terms/smooth.rs), so we draw from the Laplace-Gaussian approximation
+    // `N(mode, H^{-1})` of the user-scale posterior — the same closed-form
+    // credible surface mgcv uses, and the one already employed for the
+    // location-scale / marginal-slope classes above.
+    if spec
+        .linear_terms
+        .iter()
+        .any(|term| matches!(term.coefficient_geometry, LinearCoefficientGeometry::Bounded { .. }))
+    {
+        return laplace_gaussian_fallback(model, cfg, "standard bounded-coefficient posterior");
+    }
     let design = build_term_collection_design(data, &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
     let weights = Array1::ones(data.nrows());

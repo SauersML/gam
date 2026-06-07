@@ -1775,6 +1775,23 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Pre-fit near-degeneracy detected in the realized unpenalized design: the {num_unpenalized_columns} \
+        unpenalized columns span a numerically rank-degenerate direction (Gram condition number {condition_number:.3e} \
+        exceeds tolerance {tolerance:.3e}; min eigenvalue {min_eigenvalue:.3e}, max eigenvalue {max_eigenvalue:.3e}, \
+        columns {column_indices:?}). The unpenalized normal equations are effectively singular along this direction, \
+        so the fit would grind/diverge. Remove/reparameterize the near-aliased columns or add an explicit \
+        penalty/constraint before fitting."
+    )]
+    PrefitNearDegenerateDesignDetected {
+        num_unpenalized_columns: usize,
+        condition_number: f64,
+        min_eigenvalue: f64,
+        max_eigenvalue: f64,
+        tolerance: f64,
+        column_indices: Vec<usize>,
+    },
+
+    #[error(
         "Perfect or quasi-perfect separation detected during multinomial fitting at iteration {iteration}. \
         The active class-{active_class_index} logit against the reference class is saturated at training row {row_index}, \
         so the unpenalized softmax MLE is not finite in that direction. \
@@ -2132,12 +2149,22 @@ struct PrefitLinearSeparationDiagnostic {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct PrefitRankDiagnostic {
-    rank: usize,
-    num_unpenalized_columns: usize,
-    min_eigenvalue: f64,
-    tolerance: f64,
-    column_indices: Vec<usize>,
+enum PrefitRegularityDiagnostic {
+    RankDeficient {
+        rank: usize,
+        num_unpenalized_columns: usize,
+        min_eigenvalue: f64,
+        tolerance: f64,
+        column_indices: Vec<usize>,
+    },
+    NearDegenerate {
+        num_unpenalized_columns: usize,
+        condition_number: f64,
+        min_eigenvalue: f64,
+        max_eigenvalue: f64,
+        tolerance: f64,
+        column_indices: Vec<usize>,
+    },
 }
 
 fn prefit_binary_response_classes(
@@ -2205,7 +2232,7 @@ fn detect_prefit_unpenalized_rank_deficiency_in_design(
     w: ArrayView1<'_, f64>,
     x: &DesignMatrix,
     unpenalized_columns: &[bool],
-) -> Result<Option<PrefitRankDiagnostic>, EstimationError> {
+) -> Result<Option<PrefitRegularityDiagnostic>, EstimationError> {
     if x.nrows() != w.len() || x.ncols() != unpenalized_columns.len() {
         return Ok(None);
     }
@@ -2281,14 +2308,42 @@ fn detect_prefit_unpenalized_rank_deficiency_in_design(
         .iter()
         .filter(|&&value| value > tolerance)
         .count();
+    let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
     if rank < q {
-        return Ok(Some(PrefitRankDiagnostic {
+        return Ok(Some(PrefitRegularityDiagnostic::RankDeficient {
             rank,
             num_unpenalized_columns: q,
-            min_eigenvalue: eigenvalues.iter().copied().fold(f64::INFINITY, f64::min),
+            min_eigenvalue,
             tolerance,
             column_indices,
         }));
+    }
+
+    // Full numeric rank, but the unpenalized normal equations may still be
+    // near-singular along a direction (quasi-/near-degenerate). The condition
+    // number of the unpenalized Gram is a cheap, principled upfront signal:
+    // beyond CONDITION_TOL the unpenalized solve loses too many digits and the
+    // fit grinds/diverges instead of converging. CONDITION_TOL is a Gram
+    // condition number (≈ design condition squared); 1e12 corresponds to a
+    // design condition ≈ 1e6, strictly looser than the 1e-10 exact-rank floor
+    // above so the two checks are nested and consistent.
+    const CONDITION_TOL: f64 = 1e12;
+    let max_eigenvalue = eigenvalues
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    if min_eigenvalue.is_finite() && min_eigenvalue > 0.0 && max_eigenvalue.is_finite() {
+        let condition_number = max_eigenvalue / min_eigenvalue;
+        if condition_number.is_finite() && condition_number > CONDITION_TOL {
+            return Ok(Some(PrefitRegularityDiagnostic::NearDegenerate {
+                num_unpenalized_columns: q,
+                condition_number,
+                min_eigenvalue,
+                max_eigenvalue,
+                tolerance: CONDITION_TOL,
+                column_indices,
+            }));
+        }
     }
 
     Ok(None)
@@ -2300,18 +2355,37 @@ fn reject_prefit_unpenalized_rank_deficiency(
     penalties: &[CanonicalPenalty],
 ) -> Result<(), EstimationError> {
     let unpenalized_columns = canonical_unpenalized_column_mask(penalties, x_fit.ncols());
-    if let Some(diagnostic) =
-        detect_prefit_unpenalized_rank_deficiency_in_design(w, x_fit, &unpenalized_columns)?
-    {
-        return Err(EstimationError::PrefitRankDeficientDesignDetected {
-            rank: diagnostic.rank,
-            num_unpenalized_columns: diagnostic.num_unpenalized_columns,
-            min_eigenvalue: diagnostic.min_eigenvalue,
-            tolerance: diagnostic.tolerance,
-            column_indices: diagnostic.column_indices,
-        });
+    match detect_prefit_unpenalized_rank_deficiency_in_design(w, x_fit, &unpenalized_columns)? {
+        Some(PrefitRegularityDiagnostic::RankDeficient {
+            rank,
+            num_unpenalized_columns,
+            min_eigenvalue,
+            tolerance,
+            column_indices,
+        }) => Err(EstimationError::PrefitRankDeficientDesignDetected {
+            rank,
+            num_unpenalized_columns,
+            min_eigenvalue,
+            tolerance,
+            column_indices,
+        }),
+        Some(PrefitRegularityDiagnostic::NearDegenerate {
+            num_unpenalized_columns,
+            condition_number,
+            min_eigenvalue,
+            max_eigenvalue,
+            tolerance,
+            column_indices,
+        }) => Err(EstimationError::PrefitNearDegenerateDesignDetected {
+            num_unpenalized_columns,
+            condition_number,
+            min_eigenvalue,
+            max_eigenvalue,
+            tolerance,
+            column_indices,
+        }),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn separator_from_column_extrema(
@@ -7726,13 +7800,24 @@ mod estimate_policy_tests {
         .expect("rank check should stream dense design")
         .expect("duplicate unpenalized columns are rank deficient");
 
-        assert_eq!(diagnostic.rank, 2);
-        assert_eq!(diagnostic.num_unpenalized_columns, 3);
-        assert_eq!(diagnostic.column_indices, vec![0, 1, 2]);
-        assert!(
-            diagnostic.min_eigenvalue.abs() <= diagnostic.tolerance,
-            "duplicate-column min eigenvalue should be at the rank tolerance"
-        );
+        match diagnostic {
+            PrefitRegularityDiagnostic::RankDeficient {
+                rank,
+                num_unpenalized_columns,
+                min_eigenvalue,
+                tolerance,
+                column_indices,
+            } => {
+                assert_eq!(rank, 2);
+                assert_eq!(num_unpenalized_columns, 3);
+                assert_eq!(column_indices, vec![0, 1, 2]);
+                assert!(
+                    min_eigenvalue.abs() <= tolerance,
+                    "duplicate-column min eigenvalue should be at the rank tolerance"
+                );
+            }
+            other => panic!("expected exact rank deficiency, got {other:?}"),
+        }
     }
 
     #[test]
@@ -7779,6 +7864,78 @@ mod estimate_policy_tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn prefit_rank_check_detects_near_degenerate_unpenalized_design() {
+        // Two near-collinear columns (alias to ~1e-7 perturbation) keep full
+        // numeric rank but blow the Gram condition number past the
+        // near-degeneracy tolerance, so the fit would grind/diverge.
+        let x = array![
+            [1.0, -2.0, -2.0 + 1e-7],
+            [1.0, -1.0, -1.0 - 1e-7],
+            [1.0, 1.0, 1.0 + 1e-7],
+            [1.0, 2.0, 2.0 - 1e-7]
+        ];
+        let w = Array1::ones(x.nrows());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let diagnostic = detect_prefit_unpenalized_rank_deficiency_in_design(
+            w.view(),
+            &design,
+            &[true, true, true],
+        )
+        .expect("rank check should stream dense design")
+        .expect("near-collinear unpenalized columns are near-degenerate");
+
+        match diagnostic {
+            PrefitRegularityDiagnostic::NearDegenerate {
+                num_unpenalized_columns,
+                condition_number,
+                tolerance,
+                column_indices,
+                ..
+            } => {
+                assert_eq!(num_unpenalized_columns, 3);
+                assert_eq!(column_indices, vec![0, 1, 2]);
+                assert!(
+                    condition_number > tolerance,
+                    "near-degenerate Gram condition number {condition_number:.3e} should exceed tolerance {tolerance:.3e}"
+                );
+            }
+            other => panic!("expected near-degenerate diagnostic, got {other:?}"),
+        }
+
+        let err = reject_prefit_unpenalized_rank_deficiency(w.view(), &design, &[])
+            .expect_err("near-degenerate unpenalized design should fail before REML/PIRLS");
+        assert!(matches!(
+            err,
+            EstimationError::PrefitNearDegenerateDesignDetected {
+                num_unpenalized_columns: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn prefit_rank_check_accepts_well_conditioned_unpenalized_design() {
+        let x = array![
+            [1.0, -2.0, 4.0],
+            [1.0, -1.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [1.0, 2.0, 4.0]
+        ];
+        let w = Array1::ones(x.nrows());
+        let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
+        let diagnostic = detect_prefit_unpenalized_rank_deficiency_in_design(
+            w.view(),
+            &design,
+            &[true, true, true],
+        )
+        .expect("rank check should stream dense design");
+        assert_eq!(
+            diagnostic, None,
+            "a well-conditioned full-rank unpenalized design must not be pre-fit rejected"
+        );
     }
 
     #[test]
