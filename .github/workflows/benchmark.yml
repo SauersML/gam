@@ -233,9 +233,16 @@ jobs:
           mkdir -p bench/runtime
           if [ "${{ steps.runtime-cache.outputs.cache-hit }}" != "true" ]; then
             mkdir -p bench/runtime/pydeps bench/runtime/r-lib
-            if [ -d "${R_LIBS_USER}" ]; then
-              cp -a "${R_LIBS_USER}/." bench/runtime/r-lib/ || true
+            if [ ! -d "${R_LIBS_USER}" ]; then
+              echo "::error title=Missing R library::R_LIBS_USER=${R_LIBS_USER} does not exist after bench-setup; cannot stage R packages for shards."
+              exit 1
             fi
+            # Hard-fail on copy errors: prior `|| true` here swallowed
+            # partial-copy failures and shipped a runtime artifact that
+            # was missing R packages (gamboostLSS, mboost, ...) into the
+            # bench shards, where every scenario then died on
+            # `library(gamboostLSS)`.
+            cp -a "${R_LIBS_USER}/." bench/runtime/r-lib/
             python3 -m pip install --upgrade pip setuptools wheel
             python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn lifelines scikit-survival xgboost matplotlib
           fi
@@ -282,6 +289,43 @@ jobs:
           # Ship the freshly-built extension through the shared runtime
           # artifact so each shard does not have to recompile it.
           cp gamfit/_rust*.so bench/runtime/
+
+      - name: Verify staged R library is complete
+        shell: bash
+        env:
+          STAGED_R_LIB: ${{ github.workspace }}/bench/runtime/r-lib
+        run: |
+          set -euo pipefail
+          # Run the same `library(...)` smoke check the shards run, but
+          # do it here, ONCE, against the staged `bench/runtime/r-lib` so
+          # a missing R package fails the bootstrap (and refuses to save
+          # an incomplete cache or upload an incomplete artifact) instead
+          # of fanning the failure out to every shard. Restricting
+          # `.libPaths` to the staged tree (rather than just adding it
+          # to the search) is important: setup-r leaves the installed
+          # `/home/runner/work/_temp/Library` tree visible to this job,
+          # which would mask a missing package in the staged tree.
+          STAGED_R_LIB="${STAGED_R_LIB}" Rscript -e '
+            staged <- Sys.getenv("STAGED_R_LIB")
+            stopifnot(nzchar(staged))
+            .libPaths(staged)
+            required <- c("mgcv","jsonlite","survival","glmnet","gamlss",
+                          "gamlss.dist","gamboostLSS","mboost","bamlss","brms")
+            installed <- rownames(installed.packages(lib.loc = staged))
+            cat("staged lib: ", staged, "\n",
+                "staged pkgs: ", length(installed), "\n", sep = "")
+            missing <- setdiff(required, installed)
+            if (length(missing) > 0L) {
+              stop("staged R lib is missing required packages: ",
+                   paste(missing, collapse = ", "))
+            }
+            for (pkg in required) {
+              if (!isTRUE(requireNamespace(pkg, quietly = TRUE))) {
+                stop("staged R lib has unloadable package: ", pkg)
+              }
+            }
+            cat("staged R lib OK; all required packages loadable\n")
+          '
 
       - name: Save shared runtime cache
         if: ${{ steps.runtime-cache.outputs.cache-hit != 'true' }}
