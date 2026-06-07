@@ -5049,6 +5049,64 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
         .map_err(|err| py_value_error(format!("rank_topology_candidates: serialise: {err}")))
 }
 
+/// Solve the stacking-of-predictive-distributions weight problem over retained
+/// topology candidates (#768). `names` aligns with the columns of the
+/// row-major held-out log-predictive-density table `log_density_rows` (each
+/// inner vector is one held-out observation row over candidates). Returns a
+/// JSON object `{ "weights": {name: w}, "mean_log_score": f, "iterations": k }`
+/// where the weights are the simplex maximiser of the held-out mean log-score.
+/// Candidates with no finite held-out density are rejected and zero-weighted.
+#[pyfunction]
+fn stacking_weights_from_log_density(
+    names: Vec<String>,
+    log_density_rows: Vec<Vec<f64>>,
+) -> PyResult<String> {
+    if names.is_empty() {
+        return Err(py_value_error(
+            "stacking_weights_from_log_density: at least one candidate name is required".to_string(),
+        ));
+    }
+    let n_cand = names.len();
+    if log_density_rows.is_empty() {
+        return Err(py_value_error(
+            "stacking_weights_from_log_density: at least one held-out row is required".to_string(),
+        ));
+    }
+    let n_rows = log_density_rows.len();
+    let mut table = Array2::<f64>::zeros((n_rows, n_cand));
+    for (i, row) in log_density_rows.iter().enumerate() {
+        if row.len() != n_cand {
+            return Err(py_value_error(format!(
+                "stacking_weights_from_log_density: row {i} has {} entries but {n_cand} candidates",
+                row.len()
+            )));
+        }
+        for (k, &value) in row.iter().enumerate() {
+            table[[i, k]] = value;
+        }
+    }
+    let solved = gam::solver::stacking::solve_stacking_weights(
+        table.view(),
+        gam::solver::stacking::StackingConfig::default(),
+    )
+    .map_err(py_value_error)?;
+    let weights_by_name: serde_json::Map<String, serde_json::Value> = names
+        .iter()
+        .zip(solved.weights.iter())
+        .map(|(name, &w)| (name.clone(), serde_json::json!(w)))
+        .collect();
+    let out = serde_json::json!({
+        "weights": weights_by_name,
+        "mean_log_score": solved.mean_log_score,
+        "iterations": solved.iterations,
+    });
+    serde_json::to_string(&out).map_err(|err| {
+        py_value_error(format!(
+            "stacking_weights_from_log_density: serialise: {err}"
+        ))
+    })
+}
+
 const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
 const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
 const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
@@ -23480,6 +23538,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(assemble_candidate_formula, module)?)?;
     module.add_function(wrap_pyfunction!(ordered_prediction_columns, module)?)?;
     module.add_function(wrap_pyfunction!(rank_topology_candidates, module)?)?;
+    module.add_function(wrap_pyfunction!(stacking_weights_from_log_density, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_score_raw, module)?)?;
     module.add_function(wrap_pyfunction!(extract_reml_edf, module)?)?;
