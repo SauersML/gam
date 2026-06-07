@@ -4149,9 +4149,29 @@ fn prepare_survival_location_scale_model(
 
     let threshold_prep = prepare_cov_block_kind(&spec.threshold_block)?;
     let threshold_full_ncols = threshold_prep.design_exit.ncols();
-    let threshold_fixed_cols =
+    let time_reduced_to_parametric = time_block_reduces_to_parametric(
+        &spec.time_block.penalties,
+        spec.time_block.design_exit.ncols(),
+        survival_constant_scale(spec),
+        protected_timewiggle_cols,
+    );
+    let threshold_fixed_cols = if time_reduced_to_parametric {
+        // Reduced constant-scale parametric-AFT regime: the time-warp has
+        // collapsed to a constant-free affine shape basis (its reduced design
+        // columns are strictly monotone in t and span no constant-in-t
+        // direction), so it no longer carries the location intercept the gauge
+        // contract normally attributes to it. Keep the threshold (location)
+        // intercept here — it is the free location level b0, NOT aliased with
+        // the multiplicative scale constant nor with any time-warp constant
+        // (there is none) — exactly mirroring why the constant log_sigma block
+        // keeps its intercept (`log_sigma_fixed_cols = 0`). Dropping it (#736)
+        // left the raw covariate column to double as both level and slope,
+        // pinning the covariate to a wrong-signed level-matching value.
+        0
+    } else {
         infer_non_intercept_start_design(&threshold_prep.design_exit, &spec.weights)?
-            .min(threshold_full_ncols);
+            .min(threshold_full_ncols)
+    };
     let threshold_design = design_column_tail(
         &threshold_prep.design_exit,
         threshold_fixed_cols,
