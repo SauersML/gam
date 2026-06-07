@@ -352,6 +352,46 @@ pub fn gamma_quantile(p: f64, shape: f64, scale: f64) -> f64 {
     scale * inverse_regularized_lower_gamma(p, shape)
 }
 
+/// Equal-tailed predictive interval for a strictly-positive, right-skewed
+/// response modelled as a Gamma whose first two moments match a point
+/// prediction: mean `mu` and total predictive variance `total_var`
+/// (estimation + observation noise). Returns the pair of Gamma quantiles at
+/// lower-tail probabilities `p_lo < p_hi` — the skew-correct replacement for a
+/// symmetric `mu ± z·σ` band, which for a Gamma pins the lower edge near the
+/// support floor and mis-covers each tail (#817).
+///
+/// Moment matching fixes `shape k = mu²/V` and `scale θ = V/mu`, so the
+/// predictive carries exactly the requested mean and variance. When estimation
+/// uncertainty vanishes (`total_var → φμ²`) this is *exact*: `k → 1/φ`,
+/// `θ → φμ`, recovering the conditional Gamma `Gamma(shape = 1/φ, scale = φμ)`.
+/// With nonzero estimation variance it is the moment-matched Gamma predictive —
+/// the minimal skew-correct widening.
+///
+/// Returns `None` when the inputs are degenerate (non-positive mean or
+/// variance, non-finite), or when the incomplete-gamma inverse yields a
+/// non-finite / mis-ordered pair — which happens for an enormous shape, where
+/// the Gamma is essentially Gaussian and the caller should fall back to the
+/// then-accurate symmetric edges.
+pub fn gamma_moment_matched_interval(
+    mu: f64,
+    total_var: f64,
+    p_lo: f64,
+    p_hi: f64,
+) -> Option<(f64, f64)> {
+    if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
+        return None;
+    }
+    let shape = mu * mu / total_var;
+    let scale = total_var / mu;
+    let q_lo = gamma_quantile(p_lo, shape, scale);
+    let q_hi = gamma_quantile(p_hi, shape, scale);
+    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
+        Some((q_lo, q_hi))
+    } else {
+        None
+    }
+}
+
 /// Inverse of the regularized lower incomplete gamma function: the `x ≥ 0` with
 /// `P(a, x) = p`, where `P(a, x) = γ(a, x) / Γ(a)` is the CDF of a unit-scale
 /// `Gamma(shape = a)` variate, `a > 0`, `p ∈ (0, 1)`.
@@ -575,5 +615,93 @@ mod tests {
         assert_eq!(gamma_quantile(0.0, 2.0, 1.0), 0.0);
         assert_eq!(gamma_quantile(-0.1, 2.0, 1.0), 0.0);
         assert!(gamma_quantile(1.0, 2.0, 1.0).is_infinite());
+    }
+
+    #[test]
+    fn gamma_moment_matched_interval_is_the_exact_conditional_gamma_when_se_vanishes() {
+        // With no estimation uncertainty the total predictive variance is the
+        // pure observation noise `Var(Y|μ) = φμ²`, and the moment-matched Gamma
+        // must coincide *exactly* with the conditional `Gamma(shape = 1/φ,
+        // scale = φμ)` (#817). Check against the analytic Gamma quantiles for a
+        // shape-4 (φ = 0.25) Gamma at the equal-tailed 2.5%/97.5% levels.
+        let phi = 0.25_f64; // shape k = 1/φ = 4
+        let mu = 7.5_f64;
+        let total_var = phi * mu * mu; // SE(μ̂) = 0
+        let (lo, hi) = gamma_moment_matched_interval(mu, total_var, 0.025, 0.975)
+            .expect("non-degenerate moment-matched Gamma interval");
+
+        let analytic_lo = gamma_quantile(0.025, 1.0 / phi, phi * mu);
+        let analytic_hi = gamma_quantile(0.975, 1.0 / phi, phi * mu);
+        assert!(
+            (lo - analytic_lo).abs() < 1e-9 * analytic_lo.max(1.0)
+                && (hi - analytic_hi).abs() < 1e-9 * analytic_hi.max(1.0),
+            "moment-matched interval [{lo}, {hi}] != conditional Gamma \
+             [{analytic_lo}, {analytic_hi}]"
+        );
+    }
+
+    #[test]
+    fn gamma_moment_matched_interval_is_right_skewed_not_symmetric() {
+        // The whole point of #817: for a right-skewed Gamma the equal-tailed
+        // band is *asymmetric* about the mean — the upper gap exceeds the lower
+        // gap — and the lower edge sits FAR above the symmetric-band edge
+        // `μ·(1 − z/√k)`, which for shape 4 hugs the support floor at ≈ 0.02·μ.
+        let phi = 0.25_f64; // shape 4, CV = 0.5
+        let mu = 10.0_f64;
+        let total_var = phi * mu * mu;
+        let z = 1.959_963_984_540_054_f64; // 97.5% standard-normal quantile
+        let (lo, hi) =
+            gamma_moment_matched_interval(mu, total_var, normal_cdf(-z), normal_cdf(z)).unwrap();
+
+        // Ordered, strictly positive, brackets the mean.
+        assert!(0.0 < lo && lo < mu && mu < hi, "interval [{lo}, {hi}] ∌ μ={mu}");
+        // Right skew: the upper gap is the larger one.
+        let lower_gap = mu - lo;
+        let upper_gap = hi - mu;
+        assert!(
+            upper_gap > 1.3 * lower_gap,
+            "expected a right-skewed band (upper gap ≫ lower gap), got \
+             lower_gap={lower_gap}, upper_gap={upper_gap}"
+        );
+        // The symmetric lower edge would be μ·(1 − z·√φ) = 10·(1 − 1.96·0.5) ≈
+        // 0.20 — essentially the support floor. The skew-correct lower edge sits
+        // well above it (true Gamma 2.5% quantile ≈ 0.27·μ for shape 4).
+        let symmetric_lower = mu * (1.0 - z * phi.sqrt());
+        assert!(
+            lo > 2.0 * symmetric_lower.max(0.0) + 1.0,
+            "skew-correct lower edge {lo} should sit well above the symmetric \
+             edge {symmetric_lower}"
+        );
+    }
+
+    #[test]
+    fn gamma_moment_matched_interval_widens_with_estimation_uncertainty() {
+        // Adding estimation variance SE(μ̂)² to the observation noise must widen
+        // the predictive band (lower edge down, upper edge up) — it is the
+        // moment-matched predictive, not just the conditional law.
+        let phi = 0.25_f64;
+        let mu = 5.0_f64;
+        let obs_var = phi * mu * mu;
+        let (lo0, hi0) = gamma_moment_matched_interval(mu, obs_var, 0.025, 0.975).unwrap();
+        let (lo1, hi1) =
+            gamma_moment_matched_interval(mu, obs_var + 4.0, 0.025, 0.975).unwrap();
+        assert!(
+            lo1 < lo0 && hi1 > hi0,
+            "estimation uncertainty must widen the band: [{lo0},{hi0}] -> [{lo1},{hi1}]"
+        );
+    }
+
+    #[test]
+    fn gamma_moment_matched_interval_rejects_degenerate_and_near_gaussian_inputs() {
+        // Non-positive mean / variance, or non-finite inputs => None (caller
+        // falls back to the symmetric Gaussian edges).
+        assert!(gamma_moment_matched_interval(0.0, 1.0, 0.025, 0.975).is_none());
+        assert!(gamma_moment_matched_interval(-1.0, 1.0, 0.025, 0.975).is_none());
+        assert!(gamma_moment_matched_interval(1.0, 0.0, 0.025, 0.975).is_none());
+        assert!(gamma_moment_matched_interval(1.0, -1.0, 0.025, 0.975).is_none());
+        assert!(gamma_moment_matched_interval(f64::NAN, 1.0, 0.025, 0.975).is_none());
+        assert!(gamma_moment_matched_interval(1.0, f64::INFINITY, 0.025, 0.975).is_none());
+        // A finite, well-conditioned case still returns Some.
+        assert!(gamma_moment_matched_interval(3.0, 2.0, 0.025, 0.975).is_some());
     }
 }

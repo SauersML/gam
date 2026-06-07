@@ -32,7 +32,9 @@ use crate::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
-use crate::probability::{gamma_quantile, normal_cdf, normal_pdf, standard_normal_quantile};
+use crate::probability::{
+    gamma_moment_matched_interval, normal_cdf, normal_pdf, standard_normal_quantile,
+};
 use crate::quadrature::QuadratureContext;
 use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -5678,29 +5680,21 @@ where
             // symmetric band, routed through the correct distribution.
             let p_lower = normal_cdf(-z_lower_per_row[i]);
             let p_upper = normal_cdf(z_upper_per_row[i]);
-            if !(mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
-                // Degenerate point (non-positive mean or zero variance): fall
-                // back to the symmetric Gaussian edges, then clamp to support.
-                let s = total_var.sqrt();
-                lower[i] = mu - z_lower_per_row[i] * s;
-                upper[i] = mu + z_upper_per_row[i] * s;
-                continue;
-            }
-            let shape = mu * mu / total_var;
-            let scale = total_var / mu;
-            let q_lo = gamma_quantile(p_lower, shape, scale);
-            let q_hi = gamma_quantile(p_upper, shape, scale);
-            // For an enormous shape (φ → 0 and SE(μ̂) → 0) the Gamma is
-            // essentially Gaussian and the incomplete-gamma inverse loses
-            // precision; if either quantile comes back non-finite or mis-ordered
-            // fall back to the (then-accurate) symmetric Gaussian edges.
-            if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
-                lower[i] = q_lo;
-                upper[i] = q_hi;
-            } else {
-                let s = total_var.sqrt();
-                lower[i] = mu - z_lower_per_row[i] * s;
-                upper[i] = mu + z_upper_per_row[i] * s;
+            match gamma_moment_matched_interval(mu, total_var, p_lower, p_upper) {
+                Some((q_lo, q_hi)) => {
+                    lower[i] = q_lo;
+                    upper[i] = q_hi;
+                }
+                None => {
+                    // Degenerate point (non-positive mean / zero variance), or an
+                    // enormous shape where the incomplete-gamma inverse loses
+                    // precision and the Gamma is essentially Gaussian anyway: fall
+                    // back to the (then-accurate) symmetric Gaussian edges, then
+                    // clamp to support.
+                    let s = total_var.sqrt();
+                    lower[i] = mu - z_lower_per_row[i] * s;
+                    upper[i] = mu + z_upper_per_row[i] * s;
+                }
             }
         }
         clamp_to_support(lower, upper)
