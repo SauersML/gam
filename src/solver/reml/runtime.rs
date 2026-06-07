@@ -4768,6 +4768,19 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
+        if let Some(sparse) = bundle.sparse_exact.as_ref() {
+            let h = crate::linalg::sparse_exact::assemble_sparse_factor_h_dense(&sparse.factor)?;
+            if h.nrows() != self.p || h.ncols() != self.p {
+                crate::bail_invalid_estim!(
+                    "sparse exact objective inner Hessian shape {}x{} != {}x{}",
+                    h.nrows(),
+                    h.ncols(),
+                    self.p,
+                    self.p
+                );
+            }
+            return Ok(h);
+        }
         Ok(bundle.h_total.as_ref().clone())
     }
 
