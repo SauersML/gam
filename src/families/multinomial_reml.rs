@@ -850,35 +850,14 @@ impl CustomFamily for MultinomialFamily {
     }
 
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        // The softmax joint curvature `H = block(X^T W(β) X)` with the rank-M
-        // per-row Fisher block `W_{n,a,b} = w_n (δ_ab p_a − p_a p_b)` admits an
-        // exact matrix-free `H·v` contraction in `O(N·(K−1)·P)` via
-        // [`MultinomialHessianWorkspace::hessian_matvec_into`] (issue #347,
-        // bit-identical to the dense path per #846). Advertising it routes the
-        // inner joint-Newton through the operator/PCG source instead of
-        // assembling and factorizing the dense `(K−1)P × (K−1)P` Hessian on
-        // EVERY inner cycle of EVERY outer trial. Without this flag
-        // `joint_workspace_requested` is false, so a smooth-by-factor model
-        // (`D=8`, `(K−1)P ≈ 80`) — below `use_joint_matrix_free_path`'s 512 /
-        // 128@50k / 4M-linear-work thresholds — silently fell to the dense
-        // inner build, the O(bad) cost behind #714's 329s fit and #722's
-        // grind. The family already wires the full operator workspace
-        // (matvec + diagonal + directional derivatives); this flag is the
-        // missing declaration that makes the engine use it.
         self.specs_match_workspace_shape(specs)
     }
 
     fn inner_joint_workspace_gradient_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        // The frozen-β workspace also serves the joint log-likelihood gradient
-        // `∂log L/∂β_a = X^T(y − p)_a` from the SAME cached softmax
-        // probabilities, so the inner gradient load reuses the workspace
-        // instead of re-collecting η and recomputing the row kernels.
         self.specs_match_workspace_shape(specs)
     }
 
     fn inner_joint_workspace_log_likelihood_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        // Line-search accept/reject reads the trial log-likelihood straight
-        // from the workspace's cached probabilities — no separate `evaluate`.
         self.specs_match_workspace_shape(specs)
     }
 
