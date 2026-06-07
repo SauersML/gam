@@ -1,0 +1,50 @@
+srun: Setting account: hsiehph
+srun: job 10517741 queued and waiting for resources
+srun: job 10517741 has been allocated resources
+🍹 Building a mixed python/rust project
+🐍 Found CPython 3.11 at /projects/standard/hsiehph/sauer354/gamfit-sweep-venv/bin/python
+🔗 Found pyo3 bindings with abi3 support
+Ignoring numpy: markers 'extra == "all"' don't match your environment
+Ignoring pandas: markers 'extra == "all"' don't match your environment
+Ignoring pyarrow: markers 'extra == "all"' don't match your environment
+Ignoring matplotlib: markers 'extra == "all"' don't match your environment
+Ignoring scikit-learn: markers 'extra == "all"' don't match your environment
+Ignoring torch: markers 'extra == "all"' don't match your environment
+Ignoring nvidia-cublas-cu12: markers 'platform_machine == "x86_64" and platform_system == "Linux" and extra == "cuda"' don't match your environment
+Ignoring nvidia-cuda-nvrtc-cu12: markers 'platform_machine == "x86_64" and platform_system == "Linux" and extra == "cuda"' don't match your environment
+Ignoring nvidia-cuda-runtime-cu12: markers 'platform_machine == "x86_64" and platform_system == "Linux" and extra == "cuda"' don't match your environment
+Ignoring nvidia-cusolver-cu12: markers 'platform_machine == "x86_64" and platform_system == "Linux" and extra == "cuda"' don't match your environment
+Ignoring nvidia-cusparse-cu12: markers 'platform_machine == "x86_64" and platform_system == "Linux" and extra == "cuda"' don't match your environment
+Ignoring nvidia-nvjitlink-cu12: markers 'platform_machine == "x86_64" and platform_system == "Linux" and extra == "cuda"' don't match your environment
+Ignoring pandas: markers 'extra == "pandas"' don't match your environment
+Ignoring pyarrow: markers 'extra == "pandas"' don't match your environment
+Ignoring matplotlib: markers 'extra == "plot"' don't match your environment
+Ignoring scikit-learn: markers 'extra == "sklearn"' don't match your environment
+Ignoring numpy: markers 'extra == "sklearn"' don't match your environment
+Ignoring pytest: markers 'extra == "test"' don't match your environment
+Ignoring numpy: markers 'extra == "test"' don't match your environment
+Ignoring pandas: markers 'extra == "test"' don't match your environment
+Ignoring pyarrow: markers 'extra == "test"' don't match your environment
+Ignoring matplotlib: markers 'extra == "test"' don't match your environment
+Ignoring scikit-learn: markers 'extra == "test"' don't match your environment
+Ignoring torch: markers 'extra == "torch"' don't match your environment
+Ignoring mypy: markers 'extra == "type"' don't match your environment
+Ignoring numpy: markers 'extra == "type"' don't match your environment
+Ignoring pandas: markers 'extra == "type"' don't match your environment
+Ignoring pandas-stubs: markers 'extra == "type"' don't match your environment
+Ignoring pyarrow: markers 'extra == "type"' don't match your environment
+Ignoring polars: markers 'extra == "type"' don't match your environment
+Ignoring matplotlib: markers 'extra == "type"' don't match your environment
+Ignoring scikit-learn: markers 'extra == "type"' don't match your environment
+Ignoring scikit-learn-stubs: markers 'extra == "type"' don't match your environment
+Ignoring scipy-stubs: markers 'extra == "type"' don't match your environment
+Ignoring pytest: markers 'extra == "type"' don't match your environment
+Ignoring types-requests: markers 'extra == "type"' don't match your environment
+Ignoring vulture: markers 'extra == "type"' don't match your environment
+Requirement already satisfied: numpy>=1.26 in /projects/standard/hsiehph/sauer354/gamfit-sweep-venv/lib64/python3.11/site-packages (2.4.6)
+   Compiling gam v0.3.100 (/projects/standard/hsiehph/sauer354/gam-808b)
+   Compiling gam-pyffi v0.1.174 (/projects/standard/hsiehph/sauer354/gam-808b/crates/gam-pyffi)
+    Finished `release` profile [optimized] target(s) in 13m 03s
+📦 Built wheel for abi3 Python ≥ 3.10 to /tmp/.tmp2ftqoa/gamfit-0.1.174-cp310-abi3-linux_x86_64.whl
+✏️ Setting installed package as editable
+🛠 Installed gamfit-0.1.174

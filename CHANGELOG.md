@@ -1,3 +1,9 @@
+## gam v0.3.102 / gamfit v0.1.176
+
+- fix(#789B): fast-fail survival marginal-slope on all-censored (zero-event) designs instead of spinning.
+- fix(#808): never-fail outer escalation for survival marginal-slope (graceful degradation instead of fatal IntegrationFailed); permanent regression test (#814).
+- Includes #700-703 tensor/sz null-space penalty defaults, #811/#812 binomial predict covariance_mode/observation_interval threading, #795 periodic-axis shrinkage fix, and #735/#736 log_sigma block-width fixes.
+
 # Changelog
 
 All notable, user-visible changes to **gam** (the Rust engine, published to
