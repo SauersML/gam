@@ -1686,7 +1686,10 @@ fn run_fit_bernoulli_marginal_slope(
         );
     }
     if args.firth {
-        return Err("--firth is not supported for the bernoulli marginal-slope family".to_string());
+        inference_notes.push(
+            "--firth is redundant for bernoulli marginal-slope: the robust Jeffreys/Firth stabilizer is installed by policy"
+                .to_string(),
+        );
     }
     if args.predict_noise.is_some() {
         return Err(
@@ -6769,7 +6772,9 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
             );
         }
         if args.firth {
-            return Err("--firth is not supported for marginal-slope fitting".to_string());
+            log::info!(
+                "--firth is redundant for marginal-slope fitting: the robust Jeffreys/Firth stabilizer is installed by policy"
+            );
         }
         if args.adaptive_regularization {
             return Err(
