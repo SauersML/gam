@@ -41,8 +41,10 @@
 //! sigma(x) move with x), so gam must exercise *both* smooth channels — the mean
 //! `s(x, k=8)` and the log-sigma `1 + s(x, k=8)` — to produce sensible predictive
 //! distributions. We fit on 100 training rows, predict (mu, sigma) on a held-out
-//! 50-row test set, and score generalization. The contiguous-tail split isolates
-//! held-out calibration from training-set overfitting.
+//! 50-row test set, and score generalization. The hold-out is INTERLEAVED (every
+//! 3rd row of sorted x) so the test rows span the whole support [0, 1] and the
+//! near-optimality verdict measures in-support calibration — not the irreducible
+//! extrapolation error a contiguous-tail split would impose on any smoother.
 //!
 //! gam-side API (pinned by reading the source):
 //!   * `fit_from_formula(.., FitConfig{ noise_formula: Some(..), .. })` produces a
@@ -130,16 +132,29 @@ fn gam_gaussian_location_scale_crps_matches_properscoring() {
         .map(|i| mu_true(x[i]) + sigma_true(x[i]) * z[i])
         .collect();
 
-    // ---- split: first 100 train, last 50 hold-out test --------------------
-    // x is sorted, so taking a contiguous tail as the test set probes
-    // extrapolation/interpolation across the full support rather than a single
-    // region; CRPS agreement must hold regardless of where the held-out rows lie.
-    let n_train = 100usize;
-    let n_test = n - n_train; // 50
-    let x_train = &x[..n_train];
-    let y_train = &y[..n_train];
-    let x_test = &x[n_train..];
-    let y_test = &y[n_train..];
+    // ---- split: interleaved 100 train / 50 hold-out test ------------------
+    // x is sorted, so the hold-out is taken as every 3rd row (i % 3 == 2) — 50
+    // of 150 — which spreads the test set evenly across the WHOLE support
+    // [0, 1] rather than a single tail. This judges held-out CALIBRATION
+    // everywhere the heteroscedasticity lives, in-support, the same way the
+    // sibling PIT and GAGurine tests interleave their splits. A contiguous
+    // tail of sorted x is pure extrapolation (test x entirely outside the
+    // training range): the scale spline can only extend its penalty-nullspace
+    // trend beyond the data, so the oracle-relative CRPS there measures
+    // irreducible extrapolation error that no smoother (gam, gamlss, or mgcv)
+    // can beat — not predictive calibration. The near-optimality bar below is
+    // a calibration claim, so the split must keep the test rows in-support.
+    let is_test = |i: usize| i % 3 == 2;
+    let n_test = (0..n).filter(|&i| is_test(i)).count(); // 50
+    let n_train = n - n_test; // 100
+    let x_train: Vec<f64> = (0..n).filter(|&i| !is_test(i)).map(|i| x[i]).collect();
+    let y_train: Vec<f64> = (0..n).filter(|&i| !is_test(i)).map(|i| y[i]).collect();
+    let x_test: Vec<f64> = (0..n).filter(|&i| is_test(i)).map(|i| x[i]).collect();
+    let y_test: Vec<f64> = (0..n).filter(|&i| is_test(i)).map(|i| y[i]).collect();
+    let x_train = x_train.as_slice();
+    let y_train = y_train.as_slice();
+    let x_test = x_test.as_slice();
+    let y_test = y_test.as_slice();
 
     // ---- build the TRAINING dataset (column 0 = x, column 1 = y) ----------
     let headers: Vec<String> = vec!["x".to_string(), "y".to_string()];
