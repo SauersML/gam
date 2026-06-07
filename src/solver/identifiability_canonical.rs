@@ -152,6 +152,22 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
     fn evaluate_full(&self) -> Array3<f64> {
         self.jac.clone()
     }
+    fn channel_flattened_column(&self, col: usize, out: &mut [f64]) {
+        let n = self.nrows();
+        let k = self.k();
+        assert!(
+            col < self.ncols(),
+            "BlockJacobianAsRowOp::channel_flattened_column col {col} out of range {}",
+            self.ncols()
+        );
+        assert_eq!(out.len(), n * k);
+        // Stream the column straight out of the stored tensor — no full clone.
+        for i in 0..n {
+            for ch in 0..k {
+                out[i * k + ch] = self.jac[[i, col, ch]];
+            }
+        }
+    }
 }
 
 /// Specs after pre-fit cross-block identifiability canonicalisation.
