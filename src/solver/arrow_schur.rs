@@ -1679,16 +1679,6 @@ fn combine_row_and_registry_fingerprints(row: u64, registry: u64) -> u64 {
     hasher.finish_u64()
 }
 
-fn stable_softplus_for_fingerprint(x: f64) -> f64 {
-    if x > 30.0 {
-        x
-    } else if x < -30.0 {
-        x.exp()
-    } else {
-        (1.0 + x.exp()).ln()
-    }
-}
-
 fn write_array2_fingerprint(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     hasher.write_usize(values.nrows());
     hasher.write_usize(values.ncols());
@@ -1757,7 +1747,7 @@ fn analytic_penalty_row_hessian_fingerprint(
                 let active_raw_beta = p.raw_beta[k] + rho_local[raw_beta_offset + k];
                 hasher.write_f64(p.raw_beta[k]);
                 hasher.write_f64(active_raw_beta);
-                hasher.write_f64(stable_softplus_for_fingerprint(active_raw_beta));
+                hasher.write_f64(crate::linalg::utils::stable_softplus(active_raw_beta));
             }
             let mu_offset = p.log_alpha.len() + p.raw_beta.len();
             for k in 0..p.mu.nrows() {

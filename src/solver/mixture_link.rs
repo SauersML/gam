@@ -156,11 +156,6 @@ pub(crate) fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
 }
 
 #[inline]
-fn logistic_stable(eta: f64) -> f64 {
-    logit_inverse_link_jet5(eta).mu
-}
-
-#[inline]
 fn probit_jet(eta: f64) -> InverseLinkJet {
     // Exact probit semantics:
     //
@@ -1519,7 +1514,7 @@ pub fn mixture_inverse_link_jetwith_rho_partials_into(
 
 #[inline]
 fn logistic_uwith_derivatives(eta: f64) -> (f64, f64) {
-    let u = logistic_stable(eta);
+    let u = crate::linalg::utils::stable_logistic(eta);
     let u_clamped = u.clamp(BETA_LOGISTIC_U_EPS, 1.0 - BETA_LOGISTIC_U_EPS);
     let clamp_active = !eta.is_finite() || u_clamped != u;
     let du = if clamp_active {
