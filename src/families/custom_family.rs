@@ -15328,8 +15328,29 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // workspace path is preserved behind
                 // `options.line_search_prefer_workspace` for A/B regression
                 // checks against the legacy numerics.
-                let line_search_options =
-                    coefficient_line_search_options(options, old_objective + 1e-10);
+                //
+                // EARLY-EXIT THRESHOLD MUST BOUND THE NLL, NOT THE FULL OBJECTIVE
+                // (was a stall — gam#787/#785, duchon centers≥20). The family's
+                // `bernoulli_margslope_line_search_ll_with_early_exit` short-
+                // circuits the row sweep when the accumulated `-Σ wᵢ log CDF` (the
+                // NLL ALONE — no penalty, no Jeffreys Φ) exceeds the threshold; its
+                // monotone-lower-bound proof is valid only for the NLL term. But the
+                // accept test is on the FULL augmented objective
+                // `F = -ℓ + ½βᵀSβ + Φ_trial`, accepted iff `F ≤ old_objective + slack`,
+                // i.e. iff `-ℓ_trial ≤ old_objective + slack − penalty_trial`. Passing
+                // the full `old_objective` as the NLL threshold therefore over-rejects
+                // by exactly `penalty_trial`: where the trial penalty is NEGATIVE
+                // (the Jeffreys term subtracts Φ, and `½βᵀSβ` can be net-negative
+                // under the reparam) the NLL threshold sits BELOW the true accept
+                // bound, so the early exit kills net-descent steps the trust region
+                // would accept — every backtracking attempt false-rejects, the radius
+                // collapses, and the inner exits non-converged at cycle ~2 (seed
+                // rejected pre-solver → hard raise, β pinned). Subtract the trial
+                // penalty so the threshold is the NLL the trial must beat.
+                let line_search_options = coefficient_line_search_options(
+                    options,
+                    old_objective + 1e-10 - trial_penalty,
+                );
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
