@@ -4186,6 +4186,26 @@ impl NuclearNormPenalty {
         self.max_rank.unwrap_or(thin_rank).min(thin_rank)
     }
 
+    /// PSD-floored squared smoothed singular value `max(σ² + ε², eig_floor)`,
+    /// with `eig_floor = max(ε², 1e-15)`.
+    ///
+    /// This is the single regularized spectrum shared by `value`, `grad_target`
+    /// and the HVP's right-Gram filter, so that the smoothed nuclear norm
+    /// `Σ(√(σ²+ε²) − ε)`, its gradient `σ/√(σ²+ε²)`, and the Fréchet
+    /// inverse-square-root filter `(σ²+ε²)^{-1/2}` are all evaluated on the
+    /// *same* eigenvalue. Without the shared floor the value/gradient (which
+    /// previously used the unfloored `σ²+ε²`) desync from the HVP (which floors
+    /// the right-Gram eigenvalues) when `ε² < 1e-15`, breaking the
+    /// value↔gradient↔Hessian consistency that REML evidence and the Newton
+    /// curvature block rely on (#737). The floor itself was introduced for
+    /// PSD-roundoff robustness (651d827e6); applying it everywhere preserves
+    /// that protection without reintroducing the desync.
+    fn regularized_sigma_sq(&self, sigma_sq: f64) -> f64 {
+        let eps2 = self.smoothing_eps * self.smoothing_eps;
+        let eig_floor = eps2.max(1.0e-15);
+        (sigma_sq + eps2).max(eig_floor)
+    }
+
     /// Number of leading right-Gram eigen-directions (top singular values) the
     /// HVP keeps active, identical to the rank `value`/`grad` sum over.
     ///
@@ -4294,13 +4314,15 @@ impl NuclearNormPenalty {
                 ));
             }
         }
-        let eps2 = self.smoothing_eps * self.smoothing_eps;
-        let eig_floor = eps2.max(1.0e-15);
         let mut regularized_evals = Array1::<f64>::zeros(d);
         let mut f = Array1::<f64>::zeros(d);
         let mut df = Array1::<f64>::zeros(d);
         for i in 0..d {
-            regularized_evals[i] = (raw_evals[i] + eps2).max(eig_floor);
+            // Same shared floor used by `value`/`grad_target` (#737): the
+            // right-Gram eigenvalue `raw_evals[i]` is the squared singular value
+            // `σ²`, so `regularized_sigma_sq(σ²) = max(σ²+ε², eig_floor)` keeps
+            // the filter on the identical regularized spectrum.
+            regularized_evals[i] = self.regularized_sigma_sq(raw_evals[i]);
             if i >= active_start {
                 // Keep the value filter and Fréchet derivative on the same
                 // regularized spectrum. This preserves the PSD-roundoff floor
@@ -4401,7 +4423,9 @@ impl AnalyticPenalty for NuclearNormPenalty {
         let mut acc = 0.0;
         for i in 0..rank {
             let sigma = svd.singular[i];
-            acc += (sigma * sigma + eps * eps).sqrt() - eps;
+            // Floored on the shared regularized spectrum so the value matches the
+            // HVP's right-Gram filter (see `regularized_sigma_sq`).
+            acc += self.regularized_sigma_sq(sigma * sigma).sqrt() - eps;
         }
         self.resolved_weight(rho) * acc
     }
@@ -4413,11 +4437,12 @@ impl AnalyticPenalty for NuclearNormPenalty {
         let svd = self.compute_svd_cached(t);
         let rank = self.rank_limit(svd.singular.len());
         let weight = self.resolved_weight(rho);
-        let eps2 = self.smoothing_eps * self.smoothing_eps;
         let mut grad = Array2::<f64>::zeros(t.dim());
         for i in 0..rank {
             let sigma = svd.singular[i];
-            let spectral_grad = sigma / (sigma * sigma + eps2).sqrt();
+            // d/dσ (√(σ²+ε²) − ε) = σ/√(σ²+ε²), floored on the shared regularized
+            // spectrum so grad↔value↔HVP stay mutually consistent (#737).
+            let spectral_grad = sigma / self.regularized_sigma_sq(sigma * sigma).sqrt();
             for n in 0..t.nrows() {
                 for a in 0..t.ncols() {
                     grad[[n, a]] += weight * svd.u[[n, i]] * spectral_grad * svd.vt[[i, a]];

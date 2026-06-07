@@ -24353,6 +24353,38 @@ fn outer_startup_failure_is_escalatable(err: &EstimationError) -> bool {
         EstimationError::RemlOptimizationFailed(message) => {
             message.contains("no candidate seeds passed outer startup validation")
                 || message.contains("objective returned a non-finite cost")
+                // Data-driven inner non-convergence on a structurally-audited design:
+                // the coupled exact-joint Newton path could not drive a weakly-identified
+                // block's penalized stationarity residual below tol at every screened seed
+                // (the #787 weak marginal/logslope-coupling KKT-flooring regime). This
+                // surfaces as a hard `Err` from the inner solve (rather than the
+                // `Ok(!inner_converged)` retreat sentinel), so when it rejects every seed
+                // BEFORE the outer optimizer starts it would otherwise dead-end short of
+                // the post-run escalation rung. It is a post-audit NUMERICAL pathology, not
+                // an ill-posed input — the best inner mode reached during screening is a
+                // usable posterior mode — so route it into the same never-fail escalation
+                // (gam#860).
+                //
+                // Both coupled-exact-joint non-convergence signatures qualify: the
+                // pre-budget "exited the joint Newton path before convergence" exit and
+                // the "exhausted the joint Newton budget without KKT convergence" exit are
+                // the same #787-class weak-identification floor reached two ways.
+                //
+                // The SAME prefixes are also emitted for GENUINELY STRUCTURAL cert
+                // refusals (the diagnosis is carried in the trailing `; diagnosis: <label>`
+                // slot of the bubbled error). Those — a rank-deficient joint design, an
+                // unresolved active set, or a cross-block alias surfaced at fit time — are
+                // NOT recoverable by sampling about the mode (the mode itself is
+                // degenerate), so they must keep hard-raising. We therefore escalate the
+                // coupled-joint failure only when it carries no structural diagnosis label.
+                || ((message
+                    .contains("coupled exact-joint inner solve exited the joint Newton path")
+                    || message.contains(
+                        "coupled exact-joint inner solve exhausted the joint Newton budget",
+                    ))
+                    && !message.contains("diagnosis: rank_deficient_H_pen")
+                    && !message.contains("diagnosis: active_set_incomplete")
+                    && !message.contains("diagnosis: aliasing_detected_at_fit"))
         }
         _ => false,
     }
