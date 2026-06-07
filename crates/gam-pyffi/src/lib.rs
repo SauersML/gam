@@ -483,6 +483,7 @@ struct SummaryPayload {
     deployment_extensions: Vec<SavedDeploymentExtension>,
     deviance: f64,
     reml_score: f64,
+    raw_reml_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     null_space_logdet: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2876,18 +2877,16 @@ fn load_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<()> {
 
 #[pyfunction]
 fn bayes_factor_log_diff(model_a_bytes: Vec<u8>, model_b_bytes: Vec<u8>) -> PyResult<f64> {
-    let model_a = load_model_impl(&model_a_bytes).map_err(PyValueError::new_err)?;
-    let model_b = load_model_impl(&model_b_bytes).map_err(PyValueError::new_err)?;
-    let fit_a =
-        fit_result_from_saved_model_for_prediction(&model_a).map_err(PyValueError::new_err)?;
-    let fit_b =
-        fit_result_from_saved_model_for_prediction(&model_b).map_err(PyValueError::new_err)?;
+    let payload_a = summary_payload_from_model_bytes(&model_a_bytes)?;
+    let payload_b = summary_payload_from_model_bytes(&model_b_bytes)?;
+    let score_a = comparable_reml_score_from_summary_payload(&payload_a)?;
+    let score_b = comparable_reml_score_from_summary_payload(&payload_b)?;
     // `reml_score` is a minimised cost (lower = better marginal likelihood),
     // so the log Bayes factor of A over B is `score_b - score_a`, not
     // `score_a - score_b`. Route through the shared convention so this agrees
     // with `compare_reml_fits` (issue #575: the raw subtraction was inverted,
     // reporting overwhelming evidence for the worse-fitting model).
-    Ok(log_bayes_factor(fit_a.reml_score, fit_b.reml_score))
+    Ok(log_bayes_factor(score_a, score_b))
 }
 
 #[pyfunction]
@@ -5054,6 +5053,7 @@ fn rank_topology_candidates(evidence_json: &str) -> PyResult<String> {
 }
 
 const REML_SCORE_KEYS: &[&str] = &["reml_score", "evidence", "laml", "score"];
+const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
 const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
 const PENALTY_RANK_KEYS: &[&str] = &["penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"];
 const NULL_DIM_KEYS: &[&str] = &["null_dim"];
@@ -5207,6 +5207,9 @@ fn extract_reml_score_raw_impl(py: Python<'_>, fit: &Bound<'_, PyAny>) -> PyResu
 }
 
 fn extract_reml_score_raw_from_view(view: &RemlFitView<'_>) -> PyResult<f64> {
+    if let Some(score) = extract_float_metadata_from_view(view, RAW_REML_SCORE_KEYS)? {
+        return Ok(score);
+    }
     if let Some(score) = extract_float_metadata_from_view(view, REML_SCORE_KEYS)? {
         return Ok(score);
     }
@@ -5230,11 +5233,47 @@ fn with_tierney_kadane_normalizer_from_view(
     let Some(null_dim) = extract_null_dim_from_view(py, view)? else {
         return Ok(score);
     };
-    tierney_kadane_normalized_score(
+    comparable_reml_score(
         score,
-        null_dim,
+        Some(null_dim),
         extract_float_metadata_from_view(view, NULL_HESSIAN_LOGDET_KEYS)?,
     )
+    .map_err(PyValueError::new_err)
+}
+
+fn comparable_reml_score(
+    raw_reml_score: f64,
+    null_dim: Option<f64>,
+    null_space_logdet: Option<f64>,
+) -> Result<f64, String> {
+    let Some(null_dim) = null_dim else {
+        return Ok(raw_reml_score);
+    };
+    gam::solver::topology_selector::tk_normalized_score(
+        raw_reml_score,
+        null_dim,
+        null_space_logdet,
+        1.0,
+        1,
+        gam::solver::evidence::TopologyScoreScale::PerObservation,
+    )
+}
+
+fn comparable_reml_score_from_summary_payload(payload: &serde_json::Value) -> PyResult<f64> {
+    let raw = json_lookup_f64(payload, RAW_REML_SCORE_KEYS)
+        .or_else(|| json_lookup_f64(payload, REML_SCORE_KEYS))
+        .ok_or_else(|| py_value_error("saved model payload is missing reml_score".to_string()))?;
+    if !raw.is_finite() {
+        return Err(py_value_error(
+            "saved model payload reml_score must be finite".to_string(),
+        ));
+    }
+    comparable_reml_score(
+        raw,
+        json_lookup_f64(payload, NULL_DIM_KEYS),
+        json_lookup_f64(payload, NULL_HESSIAN_LOGDET_KEYS),
+    )
+    .map_err(PyValueError::new_err)
 }
 
 fn extract_null_dim_from_view(py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
@@ -16314,16 +16353,7 @@ fn model_deployment_extensions(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult
 #[pyfunction]
 fn model_evidence(model_bytes: Vec<u8>) -> PyResult<f64> {
     let payload = summary_payload_from_model_bytes(&model_bytes)?;
-    let value = payload
-        .get("reml_score")
-        .and_then(serde_json::Value::as_f64)
-        .ok_or_else(|| py_value_error("saved model payload is missing reml_score".to_string()))?;
-    if !value.is_finite() {
-        return Err(py_value_error(
-            "saved model payload reml_score must be finite".to_string(),
-        ));
-    }
-    Ok(value)
+    comparable_reml_score_from_summary_payload(&payload)
 }
 
 fn summary_payload_value_from_model_bytes(model_bytes: &[u8]) -> Result<serde_json::Value, String> {
@@ -27649,6 +27679,13 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
             std_error: standard_errors.and_then(|values| values.get(index).copied()),
         })
         .collect();
+    let raw_reml_score = fit.reml_score;
+    let reml_score = comparable_reml_score(
+        raw_reml_score,
+        fit.artifacts.null_space_dim.map(|dim| dim as f64),
+        fit.artifacts.null_space_logdet,
+    )
+    .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
     let payload = SummaryPayload {
         formula: model.payload().formula.clone(),
         family_name: model.likelihood().pretty_name().to_string(),
@@ -27656,7 +27693,8 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
-        reml_score: fit.reml_score,
+        reml_score,
+        raw_reml_score,
         null_space_logdet: fit.artifacts.null_space_logdet,
         null_dim: fit.artifacts.null_space_dim.map(|dim| dim as f64),
         iterations: fit.outer_iterations,

@@ -547,10 +547,11 @@ class Model:
     @property
     def evidence(self) -> float:
         """Minimised REML / LAML cost for this fit (penalised negative log
-        marginal likelihood plus Laplace correction). It is a *cost*, so
-        **lower is better** -- the model with the smaller ``evidence`` is the
-        better-supported one. Use :meth:`bayes_factor_vs` or
-        ``gamfit.compare_models`` for a direct comparison.
+        marginal likelihood plus Laplace correction), on the same
+        rank-normalized comparison scale used by ``gamfit.compare_models``.
+        It is a *cost*, so **lower is better** -- the model with the smaller
+        ``evidence`` is the better-supported one. Use :meth:`bayes_factor_vs`
+        or ``gamfit.compare_models`` for a direct comparison.
         """
         return float(rust_module().model_evidence(self._model_bytes))
 
