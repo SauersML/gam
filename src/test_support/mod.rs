@@ -145,6 +145,62 @@ macro_rules! assert_central_difference_array {
     };
 }
 
+/// Asserts that a finite difference dense matrix matches an analytically
+/// computed directional derivative matrix to a *relative* tolerance
+/// `rel_tol·(1 + |analytic|)`, plus component-wise sign agreement.
+///
+/// Use this (rather than the absolute-tolerance [`assert_matrix_derivativefd`])
+/// when the comparison's dominant components are O(0.1–1) and the finite
+/// difference is contaminated by a small, non-smooth solver channel — e.g. an
+/// adaptive PIRLS stabilization ridge whose magnitude shifts discontinuously
+/// across the ± FD re-solves. There the exact analytic IFT derivative (which
+/// correctly excludes that solver-only ridge) and the FD disagree by a fixed
+/// *fraction* of the component magnitude, not a fixed absolute amount, so an
+/// absolute bound tuned for the small components is spuriously tight on the
+/// large ones. The two underlying derivative channels are validated separately
+/// against their own FDs, so this asserts the composite to the achievable
+/// relative precision rather than weakening the per-channel checks (gam#855).
+pub fn assert_matrix_derivativefd_rel(
+    fd: &Array2<f64>,
+    analytic: &Array2<f64>,
+    rel_tol: f64,
+    label: &str,
+) {
+    assert_eq!(analytic.dim(), fd.dim(), "{} dimensions must match", label);
+    for i in 0..analytic.nrows() {
+        for j in 0..analytic.ncols() {
+            let analytic_ij = analytic[[i, j]];
+            let fd_ij = fd[[i, j]];
+            let tol = rel_tol * (1.0 + analytic_ij.abs());
+            if analytic_ij.abs() > tol && fd_ij.abs() > tol {
+                assert_eq!(
+                    analytic_ij.signum(),
+                    fd_ij.signum(),
+                    "{} sign mismatch at ({}, {}): analytic={}, fd={}",
+                    label,
+                    i,
+                    j,
+                    analytic_ij,
+                    fd_ij
+                );
+            }
+            let diff = (analytic_ij - fd_ij).abs();
+            assert!(
+                diff <= tol,
+                "{} value mismatch at ({}, {}): analytic={}, fd={}, abs_diff={}, rel_tol={}, tol={}",
+                label,
+                i,
+                j,
+                analytic_ij,
+                fd_ij,
+                diff,
+                rel_tol,
+                tol
+            );
+        }
+    }
+}
+
 /// Asserts that a finite difference dense matrix closely matches an analytically computed
 /// directional derivative matrix, both in tolerance and in component-wise sign.
 pub fn assert_matrix_derivativefd(fd: &Array2<f64>, analytic: &Array2<f64>, tol: f64, label: &str) {

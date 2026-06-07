@@ -12246,9 +12246,33 @@ mod tests {
         );
     }
 
+    /// Build a location-scale family whose three coefficient blocks are each
+    /// `p`-columns wide (and `n`-rows) so `joint_block_dims()` == `[p, p, p]`.
+    /// The advertisement guards (`validate_joint_specs`) compare the spec
+    /// widths against `joint_block_dims()`, so the family's design widths must
+    /// equal the spec widths for the HVP-availability path to be exercised
+    /// (gam#848); the previous fixture left the family at 1-column designs
+    /// while building width-200 specs, so the guard correctly rejected them.
+    fn survival_biobank_block_test_family(p: usize) -> SurvivalLocationScaleFamily {
+        let n = 3usize;
+        let mut family = survival_exact_newton_test_family();
+        family.x_threshold =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::<f64>::zeros(
+                (n, p),
+            )));
+        family.x_log_sigma =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::<f64>::zeros(
+                (n, p),
+            )));
+        family.x_time_entry = Arc::new(Array2::<f64>::zeros((n, p)));
+        family.x_time_exit = Arc::new(Array2::<f64>::zeros((n, p)));
+        family.x_time_deriv = Arc::new(Array2::<f64>::zeros((n, p)));
+        family
+    }
+
     #[test]
     fn survival_location_scale_advertises_outer_hvp_at_biobank_dimensions() {
-        let family = survival_exact_newton_test_family();
+        let family = survival_biobank_block_test_family(200);
         let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
             name: name.to_string(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
@@ -12283,7 +12307,7 @@ mod tests {
 
     #[test]
     fn survival_location_scale_planner_keeps_analytic_hessian_at_biobank_dimensions() {
-        let family = survival_exact_newton_test_family();
+        let family = survival_biobank_block_test_family(200);
         let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
             name: name.to_string(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((

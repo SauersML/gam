@@ -58,26 +58,33 @@ const LOG_ZERO_SATURATION_THRESHOLD: f64 = LOG_ZERO_SENTINEL * 0.5;
 /// garbage.
 pub const MIN_EPS: f64 = 1.0e-12;
 
-/// Numerically-stable in-place `logsumexp` along the first axis of an
-/// `(M, M)` log-matrix `log_x`, returning an `(M,)` vector with
-/// `out[j] = log(sum_i exp(log_x[i, j]))`.
+/// Stabilized `logsumexp` of `log_kernel[i, j] + off[i]` over the first axis
+/// `i`, returning an `(M,)` vector indexed by `j`.
 ///
-/// The implementation subtracts the column maximum before the `exp`
-/// step, so the result is correct even when individual entries
-/// underflow or overflow `f64`. Special cases:
-///
-/// * if all entries in a column are `-inf` (or the sentinel) the
-///   result is `LOG_ZERO_SENTINEL`, never `NaN`.
-fn logsumexp_axis0(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
-    let (m_rows, m_cols) = log_x.dim();
+/// This is the core Sinkhorn projection kernel. It is mathematically identical
+/// to materializing the `(M, M)` matrix `scratch[i, j] = log_kernel[i, j] +
+/// off[i]` and taking a stabilized column-wise `logsumexp`, but it never
+/// allocates or fills that matrix: it folds directly over each column of
+/// `log_kernel` zipped with
+/// `off` using slice iterators. Eliminating the per-(atom, iteration) `(M, M)`
+/// scratch fill — and the double-`[[i, j]]` indexing that fill performed — is
+/// what brings the per-iteration cost down to the matvec form the kernel
+/// advertises (gam#852). The column-max subtraction preserves the exact
+/// log-domain stability guarantee (no underflow at small `eps`).
+fn logsumexp_kernel_plus_offset_axis0(
+    log_kernel: ArrayView2<'_, f64>,
+    off: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let (m_rows, m_cols) = log_kernel.dim();
     let mut out = Array1::<f64>::from_elem(m_cols, LOG_ZERO_SENTINEL);
     if m_rows == 0 {
         return out;
     }
     for j in 0..m_cols {
+        let col = log_kernel.column(j);
         let mut col_max = f64::NEG_INFINITY;
-        for i in 0..m_rows {
-            let value = log_x[[i, j]];
+        for (&k, &o) in col.iter().zip(off.iter()) {
+            let value = k + o;
             if value > col_max {
                 col_max = value;
             }
@@ -87,8 +94,8 @@ fn logsumexp_axis0(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
             continue;
         }
         let mut acc = 0.0_f64;
-        for i in 0..m_rows {
-            acc += (log_x[[i, j]] - col_max).exp();
+        for (&k, &o) in col.iter().zip(off.iter()) {
+            acc += (k + o - col_max).exp();
         }
         out[j] = if acc > 0.0 {
             col_max + acc.ln()
@@ -99,19 +106,24 @@ fn logsumexp_axis0(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
     out
 }
 
-/// Numerically-stable `logsumexp` along the second axis of an
-/// `(M, M)` log-matrix `log_x`, returning an `(M,)` vector with
-/// `out[i] = log(sum_j exp(log_x[i, j]))`.
-fn logsumexp_axis1(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
-    let (m_rows, m_cols) = log_x.dim();
+/// Stabilized `logsumexp` of `log_kernel[i, j] + off[j]` over the second axis
+/// `j`, returning an `(M,)` vector indexed by `i`. Row-oriented dual of
+/// [`logsumexp_kernel_plus_offset_axis0`]; avoids the `(M, M)` scratch fill
+/// (gam#852).
+fn logsumexp_kernel_plus_offset_axis1(
+    log_kernel: ArrayView2<'_, f64>,
+    off: ArrayView1<'_, f64>,
+) -> Array1<f64> {
+    let (m_rows, m_cols) = log_kernel.dim();
     let mut out = Array1::<f64>::from_elem(m_rows, LOG_ZERO_SENTINEL);
     if m_cols == 0 {
         return out;
     }
     for i in 0..m_rows {
+        let row = log_kernel.row(i);
         let mut row_max = f64::NEG_INFINITY;
-        for j in 0..m_cols {
-            let value = log_x[[i, j]];
+        for (&k, &o) in row.iter().zip(off.iter()) {
+            let value = k + o;
             if value > row_max {
                 row_max = value;
             }
@@ -121,8 +133,8 @@ fn logsumexp_axis1(log_x: ArrayView2<'_, f64>) -> Array1<f64> {
             continue;
         }
         let mut acc = 0.0_f64;
-        for j in 0..m_cols {
-            acc += (log_x[[i, j]] - row_max).exp();
+        for (&k, &o) in row.iter().zip(off.iter()) {
+            acc += (k + o - row_max).exp();
         }
         out[i] = if acc > 0.0 {
             row_max + acc.ln()
@@ -336,20 +348,10 @@ pub fn sinkhorn_barycenter_forward_state(
     let inv_m = (1.0_f64 / m as f64).ln();
     let mut log_a = Array1::<f64>::from_elem(m, inv_m);
 
-    // Scratch buffer of shape (M, M) for the broadcasted sum
-    // `log_kernel + dual[:, None]`.
-    let mut scratch = Array2::<f64>::zeros((m, m));
-
     for _ in 0..n_iter {
         // Step 1: log_v[k, :] = log_a - logsumexp_i(log_kernel[i, :] + log_u[k, i]).
         for ki in 0..k {
-            for i in 0..m {
-                let off = log_u[[ki, i]];
-                for j in 0..m {
-                    scratch[[i, j]] = log_kernel[[i, j]] + off;
-                }
-            }
-            let lse = logsumexp_axis0(scratch.view());
+            let lse = logsumexp_kernel_plus_offset_axis0(log_kernel.view(), log_u.row(ki));
             for j in 0..m {
                 log_v[[ki, j]] = log_a[j] - lse[j];
             }
@@ -357,30 +359,16 @@ pub fn sinkhorn_barycenter_forward_state(
 
         // Step 2: log_u[k, :] = log_atoms[k, :] - logsumexp_j(log_kernel[:, j] + log_v[k, j]).
         for ki in 0..k {
-            for j in 0..m {
-                let off = log_v[[ki, j]];
-                for i in 0..m {
-                    scratch[[i, j]] = log_kernel[[i, j]] + off;
-                }
-            }
-            let lse = logsumexp_axis1(scratch.view());
+            let lse = logsumexp_kernel_plus_offset_axis1(log_kernel.view(), log_v.row(ki));
             for i in 0..m {
                 log_u[[ki, i]] = log_atoms[[ki, i]] - lse[i];
             }
         }
 
-        // Step 3: log_a[i] = sum_k w_k * logsumexp_j(log_kernel[j, i] + log_u[k, j])
-        // = sum_k w_k * logsumexp_i' over axis 0 since kernel is symmetric in our use.
-        // Use axis-0 LSE: scratch[i', i] = log_kernel[i', i] + log_u[k, i'].
+        // Step 3: log_a[i] = sum_k w_k * logsumexp_i'(log_kernel[i', i] + log_u[k, i']).
         let mut next_log_a = Array1::<f64>::zeros(m);
         for ki in 0..k {
-            for i_prime in 0..m {
-                let off = log_u[[ki, i_prime]];
-                for i in 0..m {
-                    scratch[[i_prime, i]] = log_kernel[[i_prime, i]] + off;
-                }
-            }
-            let lse = logsumexp_axis0(scratch.view());
+            let lse = logsumexp_kernel_plus_offset_axis0(log_kernel.view(), log_u.row(ki));
             for i in 0..m {
                 next_log_a[i] += weights_norm[ki] * lse[i];
             }
@@ -481,17 +469,10 @@ pub fn sinkhorn_barycenter_vjp(
     log_u_hist.push(log_u.clone());
     log_a_hist.push(log_a.clone());
 
-    let mut scratch = Array2::<f64>::zeros((m, m));
     for _ in 0..n_iter {
         let mut log_v = Array2::<f64>::zeros((k, m));
         for ki in 0..k {
-            for i in 0..m {
-                let off = log_u[[ki, i]];
-                for j in 0..m {
-                    scratch[[i, j]] = log_kernel[[i, j]] + off;
-                }
-            }
-            let lse = logsumexp_axis0(scratch.view());
+            let lse = logsumexp_kernel_plus_offset_axis0(log_kernel.view(), log_u.row(ki));
             for j in 0..m {
                 log_v[[ki, j]] = log_a[j] - lse[j];
             }
@@ -499,13 +480,7 @@ pub fn sinkhorn_barycenter_vjp(
 
         let mut next_log_u = Array2::<f64>::zeros((k, m));
         for ki in 0..k {
-            for j in 0..m {
-                let off = log_v[[ki, j]];
-                for i in 0..m {
-                    scratch[[i, j]] = log_kernel[[i, j]] + off;
-                }
-            }
-            let lse = logsumexp_axis1(scratch.view());
+            let lse = logsumexp_kernel_plus_offset_axis1(log_kernel.view(), log_v.row(ki));
             for i in 0..m {
                 next_log_u[[ki, i]] = log_atoms[[ki, i]] - lse[i];
             }
@@ -513,13 +488,7 @@ pub fn sinkhorn_barycenter_vjp(
 
         let mut next_log_a = Array1::<f64>::zeros(m);
         for ki in 0..k {
-            for i_prime in 0..m {
-                let off = next_log_u[[ki, i_prime]];
-                for j in 0..m {
-                    scratch[[i_prime, j]] = log_kernel[[i_prime, j]] + off;
-                }
-            }
-            let lse = logsumexp_axis0(scratch.view());
+            let lse = logsumexp_kernel_plus_offset_axis0(log_kernel.view(), next_log_u.row(ki));
             for j in 0..m {
                 next_log_a[j] += weights_norm[ki] * lse[j];
             }
@@ -569,13 +538,7 @@ pub fn sinkhorn_barycenter_vjp(
         // Step 3 backward:
         //   log_a_new[j] = sum_k w_k * LSE_i(log_kernel[i,j] + log_u_new[k,i]).
         for ki in 0..k {
-            for i in 0..m {
-                let off = log_u_new[[ki, i]];
-                for j in 0..m {
-                    scratch[[i, j]] = log_kernel[[i, j]] + off;
-                }
-            }
-            let s = logsumexp_axis0(scratch.view());
+            let s = logsumexp_kernel_plus_offset_axis0(log_kernel.view(), log_u_new.row(ki));
             for j in 0..m {
                 let ga = g_log_a_next[j];
                 g_weights[ki] += ga * s[j];
