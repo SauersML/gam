@@ -100,18 +100,13 @@ def shape_predict_response(
     marginal-slope variant). The dispatcher never decides shape itself —
     it picks a shaper and the shaper consults :func:`wants_table`.
     """
-    if raw.startswith('{"class":"survival_prediction"'):
-        return survival_prediction_from_ffi_payload(
-            raw, id_column=id_column, row_ids=row_ids
-        )
-    if raw.startswith('{"class":"competing_risks_prediction"'):
-        return competing_risks_prediction_from_ffi_payload(raw)
     parsed = json.loads(raw)
-    if parsed.get("class") == "survival_prediction":
+    payload_class = parsed.get("class")
+    if payload_class == "survival_prediction":
         return survival_prediction_from_ffi_payload(
             raw, id_column=id_column, row_ids=row_ids
         )
-    if parsed.get("class") == "competing_risks_prediction":
+    if payload_class == "competing_risks_prediction":
         return competing_risks_prediction_from_ffi_payload(raw)
 
     columns_json = json.dumps(parsed["columns"], separators=(",", ":"))
@@ -125,37 +120,27 @@ def shape_predict_response(
         interval=interval,
     )
 
-    if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
-        return _shape_transformation_normal(
-            columns,
-            table_requested=table_requested,
-            return_type=return_type,
-            id_column=id_column,
-            row_ids=row_ids,
-            table_kind=table_kind,
-            training_table_kind=training_table_kind,
-            restore=restore,
-        )
-
-    if _is_bernoulli_marginal_slope(model_class, family):
-        return _shape_bernoulli_marginal_slope(
-            columns,
-            table_requested=table_requested,
-            return_type=return_type,
-            id_column=id_column,
-            row_ids=row_ids,
-            table_kind=table_kind,
-            training_table_kind=training_table_kind,
-            restore=restore,
-        )
-
-    if model_class in _SURVIVAL_MODEL_CLASSES:
+    # Survival column payloads (no structured FFI container) keep their own
+    # tabular shaper: they expand into a per-time grid, not a single point
+    # vector, so they are a genuinely distinct shape — not a point payload.
+    if (
+        model_class in _SURVIVAL_MODEL_CLASSES
+        and not _is_bernoulli_marginal_slope(model_class, family)
+    ):
         return survival_prediction_from_columns(
             model_class, columns, id_column=id_column, row_ids=row_ids
         )
 
-    return _shape_standard(
-        columns,
+    # Every remaining class is a POINT payload: one scalar per row. They differ
+    # only in (a) which column carries the point and how it is transformed, and
+    # (b) the column key used when a table is requested. `_point_payload_spec`
+    # encodes exactly those two per-class differences; the shared shaper
+    # (`_shape_point_payload`) owns the identical "return the vector, or restore
+    # a one-column table" tail that the three forked shapers used to duplicate.
+    point, table_columns = _point_payload_spec(model_class, family, columns)
+    return _shape_point_payload(
+        point,
+        table_columns,
         table_requested=table_requested,
         return_type=return_type,
         id_column=id_column,
@@ -166,8 +151,54 @@ def shape_predict_response(
     )
 
 
-def _shape_standard(
+def _point_payload_spec(
+    model_class: str,
+    family: str,
     columns: dict[str, list[Any]],
+) -> tuple[Any, dict[str, list[Any]]]:
+    """Resolve a point-payload class to its ``(point_vector, table_columns)``.
+
+    Every non-survival predictive class returns one scalar per row. The only
+    per-class differences are which column carries that scalar, how it is
+    transformed to the response scale, and which columns make up the tabular
+    form when the caller opts into a table:
+
+    * **transformation-normal** — the per-row z-score (``transformation_normal_z``);
+      table form is the single ``z`` column.
+    * **Bernoulli marginal-slope** — ``mean`` clipped back to ``(0, 1)`` as a
+      probability; table form is the single ``mean`` (probability) column.
+    * **standard GAM / GLM** — ``mean`` as emitted; table form is the *full*
+      Rust column payload (``linear_predictor`` + ``mean`` always, plus
+      ``std_error`` / ``mean_lower`` / ``mean_upper`` when an interval was set).
+
+    The shared "return the vector, else restore a table" tail lives in
+    :func:`_shape_point_payload`; this function owns only the differences.
+    """
+    if model_class in _TRANSFORMATION_NORMAL_MODEL_CLASSES:
+        z = rust_module().vec_to_array1_f64(
+            [float(value) for value in transformation_normal_z(columns)]
+        )
+        return z, {"z": z.tolist()}
+
+    if _is_bernoulli_marginal_slope(model_class, family):
+        # The Rust core may emit linear-predictor-scale values that need
+        # clipping back to (0, 1) before exposure — the only transformation.
+        prob_values = rust_module().marginal_slope_clip_probabilities(
+            [float(value) for value in columns.get("mean", [])]
+        )
+        probs = rust_module().vec_to_array1_f64(prob_values)
+        return probs, {"mean": probs.tolist()}
+
+    mean = rust_module().vec_to_array1_f64(
+        [float(value) for value in columns["mean"]]
+    )
+    # Standard models keep the full multi-column payload in tabular form.
+    return mean, columns
+
+
+def _shape_point_payload(
+    point: Any,
+    table_columns: dict[str, list[Any]],
     *,
     table_requested: bool,
     return_type: str | None,
@@ -177,80 +208,19 @@ def _shape_standard(
     training_table_kind: str | None,
     restore: Any,
 ) -> Any:
-    """Shape a standard-GAM / GLM column payload.
+    """Shape any point payload: the 1-D ``point`` vector, or its table form.
 
-    Default contract: a 1-D ``ndarray`` of fitted means. When the caller
-    opted into a tabular shape, return whatever the Rust core emitted
-    (``linear_predictor`` + ``mean`` always; plus ``std_error`` /
-    ``mean_lower`` / ``mean_upper`` when ``interval`` was set).
+    Default contract: return the 1-D ``ndarray`` ``point``. When the caller
+    opted into a tabular shape, restore ``table_columns`` (with the optional id
+    column) through ``restore_output_table``. This is the single shaper for the
+    standard, transformation-normal, and Bernoulli marginal-slope classes,
+    which differ only in ``point`` / ``table_columns`` (see
+    :func:`_point_payload_spec`).
     """
     if not table_requested:
-        mean_values = [float(value) for value in columns["mean"]]
-        return rust_module().vec_to_array1_f64(mean_values)
+        return point
     return _restore_with_optional_id(
-        columns,
-        id_column=id_column,
-        row_ids=row_ids,
-        return_type=return_type,
-        table_kind=table_kind,
-        training_table_kind=training_table_kind,
-        restore=restore,
-    )
-
-
-def _shape_transformation_normal(
-    columns: dict[str, list[Any]],
-    *,
-    table_requested: bool,
-    return_type: str | None,
-    id_column: str | None,
-    row_ids: list[str] | None,
-    table_kind: str | None,
-    training_table_kind: str | None,
-    restore: Any,
-) -> Any:
-    """Shape a transformation-normal payload (z-score per row)."""
-    z = rust_module().vec_to_array1_f64(
-        [float(value) for value in transformation_normal_z(columns)]
-    )
-    if not table_requested:
-        return z
-    return _restore_with_optional_id(
-        {"z": z.tolist()},
-        id_column=id_column,
-        row_ids=row_ids,
-        return_type=return_type,
-        table_kind=table_kind,
-        training_table_kind=training_table_kind,
-        restore=restore,
-    )
-
-
-def _shape_bernoulli_marginal_slope(
-    columns: dict[str, list[Any]],
-    *,
-    table_requested: bool,
-    return_type: str | None,
-    id_column: str | None,
-    row_ids: list[str] | None,
-    table_kind: str | None,
-    training_table_kind: str | None,
-    restore: Any,
-) -> Any:
-    """Shape a Bernoulli marginal-slope payload (probability per row).
-
-    The Rust core may emit linear-predictor-scale values that need clipping
-    back to ``(0, 1)`` before exposure — that conversion is the only
-    transformation done here.
-    """
-    prob_values = rust_module().marginal_slope_clip_probabilities(
-        [float(value) for value in columns.get("mean", [])]
-    )
-    probs = rust_module().vec_to_array1_f64(prob_values)
-    if not table_requested:
-        return probs
-    return _restore_with_optional_id(
-        {"mean": probs.tolist()},
+        table_columns,
         id_column=id_column,
         row_ids=row_ids,
         return_type=return_type,
