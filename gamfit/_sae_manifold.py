@@ -1600,17 +1600,12 @@ def _schedule_payload(schedule: Any) -> dict[str, Any] | None:
         return schedule.to_rust_descriptor()
     descriptor = dict(schedule)
     decay = str(descriptor.get("decay", "geometric")).lower().replace("-", "_")
-    if decay == "exponential":
-        decay = "geometric"
     if "tau_start" not in descriptor:
         raise ValueError("GumbelTemperatureSchedule (dict form): missing 'tau_start'")
+    if "tau_min" not in descriptor:
+        raise ValueError("GumbelTemperatureSchedule (dict form): missing 'tau_min'")
     tau_start = float(descriptor["tau_start"])
-    if "tau_min" in descriptor:
-        tau_min = float(descriptor["tau_min"])
-    elif "tau_end" in descriptor:
-        tau_min = float(descriptor["tau_end"])
-    else:
-        raise ValueError("GumbelTemperatureSchedule (dict form): missing 'tau_min' (or 'tau_end')")
+    tau_min = float(descriptor["tau_min"])
     rate = descriptor.get("rate")
     steps = descriptor.get("steps")
     iter_count = int(descriptor.get("iter_count", 0))

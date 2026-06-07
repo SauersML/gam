@@ -9213,15 +9213,12 @@ fn gumbel_temperature_schedule_from_pydict(
     let tau_min = match schedule
         .get_item("tau_min")
         .map_err(|err| err.to_string())?
-        .or(schedule
-            .get_item("tau_end")
-            .map_err(|err| err.to_string())?)
     {
         Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
         None => return Err("gumbel_schedule is missing key \"tau_min\"".to_string()),
     };
     let decay = match decay_name.as_str() {
-        "geometric" | "exponential" => {
+        "geometric" => {
             let rate = match schedule.get_item("rate").map_err(|err| err.to_string())? {
                 Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
                 None => 0.9,
@@ -9237,7 +9234,7 @@ fn gumbel_temperature_schedule_from_pydict(
         "reciprocal_iter" => ScheduleKind::ReciprocalIter,
         other => {
             return Err(format!(
-                "gumbel_schedule decay must be 'geometric', 'exponential', 'linear', or 'reciprocal_iter'; got {other:?}"
+                "gumbel_schedule decay must be 'geometric', 'linear', or 'reciprocal_iter'; got {other:?}"
             ));
         }
     };
@@ -27874,7 +27871,7 @@ fn jumprelu_gate_value_grad<'py>(
 /// `iter`, so torch's sparsity-layer annealing queries the single Rust schedule
 /// instead of duplicating the decay arithmetic in Python. `schedule` is the
 /// same descriptor dict the SAE composition surface accepts (keys: `tau_start`,
-/// `tau_min`/`tau_end`, `decay`, and `rate`/`steps` as required by the decay).
+/// `tau_min`, `decay`, and `rate`/`steps` as required by the decay).
 #[pyfunction(signature = (schedule, iter))]
 fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f64> {
     let parsed = gumbel_temperature_schedule_from_pydict(Some(schedule))
