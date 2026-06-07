@@ -2,8 +2,8 @@
 //!
 //! Process-wide GPU policy and direct device selection live in [`crate::gpu`].
 
-pub mod arrow_schur_gpu;
-pub mod pirls_dispatch_wire;
+pub(crate) mod arrow_schur_gpu;
+pub(crate) mod pirls_dispatch_wire;
 pub mod pirls_gpu;
 pub mod reml_gpu;
-pub mod reml_outer;
+pub(crate) mod reml_outer;
