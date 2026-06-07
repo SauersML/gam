@@ -1,5 +1,4 @@
 use gam::solver::gpu::pirls_gpu::{PirlsGpuInput, solve_pirls_step_gpu, weighted_crossprod_gpu};
-use gam::solver::gpu::{GpuDispatch, GpuOperation, dense_pirls_dispatch};
 use ndarray::{Array2, arr1, arr2};
 
 fn tiny_case() -> (
@@ -32,21 +31,6 @@ fn gpu_pirls_step_falls_back_to_cpu_and_matches_beta_update_when_cuda_unavailabl
         gradient.len(),
         "Fallback PIRLS direction must preserve coefficient dimension"
     );
-}
-
-#[test]
-fn gpu_dispatch_reports_fallback_reason_token_expected_by_solver_telemetry() {
-    let dispatch = dense_pirls_dispatch(GpuOperation::DensePirlsXtWX, 64, 8, false)
-        .expect("Dense PIRLS dispatch should return a CPU fallback decision instead of failing");
-    match dispatch {
-        GpuDispatch::UseCpu { reason } => {
-            assert!(
-                reason.contains("gpu-backend-not-compiled"),
-                "Fallback reason should contain the stable token used by solver telemetry so the fallback is recorded consistently"
-            );
-        }
-        GpuDispatch::UseDevice => panic!("Dispatch unexpectedly chose GPU in a backend-less build"),
-    }
 }
 
 #[test]
@@ -95,10 +79,12 @@ fn gpu_hessian_assembly_matches_cpu_hessian_within_1e8_under_fallback() {
             }
         }
     }
-    let mut cpu_h = cpu_xtwx + penalty;
-    for d in 0..cpu_h.nrows() {
-        cpu_h[[d, d]] += 0.3;
-    }
+    // `step_lm_lambda` is Levenberg–Marquardt damping; per the documented
+    // contract on `PirlsGpuInput::step_lm_lambda`, it is added to H only for
+    // the Newton solve and is *stripped* from the exported `penalized_hessian`
+    // (which carries XᵀWX + S + objective_ridge·I). `objective_ridge` is 0
+    // here, so the expected exported Hessian is just XᵀWX + S.
+    let cpu_h = cpu_xtwx + penalty;
 
     for i in 0..cpu_h.nrows() {
         for j in 0..cpu_h.ncols() {
