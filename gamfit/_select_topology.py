@@ -15,6 +15,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping, Sequence
+from statistics import NormalDist
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
@@ -61,6 +62,12 @@ class _TopologyRustModule(Protocol):
     ) -> str | None: ...
 
     def rank_topology_candidates(self, evidence_json: str) -> str: ...
+
+    def stacking_weights_from_log_density(
+        self,
+        names: list[str],
+        log_density_rows: list[list[float]],
+    ) -> str: ...
 
 
 BasisSpec: TypeAlias = Smooth
@@ -394,6 +401,198 @@ def select_topology(
         warnings=warnings_out,
         fits=fits if return_fits else None,
     )
+
+
+# Coverage level whose Gaussian observation band is inverted to recover each
+# candidate's per-point predictive standard deviation. 0.95 keeps the band wide
+# enough that support clamping is rare while staying away from the extreme tails
+# where the symmetric-Gaussian band approximation is weakest.
+_STACK_INTERVAL_LEVEL = 0.95
+
+
+@dataclass(frozen=True, slots=True)
+class TopologyStack:
+    """Stacked predictive mixture over retained topology candidate fits (#768).
+
+    Built by :func:`stack_topologies` from the candidate fits that
+    :func:`select_topology` retains and a held-out labeled fold. The mixture
+    weights are the simplex maximiser of the held-out mean logarithmic score of
+    the stacked predictive density (Yao, Vehtari, Simpson & Gelman 2018) — the
+    principled alternative to winner-take-all selection. Calling :meth:`predict`
+    returns the stacked response-scale predictive mean ``Σ_k w_k μ_k(x)`` at new
+    rows.
+
+    Attributes
+    ----------
+    weights:
+        Stacking weight per candidate name; sums to one. Candidates the held-out
+        fold could not score receive zero weight.
+    mean_log_score:
+        Achieved held-out mean log-score at ``weights`` (higher is better).
+    names:
+        Candidate names in a deterministic order.
+    """
+
+    weights: dict[str, float]
+    mean_log_score: float
+    names: tuple[str, ...]
+    _fits: Mapping[str, Any]
+
+    def predict(self, data: Any, **predict_kwargs: Any) -> "list[float]":
+        """Stacked response-scale predictive mean at the rows of ``data``.
+
+        Each retained candidate predicts the response-scale mean over ``data``;
+        the per-candidate means are combined with the stacking weights. Extra
+        keyword arguments are forwarded to each candidate's ``predict``.
+        """
+        cand_means: dict[str, list[float]] = {}
+        n_rows: int | None = None
+        for name in self.names:
+            weight = self.weights.get(name, 0.0)
+            if weight == 0.0:
+                continue
+            means = _predict_response_mean(self._fits[name], data, **predict_kwargs)
+            if n_rows is None:
+                n_rows = len(means)
+            elif len(means) != n_rows:
+                raise ValueError(
+                    "TopologyStack candidates disagree on prediction row count"
+                )
+            cand_means[name] = means
+        if n_rows is None:
+            raise ValueError("TopologyStack has no positively-weighted candidate")
+        out = [0.0] * n_rows
+        for name, means in cand_means.items():
+            weight = self.weights[name]
+            for i, value in enumerate(means):
+                out[i] += weight * value
+        return out
+
+
+def stack_topologies(
+    fits: Mapping[str, Any],
+    holdout: Any,
+    response: str,
+    *,
+    interval_level: float = _STACK_INTERVAL_LEVEL,
+) -> TopologyStack:
+    """Stack retained topology candidate fits into a predictive mixture (#768).
+
+    Parameters
+    ----------
+    fits:
+        Retained candidate fits keyed by name — e.g. the ``fits`` mapping from
+        :func:`select_topology` called with ``return_fits=True``.
+    holdout:
+        A labeled held-out fold (independent of the fits' training data) in any
+        format accepted by :func:`gamfit.fit`. Must carry the ``response``
+        column alongside every predictor each candidate references. The
+        per-candidate held-out log-predictive densities of this fold's
+        responses define the stacking objective.
+    response:
+        Name of the response column in ``holdout``.
+    interval_level:
+        Coverage of the predictive band inverted to recover each candidate's
+        per-point predictive standard deviation.
+
+    Returns
+    -------
+    TopologyStack
+        Stacking weights, achieved held-out mean log-score, and a stacked
+        :meth:`~TopologyStack.predict`.
+
+    Notes
+    -----
+    The held-out predictive density is Gaussian in the candidate's response-scale
+    predictive moments: mean ``μ_k(x)`` and total predictive standard deviation
+    ``σ_k(x)`` recovered from the family-correct observation interval the Rust
+    predictor emits (``Var(μ̂) + Var(Y|μ)``). This keeps every family-specific
+    variance in the Rust core; only the generic log-score weight solve and
+    mixture run in Python (the solve itself is the Rust
+    ``stacking_weights_from_log_density`` binding). Rows whose recovered σ is
+    non-positive (e.g. fully clamped against the response support) carry no
+    Gaussian density and are dropped from that candidate's column.
+    """
+    if not fits:
+        raise ValueError("stack_topologies requires at least one candidate fit")
+    if not (0.0 < interval_level < 1.0):
+        raise ValueError("interval_level must lie in (0, 1)")
+    names = tuple(fits.keys())
+    columns, _kind = table_columns(holdout)
+    if response not in columns:
+        raise ValueError(f"response column {response!r} not found in holdout fold")
+    try:
+        y = [float(value) for value in columns[response]]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"holdout response column {response!r} is not numeric"
+        ) from exc
+    if not y:
+        raise ValueError("stack_topologies holdout fold cannot be empty")
+
+    z = NormalDist().inv_cdf(0.5 + 0.5 * interval_level)
+    # log_density_rows[i][k] = log p_k(y_i | x_i) on the held-out fold.
+    log_density_rows: list[list[float]] = [
+        [float("-inf")] * len(names) for _ in range(len(y))
+    ]
+    for k, name in enumerate(names):
+        means, sds = _holdout_predictive_moments(fits[name], holdout, interval_level, z)
+        if len(means) != len(y) or len(sds) != len(y):
+            raise ValueError(
+                f"candidate {name!r} predicted {len(means)} rows for a "
+                f"{len(y)}-row holdout fold"
+            )
+        for i, (mean, sd) in enumerate(zip(means, sds)):
+            if sd > 0.0 and math.isfinite(mean) and math.isfinite(sd):
+                log_density_rows[i][k] = _gaussian_logpdf(y[i], mean, sd)
+
+    raw = _topology_rust().stacking_weights_from_log_density(
+        list(names), log_density_rows
+    )
+    parsed = json.loads(raw)
+    weights = {name: float(parsed["weights"].get(name, 0.0)) for name in names}
+    return TopologyStack(
+        weights=weights,
+        mean_log_score=float(parsed["mean_log_score"]),
+        names=names,
+        _fits=dict(fits),
+    )
+
+
+def _gaussian_logpdf(y: float, mean: float, sd: float) -> float:
+    z = (y - mean) / sd
+    return -0.5 * math.log(2.0 * math.pi) - math.log(sd) - 0.5 * z * z
+
+
+def _holdout_predictive_moments(
+    model: Any,
+    holdout: Any,
+    interval_level: float,
+    z: float,
+) -> tuple[list[float], list[float]]:
+    """Per-point response-scale predictive mean and total predictive std on the
+    held-out fold, both sourced from the Rust predictor's family-correct
+    observation interval ``μ ± z·σ`` with ``σ² = Var(μ̂) + Var(Y|μ)``."""
+    prediction = model.predict(
+        holdout,
+        interval=interval_level,
+        observation_interval=True,
+        return_type="dict",
+    )
+    means = [float(value) for value in prediction["mean"]]
+    lower = [float(value) for value in prediction["observation_lower"]]
+    upper = [float(value) for value in prediction["observation_upper"]]
+    sds = [(hi - lo) / (2.0 * z) for lo, hi in zip(lower, upper)]
+    return means, sds
+
+
+def _predict_response_mean(model: Any, data: Any, **predict_kwargs: Any) -> list[float]:
+    prediction = model.predict(data, return_type="dict", **predict_kwargs)
+    if isinstance(prediction, Mapping) and "mean" in prediction:
+        return [float(value) for value in prediction["mean"]]
+    # Families whose predict() returns a bare response vector (e.g. probabilities)
+    # rather than the linear-predictor/mean table.
+    return [float(value) for value in prediction]
 
 
 def _normalize_candidates(

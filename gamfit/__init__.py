@@ -133,7 +133,9 @@ from ._select_topology import (
     TopologyAutoSelector,
     TopologyAutoSelectorRank,
     TopologyAutoSelectorResult,
+    TopologyStack,
     select_topology,
+    stack_topologies,
 )
 from ._diagnostics import Diagnostics
 from . import diagnostics
