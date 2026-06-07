@@ -2746,7 +2746,17 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     );
     progress.advance_workflow(1);
     progress.set_stage("predict", "loading new data");
-    let ds = load_datasetwith_model_schema(&args.new_data, &model)?;
+    // A `--offset-column` / `--noise-offset-column` override at predict time may
+    // name a column other than the model's saved offset; keep it (resolved by
+    // name below) in addition to the model's referenced columns.
+    let (effective_offset_column, effective_noise_offset_column) =
+        effective_predict_offset_columns(&model, &args);
+    let offset_extras: Vec<String> = [effective_offset_column, effective_noise_offset_column]
+        .into_iter()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+    let ds = load_datasetwith_model_schema_extra(&args.new_data, &model, &offset_extras)?;
     require_dataset_rows("predict", &args.new_data, ds.values.nrows())?;
     log::info!(
         "[PHASE] predict load-data done elapsed={:.3}s n={}",
@@ -2765,8 +2775,6 @@ fn run_predict(args: PredictArgs) -> Result<(), String> {
     let col_map = ds.column_map();
     let training_headers = model.training_headers.as_ref();
     progress.set_stage("predict", "building prediction matrices");
-    let (effective_offset_column, effective_noise_offset_column) =
-        effective_predict_offset_columns(&model, &args);
     let (predict_offset, predict_noise_offset) = resolve_predict_offsets(
         &model,
         &ds,
@@ -8154,20 +8162,33 @@ fn load_dataset_projected(
 }
 
 fn load_datasetwith_model_schema(path: &Path, model: &SavedModel) -> Result<Dataset, String> {
+    load_datasetwith_model_schema_extra(path, model, &[])
+}
+
+/// Load a new-data file against a fitted model's schema, keeping only the
+/// columns the model references (plus any `extra_required` ones a caller knows
+/// it will resolve by name, e.g. a `--offset-column` override that differs from
+/// the model's saved offset).
+///
+/// A prediction file commonly carries extra ID / label / grouping columns the
+/// formula never names; encoding those against the training schema would
+/// strict-validate an unrelated categorical and abort on a held-out level
+/// (#840). The projected loader selects just the model's input columns (and the
+/// extras), erroring only when a genuinely required one is absent and ignoring
+/// the rest — matching mgcv / glm semantics and the PyFFI predict path.
+fn load_datasetwith_model_schema_extra(
+    path: &Path,
+    model: &SavedModel,
+    extra_required: &[String],
+) -> Result<Dataset, String> {
     let schema = model.require_data_schema()?;
     let policy =
         UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
-    // Load only the columns the model references. A prediction file commonly
-    // carries extra ID / label / grouping columns the formula never names;
-    // encoding those against the training schema would strict-validate an
-    // unrelated categorical and abort predict on a held-out level (#840). The
-    // projected loader selects just the model's input columns (erroring only
-    // when a genuinely required one is absent) and ignores the rest, matching
-    // mgcv / glm semantics — and the PyFFI predict path.
-    let requested: Vec<String> = model
+    let mut requested: Vec<String> = model
         .prediction_required_columns()?
         .into_iter()
         .collect::<Vec<_>>();
+    requested.extend(extra_required.iter().cloned());
     load_dataset_auto_with_schema_projected(path, schema, policy, &requested).map_err(String::from)
 }
 
