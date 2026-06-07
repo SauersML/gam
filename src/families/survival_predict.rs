@@ -19,11 +19,10 @@ use crate::families::survival_construction::{
     add_survival_time_derivative_guard_offset, build_survival_time_basis,
     build_survival_time_offsets_for_likelihood, build_survival_timewiggle_derivative_design,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
-    normalize_survival_time_pair, parse_survival_baseline_config, parse_survival_likelihood_mode,
+    normalize_survival_time_pair, parse_survival_likelihood_mode,
     require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
     survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
-use crate::families::survival_location_scale::residual_distribution_inverse_link;
 use crate::gamlss::buildwiggle_block_input_from_knots;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
@@ -385,7 +384,7 @@ pub fn predict_survival(
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
-    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
 
     // Resolve the time-grid: either the explicit grid (same for every
     // row) or per-row exit times (one column per row).
@@ -741,7 +740,7 @@ pub fn predict_competing_risks_survival(
             "saved competing-risks survival prediction",
         )?;
     }
-    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
 
     let per_row_eval = time_grid.is_none();
     let eval_times: Vec<f64> = match time_grid {
@@ -1512,7 +1511,7 @@ fn predict_survival_location_scale_batch(
     let t_cols = if per_row_eval { 1 } else { eval_times.len() };
     let eval_width = if per_row_eval { 1 } else { t_cols + 1 };
     let saved_likelihood_mode = SurvivalLikelihoodMode::LocationScale;
-    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(age_entry, age_exit, time_cfg.clone(), None)?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
@@ -2046,16 +2045,10 @@ pub fn require_saved_survival_likelihood_mode(
     parse_survival_likelihood_mode(raw).map_err(SurvivalPredictError::from)
 }
 
-/// Baseline config with a linear fallback for plain Weibull models that
-/// don't carry an explicit timewiggle.
+/// Baseline config persisted by the saved survival model.
 pub fn saved_survival_runtime_baseline_config(
     model: &SavedModel,
-    likelihood_mode: SurvivalLikelihoodMode,
 ) -> Result<SurvivalBaselineConfig, SurvivalPredictError> {
-    if likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle() {
-        return parse_survival_baseline_config("linear", None, None, None, None)
-            .map_err(SurvivalPredictError::from);
-    }
     survival_baseline_config_from_model(model).map_err(SurvivalPredictError::from)
 }
 
@@ -2156,17 +2149,8 @@ pub fn resolve_survival_inverse_link_from_saved(
     if let Some(link) = model.link.as_ref() {
         return Ok(link.clone());
     }
-    // With the typed `survival_distribution: Option<ResidualDistribution>`
-    // schema, the only legacy-fallback path remaining is reconstructing the
-    // standard residual-distribution inverse link from the typed enum when an
-    // older payload did not set `model.link`. Stateful links (Sas /
-    // BetaLogistic / Mixture / LatentCLogLog) were always written via
-    // `payload.link` and have no `ResidualDistribution` representation.
-    if let Some(dist) = model.survival_distribution {
-        return Ok(residual_distribution_inverse_link(dist));
-    }
     Err(SurvivalPredictError::MissingFitMetadata {
-        reason: "saved survival model is missing link/distribution metadata".to_string(),
+        reason: "saved survival model is missing link metadata; refit".to_string(),
     })
 }
 
