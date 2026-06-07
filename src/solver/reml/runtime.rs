@@ -187,6 +187,33 @@ fn transformed_penalty_matvec(
     out
 }
 
+// Per-fit frozen nuisance/robustness quantities for the ALO-stabilization
+// deviance term (#821 / #813). The PSIS reweight `influence_scale[i]` and the
+// dispersion `phi` are both functions of the hat diagonals / deviance, hence of
+// rho; recomputing them at every outer evaluation while the analytic gradient
+// treats them as constants made the augmented REML gradient inconsistent with
+// the augmented cost. The optimizer then could not reach a stationary point
+// (observed: cost flat, |g| pinned/growing) and ran the full outer iteration
+// budget twice without converging - the 30-500x `te()` slowdowns. The
+// differentiated rho-dependence (the LOO predictor eta_tilde via `deta_loo` and
+// the hat diagonal h via the leverage barrier) is verified correct and stays
+// live.
+//
+// Freezing the two nuisance quantities at their first-activation geometry makes
+// the augmented objective a fixed function of rho within the fit, so the
+// existing analytic gradient is exactly its gradient and the outer loop
+// converges as it does for non-ALO smooths. Robustness to isolated
+// high-leverage rows is still provided by the frozen reweight plus the #711
+// tanh saturator. Keyed by the `RemlState` owner pointer (same convention as
+// the IFT runtime caches) with an `n`-fingerprint guard against pointer reuse
+// across fits.
+static ALO_FROZEN_NUISANCE: OnceLock<Mutex<HashMap<usize, (usize, Vec<f64>, f64)>>> =
+    OnceLock::new();
+
+fn alo_frozen_nuisance() -> &'static Mutex<HashMap<usize, (usize, Vec<f64>, f64)>> {
+    ALO_FROZEN_NUISANCE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
 static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
@@ -9203,17 +9230,36 @@ impl<'a> RemlState<'a> {
         // 4× band bounds how far a single PSIS-smoothed influence weight can
         // pull the deviance term, guaranteeing no point can dominate the
         // augmented objective even if the tail fit is imperfect.
-        let influence_scale: Vec<f64> = smoothed_influence
+        let fresh_influence_scale: Vec<f64> = smoothed_influence
             .iter()
             .map(|w| (*w / mean_influence.max(f64::MIN_POSITIVE)).clamp(0.25, 4.0))
             .collect();
-        let phi = match self.config.likelihood.scale.fixed_phi() {
+        let fresh_phi = match self.config.likelihood.scale.fixed_phi() {
             Some(phi) if phi.is_finite() && phi > 0.0 => phi,
             Some(_) => 1.0,
             None => {
                 let dp = bundle.pirls_result.deviance + bundle.pirls_result.stable_penalty_term;
                 let denom = (n as f64 - bundle.pirls_result.edf).max(1.0);
                 (dp / denom).max(f64::MIN_POSITIVE)
+            }
+        };
+        // Freeze the reweight and dispersion at their first-activation values
+        // for the rest of the fit so the augmented cost and its analytic
+        // gradient stay consistent (see ALO_FROZEN_NUISANCE). Recomputing them
+        // per outer evaluation while the gradient holds them constant is the
+        // #821/#813 inconsistency. A user-fixed phi is already constant, so for
+        // that path the freeze is a no-op on phi.
+        let (influence_scale, phi) = {
+            let key = self as *const _ as usize;
+            let mut frozen = alo_frozen_nuisance().lock().unwrap();
+            match frozen.get(&key) {
+                Some((cached_n, cached_scale, cached_phi)) if *cached_n == n => {
+                    (cached_scale.clone(), *cached_phi)
+                }
+                _ => {
+                    frozen.insert(key, (n, fresh_influence_scale.clone(), fresh_phi));
+                    (fresh_influence_scale, fresh_phi)
+                }
             }
         };
         let mut cost = 0.0_f64;
