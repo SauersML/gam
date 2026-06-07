@@ -4656,17 +4656,121 @@ impl SaeManifoldTerm {
             ridge_beta,
         )?;
 
-        // 2. One final UNDAMPED assemble + factor to obtain the converged
-        //    joint Hessian log-determinant. We force ridge = 0 and the dense
-        //    `Direct` Schur mode so `arrow_log_det_from_cache` returns the
-        //    exact `log|H| = Σ_i log|H_tt^(i)| + log|Schur_β|` (it rejects
-        //    damped factors and InexactPCG caches, which have no dense Schur
-        //    factor). This is the same evidence convention the main GAM REML
-        //    path uses.
+        // 2. Drive the inner (t, β) solve to the KKT/step-converged optimum and
+        //    take one final UNDAMPED factor there to obtain the joint Hessian
+        //    log-determinant. We force ridge = 0 and the dense `Direct` Schur
+        //    mode so `arrow_log_det_from_cache` returns the exact
+        //    `log|H| = Σ_i log|H_tt^(i)| + log|Schur_β|` (it rejects damped
+        //    factors and InexactPCG caches, which have no dense Schur factor).
+        //    This is the same evidence convention the main GAM REML path uses.
+        //    The shared `converge_inner_for_undamped_logdet` driver guarantees
+        //    the per-row `H_tt^(i)` blocks are PD at the converged optimum so
+        //    the undamped (`ridge = 0`) factorization succeeds — the streaming
+        //    log-det path reuses the identical driver so both rank the same
+        //    converged Laplace optimum and stay bit-identical.
         let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        let cache = self.converge_inner_for_undamped_logdet(
+            target,
+            rho,
+            &mut rho_fixed,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            &mut loss,
+            &options,
+        )?;
+        let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
+            "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
+             ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
+             required for the Laplace normaliser"
+                .to_string()
+        })?;
+
+        // 3. Smoothing-penalty Occam term: −½·p·(Σ_k rank S_k)·log λ_smooth.
+        let p_out = self.output_dim() as f64;
+        let mut smooth_rank_total = 0usize;
+        for atom in &self.atoms {
+            smooth_rank_total += Self::symmetric_rank(&atom.smooth_penalty)?;
+        }
+        let occam = 0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth;
+
+        // Decoder-block analytic-penalty energy (#671/#672). The inner solve
+        // descended this energy (it enters `gb`/`hbb`) but it had no native
+        // `loss.*` representative, so the Laplace criterion `v` was scoring a
+        // different objective than the one minimized. Add the converged
+        // decoder-penalty value so the ρ-sweep ranks the same penalized
+        // deviance. Excludes the Psi-tier ARD/assignment penalties already
+        // accounted for in `loss.total()` (see
+        // `analytic_decoder_penalty_value_total`).
+        // Extra analytic-penalty energy (#671/#737). Decoder-block penalties and
+        // coordinate-tier isometry enter the inner solve but have no `loss.*`
+        // representative, so the Laplace criterion must add them explicitly to
+        // rank the same penalized deviance the Newton solve descends.
+        let extra_penalty_energy = match registry {
+            Some(reg) => self
+                .reml_extra_penalty_value_total(reg)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
+            None => 0.0,
+        };
+
+        let v = loss.total() + extra_penalty_energy + 0.5 * log_det - occam;
+        Ok((v, loss, cache))
+    }
+
+    /// Drive the inner `(t, β)` Newton solve to the KKT/step-converged optimum
+    /// and return the final UNDAMPED (`ridge = 0`) joint-Hessian factor cache.
+    ///
+    /// The Laplace normaliser `½log|H|` is only the correct REML criterion at
+    /// the inner optimum `(t̂, β̂)`, so the criterion must refine the inner state
+    /// until either the KKT gradient or the undamped Newton step meets tolerance
+    /// before factoring. Crucially, **at the converged optimum the per-row
+    /// `H_tt^(i)` blocks are PD**, so the undamped (`ridge = 0`) factorization
+    /// succeeds; an off-optimum iterate (e.g. the initial seed, or a state
+    /// stopped after only `inner_max_iter` steps) can have an indefinite /
+    /// rank-deficient per-row block (`p_out = 1` → rank-1 `JᵀJ`, softmax
+    /// assignment-sparsity negative logit curvature) that surfaces
+    /// `PerRowFactorFailed` from the undamped `factor_one_row`. Both the dense
+    /// (`reml_criterion_with_cache`) and the streaming
+    /// (`reml_criterion_streaming_exact`) evidence paths route through this same
+    /// driver, so they converge to the identical inner state and their
+    /// `ridge = 0` log-determinants stay bit-identical (#847).
+    fn converge_inner_for_undamped_logdet(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        rho_fixed: &mut SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        inner_max_iter: usize,
+        learning_rate: f64,
+        ridge_ext_coord: f64,
+        ridge_beta: f64,
+        loss: &mut SaeManifoldLoss,
+        options: &ArrowSolveOptions,
+    ) -> Result<ArrowFactorCache, String> {
+        // `inner_max_iter == 0` is a genuine FREEZE of the inner `(t, β)` state
+        // — a verbatim warm-start reuse, not a convergence request (gam#577/#579,
+        // #850). The convergence/refinement loop below MUST NOT run even one
+        // Newton step in that case (the old `inner_max_iter.max(1)` floor moved
+        // β off the seed), so we factor exactly once at the frozen iterate and
+        // return that undamped cache without invoking the stationarity gate.
+        // The caller has already run `run_joint_fit_arrow_schur(..., 0, ...)`,
+        // which left the seed untouched, so `self` is at the warm-start β here.
+        if inner_max_iter == 0 {
+            let sys = self
+                .assemble_arrow_schur(target, rho, registry)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+            let factored = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
+                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
+            // The frozen-state Newton step (factored.0, factored.1) is discarded
+            // — only the undamped factor cache (factored.2) is consumed for the
+            // log-det / selected-inverse traces; β stays at the warm-start seed.
+            return Ok(factored.2);
+        }
         let mut total_inner_iter = inner_max_iter;
         let max_refine_iter = inner_max_iter.max(1).saturating_mul(16).max(64);
-        let (log_det, cache) = loop {
+        loop {
             let sys = self
                 .assemble_arrow_schur(target, rho, registry)
                 .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
@@ -4696,7 +4800,7 @@ impl SaeManifoldTerm {
                 .sum::<f64>()
                 + sys.gb.iter().map(|&v| v * v).sum::<f64>();
             let (delta_t, delta_beta, cache): (Array1<f64>, Array1<f64>, ArrowFactorCache) =
-                solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+                solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, options)
                     .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?;
             // The Laplace normaliser ½log|H| is only the correct REML criterion at
             // the inner optimum (t̂, β̂). Convergence is judged by EITHER a small
@@ -4749,13 +4853,7 @@ impl SaeManifoldTerm {
             let step_tolerance = 1.0e-4 * iterate_scale;
             let grad_tolerance = 1.0e-5 * iterate_scale;
             if grad_norm <= grad_tolerance || step_norm <= step_tolerance {
-                let log_det = arrow_log_det_from_cache(&cache).ok_or_else(|| {
-                    "SaeManifoldTerm::reml_criterion: arrow_log_det_from_cache returned None at \
-                     ridge=0 Direct mode (no dense Schur factor); the joint Hessian log-det is \
-                     required for the Laplace normaliser"
-                        .to_string()
-                })?;
-                break (log_det, cache);
+                return Ok(cache);
             }
             if total_inner_iter >= max_refine_iter {
                 return Err(format!(
@@ -4768,9 +4866,9 @@ impl SaeManifoldTerm {
             }
             let remaining = max_refine_iter - total_inner_iter;
             let refine_iter = inner_max_iter.max(1).min(remaining);
-            loss = self.run_joint_fit_arrow_schur(
+            *loss = self.run_joint_fit_arrow_schur(
                 target,
-                &mut rho_fixed,
+                rho_fixed,
                 registry,
                 refine_iter,
                 learning_rate,
@@ -4778,37 +4876,7 @@ impl SaeManifoldTerm {
                 ridge_beta,
             )?;
             total_inner_iter += refine_iter;
-        };
-
-        // 3. Smoothing-penalty Occam term: −½·p·(Σ_k rank S_k)·log λ_smooth.
-        let p_out = self.output_dim() as f64;
-        let mut smooth_rank_total = 0usize;
-        for atom in &self.atoms {
-            smooth_rank_total += Self::symmetric_rank(&atom.smooth_penalty)?;
         }
-        let occam = 0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth;
-
-        // Decoder-block analytic-penalty energy (#671/#672). The inner solve
-        // descended this energy (it enters `gb`/`hbb`) but it had no native
-        // `loss.*` representative, so the Laplace criterion `v` was scoring a
-        // different objective than the one minimized. Add the converged
-        // decoder-penalty value so the ρ-sweep ranks the same penalized
-        // deviance. Excludes the Psi-tier ARD/assignment penalties already
-        // accounted for in `loss.total()` (see
-        // `analytic_decoder_penalty_value_total`).
-        // Extra analytic-penalty energy (#671/#737). Decoder-block penalties and
-        // coordinate-tier isometry enter the inner solve but have no `loss.*`
-        // representative, so the Laplace criterion must add them explicitly to
-        // rank the same penalized deviance the Newton solve descends.
-        let extra_penalty_energy = match registry {
-            Some(reg) => self
-                .reml_extra_penalty_value_total(reg)
-                .map_err(|err| format!("SaeManifoldTerm::reml_criterion: {err}"))?,
-            None => 0.0,
-        };
-
-        let v = loss.total() + extra_penalty_energy + 0.5 * log_det - occam;
-        Ok((v, loss, cache))
     }
 
     fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
@@ -4831,7 +4899,7 @@ impl SaeManifoldTerm {
         ridge_beta: f64,
     ) -> Result<(f64, SaeManifoldLoss), String> {
         let mut rho_fixed = rho.clone();
-        let loss = self.run_joint_fit_arrow_schur(
+        let mut loss = self.run_joint_fit_arrow_schur(
             target,
             &mut rho_fixed,
             registry,
@@ -4840,6 +4908,32 @@ impl SaeManifoldTerm {
             ridge_ext_coord,
             ridge_beta,
         )?;
+        // Drive the inner (t, β) state to the SAME KKT/step-converged optimum the
+        // dense `reml_criterion_with_cache` reaches before factoring. At that
+        // optimum the per-row `H_tt^(i)` blocks are PD, so the undamped
+        // (`ridge_t = 0`) streaming factorization in `streaming_exact_arrow_log_det`
+        // succeeds — without this, a state stopped after only `inner_max_iter`
+        // steps can leave a rank-deficient / indefinite row block (`p_out = 1` →
+        // rank-1 `JᵀJ`, softmax negative-logit curvature) that surfaces
+        // `PerRowFactorFailed` at base ridge 0. Sharing the driver also keeps the
+        // streaming and dense log-determinants bit-identical (#847).
+        let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
+        // The dense factor cache from convergence is surplus here — the streaming
+        // path recomputes the (bit-identical) log-determinant chunk-by-chunk in
+        // `streaming_exact_arrow_log_det` to bound peak memory — so it is dropped.
+        let converged_cache = self.converge_inner_for_undamped_logdet(
+            target,
+            rho,
+            &mut rho_fixed,
+            registry,
+            inner_max_iter,
+            learning_rate,
+            ridge_ext_coord,
+            ridge_beta,
+            &mut loss,
+            &options,
+        )?;
+        drop(converged_cache);
         let log_det = self.streaming_exact_arrow_log_det(target, rho, registry)?;
         let occam = self.reml_occam_term(rho)?;
         // Extra analytic-penalty energy (#671/#737), matching the full-batch
@@ -8523,15 +8617,34 @@ fn assignment_prior_grad_hdiag(
             alpha,
             learnable_alpha,
         } => {
-            let penalty = IBPAssignmentPenalty::new(
+            // Scale the IBP assignment-sparsity prior by `lambda_sparse`, exactly
+            // like the Softmax and JumpReLU branches do (Softmax folds it into the
+            // penalty's rho coordinate, JumpReLU multiplies `sparsity_strength`).
+            // Previously the IBP penalty used its hardcoded `weight = 1.0` and the
+            // `rho.log_lambda_sparse` coordinate never reached it (the rho_view was
+            // empty for the common `learnable_alpha = false` config), so the prior
+            // ran at full strength with no way to dial it down — and its
+            // Beta-Bernoulli BCE energy `−mass·ln π_k − (n−mass)·ln(1−π_k)` toward
+            // the self-referential empirical active fraction `π_k` has its global
+            // minimum at the all-off gate, so at full weight it over-shrank the
+            // assignment off both atoms even with a truth-seeded decoder (#853).
+            // Routing `lambda_sparse` into the penalty weight makes the prior a
+            // genuine, user-controllable lever balanced against the data fit.
+            let mut penalty = IBPAssignmentPenalty::new(
                 assignment.k_atoms(),
                 alpha,
                 temperature,
                 learnable_alpha,
             );
+            // When `alpha` is learnable, `log_lambda_sparse` already modulates
+            // it through `resolved_alpha(rho)`, so the weight stays 1.0 to avoid
+            // double-counting that coordinate. Only when `alpha` is fixed (so the
+            // sparse coordinate would otherwise be ignored entirely) does
+            // `lambda_sparse` become the prior's weight lever.
             let rho_view = if learnable_alpha {
                 Array1::from_vec(vec![rho.log_lambda_sparse])
             } else {
+                penalty.weight = rho.lambda_sparse();
                 Array1::zeros(0)
             };
             let g = penalty.grad_target(target.view(), rho_view.view());
@@ -9032,8 +9145,12 @@ mod tests {
         assert_abs_diff_eq!(jr.try_assignments_row(0).unwrap()[0], 0.0, epsilon = 1e-12);
 
         // Softmax, K=1: still pinned to 1.0 (no free simplex coordinate).
+        // The softmax logits matrix carries `K = k_atoms()` columns (one per
+        // atom, canonicalized so the reference column is 0), so K=1 is a single
+        // zero column — not the K-1 `assignment_coord_dim` layout. The K=1 pin
+        // in `try_assignments_row` keys off `k_atoms() == 1`, i.e. one column.
         let sm = SaeAssignment::from_blocks_with_mode(
-            Array2::<f64>::zeros((1, 0)),
+            Array2::<f64>::zeros((1, 1)),
             vec![array![[0.0]]],
             AssignmentMode::softmax(1.0),
         )
@@ -9796,6 +9913,17 @@ mod tests {
         assert!(streaming_plan.streaming);
 
         let mut full = term0.clone();
+        // The undamped (`ridge_t = 0`) log-det is only well-defined at the inner
+        // optimum, where the per-row `H_tt^(i)` blocks are PD. At the initial
+        // (non-stationary) iterate a `p_out = 1` rank-1 `JᵀJ` row block plus the
+        // softmax negative-logit curvature is indefinite, so factoring there at
+        // ridge 0 surfaces `PerRowFactorFailed` for BOTH the dense and streaming
+        // paths. Converge the inner `(t, β)` state first (matching how
+        // `reml_criterion_with_cache` reaches a PD block), then compare the
+        // streaming-vs-dense log-determinants of the SAME converged system —
+        // which is the routing invariant this test pins (#847).
+        full.reml_criterion_with_cache(target.view(), &rho, None, 2, 0.25, 1.0e-4, 1.0e-4)
+            .unwrap();
         let sys = full
             .assemble_arrow_schur(target.view(), &rho, None)
             .unwrap();
@@ -10131,20 +10259,32 @@ mod tests {
             absmax > 1.0e-6,
             "MechSparsity must inject a non-trivial gradient into the SAE arrow-Schur gb; absmax={absmax:.3e}"
         );
-        // Closed-form check: the row=1 column=0 entry of grad is
-        //   w / sqrt(|G|) * b[1,0] / ||b[1, group={0,1}]||
-        // where group {0,1} has size 2 → factor sqrt(2). With unit weight
-        // and tiny eps, the expected magnitude matches Penalty::grad_target.
+        // Closed-form check on the ISOLATED MechSparsity contribution. `sys.gb`
+        // is the FULL penalized β-gradient (data-fit + decoder-smoothness +
+        // MechSparsity), so comparing a raw `gb` entry to the penalty-only
+        // closed form is wrong (it omits the data-fit and smoothness terms).
+        // Difference two assemblies — with and without the registry — to recover
+        // exactly the penalty gradient `Δgb = gb_with − gb_without`, then compare
+        // that delta to `MechanismSparsityPenalty::grad_target` at (basis=1,
+        // feat=0):
+        //   w / sqrt(|G|) · b[1,0] / ||b[1, group={0,1}]||
+        // group {0,1} has size 2 → factor sqrt(2); unit weight, tiny eps.
+        let sys_no_penalty = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .unwrap();
         let beta = term.flatten_beta();
         let expected = {
             // ||b[1, {0,1}]|| ≈ sqrt(0.5² + 0.6²) = sqrt(0.61)
             let s = (0.5_f64.powi(2) + 0.6_f64.powi(2) + 1.0e-12).sqrt();
             (2.0_f64).sqrt() * (-0.5_f64) / s
         };
-        let observed = sys.gb[1 * p + 0];
+        let delta = sys.gb[1 * p + 0] - sys_no_penalty.gb[1 * p + 0];
         assert!(
-            (observed - expected).abs() <= 1.0e-6,
-            "expected MechSparsity gb entry at (basis=1, feat=0) ≈ {expected:.6e}, got {observed:.6e} (beta entry = {})",
+            (delta - expected).abs() <= 1.0e-6,
+            "expected MechSparsity gb contribution at (basis=1, feat=0) ≈ {expected:.6e}, \
+             got Δgb={delta:.6e} (gb_with={:.6e}, gb_without={:.6e}, beta entry = {})",
+            sys.gb[1 * p + 0],
+            sys_no_penalty.gb[1 * p + 0],
             beta[1 * p + 0]
         );
     }
@@ -11552,13 +11692,24 @@ mod tests {
 
     /// Central-difference oracle for `second_jet`: differentiate the analytic
     /// first jet (which is FD-validated by the test above) coordinate-wise.
-    /// Tolerance is `1e-5` per the charter; the FD step is 1e-4 (the sweet
-    /// spot before f64 cancellation dominates a centered difference of an
+    ///
+    /// The threshold is magnitude-scaled (`abs_tol + rel_tol·max(|analytic|,
+    /// |fd|)`), exactly like the third-jet helper, because the central-difference
+    /// truncation error of a second derivative obtained by differencing the
+    /// first jet is `O(ε²/6·|f⁗|)`. For a harmonic basis `sin(ωt)` the fourth
+    /// derivative is `ω⁴·φ`, so with `ε = 1e-4` and the top harmonic of the
+    /// periodic/torus evaluators (`ω = 2π·3 ≈ 18.85 → ω⁴ ≈ 1.26e5`) the floor is
+    /// `≈ (1e-4)²/6·1.26e5 ≈ 2e-5` — several × any flat `1e-5` absolute bound.
+    /// A pure absolute bound is therefore physically wrong at the top of the
+    /// frequency range; the rel_tol term tracks the `ω⁴` truncation scale (the
+    /// analytic second jet itself is exact, `-ω²·φ`). The FD step is 1e-4 (the
+    /// sweet spot before f64 cancellation dominates a centered difference of an
     /// `O(1)` Jacobian).
     fn assert_second_jet_matches_central_difference<E: SaeBasisSecondJet>(
         evaluator: &E,
         coords: Array2<f64>,
-        tolerance: f64,
+        abs_tol: f64,
+        rel_tol: f64,
     ) -> Result<(), String> {
         let epsilon = 1.0e-4;
         let second = evaluator.second_jet(coords.view())?;
@@ -11580,11 +11731,12 @@ mod tests {
                             / (2.0 * epsilon);
                         let analytic = second[[row, basis, axis_a, axis_c]];
                         let error = (analytic - fd).abs();
+                        let threshold = abs_tol + rel_tol * analytic.abs().max(fd.abs());
                         assert!(
-                            error <= tolerance,
+                            error <= threshold,
                             "row={row} basis={basis} axis_a={axis_a} axis_c={axis_c}: \
                              analytic={analytic:.12e}, fd={fd:.12e}, error={error:.12e}, \
-                             tol={tolerance:.12e}"
+                             threshold={threshold:.12e}"
                         );
                     }
                 }
@@ -11688,9 +11840,13 @@ mod tests {
 
     #[test]
     fn isometry_periodic_second_jet_matches_fd() -> Result<(), String> {
+        // Magnitude-scaled tolerance: the top harmonic (ω = 2π·3) drives a
+        // O(ε²·ω⁴) ≈ 2e-5 central-difference truncation floor, far above any flat
+        // 1e-5 absolute bound; rel_tol = 1e-5 tracks the ω⁴ scale (analytic exact).
         assert_second_jet_matches_central_difference(
             &PeriodicHarmonicEvaluator::new(7).unwrap(),
             array![[-0.37], [0.0], [0.125], [0.41]],
+            1.0e-6,
             1.0e-5,
         )?;
         Ok(())
@@ -11701,7 +11857,12 @@ mod tests {
         // Stay inside the interior `(-π/2, π/2)` for lat so the chain factor
         // is active — that is where the Hessian carries information.
         let sphere_coords = array![[-0.7, -1.2], [-0.25, 0.0], [0.35, 0.9], [0.8, 2.1]];
-        assert_second_jet_matches_central_difference(&SphereChartEvaluator, sphere_coords, 1.0e-5)?;
+        assert_second_jet_matches_central_difference(
+            &SphereChartEvaluator,
+            sphere_coords,
+            1.0e-6,
+            1.0e-5,
+        )?;
         Ok(())
     }
 
@@ -11710,7 +11871,8 @@ mod tests {
         let torus_coords = array![[0.1, 0.7], [0.42, 0.0], [0.95, 0.33], [0.5, 0.5]];
         let evaluator = TorusHarmonicEvaluator::new(2, 3).unwrap();
         assert!(evaluator.basis_size() > 0);
-        assert_second_jet_matches_central_difference(&evaluator, torus_coords, 1.0e-5)?;
+        // Same ω⁴ truncation floor as the periodic case (top harmonic ω = 2π·3).
+        assert_second_jet_matches_central_difference(&evaluator, torus_coords, 1.0e-6, 1.0e-5)?;
         Ok(())
     }
 
@@ -11840,7 +12002,7 @@ mod tests {
         ];
         let evaluator = DuchonCoordinateEvaluator::new(centers, 2).unwrap();
         let coords = array![[-0.5, 0.2], [0.05, -0.35], [0.45, 0.75], [1.3, 0.1]];
-        assert_second_jet_matches_central_difference(&evaluator, coords, 1.0e-4)?;
+        assert_second_jet_matches_central_difference(&evaluator, coords, 1.0e-4, 1.0e-4)?;
         Ok(())
     }
 
@@ -11871,7 +12033,7 @@ mod tests {
         let evaluator = EuclideanPatchEvaluator::new(2, 2).unwrap();
         let coords = array![[0.0, -1.0], [3.5, 0.25], [-0.75, 1.2], [0.4, 0.9]];
         assert_jacobian_matches_central_difference(&evaluator, coords.clone(), 1.0e-6);
-        assert_second_jet_matches_central_difference(&evaluator, coords, 1.0e-5)?;
+        assert_second_jet_matches_central_difference(&evaluator, coords, 1.0e-5, 1.0e-5)?;
         // The degree-2 patch in d=2 has columns {1, x, y, x², xy, y²}.
         let (phi, _jet) = evaluator.evaluate(array![[0.0, 0.0]].view())?;
         assert_eq!(phi.ncols(), 6);
@@ -12023,7 +12185,11 @@ mod tests {
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
-        let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(1)]);
+        // The sphere atom's coordinate is a dim-2 product manifold (lat × lon),
+        // so per-axis ARD must carry one log-precision per axis (`atom dim = 2`).
+        // A length-1 block would be indexed out of bounds at `axis == 1` in the
+        // per-axis assembly loop and is rejected by the per-axis ARD contract.
+        let mut rho = SaeManifoldRho::new(0.0, -4.0, vec![Array1::<f64>::zeros(2)]);
         let ridge = 1.0e-6;
         for _ in 0..10 {
             let loss = term
@@ -12350,7 +12516,17 @@ mod tests {
         )
         .unwrap();
         let mut term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-        let mut rho = SaeManifoldRho::new(0.0, -6.0, vec![Array1::<f64>::zeros(1); k]);
+        // `lambda_sparse` is the IBP assignment-sparsity prior weight (now wired
+        // through `assignment_prior_grad_hdiag`'s IBP branch, #853). The
+        // Beta-Bernoulli BCE energy toward the self-referential empirical active
+        // fraction has its global minimum at the all-off gate, so at the old
+        // full weight (`log_lambda_sparse = 0 → λ = 1`) it overwhelmed the
+        // truth-seeded data fit and collapsed the assignment off both atoms. A
+        // moderate prior weight keeps the sparsity pressure honest while letting
+        // the LSQ-seeded reconstruction hold both real atoms active — the
+        // realistic operating point this recovery test pins.
+        let mut rho =
+            SaeManifoldRho::new((0.02_f64).ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
 
         let mut prev_total = f64::INFINITY;
         for _ in 0..30 {
@@ -12705,34 +12881,31 @@ mod tests {
         p_out: usize,
         direction: Array2<f64>,
     ) {
-        let (atom, scratch, target_flat) =
+        let (atom, penalty, target_flat) =
             build_isometry_atom_for_evaluator(evaluator, kind, &coords, p_out, 1.37);
         let rho = array![0.0_f64];
-        refresh_isometry_caches_from_atom(&scratch, &atom, coords.view()).unwrap();
-        let jac = scratch
-            .jacobian_cache()
-            .expect("scratch Jacobian cache is available after refresh");
         let d = coords.ncols();
-        let n_obs = coords.nrows();
-        let mut g_ref = Array2::<f64>::zeros((n_obs, d * d));
-        for n in 0..n_obs {
-            for a in 0..d {
-                for b in 0..d {
-                    let mut acc = 0.0_f64;
-                    for out_col in 0..p_out {
-                        acc += jac[[n, out_col * d + a]] * jac[[n, out_col * d + b]];
-                    }
-                    g_ref[[n, a * d + b]] = acc;
-                }
-            }
-        }
 
-        let penalty = IsometryPenalty::new_euclidean(
-            PsiSlice::full(target_flat.len(), Some(coords.ncols())),
-            p_out,
-        )
-        .with_reference(IsometryReference::UserSupplied(Arc::new(g_ref)));
+        // Build the reference metric from the EXACT SAME cache the exact HVP
+        // differences against (#857). The exact HVP computes its residual
+        // `diff = g − g_ref` where `g = penalty.pullback_metric(d)` is read from
+        // `penalty`'s own Jacobian cache, and skips the third-jet `K` term only
+        // when `diff == 0.0` (a bit-exact float compare). Previously `g_ref` was
+        // built from a SEPARATE `scratch` penalty's cache, so a last-ULP
+        // difference between the two independent refreshes left `diff` ~1e-16
+        // rather than exactly 0; multiplied by the large third decoder jet
+        // (`K ~ ω³`) for the torus/sphere bases, that leaked past the 1e-10
+        // exact-equality bound. Refreshing `penalty` once and seeding the
+        // UserSupplied reference from `penalty.pullback_metric(d)` makes
+        // `g_ref` the identical array `g` is recomputed from, so the residual is
+        // bit-zero and the K term is genuinely skipped — leaving exactly the GN
+        // term. `with_reference` moves the penalty by value and preserves every
+        // cache slot, so the J/J2/K caches read by the HVP are unchanged.
         refresh_isometry_caches_from_atom(&penalty, &atom, coords.view()).unwrap();
+        let g_ref = penalty
+            .pullback_metric(d)
+            .expect("pullback metric is available after the cache refresh");
+        let penalty = penalty.with_reference(IsometryReference::UserSupplied(Arc::new(g_ref)));
         assert!(
             penalty.third_decoder_derivative().is_some(),
             "zero-residual exact/GN test must still carry the real refreshed K cache"
