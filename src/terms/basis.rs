@@ -4764,9 +4764,103 @@ impl LatentCoordDesignDerivativeBasis {
     }
 }
 
-trait LatentCoordLocalDesignJacobian {
+/// The complete contract a per-row latent / novel-manifold coordinate type must
+/// supply to participate in the REML design-derivative operator surface.
+///
+/// Onboarding a new coordinate type (the SAE / novel-manifold frontier) reduces
+/// to implementing the small set of *required* methods below — the coordinate
+/// geometry (`n_data`, `latent_dim`, `n_axes`) plus the single genuinely-new
+/// payload `local_design_jacobian_row` (the local block ∂(design row)/∂(coord)).
+/// The streaming operator surface consumed by `LatentCoordDerivativeOp` in
+/// `src/solver/reml/mod.rs` — forward matvec, transpose matvec, and dense
+/// materialization, together with the flat-axis → (row, axis) decode — is
+/// inherited as *default* methods and never re-implemented per coordinate type.
+///
+/// This is the close condition for #767: a new coordinate type touches zero
+/// operator-surface code; it provides only its local Jacobian and geometry.
+pub(crate) trait LocalDesignJacobianProvider {
+    /// Number of data rows `n` the operator spans.
+    fn n_data(&self) -> usize;
+
+    /// Latent coordinate dimension `d` (perturbation axes per row).
+    fn latent_dim(&self) -> usize;
+
+    /// Number of flat hyper-axes `n · d` (one per (row, coordinate-axis) pair).
+    fn n_axes(&self) -> usize;
+
+    /// The only per-coordinate payload: the projected local design-Jacobian row
+    /// ∂(design row `row`)/∂(coordinate axis `axis`) in output-basis columns.
     fn local_design_jacobian_row(&self, row: usize, axis: usize)
     -> Result<Array1<f64>, BasisError>;
+
+    /// Decode a flat hyper-axis into its `(row, coordinate axis)`. Row-major over
+    /// `(row, axis)` with stride `latent_dim`; uniform across coordinate types.
+    fn row_axis(&self, flat_axis: usize) -> (usize, usize) {
+        let d = self.latent_dim();
+        (flat_axis / d, flat_axis % d)
+    }
+
+    /// Forward matvec for one flat hyper-axis: place `J_row · u` at `row`.
+    fn forward_mul_axis(
+        &self,
+        flat_axis: usize,
+        u: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, BasisError> {
+        assert!(
+            flat_axis < self.n_axes(),
+            "latent-coordinate derivative flat axis out of bounds in forward_mul_axis: flat_axis={flat_axis}, n_axes={}",
+            self.n_axes()
+        );
+        let (row, axis) = self.row_axis(flat_axis);
+        let local_jacobian = self.local_design_jacobian_row(row, axis)?;
+        assert_eq!(
+            u.len(),
+            local_jacobian.len(),
+            "latent-coordinate derivative coefficient length mismatch in forward_mul_axis"
+        );
+        let value = local_jacobian.dot(u);
+        let mut out = Array1::<f64>::zeros(self.n_data());
+        out[row] = value;
+        Ok(out)
+    }
+
+    /// Transpose matvec for one flat hyper-axis: scatter `v[row] · J_rowᵀ`.
+    fn transpose_mul_axis(
+        &self,
+        flat_axis: usize,
+        v: &ArrayView1<'_, f64>,
+    ) -> Result<Array1<f64>, BasisError> {
+        assert!(
+            flat_axis < self.n_axes(),
+            "latent-coordinate derivative flat axis out of bounds in transpose_mul_axis: flat_axis={flat_axis}, n_axes={}",
+            self.n_axes()
+        );
+        assert_eq!(
+            v.len(),
+            self.n_data(),
+            "latent-coordinate derivative row-adjoint length mismatch in transpose_mul_axis"
+        );
+        let (row, axis) = self.row_axis(flat_axis);
+        let scale = v[row];
+        Ok(self
+            .local_design_jacobian_row(row, axis)?
+            .mapv(|value| scale * value))
+    }
+
+    /// Dense `(n_data × p_out)` materialization of one flat hyper-axis: the local
+    /// Jacobian row placed at `row`, all other rows zero.
+    fn materialize_axis(&self, flat_axis: usize) -> Result<Array2<f64>, BasisError> {
+        assert!(
+            flat_axis < self.n_axes(),
+            "latent-coordinate derivative flat axis out of bounds in materialize_axis: flat_axis={flat_axis}, n_axes={}",
+            self.n_axes()
+        );
+        let (row, axis) = self.row_axis(flat_axis);
+        let projected = self.local_design_jacobian_row(row, axis)?;
+        let mut out = Array2::<f64>::zeros((self.n_data(), projected.len()));
+        out.row_mut(row).assign(&projected);
+        Ok(out)
+    }
 }
 
 /// The rayon chunk size for parallel implicit matvec operations.
@@ -4993,11 +5087,6 @@ impl LatentCoordDesignDerivative {
         self.basis.p_out()
     }
 
-    fn row_axis(&self, flat_axis: usize) -> (usize, usize) {
-        let d = self.latent.latent_dim();
-        (flat_axis / d, flat_axis % d)
-    }
-
     fn project_and_pad(
         &self,
         raw_knot: &Array1<f64>,
@@ -5136,7 +5225,19 @@ impl LatentCoordDesignDerivative {
     }
 }
 
-impl LatentCoordLocalDesignJacobian for LatentCoordDesignDerivative {
+impl LocalDesignJacobianProvider for LatentCoordDesignDerivative {
+    fn n_data(&self) -> usize {
+        self.latent.n_obs()
+    }
+
+    fn latent_dim(&self) -> usize {
+        self.latent.latent_dim()
+    }
+
+    fn n_axes(&self) -> usize {
+        self.latent.len()
+    }
+
     fn local_design_jacobian_row(
         &self,
         row: usize,
@@ -5159,66 +5260,6 @@ impl LatentCoordLocalDesignJacobian for LatentCoordDesignDerivative {
                 self.project_jet(&raw_knot)
             }
         }
-    }
-}
-
-impl LatentCoordDesignDerivative {
-    pub fn forward_mul_axis(
-        &self,
-        flat_axis: usize,
-        u: &ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError> {
-        assert!(
-            flat_axis < self.n_axes(),
-            "latent-coordinate derivative flat axis out of bounds in forward_mul_axis: flat_axis={flat_axis}, n_axes={}",
-            self.n_axes()
-        );
-        assert_eq!(
-            u.len(),
-            self.p_out(),
-            "latent-coordinate derivative coefficient length mismatch in forward_mul_axis"
-        );
-        let (row, axis) = self.row_axis(flat_axis);
-        let local_jacobian = self.local_design_jacobian_row(row, axis)?;
-        let value = local_jacobian.dot(u);
-        let mut out = Array1::<f64>::zeros(self.n_data());
-        out[row] = value;
-        Ok(out)
-    }
-
-    pub fn transpose_mul_axis(
-        &self,
-        flat_axis: usize,
-        v: &ArrayView1<'_, f64>,
-    ) -> Result<Array1<f64>, BasisError> {
-        assert!(
-            flat_axis < self.n_axes(),
-            "latent-coordinate derivative flat axis out of bounds in transpose_mul_axis: flat_axis={flat_axis}, n_axes={}",
-            self.n_axes()
-        );
-        assert_eq!(
-            v.len(),
-            self.n_data(),
-            "latent-coordinate derivative row-adjoint length mismatch in transpose_mul_axis"
-        );
-        let (row, axis) = self.row_axis(flat_axis);
-        let scale = v[row];
-        Ok(self
-            .local_design_jacobian_row(row, axis)?
-            .mapv(|value| scale * value))
-    }
-
-    pub fn materialize_axis(&self, flat_axis: usize) -> Result<Array2<f64>, BasisError> {
-        assert!(
-            flat_axis < self.n_axes(),
-            "latent-coordinate derivative flat axis out of bounds in materialize_axis: flat_axis={flat_axis}, n_axes={}",
-            self.n_axes()
-        );
-        let (row, axis) = self.row_axis(flat_axis);
-        let projected = self.local_design_jacobian_row(row, axis)?;
-        let mut out = Array2::<f64>::zeros((self.n_data(), projected.len()));
-        out.row_mut(row).assign(&projected);
-        Ok(out)
     }
 }
 
