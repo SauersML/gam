@@ -1,3 +1,15 @@
+## v0.3.103 — gam 0.3.103 / gamfit 0.1.177 (2026-06-07)
+
+- feat(#817): skew-aware Gamma observation (prediction) intervals. Response-scale predictive bands for the Gamma family are now equal-tailed quantiles of a moment-matched Gamma predictive — built on a robust inverse regularized incomplete-gamma (`probability::gamma_quantile`) — instead of the symmetric `μ ± z·σ` band that systematically mis-covered each tail of a right-skewed response. Includes a per-tail coverage regression and a degenerate-shape symmetric fallback.
+- feat(#811, #812): the binomial posterior-mean `predict` path now honours `covariance_mode` (the smoothing correction reaches the credible band) and `observation_interval=True` (emits `observation_lower` / `observation_upper`), matching the Gaussian path and centred on the bias-corrected posterior-mean point; `covariance_mode='required'` now hard-errors when no correction is available.
+- fix(#815, #816): `cyclic()` / `cc()` / `cp()` honour `period=` / `origin=` (parsed through the numeric-expression grammar, with a hard error on unparseable endpoints) and validate their options instead of silently falling back to the observed data range.
+- fix(#685–#688): Gaussian location-scale fits through the formula API (`noise_formula=`) now converge on heteroscedastic data instead of aborting outer REML on every seed — the log-σ (scale) block carries a REML-selected identity ridge constraining its polynomial nullspace, and the spurious full-span Jeffreys term is dropped. (The hand-built custom-family location-scale path, #684, remains a tracked log-σ recovery / convergence gap.)
+- fix(survival): Royston–Parmar monotonicity is enforced at every observed exit time; structural model construction is split from the ≥1-event fittability check so all fit modes share one validation chokepoint.
+- fix(multinomial): the matrix-free Hessian diagonal mirrors the dense path's parallel reduction order, restoring bit-identical agreement under IEEE-754 non-associativity.
+- fix(reml): the TK-refinement scale gate is aligned with the outer Firth gate.
+- fix(#795): `sae_manifold_fit` defaults `isometry_weight=0.0`, so the single-planted-circle quickstart converges (the MeanProfiled isometry energy is not scale-invariant and was saturating the arrow-Schur proximal ridge); pass `isometry_weight > 0` to opt back in. Adds a default-exercising regression test.
+- chore: removed accidentally-committed repro scripts / build log from the tree (and the gamfit sdist).
+
 ## gam v0.3.102 / gamfit v0.1.176
 
 - fix(#789B): fast-fail survival marginal-slope on all-censored (zero-event) designs instead of spinning.
