@@ -23,11 +23,11 @@ def _data(seed: int = 0, n: int = 32, d: int = 4) -> np.ndarray:
 def _baseline(**overrides):
     """Common kwargs for sae_manifold_fit.
 
-    Uses ``n_atoms=1, atom_dim=2``: the SAE arrow-Schur driver supports
+    Uses ``K=1, d_atom=2``: the SAE arrow-Schur driver supports
     multi-axis analytic penalties (ARD, Isometry, BlockOrthogonality) only
     when ``k_atoms == 1`` — see
     ``src/terms/sae_manifold.rs::add_sae_analytic_penalty_contributions``.
-    Holding ``atom_dim=2`` gives enough latent axes for
+    Holding ``d_atom=2`` gives enough latent axes for
     ``block_orthogonality_weight`` to find a non-trivial 2-group partition,
     and for ``decoder_feature_sparsity_groups=[[0,1],[2,3]]`` to partition
     the four-feature output into two basis-aligned decoder groups.
@@ -38,11 +38,11 @@ def _baseline(**overrides):
     # baseline does not trip the issue #249 NotImplementedError gate when
     # tests vary unrelated parameters.
     kwargs = dict(
-        n_atoms=1,
+        K=1,
         atom_basis="sphere",
-        atom_dim=2,
+        d_atom=2,
         assignment="softmax",
-        max_iter=5,
+        n_iter=5,
         random_state=7,
         isometry_weight=0.0,
     )
@@ -69,12 +69,12 @@ def _fit_must_react(param_name: str, on_value, off_value=None, *, n: int = 32):
     off_kwargs = dict(base_kwargs)
     if off_value is not None:
         off_kwargs[param_name] = off_value
-    fit_off = gamfit.sae_manifold_fit(Z=X, **off_kwargs)
+    fit_off = gamfit.sae_manifold_fit(X=X, **off_kwargs)
 
     on_kwargs = dict(base_kwargs)
     on_kwargs[param_name] = on_value
     try:
-        fit_on = gamfit.sae_manifold_fit(Z=X, **on_kwargs)
+        fit_on = gamfit.sae_manifold_fit(X=X, **on_kwargs)
     except NotImplementedError:
         # Principled rejection: parameter is honestly declared unsupported.
         return
@@ -95,8 +95,8 @@ def test_isometry_weight_is_not_a_silent_noop():
     — the SAE Isometry path is fully wired as of issue #250."""
     X = _data(seed=1, n=32)
     base_kwargs = _baseline()
-    fit_off = gamfit.sae_manifold_fit(Z=X, **{**base_kwargs, "isometry_weight": 0.0})
-    fit_on = gamfit.sae_manifold_fit(Z=X, **{**base_kwargs, "isometry_weight": 100.0})
+    fit_off = gamfit.sae_manifold_fit(X=X, **{**base_kwargs, "isometry_weight": 0.0})
+    fit_on = gamfit.sae_manifold_fit(X=X, **{**base_kwargs, "isometry_weight": 100.0})
     assert _differs(fit_on.fitted, fit_off.fitted) or _differs(
         fit_on.assignments, fit_off.assignments
     ), (
@@ -133,9 +133,9 @@ def test_decoder_feature_sparsity_groups_produces_nontrivial_gradient():
     and the fit must visibly differ from the no-penalty baseline."""
     X = _data(seed=4, n=32)
     base = _baseline()
-    fit_off = gamfit.sae_manifold_fit(Z=X, **base)
+    fit_off = gamfit.sae_manifold_fit(X=X, **base)
     fit_on = gamfit.sae_manifold_fit(
-        Z=X, **base, decoder_feature_sparsity_groups=[[0, 1], [2, 3]]
+        X=X, **base, decoder_feature_sparsity_groups=[[0, 1], [2, 3]]
     )
     # Must not silently raise — the rename is a wiring change, not a deferral.
     assert _differs(fit_on.fitted, fit_off.fitted) or _differs(
@@ -153,7 +153,7 @@ def test_topology_selector_is_not_an_accepted_kwarg():
     raise ``TypeError`` so callers don't silently lose configuration."""
     X = _data(seed=3)
     with pytest.raises(TypeError, match="topology_selector"):
-        gamfit.sae_manifold_fit(Z=X, **_baseline(), topology_selector=object())
+        gamfit.sae_manifold_fit(X=X, **_baseline(), topology_selector=object())
 
 
 def test_primitive_names_metadata_is_not_a_substitute_for_effect():
@@ -175,13 +175,13 @@ def test_primitive_names_metadata_is_not_a_substitute_for_effect():
     on_kwargs["isometry_weight"] = 10.0
     on_kwargs["block_orthogonality_weight"] = 10.0
     try:
-        fit_on = gamfit.sae_manifold_fit(Z=X, **on_kwargs)
+        fit_on = gamfit.sae_manifold_fit(X=X, **on_kwargs)
     except NotImplementedError:
         # Principled rejection — exactly the contract we want.
         return
     # If the call returned, the fit must visibly differ from the no-penalty
     # baseline. Silent acceptance with no effect is the bug.
-    fit_off = gamfit.sae_manifold_fit(Z=X, **base_kwargs)
+    fit_off = gamfit.sae_manifold_fit(X=X, **base_kwargs)
     differs = (
         _differs(fit_on.fitted, fit_off.fitted)
         or _differs(fit_on.assignments, fit_off.assignments)

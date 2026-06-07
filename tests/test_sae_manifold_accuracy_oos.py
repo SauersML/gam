@@ -69,12 +69,12 @@ def test_curved_circle_atom_in_sample_r2_per_seed(seed: int):
     optimization got stuck in a bad local minimum (initialisation bug)."""
     z, _ = _circle_data(n=400, p=64, noise=0.04, seed=seed)
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=1,
+        X=z,
+        K=1,
         atom_basis="periodic",
-        atom_dim=2,
+        d_atom=2,
         assignment="ibp_map",
-        max_iter=50,
+        n_iter=50,
         learning_rate=0.04,
         random_state=seed,
     )
@@ -92,12 +92,12 @@ def test_curved_circle_atom_mean_r2_across_seeds():
     for seed in range(5):
         z, _ = _circle_data(n=400, p=64, noise=0.04, seed=seed)
         fit = gamfit.sae_manifold_fit(
-            Z=z,
-            n_atoms=1,
+            X=z,
+            K=1,
             atom_basis="periodic",
-            atom_dim=2,
+            d_atom=2,
             assignment="ibp_map",
-            max_iter=50,
+            n_iter=50,
             learning_rate=0.04,
             random_state=seed,
         )
@@ -120,12 +120,12 @@ def test_curved_circle_atom_oos_r2():
     z_test = z_full[200:]
 
     fit = gamfit.sae_manifold_fit(
-        Z=z_train,
-        n_atoms=1,
+        X=z_train,
+        K=1,
         atom_basis="periodic",
-        atom_dim=2,
+        d_atom=2,
         assignment="ibp_map",
-        max_iter=50,
+        n_iter=50,
         learning_rate=0.04,
         random_state=0,
     )
@@ -176,12 +176,12 @@ def test_oos_uses_fit_time_hyperparameters():
     z_test = z_full[200:]
 
     fit = gamfit.sae_manifold_fit(
-        Z=z_train,
-        n_atoms=1,
+        X=z_train,
+        K=1,
         atom_basis="periodic",
-        atom_dim=2,
+        d_atom=2,
         assignment="ibp_map",
-        max_iter=37,
+        n_iter=37,
         learning_rate=0.07,
         tau=0.3,
         sparsity_strength=0.5,
@@ -230,12 +230,12 @@ def test_curved_sphere_atom_on_sphere_data():
     """
     z, _ = _sphere_data(n=500, p=48, noise=0.03, seed=0)
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=1,
+        X=z,
+        K=1,
         atom_basis="sphere",
-        atom_dim=2,
+        d_atom=2,
         assignment="ibp_map",
-        max_iter=50,
+        n_iter=50,
         learning_rate=0.04,
         random_state=0,
     )
@@ -265,12 +265,12 @@ def test_sae_manifold_oos_reconstruction_idempotence():
     z_test = z_full[200:]
 
     fit = gamfit.sae_manifold_fit(
-        Z=z_train,
-        n_atoms=1,
+        X=z_train,
+        K=1,
         atom_basis="periodic",
-        atom_dim=2,
+        d_atom=2,
         assignment="ibp_map",
-        max_iter=40,
+        n_iter=40,
         learning_rate=0.04,
         random_state=0,
     )

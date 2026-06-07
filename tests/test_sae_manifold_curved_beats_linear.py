@@ -63,22 +63,22 @@ def test_curved_atom_beats_linear_shards_on_one_harmonic():
     z = _synthetic_one_harmonic()
 
     curved = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=1,
+        X=z,
+        K=1,
         atom_basis="periodic",
-        atom_dim=2,
+        d_atom=2,
         assignment="ibp_map",
-        max_iter=50,
+        n_iter=50,
         learning_rate=0.04,
         random_state=0,
     )
     linear = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=10,
+        X=z,
+        K=10,
         atom_basis="duchon",
-        atom_dim=1,
+        d_atom=1,
         assignment="softmax",
-        max_iter=50,
+        n_iter=50,
         learning_rate=0.04,
         random_state=0,
     )

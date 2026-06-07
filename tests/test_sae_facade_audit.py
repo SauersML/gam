@@ -108,44 +108,20 @@ def test_decoder_incoherence_payload_builder_default_is_on_for_multi_atom(monkey
     ]
 
 
-# ---------------------------------------------------------------------------
-# #606 — X and Z are aliases; differing arrays must raise, identical arrays are
-# accepted, and neither-supplied still raises the original TypeError.
-# ---------------------------------------------------------------------------
-def test_x_neq_z_raises(monkeypatch):
-    # Short-circuit before any Rust call: the alias check is the first thing
-    # sae_manifold_fit does.
-    x = np.arange(12, dtype=float).reshape(6, 2)
-    z = x.copy()
-    z[0, 0] += 1.0  # make them differ
-    with pytest.raises(ValueError, match="X and Z are aliases"):
-        sae.sae_manifold_fit(X=x, Z=z, K=2)
-
-
-def test_x_neq_z_shape_mismatch_raises():
-    x = np.zeros((6, 2))
-    z = np.zeros((6, 3))
-    with pytest.raises(ValueError, match="X and Z are aliases"):
-        sae.sae_manifold_fit(X=x, Z=z, K=2)
-
-
-def test_neither_x_nor_z_raises():
-    with pytest.raises(TypeError, match=r"requires Z= \(or X=\)"):
+def test_missing_x_raises():
+    with pytest.raises(TypeError, match=r"requires X input array"):
         sae.sae_manifold_fit(K=2)
 
 
 # ---------------------------------------------------------------------------
-# #607 — "ibp" and "ibp_map" canonicalize to the same kind; summary thresholds
-# are mode-specific on the canonical kind.
+# #607 — assignment summary thresholds are mode-specific on the canonical kind.
 # ---------------------------------------------------------------------------
-def test_ibp_aliases_share_canonical_kind():
-    a = sae._canonical_assignment("ibp", "assignment")
-    b = sae._canonical_assignment("ibp_map", "assignment")
-    assert a == b == "ibp_map"
+def test_ibp_alias_is_rejected():
+    with pytest.raises(ValueError, match="not a recognized assignment kind"):
+        sae._canonical_assignment("ibp", "assignment")
 
 
-def test_gated_aliases_to_jumprelu():
-    assert sae._canonical_assignment("gated", "assignment") == "jumprelu"
+def test_jumprelu_assignment_is_canonical():
     assert sae._canonical_assignment("jumprelu", "assignment") == "jumprelu"
 
 
@@ -336,7 +312,7 @@ def test_trust_diagnostics_normalize_and_round_trip():
 
 
 def test_research_trust_scores_are_assignment_weighted():
-    fit = _make_fit("softmax", n_atoms=2)
+    fit = _make_fit("softmax", K=2)
     fit.training_data = np.zeros((3, 1))
     fit.assignments = np.asarray(
         [
@@ -355,8 +331,8 @@ def test_research_trust_scores_are_assignment_weighted():
 
 
 def test_alignment_public_api_uses_rich_result():
-    fit_a = _make_fit("softmax", n_atoms=2)
-    fit_b = _make_fit("softmax", n_atoms=2)
+    fit_a = _make_fit("softmax", K=2)
+    fit_b = _make_fit("softmax", K=2)
     fit_a.decoder_blocks = [np.eye(2), np.fliplr(np.eye(2))]
     fit_b.decoder_blocks = [np.fliplr(np.eye(2)), np.eye(2)]
     for atom, block in zip(fit_a.atoms, fit_a.decoder_blocks):
@@ -382,18 +358,18 @@ def test_alignment_public_api_uses_rich_result():
 def test_summary_threshold_mode_specific(monkeypatch, kind, expected_threshold):
     stub = _StubModule()
     monkeypatch.setattr(sae, "rust_module", lambda: stub)
-    fit = _make_fit(kind, n_atoms=4)
+    fit = _make_fit(kind, K=4)
     fit.summary()
     assert stub.threshold == pytest.approx(expected_threshold)
 
 
-def test_summary_canonical_kind_for_ibp_label(monkeypatch):
-    """A raw 'ibp' label still drives the canonical ibp_map 0.5 threshold."""
+def test_summary_canonical_kind_for_ibp_map_label(monkeypatch):
+    """The canonical ibp_map label drives the 0.5 threshold."""
     stub = _StubModule()
     monkeypatch.setattr(sae, "rust_module", lambda: stub)
     # Even if the stored label is the raw alias, the canonical field governs.
     fit = _make_fit("ibp_map", n_atoms=4)
-    fit.assignment_label = "ibp"  # raw user label
+    fit.assignment_label = "ibp_map"
     fit.summary()
     assert stub.threshold == pytest.approx(0.5)
 
@@ -425,14 +401,14 @@ def test_top_k_too_large_raises(monkeypatch):
     _no_row_block_probe(monkeypatch)
     x = np.random.default_rng(0).standard_normal((20, 3))
     with pytest.raises(ValueError, match=r"top_k must be in \[1, K=2\]"):
-        sae.sae_manifold_fit(Z=x, K=2, top_k=5)
+        sae.sae_manifold_fit(X=x, K=2, top_k=5)
 
 
 def test_top_k_negative_raises(monkeypatch):
     _no_row_block_probe(monkeypatch)
     x = np.random.default_rng(0).standard_normal((20, 3))
     with pytest.raises(ValueError, match=r"top_k must be in \[1, K=2\]"):
-        sae.sae_manifold_fit(Z=x, K=2, top_k=-3)
+        sae.sae_manifold_fit(X=x, K=2, top_k=-3)
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +416,7 @@ def test_top_k_negative_raises(monkeypatch):
 # and do not depend on the current convergence state of the compiled solver.
 # ---------------------------------------------------------------------------
 
-def test_ibp_aliases_same_metadata_e2e(monkeypatch):
+def test_ibp_map_metadata_e2e(monkeypatch):
     fake = _FakeRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     x = np.random.default_rng(1).standard_normal((40, 4))
@@ -451,13 +427,10 @@ def test_ibp_aliases_same_metadata_e2e(monkeypatch):
         nuclear_norm_weight=0.0,
         decoder_incoherence_weight=0.0,
     )
-    fit_ibp = sae.sae_manifold_fit(
-        Z=x, K=3, d_atom=2, assignment="ibp", n_iter=2, **baseline
-    )
     fit_map = sae.sae_manifold_fit(
-        Z=x, K=3, d_atom=2, assignment="ibp_map", n_iter=2, **baseline
+        X=x, K=3, d_atom=2, assignment="ibp_map", n_iter=2, **baseline
     )
-    assert fit_ibp.assignment == fit_map.assignment == "ibp_map"
+    assert fit_map.assignment == "ibp_map"
 
 
 def test_mixed_basis_topology_e2e(monkeypatch):
@@ -465,7 +438,7 @@ def test_mixed_basis_topology_e2e(monkeypatch):
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     x = np.random.default_rng(2).standard_normal((40, 4))
     fit = sae.sae_manifold_fit(
-        Z=x,
+        X=x,
         K=2,
         d_atom=2,
         atom_basis=["periodic", "sphere"],
@@ -486,7 +459,7 @@ def test_ard_per_atom_controls_native_ard_plumbing(monkeypatch):
     x = np.random.default_rng(3).standard_normal((24, 3))
 
     sae.sae_manifold_fit(
-        Z=x,
+        X=x,
         K=2,
         d_atom=1,
         n_iter=2,
@@ -499,7 +472,7 @@ def test_ard_per_atom_controls_native_ard_plumbing(monkeypatch):
     assert fake.last_native_ard_enabled is False
 
     sae.sae_manifold_fit(
-        Z=x,
+        X=x,
         K=2,
         d_atom=1,
         n_iter=2,

@@ -38,12 +38,12 @@ def _diff_under(a: np.ndarray, b: np.ndarray, atol: float) -> bool:
 def test_sae_fit_is_deterministic_for_fixed_seed():
     z = _synthetic_one_harmonic()
     kwargs = dict(
-        Z=z,
-        n_atoms=2,
+        X=z,
+        K=2,
         atom_basis="periodic",
-        atom_dim=2,
-        assignment_prior="ibp_map",
-        max_iter=50,
+        d_atom=2,
+        assignment="ibp_map",
+        n_iter=50,
         learning_rate=0.04,
         random_state=123,
     )
@@ -82,12 +82,12 @@ def test_sae_fit_random_state_changes_output():
     decoder and assignment posterior past trivial precision."""
     z = _synthetic_one_harmonic(noise=0.08)
     common = dict(
-        Z=z,
-        n_atoms=2,
+        X=z,
+        K=2,
         atom_basis="periodic",
-        atom_dim=2,
-        assignment_prior="ibp_map",
-        max_iter=30,
+        d_atom=2,
+        assignment="ibp_map",
+        n_iter=30,
         learning_rate=0.2,
     )
     fit_0 = gamfit.sae_manifold_fit(**common, random_state=0)

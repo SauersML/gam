@@ -2,9 +2,9 @@
 
 Repros from issue #246:
 
-- atom_basis="duchon", atom_dim=2 → "Duchon D2 collocation requires 2*(p+s) > dimension+2"
-- atom_basis="duchon", atom_dim=1 → "sae_build_duchon_atom: primary penalty was not built"
-- atom_basis="euclidean", atom_dim={1,2,3} → same routing into broken Duchon builder
+- atom_basis="duchon", d_atom=2 → "Duchon D2 collocation requires 2*(p+s) > dimension+2"
+- atom_basis="duchon", d_atom=1 → "sae_build_duchon_atom: primary penalty was not built"
+- atom_basis="euclidean", d_atom={1,2,3} → same routing into broken Duchon builder
 
 These tests should be RED today (the user-facing API rejects documented atom_basis
 values for documented atom_dim choices) and GREEN once the Rust path is reworked
@@ -29,14 +29,14 @@ def random_data() -> np.ndarray:
 def test_sae_manifold_fit_duchon_atom_dim_succeeds(
     random_data: np.ndarray, atom_dim: int
 ) -> None:
-    """sae_manifold_fit(atom_basis="duchon", atom_dim=d) should succeed for d in {1,2,3}."""
+    """sae_manifold_fit(atom_basis="duchon", d_atom=d) should succeed for d in {1,2,3}."""
     fit = gamfit.sae_manifold_fit(
-        Z=random_data,
-        n_atoms=1,
+        X=random_data,
+        K=1,
         atom_basis="duchon",
-        atom_dim=atom_dim,
+        d_atom=atom_dim,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     assert fit is not None
@@ -49,19 +49,19 @@ def test_sae_manifold_fit_duchon_atom_dim_succeeds(
 def test_sae_manifold_fit_euclidean_atom_dim_succeeds(
     random_data: np.ndarray, atom_dim: int
 ) -> None:
-    """sae_manifold_fit(atom_basis="euclidean", atom_dim=d) should succeed for d in {1,2,3}.
+    """sae_manifold_fit(atom_basis="euclidean", d_atom=d) should succeed for d in {1,2,3}.
 
     Today this routes through sae_build_duchon_atom (lib.rs:9754, 9925), so it fails
     with the same Duchon errors. Euclidean atoms are mathematically distinct from
     thin-plate splines and should get their own builder.
     """
     fit = gamfit.sae_manifold_fit(
-        Z=random_data,
-        n_atoms=1,
+        X=random_data,
+        K=1,
         atom_basis="euclidean",
-        atom_dim=atom_dim,
+        d_atom=atom_dim,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     assert fit is not None
@@ -74,12 +74,12 @@ def test_sae_manifold_fit_duchon_2d_does_not_violate_collocation(
 ) -> None:
     """The exact failure mode from the issue: d=2 trips 2*(p+s) > d+2."""
     fit = gamfit.sae_manifold_fit(
-        Z=random_data,
-        n_atoms=1,
+        X=random_data,
+        K=1,
         atom_basis="duchon",
-        atom_dim=2,
+        d_atom=2,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     assert fit is not None
@@ -90,12 +90,12 @@ def test_sae_manifold_fit_duchon_1d_builds_primary_penalty(
 ) -> None:
     """The exact 1D failure: 'sae_build_duchon_atom: primary penalty was not built'."""
     fit = gamfit.sae_manifold_fit(
-        Z=random_data,
-        n_atoms=1,
+        X=random_data,
+        K=1,
         atom_basis="duchon",
-        atom_dim=1,
+        d_atom=1,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     assert fit is not None
@@ -104,12 +104,12 @@ def test_sae_manifold_fit_duchon_1d_builds_primary_penalty(
 def test_sae_manifold_fit_multi_atom_duchon_mix(random_data: np.ndarray) -> None:
     """Per-atom mixed Duchon dims should all work, not just one."""
     fit = gamfit.sae_manifold_fit(
-        Z=random_data,
-        n_atoms=3,
+        X=random_data,
+        K=3,
         atom_basis="duchon",
-        atom_dim=[1, 2, 3],
+        d_atom=[1, 2, 3],
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     assert fit is not None
@@ -123,12 +123,12 @@ def test_euclidean_atom_is_not_thin_plate(random_data: np.ndarray) -> None:
     distinguish it from "duchon". Today they share the underlying builder.
     """
     fit = gamfit.sae_manifold_fit(
-        Z=random_data,
-        n_atoms=1,
+        X=random_data,
+        K=1,
         atom_basis="euclidean",
-        atom_dim=2,
+        d_atom=2,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     # basis_specs should report "euclidean" or "euclidean_patch", not "duchon"

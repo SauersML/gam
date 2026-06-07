@@ -119,7 +119,7 @@ def test_ibp_driver_refreshes_basis_between_rust_steps(monkeypatch):
         K=1,
         atom_topology="circle",
         d_atom=1,
-        assignment="ibp",
+        assignment="ibp_map",
         alpha=1.0,
         schedule=sae.gumbel_linear_schedule(tau_start=0.7, tau_min=0.7, steps=1),
         n_iter=2,

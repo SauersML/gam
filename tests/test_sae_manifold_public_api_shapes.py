@@ -20,7 +20,7 @@ def _fresh_fit_or_fail(z: np.ndarray):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             fit = gamfit.sae_manifold_fit(
-                Z=z,
+                X=z,
                 K=1,
                 d_atom=1,
                 atom_topology="circle",
@@ -30,7 +30,7 @@ def _fresh_fit_or_fail(z: np.ndarray):
                 sparsity_weight=0.01,
                 smoothness_weight=0.01,
                 decoder_incoherence_weight=0.0,
-                max_iter=25,
+                n_iter=25,
                 learning_rate=1.0,
                 random_state=21,
             )

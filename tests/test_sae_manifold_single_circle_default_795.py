@@ -45,7 +45,7 @@ def test_single_circle_quickstart_converges_with_default_isometry() -> None:
             warnings.simplefilter("ignore", UserWarning)
             # No `isometry_weight=` here on purpose — exercise the shipped default.
             fit = gamfit.sae_manifold_fit(
-                Z=z,
+                X=z,
                 K=1,
                 d_atom=1,
                 atom_topology="circle",

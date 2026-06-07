@@ -47,7 +47,7 @@ def test_softmax_fit_matches_closed_form_k3() -> None:
     # anneals, so the kernel sees a fixed tau on every iteration.
     cfg = gt.ManifoldSAEConfig(
         input_dim=X.shape[1],
-        n_atoms=3,
+        K=3,
         intrinsic_rank=1,
         atom_manifold="circle",
         atom_basis="fourier",
@@ -61,13 +61,13 @@ def test_softmax_fit_matches_closed_form_k3() -> None:
 
     sae = gt.ManifoldSAE(cfg).double()
     torch_x = torch.as_tensor(X, dtype=torch.float64)
-    torch_fit = sae.fit(torch_x, max_iter=10, random_state=42)
+    torch_fit = sae.fit(torch_x, n_iter=10, random_state=42)
 
     # Equivalent closed-form call: same Rust kernel, same (constant) schedule.
     cf_fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=cfg.n_atoms,
-        atom_dim=cfg.intrinsic_rank,
+        X=X,
+        K=cfg.n_atoms,
+        d_atom=cfg.intrinsic_rank,
         atom_topology="circle",
         atom_basis=cfg.closed_form_basis_kind(),
         assignment=cfg.closed_form_assignment(),
@@ -96,7 +96,7 @@ def test_softmax_module_forward_matches_fit_k3() -> None:
     X = _make_synth(seed=3)
     cfg = gt.ManifoldSAEConfig(
         input_dim=X.shape[1],
-        n_atoms=3,
+        K=3,
         intrinsic_rank=1,
         atom_manifold="circle",
         atom_basis="fourier",
@@ -105,7 +105,7 @@ def test_softmax_module_forward_matches_fit_k3() -> None:
     )
     sae = gt.ManifoldSAE(cfg).double()
     x = torch.as_tensor(X, dtype=torch.float64)
-    fit = sae.fit(x, max_iter=10, random_state=42)
+    fit = sae.fit(x, n_iter=10, random_state=42)
     out = sae(x)
     fitted = torch.as_tensor(np.asarray(fit.fitted, dtype=np.float64), dtype=torch.float64)
     assert out.assignments.shape == (x.shape[0], 3)

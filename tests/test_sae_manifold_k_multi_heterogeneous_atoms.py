@@ -87,7 +87,7 @@ def _r2(x: np.ndarray, fitted: np.ndarray) -> float:
 
 def test_heterogeneous_mixed_topology_atoms_reconstruct():
     """A single fit with atom_basis=['periodic','sphere','torus'] and
-    per-atom atom_dim=[1,2,2] must reconstruct mixed-manifold data and
+    per-atom d_atom=[1,2,2] must reconstruct mixed-manifold data and
     expose per-atom coordinates whose width matches each declared dim."""
     z = _heterogeneous_manifold_data(n=600, p=72, noise=0.04, seed=0)
 
@@ -95,12 +95,12 @@ def test_heterogeneous_mixed_topology_atoms_reconstruct():
     atom_dim = [1, 2, 2]
 
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=3,
+        X=z,
+        K=3,
         atom_basis=atom_basis,
-        atom_dim=atom_dim,
-        assignment_prior="ibp_map",
-        max_iter=60,
+        d_atom=atom_dim,
+        assignment="ibp_map",
+        n_iter=60,
         learning_rate=0.04,
         random_state=0,
     )

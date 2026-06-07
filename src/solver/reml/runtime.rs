@@ -95,6 +95,38 @@ struct AloStabilizationEval {
 // distinguish a genuinely influential point from sampling jitter, so the
 // stabilization stays off entirely.
 const ALO_STABILIZATION_MIN_N: usize = 20;
+// Effective-dof fraction (edf / n) above which the design is treated as
+// over-parameterized / near-interpolating and the ALO stabilization is
+// suppressed.
+//
+// The stabilizer exists to robustify the REML criterion against a *handful* of
+// genuinely influential observations on an *identified* design. On a
+// near-saturated basis (edf approaching n — e.g. a tensor-product `te()` smooth
+// whose marginal-product column count rivals n at small n), leverage is high
+// for essentially *every* row purely from basis geometry, not from outliers.
+// There the augmentation — whose mechanism is to pull λ upward until each row's
+// LOO denominator clears the leverage barrier — can never satisfy its own gate
+// (no finite λ drives an over-parameterized basis's leverage below 0.80 for all
+// rows), so it adds a near-flat, ill-conditioned ridge to the outer surface.
+// The outer optimizer then crawls that ridge to its iteration cap (the
+// `[ALO-STABILIZED-REML]` "cost decreasing ~1e-4 per step over thousands of
+// evals" / `min_denom≈0.043` signature of #813 / #821), re-running PIRLS every
+// step. RKHS smooths (`duchon`/`matern`) regularize edf well below n and never
+// reach this regime, which is exactly why `te()` was pathological while they
+// were not on identical data. The 0.70 cut leaves genuinely identified,
+// moderately-fit designs (where a few isolated rows carry the high leverage)
+// fully stabilized while excluding the basis-saturation artifact.
+const ALO_EDF_FRACTION_SATURATION: f64 = 0.70;
+// Fraction of rows that may clear the leverage activation threshold before the
+// high leverage is judged pervasive (a basis-geometry artifact) rather than
+// concentrated in a few influential observations. Genuine influential-point
+// stabilization touches a small minority of rows; a near-interpolating
+// tensor-product basis trips a large fraction. Above this fraction the
+// stabilizer is suppressed (see the pervasiveness guard in
+// `alo_stabilization_eval`). 0.25 is well above the handful of rows a real
+// outlier cluster produces yet far below the pervasive activation a saturated
+// `te()` basis exhibits.
+const ALO_PERVASIVE_LEVERAGE_FRACTION: f64 = 0.25;
 // Activation gate on the leave-one-out denominator (1 - h). 0.20 means we only
 // engage once some observation's LOO predictor is amplified by >5×; below that
 // the correction is negligible and we preserve the unstabilized objective.
@@ -9188,6 +9220,21 @@ impl<'a> RemlState<'a> {
         if n < ALO_STABILIZATION_MIN_N {
             return Ok(None);
         }
+        // Suppress the stabilizer on near-saturated / over-parameterized designs
+        // (e.g. small-n tensor-product `te()` whose marginal-product column count
+        // rivals n). There leverage is high for *every* row from basis geometry,
+        // not from a few influential observations, so the augmentation can never
+        // clear its own leverage gate and instead leaves a near-flat ill-
+        // conditioned ridge on the outer surface that the optimizer crawls to its
+        // iteration cap (#813 / #821). This check is cheap (one scalar ratio) and
+        // is intentionally placed *before* `compute_alo_diagnostics_from_pirls`,
+        // so the per-outer-evaluation dense Hessian factorization and n column
+        // solves the diagnostics require are skipped entirely in this regime —
+        // restoring `te()` to the same per-eval cost profile as `duchon`/`matern`.
+        let edf = bundle.pirls_result.edf;
+        if edf.is_finite() && edf > ALO_EDF_FRACTION_SATURATION * (n as f64) {
+            return Ok(None);
+        }
         let alo = crate::inference::alo::compute_alo_diagnostics_from_pirls(
             bundle.pirls_result.as_ref(),
             self.y,
@@ -9207,6 +9254,32 @@ impl<'a> RemlState<'a> {
         if max_leverage < ALO_MAX_LEVERAGE_THRESHOLD
             && min_denominator > ALO_DENOM_INSTABILITY_THRESHOLD
         {
+            return Ok(None);
+        }
+
+        // Pervasiveness guard. The stabilizer is designed for a *minority* of
+        // genuinely influential rows on an identified design; there the leverage
+        // barrier `Σ(h_i − 0.80)₊²` can be cleared by a modest λ bump that the
+        // REML criterion tolerates, and the augmented surface stays well-
+        // conditioned. When instead a *large fraction* of rows clears the
+        // leverage threshold, the high leverage is a basis-geometry artifact of a
+        // near-interpolating tensor-product `te()` basis (every local B-spline
+        // cell carries one or two near-interpolated rows), not outliers: no
+        // finite λ can pull all of them below 0.80, so the barrier turns the
+        // outer surface into a near-flat ill-conditioned ridge that the optimizer
+        // crawls to its iteration cap (the #821 "cost decreasing ~1e-4 per step
+        // over thousands of evals" signature). RKHS smooths (`duchon`/`matern`)
+        // spread leverage globally and keep this fraction near zero on identical
+        // data — which is precisely why they were fast while `te()` was not.
+        // Suppressing the augmentation here returns `te()` to the plain REML
+        // surface (which already controls λ) and to the others' convergence
+        // profile, while leaving every concentrated-outlier fit fully stabilized.
+        let n_high_leverage = alo
+            .leverage
+            .iter()
+            .filter(|&&h| h > ALO_MAX_LEVERAGE_THRESHOLD)
+            .count();
+        if (n_high_leverage as f64) > ALO_PERVASIVE_LEVERAGE_FRACTION * (n as f64) {
             return Ok(None);
         }
 

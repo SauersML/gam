@@ -71,12 +71,12 @@ def test_single_atom_recovers_each_supported_topology(basis: str):
     z = _data_for_basis(basis)
 
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=1,
+        X=z,
+        K=1,
         atom_basis=basis,
-        atom_dim=2,
-        assignment_prior="ibp_map",
-        max_iter=50,
+        d_atom=2,
+        assignment="ibp_map",
+        n_iter=50,
         learning_rate=0.04,
         random_state=0,
     )

@@ -48,12 +48,12 @@ def test_periodic_atom_fit_completes_within_wall_clock_limit():
 
     start = time.perf_counter()
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=4,
+        X=z,
+        K=4,
         atom_basis="periodic",
-        atom_dim=2,
-        assignment_prior="ibp_map",
-        max_iter=MAX_ITER,
+        d_atom=2,
+        assignment="ibp_map",
+        n_iter=MAX_ITER,
         learning_rate=0.04,
         random_state=0,
     )
@@ -63,6 +63,6 @@ def test_periodic_atom_fit_completes_within_wall_clock_limit():
     score = _r2(z, fit.fitted)
     assert elapsed < TIME_LIMIT_SECONDS, (
         f"periodic atom fit took {elapsed:.2f}s for "
-        f"{N_SAMPLES}x{N_FEATURES}, K=4, max_iter={MAX_ITER}; "
+        f"{N_SAMPLES}x{N_FEATURES}, K=4, n_iter={MAX_ITER}; "
         f"limit is {TIME_LIMIT_SECONDS:.2f}s, reconstruction R^2={score:.4f}"
     )

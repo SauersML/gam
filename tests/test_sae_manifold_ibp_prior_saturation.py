@@ -81,13 +81,13 @@ def _select_k(z: np.ndarray, candidates: list[int], alpha: float) -> tuple[int, 
     scores: dict[int, float] = {}
     for k in candidates:
         fit = gamfit.sae_manifold_fit(
-            Z=z,
-            n_atoms=k,
+            X=z,
+            K=k,
             atom_basis="periodic",
-            atom_dim=2,
-            assignment_prior="ibp_map",
+            d_atom=2,
+            assignment="ibp_map",
             alpha=alpha,
-            max_iter=60,
+            n_iter=60,
             learning_rate=0.04,
             random_state=0,
         )
@@ -119,13 +119,13 @@ def test_ibp_assignments_decay_not_truncate_under_saturation():
     exact zero would be an unrecoverable masking bug, not a soft prior."""
     z = _multi_harmonic_data(n=600, p=64, k_true=5, noise=0.04, seed=0)
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=15,
+        X=z,
+        K=15,
         atom_basis="periodic",
-        atom_dim=2,
-        assignment_prior="ibp_map",
+        d_atom=2,
+        assignment="ibp_map",
         alpha=0.1,
-        max_iter=60,
+        n_iter=60,
         learning_rate=0.04,
         random_state=0,
     )

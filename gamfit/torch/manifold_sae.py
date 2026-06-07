@@ -965,9 +965,9 @@ class ManifoldSAE(nn.Module):
         if cfg.closed_form_assignment() == "jumprelu":
             kwargs["jumprelu_threshold"] = float(cfg.sparsity.jumprelu_threshold)
         fit = _closed_form_sae_manifold_fit(
-            Z=to_numpy_f64(x),
-            n_atoms=int(cfg.n_atoms),
-            atom_dim=int(cfg.intrinsic_rank),
+            X=to_numpy_f64(x),
+            K=int(cfg.n_atoms),
+            d_atom=int(cfg.intrinsic_rank),
             atom_topology=_topology_for_manifold(cfg.atom_manifold),
             atom_basis=cfg.closed_form_basis_kind(),
             assignment=cfg.closed_form_assignment(),

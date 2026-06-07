@@ -34,7 +34,7 @@ def main() -> None:
         ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
-        max_iter=40,
+        n_iter=40,
         learning_rate=1.0,
         random_state=0,
     )

@@ -1,4 +1,4 @@
-"""End-to-end coverage for JumpReLU (``assignment='gated'``) active-set
+"""End-to-end coverage for JumpReLU (``assignment='jumprelu'``) active-set
 dynamics during a real SAE-manifold fit.
 
 JumpReLU uses variable-stride compact row layouts where the per-row active
@@ -8,7 +8,7 @@ logits in ``apply_newton_step``, and expands the compact delta against the
 layout from the most recent assembly. The existing ``jumprelu_ste.rs``
 tests only check penalty value/gradient at fixed thresholds, and
 ``test_sae_manifold_top_k_issue.py`` exercises softmax top-k, not the
-gated path. Nothing exercises the variable-stride active-set evolution
+JumpReLU path. Nothing exercises the variable-stride active-set evolution
 end to end.
 
 These tests fit on data with distinct per-atom activation patterns and
@@ -64,7 +64,7 @@ def _active_sets(assignments: np.ndarray, threshold: float) -> list[frozenset[in
 
 
 def test_jumprelu_active_sets_change_across_iterations():
-    """Two gated fits that differ only in iteration budget must end with
+    """Two JumpReLU fits that differ only in iteration budget must end with
     different active-set configurations across the row population — the
     variable-stride layout is rebuilt every Newton step as logits cross
     the threshold, so the active-set distribution should not be frozen at
@@ -77,21 +77,21 @@ def test_jumprelu_active_sets_change_across_iterations():
     snapshots: dict[int, list[frozenset[int]]] = {}
     for iters in (1, 10, 40):
         fit = gamfit.sae_manifold_fit(
-            Z=z,
-            n_atoms=3,
+            X=z,
+            K=3,
             atom_basis="periodic",
-            atom_dim=2,
-            assignment="gated",
-            max_iter=iters,
+            d_atom=2,
+            assignment="jumprelu",
+            n_iter=iters,
             learning_rate=0.05,
             random_state=1,
         )
         A = np.asarray(fit.assignments)
         assert A.shape == (z.shape[0], 3), (
-            f"gated assignments shape {A.shape} should be (n=300, K=3)"
+            f"JumpReLU assignments shape {A.shape} should be (n=300, K=3)"
         )
         assert np.all(np.isfinite(A)), (
-            f"gated assignments at {iters} iters contain non-finite entries"
+            f"JumpReLU assignments at {iters} iters contain non-finite entries"
         )
         snapshots[iters] = _active_sets(A, threshold)
 
@@ -138,18 +138,18 @@ def test_jumprelu_reconstruction_stable_with_variable_active_sets():
     z_test = z_full[250:]
 
     fit = gamfit.sae_manifold_fit(
-        Z=z_train,
-        n_atoms=4,
+        X=z_train,
+        K=4,
         atom_basis="periodic",
-        atom_dim=2,
-        assignment="gated",
-        max_iter=40,
+        d_atom=2,
+        assignment="jumprelu",
+        n_iter=40,
         learning_rate=0.05,
         random_state=2,
     )
 
     assert hasattr(fit, "reconstruct"), (
-        "gated fit must expose reconstruct() for OOS scoring"
+        "JumpReLU fit must expose reconstruct() for OOS scoring"
     )
     oos_fitted = fit.reconstruct(z_test)
     assert np.all(np.isfinite(oos_fitted)), (

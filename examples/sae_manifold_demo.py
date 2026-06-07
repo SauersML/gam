@@ -24,7 +24,7 @@ def main() -> None:
         K=1,
         d_atom=2,
         atom_topology="circle",
-        assignment="ibp",
+        assignment="ibp_map",
         n_iter=8,
         learning_rate=0.04,
         random_state=7,

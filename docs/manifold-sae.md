@@ -20,11 +20,11 @@ import gamfit
 Z = ...  # (N, p) activations / embeddings to decompose
 
 fit = gamfit.sae_manifold_fit(
-    Z=Z,
-    K=16,                       # dictionary size (alias: n_atoms=)
+    X=Z,
+    K=16,                       # dictionary size
     d_atom=1,                   # intrinsic dim per atom (int, or per-atom list)
     atom_topology="circle",     # line/circle/sphere/torus/euclidean (or per-atom atom_basis=)
-    assignment="ibp",           # canonical gate: IBP-MAP sparsity
+    assignment="ibp_map",       # IBP-MAP sparsity
 )
 
 print(fit)              # ManifoldSAE(K=16, d_atom=1, atom_topology='circle', ...)
@@ -63,10 +63,10 @@ smoothing weights selected by REML. Each piece plays a distinct role
   per-atom decoded points. Reported as `fit.reconstruction_r2`.
 
 - **Gate sparsity (`assignment=`, canonical).** The per-token, per-atom gate
-  is selected by the assignment prior. The canonical choice is `"ibp"`
+  is selected by the assignment prior. The canonical choice is `"ibp_map"`
   (Indian Buffet Process MAP): it adapts the *number* of active atoms per
   token and produces **true zeros** rather than a soft simplex. Alternatives
-  are `"softmax"` (dense, simplex-normalized) and `"jumprelu"` / `"gated"`
+  are `"softmax"` (dense, simplex-normalized) and `"jumprelu"`
   (hard threshold). `top_k=` optionally caps the per-token active set.
 
 - **Cross-atom decoder incoherence** (`decoder_incoherence_weight=1.0`, **on
@@ -221,7 +221,7 @@ Methods: `predict` / `reconstruct(X)`, `encode(X)` (out-of-sample gates),
 
 ### Out-of-sample and encoder distillation (issue #357)
 
-`Z=` (alias `X=`) is the data to reconstruct — it is **not** a warm start.
+`X=` is the data to reconstruct — it is **not** a warm start.
 To seed the joint solve from an amortized encoder's per-token prediction,
 pass `a_init` (assignment logits `(N, K)`) and/or `t_init` (coordinates
 `(K, N, D_max)`) and a small `n_iter` for a bounded refinement; read the

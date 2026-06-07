@@ -41,12 +41,12 @@ def test_periodic_atom_oos_r2_noise_sweep(noise: float):
     z_test = z[300:]
 
     fit = gamfit.sae_manifold_fit(
-        Z=z_train,
-        n_atoms=1,
+        X=z_train,
+        K=1,
         atom_basis="periodic",
-        atom_dim=2,
-        assignment_prior="ibp_map",
-        max_iter=50,
+        d_atom=2,
+        assignment="ibp_map",
+        n_iter=50,
         learning_rate=0.04,
         random_state=0,
     )
