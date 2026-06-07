@@ -83,11 +83,25 @@ class _FakeRustModule:
             )
         return {
             "atoms": atoms,
+            "atom_plans": [
+                {
+                    "kind": str(atom_basis[atom]),
+                    "latent_dim": int(atom_dim[atom]),
+                    "basis_size": int(atoms[atom]["decoder_B"].shape[0]),
+                    "n_harmonics": 0,
+                    "duchon_centers": None,
+                }
+                for atom in range(K)
+            ],
             "assignments_z": assignments,
             "logits": logits,
             "atom_active_mask": [True for _ in atom_dim],
             "fitted": np.zeros_like(z),
             "reml_score": -1.0,
+            "chosen_k": K,
+            "dispersion": 1.0,
+            "oos_projection_top1": False,
+            "diagnostics": _diagnostics(K, n),
             "log_alpha": np.log(alpha),
             "log_lambda_smooth": np.log(smoothness),
             "log_ard": [np.zeros(dim) for dim in atom_dim],
@@ -118,3 +132,32 @@ def test_ibp_driver_refreshes_basis_between_rust_steps(monkeypatch):
     assert np.isfinite(fit.reml_score)
     assert np.all(np.isfinite(fit.assignments))
     assert np.linalg.norm(fit.coords[0]) > 0.0
+
+
+def _diagnostics(k_atoms: int, n_obs: int) -> dict[str, object]:
+    return {
+        "atom_trust": np.ones(k_atoms, dtype=float),
+        "atoms": [
+            {
+                "trust_score": 1.0,
+                "sigma_min_tangent": 1.0,
+                "sigma_max_tangent": 1.0,
+                "tangent_condition_score": 1.0,
+                "mean_neighbor_coherence": 0.0,
+                "coherence_score": 1.0,
+                "topology_evidence_margin": 0.0,
+                "topology_margin_score": 0.5,
+                "coverage": 1.0,
+                "activation_frequency": 1.0,
+                "coverage_score": 1.0,
+                "typed_reconstruction_mse": 0.0,
+                "level0_reference_mse": 0.0,
+                "level0_residual_ratio": 1.0,
+                "level0_score": 1.0,
+                "untyped": False,
+                "active_token_count": int(n_obs),
+            }
+            for _ in range(k_atoms)
+        ],
+        "level0_test": "test",
+    }

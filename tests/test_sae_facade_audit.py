@@ -292,12 +292,24 @@ class _FakeRustModule:
             })
         return {
             "atoms": atoms,
+            "atom_plans": [
+                {
+                    "kind": str(atom_basis[atom_k]),
+                    "latent_dim": int(atom_dim[atom_k]),
+                    "basis_size": int(atoms[atom_k]["decoder_B"].shape[0]),
+                    "n_harmonics": 0,
+                    "duchon_centers": None,
+                }
+                for atom_k in range(k_atoms)
+            ],
             "assignments_z": assignments,
             "logits": logits,
             "fitted": np.zeros_like(z),
             "reml_score": -1.0,
             "chosen_k": k_atoms,
             "dispersion": 1.0,
+            "oos_projection_top1": False,
+            "diagnostics": _diagnostics(k_atoms),
         }
 
 
