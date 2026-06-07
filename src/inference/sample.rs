@@ -765,7 +765,7 @@ fn sample_survival(
             &time_anchor_row,
         )?;
     }
-    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
     let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
         build_survival_time_offsets_for_likelihood(
             &age_entry,

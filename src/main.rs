@@ -3378,7 +3378,7 @@ fn run_predict_survival(
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
-    let baseline_cfg = saved_survival_runtime_baseline_config(model, saved_likelihood_mode)?;
+    let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::Latent | SurvivalLikelihoodMode::LatentBinary

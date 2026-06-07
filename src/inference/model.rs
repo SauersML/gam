@@ -3852,11 +3852,13 @@ impl DerefMut for FittedModel {
 pub fn survival_baseline_config_from_model(
     model: &FittedModel,
 ) -> Result<SurvivalBaselineConfig, FittedModelError> {
+    let target = model.survival_baseline_target.as_deref().ok_or_else(|| {
+        FittedModelError::MissingField {
+            reason: "saved survival model missing survival_baseline_target; refit".to_string(),
+        }
+    })?;
     parse_survival_baseline_config(
-        model
-            .survival_baseline_target
-            .as_deref()
-            .unwrap_or("linear"),
+        target,
         model.survival_baseline_scale,
         model.survival_baseline_shape,
         model.survival_baseline_rate,
