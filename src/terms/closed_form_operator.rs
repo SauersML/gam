@@ -135,11 +135,6 @@ impl ClosedFormPenaltyOperator {
         self.cached_dense.get_or_compute(|| self.build_dense())
     }
 
-    /// Number of raw kernel rows (K).
-    pub fn raw_dim(&self) -> usize {
-        self.centers.nrows()
-    }
-
     /// Number of columns *after* applying constraint composition: the
     /// dimension that callers see when invoking matvec/dense_form.
     pub fn dim(&self) -> usize {

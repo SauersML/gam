@@ -16,7 +16,7 @@ pub(crate) mod persistent_warm_start;
 pub mod pirls;
 pub(crate) mod priority_selection;
 pub mod protocol;
-pub mod riemannian_retraction;
+pub(crate) mod riemannian_retraction;
 pub mod row_measure;
 pub mod seeding;
 pub mod sindy;
