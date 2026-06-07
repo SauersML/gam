@@ -32,7 +32,7 @@ use crate::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
-use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
+use crate::probability::{gamma_quantile, normal_cdf, normal_pdf, standard_normal_quantile};
 use crate::quadrature::QuadratureContext;
 use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -5585,15 +5585,22 @@ where
 /// Exact analytic representation (Mellin-Barnes) for I(λ):
 ///   I(λ) = (1/(2πi)) ∫_{c-i∞}^{c+i∞} Γ(z) λ^{-z} exp(-μ z + 0.5 σ² z²) dz, c>0.
 /// This Mellin-Barnes integral is mathematically exact.
-/// Build the response-scale observation (prediction) interval band
-/// `μ ± z·√(Var(μ̂) + Var(Y|μ))`, clamped to the family's response support.
+/// Build the response-scale observation (prediction) interval band, clamped to
+/// the family's response support.
 ///
 /// `Var(μ̂)` is the squared mean-scale SE (estimation uncertainty); `Var(Y|μ)`
 /// is the family's conditional response variance evaluated at the point mean
 /// (Poisson `μ`, Binomial `p(1−p)`, Gamma `φμ²`, NegBin `μ+μ²/θ`, Beta
-/// `μ(1−μ)/(1+φ)`). The Gaussian identity-link arm instead widens on the η scale
-/// directly with the residual SD. Returns `(None, None)` for families without a
-/// closed-form conditional response variance (`RoystonParmar`).
+/// `μ(1−μ)/(1+φ)`). The total predictive variance is `V = Var(μ̂) + Var(Y|μ)`.
+///
+/// Most arms form the symmetric band `μ ± z·√V`, which is exact for the
+/// Gaussian. The **Gamma** arm instead builds an *equal-tailed* band from the
+/// quantiles of a moment-matched Gamma predictive (mean `μ`, variance `V`):
+/// a symmetric band gets the Gamma's width right but its right-skew wrong, so
+/// each tail is badly mis-covered even when total coverage lands near nominal
+/// (#817). The Gaussian identity-link arm widens on the η scale directly with
+/// the residual SD. Returns `(None, None)` for families without a closed-form
+/// conditional response variance (`RoystonParmar`).
 ///
 /// For a bounded or half-bounded response (a count, a positive value, a
 /// proportion) the symmetric band crosses the support edge for a small/extreme
@@ -5646,6 +5653,53 @@ where
         clamp_to_support(lower, upper)
     };
 
+    // Skew-aware equal-tailed band for a strictly-positive, right-skewed
+    // response whose conditional law is well-approximated by a Gamma. A
+    // symmetric `μ ± z·σ` band gets the *width* right but the *shape* wrong:
+    // for a Gamma the true lower 2.5% quantile sits well above zero while the
+    // symmetric lower edge hugs the support floor, so the lower tail captures
+    // (almost) the whole lower half of the distribution and the upper tail then
+    // overshoots the nominal level (#817).
+    //
+    // Instead, model the predictive distribution of a *new* observation as a
+    // Gamma whose first two moments match the point prediction: mean `μ` and
+    // total predictive variance `V = SE(μ̂)² + Var(Y|μ)` (estimation +
+    // observation noise). That fixes `shape k = μ²/V`, `scale θ = V/μ`, and the
+    // band is the pair of equal-tailed Gamma quantiles at the same tail
+    // probabilities the symmetric band targeted, `Φ(−z_lower)` and `Φ(z_upper)`.
+    //
+    // When estimation uncertainty vanishes (`SE(μ̂) → 0`) this is *exact*: with
+    // `Var(Y|μ) = φμ²`, `k → 1/φ` and `θ → φμ`, recovering the conditional Gamma
+    // `Gamma(shape = 1/φ, scale = φμ)` exactly. With nonzero `SE(μ̂)` it is the
+    // moment-matched Gamma predictive — the minimal skew-correct widening.
+    let gamma_predictive_bounds = |response_var: Array1<f64>| {
+        let n = mean.len();
+        let mut lower = Array1::<f64>::zeros(n);
+        let mut upper = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mu = mean[i];
+            let total_var = (mean_standard_error[i].powi(2) + response_var[i]).max(0.0);
+            // Lower-tail probability of the lower edge and cumulative
+            // probability of the upper edge — identical tail mass to the
+            // symmetric band, routed through the correct distribution.
+            let p_lower = normal_cdf(-z_lower_per_row[i]);
+            let p_upper = normal_cdf(z_upper_per_row[i]);
+            if !(mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
+                // Degenerate point (non-positive mean or zero variance): fall
+                // back to the symmetric Gaussian edges, then clamp to support.
+                let s = total_var.sqrt();
+                lower[i] = mu - z_lower_per_row[i] * s;
+                upper[i] = mu + z_upper_per_row[i] * s;
+                continue;
+            }
+            let shape = mu * mu / total_var;
+            let scale = total_var / mu;
+            lower[i] = gamma_quantile(p_lower, shape, scale);
+            upper[i] = gamma_quantile(p_upper, shape, scale);
+        }
+        clamp_to_support(lower, upper)
+    };
+
     match response {
         ResponseFamily::Gaussian => {
             let obsvar = source.observation_standard_deviation().max(0.0).powi(2);
@@ -5686,9 +5740,13 @@ where
             response_observation_bounds(response_var)
         }
         ResponseFamily::Gamma => {
+            // Conditional response variance `Var(Y|μ) = φμ²`. The Gamma is
+            // strongly right-skewed, so the band is built from equal-tailed
+            // Gamma quantiles (moment-matched predictive), not a symmetric
+            // `μ ± z·σ` band that mis-covers each tail (#817).
             let phi = source.observation_phi().unwrap_or(1.0);
             let response_var = mean.mapv(|mu| phi * mu.powi(2));
-            response_observation_bounds(response_var)
+            gamma_predictive_bounds(response_var)
         }
         ResponseFamily::Beta { phi } => {
             // Beta's precision is estimated jointly with the mean (#567/#769)

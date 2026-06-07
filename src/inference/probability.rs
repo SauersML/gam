@@ -331,6 +331,113 @@ pub fn standard_normal_quantile(p: f64) -> Result<f64, String> {
     Ok(x)
 }
 
+/// Quantile (inverse CDF) of a Gamma distribution parameterized by shape
+/// `k > 0` and scale `θ > 0` at probability `p ∈ (0, 1)`: the value `x` with
+/// `P(X ≤ x) = p` for `X ~ Gamma(shape = k, scale = θ)` (mean `kθ`, variance
+/// `kθ²`).
+///
+/// Equals `θ · Q(p; k)`, where `Q(p; k)` inverts the regularized lower
+/// incomplete gamma `P(k, x)` (the unit-scale Gamma CDF). `p ≤ 0` maps to the
+/// `0` support floor and `p ≥ 1` to `+∞`; a non-finite or non-positive shape or
+/// scale yields `NaN`.
+///
+/// This is the building block for *skew-aware* response-scale predictive
+/// (observation) intervals: a Gamma response is strongly right-skewed, so the
+/// symmetric `μ ± z·σ` band mis-covers each tail even when its width (variance)
+/// is correct. Equal-tailed Gamma quantiles place the right mass in each tail.
+pub fn gamma_quantile(p: f64, shape: f64, scale: f64) -> f64 {
+    if !(shape.is_finite() && shape > 0.0 && scale.is_finite() && scale > 0.0) {
+        return f64::NAN;
+    }
+    scale * inverse_regularized_lower_gamma(p, shape)
+}
+
+/// Inverse of the regularized lower incomplete gamma function: the `x ≥ 0` with
+/// `P(a, x) = p`, where `P(a, x) = γ(a, x) / Γ(a)` is the CDF of a unit-scale
+/// `Gamma(shape = a)` variate, `a > 0`, `p ∈ (0, 1)`.
+///
+/// Uses the standard rational/Wilson–Hilferty initial estimate (a series form
+/// for `a ≤ 1`) refined by Halley's method on `P(a, x) − p` — third order, a
+/// Newton step scaled by the local curvature of `P`. The ratio `P(a, x)` is the
+/// well-tested `statrs` `gamma_lr`; the density
+/// `f(x) = x^{a−1} e^{−x} / Γ(a)` is evaluated through the same overflow-safe
+/// log factorization Numerical Recipes uses (`invgammp`), so the iteration stays
+/// finite across a wide range of `a`. A positivity step-halving guard keeps the
+/// iterate inside the support.
+fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
+    use statrs::function::gamma::{gamma_lr, ln_gamma};
+
+    if !(a.is_finite() && a > 0.0) {
+        return f64::NAN;
+    }
+    if !p.is_finite() || p <= 0.0 {
+        return 0.0;
+    }
+    if p >= 1.0 {
+        return f64::INFINITY;
+    }
+
+    let gln = ln_gamma(a);
+    let a1 = a - 1.0;
+
+    // Initial estimate. For `a > 1` a Wilson–Hilferty transform of a normal
+    // quantile (the rational tail approximation avoids depending on the caller's
+    // own quantile); for `a ≤ 1` the small-`x` series / large-`x` log form.
+    let mut x = if a > 1.0 {
+        let pp = if p < 0.5 { p } else { 1.0 - p };
+        let t = (-2.0 * pp.ln()).sqrt();
+        let mut z = (2.30753 + t * 0.27061) / (1.0 + t * (0.99229 + t * 0.04481)) - t;
+        if p < 0.5 {
+            z = -z;
+        }
+        (a * (1.0 - 1.0 / (9.0 * a) - z / (3.0 * a.sqrt())).powi(3)).max(1.0e-3)
+    } else {
+        let t = 1.0 - a * (0.253 + a * 0.12);
+        if p < t {
+            (p / t).powf(1.0 / a)
+        } else {
+            1.0 - (1.0 - (p - t) / (1.0 - t)).ln()
+        }
+    };
+
+    // Density factorization constants for `a > 1` (kept overflow-safe in logs).
+    let (lna1, afac) = if a > 1.0 {
+        let lna1 = a1.ln();
+        (lna1, (a1 * (lna1 - 1.0) - gln).exp())
+    } else {
+        (0.0, 0.0)
+    };
+
+    for _ in 0..16 {
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let err = gamma_lr(a, x) - p;
+        let dens = if a > 1.0 {
+            afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
+        } else {
+            (-x + a1 * x.ln() - gln).exp()
+        };
+        if !(dens.is_finite() && dens > 0.0) {
+            break;
+        }
+        // Newton step `u = (P(a,x) − p) / f(x)`, then the Halley scaling by the
+        // local curvature `f'/f = (a−1)/x − 1`, capped (per NR) so the
+        // denominator never collapses below ½.
+        let u = err / dens;
+        let step = u / (1.0 - 0.5 * (u * (a1 / x - 1.0)).min(1.0));
+        x -= step;
+        if x <= 0.0 {
+            // Overshot the support floor: step back to half the prior iterate.
+            x = 0.5 * (x + step);
+        }
+        if step.abs() < 1.0e-12 * x.max(1.0e-300) {
+            break;
+        }
+    }
+    x
+}
+
 /// Inverse-link transform per likelihood specification.
 #[inline]
 pub fn try_inverse_link_array(
@@ -392,5 +499,78 @@ mod tests {
         let mix = try_inverse_link_array(&mix_likelihood, eta.view()).expect("mixture with state");
         assert_eq!(mix.len(), eta.len());
         assert!(mix.iter().all(|p| p.is_finite() && *p > 0.0 && *p < 1.0));
+    }
+
+    #[test]
+    fn gamma_quantile_matches_known_reference_values() {
+        // Reference quantiles for unit-scale Gamma(shape=a) from the regularized
+        // lower incomplete gamma inverse (cross-checked against scipy
+        // `gamma.ppf(p, a)` to ~1e-6). Spanning a < 1, a = 1 (exponential), and
+        // a ≫ 1 exercises every initial-estimate / density branch.
+        let cases: [(f64, f64, f64); 9] = [
+            // (p, shape a, expected unit-scale quantile)
+            (0.025, 4.0, 1.089_865_4),
+            (0.5, 4.0, 3.672_060_4),
+            (0.975, 4.0, 8.767_273_4),
+            (0.025, 1.0, 0.025_317_8),  // Exp(1): -ln(1-p)
+            (0.975, 1.0, 3.688_879_4),
+            (0.5, 0.5, 0.227_468_2),
+            (0.99, 0.5, 3.317_448_3),
+            (0.025, 50.0, 37.110_963_7),
+            (0.975, 50.0, 64.780_598_6),
+        ];
+        for (p, a, expected) in cases {
+            let got = gamma_quantile(p, a, 1.0);
+            let rel = (got - expected).abs() / expected.max(1e-12);
+            assert!(
+                rel < 1e-4,
+                "gamma_quantile(p={p}, a={a}) = {got}, expected ≈ {expected} (rel err {rel})"
+            );
+        }
+    }
+
+    #[test]
+    fn gamma_quantile_is_consistent_with_the_cdf_round_trip() {
+        // The inverse must invert the CDF: P(a, Q(p; a)) = p. Verify across a
+        // grid of shapes and probabilities using statrs `gamma_lr` as the CDF.
+        use statrs::function::gamma::gamma_lr;
+        for &a in &[0.3_f64, 0.75, 1.0, 2.5, 10.0, 80.0] {
+            for &p in &[0.001_f64, 0.01, 0.025, 0.25, 0.5, 0.75, 0.975, 0.99, 0.999] {
+                let x = gamma_quantile(p, a, 1.0);
+                assert!(x.is_finite() && x > 0.0, "non-finite quantile a={a} p={p}: {x}");
+                let recovered = gamma_lr(a, x);
+                assert!(
+                    (recovered - p).abs() < 1e-6,
+                    "CDF round-trip failed a={a} p={p}: P(a, {x}) = {recovered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gamma_quantile_scale_and_monotonicity() {
+        // Scale is a pure multiplier, and the quantile is strictly increasing
+        // in p (an equal-tailed interval must order correctly).
+        let q_unit = gamma_quantile(0.9, 3.0, 1.0);
+        let q_scaled = gamma_quantile(0.9, 3.0, 7.5);
+        assert!((q_scaled - 7.5 * q_unit).abs() < 1e-9 * q_scaled.max(1.0));
+
+        let mut prev = 0.0;
+        for i in 1..100 {
+            let p = i as f64 / 100.0;
+            let q = gamma_quantile(p, 2.0, 1.0);
+            assert!(q > prev, "quantile not increasing at p={p}: {q} <= {prev}");
+            prev = q;
+        }
+    }
+
+    #[test]
+    fn gamma_quantile_rejects_degenerate_parameters() {
+        assert!(gamma_quantile(0.5, -1.0, 1.0).is_nan());
+        assert!(gamma_quantile(0.5, 1.0, 0.0).is_nan());
+        assert!(gamma_quantile(0.5, f64::NAN, 1.0).is_nan());
+        assert_eq!(gamma_quantile(0.0, 2.0, 1.0), 0.0);
+        assert_eq!(gamma_quantile(-0.1, 2.0, 1.0), 0.0);
+        assert!(gamma_quantile(1.0, 2.0, 1.0).is_infinite());
     }
 }
