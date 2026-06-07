@@ -1620,4 +1620,142 @@ mod tests {
         assert_eq!(sel.winner, TopologyKind::Flat);
         assert!(sel.tie);
     }
+
+    fn gaussian_logpdf(y: f64, mean: f64, sd: f64) -> f64 {
+        let z = (y - mean) / sd;
+        -0.5 * (2.0 * std::f64::consts::PI).ln() - sd.ln() - 0.5 * z * z
+    }
+
+    #[test]
+    fn stacking_single_candidate_gets_full_weight() {
+        let log_density = Array2::from_shape_vec((3, 1), vec![-1.0, -2.0, -0.5]).unwrap();
+        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        assert!((out.weights[0] - 1.0).abs() < 1e-12);
+        assert_eq!(out.weights.len(), 1);
+    }
+
+    #[test]
+    fn stacking_dominant_candidate_attracts_nearly_all_weight() {
+        let mut log_density = Array2::<f64>::zeros((50, 2));
+        for i in 0..50 {
+            log_density[[i, 0]] = -0.1;
+            log_density[[i, 1]] = -5.0;
+        }
+        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        assert!(out.weights[0] > 0.99, "w0 = {}", out.weights[0]);
+        assert!(out.weights[1] < 0.01, "w1 = {}", out.weights[1]);
+    }
+
+    #[test]
+    fn stacking_complementary_candidates_share_weight() {
+        // Each candidate is the better predictor on its own half of the data;
+        // stacking keeps both, unlike winner-take-all.
+        let n = 40;
+        let mut log_density = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            if i < n / 2 {
+                log_density[[i, 0]] = gaussian_logpdf(0.0, 0.0, 0.5);
+                log_density[[i, 1]] = gaussian_logpdf(0.0, 1.5, 0.5);
+            } else {
+                log_density[[i, 0]] = gaussian_logpdf(0.0, 1.5, 0.5);
+                log_density[[i, 1]] = gaussian_logpdf(0.0, 0.0, 0.5);
+            }
+        }
+        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        assert!(
+            out.weights[0] > 0.2 && out.weights[0] < 0.8,
+            "w0 = {}",
+            out.weights[0]
+        );
+        assert!((out.weights.sum() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stacking_weights_stay_on_the_simplex() {
+        let log_density = Array2::from_shape_vec(
+            (3, 3),
+            vec![-1.0, -2.0, -3.0, -2.5, -1.0, -2.0, -3.0, -2.0, -1.0],
+        )
+        .unwrap();
+        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        assert!((out.weights.sum() - 1.0).abs() < 1e-9);
+        assert!(out.weights.iter().all(|&w| w >= -1e-12));
+    }
+
+    #[test]
+    fn stacking_mean_log_score_is_monotone_under_more_iterations() {
+        // The EM ascent is monotone in the held-out mean log-score, so allowing
+        // more iterations never lowers it.
+        let log_density = Array2::from_shape_vec(
+            (4, 2),
+            vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5],
+        )
+        .unwrap();
+        let mut prev = f64::NEG_INFINITY;
+        for max_iter in [1usize, 2, 4, 8, 32] {
+            let out = solve_stacking_weights(
+                log_density.view(),
+                StackingConfig {
+                    max_iter,
+                    weight_tol: 0.0,
+                },
+            )
+            .unwrap();
+            assert!(
+                out.mean_log_score >= prev - 1e-12,
+                "log-score decreased at max_iter={max_iter}: {prev} -> {}",
+                out.mean_log_score
+            );
+            prev = out.mean_log_score;
+        }
+    }
+
+    #[test]
+    fn stacking_dead_candidate_column_is_rejected_and_zero_weighted() {
+        let log_density = Array2::from_shape_vec(
+            (3, 2),
+            vec![-1.0, f64::NEG_INFINITY, -2.0, f64::NAN, -0.5, f64::NEG_INFINITY],
+        )
+        .unwrap();
+        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        assert_eq!(out.weights[1], 0.0);
+        assert!((out.weights[0] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stacking_rows_with_no_finite_density_are_dropped() {
+        let log_density = Array2::from_shape_vec(
+            (3, 2),
+            vec![-1.0, -2.0, f64::NAN, f64::NEG_INFINITY, -2.0, -1.0],
+        )
+        .unwrap();
+        let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
+        assert!((out.weights.sum() - 1.0).abs() < 1e-9);
+        assert!(out.mean_log_score.is_finite());
+    }
+
+    #[test]
+    fn stacking_all_dead_table_errors() {
+        let log_density = Array2::from_elem((2, 2), f64::NEG_INFINITY);
+        assert!(solve_stacking_weights(log_density.view(), StackingConfig::default()).is_err());
+    }
+
+    #[test]
+    fn stacked_mean_is_weighted_combination() {
+        let weights = Array1::from_vec(vec![0.25, 0.75]);
+        let means = vec![
+            Array1::from_vec(vec![1.0, 2.0, 3.0]),
+            Array1::from_vec(vec![5.0, 6.0, 7.0]),
+        ];
+        let out = stacked_predictive_mean(&weights, &means).unwrap();
+        assert!((out[0] - (0.25 * 1.0 + 0.75 * 5.0)).abs() < 1e-12);
+        assert!((out[2] - (0.25 * 3.0 + 0.75 * 7.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stacked_mean_rejects_shape_mismatch() {
+        let weights = Array1::from_vec(vec![0.5, 0.5]);
+        let means = vec![Array1::from_vec(vec![1.0, 2.0]), Array1::from_vec(vec![3.0])];
+        assert!(stacked_predictive_mean(&weights, &means).is_err());
+    }
 }
