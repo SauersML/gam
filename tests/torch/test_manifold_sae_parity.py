@@ -37,7 +37,7 @@ def test_fit_matches_closed_form_reml_score_and_blocks():
     X = _make_synth()
     cfg = gt.ManifoldSAEConfig(
         input_dim=X.shape[1],
-        n_atoms=3,
+        K=3,
         intrinsic_rank=1,
         atom_manifold="circle",
         atom_basis="fourier",
@@ -50,13 +50,13 @@ def test_fit_matches_closed_form_reml_score_and_blocks():
 
     sae = gt.ManifoldSAE(cfg)
     torch_x = torch.as_tensor(X, dtype=torch.float64)
-    torch_fit = sae.fit(torch_x, max_iter=10, random_state=42)
+    torch_fit = sae.fit(torch_x, n_iter=10, random_state=42)
 
     # Equivalent closed-form call (same Rust kernel, same args).
     cf_fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=cfg.n_atoms,
-        atom_dim=cfg.intrinsic_rank,
+        X=X,
+        K=cfg.n_atoms,
+        d_atom=cfg.intrinsic_rank,
         atom_topology="circle",
         atom_basis=cfg.closed_form_basis_kind(),
         assignment=cfg.closed_form_assignment(),
@@ -75,7 +75,7 @@ def test_fit_matches_closed_form_reml_score_and_blocks():
 def test_forward_output_shapes_and_finite():
     cfg = gt.ManifoldSAEConfig(
         input_dim=8,
-        n_atoms=4,
+        K=4,
         intrinsic_rank=1,
         atom_manifold="circle",
         atom_basis="fourier",
@@ -94,7 +94,7 @@ def test_forward_output_shapes_and_finite():
 
 
 def test_lock_snapshot_freezes_hypers():
-    cfg = gt.ManifoldSAEConfig(input_dim=4, n_atoms=2, intrinsic_rank=1, n_basis_per_atom=3)
+    cfg = gt.ManifoldSAEConfig(input_dim=4, K=2, intrinsic_rank=1, n_basis_per_atom=3)
     sae = gt.ManifoldSAE(cfg)
     assert sae.log_lambda.requires_grad
     sae.lock_snapshot()
@@ -108,7 +108,7 @@ def test_lock_snapshot_freezes_hypers():
 
 def test_extract_feature_curves_grid_shape():
     cfg = gt.ManifoldSAEConfig(
-        input_dim=5, n_atoms=3, intrinsic_rank=1, atom_manifold="circle",
+        input_dim=5, K=3, intrinsic_rank=1, atom_manifold="circle",
         atom_basis="fourier", n_basis_per_atom=4,
     )
     sae = gt.ManifoldSAE(cfg)
@@ -123,13 +123,13 @@ def test_decoder_ortho_routes_through_rust():
     # Both ortho (block_orthogonality) and monotonicity descriptors now route
     # through Rust analytic_penalty_value_grad; nothing remains deferred.
     cfg = gt.ManifoldSAEConfig(
-        input_dim=4, n_atoms=3, intrinsic_rank=1, n_basis_per_atom=4,
+        input_dim=4, K=3, intrinsic_rank=1, n_basis_per_atom=4,
         decoder={"ortho_weight": 1e-2},
     )
     sae = gt.ManifoldSAE(cfg)
     assert sae.decoder_ortho_penalty().item() > 0.0
     cfg0 = gt.ManifoldSAEConfig(
-        input_dim=4, n_atoms=3, intrinsic_rank=1, n_basis_per_atom=4,
+        input_dim=4, K=3, intrinsic_rank=1, n_basis_per_atom=4,
         decoder={"ortho_weight": 0.0},
     )
     sae0 = gt.ManifoldSAE(cfg0)
@@ -138,13 +138,13 @@ def test_decoder_ortho_routes_through_rust():
 
 def test_decoder_monotonicity_routes_through_rust():
     cfg = gt.ManifoldSAEConfig(
-        input_dim=4, n_atoms=2, intrinsic_rank=1, n_basis_per_atom=5,
+        input_dim=4, K=2, intrinsic_rank=1, n_basis_per_atom=5,
         decoder={"monotonicity_weight": 1e-2, "monotonicity_direction": 1.0},
     )
     sae = gt.ManifoldSAE(cfg)
     assert sae.decoder_monotonicity_penalty().item() > 0.0
     cfg0 = gt.ManifoldSAEConfig(
-        input_dim=4, n_atoms=2, intrinsic_rank=1, n_basis_per_atom=5,
+        input_dim=4, K=2, intrinsic_rank=1, n_basis_per_atom=5,
         decoder={"monotonicity_weight": 0.0},
     )
     sae0 = gt.ManifoldSAE(cfg0)
@@ -156,7 +156,7 @@ def test_bspline_basis_routes_through_rust():
     # (open uniform). Forward and backward must both succeed without falling
     # back to the Duchon path.
     cfg = gt.ManifoldSAEConfig(
-        input_dim=5, n_atoms=2, intrinsic_rank=2, atom_manifold="cylinder",
+        input_dim=5, K=2, intrinsic_rank=2, atom_manifold="cylinder",
         atom_basis="bspline", basis_order=2, n_basis_per_atom=6,
     )
     sae = gt.ManifoldSAE(cfg)
@@ -172,7 +172,7 @@ def test_basis_eval_matches_rust_basis_with_jet():
     # done out-of-band. Proves the basis math lives in Rust, not torch.
     import gamfit
     cfg = gt.ManifoldSAEConfig(
-        input_dim=6, n_atoms=2, intrinsic_rank=1, atom_manifold="circle",
+        input_dim=6, K=2, intrinsic_rank=1, atom_manifold="circle",
         atom_basis="fourier", n_basis_per_atom=5,
     )
     sae = gt.ManifoldSAE(cfg)
@@ -201,7 +201,7 @@ def test_basis_eval_backward_uses_rust_jet():
     # dphi/dtheta backward flows through the saved jet tensor; sanity-check by
     # finite differencing the forward and matching the autograd gradient.
     cfg = gt.ManifoldSAEConfig(
-        input_dim=4, n_atoms=1, intrinsic_rank=1, atom_manifold="circle",
+        input_dim=4, K=1, intrinsic_rank=1, atom_manifold="circle",
         atom_basis="fourier", n_basis_per_atom=3,
     )
     sae = gt.ManifoldSAE(cfg)
@@ -222,7 +222,7 @@ def test_advance_temperature_queries_rust_schedule():
 
     cfg = gt.ManifoldSAEConfig(
         input_dim=4,
-        n_atoms=3,
+        K=3,
         intrinsic_rank=1,
         n_basis_per_atom=4,
         sparsity={"kind": "ibp_gumbel", "init_alpha": 1.0, "tau_schedule": "linear:4.0->1.0"},
@@ -259,7 +259,7 @@ def test_ibp_gumbel_forward_applies_stick_breaking_prior():
     tau_start = 2.5
     cfg = gt.ManifoldSAEConfig(
         input_dim=4,
-        n_atoms=5,
+        K=5,
         intrinsic_rank=1,
         n_basis_per_atom=4,
         sparsity={"kind": "ibp_gumbel", "init_alpha": alpha, "tau_start": tau_start, "tau_min": 0.5},
@@ -343,10 +343,10 @@ def test_isometry_backward_grad_matches_rust_grad_jacobian():
 
 def test_invalid_config_raises():
     with pytest.raises(ValueError):
-        gt.ManifoldSAEConfig(input_dim=0, n_atoms=4)
+        gt.ManifoldSAEConfig(input_dim=0, K=4)
     with pytest.raises(ValueError):
-        gt.ManifoldSAEConfig(input_dim=4, n_atoms=4, atom_manifold="circle", intrinsic_rank=2)
+        gt.ManifoldSAEConfig(input_dim=4, K=4, atom_manifold="circle", intrinsic_rank=2)
     with pytest.raises(ValueError):
-        gt.ManifoldSAEConfig(input_dim=4, n_atoms=4, atom_manifold="sphere", intrinsic_rank=1)
+        gt.ManifoldSAEConfig(input_dim=4, K=4, atom_manifold="sphere", intrinsic_rank=1)
     with pytest.raises(ValueError):
         gt.SparsityConfig(kind="ibp_gumbel", tau_start=1.0, tau_min=4.0)

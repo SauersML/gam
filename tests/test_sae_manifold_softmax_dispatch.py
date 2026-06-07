@@ -118,7 +118,7 @@ def test_softmax_fixed_k_dispatches_to_rust(monkeypatch):
         assignment="softmax",
         alpha=1.0,
         tau=0.7,
-        max_iter=1,
+        n_iter=1,
         learning_rate=0.1,
         random_state=4,
     )

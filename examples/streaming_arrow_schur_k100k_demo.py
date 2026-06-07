@@ -67,18 +67,18 @@ def main() -> None:
     )
 
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=N_ATOMS,
+        X=z,
+        K=N_ATOMS,
         atom_topology="euclidean",
         d_atom=D_ATOM,
         assignment="jumprelu",
-        max_iter=MAX_ITER,
+        n_iter=MAX_ITER,
         random_state=0,
     )
 
     plan = "streaming" if use_streaming else "in-core"
     print(
-        f"sae_manifold_fit n_atoms={N_ATOMS:,} n_obs={N_OBS:,} "
+        f"sae_manifold_fit K={N_ATOMS:,} n_obs={N_OBS:,} "
         f"plan={plan} chunk_size={chunk_size:,} "
         f"r2={fit.reconstruction_r2:.4f}"
     )

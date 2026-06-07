@@ -124,7 +124,7 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
         assignment_kind="softmax",
         sparsity_strength=0.01,
         smoothness=0.01,
-        max_iter=4,
+        n_iter=4,
         learning_rate=1.0,
     )
     assignments = np.asarray(payload["assignments_z"], dtype=float)
@@ -152,17 +152,17 @@ def test_fit_learns_disjoint_periodic_atoms_without_inactive_leakage() -> None:
     """
     x, truth, _t = _planted_one_hot_periodic(n=48, seed=4, noise=0.01)
     fit = gamfit.sae_manifold_fit(
-        Z=x,
-        n_atoms=2,
+        X=x,
+        K=2,
         atom_basis="periodic",
-        atom_dim=1,
+        d_atom=1,
         assignment="softmax",
         top_k=1,
         isometry_weight=0.0,
         ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
-        max_iter=6,
+        n_iter=6,
         learning_rate=1.0,
         random_state=1,
     )
@@ -178,17 +178,17 @@ def test_fit_oos_quality_matches_training_on_planted_oracle_distribution() -> No
     x_train, _truth_train, _ = _planted_one_hot_periodic(n=48, seed=10, noise=0.01)
     x_test, truth_test, _ = _planted_one_hot_periodic(n=16, seed=11, noise=0.01)
     fit = gamfit.sae_manifold_fit(
-        Z=x_train,
-        n_atoms=2,
+        X=x_train,
+        K=2,
         atom_basis="periodic",
-        atom_dim=1,
+        d_atom=1,
         assignment="softmax",
         top_k=1,
         isometry_weight=0.0,
         ard_per_atom=False,
         sparsity_weight=0.01,
         smoothness_weight=0.01,
-        max_iter=6,
+        n_iter=6,
         learning_rate=1.0,
         random_state=2,
     )

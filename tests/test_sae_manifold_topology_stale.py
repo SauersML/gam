@@ -31,12 +31,12 @@ def test_summary_topology_matches_atom_basis(
 ) -> None:
     X = _toy_inputs()
     fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=1,
+        X=X,
+        K=1,
         atom_basis=atom_basis,
-        atom_dim=atom_dim,
+        d_atom=atom_dim,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     summary = fit.summary()
@@ -61,12 +61,12 @@ def test_payload_round_trip_preserves_topology(
     regressions."""
     X = _toy_inputs()
     fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=1,
+        X=X,
+        K=1,
         atom_basis=atom_basis,
-        atom_dim=atom_dim,
+        d_atom=atom_dim,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     assert fit.atom_topology == expected_topology, (
@@ -81,12 +81,12 @@ def test_basis_specs_and_topology_are_internally_consistent() -> None:
     drift in either field fails this test."""
     X = _toy_inputs()
     fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=2,
+        X=X,
+        K=2,
         atom_basis="sphere",
-        atom_dim=2,
+        d_atom=2,
         assignment="softmax",
-        max_iter=1,
+        n_iter=1,
         random_state=0,
     )
     topology = fit.summary()["atom_topology"]
@@ -104,12 +104,12 @@ def test_explicit_conflicting_topology_and_basis_raises() -> None:
     X = _toy_inputs()
     with pytest.raises((ValueError, TypeError)):
         gamfit.sae_manifold_fit(
-            Z=X,
-            n_atoms=1,
+            X=X,
+            K=1,
             atom_basis="sphere",
             atom_topology="circle",
-            atom_dim=2,
+            d_atom=2,
             assignment="softmax",
-            max_iter=1,
+            n_iter=1,
             random_state=0,
         )

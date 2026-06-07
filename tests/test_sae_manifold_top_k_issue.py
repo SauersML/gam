@@ -26,13 +26,13 @@ def test_sae_manifold_fit_top_k_one_yields_at_most_one_active_atom() -> None:
     """Public ``gamfit.sae_manifold_fit`` must honour ``top_k=1``."""
     X = _random_inputs()
     fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=3,
+        X=X,
+        K=3,
         atom_basis="periodic",
-        atom_dim=1,
+        d_atom=1,
         assignment="softmax",
         top_k=1,
-        max_iter=5,
+        n_iter=5,
         random_state=0,
     )
     A = np.asarray(fit.assignments)
@@ -46,13 +46,13 @@ def test_sae_manifold_fit_top_k_one_yields_at_most_one_active_atom() -> None:
 def test_sae_manifold_fit_top_k_general(k: int) -> None:
     X = _random_inputs()
     fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=4,
+        X=X,
+        K=4,
         atom_basis="periodic",
-        atom_dim=1,
+        d_atom=1,
         assignment="softmax",
         top_k=k,
-        max_iter=5,
+        n_iter=5,
         random_state=0,
     )
     A = np.asarray(fit.assignments)
@@ -67,7 +67,7 @@ def test_manifold_sae_module_fit_respects_target_k() -> None:
 
     cfg = gt.ManifoldSAEConfig(
         input_dim=6,
-        n_atoms=4,
+        K=4,
         intrinsic_rank=1,
         atom_manifold="circle",
         atom_basis="fourier",
@@ -76,7 +76,7 @@ def test_manifold_sae_module_fit_respects_target_k() -> None:
     sae = gt.ManifoldSAE(cfg).double()
     rng = np.random.default_rng(1)
     X = rng.standard_normal((16, 6))
-    fit = sae.fit(torch.tensor(X, dtype=torch.float64), max_iter=3, random_state=0)
+    fit = sae.fit(torch.tensor(X, dtype=torch.float64), n_iter=3, random_state=0)
 
     A = np.asarray(fit.assignments)
     active_per_row = (A > 1e-12).sum(axis=1)

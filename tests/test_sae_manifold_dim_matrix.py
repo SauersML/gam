@@ -47,7 +47,7 @@ def _fit_or_fail(z: np.ndarray, *, atom_topology: str, d_atom: int):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             fit = gamfit.sae_manifold_fit(
-                Z=z,
+                X=z,
                 K=1,
                 d_atom=d_atom,
                 atom_topology=atom_topology,
@@ -57,7 +57,7 @@ def _fit_or_fail(z: np.ndarray, *, atom_topology: str, d_atom: int):
                 sparsity_weight=0.01,
                 smoothness_weight=0.01,
                 decoder_incoherence_weight=0.0,
-                max_iter=30,
+                n_iter=30,
                 learning_rate=1.0,
                 random_state=13,
             )

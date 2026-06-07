@@ -111,7 +111,7 @@ import torch
 from gamfit.torch import ManifoldSAE, ManifoldSAEConfig
 
 cfg = ManifoldSAEConfig(
-    input_dim=D, n_atoms=F, intrinsic_rank=1,
+    input_dim=D, K=F, intrinsic_rank=1,
     atom_manifold="circle",
     atom_basis="fourier", basis_order=2, n_basis_per_atom=K,
     sparsity={"kind": "ibp_gumbel", "init_alpha": 0.1,

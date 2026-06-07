@@ -52,7 +52,7 @@ def test_ibp_gumbel_fit_k4_matches_closed_form() -> None:
     X = _make_synth()
     cfg = gt.ManifoldSAEConfig(
         input_dim=X.shape[1],
-        n_atoms=4,
+        K=4,
         intrinsic_rank=1,
         atom_manifold="circle",
         atom_basis="fourier",
@@ -65,12 +65,12 @@ def test_ibp_gumbel_fit_k4_matches_closed_form() -> None:
 
     sae = gt.ManifoldSAE(cfg).double()
     torch_x = torch.as_tensor(X, dtype=torch.float64)
-    torch_fit = sae.fit(torch_x, max_iter=10, random_state=42)
+    torch_fit = sae.fit(torch_x, n_iter=10, random_state=42)
 
     cf_fit = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=cfg.n_atoms,
-        atom_dim=cfg.intrinsic_rank,
+        X=X,
+        K=cfg.n_atoms,
+        d_atom=cfg.intrinsic_rank,
         atom_topology="circle",
         atom_basis=cfg.closed_form_basis_kind(),
         assignment=cfg.closed_form_assignment(),
@@ -131,7 +131,7 @@ def test_ibp_gumbel_k4_stick_breaking_prior_decays() -> None:
     alpha = 1.2
     cfg = gt.ManifoldSAEConfig(
         input_dim=4,
-        n_atoms=4,
+        K=4,
         intrinsic_rank=1,
         n_basis_per_atom=4,
         sparsity={"kind": "ibp_gumbel", "init_alpha": alpha, "tau_start": 1.5, "tau_min": 0.5},

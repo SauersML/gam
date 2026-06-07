@@ -18,14 +18,13 @@ from ._sae_trust import atom_trust_scores, coerce_sae_trust_diagnostics
 
 
 _ASSIGNMENT_KINDS: dict[str, str] = {
-    "ibp": "ibp_map",
     "ibp_map": "ibp_map",
     "softmax": "softmax",
     "jumprelu": "jumprelu",
 }
 
 _PUBLIC_ASSIGNMENT_KINDS: dict[str, str] = {
-    "ibp": "ibp_map",
+    "ibp_map": "ibp_map",
     "softmax": "softmax",
     "jumprelu": "jumprelu",
 }
@@ -231,7 +230,7 @@ class SaeManifoldAtomFit:
     assignments
         Per-observation assignment/gate values for this atom, shape ``(N,)``.
         For ``assignment="softmax"`` these are mixture masses; for
-        ``"ibp"``/``"ibp_map"`` and ``"jumprelu"`` these are
+        ``"ibp_map"`` and ``"jumprelu"`` these are
         gate activations.
     coords
         Recovered on-atom latent coordinates ``t*`` for the training data,
@@ -949,7 +948,7 @@ _TOPOLOGY_UNSET: Any = object()
 
 
 def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
-                     assignment: str = "ibp", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
+                     assignment: str = "ibp_map", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
                      isometry_weight: float = 0.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      sparsity_weight: float = 1.0,
@@ -981,9 +980,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         values are ``"circle"``, ``"periodic"``, ``"sphere"``, ``"torus"``,
         and ``"euclidean"``. If omitted, the default is ``"circle"``.
     assignment
-        Assignment/gating family. ``"ibp"`` is the public canonical spelling
-        for the IBP-MAP gate path (internal canonical kind ``"ibp_map"``);
-        ``"softmax"`` uses soft mixture masses. ``"jumprelu"`` uses the
+        Assignment/gating family. ``"ibp_map"`` uses the IBP-MAP gate path,
+        ``"softmax"`` uses soft mixture masses, and ``"jumprelu"`` uses the
         JumpReLU hard-gate family.
     schedule
         Optional :class:`GumbelTemperatureSchedule` or mapping forwarded to the
@@ -1705,7 +1703,7 @@ def fit(activations: Any, config: Mapping[str, Any] | None = None) -> dict[str, 
     global _LAST_RESEARCH_LOOP_MODEL
     x = _as_2d_float(activations, "activations")
     cfg = {} if config is None else dict(config)
-    if "K" not in cfg and "n_atoms" not in cfg:
+    if "K" not in cfg:
         cfg["K"] = _default_research_k(x.shape[0])
     model = sae_manifold_fit(x, **cfg)
     _LAST_RESEARCH_LOOP_MODEL = model

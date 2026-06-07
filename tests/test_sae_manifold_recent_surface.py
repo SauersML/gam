@@ -183,11 +183,11 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
     x = _toy_matrix(n=14, p=4)
 
     fit = gamfit.sae_manifold_fit(
-        Z=x,
+        X=x,
         K=2,
         d_atom=2,
         atom_topology="circle",
-        assignment="ibp",
+        assignment="ibp_map",
         isometry_weight=0.0,
         ard_per_atom=False,
         sparsity_weight=0.3,
@@ -196,7 +196,7 @@ def test_recent_penalty_knobs_emit_expected_analytic_descriptors(monkeypatch):
         nuclear_norm_weight=0.4,
         nuclear_norm_max_rank=1,
         decoder_incoherence_weight=0.7,
-        max_iter=1,
+        n_iter=1,
         random_state=11,
     )
 
@@ -271,7 +271,7 @@ def test_gate_sparsity_variants_are_accepted_and_described(
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
 
     fit = gamfit.sae_manifold_fit(
-        Z=_toy_matrix(),
+        X=_toy_matrix(),
         K=1,
         d_atom=1,
         atom_topology="circle",
@@ -282,7 +282,7 @@ def test_gate_sparsity_variants_are_accepted_and_described(
         gate_sparsity=gate_sparsity,
         scad_mcp_gamma=gamma,
         decoder_incoherence_weight=0.0,
-        max_iter=1,
+        n_iter=1,
     )
 
     items = _captured_penalties(fake)
@@ -297,7 +297,7 @@ def test_gate_sparsity_variants_are_accepted_and_described(
 @pytest.mark.parametrize(
     "assignment,expected_kind",
     [
-        ("ibp", "ibp_map"),
+        ("ibp_map", "ibp_map"),
         ("softmax", "softmax"),
         ("jumprelu", "jumprelu"),
     ],
@@ -308,7 +308,7 @@ def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_k
     x = _toy_matrix(n=10, p=3)
 
     fit = gamfit.sae_manifold_fit(
-        Z=x,
+        X=x,
         K=2,
         d_atom=1,
         atom_topology="circle",
@@ -316,7 +316,7 @@ def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_k
         isometry_weight=0.0,
         ard_per_atom=False,
         decoder_incoherence_weight=0.0,
-        max_iter=1,
+        n_iter=1,
         jumprelu_threshold=0.15,
     )
 
@@ -357,11 +357,11 @@ def test_assignment_kinds_run_through_facade(monkeypatch, assignment, expected_k
 def test_recent_penalty_knobs_validate_parameters_eagerly(kwargs, match):
     with pytest.raises(ValueError, match=match):
         gamfit.sae_manifold_fit(
-            Z=_toy_matrix(),
+            X=_toy_matrix(),
             K=2,
             d_atom=1,
             atom_topology="circle",
-            max_iter=1,
+            n_iter=1,
             **kwargs,
         )
 
@@ -377,7 +377,7 @@ def _multi_atom_surface_fit(x: np.ndarray, monkeypatch) -> gamfit.ManifoldSAE:
     fake = _CapturingRustModule()
     monkeypatch.setattr(sae, "rust_module", lambda: fake)
     return gamfit.sae_manifold_fit(
-        Z=x,
+        X=x,
         K=2,
         d_atom=1,
         atom_topology="circle",
@@ -387,7 +387,7 @@ def _multi_atom_surface_fit(x: np.ndarray, monkeypatch) -> gamfit.ManifoldSAE:
         sparsity_weight=0.01,
         smoothness_weight=0.01,
         decoder_incoherence_weight=0.0,
-        max_iter=20,
+        n_iter=20,
         learning_rate=1.0,
         random_state=0,
     )

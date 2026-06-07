@@ -26,7 +26,7 @@ def _fit(x: np.ndarray, weight: float, seed: int) -> gamfit.ManifoldSAE:
         K=2,
         d_atom=1,
         atom_topology="circle",
-        assignment="ibp",
+        assignment="ibp_map",
         decoder_incoherence_weight=weight,
         sparsity_weight=0.35,
         n_iter=18,

@@ -68,12 +68,12 @@ def test_sphere_atom_stable_at_poles():
     )
 
     fit = gamfit.sae_manifold_fit(
-        Z=z,
-        n_atoms=1,
+        X=z,
+        K=1,
         atom_basis="sphere",
-        atom_dim=2,
-        assignment_prior="ibp_map",
-        max_iter=30,
+        d_atom=2,
+        assignment="ibp_map",
+        n_iter=30,
         learning_rate=0.04,
         random_state=0,
     )

@@ -13,7 +13,7 @@ three on the public ``gamfit.sae_manifold_fit`` surface:
    ``a_init`` (assignment logits, ``(N, K)``) and ``t_init`` (coordinates,
    ``(K, N, D_max)``) and run a bounded ``n_iter`` refinement of those seeds, so
    training can do "encoder predicts -> solver refines a few steps -> distill."
-   ``Z`` is the data alias, NOT a warm start; the docstring says so and this
+   ``X`` is the data matrix, NOT a warm start; the docstring says so and this
    test pins that ``a_init``/``t_init`` are separate, shape-validated kwargs.
 
 3. **Standalone per-atom projection.** ``fit.project(x, atom_k)`` must map an
@@ -44,12 +44,12 @@ def _synth(n: int = 40, d: int = 6, k: int = 3, seed: int = 0) -> np.ndarray:
 
 def _fit(X: np.ndarray, k: int = 3):
     return gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=k,
-        atom_dim=1,
+        X=X,
+        K=k,
+        d_atom=1,
         atom_topology="circle",
         assignment="softmax",
-        max_iter=4,
+        n_iter=4,
         random_state=0,
     )
 
@@ -97,7 +97,7 @@ def test_standalone_per_atom_projection() -> None:
 
 def test_warm_start_accepted_and_refines() -> None:
     # Request 2: a_init / t_init warm-start a bounded refinement and are distinct
-    # from Z (the data). Seed from a prior fit's converged latents (the
+    # from X (the data). Seed from a prior fit's converged latents (the
     # encoder-predicts -> solver-refines loop), then refine for a few steps.
     X = _synth()
     teacher = _fit(X)
@@ -111,9 +111,9 @@ def test_warm_start_accepted_and_refines() -> None:
     assert t_init.shape == (k, n, 1)
 
     warm = gamfit.sae_manifold_fit(
-        Z=X,
-        n_atoms=k,
-        atom_dim=1,
+        X=X,
+        K=k,
+        d_atom=1,
         atom_topology="circle",
         assignment="softmax",
         n_iter=2,
@@ -134,13 +134,13 @@ def test_warm_start_shapes_are_validated() -> None:
     n, k = X.shape[0], 3
     with pytest.raises(ValueError):
         gamfit.sae_manifold_fit(
-            Z=X, n_atoms=k, atom_dim=1, atom_topology="circle",
+            X=X, K=k, d_atom=1, atom_topology="circle",
             assignment="softmax", n_iter=1, random_state=0,
             a_init=np.zeros((n, k + 1)),
         )
     with pytest.raises(ValueError):
         gamfit.sae_manifold_fit(
-            Z=X, n_atoms=k, atom_dim=1, atom_topology="circle",
+            X=X, K=k, d_atom=1, atom_topology="circle",
             assignment="softmax", n_iter=1, random_state=0,
             t_init=np.zeros((k, n + 1, 1)),
         )

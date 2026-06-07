@@ -15,15 +15,15 @@ import pytest
 gamfit = pytest.importorskip("gamfit")
 
 
-def _fit_circle(n=400, noise=0.18, seed=0, max_iter=40):
+def _fit_circle(n=400, noise=0.18, seed=0, n_iter=40):
     rng = np.random.default_rng(seed)
     t = rng.uniform(0.0, 1.0, n)
     clean = np.column_stack([np.cos(2 * np.pi * t), np.sin(2 * np.pi * t)])
     x = clean + noise * rng.standard_normal((n, 2))
     fit = gamfit.sae_manifold_fit(
-        Z=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
+        X=x, K=1, d_atom=1, atom_topology="circle", assignment="softmax",
         isometry_weight=0.0, ard_per_atom=False, sparsity_weight=0.01,
-        smoothness_weight=0.01, max_iter=max_iter, learning_rate=1.0, random_state=seed,
+        smoothness_weight=0.01, n_iter=max_iter, learning_rate=1.0, random_state=seed,
     )
     return fit, x
 

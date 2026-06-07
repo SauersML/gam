@@ -32,7 +32,7 @@ def _fit(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             fit = gamfit.sae_manifold_fit(
-                Z=z,
+                X=z,
                 K=2,
                 d_atom=2,
                 atom_topology="euclidean",
@@ -42,7 +42,7 @@ def _fit(z: np.ndarray, *, decoder_incoherence_weight: float, seed: int):
                 sparsity_weight=0.01,
                 smoothness_weight=0.01,
                 decoder_incoherence_weight=decoder_incoherence_weight,
-                max_iter=35,
+                n_iter=35,
                 learning_rate=1.0,
                 random_state=seed,
             )

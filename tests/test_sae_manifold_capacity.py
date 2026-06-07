@@ -52,12 +52,12 @@ def test_reml_evidence_picks_k1_on_one_harmonic_data():
     scores: dict[int, float] = {}
     for k in candidates:
         fit = gamfit.sae_manifold_fit(
-            Z=z,
-            n_atoms=k,
+            X=z,
+            K=k,
             atom_basis="periodic",
-            atom_dim=2,
-            assignment_prior="ibp_map",
-            max_iter=50,
+            d_atom=2,
+            assignment="ibp_map",
+            n_iter=50,
             learning_rate=0.04,
             random_state=0,
         )
