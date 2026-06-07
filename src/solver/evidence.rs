@@ -368,6 +368,137 @@ pub fn stacked_predictive_mean(
     Ok(out)
 }
 
+/// One fitted model in a REML/LAML evidence comparison.
+#[derive(Clone, Debug)]
+pub struct RemlCandidate {
+    pub index: usize,
+    pub name: String,
+    /// Minimised REML/LAML cost. Lower is better.
+    pub score: f64,
+    pub edf: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RemlComparison {
+    pub ranking: Vec<RankedRow>,
+    pub winner: String,
+    pub evidence_summary: String,
+    pub score_table: Vec<ScoreRow>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RankedRow {
+    pub name: String,
+    pub score: f64,
+    /// Cost gap from the winning model: `score - best_score`.
+    pub delta: f64,
+    pub bayes_factor: f64,
+    pub edf: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScoreRow {
+    pub name: String,
+    pub reml_score: f64,
+    pub delta_reml: f64,
+    pub bayes_factor_best_over_model: f64,
+    pub effective_dof: Option<f64>,
+}
+
+/// Log Bayes factor of model `a` over model `b` from minimised REML/LAML costs.
+#[inline]
+pub fn log_bayes_factor(reml_score_a: f64, reml_score_b: f64) -> f64 {
+    reml_score_b - reml_score_a
+}
+
+/// Compare fitted models by the single evidence ordering contract used by
+/// topology ranking and seed screening: lower finite cost wins, with stable
+/// original-order tie handling.
+pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlComparison, String> {
+    if candidates.is_empty() {
+        return Err("compare_models requires at least one fit".to_string());
+    }
+    candidates = rank_priority_candidates(
+        candidates
+            .into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let score = row.score;
+                PriorityCandidate::new(row, idx, score, 0)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|row| row.item)
+    .collect();
+
+    let best_score = candidates[0].score;
+    let winner = candidates[0].name.clone();
+    let mut ranking = Vec::with_capacity(candidates.len());
+    let mut score_table = Vec::with_capacity(candidates.len());
+    for row in &candidates {
+        let delta = log_bayes_factor(best_score, row.score);
+        let bayes_factor = delta.exp();
+        ranking.push(RankedRow {
+            name: row.name.clone(),
+            score: row.score,
+            delta,
+            bayes_factor,
+            edf: row.edf,
+        });
+        score_table.push(ScoreRow {
+            name: row.name.clone(),
+            reml_score: row.score,
+            delta_reml: delta,
+            bayes_factor_best_over_model: bayes_factor,
+            effective_dof: row.edf,
+        });
+    }
+    let evidence_summary = if let Some(runner_up) = candidates.get(1) {
+        format!(
+            "{} wins by Bayes factor {} over {}",
+            winner,
+            format_bayes_factor(log_bayes_factor(best_score, runner_up.score)),
+            runner_up.name
+        )
+    } else {
+        format!("{winner} (single fit; no comparison)")
+    };
+    Ok(RemlComparison {
+        ranking,
+        winner,
+        evidence_summary,
+        score_table,
+    })
+}
+
+pub fn format_bayes_factor(log_bf: f64) -> String {
+    if !log_bf.is_finite() {
+        return "inf".to_string();
+    }
+    if log_bf.abs() >= std::f64::consts::LN_10 * 3.0 {
+        return format!("1e{:+.1}", log_bf / std::f64::consts::LN_10);
+    }
+    format_three_significant(log_bf.exp())
+}
+
+pub fn format_three_significant(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_string();
+    }
+    if !value.is_finite() {
+        return format!("{value}");
+    }
+    let exponent = value.abs().log10().floor() as i32;
+    if exponent >= 3 {
+        return format!("{value:.2e}");
+    }
+    let decimals = (2 - exponent).max(0) as usize;
+    let scale = 10f64.powi(decimals as i32);
+    let rounded = (value * scale).abs().round() / scale * value.signum();
+    format!("{rounded:.decimals$}")
+}
+
 impl Default for TopologySelectOptions {
     fn default() -> Self {
         Self {

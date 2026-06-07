@@ -11,7 +11,7 @@ Root cause: ``reml_score`` is a minimised cost (lower = better marginal
 likelihood). The Python FFI computed ``self.reml_score - other.reml_score``,
 which is negative when ``self`` is the better (lower-cost) model, so its
 exponential fell below 1. The comparator's convention is the opposite
-subtraction. Both now route through ``reml_compare::log_bayes_factor``.
+subtraction. Both now route through ``evidence::log_bayes_factor``.
 
 This test anchors that ``s(x)`` is the better fit, then asserts the Bayes
 factor direction and that ``bayes_factor_vs`` agrees with ``compare_models``.

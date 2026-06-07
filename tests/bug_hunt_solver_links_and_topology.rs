@@ -117,7 +117,7 @@ fn inverse_link_jet_for_family_uses_parameterized_state_for_mixture_and_sas_link
 #[test]
 fn topology_selector_picks_lowest_cost_and_returns_fit_metadata() {
     // `tk_score` is a minimised REML / TK cost (lower is better; see issue
-    // #396 and `solver::reml_compare`). Circle (raw_reml 10) must beat Sphere
+    // #396 and `solver::evidence`). Circle (raw_reml 10) must beat Sphere
     // (raw_reml 20). The pre-fix descending sort returned the worst topology.
     let selector = TopologyAutoSelector::new(Some(vec![
         AutoTopologyKind::Circle,

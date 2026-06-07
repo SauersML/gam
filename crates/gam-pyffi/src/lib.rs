@@ -74,7 +74,7 @@ use gam::smooth::{
     freeze_term_collection_from_design,
 };
 use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
-use gam::solver::reml_compare::{
+use gam::solver::evidence::{
     RemlCandidate, compare_reml_fits as compare_reml_fits_core, log_bayes_factor,
 };
 use gam::survival_marginal_slope::SurvivalMarginalSlopeFitResult;
@@ -5196,7 +5196,7 @@ fn compare_reml_fits(
     // fit (which may be a saved-summary dict, a Model object, or any
     // object exposing .evidence). Then the ranking, delta, Bayes-factor,
     // and evidence-summary logic is delegated to the pure-Rust core in
-    // `gam::solver::reml_compare`, which is identically callable from
+    // `gam::solver::evidence`, which is identically callable from
     // the CLI binary.
     let mut candidates = Vec::with_capacity(fits.len());
     for (index, (name, fit)) in labels.into_iter().zip(fits.iter()).enumerate() {
