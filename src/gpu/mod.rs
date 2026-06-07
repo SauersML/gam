@@ -76,9 +76,9 @@ pub enum GpuPolicy {
 impl GpuPolicy {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" | "" => Some(Self::Auto),
-            "off" | "false" | "0" | "cpu" => Some(Self::Off),
-            "force" | "on" | "true" | "1" | "gpu" => Some(Self::Force),
+            "auto" => Some(Self::Auto),
+            "off" => Some(Self::Off),
+            "force" => Some(Self::Force),
             _ => None,
         }
     }
@@ -374,10 +374,12 @@ mod policy_tests {
     use super::*;
 
     #[test]
-    fn parses_user_gpu_policy_aliases() {
+    fn parses_canonical_user_gpu_policy_values() {
         assert_eq!(GpuPolicy::parse("auto"), Some(GpuPolicy::Auto));
-        assert_eq!(GpuPolicy::parse("cpu"), Some(GpuPolicy::Off));
+        assert_eq!(GpuPolicy::parse("off"), Some(GpuPolicy::Off));
         assert_eq!(GpuPolicy::parse("force"), Some(GpuPolicy::Force));
+        assert_eq!(GpuPolicy::parse("cpu"), None);
+        assert_eq!(GpuPolicy::parse(""), None);
         assert_eq!(GpuPolicy::parse("wat"), None);
     }
 
