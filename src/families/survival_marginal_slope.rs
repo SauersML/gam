@@ -21383,7 +21383,32 @@ pub fn fit_survival_marginal_slope_terms(
                     let w_time = map.compiled_block_ranges[0].len();
                     let w_marg = map.compiled_block_ranges[1].len();
                     let w_log = map.compiled_block_ranges[2].len();
-                    Ok(Some((map, (w_time, w_marg, w_log))))
+                    // #808 DISABLED: do NOT apply the rawstack reduction. It is a
+                    // REGRESSION on this path — on clustered-PC designs marginal
+                    // and logslope share the matern basis, so this [Time, Marginal,
+                    // Logslope] cross-block carry zeroes the entire logslope block
+                    // (logslope {p_log}→{w_log}=0), which deletes the log-slope
+                    // channel the marginal-slope model exists to estimate and makes
+                    // the inner solve DIVERGE (objective → −∞, NaN residual). The
+                    // raw-column marginal↔logslope collinearity is NOT a true model
+                    // unidentifiability (the full η-Jacobian is rank-complete:
+                    // marginal enters η via q1·c(g), logslope via the slope channel
+                    // — distinguishable; the η₁-Jacobian probe measured rank
+                    // 26/26). The inner stall is a CONDITIONING problem (H_pen =
+                    // JᵀWJ + S is full-rank but ill-conditioned, cond≈5.8e6 /
+                    // near-null at the g≈0 pilot), to be fixed by an inner Jeffreys/
+                    // ridge conditioning of the near-null direction (the same cure
+                    // as the bernoulli #787 inner), NOT by a rank reduction. Until
+                    // that lands, fall through to the unreduced design (the benign
+                    // time-block stall) — never apply this block-killing reduction.
+                    // The compile + DIAG above are kept for observability of what
+                    // the (disabled) reduction WOULD do.
+                    log::info!(
+                        "[smgs phase-4b compiled-map] rawstack reduction DISABLED (#808 regression): \
+                         would have applied time {p_time}→{w_time}, marginal {p_marg}→{w_marg}, \
+                         logslope {p_log}→{w_log}; falling through to the unreduced design instead",
+                    );
+                    Ok(None)
                 })();
                     match closed_form {
                         Ok(Some((map, (wt, wm, wl)))) => {
