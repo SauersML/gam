@@ -7721,6 +7721,39 @@ impl<'a> RemlState<'a> {
             );
             return Ok(eval.cost);
         }
+        // Cost-order short-circuit (#778). The configured/soft ρ-prior cost is
+        // the *cheapest* additive term in the objective — `O(K)`, a function of
+        // ρ alone, with no dependence on the inner P-IRLS solve. The unified
+        // evaluator forms the final cost as
+        //   V(ρ) = data_term(ρ) + prior_cost(ρ) + barrier_cost(β̂),
+        // where `data_term` (the inner solve + the `O(K³)` penalty/Hessian
+        // log-determinants) is the dominant cost and is always finite for a
+        // feasible inner solve, while `prior_cost` saturates to `+∞` whenever ρ
+        // leaves the prior's support (Saturate policy, see
+        // `evaluate_configured_rho_prior`). When the cheap prior term is already
+        // non-finite the sum is `+∞` regardless of the data term, so the outer
+        // optimizer will reject this step — evaluate it first and return `+∞`
+        // without paying for the inner P-IRLS solve or the log-determinant
+        // assembly. This is exact, not an approximation: it reproduces the value
+        // the full path would return (`build_prior` adds the identical
+        // `compute_soft_priorcost(ρ) + compute_configured_rho_prior_cost(ρ)`).
+        let prior_cost =
+            self.compute_soft_priorcost(p) + self.compute_configured_rho_prior_cost(p);
+        if !prior_cost.is_finite() {
+            log::debug!(
+                "[REML] eval#{} prior short-circuit | prior_cost {:.6e} | rejecting step \
+                 without inner solve | elapsed {:.1}ms",
+                cost_call_idx,
+                prior_cost,
+                t_eval_start.elapsed().as_secs_f64() * 1000.0
+            );
+            // Out-of-support ρ saturates the prior to `+∞` (never `−∞`/`NaN`,
+            // since the soft prior is finite and non-negative and the configured
+            // prior's Saturate policy folds to `+∞`); return the `+∞` retreat
+            // signal explicitly to match the `obtain_eval_bundle` failure paths
+            // below that also return `f64::INFINITY` on an infeasible step.
+            return Ok(f64::INFINITY);
+        }
         let t_pirls = std::time::Instant::now();
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
