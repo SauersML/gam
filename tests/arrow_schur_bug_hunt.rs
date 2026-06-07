@@ -1,7 +1,4 @@
 use gam::solver::arrow_schur::{ArrowSchurError, ArrowSchurSystem, ArrowSolveOptions};
-use gam::solver::arrow_schur_convergence_check::{
-    ArrowSchurConvergenceCheckOptions, check_arrow_schur_fit_start,
-};
 use ndarray::{Array1, Array2, array};
 
 fn solve_linear(mut a: Array2<f64>, mut b: Array1<f64>) -> Array1<f64> {
@@ -116,20 +113,6 @@ fn block_solve_recovers_joint_system_solution_within_tolerance() {
 }
 
 #[test]
-fn convergence_check_rejects_indefinite_row_block_via_inertia_requirement() {
-    let mut sys = ArrowSchurSystem::new(1, 1, 1);
-    sys.rows[0].htt = array![[-1.0]];
-    sys.rows[0].htbeta = array![[0.0]];
-    sys.hbb = array![[2.0]];
-    let opts = ArrowSchurConvergenceCheckOptions::default();
-    let report = check_arrow_schur_fit_start(&sys, None, None, &opts);
-    assert!(
-        report.has_failures(),
-        "convergence acceptance must fail when a row Hessian has negative inertia"
-    );
-}
-
-#[test]
 fn per_row_arrow_structure_matches_dense_block_solve_for_vector_response_shape() {
     let mut sys = ArrowSchurSystem::new(3, 1, 1);
     sys.rows[0].htt = array![[2.0]];
@@ -164,23 +147,6 @@ fn per_row_arrow_structure_matches_dense_block_solve_for_vector_response_shape()
             && (dt[2] - x[2]).abs() < 1e-9
             && (db[0] - x[3]).abs() < 1e-9,
         "per-row arrow solve should match dense vector-response block solve to 1e-9"
-    );
-}
-
-#[test]
-fn ridge_stabilization_inside_arrow_keeps_shifted_schur_spd() {
-    let mut sys = ArrowSchurSystem::new(1, 1, 1);
-    sys.rows[0].htt = array![[1e-8]];
-    sys.rows[0].htbeta = array![[1.0]];
-    sys.hbb = array![[3.0]];
-    let opts = ArrowSchurConvergenceCheckOptions {
-        proximal_ridge_floor: 1.0,
-        ..Default::default()
-    };
-    let report = check_arrow_schur_fit_start(&sys, None, None, &opts);
-    assert!(
-        !report.has_failures(),
-        "with sufficient ridge on the (1,1) block, shifted Schur complement should remain SPD"
     );
 }
 
