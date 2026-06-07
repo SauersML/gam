@@ -1902,7 +1902,11 @@ impl WorkingModelSurvival {
             // need deriv strictly above the numerical guard because their
             // NLL contains `deriv.ln()` and `1.0 / deriv`; censored rows do
             // not, so a boundary value of exactly zero is feasible there.
-            let mono_floor = if d > 0.0 { derivative_guard_numerical } else { 0.0 };
+            let mono_floor = if d > 0.0 {
+                derivative_guard_numerical
+            } else {
+                0.0
+            };
             if !deriv.is_finite() || deriv < mono_floor {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "survival monotonicity violated at row {}: d_eta/dt={:.3e} <= tolerance={:.3e}",
@@ -2243,7 +2247,11 @@ impl WorkingModelSurvival {
             let deriv = self
                 .stabilized_structural_derivative(deriv_raw)
                 .unwrap_or(deriv_raw);
-            let mono_floor = if d > 0.0 { derivative_guard_numerical } else { 0.0 };
+            let mono_floor = if d > 0.0 {
+                derivative_guard_numerical
+            } else {
+                0.0
+            };
             if !deriv.is_finite() || deriv < mono_floor {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "offset_channel_residuals: derivative ≤ numerical guard at row {i}: {deriv:.3e}"

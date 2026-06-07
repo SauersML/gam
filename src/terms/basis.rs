@@ -31450,14 +31450,17 @@ mod tests {
         // overall scale, so the cheaper integer-difference path is selected.
         let degree = 3usize;
         let n_basis = 8usize;
-        let knots: Array1<f64> =
-            Array1::from_iter((0..(n_basis + degree + 1)).map(|i| i as f64));
+        let knots: Array1<f64> = Array1::from_iter((0..(n_basis + degree + 1)).map(|i| i as f64));
         let g = compute_greville_abscissae(&knots, degree).unwrap();
         assert!(
             is_uniformly_spaced_sequence(g.view()),
             "evenly spaced knot vector should yield uniform Greville abscissae: {g:?}"
         );
-        assert!(penalty_greville_abscissae_for_knots(&knots, degree).unwrap().is_none());
+        assert!(
+            penalty_greville_abscissae_for_knots(&knots, degree)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
