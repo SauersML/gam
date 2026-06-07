@@ -2907,25 +2907,26 @@ fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx:
     // "standardize the geometry, then learn the smoothness." Only an explicit
     // kernel length scale κ (the Matérn / hybrid path) is optimized here.
     //
-    // ISOTROPIC Matérn (#519): the *default* `matern(x1, x2)` is isotropic
-    // (`scale_dims=false` → `aniso_log_scales = None`), so the only candidate
-    // hyper axis is the scalar κ. That single-axis "isotropic analytic"
-    // κ-search runs into the boundary valley described in #519 and diverges
-    // (final_grad_norm ~ 3e2 after 80 iters) on perfectly ordinary 2-D data.
-    // The kernel scale is already seeded from data geometry
-    // (`default_matern_length_scale`, intersected with the safe κ window), and
-    // for an isotropic kernel REML can recover all the needed smoothness
-    // through the penalty weight ρ alone. So we anchor κ at the data-derived
-    // seed and contribute NO κ axis: REML optimizes only ρ, which converges.
+    // ISOTROPIC Matérn: the *default* `matern(x1, x2)` is isotropic
+    // (`scale_dims=false` → `aniso_log_scales = None`). It contributes exactly
+    // ONE κ optimization axis — its scalar log-κ. The shared GAMLSS /
+    // location-scale exact-joint ψ engine and the spatial-κ joint outer solver
+    // both require an isotropic Matérn block to expose this single isotropic κ
+    // axis (#822/#851); without it the per-block ψ-derivative lists are empty
+    // and the joint-ψ hooks degenerate to `None`. The isotropic κ is the lone
+    // kernel hyper axis here, mirroring the per-axis ψ ARD that the anisotropic
+    // path exposes (just collapsed to one dimension).
     //
     // ANISOTROPIC Matérn (`scale_dims=true` → `aniso_log_scales = Some`) keeps
     // its per-axis kernel-η ARD: the d-dimensional ψ search is the *point* of
-    // the anisotropic request ("Matérn keeps its kernel-η ARD"), and it has
-    // more than the single brittle scalar axis to move along, so it is healthy.
+    // the anisotropic request ("Matérn keeps its kernel-η ARD").
+    //
+    // Either way a Matérn term always enrolls a κ/ψ axis (1 isotropic, or d
+    // anisotropic), so `spatial_dims_per_term` reports the correct count.
     if let Some(term) = spec.smooth_terms.get(term_idx)
-        && let SmoothBasisSpec::Matern { spec: matern, .. } = &term.basis
+        && let SmoothBasisSpec::Matern { .. } = &term.basis
     {
-        return matern.aniso_log_scales.is_some();
+        return true;
     }
     get_spatial_length_scale(spec, term_idx).is_some()
 }
@@ -6635,6 +6636,14 @@ fn build_single_local_smooth_term(
                 // Sum-to-zero side constraints conflict with monotonic/convex cones.
                 spec_local.identifiability = BSplineIdentifiability::None;
             }
+            // Boundary conditions are emitted by the smooth-level paired
+            // linear-constraint path (`bspline_boundary_linear_constraints`),
+            // which supports non-zero anchors and composes them with the frozen
+            // identifiability transform. Clear them here so the basis builder
+            // does not also bake them into the basis null space — the legacy
+            // basis-level path rejected non-zero anchors and dropped columns
+            // before the frozen transform, conflicting with the constraint path.
+            spec_local.boundary_conditions = BSplineBoundaryConditions::default();
             build_bspline_basis_1d(data.column(*feature_col), &spec_local)?
         }
         SmoothBasisSpec::ThinPlate {
@@ -9966,9 +9975,11 @@ fn extract_spatial_operator_runtime_caches(
         let mut mass_local_idx = None;
         let mut tension_local_idx = None;
         let mut stiffness_local_idx = None;
+        let mut primary_local_idx = None;
         let mut mass_norm = None;
         let mut tension_norm = None;
         let mut stiffness_norm = None;
+        let mut primary_norm = None;
         for info in &term_fit.penaltyinfo_local {
             if !info.active {
                 continue;
@@ -9986,10 +9997,26 @@ fn extract_spatial_operator_runtime_caches(
                     stiffness_local_idx = Some(active_local_idx);
                     stiffness_norm = Some(info.normalization_scale);
                 }
+                PenaltySource::Primary => {
+                    primary_local_idx = Some(active_local_idx);
+                    primary_norm = Some(info.normalization_scale);
+                }
                 _ => {}
             }
             active_local_idx += 1;
         }
+        // The curvature channel maps onto the explicit D2 Stiffness operator when
+        // the term ships one (Matérn collocation / Duchon `all_active()`); for the
+        // *default* Duchon penalty Stiffness is deliberately disabled because the
+        // always-on Primary RKHS Gram is the exact curvature (#858). In that
+        // {mass, tension, Primary} layout the Primary penalty is the curvature
+        // channel: the adaptive Charbonnier surrogate (built from the D2
+        // collocation operator below) reweights and replaces it, so the curvature
+        // global index / normalization come from Primary.
+        let (curvature_local_idx, curvature_norm) = match (stiffness_local_idx, stiffness_norm) {
+            (Some(idx), Some(norm)) => (Some(idx), Some(norm)),
+            _ => (primary_local_idx, primary_norm),
+        };
         let (
             Some(mass_local),
             Some(tension_local),
@@ -10000,10 +10027,10 @@ fn extract_spatial_operator_runtime_caches(
         ) = (
             mass_local_idx,
             tension_local_idx,
-            stiffness_local_idx,
+            curvature_local_idx,
             mass_norm,
             tension_norm,
-            stiffness_norm,
+            curvature_norm,
         )
         else {
             continue;
@@ -24299,6 +24326,13 @@ mod tests {
         let x = Array1::linspace(0.0, 1.0, n);
         let mut data = Array2::<f64>::zeros((n, 1));
         data.column_mut(0).assign(&x);
+        // `BSplineIdentifiability::None` keeps the smooth block sparse through
+        // `build_bspline_basis_1d`. The default `WeightedSumToZero` policy is
+        // deliberately densified by `apply_sum_to_zero_constraint_sparse`
+        // (orthonormal Z, so ZZᵀ is a true projector — `B·Z` is mathematically
+        // dense), which would prevent the assembled design from landing in
+        // `DesignMatrix::Sparse`; the sparse-design pin only holds on the None
+        // branch (see `test_build_bspline_basis_1d_default_identifiability_densifies_via_orthonormal_centering`).
         let spec = TermCollectionSpec {
             linear_terms: vec![],
             random_effect_terms: vec![],
@@ -24314,7 +24348,7 @@ mod tests {
                             num_internal_knots: 32,
                         },
                         double_penalty: false,
-                        identifiability: BSplineIdentifiability::default(),
+                        identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     },
