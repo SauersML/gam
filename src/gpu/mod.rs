@@ -32,7 +32,7 @@ pub mod profile;
 pub mod reml_trace;
 pub mod row_hessian_ops;
 pub mod runtime;
-pub mod sigma_cubature;
+pub(crate) mod sigma_cubature;
 pub mod solver;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
