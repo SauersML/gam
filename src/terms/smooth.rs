@@ -13392,6 +13392,12 @@ fn fit_bounded_term_collection_with_design(
             inner_tol: options.tol,
             outer_max_iter: options.max_iter,
             outer_tol: options.tol,
+            // When the caller requested inference, ask the custom-family solve
+            // for the latent-scale conditional covariance so the bounded path
+            // can delta-method it back to the user scale below. Without this
+            // the solve returns `covariance_conditional = None` and
+            // `beta_covariance()` reports `None` despite inference being on.
+            compute_covariance: options.compute_inference,
             ..BlockwiseFitOptions::default()
         },
     )

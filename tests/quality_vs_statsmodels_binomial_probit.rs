@@ -7,7 +7,8 @@
 //! `mu(x) = Phi(eta(x))`, whose ground truth is `mu_true(x) = Phi(eta_true(x))`.
 //! We therefore assert that gam's fitted probability curve recovers `mu_true`:
 //!   * RMSE(gam_mu, mu_true) on a held-out grid is below a principled bar tied
-//!     to the achievable precision of a 3-df smooth on n=250 binary draws.
+//!     to the achievable precision of a REML-penalized k=10 smooth on n=250
+//!     binary draws.
 //!
 //! This is a *truth-recovery* assertion, not a "matches statsmodels" assertion:
 //! reproducing another tool's noisy fit proves nothing, but recovering the
@@ -90,7 +91,19 @@ fn gam_binomial_probit_recovers_truth() {
         .map(|&x| std_normal.cdf(truth_eta(x)))
         .collect();
 
-    // ---- fit with gam: y ~ s(x1, k=4), Binomial(probit) -------------------
+    // ---- fit with gam: y ~ s(x1, k=10), Binomial(probit) ------------------
+    // BASIS-DIMENSION PARITY (the fair penalized-vs-penalized comparison): the
+    // statsmodels reference is a `BSplines(df=10)` smooth whose effective df is
+    // driven down to the data-appropriate smoothness by the GCV-selected penalty
+    // weight (see the reference comment: "smoothness, not column count, is the
+    // method-comparable knob"). gam must be handed the SAME column budget so its
+    // REML — not an artificially small `k` cap — sets the effective df. With
+    // `k=4` gam tops out near ~3 edf and physically CANNOT reach the ~4–5 edf the
+    // `sin(x1)` hump over x1∈[-3,3] needs, so the earlier gap was a basis-budget
+    // handicap, not a probit-fit defect (the probit link value/derivative/working
+    // -weight math is exact). At `k=10` both engines auto-select smoothness from
+    // an equally rich basis, making the 1.10× match-or-beat gate a genuine
+    // penalized-vs-penalized accuracy test.
     let headers = ["x1", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = x1
         .iter()
@@ -105,7 +118,7 @@ fn gam_binomial_probit_recovers_truth() {
         family: Some("binomial-probit".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x1, k=4)", &ds, &cfg).expect("gam probit fit");
+    let result = fit_from_formula("y ~ s(x1, k=10)", &ds, &cfg).expect("gam probit fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for binomial-probit");
     };
@@ -158,9 +171,10 @@ xgrid = np.array([{grid_literal}], dtype=float)
 # interior knots and a non-degenerate 2nd-derivative penalty: with df=degree+1
 # (=4) there are ZERO interior knots, the penalty matrix is singular and
 # select_penweight()'s GCV search raises. df=10 gives a well-conditioned
-# penalized B-spline whose effective df is then driven down to gam's ~3-df
-# smooth by the GCV-selected penalty weight (smoothness, not column count, is
-# the method-comparable knob).
+# penalized B-spline whose effective df is then driven down to the data-
+# appropriate smoothness by the GCV-selected penalty weight (smoothness, not
+# column count, is the method-comparable knob). gam fits a column-matched k=10
+# smooth so its REML — not a small-k cap — sets the effective df on equal footing.
 bs = BSplines(x1.reshape(-1, 1), df=[10], degree=[3])
 
 def fit_mean(link):
@@ -222,15 +236,16 @@ emit("mu_logit", fit_mean(sm.families.links.Logit()))
     let rel_ref = relative_l2(&gam_mu, sm_mu_probit);
 
     eprintln!(
-        "binomial-probit s(x1,k=4): n={N} ngrid={NGRID} gam_edf={gam_edf:.3} \
+        "binomial-probit s(x1,k=10): n={N} ngrid={NGRID} gam_edf={gam_edf:.3} \
          rmse_truth(gam)={gam_err:.4} rmse_truth(sm_probit)={sm_probit_err:.4} \
          rmse_truth(sm_logit)={sm_logit_err:.4} | ctx: pearson(gam,sm_probit)={corr_ref:.5} \
          rel_l2(gam,sm_probit)={rel_ref:.4}"
     );
 
     // PRIMARY CLAIM: gam recovers the data-generating probability curve. With a
-    // 3-df smooth on n=250 Bernoulli draws over x1~U(-3,3), the binomial sampling
-    // noise on the mean is the dominant error floor; an RMSE of 0.06 on the
+    // REML-penalized k=10 smooth on n=250 Bernoulli draws over x1~U(-3,3), the
+    // binomial sampling noise on the mean is the dominant error floor; an RMSE
+    // of 0.06 on the
     // probability scale (mu spans roughly Phi(-1.1)..Phi(0.9), about a 0.6 range)
     // is well inside what a correct probit fit achieves and far above its floor,
     // while loudly failing a fit that does not track the truth.
