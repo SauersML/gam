@@ -1287,12 +1287,12 @@ impl SavedCompiledFlexBlock {
                     .to_string(),
             });
         }
-        if self.kernel != crate::families::bms::exact_kernel::ANCHORED_DEVIATION_KERNEL {
+        if self.kernel != crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL {
             return Err(FittedModelError::IncompatibleConfig {
                 reason: format!(
                     "saved anchored deviation runtime uses unsupported kernel '{}'; expected {}",
                     self.kernel,
-                    crate::families::bms::exact_kernel::ANCHORED_DEVIATION_KERNEL
+                    crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL
                 ),
             });
         }
@@ -1565,7 +1565,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1583,7 +1583,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1596,7 +1596,7 @@ impl SavedCompiledFlexBlock {
         }
         let left = points[span_idx];
         let right = points[span_idx + 1];
-        Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+        Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
             left,
             right,
             c0: self.span_c0[span_idx]
@@ -1626,7 +1626,7 @@ impl SavedCompiledFlexBlock {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1643,7 +1643,7 @@ impl SavedCompiledFlexBlock {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1654,7 +1654,7 @@ impl SavedCompiledFlexBlock {
                 ),
             });
         }
-        Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+        Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
             left: points[span_idx],
             right: points[span_idx + 1],
             c0: self.span_c0[span_idx][basis_idx],
@@ -1668,7 +1668,7 @@ impl SavedCompiledFlexBlock {
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1680,7 +1680,7 @@ impl SavedCompiledFlexBlock {
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
                 c0: self.span_c0[0][basis_idx],
@@ -1690,7 +1690,7 @@ impl SavedCompiledFlexBlock {
             });
         }
         if value > right_ep {
-            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
                 left: right_ep,
                 right: right_ep + 1.0,
                 c0: self.right_boundary_basis_value(basis_idx),
@@ -1707,7 +1707,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1720,7 +1720,7 @@ impl SavedCompiledFlexBlock {
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
                 c0: self.span_c0[0]
@@ -1734,7 +1734,7 @@ impl SavedCompiledFlexBlock {
             });
         }
         if value > right_ep {
-            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
                 left: right_ep,
                 right: right_ep + 1.0,
                 c0: (0..self.basis_dim)
@@ -3945,7 +3945,7 @@ pub fn load_survival_time_basis_config_from_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::bms::exact_kernel::ANCHORED_DEVIATION_KERNEL;
+    use crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
     use crate::families::lognormal_kernel::FrailtySpec;
     use crate::pirls::PirlsStatus;
     use crate::solver::estimate::{FitArtifacts, FittedBlock, FittedLinkState};

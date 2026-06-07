@@ -177,16 +177,6 @@ impl PsiSlice {
     }
 }
 
-fn stable_softplus(x: f64) -> f64 {
-    if x > 30.0 {
-        x
-    } else if x < -30.0 {
-        x.exp()
-    } else {
-        (1.0 + x.exp()).ln()
-    }
-}
-
 /// Resolve a learnable penalty strength `base_weight · exp(rho)` without ever
 /// overflowing to `inf` or (for a nonzero base weight) underflowing to exact
 /// `0.0`.
@@ -5983,7 +5973,7 @@ impl ParametricRowPrecisionPriorPenalty {
                     "ParametricRowPrecisionPriorPenalty::new raw_beta[{k}] must be finite"
                 ));
             }
-            let beta_k = stable_softplus(raw_beta_k);
+            let beta_k = crate::linalg::utils::stable_softplus(raw_beta_k);
             if !(beta_k.is_finite() && beta_k >= 0.0) {
                 return Err(format!(
                     "ParametricRowPrecisionPriorPenalty::new softplus(raw_beta[{k}]) must be finite and >= 0"
@@ -6079,7 +6069,7 @@ impl ParametricRowPrecisionPriorPenalty {
 
     fn lambda_at(&self, n: usize, k: usize, rho: ArrayView1<'_, f64>) -> f64 {
         let alpha = stable_exp_log_precision(self.active_log_alpha(k, rho));
-        let beta = stable_softplus(self.active_raw_beta(k, rho));
+        let beta = crate::linalg::utils::stable_softplus(self.active_raw_beta(k, rho));
         MIN_CONDITIONAL_PRECISION + alpha + beta * self.dist2(n, k, rho)
     }
 
@@ -6223,7 +6213,7 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
             let log_alpha = self.active_log_alpha(k, rho);
             let alpha = stable_exp_log_precision(log_alpha);
             let raw_beta = self.active_raw_beta(k, rho);
-            let beta = stable_softplus(raw_beta);
+            let beta = crate::linalg::utils::stable_softplus(raw_beta);
             let beta_jac = crate::linalg::utils::stable_logistic(raw_beta);
             let mut grad_alpha_direct = 0.0;
             let mut grad_beta_direct = 0.0;

@@ -1114,8 +1114,11 @@ fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
     args.survival_likelihood = "marginal-slope".to_string();
     args.firth = true;
 
-    validate_fit_args_preflight(&args, &parsed)
-        .expect("--firth is redundant, not rejected, for marginal-slope");
+    let result = validate_fit_args_preflight(&args, &parsed);
+    assert!(
+        result.is_ok(),
+        "--firth is redundant, not rejected, for marginal-slope: {result:?}"
+    );
 }
 
 #[test]

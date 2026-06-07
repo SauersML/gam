@@ -4,7 +4,6 @@ pub mod arrow_schur_beta_graph;
 pub mod arrow_schur_convergence_check;
 pub mod estimate;
 pub mod evidence;
-pub mod family_jacobian;
 pub mod gaussian_reml;
 pub mod gpu;
 pub mod identifiability_audit;
