@@ -120,8 +120,8 @@ class SparsityConfig:
         if isinstance(sched, str):
             kind, start, end = cls._parse_tau_schedule(sched)
             data["tau_schedule"] = kind
-            data.setdefault("tau_start", start)
-            data.setdefault("tau_min", end)
+            data["tau_start"] = start
+            data["tau_min"] = end
         elif sched is not None:
             data["tau_schedule"] = str(sched)
         return cls(**data)

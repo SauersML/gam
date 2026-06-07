@@ -302,23 +302,13 @@ class GumbelTemperatureSchedule:
     def __init__(
         self,
         tau_start: float,
-        tau_min: float | None = None,
+        tau_min: float,
         decay: str = "geometric",
         rate: float | None = None,
         steps: int | None = None,
         iter_count: int = 0,
-        *,
-        tau_end: float | None = None,
     ) -> None:
-        if tau_min is None:
-            if tau_end is None:
-                raise TypeError("GumbelTemperatureSchedule requires tau_min or tau_end")
-            tau_min = tau_end
-        if tau_end is not None and float(tau_end) != float(tau_min):
-            raise ValueError("GumbelTemperatureSchedule tau_min and tau_end disagree")
         name = str(decay).lower().replace("-", "_")
-        if name == "exponential":
-            name = "geometric"
         validate_gumbel_schedule_fields(
             tau_start=float(tau_start),
             tau_min=float(tau_min),
