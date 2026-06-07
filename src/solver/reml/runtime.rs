@@ -135,6 +135,23 @@ const ALO_DENOM_INSTABILITY_THRESHOLD: f64 = 0.20;
 // rule-of-thumb cut (well above the 2p/n and 3p/n flags); only points past it
 // can trip the stabilizer.
 const ALO_MAX_LEVERAGE_THRESHOLD: f64 = 0.80;
+// Parametric-rank gate (#862). When a high-leverage row's leverage is already
+// accounted for by the UNPENALIZED (parametric + penalty-null) block of the
+// design — i.e. that block alone near-interpolates the row — the high leverage
+// is an artifact of adding plain linear/parametric nuisance columns on small n,
+// not a concentrated outlier on the penalized smooth. No finite λ on the
+// penalized terms can pull such a row's hat diagonal down (the unpenalized block
+// is fit exactly), so the barrier just grinds the outer-REML surface. If at
+// least this fraction of the high-leverage rows are explained by the unpenalized
+// block, the augmentation is suppressed. 0.80 of the row's total leverage being
+// unpenalized is a strong "the parametric block owns this row" signal; a clean
+// s(x)+outlier fit keeps the outlier's leverage in the PENALIZED range, well
+// below this, so it stays fully stabilized.
+const ALO_UNPENALIZED_LEVERAGE_FRACTION: f64 = 0.80;
+// Fraction of the high-leverage rows that must be unpenalized-explained before
+// the parametric-rank gate suppresses. A majority keeps a single incidental
+// alignment from gating off a genuine concentrated-outlier fit.
+const ALO_UNPENALIZED_ROWS_FRACTION: f64 = 0.50;
 // Weight on the smooth leverage barrier 0.5·τ·Σ(h - 0.80)₊². τ = 0.5 keeps the
 // barrier a soft nudge that grows quadratically past the threshold rather than
 // a hard wall, so the augmented objective stays smooth and differentiable.

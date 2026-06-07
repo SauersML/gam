@@ -346,23 +346,10 @@ impl WarmStartStore {
             mode: LookupMode::Latest,
         });
         let dir = self.key_dir(key);
-        fs::create_dir_all(&dir)?;
         let pid = std::process::id();
-        let nonce = nanos_now();
-        let bin_tmp = dir.join(format!("{run_id}.bin.tmp.{pid}.{nonce}"));
-        let meta_tmp = dir.join(format!("{run_id}.json.tmp.{pid}.{nonce}"));
-        let bin_final = dir.join(format!("{run_id}.bin"));
-        let meta_final = dir.join(format!("{run_id}.json"));
-
-        // 1. Write payload bytes.
-        {
-            let mut f = create_file_in_dir(&dir, &bin_tmp)?;
-            f.write_all(payload)?;
-            f.sync_all().ok();
-        }
-        // 2. Compute checksum from payload.
+        // 1. Compute checksum from payload.
         let checksum = checksum_hex(payload);
-        // 3. Write meta JSON. Sanitize NaN/Inf objectives — `serde_json`
+        // 2. Build meta JSON. Sanitize NaN/Inf objectives — `serde_json`
         // hard-errors on non-finite f64 by default, which would abort the
         // entire checkpoint write and lose warm-start progress. A
         // non-finite objective is no better than "unknown" for ranking
@@ -379,26 +366,57 @@ impl WarmStartStore {
             checksum_hex: checksum,
             payload_bytes: payload.len() as u64,
         };
-        {
-            let json = serde_json::to_vec_pretty(&meta)?;
-            let mut f = create_file_in_dir(&dir, &meta_tmp)?;
-            f.write_all(&json)?;
-            f.sync_all().ok();
-        }
-        // 4. Atomic renames. .bin first so a meta-pointing-to-missing-bin
-        // window is impossible on the happy path. A reader that catches
-        // .bin-missing treats the entry as corrupt and cleans it up.
-        let bin_rename = rename_in_dir(&dir, &bin_tmp, &bin_final);
-        if let Err(e) = bin_rename {
-            fs::remove_file(&bin_tmp).ok();
-            fs::remove_file(&meta_tmp).ok();
-            return Err(StoreError::Io(e));
-        }
-        if let Err(e) = rename_in_dir(&dir, &meta_tmp, &meta_final) {
-            // Roll back the bin we just promoted to avoid orphaning it.
-            fs::remove_file(&bin_final).ok();
-            fs::remove_file(&meta_tmp).ok();
-            return Err(StoreError::Io(e));
+        let meta_json = serde_json::to_vec_pretty(&meta)?;
+
+        // 3. Write both temp files and atomically rename them into place. The
+        //    whole "ensure dir → write temps → rename" sequence is retried once
+        //    as a unit on `ErrorKind::NotFound`, because a concurrent process'
+        //    `evict_overflow` can `remove_dir` this key dir the instant it
+        //    observes it empty (store.rs `evict_overflow`, "Sweep now-empty key
+        //    dirs"). That removal races every write step here: it can vanish the
+        //    dir after `create_dir_all` but before a temp `File::create`, or
+        //    take the dir *and our just-written temps with it* before the
+        //    rename, surfacing as `io: No such file or directory (os error 2)`
+        //    under parallel CV / bootstrap fitting (gam#868). Retrying the
+        //    sequence (not an individual step) is the only correct response: a
+        //    bare rename retry can't recover once the source temp was swept with
+        //    the dir, so we recreate the dir and rewrite the temps from the
+        //    in-memory `payload` / `meta_json` we still hold. A single retry is
+        //    sufficient — the eviction window is one `remove_dir` syscall wide —
+        //    and a second genuine `NotFound` is propagated as before.
+        let nonce = nanos_now();
+        let bin_final = dir.join(format!("{run_id}.bin"));
+        let meta_final = dir.join(format!("{run_id}.json"));
+        let mut attempt = 0u8;
+        loop {
+            let bin_tmp = dir.join(format!("{run_id}.bin.tmp.{pid}.{nonce}.{attempt}"));
+            let meta_tmp = dir.join(format!("{run_id}.json.tmp.{pid}.{nonce}.{attempt}"));
+            match write_and_promote_entry(&EntryWrite {
+                dir: &dir,
+                bin_tmp: &bin_tmp,
+                meta_tmp: &meta_tmp,
+                payload,
+                meta_json: &meta_json,
+                bin_final: &bin_final,
+                meta_final: &meta_final,
+            }) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::NotFound && attempt == 0 => {
+                    // A sibling process' eviction removed the key dir mid-write.
+                    // Clean up any partial temps, then retry the whole sequence
+                    // once after recreating the dir inside `write_and_promote_entry`.
+                    fs::remove_file(&bin_tmp).ok();
+                    fs::remove_file(&meta_tmp).ok();
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => {
+                    fs::remove_file(&bin_tmp).ok();
+                    fs::remove_file(&meta_tmp).ok();
+                    fs::remove_file(&bin_final).ok();
+                    return Err(StoreError::Io(e));
+                }
+            }
         }
         // Fsync the containing directory so the rename itself is durable
         // across a power loss / hard crash. fs::File::sync_all on the
@@ -552,6 +570,52 @@ impl WarmStartStore {
     }
 }
 
+/// Ensure the key dir exists, write the `.bin` and `.json` temp files, and
+/// atomically rename both into place. Returns the raw `io::Error` (not a
+/// `StoreError`) so the caller can branch on `ErrorKind::NotFound` to retry the
+/// whole sequence after a concurrent eviction removed the dir mid-write
+/// (gam#868). Idempotent across a retry: every path is derived from the caller's
+/// stable args and the temps are rewritten from the in-memory payload, so a
+/// second pass into a freshly recreated dir produces the same final entry.
+///
+/// `.bin` is renamed before `.json` so a meta-pointing-to-missing-bin window is
+/// impossible on the happy path; a reader that catches `.bin`-missing treats the
+/// entry as corrupt and cleans it up.
+struct EntryWrite<'a> {
+    dir: &'a Path,
+    bin_tmp: &'a Path,
+    meta_tmp: &'a Path,
+    payload: &'a [u8],
+    meta_json: &'a [u8],
+    bin_final: &'a Path,
+    meta_final: &'a Path,
+}
+
+fn write_and_promote_entry(w: &EntryWrite<'_>) -> io::Result<()> {
+    // Recreate the dir up front: on the first attempt this is the original
+    // `create_dir_all`; on a retry it re-establishes the dir a sibling
+    // process' eviction removed.
+    fs::create_dir_all(w.dir)?;
+    {
+        let mut f = fs::File::create(w.bin_tmp)?;
+        f.write_all(w.payload)?;
+        f.sync_all().ok();
+    }
+    {
+        let mut f = fs::File::create(w.meta_tmp)?;
+        f.write_all(w.meta_json)?;
+        f.sync_all().ok();
+    }
+    fs::rename(w.bin_tmp, w.bin_final)?;
+    if let Err(e) = fs::rename(w.meta_tmp, w.meta_final) {
+        // Roll back the bin we just promoted to avoid orphaning it, then
+        // surface the error so the caller can retry or fail.
+        fs::remove_file(w.bin_final).ok();
+        return Err(e);
+    }
+    Ok(())
+}
+
 /// Conservative meta-JSON size used by the throttled save counter. Real
 /// meta files run ~250-400 bytes after pretty-printing; overestimating
 /// just means the throttle fires slightly earlier, never later.
@@ -669,8 +733,9 @@ fn lookup_cache_invalidate(key: &LookupCacheKey) {
 const EVICT_EVERY_N_SAVES: u64 = 32;
 
 fn parse_tmp_pid(name: &str) -> Option<u32> {
-    // Names look like "<runid>.bin.tmp.<pid>.<nonce>" or
-    // "<runid>.json.tmp.<pid>.<nonce>".
+    // Names look like "<runid>.bin.tmp.<pid>.<nonce>.<attempt>" or
+    // "<runid>.json.tmp.<pid>.<nonce>.<attempt>" (the trailing retry-attempt
+    // suffix is irrelevant here — only the first token after ".tmp." is the pid).
     let tail = name.split(".tmp.").nth(1)?;
     let pid_str = tail.split('.').next()?;
     pid_str.parse::<u32>().ok()
@@ -1088,6 +1153,102 @@ mod tests {
         let got = store.lookup(&key).unwrap().unwrap();
         assert_eq!(got.payload, b"v2");
         assert_eq!(got.objective, Some(1.0));
+    }
+
+    #[test]
+    fn write_and_promote_recreates_dir_removed_before_write() {
+        // gam#868: a sibling process' eviction can `remove_dir` the key dir the
+        // instant it observes it empty, racing every write step in `save`. The
+        // promote helper must recreate the dir rather than failing with ENOENT.
+        let (_d, store) = temp_store();
+        let key = key_for("race-recreate");
+        let dir = store.key_dir(&key);
+        // Dir does NOT exist yet (simulates eviction having removed it after a
+        // prior `create_dir_all`). The helper must create it and succeed.
+        assert!(!dir.exists());
+        let bin_tmp = dir.join("r0.bin.tmp.1.0.0");
+        let meta_tmp = dir.join("r0.json.tmp.1.0.0");
+        let bin_final = dir.join("r0.bin");
+        let meta_final = dir.join("r0.json");
+        let meta_json = b"{}";
+        write_and_promote_entry(&EntryWrite {
+            dir: &dir,
+            bin_tmp: &bin_tmp,
+            meta_tmp: &meta_tmp,
+            payload: b"payload",
+            meta_json,
+            bin_final: &bin_final,
+            meta_final: &meta_final,
+        })
+        .expect("promote into a missing dir must recreate it and succeed");
+        assert!(bin_final.exists() && meta_final.exists());
+        assert_eq!(fs::read(&bin_final).unwrap(), b"payload");
+    }
+
+    #[test]
+    fn save_survives_concurrent_eviction_removing_key_dir() {
+        // gam#868 end-to-end: hammer the same key with concurrent saves while a
+        // sibling thread repeatedly runs `evict_overflow` (which `remove_dir`s
+        // now-empty key dirs). Before the atomic-retry fix, a save whose
+        // `create_dir_all`→write/rename window straddled a `remove_dir` failed
+        // with `io: No such file or directory (os error 2)`. Every save must now
+        // succeed; we assert no save returns an error.
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Zero size budget forces `evict_overflow` to delete entries (and then
+        // sweep the emptied key dir) on essentially every sweep, maximizing the
+        // race window.
+        let store = Arc::new(
+            WarmStartStore::open(
+                dir.path().to_path_buf(),
+                StoreOptions {
+                    size_budget_bytes: 0,
+                    ttl: Duration::from_secs(60),
+                },
+            )
+            .unwrap(),
+        );
+        let key = key_for("concurrent-evict");
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let evictor = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    store.evict_overflow().ok();
+                }
+            })
+        };
+
+        let writers: Vec<_> = (0..4)
+            .map(|w| {
+                let store = Arc::clone(&store);
+                let key = key;
+                std::thread::spawn(move || {
+                    for i in 0..200u32 {
+                        let payload = format!("w{w}-i{i}");
+                        store
+                            .save(
+                                &key,
+                                payload.as_bytes(),
+                                Some(i as f64),
+                                Some(i as u64),
+                                EntryKind::Checkpoint,
+                            )
+                            .expect("save must not fail with ENOENT under concurrent eviction");
+                    }
+                })
+            })
+            .collect();
+
+        for h in writers {
+            h.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        evictor.join().unwrap();
     }
 
     #[test]
