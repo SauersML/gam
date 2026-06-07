@@ -3223,6 +3223,45 @@ impl<'a> RemlState<'a> {
             });
         }
 
+        let compute_gradient = compute_gradient_for_tk(mode);
+        let zero_correction = || TkCorrectionTerms {
+            value: 0.0,
+            gradient: if compute_gradient {
+                Some(Array1::zeros(rho.len() + ext_coords.len()))
+            } else {
+                None
+            },
+            hessian: if mode == super::unified::EvalMode::ValueGradientHessian {
+                Some(Array2::zeros((
+                    rho.len() + ext_coords.len(),
+                    rho.len() + ext_coords.len(),
+                )))
+            } else {
+                None
+            },
+        };
+
+        // The outer Firth gate (`firth_problem_scale_allows`) disables the dense
+        // Firth operator at the same problem scale that makes the TK refinement's
+        // dense calculus infeasible. When that gate trips, the inner PIRLS solve
+        // logs `jeffreys_logdet=none` and falls back to plain Laplace REML, and
+        // both `bundle.firth_dense_operator` and `bundle.firth_dense_operator_original`
+        // are `None`. The TK refinement is a higher-order correction on top of the
+        // Firth/Jeffreys-augmented Laplace expansion; without the operator it has
+        // nothing to refine. Mirror the gate here so large-model fits silently drop
+        // the refinement rather than erroring out — matching the established skip
+        // pattern for non-canonical-logit links above.
+        let n_x = self.x().nrows();
+        let p_x = self.x().ncols();
+        if !super::firth_problem_scale_allows(n_x, p_x) {
+            return Ok(zero_correction());
+        }
+        let dense_work = n_x.saturating_mul(p_x);
+        if n_x > TK_MAX_OBSERVATIONS || p_x > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
+        {
+            return Ok(zero_correction());
+        }
+
         let pirls_result = bundle.pirls_result.as_ref();
         let (c_array, d_array, e_array, f_array) = self.hessian_cdef_arrays(pirls_result)?;
         if let Some(idx) = c_array.iter().position(|v| !v.is_finite()) {
@@ -3237,34 +3276,8 @@ impl<'a> RemlState<'a> {
                 d_array[idx]
             );
         }
-        let compute_gradient = compute_gradient_for_tk(mode);
         if c_array.is_empty() || d_array.is_empty() {
-            return Ok(TkCorrectionTerms {
-                value: 0.0,
-                gradient: if compute_gradient {
-                    Some(Array1::zeros(rho.len() + ext_coords.len()))
-                } else {
-                    None
-                },
-                hessian: if mode == super::unified::EvalMode::ValueGradientHessian {
-                    Some(Array2::zeros((
-                        rho.len() + ext_coords.len(),
-                        rho.len() + ext_coords.len(),
-                    )))
-                } else {
-                    None
-                },
-            });
-        }
-
-        let n_x = self.x().nrows();
-        let p_x = self.x().ncols();
-        let dense_work = n_x.saturating_mul(p_x);
-        if n_x > TK_MAX_OBSERVATIONS || p_x > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
-        {
-            crate::bail_invalid_estim!(
-                "Tierney-Kadane correction requires dense small-model calculus; refusing to silently disable it for n={n_x}, p={p_x}, n*p={dense_work}"
-            );
+            return Ok(zero_correction());
         }
 
         if let Some(sparse) = bundle.sparse_exact.as_ref() {
