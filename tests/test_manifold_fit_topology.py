@@ -8,7 +8,9 @@ They pin the behaviour a *user* sees from a fitted surface:
   * a 2-D torus smooth ``te(u, v, periodic=[0,1], period=[2*pi, 2*pi])`` must wrap on
     BOTH axes (no seam at u=0/2pi or v=0/2pi);
   * a ``sphere(lat, lon)`` smooth must wrap in longitude (no seam at lon=0/2pi) and
-    must collapse the pole to a single point (all longitudes at lat=pi/2 agree).
+    must collapse the pole to a single point (all longitudes at lat=pi/2 agree);
+  * a cylinder smooth ``te(theta, z, periodic=[0], period=[2*pi, 0])`` must wrap on the
+    angular axis WITHOUT imposing spurious periodicity on the linear height axis.
 
 A regression in the periodic-margin wiring or the spherical chart would surface here as
 a nonzero seam gap or a fanned-out pole, even if the basis-level contracts still hold.
@@ -89,4 +91,44 @@ def test_sphere_fit_wraps_in_longitude_and_collapses_pole() -> None:
     pole_spread = float(np.max(f_pole) - np.min(f_pole))
     assert pole_spread <= SEAM_TOL, (
         f"sphere north pole fans out across longitude: spread={pole_spread:.3e}"
+    )
+
+
+def test_cylinder_fit_wraps_in_angle_but_not_in_height() -> None:
+    """A cylinder smooth wraps on the angular axis WITHOUT wrapping the linear axis.
+
+    ``te(theta, z, periodic=[0], period=[2*pi, 0])`` makes only the first margin
+    periodic. The fitted surface must therefore close the seam at theta=0/2pi while
+    leaving the height axis ``z`` a genuine non-periodic trend. This guards the
+    mixed-periodicity bug class where a periodic margin leaks into the linear margin
+    (which would flatten or wrap ``z``) or fails to close the angular seam.
+    """
+    rng = np.random.default_rng(7)
+    n = 1400
+    theta = rng.uniform(0.0, TWO_PI, n)  # periodic angular axis
+    z = rng.uniform(-2.0, 2.0, n)  # linear (non-periodic) height axis
+    y = np.sin(theta) + 0.7 * z + 0.3 * np.cos(theta) * z + rng.normal(0.0, 0.2, n)
+
+    model = gamfit.fit(
+        pd.DataFrame({"theta": theta, "z": z, "y": y}),
+        "y ~ te(theta, z, periodic=[0], period=[2*pi, 0])",
+    )
+
+    # (a) angular seam closes: f(0, z) == f(2*pi, z)
+    zp = np.linspace(-1.8, 1.8, 12)
+    f_th0 = np.asarray(model.predict(pd.DataFrame({"theta": np.zeros(12), "z": zp})))
+    f_th2pi = np.asarray(model.predict(pd.DataFrame({"theta": np.full(12, TWO_PI), "z": zp})))
+    angular_gap = float(np.max(np.abs(f_th0 - f_th2pi)))
+    assert angular_gap <= SEAM_TOL, (
+        f"cylinder angular seam not continuous: max|f(0,z)-f(2pi,z)|={angular_gap:.3e}"
+    )
+
+    # (b) the height axis is genuinely non-periodic: the surface varies along z.
+    # A leaked periodic margin would flatten or wrap z, collapsing this range toward 0;
+    # the true trend here spans ~2.5, so a 0.5 floor cleanly separates the two regimes.
+    z_line = np.linspace(-1.8, 1.8, 9)
+    f_z = np.asarray(model.predict(pd.DataFrame({"theta": np.full(9, 1.0), "z": z_line})))
+    z_range = float(np.max(f_z) - np.min(f_z))
+    assert z_range > 0.5, (
+        f"cylinder height axis appears wrongly periodic/flat: range along z={z_range:.3e}"
     )
