@@ -412,7 +412,7 @@ pub fn sindy_library(
 ///
 /// `theta` is the public-API coefficient layout `(state_dim, n_terms)`: row `i`
 /// is the coefficient vector for `d{state_i}/dt`. Coefficients are formatted to
-/// three significant figures via [`crate::solver::reml_compare::format_three_significant`]
+/// three significant figures via [`crate::solver::evidence::format_three_significant`]
 /// (the single source of truth for SINDy number formatting), exactly-zero
 /// coefficients are dropped, the first surviving term inlines its sign
 /// (`-10.0x`), and subsequent terms use a spaced separator (` - 3.00y`). The
@@ -422,7 +422,7 @@ pub fn sindy_render_equations(
     term_names: &[String],
     state_names: &[String],
 ) -> Result<Vec<String>, String> {
-    use crate::solver::reml_compare::format_three_significant;
+    use crate::solver::evidence::format_three_significant;
     let (d, p) = theta.dim();
     if state_names.len() != d {
         return Err(format!(
