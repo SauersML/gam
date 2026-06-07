@@ -24,10 +24,10 @@ The runner is:
 (N, 3)
 >>> result.evidence  # higher = better (Laplace-style log marginal-likelihood proxy)
 
-If any precondition of the theorem fails, the corresponding warning is added
-to ``result.warnings`` and emitted via :mod:`warnings.warn` as
-``UserWarning``. The fit always completes — the warnings are informational
-about which guarantee no longer formally holds.
+If any precondition of the theorem fails, the corresponding warning is emitted
+via :mod:`warnings.warn` as ``UserWarning`` and recorded in
+``result.report.as_warnings()``. The fit always completes — the warnings are
+informational about which guarantee no longer formally holds.
 """
 
 from __future__ import annotations
@@ -173,7 +173,7 @@ class IdentifiabilityReport:
     The report's overall status is the worst of its theorem statuses
     (``fail`` > ``warn`` > ``pass``). Iterate ``report.theorems`` for
     per-theorem detail or call :meth:`as_warnings` to format the warn/fail
-    entries as plain strings (suitable for ``result.warnings``).
+    entries as plain strings.
     """
 
     theorems: list[IdentifiabilityTheoremResult]
@@ -416,11 +416,6 @@ class IdentifiableFactorFitResult:
     encoder_state : dict[str, np.ndarray]
         ``state_dict``-style snapshot of the encoder. Useful for
         out-of-sample prediction.
-    warnings : list[str]
-        Human-readable preconditions of the iVAE+mech-sparsity theorem that
-        do *not* hold for this fit. An empty list means all preconditions
-        are satisfied within numerical tolerance. Mirror of
-        ``report.as_warnings()`` for backward compatibility.
     aux : np.ndarray
         Auxiliary covariates used at fit time. Stored on the result so
         downstream :func:`check` calls can re-verify the iVAE preconditions
@@ -438,7 +433,6 @@ class IdentifiableFactorFitResult:
     aux_prior_weight: float
     mech_sparsity_weight: float
     encoder_state: dict[str, np.ndarray]
-    warnings: list[str] = field(default_factory=list)
     aux: np.ndarray | None = None
     report: "IdentifiabilityReport | None" = None
 
@@ -897,7 +891,6 @@ def identifiable_factor_fit(
         aux_prior_weight=float(aux_w),
         mech_sparsity_weight=float(mech_w),
         encoder_state=encoder_state,
-        warnings=[],
         aux=aux_np,
         report=None,
     )
@@ -905,12 +898,7 @@ def identifiable_factor_fit(
     if bool(check_identifiability):
         report = check(result)
         result.report = report
-        # Structured per-theorem warning channel — single source of truth.
-        # The free-form precondition list has been removed; every
-        # warning now comes from the Rust check.
-        structured = report.as_warnings()
-        result.warnings = list(structured)
-        for msg in structured:
+        for msg in report.as_warnings():
             warnings.warn(msg, UserWarning, stacklevel=2)
 
     return result

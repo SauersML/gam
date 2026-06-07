@@ -114,7 +114,7 @@ def test_identifiable_factor_fit_smoke() -> None:
     # The mechanism-sparsity theorem is reported separately below because
     # the smoothed-L1 decoder penalty may not produce exact zeros on this
     # tiny smoke fixture.
-    assert any("MechanismSparsity" in w for w in result.warnings)
+    assert any("MechanismSparsity" in w for w in result.report.as_warnings())
     # The fit completing at all is the regression guard for #576: the
     # supervised iVAE prior previously raised because its conditional scale
     # σ(u) was hardcoded to ones, collapsing the Khemakhem natural-parameter
@@ -157,7 +157,7 @@ def test_identifiable_factor_fit_warns_on_constant_aux() -> None:
             learning_rate=1e-2,
             random_state=3,
         )
-    assert any("auxiliary" in w for w in result.warnings)
+    assert any("auxiliary" in w for w in result.report.as_warnings())
 
 
 def test_identifiability_check_flags_constant_aux() -> None:

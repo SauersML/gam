@@ -276,7 +276,7 @@ pub struct FittedModelPayload {
     pub noise_non_intercept_start: Option<usize>,
     /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
     /// `noise_projection`.  Persisted so prediction-time replay is identical
-    /// to fit-time projection.  `None` for legacy payloads (interpreted as 0).
+    /// to fit-time projection.
     #[serde(default)]
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
@@ -386,8 +386,7 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub survival_noise_non_intercept_start: Option<usize>,
     /// Survival analog of `noise_projection_ridge_alpha`: the Tikhonov ridge
-    /// used when fitting the survival log-sigma projection.  See doc comment
-    /// on `noise_projection_ridge_alpha`.
+    /// used when fitting the survival log-sigma projection.
     #[serde(default)]
     pub survival_noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
@@ -3726,6 +3725,13 @@ impl FittedModel {
         if let Some(v) = self.noise_projection.as_ref() {
             validate_all_finite("noise_projection", v.iter().flatten().copied())
                 .map_err(corrupt)?;
+            if self.noise_projection_ridge_alpha.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason:
+                        "model has noise_projection but is missing noise_projection_ridge_alpha; refit"
+                            .to_string(),
+                });
+            }
         }
         if let Some(v) = self.noise_center.as_ref() {
             validate_all_finite("noise_center", v.iter().copied()).map_err(corrupt)?;
@@ -3775,6 +3781,13 @@ impl FittedModel {
         if let Some(v) = self.survival_noise_projection.as_ref() {
             validate_all_finite("survival_noise_projection", v.iter().flatten().copied())
                 .map_err(corrupt)?;
+            if self.survival_noise_projection_ridge_alpha.is_none() {
+                return Err(FittedModelError::MissingField {
+                    reason:
+                        "model has survival_noise_projection but is missing survival_noise_projection_ridge_alpha; refit"
+                            .to_string(),
+                });
+            }
         }
         if let Some(v) = self.survival_noise_center.as_ref() {
             validate_all_finite("survival_noise_center", v.iter().copied()).map_err(corrupt)?;
