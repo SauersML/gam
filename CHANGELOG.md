@@ -1,3 +1,40 @@
+## v0.3.105 — gam 0.3.105 / gamfit 0.1.183 (2026-06-07)
+
+Catch-up crate release. crates.io was last published at gam 0.3.103; this rolls
+up every engine fix that shipped through gamfit 0.1.178–0.1.183 since then.
+
+Survival marginal-slope (#808 family):
+- fix(#808): reject only *channel-deleting* rawstack reductions. On clustered-PC designs the raw marginal / log-slope columns collide and the `[Time, Marginal, Logslope]` cross-block carry would zero the entire log-slope block — deleting the slope channel the model exists to estimate and diverging the inner solve. Non-destructive partial reductions are kept; any map that collapses a required channel to zero width is rejected and the unreduced design is used, leaving the near-null direction to Jeffreys conditioning. Guarded by a unit-tested predicate.
+- fix(#834): continuation prewarm is now objective-opt-in, and the continuation seed dispatch / RE-Hessian guard / never-fail escalation reachability are pinned (#819/#737/#834/#860).
+
+REML / ALO performance and correctness:
+- fix(#862): ALO robustness weights are scoped to the owning `RemlState` instead of a process-global pointer-keyed map. Cold model sweeps reallocate a state at the same address with the same `n`; the old map then reused another formula's frozen ALO weights and recreated the 30–70× outer-REML grind on `smooth + a few linear covariates`. The frozen nuisance now lives on the surface and invalidates with the design in `reset_surface`.
+- fix(#818): one comparable REML score across the Python APIs, so model-selection numbers line up between the formula and builder paths.
+- fix(#819): materialize the sparse exact inner Hessian — `group()`-panel sparse-exact REML smoothing-correction no longer aborts.
+- fix(custom/REML #824,#825,#837,#826): Firth consistency, Fisher block contract, joint-Newton rank floor, and stacked-solver η honored in custom-family assembly.
+
+Smooths / bases:
+- fix(#787): the Matérn formula defaults to `double_penalty=false`. The strictly positive-definite Matérn kernel has no structural polynomial nullspace, so the double-penalty ridge was spurious and flipped the learned-penalty count across the κ optimizer's design rebuilds ("joint hyper rho dimension mismatch"). An explicit `double_penalty=true` is still honored; Duchon/thin-plate keeps its native nullspace shrinkage (#754).
+- fix(smooth/basis #822,#823,#851,#858): isotropic-Matérn κ axis, design storage / boundary handling, Duchon adaptive caches.
+
+Predictions:
+- refactor(#817): the moment-matched Gamma predictive interval is lifted into a pure, unit-tested `probability::gamma_moment_matched_interval` (exact conditional-Gamma limit, right-skew asymmetry, estimation-uncertainty widening, degenerate-input fallback). No behavior change to the #817 fix itself.
+
+Diagnostics / families / linalg:
+- fix(#864): `diagnose` keeps the response column instead of dropping it and aborting on its own training data.
+- fix(#861): accept the redundant marginal-slope Firth flag.
+- fix(#845,#846,#848,#849,#852,#855,#856): arrow-Schur / linalg / survival / sinkhorn correctness.
+- fix(GPU/BMS #829,#831,#833,#835,#836,#838): trace SE, survival_flex integrand, 4th-order term, saddlepoint κ4, Mills seam.
+- fix(SAE #841–#857): manifold correctness and streaming-logdet convergence.
+- fix(#827,#828,#830): identifiability audit / canonical / compiler correctness.
+- fix(#863): sphere GPU terms compile (`gpu_err!` import / macro scope).
+
+Cleanup — removed deprecated aliases / compatibility shims (use the canonical names):
+- Removed CLI family spelling aliases, shared precision-key aliases, Gumbel schedule aliases, and the identifiability-warning compatibility mirror; unified and restricted GPU policy parsing; reject stale SAE payload shapes.
+
+Tests:
+- test(#860, #820, #819): regression pins for startup-validation never-fail escalation, the fuzzer scenario cost cap, and the sparse-exact REML `group()`-panel repro.
+
 ## gam v0.3.104 / gamfit v0.1.178
 
 - fix(#787/#785): C1 antiderivative for floored Jeffreys eigenvalue + line-search early-exit threshold (bernoulli marginal-slope inner KKT now converges; centers=12 PGS config that previously froze ~20min now returns).
