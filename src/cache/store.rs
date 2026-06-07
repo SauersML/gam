@@ -356,7 +356,7 @@ impl WarmStartStore {
 
         // 1. Write payload bytes.
         {
-            let mut f = fs::File::create(&bin_tmp)?;
+            let mut f = create_file_in_dir(&dir, &bin_tmp)?;
             f.write_all(payload)?;
             f.sync_all().ok();
         }
@@ -381,20 +381,20 @@ impl WarmStartStore {
         };
         {
             let json = serde_json::to_vec_pretty(&meta)?;
-            let mut f = fs::File::create(&meta_tmp)?;
+            let mut f = create_file_in_dir(&dir, &meta_tmp)?;
             f.write_all(&json)?;
             f.sync_all().ok();
         }
         // 4. Atomic renames. .bin first so a meta-pointing-to-missing-bin
         // window is impossible on the happy path. A reader that catches
         // .bin-missing treats the entry as corrupt and cleans it up.
-        let bin_rename = fs::rename(&bin_tmp, &bin_final);
+        let bin_rename = rename_in_dir(&dir, &bin_tmp, &bin_final);
         if let Err(e) = bin_rename {
             fs::remove_file(&bin_tmp).ok();
             fs::remove_file(&meta_tmp).ok();
             return Err(StoreError::Io(e));
         }
-        if let Err(e) = fs::rename(&meta_tmp, &meta_final) {
+        if let Err(e) = rename_in_dir(&dir, &meta_tmp, &meta_final) {
             // Roll back the bin we just promoted to avoid orphaning it.
             fs::remove_file(&bin_final).ok();
             fs::remove_file(&meta_tmp).ok();

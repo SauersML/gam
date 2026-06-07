@@ -99,7 +99,6 @@ use crate::linalg::faer_ndarray::{FaerArrayView, FaerLlt};
 use crate::linalg::triangular::{
     cholesky_solve_matrix, cholesky_solve_vector, forward_substitution_lower_matrix,
 };
-use crate::solver::arrow_schur_beta_graph::BetaCouplingGraph;
 use crate::terms::analytic_penalties::{AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier};
 use crate::terms::latent_coord::{LatentCoordValues, LatentManifold};
 
@@ -118,6 +117,136 @@ const DEFAULT_PCG_RELATIVE_TOLERANCE: f64 = 1e-4;
 const PCG_ABSOLUTE_TOLERANCE_FLOOR: f64 = 1e-14;
 const DEFAULT_TRUST_REGION_RADIUS: f64 = f64::INFINITY;
 pub const DEFAULT_PROXIMAL_INITIAL_RIDGE: f64 = 1e-8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BetaEdge {
+    a: usize,
+    b: usize,
+}
+
+#[derive(Debug, Clone)]
+struct BetaCouplingGraph {
+    num_blocks: usize,
+    edges: Vec<BetaEdge>,
+    adj_start: Vec<usize>,
+    adj_targets: Vec<usize>,
+}
+
+impl BetaCouplingGraph {
+    fn build(block_offsets: &[Range<usize>], htbeta_rows: &[Array2<f64>]) -> Self {
+        let num_blocks = block_offsets.len();
+        if num_blocks == 0 {
+            return Self {
+                num_blocks: 0,
+                edges: Vec::new(),
+                adj_start: vec![0],
+                adj_targets: Vec::new(),
+            };
+        }
+
+        let mut edge_set = Vec::<(usize, usize)>::new();
+        for row in htbeta_rows {
+            let mut active = Vec::<usize>::new();
+            for (block, range) in block_offsets.iter().enumerate() {
+                if range
+                    .clone()
+                    .any(|col| (0..row.nrows()).any(|axis| row[[axis, col]] != 0.0))
+                {
+                    active.push(block);
+                }
+            }
+            for i in 0..active.len() {
+                for j in (i + 1)..active.len() {
+                    edge_set.push((active[i].min(active[j]), active[i].max(active[j])));
+                }
+            }
+        }
+        edge_set.sort_unstable();
+        edge_set.dedup();
+
+        let edges: Vec<_> = edge_set.iter().map(|&(a, b)| BetaEdge { a, b }).collect();
+        let mut degree = vec![0usize; num_blocks];
+        for &BetaEdge { a, b } in &edges {
+            degree[a] += 1;
+            degree[b] += 1;
+        }
+        let mut adj_start = vec![0usize; num_blocks + 1];
+        for block in 0..num_blocks {
+            adj_start[block + 1] = adj_start[block] + degree[block];
+        }
+        let mut adj_targets = vec![0usize; adj_start[num_blocks]];
+        let mut cursor = adj_start[..num_blocks].to_vec();
+        for &BetaEdge { a, b } in &edges {
+            adj_targets[cursor[a]] = b;
+            cursor[a] += 1;
+            adj_targets[cursor[b]] = a;
+            cursor[b] += 1;
+        }
+        Self {
+            num_blocks,
+            edges,
+            adj_start,
+            adj_targets,
+        }
+    }
+
+    fn neighbours(&self, node: usize) -> &[usize] {
+        &self.adj_targets[self.adj_start[node]..self.adj_start[node + 1]]
+    }
+
+    fn component_partition(&self) -> Vec<Vec<usize>> {
+        let mut parent: Vec<usize> = (0..self.num_blocks).collect();
+        let mut rank = vec![0u8; self.num_blocks];
+
+        fn find(parent: &mut [usize], mut x: usize) -> usize {
+            while parent[x] != x {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            x
+        }
+
+        for &BetaEdge { a, b } in &self.edges {
+            let lhs = find(&mut parent, a);
+            let rhs = find(&mut parent, b);
+            if lhs != rhs {
+                if rank[lhs] < rank[rhs] {
+                    parent[lhs] = rhs;
+                } else if rank[lhs] > rank[rhs] {
+                    parent[rhs] = lhs;
+                } else {
+                    parent[rhs] = lhs;
+                    rank[lhs] += 1;
+                }
+            }
+        }
+
+        let mut label_map = vec![usize::MAX; self.num_blocks];
+        let mut parts = Vec::<Vec<usize>>::new();
+        for block in 0..self.num_blocks {
+            let root = find(&mut parent, block);
+            let label = if label_map[root] == usize::MAX {
+                label_map[root] = parts.len();
+                parts.push(Vec::new());
+                label_map[root]
+            } else {
+                label_map[root]
+            };
+            parts[label].push(block);
+        }
+        parts
+    }
+
+    fn expand_one_hop(&self, seed: &[usize]) -> Vec<usize> {
+        let mut expanded = seed.to_vec();
+        for &block in seed {
+            expanded.extend_from_slice(self.neighbours(block));
+        }
+        expanded.sort_unstable();
+        expanded.dedup();
+        expanded
+    }
+}
 pub const DEFAULT_PROXIMAL_RIDGE_GROWTH: f64 = 10.0;
 /// Number of geometric proximal-ridge escalations the adaptive correction
 /// attempts before giving up. Raised from 16 to 22 so the ridge can climb from

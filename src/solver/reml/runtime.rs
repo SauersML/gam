@@ -9389,7 +9389,37 @@ impl<'a> RemlState<'a> {
             && n.saturating_mul(bundle.pirls_result.beta_transformed.as_ref().len())
                 <= ALO_GRADIENT_MAX_WORK
         {
-            self.alo_stabilization_gradient(rho, bundle, &alo, &influence_scale, phi)?
+            // Factor the stabilized penalized Hessian and form H⁻¹Xᵀ exactly once
+            // here, then hand the factor + solve to the gradient. The leverage
+            // diagnostics above already factored the same matrix internally, so
+            // recomputing dense X + a fresh Cholesky + the H⁻¹Xᵀ solve inside the
+            // gradient is a full duplicate O(np² + p³) per outer evaluation —
+            // the dominant per-eval cost once ALO engages on small-n smooth+linear
+            // fits (#862). One factorization feeds both the value and the gradient.
+            let x = bundle.pirls_result.x_transformed.to_dense();
+            match bundle
+                .pirls_result
+                .dense_stabilizedhessian_transformed("ALO-stabilized REML gradient")?
+                .cholesky(Side::Lower)
+            {
+                Ok(chol) => {
+                    let mut h_inv_xt = x.t().to_owned();
+                    chol.solve_mat_in_place(&mut h_inv_xt);
+                    self.alo_stabilization_gradient(
+                        rho,
+                        bundle,
+                        &alo,
+                        &influence_scale,
+                        phi,
+                        &AloFactoredHessian {
+                            x: &x,
+                            chol: &chol,
+                            h_inv_xt: &h_inv_xt,
+                        },
+                    )?
+                }
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -9412,6 +9442,10 @@ impl<'a> RemlState<'a> {
     /// The base REML analytic Hessian is reused unchanged as the second-order
     /// model for ARC's adaptive cubic regularization (the ratio test runs on
     /// the exact augmented cost+gradient produced here).
+    ///
+    /// The stabilized-Hessian factorization is supplied via `factored` — the
+    /// value path factors the same matrix once and shares it here, so the
+    /// gradient adds no extra dense factorization (#862).
     fn alo_stabilization_gradient(
         &self,
         rho: &Array1<f64>,
@@ -9419,17 +9453,13 @@ impl<'a> RemlState<'a> {
         alo: &crate::inference::alo::AloDiagnostics,
         influence_scale: &[f64],
         phi: f64,
+        factored: &AloFactoredHessian<'_>,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        let x = bundle.pirls_result.x_transformed.to_dense();
-        let h = bundle
-            .pirls_result
-            .dense_stabilizedhessian_transformed("ALO-stabilized REML gradient")?;
-        let chol = match h.cholesky(Side::Lower) {
-            Ok(chol) => chol,
-            Err(_) => return Ok(None),
-        };
-        let mut h_inv_xt = x.t().to_owned();
-        chol.solve_mat_in_place(&mut h_inv_xt);
+        let &AloFactoredHessian {
+            x,
+            chol,
+            h_inv_xt,
+        } = factored;
         let beta = bundle.pirls_result.beta_transformed.as_ref();
         let k = rho.len();
         let nrows = x.nrows();

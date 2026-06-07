@@ -1,6 +1,5 @@
 pub(crate) mod active_set;
 pub mod arrow_schur;
-pub mod arrow_schur_beta_graph;
 pub mod estimate;
 pub mod evidence;
 pub mod gaussian_reml;
