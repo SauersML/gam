@@ -668,7 +668,7 @@ fn emit_python_penalty_manifest(manifest_dir: &Path) -> std::io::Result<()> {
             Some(value) if !value.is_empty() => value,
             _ => continue,
         };
-        let source = penalty_manifest_source_for_type(&penalties_dir, rust_type)?;
+        let source = penalty_manifest_source_for_type(&registry, rust_type)?;
         wrappers.push(PenaltyWrapperManifest {
             kind_tag: manifest_const_string(&source, "KIND_TAG")?,
             rust_type: format!("{variant}:{rust_type}"),
@@ -705,32 +705,12 @@ fn emit_python_penalty_manifest(manifest_dir: &Path) -> std::io::Result<()> {
     )
 }
 
-fn penalty_manifest_source_for_type(
-    penalties_dir: &Path,
-    rust_type: &str,
-) -> std::io::Result<String> {
-    for entry in fs::read_dir(penalties_dir)? {
-        let path = entry?.path();
-        if path.extension() != Some(OsStr::new("rs"))
-            || path.file_name() == Some(OsStr::new("mod.rs"))
-        {
-            continue;
-        }
-        // Skip macOS AppleDouble sidecar files (`._foo.rs`) that ride along
-        // with `.rs` files when a directory is tar'd on Darwin and untar'd
-        // on Linux. They share the `.rs` extension but contain binary
-        // extended-attribute blobs, so `fs::read_to_string` fails with
-        // "stream did not contain valid UTF-8". Treat them as not-there.
-        if path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with("._"))
-        {
-            continue;
-        }
-        let source = fs::read_to_string(&path)?;
-        if source.contains(&format!("impl PenaltyManifest for {rust_type}")) {
-            return Ok(source);
+fn penalty_manifest_source_for_type(registry: &str, rust_type: &str) -> std::io::Result<String> {
+    let marker = format!("impl PenaltyManifest for {rust_type} {{");
+    if let Some(start) = registry.find(&marker) {
+        let rest = &registry[start..];
+        if let Some(end) = rest.find("\n}") {
+            return Ok(rest[..end + 2].to_string());
         }
     }
     Err(std::io::Error::new(

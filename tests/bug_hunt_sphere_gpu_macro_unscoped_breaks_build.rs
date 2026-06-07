@@ -48,11 +48,11 @@
 //! (~0.98 in-sample), so the assertion is meaningful rather than a tautology.
 
 use csv::StringRecord;
+use gam::matrix::LinearOperator;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     smooth::build_term_collection_design,
 };
-use gam::matrix::LinearOperator;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;

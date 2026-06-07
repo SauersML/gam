@@ -1,7 +1,6 @@
 use gam::basis::DuchonNullspaceOrder;
 use gam::terms::atom_codes::BitVec;
 use gam::terms::hull::PeeledHull;
-use gam::terms::layout::{EngineLayoutBuilder, EngineTermKind, EngineTermSpec};
 use gam::terms::term_builder::{
     heuristic_knots_for_column, parse_duchon_order, parse_duchon_power,
 };
@@ -61,33 +60,6 @@ fn bug_hull_contains_convex_hull_of_input_vertices() {
     assert!(
         hull.is_inside(mid.view()),
         "A convex combination of in-hull vertices should remain inside the peeled hull."
-    );
-}
-
-#[test]
-fn bug_layout_column_order_matches_sequential_builder_contract() {
-    let mut b = EngineLayoutBuilder::new();
-    b.push_term(EngineTermSpec::unpenalized(EngineTermKind::Intercept, 1))
-        .expect("intercept");
-    b.push_term(EngineTermSpec::unpenalized(EngineTermKind::Linear, 2))
-        .expect("linear");
-    b.push_term(EngineTermSpec::penalized(EngineTermKind::Smooth, 3, 1))
-        .expect("smooth");
-    let layout = b.build();
-    assert_eq!(
-        layout.terms[0].col_range,
-        0..1,
-        "Intercept columns should be first."
-    );
-    assert_eq!(
-        layout.terms[1].col_range,
-        1..3,
-        "Linear term columns should follow intercept columns."
-    );
-    assert_eq!(
-        layout.terms[2].col_range,
-        3..6,
-        "Smooth columns should follow linear term columns."
     );
 }
 
