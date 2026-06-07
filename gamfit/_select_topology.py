@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
@@ -74,6 +74,22 @@ TopologyAutoSelectorRank: TypeAlias = tuple[str, float, float, float, int, Any]
 _TOPOLOGY_SCREEN_OUTER_MAX_ITER = 4
 _TOPOLOGY_SCREEN_SURVIVORS = 2
 
+# Escalating cheap-cap cascade for candidate enumeration (#781). A single fixed
+# screening cap silently drops every candidate when none converges inside it,
+# forcing the caller into the empty-screen error even though a slightly larger
+# budget would have admitted survivors. Mirror the seed-screening contract in
+# `solver::outer_strategy` (`SEED_SCREENING_CASCADE_MULTIPLIERS = [1, 4, 16]`
+# then uncapped): run every candidate at the cheapest cap, and escalate to the
+# next cap ONLY when the whole stage rejected everything as non-finite. The
+# first stage that admits at least one finite-scored candidate wins, so the
+# common case still pays a single cheap pass over all candidates. `None`
+# denotes the uncapped final stage (no `outer_max_iter` override).
+_TOPOLOGY_SCREEN_CAP_MULTIPLIERS: tuple[int, ...] = (1, 4, 16)
+_TOPOLOGY_SCREEN_CASCADE_CAPS: tuple[int | None, ...] = (
+    *(_TOPOLOGY_SCREEN_OUTER_MAX_ITER * m for m in _TOPOLOGY_SCREEN_CAP_MULTIPLIERS),
+    None,
+)
+
 _DEFAULT_TOPOLOGY_NAMES: tuple[TopologyName, ...] = (
     "euclidean",
     "circle",
@@ -103,6 +119,54 @@ def _fit_kwargs_with_outer_max_iter(fit_kwargs: Mapping[str, Any], cap: int) -> 
 
 def _survivor_count(n_candidates: int) -> int:
     return min(n_candidates, _TOPOLOGY_SCREEN_SURVIVORS)
+
+
+def _screen_kwargs_for_cap(
+    fit_kwargs: Mapping[str, Any], cap: int | None
+) -> dict[str, Any]:
+    """Fit kwargs for one cascade stage: cap the outer iterations, or run
+    uncapped when ``cap`` is ``None`` (the final escalation stage)."""
+    if cap is None:
+        return dict(fit_kwargs)
+    return _fit_kwargs_with_outer_max_iter(fit_kwargs, cap)
+
+
+def _screen_candidates_with_budget_cascade(
+    candidates: Sequence[_Candidate],
+    fit_kwargs: Mapping[str, Any],
+    score_one: "Callable[[_Candidate, Mapping[str, Any]], float]",
+) -> tuple[list[tuple[float, int, _Candidate]], dict[str, str]]:
+    """Run candidate screening through the escalating cheap-cap cascade (#781).
+
+    ``score_one`` fits ``candidate`` under the stage's capped ``fit_kwargs`` and
+    returns a finite lower-is-better comparison score, or raises to reject the
+    candidate at this cap. The cascade evaluates every candidate at the cheapest
+    cap and escalates to the next cap only when the entire stage rejected every
+    candidate as non-finite/errored — matching ``rank_indices_with_budget_cascade``
+    in ``solver::priority_selection``, which breaks the moment a stage admits a
+    finite survivor. Returns ``(screened, errors)`` where ``screened`` is the
+    ``(score, original_index, candidate)`` list from the first non-empty stage
+    and ``errors`` carries the most recent rejection reason per candidate name.
+    """
+    errors: dict[str, str] = {}
+    for cap in _TOPOLOGY_SCREEN_CASCADE_CAPS:
+        stage_kwargs = _screen_kwargs_for_cap(fit_kwargs, cap)
+        screened: list[tuple[float, int, _Candidate]] = []
+        stage_errors: dict[str, str] = {}
+        for idx, candidate in enumerate(candidates):
+            try:
+                score = score_one(candidate, stage_kwargs)
+            except Exception as exc:
+                stage_errors[candidate.name] = str(exc)
+                continue
+            if not math.isfinite(score):
+                stage_errors[candidate.name] = f"non-finite screening score {score!r}"
+                continue
+            screened.append((score, idx, candidate))
+        if screened:
+            return screened, stage_errors
+        errors = stage_errors
+    return [], errors
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,13 +273,7 @@ def select_topology(
     normalized = _normalize_candidates(candidates, feature_dim=feature_dim)
     _find_auto_smooth_call(formula)
 
-    screen_kwargs = _fit_kwargs_with_outer_max_iter(
-        fit_kwargs,
-        _TOPOLOGY_SCREEN_OUTER_MAX_ITER,
-    )
-    screened: list[tuple[float, int, _Candidate]] = []
-    screen_errors: dict[str, str] = {}
-    for idx, candidate in enumerate(normalized):
+    def _screen_score(candidate: _Candidate, stage_kwargs: Mapping[str, Any]) -> float:
         candidate_formula = _formula_for_candidate(
             formula,
             candidate,
@@ -223,18 +281,21 @@ def select_topology(
         )
         if candidate_formula is None:  # defensive; strict_dimension=True raises.
             raise ValueError(f"candidate {candidate.name!r} is not constructible")
-        try:
-            model = fit(data, candidate_formula, **screen_kwargs)
-            reml_score = _extract_reml_score_raw(model)
-            if not math.isfinite(reml_score):
-                raise ValueError(f"degenerate REML score {reml_score!r}")
-            basis_size = _basis_size(model)
-            null_dim = _fitted_or_candidate_null_dim(model, candidate, basis_size)
-            raw_score = _score_for_kind(model, score_kind, n_obs, basis_size, null_dim)
-            screen_score = _scale_score(raw_score, score_scale_kind, n_obs, _effective_dim(model))
-            screened.append((_comparison_score(screen_score, score_kind), idx, candidate))
-        except Exception as exc:
-            screen_errors[candidate.name] = str(exc)
+        model = fit(data, candidate_formula, **stage_kwargs)
+        reml_score = _extract_reml_score_raw(model)
+        if not math.isfinite(reml_score):
+            raise ValueError(f"degenerate REML score {reml_score!r}")
+        basis_size = _basis_size(model)
+        null_dim = _fitted_or_candidate_null_dim(model, candidate, basis_size)
+        raw_score = _score_for_kind(model, score_kind, n_obs, basis_size, null_dim)
+        screen_score = _scale_score(raw_score, score_scale_kind, n_obs, _effective_dim(model))
+        return _comparison_score(screen_score, score_kind)
+
+    screened, screen_errors = _screen_candidates_with_budget_cascade(
+        normalized,
+        fit_kwargs,
+        _screen_score,
+    )
 
     if not screened:
         detail = "; ".join(f"{name}: {err}" for name, err in screen_errors.items())
@@ -1085,42 +1146,40 @@ class TopologyAutoSelector:
         auto = _maybe_auto_smooth(formula)
         normalized = _normalize_selector_candidates(self.candidates, latent.d)
 
-        screen_kwargs = _fit_kwargs_with_outer_max_iter(
+        def _screen_score(
+            candidate: _Candidate, stage_kwargs: Mapping[str, Any]
+        ) -> float:
+            candidate_formula = _candidate_formula(formula, auto, candidate)
+            candidate_latent = _latent_for_topology(latent, candidate.name)
+            model = fit(
+                data,
+                candidate_formula,
+                latents={latent_name: candidate_latent},
+                penalties=penalties,
+                **stage_kwargs,
+            )
+            raw_reml = _extract_reml_score_raw(model)
+            effective_dim = _effective_dim(model)
+            null_dim = _extract_null_dim(model)
+            if null_dim is None:
+                raise ValueError(
+                    "TopologyAutoSelector requires TK null-dimension metadata; "
+                    "fit summary is missing null_dim"
+                )
+            return _tk_score_from_parts(
+                float(raw_reml),
+                float(null_dim),
+                _extract_null_hessian_logdet(model),
+                float(effective_dim),
+                int(n_obs),
+                self.score_scale,
+            )
+
+        screened, screen_errors = _screen_candidates_with_budget_cascade(
+            normalized,
             fit_kwargs,
-            _TOPOLOGY_SCREEN_OUTER_MAX_ITER,
+            _screen_score,
         )
-        screened: list[tuple[float, int, _Candidate]] = []
-        screen_errors: dict[str, str] = {}
-        for idx, candidate in enumerate(normalized):
-            try:
-                candidate_formula = _candidate_formula(formula, auto, candidate)
-                candidate_latent = _latent_for_topology(latent, candidate.name)
-                model = fit(
-                    data,
-                    candidate_formula,
-                    latents={latent_name: candidate_latent},
-                    penalties=penalties,
-                    **screen_kwargs,
-                )
-                raw_reml = _extract_reml_score_raw(model)
-                effective_dim = _effective_dim(model)
-                null_dim = _extract_null_dim(model)
-                if null_dim is None:
-                    raise ValueError(
-                        "TopologyAutoSelector requires TK null-dimension metadata; "
-                        "fit summary is missing null_dim"
-                    )
-                tk_score = _tk_score_from_parts(
-                    float(raw_reml),
-                    float(null_dim),
-                    _extract_null_hessian_logdet(model),
-                    float(effective_dim),
-                    int(n_obs),
-                    self.score_scale,
-                )
-                screened.append((tk_score, idx, candidate))
-            except Exception as exc:
-                screen_errors[candidate.name] = str(exc)
 
         if not screened:
             detail = "; ".join(f"{name}: {err}" for name, err in screen_errors.items())
