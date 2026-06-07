@@ -187,33 +187,6 @@ fn transformed_penalty_matvec(
     out
 }
 
-// Per-fit frozen nuisance/robustness quantities for the ALO-stabilization
-// deviance term (#821 / #813). The PSIS reweight `influence_scale[i]` and the
-// dispersion `phi` are both functions of the hat diagonals / deviance, hence of
-// rho; recomputing them at every outer evaluation while the analytic gradient
-// treats them as constants made the augmented REML gradient inconsistent with
-// the augmented cost. The optimizer then could not reach a stationary point
-// (observed: cost flat, |g| pinned/growing) and ran the full outer iteration
-// budget twice without converging - the 30-500x `te()` slowdowns. The
-// differentiated rho-dependence (the LOO predictor eta_tilde via `deta_loo` and
-// the hat diagonal h via the leverage barrier) is verified correct and stays
-// live.
-//
-// Freezing the two nuisance quantities at their first-activation geometry makes
-// the augmented objective a fixed function of rho within the fit, so the
-// existing analytic gradient is exactly its gradient and the outer loop
-// converges as it does for non-ALO smooths. Robustness to isolated
-// high-leverage rows is still provided by the frozen reweight plus the #711
-// tanh saturator. Keyed by the `RemlState` owner pointer (same convention as
-// the IFT runtime caches) with an `n`-fingerprint guard against pointer reuse
-// across fits.
-static ALO_FROZEN_NUISANCE: OnceLock<Mutex<HashMap<usize, (usize, Vec<f64>, f64)>>> =
-    OnceLock::new();
-
-fn alo_frozen_nuisance() -> &'static Mutex<HashMap<usize, (usize, Vec<f64>, f64)>> {
-    ALO_FROZEN_NUISANCE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
 static OUTER_IFT_RESIDUAL_ENERGY: OnceLock<Mutex<HashMap<Vec<u64>, (f64, u64)>>> = OnceLock::new();
 static OUTER_IFT_RESIDUAL_ENERGY_ITER: AtomicU64 = AtomicU64::new(0);
 
@@ -4563,6 +4536,7 @@ impl<'a> RemlState<'a> {
             kronecker_penalty_system: None,
             kronecker_factored: None,
             gaussian_fixed_cache: RwLock::new(None),
+            alo_frozen_nuisance: RwLock::new(None),
             persistent_warm_start_key: RwLock::new(None),
             persistent_latent_values_fingerprint: None,
             persistent_latent_values_cache: RwLock::new(PersistentLatentValuesCache::default()),
@@ -4616,6 +4590,7 @@ impl<'a> RemlState<'a> {
         // The Gaussian-fixed cache is keyed to (X, y, w, offset); replacing the
         // design invalidates it. The new surface will repopulate it on demand.
         *self.gaussian_fixed_cache.write().unwrap() = None;
+        *self.alo_frozen_nuisance.write().unwrap() = None;
         *self.persistent_warm_start_key.write().unwrap() = None;
         self.persistent_warm_start_loaded
             .store(false, Ordering::Relaxed);
@@ -9266,20 +9241,25 @@ impl<'a> RemlState<'a> {
             }
         };
         // Freeze the reweight and dispersion at their first-activation values
-        // for the rest of the fit so the augmented cost and its analytic
-        // gradient stay consistent (see ALO_FROZEN_NUISANCE). Recomputing them
-        // per outer evaluation while the gradient holds them constant is the
-        // #821/#813 inconsistency. A user-fixed phi is already constant, so for
-        // that path the freeze is a no-op on phi.
+        // for this REML surface so the augmented cost and its analytic gradient
+        // stay consistent. Recomputing them per outer evaluation while the
+        // gradient holds them constant is the #821/#813 inconsistency. The
+        // cache must be owned by this RemlState, not a static pointer-keyed map:
+        // cold model sweeps commonly allocate a new state at the same address
+        // with the same n, and reusing another formula's ALO weights recreates
+        // the #862 smooth+linear outer-REML grind.
         let (influence_scale, phi) = {
-            let key = self as *const _ as usize;
-            let mut frozen = alo_frozen_nuisance().lock().unwrap();
-            match frozen.get(&key) {
-                Some((cached_n, cached_scale, cached_phi)) if *cached_n == n => {
-                    (cached_scale.clone(), *cached_phi)
+            let mut frozen = self.alo_frozen_nuisance.write().unwrap();
+            match frozen.as_ref() {
+                Some(cached) if cached.n_obs == n && cached.influence_scale.len() == n => {
+                    (cached.influence_scale.clone(), cached.phi)
                 }
                 _ => {
-                    frozen.insert(key, (n, fresh_influence_scale.clone(), fresh_phi));
+                    *frozen = Some(super::AloFrozenNuisance {
+                        n_obs: n,
+                        influence_scale: fresh_influence_scale.clone(),
+                        phi: fresh_phi,
+                    });
                     (fresh_influence_scale, fresh_phi)
                 }
             }

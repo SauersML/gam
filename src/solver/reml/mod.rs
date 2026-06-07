@@ -4352,6 +4352,12 @@ impl RemlArena {
     }
 }
 
+struct AloFrozenNuisance {
+    n_obs: usize,
+    influence_scale: Vec<f64>,
+    phi: f64,
+}
+
 pub(crate) struct RemlState<'a> {
     y: ArrayView1<'a, f64>,
     x: DesignMatrix,
@@ -4523,6 +4529,13 @@ pub(crate) struct RemlState<'a> {
     ///
     /// Invalidated jointly with the design in `reset_surface`.
     pub(crate) gaussian_fixed_cache: RwLock<Option<Arc<crate::pirls::GaussianFixedCache>>>,
+    /// Frozen ALO robustness weights for this REML surface.
+    ///
+    /// The PSIS influence scale is a non-smooth function of the current hat
+    /// diagonals. Once the high-leverage ALO objective activates, it is frozen
+    /// for the current surface so the analytic gradient differentiates the
+    /// same fixed-weight objective the cost evaluates.
+    alo_frozen_nuisance: RwLock<Option<AloFrozenNuisance>>,
 
     /// Stable disk-cache key for the current realized REML surface. Computed
     /// lazily because it hashes the row-chunked design and data vectors.
