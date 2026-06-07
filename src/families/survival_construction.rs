@@ -1929,16 +1929,13 @@ pub fn baseline_offset_theta_partials(
     age: f64,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<Option<Vec<(f64, f64)>>, String> {
-    if !age.is_finite() || age <= 0.0 {
-        return Err(
-            "survival ages must be finite and positive for baseline derivative evaluation"
-                .to_string(),
-        );
-    }
+    let Some(params) = validated_baseline_params(age, cfg, "baseline derivative evaluation")?
+    else {
+        return Ok(None);
+    };
 
-    match cfg.target {
-        SurvivalBaselineTarget::Linear => Ok(None),
-        SurvivalBaselineTarget::Weibull => {
+    match params {
+        ValidatedBaselineTarget::Weibull { scale, shape } => {
             // eta = shape·(log t − log scale)
             //     = shape·log t − shape·log scale
             // o_D = shape / t
@@ -1947,18 +1944,6 @@ pub fn baseline_offset_theta_partials(
             //   ∂eta/∂log_scale  = −shape          ∂o_D/∂log_scale = 0
             //   ∂eta/∂log_shape  = shape·(log t − log scale) = eta
             //   ∂o_D/∂log_shape  = shape / t = o_D
-            let scale = cfg
-                .scale
-                .ok_or_else(|| "weibull missing scale".to_string())?;
-            let shape = cfg
-                .shape
-                .ok_or_else(|| "weibull missing shape".to_string())?;
-            if !(scale.is_finite() && shape.is_finite() && scale > 0.0 && shape > 0.0) {
-                return Err(SurvivalConstructionError::InvalidConfig {
-                    reason: "weibull baseline requires finite positive scale and shape".to_string(),
-                }
-                .into());
-            }
             let eta = shape * (age.ln() - scale.ln());
             let o_d = shape / age;
             let d_eta_d_log_scale = -shape;
@@ -1970,18 +1955,7 @@ pub fn baseline_offset_theta_partials(
                 (d_eta_d_log_shape, d_od_d_log_shape),
             ]))
         }
-        SurvivalBaselineTarget::Gompertz => {
-            let rate = cfg
-                .rate
-                .ok_or_else(|| "gompertz missing rate".to_string())?;
-            let shape = cfg
-                .shape
-                .ok_or_else(|| "gompertz missing shape".to_string())?;
-            if !(rate.is_finite() && shape.is_finite() && rate > 0.0) {
-                return Err(
-                    "gompertz baseline requires finite positive rate and finite shape".to_string(),
-                );
-            }
+        ValidatedBaselineTarget::Gompertz { shape, .. } => {
             // θ = (log_rate, shape):
             //   Rate cancels in o_D = h/H for Gompertz, so ∂o_D/∂log_rate = 0
             //   and ∂eta/∂log_rate = 1. The shape channel uses
@@ -1994,23 +1968,11 @@ pub fn baseline_offset_theta_partials(
             let (d_eta_d_shape, d_od_d_shape) = gompertz_shape_derivatives(age, shape);
             Ok(Some(vec![(1.0, 0.0), (d_eta_d_shape, d_od_d_shape)]))
         }
-        SurvivalBaselineTarget::GompertzMakeham => {
-            let rate = cfg.rate.ok_or_else(|| "gm missing rate".to_string())?;
-            let shape = cfg.shape.ok_or_else(|| "gm missing shape".to_string())?;
-            let makeham = cfg
-                .makeham
-                .ok_or_else(|| "gm missing makeham".to_string())?;
-            if !(rate.is_finite()
-                && shape.is_finite()
-                && makeham.is_finite()
-                && rate > 0.0
-                && makeham > 0.0)
-            {
-                return Err(
-                    "gompertz-makeham baseline requires finite positive rate, makeham, and finite shape"
-                        .to_string(),
-                );
-            }
+        ValidatedBaselineTarget::GompertzMakeham {
+            rate,
+            shape,
+            makeham,
+        } => {
             // H(t) = M·t + H_G(t),   H_G(t) = (rate/shape)·(E−1),  E = exp(shape·t)
             // h(t) = M + h_G(t),     h_G(t) = rate·E
             // o_D  = h/H
@@ -2576,18 +2538,17 @@ pub fn evaluate_survival_baseline(
         };
     }
 
-    match cfg.target {
-        SurvivalBaselineTarget::Linear => Ok((0.0, 0.0)),
-        SurvivalBaselineTarget::Weibull => {
-            let scale = cfg.scale.unwrap_or(1.0);
-            let shape = cfg.shape.unwrap_or(1.0);
+    let Some(params) = validated_baseline_params(age, cfg, "baseline target evaluation")? else {
+        return Ok((0.0, 0.0));
+    };
+
+    match params {
+        ValidatedBaselineTarget::Weibull { scale, shape } => {
             let eta = shape * (age.ln() - scale.ln());
             let derivative = shape / age;
             Ok((eta, derivative))
         }
-        SurvivalBaselineTarget::Gompertz => {
-            let rate = cfg.rate.unwrap_or(1.0);
-            let shape = cfg.shape.unwrap_or(0.0);
+        ValidatedBaselineTarget::Gompertz { rate, shape } => {
             let (h, inst) = gompertz_hazard_components(age, rate, shape);
             if h <= 0.0 || !h.is_finite() {
                 return Err(if shape.abs() < 1e-10 {
@@ -2599,10 +2560,11 @@ pub fn evaluate_survival_baseline(
             let derivative = inst / h;
             Ok((h.ln(), derivative))
         }
-        SurvivalBaselineTarget::GompertzMakeham => {
-            let makeham = cfg.makeham.unwrap_or(0.0);
-            let rate = cfg.rate.unwrap_or(1.0);
-            let shape = cfg.shape.unwrap_or(0.0);
+        ValidatedBaselineTarget::GompertzMakeham {
+            rate,
+            shape,
+            makeham,
+        } => {
             let (h_gompertz, inst_gompertz) = gompertz_hazard_components(age, rate, shape);
             let h = makeham * age + h_gompertz;
             if h <= 0.0 || !h.is_finite() {
@@ -2904,18 +2866,57 @@ fn gompertz_cumulative_shape_second_derivative(age: f64, rate: f64, shape: f64) 
 // Baseline offsets
 // ---------------------------------------------------------------------------
 
-/// Compute baseline target offsets for all observations.
-/// Returns `(eta_entry, eta_exit, derivative_exit)`.
-pub fn build_survival_baseline_offsets(
+#[derive(Clone, Copy)]
+enum BaselineOffsetEvaluator {
+    LogCumulativeHazard,
+    ProbitSurvival,
+}
+
+impl BaselineOffsetEvaluator {
+    fn length_error(self) -> String {
+        match self {
+            Self::LogCumulativeHazard => SurvivalConstructionError::IncompatibleDimensions {
+                reason: "survival baseline offsets require matching entry/exit lengths".to_string(),
+            }
+            .into(),
+            Self::ProbitSurvival => {
+                "survival probit baseline offsets require matching entry/exit lengths".to_string()
+            }
+        }
+    }
+
+    fn finite_error(self) -> &'static str {
+        match self {
+            Self::LogCumulativeHazard => "non-finite survival baseline offsets computed",
+            Self::ProbitSurvival => "non-finite survival probit baseline offsets computed",
+        }
+    }
+
+    fn evaluate(self, age: f64, cfg: &SurvivalBaselineConfig) -> Result<(f64, f64), String> {
+        match self {
+            Self::LogCumulativeHazard => evaluate_survival_baseline(age, cfg),
+            Self::ProbitSurvival => evaluate_survival_marginal_slope_baseline(age, cfg),
+        }
+    }
+
+    fn exit_is_finite(self, value: f64, age: f64) -> bool {
+        match self {
+            Self::LogCumulativeHazard => {
+                value.is_finite() || (age == 0.0 && value == f64::NEG_INFINITY)
+            }
+            Self::ProbitSurvival => value.is_finite(),
+        }
+    }
+}
+
+fn build_survival_offsets_with_evaluator(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
     cfg: &SurvivalBaselineConfig,
+    evaluator: BaselineOffsetEvaluator,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
     if age_entry.len() != age_exit.len() {
-        return Err(SurvivalConstructionError::IncompatibleDimensions {
-            reason: "survival baseline offsets require matching entry/exit lengths".to_string(),
-        }
-        .into());
+        return Err(evaluator.length_error());
     }
     let n = age_entry.len();
     // Each row's three offsets are independent across i. Compute the triplets
@@ -2923,13 +2924,9 @@ pub fn build_survival_baseline_offsets(
     let triples: Vec<(f64, f64, f64)> = (0..n)
         .into_par_iter()
         .map(|i| -> Result<(f64, f64, f64), String> {
-            // Origin-entry rows have `entry_at_origin[i] = true` in the engine
-            // (`age_entry[i] <= 1e-8`) and their eta_entry value is multiplied
-            // out by `has_entry_interval = false` in the NLL/gradient/Hessian.
-            // `evaluate_survival_baseline` reports log H(0) = -inf for
-            // parametric targets at the origin; we substitute a finite zero
-            // placeholder for the entry channel here so downstream sums that
-            // would otherwise propagate -inf via gated rows stay finite.
+            // Origin-entry rows are multiplied out by the survival engines, so
+            // keep their entry channel finite even when the evaluator's natural
+            // value at t=0 is undefined or -inf.
             let entry_age = age_entry[i];
             let e0 = if !entry_age.is_finite() {
                 return Err(SurvivalConstructionError::DataValidationFailed {
@@ -2939,19 +2936,13 @@ pub fn build_survival_baseline_offsets(
             } else if entry_age <= 0.0 {
                 0.0
             } else {
-                evaluate_survival_baseline(entry_age, cfg)?.0
+                evaluator.evaluate(entry_age, cfg)?.0
             };
             let exit_age = age_exit[i];
-            let (e1, d1) = evaluate_survival_baseline(exit_age, cfg)?;
-            // The exit channel is the log-cumulative-hazard offset; at t = 0
-            // we report H(0) = 0 exactly via eta_exit = -inf so that
-            // `exp(eta_exit) = 0` round-trips to the physical cumulative
-            // hazard. The derivative is zero at the origin (no contribution
-            // yet). All other values must be finite.
-            let exit_origin = exit_age == 0.0 && e1 == f64::NEG_INFINITY;
-            if !e0.is_finite() || (!exit_origin && !e1.is_finite()) || !d1.is_finite() {
+            let (e1, d1) = evaluator.evaluate(exit_age, cfg)?;
+            if !e0.is_finite() || !evaluator.exit_is_finite(e1, exit_age) || !d1.is_finite() {
                 return Err(SurvivalConstructionError::DataValidationFailed {
-                    reason: "non-finite survival baseline offsets computed".to_string(),
+                    reason: evaluator.finite_error().to_string(),
                 }
                 .into());
             }
@@ -2969,6 +2960,21 @@ pub fn build_survival_baseline_offsets(
     Ok((eta_entry, eta_exit, derivative_exit))
 }
 
+/// Compute baseline target offsets for all observations.
+/// Returns `(eta_entry, eta_exit, derivative_exit)`.
+pub fn build_survival_baseline_offsets(
+    age_entry: &Array1<f64>,
+    age_exit: &Array1<f64>,
+    cfg: &SurvivalBaselineConfig,
+) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
+    build_survival_offsets_with_evaluator(
+        age_entry,
+        age_exit,
+        cfg,
+        BaselineOffsetEvaluator::LogCumulativeHazard,
+    )
+}
+
 /// Compute probit-survival baseline target offsets for all observations.
 /// Returns `(q_entry, q_exit, q_derivative_exit)` where `Phi(-q(t)) = exp(-H0(t))`.
 pub fn build_survival_marginal_slope_baseline_offsets(
@@ -2976,52 +2982,12 @@ pub fn build_survival_marginal_slope_baseline_offsets(
     age_exit: &Array1<f64>,
     cfg: &SurvivalBaselineConfig,
 ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>), String> {
-    if age_entry.len() != age_exit.len() {
-        return Err(
-            "survival probit baseline offsets require matching entry/exit lengths".to_string(),
-        );
-    }
-    let n = age_entry.len();
-    // Per-row marginal-slope baseline triplets are independent: evaluate in
-    // parallel, then materialize the three Array1 outputs in order.
-    let triples: Vec<(f64, f64, f64)> = (0..n)
-        .into_par_iter()
-        .map(|i| -> Result<(f64, f64, f64), String> {
-            // See `build_survival_baseline_offsets`: origin-entry rows are
-            // gated by `entry_at_origin[i]` in the engine and their entry
-            // channel is multiplied out. `evaluate_survival_marginal_slope_baseline`
-            // forwards an `age <= 0` reject from `survival_cumulative_and_instant_hazard`,
-            // so short-circuit origin entries to a finite placeholder here.
-            let entry_age = age_entry[i];
-            let e0 = if !entry_age.is_finite() {
-                return Err(SurvivalConstructionError::DataValidationFailed {
-                    reason: format!("non-finite entry age at row {i}"),
-                }
-                .into());
-            } else if entry_age <= 0.0 {
-                0.0
-            } else {
-                evaluate_survival_marginal_slope_baseline(entry_age, cfg)?.0
-            };
-            let (e1, d1) = evaluate_survival_marginal_slope_baseline(age_exit[i], cfg)?;
-            if !e0.is_finite() || !e1.is_finite() || !d1.is_finite() {
-                return Err(SurvivalConstructionError::DataValidationFailed {
-                    reason: "non-finite survival probit baseline offsets computed".to_string(),
-                }
-                .into());
-            }
-            Ok((e0, e1, d1))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let mut eta_entry = Array1::<f64>::zeros(n);
-    let mut eta_exit = Array1::<f64>::zeros(n);
-    let mut derivative_exit = Array1::<f64>::zeros(n);
-    for (i, (e0, e1, d1)) in triples.into_iter().enumerate() {
-        eta_entry[i] = e0;
-        eta_exit[i] = e1;
-        derivative_exit[i] = d1;
-    }
-    Ok((eta_entry, eta_exit, derivative_exit))
+    build_survival_offsets_with_evaluator(
+        age_entry,
+        age_exit,
+        cfg,
+        BaselineOffsetEvaluator::ProbitSurvival,
+    )
 }
 
 pub fn location_scale_uses_probit_survival_baseline(inverse_link: Option<&InverseLink>) -> bool {
