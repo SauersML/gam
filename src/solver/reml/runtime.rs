@@ -1507,11 +1507,20 @@ fn reml_jeffreys_supported_link(likelihood: &GlmLikelihoodSpec) -> Option<Invers
 /// Resolve whether the Jeffreys/Firth term should be assembled on the REML path
 /// and, if so, the inverse link to evaluate the Fisher weight with.
 ///
-/// Robustness is unconditionally on, so the gate covers every Binomial inverse
-/// link with a Fisher-weight jet. Unsupported links return `None` instead of
-/// pretending they are Logit.
+/// The Jeffreys term is assembled iff the caller requested Firth bias reduction
+/// (`firth_bias_reduction`) on a Binomial inverse link that exposes a
+/// Fisher-weight jet. This MUST agree with the inner P-IRLS Firth activation in
+/// `loop_driver.rs`: the outer analytic derivatives (`H`, `u`, IFT) and the
+/// converged inner mode have to be derivatives of the SAME penalized objective.
+/// Arming the outer term while the inner mode is non-Firth (or vice-versa)
+/// desyncs the two by exactly the Jeffreys score/curvature contribution and
+/// breaks the τ-τ Hessian-vs-FD and stationarity-cancellation identities
+/// (#825). Unsupported links return `None` instead of pretending they are Logit.
 #[inline]
 pub(super) fn reml_robust_jeffreys_link(config: &RemlConfig) -> Option<InverseLink> {
+    if !config.firth_bias_reduction {
+        return None;
+    }
     reml_jeffreys_supported_link(&config.likelihood)
 }
 

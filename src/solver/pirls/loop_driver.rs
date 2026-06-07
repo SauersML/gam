@@ -1216,9 +1216,18 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         workspace,
         config.likelihood.clone(),
         config.link_kind.clone(),
-        // Robustness is unconditionally on: the inner Firth/Jeffreys activation
-        // covers every binomial inverse link with a Fisher-weight jet.
-        matches!(config.likelihood.spec.response, ResponseFamily::Binomial)
+        // Inner Firth/Jeffreys activation must agree with the caller-requested
+        // mode. The REML *outer* analytic derivative assembly only carries the
+        // Jeffreys score/curvature term when `firth_bias_reduction` is set
+        // (`reml_robust_jeffreys_link` returns `None` otherwise), so arming the
+        // inner penalty unconditionally would converge the inner mode to the
+        // Firth-penalized stationary point while the outer H/u/IFT stayed
+        // non-Firth — the two would then disagree by exactly the Jeffreys
+        // contribution (broken τ-τ Hessian-vs-FD and stationarity-cancellation
+        // identities, #825). Gate on `firth_bias_reduction` so inner and outer
+        // are the same objective.
+        config.firth_bias_reduction
+            && matches!(config.likelihood.spec.response, ResponseFamily::Binomial)
             && inverse_link_has_fisher_weight_jet(&config.link_kind),
         transform_active.clone(),
         quadctx,
@@ -1267,19 +1276,26 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     } else {
         initial_beta
     };
-    // Inner P-IRLS Firth activation. Robustness is unconditionally on, so the
-    // family-general Jeffreys/Firth term is armed on every binomial inverse link
-    // with a Fisher-weight jet.
-    let firth_active = matches!(config.likelihood.spec.response, ResponseFamily::Binomial)
+    // Inner P-IRLS Firth activation. The inner penalized objective must match
+    // the objective the REML outer derivatives are assembled against: the outer
+    // path carries the Jeffreys/Firth score+curvature only when the caller set
+    // `firth_bias_reduction` (`reml_robust_jeffreys_link` is `None` otherwise),
+    // so the inner Firth term is armed iff the caller requested it AND the link
+    // exposes a Fisher-weight jet (#825). Forcing it on unconditionally desynced
+    // the Firth-penalized inner mode from the non-Firth outer assembly.
+    let firth_active = config.firth_bias_reduction
+        && matches!(config.likelihood.spec.response, ResponseFamily::Binomial)
         && inverse_link_has_fisher_weight_jet(&config.link_kind);
     let base_max_step_halving = if firth_active { 60 } else { 30 };
     let options = WorkingModelPirlsOptions {
-        // Firth logit fits often need more inner iterations to settle.
-        max_iterations: if firth_active {
-            config.max_iterations.max(200)
-        } else {
-            config.max_iterations
-        },
+        // The Firth-penalized P-IRLS converges at the same iteration count as
+        // the unpenalized fit — the Jeffreys term is a smooth, bounded addition
+        // to a Newton system that is already well conditioned (the additional
+        // per-iteration LM step-halving budget above absorbs the early-iteration
+        // curvature change). Bumping the outer-iteration cap to mask a
+        // mis-conditioned step would only hide non-convergence, so the cap stays
+        // the caller's `max_iterations` and trips as a hard error if exceeded.
+        max_iterations: config.max_iterations,
         convergence_tolerance: config.convergence_tolerance,
         adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
