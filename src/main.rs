@@ -732,13 +732,6 @@ enum PredictModeArg {
     Map,
 }
 
-/// CLI-side alias for the canonical model-payload schema version defined in
-/// `gam::inference::model::MODEL_PAYLOAD_VERSION`. Kept as a re-export so
-/// existing `FittedModelPayload::new(MODEL_VERSION, ...)` call sites remain
-/// unchanged; the underlying source of truth now lives next to the struct
-/// whose schema it describes, eliminating drift between writer and reader.
-const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
-
 struct CliFirthValidation<'a> {
     enabled: bool,
     family: LikelihoodSpec,
@@ -1630,7 +1623,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
             saved_latent_cloglog_state_from_fit(&saved_fit)
         };
         let mut payload = FittedModelPayload::new(
-            MODEL_VERSION,
+            MODEL_PAYLOAD_VERSION,
             formula_text,
             ModelKind::Standard,
             FittedFamily::Standard {

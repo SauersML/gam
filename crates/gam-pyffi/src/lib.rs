@@ -153,8 +153,6 @@ use std::io::{BufWriter, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-const MODEL_VERSION: u32 = MODEL_PAYLOAD_VERSION;
-
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PyFitConfig {
@@ -30250,7 +30248,7 @@ fn build_standard_payload(
     let family_inverse_link = family.link.clone();
     let family_name = family.name().to_string();
     let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
+        MODEL_PAYLOAD_VERSION,
         formula,
         ModelKind::Standard,
         FittedFamily::Standard {
