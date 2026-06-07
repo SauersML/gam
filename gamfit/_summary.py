@@ -26,6 +26,7 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "model_class",
     "deviance",
     "reml_score",
+    "raw_reml_score",
     "null_space_logdet",
     "null_dim",
     "iterations",
@@ -63,7 +64,10 @@ class Summary:
         Model deviance at the converged fit. ``None`` for models that do not
         report a deviance.
     reml_score : float or None
-        Outer-loop REML / LAML log marginal-likelihood at convergence.
+        Comparable REML / LAML cost at convergence, including the
+        rank-aware Tierney-Kadane null-space normalizer when available.
+    raw_reml_score : float or None
+        Raw outer-loop REML / LAML cost before the null-space normalizer.
     null_space_logdet : float or None
         Log-determinant of the null-space penalty Gram block; used by the
         evidence calculation.
@@ -116,6 +120,7 @@ class Summary:
     model_class: str = ""
     deviance: float | None = None
     reml_score: float | None = None
+    raw_reml_score: float | None = None
     null_space_logdet: float | None = None
     null_dim: float | None = None
     iterations: int | None = None
