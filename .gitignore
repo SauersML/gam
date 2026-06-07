@@ -8,8 +8,14 @@ bench/**/__pycache__/
 benchmarks/**/__pycache__/
 tests/**/__pycache__/
 tests/bench_tools/*.joblib
-=
 benchmarks/results.cv_*.json
+
+# Ad-hoc reproduction / debug scripts and build logs that occasionally get
+# created at the repo root during bug triage. Keep them out of commits and,
+# in turn, out of the published gamfit sdist.
+/repro*.py
+/rs.py
+/build_*.log
 benchmarks/results.*.local.json
 benchmarks/results.*.debug.json
 benchmarks/results.*.fair.json
