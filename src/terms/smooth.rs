@@ -20080,6 +20080,76 @@ mod tests {
         }
     }
 
+    fn structural_shape_hex(spec: &TermCollectionSpec) -> String {
+        let mut h = crate::cache::Fingerprinter::new();
+        spec.write_structural_shape_hash(&mut h);
+        h.finish_hex()
+    }
+
+    fn smooth_only_collection(basis: SmoothBasisSpec) -> TermCollectionSpec {
+        TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                name: "s".to_string(),
+                basis,
+                shape: ShapeConstraint::None,
+                joint_null_rotation: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn structural_shape_hash_separates_topologies_but_repeats_for_same_topology(/* #869 */) {
+        // Two collections that differ only in their smooth's basis variant must
+        // hash differently, so AUTO topology candidates fit on the same data
+        // cannot share one warm-start key and cross-seed incompatible β/ρ.
+        let bspline = smooth_only_collection(remap_test_bspline(0));
+        let sphere = smooth_only_collection(SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 1, 2],
+            spec: SphericalSplineBasisSpec::default(),
+        });
+        assert_ne!(
+            structural_shape_hex(&bspline),
+            structural_shape_hex(&sphere),
+            "bspline and sphere topologies must key distinctly"
+        );
+
+        // Same topology on a different axis is still a different fit.
+        let bspline_axis1 = smooth_only_collection(remap_test_bspline(1));
+        assert_ne!(
+            structural_shape_hex(&bspline),
+            structural_shape_hex(&bspline_axis1),
+            "same basis kind on a different feature column must key distinctly"
+        );
+
+        // The same topology on the same axis keys identically, so a refit of one
+        // candidate (the screen→full-refit cascade) still hits its own key.
+        let bspline_again = smooth_only_collection(remap_test_bspline(0));
+        assert_eq!(
+            structural_shape_hex(&bspline),
+            structural_shape_hex(&bspline_again),
+            "identical topology must reuse the same warm-start key"
+        );
+    }
+
+    #[test]
+    fn structural_kind_and_feature_cols_track_basis_identity(/* #869 */) {
+        // Distinct basis variants get distinct discriminants, and a wrapper
+        // delegates feature columns to its inner basis so a `by=` smooth keys
+        // off the same axis as the bare smooth.
+        let bspline = remap_test_bspline(2);
+        let sphere = SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 1, 2],
+            spec: SphericalSplineBasisSpec::default(),
+        };
+        assert_ne!(bspline.structural_kind(), sphere.structural_kind());
+        assert_eq!(bspline.structural_kind(), "bspline_1d");
+        assert_eq!(sphere.structural_kind(), "sphere");
+        assert_eq!(bspline.structural_feature_cols(), vec![2]);
+        assert_eq!(sphere.structural_feature_cols(), vec![0, 1, 2]);
+    }
+
     #[test]
     fn remap_feature_columns_rewrites_every_index_bearing_field() {
         // Exhaustively verify that TermCollectionSpec::remap_feature_columns
