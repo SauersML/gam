@@ -12558,96 +12558,6 @@ fn generic_kkt_refusal_guidance() -> &'static str {
      or whether a constrained fit has an incomplete active set"
 }
 
-/// Format a one-line diagnostic naming which block carries the dominant
-/// unresolved KKT residual when the joint Newton refuses to certify
-/// convergence. This is the actionable signal a user needs to recognise
-/// model ill-posedness — the rejected fit is the *symptom*, the block
-/// with the unresolved gradient is the *cause*. Embedded in the error
-/// string returned by the inner solver so the cause survives serialisation
-/// through the outer optimiser, the seed-validation cascade, and gamfit.
-fn block_residual_diagnostic_string(
-    cached_joint_gradient: Option<&Array1<f64>>,
-    states: &[ParameterBlockState],
-    specs: &[ParameterBlockSpec],
-    s_lambdas: &[Array2<f64>],
-    ridge: f64,
-    ridge_policy: RidgePolicy,
-) -> String {
-    let Some(joint_grad) = cached_joint_gradient else {
-        return "no joint gradient available for block diagnostic".to_string();
-    };
-    let block_widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
-    let block_beta_inf: Vec<f64> = states
-        .iter()
-        .map(|s| s.beta.iter().map(|x: &f64| x.abs()).fold(0.0_f64, f64::max))
-        .collect();
-    let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-    let stationarity = exact_newton_joint_stationarity_vector_from_gradient(
-        joint_grad,
-        states,
-        specs,
-        s_lambdas,
-        ridge,
-        ridge_policy,
-    );
-    let (block_residual_inf, exit_kkt_inf) = match stationarity {
-        Ok(residual) => {
-            let mut acc = 0usize;
-            let by_block = states
-                .iter()
-                .map(|s| {
-                    let n = s.beta.len();
-                    let end = (acc + n).min(residual.len());
-                    let nrm = if acc < end {
-                        residual
-                            .slice(ndarray::s![acc..end])
-                            .iter()
-                            .map(|x: &f64| x.abs())
-                            .fold(0.0_f64, f64::max)
-                    } else {
-                        f64::NAN
-                    };
-                    acc += n;
-                    nrm
-                })
-                .collect::<Vec<_>>();
-            let joint = residual
-                .iter()
-                .map(|x: &f64| x.abs())
-                .fold(0.0_f64, f64::max);
-            (by_block, joint)
-        }
-        Err(_) => (vec![f64::NAN; states.len()], f64::NAN),
-    };
-    // Empty / zero-width blocks contribute `f64::NAN` to `block_residual_inf`
-    // above (the `acc >= end` branch). A `max_by` over `partial_cmp` treats
-    // NaN as `Ordering::Equal`, so an empty block can falsely win the max and
-    // be reported as the carrying block even though all finite residual lives
-    // in the active blocks. Restrict the selection to finite residuals so a
-    // genuinely zero-width block can never be named the dominant block.
-    let dominant_idx = block_residual_inf
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.is_finite())
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(i, _)| i);
-    let dominant = if let Some(i) = dominant_idx {
-        format!(
-            "block '{}' carries the dominant penalized stationarity residual (|Sβ − ∇L|∞ = {:.3e})",
-            names.get(i).copied().unwrap_or("?"),
-            block_residual_inf[i],
-        )
-    } else {
-        "<no blocks>".to_string()
-    };
-    format!(
-        "{dominant}; |∇L − Sβ|∞ = {exit_kkt_inf:.3e}, block_widths = {block_widths:?}, \
-         block_names = {names:?}, block_beta_inf = {block_beta_inf:?}, \
-         block_residual_inf = {block_residual_inf:?}; {}",
-        generic_kkt_refusal_guidance()
-    )
-}
-
 /// Per-iterate diagnostic snapshot assembled when the joint Newton inner solve
 /// refuses to certify constrained-stationarity. The report breaks the failure
 /// down by block (so the offending smooth can be named), records the H_pen
@@ -17073,17 +16983,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     last_math_summary,
                 );
                 if coupled_exact_joint_required {
-                    let block_diag = match last_kkt_refusal_report.as_ref() {
-                        Some(report) => report.format_bubbled_error(),
-                        None => block_residual_diagnostic_string(
-                            cached_joint_gradient.as_ref(),
-                            &states,
-                            specs,
-                            &s_lambdas,
-                            ridge,
-                            options.ridge_policy,
-                        ),
-                    };
+                    let block_diag = last_kkt_refusal_report
+                        .as_ref()
+                        .map(KktRefusalReport::format_bubbled_error)
+                        .or_else(|| {
+                            last_joint_math.as_ref().map(|math| {
+                                compute_kkt_refusal_report(
+                                    cycles_done,
+                                    &states,
+                                    specs,
+                                    &s_lambdas,
+                                    &ranges,
+                                    cached_joint_gradient.as_ref(),
+                                    &cached_active_sets,
+                                    &block_constraints,
+                                    &joint_hessian_source,
+                                    total_p,
+                                    ridge,
+                                    options.ridge_policy,
+                                    math.step_inf,
+                                    math.proposal_inf,
+                                    joint_trust_radius,
+                                    residual_tol,
+                                    objective_tol,
+                                    step_tol,
+                                    math.actual_reduction.abs(),
+                                    exit_unprojected_kkt_inf,
+                                    math,
+                                )
+                                .format_bubbled_error()
+                            })
+                        })
+                        .unwrap_or_else(|| {
+                            "structured KKT refusal report unavailable: no joint Newton math snapshot"
+                                .to_string()
+                        });
                     return Err(format!(
                         "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}"
                     ));
@@ -17136,26 +17070,47 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Bubble the structured KKT refusal report (per-block residual
             // breakdown + H_pen spectrum + diagnosis) so the cause of the
             // refusal survives serialization through the outer optimizer,
-            // the seed-validation cascade, and gamfit. When the cert
-            // refused inside the cycle loop we already computed a
-            // `KktRefusalReport` at the refusing iterate; reuse it
-            // verbatim — recomputing here would lose the spectrum at the
-            // actual failing β and double the eigh cost. When the loop
-            // never reached the cert refusal site (e.g. exited via a
-            // different early-exit path), fall back to the legacy one-line
-            // per-block diagnostic so the bubbled error still names the
-            // offending block.
-            let block_diag = match last_kkt_refusal_report.as_ref() {
-                Some(report) => report.format_bubbled_error(),
-                None => block_residual_diagnostic_string(
-                    cached_joint_gradient.as_ref(),
-                    &states,
-                    specs,
-                    &s_lambdas,
-                    ridge,
-                    options.ridge_policy,
-                ),
-            };
+            // the seed-validation cascade, and gamfit. When the cert refused
+            // inside the cycle loop we already computed a `KktRefusalReport`
+            // at the refusing iterate; reuse it verbatim. If a different
+            // early-exit path reaches this branch, build the same structured
+            // report from the last Newton math snapshot rather than routing
+            // through a second diagnostic string format.
+            let block_diag = last_kkt_refusal_report
+                .as_ref()
+                .map(KktRefusalReport::format_bubbled_error)
+                .or_else(|| {
+                    last_joint_math.as_ref().map(|math| {
+                        compute_kkt_refusal_report(
+                            cycles_done,
+                            &states,
+                            specs,
+                            &s_lambdas,
+                            &ranges,
+                            cached_joint_gradient.as_ref(),
+                            &cached_active_sets,
+                            &block_constraints,
+                            &joint_hessian_source,
+                            total_p,
+                            ridge,
+                            options.ridge_policy,
+                            math.step_inf,
+                            math.proposal_inf,
+                            joint_trust_radius,
+                            residual_tol,
+                            objective_tol,
+                            step_tol,
+                            math.actual_reduction.abs(),
+                            math.old_kkt_inf,
+                            math,
+                        )
+                        .format_bubbled_error()
+                    })
+                })
+                .unwrap_or_else(|| {
+                    "structured KKT refusal report unavailable: no joint Newton math snapshot"
+                        .to_string()
+                });
             return Err(format!(
                 "coupled exact-joint inner solve exited the joint Newton path before convergence — {block_diag}"
             ));
