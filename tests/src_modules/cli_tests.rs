@@ -1,19 +1,19 @@
 use super::{
     BlockRole, BoundedCoefficientPriorSpec, CliFirthValidation, DataSchema,
     FAMILY_GAUSSIAN_LOCATION_SCALE, FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice, LinkMode,
-    MODEL_VERSION, ModelKind, ResponseColumnKind, ResponseFamily, SavedFitSummary, SavedModel,
-    SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
-    build_survival_time_basis, classify_cli_error, collect_hierarchical_smooth_overlapwarnings,
-    collect_linear_smooth_overlapwarnings, collect_spatial_smooth_usagewarnings,
-    compact_fit_result_for_batch, compact_saved_multiblock_fit_result, compute_probit_q0_from_eta,
-    core_saved_fit_result, covariance_from_model, effectivelinkwiggle_formulaspec,
-    family_arg_canonical_name, fit_result_from_external, load_dataset_projected, parse_formula,
-    parse_link_choice, parse_matching_auxiliary_formula, parse_surv_response,
-    parse_survival_inverse_link, parse_survival_time_basis_config, predict_gam,
-    prepend_id_column_to_prediction_csv, required_columns_for_fit, required_columns_for_formula,
-    resolve_family, summarizewiggle_domain, validate_cli_firth_configuration,
-    write_gaussian_location_scale_prediction_csv, write_prediction_csv,
-    write_survival_binary_prediction_csv, write_survival_prediction_csv,
+    MODEL_PAYLOAD_VERSION, ModelKind, ResponseColumnKind, ResponseFamily, SavedFitSummary,
+    SavedModel, SurvivalArgs, SurvivalBaselineTarget, SurvivalLikelihoodMode,
+    SurvivalTimeBasisConfig, build_survival_time_basis, classify_cli_error,
+    collect_hierarchical_smooth_overlapwarnings, collect_linear_smooth_overlapwarnings,
+    collect_spatial_smooth_usagewarnings, compact_fit_result_for_batch,
+    compact_saved_multiblock_fit_result, compute_probit_q0_from_eta, core_saved_fit_result,
+    covariance_from_model, effectivelinkwiggle_formulaspec, family_arg_canonical_name,
+    fit_result_from_external, load_dataset_projected, parse_formula, parse_link_choice,
+    parse_matching_auxiliary_formula, parse_surv_response, parse_survival_inverse_link,
+    parse_survival_time_basis_config, predict_gam, prepend_id_column_to_prediction_csv,
+    required_columns_for_fit, required_columns_for_formula, resolve_family, summarizewiggle_domain,
+    validate_cli_firth_configuration, write_gaussian_location_scale_prediction_csv,
+    write_prediction_csv, write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
     Cli, Command, CovarianceModeArg, FitArgs, PredictArgs, PredictModeArg, SampleArgs, run_fit,
@@ -1579,7 +1579,7 @@ fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes()
         },
     );
     let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
+        MODEL_PAYLOAD_VERSION,
         "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")"
             .to_string(),
         ModelKind::MarginalSlope,
@@ -1676,7 +1676,7 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
     .expect("construct hessian-only fit result");
 
     let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
+        MODEL_PAYLOAD_VERSION,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {
@@ -1911,7 +1911,7 @@ fn test_payload(
     family: impl Into<String>,
 ) -> FittedModelPayload {
     let mut payload = FittedModelPayload::new(
-        MODEL_VERSION,
+        MODEL_PAYLOAD_VERSION,
         formula.into(),
         model_kind,
         family_state,
