@@ -1426,6 +1426,62 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
 }
 
 #[test]
+fn cli_bernoulli_marginal_slope_accepts_firth_as_redundant_noop() {
+    // Regression for #861: the bernoulli marginal-slope path runs an always-on
+    // full-span Jeffreys/Firth stabilizer by policy (#774), so `--firth` is redundant,
+    // not unsupported. The CLI must accept it (matching the Python API, which already
+    // accepts `firth=True` for this family) instead of hard-erroring. Survival
+    // marginal-slope firth stays rejected by `validate_cli_firth_configuration` and is
+    // covered by `cli_firth_validation_rejects_survival_models`.
+    let td = tempdir().expect("tempdir");
+    let train_path = td.path().join("train.csv");
+    let model_path = td.path().join("model.json");
+    write_bernoulli_marginal_slope_train_csv(&train_path);
+
+    run_fit(FitArgs {
+        data: train_path,
+        formula_positional: "y ~ x".to_string(),
+        predict_noise: None,
+        logslope_formula: Some("1".to_string()),
+        z_column: Some("z".to_string()),
+        weights_column: None,
+        offset_column: None,
+        noise_offset_column: None,
+        frailty_kind: None,
+        frailty_sd: None,
+        hazard_loading: None,
+        transformation_normal: false,
+        firth: true,
+        family: FamilyArg::Auto,
+        negative_binomial_theta: None,
+        survival_likelihood: "transformation".to_string(),
+        survival_time_anchor: None,
+        baseline_target: "linear".to_string(),
+        baseline_scale: None,
+        baseline_shape: None,
+        baseline_rate: None,
+        baseline_makeham: None,
+        time_basis: "ispline".to_string(),
+        time_degree: 3,
+        time_num_internal_knots: 8,
+        time_smooth_lambda: 1e-2,
+        ridge_lambda: 1e-6,
+        threshold_time_k: None,
+        threshold_time_degree: 3,
+        sigma_time_k: None,
+        sigma_time_degree: 3,
+        adaptive_regularization: false,
+        scale_dimensions: false,
+        pilot_subsample_threshold: 0,
+        out: Some(model_path.clone()),
+    })
+    .expect("--firth must be accepted as a redundant no-op for bernoulli marginal-slope (#861)");
+
+    // The fit must actually produce a saved model, not merely avoid erroring.
+    SavedModel::load_from_path(&model_path).expect("fit with --firth should save a model");
+}
+
+#[test]
 fn cli_bernoulli_marginal_slope_rejects_z_column_in_main_formula() {
     let td = tempdir().expect("tempdir");
     let train_path = td.path().join("train.csv");

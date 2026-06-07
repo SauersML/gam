@@ -1686,7 +1686,17 @@ fn run_fit_bernoulli_marginal_slope(
         );
     }
     if args.firth {
-        return Err("--firth is not supported for the bernoulli marginal-slope family".to_string());
+        // #861 / #774: the bernoulli marginal-slope path runs an always-on full-span
+        // Jeffreys/Firth stabilizer by policy, so `--firth` is *redundant*, not
+        // unsupported. Accept-and-noop to match the Python surface (which also accepts
+        // `firth=True` here), and advise the user the flag had no additional effect so
+        // that "is Firth active on marginal-slope?" gets one consistent, truthful answer.
+        inference_notes.push(
+            "--firth is redundant for the bernoulli marginal-slope family: a full-span \
+             Jeffreys/Firth stabilizer is always active by policy (#774), so the flag has \
+             no additional effect."
+                .to_string(),
+        );
     }
     if args.predict_noise.is_some() {
         return Err(
@@ -6768,9 +6778,11 @@ fn validate_fit_args_preflight(args: &FitArgs, parsed: &ParsedFormula) -> Result
                 "--predict-noise cannot be combined with --logslope-formula/--z-column".to_string(),
             );
         }
-        if args.firth {
-            return Err("--firth is not supported for marginal-slope fitting".to_string());
-        }
+        // #861: firth on marginal-slope is no longer rejected in this scattered preflight
+        // branch. Bernoulli marginal-slope accept-and-noops it (always-on Jeffreys/Firth,
+        // #774); survival marginal-slope firth is still rejected by
+        // `validate_cli_firth_configuration` (a `Surv(...)` response sets `is_survival`).
+        // Removing the bespoke gate here is what eliminates the CLI/Python divergence.
         if args.adaptive_regularization {
             return Err(
                 "--adaptive-regularization is only supported for standard GAM fitting".to_string(),
