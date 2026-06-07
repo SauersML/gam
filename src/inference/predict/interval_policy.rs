@@ -61,9 +61,11 @@ impl ResponseBounds {
     /// [`ResponseFamily`], matching [`ResponseFamily::response_support_bounds`].
     ///
     /// Distinct from [`Self::for_family`] (the *mean*-interval clamp): the
-    /// observation band is the symmetric `μ ± z·σ_pred`, which crosses the
-    /// support floor for a small fitted mean even when the mean-interval clamp
-    /// is `None`. See [`ResponseFamily::response_support_bounds`].
+    /// observation band (symmetric `μ ± z·σ_pred` for most families, equal-tailed
+    /// Gamma quantiles for the skewed Gamma arm, see `family_observation_band`)
+    /// crosses the support floor for a small fitted mean even when the
+    /// mean-interval clamp is `None`. See
+    /// [`ResponseFamily::response_support_bounds`].
     pub fn response_support(response: &ResponseFamily) -> Self {
         Self(response.response_support_bounds())
     }
