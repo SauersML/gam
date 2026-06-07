@@ -29017,11 +29017,15 @@ fn dataset_with_model_schema(
     if !missing.is_empty() {
         return Err(missing.join(" "));
     }
+    // Drop columns the model does not reference *before* encoding, so an
+    // unrelated ID/label column with a held-out categorical level is ignored
+    // rather than aborting predict against the training schema (#840).
+    let (headers, rows) = project_frame_to_model_columns(model, headers, rows)?;
     let schema = model.require_data_schema()?;
-    let records = string_records_from_rows(headers, rows)?;
+    let records = string_records_from_rows(&headers, &rows)?;
     let policy =
         UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
-    encode_recordswith_schema(headers.to_vec(), records, schema, policy)
+    encode_recordswith_schema(headers, records, schema, policy)
 }
 
 fn dataset_from_xy_arrays(
@@ -29276,10 +29280,14 @@ fn schema_check(
     }
 
     if issues.is_empty() {
-        let records = string_records_from_rows(headers, rows)?;
+        // Validate only the columns the model references; unrelated frame
+        // columns are not part of the model's input contract (#840) and must
+        // not trip the strict schema re-encode.
+        let (proj_headers, proj_rows) = project_frame_to_model_columns(model, headers, rows)?;
+        let records = string_records_from_rows(&proj_headers, &proj_rows)?;
         let policy =
             UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
-        if let Err(message) = encode_recordswith_schema(headers.to_vec(), records, schema, policy) {
+        if let Err(message) = encode_recordswith_schema(proj_headers, records, schema, policy) {
             issues.push(SchemaIssue {
                 kind: "schema_error".to_string(),
                 message,
@@ -29388,6 +29396,75 @@ fn required_prediction_columns(model: &FittedModel) -> Result<BTreeSet<String>, 
         }
     }
     Ok(required)
+}
+
+/// Columns a fitted model can legitimately consume from a prediction frame.
+///
+/// This is the model's *input contract*: every variable the formula names
+/// (features, interaction margins, random-effect grouping columns), plus the
+/// offset / noise-offset / latent-`z` / survival entry-exit columns surfaced
+/// by [`required_prediction_columns`], plus the response column (needed for
+/// the conformal-calibration fold and for survival / transformation-normal
+/// label-bearing frames).
+///
+/// Any column *not* in this set is irrelevant to the model — a row ID, a
+/// grouping/label column carried for bookkeeping, an auxiliary measurement —
+/// and must be ignored at predict time rather than strictly re-encoded against
+/// the training schema. See [`project_frame_to_model_columns`] for why.
+fn prediction_consumable_columns(model: &FittedModel) -> Result<BTreeSet<String>, String> {
+    let mut consumable = required_prediction_columns(model)?;
+    if let Some(response) = response_column_name(model.payload().formula.as_str()) {
+        consumable.insert(response);
+    }
+    Ok(consumable)
+}
+
+/// Project a prediction frame onto the columns the model actually references,
+/// preserving the input column order.
+///
+/// A fitted GAM is a function of exactly the variables in its formula (+
+/// offset / weights / response). Columns the model never references must not
+/// participate in prediction: in particular they must *not* be strictly
+/// re-encoded against the training schema. Without this projection, an
+/// unrelated categorical column — e.g. a `color`/`group`/`id` label kept in
+/// the frame for downstream bookkeeping — is re-validated against the training
+/// levels, so a held-out CV fold carrying a brand-new level aborts predict
+/// with `unseen level '…' in categorical column '…'` (the classic
+/// leave-one-group-out foot-gun, #840). Dropping such columns here mirrors
+/// mgcv / glm / scikit-learn `Pipeline` semantics, where extra frame columns
+/// are simply ignored.
+///
+/// All downstream prediction machinery resolves columns *by name* (the term
+/// spec is remapped through `training_headers` → name → prediction `col_map`,
+/// and offset/clip resolution look columns up by name with a graceful skip),
+/// so narrowing the encoded dataset to a subset of named columns is safe.
+fn project_frame_to_model_columns(
+    model: &FittedModel,
+    headers: &[String],
+    rows: &[Vec<String>],
+) -> Result<(Vec<String>, Vec<Vec<String>>), String> {
+    let consumable = prediction_consumable_columns(model)?;
+    let keep: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| consumable.contains(name.as_str()))
+        .map(|(idx, _)| idx)
+        .collect();
+    // Keep the frame verbatim when there is nothing to drop (the common case
+    // where the caller passes exactly the model's columns), or when a row's
+    // width disagrees with the header count — in the latter case we defer to
+    // the canonical width validation in `string_records_from_rows` instead of
+    // risking an out-of-bounds projection here.
+    let width_consistent = rows.iter().all(|row| row.len() == headers.len());
+    if keep.len() == headers.len() || !width_consistent {
+        return Ok((headers.to_vec(), rows.to_vec()));
+    }
+    let filtered_headers = keep.iter().map(|&i| headers[i].clone()).collect::<Vec<_>>();
+    let filtered_rows = rows
+        .iter()
+        .map(|row| keep.iter().map(|&i| row[i].clone()).collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    Ok((filtered_headers, filtered_rows))
 }
 
 fn add_auxiliary_formula_columns(
