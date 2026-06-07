@@ -23,8 +23,8 @@ use gam::basis::{
     CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
     MaternBasisSpec, MaternIdentifiability, MaternNu, SpatialIdentifiability,
 };
-use gam::bernoulli_marginal_slope::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::custom_family::BlockwiseFitOptions;
+use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,

@@ -10,7 +10,7 @@ use crate::custom_family::{
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
-use crate::families::bernoulli_marginal_slope::{
+use crate::families::bms::{
     CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,
     LatentZPolicy, MarginalSlopeCovariance, ParametricAnchorBlock,
     marginal_slope_covariance_from_scores, marginal_slope_preserving_scale,
@@ -838,7 +838,7 @@ fn block_slices(
 }
 
 /// Owned scratch buffers backing a
-/// [`crate::gpu::survival_flex::SurvivalFlexGpuRowInputs`] descriptor.
+/// [`crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs`] descriptor.
 ///
 /// Built per-call by
 /// [`SurvivalMarginalSlopeFamily::build_survival_flex_gpu_row_batch`];
@@ -859,12 +859,12 @@ struct SurvivalFlexGpuRowBatch {
 
 impl SurvivalFlexGpuRowBatch {
     /// Borrow the buffers as a
-    /// [`crate::gpu::survival_flex::SurvivalFlexGpuRowInputs`] descriptor.
+    /// [`crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs`] descriptor.
     fn as_inputs<'a>(
         &'a self,
         family: &SurvivalMarginalSlopeFamily,
-    ) -> crate::gpu::survival_flex::SurvivalFlexGpuRowInputs<'a> {
-        crate::gpu::survival_flex::SurvivalFlexGpuRowInputs {
+    ) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs<'a> {
+        crate::families::survival_marginal_slope_gpu::SurvivalFlexGpuRowInputs {
             n: self.n,
             r: N_PRIMARY,
             p: self.p,
@@ -907,12 +907,12 @@ struct FlexPrimarySlices {
 
 /// Pack a private `SurvivalFlexTimepointExact` into the Block 10
 /// pub-substrate input type so the shared CPU/GPU pure assembler in
-/// `crate::gpu::survival_flex` can consume it without taking a
+/// `crate::families::survival_marginal_slope_gpu` can consume it without taking a
 /// dependency on the family's private jet structs.
 pub(crate) fn block10_pack_base(
     base: &SurvivalFlexTimepointExact,
-) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
-    crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
+) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
+    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
         eta: base.eta,
         chi: base.chi,
         d: base.d,
@@ -927,8 +927,8 @@ pub(crate) fn block10_pack_base(
 
 pub(crate) fn block10_pack_dir(
     ext: &SurvivalFlexTimepointDirectionalExact,
-) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
-    crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
+) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
+    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
         eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
         chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
         d_u_dir: ext.d_u_dir.to_vec(),
@@ -938,8 +938,8 @@ pub(crate) fn block10_pack_dir(
 
 pub(crate) fn block10_pack_bi(
     bi: &SurvivalFlexTimepointBiDirectionalExact,
-) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
-    crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
+) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
+    crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
         eta_uv_uv: bi.eta_uv_uv.iter().copied().collect(),
         chi_uv_uv: bi.chi_uv_uv.iter().copied().collect(),
         d_uv_uv: bi.d_uv_uv.iter().copied().collect(),
@@ -1131,7 +1131,7 @@ struct DenestedCellPrimaryFixedPartials {
 
 impl DenestedCellPrimaryFixedPartials {
     /// Reconstruct the struct from the device-flat layout emitted by
-    /// `crate::gpu::survival_flex_prep::DENESTED_CELL_PRIMARY_FIXED_PARTIALS_KERNEL_SRC`.
+    /// `crate::families::survival_marginal_slope_gpu_prep::DENESTED_CELL_PRIMARY_FIXED_PARTIALS_KERNEL_SRC`.
     ///
     /// Layout (per cell):
     ///
@@ -6877,7 +6877,7 @@ impl SurvivalMarginalSlopeFamily {
     ///
     /// The cell-table assembly and the per-cell primary-fixed-partials
     /// assembly route through the GPU-shaped `try_device_*` seams in
-    /// [`crate::gpu::survival_flex_prep`].  Until the matching NVRTC kernels
+    /// [`crate::families::survival_marginal_slope_gpu_prep`].  Until the matching NVRTC kernels
     /// land, both seams return `Ok(None)` and the call site falls back to
     /// the existing CPU implementation, so behavior is preserved.
     fn build_cached_partition_with_moment_order(
@@ -6891,16 +6891,18 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<CachedPartitionCells, String> {
         // ── 1. partition cells via the device seam, CPU fallback on decline ──
         let raw_cells = {
-            let row_input = crate::gpu::survival_flex_prep::PartitionCellsRowInputs {
-                a,
-                b,
-                beta_h: beta_h.and_then(|b| b.as_slice()),
-                beta_w: beta_w.and_then(|b| b.as_slice()),
-            };
-            let dev = crate::gpu::survival_flex_prep::try_device_partition_cells(
-                std::slice::from_ref(&row_input),
-            )
-            .map_err(|e| e.to_string())?;
+            let row_input =
+                crate::families::survival_marginal_slope_gpu_prep::PartitionCellsRowInputs {
+                    a,
+                    b,
+                    beta_h: beta_h.and_then(|b| b.as_slice()),
+                    beta_w: beta_w.and_then(|b| b.as_slice()),
+                };
+            let dev =
+                crate::families::survival_marginal_slope_gpu_prep::try_device_partition_cells(
+                    std::slice::from_ref(&row_input),
+                )
+                .map_err(|e| e.to_string())?;
             match dev {
                 Some(mut by_row) if by_row.len() == 1 => by_row.remove(0),
                 _ => self.denested_partition_cells(a, b, beta_h, beta_w)?,
@@ -6913,10 +6915,9 @@ impl SurvivalMarginalSlopeFamily {
         let mut z_mids = Vec::with_capacity(n);
         let mut u_mids = Vec::with_capacity(n);
         let mut states = Vec::with_capacity(n);
-        let mut fp_inputs =
-            Vec::<crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsCellInputs>::with_capacity(
-                n,
-            );
+        let mut fp_inputs = Vec::<
+            crate::families::survival_marginal_slope_gpu_prep::CellPrimaryFixedPartialsCellInputs,
+        >::with_capacity(n);
         for partition_cell in &raw_cells {
             let cell = partition_cell.cell;
             let neg_cell = exact_kernel::DenestedCubicCell {
@@ -6935,7 +6936,7 @@ impl SurvivalMarginalSlopeFamily {
             u_mids.push(u_mid);
             states.push(state);
             fp_inputs.push(
-                crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsCellInputs {
+                crate::families::survival_marginal_slope_gpu_prep::CellPrimaryFixedPartialsCellInputs {
                     score_span: partition_cell.score_span,
                     link_span: partition_cell.link_span,
                     z_basis: z_mid,
@@ -6945,7 +6946,7 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         // ── 3. per-cell fixed partials via the device seam, CPU fallback ──
-        let layout = crate::gpu::survival_flex_prep::FlexPrimaryLayout {
+        let layout = crate::families::survival_marginal_slope_gpu_prep::FlexPrimaryLayout {
             r: u32::try_from(primary.total).map_err(|_| {
                 format!(
                     "build_cached_partition_with_moment_order: primary.total={} exceeds u32",
@@ -6959,13 +6960,14 @@ impl SurvivalMarginalSlopeFamily {
                 )
             })?,
         };
-        let row_fp_input = crate::gpu::survival_flex_prep::CellPrimaryFixedPartialsRowInputs {
-            a,
-            b,
-            cells: &fp_inputs,
-            layout,
-        };
-        let dev_fixed = crate::gpu::survival_flex_prep::try_device_cell_primary_fixed_partials(
+        let row_fp_input =
+            crate::families::survival_marginal_slope_gpu_prep::CellPrimaryFixedPartialsRowInputs {
+                a,
+                b,
+                cells: &fp_inputs,
+                layout,
+            };
+        let dev_fixed = crate::families::survival_marginal_slope_gpu_prep::try_device_cell_primary_fixed_partials(
             std::slice::from_ref(&row_fp_input),
         )
         .map_err(|e| e.to_string())?;
@@ -7791,7 +7793,7 @@ impl SurvivalMarginalSlopeFamily {
         // jets via `compute_survival_timepoint_exact` →
         // `build_cached_partition_with_moment_order`, so the only remaining
         // family-side hop is the Step-5 G/H pullback in
-        // [`crate::gpu::survival_flex::try_device_step5_primary_assembly`].
+        // [`crate::families::survival_marginal_slope_gpu::try_device_step5_primary_assembly`].
         //
         // The GPU entry takes flat `&[f64]` views; both `Array1` and `Array2`
         // returned by the timepoint-exact pass live in standard contiguous
@@ -7831,44 +7833,46 @@ impl SurvivalMarginalSlopeFamily {
             && exit.d.is_finite()
             && exit.d > 0.0
         {
-            let row_inputs = [crate::gpu::survival_flex::SurvivalFlexStep5RowInputs {
-                entry: crate::gpu::survival_flex::SurvivalFlexTimepointJet {
-                    eta: entry.eta,
-                    chi: entry.chi,
-                    d: entry.d,
-                    eta_u: entry_eta_u.unwrap(),
-                    eta_uv: entry_eta_uv.unwrap(),
-                    chi_u: entry_chi_u.unwrap(),
-                    chi_uv: entry_chi_uv.unwrap(),
-                    d_u: entry_d_u.unwrap(),
-                    d_uv: entry_d_uv.unwrap(),
+            let row_inputs = [
+                crate::families::survival_marginal_slope_gpu::SurvivalFlexStep5RowInputs {
+                    entry: crate::families::survival_marginal_slope_gpu::SurvivalFlexTimepointJet {
+                        eta: entry.eta,
+                        chi: entry.chi,
+                        d: entry.d,
+                        eta_u: entry_eta_u.unwrap(),
+                        eta_uv: entry_eta_uv.unwrap(),
+                        chi_u: entry_chi_u.unwrap(),
+                        chi_uv: entry_chi_uv.unwrap(),
+                        d_u: entry_d_u.unwrap(),
+                        d_uv: entry_d_uv.unwrap(),
+                    },
+                    exit: crate::families::survival_marginal_slope_gpu::SurvivalFlexTimepointJet {
+                        eta: exit.eta,
+                        chi: exit.chi,
+                        d: exit.d,
+                        eta_u: exit_eta_u.unwrap(),
+                        eta_uv: exit_eta_uv.unwrap(),
+                        chi_u: exit_chi_u.unwrap(),
+                        chi_uv: exit_chi_uv.unwrap(),
+                        d_u: exit_d_u.unwrap(),
+                        d_uv: exit_d_uv.unwrap(),
+                    },
+                    wi,
+                    di,
+                    q1,
+                    qd1,
+                    q1_index: primary.q1,
+                    qd1_index: primary.qd1,
+                    entry_k1,
+                    entry_k2,
+                    exit_k1,
+                    exit_k2,
+                    log_surv0,
+                    log_surv1,
                 },
-                exit: crate::gpu::survival_flex::SurvivalFlexTimepointJet {
-                    eta: exit.eta,
-                    chi: exit.chi,
-                    d: exit.d,
-                    eta_u: exit_eta_u.unwrap(),
-                    eta_uv: exit_eta_uv.unwrap(),
-                    chi_u: exit_chi_u.unwrap(),
-                    chi_uv: exit_chi_uv.unwrap(),
-                    d_u: exit_d_u.unwrap(),
-                    d_uv: exit_d_uv.unwrap(),
-                },
-                wi,
-                di,
-                q1,
-                qd1,
-                q1_index: primary.q1,
-                qd1_index: primary.qd1,
-                entry_k1,
-                entry_k2,
-                exit_k1,
-                exit_k2,
-                log_surv0,
-                log_surv1,
-            }];
+            ];
             // `try_device_step5_primary_assembly` is the device-shape Step-5
-            // pullback (`src/gpu/survival_flex.rs:3513`).  Its current body
+            // pullback (`survival_marginal_slope_gpu`). Its current body
             // is CPU-resident scalar algebra producing the same `(row_nll,
             // grad, hess)` the inline CPU loop below builds; when the NVRTC
             // kernel lands, this call site becomes the device-dispatch seam
@@ -7877,7 +7881,9 @@ impl SurvivalMarginalSlopeFamily {
             // surfaces as a row-level CPU re-evaluation rather than a hard
             // panic.
             if let Ok(mut out) =
-                crate::gpu::survival_flex::try_device_step5_primary_assembly(&row_inputs)
+                crate::families::survival_marginal_slope_gpu::try_device_step5_primary_assembly(
+                    &row_inputs,
+                )
                 && out.len() == 1
             {
                 let row = out.remove(0);
@@ -11454,7 +11460,7 @@ impl SurvivalMarginalSlopeFamily {
         )?;
 
         // Delegate the per-(u, v) assembly to the Block 10 GPU-substrate
-        // pure assembler in `crate::gpu::survival_flex`.  This is the
+        // pure assembler in `crate::families::survival_marginal_slope_gpu`.  This is the
         // single source of truth for the third-contraction inner loop —
         // shared with the GPU dispatch path so CPU/GPU cannot drift.
         let entry_b = block10_pack_base(&entry);
@@ -11462,7 +11468,7 @@ impl SurvivalMarginalSlopeFamily {
         let entry_d = block10_pack_dir(&entry_ext);
         let exit_d = block10_pack_dir(&exit_ext);
         let dir_vec: Vec<f64> = dir.to_vec();
-        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10ThirdInputs {
+        let inputs = crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10ThirdInputs {
             p,
             qd1_index: primary.qd1,
             qd1,
@@ -11474,7 +11480,8 @@ impl SurvivalMarginalSlopeFamily {
             entry_ext: &entry_d,
             exit_ext: &exit_d,
         };
-        let flat = crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs)?;
+        let flat =
+            crate::families::survival_marginal_slope_gpu::cpu_oracle_third_contraction(&inputs)?;
         Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
     }
 
@@ -11592,25 +11599,27 @@ impl SurvivalMarginalSlopeFamily {
         let exit_bi_p = block10_pack_bi(&exit_bi);
         let dir_u_vec: Vec<f64> = dir_u.to_vec();
         let dir_v_vec: Vec<f64> = dir_v.to_vec();
-        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10FourthInputs {
-            p,
-            qd1_index: primary.qd1,
-            qd1,
-            w: self.weights[row],
-            d: self.event[row],
-            dir_u: &dir_u_vec,
-            dir_v: &dir_v_vec,
-            entry_base: &entry_b,
-            exit_base: &exit_b,
-            entry_ext_u: &entry_d1,
-            entry_ext_v: &entry_d2,
-            exit_ext_u: &exit_d1,
-            exit_ext_v: &exit_d2,
-            entry_bi: &entry_bi_p,
-            exit_bi: &exit_bi_p,
-        };
-        let flat = crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs)
-            .map_err(|e| format!("block10 fourth contraction: {e}"))?;
+        let inputs =
+            crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10FourthInputs {
+                p,
+                qd1_index: primary.qd1,
+                qd1,
+                w: self.weights[row],
+                d: self.event[row],
+                dir_u: &dir_u_vec,
+                dir_v: &dir_v_vec,
+                entry_base: &entry_b,
+                exit_base: &exit_b,
+                entry_ext_u: &entry_d1,
+                entry_ext_v: &entry_d2,
+                exit_ext_u: &exit_d1,
+                exit_ext_v: &exit_d2,
+                entry_bi: &entry_bi_p,
+                exit_bi: &exit_bi_p,
+            };
+        let flat =
+            crate::families::survival_marginal_slope_gpu::cpu_oracle_fourth_contraction(&inputs)
+                .map_err(|e| format!("block10 fourth contraction: {e}"))?;
         let mut out = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in 0..p {
@@ -13721,7 +13730,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
         // ── Step-6 dispatcher: try GPU joint-Hessian × v first ───────────
         //
         // Routes through
-        // [`crate::gpu::survival_flex::try_survival_flex_hvp`] via the
+        // [`crate::families::survival_marginal_slope_gpu::try_survival_flex_hvp`] via the
         // `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
         // device HVP assembly lands; on `Ok(Some(hv))` we write straight
         // into the caller-owned `out` buffer and skip the prebuilt
@@ -14330,7 +14339,7 @@ impl SurvivalMarginalSlopeFamily {
     /// Step-6 dispatcher for the joint-β gradient.  Builds the
     /// `SurvivalFlexGpuRowInputs` descriptor, runs the GPU policy
     /// `decide`, and routes through
-    /// [`crate::gpu::survival_flex::try_survival_flex_gradient`].
+    /// [`crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient`].
     ///
     /// Returns:
     ///
@@ -14345,7 +14354,9 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<(f64, Array1<f64>)>, String> {
-        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(self.n, N_PRIMARY);
+        let decision = crate::families::survival_marginal_slope_gpu::row_primary_hessian_decision(
+            self.n, N_PRIMARY,
+        );
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -14359,7 +14370,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         };
         let inputs = batch.as_inputs(self);
-        match crate::gpu::survival_flex::try_survival_flex_gradient(inputs, None)
+        match crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient(inputs, None)
             .map_err(|e| e.to_string())?
         {
             Some((nll, grad)) => {
@@ -14388,7 +14399,9 @@ impl SurvivalMarginalSlopeFamily {
         slices: &BlockSlices,
         v: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(self.n, N_PRIMARY);
+        let decision = crate::families::survival_marginal_slope_gpu::row_primary_hessian_decision(
+            self.n, N_PRIMARY,
+        );
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -14408,7 +14421,7 @@ impl SurvivalMarginalSlopeFamily {
         let v_slice = v
             .as_slice()
             .ok_or_else(|| "survival-flex GPU HVP requires contiguous v".to_string())?;
-        match crate::gpu::survival_flex::try_survival_flex_hvp(inputs, v_slice)
+        match crate::families::survival_marginal_slope_gpu::try_survival_flex_hvp(inputs, v_slice)
             .map_err(|e| e.to_string())?
         {
             Some(hv) => {
@@ -14436,7 +14449,9 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         slices: &BlockSlices,
     ) -> Result<Option<Array2<f64>>, String> {
-        let decision = crate::gpu::survival_flex::row_primary_hessian_decision(self.n, N_PRIMARY);
+        let decision = crate::families::survival_marginal_slope_gpu::row_primary_hessian_decision(
+            self.n, N_PRIMARY,
+        );
         decision.clone().log();
         if !decision.use_gpu {
             decision.require_supported()?;
@@ -14450,8 +14465,10 @@ impl SurvivalMarginalSlopeFamily {
             }
         };
         let inputs = batch.as_inputs(self);
-        match crate::gpu::survival_flex::try_survival_flex_dense_hessian(inputs, None)
-            .map_err(|e| e.to_string())?
+        match crate::families::survival_marginal_slope_gpu::try_survival_flex_dense_hessian(
+            inputs, None,
+        )
+        .map_err(|e| e.to_string())?
         {
             Some(h) => {
                 let p = slices.total;
@@ -14484,8 +14501,8 @@ impl SurvivalMarginalSlopeFamily {
         //
         // The two `try_survival_flex_joint_dispatch_*` entries route the
         // joint-β work through
-        // [`crate::gpu::survival_flex::try_survival_flex_dense_hessian`]
-        // and [`crate::gpu::survival_flex::try_survival_flex_gradient`]
+        // [`crate::families::survival_marginal_slope_gpu::try_survival_flex_dense_hessian`]
+        // and [`crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient`]
         // respectively, with the standard `gpu::decide` policy.  Both
         // currently return `Ok(None)` until the NVRTC joint-β assembly
         // lands (Steps 4 + 5 sibling commits), so the CPU per-row sweep
@@ -14601,7 +14618,7 @@ impl SurvivalMarginalSlopeFamily {
         // ── Step-6 dispatcher: try GPU joint-β gradient first ────────────
         //
         // Routes through
-        // [`crate::gpu::survival_flex::try_survival_flex_gradient`] via
+        // [`crate::families::survival_marginal_slope_gpu::try_survival_flex_gradient`] via
         // the `gpu::decide` policy.  Returns `Ok(None)` until the joint-β
         // device assembly lands (Steps 4 + 5 sibling commits), at which
         // point this site becomes the hot dispatch with no further
@@ -28215,7 +28232,7 @@ mod tests {
 
     // ────────────────────────────────────────────────────────────────────
     // Block 10 parity — third T_uv[r] and fourth Q_uv[r,s] contractions:
-    // crate::gpu::survival_flex::cpu_oracle_third_contraction /
+    // crate::families::survival_marginal_slope_gpu::cpu_oracle_third_contraction /
     // cpu_oracle_fourth_contraction must match the family CPU paths
     // (row_flex_primary_third_contracted_exact / _fourth_contracted_exact)
     // to within 5e-8 absolute / 5e-7 relative.
@@ -28378,8 +28395,8 @@ mod tests {
 
     fn b10_pack_base(
         base: &SurvivalFlexTimepointExact,
-    ) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
-        crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBase {
+    ) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
+        crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBase {
             eta: base.eta,
             chi: base.chi,
             d: base.d,
@@ -28394,8 +28411,8 @@ mod tests {
 
     fn b10_pack_dir(
         ext: &SurvivalFlexTimepointDirectionalExact,
-    ) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
-        crate::gpu::survival_flex::SurvivalFlexBlock10TimepointDirectional {
+    ) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
+        crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointDirectional {
             eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
             chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
             d_u_dir: ext.d_u_dir.to_vec(),
@@ -28405,8 +28422,9 @@ mod tests {
 
     fn b10_pack_bi(
         bi: &SurvivalFlexTimepointBiDirectionalExact,
-    ) -> crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
-        crate::gpu::survival_flex::SurvivalFlexBlock10TimepointBiDirectional {
+    ) -> crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional
+    {
+        crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10TimepointBiDirectional {
             eta_uv_uv: bi.eta_uv_uv.iter().copied().collect(),
             chi_uv_uv: bi.chi_uv_uv.iter().copied().collect(),
             d_uv_uv: bi.d_uv_uv.iter().copied().collect(),
@@ -28557,7 +28575,7 @@ mod tests {
         let entry_d = b10_pack_dir(&entry_ext);
         let exit_d = b10_pack_dir(&exit_ext);
         let dir_vec: Vec<f64> = dir.to_vec();
-        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10ThirdInputs {
+        let inputs = crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10ThirdInputs {
             p: p_total,
             qd1_index: qd1_idx,
             qd1,
@@ -28569,7 +28587,8 @@ mod tests {
             entry_ext: &entry_d,
             exit_ext: &exit_d,
         };
-        crate::gpu::survival_flex::cpu_oracle_third_contraction(&inputs).expect("oracle third")
+        crate::families::survival_marginal_slope_gpu::cpu_oracle_third_contraction(&inputs)
+            .expect("oracle third")
     }
 
     fn b10_fourth_oracle_from_family(
@@ -28607,24 +28626,26 @@ mod tests {
         let exit_bi_p = b10_pack_bi(&exit_bi);
         let dir_u_v: Vec<f64> = dir_u.to_vec();
         let dir_v_v: Vec<f64> = dir_v.to_vec();
-        let inputs = crate::gpu::survival_flex::SurvivalFlexBlock10FourthInputs {
-            p: p_total,
-            qd1_index: qd1_idx,
-            qd1,
-            w: family.weights[0],
-            d: family.event[0],
-            dir_u: &dir_u_v,
-            dir_v: &dir_v_v,
-            entry_base: &entry_b,
-            exit_base: &exit_b,
-            entry_ext_u: &entry_d1,
-            entry_ext_v: &entry_d2,
-            exit_ext_u: &exit_d1,
-            exit_ext_v: &exit_d2,
-            entry_bi: &entry_bi_p,
-            exit_bi: &exit_bi_p,
-        };
-        crate::gpu::survival_flex::cpu_oracle_fourth_contraction(&inputs).expect("oracle fourth")
+        let inputs =
+            crate::families::survival_marginal_slope_gpu::SurvivalFlexBlock10FourthInputs {
+                p: p_total,
+                qd1_index: qd1_idx,
+                qd1,
+                w: family.weights[0],
+                d: family.event[0],
+                dir_u: &dir_u_v,
+                dir_v: &dir_v_v,
+                entry_base: &entry_b,
+                exit_base: &exit_b,
+                entry_ext_u: &entry_d1,
+                entry_ext_v: &entry_d2,
+                exit_ext_u: &exit_d1,
+                exit_ext_v: &exit_d2,
+                entry_bi: &entry_bi_p,
+                exit_bi: &exit_bi_p,
+            };
+        crate::families::survival_marginal_slope_gpu::cpu_oracle_fourth_contraction(&inputs)
+            .expect("oracle fourth")
     }
 
     #[test]

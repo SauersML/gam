@@ -785,7 +785,7 @@ where
                                     crate::solver::arrow_schur::PcgDiagnostics,
                                 ),
                                 crate::solver::arrow_schur::ArrowSchurError,
-                            > = if crate::solver::gpu::cuda_selected() {
+                            > = if crate::gpu::cuda_selected() {
                                 let has_matvec = arrow_system.hbb_matvec.is_some()
                                     || arrow_system.htbeta_matvec.is_some();
                                 if has_matvec

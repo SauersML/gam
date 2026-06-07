@@ -186,10 +186,6 @@ class BasisDescriptor:
     * :meth:`_evaluate_numpy` — returns ``(B, M)`` numpy ndarray (no grad).
     * :meth:`_evaluate_jax`   — returns ``(B, M)`` jax array (jit/vmap-safe).
 
-    For backwards compatibility, concrete descriptors that previously
-    implemented :meth:`_evaluate_impl` (the torch-only entry point) keep
-    working: :meth:`_evaluate_torch` falls back to it.
-
     The protocol also derives :meth:`jacobian` / :meth:`hessian` from the
     torch implementation via ``torch.autograd.functional``. Descriptors are
     free to override either with an analytic closed form — the contract is
@@ -216,21 +212,11 @@ class BasisDescriptor:
 
     # ------------------------------------------------------------------ core
 
-    def _evaluate_impl(self, coords: Any) -> Any:
-        """Legacy torch-only entry point. Prefer :meth:`_evaluate_torch`.
-
-        ``coords`` is a stacked ``(B, d)`` torch tensor with
-        ``requires_grad`` already toggled by the caller (when a derivative
-        is needed).
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__} must implement _evaluate_torch / "
-            "_evaluate_numpy / _evaluate_jax (or the legacy _evaluate_impl)"
-        )
-
     def _evaluate_torch(self, coords: Any) -> Any:
-        """Torch backend implementation. Default: delegate to legacy hook."""
-        return self._evaluate_impl(coords)
+        """Torch backend implementation."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement the torch backend"
+        )
 
     def _evaluate_numpy(self, coords: Any) -> Any:
         """NumPy backend implementation.

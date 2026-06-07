@@ -320,7 +320,7 @@ fn dense_spd_log_det(matrix: &Array2<f64>) -> Result<f64, String> {
             matrix.ncols()
         ));
     }
-    if crate::solver::gpu::cuda_selected() {
+    if crate::gpu::cuda_selected() {
         return crate::solver::gpu::reml_gpu::evidence_derivatives_gpu(
             crate::solver::gpu::reml_gpu::RemlGpuInput {
                 penalized_hessian: matrix.view(),

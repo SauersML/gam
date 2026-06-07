@@ -647,8 +647,8 @@ serializes to ``kind="topk_activation"``. Direct evaluation uses the same Rust
     "JumpReLUPenalty": """Analytic JumpReLU SAE sparsity penalty descriptor.
 
 Represents the hard-threshold SAE assignment family exposed by
-``sae_manifold_fit(..., assignment="jumprelu")`` and the gated alias. The
-Python wrapper forwards constructor arguments to the Rust descriptor and
+``sae_manifold_fit(..., assignment="jumprelu")``. The Python wrapper forwards
+constructor arguments to the Rust descriptor and
 supports ``value_grad(t)`` / ``hvp(t, v)`` in NumPy, Torch, and JAX frames.
 """,
     "SparsityPenalty": """Smoothed element-wise sparsity penalty descriptor.

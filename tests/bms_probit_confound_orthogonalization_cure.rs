@@ -23,7 +23,7 @@
 //!
 //! Deterministic: fixed-seed `StdRng`, no time/unseeded RNG.
 
-use gam::families::bernoulli_marginal_slope::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
+use gam::families::bms::{BernoulliMarginalSlopeTermSpec, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::resource::ResourcePolicy;

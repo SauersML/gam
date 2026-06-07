@@ -295,7 +295,7 @@ pub enum RowPrimaryEvalCache {
     /// Device-resident row Hessian + designs. HVP / diagonal / dense-block
     /// consumers route through the device-aware GPU entry points.
     #[cfg(target_os = "linux")]
-    Device(crate::gpu::bms_flex_row::DeviceResidentRowHess),
+    Device(crate::families::bms::gpu::row::DeviceResidentRowHess),
 }
 
 impl RowPrimaryEvalCache {
@@ -338,7 +338,7 @@ impl RowPrimaryEvalCache {
     /// GPU. `None` on every other variant (and on non-Linux builds).
     #[cfg(target_os = "linux")]
     #[inline]
-    pub(crate) fn device(&self) -> Option<&crate::gpu::bms_flex_row::DeviceResidentRowHess> {
+    pub(crate) fn device(&self) -> Option<&crate::families::bms::gpu::row::DeviceResidentRowHess> {
         match self {
             Self::Device(hess) => Some(hess),
             _ => None,

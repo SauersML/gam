@@ -207,7 +207,7 @@ def select_topology(
     score_scale_kind = _normalize_score_scale(score_scale)
     formula, feature_dim, n_obs = _formula_from_response(data, response)
     normalized = _normalize_candidates(candidates, feature_dim=feature_dim)
-    auto = _find_auto_smooth_call(formula)
+    _find_auto_smooth_call(formula)
 
     screen_kwargs = _fit_kwargs_with_outer_max_iter(
         fit_kwargs,
@@ -218,7 +218,6 @@ def select_topology(
     for idx, candidate in enumerate(normalized):
         candidate_formula = _formula_for_candidate(
             formula,
-            auto,
             candidate,
             strict_dimension=True,
         )
@@ -253,7 +252,6 @@ def select_topology(
     for candidate in survivors:
         candidate_formula = _formula_for_candidate(
             formula,
-            auto,
             candidate,
             strict_dimension=True,
         )
@@ -435,7 +433,6 @@ def _find_auto_smooth_call(formula: str) -> tuple[int, int, str]:
 
 def _formula_for_candidate(
     formula: str,
-    auto: tuple[int, int, str],
     candidate: _Candidate,
     *,
     strict_dimension: bool,
@@ -447,10 +444,6 @@ def _formula_for_candidate(
     Python `Smooth` subclass instance into a typed JSON description and
     invokes the Rust assembler.
     """
-    # The `auto` argument is kept for backwards-compatible signature; the
-    # Rust assembler does its own AUTO scan and the sentinel carries no state.
-    del auto
-
     payload = _candidate_to_rust_payload(candidate)
     try:
         result = _topology_rust().assemble_candidate_formula(
@@ -1272,7 +1265,6 @@ def _candidate_formula(
         return formula
     candidate_formula = _formula_for_candidate(
         formula,
-        auto,
         candidate,
         strict_dimension=False,
     )

@@ -85,8 +85,6 @@ def shape_predict_response(
     rows: list[list[str]],
     table_kind: str | None,
     training_table_kind: str | None,
-    fallback_model_class: str,
-    fallback_family: str,
     interval: float | None,
     return_type: str | None,
     id_column: str | None,
@@ -118,8 +116,8 @@ def shape_predict_response(
 
     columns_json = json.dumps(parsed["columns"], separators=(",", ":"))
     columns = json.loads(rust_module().ordered_prediction_columns(columns_json))
-    model_class = str(parsed.get("model_class") or fallback_model_class)
-    family = str(parsed.get("family") or parsed.get("family_kind") or fallback_family)
+    model_class = str(parsed["model_class"])
+    family = str(parsed["family"])
 
     table_requested = wants_table(
         return_type=return_type,

@@ -13862,12 +13862,12 @@ fn residual_in_steady_geometric_descent(history: &std::collections::VecDeque<f64
         return false;
     }
     let min_drop = 0.1; // each cycle must cut the residual by ≥ 10%.
-    history.iter().zip(history.iter().skip(1)).all(|(prev, next)| {
-        prev.is_finite()
-            && next.is_finite()
-            && *prev > 0.0
-            && *next < (1.0 - min_drop) * *prev
-    })
+    history
+        .iter()
+        .zip(history.iter().skip(1))
+        .all(|(prev, next)| {
+            prev.is_finite() && next.is_finite() && *prev > 0.0 && *next < (1.0 - min_drop) * *prev
+        })
 }
 
 /// Inf-norm of the active-set-projected stationarity residual restricted to the
@@ -15448,10 +15448,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // collapses, and the inner exits non-converged at cycle ~2 (seed
                 // rejected pre-solver → hard raise, β pinned). Subtract the trial
                 // penalty so the threshold is the NLL the trial must beat.
-                let line_search_options = coefficient_line_search_options(
-                    options,
-                    old_objective + 1e-10 - trial_penalty,
-                );
+                let line_search_options =
+                    coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
@@ -31853,9 +31851,7 @@ mod tests {
             "a steadily ~0.33x/cycle descending residual must be recognized as converging"
         );
         // A genuine multiplier/null plateau: residual flat/oscillating above tol.
-        let plateau: VecDeque<f64> = [2.066e0, 2.063e0, 2.066e0, 2.063e0]
-            .into_iter()
-            .collect();
+        let plateau: VecDeque<f64> = [2.066e0, 2.063e0, 2.066e0, 2.063e0].into_iter().collect();
         assert!(
             !residual_in_steady_geometric_descent(&plateau),
             "a flat/oscillating residual plateau must NOT be treated as converging"

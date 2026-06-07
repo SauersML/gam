@@ -27,7 +27,7 @@
 //! validates the multi-z (K=2) survival marginal-slope contract just as
 //! tightly as a full fit would, without the spec-construction surface.
 
-use gam::bernoulli_marginal_slope::{
+use gam::families::bms::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
 };
 use gam::probability::{normal_cdf, normal_pdf};

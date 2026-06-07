@@ -1,23 +1,14 @@
-pub mod bms;
-/// Backward-compatible path alias: all callers of
-/// `crate::families::bernoulli_marginal_slope::*` continue to resolve
-/// because every public symbol is re-exported here.
-pub mod bernoulli_marginal_slope {
-    pub use crate::families::bms::*;
-    pub mod deviation_runtime {
-        pub use crate::families::bms::deviation_runtime::*;
-    }
-    pub mod exact_kernel {
-        pub use crate::families::bms::exact_kernel::*;
-    }
-}
 pub mod bernoulli_marginal_slope_identifiability;
 pub mod binomial_multi;
+pub mod bms;
 pub mod coefficient_cost;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod gamlss;
 pub mod identifiability_compiler;
+pub mod identifiability_gpu;
+#[cfg(target_os = "linux")]
+pub mod identifiability_gpu_kernel;
 pub mod inverse_link;
 pub mod jet_partitions;
 pub mod joint_penalty;
@@ -40,6 +31,8 @@ pub mod survival;
 pub mod survival_construction;
 pub mod survival_location_scale;
 pub mod survival_marginal_slope;
+pub mod survival_marginal_slope_gpu;
+pub mod survival_marginal_slope_gpu_prep;
 pub mod survival_marginal_slope_identifiability;
 pub mod survival_predict;
 pub mod survival_time_constraints;

@@ -3105,9 +3105,8 @@ impl LinearOperator for MultiChannelOperator {
         let w_pos = weights.mapv(|w: f64| w.max(0.0));
         let mut xtwx = Array2::<f64>::zeros((self.p, self.p));
         for (i, ch) in self.channels.iter().enumerate() {
-            let ch_xtwx = ch.xt_diag_x_signed_op(SignedWeightsView::new(
-                w_pos.slice(s![i * n..(i + 1) * n]),
-            ))?;
+            let ch_xtwx = ch
+                .xt_diag_x_signed_op(SignedWeightsView::new(w_pos.slice(s![i * n..(i + 1) * n])))?;
             xtwx += &ch_xtwx;
         }
         Ok(xtwx)

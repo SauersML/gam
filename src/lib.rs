@@ -63,23 +63,25 @@ pub fn init_parallelism() {
 }
 
 pub mod cache;
-pub mod diagnostics;
 pub mod families;
 pub mod geometry;
 pub mod gpu;
-pub mod heartbeat;
-pub mod identifiability;
+pub mod identifiability_diagnostics;
 pub mod inference;
 pub mod kernels;
 pub mod linalg;
 pub mod report;
 pub mod resource;
+pub mod sae_identifiability;
 pub mod solver;
 mod span;
 pub mod terms;
 pub mod test_support;
 pub mod types;
 pub mod util;
+
+#[path = "heartbeat.rs"]
+pub mod process_monitor;
 
 pub use data::{
     encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
@@ -105,7 +107,6 @@ pub use solver::{
 };
 pub use terms::{basis, construction, hull, layout, smooth, term_builder};
 
-pub use families::bernoulli_marginal_slope;
 pub use families::custom_family;
 pub use families::gamlss;
 pub use families::survival;

@@ -1,4 +1,4 @@
-use gam::bernoulli_marginal_slope::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape};
+use gam::families::bms::{MarginalSlopeCovariance, MarginalSlopeCovarianceShape};
 use gam::probability::normal_cdf;
 use gam::survival_marginal_slope::{
     survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,

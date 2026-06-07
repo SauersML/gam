@@ -7,7 +7,7 @@ pub mod fisher_rao;
 pub mod formula_dsl;
 pub mod generative;
 pub mod hmc;
-pub mod identifiability;
+pub mod identifiability_diagnostics;
 pub mod model;
 pub mod model_payload_builders;
 pub mod polya_gamma;

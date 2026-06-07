@@ -41,9 +41,9 @@ class CtnStage1:
     the estimated slope surface ``β(x)`` does not inherit Stage-1 miscalibration.
 
     There is no separate boolean to "turn on" orthogonalization — supplying the
-    recipe *is* the request (magic by default). Omit it (and supply a raw
-    ``z_column`` instead) to keep the legacy free-warp ``score_warp`` fallback,
-    which can only defend the x-free leakage column.
+    recipe *is* the request (magic by default). Supplying a raw ``z_column``
+    selects the free-warp ``score_warp`` path, which can only defend the x-free
+    leakage column.
 
     Parameters
     ----------

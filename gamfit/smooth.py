@@ -143,8 +143,8 @@ class Smooth(_BasisDescriptor):
     # ------------------------------------------------------------------
     # Callable-basis protocol is inherited from
     # :class:`gamfit._basis_protocol.BasisDescriptor`. Concrete subclasses
-    # override at least :meth:`_evaluate_torch` (or the legacy
-    # :meth:`_evaluate_impl`) plus :attr:`intrinsic_dim` / :attr:`basis_size`.
+    # override at least :meth:`_evaluate_torch` plus :attr:`intrinsic_dim` /
+    # :attr:`basis_size`.
     # ------------------------------------------------------------------
 
     def to_rust_descriptor(self) -> dict[str, Any]:

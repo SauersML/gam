@@ -1,28 +1,10 @@
-//! Identifiability-theorem diagnostics — pure numeric kernels.
+//! Numeric kernels for identifiability-theorem diagnostics.
 //!
-//! Each function in this module takes plain arrays and returns a struct of
-//! scalar facts. Higher-level wrappers (the Python `gamfit.diagnostics`
-//! package, but also the gam CLI / library) then translate the numeric
-//! facts into human-readable violations and recommendations.
-//!
-//! The three kernels here match three identifiability theorems:
-//!
-//! * [`aux_richness_metrics`] — Khemakhem et al. 2020 (iVAE) Theorem 1
-//!   preconditions on the auxiliary covariate.
-//! * [`jacobian_sparsity_metrics`] — Hyvarinen-Morioka 2017 / Lachapelle
-//!   et al. 2024 mechanism-sparsity precondition on the decoder Jacobian.
-//! * [`anchor_consistency_metrics`] — the project's atom-anchor
-//!   convention for multi-atom manifold-SAE identifiability.
-//!
-//! None of these kernels allocate Python objects, depend on `pyo3`, or
-//! reference `gamfit`-specific types — they are reusable from the gam CLI
-//! and the gam library directly.
+//! The kernels return scalar facts for iVAE auxiliary richness, decoder
+//! Jacobian sparsity, and manifold-SAE anchor coverage. Rust, Python, and CLI
+//! layers turn those facts into user-facing reports.
 
 use ndarray::{Array2, ArrayView1, ArrayView2, Axis};
-
-// ---------------------------------------------------------------------------
-// Aux-richness (iVAE Theorem 1)
-// ---------------------------------------------------------------------------
 
 /// Scalar facts about the auxiliary covariate / latent pair feeding an iVAE.
 #[derive(Debug, Clone)]
@@ -284,10 +266,6 @@ fn matrix_rank(m: ArrayView2<f64>, tol: f64) -> usize {
     rank
 }
 
-// ---------------------------------------------------------------------------
-// Jacobian sparsity (Hyvarinen-Morioka / Lachapelle)
-// ---------------------------------------------------------------------------
-
 /// Scalar facts about decoder Jacobian sparsity.
 #[derive(Debug, Clone)]
 pub struct JacobianSparsityMetrics {
@@ -365,10 +343,6 @@ pub fn jacobian_sparsity_metrics(
         ranks,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Anchor consistency (manifold-SAE atom-anchor convention)
-// ---------------------------------------------------------------------------
 
 /// Scalar facts about the per-atom anchor structure of an assignment matrix.
 #[derive(Debug, Clone)]
@@ -464,12 +438,6 @@ pub fn concat_decoder_blocks(blocks: &[ArrayView2<f64>]) -> Result<Array2<f64>, 
 pub fn jacobian_view_from_linear(decoder_pk: ArrayView2<f64>) -> Array2<f64> {
     decoder_pk.to_owned()
 }
-
-// ---------------------------------------------------------------------------
-// Helper: row counts of unobserved aux. Used by aux-richness pyfunction
-// callers that need a quick "is this aux fully observed?" answer without
-// triggering a Jacobian-rank estimate.
-// ---------------------------------------------------------------------------
 
 /// Number of non-finite entries in a 1-D view. Used by callers that pre-extract
 /// a single aux column.

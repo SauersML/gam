@@ -41,8 +41,6 @@ def _dispatch(
     monkeypatch: Any,
     raw: str,
     *,
-    fallback_model_class: str,
-    fallback_family: str,
     interval: float | None = None,
     return_type: str | None = None,
     id_column: str | None = None,
@@ -56,8 +54,6 @@ def _dispatch(
         rows=[],
         table_kind="pandas",
         training_table_kind="pandas",
-        fallback_model_class=fallback_model_class,
-        fallback_family=fallback_family,
         interval=interval,
         return_type=return_type,
         id_column=id_column,
@@ -66,23 +62,31 @@ def _dispatch(
     )
 
 
+def _payload(model_class: str, family: str, columns: dict[str, list[float]]) -> str:
+    return json.dumps(
+        {
+            "model_class": model_class,
+            "family": family,
+            "columns": columns,
+        }
+    )
+
+
 def test_bernoulli_marginal_slope_saved_kind_returns_1d_probabilities(
     monkeypatch: Any,
 ) -> None:
-    raw = json.dumps(
+    raw = _payload(
+        "marginal-slope",
+        "bernoulli-marginal-slope",
         {
-            "columns": {
-                "linear_predictor": [-1.0, 0.0, 1.0],
-                "mean": [0.2, 0.5, 0.8],
-            }
-        }
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            "mean": [0.2, 0.5, 0.8],
+        },
     )
 
     out = _dispatch(
         monkeypatch,
         raw,
-        fallback_model_class="marginal-slope",
-        fallback_family="bernoulli-marginal-slope",
     )
 
     arr = np.asarray(out, dtype=float)
@@ -99,22 +103,17 @@ def test_standard_gam_default_returns_1d_mean(monkeypatch: Any) -> None:
     of ``std_error`` here is a *data* artefact and must not flip the
     return shape — that decision is a caller-intent decision only.
     """
-    raw = json.dumps(
+    raw = _payload(
+        "standard",
+        "gaussian",
         {
-            "columns": {
-                "linear_predictor": [-1.0, 0.0, 1.0],
-                "mean": [0.2, 0.5, 0.8],
-                "std_error": [0.01, 0.02, 0.03],
-            }
-        }
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            "mean": [0.2, 0.5, 0.8],
+            "std_error": [0.01, 0.02, 0.03],
+        },
     )
 
-    out = _dispatch(
-        monkeypatch,
-        raw,
-        fallback_model_class="standard",
-        fallback_family="gaussian",
-    )
+    out = _dispatch(monkeypatch, raw)
 
     arr = np.asarray(out, dtype=float)
     assert arr.shape == (3,)
@@ -126,20 +125,18 @@ def test_standard_gam_with_return_type_returns_table(monkeypatch: Any) -> None:
     when ``interval`` / ``id_column`` are ``None``. This pins the shape
     policy as a pure caller-intent decision: every public knob promotes
     the return shape independently."""
-    raw = json.dumps(
+    raw = _payload(
+        "standard",
+        "gaussian",
         {
-            "columns": {
-                "linear_predictor": [-1.0, 0.0, 1.0],
-                "mean": [0.2, 0.5, 0.8],
-            }
-        }
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            "mean": [0.2, 0.5, 0.8],
+        },
     )
 
     out = _dispatch(
         monkeypatch,
         raw,
-        fallback_model_class="standard",
-        fallback_family="gaussian",
         return_type="dict",
     )
 
@@ -150,20 +147,18 @@ def test_standard_gam_with_return_type_returns_table(monkeypatch: Any) -> None:
 def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:
     """``id_column`` only makes sense alongside a tabular shape, so its
     presence must flip the return shape on its own."""
-    raw = json.dumps(
+    raw = _payload(
+        "standard",
+        "gaussian",
         {
-            "columns": {
-                "linear_predictor": [-1.0, 0.0, 1.0],
-                "mean": [0.2, 0.5, 0.8],
-            }
-        }
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            "mean": [0.2, 0.5, 0.8],
+        },
     )
 
     out = _dispatch(
         monkeypatch,
         raw,
-        fallback_model_class="standard",
-        fallback_family="gaussian",
         id_column="person_id",
         row_ids=["a", "b", "c"],
     )
@@ -181,23 +176,21 @@ def test_standard_gam_with_id_column_returns_table(monkeypatch: Any) -> None:
 def test_standard_gam_with_interval_returns_table(monkeypatch: Any) -> None:
     """``interval=`` alone is also enough to opt into the table — matches
     the documented ``Model.predict`` contract."""
-    raw = json.dumps(
+    raw = _payload(
+        "standard",
+        "gaussian",
         {
-            "columns": {
-                "linear_predictor": [-1.0, 0.0, 1.0],
-                "mean": [0.2, 0.5, 0.8],
-                "std_error": [0.01, 0.02, 0.03],
-                "mean_lower": [0.19, 0.48, 0.77],
-                "mean_upper": [0.21, 0.52, 0.83],
-            }
-        }
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            "mean": [0.2, 0.5, 0.8],
+            "std_error": [0.01, 0.02, 0.03],
+            "mean_lower": [0.19, 0.48, 0.77],
+            "mean_upper": [0.21, 0.52, 0.83],
+        },
     )
 
     out = _dispatch(
         monkeypatch,
         raw,
-        fallback_model_class="standard",
-        fallback_family="gaussian",
         interval=0.95,
     )
 
@@ -221,21 +214,16 @@ def test_marginal_slope_non_bernoulli_falls_through_to_standard_shaper(
     class and is not a transformation-normal model, so it lands on the
     standard shaper. Under the principled shape policy that means a 1-D
     mean array by default — the same as any other plain GAM."""
-    raw = json.dumps(
+    raw = _payload(
+        "marginal-slope",
+        "royston-parmar",
         {
-            "columns": {
-                "linear_predictor": [-1.0, 0.0, 1.0],
-                "mean": [0.2, 0.5, 0.8],
-            }
-        }
+            "linear_predictor": [-1.0, 0.0, 1.0],
+            "mean": [0.2, 0.5, 0.8],
+        },
     )
 
-    out = _dispatch(
-        monkeypatch,
-        raw,
-        fallback_model_class="marginal-slope",
-        fallback_family="royston-parmar",
-    )
+    out = _dispatch(monkeypatch, raw)
 
     arr = np.asarray(out, dtype=float)
     assert arr.shape == (3,)

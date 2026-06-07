@@ -581,10 +581,6 @@ class Poincare(ManifoldDescriptor):
         return out
 
 
-# Backwards-readable hyperbolic alias.
-Hyperbolic = Poincare
-
-
 __all__ = [
     "Euclidean",
     "Circle",
@@ -595,5 +591,4 @@ __all__ = [
     "Stiefel",
     "Spd",
     "Poincare",
-    "Hyperbolic",
 ]

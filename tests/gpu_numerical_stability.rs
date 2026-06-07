@@ -5,7 +5,6 @@
 // `warnings = "deny"` lint policy.
 #[path = "common/gpu_gate.rs"]
 mod gpu_gate;
-use gam::solver::gpu::{Device, configure_device};
 use gpu_gate::{GpuGate, gpu_gate};
 use ndarray::{Array1, Array2};
 
@@ -121,7 +120,6 @@ fn pirls_gpu_matches_cpu_across_stability_grid() {
     if let GpuGate::Skip = gpu_gate("pirls_gpu_matches_cpu_across_stability_grid") {
         return;
     }
-    configure_device(Device::Cuda);
     let mut cases = 0;
     for n in [8_usize, 13, 21, 34] {
         for p in [2_usize, 3, 5] {
@@ -164,7 +162,6 @@ fn reml_gpu_logdet_and_score_match_cpu() {
     if let GpuGate::Skip = gpu_gate("reml_gpu_logdet_and_score_match_cpu") {
         return;
     }
-    configure_device(Device::Cuda);
     for p in [2_usize, 4, 7, 11] {
         let mut h = Array2::from_shape_fn((p, p), |(i, j)| {
             if i == j {

@@ -10,9 +10,7 @@
 //! solver but tight enough to catch a slow-loop regression like the CTN
 //! exact-fn rejection cycle that recently cost ≥14h of CI.
 
-use gam::families::bernoulli_marginal_slope::{
-    BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy,
-};
+use gam::families::bms::{BernoulliMarginalSlopeTermSpec, DeviationBlockConfig, LatentZPolicy};
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::lognormal_kernel::FrailtySpec;
 use gam::resource::ResourcePolicy;

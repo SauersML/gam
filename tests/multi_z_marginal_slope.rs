@@ -1,4 +1,4 @@
-use gam::bernoulli_marginal_slope::{
+use gam::families::bms::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     marginal_slope_preserving_scale, marginal_slope_probit_eta,
 };

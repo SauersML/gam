@@ -10,8 +10,6 @@ pub mod arrow_schur;
 pub mod arrow_schur_nvrtc;
 pub mod backend_probe;
 pub mod blas;
-pub mod bms_flex;
-pub mod bms_flex_row;
 #[cfg(target_os = "linux")]
 pub mod calibration;
 pub mod common;
@@ -22,9 +20,6 @@ pub mod device;
 pub mod driver;
 #[macro_use]
 pub mod error;
-pub mod identifiability_compile;
-#[cfg(target_os = "linux")]
-pub mod identifiability_compile_kernel;
 pub mod linalg;
 pub mod memory;
 pub mod numerics_device;
@@ -39,9 +34,6 @@ pub mod row_hessian_ops;
 pub mod runtime;
 pub mod sigma_cubature;
 pub mod solver;
-pub mod sphere;
-pub mod survival_flex;
-pub mod survival_flex_prep;
 
 pub use cpu_traits::{ExecutionTarget, MatrixLocation};
 pub use device::GpuDeviceInfo;
@@ -65,6 +57,7 @@ pub use runtime::GpuRuntime;
 // ---------------------------------------------------------------------------
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::sync::OnceLock;
 
 /// User-facing GPU backend policy.
@@ -97,6 +90,18 @@ impl GpuPolicy {
             Self::Off => "off",
             Self::Force => "force",
         }
+    }
+
+    /// Whether unsupported GPU dispatch should be surfaced as a hard error.
+    #[inline]
+    pub const fn is_force(self) -> bool {
+        matches!(self, Self::Force)
+    }
+}
+
+impl fmt::Display for GpuPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -167,6 +172,21 @@ pub fn global_policy() -> GpuPolicy {
 pub fn configure_global_policy(policy: GpuPolicy) {
     // First-writer-wins semantics; ignore a redundant late call.
     POLICY.set(policy).ok();
+}
+
+/// True when direct solver GPU entry points should be attempted.
+///
+/// `Auto` attempts CUDA only after the runtime probe finds a usable device.
+/// `Off` pins the process to CPU. `Force` attempts the GPU path so missing
+/// runtime/backend support becomes an explicit error at the callee instead of
+/// an implicit CPU route.
+#[inline]
+pub fn cuda_selected() -> bool {
+    match global_policy() {
+        GpuPolicy::Auto => runtime::GpuRuntime::is_available(),
+        GpuPolicy::Off => false,
+        GpuPolicy::Force => true,
+    }
 }
 
 /// Joint eligibility state for a GPU kernel at the call site.

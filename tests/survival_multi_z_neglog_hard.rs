@@ -5,7 +5,7 @@
 //! (`survival_marginal_slope_vector_scale`, `quadratic_form`,
 //! `normal_cdf`) so the test file is self-contained.
 
-use gam::bernoulli_marginal_slope::MarginalSlopeCovariance;
+use gam::families::bms::MarginalSlopeCovariance;
 use gam::probability::normal_cdf;
 use gam::survival_marginal_slope::{
     survival_marginal_slope_vector_neglog, survival_marginal_slope_vector_scale,

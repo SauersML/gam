@@ -3033,7 +3033,7 @@ impl BernoulliMarginalSlopeFamily {
         });
         let context_row_count = selected_context_rows.as_ref().map_or(n, |rows| rows.len());
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS exact-cache build n={n} context_rows={context_row_count} p={} flex={flex_active}",
             slices.total
         ));
@@ -3219,7 +3219,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(BernoulliMarginalSlopeExactEvalCache {
             slices,
             primary,
@@ -3287,7 +3287,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS row-cell-moments n={n} selected_rows={selected_row_count} degree={max_degree}"
         ));
         if log_exact_work(n) {
@@ -3514,7 +3514,7 @@ impl BernoulliMarginalSlopeFamily {
                 moment_started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(Some(RowCellMomentsBundle {
             max_degree,
             selected_rows: selected_n,
@@ -3563,7 +3563,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS row-cell-moments upgrade n={n} degree={}->{required_degree}",
             base.max_degree
         ));
@@ -3604,7 +3604,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(Some(RowCellMomentsBundle {
             max_degree: required_degree,
             selected_rows: base.selected_rows,
@@ -3613,7 +3613,7 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// BMS-FLEX GPU milestone 1: pack the row-primary Hessian inputs for the
-    /// Stage-2 device kernel in `crate::gpu::bms_flex_row`. Returns `None`
+    /// Stage-2 device kernel in `crate::families::bms::gpu::row`. Returns `None`
     /// when any precondition fails (latent is not StandardNormal, the
     /// row-cell-moments bundle was not materialised, or score-warp /
     /// link-deviation runtimes are missing); the caller then falls back to
@@ -3628,7 +3628,7 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         block_states: &[ParameterBlockState],
         cache: &BernoulliMarginalSlopeExactEvalCache,
-    ) -> Result<Option<crate::gpu::bms_flex_row::BmsFlexRowKernelInputsOwned>, String> {
+    ) -> Result<Option<crate::families::bms::gpu::row::BmsFlexRowKernelInputsOwned>, String> {
         use super::exact_kernel as exact;
         use crate::families::marginal_slope_shared::SparsePrimaryCoeffJetView;
 
@@ -3644,7 +3644,7 @@ impl BernoulliMarginalSlopeFamily {
         };
         let primary = &cache.primary;
         let r = primary.total;
-        if r < 2 || r > crate::gpu::bms_flex_row::MAX_R {
+        if r < 2 || r > crate::families::bms::gpu::row::MAX_R {
             return Ok(None);
         }
         let h_range = primary.h.clone();
@@ -3715,8 +3715,8 @@ impl BernoulliMarginalSlopeFamily {
         let mut row_ruv = vec![0.0_f64; n * r * r];
 
         // ── Per-cell SoA arrays sized once.
-        let coeff4 = crate::gpu::bms_flex_row::COEFF4;
-        let moment_stride = crate::gpu::bms_flex_row::MOMENT_STRIDE;
+        let coeff4 = crate::families::bms::gpu::row::COEFF4;
+        let moment_stride = crate::families::bms::gpu::row::MOMENT_STRIDE;
         let mut cell_c0 = vec![0.0_f64; total_cells_us];
         let mut cell_c1 = vec![0.0_f64; total_cells_us];
         let mut cell_c2 = vec![0.0_f64; total_cells_us];
@@ -4058,7 +4058,7 @@ impl BernoulliMarginalSlopeFamily {
             let view = CubicCellDerivativeMomentHostView {
                 cells: &gpu_cells,
                 branches: &gpu_branches,
-                max_degree: crate::gpu::bms_flex_row::MOMENT_STRIDE - 1,
+                max_degree: crate::families::bms::gpu::row::MOMENT_STRIDE - 1,
                 residency: CubicCellMomentResidency::Device,
             };
             // The GPU device-moment build is an OPTIONAL acceleration. On any
@@ -4076,13 +4076,13 @@ impl BernoulliMarginalSlopeFamily {
                     stride,
                     n_cells,
                 })) => {
-                    if stride != crate::gpu::bms_flex_row::MOMENT_STRIDE
+                    if stride != crate::families::bms::gpu::row::MOMENT_STRIDE
                         || n_cells != total_cells_us
                     {
                         return Err(format!(
                             "bms_flex_row device-moment substrate returned bad shape: \
                              stride={stride} n_cells={n_cells} expected stride={} cells={}",
-                            crate::gpu::bms_flex_row::MOMENT_STRIDE,
+                            crate::families::bms::gpu::row::MOMENT_STRIDE,
                             total_cells_us
                         ));
                     }
@@ -4151,7 +4151,7 @@ impl BernoulliMarginalSlopeFamily {
         drop(gpu_branches);
 
         Ok(Some(
-            crate::gpu::bms_flex_row::BmsFlexRowKernelInputsOwned {
+            crate::families::bms::gpu::row::BmsFlexRowKernelInputsOwned {
                 n_rows: n,
                 r,
                 p_h,
@@ -4213,7 +4213,8 @@ impl BernoulliMarginalSlopeFamily {
             runtime_available,
             workspace_pinned,
         );
-        let gpu_decision = crate::gpu::bms_flex::require_row_primary_hessian_supported(n, r)?;
+        let gpu_decision =
+            crate::families::bms::gpu::flex::require_row_primary_hessian_supported(n, r)?;
         // Milestone 2 (#210): when the policy says GPU, eagerly probe the
         // backend so any NVRTC compile / context init failure surfaces in
         // the cache-decision log instead of at first dispatch. Probe
@@ -4221,7 +4222,7 @@ impl BernoulliMarginalSlopeFamily {
         // outcome and means dispatch falls through to CPU rows below —
         // the same path as today.
         if gpu_decision.use_gpu {
-            match crate::gpu::bms_flex::BmsFlexGpuBackend::probe() {
+            match crate::families::bms::gpu::flex::BmsFlexGpuBackend::probe() {
                 Ok(backend) => {
                     if log_exact_work(n) {
                         log::info!(
@@ -4253,7 +4254,7 @@ impl BernoulliMarginalSlopeFamily {
                 && n > 0
             {
                 let started = std::time::Instant::now();
-                let heartbeat_guard = crate::heartbeat::scope(format!(
+                let process_monitor_guard = crate::process_monitor::track_scope(format!(
                     "BMS row-primary-hessian-tiles n={n} r={r} bytes={} tile_rows={} global_budget={}",
                     plan.bytes, BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS, plan.global_pin_budget_bytes
                 ));
@@ -4302,7 +4303,7 @@ impl BernoulliMarginalSlopeFamily {
                         started.elapsed().as_secs_f64()
                     );
                 }
-                drop(heartbeat_guard);
+                drop(process_monitor_guard);
                 return Ok(RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
                     n,
                     r,
@@ -4333,7 +4334,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(RowPrimaryEvalCache::Empty);
         }
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS row-primary-hessian-cache n={n} r={r} bytes={} single_budget={} global_budget={}",
             plan.bytes, plan.single_cache_budget_bytes, plan.global_pin_budget_bytes
         ));
@@ -4388,15 +4389,16 @@ impl BernoulliMarginalSlopeFamily {
                             let md_is_rowmajor = md.is_standard_layout();
                             let gd_is_rowmajor = gd.is_standard_layout();
                             if md_is_rowmajor && gd_is_rowmajor {
-                                let block_layout = crate::gpu::bms_flex_row::BmsFlexBlockLayout {
-                                    p_m: cache.slices.marginal.len(),
-                                    p_g: cache.slices.logslope.len(),
-                                    h: cache.slices.h.clone(),
-                                    w: cache.slices.w.clone(),
-                                    p_total: cache.slices.total,
-                                };
+                                let block_layout =
+                                    crate::families::bms::gpu::row::BmsFlexBlockLayout {
+                                        p_m: cache.slices.marginal.len(),
+                                        p_g: cache.slices.logslope.len(),
+                                        h: cache.slices.h.clone(),
+                                        w: cache.slices.w.clone(),
+                                        p_total: cache.slices.total,
+                                    };
                                 let primary_layout =
-                                    crate::gpu::bms_flex_row::BmsFlexPrimaryLayout {
+                                    crate::families::bms::gpu::row::BmsFlexPrimaryLayout {
                                         h: primary.h.clone(),
                                         w: primary.w.clone(),
                                         r: primary.total,
@@ -4407,7 +4409,7 @@ impl BernoulliMarginalSlopeFamily {
                                 let gd_slice = gd
                                     .as_slice()
                                     .expect("dense logslope_design is row-major contiguous");
-                                match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel_device_resident(
+                                match crate::families::bms::gpu::row::launch_bms_flex_row_kernel_device_resident(
                                     owned.as_borrowed(),
                                     md_slice,
                                     gd_slice,
@@ -4423,7 +4425,7 @@ impl BernoulliMarginalSlopeFamily {
                                                 started.elapsed().as_secs_f64()
                                             );
                                         }
-                                        drop(heartbeat_guard);
+                                        drop(process_monitor_guard);
                                         return Ok(RowPrimaryEvalCache::Device(device_state));
                                     }
                                     Err(err) => {
@@ -4436,8 +4438,9 @@ impl BernoulliMarginalSlopeFamily {
                             }
                         }
                     }
-                    match crate::gpu::bms_flex_row::launch_bms_flex_row_kernel(owned.as_borrowed())
-                    {
+                    match crate::families::bms::gpu::row::launch_bms_flex_row_kernel(
+                        owned.as_borrowed(),
+                    ) {
                         Ok(outputs) => {
                             if log_exact_work(n) {
                                 log::info!(
@@ -4454,7 +4457,7 @@ impl BernoulliMarginalSlopeFamily {
                             let packed_hess =
                                 Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
                                     .map_err(|err| format!("bms_flex_row hess shape: {err}"))?;
-                            drop(heartbeat_guard);
+                            drop(process_monitor_guard);
                             return Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
                                 packed_neglog,
                                 packed_grad,
@@ -4564,7 +4567,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
             packed_neglog,
             packed_grad,
@@ -9323,8 +9326,10 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let heartbeat_guard =
-            crate::heartbeat::scope(format!("BMS dense-H build n={n} p={}", slices.total));
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+            "BMS dense-H build n={n} p={}",
+            slices.total
+        ));
         let hessian_source = if cache.row_primary_hessians.is_some() {
             "row-primary-cache"
         } else {
@@ -9494,7 +9499,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(dense)
     }
 
@@ -9507,7 +9512,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS fused exact-gradient+dense-H n={n} p={}",
             slices.total
         ));
@@ -9778,7 +9783,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(ExactNewtonJointFusedDenseEvaluation {
             gradient: ExactNewtonJointGradientEvaluation {
                 log_likelihood,
@@ -9799,7 +9804,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS exact-loglik eval n={n} p={}",
             cache.slices.total
         ));
@@ -9846,7 +9851,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(log_likelihood)
     }
 
@@ -9859,8 +9864,10 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let heartbeat_guard =
-            crate::heartbeat::scope(format!("BMS exact-gradient eval n={n} p={}", slices.total));
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+            "BMS exact-gradient eval n={n} p={}",
+            slices.total
+        ));
         if log_exact_work(n) {
             log::info!(
                 "[BMS exact-gradient] eval start n={} p={} source=cache",
@@ -9979,7 +9986,7 @@ impl BernoulliMarginalSlopeFamily {
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(ExactNewtonJointGradientEvaluation {
             log_likelihood,
             gradient,
@@ -10070,7 +10077,7 @@ impl BernoulliMarginalSlopeFamily {
         #[cfg(target_os = "linux")]
         {
             if let Some(device_state) = cache.row_primary_hessians.device() {
-                match crate::gpu::bms_flex_row::launch_bms_flex_row_hvp(
+                match crate::families::bms::gpu::row::launch_bms_flex_row_hvp(
                     device_state,
                     direction.as_slice().expect("direction is contiguous"),
                 ) {
@@ -10615,7 +10622,7 @@ impl BernoulliMarginalSlopeFamily {
         #[cfg(target_os = "linux")]
         {
             if let Some(device_state) = cache.row_primary_hessians.device() {
-                match crate::gpu::bms_flex_row::launch_bms_flex_row_diagonal(device_state) {
+                match crate::families::bms::gpu::row::launch_bms_flex_row_diagonal(device_state) {
                     Ok(host) => {
                         return Ok(Array1::<f64>::from_vec(host));
                     }
@@ -12051,7 +12058,7 @@ impl BernoulliMarginalSlopeFamily {
         let n_dirs = d_beta_flats.len();
         let flex_active = self.effective_flex_active(block_states)?;
         let bundle_present = cache.row_cell_moments.is_some();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS batched dH n={n} rows={n_rows} p={} dirs={n_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
@@ -12363,7 +12370,7 @@ impl BernoulliMarginalSlopeFamily {
             .drain(..)
             .map(|acc| Some(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
             .collect();
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(operators)
     }
 
@@ -12627,7 +12634,7 @@ impl BernoulliMarginalSlopeFamily {
         let n_unique_dirs = unique_dirs.len();
         let flex_active = self.effective_flex_active(block_states)?;
         let bundle_present = cache.row_cell_moments.is_some();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS batched d2H n={n} rows={n_rows} p={} pairs={n_pairs} unique_dirs={n_unique_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
@@ -12826,7 +12833,7 @@ impl BernoulliMarginalSlopeFamily {
             n_unique_dirs,
             started.elapsed().as_secs_f64(),
         );
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(accs
             .into_iter()
             .map(|acc| Some(Arc::new(acc.into_operator(slices)) as Arc<dyn HyperOperator>))
@@ -14107,7 +14114,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS Hessian-workspace build n={} p={} subsample_rows={}",
             family.y.len(),
             block_slices(&family).total,
@@ -14145,7 +14152,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
             );
         }
         let workspace = Self::from_arc_cache(family, block_states, Arc::new(cache), options);
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         workspace
     }
 
@@ -14234,8 +14241,10 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         {
             if let Some(device_state) = self.cache.row_primary_hessians.device() {
                 let p_total = self.cache.slices.total;
-                if p_total <= crate::gpu::bms_flex_row::DENSE_BLOCK_MAX_P {
-                    match crate::gpu::bms_flex_row::launch_bms_flex_row_dense_block(device_state) {
+                if p_total <= crate::families::bms::gpu::row::DENSE_BLOCK_MAX_P {
+                    match crate::families::bms::gpu::row::launch_bms_flex_row_dense_block(
+                        device_state,
+                    ) {
                         Ok(flat) => {
                             let h_arr =
                                 Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {
@@ -14296,8 +14305,10 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         {
             if let Some(device_state) = self.cache.row_primary_hessians.device() {
                 let p_total = self.cache.slices.total;
-                if p_total <= crate::gpu::bms_flex_row::DENSE_BLOCK_MAX_P {
-                    match crate::gpu::bms_flex_row::launch_bms_flex_row_dense_block(device_state) {
+                if p_total <= crate::families::bms::gpu::row::DENSE_BLOCK_MAX_P {
+                    match crate::families::bms::gpu::row::launch_bms_flex_row_dense_block(
+                        device_state,
+                    ) {
                         Ok(flat) => {
                             let h_arr =
                                 Array2::from_shape_vec((p_total, p_total), flat).map_err(|e| {
@@ -14361,7 +14372,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // does not apply here — keep full-data semantics.
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS Hessian-Hv call={call} n={} p={}",
             self.family.y.len(),
             self.cache.slices.total
@@ -14384,14 +14395,14 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         result
     }
 
     fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS Hessian-Hv (into) call={call} n={} p={}",
             self.family.y.len(),
             self.cache.slices.total
@@ -14413,7 +14424,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(true)
     }
 
@@ -14441,7 +14452,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         }
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let heartbeat_guard = crate::heartbeat::scope(format!(
+        let process_monitor_guard = crate::process_monitor::track_scope(format!(
             "BMS Hessian-Hv (mat) call={call} n={} p={} n_rhs={}",
             self.family.y.len(),
             total,
@@ -14465,7 +14476,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
                 started.elapsed().as_secs_f64()
             );
         }
-        drop(heartbeat_guard);
+        drop(process_monitor_guard);
         Ok(true)
     }
 

@@ -173,10 +173,7 @@ class DecoderConfig:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "DecoderConfig":
-        data = dict(payload)
-        # Legacy field kept for backward compatibility with earlier dict payloads.
-        data.pop("monotonicity_supported", None)
-        return cls(**data)
+        return cls(**dict(payload))
 
 
 @dataclass(frozen=True, slots=True)

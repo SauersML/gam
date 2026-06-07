@@ -377,11 +377,11 @@ mod cuda_impl {
                 .get_or_compile(
                     &ctx,
                     "identifiability_compile_fused",
-                    crate::gpu::identifiability_compile_kernel::KERNEL_SRC,
+                    crate::families::identifiability_gpu_kernel::KERNEL_SRC,
                 )
                 .ok()?;
             let func = module
-                .load_function(crate::gpu::identifiability_compile_kernel::KERNEL_NAME)
+                .load_function(crate::families::identifiability_gpu_kernel::KERNEL_NAME)
                 .ok()?;
 
             let total_cols = self.total_cols;
@@ -447,8 +447,8 @@ mod cuda_impl {
                         self.uploads[block_b][3].as_ref().unwrap_or(placeholder),
                     ];
 
-                    let tile_a = crate::gpu::identifiability_compile_kernel::TILE_A;
-                    let tile_b = crate::gpu::identifiability_compile_kernel::TILE_B;
+                    let tile_a = crate::families::identifiability_gpu_kernel::TILE_A;
+                    let tile_b = crate::families::identifiability_gpu_kernel::TILE_B;
                     let grid_x = a_cols_u32.div_ceil(tile_a).max(1);
                     let grid_y = b_cols_u32.div_ceil(tile_b).max(1);
                     let cfg = cudarc::driver::LaunchConfig {

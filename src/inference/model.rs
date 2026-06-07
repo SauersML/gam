@@ -1,6 +1,6 @@
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::families::bernoulli_marginal_slope::{LatentMeasureKind, LatentZRankIntCalibration};
+use crate::families::bms::{LatentMeasureKind, LatentZRankIntCalibration};
 use crate::families::gamlss::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
@@ -840,7 +840,7 @@ pub struct SavedBaselineTimeWiggleRuntime {
 
 // Re-export so saved-model consumers can refer to the anchor-block tag
 // without reaching across module boundaries.
-pub use crate::families::bernoulli_marginal_slope::deviation_runtime::ParametricAnchorBlock;
+pub use crate::families::bms::deviation_runtime::ParametricAnchorBlock;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedCompiledFlexBlock {
@@ -1288,14 +1288,12 @@ impl SavedCompiledFlexBlock {
                     .to_string(),
             });
         }
-        if self.kernel
-            != crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
-        {
+        if self.kernel != crate::families::bms::exact_kernel::ANCHORED_DEVIATION_KERNEL {
             return Err(FittedModelError::IncompatibleConfig {
                 reason: format!(
                     "saved anchored deviation runtime uses unsupported kernel '{}'; expected {}",
                     self.kernel,
-                    crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL
+                    crate::families::bms::exact_kernel::ANCHORED_DEVIATION_KERNEL
                 ),
             });
         }
@@ -1568,10 +1566,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<
-        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
-        FittedModelError,
-    > {
+    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1589,10 +1584,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<
-        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
-        FittedModelError,
-    > {
+    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1605,42 +1597,37 @@ impl SavedCompiledFlexBlock {
         }
         let left = points[span_idx];
         let right = points[span_idx + 1];
-        Ok(
-            crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                left,
-                right,
-                c0: self.span_c0[span_idx]
-                    .iter()
-                    .zip(beta.iter())
-                    .map(|(coeff, weight)| coeff * weight)
-                    .sum(),
-                c1: self.span_c1[span_idx]
-                    .iter()
-                    .zip(beta.iter())
-                    .map(|(coeff, weight)| coeff * weight)
-                    .sum(),
-                c2: self.span_c2[span_idx]
-                    .iter()
-                    .zip(beta.iter())
-                    .map(|(coeff, weight)| coeff * weight)
-                    .sum(),
-                c3: self.span_c3[span_idx]
-                    .iter()
-                    .zip(beta.iter())
-                    .map(|(coeff, weight)| coeff * weight)
-                    .sum(),
-            },
-        )
+        Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+            left,
+            right,
+            c0: self.span_c0[span_idx]
+                .iter()
+                .zip(beta.iter())
+                .map(|(coeff, weight)| coeff * weight)
+                .sum(),
+            c1: self.span_c1[span_idx]
+                .iter()
+                .zip(beta.iter())
+                .map(|(coeff, weight)| coeff * weight)
+                .sum(),
+            c2: self.span_c2[span_idx]
+                .iter()
+                .zip(beta.iter())
+                .map(|(coeff, weight)| coeff * weight)
+                .sum(),
+            c3: self.span_c3[span_idx]
+                .iter()
+                .zip(beta.iter())
+                .map(|(coeff, weight)| coeff * weight)
+                .sum(),
+        })
     }
 
     pub fn basis_span_cubic(
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<
-        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
-        FittedModelError,
-    > {
+    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1657,10 +1644,7 @@ impl SavedCompiledFlexBlock {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<
-        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
-        FittedModelError,
-    > {
+    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1671,26 +1655,21 @@ impl SavedCompiledFlexBlock {
                 ),
             });
         }
-        Ok(
-            crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                left: points[span_idx],
-                right: points[span_idx + 1],
-                c0: self.span_c0[span_idx][basis_idx],
-                c1: self.span_c1[span_idx][basis_idx],
-                c2: self.span_c2[span_idx][basis_idx],
-                c3: self.span_c3[span_idx][basis_idx],
-            },
-        )
+        Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+            left: points[span_idx],
+            right: points[span_idx + 1],
+            c0: self.span_c0[span_idx][basis_idx],
+            c1: self.span_c1[span_idx][basis_idx],
+            c2: self.span_c2[span_idx][basis_idx],
+            c3: self.span_c3[span_idx][basis_idx],
+        })
     }
 
     pub fn basis_cubic_at(
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<
-        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
-        FittedModelError,
-    > {
+    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1702,28 +1681,24 @@ impl SavedCompiledFlexBlock {
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            return Ok(
-                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                    left: left_ep,
-                    right: left_ep + 1.0,
-                    c0: self.span_c0[0][basis_idx],
-                    c1: 0.0,
-                    c2: 0.0,
-                    c3: 0.0,
-                },
-            );
+            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+                left: left_ep,
+                right: left_ep + 1.0,
+                c0: self.span_c0[0][basis_idx],
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
         }
         if value > right_ep {
-            return Ok(
-                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                    left: right_ep,
-                    right: right_ep + 1.0,
-                    c0: self.right_boundary_basis_value(basis_idx),
-                    c1: 0.0,
-                    c2: 0.0,
-                    c3: 0.0,
-                },
-            );
+            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+                left: right_ep,
+                right: right_ep + 1.0,
+                c0: self.right_boundary_basis_value(basis_idx),
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
         }
         let span_idx = self.left_biased_span_index_for(value)?;
         self.basis_span_cubic_validated(span_idx, basis_idx)
@@ -1733,10 +1708,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<
-        crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic,
-        FittedModelError,
-    > {
+    ) -> Result<crate::families::bms::exact_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1749,36 +1721,30 @@ impl SavedCompiledFlexBlock {
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            return Ok(
-                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                    left: left_ep,
-                    right: left_ep + 1.0,
-                    c0: self.span_c0[0]
-                        .iter()
-                        .zip(beta.iter())
-                        .map(|(coeff, weight)| coeff * weight)
-                        .sum(),
-                    c1: 0.0,
-                    c2: 0.0,
-                    c3: 0.0,
-                },
-            );
+            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+                left: left_ep,
+                right: left_ep + 1.0,
+                c0: self.span_c0[0]
+                    .iter()
+                    .zip(beta.iter())
+                    .map(|(coeff, weight)| coeff * weight)
+                    .sum(),
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
         }
         if value > right_ep {
-            return Ok(
-                crate::families::bernoulli_marginal_slope::exact_kernel::LocalSpanCubic {
-                    left: right_ep,
-                    right: right_ep + 1.0,
-                    c0: (0..self.basis_dim)
-                        .map(|basis_idx| {
-                            self.right_boundary_basis_value(basis_idx) * beta[basis_idx]
-                        })
-                        .sum(),
-                    c1: 0.0,
-                    c2: 0.0,
-                    c3: 0.0,
-                },
-            );
+            return Ok(crate::families::bms::exact_kernel::LocalSpanCubic {
+                left: right_ep,
+                right: right_ep + 1.0,
+                c0: (0..self.basis_dim)
+                    .map(|basis_idx| self.right_boundary_basis_value(basis_idx) * beta[basis_idx])
+                    .sum(),
+                c1: 0.0,
+                c2: 0.0,
+                c3: 0.0,
+            });
         }
         let span_idx = self.left_biased_span_index_for(value)?;
         self.local_cubic_on_span_validated(beta, span_idx)
@@ -3966,7 +3932,7 @@ pub fn load_survival_time_basis_config_from_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::bernoulli_marginal_slope::exact_kernel::ANCHORED_DEVIATION_KERNEL;
+    use crate::families::bms::exact_kernel::ANCHORED_DEVIATION_KERNEL;
     use crate::families::lognormal_kernel::FrailtySpec;
     use crate::pirls::PirlsStatus;
     use crate::solver::estimate::{FitArtifacts, FittedBlock, FittedLinkState};

@@ -14,13 +14,13 @@ Architecture (issue #343):
   ``crates/gam-pyffi/src/lib.rs::estimation_error_to_pyerr`` dispatches
   each variant to its corresponding subclass below. No ``err.to_string()``
   flattening, no message-regex reclassification.
-* ``GamError`` inherits from :class:`ValueError`, so legacy ``except
-  ValueError`` catches every gamfit engine error unchanged (issue #330).
+* ``GamError`` inherits from :class:`ValueError`, so callers can catch either
+  the package umbrella or Python's standard value-contract exception.
 * The remaining ``Result<_, String>`` error paths at the FFI boundary
   (formula validation, schema-mismatch during predict, basis builders
   not wrapped in ``EstimationError``, etc.) still flow through
-  :func:`map_exception` and the legacy message-regex classifier. They
-  will be migrated to typed dispatch one enum at a time; until then,
+  :func:`map_exception`. They will be migrated to typed dispatch one enum at a
+  time; until then,
   NEW error variants for already-typed enums MUST extend the Rust-side
   dispatcher, never the regex classifier.
 """
@@ -116,8 +116,8 @@ def map_exception(exc: BaseException) -> BaseException:
     selected the correct subclass via variant dispatch
     (``estimation_error_to_pyerr``, ``workflow_error_to_pyerr``,
     ``geometry_error_to_pyerr``, etc. in ``crates/gam-pyffi/src/lib.rs``),
-    so there is nothing to reclassify. The legacy message-regex
-    classifier is gone (issue #343); structured engine errors no longer
+    so there is nothing to reclassify. The message-regex classifier is gone
+    (issue #343); structured engine errors no longer
     round-trip through stringly-typed text.
 
     ``TypeError`` / ``LookupError`` / ``ArithmeticError`` describe

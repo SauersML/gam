@@ -71,7 +71,7 @@
 //! different links need not coincide, and matching a peer tool's noisy fit proves
 //! nothing. We do NOT loosen any bound and we do NOT modify gam source.
 
-use gam::bernoulli_marginal_slope::marginal_slope_covariance_from_scores;
+use gam::families::bms::marginal_slope_covariance_from_scores;
 use gam::families::marginal_slope_shared::probit_frailty_scale;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;

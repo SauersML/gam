@@ -1808,7 +1808,7 @@ impl<'a> GamWorkingModel<'a> {
                 } else {
                     workspace.hessian_buf.fill(0.0);
                 }
-                if crate::solver::gpu::cuda_selected() {
+                if crate::gpu::cuda_selected() {
                     return crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(
                         x_dense.view(),
                         weights.view(),
@@ -3046,7 +3046,7 @@ pub(super) fn solve_newton_direction_dense_with_factor(
         *direction_out = Array1::zeros(gradient.len());
     }
 
-    if crate::solver::gpu::cuda_selected() {
+    if crate::gpu::cuda_selected() {
         let rhs = Array2::from_shape_vec((p, 1), gradient.to_vec()).map_err(|e| {
             EstimationError::InvalidInput(format!("CUDA PIRLS RHS layout failed: {e}"))
         })?;

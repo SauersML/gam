@@ -1,12 +1,14 @@
+//! Process-wide liveness monitor with per-thread scope stacks.
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
+const PROCESS_MONITOR_INTERVAL: Duration = Duration::from_secs(60);
 
-static HEARTBEAT_STATE: OnceLock<Arc<HeartbeatState>> = OnceLock::new();
+static PROCESS_MONITOR: OnceLock<Arc<ProcessMonitorState>> = OnceLock::new();
 
 thread_local! {
     static THREAD_STACK: RefCell<ThreadStack> = RefCell::new(ThreadStack::new());
@@ -24,7 +26,7 @@ struct ThreadSnapshot {
     updated: Instant,
 }
 
-struct HeartbeatState {
+struct ProcessMonitorState {
     started: Instant,
     threads: Mutex<BTreeMap<String, ThreadSnapshot>>,
 }
@@ -35,9 +37,7 @@ struct ThreadStack {
     stack: Vec<FrameSnapshot>,
 }
 
-pub(crate) struct HeartbeatGuard {
-    active: bool,
-}
+pub(crate) struct ProcessScopeGuard;
 
 impl ThreadStack {
     fn new() -> Self {
@@ -50,9 +50,12 @@ impl ThreadStack {
     }
 }
 
-impl HeartbeatState {
+impl ProcessMonitorState {
     fn update_thread(&self, thread: &ThreadStack) {
-        let mut threads = self.threads.lock().expect("heartbeat registry poisoned");
+        let mut threads = self
+            .threads
+            .lock()
+            .expect("process monitor registry poisoned");
         if thread.stack.is_empty() {
             threads.remove(&thread.id);
         } else {
@@ -68,10 +71,13 @@ impl HeartbeatState {
     }
 
     fn emit(&self) {
-        let threads = self.threads.lock().expect("heartbeat registry poisoned");
+        let threads = self
+            .threads
+            .lock()
+            .expect("process monitor registry poisoned");
         let resource = ProcessResourceSnapshot::read();
         log::info!(
-            "[heartbeat] elapsed={} {} active_threads={}",
+            "[process-monitor] elapsed={} {} active_threads={}",
             format_duration(self.started.elapsed()),
             resource.format(),
             threads.len(),
@@ -82,14 +88,14 @@ impl HeartbeatState {
                 None => thread_id.clone(),
             };
             log::info!(
-                "[heartbeat] stack thread={} depth={} updated_ago={}",
+                "[process-monitor] stack thread={} depth={} updated_ago={}",
                 thread_label,
                 thread.stack.len(),
                 format_duration(thread.updated.elapsed()),
             );
             for (idx, frame) in thread.stack.iter().enumerate() {
                 log::info!(
-                    "[heartbeat]   #{idx}: {} [{}]",
+                    "[process-monitor]   #{idx}: {} [{}]",
                     frame.label,
                     format_duration(frame.entered.elapsed()),
                 );
@@ -98,12 +104,9 @@ impl HeartbeatState {
     }
 }
 
-impl Drop for HeartbeatGuard {
+impl Drop for ProcessScopeGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let state = heartbeat_state();
+        let state = process_monitor();
         THREAD_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             stack.stack.pop();
@@ -112,17 +115,13 @@ impl Drop for HeartbeatGuard {
     }
 }
 
-/// Eagerly start the background heartbeat thread (idempotent). Once
-/// started, the thread emits an `[heartbeat] elapsed=… rss=…` line every
-/// `HEARTBEAT_INTERVAL` until process exit — even when no `scope()`
-/// frames are active — so long silent stretches in the solver still
-/// surface a process-alive signal with current memory footprint.
-pub fn ensure_started() {
-    heartbeat_state();
+/// Start the background process monitor thread if it is not already running.
+pub fn start() {
+    process_monitor();
 }
 
-pub(crate) fn scope(label: impl Into<String>) -> HeartbeatGuard {
-    let state = heartbeat_state();
+pub(crate) fn track_scope(label: impl Into<String>) -> ProcessScopeGuard {
+    let state = process_monitor();
     THREAD_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         stack.stack.push(FrameSnapshot {
@@ -131,32 +130,32 @@ pub(crate) fn scope(label: impl Into<String>) -> HeartbeatGuard {
         });
         state.update_thread(&stack);
     });
-    HeartbeatGuard { active: true }
+    ProcessScopeGuard
 }
 
-fn heartbeat_state() -> Arc<HeartbeatState> {
-    HEARTBEAT_STATE
+fn process_monitor() -> Arc<ProcessMonitorState> {
+    PROCESS_MONITOR
         .get_or_init(|| {
-            let state = Arc::new(HeartbeatState {
+            let state = Arc::new(ProcessMonitorState {
                 started: Instant::now(),
                 threads: Mutex::new(BTreeMap::new()),
             });
-            start_heartbeat_thread(Arc::clone(&state));
+            start_process_monitor_thread(Arc::clone(&state));
             state
         })
         .clone()
 }
 
-fn start_heartbeat_thread(state: Arc<HeartbeatState>) {
-    let builder = thread::Builder::new().name("gam-heartbeat".to_string());
+fn start_process_monitor_thread(state: Arc<ProcessMonitorState>) {
+    let builder = thread::Builder::new().name("gam-process-monitor".to_string());
     match builder.spawn(move || {
         loop {
-            thread::park_timeout(HEARTBEAT_INTERVAL);
+            thread::park_timeout(PROCESS_MONITOR_INTERVAL);
             state.emit();
         }
     }) {
         Ok(handle) => drop(handle),
-        Err(err) => log::warn!("failed to start heartbeat thread: {err}"),
+        Err(err) => log::warn!("failed to start process monitor thread: {err}"),
     }
 }
 

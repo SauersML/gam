@@ -485,8 +485,8 @@ fn pg_fourth_cumulant(b: f64, c: f64) -> f64 {
     let s = 1.0 - t * t; // sech²u
     let u2 = u * u;
     let u3 = u2 * u;
-    let bracket = 15.0 * t - 15.0 * u * s - 12.0 * u2 * t * s + 2.0 * u3 * s * s
-        - 4.0 * u3 * t * t * s;
+    let bracket =
+        15.0 * t - 15.0 * u * s - 12.0 * u2 * t * s + 2.0 * u3 * s * s - 4.0 * u3 * t * t * s;
     b * bracket / (256.0 * u.powi(7))
 }
 

@@ -135,10 +135,13 @@ fn scale_transform_from_payload_typed(
                     projection_coef[[i, j]] = value;
                 }
             }
-            // Older saved payloads did not record the squared truncation
-            // cutoff. Treat them as cutoff=0: replay then matches the
-            // original least-squares coefficients exactly.
-            let projection_ridge_alpha = projection_ridge_alpha.unwrap_or(0.0);
+            let Some(projection_ridge_alpha) = projection_ridge_alpha else {
+                return Err(ScaleDesignError::DegenerateDesign {
+                    reason:
+                        "saved scale transform payload is missing projection_ridge_alpha; refit"
+                            .to_string(),
+                });
+            };
             if !projection_ridge_alpha.is_finite() || projection_ridge_alpha < 0.0 {
                 return Err(ScaleDesignError::NonFiniteInput {
                     reason: format!(
@@ -1236,27 +1239,6 @@ mod tests {
         assert_eq!(
             restored.projection_ridge_alpha, transform.projection_ridge_alpha,
             "alpha must round-trip exactly through payload serialization"
-        );
-
-        let legacy = scale_transform_from_payload(
-            &Some(
-                transform
-                    .projection_coef
-                    .rows()
-                    .into_iter()
-                    .map(|row| row.to_vec())
-                    .collect(),
-            ),
-            &Some(transform.weighted_column_mean.to_vec()),
-            &Some(transform.rescale.to_vec()),
-            Some(transform.non_intercept_start),
-            None,
-        )
-        .expect("legacy payload (no alpha) should still load")
-        .expect("legacy payload should produce a transform");
-        assert_eq!(
-            legacy.projection_ridge_alpha, 0.0,
-            "legacy payload without alpha must default to zero for backward compatibility"
         );
     }
 }

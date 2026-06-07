@@ -12,9 +12,7 @@
 //! forms, permutation sensitivity) makes one or more of these tests blow past
 //! the 2e-15 tolerance.
 
-use gam::bernoulli_marginal_slope::{
-    MarginalSlopeCovariance, marginal_slope_covariance_from_scores,
-};
+use gam::families::bms::{MarginalSlopeCovariance, marginal_slope_covariance_from_scores};
 use gam::probability::normal_cdf;
 use gam::survival_marginal_slope::{
     survival_marginal_slope_vector_eta, survival_marginal_slope_vector_neglog,

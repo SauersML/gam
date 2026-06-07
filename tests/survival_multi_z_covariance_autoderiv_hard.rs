@@ -7,7 +7,7 @@
 //! the wrong shape, the test is supposed to fail. Do not weaken thresholds
 //! to make these pass.
 
-use gam::bernoulli_marginal_slope::{
+use gam::families::bms::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
 };
 use ndarray::{Array1, Array2, ArrayView2};
