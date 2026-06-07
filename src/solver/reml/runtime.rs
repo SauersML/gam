@@ -167,6 +167,18 @@ const ALO_DEVIANCE_SATURATION: f64 = 9.0;
 // gate-off path).
 const ALO_GRADIENT_MAX_WORK: usize = 4_000_000;
 
+/// Shared factorization of the stabilized penalized Hessian, computed once on
+/// the value path and threaded into the ALO ρ-gradient so the gradient never
+/// re-materializes dense `X` or re-factorizes the same matrix (#862).
+struct AloFactoredHessian<'a> {
+    /// Dense transformed design `X` (n × p).
+    x: &'a Array2<f64>,
+    /// Lower-triangular Cholesky factor of the stabilized penalized Hessian.
+    chol: &'a crate::linalg::faer_ndarray::FaerCholeskyFactor,
+    /// `H⁻¹Xᵀ` (p × n), the column-solve the gradient reuses per observation.
+    h_inv_xt: &'a Array2<f64>,
+}
+
 fn alo_leverage_barrier(h: f64) -> f64 {
     let excess = (h - ALO_MAX_LEVERAGE_THRESHOLD).max(0.0);
     excess * excess
