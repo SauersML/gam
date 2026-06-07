@@ -20978,6 +20978,12 @@ mod tests {
 
     #[test]
     fn term_collection_design_keeps_intercept_plus_bspline_sparse() {
+        // Use `BSplineIdentifiability::None` so the smooth block stays sparse
+        // through `build_bspline_basis_1d`: the default `WeightedSumToZero`
+        // policy is deliberately densified by `apply_sum_to_zero_constraint_sparse`
+        // (orthonormal Z, so ZZᵀ projects), which would prevent the full
+        // assembled design from ever landing in `DesignMatrix::Sparse`
+        // — that is, the pin only makes sense for the None branch.
         let n = 96usize;
         let x = Array1::linspace(0.0, 1.0, n);
         let mut data = Array2::<f64>::zeros((n, 1));
@@ -20997,7 +21003,7 @@ mod tests {
                             num_internal_knots: 32,
                         },
                         double_penalty: false,
-                        identifiability: BSplineIdentifiability::default(),
+                        identifiability: BSplineIdentifiability::None,
                         boundary: OneDimensionalBoundary::Open,
                         boundary_conditions: BSplineBoundaryConditions::default(),
                     },

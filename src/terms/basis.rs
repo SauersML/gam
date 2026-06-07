@@ -31009,8 +31009,15 @@ mod tests {
 
     #[test]
     fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
+        // The lazy switch fires when the projected dense materialization would
+        // exceed `ResourcePolicy::max_single_materialization_bytes` (1 GiB on
+        // `default_library`). For n × p × 8 to cross that bound we need
+        // n·p > 2^27, so the smaller (17_000 × 2_000) pin used previously
+        // landed at ~272 MiB and never triggered the lazy path. Size the
+        // test so the dense allocation alone would be ~1.01 GiB — comfortably
+        // over the cap, while still allocating only ~200 KiB of inputs.
         let n = 17_000usize;
-        let k = 2_000usize;
+        let k = 8_000usize;
         let mut data = Array2::<f64>::zeros((n, 1));
         let mut centers = Array2::<f64>::zeros((k, 1));
         for i in 0..n {
@@ -31597,7 +31604,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_bspline_basis_1d_default_identifiability_prefers_sparse_design() {
+    fn test_build_bspline_basis_1d_default_identifiability_densifies_via_orthonormal_centering() {
+        // The default (`WeightedSumToZero`) identifiability multiplies the
+        // sparse B-spline by the orthonormal null-space basis Z of c = Bᵀw.
+        // Z is dense in general (rrqr_nullspace_basis yields an orthonormal,
+        // not sparsity-preserving, factor), so B·Z is mathematically dense —
+        // the cost of having ZZᵀ act as a true projector, called out in the
+        // matching comment inside `build_bspline_basis_1d`. Pin that the
+        // densification is exposed at the API: a downstream caller that
+        // assumes sparse storage for the default-centered basis is wrong.
         let x = Array::linspace(0.0, 1.0, 32);
         let spec = BSplineBasisSpec {
             degree: 3,
@@ -31612,8 +31627,8 @@ mod tests {
             boundary_conditions: BSplineBoundaryConditions::default(),
         };
 
-        let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered sparse bspline");
-        assert!(matches!(built.design, DesignMatrix::Sparse(_)));
+        let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered bspline");
+        assert!(matches!(built.design, DesignMatrix::Dense(_)));
     }
 
     #[test]
@@ -31723,7 +31738,11 @@ mod tests {
     }
 
     #[test]
-    fn test_bspline_identifiability_weighted_sum_tozero_respects_weights_with_sparse_design() {
+    fn test_bspline_identifiability_weighted_sum_tozero_respects_weights() {
+        // Pin the centering identity itself: every column of the constrained
+        // basis is orthogonal to the supplied weight vector. Storage type is
+        // a separate concern (covered by
+        // `..._default_identifiability_densifies_via_orthonormal_centering`).
         let x = Array::linspace(0.0, 1.0, 30);
         let weights = Array1::from_iter((0..x.len()).map(|idx| 1.0 + idx as f64 / 10.0));
         let spec = BSplineBasisSpec {
@@ -31742,7 +31761,6 @@ mod tests {
         };
 
         let built = build_bspline_basis_1d(x.view(), &spec).unwrap();
-        assert!(matches!(built.design, DesignMatrix::Sparse(_)));
         let built_design = built.design.to_dense();
         for j in 0..built_design.ncols() {
             let weighted_sum = built_design.column(j).dot(&weights);
