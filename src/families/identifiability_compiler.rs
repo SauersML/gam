@@ -332,6 +332,14 @@ pub fn compile_with_dual_metric(
         .collect();
 
     let mut compiled: Vec<CompiledBlock> = Vec::with_capacity(operators.len());
+    // Demotions that happen *inside* the per-block walk (a structurally-kept
+    // block losing all its directions to a higher-priority anchor in the
+    // structural or curvature pass) are recorded here, one entry per demoted
+    // raw column, in the same `(block_idx, local_col)` convention that
+    // `audit_and_drop_trailing_pivots` emits at the joint-audit step. Without
+    // this, a zero-width demotion vanished from `dropped`, breaking the
+    // `kept_width + dropped_count == structural_pre_audit_width` accounting.
+    let mut walk_demotions: Vec<(usize, usize)> = Vec::new();
     let mut anchor_h: Array2<f64> = Array2::zeros((n * k, 0));
     let mut anchor_s: Array2<f64> = Array2::zeros((n * k, 0));
     // Cumulative *raw* (un-residualised) curvature-scaled anchor: the
@@ -359,7 +367,14 @@ pub fn compile_with_dual_metric(
         // (`M^H_inner` below), not the structural one.
         let (residual_s, _) = residualise_in_metric(&anchor_s, w_s)?;
         let g_s = fast_atb(&residual_s, &residual_s);
-        let g_s_trace: f64 = (0..p_b).map(|i| g_s[[i, i]].max(0.0)).sum();
+        // Scale reference for the kept-eigenspace tolerance: the *original*
+        // (pre-residualisation) structural block Gram trace. A fully-absorbed
+        // block's residual collapses to ~ε² noise; anchoring tau to that would
+        // keep the noise directions and wrongly treat the block as
+        // structurally independent. The original-block trace is invariant to
+        // absorption, so a near-zero residual is rejected as fully absorbed.
+        let g_s_bb = fast_atb(w_s, w_s);
+        let g_s_trace: f64 = (0..p_b).map(|i| g_s_bb[[i, i]].max(0.0)).sum();
         let d = keep_positive_eigenspace(&g_s, n, k, g_s_trace)?;
         if d.ncols() == 0 {
             if anchor_h.ncols() == 0 {
@@ -376,6 +391,12 @@ pub fn compile_with_dual_metric(
                 r_lw: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
                 anchor_evaluator: None,
             });
+            // The structural pass fully absorbed all `p_b` raw columns into the
+            // higher-priority anchor: record each as a drop so the per-block
+            // width accounting (kept + dropped == raw width) stays exact.
+            for c in 0..p_b {
+                walk_demotions.push((idx, c));
+            }
             raw_anchor_h = concat_cols(&raw_anchor_h, w_h);
             continue;
         }
@@ -390,7 +411,13 @@ pub fn compile_with_dual_metric(
         let (residual_h, m_h_inner_opt) = residualise_in_metric(&anchor_h, &w_h_d)?;
         let g_h = fast_atb(&residual_h, &residual_h);
         let p_d = d.ncols();
-        let g_h_trace: f64 = (0..p_d).map(|i| g_h[[i, i]].max(0.0)).sum();
+        // Scale reference: the *unresidualised* curvature block Gram trace of
+        // `W^H_b · D` (the same convention the closed-form `compile_from_raw_grams`
+        // path uses with `d_t_kh_d`). Anchoring to the residual trace would
+        // collapse to ~ε² when the block is fully curvature-absorbed and keep
+        // its noise directions.
+        let g_h_dd = fast_atb(&w_h_d, &w_h_d);
+        let g_h_trace: f64 = (0..p_d).map(|i| g_h_dd[[i, i]].max(0.0)).sum();
         let t_inner = keep_positive_eigenspace(&g_h, n, k, g_h_trace)?;
         if t_inner.ncols() == 0 {
             if anchor_h.ncols() == 0 {
@@ -407,6 +434,13 @@ pub fn compile_with_dual_metric(
                 r_lw: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
                 anchor_evaluator: None,
             });
+            // The structural pass kept `p_d` directions, but the curvature pass
+            // absorbed all of them into the higher-priority anchor. Record each
+            // structurally-kept-but-curvature-demoted direction as a drop so the
+            // pre-audit structural width is fully accounted for.
+            for c in 0..p_d {
+                walk_demotions.push((idx, c));
+            }
             raw_anchor_h = concat_cols(&raw_anchor_h, w_h);
             continue;
         }
@@ -493,7 +527,12 @@ pub fn compile_with_dual_metric(
 
     // Joint-design audit on the curvature-scaled cumulative anchor: the
     // identifiability question the fit cares about is curvature-rank.
-    let dropped = audit_and_drop_trailing_pivots(&anchor_h, &mut compiled)?;
+    let audit_dropped = audit_and_drop_trailing_pivots(&anchor_h, &mut compiled)?;
+    // Combine in-walk demotions (structural / curvature full absorption of a
+    // block) with the joint-audit trailing-pivot drops so `dropped` accounts
+    // for *every* column the compiler removed, not just the joint-audit ones.
+    let mut dropped = walk_demotions;
+    dropped.extend(audit_dropped);
     let joint_rank: usize = compiled.iter().map(|b| b.t_lw.ncols()).sum();
 
     Ok(CompiledBlocks {
@@ -1463,7 +1502,16 @@ pub fn orthogonalize_design_blocks(
         // anchor and are removed.
         let (residual, _correction) = residualise_in_metric(&anchor, &w_b)?;
         let g_res = symmetrise(&fast_atb(&residual, &residual));
-        let g_bb_trace: f64 = (0..p_b).map(|i| g_res[[i, i]].max(0.0)).sum();
+        // Scale reference for `keep_positive_eigenspace` must be the
+        // *original* (pre-residualisation) weighted block Gram trace, NOT the
+        // residual's. When `b` is fully absorbed by a higher-priority anchor
+        // the residual collapses to floating-point noise (~ε² of the original
+        // O(1) data); anchoring tau to that noise floor would keep the noise
+        // eigenvalues and misreport a fully-absorbed block as `Independent`.
+        // The original-block trace is invariant to absorption, so a near-zero
+        // residual is correctly rejected as fully absorbed.
+        let g_bb = fast_atb(&w_b, &w_b);
+        let g_bb_trace: f64 = (0..p_b).map(|i| g_bb[[i, i]].max(0.0)).sum();
         let v_b = keep_positive_eigenspace(&g_res, n, 1, g_bb_trace)?;
         let r_b = v_b.ncols();
         let absorbed_width = p_b - r_b;

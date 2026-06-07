@@ -94,6 +94,17 @@ use crate::solver::estimate::EstimationError;
 
 const DEFAULT_GAUGE_PRIORITY: u8 = 100;
 
+/// Lower bound on the cosine that may be reported as an `AliasedPair` when the
+/// per-pair null cosine distribution has little width (σ → 0, i.e. both columns
+/// near-uniform with leverage concentration S2 ≈ 1/n). In that regime ordinary
+/// correlation between two distinct, fully-identifiable directions can reach a
+/// substantial cosine (e.g. ≈ 0.745 between a constant `1` and an `x²` column
+/// over a symmetric grid) without being an aliasing/identifiability problem;
+/// only a near-exact cosine (≈ 1) is a genuine rank deficiency there. This is
+/// the near-exact-alias boundary the fixed `ALIAS_OVERLAP_REPORTING_THRESHOLD`
+/// used before the leverage-scaled rewrite, restored as the report-band floor.
+const REPORT_FLOOR_NEAR_EXACT: f64 = 0.95;
+
 /// Per-block accounting record. `original_dim` is the spec's column
 /// count at audit entry (post `joint_null_rotation` absorption — the
 /// audit is contractually run on the rotated specs). `effective_dim`
@@ -367,15 +378,27 @@ fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
 /// with α = 0.05.  For m_pairs = 1 this gives K = 3 (three-sigma).
 /// For m_pairs = 1000 (large biobank audit) this gives K ≈ 5.1.
 ///
-/// The floor of 0.10 prevents collapse to near-zero on pathological
-/// inputs; the ceiling 0.999 is the absolute alias boundary.
-/// For a column with n_eff = 100 and m_pairs = 100: σ ≈ 0.1,
-/// K ≈ 4.3, threshold ≈ 0.43.  For n_eff = 10000: σ ≈ 0.01,
-/// threshold ≈ 0.043, clamped to 0.10.
+/// # Floor — the near-exact-alias boundary, NOT 0.10
+///
+/// The floor is the regime where σ → 0: both columns are near-uniform
+/// (S2 ≈ 1/n), so the null cosine distribution is tightly concentrated and
+/// has effectively no statistical width.  In that regime a moderate cosine
+/// (e.g. the 0.745 uncentered cosine between a constant `1` column and a `x²`
+/// column over a symmetric grid) is *ordinary correlation between two
+/// distinct, fully-identifiable directions* — not aliasing.  Only a
+/// near-exact cosine (≈ 1) is a genuine rank deficiency there.  A 0.10 floor
+/// would flag any moderately-correlated pair of basis functions as an alias
+/// (the WIP regression these constants replaced the fixed-0.95 report
+/// threshold with).  We therefore floor at [`REPORT_FLOOR_NEAR_EXACT`] (the
+/// near-exact-alias boundary) so σ → 0 approaches the exact-alias regime
+/// rather than collapsing to a low value.  The ceiling 0.999 is the absolute
+/// alias boundary.  For a column with n_eff = 100 and m_pairs = 100: σ ≈ 0.1,
+/// K ≈ 4.3, K·σ ≈ 0.43 — but the band must still report a near-exact alias,
+/// so the effective report threshold never drops below the floor.
 fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 {
     let sigma = pair_null_sigma(s2_a, s2_b, n);
     if sigma <= 0.0 {
-        return 0.10_f64;
+        return REPORT_FLOOR_NEAR_EXACT;
     }
     let k_report = if m_pairs <= 1 {
         3.0_f64
@@ -384,7 +407,12 @@ fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 
             .sqrt()
             .max(3.0)
     };
-    (k_report * sigma).clamp(0.10, 0.999)
+    // The statistical K·σ band is the *upper* bound on how wide the report
+    // region may be; the near-exact-alias floor is the *lower* bound on the
+    // overlap that may be called an alias when the null has little width. Take
+    // the larger of the two so a wide-σ pair uses K·σ while a narrow-σ pair
+    // (near-uniform columns) requires a near-exact cosine.
+    (k_report * sigma).max(REPORT_FLOOR_NEAR_EXACT).min(0.999)
 }
 
 /// Overlap threshold above which the audit halts the fit for this pair.
@@ -2752,11 +2780,23 @@ mod tests {
             parametric[[i, 0]] = 1.0;
             parametric[[i, 1]] = x[i];
         }
-        // Block 1: smooth in x — 8 polynomial-like columns.
+        // Block 1: smooth in x — 8 genuinely independent radial basis
+        // columns (Gaussian bumps at 8 distinct, well-separated knots). The
+        // earlier `(x − (k−4)·0.2)²` construction was rank-3 (every column
+        // expands to `x² − 2(k−4)(0.2)x + const` ∈ span{1, x, x²}), so 5 of
+        // the 8 columns were genuinely redundant and RRQR correctly demoted
+        // them — contradicting the fixture's "8 independent columns, one
+        // seeded drop" premise. Gaussian RBFs at distinct centres are
+        // linearly independent and do not lie in span{1, x}, so the block
+        // contributes its full rank-8 and the ONLY drop is the seeded x~x
+        // alias in block 3.
         let mut s_x = Array2::<f64>::zeros((n, 8));
+        let rbf_width = 0.30_f64;
         for i in 0..n {
             for k in 0..8 {
-                s_x[[i, k]] = (x[i] - (k as f64 - 4.0) * 0.2).powi(2);
+                let center = (k as f64 - 3.5) * 0.25;
+                let d = (x[i] - center) / rbf_width;
+                s_x[[i, k]] = (-0.5 * d * d).exp();
             }
         }
         // Block 2: smooth in sin(x) — 6 columns. No alias with block 1.
