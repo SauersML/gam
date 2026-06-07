@@ -2,8 +2,8 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
+from unittest.mock import patch
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,146 +16,91 @@ sys.modules[_SPEC.name] = _FUZZ
 _SPEC.loader.exec_module(_FUZZ)
 
 
-def _scenario(**overrides: Any) -> Any:
-    base = {
-        "double_penalty": True,
-        "basis_type": "ps",
-        "knots": 8,
-        "duchon_order": 0,
-        "duchon_power": 1,
-        "n_duchon_dims": 2,
-        "model_type": "gamlss",
-    }
-    base.update(overrides)
-    return SimpleNamespace(**base)
+def _fuzz_scenario(
+    name: str,
+    *,
+    n_obs: int,
+    n_features: int,
+    seed: int = 0,
+    family: str = "gaussian",
+    model_type: str = "gam",
+    basis_type: str = "ps",
+) -> Any:
+    return _FUZZ.FuzzScenario(
+        trial_id=f"{seed}:{name}:{model_type}",
+        seed=seed,
+        name=name,
+        family=family,
+        model_type=model_type,
+        basis_type=basis_type,
+        n_obs=n_obs,
+        n_features=n_features,
+        formula="y ~ x0",
+        mgcv_formula="y ~ s(x0)",
+    )
 
 
-class FuzzVsMgcvFormulaTests(unittest.TestCase):
-    def test_gamlss_fit_command_uses_rhs_only_predict_noise(self) -> None:
-        sc = _scenario()
-        cmd = _FUZZ.build_rust_fit_cmd(sc, "train.csv", "model.json", ["x0", "x1"])
-
-        self.assertIn("--predict-noise", cmd)
-        noise_terms = cmd[cmd.index("--predict-noise") + 1]
-        self.assertEqual(noise_terms, "s(x0, type=ps, knots=4, double_penalty=true)")
-        self.assertNotIn("~", noise_terms)
-        self.assertEqual(cmd[-1], "y ~ s(x0, type=ps, knots=8, double_penalty=true) + s(x1, type=ps, knots=8, double_penalty=true)")
-
-    def test_duchon_noise_terms_stay_rhs_only(self) -> None:
-        sc = _scenario(basis_type="duchon", knots=10, double_penalty=False, duchon_order=0, duchon_power=2)
-
-        noise_terms = _FUZZ.rust_noise_terms(["x0", "x1", "x2"], sc)
-
-        self.assertEqual(
-            noise_terms,
-            "duchon(x0, x1, centers=5, order=0, power=2)",
-        )
-        self.assertNotIn("~", noise_terms)
-
-    def test_gam_fit_command_omits_predict_noise(self) -> None:
-        sc = _scenario(model_type="gam", basis_type="tps", knots=6)
-
-        cmd = _FUZZ.build_rust_fit_cmd(sc, "train.csv", "model.json", ["x0", "x1"])
-
-        self.assertNotIn("--predict-noise", cmd)
-        self.assertEqual(
-            cmd[-1],
-            "y ~ s(x0, type=tps, centers=6, double_penalty=true) + s(x1, type=tps, centers=6, double_penalty=true)",
+class FuzzVsMgcvSelectionTests(unittest.TestCase):
+    def test_cost_model_scales_with_rows_features_and_gamlss_multiplier(self) -> None:
+        gam = _fuzz_scenario("gam", n_obs=10_000, n_features=4)
+        gamlss = _fuzz_scenario(
+            "gamlss",
+            n_obs=10_000,
+            n_features=4,
+            model_type="gamlss",
         )
 
-    def test_select_scenarios_applies_cost_cap_before_sorting(self) -> None:
-        seeds = list(range(1, 60))
-        cap = 75_000.0
-        scenarios, skipped = _FUZZ.select_scenarios(seeds, max_scenario_cost=cap)
+        self.assertEqual(_FUZZ._scenario_cost(gam), 40_000.0)
+        self.assertEqual(_FUZZ._scenario_cost(gamlss), 72_000.0)
 
-        for sc in scenarios:
-            self.assertLessEqual(_FUZZ.estimate_scenario_cost(sc), cap)
-        for sc, cost in skipped:
-            self.assertGreater(cost, cap)
-        self.assertGreater(len(scenarios), 0)
-        self.assertGreater(len(skipped), 0)
-
-    def test_backfilled_selection_preserves_requested_ci_coverage_under_cap(self) -> None:
-        scenarios, skipped = _FUZZ.select_scenarios_backfilled(
-            seed_start=42,
-            target_count=100,
-            excluded_seeds=set(),
-            max_scenario_cost=200_000.0,
+    def test_backfilled_selection_skips_oversized_mgcv_runner_draw(self) -> None:
+        oversized = _fuzz_scenario(
+            "gam_bench_mgcv_cv_skcfgtbl",
+            n_obs=2_399_999,
+            n_features=4,
         )
+        keep_1 = _fuzz_scenario("small_1", n_obs=10_000, n_features=4, seed=1)
+        keep_2 = _fuzz_scenario("small_2", n_obs=20_000, n_features=4, seed=2)
+        candidates = [oversized, keep_1, keep_2]
 
-        self.assertEqual(len(scenarios), 100)
-        self.assertGreater(len(skipped), 0)
-        self.assertTrue(
-            all(_FUZZ.estimate_scenario_cost(sc) <= 200_000.0 for sc in scenarios)
-        )
+        with patch.object(_FUZZ, "_candidate_scenarios", return_value=candidates):
+            selected, skipped = _FUZZ.select_scenarios_backfilled(
+                seed_start=0,
+                target_count=2,
+                excluded_ids=set(),
+                max_scenario_cost=200_000.0,
+            )
 
-    def test_mgcv_ps_formula_converts_rust_internal_knots_to_basis_width(self) -> None:
-        sc = _scenario(model_type="gam", basis_type="ps", knots=3)
+        self.assertEqual([sc.name for sc in selected], ["small_1", "small_2"])
+        self.assertEqual([sc.name for sc, _ in skipped], ["gam_bench_mgcv_cv_skcfgtbl"])
+        self.assertGreater(skipped[0][1], 9_000_000.0)
 
-        self.assertEqual(
-            _FUZZ.mgcv_formula(["x0", "x1"], sc),
-            "y ~ s(x0, bs='ps', k=min(7, nrow(train_df)-1)) + s(x1, bs='ps', k=min(7, nrow(train_df)-1))",
-        )
-        self.assertEqual(
-            _FUZZ.mgcv_sigma_formula(["x0", "x1"], sc),
-            "~ s(x0, bs='ps', k=min(7, nrow(train_df)-1))",
-        )
+    def test_backfilled_selection_honors_existing_trial_ids(self) -> None:
+        old = _fuzz_scenario("already_done", n_obs=10_000, n_features=4)
+        new = _fuzz_scenario("new", n_obs=10_000, n_features=4, seed=1)
 
-    def test_duchon_generation_disables_unmatched_mgcv_select_penalty(self) -> None:
-        sc = _FUZZ.generate_scenario(126)
+        with patch.object(_FUZZ, "_candidate_scenarios", return_value=[old, new]):
+            selected, skipped = _FUZZ.select_scenarios_backfilled(
+                seed_start=0,
+                target_count=1,
+                excluded_ids={old.trial_id},
+                max_scenario_cost=200_000.0,
+            )
 
-        self.assertEqual(sc.basis_type, "duchon")
-        self.assertFalse(sc.double_penalty)
+        self.assertEqual([sc.name for sc in selected], ["new"])
+        self.assertEqual(skipped, [])
 
-    def test_forced_duchon_filter_disables_unmatched_mgcv_select_penalty(self) -> None:
-        sc = _scenario(basis_type="ps", double_penalty=True, knots=8, n_smooths=3, n_obs=40)
+    def test_backfilled_selection_fails_when_cap_blocks_coverage(self) -> None:
+        oversized = _fuzz_scenario("too_big", n_obs=100_000, n_features=4)
 
-        _FUZZ._apply_basis_filter(sc, "duchon")
-
-        self.assertEqual(sc.basis_type, "duchon")
-        self.assertFalse(sc.double_penalty)
-
-    def test_mgcv_select_penalty_matches_rust_double_penalty_semantics(self) -> None:
-        cases = [
-            ("tps", False, False),
-            ("tps", True, True),
-            ("duchon", True, False),
-            ("ps", False, False),
-            ("ps", True, True),
-        ]
-        for basis_type, double_penalty, expected in cases:
-            with self.subTest(basis_type=basis_type, double_penalty=double_penalty):
-                self.assertIs(
-                    _FUZZ._mgcv_select_penalty(
-                        _scenario(
-                            basis_type=basis_type,
-                            double_penalty=double_penalty,
-                        )
-                    ),
-                    expected,
+        with patch.object(_FUZZ, "_candidate_scenarios", return_value=[oversized]):
+            with self.assertRaisesRegex(RuntimeError, "only selected 0/1"):
+                _FUZZ.select_scenarios_backfilled(
+                    seed_start=0,
+                    target_count=1,
+                    excluded_ids=set(),
+                    max_scenario_cost=200_000.0,
                 )
-
-    def test_duchon_extra_terms_raise_estimated_cost(self) -> None:
-        small = SimpleNamespace(
-            seed=0, family="gaussian", model_type="gam",
-            n_obs=200, n_smooths=3, knots=8, double_penalty=False,
-            noise_sd=1.0, noise_kind="gaussian", smooth_kinds=["sine"],
-            x_distribution="uniform", basis_type="duchon",
-            collinear_strength=0.0, signal_structure="additive",
-            sigma_kind="constant", duchon_order=0, duchon_power=2,
-            n_duchon_dims=2,
-        )
-        large = SimpleNamespace(
-            seed=0, family="gaussian", model_type="gam",
-            n_obs=5000, n_smooths=10, knots=20, double_penalty=True,
-            noise_sd=1.0, noise_kind="gaussian", smooth_kinds=["sine"],
-            x_distribution="uniform", basis_type="duchon",
-            collinear_strength=0.0, signal_structure="additive",
-            sigma_kind="constant", duchon_order=0, duchon_power=2,
-            n_duchon_dims=2,
-        )
-        self.assertGreater(_FUZZ.estimate_scenario_cost(large), 75_000)
-        self.assertLess(_FUZZ.estimate_scenario_cost(small), 75_000)
 
 
 def _trial(
