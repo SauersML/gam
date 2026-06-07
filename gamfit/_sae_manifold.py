@@ -947,7 +947,7 @@ _TOPOLOGY_UNSET: Any = object()
 
 def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_topology: Any = _TOPOLOGY_UNSET,
                      assignment: str = "ibp", schedule: GumbelTemperatureSchedule | Mapping[str, Any] | None = None,
-                     isometry_weight: float = 1.0, ard_per_atom: bool = True,
+                     isometry_weight: float = 0.0, ard_per_atom: bool = True,
                      decoder_feature_sparsity_groups: list[list[int]] | None = None, n_iter: int = 50, *,
                      Z: Any = None, sparsity_weight: float = 1.0,
                      gate_sparsity: str = "scad", scad_mcp_gamma: float | None = None,
@@ -1206,6 +1206,10 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     # and therefore the REML Occam / joint-log-det terms that enter
     # `reml_score` — is invariant under reparameterizing the latent coordinate
     # t. Topology comparison (e.g. circle vs euclidean) is thus well posed
+    # NOTE(#795): isometry defaults to 0.0 (off) — the MeanProfiled isometry
+    # energy is not scale-invariant (scales as decoder^4), exploding to ~1e13
+    # during the joint solve and saturating the arrow-Schur ridge at 1e15
+    # (RemlConvergenceError). Re-enable once the residual is scale-normalized.
     # regardless of `isometry_weight`. `IsometryPenalty` (on by default) is now
     # purely a complementary regularizer that drives g -> I for an
     # interpretable near-arc-length chart; turning it off no longer makes
