@@ -143,7 +143,10 @@ fn gamma_observation_interval_covers_each_tail_not_just_the_total() {
     let n = m as f64;
     let lower_tail = (0..m).filter(|&i| yev[i] < lower[i]).count() as f64 / n;
     let upper_tail = (0..m).filter(|&i| yev[i] > upper[i]).count() as f64 / n;
-    let total = (0..m).filter(|&i| yev[i] >= lower[i] && yev[i] <= upper[i]).count() as f64 / n;
+    let total = (0..m)
+        .filter(|&i| yev[i] >= lower[i] && yev[i] <= upper[i])
+        .count() as f64
+        / n;
 
     eprintln!(
         "[gamma-obs] lower-tail freq = {lower_tail:.4} (nominal 0.025), \
