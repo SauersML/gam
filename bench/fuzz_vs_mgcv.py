@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 from bench.run_suite import (  # noqa: E402
     _formula_rhs_from_terms,
     _mgcv_formula_for_scenario,
+    _read_meminfo,
     _rust_formula_for_scenario,
     _scenario_fit_mapping,
     _sigma_feature_terms,
@@ -127,6 +128,56 @@ def _load_scenario_configs() -> list[dict[str, typing.Any]]:
 def _scenario_cost(sc: FuzzScenario) -> float:
     multiplier = 1.8 if sc.model_type == "gamlss" else 1.0
     return float(max(sc.n_obs, 1) * max(sc.n_features, 1) * multiplier)
+
+
+# Conservative per-(n*p)-element resident-byte estimates, calibrated against the
+# observed OOM at n=2,399,999 p=4 (n*p ~= 9.6M): gam peaked ~13.7 GiB
+# (~1530 B/elem) and the concurrent mgcv CV runner ~6.7 GiB (~750 B/elem). gam
+# and mgcv run back-to-back within one trial while gam's RSS is still resident,
+# so the runner must hold both peaks at once. Rounded up for headroom.
+_GAM_BYTES_PER_NP = 1700.0
+_MGCV_BYTES_PER_NP = 850.0
+# Fraction of total runner RAM a single trial's combined gam+mgcv peak may use
+# before the mgcv arm is skipped. Leaves room for the OS, the heartbeat process,
+# and estimate error; below this the trial runs both arms as before.
+_RAM_SAFETY_FRACTION = 0.80
+
+
+def _projected_trial_peak_bytes(n_obs: int, n_features: int) -> tuple[float, float]:
+    """Return (gam_peak, mgcv_peak) projected resident bytes for an (n, p) fit."""
+    np_elems = float(max(n_obs, 1) * max(n_features, 1))
+    return np_elems * _GAM_BYTES_PER_NP, np_elems * _MGCV_BYTES_PER_NP
+
+
+def _runner_total_ram_bytes() -> Optional[float]:
+    """Total physical RAM in bytes from /proc/meminfo, or None when unavailable
+    (e.g. non-Linux dev hosts), in which case the RAM guard is a no-op."""
+    meminfo = _read_meminfo()
+    total_kib = meminfo.get("MemTotal")
+    if total_kib is None:
+        return None
+    return float(total_kib) * 1024.0
+
+
+def _mgcv_arm_fits_in_ram(n_obs: int, n_features: int) -> tuple[bool, str]:
+    """Decide whether running the mgcv CV arm alongside gam at this (n, p) is
+    safe on the current runner. Returns (ok, reason). When total RAM cannot be
+    read the guard defers (``ok=True``) rather than skipping work blindly."""
+    total = _runner_total_ram_bytes()
+    if total is None:
+        return True, "ram-unknown"
+    gam_peak, mgcv_peak = _projected_trial_peak_bytes(n_obs, n_features)
+    combined = gam_peak + mgcv_peak
+    budget = total * _RAM_SAFETY_FRACTION
+    if combined > budget:
+        gib = 1024.0 ** 3
+        return (
+            False,
+            f"projected gam({gam_peak / gib:.1f}GiB)+mgcv({mgcv_peak / gib:.1f}GiB)"
+            f"={combined / gib:.1f}GiB exceeds {_RAM_SAFETY_FRACTION:.0%} of "
+            f"{total / gib:.1f}GiB runner RAM at n={n_obs} p={n_features}",
+        )
+    return True, "ok"
 
 
 def _materialize_scenario(
@@ -391,12 +442,32 @@ def run_trial(sc: FuzzScenario, rust_timeout: int, r_timeout: int) -> FuzzResult
         raise RuntimeError(f"{sc.name}: no folds generated")
     fold = folds[0]
     df = pd.DataFrame(ds["rows"])
+    # The dataset is re-materialized here, so the true (n, p) of *this* fit is
+    # known. The selection-time scenario cost cap is a throughput heuristic, not
+    # a RAM bound, and a scenario's n can differ from what selection observed.
+    # Guard the mgcv CV arm against the actual fit size: gam and mgcv run
+    # back-to-back within the trial while gam's peak RSS is still resident, so an
+    # oversized draw can hold both peaks at once and OOM-kill the whole runner
+    # (gam#820: n=2.4M p=4 → gam 13.7GiB + mgcv 6.7GiB on a 15.6GiB runner). When
+    # the projected combined peak won't fit, skip *only* the mgcv arm and still
+    # record the gam result, rather than letting the runner die.
+    n_obs = len(df)
+    n_features = len(ds["features"])
+    mgcv_ok, mgcv_reason = _mgcv_arm_fits_in_ram(n_obs, n_features)
+
     train_df = df.iloc[fold.train_idx].copy()
     test_df = df.iloc[fold.test_idx].copy()
     train_df, test_df = zscore_train_test(train_df, test_df, ds["features"])
 
     rust_out = run_gamfit(sc, train_df, test_df, ds, rust_timeout)
-    mgcv_out = run_mgcv(sc, ds, fold, r_timeout)
+    if mgcv_ok:
+        mgcv_out = run_mgcv(sc, ds, fold, r_timeout)
+    else:
+        print(
+            f"  [ram-skip] {sc.name}: skipping mgcv CV arm — {mgcv_reason}",
+            flush=True,
+        )
+        mgcv_out = {"skipped": True, "skip_reason": mgcv_reason}
     result = FuzzResult(scenario=asdict(sc), rust=rust_out, mgcv=mgcv_out)
     result.compute_gap()
     return result
@@ -537,13 +608,21 @@ def compute_ci_gates(
             "offenders": nan_offenders,
         })
 
-    min_required = max(1, int(math.ceil(MIN_VALID_TRIAL_FRACTION * requested_trials)))
+    # Trials whose mgcv CV arm was deliberately skipped to keep the runner
+    # within RAM (gam#820) have no mgcv metric, so they carry no `primary_gap`
+    # and would otherwise drag down `valid_count`. They are a harness resource
+    # decision, not a gam failure or a missing comparison we could have run, so
+    # exclude them from the coverage denominator — exactly like cost-cap skips.
+    ram_skipped_count = sum(1 for r in results if r.mgcv.get("skipped"))
+    comparable_trials = max(0, requested_trials - ram_skipped_count)
+    min_required = max(1, int(math.ceil(MIN_VALID_TRIAL_FRACTION * comparable_trials)))
     if valid_count < min_required:
         gate_failures.append({
             "gate": "coverage",
             "message": (
-                f"only {valid_count}/{requested_trials} trial(s) produced a valid comparison "
-                f"(skipped above cost cap: {skipped_count}); minimum required: {min_required}"
+                f"only {valid_count}/{comparable_trials} comparable trial(s) produced a valid "
+                f"comparison (skipped above cost cap: {skipped_count}; ram-skipped mgcv arm: "
+                f"{ram_skipped_count}); minimum required: {min_required}"
             ),
             "offenders": [],
         })
@@ -583,6 +662,7 @@ def compute_ci_gates(
         "valid_count": valid_count,
         "requested_trials": requested_trials,
         "skipped_count": skipped_count,
+        "ram_skipped_count": ram_skipped_count,
         "min_required": min_required,
     }
 

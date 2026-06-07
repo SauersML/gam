@@ -235,5 +235,66 @@ class FuzzCiGateTests(unittest.TestCase):
         self.assertIn("baseline_regression", _gate_names(gates))
 
 
+def _ram_skipped_trial(*, rust_metric: float | None = 0.80, seed: int = 0) -> Any:
+    """A trial whose gam arm ran but whose mgcv CV arm was RAM-skipped."""
+    scenario = {
+        "seed": seed,
+        "family": "gaussian",
+        "model_type": "gam",
+        "basis_type": "ps",
+        "n_obs": 2_399_999,
+        "n_smooths": 1,
+        "knots": 8,
+    }
+    fr = _FUZZ.FuzzResult(
+        scenario=scenario,
+        rust={"r2": rust_metric},
+        mgcv={"skipped": True, "skip_reason": "projected peak exceeds runner RAM"},
+    )
+    fr.compute_gap()
+    return fr
+
+
+class FuzzRamGuardTests(unittest.TestCase):
+    """gam#820: the fuzzer must not pick an (n, p) that OOM-kills the runner when
+    gam and mgcv hold their peaks at once."""
+
+    def test_oversized_np_skips_mgcv_arm_on_constrained_runner(self) -> None:
+        # The OOM draw (n=2.4M, p=4) on a 15.6 GiB runner must be rejected.
+        with patch.object(
+            _FUZZ, "_read_meminfo", return_value={"MemTotal": 16_367_000}
+        ):
+            ok, reason = _FUZZ._mgcv_arm_fits_in_ram(2_399_999, 4)
+        self.assertFalse(ok)
+        self.assertIn("exceeds", reason)
+
+    def test_small_fit_runs_both_arms(self) -> None:
+        with patch.object(
+            _FUZZ, "_read_meminfo", return_value={"MemTotal": 16_367_000}
+        ):
+            ok, reason = _FUZZ._mgcv_arm_fits_in_ram(150, 5)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok")
+
+    def test_guard_defers_when_ram_unknown(self) -> None:
+        # Non-Linux dev hosts have no /proc/meminfo: never skip blindly.
+        with patch.object(_FUZZ, "_read_meminfo", return_value={}):
+            ok, reason = _FUZZ._mgcv_arm_fits_in_ram(2_399_999, 4)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ram-unknown")
+
+    def test_ram_skipped_trials_excluded_from_coverage_denominator(self) -> None:
+        # 80 fully-comparable trials + 20 RAM-skipped (gam ran, mgcv skipped).
+        # The coverage gate must measure 80/80, not 80/100, so it passes.
+        results = [
+            _trial(rust_metric=0.80, mgcv_metric=0.80, seed=i) for i in range(80)
+        ]
+        results += [_ram_skipped_trial(seed=1000 + i) for i in range(20)]
+        gates = _FUZZ.compute_ci_gates(results, requested_trials=100)
+        self.assertEqual(gates["ram_skipped_count"], 20)
+        self.assertNotIn("coverage", _gate_names(gates))
+        self.assertFalse(gates["failed"])
+
+
 if __name__ == "__main__":
     unittest.main()
