@@ -2194,6 +2194,7 @@ pub use sphere_spectral::{
     pseudo_s2_truncated_coefficients, sobolev_s2_truncated_coefficients,
     sphere_truncated_spectral_eval,
 };
+pub(crate) use sphere_spectral::sphere_truncated_spectral_derivative_eval;
 
 /// Intrinsic S² (sphere) smooth configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21815,50 +21816,6 @@ fn wahba_sphere_kernel_derivative_dcos_kind(
             sphere_truncated_spectral_derivative_eval(cos_gamma, &coeffs)
         }
     }
-}
-
-/// `d/d(cos γ) Σ_ℓ c_ℓ P_ℓ(cos γ)` for a truncated Legendre-coefficient array,
-/// the exact derivative of [`sphere_truncated_spectral_eval`]. Uses
-/// `(1 − x²) P_ℓ'(x) = ℓ (P_{ℓ−1}(x) − x P_ℓ(x))`, with the analytic pole
-/// limits `P_ℓ'(±1) = ±(±1)^ℓ · ℓ(ℓ+1)/2` near `|x| = 1`.
-#[inline]
-fn sphere_truncated_spectral_derivative_eval(cos_gamma: f64, coeffs: &[f64]) -> f64 {
-    const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
-    let x = cos_gamma.clamp(-1.0, 1.0);
-    let lmax = coeffs.len().saturating_sub(1);
-    if lmax == 0 {
-        return 0.0;
-    }
-    if x.abs() > 1.0 - POLE_LIMIT_THRESHOLD {
-        let pole_neg = x.is_sign_negative();
-        let mut acc = 0.0_f64;
-        for ell in 1..=lmax {
-            let lf = ell as f64;
-            let sign = if pole_neg && ell % 2 == 0 { -1.0 } else { 1.0 };
-            let p_prime = 0.5 * lf * (lf + 1.0) * sign;
-            acc += coeffs[ell] * p_prime;
-        }
-        return acc;
-    }
-    let one_minus_x2 = (1.0 - x * x).max(f64::EPSILON);
-    // P_0 = 1, P_1 = x; advance P_ℓ while computing P_ℓ' from P_{ℓ-1}, P_ℓ.
-    let mut p_prev = 1.0_f64; // P_{ℓ-1}
-    let mut p_curr = x; // P_ℓ (ℓ starts at 1)
-    let mut acc = 0.0_f64;
-    let mut ell = 1usize;
-    loop {
-        let lf = ell as f64;
-        let p_prime = lf * (p_prev - x * p_curr) / one_minus_x2;
-        acc += coeffs[ell] * p_prime;
-        if ell >= lmax {
-            break;
-        }
-        let p_next = ((2.0 * lf + 1.0) * x * p_curr - lf * p_prev) / (lf + 1.0);
-        p_prev = p_curr;
-        p_curr = p_next;
-        ell += 1;
-    }
-    acc
 }
 
 /// Raw (pre-identifiability) Wahba sphere DESIGN jet `∂Φ_raw/∂(lat, lon)`.
