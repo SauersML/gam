@@ -3487,10 +3487,34 @@ fn survival_rigid_pilot_eta(
 /// scope of `survival_pilot_irls_row_metric_at_eta` (see its long block);
 /// the chain factor `dη₁/dq = c(g)` is absorbed into a per-row scaling of
 /// the location anchor before the solve.
+/// Decomposed one-step IRLS pilot output. `eta1` is the per-row observed
+/// index used by the cross-block W metric (unchanged from the legacy
+/// scalar return). The remaining fields carry the *operating-point* row
+/// primary-state increments — the time-exit + marginal location step
+/// `q_delta` (the part shared by q0/q1) and the logslope step `g_delta`,
+/// split by block — so a caller can rebuild the survival 4×4 row Hessian
+/// at the operating point instead of the β=0 pilot. The shared global
+/// `step_scale ∈ (0, 1]` is the uniform trust-region damping applied to the
+/// β step (the minimum per-row ratio that keeps |Δη₁| ≤ step_cap), so the
+/// reconstructed primary state stays linear in the (damped) β across all
+/// four channels rather than per-row clamped only along η₁.
+struct SurvivalNonrigidPilot {
+    eta1: Array1<f64>,
+    /// Time-exit block coefficients (first `p_time` columns of the
+    /// location anchor), already scaled by `step_scale`.
+    beta_time: Array1<f64>,
+    /// Marginal block coefficients (remaining location-anchor columns),
+    /// already scaled by `step_scale`.
+    beta_marginal: Array1<f64>,
+    /// Logslope block coefficients, already scaled by `step_scale`.
+    beta_logslope: Array1<f64>,
+}
+
 fn survival_nonrigid_pilot_eta(
     n: usize,
     location_anchor_design: &DesignMatrix,
     logslope_design: &DesignMatrix,
+    p_time_exit: usize,
     z_primary: &Array1<f64>,
     offset_exit: &Array1<f64>,
     marginal_offset: &Array1<f64>,
@@ -3499,7 +3523,7 @@ fn survival_nonrigid_pilot_eta(
     sample_weights: &Array1<f64>,
     event: &Array1<f64>,
     probit_scale: f64,
-) -> Result<Array1<f64>, String> {
+) -> Result<SurvivalNonrigidPilot, String> {
     if location_anchor_design.nrows() != n
         || logslope_design.nrows() != n
         || z_primary.len() != n
@@ -3529,16 +3553,27 @@ fn survival_nonrigid_pilot_eta(
     let p_loc = loc_dense.ncols();
     let p_g = g_dense.ncols();
     let p_joint = p_loc + p_g;
-    if p_joint == 0 {
-        return Ok(survival_rigid_pilot_eta(
-            n,
-            z_primary,
-            offset_exit,
-            marginal_offset,
-            logslope_offset,
-            baseline_slope,
-            probit_scale,
+    if p_loc < p_time_exit {
+        return Err(format!(
+            "survival_nonrigid_pilot_eta: location anchor width {p_loc} < time-exit width {p_time_exit}"
         ));
+    }
+    let p_marg = p_loc - p_time_exit;
+    if p_joint == 0 {
+        return Ok(SurvivalNonrigidPilot {
+            eta1: survival_rigid_pilot_eta(
+                n,
+                z_primary,
+                offset_exit,
+                marginal_offset,
+                logslope_offset,
+                baseline_slope,
+                probit_scale,
+            ),
+            beta_time: Array1::<f64>::zeros(p_time_exit),
+            beta_marginal: Array1::<f64>::zeros(p_marg),
+            beta_logslope: Array1::<f64>::zeros(p_g),
+        });
     }
     // Starting pilot (offset-only). Decompose into q_exit and slope so the
     // chain rule below can attribute the η₁ Newton step back to each piece.
@@ -3671,6 +3706,39 @@ fn survival_nonrigid_pilot_eta(
             step_cap = (4.0_f64).max(4.0 * sd);
         }
     }
+    // Uniform trust-region damping for the *β* step. The legacy η₁ output
+    // clamps each row's |Δη₁| independently, which is fine for a per-row
+    // metric vector but would break the linear q0/q1/qd1/g reconstruction a
+    // row-Hessian rebuild needs (a per-row clamp on η₁ does not correspond
+    // to a single β). Instead derive one global scale `s ∈ (0, 1]` = the
+    // smallest per-row ratio that keeps the *linearised* |s·Δη₁_row| within
+    // step_cap, where Δη₁_row is the first-order row step
+    // `dη₁/dq · q_delta + dη₁/dg · g_delta`. The same `s` damps the returned
+    // β so the operating-point primary state is `state₀ + s·(design·β)` in
+    // every channel. (`eta1` below still uses the per-row clamp to preserve
+    // the exact legacy W-metric behaviour.)
+    let mut step_scale: f64 = 1.0;
+    for i in 0..n {
+        let g_i = slope[i];
+        let z_i = z_primary[i];
+        let h_fd: f64 = 1.0e-7;
+        let chain_q = (rigid_observed_eta(q_exit[i] + h_fd, g_i, z_i, probit_scale)
+            - rigid_observed_eta(q_exit[i] - h_fd, g_i, z_i, probit_scale))
+            / (2.0 * h_fd);
+        let chain_g = (rigid_observed_eta(q_exit[i], g_i + h_fd, z_i, probit_scale)
+            - rigid_observed_eta(q_exit[i], g_i - h_fd, z_i, probit_scale))
+            / (2.0 * h_fd);
+        let lin_delta_eta1 = chain_q * q_delta[i] + chain_g * g_delta[i];
+        if lin_delta_eta1.is_finite() && lin_delta_eta1.abs() > step_cap && lin_delta_eta1 != 0.0 {
+            let ratio = step_cap / lin_delta_eta1.abs();
+            if ratio.is_finite() && ratio < step_scale {
+                step_scale = ratio;
+            }
+        }
+    }
+    if !(step_scale.is_finite() && step_scale > 0.0) {
+        step_scale = 0.0;
+    }
     let mut pilot_eta = Array1::<f64>::zeros(n);
     for i in 0..n {
         let q_new = q_exit[i] + q_delta[i];
@@ -3684,7 +3752,24 @@ fn survival_nonrigid_pilot_eta(
         };
         pilot_eta[i] = if capped.is_finite() { capped } else { eta1[i] };
     }
-    Ok(pilot_eta)
+    let mut beta_time = Array1::<f64>::zeros(p_time_exit);
+    for j in 0..p_time_exit {
+        beta_time[j] = beta_loc[j] * step_scale;
+    }
+    let mut beta_marginal = Array1::<f64>::zeros(p_marg);
+    for j in 0..p_marg {
+        beta_marginal[j] = beta_loc[p_time_exit + j] * step_scale;
+    }
+    let mut beta_logslope = Array1::<f64>::zeros(p_g);
+    for j in 0..p_g {
+        beta_logslope[j] = beta_g[j] * step_scale;
+    }
+    Ok(SurvivalNonrigidPilot {
+        eta1: pilot_eta,
+        beta_time,
+        beta_marginal,
+        beta_logslope,
+    })
 }
 
 pub fn survival_marginal_slope_vector_scale(
@@ -20618,10 +20703,11 @@ pub fn fit_survival_marginal_slope_terms(
     // Newton step is sufficient for the cross-block residualisation: we
     // need a per-row-varying η₁ that respects event/weight structure, not
     // a converged β.
-    let cross_block_pilot_eta = survival_nonrigid_pilot_eta(
+    let cross_block_pilot = survival_nonrigid_pilot_eta(
         n,
         &location_anchor_design,
         &logslope_design.design,
+        spec.time_block.design_exit.ncols(),
         &z_primary,
         &spec.time_block.offset_exit,
         &spec.marginal_offset,
@@ -20631,6 +20717,7 @@ pub fn fit_survival_marginal_slope_terms(
         &spec.event_target,
         probit_scale,
     )?;
+    let cross_block_pilot_eta = cross_block_pilot.eta1.clone();
     let cross_block_pilot_w = survival_pilot_irls_row_metric_at_eta(
         &cross_block_pilot_eta,
         &spec.weights,
@@ -21137,8 +21224,8 @@ pub fn fit_survival_marginal_slope_terms(
         recompile_after_accept,
     ): SmgsCutoverTuple = {
         use crate::families::survival_marginal_slope_identifiability::{
-            CompiledSurvivalDesignsVMExact, SmgsLiftViaT, SurvivalRowHessian,
-            apply_compiled_map_to_designs, extract_term_partition_from_penalty_ranges,
+            CompiledSurvivalDesignsVMExact, SmgsLiftViaT, apply_compiled_map_to_designs,
+            extract_term_partition_from_penalty_ranges,
         };
         // Recompile context, populated when the closed-form compile
         // succeeds. The post-solve recompile-after-accept hook consumes
@@ -21195,33 +21282,71 @@ pub fn fit_survival_marginal_slope_terms(
                 let g_dg = logslope_design
                     .design
                     .try_to_dense_by_chunks("smgs phase-4b active: logslope")?;
-                // Channel-aware per-subject Fisher Gram (T8). Build the
-                // pilot primary state at β=0: q0 = offset_entry +
-                // marginal_offset, q1 = offset_exit + marginal_offset,
-                // qd1 = derivative_offset_exit, g = logslope_offset. The
-                // marginal predictor enters BOTH entry and exit channels
-                // (see `row_dynamic_q_values`); at β=0 it is `marginal_offset`.
-                // The resulting 4×4 per-row H couples the logslope g channel
-                // to the q0/q1 channels through the off-diagonal Fisher
-                // entries (∂²(−ℓ)/∂q1∂g ≠ 0), which prevents the
-                // logslope block from appearing fully aliased by the
-                // time+marginal anchor in the structural-residual Gram.
-                // Under the identity H those cross-channel couplings were
-                // zero, causing false "fully aliased" reports for the
-                // logslope block on biobank designs where g_dg and dq1
-                // share column span in raw design space.
+                // Channel-aware per-subject Fisher Gram (T8) at the
+                // OPERATING-POINT primary state (#808).
+                //
+                // The β=0 pilot state (q0 = offset_entry + marginal_offset,
+                // q1 = offset_exit + marginal_offset, qd1 =
+                // derivative_offset_exit, g = logslope_offset) makes the 4×4
+                // row Hessian's cross-channel couplings W[·,3] (which scale as
+                // `q·c1(g) + s_f·z` along the g channel; see
+                // `row_primary_closed_form`) degenerate: with g ≈ 0 the slope
+                // curvature factor c1(g) ≈ 0 and the q-magnitudes are pure
+                // offsets, so the time↔logslope and marginal↔logslope aliases
+                // that the inner joint-Newton actually sees at the fitted slope
+                // surface are INVISIBLE to `compile_from_raw_grams`. That is
+                // the #808 root cause: the structural compile declares the
+                // joint design rank-clean at β=0, the time-channel phantom
+                // multiplier survives into the inner solve, the inner residual
+                // freezes (block_grad_inf dominated by the TIME block), and the
+                // outer REML/ARC stalls on the stale envelope gradient.
+                //
+                // Rebuild the row Hessian at the operating point instead, using
+                // the one-step non-rigid pilot β decomposed by block
+                // (`cross_block_pilot.beta_{time,marginal,logslope}`, already
+                // trust-region damped). This is the same η₁ pilot the flex
+                // blocks residualise against (`cross_block_pilot_w`), so the
+                // metric is consistent across the whole construction. The
+                // marginal predictor enters BOTH entry and exit channels (see
+                // `row_dynamic_q_values`), the time β rides entry/exit/deriv,
+                // and the logslope value carries the pooled baseline so c(g) /
+                // c1(g) are evaluated where the likelihood actually lives.
+                let marginal_step = fast_av(&m_dq, &cross_block_pilot.beta_marginal);
+                let time_q0_step = fast_av(&dq0, &cross_block_pilot.beta_time);
+                let time_q1_step = fast_av(&dq1, &cross_block_pilot.beta_time);
+                let time_qd1_step = fast_av(&dqd1, &cross_block_pilot.beta_time);
+                let logslope_step = fast_av(&g_dg, &cross_block_pilot.beta_logslope);
                 let mut q0_pilot = spec.time_block.offset_entry.clone();
                 let mut q1_pilot = spec.time_block.offset_exit.clone();
+                let mut qd1_pilot = spec.time_block.derivative_offset_exit.clone();
+                let mut g_pilot = spec.logslope_offset.clone();
                 for i in 0..n_rows {
-                    q0_pilot[i] += spec.marginal_offset[i];
-                    q1_pilot[i] += spec.marginal_offset[i];
+                    let marginal_eta = spec.marginal_offset[i] + marginal_step[i];
+                    q0_pilot[i] += marginal_eta + time_q0_step[i];
+                    q1_pilot[i] += marginal_eta + time_q1_step[i];
+                    // Floor the operating-point derivative strictly above the
+                    // monotonicity guard. `row_primary_for_compiler` rejects any
+                    // `qd1` below the guard with a MonotonicityViolation Err,
+                    // which would abort the whole compile attempt and silently
+                    // skip the reduction (regressing to the #808 stall). The row
+                    // Hessian only needs a *representative* feasible operating
+                    // point, so a one-sided floor at guard·(1+1e-6) is sound:
+                    // it cannot under-estimate the curvature that exposes the
+                    // alias, and the step is only ever clipped on rows the one-
+                    // step pilot drove (transiently) non-monotone.
+                    let qd1_stepped = qd1_pilot[i] + time_qd1_step[i];
+                    let qd1_floor = derivative_guard * (1.0 + 1.0e-6);
+                    qd1_pilot[i] = if qd1_stepped.is_finite() && qd1_stepped > qd1_floor {
+                        qd1_stepped
+                    } else {
+                        qd1_floor.max(qd1_pilot[i])
+                    };
+                    g_pilot[i] += baseline_slope + logslope_step[i];
                 }
-                let qd1_pilot = spec.time_block.derivative_offset_exit.clone();
-                let g_pilot = spec.logslope_offset.clone();
                 // Replace the zero placeholder timewiggle tail columns with the
-                // analytic basis-derived time Jacobian at the β=0 pilot state.
-                // Without this, the time-channel slots are structurally zero
-                // when `timewiggle(...)` disables the base time basis, and
+                // analytic basis-derived time Jacobian at the operating-point
+                // state. Without this, the time-channel slots are structurally
+                // zero when `timewiggle(...)` disables the base time basis, and
                 // `compile_from_raw_grams` falsely reports "block 0 fully
                 // aliased" — dropping into the dense O(n·K·p) fallback.
                 if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
@@ -21229,31 +21354,39 @@ pub fn fit_survival_marginal_slope_terms(
                         &mut dq0, &mut dq1, &mut dqd1, timewiggle, &q0_pilot, &q1_pilot, &qd1_pilot,
                     )?;
                 }
-                let row_hess = SurvivalRowHessian::from_pilot_primary_state(
-                    &q0_pilot,
-                    &q1_pilot,
-                    &qd1_pilot,
-                    &g_pilot,
-                    &z_primary,
-                    &spec.weights,
-                    &spec.event_target,
-                    derivative_guard,
-                    probit_scale,
-                )?;
 
-                // Closed-form Gram path: assemble the SMGS K=4 channel-block
-                // view (time → q0/q1/qd1; marginal → q0/q1; logslope → g),
-                // build (K^H, K^S) via the GPU-or-CPU dispatcher, run
-                // `compile_from_raw_grams`, and — when the build succeeds —
-                // route the resulting `CompiledMap` T through
-                // `apply_compiled_map_to_designs` so the compiled designs +
-                // pulled-back penalties + result-time lift come from the
-                // closed-form path. On any failure propagate Err to skip
-                // phase-4b entirely.
+                // Closed-form Gram path on the OBSERVED-INDEX (η₁) channel (#808).
+                //
+                // The 4-channel `build_primary_grams_gpu_or_cpu` view assigns
+                // marginal to the location channels (q0/q1) and logslope to the
+                // slope channel (g). Its STRUCTURAL Gram K^S = Σ_c Xᵀ X is
+                // block-diagonal *by channel*, so marginal (c∈{0,1}) and
+                // logslope (c=3) are structurally orthogonal and the structural
+                // step never sees their overlap — even though the two blocks
+                // SHARE the same matern PC basis and collapse onto the single
+                // observed index η₁ = q1·c(g) + s_f·z in the realised metric
+                // (the #808 alias: preflight reports W-metric rank 19/26, the 7
+                // redundant directions all in marginal/logslope). The curvature
+                // step alone could not drive those eigenvalues below tol either.
+                //
+                // Build the Gram on the η₁ row-Jacobian instead, where marginal
+                // and logslope land in the SAME channel and the overlap is a
+                // genuine column collinearity the structural step resolves with
+                // cross-block carry (R terms — keep the high-priority block,
+                // reparameterise the low-priority block as its W-orthogonal
+                // complement; NOT a whole-block deletion). The Jacobian columns
+                // at the operating point (from `row_primary_closed_form`):
+                //   ∂η₁/∂β_time     = c(g) · X_time_exit
+                //   ∂η₁/∂β_marginal = c(g) · X_marginal       (marginal ⊂ q1)
+                //   ∂η₁/∂β_logslope = (q1·c1(g) + s_f·z) · X_logslope
+                // weighted by the η₁ row curvature `cross_block_pilot_w` (the
+                // same metric the preflight + flex blocks use). Single-channel,
+                // so K^S = JᵀJ and K^H = Jᵀ diag(w) J. η₀/qd1 are carried by
+                // the high-priority time anchor; marginal's η₀ Jacobian is the
+                // same c(g)·X_marginal so the η₁ reduction is η₀-consistent.
                 {
                     use crate::families::identifiability_compiler::{
-                        BlockOrder as IdBlockOrder, PrimaryChannelBlocks,
-                        build_primary_grams_gpu_or_cpu, compile_from_raw_grams,
+                        BlockOrder as IdBlockOrder, compile_from_raw_grams,
                     };
                     let closed_form = (|| -> Result<
                     Option<(
@@ -21262,39 +21395,85 @@ pub fn fit_survival_marginal_slope_terms(
                     )>,
                     String,
                 > {
-                    let time_slots: Vec<Option<ndarray::Array2<f64>>> = vec![
-                        Some(dq0.clone()),
-                        Some(dq1.clone()),
-                        Some(dqd1.clone()),
-                        None,
-                    ];
-                    let marg_slots: Vec<Option<ndarray::Array2<f64>>> = vec![
-                        Some(m_dq.clone()),
-                        Some(m_dq.clone()),
-                        Some(m_dqd1.clone()),
-                        None,
-                    ];
-                    let log_slots: Vec<Option<ndarray::Array2<f64>>> = vec![
-                        None,
-                        None,
-                        None,
-                        Some(g_dg.clone()),
-                    ];
-                    let channel_blocks = PrimaryChannelBlocks {
-                        blocks: vec![time_slots, marg_slots, log_slots],
-                    };
                     let p_total_raw = p_time + p_marg + p_log;
                     let raw_ranges = vec![
                         0..p_time,
                         p_time..(p_time + p_marg),
                         (p_time + p_marg)..p_total_raw,
                     ];
-                    let (gram_h, gram_struct) = build_primary_grams_gpu_or_cpu(
-                        &channel_blocks,
-                        &row_hess,
-                        &raw_ranges,
-                    )
-                    .map_err(|e| format!("gram build: {e}"))?;
+                    // η₁ row-Jacobian chain factors at the operating-point
+                    // primary state. `c`/`c1` from `c_derivatives` (scalar-z
+                    // metric: covariance_ones≈1 so effective_scale=probit_scale,
+                    // matching the rigid-pilot chain used to build q1_pilot/
+                    // g_pilot); `linear_dg = s_f·z` is the z-coupling slope of
+                    // η₁ wrt g. This is an identifiability-reduction metric, so
+                    // the scalar-z approximation (alias lives in the PC surface,
+                    // not the z-coupling) is faithful.
+                    let mut j_eta1 = ndarray::Array2::<f64>::zeros((n_rows, p_total_raw));
+                    for i in 0..n_rows {
+                        let (c, c1, ..) = c_derivatives(g_pilot[i], probit_scale);
+                        let linear_dg = probit_scale * z_primary[i];
+                        let log_chain = q1_pilot[i] * c1 + linear_dg;
+                        for j in 0..p_time {
+                            j_eta1[[i, j]] = c * dq1[[i, j]];
+                        }
+                        for j in 0..p_marg {
+                            j_eta1[[i, p_time + j]] = c * m_dq[[i, j]];
+                        }
+                        for j in 0..p_log {
+                            j_eta1[[i, p_time + p_marg + j]] = log_chain * g_dg[[i, j]];
+                        }
+                    }
+                    if cross_block_pilot_w.len() != n_rows {
+                        return Err(format!(
+                            "eta1 Gram: cross_block_pilot_w len {} != n_rows {}",
+                            cross_block_pilot_w.len(),
+                            n_rows
+                        ));
+                    }
+                    // K^S = Jᵀ J (structural), K^H = Jᵀ diag(w) J (curvature in
+                    // the η₁ row metric the inner Newton actually sees).
+                    let gram_struct = crate::faer_ndarray::fast_ata(&j_eta1);
+                    let gram_h = fast_xt_diag_x(&j_eta1, &cross_block_pilot_w);
+                    // #808 diagnostic: W-metric thin-SVD of the η₁ row-Jacobian
+                    // so we can see directly whether the reduction metric is
+                    // rank-deficient (and by how much) before compile runs.
+                    if log::log_enabled!(log::Level::Info) {
+                        use crate::faer_ndarray::FaerSvd;
+                        let mut jw = j_eta1.clone();
+                        for i in 0..n_rows {
+                            let s = cross_block_pilot_w[i].max(0.0).sqrt();
+                            for j in 0..p_total_raw {
+                                jw[[i, j]] *= s;
+                            }
+                        }
+                        if let Ok((_u, sigma, _vt)) = jw.svd(false, false) {
+                            let smax = sigma.iter().copied().fold(0.0_f64, f64::max);
+                            let tol_dbg = smax
+                                * (n_rows.max(p_total_raw) as f64)
+                                * 16.0
+                                * f64::EPSILON;
+                            let n_alias = sigma.iter().filter(|&&s| s <= tol_dbg).count();
+                            let smin = sigma.iter().copied().fold(f64::INFINITY, f64::min);
+                            let g_range = {
+                                let mut lo = f64::INFINITY;
+                                let mut hi = f64::NEG_INFINITY;
+                                for &g in g_pilot.iter() {
+                                    lo = lo.min(g);
+                                    hi = hi.max(g);
+                                }
+                                (lo, hi)
+                            };
+                            log::info!(
+                                "[smgs phase-4b eta1-gram DIAG] sigma_max={smax:.4e} sigma_min={smin:.4e} \
+                                 tol={tol_dbg:.4e} W-rank={}/{} alias_dirs={n_alias} g_pilot=[{:.3e},{:.3e}]",
+                                p_total_raw - n_alias,
+                                p_total_raw,
+                                g_range.0,
+                                g_range.1,
+                            );
+                        }
+                    }
                     let map = compile_from_raw_grams(
                         &gram_h,
                         &gram_struct,
