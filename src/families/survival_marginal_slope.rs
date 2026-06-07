@@ -19589,6 +19589,16 @@ fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
         }
         .into());
     }
+    // Fast-fail on a degenerate all-censored design: the marginal-slope partial
+    // likelihood has no events to anchor the hazard scale, so the outer/inner
+    // solve cannot make progress and otherwise spins without termination (#789B).
+    if !spec.event_target.is_empty() && spec.event_target.iter().all(|&d| d == 0.0) {
+        return Err(SurvivalMarginalSlopeError::InvalidInput {
+            reason: "survival-marginal-slope requires at least one event (event==1); the supplied design is entirely censored (all event==0), which has no finite marginal-slope fit"
+                .to_string(),
+        }
+        .into());
+    }
     if !spec.derivative_guard.is_finite() || spec.derivative_guard <= 0.0 {
         return Err(SurvivalMarginalSlopeError::InvalidInput {
             reason: format!(
