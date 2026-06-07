@@ -29,9 +29,8 @@ The family is inferred from the response. When `link(type=log)` is set,
 Poisson vs Gamma is chosen by whether `y` is integer-valued — `family=`
 is optional in that case. `family=` accepts `gaussian`, `binomial`
 (aliases `binomial-logit`, `binomial-probit`, `binomial-cloglog`),
-`latent-cloglog-binomial`, `poisson`, `negative-binomial` (aliases
-`nb`, `negbin`, `negative_binomial`), `gamma`, and `beta` /
-`beta-regression`. Survival, transformation-normal, and Bernoulli
+`latent-cloglog-binomial`, `poisson`, `negative-binomial`, `gamma`,
+and `beta`. Survival, transformation-normal, and Bernoulli
 marginal-slope families are selected through `Surv(...)` or dedicated
 fit options rather than `family=`.
 

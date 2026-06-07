@@ -697,12 +697,9 @@ enum FamilyArg {
     BinomialCloglog,
     LatentCloglogBinomial,
     PoissonLog,
-    #[value(alias = "nb", alias = "negbin", alias = "negative_binomial")]
     NegativeBinomial,
     GammaLog,
-    #[value(alias = "tw")]
     Tweedie,
-    #[value(alias = "beta-regression")]
     Beta,
     RoystonParmar,
     TransformationNormal,
