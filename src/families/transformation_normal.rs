@@ -155,6 +155,14 @@ pub struct TransformationNormalConfig {
     pub response_extra_penalty_orders: Vec<usize>,
     /// Whether to add a global identity (ridge) penalty (default true).
     pub double_penalty: bool,
+    /// When true, `response_num_internal_knots` is treated as an already-resolved
+    /// effective value: `fit_transformation_normal` uses it verbatim instead of
+    /// re-running `effective_response_num_internal_knots`. This is required by the
+    /// cross-fit Stage-1 calibration, which pins the knot count once at the
+    /// smallest fold complement so `p_resp` (and hence `p₁ = p_resp · p_cov`)
+    /// is fold-invariant; the data-driven complexity cap would otherwise round
+    /// to different counts on each fold's response subsample (workflow.rs §3).
+    pub response_num_internal_knots_pinned: bool,
 }
 
 impl Default for TransformationNormalConfig {
@@ -165,6 +173,7 @@ impl Default for TransformationNormalConfig {
             response_penalty_order: 2,
             response_extra_penalty_orders: vec![1],
             double_penalty: true,
+            response_num_internal_knots_pinned: false,
         }
     }
 }
@@ -15093,12 +15102,19 @@ pub fn fit_transformation_normal(
     let boot_spec = freeze_term_collection_from_design(&covariate_spec, &boot_design)
         .map_err(|e| format!("failed to freeze bootstrap covariate spatial basis centers: {e}"))?;
     let mut effective_config = config.clone();
-    effective_config.response_num_internal_knots = effective_response_num_internal_knots(
-        config,
-        response.len(),
-        boot_design.design.ncols(),
-        response.view(),
-    );
+    // When the caller has already resolved the knot count (cross-fit pins it
+    // once at the smallest fold complement so every fold shares one p_resp),
+    // use it verbatim — re-applying the data-driven complexity cap on this
+    // fold's response subsample would round to a different count and break the
+    // fold-invariant `p₁` the cross-fit OOF assembly requires.
+    if !config.response_num_internal_knots_pinned {
+        effective_config.response_num_internal_knots = effective_response_num_internal_knots(
+            config,
+            response.len(),
+            boot_design.design.ncols(),
+            response.view(),
+        );
+    }
 
     // 2. Build response basis ONCE — it is independent of κ once the effective
     // response complexity has been chosen.
