@@ -45,7 +45,10 @@ fn make_panel(
     let true_effect: Vec<f64> = (0..n_groups).map(|_| between.sample(&mut rng)).collect();
     let true_group_mean: Vec<f64> = true_effect.iter().map(|b| intercept + b).collect();
 
-    let headers = ["site", "y"].into_iter().map(String::from).collect::<Vec<_>>();
+    let headers = ["site", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
     let mut rows: Vec<StringRecord> = Vec::with_capacity(n_groups * per_group);
     for (g, b) in true_effect.iter().enumerate() {
         for _ in 0..per_group {
@@ -137,7 +140,9 @@ fn group_random_intercept_fits_above_sparse_exact_threshold() {
         "expected intercept + one coefficient per group, got p={p}"
     );
     let intercept = fit.fit.beta[0];
-    let blup_means: Vec<f64> = (0..n_groups).map(|g| intercept + fit.fit.beta[g + 1]).collect();
+    let blup_means: Vec<f64> = (0..n_groups)
+        .map(|g| intercept + fit.fit.beta[g + 1])
+        .collect();
     let corr = pearson(&blup_means, &true_group_mean);
     assert!(
         corr > 0.9,
@@ -173,6 +178,8 @@ fn group_random_intercept_just_below_threshold_still_fits() {
         "control fit must also materialize Vp"
     );
     let intercept = fit.fit.beta[0];
-    let blup_means: Vec<f64> = (0..n_groups).map(|g| intercept + fit.fit.beta[g + 1]).collect();
+    let blup_means: Vec<f64> = (0..n_groups)
+        .map(|g| intercept + fit.fit.beta[g + 1])
+        .collect();
     assert!(pearson(&blup_means, &true_group_mean) > 0.9);
 }
