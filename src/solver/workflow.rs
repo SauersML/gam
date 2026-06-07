@@ -3532,6 +3532,12 @@ fn crossfit_score_calibration(
             p_cov,
             response_full.view(),
         );
+    // Pin the resolved knot count: each fold's CTN refit must use exactly this
+    // value, not re-derive it from its own response subsample. Without this the
+    // data-driven complexity cap rounds to different counts per fold, so p_resp
+    // (and p₁ = p_resp · p_cov) drifts across folds and the OOF Jacobian
+    // assembly fails the fold-alignment check below ("cross-fit fold p₁ mismatch").
+    fold_config.response_num_internal_knots_pinned = true;
 
     let mut z_oof = Array1::<f64>::zeros(n);
     let mut jac_oof: Option<Array2<f64>> = None;
