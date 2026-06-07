@@ -1420,6 +1420,27 @@ fn compute_smoothing_correction(
         .objective_innerhessian(final_rho)
         .unwrap_or_else(|_| final_fit.stabilizedhessian_transformed.to_dense());
 
+    // The IFT solve below feeds length-`n_coeffs_trans` right-hand sides into
+    // the Cholesky factor of `h_trans`, and faer asserts `rhs.len() == factor.n()`.
+    // A Hessian that does not match the coefficient dimension (e.g. a degenerate
+    // 0×0 placeholder from a geometry backend that failed to materialize a real
+    // dense inner Hessian) would otherwise abort the whole fit inside the solve.
+    // Bail to the no-correction branch exactly like the Cholesky-`Err` guard
+    // below, so the post-fit smoothing correction is simply skipped.
+    if h_trans.nrows() != n_coeffs_trans || h_trans.ncols() != n_coeffs_trans {
+        log::warn!(
+            "smoothing-correction inner Hessian shape {}x{} does not match coefficient dimension {}; skipping.",
+            h_trans.nrows(),
+            h_trans.ncols(),
+            n_coeffs_trans
+        );
+        return SmoothingCorrectionComputation {
+            correction: None,
+            hessian_rho: None,
+            active_rank: None,
+        };
+    }
+
     // Factor the Hessian for solving
     let h_chol = match h_trans.cholesky(faer::Side::Lower) {
         Ok(c) => c,

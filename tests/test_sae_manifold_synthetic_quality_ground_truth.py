@@ -9,6 +9,8 @@ periodic basis primitive the Rust OOS solver consumes.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pytest
 
@@ -194,4 +196,55 @@ def test_fit_oos_quality_matches_training_on_planted_oracle_distribution() -> No
     assignments = fit.encode(x_test)
 
     assert _r2(x_test, oos) >= 0.90
+
+
+def _planted_circle(
+    n: int = 200, d_ambient: int = 12, noise: float = 0.02, seed: int = 0
+) -> np.ndarray:
+    """A 1-D circle (period 2*pi) linearly embedded in ``d_ambient`` dims.
+
+    Matches the #795 / #681 ``circ`` geometry: ``J^T J = (2*pi)^2`` along the
+    intrinsic coordinate, so a *fixed* identity isometry reference ``G_ref = I``
+    would pull the decoder radius toward ``1/(2*pi)`` and fight reconstruction.
+    """
+    rng = np.random.default_rng(seed)
+    basis = rng.standard_normal((2, d_ambient))
+    basis /= np.linalg.norm(basis, axis=1, keepdims=True)
+    t = rng.uniform(0.0, 2.0 * np.pi, n)
+    clean = np.column_stack([np.cos(t), np.sin(t)]) @ basis
+    return clean + noise * rng.standard_normal((n, d_ambient))
+
+
+def test_isometry_on_circle_recovers_planted_geometry_scale_free_reference() -> None:
+    """#737 item 1: with the isometry penalty ON, the scale-free MeanProfiled
+    reference must recover the planted circle.
+
+    A *fixed* ``G_ref = I`` reference fixes the metric scale; for a period-1
+    circle (``J^T J = (2*pi)^2``) that pulls the radius toward ``1/(2*pi)`` and
+    fought reconstruction, collapsing recovery to R^2 ~= 0.47. The SAE isometry
+    descriptor now wires ``IsometryReference::MeanProfiled`` (commit b27f1982a),
+    which profiles ``G_ref`` as the row-mean pullback metric and so penalizes
+    metric *variation* across tokens rather than absolute scale. Recovery must
+    therefore stay high with ``isometry_weight=0.1`` (the #737 repro value),
+    NOT collapse toward 0.47.
+    """
+    z = _planted_circle(noise=0.02, seed=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        fit = gamfit.sae_manifold_fit(
+            X=z,
+            K=1,
+            d_atom=1,
+            atom_topology="circle",
+            isometry_weight=0.1,
+            n_iter=20,
+            random_state=0,
+        )
+    assert np.all(np.isfinite(fit.fitted)), "isometry-on circle fit is non-finite"
+    r2 = _r2(z, np.asarray(fit.fitted, dtype=float))
+    assert r2 >= 0.90, (
+        "scale-free MeanProfiled isometry reference must recover the planted "
+        f"circle with isometry_weight=0.1 (#737); got R^2={r2:.4f} (the fixed "
+        "identity reference regressed this to ~0.47)"
+    )
     assert _best_binary_assignment_accuracy(assignments, truth_test) >= 0.85
