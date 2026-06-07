@@ -5747,21 +5747,32 @@ impl SaeManifoldTerm {
         // `A = [A_t | A_β]`, so `[[htt,cross],[crossᵀ,hbb]] = μ AᵀA` is PSD *as a
         // whole* and its Schur complement is PSD — but ONLY while all three
         // blocks stay that exact pullback. After assembly the latent blocks pass
-        // through `apply_riemannian_latent_geometry`, which rewrites `htt` with
-        // the (indefinite) Riemannian connection term and column-projects the
-        // `htbeta` cross-block to `T_tM`, while the shared `hbb` is left
-        // untouched. For a non-Euclidean chart that projection breaks the
-        // `μ AᵀA` coherence: the cross-block is then a nonzero coupling NOT paired
-        // with diagonals from the same Jacobian, and the Schur complement
-        // `hbb − Σ crossᵀ htt⁻¹ cross` can go indefinite (the #681 circle/sphere
-        // failure mode flagged in the math review). For a Euclidean chart the
-        // projection is the identity, so the coupled block survives exactly and
-        // we keep the full cross-coupling (faster Newton). For any non-Euclidean
-        // chart we contribute only the PSD `htt` diagonal block and DROP the
+        // through `apply_riemannian_latent_geometry`, which on a *curved* chart
+        // rewrites `htt` with the (indefinite) Riemannian connection term and
+        // column-projects the `htbeta` cross-block to `T_tM`, while the shared
+        // `hbb` is left untouched. That projection breaks the `μ AᵀA` coherence:
+        // the cross-block is then a nonzero coupling NOT paired with diagonals
+        // from the same Jacobian, and the Schur complement
+        // `hbb − Σ crossᵀ htt⁻¹ cross` can go indefinite (the #681 sphere
+        // failure mode flagged in the math review).
+        //
+        // The decision must therefore key on whether the geometry transform is
+        // the IDENTITY for this chart, NOT on `is_euclidean()`. A flat periodic
+        // chart (`Circle`/`Torus`) is non-Euclidean yet transforms as the exact
+        // identity — its tangent projection is the identity, it carries no
+        // connection term, and it adds no normal pinning — so the coupled block
+        // survives exactly and the full cross-coupling must be kept. Keying on
+        // `is_euclidean()` instead wrongly dropped the cross-block for the
+        // single-circle fit, leaving a block-diagonal Hessian that misses the
+        // strong isometry `t`↔`B` coupling; the joint Newton step then never
+        // reaches the KKT stationarity the REML criterion now requires, and the
+        // arrow-Schur proximal ridge saturates at 1e15 (issue #795, a regression
+        // of #681). For a genuinely curved chart (Sphere, an active Interval
+        // boundary) we contribute only the PSD `htt` diagonal block and DROP the
         // cross-block: a block-diagonal `diag(μ A_tᵀA_t, μ A_βᵀA_β)` of two PSD
         // blocks is still PSD, so the Schur stays PSD by construction while the
         // gradient (which alone fixes the stationary point) is unchanged.
-        let couple_cross_block = coord.manifold().is_euclidean();
+        let couple_cross_block = coord.manifold().preserves_isometry_cross_block_coherence();
         let mut metric_coord_jac = Array2::<f64>::zeros((d * d, d));
         let mut metric_beta_jac = Array2::<f64>::zeros((d * d, beta_block));
         let mut wrote_dense_cross = false;

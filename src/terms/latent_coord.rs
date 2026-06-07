@@ -183,6 +183,45 @@ impl LatentManifold {
         matches!(self, Self::Euclidean)
     }
 
+    /// Whether the Euclidean→Riemannian geometry transform applied by
+    /// [`crate::solver::arrow_schur::ArrowSchurSystem::apply_riemannian_latent_geometry`]
+    /// is the **identity** on the per-row gradient, `H_tt`, and `H_tβ` blocks
+    /// for *every* coordinate `t` on this chart.
+    ///
+    /// This is the exact condition under which a coupled Gauss-Newton block
+    /// `μ AᵀA = [[htt, cross],[crossᵀ, hbb]]` assembled from one residual
+    /// Jacobian survives the geometry pass with its PSD coherence intact: if
+    /// the transform leaves `htt` and the `htbeta` cross-block untouched, the
+    /// whole block is still `μ AᵀA` (PSD) and its Schur complement is PSD, so
+    /// the isometry cross-coupling can be kept (faster, exact Newton).
+    ///
+    /// A chart that rewrites `htt` with a curvature/connection term or
+    /// column-projects the cross-block (`Sphere`, an active `Interval`
+    /// boundary, any curved `Product` factor) breaks that pairing — the
+    /// cross-block is then no longer matched to diagonals from the same
+    /// Jacobian and the Schur complement can go indefinite (the #681
+    /// circle/sphere failure mode). Such charts must drop the cross-block.
+    ///
+    /// Flat charts (`Euclidean`, `Circle`, and `Product`s built only from
+    /// these) transform as the identity unconditionally — their tangent
+    /// projection is the identity, they carry no connection term, and they add
+    /// no normal pinning — so coherence is preserved and the cross-block is
+    /// kept. `Interval` is excluded: its tangent projection masks coordinates
+    /// at an active boundary (a `t`-dependent projection), which breaks the
+    /// pairing exactly like a curved chart.
+    pub fn preserves_isometry_cross_block_coherence(&self) -> bool {
+        match self {
+            Self::Euclidean | Self::Circle { .. } => true,
+            Self::Sphere { .. } | Self::Interval { .. } => false,
+            Self::Product(parts)
+            | Self::ProductWithMetric {
+                manifolds: parts, ..
+            } => parts
+                .iter()
+                .all(|part| part.preserves_isometry_cross_block_coherence()),
+        }
+    }
+
     pub fn ambient_dim(&self, fallback_dim: usize) -> usize {
         match self {
             Self::Euclidean => fallback_dim,
@@ -1471,6 +1510,51 @@ mod tests {
         let lc = LatentCoordValues::from_matrix(m.view(), LatentIdMode::None);
         assert_eq!(lc.row(0), &[1.0, 2.0]);
         assert_eq!(lc.row(1), &[3.0, 4.0]);
+    }
+
+    /// `preserves_isometry_cross_block_coherence` must report exactly the
+    /// charts whose Euclidean→Riemannian geometry transform is the identity on
+    /// the per-row gradient / `H_tt` blocks. Keying the SAE isometry
+    /// cross-block coupling decision on `is_euclidean()` instead of this
+    /// predicate dropped the cross-block on the flat `Circle` chart, leaving a
+    /// block-diagonal Hessian whose joint Newton step never reached KKT
+    /// stationarity — the arrow-Schur proximal ridge then saturated at 1e15
+    /// (issue #795, regression of #681). We pin the predicate AND its grounding
+    /// invariant: on `Circle` the geometry transform really is the identity, so
+    /// coherence is preserved; on `Sphere` / `Interval` it is not.
+    #[test]
+    fn isometry_cross_block_coherence_tracks_identity_geometry_transform() {
+        assert!(LatentManifold::Euclidean.preserves_isometry_cross_block_coherence());
+        assert!(LatentManifold::Circle { period: std::f64::consts::TAU }
+            .preserves_isometry_cross_block_coherence());
+        assert!(!LatentManifold::Sphere { dim: 3 }.preserves_isometry_cross_block_coherence());
+        assert!(!LatentManifold::Interval { lo: -1.0, hi: 1.0 }
+            .preserves_isometry_cross_block_coherence());
+        // A Product is coherent iff every factor is.
+        assert!(LatentManifold::Product(vec![
+            LatentManifold::Euclidean,
+            LatentManifold::Circle { period: std::f64::consts::TAU },
+        ])
+        .preserves_isometry_cross_block_coherence());
+        assert!(!LatentManifold::Product(vec![
+            LatentManifold::Circle { period: std::f64::consts::TAU },
+            LatentManifold::Sphere { dim: 3 },
+        ])
+        .preserves_isometry_cross_block_coherence());
+
+        // Grounding invariant: on the Circle chart the geometry transform that
+        // `apply_riemannian_latent_geometry` applies — gradient projection and
+        // the Euclidean→Riemannian Hessian conversion — is the EXACT identity,
+        // so the coupled `μ AᵀA` block survives intact and the cross-block must
+        // be kept.
+        let circle = LatentManifold::Circle { period: std::f64::consts::TAU };
+        let t = array![0.73_f64];
+        let eg = array![2.4_f64];
+        let eh = array![[1.7_f64]];
+        let projected_g = circle.project_gradient_to_tangent(t.view(), eg.view());
+        assert_eq!(projected_g, eg, "Circle gradient projection must be identity");
+        let rhess = circle.riemannian_hessian_matrix(t.view(), eg.view(), eh.view());
+        assert_eq!(rhess, eh, "Circle Riemannian Hessian must equal the Euclidean Hessian");
     }
 
     /// `project_matrix_columns_to_tangent_into` (the hoisted, allocation-reuse

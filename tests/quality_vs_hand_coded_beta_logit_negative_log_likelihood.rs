@@ -84,6 +84,41 @@ fn trigamma(mut x: f64) -> f64 {
     acc + inv + 0.5 * inv2 + inv * inv2 * (1.0 / 6.0 - inv2 * (1.0 / 30.0 - inv2 / 42.0))
 }
 
+/// Tetragamma ψ''(x) = d/dx ψ'(x), x > 0. Derivative of the `trigamma`
+/// approximation above with the matching recurrence ψ''(x) = ψ''(x+1) − 2/x³.
+/// Needed for the exact β-directional derivatives of the coupled Beta joint
+/// Hessian (the ψ'(α)/ψ'(α+β) curvature weights differentiate to ψ'').
+fn tetragamma(mut x: f64) -> f64 {
+    let mut acc = 0.0;
+    while x < 6.0 {
+        acc -= 2.0 / (x * x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    // ψ''(x) ≈ −1/x² − 1/x³ − 1/(2x⁴) + 1/(6x⁶) − 1/(6x⁸) + 3/(10x¹⁰)
+    acc + (-inv2 - inv2 * inv - 0.5 * inv2 * inv2
+        + inv2 * inv2 * inv2 * (1.0 / 6.0 + inv2 * (-1.0 / 6.0 + inv2 * 0.3)))
+}
+
+/// Pentagamma ψ'''(x) = d/dx ψ''(x), x > 0. Derivative of `tetragamma` with the
+/// matching recurrence ψ'''(x) = ψ'''(x+1) + 6/x⁴. Needed for the exact second
+/// β-directional derivative of the coupled Beta joint Hessian.
+fn pentagamma(mut x: f64) -> f64 {
+    let mut acc = 0.0;
+    while x < 6.0 {
+        acc += 6.0 / (x * x * x * x);
+        x += 1.0;
+    }
+    let inv = 1.0 / x;
+    let inv2 = inv * inv;
+    let inv3 = inv2 * inv;
+    // ψ'''(x) ≈ 2/x³ + 3/x⁴ + 2/x⁵ − 1/x⁷ + 4/(3x⁹) − 3/x¹¹
+    acc + 2.0 * inv3 + 3.0 * inv2 * inv2 + 2.0 * inv2 * inv3 - inv3 * inv2 * inv2
+        + (4.0 / 3.0) * inv3 * inv3 * inv3
+        - 3.0 * inv3 * inv3 * inv3 * inv2
+}
+
 /// Row negative log-likelihood of Beta(α, β) at observation y, with
 /// α = softplus(η₁), β = softplus(η₂). This is the *exact* arithmetic the
 /// family below sums into its log-likelihood; the FD harness differentiates
@@ -256,9 +291,336 @@ impl CustomFamily for BetaLogitCustomFamily {
         joint.slice_mut(ndarray::s![p0.., 0..p0]).assign(&h12.t());
         Ok(Some(joint))
     }
+
+    /// Exact first β-directional derivative `D_β H_L[u]` of the coupled joint
+    /// Hessian along a flattened coefficient direction `u = [u_α ; u_β]`. The
+    /// Hessian weights depend on β only through η = Xβ, so this differentiates
+    /// each weight w·(η) along the η-directions `dh1 = X₁·u_α`, `dh2 = X₂·u_β`
+    /// (the softplus/sigmoid + digamma chain), then re-assembles the same three
+    /// `Xᵀ diag(·) X` blocks. Without this override the engine would assemble a
+    /// block-diagonal `D_β H` and silently drop the cross-block w12 drift.
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let p0 = self.design0.ncols();
+        let p1 = self.design1.ncols();
+        if d_beta_flat.len() != p0 + p1 {
+            return Err(format!(
+                "BetaLogit directional derivative length {} != joint width {}",
+                d_beta_flat.len(),
+                p0 + p1
+            ));
+        }
+        let eta1 = &block_states[0].eta + &self.alpha_offset;
+        let eta2 = &block_states[1].eta + &self.beta_offset;
+        let dh1 = self
+            .design0
+            .dot(&d_beta_flat.slice(ndarray::s![0..p0]).to_owned());
+        let dh2 = self
+            .design1
+            .dot(&d_beta_flat.slice(ndarray::s![p0..]).to_owned());
+        let n = self.response.len();
+        let mut dw11 = Array1::<f64>::zeros(n);
+        let mut dw22 = Array1::<f64>::zeros(n);
+        let mut dw12 = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let der =
+                beta_weight_first_derivative(self.response[i], eta1[i], eta2[i], dh1[i], dh2[i]);
+            dw11[i] = der.dw11;
+            dw22[i] = der.dw22;
+            dw12[i] = der.dw12;
+        }
+        Ok(Some(self.assemble_joint(&dw11, &dw22, &dw12)))
+    }
+
+    /// Exact second β-directional derivative `D²_β H_L[u, v]` of the coupled
+    /// joint Hessian. Second mixed derivative of each weight along the two
+    /// η-direction pairs `(du1, du2)` and `(dv1, dv2)`, re-assembled into the
+    /// same three blocks. Needed (with the first derivative above) for the
+    /// exact coupled outer REML Hessian; absent, the engine's block-diagonal
+    /// default drops the cross-block third-order term.
+    fn exact_newton_joint_hessiansecond_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        u: &Array1<f64>,
+        v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let p0 = self.design0.ncols();
+        let p1 = self.design1.ncols();
+        if u.len() != p0 + p1 || v.len() != p0 + p1 {
+            return Err(format!(
+                "BetaLogit second directional derivative lengths {}/{} != joint width {}",
+                u.len(),
+                v.len(),
+                p0 + p1
+            ));
+        }
+        let eta1 = &block_states[0].eta + &self.alpha_offset;
+        let eta2 = &block_states[1].eta + &self.beta_offset;
+        let du1 = self.design0.dot(&u.slice(ndarray::s![0..p0]).to_owned());
+        let du2 = self.design1.dot(&u.slice(ndarray::s![p0..]).to_owned());
+        let dv1 = self.design0.dot(&v.slice(ndarray::s![0..p0]).to_owned());
+        let dv2 = self.design1.dot(&v.slice(ndarray::s![p0..]).to_owned());
+        let n = self.response.len();
+        let mut dw11 = Array1::<f64>::zeros(n);
+        let mut dw22 = Array1::<f64>::zeros(n);
+        let mut dw12 = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let der = beta_weight_second_derivative(
+                self.response[i],
+                eta1[i],
+                eta2[i],
+                EtaDir {
+                    d1: du1[i],
+                    d2: du2[i],
+                },
+                EtaDir {
+                    d1: dv1[i],
+                    d2: dv2[i],
+                },
+            );
+            dw11[i] = der.dw11;
+            dw22[i] = der.dw22;
+            dw12[i] = der.dw12;
+        }
+        Ok(Some(self.assemble_joint(&dw11, &dw22, &dw12)))
+    }
+}
+
+/// Per-row weight derivatives `(D[w11], D[w22], D[w12])` of the coupled Beta
+/// joint Hessian.
+struct BetaWeightDeriv {
+    dw11: f64,
+    dw22: f64,
+    dw12: f64,
+}
+
+/// Shared per-row chain-rule scalars at (η₁, η₂): the softplus shapes a,b, the
+/// sigmoid links and their derivatives, the digamma score residuals, and the
+/// curvature levels. Reused by the first- and second-derivative weight kernels.
+struct BetaRowChain {
+    a: f64,
+    b: f64,
+    s1: f64,
+    s2: f64,
+    sp1: f64,
+    sp2: f64,
+    /// d/dη of sp = σ'(η): sp·(1 − 2σ).
+    dsp1: f64,
+    dsp2: f64,
+    d_la: f64,
+    d_lb: f64,
+    d2_aa: f64,
+    d2_bb: f64,
+    d2_ab: f64,
+}
+
+fn beta_row_chain(y: f64, eta1: f64, eta2: f64) -> BetaRowChain {
+    let a = softplus(eta1);
+    let b = softplus(eta2);
+    let s1 = sigmoid(eta1);
+    let s2 = sigmoid(eta2);
+    let sp1 = s1 * (1.0 - s1);
+    let sp2 = s2 * (1.0 - s2);
+    BetaRowChain {
+        a,
+        b,
+        s1,
+        s2,
+        sp1,
+        sp2,
+        dsp1: sp1 * (1.0 - 2.0 * s1),
+        dsp2: sp2 * (1.0 - 2.0 * s2),
+        d_la: y.ln() - (digamma(a) - digamma(a + b)),
+        d_lb: (1.0 - y).ln() - (digamma(b) - digamma(a + b)),
+        d2_aa: -(trigamma(a) - trigamma(a + b)),
+        d2_bb: -(trigamma(b) - trigamma(a + b)),
+        d2_ab: trigamma(a + b),
+    }
+}
+
+/// First β-directional derivative of the three Beta Hessian weights along the
+/// η-directions (dh1, dh2). Weights (observed information):
+///   w11 = −(d2_aa·s1² + d_la·sp1),  w22 = −(d2_bb·s2² + d_lb·sp2),
+///   w12 = −(d2_ab·s1·s2),  with d2_aa = −(ψ'(a) − ψ'(a+b)), d_la = lny − (ψ(a) − ψ(a+b)),
+///   d2_ab = ψ'(a+b),  a = softplus(η₁), b = softplus(η₂).
+fn beta_weight_first_derivative(
+    y: f64,
+    eta1: f64,
+    eta2: f64,
+    dh1: f64,
+    dh2: f64,
+) -> BetaWeightDeriv {
+    let c = beta_row_chain(y, eta1, eta2);
+    // Shape derivatives along the direction: da = σ(η₁)·dh1, db = σ(η₂)·dh2.
+    let da = c.s1 * dh1;
+    let db = c.s2 * dh2;
+    let dab = da + db; // d(a+b)
+    let ds1 = c.sp1 * dh1;
+    let ds2 = c.sp2 * dh2;
+    let dsp1 = c.dsp1 * dh1;
+    let dsp2 = c.dsp2 * dh2;
+
+    let d_d_la = -(trigamma(c.a) * da - trigamma(c.a + c.b) * dab);
+    let d_d_lb = -(trigamma(c.b) * db - trigamma(c.a + c.b) * dab);
+    let d_d2_aa = -(tetragamma(c.a) * da - tetragamma(c.a + c.b) * dab);
+    let d_d2_bb = -(tetragamma(c.b) * db - tetragamma(c.a + c.b) * dab);
+    let d_d2_ab = tetragamma(c.a + c.b) * dab;
+
+    let dw11 =
+        -(d_d2_aa * c.s1 * c.s1 + c.d2_aa * 2.0 * c.s1 * ds1 + d_d_la * c.sp1 + c.d_la * dsp1);
+    let dw22 =
+        -(d_d2_bb * c.s2 * c.s2 + c.d2_bb * 2.0 * c.s2 * ds2 + d_d_lb * c.sp2 + c.d_lb * dsp2);
+    let dw12 = -(d_d2_ab * c.s1 * c.s2 + c.d2_ab * ds1 * c.s2 + c.d2_ab * c.s1 * ds2);
+    BetaWeightDeriv { dw11, dw22, dw12 }
+}
+
+/// A per-row pair of η-space directions `(dη₁, dη₂)` (the rows of `X·dir` for
+/// the α and β blocks) used by the second-derivative weight kernel.
+struct EtaDir {
+    d1: f64,
+    d2: f64,
+}
+
+/// Second mixed β-directional derivative `D_v D_u[w]` of the three Beta Hessian
+/// weights along η-direction pairs `u = (du1, du2)` and `v = (dv1, dv2)`.
+/// Differentiates the first-derivative expression once more; the η-directions
+/// are β-independent so d_v(du) = 0 and d_v(σ(η)) etc. introduce the next chain
+/// order (needs ψ''').
+fn beta_weight_second_derivative(
+    y: f64,
+    eta1: f64,
+    eta2: f64,
+    u: EtaDir,
+    v: EtaDir,
+) -> BetaWeightDeriv {
+    let (du1, du2, dv1, dv2) = (u.d1, u.d2, v.d1, v.d2);
+    let c = beta_row_chain(y, eta1, eta2);
+    let ab = c.a + c.b;
+    // First-order shape moves along u and v.
+    let dua = c.s1 * du1;
+    let dub = c.s2 * du2;
+    let dva = c.s1 * dv1;
+    let dvb = c.s2 * dv2;
+    let duab = dua + dub;
+    let dvab = dva + dvb;
+    // Second mixed shape derivative: d_v(da) = d_v(σ(η₁))·du1 = sp1·dv1·du1.
+    let duva = c.sp1 * dv1 * du1;
+    let duvb = c.sp2 * dv2 * du2;
+    let duvab = duva + duvb;
+
+    // Link-function moves (σ and σ' = sp) along u and v, and second mixed.
+    let du_s1 = c.sp1 * du1;
+    let du_s2 = c.sp2 * du2;
+    let dv_s1 = c.sp1 * dv1;
+    let dv_s2 = c.sp2 * dv2;
+    let duv_s1 = c.dsp1 * dv1 * du1;
+    let duv_s2 = c.dsp2 * dv2 * du2;
+    let du_sp1 = c.dsp1 * du1;
+    let du_sp2 = c.dsp2 * du2;
+    let dv_sp1 = c.dsp1 * dv1;
+    let dv_sp2 = c.dsp2 * dv2;
+    // d²/dη² of sp = d/dη[sp·(1−2σ)] = sp(1−2σ)² − 2·sp²; mixed along (du,dv).
+    let dd_sp1 = c.sp1 * (1.0 - 2.0 * c.s1) * (1.0 - 2.0 * c.s1) - 2.0 * c.sp1 * c.sp1;
+    let dd_sp2 = c.sp2 * (1.0 - 2.0 * c.s2) * (1.0 - 2.0 * c.s2) - 2.0 * c.sp2 * c.sp2;
+    let duv_sp1 = dd_sp1 * dv1 * du1;
+    let duv_sp2 = dd_sp2 * dv2 * du2;
+
+    // Curvature levels and their u/v/mixed derivatives.
+    // d_la = lny − (ψ(a) − ψ(a+b)).
+    let du_d_la = -(trigamma(c.a) * dua - trigamma(ab) * duab);
+    let dv_d_la = -(trigamma(c.a) * dva - trigamma(ab) * dvab);
+    let duv_d_la = -(tetragamma(c.a) * dva * dua + trigamma(c.a) * duva
+        - tetragamma(ab) * dvab * duab
+        - trigamma(ab) * duvab);
+    let du_d_lb = -(trigamma(c.b) * dub - trigamma(ab) * duab);
+    let dv_d_lb = -(trigamma(c.b) * dvb - trigamma(ab) * dvab);
+    let duv_d_lb = -(tetragamma(c.b) * dvb * dub + trigamma(c.b) * duvb
+        - tetragamma(ab) * dvab * duab
+        - trigamma(ab) * duvab);
+
+    // d2_aa = −(ψ'(a) − ψ'(a+b)).
+    let du_d2_aa = -(tetragamma(c.a) * dua - tetragamma(ab) * duab);
+    let dv_d2_aa = -(tetragamma(c.a) * dva - tetragamma(ab) * dvab);
+    let duv_d2_aa = -(pentagamma(c.a) * dva * dua + tetragamma(c.a) * duva
+        - pentagamma(ab) * dvab * duab
+        - tetragamma(ab) * duvab);
+    let du_d2_bb = -(tetragamma(c.b) * dub - tetragamma(ab) * duab);
+    let dv_d2_bb = -(tetragamma(c.b) * dvb - tetragamma(ab) * dvab);
+    let duv_d2_bb = -(pentagamma(c.b) * dvb * dub + tetragamma(c.b) * duvb
+        - pentagamma(ab) * dvab * duab
+        - tetragamma(ab) * duvab);
+
+    // d2_ab = ψ'(a+b).
+    let du_d2_ab = tetragamma(ab) * duab;
+    let dv_d2_ab = tetragamma(ab) * dvab;
+    let duv_d2_ab = pentagamma(ab) * dvab * duab + tetragamma(ab) * duvab;
+
+    // w11 = −(d2_aa·s1² + d_la·sp1). Product rule, second mixed derivative.
+    let s1sq = c.s1 * c.s1;
+    let du_s1sq = 2.0 * c.s1 * du_s1;
+    let dv_s1sq = 2.0 * c.s1 * dv_s1;
+    let duv_s1sq = 2.0 * (dv_s1 * du_s1 + c.s1 * duv_s1);
+    let duv_w11 = -(duv_d2_aa * s1sq
+        + du_d2_aa * dv_s1sq
+        + dv_d2_aa * du_s1sq
+        + c.d2_aa * duv_s1sq
+        + duv_d_la * c.sp1
+        + du_d_la * dv_sp1
+        + dv_d_la * du_sp1
+        + c.d_la * duv_sp1);
+
+    let s2sq = c.s2 * c.s2;
+    let du_s2sq = 2.0 * c.s2 * du_s2;
+    let dv_s2sq = 2.0 * c.s2 * dv_s2;
+    let duv_s2sq = 2.0 * (dv_s2 * du_s2 + c.s2 * duv_s2);
+    let duv_w22 = -(duv_d2_bb * s2sq
+        + du_d2_bb * dv_s2sq
+        + dv_d2_bb * du_s2sq
+        + c.d2_bb * duv_s2sq
+        + duv_d_lb * c.sp2
+        + du_d_lb * dv_sp2
+        + dv_d_lb * du_sp2
+        + c.d_lb * duv_sp2);
+
+    // w12 = −(d2_ab·s1·s2). Let P = s1·s2.
+    let p = c.s1 * c.s2;
+    let du_p = du_s1 * c.s2 + c.s1 * du_s2;
+    let dv_p = dv_s1 * c.s2 + c.s1 * dv_s2;
+    let duv_p = duv_s1 * c.s2 + dv_s1 * du_s2 + du_s1 * dv_s2 + c.s1 * duv_s2;
+    let duv_w12 = -(duv_d2_ab * p + du_d2_ab * dv_p + dv_d2_ab * du_p + c.d2_ab * duv_p);
+
+    BetaWeightDeriv {
+        dw11: duv_w11,
+        dw22: duv_w22,
+        dw12: duv_w12,
+    }
 }
 
 impl BetaLogitCustomFamily {
+    /// Assemble the symmetric joint `[[H11, H12],[H12ᵀ, H22]]` from per-row
+    /// weight vectors via the family's own block designs.
+    fn assemble_joint(
+        &self,
+        w11: &Array1<f64>,
+        w22: &Array1<f64>,
+        w12: &Array1<f64>,
+    ) -> Array2<f64> {
+        let h11 = self.design0_gram_weighted(w11);
+        let h22 = self.design1_gram_weighted(w22);
+        let h12 = self.design0_transpose_weighted_design1(w12);
+        let p0 = h11.nrows();
+        let p1 = h22.nrows();
+        let mut joint = Array2::<f64>::zeros((p0 + p1, p0 + p1));
+        joint.slice_mut(ndarray::s![0..p0, 0..p0]).assign(&h11);
+        joint.slice_mut(ndarray::s![p0.., p0..]).assign(&h22);
+        joint.slice_mut(ndarray::s![0..p0, p0..]).assign(&h12);
+        joint.slice_mut(ndarray::s![p0.., 0..p0]).assign(&h12.t());
+        joint
+    }
+
     fn design0_transpose_dot(&self, v: &Array1<f64>) -> Array1<f64> {
         self.design0.t().dot(v)
     }
