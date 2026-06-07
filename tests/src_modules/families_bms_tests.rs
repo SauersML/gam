@@ -12,7 +12,6 @@ use super::exact_kernel::{
     global_cubic_from_local as exact_global_cubic_from_local,
     transformed_link_cubic as exact_transformed_link_cubic,
 };
-use super::*;
 use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 use ndarray::array;
 
