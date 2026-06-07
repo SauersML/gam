@@ -2957,6 +2957,18 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         &self.noisespec
     }
 
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+        // Mirror the Binomial location-scale path: the log-sigma (scale)
+        // block carries an extra full-space shrinkage penalty so its
+        // polynomial nullspace (constant log-sigma, plus the linear term for
+        // tp/Duchon bases) is not left unpenalized. Without it, outer REML
+        // optimizes lambda_sigma on a flat/ill-conditioned surface, which
+        // over-smooths the scale envelope (bad Pearson/CRPS/PIT/NLL) and can
+        // diverge the coupled inner Newton (log_sigma residual blows up,
+        // beta -> infinity). The strength of this ridge is REML-selected.
+        noise_design.penalties.len() + 1
+    }
+
     fn exact_spatial_joint_supported(&self) -> bool {
         true
     }
@@ -2975,7 +2987,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
     ) -> Result<Vec<ParameterBlockSpec>, String> {
         let layout = GamlssLambdaLayout::two_block(
             mean_design.penalties.len(),
-            noise_design.penalties.len(),
+            self.noise_penalty_count(noise_design),
         );
         layout.validate_theta_len(theta.len(), "gaussian location-scale")?;
         let mean_log_lambdas = layout.mean_from(theta);
@@ -2992,12 +3004,20 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             LOCATION_SCALE_N_OUTPUTS,
             "GaussianLocationScale::build_blocks: mu",
         )?;
+        let prepared_noise_design =
+            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
+        let p_noise = prepared_noise_design.ncols();
+        let mut log_sigma_penalty_matrices = noise_design.penalties_as_penalty_matrix();
+        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
+        let mut log_sigma_nullspace_dims = noise_design.nullspace_dims.clone();
+        // Identity penalty penalizes the full log-sigma space -> nullspace 0.
+        log_sigma_nullspace_dims.push(0);
         let mut noisespec = build_location_scale_block(
             "log_sigma",
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
+            prepared_noise_design,
             self.noise_offset.clone(),
-            noise_design.penalties_as_penalty_matrix(),
-            noise_design.nullspace_dims.clone(),
+            log_sigma_penalty_matrices,
+            log_sigma_nullspace_dims,
             noise_log_lambdas,
             noise_beta_hint,
             1,
@@ -3102,6 +3122,12 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         &self.noisespec
     }
 
+    fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
+        // Same full-space log-sigma shrinkage penalty as the non-wiggle
+        // Gaussian builder; see GaussianLocationScaleTermBuilder.
+        noise_design.penalties.len() + 1
+    }
+
     fn exact_spatial_joint_supported(&self) -> bool {
         true
     }
@@ -3128,7 +3154,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
     ) -> Result<Vec<ParameterBlockSpec>, String> {
         let layout = GamlssLambdaLayout::withwiggle(
             mean_design.penalties.len(),
-            noise_design.penalties.len(),
+            self.noise_penalty_count(noise_design),
             self.wiggle_block.penalties.len(),
         );
         layout.validate_theta_len(theta.len(), "gaussian location-scale wiggle")?;
@@ -3144,11 +3170,16 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             LOCATION_SCALE_N_OUTPUTS,
             "GaussianLocationScaleWiggle::build_blocks: mu",
         )?;
+        let prepared_noise_design =
+            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
+        let p_noise = prepared_noise_design.ncols();
+        let mut log_sigma_penalty_matrices = noise_design.penalties_as_penalty_matrix();
+        log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
         let mut noisespec = build_location_scale_block(
             "log_sigma",
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?,
+            prepared_noise_design,
             self.noise_offset.clone(),
-            noise_design.penalties_as_penalty_matrix(),
+            log_sigma_penalty_matrices,
             vec![],
             layout.noise_from(theta),
             noise_beta_hint,

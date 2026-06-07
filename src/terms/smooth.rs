@@ -6303,7 +6303,7 @@ fn build_factor_smooth(
         penaltyinfo.push(info);
     }
 
-    let nullspaces: Vec<usize> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
+    let mut nullspaces: Vec<usize> = if matches!(spec.flavour, FactorSmoothFlavour::Re) {
         vec![0]
     } else {
         inner
@@ -6312,6 +6312,70 @@ fn build_factor_smooth(
             .map(|ns| ns.saturating_mul(n_levels))
             .collect()
     };
+
+    // `Fs` is the random-effect flavour of a smooth: the per-group curve is an
+    // exchangeable Gaussian *function*, so its WHOLE coefficient vector — not
+    // only the {const, linear} null space the double penalty already ridges —
+    // must be shrinkable toward zero under one shared variance. The marginal's
+    // derivative (wiggliness) penalty `S_wiggle` shapes the curvature but leaves
+    // its overall MAGNITUDE governed only by the curvature eigenvalues; the
+    // softest curvature mode (just past linear) is then barely penalized, so
+    // REML can park ~0.8 residual curvature DF per group on within-window noise
+    // and the held-out forecast curves away from the true per-group line
+    // (gam#712 real arm, gam#713). Capping the basis dimension (dc912b30) shrank
+    // the count of those modes but not their variance.
+    //
+    // Add a range-space identity ridge `I_L ⊗ (I_p − Z Zᵀ)` (Z = the marginal
+    // wiggliness null basis = the {const, linear} directions), shared across all
+    // groups under a single λ, so the curvature MAGNITUDE of every group's curve
+    // is a proper zero-mean random effect. With linear data REML drives this λ
+    // up and the per-group curvature variance → 0, degrading `fs` to the linear
+    // random slope the DGP is (edf → ≈2/group); with genuine curvature the same
+    // λ stays small and the wiggle survives (it is data-adaptive, not a cap).
+    // The ridge is gated by `m_null_penalty_orders`: order ≥ 1 enables it, the
+    // explicit `m=0` form opts out and keeps the legacy null-only double penalty.
+    if let FactorSmoothFlavour::Fs {
+        m_null_penalty_orders,
+    } = &spec.flavour
+        && m_null_penalty_orders.iter().copied().max().unwrap_or(0) >= 1
+    {
+        // Range-space projector for one marginal block: `P = I_p − Z Zᵀ`, the
+        // orthogonal complement of the wiggliness penalty's null space (the
+        // curvature subspace). `inner.null_eigenvectors[0]` is the orthonormal
+        // null basis of the primary marginal penalty `S_wiggle`; when the
+        // marginal is full-rank (`None`) the whole block is curvature and the
+        // projector is the identity.
+        let mut p_range = Array2::<f64>::eye(p);
+        if let Some(Some(z)) = inner.null_eigenvectors.first()
+            && z.nrows() == p
+        {
+            p_range -= &z.dot(&z.t());
+        }
+        let mut s_range = Array2::<f64>::zeros((q, q));
+        for level in 0..n_levels {
+            let start = level * p;
+            s_range
+                .slice_mut(s![start..start + p, start..start + p])
+                .assign(&p_range);
+        }
+        let (s_range, range_scale) = normalize_penalty_in_constrained_space(&s_range);
+        let range_block = crate::terms::basis::analyze_penalty_block_with_op(&s_range, None)?;
+        if range_block.rank > 0 {
+            let original_index = penalties.len();
+            penalties.push(range_block.sym_penalty);
+            nullspaces.push(range_block.nullity);
+            penaltyinfo.push(PenaltyInfo {
+                source: PenaltySource::Primary,
+                original_index,
+                active: true,
+                effective_rank: range_block.rank,
+                dropped_reason: None,
+                nullspace_dim_hint: range_block.nullity,
+                normalization_scale: range_scale,
+                kronecker_factors: None,
+            });
+        }
+    }
     let null_eigenvectors = crate::terms::basis::recompute_null_eigenvectors(&penalties)?;
     let joint_null_rotation = crate::terms::basis::compute_joint_null_rotation(&penalties)?;
 
