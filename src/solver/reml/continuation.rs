@@ -268,7 +268,8 @@ fn eval_step(
     // it must never reset that state — only refine it when it carries a real
     // (non-empty) warm-start β forward across continuation steps (#834, #236).
     if !beta_seed.is_empty() {
-        obj.seed_inner_state(beta_seed).map_err(inner_failure_from)?;
+        obj.seed_inner_state(beta_seed)
+            .map_err(inner_failure_from)?;
     }
     obj.eval_with_order(rho, order).map_err(inner_failure_from)
 }

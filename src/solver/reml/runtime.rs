@@ -7737,8 +7737,7 @@ impl<'a> RemlState<'a> {
         // assembly. This is exact, not an approximation: it reproduces the value
         // the full path would return (`build_prior` adds the identical
         // `compute_soft_priorcost(ρ) + compute_configured_rho_prior_cost(ρ)`).
-        let prior_cost =
-            self.compute_soft_priorcost(p) + self.compute_configured_rho_prior_cost(p);
+        let prior_cost = self.compute_soft_priorcost(p) + self.compute_configured_rho_prior_cost(p);
         if !prior_cost.is_finite() {
             log::debug!(
                 "[REML] eval#{} prior short-circuit | prior_cost {:.6e} | rejecting step \
