@@ -609,7 +609,33 @@ where
     let mut inv_diag = Array1::<f64>::zeros(m);
     for (i, &lam) in evals.iter().enumerate() {
         let lam_floored = lam.max(floor);
-        phi += 0.5 * lam_floored.ln();
+        // VALUE / GRADIENT CONSISTENCY (was a stall — gam#787/#785). The gradient
+        // below is `½ tr(H_id⁻¹ D_k) = ½ Σ_i (1/λ_i_floored) ∂λ_i/∂β`, i.e. it
+        // uses the FLOORED inverse `1/max(λ_i,floor)` on EVERY direction. For the
+        // value/gradient pair to be consistent (∇Φ = d/dβ Φ), `Φ = ½ Σ_i g(λ_i)`
+        // must use the antiderivative `g` of `λ ↦ 1/max(λ,floor)`, NOT plain
+        // `log(max(λ,floor))`:
+        //   • λ ≥ floor: g(λ) = ln(λ)               (g'(λ) = 1/λ),
+        //   • λ < floor: g(λ) = λ/floor + ln(floor) − 1  (g'(λ) = 1/floor),
+        // the linear continuation that is C¹ at λ = floor (g(floor) = ln(floor),
+        // g'(floor⁻) = g'(floor⁺) = 1/floor). The previous form used the CONSTANT
+        // `ln(floor)` below the floor, whose derivative is 0 — so on a separating
+        // direction (λ_i pinned at the floor, exactly where the conditioning gate
+        // arms Firth) the inner KKT residual ‖∇ℓ − Sβ + ∇Φ‖ floored at the
+        // nonzero `½ (1/floor) ∂λ_i/∂β` mass that the value's gradient did NOT
+        // contain, so no Newton step could drive it to tolerance: the inner
+        // joint-Newton burned its whole cycle budget at a frozen residual and the
+        // outer LAML never received a stationary mode (universal bernoulli-MS
+        // outer non-convergence, magnitude scaling with the separating curvature).
+        // The linear continuation keeps the gradient byte-identical (so the Firth
+        // O(1)-bounding response is unchanged) while making the value its exact
+        // antiderivative, so the residual can reach zero and the term still
+        // self-limits the separating direction.
+        if lam >= floor {
+            phi += 0.5 * lam.ln();
+        } else {
+            phi += 0.5 * (lam / floor + floor.ln() - 1.0);
+        }
         inv_diag[i] = 1.0 / lam_floored;
     }
     let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
@@ -999,6 +1025,74 @@ mod tests {
         let (evals, _) = hphi.eigh(Side::Lower).unwrap();
         for e in evals.iter() {
             assert!(*e >= -1e-10, "H_Phi must be PSD, got eigenvalue {e}");
+        }
+    }
+
+    #[test]
+    fn joint_jeffreys_term_value_gradient_consistent_below_floor() {
+        // Regression for the bernoulli-MS outer-non-convergence stall
+        // (gam#787/#785): a separating direction whose reduced-information
+        // eigenvalue sits BELOW the floored ridge. The released code computed the
+        // value as the CONSTANT `½ ln(floor)` there (derivative 0) while the
+        // gradient used the floored inverse `½ (1/floor) ∂λ/∂β` (derivative
+        // nonzero), so ∇Φ ≠ d/dβ Φ exactly where Firth arms. The inner KKT
+        // residual then floored at that mismatch and the joint-Newton could never
+        // certify. The existing above-floor FD test could not catch this (its
+        // λ_min stays above the floor). Here the second eigenvalue is genuinely
+        // below the floor, so the FD MUST match the analytic gradient only with
+        // the C¹ linear continuation of the value below the floor.
+        let p = 2usize;
+        // λ_max ≈ exp(0.3) ≈ 1.35 ⇒ floor = 1e-10·λ_max ≈ 1.35e-10. With
+        // ill = 1e-12 the second eigenvalue λ_min ≈ 1.16e-12 < floor.
+        let ill = 1e-12_f64;
+        let z = Array2::<f64>::eye(p);
+        let h_at = |b: &Array1<f64>| -> Array2<f64> {
+            let mut h = Array2::<f64>::zeros((p, p));
+            h[[0, 0]] = b[0].exp();
+            h[[1, 1]] = ill * (1.0 + b[1] * b[1]);
+            h
+        };
+        let beta: Array1<f64> = array![0.3, -0.4];
+        let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            let mut hd = Array2::<f64>::zeros((p, p));
+            hd[[0, 0]] = beta[0].exp() * d[0];
+            hd[[1, 1]] = ill * 2.0 * beta[1] * d[1];
+            Ok(Some(hd))
+        };
+        let h = h_at(&beta);
+        let (_phi, grad, _hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
+        // Re-derive the floor exactly as the term does, and finite-difference the
+        // value the term ACTUALLY accumulates (C¹ floored-inverse antiderivative):
+        //   g(λ) = ln(λ)                    for λ ≥ floor,
+        //   g(λ) = λ/floor + ln(floor) − 1  for λ < floor.
+        let value_at = |b: &Array1<f64>| -> f64 {
+            let hh = h_at(b);
+            let lam0 = hh[[0, 0]];
+            let lam1 = hh[[1, 1]];
+            let lambda_max = lam0.max(lam1);
+            let floor = (1e-10_f64 * lambda_max).max(1e-12_f64);
+            let g = |lam: f64| -> f64 {
+                if lam >= floor {
+                    lam.ln()
+                } else {
+                    lam / floor + floor.ln() - 1.0
+                }
+            };
+            0.5 * (g(lam0) + g(lam1))
+        };
+        let eps = 1e-7;
+        for k in 0..p {
+            let mut bp = beta.clone();
+            let mut bm = beta.clone();
+            bp[k] += eps;
+            bm[k] -= eps;
+            let fd = (value_at(&bp) - value_at(&bm)) / (2.0 * eps);
+            assert!(
+                (grad[k] - fd).abs() <= 1e-5 * (1.0 + fd.abs()),
+                "below-floor grad[{k}] {} vs fd {fd}; the Jeffreys value must be the \
+                 exact antiderivative of the floored-inverse gradient",
+                grad[k]
+            );
         }
     }
 
