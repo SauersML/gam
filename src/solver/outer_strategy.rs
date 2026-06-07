@@ -6027,8 +6027,6 @@ fn run_outer_with_plan(
                         max_iterations: config.max_iter,
                         axis_step_caps: axis_caps_dev,
                         admission,
-                        seed_penalised_hessian: ndarray::Array2::<f64>::zeros((0, 0)),
-                        seed_derivative_hessians: Vec::new(),
                         seed_objective: seed_eval_dev.cost,
                     };
                     // The per-step evaluator routes the on-device

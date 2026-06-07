@@ -53,9 +53,8 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
-use crate::gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind, RemlOuterAdmission};
+use crate::gpu::policy::RemlOuterAdmission;
 use crate::solver::estimate::EstimationError;
-use crate::solver::gpu::reml_gpu::{RemlGpuEvidence, RemlGpuInput, evidence_derivatives_gpu};
 
 /// Input bundle handed to [`run_reml_outer_on_device`] by the host
 /// outer-strategy dispatch site. Everything needed to seed the device-resident
@@ -88,13 +87,6 @@ pub struct RemlOuterGpuInput {
     /// curvature / device-availability still hold; a flip mid-run (e.g. the
     /// CUDA context dying) routes the next eval to the host fallback.
     pub admission: RemlOuterAdmission,
-    /// Penalised Hessian `H_λ` at the seed, used to seed the BFGS curvature
-    /// initialisation. Same array the host branch threads through
-    /// `evidence_derivatives_gpu` on the first iteration.
-    pub seed_penalised_hessian: Array2<f64>,
-    /// Derivative Hessians `∂H/∂ρⱼ` at the seed, one per smoothing param.
-    /// Routed straight into `RemlGpuInput::derivative_hessians`.
-    pub seed_derivative_hessians: Vec<Array2<f64>>,
     /// REML log-evidence value at the seed (`−ℓ + ½ log|H_λ| − ½ log|S_λ|`
     /// up to the engine's sign convention). Used to seed the BFGS sample so
     /// the optimiser's first cached eval matches the host bridge.
@@ -123,10 +115,8 @@ pub struct RemlOuterGpuOutcome {
     pub converged: bool,
 }
 
-/// Per-step device-resident evaluation handed back from
-/// [`evaluate_outer_on_device`]. The driver assembles one of these per
-/// trial-ρ, then feeds `objective` + `gradient` into the on-device BFGS
-/// state update.
+/// Per-step evaluation handed back by the unified outer objective closure.
+/// The driver feeds `objective` + `gradient` into the BFGS state update.
 #[derive(Clone, Debug)]
 pub struct RemlOuterDeviceEval {
     /// Penalised REML objective at the trial ρ. Single scalar download.
@@ -134,53 +124,6 @@ pub struct RemlOuterDeviceEval {
     /// Per-ρ gradient assembled from `evidence_derivatives_gpu` on the
     /// cached Cholesky factor of the penalised Hessian.
     pub gradient: Array1<f64>,
-}
-
-/// Evaluate `(objective, ∇)` at a trial ρ entirely through the device-resident
-/// kernels:
-///
-/// * The penalised Hessian `H_λ` and the per-ρ derivative Hessians `∂H/∂ρⱼ`
-///   come in as host views, but the driver passes them straight into
-///   `evidence_derivatives_gpu`, which uploads once, factors once, and back-
-///   solves the per-ρ derivative slabs in a single batched `potrs`.
-/// * The objective scalar is the only payload the host sees per step.
-///
-/// The penalised Hessian and derivative Hessians supplied here come from the
-/// host REML evaluator (which in turn already routes its inner kernels —
-/// PIRLS, Hutchinson trace, arrow-Schur — onto the device). This function is
-/// the convergence-test boundary for that hand-off: once `H_λ` and the
-/// derivative slabs are device-resident, every quantity the outer BFGS
-/// consumes is computed on the device.
-pub fn evaluate_outer_on_device(
-    penalised_hessian: ArrayView2<'_, f64>,
-    derivative_hessians: &[ArrayView2<'_, f64>],
-    penalised_log_likelihood: f64,
-    penalty_logdet: f64,
-) -> Result<RemlOuterDeviceEval, EstimationError> {
-    let input = RemlGpuInput {
-        penalized_hessian: penalised_hessian,
-        derivative_hessians: derivative_hessians.to_vec(),
-    };
-    let RemlGpuEvidence {
-        logdet_hessian,
-        gradient_rho,
-    } = evidence_derivatives_gpu(input).map_err(|err| {
-        EstimationError::RemlOptimizationFailed(format!(
-            "device-resident REML evidence failed: {err}"
-        ))
-    })?;
-    // Standard penalised REML objective (negative log-evidence, engine sign):
-    //   φ(ρ) = −ℓ̂(β̂(ρ)) + ½ log|H_λ(ρ)| − ½ log|S_λ(ρ)|
-    // The penalised log-likelihood and penalty log-det are supplied by the
-    // host evaluator (both are by-products of the device-resident inner
-    // PIRLS loop's final state); the log|H_λ| term is the only piece this
-    // driver assembles directly, and it falls out of the same factor that
-    // produced `gradient_rho`.
-    let objective = -penalised_log_likelihood + 0.5 * logdet_hessian - 0.5 * penalty_logdet;
-    Ok(RemlOuterDeviceEval {
-        objective,
-        gradient: gradient_rho,
-    })
 }
 
 /// Default BFGS inverse-Hessian initialisation: identity scaled by the
@@ -261,8 +204,8 @@ pub fn project_onto_bounds(rho: &mut Array1<f64>, bounds: &(Array1<f64>, Array1<
 ///
 /// `evaluator` is the per-step bridge supplied by the outer-strategy
 /// dispatch site: it is responsible for invoking the inner P-IRLS loop and
-/// returning the penalised Hessian + derivative Hessians needed by
-/// `evaluate_outer_on_device`. Threading the evaluator in as a closure
+/// returning the objective and gradient from the unified REML evaluator.
+/// Threading the evaluator in as a closure
 /// keeps this driver agnostic of how the host wires up the REML evaluator
 /// while still letting every per-step kernel run on the device.
 pub fn run_reml_outer_on_device<E>(
@@ -478,18 +421,6 @@ fn bfgs_inverse_hessian_update(h_inv: &mut Array2<f64>, s: &Array1<f64>, y: &Arr
     }
 }
 
-/// Map a `(family, curvature)` admission to the underlying device kernel
-/// flavour for the inner P-IRLS hand-off. Kept as a free function so the
-/// outer driver can stay agnostic of `pirls_row` internals — the dispatch
-/// site is the only place that needs to know how the curvature surface
-/// translates into the kernel JIT key.
-pub fn device_pirls_kernel_kind(
-    family: PirlsLoopFamilyKind,
-    curvature: PirlsLoopCurvatureKind,
-) -> (PirlsLoopFamilyKind, PirlsLoopCurvatureKind) {
-    (family, curvature)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,8 +446,6 @@ mod tests {
             max_iterations: 10,
             axis_step_caps: None,
             admission: dummy_admission(0),
-            seed_penalised_hessian: Array2::<f64>::zeros((0, 0)),
-            seed_derivative_hessians: Vec::new(),
             seed_objective: 42.0,
         };
         let evaluator = |_: &Array1<f64>| -> Result<RemlOuterDeviceEval, EstimationError> {
@@ -544,8 +473,6 @@ mod tests {
             max_iterations: 100,
             axis_step_caps: None,
             admission: dummy_admission(4),
-            seed_penalised_hessian: Array2::<f64>::eye(4),
-            seed_derivative_hessians: Vec::new(),
             seed_objective: 0.0,
         };
         let evaluator = move |rho: &Array1<f64>| -> Result<RemlOuterDeviceEval, EstimationError> {
