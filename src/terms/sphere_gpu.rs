@@ -590,8 +590,10 @@ pub fn build_kernel_matrix_device(
             block_dim: (block_x, block_y, 1),
             shared_mem_bytes: 0,
         };
-        let n_i32: i32 = i32::try_from(n).map_err(|_| gpu_err!("sphere n={n} overflows i32"))?;
-        let m_i32: i32 = i32::try_from(m).map_err(|_| gpu_err!("sphere m={m} overflows i32"))?;
+        let n_i32: i32 =
+            i32::try_from(n).map_err(|_| crate::gpu_err!("sphere n={n} overflows i32"))?;
+        let m_i32: i32 =
+            i32::try_from(m).map_err(|_| crate::gpu_err!("sphere m={m} overflows i32"))?;
         let ld_i64: i64 = ld as i64;
 
         let mut builder = stream.launch_builder(&func);
@@ -703,8 +705,10 @@ pub fn build_householder_constrained_design_device(
             block_dim: (block_x, 1, 1),
             shared_mem_bytes: 0,
         };
-        let n_i32: i32 = i32::try_from(n).map_err(|_| gpu_err!("sphere-hh n={n} overflows i32"))?;
-        let m_i32: i32 = i32::try_from(m).map_err(|_| gpu_err!("sphere-hh m={m} overflows i32"))?;
+        let n_i32: i32 =
+            i32::try_from(n).map_err(|_| crate::gpu_err!("sphere-hh n={n} overflows i32"))?;
+        let m_i32: i32 =
+            i32::try_from(m).map_err(|_| crate::gpu_err!("sphere-hh m={m} overflows i32"))?;
         let ld_out_i64: i64 = ld_out as i64;
 
         let mut builder = stream.launch_builder(&func);
@@ -983,9 +987,9 @@ pub fn solve_penalised_ls_device(
 
     let solver = DnHandle::new(stream.clone()).gpu_ctx("solve_penalised_ls_device DnHandle")?;
     let n_aug_i: i32 = i32::try_from(n_aug)
-        .map_err(|_| gpu_err!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"))?;
-    let p_i: i32 =
-        i32::try_from(p).map_err(|_| gpu_err!("solve_penalised_ls_device: p={p} overflows i32"))?;
+        .map_err(|_| crate::gpu_err!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"))?;
+    let p_i: i32 = i32::try_from(p)
+        .map_err(|_| crate::gpu_err!("solve_penalised_ls_device: p={p} overflows i32"))?;
 
     // 2) Workspace size for geqrf.
     let mut lwork: i32 = 0;
@@ -1008,7 +1012,7 @@ pub fn solve_penalised_ls_device(
         }
     }
     let lwork_us = usize::try_from(lwork)
-        .map_err(|_| gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
+        .map_err(|_| crate::gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
     let mut workspace = stream
         .alloc_zeros::<f64>(lwork_us.max(1))
         .gpu_ctx("solve_penalised_ls_device alloc workspace")?;
