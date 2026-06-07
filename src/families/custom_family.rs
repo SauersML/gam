@@ -4378,7 +4378,7 @@ pub fn blockwise_fit_from_parts(
         }
         .into());
     }
-    let n = block_states[0].eta.len();
+    let n = specs[0].design.nrows();
     let total_p = block_states
         .iter()
         .map(|state| state.beta.len())
@@ -4388,10 +4388,10 @@ pub fn blockwise_fit_from_parts(
             &format!("blockwise_fit.block_states[{idx}]"),
             state,
         )?;
-        let expected_rows = specs[idx].design.nrows();
+        let expected_rows = specs[idx].solver_design().nrows();
         if state.eta.len() != expected_rows {
             return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                "blockwise_fit.block_states[{idx}] eta length mismatch: got {}, expected {} (design rows)",
+                "blockwise_fit.block_states[{idx}] eta length mismatch: got {}, expected {} (solver design rows)",
                 state.eta.len(),
                 expected_rows
             ) }.into());
@@ -25564,6 +25564,8 @@ mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[derive(Clone)]
     struct BatchedOuterHessianTestFamily {
         matrix: Array2<f64>,
@@ -25613,6 +25615,55 @@ mod tests {
                 matrix: self.matrix.clone(),
             }))
         }
+    }
+
+    #[test]
+    fn blockwise_fit_from_parts_accepts_stacked_solver_eta_with_canonical_geometry_rows() {
+        let canonical_design = DesignMatrix::from(Array2::ones((2, 1)));
+        let stacked_design = DesignMatrix::from(Array2::ones((6, 1)));
+        let spec = ParameterBlockSpec {
+            name: "stacked".to_string(),
+            design: canonical_design,
+            offset: Array1::zeros(2),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: Array1::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: Some(stacked_design),
+            stacked_offset: Some(Array1::zeros(6)),
+        };
+        let state = ParameterBlockState {
+            beta: array![0.25],
+            eta: Array1::zeros(6),
+        };
+        let fit = blockwise_fit_from_parts(
+            BlockwiseFitResultParts {
+                block_states: vec![state],
+                log_likelihood: -1.0,
+                log_lambdas: Array1::zeros(0),
+                lambdas: Array1::zeros(0),
+                covariance_conditional: Some(Array2::eye(1)),
+                stable_penalty_term: 0.0,
+                penalized_objective: 1.0,
+                outer_iterations: 0,
+                outer_gradient_norm: Some(0.0),
+                inner_cycles: 0,
+                outer_converged: true,
+                geometry: Some(FitGeometry {
+                    penalized_hessian: Array2::eye(1).into(),
+                    working_weights: Array1::ones(2),
+                    working_response: Array1::zeros(2),
+                }),
+                precomputed_edf: Some((1.0, Vec::new(), vec![1.0])),
+            },
+            &[spec],
+        )
+        .expect("stacked solver eta should assemble against canonical geometry rows");
+
+        assert_eq!(fit.block_states[0].eta.len(), 6);
+        assert_eq!(fit.geometry.as_ref().unwrap().working_weights.len(), 2);
     }
 
     #[test]
