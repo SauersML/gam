@@ -5694,8 +5694,20 @@ where
             }
             let shape = mu * mu / total_var;
             let scale = total_var / mu;
-            lower[i] = gamma_quantile(p_lower, shape, scale);
-            upper[i] = gamma_quantile(p_upper, shape, scale);
+            let q_lo = gamma_quantile(p_lower, shape, scale);
+            let q_hi = gamma_quantile(p_upper, shape, scale);
+            // For an enormous shape (φ → 0 and SE(μ̂) → 0) the Gamma is
+            // essentially Gaussian and the incomplete-gamma inverse loses
+            // precision; if either quantile comes back non-finite or mis-ordered
+            // fall back to the (then-accurate) symmetric Gaussian edges.
+            if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
+                lower[i] = q_lo;
+                upper[i] = q_hi;
+            } else {
+                let s = total_var.sqrt();
+                lower[i] = mu - z_lower_per_row[i] * s;
+                upper[i] = mu + z_upper_per_row[i] * s;
+            }
         }
         clamp_to_support(lower, upper)
     };
