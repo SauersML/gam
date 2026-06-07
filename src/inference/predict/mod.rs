@@ -1210,9 +1210,18 @@ impl PredictableModel for StandardPredictor {
                     fit,
                     &unc_options,
                 )?;
+                // Adopt the covariance-mode η-scale SE, then re-derive the
+                // TransformEta credible bounds from the posterior-mean point's
+                // own η (which carries the bias correction) so the bounds stay
+                // centred consistently with the reported point — only their width
+                // changes with `covariance_mode`.
                 result.eta_standard_error = unc.eta_standard_error;
-                result.mean_lower = Some(unc.mean_lower);
-                result.mean_upper = Some(unc.mean_upper);
+                enrich_posterior_mean_bounds(
+                    &mut result,
+                    level,
+                    self.family.clone(),
+                    self.link_kind.as_ref(),
+                )?;
                 if options.include_observation_interval {
                     let z = standard_normal_quantile(0.5 + 0.5 * level)
                         .map_err(EstimationError::InvalidInput)?;
