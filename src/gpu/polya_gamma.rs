@@ -460,18 +460,65 @@ fn pg_third_cumulant(b: f64, c: f64) -> f64 {
     b * bracket / (64.0 * u.powi(5))
 }
 
-/// Cornish-Fisher draw: `X ≈ μ + σ·[Z + (γ_1/6)·(Z² − 1)]` with
-/// `γ_1 = κ_3 / σ³`. Falls back to plain reflected normal when `c ≈ 0` and the
-/// distribution is symmetric (γ_1 → 0).
+/// Fourth cumulant `κ_4 = K⁗(0)` of the PG CGF
+/// `K(t) = b·[log cosh(c/2) − log cosh(u)]`, `u = √(c²−2t)/2`, `du/dt = −1/(4u)`.
+///
+/// Closed form (no finite differences), derived by carrying the same
+/// chain-rule machinery one order past [`pg_third_cumulant`]. With
+/// `T = tanh u`, `S = sech²u` (so `T' = S`, `S' = −2TS`):
+///   K''(t)  = b·H(u),                  H  = −S/(16u²) + T/(16u³)
+///   K'''(t) = (b/(64u⁵))·B₃(u),        B₃ = 3T − 3uS − 2u²TS
+///   K⁗(t)   = b·M'(u)·du/dt = −(b/256)·u⁻⁷·(u·B₃' − 5·B₃)
+///           = (b/256)·u⁻⁷·[15T − 15uS − 12u²TS + 2u³S² − 4u³T²S].
+/// (using B₃' = 2uTS − 2u²S² + 4u²T²S.)
+/// Small-u Taylor of the bracket is `(272/105)·u⁷ + O(u⁹)`, giving the clean
+/// symmetric limit `K⁗(0) → b·(272/105)/256 = 17b/1680` (the intrinsic excess
+/// kurtosis of a sum of `b` PG(1) atoms; positive ⇒ leptokurtic, as expected).
+#[inline]
+fn pg_fourth_cumulant(b: f64, c: f64) -> f64 {
+    let c_abs = c.abs();
+    if c_abs < 1e-6 {
+        return b * 17.0 / 1680.0;
+    }
+    let u = 0.5 * c_abs;
+    let t = u.tanh();
+    let s = 1.0 - t * t; // sech²u
+    let u2 = u * u;
+    let u3 = u2 * u;
+    let bracket = 15.0 * t - 15.0 * u * s - 12.0 * u2 * t * s + 2.0 * u3 * s * s
+        - 4.0 * u3 * t * t * s;
+    b * bracket / (256.0 * u.powi(7))
+}
+
+/// Cornish-Fisher draw matching the PG law's first FOUR cumulants:
+///
+///   X ≈ μ + σ·[ Z + (γ₁/6)(Z²−1) + (γ₂/24)(Z³−3Z) − (γ₁²/36)(2Z³−5Z) ]
+///
+/// with skewness `γ₁ = κ₃/σ³` and excess kurtosis `γ₂ = κ₄/σ⁴`. The earlier
+/// 2-term form (`Z + (γ₁/6)(Z²−1)`) matched only κ₁..κ₃ and dropped κ₄⁺; at the
+/// low-`b` edge of the saddlepoint regime (b ≈ SADDLE_MIN_B) the PG's O(1/b)
+/// excess kurtosis is large enough that the missing κ₄ term failed the
+/// two-sample KS gate vs the exact convolution oracle (#836). Adding the κ₄
+/// (and the κ₃²) Cornish-Fisher terms restores agreement without weakening the
+/// α = 0.01 KS bound. Falls back to a reflected normal as `c → 0` only to the
+/// extent γ₁, γ₂ → their symmetric limits (both stay finite and nonzero — the
+/// atoms themselves are skewed and leptokurtic).
 pub fn pg_saddlepoint_normal_skew_oracle(state: &mut XorwowState, b: u32, tilt: f64) -> f64 {
     let bf = b as f64;
     let mean = pg_mean(bf, tilt);
     let var = pg_variance(bf, tilt);
     let sd = var.sqrt();
     let k3 = pg_third_cumulant(bf, tilt);
+    let k4 = pg_fourth_cumulant(bf, tilt);
     let gamma1 = k3 / (sd * sd * sd);
+    let gamma2 = k4 / (var * var);
     let z = state.next_norm();
-    let mut draw = mean + sd * (z + gamma1 / 6.0 * (z * z - 1.0));
+    let z2 = z * z;
+    let z3 = z2 * z;
+    // Cornish-Fisher quantile expansion through the κ₄ term.
+    let cf = z + gamma1 / 6.0 * (z2 - 1.0) + gamma2 / 24.0 * (z3 - 3.0 * z)
+        - gamma1 * gamma1 / 36.0 * (2.0 * z3 - 5.0 * z);
+    let mut draw = mean + sd * cf;
     if draw <= 0.0 {
         draw = -draw + 1e-300;
     }

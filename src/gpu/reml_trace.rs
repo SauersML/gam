@@ -170,8 +170,10 @@ pub struct RemlTraceHutchinsonEvidence {
     pub logdet_hessian: f64,
     /// REML logdet gradient `g_j = (1/2) · mean_k(q_{j,k})`, length `D`.
     pub gradient_rho_logdet: Array1<f64>,
-    /// Sample standard error of `g_j` across the `K` probes (already
-    /// includes the leading `1/2`), length `D`.
+    /// Per-probe sample standard deviation of the half-scaled gradient term
+    /// `(1/2)·q_{j,·}` across the `K` probes (i.e. `0.5·sd`, NOT divided by
+    /// `sqrt(K)`), length `D`. To obtain the standard error of the running
+    /// mean `g_j`, divide by `sqrt(K)` (= `sqrt(probe_count)`).
     pub gradient_rho_stderr: Array1<f64>,
     /// `K` probes actually used (matches `input.probe_count`).
     pub probe_count: usize,
@@ -443,6 +445,9 @@ pub const HUTCHINSON_ADAPTIVE_TAU_REL: f64 = 1e-8;
 pub struct AdaptiveTraceEvidence {
     pub logdet_hessian: f64,
     pub traces: Array1<f64>,
+    /// Per-probe sample standard deviation of the raw trace estimator
+    /// `q_{j,·}` (NOT divided by `sqrt(K)`); divide by `sqrt(probe_count)`
+    /// to obtain the standard error of the running mean `traces[j]`.
     pub stderrs: Array1<f64>,
     pub probe_count: usize,
     pub converged: bool,
@@ -493,8 +498,9 @@ pub fn evidence_traces_adaptive<'a>(
         last_k = k;
 
         // The dispatch entry returns the **(1/2)·mean** REML logdet
-        // gradient and **(1/2)·sample-SE**. Undo the half to recover the
-        // raw `t_j = mean_k q_{j,k}` and `s_j` the stopping rule wants.
+        // gradient and **(1/2)·per-probe sample SD**. Undo the half to
+        // recover the raw `t_j = mean_k q_{j,k}` and the per-probe sample
+        // standard deviation `s_j` the stopping rule wants.
         for j in 0..d {
             last_traces[j] = 2.0 * evidence.gradient_rho_logdet[j];
             last_stderrs[j] = 2.0 * evidence.gradient_rho_stderr[j];
@@ -502,9 +508,12 @@ pub fn evidence_traces_adaptive<'a>(
 
         // Stopping rule (math block 2 §16):
         //   max_j  s_j / (sqrt(K) · max(|t_j|, τ))  ≤  ε
-        // `s_j` here is the sample standard deviation across the K probes
-        // (returned by `reduce_mean_stderr`); dividing by sqrt(K) converts
-        // it to the standard error of the running mean.
+        // `s_j` here is the per-probe sample standard deviation across the K
+        // probes (`reduce_mean_stderr` returns the raw SD, NOT the SE-of-mean);
+        // dividing by sqrt(K) once converts it to the standard error of the
+        // running mean. (The earlier double-sqrt(K) division — once here and
+        // once already inside `reduce_mean_stderr` — made this test sqrt(K)×
+        // too lax, stopping the schedule at too-small K; see #829.)
         let sqrt_k = (k as f64).sqrt();
         let mut worst = 0.0_f64;
         for j in 0..d {
@@ -1424,10 +1433,15 @@ fn validate_inputs(input: &RemlTraceHutchinsonInput<'_>) -> Result<(), String> {
     Ok(())
 }
 
-/// Compute the per-derivative sample mean and sample-mean SE from the
-/// flat row-major (D, K) Q matrix. SE uses Bessel's correction (K-1) for
-/// the variance and divides by `sqrt(K)` so the returned value is the
-/// standard error of the mean.
+/// Compute the per-derivative sample mean and **per-probe sample standard
+/// deviation** from the flat row-major (D, K) Q matrix. The SD uses Bessel's
+/// correction (K-1) for the variance; it is NOT divided by `sqrt(K)`. Callers
+/// that want the standard error of the running mean must divide by `sqrt(K)`
+/// themselves (the stopping rule and the tests do). Returning the raw sample
+/// SD here keeps a single convention shared with the HVP adaptive path
+/// (which folds `var.sqrt()` directly into its `stderrs`), and avoids the
+/// historical double `1/sqrt(K)` division that under-counted the variance
+/// band by a factor of `K`.
 fn reduce_mean_stderr(q: &[f64], d: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
     assert_eq!(
         q.len(),
@@ -1446,7 +1460,7 @@ fn reduce_mean_stderr(q: &[f64], d: usize, k: usize) -> (Vec<f64>, Vec<f64>) {
         means[j] = mean;
         if k >= 2 {
             let var = row.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / ((k - 1) as f64);
-            stderrs[j] = (var / (k as f64)).sqrt();
+            stderrs[j] = var.sqrt();
         }
     }
     (means, stderrs)
@@ -1627,8 +1641,13 @@ mod tests {
         // gradient = 0.5 * trace, so multiply estimate by 2 for the trace.
         let est1 = 2.0 * evidence.gradient_rho_logdet[0];
         let est2 = 2.0 * evidence.gradient_rho_logdet[1];
-        let tol1 = 6.0 * evidence.gradient_rho_stderr[0].max(1e-8) * 2.0;
-        let tol2 = 6.0 * evidence.gradient_rho_stderr[1].max(1e-8) * 2.0;
+        // `gradient_rho_stderr` is the per-probe sample SD of the half-scaled
+        // gradient; the trace SE of the K-probe mean is `2·sd/sqrt(K)`.
+        let sqrt_k = (evidence.probe_count as f64).sqrt();
+        let se1 = 2.0 * evidence.gradient_rho_stderr[0] / sqrt_k;
+        let se2 = 2.0 * evidence.gradient_rho_stderr[1] / sqrt_k;
+        let tol1 = 6.0 * se1.max(1e-8);
+        let tol2 = 6.0 * se2.max(1e-8);
         assert!(
             (est1 - exact1).abs() <= tol1,
             "Hutchinson est {est1} too far from exact {exact1} (tol={tol1}, se={})",
@@ -1734,7 +1753,9 @@ mod tests {
             seed: ProbeSeed(0xAA55),
         };
         let evidence = evidence_derivatives_hutchinson_cpu(&input).expect("ok");
-        let tol = 8.0 * evidence.gradient_rho_stderr[0].max(1e-8);
+        // SE of the half-scaled gradient mean = (per-probe sample SD) / sqrt(K).
+        let se = evidence.gradient_rho_stderr[0] / (evidence.probe_count as f64).sqrt();
+        let tol = 8.0 * se.max(1e-8);
         assert!(
             (evidence.gradient_rho_logdet[0] - 0.5 * exact).abs() < tol,
             "Hutchinson gradient {} not within 8·SE of 0.5·exact={}",

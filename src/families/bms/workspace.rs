@@ -499,11 +499,20 @@ impl BernoulliMarginalSlopeFamily {
             + g_ggg)
             / d;
         // Pgg = Dg(Pg); R1 = Dg(G_aaa·a_g + G_aag) = Dg(aag).
+        //
+        // Pg = g_aaa·a_g² + 2·g_aag·a_g + g_aa·a_gg + g_agg, so its total
+        // g-derivative Dg(Pg) must differentiate the `g_aa·a_gg` product by
+        // BOTH factors: Dg(g_aa)·a_gg + g_aa·Dg(a_gg) = aag·a_gg + g_aa·a_ggg.
+        // The `aag·a_gg` half lands in the `3·g_aaa·a_g·a_gg + 3·g_aag·a_gg`
+        // tally below; the `g_aa·a_ggg` half is a distinct term (#833 — its
+        // omission left a_mggg, hence the marginal/slope fourth-order block,
+        // ~1.8% short of the finite-difference of the third-order form).
         let pgg = g_aaaa * a_g * a_g * a_g
             + 3.0 * g_aaag * a_g * a_g
             + 3.0 * g_aaa * a_g * a_gg
             + 3.0 * g_aagg * a_g
             + 3.0 * g_aag * a_gg
+            + g_aa * a_ggg
             + g_aggg;
         let r1 = g_aaaa * a_g * a_g + 2.0 * g_aaag * a_g + g_aaa * a_gg + g_aagg;
         let aaag = g_aaaa * a_g + g_aaag; // Dg(G_aaa)

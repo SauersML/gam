@@ -7811,9 +7811,12 @@ mod tests {
 
     #[test]
     fn bernoulli_flex_row_primary_hessian_cache_policy_materializes_aou_shape() {
-        // AoU-shaped cache (~626 MiB) under a 16 GiB available-RAM budget:
+        // AoU-shaped cache (~629 MiB) under a 16 GiB available-RAM budget:
         // single-cache budget is 4 GiB and the global pin budget is 8 GiB, so
         // even though the cache is hundreds of MiB it amortizes the build.
+        // The full row-primary shape is neglog (1) + grad (r) + hess (r*r)
+        // per row, i.e. r²+r+1 = 421 floats/row for r=20 (not r²=400):
+        //   195_780 · 421 · 8 = 659_387_040 bytes (~629 MiB).
         let plan = decide_row_primary_hessian_cache(
             195_780,
             20,
@@ -7822,7 +7825,7 @@ mod tests {
             16 * 1024 * 1024 * 1024,
             0,
         );
-        assert_eq!(plan.bytes, 626_496_000);
+        assert_eq!(plan.bytes, 659_387_040);
         assert!(plan.materialize);
         assert_eq!(
             plan.reason,

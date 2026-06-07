@@ -2658,7 +2658,12 @@ pub fn cpu_oracle_evaluate_calibration(
 //
 // Math identity: the calibration evaluator is
 //
-//     F(a)   = -Φ(-q) + Σ_cells INV_TWO_PI · moments_neg[0]
+//     F(a)   = -Φ(-q) + Σ_cells value_neg   (value_neg = Σ w·e^{-½z²}·Φ(η)/√(2π),
+//                                            the survival value-integral the
+//                                            oracle reads as `state.value`; NOT
+//                                            `INV_TWO_PI · moments_neg[0]`, which
+//                                            integrates the different weight
+//                                            e^{-½(z²+η²)} — see #831)
 //     F'(a)  = INV_TWO_PI · Σ_cells ⟨dc_da_neg, moments_neg[0..4]⟩
 //     F''(a) = INV_TWO_PI · Σ_cells (⟨dc_daa_neg, moments_neg[0..4]⟩
 //                                    - ⟨conv(neg_cubic, dc_da_neg, dc_da_neg), moments_neg[0..10]⟩)
@@ -2700,7 +2705,8 @@ pub fn try_device_evaluate_calibration(
     probit_scale: f64,
 ) -> Result<Option<Vec<SurvivalFlexCalibrationFAndDerivs>>, GpuError> {
     use crate::families::cubic_cell_kernel::{
-        denested_cell_coefficient_partials, denested_cell_second_partials,
+        DenestedCubicCell, denested_cell_coefficient_partials, denested_cell_second_partials,
+        evaluate_cell_moments,
     };
 
     let n_rows = partition_by_row.len();
@@ -2810,9 +2816,34 @@ pub fn try_device_evaluate_calibration(
         for cell_idx in start..end {
             let pc = &partition_by_row[row][cell_idx - start];
             let moments_row = &mom.moments[cell_idx * stride..cell_idx * stride + stride];
-            // Cell value contribution: `INV_TWO_PI * moments[0]` (matches
-            // `cell_polynomial_integral_from_moments` for `[1.0]`).
-            f += moments_row[0] * inv_two_pi;
+            // Cell value contribution: the calibration F-seed integrand is the
+            // *survival* value-integral `Σ w·e^{-½z²}·Φ(η) / √(2π)` (= the
+            // oracle's `state.value`, cubic_cell_kernel.rs `value_integral *
+            // 1/√τ`), NOT the moment-weight integral `Σ w·e^{-½(z²+η²)} / 2π`
+            // (= `moments[0]·INV_TWO_PI`). The substrate returns only the
+            // derivative moments (the `e^{-½(z²+η²)}` family used for F'/F''),
+            // so the value term cannot be reconstructed from `moments[0]`; it
+            // is a genuinely different integrand (#831 Defect B). Fold it on
+            // host from the closed-form value-integral the kernel exposes via
+            // `evaluate_cell_moments(neg_cell).value`, keeping the device
+            // moments for the higher-order derivative folds below.
+            let neg_cell = DenestedCubicCell {
+                left: pc.cell.left,
+                right: pc.cell.right,
+                c0: -pc.cell.c0,
+                c1: -pc.cell.c1,
+                c2: -pc.cell.c2,
+                c3: -pc.cell.c3,
+            };
+            let value_state = evaluate_cell_moments(neg_cell, 9).map_err(|reason| {
+                GpuError::DriverCallFailed {
+                    reason: format!(
+                        "try_device_evaluate_calibration: value-integral evaluation failed \
+                         for row {row} cell {cell_idx}: {reason}"
+                    ),
+                }
+            })?;
+            f += value_state.value;
 
             let (dc_da_pos, _) =
                 denested_cell_coefficient_partials(pc.score_span, pc.link_span, a, slope);
@@ -6190,19 +6221,29 @@ mod survival_flex_gpu_tests {
     // No CUDA dependency — runs on every host.
     // ────────────────────────────────────────────────────────────────────
 
-    fn step4a_fixture_cells() -> Vec<SurvivalFlexCalibrationCell> {
-        use crate::families::cubic_cell_kernel::{DenestedCubicCell, LocalSpanCubic};
-        // Single cell — keeps the test deterministic and easy to audit.
-        // Coefficients picked so the cubic is non-affine and non-degenerate
-        // over the cell interior; spans likewise non-trivial.
-        let cell = DenestedCubicCell {
-            left: -0.5,
-            right: 0.5,
-            c0: 0.31,
-            c1: 0.27,
-            c2: -0.11,
-            c3: 0.07,
+    /// Build the single-cell calibration fixture **at intercept `a`** (and
+    /// scale `slope`).
+    ///
+    /// The cell's cubic coefficients are NOT frozen: they are recomputed from
+    /// the fixed score/link spans via `denested_cell_coefficients(score_span,
+    /// link_span, a, slope)` — exactly the `a → cell` map production uses
+    /// (`survival_marginal_slope::denested_partition_cells` →
+    /// `build_denested_partition_cells_with_tails`). This is what makes the
+    /// oracle's value-integral seed `F(a)` genuinely vary with `a`, so a
+    /// finite difference of `F` reproduces the analytic `F'` (= the oracle's
+    /// `f_prime`, which is `⟨denested_cell_coefficient_partials(...,a,slope),
+    /// moments⟩`, the exact `∂a` of `denested_cell_coefficients`).
+    ///
+    /// A frozen cell (the prior fixture) left `F(a)` constant in `a`, so the
+    /// FD of `F` was identically 0 while the analytic `F'` was nonzero — a
+    /// structurally-guaranteed FD-lock failure (#831 Defect A). The spans
+    /// stay fixed across `a`; only the cell cubic tracks `a`.
+    fn step4a_fixture_cells_at(a: f64, slope: f64) -> Vec<SurvivalFlexCalibrationCell> {
+        use crate::families::cubic_cell_kernel::{
+            DenestedCubicCell, LocalSpanCubic, denested_cell_coefficients,
         };
+        // Fixed, non-trivial spans — the same span for every `a` so the
+        // finite-difference contract holds (only the cell cubic moves).
         let score_span = LocalSpanCubic {
             left: -0.5,
             right: 0.5,
@@ -6219,6 +6260,20 @@ mod survival_flex_gpu_tests {
             c2: 0.04,
             c3: -0.01,
         };
+        // `a → cell` map: the cell cubic is the closed-form
+        // `denested_cell_coefficients`, whose `∂a` is exactly the
+        // `denested_cell_coefficient_partials` the oracle folds against the
+        // moments. Anchor the cell support at the fixed span window so the
+        // quadrature domain is stable across the FD stencil.
+        let coeffs = denested_cell_coefficients(score_span, link_span, a, slope);
+        let cell = DenestedCubicCell {
+            left: -0.5,
+            right: 0.5,
+            c0: coeffs[0],
+            c1: coeffs[1],
+            c2: coeffs[2],
+            c3: coeffs[3],
+        };
         vec![SurvivalFlexCalibrationCell {
             cell,
             score_span,
@@ -6228,31 +6283,46 @@ mod survival_flex_gpu_tests {
 
     #[test]
     fn step4a_oracle_f_prime_matches_finite_difference() {
-        let cells = step4a_fixture_cells();
         let q = 0.4_f64;
         let slope = 0.55_f64;
         let probit_scale = 1.0_f64;
         let h = 1e-5_f64;
 
+        // Evaluate `F(a')` with the cell cubic rebuilt AT `a'` — both the
+        // value-integral seed (driven by the cell coefficients) and the
+        // analytic partials (driven by the explicit `a'` argument) must track
+        // the same `a'`, exactly as production does. A stencil that reused a
+        // cell frozen at the centre `a` would make `F` constant in `a'`
+        // (FD ≡ 0); see #831 Defect A.
+        let f_at = |a_prime: f64| -> f64 {
+            cpu_oracle_evaluate_calibration(
+                &step4a_fixture_cells_at(a_prime, slope),
+                a_prime,
+                q,
+                slope,
+                probit_scale,
+            )
+            .expect("oracle must succeed on the fixture")
+            .f
+        };
+
         // Probe `a` on a small grid covering both sides of the typical
         // calibration root.
         for &a in &[-0.2_f64, -0.05, 0.0, 0.07, 0.18] {
-            let out = cpu_oracle_evaluate_calibration(&cells, a, q, slope, probit_scale)
-                .expect("oracle must succeed on the fixture");
+            let out = cpu_oracle_evaluate_calibration(
+                &step4a_fixture_cells_at(a, slope),
+                a,
+                q,
+                slope,
+                probit_scale,
+            )
+            .expect("oracle must succeed on the fixture");
             // 4-point central FD of F(a):
             //   F'(a) ≈ (-F(a+2h) + 8 F(a+h) - 8 F(a-h) + F(a-2h)) / (12 h)
-            let f_p2 = cpu_oracle_evaluate_calibration(&cells, a + 2.0 * h, q, slope, probit_scale)
-                .expect("oracle +2h")
-                .f;
-            let f_p1 = cpu_oracle_evaluate_calibration(&cells, a + h, q, slope, probit_scale)
-                .expect("oracle +h")
-                .f;
-            let f_m1 = cpu_oracle_evaluate_calibration(&cells, a - h, q, slope, probit_scale)
-                .expect("oracle -h")
-                .f;
-            let f_m2 = cpu_oracle_evaluate_calibration(&cells, a - 2.0 * h, q, slope, probit_scale)
-                .expect("oracle -2h")
-                .f;
+            let f_p2 = f_at(a + 2.0 * h);
+            let f_p1 = f_at(a + h);
+            let f_m1 = f_at(a - h);
+            let f_m2 = f_at(a - 2.0 * h);
             let fd = (-f_p2 + 8.0 * f_p1 - 8.0 * f_m1 + f_m2) / (12.0 * h);
 
             let abs = (out.f_prime - fd).abs();
@@ -6270,31 +6340,43 @@ mod survival_flex_gpu_tests {
 
     #[test]
     fn step4a_oracle_f_double_prime_matches_finite_difference() {
-        let cells = step4a_fixture_cells();
         let q = 0.4_f64;
         let slope = 0.55_f64;
         let probit_scale = 1.0_f64;
         let h = 1e-4_f64;
 
+        // `F'(a')` with the cell cubic rebuilt at `a'` (see Defect A note on
+        // the F' test): the moments and the partials must both track `a'`,
+        // else the FD of `F'` would be the partial-only derivative and drift
+        // from the analytic `F''` (which also includes the ∂moments/∂a
+        // convolution term).
+        let fp_at = |a_prime: f64| -> f64 {
+            cpu_oracle_evaluate_calibration(
+                &step4a_fixture_cells_at(a_prime, slope),
+                a_prime,
+                q,
+                slope,
+                probit_scale,
+            )
+            .expect("oracle must succeed on the fixture")
+            .f_prime
+        };
+
         for &a in &[-0.2_f64, -0.05, 0.0, 0.07, 0.18] {
-            let out = cpu_oracle_evaluate_calibration(&cells, a, q, slope, probit_scale)
-                .expect("oracle must succeed on the fixture");
+            let out = cpu_oracle_evaluate_calibration(
+                &step4a_fixture_cells_at(a, slope),
+                a,
+                q,
+                slope,
+                probit_scale,
+            )
+            .expect("oracle must succeed on the fixture");
             // 4-point central FD of F'(a) (using the analytic F' the oracle
             // already returns — keeps the FD inner sample to one quantity).
-            let fp_p2 =
-                cpu_oracle_evaluate_calibration(&cells, a + 2.0 * h, q, slope, probit_scale)
-                    .expect("oracle +2h")
-                    .f_prime;
-            let fp_p1 = cpu_oracle_evaluate_calibration(&cells, a + h, q, slope, probit_scale)
-                .expect("oracle +h")
-                .f_prime;
-            let fp_m1 = cpu_oracle_evaluate_calibration(&cells, a - h, q, slope, probit_scale)
-                .expect("oracle -h")
-                .f_prime;
-            let fp_m2 =
-                cpu_oracle_evaluate_calibration(&cells, a - 2.0 * h, q, slope, probit_scale)
-                    .expect("oracle -2h")
-                    .f_prime;
+            let fp_p2 = fp_at(a + 2.0 * h);
+            let fp_p1 = fp_at(a + h);
+            let fp_m1 = fp_at(a - h);
+            let fp_m2 = fp_at(a - 2.0 * h);
             let fd = (-fp_p2 + 8.0 * fp_p1 - 8.0 * fp_m1 + fp_m2) / (12.0 * h);
 
             let abs = (out.f_double_prime - fd).abs();
@@ -6321,13 +6403,13 @@ mod survival_flex_gpu_tests {
         // F seed equals `-Φ(-q)` exactly.  Use a very negative `a`
         // (-1e3) where the integrand contribution is negligible; the
         // residual then equals the seed within f64 epsilon.
-        let cells = step4a_fixture_cells();
         let q = 0.4_f64;
         let slope = 0.55_f64;
         let probit_scale = 1.0_f64;
         // The oracle's seed term is `-Φ(-q)` directly; we don't need to
         // probe at large `|a|` to read it.  Subtract the per-cell value
         // contribution from the oracle output and compare to the seed.
+        let cells = step4a_fixture_cells_at(0.0, slope);
         let out = cpu_oracle_evaluate_calibration(&cells, 0.0, q, slope, probit_scale)
             .expect("oracle must succeed");
         let target = -crate::probability::normal_cdf(-q);

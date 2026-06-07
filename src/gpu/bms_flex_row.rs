@@ -3237,16 +3237,20 @@ mod tests {
         if x.is_nan() {
             return (x, x);
         }
-        if x < 0.0 {
-            let u = -x / ORACLE_SQRT_2;
-            let mut ex = oracle_erfcx_nonnegative(u);
-            if ex < 1e-300 {
-                ex = 1e-300;
-            }
-            let log_cdf = -u * u + (0.5 * ex).ln();
-            let sqrt_2_over_pi: f64 = 0.797_884_560_802_865_4;
-            (log_cdf, sqrt_2_over_pi / ex)
-        } else {
+        // Single-algorithm region around and above 0. Both `log Φ(x)` and the
+        // Mills ratio `φ/Φ` are computed from the SAME `erfc(-x/√2)` call, so
+        // the oracle is C¹ across the x=0 seam (the prior split — erfcx-based
+        // `-u²+ln(0.5·e^{u²}·erfc u)` for x<0 vs direct `ln(0.5·erfc(-x))` for
+        // x≥0 — used two distinct float algorithms whose ~1e-7 disagreement at
+        // x=0 corrupted a finite-difference reference straddling the seam, #838).
+        //
+        // The erfcx form is mathematically identical (e^{u²}·erfc(u)=erfcx(u),
+        // so −u²+ln(0.5·erfcx u)=ln(0.5·erfc(−x/√2))); it is only needed deep in
+        // the left tail (x ≲ −38), where `erfc(-x/√2)` underflows to 0 and the
+        // exp/ln cancellation is the *only* way to keep `log Φ` finite. We move
+        // the branch there, far from any region the kernel or its FD lock visits.
+        const ORACLE_LEFT_TAIL_X: f64 = -37.0;
+        if x >= ORACLE_LEFT_TAIL_X {
             let mut cdf = 0.5 * crate::gpu::numerics_host::erfc(-x / ORACLE_SQRT_2);
             if cdf < 1e-300 {
                 cdf = 1e-300;
@@ -3256,6 +3260,15 @@ mod tests {
             }
             let pdf = ORACLE_INV_SQRT_2PI * (-0.5 * x * x).exp();
             (cdf.ln(), pdf / cdf)
+        } else {
+            let u = -x / ORACLE_SQRT_2;
+            let mut ex = oracle_erfcx_nonnegative(u);
+            if ex < 1e-300 {
+                ex = 1e-300;
+            }
+            let log_cdf = -u * u + (0.5 * ex).ln();
+            let sqrt_2_over_pi: f64 = 0.797_884_560_802_865_4;
+            (log_cdf, sqrt_2_over_pi / ex)
         }
     }
 
