@@ -134,6 +134,16 @@ Boundary conditions are available for 1-D P-spline smooths. They are useful for 
 The 1-D B-spline path accepts these options plus `periodic`, `period`,
 `periods`, `period_start`, `period_end`, `origin`, `identifiability`.
 
+`cyclic(x, ...)` (aliases `cc`, `cp`) is shorthand for a periodic 1-D
+B-spline. It accepts the same period declaration two equivalent ways: a
+period length via `period=` (with an optional `origin=` for the domain
+start), or an explicit domain via `period_start=`/`period_end=`. All of
+these accept symbolic numeric expressions — e.g. `period=2*pi`,
+`period_end=tau`, `period=0.5*tau` — exactly as `s(..., periodic=true)`
+does, so `cyclic(x, period=2*pi)` and `cyclic(x, period_start=0,
+period_end=2*pi)` describe the same `[0, 2π)` smooth. An unparseable
+endpoint or an unknown option is rejected rather than silently dropped.
+
 Default interior knots:
 `clamp(unique_values / 4, 4, max(20, cbrt(unique_values)))`. The basis
 dimension is then `k = internal_knots + degree + 1`. Passing both `k`
