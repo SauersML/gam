@@ -16920,6 +16920,17 @@ fn smgs_deleted_required_channel_reason(
 }
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
+    /// #808: engage the inner self-vanishing Levenberg–Marquardt μ on a
+    /// full-rank-but-ill-conditioned penalized Hessian. Clustered-PC marginal +
+    /// log-slope share a matern PC basis → `H_pen` is full rank (`nullity == 0`)
+    /// yet cond ≈ 5.8e6; the nullity-only μ gate would leave the trust-region
+    /// Newton oscillating on the near-singular mode. μ is self-vanishing
+    /// (∝ ‖∇L − Sβ‖∞ → 0 at the fixed point), so the converged β is the exact
+    /// unconditioned solution — log-slope conditioned, NOT reduced. Survival-local.
+    fn levenberg_on_ill_conditioning(&self) -> bool {
+        true
+    }
+
     fn persistent_warm_start_fingerprint(
         &self,
         specs: &[ParameterBlockSpec],
