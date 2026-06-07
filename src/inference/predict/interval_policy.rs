@@ -646,34 +646,41 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
 
     // UNCERTAINTY: the reported SE / credible bounds / observation band honour
     // `covariance_mode` (issues #811/#812: this path previously hardwired the
-    // conditional covariance). When a smoothing mode is requested and the fit
-    // actually carries a smoothing-corrected covariance, re-derive the SEs from
-    // the full-uncertainty pass (which selects the corrected backend) while
-    // keeping the posterior-mean point above. Otherwise the conditional SEs from
-    // the posterior pass are already correct, so we avoid the extra work and stay
-    // bitwise-identical to the prior behaviour.
-    let smoothing_requested = !matches!(
-        options.covariance_mode,
-        InferenceCovarianceMode::Conditional
-    );
-    let (eta_se, mean_se) = if smoothing_requested && fit.beta_covariance_corrected().is_some() {
-        match transform.linear_state(
-            input,
-            fit,
-            PredictPass::FullUncertainty,
-            options.covariance_mode,
-        ) {
-            Ok(unc) => (
-                unc.eta_se.unwrap_or(cond_eta_se),
-                unc.mean_se.unwrap_or(cond_mean_se),
-            ),
-            // The corrected backend could not be formed for this transform; fall
-            // back to the conditional SEs rather than failing the prediction
-            // (matches the `*Preferred` covariance-mode semantics).
-            Err(_) => (cond_eta_se, cond_mean_se),
+    // conditional covariance). The posterior-mean *point* above stays
+    // conditional; only the uncertainty responds.
+    //
+    // `Conditional` keeps the posterior pass's own SE (no extra work, bitwise
+    // identical to prior behaviour). For the smoothing modes:
+    //   * when the fit carries a smoothing-corrected covariance, re-derive the
+    //     SEs from the full-uncertainty pass (which selects the corrected
+    //     backend);
+    //   * `…Required` with no correction available must error, exactly as the
+    //     full-uncertainty path's `select_uncertainty_backend` does — silently
+    //     downgrading to conditional would make the mode meaningless;
+    //   * `…Preferred` with no correction falls back to the conditional SEs.
+    let (eta_se, mean_se) = match options.covariance_mode {
+        InferenceCovarianceMode::Conditional => (cond_eta_se, cond_mean_se),
+        mode if fit.beta_covariance_corrected().is_some() => {
+            match transform.linear_state(input, fit, PredictPass::FullUncertainty, mode) {
+                Ok(unc) => (
+                    unc.eta_se.unwrap_or(cond_eta_se),
+                    unc.mean_se.unwrap_or(cond_mean_se),
+                ),
+                Err(err) => match mode {
+                    InferenceCovarianceMode::ConditionalPlusSmoothingRequired => return Err(err),
+                    _ => (cond_eta_se, cond_mean_se),
+                },
+            }
         }
-    } else {
-        (cond_eta_se, cond_mean_se)
+        InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
+            return Err(EstimationError::InvalidInput(
+                "posterior-mean prediction: covariance_mode='required' but the fit does not \
+                 contain a smoothing-corrected covariance"
+                    .to_string(),
+            ));
+        }
+        // `…Preferred` with no correction available: fall back to conditional.
+        _ => (cond_eta_se, cond_mean_se),
     };
     result.eta_standard_error = eta_se;
 
