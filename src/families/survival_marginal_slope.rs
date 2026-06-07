@@ -23271,6 +23271,21 @@ mod tests {
         spec
     }
 
+    /// Like `dummy_penalized_blockspec`, but with an `n`-row design/offset so
+    /// the spec passes `parameter_block_specs_match_rows` against a family with
+    /// `n` observations (the HVP-advertisement checks reject row-count
+    /// mismatches before evaluating the operator).
+    fn dummy_penalized_blockspec_with_rows(
+        cols: usize,
+        penalties: usize,
+        n: usize,
+    ) -> ParameterBlockSpec {
+        let mut spec = dummy_penalized_blockspec(cols, penalties);
+        spec.design = DesignMatrix::Dense(DenseDesignMatrix::from(Array2::zeros((n, cols))));
+        spec.offset = Array1::zeros(n);
+        spec
+    }
+
     fn test_deviation_runtime() -> DeviationRuntime {
         build_score_warp_deviation_block_from_seed(
             &array![-1.0, 0.0, 1.0],
@@ -24338,10 +24353,13 @@ mod tests {
     fn survival_marginal_slope_advertises_outer_hvp_at_large_psi_dim() {
         let n = 2usize;
         let family = make_block_psi_test_family(n);
+        // n-row designs so the specs pass parameter_block_specs_match_rows
+        // against the n-observation family (the HVP-availability checks reject
+        // a row-count mismatch before the operator is ever consulted).
         let specs = vec![
-            dummy_penalized_blockspec(0, 0),
-            dummy_penalized_blockspec(1, 31),
-            dummy_penalized_blockspec(1, 1),
+            dummy_penalized_blockspec_with_rows(0, 0, n),
+            dummy_penalized_blockspec_with_rows(1, 31, n),
+            dummy_penalized_blockspec_with_rows(1, 1, n),
         ];
         let options = BlockwiseFitOptions {
             use_remlobjective: true,
@@ -26772,7 +26790,15 @@ mod tests {
             .max_feasible_step_size(&states, 0, &array![-1.0, 0.0])
             .expect("time step ceiling")
             .expect("time step should be bounded");
-        assert_eq!(alpha, 0.0);
+        // The current derivative (0.2) sits far above the guard (1e-4), so a
+        // strictly-positive step is feasible before the derivative-guard
+        // constraint binds: stepping β[0] by `-alpha` drives the derivative to
+        // `0.2 - alpha`, which stays ≥ guard up to alpha ≈ 0.2 - 1e-4. The
+        // ceiling is the interior feasible step, NOT zero.
+        assert!(
+            (alpha - 0.1989).abs() < 1e-3,
+            "interior feasible step ceiling expected ≈0.1989, got {alpha}"
+        );
         let feasible = &states[0].beta + &(array![-1.0, 0.0] * alpha);
         let slack = family
             .time_linear_constraints

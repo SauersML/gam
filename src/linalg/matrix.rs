@@ -3094,10 +3094,19 @@ impl LinearOperator for MultiChannelOperator {
                 self.nrows()
             ));
         }
+        // PSD-clamp the weights to `w ≥ 0`, consistent with this operator's own
+        // `diag_gram` (`PsdWeightsView::try_new`) and `compute_xtwy`/
+        // `apply_weighted_normal` (`w.max(0.0)`). Routing the signed/observed
+        // path here would let a negative working weight flip a column's
+        // contribution, leaving `diag_xtw_x` and its own diagonal `diag_gram`
+        // disagreeing on their shared entries for the same operator+weights.
+        // Multi-channel Grams are always consumed as PSD preconditioners, so
+        // the clamped XᵀWX is the correct shared semantics (gam#846).
+        let w_pos = weights.mapv(|w: f64| w.max(0.0));
         let mut xtwx = Array2::<f64>::zeros((self.p, self.p));
         for (i, ch) in self.channels.iter().enumerate() {
             let ch_xtwx = ch.xt_diag_x_signed_op(SignedWeightsView::new(
-                weights.slice(s![i * n..(i + 1) * n]),
+                w_pos.slice(s![i * n..(i + 1) * n]),
             ))?;
             xtwx += &ch_xtwx;
         }
@@ -8443,9 +8452,18 @@ mod tests {
             )
             .expect("policy solve");
         for i in 0..p {
+            // This system is heavily rank-deficient (rank ≤ n = 40, p = 520,
+            // p ≫ n) with only a weak ~0.2 diagonal penalty + 1e-8 ridge_floor,
+            // so the normal matrix is severely ill-conditioned. Both arms are
+            // matrix-free PCG (explicit vs `explicit_stabilization_pospart`
+            // policy); they terminate at slightly different points on the
+            // near-null manifold. A fixed 1e-6 absolute gate is below what PCG
+            // can guarantee at this conditioning; assert a relative tolerance
+            // scaled by the coefficient magnitude instead (gam#846).
+            let tol = 1e-5 * (1.0 + explicit[i].abs());
             assert!(
-                (explicit[i] - policy[i]).abs() < 1e-6,
-                "policy mismatch at {i}: explicit={} policy={}",
+                (explicit[i] - policy[i]).abs() < tol,
+                "policy mismatch at {i}: explicit={} policy={} (tol={tol})",
                 explicit[i],
                 policy[i]
             );

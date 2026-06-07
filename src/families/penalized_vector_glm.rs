@@ -351,10 +351,27 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         };
         // 30 doublings span ~9 orders of magnitude over the base ridge, which
         // covers any conditioning a finite-curvature softmax/binomial block can
-        // present; the loop almost always exits at ridge = 0 (well-posed H).
+        // present.
+        //
+        // The ridge floors at `base_ridge` (not 0) for every solve. An exactly
+        // rank-deficient block (e.g. duplicate / collinear design columns under
+        // a near-zero λ) leaves `H = block(XᵀWX) + diag_a(λ_a S)` singular along
+        // a null direction. faer's Bunch–Kaufman fallback factorizes a singular
+        // matrix "successfully" and back-substitutes through the zero pivot to a
+        // *finite but arbitrary* component in the null space, so the resulting
+        // Newton direction is not a descent direction in the identified
+        // subspace — the line search then shrinks α toward 0 and the step-norm
+        // test declares a false convergence at a point where the unridged
+        // penalized gradient on identified directions is still large (gam#856).
+        // A minimal Tikhonov ridge `base_ridge·I = max_diag·1e-10·I` resolves the
+        // null direction to its minimum-norm representative, giving a true
+        // descent direction. Because `base_ridge` is ~1e-10 of the dominant
+        // curvature, it is negligible relative to identified-direction curvature,
+        // so it never biases the identified optimum: at β̂ the unridged gradient
+        // still vanishes there.
         const MAX_RIDGE_ESCALATIONS: usize = 30;
         let mut delta = Array1::<f64>::zeros(beta_flat_dim);
-        let mut ridge = 0.0_f64;
+        let mut ridge = base_ridge;
         let mut solved = false;
         for attempt in 0..=MAX_RIDGE_ESCALATIONS {
             let mut ridged = hessian.clone();
@@ -456,7 +473,24 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
 
         let step_norm = step_norm_sq.sqrt();
         let beta_norm = beta_norm_sq.sqrt();
-        if step_norm <= tol * (1.0 + beta_norm) {
+        // First-order optimality gate (gam#856): the step-norm test alone can
+        // fire prematurely when a backtracking line search has shrunk α on a
+        // poor direction, leaving a point that is NOT stationary. `grad_flat`
+        // is the unridged penalized gradient ∇F(β) at the pre-step β; with a
+        // small step it is ≈ ∇F at the accepted β. Its norm reflects only
+        // identified directions (it is exactly zero along an unidentified null
+        // direction such as a duplicate-column e₁−e₂ split), so requiring it to
+        // be small certifies first-order optimality on the identified subspace
+        // without penalizing legitimate non-identifiability. Scale the gate by
+        // the data magnitude so it is invariant to problem scale.
+        let grad_norm = grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // Curvature-scaled optimality threshold: `max_diag` is the dominant
+        // penalized-Hessian diagonal entry, so `1e-6·max_diag` is a tiny
+        // gradient relative to the problem's curvature scale and is reached by
+        // a few quadratically-converging Newton steps on this smooth, bounded
+        // softmax/binomial likelihood.
+        let grad_optimal = grad_norm <= 1.0e-6 * (1.0 + max_diag);
+        if step_norm <= tol * (1.0 + beta_norm) && grad_optimal {
             converged = true;
             break;
         }
