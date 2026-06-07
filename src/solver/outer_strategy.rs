@@ -1958,6 +1958,19 @@ pub trait OuterObjective {
     /// propagate `Err`.
     fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError>;
 
+    /// Whether the objective can benefit from continuation pre-warm before
+    /// the first solver eval at a candidate seed.
+    ///
+    /// Pre-warm is only correct for objectives with a real writable inner
+    /// state slot: it evaluates an oversmoothed rho path before the seed and
+    /// forwards non-empty `inner_beta_hint`s between steps. Generic synthetic
+    /// objectives and rho-only cache probes must start at the chosen seed
+    /// directly, otherwise the pre-warm becomes an observable extra eval and
+    /// can clobber seed-dispatch bookkeeping with empty beta seeds.
+    fn allow_continuation_prewarm(&self) -> bool {
+        false
+    }
+
     /// Optional opt-in to the device-resident outer REML BFGS-over-ρ driver
     /// (`crate::solver::gpu::reml_outer::run_reml_outer_on_device`). Returns
     /// `Some(adm)` when the objective is a REML evaluator whose
@@ -2265,6 +2278,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         result
     }
 
+    fn allow_continuation_prewarm(&self) -> bool {
+        self.inner.allow_continuation_prewarm()
+    }
+
     fn reset(&mut self) {
         self.inner.reset();
     }
@@ -2377,6 +2394,10 @@ where
             // event or a silent continuation-walk degradation.
             None => Ok(SeedOutcome::NoSlot),
         }
+    }
+
+    fn allow_continuation_prewarm(&self) -> bool {
+        self.seed_fn.is_some()
     }
 
     fn reset(&mut self) {
@@ -5555,7 +5576,7 @@ fn run_outer_with_plan(
         // there would route straight into that error stub and reject every
         // seed, so skip it: the direct search starts from `seed` directly,
         // exactly as its dispatch (`Solver::CompassSearch` arm below) expects.
-        if the_plan.solver != Solver::CompassSearch {
+        if the_plan.solver != Solver::CompassSearch && obj.allow_continuation_prewarm() {
             let prewarm_start = std::time::Instant::now();
             match crate::solver::estimate::reml::continuation::prime_outer_seed(
                 obj,
