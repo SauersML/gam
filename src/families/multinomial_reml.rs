@@ -579,33 +579,56 @@ impl MultinomialFamily {
     /// contribution to entry `(a·P+i, a·P+i)` is the block-diagonal Fisher
     /// term `Σ_n w_n p_{n,a}(1 − p_{n,a}) X_{n,i}²`; the off-diagonal
     /// `−p_a p_b` blocks never reach the diagonal. This is bit-identical to
-    /// `assemble_joint_hessian(...).diag()` because [`dense_block_xtwx`]'s
-    /// symmetrisation pass only averages strictly off-diagonal entries.
+    /// `assemble_joint_hessian(...).diag()` because (a) the per-row
+    /// contribution `w · pa·(1−pa) · xi²` is built from the exact same
+    /// scalar product chain `((w·pa·(1−pa)) · xi) · xi` that
+    /// [`dense_block_xtwx`] flows through `scaled = wab · xi; acc += scaled · xj`
+    /// at `i==j`, (b) the row sums are reduced through the same rayon
+    /// `into_par_iter().fold(...).reduce(...)` partition tree, so the
+    /// floating-point associativity of the parallel chunking matches the
+    /// dense path bit-for-bit on identical input, and (c) the symmetrisation
+    /// pass only averages strictly off-diagonal entries. Departing from
+    /// (b) — e.g. a plain `for row in 0..n` serial loop here — would change
+    /// the reduction order and break the bit-identical contract whenever
+    /// rayon splits the dense path's row range into more than one chunk.
     fn hessian_diagonal_with_probs(&self, probs_full: ArrayView2<'_, f64>) -> Array1<f64> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let p = self.design.ncols();
         let m = self.active_classes();
         let n = self.weights.len();
-        let mut out = Array1::<f64>::zeros(m * p);
+        let dim = m * p;
         let design = self.design.view();
-        for row in 0..n {
-            let w = self.weights[row];
-            if w == 0.0 {
-                continue;
-            }
-            for a in 0..m {
-                let pa = probs_full[[row, a]];
-                let waa = w * pa * (1.0 - pa);
-                if waa == 0.0 {
-                    continue;
-                }
-                let base = a * p;
-                for i in 0..p {
-                    let xi = design[[row, i]];
-                    out[base + i] += waa * xi * xi;
-                }
-            }
-        }
-        out
+        (0..n)
+            .into_par_iter()
+            .fold(
+                || Array1::<f64>::zeros(dim),
+                |mut acc, row| {
+                    let w = self.weights[row];
+                    if w == 0.0 {
+                        return acc;
+                    }
+                    for a in 0..m {
+                        let pa = probs_full[[row, a]];
+                        let waa = w * pa * (1.0 - pa);
+                        if waa == 0.0 {
+                            continue;
+                        }
+                        let base = a * p;
+                        for i in 0..p {
+                            let xi = design[[row, i]];
+                            acc[base + i] += waa * xi * xi;
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || Array1::<f64>::zeros(dim),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            )
     }
 
     /// Directional derivative of the per-row Fisher block along a
