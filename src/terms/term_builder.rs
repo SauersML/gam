@@ -738,6 +738,27 @@ fn parse_numeric_expr(raw: &str) -> Result<f64, String> {
     Ok(acc)
 }
 
+/// Read an endpoint/period option as a numeric *expression* (`2*pi`, `tau`,
+/// `0.5*tau`, `6.283185307179586`, ...) — the same grammar that `period=` and
+/// `origin=` already accept via [`parse_numeric_expr`].
+///
+/// Returns `Ok(None)` when the key is absent, `Ok(Some(v))` when it parses, and
+/// a hard `Err` when the key is *present but unparseable*. The crucial contrast
+/// is with the lenient [`option_f64`], which collapses an unparseable value to
+/// `None` and lets the caller silently substitute the data range — wrapping a
+/// cyclic smooth at the wrong period with no diagnostic (the #815 failure mode).
+fn option_numeric_expr(
+    options: &BTreeMap<String, String>,
+    key: &str,
+) -> Result<Option<f64>, String> {
+    match options.get(key) {
+        None => Ok(None),
+        Some(raw) => parse_numeric_expr(raw)
+            .map(Some)
+            .map_err(|err| format!("option `{key}={raw}` is not a valid numeric value: {err}")),
+    }
+}
+
 fn parse_periods_option(
     options: &BTreeMap<String, String>,
     dim: usize,
@@ -2906,12 +2927,14 @@ pub fn parse_cyclic_boundary(
     if !cyclic {
         return Ok(OneDimensionalBoundary::Open);
     }
-    let start = option_f64(options, "period_start")
-        .or_else(|| option_f64(options, "start"))
-        .unwrap_or(minv);
-    let end = option_f64(options, "period_end")
-        .or_else(|| option_f64(options, "end"))
-        .unwrap_or(maxv);
+    let start = match option_numeric_expr(options, "period_start")? {
+        Some(v) => v,
+        None => option_numeric_expr(options, "start")?.unwrap_or(minv),
+    };
+    let end = match option_numeric_expr(options, "period_end")? {
+        Some(v) => v,
+        None => option_numeric_expr(options, "end")?.unwrap_or(maxv),
+    };
     if end <= start {
         return Err(format!(
             "cyclic smooth requires period_end/end ({end}) > period_start/start ({start})"
@@ -2931,12 +2954,14 @@ pub fn parse_periodic_domain_1d(
     minv: f64,
     maxv: f64,
 ) -> Result<(f64, f64), String> {
-    let start = option_f64(options, "period_start")
-        .or_else(|| option_f64(options, "start"))
-        .unwrap_or(minv);
-    let end = option_f64(options, "period_end")
-        .or_else(|| option_f64(options, "end"))
-        .unwrap_or(maxv);
+    let start = match option_numeric_expr(options, "period_start")? {
+        Some(v) => v,
+        None => option_numeric_expr(options, "start")?.unwrap_or(minv),
+    };
+    let end = match option_numeric_expr(options, "period_end")? {
+        Some(v) => v,
+        None => option_numeric_expr(options, "end")?.unwrap_or(maxv),
+    };
     if !(start.is_finite() && end.is_finite()) {
         return Err(format!(
             "periodic smooth domain requires finite endpoints, got ({start}, {end})"
