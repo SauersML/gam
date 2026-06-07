@@ -1611,16 +1611,11 @@ pub fn audit_identifiability_channel_aware(
     let ca_col_s2: Vec<f64> = {
         let p_total_ca = *col_offsets.last().unwrap_or(&0);
         let mut s2_vals: Vec<f64> = Vec::with_capacity(p_total_ca);
+        let mut w = Array1::<f64>::zeros(n * k);
         for op in operators.iter() {
-            let j_full = op.evaluate_full();
             let p_b = op.ncols();
             for c in 0..p_b {
-                let mut w = Array1::<f64>::zeros(n * k);
-                for i in 0..n {
-                    for ch in 0..k {
-                        w[i * k + ch] = j_full[[i, c, ch]];
-                    }
-                }
+                op.channel_flattened_column(c, w.as_slice_mut().expect("contiguous column buffer"));
                 s2_vals.push(compute_leverage_s2(&w.view()));
             }
         }
@@ -1892,15 +1887,10 @@ fn channel_aware_aliased_pairs(
     let mut col_norms: Vec<f64> = Vec::with_capacity(p_total);
     let mut col_s2: Vec<f64> = Vec::with_capacity(p_total);
     for op in operators.iter() {
-        let j_full = op.evaluate_full();
         let p_b = op.ncols();
         for c in 0..p_b {
             let mut w = Array1::<f64>::zeros(nk);
-            for i in 0..n {
-                for ch in 0..k {
-                    w[i * k + ch] = j_full[[i, c, ch]];
-                }
-            }
+            op.channel_flattened_column(c, w.as_slice_mut().expect("contiguous column buffer"));
             let norm = w.iter().map(|v| v * v).sum::<f64>().sqrt();
             let s2 = compute_leverage_s2(&w.view());
             cols.push(w);

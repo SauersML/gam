@@ -42,6 +42,43 @@ pub trait RowJacobianOperator: Send + Sync {
 
     /// Materialise the full operator as an `(n_rows × ncols × K)` tensor.
     fn evaluate_full(&self) -> Array3<f64>;
+
+    /// Write the channel-flattened column `col` — the `(n_rows · K)` vector
+    /// whose entry `i·K + ch` is `J[i, col, ch]` — into `out`.
+    ///
+    /// This is the representation the identifiability *audit* actually consumes
+    /// (per-column leverage statistics and pairwise overlaps), as opposed to the
+    /// dense `(n, p, K)` tensor. Requesting a column directly lets an operator
+    /// that has a structured / streaming form supply it without materialising
+    /// and cloning the whole `O(n·p·K)` tensor on every audit pass; the default
+    /// implementation routes through [`evaluate_full`] so existing operators
+    /// remain correct unchanged. (#738: a capability is not a representation —
+    /// the audit asks for the column view it needs, not the tensor.)
+    ///
+    /// [`evaluate_full`]: RowJacobianOperator::evaluate_full
+    fn channel_flattened_column(&self, col: usize, out: &mut [f64]) {
+        let k = self.k();
+        let n = self.nrows();
+        assert!(
+            col < self.ncols(),
+            "channel_flattened_column col {col} out of range {}",
+            self.ncols()
+        );
+        assert_eq!(
+            out.len(),
+            n * k,
+            "channel_flattened_column out length {} != n*k = {}*{}",
+            out.len(),
+            n,
+            k
+        );
+        let full = self.evaluate_full();
+        for i in 0..n {
+            for ch in 0..k {
+                out[i * k + ch] = full[[i, col, ch]];
+            }
+        }
+    }
 }
 
 /// Per-row `K × K` PSD Hessian of `−log L_i(u_i)` evaluated at a pilot β.
