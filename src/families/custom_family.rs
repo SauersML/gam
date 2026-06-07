@@ -13984,10 +13984,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let matrix_free_joint_requested = use_joint_matrix_free_path(total_joint_p, total_joint_n)
         || family.prefers_matrix_free_inner_joint(specs, &states);
     let has_workspace_source = family.inner_coefficient_hessian_hvp_available(specs);
+    // Probe the *spec-aware* joint Hessian: it is the canonical source of the
+    // coupled joint curvature. A family may override only
+    // `exact_newton_joint_hessian_with_specs` (the variant that has access to
+    // the realized block designs needed to assemble the cross-block
+    // `X_aᵀ diag(w_ab) X_b` blocks — e.g. the Dirichlet common-parameterization
+    // family, whose `evaluate` emits diagonal working sets so the spec-less
+    // default block assembler returns `None`). Routing the inner joint-Newton
+    // availability gate through the spec-less `exact_newton_joint_hessian`
+    // would then mis-classify such a family as "no joint Hessian" and drop it
+    // onto pure block-diagonal backfitting, which fails to reach KKT on small,
+    // concentrated coupled likelihoods. The `_with_specs` path subsumes the
+    // spec-less one for every family (single-block / uncoupled delegate
+    // identically), so it is the correct probe here.
     let has_joint_exacthessian = if has_workspace_source {
         true
     } else {
-        family.exact_newton_joint_hessian(&states)?.is_some()
+        family
+            .exact_newton_joint_hessian_with_specs(&states, specs)?
+            .is_some()
     };
     let coupled_exact_joint_required = specs.len() >= 2
         && !family.likelihood_blocks_uncoupled()
@@ -14513,7 +14528,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let joint_hessian_source = match joint_hessian_source {
                 Some(source) => source,
                 None => {
-                    let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
+                    // Spec-aware joint Hessian: canonical coupled-curvature
+                    // source (see the availability gate above). Families that
+                    // only override `_with_specs` (Dirichlet common-parameter)
+                    // would otherwise hand back `None` from the spec-less
+                    // default and silently drop off the joint-Newton path.
+                    let h_joint_opt =
+                        family.exact_newton_joint_hessian_with_specs(&states, specs)?;
                     let Some(h_joint) = h_joint_opt else {
                         break; // Fall back to blockwise if joint Hessian unavailable
                     };
@@ -17793,7 +17814,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     Some(g) => g,
                     None => break,
                 };
-            let h_joint_opt = family.exact_newton_joint_hessian(&states)?;
+            // Spec-aware joint Hessian: canonical coupled-curvature source
+            // (see the joint-Newton availability gate). Families overriding
+            // only `_with_specs` return `None` from the spec-less default.
+            let h_joint_opt = family.exact_newton_joint_hessian_with_specs(&states, specs)?;
             let Some(h_joint) = h_joint_opt else { break };
             let mut h_dense = match symmetrized_square_matrix(
                 h_joint,
