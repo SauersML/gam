@@ -519,6 +519,17 @@ struct SchemaCheckPayload {
 #[derive(Serialize)]
 struct PredictionPayload {
     columns: BTreeMap<String, Vec<f64>>,
+    /// Predictive-class discriminator (e.g. "standard", "transformation-normal",
+    /// "bernoulli marginal-slope"). The Python `shape_predict_response` dispatcher
+    /// reads this to pick the right shaper, exactly as the survival payload's
+    /// `model_class` does. Standard models historically omitted it, which broke
+    /// `Model.predict()` with `KeyError: 'model_class'` once the defensive
+    /// `parsed.get(...)` fallback was removed from the post-shim shaper (#866/#867).
+    model_class: String,
+    /// Inverse-link family kind tag (`identity`, `logit`, `probit`, `log`, ...).
+    /// The shaper consults it alongside `model_class` to disambiguate the
+    /// Bernoulli marginal-slope path from the survival marginal-slope variant.
+    family: String,
 }
 
 /// JSON wire format for NUTS posterior draws.
@@ -25378,8 +25389,12 @@ fn predict_dataset_impl(
         return predict_table_survival(model, &dataset, &options);
     }
     let columns = predict_columns(model, dataset, &options)?;
-    serde_json::to_string(&PredictionPayload { columns })
-        .map_err(|err| format!("failed to serialize prediction payload: {err}"))
+    serde_json::to_string(&PredictionPayload {
+        columns,
+        model_class: prediction_model_class_label(model),
+        family: family_link_kind(&model_likelihood_spec(model)).to_string(),
+    })
+    .map_err(|err| format!("failed to serialize prediction payload: {err}"))
 }
 
 fn predict_columns(
@@ -25744,8 +25759,12 @@ fn predict_table_conformal_impl(
     drop(calibration_rows);
     drop(calibration_headers);
     let columns = predict_columns_conformal(&model, dataset, calibration, &options)?;
-    serde_json::to_string(&PredictionPayload { columns })
-        .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
+    serde_json::to_string(&PredictionPayload {
+        columns,
+        model_class: prediction_model_class_label(&model),
+        family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
+    })
+    .map_err(|err| format!("failed to serialize conformal prediction payload: {err}"))
 }
 
 fn columns_to_array(columns: BTreeMap<String, Vec<f64>>) -> Result<Array2<f64>, String> {
