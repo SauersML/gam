@@ -12,7 +12,18 @@ def test_sae_assignment_mode_and_schedule_survive_python_to_rust_bridge(monkeypa
             captured["tau"] = tau
             captured["gumbel_schedule"] = dict(gumbel_schedule or {})
             atoms = [{"decoder_B": np.ones((2, z.shape[1])), "basis_kind": atom_basis[0], "on_atom_coords_t": np.zeros((z.shape[0], atom_dim[0])), "assignments_z": np.ones(z.shape[0]), "active_dim": atom_dim[0]}]
-            return {"atoms": atoms, "assignments_z": np.ones((z.shape[0], 1)), "fitted": np.zeros_like(z), "reml_score": -1.0}
+            return {
+                "atoms": atoms,
+                "atom_plans": [{"kind": str(atom_basis[0]), "latent_dim": int(atom_dim[0]), "basis_size": 2, "n_harmonics": 0, "duchon_centers": None}],
+                "assignments_z": np.ones((z.shape[0], 1)),
+                "logits": np.zeros((z.shape[0], 1)),
+                "fitted": np.zeros_like(z),
+                "reml_score": -1.0,
+                "chosen_k": 1,
+                "dispersion": 1.0,
+                "oos_projection_top1": False,
+                "diagnostics": _diagnostics(1, z.shape[0]),
+            }
 
         def sae_manifold_reconstruction_r2(self, observed, fitted):
             return 0.0
@@ -24,3 +35,32 @@ def test_sae_assignment_mode_and_schedule_survive_python_to_rust_bridge(monkeypa
 
     assert captured["assignment_kind"] == "jumprelu", "Python AssignmentMode 'gated' should map to Rust AssignmentMode::JumpReLU, not any other mode."
     assert captured["tau"] == 0.7 and captured["gumbel_schedule"] == schedule.to_rust_descriptor(), "Temperature scalar and schedule descriptor should survive the Python-to-Rust FFI bridge unchanged."
+
+
+def _diagnostics(k_atoms: int, n_obs: int) -> dict[str, object]:
+    return {
+        "atom_trust": np.ones(k_atoms, dtype=float),
+        "atoms": [
+            {
+                "trust_score": 1.0,
+                "sigma_min_tangent": 1.0,
+                "sigma_max_tangent": 1.0,
+                "tangent_condition_score": 1.0,
+                "mean_neighbor_coherence": 0.0,
+                "coherence_score": 1.0,
+                "topology_evidence_margin": 0.0,
+                "topology_margin_score": 0.5,
+                "coverage": 1.0,
+                "activation_frequency": 1.0,
+                "coverage_score": 1.0,
+                "typed_reconstruction_mse": 0.0,
+                "level0_reference_mse": 0.0,
+                "level0_residual_ratio": 1.0,
+                "level0_score": 1.0,
+                "untyped": False,
+                "active_token_count": int(n_obs),
+            }
+            for _ in range(k_atoms)
+        ],
+        "level0_test": "test",
+    }

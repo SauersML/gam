@@ -360,18 +360,18 @@ class ManifoldSAE:
 
     @classmethod
     def from_payload(cls, x: np.ndarray, payload: Mapping[str, Any], topology: str, assignment: str, penalties: list[str], alpha: float = 1.0, learnable_alpha: bool = False, *, assignment_label: str | None = None, tau: float = 0.5, sparsity_strength: float = 1.0, smoothness: float = 1.0, learning_rate: float = 0.04, max_iter: int = 50, random_state: int = 0, top_k: int | None = None, jumprelu_threshold: float = 0.0) -> "ManifoldSAE":
-        plans = list(payload.get("atom_plans", []))
+        plans = list(payload["atom_plans"])
         def _opt_arr(atom: Mapping[str, Any], key: str) -> np.ndarray | None:
             value = atom.get(key)
             return None if value is None else np.asarray(value, dtype=float)
 
         atoms = [SaeManifoldAtomFit(
-            basis=str(atom.get("basis_kind", "")),
+            basis=str(atom["basis_kind"]),
             decoder_coefficients=np.asarray(atom["decoder_B"], dtype=float),
             assignments=np.asarray(atom["assignments_z"], dtype=float),
             coords=np.asarray(atom["on_atom_coords_t"], dtype=float),
             evidence=float(payload["reml_score"]),
-            active_dim=int(atom.get("active_dim", 0)),
+            active_dim=int(atom["active_dim"]),
             decoder_covariance=_opt_arr(atom, "decoder_covariance"),
             shape_band_coords=_opt_arr(atom, "shape_band_coords"),
             shape_band_mean=_opt_arr(atom, "shape_band_mean"),
@@ -380,21 +380,19 @@ class ManifoldSAE:
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments_z"], dtype=float)
         logits = np.asarray(payload["logits"], dtype=float)
-        diagnostics = coerce_sae_trust_diagnostics(
-            payload,
-            n_atoms=len(atoms),
-            assignments=assigns,
-            logits=logits,
-        )
+        diagnostics = coerce_sae_trust_diagnostics(payload)
         coords = [atom.coords.copy() for atom in atoms]
         score = float(payload["reml_score"])
-        chosen_k = int(payload["chosen_k"]) if "chosen_k" in payload else len(atoms)
+        chosen_k = int(payload["chosen_k"])
         low = SaeManifoldFitResult(atoms, chosen_k, {chosen_k: score}, {"winner": f"K={chosen_k}"}, fitted, assigns, coords, score)
-        kinds = [str(p.get("kind", atoms[i].basis)) for i, p in enumerate(plans)] if plans else [a.basis for a in atoms]
-        dims = [int(p.get("latent_dim", 0)) for p in plans] if plans else [a.coords.shape[1] if a.coords.ndim == 2 else 0 for a in atoms]
-        sizes = [int(p.get("basis_size", 0)) for p in plans] if plans else [int(a.decoder_coefficients.shape[0]) for a in atoms]
-        nharm = [int(p.get("n_harmonics", 0)) for p in plans] if plans else [0 for _ in atoms]
-        centers: list[np.ndarray | None] = [(None if p.get("duchon_centers") is None else np.asarray(p["duchon_centers"], dtype=float)) for p in plans] if plans else [None for _ in atoms]
+        kinds = [str(p["kind"]) for p in plans]
+        dims = [int(p["latent_dim"]) for p in plans]
+        sizes = [int(p["basis_size"]) for p in plans]
+        nharm = [int(p["n_harmonics"]) for p in plans]
+        centers: list[np.ndarray | None] = [
+            None if p["duchon_centers"] is None else np.asarray(p["duchon_centers"], dtype=float)
+            for p in plans
+        ]
         canonical = _canonical_assignment(assignment, "assignment")
         return cls(
             atoms=atoms, atom_topology=str(topology),
@@ -411,14 +409,14 @@ class ManifoldSAE:
             diagnostics=diagnostics,
             _basis_kinds=kinds, _atom_dims=dims, _basis_sizes=sizes,
             _n_harmonics=nharm, _duchon_centers=centers,
-            _oos_projection_top1=bool(payload.get("oos_projection_top1", False)),
+            _oos_projection_top1=bool(payload["oos_projection_top1"]),
             alpha=float(alpha), learnable_alpha=bool(learnable_alpha),
             tau=float(tau), sparsity_strength=float(sparsity_strength),
             smoothness=float(smoothness), learning_rate=float(learning_rate),
             max_iter=int(max_iter), random_state=int(random_state),
             top_k=None if top_k is None else int(top_k),
             jumprelu_threshold=float(jumprelu_threshold),
-            dispersion=float(payload.get("dispersion", 1.0)),
+            dispersion=float(payload["dispersion"]),
         )
 
     def _periodic_top1_projection_payload(self, x: np.ndarray) -> dict[str, Any]:
@@ -854,8 +852,8 @@ class ManifoldSAE:
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "ManifoldSAE":
-        schema = str(payload.get("schema", ""))
-        if schema and schema != "gamfit.ManifoldSAE/v1":
+        schema = str(payload["schema"])
+        if schema != "gamfit.ManifoldSAE/v1":
             raise ValueError(f"ManifoldSAE.from_dict: unsupported schema {schema!r}")
         def _optional_array(atom_payload: Mapping[str, Any], key: str) -> np.ndarray | None:
             value = atom_payload.get(key)
@@ -879,12 +877,7 @@ class ManifoldSAE:
         fitted = np.asarray(payload["fitted"], dtype=float)
         assigns = np.asarray(payload["assignments"], dtype=float)
         logits = np.asarray(payload["logits"], dtype=float)
-        diagnostics = coerce_sae_trust_diagnostics(
-            payload,
-            n_atoms=len(atoms),
-            assignments=assigns,
-            logits=logits,
-        )
+        diagnostics = coerce_sae_trust_diagnostics(payload)
         coords = [np.asarray(c, dtype=float) for c in payload["coords"]]
         decoder_blocks = [np.asarray(b, dtype=float) for b in payload["decoder_blocks"]]
         score = float(payload["reml_score"])
@@ -902,7 +895,7 @@ class ManifoldSAE:
             atom_topology=str(payload["atom_topology"]),
             atom_topologies=list(payload["atom_topologies"]),
             assignment=canonical_assignment,
-            assignment_label=str(payload.get("assignment_label", raw_assignment)),
+            assignment_label=str(payload["assignment_label"]),
             primitive_names=list(payload["primitive_names"]),
             fitted=fitted,
             assignments=assigns,
@@ -921,18 +914,18 @@ class ManifoldSAE:
             _basis_sizes=[int(s) for s in payload["basis_sizes"]],
             _n_harmonics=[int(h) for h in payload["n_harmonics"]],
             _duchon_centers=centers,
-            alpha=float(payload.get("alpha", 1.0)),
-            learnable_alpha=bool(payload.get("learnable_alpha", False)),
+            alpha=float(payload["alpha"]),
+            learnable_alpha=bool(payload["learnable_alpha"]),
             tau=float(payload["tau"]),
             sparsity_strength=float(payload["sparsity_strength"]),
             smoothness=float(payload["smoothness"]),
             learning_rate=float(payload["learning_rate"]),
             max_iter=int(payload["max_iter"]),
             random_state=int(payload["random_state"]),
-            top_k=None if payload.get("top_k") is None else int(payload["top_k"]),
-            jumprelu_threshold=float(payload.get("jumprelu_threshold", 0.0)),
-            _oos_projection_top1=bool(payload.get("oos_projection_top1", False)),
-            dispersion=float(payload.get("dispersion", 1.0)),
+            top_k=None if payload["top_k"] is None else int(payload["top_k"]),
+            jumprelu_threshold=float(payload["jumprelu_threshold"]),
+            _oos_projection_top1=bool(payload["oos_projection_top1"]),
+            dispersion=float(payload["dispersion"]),
         )
 
     @classmethod

@@ -35,10 +35,6 @@ _ATOM_DIAGNOSTIC_KEYS = (
 
 def coerce_sae_trust_diagnostics(
     payload: Mapping[str, Any],
-    *,
-    n_atoms: int | None = None,
-    assignments: Any | None = None,
-    logits: Any | None = None,
 ) -> dict[str, Any]:
     """Validate and normalize the ``payload["diagnostics"]`` trust block.
 
@@ -57,11 +53,8 @@ def coerce_sae_trust_diagnostics(
         trust diagnostic schema.
     """
     if "diagnostics" not in payload:
-        return _default_sae_trust_diagnostics(
-            payload,
-            n_atoms=n_atoms,
-            assignments=assignments,
-            logits=logits,
+        raise ValueError(
+            "SAE fit payload is missing diagnostics; refit with the current Rust runtime"
         )
 
     diagnostics = dict(payload["diagnostics"])
@@ -136,96 +129,6 @@ def atom_trust_scores(diagnostics: Mapping[str, Any]) -> np.ndarray:
     if trust.ndim != 1:
         raise ValueError(f"atom_trust must be 1D; got shape {trust.shape}")
     return trust.copy()
-
-
-def _default_sae_trust_diagnostics(
-    payload: Mapping[str, Any],
-    *,
-    n_atoms: int | None,
-    assignments: Any | None,
-    logits: Any | None,
-) -> dict[str, Any]:
-    """Construct conservative diagnostics for older Rust payloads.
-
-    Missing diagnostics mean the fit did not run the trust-score pipeline.
-    We still return the public schema so callers can inspect the fit, but all
-    unknown accuracy terms are marked untrusted rather than inferred.
-    """
-
-    inferred_atoms = _infer_atom_count(payload, n_atoms, assignments, logits)
-    assigns = _assignment_matrix(payload, assignments, inferred_atoms)
-    if assigns is None:
-        coverage = np.zeros(inferred_atoms, dtype=float)
-        active_counts = np.zeros(inferred_atoms, dtype=int)
-    else:
-        active = np.asarray(assigns, dtype=float) > 1.0e-9
-        coverage = active.mean(axis=0) if active.size else np.zeros(inferred_atoms)
-        active_counts = active.sum(axis=0).astype(int) if active.size else np.zeros(inferred_atoms, dtype=int)
-
-    atoms: list[dict[str, Any]] = []
-    for atom_idx in range(inferred_atoms):
-        cov = float(coverage[atom_idx]) if atom_idx < coverage.shape[0] else 0.0
-        count = int(active_counts[atom_idx]) if atom_idx < active_counts.shape[0] else 0
-        atoms.append({
-            "trust_score": 0.0,
-            "sigma_min_tangent": 0.0,
-            "sigma_max_tangent": 0.0,
-            "tangent_condition_score": 0.0,
-            "mean_neighbor_coherence": 1.0,
-            "coherence_score": 0.0,
-            "topology_evidence_margin": 0.0,
-            "topology_margin_score": 0.0,
-            "coverage": cov,
-            "activation_frequency": cov,
-            "coverage_score": cov,
-            "typed_reconstruction_mse": 0.0,
-            "level0_reference_mse": 0.0,
-            "level0_residual_ratio": float("inf"),
-            "level0_score": 0.0,
-            "untyped": True,
-            "active_token_count": count,
-        })
-    return {
-        "atom_trust": np.zeros(inferred_atoms, dtype=float),
-        "atoms": atoms,
-        "level0_test": "not_run",
-    }
-
-
-def _infer_atom_count(
-    payload: Mapping[str, Any],
-    n_atoms: int | None,
-    assignments: Any | None,
-    logits: Any | None,
-) -> int:
-    if n_atoms is not None:
-        return int(n_atoms)
-    atoms = payload.get("atoms")
-    if atoms is not None:
-        return len(atoms)
-    for value in (assignments, logits, payload.get("assignments_z"), payload.get("assignments")):
-        if value is None:
-            continue
-        arr = np.asarray(value)
-        if arr.ndim == 2:
-            return int(arr.shape[1])
-    return 0
-
-
-def _assignment_matrix(
-    payload: Mapping[str, Any],
-    assignments: Any | None,
-    n_atoms: int,
-) -> np.ndarray | None:
-    value = assignments
-    if value is None:
-        value = payload.get("assignments_z", payload.get("assignments"))
-    if value is None:
-        return None
-    arr = np.asarray(value, dtype=float)
-    if arr.ndim != 2 or arr.shape[1] != int(n_atoms):
-        return None
-    return arr
 
 
 __all__ = [
