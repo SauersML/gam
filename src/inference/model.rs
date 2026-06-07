@@ -10,7 +10,8 @@ use crate::families::survival_construction::{
 };
 use crate::families::survival_location_scale::ResidualDistribution;
 use crate::inference::formula_dsl::{
-    inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message,
+    inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
+    parse_surv_response, parsed_term_column_names,
 };
 use crate::inference::predict::{
     BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
@@ -2496,6 +2497,104 @@ impl FittedModel {
     #[inline]
     pub fn likelihood(&self) -> LikelihoodSpec {
         self.payload().family_state.likelihood()
+    }
+
+    /// Columns this model consumes from a prediction frame — its *input
+    /// contract*.
+    ///
+    /// Every variable named by the main formula (features, interaction margins,
+    /// random-effect groups, and a smooth's `by=` column), the survival
+    /// entry/exit columns or the transformation-normal response, the auxiliary
+    /// noise / logslope formula columns, and the offset / noise-offset /
+    /// latent-`z` columns. The event-indicator and the plain response of a
+    /// standard model are deliberately excluded: they are not needed to *form*
+    /// a prediction (the conformal-calibration fold layers the response back on
+    /// separately).
+    ///
+    /// This is the single authority shared by the CLI and PyFFI predict paths.
+    /// A prediction frame column that is *not* in this set is irrelevant to the
+    /// model and must be ignored rather than strict-encoded against the
+    /// training schema — otherwise an unrelated ID/label column with a held-out
+    /// categorical level aborts predict (#840).
+    pub fn prediction_required_columns(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let payload = self.payload();
+        let parsed = parse_formula(payload.formula.as_str()).map_err(|e| e.to_string())?;
+        let mut required = std::collections::BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut required);
+
+        if let Some((entry, exit, _event)) =
+            parse_surv_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            if let Some(entry) = entry {
+                required.insert(entry);
+            }
+            required.insert(exit);
+        } else if matches!(
+            self.predict_model_class(),
+            PredictModelClass::TransformationNormal
+        ) {
+            let response = parsed.response.trim();
+            if !response.is_empty() && !response.starts_with("Surv(") {
+                required.insert(response.to_string());
+            }
+        }
+
+        if let Some(offset) = payload.offset_column.as_ref() {
+            required.insert(offset.clone());
+        }
+        if let Some(noise_offset) = payload.noise_offset_column.as_ref() {
+            required.insert(noise_offset.clone());
+        }
+        if matches!(
+            self.predict_model_class(),
+            PredictModelClass::BernoulliMarginalSlope | PredictModelClass::Survival
+        ) {
+            if let Some(z_column) = payload.z_column.as_ref() {
+                required.remove("z");
+                required.insert(z_column.clone());
+            }
+        }
+        if let Some(noise_formula) = payload.formula_noise.as_ref() {
+            self.add_auxiliary_formula_columns(
+                &mut required,
+                noise_formula,
+                parsed.response.as_str(),
+            )?;
+        }
+        if let Some(logslope_formula) = payload.formula_logslope.as_ref() {
+            if logslope_formula != "same-as-main" {
+                self.add_auxiliary_formula_columns(
+                    &mut required,
+                    logslope_formula,
+                    parsed.response.as_str(),
+                )?;
+            }
+        }
+        Ok(required)
+    }
+
+    /// Add the columns referenced by an auxiliary (noise / logslope) formula,
+    /// which may be supplied as a full `lhs ~ rhs` formula or as a bare RHS.
+    fn add_auxiliary_formula_columns(
+        &self,
+        required: &mut std::collections::BTreeSet<String>,
+        formula_or_rhs: &str,
+        response: &str,
+    ) -> Result<(), String> {
+        let trimmed = formula_or_rhs.trim();
+        if trimmed.is_empty() || trimmed == "1" {
+            return Ok(());
+        }
+        let formula = if trimmed.contains('~') {
+            trimmed.to_string()
+        } else {
+            format!("{response} ~ {trimmed}")
+        };
+        let parsed = parse_formula(formula.as_str()).map_err(|e| e.to_string())?;
+        parsed_term_column_names(&parsed.terms, required);
+        Ok(())
     }
 
     #[inline]

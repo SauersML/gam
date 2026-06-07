@@ -29,12 +29,12 @@ use gam::hmc::NutsConfig;
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy,
     load_dataset_projected as load_dataset_auto_projected,
-    load_datasetwith_schema as load_dataset_auto_with_schema,
+    load_datasetwith_schema_projected as load_dataset_auto_with_schema_projected,
 };
 use gam::inference::formula_dsl::{
     LinkChoice, LinkFormulaSpec, LinkMode, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm,
     effectivelinkwiggle_formulaspec, formula_rhs_text, parse_formula, parse_link_choice,
-    parse_matching_auxiliary_formula, parse_surv_response,
+    parse_matching_auxiliary_formula, parse_surv_response, parsed_term_column_names,
     require_inverse_link_supports_joint_wiggle, require_likelihood_spec_supports_joint_wiggle,
     require_linkchoice_supports_joint_wiggle, validate_auxiliary_formula_controls,
     validate_marginal_slope_z_column_exclusion,
@@ -8033,37 +8033,11 @@ fn set_saved_offset_columns(
 }
 
 fn collect_term_column_names(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
-    for term in terms {
-        match term {
-            ParsedTerm::Linear { name, .. }
-            | ParsedTerm::BoundedLinear { name, .. }
-            | ParsedTerm::RandomEffect { name } => {
-                out.insert(name.clone());
-            }
-            ParsedTerm::Smooth { vars, options, .. } => {
-                out.extend(vars.iter().cloned());
-                // A `by=` smooth (`s(x, by=g)`, factor or numeric varying
-                // coefficient) consumes the grouping/scaling variable from
-                // `options["by"]` (see `term_builder.rs` `options.get("by")`),
-                // but it is not among the positional `vars`. It must still be
-                // loaded from the data file, so list it as required.
-                if let Some(by) = options.get("by") {
-                    out.insert(by.clone());
-                }
-            }
-            ParsedTerm::Interaction { vars } => {
-                out.extend(vars.iter().cloned());
-            }
-            ParsedTerm::LinkWiggle { .. }
-            | ParsedTerm::TimeWiggle { .. }
-            | ParsedTerm::LinkConfig { .. }
-            | ParsedTerm::SurvivalConfig { .. } => {}
-            ParsedTerm::LogSlopeSurface { z_column, terms } => {
-                out.insert(z_column.clone());
-                collect_term_column_names(terms, out);
-            }
-        }
-    }
+    // Delegate to the single shared authority on the formula→columns walk
+    // (`s(x, by=g)`'s `by` column is included there) so the fit-time required
+    // columns, the predict-time required columns, and the PyFFI surface all
+    // agree.
+    parsed_term_column_names(terms, out);
 }
 
 fn required_columns_for_formula(parsed: &ParsedFormula) -> Result<Vec<String>, String> {
@@ -8183,7 +8157,18 @@ fn load_datasetwith_model_schema(path: &Path, model: &SavedModel) -> Result<Data
     let schema = model.require_data_schema()?;
     let policy =
         UnseenCategoryPolicy::encode_unknown_for_columns(model.random_effect_group_columns());
-    load_dataset_auto_with_schema(path, schema, policy).map_err(String::from)
+    // Load only the columns the model references. A prediction file commonly
+    // carries extra ID / label / grouping columns the formula never names;
+    // encoding those against the training schema would strict-validate an
+    // unrelated categorical and abort predict on a held-out level (#840). The
+    // projected loader selects just the model's input columns (erroring only
+    // when a genuinely required one is absent) and ignores the rest, matching
+    // mgcv / glm semantics — and the PyFFI predict path.
+    let requested: Vec<String> = model
+        .prediction_required_columns()?
+        .into_iter()
+        .collect::<Vec<_>>();
+    load_dataset_auto_with_schema_projected(path, schema, policy, &requested).map_err(String::from)
 }
 
 /// Canonical family name for a CLI `--family` selection.

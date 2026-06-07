@@ -737,10 +737,36 @@ fn parse_call_pair(call: Pair<'_, Rule>) -> Result<FunctionCallSpec, String> {
 mod tests {
     use super::{
         CallArgSpec, ParsedTerm, parse_formula, parse_formula_dsl, parse_function_call,
-        parse_linkwiggle_formulaspec, parsed_terms_reference_column,
+        parse_linkwiggle_formulaspec, parsed_term_column_names, parsed_terms_reference_column,
         validate_marginal_slope_z_column_exclusion,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn parsed_term_column_names_includes_by_smooth_grouping_variable() {
+        // The model's input contract must include a smooth's `by=` column, not
+        // just its positional variable. `s(x, by=g)` consumes both `x` and `g`
+        // (`term_builder` reads `options["by"]`); dropping `g` from the
+        // required/consumable set would either omit a genuine predictor at fit
+        // (CLI projected load) or — worse — make predict silently project the
+        // `g` column away (#840 regression). A bare main effect and an
+        // interaction round out the variant coverage.
+        let parsed =
+            parse_formula("y ~ s(x, by=g) + z + a:b").expect("formula with a by= smooth parses");
+        let mut cols = BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut cols);
+        for expected in ["x", "g", "z", "a", "b"] {
+            assert!(
+                cols.contains(expected),
+                "parsed_term_column_names dropped '{expected}'; got {cols:?}"
+            );
+        }
+        // The response is never a *term* column (it is handled separately).
+        assert!(
+            !cols.contains("y"),
+            "response leaked into term columns: {cols:?}"
+        );
+    }
 
     #[test]
     fn linkwiggle_parser_does_not_bake_in_cubic_only_restriction() {
@@ -1159,6 +1185,46 @@ pub enum ParsedTerm {
     Interaction {
         vars: Vec<String>,
     },
+}
+
+/// Collect the names of every data column the parsed terms consume.
+///
+/// This is the canonical formula→columns walk shared by the fit-time and
+/// predict-time required-column computations (the CLI and PyFFI surfaces both
+/// route through it). It includes a smooth's positional `vars` *and* its `by=`
+/// grouping/scaling column (`s(x, by=g)`), which `term_builder` reads from
+/// `options["by"]` but which is not among the positional variables — omitting
+/// it would drop a genuine predictor from the model's input contract.
+pub fn parsed_term_column_names(
+    terms: &[ParsedTerm],
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    for term in terms {
+        match term {
+            ParsedTerm::Linear { name, .. }
+            | ParsedTerm::BoundedLinear { name, .. }
+            | ParsedTerm::RandomEffect { name } => {
+                out.insert(name.clone());
+            }
+            ParsedTerm::Smooth { vars, options, .. } => {
+                out.extend(vars.iter().cloned());
+                if let Some(by) = options.get("by") {
+                    out.insert(by.clone());
+                }
+            }
+            ParsedTerm::Interaction { vars } => {
+                out.extend(vars.iter().cloned());
+            }
+            ParsedTerm::LinkWiggle { .. }
+            | ParsedTerm::TimeWiggle { .. }
+            | ParsedTerm::LinkConfig { .. }
+            | ParsedTerm::SurvivalConfig { .. } => {}
+            ParsedTerm::LogSlopeSurface { z_column, terms } => {
+                out.insert(z_column.clone());
+                parsed_term_column_names(terms, out);
+            }
+        }
+    }
 }
 
 pub fn parsed_terms_reference_column(terms: &[ParsedTerm], column_name: &str) -> bool {

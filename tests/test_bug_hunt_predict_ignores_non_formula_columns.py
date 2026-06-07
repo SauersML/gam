@@ -162,3 +162,43 @@ def test_used_categorical_column_unseen_level_still_handled() -> None:
         "unseen random-effect level should map to the prior-mean effect, "
         "not produce NaN or an error"
     )
+
+
+def test_by_smooth_grouping_column_is_not_dropped() -> None:
+    """A smooth's ``by=`` column is part of the input contract and must survive.
+
+    ``s(x, by=w)`` is a varying-coefficient smooth: its contribution scales with
+    ``w``. The ``by`` variable is read from the term options, not the positional
+    smooth variables, so a naive "formula columns = positional vars" projection
+    would silently drop ``w`` — making predict either error (column gone) or
+    ignore a genuine predictor. This guards that the shared
+    ``prediction_required_columns`` keeps ``by`` columns while still ignoring
+    unrelated ones.
+    """
+    rng = np.random.RandomState(7)
+    n = 200
+    x = rng.uniform(0.0, 1.0, n)
+    w = rng.uniform(0.5, 2.0, n)
+    y = np.sin(3.0 * x) * w + 0.05 * rng.randn(n)
+    train = pd.DataFrame({"x": x, "w": w, "y": y})
+    model = gamfit.fit(train, "y ~ s(x, by=w)")
+
+    grid_x = np.linspace(0.1, 0.9, 10)
+    low = pd.DataFrame({"x": grid_x, "w": np.full_like(grid_x, 0.6)})
+    high = pd.DataFrame({"x": grid_x, "w": np.full_like(grid_x, 1.8)})
+    # The by-variable genuinely drives the prediction, so different w => different
+    # means. If the projection had dropped w, these would be identical.
+    assert not np.allclose(_mean(model.predict(low)), _mean(model.predict(high))), (
+        "by= column 'w' appears to have been ignored at predict"
+    )
+
+    # An unrelated extra column is still dropped; predictions are unaffected.
+    base = _mean(model.predict(high))
+    high_extra = high.copy()
+    high_extra["label"] = ["aa"] * len(high)  # never seen, never in formula
+    np.testing.assert_allclose(_mean(model.predict(high_extra)), base, atol=1e-12)
+
+    # Dropping the required by-column must error, not silently ignore it.
+    with pytest.raises(Exception) as excinfo:
+        model.predict(pd.DataFrame({"x": grid_x}))
+    assert "w" in str(excinfo.value)
