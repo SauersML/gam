@@ -3,9 +3,10 @@ use crate::cache::Fingerprinter;
 use crate::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
+use crate::faer_ndarray::array2_to_matmut;
 use crate::linalg::sparse_exact::build_sparse_penalty_blocks_from_canonical;
 use crate::linalg::utils::{
-    boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
+    StableSolver, boundary_hit_indices, enforce_symmetry, symmetric_spectrum_condition_number,
 };
 use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use crate::pirls::PirlsWorkspace;
@@ -127,6 +128,10 @@ const ALO_EDF_FRACTION_SATURATION: f64 = 0.70;
 // outlier cluster produces yet far below the pervasive activation a saturated
 // `te()` basis exhibits.
 const ALO_PERVASIVE_LEVERAGE_FRACTION: f64 = 0.25;
+// Suppress ALO when every ALO-triggering row is already high-leverage in the
+// exact pure-parametric subdesign. Those directions are unpenalized, so no
+// smoothness-parameter move can clear the leverage barrier (#862).
+const ALO_PARAMETRIC_LEVERAGE_SHARE: f64 = 0.75;
 // Activation gate on the leave-one-out denominator (1 - h). 0.20 means we only
 // engage once some observation's LOO predictor is amplified by >5×; below that
 // the correction is negligible and we preserve the unstabilized objective.
@@ -9300,6 +9305,9 @@ impl<'a> RemlState<'a> {
         {
             return Ok(None);
         }
+        if self.high_leverage_is_pure_parametric(&alo.leverage, bundle.pirls_result.as_ref())? {
+            return Ok(None);
+        }
 
         // Pervasiveness guard. The stabilizer is designed for a *minority* of
         // genuinely influential rows on an identified design; there the leverage
@@ -9444,6 +9452,119 @@ impl<'a> RemlState<'a> {
         }))
     }
 
+    fn high_leverage_is_pure_parametric(
+        &self,
+        alo_leverage: &Array1<f64>,
+        pirls_result: &PirlsResult,
+    ) -> Result<bool, EstimationError> {
+        let pure_parametric_cols = self.pure_parametric_column_indices();
+        if pure_parametric_cols.len() <= 1 {
+            return Ok(false);
+        }
+        let high_rows: Vec<usize> = alo_leverage
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &h)| (h > ALO_MAX_LEVERAGE_THRESHOLD).then_some(idx))
+            .collect();
+        if high_rows.is_empty() {
+            return Ok(false);
+        }
+        let parametric_leverage =
+            self.pure_parametric_projection_leverage(&pure_parametric_cols, pirls_result)?;
+        let all_high_rows_parametric = high_rows.iter().all(|&idx| {
+            let h = alo_leverage[idx];
+            let hp = parametric_leverage[idx];
+            hp >= ALO_MAX_LEVERAGE_THRESHOLD && hp >= ALO_PARAMETRIC_LEVERAGE_SHARE * h
+        });
+        if all_high_rows_parametric {
+            log::info!(
+                "[ALO-STABILIZED-REML] suppressed: {} high-leverage rows are explained by {} pure-parametric columns",
+                high_rows.len(),
+                pure_parametric_cols.len(),
+            );
+        }
+        Ok(all_high_rows_parametric)
+    }
+
+    fn pure_parametric_column_indices(&self) -> Vec<usize> {
+        let mut covered_by_penalty = vec![false; self.p];
+        for penalty in self.canonical_penalties.iter() {
+            for col in penalty.col_range.clone() {
+                if col < self.p {
+                    covered_by_penalty[col] = true;
+                }
+            }
+        }
+        covered_by_penalty
+            .iter()
+            .enumerate()
+            .filter_map(|(col, &covered)| (!covered).then_some(col))
+            .collect()
+    }
+
+    fn pure_parametric_projection_leverage(
+        &self,
+        cols: &[usize],
+        pirls_result: &PirlsResult,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let x_dense = match self
+            .x
+            .try_to_dense_arc("ALO pure-parametric activation gate requires dense design")
+        {
+            Ok(x_dense) => x_dense,
+            Err(reason) => {
+                log::debug!("[ALO-STABILIZED-REML] pure-parametric gate skipped: {reason}");
+                return Ok(Array1::<f64>::zeros(pirls_result.finalweights.len()));
+            }
+        };
+        let n = x_dense.nrows();
+        if n != pirls_result.finalweights.len() || cols.iter().any(|&col| col >= x_dense.ncols()) {
+            crate::bail_invalid_estim!(
+                "ALO pure-parametric activation gate received inconsistent dimensions"
+            );
+        }
+        let q = cols.len();
+        let mut gram = Array2::<f64>::zeros((q, q));
+        for i in 0..n {
+            let wi = pirls_result.finalweights[i];
+            if !wi.is_finite() || wi <= 0.0 {
+                return Ok(Array1::<f64>::zeros(n));
+            }
+            for (a, &ca) in cols.iter().enumerate() {
+                let xa = x_dense[[i, ca]];
+                for (b, &cb) in cols.iter().take(a + 1).enumerate() {
+                    gram[[a, b]] += wi * xa * x_dense[[i, cb]];
+                }
+            }
+        }
+        for a in 0..q {
+            for b in 0..a {
+                gram[[b, a]] = gram[[a, b]];
+            }
+        }
+        let factor = match StableSolver::new("ALO pure-parametric activation gate").factorize(&gram)
+        {
+            Ok(factor) => factor,
+            Err(_) => return Ok(Array1::<f64>::zeros(n)),
+        };
+        let mut gram_inv = Array2::<f64>::eye(q);
+        let mut gram_inv_view = array2_to_matmut(&mut gram_inv);
+        factor.solve_in_place(gram_inv_view.as_mut());
+        let mut leverage = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let wi = pirls_result.finalweights[i];
+            let mut h = 0.0;
+            for (a, &ca) in cols.iter().enumerate() {
+                let xa = x_dense[[i, ca]];
+                for (b, &cb) in cols.iter().enumerate() {
+                    h += xa * gram_inv[[a, b]] * x_dense[[i, cb]];
+                }
+            }
+            leverage[i] = (wi * h).max(0.0);
+        }
+        Ok(leverage)
+    }
+
     /// Analytic ρ-gradient of the ALO augmentation.
     ///
     /// The augmentation is `C(ρ) = Σ_i [ τ·b(h_i(ρ)) + γ·s_i·w_i·(y_i −
@@ -9467,11 +9588,7 @@ impl<'a> RemlState<'a> {
         phi: f64,
         factored: &AloFactoredHessian<'_>,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        let &AloFactoredHessian {
-            x,
-            chol,
-            h_inv_xt,
-        } = factored;
+        let &AloFactoredHessian { x, chol, h_inv_xt } = factored;
         let beta = bundle.pirls_result.beta_transformed.as_ref();
         let k = rho.len();
         let nrows = x.nrows();
