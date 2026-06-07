@@ -16,15 +16,15 @@
 //!   between the two — sometimes structural, sometimes just unlucky.
 //!
 //! [`InnerFailure`] captures these classes. Startup accounting classifies
-//! legacy error strings through [`classify_inner_error`], which inspects
-//! the bubbled error string for the sentinels emitted by
-//! `inner_blockwise_fit` and the diagnostician's `KktRefusalReport`.
+//! bubbled inner errors through [`classify_inner_error`], which inspects the
+//! structured labels emitted by `inner_blockwise_fit` and the diagnostician's
+//! `KktRefusalReport`.
 
 use crate::families::custom_family::KktRefusalDiagnosis;
 
-/// Structured failure modes for the inner solver. Each variant carries
-/// the original message for backwards-compatible logging plus structured
-/// fields that the outer cascade can match against without reparsing.
+/// Structured failure modes for the inner solver. Each variant carries the
+/// original message for logging plus structured fields that the outer cascade
+/// can match against without reparsing.
 #[derive(Clone, Debug)]
 pub(crate) enum InnerFailure {
     /// The joint Newton constrained-stationary certificate refused. The
@@ -33,12 +33,10 @@ pub(crate) enum InnerFailure {
     /// reason via [`KktRefusalDiagnosis`].
     ///
     /// `carrying_block` names the block (by spec name) that holds the
-    /// largest unresolved residual mass when the bubbled error embeds
-    /// the diagnostician's structured payload. Older error strings (the
-    /// legacy `block_residual_diagnostic_string` shape) populate this via
-    /// the `block '<name>' carries the dominant unresolved KKT gradient`
-    /// sentinel. The pair `(diagnosis, carrying_block)` is the equality
-    /// key the seed-screening loop uses for structural early-exit.
+    /// largest unresolved residual mass when the bubbled error embeds the
+    /// diagnostician's structured payload. The pair `(diagnosis,
+    /// carrying_block)` is the equality key the seed-screening loop uses for
+    /// structural early-exit.
     CertRefused {
         diagnosis: KktRefusalDiagnosis,
         carrying_block: Option<String>,
@@ -63,9 +61,9 @@ pub(crate) enum InnerFailure {
     /// unfittable in its current shape". No rho-anneal recovers this;
     /// the structural fix is to reparameterise the aliased block.
     IdentifiabilityFailure { message: String },
-    /// Catch-all for legacy error strings that do not match any of the
-    /// structured sentinels above. These are still rejected; the outer
-    /// cascade just cannot classify them.
+    /// Catch-all for strings that do not match any of the structured sentinels
+    /// above. These are still rejected; the outer cascade just cannot classify
+    /// them.
     Other(String),
 }
 
@@ -92,21 +90,6 @@ pub(crate) fn classify_inner_error(message: String) -> InnerFailure {
         let carrying_block = parse_carrying_block(&message);
         return InnerFailure::CertRefused {
             diagnosis,
-            carrying_block,
-            message,
-        };
-    }
-    // Legacy cert-refusal path: the inner solver bubbled the error via
-    // `block_residual_diagnostic_string`. We can recover the carrying
-    // block name but not the H_pen-spectrum diagnosis, so default to
-    // PhantomMultiplier when the sentinel matches and otherwise leave
-    // the failure unclassified.
-    if message.contains("coupled exact-joint inner solve exited the joint Newton path")
-        || message.contains("carries the dominant unresolved KKT gradient")
-    {
-        let carrying_block = parse_legacy_carrying_block(&message);
-        return InnerFailure::CertRefused {
-            diagnosis: KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH,
             carrying_block,
             message,
         };
@@ -147,22 +130,6 @@ fn parse_carrying_block(message: &str) -> Option<String> {
     }
 }
 
-/// Legacy parser: `block '<name>' carries the dominant unresolved KKT
-/// gradient (...)`. The single-quoted block name lets us recover the
-/// carrying block even when the structured diagnosis label is missing.
-fn parse_legacy_carrying_block(message: &str) -> Option<String> {
-    let marker = "block '";
-    let start = message.find(marker)? + marker.len();
-    let tail = &message[start..];
-    let end = tail.find('\'')?;
-    let name = &tail[..end];
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,28 +148,6 @@ mod tests {
                 ..
             } => {
                 assert_eq!(diagnosis, KktRefusalDiagnosis::RankDeficientHPen);
-                assert_eq!(carrying_block.as_deref(), Some("time_surface"));
-            }
-            other => panic!("expected CertRefused, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_legacy_carrying_block_when_diagnosis_absent() {
-        let message = "coupled exact-joint inner solve exited the joint Newton path before \
-            convergence — block 'time_surface' carries the dominant unresolved KKT gradient \
-            (|g_block|∞ = 5.000e+05); |∇L − Sβ|∞ = 5.000e+05"
-            .to_string();
-        match classify_inner_error(message) {
-            InnerFailure::CertRefused {
-                diagnosis,
-                carrying_block,
-                ..
-            } => {
-                assert_eq!(
-                    diagnosis,
-                    KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH
-                );
                 assert_eq!(carrying_block.as_deref(), Some("time_surface"));
             }
             other => panic!("expected CertRefused, got {other:?}"),
@@ -238,11 +183,9 @@ mod tests {
 
     /// Round-trip test against the diagnostician's
     /// `KktRefusalReport::format_bubbled_error` output. The report
-    /// formatter lives in `src/families/custom_family.rs` and is
-    /// private; we reproduce its exact text shape here so the parser
-    /// stays pinned even after the bubbled-error swap at line ~13540
-    /// stops calling `block_residual_diagnostic_string` and starts
-    /// calling `KktRefusalReport::format_bubbled_error` directly.
+    /// formatter lives in `src/families/custom_family.rs` and is private; we
+    /// reproduce its exact text shape here so the parser stays pinned to the
+    /// single structured report format.
     ///
     /// The fixture below is a verbatim copy of the diagnostician's
     /// format string with concrete values plugged in. Any change to
