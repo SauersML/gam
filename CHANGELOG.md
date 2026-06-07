@@ -1,3 +1,10 @@
+## gam v0.3.104 / gamfit v0.1.178
+
+- fix(#787/#785): C1 antiderivative for floored Jeffreys eigenvalue + line-search early-exit threshold (bernoulli marginal-slope inner KKT now converges; centers=12 PGS config that previously froze ~20min now returns).
+- fix(#859): pin CTN cross-fit response knot count across folds (skewed-PGS biobank calibration no longer raises p1 mismatch).
+- fix(#813/#821): freeze ALO influence_scale/phi per fit (te() outer-REML no longer grinds; value<->gradient consistency).
+- wip(#808): eta1-channel cross-block reduction for survival marginal-slope.
+
 ## v0.3.103 — gam 0.3.103 / gamfit 0.1.177 (2026-06-07)
 
 - feat(#817): skew-aware Gamma observation (prediction) intervals. Response-scale predictive bands for the Gamma family are now equal-tailed quantiles of a moment-matched Gamma predictive — built on a robust inverse regularized incomplete-gamma (`probability::gamma_quantile`) — instead of the symmetric `μ ± z·σ` band that systematically mis-covered each tail of a right-skewed response. Includes a per-tail coverage regression and a degenerate-shape symmetric fallback.
