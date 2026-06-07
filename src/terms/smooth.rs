@@ -593,6 +593,52 @@ impl SmoothBasisSpec {
             }
         }
     }
+
+    /// Stable structural discriminant for warm-start cache keying (#869).
+    ///
+    /// Two smooths that produce different bases / penalty structures must map
+    /// to different strings here so they cannot collide on the persistent
+    /// warm-start `cache_key` (which is otherwise blind to topology: it hashes
+    /// only the raw input column count, so e.g. `sphere` vs `torus` vs
+    /// `euclidean` candidates fit on the *same* data would otherwise share one
+    /// key and cross-contaminate each other's β/ρ seed). The string is the
+    /// topology identity, not the fitted coefficients, so same-topology refits
+    /// (the screen→full-refit cascade) still hit the same key and reuse work.
+    pub fn structural_kind(&self) -> &'static str {
+        match self {
+            Self::ByVariable { .. } => "by_variable",
+            Self::FactorSumToZero { .. } => "factor_sum_to_zero",
+            Self::BSpline1D { .. } => "bspline_1d",
+            Self::BySmooth { .. } => "by_smooth",
+            Self::FactorSmooth { .. } => "factor_smooth",
+            Self::ThinPlate { .. } => "thin_plate",
+            Self::Sphere { .. } => "sphere",
+            Self::Matern { .. } => "matern",
+            Self::Duchon { .. } => "duchon",
+            Self::Pca { .. } => "pca",
+            Self::TensorBSpline { .. } => "tensor_bspline",
+        }
+    }
+
+    /// Feature columns this basis consumes, used alongside [`structural_kind`]
+    /// to disambiguate two same-kind smooths on different axes. Wrapper
+    /// variants delegate to their inner basis.
+    pub fn structural_feature_cols(&self) -> Vec<usize> {
+        match self {
+            Self::ByVariable { inner, .. } | Self::FactorSumToZero { inner, .. } => {
+                inner.structural_feature_cols()
+            }
+            Self::BySmooth { smooth, .. } => smooth.structural_feature_cols(),
+            Self::FactorSmooth { .. } => Vec::new(),
+            Self::BSpline1D { feature_col, .. } => vec![*feature_col],
+            Self::ThinPlate { feature_cols, .. }
+            | Self::Sphere { feature_cols, .. }
+            | Self::Matern { feature_cols, .. }
+            | Self::Duchon { feature_cols, .. }
+            | Self::Pca { feature_cols, .. }
+            | Self::TensorBSpline { feature_cols, .. } => feature_cols.clone(),
+        }
+    }
 }
 
 /// Lower bound on the number of basis columns produced by a 1D B-spline
@@ -1046,6 +1092,36 @@ fn validate_smooth_basis_frozen(
 }
 
 impl TermCollectionSpec {
+    /// Write this collection's topology identity into a warm-start cache
+    /// fingerprint (#869).
+    ///
+    /// The persistent warm-start `cache_key` hashes only family + raw input
+    /// dimensions, so two fits on the same data that differ *only* in their
+    /// smooth topology (the `s(..., type=AUTO)` candidate enumeration: sphere
+    /// vs torus vs euclidean vs duchon) collide on one key and seed each other
+    /// with geometrically incompatible β/ρ. Folding the per-term structural
+    /// kind + feature columns + linear/random-effect counts into the shape hash
+    /// gives each candidate its own key, so the screen→full-refit reuse of one
+    /// candidate is preserved while cross-candidate contamination is removed.
+    /// Only the structural identity is hashed (not fitted coefficients or
+    /// frozen knot values), so a refit of the *same* topology still hits.
+    pub fn write_structural_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+        h.write_str("term-collection");
+        h.write_usize(self.linear_terms.len());
+        for linear in &self.linear_terms {
+            h.write_str(&linear.name);
+        }
+        h.write_usize(self.random_effect_terms.len());
+        h.write_usize(self.smooth_terms.len());
+        for smooth in &self.smooth_terms {
+            h.write_str(&smooth.name);
+            h.write_str(smooth.basis.structural_kind());
+            for col in smooth.basis.structural_feature_cols() {
+                h.write_usize(col);
+            }
+        }
+    }
+
     /// Validate that a term collection spec represents a fully frozen model
     /// (i.e. all knots/centers are pre-computed, identifiability transforms are
     /// baked in, and random-effect levels are fixed).

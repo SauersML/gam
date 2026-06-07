@@ -575,11 +575,20 @@ impl<'a> FamilyFitRequest for StandardFitRequest<'a> {
         h.write_str(&format!("{:?}", self.family));
         h.write_usize(self.y.len());
         h.write_usize(self.data.ncols());
+        // Topology identity (#869): raw `data.ncols()` is blind to the smooth
+        // basis, so `s(..., type=AUTO)` candidates fit on the same data would
+        // otherwise share one warm-start key and cross-seed each other with
+        // incompatible β/ρ. Fold the term-collection structural shape in so
+        // each candidate keys distinctly while same-topology refits still hit.
+        self.spec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("standard-seed");
         h.write_str(&format!("{:?}", self.family));
         h.write_usize(self.data.ncols());
+        // Same topology disambiguation for the data-independent seed key: a
+        // sphere candidate must not seed a torus candidate across folds.
+        self.spec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         // The standard REML path opens its own session inside the outer
