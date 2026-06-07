@@ -2911,9 +2911,12 @@ mod tests {
         let v_log = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| if i == j { 1.2 } else { 0.4 });
         // R_marg: rows = time raw width 3, cols = marginal compiled width 2.
         let r_marg = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| 0.7 - 0.1 * ((i + j) as f64));
-        // R_log: rows = time+marg raw width 5, cols = logslope compiled width 2.
+        // R_log: rows = time+marg RAW width 6 (3 + 3), cols = logslope compiled
+        // width 2. `build_full_t_matrix` stacks R_{a→b} over a<b, so the row
+        // count is the sum of the RAW widths of the prior blocks (not their
+        // compiled widths — marginal's compiled width is 2 but its raw width is 3).
         let r_log =
-            Array2::<f64>::from_shape_fn((5, 2), |(i, j)| 0.3 + 0.05 * ((i * 2 + j) as f64));
+            Array2::<f64>::from_shape_fn((6, 2), |(i, j)| 0.3 + 0.05 * ((i * 2 + j) as f64));
 
         let t = build_full_t_matrix(
             &[v_time.clone(), v_marg.clone(), v_log.clone()],

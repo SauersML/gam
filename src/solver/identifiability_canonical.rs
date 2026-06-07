@@ -979,6 +979,50 @@ fn try_orthogonalize_blocks(
         return Ok(None);
     }
 
+    // Equal-priority gauge-ambiguity guard. Orthogonalisation removes a block's
+    // overlap by residualising it against the cumulative anchor of all
+    // higher-or-equal-priority blocks already visited (descending-priority,
+    // stable-on-ties order — identical to `orthogonalize_design_blocks`). When a
+    // direction is absorbed *into an equal-priority anchor block* there is NO
+    // gauge ordering to decide which block loses the shared column: the inner
+    // KKT system is structurally rank-deficient regardless of penalty, exactly
+    // the contract the flat audit gate encodes (`all_priorities_equal` forces
+    // `gauge_resolves_rank_deficiency = false`, so the alias is fatal). Reducing
+    // here would silently drop the later block's column instead of refusing.
+    // Defer to the audit gate, which raises `IdentifiabilityFailure`, whenever
+    // an absorbed block shares its priority with any earlier-visited block.
+    let mut visit_order: Vec<usize> = (0..specs.len()).collect();
+    visit_order.sort_by(|&a, &b| priority[b].cmp(&priority[a]));
+    let visit_rank: Vec<usize> = {
+        let mut rank = vec![0usize; specs.len()];
+        for (r, &b) in visit_order.iter().enumerate() {
+            rank[b] = r;
+        }
+        rank
+    };
+    for annotation in ortho
+        .direction_annotations
+        .iter()
+        .filter(|annotation| annotation.absorbed_width > 0)
+    {
+        let absorbed = annotation.block_idx;
+        let equal_priority_anchor_exists = (0..specs.len()).any(|other| {
+            other != absorbed
+                && visit_rank[other] < visit_rank[absorbed]
+                && priority[other] == priority[absorbed]
+        });
+        if equal_priority_anchor_exists {
+            log::info!(
+                "[CANON] orthogonalisation declined: block {} (priority {}) was absorbed into an \
+                 equal-priority anchor — exact alias has no gauge ordering; deferring to the fatal \
+                 audit gate instead of arbitrarily dropping the later block's column",
+                absorbed,
+                priority[absorbed],
+            );
+            return Ok(None);
+        }
+    }
+
     for annotation in ortho
         .direction_annotations
         .iter()
