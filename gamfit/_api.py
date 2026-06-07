@@ -48,12 +48,12 @@ def _normalize_shared_precision_group(
     if isinstance(value, SharedPrecisionGroup):
         return value
     if isinstance(value, Mapping):
-        name = value.get("name", value.get("label", default_name))
+        name = value.get("name", default_name)
         if name is None:
-            raise ValueError("shared precision group mapping needs a name/label")
-        shape = value.get("shape", value.get("a", value.get("a_p", 1.0)))
-        rate = value.get("rate", value.get("b", value.get("b_p", 0.0)))
-        labels = value.get("labels", value.get("terms", value.get("selectors")))
+            raise ValueError("shared precision group mapping needs a name")
+        shape = value.get("shape", 1.0)
+        rate = value.get("rate", 0.0)
+        labels = value.get("labels")
         return SharedPrecisionGroup(
             name=str(name),
             shape=float(shape),
@@ -506,8 +506,8 @@ def _normalize_aux_strength(value: Any) -> float | None:
 
 def _normalize_precision_pair(value: Any, label: str) -> list[float]:
     if isinstance(value, dict):
-        shape = value.get("shape", value.get("a", value.get("a_p")))
-        rate = value.get("rate", value.get("b", value.get("b_p")))
+        shape = value.get("shape")
+        rate = value.get("rate")
     else:
         try:
             shape, rate = value
@@ -516,13 +516,9 @@ def _normalize_precision_pair(value: Any, label: str) -> list[float]:
                 f"precision_hyperpriors[{label!r}] must be (shape, rate)"
             ) from exc
     if shape is None:
-        raise ValueError(
-            f"precision_hyperpriors[{label!r}] needs a shape/a/a_p value"
-        )
+        raise ValueError(f"precision_hyperpriors[{label!r}] needs a shape value")
     if rate is None:
-        raise ValueError(
-            f"precision_hyperpriors[{label!r}] needs a rate/b/b_p value"
-        )
+        raise ValueError(f"precision_hyperpriors[{label!r}] needs a rate value")
     shape_f = float(shape)
     rate_f = float(rate)
     if (
