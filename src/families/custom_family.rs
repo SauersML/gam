@@ -8527,20 +8527,11 @@ fn custom_family_seed_screening_proxy_labeled<F: CustomFamily + Clone + Send + S
         physical_warm_start.as_ref().or(warm_start),
     )?;
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
-    let reml_term = if include_exact_newton_logdet_h(family, options) {
-        0.5 * inner.block_logdet_h
-    } else {
-        0.0
-    } - if include_exact_newton_logdet_s(family, options) {
-        0.5 * inner.block_logdet_s
-    } else {
-        0.0
-    };
     let prior_terms = rho_prior_cost_gradient_hessian(rho_prior, rho)?;
-    let score = checked_penalizedobjective(
-        inner.log_likelihood,
-        inner.penalty_value,
-        reml_term,
+    let score = inner_penalized_objective(
+        &inner,
+        include_exact_newton_logdet_h(family, options),
+        include_exact_newton_logdet_s(family, options),
         "custom-family labeled seed-screening proxy",
     )? + prior_terms.0;
     let warm = ConstrainedWarmStart {
@@ -24262,6 +24253,74 @@ fn lift_fit_geometry_to_raw(
     (lifted_cov, lifted_geom)
 }
 
+struct BlockwiseFitAssembly<'a> {
+    rho_physical: Array1<f64>,
+    covariance_conditional: Option<Array2<f64>>,
+    geometry: Option<FitGeometry>,
+    canonical: Option<&'a crate::solver::identifiability_canonical::CanonicalSpecs>,
+    result_specs: &'a [ParameterBlockSpec],
+    penalized_objective: f64,
+    outer_iterations: usize,
+    outer_gradient_norm: Option<f64>,
+    outer_converged: bool,
+    context: &'static str,
+}
+
+fn assemble_custom_family_fit_result(
+    inner: BlockwiseInnerResult,
+    assembly: BlockwiseFitAssembly<'_>,
+) -> Result<crate::solver::estimate::UnifiedFitResult, CustomFamilyError> {
+    let BlockwiseFitAssembly {
+        rho_physical,
+        covariance_conditional,
+        geometry,
+        canonical,
+        result_specs,
+        penalized_objective,
+        outer_iterations,
+        outer_gradient_norm,
+        outer_converged,
+        context,
+    } = assembly;
+    let lambdas = rho_physical.mapv(f64::exp);
+    let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+    let (block_states, covariance_conditional, geometry, precomputed_edf) =
+        if let Some(canonical) = canonical {
+            let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas);
+            let block_states = lift_block_states_to_raw(canonical, inner.block_states);
+            let (covariance_conditional, geometry) =
+                lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry);
+            (
+                block_states,
+                covariance_conditional,
+                geometry,
+                precomputed_edf,
+            )
+        } else {
+            (inner.block_states, covariance_conditional, geometry, None)
+        };
+
+    blockwise_fit_from_parts(
+        BlockwiseFitResultParts {
+            block_states,
+            log_likelihood: inner.log_likelihood,
+            log_lambdas,
+            lambdas,
+            covariance_conditional,
+            stable_penalty_term: 2.0 * inner.penalty_value,
+            penalized_objective,
+            outer_iterations,
+            outer_gradient_norm,
+            inner_cycles: inner.cycles,
+            outer_converged,
+            geometry,
+            precomputed_edf,
+        },
+        result_specs,
+    )
+    .map_err(|reason| CustomFamilyError::Optimization { context, reason })
+}
+
 /// Install the channel-aware `AdditiveBlockJacobian` callbacks declared by a
 /// family's [`CustomFamily::output_channel_assignment`].
 ///
@@ -24556,35 +24615,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             specs,
             &warm_start,
         );
-        let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
-        let lambdas = physical_rho0.mapv(f64::exp);
-        let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
-        let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), &canonical, &lambdas);
-        let (covariance_conditional, geometry) =
-            lift_fit_geometry_to_raw(&canonical, covariance_conditional, geometry);
-        return blockwise_fit_from_parts(
-            BlockwiseFitResultParts {
-                block_states: block_states_raw,
-                log_likelihood: inner.log_likelihood,
-                log_lambdas,
-                lambdas,
+        let inner_converged = inner.converged;
+        return assemble_custom_family_fit_result(
+            inner,
+            BlockwiseFitAssembly {
+                rho_physical: physical_rho0,
                 covariance_conditional,
-                stable_penalty_term: 2.0 * inner.penalty_value,
+                geometry,
+                canonical: Some(&canonical),
+                result_specs: raw_specs,
                 penalized_objective,
                 outer_iterations: 0,
-                // No outer optimization ran — there is no gradient to report.
                 outer_gradient_norm: None,
-                inner_cycles: inner.cycles,
-                outer_converged: inner.converged,
-                geometry,
-                precomputed_edf,
+                outer_converged: inner_converged,
+                context: "fit_custom_family no-smoothing result assembly",
             },
-            raw_specs,
-        )
-        .map_err(|reason| CustomFamilyError::Optimization {
-            context: "fit_custom_family no-smoothing result assembly",
-            reason,
-        });
+        );
     }
 
     // Exact Hessians are primary whenever the assembled family can supply them.
@@ -24603,18 +24649,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 reason,
             }
         })?;
-        let penalized_objective = checked_penalizedobjective(
-            inner.log_likelihood,
-            inner.penalty_value,
-            if include_exact_newton_logdet_h(family, options) {
-                0.5 * inner.block_logdet_h
-            } else {
-                0.0
-            } - if include_exact_newton_logdet_s(family, options) {
-                0.5 * inner.block_logdet_s
-            } else {
-                0.0
-            },
+        let penalized_objective = inner_penalized_objective(
+            &inner,
+            include_exact_newton_logdet_h(family, options),
+            include_exact_newton_logdet_s(family, options),
             "custom-family explicit one-cycle inner probe",
         )
         .map_err(|reason| CustomFamilyError::Optimization {
@@ -24622,31 +24660,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             reason,
         })?;
         let physical_rho0 = expand_labeled_log_lambdas(&rho0, &label_layout)?;
-        let lambdas = physical_rho0.mapv(f64::exp);
-        let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
-        let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
-        return blockwise_fit_from_parts(
-            BlockwiseFitResultParts {
-                block_states: block_states_raw,
-                log_likelihood: inner.log_likelihood,
-                log_lambdas,
-                lambdas,
+        let inner_converged = inner.converged;
+        return assemble_custom_family_fit_result(
+            inner,
+            BlockwiseFitAssembly {
+                rho_physical: physical_rho0,
                 covariance_conditional: None,
-                stable_penalty_term: 2.0 * inner.penalty_value,
+                geometry: None,
+                canonical: Some(&canonical),
+                result_specs: raw_specs,
                 penalized_objective,
                 outer_iterations: 0,
                 outer_gradient_norm: Some(0.0),
-                inner_cycles: inner.cycles,
-                outer_converged: inner.converged,
-                geometry: None,
-                precomputed_edf: None,
+                outer_converged: inner_converged,
+                context: "fit_custom_family one-cycle result assembly",
             },
-            raw_specs,
-        )
-        .map_err(|reason| CustomFamilyError::Optimization {
-            context: "fit_custom_family one-cycle result assembly",
-            reason,
-        });
+        );
     }
 
     use crate::estimate::EstimationError;
@@ -25208,18 +25237,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             reason,
         },
     )?;
-    let penalized_objective = checked_penalizedobjective(
-        inner.log_likelihood,
-        inner.penalty_value,
-        if include_exact_newton_logdet_h(family, options) {
-            0.5 * inner.block_logdet_h
-        } else {
-            0.0
-        } - if include_exact_newton_logdet_s(family, options) {
-            0.5 * inner.block_logdet_s
-        } else {
-            0.0
-        },
+    let penalized_objective = inner_penalized_objective(
+        &inner,
+        include_exact_newton_logdet_h(family, options),
+        include_exact_newton_logdet_s(family, options),
         "custom-family fit final outer refit",
     )
     .map_err(|reason| CustomFamilyError::Optimization {
@@ -25366,35 +25387,22 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         }
     }
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
-    let lambdas_final = rho_star_physical.mapv(f64::exp);
-    let log_lambdas_final = lambdas_final.mapv(|v| v.max(1e-300).ln());
-    let block_states_raw = lift_block_states_to_raw(&canonical, inner.block_states);
-    let precomputed_edf = reduced_blockwise_edf(geometry.as_ref(), &canonical, &lambdas_final);
-    let (covariance_conditional, geometry) =
-        lift_fit_geometry_to_raw(&canonical, covariance_conditional, geometry);
     let outer_converged = !nonconvergence_escalation;
-    blockwise_fit_from_parts(
-        BlockwiseFitResultParts {
-            block_states: block_states_raw,
-            log_likelihood: inner.log_likelihood,
-            log_lambdas: log_lambdas_final,
-            lambdas: lambdas_final,
+    assemble_custom_family_fit_result(
+        inner,
+        BlockwiseFitAssembly {
+            rho_physical: rho_star_physical,
             covariance_conditional,
-            stable_penalty_term: 2.0 * inner.penalty_value,
+            geometry,
+            canonical: Some(&canonical),
+            result_specs: raw_specs,
             penalized_objective,
             outer_iterations: outer_iters,
             outer_gradient_norm: outer_grad_norm,
-            inner_cycles: inner.cycles,
             outer_converged,
-            geometry,
-            precomputed_edf,
+            context: "fit_custom_family result assembly",
         },
-        raw_specs,
     )
-    .map_err(|reason| CustomFamilyError::Optimization {
-        context: "fit_custom_family result assembly",
-        reason,
-    })
 }
 
 pub(crate) fn fit_custom_family_fixed_log_lambdas<
@@ -25436,52 +25444,31 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
             reason,
         },
     )?;
-    let penalized_objective = checked_penalizedobjective(
-        inner.log_likelihood,
-        inner.penalty_value,
-        if include_exact_newton_logdet_h(family, options) {
-            0.5 * inner.block_logdet_h
-        } else {
-            0.0
-        } - if include_exact_newton_logdet_s(family, options) {
-            0.5 * inner.block_logdet_s
-        } else {
-            0.0
-        },
+    let penalized_objective = inner_penalized_objective(
+        &inner,
+        include_exact_newton_logdet_h(family, options),
+        include_exact_newton_logdet_s(family, options),
         "custom-family fixed-log-lambda fit",
     )
     .map_err(|reason| CustomFamilyError::Optimization {
         context: "fit_custom_family_fixed_log_lambdas penalized objective",
         reason,
     })?;
-    let lambdas = rho.mapv(f64::exp);
-    let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
-    blockwise_fit_from_parts(
-        BlockwiseFitResultParts {
-            block_states: inner.block_states,
-            log_likelihood: inner.log_likelihood,
-            log_lambdas,
-            lambdas,
+    assemble_custom_family_fit_result(
+        inner,
+        BlockwiseFitAssembly {
+            rho_physical: rho,
             covariance_conditional,
-            stable_penalty_term: 2.0 * inner.penalty_value,
+            geometry,
+            canonical: None,
+            result_specs: specs,
             penalized_objective,
             outer_iterations,
             outer_gradient_norm,
-            inner_cycles: inner.cycles,
             outer_converged,
-            geometry,
-            // This path passes `specs` directly (no canonicalization/lift), so
-            // the geometry's penalized Hessian is full rank in the same space —
-            // the raw-geometry edf fallback inside `blockwise_fit_from_parts` is
-            // exact here, no reduced-space precompute needed.
-            precomputed_edf: None,
+            context: "fit_custom_family_fixed_log_lambdas result assembly",
         },
-        specs,
     )
-    .map_err(|reason| CustomFamilyError::Optimization {
-        context: "fit_custom_family_fixed_log_lambdas result assembly",
-        reason,
-    })
 }
 
 pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
@@ -32588,8 +32575,9 @@ mod tests {
         // residual so the caller's identified-subspace KKT certificate can fire.
         let h = array![[4.0, 0.0], [0.0, 0.0]];
         let rhs = array![8.0, 0.25];
-        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
-            .expect("nonzero null RHS must range-project, not error");
+        let step =
+            solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
+                .expect("nonzero null RHS must range-project, not error");
 
         // Identified direction [1,0] (λ=4): 8/4 = 2. Null direction [0,1] (λ=0):
         // dropped, so the step leaves coordinate 1 unchanged at 0.
