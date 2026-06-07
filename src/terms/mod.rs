@@ -11,7 +11,6 @@ pub mod hull;
 pub mod input_loc_derivatives;
 pub mod interchange_decoder;
 pub mod latent_coord;
-pub mod layout;
 pub mod matern_gradient;
 pub mod penalties;
 pub mod penalty_op;

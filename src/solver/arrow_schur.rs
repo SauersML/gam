@@ -2293,7 +2293,7 @@ impl ArrowSchurSystem {
     ///
     /// The same plumbing is compatible with #287 (custom `ParameterBlockSpec`
     /// families): callers from that path simply supply ranges derived from
-    /// their own block layout instead of `EngineLayout.terms[*].col_range`.
+    /// their own block layout.
     pub fn set_block_offsets(&mut self, offsets: Arc<[Range<usize>]>) {
         self.block_offsets = offsets;
     }
@@ -5609,7 +5609,7 @@ impl std::fmt::Debug for BlockFactor {
 ///
 /// The `block_offsets` plumbing is compatible with issue #287 (custom
 /// `ParameterBlockSpec` families): those callers supply ranges derived from
-/// their own block layout rather than `EngineLayout.terms[*].col_range`.
+/// their own block layout.
 #[derive(Debug, Clone)]
 pub struct JacobiPreconditioner {
     blocks: Vec<BlockFactor>,
