@@ -42,6 +42,7 @@ use std::sync::Arc;
 ///
 /// `materialize_reparam` is called lazily — only when every gating condition
 /// is satisfied — to produce the `ReparamResult` the GPU input needs.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub(super) fn try_gaussian_pls_gpu<F>(
     link_function: LinkFunction,
     config: &PirlsConfig,
@@ -63,37 +64,6 @@ pub(super) fn try_gaussian_pls_gpu<F>(
 where
     F: FnOnce() -> Result<ReparamResult, EstimationError>,
 {
-    #[cfg(not(target_os = "linux"))]
-    {
-        // GPU PIRLS dispatch is Linux-only; on other targets we read each
-        // input once to acknowledge the parameters are part of the API
-        // contract everywhere, and return None so the caller falls through
-        // to the CPU PIRLS loop. The reads are folded into a single log
-        // statement so the optimizer can collapse them.
-        log::trace!(
-            "[PIRLS GPU Gaussian PLS] non-Linux target: skipping dispatch (link={:?}, \
-             gaussian_identity={}, firth={}, lb_present={}, lc_present={}, cache_present={}, \
-             qs_present={}, x_rows={}, sparse_native={}, p={}, y_len={}, w_len={}, off_len={}, \
-             frame={:?}, lc_secondary={}, closure_size={}, penalty_kind={:?})",
-            link_function,
-            config.likelihood.spec.is_gaussian_identity(),
-            config.firth_bias_reduction,
-            penalty_coefficient_lower_bounds.is_some(),
-            penalty_linear_constraints_original.is_some(),
-            gaussian_fixed_cache.is_some(),
-            qs_arc.is_some(),
-            x_original.nrows(),
-            use_sparse_native,
-            penalty_p,
-            y.len(),
-            priorweights.len(),
-            offset.len(),
-            coordinate_frame,
-            linear_constraints.is_some(),
-            std::mem::size_of_val(&materialize_reparam),
-            std::mem::discriminant(penalty_active),
-        );
-    }
     #[cfg(target_os = "linux")]
     if matches!(link_function, LinkFunction::Identity)
         && config.likelihood.spec.is_gaussian_identity()
@@ -172,6 +142,7 @@ where
 ///
 /// `materialize_reparam` is called lazily — only when the admission shim
 /// confirms the fit is eligible.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
 pub(super) fn try_pirls_loop_gpu<F>(
     config: &PirlsConfig,
     penalty_active: &PirlsPenalty,
@@ -193,33 +164,6 @@ pub(super) fn try_pirls_loop_gpu<F>(
 where
     F: FnOnce() -> Result<ReparamResult, EstimationError>,
 {
-    #[cfg(not(target_os = "linux"))]
-    {
-        // GPU PIRLS dispatch is Linux-only; consume parameters via trace
-        // logging to keep them in the public API surface on every target.
-        log::trace!(
-            "[PIRLS GPU loop] non-Linux: skipping dispatch (firth={}, kron_none={}, \
-             sparse_native={}, lc_present={}, x_rows={}, qs_present={}, p={}, x2_rows={}, \
-             y_len={}, w_len={}, off_len={}, beta_len={}, link={:?}, frame={:?}, \
-             closure_size={}, penalty_kind={:?})",
-            config.firth_bias_reduction,
-            kronecker_runtime_is_none,
-            use_sparse_native,
-            linear_constraints.is_some(),
-            x_original.nrows(),
-            qs_arc.is_some(),
-            penalty_p,
-            x_original_for_result.nrows(),
-            y.len(),
-            priorweights.len(),
-            offset.len(),
-            initial_beta.len(),
-            link_function,
-            coordinate_frame,
-            std::mem::size_of_val(&materialize_reparam),
-            std::mem::discriminant(penalty_active),
-        );
-    }
     #[cfg(target_os = "linux")]
     use super::HessianCurvatureKind;
     #[cfg(target_os = "linux")]
