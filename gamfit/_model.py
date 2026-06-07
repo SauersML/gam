@@ -90,15 +90,20 @@ class Model:
             default when ``None``) prefers the first-order smoothing-corrected
             covariance ``H^{-1} + J Var(rho_hat) J^T`` and falls back to
             conditional when it is unavailable; ``"required"`` demands the
-            smoothing correction and errors if it cannot be formed. Only read
-            when ``interval`` is set on an effectively-linear model (the
-            delta-method interval path).
+            smoothing correction and errors if it cannot be formed. Read
+            whenever ``interval`` is set, for every family — including the
+            curved-inverse-link families (binomial / Bernoulli) whose default
+            point is the posterior mean: the mode shapes the reported SE and the
+            credible bounds, while the posterior-mean point itself always
+            integrates the conditional posterior and is unaffected.
         observation_interval : bool, default False
             When ``True`` (and ``interval`` is set), the output also gains
             ``observation_lower`` / ``observation_upper`` columns — the
             response-scale *prediction* interval
             ``Var(y_new|x) = Var(mu_hat) + Var(Y|mu)`` — for families that
-            support it. The credible ``mean_lower`` / ``mean_upper`` are left
+            support it (Gaussian, Poisson, Gamma, Negative-Binomial, Beta,
+            Tweedie, and binomial/Bernoulli via the conditional ``p(1-p)``
+            variance). The credible ``mean_lower`` / ``mean_upper`` are left
             untouched.
         return_type : {"dict", "pandas", "numpy", "polars", "pyarrow", "list"}, optional
             Force a specific output container. ``None`` (default) mirrors the
