@@ -9453,7 +9453,10 @@ mod tests {
         // Pure periodic axis: restricted to an empty Euclidean carrier.
         let (axes, compacted) = sae_coord_penalty_euclidean_restriction(&circle.coords[0])
             .expect("periodic coord must be restricted");
-        assert!(axes.is_empty(), "circle has no Euclidean axes, got {axes:?}");
+        assert!(
+            axes.is_empty(),
+            "circle has no Euclidean axes, got {axes:?}"
+        );
         assert_eq!(compacted.len(), 0, "compacted target must be empty");
     }
 

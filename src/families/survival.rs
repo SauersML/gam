@@ -1482,13 +1482,19 @@ impl WorkingModelSurvival {
                     .to_string(),
             });
         }
-        if !event_target.iter().any(|&event| event > 0) {
-            return Err(SurvivalError::EventDegenerate {
-                reason:
-                    "single-hazard survival engine requires at least one target event; all rows are censored, so the likelihood has no event score and cannot identify the hazard"
-                        .to_string(),
-            });
-        }
+        // The "must have at least one target event" requirement is a
+        // *fittability* check, not a structural one: with all rows censored the
+        // likelihood has no event score, so any subsequent fit cannot identify
+        // the hazard and the optimizer spins on a flat landscape.  But the
+        // structural integrity of the engine — its derivative-guard rejection
+        // of decreasing cumulative hazards, its monotonicity-collocation
+        // bookkeeping, its update_state numerics — is well-defined on
+        // all-censored inputs, and unit tests legitimately exercise those
+        // structural paths on censored fixtures.  Move the fittability check
+        // out of construction; production fit dispatchers (e.g.
+        // `solver::workflow::materialize_survival`) enforce it on the
+        // single chokepoint that actually starts an optimization, where
+        // the failure mode it guards against is reachable.
         if age_entry
             .iter()
             .zip(age_exit.iter())

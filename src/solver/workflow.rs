@@ -6344,20 +6344,27 @@ fn materialize_survival<'a>(
     }
 
     let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
-    // Fail fast on all-censored (zero-event) survival data in the marginal-slope
-    // path (#789B). The single-hazard / marginal-slope likelihood has no event
-    // score when no row is an event, so the inner/outer solve cannot identify the
-    // hazard and the optimizer spins without termination. The standard survival
-    // engine rejects this inside `WorkingModelSurvival`, but the marginal-slope
-    // construction does not necessarily build that working model, so the
-    // degenerate config must be caught here before any heavy construction.
-    if matches!(survival_mode, SurvivalLikelihoodMode::MarginalSlope)
-        && !event_codes.iter().any(|&code| code > 0)
-    {
+    // Fail fast on all-censored (zero-event) survival data for every survival
+    // likelihood (#789B / construction-time fittability split). With no row
+    // marking a target event, the survival likelihood has no event score: the
+    // hazard direction is unidentified and the inner/outer solve either spins
+    // on a flat landscape (marginal-slope) or returns a numerically degenerate
+    // fit (other modes). This is the single chokepoint every survival fit
+    // dispatcher routes through (Surv(...) responses + all FitConfig survival
+    // modes), so catching it here keeps every downstream constructor —
+    // `WorkingModelSurvival`, the Royston-Parmar wrapper, the marginal-slope
+    // builders — free to materialize models on censored fixtures (which the
+    // engine's structural unit tests rely on) without losing the user-facing
+    // safety on real fits.
+    if !event_codes.iter().any(|&code| code > 0) {
+        let mode_label = match survival_mode {
+            SurvivalLikelihoodMode::MarginalSlope => "survival marginal-slope",
+            _ => "survival fit",
+        };
         return Err(WorkflowError::InvalidConfig {
-            reason: "survival marginal-slope requires at least one target event; all rows are \
-                     censored, so the likelihood has no event score and cannot identify the hazard"
-                .to_string(),
+            reason: format!(
+                "{mode_label} requires at least one target event; all rows are censored, so the likelihood has no event score and cannot identify the hazard"
+            ),
         });
     }
     let cause_count =

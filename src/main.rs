@@ -4404,6 +4404,19 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             "cause-specific competing risks with {cause_count} causes are currently supported for --survival-likelihood transformation and weibull"
         ));
     }
+    // All-censored (zero-event) fittability gate. The survival likelihood has
+    // no event score when no row marks a target event, so the inner/outer
+    // solve cannot identify the hazard. The single-hazard engine's structural
+    // checks (in `WorkingModelSurvival::validate_common_inputs`) intentionally
+    // permit construction on censored fixtures so the engine's update_state
+    // / monotonicity-collocation contracts can be unit-tested in isolation;
+    // production fit dispatchers own the fittability gate.
+    if !event_target.iter().any(|&code| code > 0) {
+        return Err(
+            "survival fit requires at least one target event; all rows are censored, so the likelihood has no event score and cannot identify the hazard"
+                .to_string(),
+        );
+    }
     let mut baseline_cfg = initial_survival_baseline_config_for_fit(
         &baseline_target_raw,
         effective_args.baseline_scale,
@@ -11597,11 +11610,7 @@ mod tests {
             auxiliary_matrix: None,
         };
         let out = predictor
-            .predict_posterior_mean(
-                &input,
-                &fit,
-                &super::PosteriorMeanOptions::with_level(0.95),
-            )
+            .predict_posterior_mean(&input, &fit, &super::PosteriorMeanOptions::with_level(0.95))
             .expect("predict standard binomial wiggle");
         assert_eq!(out.eta.len(), 3);
         assert_eq!(
