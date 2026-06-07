@@ -209,6 +209,69 @@ fn alo_leverage_barrier_derivative(h: f64) -> f64 {
     }
 }
 
+/// Parametric-rank gate for ALO activation (#862).
+///
+/// Decompose each high-leverage row's hat diagonal against the UNPENALIZED
+/// (parametric + penalty-null) block of the design. With `U` (`p × m`) the
+/// structural null-space basis in the transformed frame and `X_u = X·U`
+/// (`n × m`), the leverage of row `i` under the unpenalized block alone is
+/// `h_i^u = w_i · x_{u,i}ᵀ (X_uᵀ W X_u)⁻¹ x_{u,i}` with `W = diag(weights)` the
+/// PSD working weights. The full hat splits as `h_i = h_i^u + h_i^range`, so
+/// `h_i^u / h_i` is the fraction of the row's leverage owned by the unpenalized
+/// block. When that fraction is large for a row, no finite λ on the penalized
+/// terms can pull `h_i` down — the high leverage is a small-n parametric-column
+/// artifact, not a concentrated outlier on the penalized smooth.
+///
+/// Returns `true` when a majority of the high-leverage rows are unpenalized-
+/// explained, i.e. the augmentation should be suppressed. A clean `s(x)` +
+/// isolated-outlier fit keeps each outlier's leverage in the PENALIZED range
+/// (tiny `m`, support-gap geometry), so `h_i^u / h_i` stays small and the gate
+/// does not fire — the legitimate concentrated-outlier path stays stabilized.
+fn unpenalized_block_explains_high_leverage(
+    x: &Array2<f64>,
+    u_truncated: &Array2<f64>,
+    weights: ArrayView1<'_, f64>,
+    leverage: ArrayView1<'_, f64>,
+) -> bool {
+    let m = u_truncated.ncols();
+    let n = x.nrows();
+    if m == 0 || n == 0 || u_truncated.nrows() != x.ncols() || weights.len() != n {
+        return false;
+    }
+    // X_u = X · U  (n × m), the design restricted to the unpenalized subspace.
+    let x_u = x.dot(u_truncated);
+    // Weighted Gram G = X_uᵀ W X_u  (m × m).
+    let mut wx_u = x_u.clone();
+    for (mut row, &w) in wx_u.outer_iter_mut().zip(weights.iter()) {
+        row *= w.max(0.0);
+    }
+    let gram = x_u.t().dot(&wx_u);
+    let chol = match gram.cholesky(Side::Lower) {
+        Ok(chol) => chol,
+        // Degenerate unpenalized block: cannot attribute leverage to it, so do
+        // not suppress (leave the existing guards to decide).
+        Err(_) => return false,
+    };
+
+    let mut n_high = 0usize;
+    let mut n_unpenalized = 0usize;
+    for i in 0..n {
+        let h_i = leverage[i];
+        if h_i <= ALO_MAX_LEVERAGE_THRESHOLD {
+            continue;
+        }
+        n_high += 1;
+        let x_ui = x_u.row(i).to_owned();
+        // g = G⁻¹ x_{u,i}; h_i^u = w_i · x_{u,i}ᵀ g.
+        let g = chol.solvevec(&x_ui);
+        let h_unpenalized = weights[i].max(0.0) * x_ui.dot(&g);
+        if h_unpenalized >= ALO_UNPENALIZED_LEVERAGE_FRACTION * h_i {
+            n_unpenalized += 1;
+        }
+    }
+    n_high > 0 && (n_unpenalized as f64) >= ALO_UNPENALIZED_ROWS_FRACTION * (n_high as f64)
+}
+
 /// Raw standardized leave-one-out deviance contribution
 /// d = w·(y − η̃)²/φ for one observation, before saturation.
 fn gaussian_alo_raw_deviance(y: f64, eta_loo: f64, prior_weight: f64, phi: f64) -> f64 {
@@ -9341,6 +9404,23 @@ impl<'a> RemlState<'a> {
             .filter(|&&h| h > ALO_MAX_LEVERAGE_THRESHOLD)
             .count();
         if (n_high_leverage as f64) > ALO_PERVASIVE_LEVERAGE_FRACTION * (n as f64) {
+            return Ok(None);
+        }
+
+        // Parametric-rank gate (#862). Adding a few plain linear/parametric
+        // nuisance columns to a smooth on small n raises a handful of rows above
+        // the leverage threshold — but that leverage is owned by the UNPENALIZED
+        // (parametric + penalty-null) block, which is fit exactly, so no finite λ
+        // on the penalized terms can clear the barrier and ALO just grinds the
+        // outer-REML surface (the 30-70× slowdown). Suppress when the high-
+        // leverage rows are explained by the unpenalized block rather than being
+        // concentrated outliers on the penalized smooth.
+        if unpenalized_block_explains_high_leverage(
+            &bundle.pirls_result.x_transformed.to_dense(),
+            &bundle.pirls_result.reparam_result.u_truncated,
+            bundle.pirls_result.solveweights.view(),
+            alo.leverage.view(),
+        ) {
             return Ok(None);
         }
 
