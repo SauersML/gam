@@ -2540,6 +2540,47 @@ impl FittedModel {
         Ok(required)
     }
 
+    /// Columns a *post-fit diagnostic* command (diagnose / sample / report)
+    /// needs **beyond** [`Self::prediction_required_columns`].
+    ///
+    /// Prediction deliberately drops a standard GAM's bare response so a
+    /// prediction frame may omit it (#840 / #864). Diagnostics are statements
+    /// *about* that observed response — residuals, R², posterior likelihoods,
+    /// leave-one-out — so the response must be present. This returns the bare
+    /// response column when the prediction projection would otherwise drop it,
+    /// and nothing when the response is already prediction-required (survival
+    /// `Surv(...)` time/event columns, the transformation-normal response) or
+    /// is not a plain data column.
+    ///
+    /// Centralising the intent here is what makes it *structurally impossible*
+    /// for a diagnostic command to silently drop the response: callers use
+    /// `load_dataset…_for_diagnostics`, which always folds these in, instead of
+    /// each remembering to thread an `extra_required` response by hand.
+    pub fn diagnostic_extra_columns(&self) -> Result<Vec<String>, String> {
+        let payload = self.payload();
+        let parsed = parse_formula(payload.formula.as_str()).map_err(|e| e.to_string())?;
+        // Survival responses are `Surv(...)` expressions, not bare columns; the
+        // underlying entry/exit columns are already prediction-required.
+        if parse_surv_response(parsed.response.as_str())
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let response = parsed.response.trim();
+        // A response that is empty, or a function-call expression rather than a
+        // plain data column, has no bare column to re-add.
+        if response.is_empty() || response.contains('(') {
+            return Ok(Vec::new());
+        }
+        // Already prediction-required (e.g. transformation-normal re-adds it):
+        // nothing extra to fold in.
+        if self.prediction_required_columns()?.contains(response) {
+            return Ok(Vec::new());
+        }
+        Ok(vec![response.to_string()])
+    }
+
     /// Add the columns referenced by an auxiliary (noise / logslope) formula,
     /// which may be supplied as a full `lhs ~ rhs` formula or as a bare RHS.
     fn add_auxiliary_formula_columns(
