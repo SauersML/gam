@@ -6766,6 +6766,7 @@ fn build_latent_duchon_design(
     latent_dim: usize,
     centers: ArrayView2<'_, f64>,
     m: usize,
+    periodic: Option<&[Option<f64>]>,
 ) -> Result<(Array2<f64>, Array2<f64>), String> {
     if t_flat.len() != n_obs * latent_dim {
         return Err(format!(
@@ -6804,6 +6805,24 @@ fn build_latent_duchon_design(
     // point which routes through this same resolver.
     let (resolved_nullspace, resolved_power) =
         resolve_duchon_orders(latent_dim, duchon_nullspace_from_m(m), 0, None);
+    // When the optimizer retracts the latent coordinates on a PERIODIC manifold
+    // (circle / torus), the decoder MUST be a function on that manifold:
+    // Φ(θ) = Φ(θ + period) per circular axis, with the kernel distance measured
+    // across the seam. We mirror the POSITION periodic-Duchon path exactly —
+    // route through `build_duchon_basis_mixed_periodicity_auto`, which sends the
+    // 1-D circle to the Bernoulli Green's-function builder (the true PSD circle
+    // kernel, gam#580) and a multi-axis torus to the chord-distance polyharmonic
+    // builder. `periodic` carries a per-axis optional period (radians, the chart
+    // wrap = TAU for circle/torus); a `None` axis is a Euclidean (open) axis.
+    // When `periodic` is `None`/all-open the basis stays byte-identical to the
+    // open Euclidean construction (euclidean / sphere / matern latent fits).
+    let periodic_flags: Option<Vec<bool>> = periodic.and_then(|axes| {
+        if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) {
+            Some(axes.iter().map(|p| p.is_some()).collect())
+        } else {
+            None
+        }
+    });
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
         length_scale: None,
@@ -6815,8 +6834,20 @@ fn build_latent_duchon_design(
         periodic: None,
         boundary: OneDimensionalBoundary::Open,
     };
-    let built = build_duchon_basis(t_mat.view(), &spec)
-        .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?;
+    let built = if let Some(flags) = periodic_flags {
+        // `periodic` is Some with the same arity (checked above). Each periodic
+        // axis carries an explicit chart period (TAU); non-periodic axes get a
+        // placeholder period (unused by the builder for `!periodic` axes).
+        let axes = periodic.expect("periodic_flags is only Some when periodic is Some");
+        let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
+        build_duchon_basis_mixed_periodicity_auto(t_mat.view(), &spec, &flags, Some(&periods))
+            .map_err(|err| {
+                format!("failed to evaluate periodic N-D Duchon basis for LatentCoord: {err}")
+            })?
+    } else {
+        build_duchon_basis(t_mat.view(), &spec)
+            .map_err(|err| format!("failed to evaluate N-D Duchon basis for LatentCoord: {err}"))?
+    };
     let design = built
         .design
         .try_to_dense_by_chunks("latent_duchon_design")
@@ -7003,10 +7034,11 @@ fn build_latent_forward_design(
     tensor_knots_concat: Option<ArrayView1<'_, f64>>,
     tensor_knot_offsets: Option<&[usize]>,
     tensor_degrees: Option<&[usize]>,
+    periodic: Option<&[Option<f64>]>,
 ) -> Result<(Array2<f64>, Array2<f64>, Array3<f64>), String> {
     let basis_kind = latent_basis_kind(basis_kind)?;
     let (design, t_mat) = match basis_kind {
-        "duchon" => build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?,
+        "duchon" => build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, periodic)?,
         "matern" => {
             if centers.ncols() != latent_dim {
                 return Err(format!(
@@ -8332,6 +8364,7 @@ fn gaussian_reml_fit_latent_impl(
     aux_strength: Option<f64>,
     dim_selection_precision: Option<ArrayView1<'_, f64>>,
     analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+    periodic: Option<&[Option<f64>]>,
 ) -> Result<
     (
         gam::gaussian_reml::GaussianRemlMultiResult,
@@ -8350,6 +8383,7 @@ fn gaussian_reml_fit_latent_impl(
         tensor_knots_concat,
         tensor_knot_offsets,
         tensor_degrees,
+        periodic,
     )?;
     // Build the (optionally) augmented Y/X stack carrying the identifiability
     // penalty. The penalty `½ μ ‖t − t_ref‖²` is *not* on the design Φ; it
@@ -8505,6 +8539,9 @@ fn gaussian_reml_fit_latent<'py>(
                 tensor_knots_values.as_ref().map(|a| a.view()),
                 tensor_knot_offsets.as_deref(),
                 tensor_degrees.as_deref(),
+                // Standalone fit entrypoint: no manifold/chart concept, so the
+                // latent design stays the open Euclidean basis (unchanged).
+                None,
             )
             .map_err(py_value_error)?;
             let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
@@ -8564,6 +8601,8 @@ fn gaussian_reml_fit_latent<'py>(
                 aux_strength,
                 dim_selection_values.as_ref().map(|a| a.view()),
                 Some(&registry),
+                // Standalone fit entrypoint: no manifold/chart, open Euclidean.
+                None,
             )
         })?;
     let out = PyDict::new(py);
@@ -12093,6 +12132,11 @@ fn gaussian_reml_fit_latent_backward<'py>(
         tensor_knots_concat.as_ref().map(|a| a.as_array()),
         tensor_knot_offsets.as_deref(),
         tensor_degrees.as_deref(),
+        // Standalone Python backward/gradient entrypoint: no manifold/chart
+        // concept here (the Rust outer optimizer routes through
+        // `LatentOuterProblem`), so the latent design stays the open Euclidean
+        // basis — byte-identical to prior behavior.
+        None,
     )
     .map_err(py_value_error)?;
     let fit = gaussian_reml_multi_closed_form_with_cache(
@@ -12264,6 +12308,11 @@ struct LatentOuterProblem {
     tensor_knots: Option<Array1<f64>>,
     tensor_knot_offsets: Option<Vec<usize>>,
     tensor_degrees: Option<Vec<usize>>,
+    /// Per-axis chart period of the optimizer's manifold (radians) for the
+    /// Duchon decoder; `None` on Euclidean / sphere so the decoder stays the
+    /// open Euclidean basis. Derived from the `manifold` string in
+    /// `gaussian_reml_optimize_latent` via `latent_manifold_periodic_descriptor`.
+    periodic: Option<Vec<Option<f64>>>,
 }
 
 impl LatentOuterProblem {
@@ -12302,6 +12351,7 @@ impl LatentOuterProblem {
             self.tensor_knots.as_ref().map(|a| a.view()),
             self.tensor_knot_offsets.as_deref(),
             self.tensor_degrees.as_deref(),
+            self.periodic.as_deref(),
         )?;
         let weights_view = self.weights.as_ref().map(|w| w.view());
         let fit = gaussian_reml_multi_closed_form_with_cache(
@@ -12392,6 +12442,31 @@ impl gam::geometry::RiemannianObjective for LatentOuterObjective<'_> {
 
 /// Build the manifold the outer optimizer walks `t` on. `manifold` names the
 /// per-observation geometry; the full latent lives on the `n_obs`-fold product.
+/// Per-axis chart period for the latent decoder, derived from the optimizer's
+/// manifold so the Duchon decoder is a genuine function ON that manifold.
+///
+/// The circle manifold (`src/geometry/circle.rs`) wraps each coordinate to
+/// `[-π, π)`, i.e. period `2π = TAU` radians; the torus is its `d`-fold product.
+/// The optimizer retracts the latent in radians on these charts, and the
+/// periodic eigenmap seed (`latent_periodic_seed_start`) also produces radians,
+/// so the decoder kernel distance must be measured modulo `TAU` per circular
+/// axis and satisfy `Φ(θ) = Φ(θ + TAU)`. A non-periodic axis is `None`.
+///
+/// Euclidean / sphere return `None` (no axis is a circle): those latent fits
+/// stay byte-identical to the open Euclidean Duchon basis. (`sphere` is `S^{d-1}`
+/// embedded in `R^d` with NO periodic chart axis here — the spherical structure
+/// is carried by the retraction, not by a per-axis wrap.)
+fn latent_manifold_periodic_descriptor(
+    manifold: &str,
+    latent_dim: usize,
+) -> Option<Vec<Option<f64>>> {
+    match manifold.to_ascii_lowercase().replace('-', "_").as_str() {
+        "circle" | "s1" if latent_dim == 1 => Some(vec![Some(std::f64::consts::TAU)]),
+        "torus" => Some(vec![Some(std::f64::consts::TAU); latent_dim]),
+        _ => None,
+    }
+}
+
 fn build_latent_outer_manifold(
     manifold: &str,
     n_obs: usize,
@@ -12792,6 +12867,11 @@ fn gaussian_reml_optimize_latent<'py>(
         .as_ref()
         .map(|a| a.as_array().to_owned());
 
+    // Derive the periodic chart descriptor ONCE from the manifold; it drives the
+    // periodic Duchon decoder both during optimization (`try_value_and_grad`) and
+    // for the final reported fit so the OPTIMIZED basis == the FINAL basis. Only
+    // the Duchon decoder consumes it; matern/sphere/tensor branches ignore it.
+    let latent_periodic = latent_manifold_periodic_descriptor(&manifold, latent_dim);
     let problem = LatentOuterProblem {
         y: y.as_array().to_owned(),
         centers: centers.as_array().to_owned(),
@@ -12810,6 +12890,7 @@ fn gaussian_reml_optimize_latent<'py>(
         tensor_knots: tensor_knots_values,
         tensor_knot_offsets,
         tensor_degrees,
+        periodic: latent_periodic,
     };
 
     let manifold_box =
@@ -12907,6 +12988,7 @@ fn gaussian_reml_optimize_latent<'py>(
         tensor_knots,
         tensor_knot_offsets,
         tensor_degrees,
+        periodic: latent_periodic_final,
         ..
     } = problem;
     let best_t_for_fit = best_t.clone();
@@ -12935,6 +13017,10 @@ fn gaussian_reml_optimize_latent<'py>(
                 aux_strength,
                 dim_selection.as_ref().map(|a| a.view()),
                 Some(&registry),
+                // Final reported fit MUST use the SAME manifold-derived periodic
+                // Duchon decoder the optimizer used (so OPTIMIZED basis == FINAL
+                // basis); `None` for Euclidean / sphere keeps those byte-identical.
+                latent_periodic_final.as_deref(),
             )
         })?;
 
@@ -13091,7 +13177,10 @@ fn glm_reml_fit_latent_impl(
             y.ncols()
         ));
     }
-    let (design, t_mat) = build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m)?;
+    // GLM standalone latent fit: no manifold/chart concept here, so the latent
+    // Duchon decoder stays the open Euclidean basis (byte-identical).
+    let (design, t_mat) =
+        build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, None)?;
     if penalty.dim() != (design.ncols(), design.ncols()) {
         return Err(format!(
             "penalty shape mismatch: expected {}x{}, got {}x{}",
@@ -13331,6 +13420,8 @@ fn glm_reml_fit_latent<'py>(
             latent_dim,
             centers_values.view(),
             m,
+            // GLM standalone latent entrypoint: no manifold/chart, open Euclidean.
+            None,
         )
         .map_err(py_value_error)?;
         let (prior_score, aux_strength_state) = latent_prior_score_and_aux_state_for_t(
