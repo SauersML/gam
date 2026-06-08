@@ -1365,13 +1365,34 @@ class TopologyAutoSelector:
         auto = _maybe_auto_smooth(formula)
         normalized = _normalize_selector_candidates(self.candidates, latent.d)
 
+        # Hoist topology-independent shared work above the candidate loop
+        # (#869): the table ingestion (normalize_table) and the per-candidate
+        # AUTO-formula surgery (_candidate_formula) and per-candidate latent
+        # projection (_latent_for_topology) are invariant to the budget cap, so
+        # the budget cascade and the survivor refit would otherwise recompute
+        # them on every pass. Normalize the table once and cache each
+        # candidate's (formula, latent) pair keyed by candidate identity.
+        headers, rows, table_kind = normalize_table(data)
+        shared_table = PreNormalizedTable(headers, rows, table_kind)
+        candidate_inputs: dict[int, tuple[str, Any]] = {}
+
+        def _candidate_inputs_cached(candidate: _Candidate) -> tuple[str, Any]:
+            cached = candidate_inputs.get(id(candidate))
+            if cached is not None:
+                return cached
+            built = (
+                _candidate_formula(formula, auto, candidate),
+                _latent_for_topology(latent, candidate.name),
+            )
+            candidate_inputs[id(candidate)] = built
+            return built
+
         def _screen_score(
             candidate: _Candidate, stage_kwargs: Mapping[str, Any]
         ) -> float:
-            candidate_formula = _candidate_formula(formula, auto, candidate)
-            candidate_latent = _latent_for_topology(latent, candidate.name)
+            candidate_formula, candidate_latent = _candidate_inputs_cached(candidate)
             model = fit(
-                data,
+                shared_table,
                 candidate_formula,
                 latents={latent_name: candidate_latent},
                 penalties=penalties,
@@ -1417,10 +1438,9 @@ class TopologyAutoSelector:
 
         for candidate in survivors:
             try:
-                candidate_formula = _candidate_formula(formula, auto, candidate)
-                candidate_latent = _latent_for_topology(latent, candidate.name)
+                candidate_formula, candidate_latent = _candidate_inputs_cached(candidate)
                 model = fit(
-                    data,
+                    shared_table,
                     candidate_formula,
                     latents={latent_name: candidate_latent},
                     penalties=penalties,
