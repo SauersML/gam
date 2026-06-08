@@ -1639,26 +1639,69 @@ pub fn build_survival_time_basis(
             if penalty_basis.design.ncols() != p_time_full + 1 {
                 return Err("internal error: ispline penalty dimension mismatch".to_string());
             }
-            // I-spline second-difference penalty, restricted to the retained
-            // (non-dropped) coefficient block. NOTE: the principled penalty is
-            // the value-space curvature `Lᵀ S_B L` (so a linear log-cumulative-
-            // hazard lands in the nullspace and the tail is not over-shrunk —
-            // see #691), but applying it enlarges the penalty nullspace and the
-            // survival inner PIRLS does not yet keep the likelihood-identified
-            // linear-trend curvature over that nullspace, so it fails to
-            // converge. Until the survival REML/PIRLS keeps that curvature
-            // (the #752 principle, on the inner solve), use the increment-space
-            // submatrix, which converges.
+            // Value-space I-spline curvature penalty `S_I = Lᵀ S_B L` (#691).
+            //
+            // The I-spline value columns are right-cumulative sums of the
+            // degree-`bspline_degree` B-splines: I-spline column `c`
+            // (`c = 0..p_time_full-1`) equals `Σ_{m ≥ c+1} B_m`. Writing the
+            // baseline `q = Σ_c γ_c I_c = Σ_m B_m · (Σ_{c < m} γ_c)`, the B-spline
+            // coefficient vector is `cβ = L γ` with the lower-triangular
+            // cumulative-sum operator `L[m, c] = 1 iff c < m` (the dropped
+            // `m = 0` B-spline column has coefficient 0). The 2nd-difference
+            // penalty `S_B` measures curvature of `q` through its B-spline
+            // coefficients, so the curvature penalty on the I-spline coefficients
+            // γ is `S_I = Lᵀ S_B L`, NOT the raw `S_B[1.., 1..]` increment-space
+            // submatrix. The increment-space penalty penalizes 2nd differences of
+            // the I-spline INCREMENTS (γ are the derivative increments, not the
+            // curve values), whose nullspace does NOT contain a linear `q`; a
+            // linear log-cumulative-hazard (`q = a·log t`, the affine truth) then
+            // gets a positive cost and REML over-shrinks the baseline slope,
+            // flattening the upper tail of `log Λ(t)` (the #691 tail bias).
+            //
+            // `Lᵀ S_B L` puts a linear `q` in the penalty nullspace (zero
+            // curvature, unpenalized) so the tail slope is recovered. This
+            // ENLARGES the penalty nullspace (the linear log-cumhaz trend is now
+            // unpenalized); the survival inner solve keeps that likelihood-
+            // identified direction via the stabilization ridge in the PLS solve
+            // and the #752 generalized-determinant EDF/logdet over range(H+Sλ),
+            // so it is fit by the data rather than left adrift.
+            //
+            // `S_I[a, b] = Σ_{m > a} Σ_{m' > b} S_B[m, m']` is the double
+            // right-cumulative sum of `S_B` over B-spline rows/cols `> a`/`> b`.
             let mut penalties = Vec::<Array2<f64>>::new();
             for s_mat in &penalty_basis.penalties {
                 if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
                     continue;
                 }
-                let reduced = s_mat.slice(ndarray::s![1.., 1..]).to_owned();
+                // Build the full I-spline-space penalty `S_I = Lᵀ S_B L`.
+                let s_i_full = {
+                    // Row-side cumulative: rowcum[a][m'] = Σ_{m ≥ a+1} S_B[m, m'].
+                    let mut rowcum = Array2::<f64>::zeros((p_time_full, p_time_full + 1));
+                    for a in (0..p_time_full).rev() {
+                        for m_col in 0..(p_time_full + 1) {
+                            let below = if a + 1 < p_time_full {
+                                rowcum[[a + 1, m_col]]
+                            } else {
+                                0.0
+                            };
+                            rowcum[[a, m_col]] = below + s_mat[[a + 1, m_col]];
+                        }
+                    }
+                    // Column-side cumulative: S_I[a][b] = Σ_{m' ≥ b+1} rowcum[a][m'].
+                    let mut s_i = Array2::<f64>::zeros((p_time_full, p_time_full));
+                    for a in 0..p_time_full {
+                        let mut running = 0.0_f64;
+                        for b in (0..p_time_full).rev() {
+                            running += rowcum[[a, b + 1]];
+                            s_i[[a, b]] = running;
+                        }
+                    }
+                    s_i
+                };
                 let mut local = Array2::<f64>::zeros((p_time, p_time));
                 for (i_new, &i_old) in keep_cols.iter().enumerate() {
                     for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                        local[[i_new, j_new]] = reduced[[i_old, j_old]];
+                        local[[i_new, j_new]] = s_i_full[[i_old, j_old]];
                     }
                 }
                 penalties.push(local);
