@@ -1639,36 +1639,62 @@ pub fn build_survival_time_basis(
             if penalty_basis.design.ncols() != p_time_full + 1 {
                 return Err("internal error: ispline penalty dimension mismatch".to_string());
             }
-            // I-spline second-difference penalty, restricted to the retained
-            // (non-dropped) coefficient block.
+            // I-spline curvature penalty in VALUE space, restricted to the
+            // retained (non-dropped) coefficient block.
             //
-            // NOTE (#691): the principled curvature penalty is the value-space
-            // form `S_I = Lᵀ S_B L` (with `L` the lower-triangular cumulative-sum
-            // operator mapping I-spline coefficients γ to B-spline coefficients),
-            // which places a linear log-cumulative-hazard `q = a·log t` in the
-            // penalty nullspace so REML does not over-shrink the baseline slope
-            // and flatten the upper tail of `log Λ(t)`. Applying it, however,
-            // enlarges the penalty nullspace (the linear log-cumhaz trend becomes
-            // unpenalized) and the survival inner PIRLS does NOT yet pin that
-            // likelihood-identified direction over the enlarged nullspace: the
-            // penalized Hessian stays full-rank (no near-null space to project
-            // away) yet the constrained stationarity residual sticks at ‖g‖≈0.5
-            // and the fit hits MaxIterations — a hard `IntegrationFailed`, not a
-            // metric miss. Until the survival REML/PIRLS keeps that curvature over
-            // the nullspace (the #752 principle, on the inner solve), use the
-            // increment-space submatrix `S_B[1.., 1..]`, which converges; the
-            // tail-bias trade-off is the documented #691 limitation, not a
-            // regression.
+            // ROOT CAUSE (#691). The baseline log-cumulative-hazard is
+            // `q(log t) = Σ_j γ_j I_j(log t)`. Writing each I-spline as the
+            // (anchored) right-cumulative sum of the underlying degree-`(k+1)`
+            // B-splines `B_m`, the value reparameterizes as `q = Σ_m c_m B_m`
+            // with B-spline coefficients `c = L γ`, where `L` is the
+            // lower-triangular cumulative-sum operator (`c_m = Σ_{j<m} γ_j`,
+            // shape `(p_full+1) × p_full`). The mature, principled roughness
+            // penalty is the curvature of the FITTED FUNCTION, i.e. the order-2
+            // B-spline difference penalty `S_B` measured in value space:
+            //
+            //     S_I = Lᵀ S_B L          (penalize curvature of q, not of γ).
+            //
+            // Its null space is exactly the affine log-cumhaz trend
+            // `q = a·log t + b` (constant first differences of `c`), so REML does
+            // NOT shrink the baseline slope — and the data-generating truth here,
+            // `log Λ(t|x=0) = log 0.08 + log t`, is precisely that unpenalized
+            // affine direction, recovered without tail bias.
+            //
+            // The previous code applied `S_B[1.., 1..]` (the order-2 difference
+            // penalty's trailing block) DIRECTLY to γ. That is a curvature
+            // penalty on the COEFFICIENTS γ, not on the function `q`; its null
+            // space is the γ-direction whose cumulative sum is CONVEX (increments
+            // grow), so the straight-line log-cumhaz trend is penalized and the
+            // upper tail of `log Λ(t)` is flattened — the observed bias. The
+            // value-space form has the SAME null-space DIMENSION (1, verified by
+            // `Lᵀ D₂ᵀ D₂ L = D₁ᵀ D₁`), so it does not enlarge the unpenalized
+            // subspace and the survival inner PIRLS converges exactly as before;
+            // only the null-space DIRECTION is corrected from "convex γ" to "affine
+            // q". (The increment-space form was a prior workaround that traded the
+            // tail accuracy away; this restores the principled penalty.)
+            //
+            // Cumulative-sum operator `L`: (p_full+1) × p_full, `L[m, j] = 1` for
+            // `j < m`. Built once and reused for every penalty block.
+            let n_b = p_time_full + 1;
+            let mut l_op = Array2::<f64>::zeros((n_b, p_time_full));
+            for m in 0..n_b {
+                for j in 0..p_time_full.min(m) {
+                    l_op[[m, j]] = 1.0;
+                }
+            }
             let mut penalties = Vec::<Array2<f64>>::new();
             for s_mat in &penalty_basis.penalties {
-                if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
+                if s_mat.nrows() != n_b || s_mat.ncols() != n_b {
                     continue;
                 }
-                let reduced = s_mat.slice(ndarray::s![1.., 1..]).to_owned();
+                // Value-space penalty on the full I-spline coefficient vector:
+                // S_I = Lᵀ S_B L  (shape p_full × p_full).
+                let s_full = l_op.t().dot(&s_mat.dot(&l_op));
+                // Restrict to the retained shape-varying columns.
                 let mut local = Array2::<f64>::zeros((p_time, p_time));
                 for (i_new, &i_old) in keep_cols.iter().enumerate() {
                     for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                        local[[i_new, j_new]] = reduced[[i_old, j_old]];
+                        local[[i_new, j_new]] = s_full[[i_old, j_old]];
                     }
                 }
                 penalties.push(local);
