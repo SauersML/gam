@@ -18,6 +18,20 @@
 //! and against scipy's `spence`-based Li₃ on a sweep of `z ∈ {0.1, …, 0.99}`
 //! to ≤ 1e-13.
 
+/// Per-term magnitude below which the truncated power series is considered
+/// converged: at `1e-18` the dropped tail is well under one ulp of an O(1)
+/// partial sum, so the early exit never costs accuracy.
+const SERIES_TERM_FLOOR: f64 = 1e-18;
+
+/// Hard term cap for the fast regime `z ≤ 0.5`, where the geometric-like decay
+/// reaches [`SERIES_TERM_FLOOR`] in well under this many terms; acts only as a
+/// non-convergence guard.
+const FAST_REGIME_MAX_TERMS: usize = 200;
+
+/// Hard term cap for the slow `Li₃` regime `z ∈ (0.5, 1)`, raised so the series
+/// still holds ≳13 digits at `z = 0.999` before the floor triggers.
+const SLOW_TRILOG_MAX_TERMS: usize = 5000;
+
 /// Dilogarithm `Li₂(z) = Σ_{k≥1} z^k / k²` for real `z ∈ [0, 1]`.
 ///
 /// Direct series for `z ≤ 0.5`; for `z ∈ (0.5, 1]` the reflection
@@ -38,11 +52,11 @@ pub(crate) fn dilog_unit(z: f64) -> f64 {
     if z <= 0.5 {
         let mut sum = 0.0_f64;
         let mut zk = z;
-        for k in 1..=200 {
+        for k in 1..=FAST_REGIME_MAX_TERMS {
             let kf = k as f64;
             let term = zk / (kf * kf);
             sum += term;
-            if term < 1e-18 {
+            if term < SERIES_TERM_FLOOR {
                 break;
             }
             zk *= z;
@@ -73,14 +87,18 @@ pub(crate) fn trilog_unit(z: f64) -> f64 {
     if z >= 1.0 {
         return ZETA3;
     }
-    let max_terms: usize = if z <= 0.5 { 200 } else { 5000 };
+    let max_terms: usize = if z <= 0.5 {
+        FAST_REGIME_MAX_TERMS
+    } else {
+        SLOW_TRILOG_MAX_TERMS
+    };
     let mut sum = 0.0_f64;
     let mut zk = z;
     for k in 1..=max_terms {
         let kf = k as f64;
         let term = zk / (kf * kf * kf);
         sum += term;
-        if term < 1e-18 {
+        if term < SERIES_TERM_FLOOR {
             break;
         }
         zk *= z;
