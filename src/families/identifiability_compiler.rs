@@ -53,6 +53,25 @@ pub trait RowJacobianOperator: Send + Sync {
     /// Materialise the full operator as an `(n_rows × ncols × K)` tensor.
     fn evaluate_full(&self) -> Array3<f64>;
 
+    /// Build the sqrt(H)-scaled design `W = stack_i sqrt(H_i) · J_i`, flattened
+    /// channel-major to `(n_rows·K × ncols)`.
+    ///
+    /// This is the representation the identifiability *compiler*
+    /// ([`compile_with_dual_metric`]) actually consumes — it residualises and
+    /// eigendecomposes Grams of `W`, and never indexes the per-row `(n, p, K)`
+    /// tensor element-wise. Requesting the scaled design directly lets an
+    /// operator with a structured / streaming form supply it without
+    /// materialising and cloning the whole `O(n·p·K)` tensor; the default
+    /// implementation routes through [`evaluate_full`] so existing operators
+    /// remain correct unchanged. (#738: a capability is not a representation —
+    /// the compiler asks for the scaled design it needs, not the dense tensor.)
+    ///
+    /// [`evaluate_full`]: RowJacobianOperator::evaluate_full
+    /// [`compile_with_dual_metric`]: crate::families::identifiability_compiler::compile_with_dual_metric
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+        scale_block_by_sqrt_h(&self.evaluate_full(), h_full)
+    }
+
     /// Write the channel-flattened column `col` — the `(n_rows · K)` vector
     /// whose entry `i·K + ch` is `J[i, col, ch]` — into `out`.
     ///
@@ -367,15 +386,24 @@ pub fn compile_with_dual_metric(
     // symmetric-sqrt cost is dominated by the joint-design audit below.
     let h_full = row_hess.evaluate_full();
     let s_full = row_structural.evaluate_full();
-    let j_full: Vec<Array3<f64>> = operators.iter().map(|op| op.evaluate_full()).collect();
 
-    let scaled_h: Vec<Array2<f64>> = j_full
+    // Request each block's sqrt(H)-scaled design directly through the intent
+    // accessor — the `(n·K, p)` representation the compiler actually consumes —
+    // instead of first materialising the dense `(n, p, K)` per-row tensor and
+    // scaling it. The default `scaled_design_by_sqrt_h` impl still routes
+    // through `evaluate_full()`, so operators without a structured form stay
+    // correct unchanged; a streaming operator (e.g. `BlockJacobianAsRowOp`)
+    // overrides it to scale straight out of its stored layout, dropping the
+    // `O(n·p·K)` tensor clone that `evaluate_full()` performs per block at
+    // biobank `n`. (#738: a capability is not a representation — the compiler
+    // asks for the scaled design it needs, never the dense tensor.)
+    let scaled_h: Vec<Array2<f64>> = operators
         .iter()
-        .map(|jb| scale_block_by_sqrt_h(jb, &h_full))
+        .map(|op| op.scaled_design_by_sqrt_h(&h_full))
         .collect();
-    let scaled_s: Vec<Array2<f64>> = j_full
+    let scaled_s: Vec<Array2<f64>> = operators
         .iter()
-        .map(|jb| scale_block_by_sqrt_h(jb, &s_full))
+        .map(|op| op.scaled_design_by_sqrt_h(&s_full))
         .collect();
 
     let mut compiled: Vec<CompiledBlock> = Vec::with_capacity(operators.len());
@@ -589,19 +617,42 @@ pub fn compile_with_dual_metric(
     })
 }
 
-/// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)`.
+/// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)` from a
+/// materialised `(n, p, K)` tensor. Thin wrapper over
+/// [`scale_jacobian_by_sqrt_h_with`] that reads the tensor element-wise.
 fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> {
     let n = jb.shape()[0];
     let p = jb.shape()[1];
     let k = jb.shape()[2];
+    scale_jacobian_by_sqrt_h_with(n, p, k, h_full, |i, a, c| jb[[i, a, c]])
+}
+
+/// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)` without
+/// ever requiring a materialised `(n, p, K)` tensor.
+///
+/// The Jacobian entries are pulled through the `jac` closure
+/// (`jac(i, a, c) = J_b,i[a, c]`), so a structured operator that stores its
+/// Jacobian in a compact / streaming form can supply the sqrt(H)-scaled design
+/// directly — the representation the compiler actually consumes — rather than
+/// being forced to clone a dense `(n, p, K)` tensor first. (#738: a capability
+/// is not a representation — the compiler asks for the scaled `(n·K, p)` design
+/// it needs, not the dense per-row tensor.)
+///
+/// `K` is tiny (1 or 4), so the per-row symmetric sqrt is negligible relative
+/// to the overall compile.
+pub fn scale_jacobian_by_sqrt_h_with(
+    n: usize,
+    p: usize,
+    k: usize,
+    h_full: &Array3<f64>,
+    jac: impl Fn(usize, usize, usize) -> f64,
+) -> Array2<f64> {
     assert_eq!(h_full.shape(), &[n, k, k]);
     let mut out = Array2::<f64>::zeros((n * k, p));
     let mut sqrt_h = Array2::<f64>::zeros((k, k));
     let mut scratch_jrow = Array2::<f64>::zeros((p, k));
     for i in 0..n {
-        // Symmetric square root of H_i via eigendecomposition. K is tiny
-        // (1 or 4), so the per-row eigh cost is negligible relative to the
-        // overall compile.
+        // Symmetric square root of H_i via eigendecomposition.
         let h_i = h_full.index_axis(Axis(0), i).to_owned();
         sqrt_h.fill(0.0);
         symmetric_sqrt_into(&h_i, &mut sqrt_h);
@@ -610,7 +661,7 @@ fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> 
         // sqrt_h, but we batch by writing out[(i*k+c), a] = (sqrt_h · J_b,iᵀ)[c, a].
         for a in 0..p {
             for c in 0..k {
-                scratch_jrow[[a, c]] = jb[[i, a, c]];
+                scratch_jrow[[a, c]] = jac(i, a, c);
             }
         }
         for c in 0..k {
