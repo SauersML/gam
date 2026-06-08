@@ -1232,28 +1232,6 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
-    /// Above this `n`, line-search trial probes (calls with
-    /// `options.early_exit_threshold = Some(_)`) install an
-    /// auto-stratified Horvitz–Thompson subsample for the reject/accept
-    /// short-circuit, and accepted trials are re-evaluated on the full
-    /// data before the LL is handed to the solver. Below this `n` the
-    /// full-data path is cheap enough that subsampling buys nothing
-    /// (the per-row objective-only kernel collapses to a single
-    /// `signed_probit_logcdf_and_mills_ratio` call on the standard-
-    /// normal latent measure).
-    ///
-    /// Unbiasedness: every line-search *accept* decision is made on the
-    /// full-data objective (the subsample only filters out
-    /// *rejected* trials cheaply via the early-exit lower bound on
-    /// `-Σ log Φ`), so the converged iterate is bit-identical to the
-    /// full-data line search modulo the order in which the partial-sum
-    /// chunks are summed.
-    ///
-    /// No flags, no env vars: the user-facing rule is auto-derived from
-    /// problem characteristics, with this in-source constant as the
-    /// canonical `n`-threshold.
-    pub(crate) const AUTO_LINE_SEARCH_SUBSAMPLE_N: usize = 30_000;
-
     /// Outer-aware variant of `log_likelihood_only`. When
     /// `options.outer_score_subsample` is `None` this iterates over all rows
     /// and returns a value identical (bit-for-bit) to the legacy full-data
@@ -1270,56 +1248,22 @@ impl BernoulliMarginalSlopeFamily {
         self.validate_exact_monotonicity(block_states)?;
         let flex_active = self.effective_flex_active(block_states)?;
         let n = self.y.len();
-        // ── Auto line-search subsample ──────────────────────────────
-        //
-        // When the caller is a line-search trial probe
-        // (`options.early_exit_threshold = Some(_)`) and has NOT
-        // supplied their own outer-score subsample, and `n` is large
-        // enough that the per-row trial cost dominates, auto-install a
-        // stratified Horvitz-Thompson mask for the *trial* evaluation
-        // only. On rejected trials this short-circuits the full row
-        // sweep via `bernoulli_margslope_line_search_ll_with_early_exit`'s
-        // existing early-exit. On accepted trials we re-evaluate the
-        // objective on the full data before returning the LL so the
-        // solver's Armijo/Wolfe check is bit-exact equivalent to the
-        // full-data line search.
-        //
-        // The subsample uses {0, 1} y as the secondary stratum (mirrors
-        // `batched_outer_gradient_terms`'s rho-gradient subsampling), so
-        // rare-event imbalanced fits keep proper class representation
-        // in every trial probe.
-        let (effective_options, trial_subsample_installed) =
-            if options.early_exit_threshold.is_some()
-                && options.outer_score_subsample.is_none()
-                && n >= Self::AUTO_LINE_SEARCH_SUBSAMPLE_N
-            {
-                let stratum_secondary: Vec<u8> = self
-                    .y
-                    .iter()
-                    .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
-                    .collect();
-                let z_slice = self
-                    .z
-                    .as_slice()
-                    .expect("BMS family z must be contiguous for line-search subsample");
-                let auto_opts =
-                    crate::families::marginal_slope_shared::AutoOuterSubsampleOptions::default();
-                match crate::families::marginal_slope_shared::auto_outer_score_subsample(
-                    z_slice,
-                    Some(&stratum_secondary),
-                    &auto_opts,
-                ) {
-                    Some(subsample) => {
-                        let mut cloned = options.clone();
-                        cloned.outer_score_subsample = Some(std::sync::Arc::new(subsample));
-                        (std::borrow::Cow::Owned(cloned), true)
-                    }
-                    None => (std::borrow::Cow::Borrowed(options), false),
-                }
-            } else {
-                (std::borrow::Cow::Borrowed(options), false)
-            };
-        let options: &BlockwiseFitOptions = &effective_options;
+        // Line-search accept/reject is an exact full-data decision. A
+        // line-search trial probe (`options.early_exit_threshold =
+        // Some(_)`) never installs an auto Horvitz-Thompson subsample:
+        // the threshold is the *full-data* objective at the old iterate
+        // (`old_objective + slack - trial_penalty`), and an HT-weighted
+        // partial sum is only an *unbiased estimator* of the full-data
+        // NLL, not a deterministic lower bound on it — so an HT
+        // early-exit can falsely reject a step whose true full-data NLL
+        // sits below the threshold. The full-data sweep below keeps a
+        // *sound* early-exit reject: every row contributes
+        // `weight_i * log Φ ≤ 0`, so the running `-total_ll` is a genuine
+        // monotone lower bound on the full-data NLL and short-circuits a
+        // genuinely-rejected trial before the sweep finishes. Outer
+        // derivative passes still subsample via the caller-supplied
+        // `options.outer_score_subsample` (set only for `OuterDerivative`
+        // scope), which `outer_weighted_rows` honors here.
         let weighted_rows = outer_weighted_rows(options, n);
         if !flex_active {
             // Rigid probit under the active latent measure. Standard-normal
@@ -1350,33 +1294,11 @@ impl BernoulliMarginalSlopeFamily {
                 Ok(-neglog)
             };
             if let Some(threshold) = options.early_exit_threshold {
-                let trial_result = bernoulli_margslope_line_search_ll_with_early_exit(
+                return bernoulli_margslope_line_search_ll_with_early_exit(
                     &weighted_rows,
                     threshold,
                     row_ll,
                 );
-                // Trial accepted on the auto-installed subsample: re-
-                // evaluate on the full data so the solver's Armijo/Wolfe
-                // check decides on the bit-exact full-data objective.
-                // Rejected trials short-circuit through the `Err` path —
-                // no full-data work paid on the reject.
-                if trial_subsample_installed && let Ok(_subsample_ll) = trial_result {
-                    let full_total: Result<f64, String> = (0..n)
-                        .into_par_iter()
-                        .try_fold(
-                            || 0.0,
-                            |mut ll, i| -> Result<_, String> {
-                                ll += row_ll(i)?;
-                                Ok(ll)
-                            },
-                        )
-                        .try_reduce(
-                            || 0.0,
-                            |left, right| -> Result<_, String> { Ok(left + right) },
-                        );
-                    return full_total;
-                }
-                return trial_result;
             }
             let total: Result<f64, String> = weighted_rows
                 .into_par_iter()
@@ -1415,28 +1337,11 @@ impl BernoulliMarginalSlopeFamily {
             Ok(self.weights[row] * log_cdf)
         };
         if let Some(threshold) = options.early_exit_threshold {
-            let trial_result = bernoulli_margslope_line_search_ll_with_early_exit(
+            return bernoulli_margslope_line_search_ll_with_early_exit(
                 &weighted_rows,
                 threshold,
                 row_ll,
             );
-            if trial_subsample_installed && let Ok(_subsample_ll) = trial_result {
-                let full_total: Result<f64, String> = (0..n)
-                    .into_par_iter()
-                    .try_fold(
-                        || 0.0,
-                        |mut ll, i| -> Result<_, String> {
-                            ll += row_ll(i)?;
-                            Ok(ll)
-                        },
-                    )
-                    .try_reduce(
-                        || 0.0,
-                        |left, right| -> Result<_, String> { Ok(left + right) },
-                    );
-                return full_total;
-            }
-            return trial_result;
         }
         let total: Result<f64, String> = weighted_rows
             .into_par_iter()
