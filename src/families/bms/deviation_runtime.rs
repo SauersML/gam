@@ -5,6 +5,14 @@ use crate::pirls::LinearInequalityConstraints;
 use crate::span::{breakpoints_from_knots, span_index_for_breakpoints};
 use ndarray::{Array1, Array2, ArrayView2};
 
+/// Round-off tolerance on the minimum monotonicity-derivative slack. The
+/// constraints are constructed with a positive required margin
+/// (`monotonicity_eps`); this separate, tiny negative bound only absorbs the
+/// finite-precision accumulation in evaluating the slack at the I-spline
+/// breakpoints, so a coefficient that is feasible up to a few ulps is not
+/// spuriously rejected. Anything more negative is a genuine violation.
+const MONOTONICITY_SLACK_ROUNDOFF_TOL: f64 = -1e-10;
+
 /// Typed errors emitted by the deviation runtime construction and evaluation
 /// helpers in this module.
 ///
@@ -1397,7 +1405,7 @@ impl DeviationRuntime {
         context: &str,
     ) -> Result<(), String> {
         let slack = self.exact_monotonicity_min_slack(beta)?;
-        if slack >= -1e-10 {
+        if slack >= MONOTONICITY_SLACK_ROUNDOFF_TOL {
             Ok(())
         } else {
             let (left, right) = self.support_interval()?;
