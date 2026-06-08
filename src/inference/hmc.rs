@@ -189,6 +189,17 @@ impl SamplingVisualizer {
     }
 }
 
+/// Upper bound on the autocorrelation lag summed in the effective-sample-size
+/// estimate. The Geyer initial-positive-sequence sum normally self-truncates
+/// long before this, but a hard cap bounds the `O(n·lag)` work for very long
+/// chains where the autocorrelation tail is numerical noise.
+const MAX_AUTOCORRELATION_LAG: usize = 1000;
+
+/// Floor on the lag-0 autocovariance (chain variance) used as the denominator in
+/// the autocorrelation ratios, guarding against division by zero for a chain
+/// that is numerically constant.
+const AUTOCOVARIANCE_FLOOR: f64 = 1e-16;
+
 /// Compute split-chain R-hat and ESS using the Gelman-Rubin diagnostic.
 ///
 /// This is the standard split-chain formulation (no rank normalization).
@@ -253,10 +264,10 @@ fn compute_split_rhat_and_ess(samples: &Array3<f64>) -> (f64, f64) {
                 let d = splitvalue(samples, n_chains, half, dim, sc, t) - mean;
                 g0 += d * d;
             }
-            gamma0[sc] = (g0 / n as f64).max(1e-16);
+            gamma0[sc] = (g0 / n as f64).max(AUTOCOVARIANCE_FLOOR);
         }
 
-        let max_lag = (n - 1).min(1000);
+        let max_lag = (n - 1).min(MAX_AUTOCORRELATION_LAG);
         let mut tau = 1.0_f64;
         let mut lag = 1usize;
         while lag < max_lag {
@@ -3724,10 +3735,56 @@ fn nuts_transition_seed(seed: u64, stream: u64) -> u64 {
     splitmix64(seed ^ stream ^ 0xA24B_AED4_963E_E407)
 }
 
+/// Parameter dimension above which the posterior is treated as "high-dimensional"
+/// for the purpose of the more conservative sampler heuristics below: a higher
+/// target-acceptance floor (smaller leapfrog steps) and stronger mass-matrix
+/// regularization. The boundary matches the `dense_max_dim` cap at which the
+/// engine stops attempting dense mass-matrix adaptation.
+const HIGH_DIM_THRESHOLD: usize = 50;
+
+/// Target-acceptance floor enforced for high-dimensional posteriors
+/// (`dim > HIGH_DIM_THRESHOLD`). NUTS efficiency degrades faster with too-large
+/// steps in high dimensions, so we refuse to honor a requested accept below this.
+const HIGH_DIM_TARGET_ACCEPT_FLOOR: f64 = 0.92;
+/// Target-acceptance floor for low-dimensional posteriors.
+const LOW_DIM_TARGET_ACCEPT_FLOOR: f64 = 0.90;
+/// Upper bound on the effective target acceptance. Pushing target accept toward
+/// 1 collapses the step size and stalls mixing, so we cap the requested value.
+const MAX_TARGET_ACCEPT: f64 = 0.95;
+
+/// Minimum warmup length below which mass-matrix adaptation is disabled: the
+/// windowed (Stan-style) adaptation schedule needs enough warmup iterations to
+/// populate its initial / terminal buffers, otherwise the estimated metric is
+/// noise. With fewer warmup steps the sampler runs on the identity metric.
+const MIN_WARMUP_FOR_MASS_ADAPT: usize = 80;
+
+/// Largest parameter dimension for which the engine attempts *dense* mass-matrix
+/// adaptation; above this it falls back to a diagonal metric (an `O(p²)` dense
+/// metric is neither affordable nor reliably estimable from limited warmup).
+const DENSE_MASS_MATRIX_MAX_DIM: usize = 75;
+
+/// Mass-matrix ridge (added to the diagonal of the estimated metric) for the
+/// general (mean-family) sampler. The high-dimensional value is larger because
+/// the warmup metric estimate is noisier relative to its scale as `p` grows.
+const MASS_REGULARIZE_HIGH_DIM: f64 = 0.14;
+const MASS_REGULARIZE_LOW_DIM: f64 = 0.10;
+/// Mass-matrix ridge for survival posteriors, which are frequently skewed by
+/// censoring / rare events and so warrant a heavier ridge than the mean family.
+const SURVIVAL_MASS_REGULARIZE_HIGH_DIM: f64 = 0.18;
+const SURVIVAL_MASS_REGULARIZE_LOW_DIM: f64 = 0.12;
+
+/// Jitter added during mass-matrix inversion to keep the metric strictly
+/// positive-definite against round-off in the warmup covariance estimate.
+const MASS_MATRIX_JITTER: f64 = 1e-5;
+
 #[inline]
 fn robust_target_accept(requested: f64, dim: usize) -> f64 {
-    let floor = if dim > 50 { 0.92 } else { 0.90 };
-    requested.max(floor).min(0.95)
+    let floor = if dim > HIGH_DIM_THRESHOLD {
+        HIGH_DIM_TARGET_ACCEPT_FLOOR
+    } else {
+        LOW_DIM_TARGET_ACCEPT_FLOOR
+    };
+    requested.max(floor).min(MAX_TARGET_ACCEPT)
 }
 
 fn jittered_initial_positions(
@@ -3745,7 +3802,7 @@ fn jittered_initial_positions(
 }
 
 fn robust_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMatrixConfig {
-    if nwarmup < 80 {
+    if nwarmup < MIN_WARMUP_FOR_MASS_ADAPT {
         return NUTSMassMatrixConfig::disabled();
     }
     let start_buffer = (nwarmup / 8).clamp(35, 180);
@@ -3756,14 +3813,18 @@ fn robust_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMatrixConfig
         start_buffer,
         end_buffer,
         initial_window,
-        regularize: if dim > 50 { 0.14 } else { 0.10 },
-        jitter: 1e-5,
-        dense_max_dim: 75,
+        regularize: if dim > HIGH_DIM_THRESHOLD {
+            MASS_REGULARIZE_HIGH_DIM
+        } else {
+            MASS_REGULARIZE_LOW_DIM
+        },
+        jitter: MASS_MATRIX_JITTER,
+        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
     }
 }
 
 fn robust_survival_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMatrixConfig {
-    if nwarmup < 80 {
+    if nwarmup < MIN_WARMUP_FOR_MASS_ADAPT {
         return NUTSMassMatrixConfig::disabled();
     }
     // Survival posteriors with censoring/rare events are often skewed; this
@@ -3776,9 +3837,13 @@ fn robust_survival_mass_matrix_config(dim: usize, nwarmup: usize) -> NUTSMassMat
         start_buffer,
         end_buffer,
         initial_window,
-        regularize: if dim > 50 { 0.18 } else { 0.12 },
-        jitter: 1e-5,
-        dense_max_dim: 75,
+        regularize: if dim > HIGH_DIM_THRESHOLD {
+            SURVIVAL_MASS_REGULARIZE_HIGH_DIM
+        } else {
+            SURVIVAL_MASS_REGULARIZE_LOW_DIM
+        },
+        jitter: MASS_MATRIX_JITTER,
+        dense_max_dim: DENSE_MASS_MATRIX_MAX_DIM,
     }
 }
 

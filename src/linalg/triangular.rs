@@ -19,6 +19,12 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
+/// Diagonal magnitude below which a pivot in the guarded back-substitution is
+/// treated as a rank-deficient (zero) direction, yielding a zero draw component
+/// rather than a non-finite value. Chosen near `f64` working precision so that
+/// only genuinely degenerate conditional precisions are zeroed.
+const RANK_DEFICIENT_PIVOT_FLOOR: f64 = 1e-14;
+
 /// Validation strictness for [`cholesky_factor_in_place`].
 ///
 /// The historical call sites differed in how aggressively they rejected
@@ -155,7 +161,11 @@ pub(crate) fn back_substitution_lower_transpose_guarded_into(
             v -= l[[j, i]] * out[j];
         }
         let d = l[[i, i]];
-        out[i] = if d.abs() > 1e-14 { v / d } else { 0.0 };
+        out[i] = if d.abs() > RANK_DEFICIENT_PIVOT_FLOOR {
+            v / d
+        } else {
+            0.0
+        };
     }
 }
 
