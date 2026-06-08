@@ -875,6 +875,11 @@ fn parse_periodic_per_axis(value: &JsonValue, symbol: &str) -> Result<Vec<Option
     Ok(out)
 }
 
+/// Absolute tolerance for matching a user-supplied `nu` to one of the supported
+/// half-integer Matérn smoothness values; loose enough to absorb the float
+/// round-trip through JSON, tight enough that no two half-integers collide.
+const MATERN_NU_HALF_INTEGER_TOL: f64 = 1e-9;
+
 fn parse_matern_nu(nu: f64, symbol: &str) -> Result<MaternNu, String> {
     // Half-integer match with tolerance.
     let candidates = [
@@ -885,7 +890,7 @@ fn parse_matern_nu(nu: f64, symbol: &str) -> Result<MaternNu, String> {
         (4.5, MaternNu::NineHalves),
     ];
     for (target, variant) in candidates {
-        if (nu - target).abs() < 1e-9 {
+        if (nu - target).abs() < MATERN_NU_HALF_INTEGER_TOL {
             return Ok(variant);
         }
     }
