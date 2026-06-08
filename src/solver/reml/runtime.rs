@@ -5448,18 +5448,21 @@ impl<'a> RemlState<'a> {
         let Some(kkt) = pr.constraint_kkt.as_ref() else {
             return Ok(());
         };
-        // On a degenerate boundary face (linearly-dependent active rows), the
-        // exact projected gradient is not unique and a strict 5e-6
+        // On a genuinely degenerate boundary face (linearly-dependent active
+        // rows), the active-row multipliers are non-unique and a strict 5e-6
         // stationarity check is unreachable by construction. The inner
         // active-set solver already certifies such iterates via its
         // `degenerate_boundary_ok` clause at the relaxed
         // `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` tolerance — without
-        // matching that here, the outer startup gate refuses a legitimately
-        // converged constrained optimum (root cause of the
-        // `shape=concave`/`shape=convex` curvature-constraint startup abort:
-        // a 2nd-difference operator forces dependence whenever more than `p`
-        // rows bind, and every cold seed lands on such a face). Primal /
-        // dual / complementarity stay on their strict tolerances; only the
+        // matching that here, the outer startup gate would refuse a
+        // legitimately converged constrained optimum. This relaxation is gated
+        // strictly on `working_set_rank_deficient`; it does NOT fire for
+        // `shape=concave`/`shape=convex`, whose active rows are independent
+        // coordinate lower bounds `γ_j ≥ 0` (full rank). Those converge from a
+        // strictly-interior cold seed (`project_point_strictly_into_feasible_cone`)
+        // and are held to the strict tolerance — their cold-vs-warm cache
+        // divergence (#873) was a seed problem, not a degeneracy. Primal / dual
+        // / complementarity stay on their strict tolerances; only the
         // stationarity channel — the one mathematically unreachable on a
         // rank-deficient face — gets the matching relaxation.
         let stationarity_tol = if kkt.working_set_rank_deficient {

@@ -38,18 +38,29 @@ const ACTIVE_SET_KKT_COMPLEMENTARITY_TOL: f64 = 1e-6;
 /// strictly-negative multiplier means the constraint should be released).
 const ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL: f64 = 1e-8;
 
-/// Relaxed stationarity tolerance accepted only on a *degenerate boundary
-/// face* (linearly-dependent active rows), where the exact projected gradient
-/// cannot reach `ACTIVE_SET_KKT_STATIONARITY_TOL`. Still requires primal
-/// feasibility, complementarity, and a relative-stationarity backstop.
+/// Relaxed stationarity tolerance accepted only on a *genuinely degenerate
+/// boundary face* — one whose active rows are linearly dependent
+/// (`rank(A_active) < n_active`), so the active-row multipliers are non-unique
+/// and the exact projected gradient cannot reach
+/// `ACTIVE_SET_KKT_STATIONARITY_TOL`. Still requires primal feasibility,
+/// complementarity, and a relative-stationarity backstop.
 ///
 /// Public so the outer REML / PIRLS validation gate can apply the same
 /// relaxation when the diagnostic reports a rank-deficient active face — a
 /// strict 5e-6 check there would otherwise refuse iterates that the inner
 /// active-set solver legitimately certified via its own `degenerate_boundary_ok`
-/// clause, causing a startup-validation abort on curvature constraints
-/// (`shape=concave` / `shape=convex`) where the second-difference operator
-/// makes the active rows linearly dependent by construction.
+/// clause.
+///
+/// NOTE: this is *not* the mechanism that fixes the `shape=concave` /
+/// `shape=convex` cold-vs-warm cache divergence (#873). The B-spline shape path
+/// reparameterizes curvature into independent *coordinate lower bounds*
+/// `γ_j ≥ 0` (see `shape_lower_bounds_local`); any subset of those active rows
+/// is full rank, so `working_set_rank_deficient` stays `false` and this
+/// relaxation never fires for them — and must not be widened to. That bug is a
+/// *seed* problem (a cold seed landing on the cone vertex with every curvature
+/// row tight); it is fixed at the source by
+/// `project_point_strictly_into_feasible_cone`, which starts the inner solve
+/// strictly inside the cone so the strict tolerance is reachable.
 pub(crate) const ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL: f64 = 1e-3;
 
 /// Relative scale on the predicted-decrease test `predicted_delta ≤
@@ -140,16 +151,19 @@ pub struct ConstraintKktDiagnostics {
     /// Tolerance used to classify active constraints from slacks.
     pub active_tolerance: f64,
     /// `true` when the active rows are linearly dependent (`rank(A_active) <
-    /// n_active`) — a *degenerate boundary face*. On such a face the exact
-    /// projected gradient is not unique and the strict stationarity tolerance
-    /// is unreachable by construction (curvature constraints — e.g.
-    /// `shape=concave`/`shape=convex` — encode a second-difference operator
-    /// whose active rows are linearly dependent whenever more than `p` of
-    /// them bind). The inner active-set solver certifies these iterates via
-    /// its `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` relaxation; the
-    /// outer validation gate must consult this flag to apply the matching
+    /// n_active`) — a *degenerate boundary face*. On such a face the active-row
+    /// multipliers are non-unique and the strict stationarity tolerance is
+    /// unreachable by construction. The inner active-set solver certifies these
+    /// iterates via its `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` relaxation;
+    /// the outer validation gate must consult this flag to apply the matching
     /// relaxation, or it will refuse a legitimately-converged constrained
     /// optimum and abort the REML startup loop.
+    ///
+    /// NOTE: B-spline `shape=concave`/`shape=convex` faces are *not* degenerate
+    /// — that path reparameterizes curvature into independent coordinate lower
+    /// bounds `γ_j ≥ 0` (full-rank active subsets), so this flag stays `false`
+    /// for them. Their cold-start fragility is a seed problem fixed by the
+    /// strictly-interior seed, not by this relaxation.
     #[serde(default)]
     pub working_set_rank_deficient: bool,
 }
@@ -540,12 +554,49 @@ pub(crate) fn project_point_strictly_into_feasible_cone(
     if constraints.a.ncols() != p || m == 0 || constraints.b.len() != m {
         return None;
     }
-    // Shift each row strictly into the interior by `δ·‖a_i‖`, so that the scaled
-    // (geometric) slack `(a_iᵀβ − b_i)/‖a_i‖ ≥ δ` on the returned seed.
+    // Per-row interior margin in scaled (geometric) slack units. A genuine
+    // one-sided inequality is shifted the full `δ`, so that the scaled slack
+    // `(a_iᵀβ − b_i)/‖a_i‖ ≥ δ` on the returned seed. But a row that is one half
+    // of an *anti-parallel pair* — the canonical encoding of an equality
+    // `rᵀβ = t` as `{rᵀβ ≥ t, −rᵀβ ≥ −t}` emitted by a clamped / anchored
+    // boundary condition — must NOT be shifted into mutual infeasibility with
+    // its partner. For an anti-parallel pair the feasible slab has scaled width
+    // `w`; shifting each side inward by `s` needs `s_i + s_j ≤ w`, so each side
+    // is capped at `w/3`. An exact equality pair has `w = 0`, so neither side
+    // moves and the seed is projected exactly onto the equality hyperplane
+    // (where that row is *meant* to be tight), while the genuine one-sided shape
+    // rows still receive the full interior margin. Without this cap, combining
+    // `shape=concave`/`convex` with `bc=clamped`/`anchored` shifts the equality
+    // pair to the empty set `t+δ ≤ rᵀβ ≤ t−δ`, the projection fails, and the
+    // caller falls back to the cone vertex — silently reintroducing the #873
+    // boundary seed for the *combined* constraint case.
+    let norms: Vec<f64> = (0..m)
+        .map(|i| constraints.a.row(i).dot(&constraints.a.row(i)).sqrt())
+        .collect();
+    let mut margin = vec![ACTIVE_SET_INTERIOR_SEED_MARGIN; m];
+    for i in 0..m {
+        if norms[i] == 0.0 {
+            margin[i] = 0.0;
+            continue;
+        }
+        for j in (i + 1)..m {
+            if norms[j] == 0.0 {
+                continue;
+            }
+            let cos = constraints.a.row(i).dot(&constraints.a.row(j)) / (norms[i] * norms[j]);
+            if cos <= -1.0 + 1e-9 {
+                // Anti-parallel rows â and −â: row i is `âᵀβ ≥ b_i/‖a_i‖` and
+                // row j is `âᵀβ ≤ −b_j/‖a_j‖`. Scaled feasible-slab width:
+                let width = -constraints.b[j] / norms[j] - constraints.b[i] / norms[i];
+                let cap = (width / 3.0).max(0.0);
+                margin[i] = margin[i].min(cap);
+                margin[j] = margin[j].min(cap);
+            }
+        }
+    }
     let mut b_interior = constraints.b.clone();
     for i in 0..m {
-        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
-        b_interior[i] += ACTIVE_SET_INTERIOR_SEED_MARGIN * norm;
+        b_interior[i] += margin[i] * norms[i];
     }
     let interior = LinearInequalityConstraints::from_paired(constraints.a.clone(), b_interior);
     let identity = Array2::<f64>::eye(p);
@@ -554,18 +605,18 @@ pub(crate) fn project_point_strictly_into_feasible_cone(
     if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    // Certify strict interiority against the ORIGINAL constraints: every scaled
-    // slack must clear (most of) the requested margin so the QP step solver sees
-    // an empty initial active set.
-    let mut min_scaled_slack = f64::INFINITY;
+    // Certify against the ORIGINAL constraints: every genuine one-sided row must
+    // clear (most of) its requested margin so the QP step solver sees no
+    // spurious active rows, while equality-pair rows (margin ≈ 0) need only be
+    // feasible — they are legitimately tight.
+    const SEED_FEASIBILITY_TOL: f64 = 1e-9;
     for i in 0..m {
-        min_scaled_slack = min_scaled_slack.min(scaled_constraint_slack(&beta, constraints, i));
+        let s = scaled_constraint_slack(&beta, constraints, i);
+        if s < 0.5 * margin[i] - SEED_FEASIBILITY_TOL {
+            return None;
+        }
     }
-    if min_scaled_slack >= 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN {
-        Some(beta)
-    } else {
-        None
-    }
+    Some(beta)
 }
 
 /// Worst primal-feasibility violation across all rows of `constraints`,
@@ -960,7 +1011,19 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
     let mut complementarity: f64 = 0.0;
     for i in 0..m {
         dual_feasibility = dual_feasibility.max((-lambda[i]).max(0.0));
-        complementarity = complementarity.max((lambda[i] * slack[i]).abs());
+        // Scale-invariant complementarity `λ̂_i · ŝ_i` with `λ̂_i = ‖a_i‖·λ_i`
+        // and `ŝ_i` the already-scaled slack: this product equals the raw
+        // `λ_i · (a_iᵀx − b_i)`, invariant under per-row rescaling — matching the
+        // documented contract above (`λ̂_i = ‖a_i‖·λ_i`). `lambda_active_true`
+        // here is the RAW multiplier, so without the `‖a_i‖` factor this would
+        // understate complementarity by `1/‖a_i‖` on high-norm rows (e.g. a
+        // B-spline endpoint-derivative clamp, ‖a‖ ≈ 38).
+        let norm_i = working_constraints
+            .a
+            .row(i)
+            .dot(&working_constraints.a.row(i))
+            .sqrt();
+        complementarity = complementarity.max((norm_i * lambda[i] * slack[i]).abs());
     }
     let stationarity = {
         let mut resid = gradient.to_owned();
@@ -1510,6 +1573,54 @@ mod tests {
         assert!(
             min_slack >= 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN,
             "projected seed must be strictly interior on every row; min scaled slack = {min_slack:.3e}"
+        );
+    }
+
+    /// Mirrors `s(x, shape=concave, bc=clamped)`: shape curvature reparameterized
+    /// to independent coordinate lower bounds `γ_j ≥ 0` (genuine one-sided rows),
+    /// MERGED with a boundary condition encoded as an anti-parallel inequality
+    /// PAIR `{r·β ≥ t, −r·β ≥ −t}` (an equality `r·β = t`). A naive
+    /// shift-every-row-inward projection turns that pair into the empty set
+    /// `t+δ ≤ r·β ≤ t−δ`, fails, and the caller falls back to the cone vertex —
+    /// silently reintroducing the #873 seed for the combined case. The
+    /// anti-parallel-aware margin must leave the equality pair tight while still
+    /// pushing the genuine shape rows strictly interior.
+    #[test]
+    fn strict_interior_projection_keeps_equality_pairs_tight_with_shape_bounds() {
+        let p = 5usize;
+        // Rows 0..3: shape lower bounds γ_2,γ_3,γ_4 ≥ 0 (homogeneous, b = 0).
+        // Rows 3,4: endpoint equality β_0 = 0 as {e_0·β ≥ 0, −e_0·β ≥ 0}.
+        let m = 3 + 2;
+        let mut a = Array2::<f64>::zeros((m, p));
+        a[[0, 2]] = 1.0;
+        a[[1, 3]] = 1.0;
+        a[[2, 4]] = 1.0;
+        a[[3, 0]] = 1.0;
+        a[[4, 0]] = -1.0;
+        let constraints = LinearInequalityConstraints::from_paired(a, Array1::zeros(m));
+
+        // A seed that violates the shape bounds (negative curvature coords) and
+        // the equality (β_0 ≠ 0).
+        let point = Array1::from_vec(vec![0.7, -0.2, -0.5, -0.3, -0.1]);
+        let seed = project_point_strictly_into_feasible_cone(&point, &constraints).expect(
+            "strict-interior projection must succeed when an equality pair is present, \
+             not collapse to the empty set and fall back to the vertex",
+        );
+
+        // Genuine one-sided shape rows are pushed strictly interior.
+        for i in 0..3 {
+            assert!(
+                scaled_constraint_slack(&seed, &constraints, i) >= 0.4 * ACTIVE_SET_INTERIOR_SEED_MARGIN,
+                "shape row {i} not strictly interior: scaled slack = {:.3e}",
+                scaled_constraint_slack(&seed, &constraints, i)
+            );
+        }
+        // The equality pair stays tight (β_0 ≈ 0), i.e. the seed is projected
+        // onto the boundary hyperplane rather than shifted off it.
+        assert!(
+            seed[0].abs() <= 1e-6,
+            "boundary equality must be enforced, got β_0 = {:.3e}",
+            seed[0]
         );
     }
 
