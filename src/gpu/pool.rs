@@ -25,6 +25,7 @@
 //! `ctx.bind_to_thread()` for its ordinal before issuing any CUDA work, so the
 //! thread-local current context is correct for every kernel launched on it.
 
+use super::device::GpuDeviceInfo;
 use super::runtime::GpuRuntime;
 
 impl GpuRuntime {
@@ -54,9 +55,7 @@ impl GpuRuntime {
         self.devices
             .iter()
             .find(|device| device.ordinal == ordinal)
-            .map_or(self.memory_budget_bytes, |device| {
-                device.free_mem_bytes.min(device.total_mem_bytes / 2)
-            })
+            .map_or(self.memory_budget_bytes, GpuDeviceInfo::memory_budget_bytes)
     }
 }
 
