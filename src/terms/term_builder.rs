@@ -33,6 +33,31 @@ use crate::smooth::{
 };
 use crate::types::ColIdx;
 
+/// Fraction of the data bounding-box diameter used as the default Matérn
+/// length scale when the user does not supply one. A length scale near a small
+/// fraction of the domain extent puts the kernel's correlation range at the
+/// scale of local structure rather than the whole domain.
+const DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
+
+/// Floor on the derived default Matérn length scale, guarding against a zero or
+/// vanishingly small scale when the data span is degenerate.
+const DEFAULT_MATERN_LENGTH_SCALE_FLOOR: f64 = 1e-6;
+
+/// Default B-spline degree when a smooth's `degree=` option is absent. Cubic
+/// (degree 3) is the standard GAM convention: C² continuity with a low knot
+/// count.
+const DEFAULT_BSPLINE_DEGREE: usize = 3;
+
+/// Default difference-penalty order when a smooth's `penalty_order=` (alias
+/// `m=`) option is absent. Second-order (curvature) is the standard P-spline
+/// convention.
+const DEFAULT_PENALTY_ORDER: usize = 2;
+
+/// Default row-chunk size for the out-of-core PCA-basis smooth when the
+/// `chunk_size=` option is absent. Streams the design in row blocks to bound
+/// peak memory independent of the dataset row count.
+const DEFAULT_PCA_CHUNK_SIZE: usize = 4096;
+
 fn default_matern_length_scale(ds: &Dataset, cols: &[usize]) -> f64 {
     let mut diameter2 = 0.0_f64;
     for &col in cols {
@@ -50,7 +75,8 @@ fn default_matern_length_scale(ds: &Dataset, cols: &[usize]) -> f64 {
     }
     let diameter = diameter2.sqrt();
     if diameter.is_finite() && diameter > 0.0 {
-        (0.15 * diameter).max(1e-6)
+        (DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION * diameter)
+            .max(DEFAULT_MATERN_LENGTH_SCALE_FLOOR)
     } else {
         1.0
     }
@@ -1399,7 +1425,7 @@ pub fn build_smooth_basis(
         let degree = if type_opt == "re" {
             1
         } else {
-            option_usize(options, "degree").unwrap_or(3)
+            option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE)
         };
         // For a factor smooth every group's curve is fit from THAT group's rows
         // alone, so the marginal's flexibility must respect the least-resolved
@@ -1468,7 +1494,9 @@ pub fn build_smooth_basis(
         };
         let flavour = match type_opt.as_str() {
             "fs" => FactorSmoothFlavour::Fs {
-                m_null_penalty_orders: vec![option_usize(options, "m").unwrap_or(2)],
+                m_null_penalty_orders: vec![
+                    option_usize(options, "m").unwrap_or(DEFAULT_PENALTY_ORDER),
+                ],
             },
             "sz" => FactorSmoothFlavour::Sz,
             "re" => FactorSmoothFlavour::Re,
@@ -1531,7 +1559,7 @@ pub fn build_smooth_basis(
             }
             let c = cols[0];
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
-            let degree = option_usize(options, "degree").unwrap_or(3);
+            let degree = option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE);
             let mut default_internal = heuristic_knots_for_column(ds.values.column(c));
             if ds.values.nrows() <= 32 && smooth_coordinate_count >= 5 {
                 default_internal = default_internal.min(1);
@@ -1569,7 +1597,8 @@ pub fn build_smooth_basis(
                 feature_col: c,
                 spec: BSplineBasisSpec {
                     degree,
-                    penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
+                    penalty_order: option_usize(options, "penalty_order")
+                        .unwrap_or(DEFAULT_PENALTY_ORDER),
                     knotspec: BSplineKnotSpec::PeriodicUniform {
                         data_range: (domain_start, domain_start + period),
                         num_basis,
@@ -1642,7 +1671,7 @@ pub fn build_smooth_basis(
             }
             let c = cols[0];
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
-            let degree = option_usize(options, "degree").unwrap_or(3);
+            let degree = option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE);
             let default_internal = heuristic_knots_for_column(ds.values.column(c));
             let (mut n_knots, inferred) =
                 parse_ps_internal_knots(options, degree, default_internal)?;
@@ -1711,7 +1740,8 @@ pub fn build_smooth_basis(
                 feature_col: c,
                 spec: BSplineBasisSpec {
                     degree,
-                    penalty_order: option_usize(options, "penalty_order").unwrap_or(2),
+                    penalty_order: option_usize(options, "penalty_order")
+                        .unwrap_or(DEFAULT_PENALTY_ORDER),
                     knotspec,
                     double_penalty: smooth_double_penalty,
                     identifiability: BSplineIdentifiability::default(),
@@ -1884,7 +1914,7 @@ pub fn build_smooth_basis(
                     center_strategy,
                     penalty_order: option_usize(options, "penalty_order")
                         .or_else(|| option_usize(options, "m"))
-                        .unwrap_or(2),
+                        .unwrap_or(DEFAULT_PENALTY_ORDER),
                     double_penalty: smooth_double_penalty,
                     radians,
                     method,
@@ -2265,7 +2295,7 @@ pub fn build_smooth_basis(
             let periodic_axes = parse_tensor_periodic_axes(options, dim)?;
             let periods_opt = parse_periods(options, &periodic_axes)?;
             let origins_opt = parse_period_origins(options, &periodic_axes)?;
-            let degree = option_usize(options, "degree").unwrap_or(3);
+            let degree = option_usize(options, "degree").unwrap_or(DEFAULT_BSPLINE_DEGREE);
             let penalty_order =
                 option_usize(options, "penalty_order").unwrap_or(if degree > 1 { 2 } else { 1 });
             let (mut k_list, k_inferred) = parse_tensor_k_list(options, cols, ds)?;
@@ -2422,7 +2452,7 @@ pub fn build_smooth_basis(
             };
             let k = option_usize_any(options, &["k", "basis_dim", "basis-dim", "basisdim"])
                 .unwrap_or(0);
-            let chunk_size = option_usize(options, "chunk_size").unwrap_or(4096);
+            let chunk_size = option_usize(options, "chunk_size").unwrap_or(DEFAULT_PCA_CHUNK_SIZE);
             Ok(SmoothBasisSpec::Pca {
                 feature_cols: cols.to_vec(),
                 basis_matrix: Array2::<f64>::zeros((cols.len(), k)),
