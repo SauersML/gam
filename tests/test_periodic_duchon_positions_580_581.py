@@ -129,6 +129,34 @@ def test_periodic_duchon_recovers_periodic_truth(period: float | None) -> None:
     assert r2 > 0.99, f"periodic Duchon must recover the circle (R²={r2:.4f}, period={period})"
 
 
+def test_periodic_bspline_position_count_matches_cyclic_penalty() -> None:
+    """Count-based periodic B-spline position fits use K columns and KxK penalty.
+
+    ``knots_or_centers=K`` is the public position-API basis count. It must agree
+    with ``periodic_spline_curve_basis(..., n_knots=K)`` instead of expanding as
+    an open B-spline interior-knot count.
+    """
+    rng = np.random.default_rng(0)
+    t = np.linspace(0.0, 1.0, 40, endpoint=False)
+    y = np.cos(2.0 * np.pi * t)[:, None] + 0.05 * rng.standard_normal((t.size, 1))
+    _, helper_penalty = gamfit.periodic_spline_curve_basis(t, n_knots=12, degree=3)
+
+    for penalty in (None, helper_penalty):
+        out = gamfit.gaussian_reml_fit_positions(
+            t,
+            y,
+            knots_or_centers=12,
+            penalty=penalty,
+            periodic=True,
+            period=1.0,
+        )
+        assert out.get("status") == "ok"
+        assert np.asarray(out["coefficients"]).shape == (12, 1)
+        assert np.asarray(out["fitted"]).shape == y.shape
+        assert np.asarray(out["penalty"]).shape == (12, 12)
+        assert np.all(np.isfinite(np.asarray(out["fitted"])))
+
+
 def test_periodic_duchon_fit_wraps_at_seam() -> None:
     """The fitted periodic smooth must be continuous across the seam.
 

@@ -2434,13 +2434,26 @@ def _resolve_position_basis_inputs(
     )
     effective_kind, order, _ = _normalize_position_basis(display_kind, basis_order)
     t_np = _numeric_vector(t, "t")
-    knots_np, eff_order, _shrunk = _resolve_basis_locations(
-        knots_or_centers,
-        t_np,
-        basis_kind=effective_kind,
-        label="knots_or_centers",
-        degree=order,
-    )
+    kind_norm = str(display_kind).strip().lower().replace("_", "").replace("-", "")
+    if periodic and effective_kind == "bspline" and (
+        knots_or_centers is None
+        or (isinstance(knots_or_centers, int) and not isinstance(knots_or_centers, bool))
+    ):
+        knots_np = _resolve_periodic_position_bspline_knots(
+            knots_or_centers,
+            t_np,
+            degree=order,
+            period=period,
+        )
+        eff_order = order
+    else:
+        knots_np, eff_order, _shrunk = _resolve_basis_locations(
+            knots_or_centers,
+            t_np,
+            basis_kind=effective_kind,
+            label="knots_or_centers",
+            degree=order,
+        )
     # Resolve the effective wrap period for periodic Duchon. The period is the
     # domain wrap, not the knot span: on a half-open grid the knots span only
     # (period − one_spacing). When the caller gives no explicit period, derive it
@@ -2448,7 +2461,6 @@ def _resolve_position_basis_inputs(
     # spacing apart across the wrap (an undersized period gave a non-PSD Gram —
     # gam#580). Non-periodic / non-Duchon bases ignore this.
     eff_period = period
-    kind_norm = str(display_kind).strip().lower().replace("_", "").replace("-", "")
     if periodic and period is None and kind_norm in {"duchon", "duchonspline", "thinplate", "thinplatespline", "tps"}:
         k = np.asarray(knots_np, dtype=float)
         if k.size >= 2:
@@ -2468,6 +2480,63 @@ def _resolve_position_basis_inputs(
         period=eff_period,
     )
     return display_kind, effective_kind, eff_order, t_np, knots_np, penalty_np, eff_period
+
+
+def _resolve_periodic_position_bspline_knots(
+    count: Any,
+    t_arr: Any,
+    *,
+    degree: int,
+    period: float | None,
+) -> Any:
+    """Resolve count-based periodic position B-splines to K cyclic controls.
+
+    ``gaussian_reml_fit_positions(..., periodic=True)`` documents integer
+    ``knots_or_centers`` as a basis count. The Rust position kernel accepts an
+    explicit half-open knot/control grid and derives ``num_basis = len(grid)-1``.
+    Therefore the public count K must become K+1 grid endpoints, not the open
+    B-spline auto-knot vector used by non-periodic fits.
+    """
+    import numpy as np
+
+    degree_i = int(degree)
+    k = int(_DEFAULT_BASIS_K if count is None else count)
+    if k < degree_i + 1:
+        raise ValueError(
+            "periodic B-spline position basis count must be at least "
+            f"degree + 1 (got {k} for degree {degree_i})"
+        )
+    if period is None:
+        raise ValueError("periodic B-spline position fits require a finite positive period")
+    period_f = float(period)
+    if not np.isfinite(period_f) or period_f <= 0.0:
+        raise ValueError(f"period must be finite and positive, got {period}")
+    t_np = np.asarray(t_arr, dtype=float)
+    if t_np.size == 0:
+        raise ValueError("t must contain at least one value")
+    origin = float(np.min(t_np))
+    return np.linspace(origin, origin + period_f, k + 1, dtype=float)
+
+
+def _cyclic_difference_penalty(num_basis: int, order: int = 2) -> Any:
+    """Return ``D.T @ D`` for the cyclic finite-difference operator."""
+    import numpy as np
+
+    k = int(num_basis)
+    order_i = int(order)
+    if k <= 0:
+        raise ValueError(f"num_basis must be positive, got {num_basis}")
+    if order_i <= 0 or order_i >= k:
+        raise ValueError(
+            f"cyclic difference order must be in [1, {k - 1}], got {order}"
+        )
+    d = np.zeros((k, k), dtype=float)
+    rows = np.arange(k)
+    d[rows, rows] = -1.0
+    d[rows, (rows + 1) % k] = 1.0
+    for _ in range(1, order_i):
+        d = d @ d
+    return d.T @ d
 
 
 def gaussian_reml_fit_positions(
@@ -4020,6 +4089,9 @@ def _resolve_position_penalty(
         if kind in {"bspline", "spline"}:
             if penalty_kind not in {None, "coefficient-difference", "coefficientdifference", "difference"}:
                 raise ValueError(f"unsupported B-spline penalty {penalty!r}")
+            if periodic:
+                k = int(np.asarray(knots_or_centers, dtype=float).size - 1)
+                return _cyclic_difference_penalty(k, order=2)
             s, _ = smoothness_penalty(knots_or_centers, degree=int(basis_order), order=2)
             return s
         if kind in {"thinplate", "thinplatespline", "tps"}:

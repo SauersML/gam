@@ -5707,16 +5707,6 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    /// Set ½·Σᵢ log(wᵢ), the dropped Gaussian per-observation normalization
-    /// constant restored by the `ProfiledGaussian` cost so that the objective
-    /// VALUE is exactly invariant to a global prior-weight rescale `w → c·w`
-    /// (issue #877). Pass `0.0` (the default) for any non-Gaussian family; the
-    /// `Fixed`-dispersion arm does not consume it.
-    pub fn gaussian_weight_log_sum_half(mut self, half_log_sum: f64) -> Self {
-        self.gaussian_weight_log_sum_half = half_log_sum;
-        self
-    }
-
     pub fn tk(mut self, correction: f64, gradient: Option<Array1<f64>>) -> Self {
         self.tk_correction = correction;
         self.tk_gradient = gradient;
