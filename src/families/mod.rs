@@ -9,7 +9,6 @@ pub mod identifiability_compiler;
 pub(crate) mod identifiability_gpu;
 #[cfg(target_os = "linux")]
 pub(crate) mod identifiability_gpu_kernel;
-pub mod inverse_link;
 pub(crate) mod jet_partitions;
 pub mod joint_penalty;
 pub(crate) mod latent_interval;

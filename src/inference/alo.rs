@@ -137,6 +137,12 @@ const LEVERAGE_PERCENTILES: [f64; 3] = [0.50, 0.95, 0.99];
 const ALO_DENOMINATOR_MIN: f64 = 1e-12;
 const MULTIBLOCK_ALO_MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
+/// Number of observation columns solved per blocked right-hand-side batch in the
+/// scalar-leverage path. Sizes the reusable `(p, .)` and `(e_rank, .)` scratch
+/// buffers so the dense multi-RHS solve stays BLAS-3 (good cache reuse) without
+/// materializing all `n` columns at once. The final batch is the remainder.
+const ALO_RHS_BLOCK_COLS: usize = 8192;
+
 /// Relative tolerance for accepting the input penalised Hessian `H` as
 /// symmetric. We require `|H_ij − H_ji| ≤ HESSIAN_SYMMETRY_REL_TOL ·
 /// max(|H_ij|, |H_ji|, 1)`. `1e-8` matches the loosest tolerance any
@@ -506,7 +512,7 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
     let mut se_bayes = Array1::<f64>::zeros(n);
     let mut se_sandwich = Array1::<f64>::zeros(n);
 
-    let block_cols = 8192usize;
+    let block_cols = ALO_RHS_BLOCK_COLS;
     // Allocate the RHS scratch in column-major (Fortran) order so its column
     // slices are contiguous and align with faer's column-major solve output.
     // This removes redundant `xrow = x_dense.row(obs)` indirection inside the
