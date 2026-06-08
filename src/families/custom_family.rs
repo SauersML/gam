@@ -16201,6 +16201,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
+            if cycle < 40 || cycle % 50 == 0 {
+                let beta_inf = flatten_state_betas(&states, specs)
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f64, f64::max);
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/gam_diag.log")
+                {
+                    writeln!(
+                        f,
+                        "[DIAG-CYC] cycle={cycle} residual={residual:.4e} step_inf={step_inf:.4e} accepted_step_inf={accepted_step_inf:.4e} beta_inf={beta_inf:.4e} tr={joint_trust_radius:.3e} nullity={joint_step_spectral_nullity}"
+                    )
+                    .ok();
+                }
+            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
@@ -17148,9 +17166,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 log::warn!("{verdict}");
             }
-            eprintln!(
-                "[DIAG-INNER] converged={converged} terminator={terminator} cycles={cycles_done}/{inner_max_cycles} best_resid={best_residual_seen:.3e} p={total_p}"
-            );
+            {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/gam_diag.log")
+                {
+                    writeln!(
+                        f,
+                        "[DIAG-INNER] converged={converged} terminator={terminator} cycles={cycles_done}/{inner_max_cycles} best_resid={best_residual_seen:.3e} p={total_p}"
+                    )
+                    .ok();
+                }
+            }
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
