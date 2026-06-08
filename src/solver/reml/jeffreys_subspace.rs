@@ -216,6 +216,14 @@ const CHEAP_PRECHECK_SAFETY_MARGIN: f64 = 8.0;
 /// routes to the exact path anyway).
 const CHEAP_PRECHECK_LANCZOS_STEPS: usize = 12;
 
+/// Relative residual below which an extreme Ritz pair counts as "converged" and
+/// its residual-augmented eigenvalue bound may be trusted. Measured against the
+/// spectral scale `θ_max` (floored at 1): once `‖H y − θ y‖ ≤ 1e-3·scale`, the
+/// extreme eigenvalue is resolved to three digits, far tighter than the `8×`
+/// safety margin the skip decision then applies. An unresolved residual returns
+/// `None` so the caller falls through to the exact dense path.
+const CHEAP_PRECHECK_RITZ_REL_TOL: f64 = 1e-3;
+
 /// Conservative extreme-eigenvalue bounds `(λ_min_lower, λ_max_upper)` for the
 /// reduced information `H_id = Z_Jᵀ H Z_J` on the FULL span (`Z_J = I`, so
 /// `H_id = H`), computed MATRIX-FREE from a Hessian-vector product `hv` and the
@@ -371,7 +379,7 @@ where
     // the exact dense path rather than trusting an unconverged estimate. This is
     // the safety valve: an unconverged cheap check never authorises a skip.
     let scale = theta_max.abs().max(1.0);
-    let converged_tol = 1e-3 * scale;
+    let converged_tol = CHEAP_PRECHECK_RITZ_REL_TOL * scale;
     if res_min > converged_tol || res_max > converged_tol {
         return Ok(None);
     }
