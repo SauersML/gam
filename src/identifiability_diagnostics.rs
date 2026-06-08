@@ -6,6 +6,33 @@
 
 use ndarray::{Array2, ArrayView1, ArrayView2, Axis};
 
+/// Maximum sweeps for the cyclic-by-largest-pivot Jacobi eigensolver.
+///
+/// Jacobi converges quadratically once off-diagonals are small, and the
+/// matrices here are tiny (< 64×64 identifiability normal-equation blocks),
+/// so a converged solve needs only a handful of sweeps. 200 is a generous
+/// safety cap that the `JACOBI_OFFDIAG_TOL` break almost always reaches
+/// first; it only bounds pathological non-converging inputs.
+const JACOBI_MAX_SWEEPS: usize = 200;
+
+/// Off-diagonal magnitude below which the Jacobi sweep is considered
+/// converged. `1e-14` is two orders above f64 unit roundoff, tight enough
+/// that residual off-diagonal mass cannot perturb the rank/pseudo-inverse
+/// decisions these diagnostics make.
+const JACOBI_OFFDIAG_TOL: f64 = 1.0e-14;
+
+/// Maximum distinct values per aux column for it to count as "discrete".
+///
+/// An integer-valued column with at most this many levels is treated as a
+/// categorical/discrete covariate (the regime the iVAE auxiliary-richness
+/// theorem is stated for); above it the column is treated as continuous.
+const AUX_DISCRETE_MAX_LEVELS: usize = 64;
+
+/// Absolute gap below which two aux values count as the same distinct level.
+/// Integer-valued aux data dedups exactly; this only guards float dust from
+/// the `round()` check above.
+const AUX_LEVEL_DEDUP_TOL: f64 = 1.0e-12;
+
 /// Scalar facts about the auxiliary covariate / latent pair feeding an iVAE.
 #[derive(Debug, Clone)]
 pub struct AuxRichnessMetrics {
@@ -86,8 +113,8 @@ pub fn aux_richness_metrics(aux: ArrayView2<f64>, latents: ArrayView2<f64>) -> A
                 let col = aux.column(j);
                 let mut sorted: Vec<f64> = col.iter().copied().collect();
                 sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                sorted.dedup_by(|a, b| (*a - *b).abs() < 1.0e-12);
-                if sorted.len() > 64 {
+                sorted.dedup_by(|a, b| (*a - *b).abs() < AUX_LEVEL_DEDUP_TOL);
+                if sorted.len() > AUX_DISCRETE_MAX_LEVELS {
                     discrete = false;
                     break;
                 }
@@ -191,9 +218,7 @@ fn jacobi_symmetric_eigen(a: ArrayView2<f64>) -> (Vec<f64>, Array2<f64>) {
     assert_eq!(n, a.ncols());
     let mut m = a.to_owned();
     let mut v = Array2::<f64>::eye(n);
-    let max_iter = 200;
-    let tol = 1.0e-14;
-    for _ in 0..max_iter {
+    for _ in 0..JACOBI_MAX_SWEEPS {
         // Find largest off-diagonal.
         let mut p = 0usize;
         let mut q = 1usize;
@@ -208,7 +233,7 @@ fn jacobi_symmetric_eigen(a: ArrayView2<f64>) -> (Vec<f64>, Array2<f64>) {
                 }
             }
         }
-        if max_off < tol {
+        if max_off < JACOBI_OFFDIAG_TOL {
             break;
         }
         let app = m[[p, p]];
