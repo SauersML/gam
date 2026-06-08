@@ -898,23 +898,126 @@ where
     Dir2Fn: FnMut(&Array1<f64>, &Array1<f64>) -> Result<Option<Array2<f64>>, String>,
 {
     let p = h_joint.nrows();
+    if delta.len() != p {
+        return Err(format!(
+            "joint_jeffreys_hphi_directional_derivative: delta has {} entries, expected {p}",
+            delta.len()
+        ));
+    }
+    // The mode-response perturbation acts on `H_joint` through `Hdot[δ] = D_β H[δ]`
+    // and on each axis derivative `D_a` through `H²dot[δ, e_a] = D²_β H[δ, e_a]`.
+    let pert_h = match hessian_dir(delta)? {
+        Some(hd) => hd,
+        // No exact first directional derivative ⇒ drift undefined ⇒ safe zero.
+        None => return Ok(Array2::zeros((p, p))),
+    };
+    if pert_h.nrows() != p || pert_h.ncols() != p {
+        return Err(format!(
+            "joint_jeffreys_hphi_directional_derivative: Hdot[δ] shape {}x{} != {p}x{p}",
+            pert_h.nrows(),
+            pert_h.ncols()
+        ));
+    }
+    joint_jeffreys_hphi_perturbation_derivative(
+        h_joint,
+        z_j,
+        |axis| hessian_dir(axis),
+        &pert_h,
+        |axis| hessian_second_dir(delta, axis),
+    )
+}
+
+/// Explicit (β-frozen) derivative `∂_ρ H_Φ|_β` of the gated joint-Jeffreys
+/// curvature along an OUTER hyperparameter `ρ` (e.g. a log-penalty `log λ_m` or a
+/// family log-scale `log ε_m`), for the augmented-LAML hypergradient.
+///
+/// THE GAP THIS CLOSES (gam#854). `H_Φ` is built from the JOINT Hessian
+/// `H_joint(β, ρ) = H_data + Σ_m λ_m H_m^pen(β; ε_m)` (value path
+/// [`joint_jeffreys_term`]), so it depends on ρ BOTH through β̂ — the mode response,
+/// supplied by [`joint_jeffreys_hphi_directional_derivative`] — AND EXPLICITLY
+/// through the `λ_m`/`ε_m` that scale and shape the penalty blocks INSIDE
+/// `H_joint`. The outer score
+///   `½ tr[(H+S_λ+H_Φ)⁻¹ ∂_ρ(H+S_λ+H_Φ)]`
+/// therefore needs the explicit term `½ tr[(·)⁻¹ ∂_ρ H_Φ|_β]`; omitting it leaves
+/// the analytic hypergradient short on exactly the most-active penalty axis (the
+/// residual spatial-adaptive tension-axis miss).
+///
+/// The arithmetic is IDENTICAL to the mode-response drift, with the perturbation
+/// sourced from the explicit ρ-derivatives instead of `Hdot[δ]`/`H²dot[δ,e_a]`:
+///   * `pert_h = ∂_ρ H_joint|_β`              perturbs `H_id` and hence `K`,
+///   * `pert_hessian_dir(e_a) = ∂_ρ Hdot[e_a]|_β`  perturbs each axis derivative `D_a`,
+/// while the BASE `M_a = K D_a` uses `base_hessian_dir` (= the real `Hdot[e_a]` at
+/// the current point). Returns the zero matrix when the family lacks the exact
+/// derivatives or the conditioning gate skips the term, so a clean fit is
+/// byte-unchanged.
+pub fn joint_jeffreys_hphi_explicit_param_derivative<BaseFn, PertFn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    pert_h: &Array2<f64>,
+    base_hessian_dir: BaseFn,
+    pert_hessian_dir: PertFn,
+) -> Result<Array2<f64>, String>
+where
+    BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+{
+    joint_jeffreys_hphi_perturbation_derivative(
+        h_joint,
+        z_j,
+        base_hessian_dir,
+        pert_h,
+        pert_hessian_dir,
+    )
+}
+
+/// Shared core for the joint-Jeffreys curvature perturbation derivative
+/// `D[gate·H_Φ_raw]`, given a perturbation that acts on `H_joint` through `pert_h`
+/// (a `p×p` matrix `∂H_joint`) and on each axis derivative `D_a` through
+/// `pert_hessian_dir(e_a)` (a `p×p` matrix `∂Hdot[e_a]`). `base_hessian_dir(e_a)`
+/// supplies the unperturbed `Hdot[e_a]` that forms the base `M_a = K D_a`.
+///
+/// Both the mode-response drift (perturbation `Hdot[δ]`, `H²dot[δ,e_a]`) and the
+/// explicit ρ-derivative (perturbation `∂_ρ H_joint`, `∂_ρ Hdot[e_a]`) are
+/// instances. It reproduces the value path's reduced information, smooth
+/// conditioning gate, and floored pseudo-inverse, and differentiates the gate
+/// (`(D gate)·H_Φ_raw`) so the result is consistent with the gated `H_Φ` the
+/// objective folds into `½ log|H+S_λ+H_Φ|`. With `K = H_id⁻¹` the floored
+/// pseudo-inverse, `M_a = K D_a`, `H_Φ_raw[a,b] = ½⟨vec M_a, vec M_b⟩`:
+///   * `δK = −K Ḋ K`, `Ḋ = Z_Jᵀ (∂H_joint) Z_J` (exact on the unfloored spectrum,
+///     matching the value path; the floored-spectrum divided-difference correction
+///     is the same residual the value/gradient pair already carries),
+///   * `δM_a = −K Ḋ M_a + K (Z_Jᵀ ∂Hdot[e_a] Z_J)`,
+///   * `δH_Φ_raw[a,b] = ½(⟨δM_a, M_b⟩ + ⟨M_a, δM_b⟩)`.
+fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
+    h_joint: ArrayView2<'_, f64>,
+    z_j: ArrayView2<'_, f64>,
+    mut base_hessian_dir: BaseFn,
+    pert_h: &Array2<f64>,
+    mut pert_hessian_dir: PertFn,
+) -> Result<Array2<f64>, String>
+where
+    BaseFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+    PertFn: FnMut(&Array1<f64>) -> Result<Option<Array2<f64>>, String>,
+{
+    let p = h_joint.nrows();
     if h_joint.ncols() != p {
         return Err(format!(
-            "joint_jeffreys_hphi_directional_derivative: H must be square, got {}x{}",
+            "joint_jeffreys_hphi_perturbation_derivative: H must be square, got {}x{}",
             h_joint.nrows(),
             h_joint.ncols()
         ));
     }
     if z_j.nrows() != p {
         return Err(format!(
-            "joint_jeffreys_hphi_directional_derivative: Z_J has {} rows, expected {p}",
+            "joint_jeffreys_hphi_perturbation_derivative: Z_J has {} rows, expected {p}",
             z_j.nrows()
         ));
     }
-    if delta.len() != p {
+    if pert_h.nrows() != p || pert_h.ncols() != p {
         return Err(format!(
-            "joint_jeffreys_hphi_directional_derivative: delta has {} entries, expected {p}",
-            delta.len()
+            "joint_jeffreys_hphi_perturbation_derivative: pert_h shape {}x{} != {p}x{p}",
+            pert_h.nrows(),
+            pert_h.ncols()
         ));
     }
     let m = z_j.ncols();
@@ -924,8 +1027,7 @@ where
 
     // Reproduce EXACTLY the value-path reduced information, conditioning gate, and
     // floored pseudo-inverse so the derivative is consistent with the `H_Φ` the
-    // objective uses. Any divergence here would reintroduce the value/gradient
-    // mismatch this whole term exists to remove.
+    // objective uses.
     let hz0 = h_joint.dot(&z_j);
     let h_id = z_j.t().dot(&hz0);
     let mut h_id_sym = Array2::<f64>::zeros((m, m));
@@ -935,29 +1037,20 @@ where
         }
     }
     let (evals, evecs) = h_id_sym.eigh(Side::Lower).map_err(|e| {
-        format!("joint_jeffreys_hphi_directional_derivative: eigendecomposition failed: {e}")
+        format!("joint_jeffreys_hphi_perturbation_derivative: eigendecomposition failed: {e}")
     })?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max);
-    let gate_weight = {
-        // Same SMOOTH gate weight as the value/gradient path, so the drift is
-        // consistent with the (now smoothly-tapered) `H_Φ` the objective uses.
-        // The weight is treated as locally constant along `δ`: its own first-order
-        // variation feeds only the exact outer-Newton Hessian, not the BFGS outer
-        // gradient the smoother actually consumes, and tapering `H_Φ` smoothly is
-        // what removes the discontinuity that broke outer convergence (#787).
-        let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-        conditioning_gate_weight(lambda_min, lambda_max)
-    };
+    let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let gate_weight = conditioning_gate_weight(lambda_min, lambda_max);
     if gate_weight == 0.0 {
-        // Fully gated out ⇒ H_Φ ≡ 0 in a neighborhood ⇒ its drift vanishes.
+        // Fully gated out ⇒ H_Φ ≡ 0 in a neighborhood ⇒ its derivative vanishes.
         return Ok(Array2::zeros((p, p)));
     }
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
     let mut inv_diag = Array1::<f64>::zeros(m);
     for (i, &lam) in evals.iter().enumerate() {
         // Floor on |λ| with the SIGNED true inverse, identical to the value/gradient
-        // path in `joint_jeffreys_term` (gam#814): an off-mode indefinite reduced
-        // info must use `1/λ` on its moderate negative directions, not `+1/floor`.
+        // path in `joint_jeffreys_term` (gam#814).
         if lam.abs() >= floor {
             inv_diag[i] = 1.0 / lam;
         } else {
@@ -967,39 +1060,26 @@ where
     let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
     let h_id_inv = scaled.dot(&evecs.t());
 
-    // Ḋ = Z_Jᵀ Hdot[δ] Z_J, the directional derivative of the reduced information
-    // along the mode-response direction δ. δ_δ K = −K Ḋ K.
-    let hdot_delta = match hessian_dir(delta)? {
-        Some(hd) => hd,
-        // No exact first directional derivative ⇒ drift undefined ⇒ safe zero.
-        None => return Ok(Array2::zeros((p, p))),
-    };
-    if hdot_delta.nrows() != p || hdot_delta.ncols() != p {
-        return Err(format!(
-            "joint_jeffreys_hphi_directional_derivative: Hdot[δ] shape {}x{} != {p}x{p}",
-            hdot_delta.nrows(),
-            hdot_delta.ncols()
-        ));
-    }
-    let dbar = z_j.t().dot(&hdot_delta.dot(&z_j)); // m x m
+    // Ḋ = Z_Jᵀ (∂H_joint) Z_J, the reduced perturbation of the reduced information.
+    let dbar = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
     let k_dbar = h_id_inv.dot(&dbar); // K Ḋ
 
-    // For each canonical axis e_a: M_a = K D_a and its drift δM_a.
-    // We assemble flattened vec(M_a) and vec(δM_a) so the final contraction is a
-    // pair of m·m inner products per (a,b).
+    // For each canonical axis e_a: base M_a = K D_a and its perturbation δM_a. We
+    // assemble flattened vec(M_a) and vec(δM_a) so the final contraction is a pair
+    // of m·m inner products per (a,b).
     let mut m_rows = Array2::<f64>::zeros((p, m * m)); // vec(M_a)
     let mut dm_rows = Array2::<f64>::zeros((p, m * m)); // vec(δM_a)
     let mut axis = Array1::<f64>::zeros(p);
     for a in 0..p {
         axis.fill(0.0);
         axis[a] = 1.0;
-        let hdot_a = match hessian_dir(&axis)? {
+        let hdot_a = match base_hessian_dir(&axis)? {
             Some(hd) => hd,
             None => return Ok(Array2::zeros((p, p))),
         };
         if hdot_a.nrows() != p || hdot_a.ncols() != p {
             return Err(format!(
-                "joint_jeffreys_hphi_directional_derivative: Hdot[e_a] shape {}x{} != {p}x{p}",
+                "joint_jeffreys_hphi_perturbation_derivative: Hdot[e_a] shape {}x{} != {p}x{p}",
                 hdot_a.nrows(),
                 hdot_a.ncols()
             ));
@@ -1007,23 +1087,21 @@ where
         let d_a = z_j.t().dot(&hdot_a.dot(&z_j)); // Z_Jᵀ ∂_a H Z_J
         let m_a = h_id_inv.dot(&d_a); // K D_a
 
-        // D_a^δ = Z_Jᵀ H²dot[δ, e_a] Z_J  (second directional derivative).
-        let h2dot = match hessian_second_dir(delta, &axis)? {
+        let pert_hdot_a = match pert_hessian_dir(&axis)? {
             Some(h2) => h2,
-            // No exact second directional derivative ⇒ drift undefined ⇒ safe zero.
             None => return Ok(Array2::zeros((p, p))),
         };
-        if h2dot.nrows() != p || h2dot.ncols() != p {
+        if pert_hdot_a.nrows() != p || pert_hdot_a.ncols() != p {
             return Err(format!(
-                "joint_jeffreys_hphi_directional_derivative: H²dot[δ,e_a] shape {}x{} != {p}x{p}",
-                h2dot.nrows(),
-                h2dot.ncols()
+                "joint_jeffreys_hphi_perturbation_derivative: ∂Hdot[e_a] shape {}x{} != {p}x{p}",
+                pert_hdot_a.nrows(),
+                pert_hdot_a.ncols()
             ));
         }
-        let d_a_delta = z_j.t().dot(&h2dot.dot(&z_j)); // Z_Jᵀ ∂_δ∂_a H Z_J
+        let d_a_pert = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
 
-        // δM_a = −K Ḋ M_a + K D_a^δ.
-        let dm_a = &h_id_inv.dot(&d_a_delta) - &k_dbar.dot(&m_a);
+        // δM_a = (∂K) D_a + K (∂D_a) = −K Ḋ M_a + K D_a^pert.
+        let dm_a = &h_id_inv.dot(&d_a_pert) - &k_dbar.dot(&m_a);
 
         let mut col = 0usize;
         for i in 0..m {
@@ -1035,7 +1113,7 @@ where
         }
     }
 
-    // D_β H_Φ[δ][a,b] = ½ (⟨vec δM_a, vec M_b⟩ + ⟨vec M_a, vec δM_b⟩). Symmetric.
+    // δ(½Gram)[a,b] = ½ (⟨vec δM_a, vec M_b⟩ + ⟨vec M_a, vec δM_b⟩). Symmetric.
     let mut out = Array2::<f64>::zeros((p, p));
     for a in 0..p {
         for b in a..p {
@@ -1049,18 +1127,12 @@ where
         }
     }
 
-    // GATE β-DERIVATIVE (value↔outer-gradient consistency, gam#854 tension axis).
-    // The objective folds the GATED curvature `G·H_Φ_raw` into `½ log|H+S_λ+G·H_Φ_raw|`,
-    // and the gate `G(λ_min, λ_max)` moves with β through the mode response δ. The
-    // exact drift is therefore
-    //   D_β[G·H_Φ_raw][δ] = (D_β G[δ]) · H_Φ_raw + G · D_β H_Φ_raw[δ],
-    // where `out` above is `D_β H_Φ_raw[δ]`. `D_β G[δ] = G_λmin·δλ_min + G_λmax·δλ_max`
-    // with `δλ = vᵀ Ḋ v` the first-order perturbation of the extreme reduced-info
-    // eigenvalue (`Ḋ = dbar = Z_Jᵀ Hdot[δ] Z_J`) and `H_Φ_raw[a,b] = ½⟨vec M_a, vec M_b⟩
-    // = ½ (m_rows m_rowsᵀ)[a,b]`. On a saturated gate `G_λ = 0`, so this term is
-    // identically zero and the drift stays byte-unchanged on fully-active fits.
+    // GATE DERIVATIVE (value↔gradient consistency, gam#854). `H_Φ = G(λ_min,λ_max)·H_Φ_raw`,
+    // and the gate moves with the perturbation through the reduced eigenvalues, so
+    //   `D[G·H_Φ_raw] = (D G)·H_Φ_raw + G·(D H_Φ_raw)`,
+    // `D G = G_λmin·δλ_min + G_λmax·δλ_max`, `δλ = vᵀ Ḋ v`. Identically zero on a
+    // saturated gate, so fully-active / well-conditioned fits are byte-unchanged.
     let mut result = out * gate_weight;
-    let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
     let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lambda_min, lambda_max);
     if g_dlmin != 0.0 || g_dlmax != 0.0 {
         let mut idx_min = 0usize;
@@ -1091,6 +1163,88 @@ where
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// `joint_jeffreys_hphi_explicit_param_derivative` must equal the central
+    /// finite difference of the value-path gated curvature `H_Φ` w.r.t. a scalar
+    /// outer parameter `s`, on a synthetic β-frozen family where
+    /// `H_joint(s) = H0 + s·P` and `Hdot[e_a](s) = G_a + s·Q_a` (so `∂_s H_joint = P`,
+    /// `∂_s Hdot[e_a] = Q_a`). H0's smallest reduced eigenvalue sits in the ABSOLUTE
+    /// gate transition band (exercising the gate derivative) with no floored
+    /// eigenvalue, the regime of the gam#854 tension-axis miss.
+    #[test]
+    fn explicit_param_derivative_matches_finite_difference() {
+        let p = 4usize;
+        let z = Array2::<f64>::eye(p);
+        let h0 = array![
+            [30.0, 1.0, 0.5, 0.2],
+            [1.0, 12.0, 0.3, 0.1],
+            [0.5, 0.3, 5.0, 0.4],
+            [0.2, 0.1, 0.4, 1.5],
+        ];
+        let pmat = array![
+            [2.0, 0.3, 0.1, 0.05],
+            [0.3, 1.5, 0.2, 0.1],
+            [0.1, 0.2, 1.0, 0.15],
+            [0.05, 0.1, 0.15, 0.7],
+        ];
+        let make_sym = |seed: f64| -> Array2<f64> {
+            let mut a = Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                for j in 0..p {
+                    a[[i, j]] = (seed + 0.37 * (i as f64) - 0.19 * (j as f64)).sin()
+                        + 0.5 * ((i + j) as f64 * seed).cos();
+                }
+            }
+            let at = a.t().to_owned();
+            (&a + &at).mapv(|v| 0.5 * v)
+        };
+        let g: Vec<Array2<f64>> = (0..p).map(|a| make_sym(1.0 + a as f64)).collect();
+        let q: Vec<Array2<f64>> = (0..p).map(|a| make_sym(7.0 + 2.0 * a as f64)).collect();
+        let axis_index = |axis: &Array1<f64>| -> usize {
+            axis.iter().position(|&x| x != 0.0).expect("one-hot axis")
+        };
+
+        let hphi_at = |s: f64| -> Array2<f64> {
+            let h = &h0 + &pmat.mapv(|v| s * v);
+            joint_jeffreys_term(h.view(), z.view(), |axis: &Array1<f64>| {
+                let a = axis_index(axis);
+                Ok(Some(&g[a] + &q[a].mapv(|v| s * v)))
+            })
+            .expect("value-path H_Φ")
+            .2
+        };
+
+        let s0 = 0.0_f64;
+        let hh = 1e-5;
+        let fd = (&hphi_at(s0 + hh) - &hphi_at(s0 - hh)).mapv(|v| v / (2.0 * hh));
+
+        let h_s0 = &h0 + &pmat.mapv(|v| s0 * v);
+        let analytic = joint_jeffreys_hphi_explicit_param_derivative(
+            h_s0.view(),
+            z.view(),
+            &pmat,
+            |axis: &Array1<f64>| {
+                let a = axis_index(axis);
+                Ok(Some(&g[a] + &q[a].mapv(|v| s0 * v)))
+            },
+            |axis: &Array1<f64>| {
+                let a = axis_index(axis);
+                Ok(Some(q[a].clone()))
+            },
+        )
+        .expect("explicit ∂_s H_Φ");
+
+        let mut max_err = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                max_err = max_err.max((analytic[[i, j]] - fd[[i, j]]).abs());
+            }
+        }
+        assert!(
+            max_err < 1e-5,
+            "explicit ∂_s H_Φ mismatch vs FD: max_err={max_err}"
+        );
+    }
 
     /// Test-only convenience predicate: `true` when the smooth gate weight is exactly
     /// `0` (the term is fully skippable). Non-test code uses `conditioning_gate_weight`
