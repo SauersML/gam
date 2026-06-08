@@ -7658,24 +7658,6 @@ impl FamilyChannelHessian for GaussianLocationScaleChannelHessian {
     }
 }
 
-/// The custom-family outer seeding tuning (`max_seeds`, `seed_budget`, screening
-/// inner-iteration cap) that the generic `CustomFamily::outer_seed_config`
-/// default applies, reproduced here so the Gaussian location-scale families can
-/// keep that budget verbatim while swapping only the risk profile to
-/// `Gaussian`. Kept in lock-step with the trait default in `custom_family.rs`;
-/// the sole intentional divergence is the caller-supplied `risk_profile`.
-fn custom_family_default_outer_seed_config(n_params: usize) -> crate::seeding::SeedConfig {
-    if n_params == 0 {
-        return crate::seeding::SeedConfig::default();
-    }
-    crate::seeding::SeedConfig {
-        max_seeds: if n_params <= 4 { 6 } else { 4 },
-        seed_budget: 1,
-        screen_max_inner_iterations: 2,
-        ..crate::seeding::SeedConfig::default()
-    }
-}
-
 impl CustomFamily for GaussianLocationScaleFamily {
     /// The Gaussian location-scale joint Hessian depends on β because the
     /// cross-block (μ,log σ) and (log σ,log σ) blocks contain the residual
@@ -7715,35 +7697,6 @@ impl CustomFamily for GaussianLocationScaleFamily {
             self.y.len() as u64,
             specs,
         )
-    }
-
-    /// Gaussian-residual smoothing-parameter seeding (not the GLM default).
-    ///
-    /// Both blocks of this family — the mean μ and the log-σ scale — are driven
-    /// by a Gaussian likelihood. The generic custom-family `outer_seed_config`
-    /// inherits `SeedRiskProfile::GeneralizedLinear`, whose seed grid is
-    /// deliberately biased *up* in ρ = log λ: it shifts the heuristic anchor by
-    /// `+1`, centers baselines at `[0, +2, +4, −2]`, and injects an extra
-    /// over-smoothed seed pinned to the upper ρ bound. That upward bias exists
-    /// to keep GLM PIRLS away from separation at light smoothing — a risk a
-    /// Gaussian residual model does not carry. On the scale block it is actively
-    /// harmful: when the true log σ is (near-)affine it lies in the difference
-    /// penalty's null space, the REML criterion is then near-flat in λ_σ across a
-    /// wide upper range, and the GLM-biased seeds let the outer optimizer settle
-    /// at an over-smoothed λ_σ that attenuates the genuine heteroscedastic slope
-    /// (gam#684: log-σ recovery lost to gamlss purely from this λ_σ drift, not
-    /// from the likelihood or penalty). `SeedRiskProfile::Gaussian` removes the
-    /// upward shift, centers the grid symmetrically (`[0, ±3, ±6]` with `[±2,
-    /// ±4]` global shifts), and drops the boundary over-smoothing seed, so REML
-    /// is seeded even-handedly and lands at the data-supported λ. It is not a
-    /// downward bias: the symmetric grid still reaches ρ = +6 (λ ≈ 400) and the
-    /// full bound, so the genuinely curved mean μ(x) = 1 + sin x is recovered
-    /// unchanged — this only stops the scale block from being pushed flat.
-    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
-        crate::seeding::SeedConfig {
-            risk_profile: crate::seeding::SeedRiskProfile::Gaussian,
-            ..custom_family_default_outer_seed_config(n_params)
-        }
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
@@ -11416,19 +11369,6 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             self.y.len() as u64,
             specs,
         )
-    }
-
-    /// Gaussian-residual smoothing-parameter seeding (see
-    /// `GaussianLocationScaleFamily::outer_seed_config` for the full derivation):
-    /// the mean/scale/wiggle blocks are all Gaussian-likelihood, so the GLM
-    /// default's upward ρ bias would over-smooth the affine-nullspace scale
-    /// block (gam#684). Use the symmetric `Gaussian` risk profile while keeping
-    /// the shared custom-family seed budget.
-    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
-        crate::seeding::SeedConfig {
-            risk_profile: crate::seeding::SeedRiskProfile::Gaussian,
-            ..custom_family_default_outer_seed_config(n_params)
-        }
     }
 
     fn block_linear_constraints(
