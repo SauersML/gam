@@ -21,6 +21,16 @@ use crate::linalg::faer_ndarray::{
 };
 use faer::Side;
 
+/// Slack factor (multiples of machine ε) for the rank-revealing eigenvalue
+/// threshold used when pseudo-inverting a Gram matrix or selecting the
+/// positive eigenspace of a residual Gram. The retain threshold is
+/// `scale · RANK_REVEAL_EPS_SLACK · size · ε`, where `scale` is the dominant
+/// eigenvalue (and matrix size accounts for the worst-case roundoff
+/// accumulation in the `O(size)` inner products forming each Gram entry). 64×
+/// keeps numerically-zero directions out of the kept subspace while preserving
+/// every genuinely identified direction at biobank-scale conditioning.
+const RANK_REVEAL_EPS_SLACK: f64 = 64.0;
+
 /// Maps a coefficient perturbation `δβ ∈ R^p` for one parameter block into
 /// its contribution to the per-row primary state `u_i ∈ R^K`.
 ///
@@ -694,7 +704,7 @@ fn solve_psd_system(g: &Array2<f64>, r: &Array2<f64>) -> Result<Array2<f64>, Com
         .eigh(Side::Lower)
         .map_err(|err| CompilerError::LinalgFailure(format!("Gram eigh failed: {err:?}")))?;
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
-    let tol = lambda_max * 64.0 * (n.max(1) as f64) * f64::EPSILON;
+    let tol = lambda_max * RANK_REVEAL_EPS_SLACK * (n.max(1) as f64) * f64::EPSILON;
     // M = U · diag(1/λ_kept) · Uᵀ · R
     let u_t_r = fast_atb(&evecs, r);
     let mut scaled = u_t_r.clone();
@@ -711,7 +721,7 @@ fn solve_psd_system(g: &Array2<f64>, r: &Array2<f64>) -> Result<Array2<f64>, Com
 
 /// Eigendecompose the residual Gram `G̃` and return `V` made of the
 /// eigenvectors whose eigenvalues exceed
-/// `τ = max(λ_max(G̃), tr(G_BB)) · 64 · n · K · ε`.
+/// `τ = max(λ_max(G̃), tr(G_BB)) · RANK_REVEAL_EPS_SLACK · n · K · ε`.
 fn keep_positive_eigenspace(
     g_tilde: &Array2<f64>,
     n: usize,
@@ -728,7 +738,7 @@ fn keep_positive_eigenspace(
     let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
     let scale = lambda_max.max(g_bb_trace);
     let nk = (n.saturating_mul(k)).max(p).max(1) as f64;
-    let tau = scale * 64.0 * nk * f64::EPSILON;
+    let tau = scale * RANK_REVEAL_EPS_SLACK * nk * f64::EPSILON;
     // Collect kept column indices.
     let mut kept: Vec<usize> = (0..p).filter(|&i| evals[i] > tau).collect();
     // Sort kept indices by descending eigenvalue for a stable column order.
