@@ -18321,6 +18321,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 2,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -18403,6 +18404,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 2,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             // Profiled Gaussian does not satisfy the fixed-dispersion IFT
             // identity used by the projected KKT residual correction, so an
             // inconsistent envelope gradient remains a soft "unavailable
@@ -19011,6 +19013,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 3,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -19306,6 +19309,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 4,
             nullspace_dim: 2.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -19401,6 +19405,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 4,
             nullspace_dim: 1.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -19546,6 +19551,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 4,
             nullspace_dim: 1.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -19726,6 +19732,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 320_000,
             nullspace_dim: 1.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -19796,6 +19803,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 10,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             // Use Fixed dispersion so the gradient is exactly the
             // Laplace/REML form `½(λβ̂²S β̂ + tr(H⁻¹λS) − tr(S⁺λS))`
             // without the smooth-floor / profiling factors the test
@@ -19968,6 +19976,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 100,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -20032,6 +20041,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: x.nrows(),
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -20143,6 +20153,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 1,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -20223,6 +20234,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 10,
             nullspace_dim: 1.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -20444,6 +20456,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: n,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -20498,6 +20511,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: n,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -22298,6 +22312,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: n,
             nullspace_dim: (p - r_rank) as f64,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::Fixed {
                 phi: 1.0,
                 include_logdet_h: true,
@@ -22559,6 +22574,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: n,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             dispersion: DispersionHandling::ProfiledGaussian,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -23123,6 +23139,7 @@ mod tests {
             rho_prior: crate::types::RhoPrior::Flat,
             n_observations: 10,
             nullspace_dim: 0.0,
+            gaussian_weight_log_sum_half: 0.0,
             // Fixed-dispersion with logdet_h on, logdet_s off makes the
             // cost reduce to `0.5 · (hop.logdet() + correction)` plus
             // ρ-independent constants.  Pure log|H| derivative test.

@@ -4845,6 +4845,30 @@ impl<'a> RemlState<'a> {
         resolve_effective_rho_prior(&self.rho_prior)
     }
 
+    /// ½·Σᵢ log(wᵢ) over the positive-weight rows — the per-observation
+    /// Gaussian normalization constant that the log-likelihood drops.
+    ///
+    /// `Var(yᵢ) = φ/wᵢ` under inverse-variance prior weights, so the full
+    /// weighted-Gaussian normalization is `½ Σ log(2π φ/wᵢ) =
+    /// (n/2) log(2πφ) − ½ Σ log wᵢ`; the `calculate_loglikelihood_omitting_constants`
+    /// helper omits the `−½ Σ log wᵢ` piece. The `ProfiledGaussian` REML cost
+    /// adds it back (`InnerSolution::gaussian_weight_log_sum_half`) so the
+    /// objective VALUE — not just its argmin — is exactly invariant to a global
+    /// prior-weight rescale `w → c·w` (issue #877): the invariance-preserving
+    /// `λ → c·λ` otherwise inflates the cost value by `(n/2) log c`, breaking
+    /// the weight-scale invariance of the selected λ̂ / EDF / fit. With all
+    /// weights 1 this is exactly 0. Summed over the SAME positive-weight rows
+    /// counted in `n_observations` (zero-weight rows are dropped; `log(0)` is
+    /// undefined).
+    fn gaussian_weight_log_sum_half(&self) -> f64 {
+        0.5 * self
+            .weights
+            .iter()
+            .filter(|&&wi| wi > 0.0)
+            .map(|&wi| wi.ln())
+            .sum::<f64>()
+    }
+
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
         self.evaluate_configured_rho_prior(rho).cost
     }
@@ -10164,6 +10188,7 @@ impl<'a> RemlState<'a> {
         let assembly_ext_len = assembly.ext_coords.len();
         let mut inner_solution = assembly.build();
         inner_solution.stochastic_trace_state = trace_state;
+        inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
         let solution_beta = inner_solution.beta.clone();
         let result = super::assembly::evaluate_solution(
             &inner_solution,
@@ -10211,7 +10236,8 @@ impl<'a> RemlState<'a> {
         self.validate_tk_ext_coords(eval_mode, &assembly.ext_coords)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, &assembly.ext_coords)?;
         let assembly_ext_len = assembly.ext_coords.len();
-        let inner_solution = assembly.build();
+        let mut inner_solution = assembly.build();
+        inner_solution.gaussian_weight_log_sum_half = self.gaussian_weight_log_sum_half();
         let inner_hessian_scale =
             super::unified::hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
 
