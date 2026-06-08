@@ -1676,7 +1676,7 @@ pub fn build_survival_time_basis(
                     continue;
                 }
                 // Build the full I-spline-space penalty `S_I = Lᵀ S_B L`.
-                // `column_cumsum[a][m'] = Σ_{m > a} S_B[m, m']` is the row-side
+                // `rowcum[a][m'] = Σ_{m > a} S_B[m, m']` is the row-side
                 // cumulative sum (`Lᵀ S_B`); the second cumulative over `m' > b`
                 // completes `S_I`.
                 let s_i_full = {
