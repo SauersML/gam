@@ -1195,6 +1195,74 @@ where
                                 aa_state.note_reject(iter);
                             }
                             candidate_buf = candidate_beta.into();
+                            // Exhaustion guard, identical to the screening-reject
+                            // branch below. The screening test admitted this trial
+                            // (cheap forward eval looked like a descent) but the full
+                            // penalized gain `rho` came back ≤ 0 — i.e. the step is a
+                            // genuine non-improver at the current iterate. Without
+                            // this guard the loop would bump λ and `continue` forever:
+                            // at a flat optimum (e.g. the larger null space of a
+                            // cyclic `bs='cc'` penalty, where the gradient is at
+                            // machine zero and every trial step lies in a direction
+                            // the objective is flat along) `rho` never crosses 0, λ
+                            // grows until it overflows to `inf`, the damped solve then
+                            // returns δ≈0 so the candidate equals the current iterate,
+                            // and `rho` stays ≤ 0 — an unbounded ~0%-CPU spin that
+                            // never increments the outer iteration counter (gam#874).
+                            // When the LM budget is spent we instead recognize a
+                            // genuinely-converged iterate (near-stationary KKT ⇒
+                            // StalledAtValidMinimum) or surface the honest
+                            // non-convergence, mirroring the guarded reject path.
+                            let projected_grad = constrained_stationarity_norm(
+                                &state.gradient,
+                                beta.as_ref(),
+                                options.coefficient_lower_bounds.as_ref(),
+                                options.linear_constraints.as_ref(),
+                            );
+                            let lm_rejection_soft = pirls_soft_acceptance(
+                                &state,
+                                projected_grad,
+                                SoftAcceptProgress::Predicted {
+                                    predicted_reduction,
+                                    current_penalized,
+                                },
+                                f64::NAN,
+                                options.convergence_tolerance,
+                                kkt_tolerance,
+                            );
+                            if let Some(reason) = lm_rejection_soft {
+                                log::debug!(
+                                    "[PIRLS] gain-rejection soft acceptance: {reason:?} \
+                                     (‖g‖={projected_grad:.3e}, \
+                                     predicted_reduction={predicted_reduction:.3e})"
+                                );
+                                lastgradient_norm = projected_grad;
+                                last_deviance_change = 0.0;
+                                last_step_size = 0.0;
+                                last_step_halving = attempts;
+                                max_abs_eta = inf_norm(state.eta.iter().copied());
+                                restore_pending_arrow_latent_if_needed(
+                                    options,
+                                    &mut pending_arrow_latent_restore,
+                                );
+                                final_state = Some(state);
+                                status = PirlsStatus::StalledAtValidMinimum;
+                                break 'pirls_loop;
+                            }
+                            if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                                lastgradient_norm = projected_grad;
+                                if state.near_stationary_kkt(projected_grad, kkt_tolerance) {
+                                    status = PirlsStatus::StalledAtValidMinimum;
+                                } else {
+                                    status = PirlsStatus::LmStepSearchExhausted;
+                                }
+                                restore_pending_arrow_latent_if_needed(
+                                    options,
+                                    &mut pending_arrow_latent_restore,
+                                );
+                                final_state = Some(state);
+                                break 'pirls_loop;
+                            }
                             loop_lambda *= madsen_reject_factor;
                             madsen_reject_factor *= 2.0;
                             continue;
