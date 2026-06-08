@@ -16,12 +16,10 @@ pub mod penalties;
 pub mod penalty_op;
 pub mod sae_manifold;
 pub mod sheaf;
-pub mod skip_transcoder;
 pub mod smooth;
 pub mod smooth_overrides;
 pub mod sphere_gpu;
 pub mod term_builder;
-pub mod torch_dispatch;
 
 pub use analytic_penalties::{
     ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp, AnalyticPenaltyRegistry,

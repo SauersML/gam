@@ -734,8 +734,15 @@ fn symmetric_tridiagonal_eigen_dynamic(
     for (i, row) in z.iter_mut().enumerate().take(dim) {
         row[i] = 1.0;
     }
-    let eps = 1e-15;
-    let max_iter = 200usize;
+    // Relative off-diagonal deflation tolerance (near `f64` precision) and the
+    // per-subproblem QL/QR sweep cap, mirroring LAPACK `dsteqr`'s convergence
+    // guards. The cap is generous: QL with implicit shifts deflates an
+    // eigenvalue in a handful of sweeps, so reaching it signals a pathological
+    // matrix rather than normal operation.
+    const DEFLATION_TOL: f64 = 1e-15;
+    const MAX_QL_SWEEPS: usize = 200;
+    let eps = DEFLATION_TOL;
+    let max_iter = MAX_QL_SWEEPS;
     // Matrix 1-norm fallback scale. The row-local criterion
     // `eps * (|d[m-1]| + |d[m]|)` collapses to zero when the diagonal is
     // identically zero (as for physicist's Hermite), which stalls QR because
@@ -1005,7 +1012,7 @@ fn logistic_normal_series_cutoff(mu: f64, sigma: f64, target_accuracy: f64) -> O
 
 #[inline]
 fn stable_sigmoidwith_derivative(x: f64) -> (f64, f64) {
-    let x_clamped = x.clamp(-700.0, 700.0);
+    let x_clamped = x.clamp(-QUADRATURE_EXP_LOG_MAX, QUADRATURE_EXP_LOG_MAX);
     if x_clamped != x {
         return (sigmoid(x), 0.0);
     }
@@ -4265,7 +4272,7 @@ fn faddeeva_upper_halfplane(z: Complex) -> Complex {
 /// Standard sigmoid function with numerical stability.
 #[inline]
 fn sigmoid(x: f64) -> f64 {
-    let x_clamped = x.clamp(-700.0, 700.0);
+    let x_clamped = x.clamp(-QUADRATURE_EXP_LOG_MAX, QUADRATURE_EXP_LOG_MAX);
     1.0 / (1.0 + f64::exp(-x_clamped))
 }
 
