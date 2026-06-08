@@ -6469,8 +6469,11 @@ fn gaussian_joint_psi_firstweights(
         // + κ'·(a−n)·η̇ chain-rule term (∂[κ(a−n)]/∂η = κ'(a−n) + 2κ²n).
         dscore_ls[i].write(ki * (2.0 * mi * ma + 2.0 * ni * sea) + kpi * (ai - ni) * ea);
         hmumu[i].write(wi);
-        // Cross block: H_{μ,ls} = 2mκ (no κ' term — derivative of −m wrt η is 2mκ).
-        hmu_ls[i].write(2.0 * ki * mi);
+        // Cross block: Fisher expectation E[H_{μ,ls}] = 2κ·E[m] = 0 (μ ⊥ σ;
+        // see exact_newton_joint_hessian_from_designs / #684). The observed
+        // 2mκ is mean-zero noise that would inject spurious μ↔σ coupling into
+        // the REML determinant via the Schur complement and over-smooth log σ.
+        hmu_ls[i].write(0.0);
         // Fisher/expected (log σ, log σ) information: E[H_{ls,ls}] = 2κ²a.
         // The observed curvature 2κ²n + κ'(a−n) collapses where the fitted
         // residual is small (n→0), under-counting the scale block's EDF and
@@ -6485,8 +6488,9 @@ fn gaussian_joint_psi_firstweights(
         // expectation.
         h_ls_ls[i].write(2.0 * ki * ki * ai);
         dhmumu[i].write(-2.0 * wi * sea);
-        // + 2m·κ'·η̇: ∂(2mκ)/∂η = −4mκ² + 2mκ'.
-        dhmu_ls[i].write(ki * (-2.0 * wi * ma - 4.0 * mi * sea) + 2.0 * mi * kpi * ea);
+        // Cross block is Fisher 0 (μ ⊥ σ; #684), so its directional derivative
+        // is identically 0.
+        dhmu_ls[i].write(0.0);
         // Directional derivative of E[H_{ls,ls}]=2κ²a along (μ̇,η̇): no μ
         // dependence; ∂(2κ²a)/∂η = 4κκ'a, so dh_ls_ls = 4κκ'a·η̇.
         dh_ls_ls[i].write(4.0 * ki * kpi * ai * ea);
@@ -6575,13 +6579,9 @@ fn gaussian_joint_psisecondweights(
         );
         // − 2·κ'·w·ea·eb: ∂²w/∂η² = 4wκ² − 2wκ'.
         d2hmumu[i].write(4.0 * wi * sea_seb - 2.0 * wi * seab - 2.0 * wi * kpi * ea_eb);
-        // − 2·κ'·w·sym + 2·m·(κ''−6κκ')·ea·eb + 2·m·κ'·eab from d²(2mκ).
-        d2hmu_ls[i].write(
-            ki * (-2.0 * wi * mab + 4.0 * wi * cross + 8.0 * mi * sea_seb - 4.0 * mi * seab)
-                - 2.0 * wi * kpi * cross_eta
-                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * ea_eb
-                + 2.0 * mi * kpi * eab,
-        );
+        // Cross block is Fisher 0 (μ ⊥ σ; #684), so its second directional
+        // derivative is identically 0.
+        d2hmu_ls[i].write(0.0);
         // d²/dψ_a dψ_b of the Fisher (ls,ls) information E[H_{ls,ls}]=2κ²a (#566).
         // No μ dependence; ∂(2κ²a)/∂η=4κκ'a and ∂(4κκ'a)/∂η=4a(κ'²+κκ'')a, so
         // the second directional derivative is 4a(κ'²+κκ'')·ea·eb + 4aκκ'·eab.
@@ -6603,11 +6603,11 @@ fn gaussian_joint_psisecondweights(
 
 fn gaussian_joint_psi_mixed_driftweights(
     scalars: &GaussianJointRowScalars,
-    dotmu: &Array1<f64>,
+    // Only the log-σ–channel directions enter the surviving (μ,μ) and (ls,ls)
+    // Fisher blocks; the μ-channel drift directions fed the observed cross
+    // block, which is now Fisher 0 (μ ⊥ σ; #684) and no longer assembled.
     dot_eta: &Array1<f64>,
-    mu_a: &Array1<f64>,
     eta_a: &Array1<f64>,
-    dotmu_a: &Array1<f64>,
     dot_eta_a: &Array1<f64>,
 ) -> GaussianJointPsiMixedDriftWeights {
     let nobs = scalars.w.len();
@@ -6619,41 +6619,31 @@ fn gaussian_joint_psi_mixed_driftweights(
     let mut d2h_ls_ls = Array1::<f64>::uninit(nobs);
     for i in 0..nobs {
         let wi = scalars.w[i];
-        let mi = scalars.m[i];
         let ki = scalars.kappa[i];
         let kpi = scalars.kappa_prime[i];
         let kdpi = scalars.kappa_dprime[i];
         let ai = scalars.obs_weight[i];
-        let dm = dotmu[i];
         let de = dot_eta[i];
-        let ma = mu_a[i];
         let ea = eta_a[i];
-        let dma = dotmu_a[i];
         let dea = dot_eta_a[i];
         // κ-scaled log-sigma directions.
         let sde = ki * de;
         let sea = ki * ea;
         let sdea = ki * dea;
-        let cross = sde * ma + dm * sea;
-        // Bare-η symmetric: dm·ea + ma·de (no κ, for κ' chain-rule pieces).
-        let cross_eta = dm * ea + ma * de;
         let de_ea = de * ea;
         // First directional derivative of Hessian blocks (== Helper A).
         dhmumu_u[i].write(-2.0 * wi * sde);
-        // + 2·κ'·m·de.
-        dhmu_ls_u[i].write(ki * (-2.0 * wi * dm - 4.0 * mi * sde) + 2.0 * mi * kpi * de);
+        // Cross block is Fisher 0 (μ ⊥ σ; #684); its first directional and
+        // second mixed directional derivatives are identically 0. The
+        // observed-cross drift inputs (m, dotmu, μ_a, dotmu_a) are therefore
+        // not read here.
+        dhmu_ls_u[i].write(0.0);
         // Directional derivative of Fisher E[H_{ls,ls}]=2κ²a along (dm,de):
         // no μ dependence, ∂(2κ²a)/∂η=4κκ'a ⇒ 4κκ'a·de (#566).
         dh_ls_ls_u[i].write(4.0 * ki * kpi * ai * de);
         // − 2·κ'·w·de·ea: ∂²w/∂η² = 4wκ² − 2wκ'.
         d2hmumu[i].write(4.0 * wi * sde * sea - 2.0 * wi * sdea - 2.0 * wi * kpi * de_ea);
-        // − 2·κ'·w·(dm·ea + de·ma) + 2·m·(κ''−6κκ')·de·ea + 2·m·κ'·dea from d²(2mκ).
-        d2hmu_ls[i].write(
-            ki * (-2.0 * wi * dma + 4.0 * wi * cross + 8.0 * mi * sde * sea - 4.0 * mi * sdea)
-                - 2.0 * wi * kpi * cross_eta
-                + 2.0 * mi * (kdpi - 6.0 * ki * kpi) * de_ea
-                + 2.0 * mi * kpi * dea,
-        );
+        d2hmu_ls[i].write(0.0);
         // d²/(drift × ψ) of Fisher E[H_{ls,ls}]=2κ²a: 4a(κ'²+κκ'')·de·ea +
         // 4aκκ'·dea (drift direction de, ψ direction ea, mixed dea) (#566).
         d2h_ls_ls[i].write(4.0 * ai * (kpi * kpi + ki * kdpi) * de_ea + 4.0 * ai * ki * kpi * dea);
@@ -7275,15 +7265,27 @@ impl GaussianLocationScaleFamily {
         }
 
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        // H_{μ,ls} = 2κm. (log σ, log σ) block uses the Fisher/expected
-        // information E[H_{ls,ls}] = 2κ²a (a = obs_weight): the observed
-        // curvature 2κ²n + κ'(a−n) collapses where the residual is small
-        // (n→0), under-counting the scale EDF and over-smoothing the scale
-        // predictor (#566). E[n]=a at the true model ⇒ 2κ²a, the residual-free
-        // Fisher form gamlss/mgcv gaulss use. The exact observed score still
-        // drives the Newton step, so the stationary point is unchanged; only
-        // the curvature feeding the REML determinant is the expectation.
-        let cross = 2.0 * &rows.kappa * &rows.m;
+        // The curvature object is the Gaussian Fisher (expected) information,
+        // which for the (μ, log σ) parameterisation is BLOCK-DIAGONAL because
+        // the location and scale parameters are information-orthogonal:
+        //   E[H_{μ,ls}] = 2κ·E[m] = 2κ·E[r]·w/σ² = 0   (E[r] = 0 at any β),
+        // and the (log σ, log σ) block is the residual-free Fisher form
+        //   E[H_{ls,ls}] = 2κ²a   (a = obs_weight; #566).
+        // Using the OBSERVED cross term 2κm (m = r·w, mean-zero noise) instead
+        // of its expectation injects spurious μ↔σ coupling into the joint
+        // Hessian. That coupling enters the scale block's marginal curvature
+        // through the Schur complement H_{ls,ls} − H_{ls,μ} H_{μ,μ}⁻¹ H_{μ,ls},
+        // so the REML log-determinant / EDF — hence the λ_σ selection — sees a
+        // scale-block curvature distorted by the random mean residuals. gamlss
+        // (RS backfitting) and mgcv gaulss both select each block's smoothing
+        // parameter on the block-diagonal Fisher information with NO cross
+        // term; the observed-cross term is precisely why gam systematically
+        // over-smoothed log σ versus gamlss (#684). Mirroring the #566 (ls,ls)
+        // decision, the cross block is its Fisher expectation 0. The exact
+        // observed SCORE still drives the Newton step (Fisher scoring), so the
+        // stationary point is the exact joint MLE — only the curvature feeding
+        // the REML determinant / Newton metric is the (orthogonal) expectation.
+        let cross = Array1::<f64>::zeros(rows.kappa.len());
         let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &rows.w, &cross, &scale,
@@ -7332,8 +7334,16 @@ impl GaussianLocationScaleFamily {
         let ximu = xmu.dot(d_beta_flat.slice(s![0..pmu]));
         let xi_ls = x_ls.dot(d_beta_flat.slice(s![pmu..pmu + p_ls]));
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let (dhmumu, dhmu_ls, dh_ls_ls) =
-            gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
+        let directional = gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
+        let dhmumu = directional.0;
+        let dh_ls_ls = directional.2;
+        // Fisher cross block E[H_{μ,ls}] ≡ 0 (μ ⊥ σ; see
+        // exact_newton_joint_hessian_from_designs / #684), so its directional
+        // derivative is identically 0 — keep the Hessian's curvature object the
+        // block-diagonal Gaussian Fisher information at every order. The
+        // observed-cross directional weight (`directional.1`) is therefore not
+        // assembled.
+        let dhmu_ls = Array1::<f64>::zeros(dhmumu.len());
 
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &dhmumu, &dhmu_ls, &dh_ls_ls,
@@ -7383,8 +7393,13 @@ impl GaussianLocationScaleFamily {
         let ximuv = xmu.dot(d_betav_flat.slice(s![0..pmu]));
         let xi_lsv = x_ls.dot(d_betav_flat.slice(s![pmu..pmu + p_ls]));
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let (d2hmumu, d2hmu_ls, d2h_ls_ls) =
-            gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
+        let second = gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
+        let d2hmumu = second.0;
+        let d2h_ls_ls = second.2;
+        // Fisher cross block E[H_{μ,ls}] ≡ 0 (μ ⊥ σ; #684), so its second
+        // directional derivative is identically 0; `second.1` (observed) is not
+        // assembled, keeping the curvature object block-diagonal Fisher.
+        let d2hmu_ls = Array1::<f64>::zeros(d2hmumu.len());
 
         Ok(Some(gaussian_joint_hessian_from_designs(
             xmu, x_ls, &d2hmumu, &d2hmu_ls, &d2h_ls_ls,
