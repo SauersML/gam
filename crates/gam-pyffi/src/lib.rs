@@ -3037,6 +3037,7 @@ fn matern_basis<'py>(
         identifiability: MaternIdentifiability::None,
         aniso_log_scales: aniso_vec,
         periodic: None,
+        nullspace_shrinkage_survived: None,
     };
     let built = build_matern_basis(pts, &spec).map_err(|err| py_value_error(err.to_string()))?;
     let design = built
@@ -7007,6 +7008,7 @@ fn build_latent_forward_design(
                 identifiability: MaternIdentifiability::None,
                 aniso_log_scales: None,
                 periodic: None,
+                nullspace_shrinkage_survived: None,
             };
             let built = build_matern_basis(t_mat.view(), &spec)
                 .map_err(|err| format!("failed to evaluate Matérn latent basis: {err}"))?;
