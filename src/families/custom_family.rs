@@ -34517,4 +34517,67 @@ mod tests {
             "post-absorption: the rank-deficiency diagnosis must no longer fire",
         );
     }
+
+    /// Pins the structural effective-df machinery to the exact trace identity
+    ///
+    /// ```text
+    /// Σ_j γ_j/(γ_j + λ) = tr{ G (G + λ S)⁻¹ }
+    /// ```
+    ///
+    /// on a NON-commuting Gram/penalty pair, where the historical Rayleigh-quotient
+    /// implementation (diagonal of B only) gave the wrong answer. With
+    /// `S = diag(1, 4)` and `G = [[1, 0.8], [0.8, 1]]` the true generalized
+    /// eigenvalues are eig(D^{-1/2} Uᵀ G U D^{-1/2}) ≈ [0.0767072, 1.1732928],
+    /// whereas the Rayleigh quotients are [1, 0.25]; only the former reproduce the
+    /// trace identity, and they disagree at λ = 1 (≈0.6111 vs the buggy 0.7000).
+    #[test]
+    fn structural_edf_matches_trace_identity_noncommuting_pair() {
+        // Penalty S = diag(1, 4).
+        let s = array![[1.0, 0.0], [0.0, 4.0]];
+        // Design with Gram G = XᵀX = [[1, 0.8], [0.8, 1]]. Use the symmetric
+        // square root G^{1/2} so that XᵀX = G exactly:
+        //   G = 1.8·v1v1ᵀ + 0.2·v2v2ᵀ, v1=[1,1]/√2, v2=[1,-1]/√2.
+        let off = 0.5 * (1.8_f64.sqrt() - 0.2_f64.sqrt());
+        let diag = 0.5 * (1.8_f64.sqrt() + 0.2_f64.sqrt());
+        let x = array![[diag, off], [off, diag]];
+        let design = DesignMatrix::from(x);
+        let penalty = PenaltyMatrix::Dense(s.clone());
+
+        let gammas = design_penalty_range_gammas(&design, &penalty)
+            .expect("2x2 full-rank p×p pair must yield generalized eigenvalues");
+        assert_eq!(gammas.len(), 2, "range(S) is full rank ⇒ two γ_j");
+
+        // Reference: G = XᵀX, and tr(G (G+λS)⁻¹) computed via the closed-form
+        // 2×2 inverse of M = G + λ S (det/adjugate), independent of the helper.
+        let g = array![[1.0, 0.8], [0.8, 1.0]];
+        let trace_g_minv = |lambda: f64| -> f64 {
+            let m00 = g[(0, 0)] + lambda * s[(0, 0)];
+            let m01 = g[(0, 1)] + lambda * s[(0, 1)];
+            let m10 = g[(1, 0)] + lambda * s[(1, 0)];
+            let m11 = g[(1, 1)] + lambda * s[(1, 1)];
+            let det = m00 * m11 - m01 * m10;
+            // M⁻¹ = (1/det) [[m11, -m01], [-m10, m00]];
+            // tr(G M⁻¹) = (1/det) · [ G00·m11 - G01·m10 - G10·m01 + G11·m00 ].
+            (g[(0, 0)] * m11 - g[(0, 1)] * m10 - g[(1, 0)] * m01 + g[(1, 1)] * m00) / det
+        };
+
+        for &lambda in &[1.0_f64, 0.3] {
+            let rho = lambda.ln();
+            let edf = unit_weight_term_edf(&gammas, rho);
+            let trace = trace_g_minv(lambda);
+            assert!(
+                (edf - trace).abs() < 1e-9,
+                "structural edf {edf} must equal tr(G(G+λS)⁻¹) {trace} at λ={lambda}",
+            );
+        }
+
+        // Sanity: the buggy Rayleigh quotients [1, 0.25] would give 0.7 at λ=1,
+        // which the trace identity (≈0.6111) rejects — guard against regression
+        // to the diagonal-only computation.
+        let edf_at_one = unit_weight_term_edf(&gammas, 0.0_f64);
+        assert!(
+            (edf_at_one - 0.611111_f64).abs() < 1e-5,
+            "edf at λ=1 must be ≈0.6111 (true), not 0.7000 (Rayleigh-quotient bug): got {edf_at_one}",
+        );
+    }
 }
