@@ -9242,14 +9242,12 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
                 constraints,
                 LINEAR_FEASIBILITY_TOL,
             )
-            .map_err(
-                |e| {
-                    format!(
-                        "block {} ({}) constrained diagonal solve: {e}",
-                        ctx.block_idx, ctx.spec.name
-                    )
-                },
-            )?;
+            .map_err(|e| {
+                format!(
+                    "block {} ({}) constrained diagonal solve: {e}",
+                    ctx.block_idx, ctx.spec.name
+                )
+            })?;
             with_block_geometry(ctx.family, ctx.states, ctx.spec, ctx.block_idx, |x, off| {
                 let mut y_star = self.working_response.clone();
                 y_star -= off;
@@ -9364,14 +9362,12 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
                 constraints,
                 LINEAR_FEASIBILITY_TOL,
             )
-            .map_err(
-                |e| {
-                    format!(
-                        "block {} ({}) constrained exact-newton solve: {e}",
-                        ctx.block_idx, ctx.spec.name
-                    )
-                },
-            )?;
+            .map_err(|e| {
+                format!(
+                    "block {} ({}) constrained exact-newton solve: {e}",
+                    ctx.block_idx, ctx.spec.name
+                )
+            })?;
             let lower_bounds = extract_simple_lower_bounds(constraints, p).map_err(|e| {
                 format!(
                     "block {} ({}) constrained exact-newton solve: {e}",
@@ -15488,11 +15484,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // collapses, and the inner exits non-converged at cycle ~2 (seed
                 // rejected pre-solver → hard raise, β pinned). Subtract the trial
                 // penalty so the threshold is the NLL the trial must beat.
-                let line_search_options =
-                    coefficient_line_search_options(
-                        options,
-                        old_objective + LINE_SEARCH_OBJECTIVE_SLACK - trial_penalty,
-                    );
+                let line_search_options = coefficient_line_search_options(
+                    options,
+                    old_objective + LINE_SEARCH_OBJECTIVE_SLACK - trial_penalty,
+                );
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
