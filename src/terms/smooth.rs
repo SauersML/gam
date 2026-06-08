@@ -3890,6 +3890,9 @@ fn plan_joint_spatial_centers_for_term_blocks(
 /// reachable for smoother kernels (ν ≥ 5/2). Clamped to a tiny positive
 /// floor so degenerate constant-input columns can't produce 0.
 fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) -> f64 {
+    /// Tiny positive floor for the auto length scale, guarding against a zero
+    /// kernel range when every feature column is (near-)constant.
+    const LENGTH_SCALE_FLOOR: f64 = 1e-6;
     let n = data.nrows();
     if n == 0 || feature_cols.is_empty() {
         return 1.0;
@@ -3923,7 +3926,7 @@ fn auto_initial_length_scale(data: ArrayView2<'_, f64>, feature_cols: &[usize]) 
         return 1.0;
     }
     let init = max_range / (n as f64).sqrt();
-    init.max(1e-6).min(max_range)
+    init.max(LENGTH_SCALE_FLOOR).min(max_range)
 }
 
 /// Walk a term and, if it is a Matern or thin-plate smooth whose length_scale
