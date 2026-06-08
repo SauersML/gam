@@ -2160,14 +2160,22 @@ def duchon_function_norm_penalty(
                 f"got {len(per_list)}"
             )
     try:
+        # Pass the optional arguments by keyword. The binding's positional
+        # layout is ``(centers, m, period, periodic_per_axis, length_scale,
+        # nullspace_order, power)``; an obsolete ``periodic: bool`` third
+        # positional (once passed here as ``False``) was dropped from the
+        # binding when ``period``/``periodic_per_axis`` superseded it, but the
+        # call site kept the stray ``False`` and overflowed the arity by one
+        # (gam#880). Keywords make this call robust to any future reordering of
+        # the binding's parameters.
         penalty = rust_module().duchon_function_norm_penalty(
             ctrs,
             m_i,
-            float(period) if period is not None else None,
-            per_list,
-            None if length_scale is None else float(length_scale),
-            None if nullspace_order is None else str(nullspace_order),
-            None if power is None else float(power),
+            period=float(period) if period is not None else None,
+            periodic_per_axis=per_list,
+            length_scale=None if length_scale is None else float(length_scale),
+            nullspace_order=None if nullspace_order is None else str(nullspace_order),
+            power=None if power is None else float(power),
         )
     except Exception as exc:
         raise map_exception(exc) from exc
