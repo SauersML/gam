@@ -215,6 +215,12 @@ fn likelihood_spec_for_saved_model(model: &SavedModel) -> Result<LikelihoodSpec,
     Ok(model.likelihood())
 }
 
+/// Default smoothing strength `λ` applied to a reconstructed penalty block when
+/// the saved model carries no fitted `smooth_lambda`. A mild penalty: enough to
+/// regularize the reconstructed-for-prediction design without materially
+/// reshaping the saved fit. Fitted lambdas, when present, always override this.
+const DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA: f64 = 1e-2;
+
 #[inline]
 const fn splitmix64(x: u64) -> u64 {
     crate::linalg::utils::splitmix64_hash(x)
@@ -839,7 +845,9 @@ fn sample_survival(
         if s.nrows() == p_time && s.ncols() == p_time {
             penalty_blocks.push(PenaltyBlock {
                 matrix: s.clone(),
-                lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+                lambda: time_build
+                    .smooth_lambda
+                    .unwrap_or(DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA),
                 range: 0..p_time,
                 nullspace_dim: time_build.nullspace_dims.get(idx).copied().unwrap_or(0),
             });
@@ -883,7 +891,9 @@ fn sample_survival(
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
                 penalty_blocks.push(PenaltyBlock {
                     matrix: s.clone(),
-                    lambda: time_build.smooth_lambda.unwrap_or(1e-2),
+                    lambda: time_build
+                    .smooth_lambda
+                    .unwrap_or(DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA),
                     range: start..end,
                     nullspace_dim: block.nullspace_dims.get(widx).copied().unwrap_or(0),
                 });
