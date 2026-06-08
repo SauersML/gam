@@ -251,3 +251,28 @@ impl SparseHessianAccumulator {
         SparseColMat::new(symbolic, self.values)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use faer::sparse::Triplet;
+
+    #[test]
+    fn sparse_hessian_pattern_is_column_major_csc() {
+        let sparse = SparseColMat::try_new_from_triplets(
+            1,
+            3,
+            &[
+                Triplet::new(0, 0, 1.0),
+                Triplet::new(0, 1, 1.0),
+                Triplet::new(0, 2, 1.0),
+            ],
+        )
+        .expect("sparse column matrix");
+        let csr = sparse.to_row_major().expect("csr conversion");
+        let accumulator = SparseHessianAccumulator::from_single_csr(&csr, 3);
+
+        assert_eq!(accumulator.sym.col_ptrs, vec![0, 1, 3, 6]);
+        assert_eq!(accumulator.sym.row_indices, vec![0, 0, 1, 0, 1, 2]);
+    }
+}

@@ -7372,7 +7372,7 @@ mod tests {
         ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignMatrix,
         DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
         PsdWeightsView, ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator,
-        SignedWeightsView, SparseDesignMatrix, SparseHessianAccumulator, dense_matvec,
+        SignedWeightsView, SparseDesignMatrix, dense_matvec,
         dense_operator_to_dense_by_chunks, dense_transpose_matvec,
         dense_transpose_weighted_response, streaming_sparse_csc_xt_diag_x,
         weighted_crossprod_dense_view,
@@ -7678,25 +7678,6 @@ mod tests {
         assert_eq!(operator.ncols(), 3);
         let chunk = operator.row_chunk_combined(0..2);
         assert_eq!(chunk.dim(), (2, 3));
-    }
-
-    #[test]
-    fn sparse_hessian_pattern_is_column_major_csc() {
-        let sparse = SparseColMat::try_new_from_triplets(
-            1,
-            3,
-            &[
-                Triplet::new(0, 0, 1.0),
-                Triplet::new(0, 1, 1.0),
-                Triplet::new(0, 2, 1.0),
-            ],
-        )
-        .expect("sparse column matrix");
-        let csr = sparse.to_row_major().expect("csr conversion");
-        let accumulator = SparseHessianAccumulator::from_single_csr(&csr, 3);
-
-        assert_eq!(accumulator.sym.col_ptrs, vec![0, 1, 3, 6]);
-        assert_eq!(accumulator.sym.row_indices, vec![0, 0, 1, 0, 1, 2]);
     }
 
     #[test]
