@@ -7794,11 +7794,11 @@ impl GaussianLocationScaleFamily {
                 total
             ) }.into());
         }
-        let umu = d_beta_flat.slice(s![0..pmu]);
+        // Only the log-σ–channel direction enters the surviving Fisher blocks
+        // of the mixed drift (the μ-channel direction fed the observed cross
+        // block, now Fisher 0; μ ⊥ σ, #684).
         let u_ls = d_beta_flat.slice(s![pmu..pmu + p_ls]);
-        let ximu = fast_av(xmu, &umu);
         let xi_ls = fast_av(x_ls, &u_ls);
-        let uzamu = xmu_map.forward_mul(umu);
         let uza_ls = x_ls_map.forward_mul(u_ls);
         // Mixed drift T_a[u] = D_beta H_a^{(D)}[u] for the Gaussian family.
         //
@@ -7842,15 +7842,8 @@ impl GaussianLocationScaleFamily {
         // Generic code then combines this with S(theta)-motion and the profile
         // mode responses to form ddot H_{ij}.
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let mut mixedweights = gaussian_joint_psi_mixed_driftweights(
-            &rows,
-            &ximu,
-            &xi_ls,
-            &dir_a.z_primary_psi,
-            &dir_a.z_ls_psi,
-            &uzamu,
-            &uza_ls,
-        );
+        let mut mixedweights =
+            gaussian_joint_psi_mixed_driftweights(&rows, &xi_ls, &dir_a.z_ls_psi, &uza_ls);
         if let Some(sub_rows) = subsample {
             // HT mask: `gaussian_joint_psi_mixedhessian_drift_fromweights` is
             // row-linear in every `mixedweights.*` array via `xt_diag_*_dense`
