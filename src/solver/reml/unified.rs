@@ -5538,6 +5538,29 @@ pub struct InnerSolution<'dp> {
     /// M_p: dimension of the penalty null space (unpenalized coefficients).
     pub nullspace_dim: f64,
 
+    /// ½·Σᵢ log(wᵢ) — half the sum of log prior weights.
+    ///
+    /// This is the per-observation Gaussian normalization constant that the
+    /// `log_likelihood` (computed by
+    /// [`calculate_loglikelihood_omitting_constants`]) deliberately drops. The
+    /// full weighted-Gaussian negative log-likelihood normalization is
+    ///   ½·Σᵢ log(2π·φ/wᵢ) = (n/2)·log(2πφ) − ½·Σᵢ log(wᵢ),
+    /// because `Var(yᵢ) = φ/wᵢ` under inverse-variance prior weights.
+    ///
+    /// Dropping `−½·Σ log(wᵢ)` does not move the ρ-argmin in exact arithmetic
+    /// (it is constant in ρ), but it makes the ProfiledGaussian objective VALUE
+    /// scale-dependent: under a global rescale `w → c·w` the invariance-
+    /// preserving smoothing `λ → c·λ` leaves the cost SHAPE fixed but inflates
+    /// its absolute value by `(n/2)·log c`. That inflation breaks the exact
+    /// weight-scale invariance of the selected λ̂ / EDF / fit (issue #877).
+    /// Restoring this term makes the ProfiledGaussian cost value exactly
+    /// invariant to `w → c·w` (with σ̂² absorbing the c factor), matching mgcv.
+    ///
+    /// Only consumed by the `ProfiledGaussian` arm; the `Fixed`-dispersion arm
+    /// already omits the Gaussian normalization constant by design and is not
+    /// affected.
+    pub gaussian_weight_log_sum_half: f64,
+
     /// How the dispersion parameter is handled.
     pub dispersion: DispersionHandling,
 
@@ -5635,6 +5658,7 @@ pub struct InnerSolutionBuilder<'dp> {
     barrier_config: Option<BarrierConfig>,
     kkt_residual: Option<ProjectedKktResidual>,
     active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
+    gaussian_weight_log_sum_half: f64,
 }
 
 impl<'dp> InnerSolutionBuilder<'dp> {
@@ -5674,11 +5698,22 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
+            gaussian_weight_log_sum_half: 0.0,
         }
     }
 
     pub fn deriv_provider(mut self, p: Box<dyn HessianDerivativeProvider + 'dp>) -> Self {
         self.deriv_provider = p;
+        self
+    }
+
+    /// Set ½·Σᵢ log(wᵢ), the dropped Gaussian per-observation normalization
+    /// constant restored by the `ProfiledGaussian` cost so that the objective
+    /// VALUE is exactly invariant to a global prior-weight rescale `w → c·w`
+    /// (issue #877). Pass `0.0` (the default) for any non-Gaussian family; the
+    /// `Fixed`-dispersion arm does not consume it.
+    pub fn gaussian_weight_log_sum_half(mut self, half_log_sum: f64) -> Self {
+        self.gaussian_weight_log_sum_half = half_log_sum;
         self
     }
 
@@ -5892,6 +5927,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             rho_prior: self.rho_prior,
             n_observations: self.n_observations,
             nullspace_dim,
+            gaussian_weight_log_sum_half: self.gaussian_weight_log_sum_half,
             dispersion: self.dispersion,
             ext_coords: self.ext_coords,
             ext_coord_pair_fn: self.ext_coord_pair_fn,
@@ -7125,6 +7161,7 @@ fn try_tangent_projected_evaluate(
         rho_prior: solution.rho_prior.clone(),
         n_observations: solution.n_observations,
         nullspace_dim: solution.nullspace_dim,
+        gaussian_weight_log_sum_half: solution.gaussian_weight_log_sum_half,
         dispersion: solution.dispersion.clone(),
         // ext_coord g/drift pass-through: projection is applied by the
         // tangent hessian wrapper's trace and solve methods.
@@ -7248,8 +7285,23 @@ pub fn reml_laml_evaluate(
     let (cost, profiled_scale, dp_cgrad, _dp_cgrad2) = match &solution.dispersion {
         DispersionHandling::ProfiledGaussian => {
             // Gaussian REML with profiled scale:
-            //   V(ρ) = D_p/(2φ̂) + ½ log|H| − ½ log|S|₊ + ((n−M_p)/2) log(2πφ̂)
+            //   V(ρ) = D_p/(2φ̂) + ½ log|H| − ½ log|S|₊
+            //          + ((n−M_p)/2) log(2πφ̂) − ½ Σᵢ log(wᵢ)
             // where D_p = deviance + penalty, φ̂ = D_p/(n−M_p).
+            //
+            // The final `− ½ Σ log(wᵢ)` is the per-observation Gaussian
+            // normalization constant that the log-likelihood deliberately
+            // drops (`Var(yᵢ) = φ/wᵢ` ⇒ ½ Σ log(2π φ/wᵢ) =
+            // (n/2) log(2πφ) − ½ Σ log wᵢ). It is constant in ρ — it does NOT
+            // move the argmin — but WITHOUT it the cost VALUE is not invariant
+            // to a global prior-weight rescale `w → c·w`: the invariance-
+            // preserving smoothing `λ → c·λ` keeps the cost shape fixed yet
+            // inflates its value by `(n/2) log c`, and that inflation breaks
+            // the exact weight-scale invariance of λ̂ / EDF / fit (issue #877).
+            // Adding `−½ Σ log(wᵢ)` (which contributes `−(n/2) log c` under the
+            // rescale) cancels the inflation, so the ProfiledGaussian cost
+            // VALUE — not just its argmin — is exactly invariant, matching mgcv
+            // (the profiled σ̂² absorbs the c factor).
             let dp_raw = -2.0 * solution.log_likelihood + solution.penalty_quadratic;
             let (dp_c, dp_cgrad, dp_cgrad2) = smooth_floor_dp(dp_raw);
             let denom = (solution.n_observations as f64 - solution.nullspace_dim).max(DENOM_RIDGE);
@@ -7257,7 +7309,8 @@ pub fn reml_laml_evaluate(
 
             let cost = dp_c / (2.0 * phi)
                 + 0.5 * (log_det_h - log_det_s)
-                + (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln();
+                + (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
+                - solution.gaussian_weight_log_sum_half;
 
             (cost, phi, dp_cgrad, dp_cgrad2)
         }
