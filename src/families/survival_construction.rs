@@ -3634,17 +3634,31 @@ mod tests {
             build.nullspace_dims
         );
 
-        // Confirm the emitted penalty really annihilates a constant-coefficient
-        // direction restricted to the retained columns (affine baseline).
-        for s_i in &build.penalties {
+        // Independently confirm the emitted value-space penalty is genuinely
+        // rank-deficient (carries a null direction) — the property that
+        // distinguishes the correct `Lᵀ S_B L` from the old full-rank
+        // increment-space submatrix `S_B[1.., 1..]`, which had NO null space and
+        // so over-penalized the affine baseline (#691). A constant-coefficient
+        // probe is NOT the null direction once `keep_cols` drops columns (the
+        // retained-column sum is then a step function, not an affine baseline),
+        // so verify the spectrum directly rather than a fixed vector.
+        for (s_i, &reported) in build.penalties.iter().zip(build.nullspace_dims.iter()) {
             let p = s_i.nrows();
-            let gamma = Array1::<f64>::from_elem(p, 1.0);
-            let q = gamma.dot(&s_i.dot(&gamma));
-            let scale = s_i.iter().fold(0.0_f64, |a, &b| a.max(b.abs())).max(1.0);
+            let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(s_i, faer::Side::Lower)
+                .expect("eigendecompose emitted value-space penalty");
+            let evals_slice: &[f64] = evals.as_slice().unwrap();
+            let max_ev = evals_slice
+                .iter()
+                .copied()
+                .fold(0.0_f64, |a, b| a.max(b.abs()))
+                .max(1.0);
+            let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
+            let min_ev = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
             assert!(
-                q.abs() <= 1e-8 * scale * (p as f64),
-                "constant gamma should be (near) null under the emitted value-space \
-                 penalty, got {q:.3e} (scale {scale:.3e}, p {p})"
+                reported >= 1 && min_ev <= threshold,
+                "emitted value-space I-spline penalty must be rank-deficient (affine \
+                 null direction): reported nullspace_dims={reported}, smallest \
+                 eigenvalue={min_ev:.3e}, threshold={threshold:.3e}"
             );
         }
     }
