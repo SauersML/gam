@@ -456,8 +456,7 @@ pub(super) fn detect_logit_instability(
         return classic_signals || order_separated;
     }
 
-    let severe_saturation =
-        sat_fraction > SEVERE_SATURATION_FRACTION && max_abs_eta > EXTREME_ETA;
+    let severe_saturation = sat_fraction > SEVERE_SATURATION_FRACTION && max_abs_eta > EXTREME_ETA;
     let weights_collapsed = weight_collapse_fraction > WEIGHT_COLLAPSE_FRACTION;
     let dev_extremely_small = dev_per_sample < EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE;
 

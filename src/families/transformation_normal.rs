@@ -10904,9 +10904,10 @@ fn estimate_default_warm_start(
         }
         .into());
     }
-    let global_scale = (weighted_ss / weight_sum).sqrt().max(WARMSTART_GLOBAL_SCALE_FLOOR);
-    let residual_floor =
-        global_scale * WARMSTART_RESIDUAL_REL_FLOOR + WARMSTART_RESIDUAL_ABS_FLOOR;
+    let global_scale = (weighted_ss / weight_sum)
+        .sqrt()
+        .max(WARMSTART_GLOBAL_SCALE_FLOOR);
+    let residual_floor = global_scale * WARMSTART_RESIDUAL_REL_FLOOR + WARMSTART_RESIDUAL_ABS_FLOOR;
     let log_scale_target =
         Array1::from_iter(response.iter().zip(location.iter()).map(|(&y, &mu)| {
             (y - mu).abs().max(residual_floor).ln() - STANDARD_NORMAL_MEAN_LOG_ABS

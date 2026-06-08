@@ -1773,7 +1773,8 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
         let mut mu_disp = Array1::<f64>::zeros(self.eta_hat.len());
         for i in 0..self.eta_hat.len() {
             let eta_i = self.eta_hat[i] + s[i];
-            match crate::mixture_link::inverse_link_jet_for_inverse_link(&self.inverse_link, eta_i) {
+            match crate::mixture_link::inverse_link_jet_for_inverse_link(&self.inverse_link, eta_i)
+            {
                 Ok(jet) => mu_disp[i] = jet.mu,
                 Err(_) => return f64::INFINITY,
             }
@@ -3879,7 +3880,8 @@ impl<'a> RemlState<'a> {
         // Laplace summary.
         let n_obs = x_design.nrows();
         let dense_work = n_obs.saturating_mul(p);
-        if n_obs > TK_MAX_OBSERVATIONS || p > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK {
+        if n_obs > TK_MAX_OBSERVATIONS || p > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
+        {
             return Ok(zero());
         }
 
@@ -3938,7 +3940,11 @@ impl<'a> RemlState<'a> {
             ResponseFamily::Gaussian => 1.0,
             _ => reml_fixed_glm_dispersion(&self.config.likelihood),
         };
-        let phi = if phi.is_finite() && phi > 0.0 { phi } else { 1.0 };
+        let phi = if phi.is_finite() && phi > 0.0 {
+            phi
+        } else {
+            1.0
+        };
 
         let x_dense = x_design
             .try_to_dense_arc("#784 block-local fallback requires dense design access")
@@ -10173,8 +10179,7 @@ impl<'a> RemlState<'a> {
         // the same value+gradient splicing contract as the TK correction so the
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
-        let block_terms =
-            self.block_local_sampled_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms = self.block_local_sampled_correction(rho, bundle, assembly_ext_len)?;
         let result = self.apply_tk_to_result(result, block_terms)?;
         let result = self.apply_alo_stabilization_to_result(rho, bundle, mode, result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &result);

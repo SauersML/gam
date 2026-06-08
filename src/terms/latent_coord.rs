@@ -1525,36 +1525,58 @@ mod tests {
     #[test]
     fn isometry_cross_block_coherence_tracks_identity_geometry_transform() {
         assert!(LatentManifold::Euclidean.preserves_isometry_cross_block_coherence());
-        assert!(LatentManifold::Circle { period: std::f64::consts::TAU }
-            .preserves_isometry_cross_block_coherence());
+        assert!(
+            LatentManifold::Circle {
+                period: std::f64::consts::TAU
+            }
+            .preserves_isometry_cross_block_coherence()
+        );
         assert!(!LatentManifold::Sphere { dim: 3 }.preserves_isometry_cross_block_coherence());
-        assert!(!LatentManifold::Interval { lo: -1.0, hi: 1.0 }
-            .preserves_isometry_cross_block_coherence());
+        assert!(
+            !LatentManifold::Interval { lo: -1.0, hi: 1.0 }
+                .preserves_isometry_cross_block_coherence()
+        );
         // A Product is coherent iff every factor is.
-        assert!(LatentManifold::Product(vec![
-            LatentManifold::Euclidean,
-            LatentManifold::Circle { period: std::f64::consts::TAU },
-        ])
-        .preserves_isometry_cross_block_coherence());
-        assert!(!LatentManifold::Product(vec![
-            LatentManifold::Circle { period: std::f64::consts::TAU },
-            LatentManifold::Sphere { dim: 3 },
-        ])
-        .preserves_isometry_cross_block_coherence());
+        assert!(
+            LatentManifold::Product(vec![
+                LatentManifold::Euclidean,
+                LatentManifold::Circle {
+                    period: std::f64::consts::TAU
+                },
+            ])
+            .preserves_isometry_cross_block_coherence()
+        );
+        assert!(
+            !LatentManifold::Product(vec![
+                LatentManifold::Circle {
+                    period: std::f64::consts::TAU
+                },
+                LatentManifold::Sphere { dim: 3 },
+            ])
+            .preserves_isometry_cross_block_coherence()
+        );
 
         // Grounding invariant: on the Circle chart the geometry transform that
         // `apply_riemannian_latent_geometry` applies — gradient projection and
         // the Euclidean→Riemannian Hessian conversion — is the EXACT identity,
         // so the coupled `μ AᵀA` block survives intact and the cross-block must
         // be kept.
-        let circle = LatentManifold::Circle { period: std::f64::consts::TAU };
+        let circle = LatentManifold::Circle {
+            period: std::f64::consts::TAU,
+        };
         let t = array![0.73_f64];
         let eg = array![2.4_f64];
         let eh = array![[1.7_f64]];
         let projected_g = circle.project_gradient_to_tangent(t.view(), eg.view());
-        assert_eq!(projected_g, eg, "Circle gradient projection must be identity");
+        assert_eq!(
+            projected_g, eg,
+            "Circle gradient projection must be identity"
+        );
         let rhess = circle.riemannian_hessian_matrix(t.view(), eg.view(), eh.view());
-        assert_eq!(rhess, eh, "Circle Riemannian Hessian must equal the Euclidean Hessian");
+        assert_eq!(
+            rhess, eh,
+            "Circle Riemannian Hessian must equal the Euclidean Hessian"
+        );
     }
 
     /// `project_matrix_columns_to_tangent_into` (the hoisted, allocation-reuse

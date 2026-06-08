@@ -225,7 +225,9 @@ impl FamilyChannelHessian for SurvivalRowHessian {
             family_scalars.and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
 
         // Determine whether beta is non-trivial (any |β_j| > ε).
-        let beta_nontrivial = beta.iter().any(|&b| b.abs() > BETA_NONTRIVIAL_ABS_THRESHOLD);
+        let beta_nontrivial = beta
+            .iter()
+            .any(|&b| b.abs() > BETA_NONTRIVIAL_ABS_THRESHOLD);
 
         match scalars_opt {
             None if beta_nontrivial => {

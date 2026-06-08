@@ -900,8 +900,10 @@ fn latent_z_is_standard_normal_enough(
         && excess_kurtosis.abs() <= policy.max_abs_excess_kurtosis.min(AUTO_Z_NORMAL_KURT_TOL)
         && ks_to_normal.is_finite()
         && ks_to_normal <= AUTO_Z_NORMAL_KS_TOL
-        && tail_mass_4 <= AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_4 + AUTO_Z_NORMAL_TAIL_FLOOR_INNER
-        && tail_mass_6 <= AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_6 + AUTO_Z_NORMAL_TAIL_FLOOR_OUTER
+        && tail_mass_4
+            <= AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_4 + AUTO_Z_NORMAL_TAIL_FLOOR_INNER
+        && tail_mass_6
+            <= AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_6 + AUTO_Z_NORMAL_TAIL_FLOOR_OUTER
         && max_abs_z < AUTO_Z_NORMAL_MAX_ABS)
 }
 

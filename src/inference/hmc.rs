@@ -3268,7 +3268,11 @@ mod tests {
             a: 0.0,
         };
         let out = super::block_sampled_marginal_correction(&target).expect("correction");
-        assert!(out.value.abs() < 1e-12, "Gaussian block value {}", out.value);
+        assert!(
+            out.value.abs() < 1e-12,
+            "Gaussian block value {}",
+            out.value
+        );
         assert!(out.rho_gradient.iter().all(|&g| g.abs() < 1e-12));
         assert!(out.n_draws > 0);
     }

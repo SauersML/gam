@@ -1891,7 +1891,9 @@ impl SoftmaxAssignmentSparsityPenalty {
     fn psd_majorizer_abs_row_sums(&self, row: &[f64], scale: f64) -> Vec<f64> {
         let a = self.softmax_row(row);
         let k = self.k_atoms;
-        let l: Vec<f64> = (0..k).map(|i| a[i].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0).collect();
+        let l: Vec<f64> = (0..k)
+            .map(|i| a[i].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0)
+            .collect();
         let m: f64 = (0..k).map(|i| a[i] * l[i]).sum();
         let mut d = vec![0.0_f64; k];
         for kk in 0..k {
@@ -2037,7 +2039,8 @@ impl AnalyticPenalty for SoftmaxAssignmentSparsityPenalty {
             let mut mean_centered_v_log_plus_one = 0.0;
             for k in 0..self.k_atoms {
                 let centered_v = v[start + k] - mean_v;
-                mean_centered_v_log_plus_one += a[k] * centered_v * (a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0);
+                mean_centered_v_log_plus_one +=
+                    a[k] * centered_v * (a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0);
             }
             for k in 0..self.k_atoms {
                 let log_plus_one = a[k].max(ENTROPY_LOG_PROBABILITY_FLOOR).ln() + 1.0;
@@ -2436,7 +2439,9 @@ impl AnalyticPenalty for IBPAssignmentPenalty {
         let pi = self.pi_map(z.view(), alpha);
         let mut sum_log_pi = 0.0;
         for &pk in pi.iter() {
-            sum_log_pi += pk.clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP).ln();
+            sum_log_pi += pk
+                .clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP)
+                .ln();
         }
         Array1::from_vec(vec![-self.weight * alpha * sum_log_pi / self.k_max as f64])
     }

@@ -127,14 +127,18 @@ impl<'a> RemlState<'a> {
         }
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
         match workspace.sparse_penalized_system_stats(x_sparse, &s_lambda) {
-            Ok(stats) if stats.density_upper < Self::SPARSE_HESSIAN_MAX_DENSITY && !blocks.is_empty() => SparseRemlDecision {
-                geometry: RemlGeometry::SparseExactSpd,
-                reason: "sparse_exact_spd",
-                p,
-                nnz_x,
-                nnz_h_upper_est: Some(stats.nnz_h_upper),
-                density_h_upper_est: Some(stats.density_upper),
-            },
+            Ok(stats)
+                if stats.density_upper < Self::SPARSE_HESSIAN_MAX_DENSITY && !blocks.is_empty() =>
+            {
+                SparseRemlDecision {
+                    geometry: RemlGeometry::SparseExactSpd,
+                    reason: "sparse_exact_spd",
+                    p,
+                    nnz_x,
+                    nnz_h_upper_est: Some(stats.nnz_h_upper),
+                    density_h_upper_est: Some(stats.density_upper),
+                }
+            }
             Ok(stats) => dense_backend(
                 "penalized_hessian_too_dense",
                 Some(stats.nnz_h_upper),

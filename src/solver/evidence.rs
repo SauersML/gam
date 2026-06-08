@@ -1686,11 +1686,9 @@ mod tests {
     fn stacking_mean_log_score_is_monotone_under_more_iterations() {
         // The EM ascent is monotone in the held-out mean log-score, so allowing
         // more iterations never lowers it.
-        let log_density = Array2::from_shape_vec(
-            (4, 2),
-            vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5],
-        )
-        .unwrap();
+        let log_density =
+            Array2::from_shape_vec((4, 2), vec![-0.2, -3.0, -3.0, -0.2, -0.5, -1.5, -1.5, -0.5])
+                .unwrap();
         let mut prev = f64::NEG_INFINITY;
         for max_iter in [1usize, 2, 4, 8, 32] {
             let out = solve_stacking_weights(
@@ -1714,7 +1712,14 @@ mod tests {
     fn stacking_dead_candidate_column_is_rejected_and_zero_weighted() {
         let log_density = Array2::from_shape_vec(
             (3, 2),
-            vec![-1.0, f64::NEG_INFINITY, -2.0, f64::NAN, -0.5, f64::NEG_INFINITY],
+            vec![
+                -1.0,
+                f64::NEG_INFINITY,
+                -2.0,
+                f64::NAN,
+                -0.5,
+                f64::NEG_INFINITY,
+            ],
         )
         .unwrap();
         let out = solve_stacking_weights(log_density.view(), StackingConfig::default()).unwrap();
@@ -1755,7 +1760,10 @@ mod tests {
     #[test]
     fn stacked_mean_rejects_shape_mismatch() {
         let weights = Array1::from_vec(vec![0.5, 0.5]);
-        let means = vec![Array1::from_vec(vec![1.0, 2.0]), Array1::from_vec(vec![3.0])];
+        let means = vec![
+            Array1::from_vec(vec![1.0, 2.0]),
+            Array1::from_vec(vec![3.0]),
+        ];
         assert!(stacked_predictive_mean(&weights, &means).is_err());
     }
 }

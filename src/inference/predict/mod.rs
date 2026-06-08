@@ -3824,8 +3824,10 @@ impl BinomialLocationScalePredictor {
         // Floor sigma to prevent division by zero when eta_s underflows.
         let sigma = eta_s.mapv(|v| v.exp().max(f64::MIN_POSITIVE));
         let q0 = Array1::from_shape_fn(eta_t.len(), |i| {
-            (-eta_t[i] / sigma[i])
-                .clamp(-SURVIVAL_STANDARDIZED_ARG_CLAMP, SURVIVAL_STANDARDIZED_ARG_CLAMP)
+            (-eta_t[i] / sigma[i]).clamp(
+                -SURVIVAL_STANDARDIZED_ARG_CLAMP,
+                SURVIVAL_STANDARDIZED_ARG_CLAMP,
+            )
         });
         Ok((q0, sigma, eta_t))
     }
