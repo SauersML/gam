@@ -1713,6 +1713,21 @@ pub fn build_survival_time_basis(
                         local[[i_new, j_new]] = v;
                     }
                 }
+                // The value-space congruence `Lᵀ S_B L` inflates the penalty
+                // magnitude (the cumulative-sum `L` has growing entries), so against
+                // the absolute REML λ grid and the fixed inner stabilization ridge
+                // even the smallest λ over-penalizes and the survival inner PIRLS
+                // stalls (#691 non-convergence regression). Rescale to unit mean
+                // diagonal: a positive scalar that the REML-selected λ absorbs
+                // exactly (the penalty subspace and its affine null space are
+                // scale-invariant, and `nullspace_dims` below uses a relative
+                // threshold), restoring the conditioning regime the increment-space
+                // penalty enjoyed while keeping the correct affine nullspace.
+                let tr_local: f64 = (0..p_time).map(|i| local[[i, i]]).sum();
+                if tr_local > 0.0 {
+                    let scale = (p_time as f64) / tr_local;
+                    local.mapv_inplace(|v| v * scale);
+                }
                 penalties.push(local);
             }
 
