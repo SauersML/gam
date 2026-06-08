@@ -1257,14 +1257,6 @@ where
                         last_deviance_change = deviance_change;
                         last_step_size = 1.0;
                         last_step_halving = attempts;
-                        if iter <= 20 || iter % 50 == 0 {
-                            use std::io::Write as _;
-                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                                let raw_g = accepted_state.gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                                let bi = beta.as_ref().iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                                writeln!(f, "[DIAG-PIRLS] iter={iter} kkt={candidategrad_norm:.4e} raw_grad_inf={raw_g:.4e} dev_chg={deviance_change:.4e} beta_inf={bi:.4e} attempts={attempts}").ok();
-                            }
-                        }
                         max_abs_eta = accepted_state
                             .eta
                             .iter()
@@ -1880,6 +1872,63 @@ where
                  Δdev={last_deviance_change:.3e})"
             );
             status = PirlsStatus::StalledAtValidMinimum;
+        } else {
+            // #752 principle on the inner solve (gam#691). When a penalty leaves a
+            // likelihood-WEAKLY-identified direction unpenalized — the value-space
+            // I-spline curvature `Lᵀ S_B L` puts a linear log-cumulative-hazard in
+            // `ker(Sλ)`, identified only weakly by the steep upper-tail data — the
+            // penalized Hessian `H = XᵀWX + Sλ` is near-singular along it. The
+            // objective is then genuinely FLAT there (deviance change at machine
+            // precision) but the constrained stationarity residual retains O(0.5)
+            // mass in that near-null direction, so `certifies_kkt` /
+            // `pirls_soft_acceptance` refuse and the survival fit hits
+            // MaxIterations at a valid constrained penalized optimum.
+            //
+            // The honest certificate is stationarity over `range(H)` — the
+            // identifiable subspace. Project the constrained-stationarity residual
+            // onto the range of the penalized Hessian (drop only its numerical
+            // near-null space, the flat directions data+penalty cannot resolve) and
+            // accept when progress has stopped AND that range-projected residual is
+            // near-stationary. Full-rank H ⇒ the projection is identity ⇒
+            // byte-identical to the strict/soft tests above; a genuine non-optimum
+            // keeps residual in `range(H)` and still refuses. Runs once, here, only
+            // after the cheap rescues already declined.
+            let dev_scale = state.deviance.abs().max(1.0);
+            let progress_stopped = last_deviance_change.abs()
+                <= options.convergence_tolerance * dev_scale
+                || last_step_size <= options.min_step_size * 2.0;
+            if progress_stopped
+                && let Some(h_dense) = state.hessian.as_dense()
+                && let Ok((evals, evecs)) =
+                    crate::faer_ndarray::FaerEigh::eigh(h_dense, faer::Side::Lower)
+            {
+                let max_ev = evals
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, |a, b| a.max(b.abs()))
+                    .max(1.0);
+                let p = h_dense.nrows();
+                let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
+                // ‖P_range g‖₂ over eigenvectors with eigenvalue > threshold.
+                let mut acc = 0.0_f64;
+                for (k, &lam) in evals.iter().enumerate() {
+                    if lam > threshold {
+                        let comp = evecs.column(k).dot(&state.gradient);
+                        acc += comp * comp;
+                    }
+                }
+                let range_resid = acc.sqrt();
+                if state.near_stationary_kkt(range_resid, kkt_tolerance) {
+                    log::debug!(
+                        "[PIRLS] post-loop rescue on range(H) stationarity: \
+                         range_resid={range_resid:.3e} (full ‖g‖={final_projected_grad:.3e}); \
+                         residual mass lies in the near-null space of the penalized Hessian \
+                         (objective flat there), the iterate is a valid identifiable-subspace \
+                         minimum (gam#691)"
+                    );
+                    status = PirlsStatus::StalledAtValidMinimum;
+                }
+            }
         }
     }
 
