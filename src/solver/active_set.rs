@@ -437,47 +437,86 @@ pub(crate) fn feasible_point_for_linear_constraints(
     }
 }
 
-/// Euclidean projection of `point` onto the feasible polyhedron
-/// `{β : A·β ≥ b}`, i.e. the solution of `min_β ½‖β − point‖² s.t. A·β ≥ b`.
+/// Strictly-interior margin (in per-row geometric / scaled-slack units) required
+/// of the projected cold-start seed produced by
+/// [`project_point_strictly_into_feasible_cone`]. Each constraint row is shifted
+/// to `a_iᵀβ ≥ b_i + ACTIVE_SET_INTERIOR_SEED_MARGIN·‖a_i‖` so that, scaled by
+/// `‖a_i‖`, every row of the returned seed has slack `≥` this margin. The value
+/// is far above the active-set activation threshold (`tol_active = 1e-10`) so the
+/// initial working set the QP step solver builds from the seed is **empty** — no
+/// row is mistaken for "on the boundary" — yet small enough that the seed stays a
+/// negligible distance from the data-driven projection it is derived from.
+const ACTIVE_SET_INTERIOR_SEED_MARGIN: f64 = 1e-6;
+
+/// The strictly-interior cold-start margin (scaled-slack units) that
+/// [`project_point_strictly_into_feasible_cone`] guarantees on its returned
+/// seed. Exposed so the P-IRLS seed builder can decide, on the same scale,
+/// whether the current seed is already strictly interior (and may be used as-is)
+/// or sits on / outside the cone boundary (and must be projected).
+#[inline]
+pub(crate) fn interior_seed_margin() -> f64 {
+    ACTIVE_SET_INTERIOR_SEED_MARGIN
+}
+
+/// Project `point` to a *strictly interior* feasible point of the polyhedron
+/// `{β : A·β ≥ b}`: the solution of `min_β ½‖β − point‖²` subject to the
+/// margin-shifted system `A·β ≥ b + δ·‖a_i‖`, with `δ =
+/// ACTIVE_SET_INTERIOR_SEED_MARGIN`.
 ///
 /// This is the principled feasible cold-start seed for a shape-constrained
-/// (convex/concave/monotone) smooth: it carries the data-driven curvature of
-/// the unconstrained seed `point` and merely nudges it the minimum distance
-/// required to enter the constraint cone. It is qualitatively different from
+/// (convex / concave / monotone) smooth. It is qualitatively different from
 /// [`feasible_point_for_linear_constraints`], which returns the *minimum-norm*
 /// feasible point — for a homogeneous cone (`b = 0`, as the second-difference
-/// convexity/concavity constraints are) that minimum-norm point is the cone
-/// **vertex** `β = 0` (a flat line), where every constraint row is tight. P-IRLS
-/// launched from that vertex stalls on a non-stationary face of the cone and
-/// the fit's success then depends on whether a warm-start seed happens to land
-/// it in the right basin (#873). Projecting the unconstrained seed instead
-/// lands a strictly-interior-or-boundary point already near the constrained
-/// optimum, so the fit converges identically from a cold or warm cache.
+/// convexity / concavity constraints are) that minimum-norm point is the cone
+/// **vertex** `β = 0` (a flat line) where every constraint row is tight. A
+/// shape-constrained P-IRLS launched from that vertex hands the inner active-set
+/// QP an all-rows-active working set (every row's slack is `0`), and the QP then
+/// stalls on a degenerate, non-stationary face of the cone. The fit's success
+/// then depends on whether a warm-start seed happens to drop it into the right
+/// basin, so the same fit silently diverges (or aborts) between a cold and a
+/// warm cache (#873).
 ///
-/// The projection is the identity-Hessian instance of
-/// [`solve_quadratic_with_linear_constraints`]: with `H = I` and `rhs = point`
-/// the quadratic `½βᵀβ − pointᵀβ = ½‖β − point‖² − ½‖point‖²` is minimized by
-/// the projection. Returns `None` if the constraints are malformed or the
-/// active-set QP fails to certify a feasible solution, so callers can fall back.
-pub(crate) fn project_point_onto_feasible_cone(
+/// Requiring a strictly-positive margin on every row makes the returned seed an
+/// interior point: the QP step solver starts from an **empty** active set and
+/// adds only the genuinely binding rows, converging to the certified constrained
+/// stationary point regardless of cache state. The projection is the
+/// identity-Hessian instance of [`solve_quadratic_with_linear_constraints`]
+/// (`H = I`, `rhs = point` ⇒ minimizing `½‖β − point‖²`), so the interior seed is
+/// also the *nearest* strictly-interior point to the supplied data-driven
+/// `point` — it inherits whatever curvature `point` already carries. Returns
+/// `None` if the constraints are malformed or the active-set QP cannot certify a
+/// feasible solution, so callers can fall back.
+pub(crate) fn project_point_strictly_into_feasible_cone(
     point: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
 ) -> Option<Array1<f64>> {
     let p = point.len();
-    if constraints.a.ncols() != p
-        || constraints.a.nrows() == 0
-        || constraints.b.len() != constraints.a.nrows()
-    {
+    let m = constraints.a.nrows();
+    if constraints.a.ncols() != p || m == 0 || constraints.b.len() != m {
         return None;
     }
+    // Shift each row strictly into the interior by `δ·‖a_i‖`, so that the scaled
+    // (geometric) slack `(a_iᵀβ − b_i)/‖a_i‖ ≥ δ` on the returned seed.
+    let mut b_interior = constraints.b.clone();
+    for i in 0..m {
+        let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+        b_interior[i] += ACTIVE_SET_INTERIOR_SEED_MARGIN * norm;
+    }
+    let interior = LinearInequalityConstraints::from_paired(constraints.a.clone(), b_interior);
     let identity = Array2::<f64>::eye(p);
     let (beta, _active) =
-        solve_quadratic_with_linear_constraints(&identity, point, point, constraints, None).ok()?;
+        solve_quadratic_with_linear_constraints(&identity, point, point, &interior, None).ok()?;
     if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
         return None;
     }
-    let (worst, _row) = max_linear_constraint_violation(&beta, constraints);
-    if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+    // Certify strict interiority against the ORIGINAL constraints: every scaled
+    // slack must clear (most of) the requested margin so the QP step solver sees
+    // an empty initial active set.
+    let mut min_scaled_slack = f64::INFINITY;
+    for i in 0..m {
+        min_scaled_slack = min_scaled_slack.min(scaled_constraint_slack(&beta, constraints, i));
+    }
+    if min_scaled_slack >= 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN {
         Some(beta)
     } else {
         None
@@ -1370,14 +1409,88 @@ pub(crate) fn solve_quadratic_with_linear_constraints(
 #[cfg(test)]
 mod tests {
     use super::{
-        LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
+        ACTIVE_SET_INTERIOR_SEED_MARGIN, LinearInequalityConstraints,
+        compute_constraint_kkt_diagnostics, project_point_strictly_into_feasible_cone,
         project_stationarity_residual_on_constraint_cone,
-        rank_reduce_rows_pivoted_qr_with_dependence,
+        rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
         solve_newton_direction_with_linear_constraints_impl,
         solve_quadratic_with_linear_constraints,
     };
     use approx::assert_relative_eq;
-    use ndarray::{Array1, array};
+    use ndarray::{Array1, Array2, array};
+
+    /// A `β = 0` seed sits on the boundary of EVERY row of a homogeneous
+    /// (`b = 0`) convex/concave second-difference cone — it is the cone vertex.
+    /// The strict-interior projection must move it to a point with a strictly
+    /// positive scaled slack on every row, so the inner active-set QP starts
+    /// from an EMPTY working set rather than an all-rows-active degenerate face
+    /// (the #873 cache-dependence root cause). The zero seed is the worst case:
+    /// the nearest interior point is unique up to the margin, and a buggy
+    /// "min-norm" feasibility fallback would return `0` again.
+    #[test]
+    fn strict_interior_projection_lifts_vertex_seed_off_every_constraint_row() {
+        // Signed second-difference rows of a 5-coefficient concave smooth:
+        // -(β_{i+2} - 2β_{i+1} + β_i) ≥ 0 for i = 0..3.
+        let p = 5usize;
+        let rows = p - 2;
+        let mut a = Array2::<f64>::zeros((rows, p));
+        for i in 0..rows {
+            a[[i, i]] = -1.0;
+            a[[i, i + 1]] = 2.0;
+            a[[i, i + 2]] = -1.0;
+        }
+        let constraints = LinearInequalityConstraints::from_paired(a, Array1::zeros(rows));
+
+        let vertex = Array1::<f64>::zeros(p);
+        // The vertex is feasible (all rows exactly tight) but on every boundary.
+        for i in 0..rows {
+            assert!(
+                scaled_constraint_slack(&vertex, &constraints, i).abs() < 1e-12,
+                "vertex seed should sit exactly on row {i}"
+            );
+        }
+
+        let interior = project_point_strictly_into_feasible_cone(&vertex, &constraints)
+            .expect("strict-interior projection of the vertex must succeed");
+        let min_slack = (0..rows)
+            .map(|i| scaled_constraint_slack(&interior, &constraints, i))
+            .fold(f64::INFINITY, f64::min);
+        assert!(
+            min_slack >= 0.5 * ACTIVE_SET_INTERIOR_SEED_MARGIN,
+            "projected seed must be strictly interior on every row; min scaled slack = {min_slack:.3e}"
+        );
+    }
+
+    /// A seed that already carries genuine (concave) curvature and clears the
+    /// interior margin is returned essentially unchanged — the projection only
+    /// nudges boundary/violating seeds, it does not discard usable curvature.
+    #[test]
+    fn strict_interior_projection_preserves_a_curvature_carrying_seed() {
+        let p = 5usize;
+        let rows = p - 2;
+        let mut a = Array2::<f64>::zeros((rows, p));
+        for i in 0..rows {
+            a[[i, i]] = -1.0;
+            a[[i, i + 1]] = 2.0;
+            a[[i, i + 2]] = -1.0;
+        }
+        let constraints = LinearInequalityConstraints::from_paired(a, Array1::zeros(rows));
+        // A strictly concave coefficient profile (-(j-2)^2): every second
+        // difference is -(-2) = +2 > 0 after the concave sign flip, well above
+        // the interior margin.
+        let seed = Array1::from_iter((0..p).map(|j| -((j as f64 - 2.0).powi(2))));
+        let projected = project_point_strictly_into_feasible_cone(&seed, &constraints)
+            .expect("already-interior seed must project");
+        let max_move = seed
+            .iter()
+            .zip(projected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_move < 1e-3,
+            "strictly-interior curvature-carrying seed should be preserved; max move = {max_move:.3e}"
+        );
+    }
 
     #[test]
     fn maxiter_accepts_current_boundary_solution() {
