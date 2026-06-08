@@ -15411,7 +15411,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_mode_diagonal_ridge,
                 joint_bundle,
             );
-            let rhs = &grad_joint - &penalty_beta;
+            // Stationarity RHS for the trust-region quadratic model. When the
+            // Jeffreys/Firth term is armed the inner objective is `−ℓ+½βᵀSβ+Φ`, so
+            // the model RHS is `∇L − Sβ + ∇Φ` — the SAME augmented RHS the Newton
+            // step solves and the H_Φ-augmented `hpen_delta` below pairs with. Using
+            // the bare `∇L − Sβ` here desyncs `predicted_reduction` from the
+            // augmented step + the Φ-augmented `actual_reduction`, which is what
+            // froze the coupled K-block line search (gam#729/#715). No-op when the
+            // term is condition-gated/unavailable (∇Φ=0).
+            let mut rhs = &grad_joint - &penalty_beta;
+            if let Some((grad_phi, _hphi)) = head_jeffreys_term.as_ref()
+                && grad_phi.len() == rhs.len()
+            {
+                rhs += grad_phi;
+            }
             let beta_inf = states
                 .iter()
                 .flat_map(|s| s.beta.iter().copied())
@@ -15563,6 +15576,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .is_err()
                 {
                     break;
+                }
+                // JEFFREYS/FIRTH CURVATURE IN THE TRUST-REGION MODEL (gam#729/#715).
+                // When the Jeffreys term is armed, the inner objective the merit
+                // (`trialobjective = −ℓ + ½βᵀSβ + Φ`) measures and the Newton step
+                // (`(H+Sλ+H_Φ)δ = ∇L−Sβ+∇Φ`) target both include the Firth term, so
+                // the trust-region quadratic model's curvature MUST include `H_Φδ`
+                // too. Omitting it (bare `(H+Sλ)δ`) makes `predicted_reduction`
+                // inconsistent with the H_Φ-augmented `rhs` and the Φ-augmented
+                // `actual_reduction`: for a coupled K-block family near the Firth
+                // optimum (residual floored at ‖∇Φ‖) the resulting trust_ratio is
+                // wrong, the line search rejects the genuine descent step (accepts
+                // ~0), and β freezes with the residual stalled at a constant ≫ tol
+                // — the unbounded-cycle non-convergence the inner solve exhibits on
+                // the Dirichlet/multinomial fits. Adding `H_Φδ` makes the model
+                // curvature match the augmented system the step solves and the
+                // merit the accept test uses, so the step is accepted and the
+                // residual descends. No-op when the term is condition-gated (∇Φ=0,
+                // H_Φ=0) or unavailable.
+                if let Some((_grad_phi, hphi)) = head_jeffreys_term.as_ref() {
+                    let hphi_delta = hphi.dot(&trial_delta);
+                    hpen_delta += &hphi_delta;
                 }
                 let predicted_reduction =
                     joint_quadratic_predicted_reduction(&rhs, &hpen_delta, &trial_delta);
@@ -16201,24 +16235,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
-            if cycle < 40 || cycle % 50 == 0 {
-                let beta_inf = flatten_state_betas(&states, specs)
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f64, f64::max);
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/gam_diag.log")
-                {
-                    writeln!(
-                        f,
-                        "[DIAG-CYC] cycle={cycle} residual={residual:.4e} step_inf={step_inf:.4e} accepted_step_inf={accepted_step_inf:.4e} beta_inf={beta_inf:.4e} tr={joint_trust_radius:.3e} nullity={joint_step_spectral_nullity}"
-                    )
-                    .ok();
-                }
-            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
@@ -17165,20 +17181,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 log::info!("{verdict}");
             } else {
                 log::warn!("{verdict}");
-            }
-            {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/gam_diag.log")
-                {
-                    writeln!(
-                        f,
-                        "[DIAG-INNER] converged={converged} terminator={terminator} cycles={cycles_done}/{inner_max_cycles} best_resid={best_residual_seen:.3e} p={total_p}"
-                    )
-                    .ok();
-                }
             }
         }
 
