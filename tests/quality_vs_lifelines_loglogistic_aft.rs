@@ -174,6 +174,12 @@ fn gam_loglogistic_aft_matches_lifelines_on_haberman_ages() {
         // Constant scale block: a single sigma shared across subjects, exactly
         // like lifelines' LogLogisticAFT shape parameter.
         noise_formula: Some("1".to_string()),
+        // #736: this test is a parametric log-logistic AFT recovery check.
+        // The default flexible 8-internal-knot time warp admits curved
+        // baseline-shape directions that are unnecessary for an affine
+        // log-time AFT surface and can dominate small-time survivor error.
+        time_num_internal_knots: 2,
+        outer_max_iter: Some(80),
         ..FitConfig::default()
     };
     let result =
