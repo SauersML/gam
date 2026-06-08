@@ -56,6 +56,20 @@ pub enum ArrowSchurGpuFailure {
     },
 }
 
+/// Safety-margin multiplier on `√(machine ε)` for the diagonal ridge bump
+/// suggested when a local block fails Cholesky.
+///
+/// The estimated bump is `diag_scale · |pivot| · √ε · RIDGE_BUMP_EPS_MARGIN`.
+/// A bare `diag_scale · √ε` ridge is the smallest perturbation that makes a
+/// marginally-indefinite block PD in exact arithmetic, but a single retry at
+/// that magnitude is routinely re-rejected by the next POTRF because the
+/// rounding error of forming `D + ridge·I` and re-factoring is itself O(√ε).
+/// The 1024× headroom (≈ 2¹⁰, i.e. ten extra bits below the f64 mantissa's
+/// 52) clears the pivot on the first retry without materially perturbing the
+/// curvature the Newton step sees. Shared by the per-row scalar path and the
+/// batched-tile path so both suggest an identical bump.
+const RIDGE_BUMP_EPS_MARGIN: f64 = 1024.0;
+
 /// Entry point: attempt the fully device-resident Arrow-Schur Newton solve.
 /// Returns `Err(ArrowSchurGpuFailure::Unavailable)` to indicate "device path
 /// declined, fall back to CPU" — never panics.
@@ -374,7 +388,7 @@ fn build_row_procedural_matvec(
                     .max(1.0);
                 ArrowSchurGpuFailure::RidgeBumpRequired {
                     row: i,
-                    bump: scale * f64::EPSILON.sqrt() * 1024.0,
+                    bump: scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN,
                 }
             })?;
         factors.push(factor);
@@ -823,7 +837,7 @@ mod cuda {
                 tile[local].diag_scale
                     * (f64::from(pivot).abs()).max(1.0)
                     * f64::EPSILON.sqrt()
-                    * 1024.0,
+                    * RIDGE_BUMP_EPS_MARGIN,
             );
             return Some(());
         }
