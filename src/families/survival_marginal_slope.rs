@@ -19373,20 +19373,31 @@ fn mean_abs(values: impl IntoIterator<Item = f64>) -> f64 {
     if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
+/// Floor on the mean-absolute diagonal scale of the likelihood Gram and of a
+/// penalty block when forming the initial `log λ` seed, guarding the ratio
+/// against a divide-by-zero / `ln(0)` when a block is (numerically) all zero.
+const BLOCK_LOG_LAMBDA_SCALE_FLOOR: f64 = 1.0e-8;
+/// Symmetric clamp on the seeded `log λ`. Keeps the warm start inside
+/// `λ ∈ [e^-12, e^12]` so a pathological scale ratio cannot seed the outer
+/// optimiser at a degenerate (fully-unpenalised or fully-saturated) corner.
+const BLOCK_LOG_LAMBDA_SEED_CLAMP: f64 = 12.0;
+
 fn block_log_lambda_seeds<'a, I>(design: &DesignMatrix, penalty_locals: I) -> Vec<f64>
 where
     I: IntoIterator<Item = &'a Array2<f64>>,
 {
     let unit_weights = Array1::<f64>::ones(design.nrows());
     let likelihood_scale = match design.diag_gram(&unit_weights) {
-        Ok(d) => mean_abs(d.iter().copied()).max(1.0e-8),
+        Ok(d) => mean_abs(d.iter().copied()).max(BLOCK_LOG_LAMBDA_SCALE_FLOOR),
         Err(_) => 1.0,
     };
     penalty_locals
         .into_iter()
         .map(|s| {
-            let penalty_scale = mean_abs(s.diag().iter().copied()).max(1.0e-8);
-            (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
+            let penalty_scale = mean_abs(s.diag().iter().copied()).max(BLOCK_LOG_LAMBDA_SCALE_FLOOR);
+            (likelihood_scale / penalty_scale)
+                .ln()
+                .clamp(-BLOCK_LOG_LAMBDA_SEED_CLAMP, BLOCK_LOG_LAMBDA_SEED_CLAMP)
         })
         .collect()
 }
@@ -20407,6 +20418,13 @@ pub(crate) fn joint_training_design_preflight(
     );
     Ok(())
 }
+
+/// Floor on the relative tolerance handed to the exact-joint spatial
+/// length-scale outer solve. The κ-options' own `rel_tol` is used when it is
+/// looser than this, but is never tightened below `1e-6`: the spatial outer
+/// objective is itself the result of a nested inner fit, so a tolerance tighter
+/// than this only chases inner-solve noise without improving the length scale.
+const EXACT_SPATIAL_OUTER_REL_TOL_FLOOR: f64 = 1e-6;
 
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
@@ -22299,7 +22317,7 @@ pub fn fit_survival_marginal_slope_terms(
         let psi_dim = setup.theta0().len() - setup.rho_dim();
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
-    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
+    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(EXACT_SPATIAL_OUTER_REL_TOL_FLOOR);
     let mut solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
