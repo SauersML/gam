@@ -197,15 +197,25 @@ pub struct PirlsLoopAdmission {
 }
 
 impl GpuDispatchPolicy {
+    /// Minimum design column count for the device-resident inner/outer loops.
+    ///
+    /// Below this width the per-iteration `XᵀWX + Cholesky` is dominated by
+    /// launch latency and PCIe staging rather than arithmetic, so the host LM
+    /// loop (which populates the full `PirlsResult` surface as a free
+    /// side-effect) is strictly cheaper. Shared by both the inner PIRLS and
+    /// outer REML admission predicates so they cannot drift apart.
+    pub const DEVICE_LOOP_MIN_P: usize = 32;
+
     /// Conservative admission predicate for routing
     /// `fit_model_for_fixed_rho_with_adaptive_kkt` through the Stage 3.3
     /// device-resident PIRLS loop instead of the CPU LM loop.
     ///
-    /// The thresholds (`n ≥ 50_000`, `p ≥ 32`) are deliberately well above
-    /// the matrix-size where a single PIRLS iter's `XᵀWX + Cholesky` would
-    /// be PCIe-bandwidth-bound. Smaller fits stay on the CPU LM loop where
-    /// the full `PirlsResult` surface (firth, EDF, per-row weights, …) is
-    /// already populated as a free side-effect of the iteration.
+    /// The thresholds (`n ≥ row_kernel_min_n`, `p ≥ DEVICE_LOOP_MIN_P`) are
+    /// deliberately well above the matrix-size where a single PIRLS iter's
+    /// `XᵀWX + Cholesky` would be PCIe-bandwidth-bound. Smaller fits stay on
+    /// the CPU LM loop where the full `PirlsResult` surface (firth, EDF,
+    /// per-row weights, …) is already populated as a free side-effect of the
+    /// iteration.
     pub const fn should_use_gpu_pirls_loop(&self, adm: PirlsLoopAdmission) -> bool {
         if !adm.gpu_available {
             return false;
@@ -213,7 +223,7 @@ impl GpuDispatchPolicy {
         if adm.n < self.row_kernel_min_n {
             return false;
         }
-        if adm.p < 32 {
+        if adm.p < Self::DEVICE_LOOP_MIN_P {
             return false;
         }
         match adm.family {
@@ -228,7 +238,7 @@ impl GpuDispatchPolicy {
     /// metrics (objective value, gradient norm, convergence flag).
     ///
     /// The thresholds piggyback on the existing inner-PIRLS admission floor
-    /// (`n ≥ row_kernel_min_n`, `p ≥ 32`) because the device-resident outer
+    /// (`n ≥ row_kernel_min_n`, `p ≥ DEVICE_LOOP_MIN_P`) because the device-resident outer
     /// loop calls `pirls_loop_on_stream` per step and must not pay the host
     /// hop for small fits the inner loop would have rejected anyway. The
     /// `num_rho ≥ 2` floor rules out the trivial single-smoother case where
@@ -242,7 +252,7 @@ impl GpuDispatchPolicy {
         if adm.n < self.row_kernel_min_n {
             return false;
         }
-        if adm.p < 32 {
+        if adm.p < Self::DEVICE_LOOP_MIN_P {
             return false;
         }
         if adm.num_rho < 2 {
