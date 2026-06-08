@@ -25450,14 +25450,22 @@ fn design_penalty_range_gammas(design: &DesignMatrix, penalty: &PenaltyMatrix) -
 /// is monotone decreasing in ρ. The bound is the ρ at which it equals
 /// `EFFECTIVE_DF_FLOOR` (when the term's max attainable edf exceeds the floor),
 /// found by bisection on the closed-form edf. Tied coordinates (shared precision
-/// label) take the LOOSEST (largest) per-term bound so the shared λ is never
-/// forced tighter than any single contributing term requires. Every coordinate
-/// is additionally capped at the caller's uniform `ceiling` so this can only
-/// TIGHTEN, never loosen, the existing bound.
+/// label) take the TIGHTEST (smallest) per-term bound: the shared λ must retain
+/// the floor for EVERY contributing term, so the binding constraint is the most
+/// restrictive one — relaxing to a looser term's bound would let some other term
+/// fall below its floor. Every coordinate is additionally capped at the caller's
+/// uniform `ceiling` so this can only TIGHTEN, never loosen, the existing bound.
 ///
-/// This enters ONLY the λ-selection domain: the inner β solve at any selected ρ
-/// is unchanged and exact, so the converged β carries no bias (same discipline
-/// as the #747 solver-only ridge). It is the λ-upper-side dual of the #752
+/// This enters ONLY the λ-selection domain. The inner β solve is exact
+/// CONDITIONAL on the selected λ, so there is no per-λ approximation (same
+/// discipline as the #747 solver-only ridge). It is NOT, however, a bias-free
+/// no-op: whenever the unconstrained REML optimum lies beyond this upper bound,
+/// the bound changes the SELECTED λ, and the selected λ changes the fitted
+/// β̂ = argmin{−ℓ + ½λ βᵀSβ} (∂β̂/∂λ = −(H + λS)⁻¹ S β̂ ≠ 0). The floor is an
+/// explicit smoothing-regularization constraint on the λ-selection — it
+/// deliberately moves the estimate away from the (flat-Fisher) null-space
+/// collapse, not a transparent reparameterization. It is the λ-upper-side dual
+/// of the #752
 /// full-subspace logdet work — there the value/gradient subspace was fixed on the
 /// λ→∞ side of a near-collinear block; here the selection domain is bounded so a
 /// flat Fisher surface cannot push a term past null-space collapse (#715/#684).
@@ -25505,7 +25513,8 @@ fn effective_df_floor_rho_upper_bounds(
                 }
             }
             let rho_star = 0.5 * (lo + hi);
-            // Tied coordinates: take the loosest (largest) bound across terms.
+            // Tied coordinates: take the tightest (smallest) bound across terms,
+            // so every term sharing this λ retains at least the floor.
             let slot = &mut upper[outer];
             if rho_star > -ceiling && rho_star < *slot {
                 *slot = rho_star;
