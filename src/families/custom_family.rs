@@ -26284,15 +26284,17 @@ mod tests {
         );
     }
 
-    // Experimental scan documenting that the joint_outer_evaluate path
-    // itself does *not* show divergence between project_hessian_logdet=true
-    // and =false at biobank-scale ρ: the dominant term ½ λ β'Sβ grows
-    // linearly in λ regardless of projection, and the trace pair cancels
-    // in both routes at this fixture's geometry.  The biobank failure lives
-    // in the custom survival-marginal-slope outer-
-    // gradient assembler (which has its own unprojected formula and has
-    // not been retrofitted to use joint_outer_evaluate's projected
-    // kernel).
+    // Experimental scan documenting that on THIS fixture's geometry the
+    // joint_outer_evaluate path does not show divergence between
+    // project_hessian_logdet=true and =false at biobank-scale ρ: the dominant
+    // term ½ λ β'Sβ grows linearly in λ regardless of projection, and the trace
+    // pair cancels in both routes here. The clustered-PC marginal-slope failure
+    // (#808/#787) is a DIFFERENT geometry — a near-collinear penalty-null trend
+    // whose likelihood determinant the range(Sλ)-only route drops. That route is
+    // now disabled for all marginal-slope families: the project_hessian_logdet
+    // flag at every joint_outer_evaluate/_efs call site reads
+    // `use_projected_penalty_logdet()` (default true), so value and analytic
+    // gradient share the range(H+Sλ) generalized determinant.
     #[test]
     fn biobank_scale_rho_scan_joint_outer_evaluate_is_projection_invariant() {
         // Same fixture shape as the rank-deficient projected-trace test,
