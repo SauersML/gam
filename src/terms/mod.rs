@@ -1,4 +1,5 @@
 pub mod analytic_penalties;
+pub mod equivariant_penalty;
 pub mod atom_codes;
 pub mod atom_selection;
 pub mod basis;
