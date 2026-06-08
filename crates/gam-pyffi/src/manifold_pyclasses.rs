@@ -12,7 +12,7 @@
 //! the `#[pymodule]` block via a focused re-import.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList, PyTuple};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::{PyObject, py_value_error};
 
