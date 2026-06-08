@@ -262,10 +262,11 @@ impl CustomFamily for DirichletCommonFamily {
     /// ILL-CONDITIONED penalized joint Hessian, not only on a rank-deficient one.
     ///
     /// The coupled common-log-α Dirichlet is exactly the regime this gate exists
-    /// for: the *observed* joint information `∂²(−ℓ)/∂η_a∂η_b` couples every block
+    /// for: the Fisher joint information `E[−∂²ℓ/∂η_a∂η_b]` couples every block
     /// through `α₀ = Σ_k α_k`, and on a small, concentrated composition (the 23-row
     /// Skye AFM series, ~15 train rows, K = 3) the penalized joint Hessian is
-    /// full-rank but ill-conditioned: some range-space curvature directions sit
+    /// full-rank (Fisher is PSD) but ill-conditioned: some range-space curvature
+    /// directions sit
     /// just above the rank cutoff. Undamped, the range-restricted joint-Newton step
     /// takes an enormous `component/λ` proposal on those near-singular modes, the
     /// trust region clips it every cycle, and the stationarity residual along that
