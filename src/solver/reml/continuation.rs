@@ -71,6 +71,12 @@ pub(crate) const OVERSMOOTH_RETRY_MAX: usize = 3;
 /// collapse. 0.5 log-units ≈ factor of √e in λ.
 pub(crate) const RHO_EQUAL_TOL: f64 = 0.5;
 
+/// Number of consecutive `TrustRegionFloor` failures at the SAME ρ-step that
+/// switches the recovery from "shrink α and retry" to "expand ρ₀ and restart
+/// the path". Two repeats means step-shrinking is not buying convergence at
+/// this start, so the oversmoothed seed itself must move outward.
+pub(crate) const TRUST_FLOOR_EXPAND_AFTER: usize = 2;
+
 #[derive(Debug, Clone)]
 pub(crate) enum ContinuationFailure {
     PathBudgetExhausted {
@@ -225,8 +231,14 @@ fn step_toward(rho_k: &Array1<f64>, target: &Array1<f64>, alpha: f64) -> Array1<
     out
 }
 
+/// How much tighter the "we have arrived at ρ*" stopping test is than the
+/// `RHO_EQUAL_TOL` start-collapse band. Reaching the target must be a stricter
+/// statement than ρ₀≈ρ*, so the path does not declare success one full collapse
+/// band away from the seed.
+const REACHED_TARGET_TIGHTEN: f64 = 8.0;
+
 fn reached_target(rho: &Array1<f64>, target: &Array1<f64>) -> bool {
-    let tol = RHO_EQUAL_TOL / 8.0;
+    let tol = RHO_EQUAL_TOL / REACHED_TARGET_TIGHTEN;
     rho.iter()
         .zip(target.iter())
         .all(|(a, b)| (a - b).abs() <= tol)
@@ -528,7 +540,7 @@ fn run_path(
                     }
                     FailureAction::ShrinkOrExpand => {
                         consecutive_trust_floor += 1;
-                        if consecutive_trust_floor >= 2 {
+                        if consecutive_trust_floor >= TRUST_FLOOR_EXPAND_AFTER {
                             return Err(PathOutcome::ExpandRhoZero(failure));
                         }
                         alpha *= ALPHA_SHRINK;
