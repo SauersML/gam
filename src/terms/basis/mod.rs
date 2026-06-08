@@ -30,9 +30,16 @@ use std::ops::Range;
 use std::sync::Arc;
 use thiserror::Error;
 
+mod cyclic;
 mod polylog;
 mod sphere_kernels;
 mod sphere_spectral;
+
+pub use cyclic::create_cyclic_difference_penalty_matrix;
+pub(crate) use cyclic::{
+    create_cyclic_bspline_basis_dense, cyclic_distance_1d, cyclic_uniform_knot_vector,
+    wrap_to_period,
+};
 
 /// Absolute floor below which a B-spline knot span (`t_{i+k} - t_i`) is treated
 /// as degenerate: the corresponding Cox–de Boor / derivative-recurrence
@@ -1295,108 +1302,6 @@ pub fn create_difference_penalty_matrix(
     // The penalty matrix S = D' * D
     let s = fast_ata(&d);
     Ok(s)
-}
-
-/// Creates a cyclic finite-difference penalty `S = D' D`.
-///
-/// Unlike the ordinary P-spline Reinsch penalty, every difference stencil wraps
-/// around the coefficient ring. For `order = 2`, each row is
-/// `β_i - 2β_{i+1} + β_{i+2}` modulo the number of coefficients, so the
-/// constant vector is the only null direction and no endpoint is privileged.
-pub fn create_cyclic_difference_penalty_matrix(
-    num_basis_functions: usize,
-    order: usize,
-) -> Result<Array2<f64>, BasisError> {
-    if order == 0 || order >= num_basis_functions {
-        return Err(BasisError::InvalidPenaltyOrder {
-            order,
-            num_basis: num_basis_functions,
-        });
-    }
-
-    let mut d = Array2::<f64>::eye(num_basis_functions);
-    for _ in 0..order {
-        let previous = d;
-        d = Array2::<f64>::zeros((num_basis_functions, num_basis_functions));
-        for i in 0..num_basis_functions {
-            let next = (i + 1) % num_basis_functions;
-            for j in 0..num_basis_functions {
-                d[[i, j]] = previous[[next, j]] - previous[[i, j]];
-            }
-        }
-    }
-    Ok(fast_ata(&d))
-}
-
-#[inline]
-fn wrap_to_period(x: f64, start: f64, period: f64) -> f64 {
-    // Keep wrapped values numerically inside the half-open period
-    // `[start, start + period)`. `rem_euclid` can return exactly `period`
-    // after extreme-roundoff cancellation (e.g. `(start + period - eps - start)`
-    // rounding up to `period`), which lifts the result to `start + period`
-    // and pushes basis evaluators that assume `x < start + period` over the
-    // right knot. Fold that boundary back to `start` so every caller — the
-    // dense cyclic B-spline evaluator, the periodic Duchon kernel matrix,
-    // and the cylinder/torus tensor margins — agrees with the
-    // `wrap_periodic_phase` convention used by the derivative path.
-    let offset = (x - start).rem_euclid(period);
-    if offset >= period {
-        start
-    } else {
-        start + offset
-    }
-}
-
-#[inline]
-fn cyclic_distance_1d(x: f64, c: f64, period: f64) -> f64 {
-    let delta = (x - c).abs().rem_euclid(period);
-    delta.min(period - delta)
-}
-
-fn cyclic_uniform_knot_vector(
-    start: f64,
-    end: f64,
-    degree: usize,
-    num_basis: usize,
-) -> Array1<f64> {
-    let period = end - start;
-    let h = period / num_basis as f64;
-    let total_knots = num_basis + 2 * degree + 1;
-    Array1::from_iter((0..total_knots).map(|i| start + (i as f64 - degree as f64) * h))
-}
-
-fn create_cyclic_bspline_basis_dense(
-    data: ArrayView1<'_, f64>,
-    start: f64,
-    end: f64,
-    degree: usize,
-    num_basis: usize,
-) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
-    if end <= start {
-        return Err(BasisError::InvalidRange(start, end));
-    }
-    if num_basis <= degree {
-        crate::bail_invalid_basis!(
-            "cyclic B-spline basis requires more basis functions ({num_basis}) than degree ({degree})"
-        );
-    }
-    let period = end - start;
-    let wrapped = data.mapv(|x| wrap_to_period(x, start, period));
-    let knots = cyclic_uniform_knot_vector(start, end, degree, num_basis);
-    let (extended, _) = create_basis::<Dense>(
-        wrapped.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::value(),
-    )?;
-    let mut cyclic = Array2::<f64>::zeros((data.len(), num_basis));
-    for i in 0..extended.nrows() {
-        for j in 0..extended.ncols() {
-            let target = j % num_basis;
-            cyclic[[i, target]] += extended[[i, j]];
-        }
-    }
-    Ok((cyclic, knots))
 }
 
 fn bspline_raw_column_count(
@@ -26179,13 +26084,59 @@ fn create_ispline_dense(
         left_offsets[j] = left_running;
     }
 
+    // First-order linear extension outside the knot domain. The plain B-spline
+    // basis (`BasisEvalKind::Basis`) already extends linearly past the boundary
+    // knots via `apply_linear_extension_from_first_derivative`; the I-spline must
+    // do the same or its cumulative time effect SATURATES flat beyond `right`,
+    // biasing the upper tail of `log Λ(t)` (it stops growing while the true
+    // log-cumulative-hazard keeps rising as log t). The I-spline derivative is
+    // the reverse-cumulative sum of the degree-`bs_degree` B-spline first
+    // derivative (the same identity the survival time-basis builder uses to
+    // assemble `x_derivative_time`), so we evaluate that derivative at each
+    // boundary knot and extend every column as
+    // `I_{j-1}(x) = I_{j-1}(boundary) + (x − boundary)·I_{j-1}'(boundary)`.
+    let boundary_ispline_derivative = |boundary: f64| -> Result<Vec<f64>, BasisError> {
+        let mut bspline_deriv = vec![0.0_f64; num_bspline_basis];
+        let mut lower_basis = vec![0.0_f64; knot_vector.len().saturating_sub(bs_degree)];
+        let mut lower_scratch = internal::BsplineScratch::new(bs_degree.saturating_sub(1));
+        evaluate_bspline_derivative_scalar_into(
+            boundary,
+            knot_vector,
+            bs_degree,
+            &mut bspline_deriv,
+            &mut lower_basis,
+            &mut lower_scratch,
+        )?;
+        // I_{j-1}'(x) = Σ_{m ≥ j} (B_m^{bs_degree})'(x): reverse-cumulative sum,
+        // matching the I-spline value relation `I_{j-1} = Σ_{m ≥ j} B_m − offset`.
+        let mut ispline_deriv = vec![0.0_f64; num_ispline_basis];
+        let mut running = 0.0_f64;
+        for j in (1..num_bspline_basis).rev() {
+            running += bspline_deriv[j];
+            ispline_deriv[j - 1] = running;
+        }
+        Ok(ispline_deriv)
+    };
+    let right_deriv = boundary_ispline_derivative(right)?;
+    let left_deriv = boundary_ispline_derivative(left)?;
+
     for (row_i, &x) in data.iter().enumerate() {
         if x < left {
+            // Below the left boundary knot every interior I-spline value is 0;
+            // extend linearly with the boundary derivative so the cumulative
+            // effect does not clip flat to 0 (monotonicity is preserved because
+            // the I-spline derivative is non-negative).
+            let dx = x - left;
+            for j in 1..num_bspline_basis {
+                let value = dx * left_deriv[j - 1];
+                out[[row_i, j - 1]] = if value.abs() <= 1e-15 { 0.0 } else { value };
+            }
             continue;
         }
         if x >= right {
+            let dx = x - right;
             for j in 1..num_bspline_basis {
-                let value = 1.0 - left_offsets[j];
+                let value = (1.0 - left_offsets[j]) + dx * right_deriv[j - 1];
                 out[[row_i, j - 1]] = if value.abs() <= 1e-15 { 0.0 } else { value };
             }
             continue;

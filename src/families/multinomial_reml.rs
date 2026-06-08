@@ -821,6 +821,36 @@ impl CustomFamily for MultinomialFamily {
         true
     }
 
+    fn levenberg_on_ill_conditioning(&self) -> bool {
+        // Engage the self-vanishing Levenberg–Marquardt damping on a FULL-RANK
+        // but ILL-CONDITIONED penalized joint Hessian, not only on a
+        // rank-deficient one.
+        //
+        // The penalized multinomial joint information is `H = Jᵀ W(β) J + S_λ`
+        // with the softmax Fisher weight `W = diag(p) − p pᵀ`, which collapses
+        // toward zero as fitted probabilities saturate near the simplex boundary
+        // (the near-separating regime of small, well-fit categorical data — e.g.
+        // the penguins `species ~ s(bill) + s(flipper) + body_mass` fit). There
+        // `H` stays full rank (the always-on Jeffreys/Firth term supplies the
+        // O(1) curvature on any genuinely separating null direction) but becomes
+        // ILL-CONDITIONED: range-space curvature directions sit just above the
+        // rank cutoff. Undamped, the range-restricted joint-Newton step takes an
+        // enormous `component/λ` proposal on those near-singular modes, the trust
+        // region clips it every cycle, and the stationarity residual along that
+        // mode never settles — the inner solve oscillates and never certifies a
+        // KKT point, so the outer REML startup seeds are all rejected (#715
+        // real-data arm: "canonical-gauge null direction rejects all REML
+        // seeds"; the macOS verdict's `phantom_multiplier_with_well_conditioned_H`
+        // is the same near-singular-but-full-rank certificate failure).
+        //
+        // Because `μ ∝ ‖∇L − Sβ‖∞ → 0` at the fixed point, the damping only
+        // shapes the trajectory (oscillation → bounded descent); the converged β,
+        // the selected λ, and the KKT certificate are unchanged, so the
+        // truth-recovery / match-or-beat bars are evaluated against the same
+        // optimum and are never weakened.
+        true
+    }
+
     fn inner_coefficient_hessian_hvp_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         self.specs_match_workspace_shape(specs)
     }

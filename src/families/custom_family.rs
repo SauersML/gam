@@ -11758,7 +11758,10 @@ fn strict_exact_pseudo_logdet(
     let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
     // Bauer-Fike: |δσ| ≤ p·‖δH‖_∞; n-term fma roundoff gives ‖δH‖_∞ ≤ ε·n·‖H‖,
     // so σ_noise ≤ ε·n·p·‖H‖₂. Tenfold slack absorbs sign cancellations,
-    // and a 100·ε floor handles the ‖H‖→0 limit.
+    // and a 100·ε floor handles the ‖H‖→0 limit. This `neg_tol` is the
+    // INDEFINITENESS-rejection band only: an eigenvalue below `−neg_tol` is a
+    // genuine negative curvature (non-stationary β / mis-signed block) and is
+    // rejected, not masked (gam#748).
     let eps = f64::EPSILON;
     let eps_np = eps * (accumulation_depth as f64) * (p as f64);
     // `neg_tol` is the INDEFINITENESS-rejection band only: an eigenvalue below
