@@ -10,6 +10,7 @@ pub mod model;
 pub mod model_payload_builders;
 pub mod polya_gamma;
 pub mod polya_gamma_core;
+pub mod posterior_bands;
 pub mod predict;
 pub mod probability;
 pub mod psis;
