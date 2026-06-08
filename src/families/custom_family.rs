@@ -25938,6 +25938,21 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     }
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
     let outer_converged = !nonconvergence_escalation;
+    {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/gam_diag.log")
+        {
+            writeln!(
+                f,
+                "[DIAG-FINAL] outer_converged={outer_converged} nonconv_escalation={nonconvergence_escalation} outer_iters={outer_iters} |g|={outer_grad_norm:?} rho_star={:?}",
+                rho_star.as_slice()
+            )
+            .ok();
+        }
+    }
     assemble_custom_family_fit_result(
         inner,
         BlockwiseFitAssembly {
