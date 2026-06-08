@@ -4830,9 +4830,10 @@ pub(crate) fn positive_eigenvalue_threshold(eigenvalues: &[f64]) -> f64 {
         .iter()
         .copied()
         .fold(0.0_f64, |a, b| a.max(b.abs()));
-    // Safety factor of 100 above the theoretical noise floor p × ε_mach × ‖S‖.
-    let safety = 100.0;
-    safety * (p as f64) * f64::EPSILON * max_ev
+    // Safety factor above the theoretical noise floor p × ε_mach × ‖S‖, so a
+    // genuine small positive mode is never misclassified as numerical zero.
+    const SAFETY_FACTOR: f64 = 100.0;
+    SAFETY_FACTOR * (p as f64) * f64::EPSILON * max_ev
 }
 
 /// Exact pseudo-logdet on the positive eigenspace: L = Σ_{σ_i > threshold} log σ_i.
@@ -8680,6 +8681,18 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_K_THRESHOLD: usize = 32;
 /// contractions over the upper-triangular coordinate pairs.
 pub(crate) const CALLBACK_OUTER_HESSIAN_ROW_PAIR_WORK_THRESHOLD: usize = 25_000_000;
 
+/// Coefficient-dimension threshold above which a stochastic (Hutch++) trace
+/// kernel is preferred over the exact dense trace for the logdet-H⁻¹ and ψ-Gram
+/// paths. Below this the exact dense O(p³) work is cheap enough that the
+/// estimator's variance is not worth trading for; above it the stochastic
+/// estimator's O(p²·m) cost wins.
+const STOCHASTIC_TRACE_DIM_THRESHOLD: usize = 500;
+
+/// Elapsed-time (ms) above which a sparse-Cholesky trace path emits a timing
+/// diagnostic. Purely observational — surfaces slow per-eval trace solves to the
+/// bench runner without affecting the fit.
+const REML_TRACE_SLOW_LOG_MS: f64 = 100.0;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OuterHessianRoutePlan {
     pub(crate) use_operator: bool,
@@ -9317,7 +9330,7 @@ fn can_use_stochastic_logdet_hinv_kernel(
     total_p: usize,
     incl_logdet_h: bool,
 ) -> bool {
-    total_p > 500
+    total_p > STOCHASTIC_TRACE_DIM_THRESHOLD
         && hop.prefers_stochastic_trace_estimation()
         && hop.logdet_traces_match_hinv_kernel()
         && incl_logdet_h
@@ -12505,7 +12518,9 @@ pub fn compute_hybrid_efs_update(
             drift.uses_operator_fast_path()
         });
         let use_stochastic_psi_gram =
-            any_psi_operator && total_p > 500 && hop.prefers_stochastic_trace_estimation();
+            any_psi_operator
+                && total_p > STOCHASTIC_TRACE_DIM_THRESHOLD
+                && hop.prefers_stochastic_trace_estimation();
 
         // Step 1: Build the trace Gram matrix
         //   G_{de} = tr(H⁻¹ B_d H⁻¹ B_e).
@@ -12790,11 +12805,19 @@ fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>)
     let mut v = ndarray::Array2::<f64>::eye(n);
 
     // Jacobi iteration: sweep through all off-diagonal pairs, zeroing them.
-    let max_sweeps = 100;
-    let tol = 1e-15;
+    // The off-diagonal Frobenius norm converges quadratically, so a near-machine
+    // `tol` is reached in a handful of sweeps for the small matrices this serves;
+    // `MAX_SWEEPS` is a generous safety cap that the convergence test hits first.
+    const MAX_SWEEPS: usize = 100;
+    const TOL: f64 = 1e-15;
+    // Skip a pair whose off-diagonal magnitude is already two orders below `TOL`
+    // (rotating it would only add round-off), and skip a rotation whose `τ`
+    // magnitude is so large the pair is numerically diagonal already.
+    const PAIR_SKIP_TOL: f64 = TOL * 0.01;
+    const TAU_DIAGONAL_THRESHOLD: f64 = 1e15;
 
     let mut sweep = 0;
-    while sweep < max_sweeps {
+    while sweep < MAX_SWEEPS {
         // Check convergence: sum of squares of off-diagonal elements.
         let mut off_diag_sq = 0.0;
         for i in 0..n {
@@ -12802,14 +12825,14 @@ fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>)
                 off_diag_sq += work[[i, j]] * work[[i, j]];
             }
         }
-        if off_diag_sq < tol * tol {
+        if off_diag_sq < TOL * TOL {
             break;
         }
 
         for p in 0..n {
             for q in (p + 1)..n {
                 let apq = work[[p, q]];
-                if apq.abs() < tol * 0.01 {
+                if apq.abs() < PAIR_SKIP_TOL {
                     continue;
                 }
 
@@ -12818,7 +12841,7 @@ fn symmetric_eigen(a: &ndarray::Array2<f64>) -> (Vec<f64>, ndarray::Array2<f64>)
                 let tau = (aqq - app) / (2.0 * apq);
 
                 // Stable computation of t = sign(τ) / (|τ| + sqrt(1 + τ²))
-                let t = if tau.abs() > 1e15 {
+                let t = if tau.abs() > TAU_DIAGONAL_THRESHOLD {
                     // Nearly diagonal: skip.
                     continue;
                 } else {
@@ -14479,7 +14502,7 @@ impl SparseCholeskyOperator {
         }
 
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-        if elapsed_ms > 100.0 {
+        if elapsed_ms > REML_TRACE_SLOW_LOG_MS {
             log::info!(
                 "[REML-trace] block_local_exact | n_dim={} | block={} | {:.1}ms",
                 self.n_dim,
@@ -14567,7 +14590,7 @@ impl SparseCholeskyOperator {
             });
         let result = trace_matrix_product(&solved, &solved);
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-        if elapsed_ms > 100.0 {
+        if elapsed_ms > REML_TRACE_SLOW_LOG_MS {
             log::info!(
                 "[REML-trace] block_local_cross_exact | n_dim={} | block={} | {:.1}ms",
                 self.n_dim,
@@ -14706,7 +14729,7 @@ impl SparseCholeskyOperator {
         }
 
         let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-        if elapsed_ms > 100.0 {
+        if elapsed_ms > REML_TRACE_SLOW_LOG_MS {
             log::info!(
                 "[REML-trace] matrix_block_op_cross_exact | n_dim={} | block={} | {:.1}ms",
                 self.n_dim,
