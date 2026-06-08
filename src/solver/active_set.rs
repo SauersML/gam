@@ -554,25 +554,27 @@ pub(crate) fn project_point_strictly_into_feasible_cone(
     if constraints.a.ncols() != p || m == 0 || constraints.b.len() != m {
         return None;
     }
-    // Per-row interior margin in scaled (geometric) slack units. A genuine
-    // one-sided inequality is shifted the full `δ`, so that the scaled slack
-    // `(a_iᵀβ − b_i)/‖a_i‖ ≥ δ` on the returned seed. But a row that is one half
-    // of an *anti-parallel pair* — the canonical encoding of an equality
-    // `rᵀβ = t` as `{rᵀβ ≥ t, −rᵀβ ≥ −t}` emitted by a clamped / anchored
-    // boundary condition — must NOT be shifted into mutual infeasibility with
-    // its partner. For an anti-parallel pair the feasible slab has scaled width
-    // `w`; shifting each side inward by `s` needs `s_i + s_j ≤ w`, so each side
-    // is capped at `w/3`. An exact equality pair has `w = 0`, so neither side
-    // moves and the seed is projected exactly onto the equality hyperplane
-    // (where that row is *meant* to be tight), while the genuine one-sided shape
-    // rows still receive the full interior margin. Without this cap, combining
-    // `shape=concave`/`convex` with `bc=clamped`/`anchored` shifts the equality
-    // pair to the empty set `t+δ ≤ rᵀβ ≤ t−δ`, the projection fails, and the
-    // caller falls back to the cone vertex — silently reintroducing the #873
-    // boundary seed for the *combined* constraint case.
     let norms: Vec<f64> = (0..m)
         .map(|i| constraints.a.row(i).dot(&constraints.a.row(i)).sqrt())
         .collect();
+
+    // Classify rows. An *anti-parallel pair* with ~zero scaled feasible-slab
+    // width is an EQUALITY `rᵀβ = t` encoded as `{rᵀβ ≥ t, −rᵀβ ≥ −t}` (the
+    // canonical encoding emitted by a clamped / anchored boundary condition).
+    // Representing an equality as two opposing inequalities makes the inequality
+    // active-set QP CYCLE: it adds one side, the equality-split multiplier turns
+    // the other negative, it removes it, and the working set repeats until cycle
+    // detection aborts the solve — so the projection would fail and the caller
+    // would fall back to the cone vertex, silently reintroducing the #873 seed
+    // for the *combined* case (`shape=concave`/`convex` with `bc=clamped`). So we
+    // lift such pairs out as genuine equalities, eliminate them through the null
+    // space, and run the strictly-interior QP only on the one-sided rows. A pure
+    // shape cone has no anti-parallel rows, so `equality_rows` is empty and this
+    // reduces to the original single-QP path verbatim.
+    const ANTIPARALLEL_COS_TOL: f64 = -1.0 + 1e-9;
+    const EQUALITY_WIDTH_TOL: f64 = 1e-9;
+    let mut is_equality_member = vec![false; m];
+    let mut equality_rows: Vec<usize> = Vec::new();
     let mut margin = vec![ACTIVE_SET_INTERIOR_SEED_MARGIN; m];
     for i in 0..m {
         if norms[i] == 0.0 {
@@ -584,35 +586,130 @@ pub(crate) fn project_point_strictly_into_feasible_cone(
                 continue;
             }
             let cos = constraints.a.row(i).dot(&constraints.a.row(j)) / (norms[i] * norms[j]);
-            if cos <= -1.0 + 1e-9 {
-                // Anti-parallel rows â and −â: row i is `âᵀβ ≥ b_i/‖a_i‖` and
-                // row j is `âᵀβ ≤ −b_j/‖a_j‖`. Scaled feasible-slab width:
-                let width = -constraints.b[j] / norms[j] - constraints.b[i] / norms[i];
+            if cos > ANTIPARALLEL_COS_TOL {
+                continue;
+            }
+            // Anti-parallel rows â and −â: row i is `âᵀβ ≥ b_i/‖a_i‖`, row j is
+            // `âᵀβ ≤ −b_j/‖a_j‖`. Scaled feasible-slab width:
+            let width = -constraints.b[j] / norms[j] - constraints.b[i] / norms[i];
+            if width.abs() <= EQUALITY_WIDTH_TOL {
+                // Zero width ⇒ equality. Record it once (row i's orientation) and
+                // exclude both rows from the one-sided interior shift.
+                if !is_equality_member[i] && !is_equality_member[j] {
+                    equality_rows.push(i);
+                }
+                is_equality_member[i] = true;
+                is_equality_member[j] = true;
+            } else {
+                // Genuine (wide) two-sided bound: cap each side's inward shift at
+                // `w/3` so the shifted slab `s_i + s_j ≤ w` stays non-empty.
                 let cap = (width / 3.0).max(0.0);
                 margin[i] = margin[i].min(cap);
                 margin[j] = margin[j].min(cap);
             }
         }
     }
-    let mut b_interior = constraints.b.clone();
-    for i in 0..m {
-        b_interior[i] += margin[i] * norms[i];
+
+    // One-sided rows (everything not lifted into an equality), shifted strictly
+    // inward by `margin·‖a‖`.
+    let ineq_rows: Vec<usize> = (0..m).filter(|&i| !is_equality_member[i]).collect();
+    let mut a_ineq = Array2::<f64>::zeros((ineq_rows.len(), p));
+    let mut b_ineq = Array1::<f64>::zeros(ineq_rows.len());
+    for (r, &i) in ineq_rows.iter().enumerate() {
+        a_ineq.row_mut(r).assign(&constraints.a.row(i));
+        b_ineq[r] = constraints.b[i] + margin[i] * norms[i];
     }
-    let interior = LinearInequalityConstraints::from_paired(constraints.a.clone(), b_interior);
-    let identity = Array2::<f64>::eye(p);
-    let (beta, _active) =
-        solve_quadratic_with_linear_constraints(&identity, point, point, &interior, None).ok()?;
+
+    let beta = if equality_rows.is_empty() {
+        // No equalities: the original single strictly-interior QP
+        // (`min ½‖β − point‖²` s.t. the margin-shifted one-sided rows).
+        let interior = LinearInequalityConstraints::from_paired(a_ineq, b_ineq);
+        let identity = Array2::<f64>::eye(p);
+        solve_quadratic_with_linear_constraints(&identity, point, point, &interior, None)
+            .ok()?
+            .0
+    } else {
+        // Eliminate `E β = e` through its null space. From the thin SVD
+        // `E = U Σ Vᵀ` (rank `r`): the row space is `span(v_0..v_{r-1})`, the
+        // minimum-norm particular solution is `β_p = Σ_{i<r} (uᵢᵀe / σᵢ) vᵢ`, and
+        // an orthonormal null basis `Z` (p × (p−r)) is the complement of the row
+        // space (built by Gram-Schmidt of the standard axes — `p` is a single
+        // smooth-term width, so this is cheap and exact). Writing `β = β_p + Z u`
+        // and using `ZᵀZ = I`, the projection becomes the reduced strictly-
+        // interior QP `min ½‖u − Zᵀ(point − β_p)‖²` s.t. `(A_ineq Z) u ≥ b_ineq −
+        // A_ineq β_p`, whose rows carry no anti-parallel pair, so it can't cycle.
+        let k = equality_rows.len();
+        let mut e_mat = Array2::<f64>::zeros((k, p));
+        let mut e_rhs = Array1::<f64>::zeros(k);
+        for (r, &i) in equality_rows.iter().enumerate() {
+            e_mat.row_mut(r).assign(&constraints.a.row(i));
+            e_rhs[r] = constraints.b[i];
+        }
+        let (u_opt, sing, vt_opt) = e_mat.svd(true, true).ok()?;
+        let (u_mat, vt) = (u_opt?, vt_opt?);
+        let smax = sing.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+        let rank_tol = smax.max(1.0) * (k.max(p) as f64) * f64::EPSILON * 100.0;
+        let rank = sing.iter().filter(|&&s| s > rank_tol).count();
+        if rank == 0 || rank >= p {
+            return None;
+        }
+        let mut beta_p = Array1::<f64>::zeros(p);
+        for idx in 0..rank {
+            let coeff = u_mat.column(idx).dot(&e_rhs) / sing[idx];
+            beta_p.scaled_add(coeff, &vt.row(idx));
+        }
+        // Orthonormal null basis: Gram-Schmidt the standard axes against the row
+        // space `vt[0..rank]` and the null vectors collected so far.
+        let mut basis: Vec<Array1<f64>> = (0..rank).map(|i| vt.row(i).to_owned()).collect();
+        let mut z = Array2::<f64>::zeros((p, p - rank));
+        let mut collected = 0usize;
+        for axis in 0..p {
+            if collected == p - rank {
+                break;
+            }
+            let mut v = Array1::<f64>::zeros(p);
+            v[axis] = 1.0;
+            for q in basis.iter() {
+                let c = q.dot(&v);
+                v.scaled_add(-c, q);
+            }
+            let nrm = v.dot(&v).sqrt();
+            if nrm > 1e-8 {
+                v /= nrm;
+                z.column_mut(collected).assign(&v);
+                basis.push(v);
+                collected += 1;
+            }
+        }
+        if collected != p - rank {
+            return None;
+        }
+        let a_red = a_ineq.dot(&z);
+        let b_red = &b_ineq - &a_ineq.dot(&beta_p);
+        let u0 = z.t().dot(&(point - &beta_p));
+        let reduced = LinearInequalityConstraints::from_paired(a_red, b_red);
+        let identity = Array2::<f64>::eye(z.ncols());
+        let (u_sol, _active) =
+            solve_quadratic_with_linear_constraints(&identity, &u0, &u0, &reduced, None).ok()?;
+        &beta_p + &z.dot(&u_sol)
+    };
+
     if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
         return None;
     }
     // Certify against the ORIGINAL constraints: every genuine one-sided row must
-    // clear (most of) its requested margin so the QP step solver sees no
-    // spurious active rows, while equality-pair rows (margin ≈ 0) need only be
-    // feasible — they are legitimately tight.
+    // clear (most of) its requested margin so the QP step solver sees no spurious
+    // active rows; equality-pair rows need only be feasible — they are
+    // legitimately tight.
     const SEED_FEASIBILITY_TOL: f64 = 1e-9;
     for i in 0..m {
         let s = scaled_constraint_slack(&beta, constraints, i);
-        if s < 0.5 * margin[i] - SEED_FEASIBILITY_TOL {
+        let lower = if is_equality_member[i] {
+            -SEED_FEASIBILITY_TOL
+        } else {
+            0.5 * margin[i] - SEED_FEASIBILITY_TOL
+        };
+        if s < lower {
             return None;
         }
     }
