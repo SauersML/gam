@@ -1601,6 +1601,28 @@ pub fn audit_identifiability_channel_aware(
     let joint_rank = compiled.joint_rank;
     let joint_rank_deficient = joint_rank < p_total;
 
+    // Penalty-aware joint rank `rank([J_joint; S_blockdiag])` = co-dimension of
+    // `ker(J) ∩ ker(S)`. The structural `joint_rank` above is penalty-BLIND, so
+    // a design-null-but-penalty-covered direction (e.g. a smooth's penalized
+    // null space replicated across the multinomial softmax channels, or a
+    // marginal-slope curvature direction the marginal penalty covers) is counted
+    // as a structural rank shortfall. It is NOT a genuine non-identifiability:
+    // the penalized normal equations `JᵀWJ + S` are non-singular there, so the
+    // MAP is unique and the REML seed is legitimately fittable. The flat audit
+    // already augments with the penalty rows for exactly this reason
+    // (`x_joint_rank_input`); the multi-channel path must do the same or it
+    // refuses identifiable seeds (#715 real-data arm: "canonical-gauge null
+    // direction rejects all REML seeds"). When the penalty closes the structural
+    // gap (`penalty_aware_joint_rank == p_total`) the only residual deficiency is
+    // penalty-covered, hence identified — never a fatal refusal. The downstream
+    // `check_map_uniqueness` (run in `canonicalize_for_identifiability_inner`)
+    // remains the precise gate for the genuinely fatal `ker(JᵀWJ) ∩ ker(S) ≠ {0}`
+    // case; this only stops the structural-rank gate from shadowing it.
+    let penalty_aware_joint_rank =
+        channel_aware_penalty_aware_joint_rank(operators, &col_offsets, specs)?;
+    let penalty_covers_rank_deficiency =
+        joint_rank_deficient && penalty_aware_joint_rank >= p_total;
+
     // Same gauge-priority gating as the flat audit path (see the
     // corresponding comment in `audit_identifiability`).
     let block_priority_ca: std::collections::HashMap<&str, u8> = specs
@@ -1720,9 +1742,18 @@ pub fn audit_identifiability_channel_aware(
     // cross-block alias is still caught by `hard_alias_pair`.
     let intra_block_only_ca = aliased_pairs.is_empty();
 
-    let fatal =
-        (joint_rank_deficient && !gauge_resolves_rank_deficiency_ca && !intra_block_only_ca)
-            || hard_alias_pair.is_some();
+    // Penalty-aware fatal verdict (#715): a structural rank deficiency — whether
+    // surfaced as an unresolved cross-block alias or as a hard near-perfect alias
+    // pair — is only a genuine non-identifiability when the deficient direction
+    // is ALSO penalty-null (`ker(J) ∩ ker(S) ≠ {0}`). When the block penalties
+    // close the gap (`penalty_covers_rank_deficiency`), the penalized normal
+    // equations are non-singular along every deficient direction, the MAP is
+    // unique, and the REML seed is legitimately fittable; refusing it
+    // over-rejects an identifiable model. This makes the multi-channel gate match
+    // the flat audit's `[J; S]`-augmented rank verdict.
+    let fatal = !penalty_covers_rank_deficiency
+        && ((joint_rank_deficient && !gauge_resolves_rank_deficiency_ca && !intra_block_only_ca)
+            || hard_alias_pair.is_some());
 
     let fatal_detail = if fatal {
         let mut parts: Vec<String> = Vec::new();
@@ -1824,6 +1855,19 @@ pub fn audit_identifiability_channel_aware(
             ));
         }
         format!(" — FATAL: {}", parts.join("; "))
+    } else if penalty_covers_rank_deficiency {
+        // The structural joint rank is short of full, but the block penalties
+        // close the gap: `rank([J; S]) == p_total`, so the only deficient
+        // directions are penalty-covered (in `ker(J)` but not `ker(S)`). The
+        // penalized normal equations are non-singular there — the MAP is unique
+        // and the seed is fittable. Not a refusal (#715 real-data arm).
+        format!(
+            " — penalty-covered rank deficiency (channel-aware): structural joint rank {} \
+             < joint columns {} but penalty-aware rank [J; S] = {} = full; deficient \
+             directions are penalty-covered (ker(J)∖ker(S)) — identified, MAP unique; \
+             canonical-gauge pipeline will proceed",
+            joint_rank, p_total, penalty_aware_joint_rank,
+        )
     } else if gauge_resolves_rank_deficiency_ca {
         format!(
             " — gauge-attributed drops (channel-aware): {} column(s) attributed to \
@@ -1869,6 +1913,98 @@ pub fn audit_identifiability_channel_aware(
         fatal,
         summary,
     })
+}
+
+/// Penalty-aware joint column rank of the channel-weighted joint design,
+/// computed exactly the way the flat audit computes it (see
+/// [`block_structural_penalty_dense`] / [`block_penalty_aware_rank`] and the
+/// `x_joint_rank_input` augmentation in `audit_identifiability_impl`): the
+/// numerical rank of `[J_joint; S_blockdiag]`, whose null space is precisely
+/// `ker(J_joint) ∩ ker(S)`.
+///
+/// The structural rank from `compile_with_dual_metric` answers
+/// `rank(J_joint)` alone — penalty-BLIND. A direction that is design-null
+/// (collinear in the row Jacobian) but COVERED by a block's smoothness
+/// penalty is still fully estimated by the penalized normal equations
+/// `JᵀWJ + S`; counting it as a rank deficiency over-rejects an identifiable
+/// model. Multi-channel families (multinomial softmax, survival marginal-slope)
+/// route exclusively through the channel-aware audit, so without this they
+/// never benefit from the `[J; S]` augmentation the flat path already applies.
+///
+/// `S_blockdiag` is the unit-weight STRUCTURAL sum of each block's penalty
+/// matrices (the same ρ-invariant `block_structural_penalty_dense` the flat
+/// audit uses): only `∩_m ker(S_m)` matters for the rank verdict, independent
+/// of the fitted λ values. Blocks with no penalty contribute no rows, so for an
+/// unpenalized multi-channel model this reduces exactly to `rank(J_joint)`.
+fn channel_aware_penalty_aware_joint_rank(
+    operators: &[std::sync::Arc<
+        dyn crate::families::identifiability_compiler::RowJacobianOperator,
+    >],
+    col_offsets: &[usize],
+    specs: &[ParameterBlockSpec],
+) -> Result<usize, EstimationError> {
+    if operators.is_empty() {
+        return Ok(0);
+    }
+    let k = operators[0].k();
+    let n = operators[0].nrows();
+    let nk = n.checked_mul(k).ok_or_else(|| {
+        EstimationError::LayoutError(format!(
+            "channel-aware penalty-aware rank: n*k overflow (n={n}, k={k})"
+        ))
+    })?;
+    let p_total = *col_offsets.last().unwrap_or(&0);
+    if p_total == 0 || nk == 0 {
+        return Ok(0);
+    }
+
+    // Per-block structural penalties, parallel to `specs` (None ⇒ no penalty
+    // rows for that block). Reuses the exact unit-weight sum the flat audit
+    // uses so the two paths agree on the ρ-invariant penalty geometry.
+    let block_penalties: Vec<Option<Array2<f64>>> =
+        specs.iter().map(block_structural_penalty_dense).collect();
+    let n_penalty_rows: usize = block_penalties
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            s.as_ref()
+                .map_or(0, |_| col_offsets[idx + 1] - col_offsets[idx])
+        })
+        .sum();
+
+    // Augmented matrix `[J_joint; S_blockdiag]` of shape
+    // `(nk + n_penalty_rows, p_total)`. The top `nk` rows are the
+    // channel-flattened joint row Jacobian; the trailing rows embed each
+    // block's structural penalty on the block's own column range.
+    let mut aug = Array2::<f64>::zeros((nk + n_penalty_rows, p_total));
+    for (block_idx, op) in operators.iter().enumerate() {
+        let base = col_offsets[block_idx];
+        let p_b = op.ncols();
+        let mut col = Array1::<f64>::zeros(nk);
+        for c in 0..p_b {
+            op.channel_flattened_column(c, col.as_slice_mut().expect("contiguous column buffer"));
+            aug.slice_mut(ndarray::s![..nk, base + c]).assign(&col);
+        }
+    }
+    let mut row = nk;
+    for (idx, s_opt) in block_penalties.iter().enumerate() {
+        if let Some(s) = s_opt {
+            let start = col_offsets[idx];
+            let end = col_offsets[idx + 1];
+            let h = end - start;
+            aug.slice_mut(ndarray::s![row..row + h, start..end])
+                .assign(s);
+            row += h;
+        }
+    }
+
+    rrqr_with_permutation(&aug, default_rrqr_rank_alpha())
+        .map(|r| r.rank)
+        .map_err(|e| {
+            EstimationError::LayoutError(format!(
+                "channel-aware penalty-aware joint RRQR failed: {e:?}"
+            ))
+        })
 }
 
 /// Pairwise overlap scan on the channel-weighted joint design
