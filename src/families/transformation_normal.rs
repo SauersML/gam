@@ -35,11 +35,11 @@ use crate::families::custom_family::{
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     JointHessianSourcePreference, MaterializablePsiDerivativeOperator, ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, build_block_spatial_psi_derivatives,
-    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
-    fit_custom_family_fixed_log_lambdas,
+    ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::solve_penalizedweighted_projection;
+use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::families::wiggle::initializewiggle_knots_from_seed;
 use crate::inference::model::{TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration};
 use crate::matrix::{
@@ -15209,7 +15209,7 @@ pub fn fit_transformation_normal(
             cov_design
                 .penalties
                 .iter()
-                .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), cov_design.design.ncols()))
+                .map(|bp| bp.to_penalty_matrix(cov_design.design.ncols()))
                 .collect(),
             &effective_config,
             warm_start,
@@ -15298,7 +15298,7 @@ pub fn fit_transformation_normal(
         probe_design
             .penalties
             .iter()
-            .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), probe_design.design.ncols()))
+            .map(|bp| bp.to_penalty_matrix(probe_design.design.ncols()))
             .collect(),
         &effective_config,
         warm_start,
@@ -15387,7 +15387,7 @@ pub fn fit_transformation_normal(
                 cov_design
                     .penalties
                     .iter()
-                    .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), cov_design.design.ncols()))
+                    .map(|bp| bp.to_penalty_matrix(cov_design.design.ncols()))
                     .collect(),
                 &cfg,
                 ws.as_ref(),

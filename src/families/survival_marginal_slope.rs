@@ -3,12 +3,12 @@ use crate::custom_family::{
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
-    build_block_spatial_psi_derivatives, custom_family_outer_derivatives,
-    evaluate_custom_family_joint_hyper_efs_shared, evaluate_custom_family_joint_hyper_shared,
-    fit_custom_family, fit_custom_family_fixed_log_lambda_warm_start,
-    joint_hyper_options_for_outer_tolerance,
+    custom_family_outer_derivatives, evaluate_custom_family_joint_hyper_efs_shared,
+    evaluate_custom_family_joint_hyper_shared, fit_custom_family,
+    fit_custom_family_fixed_log_lambda_warm_start, joint_hyper_options_for_outer_tolerance,
 };
 use crate::estimate::UnifiedFitResult;
+use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bms::{
     CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,

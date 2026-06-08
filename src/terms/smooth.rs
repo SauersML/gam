@@ -1592,6 +1592,19 @@ impl BlockwisePenalty {
         g
     }
 
+    /// Convert into a blockwise [`crate::custom_family::PenaltyMatrix`] without
+    /// expanding to full dimensions.
+    pub(crate) fn to_penalty_matrix(
+        &self,
+        total_dim: usize,
+    ) -> crate::custom_family::PenaltyMatrix {
+        crate::custom_family::PenaltyMatrix::Blockwise {
+            local: self.local.clone(),
+            col_range: self.col_range.clone(),
+            total_dim,
+        }
+    }
+
     /// The block size of this penalty.
     #[inline]
     pub fn block_size(&self) -> usize {
@@ -1836,7 +1849,7 @@ impl TermCollectionDesign {
         let p = self.design.ncols();
         self.penalties
             .iter()
-            .map(|bp| crate::custom_family::PenaltyMatrix::from_blockwise(bp.clone(), p))
+            .map(|bp| bp.to_penalty_matrix(p))
             .collect()
     }
 
