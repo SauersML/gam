@@ -613,8 +613,12 @@ fn build_formula_design_for_multinomial(
 /// smoothing parameters `λ_a` (one per class block, shared-penalty
 /// architecture) are selected by the outer REML/LAML loop rather than pinned
 /// by the caller. `init_lambda` survives as a warm-start hint that seeds
-/// every block's `initial_log_lambdas`; the inner Newton solve still uses
-/// `max_iter` / `tol` via `BlockwiseFitOptions`.
+/// every block's `initial_log_lambdas`. `max_iter` / `tol` drive the OUTER
+/// REML/LAML smoothing-parameter search (`outer_max_iter` / `outer_tol`); the
+/// inner joint-Newton solve runs on the framework's principled production cycle
+/// budget at the default KKT tolerance so an ill-conditioned, LM-damped
+/// near-simplex-boundary solve can certify a stationary point instead of being
+/// declared non-converged after only `max_iter` cycles (#715).
 ///
 /// The categorical response column is recognised via the dataset schema
 /// (`ColumnKindTag::Categorical`); reference class = last level. Returns a
