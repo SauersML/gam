@@ -443,3 +443,82 @@ where
     }
     Ok(total_ll)
 }
+
+#[cfg(test)]
+mod early_exit_soundness_tests {
+    use super::*;
+
+    fn full_data_rows(n: usize) -> Vec<WeightedOuterRow> {
+        (0..n)
+            .map(|index| WeightedOuterRow {
+                index,
+                weight: 1.0,
+                stratum: 0,
+            })
+            .collect()
+    }
+
+    /// On the full-data measure (weight 1, every row) the running `-total_ll`
+    /// is a genuine monotone lower bound on the full-data NLL, so the early
+    /// exit is a valid reject certificate: it rejects iff the full NLL exceeds
+    /// the threshold and otherwise returns the exact LL.
+    #[test]
+    fn full_data_early_exit_is_a_valid_reject_certificate() {
+        // Each row contributes log Φ = -1.0, i.e. NLL contribution 1.0; full
+        // NLL over 100 rows is exactly 100.
+        let rows = full_data_rows(100);
+        let row_ll = |_i: usize| -> Result<f64, String> { Ok(-1.0) };
+
+        // Threshold below the full NLL → must reject.
+        assert!(
+            bernoulli_margslope_line_search_ll_with_early_exit(&rows, 50.0, row_ll).is_err(),
+            "full-data NLL 100 > threshold 50 must reject"
+        );
+
+        // Threshold above the full NLL → must accept with the exact LL.
+        let ll = bernoulli_margslope_line_search_ll_with_early_exit(&rows, 150.0, row_ll)
+            .expect("full-data NLL 100 < threshold 150 must accept");
+        assert!((ll - (-100.0)).abs() < 1e-9, "accepted LL must be exact, got {ll}");
+    }
+
+    /// Regression for the biobank `IntegrationError`: a Horvitz-Thompson
+    /// subsample sum is an *unbiased estimator* of the full-data NLL, not a
+    /// lower bound on it, so feeding the kernel an HT-weighted subset against a
+    /// full-data threshold can falsely reject a trial whose true full-data NLL
+    /// is below the threshold. This is exactly why the BMS line search must
+    /// only ever pass the full-data row set — the auto line-search subsample
+    /// that used to violate this was removed.
+    #[test]
+    fn ht_subsample_against_full_data_threshold_can_falsely_reject() {
+        // True per-row NLL: rows 0..10 contribute 10 each, rows 10..100
+        // contribute 0. Full-data NLL = 100.
+        let row_ll = |i: usize| -> Result<f64, String> {
+            if i < 10 { Ok(-10.0) } else { Ok(0.0) }
+        };
+        let threshold = 500.0;
+
+        // Full-data decision: NLL 100 < 500 → accept (the correct decision).
+        let full_rows = full_data_rows(100);
+        let full = bernoulli_margslope_line_search_ll_with_early_exit(&full_rows, threshold, row_ll)
+            .expect("full-data NLL 100 < threshold 500 must accept");
+        assert!((full - (-100.0)).abs() < 1e-9);
+
+        // HT subsample that happens to draw the 10 high-NLL rows with
+        // inverse-inclusion weight 10: weighted sum = 10·10·10 = 1000 > 500.
+        // Fed against the full-data threshold the kernel rejects — a FALSE
+        // reject. The product invariant is that this row set is never built
+        // for a line-search probe; the assertion documents the hazard.
+        let ht_rows: Vec<WeightedOuterRow> = (0..10)
+            .map(|index| WeightedOuterRow {
+                index,
+                weight: 10.0,
+                stratum: 1,
+            })
+            .collect();
+        assert!(
+            bernoulli_margslope_line_search_ll_with_early_exit(&ht_rows, threshold, row_ll).is_err(),
+            "HT-weighted sum 1000 spuriously exceeds the full-data threshold 500 — \
+             demonstrates why an HT subsample must never certify a line-search reject"
+        );
+    }
+}
