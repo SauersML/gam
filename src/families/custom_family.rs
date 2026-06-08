@@ -14759,6 +14759,35 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_bundle,
                 ),
             };
+            // HEAD-β JEFFREYS CACHE (gam#729/#808). The full Jeffreys/Firth triple
+            // `(Φ, ∇Φ, H_Φ)` costs `p` family directional-derivative calls (the
+            // `for k in 0..p` loop in `joint_jeffreys_term`); for a K-block coupled
+            // family (Dirichlet/multinomial) that is the dominant per-cycle cost.
+            // The head-of-cycle KKT residual, the constrained-QP step, and the
+            // spectral/dense Newton step are ALL built at the SAME cycle-start β
+            // (`&states`, before any step is accepted), so they need the SAME
+            // triple. Compute it ONCE here and reuse, instead of three independent
+            // O(p)-directional-derivative evaluations per cycle. The post-step
+            // residual below is at the accepted β, so it correctly recomputes.
+            // `None` when the term is condition-gated/skippable (∇Φ=0, H_Φ=0).
+            let head_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
+                if jeffreys_skippable_this_cycle {
+                    None
+                } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                    match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)?
+                    {
+                        Some((_phi, grad_phi, hphi))
+                            if grad_phi.len() == grad_joint.len()
+                                && hphi.nrows() == total_p
+                                && hphi.ncols() == total_p =>
+                        {
+                            Some((grad_phi, hphi))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
             // Fold the Firth/Jeffreys score `∇Φ` into the head-of-cycle KKT
             // residual when the term is armed, for the same reason as the
             // post-step residual below: the inner objective is `−ℓ + ½βᵀSβ − Φ`,
@@ -14767,20 +14796,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // residual_tol`) can never fire on the near-separating span, even
             // when the iterate is the Firth optimum. No-op when the Jeffreys
             // term is unavailable or condition-gated to zero.
-            let head_kkt_gradient: Option<Array1<f64>> = if jeffreys_skippable_this_cycle {
-                // Pre-check certified well-conditioned ⇒ exact term is the zero
-                // contribution ⇒ ∇Φ = 0, so the head-KKT gradient is unchanged.
-                None
-            } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
-                    Some((_phi, grad_phi, _hphi)) if grad_phi.len() == grad_joint.len() => {
-                        Some(&grad_joint + &grad_phi)
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            let head_kkt_gradient: Option<Array1<f64>> = head_jeffreys_term
+                .as_ref()
+                .map(|(grad_phi, _hphi)| &grad_joint + grad_phi);
             let current_kkt_norm = exact_newton_joint_stationarity_inf_norm_from_gradient(
                 head_kkt_gradient.as_ref().unwrap_or(&grad_joint),
                 &states,
@@ -14850,26 +14868,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_bundle,
                     );
                     let mut rhs_step = &grad_joint - &penalty_beta_joint;
-                    if !jeffreys_skippable_this_cycle
-                        && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
+                    // Reuse the head-β Jeffreys triple (computed once this cycle).
+                    // Skipped when the cheap pre-check certifies well-conditioning:
+                    // ∇Φ = 0 and H_Φ = 0 there, so neither rhs_step nor lhs change.
+                    if let Some((grad_phi, hphi)) = head_jeffreys_term.as_ref()
+                        && grad_phi.len() == rhs_step.len()
                     {
-                        // Skipped when the cheap pre-check certifies well-
-                        // conditioning: ∇Φ = 0 and H_Φ = 0 there, so neither
-                        // rhs_step nor lhs change — byte-identical to the gated-off
-                        // dense path, without forming dense H/H_Φ.
-                        match custom_family_joint_jeffreys_term(
-                            family, &states, specs, &ranges, z_joint,
-                        )? {
-                            Some((_phi, grad_phi, hphi))
-                                if grad_phi.len() == rhs_step.len()
-                                    && hphi.nrows() == total_p
-                                    && hphi.ncols() == total_p =>
-                            {
-                                rhs_step += &grad_phi;
-                                lhs += &hphi;
-                            }
-                            _ => {}
-                        }
+                        rhs_step += grad_phi;
+                        lhs += hphi;
                     }
                     // Self-vanishing Levenberg–Marquardt damping for the
                     // CONSTRAINED active-set QP, mirroring the spectral-range
@@ -15002,25 +15008,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // PCG hot path, where forming a dense p×p H_Φ every cycle was the
                     // regression. Byte-identical to the gated-off dense path: `rhs`
                     // is left as `∇ℓ − S_λβ` and no H_Φ is folded into the matvec.
+                    // Reuse the head-β Jeffreys triple (computed once this cycle);
+                    // this Newton step is built at the same cycle-start β.
                     let inner_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
-                        if jeffreys_skippable_this_cycle {
-                            None
-                        } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                            match custom_family_joint_jeffreys_term(
-                                family, &states, specs, &ranges, z_joint,
-                            )? {
-                                Some((_phi, grad_phi, hphi))
-                                    if grad_phi.len() == rhs.len()
-                                        && hphi.nrows() == total_p
-                                        && hphi.ncols() == total_p =>
-                                {
-                                    rhs += &grad_phi;
-                                    Some((grad_phi, hphi))
-                                }
-                                _ => None,
+                        match head_jeffreys_term.as_ref() {
+                            Some((grad_phi, hphi)) if grad_phi.len() == rhs.len() => {
+                                rhs += grad_phi;
+                                Some((grad_phi.clone(), hphi.clone()))
                             }
-                        } else {
-                            None
+                            _ => None,
                         };
                     let inner_jeffreys_hphi: Option<Arc<Array2<f64>>> = inner_jeffreys_term
                         .as_ref()
