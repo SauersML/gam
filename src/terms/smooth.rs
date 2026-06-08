@@ -13805,7 +13805,11 @@ fn stratified_spatial_subsample(
         }
     }
 
-    let total_cells_target = (target_size / 5).max(1);
+    // Aim for roughly this many sampled points per stratification cell so each
+    // occupied cell can contribute a representative draw without collapsing the
+    // grid to one point per cell.
+    const TARGET_POINTS_PER_CELL: usize = 5;
+    let total_cells_target = (target_size / TARGET_POINTS_PER_CELL).max(1);
     let cells_per_axis = ((total_cells_target as f64).powf(1.0 / d as f64)).ceil() as usize;
     let cells_per_axis = cells_per_axis.max(1);
 
