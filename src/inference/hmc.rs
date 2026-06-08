@@ -3249,11 +3249,11 @@ mod tests {
             fn block_curvatures(&self) -> &Array1<f64> {
                 &self.lambdas
             }
-            fn excess(&self, _t: &Array1<f64>) -> f64 {
-                0.0
+            fn excess(&self, t: &Array1<f64>) -> f64 {
+                0.0 * t.sum()
             }
-            fn excess_rho_gradient(&self, _t: &Array1<f64>) -> Array1<f64> {
-                Array1::zeros(2)
+            fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+                Array1::from_elem(2, 0.0 * t.sum())
             }
         }
         let target = GaussianBlock {
@@ -3292,8 +3292,8 @@ mod tests {
             fn excess(&self, t: &Array1<f64>) -> f64 {
                 self.a * t[0].powi(4)
             }
-            fn excess_rho_gradient(&self, _t: &Array1<f64>) -> Array1<f64> {
-                Array1::zeros(1)
+            fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+                Array1::from_elem(1, 0.0 * t.sum())
             }
         }
         let target = Quartic {

@@ -837,7 +837,7 @@ mod cuda {
                 tile[local].diag_scale
                     * (f64::from(pivot).abs()).max(1.0)
                     * f64::EPSILON.sqrt()
-                    * RIDGE_BUMP_EPS_MARGIN,
+                    * super::RIDGE_BUMP_EPS_MARGIN,
             );
             return Some(());
         }
