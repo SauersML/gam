@@ -27882,9 +27882,9 @@ mod tests {
     fn binomial_location_scale_wiggle_outer_fixture() -> BinomialLocationScaleWiggleOuterFixture {
         let base = binomial_location_scale_base_fixture();
         let q_seed = Array1::linspace(-1.4, 1.4, base.n);
-        let knots = crate::families::gamlss::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
+        let knots = crate::families::wiggle::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
             .expect("knots");
-        let wiggle_block = crate::families::gamlss::buildwiggle_block_input_from_knots(
+        let wiggle_block = crate::families::wiggle::buildwiggle_block_input_from_knots(
             q_seed.view(),
             &knots,
             3,

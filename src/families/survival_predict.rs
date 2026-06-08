@@ -23,7 +23,7 @@ use crate::families::survival_construction::{
     require_structural_survival_time_basis, resolved_survival_time_basis_config_from_build,
     survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
-use crate::gamlss::buildwiggle_block_input_from_knots;
+use crate::families::wiggle::buildwiggle_block_input_from_knots;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
@@ -1906,7 +1906,7 @@ fn location_scale_eta_derivative_components(
         } else {
             eta_time_offset_exit.clone()
         };
-        let basis_d1 = crate::families::gamlss::monotone_wiggle_basis_with_derivative_order(
+        let basis_d1 = crate::families::wiggle::monotone_wiggle_basis_with_derivative_order(
             h_base.view(),
             knots,
             degree,

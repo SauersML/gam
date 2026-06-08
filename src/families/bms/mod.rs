@@ -11,7 +11,8 @@ use crate::custom_family::{
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::{DenseSpectralOperator, HessianOperator, HyperOperator};
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::gamlss::{ParameterBlockInput, initialize_monotone_wiggle_knots_from_seed};
+use crate::families::parameter_block::ParameterBlockInput;
+use crate::families::wiggle::initialize_monotone_wiggle_knots_from_seed;
 use crate::families::jet_partitions::MultiDirJet;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{

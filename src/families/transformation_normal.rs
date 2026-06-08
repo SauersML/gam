@@ -39,9 +39,8 @@ use crate::families::custom_family::{
     evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
     fit_custom_family_fixed_log_lambdas,
 };
-use crate::families::gamlss::{
-    initializewiggle_knots_from_seed, solve_penalizedweighted_projection,
-};
+use crate::families::gamlss::solve_penalizedweighted_projection;
+use crate::families::wiggle::initializewiggle_knots_from_seed;
 use crate::inference::model::{TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration};
 use crate::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SymmetricMatrix,

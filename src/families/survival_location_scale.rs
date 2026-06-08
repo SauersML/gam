@@ -18,10 +18,11 @@ use crate::faer_ndarray::{
     FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
     fast_xt_diag_x_with_parallelism,
 };
-use crate::families::gamlss::{
-    ParameterBlockInput, SelectedWiggleBasis, WiggleBlockConfig,
-    monotone_wiggle_basis_with_derivative_order, monotone_wiggle_nonnegative_constraints,
-    select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
+use crate::families::parameter_block::ParameterBlockInput;
+use crate::families::wiggle::{
+    SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
+    monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
+    validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::families::location_scale_engine::build_location_scale_exact_joint_setup;
 use crate::families::scale_design::{
@@ -11027,13 +11028,13 @@ pub(crate) fn select_survival_link_wiggle_basis_from_pilot(
 fn linkwiggle_block_input_from_selected_basis(
     selected_wiggle_basis: SelectedWiggleBasis,
 ) -> LinkWiggleBlockInput {
-    let crate::families::gamlss::SelectedWiggleBasis {
+    let crate::families::wiggle::SelectedWiggleBasis {
         block,
         knots,
         degree,
         ..
     } = selected_wiggle_basis;
-    let crate::families::gamlss::ParameterBlockInput {
+    let crate::families::parameter_block::ParameterBlockInput {
         design,
         penalties,
         nullspace_dims,
@@ -12205,7 +12206,7 @@ mod tests {
                     double_penalty: false,
                 };
                 if let Ok((block, knots)) =
-                    crate::families::gamlss::buildwiggle_block_input_from_seed(seed.view(), &cfg)
+                    crate::families::wiggle::buildwiggle_block_input_from_seed(seed.view(), &cfg)
                     && block.design.ncols() == beta_link_wiggle.len()
                 {
                     return (knots, degree);
