@@ -5036,7 +5036,15 @@ fn build_tensor_bspline_basis(
                 }
                 BSplineKnotSpec::Automatic {
                     num_internal_knots, ..
-                } => num_internal_knots.unwrap_or(8) + marginalspec.degree + 1,
+                } => {
+                    // Fallback internal-knot count when an automatic marginal has
+                    // not yet resolved its knot count at periodic-margin build
+                    // time; matches the modest default used for a 1-D `s()`.
+                    const DEFAULT_AUTOMATIC_INTERNAL_KNOTS: usize = 8;
+                    num_internal_knots.unwrap_or(DEFAULT_AUTOMATIC_INTERNAL_KNOTS)
+                        + marginalspec.degree
+                        + 1
+                }
                 BSplineKnotSpec::PeriodicUniform { num_basis, .. } => num_basis,
             };
             let (basis, penalty, knots) = build_periodic_fourier_margin(
