@@ -14430,22 +14430,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             None
         };
-        // Fold the Jeffreys objective value into the cycle-0 baseline so the
-        // first trust-region accept/reject compares like-for-like against the
-        // Jeffreys-augmented trial objectives below. No-op when there is no
-        // coefficient system or the term is condition-gated to zero.
-        //
-        // SIGN (gam#729/#715): Firth ADDS ½log|I| to the log-likelihood, i.e.
-        // SUBTRACTS Φ from the NLL objective the inner Newton minimizes:
-        // `−ℓ + ½βᵀSβ − Φ`. The Newton step rhs and the KKT residual already
-        // encode this (they ADD `∇Φ` to `∇L − Sβ`, the −gradient of `−Φ`), so the
-        // accept/reject MERIT must SUBTRACT Φ too. Adding it (the previous code)
-        // gave the line search the objective `−ℓ + ½βᵀSβ + Φ`, whose descent
-        // direction is OPPOSITE the augmented Newton step's — so for the coupled
-        // K-block fit near the Firth optimum every backtracking attempt saw the
-        // merit INCREASE (actual_reduction < 0) while the model predicted a
-        // decrease, rejected the step, and the inner solve exited "before
-        // convergence" with the residual pinned at ‖∇Φ‖.
+        // Fold the Firth value `−Φ` into the cycle-0 baseline. SIGN
+        // (gam#729/#715): Firth ADDS ½log|I| to the log-likelihood ⇒ the NLL
+        // objective is `−ℓ + ½βᵀSβ − Φ`, matching the Newton step rhs / KKT
+        // residual which ADD `∇Φ` to `∇L − Sβ`. The per-cycle trial and post-accept
+        // folds carry the matching `jeffreys_skippable_this_cycle` gate; this
+        // cycle-0 baseline is computed at the start β where the term is active
+        // (cold seed is never well-conditioned-skippable), so it folds Φ to keep
+        // the first trust-region accept on the augmented objective.
         if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
             let phi0 = custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             current_penalty -= phi0;
@@ -15721,25 +15713,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // a single damped Newton step incapable of crossing the gate.
                 // SUBTRACT Φ: the inner NLL objective is `−ℓ + ½βᵀSβ − Φ` (Firth
                 // adds ½log|I| to the log-likelihood). Must match the cycle-0
-                // baseline (`current_penalty -= phi0`), the Newton step, and the
-                // KKT residual (gam#729/#715 sign fix).
-                //
-                // CRITICAL (gam#826/#715): fold the VALUE Φ UNCONDITIONALLY — do
-                // NOT gate it on `jeffreys_skippable_this_cycle`. The cycle-0
-                // baseline subtracts `phi0` whenever the subspace exists (it is not
-                // gated on skippability), so gating the TRIAL value on skippable
-                // made the accept/reject objective inconsistent with its own
-                // baseline: on a well-conditioned cycle (skippable=true) the trial
-                // dropped Φ while `old_objective` still carried `−phi0`, so a
-                // ZERO-step trial reported a spurious `Δobj = ±Φ` (observed: a 0
-                // step with Δobj ≈ −20.8 = the firth value), the line search
-                // rejected every backtrack, and the coupled inner solve exited
-                // 'before convergence'. The value Φ is CHEAP (one reduced-info
-                // eigendecomposition via `custom_family_joint_jeffreys_value`, no
-                // per-axis directional-derivative loop), so `jeffreys_skippable`
-                // must gate ONLY the expensive gradient/curvature term, never this
-                // merit value.
-                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                // baseline, the Newton step, and the KKT residual — INCLUDING the
+                // `jeffreys_skippable_this_cycle` gate, so that on a well-conditioned
+                // cycle the trial, the step (H_Φ=0/∇Φ=0), and the residual all sit
+                // on the SAME Φ=0 objective (gam#729/#715 sign fix; the baseline and
+                // post-accept folds carry the matching skippable gate).
+                if !jeffreys_skippable_this_cycle
+                    && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
+                {
                     trial_penalty -= custom_family_joint_jeffreys_value(
                         family, &states, specs, &ranges, z_joint,
                     );
@@ -16185,18 +16166,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_bundle,
                 Some(specs),
             );
-            // Re-fold the Jeffreys objective at the accepted iterate so the
-            // post-accept baseline (`lastobjective`, the next cycle's
-            // `old_objective`) matches the augmented objective the trial points are
-            // compared against. SUBTRACT Φ (objective is `−ℓ + ½βᵀSβ − Φ`) and do
-            // so UNCONDITIONALLY — exactly mirroring the trial-penalty fold above
-            // and the cycle-0 baseline. Gating this on `jeffreys_skippable` or
-            // adding it (the previous code did both) desynced the post-accept
-            // baseline from the trial objective by ±Φ, so the next cycle's
-            // accept/reject saw a spurious Δobj of order Φ on a zero/small step and
-            // refused every backtrack (gam#826/#715). No-op when the term is
-            // unavailable (∇Φ subspace empty).
-            if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+            // Re-fold the Firth value `−Φ` at the accepted iterate so the carried
+            // baseline (`lastobjective`, next cycle's `old_objective`) stays on the
+            // augmented objective `−ℓ + ½βᵀSβ − Φ` the trials are compared against.
+            // SUBTRACT (sign) and gate on `jeffreys_skippable_this_cycle` to match
+            // the trial fold (gam#729/#715 sign fix). No-op when unavailable/skipped.
+            if !jeffreys_skippable_this_cycle
+                && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
+            {
                 current_penalty -=
                     custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             }
