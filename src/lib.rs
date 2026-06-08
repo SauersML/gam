@@ -102,7 +102,9 @@ pub use resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
 };
-pub use solver::{estimate, mixture_link, pirls, seeding, topology_selector, visualizer};
+pub use solver::{
+    estimate, gaussian_reml, mixture_link, pirls, seeding, topology_selector, visualizer,
+};
 pub use terms::{basis, construction, hull, smooth, term_builder};
 
 pub use families::custom_family;

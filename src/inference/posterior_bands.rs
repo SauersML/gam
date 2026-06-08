@@ -1,0 +1,232 @@
+use ndarray::{Array2, ArrayView2};
+use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
+
+use crate::families::inverse_link::apply_inverse_link_vec;
+use crate::util::quantile::quantile_from_sorted;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PosteriorPredictBandsPayload {
+    pub linear_predictor: Vec<f64>,
+    pub linear_predictor_lower: Vec<f64>,
+    pub linear_predictor_upper: Vec<f64>,
+    pub mean: Vec<f64>,
+    pub mean_lower: Vec<f64>,
+    pub mean_upper: Vec<f64>,
+    pub n_rows: usize,
+    pub n_draws: usize,
+    pub model_class: String,
+    pub family_kind: String,
+}
+
+/// Posterior eta matrix (n_draws x n_rows) -> per-row bands.
+///
+/// Handles empty draws gracefully and uses link-scale quantiles for the
+/// response-scale credible bounds (monotone inverse link preserves
+/// quantiles). The response-scale **point estimate** is the posterior mean of
+/// the response-scale draws — i.e. `E[g^{-1}(eta)]`, **not** `g^{-1}(E[eta])`.
+/// For nonlinear inverse links (logit, log, probit, cloglog) the two differ
+/// by Jensen's inequality, and consumers of the `"mean"` field expect the
+/// former (it should equal the per-row posterior mean of `predict_draws`'
+/// `mean` matrix). Computing it as `g^{-1}(mean(eta))` instead would give
+/// the *median* of the response-scale draws under a monotone link, which is
+/// a different summary and silently biases reported response-scale means.
+pub fn eta_bands_from_matrix(
+    eta: ArrayView2<'_, f64>,
+    family_kind: &str,
+    level: f64,
+) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
+    if !(level > 0.0 && level < 1.0) {
+        return Err(format!("interval level must lie in (0, 1); got {level}"));
+    }
+    let alpha = (1.0 - level) / 2.0;
+    let n_draws = eta.nrows();
+    let n_rows = eta.ncols();
+    let (eta_mean, eta_lower, eta_upper, response_mean) = if n_draws == 0 {
+        (
+            vec![0.0; n_rows],
+            vec![0.0; n_rows],
+            vec![0.0; n_rows],
+            vec![0.0; n_rows],
+        )
+    } else {
+        let mut means = vec![0.0_f64; n_rows];
+        let mut lower = vec![0.0_f64; n_rows];
+        let mut upper = vec![0.0_f64; n_rows];
+        let mut response = vec![0.0_f64; n_rows];
+        let mut column = vec![0.0_f64; n_draws];
+        let inv_n = 1.0 / n_draws as f64;
+        for j in 0..n_rows {
+            for k in 0..n_draws {
+                column[k] = eta[[k, j]];
+            }
+            let mut sum = 0.0_f64;
+            for v in &column {
+                sum += *v;
+            }
+            means[j] = sum * inv_n;
+            // Response-scale posterior mean: average inv-link draws, not
+            // inv-link of the eta mean. See doc comment above.
+            let response_draws = apply_inverse_link_vec(&column, family_kind)?;
+            let mut rsum = 0.0_f64;
+            for v in &response_draws {
+                rsum += *v;
+            }
+            response[j] = rsum * inv_n;
+            column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+            lower[j] = quantile_from_sorted(&column, alpha);
+            upper[j] = quantile_from_sorted(&column, 1.0 - alpha);
+        }
+        (means, lower, upper, response)
+    };
+    let mean_lower = apply_inverse_link_vec(&eta_lower, family_kind)?;
+    let mean_upper = apply_inverse_link_vec(&eta_upper, family_kind)?;
+    Ok((
+        eta_mean,
+        eta_lower,
+        eta_upper,
+        response_mean,
+        mean_lower,
+        mean_upper,
+    ))
+}
+
+pub fn posterior_eta_bands(
+    eta_flat: Vec<f64>,
+    n_draws: usize,
+    n_rows: usize,
+    family_kind: &str,
+    level: f64,
+) -> Result<PosteriorPredictBandsPayload, String> {
+    if eta_flat.len() != n_draws * n_rows {
+        return Err(format!(
+            "posterior_eta_bands shape mismatch: got {} floats, expected {} * {}",
+            eta_flat.len(),
+            n_draws,
+            n_rows
+        ));
+    }
+    let eta = Array2::<f64>::from_shape_vec((n_draws, n_rows), eta_flat)
+        .map_err(|err| format!("failed to reshape eta matrix: {err}"))?;
+    let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
+        eta_bands_from_matrix(eta.view(), family_kind, level)?;
+    Ok(PosteriorPredictBandsPayload {
+        linear_predictor: eta_mean,
+        linear_predictor_lower: eta_lower,
+        linear_predictor_upper: eta_upper,
+        mean,
+        mean_lower,
+        mean_upper,
+        n_rows,
+        n_draws,
+        model_class: String::new(),
+        family_kind: family_kind.to_string(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::quantile::quantile_from_sorted;
+    use ndarray::Array2;
+
+    /// Parity / regression test pinning the *single* posterior eta-band
+    /// engine to its documented semantics, so future interval-logic fixes
+    /// land here and nowhere else.
+    ///
+    /// Two contracts are asserted against an independent hand computation:
+    ///
+    ///   1. Link-scale credible bounds are the shared numpy-`linear`
+    ///      quantile (`util::quantile::quantile_from_sorted`) of the
+    ///      per-row eta draws — *not* a normal-approximation interval.
+    ///   2. The response-scale point estimate is `E[g^{-1}(eta)]` (mean of
+    ///      inverse-link draws), *not* `g^{-1}(E[eta])`. Under a strictly
+    ///      convex inverse link the two differ by Jensen's inequality, and
+    ///      this asymmetric column makes that difference observable.
+    #[test]
+    fn eta_bands_match_shared_quantile_and_response_mean_semantics() {
+        // Column 0: symmetric draws. Column 1: deliberately skewed so the
+        // mean of exp(eta) sits strictly above exp(mean(eta)).
+        let eta = Array2::from_shape_vec(
+            (5, 2),
+            vec![
+                -2.0, 0.0, //
+                -1.0, 0.5, //
+                0.0, 1.0, //
+                1.0, 1.5, //
+                2.0, 4.0, //
+            ],
+        )
+        .expect("shape");
+        let level = 0.80; // alpha = 0.10 each tail
+        let alpha = (1.0 - level) / 2.0;
+
+        let (eta_mean, eta_lower, eta_upper, mean, _mean_lower, _mean_upper) =
+            eta_bands_from_matrix(eta.view(), "log", level).expect("bands");
+
+        for j in 0..2 {
+            let mut col: Vec<f64> = (0..5).map(|k| eta[[k, j]]).collect();
+            let inv_n = 1.0 / 5.0;
+            let mean_eta: f64 = col.iter().sum::<f64>() * inv_n;
+            assert!(
+                (eta_mean[j] - mean_eta).abs() < 1e-12,
+                "eta mean mismatch col {j}"
+            );
+
+            // Response-scale point estimate = mean of inverse-link draws.
+            let resp_mean: f64 = col.iter().map(|e| e.exp()).sum::<f64>() * inv_n;
+            assert!(
+                (mean[j] - resp_mean).abs() < 1e-12,
+                "response mean must be E[g^-1(eta)] for col {j}"
+            );
+
+            col.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+            let lo = quantile_from_sorted(&col, alpha);
+            let hi = quantile_from_sorted(&col, 1.0 - alpha);
+            assert!(
+                (eta_lower[j] - lo).abs() < 1e-12,
+                "lower band must be shared linear quantile col {j}"
+            );
+            assert!(
+                (eta_upper[j] - hi).abs() < 1e-12,
+                "upper band must be shared linear quantile col {j}"
+            );
+        }
+
+        // Jensen gap is real and oriented: for the skewed column the
+        // response mean strictly exceeds g^{-1}(mean(eta)).
+        let mean_eta_col1: f64 = (0..5).map(|k| eta[[k, 1]]).sum::<f64>() / 5.0;
+        assert!(
+            mean[1] > mean_eta_col1.exp() + 1e-9,
+            "E[exp(eta)] must exceed exp(E[eta]) for the convex link"
+        );
+    }
+
+    /// Empty draws degrade to all-zero bands without panicking, matching
+    /// the documented graceful-degradation contract.
+    #[test]
+    fn empty_draws_yield_zero_bands() {
+        let eta = Array2::<f64>::zeros((0, 3));
+        let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =
+            eta_bands_from_matrix(eta.view(), "identity", 0.95).expect("bands");
+        for v in [
+            &eta_mean,
+            &eta_lower,
+            &eta_upper,
+            &mean,
+            &mean_lower,
+            &mean_upper,
+        ] {
+            assert_eq!(v.len(), 3);
+            assert!(v.iter().all(|x| *x == 0.0));
+        }
+    }
+
+    /// Levels outside (0, 1) are rejected rather than silently clamped.
+    #[test]
+    fn level_must_lie_in_open_unit_interval() {
+        let eta = Array2::<f64>::zeros((4, 2));
+        assert!(eta_bands_from_matrix(eta.view(), "identity", 0.0).is_err());
+        assert!(eta_bands_from_matrix(eta.view(), "identity", 1.0).is_err());
+    }
+}
