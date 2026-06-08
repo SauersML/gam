@@ -1444,3 +1444,168 @@ fn make_folds_indices_rejects_invalid_inputs() {
     assert!(make_folds_indices(vec![0.0, f64::NAN, 1.0], 2, 0, false).is_err());
     assert!(make_folds_indices(vec![0.0, f64::INFINITY, 1.0], 2, 0, false).is_err());
 }
+
+/// Ordinary least squares R^2 of fitting `design @ beta ~= y` (single output),
+/// via the normal equations with a tiny relative ridge floor on the Gram for
+/// numerical robustness. Used by the issue #876 latent-decoder regression below
+/// to quantify how well a candidate latent Duchon basis reconstructs a clean
+/// circular signal. NOT a tolerance to weaken — it is the recovery metric.
+fn latent_decoder_ols_r2(design: &Array2<f64>, y: &Array1<f64>) -> f64 {
+    let gram = design.t().dot(design);
+    let rhs = design.t().dot(y);
+    let beta = gam::linalg::utils::solve_symmetric_vector_with_floor(&gram, &rhs, 1.0e-10)
+        .expect("OLS normal-equations solve for latent decoder recovery");
+    let fitted = design.dot(&beta);
+    let mean = y.sum() / y.len() as f64;
+    let mut ss_res = 0.0;
+    let mut ss_tot = 0.0;
+    for (yi, fi) in y.iter().zip(fitted.iter()) {
+        ss_res += (yi - fi) * (yi - fi);
+        ss_tot += (yi - mean) * (yi - mean);
+    }
+    1.0 - ss_res / ss_tot
+}
+
+/// Issue #876: when the latent optimizer retracts on a PERIODIC manifold
+/// (circle, radians wrapped to [-pi, pi), period TAU), the latent Duchon decoder
+/// MUST be a function ON the circle. The pre-fix open Euclidean basis violated
+/// `Phi(theta) = Phi(theta + TAU)` and measured the kernel distance across the
+/// seam (theta = pi - eps vs -pi + eps, adjacent on the circle) as ~2*pi apart.
+///
+/// This pins both halves of the fix:
+///   (a) seam consistency: the PERIODIC basis satisfies `Phi(theta) ~= Phi(theta
+///       + TAU)` row-for-row, while the OPEN basis does not;
+///   (b) recovery: on a clean circular signal `y = cos(theta) + 0.5 sin(2 theta)`
+///       sampled across the WHOLE circle (including the seam), the periodic
+///       decoder reconstructs the angle structure (high R^2), whereas the open
+///       decoder is materially worse near the seam.
+///
+/// `latent_manifold_periodic_descriptor("circle", 1)` is the exact descriptor the
+/// optimizer feeds the decoder, so this exercises the production path.
+#[test]
+fn issue_876_periodic_latent_duchon_decoder_is_seam_consistent_and_recovers_circle() {
+    let tau = std::f64::consts::TAU;
+    let latent_dim = 1usize;
+    let m = 2usize;
+
+    // Radian centers spanning the circle, matching the optimizer's chart and the
+    // periodic eigenmap seed (`latent_periodic_seed_start`), which both live in
+    // [-pi, pi). Deliberately include centers near both seam edges.
+    let n_centers = 12usize;
+    let mut centers = Array2::<f64>::zeros((n_centers, latent_dim));
+    for k in 0..n_centers {
+        // Evenly spaced angles in [-pi, pi).
+        centers[[k, 0]] = -std::f64::consts::PI + tau * (k as f64) / (n_centers as f64);
+    }
+
+    // The descriptor the production optimizer derives for a 1-D circle chart.
+    let descriptor = latent_manifold_periodic_descriptor("circle", latent_dim)
+        .expect("circle manifold must yield a periodic descriptor");
+    assert_eq!(descriptor, vec![Some(tau)]);
+
+    // (a) Seam consistency. Build the design at sample angles theta and again at
+    // theta + TAU (same point on the circle). For the periodic decoder the two
+    // designs must agree row-for-row; the open Euclidean decoder must not.
+    let n_obs = 40usize;
+    let theta: Vec<f64> = (0..n_obs)
+        .map(|i| -std::f64::consts::PI + tau * (i as f64 + 0.5) / (n_obs as f64))
+        .collect();
+    let theta_shift: Vec<f64> = theta.iter().map(|&a| a + tau).collect();
+
+    let t_flat = Array1::from(theta.clone());
+    let t_flat_shift = Array1::from(theta_shift.clone());
+
+    let (design_per, _) = build_latent_duchon_design(
+        t_flat.view(),
+        n_obs,
+        latent_dim,
+        centers.view(),
+        m,
+        Some(descriptor.as_slice()),
+    )
+    .expect("periodic latent Duchon design");
+    let (design_per_shift, _) = build_latent_duchon_design(
+        t_flat_shift.view(),
+        n_obs,
+        latent_dim,
+        centers.view(),
+        m,
+        Some(descriptor.as_slice()),
+    )
+    .expect("periodic latent Duchon design (shifted by TAU)");
+
+    assert_eq!(design_per.dim(), design_per_shift.dim());
+    let mut max_per_seam_gap = 0.0_f64;
+    for (a, b) in design_per.iter().zip(design_per_shift.iter()) {
+        max_per_seam_gap = max_per_seam_gap.max((a - b).abs());
+    }
+    // Periodic decoder is a genuine function on the circle: Phi(theta) = Phi(theta + TAU).
+    assert!(
+        max_per_seam_gap <= 1.0e-8,
+        "periodic latent decoder must satisfy Phi(theta) = Phi(theta + TAU); \
+         max row gap was {max_per_seam_gap}"
+    );
+
+    // The OPEN Euclidean decoder (None) is NOT periodic: it must visibly differ.
+    let (design_open, _) =
+        build_latent_duchon_design(t_flat.view(), n_obs, latent_dim, centers.view(), m, None)
+            .expect("open Euclidean latent Duchon design");
+    let (design_open_shift, _) = build_latent_duchon_design(
+        t_flat_shift.view(),
+        n_obs,
+        latent_dim,
+        centers.view(),
+        m,
+        None,
+    )
+    .expect("open Euclidean latent Duchon design (shifted by TAU)");
+    let mut max_open_seam_gap = 0.0_f64;
+    for (a, b) in design_open.iter().zip(design_open_shift.iter()) {
+        max_open_seam_gap = max_open_seam_gap.max((a - b).abs());
+    }
+    assert!(
+        max_open_seam_gap > 1.0e-3,
+        "open Euclidean latent decoder must NOT be periodic (control); \
+         max row gap was {max_open_seam_gap}"
+    );
+
+    // (b) Recovery on a clean circular signal across the whole circle, including
+    // the seam. The truth is a genuine function on the circle.
+    let y: Array1<f64> =
+        Array1::from_iter(theta.iter().map(|&a| a.cos() + 0.5 * (2.0 * a).sin()));
+
+    let r2_periodic = latent_decoder_ols_r2(&design_per, &y);
+    let r2_open = latent_decoder_ols_r2(&design_open, &y);
+
+    // The periodic decoder recovers the angle structure (not collapsed).
+    assert!(
+        r2_periodic >= 0.95,
+        "periodic latent decoder must recover the circular signal; R^2 = {r2_periodic}"
+    );
+
+    // Compare reconstruction error specifically at the seam-adjacent points (the
+    // first and last sample angles, which straddle theta = +/- pi). The periodic
+    // decoder must not have the cross-seam discontinuity the open basis carries.
+    let solve_fitted = |design: &Array2<f64>| -> Array1<f64> {
+        let gram = design.t().dot(design);
+        let rhs = design.t().dot(&y);
+        let beta = gam::linalg::utils::solve_symmetric_vector_with_floor(&gram, &rhs, 1.0e-10)
+            .expect("seam OLS solve");
+        design.dot(&beta)
+    };
+    let fitted_per = solve_fitted(&design_per);
+    let fitted_open = solve_fitted(&design_open);
+    // Seam-straddling pair: last sample (just below +pi) and first (just above -pi).
+    let seam_err = |fitted: &Array1<f64>| -> f64 {
+        let e_first = (fitted[0] - y[0]).abs();
+        let e_last = (fitted[n_obs - 1] - y[n_obs - 1]).abs();
+        e_first.max(e_last)
+    };
+    assert!(
+        seam_err(&fitted_per) <= seam_err(&fitted_open) + 1.0e-9,
+        "periodic decoder must reconstruct seam-adjacent points at least as well \
+         as the open decoder: periodic seam err = {}, open seam err = {}, R^2 open = {r2_open}",
+        seam_err(&fitted_per),
+        seam_err(&fitted_open),
+    );
+}
