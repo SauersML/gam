@@ -1144,6 +1144,14 @@ def test_duchon_function_norm_penalty_2d_smoke() -> None:
     _assert_symmetric_psd(s, "2D Duchon penalty")
 
 
+def test_duchon_function_norm_penalty_1d_public_wrapper_arity_issue_880() -> None:
+    """The public wrapper must match the PyO3 binding arity for 1-D centers."""
+    centers = np.linspace(-1.0, 1.0, 16).reshape(-1, 1)
+    s = np.asarray(gamfit.duchon_function_norm_penalty(centers, m=2), dtype=float)
+    assert s.shape == (16, 16)
+    _assert_symmetric_psd(s, "1D Duchon penalty")
+
+
 def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     """d=2 mixed-periodicity Duchon (cylinder): symmetric, PSD, wraps cleanly."""
     # Spread centers across the periodic axis [0, 2π] (auto-derived period)
