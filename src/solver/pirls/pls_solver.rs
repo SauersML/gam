@@ -313,6 +313,10 @@ pub(super) fn solve_penalized_least_squares_implicit(
     workspace.vec_buf_p += penalty.linear_shift();
 
     {
+        // The penalized Hessian is assembled from symmetric pieces (XᵀWX and
+        // the penalty), so any asymmetry is pure floating-point accumulation
+        // error; anything above this floor signals a genuine assembly bug.
+        const PENALIZED_HESSIAN_ASYMMETRY_TOL: f64 = 1e-8;
         let xtwx_asym = max_symmetric_asymmetry(&xtwx_transformed);
         let penalty_asym = match penalty {
             PirlsPenalty::Dense { s_transformed, .. } => max_symmetric_asymmetry(s_transformed),
@@ -320,9 +324,8 @@ pub(super) fn solve_penalized_least_squares_implicit(
         };
         let total_asym = max_symmetric_asymmetry(&penalized_hessian);
         assert!(
-            total_asym <= 1e-8,
-            "implicit PLS penalized Hessian asymmetry too large: total={total_asym:.3e}, xtwx_orig={xtwx_orig_asym:.3e}, xtwx={xtwx_asym:.3e}, penalty={penalty_asym:.3e}, tol={:.3e}",
-            1e-8
+            total_asym <= PENALIZED_HESSIAN_ASYMMETRY_TOL,
+            "implicit PLS penalized Hessian asymmetry too large: total={total_asym:.3e}, xtwx_orig={xtwx_orig_asym:.3e}, xtwx={xtwx_asym:.3e}, penalty={penalty_asym:.3e}, tol={PENALIZED_HESSIAN_ASYMMETRY_TOL:.3e}",
         );
     }
 

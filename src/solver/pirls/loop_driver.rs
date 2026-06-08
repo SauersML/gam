@@ -376,6 +376,30 @@ pub(super) fn detect_logit_instability(
         return false;
     }
 
+    // Separation-detection policy thresholds. Each is a heuristic cut-off, not
+    // a math identity: they decide when a binary-logit fit has drifted into the
+    // perfect/quasi-perfect separation regime and the inner solve must retreat.
+    //
+    // `ORDER_SEPARATION_ETA_GAP`: a strictly positive η-gap between the lowest
+    //   η among y=1 rows and the highest among y=0 rows means the two classes
+    //   are linearly separable on the linear predictor.
+    // `EXTREME_ETA`: |η| this large drives μ to within machine-ε of {0,1}.
+    // `SATURATION_FRACTION` / `SEVERE_SATURATION_FRACTION`: share of fitted μ
+    //   pinned to the {0,1} boundary that flags (severe) saturation.
+    // `DEGENERATE_DEVIANCE_PER_SAMPLE` / `EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE`:
+    //   near-zero per-sample deviance means the model fits the data perfectly.
+    // `EXTREME_BETA_NORM`: coefficient norm blow-up characteristic of the MLE
+    //   escaping to infinity under separation.
+    // `WEIGHT_COLLAPSE_FRACTION`: share of working weights collapsed to ~0.
+    const ORDER_SEPARATION_ETA_GAP: f64 = 1e-3;
+    const EXTREME_ETA: f64 = 30.0;
+    const SATURATION_FRACTION: f64 = 0.98;
+    const SEVERE_SATURATION_FRACTION: f64 = 0.995;
+    const DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-3;
+    const EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE: f64 = 1e-6;
+    const EXTREME_BETA_NORM: f64 = 1e4;
+    const WEIGHT_COLLAPSE_FRACTION: f64 = 0.98;
+
     let n = y.len() as f64;
     if n == 0.0 {
         return false;
@@ -420,18 +444,22 @@ pub(super) fn detect_logit_instability(
             }
         }
     }
-    let order_separated = has_pos && has_neg && (min_eta_pos - max_eta_neg) > 1e-3;
+    let order_separated =
+        has_pos && has_neg && (min_eta_pos - max_eta_neg) > ORDER_SEPARATION_ETA_GAP;
 
-    let classic_signals =
-        max_abs_eta > 30.0 || sat_fraction > 0.98 || dev_per_sample < 1e-3 || beta_norm > 1e4;
+    let classic_signals = max_abs_eta > EXTREME_ETA
+        || sat_fraction > SATURATION_FRACTION
+        || dev_per_sample < DEGENERATE_DEVIANCE_PER_SAMPLE
+        || beta_norm > EXTREME_BETA_NORM;
 
     if !has_penalty {
         return classic_signals || order_separated;
     }
 
-    let severe_saturation = sat_fraction > 0.995 && max_abs_eta > 30.0;
-    let weights_collapsed = weight_collapse_fraction > 0.98;
-    let dev_extremely_small = dev_per_sample < 1e-6;
+    let severe_saturation =
+        sat_fraction > SEVERE_SATURATION_FRACTION && max_abs_eta > EXTREME_ETA;
+    let weights_collapsed = weight_collapse_fraction > WEIGHT_COLLAPSE_FRACTION;
+    let dev_extremely_small = dev_per_sample < EXTREME_DEGENERATE_DEVIANCE_PER_SAMPLE;
 
     order_separated || severe_saturation || weights_collapsed || dev_extremely_small
 }
@@ -2006,13 +2034,20 @@ pub(super) fn merge_linear_constraints(
 }
 
 pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
+    // Below this column count a dense factorization beats the sparse path even
+    // at high sparsity, so skip the sparsity scan entirely for narrow designs.
+    const DENSE_PREFERRED_MAX_COLS: usize = 32;
+    // Sparse storage + sparse Cholesky only pays off below this density (nnz as
+    // a fraction of all entries); denser matrices stay dense.
+    const SPARSE_DENSITY_LIMIT: f64 = 0.20;
+
     let nrows = x.nrows();
     let ncols = x.ncols();
     if nrows == 0 || ncols == 0 {
         return None;
     }
     // Narrow matrices are faster in dense form; avoid any sparsity scan overhead.
-    if ncols <= 32 {
+    if ncols <= DENSE_PREFERRED_MAX_COLS {
         return None;
     }
 
@@ -2022,7 +2057,7 @@ pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> 
         return None;
     }
     // If a matrix exceeds this nnz count it is too dense for sparse path; bail early.
-    let sparse_nnz_limit = ((total as f64) * 0.20).floor() as usize;
+    let sparse_nnz_limit = ((total as f64) * SPARSE_DENSITY_LIMIT).floor() as usize;
     let mut nnz = 0usize;
     for &val in x.iter() {
         if val.abs() > ZERO_EPS {
