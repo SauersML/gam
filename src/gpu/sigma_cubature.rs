@@ -43,6 +43,17 @@ pub struct SigmaPointGpuInput {
 #[cfg(target_os = "linux")]
 const STREAM_POOL_MAX: usize = 8;
 
+/// Initial Levenberg-Marquardt damping for each sigma-point PIRLS fit.
+///
+/// The sigma-point fits are cold-started from a zero β seed, so a small but
+/// non-zero seed damping keeps the first Gauss-Newton step well-conditioned
+/// when the design's `XᵀWX` is near-singular at β=0; the inner loop's own
+/// trust-region logic then grows or shrinks it. `1e-6` is the same seed the
+/// stateless CPU sigma-cubature path uses, so the two solvers take an
+/// identical first step.
+#[cfg(target_os = "linux")]
+const SIGMA_PIRLS_INITIAL_LM_LAMBDA: f64 = 1e-6;
+
 /// Compute the stream-pool size for a batch of M sigma points.
 ///
 /// Auto-derived — no flag, no env var.
@@ -296,7 +307,7 @@ mod linux_impl {
                 pt.s_transformed.view(),
                 pt.linear_shift.view(),
                 pt.constant_shift,
-                1e-6,
+                super::SIGMA_PIRLS_INITIAL_LM_LAMBDA,
                 0.0,
                 max_iter,
                 convergence_tol,
