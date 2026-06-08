@@ -10418,18 +10418,19 @@ impl GaussianLocationScaleWiggleFamily {
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
             - &(&dm_u * &geom.d2q_dq02)
             - &(&rows.m * &g2_u);
-        // Static blocks: H_{μ,ls} = 2κm·dq_dq0; H_{ls,ls} = Fisher 2κ²a (#566).
-        // Differentiating the cross block along α = (xi, zeta, phi) carries
-        // dκ/dη_ls = κ' on every term that originally read just κ. The Fisher
-        // (ls,ls) block 2κ²a depends only on η_ls (a is the constant prior
-        // weight), so its directional derivative is 4κκ'a·zeta.
-        let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
-            + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
+        // Static blocks: H_{μ,ls} = Fisher 0 (mean⊥scale); H_{ls,ls} = Fisher
+        // 2κ²a (#566). H_{μ,ls} ≡ 0 for all β, so its directional derivative is
+        // also identically 0. The Fisher (ls,ls) block 2κ²a depends only on
+        // η_ls (a is the constant prior weight), so its directional derivative
+        // is 4κκ'a·zeta.
+        let coeff_ml_u = Array1::<f64>::zeros(n);
         let coeff_ll_u = 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.obs_weight);
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
         let c_u = -&dm_u;
-        // ls-wiggle cross block: l = 2κm; differentiating gains 2κ'·m·zeta.
-        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&rows.m * &zeta);
+        // ls↔wiggle cross block: Fisher 0 (wiggle is mean-side), so its
+        // directional derivative is 0 as well.
+        let l_u = Array1::<f64>::zeros(n);
+        let zeros_ls_b1 = Array1::<f64>::zeros(n);
 
         let h_mm = xt_diag_x_dense(xmu, &coeff_mm_u)?;
         let h_ml = xt_diag_y_dense(xmu, &coeff_ml_u, x_ls)?;
@@ -10439,7 +10440,7 @@ impl GaussianLocationScaleWiggleFamily {
             + &xt_diag_y_dense(xmu, &c_u, &geom.basis_d1)?
             + &xt_diag_y_dense(xmu, &(-&rows.m), &basis1_u)?;
         let h_lw = xt_diag_y_dense(x_ls, &l_u, &geom.basis)?
-            + &xt_diag_y_dense(x_ls, &(2.0 * &rows.kappa * &rows.m), &basis_u)?;
+            + &xt_diag_y_dense(x_ls, &zeros_ls_b1, &basis_u)?;
         let a_ww = xt_diag_y_dense(&basis_u, &rows.w, &geom.basis)?;
         let h_ww = &a_ww + &a_ww.t() + &xt_diag_x_dense(&geom.basis, &dw_u)?;
         Ok(Some(gaussian_pack_wiggle_joint_symmetrichessian(
@@ -10503,13 +10504,15 @@ impl GaussianLocationScaleWiggleFamily {
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
             - &(&dm_u * &geom.d2q_dq02)
             - &(&rows.m * &g2_u);
-        let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
-            + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
+        // H_{μ,ls} ≡ Fisher 0 (mean⊥scale); its directional derivative is 0.
+        let coeff_ml_u = Array1::<f64>::zeros(n);
         // Fisher (ls,ls) 2κ²a directional derivative: 4κκ'a·zeta (#566).
         let coeff_ll_u = 4.0 * &rows.kappa * &rows.kappa_prime * &(&zeta * &rows.obs_weight);
         let a_u = &dw_u * &geom.dq_dq0 + &rows.w * &s1_u;
         let c_u = -&dm_u;
-        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&rows.m * &zeta);
+        // H_{ls,w} ≡ Fisher 0 (wiggle is mean-side); its derivative is 0 in
+        // both the B channel (l_u) and the B' channel (coeff_ls_b1).
+        let l_u = Array1::<f64>::zeros(n);
 
         // Pair-coefficient bundles. For (0=X_mu, 3=B'): combine
         // `xt_diag_y_dense(xmu, &(w·dq_dq0), &basis_u=diag(xi)·B')`
@@ -10518,8 +10521,8 @@ impl GaussianLocationScaleWiggleFamily {
         let coeff_m_b1 = &(&rows.w * &geom.dq_dq0 * &xi) + &c_u;
         // (0=X_mu, 4=B''): from `xt_diag_y_dense(xmu, &(-m), &basis1_u=diag(xi)·B'')`.
         let coeff_m_b2 = -(&rows.m * &xi);
-        // (1=X_ls, 3=B'): `xt_diag_y_dense(x_ls, &(2κm), &basis_u=diag(xi)·B')`.
-        let coeff_ls_b1 = 2.0 * &rows.kappa * &rows.m * &xi;
+        // (1=X_ls, 3=B'): ls↔wiggle Fisher-0 cross → zero.
+        let coeff_ls_b1 = Array1::<f64>::zeros(n);
         // (2=B, 3=B'): a_ww + a_ww^T where a_ww = (diag(xi)·B')^T diag(w) B
         // = B'^T diag(w·xi) B. The symmetric pair contribution in
         // `RowCoeffOperator` reproduces a_ww + a_ww^T with c = w·xi.
