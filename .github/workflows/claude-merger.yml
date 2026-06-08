@@ -137,6 +137,18 @@ jobs:
             deeper work on `main` before cutting the release. Do not ship a
             half-fix and tell yourself a follow-up will land later.
 
+            DEAD-CODE REMOVAL GUARD (#871): `crates/gam-pyffi` (the published
+            PyO3 wheel) imports many `pub` items from `gam` via `use gam::…`.
+            Those items have no `gam`-internal caller, so they look dead to the
+            `gam` crate and to `cargo check --lib` — but deleting them breaks
+            the wheel, which only fails ~12 min into the release build. Before
+            removing ANY `pub` module / fn / struct / re-export as "dead",
+            verify workspace-wide reachability: `cargo check --workspace
+            --all-targets` (at minimum `cargo check -p gam-pyffi`). If
+            `gam-pyffi` references it (grep `crates/gam-pyffi/src` for the
+            symbol/path), it is LIVE — keep it. Never gate a deletion on the
+            `gam` crate alone.
+
             ## 3 — Bump versions and publish
 
             After every merge that lands user-facing code, cut a release:

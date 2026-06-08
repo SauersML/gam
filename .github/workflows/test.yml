@@ -100,6 +100,19 @@ jobs:
         with:
           cache-targets: false
 
+      # #871: `gam-pyffi` (the PyO3 wheel crate) imports many `pub` items from
+      # `gam` via `use gam::…`. The `gam` crate's own dead-code lint and the
+      # `--lib --bins --examples` test phase below only see in-crate
+      # reachability, so a `pub fn`/`pub mod`/re-export with no `gam`-internal
+      # caller looks dead even when the wheel depends on it. The de-magic /
+      # dead-code sweep deleted such items three times (cyclic, sindy, six more
+      # modules), each only surfacing ~12 min into the release wheel build and
+      # blocking every PyPI publish. Gate cross-crate reachability here so any
+      # pub-item removal that breaks the wheel fast-fails in normal CI instead.
+      - name: Check gam-pyffi cross-crate reachability (#871)
+        shell: bash
+        run: cargo check -p gam-pyffi --all-targets --all-features
+
       - name: Run tests
         shell: bash
         env:
