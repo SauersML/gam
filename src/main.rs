@@ -1360,9 +1360,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
                 .to_string(),
         );
         print_inference_summary(std::slice::from_ref(
-            inference_notes
-                .last()
-                .expect("note just pushed is present"),
+            inference_notes.last().expect("note just pushed is present"),
         ));
     }
     let fit_max_iter = 200usize;

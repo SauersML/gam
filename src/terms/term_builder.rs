@@ -2610,7 +2610,9 @@ fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
     };
     let mgcv_like_total = (mgcv_like_per_margin as f64).powi(d as i32);
     let data_budget = (n as f64) * 0.8;
-    let p_target = mgcv_like_total.max(min_k.pow(d as u32) as f64).min(data_budget);
+    let p_target = mgcv_like_total
+        .max(min_k.pow(d as u32) as f64)
+        .min(data_budget);
 
     // Geometric per-margin target so ∏k ≈ p_target, then clamp each margin to
     // its own 1-D resolution cap and the difference-penalty floor.
