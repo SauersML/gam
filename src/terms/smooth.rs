@@ -30145,4 +30145,104 @@ mod tests {
         assert_eq!(decoded.maps[0].invgradweight.len(), 2);
         assert_eq!(decoded.maps[0].inv_lapweight.len(), 2);
     }
+
+    // ------------------------------------------------------------------
+    // #760(c): exact bounded() posterior sampler on the latent scale.
+    //
+    // Verifies the three principled contracts of
+    // `sample_bounded_latent_posterior_internal`:
+    //   1. every user-scale draw of a bounded column lies STRICTLY inside its
+    //      interval (the interval map cannot escape the bounds);
+    //   2. an unconstrained column is the ordinary Gaussian Laplace draw whose
+    //      sample variance recovers the marginal `H_user^{-1}` diagonal — i.e.
+    //      the latent precision transform did NOT corrupt the unconstrained
+    //      block (J_ii = 1 there);
+    //   3. cross-coefficient correlation between the bounded and unconstrained
+    //      columns is present (the full `H_latent = J H_user J` joint is drawn,
+    //      not an independent per-column approximation), recovered on the latent
+    //      scale where the draw is exactly Gaussian.
+    // ------------------------------------------------------------------
+    #[test]
+    fn bounded_latent_sampler_draws_in_bounds_and_preserves_joint() {
+        let (min, max) = (-0.5_f64, 0.5_f64);
+        // User-scale mode: bounded col at 0.2 (interior), unconstrained at 1.3.
+        let beta_user = array![0.2, 1.3];
+        // A correlated user-scale penalized Hessian (SPD): off-diagonal couples
+        // the two coefficients so the joint draw must reproduce correlation.
+        let user_hessian = array![[4.0, 1.2], [1.2, 3.0]];
+        let bounded_columns = vec![BoundedSampleColumn {
+            col_idx: 0,
+            min,
+            max,
+        }];
+        let n_draws = 40_000usize;
+        let draws =
+            sample_bounded_latent_posterior_internal(&beta_user, &user_hessian, &bounded_columns, n_draws, 7607760)
+                .expect("bounded latent sampler");
+        assert_eq!(draws.dim(), (n_draws, 2));
+
+        // (1) Bounded column strictly inside (min, max).
+        for k in 0..n_draws {
+            let b = draws[(k, 0)];
+            assert!(
+                b > min && b < max,
+                "bounded draw {b} escaped interval ({min}, {max})"
+            );
+        }
+
+        // Reconstruct the latent geometry the sampler used so we can check the
+        // moments on the scale where the draw is exactly Gaussian.
+        let theta_mode0 = bounded_user_to_latent(beta_user[0], min, max);
+        let (_, _, j0) = bounded_latent_to_user(theta_mode0, min, max);
+        let h_latent = array![
+            [user_hessian[[0, 0]] * j0 * j0, user_hessian[[0, 1]] * j0],
+            [user_hessian[[1, 0]] * j0, user_hessian[[1, 1]]]
+        ];
+        // Latent covariance = H_latent^{-1} (2x2 closed form).
+        let det = h_latent[[0, 0]] * h_latent[[1, 1]] - h_latent[[0, 1]] * h_latent[[1, 0]];
+        let cov_latent = array![
+            [h_latent[[1, 1]] / det, -h_latent[[0, 1]] / det],
+            [-h_latent[[1, 0]] / det, h_latent[[0, 0]] / det]
+        ];
+
+        // Map bounded draws back to the latent scale; the unconstrained column
+        // is already on its (identity) latent scale.
+        let mut theta0 = Array1::<f64>::zeros(n_draws);
+        let mut theta1 = Array1::<f64>::zeros(n_draws);
+        for k in 0..n_draws {
+            theta0[k] = bounded_user_to_latent(draws[(k, 0)], min, max);
+            theta1[k] = draws[(k, 1)];
+        }
+        let mean0 = theta0.sum() / n_draws as f64;
+        let mean1 = theta1.sum() / n_draws as f64;
+        let var0 = theta0.iter().map(|&t| (t - mean0).powi(2)).sum::<f64>() / n_draws as f64;
+        let var1 = theta1.iter().map(|&t| (t - mean1).powi(2)).sum::<f64>() / n_draws as f64;
+        let cov01 = theta0
+            .iter()
+            .zip(theta1.iter())
+            .map(|(&a, &b)| (a - mean0) * (b - mean1))
+            .sum::<f64>()
+            / n_draws as f64;
+
+        // (2)/(3) Latent moments match H_latent^{-1} within Monte-Carlo error.
+        let rel = |emp: f64, truth: f64| (emp - truth).abs() / truth.abs().max(1e-12);
+        assert!(
+            rel(var0, cov_latent[[0, 0]]) < 0.05,
+            "latent var0 {var0} vs {} ", cov_latent[[0, 0]]
+        );
+        assert!(
+            rel(var1, cov_latent[[1, 1]]) < 0.05,
+            "latent var1 {var1} vs {}", cov_latent[[1, 1]]
+        );
+        let corr_emp = cov01 / (var0.sqrt() * var1.sqrt());
+        let corr_truth = cov_latent[[0, 1]] / (cov_latent[[0, 0]].sqrt() * cov_latent[[1, 1]].sqrt());
+        assert!(
+            corr_truth.abs() > 0.2,
+            "fixture must carry real correlation, got {corr_truth}"
+        );
+        assert!(
+            (corr_emp - corr_truth).abs() < 0.03,
+            "joint correlation not preserved: empirical {corr_emp} vs truth {corr_truth}"
+        );
+    }
 }
