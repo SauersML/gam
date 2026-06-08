@@ -157,6 +157,76 @@ def test_periodic_bspline_position_count_matches_cyclic_penalty() -> None:
         assert np.all(np.isfinite(np.asarray(out["fitted"])))
 
 
+def test_periodic_bspline_position_fit_recovers_truth_issue_878() -> None:
+    """gam#878: periodic B-spline position fits must size the internal basis to
+    the public count K AND actually recover the periodic truth.
+
+    The bug expanded ``knots_or_centers=K`` through the *open* B-spline auto-knot
+    builder, giving an internal basis of size ``K + degree-wrap`` (e.g. 19 for
+    K=12) that never matched the ``K x K`` penalty it validated against — so the
+    helper rejected every penalty with ``penalty shape mismatch: expected 19x19,
+    got 16x16``. A shape-only assertion is not enough to pin the fix: a basis
+    whose size merely *happened* to agree could still mis-fit. This locks the
+    count alignment (across several K, auto- and explicit-penalty, and against
+    ``periodic_spline_curve_basis``) together with the recovered fit quality on a
+    clean two-harmonic periodic signal.
+    """
+    rng = np.random.default_rng(0)
+    t = np.linspace(0.0, 1.0, 60, endpoint=False)
+    truth = np.cos(2.0 * np.pi * t) + 0.5 * np.sin(4.0 * np.pi * t)
+    y = truth + 0.05 * rng.standard_normal(t.size)
+
+    for k in (8, 12, 16):
+        _, helper_penalty = gamfit.periodic_spline_curve_basis(t, n_knots=k, degree=3)
+        assert np.asarray(helper_penalty).shape == (k, k)
+        for penalty, name in ((None, "auto"), (np.asarray(helper_penalty), "explicit")):
+            out = gamfit.gaussian_reml_fit_positions(
+                t,
+                y,
+                knots_or_centers=k,
+                penalty=penalty,
+                periodic=True,
+                period=1.0,
+            )
+            assert out.get("status") == "ok"
+            # Internal basis count == public K == cyclic penalty size: the
+            # phantom open-knot expansion would have desynced these.
+            assert np.asarray(out["coefficients"]).shape == (k, 1)
+            assert np.asarray(out["penalty"]).shape == (k, k)
+            fit = np.asarray(out["fitted"], dtype=float).ravel()
+            ss_res = float(np.sum((y - fit) ** 2))
+            ss_tot = float(np.sum((y - y.mean()) ** 2))
+            r2 = 1.0 - ss_res / ss_tot
+            assert r2 > 0.97, (
+                f"k={k}, {name} penalty: periodic B-spline position fit did not "
+                f"recover the truth (R2={r2:.3f}); a size-aligned but ill-posed "
+                "internal basis would surface here"
+            )
+
+
+def test_periodic_bspline_position_fit_default_count_issue_878() -> None:
+    """gam#878 (second repro): the DEFAULT basis count (no ``knots_or_centers``)
+    periodic B-spline position fit must also align its internal basis to its
+    penalty and recover the truth — the reporter's ``expected 17x17, got 14x14``
+    auto case, on irregularly spaced angles.
+    """
+    rng = np.random.default_rng(1)
+    t = np.sort(rng.uniform(0.0, 1.0, 50))
+    y = np.cos(2.0 * np.pi * t) + 0.05 * rng.standard_normal(t.size)
+
+    out = gamfit.gaussian_reml_fit_positions(t, y, periodic=True, period=1.0)
+    assert out.get("status") == "ok"
+    penalty = np.asarray(out["penalty"])
+    coeffs = np.asarray(out["coefficients"])
+    assert penalty.ndim == 2 and penalty.shape[0] == penalty.shape[1]
+    assert penalty.shape[0] == coeffs.shape[0], (
+        "default-count periodic penalty size must match the internal basis count"
+    )
+    fit = np.asarray(out["fitted"], dtype=float).ravel()
+    r2 = 1.0 - float(np.sum((y - fit) ** 2)) / float(np.sum((y - y.mean()) ** 2))
+    assert r2 > 0.97, f"default-count periodic fit did not recover the truth (R2={r2:.3f})"
+
+
 def test_periodic_duchon_fit_wraps_at_seam() -> None:
     """The fitted periodic smooth must be continuous across the seam.
 
