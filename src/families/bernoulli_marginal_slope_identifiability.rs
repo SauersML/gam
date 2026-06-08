@@ -192,7 +192,7 @@ impl RowJacobianOperator for BernoulliDenseDesignOperator {
         let n = self.design.nrows();
         let p = self.design.ncols();
         scale_jacobian_by_sqrt_h_with(n, p, 1, h_full, |i, a, c| {
-            debug_assert_eq!(c, 0, "K=1 operator has only channel 0");
+            assert_eq!(c, 0, "K=1 operator has only channel 0");
             self.design[[i, a]]
         })
     }
