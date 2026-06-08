@@ -738,8 +738,33 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
         },
         LikelihoodSpec::gaussian_identity().name(),
     );
+    // The bounded design is `[intercept, bounded(x)]` (2 coefficients). A
+    // persistable model requires a canonical fit_result + training headers, so
+    // build a single Mean block with a well-conditioned user-scale penalized
+    // Hessian; this lets `run_sample` load the model and reach the unified
+    // sampler dispatch (which validates the NUTS config before drawing).
+    let fit_result = compact_saved_multiblock_fit_result(
+        vec![FittedBlock {
+            beta: array![0.1, 0.2],
+            role: BlockRole::Mean,
+            edf: 2.0,
+            lambdas: Array1::zeros(0),
+        }],
+        Array1::zeros(0),
+        1.0,
+        None,
+        None,
+        Some(FitGeometry {
+            penalized_hessian: array![[4.0, 1.0], [1.0, 3.0]].into(),
+            working_weights: array![1.0, 1.0, 1.0],
+            working_response: array![0.0, 1.0, 1.0],
+        }),
+        saved_fit_summary_fixture(),
+    );
+    payload.fit_result = Some(fit_result);
     payload.data_schema = Some(bounded_cli_schema());
     payload.resolved_termspec = Some(bounded_cli_termspec());
+    payload.set_training_feature_metadata(vec!["x".to_string(), "y".to_string()], vec![]);
     write_model_json(&model_path, &SavedModel::from_payload(payload)).expect("write model");
 
     let err = run_sample(SampleArgs {
