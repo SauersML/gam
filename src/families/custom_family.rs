@@ -3544,6 +3544,28 @@ pub struct BlockwiseFitOptions {
     /// box-constraint stationarity at iteration 0. Genuinely flexible regimes
     /// (smooth scale / spatial) leave this `true` and keep full screening.
     pub screen_initial_rho: bool,
+    /// Set ONLY while the inner solve is invoked from the seed-screening proxy
+    /// (`custom_family_seed_screening_proxy_labeled`), which RANKS candidate
+    /// seeds by their penalized objective and never produces the final fit.
+    ///
+    /// When `true`, the inner joint-Newton skips the full per-axis
+    /// Jeffreys/Firth curvature (`custom_family_joint_jeffreys_term`'s
+    /// `for k in 0..p` directional-derivative loop, O(p · per-axis-Hdot) per
+    /// cycle), keeping ONLY the cheap value-only Jeffreys term
+    /// (`custom_family_joint_jeffreys_value`, one reduced-info eigendecomposition)
+    /// in the screening score. The per-axis gradient/curvature is what the inner
+    /// Newton step needs to *converge* a near-separating fit; the screening proxy
+    /// is capped and only ranks, so it does not need step convergence — it needs
+    /// a finite, separation-aware score cheaply. For a K-block coupled family
+    /// (Dirichlet/multinomial) each per-axis directional derivative is itself
+    /// O(K²·n·p), so running the full term for every cascade candidate over the
+    /// joint width `p` is the wrong cost class and made the coupled fit
+    /// non-completing during screening alone (gam#729/#808). The actual fit
+    /// (after a seed is selected) runs with this `false`, so the load-bearing
+    /// Firth curvature is fully present where it matters.
+    ///
+    /// **Default `false`** — only the screening proxy sets it `true`.
+    pub seed_screening: bool,
 }
 
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
@@ -3583,6 +3605,7 @@ impl Default for BlockwiseFitOptions {
             compute_covariance: false,
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
+            seed_screening: false,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
@@ -8547,11 +8570,25 @@ fn custom_family_seed_screening_proxy_labeled<F: CustomFamily + Clone + Send + S
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
     let physical_warm_start = physical_warm_start_for_labeled(warm_start, &physical_rho, layout);
+    // Seed screening only RANKS candidate seeds by their penalized objective; it
+    // is capped and never produces the final fit. Mark the inner solve as a
+    // screening solve so it skips the O(p · per-axis-Hdot) full Jeffreys/Firth
+    // curvature loop and keeps only the cheap value-only Jeffreys term in the
+    // score (gam#729/#808). For a K-block coupled family (Dirichlet/multinomial)
+    // each per-axis directional derivative is O(K²·n·p), so paying the full term
+    // for every cascade candidate over the joint width is the wrong cost class
+    // and made the coupled fit non-completing in screening alone. The real fit
+    // (after a seed is selected) runs with `seed_screening = false`, so the
+    // load-bearing Firth curvature is fully present where it matters.
+    let screening_options = BlockwiseFitOptions {
+        seed_screening: true,
+        ..options.clone()
+    };
     let mut inner = inner_blockwise_fit(
         family,
         specs,
         &per_block,
-        options,
+        &screening_options,
         physical_warm_start.as_ref().or(warm_start),
     )?;
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
@@ -11968,8 +12005,15 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
     };
     let logdet_jeffreys_hphi: Option<Array2<f64>> = if include_logdet_h
         && !outer_jeffreys_precheck_skips
+        && !options.seed_screening
         && family.joint_jeffreys_term_required()
     {
+        // Skipped during seed screening: this per-axis Jeffreys curvature
+        // (O(p · per-axis-Hdot)) augments the outer LAML logdet `½ log|H+Sλ+H_Φ|`,
+        // a refinement the screening SCORE does not need. Screening ranks seeds by
+        // the un-augmented `½ log|H+Sλ|` plus the value-only Firth penalty already
+        // in `penalty_value`; the load-bearing H_Φ is restored for the real fit
+        // (gam#729/#808).
         match build_joint_jeffreys_subspace(specs, &ranges)? {
             Some(z_joint) => {
                 custom_family_joint_jeffreys_term(family, states, specs, &ranges, &z_joint)?
@@ -14684,7 +14728,17 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // and trial-value calls; the conditioning changes slowly across cycles
             // so re-estimating per cycle (one `O(p·k)` burst) is already cheap
             // against the work it guards.
-            let jeffreys_skippable_this_cycle: bool = if joint_jeffreys_subspace.is_some() {
+            let jeffreys_skippable_this_cycle: bool = if options.seed_screening {
+                // Seed screening only ranks seeds: skip the O(p · per-axis-Hdot)
+                // full Jeffreys gradient/curvature loop. The value-only Jeffreys
+                // term (folded into the objective baseline / trial penalties via
+                // `custom_family_joint_jeffreys_value`, gated independently on
+                // `joint_jeffreys_subspace.is_some()`) still bounds the screening
+                // score on separating directions; only the per-axis step curvature
+                // — the wrong cost class for ranking on a K-block coupled family —
+                // is dropped here (gam#729/#808).
+                true
+            } else if joint_jeffreys_subspace.is_some() {
                 jeffreys_term_skippable_for_source(&joint_hessian_source, total_p).unwrap_or(false)
             } else {
                 false
@@ -29320,6 +29374,7 @@ mod tests {
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
+            seed_screening: false,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
@@ -29373,6 +29428,7 @@ mod tests {
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
+            seed_screening: false,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
@@ -29429,6 +29485,7 @@ mod tests {
             use_outer_hessian: false,
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
+            seed_screening: false,
             line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
