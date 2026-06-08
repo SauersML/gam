@@ -3286,6 +3286,16 @@ pub(super) fn project_coefficients_to_lower_bounds(
 /// bound that point into the infeasible direction (gradient > 0 for minimization)
 /// are KKT multipliers, not convergence defects.  Zeroing them gives the
 /// standard "projected gradient" used to test stationarity.
+/// Relative and absolute tolerances for deciding when a coefficient sits "at"
+/// its lower bound (an active box constraint). A coefficient is active when its
+/// slack is below `ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL`; the
+/// absolute term keeps genuinely-near-zero bounded coefficients (e.g. I-spline
+/// time coefficients pinned around 1e-6) from being treated as interior. Both
+/// the projected-gradient norm and the active-set classifier must use the same
+/// band so KKT diagnostics and the working set agree.
+const ACTIVE_BOUND_REL_TOL: f64 = 1e-6;
+const ACTIVE_BOUND_ABS_TOL: f64 = 1e-10;
+
 pub(super) fn projected_gradient_norm(
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
@@ -3304,7 +3314,7 @@ pub(super) fn projected_gradient_norm(
             // is a multiplier, not a convergence defect.
             let slack = beta[i] - lb[i];
             let scale = beta[i].abs().max(lb[i].abs()).max(1.0);
-            let tol = 1e-6 * scale + 1e-10;
+            let tol = ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL;
             if slack < tol {
                 continue;
             }
@@ -3856,7 +3866,7 @@ pub(crate) fn solve_newton_directionwith_lower_bounds(
             // so coefficients near the bound (e.g. I-spline at 1e-6) with positive
             // gradient (KKT multiplier) are correctly identified as active.
             let scale = beta[i].abs().max(lb.abs()).max(1.0);
-            let tol = 1e-6 * scale + 1e-10;
+            let tol = ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL;
             if beta[i] <= lb + tol {
                 active[i] = true;
             }
@@ -5490,6 +5500,10 @@ pub struct VarianceJet {
 }
 
 impl VarianceJet {
+    /// Lower floor on μ before evaluating power-law variance functions, so that
+    /// `μ^(p−k)` derivatives stay finite as μ → 0 instead of producing inf/NaN.
+    const VARIANCE_MU_FLOOR: f64 = 1e-10;
+
     /// Bernoulli / binomial variance V(μ) = μ(1−μ).
     #[inline]
     pub fn bernoulli(mu: f64) -> Self {
@@ -5529,7 +5543,7 @@ impl VarianceJet {
     /// Tweedie variance V(μ) = μ^p.
     #[inline]
     pub fn tweedie(mu: f64, p: f64) -> Self {
-        let mu = mu.max(1e-10);
+        let mu = mu.max(Self::VARIANCE_MU_FLOOR);
         Self {
             v: mu.powf(p),
             v1: p * mu.powf(p - 1.0),
@@ -5542,7 +5556,7 @@ impl VarianceJet {
     /// Negative-binomial variance V(μ) = μ + μ² / theta.
     #[inline]
     pub fn negative_binomial(mu: f64, theta: f64) -> Self {
-        let mu = mu.max(1e-10);
+        let mu = mu.max(Self::VARIANCE_MU_FLOOR);
         let inv_theta = if valid_negbin_theta(theta) {
             1.0 / theta
         } else {
