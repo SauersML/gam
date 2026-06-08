@@ -1287,25 +1287,32 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         .map(|transform| transform.apply_transpose(beta_guess_original.as_ref()))
         .unwrap_or_else(|| beta_guess_original.as_ref().clone());
     let initial_beta = if let Some(constraints) = linear_constraints.as_ref() {
-        let current_violation = constraints
-            .a
-            .dot(&initial_beta)
-            .iter()
-            .zip(constraints.b.iter())
-            .map(|(lhs, rhs)| (rhs - lhs).max(0.0))
-            .fold(0.0_f64, f64::max);
-        if current_violation > 1e-8 {
-            // The unconstrained seed violates the shape-constraint cone. Project
-            // it onto the feasible polyhedron (nearest feasible point) so the
-            // seed keeps the data-driven curvature of `initial_beta` and merely
-            // enters the cone. This is essential for homogeneous cones (convex /
-            // concave second-difference constraints, `b = 0`): the min-norm
-            // feasible point there is the cone *vertex* `β = 0` (a flat line),
-            // and P-IRLS launched from the vertex stalls on a non-stationary
-            // face, leaving the fit's success dependent on warm-start cache
-            // state (#873). The min-norm point remains the fallback if the
-            // projection QP cannot certify a feasible solution.
-            active_set::project_point_onto_feasible_cone(&initial_beta, constraints)
+        // Worst per-row *scaled* (geometric) slack of the current seed against the
+        // constraint cone. Negative ⇒ the seed violates a row; ~0 ⇒ the seed sits
+        // ON the boundary (for a homogeneous convex/concave second-difference
+        // cone, `β = 0` — the unconstrained Gaussian seed — sits on EVERY row's
+        // boundary, i.e. the cone vertex). Either way the seed must be pushed
+        // strictly into the interior before P-IRLS starts.
+        let mut min_scaled_slack = f64::INFINITY;
+        for i in 0..constraints.a.nrows() {
+            let norm = constraints.a.row(i).dot(&constraints.a.row(i)).sqrt();
+            let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+            let slack = (constraints.a.row(i).dot(&initial_beta) - constraints.b[i]) * inv;
+            min_scaled_slack = min_scaled_slack.min(slack);
+        }
+        // Push the seed to the nearest STRICTLY-INTERIOR feasible point whenever
+        // any row is tight or violated. A seed on the cone boundary (most acutely
+        // the vertex `β = 0`) hands the inner active-set QP an all-rows-active
+        // working set, where it stalls on a degenerate, non-stationary face — so
+        // the fit silently diverges (or aborts in release) between a cold and a
+        // warm warm-start cache (#873). A strictly-interior seed makes the QP's
+        // initial active set empty; it then adds only the genuinely binding rows
+        // and converges to the certified constrained optimum regardless of cache
+        // state. The projection keeps the data-driven curvature of `initial_beta`
+        // and falls back to the min-norm feasible point only if it cannot certify
+        // a strictly-interior solution.
+        if min_scaled_slack < active_set::interior_seed_margin() {
+            active_set::project_point_strictly_into_feasible_cone(&initial_beta, constraints)
                 .or_else(|| {
                     active_set::feasible_point_for_linear_constraints(
                         constraints,
