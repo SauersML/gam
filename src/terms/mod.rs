@@ -1,11 +1,11 @@
 pub mod analytic_penalties;
-pub mod equivariant_penalty;
 pub mod atom_codes;
 pub mod atom_selection;
 pub mod basis;
-pub(crate) mod closed_form_operator;
+pub mod closed_form_operator;
 pub(crate) mod coefficient_group_resolver;
 pub mod construction;
+pub mod equivariant_penalty;
 pub mod gated_decoder;
 pub mod hull;
 pub mod input_loc_derivatives;

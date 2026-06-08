@@ -1,5 +1,4 @@
 use criterion::{Criterion, criterion_group, criterion_main};
-use gam::solver::gpu::{Device, configure_device};
 use ndarray::{Array1, Array2};
 use std::hint::black_box;
 use std::time::Instant;
@@ -76,7 +75,6 @@ fn bench_reml_gpu(c: &mut Criterion) {
 
     group.bench_function("cuda_logdet_and_rho_gradient_batch32", |b| {
         b.iter_custom(|iters| {
-            configure_device(Device::Cuda);
             let start = Instant::now();
             for _ in 0..iters {
                 let result = gam::solver::gpu::reml_gpu::evidence_derivatives_gpu(

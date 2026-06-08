@@ -1,6 +1,5 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use gam::solver::arrow_schur::{ArrowSchurSystem, ArrowSolveOptions};
-use gam::solver::gpu::{Device, configure_device};
 use ndarray::Array2;
 use std::hint::black_box;
 use std::time::Instant;
@@ -64,7 +63,6 @@ fn bench_arrow_gpu(c: &mut Criterion) {
 
     group.bench_function("cuda_arrow_schur", |b| {
         b.iter_custom(|iters| {
-            configure_device(Device::Cuda);
             let start = Instant::now();
             for _ in 0..iters {
                 let solution = gam::solver::gpu::arrow_schur_gpu::solve_arrow_newton_step_gpu(
