@@ -451,6 +451,22 @@ pub struct SurvivalMarginalSlopeFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
+/// Lower floor applied before taking `ln(λ)` when mapping a smoothing parameter
+/// into the log-λ optimization coordinate. `λ` is non-negative by construction;
+/// flooring at the smallest positive normal `f64` keeps `ln` finite for an
+/// exactly-zero (fully-relaxed) penalty without perturbing any λ above the
+/// denormal range.
+const LOG_LAMBDA_UNDERFLOW_FLOOR: f64 = 1e-300;
+
+/// Inner-PIRLS controls shared by the survival-transformation baseline and
+/// smoothing-coordinate eval closures. The baseline geometry is mildly
+/// nonlinear, so the iteration budget is generous; the convergence/step floors
+/// match the working-model PIRLS contract used throughout the survival path.
+const SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS: usize = 400;
+const SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL: f64 = 1e-6;
+const SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING: usize = 40;
+const SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE: f64 = 1e-12;
+
 pub struct LatentSurvivalFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: LatentSurvivalTermSpec,
@@ -1906,11 +1922,11 @@ fn optimize_survival_transformation_smoothing(
             .set_penalty_lambdas(&lambdas)
             .map_err(|e| e.to_string())?;
         let opts = crate::pirls::WorkingModelPirlsOptions {
-            max_iterations: 400,
-            convergence_tolerance: 1e-6,
+            max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
+            convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
             adaptive_kkt_tolerance: None,
-            max_step_halving: 40,
-            min_step_size: 1e-12,
+            max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
+            min_step_size: SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE,
             firth_bias_reduction: false,
             coefficient_lower_bounds: structural_lower_bounds.cloned(),
             linear_constraints: None,
@@ -2018,7 +2034,7 @@ fn survival_unified_fit_result(
     state: &crate::pirls::WorkingState,
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<UnifiedFitResult, String> {
-    let log_lambdas = lambdas.mapv(|v| v.max(1e-300).ln());
+    let log_lambdas = lambdas.mapv(|v| v.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln());
     let reml_score = survival_working_reml_score(state);
     crate::estimate::validate_all_finite("survival fit beta", beta.iter().copied())?;
     crate::estimate::validate_all_finite("survival fit lambdas", lambdas.iter().copied())?;
@@ -2234,7 +2250,7 @@ fn fit_cause_specific_survival_transformation_custom(
                 .with_precision_label(format!("cause_specific_survival_penalty_{penalty_idx}")),
             );
             nullspace_dims.push(block.nullspace_dim);
-            initial_log_lambdas[penalty_idx] = block.lambda.max(1e-300).ln();
+            initial_log_lambdas[penalty_idx] = block.lambda.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln();
         }
         let beta_start = beta0_flat.slice(s![cause * p..(cause + 1) * p]).to_owned();
         block_specs.push(ParameterBlockSpec {
@@ -2413,7 +2429,7 @@ fn survival_transformation_log_lambdas(
 ) -> Vec<f64> {
     penalty_blocks
         .iter()
-        .map(|block| block.lambda.max(1e-300).ln())
+        .map(|block| block.lambda.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln())
         .collect()
 }
 
@@ -2773,11 +2789,11 @@ fn fit_survival_transformation_model(
                 let (_, _, beta0, structural_lower_bounds, mut model, _) =
                     build_working_model(candidate)?;
                 let opts = crate::pirls::WorkingModelPirlsOptions {
-                    max_iterations: 400,
-                    convergence_tolerance: 1e-6,
+                    max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
+                    convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
                     adaptive_kkt_tolerance: None,
-                    max_step_halving: 40,
-                    min_step_size: 1e-12,
+                    max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
+                    min_step_size: SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE,
                     firth_bias_reduction: false,
                     coefficient_lower_bounds: structural_lower_bounds,
                     linear_constraints: None,
@@ -2846,11 +2862,11 @@ fn fit_survival_transformation_model(
         }
     }
     let opts = crate::pirls::WorkingModelPirlsOptions {
-        max_iterations: 400,
-        convergence_tolerance: 1e-6,
+        max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
+        convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
         adaptive_kkt_tolerance: None,
-        max_step_halving: 40,
-        min_step_size: 1e-12,
+        max_step_halving: SURVIVAL_TRANSFORMATION_PIRLS_MAX_STEP_HALVING,
+        min_step_size: SURVIVAL_TRANSFORMATION_PIRLS_MIN_STEP_SIZE,
         firth_bias_reduction: false,
         coefficient_lower_bounds: structural_lower_bounds,
         linear_constraints: None,
