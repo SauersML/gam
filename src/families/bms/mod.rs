@@ -202,6 +202,24 @@ const AUTO_Z_NORMAL_SKEW_TOL: f64 = 0.10;
 const AUTO_Z_NORMAL_KURT_TOL: f64 = 0.25;
 const AUTO_Z_NORMAL_KS_TOL: f64 = 0.025;
 const AUTO_Z_NORMAL_MAX_ABS: f64 = 8.0;
+/// Inner σ level at which the empirical tail mass of latent z is compared
+/// against the standard normal's theoretical two-sided tail in the auto
+/// normality gate. Chosen well inside `AUTO_Z_NORMAL_MAX_ABS` so a fat inner
+/// tail is caught before any single observation trips the hard `max |z|` bound.
+const AUTO_Z_NORMAL_TAIL_SIGMA_INNER: f64 = 4.0;
+/// Outer σ level for the same tail-mass comparison; catches heavier far-tail
+/// excess that the inner level can miss.
+const AUTO_Z_NORMAL_TAIL_SIGMA_OUTER: f64 = 6.0;
+/// Multiplier applied to the normal's theoretical tail mass before comparison:
+/// the empirical tail may be up to this many times the Gaussian tail at the
+/// same σ before the gate fails, allowing for finite-sample sampling noise.
+const AUTO_Z_NORMAL_TAIL_MASS_SLACK: f64 = 2.0;
+/// Absolute additive floor on the inner-σ tail comparison, so the gate does
+/// not fail on round-off when the Gaussian tail itself is already tiny.
+const AUTO_Z_NORMAL_TAIL_FLOOR_INNER: f64 = 1e-5;
+/// Absolute additive floor on the outer-σ tail comparison; smaller than the
+/// inner floor because the 6σ Gaussian tail is many orders smaller than 4σ.
+const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatentMeasureSpec {
@@ -523,7 +541,7 @@ impl LatentZNormalization {
     pub fn apply(&self, z: &Array1<f64>, context: &str) -> Result<Array1<f64>, String> {
         if !(self.mean.is_finite() && self.sd.is_finite() && self.sd > BMS_VARIANCE_FLOOR) {
             return Err(format!(
-                "{context} requires finite latent z normalization with sd > 1e-12; got mean={} sd={}",
+                "{context} requires finite latent z normalization with sd > {BMS_VARIANCE_FLOOR:e}; got mean={} sd={}",
                 self.mean, self.sd
             ));
         }
@@ -869,11 +887,11 @@ fn latent_z_is_standard_normal_enough(
     let mean_tol = policy.mean_tol_multiplier / effective_n.sqrt();
     let sd_tol = policy.sd_tol_multiplier / (2.0 * (effective_n - 1.0).max(1.0)).sqrt();
     let ks_to_normal = weighted_ks_to_standard_normal(z, weights, weight_sum)?;
-    let tail_mass_4 = weighted_tail_mass(z, weights, weight_sum, 4.0);
-    let tail_mass_6 = weighted_tail_mass(z, weights, weight_sum, 6.0);
+    let tail_mass_4 = weighted_tail_mass(z, weights, weight_sum, AUTO_Z_NORMAL_TAIL_SIGMA_INNER);
+    let tail_mass_6 = weighted_tail_mass(z, weights, weight_sum, AUTO_Z_NORMAL_TAIL_SIGMA_OUTER);
     let max_abs_z = z.iter().fold(0.0_f64, |acc, &zi| acc.max(zi.abs()));
-    let normal_tail_4 = 2.0 * (1.0 - normal_cdf(4.0));
-    let normal_tail_6 = 2.0 * (1.0 - normal_cdf(6.0));
+    let normal_tail_4 = 2.0 * (1.0 - normal_cdf(AUTO_Z_NORMAL_TAIL_SIGMA_INNER));
+    let normal_tail_6 = 2.0 * (1.0 - normal_cdf(AUTO_Z_NORMAL_TAIL_SIGMA_OUTER));
     Ok(mean.abs() <= mean_tol
         && (sd - 1.0).abs() <= sd_tol
         && skew.is_finite()
@@ -882,8 +900,8 @@ fn latent_z_is_standard_normal_enough(
         && excess_kurtosis.abs() <= policy.max_abs_excess_kurtosis.min(AUTO_Z_NORMAL_KURT_TOL)
         && ks_to_normal.is_finite()
         && ks_to_normal <= AUTO_Z_NORMAL_KS_TOL
-        && tail_mass_4 <= 2.0 * normal_tail_4 + 1e-5
-        && tail_mass_6 <= 2.0 * normal_tail_6 + 1e-8
+        && tail_mass_4 <= AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_4 + AUTO_Z_NORMAL_TAIL_FLOOR_INNER
+        && tail_mass_6 <= AUTO_Z_NORMAL_TAIL_MASS_SLACK * normal_tail_6 + AUTO_Z_NORMAL_TAIL_FLOOR_OUTER
         && max_abs_z < AUTO_Z_NORMAL_MAX_ABS)
 }
 
@@ -1004,13 +1022,15 @@ fn build_empirical_z_grid(
         let mut need = bin_weight_target;
         let mut bin_weight = 0.0;
         let mut bin_sum = 0.0;
-        while need > 1e-14 * bin_weight_target && cursor < pairs.len() {
+        while need > EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL * bin_weight_target
+            && cursor < pairs.len()
+        {
             let take = remaining.min(need);
             bin_sum += take * pairs[cursor].0;
             bin_weight += take;
             need -= take;
             remaining -= take;
-            if remaining <= 1e-14 * pairs[cursor].1 {
+            if remaining <= EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL * pairs[cursor].1 {
                 cursor += 1;
                 if cursor < pairs.len() {
                     remaining = pairs[cursor].1;
@@ -1074,6 +1094,12 @@ pub(super) const BMS_AUTO_SUBSAMPLE_PHASE1_BUDGET: usize = 12;
 pub(super) const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 pub(super) const BMS_VARIANCE_FLOOR: f64 = 1e-12;
 pub(super) const BMS_DERIV_TOL: f64 = 1e-8;
+/// Relative tolerance below which a residual weight is treated as exhausted in
+/// the equal-mass empirical-grid compression loop. Used both for the per-bin
+/// "need" remaining (relative to the target bin weight) and for the per-pair
+/// remainder (relative to that pair's weight), so a pair/bin that is filled to
+/// within a few ulps advances the cursor instead of spinning on round-off.
+pub(super) const EMPIRICAL_GRID_WEIGHT_EXHAUSTED_REL_TOL: f64 = 1e-14;
 /// Chunk size for parallel row accumulation (rows per task).
 pub(super) const ROW_CHUNK_SIZE: usize = 1024;
 pub(super) const EXACT_WORK_LOG_MIN_ROWS: usize = 50_000;
