@@ -674,10 +674,15 @@ impl ParametricColumnConditioning {
             inf.reparam_qs = None;
         }
         result.constraint_kkt = None;
-        result.artifacts = FitArtifacts {
-            pirls: None,
-            ..Default::default()
-        };
+        // `result.artifacts.pirls` is a self-consistent geometric bundle in the
+        // PIRLS internal basis (`x_transformed`, `beta_transformed`,
+        // `penalized_hessian_transformed`, and the per-observation
+        // `final_eta`/`finalmu`/`solveworking_response`/weights, all paired in
+        // that one frame). Observation-space quantities derived from it
+        // — η̂_i, leverages a_ii, sandwich SEs — are invariant under the
+        // invertible coefficient-space reparameterization that conditioning
+        // introduces, so the bundle stays correct in its own coordinates and
+        // we keep it instead of wiping `pirls: None`.
         result
     }
 }
