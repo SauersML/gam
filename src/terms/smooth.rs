@@ -13678,7 +13678,11 @@ fn enforce_term_constraint_feasibility(
     // Holding this gate to raw 1e-7 while the in-solver acceptance gate
     // measures geometric 1e-8 is the inconsistency that made well-conditioned
     // clamped fits get rejected after they completed cleanly.
-    let tol = 1e-7;
+    /// Raw (unscaled) constraint-residual tolerance for the post-fit feasibility
+    /// audit; kept loose enough to be consistent with the geometric in-solver
+    /// acceptance gate on non-unit-norm linear-inequality rows (see comment).
+    const CONSTRAINT_FEASIBILITY_RAW_TOL: f64 = 1e-7;
+    let tol = CONSTRAINT_FEASIBILITY_RAW_TOL;
     let smooth_start = design
         .design
         .ncols()
@@ -14158,7 +14162,9 @@ fn require_successful_spatial_optimization_result<T>(
             // worsenings (>1 unit) but admit anything within ~1e-6
             // absolute / 1e-8 relative — meaningful REML gains are
             // orders of magnitude larger.
-            let tol = 1e-6_f64.max(initial_score.abs() * 1e-8);
+            const SCORE_DRIFT_ABS_TOL: f64 = 1e-6;
+            const SCORE_DRIFT_REL_TOL: f64 = 1e-8;
+            let tol = SCORE_DRIFT_ABS_TOL.max(initial_score.abs() * SCORE_DRIFT_REL_TOL);
             if exact_score <= initial_score + tol {
                 Ok(value)
             } else {
