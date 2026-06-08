@@ -11348,7 +11348,17 @@ fn exact_newton_dh_apply<F: CustomFamily + Sync>(
     check_finite: bool,
     v_k: &Array1<f64>,
 ) -> Result<Option<DriftDerivResult>, String> {
-    let mode_response = v_k.mapv(|value| -value);
+    // `v_k` is ALREADY the perturbation direction `δβ` the caller wants the
+    // directional Hessian derivative evaluated along. The `HessianDerivativeProvider`s
+    // (`BorrowedJointDerivProvider`/`OwnedJointDerivProvider`) own the implicit-
+    // function-theorem sign `δβ = −H⁻¹(A_k β̂)` and negate before calling this
+    // closure (matching `exact_newton_d2h_apply` and the owned `_many` closure,
+    // which also pass the direction straight through). Re-negating here would
+    // double-negate `D_β H[δβ]`, flipping the mode-response drift in the outer
+    // LAML trace `½ tr(K · (B_i + D_β H[δβ_i]))` and desynchronising the analytic
+    // outer gradient from its objective for every β-dependent-Hessian exact
+    // family (spatial-adaptive, survival/bernoulli marginal-slope). Pass through.
+    let mode_response = v_k.clone();
     if use_outer_curvature_derivatives {
         let h_rho = family.exact_newton_outer_curvature_directional_derivative_with_specs(
             synced_states,
@@ -11416,12 +11426,12 @@ fn exact_newton_dh_many_closure<'a>(
 ) -> Option<Box<DriftDerivManyFn<'a>>> {
     let workspace = workspace?;
     Some(Box::new(move |directions: &[Array1<f64>]| {
-        let mode_responses = directions
-            .iter()
-            .map(|direction| direction.mapv(|value| -value))
-            .collect::<Vec<_>>();
+        // `directions` are already the perturbation directions `δβ`; the provider
+        // owns the IFT sign and pre-negates (see `exact_newton_dh_apply`). The
+        // owned `_many` counterpart passes them straight through, so this borrowed
+        // path must too — re-negating here double-flips the mode-response drift.
         workspace
-            .directional_derivative_operators(&mode_responses)?
+            .directional_derivative_operators(directions)?
             .into_iter()
             .map(|maybe_operator| {
                 Ok(maybe_operator.map(|operator| {
