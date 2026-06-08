@@ -186,4 +186,23 @@ fn gaussian_reml_fit_is_invariant_to_global_weight_rescaling() {
          positive constant — the change is a smoothing-selection artefact, not \
          a statistical effect (the conditional SEs are already invariant)."
     );
+
+    // ── σ̂²: the profiled scale is the ONLY quantity that may move, and it must
+    //    absorb the whole rescale exactly: φ̂(c·w) = c·φ̂(w). Under inverse-
+    //    variance weights `Var(yᵢ) = φ/wᵢ`, the weighted RSS `Σ wᵢ rᵢ²` scales by
+    //    c, so φ̂ = RSS/(n−edf) → c·φ̂. That leaves `Var(yᵢ) = φ̂/wᵢ = c·φ̂/(c·wᵢ)`
+    //    — and therefore the SEs and every fitted/predicted quantity —
+    //    invariant. This is the dual of the λ̂ → c·λ̂ scaling above. ────────────
+    let phi1 = fit1.dispersion_phi();
+    let phic = fitc.dispersion_phi();
+    let phi_ratio = phic / phi1; // expected: c
+    let phi_ratio_rel = (phi_ratio - c).abs() / c;
+    assert!(
+        phi_ratio_rel < 1e-4,
+        "profiled dispersion did not absorb the weight rescale: \
+         φ̂(w=1)={phi1:.10e}, φ̂(w={c})={phic:.10e}, ratio={phi_ratio:.6e} \
+         (must equal c={c}); under inverse-variance weights only σ̂² may move, \
+         and it must scale by exactly c so Var(yᵢ)=φ̂/wᵢ — and thus the fit and \
+         the SEs — stay invariant."
+    );
 }
