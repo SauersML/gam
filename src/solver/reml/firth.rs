@@ -5,6 +5,13 @@ use crate::types::InverseLink;
 
 const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 
+/// Reciprocal-condition-number floor below which the reduced Fisher information
+/// `I_r` is flagged as near-singular (a diagnostic warning only, not a hard
+/// gate). At `λ_min/λ_max < 1e-10` the SPD assumption on the identifiable
+/// subspace is numerically fragile and the exact pseudodet derivatives may be
+/// ill-conditioned near active-subspace boundaries.
+const FIRTH_REDUCED_FISHER_RCOND_WARN: f64 = 1e-10;
+
 impl<'a> RemlState<'a> {
     pub(crate) fn xt_diag_x_dense_into(
         x: &Array2<f64>,
@@ -573,7 +580,7 @@ impl FirthDenseOperator {
                 .fold(f64::INFINITY, f64::min);
             if min_ev.is_finite() {
                 let rel = min_ev / max_ev;
-                if rel < 1e-10 {
+                if rel < FIRTH_REDUCED_FISHER_RCOND_WARN {
                     log::warn!(
                         "[REML/Firth] reduced Fisher I_r is near-singular (min/max={:.3e}/{:.3e}, rel={:.3e}); exact derivatives may be ill-conditioned near active-subspace boundaries.",
                         min_ev,
