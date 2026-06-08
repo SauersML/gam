@@ -8737,7 +8737,19 @@ fn capped_inner_max_cycles(options: &BlockwiseFitOptions, base_cycles: usize) ->
         }
     }
     if let Some(outer) = options.outer_inner_max_iterations.as_ref() {
-        cap = cap.min(outer.load(Ordering::Relaxed));
+        let outer_cap = outer.load(Ordering::Relaxed);
+        // `0` is the `SEED_SCREENING_UNCAPPED` sentinel: "no cap — use the full
+        // `pirls_config.max_iterations`". The outer bridges store it into this
+        // atomic for the line-search COST probe so the deciding cost is the true
+        // converged-inner envelope objective the analytic gradient differentiates
+        // (gam#787/#808). Honoring it requires the SAME `> 0` guard the screening
+        // branch above uses; an unconditional `cap.min(0)` would collapse the
+        // probe to a single inner cycle (`.max(1)`), guaranteeing a non-converged
+        // inner solve and a spurious `∞` cost — re-introducing the frozen-|g|
+        // outer stall the uncap was meant to remove.
+        if outer_cap > 0 {
+            cap = cap.min(outer_cap);
+        }
     }
     cap.max(1)
 }
