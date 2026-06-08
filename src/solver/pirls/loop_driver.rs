@@ -1295,7 +1295,23 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             .map(|(lhs, rhs)| (rhs - lhs).max(0.0))
             .fold(0.0_f64, f64::max);
         if current_violation > 1e-8 {
-            active_set::feasible_point_for_linear_constraints(constraints, initial_beta.len())
+            // The unconstrained seed violates the shape-constraint cone. Project
+            // it onto the feasible polyhedron (nearest feasible point) so the
+            // seed keeps the data-driven curvature of `initial_beta` and merely
+            // enters the cone. This is essential for homogeneous cones (convex /
+            // concave second-difference constraints, `b = 0`): the min-norm
+            // feasible point there is the cone *vertex* `β = 0` (a flat line),
+            // and P-IRLS launched from the vertex stalls on a non-stationary
+            // face, leaving the fit's success dependent on warm-start cache
+            // state (#873). The min-norm point remains the fallback if the
+            // projection QP cannot certify a feasible solution.
+            active_set::project_point_onto_feasible_cone(&initial_beta, constraints)
+                .or_else(|| {
+                    active_set::feasible_point_for_linear_constraints(
+                        constraints,
+                        initial_beta.len(),
+                    )
+                })
                 .unwrap_or(initial_beta)
         } else {
             initial_beta

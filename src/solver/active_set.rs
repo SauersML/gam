@@ -437,6 +437,53 @@ pub(crate) fn feasible_point_for_linear_constraints(
     }
 }
 
+/// Euclidean projection of `point` onto the feasible polyhedron
+/// `{β : A·β ≥ b}`, i.e. the solution of `min_β ½‖β − point‖² s.t. A·β ≥ b`.
+///
+/// This is the principled feasible cold-start seed for a shape-constrained
+/// (convex/concave/monotone) smooth: it carries the data-driven curvature of
+/// the unconstrained seed `point` and merely nudges it the minimum distance
+/// required to enter the constraint cone. It is qualitatively different from
+/// [`feasible_point_for_linear_constraints`], which returns the *minimum-norm*
+/// feasible point — for a homogeneous cone (`b = 0`, as the second-difference
+/// convexity/concavity constraints are) that minimum-norm point is the cone
+/// **vertex** `β = 0` (a flat line), where every constraint row is tight. P-IRLS
+/// launched from that vertex stalls on a non-stationary face of the cone and
+/// the fit's success then depends on whether a warm-start seed happens to land
+/// it in the right basin (#873). Projecting the unconstrained seed instead
+/// lands a strictly-interior-or-boundary point already near the constrained
+/// optimum, so the fit converges identically from a cold or warm cache.
+///
+/// The projection is the identity-Hessian instance of
+/// [`solve_quadratic_with_linear_constraints`]: with `H = I` and `rhs = point`
+/// the quadratic `½βᵀβ − pointᵀβ = ½‖β − point‖² − ½‖point‖²` is minimized by
+/// the projection. Returns `None` if the constraints are malformed or the
+/// active-set QP fails to certify a feasible solution, so callers can fall back.
+pub(crate) fn project_point_onto_feasible_cone(
+    point: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+) -> Option<Array1<f64>> {
+    let p = point.len();
+    if constraints.a.ncols() != p
+        || constraints.a.nrows() == 0
+        || constraints.b.len() != constraints.a.nrows()
+    {
+        return None;
+    }
+    let identity = Array2::<f64>::eye(p);
+    let (beta, _active) =
+        solve_quadratic_with_linear_constraints(&identity, point, point, constraints, None).ok()?;
+    if beta.len() != p || beta.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let (worst, _row) = max_linear_constraint_violation(&beta, constraints);
+    if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL {
+        Some(beta)
+    } else {
+        None
+    }
+}
+
 /// Worst primal-feasibility violation across all rows of `constraints`,
 /// measured in the per-row-scaled (geometric) coordinate system documented on
 /// [`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`]. A row's slack is divided by ‖a_i‖
