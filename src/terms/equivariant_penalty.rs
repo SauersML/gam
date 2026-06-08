@@ -1,5 +1,22 @@
 use ndarray::{ArrayView1, ArrayView2, ArrayView3, ArrayViewD, IxDyn};
 
+/// Pivot magnitude at or below which a small matrix is declared singular during
+/// Gauss-Jordan inversion.
+const SMALL_MATRIX_SINGULAR_TOL: f64 = 1.0e-12;
+
+/// Floor on the SO(3) rotation angle (axis-angle magnitude) used to normalise
+/// the rotation axis, avoiding a 0/0 at the identity rotation.
+const SO3_ANGLE_FLOOR: f64 = 1.0e-12;
+
+/// Tikhonov ridge added to the diagonal of `WᵀW` before inverting it for the
+/// orthogonal projector `P_perp`, keeping the small solve well-conditioned for
+/// near-rank-deficient atom bases.
+const PROJECTION_WTW_RIDGE: f64 = 1.0e-6;
+
+/// Floor inside the ARD log-bandwidth penalty `½·ln(floor + bw²)`, bounding the
+/// log below as `bw → 0` so the penalty stays finite.
+const ARD_BANDWIDTH_FLOOR: f64 = 1.0e-3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EquivariantGroup {
     SO2,
@@ -79,7 +96,7 @@ fn invert_small_matrix(matrix: &[Vec<f64>], context: &str) -> Result<Vec<Vec<f64
                 pivot_abs = candidate;
             }
         }
-        if pivot_abs <= 1.0e-12 {
+        if pivot_abs <= SMALL_MATRIX_SINGULAR_TOL {
             return Err(format!("{context}: matrix is singular at pivot {col}"));
         }
         if pivot != col {
@@ -146,7 +163,7 @@ fn equivariant_rotation(
             let ox = dynamic_value(&g, &[batch, atom, 0], "SO3 group coordinates")?;
             let oy = dynamic_value(&g, &[batch, atom, 1], "SO3 group coordinates")?;
             let oz = dynamic_value(&g, &[batch, atom, 2], "SO3 group coordinates")?;
-            let angle = (ox * ox + oy * oy + oz * oz).sqrt().max(1.0e-12);
+            let angle = (ox * ox + oy * oy + oz * oz).sqrt().max(SO3_ANGLE_FLOOR);
             let ax = ox / angle;
             let ay = oy / angle;
             let az = oz / angle;
@@ -294,7 +311,7 @@ pub fn equivariant_penalty_value(
                     acc += w[[atom, d, r1]] * w[[atom, d, r2]];
                 }
                 if r1 == r2 {
-                    acc += 1.0e-6;
+                    acc += PROJECTION_WTW_RIDGE;
                 }
                 wtw[r1][r2] = acc;
             }
@@ -346,7 +363,7 @@ pub fn equivariant_penalty_value(
                 if !bandwidth.is_finite() {
                     return Err("log_bandwidth entries must be finite".to_string());
                 }
-                bw_value += 0.5 * (1.0e-3 + bandwidth * bandwidth).ln();
+                bw_value += 0.5 * (ARD_BANDWIDTH_FLOOR + bandwidth * bandwidth).ln();
             }
             value += ard_weight * bw_value;
         }

@@ -10,6 +10,16 @@ use rayon::prelude::*;
 
 use crate::terms::basis::{BasisError, MaternNu};
 
+/// Default row-chunk size for streaming the `(data × centers)` distance scan.
+/// Chosen so a chunk's working set (`chunk × k_centers` f64) stays in L2 for
+/// typical center counts while keeping rayon task granularity coarse.
+const DEFAULT_ROW_CHUNK: usize = 2048;
+
+/// Argument above which `exp(-a)` underflows `f64` to zero. `f64::MIN_POSITIVE`
+/// occurs near `exp(-708)`; full underflow to `0.0` happens by `exp(-745)`, so
+/// the polynomial-times-`exp(-a)` product is exactly zero beyond this point.
+const EXP_NEG_UNDERFLOW: f64 = 745.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaternBasisGradientTarget {
     LogKappa,
@@ -78,7 +88,7 @@ impl StreamingMaternBasisGradientEvaluator {
             length_scale,
             nu,
             metric_weights,
-            chunk_size: chunk_size.unwrap_or(2048).max(1),
+            chunk_size: chunk_size.unwrap_or(DEFAULT_ROW_CHUNK).max(1),
         })
     }
 
@@ -211,7 +221,7 @@ impl StreamingMaternBasisGradientEvaluator {
 }
 
 fn stable_poly_exp(a: f64, coeffs: &[f64]) -> f64 {
-    if a > 745.0 {
+    if a > EXP_NEG_UNDERFLOW {
         return 0.0;
     }
     let mut poly = 0.0;
