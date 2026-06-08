@@ -25661,6 +25661,24 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     outer_result.iterations,
                     outer_result.final_grad_norm_report(),
                 );
+                {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/gam_diag.log")
+                    {
+                        writeln!(
+                            f,
+                            "[DIAG-OUTER] converged=false plan={} iters={} |g|={} rho={:?}",
+                            outer_result.plan_used,
+                            outer_result.iterations,
+                            outer_result.final_grad_norm_report(),
+                            outer_result.rho.as_slice(),
+                        )
+                        .ok();
+                    }
+                }
             }
             (
                 outer_result.rho,
