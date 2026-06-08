@@ -5453,7 +5453,11 @@ impl<'a> RemlState<'a> {
                 kkt.complementarity,
                 kkt.stationarity,
                 stationarity_tol,
-                if kkt.working_set_rank_deficient { ", degenerate face" } else { "" },
+                if kkt.working_set_rank_deficient {
+                    ", degenerate face"
+                } else {
+                    ""
+                },
                 kkt.n_active,
                 kkt.n_constraints,
                 worstrow_msg
