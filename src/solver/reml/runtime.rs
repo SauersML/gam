@@ -22,6 +22,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 const TK_BLOCK_SIZE: usize = 128;
+/// Upper bound on the parallel row-chunk length for the TK accumulation, so a
+/// large `n / (4·threads)` split does not produce chunks so coarse that load
+/// balancing across rayon workers suffers. Pairs with the [`TK_BLOCK_SIZE`]
+/// lower bound. The `4×` oversubscription on the thread count keeps each worker
+/// fed with several chunks for work stealing.
+const TK_CHUNK_MAX_ROWS: usize = 2048;
+const TK_CHUNK_OVERSUBSCRIBE: usize = 4;
 const TK_MAX_OBSERVATIONS: usize = 20_000;
 const TK_MAX_COEFFICIENTS: usize = 2_000;
 const ADAPTIVE_KKT_ETA: f64 = 0.1;
@@ -51,6 +58,25 @@ const S_LINEAR_INIT: f64 = 1.0;
 const S_TRACE_INIT: f64 = 1.0;
 const HGB_SENS_FLOOR: f64 = 1e-6;
 const IFT_QUALITY_HISTORY_CAP: usize = 5;
+
+/// Clamp bound on a linear predictor `eta` so `exp(eta)` cannot overflow f64
+/// (`exp` overflows near `709`). Mirrors the canonical PIRLS `ETA_CLAMP`; kept
+/// as a local const because that one is private to the `pirls` module. Used to
+/// detect out-of-range η rows when materializing the logit fifth-derivative
+/// channel (an out-of-range row contributes zero rather than a garbage jet).
+const ETA_OVERFLOW_CLAMP: f64 = 700.0;
+
+/// Rolling-quality bands and step-cap adjustment factors for the IFT step-cap
+/// controller (`record_ift_prediction_quality`). `quality` is the relative
+/// prediction residual averaged over the last [`IFT_QUALITY_HISTORY_CAP`]
+/// predictions; below `GROW` the linearization is reliably excellent and the cap
+/// is loosened, above `SHRINK` it is tightened, in between it is held. A rolling
+/// quality at or above `FLAT_FALLBACK` flips the predictor to flat warm-start.
+const IFT_QUALITY_GROW_BAND: f64 = 1e-3;
+const IFT_QUALITY_SHRINK_BAND: f64 = 1e-1;
+const IFT_QUALITY_FLAT_FALLBACK_BAND: f64 = 0.5;
+const IFT_STEP_CAP_GROW_FACTOR: f64 = 1.5;
+const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
 
 // KKT residual acceptance tolerances for the active-set inner solver.
 // Primal/dual/complementarity are checked at 1e-7 (matches the inner
@@ -1399,12 +1425,20 @@ pub(crate) fn analytic_penalty_registry_fingerprint(
 }
 
 fn hash_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
+    // Stream the design through fixed-byte row blocks so a biobank-scale design
+    // is never fully materialized just to fingerprint it. Target ~8 MiB of
+    // working set per chunk, with a row-count floor of 1 (always make progress)
+    // and a ceiling so a very narrow design does not request an unbounded chunk.
+    const HASH_CHUNK_TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const HASH_CHUNK_MIN_ROWS: usize = 1;
+    const HASH_CHUNK_MAX_ROWS: usize = 4096;
     let n = design.nrows();
     let p = design.ncols();
     hasher.write_usize(n);
     hasher.write_usize(p);
     let bytes_per_row = p.saturating_mul(std::mem::size_of::<f64>()).max(1);
-    let chunk_rows = ((8 * 1024 * 1024) / bytes_per_row).clamp(1, 4096);
+    let chunk_rows =
+        (HASH_CHUNK_TARGET_BYTES / bytes_per_row).clamp(HASH_CHUNK_MIN_ROWS, HASH_CHUNK_MAX_ROWS);
     for start in (0..n).step_by(chunk_rows) {
         let end = (start + chunk_rows).min(n);
         let chunk = design
@@ -1694,15 +1728,15 @@ impl<'a> RemlState<'a> {
         }
         let rolling_quality =
             state.quality_history.iter().sum::<f64>() / state.quality_history.len() as f64;
-        let next_step_cap = if rolling_quality < 1e-3 {
-            current_cap * 1.5
-        } else if rolling_quality < 1e-1 {
+        let next_step_cap = if rolling_quality < IFT_QUALITY_GROW_BAND {
+            current_cap * IFT_STEP_CAP_GROW_FACTOR
+        } else if rolling_quality < IFT_QUALITY_SHRINK_BAND {
             current_cap
         } else {
-            current_cap * 0.5
+            current_cap * IFT_STEP_CAP_SHRINK_FACTOR
         };
         state.next_step_cap = Some(next_step_cap);
-        state.fallback_next_flat = rolling_quality >= 0.5;
+        state.fallback_next_flat = rolling_quality >= IFT_QUALITY_FLAT_FALLBACK_BAND;
         Some(next_step_cap)
     }
 
@@ -2408,8 +2442,11 @@ impl<'a> RemlState<'a> {
             .and(c_array)
             .and(&x_y)
             .par_for_each(|o, &d, &h, &c, &xy| *o = d * h - c * xy);
-        let chunk_len = (n / (rayon::current_num_threads().saturating_mul(4).max(1)))
-            .clamp(TK_BLOCK_SIZE, 2048);
+        let chunk_len = (n
+            / (rayon::current_num_threads()
+                .saturating_mul(TK_CHUNK_OVERSUBSCRIBE)
+                .max(1)))
+        .clamp(TK_BLOCK_SIZE, TK_CHUNK_MAX_ROWS);
         let chunks = n.div_ceil(chunk_len);
         let mut p_total = (0..chunks)
             .into_par_iter()
@@ -4223,7 +4260,7 @@ impl<'a> RemlState<'a> {
         let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
         f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
             let eta_raw = final_eta[i];
-            let eta_used = eta_raw.clamp(-700.0_f64, 700.0_f64);
+            let eta_used = eta_raw.clamp(-ETA_OVERFLOW_CLAMP, ETA_OVERFLOW_CLAMP);
             if eta_raw != eta_used {
                 *f_o = 0.0;
             } else {
@@ -4918,6 +4955,13 @@ impl<'a> RemlState<'a> {
         let config = super::unified::BarrierConfig::from_constraints(Some(constraints))?;
         // Diagnostic: check curvature significance at a test point near bounds.
         {
+            // Place the diagnostic test point a small slack inside the feasible
+            // side of each bound, and probe the barrier curvature at unit β
+            // magnitude against a 5%-of-curvature significance threshold. These
+            // only shape the emitted trace line, not the fit.
+            const DIAGNOSTIC_BOUND_SLACK: f64 = 0.01;
+            const DIAGNOSTIC_BETA_MAGNITUDE: f64 = 1.0;
+            const DIAGNOSTIC_CURVATURE_REL_THRESHOLD: f64 = 0.05;
             let max_idx = config
                 .constrained_indices
                 .iter()
@@ -4931,9 +4975,13 @@ impl<'a> RemlState<'a> {
                 .zip(config.lower_bounds.iter())
                 .zip(config.bound_signs.iter())
             {
-                beta_test[idx] = (rhs + 0.01) / sign; // slack is 0.01 inside the feasible side
+                beta_test[idx] = (rhs + DIAGNOSTIC_BOUND_SLACK) / sign;
             }
-            let significant = config.barrier_curvature_is_significant(&beta_test, 1.0, 0.05);
+            let significant = config.barrier_curvature_is_significant(
+                &beta_test,
+                DIAGNOSTIC_BETA_MAGNITUDE,
+                DIAGNOSTIC_CURVATURE_REL_THRESHOLD,
+            );
             log::trace!(
                 "[barrier] curvature significant={significant} (tau={:.2e}, n_constrained={})",
                 config.tau,
@@ -5822,12 +5870,16 @@ impl<'a> RemlState<'a> {
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
         // d_rho = ρ_k − ρ_{k-1}; step_rho = ρ_new − ρ_k.
+        // Squared-norm floor (≈1e-12 in ‖Δρ‖) below which the previous ρ-step is
+        // treated as a degenerate/zero-length direction the tangent predictor
+        // cannot extrapolate along.
+        const DEGENERATE_DRHO_NORM_SQ: f64 = 1e-24;
         let d_rho_norm_sq: f64 = cur_rho
             .iter()
             .zip(prev_rho.iter())
             .map(|(c, p)| (c - p) * (c - p))
             .sum();
-        if !d_rho_norm_sq.is_finite() || d_rho_norm_sq <= 1e-24 {
+        if !d_rho_norm_sq.is_finite() || d_rho_norm_sq <= DEGENERATE_DRHO_NORM_SQ {
             // Degenerate Δρ direction (the previous ρ-step had zero or
             // unfinite length). Diagnostic rather than bug: this fires
             // when the outer optimizer landed on a flat region or the
@@ -7075,6 +7127,18 @@ impl<'a> RemlState<'a> {
 /// is available yet (the first PIRLS solve at a fresh surface).
 const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
 
+/// Shared relative-residual tier breakpoints for the warm-start linear
+/// predictors. `r = ‖β_converged − β_predicted‖ / ‖β_converged‖` from the
+/// previous IFT prediction classifies the local linearization quality into
+/// five bands; both `adaptive_ift_max_drho` and `adaptive_tangent_alpha_cap`
+/// key off the SAME breakpoints so their caps move in lockstep (the two
+/// predictors share one quality signal). One step per decade of residual keeps
+/// the policy stable under noise.
+const IFT_RESIDUAL_TIER_EXCELLENT: f64 = 0.01;
+const IFT_RESIDUAL_TIER_VERY_GOOD: f64 = 0.05;
+const IFT_RESIDUAL_TIER_OK: f64 = 0.20;
+const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
+
 /// Adaptive |Δρ| cap for the IFT predictor, driven by the residual of
 /// the previous IFT prediction (see `last_ift_prediction_residual`).
 ///
@@ -7110,10 +7174,10 @@ fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
         return IFT_WARM_START_DEFAULT_MAX_DRHO;
     }
     match r {
-        r if r < 0.01 => 4.0,
-        r if r < 0.05 => 3.0,
-        r if r < 0.20 => 2.0,
-        r if r < 0.50 => 1.0,
+        r if r < IFT_RESIDUAL_TIER_EXCELLENT => 4.0,
+        r if r < IFT_RESIDUAL_TIER_VERY_GOOD => 3.0,
+        r if r < IFT_RESIDUAL_TIER_OK => 2.0,
+        r if r < IFT_RESIDUAL_TIER_MARGINAL => 1.0,
         _ => 0.5,
     }
 }
@@ -7159,10 +7223,10 @@ fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
         return TANGENT_ALPHA_DEFAULT_CAP;
     }
     match r {
-        r if r < 0.01 => 2.0,
-        r if r < 0.05 => 1.75,
-        r if r < 0.20 => 1.5,
-        r if r < 0.50 => 1.0,
+        r if r < IFT_RESIDUAL_TIER_EXCELLENT => 2.0,
+        r if r < IFT_RESIDUAL_TIER_VERY_GOOD => 1.75,
+        r if r < IFT_RESIDUAL_TIER_OK => 1.5,
+        r if r < IFT_RESIDUAL_TIER_MARGINAL => 1.0,
         _ => 0.5,
     }
 }
