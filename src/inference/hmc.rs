@@ -6056,7 +6056,7 @@ pub fn laplace_trustworthiness_from_skewness(
 /// correction expose a ρ-gradient consistent with its own value (Fisher's
 /// identity over the same draws) — required so the outer REML/LAML stays
 /// consistent and smoothing selection is not biased.
-pub trait BlockExcessTarget: Sync {
+pub trait BlockExcessTarget {
     /// Dimension `m` of the block subspace (number of untrustworthy
     /// directions being sampled).
     fn block_dim(&self) -> usize;
