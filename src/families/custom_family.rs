@@ -12421,8 +12421,17 @@ fn update_joint_trust_region_radius(
     }
 }
 
+/// Absolute round-off slack on the augmented-objective accept test in the
+/// coefficient-space backtracking line searches. A trial step is accepted when
+/// its objective is no worse than the incumbent by more than this slack, so a
+/// numerically neutral (converged) step at a flat optimum is not false-rejected
+/// into a trust-radius collapse. Also the absolute floor of the scale-aware
+/// [`joint_objective_roundoff_slack`].
+const LINE_SEARCH_OBJECTIVE_SLACK: f64 = 1e-10;
+
 fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f64 {
-    (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs())).max(1.0e-10)
+    (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs()))
+        .max(LINE_SEARCH_OBJECTIVE_SLACK)
 }
 
 // True iff the line search detected a noise-level realized reduction (i.e.
@@ -15480,7 +15489,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // rejected pre-solver → hard raise, β pinned). Subtract the trial
                 // penalty so the threshold is the NLL the trial must beat.
                 let line_search_options =
-                    coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
+                    coefficient_line_search_options(
+                        options,
+                        old_objective + LINE_SEARCH_OBJECTIVE_SLACK - trial_penalty,
+                    );
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
@@ -17389,7 +17401,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
                 let line_search_options = coefficient_line_search_options(
                     options,
-                    objective_cycle_prev - trial_penalty + 1e-10,
+                    objective_cycle_prev - trial_penalty + LINE_SEARCH_OBJECTIVE_SLACK,
                 );
                 let trial_ll =
                     match family.log_likelihood_only_with_options(&states, &line_search_options) {
@@ -17401,7 +17413,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                     };
                 let trialobjective = -trial_ll + trial_penalty;
-                if trialobjective.is_finite() && trialobjective <= objective_cycle_prev + 1e-10 {
+                if trialobjective.is_finite()
+                    && trialobjective <= objective_cycle_prev + LINE_SEARCH_OBJECTIVE_SLACK
+                {
                     objective_cycle_prev = trialobjective;
                     current_penalty = trial_penalty;
                     accepted = true;
@@ -17553,7 +17567,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 current_penalty - old_block_penalty + trial_block_penalty;
                             let line_search_options = coefficient_line_search_options(
                                 options,
-                                objective_cycle_prev - trial_penalty + 1e-10,
+                                objective_cycle_prev - trial_penalty + LINE_SEARCH_OBJECTIVE_SLACK,
                             );
                             let trial_ll = match family
                                 .log_likelihood_only_with_options(&states, &line_search_options)
@@ -17567,7 +17581,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             };
                             let trialobjective = -trial_ll + trial_penalty;
                             if trialobjective.is_finite()
-                                && trialobjective <= objective_cycle_prev + 1e-10
+                                && trialobjective <= objective_cycle_prev + LINE_SEARCH_OBJECTIVE_SLACK
                             {
                                 objective_cycle_prev = trialobjective;
                                 current_penalty = trial_penalty;
