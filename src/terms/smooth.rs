@@ -9474,42 +9474,40 @@ impl CharbonnierScalarBlockState {
         //   r_k^snr        = sqrt( t_k^credible^2 + eps^2 ),
         //   w_k            = 1 / r_k^snr.
         //
-        // The principled fix is the *posterior expectation* of the MM weight
-        // under the working-Laplace posterior `beta ~ N(beta_hat, Sigma_beta)`,
-        // `Sigma_beta = H^{-1}`. The Charbonnier MM weight is the function
+        // The principled fix evaluates the MM weight at the *credible* (noise-
+        // floor-corrected) squared magnitude rather than the raw point estimate.
+        // Under the working-Laplace posterior `beta ~ N(beta_hat, Sigma_beta)`,
+        // `Sigma_beta = H^{-1}`, the response `t_k = (D0 beta)_k` has posterior
+        // mean `t_hat_k` and variance `V_k = (D0 Sigma_beta D0^T)_kk >= 0`. The
+        // expected squared response is `E[t_k^2] = t_hat_k^2 + V_k`, so the part
+        // of `t_hat_k^2` that exceeds the noise floor `V_k` is the credibly real
+        // squared magnitude
         //
-        //   f(t) = 1 / sqrt(t^2 + eps^2),
+        //   t_k^credible^2 = max( t_hat_k^2 - V_k , 0 ),
+        //   r_k^snr        = sqrt( t_k^credible^2 + eps^2 ),   w_k = 1 / r_k^snr.
         //
-        // and the response `t_k = (D0 beta)_k` is, under the posterior, a normal
-        // variate `t_k ~ N(t_hat_k, V_k)` with `V_k = (D0 Sigma_beta D0^T)_kk`.
-        // The weight that majorizes the *expected* penalty is `E[f(t_k)]`, which
-        // to second order (the only order the diagonal variance proxy supports)
-        // is the delta-method expansion
-        //
-        //   E[f(t_k)] ≈ f(t_hat_k) + ½ f''(t_hat_k) V_k,
-        //   f''(t) = (2 t^2 - eps^2) / (t^2 + eps^2)^{5/2}.
-        //
-        // This is the correct realization of the intent: where the point
-        // estimate is a *credible* edge (t_hat^2 >> V) the curvature `f''` is
-        // small and the weight is essentially `1/|t_hat|` (left un-penalized);
-        // where the large point-estimate magnitude is *noise* (t_hat^2 ~ V) the
-        // positive `½ f'' V` correction *raises* the weight (extra smoothing),
-        // but only by a bounded, signal-scale-aware amount (~2× for pure noise),
-        // never the unbounded `1/eps` saturation a hard `max(t^2 - V, 0)` noise
-        // floor injects — that saturation over-regularizes when `eps` is small
-        // relative to the data and is what made SNR fits *worse* than the
-        // magnitude-only baseline. With `V == 0` everywhere this degrades
-        // exactly to `surrogateweights` (`1/sqrt(t^2 + eps^2)`), so any
-        // covariance-unavailable path is unchanged.
+        // This is the correct realization of the intent. Where the point
+        // estimate is a *credible* edge (t_hat^2 >> V) the credible magnitude is
+        // ~|t_hat| and the weight is essentially `1/|t_hat|` (left un-penalized,
+        // edge preserved). Where the large point-estimate magnitude is *noise*
+        // (t_hat^2 <~ V) the credible magnitude collapses to 0 and the weight
+        // rises to `1/eps` (extra smoothing, noise suppressed). The weight is
+        // monotone non-decreasing in `V`, and is bounded above by `1/eps` — the
+        // *same* ceiling the magnitude-only weight `1/sqrt(t^2 + eps^2)` already
+        // attains at `t = 0` (and clamped by `weight_ceiling`), so it is not an
+        // unbounded blow-up: it only moves the noise-dominated rows to the flat-
+        // response weight they would have had with a credible estimate of zero
+        // curvature. The earlier delta-method form `f + ½ f'' V` was non-monotone
+        // (`f''` flips sign at `2t^2 = eps^2`) and unbounded in `V`, which left
+        // noisy rows under-penalized and was the source of the SNR regression.
+        // With `V == 0` everywhere this degrades exactly to `surrogateweights`
+        // (`1/sqrt(t^2 + eps^2)`), so any covariance-unavailable path is
+        // unchanged.
         let eps2 = self.epsilon * self.epsilon;
         let weight = Array1::from_iter(self.signal.iter().zip(variance.iter()).map(|(&t, &v)| {
-            let t2 = t * t;
-            let r2 = t2 + eps2;
-            let r = r2.sqrt();
-            let f = 1.0 / r;
-            let f_second = (2.0 * t2 - eps2) / (r2 * r2 * r);
-            let expected = f + 0.5 * f_second * v.max(0.0);
-            expected.clamp(weight_floor, weight_ceiling)
+            let credible2 = (t * t - v.max(0.0)).max(0.0);
+            let r = (credible2 + eps2).sqrt();
+            (1.0 / r).clamp(weight_floor, weight_ceiling)
         }));
         let invweight = weight.mapv(|u| 1.0 / u);
         (weight, invweight)
@@ -9728,41 +9726,27 @@ impl CharbonnierGroupedBlockState {
         //
         // A block whose norm is credibly large (g_k^2 >> tr Cov) keeps a small
         // weight (real feature, left un-penalized); a block whose norm is
-        // dominated by posterior variance is pulled toward zero by a *bounded*
-        // up-weighting (noise suppressed) — never the unbounded `1/eps`
-        // saturation a hard `max(g^2 - V, 0)` noise floor injects (which
-        // over-regularizes and made SNR fits worse than magnitude-only).
+        // dominated by posterior variance has its credible norm collapse to 0,
+        // raising the weight to `1/eps` (noise suppressed). The weight is
+        // monotone non-decreasing in `tr Cov` and bounded above by `1/eps` — the
+        // same ceiling the magnitude-only weight already attains at `g = 0`
+        // (and clamped by `weight_ceiling`), so it is not an unbounded blow-up.
         //
-        // As in the scalar case the weight is the posterior expectation of the
-        // grouped MM weight `f(v) = (||v||^2 + eps^2)^{-1/2}` under the
-        // working-Laplace posterior `v_k ~ N(v_hat_k, C_k)` with
-        // `tr(C_k) = variance[k]`. The second-order (delta-method) expectation is
-        //
-        //   E[f(v_k)] ≈ f(v_hat_k) + ½ Σ_ab ∂²_ab f · (C_k)_ab,
-        //   ∂²_ab f = -δ_ab / r^3 + 3 v_a v_b / r^5,   r = sqrt(g^2 + eps^2).
-        //
-        // With only the diagonal trace proxy available we use the isotropic
-        // `C_k ≈ (tr C_k / block_dim) I`, for which `v_hat^T C v_hat ≈
-        // (tr C / block_dim) g^2`, giving the correction
-        //
-        //   ½ ( -tr(C)/r^3 + 3 (tr C / block_dim) g^2 / r^5 ).
-        //
-        // For `block_dim == 1` this reduces *exactly* to the scalar
-        // `½ (2 g^2 - eps^2) V / r^5` form, keeping the two paths consistent.
-        // With `V == 0` it recovers `1/sqrt(g^2 + eps^2)`.
+        // This evaluates the grouped MM weight `f(v) = (||v||^2 + eps^2)^{-1/2}`
+        // at the credible block norm rather than at the raw point estimate. The
+        // expected squared block norm under `v_k ~ N(v_hat_k, C_k)` is
+        // `E[||v_k||^2] = ||v_hat_k||^2 + tr(C_k)`, so the credibly-real squared
+        // norm is `max(g_k^2 - tr(C_k), 0)`, identical in form to the scalar
+        // path (`block_dim == 1` recovers it exactly). The earlier delta-method
+        // correction `½ Σ ∂²f · C` was non-monotone (its sign flips with the
+        // Hessian of `f`) and unbounded in `tr C`, which under-penalized noisy
+        // blocks and was the source of the SNR regression. With `tr C == 0` it
+        // recovers `1/sqrt(g^2 + eps^2)`.
         let eps2 = self.epsilon * self.epsilon;
-        let block_dim = self.signal_blocks.ncols().max(1) as f64;
         let weight = Array1::from_iter(self.norm.iter().zip(variance.iter()).map(|(&g, &v)| {
-            let g2 = g * g;
-            let r2 = g2 + eps2;
-            let r = r2.sqrt();
-            let f = 1.0 / r;
-            let tr_c = v.max(0.0);
-            let r3 = r2 * r;
-            let r5 = r2 * r2 * r;
-            let correction = 0.5 * (-tr_c / r3 + 3.0 * (tr_c / block_dim) * g2 / r5);
-            let expected = f + correction;
-            expected.clamp(weight_floor, weight_ceiling)
+            let credible2 = (g * g - v.max(0.0)).max(0.0);
+            let r = (credible2 + eps2).sqrt();
+            (1.0 / r).clamp(weight_floor, weight_ceiling)
         }));
         let invweight = weight.mapv(|u| 1.0 / u);
         (weight, invweight)
@@ -28184,11 +28168,20 @@ mod tests {
     // ------------------------------------------------------------------
     // Posterior-SNR adaptive weighting: end-to-end objective-quality test.
     //
-    // Truth: a 1D function on a uniform grid with a genuine sharp edge in the
-    // middle (high curvature, *credibly* determined) and two flat regions. The
-    // LEFT flat region is a low-information region whose grid coefficients are
-    // poorly determined: its posterior covariance Sigma_beta = H^{-1} carries
-    // large variance there, and the noisy point-estimate beta_hat shows
+    // Truth: a 1D function on a uniform grid with a genuine sharp, localized
+    // feature in the middle (a tall narrow bump — high curvature, *credibly*
+    // determined) flanked by flat regions that are *zero* (no trend to leak).
+    // Using an isolated feature rather than a monotone step is deliberate: a
+    // step edge would impose a non-zero slope that the curvature penalty smears
+    // linearly into the adjacent flat region, so heavier flat-region smoothing
+    // would *raise* flat MSE (tilted line) regardless of the weighting — a
+    // confound that has nothing to do with the SNR weight. With a bump, the
+    // flat regions have zero true slope and zero true curvature, so suppressing
+    // the spurious noise-curvature there genuinely denoises toward truth.
+    //
+    // The LEFT flat region is a low-information region whose grid coefficients
+    // are poorly determined: its posterior covariance Sigma_beta = H^{-1}
+    // carries large variance there, and the noisy point-estimate beta_hat shows
     // spurious curvature there. The RIGHT flat region is well determined.
     //
     // We drive the *real* adaptive-weight machinery
@@ -28228,20 +28221,24 @@ mod tests {
         let h = 1.0 / (m as f64 - 1.0);
         let xs: Vec<f64> = (0..m).map(|j| j as f64 * h).collect();
 
-        // True function: flat-low on the left, a sharp tanh edge centered at
-        // x = 0.5, flat-high on the right.
+        // True function: zero-flat on both ends with a single tall, narrow
+        // Gaussian bump centered at x = 0.5 (the credible high-curvature
+        // feature). The flat ends carry no trend, so smoothing the spurious
+        // noise-curvature there denoises toward the true zero without any
+        // edge-slope leakage confound.
         let edge_center = 0.5;
-        let edge_sharpness = 28.0;
+        let bump_width = 0.06;
         let amplitude = 2.0;
-        let truth = Array1::from_iter(
-            xs.iter()
-                .map(|&x| 0.5 * amplitude * (1.0 + (edge_sharpness * (x - edge_center)).tanh())),
-        );
+        let truth = Array1::from_iter(xs.iter().map(|&x| {
+            let z = (x - edge_center) / bump_width;
+            amplitude * (-0.5 * z * z).exp()
+        }));
 
-        // Region indices.
-        let left_flat: Vec<usize> = (0..m).filter(|&j| xs[j] <= 0.30).collect();
+        // Region indices. The flat region stops well short of the bump so its
+        // true curvature is ~0; the edge band straddles the bump's steep flanks.
+        let left_flat: Vec<usize> = (0..m).filter(|&j| xs[j] <= 0.25).collect();
         let edge_band: Vec<usize> = (0..m)
-            .filter(|&j| (xs[j] - edge_center).abs() <= 0.07)
+            .filter(|&j| (xs[j] - edge_center).abs() <= 0.10)
             .collect();
         assert!(!left_flat.is_empty() && !edge_band.is_empty());
 
@@ -28349,7 +28346,10 @@ mod tests {
 
         // Penalized least-squares fit on the identity design X = I:
         //   beta = (I + lambda * D2^T diag(w_c) D2)^{-1} y.
-        let lambda = 0.02;
+        // lambda is large enough that the curvature penalty (and hence the
+        // weighting) materially shapes the fit, rather than the identity data
+        // term dominating it.
+        let lambda = 0.5;
         let fit = |w: &Array1<f64>| -> Array1<f64> {
             let k = scalar_operatorhessian(&d2, w); // D2^T diag(w) D2 (symmetric)
             let mut a = Array2::<f64>::eye(m);
