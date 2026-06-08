@@ -16,6 +16,14 @@ use super::*;
 // so there is exactly one cross-block residualisation math implementation in
 // the codebase.
 
+/// Tolerance (in constraint units) by which a structural-monotonicity slack
+/// `A·β − b` may dip below zero before we treat it as a genuine violation
+/// rather than floating-point round-off in the constraint inner products. The
+/// constraint rows are O(1)-scaled deviation differences, so a few ulps of
+/// accumulation sit comfortably under this bound while any real infeasibility
+/// is orders of magnitude larger.
+const MONOTONICITY_SLACK_TOL: f64 = -1e-10;
+
 /// Assembled inputs for the BMS flex-block spec-builder → compile pipeline.
 ///
 /// Produced by [`build_bms_flex_block_context`] and consumed by
@@ -366,7 +374,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                     nullspace_dims: Vec::new(),
                     initial_log_lambdas: Array1::<f64>::zeros(0),
                     initial_beta: None,
-                    gauge_priority: 200,
+                    gauge_priority: super::block_specs::GAUGE_PRIORITY_ANCHOR,
                     jacobian_callback: None,
                     stacked_design: None,
                     stacked_offset: None,
@@ -382,7 +390,7 @@ pub(crate) fn install_compiled_flex_block_into_runtime(
                 nullspace_dims: Vec::new(),
                 initial_log_lambdas: Array1::<f64>::zeros(0),
                 initial_beta: None,
-                gauge_priority: 100,
+                gauge_priority: super::block_specs::GAUGE_PRIORITY_CANDIDATE_FLEX,
                 jacobian_callback: None,
                 stacked_design: None,
                 stacked_offset: None,
@@ -575,7 +583,7 @@ pub(crate) fn validate_monotone_structural_feasible(
             min_row = row;
         }
     }
-    if min_slack < -1e-10 {
+    if min_slack < MONOTONICITY_SLACK_TOL {
         return Err(format!(
             "{label} violates structural monotonicity row {min_row}: slack={min_slack:.3e}; \
              deviation monotonicity must be enforced by analytic linear constraints, not post-update projection"
@@ -610,7 +618,7 @@ fn max_linear_constraint_segment_alpha(
     for row in 0..constraints.a.nrows() {
         let a_row = constraints.a.row(row);
         let slack = a_row.dot(current) - constraints.b[row];
-        if slack < -1e-10 {
+        if slack < MONOTONICITY_SLACK_TOL {
             return Err(format!(
                 "{label} current beta violates structural monotonicity row {row}: slack={slack:.3e}"
             ));

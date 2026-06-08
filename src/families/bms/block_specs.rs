@@ -9,6 +9,39 @@ use faer::Side;
 
 const BMS_PROBIT_SEPARATION_BETA_INF: f64 = 40.0;
 
+// ── Canonical-gauge priority ladder (issue #322) ─────────────────────────────
+//
+// The priority-ordered RRQR in `canonicalize_for_identifiability` presents
+// higher-priority blocks first and routes any shared cross-block alias drop
+// into the lowest-priority block that still spans the aliased direction. The
+// values below form a single ordered ladder so the relationships that the
+// architecture depends on (anchors > parametric surfaces > flex deviations,
+// marginal > logslope, score_warp > link_dev) are expressed once here rather
+// than re-derived from comments at each `gauge_priority:` site. The ladder
+// mirrors the survival marginal-slope entry (time=200 / marginal=150 /
+// logslope=120 / score_warp=80 / link_dev=60).
+
+/// Audit-only anchor blocks sit at the top of the ladder so the candidate
+/// flex block always yields to them in the cross-block identifiability audit.
+pub(super) const GAUGE_PRIORITY_ANCHOR: u8 = 200;
+/// Marginal surface: strictly above the logslope surface so a shared affine
+/// direction is demoted out of logslope, never out of marginal.
+pub(super) const GAUGE_PRIORITY_MARGINAL: u8 = 150;
+/// Logslope surface: one rung below the marginal surface.
+pub(super) const GAUGE_PRIORITY_LOGSLOPE: u8 = 120;
+/// Candidate flex block under audit: below every parametric anchor so the
+/// audit demotes the candidate when it aliases an anchor.
+pub(super) const GAUGE_PRIORITY_CANDIDATE_FLEX: u8 = 100;
+/// `score_warp_dev`: above `link_dev` because in mixed-flex configurations
+/// link_dev is the residualised block and should yield first.
+pub(super) const GAUGE_PRIORITY_SCORE_WARP_DEV: u8 = 80;
+/// Default for any deviation auxiliary block not otherwise named; below the
+/// parametric default so shared affine directions never demote a parametric
+/// block.
+pub(super) const GAUGE_PRIORITY_DEVIATION_DEFAULT: u8 = 70;
+/// `link_dev`: lowest rung, yields first among the flex deviation blocks.
+pub(super) const GAUGE_PRIORITY_LINK_DEV: u8 = 60;
+
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
 // BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is
@@ -1156,7 +1189,7 @@ fn build_marginal_blockspec_bms(
         // the spectral Newton solve refusing to step.  The values mirror
         // the canonical-gauge entry for survival marginal-slope
         // (marginal=150, logslope=120).
-        gauge_priority: 150,
+        gauge_priority: GAUGE_PRIORITY_MARGINAL,
         jacobian_callback: Some(callback),
         stacked_design: None,
         stacked_offset: None,
@@ -1215,7 +1248,7 @@ fn build_logslope_blockspec_bms(
         // value (marginal=150, logslope=120).  See the matching comment
         // on `build_marginal_blockspec_bms` for the failure mode this
         // resolves.
-        gauge_priority: 120,
+        gauge_priority: GAUGE_PRIORITY_LOGSLOPE,
         jacobian_callback: Some(callback),
         stacked_design: None,
         stacked_offset: None,
@@ -1245,17 +1278,18 @@ pub(crate) fn build_deviation_aux_blockspec(
     // (time / marginal / logslope) blocks. The canonical-gauge
     // selector drops shared directions from blocks with lower
     // gauge_priority first; assigning a value below the parametric
-    // default (100) realises that contract automatically.
+    // default (GAUGE_PRIORITY_CANDIDATE_FLEX) realises that contract
+    // automatically.
     spec.gauge_priority = match name {
-        "link_dev" => 60,
+        "link_dev" => GAUGE_PRIORITY_LINK_DEV,
         // score_warp_dev gets a slightly higher priority than link_dev
         // because in mixed-flex configurations (both blocks present)
         // link_dev is the residualised one (orthogonalised against the
         // parametric anchors PLUS the already-prepared score_warp
         // basis at construction time); link_dev should therefore yield
         // first when an alias still survives into the joint design.
-        "score_warp_dev" => 80,
-        _ => 70,
+        "score_warp_dev" => GAUGE_PRIORITY_SCORE_WARP_DEV,
+        _ => GAUGE_PRIORITY_DEVIATION_DEFAULT,
     };
     Ok(spec)
 }
