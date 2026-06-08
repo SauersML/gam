@@ -2191,12 +2191,12 @@ pub enum SphereWahbaKernel {
     },
 }
 
+pub(crate) use polylog::{dilog_unit, trilog_unit};
+pub(crate) use sphere_spectral::sphere_truncated_spectral_derivative_eval;
 pub use sphere_spectral::{
     pseudo_s2_truncated_coefficients, sobolev_s2_truncated_coefficients,
     sphere_truncated_spectral_eval,
 };
-pub(crate) use polylog::{dilog_unit, trilog_unit};
-pub(crate) use sphere_spectral::sphere_truncated_spectral_derivative_eval;
 
 /// Intrinsic S² (sphere) smooth configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4645,75 +4645,71 @@ pub struct ImplicitDesignPsiDerivative {
 /// hyper-directions carry only a flat coordinate index and call
 /// `forward_mul_axis` / `transpose_mul_axis` to expose the corresponding
 /// one-row design derivative on demand.
-#[derive(Debug, Clone)]
 pub struct LatentCoordDesignDerivative {
-    latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
-    basis: LatentCoordDesignDerivativeBasis,
+    provider: Arc<dyn LocalDesignJacobianProvider>,
 }
 
 #[derive(Debug, Clone)]
-enum LatentCoordDesignDerivativeBasis {
-    Radial {
-        centers: Arc<Array2<f64>>,
-        radial_kind: RadialScalarKind,
-        ident_transform: Option<Array2<f64>>,
-        full_ident_transform: Option<Array2<f64>>,
-        n_poly: usize,
-        polynomial_order: Option<DuchonNullspaceOrder>,
-    },
-    Jet {
-        jet: Arc<Array3<f64>>,
-        ident_transform: Option<Array2<f64>>,
-    },
+struct RadialLatentCoordLocalDesignJacobian {
+    latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+    centers: Arc<Array2<f64>>,
+    radial_kind: RadialScalarKind,
+    ident_transform: Option<Array2<f64>>,
+    full_ident_transform: Option<Array2<f64>>,
+    n_poly: usize,
+    polynomial_order: Option<DuchonNullspaceOrder>,
 }
 
-impl LatentCoordDesignDerivativeBasis {
-    fn raw_cols(&self) -> usize {
-        match self {
-            Self::Radial { centers, .. } => centers.nrows(),
-            Self::Jet { jet, .. } => jet.shape()[1],
+#[derive(Debug, Clone)]
+struct JetLatentCoordLocalDesignJacobian {
+    latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
+    jet: Arc<Array3<f64>>,
+    ident_transform: Option<Array2<f64>>,
+}
+
+impl std::fmt::Debug for LatentCoordDesignDerivative {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LatentCoordDesignDerivative")
+            .field("n_data", &self.n_data())
+            .field("latent_dim", &self.latent_dim())
+            .field("n_axes", &self.n_axes())
+            .field("p_out", &self.p_out())
+            .field("provider", &self.provider)
+            .finish()
+    }
+}
+
+impl Clone for LatentCoordDesignDerivative {
+    fn clone(&self) -> Self {
+        Self {
+            provider: Arc::clone(&self.provider),
         }
     }
+}
 
+impl RadialLatentCoordLocalDesignJacobian {
     fn p_constrained(&self) -> usize {
-        match self {
-            Self::Radial {
-                centers,
-                ident_transform,
-                ..
-            } => ident_transform
-                .as_ref()
-                .map_or(centers.nrows(), Array2::ncols),
-            Self::Jet {
-                jet,
-                ident_transform,
-            } => ident_transform
-                .as_ref()
-                .map_or(jet.shape()[1], Array2::ncols),
-        }
+        self.ident_transform
+            .as_ref()
+            .map_or(self.centers.nrows(), Array2::ncols)
     }
 
     fn p_after_pad(&self) -> usize {
-        match self {
-            Self::Radial { n_poly, .. } => self.p_constrained() + *n_poly,
-            Self::Jet { .. } => self.p_constrained(),
-        }
+        self.p_constrained() + self.n_poly
     }
 
     fn p_out(&self) -> usize {
-        match self {
-            Self::Radial {
-                full_ident_transform,
-                ..
-            } => full_ident_transform
-                .as_ref()
-                .map_or(self.p_after_pad(), Array2::ncols),
-            Self::Jet {
-                ident_transform, ..
-            } => ident_transform
-                .as_ref()
-                .map_or(self.raw_cols(), Array2::ncols),
-        }
+        self.full_ident_transform
+            .as_ref()
+            .map_or(self.p_after_pad(), Array2::ncols)
+    }
+}
+
+impl JetLatentCoordLocalDesignJacobian {
+    fn p_out(&self) -> usize {
+        self.ident_transform
+            .as_ref()
+            .map_or(self.jet.shape()[1], Array2::ncols)
     }
 }
 
@@ -4731,7 +4727,7 @@ impl LatentCoordDesignDerivativeBasis {
 ///
 /// This is the close condition for #767: a new coordinate type touches zero
 /// operator-surface code; it provides only its local Jacobian and geometry.
-pub(crate) trait LocalDesignJacobianProvider {
+pub(crate) trait LocalDesignJacobianProvider: Send + Sync + std::fmt::Debug {
     /// Number of data rows `n` the operator spans.
     fn n_data(&self) -> usize;
 
@@ -4740,6 +4736,9 @@ pub(crate) trait LocalDesignJacobianProvider {
 
     /// Number of flat hyper-axes `n · d` (one per (row, coordinate-axis) pair).
     fn n_axes(&self) -> usize;
+
+    /// Number of output-basis columns in each local design-Jacobian row.
+    fn p_out(&self) -> usize;
 
     /// The only per-coordinate payload: the projected local design-Jacobian row
     /// ∂(design row `row`)/∂(coordinate axis `axis`) in output-basis columns.
@@ -4828,6 +4827,12 @@ const IMPLICIT_MATVEC_PAR_THRESHOLD: usize = 10_000;
 const THIN_PLATE_PENALTY_PSI_TILE_ROWS: usize = 32;
 
 impl LatentCoordDesignDerivative {
+    pub(crate) fn from_local_design_jacobian_provider(
+        provider: Arc<dyn LocalDesignJacobianProvider>,
+    ) -> Self {
+        Self { provider }
+    }
+
     pub(crate) fn new_matern(
         latent: Arc<crate::terms::latent_coord::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
@@ -4843,9 +4848,9 @@ impl LatentCoordDesignDerivative {
                 centers.ncols()
             );
         }
-        Ok(Self {
-            latent,
-            basis: LatentCoordDesignDerivativeBasis::Radial {
+        Ok(Self::from_local_design_jacobian_provider(Arc::new(
+            RadialLatentCoordLocalDesignJacobian {
+                latent,
                 centers,
                 radial_kind: RadialScalarKind::Matern { length_scale, nu },
                 ident_transform,
@@ -4853,7 +4858,7 @@ impl LatentCoordDesignDerivative {
                 n_poly: usize::from(include_intercept),
                 polynomial_order: None,
             },
-        })
+        )))
     }
 
     pub(crate) fn new_duchon(
@@ -4898,9 +4903,9 @@ impl LatentCoordDesignDerivative {
         let ident_transform =
             kernel_constraint_nullspace(centers.view(), effective_order, &mut workspace.cache)?;
         let n_poly = polynomial_block_from_order(centers.view(), effective_order).ncols();
-        Ok(Self {
-            latent,
-            basis: LatentCoordDesignDerivativeBasis::Radial {
+        Ok(Self::from_local_design_jacobian_provider(Arc::new(
+            RadialLatentCoordLocalDesignJacobian {
+                latent,
                 centers,
                 radial_kind,
                 ident_transform: Some(ident_transform),
@@ -4908,7 +4913,7 @@ impl LatentCoordDesignDerivative {
                 n_poly,
                 polynomial_order: Some(effective_order),
             },
-        })
+        )))
     }
 
     pub(crate) fn new_sphere(
@@ -5019,77 +5024,53 @@ impl LatentCoordDesignDerivative {
                 jet.shape()[1]
             );
         }
-        Ok(Self {
-            latent,
-            basis: LatentCoordDesignDerivativeBasis::Jet {
+        Ok(Self::from_local_design_jacobian_provider(Arc::new(
+            JetLatentCoordLocalDesignJacobian {
+                latent,
                 jet: Arc::new(jet),
                 ident_transform,
             },
-        })
+        )))
     }
 
     pub(crate) fn n_data(&self) -> usize {
-        self.latent.n_obs()
+        self.provider.n_data()
+    }
+
+    pub(crate) fn latent_dim(&self) -> usize {
+        self.provider.latent_dim()
     }
 
     pub(crate) fn n_axes(&self) -> usize {
-        self.latent.len()
+        self.provider.n_axes()
     }
 
     pub(crate) fn p_out(&self) -> usize {
-        self.basis.p_out()
+        self.provider.p_out()
     }
+}
 
+impl RadialLatentCoordLocalDesignJacobian {
     fn project_and_pad(
         &self,
         raw_knot: &Array1<f64>,
         raw_poly: &Array1<f64>,
     ) -> Result<Array1<f64>, BasisError> {
-        match &self.basis {
-            LatentCoordDesignDerivativeBasis::Radial {
-                ident_transform,
-                full_ident_transform,
-                n_poly,
-                ..
-            } => {
-                let constrained = match ident_transform {
-                    Some(z) => z.t().dot(raw_knot),
-                    None => raw_knot.clone(),
-                };
-                let mut padded = Array1::<f64>::zeros(constrained.len() + *n_poly);
-                padded
-                    .slice_mut(s![..constrained.len()])
-                    .assign(&constrained);
-                if *n_poly > 0 {
-                    padded.slice_mut(s![constrained.len()..]).assign(raw_poly);
-                }
-                Ok(match full_ident_transform {
-                    Some(zf) => zf.t().dot(&padded),
-                    None => padded,
-                })
-            }
-            LatentCoordDesignDerivativeBasis::Jet { .. } => Err(BasisError::InvalidInput(
-                "LatentCoordDesignDerivative::project_and_pad called on Jet basis; \
-                 jet derivatives must route through project_jet"
-                    .to_string(),
-            )),
+        let constrained = match &self.ident_transform {
+            Some(z) => z.t().dot(raw_knot),
+            None => raw_knot.clone(),
+        };
+        let mut padded = Array1::<f64>::zeros(constrained.len() + self.n_poly);
+        padded
+            .slice_mut(s![..constrained.len()])
+            .assign(&constrained);
+        if self.n_poly > 0 {
+            padded.slice_mut(s![constrained.len()..]).assign(raw_poly);
         }
-    }
-
-    fn project_jet(&self, raw_knot: &Array1<f64>) -> Result<Array1<f64>, BasisError> {
-        match &self.basis {
-            LatentCoordDesignDerivativeBasis::Jet {
-                ident_transform, ..
-            } => Ok(match ident_transform {
-                Some(z) => z.t().dot(raw_knot),
-                None => raw_knot.clone(),
-            }),
-            LatentCoordDesignDerivativeBasis::Radial { .. } => Err(BasisError::InvalidInput(
-                "LatentCoordDesignDerivative::project_jet called on Radial basis; \
-                 radial derivatives must route through project_and_pad"
-                    .to_string(),
-            )),
-        }
+        Ok(match &self.full_ident_transform {
+            Some(zf) => zf.t().dot(&padded),
+            None => padded,
+        })
     }
 
     fn kernel_axis_scalar(
@@ -5098,24 +5079,10 @@ impl LatentCoordDesignDerivative {
         center: usize,
         axis: usize,
     ) -> Result<f64, BasisError> {
-        let (centers, radial_kind) = match &self.basis {
-            LatentCoordDesignDerivativeBasis::Radial {
-                centers,
-                radial_kind,
-                ..
-            } => (centers, radial_kind),
-            LatentCoordDesignDerivativeBasis::Jet { .. } => {
-                crate::bail_invalid_basis!(
-                    "LatentCoordDesignDerivative::kernel_axis_scalar called on Jet basis; \
-                     this helper is radial-only"
-                        .to_string(),
-                );
-            }
-        };
         let t_row = self.latent.row(row);
         let mut r2 = 0.0_f64;
         for a in 0..self.latent.latent_dim() {
-            let delta = t_row[a] - centers[[center, a]];
+            let delta = t_row[a] - self.centers[[center, a]];
             r2 += delta * delta;
         }
         let r = r2.sqrt();
@@ -5125,7 +5092,7 @@ impl LatentCoordDesignDerivative {
             // kernel whose q has a finite limit; for kernels where q diverges
             // the value is genuinely indeterminate (0 · ∞) and we must not
             // pretend it is zero. Defer to the kernel's classification.
-            if radial_kind.is_smooth_at_collision() {
+            if self.radial_kind.is_smooth_at_collision() {
                 return Ok(0.0);
             }
             return Err(BasisError::DegenerateAtCollision {
@@ -5136,21 +5103,13 @@ impl LatentCoordDesignDerivative {
                           the design row axis component is undefined",
             });
         }
-        let (_, q, _) = radial_kind.eval_design_triplet(r)?;
-        Ok(q * (t_row[axis] - centers[[center, axis]]))
+        let (_, q, _) = self.radial_kind.eval_design_triplet(r)?;
+        Ok(q * (t_row[axis] - self.centers[[center, axis]]))
     }
 
     fn polynomial_axis_values(&self, row: usize, axis: usize) -> Array1<f64> {
-        let LatentCoordDesignDerivativeBasis::Radial {
-            n_poly,
-            polynomial_order,
-            ..
-        } = &self.basis
-        else {
-            return Array1::<f64>::zeros(0);
-        };
-        let Some(order) = *polynomial_order else {
-            return Array1::<f64>::zeros(*n_poly);
+        let Some(order) = self.polynomial_order else {
+            return Array1::<f64>::zeros(self.n_poly);
         };
         let max_degree = match order {
             DuchonNullspaceOrder::Zero => 0usize,
@@ -5178,7 +5137,42 @@ impl LatentCoordDesignDerivative {
     }
 }
 
+impl JetLatentCoordLocalDesignJacobian {
+    fn project_jet(&self, raw_knot: &Array1<f64>) -> Result<Array1<f64>, BasisError> {
+        Ok(match &self.ident_transform {
+            Some(z) => z.t().dot(raw_knot),
+            None => raw_knot.clone(),
+        })
+    }
+}
+
 impl LocalDesignJacobianProvider for LatentCoordDesignDerivative {
+    fn n_data(&self) -> usize {
+        self.provider.n_data()
+    }
+
+    fn latent_dim(&self) -> usize {
+        self.provider.latent_dim()
+    }
+
+    fn n_axes(&self) -> usize {
+        self.provider.n_axes()
+    }
+
+    fn p_out(&self) -> usize {
+        self.provider.p_out()
+    }
+
+    fn local_design_jacobian_row(
+        &self,
+        row: usize,
+        axis: usize,
+    ) -> Result<Array1<f64>, BasisError> {
+        self.provider.local_design_jacobian_row(row, axis)
+    }
+}
+
+impl LocalDesignJacobianProvider for RadialLatentCoordLocalDesignJacobian {
     fn n_data(&self) -> usize {
         self.latent.n_obs()
     }
@@ -5191,28 +5185,51 @@ impl LocalDesignJacobianProvider for LatentCoordDesignDerivative {
         self.latent.len()
     }
 
+    fn p_out(&self) -> usize {
+        Self::p_out(self)
+    }
+
     fn local_design_jacobian_row(
         &self,
         row: usize,
         axis: usize,
     ) -> Result<Array1<f64>, BasisError> {
-        match &self.basis {
-            LatentCoordDesignDerivativeBasis::Radial { centers, .. } => {
-                let mut raw_knot = Array1::<f64>::zeros(centers.nrows());
-                for center in 0..centers.nrows() {
-                    raw_knot[center] = self.kernel_axis_scalar(row, center, axis)?;
-                }
-                let raw_poly = self.polynomial_axis_values(row, axis);
-                self.project_and_pad(&raw_knot, &raw_poly)
-            }
-            LatentCoordDesignDerivativeBasis::Jet { jet, .. } => {
-                let mut raw_knot = Array1::<f64>::zeros(jet.shape()[1]);
-                for basis_col in 0..jet.shape()[1] {
-                    raw_knot[basis_col] = jet[[row, basis_col, axis]];
-                }
-                self.project_jet(&raw_knot)
-            }
+        let mut raw_knot = Array1::<f64>::zeros(self.centers.nrows());
+        for center in 0..self.centers.nrows() {
+            raw_knot[center] = self.kernel_axis_scalar(row, center, axis)?;
         }
+        let raw_poly = self.polynomial_axis_values(row, axis);
+        self.project_and_pad(&raw_knot, &raw_poly)
+    }
+}
+
+impl LocalDesignJacobianProvider for JetLatentCoordLocalDesignJacobian {
+    fn n_data(&self) -> usize {
+        self.latent.n_obs()
+    }
+
+    fn latent_dim(&self) -> usize {
+        self.latent.latent_dim()
+    }
+
+    fn n_axes(&self) -> usize {
+        self.latent.len()
+    }
+
+    fn p_out(&self) -> usize {
+        Self::p_out(self)
+    }
+
+    fn local_design_jacobian_row(
+        &self,
+        row: usize,
+        axis: usize,
+    ) -> Result<Array1<f64>, BasisError> {
+        let mut raw_knot = Array1::<f64>::zeros(self.jet.shape()[1]);
+        for basis_col in 0..self.jet.shape()[1] {
+            raw_knot[basis_col] = self.jet[[row, basis_col, axis]];
+        }
+        self.project_jet(&raw_knot)
     }
 }
 
