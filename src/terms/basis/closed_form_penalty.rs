@@ -173,8 +173,7 @@ pub(crate) fn stable_hybrid_duchon_radial(
         // The factor of 2 from the t = 1-u² Jacobian, combined with
         // 1/2 from the [-1,1]→[0,1] map, leaves the unit prefactor wi.
         let weight = wi * one_minus_u2_pow * u_pow;
-        let matern_derivs =
-            matern_block_radial_derivatives(d, matern_order, kappa_u, r, max_order);
+        let matern_derivs = matern_block_radial_derivatives(d, matern_order, kappa_u, r, max_order);
         for (k, v) in matern_derivs.iter().enumerate() {
             accum[k].add(weight * v);
         }
@@ -589,13 +588,7 @@ fn duchon_small_chi_riesz_series_radial_derivatives(
     total.iter().map(|acc| acc.sum()).collect()
 }
 
-fn duchon_small_chi_riesz_series_value(
-    d: usize,
-    a: usize,
-    b: usize,
-    kappa: f64,
-    r: f64,
-) -> f64 {
+fn duchon_small_chi_riesz_series_value(d: usize, a: usize, b: usize, kappa: f64, r: f64) -> f64 {
     duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, 0, 0)[0]
 }
 
@@ -618,14 +611,7 @@ fn duchon_small_chi_riesz_series_value(
 ///   partial-fraction decomposition with a = 2m - q, b = 2s.
 ///
 /// Requires a := 2m - q ≥ 1.
-pub fn isotropic_duchon_penalty(
-    q: usize,
-    d: usize,
-    m: usize,
-    s: f64,
-    kappa: f64,
-    r: f64,
-) -> f64 {
+pub fn isotropic_duchon_penalty(q: usize, d: usize, m: usize, s: f64, kappa: f64, r: f64) -> f64 {
     assert!(2 * m >= q + 1, "isotropic_duchon_penalty: need 2m - q ≥ 1");
     assert!(
         s.is_finite() && s >= 0.0,
@@ -851,11 +837,10 @@ pub(crate) fn schoenberg_self_pair_bundle(
         return None;
     }
 
-    let log_base =
-        -half_d * (4.0 * std::f64::consts::PI).ln() + ln_gamma(lambda) + ln_gamma(mu)
-            - ln_gamma(s_total as f64)
-            - ln_gamma(half_d + q as f64)
-            - 2.0 * lambda * kappa.ln();
+    let log_base = -half_d * (4.0 * std::f64::consts::PI).ln() + ln_gamma(lambda) + ln_gamma(mu)
+        - ln_gamma(s_total as f64)
+        - ln_gamma(half_d + q as f64)
+        - 2.0 * lambda * kappa.ln();
     let base = log_base.exp();
     if !base.is_finite() {
         return None;
@@ -918,8 +903,7 @@ fn hybrid_self_pair_radial_derivative_with_kappa_derivs_odd_d(
 
     let length_scale = 1.0 / kappa;
     let coeffs = super::duchon_partial_fraction_coeffs(m, s, kappa);
-    let f =
-        super::duchon_phi_even_derivative_collision(length_scale, m, s, d, &coeffs, q).ok()?;
+    let f = super::duchon_phi_even_derivative_collision(length_scale, m, s, d, &coeffs, q).ok()?;
     if !f.is_finite() {
         return None;
     }
@@ -1305,8 +1289,8 @@ fn riesz_block_radial_derivatives(d: usize, j: f64, r: f64, max_order: usize) ->
     // Non-log case: c · r^p with p = 2j − d (real-valued for fractional
     // j). Successive derivatives multiply by the current exponent and
     // decrement it by 1; with non-integer p we use `powf` throughout.
-    let c = gamma_fn(half_d - j)
-        / (4.0_f64.powf(j) * std::f64::consts::PI.powf(half_d) * gamma_fn(j));
+    let c =
+        gamma_fn(half_d - j) / (4.0_f64.powf(j) * std::f64::consts::PI.powf(half_d) * gamma_fn(j));
     let mut coef = c;
     let mut exp = 2.0 * j - d as f64;
     out.push(coef * r.powf(exp));
@@ -1408,9 +1392,7 @@ pub fn radial_derivatives_of_isotropic_duchon(
     //    expansion. Cancellation is mild for `d ≤ 4m`.
     let b = 2 * s;
     if use_duchon_small_chi_riesz_series(kappa, r) {
-        return duchon_small_chi_riesz_series_radial_derivatives(
-            d, a, b, kappa, r, max_order, 0,
-        );
+        return duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 0);
     }
     if schwinger_radial_is_convergent(d, m) {
         return stable_hybrid_duchon_radial(d, m, s, kappa, r, max_order);
@@ -1926,9 +1908,7 @@ pub fn radial_derivatives_of_isotropic_duchon_kappa_partial(
     let a = 2 * m;
     let b = 2 * s;
     if use_duchon_small_chi_riesz_series(kappa, r) {
-        return duchon_small_chi_riesz_series_radial_derivatives(
-            d, a, b, kappa, r, max_order, 1,
-        );
+        return duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 1);
     }
 
     let kappa_sq = kappa * kappa;
@@ -2000,9 +1980,7 @@ pub fn radial_derivatives_of_isotropic_duchon_kappa_partial2(
     let a = 2 * m;
     let b = 2 * s;
     if use_duchon_small_chi_riesz_series(kappa, r) {
-        return duchon_small_chi_riesz_series_radial_derivatives(
-            d, a, b, kappa, r, max_order, 2,
-        );
+        return duchon_small_chi_riesz_series_radial_derivatives(d, a, b, kappa, r, max_order, 2);
     }
 
     let kappa_sq = kappa * kappa;
@@ -2122,11 +2100,9 @@ fn radial_g_q_partials(
             //   dF5/dR = 2 f'''/R² - 6 f''/R³ + 6 f'/R⁴
             let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6 - 105.0 * fr[2] / r7
                 + 105.0 * fr[1] / r8;
-            let df2 =
-                2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5 - 30.0 * fr[1] / r6;
+            let df2 = 2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5 - 30.0 * fr[1] / r6;
             let df3 = fr[3] / r2 - 3.0 * fr[2] / r3 + 3.0 * fr[1] / r4;
-            let df4 =
-                4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5 - 60.0 * fr[1] / r6;
+            let df4 = 4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5 - 60.0 * fr[1] / r6;
             let df5 = 2.0 * fr[3] / r2 - 6.0 * fr[2] / r3 + 6.0 * fr[1] / r4;
 
             let g_r = u1 * u1 * df1 + s1 * u1 * df2 + s1 * s1 * df3 + u2 * df4 + s2 * df5;
@@ -2220,20 +2196,18 @@ fn radial_g_q_hessian(
             //   = -f'''' u1/R² + 5 f''' u1/R³ - 12 f'' u1/R⁴
             //     - f''' s1/R + 2 f'' s1/R² - 2 f' s1/R³
             //     + 12 f' u1/R⁵
-            let g_rr = -fr[4] * u1 / r2 + 5.0 * fr[3] * u1 / r3
-                - 12.0 * fr[2] * u1 / r4
-                - fr[3] * s1 / r
-                + 2.0 * fr[2] * s1 / r2
-                - 2.0 * fr[1] * s1 / r3
-                + 12.0 * fr[1] * u1 / r5;
+            let g_rr =
+                -fr[4] * u1 / r2 + 5.0 * fr[3] * u1 / r3 - 12.0 * fr[2] * u1 / r4 - fr[3] * s1 / r
+                    + 2.0 * fr[2] * s1 / r2
+                    - 2.0 * fr[1] * s1 / r3
+                    + 12.0 * fr[1] * u1 / r5;
             // g_R_s1 = ∂g_R/∂s1 = -f''/R + f'/R²
             let g_r_s1 = -fr[2] / r + fr[1] / r2;
             // g_R_u1 = ∂g_R/∂u1 = -f'''/R² + 3 f''/R³ - 3 f'/R⁴
             let g_r_u1 = -fr[3] / r2 + 3.0 * fr[2] / r3 - 3.0 * fr[1] / r4;
             // q=1 is linear in s_1, u_1; cross/diagonal partials vanish.
             (
-                g_rr, g_r_s1, 0.0, g_r_u1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                0.0,
+                g_rr, g_r_s1, 0.0, g_r_u1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
             )
         }
         2 => {
@@ -2249,11 +2223,9 @@ fn radial_g_q_hessian(
 
             let df1 = fr[5] / r4 - 10.0 * fr[4] / r5 + 45.0 * fr[3] / r6 - 105.0 * fr[2] / r7
                 + 105.0 * fr[1] / r8;
-            let df2 =
-                2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5 - 30.0 * fr[1] / r6;
+            let df2 = 2.0 * fr[4] / r3 - 12.0 * fr[3] / r4 + 30.0 * fr[2] / r5 - 30.0 * fr[1] / r6;
             let df3 = fr[3] / r2 - 3.0 * fr[2] / r3 + 3.0 * fr[1] / r4;
-            let df4 =
-                4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5 - 60.0 * fr[1] / r6;
+            let df4 = 4.0 * fr[4] / r3 - 24.0 * fr[3] / r4 + 60.0 * fr[2] / r5 - 60.0 * fr[1] / r6;
             let df5 = 2.0 * fr[3] / r2 - 6.0 * fr[2] / r3 + 6.0 * fr[1] / r4;
 
             // d²F_i/dR² (derived in task #24 phase 3 notes):
@@ -2272,8 +2244,7 @@ fn radial_g_q_hessian(
             let d2f4 = 4.0 * fr[5] / r3 - 36.0 * fr[4] / r4 + 156.0 * fr[3] / r5
                 - 360.0 * fr[2] / r6
                 + 360.0 * fr[1] / r7;
-            let d2f5 =
-                2.0 * fr[4] / r2 - 10.0 * fr[3] / r3 + 24.0 * fr[2] / r4 - 24.0 * fr[1] / r5;
+            let d2f5 = 2.0 * fr[4] / r2 - 10.0 * fr[3] / r3 + 24.0 * fr[2] / r4 - 24.0 * fr[1] / r5;
 
             // g_RR = u_1²·d²F1 + s_1·u_1·d²F2 + s_1²·d²F3 + u_2·d²F4 + s_2·d²F5
             let g_rr = u1 * u1 * d2f1 + s1 * u1 * d2f2 + s1 * s1 * d2f3 + u2 * d2f4 + s2 * d2f5;
@@ -2427,8 +2398,7 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     let max_order_h = (2 * q + 2).min(6);
     let (big_r, s1, s2, u1, u2, dr_de, ds1_de, ds2_de, du1_de, du2_de) =
         aniso_invariants_eta_jacobian_with_powers(eta, r, powers);
-    let fr =
-        radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h);
+    let fr = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h);
     let (g, g_r, g_s1, g_s2, g_u1, g_u2) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &fr);
     let big_j = eta.iter().sum::<f64>().exp();
     let value = big_j * g;
@@ -2474,9 +2444,8 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
     // `radial_g_q_partials` directly on the second-κ-partial table.
     let d2_kappa = if s != 0 && kappa != 0.0 {
         let max_order = 2 * q + 1;
-        let ddfr = radial_derivatives_of_isotropic_duchon_kappa_partial2(
-            d, m, s, kappa, big_r, max_order,
-        );
+        let ddfr =
+            radial_derivatives_of_isotropic_duchon_kappa_partial2(d, m, s, kappa, big_r, max_order);
         let (ddg, _, _, _, _, _) = radial_g_q_partials(q, big_r, s1, s2, u1, u2, &ddfr);
         big_j * ddg
     } else {

@@ -9819,18 +9819,12 @@ impl CharbonnierGroupedBlockState {
         direction2_blocks: &Array2<f64>,
     ) -> Vec<Array2<f64>> {
         let mut out = Vec::with_capacity(self.signal_blocks.nrows());
-        for ((k, v), (a, b)) in self
-            .signal_blocks
-            .rows()
-            .into_iter()
-            .enumerate()
-            .zip(
-                direction1_blocks
-                    .rows()
-                    .into_iter()
-                    .zip(direction2_blocks.rows().into_iter()),
-            )
-        {
+        for ((k, v), (a, b)) in self.signal_blocks.rows().into_iter().enumerate().zip(
+            direction1_blocks
+                .rows()
+                .into_iter()
+                .zip(direction2_blocks.rows().into_iter()),
+        ) {
             let dim = v.len();
             let dot = |x: ndarray::ArrayView1<'_, f64>, y: ndarray::ArrayView1<'_, f64>| {
                 x.iter().zip(y.iter()).map(|(p, q)| p * q).sum::<f64>()
@@ -13752,12 +13746,14 @@ fn symmetric_positive_definite_inverse_or_pseudo(
         return Ok(Array2::<f64>::zeros((0, 0)));
     }
     let symmetric = (precision + &precision.t().to_owned()) * 0.5;
-    let (evals, evecs) = symmetric
-        .eigh(faer::Side::Lower)
-        .map_err(|e| EstimationError::InvalidInput(format!("posterior precision eigendecomposition failed: {e}")))?;
+    let (evals, evecs) = symmetric.eigh(faer::Side::Lower).map_err(|e| {
+        EstimationError::InvalidInput(format!(
+            "posterior precision eigendecomposition failed: {e}"
+        ))
+    })?;
     let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let tol = (10.0 * f64::EPSILON * (p as f64) * (p as f64) * max_abs_eval)
-        .max(100.0 * f64::EPSILON);
+    let tol =
+        (10.0 * f64::EPSILON * (p as f64) * (p as f64) * max_abs_eval).max(100.0 * f64::EPSILON);
     if let Some(&min_eval) = evals
         .iter()
         .filter(|&&ev| ev < -tol)
@@ -14019,7 +14015,9 @@ fn fit_bounded_term_collection_with_design(
     // penalised model is a flat posterior direction, not something to ridge
     // away), matching the strict-pseudo-Laplace covariance contract (gam#748).
     let beta_covariance = if options.compute_inference {
-        Some(symmetric_positive_definite_inverse_or_pseudo(&penalized_hessian)?)
+        Some(symmetric_positive_definite_inverse_or_pseudo(
+            &penalized_hessian,
+        )?)
     } else {
         None
     };
@@ -30282,9 +30280,14 @@ mod tests {
             max,
         }];
         let n_draws = 40_000usize;
-        let draws =
-            sample_bounded_latent_posterior_internal(&beta_user, &user_hessian, &bounded_columns, n_draws, 7607760)
-                .expect("bounded latent sampler");
+        let draws = sample_bounded_latent_posterior_internal(
+            &beta_user,
+            &user_hessian,
+            &bounded_columns,
+            n_draws,
+            7607760,
+        )
+        .expect("bounded latent sampler");
         assert_eq!(draws.dim(), (n_draws, 2));
 
         // (1) Bounded column strictly inside (min, max).
@@ -30334,14 +30337,17 @@ mod tests {
         let rel = |emp: f64, truth: f64| (emp - truth).abs() / truth.abs().max(1e-12);
         assert!(
             rel(var0, cov_latent[[0, 0]]) < 0.05,
-            "latent var0 {var0} vs {} ", cov_latent[[0, 0]]
+            "latent var0 {var0} vs {} ",
+            cov_latent[[0, 0]]
         );
         assert!(
             rel(var1, cov_latent[[1, 1]]) < 0.05,
-            "latent var1 {var1} vs {}", cov_latent[[1, 1]]
+            "latent var1 {var1} vs {}",
+            cov_latent[[1, 1]]
         );
         let corr_emp = cov01 / (var0.sqrt() * var1.sqrt());
-        let corr_truth = cov_latent[[0, 1]] / (cov_latent[[0, 0]].sqrt() * cov_latent[[1, 1]].sqrt());
+        let corr_truth =
+            cov_latent[[0, 1]] / (cov_latent[[0, 0]].sqrt() * cov_latent[[1, 1]].sqrt());
         assert!(
             corr_truth.abs() > 0.2,
             "fixture must carry real correlation, got {corr_truth}"

@@ -12565,7 +12565,11 @@ fn latent_periodic_seed_start(
         let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
         for a in 0..latent_dim {
             for n in 0..n_obs {
-                let frac = if n_obs > 0 { n as f64 / n_obs as f64 } else { 0.0 };
+                let frac = if n_obs > 0 {
+                    n as f64 / n_obs as f64
+                } else {
+                    0.0
+                };
                 start[n * latent_dim + a] = wrap_to_pi(frac * TAU);
             }
         }
@@ -12615,7 +12619,11 @@ fn latent_periodic_seed_start(
         }
         if !(hi - lo > 1.0e-6) {
             for n in 0..n_obs {
-                let frac = if n_obs > 0 { n as f64 / n_obs as f64 } else { 0.0 };
+                let frac = if n_obs > 0 {
+                    n as f64 / n_obs as f64
+                } else {
+                    0.0
+                };
                 start[n * latent_dim + axis] = wrap_to_pi(frac * TAU);
             }
         }
@@ -29283,9 +29291,9 @@ mod batch_tests {
 
         // (a) Not collapsed: the recovered angles keep a large spread.
         let mean = recovered.iter().sum::<f64>() / recovered.len() as f64;
-        let rec_std =
-            (recovered.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / recovered.len() as f64)
-                .sqrt();
+        let rec_std = (recovered.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+            / recovered.len() as f64)
+            .sqrt();
         assert!(
             rec_std > 0.3,
             "circle latent collapsed (std={rec_std}); expected a spread circular latent"

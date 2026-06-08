@@ -47,7 +47,10 @@ fn in_sample_deviance(fit: &FitResult) -> f64 {
 
 /// The documented `+ linkwiggle(...)` model must fit (never abort) with a finite
 /// deviance no worse than the baseline it contains as a large-smoothing limit.
-fn assert_wiggle_no_worse_than_baseline(formula_base: &str, ds: &gam::inference::data::EncodedDataset) {
+fn assert_wiggle_no_worse_than_baseline(
+    formula_base: &str,
+    ds: &gam::inference::data::EncodedDataset,
+) {
     let cfg = binomial_cfg();
 
     let baseline = fit_from_formula(formula_base, ds, &cfg)
@@ -60,7 +63,9 @@ fn assert_wiggle_no_worse_than_baseline(formula_base: &str, ds: &gam::inference:
 
     let wiggle_formula = format!("{formula_base} + linkwiggle(internal_knots=4)");
     let wiggle = fit_from_formula(&wiggle_formula, ds, &cfg).unwrap_or_else(|e| {
-        panic!("documented flexible(probit) + linkwiggle(...) model must fit ({wiggle_formula}): {e:?}")
+        panic!(
+            "documented flexible(probit) + linkwiggle(...) model must fit ({wiggle_formula}): {e:?}"
+        )
     });
     let dev_wiggle = in_sample_deviance(&wiggle);
     assert!(

@@ -7393,7 +7393,8 @@ impl GaussianLocationScaleFamily {
         let ximuv = xmu.dot(d_betav_flat.slice(s![0..pmu]));
         let xi_lsv = x_ls.dot(d_betav_flat.slice(s![pmu..pmu + p_ls]));
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let second = gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
+        let second =
+            gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximuv, &xi_lsv);
         let d2hmumu = second.0;
         let d2h_ls_ls = second.2;
         // Fisher cross block E[H_{μ,ls}] ≡ 0 (μ ⊥ σ; #684), so its second

@@ -7372,9 +7372,8 @@ mod tests {
         ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignMatrix,
         DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
         PsdWeightsView, ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator,
-        SignedWeightsView, SparseDesignMatrix, dense_matvec,
-        dense_operator_to_dense_by_chunks, dense_transpose_matvec,
-        dense_transpose_weighted_response, streaming_sparse_csc_xt_diag_x,
+        SignedWeightsView, SparseDesignMatrix, dense_matvec, dense_operator_to_dense_by_chunks,
+        dense_transpose_matvec, dense_transpose_weighted_response, streaming_sparse_csc_xt_diag_x,
         weighted_crossprod_dense_view,
     };
     use crate::linalg::matrix::LinearOperator;

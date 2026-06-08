@@ -26783,7 +26783,10 @@ mod tests {
         // guard; the largest feasible α satisfies -α + 0.2 = 1e-4, i.e. α ≈ 0.1999,
         // and the shared `feasible_step_fraction` applies a 0.995 boundary backoff
         // so the post-step iterate stays *strictly* interior (slack > 0).
-        assert!(alpha > 0.0 && alpha < 1.0, "expected an interior step, got {alpha}");
+        assert!(
+            alpha > 0.0 && alpha < 1.0,
+            "expected an interior step, got {alpha}"
+        );
         let feasible = &states[0].beta + &(array![-1.0, 0.0] * alpha);
         let slack = family
             .time_linear_constraints
@@ -26797,7 +26800,10 @@ mod tests {
                 .as_ref()
                 .expect("constraints")
                 .b[0];
-        assert!(slack > 0.0, "boundary-backed-off step must stay strictly interior; slack={slack}");
+        assert!(
+            slack > 0.0,
+            "boundary-backed-off step must stay strictly interior; slack={slack}"
+        );
     }
 
     #[test]

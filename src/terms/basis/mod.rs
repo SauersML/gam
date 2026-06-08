@@ -31333,7 +31333,8 @@ mod tests {
             );
             // The resolver never weakens the requested null-space order.
             assert!(
-                duchon_p_from_nullspace_order(nullspace) >= duchon_p_from_nullspace_order(requested),
+                duchon_p_from_nullspace_order(nullspace)
+                    >= duchon_p_from_nullspace_order(requested),
                 "dim={dim}: resolver decreased the requested null-space order"
             );
             // And the concrete kernel-order validator accepts the resolved pair.
