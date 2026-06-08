@@ -473,6 +473,14 @@ struct SharedData {
     weights: Arc<Array1<f64>>,
     /// MAP estimate (mode) μ [dim]
     mode: Arc<Array1<f64>>,
+    /// Fixed additive offset on the linear predictor: η = Xβ + offset
+    /// [n_samples]. `None` when the model was fit without an offset (the common
+    /// case), avoiding a per-step O(n) add of zeros. The offset shifts η only —
+    /// it is constant in β, so ∂η/∂β = X is unchanged and no gradient,
+    /// Hessian, or penalty term is affected. Dropping it (the historical
+    /// behaviour) silently sampled the wrong posterior for any `--offset-column`
+    /// fit (#882).
+    offset: Option<Arc<Array1<f64>>>,
     /// Auxiliary log-link family parameter: Gamma shape, Tweedie power, or NB theta.
     gamma_shape: f64,
     /// Dispersion parameter φ (Gaussian: σ²; Gamma: 1/shape; `Known(1.0)` for
@@ -747,6 +755,7 @@ impl NutsPosterior {
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
             mode: Arc::new(mode_owned),
+            offset: None,
             gamma_shape,
             dispersion,
             n_samples,
@@ -766,6 +775,36 @@ impl NutsPosterior {
         })
     }
 
+    /// Attach a fixed additive offset to the linear predictor: η = Xβ + offset.
+    ///
+    /// The offset is constant in β, so the whitening geometry (`chol`), penalty
+    /// operators, and stored Hessian are all unchanged — only η (and hence the
+    /// per-observation working residual / mean) shifts. The fitted `mode` and
+    /// `hessian` handed to [`Self::new`] already correspond to the offset-trained
+    /// fit, so this only needs to restore the offset to the likelihood
+    /// evaluation. Returns an error if the offset length disagrees with the data
+    /// or carries non-finite entries.
+    fn with_offset(mut self, offset: ArrayView1<f64>) -> Result<Self, String> {
+        if offset.len() != self.data.n_samples {
+            return Err(HmcError::DimensionMismatch {
+                reason: format!(
+                    "NUTS offset length {} does not match {} observations",
+                    offset.len(),
+                    self.data.n_samples
+                ),
+            }
+            .into());
+        }
+        if !offset.iter().all(|v| v.is_finite()) {
+            return Err(HmcError::NonFiniteState {
+                reason: "NUTS offset contains NaN or Inf values".to_string(),
+            }
+            .into());
+        }
+        self.data.offset = Some(Arc::new(offset.to_owned()));
+        Ok(self)
+    }
+
     fn compute_logp_and_grad_nd_into(
         &self,
         z: &Array1<f64>,
@@ -776,8 +815,11 @@ impl NutsPosterior {
         // β = μ + L @ z
         let beta = self.data.mode.as_ref() + &self.chol.dot(z);
 
-        // === Step 2: Compute η = X @ β ===
-        let eta = crate::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
+        // === Step 2: Compute η = X @ β (+ offset) ===
+        let mut eta = crate::faer_ndarray::fast_av(self.data.x.as_ref(), &beta);
+        if let Some(offset) = self.data.offset.as_ref() {
+            eta += offset.as_ref();
+        }
 
         // === Step 3: Compute log-likelihood and gradient ===
         let (ll, mut grad_ll_beta) = self.family_logp_and_grad_into(&eta, residual);
@@ -2084,6 +2126,7 @@ mod tests {
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             mode: Arc::new(Array1::zeros(1)),
+            offset: None,
             gamma_shape: shape,
             dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: x.nrows(),
@@ -2275,6 +2318,7 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights.clone()),
             mode: Arc::new(Array1::zeros(x.ncols())),
+            offset: None,
             gamma_shape: 1.0,
             dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: x.nrows(),
@@ -2347,6 +2391,7 @@ mod tests {
                 gamma_shape: None,
                 dispersion: crate::solver::estimate::Dispersion::Known(1.0),
                 firth_bias_reduction: false,
+                offset: None,
             }),
             &cfg,
         );
@@ -2388,6 +2433,7 @@ mod tests {
                 gamma_shape: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
                 firth_bias_reduction: false,
+                offset: None,
             }),
             &cfg,
         )
@@ -2427,6 +2473,7 @@ mod tests {
                 gamma_shape: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
                 firth_bias_reduction: false,
+                offset: None,
             }),
             &cfg,
         ) {
@@ -2471,6 +2518,7 @@ mod tests {
                 gamma_shape: None,
                 dispersion: crate::estimate::Dispersion::Known(1.0),
                 firth_bias_reduction: true,
+                offset: None,
             }),
             &cfg,
         ) {
@@ -2513,6 +2561,7 @@ mod tests {
             1.0,
             crate::estimate::Dispersion::Known(1.0),
             false,
+            None,
             &cfg,
         )
         .expect_err("invalid target_accept should be rejected before sampling");
@@ -2558,6 +2607,7 @@ mod tests {
                 1.0,
                 crate::estimate::Dispersion::Known(1.0),
                 false,
+                None,
                 &cfg,
             )
             .expect_err("too-few samples must be rejected before sampling");
@@ -2690,6 +2740,7 @@ mod tests {
             1.0,
             crate::estimate::Dispersion::Known(1.0),
             false,
+            None,
             &zero_chain_cfg,
         )
         .expect_err("zero chains must be rejected before sampling");
@@ -2716,6 +2767,7 @@ mod tests {
             1.0,
             crate::estimate::Dispersion::Known(1.0),
             false,
+            None,
             &single_chain_cfg,
         )
         .expect("a single chain is a supported configuration and must return draws");
@@ -2901,6 +2953,7 @@ mod tests {
             y: Arc::new(y),
             weights: Arc::new(weights),
             mode: Arc::new(Array1::zeros(1)),
+            offset: None,
             gamma_shape: 1.0,
             dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: 2,
@@ -3066,6 +3119,7 @@ mod tests {
             y: Arc::new(array![1.0, 0.0]),
             weights: Arc::new(array![1.0, 1.0]),
             mode: Arc::new(Array1::zeros(1)),
+            offset: None,
             gamma_shape: 1.0,
             dispersion: crate::estimate::Dispersion::Known(1.0),
             n_samples: 2,
@@ -4433,6 +4487,7 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 /// * `nuts_family` - Family for log-likelihood computation
 /// * `firth_bias_reduction` - Whether Firth bias reduction was used in training
 /// * `config` - NUTS configuration
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_nuts_sampling(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,
@@ -4444,6 +4499,7 @@ pub(crate) fn run_nuts_sampling(
     gamma_shape: f64,
     dispersion: crate::solver::estimate::Dispersion,
     firth_bias_reduction: bool,
+    offset: Option<ArrayView1<f64>>,
     config: &NutsConfig,
 ) -> Result<NutsResult, String> {
     validate_firth_support(nuts_family, firth_bias_reduction).map_err(String::from)?;
@@ -4469,6 +4525,10 @@ pub(crate) fn run_nuts_sampling(
         dispersion,
         firth_bias_reduction,
     )?;
+    let target = match offset {
+        Some(offset) => target.with_offset(offset)?,
+        None => target,
+    };
 
     // Get Cholesky factor for un-whitening samples later
     let chol = target.chol().clone();
@@ -4725,6 +4785,11 @@ pub struct GlmFlatInputs<'a> {
     /// See `inference::dispersion_cov` for the ownership invariants.
     pub dispersion: crate::solver::estimate::Dispersion,
     pub firth_bias_reduction: bool,
+    /// Fixed additive offset on the linear predictor (η = Xβ + offset), or
+    /// `None` for an offset-free fit. Carried so posterior sampling targets the
+    /// same η the model was fit and predicts on; omitting it sampled the wrong
+    /// posterior for any `--offset-column` model (#882).
+    pub offset: Option<ArrayView1<'a, f64>>,
 }
 
 /// Flat survival inputs for engine-facing HMC APIs.
@@ -4822,6 +4887,7 @@ pub fn run_nuts_sampling_flattened_family(
             1.0,
             glm.dispersion,
             glm.firth_bias_reduction,
+            glm.offset,
             config,
         ),
         (
@@ -4831,7 +4897,14 @@ pub fn run_nuts_sampling_flattened_family(
         ) => {
             // Auto-select PG Gibbs when assumptions hold; otherwise fall back to NUTS.
             // This gives gradient-free posterior draws for standard Bernoulli logit GAMs.
-            if !glm.firth_bias_reduction && glm.weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10) {
+            // The Pólya-Gamma augmentation here assumes η = Xβ (no offset); an
+            // offset model routes to NUTS, which carries the offset through
+            // `glm.offset` (#882). PG-with-offset is a valid but separate scheme
+            // we deliberately do not duplicate.
+            if !glm.firth_bias_reduction
+                && glm.offset.is_none()
+                && glm.weights.iter().all(|w| (*w - 1.0).abs() <= 1e-10)
+            {
                 run_logit_polya_gamma_gibbs(
                     glm.x,
                     glm.y,
@@ -4852,6 +4925,7 @@ pub fn run_nuts_sampling_flattened_family(
                     1.0,
                     glm.dispersion,
                     glm.firth_bias_reduction,
+                    glm.offset,
                     config,
                 )
             }
@@ -4871,6 +4945,7 @@ pub fn run_nuts_sampling_flattened_family(
             1.0,
             glm.dispersion,
             glm.firth_bias_reduction,
+            glm.offset,
             config,
         ),
         (
@@ -4888,6 +4963,7 @@ pub fn run_nuts_sampling_flattened_family(
             1.0,
             glm.dispersion,
             glm.firth_bias_reduction,
+            glm.offset,
             config,
         ),
         (
@@ -4905,6 +4981,7 @@ pub fn run_nuts_sampling_flattened_family(
             1.0,
             glm.dispersion,
             glm.firth_bias_reduction,
+            glm.offset,
             config,
         ),
         (ResponseFamily::Binomial, InverseLink::Mixture(_), FamilyNutsInputs::Glm(_)) => Err(
@@ -4963,6 +5040,7 @@ pub fn run_nuts_sampling_flattened_family(
             1.0,
             glm.dispersion,
             glm.firth_bias_reduction,
+            glm.offset,
             config,
         ),
         (ResponseFamily::Tweedie { p }, _, FamilyNutsInputs::Glm(glm)) => {
@@ -4984,6 +5062,7 @@ pub fn run_nuts_sampling_flattened_family(
                 p,
                 glm.dispersion,
                 glm.firth_bias_reduction,
+                glm.offset,
                 config,
             )
         }
@@ -5001,6 +5080,7 @@ pub fn run_nuts_sampling_flattened_family(
                 theta,
                 glm.dispersion,
                 glm.firth_bias_reduction,
+                glm.offset,
                 config,
             )
         }
@@ -5018,6 +5098,7 @@ pub fn run_nuts_sampling_flattened_family(
             glm.gamma_shape.unwrap_or(1.0),
             glm.dispersion,
             glm.firth_bias_reduction,
+            glm.offset,
             config,
         ),
         (ResponseFamily::Gaussian, _, FamilyNutsInputs::Glm(_)) => Err(
@@ -6438,6 +6519,7 @@ impl JointBetaRhoPosterior {
             y: Arc::new(y.to_owned()),
             weights: Arc::new(weights.to_owned()),
             mode: Arc::new(mode.to_owned()),
+            offset: None,
             gamma_shape: gamma_shape.unwrap_or(1.0),
             // Joint (β, ρ) HMC keeps the likelihood on its native scale;
             // dispersion enters via the per-family scale parameter, not

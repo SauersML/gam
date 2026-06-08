@@ -3917,7 +3917,7 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         ));
     }
     progress.set_stage("diagnose", "loading diagnostic dataset");
-    let ds = load_datasetwith_model_schema_extra(&args.data, &model, &[parsed.response.clone()])?;
+    let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("diagnose", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
@@ -3939,13 +3939,26 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
 
     let link = family.link_function();
     let weights = Array1::ones(ds.values.nrows());
-    let offset = Array1::zeros(ds.values.nrows());
+    // Re-apply the offset the model was fit with, resolved by the saved offset
+    // column name exactly as the predict path does. Diagnose is Standard-only
+    // (non-standard classes are rejected above), so the noise-offset slot is
+    // always zero here. Hard-coding `offset = 0` made every ALO diagnostic
+    // (eta_tilde / leverage / alo_se) wrong by the entire offset for any
+    // `--offset-column` fit (#881): the saved working response is offset-
+    // inclusive, so a zero offset broke the `eta − offset` centering in
+    // `alo_eta_update`. `report_offset_for` reads the saved offset column and
+    // returns a zero noise-offset for standard models.
+    let (offset, _noise_offset) = report_offset_for(&model, &ds, &col_map)?;
 
     // Try geometry-based ALO from the unified result first (avoids refit).
     let alo = if let Some(geom) = model.unified().and_then(|u| u.geometry.as_ref()) {
         progress.set_stage("diagnose", "computing alo from saved geometry");
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
-        let eta = design.design.dot(&fit_saved.beta);
+        // ALO's `from_geometry` expects the *full* linear predictor (offset
+        // included); it re-centres internally via the separate `offset` arg to
+        // match the offset-inclusive saved working response. The refit branch
+        // below already adds `offset` here — the geometry path must too (#881).
+        let eta = &design.design.dot(&fit_saved.beta) + &offset;
         // ALO needs a dense X — materialize from row chunks when the design
         // is an operator-backed (lazy) one. `as_dense_cow` panicked on lazy
         // designs ("called on operator-backed design; use row chunks or
@@ -6055,7 +6068,7 @@ fn run_sample(args: SampleArgs) -> Result<(), String> {
     let model = SavedModel::load_from_path(&args.model)?;
     progress.advance_workflow(1);
     progress.set_stage("sample", "loading sampling data");
-    let ds = load_datasetwith_model_schema(&args.data, &model)?;
+    let ds = load_datasetwith_model_schema_for_diagnostics(&args.data, &model)?;
     require_dataset_rows("sample", &args.data, ds.values.nrows())?;
     progress.advance_workflow(2);
     let col_map = ds.column_map();
@@ -6429,7 +6442,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
 
     if let Some(data_path) = args.data.as_ref() {
         progress.set_stage("report", "loading report dataset");
-        let ds = load_datasetwith_model_schema(data_path, &model)?;
+        let ds = load_datasetwith_model_schema_for_diagnostics(data_path, &model)?;
         require_dataset_rows("report", data_path, ds.values.nrows())?;
         progress.advance_workflow(2);
 
@@ -8183,6 +8196,25 @@ fn load_dataset_projected(
 
 fn load_datasetwith_model_schema(path: &Path, model: &SavedModel) -> Result<Dataset, String> {
     load_datasetwith_model_schema_extra(path, model, &[])
+}
+
+/// Load a dataset for a *post-fit diagnostic* command (diagnose / sample /
+/// report) against a fitted model's schema.
+///
+/// Unlike prediction, diagnostics need the observed response column: residuals,
+/// R², posterior likelihoods, and leave-one-out are all statements *about* it.
+/// The prediction loader deliberately drops a standard GAM's bare response
+/// (#840 / #864), so this variant folds the model's diagnostic-required
+/// response back in via [`SavedModel::diagnostic_extra_columns`]. Routing every
+/// diagnostic command through here makes it structurally impossible to silently
+/// drop the response — the #864 / #882 / #883 failure mode — rather than relying
+/// on each command to remember an `extra_required` argument.
+fn load_datasetwith_model_schema_for_diagnostics(
+    path: &Path,
+    model: &SavedModel,
+) -> Result<Dataset, String> {
+    let extras = model.diagnostic_extra_columns()?;
+    load_datasetwith_model_schema_extra(path, model, &extras)
 }
 
 /// Load a new-data file against a fitted model's schema, keeping only the

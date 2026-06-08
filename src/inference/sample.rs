@@ -523,6 +523,18 @@ fn sample_standard(
     let penalty =
         weighted_blockwise_penalty_sum(&design.penalties, fit.lambdas.as_slice().unwrap(), p);
 
+    // Re-apply the offset the model was fit with so the posterior targets the
+    // same η = Xβ + offset as the fit and predict paths. The diagnostic loader
+    // keeps the saved offset column in the frame; dropping the offset silently
+    // sampled the wrong target for any `--offset-column` GLM (#882).
+    let offset_vec: Option<Array1<f64>> = match model.offset_column.as_deref() {
+        Some(name) => {
+            let idx = resolve_role_col(col_map, name, "offset")?;
+            Some(data.column(idx).to_owned())
+        }
+        None => None,
+    };
+
     run_nuts_sampling_flattened_family(
         likelihood,
         FamilyNutsInputs::Glm(GlmFlatInputs {
@@ -538,6 +550,7 @@ fn sample_standard(
             // a no-op.
             dispersion: fit.dispersion().unwrap_or_default(),
             firth_bias_reduction: false,
+            offset: offset_vec.as_ref().map(|o| o.view()),
         }),
         cfg,
     )
