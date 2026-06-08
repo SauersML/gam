@@ -6787,11 +6787,24 @@ fn build_latent_duchon_design(
         }
     }
     let center_matrix = centers.to_owned();
+    // Resolve a fully admissible (nullspace_order, power) for THIS ambient
+    // latent dimension. The pure scale-free polyharmonic kernel exists only
+    // when 2(p + s) > d; with the requested null space alone (s = 0) this
+    // fails whenever 2p <= d — e.g. m = 2 (p = 2) at latent_dim >= 4, which is
+    // exactly issue #875. `resolve_duchon_orders` lifts the spectral power s
+    // (and, if pure-mode CPD requires it, the null-space order) until the
+    // kernel is well-posed for any d, including the even-d `r^{2m-d} log r`
+    // log case. The latent forward design assembles no operator penalties
+    // (`operator_penalties: Default::default()`), so `max_op = 0`: only the
+    // kernel-existence / CPD guards apply, matching every other Duchon entry
+    // point which routes through this same resolver.
+    let (resolved_nullspace, resolved_power) =
+        resolve_duchon_orders(latent_dim, duchon_nullspace_from_m(m), 0, None);
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
         length_scale: None,
-        power: 0.0,
-        nullspace_order: duchon_nullspace_from_m(m),
+        power: resolved_power as f64,
+        nullspace_order: resolved_nullspace,
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: Default::default(),
@@ -7211,19 +7224,33 @@ fn latent_input_location_jet(
             // polynomial nullspace block (n_poly cols). The derivative jet
             // must use the same effective nullspace order and the same Z
             // projection so its column count matches the design exactly.
-            let requested_nullspace = duchon_nullspace_from_m(m);
+            // Resolve the SAME admissible (nullspace_order, power) pair the
+            // forward `build_latent_duchon_design` resolves for this ambient
+            // dimension (issue #875): the pure polyharmonic kernel exists only
+            // when 2(p + s) > d, so `resolve_duchon_orders` may lift the
+            // spectral power s (and null-space order) above the m-derived
+            // request. The jet must differentiate the *resolved* forward kernel
+            // — same power, same null-space — or its column count and scaling
+            // would diverge from the design.
+            let dim_ambient = centers.ncols();
+            let (resolved_nullspace, resolved_power) =
+                resolve_duchon_orders(dim_ambient, duchon_nullspace_from_m(m), 0, None);
             let effective_nullspace =
-                pyffi_duchon_effective_nullspace_order(centers, requested_nullspace);
+                pyffi_duchon_effective_nullspace_order(centers, resolved_nullspace);
             let radial_transform =
                 pyffi_duchon_kernel_constraint_nullspace(centers, effective_nullspace)?;
-            // `build_latent_duchon_design` builds the forward with
-            // `power = 0` and `length_scale = None` (pure scale-free Duchon),
-            // so the radial derivative resolves the same `s = 0` spectrum
-            // (issue #440): the derivative differentiates the exact forward
-            // Green's function rather than a hard-coded surrogate.
-            let phi_r =
-                duchon_radial_first_derivative_nd(t_mat, centers, None, effective_nullspace, 0)
-                    .map_err(|err| err.to_string())?;
+            // The radial derivative differentiates the exact forward Green's
+            // function: same scale-free pure Duchon spectrum (`length_scale =
+            // None`, the resolved spectral power `s`), not a hard-coded
+            // surrogate (issue #440).
+            let phi_r = duchon_radial_first_derivative_nd(
+                t_mat,
+                centers,
+                None,
+                effective_nullspace,
+                resolved_power,
+            )
+            .map_err(|err| err.to_string())?;
             let radial_jet = radial_input_location_jet(t_mat, centers, phi_r.view())?;
             let poly_jet = duchon_polynomial_first_derivative_nd(t_mat, effective_nullspace);
 
@@ -7244,12 +7271,17 @@ fn latent_input_location_jet(
                 ));
             }
             // Scalar kernel amplification `α` the forward
-            // `build_latent_duchon_design` (→ `build_duchon_basis` with
-            // `power = 0`, `length_scale = None`) applies to the kernel block
-            // `α·K(t,C)·Z`. The input-location derivative is `α·K'(t,C)·Z`, so
-            // the raw radial jet must carry the same `α`; the appended
+            // `build_latent_duchon_design` (→ `build_duchon_basis` with the
+            // resolved `power`, `length_scale = None`) applies to the kernel
+            // block `α·K(t,C)·Z`. The input-location derivative is
+            // `α·K'(t,C)·Z`, so the raw radial jet must carry the same `α`
+            // computed against the same resolved spectral power; the appended
             // polynomial columns are un-amplified, matching the forward.
-            let kernel_amp = duchon_pure_kernel_amplification(centers, requested_nullspace);
+            let kernel_amp = duchon_pure_kernel_amplification(
+                centers,
+                resolved_nullspace,
+                resolved_power as f64,
+            );
             let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
             for axis in 0..dim {
                 let projected = radial_jet.index_axis(Axis(2), axis).dot(&radial_transform);
