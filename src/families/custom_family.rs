@@ -25693,6 +25693,12 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                  AUTO-ESCALATE to never-fail posterior sampling about the initial ρ seed; the \
                  degraded refit below still raises if even the seed produces a non-finite mode.",
             );
+            {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    writeln!(f, "[DIAG-STARTUP-ERR] {e} || detail={last_error_detail}").ok();
+                }
+            }
             (rho0.clone(), None, 0, true)
         }
         Err(e) => {
