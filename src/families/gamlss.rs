@@ -11228,12 +11228,16 @@ impl GaussianLocationScaleWiggleFamily {
                 + fast_atv(&geom.basis, &s_w_ab)),
         );
 
-        // Static blocks under logb. coeff_mm has no κ; coeff_ml = 2κmD;
-        // coeff_ll = Fisher 2κ²a (#566); l = 2κm. The cross-block directional
-        // derivatives pick up κ', κ'' on every leg that hits η_ls; the Fisher
-        // (ls,ls) block depends only on η_ls so its derivatives carry only κ.
+        // Static blocks under logb. coeff_mm has no κ; coeff_ll = Fisher 2κ²a
+        // (#566). Gaussian mean⊥scale Fisher orthogonality: the wiggle and μ
+        // both enter the mean (q = q0 + B·βw), log σ is the only scale block,
+        // so coeff_ml = E[H_{μ,ls}] = 0 and l = E[H_{ls,w}] = 0 (observed 2κm,
+        // E[m]=0). All of their ψ-directional derivatives (a/b/ab) are 0 since
+        // a function identically 0 has 0 derivatives. The Fisher (ls,ls) block
+        // depends only on η_ls so its derivatives carry only κ.
+        let n = rows.m.len();
         let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
-        let coeff_ml = 2.0 * &rows.kappa * &rows.m * &geom.dq_dq0;
+        let coeff_ml = Array1::<f64>::zeros(n);
         let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         // coeff_mm_a/b/ab: structurally κ-free; correctness now follows from
         // dw_a/_b/_ab and dm_a/_b/_ab carrying the κ chain on η_ls (above).
@@ -11254,23 +11258,11 @@ impl GaussianLocationScaleWiggleFamily {
             - &(&dm_a * &g2_b)
             - &(&dm_b * &g2_a)
             - &(&rows.m * &g2_ab);
-        // coeff_ml_a = 2κ(dm_a·D + m·s1_a) + 2κ'·e_a·m·D — same shape as
-        // helper 4 dh_ls_ls but along ψ_a; kappa' on every direct η_ls leg.
-        let coeff_ml_a = 2.0 * &rows.kappa * &(&dm_a * &geom.dq_dq0 + &rows.m * &s1_a)
-            + 2.0 * &rows.kappa_prime * &(e_a * &rows.m * &geom.dq_dq0);
-        let coeff_ml_b = 2.0 * &rows.kappa * &(&dm_b * &geom.dq_dq0 + &rows.m * &s1_b)
-            + 2.0 * &rows.kappa_prime * &(e_b * &rows.m * &geom.dq_dq0);
-        // coeff_ml_ab: ∂²(2κmD)/∂a∂b. Includes the η_ab leg (e_ab) since this
-        // is a ψ-second-order path (η_ab generally nonzero).
-        let coeff_ml_ab = 2.0
-            * &rows.kappa
-            * &(&dm_ab * &geom.dq_dq0 + &dm_a * &s1_b + &dm_b * &s1_a + &rows.m * &s1_ab)
-            + 2.0
-                * &rows.kappa_prime
-                * &(e_a * &(&dm_b * &geom.dq_dq0 + &rows.m * &s1_b)
-                    + e_b * &(&dm_a * &geom.dq_dq0 + &rows.m * &s1_a))
-            + 2.0 * &rows.kappa_dprime * &(e_a * e_b) * &rows.m * &geom.dq_dq0
-            + 2.0 * &rows.kappa_prime * e_ab * &(&rows.m * &geom.dq_dq0);
+        // coeff_ml (μ↔logσ) is Fisher 0; its 1st/2nd ψ-directional derivatives
+        // are 0 as well.
+        let coeff_ml_a = Array1::<f64>::zeros(n);
+        let coeff_ml_b = Array1::<f64>::zeros(n);
+        let coeff_ml_ab = Array1::<f64>::zeros(n);
         // Fisher (ls,ls) coeff_ll = 2κ²a (a constant prior weight) depends only
         // on η_ls (#566): ∂(2κ²a)/∂η = 4κκ'a, so the ψ-first derivatives are
         // 4κκ'a·e_a / e_b. The η_ab leg carries one κ on top.
@@ -11291,15 +11283,12 @@ impl GaussianLocationScaleWiggleFamily {
         let c_a = -&dm_a;
         let c_b = -&dm_b;
         let c_ab = -&dm_ab;
-        // l = 2κm; l_a/_b add κ' on the e direction; l_ab adds κ'', plus
-        // a κ' on the η_ab leg.
-        let l = 2.0 * &rows.kappa * &rows.m;
-        let l_a = 2.0 * &rows.kappa * &dm_a + 2.0 * &rows.kappa_prime * &(e_a * &rows.m);
-        let l_b = 2.0 * &rows.kappa * &dm_b + 2.0 * &rows.kappa_prime * &(e_b * &rows.m);
-        let l_ab = 2.0 * &rows.kappa * &dm_ab
-            + 2.0 * &rows.kappa_prime * &(e_a * &dm_b + e_b * &dm_a)
-            + 2.0 * &rows.kappa_dprime * &(e_a * e_b) * &rows.m
-            + 2.0 * &rows.kappa_prime * e_ab * &rows.m;
+        // l (logσ↔wiggle) is Fisher 0 (wiggle is mean-side; mean⊥scale), so all
+        // of its 1st/2nd ψ-directional derivatives vanish.
+        let l = Array1::<f64>::zeros(n);
+        let l_a = Array1::<f64>::zeros(n);
+        let l_b = Array1::<f64>::zeros(n);
+        let l_ab = Array1::<f64>::zeros(n);
 
         let hmm_ab = weighted_crossprod_psi_maps(
             xmu_ab_map,
