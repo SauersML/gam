@@ -1985,6 +1985,34 @@ pub trait CustomFamily {
         self.exact_newton_outerobjective() != ExactNewtonOuterObjective::RidgedQuadraticReml
     }
 
+    /// Whether the outer REML/LAML logdet term `½ log|H + Sλ|` and its analytic
+    /// trace gradient `½ tr((H+Sλ)⁺ ∂Sλ)` are evaluated over the FULL
+    /// identifiable subspace `range(H + Sλ)` (mgcv's generalized determinant,
+    /// gam#752) rather than the penalty-range subspace `range(Sλ)`.
+    ///
+    /// This is a value/gradient SUBSPACE-CONSISTENCY concern, orthogonal to
+    /// whether the Hessian depends on β (`exact_newton_joint_hessian_beta_dependent`,
+    /// which gates the *drift* corrections). The previous code conflated the two
+    /// by gating the projected logdet on β-dependence, so `RidgedQuadraticReml`
+    /// families (survival/bernoulli marginal-slope) silently used the
+    /// `range(Sλ)`-only determinant: on a near-collinear penalty-null trend (the
+    /// clustered-PC matern marginal-slope geometry) that DROPS the penalty-null
+    /// likelihood determinant `log|U_kᵀ H U_k|` from the value while
+    /// `½ log|Sλ|₊` is correctly over `range(Sλ)`, making the ρ-derivative of the
+    /// REML criterion inconsistent. The outer optimizer then drives that block's
+    /// λ → ∞ and the envelope gradient (valid only at a stationary β̂) freezes —
+    /// the constant-‖g‖ outer stall in gam#808/#787.
+    ///
+    /// The generalized determinant is the correct objective in ALL cases: when
+    /// `H + Sλ` is full rank it equals the ordinary logdet (the projection is a
+    /// no-op, so the correction is ≈0), and when it is rank-deficient it drops
+    /// only the truly unidentified `ker(H) ∩ ker(Sλ)` directions — exactly the
+    /// directions `½ log|Sλ|₊` also omits, keeping value and gradient over one
+    /// subspace. Always enabled by default.
+    fn use_projected_penalty_logdet(&self) -> bool {
+        true
+    }
+
     /// Per-evaluation arithmetic cost of forming or applying the inner
     /// coefficient-space Hessian once, in flop-equivalent units. This is used
     /// for diagnostics, seed-budget policy, and first-order iteration caps
