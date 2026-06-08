@@ -423,7 +423,10 @@ pub fn fit_latent_survival_terms(
         build_mean_blockspec(&mean_design, spec.mean_offset.clone()),
     ];
     if latent_sd.is_none() {
-        blocks.push(build_log_sigma_blockspec(0.5, mean_design.design.nrows()));
+        blocks.push(build_log_sigma_blockspec(
+            LEARNABLE_LATENT_SD_SEED,
+            mean_design.design.nrows(),
+        ));
     }
     let fit = fit_custom_family(&family, &blocks, options).map_err(|e| e.to_string())?;
     let latent_sd = family.latent_sd(&fit.block_states)?;
@@ -763,6 +766,14 @@ fn build_mean_blockspec(design: &TermCollectionDesign, offset: Array1<f64>) -> P
         stacked_offset: None,
     }
 }
+
+/// Starting latent-frailty standard deviation when `sigma` is learnable
+/// (`sigma_fixed == None`). The log-sigma block is seeded at `log(0.5)` so the
+/// optimizer begins from a moderate, well-conditioned dispersion (σ = 0.5,
+/// neither a near-degenerate σ → 0 that flattens the frailty integral nor a
+/// large σ that makes the Gauss-Hermite quadrature heavy-tailed) and then
+/// learns the data's actual scale. Only an initial value, not a constraint.
+const LEARNABLE_LATENT_SD_SEED: f64 = 0.5;
 
 fn build_log_sigma_blockspec(initial_sigma: f64, n_obs: usize) -> ParameterBlockSpec {
     ParameterBlockSpec {
@@ -2541,7 +2552,14 @@ fn binary_from_log_survival(
             reason: format!("latent-binary requires event targets in {{0,1}}, got {event}"),
         });
     }
-    let log_survival = log_survival.min(-1e-15);
+    // Cap log S(t) strictly below zero so the event probability
+    // `1 - exp(log S)` stays strictly positive even when the survival
+    // probability rounds to exactly 1 (log S == 0): a zero event probability
+    // would make the binary log-likelihood `log(event_prob)` diverge. The cap
+    // is at the f64 resolution near 1.0, so it never perturbs a genuinely
+    // informative survival value.
+    const MAX_LOG_SURVIVAL: f64 = -1e-15;
+    let log_survival = log_survival.min(MAX_LOG_SURVIVAL);
     let survival = log_survival.exp();
     let event_prob = 1.0 - survival;
     if !(event_prob.is_finite() && event_prob > 0.0) {
