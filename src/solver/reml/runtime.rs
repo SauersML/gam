@@ -4770,9 +4770,18 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> super::rho_prior_eval::RhoPriorEval {
         let effective = self.effective_rho_prior();
+        // Evaluate the prior at the weight-anchored coordinate `ρ̃ = ρ − log g(w)`
+        // (see [`rho_weight_anchor`](Self::rho_weight_anchor)) so the selected λ̂
+        // is exactly invariant to a global weight rescale `w → c·w` (issue #877).
+        // The anchor is a ρ-independent constant, so d/dρ̃ = d/dρ: the returned
+        // gradient and Hessian are already correct w.r.t. ρ. For unweighted fits
+        // the anchor is 0 and `rho_eff` aliases `rho` (byte-identical behaviour).
+        let anchor = self.rho_weight_anchor();
+        let rho_anchored = (anchor != 0.0).then(|| rho.mapv(|r| r - anchor));
+        let rho_eff: &Array1<f64> = rho_anchored.as_ref().unwrap_or(rho);
         let mut eval = super::rho_prior_eval::evaluate(
             effective.as_ref(),
-            rho,
+            rho_eff,
             super::rho_prior_eval::InvalidPriorPolicy::Saturate,
         )
         .expect("Saturate policy never errors");
@@ -4803,7 +4812,7 @@ impl<'a> RemlState<'a> {
                     if !is_default {
                         continue;
                     }
-                    let r = rho[idx];
+                    let r = rho_eff[idx];
                     // Remove the plain PC contribution the engine added for this
                     // defaulted coordinate, then add the self-gated barrier.
                     let (pc_c, pc_g, pc_h) = super::rho_prior_eval::pc_prior_terms(theta, r);
@@ -4853,11 +4862,14 @@ impl<'a> RemlState<'a> {
     /// (n/2) log(2πφ) − ½ Σ log wᵢ`; the `calculate_loglikelihood_omitting_constants`
     /// helper omits the `−½ Σ log wᵢ` piece. The `ProfiledGaussian` REML cost
     /// adds it back (`InnerSolution::gaussian_weight_log_sum_half`) so the
-    /// objective VALUE — not just its argmin — is exactly invariant to a global
-    /// prior-weight rescale `w → c·w` (issue #877): the invariance-preserving
-    /// `λ → c·λ` otherwise inflates the cost value by `(n/2) log c`, breaking
-    /// the weight-scale invariance of the selected λ̂ / EDF / fit. With all
-    /// weights 1 this is exactly 0. Summed over the SAME positive-weight rows
+    /// objective VALUE is exactly invariant to a global prior-weight rescale
+    /// `w → c·w`: the invariance-preserving `λ → c·λ` otherwise inflates the cost
+    /// value by `(n/2) log c`. This term only restores the *value*; it is a
+    /// ρ-independent constant and so cannot move the argmin. The *argmin*
+    /// invariance of the selected λ̂ — the substance of issue #877 — is restored
+    /// separately by [`rho_weight_anchor`](Self::rho_weight_anchor), which
+    /// evaluates the configured ρ-prior at the weight-anchored coordinate.
+    /// With all weights 1 this is exactly 0. Summed over the SAME positive-weight rows
     /// counted in `n_observations` (zero-weight rows are dropped; `log(0)` is
     /// undefined).
     fn gaussian_weight_log_sum_half(&self) -> f64 {
@@ -4867,6 +4879,36 @@ impl<'a> RemlState<'a> {
             .filter(|&&wi| wi > 0.0)
             .map(|&wi| wi.ln())
             .sum::<f64>()
+    }
+
+    /// Geometric-mean log-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ` over the
+    /// positive-weight rows.
+    ///
+    /// The configured outer ρ-prior is evaluated at the weight-anchored
+    /// coordinate `ρ̃ = ρ − log g(w)` so that the selected λ̂ is *exactly*
+    /// invariant to a global prior-weight rescale `w → c·w` (issue #877). Under
+    /// inverse-variance weights the penalized Hessian is `XᵀWX + λS`, so the
+    /// pure-REML optimum drifts by `ρ̂ → ρ̂ + log c` while the fit (β̂, EDF,
+    /// predictions) is unchanged. A prior on *raw* ρ (e.g. the default
+    /// `Normal{0, sd}`) would then pull the optimum back by `log(c)/sd²`,
+    /// breaking the invariance — the exact defect #877 reports (λ̂ ratio 810×
+    /// not 1000×). Anchoring removes it: `log g(c·w) = log c + log g(w)` drifts
+    /// identically to ρ̂, so the prior's view `ρ̃` — hence its cost, gradient and
+    /// curvature — is identical at the rescaled optimum. The
+    /// [`gaussian_weight_log_sum_half`](Self::gaussian_weight_log_sum_half) cost
+    /// term keeps the objective *value* invariant; this keeps its *argmin*
+    /// invariant. With all weights 1 the anchor is exactly 0, so unweighted fits
+    /// (the overwhelming majority) stay byte-identical.
+    fn rho_weight_anchor(&self) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for &wi in self.weights.iter() {
+            if wi > 0.0 {
+                sum += wi.ln();
+                count += 1;
+            }
+        }
+        if count == 0 { 0.0 } else { sum / count as f64 }
     }
 
     fn compute_configured_rho_prior_cost(&self, rho: &Array1<f64>) -> f64 {
