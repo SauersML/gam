@@ -423,11 +423,17 @@ where
             )?;
         total_ll += chunk_ll;
         // Every Bernoulli marginal-slope row contribution is <= 0 because it is
-        // weight_i * log(CDF(.)) with nonnegative weights. With nonnegative HT
-        // weights w_i applied row-wise the partial sum is still monotone-down,
-        // so `-total_ll` is a valid lower bound on the final negative
-        // log-likelihood and can prove the line-search trial rejected before
-        // the full row sweep finishes.
+        // weight_i * log(CDF(.)) with nonnegative weights, so the running sum is
+        // monotone-down and `-total_ll` only grows as rows are added. When the
+        // line search passes the full-data row set (the only caller — line-search
+        // accept/reject is an exact full-data decision, see
+        // `log_likelihood_only_with_options`), `-total_ll` is therefore a genuine
+        // lower bound on the final full-data negative log-likelihood and can prove
+        // the trial rejected before the sweep finishes. NOTE: this lower-bound
+        // guarantee holds only for the full-data measure; a Horvitz-Thompson
+        // subsample sum (inverse-inclusion weights) is an *unbiased estimator* of
+        // the full-data NLL, not a lower bound, so it must never drive a reject
+        // against a full-data threshold.
         if -total_ll > threshold {
             return Err(format!(
                 "bernoulli marginal-slope line-search rejected early: partial_nll={} threshold={}",
