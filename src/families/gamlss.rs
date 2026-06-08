@@ -1,7 +1,4 @@
-use crate::basis::{
-    BasisOptions, Dense, KnotSource, PenaltyInfo, PenaltySource, create_basis,
-    create_difference_penalty_matrix, create_ispline_derivative_dense,
-};
+use crate::basis::{BasisOptions, PenaltyInfo, PenaltySource};
 use crate::custom_family::{
     AdditiveBlockJacobian, BatchedOuterGradientTerms, BlockEffectiveJacobian, BlockWorkingSet,
     BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
@@ -31,12 +28,18 @@ use crate::families::sigma_link::{
     logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar, safe_exp,
 };
 use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+// The monotone-wiggle helpers live in the neutral `families::wiggle` module
+// (decoupling refactor); this block imports only the ones gamlss's own non-test
+// code uses. Symbols used solely by this module's `#[cfg(test)]` block
+// (`initialize_monotone_wiggle_knots_from_seed`, `monotone_wiggle_internal_degree`,
+// `split_wiggle_penalty_orders`) are imported inside that block instead, so they
+// are not flagged unused in a non-test `--lib` build; downstream consumers import
+// from `families::wiggle` directly.
 use crate::families::wiggle::{
     SelectedWiggleBasis, WiggleBlockConfig, buildwiggle_block_input_from_knots,
-    initialize_monotone_wiggle_knots_from_seed, initializewiggle_knots_from_seed,
-    monotone_wiggle_basis_with_derivative_order, monotone_wiggle_internal_degree,
+    initializewiggle_knots_from_seed, monotone_wiggle_basis_with_derivative_order,
     monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
-    split_wiggle_penalty_orders, validate_monotone_wiggle_beta_nonnegative,
+    validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::SymmetricMatrix;
@@ -22167,7 +22170,16 @@ impl CustomFamilyGenerative for BinomialLocationScaleWiggleFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
+    // Helpers exercised only by these tests; imported here (not at module scope)
+    // so they are not flagged unused in a non-test `--lib` build.
+    use crate::families::wiggle::{
+        initialize_monotone_wiggle_knots_from_seed, monotone_wiggle_internal_degree,
+        split_wiggle_penalty_orders,
+    };
+    use crate::basis::{
+        CenterStrategy, Dense, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
+        create_basis,
+    };
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
     use crate::test_support::{binomial_location_scale_base_fixture, no_densify_design};
     use ndarray::{Array2, Axis, array};

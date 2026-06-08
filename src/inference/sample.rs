@@ -23,7 +23,7 @@ use crate::families::survival_predict::{
     resolve_saved_survival_time_columns, resolve_termspec_for_prediction,
     saved_baseline_timewiggle_components, saved_survival_runtime_baseline_config,
 };
-use crate::gamlss::{
+use crate::families::wiggle::{
     append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
     split_wiggle_penalty_orders,
 };

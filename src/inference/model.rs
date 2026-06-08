@@ -1,7 +1,7 @@
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::bms::{LatentMeasureKind, LatentZRankIntCalibration};
-use crate::families::gamlss::{
+use crate::families::wiggle::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::families::lognormal_kernel::FrailtySpec;

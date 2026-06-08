@@ -11,7 +11,7 @@ use crate::families::bms::{
 use crate::families::gamlss::{
     BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
     BlockwiseTermFitResultParts, BlockwiseTermWiggleFitResult, GaussianLocationScaleFitResult,
-    GaussianLocationScaleTermSpec, WiggleBlockConfig, fit_binomial_location_scale_terms,
+    GaussianLocationScaleTermSpec, fit_binomial_location_scale_terms,
     fit_binomial_location_scale_terms_with_selected_wiggle,
     fit_binomial_mean_wiggle_terms_with_selected_basis, fit_gaussian_location_scale_terms,
     fit_gaussian_location_scale_terms_with_selected_wiggle,
@@ -19,6 +19,7 @@ use crate::families::gamlss::{
     select_binomial_mean_link_wiggle_basis_from_pilot,
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
+use crate::families::wiggle::WiggleBlockConfig;
 use crate::families::latent_survival::{
     LatentBinaryTermFitResult, LatentBinaryTermSpec, LatentSurvivalTermFitResult,
     LatentSurvivalTermSpec, fit_latent_binary_terms, fit_latent_survival_terms,
