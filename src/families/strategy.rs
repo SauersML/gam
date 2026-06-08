@@ -12,6 +12,13 @@ use crate::quadrature::{
 use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
 use ndarray::{Array1, ArrayView1};
 
+/// Floor on the Bernoulli posterior variance `p(1 - p)`. Keeps the reported
+/// variance strictly positive when the integrated probability saturates at 0
+/// or 1, so downstream weighting / standard-error code never divides by zero.
+/// Matches the `PROB_EPS` floor used for the same `mean·(1 - mean)` variance
+/// in `crate::inference::quadrature`.
+const PROB_VARIANCE_FLOOR: f64 = 1e-12;
+
 /// Runtime family behavior carrier built from a `LikelihoodSpec` (response
 /// distribution + parameterized inverse-link).
 pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
@@ -395,7 +402,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             let mean = jet.mean;
             return Ok(IntegratedMomentsJet {
                 mean,
-                variance: (mean * (1.0 - mean)).max(1e-12),
+                variance: (mean * (1.0 - mean)).max(PROB_VARIANCE_FLOOR),
                 d1: jet.d1,
                 d2: jet.d2,
                 d3: jet.d3,
