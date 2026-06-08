@@ -1311,15 +1311,36 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // state. The projection keeps the data-driven curvature of `initial_beta`
         // and falls back to the min-norm feasible point only if it cannot certify
         // a strictly-interior solution.
+        //
+        // The min-norm fallback (`feasible_point_for_linear_constraints`) is only
+        // used for a NON-homogeneous cone (`b ≠ 0`), where it returns a genuine
+        // interior-of-the-offset-polyhedron point. For a HOMOGENEOUS shape cone
+        // (`b ≈ 0` — the convex/concave second-difference rows) that function
+        // returns the minimum-norm feasible point `β = 0`, which is the cone
+        // *vertex*: the exact all-rows-tight degenerate seed #873 is about. Taking
+        // it would silently reintroduce the #873 pathology whenever the strict
+        // projection rarely fails to certify. So for a homogeneous cone we skip the
+        // vertex fallback entirely and prefer the data-driven `initial_beta`: it
+        // violates at most *some* rows (a lower-dimensional, non-degenerate face the
+        // inner active-set QP can recover from), strictly better than the vertex
+        // where *every* row is simultaneously tight.
+        let cone_is_homogeneous = constraints.b.iter().all(|v| v.abs() <= 1e-14);
         if min_scaled_slack < active_set::interior_seed_margin() {
-            active_set::project_point_strictly_into_feasible_cone(&initial_beta, constraints)
-                .or_else(|| {
+            let projected = active_set::project_point_strictly_into_feasible_cone(
+                &initial_beta,
+                constraints,
+            )
+            .or_else(|| {
+                if cone_is_homogeneous {
+                    None
+                } else {
                     active_set::feasible_point_for_linear_constraints(
                         constraints,
                         initial_beta.len(),
                     )
-                })
-                .unwrap_or(initial_beta)
+                }
+            });
+            projected.unwrap_or(initial_beta)
         } else {
             initial_beta
         }
