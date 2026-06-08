@@ -4563,7 +4563,9 @@ pub fn cpu_reference_rigid_row(
     let (log_cdf_neg_eta0, _l0) = crate::probability::signed_probit_logcdf_and_mills_ratio(-eta0);
     let (log_cdf_neg_eta1, _l1) = crate::probability::signed_probit_logcdf_and_mills_ratio(-eta1);
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    let log_a1 = a1.max(1e-300).ln();
+    let log_a1 = a1
+        .max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR)
+        .ln();
 
     let nll =
         w * ((1.0 - d) * (-log_cdf_neg_eta1) + log_cdf_neg_eta0 - d * log_phi_eta1 - d * log_a1);
@@ -4589,7 +4591,7 @@ pub fn cpu_reference_rigid_row(
     let (e1_k1, e1_k2) = neglog_k1k2(-eta1, w * (1.0 - d));
     let phi_u1 = w * d * eta1;
     let phi_u2 = w * d;
-    let inv = 1.0 / a1.max(1e-300);
+    let inv = 1.0 / a1.max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR);
     let nl_u1 = -inv;
     let nl_u2 = inv * inv;
     let td_u1 = w * d * nl_u1;

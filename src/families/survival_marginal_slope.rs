@@ -4015,7 +4015,7 @@ fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f64) {
 /// Derivatives of neglog(x) = -log(x): [-1/x, 1/x², -2/x³, 6/x⁴].
 #[inline]
 fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
-    let x1 = x.max(1e-300);
+    let x1 = x.max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR);
     let inv = 1.0 / x1;
     let inv2 = inv * inv;
     (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
@@ -4062,7 +4062,9 @@ fn row_primary_closed_form(
     // Event density: d·logφ(η₁)
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
     // Time derivative: d·log(ad1)
-    let log_ad1 = ad1.max(1e-300).ln();
+    let log_ad1 = ad1
+        .max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR)
+        .ln();
 
     let nll =
         w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
@@ -4234,7 +4236,9 @@ fn row_primary_closed_form_shared_score(
     let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
     let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    let log_ad1 = ad1.max(1e-300).ln();
+    let log_ad1 = ad1
+        .max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR)
+        .ln();
 
     let nll =
         w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
@@ -20001,6 +20005,23 @@ fn combine_logslope_surface_designs(
     Ok((combined, concatenate_term_specs(specs), ranges))
 }
 
+/// Convergence tolerance (in |gradient| and in bracket width) for the
+/// safeguarded 1D Newton/bisection that finds the pooled survival baseline
+/// slope. The objective is a sum over rows of a smooth likelihood, so a
+/// gradient this small is already well inside the per-row noise of the seed.
+const POOLED_BASELINE_SLOPE_TOL: f64 = 1e-8;
+/// Initial half-width of the symmetric probe step used to bracket a sign change
+/// in the baseline-slope gradient. Doubled each pass until a bracket is found.
+const POOLED_BASELINE_BRACKET_STEP0: f64 = 0.5;
+/// Maximum number of bracket-expansion passes (the probe step doubles each
+/// pass, so this reaches a half-width of `STEP0·2^N`, far beyond any
+/// physically plausible baseline slope before giving up).
+const POOLED_BASELINE_MAX_BRACKET_PASSES: usize = 48;
+/// Maximum number of Newton/bisection refinement steps once the gradient sign
+/// change is bracketed; with quadratic Newton convergence this is comfortably
+/// more than enough to reach `POOLED_BASELINE_SLOPE_TOL`.
+const POOLED_BASELINE_MAX_REFINE_STEPS: usize = 60;
+
 /// Compute a baseline slope from the actual survival marginal-slope likelihood,
 /// using the baseline offsets alone as a time-only pilot q(t).
 ///
@@ -20055,7 +20076,7 @@ fn pooled_survival_baseline(
     if !state0.0.is_finite() {
         return 0.0;
     }
-    if state0.1.abs() < 1e-8 {
+    if state0.1.abs() < POOLED_BASELINE_SLOPE_TOL {
         return 0.0;
     }
 
@@ -20072,8 +20093,8 @@ fn pooled_survival_baseline(
     } else {
         None
     };
-    let mut step = 0.5f64;
-    for _ in 0..48 {
+    let mut step = POOLED_BASELINE_BRACKET_STEP0;
+    for _ in 0..POOLED_BASELINE_MAX_BRACKET_PASSES {
         for &candidate in &[-step, step] {
             if let Some(state) = objective_grad_hess(candidate) {
                 if state.0 < best.0 {
@@ -20108,8 +20129,10 @@ fn pooled_survival_baseline(
 
                     let mut bracket_lo = (lo, lo_state);
                     let mut bracket_hi = (hi, hi_state);
-                    for _ in 0..60 {
-                        if state.1.abs() < 1e-8 || (bracket_hi.0 - bracket_lo.0).abs() < 1e-8 {
+                    for _ in 0..POOLED_BASELINE_MAX_REFINE_STEPS {
+                        if state.1.abs() < POOLED_BASELINE_SLOPE_TOL
+                            || (bracket_hi.0 - bracket_lo.0).abs() < POOLED_BASELINE_SLOPE_TOL
+                        {
                             break;
                         }
                         let mut candidate = 0.5 * (bracket_lo.0 + bracket_hi.0);
