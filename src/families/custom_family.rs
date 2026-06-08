@@ -16380,6 +16380,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
+            if !options.seed_screening && (cycle < 30 || cycle % 100 == 0) {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    let bi = flatten_state_betas(&states, specs).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                    let fs = head_jeffreys_term.as_ref().map(|(g,_)| g.iter().map(|v| v.abs()).fold(0.0_f64,f64::max)).unwrap_or(0.0);
+                    writeln!(f, "[DIAGM] cyc={cycle} resid={residual:.3e} step={step_inf:.3e} acc={accepted_step_inf:.3e} beta={bi:.3e} tr={joint_trust_radius:.3e} skip={jeffreys_skippable_this_cycle} firth={fs:.3e} nullity={joint_step_spectral_nullity}").ok();
+                }
+            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
@@ -17610,6 +17618,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if coupled_exact_joint_required {
+            {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    let bi = flatten_state_betas(&states, specs).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                    writeln!(f, "[DIAGBRK] cycles_done={cycles_done} converged={converged} has_report={} best_resid={best_residual_seen:.3e} last_below_tol={last_cycle_residual_below_tol} beta={bi:.3e} screen={} total_p={total_p}", last_kkt_refusal_report.is_some(), options.seed_screening).ok();
+                }
+            }
             // Bubble the structured KKT refusal report (per-block residual
             // breakdown + H_pen spectrum + diagnosis) so the cause of the
             // refusal survives serialization through the outer optimizer,
