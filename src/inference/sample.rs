@@ -459,23 +459,44 @@ fn sample_standard(
     // path runs the Hamiltonian over the *raw* linear design with the saved
     // user-scale mode, treating every coefficient as an unconstrained,
     // Gaussian-penalized parameter. Bounded terms are fit through a custom
-    // family that drives eta via an interval transform with the design column
-    // zeroed (the user-scale coefficient enters as beta_user * x), and whose
-    // penalty/curvature live on the bounded latent scale. Replaying that fit
-    // with the raw design + unconstrained Gaussian penalty would sample the
-    // wrong posterior geometry (and could leave the interval entirely). The
-    // bounded fit *does* export a correct user-scale mode and user-scale
-    // penalized Hessian (see `transform_bounded_latent_precision_to_user_internal`
-    // in terms/smooth.rs), so we draw from the Laplace-Gaussian approximation
-    // `N(mode, H^{-1})` of the user-scale posterior — the same closed-form
-    // credible surface mgcv uses, and the one already employed for the
-    // location-scale / marginal-slope classes above.
-    if spec
+    // family that drives eta via an interval transform `beta = min + (max-min)·
+    // sigmoid(theta)` of an unconstrained latent `theta`. The posterior is
+    // Gaussian on that *latent* scale (which is exactly where the fit treats the
+    // coefficient as a locally-quadratic, unconstrained parameter), so the
+    // correct draws are `theta ~ N(theta_mode, H_latent^{-1})` pushed forward
+    // through the interval map — never a Gaussian on the user scale, which can
+    // place mass outside [min,max] and discards the boundary-induced skew. The
+    // saved fit exports the user-scale mode and user-scale penalized Hessian;
+    // `sample_bounded_latent_posterior_internal` reconstructs the latent
+    // geometry via the exact inverse delta-method (`H_latent = J H_user J`) and
+    // returns user-scale draws that always lie strictly inside the interval.
+    let has_bounded = spec
         .linear_terms
         .iter()
-        .any(|term| matches!(term.coefficient_geometry, LinearCoefficientGeometry::Bounded { .. }))
-    {
-        return laplace_gaussian_fallback(model, cfg, "standard bounded-coefficient posterior");
+        .any(|term| matches!(term.coefficient_geometry, LinearCoefficientGeometry::Bounded { .. }));
+    if has_bounded {
+        // Mirror the fit-time layout: linear coefficient `j` lives at column
+        // `intercept_range.end + j` of the model's coefficient vector. Bounds
+        // are on the original (user/data) scale, which is also the scale the
+        // saved beta and penalized Hessian live on.
+        let design = build_term_collection_design(data, &spec)
+            .map_err(|e| format!("failed to build term collection design: {e}"))?;
+        let bounded_columns: Vec<crate::smooth::BoundedSampleColumn> = spec
+            .linear_terms
+            .iter()
+            .enumerate()
+            .filter_map(|(j, term)| match term.coefficient_geometry {
+                LinearCoefficientGeometry::Bounded { min, max, .. } => {
+                    Some(crate::smooth::BoundedSampleColumn {
+                        col_idx: design.intercept_range.end + j,
+                        min,
+                        max,
+                    })
+                }
+                LinearCoefficientGeometry::Unconstrained => None,
+            })
+            .collect();
+        return sample_standard_bounded(model, cfg, &bounded_columns);
     }
     let design = build_term_collection_design(data, &spec)
         .map_err(|e| format!("failed to build term collection design: {e}"))?;
@@ -519,6 +540,64 @@ fn sample_standard(
         cfg,
     )
     .map_err(|e| format!("NUTS sampling failed: {e}"))
+}
+
+/// Exact posterior draws for a standard GLM with `bounded()` coefficients.
+///
+/// The bounded coefficients are sampled on their natural latent (logit) scale —
+/// where the Laplace approximation is Gaussian — and every draw is pushed
+/// through the exact interval map so user-scale draws always lie strictly inside
+/// `[min, max]` and carry the boundary-induced skew. Non-bounded coefficients
+/// are drawn as the ordinary Gaussian Laplace component of the same joint
+/// posterior, so cross-coefficient correlations with the bounded columns are
+/// preserved (the latent precision is the full `H_latent = J H_user J`).
+fn sample_standard_bounded(
+    model: &SavedModel,
+    cfg: &NutsConfig,
+    bounded_columns: &[crate::smooth::BoundedSampleColumn],
+) -> Result<NutsResult, String> {
+    validate_nuts_config(cfg).map_err(String::from)?;
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let mode = fit.beta.clone();
+    let p = mode.len();
+    if p == 0 {
+        return Err(
+            "standard bounded-coefficient posterior: cannot sample from an empty coefficient vector"
+                .to_string(),
+        );
+    }
+    // The bounded fit exports the user-scale penalized Hessian; the latent
+    // sampler reconstructs the latent precision from it via the exact inverse
+    // delta-method. (`explicit_fit_hessian_for_whitening` returns this same
+    // user-scale penalized Hessian for a saved standard fit.)
+    let user_hessian = explicit_fit_hessian_for_whitening(
+        &fit,
+        p,
+        "saved standard bounded-coefficient model",
+    )?;
+    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
+    let samples = crate::smooth::sample_bounded_latent_posterior_internal(
+        &mode,
+        user_hessian,
+        bounded_columns,
+        n_total,
+        chain_stream_seed(cfg.seed, 0, 0xB0DD_ED5E_ED90_1A7Cu64),
+    )
+    .map_err(|e| format!("standard bounded-coefficient posterior sampling failed: {e}"))?;
+
+    let posterior_mean = samples
+        .mean_axis(ndarray::Axis(0))
+        .unwrap_or_else(|| Array1::<f64>::zeros(p));
+    let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
+
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat: 1.0,
+        ess: n_total as f64,
+        converged: true,
+    })
 }
 
 fn sample_standard_link_wiggle(
