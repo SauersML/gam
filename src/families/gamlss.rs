@@ -13272,6 +13272,47 @@ impl CustomFamily for BinomialMeanWiggleFamily {
         true
     }
 
+    /// The binomial mean link-wiggle refit must NOT carry the full-span
+    /// Jeffreys/Firth augmentation, for the same structural reason
+    /// `GaussianLocationScaleWiggleFamily` opts out (#684–#688) — and the
+    /// binomial wiggle hits it harder. This is a *second-stage* refit: the
+    /// pilot binomial mean fit has already converged through the ordinary
+    /// PIRLS path (which is itself un-Firthed unless the user opts in — the
+    /// standard binomial fit logs `firth=false` / `jeffreys_logdet=none`), so
+    /// the wiggle refit only adds a *penalized*, *monotone-constrained*
+    /// I-spline link-shape correction `q = η + B(η)·β_w` around an
+    /// already-finite mode. Two failure modes follow from leaving the term on
+    /// (default `true`):
+    ///
+    /// 1. **Phantom stationarity residual.** When `H_pen` is full-rank and
+    ///    well-conditioned (the normal case — e.g. `cond ≈ 5.5e2` on the #872
+    ///    pure-probit repro) the Jeffreys gate smooth-steps the curvature
+    ///    `H_Φ → 0`, but the matching score `∇Φ` does not vanish in lock-step,
+    ///    so it leaks a nonzero `|∇L − Sβ + ∇Φ|` into the inner joint-Newton
+    ///    KKT residual. The certificate then refuses every iterate and the
+    ///    outer REML rejects all seeds (exactly the #684–#688 abort signature).
+    /// 2. **Saturation barrier / divergence.** `−Φ = −½log|I_J|` is folded into
+    ///    the objective and `∇Φ ∝ I_J⁻¹` into the gradient. The I-spline warp
+    ///    can drive the binomial linear predictor toward saturation, where the
+    ///    reduced Fisher information `I_J` goes singular: `−Φ → +∞` and
+    ///    `∇Φ → ∞`. The augmented objective grows a barrier that the joint
+    ///    Newton diverges into — the #872 repro runs the full 1200-cycle budget
+    ///    with the augmented objective pinned at ~4.6e9 and the augmented
+    ///    residual at ~5.8e9 while the plain data gradient is only ~2.3e2,
+    ///    aborting the documented `link(type=flexible(...)) + linkwiggle(...)`
+    ///    fit.
+    ///
+    /// Separation robustness is not lost: the wiggle block carries both a
+    /// difference penalty (λ selected by REML) and a hard non-negativity
+    /// constraint, and the underlying mean is fit by the pilot; a penalized,
+    /// constrained refit around a finite pilot mode does not run away to
+    /// `β → ∞` the way an unpenalized MLE can. Turning the term off here makes
+    /// the wiggle refit consistent with the un-Firthed pilot and removes the
+    /// phantom residual that blocked convergence.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        false
+    }
+
     fn coefficient_hessian_cost(&self, specs: &[ParameterBlockSpec]) -> u64 {
         // The mean-wiggle Hessian is exposed as a row-coefficient operator,
         // so the hot representation cost is one Θ(n · (p_eta + p_w)) HVP
