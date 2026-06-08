@@ -15449,6 +15449,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         delta = Some(spectral_step.delta);
                     }
 
+                    {
+                        use std::io::Write as _;
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                            let dn = delta.as_ref().map(|d| d.iter().all(|v| v.is_finite()));
+                            let di = delta.as_ref().map(|d| d.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
+                            writeln!(f, "[DIAGD] cyc={cycle} screen={} delta_some={} delta_finite={dn:?} delta_inf={di:?} nullity={spectral_nullity_for_step}", options.seed_screening, delta.is_some()).ok();
+                        }
+                    }
                     let Some(delta) = delta else {
                         break; // Fall back to blockwise
                     };
