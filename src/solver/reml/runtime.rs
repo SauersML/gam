@@ -10158,6 +10158,7 @@ impl<'a> RemlState<'a> {
         let tk_terms = self.tierney_kadane_terms(rho, bundle, mode, &assembly.ext_coords)?;
         let trace_state = self.hypergradient_trace_state();
         Self::reset_hypergradient_trace_telemetry(&trace_state);
+        let assembly_ext_len = assembly.ext_coords.len();
         let mut inner_solution = assembly.build();
         inner_solution.stochastic_trace_state = trace_state;
         let solution_beta = inner_solution.beta.clone();
@@ -10176,7 +10177,7 @@ impl<'a> RemlState<'a> {
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
         let block_terms =
-            self.block_local_sampled_correction(rho, bundle, assembly.ext_coords.len())?;
+            self.block_local_sampled_correction(rho, bundle, assembly_ext_len)?;
         let result = self.apply_tk_to_result(result, block_terms)?;
         let result = self.apply_alo_stabilization_to_result(rho, bundle, mode, result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &result);
@@ -10207,6 +10208,7 @@ impl<'a> RemlState<'a> {
         let eval_mode = super::unified::EvalMode::ValueAndGradient;
         self.validate_tk_ext_coords(eval_mode, &assembly.ext_coords)?;
         let tk_terms = self.tierney_kadane_terms(rho, bundle, eval_mode, &assembly.ext_coords)?;
+        let assembly_ext_len = assembly.ext_coords.len();
         let inner_solution = assembly.build();
         let inner_hessian_scale =
             super::unified::hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
@@ -10220,6 +10222,14 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let cost_result = self.apply_tk_to_result(cost_result, tk_terms)?;
+        // Fold the #784 adaptive block-local Laplace-to-sampling correction into
+        // the EFS objective too, so the EFS fixed-point and the BFGS/Newton path
+        // (`assemble_and_evaluate`) optimize the SAME marginal-likelihood
+        // surface. The correction enters through the gradient channel exactly
+        // like TK, which the universal EFS step already folds in. No-op when no
+        // direction is non-Gaussian.
+        let block_terms = self.block_local_sampled_correction(rho, bundle, assembly_ext_len)?;
+        let cost_result = self.apply_tk_to_result(cost_result, block_terms)?;
         // Augment with the ALO stabilization term BEFORE the gradient is read,
         // so the EFS step (which is driven by `cost_result.gradient` and
         // `cost_result.cost`) targets the same stabilized stationarity equation
