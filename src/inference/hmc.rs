@@ -3231,6 +3231,103 @@ mod tests {
     }
 
     #[test]
+    fn block_sampled_marginal_is_zero_for_gaussian_block() {
+        // A purely Gaussian block has ΔF ≡ 0, so the sampled correction (the
+        // log-ratio of true to Laplace block free energy) must be exactly 0,
+        // with a zero ρ-gradient. This is the consistency anchor: where the
+        // Gaussian summary holds, the fallback is a no-op.
+        struct GaussianBlock {
+            lambdas: Array1<f64>,
+        }
+        impl super::BlockExcessTarget for GaussianBlock {
+            fn block_dim(&self) -> usize {
+                self.lambdas.len()
+            }
+            fn rho_dim(&self) -> usize {
+                2
+            }
+            fn block_curvatures(&self) -> &Array1<f64> {
+                &self.lambdas
+            }
+            fn excess(&self, _t: &Array1<f64>) -> f64 {
+                0.0
+            }
+            fn excess_rho_gradient(&self, _t: &Array1<f64>) -> Array1<f64> {
+                Array1::zeros(2)
+            }
+        }
+        let target = GaussianBlock {
+            lambdas: array![2.0, 0.5],
+        };
+        let out = super::block_sampled_marginal_correction(&target).expect("correction");
+        assert!(out.value.abs() < 1e-12, "Gaussian block value {}", out.value);
+        assert!(out.rho_gradient.iter().all(|&g| g.abs() < 1e-12));
+        assert!(out.n_draws > 0);
+    }
+
+    #[test]
+    fn block_sampled_marginal_recovers_analytic_quartic_correction() {
+        // 1-D block with a quartic excess ΔF(t) = a t⁴ (a small positive
+        // anharmonicity). Then exp(Δ_b) = E_{t~N(0,1/λ)}[exp(−a t⁴)], a known
+        // 1-D integral the IS estimator must recover. We check the sampled Δ_b
+        // matches a high-accuracy deterministic quadrature of the same
+        // expectation, and that Δ_b < 0 (an added quartic penalty makes the
+        // true block mass *smaller* than the Gaussian's).
+        let lambda = 3.0_f64;
+        let a = 0.05_f64;
+        struct Quartic {
+            lambdas: Array1<f64>,
+            a: f64,
+        }
+        impl super::BlockExcessTarget for Quartic {
+            fn block_dim(&self) -> usize {
+                1
+            }
+            fn rho_dim(&self) -> usize {
+                1
+            }
+            fn block_curvatures(&self) -> &Array1<f64> {
+                &self.lambdas
+            }
+            fn excess(&self, t: &Array1<f64>) -> f64 {
+                self.a * t[0].powi(4)
+            }
+            fn excess_rho_gradient(&self, _t: &Array1<f64>) -> Array1<f64> {
+                Array1::zeros(1)
+            }
+        }
+        let target = Quartic {
+            lambdas: array![lambda],
+            a,
+        };
+        let out = super::block_sampled_marginal_correction(&target).expect("correction");
+
+        // Deterministic reference: Δ_b = log E_{t~N(0,1/λ)}[exp(−a t⁴)] via a
+        // fine trapezoid rule over the Gaussian density.
+        let sigma = (1.0 / lambda).sqrt();
+        let steps = 20_001;
+        let lo = -8.0 * sigma;
+        let hi = 8.0 * sigma;
+        let h = (hi - lo) / (steps as f64 - 1.0);
+        let mut integral = 0.0_f64;
+        for i in 0..steps {
+            let tt = lo + h * i as f64;
+            let gauss = (-(tt * tt) / (2.0 * sigma * sigma)).exp()
+                / (sigma * (2.0 * std::f64::consts::PI).sqrt());
+            let w = if i == 0 || i == steps - 1 { 0.5 } else { 1.0 };
+            integral += w * gauss * (-a * tt.powi(4)).exp() * h;
+        }
+        let reference = integral.ln();
+        assert!(
+            (out.value - reference).abs() < 5e-3,
+            "sampled Δ_b {} vs reference {}",
+            out.value,
+            reference,
+        );
+        assert!(out.value < 0.0, "quartic penalty must shrink block mass");
+    }
+
+    #[test]
     fn logit_pg_rao_blackwell_returns_finite_terms() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
         let y = array![1.0, 0.0, 1.0, 0.0];
@@ -5936,6 +6033,227 @@ pub fn laplace_trustworthiness_from_skewness(
         threshold,
         max_abs_skewness,
     }
+}
+
+/// Caller-supplied evaluator for the *non-Gaussian remainder* of the local
+/// log-posterior, restricted to the curvature-heavy block subspace (issue
+/// #784).
+///
+/// The inner marginalization summarizes the coefficient posterior by its
+/// Laplace (Gaussian) moments.  In the curvature-heavy block this Gaussian
+/// summary is wrong; the exact summary is the integral of the true target.
+/// Writing the block displacement as `β = β̂ + V_b t` (with `V_b` the
+/// untrustworthy H-eigenvectors and `λ_r` their curvatures), the only thing
+/// the sampler needs from the family + penalty is the **excess over the local
+/// Gaussian**:
+///
+///   ΔF(t) = [F(β̂ + V_b t) − F(β̂)] − ½ Σ_r λ_r t_r²
+///   F(β)  = −ℓ(β) + ½ βᵀ S(ρ) β.
+///
+/// `ΔF` is identically zero for a purely Gaussian (quadratic) `F`, so it
+/// isolates exactly the cubic-and-higher non-Gaussianity that defeats Laplace.
+/// `rho_gradient` returns `∂ΔF/∂ρ_k` at the same `t`, which lets the marginal
+/// correction expose a ρ-gradient consistent with its own value (Fisher's
+/// identity over the same draws) — required so the outer REML/LAML stays
+/// consistent and smoothing selection is not biased.
+pub trait BlockExcessTarget: Sync {
+    /// Dimension `m` of the block subspace (number of untrustworthy
+    /// directions being sampled).
+    fn block_dim(&self) -> usize;
+    /// Number of outer ρ coordinates the gradient is reported against.
+    fn rho_dim(&self) -> usize;
+    /// Block curvatures `λ_r` (the H-eigenvalues of the sampled directions),
+    /// length `block_dim()`.
+    fn block_curvatures(&self) -> &Array1<f64>;
+    /// Non-Gaussian remainder `ΔF(t)` at whitened block displacement `t`
+    /// (length `block_dim()`).
+    fn excess(&self, t: &Array1<f64>) -> f64;
+    /// ρ-gradient `∂ΔF/∂ρ_k` at the same `t`, length `rho_dim()`.
+    fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64>;
+}
+
+/// Block-local sampled marginal correction (issue #784).
+///
+/// `value` is `Δ_b = A_exact − A_Lap`, the log-ratio of the true block free
+/// energy to its Laplace value, to be **added** to the marginal log-likelihood
+/// (equivalently **subtracted** from the REML/LAML cost).  `rho_gradient` is
+/// `∂Δ_b/∂ρ`, the consistent outer-coordinate gradient computed from the same
+/// importance draws.  Both are exactly zero when the block is Gaussian.
+#[derive(Clone, Debug)]
+pub struct BlockSampledMarginal {
+    /// `Δ_b`: additive correction to the block marginal log-likelihood.
+    pub value: f64,
+    /// `∂Δ_b/∂ρ`, length `rho_dim()`.
+    pub rho_gradient: Array1<f64>,
+    /// Importance-sampling effective sample size (draws), for diagnostics /
+    /// trust gating.
+    pub importance_ess: f64,
+    /// Number of draws used.
+    pub n_draws: usize,
+}
+
+/// Auto-derive the number of importance draws for the block-local sampled
+/// marginalization from the block dimension.  MAGIC: more directions need more
+/// draws to control the importance-weight variance, but the block is small by
+/// construction (only the curvature-heavy directions), so this stays cheap.
+/// No CLI flag.
+fn block_sampling_draws(block_dim: usize) -> usize {
+    // Base budget plus a per-direction allowance; capped so a pathological
+    // block can never make a single inner evaluation explode.
+    const BASE: usize = 256;
+    const PER_DIM: usize = 256;
+    const CAP: usize = 4096;
+    (BASE + PER_DIM * block_dim).min(CAP)
+}
+
+/// Estimate the block-local sampled marginal correction `Δ_b` and its
+/// ρ-gradient by importance sampling against the local Laplace Gaussian
+/// (issue #784).
+///
+/// # Math
+///
+/// Draw `t_s ~ q = N(0, diag(1/λ_r))` (the local Laplace Gaussian in the block
+/// subspace; whitened draws `z_s ~ N(0, I)` give `t_{s,r} = z_{s,r}/√λ_r`).
+/// With the non-Gaussian remainder `ΔF` defined on [`BlockExcessTarget`],
+///
+///   exp(Δ_b) = E_q[ exp(−ΔF(t)) ]  ⇒  Δ_b = log mean_s exp(−ΔF(t_s)),
+///
+/// computed via a numerically-stable log-mean-exp.  The ρ-gradient follows
+/// from differentiating `Δ_b = log E_q[e^{−ΔF}]` (the `q`-Gaussian normalizer
+/// `½Σ log(2π/λ_r)` cancels against `A_Lap`, leaving only the `ΔF` channel):
+///
+///   ∂Δ_b/∂ρ_k = E_p[ −∂ΔF/∂ρ_k ],   p ∝ q·e^{−ΔF},
+///
+/// i.e. the self-normalized importance-weighted average of `−∂ΔF/∂ρ_k` over the
+/// same draws.  Because value and gradient come from one set of draws and one
+/// target, they are mutually consistent — the contract the outer REML needs.
+///
+/// Determinism: draws come from a fixed-seed RNG so the inner evaluation is a
+/// pure function of `(β̂, H, ρ)` and the outer optimizer sees a smooth,
+/// reproducible objective rather than Monte-Carlo jitter across evaluations.
+pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
+    target: &T,
+) -> Result<BlockSampledMarginal, String> {
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    let m = target.block_dim();
+    let k = target.rho_dim();
+    if m == 0 {
+        return Ok(BlockSampledMarginal {
+            value: 0.0,
+            rho_gradient: Array1::zeros(k),
+            importance_ess: 0.0,
+            n_draws: 0,
+        });
+    }
+    let lambdas = target.block_curvatures();
+    if lambdas.len() != m {
+        return Err(format!(
+            "block_sampled_marginal_correction: block_curvatures len {} != block_dim {m}",
+            lambdas.len()
+        ));
+    }
+    let inv_sqrt_lambda: Array1<f64> = lambdas.mapv(|l| {
+        if l > 0.0 {
+            1.0 / l.sqrt()
+        } else {
+            // A non-positive block curvature means the mode is not a strict
+            // minimum in this direction; the Laplace Gaussian is undefined
+            // there. Reject rather than fabricate a correction.
+            f64::NAN
+        }
+    });
+    if inv_sqrt_lambda.iter().any(|v| !v.is_finite()) {
+        return Err(
+            "block_sampled_marginal_correction: non-positive block curvature (mode is not a \
+             strict local minimum in a sampled direction)"
+                .to_string(),
+        );
+    }
+
+    let n_draws = block_sampling_draws(m);
+    // Fixed seed → deterministic, jitter-free inner objective. The seed is
+    // mixed from the block geometry so different blocks/curvatures get
+    // independent streams without any external state.
+    let mut seed_bits: u64 = 0x9E37_79B9_7F4A_7C15;
+    for &l in lambdas.iter() {
+        seed_bits ^= l.to_bits().rotate_left(17);
+        seed_bits = seed_bits.wrapping_mul(0x1000_0000_01B3);
+    }
+    let mut rng = StdRng::seed_from_u64(seed_bits);
+
+    // Accumulate log-weights w_s = −ΔF(t_s) (stable log-mean-exp) and the
+    // gradient channel g_{s,k} = −∂ΔF/∂ρ_k(t_s).
+    let mut log_weights = Vec::with_capacity(n_draws);
+    let mut grad_samples: Vec<Array1<f64>> = Vec::with_capacity(n_draws);
+    let mut t = Array1::<f64>::zeros(m);
+    for _ in 0..n_draws {
+        for r in 0..m {
+            let z = sample_standard_normal(&mut rng);
+            t[r] = z * inv_sqrt_lambda[r];
+        }
+        let excess = target.excess(&t);
+        if !excess.is_finite() {
+            // An infeasible / divergent draw contributes zero weight rather
+            // than poisoning the estimate.
+            log_weights.push(f64::NEG_INFINITY);
+            grad_samples.push(Array1::zeros(k));
+            continue;
+        }
+        log_weights.push(-excess);
+        let mut g = target.excess_rho_gradient(&t);
+        // gradient channel is −∂ΔF/∂ρ
+        g.mapv_inplace(|v| -v);
+        grad_samples.push(g);
+    }
+
+    // Stable log-mean-exp for Δ_b = log mean_s exp(log_weights_s).
+    let max_lw = log_weights
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !max_lw.is_finite() {
+        return Err(
+            "block_sampled_marginal_correction: all importance draws were infeasible".to_string(),
+        );
+    }
+    let mut sum_w = 0.0_f64;
+    let mut sum_w2 = 0.0_f64;
+    let mut grad_acc = Array1::<f64>::zeros(k);
+    for (lw, g) in log_weights.iter().zip(grad_samples.iter()) {
+        let w = (lw - max_lw).exp();
+        sum_w += w;
+        sum_w2 += w * w;
+        grad_acc.scaled_add(w, g);
+    }
+    let value = max_lw + (sum_w / n_draws as f64).ln();
+    // Self-normalized importance-weighted gradient E_p[−∂ΔF/∂ρ].
+    let rho_gradient = if sum_w > 0.0 {
+        grad_acc / sum_w
+    } else {
+        Array1::zeros(k)
+    };
+    // Kish effective sample size of the importance weights.
+    let importance_ess = if sum_w2 > 0.0 {
+        (sum_w * sum_w) / sum_w2
+    } else {
+        0.0
+    };
+
+    if !value.is_finite() || rho_gradient.iter().any(|v| !v.is_finite()) {
+        return Err(
+            "block_sampled_marginal_correction: produced a non-finite correction or gradient"
+                .to_string(),
+        );
+    }
+
+    Ok(BlockSampledMarginal {
+        value,
+        rho_gradient,
+        importance_ess,
+        n_draws,
+    })
 }
 
 /// Result of joint (β, ρ) sampling.
