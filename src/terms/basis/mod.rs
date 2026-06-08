@@ -2251,6 +2251,17 @@ pub struct MaternBasisSpec {
     /// When None, isotropic distance r = ‖x - c‖ is used.
     #[serde(default)]
     pub aniso_log_scales: Option<Vec<f64>>,
+    /// Frozen double-penalty nullspace-shrinkage decision (gam#787/#860).
+    ///
+    /// `None` (the default, and the cold-build value) = decide whether to emit
+    /// the `DoublePenaltyNullspace` candidate via the κ-dependent spectral test in
+    /// `build_nullspace_shrinkage_penalty`. `Some(b)` = force the decision (set by
+    /// the freeze step from the bootstrap-κ build, mirrored from
+    /// `MaternIdentifiability::FrozenTransform`) so the learned-penalty count stays
+    /// invariant as the κ-optimizer rebuilds the design at each trial length-scale.
+    /// Only consulted when `double_penalty` is true.
+    #[serde(default)]
+    pub nullspace_shrinkage_survived: Option<bool>,
 }
 
 /// Per-smooth identifiability policy for Matérn kernel coefficients.
@@ -2270,7 +2281,27 @@ pub enum MaternIdentifiability {
     /// Use this when explicit linear terms should own global trends.
     CenterLinearOrthogonal,
     /// Freeze a fit-time transform `Z` so prediction cannot drift.
-    FrozenTransform { transform: Array2<f64> },
+    ///
+    /// `nullspace_shrinkage_survived` freezes the double-penalty
+    /// nullspace-shrinkage decision alongside the transform (gam#787/#860). The
+    /// matern double-penalty path emits a `DoublePenaltyNullspace` candidate iff
+    /// `build_nullspace_shrinkage_penalty(&projected_kernel)` finds a near-zero
+    /// eigenvalue — but that spectral test is κ-DEPENDENT (its tolerance scales
+    /// with `λ_max`), so a near-zero eigenvalue can cross the threshold as the
+    /// κ-optimizer rebuilds the design at each trial length-scale. That flips the
+    /// learned-penalty count 6↔7 across the rebuild and the rebuilt design's ρ
+    /// dimension then disagrees with the frozen joint setup ("joint hyper rho
+    /// dimension mismatch" → every κ seed fails startup validation). Freezing the
+    /// bootstrap-κ decision here (`Some(true)` = always emit the shrinkage
+    /// candidate, `Some(false)` = never) keeps the penalty count INVARIANT across
+    /// the κ rebuild so κ actually optimizes. `None` = decide via the spectral
+    /// test (the non-frozen / cold-build behavior; also the serde back-compat
+    /// default for transforms frozen before this field existed).
+    FrozenTransform {
+        transform: Array2<f64>,
+        #[serde(default)]
+        nullspace_shrinkage_survived: Option<bool>,
+    },
 }
 
 /// Duchon null-space polynomial degree.
@@ -2665,6 +2696,13 @@ pub enum BasisMetadata {
         /// Per-axis anisotropy log-scales η_a for geometric anisotropy.
         /// When Some, distance is r = √(Σ_a exp(2η_a) · (x_a - c_a)²).
         aniso_log_scales: Option<Vec<f64>>,
+        /// Realized double-penalty nullspace-shrinkage decision at this build
+        /// (gam#787/#860). The freeze step pins this into
+        /// `MaternIdentifiability::FrozenTransform::nullspace_shrinkage_survived`
+        /// so the κ-optimizer's per-trial rebuilds keep the learned-penalty count
+        /// invariant (otherwise the κ-dependent spectral test flips it 6↔7 → "joint
+        /// hyper rho dimension mismatch").
+        nullspace_shrinkage_survived: bool,
     },
     Duchon {
         centers: Array2<f64>,
@@ -14664,7 +14702,7 @@ fn matern_identifiability_transform(
             let q = polynomial_block_from_order(centers, effective_order);
             Ok(Some(kernel_constraint_nullspace_from_matrix(q.view())?))
         }
-        MaternIdentifiability::FrozenTransform { transform } => {
+        MaternIdentifiability::FrozenTransform { transform, .. } => {
             if transform.nrows() != k {
                 crate::bail_dim_basis!(
                     "frozen Matérn identifiability transform mismatch: centers={k}, transform rows={}",
@@ -14705,24 +14743,68 @@ fn build_matern_operator_penalty_candidates(
     ))
 }
 
-fn build_matern_double_penalty_candidates(
-    spline: &MaternSplineBasis,
-    full_transform: Option<&Array2<f64>>,
-) -> Result<Vec<PenaltyCandidate>, BasisError> {
-    let primary = project_penalty_matrix(&spline.penalty_kernel, full_transform);
+/// Decide whether the matern double-penalty path emits the
+/// `DoublePenaltyNullspace` shrinkage candidate, honoring a FROZEN bootstrap-κ
+/// decision when one is present (gam#787/#860). `frozen` is
+/// `MaternIdentifiability::FrozenTransform`'s `nullspace_shrinkage_survived`:
+/// `Some(b)` forces the answer (so the learned-penalty count stays invariant as
+/// the κ-optimizer rebuilds the design), `None` falls back to the κ-dependent
+/// spectral test (the cold-build / non-frozen behavior). Returns the emitted
+/// candidate list together with the realized decision so the caller can record
+/// it into the basis metadata for the freeze step.
+fn matern_double_penalty_candidates_with_decision(
+    primary: &Array2<f64>,
+    frozen: Option<bool>,
+) -> Result<(Vec<PenaltyCandidate>, bool), BasisError> {
     let mut candidates = vec![normalize_penalty_candidate(
         primary.clone(),
         0,
         PenaltySource::Primary,
     )];
-    if let Some(shrinkage) = build_nullspace_shrinkage_penalty(&primary)? {
-        candidates.push(normalize_penalty_candidate(
-            shrinkage.sym_penalty,
-            0,
-            PenaltySource::DoublePenaltyNullspace,
-        ));
-    }
-    Ok(candidates)
+    let survived = match frozen {
+        Some(forced) => {
+            if forced && let Some(shrinkage) = build_nullspace_shrinkage_penalty(primary)? {
+                candidates.push(normalize_penalty_candidate(
+                    shrinkage.sym_penalty,
+                    0,
+                    PenaltySource::DoublePenaltyNullspace,
+                ));
+                true
+            } else {
+                // Forced ON but the projected kernel has no near-zero direction
+                // at this κ (so there is literally no shrinkage subspace to
+                // build), OR forced OFF: emit only the primary kernel penalty.
+                // Forced-ON-without-a-subspace cannot manufacture a 7th penalty,
+                // but the frozen path only sets `Some(true)` when the bootstrap κ
+                // DID find a subspace, and the projected-kernel null space is a
+                // geometric property of the centers/transform (κ rescales every
+                // eigenvalue together), so the subspace persists across rebuilds.
+                false
+            }
+        }
+        None => {
+            if let Some(shrinkage) = build_nullspace_shrinkage_penalty(primary)? {
+                candidates.push(normalize_penalty_candidate(
+                    shrinkage.sym_penalty,
+                    0,
+                    PenaltySource::DoublePenaltyNullspace,
+                ));
+                true
+            } else {
+                false
+            }
+        }
+    };
+    Ok((candidates, survived))
+}
+
+fn build_matern_double_penalty_candidates(
+    spline: &MaternSplineBasis,
+    full_transform: Option<&Array2<f64>>,
+    frozen_nullspace_shrinkage_survived: Option<bool>,
+) -> Result<(Vec<PenaltyCandidate>, bool), BasisError> {
+    let primary = project_penalty_matrix(&spline.penalty_kernel, full_transform);
+    matern_double_penalty_candidates_with_decision(&primary, frozen_nullspace_shrinkage_survived)
 }
 
 /// Creates a Matérn spline basis from data and centers.
@@ -15718,6 +15800,21 @@ pub fn build_matern_basiswithworkspace(
             z.clone()
         }
     });
+    // Frozen double-penalty nullspace-shrinkage decision carried by a
+    // FrozenTransform identifiability (gam#787/#860). `None` for cold/non-frozen
+    // builds → decide via the κ-dependent spectral test; `Some(b)` (set at the
+    // bootstrap-κ freeze) forces the decision so the learned-penalty count is
+    // invariant across the κ optimizer's per-trial design rebuilds.
+    let frozen_nullspace_shrinkage_survived = match &spec.identifiability {
+        MaternIdentifiability::FrozenTransform {
+            nullspace_shrinkage_survived,
+            ..
+        } => *nullspace_shrinkage_survived,
+        _ => None,
+    };
+    // Realized decision, recorded into metadata so the freeze step can pin it.
+    // Each candidate-emission arm below overwrites this with its actual outcome.
+    let mut realized_nullspace_shrinkage_survived = false;
     let design_cols =
         z_opt.as_ref().map_or(centers.nrows(), Array2::ncols) + usize::from(spec.include_intercept);
     let dense_bytes = dense_design_bytes(data.nrows(), design_cols);
@@ -15754,18 +15851,11 @@ pub fn build_matern_basiswithworkspace(
                 aniso.as_deref(),
             )?;
             let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
-            let mut candidates = vec![normalize_penalty_candidate(
-                primary.clone(),
-                0,
-                PenaltySource::Primary,
-            )];
-            if let Some(shrinkage) = build_nullspace_shrinkage_penalty(&primary)? {
-                candidates.push(normalize_penalty_candidate(
-                    shrinkage.sym_penalty,
-                    0,
-                    PenaltySource::DoublePenaltyNullspace,
-                ));
-            }
+            let (candidates, survived) = matern_double_penalty_candidates_with_decision(
+                &primary,
+                frozen_nullspace_shrinkage_survived,
+            )?;
+            realized_nullspace_shrinkage_survived = survived;
             candidates
         } else {
             build_matern_operator_penalty_candidates(
@@ -15840,18 +15930,11 @@ pub fn build_matern_basiswithworkspace(
                 aniso.as_deref(),
             )?;
             let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
-            let mut candidates = vec![normalize_penalty_candidate(
-                primary.clone(),
-                0,
-                PenaltySource::Primary,
-            )];
-            if let Some(shrinkage) = build_nullspace_shrinkage_penalty(&primary)? {
-                candidates.push(normalize_penalty_candidate(
-                    shrinkage.sym_penalty,
-                    0,
-                    PenaltySource::DoublePenaltyNullspace,
-                ));
-            }
+            let (candidates, survived) = matern_double_penalty_candidates_with_decision(
+                &primary,
+                frozen_nullspace_shrinkage_survived,
+            )?;
+            realized_nullspace_shrinkage_survived = survived;
             candidates
         } else {
             build_matern_operator_penalty_candidates(
@@ -15882,7 +15965,13 @@ pub fn build_matern_basiswithworkspace(
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(m.basis.clone()))
         };
         let candidates = if spec.double_penalty {
-            build_matern_double_penalty_candidates(&m, full_transform.as_ref())?
+            let (candidates, survived) = build_matern_double_penalty_candidates(
+                &m,
+                full_transform.as_ref(),
+                frozen_nullspace_shrinkage_survived,
+            )?;
+            realized_nullspace_shrinkage_survived = survived;
+            candidates
         } else {
             build_matern_operator_penalty_candidates(
                 centers.view(),
@@ -15911,6 +16000,7 @@ pub fn build_matern_basiswithworkspace(
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: aniso,
+            nullspace_shrinkage_survived: realized_nullspace_shrinkage_survived,
         },
         kronecker_factored: None,
         ops,
@@ -34256,6 +34346,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.design.nrows(), data.nrows());
@@ -34291,6 +34382,7 @@ mod tests {
                 double_penalty: false,
                 identifiability: MaternIdentifiability::None,
                 aniso_log_scales: None,
+                nullspace_shrinkage_survived: None,
             };
             build_matern_basis(data.view(), &spec)
                 .expect("Matérn basis should build")
@@ -34351,6 +34443,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::None,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         let dense = out.design.to_dense();
@@ -34386,6 +34479,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         // (k-1) constrained kernel cols + explicit intercept.
@@ -34407,6 +34501,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 1);
@@ -34429,6 +34524,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
         assert_eq!(out.penalties.len(), 2);
@@ -34440,6 +34536,65 @@ mod tests {
             out.penaltyinfo[1].source,
             PenaltySource::DoublePenaltyNullspace
         ));
+    }
+
+    /// gam#787/#860: a frozen `nullspace_shrinkage_survived` decision overrides
+    /// the κ-dependent spectral test so the κ-optimizer's per-trial rebuilds keep
+    /// the learned-penalty count INVARIANT. The intercept config above emits 2
+    /// penalties under the spectral test (`None`); freezing the decision to
+    /// `Some(false)` must drop the shrinkage candidate (count → 1) and freezing
+    /// to `Some(true)` must keep it (count → 2), regardless of length-scale.
+    #[test]
+    fn matern_frozen_nullspace_decision_overrides_spectral_test() {
+        let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.4, 0.7]];
+        let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        // Reuse the surviving-shrinkage center sum-to-zero transform as a frozen
+        // transform so we exercise the FrozenTransform path with a pinned decision.
+        let z = matern_identifiability_transform(
+            centers.view(),
+            &MaternIdentifiability::CenterSumToZero,
+        )
+        .expect("transform builds")
+        .expect("center sum-to-zero yields a transform");
+        let base = |survived: Option<bool>| MaternBasisSpec {
+            periodic: None,
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            length_scale: 1.1,
+            nu: MaternNu::ThreeHalves,
+            include_intercept: true,
+            double_penalty: true,
+            identifiability: MaternIdentifiability::FrozenTransform {
+                transform: z.clone(),
+                nullspace_shrinkage_survived: survived,
+            },
+            aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
+        };
+        // Frozen OFF → only the primary kernel penalty survives.
+        let off = build_matern_basis(data.view(), &base(Some(false)))
+            .expect("Matérn basis should build with frozen-off shrinkage");
+        assert_eq!(
+            off.penalties.len(),
+            1,
+            "frozen Some(false) must suppress the DoublePenaltyNullspace candidate"
+        );
+        assert!(matches!(off.penaltyinfo[0].source, PenaltySource::Primary));
+        // Frozen ON → the shrinkage block is kept, INVARIANT across length-scale.
+        for length_scale in [0.6_f64, 1.1, 3.0] {
+            let mut spec_on = base(Some(true));
+            spec_on.length_scale = length_scale;
+            let on = build_matern_basis(data.view(), &spec_on)
+                .expect("Matérn basis should build with frozen-on shrinkage");
+            assert_eq!(
+                on.penalties.len(),
+                2,
+                "frozen Some(true) must keep the shrinkage block at length_scale={length_scale}"
+            );
+            assert!(matches!(
+                on.penaltyinfo[1].source,
+                PenaltySource::DoublePenaltyNullspace
+            ));
+        }
     }
 
     #[test]
@@ -34455,6 +34610,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn derivative should build");
@@ -34525,6 +34681,7 @@ mod tests {
             double_penalty: true,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
             .expect("analytic Matérn double-penalty derivative should build");
@@ -36228,6 +36385,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: None,
+            nullspace_shrinkage_survived: None,
         };
         let analytic = build_matern_basis_log_kappasecond_derivative(data.view(), &spec)
             .expect("analytic Matérn second derivative should build");
@@ -36289,6 +36447,7 @@ mod tests {
             double_penalty: false,
             identifiability: MaternIdentifiability::CenterSumToZero,
             aniso_log_scales: Some(vec![0.1, -0.1]),
+            nullspace_shrinkage_survived: None,
         };
 
         let basis = build_matern_basis(data.view(), &spec).expect("aniso Matérn basis");

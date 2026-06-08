@@ -43,6 +43,7 @@ fn forward_kernel(
         double_penalty: false,
         identifiability: MaternIdentifiability::None,
         aniso_log_scales: aniso.map(<[f64]>::to_vec),
+        nullspace_shrinkage_survived: None,
     };
     build_matern_basis(points, &spec)
         .expect("forward Matérn kernel should build")

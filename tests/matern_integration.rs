@@ -65,6 +65,7 @@ fn matern_fit_term_collection_gaussian_simulated_10d() {
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
+                    nullspace_shrinkage_survived: None,
                     periodic: None,
                 },
                 input_scales: None,
@@ -162,6 +163,7 @@ fn matern_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
                     double_penalty: true,
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     aniso_log_scales: None,
+                    nullspace_shrinkage_survived: None,
                     periodic: None,
                 },
                 input_scales: None,
@@ -304,6 +306,7 @@ fn matern_3d_aniso_fits_successfully() {
                     identifiability: MaternIdentifiability::CenterSumToZero,
                     // Sentinel zeros: will be replaced by knot-cloud initialization.
                     aniso_log_scales: Some(vec![0.0; d]),
+                    nullspace_shrinkage_survived: None,
                     periodic: None,
                 },
                 input_scales: None,

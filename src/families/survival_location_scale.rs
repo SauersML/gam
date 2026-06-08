@@ -12083,6 +12083,7 @@ mod tests {
                         double_penalty: false,
                         identifiability: MaternIdentifiability::CenterSumToZero,
                         aniso_log_scales: Some(vec![0.0, 0.0]),
+                        nullspace_shrinkage_survived: None,
                     },
                     input_scales: None,
                 },
