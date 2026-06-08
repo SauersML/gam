@@ -12859,11 +12859,37 @@ fn gaussian_reml_optimize_latent<'py>(
         .map_err(py_value_error)?;
 
     // Final gradient norm at the chosen latent, as a convergence diagnostic.
+    // Report the PROJECTED (Riemannian) gradient — the quantity the trust region
+    // actually tests against `grad_tol` (`g_norm` in optimizer.rs) — not the raw
+    // ambient gradient. On the circle/torus the ambient gradient carries a
+    // normal component the optimizer never sees; reporting it inflated the norm
+    // and made `converged` disagree with the optimizer's own stopping test
+    // (issue #879). On a Euclidean manifold the tangent projection is the
+    // identity, so this leaves that path byte-identical.
     let (_, final_grad) = problem.value_and_grad(best_t.view(), true);
-    let grad_t_norm = final_grad
-        .as_ref()
-        .map(|g| g.iter().map(|v| v * v).sum::<f64>().sqrt())
-        .unwrap_or(f64::INFINITY);
+    let grad_t_norm = match final_grad.as_ref() {
+        Some(g) => {
+            let projected = manifold_box
+                .as_ref()
+                .project_tangent(best_t.view(), g.view())
+                .unwrap_or_else(|_| g.clone());
+            projected.iter().map(|v| v * v).sum::<f64>().sqrt()
+        }
+        None => f64::INFINITY,
+    };
+    // Latent spread: a genuine collapse (all rows retract to one latent
+    // coordinate, the issue #876 failure mode) leaves `latent_t_std ≈ 0`, which
+    // distinguishes it from a healthy fit whose latent gradient merely failed to
+    // reach `grad_tol`.
+    let latent_t_std = {
+        let n = best_t.len();
+        if n == 0 {
+            0.0
+        } else {
+            let mean = best_t.iter().sum::<f64>() / n as f64;
+            (best_t.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n as f64).sqrt()
+        }
+    };
 
     // Rebuild the full fit dictionary at the converged latent so callers get the
     // identical schema [`gaussian_reml_fit_latent`] returns, then echo `t`. The
@@ -12884,6 +12910,9 @@ fn gaussian_reml_optimize_latent<'py>(
         ..
     } = problem;
     let best_t_for_fit = best_t.clone();
+    // Retain the response for the #879 reconstruction-quality diagnostic; `y` is
+    // moved into the `move` fit closure below.
+    let y_for_diag = y.clone();
     let (fit, _design, aux_strength_state) =
         detach_py_result(py, "gaussian_reml_optimize_latent", move || {
             let registry = build_analytic_penalty_registry_from_json(Some(&latent_payload), None)?;
@@ -12909,6 +12938,39 @@ fn gaussian_reml_optimize_latent<'py>(
             )
         })?;
 
+    // Reconstruction quality of the decoder against the response, reported next
+    // to `converged` so model selection can distinguish a good decoder fit whose
+    // latent gradient simply did not reach `grad_tol` (near-interpolation the
+    // profiled scale stiffens the latent objective, so ‖∇ₜ‖ stays O(n) even at
+    // R²≈1 — issue #879) from a genuinely failed/collapsed fit. Computed over all
+    // (row, output) entries of the response and the fitted decoder image.
+    let (residual_ss, total_ss) = {
+        let fitted = &fit.fitted;
+        let mean = if y_for_diag.is_empty() {
+            0.0
+        } else {
+            y_for_diag.iter().sum::<f64>() / y_for_diag.len() as f64
+        };
+        let mut rss = 0.0;
+        let mut tss = 0.0;
+        for (&yi, &fi) in y_for_diag.iter().zip(fitted.iter()) {
+            rss += (yi - fi) * (yi - fi);
+            tss += (yi - mean) * (yi - mean);
+        }
+        (rss, tss)
+    };
+    let response_residual_norm = residual_ss.sqrt();
+    // R² = 1 − RSS/TSS; a degenerate (constant) response has TSS = 0, in which
+    // case a zero residual is a perfect fit (1.0) and any residual is reported as
+    // 0.0 rather than a spurious −∞.
+    let response_r2 = if total_ss > 0.0 {
+        1.0 - residual_ss / total_ss
+    } else if residual_ss == 0.0 {
+        1.0
+    } else {
+        0.0
+    };
+
     let out = PyDict::new(py);
     set_ok_gaussian_reml_items(py, &out, fit)?;
     set_aux_strength_items(py, &out, aux_strength_state)?;
@@ -12921,6 +12983,9 @@ fn gaussian_reml_optimize_latent<'py>(
     out.set_item("t_flat", best_t.into_pyarray(py))?;
     out.set_item("grad_t_norm", grad_t_norm)?;
     out.set_item("converged", grad_t_norm <= grad_tol)?;
+    out.set_item("latent_t_std", latent_t_std)?;
+    out.set_item("response_r2", response_r2)?;
+    out.set_item("response_residual_norm", response_residual_norm)?;
     out.set_item("objective_value", best_value)?;
     out.set_item("n_restarts", n_restarts)?;
     out.set_item("init", init)?;
