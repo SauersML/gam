@@ -11579,9 +11579,10 @@ impl GaussianLocationScaleWiggleFamily {
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_u)
             - &(&dm_u * &geom.d2q_dq02)
             - &(&rows.m * &g2_u);
-        // coeff_ml_u = ∂(2κmD)/∂u = 2κ(dm_u·D + m·s1_u) + 2κ'·ζ·m·D.
-        let coeff_ml_u = 2.0 * &rows.kappa * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
-            + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m * &geom.dq_dq0);
+        // coeff_ml (μ↔logσ) is mean⊥scale Fisher 0 (E[m]=0), so both its
+        // β-drift derivative coeff_ml_u and the mixed coeff_ml_a_u are 0.
+        let n = rows.m.len();
+        let coeff_ml_u = Array1::<f64>::zeros(n);
         // Fisher (ls,ls) coeff_ll = 2κ²a (#566); ∂(2κ²a)/∂η = 4κκ'a, so the
         // β-drift derivative along ζ is 4κκ'a·ζ.
         let coeff_ll_u = 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * &zeta;
@@ -11594,17 +11595,8 @@ impl GaussianLocationScaleWiggleFamily {
             - &(&dm_a * &g2_u)
             - &(&dm_u * &g2_a)
             - &(&rows.m * &g2_a_u);
-        // coeff_ml_a_u = ∂²(2κmD)/∂a∂u — full mixed second derivative,
-        // including the η_au = zls_a_u leg picking up 2κ'·η_au·m·D.
-        let coeff_ml_a_u = 2.0
-            * &rows.kappa
-            * &(&dm_a_u * &geom.dq_dq0 + &dm_a * &s1_u + &dm_u * &s1_a + &rows.m * &s1_a_u)
-            + 2.0
-                * &rows.kappa_prime
-                * &(e_a * &(&dm_u * &geom.dq_dq0 + &rows.m * &s1_u)
-                    + &zeta * &(&dm_a * &geom.dq_dq0 + &rows.m * &s1_a))
-            + 2.0 * &rows.kappa_dprime * &(e_a * &zeta) * &rows.m * &geom.dq_dq0
-            + 2.0 * &rows.kappa_prime * &zls_a_u * &(&rows.m * &geom.dq_dq0);
+        // coeff_ml_a_u = ∂²(coeff_ml)/∂a∂u = 0 (coeff_ml ≡ Fisher 0).
+        let coeff_ml_a_u = Array1::<f64>::zeros(n);
         // coeff_ll_a_u = ∂²(2κ²a)/∂a∂u for the Fisher (ls,ls) block (#566):
         // 4a(κ'²+κκ'')·e_a·ζ + 4κκ'a·η_au (the η_au=zls_a_u mixed leg), mirroring
         // the dense mixed-drift helper.
@@ -11622,14 +11614,12 @@ impl GaussianLocationScaleWiggleFamily {
         let c_u = -&dm_u;
         let c_a = -&dm_a;
         let c_a_u = -&dm_a_u;
-        // l = 2κm; pick up κ'/κ'' on each direction; η_au leg adds κ'.
-        let l = 2.0 * &rows.kappa * &rows.m;
-        let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(&zeta * &rows.m);
-        let l_a = 2.0 * &rows.kappa * &dm_a + 2.0 * &rows.kappa_prime * &(e_a * &rows.m);
-        let l_a_u = 2.0 * &rows.kappa * &dm_a_u
-            + 2.0 * &rows.kappa_prime * &(e_a * &dm_u + &zeta * &dm_a)
-            + 2.0 * &rows.kappa_dprime * &(e_a * &zeta) * &rows.m
-            + 2.0 * &rows.kappa_prime * &zls_a_u * &rows.m;
+        // l (logσ↔wiggle) is mean⊥scale Fisher 0 (wiggle is mean-side), so its
+        // β-drift (l_u), ψ (l_a), and mixed (l_a_u) derivatives all vanish.
+        let l = Array1::<f64>::zeros(n);
+        let l_u = Array1::<f64>::zeros(n);
+        let l_a = Array1::<f64>::zeros(n);
+        let l_a_u = Array1::<f64>::zeros(n);
 
         let hmm_a1 = weighted_crossprod_psi_maps(
             xmu_map,
