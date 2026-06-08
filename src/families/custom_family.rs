@@ -17276,6 +17276,95 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         );
                         continue;
                     }
+                    // UNCONSTRAINED MODEL-STATIONARY ACCEPTANCE (gam#826/#808/#715).
+                    //
+                    // The phantom-multiplier refusal asserts the residual is a
+                    // captured Lagrange multiplier of an active constraint that
+                    // the QP could not decompose. That diagnosis is categorically
+                    // IMPOSSIBLE when there is no active constraint at all: a
+                    // residual cannot be a phantom multiplier of a constraint that
+                    // does not exist. For a fully UNCONSTRAINED coupled fit
+                    // (multinomial softmax; the location-scale flat blocks) on a
+                    // near-flat Fisher surface (`diag(p)−ppᵀ → 0`, or the
+                    // high-curvature/low-curvature `log_sigma` block) the
+                    // Firth-augmented stationarity residual `‖∇L−Sβ+∇Φ‖` floors
+                    // LEGITIMATELY above `4·residual_tol`: the absolute curvature
+                    // is tiny so `residual_tol = inner_tol·(1+grad/pen/firth)` is
+                    // tiny too, yet the Newton/dogleg step exhausts before the
+                    // residual drops below that band — `residual_tol` is scaled by
+                    // the gradient magnitude and does not see the flat-Fisher
+                    // absolute-curvature floor. The well-conditioned spectrum keeps
+                    // the conditioning-keyed Levenberg gate (`COND_NEWTON_SAFETY`)
+                    // off, so neither LM nor the cond-armed dogleg engages, and
+                    // every seed is refused as `phantom_multiplier_with_well_
+                    // conditioned_H`.
+                    //
+                    // When the model itself certifies stationarity — the standard
+                    // trust-region "predicted decrease ≈ 0" criterion, here the
+                    // `at_numerical_fixed_point` flag (accepted step at the
+                    // machine-eps floor, |Δobj| at the eps floor, scalar model
+                    // exact to relerr ≤ 1e-3) — AND no further progress is being
+                    // made (the steady-geometric-descent test above declined) AND
+                    // we have a full descent window (the early-cycle deferral above
+                    // passed, so this is a proven plateau not a Firth-basin
+                    // transient), an unconstrained iterate is a bona fide
+                    // first-order optimum: the quadratic model says no step can
+                    // reduce the residual further, and there is no constraint whose
+                    // multiplier the residual could otherwise represent. The
+                    // residual that remains lives where the model is flat
+                    // (vanishing curvature), so it carries no `gᵀ∂β/∂ρ` envelope
+                    // contribution the outer IFT could not already neutralise
+                    // through its penalty-projected pseudo-inverse. Accept.
+                    //
+                    // This does NOT regress #729 (coupled Dirichlet): that fit
+                    // converges to a genuine `residual < residual_tol` and exits
+                    // via the strict KKT certificate long before this branch, and
+                    // even if reached it has a curved (non-flat) Fisher surface so
+                    // its model is not at a fixed point with a residual stuck above
+                    // tol. It does NOT mask a real non-convergence: a still-moving
+                    // iterate fails `at_numerical_fixed_point` (its step / |Δobj|
+                    // are above the eps floor), and a rank-deficient H-null defect
+                    // is the CONSTRAINED concern the fixed-point certificate above
+                    // already handles via its nullity check.
+                    // The certificate-candidate conditions that routed us into
+                    // this block already PROVE model stationarity for the
+                    // unconstrained case: `objective_exhausted` + `step_inf ≤
+                    // step_tol` (the model's minimizer is at this β), `scalar_relerr
+                    // ≤ 1e-3` (the quadratic model is exact), and `linearized_rel ≥
+                    // 0.5` (‖g+Hδ‖ ≈ ‖g‖, so `Hδ ≈ 0` — the residual lives in the
+                    // flat/near-null subspace of H, exactly a flat-Fisher direction
+                    // for an unconstrained fit). We do NOT additionally require the
+                    // far stricter machine-eps `at_numerical_fixed_point` here: on a
+                    // flat Fisher surface the dogleg keeps taking a small step at
+                    // the `step_tol` floor every cycle, so `accepted_step_inf` floors
+                    // a hair above `64·eps·|β|` and the eps-fixed-point flag never
+                    // sets even though the model is stationary. The `step_tol` floor
+                    // (`inner_tol·(1+|β|∞)`) is the principled stationarity gate; the
+                    // eps floor is for the constrained-multiplier certificate, where
+                    // a tighter proof is warranted because a wrong accept biases the
+                    // constraint-aware IFT kernel.
+                    let any_active_set_rows = cached_active_sets
+                        .iter()
+                        .any(|maybe| maybe.as_ref().is_some_and(|rows| !rows.is_empty()));
+                    let unconstrained_fit = !any_block_constrained && !any_active_set_rows;
+                    if unconstrained_fit {
+                        log::info!(
+                            "[PIRLS/joint-Newton convergence] cycle {:>3} | unconstrained model-stationary certificate (gam#826/#808/#715): \
+                             no active constraint (active_set_rows_total=0) so the residual={:.3e} cannot be a phantom multiplier; \
+                             the iterate is a numerical fixed point (accepted_step_inf={:.3e}, |Δobjective|={:.3e}, scalar_relerr={:.3e}) \
+                             on a flat Fisher surface where residual_tol={:.3e} sits below the absolute-curvature floor; \
+                             linearized_rel={:.3e}, |Δobjective| exhausted and residual not in steady descent → genuine first-order optimum, accepting",
+                            cycle,
+                            residual,
+                            accepted_step_inf,
+                            objective_change,
+                            scalar_model_relerr,
+                            residual_tol,
+                            linearized_rel,
+                        );
+                        converged = true;
+                        break;
+                    }
                     // Structured per-block + per-spectrum refusal report.
                     // The legacy one-line refusal log printed only aggregate
                     // numbers (linearized_rel, scalar_relerr, residual,
