@@ -10122,13 +10122,11 @@ fn gls_wiggle_second_directional_coeffs(
         - &(&dm_u * g2_v)
         - &(&dm_v * g2_u)
         - &(&rows.m * g2_uv);
-    let a_md_v = &dm_v * &geom.dq_dq0 + &rows.m * s1_v;
-    let a_md_u = &dm_u * &geom.dq_dq0 + &rows.m * s1_u;
-    let coeff_ml_uv = 2.0
-        * &rows.kappa
-        * &(&dm_uv * &geom.dq_dq0 + &dm_u * s1_v + &dm_v * s1_u + &rows.m * s1_uv)
-        + 2.0 * &rows.kappa_prime * &(zeta_u * &a_md_v + zeta_v * &a_md_u)
-        + 2.0 * &rows.kappa_dprime * &zeta_u_zeta_v * &rows.m * &geom.dq_dq0;
+    let n = rows.m.len();
+    // H_{μ,ls} ≡ Fisher 0 (mean⊥scale orthogonality; the wiggle and μ both
+    // enter the mean, log σ is the only scale block), so every β-directional
+    // derivative — including this second-order one — is identically 0.
+    let coeff_ml_uv = Array1::<f64>::zeros(n);
     // Second directional derivative of the Fisher (log σ, log σ) block
     // coeff_ll = 2κ²a (#566). η_ls is linear in β (no zeta_uv), so the only
     // surviving term is ∂²(2κ²a)/∂η² · zeta_u·zeta_v = 4a(κ'²+κκ'')·zeta_u·zeta_v
@@ -10144,11 +10142,11 @@ fn gls_wiggle_second_directional_coeffs(
     let c_u = -&dm_u;
     let c_v = -&dm_v;
     let c_uv = -&dm_uv;
-    let l_u = 2.0 * &rows.kappa * &dm_u + 2.0 * &rows.kappa_prime * &(zeta_u * &rows.m);
-    let l_v = 2.0 * &rows.kappa * &dm_v + 2.0 * &rows.kappa_prime * &(zeta_v * &rows.m);
-    let l_uv = 2.0 * &rows.kappa * &dm_uv
-        + 2.0 * &rows.kappa_prime * &(zeta_u * &dm_v + zeta_v * &dm_u)
-        + 2.0 * &rows.kappa_dprime * &(&zeta_u_zeta_v * &rows.m);
+    // H_{ls,w} ≡ Fisher 0 (wiggle is mean-side; mean⊥scale), so all of its
+    // β-directional derivatives are 0.
+    let l_u = Array1::<f64>::zeros(n);
+    let l_v = Array1::<f64>::zeros(n);
+    let l_uv = Array1::<f64>::zeros(n);
 
     GlsWiggleSecondDirCoeffs {
         coeff_mm_uv,
@@ -10680,8 +10678,10 @@ impl GaussianLocationScaleWiggleFamily {
         let coeff_m_b1 = &(&a_u * &xi_v) + &(&a_v * &xi_u) + &c_uv;
         let coeff_m_b2 = &(&rows.w * &geom.dq_dq0 * &xi_u_xi_v) + &(&c_u * &xi_v) + &(&c_v * &xi_u);
         let coeff_m_b3 = -(&rows.m * &xi_u_xi_v);
+        // ls↔wiggle is Fisher-0 (mean⊥scale): the B' (coeff_ls_b1) and B''
+        // (coeff_ls_b2) channels of its second directional derivative vanish.
         let coeff_ls_b1 = &(&l_u * &xi_v) + &(&l_v * &xi_u);
-        let coeff_ls_b2 = 2.0 * &rows.kappa * &rows.m * &xi_u_xi_v;
+        let coeff_ls_b2 = Array1::<f64>::zeros(n);
         // Wiggle-wiggle from a_ab + a_ab^T + a_ij + a_ij^T + a_iwj + a_iwj^T + a_jwi + a_jwi^T:
         //   a_ab = B''^T diag(w·ξ_uξ_v) B    → pair (B, B'', w·ξ_uξ_v)
         //   a_ij = B'^T diag(w·ξ_uξ_v) B'   → pair (B', B', 2·w·ξ_uξ_v)  (a_ij + a_ij^T)
@@ -10878,10 +10878,13 @@ impl GaussianLocationScaleWiggleFamily {
             + &xt_diag_y_dense(xmu, &c_u, &basis1_v)?
             + &xt_diag_y_dense(xmu, &c_v, &basis1_u)?
             + &xt_diag_y_dense(xmu, &(-&rows.m), &basis1_uv)?;
+        // H_{ls,w} ≡ Fisher 0 (mean⊥scale): l_uv/l_u/l_v are 0 (shared helper)
+        // and the 2κm·B'' channel vanishes too.
+        let zeros_ls_b2 = Array1::<f64>::zeros(n);
         let h_lw = xt_diag_y_dense(x_ls, &l_uv, &geom.basis)?
             + &xt_diag_y_dense(x_ls, &l_u, &basis_v)?
             + &xt_diag_y_dense(x_ls, &l_v, &basis_u)?
-            + &xt_diag_y_dense(x_ls, &(2.0 * &rows.kappa * &rows.m), &basis_uv)?;
+            + &xt_diag_y_dense(x_ls, &zeros_ls_b2, &basis_uv)?;
         let a_ab = xt_diag_y_dense(&basis_uv, &rows.w, &geom.basis)?;
         let a_ij = xt_diag_y_dense(&basis_u, &rows.w, &basis_v)?;
         let a_iwj = xt_diag_y_dense(&basis_u, &dw_v, &geom.basis)?;
