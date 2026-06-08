@@ -32,7 +32,7 @@ use ndarray::{Array1, Array2, Array3};
 
 use crate::families::custom_family::{FamilyChannelHessian, PenaltyMatrix};
 use crate::families::identifiability_compiler::{
-    AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator,
+    AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
@@ -437,6 +437,21 @@ impl RowJacobianOperator for TimeBlockOperator {
         }
         out
     }
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+        // Scale straight out of the three compact `(n, p)` channel designs —
+        // the compiler consumes the `(n·K, p)` sqrt(H)-scaled design, so the
+        // dense `(n, p, K)` tensor (3 of its 4 channels held explicitly, the
+        // 4th identically zero) that `evaluate_full()` builds is never needed.
+        // (#738: a capability is not a representation.)
+        let n = self.dq0.nrows();
+        let p = self.dq0.ncols();
+        scale_jacobian_by_sqrt_h_with(n, p, K_SURVIVAL, h_full, |i, a, c| match c {
+            0 => self.dq0[[i, a]],
+            1 => self.dq1[[i, a]],
+            2 => self.dqd1[[i, a]],
+            _ => 0.0,
+        })
+    }
 }
 
 /// Row Jacobian operator for a block whose contribution flows into the
@@ -493,6 +508,18 @@ impl RowJacobianOperator for QChannelBlockOperator {
         }
         out
     }
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+        // q0 and q1 share `dq`; qd1 is `dqd1`; the g channel is identically
+        // zero. Scale directly from the compact `(n, p)` designs, skipping the
+        // dense `(n, p, K)` tensor `evaluate_full()` would build. (#738.)
+        let n = self.dq.nrows();
+        let p = self.dq.ncols();
+        scale_jacobian_by_sqrt_h_with(n, p, K_SURVIVAL, h_full, |i, a, c| match c {
+            0 | 1 => self.dq[[i, a]],
+            2 => self.dqd1[[i, a]],
+            _ => 0.0,
+        })
+    }
 }
 
 /// Row Jacobian operator for the survival logslope block: contribution
@@ -539,6 +566,17 @@ impl RowJacobianOperator for LogslopeBlockOperator {
             }
         }
         out
+    }
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+        // The logslope contribution lives entirely on the g channel (3); the
+        // other three channels are identically zero. Scale directly from the
+        // compact `(n, p)` design, skipping the mostly-zero dense `(n, p, K)`
+        // tensor `evaluate_full()` would build. (#738.)
+        let n = self.dg.nrows();
+        let p = self.dg.ncols();
+        scale_jacobian_by_sqrt_h_with(n, p, K_SURVIVAL, h_full, |i, a, c| {
+            if c == 3 { self.dg[[i, a]] } else { 0.0 }
+        })
     }
 }
 

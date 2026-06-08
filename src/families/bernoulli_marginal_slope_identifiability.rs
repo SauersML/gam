@@ -17,7 +17,7 @@ use ndarray::{Array1, Array2, Array3};
 
 use crate::families::custom_family::FamilyChannelHessian;
 use crate::families::identifiability_compiler::{
-    AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator,
+    AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::fast_ab;
 
@@ -184,6 +184,17 @@ impl RowJacobianOperator for BernoulliDenseDesignOperator {
             }
         }
         out
+    }
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+        // K=1: the only channel is `δη = design.row(i)·δβ`. Scale straight from
+        // the stored `(n, p)` design rather than reshaping it into a `(n, p, 1)`
+        // tensor first. (#738: a capability is not a representation.)
+        let n = self.design.nrows();
+        let p = self.design.ncols();
+        scale_jacobian_by_sqrt_h_with(n, p, 1, h_full, |i, a, c| {
+            debug_assert_eq!(c, 0, "K=1 operator has only channel 0");
+            self.design[[i, a]]
+        })
     }
 }
 
