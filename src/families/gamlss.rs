@@ -9345,8 +9345,11 @@ impl DesignTwoBlockRowCoeffOperator {
 ///   H = [[X_mu^T diag(w) X_mu,    X_mu^T diag(cross) X_ls],
 ///        [X_ls^T diag(cross) X_mu, X_ls^T diag(scale) X_ls]],
 ///
-/// with `cross = 2κm` and `scale = 2κ²a` (the Fisher/expected (log σ, log σ)
-/// information, #566 — see `exact_newton_joint_hessian`). The matvec applies
+/// with `cross = 0` and `scale = 2κ²a` — the block-diagonal Gaussian Fisher
+/// (expected) information (μ ⊥ σ, #684; residual-free (log σ, log σ) block,
+/// #566). This MUST match the dense `exact_newton_joint_hessian_from_designs`
+/// curvature object exactly: the observed cross term `2κm` (mean-zero noise)
+/// over-smooths the scale and is its Fisher expectation 0. The matvec applies
 /// each block by a single design-matrix multiply on each side, so the cost
 /// is Θ(n (p_mu + p_ls)) per `Hv` rather than Θ(n (p_mu + p_ls)²) to form
 /// the dense matrix.
@@ -9371,7 +9374,12 @@ impl GaussianLocationScaleHessianWorkspace {
         let eta_ls = &block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
         let rows = family.get_or_compute_row_scalars(etamu, eta_ls)?;
         let coeff_mm = rows.w.clone();
-        let coeff_ml = 2.0 * &rows.kappa * &rows.m;
+        // Fisher cross block E[H_{μ,ls}] = 2κ·E[m] = 0 (μ ⊥ σ; #684). The
+        // observed cross weight `2κm` is mean-zero noise that over-smooths the
+        // scale and desyncs this matrix-free operator from the dense
+        // `exact_newton_joint_hessian_from_designs` (which assembles cross = 0),
+        // corrupting the REML determinant fed by both paths.
+        let coeff_ml = Array1::<f64>::zeros(rows.kappa.len());
         // Fisher/expected (log σ, log σ) information E[H_{ls,ls}] = 2κ²a (#566):
         // the observed 2κ²n + κ'(a−n) collapses at small residuals and
         // over-smooths the scale; E[n]=a gives the residual-free 2κ²a, matching
@@ -9544,7 +9552,14 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         let rows = self.family.get_or_compute_row_scalars(etamu, eta_ls)?;
         let ximu = fast_av(self.xmu.as_ref(), &d_beta_flat.slice(s![0..pmu]));
         let xi_ls = fast_av(self.x_ls.as_ref(), &d_beta_flat.slice(s![pmu..total]));
-        let (c_mm, c_ml, c_ll) = gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
+        let directional = gaussian_joint_first_directionalweights(&rows, &ximu, &xi_ls);
+        let c_mm = directional.0;
+        let c_ll = directional.2;
+        // Fisher cross block ≡ 0 (μ ⊥ σ; #684), so its directional derivative is
+        // identically 0 — matching the dense
+        // `exact_newton_joint_hessian_directional_derivative_from_designs`, which
+        // likewise does not assemble `directional.1`.
+        let c_ml = Array1::<f64>::zeros(c_mm.len());
         Ok(Some(Arc::new(make_two_block_row_coeff_operator(
             self.xmu.clone(),
             self.x_ls.clone(),
@@ -9598,8 +9613,14 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         let xi_ls_u = fast_av(self.x_ls.as_ref(), &d_beta_u.slice(s![pmu..total]));
         let ximu_v = fast_av(self.xmu.as_ref(), &d_beta_v.slice(s![0..pmu]));
         let xi_ls_v = fast_av(self.x_ls.as_ref(), &d_beta_v.slice(s![pmu..total]));
-        let (c_mm, c_ml, c_ll) =
+        let directional =
             gaussian_jointsecond_directionalweights(&rows, &ximu_u, &xi_ls_u, &ximu_v, &xi_ls_v);
+        let c_mm = directional.0;
+        let c_ll = directional.2;
+        // Fisher cross block ≡ 0 (μ ⊥ σ; #684); its second directional
+        // derivative is identically 0 too — match the dense path (which does not
+        // assemble `directional.1`).
+        let c_ml = Array1::<f64>::zeros(c_mm.len());
         Ok(Some(Arc::new(make_two_block_row_coeff_operator(
             self.xmu.clone(),
             self.x_ls.clone(),
