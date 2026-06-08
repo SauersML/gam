@@ -28780,11 +28780,19 @@ mod tests {
         .expect("initial epsilons");
         let (base_family, blockspec, derivative_blocks) =
             build_spatial_adaptive_joint_hyper_scaffold(&baseline, &runtime_caches, &y, n);
+        // The analytic hypergradient is the *envelope* derivative dF/dρ = J_a +
+        // ½tr(H⁻¹ Ḣ_a), valid only at a converged inner mode (∂F/∂β = 0). The
+        // central-difference reference re-solves the inner mode at each θ±h, so a
+        // loosely-converged inner solve makes the FD probe and the analytic
+        // envelope evaluate two different functions and disagree on the
+        // tension-dominated direction (the stiffest β-mode of the 2-D Matérn,
+        // hence the largest residual ∂F/∂β at a partial solve). Drive the inner
+        // solve to f64-grade stationarity so the FD reference is exact.
         let outer_opts = BlockwiseFitOptions {
-            inner_max_cycles: 30,
-            inner_tol: 1e-6,
+            inner_max_cycles: 200,
+            inner_tol: 1e-10,
             outer_max_iter: 30,
-            outer_tol: 1e-6,
+            outer_tol: 1e-10,
             compute_covariance: false,
             ..BlockwiseFitOptions::default()
         };
