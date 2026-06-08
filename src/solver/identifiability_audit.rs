@@ -105,6 +105,24 @@ const DEFAULT_GAUGE_PRIORITY: u8 = 100;
 /// used before the leverage-scaled rewrite, restored as the report-band floor.
 const REPORT_FLOOR_NEAR_EXACT: f64 = 0.95;
 
+/// Absolute alias-boundary cosine: the ceiling on both the report band and the
+/// halt threshold, and the value returned directly when the per-pair null has
+/// zero width. A cosine at or above this is a floating-point near-exact alias
+/// (two basis directions that coincide to working precision) that must always
+/// fire regardless of the leverage-scaled K·σ band.
+const ALIAS_BOUNDARY_COSINE: f64 = 0.999;
+
+/// Family-wise false-positive rate `α` controlling the report-band K-multiplier
+/// `K = √(2·ln(2M/α))` over `M` candidate pairs. At `0.05` the band admits a
+/// pair only when its cosine sits well outside the multiple-comparison-adjusted
+/// null, keeping the audit's aliasing reports specific.
+const REPORT_BAND_FALSE_POSITIVE_RATE: f64 = 0.05;
+
+/// Estimated audit work (rows × blocks, or rows × total columns for the
+/// pairwise sweep) above which a periodic progress ticker is attached. Below
+/// this the audit completes fast enough that progress output is noise.
+const AUDIT_PROGRESS_TICKER_WORK_THRESHOLD: usize = 1_000_000;
+
 /// Per-block accounting record. `original_dim` is the spec's column
 /// count at audit entry (post `joint_null_rotation` absorption — the
 /// audit is contractually run on the rotated specs). `effective_dim`
@@ -403,7 +421,7 @@ fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 
     let k_report = if m_pairs <= 1 {
         3.0_f64
     } else {
-        (2.0 * (2.0 * m_pairs as f64 / 0.05_f64).ln())
+        (2.0 * (2.0 * m_pairs as f64 / REPORT_BAND_FALSE_POSITIVE_RATE).ln())
             .sqrt()
             .max(3.0)
     };
@@ -412,7 +430,9 @@ fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 
     // overlap that may be called an alias when the null has little width. Take
     // the larger of the two so a wide-σ pair uses K·σ while a narrow-σ pair
     // (near-uniform columns) requires a near-exact cosine.
-    (k_report * sigma).max(REPORT_FLOOR_NEAR_EXACT).min(0.999)
+    (k_report * sigma)
+        .max(REPORT_FLOOR_NEAR_EXACT)
+        .min(ALIAS_BOUNDARY_COSINE)
 }
 
 /// Overlap threshold above which the audit halts the fit for this pair.
@@ -433,9 +453,10 @@ fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 
 fn pair_halt_threshold(s2_a: f64, s2_b: f64, n: usize) -> f64 {
     let sigma = pair_null_sigma(s2_a, s2_b, n);
     if sigma <= 0.0 {
-        return 0.999_f64;
+        return ALIAS_BOUNDARY_COSINE;
     }
-    (10.0_f64 * sigma).clamp(0.05, 0.999)
+    // Floor 0.05 prevents pathological over-sensitivity on very long columns.
+    (10.0_f64 * sigma).clamp(0.05, ALIAS_BOUNDARY_COSINE)
 }
 
 /// Decide whether a cosine (signed) falls outside the bias-corrected null band.
@@ -577,7 +598,8 @@ fn audit_identifiability_impl(
     let mut col_offsets: Vec<usize> = Vec::with_capacity(specs.len() + 1);
     col_offsets.push(0);
     let block_phase_started = std::time::Instant::now();
-    let block_progress_ticker = (n.saturating_mul(specs.len()) >= 1_000_000)
+    let block_progress_ticker = (n.saturating_mul(specs.len())
+        >= AUDIT_PROGRESS_TICKER_WORK_THRESHOLD)
         .then(crate::util::loop_progress::LoopProgress::default_interval);
     for (idx, spec) in specs.iter().enumerate() {
         // Effective Jacobians were pre-materialised above so the row-count
@@ -907,7 +929,8 @@ fn audit_identifiability_impl(
         }
         cnt.max(1)
     };
-    let pairwise_block_progress_ticker = (n.saturating_mul(p_total) >= 1_000_000)
+    let pairwise_block_progress_ticker = (n.saturating_mul(p_total)
+        >= AUDIT_PROGRESS_TICKER_WORK_THRESHOLD)
         .then(crate::util::loop_progress::LoopProgress::default_interval);
     // Precompute the full joint Gram G = Xᵀ·X once with a blocked, parallel
     // crossproduct (faer). Every cross-block column dot product below then
