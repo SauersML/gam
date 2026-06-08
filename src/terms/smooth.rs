@@ -11804,8 +11804,7 @@ pub fn sample_bounded_latent_posterior_internal(
         // Push bounded columns through the exact interval map so every draw is
         // strictly inside (min, max); leave unconstrained columns untouched.
         for bc in bounded_columns {
-            let (beta_draw, _, _) =
-                bounded_latent_to_user(draws[(k, bc.col_idx)], bc.min, bc.max);
+            let (beta_draw, _, _) = bounded_latent_to_user(draws[(k, bc.col_idx)], bc.min, bc.max);
             draws[(k, bc.col_idx)] = beta_draw;
         }
     }
