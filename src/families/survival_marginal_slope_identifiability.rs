@@ -40,6 +40,13 @@ use faer::Side;
 
 const K_SURVIVAL: usize = 4;
 
+/// Threshold below which a coefficient vector is treated as the trivial
+/// (all-zero) pilot point in the drift-detection audit. At β ≈ 0 the
+/// primary-state coupling g vanishes (c ≡ 1), so the frozen pilot W is exact;
+/// any |β_j| above this is "non-trivial" and requires the family scalars to
+/// re-evaluate W(β). The bound is well below any meaningful fitted coefficient.
+const BETA_NONTRIVIAL_ABS_THRESHOLD: f64 = 1e-12;
+
 /// Per-row 4×4 row Hessian for the survival marginal-slope likelihood at a
 /// pilot `β`. The pilot supplies the primary-state vector
 /// `(q0_i, q1_i, qd1_i, g_i)` and the per-row sample weight + event
@@ -218,8 +225,7 @@ impl FamilyChannelHessian for SurvivalRowHessian {
             family_scalars.and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
 
         // Determine whether beta is non-trivial (any |β_j| > ε).
-        // Threshold: 1e-12 (well below any meaningful coefficient).
-        let beta_nontrivial = beta.iter().any(|&b| b.abs() > 1e-12);
+        let beta_nontrivial = beta.iter().any(|&b| b.abs() > BETA_NONTRIVIAL_ABS_THRESHOLD);
 
         match scalars_opt {
             None if beta_nontrivial => {
@@ -281,11 +287,11 @@ impl FamilyChannelHessian for SurvivalRowHessian {
                     let g = sc.g_i[i];
                     let z = sc.z_i[i];
                     // Use unit weight and d=1 (event indicator 1) for the audit path.
-                    // The derivative_guard is small but non-zero; use 1e-6.
+                    // The derivative_guard is the family default (small but non-zero).
                     match crate::families::survival_marginal_slope::row_primary_for_compiler(
                         q0, q1, qd1, g, z, 1.0,  // w = unit weight
                         1.0,  // d = event
-                        1e-6, // derivative_guard
+                        crate::families::survival_marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                         sc.s, // probit_scale from scalars
                     ) {
                         Ok((_nll, _grad, hess)) => {
