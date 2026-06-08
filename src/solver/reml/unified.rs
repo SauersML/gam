@@ -213,6 +213,32 @@ pub struct StochasticTraceState {
 /// - `DenseSpectralOperator`: eigendecomposition of dense H
 /// - Sparse Cholesky operators (external implementations)
 /// - `BlockCoupledOperator`: eigendecomposition of joint multi-block H
+/// Minimum operator dimension at which the Hutch++ stochastic trace estimator is
+/// preferred over materializing an implicit operator densely. Below this, the
+/// `2·m_s + m_h` Hutch++ matvecs do not beat `dim` dense H⁻¹ HVPs, so the dense
+/// fallback is cheaper.
+const HUTCHPP_TRACE_MIN_DIM: usize = 128;
+
+/// Build the Hutch++ stochastic-trace configuration for an operator of the given
+/// dimension. The sketch dimension grows with `dim` (one column per 32 of
+/// dimension, bounded to `[4, 16]`), and the probe budget tracks the sketch so
+/// the estimator's variance and cost stay balanced across problem sizes. Shared
+/// by every implicit-operator trace path so they cannot drift apart.
+fn hutchpp_config_for_dim(dim: usize) -> StochasticTraceConfig {
+    const SKETCH_DIM_PER: usize = 32;
+    const SKETCH_DIM_MIN: usize = 4;
+    const SKETCH_DIM_MAX: usize = 16;
+    const PROBES_PER_SKETCH: usize = 4;
+    const PROBES_MAX_FLOOR: usize = 32;
+    const PROBES_MIN_FLOOR: usize = 8;
+    let sketch = (dim / SKETCH_DIM_PER).clamp(SKETCH_DIM_MIN, SKETCH_DIM_MAX);
+    let mut config = StochasticTraceConfig::default();
+    config.hutchpp_sketch_dim = Some(sketch);
+    config.n_probes_max = (sketch * PROBES_PER_SKETCH).max(PROBES_MAX_FLOOR);
+    config.n_probes_min = sketch.max(PROBES_MIN_FLOOR);
+    config
+}
+
 pub trait HessianOperator: Send + Sync {
     /// log|H|₊ — pseudo-logdet using only active eigenvalues/pivots.
     fn logdet(&self) -> f64;
@@ -255,12 +281,8 @@ pub trait HessianOperator: Send + Sync {
         // an implicit operator (so materialization is expensive) and a
         // moderately-large dim (so 2 m_s + m_h matvecs beats `dim`
         // dense HVPs).
-        if op.is_implicit() && self.dim() >= 128 {
-            let mut config = StochasticTraceConfig::default();
-            let sketch = (self.dim() / 32).clamp(4, 16);
-            config.hutchpp_sketch_dim = Some(sketch);
-            config.n_probes_max = (sketch * 4).max(32);
-            config.n_probes_min = sketch.max(8);
+        if op.is_implicit() && self.dim() >= HUTCHPP_TRACE_MIN_DIM {
+            let config = hutchpp_config_for_dim(self.dim());
             return hutchpp_estimate_trace_hinv_operator(self, op, &config);
         }
         if op.is_implicit() {
@@ -374,12 +396,8 @@ pub trait HessianOperator: Send + Sync {
         matrix: &Array2<f64>,
         op: &dyn HyperOperator,
     ) -> f64 {
-        if op.is_implicit() && self.dim() >= 128 {
-            let mut config = StochasticTraceConfig::default();
-            let sketch = (self.dim() / 32).clamp(4, 16);
-            config.hutchpp_sketch_dim = Some(sketch);
-            config.n_probes_max = (sketch * 4).max(32);
-            config.n_probes_min = sketch.max(8);
+        if op.is_implicit() && self.dim() >= HUTCHPP_TRACE_MIN_DIM {
+            let config = hutchpp_config_for_dim(self.dim());
             // Wrap the dense LHS in a matrix-backed HyperOperator so the
             // shared cross routine can call mul_vec_into on it.
             let lhs = DenseMatrixHyperOperator {
@@ -407,12 +425,8 @@ pub trait HessianOperator: Send + Sync {
     ) -> f64 {
         let l_implicit = left.is_implicit();
         let r_implicit = right.is_implicit();
-        if (l_implicit || r_implicit) && self.dim() >= 128 {
-            let mut config = StochasticTraceConfig::default();
-            let sketch = (self.dim() / 32).clamp(4, 16);
-            config.hutchpp_sketch_dim = Some(sketch);
-            config.n_probes_max = (sketch * 4).max(32);
-            config.n_probes_min = sketch.max(8);
+        if (l_implicit || r_implicit) && self.dim() >= HUTCHPP_TRACE_MIN_DIM {
+            let config = hutchpp_config_for_dim(self.dim());
             // Same-operator self-cross is PSD; the squared form is the
             // exact algorithm for that case (lower variance, no sign).
             if std::ptr::eq(
@@ -499,12 +513,11 @@ pub trait HessianOperator: Send + Sync {
     /// regularized eigenvalue weights, not `H⁻¹`), so they keep the
     /// materialize path or provide their own override.
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
-        if op.is_implicit() && self.dim() >= 128 && self.logdet_traces_match_hinv_kernel() {
-            let mut config = StochasticTraceConfig::default();
-            let sketch = (self.dim() / 32).clamp(4, 16);
-            config.hutchpp_sketch_dim = Some(sketch);
-            config.n_probes_max = (sketch * 4).max(32);
-            config.n_probes_min = sketch.max(8);
+        if op.is_implicit()
+            && self.dim() >= HUTCHPP_TRACE_MIN_DIM
+            && self.logdet_traces_match_hinv_kernel()
+        {
+            let config = hutchpp_config_for_dim(self.dim());
             return hutchpp_estimate_trace_hinv_operator(self, op, &config);
         }
         if op.is_implicit() {
