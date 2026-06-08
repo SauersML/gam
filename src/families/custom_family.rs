@@ -13315,7 +13315,7 @@ fn compute_kkt_refusal_report(
     cached_joint_gradient: Option<&Array1<f64>>,
     cached_active_sets: &[Option<Vec<usize>>],
     block_constraints: &[Option<LinearInequalityConstraints>],
-    joint_hessian_source: &JointHessianSource,
+    joint_hessian_source: Option<&JointHessianSource>,
     total_p: usize,
     ridge: f64,
     ridge_policy: RidgePolicy,
@@ -13327,7 +13327,7 @@ fn compute_kkt_refusal_report(
     step_tol: f64,
     objective_change: f64,
     projected_residual_inf: f64,
-    math: &JointNewtonMathDiagnostic,
+    math: Option<&JointNewtonMathDiagnostic>,
 ) -> KktRefusalReport {
     let block_names: Vec<String> = specs.iter().map(|s| s.name.clone()).collect();
     let block_widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
@@ -13435,11 +13435,9 @@ fn compute_kkt_refusal_report(
     let mut hpen_null_vector_block_inf = Vec::new();
     let mut hpen_null_vector_carrying_block = None;
     if total_p > 0
-        && let Ok(mut h_joint) = materialize_joint_hessian_source(
-            joint_hessian_source,
-            total_p,
-            "KKT refusal diagnostic spectrum",
-        )
+        && let Some(source) = joint_hessian_source
+        && let Ok(mut h_joint) =
+            materialize_joint_hessian_source(source, total_p, "KKT refusal diagnostic spectrum")
     {
         let model_diagonal_ridge = if ridge_policy.include_quadratic_penalty && ridge > 0.0 {
             ridge
@@ -13552,8 +13550,12 @@ fn compute_kkt_refusal_report(
         residual_tol,
         obj_tol,
         step_tol,
-        linearized_rel: math.linearized_rel(),
-        scalar_model_relerr: math.scalar_model_relative_error(),
+        linearized_rel: math
+            .map(JointNewtonMathDiagnostic::linearized_rel)
+            .unwrap_or(f64::NAN),
+        scalar_model_relerr: math
+            .map(JointNewtonMathDiagnostic::scalar_model_relative_error)
+            .unwrap_or(f64::NAN),
         objective_change,
         projected_residual_inf,
         diagnosis,
@@ -17105,7 +17107,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         cached_joint_gradient.as_ref(),
                         &cached_active_sets,
                         &block_constraints,
-                        &joint_hessian_source,
+                        Some(&joint_hessian_source),
                         total_p,
                         ridge,
                         options.ridge_policy,
@@ -17117,7 +17119,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         step_tol,
                         objective_change,
                         residual,
-                        math,
+                        Some(&math),
                     );
                     log::warn!(
                         "{}",
@@ -17557,13 +17559,43 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     last_math_summary,
                 );
                 if coupled_exact_joint_required {
-                    let block_diag = last_kkt_refusal_report
-                        .as_ref()
-                        .map(KktRefusalReport::format_bubbled_error)
-                        .unwrap_or_else(|| {
-                            "structured KKT refusal report unavailable: no joint Newton math snapshot"
-                                .to_string()
-                        });
+                    // Budget-exhaustion error MUST carry `block_residual_inf=…`
+                    // so the carrying block survives the bubble through the
+                    // outer optimiser. If no in-cycle cert refusal produced
+                    // a structured report we build one here from the cached
+                    // joint gradient + states. `joint_hessian_source` is
+                    // per-cycle so the H_pen spectrum fields degrade to
+                    // NaN/empty; per-block residual data is fully present.
+                    let block_diag = if let Some(report) = last_kkt_refusal_report.as_ref() {
+                        report.format_bubbled_error()
+                    } else {
+                        let block_constraints =
+                            collect_block_linear_constraints(family, &states, specs)?;
+                        let report = compute_kkt_refusal_report(
+                            cycles_done,
+                            &states,
+                            specs,
+                            &s_lambdas,
+                            &ranges,
+                            cached_joint_gradient.as_ref(),
+                            &cached_active_sets,
+                            &block_constraints,
+                            None,
+                            total_p,
+                            ridge,
+                            options.ridge_policy,
+                            f64::NAN,
+                            f64::NAN,
+                            f64::NAN,
+                            last_residual_tol,
+                            f64::NAN,
+                            f64::NAN,
+                            f64::NAN,
+                            exit_unprojected_kkt_inf,
+                            last_joint_math.as_ref(),
+                        );
+                        report.format_bubbled_error()
+                    };
                     return Err(format!(
                         "coupled exact-joint inner solve exhausted the joint Newton budget without KKT convergence after {cycles_done} cycle(s) — {block_diag}"
                     ));
@@ -26401,8 +26433,9 @@ mod tests {
         let family = BatchedOuterHessianTestFamily {
             matrix: exact.clone(),
         };
+        // rho.len() must equal sum(spec.penalties.len()); empty specs ⇒ empty rho.
         let terms = family
-            .batched_outer_hessian_terms(&[], &[], &[], &array![0.0, 0.0], None)
+            .batched_outer_hessian_terms(&[], &[], &[], &Array1::<f64>::zeros(0), None)
             .expect("batched Hessian hook succeeds")
             .expect("test family exposes batched HVP terms");
         let operator = match terms.outer_hessian {
@@ -26425,7 +26458,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &array![1.0, -1.0],
+            &Array1::<f64>::zeros(0),
             None,
             EvalMode::ValueGradientHessian,
         )
@@ -26440,7 +26473,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &array![1.0, -1.0],
+            &Array1::<f64>::zeros(0),
             None,
             EvalMode::ValueAndGradient,
         )
@@ -33803,7 +33836,7 @@ mod tests {
             Some(&joint_grad),
             &cached_active_sets,
             &block_constraints,
-            &source,
+            Some(&source),
             total_p,
             0.0,
             RidgePolicy::explicit_stabilization_full(),
@@ -33815,7 +33848,7 @@ mod tests {
             1.0e-6,
             1.0e-8,
             projected_residual_inf,
-            &math,
+            Some(&math),
         );
 
         assert_eq!(
@@ -33999,7 +34032,7 @@ mod tests {
             Some(&joint_grad),
             &cached_active_sets,
             &block_constraints,
-            &source,
+            Some(&source),
             total_p,
             0.0,
             RidgePolicy::explicit_stabilization_full(),
@@ -34011,7 +34044,7 @@ mod tests {
             1.0e-6,
             0.0,
             4.2,
-            &math,
+            Some(&math),
         );
 
         assert_eq!(
@@ -34116,7 +34149,7 @@ mod tests {
             Some(&joint_grad),
             &cached_active_sets,
             &block_constraints,
-            &source,
+            Some(&source),
             total_p,
             0.0,
             RidgePolicy::explicit_stabilization_full(),
@@ -34128,7 +34161,7 @@ mod tests {
             1.0e-6,
             0.0,
             0.0,
-            &math,
+            Some(&math),
         );
 
         assert_eq!(
