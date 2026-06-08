@@ -152,3 +152,7 @@ todo_history.txt
 run2_solver_independent.py
 run3_harness.py
 azuser@/
+
+# stray tool/run logs
+*.log
+.??*.log
