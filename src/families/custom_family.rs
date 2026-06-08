@@ -21705,7 +21705,15 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             include_logdet_h,
             include_logdet_s,
             strict_spd,
-            !hessian_beta_independent,
+            // ψ-bearing path (matern/duchon marginal-slope kernel length-scales):
+            // use the projected #752 generalized determinant for value AND
+            // gradient AND Hessian — all produced by this single call, so they are
+            // consistent by construction. This is the route the clustered-PC
+            // matern bernoulli/survival marginal-slope fits take, where the
+            // range(Sλ)-only determinant dropped the penalty-null trend likelihood
+            // determinant and froze the outer gradient (gam#808/#787). No batched
+            // override is possible here (it is gated to psi_dim==0).
+            family.use_projected_penalty_logdet(),
             eval_mode,
             options,
             rho_prior.clone(),
@@ -21855,7 +21863,20 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                         include_logdet_h,
                         include_logdet_s,
                         strict_spd,
-                        family.use_projected_penalty_logdet(),
+                        // VALUE/GRADIENT CONSISTENCY: this `value_only` is paired
+                        // with the family's BATCHED gradient (computed just above),
+                        // which evaluates the logdet derivative through the
+                        // family's `pseudo_logdet_mode` spectral operator (Smooth
+                        // `r_ε` for BMS) — an internally exact antiderivative pair
+                        // (value `log r_ε`, gradient `φ'=r_ε'/r_ε`). The value must
+                        // therefore use the SAME spectral convention, NOT the
+                        // projected #752 generalized determinant, or value and the
+                        // batched gradient would describe different objectives under
+                        // rank deficiency. The projected determinant is used on the
+                        // non-batched path (the ψ-bearing matern marginal-slope
+                        // route, gam#808/#787), where joint_outer_evaluate produces
+                        // a matched projected value AND gradient in one call.
+                        false,
                         EvalMode::ValueOnly,
                         options,
                         crate::types::RhoPrior::Flat,
@@ -21931,7 +21952,19 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
             include_logdet_h,
             include_logdet_s,
             strict_spd,
-            family.use_projected_penalty_logdet(),
+            // VALUE/GRADIENT CONSISTENCY: when a batched (Smooth-mode) gradient
+            // override is pending, it will replace `eval_result.gradient` below,
+            // so the value (and outer Hessian) here must use the SAME spectral
+            // convention as that gradient — the family's `pseudo_logdet_mode`
+            // (Smooth `r_ε`), NOT the projected #752 generalized determinant. The
+            // projected determinant is used only when no batched override is
+            // active (the ψ-bearing matern marginal-slope route, gam#808/#787),
+            // where this call produces a matched projected value+gradient+Hessian.
+            if batched_gradient_override.is_some() {
+                false
+            } else {
+                family.use_projected_penalty_logdet()
+            },
             eval_mode,
             options,
             rho_prior.clone(),
@@ -22716,7 +22749,10 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         include_logdet_h,
         include_logdet_s,
         strict_spd,
-        !hessian_beta_independent,
+        // ψ-bearing EFS path: projected #752 generalized determinant for value
+        // and gradient (matched in this single _efs call). Same root-cause fix as
+        // the VGH ψ path (gam#808/#787); no batched override here.
+        family.use_projected_penalty_logdet(),
         options,
         crate::types::RhoPrior::Flat,
         family.pseudo_logdet_mode(),
