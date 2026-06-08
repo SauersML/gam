@@ -8826,7 +8826,9 @@ fn exact_newton_stabilizing_shift(lhs_dense: &Array2<f64>, ridge_floor: f64) -> 
         gershgorin_min = gershgorin_min.min(diag - radius);
     }
     if !gershgorin_min.is_finite() {
-        let diag_max = (0..p).map(|d| lhs_dense[[d, d]].abs()).fold(0.0_f64, f64::max);
+        let diag_max = (0..p)
+            .map(|d| lhs_dense[[d, d]].abs())
+            .fold(0.0_f64, f64::max);
         return Some(floor.max(diag_max * 1e-6).max(1e-6));
     }
     if gershgorin_min >= floor {
@@ -17241,20 +17243,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // residual the genuinely-near-zero augmented stationarity the inner
             // certified, so the gate passes. No-op when the term is
             // condition-gated/unavailable (∇Φ=0).
-            let augmented_joint_gradient: Option<Array1<f64>> =
-                match (cached_joint_gradient.as_ref(), joint_jeffreys_subspace.as_ref()) {
-                    (Some(gradient), Some(z_joint)) => {
-                        match custom_family_joint_jeffreys_term(
-                            family, &states, specs, &ranges, z_joint,
-                        )? {
-                            Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
-                                Some(gradient + &grad_phi)
-                            }
-                            _ => None,
+            let augmented_joint_gradient: Option<Array1<f64>> = match (
+                cached_joint_gradient.as_ref(),
+                joint_jeffreys_subspace.as_ref(),
+            ) {
+                (Some(gradient), Some(z_joint)) => {
+                    match custom_family_joint_jeffreys_term(
+                        family, &states, specs, &ranges, z_joint,
+                    )? {
+                        Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
+                            Some(gradient + &grad_phi)
                         }
+                        _ => None,
                     }
-                    _ => None,
-                };
+                }
+                _ => None,
+            };
             let ift_gradient = augmented_joint_gradient
                 .as_ref()
                 .or(cached_joint_gradient.as_ref());
@@ -33123,8 +33127,9 @@ mod tests {
     fn spectral_joint_newton_step_uses_pseudoinverse_when_null_gradient_is_zero() {
         let h = array![[4.0, 0.0], [0.0, 0.0]];
         let rhs = array![8.0, 0.0];
-        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
-            .expect("range-only RHS should have a minimum-norm Newton step");
+        let step =
+            solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
+                .expect("range-only RHS should have a minimum-norm Newton step");
 
         assert_relative_eq!(step.delta[0], 2.0, epsilon = 1.0e-12);
         assert_relative_eq!(step.delta[1], 0.0, epsilon = 1.0e-12);
@@ -33150,8 +33155,9 @@ mod tests {
         // trust region then globalizes.
         let h = array![[4.0, 0.0], [0.0, -1.0]];
         let rhs = array![8.0, 3.0];
-        let step = solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
-            .expect("indefinite model must yield a modified-Newton step, not an error");
+        let step =
+            solve_joint_newton_step_on_spectral_range(&h, &rhs, 1.0e-10, 1.0e-12, 0.0, false)
+                .expect("indefinite model must yield a modified-Newton step, not an error");
 
         // Exactly one negative-curvature mode was reflected.
         assert_eq!(step.reflected_negative_modes, 1);

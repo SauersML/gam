@@ -749,14 +749,12 @@ fn dispersion_from_likelihood(
                 Dispersion::Known(phi)
             }
         }
-        ResponseFamily::NegativeBinomial { theta } => {
-            Dispersion::Known(
-                likelihood
-                    .fixed_phi()
-                    .unwrap_or(*theta)
-                    .max(DISPERSION_POSITIVE_FLOOR),
-            )
-        }
+        ResponseFamily::NegativeBinomial { theta } => Dispersion::Known(
+            likelihood
+                .fixed_phi()
+                .unwrap_or(*theta)
+                .max(DISPERSION_POSITIVE_FLOOR),
+        ),
         ResponseFamily::Beta { phi } => {
             Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(DISPERSION_POSITIVE_FLOOR))
         }

@@ -664,7 +664,10 @@ mod tests {
             gamma_moment_matched_interval(mu, total_var, normal_cdf(-z), normal_cdf(z)).unwrap();
 
         // Ordered, strictly positive, brackets the mean.
-        assert!(0.0 < lo && lo < mu && mu < hi, "interval [{lo}, {hi}] ∌ μ={mu}");
+        assert!(
+            0.0 < lo && lo < mu && mu < hi,
+            "interval [{lo}, {hi}] ∌ μ={mu}"
+        );
         // Right skew: the upper gap is the larger one.
         let lower_gap = mu - lo;
         let upper_gap = hi - mu;
@@ -693,8 +696,7 @@ mod tests {
         let mu = 5.0_f64;
         let obs_var = phi * mu * mu;
         let (lo0, hi0) = gamma_moment_matched_interval(mu, obs_var, 0.025, 0.975).unwrap();
-        let (lo1, hi1) =
-            gamma_moment_matched_interval(mu, obs_var + 4.0, 0.025, 0.975).unwrap();
+        let (lo1, hi1) = gamma_moment_matched_interval(mu, obs_var + 4.0, 0.025, 0.975).unwrap();
         assert!(
             lo1 < lo0 && hi1 > hi0,
             "estimation uncertainty must widen the band: [{lo0},{hi0}] -> [{lo1},{hi1}]"

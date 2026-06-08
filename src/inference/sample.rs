@@ -470,10 +470,12 @@ fn sample_standard(
     // `sample_bounded_latent_posterior_internal` reconstructs the latent
     // geometry via the exact inverse delta-method (`H_latent = J H_user J`) and
     // returns user-scale draws that always lie strictly inside the interval.
-    let has_bounded = spec
-        .linear_terms
-        .iter()
-        .any(|term| matches!(term.coefficient_geometry, LinearCoefficientGeometry::Bounded { .. }));
+    let has_bounded = spec.linear_terms.iter().any(|term| {
+        matches!(
+            term.coefficient_geometry,
+            LinearCoefficientGeometry::Bounded { .. }
+        )
+    });
     if has_bounded {
         // Mirror the fit-time layout: linear coefficient `j` lives at column
         // `intercept_range.end + j` of the model's coefficient vector. Bounds
@@ -570,11 +572,8 @@ fn sample_standard_bounded(
     // sampler reconstructs the latent precision from it via the exact inverse
     // delta-method. (`explicit_fit_hessian_for_whitening` returns this same
     // user-scale penalized Hessian for a saved standard fit.)
-    let user_hessian = explicit_fit_hessian_for_whitening(
-        &fit,
-        p,
-        "saved standard bounded-coefficient model",
-    )?;
+    let user_hessian =
+        explicit_fit_hessian_for_whitening(&fit, p, "saved standard bounded-coefficient model")?;
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
     let samples = crate::smooth::sample_bounded_latent_posterior_internal(
         &mode,
@@ -971,8 +970,8 @@ fn sample_survival(
                 penalty_blocks.push(PenaltyBlock {
                     matrix: s.clone(),
                     lambda: time_build
-                    .smooth_lambda
-                    .unwrap_or(DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA),
+                        .smooth_lambda
+                        .unwrap_or(DEFAULT_RECONSTRUCTED_SMOOTH_LAMBDA),
                     range: start..end,
                     nullspace_dim: block.nullspace_dims.get(widx).copied().unwrap_or(0),
                 });

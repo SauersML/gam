@@ -3929,7 +3929,11 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                         .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
                         .collect(),
                     nullspace_dims: vec![],
-                    initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln())),
+                    initial_log_lambdas: Some(
+                        pilot_fit
+                            .lambdas
+                            .mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln()),
+                    ),
                     initial_beta: Some(pilot_fit.beta.clone()),
                 },
                 wiggle_block,
@@ -3990,14 +3994,20 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: vec![],
-                initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln())),
+                initial_log_lambdas: Some(
+                    pilot_fit
+                        .lambdas
+                        .mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln()),
+                ),
                 initial_beta: Some(pilot_fit.beta.clone()),
             },
             wiggle_block: wiggle_block.clone(),
         },
         options,
     )?;
-    let baseline_log_lambdas = baseline_fit.lambdas.mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln());
+    let baseline_log_lambdas = baseline_fit
+        .lambdas
+        .mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln());
     if baseline_log_lambdas.len() != rho_dim {
         return Err(GamlssError::DimensionMismatch {
             reason: format!(
