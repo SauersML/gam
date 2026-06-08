@@ -12992,6 +12992,14 @@ fn solve_joint_newton_step_on_spectral_range(
     let cutoff = rank_tol * lambda_max_abs;
     let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
     let null_cutoff = cutoff.min(numerical_floor);
+    if p <= 4 {
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+            let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            let lmin = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+            writeln!(f, "[DIAGSPEC] p={p} lambda_max={lambda_max_abs:.4e} lambda_min={lmin:.4e} null_cutoff={null_cutoff:.4e} numerical_floor={numerical_floor:.4e} rhs_inf={rhs_inf:.4e} evals={:?}", evals.as_slice()).ok();
+        }
+    }
     let mut delta = Array1::<f64>::zeros(p);
     let mut range_rhs_inf = 0.0_f64;
     let mut null_rhs_inf = 0.0_f64;
