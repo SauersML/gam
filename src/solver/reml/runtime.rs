@@ -1724,8 +1724,6 @@ struct Gam784BlockTarget<'t> {
     block_vecs: Array2<f64>,
     /// Block curvatures `λ_r` (the `H_total` eigenvalues), length `m`.
     block_lambdas: Array1<f64>,
-    /// Converged coefficients β̂ (transformed basis).
-    beta_hat: Array1<f64>,
     /// Mode linear predictor η̂ = X_t β̂.
     eta_hat: Array1<f64>,
     /// Per-row observed weights `W_i` (the likelihood Hessian diagonal).
@@ -3950,7 +3948,6 @@ impl<'a> RemlState<'a> {
             x_transformed: x_dense.as_ref(),
             block_vecs,
             block_lambdas,
-            beta_hat,
             eta_hat: pirls_result.final_eta.clone(),
             weights_obs: pirls_result.finalweights.clone(),
             y: self.y.to_owned(),
