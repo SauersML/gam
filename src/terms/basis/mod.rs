@@ -7946,7 +7946,24 @@ pub fn build_bspline_basis_1d(
         }
         let knots = cyclic_uniform_knot_vector(start, end, spec.degree, num_basis);
         let s_bend_raw = create_cyclic_difference_penalty_matrix(num_basis, spec.penalty_order)?;
-        let mut penalties_raw = vec![PenaltyCandidate {
+        // A cyclic difference penalty has a single null direction — the constant
+        // vector — and that direction is removed wholesale by the periodic
+        // sum-to-zero identifiability constraint applied below
+        // (`apply_bspline_identifiability_policy` / streaming equivalent). The
+        // null-space-shrinkage ("double") penalty is, by construction, the
+        // projector `z·zᵀ` onto exactly that constant eigenvector, so after the
+        // constraint transform `T` (whose columns span the sum-to-zero subspace,
+        // orthogonal to the constant) it becomes `Tᵀ(z·zᵀ)T = 0` — an identically
+        // zero penalty carrying its own smoothing parameter. A zero penalty block
+        // contributes nothing to the REML cost or penalty log-determinant, so its
+        // log-λ coordinate is completely unidentified: the outer REML objective is
+        // flat along it and the outer Hessian is singular. The outer optimizer
+        // then cannot certify a step in that direction and the loop fails to
+        // terminate at the (otherwise converged) optimum (#874). mgcv's `bs="cc"`
+        // is likewise a SINGLE-penalty smooth for the same reason. Emit only the
+        // wiggliness penalty for the cyclic basis regardless of `double_penalty`:
+        // there is no free polynomial null space left to shrink.
+        let penalties_raw = vec![PenaltyCandidate {
             matrix: s_bend_raw.clone(),
             nullspace_dim_hint: 1,
             source: PenaltySource::Primary,
@@ -7954,18 +7971,6 @@ pub fn build_bspline_basis_1d(
             kronecker_factors: None,
             op: None,
         }];
-        if spec.double_penalty {
-            penalties_raw.push(PenaltyCandidate {
-                matrix: build_nullspace_shrinkage_penalty(&s_bend_raw)?
-                    .map(|shrink| shrink.sym_penalty)
-                    .unwrap_or_else(|| Array2::<f64>::zeros(s_bend_raw.raw_dim())),
-                nullspace_dim_hint: 0,
-                source: PenaltySource::DoublePenaltyNullspace,
-                normalization_scale: 1.0,
-                kronecker_factors: None,
-                op: None,
-            });
-        }
         let penalties_raw_mats = penalties_raw
             .iter()
             .map(|candidate| candidate.matrix.clone())
