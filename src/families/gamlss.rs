@@ -10555,7 +10555,7 @@ impl GaussianLocationScaleWiggleFamily {
                 (0, 4, coeff_m_b2),
                 // (X_ls, B) ← `xt_diag_y_dense(x_ls, &l_u, &geom.basis)`
                 (1, 2, l_u),
-                // (X_ls, B') ← `xt_diag_y_dense(x_ls, 2κm, basis_u=diag(ξ)·B')`
+                // (X_ls, B') ← ls↔wiggle is mean⊥scale Fisher 0, so coeff_ls_b1 = 0
                 (1, 3, coeff_ls_b1),
                 // (B, B) ← `xt_diag_x_dense(&geom.basis, &dw_u)`
                 (2, 2, dw_u),
@@ -10733,8 +10733,7 @@ impl GaussianLocationScaleWiggleFamily {
                 // basis_v) + xt_diag_y_dense(x_ls, l_v, basis_u)` =
                 // `l_u·ξ_v + l_v·ξ_u`
                 (1, 3, coeff_ls_b1),
-                // (X_ls, B'') ← `xt_diag_y_dense(x_ls, 2κm, basis_uv)` =
-                // 2κm·ξ_uξ_v
+                // (X_ls, B'') ← ls↔wiggle is mean⊥scale Fisher 0, so coeff_ls_b2 = 0
                 (1, 4, coeff_ls_b2),
                 // (B, B) ← `xt_diag_x_dense(&geom.basis, &dw_uv)`
                 (2, 2, dw_uv),
