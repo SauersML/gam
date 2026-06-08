@@ -8791,35 +8791,50 @@ fn weighted_normal_equations(
 /// which is exactly what the downstream solve requires.
 fn exact_newton_stabilizing_shift(lhs_dense: &Array2<f64>, ridge_floor: f64) -> Option<f64> {
     let floor = effective_solverridge(ridge_floor);
-    // Fast path: already PD at zero shift ⇒ no stabilization needed. This is the
-    // common case on a well-conditioned cycle and costs a single Cholesky.
+    // Fast path: already PD at zero shift ⇒ no stabilization needed. One Cholesky
+    // (O(p³/3)), the common case on a well-conditioned cycle.
     if lhs_dense.cholesky(Side::Lower).is_ok() {
         return None;
     }
-    // Near-singular / indefinite: find the smallest geometric ridge ≥ floor that
-    // restores positive definiteness. `try_cholesky_with_escalating_ridge` starts
-    // at `floor` and grows by 4× per attempt, short-circuiting on the first PD
-    // factorization. The scale ceiling tracks the diagonal magnitude so the
-    // search terminates even on a hard-singular block.
-    let diag_max = (0..lhs_dense.nrows())
-        .map(|d| lhs_dense[[d, d]].abs())
-        .fold(0.0_f64, f64::max);
-    let initial = floor.max(diag_max * 1e-12).max(f64::MIN_POSITIVE);
-    let found = try_cholesky_with_escalating_ridge(
-        lhs_dense,
-        initial,
-        // ~30 quadruplings spans floor·4³⁰ ≈ floor·1e18, enough to lift any
-        // finite-diagonal near-singular block past its smallest eigenvalue.
-        30,
-        4.0,
-        |_chol, _attempt, boost| Some(boost),
-    );
-    match found {
-        Some((boost, _, _)) => Some(boost.max(floor)),
-        // Cholesky never succeeded (non-finite entries): fall back to a
-        // diagonal-scaled ridge so the solve still receives a positive shift.
-        None => Some(floor.max(diag_max * 1e-6).max(1e-6)),
+    // Near-singular / indefinite. We need a positive diagonal shift `δ` that makes
+    // `H + δI` PD. A full eigendecomposition (the previous implementation) reads
+    // the exact `λ_min` but costs `O(p³)` for ALL eigenpairs EVERY inner cycle;
+    // for a coupled K-block family the shift fires almost every cycle, so that
+    // dominated the inner solve (gam#729/#826). A Cholesky-escalation search is
+    // even worse on a hard-near-singular block (many `O(p³)` Cholesky retries).
+    //
+    // Use the Gershgorin lower bound on `λ_min` instead — a single `O(p²)` pass,
+    // no iteration: every eigenvalue lies in some disc
+    // `[H_ii − R_i, H_ii + R_i]` with `R_i = Σ_{j≠i} |H_ij|`, so
+    // `λ_min ≥ min_i (H_ii − R_i) =: g`. Shifting by `δ = floor − g` (when `g`
+    // is at/below the floor) guarantees `λ_min(H + δI) = λ_min + δ ≥ floor > 0`,
+    // i.e. `H + δI` is PD. The bound is conservative (δ may be larger than the
+    // exact eigh shift), but it is self-vanishing in the well-conditioned regime
+    // (handled by the Cholesky fast path above) and the downstream solve only
+    // requires PD, not the tightest possible shift — and the trust region governs
+    // step size regardless. `O(p²)` per cycle instead of `O(p³)`.
+    let p = lhs_dense.nrows();
+    let mut gershgorin_min = f64::INFINITY;
+    for i in 0..p {
+        let diag = lhs_dense[[i, i]];
+        let mut radius = 0.0_f64;
+        for j in 0..p {
+            if j != i {
+                radius += lhs_dense[[i, j]].abs();
+            }
+        }
+        gershgorin_min = gershgorin_min.min(diag - radius);
     }
+    if !gershgorin_min.is_finite() {
+        let diag_max = (0..p).map(|d| lhs_dense[[d, d]].abs()).fold(0.0_f64, f64::max);
+        return Some(floor.max(diag_max * 1e-6).max(1e-6));
+    }
+    if gershgorin_min >= floor {
+        // Gershgorin certifies PD-at-floor but the no-shift Cholesky failed
+        // (round-off on a barely-PD matrix): a floor-sized shift suffices.
+        return Some(floor);
+    }
+    Some(floor - gershgorin_min)
 }
 
 fn stabilize_exact_newton_lhs_in_place<F: CustomFamily + ?Sized>(
