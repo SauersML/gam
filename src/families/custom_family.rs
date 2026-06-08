@@ -12652,6 +12652,154 @@ fn joint_block_step_hit_trust_boundary(step_norm: f64, radius: f64) -> bool {
     step_norm.is_finite() && radius > 0.0 && step_norm >= 0.99 * radius
 }
 
+/// Per-block dogleg step (Powell, blending the Cauchy and Newton points within
+/// the block's M-metric trust radius). This is the principled globalization for
+/// the coupled location-scale inner Newton (gam#826/#808): box-truncating the
+/// Newton step alone freezes progress when the spectral solve is degenerate at
+/// the oversmoothed seed — the high-curvature `log_sigma` block has
+/// `λ ~ exp(2·ρ_bound)` so its Newton component is `O(g/λ) ≈ 5e-21`, the
+/// mean/trend blocks get isotropically shrunk to the radius, and the residual
+/// stalls while β barely moves. The dogleg always includes the Cauchy leg
+/// (the model-minimizing steepest-descent step in the block metric), so the
+/// realized decrease is at least the Cauchy decrease whenever the block
+/// gradient is nonzero — progress is guaranteed even when the Newton step is
+/// numerically frozen. Inside the radius the dogleg returns the exact Newton
+/// step, so the converged β, the KKT certificate, and the well-conditioned /
+/// #729 endgame are byte-identical to the undamped solve.
+///
+/// Inputs per block `b`:
+///   * `newton[start..end]`  — Newton (spectral) step block `δ_N`.
+///   * `cauchy[start..end]`  — the FULL (unconstrained) Cauchy block
+///     `δ_C = τ·p_sd`, where `p_sd = M⁻¹·rhs` is the M-metric steepest-descent
+///     direction of the model and `τ` minimizes the model along it; precomputed
+///     once per cycle by `joint_cauchy_step` (the curvature `p_sd·H·p_sd` needs
+///     a coupled Hessian-vector product, so it must be hoisted out of the
+///     radius-shrink loop).
+///   * `radius`              — the block's current M-metric trust radius.
+///
+/// Returns the block step norms in the M-metric (same contract as
+/// `truncate_joint_step_to_block_metric_radii`) and overwrites `out` with the
+/// dogleg blend per block.
+fn joint_dogleg_step_to_block_metric_radii(
+    newton: &Array1<f64>,
+    cauchy: &Array1<f64>,
+    ranges: &[(usize, usize)],
+    metric_diag: &Array1<f64>,
+    block_radii: &[f64],
+    out: &mut Array1<f64>,
+) -> Vec<f64> {
+    assert_eq!(ranges.len(), block_radii.len());
+    assert_eq!(newton.len(), metric_diag.len());
+    assert_eq!(cauchy.len(), metric_diag.len());
+    assert_eq!(out.len(), metric_diag.len());
+    let mut norms = Vec::with_capacity(ranges.len());
+    for (block_idx, (start, end)) in ranges.iter().copied().enumerate() {
+        let metric_view = metric_diag.slice(s![start..end]);
+        let newton_b = newton.slice(s![start..end]);
+        let cauchy_b = cauchy.slice(s![start..end]);
+        let radius = block_radii[block_idx];
+        let newton_norm = joint_trust_region_metric_step_norm_view(newton_b, metric_view);
+        let cauchy_norm = joint_trust_region_metric_step_norm_view(cauchy_b, metric_view);
+        let mut out_b = out.slice_mut(s![start..end]);
+
+        // Degenerate radius (non-finite or non-positive): nothing moves.
+        if !radius.is_finite() || radius <= 0.0 {
+            out_b.fill(0.0);
+            norms.push(0.0);
+            continue;
+        }
+
+        // Newton step (or a non-finite Cauchy fallback) inside the radius: take
+        // the exact Newton step. This is the only branch a well-conditioned /
+        // converging fit ever reaches near the optimum, so the endgame numerics
+        // are unchanged.
+        if newton_norm.is_finite() && newton_norm <= radius {
+            out_b.assign(&newton_b);
+            norms.push(newton_norm);
+            continue;
+        }
+
+        // Cauchy leg longer than the radius (or Newton/Cauchy not comparable):
+        // scale the Cauchy step to the boundary. When the Cauchy step itself is
+        // unusable, fall back to scaling the Newton step (pre-dogleg behavior).
+        if !(cauchy_norm.is_finite() && cauchy_norm > 0.0) {
+            let scale = if newton_norm.is_finite() && newton_norm > 0.0 {
+                radius / newton_norm
+            } else {
+                0.0
+            };
+            out_b.assign(&newton_b);
+            out_b.mapv_inplace(|v| v * scale);
+            norms.push(if scale > 0.0 { radius } else { 0.0 });
+            continue;
+        }
+        if cauchy_norm >= radius {
+            let scale = radius / cauchy_norm;
+            out_b.assign(&cauchy_b);
+            out_b.mapv_inplace(|v| v * scale);
+            norms.push(radius);
+            continue;
+        }
+
+        // Dogleg blend: δ(θ) = δ_C + θ·(δ_N − δ_C), θ ∈ [0,1], pick θ so
+        // ‖δ(θ)‖_M = radius. Solve the quadratic ‖δ_C + θ·d‖²_M = radius² with
+        // d = δ_N − δ_C, a = ‖d‖²_M, b = 2·⟨δ_C, d⟩_M, c = ‖δ_C‖²_M − radius².
+        let mut a = 0.0_f64;
+        let mut b = 0.0_f64;
+        for ((cb, nb), w) in cauchy_b.iter().zip(newton_b.iter()).zip(metric_view.iter()) {
+            let m = positive_joint_diagonal_entry(*w);
+            let d = nb - cb;
+            a += m * d * d;
+            b += 2.0 * m * cb * d;
+        }
+        let c = cauchy_norm * cauchy_norm - radius * radius;
+        // a > 0 because δ_N ≠ δ_C here (Newton outside, Cauchy inside the
+        // radius). Largest root in [0,1] keeps the step on the dogleg path.
+        let disc = (b * b - 4.0 * a * c).max(0.0);
+        let theta = if a > 0.0 {
+            ((-b + disc.sqrt()) / (2.0 * a)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        for ((o, cb), nb) in out_b.iter_mut().zip(cauchy_b.iter()).zip(newton_b.iter()) {
+            *o = cb + theta * (nb - cb);
+        }
+        let norm = joint_trust_region_metric_step_norm_view(out_b.view(), metric_view);
+        norms.push(norm);
+    }
+    norms
+}
+
+/// Unconstrained Cauchy point of the joint penalized quadratic model in the
+/// block-diagonal M-metric: `δ_C = τ·p_sd` with `p_sd = M⁻¹·rhs` (the M-metric
+/// steepest-descent direction of the model `m(δ) = −rhs·δ + ½·δᵀHδ` at δ=0)
+/// and `τ = (rhs·p_sd)/(p_sd·H·p_sd)` minimizing the model along `p_sd`. When
+/// the curvature `p_sd·H·p_sd ≤ 0` the model is unbounded below along `p_sd`,
+/// so `δ_C` is just `p_sd` (the dogleg's boundary scaling then takes it to the
+/// radius — a descent step on the indefinite/flat direction). `h_psd` must be
+/// `H_pen·p_sd` for the SAME penalized (and Firth-augmented, when armed) Hessian
+/// the trust-region model uses, so the dogleg path is consistent with the
+/// accept/reject quadratic.
+fn joint_cauchy_step(rhs: &Array1<f64>, p_sd: &Array1<f64>, h_psd: &Array1<f64>) -> Array1<f64> {
+    let directional = rhs.dot(p_sd);
+    if !directional.is_finite() || directional <= 0.0 {
+        // `p_sd` is not an ascent direction of −m (no descent on the objective);
+        // emit a zero Cauchy step so the dogleg falls back to the Newton leg.
+        return Array1::zeros(p_sd.len());
+    }
+    let curvature = p_sd.dot(h_psd);
+    let mut delta = p_sd.clone();
+    if curvature.is_finite() && curvature > 0.0 {
+        let tau = directional / curvature;
+        if tau.is_finite() && tau > 0.0 {
+            delta.mapv_inplace(|v| tau * v);
+        }
+    }
+    // Non-positive curvature: leave δ_C = p_sd; the dogleg scales it to the
+    // trust boundary (the model decreases without bound along p_sd there).
+    delta
+}
+
 fn shrink_active_joint_block_trust_radii(
     block_radii: &mut [f64],
     block_step_norms: &[f64],
@@ -15533,6 +15681,52 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let mut search_delta = delta.clone();
             let search_joint_active_set: Option<Vec<usize>> = joint_active_set.clone();
             let mut tried_preconditioned_descent = false;
+            // Dogleg Cauchy leg (gam#826/#808). Compute the unconstrained Cauchy
+            // point of the penalized (Firth-augmented) quadratic model ONCE per
+            // cycle: the M-metric steepest-descent direction `p_sd = M⁻¹·rhs`
+            // and its curvature `p_sd·H·p_sd` (a coupled Hessian-vector product,
+            // so it must be hoisted out of the radius-shrink loop). When the
+            // Newton step exceeds a block's trust radius the dogleg blends
+            // toward this Cauchy leg, guaranteeing at least the Cauchy decrease
+            // even when the spectral Newton step is numerically frozen at the
+            // oversmoothed seed (the high-curvature log_sigma block's Newton
+            // component is `O(g/λ) ≈ 5e-21`). `joint_active_set` is the
+            // unconstrained joint Newton path; the constrained-QP path keeps its
+            // own globalization, so the dogleg is only built (and used) when no
+            // active set is in force.
+            let dogleg_cauchy: Option<Array1<f64>> = if search_joint_active_set.is_none() {
+                let mut p_sd = Array1::<f64>::zeros(total_p);
+                for (i, (r, w)) in rhs.iter().zip(joint_trust_metric_diag.iter()).enumerate() {
+                    p_sd[i] = r / positive_joint_diagonal_entry(*w);
+                }
+                let mut h_psd = Array1::<f64>::zeros(total_p);
+                let mut cauchy_penalty_scratch = Array1::<f64>::zeros(total_p);
+                match apply_joint_penalized_hessian_into_with_workspace(
+                    &joint_hessian_source,
+                    &ranges,
+                    &s_lambdas,
+                    joint_mode_diagonal_ridge,
+                    &p_sd,
+                    &mut h_psd,
+                    &mut cauchy_penalty_scratch,
+                    joint_bundle,
+                ) {
+                    Ok(()) => {
+                        if let Some((_grad_phi, hphi)) = head_jeffreys_term.as_ref() {
+                            h_psd += &hphi.dot(&p_sd);
+                        }
+                        let cauchy = joint_cauchy_step(&rhs, &p_sd, &h_psd);
+                        if cauchy.iter().all(|v| v.is_finite()) {
+                            Some(cauchy)
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
@@ -15555,12 +15749,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
                 let mut trial_delta = search_delta.clone();
-                let mut block_step_norms = truncate_joint_step_to_block_metric_radii(
-                    &mut trial_delta,
-                    &ranges,
-                    &joint_trust_metric_diag,
-                    &joint_block_trust_radii,
-                );
+                // Dogleg globalization (gam#826/#808): when the unconstrained
+                // Newton path is in force and a finite Cauchy leg was built,
+                // construct the dogleg blend of the Cauchy and Newton points at
+                // the current per-block radii. Otherwise (constrained-QP path,
+                // or after the preconditioned-descent fallback replaced
+                // `search_delta`) fall back to box-truncating the search step.
+                let mut block_step_norms = if let Some(cauchy) = dogleg_cauchy.as_ref()
+                    && !tried_preconditioned_descent
+                {
+                    let mut dogleg = Array1::<f64>::zeros(total_p);
+                    let norms = joint_dogleg_step_to_block_metric_radii(
+                        &search_delta,
+                        cauchy,
+                        &ranges,
+                        &joint_trust_metric_diag,
+                        &joint_block_trust_radii,
+                        &mut dogleg,
+                    );
+                    trial_delta = dogleg;
+                    norms
+                } else {
+                    truncate_joint_step_to_block_metric_radii(
+                        &mut trial_delta,
+                        &ranges,
+                        &joint_trust_metric_diag,
+                        &joint_block_trust_radii,
+                    )
+                };
                 if apply_joint_feasibility_limit(family, &states, &ranges, &mut trial_delta)
                     .is_err()
                 {
