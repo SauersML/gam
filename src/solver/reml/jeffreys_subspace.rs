@@ -616,35 +616,47 @@ where
     // h_id_inv = V diag(1/max(λ,floor)) Vᵀ  (floored symmetric pseudo-inverse).
     let mut inv_diag = Array1::<f64>::zeros(m);
     for (i, &lam) in evals.iter().enumerate() {
-        let lam_floored = lam.max(floor);
-        // VALUE / GRADIENT CONSISTENCY (was a stall — gam#787/#785). The gradient
-        // below is `½ tr(H_id⁻¹ D_k) = ½ Σ_i (1/λ_i_floored) ∂λ_i/∂β`, i.e. it
-        // uses the FLOORED inverse `1/max(λ_i,floor)` on EVERY direction. For the
-        // value/gradient pair to be consistent (∇Φ = d/dβ Φ), `Φ = ½ Σ_i g(λ_i)`
-        // must use the antiderivative `g` of `λ ↦ 1/max(λ,floor)`, NOT plain
-        // `log(max(λ,floor))`:
-        //   • λ ≥ floor: g(λ) = ln(λ)               (g'(λ) = 1/λ),
-        //   • λ < floor: g(λ) = λ/floor + ln(floor) − 1  (g'(λ) = 1/floor),
-        // the linear continuation that is C¹ at λ = floor (g(floor) = ln(floor),
-        // g'(floor⁻) = g'(floor⁺) = 1/floor). The previous form used the CONSTANT
-        // `ln(floor)` below the floor, whose derivative is 0 — so on a separating
-        // direction (λ_i pinned at the floor, exactly where the conditioning gate
-        // arms Firth) the inner KKT residual ‖∇ℓ − Sβ + ∇Φ‖ floored at the
-        // nonzero `½ (1/floor) ∂λ_i/∂β` mass that the value's gradient did NOT
-        // contain, so no Newton step could drive it to tolerance: the inner
-        // joint-Newton burned its whole cycle budget at a frozen residual and the
-        // outer LAML never received a stationary mode (universal bernoulli-MS
-        // outer non-convergence, magnitude scaling with the separating curvature).
-        // The linear continuation keeps the gradient byte-identical (so the Firth
-        // O(1)-bounding response is unchanged) while making the value its exact
-        // antiderivative, so the residual can reach zero and the term still
-        // self-limits the separating direction.
-        if lam >= floor {
-            phi += 0.5 * lam.ln();
+        // VALUE / GRADIENT CONSISTENCY (was a stall — gam#787/#785) AND SIGN
+        // HANDLING ON INDEFINITE REDUCED INFO (gam#814). The gradient below is
+        // `½ tr(H_id⁻¹ D_k) = ½ Σ_i inv_diag_i ∂λ_i/∂β`, so for the value/gradient
+        // pair to be consistent (∇Φ = d/dβ Φ) the value `Φ = ½ Σ_i g(λ_i)` must use
+        // the antiderivative `g` of `λ ↦ inv_diag(λ)`.
+        //
+        // We floor on the MAGNITUDE `|λ|` and keep the SIGN of the inverse:
+        //   • |λ| ≥ floor: g(λ) = ln|λ|               (g'(λ) = 1/λ),
+        //   • |λ| < floor: g(λ) = λ/floor + ln(floor) − 1  (g'(λ) = 1/floor),
+        // the #787 linear continuation, C¹ at λ = +floor (g(floor) = ln(floor),
+        // g'(floor⁻) = g'(floor⁺) = 1/floor).
+        //
+        // WHY THE FLOOR IS ON `|λ|`, NOT `λ` (gam#814). `H_id = Z_Jᵀ H Z_J` is the
+        // reduced OBSERVED information; for a non-canonical link (e.g. the
+        // marginal-slope survival family) it need NOT be PSD away from the mode, so
+        // at off-mode trial points it carries MODERATE NEGATIVE eigenvalues
+        // (measured: λ ≈ −0.05 … −0.36, |λ| ≫ floor = 1e-10·λ_max). The previous
+        // `1/max(λ, floor)` flooring keyed on the SIGNED eigenvalue, so EVERY
+        // negative direction — however moderate — was treated as near-zero and
+        // pinned to `1/floor ≈ 1.7e6`: a phantom Firth score (∇Φ ≈ 1.4e6,
+        // H_Φ ≈ 1e12) that no Newton step could satisfy, so the inner joint-Newton
+        // crawled its whole cycle budget and the outer LAML never received a
+        // stationary mode (gam#814 survival clustered-PC marginal-slope timeout).
+        // Flooring on `|λ|` with the SIGNED true inverse `1/λ` gives the moderate
+        // negatives their genuine `1/λ ≈ −20 … −2.8` instead of `+1.7e6`, so the
+        // Jeffreys log-volume uses `½ ln|λ|` (the determinant magnitude, the
+        // PSD-realisation of `½ log det I` the Jeffreys prior intends) and the term
+        // self-limits rather than exploding. On a genuinely PSD fit every λ ≥ floor
+        // and this is BYTE-IDENTICAL to the prior `1/λ`, `½ ln λ`; the #787
+        // near-separation branch (`0 ≤ λ < floor`) is UNCHANGED, preserving the
+        // 1/floor separation bound. There is a harmless C⁰ kink in inv_diag at
+        // λ = ±floor (it jumps `+1/floor ↔ −1/floor`), but no eigenvalue sits near
+        // ∓floor in practice and the value `½ ln|λ|` stays continuous there.
+        let lam_mag = lam.abs();
+        if lam_mag >= floor {
+            phi += 0.5 * lam_mag.ln();
+            inv_diag[i] = 1.0 / lam;
         } else {
             phi += 0.5 * (lam / floor + floor.ln() - 1.0);
+            inv_diag[i] = 1.0 / floor;
         }
-        inv_diag[i] = 1.0 / lam_floored;
     }
     let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
     let h_id_inv = scaled.dot(&evecs.t());
@@ -821,7 +833,14 @@ where
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
     let mut inv_diag = Array1::<f64>::zeros(m);
     for (i, &lam) in evals.iter().enumerate() {
-        inv_diag[i] = 1.0 / lam.max(floor);
+        // Floor on |λ| with the SIGNED true inverse, identical to the value/gradient
+        // path in `joint_jeffreys_term` (gam#814): an off-mode indefinite reduced
+        // info must use `1/λ` on its moderate negative directions, not `+1/floor`.
+        if lam.abs() >= floor {
+            inv_diag[i] = 1.0 / lam;
+        } else {
+            inv_diag[i] = 1.0 / floor;
+        }
     }
     let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
     let h_id_inv = scaled.dot(&evecs.t());
@@ -1098,6 +1117,85 @@ mod tests {
                  exact antiderivative of the floored-inverse gradient",
                 grad[k]
             );
+        }
+    }
+
+    #[test]
+    fn joint_jeffreys_term_indefinite_value_gradient_consistent() {
+        // Regression for the survival clustered-PC marginal-slope inner-solve
+        // crawl (gam#814). The reduced OBSERVED information `H_id = Z_Jᵀ H Z_J` is
+        // NOT PSD away from the mode for a non-canonical link, so it carries a
+        // MODERATE NEGATIVE eigenvalue (|λ| ≫ floor). The released code floored on
+        // the SIGNED eigenvalue (`1/max(λ, floor)`), pinning that moderate negative
+        // to `+1/floor ≈ 1.7e6` — a phantom Firth score that no Newton step could
+        // satisfy. The fix floors on `|λ|` and keeps the sign of the inverse
+        // (`1/λ`), with the value `½ ln|λ|`. This test exercises that branch: the
+        // second eigenvalue is genuinely NEGATIVE and well above the floor in
+        // magnitude, so the FD gradient must match the analytic gradient ONLY with
+        // the signed `1/λ` inverse and the `½ ln|λ|` value. The existing PSD-only
+        // FD test cannot catch a sign error here.
+        //
+        // H(beta) = diag(exp(beta0), -(1 + beta1^2)), Z_J = I. λ_min < 0 < 1 so the
+        // conditioning gate fires fully (weight 1) and the active path runs.
+        let p = 2usize;
+        let z = Array2::<f64>::eye(p);
+        let h_at = |b: &Array1<f64>| -> Array2<f64> {
+            let mut h = Array2::<f64>::zeros((p, p));
+            h[[0, 0]] = b[0].exp();
+            h[[1, 1]] = -(1.0 + b[1] * b[1]);
+            h
+        };
+        let beta: Array1<f64> = array![0.3, -0.4];
+        // Hdot[d] = diag(exp(b0) d0, -2 b1 d1).
+        let hdir = |d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            let mut hd = Array2::<f64>::zeros((p, p));
+            hd[[0, 0]] = beta[0].exp() * d[0];
+            hd[[1, 1]] = -2.0 * beta[1] * d[1];
+            Ok(Some(hd))
+        };
+        let h = h_at(&beta);
+        let (phi, grad, hphi) = joint_jeffreys_term(h.view(), z.view(), hdir).unwrap();
+        // Sanity: the negative direction must NOT have been pinned to the floor.
+        // With the buggy signed floor, |grad| would be ~1/floor ≈ 1.7e9 here.
+        assert!(
+            grad.iter().all(|g| g.abs() < 1e3),
+            "indefinite direction must use the signed 1/λ inverse, not 1/floor; grad={grad:?}"
+        );
+        // Φ = ½(ln|λ0| + ln|λ1|) = ½ ln(exp(b0) · (1 + b1^2)), both |λ| ≫ floor.
+        let expected_phi = 0.5 * (beta[0].exp() * (1.0 + beta[1] * beta[1])).ln();
+        assert!(
+            (phi - expected_phi).abs() < 1e-9,
+            "phi {phi} vs {expected_phi}"
+        );
+        // Finite-difference the value the term accumulates (½ Σ ln|λ_i| since both
+        // magnitudes are above the floor) and compare to the analytic gradient.
+        let value_at = |b: &Array1<f64>| -> f64 {
+            let hh = h_at(b);
+            0.5 * (hh[[0, 0]].abs().ln() + hh[[1, 1]].abs().ln())
+        };
+        let eps = 1e-7;
+        for k in 0..p {
+            let mut bp = beta.clone();
+            let mut bm = beta.clone();
+            bp[k] += eps;
+            bm[k] -= eps;
+            let fd = (value_at(&bp) - value_at(&bm)) / (2.0 * eps);
+            assert!(
+                (grad[k] - fd).abs() <= 1e-5 * (1.0 + fd.abs()),
+                "indefinite grad[{k}] {} vs fd {fd}; value must be ½Σln|λ| (signed 1/λ inverse)",
+                grad[k]
+            );
+        }
+        // H_Phi is a Gram (½ S Sᵀ) so it stays symmetric PSD even with a negative
+        // eigenvalue in H_id.
+        for a in 0..p {
+            for b in 0..p {
+                assert!((hphi[[a, b]] - hphi[[b, a]]).abs() < 1e-12);
+            }
+        }
+        let (evals, _) = hphi.eigh(Side::Lower).unwrap();
+        for e in evals.iter() {
+            assert!(*e >= -1e-10, "H_Phi must be PSD, got eigenvalue {e}");
         }
     }
 
