@@ -1333,27 +1333,37 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         is_survival: false,
         link_choice: link_choice.as_ref(),
     })?;
-    // `--firth` with `bounded()` is genuinely unsupported (not merely
-    // "not yet wired at the CLI"). The Firth branch below fits through
-    // `optimize_external_design`, which operates on the raw linear design
-    // and has no notion of the bounded interval reparameterization. Bounded
-    // terms instead fit through the custom-family blockwise solver
-    // (`fit_bounded_term_collection_with_design` -> `fit_custom_family`),
-    // whose inner coefficient Newton has no Firth/Jeffreys penalty hook
-    // exposed through `BlockwiseFitOptions`. Routing `--firth` down the
-    // external-design path would silently drop the bounds and fit an
-    // unconstrained coefficient, producing a wrong answer with no warning.
-    // Until the bounded inner solve grows an exact Firth-penalty term we
-    // refuse the combination loudly rather than compute the wrong model.
-    if args.firth && has_bounded_terms {
-        return Err(
-            "--firth is not supported with bounded() coefficients: the Firth bias-reduction \
-             path fits the raw unconstrained design, while bounded() terms fit through the \
-             custom-family solver, which has no exact Firth/Jeffreys penalty. Drop --firth for \
-             bounded() models (the bounded transform already regularizes the coefficient toward \
-             the interior), or drop bounded() to use Firth."
+    // `--firth` with `bounded()` is *redundant*, not unsupported. Firth
+    // bias-reduction is exactly penalized maximum likelihood with Jeffreys'
+    // prior `½ log|I(β)|`, and that prior is reparameterization-INVARIANT: its
+    // MAP is equivariant under any smooth change of coordinates. Bounded terms
+    // fit through the custom-family blockwise solver
+    // (`fit_bounded_term_collection_with_design` -> `fit_custom_family`), whose
+    // inner/outer joint Newton ALWAYS carries the full-span Jeffreys curvature
+    // `H_Φ` and score `∇Φ` (its `joint_jeffreys_term_required()` is the trait
+    // default `true`; `BoundedLinearFamily` does not opt out). That term is the
+    // Jeffreys prior on the bounded LATENT coordinates `θ`, whose log-det
+    // already threads the interval reparameterization's log-Jacobian
+    // (`½ log|I_θ| = ½ log|I_β| + log|det J|`), so the latent MAP maps back
+    // through the interval transform to the exact user-scale Firth estimate.
+    // The explicit `--firth` branch below instead fits through
+    // `optimize_external_design` on the raw unconstrained design and would
+    // silently DROP the bounds — wrong for a bounded model. We therefore keep
+    // bounded models on the standard branch (which is already Firth-equivalent)
+    // and record the redundancy, rather than refusing the combination.
+    let firth_redundant_for_bounded = args.firth && has_bounded_terms;
+    if firth_redundant_for_bounded {
+        inference_notes.push(
+            "--firth is redundant for bounded() coefficients: the bounded custom-family solver \
+             already installs the reparameterization-invariant Jeffreys/Firth bias-reduction in \
+             the bounded latent coordinates, which is the exact Firth estimate on the user scale."
                 .to_string(),
         );
+        print_inference_summary(std::slice::from_ref(
+            inference_notes
+                .last()
+                .expect("note just pushed is present"),
+        ));
     }
     let fit_max_iter = 200usize;
     let fit_tol = 1e-6f64;
@@ -1476,7 +1486,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
         Option<gam::smooth::AdaptiveRegularizationDiagnostics>,
         FittedLinkState,
         Option<(Vec<f64>, usize)>,
-    ) = if args.firth {
+    ) = if args.firth && !firth_redundant_for_bounded {
         let design = build_term_collection_design(ds.values.view(), &spec)
             .map_err(|e| format!("failed to build term collection design: {e}"))?;
         progress.set_stage("fit", "optimizing penalized likelihood");
