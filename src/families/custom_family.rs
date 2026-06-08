@@ -11733,24 +11733,37 @@ fn strict_exact_pseudo_logdet(
     // and a 100·ε floor handles the ‖H‖→0 limit.
     let eps = f64::EPSILON;
     let eps_np = eps * (accumulation_depth as f64) * (p as f64);
-    let tol = (10.0 * eps_np * max_abs_eval).max(100.0 * eps);
-    // Reject ONLY genuine indefiniteness. A matrix that symmetrises to PSD —
-    // including a near-singular-but-positive curvature (smallest eigenvalue just
-    // above the noise floor) or a structural null space (eigenvalues inside the
-    // `[−tol, tol]` band) — is NOT a defect: the bare Cholesky the strict path
-    // historically used accepted every such matrix, and the exact positive-
-    // eigenspace pseudo-logdet `Σ_{λ>tol} log λ` is well defined and matches the
-    // `tr((H+S_λ)⁻¹ ·)` derivative on `range(H+S_λ)`. Only a genuinely negative
-    // eigenvalue (`λ < −tol`) signals an indefinite curvature — a non-stationary
-    // inner β or a mis-signed block — and is rejected so the outer optimizer
-    // steps back instead of δ-ridge masking it (gam#748).
-    if evals.iter().any(|&ev| ev < -tol) {
+    // `neg_tol` is the INDEFINITENESS-rejection band only: an eigenvalue below
+    // `−neg_tol` is a genuine negative curvature (non-stationary β / mis-signed
+    // block) and is rejected, not masked (gam#748).
+    let neg_tol = (10.0 * eps_np * max_abs_eval).max(100.0 * eps);
+    // POSITIVE-eigenspace inclusion cutoff for the pseudo-logdet sum. This MUST
+    // be byte-identical to the cutoff the analytic REML gradient's trace kernel
+    // uses (`positive_eigenvalue_threshold`, the `range(H+Sλ)` Moore–Penrose
+    // pinv drop in `joint_penalty_subspace_trace_parts`), or the LAML VALUE
+    // `½ log|H+Sλ|₊` and its analytic GRADIENT `½ tr((H+Sλ)⁺ ∂Sλ)` are evaluated
+    // over DIFFERENT subspaces and describe DIFFERENT objectives — the "mixing
+    // an approximate determinant with exact traces gives ARC a Hessian for a
+    // different objective" trap (gam#748).
+    //
+    // Historically this sum used the Bauer–Fike `neg_tol = 10·ε·n·p·‖H‖`, a
+    // factor of ~n/10 LARGER than the kernel's `100·ε·p·‖H‖`. At an oversmoothed
+    // marginal-slope ρ probe a penalty-null trend eigenvalue lands in the band
+    // `(100·ε·p·‖H‖, 10·ε·n·p·‖H‖)`: DROPPED from the value logdet but KEPT in
+    // the gradient kernel, so the analytic outer gradient is the derivative of a
+    // different objective than the value. ARC's predicted descent then never
+    // matches the actual objective change and the outer optimizer freezes
+    // (constant ‖g‖, stuck cost — gam#808). Sharing the kernel's threshold here
+    // removes the desync at the source; both are `C∞` in ρ (the positive
+    // eigenspace of a PSD-shifted Hessian is structurally fixed).
+    let pos_tol = positive_eigenvalue_threshold(evals.as_slice().unwrap());
+    if evals.iter().any(|&ev| ev < -neg_tol) {
         let min_eval = evals.iter().copied().fold(f64::INFINITY, f64::min);
-        let below = evals.iter().filter(|&&ev| ev < -tol).count();
+        let below = evals.iter().filter(|&&ev| ev < -neg_tol).count();
         return Err(CustomFamilyError::NumericalFailure {
             reason: format!(
-                "strict pseudo-laplace logdet: {below} eigenvalue(s) below -tol \
-             (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, tol={tol:.6e}, εnp={eps_np:.6e}); \
+                "strict pseudo-laplace logdet: {below} eigenvalue(s) below -neg_tol \
+             (min(λ)={min_eval:.6e}, max|λ|={max_abs_eval:.6e}, neg_tol={neg_tol:.6e}, εnp={eps_np:.6e}); \
              indefinite joint coefficient Hessian rejected (no δ-ridge masking, gam#748)"
             ),
         }
@@ -11759,7 +11772,7 @@ fn strict_exact_pseudo_logdet(
     Ok(evals
         .iter()
         .copied()
-        .filter(|&ev| ev > tol)
+        .filter(|&ev| ev > pos_tol)
         .map(f64::ln)
         .sum())
 }
