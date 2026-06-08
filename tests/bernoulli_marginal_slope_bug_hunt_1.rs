@@ -45,8 +45,15 @@ fn bug_exact_kernel_second_and_third_derivatives_match_finite_difference() {
     let x0 = 0.23_f64;
     let h = 1e-4;
     let fpp_fd = (f(x0 + h) - 2.0 * f(x0) + f(x0 - h)) / (h * h);
-    let fppp_fd =
-        (f(x0 + 2.0 * h) - 2.0 * f(x0 + h) + 2.0 * f(x0 - h) - f(x0 - 2.0 * h)) / (2.0 * h * h * h);
+    // The third-difference stencil divides by 2·h³, so a step optimal for the
+    // second derivative (1e-4) lets floating-point rounding (≈ε/h³ ≈ 5e-5)
+    // dominate the truncation error and swamp the closed-form comparison. The
+    // round-off-vs-truncation optimum for a 3rd derivative is h ≈ ε^{1/5} ≈
+    // 1e-3 (truncation O(h²) ≈ 1e-6, rounding O(ε/h³) ≈ 2e-7), so use a wider
+    // step here than for the 2nd derivative.
+    let h3 = 1e-3;
+    let fppp_fd = (f(x0 + 2.0 * h3) - 2.0 * f(x0 + h3) + 2.0 * f(x0 - h3) - f(x0 - 2.0 * h3))
+        / (2.0 * h3 * h3 * h3);
     let fpp_closed = (x0 * x0 - 1.0) * normal_pdf(x0);
     let fppp_closed = (3.0 * x0 - x0 * x0 * x0) * normal_pdf(x0);
     assert!(
