@@ -17020,6 +17020,47 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         );
                         continue;
                     }
+                    // EARLY-CYCLE CARVE-OUT (gam#826/#872). The phantom-multiplier
+                    // refusal asserts that the residual is a captured Lagrange
+                    // multiplier / H-null mass that Newton genuinely cannot move —
+                    // a claim that requires EVIDENCE of a plateau. The candidate
+                    // conditions above (objective + step exhausted, linearized_rel ≥
+                    // 0.5) are ALSO satisfied transiently when a single Newton step
+                    // is small because the augmented (Firth) curvature `H_Φ` is
+                    // legitimately large in the `∇Φ` direction at an oversmoothed
+                    // cycle-0 seed: the step `(H+Sλ+H_Φ)⁻¹(∇L−Sβ+∇Φ)` is tiny (high
+                    // curvature ⇒ short step) and ONE step undershoots the
+                    // nonquadratic Firth optimum, so `step_inf` and `|Δobj|` look
+                    // exhausted while the residual is still O(‖∇Φ‖) ≫ tol. Refusing
+                    // there at cycle 0 (no descent history yet) aborts the coupled
+                    // binomial location-scale / flexible-linkwiggle fit before the
+                    // inner has taken the handful of cycles it needs to walk the
+                    // curved Firth basin to its optimum. When the residual is still
+                    // ORDERS above tol and we lack a full descent window to prove a
+                    // genuine plateau, keep iterating — the inner cycle cap and the
+                    // residual-stall / trust-region-floor guards still bound the
+                    // loop and diagnose a true non-convergence. A genuine multiplier
+                    // plateau (residual flat across the window) is caught once the
+                    // history fills, exactly as before. The threshold is the same
+                    // `RESIDUAL_DESCENT_WINDOW` the descent test uses, so this only
+                    // defers the refusal until there is enough history to make it,
+                    // never weakens it.
+                    let residual_far_above_tol = residual.is_finite()
+                        && residual_tol.is_finite()
+                        && residual > cert_residual_factor * residual_tol;
+                    if residual_far_above_tol
+                        && residual_descent_history.len() < RESIDUAL_DESCENT_WINDOW
+                    {
+                        log::info!(
+                            "[PIRLS/joint-Newton convergence] cycle {:>3} | constrained-stationary refusal DEFERRED: residual={:.3e} ≫ tol={:.3e} but only {} descent samples (< {} window) — too early to prove a multiplier/null plateau vs a high-curvature Firth-basin transient; continuing",
+                            cycle,
+                            residual,
+                            residual_tol,
+                            residual_descent_history.len(),
+                            RESIDUAL_DESCENT_WINDOW,
+                        );
+                        continue;
+                    }
                     // Structured per-block + per-spectrum refusal report.
                     // The legacy one-line refusal log printed only aggregate
                     // numbers (linearized_rel, scalar_relerr, residual,
