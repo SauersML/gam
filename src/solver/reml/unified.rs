@@ -3626,6 +3626,19 @@ impl HyperOperator for ImplicitHyperOperator {
     }
 }
 
+/// Row-block size that keeps each streamed `n × cols` chunk near an 8 MiB
+/// working set, with a 512-row floor so a wide design still makes useful BLAS-3
+/// progress per block, capped at the total row count. Shared by the implicit
+/// operator's row-streaming kernels so they cannot drift apart.
+fn byte_balanced_row_chunk(cols: usize, n_rows: usize) -> usize {
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_CHUNK_ROWS: usize = 512;
+    let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
+    (TARGET_BYTES / bytes_per_row)
+        .max(MIN_CHUNK_ROWS)
+        .min(n_rows)
+}
+
 impl ImplicitHyperOperator {
     /// Chunked `X · F` via faer SIMD-parallel GEMM. The chunk-row sizing
     /// targets ~8 MiB live blocks so the (chunk_n × p) row slice and
@@ -3638,10 +3651,7 @@ impl ImplicitHyperOperator {
         let n_obs = self.w_diag.len();
         let rank = factor.ncols();
         let mut xf = Array2::<f64>::zeros((n_obs, rank));
-        const TARGET_BYTES: usize = 8 * 1024 * 1024;
-        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
-            .max(512)
-            .min(n_obs);
+        let chunk_rows = byte_balanced_row_chunk(self.p + rank, n_obs);
         let mut start = 0usize;
         while start < n_obs {
             let end = (start + chunk_rows).min(n_obs);
@@ -3695,10 +3705,7 @@ impl ImplicitHyperOperator {
 
         // Match the chunk sizing `xt_logdet_kernel_x_diagonal` uses so the
         // live block stays in L2/L3 across realistic biobank shapes.
-        const TARGET_BYTES: usize = 8 * 1024 * 1024;
-        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
-            .max(512)
-            .min(n_obs);
+        let chunk_rows = byte_balanced_row_chunk(self.p + rank, n_obs);
 
         let w = self.w_diag.as_ref();
         let c_opt = self.c_x_psi_beta.as_ref().map(|arc| arc.as_ref());
@@ -3763,10 +3770,7 @@ impl ImplicitHyperOperator {
 
         let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
 
-        const TARGET_BYTES: usize = 8 * 1024 * 1024;
-        let chunk_rows = (TARGET_BYTES / ((self.p + rank).max(1) * 8))
-            .max(512)
-            .min(n_obs.max(1));
+        let chunk_rows = byte_balanced_row_chunk(self.p + rank, n_obs.max(1));
 
         let w = self.w_diag.as_ref();
         let mut design_totals = vec![0.0_f64; axes.len()];
@@ -5334,9 +5338,14 @@ impl ProjectedKktResidual {
                     .iter()
                     .map(|value| value.abs())
                     .fold(0.0_f64, f64::max);
+                // Default mixed absolute/relative tolerance for the dropped-mass
+                // gate when the caller supplies no explicit `residual_tol`:
+                // ~1e-10 scaled by `1 + ‖r‖∞` so it degrades gracefully with the
+                // residual magnitude.
+                const DEFAULT_KKT_RESIDUAL_REL_TOL: f64 = 1e-10;
                 let tol = self
                     .residual_tol
-                    .unwrap_or_else(|| 1e-10 * (1.0 + residual_inf));
+                    .unwrap_or_else(|| DEFAULT_KKT_RESIDUAL_REL_TOL * (1.0 + residual_inf));
                 let gate = tol;
                 if dropped_inf > gate {
                     return Err(format!(
@@ -14052,10 +14061,7 @@ impl HessianOperator for DenseSpectralOperator {
         if n == 0 || p == 0 || rank == 0 {
             return h;
         }
-        let chunk_rows = {
-            const TARGET_BYTES: usize = 8 * 1024 * 1024;
-            (TARGET_BYTES / ((p + rank).max(1) * 8)).max(512).min(n)
-        };
+        let chunk_rows = byte_balanced_row_chunk(p + rank, n);
         let mut start = 0usize;
         while start < n {
             let end = (start + chunk_rows).min(n);
