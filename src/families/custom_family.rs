@@ -15934,6 +15934,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_step_inf,
                     step_inf,
                 );
+                if cycle >= 3 && cycle <= 6 {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/gam_diag.log")
+                    {
+                        writeln!(f, "[DIAG-TR] cycle={cycle} attempt={line_search_attempts} {tr_attempt_sig}").ok();
+                    }
+                }
                 match tr_log_sig.as_deref() {
                     Some(prev) if prev == tr_attempt_sig.as_str() => {
                         tr_log_last = line_search_attempts;
