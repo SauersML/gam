@@ -3520,6 +3520,20 @@ pub struct BlockwiseFitOptions {
 
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
 
+/// Default inner (coefficient-space) convergence tolerance: relative KKT /
+/// objective slack at which the inner Newton/PIRLS solve is declared
+/// stationary. Tighter than the outer tolerance so the REML/LAML derivative
+/// path always sees a fully converged inner mode.
+const DEFAULT_CUSTOM_FAMILY_INNER_TOL: f64 = 1e-6;
+/// Default outer (smoothing-parameter) convergence tolerance: relative change
+/// in the REML/LAML criterion / its gradient below which the outer ρ optimizer
+/// stops.
+const DEFAULT_CUSTOM_FAMILY_OUTER_TOL: f64 = 1e-5;
+/// Default cap on outer (smoothing-parameter) iterations. The outer loop is
+/// the expensive nested level; this bounds total cost while the outer-tol
+/// certificate exits earlier for well-conditioned fits.
+const DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER: usize = 60;
+
 impl Default for BlockwiseFitOptions {
     fn default() -> Self {
         Self {
@@ -3533,9 +3547,9 @@ impl Default for BlockwiseFitOptions {
             // KKT/objective certificates to exit early for well-conditioned
             // Gaussian, logistic, and small-n fits.
             inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
-            inner_tol: 1e-6,
-            outer_max_iter: 60,
-            outer_tol: 1e-5,
+            inner_tol: DEFAULT_CUSTOM_FAMILY_INNER_TOL,
+            outer_max_iter: DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER,
+            outer_tol: DEFAULT_CUSTOM_FAMILY_OUTER_TOL,
             minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             // `ridge_floor` is an ExplicitPrior in the canonical
             // stabilization ledger taxonomy (`StabilizationKind::ExplicitPrior`):
