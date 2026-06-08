@@ -17133,6 +17133,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             } else {
                 log::warn!("{verdict}");
             }
+            eprintln!(
+                "[DIAG-INNER] converged={converged} terminator={terminator} cycles={cycles_done}/{inner_max_cycles} best_resid={best_residual_seen:.3e} p={total_p}"
+            );
         }
 
         // If joint Newton converged, skip the blockwise loop entirely.
