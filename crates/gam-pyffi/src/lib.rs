@@ -88,7 +88,7 @@ use gam::terms::basis::{
     build_duchon_operator_penalty_matrices, build_matern_basis, build_periodic_bspline_basis_1d,
     build_spherical_spline_basis, build_thin_plate_penalty_matrix, create_basis,
     create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
-    duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
+    duchon_cubic_default, duchon_nullspace_dimension, duchon_polynomial_first_derivative_nd,
     duchon_pure_kernel_amplification, duchon_radial_first_derivative_nd,
     duchon_sae_atom_basis_with_jet, evaluate_bspline_basis_scalar,
     matern_input_location_hessian_nd, matern_input_location_jet_nd,
@@ -3470,22 +3470,26 @@ fn duchon_function_norm_penalty<'py>(
             "duchon scalar `period` is only valid for d=1 (multi-D periodic axes auto-derive period from centers)".to_string(),
         ));
     }
-    // Preserve the pre-change default path bit-for-bit when no hybrid /
-    // explicit-order keyword is supplied. When any of the three new
-    // keywords is set, route through the shared hybrid resolver.
-    let hybrid_requested = length_scale.is_some() || nullspace_order.is_some() || power.is_some();
-    let (spec_length_scale, spec_nullspace, spec_power) = if hybrid_requested {
-        let cfg = resolve_duchon_hybrid_config(
-            d,
-            m,
-            length_scale,
-            nullspace_order,
-            power,
-            /* max_op = */ 2,
-        )?;
-        (cfg.length_scale, cfg.nullspace_order, cfg.power)
-    } else {
-        (None, duchon_nullspace_from_m(m), 0.0)
+    let (spec_length_scale, spec_nullspace, spec_power) = match power {
+        Some(explicit_power) => {
+            let cfg = resolve_duchon_hybrid_config(
+                d,
+                m,
+                length_scale,
+                nullspace_order,
+                Some(explicit_power),
+                /* max_op = */ 0,
+            )?;
+            (cfg.length_scale, cfg.nullspace_order, cfg.power)
+        }
+        None if length_scale.is_none() && nullspace_order.is_none() => {
+            let (default_nullspace, default_power) = duchon_cubic_default(d);
+            (None, default_nullspace, default_power)
+        }
+        None => {
+            let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, None, 0)?;
+            (cfg.length_scale, cfg.nullspace_order, cfg.power)
+        }
     };
     // Any periodic axis (1D or multi-D) routes through the mixed-periodicity
     // builder (cylinder/torus chord-distance polyharmonic).
