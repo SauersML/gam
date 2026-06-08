@@ -700,25 +700,32 @@ fn map_hessian_to_original_basis(
     Ok(h)
 }
 
+/// Strictly-positive floor on a reported dispersion / scale parameter `φ`.
+/// Every GLM family resolves `φ` to a non-negative quantity, but downstream
+/// consumers (covariance scaling, deviance ratios) divide by it, so it is
+/// clamped to the smallest positive normal `f64` to keep those quotients
+/// finite without perturbing any `φ` above the denormal range.
+const DISPERSION_POSITIVE_FLOOR: f64 = 1e-300;
+
 fn dispersion_from_likelihood(
     likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
 ) -> Dispersion {
     match &likelihood.spec.response {
-        ResponseFamily::Gaussian => {
-            Dispersion::Estimated((standard_deviation * standard_deviation).max(1e-300))
-        }
+        ResponseFamily::Gaussian => Dispersion::Estimated(
+            (standard_deviation * standard_deviation).max(DISPERSION_POSITIVE_FLOOR),
+        ),
         ResponseFamily::Gamma => {
             let phi = likelihood.scale.fixed_phi().unwrap_or_else(|| {
                 let shape = likelihood
                     .gamma_shape()
-                    .unwrap_or(standard_deviation.max(1e-300));
-                1.0 / shape.max(1e-300)
+                    .unwrap_or(standard_deviation.max(DISPERSION_POSITIVE_FLOOR));
+                1.0 / shape.max(DISPERSION_POSITIVE_FLOOR)
             });
             if likelihood.scale.gamma_shape_is_estimated() {
-                Dispersion::Estimated(phi.max(1e-300))
+                Dispersion::Estimated(phi.max(DISPERSION_POSITIVE_FLOOR))
             } else {
-                Dispersion::Known(phi.max(1e-300))
+                Dispersion::Known(phi.max(DISPERSION_POSITIVE_FLOOR))
             }
         }
         ResponseFamily::Tweedie { .. } => {
@@ -727,7 +734,10 @@ fn dispersion_from_likelihood(
             // estimate, issue #771). Reported as `Estimated` when the default
             // estimate-phi metadata is in force so downstream consumers know the
             // scale came from the data, not a frozen seed.
-            let phi = likelihood.fixed_phi().unwrap_or(1.0).max(1e-300);
+            let phi = likelihood
+                .fixed_phi()
+                .unwrap_or(1.0)
+                .max(DISPERSION_POSITIVE_FLOOR);
             if likelihood.scale.tweedie_phi_is_estimated() {
                 Dispersion::Estimated(phi)
             } else {
@@ -735,10 +745,15 @@ fn dispersion_from_likelihood(
             }
         }
         ResponseFamily::NegativeBinomial { theta } => {
-            Dispersion::Known(likelihood.fixed_phi().unwrap_or(*theta).max(1e-300))
+            Dispersion::Known(
+                likelihood
+                    .fixed_phi()
+                    .unwrap_or(*theta)
+                    .max(DISPERSION_POSITIVE_FLOOR),
+            )
         }
         ResponseFamily::Beta { phi } => {
-            Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(1e-300))
+            Dispersion::Known((1.0 / (1.0 + phi.max(1e-12))).max(DISPERSION_POSITIVE_FLOOR))
         }
         ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::RoystonParmar => {
             Dispersion::Known(1.0)
