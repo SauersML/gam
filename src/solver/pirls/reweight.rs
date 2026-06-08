@@ -1257,6 +1257,14 @@ where
                         last_deviance_change = deviance_change;
                         last_step_size = 1.0;
                         last_step_halving = attempts;
+                        if iter <= 20 || iter % 50 == 0 {
+                            use std::io::Write as _;
+                            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                                let raw_g = accepted_state.gradient.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                                let bi = beta.as_ref().iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                                writeln!(f, "[DIAG-PIRLS] iter={iter} kkt={candidategrad_norm:.4e} raw_grad_inf={raw_g:.4e} dev_chg={deviance_change:.4e} beta_inf={bi:.4e} attempts={attempts}").ok();
+                            }
+                        }
                         max_abs_eta = accepted_state
                             .eta
                             .iter()
