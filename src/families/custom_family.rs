@@ -16251,6 +16251,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
+            {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    writeln!(f, "[DIAG-CYC] cycle={cycle} residual={residual:.4e} step_inf={step_inf:.4e} accepted_step_inf={accepted_step_inf:.4e} model_rejects={model_rejects} tr={joint_trust_radius:.3e}").ok();
+                }
+            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
@@ -17197,6 +17203,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 log::info!("{verdict}");
             } else {
                 log::warn!("{verdict}");
+            }
+            {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    writeln!(f, "[DIAG-INNER] converged={converged} terminator={terminator} cycles={cycles_done}/{inner_max_cycles} best_resid={best_residual_seen:.3e} last_resid_below_tol={last_cycle_residual_below_tol} p={total_p}").ok();
+                }
             }
         }
 
