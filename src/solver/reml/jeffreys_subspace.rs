@@ -181,6 +181,66 @@ fn conditioning_gate_weight(lambda_min: f64, lambda_max: f64) -> f64 {
     w_abs.max(w_rel)
 }
 
+/// Partial derivatives `(∂G/∂λ_min, ∂G/∂λ_max)` of the conditioning gate weight
+/// `G = max(w_abs, w_rel)` (see [`conditioning_gate_weight`]).
+///
+/// The gate scales the Jeffreys curvature the LAML value folds into
+/// `½ log|H + S_λ + G·H_Φ_raw|`; because `λ_min, λ_max` move with β through the
+/// inner mode response, the gate's own mode-response variation is part of the
+/// EXACT outer hypergradient. Dropping it (treating `G` as locally constant in the
+/// drift) desyncs the analytic outer gradient from its own value precisely when
+/// the gate sits in its smooth transition band — the residual tension-axis
+/// mismatch in gam#854, even when no eigenvalue is floored. Returns `(0, 0)` on the
+/// saturated / degenerate branches where `G` is locally constant (so the outer
+/// drift is byte-unchanged on every fully-active or well-conditioned fit).
+fn conditioning_gate_weight_grad(lambda_min: f64, lambda_max: f64) -> (f64, f64) {
+    if lambda_max <= 0.0 || !lambda_min.is_finite() {
+        // Matches `conditioning_gate_weight`'s constant-`1.0` early returns.
+        return (0.0, 0.0);
+    }
+    // `ramp_down`'s value and derivative: `d/dx [1 − (3t² − 2t³)] = −6 t (1−t) / (clear − under)`
+    // on the open band (`under < x < clear`), `0` at/outside both knots (C¹).
+    #[inline]
+    fn ramp_down_value_and_deriv(x: f64, under: f64, clear: f64) -> (f64, f64) {
+        if x <= under {
+            return (1.0, 0.0);
+        }
+        if x >= clear {
+            return (0.0, 0.0);
+        }
+        let span = clear - under;
+        let t = (x - under) / span;
+        let value = 1.0 - t * t * (3.0 - 2.0 * t);
+        let deriv = -6.0 * t * (1.0 - t) / span;
+        (value, deriv)
+    }
+    let (w_abs, dw_abs_dlmin) = ramp_down_value_and_deriv(
+        lambda_min,
+        CONDITIONING_GATE_ABSOLUTE,
+        CONDITIONING_GATE_ABSOLUTE_CLEAR,
+    );
+    let ratio = (lambda_min / lambda_max).max(f64::MIN_POSITIVE);
+    let (w_rel, dw_rel_dlogratio) = ramp_down_value_and_deriv(
+        ratio.log10(),
+        CONDITIONING_GATE_RELATIVE.log10(),
+        CONDITIONING_GATE_RELATIVE_CLEAR.log10(),
+    );
+    // `G = w_abs.max(w_rel)`: only the active branch varies the max. A tie is a
+    // measure-zero kink the smooth band stays away from; resolve it to `w_abs`
+    // (consistent, and the dominant branch in the small-`n` absolute regime).
+    if w_abs >= w_rel {
+        (dw_abs_dlmin, 0.0)
+    } else {
+        // `∂ log₁₀(λ_min/λ_max)/∂λ_min = 1/(λ_min ln10)`,
+        // `∂ log₁₀(λ_min/λ_max)/∂λ_max = −1/(λ_max ln10)`.
+        let ln10 = std::f64::consts::LN_10;
+        (
+            dw_rel_dlogratio / (lambda_min * ln10),
+            -dw_rel_dlogratio / (lambda_max * ln10),
+        )
+    }
+}
+
 /// Below this joint dimension the dense reduced eigendecomposition in
 /// [`joint_jeffreys_term`] is itself cheap (`O(p³)` with `p` in the tens — e.g.
 /// the BMS-probit `p≈51` fit), so the matrix-free pre-check below would only add
@@ -988,7 +1048,43 @@ where
             out[[b, a]] = value;
         }
     }
-    Ok(out * gate_weight)
+
+    // GATE β-DERIVATIVE (value↔outer-gradient consistency, gam#854 tension axis).
+    // The objective folds the GATED curvature `G·H_Φ_raw` into `½ log|H+S_λ+G·H_Φ_raw|`,
+    // and the gate `G(λ_min, λ_max)` moves with β through the mode response δ. The
+    // exact drift is therefore
+    //   D_β[G·H_Φ_raw][δ] = (D_β G[δ]) · H_Φ_raw + G · D_β H_Φ_raw[δ],
+    // where `out` above is `D_β H_Φ_raw[δ]`. `D_β G[δ] = G_λmin·δλ_min + G_λmax·δλ_max`
+    // with `δλ = vᵀ Ḋ v` the first-order perturbation of the extreme reduced-info
+    // eigenvalue (`Ḋ = dbar = Z_Jᵀ Hdot[δ] Z_J`) and `H_Φ_raw[a,b] = ½⟨vec M_a, vec M_b⟩
+    // = ½ (m_rows m_rowsᵀ)[a,b]`. On a saturated gate `G_λ = 0`, so this term is
+    // identically zero and the drift stays byte-unchanged on fully-active fits.
+    let mut result = out * gate_weight;
+    let lambda_min = evals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let (g_dlmin, g_dlmax) = conditioning_gate_weight_grad(lambda_min, lambda_max);
+    if g_dlmin != 0.0 || g_dlmax != 0.0 {
+        let mut idx_min = 0usize;
+        let mut idx_max = 0usize;
+        for i in 1..m {
+            if evals[i] < evals[idx_min] {
+                idx_min = i;
+            }
+            if evals[i] > evals[idx_max] {
+                idx_max = i;
+            }
+        }
+        let extreme_perturbation = |idx: usize| -> f64 {
+            let v = evecs.column(idx);
+            v.dot(&dbar.dot(&v))
+        };
+        let d_gate =
+            g_dlmin * extreme_perturbation(idx_min) + g_dlmax * extreme_perturbation(idx_max);
+        if d_gate != 0.0 {
+            let hphi_raw = m_rows.dot(&m_rows.t()).mapv(|x| 0.5 * x);
+            result.scaled_add(d_gate, &hphi_raw);
+        }
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
