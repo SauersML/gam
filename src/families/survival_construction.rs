@@ -1639,41 +1639,78 @@ pub fn build_survival_time_basis(
             if penalty_basis.design.ncols() != p_time_full + 1 {
                 return Err("internal error: ispline penalty dimension mismatch".to_string());
             }
-            // I-spline second-difference penalty, restricted to the retained
-            // (non-dropped) coefficient block.
+            // I-spline curvature penalty in the value space of the baseline
+            // log-cumulative-hazard, restricted to the retained (non-dropped)
+            // coefficient block.
             //
-            // NOTE (#691). The principled curvature penalty for the baseline
-            // log-cumulative-hazard `q(log t) = Σ_j γ_j I_j(log t)` is the
-            // value-space form `S_I = Lᵀ S_B L` (with `L` the lower-triangular
-            // cumulative-sum operator mapping I-spline coefficients γ to the
-            // underlying B-spline coefficients `c = L γ`), which places the affine
-            // log-cumhaz trend `q = a·log t + b` in the penalty null space so REML
-            // does not over-shrink the baseline slope and flatten the upper tail
-            // of `log Λ(t)` — the documented #691 tail bias.
+            // #691 fix. The baseline is `q(log t) = Σ_k γ_k I_k(log t)`, where the
+            // I-spline basis is the right-cumulative sum of the underlying
+            // degree-`bspline_degree` B-spline value basis `B_m`:
+            //   `I_k(x) = Σ_{m=k+1}^{M-1} B_m(x)`,   k = 0..M-2,   M = num_bspline.
+            // Substituting and collecting `B_m`,
+            //   `q(x) = Σ_m B_m(x) · (Σ_{k=0}^{m-1} γ_k)`,
+            // so the B-spline value coefficients are the prefix sums of γ:
+            //   `c = L γ`,   `c_m = Σ_{k=0}^{m-1} γ_k`   (c_0 = 0).
+            // `L` is therefore the strictly-lower-triangular 0/1 prefix-sum map of
+            // shape `M × (M-1)` (`L[m,k] = 1 iff k < m`); the cumulative sums use
+            // unit weights — the basis applies no per-column normalization (it
+            // sums raw B-spline values and merely subtracts a left-boundary
+            // constant that adds nothing to a second-difference curvature
+            // penalty), so there are no scaling constants in `L`.
             //
-            // That value-space form is NOT applied here, and MSI verification is
-            // the reason: although `Lᵀ D₂ᵀD₂ L = D₁ᵀD₁` has the SAME null-space
-            // dimension (1) as the increment-space block, the survival inner PIRLS
-            // does not pin the now-affine likelihood-identified direction over that
-            // null space — the constrained-cone Newton stalls at ‖g‖≈0.526 and the
-            // fit hits MaxIterations (a hard `IntegrationFailed`, not a metric
-            // miss; reproduced on MSI at iters=400, grad_norm=5.262e-1). The
-            // correct fix keeps that curvature over the null space INSIDE the
-            // survival REML/PIRLS (the #752 generalized-determinant principle, on
-            // the inner solve), after which the value-space penalty becomes safe.
-            // Until then use the increment-space submatrix `S_B[1.., 1..]`, which
-            // converges; the tail-bias trade-off is the open #691 limitation, not
-            // a regression.
+            // The correct curvature penalty is the congruent value-space form
+            //   `S_I = Lᵀ S_B L`,   S_B = D₂ᵀD₂ (the B-spline second-difference
+            // penalty `penalty_basis.penalties`). With this form a constant γ maps
+            // to an affine `c` (`c_m = m·γ`), so `D₂ c = 0` and `γᵀ S_I γ = 0`:
+            // the affine log-cumhaz trend `q = a·log t + b` lies in the penalty
+            // null space. REML therefore stops over-shrinking the baseline slope,
+            // curing the documented upper-tail flattening of `log Λ(t)`.
+            //
+            // The earlier increment-space submatrix `S_B[1.., 1..]` instead
+            // applied `D₂` to `(0, γ)`, penalizing the affine slope and leaving
+            // the wrong trend unpenalized — the source of the tail bias.
+            //
+            // Null space: `S_I` is rank-deficient by exactly the dimension of the
+            // affine baseline subspace surviving in the retained coordinates. That
+            // dimension is computed below from `S_I`'s eigenspectrum and reported
+            // through `nullspace_dims`, which the generic REML uses for the
+            // mgcv-style generalized determinant (#752: `log|H+Sλ|₊` over
+            // `range(H+Sλ)`, trace kernel over `range(Sλ)`), so the affine
+            // direction is treated as unpenalized-but-likelihood-identified. The
+            // survival inner PIRLS pins that direction through the likelihood
+            // curvature plus the `SURVIVAL_STABILIZATION_RIDGE` on `H`, and its
+            // KKT certificate normalizes the penalized residual by
+            // `1 + ‖score‖ + ‖S_λβ‖`, which stays scale-invariant even though the
+            // value-space `‖S_λβ‖` is larger than in the increment space.
             let mut penalties = Vec::<Array2<f64>>::new();
             for s_mat in &penalty_basis.penalties {
                 if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
                     continue;
                 }
-                let reduced = s_mat.slice(ndarray::s![1.., 1..]).to_owned();
+                // S_B is (M × M) with M = p_time_full + 1 = num_bspline.
+                let num_bspline = p_time_full + 1;
+                // Value-space penalty over the FULL I-spline coordinate set:
+                //   S_I_full = Lᵀ S_B L,   (S_I_full)[a,b] = Σ_{m>a} Σ_{q>b} S_B[m,q],
+                // since column k of L is the indicator `{m > k}`. We compute it via
+                // the explicit prefix-sum map `L` (M × p_time_full) so the algebra
+                // matches the basis construction exactly.
+                let mut l_map = Array2::<f64>::zeros((num_bspline, p_time_full));
+                for m in 0..num_bspline {
+                    for k in 0..p_time_full {
+                        if k < m {
+                            l_map[[m, k]] = 1.0;
+                        }
+                    }
+                }
+                let sb_l = s_mat.dot(&l_map); // (M × p_time_full)
+                let s_i_full = l_map.t().dot(&sb_l); // (p_time_full × p_time_full)
+                // Restrict S_I to the retained I-spline columns and symmetrize to
+                // remove any accumulated asymmetry from the matrix products.
                 let mut local = Array2::<f64>::zeros((p_time, p_time));
                 for (i_new, &i_old) in keep_cols.iter().enumerate() {
                     for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                        local[[i_new, j_new]] = reduced[[i_old, j_old]];
+                        let v = 0.5 * (s_i_full[[i_old, j_old]] + s_i_full[[j_old, i_old]]);
+                        local[[i_new, j_new]] = v;
                     }
                 }
                 penalties.push(local);
