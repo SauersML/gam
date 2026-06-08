@@ -6283,6 +6283,30 @@ fn gaussian_pack_joint_symmetrichessian(
     out
 }
 
+/// Canonical Gaussian location-scale Fisher (expected) joint-Hessian row
+/// coefficients `(mm, ml, ll)` — the SINGLE source of truth for this curvature,
+/// shared by every representation that assembles the value Hessian (the dense
+/// `exact_newton_joint_hessian_from_designs` and the matrix-free
+/// `GaussianLocationScaleHessianWorkspace`). The (μ, log σ) information is
+/// block-diagonal because location and scale are information-orthogonal:
+///   `ml = E[H_{μ,ls}] = 2κ·E[m] = 2κ·E[r]·w/σ² = 0`  (E[r]=0 at any β; #684),
+/// and the (log σ, log σ) block is the residual-free Fisher form
+///   `ll = E[H_{ls,ls}] = 2κ²a`  (a = obs_weight; #566).
+/// Routing both paths through this one constructor makes the cross-block drift
+/// that caused #684 — one representation using the observed `2κm`, another the
+/// Fisher 0 — structurally impossible: they cannot disagree because they read
+/// the same coefficients. The observed SCORE still drives the Newton step
+/// (Fisher scoring → exact joint MLE); only the curvature feeding the REML
+/// determinant / Newton metric is the orthogonal expectation.
+fn gaussian_locscale_fisher_joint_row_coeffs(
+    rows: &GaussianJointRowScalars,
+) -> (Array1<f64>, Array1<f64>, Array1<f64>) {
+    let mm = rows.w.clone();
+    let ml = Array1::<f64>::zeros(rows.kappa.len());
+    let ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
+    (mm, ml, ll)
+}
+
 fn gaussian_joint_hessian_from_designs(
     xmu: &DenseOrOperator<'_>,
     x_ls: &DenseOrOperator<'_>,
@@ -6861,30 +6885,13 @@ impl GaussianLocationScaleFamily {
         }
 
         let rows = self.get_or_compute_row_scalars(etamu, eta_ls)?;
-        // The curvature object is the Gaussian Fisher (expected) information,
-        // which for the (μ, log σ) parameterisation is BLOCK-DIAGONAL because
-        // the location and scale parameters are information-orthogonal:
-        //   E[H_{μ,ls}] = 2κ·E[m] = 2κ·E[r]·w/σ² = 0   (E[r] = 0 at any β),
-        // and the (log σ, log σ) block is the residual-free Fisher form
-        //   E[H_{ls,ls}] = 2κ²a   (a = obs_weight; #566).
-        // Using the OBSERVED cross term 2κm (m = r·w, mean-zero noise) instead
-        // of its expectation injects spurious μ↔σ coupling into the joint
-        // Hessian. That coupling enters the scale block's marginal curvature
-        // through the Schur complement H_{ls,ls} − H_{ls,μ} H_{μ,μ}⁻¹ H_{μ,ls},
-        // so the REML log-determinant / EDF — hence the λ_σ selection — sees a
-        // scale-block curvature distorted by the random mean residuals. gamlss
-        // (RS backfitting) and mgcv gaulss both select each block's smoothing
-        // parameter on the block-diagonal Fisher information with NO cross
-        // term; the observed-cross term is precisely why gam systematically
-        // over-smoothed log σ versus gamlss (#684). Mirroring the #566 (ls,ls)
-        // decision, the cross block is its Fisher expectation 0. The exact
-        // observed SCORE still drives the Newton step (Fisher scoring), so the
-        // stationary point is the exact joint MLE — only the curvature feeding
-        // the REML determinant / Newton metric is the (orthogonal) expectation.
-        let cross = Array1::<f64>::zeros(rows.kappa.len());
-        let scale = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
+        // Block-diagonal Gaussian Fisher curvature (μ ⊥ σ ⇒ cross = 0, #684;
+        // (ls,ls) = 2κ²a, #566), built from the shared single-source-of-truth
+        // constructor so this dense path and the matrix-free workspace can never
+        // disagree on the cross block. See `gaussian_locscale_fisher_joint_row_coeffs`.
+        let (mm, cross, scale) = gaussian_locscale_fisher_joint_row_coeffs(&rows);
         Ok(Some(gaussian_joint_hessian_from_designs(
-            xmu, x_ls, &rows.w, &cross, &scale,
+            xmu, x_ls, &mm, &cross, &scale,
         )?))
     }
 
@@ -8969,19 +8976,11 @@ impl GaussianLocationScaleHessianWorkspace {
         let etamu = &block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
         let eta_ls = &block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
         let rows = family.get_or_compute_row_scalars(etamu, eta_ls)?;
-        let coeff_mm = rows.w.clone();
-        // Fisher cross block E[H_{μ,ls}] = 2κ·E[m] = 0 (μ ⊥ σ; #684). The
-        // observed cross weight `2κm` is mean-zero noise that over-smooths the
-        // scale and desyncs this matrix-free operator from the dense
-        // `exact_newton_joint_hessian_from_designs` (which assembles cross = 0),
-        // corrupting the REML determinant fed by both paths.
-        let coeff_ml = Array1::<f64>::zeros(rows.kappa.len());
-        // Fisher/expected (log σ, log σ) information E[H_{ls,ls}] = 2κ²a (#566):
-        // the observed 2κ²n + κ'(a−n) collapses at small residuals and
-        // over-smooths the scale; E[n]=a gives the residual-free 2κ²a, matching
-        // `exact_newton_joint_hessian` so the matrix-free operator and the
-        // dense path feed the REML determinant the same curvature.
-        let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
+        // Single source of truth shared with the dense
+        // `exact_newton_joint_hessian_from_designs`: μ ⊥ σ ⇒ cross = 0 (#684),
+        // (ls,ls) = 2κ²a (#566). Reading the same coefficients as the dense path
+        // makes the cross-block drift that caused #684 structurally impossible.
+        let (coeff_mm, coeff_ml, coeff_ll) = gaussian_locscale_fisher_joint_row_coeffs(&rows);
         Ok(Self {
             family,
             block_states,
