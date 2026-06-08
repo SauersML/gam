@@ -159,6 +159,16 @@ fn saturated_exp_eta(eta: f64) -> f64 {
         .max(MIN_WEIGHT)
 }
 
+/// Floor applied to a fitted smoothing parameter λ before `ln(λ)` is taken to
+/// seed an outer-loop `initial_log_lambdas` warm start. A pilot fit can return
+/// λ underflowed to exactly 0 for a deselected (effectively unpenalized) term;
+/// `ln(0) = -inf` would poison the seed, so we floor at the smallest λ that is
+/// still numerically distinguishable from zero in the log-domain rather than a
+/// modelling-meaningful value. `ln(1e-12) ≈ -27.6` sits well below any λ the
+/// outer optimizer would select, so a genuinely tiny pilot λ still seeds the
+/// search near its lower edge.
+const WARMSTART_LOG_LAMBDA_FLOOR: f64 = 1e-12;
+
 const EXACT_DENSE_BLOCK_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const EXACT_DENSE_TOTAL_BUDGET_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const GAMLSS_ROWWISE_PAR_MIN_N: usize = 4096;
@@ -3919,7 +3929,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                         .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
                         .collect(),
                     nullspace_dims: vec![],
-                    initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
+                    initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln())),
                     initial_beta: Some(pilot_fit.beta.clone()),
                 },
                 wiggle_block,
@@ -3980,14 +3990,14 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                     .map(crate::solver::estimate::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: vec![],
-                initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(1e-12).ln())),
+                initial_log_lambdas: Some(pilot_fit.lambdas.mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln())),
                 initial_beta: Some(pilot_fit.beta.clone()),
             },
             wiggle_block: wiggle_block.clone(),
         },
         options,
     )?;
-    let baseline_log_lambdas = baseline_fit.lambdas.mapv(|v| v.max(1e-12).ln());
+    let baseline_log_lambdas = baseline_fit.lambdas.mapv(|v| v.max(WARMSTART_LOG_LAMBDA_FLOOR).ln());
     if baseline_log_lambdas.len() != rho_dim {
         return Err(GamlssError::DimensionMismatch {
             reason: format!(
