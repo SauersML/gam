@@ -612,6 +612,49 @@ where
     // Absolute floor relative to the dominant identified curvature: negligible on
     // identified directions (O(n)), positive on separating ones.
     let floor = (REDUCED_INFO_RELATIVE_FLOOR * lambda_max).max(REDUCED_INFO_ABSOLUTE_FLOOR);
+    // FLOOR β-DEPENDENCE (root cause of gam#826 / the below-floor value↔gradient
+    // mismatch). The regularization floor is `max(REL·λ_max, ABS)`; in the active
+    // RELATIVE regime it scales with `λ_max(β)`, which is itself a function of β.
+    // The below-floor antiderivative is `g(λ; floor) = λ/floor + ln(floor) − 1`, so
+    // for a below-floor eigenvalue the TOTAL derivative `dΦ/dβ_k` carries, beyond
+    // the eigenvalue term `(1/floor) ∂λ/∂β_k`, the floor-response term
+    //   `∂g/∂floor · ∂floor/∂β_k = (1/floor − λ/floor²) · ∂floor/∂β_k`.
+    // The earlier gradient differentiated only the eigenvalue and treated the floor
+    // as constant, so on any fit with an eigenvalue parked below the floor the
+    // analytic gradient did not equal `d/dβ Φ` — the inner joint-Newton KKT residual
+    // could not reach zero (a contributor to the coupled location-scale
+    // non-convergence). We restore the exact pair below by adding the floor-response
+    // term, using `∂λ_max/∂β_k = v_maxᵀ D_k v_max` (first-order eigenvalue
+    // perturbation; `D_k = Z_Jᵀ Hdot[e_k] Z_J` is already formed in the gradient
+    // loop). When the floor is in the ABSOLUTE regime (`REL·λ_max ≤ ABS`, including
+    // a non-positive `λ_max`) the floor is β-independent, so the term is exactly
+    // zero and nothing is added — preserving the PSD-fit and indefinite fast paths
+    // byte-for-byte. The eigenvalue-perturbation formula is exact only at a SIMPLE
+    // dominant eigenvalue; a tied `λ_max` is a measure-zero kink the smooth-gate
+    // band keeps away from (and the floor-response term is itself O(λ/floor)-tiny
+    // there), so no special-casing is warranted.
+    let floor_in_relative_regime =
+        lambda_max > 0.0 && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
+    // Eigenvector of the dominant eigenvalue `λ_max` (the one the relative floor
+    // tracks), needed for `∂λ_max/∂β_k = v_maxᵀ D_k v_max`. Only consulted in the
+    // relative regime.
+    let lambda_max_evec: Option<Array1<f64>> = if floor_in_relative_regime {
+        let mut idx_max = 0usize;
+        for i in 1..m {
+            if evals[i] > evals[idx_max] {
+                idx_max = i;
+            }
+        }
+        Some(evecs.column(idx_max).to_owned())
+    } else {
+        None
+    };
+    // `Σ_{i: |λ_i| < floor} ∂g(λ_i; floor)/∂floor = Σ (1/floor − λ_i/floor²)`, the
+    // sensitivity of the below-floor value contributions to the floor. Zero when no
+    // eigenvalue sits below the floor (so the floor-response term vanishes on every
+    // well-conditioned / indefinite fit), making this fix inert outside the
+    // genuinely below-floor regime it targets.
+    let mut floor_value_sensitivity = 0.0_f64;
     let mut phi = 0.0_f64;
     // h_id_inv = V diag(1/max(λ,floor)) Vᵀ  (floored symmetric pseudo-inverse).
     let mut inv_diag = Array1::<f64>::zeros(m);
@@ -656,6 +699,9 @@ where
         } else {
             phi += 0.5 * (lam / floor + floor.ln() - 1.0);
             inv_diag[i] = 1.0 / floor;
+            // ∂g(λ; floor)/∂floor = 1/floor − λ/floor², accumulated so the gradient
+            // below can add the floor-response term `½ · this · ∂floor/∂β_k`.
+            floor_value_sensitivity += 1.0 / floor - lam / (floor * floor);
         }
     }
     let scaled = &evecs * &inv_diag.view().insert_axis(ndarray::Axis(0));
@@ -697,12 +743,28 @@ where
         let d_k = z_j.t().dot(&hdz);
         // M_k = H_id^{-1} D_k.
         let m_k = h_id_inv.dot(&d_k);
-        // grad[k] = 1/2 tr(M_k).
+        // grad[k] = 1/2 tr(M_k) (the eigenvalue term `½ Σ_i inv_diag_i ∂λ_i/∂β_k`).
         let mut trace = 0.0;
         for i in 0..m {
             trace += m_k[[i, i]];
         }
         grad[k] = 0.5 * trace;
+        // FLOOR-RESPONSE term (see the `floor` block above). For below-floor
+        // eigenvalues the floor moves with `λ_max(β)`, so `dΦ/dβ_k` carries
+        // `½ · floor_value_sensitivity · ∂floor/∂β_k`, with
+        // `∂floor/∂β_k = REL · ∂λ_max/∂β_k = REL · v_maxᵀ D_k v_max`. This is the
+        // exact antiderivative partner of the below-floor value branch; it is
+        // identically zero (and skipped) whenever no eigenvalue is below the floor
+        // or the floor is in the β-independent absolute regime, so the well-
+        // conditioned, indefinite, and above-floor paths are unchanged.
+        if let Some(v_max) = lambda_max_evec.as_ref() {
+            if floor_value_sensitivity != 0.0 {
+                let dvmax = d_k.dot(v_max);
+                let dlambda_max = v_max.dot(&dvmax); // v_maxᵀ D_k v_max
+                let dfloor = REDUCED_INFO_RELATIVE_FLOOR * dlambda_max;
+                grad[k] += 0.5 * floor_value_sensitivity * dfloor;
+            }
+        }
         // Store vec(M_k) for the Gauss-Newton surrogate.
         let mut col = 0usize;
         for i in 0..m {
