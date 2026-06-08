@@ -3532,6 +3532,123 @@ mod tests {
         assert!(build.ncols > 0);
     }
 
+    /// #691: the I-spline baseline curvature penalty is the value-space form
+    /// `S_I = Lᵀ S_B L`, so a constant I-spline coefficient vector γ (whose
+    /// prefix sums `c = L γ` are affine in the B-spline index, hence an affine
+    /// log-cumulative-hazard `q = a·log t + b`) is annihilated, while a
+    /// non-affine γ pays strictly positive curvature. This is the exact algebra
+    /// emitted by the build path; we reproduce it on a small explicit
+    /// second-difference penalty `S_B` so the property is verified as pure
+    /// linear algebra with no fitting.
+    #[test]
+    fn ispline_value_space_penalty_annihilates_affine_baseline() {
+        // M underlying B-spline coefficients => p = M - 1 I-spline coefficients.
+        let num_bspline = 7usize;
+        let p = num_bspline - 1;
+
+        // S_B = D₂ᵀ D₂, the standard second-difference penalty on the B-spline
+        // value coefficients `c` (rows of the (M-2) × M difference operator D₂).
+        let mut d2 = Array2::<f64>::zeros((num_bspline - 2, num_bspline));
+        for r in 0..(num_bspline - 2) {
+            d2[[r, r]] = 1.0;
+            d2[[r, r + 1]] = -2.0;
+            d2[[r, r + 2]] = 1.0;
+        }
+        let s_b = d2.t().dot(&d2);
+
+        // L: strictly-lower-triangular 0/1 prefix-sum map c = L γ, shape M × p,
+        // L[m, k] = 1 iff k < m  (matches `I_k = Σ_{m>k} B_m`).
+        let mut l_map = Array2::<f64>::zeros((num_bspline, p));
+        for m in 0..num_bspline {
+            for k in 0..p {
+                if k < m {
+                    l_map[[m, k]] = 1.0;
+                }
+            }
+        }
+        let s_i = l_map.t().dot(&s_b).dot(&l_map);
+
+        // Constant γ ⇒ c_m = m·γ is affine ⇒ D₂ c = 0 ⇒ γᵀ S_I γ = 0.
+        let gamma_const = Array1::<f64>::from_elem(p, 1.0);
+        let q_const = gamma_const.dot(&s_i.dot(&gamma_const));
+        assert!(
+            q_const.abs() <= 1e-10,
+            "constant (affine-baseline) gamma must lie in the value-space penalty \
+             null space, got gamma^T S_I gamma = {q_const:.3e}"
+        );
+
+        // A non-affine γ (a single bump) produces curvature ⇒ strictly positive.
+        let mut gamma_bump = Array1::<f64>::zeros(p);
+        gamma_bump[p / 2] = 1.0;
+        let q_bump = gamma_bump.dot(&s_i.dot(&gamma_bump));
+        assert!(
+            q_bump > 1e-6,
+            "non-affine gamma must pay strictly positive value-space curvature, \
+             got {q_bump:.3e}"
+        );
+
+        // The penalty is PSD: no direction has negative curvature.
+        let mut min_quad = f64::INFINITY;
+        for k in 0..p {
+            let mut e = Array1::<f64>::zeros(p);
+            e[k] = 1.0;
+            min_quad = min_quad.min(e.dot(&s_i.dot(&e)));
+        }
+        assert!(
+            min_quad >= -1e-12,
+            "value-space penalty must be PSD, found diagonal curvature {min_quad:.3e}"
+        );
+    }
+
+    /// #691 end-to-end: the built I-spline survival time basis reports a
+    /// non-trivial penalty null space (the affine baseline direction), which is
+    /// what the generalized-determinant REML needs to leave the baseline slope
+    /// unpenalized. The old increment-space submatrix penalized that slope.
+    #[test]
+    fn ispline_build_reports_affine_penalty_nullspace() {
+        let age_entry = Array1::<f64>::from_elem(40, 0.0);
+        let age_exit =
+            Array1::<f64>::from_shape_fn(40, |i| 1.0 + (i as f64) * 0.5).mapv(|v| v.max(1e-3));
+        let build = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 3,
+                knots: Array1::<f64>::zeros(0),
+                keep_cols: Vec::new(),
+                smooth_lambda: 1e-2,
+            },
+            Some((4, 0.0)),
+        )
+        .expect("build ispline survival time basis");
+
+        assert!(
+            !build.penalties.is_empty(),
+            "ispline build must emit at least one curvature penalty"
+        );
+        assert_eq!(build.nullspace_dims.len(), build.penalties.len());
+        assert!(
+            build.nullspace_dims.iter().all(|&d| d >= 1),
+            "value-space I-spline penalty must carry an affine null direction, \
+             got nullspace_dims = {:?}",
+            build.nullspace_dims
+        );
+
+        // Confirm the emitted penalty really annihilates a constant-coefficient
+        // direction restricted to the retained columns (affine baseline).
+        for s_i in &build.penalties {
+            let p = s_i.nrows();
+            let gamma = Array1::<f64>::from_elem(p, 1.0);
+            let q = gamma.dot(&s_i.dot(&gamma));
+            let scale = s_i.iter().fold(0.0_f64, |a, &b| a.max(b.abs())).max(1.0);
+            assert!(
+                q.abs() <= 1e-8 * scale * (p as f64),
+                "constant gamma should be (near) null under the emitted value-space \
+                 penalty, got {q:.3e} (scale {scale:.3e}, p {p})"
+            );
+        }
+    }
+
     #[test]
     fn marginal_slope_time_anchor_defaults_to_median_exit() {
         let age_entry = array![9.0, 1.0, 4.0, 6.0];
