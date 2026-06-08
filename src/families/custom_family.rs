@@ -17473,6 +17473,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if coupled_exact_joint_required {
+            {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    writeln!(f, "[DIAG-EARLYEXIT] cycles_done={cycles_done} converged={converged} has_refusal={} has_math={} best_resid={best_residual_seen:.3e} last_resid_below_tol={last_cycle_residual_below_tol} total_p={total_p}", last_kkt_refusal_report.is_some(), last_joint_math.is_some()).ok();
+                }
+            }
             // Bubble the structured KKT refusal report (per-block residual
             // breakdown + H_pen spectrum + diagnosis) so the cause of the
             // refusal survives serialization through the outer optimizer,
