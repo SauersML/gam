@@ -29201,7 +29201,7 @@ mod tests {
         // whether the family returns it dense or operator-backed.
         fn materialize(
             dense: &Array2<f64>,
-            operator: &Option<std::sync::Arc<dyn HyperOperator>>,
+            operator: Option<&dyn HyperOperator>,
             total: usize,
         ) -> Array2<f64> {
             match operator {
@@ -29286,7 +29286,7 @@ mod tests {
                 .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
                 .expect("psi terms call")
                 .expect("gaussian psi terms present");
-            let h_psi = materialize(&psi.hessian_psi, &psi.hessian_psi_operator, total);
+            let h_psi = materialize(&psi.hessian_psi, psi.hessian_psi_operator.as_deref(), total);
             let cross = block_max_abs(&h_psi, 0, p_mu, p_mu, total);
             assert!(
                 cross <= CROSS_TOL,
@@ -29300,7 +29300,7 @@ mod tests {
                 .expect("psi 2nd-order call")
                 .expect("gaussian psi 2nd-order present");
             let h_psi2 =
-                materialize(&psi2.hessian_psi_psi, &psi2.hessian_psi_psi_operator, total);
+                materialize(&psi2.hessian_psi_psi, psi2.hessian_psi_psi_operator.as_deref(), total);
             let cross2 = block_max_abs(&h_psi2, 0, p_mu, p_mu, total);
             assert!(
                 cross2 <= CROSS_TOL,
@@ -29408,7 +29408,7 @@ mod tests {
                 .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
                 .expect("wiggle psi terms call")
                 .expect("wiggle psi terms present");
-            let h_psi = materialize(&psi.hessian_psi, &psi.hessian_psi_operator, total);
+            let h_psi = materialize(&psi.hessian_psi, psi.hessian_psi_operator.as_deref(), total);
             assert_wiggle_crosses_zero(&h_psi, "1st-order ψ");
 
             // 2nd-order ψ.
@@ -29417,7 +29417,7 @@ mod tests {
                 .expect("wiggle psi 2nd-order call")
                 .expect("wiggle psi 2nd-order present");
             let h_psi2 =
-                materialize(&psi2.hessian_psi_psi, &psi2.hessian_psi_psi_operator, total);
+                materialize(&psi2.hessian_psi_psi, psi2.hessian_psi_psi_operator.as_deref(), total);
             assert_wiggle_crosses_zero(&h_psi2, "2nd-order ψ");
 
             // Mixed β·ψ.
