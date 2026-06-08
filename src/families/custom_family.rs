@@ -12992,14 +12992,6 @@ fn solve_joint_newton_step_on_spectral_range(
     let cutoff = rank_tol * lambda_max_abs;
     let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
     let null_cutoff = cutoff.min(numerical_floor);
-    if p <= 4 {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-            let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-            let lmin = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-            writeln!(f, "[DIAGSPEC] p={p} lambda_max={lambda_max_abs:.4e} lambda_min={lmin:.4e} null_cutoff={null_cutoff:.4e} numerical_floor={numerical_floor:.4e} rhs_inf={rhs_inf:.4e} evals={:?}", evals.as_slice()).ok();
-        }
-    }
     let mut delta = Array1::<f64>::zeros(p);
     let mut range_rhs_inf = 0.0_f64;
     let mut null_rhs_inf = 0.0_f64;
@@ -15694,9 +15686,33 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // ρ=1 (it neither helps nor hurts the objective beyond round-off),
                 // so the inner keeps polishing the KKT residual to tol.
                 let proposal_at_step_floor = joint_proposal_at_step_floor(step_inf, step_tol);
-                if (!predicted_reduction.is_finite() || predicted_reduction <= 0.0)
-                    && !proposal_at_step_floor
-                {
+                // OVER-DAMPED NEWTON STEP (gam#826/#872). The `proposal_at_step_floor`
+                // carve-out below treats a step-tolerance-sized proposal as
+                // legitimate KKT polishing and accepts it as-is — CORRECT only when
+                // the iterate is near-converged. But the coupled binomial
+                // location-scale / flexible-linkwiggle fit hits a different regime at
+                // an oversmoothed seed: the full Firth Gauss-Newton curvature `H_Φ`
+                // is astronomically large in the `∇Φ` direction (e.g. ‖H_Φ‖ ≈ 2e20 on
+                // the log_sigma block at β=0, the exact `(1/floor)²` value), so the
+                // Newton step `(H+Sλ+H_Φ)⁻¹(∇L−Sβ+∇Φ)` is ~`∇Φ/2e20 ≈ 5e-21` — at the
+                // step floor, but for OVER-DAMPING reasons, NOT convergence: the
+                // residual is still O(‖∇Φ‖) ≫ tol. Accepting that negligible step
+                // freezes β and the inner stalls until it refuses. When the proposal
+                // is at the step floor AND the residual is far above tol, take the
+                // diagonally-preconditioned descent step on the augmented gradient
+                // instead — its preconditioner is the data+penalty diagonal
+                // (`H+Sλ`, NOT the over-large `H_Φ`), so it moves β by ~`∇Φ/diag(H+Sλ)`
+                // ≈ O(0.1), walking the curved Firth basin toward its optimum. This
+                // does NOT shrink/clamp `H_Φ` (the Firth correction is untouched); it
+                // is a globalization fallback for a legitimately high-curvature,
+                // non-quadratic direction the single Newton step understeps.
+                let overdamped_far_from_kkt = proposal_at_step_floor
+                    && current_stationarity_residual.is_finite()
+                    && residual_tol.is_finite()
+                    && current_stationarity_residual > 16.0 * residual_tol;
+                let newton_model_invalid =
+                    !predicted_reduction.is_finite() || predicted_reduction <= 0.0;
+                if (newton_model_invalid && !proposal_at_step_floor) || overdamped_far_from_kkt {
                     model_rejects += 1;
                     if !tried_preconditioned_descent {
                         match joint_preconditioned_descent_delta(
