@@ -10957,25 +10957,40 @@ impl GaussianLocationScaleWiggleFamily {
             &(fast_atv(&basis_a, &s_w) + fast_atv(&geom.basis, &s_w_a)),
         );
 
-        // Static blocks under logb: coeff_ml = 2κmD; coeff_ll = Fisher 2κ²a; l = 2κm.
-        // Cross-block directional pieces add κ' on the e_a leg; the Fisher
-        // (ls,ls) block 2κ²a depends only on η_ls, so coeff_ll_a = 4κκ'a·e_a (#566).
+        // Static blocks under logb. Gaussian mean⊥scale Fisher orthogonality:
+        // μ AND the wiggle both enter the MEAN q = q0 + B(q0)·βw, so log σ is
+        // the only scale-side block. The Fisher (expected) cross between any
+        // mean-side parameter and log σ is exactly 0 because it carries
+        // m = r·weight/σ² and E[m] = E[r]·weight/σ² = 0:
+        //   coeff_ml = E[H_{μ,ls}] = 0  (observed 2κmD)
+        //   l        = E[H_{ls,w}] = 0  (observed 2κm)
+        // A function identically 0 has 0 ψ-derivatives, so coeff_ml_a and l_a
+        // vanish too. This mirrors the non-wiggle psi path
+        // (gaussian_joint_psi_firstweights: hmu_ls = dhmu_ls = 0) and the
+        // wiggle Newton/REML Hessian path (wiggle_hessian_row_pieces:
+        // coeff_ml = coeff_lw_b = 0). The observed SCORE (s_mu/s_ls/s_w above)
+        // stays exact so Fisher scoring still hits the joint MLE; only the
+        // curvature feeding the REML determinant / IFT correction is the
+        // (orthogonal) expectation. coeff_ll is the residual-free Fisher
+        // 2κ²a (#566); its ψ-derivative coeff_ll_a = 4κκ'a·e_a depends only on
+        // η_ls. Same-side blocks (coeff_mm within mean, a/c the μ↔wiggle
+        // within-mean cross, coeff_ww within mean) are untouched.
+        let n = rows.m.len();
         let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
         let coeff_mm_a = &(&dw_a * &geom.dq_dq0.mapv(|v| v * v))
             + &(2.0 * &rows.w * &geom.dq_dq0 * &s1_a)
             - &(&dm_a * &geom.d2q_dq02)
             - &(&rows.m * &g2_a);
-        let coeff_ml = 2.0 * &rows.kappa * &rows.m * &geom.dq_dq0;
-        let coeff_ml_a = 2.0 * &rows.kappa * &(&dm_a * &geom.dq_dq0 + &rows.m * &s1_a)
-            + 2.0 * &rows.kappa_prime * &(e_a * &rows.m * &geom.dq_dq0);
+        let coeff_ml = Array1::<f64>::zeros(n);
+        let coeff_ml_a = Array1::<f64>::zeros(n);
         let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         let coeff_ll_a = 4.0 * &rows.kappa * &rows.kappa_prime * &rows.obs_weight * e_a;
         let a = &rows.w * &geom.dq_dq0;
         let a_a = &dw_a * &geom.dq_dq0 + &rows.w * &s1_a;
         let c = -&rows.m;
         let c_a = -&dm_a;
-        let l = 2.0 * &rows.m * &rows.kappa;
-        let l_a = 2.0 * &rows.kappa * &dm_a + 2.0 * &rows.kappa_prime * &(e_a * &rows.m);
+        let l = Array1::<f64>::zeros(n);
+        let l_a = Array1::<f64>::zeros(n);
         let h_mm_a1 = weighted_crossprod_psi_maps(
             xmu_map,
             coeff_mm.view(),
