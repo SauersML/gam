@@ -1306,6 +1306,15 @@ impl BarrierConfig {
     pub fn from_constraints(
         constraints: Option<&crate::pirls::LinearInequalityConstraints>,
     ) -> Option<Self> {
+        // Tolerance for recognizing a constraint-matrix entry as exactly 0 or
+        // exactly ±1, so a row qualifies as a simple coordinate bound. The
+        // constraint rows are assembled exactly, so any nonzero deviation this
+        // large is a genuine multi-coefficient constraint, not round-off.
+        const SIMPLE_BOUND_ENTRY_TOL: f64 = 1e-14;
+        // Default log-barrier strength τ used when a simple-bound BarrierConfig
+        // is synthesized from constraints (a weak barrier that keeps β strictly
+        // feasible without materially perturbing an interior optimum).
+        const DEFAULT_BARRIER_TAU: f64 = 1e-6;
         let constraints = constraints?;
         let mut indices = Vec::new();
         let mut lower_bounds = Vec::new();
@@ -1316,10 +1325,12 @@ impl BarrierConfig {
             let mut single_sign = 0.0_f64;
             let mut is_simple = true;
             for (j, &val) in row.iter().enumerate() {
-                if val.abs() < 1e-14 {
+                if val.abs() < SIMPLE_BOUND_ENTRY_TOL {
                     continue;
                 }
-                if ((val - 1.0).abs() < 1e-14 || (val + 1.0).abs() < 1e-14) && single_col.is_none()
+                if ((val - 1.0).abs() < SIMPLE_BOUND_ENTRY_TOL
+                    || (val + 1.0).abs() < SIMPLE_BOUND_ENTRY_TOL)
+                    && single_col.is_none()
                 {
                     single_col = Some(j);
                     single_sign = if val > 0.0 { 1.0 } else { -1.0 };
@@ -1338,7 +1349,7 @@ impl BarrierConfig {
             return None;
         }
         Some(BarrierConfig {
-            tau: 1e-6,
+            tau: DEFAULT_BARRIER_TAU,
             constrained_indices: indices,
             lower_bounds,
             bound_signs,
@@ -13006,11 +13017,13 @@ fn detect_active_theta_bounds(theta: Option<&[f64]>, q: usize) -> Vec<usize> {
         return Vec::new();
     }
     let bound = crate::solver::estimate::RHO_BOUND;
-    let tol = 1e-8;
+    // Same active-bound tolerance the outer optimizer uses, so this active-set
+    // view agrees with the optimizer's at the reported optimum.
+    const ACTIVE_THETA_BOUND_TOL: f64 = 1e-8;
     theta
         .iter()
         .enumerate()
-        .filter_map(|(i, &v)| (v.abs() >= bound - tol).then_some(i))
+        .filter_map(|(i, &v)| (v.abs() >= bound - ACTIVE_THETA_BOUND_TOL).then_some(i))
         .collect()
 }
 
