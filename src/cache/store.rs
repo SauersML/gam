@@ -1226,7 +1226,6 @@ mod tests {
         let writers: Vec<_> = (0..4)
             .map(|w| {
                 let store = Arc::clone(&store);
-                let key = key;
                 std::thread::spawn(move || {
                     for i in 0..200u32 {
                         let payload = format!("w{w}-i{i}");
