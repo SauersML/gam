@@ -1035,6 +1035,13 @@ pub const AUTO_OUTER_WORK_BUDGET: u64 = 500_000_000;
 /// usable for BFGS Phase 1 progress when the family is very expensive.
 pub const AUTO_OUTER_MIN_K_FLOOR: usize = 1_000;
 
+/// L2 distance below which two outer ρ keys are treated as the *same* outer
+/// step (a line-search retry, not a fresh outer iteration). Well below any
+/// meaningful BFGS step on log-scale ρ, well above float-noise from cloning
+/// the ρ vector. Used to keep the phase-1 budget counting outer iterations
+/// rather than per-step function evaluations.
+const AUTO_OUTER_DISTINCT_STEP_L2_TOL: f64 = 1e-10;
+
 /// Reason the auto schedule chose the reported `K`. Used by the
 /// `[family auto-subsample]` log line so operators can tell whether the
 /// noise model, the work budget, the `MIN_K_FLOOR`, or `n` itself
@@ -1219,7 +1226,7 @@ pub fn maybe_install_auto_outer_subsample(
                     let d = a - b;
                     sq += d * d;
                 }
-                sq.sqrt() > 1e-10
+                sq.sqrt() > AUTO_OUTER_DISTINCT_STEP_L2_TOL
             }
         };
         if new_step {
@@ -1576,6 +1583,11 @@ pub fn feasible_step_fraction<E>(
     // step). A slack within this band is numerically AT the boundary; treat it as
     // active (slack = 0) rather than a violation.
     const FEASIBLE_STEP_VIOLATION_TOL: f64 = 1e-8;
+    // Multiplicative backoff applied when the step is clipped by a binding
+    // constraint, keeping the new iterate strictly interior (slack > 0) so the
+    // next iteration's feasibility gate cannot reject a point that landed
+    // exactly on the boundary through round-off.
+    const FEASIBLE_STEP_BOUNDARY_BACKOFF: f64 = 0.995;
     let mut alpha = 1.0f64;
     for row in 0..constraints.a.nrows() {
         let a_row = constraints.a.row(row);
@@ -1594,7 +1606,7 @@ pub fn feasible_step_fraction<E>(
     if alpha >= 1.0 {
         Ok(1.0)
     } else {
-        Ok((0.995 * alpha).clamp(0.0, 1.0))
+        Ok((FEASIBLE_STEP_BOUNDARY_BACKOFF * alpha).clamp(0.0, 1.0))
     }
 }
 
