@@ -289,3 +289,15 @@
     Checking csv v1.4.0
     Checking arrow v54.3.1
     Checking ratatui v0.30.0
+    Checking rand_distr v0.6.0
+    Checking opt v0.5.11
+    Checking burn v0.18.0
+    Checking general-mcmc v0.9.0
+    Checking comfy-table v7.2.2
+    Checking sysinfo v0.32.1
+    Checking nano-gemm v0.2.2
+    Checking faer v0.24.0
+    Checking memmap2 v0.9.10
+    Checking libloading v0.8.9
+    Checking clap v4.6.1
+    Checking statrs v0.18.0
