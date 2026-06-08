@@ -9223,7 +9223,12 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
         let w_clamped = floor_positiveworking_weights(self.working_weights, ctx.options.minweight);
 
         if let Some(constraints) = ctx.linear_constraints {
-            check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
+            check_linear_feasibility(
+                &ctx.states[ctx.block_idx].beta,
+                constraints,
+                LINEAR_FEASIBILITY_TOL,
+            )
+            .map_err(
                 |e| {
                     format!(
                         "block {} ({}) constrained diagonal solve: {e}",
@@ -9340,7 +9345,12 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         stabilize_exact_newton_lhs_in_place(ctx.family, &mut lhs_dense, ctx.options.ridge_floor);
 
         if let Some(constraints) = ctx.linear_constraints {
-            check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
+            check_linear_feasibility(
+                &ctx.states[ctx.block_idx].beta,
+                constraints,
+                LINEAR_FEASIBILITY_TOL,
+            )
+            .map_err(
                 |e| {
                     format!(
                         "block {} ({}) constrained exact-newton solve: {e}",
@@ -9508,6 +9518,12 @@ impl BlockWorkingSet {
         }
     }
 }
+
+/// Linear inequality feasibility tolerance: an iterate is treated as feasible
+/// when the worst `(b - Aβ)` violation is within this slack. Sized to absorb
+/// round-off in the constraint product `Aβ` for well-scaled designs while
+/// still rejecting genuine boundary crossings.
+const LINEAR_FEASIBILITY_TOL: f64 = 1e-8;
 
 fn check_linear_feasibility(
     beta: &Array1<f64>,
@@ -12298,6 +12314,16 @@ struct JointTrustRegionUpdate {
     decision: JointTrustRegionDecision,
 }
 
+/// Smallest admissible joint trust radius. Below this the metric step is at
+/// the floating-point floor and is reported as `RejectFloor` (no descent
+/// direction exists at this scale); it is never allowed to reach 0 so the
+/// trust-region recurrence cannot get stuck multiplying zero.
+const JOINT_TRUST_RADIUS_FLOOR: f64 = 1.0e-12;
+/// Largest admissible joint trust radius. Caps unbounded growth at boundary
+/// accepts so a single over-optimistic expansion cannot blow the step past
+/// the region where the local quadratic model is trustworthy.
+const JOINT_TRUST_RADIUS_CEIL: f64 = 1.0e6;
+
 fn update_joint_trust_region_radius(
     old_radius: f64,
     step_norm: f64,
@@ -12356,14 +12382,14 @@ fn update_joint_trust_region_radius(
         decision = JointTrustRegionDecision::HoldModerate;
     }
     if !radius.is_finite() || radius <= 0.0 {
-        radius = 1.0e-12;
+        radius = JOINT_TRUST_RADIUS_FLOOR;
     }
-    let clamped_radius = radius.clamp(1.0e-12, 1.0e6);
+    let clamped_radius = radius.clamp(JOINT_TRUST_RADIUS_FLOOR, JOINT_TRUST_RADIUS_CEIL);
     // Promote to RejectFloor if we landed at the absolute floor.  The
     // base classification is preserved up to this final clamp; the
     // floor classification is just a stronger label that captures the
     // "no descent direction exists at this radius" signal.
-    let final_decision = if clamped_radius <= 1.0e-12 + f64::EPSILON
+    let final_decision = if clamped_radius <= JOINT_TRUST_RADIUS_FLOOR + f64::EPSILON
         && matches!(
             decision,
             JointTrustRegionDecision::ShrinkOnRejection
@@ -12491,7 +12517,7 @@ fn shrink_active_joint_block_trust_radii(
         .any(|(radius, step_norm)| joint_block_step_hit_trust_boundary(*step_norm, *radius));
     for (radius, step_norm) in block_radii.iter_mut().zip(block_step_norms) {
         if !any_boundary_block || joint_block_step_hit_trust_boundary(*step_norm, *radius) {
-            *radius = (*radius * factor).clamp(1.0e-12, 1.0e6);
+            *radius = (*radius * factor).clamp(JOINT_TRUST_RADIUS_FLOOR, JOINT_TRUST_RADIUS_CEIL);
         }
     }
     block_radii.iter().copied().fold(0.0_f64, f64::max)
@@ -14651,7 +14677,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
                         }
                     }
-                    check_linear_feasibility(&beta_joint, constraints, 1e-8)
+                    check_linear_feasibility(&beta_joint, constraints, LINEAR_FEASIBILITY_TOL)
                         .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
                     let warm_joint_active =
                         flatten_joint_active_set(&cached_active_sets, &block_constraints);
