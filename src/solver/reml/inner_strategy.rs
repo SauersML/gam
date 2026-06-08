@@ -35,6 +35,17 @@ impl<'a> RemlState<'a> {
         }
     }
 
+    /// Coefficient count below which a problem is considered "small" for the
+    /// dense fast-path: at this width a dense p×p Gram/Hessian is at most a few
+    /// hundred KB, so the sparse machinery's overhead is not worth paying.
+    const SMALL_P_DENSE_THRESHOLD: usize = 256;
+
+    /// Upper-triangle density of the penalized Hessian above which the sparse
+    /// exact-SPD backend loses its advantage and we fall back to dense: once
+    /// >10% of entries are nonzero, sparse factorization fill-in and bookkeeping
+    /// cost more than a dense Cholesky of the same dimension.
+    const SPARSE_HESSIAN_MAX_DENSITY: f64 = 0.10;
+
     pub(super) fn select_reml_geometry(&self, rho: &Array1<f64>) -> SparseRemlDecision {
         let p = self.p;
         let has_dense_constraints =
@@ -95,15 +106,15 @@ impl<'a> RemlState<'a> {
             return dense_backend("penalty_blocks_not_separable", None, None);
         };
         // Small-problem dense fast-path: the previous heuristic densified
-        // unconditionally on `p < 256`, which is wrong when `n` is large
-        // (a sparse 320k×101 design has the dense Gram path consume
+        // unconditionally on `p < SMALL_P_DENSE_THRESHOLD`, which is wrong when
+        // `n` is large (a sparse 320k×101 design has the dense Gram path consume
         // O(n p²) bytes per assembled block — exact-Hessian REML can
         // accumulate many such blocks and OOM).  Restrict the early-out
-        // to truly small problems: `p < 256` AND `n·p` small enough
+        // to truly small problems: `p` below threshold AND `n·p` small enough
         // that one dense `n×p` block is in the few-tens-of-MB range.
         const SMALL_NP_DENSE_BUDGET: usize = 4_000_000;
         let n_obs = self.y.len();
-        if p < 256 && n_obs.saturating_mul(p) < SMALL_NP_DENSE_BUDGET {
+        if p < Self::SMALL_P_DENSE_THRESHOLD && n_obs.saturating_mul(p) < SMALL_NP_DENSE_BUDGET {
             return dense_backend("p_below_threshold_and_small", None, None);
         }
 
@@ -116,7 +127,7 @@ impl<'a> RemlState<'a> {
         }
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p, 0, 0);
         match workspace.sparse_penalized_system_stats(x_sparse, &s_lambda) {
-            Ok(stats) if stats.density_upper < 0.10 && !blocks.is_empty() => SparseRemlDecision {
+            Ok(stats) if stats.density_upper < Self::SPARSE_HESSIAN_MAX_DENSITY && !blocks.is_empty() => SparseRemlDecision {
                 geometry: RemlGeometry::SparseExactSpd,
                 reason: "sparse_exact_spd",
                 p,
