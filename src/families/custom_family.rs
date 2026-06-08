@@ -12893,32 +12893,6 @@ struct JointSpectralNewtonStep {
     most_negative_eigenvalue: f64,
 }
 
-/// Maximum ratio of the Firth Gauss-Newton curvature `H_Φ` spectral radius to the
-/// data+penalty Hessian `H+Sλ` spectral radius, used to cap `H_Φ` before folding
-/// it into the inner Newton system. Firth is a bounded ~½-observation prior whose
-/// curvature must not dominate the data information; capping at a small multiple of
-/// `λ_max(H+Sλ)` keeps `H+Sλ+H_Φ` well-conditioned (so the numerical-rank floor of
-/// the spectral solve does not rise above genuine data-curvature directions and
-/// drop them — gam#826/#715), while leaving the O(1)-bounding Firth GRADIENT `∇Φ`
-/// untouched. The ratio is generous (the cap binds only on the pathological
-/// `(1/floor)²` blow-up at near-separation, never on a well-identified fit).
-const FIRTH_CURVATURE_MAX_RATIO: f64 = 8.0;
-
-/// Cheap upper bound on the spectral radius of a symmetric matrix via Gershgorin
-/// discs: `λ_max ≤ max_i (|A_ii| + Σ_{j≠i} |A_ij|)`. `O(p²)`, no eigendecomposition.
-fn symmetric_gershgorin_spectral_radius(a: &Array2<f64>) -> f64 {
-    let p = a.nrows();
-    let mut radius = 0.0_f64;
-    for i in 0..p {
-        let mut row_sum = 0.0_f64;
-        for j in 0..p {
-            row_sum += a[[i, j]].abs();
-        }
-        radius = radius.max(row_sum);
-    }
-    radius
-}
-
 fn solve_joint_newton_step_on_spectral_range(
     h_pen: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -14898,41 +14872,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     None
                 };
-            // CONSISTENT FIRTH ATTENUATION (gam#826/#872/#715). On a severely
-            // near-separating coupled direction the reduced information `H_id` is
-            // tiny, so the floored inverse `1/max(λ,floor)` explodes and BOTH the
-            // Firth score `∇Φ = ½tr(H_id⁻¹ D)` AND its Gauss-Newton curvature
-            // `H_Φ = ½tr(H_id⁻¹ D H_id⁻¹ D)` blow up by many orders (observed
-            // ‖∇Φ‖ ≈ 1.8e9, ‖H_Φ‖ comparable). Capping ONLY the curvature would
-            // unbalance the Newton step `(H+Sλ+H_Φ)⁻¹(∇L−Sβ+∇Φ)` — bounded
-            // denominator over a 1e9 numerator gives a 1e6 step the line search
-            // can never accept (the matern location-scale / quasi-separating
-            // multinomial abort). Instead attenuate the WHOLE triple by one scalar
-            // `s = min(1, cap / ‖H_Φ‖)` with `cap = FIRTH_CURVATURE_MAX_RATIO ·
-            // λ_max(H+Sλ)`, so the Firth Newton DIRECTION is preserved exactly and
-            // both rhs and lhs (and the KKT residual / merit value, all built from
-            // this one triple) stay on one consistently-scaled objective. Firth is
-            // a prior; uniformly down-weighting it when it would dominate the data
-            // information by >`FIRTH_CURVATURE_MAX_RATIO`× still bounds a separating
-            // coefficient (s·∇Φ remains the largest O(1)-restoring force in the
-            // residual) while keeping `H+Sλ+s·H_Φ` well-conditioned so the solve
-            // converges. `s = 1` (no-op) whenever H_Φ is already within the cap —
-            // the well-identified fast path and #729 are byte-identical.
-            let head_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
-                head_jeffreys_term.map(|(grad_phi, hphi)| {
-                    let hphi_radius = symmetric_gershgorin_spectral_radius(&hphi);
-                    let h_pen_scale = joint_trust_metric_diag
-                        .iter()
-                        .map(|v| v.abs())
-                        .fold(0.0_f64, f64::max);
-                    let cap = FIRTH_CURVATURE_MAX_RATIO * h_pen_scale;
-                    if cap.is_finite() && cap > 0.0 && hphi_radius > cap {
-                        let s = cap / hphi_radius;
-                        (grad_phi.mapv(|v| s * v), hphi.mapv(|v| s * v))
-                    } else {
-                        (grad_phi, hphi)
-                    }
-                });
             // Fold the Firth/Jeffreys score `∇Φ` into the head-of-cycle KKT
             // residual when the term is armed, for the same reason as the
             // post-step residual below: the inner objective is `−ℓ + ½βᵀSβ − Φ`,
@@ -16371,14 +16310,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
-            if !options.seed_screening && (cycle < 30 || cycle % 100 == 0) {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                    let bi = flatten_state_betas(&states, specs).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                    let fs = head_jeffreys_term.as_ref().map(|(g,_)| g.iter().map(|v| v.abs()).fold(0.0_f64,f64::max)).unwrap_or(0.0);
-                    writeln!(f, "[DIAGM] cyc={cycle} resid={residual:.3e} step={step_inf:.3e} acc={accepted_step_inf:.3e} beta={bi:.3e} tr={joint_trust_radius:.3e} skip={jeffreys_skippable_this_cycle} firth={fs:.3e} nullity={joint_step_spectral_nullity}").ok();
-                }
-            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
@@ -17609,13 +17540,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             });
         }
         if coupled_exact_joint_required {
-            {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                    let bi = flatten_state_betas(&states, specs).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                    writeln!(f, "[DIAGBRK] cycles_done={cycles_done} converged={converged} has_report={} best_resid={best_residual_seen:.3e} last_below_tol={last_cycle_residual_below_tol} beta={bi:.3e} screen={} total_p={total_p}", last_kkt_refusal_report.is_some(), options.seed_screening).ok();
-                }
-            }
             // Bubble the structured KKT refusal report (per-block residual
             // breakdown + H_pen spectrum + diagnosis) so the cause of the
             // refusal survives serialization through the outer optimizer,
