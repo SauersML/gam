@@ -2632,13 +2632,13 @@ fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
         }
         // Grow the axis with the most remaining headroom (cap − current),
         // breaking ties toward the largest cap. Stop when none can grow.
-        let Some((idx, _)) = k_list
+        let Some(idx) = k_list
             .iter()
             .zip(per_margin_cap.iter())
             .enumerate()
             .filter(|(_, (&k, &cap))| k < cap)
             .max_by_key(|(_, (&k, &cap))| (cap - k, cap))
-            .map(|(i, _)| (i, ()))
+            .map(|(i, _)| i)
         else {
             break;
         };
@@ -3816,6 +3816,65 @@ mod tests {
         assert_eq!(
             unique_basis, repeated_basis,
             "duplicating existing tensor coordinates must not inflate inferred basis width"
+        );
+    }
+
+    #[test]
+    fn inferred_three_dim_tensor_basis_stays_bounded_for_reml_selection() {
+        // Regression for gam#813: the inferred per-margin k must be
+        // dimension-aware so the 3-D tensor width p = ∏ k_d does not explode.
+        // With the old 1-D-per-margin rule a 3-D `te` defaulted to 7³=343 at
+        // small n and 20³=8000 at larger n, making the (non-Kronecker-factorable)
+        // full-tensor sum-to-zero penalty's O(p³) REML reparameterization a
+        // multi-minute stall. The dimension-aware budget keeps the product near
+        // mgcv's te default (≈5³=125) regardless of n.
+        let make = |n: usize| -> usize {
+            let mut rows = Vec::with_capacity(n);
+            for i in 0..n {
+                let f = i as f64 / n as f64;
+                rows.push(vec![f.sin(), f, (2.0 * f).cos(), (3.0 * f) % 1.0]);
+            }
+            let ds = continuous_dataset(&["y", "x1", "x2", "x3"], rows);
+            let parsed = parse_formula("y ~ te(x1, x2, x3)").expect("parse 3-D tensor");
+            let col_map = ds.column_map();
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &ResourcePolicy::default_library(),
+            )
+            .expect("build 3-D tensor termspec");
+            let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+                panic!("expected tensor smooth");
+            };
+            spec.marginalspecs
+                .iter()
+                .map(|m| match m.knotspec {
+                    BSplineKnotSpec::Generate {
+                        num_internal_knots, ..
+                    } => num_internal_knots + m.degree + 1,
+                    BSplineKnotSpec::Automatic {
+                        num_internal_knots: Some(num_internal_knots),
+                        ..
+                    } => num_internal_knots + m.degree + 1,
+                    _ => panic!("unexpected tensor margin knotspec"),
+                })
+                .product()
+        };
+
+        // n=30 (the issue's data): was 7³=343, must now be modest.
+        assert!(
+            make(60) <= 216,
+            "3-D te at small n must stay near the mgcv te default, got {}",
+            make(60)
+        );
+        // Larger n must NOT grow the product toward n³ (was 20³=8000).
+        assert!(
+            make(2000) <= 216,
+            "3-D te at large n must not blow ∏k toward the data size, got {}",
+            make(2000)
         );
     }
 
