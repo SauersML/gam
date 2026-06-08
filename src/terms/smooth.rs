@@ -1730,8 +1730,14 @@ impl KroneckerPenaltySystem {
         let mut rank = 0usize;
         let mut grad = Array1::<f64>::zeros(n_pen);
         let mut hess = Array2::<f64>::zeros((n_pen, n_pen));
-        let tol = 1e-12;
-        let structural_zero_tol = 1e-12;
+        // Positivity floor for a penalized eigenvalue `σ`: below this the mode
+        // is treated as an unpenalized (null-space) direction and excluded from
+        // both the rank count and the pseudo-log-determinant.
+        const EIGENVALUE_POSITIVITY_FLOOR: f64 = 1e-12;
+        // Floor on the *structural* eigenvalue sum (λ-independent) used to decide
+        // whether a mode lives in the penalty range space and so should receive
+        // the stabilizing ridge; a structurally-null mode gets no ridge.
+        const STRUCTURAL_ZERO_FLOOR: f64 = 1e-12;
         let mut multi_idx = vec![0usize; d];
         loop {
             let mut sigma = 0.0;
@@ -1745,11 +1751,11 @@ impl KroneckerPenaltySystem {
                 structural_sigma += 1.0;
                 sigma += lambdas[d];
             }
-            if structural_sigma > structural_zero_tol {
+            if structural_sigma > STRUCTURAL_ZERO_FLOOR {
                 sigma += ridge;
             }
 
-            if sigma > tol {
+            if sigma > EIGENVALUE_POSITIVITY_FLOOR {
                 rank += 1;
                 logdet += sigma.ln();
                 let inv_sigma = 1.0 / sigma;
