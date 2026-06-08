@@ -3487,6 +3487,20 @@ fn survival_rigid_pilot_eta(
 /// scope of `survival_pilot_irls_row_metric_at_eta` (see its long block);
 /// the chain factor `dη₁/dq = c(g)` is absorbed into a per-row scaling of
 /// the location anchor before the solve.
+///
+/// Returns `(eta1, beta_logslope)`: the per-row observed index `eta1` (used by
+/// the cross-block W metric, unchanged from the legacy scalar return) AND the
+/// one-step IRLS estimate of the logslope-surface coefficients `beta_logslope`
+/// (the `G`-block portion of the joint Newton step). The latter is the #808
+/// operating-point WARM START for the logslope block's `initial_beta`: on
+/// clustered-PC designs the logslope block is EXACTLY W-null at the `g = 0`
+/// seed (the slope-channel IRLS weight vanishes at the null slope), so the
+/// inner joint-Newton cannot take its first step and freezes; seeding the
+/// block at the pilot's `g ≈ 0.3` operating point (where the slope channel
+/// carries information and the block is full-rank) breaks the chicken-and-egg
+/// and lets the inner converge to the true data optimum — preserving the
+/// log-slope estimand rather than dropping/pinning it. Self-correcting: it is
+/// just a warm start, so the converged fit is the data optimum (zero bias).
 fn survival_nonrigid_pilot_eta(
     n: usize,
     location_anchor_design: &DesignMatrix,
@@ -3499,7 +3513,7 @@ fn survival_nonrigid_pilot_eta(
     sample_weights: &Array1<f64>,
     event: &Array1<f64>,
     probit_scale: f64,
-) -> Result<Array1<f64>, String> {
+) -> Result<(Array1<f64>, Array1<f64>), String> {
     if location_anchor_design.nrows() != n
         || logslope_design.nrows() != n
         || z_primary.len() != n
@@ -3530,14 +3544,17 @@ fn survival_nonrigid_pilot_eta(
     let p_g = g_dense.ncols();
     let p_joint = p_loc + p_g;
     if p_joint == 0 {
-        return Ok(survival_rigid_pilot_eta(
-            n,
-            z_primary,
-            offset_exit,
-            marginal_offset,
-            logslope_offset,
-            baseline_slope,
-            probit_scale,
+        return Ok((
+            survival_rigid_pilot_eta(
+                n,
+                z_primary,
+                offset_exit,
+                marginal_offset,
+                logslope_offset,
+                baseline_slope,
+                probit_scale,
+            ),
+            Array1::<f64>::zeros(p_g),
         ));
     }
     // Starting pilot (offset-only). Decompose into q_exit and slope so the
@@ -3684,7 +3701,19 @@ fn survival_nonrigid_pilot_eta(
         };
         pilot_eta[i] = if capped.is_finite() { capped } else { eta1[i] };
     }
-    Ok(pilot_eta)
+    // Logslope-surface warm start (#808): the `G`-block portion of the joint
+    // Newton step, used to seed the logslope block's `initial_beta` off the
+    // `g = 0` seed where the block is W-null. Sanitise to finite values; the
+    // per-row logslope value `baseline_slope + logslope_offset + G·β_g` is the
+    // operating point the inner refines from, so a non-finite coefficient
+    // (degenerate one-step solve) falls back to the zero warm start rather than
+    // poisoning the seed.
+    let beta_logslope = if beta_g.iter().all(|v| v.is_finite()) {
+        beta_g
+    } else {
+        Array1::<f64>::zeros(p_g)
+    };
+    Ok((pilot_eta, beta_logslope))
 }
 
 pub fn survival_marginal_slope_vector_scale(
@@ -4015,7 +4044,7 @@ fn c_derivatives(g: f64, probit_scale: f64) -> (f64, f64, f64, f64, f64) {
 /// Derivatives of neglog(x) = -log(x): [-1/x, 1/x², -2/x³, 6/x⁴].
 #[inline]
 fn neglog_derivatives(x: f64) -> (f64, f64, f64, f64) {
-    let x1 = x.max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR);
+    let x1 = x.max(1e-300);
     let inv = 1.0 / x1;
     let inv2 = inv * inv;
     (-inv, inv2, -2.0 * inv2 * inv, 6.0 * inv2 * inv2)
@@ -4062,9 +4091,7 @@ fn row_primary_closed_form(
     // Event density: d·logφ(η₁)
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
     // Time derivative: d·log(ad1)
-    let log_ad1 = ad1
-        .max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR)
-        .ln();
+    let log_ad1 = ad1.max(1e-300).ln();
 
     let nll =
         w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
@@ -4236,9 +4263,7 @@ fn row_primary_closed_form_shared_score(
     let (logcdf_neg_eta0, _) = signed_probit_logcdf_and_mills_ratio(-eta0);
     let (logcdf_neg_eta1, _) = signed_probit_logcdf_and_mills_ratio(-eta1);
     let log_phi_eta1 = -0.5 * (eta1 * eta1 + std::f64::consts::TAU.ln());
-    let log_ad1 = ad1
-        .max(crate::families::marginal_slope_shared::SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR)
-        .ln();
+    let log_ad1 = ad1.max(1e-300).ln();
 
     let nll =
         w * ((1.0 - d) * (-logcdf_neg_eta1) + logcdf_neg_eta0 - d * log_phi_eta1 - d * log_ad1);
@@ -19373,31 +19398,20 @@ fn mean_abs(values: impl IntoIterator<Item = f64>) -> f64 {
     if count == 0 { 0.0 } else { sum / count as f64 }
 }
 
-/// Floor on the mean-absolute diagonal scale of the likelihood Gram and of a
-/// penalty block when forming the initial `log λ` seed, guarding the ratio
-/// against a divide-by-zero / `ln(0)` when a block is (numerically) all zero.
-const BLOCK_LOG_LAMBDA_SCALE_FLOOR: f64 = 1.0e-8;
-/// Symmetric clamp on the seeded `log λ`. Keeps the warm start inside
-/// `λ ∈ [e^-12, e^12]` so a pathological scale ratio cannot seed the outer
-/// optimiser at a degenerate (fully-unpenalised or fully-saturated) corner.
-const BLOCK_LOG_LAMBDA_SEED_CLAMP: f64 = 12.0;
-
 fn block_log_lambda_seeds<'a, I>(design: &DesignMatrix, penalty_locals: I) -> Vec<f64>
 where
     I: IntoIterator<Item = &'a Array2<f64>>,
 {
     let unit_weights = Array1::<f64>::ones(design.nrows());
     let likelihood_scale = match design.diag_gram(&unit_weights) {
-        Ok(d) => mean_abs(d.iter().copied()).max(BLOCK_LOG_LAMBDA_SCALE_FLOOR),
+        Ok(d) => mean_abs(d.iter().copied()).max(1.0e-8),
         Err(_) => 1.0,
     };
     penalty_locals
         .into_iter()
         .map(|s| {
-            let penalty_scale = mean_abs(s.diag().iter().copied()).max(BLOCK_LOG_LAMBDA_SCALE_FLOOR);
-            (likelihood_scale / penalty_scale)
-                .ln()
-                .clamp(-BLOCK_LOG_LAMBDA_SEED_CLAMP, BLOCK_LOG_LAMBDA_SEED_CLAMP)
+            let penalty_scale = mean_abs(s.diag().iter().copied()).max(1.0e-8);
+            (likelihood_scale / penalty_scale).ln().clamp(-12.0, 12.0)
         })
         .collect()
 }
@@ -20016,23 +20030,6 @@ fn combine_logslope_surface_designs(
     Ok((combined, concatenate_term_specs(specs), ranges))
 }
 
-/// Convergence tolerance (in |gradient| and in bracket width) for the
-/// safeguarded 1D Newton/bisection that finds the pooled survival baseline
-/// slope. The objective is a sum over rows of a smooth likelihood, so a
-/// gradient this small is already well inside the per-row noise of the seed.
-const POOLED_BASELINE_SLOPE_TOL: f64 = 1e-8;
-/// Initial half-width of the symmetric probe step used to bracket a sign change
-/// in the baseline-slope gradient. Doubled each pass until a bracket is found.
-const POOLED_BASELINE_BRACKET_STEP0: f64 = 0.5;
-/// Maximum number of bracket-expansion passes (the probe step doubles each
-/// pass, so this reaches a half-width of `STEP0·2^N`, far beyond any
-/// physically plausible baseline slope before giving up).
-const POOLED_BASELINE_MAX_BRACKET_PASSES: usize = 48;
-/// Maximum number of Newton/bisection refinement steps once the gradient sign
-/// change is bracketed; with quadratic Newton convergence this is comfortably
-/// more than enough to reach `POOLED_BASELINE_SLOPE_TOL`.
-const POOLED_BASELINE_MAX_REFINE_STEPS: usize = 60;
-
 /// Compute a baseline slope from the actual survival marginal-slope likelihood,
 /// using the baseline offsets alone as a time-only pilot q(t).
 ///
@@ -20087,7 +20084,7 @@ fn pooled_survival_baseline(
     if !state0.0.is_finite() {
         return 0.0;
     }
-    if state0.1.abs() < POOLED_BASELINE_SLOPE_TOL {
+    if state0.1.abs() < 1e-8 {
         return 0.0;
     }
 
@@ -20104,8 +20101,8 @@ fn pooled_survival_baseline(
     } else {
         None
     };
-    let mut step = POOLED_BASELINE_BRACKET_STEP0;
-    for _ in 0..POOLED_BASELINE_MAX_BRACKET_PASSES {
+    let mut step = 0.5f64;
+    for _ in 0..48 {
         for &candidate in &[-step, step] {
             if let Some(state) = objective_grad_hess(candidate) {
                 if state.0 < best.0 {
@@ -20140,10 +20137,8 @@ fn pooled_survival_baseline(
 
                     let mut bracket_lo = (lo, lo_state);
                     let mut bracket_hi = (hi, hi_state);
-                    for _ in 0..POOLED_BASELINE_MAX_REFINE_STEPS {
-                        if state.1.abs() < POOLED_BASELINE_SLOPE_TOL
-                            || (bracket_hi.0 - bracket_lo.0).abs() < POOLED_BASELINE_SLOPE_TOL
-                        {
+                    for _ in 0..60 {
+                        if state.1.abs() < 1e-8 || (bracket_hi.0 - bracket_lo.0).abs() < 1e-8 {
                             break;
                         }
                         let mut candidate = 0.5 * (bracket_lo.0 + bracket_hi.0);
@@ -20418,13 +20413,6 @@ pub(crate) fn joint_training_design_preflight(
     );
     Ok(())
 }
-
-/// Floor on the relative tolerance handed to the exact-joint spatial
-/// length-scale outer solve. The κ-options' own `rel_tol` is used when it is
-/// looser than this, but is never tightened below `1e-6`: the spatial outer
-/// objective is itself the result of a nested inner fit, so a tolerance tighter
-/// than this only chases inner-solve noise without improving the length scale.
-const EXACT_SPATIAL_OUTER_REL_TOL_FLOOR: f64 = 1e-6;
 
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
@@ -20706,7 +20694,7 @@ pub fn fit_survival_marginal_slope_terms(
     // Newton step is sufficient for the cross-block residualisation: we
     // need a per-row-varying η₁ that respects event/weight structure, not
     // a converged β.
-    let cross_block_pilot_eta = survival_nonrigid_pilot_eta(
+    let (cross_block_pilot_eta, pilot_logslope_beta) = survival_nonrigid_pilot_eta(
         n,
         &location_anchor_design,
         &logslope_design.design,
@@ -21133,6 +21121,23 @@ pub fn fit_survival_marginal_slope_terms(
     );
 
     let hints = RefCell::new(ThetaHints::default());
+    // #808 operating-point warm start for the logslope block. The inner
+    // joint-Newton seeds each block at `spec.initial_beta` (→ `hints.logslope_beta`
+    // via `build_logslope_blockspec`). At the default `g = 0` seed the logslope
+    // block is W-null (the slope-channel IRLS weight vanishes at the null slope),
+    // so the inner cannot take its first step and freezes (the #808 stall). Seed
+    // it instead at the one-step non-rigid pilot's logslope coefficients, which
+    // put `g` at the operating point (`g ≈ 0.3`) where the slope channel carries
+    // information and the block is full-rank — breaking the chicken-and-egg so the
+    // inner moves and converges to the true data optimum. It is only a warm start,
+    // so the converged β is the data optimum (zero bias; the log-slope estimand is
+    // recovered, NOT dropped or pinned to zero). Width-guarded against any
+    // logslope design rebuild.
+    if pilot_logslope_beta.len() == logslope_design.design.ncols()
+        && pilot_logslope_beta.iter().all(|v| v.is_finite())
+    {
+        hints.borrow_mut().logslope_beta = Some(pilot_logslope_beta.clone());
+    }
     let sigma_hint = RefCell::new(initial_sigma);
     let exact_warm_start = RefCell::new(None::<CustomFamilyWarmStart>);
     // Outer ρ-cache β-seed staging slot. The spatial-joint optimizer fires
@@ -22317,7 +22322,7 @@ pub fn fit_survival_marginal_slope_terms(
         let psi_dim = setup.theta0().len() - setup.rho_dim();
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
-    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(EXACT_SPATIAL_OUTER_REL_TOL_FLOOR);
+    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
     let mut solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
