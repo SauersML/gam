@@ -115,6 +115,16 @@ const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 const MAX_SOLVE_RETRIES: usize = 8;
 
+/// Floor on the requested PCG relative tolerance. Asking for convergence tighter
+/// than this is below the achievable accuracy of the SPD energy minimization in
+/// `f64`, so we clamp the target to avoid iterating on numerical noise.
+const PCG_REL_TOL_FLOOR: f64 = 1e-12;
+
+/// Floor applied to each (already non-negative) preconditioner diagonal entry
+/// before reciprocation. Exactly-zero entries are treated as numerical noise and
+/// floored to this value rather than producing an infinite `1/m`.
+const PCG_PRECONDITIONER_FLOOR: f64 = 1e-12;
+
 #[derive(Default, Clone, Copy)]
 pub(crate) struct KahanSum {
     sum: f64,
@@ -734,7 +744,7 @@ where
         ));
     }
 
-    let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
+    let tol = rel_tol.max(PCG_REL_TOL_FLOOR) * rhs_norm.max(1.0);
     let mut x = Array1::<f64>::zeros(p);
     let mut r = rhs.clone();
     let mut diagnostics = PcgDiagnostics::new(rhs_norm);
@@ -762,7 +772,7 @@ where
             bad_diag = true;
             break;
         }
-        *slot = 1.0 / m.max(1e-12);
+        *slot = 1.0 / m.max(PCG_PRECONDITIONER_FLOOR);
     }
     if bad_diag {
         log::warn!(
@@ -897,7 +907,7 @@ where
         ));
     }
 
-    let tol = rel_tol.max(1e-12) * rhs_norm.max(1.0);
+    let tol = rel_tol.max(PCG_REL_TOL_FLOOR) * rhs_norm.max(1.0);
     let mut x = Array1::<f64>::zeros(p);
     let mut r = rhs.clone();
     let mut diagnostics = PcgDiagnostics::new(rhs_norm);
@@ -912,7 +922,7 @@ where
     Zip::from(&mut inv_m)
         .and(preconditioner_diag)
         .par_for_each(|inv, &m| {
-            *inv = 1.0 / m.max(1e-12);
+            *inv = 1.0 / m.max(PCG_PRECONDITIONER_FLOOR);
         });
 
     let mut z = Array1::<f64>::zeros(p);

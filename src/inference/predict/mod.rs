@@ -421,6 +421,13 @@ fn linear_predictorvariance_from_backend(
 const POSTERIOR_MEAN_VARIANCE_TOL: f64 = 1e-10;
 const POSTERIOR_MEAN_CROSS_TOL: f64 = 1e-10;
 
+/// Saturation bound on the standardized survival argument `q0 = -η_t / σ`. When
+/// `σ` underflows toward its floor, the ratio can blow up to a non-finite value
+/// that poisons the downstream inverse-link jet; clamping to a large finite
+/// magnitude keeps the result in the saturated tail (CDF → 0 or 1) while staying
+/// numerically well-defined.
+const SURVIVAL_STANDARDIZED_ARG_CLAMP: f64 = 1e6;
+
 fn posterior_mean_backend_or_warn<'a>(
     fit: &'a UnifiedFitResult,
     fallback: Option<&'a Array2<f64>>,
@@ -3816,7 +3823,10 @@ impl BinomialLocationScalePredictor {
         let eta_s = design_noise.dot(&self.beta_noise) + &offset_noise;
         // Floor sigma to prevent division by zero when eta_s underflows.
         let sigma = eta_s.mapv(|v| v.exp().max(f64::MIN_POSITIVE));
-        let q0 = Array1::from_shape_fn(eta_t.len(), |i| (-eta_t[i] / sigma[i]).clamp(-1e6, 1e6));
+        let q0 = Array1::from_shape_fn(eta_t.len(), |i| {
+            (-eta_t[i] / sigma[i])
+                .clamp(-SURVIVAL_STANDARDIZED_ARG_CLAMP, SURVIVAL_STANDARDIZED_ARG_CLAMP)
+        });
         Ok((q0, sigma, eta_t))
     }
 
