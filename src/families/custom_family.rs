@@ -17235,6 +17235,35 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 options,
                 cached_joint_workspace.clone(),
             )?;
+            // The IFT/outer KKT residual must be the AUGMENTED stationarity
+            // `∇L − Sβ + ∇Φ` the inner Newton actually drove to zero — NOT the bare
+            // `∇L − Sβ`. With the Firth term armed, `∇L − Sβ = −∇Φ` at the
+            // converged β, so the bare residual's null-space component equals ∇Φ
+            // (O(‖∇Φ‖), e.g. 2.49 for the coupled Dirichlet). The outer evaluator's
+            // range-projected IFT validity gate (`projected_into_reduced_range`)
+            // then sees that ‖∇Φ‖ of "unresolved mass outside the reduced range"
+            // and rejects EVERY seed at outer startup validation ("no candidate
+            // seeds passed", gam#729/#715). Folding ∇Φ into the gradient makes the
+            // residual the genuinely-near-zero augmented stationarity the inner
+            // certified, so the gate passes. No-op when the term is
+            // condition-gated/unavailable (∇Φ=0).
+            let augmented_joint_gradient: Option<Array1<f64>> =
+                match (cached_joint_gradient.as_ref(), joint_jeffreys_subspace.as_ref()) {
+                    (Some(gradient), Some(z_joint)) => {
+                        match custom_family_joint_jeffreys_term(
+                            family, &states, specs, &ranges, z_joint,
+                        )? {
+                            Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
+                                Some(gradient + &grad_phi)
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+            let ift_gradient = augmented_joint_gradient
+                .as_ref()
+                .or(cached_joint_gradient.as_ref());
             let kkt_residual = exact_newton_joint_kkt_residual_for_ift_from_cached_gradient(
                 family,
                 specs,
@@ -17243,7 +17272,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 ridge,
                 options.ridge_policy,
                 Some(cached_active_sets.as_slice()),
-                cached_joint_gradient.as_ref(),
+                ift_gradient,
             )?;
             let kkt_residual =
                 require_projected_kkt_residual(kkt_residual, "joint-Newton converged exit")?;
@@ -25693,12 +25722,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                  AUTO-ESCALATE to never-fail posterior sampling about the initial ρ seed; the \
                  degraded refit below still raises if even the seed produces a non-finite mode.",
             );
-            {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                    writeln!(f, "[DIAG-STARTUP-ERR] {e} || detail={last_error_detail}").ok();
-                }
-            }
             (rho0.clone(), None, 0, true)
         }
         Err(e) => {
