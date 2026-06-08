@@ -12893,6 +12893,68 @@ struct JointSpectralNewtonStep {
     most_negative_eigenvalue: f64,
 }
 
+/// Maximum ratio of the Firth Gauss-Newton curvature `H_Φ` spectral radius to the
+/// data+penalty Hessian `H+Sλ` spectral radius before `H_Φ` is clamped. Firth is a
+/// bounded ~½-observation prior whose curvature must not dominate the data
+/// information; clamping `H_Φ`'s eigenvalues at this multiple of `λ_max(H+Sλ)` keeps
+/// `H+Sλ+H_Φ` well-conditioned so the spectral Newton solve's numerical-rank floor
+/// does not rise above genuine data-curvature directions and drop them (the
+/// log_sigma-at-β=0 cycle-0 phantom_multiplier abort, gam#826). The Firth GRADIENT
+/// `∇Φ` is left intact (it is the O(1)-bounding force); only the step CURVATURE is
+/// bounded. Generous so it binds only on the pathological `(1/floor)²` blow-up.
+const FIRTH_CURVATURE_MAX_RATIO: f64 = 8.0;
+
+/// Cheap upper bound on the spectral radius of a symmetric matrix via Gershgorin
+/// discs: `λ_max ≤ max_i (|A_ii| + Σ_{j≠i} |A_ij|)`. `O(p²)`, no eigendecomposition.
+fn symmetric_gershgorin_spectral_radius(a: &Array2<f64>) -> f64 {
+    let p = a.nrows();
+    let mut radius = 0.0_f64;
+    for i in 0..p {
+        let mut row_sum = 0.0_f64;
+        for j in 0..p {
+            row_sum += a[[i, j]].abs();
+        }
+        radius = radius.max(row_sum);
+    }
+    radius
+}
+
+/// Return a copy of the symmetric PSD matrix `a` with every eigenvalue clamped to at
+/// most `max_eig` (eigenvectors unchanged). Bounds the Firth curvature `H_Φ` to the
+/// data-Hessian scale before it enters the Newton step; a no-op (returns a clone)
+/// when no eigenvalue exceeds `max_eig`.
+fn cap_symmetric_eigenvalues(a: &Array2<f64>, max_eig: f64) -> Array2<f64> {
+    if !(max_eig.is_finite() && max_eig > 0.0) {
+        return a.clone();
+    }
+    let mut sym = a.clone();
+    symmetrize_dense_in_place(&mut sym);
+    let (evals, evecs) = match FaerEigh::eigh(&sym, Side::Lower) {
+        Ok(pair) => pair,
+        Err(_) => return a.clone(),
+    };
+    if evals.iter().all(|&lam| lam <= max_eig) {
+        return a.clone();
+    }
+    let p = sym.nrows();
+    let mut out = Array2::<f64>::zeros((p, p));
+    for k in 0..p {
+        let lam = evals[k].min(max_eig);
+        if lam == 0.0 {
+            continue;
+        }
+        let u_k = evecs.column(k);
+        for i in 0..p {
+            let ui = lam * u_k[i];
+            for j in 0..p {
+                out[[i, j]] += ui * u_k[j];
+            }
+        }
+    }
+    symmetrize_dense_in_place(&mut out);
+    out
+}
+
 fn solve_joint_newton_step_on_spectral_range(
     h_pen: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -14961,7 +15023,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         && grad_phi.len() == rhs_step.len()
                     {
                         rhs_step += grad_phi;
-                        lhs += hphi;
+                        // Clamp H_Φ to the data-Hessian scale (gam#826; see the
+                        // spectral branch for the rationale). ∇Φ in rhs_step intact.
+                        let cap = FIRTH_CURVATURE_MAX_RATIO
+                            * symmetric_gershgorin_spectral_radius(&lhs);
+                        lhs += &cap_symmetric_eigenvalues(hphi, cap);
                     }
                     // Self-vanishing Levenberg–Marquardt damping for the
                     // CONSTRAINED active-set QP, mirroring the spectral-range
@@ -15285,13 +15351,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // SAME Jeffreys-augmented Newton system.
                         let spectral_rhs = rhs.clone();
                         if let Some((_grad_phi, hphi)) = inner_jeffreys_term.as_ref() {
-                            // `hphi` (and the `∇Φ` already folded into `rhs`) are the
-                            // CONSISTENTLY-ATTENUATED Firth triple from
-                            // `head_jeffreys_term` — both scaled by the same scalar so
-                            // the Newton system `(H+Sλ+s·H_Φ)δ = ∇L−Sβ+s·∇Φ` stays
-                            // balanced and well-conditioned (gam#826/#872/#715). No
-                            // per-site capping here.
-                            lhs_true += hphi;
+                            // Clamp `H_Φ`'s eigenvalues to FIRTH_CURVATURE_MAX_RATIO ·
+                            // λ_max(H+Sλ) before folding (gam#826). On a weakly-
+                            // identified reduced-info direction (log_sigma at β=0)
+                            // `H_Φ ∝ (1/floor)²` inflates `λ_max(H+Sλ+H_Φ)` so far
+                            // that the spectral solve's numerical-rank floor rises
+                            // above genuine data-curvature directions and drops them
+                            // (the ∇Φ rhs lands there → zero step → cycle-0
+                            // phantom_multiplier abort). Clamping keeps the system
+                            // well-conditioned. The Firth gradient ∇Φ in `rhs` is
+                            // intact (the O(1)-bounding force); no-op when H_Φ is
+                            // within the cap.
+                            let cap = FIRTH_CURVATURE_MAX_RATIO
+                                * symmetric_gershgorin_spectral_radius(&lhs_true);
+                            lhs_true += &cap_symmetric_eigenvalues(hphi, cap);
                         }
                         // Self-vanishing Levenberg–Marquardt damping for the
                         // range-restricted spectral step. Scaled to the current
