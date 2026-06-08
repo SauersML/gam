@@ -10318,18 +10318,25 @@ impl GaussianLocationScaleWiggleFamily {
         }
         let rows = self.get_or_compute_row_scalars(&q, eta_ls)?;
         let coeff_mm = &rows.w * &geom.dq_dq0.mapv(|v| v * v) - &rows.m * &geom.d2q_dq02;
-        // Cross blocks involving η_ls carry overall κ; scale-scale block is
-        // 2κ²n + κ'(a−n) under the logb link (the κ'(a−n) piece is lost if κ
-        // is treated as constant under ∂/∂η_ls).
-        let coeff_ml = (2.0 * &rows.kappa * &rows.m) * &geom.dq_dq0;
+        // Gaussian mean⊥scale Fisher orthogonality. μ (mu) AND the wiggle both
+        // enter the MEAN q = q0 + B(q0)·βw (see `let q = q0 + etaw`); log σ is
+        // the only scale-side block. The Fisher (expected) cross between any
+        // mean-side parameter and log σ is exactly 0: H_{μ,ls} = 2κm·dq_dq0 and
+        // H_{ls,w} = 2κm both carry m = r·w = (y−q)·weight/σ², and E[m] =
+        // E[r]·w = 0. The dense and matrix-free workspace paths SHARE these row
+        // pieces, so setting the cross coeffs to 0 fixes the curvature object
+        // (the observed 2κm value) for both. Diagonal/same-side blocks
+        // (coeff_mm within mean, coeff_ll within scale, coeff_mw_* within mean,
+        // coeff_ww within mean) are untouched.
+        let coeff_ml = Array1::<f64>::zeros(n);
         // Fisher/expected (log σ, log σ) information E[H_{ls,ls}] = 2κ²a (#566):
         // the observed 2κ²n + κ'(a−n) collapses at small residuals and
         // over-smooths the scale; E[n]=a gives the residual-free 2κ²a.
         let coeff_ll = 2.0 * &rows.kappa * &rows.kappa * &rows.obs_weight;
         let coeff_mw_b = &rows.w * &geom.dq_dq0;
         let coeff_mw_d = -&rows.m;
-        // ls-wiggle cross block carries one κ from the η_ls chain.
-        let coeff_lw_b = 2.0 * &rows.kappa * &rows.m;
+        // ls↔wiggle is a mean⊥scale cross (wiggle is mean-side): Fisher 0.
+        let coeff_lw_b = Array1::<f64>::zeros(n);
         let coeff_ww = rows.w.clone();
         Ok(GaussianLocationScaleWiggleHessianRowPieces {
             coeff_mm,
