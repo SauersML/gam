@@ -2679,6 +2679,20 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     }
 }
 
+/// Outer gradient-decay ratio `‖g_now‖/‖g_initial‖` below which the outer is
+/// treated as essentially converged: the inner cap is lifted entirely so the
+/// cached β reaches full inner tolerance before the convergence guard runs.
+const INNER_CAP_CONVERGENCE_OVERRIDE_RATIO: f64 = 0.01;
+
+/// Floor on the adaptive inner-PIRLS cap. Any cap below this is below the
+/// inner-Newton noise level and would reject usable warm-started steps.
+const INNER_CAP_FLOOR: usize = 3;
+
+/// Ceiling on the adaptive inner-PIRLS cap, set at the inner-Newton noise
+/// floor at biobank scale; further iterations are pure waste once the warm
+/// start is close.
+const INNER_CAP_CEILING: usize = 64;
+
 /// Adaptive inner-PIRLS cap schedule. Replaces the older hardcoded
 /// iter-tier (3/5/10/20) and ratio-tier (0.50/0.20/0.05/0.01) schedule
 /// with a cap driven by the inner solver's actual convergence behavior
@@ -2713,7 +2727,7 @@ fn first_order_inner_cap_schedule(
     // path is independent of inner-progress history because the outer
     // re-evaluation guard pays a full inner solve anyway — uncapping
     // here just avoids one wasted iter at low cap before the guard.
-    if matches!(g_ratio, Some(r) if r < 0.01) {
+    if matches!(g_ratio, Some(r) if r < INNER_CAP_CONVERGENCE_OVERRIDE_RATIO) {
         return 0;
     }
 
@@ -2774,7 +2788,7 @@ fn first_order_inner_cap_schedule(
                 .saturating_mul(multiplier)
                 .max(snap.last_iters.saturating_add(4))
         };
-        return next.clamp(3, 64);
+        return next.clamp(INNER_CAP_FLOOR, INNER_CAP_CEILING);
     }
 
     // No feedback yet (first outer iter, or right after a screening
