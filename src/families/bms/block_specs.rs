@@ -1099,6 +1099,122 @@ mod runaway_tests {
         Ok(Some(penalty))
     }
 
+    // The raw-vs-effective counterexample. With q=g=0, s=1: c_i=1 (so M_eff=M)
+    // and f_i=z_i (so G_eff=diag(z)·G). Pick M=[1,1,1]ᵀ and a two-column logslope
+    // G whose RAW columns are both linearly independent of M (raw orthogonalising
+    // [M|G] would keep BOTH — the old code returned None, no reduction), but whose
+    // first EFFECTIVE column diag(z)·G[:,0] equals M_eff exactly. The effective
+    // audit must therefore drop exactly one direction (r=1), proving it removes
+    // the joint-Hessian rank-soft direction the raw audit could not see.
+    #[test]
+    fn effective_reduction_drops_score_weighted_confound_raw_audit_misses() {
+        // G col0 = [1,2,3], col1 = [1,2,9]  (row-major rows: [1,1],[2,2],[3,9]).
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        let g = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 9.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
+        let w = Array1::<f64>::ones(3);
+        let zero = Array1::<f64>::zeros(3);
+
+        // diag(z)·G[:,0] = [1·1, 0.5·2, (1/3)·3] = [1,1,1] = M_eff (fully aliased);
+        // diag(z)·G[:,1] = [1·1, 0.5·2, (1/3)·9] = [1,1,3] (NOT in span([1,1,1])).
+        let reparam = reduced_logslope_transform_effective(
+            m.view(),
+            g.view(),
+            &z,
+            &w,
+            &zero,
+            &zero,
+            0.0,
+            0.0,
+            1.0,
+        )
+        .expect("effective reduction must succeed")
+        .expect("effective audit must reduce the score-weighted confound (raw audit would not)");
+        assert_eq!(
+            reparam.ncols(),
+            1,
+            "exactly one effective-identifiable logslope direction should survive"
+        );
+
+        // The surviving raw direction's EFFECTIVE image diag(z)·G·t must carry the
+        // non-constant ([1,1,3]) content — i.e. it is the identifiable direction,
+        // not the [1,1,1] confound. Its row variance must be clearly positive.
+        let g_eff = {
+            let mut e = Array2::<f64>::zeros((3, 2));
+            for i in 0..3 {
+                for j in 0..2 {
+                    e[[i, j]] = z[i] * g[[i, j]];
+                }
+            }
+            e
+        };
+        let img = g_eff.dot(&reparam.column(0));
+        let mean = img.iter().sum::<f64>() / 3.0;
+        let var = img.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 3.0;
+        assert!(
+            var > 1.0e-6,
+            "kept direction must be the identifiable (non-constant) effective column, var={var}"
+        );
+    }
+
+    // The single-column fully-confounded case: G=[1,2,3]ᵀ, z=[1,1/2,1/3] gives
+    // G_eff=[1,1,1]=M_eff, so the entire effective logslope image is in the
+    // effective marginal span (r==0). The helper returns None (keep the raw
+    // design) rather than emitting a zero-width transform that would delete the
+    // score-effect surface.
+    #[test]
+    fn effective_reduction_fully_confounded_single_column_returns_none() {
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        let g = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 0.5, 1.0 / 3.0]);
+        let w = Array1::<f64>::ones(3);
+        let zero = Array1::<f64>::zeros(3);
+        let reparam = reduced_logslope_transform_effective(
+            m.view(),
+            g.view(),
+            &z,
+            &w,
+            &zero,
+            &zero,
+            0.0,
+            0.0,
+            1.0,
+        )
+        .expect("effective reduction must succeed");
+        assert!(
+            reparam.is_none(),
+            "fully effective-confounded logslope must keep raw design (None), not a 0-width block"
+        );
+    }
+
+    // No effective confound: both effective logslope columns stay independent of
+    // M_eff, so nothing is reduced (r==p_g ⇒ None) and healthy fits are untouched.
+    #[test]
+    fn effective_reduction_no_confound_returns_none() {
+        let m = Array2::<f64>::from_shape_vec((3, 1), vec![1.0, 1.0, 1.0]).unwrap();
+        // diag(z)·col gives non-constant images for both columns under z below.
+        let g = Array2::<f64>::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]).unwrap();
+        let z = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        let w = Array1::<f64>::ones(3);
+        let zero = Array1::<f64>::zeros(3);
+        let reparam = reduced_logslope_transform_effective(
+            m.view(),
+            g.view(),
+            &z,
+            &w,
+            &zero,
+            &zero,
+            0.0,
+            0.0,
+            1.0,
+        )
+        .expect("effective reduction must succeed");
+        assert!(
+            reparam.is_none(),
+            "no effective confound ⇒ no reduction (raw design kept unchanged)"
+        );
+    }
+
     #[test]
     fn spatial_joint_setup_counts_only_learned_penalties_in_rho() {
         let data = Array2::<f64>::zeros((3, 1));
