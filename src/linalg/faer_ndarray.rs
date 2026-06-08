@@ -1540,7 +1540,13 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
             .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
             .max(1.0);
         let scaled = repaired.mapv(|value| value / scale);
-        let jitter_schedule = [0.0_f64, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4];
+        // Relative diagonal-jitter ladder for the eigendecomposition repair: the
+        // matrix is pre-scaled to unit max-abs, so these are fractions of its
+        // scale. We try the unperturbed matrix first, then escalate the ridge by
+        // two decades per attempt until the factorization yields all-finite
+        // eigenpairs, accepting the smallest jitter that succeeds.
+        const JITTER_SCHEDULE: [f64; 6] = [0.0, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4];
+        let jitter_schedule = JITTER_SCHEDULE;
         let mut last_error = FaerLinalgError::FactorizationFailed {
             context: "self-adjoint eigendecomposition repair attempts",
         };
