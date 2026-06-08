@@ -15,7 +15,8 @@ use std::io::{BufWriter, Write};
 
 use ndarray::{Array1, Array2};
 use numpy::{
-    IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadonlyArrayDyn,
+    IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArrayDyn,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
