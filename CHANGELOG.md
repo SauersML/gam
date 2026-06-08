@@ -1,3 +1,10 @@
+## 0.1.185
+
+- Revert matern double_penalty=false default regression (#787).
+- Family-gated self-vanishing-mu cond-damping for marginal-slope inner solves (#787/#808).
+- Operating-point warm-start of survival logslope initial_beta (g=0 seed-trap escape) (#808/#814).
+- Suppress preconditioned-descent substitution at the joint-Newton step floor (#787 c12).
+
 ## v0.3.105 — gam 0.3.105 / gamfit 0.1.183 (2026-06-07)
 
 Catch-up crate release. crates.io was last published at gam 0.3.103; this rolls
