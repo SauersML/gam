@@ -67,6 +67,13 @@ const SCALE_PROJECTION_REPLAY_RCOND_FLOOR: f64 = 1e-8;
 // smaller than `1 / RCOND_FLOOR` would discard real signal from moderately
 // conditioned bases and is intentionally avoided.
 const SCALE_PROJECTION_LEVERAGE_AMPLIFICATION: f64 = 1.0e8;
+// Above this many materialized entries (rows × noise columns) the scale-deviation
+// operator routes its normal-equation solve through matrix-free PCG instead of
+// forming a dense `XᵀWX`. The dense path costs `O(n · p²)` time and `O(p²)`
+// memory; once the explicit operator footprint reaches ~10⁶ doubles (~8 MiB,
+// matching `SCALE_DESIGN_TARGET_CHUNK_BYTES`) the chunked matrix-free path is
+// the cheaper, more cache-friendly route.
+const SCALE_OPERATOR_MATRIX_FREE_PCG_THRESHOLD: usize = 1_000_000;
 
 #[derive(Clone, Debug)]
 pub struct ScaleDeviationTransform {
@@ -374,7 +381,7 @@ impl LinearOperator for ScaleDeviationOperator {
         self.primary_design
             .nrows()
             .saturating_mul(self.rawnoise_design.ncols())
-            > 1_000_000
+            > SCALE_OPERATOR_MATRIX_FREE_PCG_THRESHOLD
     }
 }
 

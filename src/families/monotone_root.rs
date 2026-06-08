@@ -177,6 +177,25 @@ impl std::fmt::Display for MonotoneRootError {
 
 impl std::error::Error for MonotoneRootError {}
 
+/// Smallest |F'| (or Halley denominator) treated as usable before a Newton /
+/// Halley step is abandoned in favour of the bracketing fallback. Below this
+/// the reciprocal `f / fp` overflows or loses all precision, so the step is
+/// meaningless; the bisection bracket still makes guaranteed progress. Set far
+/// under any derivative magnitude a well-posed monotone calibration equation
+/// produces, so it only trips on genuine flat spots.
+const NEWTON_DERIV_FLOOR: f64 = 1e-30;
+
+/// Trust-region cap on a warm-start Newton probe step, expressed as a multiple
+/// of the current iterate scale `1 + |a|`. A correction larger than this is
+/// taken as a sign the quadratic model is untrustworthy (the warm start is far
+/// from the basin), so the probe is abandoned and the globally convergent
+/// bracketed solver takes over.
+const WARMSTART_NEWTON_STEP_LIMIT: f64 = 8.0;
+
+/// Initial geometric bracketing step magnitude, as a fraction of the seed scale
+/// `1 + |a_init|` (floored at 1). Doubles each probe until the root is straddled.
+const BRACKET_INITIAL_STEP_FRAC: f64 = 0.25;
+
 /// Internal helper: wrap an `eval` closure error into `EvalFailed`.
 #[inline]
 fn map_eval_err(label: &str, a: f64, source: String) -> MonotoneRootError {
@@ -279,12 +298,12 @@ pub fn solve_monotone_root_detailed_with_bracket(
             });
         }
 
-        if !fp.is_finite() || fp.abs() <= 1e-30 {
+        if !fp.is_finite() || fp.abs() <= NEWTON_DERIV_FLOOR {
             break;
         }
 
         let step = -f / fp;
-        if !step.is_finite() || step.abs() > 8.0 * (1.0 + a.abs()) {
+        if !step.is_finite() || step.abs() > WARMSTART_NEWTON_STEP_LIMIT * (1.0 + a.abs()) {
             break;
         }
 
@@ -343,7 +362,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
 
         let f_init_negative = f_init < 0.0;
         let mut same_side = a_init; // last point with same sign as f_init
-        let mut step_mag = (0.25 * (1.0 + a_init.abs())).max(1.0);
+        let mut step_mag = (BRACKET_INITIAL_STEP_FRAC * (1.0 + a_init.abs())).max(1.0);
         // Geometric step growth is unbounded mathematically, but in practice
         // we cap to avoid runaway evaluations when F flatlines and never
         // crosses (e.g. probit calibration where every probe saturates at
@@ -438,9 +457,9 @@ pub fn solve_monotone_root_detailed_with_bracket(
         // available and well-conditioned. The caller already computed F''(a),
         // so using it here reduces expensive calibration evaluations for the
         // exact denested likelihood paths without changing the objective.
-        let halley_probe = if f_a_mid.is_finite() && f_a_mid.abs() > 1e-30 {
+        let halley_probe = if f_a_mid.is_finite() && f_a_mid.abs() > NEWTON_DERIV_FLOOR {
             let halley_denom = 2.0 * f_a_mid * f_a_mid - f_mid * f_aa_mid;
-            if halley_denom.is_finite() && halley_denom.abs() > 1e-30 {
+            if halley_denom.is_finite() && halley_denom.abs() > NEWTON_DERIV_FLOOR {
                 let cand = mid - (2.0 * f_mid * f_a_mid) / halley_denom;
                 if cand > lo && cand < hi {
                     Some(cand)
@@ -458,7 +477,7 @@ pub fn solve_monotone_root_detailed_with_bracket(
         // would leave the current bracket.
         let probe = if let Some(cand) = halley_probe {
             cand
-        } else if f_a_mid.is_finite() && f_a_mid.abs() > 1e-30 {
+        } else if f_a_mid.is_finite() && f_a_mid.abs() > NEWTON_DERIV_FLOOR {
             let cand = mid - f_mid / f_a_mid;
             if cand > lo && cand < hi { cand } else { mid }
         } else {
