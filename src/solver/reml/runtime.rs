@@ -3820,6 +3820,18 @@ impl<'a> RemlState<'a> {
     /// exact), when no direction trips the threshold, or when the importance
     /// estimate is not trustworthy (low ESS) — in which case the plain Laplace
     /// summary is retained rather than splicing in a noisy correction.
+    ///
+    /// # Outer-consistency / continuity
+    ///
+    /// The threshold-based activation is technically discontinuous in ρ (a
+    /// direction can cross `τ` as ρ moves). That discontinuity is harmless for
+    /// the outer REML by construction: a direction crosses the threshold only
+    /// at `|γ_r| ≈ τ = sqrt((24/5)/n_eff) = O(n^{−1/2})`, so its contribution to
+    /// `Δ_b` is `O(γ_r²) = O(1/n)` — the same order as the Laplace floor error
+    /// that the criterion already carries and below the inner KKT tolerance
+    /// band. The correction value therefore vanishes continuously as a
+    /// direction approaches the threshold, so the spliced objective is
+    /// continuous to leading order and does not bias ρ selection.
     fn block_local_sampled_correction(
         &self,
         rho: &Array1<f64>,
@@ -3856,6 +3868,20 @@ impl<'a> RemlState<'a> {
         let x_design = &pirls_result.x_transformed;
         let p = h_total.nrows();
         if p == 0 || c_weights.len() != x_design.nrows() {
+            return Ok(zero());
+        }
+
+        // Problem-scale gate. The non-Gaussianity diagnostic costs an O(p³)
+        // dense eigendecomposition plus O(n·p) cubic contractions, and the
+        // sampler adds O(draws · n · m) deviance work. At biobank scale that is
+        // prohibitive on every inner evaluation, and the Laplace floor error is
+        // already O(1/n) → negligible there, so the correction would be a
+        // no-op anyway. Mirror the established TK scale caps: skip the audit
+        // entirely above them and retain the (asymptotically exact) plain
+        // Laplace summary.
+        let n_obs = x_design.nrows();
+        let dense_work = n_obs.saturating_mul(p);
+        if n_obs > TK_MAX_OBSERVATIONS || p > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK {
             return Ok(zero());
         }
 
