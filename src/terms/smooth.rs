@@ -8280,7 +8280,10 @@ fn apply_global_smooth_identifiability(
         let owner_indices = if skip_global_transform {
             Vec::new()
         } else {
-            let overlap_tol = 1e-10;
+            // Relative cross-residual above which a dependent smooth's design is
+            // judged to share column space with an owner term and so needs that
+            // owner's block in its identifiability transform.
+            const OVERLAP_REL_RESIDUAL_TOL: f64 = 1e-10;
             let owner_cross_checks = term_owners[idx]
                 .clone()
                 .into_par_iter()
@@ -8295,7 +8298,7 @@ fn apply_global_smooth_identifiability(
             let mut out = Vec::new();
             for check in owner_cross_checks {
                 let (owner_idx, rel) = check?;
-                if rel > overlap_tol {
+                if rel > OVERLAP_REL_RESIDUAL_TOL {
                     out.push(owner_idx);
                 }
             }
@@ -8358,7 +8361,10 @@ fn apply_global_smooth_identifiability(
         if let Some(c_ref) = c_local.as_ref() {
             let rel =
                 orthogonality_relative_residual_for_design(&design_constrained, c_ref.view())?;
-            let tol = 1e-8;
+            // Largest relative residual tolerated before the constrained design
+            // is rejected as not orthogonal to its sum-to-zero constraint rows.
+            const ORTHOGONALITY_REL_RESIDUAL_TOL: f64 = 1e-8;
+            let tol = ORTHOGONALITY_REL_RESIDUAL_TOL;
             if rel > tol {
                 crate::bail_invalid_basis!(
                     "smooth orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
