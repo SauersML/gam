@@ -237,6 +237,15 @@ pub struct SurvivalTimeBuildOutput {
 
 pub const SURVIVAL_TIME_FLOOR: f64 = 1e-9;
 
+/// Seed smoothing penalty `λ` used when a survival time basis is reconstructed
+/// from a build (or saved model) that did not carry an explicit `smooth_lambda`.
+/// This is only an initial value for the REML smoothing search, not a fixed
+/// policy: a small positive seed keeps the baseline spline lightly regularized
+/// at the start so the outer optimizer begins from a well-conditioned point and
+/// then adapts `λ` to the data. Kept in one place so the b-spline and i-spline
+/// reconstruction paths cannot drift apart.
+const SURVIVAL_TIME_SMOOTH_LAMBDA_SEED: f64 = 1e-2;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurvivalLikelihoodMode {
     Transformation,
@@ -1691,7 +1700,7 @@ pub fn resolved_survival_time_basis_config_from_build(
                     .cloned()
                     .ok_or_else(|| "survival bspline basis is missing knots".to_string())?,
             ),
-            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
+            smooth_lambda: smooth_lambda.unwrap_or(SURVIVAL_TIME_SMOOTH_LAMBDA_SEED),
         }),
         "ispline" => Ok(SurvivalTimeBasisConfig::ISpline {
             degree: degree.ok_or_else(|| "survival ispline basis is missing degree".to_string())?,
@@ -1703,7 +1712,7 @@ pub fn resolved_survival_time_basis_config_from_build(
             keep_cols: keep_cols
                 .cloned()
                 .ok_or_else(|| "survival ispline basis is missing keep_cols".to_string())?,
-            smooth_lambda: smooth_lambda.unwrap_or(1e-2),
+            smooth_lambda: smooth_lambda.unwrap_or(SURVIVAL_TIME_SMOOTH_LAMBDA_SEED),
         }),
         other => Err(format!("unsupported survival time basis '{other}'")),
     }

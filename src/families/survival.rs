@@ -180,6 +180,24 @@ impl PenaltyBlocks {
     }
 }
 
+/// Entry ages at or below this value are treated as left-truncation at the time
+/// origin, i.e. "no delayed-entry interval" — the cumulative-hazard term
+/// `exp(η_entry)` is dropped because `H(0) = 0`. The Royston-Parmar baseline is
+/// `η(t) = log H(t)` with `H(t) → 0` as `t → 0`, so `log H` diverges at the
+/// origin; this small positive floor lets a row that genuinely enters at time
+/// zero skip the entry contribution instead of evaluating `log H` at a
+/// degenerate point. Shared so every entry-detection site stays in lockstep.
+const ENTRY_AT_ORIGIN_THRESHOLD: f64 = 1e-8;
+
+/// Fraction-to-the-boundary factor for the cause-specific feasible-step search.
+/// When a Newton direction would drive a row's derivative down to the
+/// monotonicity floor, the step is capped at this fraction of the distance to
+/// the boundary rather than landing exactly on it. Staying strictly inside the
+/// feasible region (the standard interior-point fraction-to-boundary rule)
+/// keeps the next `1/deriv` / `deriv.ln()` evaluation away from the singular
+/// boundary where curvature blows up.
+const DERIVATIVE_FRACTION_TO_BOUNDARY: f64 = 0.995;
+
 #[derive(Debug, Clone)]
 pub struct CauseSpecificRoystonParmarBlock {
     pub age_entry: Array1<f64>,
@@ -315,7 +333,7 @@ fn evaluate_cause_specific_block(
         if block.age_exit[i] < block.age_entry[i] {
             crate::bail_invalid_surv!("age_exit < age_entry at row {i}");
         }
-        let has_entry = block.age_entry[i] > 1e-8;
+        let has_entry = block.age_entry[i] > ENTRY_AT_ORIGIN_THRESHOLD;
         let h_exit = eta_exit[i].exp();
         let h_entry = if has_entry { eta_entry[i].exp() } else { 0.0 };
         if !(h_exit.is_finite() && h_entry.is_finite()) {
@@ -496,7 +514,7 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
                 if current <= 0.0 {
                     return Ok(Some(0.0));
                 }
-                alpha_max = alpha_max.min(0.995 * current / -slope);
+                alpha_max = alpha_max.min(DERIVATIVE_FRACTION_TO_BOUNDARY * current / -slope);
             }
         }
         Ok(Some(alpha_max.clamp(0.0, 1.0)))
@@ -595,7 +613,7 @@ fn cause_specific_hessian_directional_derivative(
         if weight <= 0.0 {
             continue;
         }
-        let has_entry = block.age_entry[i] > 1e-8;
+        let has_entry = block.age_entry[i] > ENTRY_AT_ORIGIN_THRESHOLD;
         w_exit[i] = weight * eta_exit[i].exp() * d_eta_exit[i];
         if has_entry {
             w_entry[i] = weight * eta_entry[i].exp() * d_eta_entry[i];
@@ -650,7 +668,7 @@ fn cause_specific_hessian_second_directional_derivative(
         if weight <= 0.0 {
             continue;
         }
-        let has_entry = block.age_entry[i] > 1e-8;
+        let has_entry = block.age_entry[i] > ENTRY_AT_ORIGIN_THRESHOLD;
         w_exit[i] = weight * eta_exit[i].exp() * u_eta_exit[i] * v_eta_exit[i];
         if has_entry {
             w_entry[i] = weight * eta_entry[i].exp() * u_eta_entry[i] * v_eta_entry[i];
@@ -1544,7 +1562,7 @@ impl WorkingModelSurvival {
         Self {
             age_entry: age_entry.to_owned(),
             age_exit: age_exit.to_owned(),
-            entry_at_origin: age_entry.mapv(|t| t <= 1e-8),
+            entry_at_origin: age_entry.mapv(|t| t <= ENTRY_AT_ORIGIN_THRESHOLD),
             event_target: event_target.to_owned(),
             sampleweight: sampleweight.to_owned(),
             design,
