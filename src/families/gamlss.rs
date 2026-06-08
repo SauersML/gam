@@ -29168,4 +29168,260 @@ mod tests {
             crate::custom_family::ExactOuterDerivativeOrder::Second
         );
     }
+
+    /// Regression guard for #684 on the ψ / influence-Jacobian (IFT) joint
+    /// Hessian. The Newton/REML dense↔workspace path is pinned by
+    /// `gaussian_location_scale_workspace_matvec_matches_dense`, but nothing
+    /// pinned the *separate* representation used by the three
+    /// `exact_newton_joint_psi*` builders — which is exactly where the observed
+    /// `2κm` Fisher-cross drift slipped in uncaught. The Gaussian mean⊥scale
+    /// Fisher cross E[H_{μ,ls}] = 2κ·E[m] = 0 (m = r·weight/σ², E[r] = 0) must
+    /// be exactly 0 on the ψ joint Hessian and on ALL of its ψ-directional
+    /// derivatives (1st, 2nd, and mixed β·ψ), because a function identically 0
+    /// has identically-0 derivatives. The fixtures carry NONZERO residuals
+    /// (y ≠ η_μ), so the old buggy `2κm` cross is genuinely nonzero — this test
+    /// FAILS against the pre-fix code.
+    #[test]
+    fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero() {
+        use crate::solver::estimate::reml::unified::HyperOperator;
+
+        // Materialize an `ExactNewtonJointPsiTerms` joint Hessian regardless of
+        // whether the family returns it dense or operator-backed.
+        fn materialize(
+            dense: &Array2<f64>,
+            operator: &Option<std::sync::Arc<dyn HyperOperator>>,
+            total: usize,
+        ) -> Array2<f64> {
+            match operator {
+                Some(op) => op.to_dense(),
+                None => {
+                    assert_eq!(dense.dim(), (total, total));
+                    dense.clone()
+                }
+            }
+        }
+
+        // Max |entry| over the rectangular block H[r0..r1, c0..c1].
+        fn block_max_abs(
+            h: &Array2<f64>,
+            r0: usize,
+            r1: usize,
+            c0: usize,
+            c1: usize,
+        ) -> f64 {
+            let mut m = 0.0_f64;
+            for r in r0..r1 {
+                for c in c0..c1 {
+                    m = m.max(h[[r, c]].abs());
+                }
+            }
+            m
+        }
+
+        const CROSS_TOL: f64 = 1e-12;
+
+        // ---- Non-wiggle GaussianLocationScaleFamily ----------------------
+        {
+            let (family, states, specs) = gls_workspace_fixture();
+            let p_mu = states[GaussianLocationScaleFamily::BLOCK_MU].beta.len();
+            let p_ls = states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta.len();
+            let total = p_mu + p_ls;
+
+            // Nonzero ψ design-Jacobian on the MEAN (μ) block so psi_index 0
+            // resolves a nonzero z_primary_psi: the observed `2κmD` cross would
+            // then leak into H_{μ,ls} on the old code. A second-order payload
+            // (x_psi_psi) feeds the 2nd-order builder too.
+            let x_mu_psi = Array2::from_shape_fn((family.y.len(), p_mu), |(i, j)| {
+                0.2 + 0.11 * ((i as f64) * 0.37 + (j as f64) * 0.53).sin()
+            });
+            let x_mu_psi_psi = Array2::from_shape_fn((family.y.len(), p_mu), |(i, j)| {
+                0.07 * ((i as f64) * 0.19 + (j as f64) * 0.23).cos()
+            });
+            let derivative_blocks = vec![
+                vec![CustomFamilyBlockPsiDerivative {
+                    penalty_index: None,
+                    x_psi: x_mu_psi,
+                    s_psi: Array2::zeros((p_mu, p_mu)),
+                    s_psi_components: None,
+                    s_psi_penalty_components: None,
+                    x_psi_psi: Some(vec![x_mu_psi_psi]),
+                    s_psi_psi: Some(vec![Array2::zeros((p_mu, p_mu))]),
+                    s_psi_psi_components: None,
+                    s_psi_psi_penalty_components: None,
+                    implicit_operator: None,
+                    implicit_axis: 0,
+                    implicit_group_id: None,
+                }],
+                Vec::new(),
+            ];
+
+            // The dense Fisher joint Hessian itself must have a zero μ↔logσ
+            // cross (cross=0 Fisher; #684) — sanity that the dense path agrees
+            // with the ψ-path's zero, since the ψ-Hessian is the ψ-derivative
+            // of exactly this curvature object.
+            let dense_h = family
+                .exact_newton_joint_hessian(&states)
+                .expect("dense joint Hessian build")
+                .expect("dense joint Hessian present");
+            assert!(
+                block_max_abs(&dense_h, 0, p_mu, p_mu, total) <= CROSS_TOL,
+                "#684: dense Fisher joint Hessian μ↔logσ cross block must be 0, got max |.|={:.3e}",
+                block_max_abs(&dense_h, 0, p_mu, p_mu, total)
+            );
+
+            // 1st-order ψ joint Hessian.
+            let psi = family
+                .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+                .expect("psi terms call")
+                .expect("gaussian psi terms present");
+            let h_psi = materialize(&psi.hessian_psi, &psi.hessian_psi_operator, total);
+            let cross = block_max_abs(&h_psi, 0, p_mu, p_mu, total);
+            assert!(
+                cross <= CROSS_TOL,
+                "#684: ψ joint Hessian μ↔logσ cross block must be Fisher-0 (observed 2κm \
+                 drift), got max |.|={cross:.3e}"
+            );
+
+            // 2nd-order ψ joint Hessian.
+            let psi2 = family
+                .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
+                .expect("psi 2nd-order call")
+                .expect("gaussian psi 2nd-order present");
+            let h_psi2 =
+                materialize(&psi2.hessian_psi_psi, &psi2.hessian_psi_psi_operator, total);
+            let cross2 = block_max_abs(&h_psi2, 0, p_mu, p_mu, total);
+            assert!(
+                cross2 <= CROSS_TOL,
+                "#684: 2nd-order ψ joint Hessian μ↔logσ cross block must be Fisher-0, \
+                 got max |.|={cross2:.3e}"
+            );
+
+            // Mixed β·ψ directional derivative of the ψ joint Hessian.
+            let d_beta = Array1::from_shape_fn(total, |i| 0.05 + 0.13 * ((i + 1) as f64).sin());
+            let mixed = family
+                .exact_newton_joint_psihessian_directional_derivative(
+                    &states,
+                    &specs,
+                    &derivative_blocks,
+                    0,
+                    &d_beta,
+                )
+                .expect("psi mixed-drift call")
+                .expect("gaussian psi mixed-drift present");
+            assert_eq!(mixed.dim(), (total, total));
+            let crossm = block_max_abs(&mixed, 0, p_mu, p_mu, total);
+            assert!(
+                crossm <= CROSS_TOL,
+                "#684: mixed β·ψ ψ-Hessian μ↔logσ cross block must be Fisher-0, \
+                 got max |.|={crossm:.3e}"
+            );
+        }
+
+        // ---- Wiggle GaussianLocationScaleWiggleFamily --------------------
+        {
+            let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
+            let p_mu = states[GaussianLocationScaleWiggleFamily::BLOCK_MU].beta.len();
+            let p_ls = states[GaussianLocationScaleWiggleFamily::BLOCK_LOG_SIGMA]
+                .beta
+                .len();
+            let p_w = states[GaussianLocationScaleWiggleFamily::BLOCK_WIGGLE]
+                .beta
+                .len();
+            let total = p_mu + p_ls + p_w;
+            // Block column offsets in the flattened joint coefficient space.
+            let mu0 = 0usize;
+            let ls0 = p_mu;
+            let ls1 = p_mu + p_ls;
+            let w0 = p_mu + p_ls;
+            let w1 = total;
+
+            // ψ design-Jacobian on the MEAN (μ) block (psi_index 0). The wiggle
+            // block does not carry an independent ψ axis here; a nonzero mean ψ
+            // is enough to exercise BOTH mean⊥scale crosses (coeff_ml = 2κmD and
+            // l = 2κm) and their derivatives on the old code.
+            let x_mu_psi = Array2::from_shape_fn((family.y.len(), p_mu), |(i, j)| {
+                0.18 + 0.09 * ((i as f64) * 0.41 + (j as f64) * 0.29).sin()
+            });
+            let x_mu_psi_psi = Array2::from_shape_fn((family.y.len(), p_mu), |(i, j)| {
+                0.06 * ((i as f64) * 0.17 + (j as f64) * 0.31).cos()
+            });
+            let derivative_blocks = vec![
+                vec![CustomFamilyBlockPsiDerivative {
+                    penalty_index: None,
+                    x_psi: x_mu_psi,
+                    s_psi: Array2::zeros((p_mu, p_mu)),
+                    s_psi_components: None,
+                    s_psi_penalty_components: None,
+                    x_psi_psi: Some(vec![x_mu_psi_psi]),
+                    s_psi_psi: Some(vec![Array2::zeros((p_mu, p_mu))]),
+                    s_psi_psi_components: None,
+                    s_psi_psi_penalty_components: None,
+                    implicit_operator: None,
+                    implicit_axis: 0,
+                    implicit_group_id: None,
+                }],
+                Vec::new(),
+                Vec::new(),
+            ];
+
+            // Assert BOTH mean⊥scale cross blocks are Fisher-0 on the ψ joint
+            // Hessian: μ↔logσ AND wiggle↔logσ. Leave the within-mean (μ↔wiggle)
+            // and within-scale (logσ↔logσ) blocks unasserted (genuinely
+            // nonzero).
+            let assert_wiggle_crosses_zero = |h: &Array2<f64>, label: &str| {
+                let c_ml = block_max_abs(h, mu0, ls0, ls0, ls1);
+                let c_wl = block_max_abs(h, w0, w1, ls0, ls1);
+                assert!(
+                    c_ml <= CROSS_TOL,
+                    "#684 (wiggle {label}): μ↔logσ cross block must be Fisher-0 \
+                     (observed 2κmD drift), got max |.|={c_ml:.3e}"
+                );
+                assert!(
+                    c_wl <= CROSS_TOL,
+                    "#684 (wiggle {label}): wiggle↔logσ cross block must be Fisher-0 \
+                     (observed 2κm drift; the wiggle is mean-side), got max |.|={c_wl:.3e}"
+                );
+            };
+
+            // Dense Fisher joint Hessian sanity: both mean⊥scale crosses zero.
+            let dense_h = family
+                .exact_newton_joint_hessian(&states)
+                .expect("wiggle dense joint Hessian build")
+                .expect("wiggle dense joint Hessian present");
+            assert_eq!(dense_h.dim(), (total, total));
+            assert_wiggle_crosses_zero(&dense_h, "dense Fisher");
+
+            // 1st-order ψ.
+            let psi = family
+                .exact_newton_joint_psi_terms(&states, &specs, &derivative_blocks, 0)
+                .expect("wiggle psi terms call")
+                .expect("wiggle psi terms present");
+            let h_psi = materialize(&psi.hessian_psi, &psi.hessian_psi_operator, total);
+            assert_wiggle_crosses_zero(&h_psi, "1st-order ψ");
+
+            // 2nd-order ψ.
+            let psi2 = family
+                .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
+                .expect("wiggle psi 2nd-order call")
+                .expect("wiggle psi 2nd-order present");
+            let h_psi2 =
+                materialize(&psi2.hessian_psi_psi, &psi2.hessian_psi_psi_operator, total);
+            assert_wiggle_crosses_zero(&h_psi2, "2nd-order ψ");
+
+            // Mixed β·ψ.
+            let d_beta = Array1::from_shape_fn(total, |i| 0.04 + 0.1 * ((i + 1) as f64).cos());
+            let mixed = family
+                .exact_newton_joint_psihessian_directional_derivative(
+                    &states,
+                    &specs,
+                    &derivative_blocks,
+                    0,
+                    &d_beta,
+                )
+                .expect("wiggle psi mixed-drift call")
+                .expect("wiggle psi mixed-drift present");
+            assert_eq!(mixed.dim(), (total, total));
+            assert_wiggle_crosses_zero(&mixed, "mixed β·ψ");
+        }
+    }
 }
