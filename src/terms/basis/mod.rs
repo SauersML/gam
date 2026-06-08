@@ -47,6 +47,12 @@ const KNOT_SPAN_DEGENERACY_FLOOR: f64 = 1e-12;
 /// this the point is treated as on-boundary and no extrapolation term is added.
 const BSPLINE_EXTRAPOLATION_THRESHOLD: f64 = 1e-12;
 
+/// Default number of rows in each block the streaming design evaluators
+/// materialize at a time when the caller does not supply an explicit chunk
+/// size. Bounds the transient working set (one `chunk_rows × p` dense block)
+/// while staying large enough to amortize per-chunk kernel-column setup.
+const DEFAULT_STREAMING_CHUNK_ROWS: usize = 2048;
+
 /// Wrapper to send a raw pointer across thread boundaries for parallel buffer fills.
 /// SAFETY: every `SendPtr` value must be built from live, properly aligned `f64`
 /// storage whose mutable borrow is held until all worker threads finish; callers
@@ -3933,7 +3939,7 @@ impl StreamingMaternEvaluator {
             metric_weights: Arc::from(metric_weights),
             ident_transform,
             include_intercept,
-            chunk_size: chunk_size.unwrap_or(2048).max(1),
+            chunk_size: chunk_size.unwrap_or(DEFAULT_STREAMING_CHUNK_ROWS).max(1),
             total_cols: kernel_cols + usize::from(include_intercept),
         })
     }
@@ -4125,7 +4131,7 @@ impl StreamingSphereEvaluator {
             cos_lat_c: Arc::from(cos_lat_c),
             sin_lon_c: Arc::from(sin_lon_c),
             cos_lon_c: Arc::from(cos_lon_c),
-            chunk_size: chunk_size.unwrap_or(2048).max(1),
+            chunk_size: chunk_size.unwrap_or(DEFAULT_STREAMING_CHUNK_ROWS).max(1),
             total_cols,
         })
     }
@@ -4315,7 +4321,7 @@ impl StreamingBSplineEvaluator {
             periodic,
             total_cols: transform.as_ref().map_or(raw_cols, |z| z.ncols()),
             transform,
-            chunk_size: chunk_size.unwrap_or(2048).max(1),
+            chunk_size: chunk_size.unwrap_or(DEFAULT_STREAMING_CHUNK_ROWS).max(1),
         })
     }
 
@@ -8675,7 +8681,7 @@ fn build_streaming_bspline_design_and_candidates(
     mut penalty_mats: Vec<Array2<f64>>,
     chunk_size: Option<usize>,
 ) -> Result<(DesignMatrix, Vec<PenaltyCandidate>, Option<Array2<f64>>), BasisError> {
-    let chunk = chunk_size.unwrap_or(2048).max(1);
+    let chunk = chunk_size.unwrap_or(DEFAULT_STREAMING_CHUNK_ROWS).max(1);
     // Boundary conditions are emitted by the smooth-level paired
     // linear-constraint path; the basis builder no longer bakes them, so this
     // streaming path starts from no boundary transform.
@@ -26013,13 +26019,12 @@ pub fn evaluate_bspline_derivative_scalar_into(
             0.0
         };
 
-        let right_term = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR
-            && (i + 1) < num_basis_lower
-        {
-            lower_basis[i + 1] / denom_right
-        } else {
-            0.0
-        };
+        let right_term =
+            if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR && (i + 1) < num_basis_lower {
+                lower_basis[i + 1] / denom_right
+            } else {
+                0.0
+            };
 
         out[i] = k * (left_term - right_term);
     }
