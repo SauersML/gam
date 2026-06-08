@@ -3230,34 +3230,42 @@ mod tests {
         assert!(none.threshold.is_infinite());
     }
 
+    /// Synthetic block-excess oracle: an anharmonicity `ΔF(t) = a·Σ_k t_k⁴`
+    /// whose per-direction strength carries unit ρ-sensitivity, so
+    /// `∂ΔF/∂ρ_k = a·t_k⁴`. `a = 0` is a pure Gaussian block (exactly zero
+    /// excess and zero ρ-gradient — the consistency anchor); `a > 0` is the
+    /// quartic correction oracle the importance sampler is checked against.
+    struct AnharmonicBlock {
+        lambdas: Array1<f64>,
+        a: f64,
+    }
+    impl super::BlockExcessTarget for AnharmonicBlock {
+        fn block_dim(&self) -> usize {
+            self.lambdas.len()
+        }
+        fn rho_dim(&self) -> usize {
+            self.lambdas.len()
+        }
+        fn block_curvatures(&self) -> &Array1<f64> {
+            &self.lambdas
+        }
+        fn excess(&self, t: &Array1<f64>) -> f64 {
+            self.a * t.iter().map(|&x| x.powi(4)).sum::<f64>()
+        }
+        fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+            t.mapv(|x| self.a * x.powi(4))
+        }
+    }
+
     #[test]
     fn block_sampled_marginal_is_zero_for_gaussian_block() {
         // A purely Gaussian block has ΔF ≡ 0, so the sampled correction (the
         // log-ratio of true to Laplace block free energy) must be exactly 0,
         // with a zero ρ-gradient. This is the consistency anchor: where the
         // Gaussian summary holds, the fallback is a no-op.
-        struct GaussianBlock {
-            lambdas: Array1<f64>,
-        }
-        impl super::BlockExcessTarget for GaussianBlock {
-            fn block_dim(&self) -> usize {
-                self.lambdas.len()
-            }
-            fn rho_dim(&self) -> usize {
-                2
-            }
-            fn block_curvatures(&self) -> &Array1<f64> {
-                &self.lambdas
-            }
-            fn excess(&self, t: &Array1<f64>) -> f64 {
-                0.0 * t.sum()
-            }
-            fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
-                Array1::from_elem(2, 0.0 * t.sum())
-            }
-        }
-        let target = GaussianBlock {
+        let target = AnharmonicBlock {
             lambdas: array![2.0, 0.5],
+            a: 0.0,
         };
         let out = super::block_sampled_marginal_correction(&target).expect("correction");
         assert!(out.value.abs() < 1e-12, "Gaussian block value {}", out.value);
@@ -3275,28 +3283,7 @@ mod tests {
         // true block mass *smaller* than the Gaussian's).
         let lambda = 3.0_f64;
         let a = 0.05_f64;
-        struct Quartic {
-            lambdas: Array1<f64>,
-            a: f64,
-        }
-        impl super::BlockExcessTarget for Quartic {
-            fn block_dim(&self) -> usize {
-                1
-            }
-            fn rho_dim(&self) -> usize {
-                1
-            }
-            fn block_curvatures(&self) -> &Array1<f64> {
-                &self.lambdas
-            }
-            fn excess(&self, t: &Array1<f64>) -> f64 {
-                self.a * t[0].powi(4)
-            }
-            fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
-                Array1::from_elem(1, 0.0 * t.sum())
-            }
-        }
-        let target = Quartic {
+        let target = AnharmonicBlock {
             lambdas: array![lambda],
             a,
         };
