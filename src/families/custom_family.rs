@@ -3520,20 +3520,6 @@ pub struct BlockwiseFitOptions {
 
 pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
 
-/// Default inner (coefficient-space) convergence tolerance: relative KKT /
-/// objective slack at which the inner Newton/PIRLS solve is declared
-/// stationary. Tighter than the outer tolerance so the REML/LAML derivative
-/// path always sees a fully converged inner mode.
-const DEFAULT_CUSTOM_FAMILY_INNER_TOL: f64 = 1e-6;
-/// Default outer (smoothing-parameter) convergence tolerance: relative change
-/// in the REML/LAML criterion / its gradient below which the outer ρ optimizer
-/// stops.
-const DEFAULT_CUSTOM_FAMILY_OUTER_TOL: f64 = 1e-5;
-/// Default cap on outer (smoothing-parameter) iterations. The outer loop is
-/// the expensive nested level; this bounds total cost while the outer-tol
-/// certificate exits earlier for well-conditioned fits.
-const DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER: usize = 60;
-
 impl Default for BlockwiseFitOptions {
     fn default() -> Self {
         Self {
@@ -3547,9 +3533,9 @@ impl Default for BlockwiseFitOptions {
             // KKT/objective certificates to exit early for well-conditioned
             // Gaussian, logistic, and small-n fits.
             inner_max_cycles: DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
-            inner_tol: DEFAULT_CUSTOM_FAMILY_INNER_TOL,
-            outer_max_iter: DEFAULT_CUSTOM_FAMILY_OUTER_MAX_ITER,
-            outer_tol: DEFAULT_CUSTOM_FAMILY_OUTER_TOL,
+            inner_tol: 1e-6,
+            outer_max_iter: 60,
+            outer_tol: 1e-5,
             minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             // `ridge_floor` is an ExplicitPrior in the canonical
             // stabilization ledger taxonomy (`StabilizationKind::ExplicitPrior`):
@@ -9237,17 +9223,14 @@ impl ParameterBlockUpdater for DiagonalBlockUpdater<'_> {
         let w_clamped = floor_positiveworking_weights(self.working_weights, ctx.options.minweight);
 
         if let Some(constraints) = ctx.linear_constraints {
-            check_linear_feasibility(
-                &ctx.states[ctx.block_idx].beta,
-                constraints,
-                LINEAR_FEASIBILITY_TOL,
-            )
-            .map_err(|e| {
-                format!(
-                    "block {} ({}) constrained diagonal solve: {e}",
-                    ctx.block_idx, ctx.spec.name
-                )
-            })?;
+            check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
+                |e| {
+                    format!(
+                        "block {} ({}) constrained diagonal solve: {e}",
+                        ctx.block_idx, ctx.spec.name
+                    )
+                },
+            )?;
             with_block_geometry(ctx.family, ctx.states, ctx.spec, ctx.block_idx, |x, off| {
                 let mut y_star = self.working_response.clone();
                 y_star -= off;
@@ -9357,17 +9340,14 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         stabilize_exact_newton_lhs_in_place(ctx.family, &mut lhs_dense, ctx.options.ridge_floor);
 
         if let Some(constraints) = ctx.linear_constraints {
-            check_linear_feasibility(
-                &ctx.states[ctx.block_idx].beta,
-                constraints,
-                LINEAR_FEASIBILITY_TOL,
-            )
-            .map_err(|e| {
-                format!(
-                    "block {} ({}) constrained exact-newton solve: {e}",
-                    ctx.block_idx, ctx.spec.name
-                )
-            })?;
+            check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints, 1e-8).map_err(
+                |e| {
+                    format!(
+                        "block {} ({}) constrained exact-newton solve: {e}",
+                        ctx.block_idx, ctx.spec.name
+                    )
+                },
+            )?;
             let lower_bounds = extract_simple_lower_bounds(constraints, p).map_err(|e| {
                 format!(
                     "block {} ({}) constrained exact-newton solve: {e}",
@@ -9528,12 +9508,6 @@ impl BlockWorkingSet {
         }
     }
 }
-
-/// Linear inequality feasibility tolerance: an iterate is treated as feasible
-/// when the worst `(b - Aβ)` violation is within this slack. Sized to absorb
-/// round-off in the constraint product `Aβ` for well-scaled designs while
-/// still rejecting genuine boundary crossings.
-const LINEAR_FEASIBILITY_TOL: f64 = 1e-8;
 
 fn check_linear_feasibility(
     beta: &Array1<f64>,
@@ -12324,16 +12298,6 @@ struct JointTrustRegionUpdate {
     decision: JointTrustRegionDecision,
 }
 
-/// Smallest admissible joint trust radius. Below this the metric step is at
-/// the floating-point floor and is reported as `RejectFloor` (no descent
-/// direction exists at this scale); it is never allowed to reach 0 so the
-/// trust-region recurrence cannot get stuck multiplying zero.
-const JOINT_TRUST_RADIUS_FLOOR: f64 = 1.0e-12;
-/// Largest admissible joint trust radius. Caps unbounded growth at boundary
-/// accepts so a single over-optimistic expansion cannot blow the step past
-/// the region where the local quadratic model is trustworthy.
-const JOINT_TRUST_RADIUS_CEIL: f64 = 1.0e6;
-
 fn update_joint_trust_region_radius(
     old_radius: f64,
     step_norm: f64,
@@ -12392,14 +12356,14 @@ fn update_joint_trust_region_radius(
         decision = JointTrustRegionDecision::HoldModerate;
     }
     if !radius.is_finite() || radius <= 0.0 {
-        radius = JOINT_TRUST_RADIUS_FLOOR;
+        radius = 1.0e-12;
     }
-    let clamped_radius = radius.clamp(JOINT_TRUST_RADIUS_FLOOR, JOINT_TRUST_RADIUS_CEIL);
+    let clamped_radius = radius.clamp(1.0e-12, 1.0e6);
     // Promote to RejectFloor if we landed at the absolute floor.  The
     // base classification is preserved up to this final clamp; the
     // floor classification is just a stronger label that captures the
     // "no descent direction exists at this radius" signal.
-    let final_decision = if clamped_radius <= JOINT_TRUST_RADIUS_FLOOR + f64::EPSILON
+    let final_decision = if clamped_radius <= 1.0e-12 + f64::EPSILON
         && matches!(
             decision,
             JointTrustRegionDecision::ShrinkOnRejection
@@ -12417,17 +12381,8 @@ fn update_joint_trust_region_radius(
     }
 }
 
-/// Absolute round-off slack on the augmented-objective accept test in the
-/// coefficient-space backtracking line searches. A trial step is accepted when
-/// its objective is no worse than the incumbent by more than this slack, so a
-/// numerically neutral (converged) step at a flat optimum is not false-rejected
-/// into a trust-radius collapse. Also the absolute floor of the scale-aware
-/// [`joint_objective_roundoff_slack`].
-const LINE_SEARCH_OBJECTIVE_SLACK: f64 = 1e-10;
-
 fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f64 {
-    (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs()))
-        .max(LINE_SEARCH_OBJECTIVE_SLACK)
+    (64.0 * f64::EPSILON * (1.0 + old_objective.abs() + trial_objective.abs())).max(1.0e-10)
 }
 
 // True iff the line search detected a noise-level realized reduction (i.e.
@@ -12536,7 +12491,7 @@ fn shrink_active_joint_block_trust_radii(
         .any(|(radius, step_norm)| joint_block_step_hit_trust_boundary(*step_norm, *radius));
     for (radius, step_norm) in block_radii.iter_mut().zip(block_step_norms) {
         if !any_boundary_block || joint_block_step_hit_trust_boundary(*step_norm, *radius) {
-            *radius = (*radius * factor).clamp(JOINT_TRUST_RADIUS_FLOOR, JOINT_TRUST_RADIUS_CEIL);
+            *radius = (*radius * factor).clamp(1.0e-12, 1.0e6);
         }
     }
     block_radii.iter().copied().fold(0.0_f64, f64::max)
@@ -14696,7 +14651,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             lhs[[d, d]] += joint_solver_diagonal_ridge - trace_diagonal_ridge;
                         }
                     }
-                    check_linear_feasibility(&beta_joint, constraints, LINEAR_FEASIBILITY_TOL)
+                    check_linear_feasibility(&beta_joint, constraints, 1e-8)
                         .map_err(|e| format!("joint Newton constrained solve: {e}"))?;
                     let warm_joint_active =
                         flatten_joint_active_set(&cached_active_sets, &block_constraints);
@@ -15484,10 +15439,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // collapses, and the inner exits non-converged at cycle ~2 (seed
                 // rejected pre-solver → hard raise, β pinned). Subtract the trial
                 // penalty so the threshold is the NLL the trial must beat.
-                let line_search_options = coefficient_line_search_options(
-                    options,
-                    old_objective + LINE_SEARCH_OBJECTIVE_SLACK - trial_penalty,
-                );
+                let line_search_options =
+                    coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
                     specs,
@@ -17396,7 +17349,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 let trial_penalty = current_penalty - old_block_penalty + trial_block_penalty;
                 let line_search_options = coefficient_line_search_options(
                     options,
-                    objective_cycle_prev - trial_penalty + LINE_SEARCH_OBJECTIVE_SLACK,
+                    objective_cycle_prev - trial_penalty + 1e-10,
                 );
                 let trial_ll =
                     match family.log_likelihood_only_with_options(&states, &line_search_options) {
@@ -17408,9 +17361,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         }
                     };
                 let trialobjective = -trial_ll + trial_penalty;
-                if trialobjective.is_finite()
-                    && trialobjective <= objective_cycle_prev + LINE_SEARCH_OBJECTIVE_SLACK
-                {
+                if trialobjective.is_finite() && trialobjective <= objective_cycle_prev + 1e-10 {
                     objective_cycle_prev = trialobjective;
                     current_penalty = trial_penalty;
                     accepted = true;
@@ -17562,7 +17513,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                                 current_penalty - old_block_penalty + trial_block_penalty;
                             let line_search_options = coefficient_line_search_options(
                                 options,
-                                objective_cycle_prev - trial_penalty + LINE_SEARCH_OBJECTIVE_SLACK,
+                                objective_cycle_prev - trial_penalty + 1e-10,
                             );
                             let trial_ll = match family
                                 .log_likelihood_only_with_options(&states, &line_search_options)
@@ -17576,7 +17527,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             };
                             let trialobjective = -trial_ll + trial_penalty;
                             if trialobjective.is_finite()
-                                && trialobjective <= objective_cycle_prev + LINE_SEARCH_OBJECTIVE_SLACK
+                                && trialobjective <= objective_cycle_prev + 1e-10
                             {
                                 objective_cycle_prev = trialobjective;
                                 current_penalty = trial_penalty;

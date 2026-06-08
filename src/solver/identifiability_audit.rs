@@ -105,19 +105,6 @@ const DEFAULT_GAUGE_PRIORITY: u8 = 100;
 /// used before the leverage-scaled rewrite, restored as the report-band floor.
 const REPORT_FLOOR_NEAR_EXACT: f64 = 0.95;
 
-/// Absolute alias-boundary cosine: the ceiling on both the report band and the
-/// halt threshold, and the value returned directly when the per-pair null has
-/// zero width. A cosine at or above this is a floating-point near-exact alias
-/// (two basis directions that coincide to working precision) that must always
-/// fire regardless of the leverage-scaled K·σ band.
-const ALIAS_BOUNDARY_COSINE: f64 = 0.999;
-
-/// Family-wise false-positive rate `α` controlling the report-band K-multiplier
-/// `K = √(2·ln(2M/α))` over `M` candidate pairs. At `0.05` the band admits a
-/// pair only when its cosine sits well outside the multiple-comparison-adjusted
-/// null, keeping the audit's aliasing reports specific.
-const REPORT_BAND_FALSE_POSITIVE_RATE: f64 = 0.05;
-
 /// Estimated audit work (rows × blocks, or rows × total columns for the
 /// pairwise sweep) above which a periodic progress ticker is attached. Below
 /// this the audit completes fast enough that progress output is noise.
@@ -414,6 +401,9 @@ fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
 /// K ≈ 4.3, K·σ ≈ 0.43 — but the band must still report a near-exact alias,
 /// so the effective report threshold never drops below the floor.
 fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 {
+    const ALIAS_BOUNDARY_COSINE: f64 = 0.999;
+    const REPORT_BAND_FALSE_POSITIVE_RATE: f64 = 0.05;
+
     let sigma = pair_null_sigma(s2_a, s2_b, n);
     if sigma <= 0.0 {
         return REPORT_FLOOR_NEAR_EXACT;
@@ -451,6 +441,8 @@ fn pair_report_threshold(s2_a: f64, s2_b: f64, n: usize, m_pairs: usize) -> f64 
 /// (cos = 0.9999…) always fire the halt.  The floor 0.05 prevents
 /// pathological over-sensitivity on very long columns.
 fn pair_halt_threshold(s2_a: f64, s2_b: f64, n: usize) -> f64 {
+    const ALIAS_BOUNDARY_COSINE: f64 = 0.999;
+
     let sigma = pair_null_sigma(s2_a, s2_b, n);
     if sigma <= 0.0 {
         return ALIAS_BOUNDARY_COSINE;
