@@ -1129,6 +1129,13 @@ pub(crate) const HVP_ROWS_PER_CTA: u32 = 256;
 #[cfg(target_os = "linux")]
 pub(crate) const HVP_THREADS: u32 = 128;
 
+/// `blockDim.x` for the partial-sum reduction kernels (one element per thread,
+/// grid-strided over the `p_total`/`rhs_elems` partial buffer). A full warp
+/// multiple that keeps the reduce launch occupancy-bound rather than tail-bound
+/// for the typical biobank `p_total`.
+#[cfg(target_os = "linux")]
+const REDUCTION_THREADS: u32 = 256;
+
 /// Maximum RHS columns fused into one row-primary HVP launch. The matching
 /// CUDA source uses fixed shared arrays sized as
 /// `BMS_FLEX_ROW_HVP_MAX_RHS * MAX_R`; increasing this requires updating the
@@ -2382,7 +2389,7 @@ fn run_bms_flex_row_partial_reduce(
         reason: format!("bms_flex_row {ctx} partial launch: {err}"),
     })?;
 
-    let red_threads: u32 = 256;
+    let red_threads: u32 = REDUCTION_THREADS;
     let red_blocks: u32 = ((p_total as u32) + red_threads - 1) / red_threads;
     let cfg_red = LaunchConfig {
         grid_dim: (red_blocks, 1, 1),
@@ -2637,7 +2644,7 @@ fn run_bms_flex_row_multi_partial_reduce(
         reason: format!("bms_flex_row {ctx} multi partial launch: {err}"),
     })?;
 
-    let red_threads: u32 = 256;
+    let red_threads: u32 = REDUCTION_THREADS;
     let red_blocks: u32 = ((rhs_elems as u32) + red_threads - 1) / red_threads;
     let cfg_red = LaunchConfig {
         grid_dim: (red_blocks, 1, 1),
@@ -2926,7 +2933,7 @@ pub fn launch_bms_flex_row_dense_block(
         reason: format!("bms_flex_row dense_block partial launch: {err}"),
     })?;
 
-    let red_threads: u32 = 256;
+    let red_threads: u32 = REDUCTION_THREADS;
     let red_blocks: u32 = ((pp as u32) + red_threads - 1) / red_threads;
     let cfg_red = LaunchConfig {
         grid_dim: (red_blocks, 1, 1),
