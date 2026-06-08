@@ -11,7 +11,7 @@ use crate::custom_family::{
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyChannelHessian,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
-    build_block_spatial_psi_derivatives, evaluate_custom_family_joint_hyper,
+    evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
     resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
     shared_dense_arc, weighted_crossprod_psi_maps,
@@ -30,6 +30,7 @@ use crate::families::sigma_link::{
     exp_sigma_derivs_up_to_third, exp_sigma_from_eta_scalar, exp_sigma_jet1_scalar,
     logb_sigma_from_eta_scalar, logb_sigma_jet1_scalar, safe_exp,
 };
+use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::families::wiggle::{
     SelectedWiggleBasis, WiggleBlockConfig, buildwiggle_block_input_from_knots,
     initialize_monotone_wiggle_knots_from_seed, initializewiggle_knots_from_seed,

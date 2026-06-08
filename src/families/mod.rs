@@ -27,6 +27,7 @@ pub(crate) mod row_kernel;
 pub mod royston_parmar;
 pub mod scale_design;
 pub mod sigma_link;
+pub mod spatial_psi_bridge;
 pub mod strategy;
 pub mod survival;
 pub mod survival_construction;

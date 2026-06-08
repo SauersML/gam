@@ -727,7 +727,7 @@ fn marginal_penalties_with_influence_ridge(
     let mut penalties: Vec<PenaltyMatrix> = design
         .penalties
         .iter()
-        .map(|bp| PenaltyMatrix::from_blockwise(bp.clone(), total_dim))
+        .map(|bp| bp.to_penalty_matrix(total_dim))
         .collect();
     let mut nullspace_dims = design.nullspace_dims.clone();
     let mut log_lambdas = rho_marginal.to_vec();

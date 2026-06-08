@@ -3775,7 +3775,7 @@ struct SurvivalTimeVaryingPsiTransform {
     time_basis_derivative_exit: Array2<f64>,
 }
 
-impl crate::custom_family::SpatialPsiBlockTransform for SurvivalTimeVaryingPsiTransform {
+impl crate::families::spatial_psi_bridge::SpatialPsiBlockTransform for SurvivalTimeVaryingPsiTransform {
     fn transform_operator(
         &self,
         op: Arc<dyn crate::custom_family::CustomFamilyPsiDerivativeOperator>,
@@ -3826,7 +3826,11 @@ fn build_survival_covariate_block_psi_derivatives(
 ) -> Result<Option<Vec<CustomFamilyBlockPsiDerivative>>, String> {
     match template {
         SurvivalCovariateTermBlockTemplate::Static => {
-            crate::custom_family::build_block_spatial_psi_derivatives(data, resolvedspec, design)
+            crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives(
+                data,
+                resolvedspec,
+                design,
+            )
         }
         SurvivalCovariateTermBlockTemplate::TimeVarying {
             time_basis_entry,
@@ -3839,7 +3843,7 @@ fn build_survival_covariate_block_psi_derivatives(
                 time_basis_exit: time_basis_exit.clone(),
                 time_basis_derivative_exit: time_basis_derivative_exit.clone(),
             };
-            crate::custom_family::build_block_spatial_psi_derivatives_with_transform(
+            crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives_with_transform(
                 data,
                 resolvedspec,
                 design,
@@ -12101,7 +12105,7 @@ mod tests {
             .expect("rebuild frozen spatial design");
 
         // Built-in / canonical path: the shared exact-derivative engine.
-        let shared = crate::custom_family::build_block_spatial_psi_derivatives(
+        let shared = crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives(
             data.view(),
             &resolvedspec,
             &resolved_design,
