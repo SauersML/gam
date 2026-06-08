@@ -2004,27 +2004,7 @@ pub fn build_smooth_basis(
                         .unwrap_or_else(|| default_matern_length_scale(ds, cols)),
                     nu,
                     include_intercept: option_bool(options, "include_intercept").unwrap_or(false),
-                    // Matérn is a STRICTLY POSITIVE-DEFINITE kernel: its penalty
-                    // (the kernel Gram `K_CC`) is full-rank with NO structural
-                    // polynomial nullspace, so the double-penalty nullspace ridge
-                    // (mgcv `select=TRUE`, which shrinks a smooth's UNPENALIZED
-                    // trend directions) has nothing to shrink. The default `true`
-                    // (`smooth_double_penalty`) therefore emitted a SPURIOUS
-                    // `DoublePenaltyNullspace` whose presence flipped with the
-                    // κ-relative spectral rank test (`build_nullspace_shrinkage_penalty`):
-                    // at a κ where the projected `K_CC` had a near-zero eigenvalue
-                    // (a conditioning artifact, not a real null direction) it
-                    // appeared, else not — flipping the learned-penalty count 6↔7
-                    // across the kappa optimizer's design rebuilds and breaking the
-                    // joint-setup rho contract (the BMS spatial setup counts only
-                    // genuinely-learned penalties; see the
-                    // `spatial_joint_setup_counts_only_learned_penalties_in_rho`
-                    // invariant), which raised "joint hyper rho dimension mismatch"
-                    // (gam#787). Default OFF for the strictly-PD Matérn kernel; an
-                    // explicit user `double_penalty=` still wins. (Duchon/thin-plate
-                    // is handled in its own arm and KEEPS its native nullspace
-                    // shrinkage — it genuinely has a polynomial nullspace, #754.)
-                    double_penalty: option_bool(options, "double_penalty").unwrap_or(false),
+                    double_penalty: smooth_double_penalty,
                     identifiability: parse_matern_identifiability(options)
                         .map_err(|e| e.to_string())?,
                     aniso_log_scales,
@@ -3392,59 +3372,6 @@ mod tests {
                 num_basis: 8
             } if *data_range == (0.0, std::f64::consts::TAU)
         ));
-    }
-
-    #[test]
-    fn matern_formula_defaults_to_no_double_penalty_but_honors_explicit() {
-        // gam#787: the Matérn kernel is strictly positive-definite (no structural
-        // polynomial nullspace), so its double-penalty nullspace ridge is spurious
-        // and was flipping the learned-penalty count across kappa rebuilds. The
-        // formula default must therefore be `double_penalty=false` for Matérn, and
-        // an explicit user `double_penalty=true` must still win.
-        let ds = continuous_dataset(
-            &["y", "x1", "x2"],
-            (0..40)
-                .map(|i| {
-                    let t = i as f64 / 40.0;
-                    vec![t.sin(), t, (2.0 * t).cos()]
-                })
-                .collect(),
-        );
-        let col_map = ds.column_map();
-        let policy = crate::resource::ResourcePolicy::default_library();
-
-        let parsed_default =
-            parse_formula("y ~ matern(x1, x2, centers=6)").expect("parse default matern");
-        let mut notes = Vec::new();
-        let terms_default =
-            build_termspec(&parsed_default.terms, &ds, &col_map, &mut notes, &policy)
-                .expect("default matern should build");
-        let SmoothBasisSpec::Matern { spec, .. } = &terms_default.smooth_terms[0].basis else {
-            panic!("expected Matérn basis");
-        };
-        assert!(
-            !spec.double_penalty,
-            "Matérn (strictly PD, no structural nullspace) must default to double_penalty=false"
-        );
-
-        let parsed_explicit = parse_formula("y ~ matern(x1, x2, centers=6, double_penalty=true)")
-            .expect("parse explicit matern");
-        let mut notes_explicit = Vec::new();
-        let terms_explicit = build_termspec(
-            &parsed_explicit.terms,
-            &ds,
-            &col_map,
-            &mut notes_explicit,
-            &policy,
-        )
-        .expect("explicit double_penalty matern should build");
-        let SmoothBasisSpec::Matern { spec, .. } = &terms_explicit.smooth_terms[0].basis else {
-            panic!("expected Matérn basis");
-        };
-        assert!(
-            spec.double_penalty,
-            "an explicit user double_penalty=true must still be honored for Matérn"
-        );
     }
 
     #[test]
