@@ -77,6 +77,10 @@ where
 {
     const LM_MAX_LAMBDA: f64 = 1e12;
     const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
+    // Minimum reduced-system dimension K at which building the GPU Y_i matvec
+    // backend for matrix-free InexactPCG pays for the device round-trip; below
+    // this the CPU-driven PCG matvec wins (issue #288 Part B).
+    const ARROW_GPU_MATVEC_MIN_K: usize = 5000;
 
     // ── Anderson acceleration of depth 1 (AA(1)) for the Fisher fixed-point ──
     // PIRLS normally uses observed-information Newton (already super-linear, no
@@ -789,7 +793,7 @@ where
                                 let has_matvec = arrow_system.hbb_matvec.is_some()
                                     || arrow_system.htbeta_matvec.is_some();
                                 if has_matvec
-                                    && arrow_system.k >= 5000
+                                    && arrow_system.k >= ARROW_GPU_MATVEC_MIN_K
                                     && solve_options.mode
                                         == crate::solver::arrow_schur::ArrowSolverMode::InexactPCG
                                 {
@@ -1738,12 +1742,13 @@ where
         }
 
         // ── Timing-driven adaptive early-exit ──────────────────────────────
-        // Update the short EMA of per-iter wall-clock.  α = 0.3 gives a
-        // memory of roughly 3 iters.
+        // Update the short EMA of per-iter wall-clock. The smoothing factor α
+        // gives a memory of roughly 1/α ≈ 3 iters.
+        const ITER_TIME_EMA_ALPHA: f64 = 0.3;
         let iter_secs = iter_elapsed.as_secs_f64();
         let ema = match ema_iter_elapsed_secs {
             None => iter_secs,
-            Some(prev) => 0.3 * iter_secs + 0.7 * prev,
+            Some(prev) => ITER_TIME_EMA_ALPHA * iter_secs + (1.0 - ITER_TIME_EMA_ALPHA) * prev,
         };
         ema_iter_elapsed_secs = Some(ema);
 
@@ -1752,21 +1757,25 @@ where
         // above have NOT already exited (we are still in the loop).
         //
         // Constants (baked in, no CLI flags):
-        //   ε_t  = 0.25  — iter must be < 25 % of the EMA to be "trivially cheap"
-        //   10 × hard tol for the relaxed deviance and grad-ratio bands
+        //   the iter must run in under this fraction of the EMA to be
+        //   "trivially cheap", and the relaxed deviance / grad-ratio bands sit
+        //   at this multiple of the hard convergence tolerance.
+        const TRIVIALLY_CHEAP_ITER_EMA_FRACTION: f64 = 0.25;
+        const RELAXED_CONVERGENCE_BAND_MULTIPLE: f64 = 10.0;
         if iter >= 2 {
             // (a) Iteration has become trivially cheap: the solver is coasting.
-            let iter_cheap = ema > 0.0 && iter_secs < 0.25 * ema;
+            let iter_cheap = ema > 0.0 && iter_secs < TRIVIALLY_CHEAP_ITER_EMA_FRACTION * ema;
 
             // (b) Deviance change is negligible relative to |F|.
             let f_abs = current_penalized.abs().max(1.0);
-            let deviance_ok =
-                (last_deviance_change / f_abs).abs() < options.convergence_tolerance * 10.0;
+            let deviance_ok = (last_deviance_change / f_abs).abs()
+                < options.convergence_tolerance * RELAXED_CONVERGENCE_BAND_MULTIPLE;
 
             // (c) Gradient has collapsed relative to its initial value.
             let grad_ok = match initial_gradient_norm {
                 Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
-                    lastgradient_norm / g0 < options.convergence_tolerance * 10.0
+                    lastgradient_norm / g0
+                        < options.convergence_tolerance * RELAXED_CONVERGENCE_BAND_MULTIPLE
                 }
                 _ => false,
             };
