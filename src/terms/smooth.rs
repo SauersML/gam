@@ -2853,7 +2853,7 @@ impl SpatialLogKappaCoords {
             log::info!(
                 "[spatial-kappa] projected {n_projected}/{} ψ seed coords into data-derived bounds \
                  (worst excess={worst_delta:.3} log units); user length_scale falls outside \
-                 [2/r_max, 1e2/r_min] geometry window",
+                 [{KERNEL_RANGE_MIN_DIAMETER_FRACTION}/r_max, {KERNEL_RANGE_MAX_SPACING_MULTIPLE}/r_min] geometry window",
                 self.values.len()
             );
         }
@@ -3035,6 +3035,17 @@ pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize)
 ///   κ ∈ [2 / r_max, 1e2 / r_min]
 /// where (r_min, r_max) are pairwise-distance extrema of the term's resolved
 /// centers (post-fit) or the standardized feature data columns (pre-fit).
+/// Lower edge of the data-derived kernel-range window, as a fraction of the
+/// maximum pairwise distance `r_max`: length scales below `2/r_max` resolve
+/// structure finer than the closest center pair, so the kernel range floor is
+/// set at twice the maximum spacing.
+const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
+/// Upper edge of the data-derived kernel-range window, as a multiple of the
+/// minimum pairwise distance `r_min`: beyond `100/r_min` the radial columns go
+/// nearly collinear with the polynomial nullspace, so the kernel range is
+/// capped here to keep the basis geometry well-conditioned.
+const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
+
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
 /// When geometry is unavailable (e.g., fewer than 2 distinct points), falls
@@ -3097,8 +3108,8 @@ fn spatial_term_psi_bounds(
     // The nullspace already carries constant/linear low-frequency structure,
     // so cap the kernel range at the diameter scale instead of letting the
     // optimizer enter a numerically degenerate basis geometry.
-    let psi_lo_data = (2.0 / r_max).ln();
-    let psi_hi_data = (1e2 / r_min).ln();
+    let psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln();
+    let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln();
     // Intersect with the options window so min/max_length_scale remain hard caps.
     let psi_lo = psi_lo_data.max(fallback.0);
     let psi_hi = psi_hi_data.min(fallback.1);
