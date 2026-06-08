@@ -3772,9 +3772,11 @@ fn run_predict_survival(
     }
     if p_cov > 0 {
         let cov_start = p_time + p_timewiggle;
-        let chunk_rows = (8 * 1024 * 1024 / (p_cov.max(1) * std::mem::size_of::<f64>()))
-            .max(1)
-            .min(n.max(1));
+        let chunk_rows = gam::resource::rows_for_target_bytes(
+            gam::resource::ResourcePolicy::default_library().row_chunk_target_bytes,
+            p_cov,
+        )
+        .min(n.max(1));
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
             let chunk = cov_design
@@ -4119,6 +4121,27 @@ fn fitted_weibull_baseline_from_linear_time_beta(beta: &Array1<f64>) -> Option<(
 
 fn baseline_timewiggle_is_present(model: &SavedModel) -> bool {
     model.has_baseline_time_wiggle()
+}
+
+/// Inner-PIRLS options shared by both survival-baseline fit sites (the
+/// per-candidate trial fit and the final baseline fit). Centralised so the two
+/// call sites cannot drift in their convergence policy: a generous 400-iter /
+/// 40-halving budget with a 1e-6 coefficient-change tolerance and a 1e-12
+/// step-size floor, matching the survival baseline's BFGS envelope solver.
+fn survival_baseline_pirls_options() -> gam::pirls::WorkingModelPirlsOptions {
+    gam::pirls::WorkingModelPirlsOptions {
+        max_iterations: 400,
+        convergence_tolerance: 1e-6,
+        adaptive_kkt_tolerance: None,
+        max_step_halving: 40,
+        min_step_size: 1e-12,
+        firth_bias_reduction: false,
+        coefficient_lower_bounds: None,
+        linear_constraints: None,
+        initial_lm_lambda: None,
+        geodesic_acceleration: false,
+        arrow_schur: None,
+    }
 }
 
 fn run_survival(args: SurvivalArgs) -> Result<(), String> {
@@ -5735,19 +5758,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             |candidate| {
                 let (_, _, _, beta0, structural_lower_bounds, mut model) =
                     build_working_model(candidate)?;
-                let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
-                    max_iterations: 400,
-                    convergence_tolerance: 1e-6,
-                    adaptive_kkt_tolerance: None,
-                    max_step_halving: 40,
-                    min_step_size: 1e-12,
-                    firth_bias_reduction: false,
-                    coefficient_lower_bounds: None,
-                    linear_constraints: None,
-                    initial_lm_lambda: None,
-                    geodesic_acceleration: false,
-                    arrow_schur: None,
-                };
+                let pirls_opts = survival_baseline_pirls_options();
                 let state = if likelihood_mode == SurvivalLikelihoodMode::Weibull {
                     let summary = gam::pirls::runworking_model_pirls(
                         &mut model,
@@ -5789,19 +5800,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         build_working_model(&baseline_cfg)?;
     let beta0_norm = beta0.dot(&beta0).sqrt();
     progress.set_stage("fit", "running survival pirls");
-    let pirls_opts = gam::pirls::WorkingModelPirlsOptions {
-        max_iterations: 400,
-        convergence_tolerance: 1e-6,
-        adaptive_kkt_tolerance: None,
-        max_step_halving: 40,
-        min_step_size: 1e-12,
-        firth_bias_reduction: false,
-        coefficient_lower_bounds: None,
-        linear_constraints: None,
-        initial_lm_lambda: None,
-        geodesic_acceleration: false,
-        arrow_schur: None,
-    };
+    let pirls_opts = survival_baseline_pirls_options();
     let pirls_start = std::time::Instant::now();
     let pirls_callback = |info: &gam::pirls::WorkingModelIterationInfo| {
         let elapsed = pirls_start.elapsed().as_secs_f64();
