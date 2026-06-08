@@ -600,6 +600,18 @@ pub(crate) fn inverse(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     Ok(out)
 }
 
+/// Sweep budget multiplier for the classical Jacobi eigensolver: the iteration
+/// cap is `JACOBI_SWEEP_BUDGET · n²`. Classical (largest-off-diagonal) Jacobi
+/// converges quadratically once the off-diagonals are small, needing only a
+/// handful of full `O(n²)` sweeps; this generous multiple lets even clustered
+/// spectra finish while still failing loudly on a genuinely stalled matrix.
+const JACOBI_SWEEP_BUDGET: usize = 64;
+
+/// Relative off-diagonal convergence threshold for [`jacobi_symmetric`]: the
+/// largest off-diagonal magnitude must fall below `JACOBI_REL_TOL · ‖A‖_F`. Near
+/// `f64` precision so the diagonalization is accurate to working precision.
+const JACOBI_REL_TOL: f64 = 1.0e-13;
+
 pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, Array2<f64>)> {
     let n = a.nrows();
     if n != a.ncols() {
@@ -609,7 +621,7 @@ pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, 
     }
     let mut d = sym(a);
     let mut v = identity(n);
-    let max_iter = 64 * n.max(1) * n.max(1);
+    let max_iter = JACOBI_SWEEP_BUDGET * n.max(1) * n.max(1);
     // Relative convergence threshold: the largest off-diagonal magnitude must
     // fall to `1e-13 * ||A||_F`. A fixed absolute `1e-13` is meaningless for
     // matrices whose scale is far from unity (a well-scaled large-norm matrix
@@ -628,7 +640,7 @@ pub(crate) fn jacobi_symmetric(a: &Array2<f64>) -> GeometryResult<(Array1<f64>, 
         }
         acc.sqrt()
     };
-    let threshold = 1.0e-13 * frob_norm;
+    let threshold = JACOBI_REL_TOL * frob_norm;
     let mut converged = false;
     for _ in 0..max_iter {
         let mut p = 0usize;

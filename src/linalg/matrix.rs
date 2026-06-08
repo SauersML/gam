@@ -23,6 +23,11 @@ use std::sync::{Arc, OnceLock};
 
 const MATRIX_FREE_PCG_MIN_P: usize = 2048;
 const MATRIX_FREE_PCG_REL_TOL: f64 = 1e-8;
+/// Minimum numerical ridge added to the (penalized) normal matrix before an SPD
+/// solve. Near `f64` precision: large enough to lift an exactly-singular system
+/// off zero so the factorization succeeds, small enough not to bias a
+/// well-conditioned solve. Acts as a floor on any caller-supplied `ridge_floor`.
+const SPD_SOLVE_RIDGE_FLOOR: f64 = 1e-15;
 const MATRIX_FREE_PCG_MAX_ITER: usize = 2000;
 const MAX_SINGLE_DENSE_MATERIALIZATION_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
@@ -5971,7 +5976,7 @@ pub trait LinearOperator {
             weights,
             rhs,
             penalty,
-            1e-15,
+            SPD_SOLVE_RIDGE_FLOOR,
             RidgePolicy::explicit_stabilization_pospart(),
         )
     }
@@ -5991,7 +5996,7 @@ pub trait LinearOperator {
             ));
         }
         let baseridge = if ridge_policy.include_laplacehessian {
-            ridge_floor.max(1e-15)
+            ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR)
         } else {
             0.0
         };
@@ -7735,7 +7740,7 @@ impl DesignMatrix {
             weights,
             rhs,
             penalty,
-            ridge_floor.max(1e-15),
+            ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR),
         )
     }
 
@@ -7751,7 +7756,7 @@ impl DesignMatrix {
             weights,
             rhs,
             penalty,
-            ridge_floor.max(1e-15),
+            ridge_floor.max(SPD_SOLVE_RIDGE_FLOOR),
         )
     }
 

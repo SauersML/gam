@@ -2,6 +2,13 @@ use ndarray::{Array1, ArrayView1};
 
 use crate::geometry::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
 
+/// Linear factor of the Steihaug truncated-CG forcing sequence: the inner CG
+/// solve is terminated once the residual drops to `min(η·‖r₀‖, ‖r₀‖²)`. The
+/// quadratic `‖r₀‖²` term gives the super-linear convergence of an inexact
+/// Newton step near the optimum, while `η·‖r₀‖` caps wasted inner work far from
+/// it (Nocedal & Wright, *Numerical Optimization*, §7.1, eq. 7.3).
+const STEIHAUG_CG_FORCING_FACTOR: f64 = 1.0e-2;
+
 pub trait RiemannianObjective {
     fn value_gradient(&mut self, point: ArrayView1<'_, f64>) -> GeometryResult<(f64, Array1<f64>)>;
 
@@ -206,7 +213,7 @@ impl RiemannianTrustRegion {
         let mut r = grad.to_owned(); // residual = grad + Hz (z=0 ⇒ grad)
         let mut p = -&r; // search direction
         let r0_norm = g_norm(manifold, x, r.view())?;
-        let tol = (1.0e-2 * r0_norm).min(r0_norm * r0_norm);
+        let tol = (STEIHAUG_CG_FORCING_FACTOR * r0_norm).min(r0_norm * r0_norm);
 
         // model reduction tracker m(0) − m(z); m(0) = 0 here (constant dropped).
         // m(z) = g(grad,z) + ½ g(z,Hz); we recompute it at the end for ρ.
