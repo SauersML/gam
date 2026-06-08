@@ -13,11 +13,6 @@ fn symmetric_curvature_solve_preserves_negative_modes() {
     assert!((solved[2] + 250.0).abs() <= 1.0e-9);
 }
 
-#[test]
-fn model_version_matches_canonical_payload_version() {
-    assert_eq!(MODEL_VERSION, MODEL_PAYLOAD_VERSION);
-}
-
 /// Builds a deterministic formula-table dataset for the shared-tangent
 /// Gaussian REML path with two unpenalized parametric columns plus one
 /// smooth: `~ x + z + s(w)` over `D = 2` outputs.
@@ -145,7 +140,7 @@ fn shared_tangent_lambda_edf_grid_is_per_coordinate() {
 #[test]
 fn load_model_rejects_payload_version_mismatch() {
     let model = FittedModel::from_payload(FittedModelPayload::new(
-        MODEL_VERSION + 1,
+        MODEL_PAYLOAD_VERSION + 1,
         "y ~ x".to_string(),
         ModelKind::Standard,
         FittedFamily::Standard {

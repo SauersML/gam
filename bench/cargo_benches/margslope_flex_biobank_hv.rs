@@ -29,7 +29,7 @@ fn bench_margslope_flex_biobank_cycle0(c: &mut Criterion) {
     let inner_cycles = BENCH_INNER_CYCLES;
     #[cfg(target_os = "linux")]
     {
-        let scratch = gam::gpu::bms_flex_row::bms_flex_row_hvp_multi_scratch_bytes_for_shape(
+        let scratch = gam::families::bms::gpu::row::bms_flex_row_hvp_multi_scratch_bytes_for_shape(
             n,
             BIOBANK_HVP_P_TOTAL,
             BENCH_MULTI_RHS_PROBE,
