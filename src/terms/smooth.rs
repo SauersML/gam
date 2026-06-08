@@ -11618,6 +11618,172 @@ fn bounded_latent_to_user(theta: f64, min: f64, max: f64) -> (f64, f64, f64) {
     (beta, z, db_dtheta)
 }
 
+/// Invert the bounded interval transform: given a user-scale coefficient
+/// `beta` in the open interval `(min, max)`, return the latent coordinate
+/// `theta` with `bounded_latent_to_user(theta, min, max).0 == beta`.
+///
+/// This is the exact inverse of the logistic interval map used by the bounded
+/// custom family: `z = (beta - min)/(max - min)` (the normalized position in
+/// the interval) and `theta = logit(z)`. The normalized position is clamped
+/// strictly inside `(0, 1)` (mirroring `bounded_logit`) so a coefficient that
+/// sits numerically at a boundary maps to a large-but-finite latent value
+/// rather than `±∞`.
+fn bounded_user_to_latent(beta: f64, min: f64, max: f64) -> f64 {
+    let width = max - min;
+    if width <= 0.0 || !width.is_finite() {
+        return 0.0;
+    }
+    let z = (beta - min) / width;
+    bounded_logit(z)
+}
+
+/// One bounded coefficient column for posterior sampling: its position in the
+/// (internal, conditioned) coefficient vector and the interval bounds expressed
+/// on that same internal scale.
+#[derive(Debug, Clone, Copy)]
+pub struct BoundedSampleColumn {
+    /// Column index into the internal (conditioned) coefficient vector.
+    pub col_idx: usize,
+    /// Lower interval bound on the internal scale.
+    pub min: f64,
+    /// Upper interval bound on the internal scale.
+    pub max: f64,
+}
+
+/// Exact posterior draws for a model with `bounded()` coefficients.
+///
+/// The bounded custom family fits each bounded coefficient as a smooth interval
+/// transform `beta = min + (max - min)·sigmoid(theta)` of an unconstrained
+/// latent `theta`. The Laplace approximation is *Gaussian on the latent scale*
+/// — that is precisely the scale on which the fit treats the coefficient as an
+/// unconstrained, locally-quadratic parameter. Sampling a Gaussian directly on
+/// the user (bounded) scale is wrong twice over: it can place mass outside
+/// `[min, max]`, and it discards the boundary-induced skew that the nonlinear
+/// map produces. This routine instead draws `theta ~ N(theta_mode, H_latent^{-1})`
+/// and pushes every draw through the *exact* interval map, so user-scale draws
+/// always lie strictly inside the interval and carry the correct skew.
+///
+/// Coordinate bookkeeping. The caller supplies the user-scale mode `beta_user`
+/// and the user-scale penalized Hessian `user_hessian` (both in *internal /
+/// conditioned* coordinates — i.e. before `backtransform_*` to the original
+/// data scale) together with the internal-scale bounds for each bounded column.
+/// The user-scale Hessian relates to the latent-scale Hessian by the diagonal
+/// delta-method Jacobian `J = diag(db/dtheta)`:
+///   `H_user = J^{-1} H_latent J^{-1}`  ⇒  `H_latent = J H_user J`,
+/// which is exactly the inverse of `transform_bounded_latent_precision_to_user_internal`.
+/// Non-bounded columns have `J_ii = 1`, so they are sampled as the ordinary
+/// Gaussian Laplace draw and returned unchanged.
+///
+/// Returns the draws as a `(n_draws, p)` matrix on the *internal* user scale
+/// (still conditioned); the caller back-transforms to the original data scale
+/// with the same conditioning it used for the point estimate.
+pub fn sample_bounded_latent_posterior_internal(
+    beta_user: &Array1<f64>,
+    user_hessian: &Array2<f64>,
+    bounded_columns: &[BoundedSampleColumn],
+    n_draws: usize,
+    base_seed: u64,
+) -> Result<Array2<f64>, EstimationError> {
+    let p = beta_user.len();
+    if user_hessian.nrows() != p || user_hessian.ncols() != p {
+        crate::bail_invalid_estim!(
+            "bounded posterior sampling dimension mismatch: mode has {p} entries, user Hessian is {}x{}",
+            user_hessian.nrows(),
+            user_hessian.ncols()
+        );
+    }
+
+    // Latent mode and delta-method Jacobian, column by column.
+    let mut theta_mode = beta_user.clone();
+    let mut jac_diag = Array1::<f64>::ones(p);
+    for bc in bounded_columns {
+        if bc.col_idx >= p {
+            crate::bail_invalid_estim!(
+                "bounded posterior sampling: bounded column index {} out of range for {p} coefficients",
+                bc.col_idx
+            );
+        }
+        let theta_i = bounded_user_to_latent(beta_user[bc.col_idx], bc.min, bc.max);
+        let (_, _, db_dtheta) = bounded_latent_to_user(theta_i, bc.min, bc.max);
+        theta_mode[bc.col_idx] = theta_i;
+        // Guard against a degenerate (numerically vanishing) Jacobian at a
+        // coefficient pinned hard against a boundary: floor the slope so the
+        // latent precision stays finite and the draw simply collapses onto the
+        // boundary, which is the correct limiting posterior.
+        jac_diag[bc.col_idx] = db_dtheta.max(1e-12);
+    }
+
+    // H_latent = J H_user J  (J diagonal). This is the exact inverse of the
+    // user-scale precision transform applied at fit time.
+    let mut h_latent = user_hessian.clone();
+    for i in 0..p {
+        let ji = jac_diag[i];
+        if ji != 1.0 {
+            h_latent.row_mut(i).mapv_inplace(|v| v * ji);
+            h_latent.column_mut(i).mapv_inplace(|v| v * ji);
+        }
+    }
+
+    // Draw theta ~ N(theta_mode, H_latent^{-1}) via the Cholesky of H_latent:
+    // L Lᵀ = H_latent, solve Lᵀ δ = ε so Var(δ) = H_latent^{-1}.
+    use crate::faer_ndarray::FaerCholesky as _;
+    use rand::SeedableRng as _;
+    let chol = h_latent.cholesky(faer::Side::Lower).map_err(|err| {
+        EstimationError::InvalidInput(format!(
+            "bounded posterior sampling: Cholesky of the latent penalized Hessian failed: {err:?}"
+        ))
+    })?;
+    let l = chol.lower_triangular();
+
+    let mut draws = Array2::<f64>::zeros((n_draws, p));
+    let mut eps = Array1::<f64>::zeros(p);
+    let mut delta = Array1::<f64>::zeros(p);
+    let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed);
+    for k in 0..n_draws {
+        for e in eps.iter_mut() {
+            *e = standard_normal_draw(&mut rng);
+        }
+        solve_lower_transpose_into(&l, &eps, &mut delta);
+        for i in 0..p {
+            draws[(k, i)] = theta_mode[i] + delta[i];
+        }
+        // Push bounded columns through the exact interval map so every draw is
+        // strictly inside (min, max); leave unconstrained columns untouched.
+        for bc in bounded_columns {
+            let (beta_draw, _, _) =
+                bounded_latent_to_user(draws[(k, bc.col_idx)], bc.min, bc.max);
+            draws[(k, bc.col_idx)] = beta_draw;
+        }
+    }
+
+    Ok(draws)
+}
+
+/// Box-Muller standard-normal draw (kept local so the bounded sampler does not
+/// depend on the HMC module's RNG plumbing).
+#[inline]
+fn standard_normal_draw<R: rand::Rng + ?Sized>(rng: &mut R) -> f64 {
+    use rand::RngExt as _;
+    let u1 = rng.random::<f64>().max(1e-16);
+    let u2 = rng.random::<f64>();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Solve `Lᵀ x = b` for a lower-triangular `L` (back substitution), writing the
+/// result into `out`. Used to turn a standard-normal `b` into a draw with
+/// covariance `(L Lᵀ)^{-1}`.
+fn solve_lower_transpose_into(l: &Array2<f64>, b: &Array1<f64>, out: &mut Array1<f64>) {
+    let p = l.nrows();
+    for i in (0..p).rev() {
+        let mut acc = b[i];
+        for j in (i + 1)..p {
+            acc -= l[(j, i)] * out[j];
+        }
+        let diag = l[(i, i)];
+        out[i] = if diag.abs() > 0.0 { acc / diag } else { 0.0 };
+    }
+}
+
 fn bounded_latent_derivatives(theta: f64, min: f64, max: f64) -> (f64, f64, f64, f64, f64) {
     let z = stable_sigmoid(theta);
     let width = max - min;
