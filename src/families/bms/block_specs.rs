@@ -42,6 +42,13 @@ pub(super) const GAUGE_PRIORITY_DEVIATION_DEFAULT: u8 = 70;
 /// `link_dev`: lowest rung, yields first among the flex deviation blocks.
 pub(super) const GAUGE_PRIORITY_LINK_DEV: u8 = 60;
 
+/// Floor on the relative outer tolerance used by the exact-joint spatial
+/// length-scale optimiser. The user's `rel_tol` drives most of the fit, but
+/// the exact spatial outer loop is a coarse 1-D search over a smooth profiled
+/// objective; tightening it below this floor only burns cycles on noise in the
+/// inner-solve-reported objective without moving the selected length scale.
+const EXACT_SPATIAL_OUTER_TOL_FLOOR: f64 = 1e-6;
+
 // ── BlockEffectiveJacobian impls for BMS ─────────────────────────────────────
 //
 // BMS has a single Bernoulli output per row (n_outputs = 1). The observed η is
@@ -2071,7 +2078,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
         let psi_dim = setup.theta0().len() - setup.rho_dim();
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
-    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
+    let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(EXACT_SPATIAL_OUTER_TOL_FLOOR);
     let solved = optimize_spatial_length_scale_exact_joint(
         data_view,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
