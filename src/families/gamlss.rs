@@ -29319,7 +29319,7 @@ mod tests {
 
         // ---- Wiggle GaussianLocationScaleWiggleFamily --------------------
         {
-            let (family, states, specs, _xmu, _xls, _xw) = gls_wiggle_workspace_fixture();
+            let (family, states, specs, ..) = gls_wiggle_workspace_fixture();
             let p_mu = states[GaussianLocationScaleWiggleFamily::BLOCK_MU].beta.len();
             let p_ls = states[GaussianLocationScaleWiggleFamily::BLOCK_LOG_SIGMA]
                 .beta
