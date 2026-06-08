@@ -13564,8 +13564,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     /// Options-aware override: outer hyper-derivative callers may pass a row
-    /// subsample, while coefficient inner line searches clear that option and
-    /// evaluate the exact full-data objective.
+    /// subsample via `outer_score_subsample`. Coefficient inner line searches
+    /// inherit that caller-supplied row measure unchanged (preserving trust-region
+    /// ratio consistency) and disable auto-install so no fresh mask can fire
+    /// mid-iteration; the early-exit monotone lower-bound proof holds for any
+    /// row set with non-negative weights, so the partial-NLL threshold is sound
+    /// regardless of whether the inherited measure is full-data or subsampled.
     fn log_likelihood_only_with_options(
         &self,
         block_states: &[ParameterBlockState],
