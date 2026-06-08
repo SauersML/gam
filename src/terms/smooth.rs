@@ -9540,6 +9540,32 @@ impl CharbonnierScalarBlockState {
         )
     }
 
+    /// Exact scalar-image fourth derivative contracted along two coefficient
+    /// directions: with `t(β)=Aβ`, `H(β)=Aᵀ diag(ψ''(t_k)) A`,
+    /// `ψ''(t)=ε²/r³`, the second directional derivative of `H` along
+    /// `(u, v)` (signals `q1=A u`, `q2=A v`) is
+    /// `Aᵀ diag( ψ''''(t_k) q1_k q2_k ) A`, with
+    /// `ψ''''(t) = -3 ε² / r⁵ + 15 ε² t² / r⁷`.
+    fn second_directionalhessian_diag(
+        &self,
+        direction1_signal: &Array1<f64>,
+        direction2_signal: &Array1<f64>,
+    ) -> Array1<f64> {
+        let eps2 = self.epsilon * self.epsilon;
+        Array1::from_iter(
+            self.signal
+                .iter()
+                .zip(direction1_signal.iter())
+                .zip(direction2_signal.iter())
+                .zip(self.radius.iter())
+                .map(|(((t, q1), q2), r)| {
+                    let r2 = r * r;
+                    let psi4 = -3.0 * eps2 / r.powi(5) + 15.0 * eps2 * t * t / (r.powi(5) * r2);
+                    psi4 * q1 * q2
+                }),
+        )
+    }
+
     fn log_epsilon_betahessian_diag(&self) -> Array1<f64> {
         let eps2 = self.epsilon * self.epsilon;
         let eps4 = eps2 * eps2;
@@ -9785,6 +9811,68 @@ impl CharbonnierGroupedBlockState {
                 for j in 0..dim {
                     block[[i, j]] -= (q[i] * v[j] + v[i] * q[j]) / r3;
                     block[[i, j]] += 3.0 * dot * v[i] * v[j] / r5;
+                }
+            }
+            out.push(block);
+        }
+        out
+    }
+
+    /// Exact grouped second directional derivative of the slope/curvature block
+    /// Hessian `B_k = (1/r_k) I − v_k v_kᵀ / r_k³` along two coefficient
+    /// directions, with per-block signal images `a_k = G_k u`, `b_k = G_k w`.
+    ///
+    /// `B_k`'s first directional derivative along `a` is
+    ///   `M_k(a) = −(v·a/r³) I − (a vᵀ + v aᵀ)/r³ + 3 (v·a) v vᵀ/r⁵`
+    /// (see `directionalhessian_blocks`). Differentiating `M_k(a)` once more
+    /// along `b` (i.e. `v ← v + t b`) gives the symmetric block
+    ///   `N_k(a,b) = (−a·b/r³ + 3 (v·a)(v·b)/r⁵) I`
+    ///            `  − (a bᵀ + b aᵀ)/r³`
+    ///            `  + 3 (v·b)(a vᵀ + v aᵀ)/r⁵`
+    ///            `  + 3 (a·b) v vᵀ/r⁵`
+    ///            `  + 3 (v·a)(b vᵀ + v bᵀ)/r⁵`
+    ///            `  − 15 (v·a)(v·b) v vᵀ/r⁷`,
+    /// so `D²_β H_g[u,w] = λ_g Σ_k G_kᵀ N_k(a_k,b_k) G_k`. `N_k` is symmetric in
+    /// `a ↔ b`, matching `D²H[u,w] = D²H[w,u]`.
+    fn second_directionalhessian_blocks(
+        &self,
+        direction1_blocks: &Array2<f64>,
+        direction2_blocks: &Array2<f64>,
+    ) -> Vec<Array2<f64>> {
+        let mut out = Vec::with_capacity(self.signal_blocks.nrows());
+        for ((k, v), (a, b)) in self
+            .signal_blocks
+            .rows()
+            .into_iter()
+            .enumerate()
+            .zip(
+                direction1_blocks
+                    .rows()
+                    .into_iter()
+                    .zip(direction2_blocks.rows().into_iter()),
+            )
+        {
+            let dim = v.len();
+            let dot = |x: ndarray::ArrayView1<'_, f64>, y: ndarray::ArrayView1<'_, f64>| {
+                x.iter().zip(y.iter()).map(|(p, q)| p * q).sum::<f64>()
+            };
+            let sa = dot(v, a);
+            let sb = dot(v, b);
+            let ab = dot(a, b);
+            let r = self.radius[k];
+            let r3 = r.powi(3);
+            let r5 = r.powi(5);
+            let r7 = r5 * r * r;
+            let diag = -ab / r3 + 3.0 * sa * sb / r5;
+            let mut block = Array2::<f64>::eye(dim);
+            block.mapv_inplace(|x| diag * x);
+            for i in 0..dim {
+                for j in 0..dim {
+                    block[[i, j]] -= (a[i] * b[j] + b[i] * a[j]) / r3;
+                    block[[i, j]] += 3.0 * sb * (a[i] * v[j] + v[i] * a[j]) / r5;
+                    block[[i, j]] += 3.0 * ab * v[i] * v[j] / r5;
+                    block[[i, j]] += 3.0 * sa * (b[i] * v[j] + v[i] * b[j]) / r5;
+                    block[[i, j]] -= 15.0 * sa * sb * v[i] * v[j] / r7;
                 }
             }
             out.push(block);
@@ -12819,6 +12907,96 @@ impl SpatialAdaptiveExactFamily {
         }
         Ok(total)
     }
+
+    /// Exact second directional derivative `D²_β H[u, v]` of the joint
+    /// (likelihood + adaptive Charbonnier penalty) Hessian, needed so the outer
+    /// LAML's joint-Jeffreys curvature drift `D_β H_Φ[β̇]` is exact rather than
+    /// silently dropped (which leaves the outer hypergradient inconsistent with
+    /// the `½log|H+H_Φ|` objective it folds `H_Φ` into).
+    ///
+    /// The data block contributes `Xᵀ diag(ℓ'''(η_i) (Xu)_i (Xv)_i) X`, where
+    /// `ℓ'''` is the third derivative of the per-observation log-likelihood in
+    /// `η`. The observation state exposes the working weight `w=−ℓ''` and its
+    /// first `η`-derivative `w'` (`neghessian_eta_derivative`) but not `w''`, so
+    /// the exact data term is available only on the **constant-weight** path
+    /// (`w' ≡ 0`, e.g. Gaussian identity), where `w'' ≡ 0` and the data block
+    /// second derivative vanishes. On a varying-weight family we return `None`
+    /// (the safe, pre-existing behavior: the drift degrades to zero rather than
+    /// to a wrong value) until the observation contract carries `w''`.
+    ///
+    /// The penalty block is always exact: with `λ_m G_mᵀ B_m(G_m β) G_m` the
+    /// per-component penalty Hessian, `D²_β` is `λ_m Σ_k G_mᵀ N_m,k G_m` using the
+    /// scalar (`second_directionalhessian_diag`) / grouped
+    /// (`second_directionalhessian_blocks`) fourth-derivative contractions.
+    fn exacthessian_second_directional_derivative_from_evaluation(
+        &self,
+        eval: &SpatialAdaptiveExactEvaluation,
+        direction_u: &Array1<f64>,
+        direction_v: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let p = self.design.ncols();
+        // Data block: exact only when the working weight is constant in η.
+        if eval.obs.neghessian_eta_derivative.iter().any(|&w| w != 0.0) {
+            return Ok(None);
+        }
+        let mut total = Array2::<f64>::zeros((p, p));
+        for (cache_idx, cache) in self.runtime_caches.iter().enumerate() {
+            let params = self.adaptive_params.get(cache_idx).ok_or_else(|| {
+                format!(
+                    "missing adaptive parameter block for cache {}",
+                    cache.termname
+                )
+            })?;
+            let state = eval
+                .adaptive_states
+                .get(cache_idx)
+                .ok_or_else(|| format!("missing adaptive state for cache {}", cache.termname))?;
+            let u_local = direction_u.slice(s![cache.coeff_global_range.clone()]);
+            let v_local = direction_v.slice(s![cache.coeff_global_range.clone()]);
+
+            // Magnitude (scalar d0).
+            let q0_u = cache.d0.dot(&u_local);
+            let q0_v = cache.d0.dot(&v_local);
+            let h0 = scalar_operatorhessian(
+                &cache.d0,
+                &state.magnitude.second_directionalhessian_diag(&q0_u, &q0_v),
+            )
+            .mapv(|x| params.lambda[0] * x);
+
+            // Gradient (grouped d1, block dim = dimension).
+            let a1 = collocationgradient_blocks(&cache.d1.dot(&u_local), cache.dimension)
+                .map_err(|e| e.to_string())?;
+            let b1 = collocationgradient_blocks(&cache.d1.dot(&v_local), cache.dimension)
+                .map_err(|e| e.to_string())?;
+            let hg = grouped_operatorhessian(
+                &cache.d1,
+                cache.dimension,
+                &state.gradient.second_directionalhessian_blocks(&a1, &b1),
+            )
+            .map_err(|e| e.to_string())?
+            .mapv(|x| params.lambda[1] * x);
+
+            // Curvature (grouped d2, block dim = dimension²).
+            let a2 = collocationhessian_blocks(&cache.d2.dot(&u_local), cache.dimension)
+                .map_err(|e| e.to_string())?;
+            let b2 = collocationhessian_blocks(&cache.d2.dot(&v_local), cache.dimension)
+                .map_err(|e| e.to_string())?;
+            let hc = grouped_operatorhessian(
+                &cache.d2,
+                cache.dimension * cache.dimension,
+                &state.curvature.second_directionalhessian_blocks(&a2, &b2),
+            )
+            .map_err(|e| e.to_string())?
+            .mapv(|x| params.lambda[2] * x);
+
+            let range = cache.coeff_global_range.clone();
+            let mut local = total.slice_mut(s![range.clone(), range]);
+            local += &h0;
+            local += &hg;
+            local += &hc;
+        }
+        Ok(Some(total))
+    }
 }
 
 impl CustomFamily for SpatialAdaptiveExactFamily {
@@ -12897,6 +13075,30 @@ impl CustomFamily for SpatialAdaptiveExactFamily {
         Ok(Some(
             self.exacthessian_directional_derivative_from_evaluation(beta, &eval, d_beta_flat)?,
         ))
+    }
+
+    fn exact_newton_joint_hessiansecond_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
+        if d_beta_u_flat.len() != beta.len() || d_betav_flat.len() != beta.len() {
+            return Err(SmoothError::dimension_mismatch(format!(
+                "spatial adaptive exact family second-direction length mismatch: got ({}, {}), expected {}",
+                d_beta_u_flat.len(),
+                d_betav_flat.len(),
+                beta.len()
+            ))
+            .into());
+        }
+        let eval = self.exact_evaluation(beta)?;
+        self.exacthessian_second_directional_derivative_from_evaluation(
+            &eval,
+            d_beta_u_flat,
+            d_betav_flat,
+        )
     }
 
     fn block_linear_constraints(
