@@ -12416,6 +12416,23 @@ fn joint_objective_floor_reached(
             ))
 }
 
+/// True iff the joint-Newton proposal is already at the step-tolerance floor —
+/// the unclamped Newton step's inf-norm is within `STEP_FLOOR_CERT_FACTOR ×
+/// step_tol` (the same round-off band the constrained-stationary certificate
+/// uses for "a hair above tol"). At the floor the iterate is doing KKT polishing
+/// on a flat objective, so a `predicted_reduction = rhs·δ − ½δᵀHδ ≤ 0` is the
+/// SIGN of two near-equal O(step²) quantities (round-off), NOT a model-invalid
+/// descent direction; the preconditioned-descent substitution must be suppressed
+/// there or it replaces the tiny polishing step with an objective-descent step
+/// that catapults the KKT residual off the near-converged iterate (gam#787 binary
+/// matern centers=12: residual 1.7e-4 → 4.7e-1, never recovers).
+fn joint_proposal_at_step_floor(proposal_step_inf: f64, step_tol: f64) -> bool {
+    const STEP_FLOOR_CERT_FACTOR: f64 = 4.0;
+    proposal_step_inf.is_finite()
+        && step_tol.is_finite()
+        && proposal_step_inf <= STEP_FLOOR_CERT_FACTOR * step_tol
+}
+
 fn joint_trust_region_metric_step_norm(delta: &Array1<f64>, metric_diag: &Array1<f64>) -> f64 {
     assert_eq!(delta.len(), metric_diag.len());
     joint_trust_region_metric_step_norm_view(delta.view(), metric_diag.view())
@@ -15337,7 +15354,32 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // shrink/expand handles small-but-valid Newton steps; the
                 // preconditioned branch below is only for model-invalid
                 // directions, and preserves linear constraints when present.
-                if !predicted_reduction.is_finite() || predicted_reduction <= 0.0 {
+                //
+                // NEAR-FLOOR CARVE-OUT (gam#787 binary matern centers=12). When
+                // the Newton proposal is already at the step-tolerance floor —
+                // `step_inf ≤ 4·step_tol`, the same round-off band the cert path
+                // uses — the iterate is doing KKT polishing on a flat objective,
+                // not global descent: there `predicted_reduction = rhs·δ − ½δᵀHδ`
+                // is two near-equal O(step²) quantities and its SIGN is round-off
+                // noise (a true Newton step gives +½δᵀHδ but the damped/range-
+                // restricted spectral solve leaves rhs·δ a hair below ½δᵀHδ). The
+                // `predicted_reduction ≤ 0` branch then mistook this for a model-
+                // invalid direction and substituted `joint_preconditioned_descent_delta`,
+                // a step sized for OBJECTIVE descent (diagonal-preconditioned
+                // gradient, O(900×) larger than the polishing proposal). That step
+                // bought a round-off-level objective gain but catapulted the KKT
+                // residual off a near-converged iterate (‖∇L−Sβ‖ 1.7e-4 → 4.7e-1),
+                // which then never recovered — every later cycle re-triggered the
+                // same substitution (proposal stays pred≤0), pinning the residual
+                // far above tol until the cycle budget exhausted → seed rejected →
+                // hard raise. At the step floor we instead take the tiny proposal
+                // as-is and let the trust-region noise-floor guard accept it at
+                // ρ=1 (it neither helps nor hurts the objective beyond round-off),
+                // so the inner keeps polishing the KKT residual to tol.
+                let proposal_at_step_floor = joint_proposal_at_step_floor(step_inf, step_tol);
+                if (!predicted_reduction.is_finite() || predicted_reduction <= 0.0)
+                    && !proposal_at_step_floor
+                {
                     model_rejects += 1;
                     if !tried_preconditioned_descent {
                         match joint_preconditioned_descent_delta(
@@ -29321,6 +29363,38 @@ mod tests {
             err.contains("block_residual_inf"),
             "error should carry per-block residual diagnostics: {err}"
         );
+    }
+
+    /// gam#787 binary matern centers=12 regression. Near a flat-objective
+    /// optimum the joint-Newton proposal shrinks to the step-tol floor while
+    /// `predicted_reduction = rhs·δ − ½δᵀHδ` becomes round-off-signed. The
+    /// `predicted_reduction ≤ 0` branch must NOT fire the preconditioned-descent
+    /// substitution there (it would replace the tiny KKT-polishing step with an
+    /// objective-descent step that catapults the residual off the near-converged
+    /// iterate). `joint_proposal_at_step_floor` is the suppression gate.
+    #[test]
+    fn joint_proposal_at_step_floor_suppresses_descent_substitution_near_optimum() {
+        // The exact c12 cycle-10 operating point: proposal_inf=1.413e-5,
+        // step_tol=1.355e-5 (proposal a hair = 1.04× above tol). The iterate is
+        // polishing KKT, so a pred≤0 here is round-off — the gate must fire.
+        assert!(
+            joint_proposal_at_step_floor(1.413e-5, 1.355e-5),
+            "a proposal within 4× step_tol is at the convergence floor; \
+             the descent substitution must be suppressed"
+        );
+        // Exactly at the 4× band edge: still at the floor.
+        assert!(joint_proposal_at_step_floor(4.0 * 1.355e-5, 1.355e-5));
+        // A genuinely large proposal (model-invalid direction far from the
+        // optimum) is NOT at the floor — the descent substitution must still run.
+        assert!(
+            !joint_proposal_at_step_floor(1.182e-2, 1.355e-5),
+            "an O(1e-2) proposal is far above the step floor; the \
+             preconditioned-descent fallback must remain active there"
+        );
+        // Non-finite inputs never certify the floor (so the substitution path
+        // keeps its existing non-finite handling).
+        assert!(!joint_proposal_at_step_floor(f64::NAN, 1.0e-5));
+        assert!(!joint_proposal_at_step_floor(1.0e-6, f64::INFINITY));
     }
 
     /// Independent derivation and direct numerical proof of the
