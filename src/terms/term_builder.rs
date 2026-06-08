@@ -2636,8 +2636,8 @@ fn heuristic_tensor_margin_knots(cols: &[usize], ds: &Dataset) -> Vec<usize> {
             .iter()
             .zip(per_margin_cap.iter())
             .enumerate()
-            .filter(|(_, (&k, &cap))| k < cap)
-            .max_by_key(|(_, (&k, &cap))| (cap - k, cap))
+            .filter(|&(_, (k, cap))| k < cap)
+            .max_by_key(|&(_, (k, cap))| (cap - k, *cap))
             .map(|(i, _)| i)
         else {
             break;
