@@ -30,7 +30,7 @@
 //! [`joint_jeffreys_term`] (self-limiting, returns the exact zero contribution on
 //! a well-conditioned fit) is the only "apply where needed" mechanism.
 
-use crate::linalg::faer_ndarray::FaerEigh;
+use crate::linalg::faer_ndarray::{FaerEigh, fast_abt};
 use crate::linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
@@ -700,23 +700,20 @@ where
             }
         }
     }
-    // Gauss-Newton curvature surrogate: H_Phi = 1/2 J J^T over the reduced
-    // sensitivities, i.e. H_Phi[a,b] = 1/2 <vec(M_a), vec(M_b)>. This is PSD by
-    // construction, vanishes on directions the data already identifies (M_k = 0
-    // there), and grows as the reduced curvature shrinks along a separating
-    // direction — exactly the automatic O(1)-bounding curvature Firth supplies.
-    let mut hphi = Array2::<f64>::zeros((p, p));
-    for a in 0..p {
-        for b in a..p {
-            let mut acc = 0.0;
-            for col in 0..(m * m) {
-                acc += sensitivity[[a, col]] * sensitivity[[b, col]];
-            }
-            let value = 0.5 * acc;
-            hphi[[a, b]] = value;
-            hphi[[b, a]] = value;
-        }
-    }
+    // Gauss-Newton curvature surrogate: H_Phi = ½ S Sᵀ over the reduced
+    // sensitivities `S = sensitivity` (p × m²), i.e. H_Phi[a,b] = ½ <vec(M_a),
+    // vec(M_b)>. PSD by construction, vanishes on directions the data already
+    // identifies (M_k = 0 there), and grows as the reduced curvature shrinks
+    // along a separating direction — the automatic O(1)-bounding Firth curvature.
+    //
+    // PERF (gam#729/#826/#808): assemble it as one BLAS-3 GEMM `S·Sᵀ` instead of
+    // the p²·m² scalar triple loop. For a K-block coupled family (Dirichlet/
+    // multinomial) the joint width p and reduced dimension m make the triple loop
+    // the dominant per-inner-cycle cost (it is rebuilt every inner Newton cycle
+    // and every outer continuation eval); routing through faer's matmul makes it
+    // cache-blocked and parallel, the same arithmetic with no accuracy change.
+    let mut hphi = fast_abt(&sensitivity, &sensitivity);
+    hphi.mapv_inplace(|v| 0.5 * v);
     // Scale the (value, gradient, curvature) triple by the smooth gate weight.
     // `gate_weight == 1` in the fully-active (under-identified) regime, so this is
     // identity there (byte-identical to the binary-gate term); it only tapers the
