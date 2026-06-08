@@ -1685,6 +1685,141 @@ fn reml_fixed_glm_dispersion(likelihood: &GlmLikelihoodSpec) -> f64 {
     }
 }
 
+/// Minimum importance-sampling effective-sample fraction below which the #784
+/// block-local sampled marginalization is declined (the Monte-Carlo estimate
+/// would be noisier than the Laplace error it corrects). Auto-derived constant,
+/// not a tunable flag.
+const MIN_IMPORTANCE_ESS_FRACTION: f64 = 0.10;
+
+/// Block-local non-Gaussian-remainder target for the adaptive Laplace-to-
+/// sampling fallback (issue #784).
+///
+/// Implements [`crate::inference::hmc::BlockExcessTarget`] for the standard-GAM
+/// GLM inner loop. The fallback sampler asks this target, for each whitened
+/// block displacement `t` (coordinates in the curvature-heavy H-eigenvector
+/// subspace `V_b`), for the non-Gaussian remainder
+///
+///   ΔF(t) = F(β̂ + δ) − F(β̂) − ½ δᵀ H δ,   δ = V_b t,
+///   F(β)  = −ℓ(β) + ½ βᵀ S(ρ) β.
+///
+/// Using the mode condition `S β̂ = ∇ℓ(β̂)` and `∇²ℓ = −Xᵀ W X`, the penalty's
+/// (exactly quadratic) curvature cancels and the remainder reduces to a
+/// family-uniform expression in the deviance plus the explicit penalty score:
+///
+///   ΔF(t) = (1/2φ)[D(μ(η̂ + Xδ)) − D(μ(η̂))]   (= −[ℓ(β̂+δ) − ℓ(β̂)])
+///           + (S β̂)·δ                          (penalty-score channel)
+///           − ½ Σ_i W_i (Xδ)_i².               (likelihood-curvature subtraction)
+///
+/// `D` is the family deviance (`calculate_deviance`), so this works uniformly
+/// across every GLM family/link without per-family score code. The only place
+/// ρ appears *explicitly* (with δ held fixed in coefficient space) is the
+/// penalty-score term, giving the exact explicit ρ-gradient
+///   ∂ΔF/∂ρ_k = λ_k (S_k β̂)·δ.
+/// The implicit β̂(ρ) channel is the same envelope term the surrounding
+/// Laplace/LAML evaluator already accounts for at the mode.
+struct Gam784BlockTarget<'t> {
+    /// `X_t` (transformed-basis dense design, matching `h_total`/`solve_c_array`).
+    x_transformed: &'t Array2<f64>,
+    /// Block eigenvectors `V_b` (columns), shape `p × m`.
+    block_vecs: Array2<f64>,
+    /// Block curvatures `λ_r` (the `H_total` eigenvalues), length `m`.
+    block_lambdas: Array1<f64>,
+    /// Converged coefficients β̂ (transformed basis).
+    beta_hat: Array1<f64>,
+    /// Mode linear predictor η̂ = X_t β̂.
+    eta_hat: Array1<f64>,
+    /// Per-row observed weights `W_i` (the likelihood Hessian diagonal).
+    weights_obs: Array1<f64>,
+    /// Response y and prior weights for the deviance.
+    y: Array1<f64>,
+    prior_weights: Array1<f64>,
+    /// Family/link spec for the deviance and the inverse link.
+    likelihood: GlmLikelihoodSpec,
+    inverse_link: InverseLink,
+    /// Dispersion φ used to scale the deviance into a log-likelihood.
+    phi: f64,
+    /// Penalty scores `S_k β̂` per canonical penalty (unscaled by λ_k).
+    penalty_scores: Vec<Array1<f64>>,
+    /// `λ_k = e^{ρ_k}` per canonical penalty, aligned with `penalty_scores`.
+    lambdas: Vec<f64>,
+    /// Deviance at the base mode.
+    base_deviance: f64,
+}
+
+impl Gam784BlockTarget<'_> {
+    /// Map a whitened block displacement `t` to the coefficient displacement
+    /// `δ = V_b t` and the per-row score `s = X_t δ`.
+    fn displacement(&self, t: &Array1<f64>) -> (Array1<f64>, Array1<f64>) {
+        let delta = self.block_vecs.dot(t);
+        let s = crate::faer_ndarray::fast_av(self.x_transformed, &delta);
+        (delta, s)
+    }
+}
+
+impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
+    fn block_dim(&self) -> usize {
+        self.block_lambdas.len()
+    }
+
+    fn rho_dim(&self) -> usize {
+        self.lambdas.len()
+    }
+
+    fn block_curvatures(&self) -> &Array1<f64> {
+        &self.block_lambdas
+    }
+
+    fn excess(&self, t: &Array1<f64>) -> f64 {
+        let (delta, s) = self.displacement(t);
+        // Displaced mean μ(η̂ + s) via the inverse-link jet (family-uniform).
+        let mut mu_disp = Array1::<f64>::zeros(self.eta_hat.len());
+        for i in 0..self.eta_hat.len() {
+            let eta_i = self.eta_hat[i] + s[i];
+            match crate::mixture_link::inverse_link_jet_for_inverse_link(&self.inverse_link, eta_i) {
+                Ok(jet) => mu_disp[i] = jet.mu,
+                Err(_) => return f64::INFINITY,
+            }
+        }
+        let dev_disp = crate::pirls::calculate_deviance(
+            self.y.view(),
+            &mu_disp,
+            &self.likelihood,
+            self.prior_weights.view(),
+        );
+        if !dev_disp.is_finite() {
+            return f64::INFINITY;
+        }
+        // −[ℓ(β̂+δ) − ℓ(β̂)] = (1/2φ)[D_disp − D_base].
+        let neg_loglik_diff = (dev_disp - self.base_deviance) / (2.0 * self.phi);
+        // Penalty-score channel (S β̂)·δ = Σ_k λ_k (S_k β̂)·δ.
+        let mut penalty_term = 0.0_f64;
+        for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
+            penalty_term += lam * score.dot(&delta);
+        }
+        // Likelihood-curvature subtraction ½ Σ_i W_i s_i².
+        let mut curv = 0.0_f64;
+        for i in 0..s.len() {
+            curv += self.weights_obs[i] * s[i] * s[i];
+        }
+        neg_loglik_diff + penalty_term - 0.5 * curv
+    }
+
+    fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+        let (delta, _s) = self.displacement(t);
+        let mut grad = Array1::<f64>::zeros(self.lambdas.len());
+        for (k, (score, &lam)) in self
+            .penalty_scores
+            .iter()
+            .zip(self.lambdas.iter())
+            .enumerate()
+        {
+            // ∂ΔF/∂ρ_k = λ_k (S_k β̂)·δ (the only explicit ρ-appearance).
+            grad[k] = lam * score.dot(&delta);
+        }
+        grad
+    }
+}
+
 impl<'a> RemlState<'a> {
     const POLISH_NORM_RATIO: f64 = 0.25;
 
@@ -3631,6 +3766,218 @@ impl<'a> RemlState<'a> {
             }
         }
         Ok(result)
+    }
+
+    /// Build the inverse link from the runtime link state, mirroring the
+    /// dispatch in `hessian_cde_arrays`. Used by the #784 block-local sampled
+    /// marginalization to evaluate μ at displaced η.
+    fn runtime_inverse_link(&self) -> InverseLink {
+        let link_function = self.config.link_function();
+        if let Some(state) = self.runtime_mixture_link_state.clone() {
+            InverseLink::Mixture(state)
+        } else if let Some(state) = self.runtime_sas_link_state {
+            if matches!(link_function, LinkFunction::BetaLogistic) {
+                InverseLink::BetaLogistic(state)
+            } else {
+                InverseLink::Sas(state)
+            }
+        } else {
+            InverseLink::Standard(
+                StandardLink::try_from(link_function)
+                    .expect("state-bearing link without runtime state in runtime_inverse_link"),
+            )
+        }
+    }
+
+    /// Adaptive, block-local Laplace-to-sampling fallback for the inner
+    /// marginalization loop (issue #784).
+    ///
+    /// The unified evaluator summarizes the coefficient posterior by its Laplace
+    /// (Gaussian) moments. This method audits that summary per curvature
+    /// direction and, where the Gaussian approximation is *not* trustworthy,
+    /// replaces it with a sampling-based block marginal — keeping the cheap
+    /// Laplace summary everywhere else:
+    ///
+    /// 1. Run the directional cubic non-Gaussianity diagnostic on the observed
+    ///    penalized Hessian + the third-derivative weights `solve_c_array`,
+    ///    yielding per-eigendirection standardized skewness `γ_r`.
+    /// 2. Convert `γ_r` into a block-local activation set via the auto-derived
+    ///    threshold `τ(n_eff)` (no flag). The flagged eigenvectors span the
+    ///    curvature-heavy subspace `V_b`.
+    /// 3. Importance-sample the true block marginal against the local Laplace
+    ///    Gaussian (reusing the whitening) and return the additive correction
+    ///    `Δ_b` to the marginal log-likelihood, together with its consistent
+    ///    ρ-gradient, so the outer REML/LAML stays consistent.
+    ///
+    /// Returns `TkCorrectionTerms` whose `value` is added to the REML cost.
+    /// Because `Δ_b` is added to the *marginal log-likelihood* it is subtracted
+    /// from the cost, so the returned `value` is `−Δ_b` (likewise the gradient).
+    /// The gradient is laid out over the ρ coordinates and zero-extended over
+    /// external coordinates to match the unified evaluator's coordinate set in
+    /// `apply_tk_to_result`.
+    ///
+    /// A no-op (zeros) is returned for Gaussian-identity fits (Laplace is
+    /// exact), when no direction trips the threshold, or when the importance
+    /// estimate is not trustworthy (low ESS) — in which case the plain Laplace
+    /// summary is retained rather than splicing in a noisy correction.
+    fn block_local_sampled_correction(
+        &self,
+        rho: &Array1<f64>,
+        bundle: &EvalShared,
+        n_ext: usize,
+    ) -> Result<TkCorrectionTerms, EstimationError> {
+        use crate::inference::hmc::{
+            block_sampled_marginal_correction, laplace_directional_cubic_diagnostic,
+            laplace_trustworthiness_from_skewness,
+        };
+
+        let n_rho = self.canonical_penalties.len();
+        let zero = || TkCorrectionTerms {
+            value: 0.0,
+            gradient: Some(Array1::zeros(n_rho + n_ext)),
+            hessian: None,
+        };
+
+        // Laplace is exact for the Gaussian-identity model: nothing to correct.
+        if reml_is_gaussian_identity(&self.config.likelihood) {
+            return Ok(zero());
+        }
+        // The penalty-score channel needs one λ per canonical penalty.
+        if rho.len() != n_rho || n_rho == 0 {
+            return Ok(zero());
+        }
+
+        let pirls_result = bundle.pirls_result.as_ref();
+        // Operate in the transformed basis, where `h_total`, `solve_c_array`,
+        // `final_eta`, `finalweights`, `beta_transformed` and `x_transformed`
+        // are all mutually consistent.
+        let h_total = bundle.h_total.as_ref();
+        let c_weights = &pirls_result.solve_c_array;
+        let x_design = &pirls_result.x_transformed;
+        let p = h_total.nrows();
+        if p == 0 || c_weights.len() != x_design.nrows() {
+            return Ok(zero());
+        }
+
+        // Step 1: per-direction skewness diagnostic γ_r.
+        let (max_abs, directional) =
+            laplace_directional_cubic_diagnostic(h_total, x_design, c_weights)
+                .map_err(EstimationError::InvalidInput)?;
+        if !max_abs.is_finite() || max_abs == 0.0 {
+            return Ok(zero());
+        }
+
+        // Step 2: auto-derived, block-local activation. `n_eff` is the number of
+        // observations carrying curvature; using it (not the raw n) keeps the
+        // verdict tied to the actual information content.
+        let n_eff = c_weights.iter().filter(|&&c| c != 0.0).count() as f64;
+        let verdict = laplace_trustworthiness_from_skewness(&directional, n_eff);
+        if !verdict.fallback_required() {
+            return Ok(zero());
+        }
+
+        // Build the block subspace V_b from the flagged H-eigenvectors.
+        let sym_h = (h_total + &h_total.t()) * 0.5;
+        let (evals, evecs) = sym_h.eigh(Side::Lower).map_err(|e| {
+            EstimationError::InvalidInput(format!(
+                "#784 block-local fallback eigendecomposition failed: {e}"
+            ))
+        })?;
+        let mut block_cols: Vec<usize> = Vec::new();
+        for &r in &verdict.untrustworthy_directions {
+            if r < evals.len() && evals[r] > 0.0 {
+                block_cols.push(r);
+            }
+        }
+        if block_cols.is_empty() {
+            return Ok(zero());
+        }
+        let m = block_cols.len();
+        let mut block_vecs = Array2::<f64>::zeros((p, m));
+        let mut block_lambdas = Array1::<f64>::zeros(m);
+        for (j, &r) in block_cols.iter().enumerate() {
+            block_vecs.column_mut(j).assign(&evecs.column(r));
+            block_lambdas[j] = evals[r];
+        }
+
+        // Penalty scores S_k β̂ (canonical basis) and λ_k = e^{ρ_k}.
+        let beta_hat = pirls_result.beta_transformed.as_ref().clone();
+        let penalty_scores: Vec<Array1<f64>> = self
+            .canonical_penalties
+            .iter()
+            .map(|pen| transformed_penalty_matvec(pen, &beta_hat))
+            .collect();
+        let lambdas: Vec<f64> = rho.iter().map(|&r| r.exp()).collect();
+
+        // Dispersion φ used to turn deviance into log-likelihood.
+        let phi = match reml_spec(&self.config.likelihood).response {
+            ResponseFamily::Gaussian => 1.0,
+            _ => reml_fixed_glm_dispersion(&self.config.likelihood),
+        };
+        let phi = if phi.is_finite() && phi > 0.0 { phi } else { 1.0 };
+
+        let x_dense = x_design
+            .try_to_dense_arc("#784 block-local fallback requires dense design access")
+            .map_err(EstimationError::InvalidInput)?;
+
+        let target = Gam784BlockTarget {
+            x_transformed: x_dense.as_ref(),
+            block_vecs,
+            block_lambdas,
+            beta_hat,
+            eta_hat: pirls_result.final_eta.clone(),
+            weights_obs: pirls_result.finalweights.clone(),
+            y: self.y.to_owned(),
+            prior_weights: self.weights.to_owned(),
+            likelihood: self.config.likelihood.clone(),
+            inverse_link: self.runtime_inverse_link(),
+            phi,
+            penalty_scores,
+            lambdas,
+            base_deviance: pirls_result.deviance,
+        };
+
+        let sampled =
+            block_sampled_marginal_correction(&target).map_err(EstimationError::InvalidInput)?;
+
+        // Trust gate: an importance estimate with too few effective draws is
+        // noisier than the Laplace error it is meant to correct, so we keep the
+        // plain Laplace summary rather than splicing in Monte-Carlo jitter.
+        let min_ess = (sampled.n_draws as f64 * MIN_IMPORTANCE_ESS_FRACTION).max(1.0);
+        if sampled.importance_ess < min_ess {
+            log::info!(
+                "[#784] block-local fallback declined: importance ESS {:.1} < {:.1} \
+                 (m={m} dirs, max|γ|={:.3}, τ={:.3})",
+                sampled.importance_ess,
+                min_ess,
+                verdict.max_abs_skewness,
+                verdict.threshold,
+            );
+            return Ok(zero());
+        }
+
+        log::info!(
+            "[#784] block-local sampled marginalization ENGAGED: m={m} curvature-heavy dirs, \
+             max|γ|={:.3}, τ={:.3}, Δ_b={:.4e}, ESS={:.1}/{}",
+            verdict.max_abs_skewness,
+            verdict.threshold,
+            sampled.value,
+            sampled.importance_ess,
+            sampled.n_draws,
+        );
+
+        // `Δ_b` is added to the marginal log-likelihood ⇒ subtracted from the
+        // REML cost. The gradient ∂Δ_b/∂ρ likewise enters the cost with a
+        // negative sign. Zero-extend over external coordinates.
+        let mut gradient = Array1::<f64>::zeros(n_rho + n_ext);
+        for k in 0..n_rho.min(sampled.rho_gradient.len()) {
+            gradient[k] = -sampled.rho_gradient[k];
+        }
+        Ok(TkCorrectionTerms {
+            value: -sampled.value,
+            gradient: Some(gradient),
+            hessian: None,
+        })
     }
 
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
@@ -9796,6 +10143,15 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::InvalidInput)?;
         let result = self.apply_tk_to_result(result, tk_terms)?;
+        // Adaptive, block-local Laplace-to-sampling fallback (issue #784): where
+        // a curvature direction is too non-Gaussian for the Laplace summary,
+        // splice in the importance-sampled block marginal correction. Reuses
+        // the same value+gradient splicing contract as the TK correction so the
+        // outer REML/LAML stays consistent. A no-op when every direction is
+        // Laplace-trustworthy.
+        let block_terms =
+            self.block_local_sampled_correction(rho, bundle, assembly.ext_coords.len())?;
+        let result = self.apply_tk_to_result(result, block_terms)?;
         let result = self.apply_alo_stabilization_to_result(rho, bundle, mode, result)?;
         self.store_ift_mode_response_cache_from_result(rho, bundle, &result);
         if let Some(polish_step) = result.inner_polish_step.as_ref() {
