@@ -25332,8 +25332,30 @@ fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> f64 {
         .sum()
 }
 
-/// Generalized eigenvalues `γ_j = g_j / s_j` of the design column Gram `XᵀX`
-/// against the penalty `S` on `range(S)`, computed structurally (unit weights).
+/// Generalized eigenvalues `γ_j` of the design column Gram `G = XᵀX` against the
+/// penalty `S` on `range(S)`, computed structurally (unit weights).
+///
+/// These are the eigenvalues of the pencil `(UᵀG U, D)` where `S = U D Uᵀ` and
+/// the index runs over `range(S)` (the positive eigenvalues `d_j` of `S`).
+/// Equivalently they are the eigenvalues of the symmetric matrix
+///
+/// ```text
+/// B = D^{-1/2} (Uᵀ G U) D^{-1/2}   restricted to range(S),
+/// ```
+///
+/// with `D = diag(d_j)` over the range and `U` the corresponding penalty
+/// eigenvectors. With these `γ_j` the structural effective df is the EXACT
+/// trace identity
+///
+/// ```text
+/// Σ_j γ_j/(γ_j + λ) = tr{ G (G + λ S)⁻¹ }   for all λ > 0.
+/// ```
+///
+/// This is NOT a per-direction Rayleigh quotient `(u_jᵀ G u_j)/d_j`: that would
+/// keep only the diagonal of `B` and is correct only when `G` and `S` commute
+/// (are simultaneously diagonalizable). Smooth Gram/penalty pairs generally do
+/// not commute, so the off-diagonal coupling of `B` must be retained — it is
+/// what makes the eigenvalue sum match the trace identity above.
 ///
 /// Returns `None` (caller falls back to the uniform ρ bound) whenever the
 /// geometry cannot be materialized safely as a `p×p` block-local pair — Kronecker
@@ -25356,29 +25378,63 @@ fn design_penalty_range_gammas(design: &DesignMatrix, penalty: &PenaltyMatrix) -
         return None;
     }
     let gram = x.t().dot(&x);
-    // Eigendecompose the penalty to find its range space.
+    // Eigendecompose the penalty to find its range space S = U D Uᵀ.
     let (s_evals, s_evecs) = s_dense.eigh(Side::Lower).ok()?;
     let s_max = s_evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
     if !(s_max > 0.0) {
         return None;
     }
     let s_thresh = positive_eigenvalue_threshold(s_evals.as_slice()?);
-    let mut gammas = Vec::new();
-    for (j, &sj) in s_evals.iter().enumerate() {
-        if sj <= s_thresh {
+    // Collect the range-space columns U_r (penalty eigenvectors with d_j above
+    // the numerical-zero threshold) and their inverse square-root weights
+    // d_j^{-1/2}. Directions in ker(S) are dropped: they are unpenalized and do
+    // not enter the structural edf of this term.
+    let mut range_cols: Vec<usize> = Vec::new();
+    let mut inv_sqrt_d: Vec<f64> = Vec::new();
+    for (j, &dj) in s_evals.iter().enumerate() {
+        if dj <= s_thresh {
             continue; // null space of S: not a penalized direction.
         }
-        let u = s_evecs.column(j);
-        // Design curvature along this penalty eigenvector (unit weights):
-        //   g_j = uᵀ (XᵀX) u.
-        let gu = gram.dot(&u);
-        let gj = u.dot(&gu);
+        range_cols.push(j);
+        inv_sqrt_d.push(1.0 / dj.sqrt());
+    }
+    let r = range_cols.len();
+    if r == 0 {
+        return None;
+    }
+    // Form U_r (p×r) and the symmetric pencil matrix
+    //   B = D_r^{-1/2} (U_rᵀ G U_r) D_r^{-1/2}   (r×r),
+    // whose eigenvalues are the generalized eigenvalues of (UᵀGU, D) on
+    // range(S). Scaling U_r's columns by d_j^{-1/2} up front gives
+    //   Y = U_r D_r^{-1/2}  (p×r),   B = Yᵀ G Y,
+    // which is symmetric by construction (Gram of G in the Y-columns).
+    let mut y = Array2::<f64>::zeros((p, r));
+    for (col, (&src, &w)) in range_cols.iter().zip(inv_sqrt_d.iter()).enumerate() {
+        let u = s_evecs.column(src);
+        for row in 0..p {
+            y[(row, col)] = u[row] * w;
+        }
+    }
+    let b = y.t().dot(&gram).dot(&y);
+    // Symmetrize defensively against round-off before the symmetric solver, then
+    // take eigenvalues. These are the γ_j (data-free, unit-weight).
+    let mut b_sym = b.clone();
+    for i in 0..r {
+        for j in (i + 1)..r {
+            let avg = 0.5 * (b_sym[(i, j)] + b_sym[(j, i)]);
+            b_sym[(i, j)] = avg;
+            b_sym[(j, i)] = avg;
+        }
+    }
+    let (b_evals, _) = b_sym.eigh(Side::Lower).ok()?;
+    let mut gammas = Vec::with_capacity(r);
+    for &gj in b_evals.iter() {
+        // A penalized direction with no design support has γ→0: edf→0 for any
+        // λ>0, so it cannot be floored by bounding ρ. Clamp tiny negative
+        // round-off to 0; it never contributes to the retained df sum.
         if gj.is_finite() && gj > 0.0 {
-            gammas.push(gj / sj);
+            gammas.push(gj);
         } else {
-            // A penalized direction with no design support has γ→0: edf→0 for any
-            // λ>0, so it cannot be floored by bounding ρ. Skip it (it never
-            // contributes to the retained df sum).
             gammas.push(0.0);
         }
     }
