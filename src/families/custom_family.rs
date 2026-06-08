@@ -14442,19 +14442,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         } else {
             None
         };
-        // Fold the Firth value `−Φ` into the cycle-0 baseline. SIGN
-        // (gam#729/#715): Firth ADDS ½log|I| to the log-likelihood ⇒ the NLL
-        // objective is `−ℓ + ½βᵀSβ − Φ`, matching the Newton step rhs / KKT
-        // residual which ADD `∇Φ` to `∇L − Sβ`. The per-cycle trial and post-accept
-        // folds carry the matching `jeffreys_skippable_this_cycle` gate; this
-        // cycle-0 baseline is computed at the start β where the term is active
-        // (cold seed is never well-conditioned-skippable), so it folds Φ to keep
-        // the first trust-region accept on the augmented objective.
-        if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-            let phi0 = custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
-            current_penalty -= phi0;
-            lastobjective = -current_log_likelihood + current_penalty;
-        }
+        // FIRTH MERIT BOOKKEEPING (gam#826/#872 — per-cycle Φ fold, not a carried
+        // value). `current_penalty` / `lastobjective` hold ONLY the quadratic
+        // penalty `½βᵀSβ` (NO Φ). The Firth value `−Φ` is folded into the
+        // accept/reject comparison FRESH at each β under the same
+        // `jeffreys_skippable_this_cycle` gate the step and KKT residual use, so
+        // `old_objective` (old β) and `trialobjective` (trial β) are always on the
+        // same objective `−ℓ + ½βᵀSβ − Φ` regardless of whether a cycle skips the
+        // term. Carrying Φ in `current_penalty` (the previous design) desynced
+        // old-vs-trial by ±Φ whenever the per-cycle skippable decision flipped —
+        // and the cycle-0 baseline folded Φ UNCONDITIONALLY while the trial folded
+        // it gated, so a skippable cycle 0 saw a spurious `Δobj = ±Φ`, rejected
+        // every backtrack, and refused as a `phantom_multiplier` at a zero step
+        // (the binomial location-scale coupled non-convergence). SIGN: Firth ADDS
+        // ½log|I| to the log-likelihood ⇒ the NLL objective SUBTRACTS Φ, matching
+        // the Newton step rhs / KKT residual which ADD `∇Φ` to `∇L − Sβ`.
 
         let joint_mode_diagonal_ridge =
             if ridge > 0.0 && options.ridge_policy.include_quadratic_penalty {
@@ -15378,7 +15380,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
 
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
-            let old_objective = lastobjective;
+            // Firth value Φ at the OLD (start-of-cycle) β, folded under the SAME
+            // skippable gate the trial uses below — so `actual_reduction =
+            // old_objective − trialobjective` compares two points on one objective
+            // `−ℓ + ½βᵀSβ − Φ` (gam#826/#872). `lastobjective` is the pure
+            // quadratic-penalized objective; subtract the gated old-β Φ here.
+            let old_phi = if !jeffreys_skippable_this_cycle {
+                joint_jeffreys_subspace
+                    .as_ref()
+                    .map(|z_joint| {
+                        custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint)
+                    })
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let old_objective = lastobjective - old_phi;
             // Row measure observed by the objective at β. `lastobjective` was
             // set on the previous cycle (or at function entry) under `options`;
             // see top-of-cycle capture for rationale.
@@ -16178,18 +16195,23 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 joint_bundle,
                 Some(specs),
             );
-            // Re-fold the Firth value `−Φ` at the accepted iterate so the carried
-            // baseline (`lastobjective`, next cycle's `old_objective`) stays on the
-            // augmented objective `−ℓ + ½βᵀSβ − Φ` the trials are compared against.
-            // SUBTRACT (sign) and gate on `jeffreys_skippable_this_cycle` to match
-            // the trial fold (gam#729/#715 sign fix). No-op when unavailable/skipped.
-            if !jeffreys_skippable_this_cycle
-                && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
-            {
-                current_penalty -=
-                    custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
-            }
+            // `current_penalty` / `lastobjective` stay the pure quadratic-penalized
+            // objective (NO Φ folded in) — the Firth value is applied per cycle at
+            // each β (see `old_objective` above and `trialobjective` below). The
+            // gated Φ at the accepted β is captured separately so the convergence
+            // `objective_change` compares the augmented objective at the new vs old
+            // β consistently (gam#826/#872).
             lastobjective = -current_log_likelihood + current_penalty;
+            let new_phi = if !jeffreys_skippable_this_cycle {
+                joint_jeffreys_subspace
+                    .as_ref()
+                    .map(|z_joint| {
+                        custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint)
+                    })
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
             let accepted_step_inf = states
                 .iter()
                 .zip(old_beta.iter())
@@ -16386,7 +16408,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         && *norm <= RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR * *tol
                 });
             let near_convergence = residual <= 10.0 * residual_tol;
-            let signed_obj_change = lastobjective - old_objective;
+            // Augmented-objective change: `(quad(new) − Φ_gated(new)) −
+            // (quad(old) − Φ_gated(old))`. `lastobjective` is quadratic-only and
+            // `old_objective` already carries `−old_phi`, so subtract the accepted
+            // β's `new_phi` here to keep both endpoints on the Φ-augmented merit
+            // (gam#826/#872). On a skippable cycle both phis are 0 ⇒ identical to
+            // the bare quadratic change.
+            let signed_obj_change = (lastobjective - new_phi) - old_objective;
             let objective_change = signed_obj_change.abs();
 
             // Per-cycle observability for the convergence test. Surfaces
