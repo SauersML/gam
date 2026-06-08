@@ -9466,23 +9466,42 @@ impl CharbonnierScalarBlockState {
         //   r_k^snr        = sqrt( t_k^credible^2 + eps^2 ),
         //   w_k            = 1 / r_k^snr.
         //
-        // This realizes the intended behavior exactly: a derivative is left
-        // un-penalized (small w) only when its magnitude is *credibly* large
-        // (t_k^2 >> Var, real feature); the penalty pulls hardest toward zero
-        // (large w) where the derivative is credibly near zero — small estimate
-        // AND small variance, OR a large-but-poorly-determined estimate whose
-        // signal is swamped by its variance. (Note: the additive `+Var` radius
-        // sketched in the design notes points the *opposite* way — it would
-        // un-penalize noisy responses even harder — so we use the variance-
-        // *corrected* second moment, which is the direction that actually
-        // suppresses noise while preserving credible edges.) With
-        // `variance == 0` everywhere this degrades exactly to `surrogateweights`,
-        // so any covariance-unavailable path is unchanged.
+        // The principled fix is the *posterior expectation* of the MM weight
+        // under the working-Laplace posterior `beta ~ N(beta_hat, Sigma_beta)`,
+        // `Sigma_beta = H^{-1}`. The Charbonnier MM weight is the function
+        //
+        //   f(t) = 1 / sqrt(t^2 + eps^2),
+        //
+        // and the response `t_k = (D0 beta)_k` is, under the posterior, a normal
+        // variate `t_k ~ N(t_hat_k, V_k)` with `V_k = (D0 Sigma_beta D0^T)_kk`.
+        // The weight that majorizes the *expected* penalty is `E[f(t_k)]`, which
+        // to second order (the only order the diagonal variance proxy supports)
+        // is the delta-method expansion
+        //
+        //   E[f(t_k)] ≈ f(t_hat_k) + ½ f''(t_hat_k) V_k,
+        //   f''(t) = (2 t^2 - eps^2) / (t^2 + eps^2)^{5/2}.
+        //
+        // This is the correct realization of the intent: where the point
+        // estimate is a *credible* edge (t_hat^2 >> V) the curvature `f''` is
+        // small and the weight is essentially `1/|t_hat|` (left un-penalized);
+        // where the large point-estimate magnitude is *noise* (t_hat^2 ~ V) the
+        // positive `½ f'' V` correction *raises* the weight (extra smoothing),
+        // but only by a bounded, signal-scale-aware amount (~2× for pure noise),
+        // never the unbounded `1/eps` saturation a hard `max(t^2 - V, 0)` noise
+        // floor injects — that saturation over-regularizes when `eps` is small
+        // relative to the data and is what made SNR fits *worse* than the
+        // magnitude-only baseline. With `V == 0` everywhere this degrades
+        // exactly to `surrogateweights` (`1/sqrt(t^2 + eps^2)`), so any
+        // covariance-unavailable path is unchanged.
         let eps2 = self.epsilon * self.epsilon;
         let weight = Array1::from_iter(self.signal.iter().zip(variance.iter()).map(|(&t, &v)| {
-            let credible_sq = (t * t - v.max(0.0)).max(0.0);
-            let r = (credible_sq + eps2).sqrt();
-            (1.0 / r).clamp(weight_floor, weight_ceiling)
+            let t2 = t * t;
+            let r2 = t2 + eps2;
+            let r = r2.sqrt();
+            let f = 1.0 / r;
+            let f_second = (2.0 * t2 - eps2) / (r2 * r2 * r);
+            let expected = f + 0.5 * f_second * v.max(0.0);
+            expected.clamp(weight_floor, weight_ceiling)
         }));
         let invweight = weight.mapv(|u| 1.0 / u);
         (weight, invweight)
@@ -9675,14 +9694,41 @@ impl CharbonnierGroupedBlockState {
         //
         // A block whose norm is credibly large (g_k^2 >> tr Cov) keeps a small
         // weight (real feature, left un-penalized); a block whose norm is
-        // dominated by posterior variance is pulled toward zero by a large
-        // weight (noise suppressed). With `variance == 0` this recovers
-        // `surrogateweights` exactly.
+        // dominated by posterior variance is pulled toward zero by a *bounded*
+        // up-weighting (noise suppressed) — never the unbounded `1/eps`
+        // saturation a hard `max(g^2 - V, 0)` noise floor injects (which
+        // over-regularizes and made SNR fits worse than magnitude-only).
+        //
+        // As in the scalar case the weight is the posterior expectation of the
+        // grouped MM weight `f(v) = (||v||^2 + eps^2)^{-1/2}` under the
+        // working-Laplace posterior `v_k ~ N(v_hat_k, C_k)` with
+        // `tr(C_k) = variance[k]`. The second-order (delta-method) expectation is
+        //
+        //   E[f(v_k)] ≈ f(v_hat_k) + ½ Σ_ab ∂²_ab f · (C_k)_ab,
+        //   ∂²_ab f = -δ_ab / r^3 + 3 v_a v_b / r^5,   r = sqrt(g^2 + eps^2).
+        //
+        // With only the diagonal trace proxy available we use the isotropic
+        // `C_k ≈ (tr C_k / block_dim) I`, for which `v_hat^T C v_hat ≈
+        // (tr C / block_dim) g^2`, giving the correction
+        //
+        //   ½ ( -tr(C)/r^3 + 3 (tr C / block_dim) g^2 / r^5 ).
+        //
+        // For `block_dim == 1` this reduces *exactly* to the scalar
+        // `½ (2 g^2 - eps^2) V / r^5` form, keeping the two paths consistent.
+        // With `V == 0` it recovers `1/sqrt(g^2 + eps^2)`.
         let eps2 = self.epsilon * self.epsilon;
+        let block_dim = self.signal_blocks.ncols().max(1) as f64;
         let weight = Array1::from_iter(self.norm.iter().zip(variance.iter()).map(|(&g, &v)| {
-            let credible_sq = (g * g - v.max(0.0)).max(0.0);
-            let r = (credible_sq + eps2).sqrt();
-            (1.0 / r).clamp(weight_floor, weight_ceiling)
+            let g2 = g * g;
+            let r2 = g2 + eps2;
+            let r = r2.sqrt();
+            let f = 1.0 / r;
+            let tr_c = v.max(0.0);
+            let r3 = r2 * r;
+            let r5 = r2 * r2 * r;
+            let correction = 0.5 * (-tr_c / r3 + 3.0 * (tr_c / block_dim) * g2 / r5);
+            let expected = f + correction;
+            expected.clamp(weight_floor, weight_ceiling)
         }));
         let invweight = weight.mapv(|u| 1.0 / u);
         (weight, invweight)
