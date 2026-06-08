@@ -16257,6 +16257,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
+            if cycle < 25 || cycle % 100 == 0 {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    let bi = flatten_state_betas(&states, specs).iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                    let fs = head_jeffreys_term.as_ref().map(|(g,_)| g.iter().map(|v| v.abs()).fold(0.0_f64,f64::max)).unwrap_or(0.0);
+                    writeln!(f, "[DIAG] screen={} cyc={cycle} resid={residual:.3e} step={step_inf:.3e} acc={accepted_step_inf:.3e} beta={bi:.3e} tr={joint_trust_radius:.3e} skip={jeffreys_skippable_this_cycle} firth={fs:.3e} p={total_p}", options.seed_screening).ok();
+                }
+            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
