@@ -258,6 +258,27 @@ impl CustomFamily for DirichletCommonFamily {
         true
     }
 
+    /// Engage the self-vanishing Levenberg–Marquardt damping on a FULL-RANK but
+    /// ILL-CONDITIONED penalized joint Hessian, not only on a rank-deficient one.
+    ///
+    /// The coupled common-log-α Dirichlet is exactly the regime this gate exists
+    /// for: the *observed* joint information `∂²(−ℓ)/∂η_a∂η_b` couples every block
+    /// through `α₀ = Σ_k α_k`, and on a small, concentrated composition (the 23-row
+    /// Skye AFM series, ~15 train rows, K = 3) the penalized joint Hessian is
+    /// full-rank but ill-conditioned: some range-space curvature directions sit
+    /// just above the rank cutoff. Undamped, the range-restricted joint-Newton step
+    /// takes an enormous `component/λ` proposal on those near-singular modes, the
+    /// trust region clips it every cycle, and the stationarity residual along that
+    /// mode never settles — the inner solve oscillates and exhausts its cycle
+    /// budget without reaching KKT (the real-data non-convergence in #729 arm 10b).
+    /// Because `μ ∝ ‖∇L − Sβ‖∞ → 0` at the fixed point, the damping only shapes the
+    /// trajectory (oscillation → bounded descent); the converged β / KKT
+    /// certificate is unchanged, so the truth-recovery and match-or-beat assertions
+    /// are evaluated against the same optimum, never weakened.
+    fn levenberg_on_ill_conditioning(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian_with_specs(
         &self,
         block_states: &[ParameterBlockState],
@@ -319,9 +340,27 @@ impl CustomFamily for DirichletCommonFamily {
                     let aa = alpha[a][i];
                     let ab = alpha[b][i];
                     let a0 = alpha0[i];
+                    // EXPECTED (Fisher) information in η-space, NOT the observed
+                    // Hessian. The Dirichlet log-link is non-canonical, so the
+                    // observed information carries the score-residual term
+                    // `−α_a·R_a` with `R_a = ψ(α₀) − ψ(α_a) + ln y_a`. Far from the
+                    // optimum that residual is O(1) and flips the sign of the
+                    // diagonal block, making the *observed* joint Hessian
+                    // INDEFINITE — the joint-Newton inner step then loses its
+                    // descent guarantee and the coupled K-block solve oscillates /
+                    // exhausts its cycle budget on the small, concentrated Skye
+                    // composition (#729 arm 10b). The Fisher information
+                    // `E[−∂²ℓ/∂η_a∂η_b]` drops the residual term (`E[R_a]=0`), is
+                    // globally PSD (a score covariance), and equals the observed
+                    // Hessian at the MLE — Fisher scoring converges to the SAME
+                    // stationary point with guaranteed-descent curvature and is
+                    // consistent with the per-block working weights `evaluate`
+                    // emits. The outer REML trace calculus below differentiates
+                    // this SAME Fisher matrix, so the logdet/trace derivatives stay
+                    // exact (mgcv's penalized-likelihood REML is built on Fisher
+                    // scoring identically).
                     weights[i] = if a == b {
-                        let residual = digamma(a0) - digamma(aa) + self.log_y[a][i];
-                        aa * aa * (trigamma(aa) - trigamma(a0)) - aa * residual
+                        aa * aa * (trigamma(aa) - trigamma(a0))
                     } else {
                         -aa * ab * trigamma(a0)
                     };
@@ -418,13 +457,14 @@ impl CustomFamily for DirichletCommonFamily {
                     let trig_a0 = trigamma(a0);
                     let tetr_a0 = tetragamma(a0);
                     weights[i] = if a == b {
-                        let residual = digamma(a0) - digamma(aa) + self.log_y[a][i];
+                        // β-directional derivative of the EXPECTED (Fisher)
+                        // diagonal block `α_a²(ψ'(α_a) − ψ'(α₀))` — the residual
+                        // term `−α_a·R_a` is absent from the Fisher Hessian, so it
+                        // contributes nothing here. Keeping H and D_β H on the same
+                        // (Fisher) matrix is what makes the outer REML trace exact.
                         let trig_aa = trigamma(aa);
-                        let d_residual = trig_a0 * da0 - trig_aa * da;
                         2.0 * aa * da * (trig_aa - trig_a0)
                             + aa * aa * (tetragamma(aa) * da - tetr_a0 * da0)
-                            - da * residual
-                            - aa * d_residual
                     } else {
                         let ab = alpha[b][i];
                         let db = d_alpha[b][i];
@@ -541,8 +581,14 @@ impl CustomFamily for DirichletCommonFamily {
                     let tetr0 = tetragamma(a0);
                     let pent0 = pentagamma(a0);
                     weights[i] = if a == b {
-                        // w_aa = α_a²(ψ'(α_a) − ψ'(α₀)) − α_a·R_a,
-                        //   R_a = ψ(α₀) − ψ(α_a) + log_y_a.
+                        // Second β-directional derivative of the EXPECTED (Fisher)
+                        // diagonal block `w_aa = α_a²(ψ'(α_a) − ψ'(α₀))`. The
+                        // observed-information residual term `−α_a·R_a`
+                        // (R_a = ψ(α₀) − ψ(α_a) + log_y_a) is NOT part of the Fisher
+                        // Hessian and is therefore absent from every order of its
+                        // directional derivative; dropping it keeps H, D_β H and
+                        // D²_β H consistent on one (Fisher) matrix so the exact
+                        // outer-REML 3rd-order trace term stays exact.
                         let aa = alpha[a][i];
                         let dua = du_alpha[a][i];
                         let dva = dv_alpha[a][i];
@@ -564,19 +610,7 @@ impl CustomFamily for DirichletCommonFamily {
                         let duv_g =
                             pent_a * dua * dva + tetr_a * duva - (pent0 * du0 * dv0 + tetr0 * duv0);
 
-                        let duv_t1 = d_uv_a2 * g + du_a2 * dv_g + dv_a2 * du_g + a2 * duv_g;
-
-                        // R = ψ(α₀) − ψ(α_a) + log_y_a (digamma value at base β).
-                        let r = digamma(a0) - digamma(aa) + self.log_y[a][i];
-                        let du_r = trig0 * du0 - trig_a * dua;
-                        let dv_r = trig0 * dv0 - trig_a * dva;
-                        let duv_r =
-                            tetr0 * du0 * dv0 + trig0 * duv0 - (tetr_a * dua * dva + trig_a * duva);
-
-                        // T2 = −α_a·R.
-                        let duv_t2 = -(duva * r + dua * dv_r + dva * du_r + aa * duv_r);
-
-                        duv_t1 + duv_t2
+                        d_uv_a2 * g + du_a2 * dv_g + dv_a2 * du_g + a2 * duv_g
                     } else {
                         // w_ab = −α_a α_b ψ'(α₀), a ≠ b.
                         let aa = alpha[a][i];
