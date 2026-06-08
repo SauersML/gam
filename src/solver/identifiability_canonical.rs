@@ -43,6 +43,7 @@ use crate::families::custom_family::{
 };
 use crate::families::identifiability_compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
+    scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::{default_rrqr_rank_alpha, rrqr_with_permutation};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
@@ -151,6 +152,18 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
     }
     fn evaluate_full(&self) -> Array3<f64> {
         self.jac.clone()
+    }
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+        // Scale straight out of the stored `(n, p, K)` tensor: the closure
+        // reads `self.jac` element-wise, so the `(n·K, p)` design the compiler
+        // consumes is produced without cloning the whole tensor first (the
+        // default impl's `evaluate_full()` clone). (#738: a capability is not a
+        // representation — supply the scaled design directly from the stored
+        // layout instead of materialising a dense tensor to be re-scaled.)
+        let n = self.nrows();
+        let p = self.ncols();
+        let k = self.k();
+        scale_jacobian_by_sqrt_h_with(n, p, k, h_full, |i, a, c| self.jac[[i, a, c]])
     }
     fn channel_flattened_column(&self, col: usize, out: &mut [f64]) {
         let n = self.nrows();
