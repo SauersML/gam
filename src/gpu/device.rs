@@ -42,6 +42,28 @@ pub struct GpuDeviceInfo {
 }
 
 impl GpuDeviceInfo {
+    /// Fraction of a device's *total* VRAM that any single dispatch is allowed
+    /// to budget against. The per-device budget is `min(free, total ·
+    /// MEMORY_BUDGET_TOTAL_FRACTION)`: free memory is the hard ceiling, but we
+    /// cap at half of *total* so that even on a freshly idle device we leave
+    /// headroom for the driver context, cuBLAS/cuSOLVER workspaces, and a
+    /// second concurrent tile from the multi-GPU pool. Denominator `2` ⇒ half.
+    const MEMORY_BUDGET_TOTAL_DIVISOR: usize = 2;
+
+    /// Per-device byte budget a dispatch may size its buffers against:
+    /// `min(free_mem, total_mem / MEMORY_BUDGET_TOTAL_DIVISOR)`. Single source
+    /// of truth for both the primary-device budget (`runtime::probe`) and the
+    /// per-ordinal pool budget (`GpuRuntime::memory_budget_for`).
+    #[must_use]
+    pub const fn memory_budget_bytes(&self) -> usize {
+        let half_total = self.total_mem_bytes / Self::MEMORY_BUDGET_TOTAL_DIVISOR;
+        if self.free_mem_bytes < half_total {
+            self.free_mem_bytes
+        } else {
+            half_total
+        }
+    }
+
     pub fn score(&self) -> f64 {
         let fp64_bonus = if self.capability.has_fp64_tensor_cores {
             100.0
