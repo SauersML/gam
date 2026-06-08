@@ -102,6 +102,7 @@ rust_digest.txt
 .maturin/
 dist/
 gamfit/_rust.abi3.so
+gamfit/_rust*.so
 gamfit/*.dSYM/
 
 # MkDocs / docs build output

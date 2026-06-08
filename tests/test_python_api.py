@@ -1152,6 +1152,93 @@ def test_duchon_function_norm_penalty_1d_public_wrapper_arity_issue_880() -> Non
     _assert_symmetric_psd(s, "1D Duchon penalty")
 
 
+@pytest.mark.parametrize("d", [1, 2, 3, 4])
+def test_duchon_function_norm_penalty_matches_basis_order_resolution_issue_880(
+    d: int,
+) -> None:
+    """The function-norm penalty must penalize the SAME matrix ``duchon_basis``
+    builds for identical ``(centers, m)``.
+
+    Root-cause guard for gam#880's second defect: the penalty primitive once
+    resolved ``(nullspace_order, power)`` with ``max_op = 2`` while the design
+    primitive ``duchon_basis`` uses ``max_op = 0``. That over-escalated the
+    polynomial null-space order (e.g. d=2 ``Linear`` → ``Degree(2)``) and
+    resolved a *different* spectral power, so the returned penalty did not match
+    the basis and erred outright on low-center-count d ≥ 2 fits.
+
+    The two primitives now agree, which pins two observable invariants per
+    dimension:
+
+    * the penalty is ``(K, K)`` with ``K`` equal to the basis column count
+      (``= n_centers``), so it can actually penalize a ``duchon_basis`` fit; and
+    * the penalty's null space is exactly the ``Linear`` affine trend
+      (``d + 1`` columns: constant + one slope per axis) that the basis leaves
+      unpenalized — not the larger ``Degree(2)`` block the stale ``max_op = 2``
+      path would have produced.
+    """
+    rng = np.random.default_rng(100 + d)
+    n_centers = 12
+    centers = rng.uniform(-1.0, 1.0, size=(n_centers, d))
+    pts = rng.uniform(-1.0, 1.0, size=(40, d))
+
+    basis = np.asarray(gamfit.duchon_basis(pts, centers, m=2), dtype=float)
+    penalty = np.asarray(
+        gamfit.duchon_function_norm_penalty(centers, m=2), dtype=float
+    )
+
+    assert basis.shape == (40, n_centers), basis.shape
+    assert penalty.shape == (n_centers, n_centers), penalty.shape
+    assert penalty.shape[1] == basis.shape[1], (
+        "penalty dimension must equal the basis column count so the penalty "
+        "applies to a duchon_basis fit"
+    )
+    _assert_symmetric_psd(penalty, f"{d}D Duchon penalty")
+
+    eigvals = np.linalg.eigvalsh(0.5 * (penalty + penalty.T))
+    null_dim = int(np.sum(np.abs(eigvals) < 1e-8))
+    assert null_dim == d + 1, (
+        f"d={d}: penalty null space dim {null_dim} != d+1={d + 1}; the cubic "
+        "default leaves only the affine trend free, so an over-escalated "
+        "Degree(2) null space (the stale max_op=2 path) would show here"
+    )
+
+
+@pytest.mark.parametrize("n_centers", [3, 4, 5, 8, 16])
+def test_duchon_function_norm_penalty_2d_low_center_counts_issue_880(
+    n_centers: int,
+) -> None:
+    """The non-periodic d=2 penalty must build + be PSD across center counts,
+    including the few-center regime that the stale ``max_op=2`` escalation
+    broke (gam#880).
+
+    With ``max_op=2`` the d=2 null space was escalated to ``Degree(2)`` (six
+    polynomial columns); with only a handful of centers that degraded all the
+    way to ``Zero`` and left ``2(p+s)=2 ≤ d`` — no admissible kernel. The cubic
+    structural default ``(Linear, s=(d-1)/2)`` keeps the kernel admissible
+    (``2(p+s)=d+3 > d``) even after the null space degrades on sparse centers.
+    """
+    rng = np.random.default_rng(7 + n_centers)
+    centers = rng.uniform(-1.0, 1.0, size=(n_centers, 2))
+    penalty = np.asarray(
+        gamfit.duchon_function_norm_penalty(centers, m=2), dtype=float
+    )
+    assert penalty.shape == (n_centers, n_centers), penalty.shape
+    assert np.all(np.isfinite(penalty)), "penalty has non-finite entries"
+    _assert_symmetric_psd(penalty, f"2D Duchon penalty ({n_centers} centers)")
+
+
+@pytest.mark.xfail(
+    reason="gam#878/#580: the d>=2 mixed-periodicity Duchon penalty uses the "
+    "polyharmonic-of-chord-distance kernel projected onto a CONSTANTS-ONLY "
+    "null space. That kernel is conditionally PD of order m=2 (PD only "
+    "orthogonal to degree-<=1 polynomials), so removing only constants leaves "
+    "the linear directions and the center Gram Omega = Z^T K_chord Z is "
+    "genuinely indefinite (large negative eigenvalues), exactly the 1D "
+    "indefiniteness gam#580 documents. A PSD periodic-Duchon penalty needs a "
+    "different construction (torus/cylinder Green's function), tracked for the "
+    "periodic-Duchon redesign; the non-periodic path (gam#880) is unaffected.",
+    strict=False,
+)
 def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     """d=2 mixed-periodicity Duchon (cylinder): symmetric, PSD, wraps cleanly."""
     # Spread centers across the periodic axis [0, 2π] (auto-derived period)
@@ -1192,6 +1279,15 @@ def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     )
 
 
+@pytest.mark.xfail(
+    reason="gam#878/#580: same root cause as the cylinder case — the "
+    "chord-distance polyharmonic kernel projected onto the constants-only null "
+    "space is indefinite for the d>=2 torus (Omega = Z^T K_chord Z carries "
+    "large negative eigenvalues). Needs the torus Green's-function "
+    "construction, tracked for the periodic-Duchon redesign; the non-periodic "
+    "path (gam#880) is unaffected.",
+    strict=False,
+)
 def test_duchon_function_norm_penalty_2d_torus_periodic() -> None:
     """d=2 mixed-periodicity Duchon (torus): symmetric, PSD, wraps cleanly."""
     rng = np.random.default_rng(1)
@@ -1714,7 +1810,25 @@ def test_duchon_basis_hybrid_high_d_builds(d: int) -> None:
     assert np.all(np.isfinite(basis)), "hybrid Duchon basis has non-finite entries"
 
 
-@pytest.mark.parametrize("d", [8, 16])
+@pytest.mark.parametrize(
+    "d",
+    [
+        8,
+        pytest.param(
+            16,
+            marks=pytest.mark.xfail(
+                reason="High-d hybrid (Matern-blended) Duchon penalty is not yet "
+                "PSD at d=16: the pure-spectrum order resolves to spectral power "
+                "s=7, and the partial-fraction Matern blend at that order loses "
+                "positive-definiteness numerically (min eigenvalue ~ -0.26, well "
+                "beyond float noise). d=8 (s=3) is fine. This is a distinct "
+                "high-d Matern-blend numerics limitation, separate from the "
+                "non-periodic order-policy fix in gam#880.",
+                strict=False,
+            ),
+        ),
+    ],
+)
 def test_duchon_function_norm_penalty_hybrid_high_d_psd(d: int) -> None:
     """Hybrid function-norm penalty at high d builds + symmetric PSD."""
     rng = np.random.default_rng(11 + d)

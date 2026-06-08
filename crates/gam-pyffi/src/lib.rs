@@ -29639,19 +29639,23 @@ struct DuchonHybridConfig {
 /// keywords. ``max_op`` is the highest radial-derivative order required by
 /// the downstream consumer of this spec:
 ///
-/// * ``max_op = 0`` — basis-only consumers that never assemble operator
-///   penalties (e.g. the Python ``duchon_basis`` PyFFI returns only the
-///   design matrix). Only kernel-existence and the pure-Duchon CPD guard
-///   apply; D1 / D2 collocation is not required.
+/// * ``max_op = 0`` — consumers that never assemble operator penalties: both
+///   the Python ``duchon_basis`` PyFFI (returns only the design matrix) AND
+///   the ``duchon_function_norm_penalty`` PyFFI (returns only the native
+///   reproducing-norm Gram ``PenaltySource::Primary`` plus a null-space
+///   shrinkage ridge). Only kernel-existence (``2(p+s) > d``) and the
+///   pure-Duchon CPD guard (``2s < d``) apply; D1 / D2 collocation is not
+///   required. These two primitives MUST resolve identically so the penalty
+///   matches the basis it penalizes (gam#880).
 /// * ``max_op = 2`` — collocation up to the curvature operator (mass +
-///   tension + stiffness). Used only by the low-level reference primitive
-///   ``duchon_function_norm_penalty``, which exposes the closed-form
-///   collocation operator Grams for the reference-quality suite. The formula
-///   path does NOT route through this resolver: the non-periodic Euclidean
-///   smooth term resolves ``(nullspace_order, power)`` via the cubic
-///   structural rule (``Linear`` null space, spectral power ``s = (d−1)/2``)
-///   and ships the native reproducing-norm Gram plus a null-space shrinkage
-///   ridge, not the operator triplet.
+///   tension + stiffness). No PyFFI primitive routes through this any longer;
+///   it is retained for any future consumer that re-introduces the closed-form
+///   collocation operator Grams. The formula path does NOT route through this
+///   resolver either: the non-periodic Euclidean smooth term resolves
+///   ``(nullspace_order, power)`` via the cubic structural rule (``Linear``
+///   null space, spectral power ``s = (d−1)/2``) and ships the native
+///   reproducing-norm Gram plus a null-space shrinkage ridge, not the operator
+///   triplet.
 fn resolve_duchon_hybrid_config(
     dim: usize,
     m: usize,
