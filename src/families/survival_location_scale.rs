@@ -66,6 +66,79 @@ use std::sync::Arc;
 const SURVIVAL_ROW_PARALLEL_THRESHOLD: usize = 256;
 const SURVIVAL_ROW_PARALLEL_CHUNK: usize = 64;
 
+/// Relative slack tolerating round-off when checking a represented
+/// nonnegativity / linear-inequality constraint (`value < -tol·max(1, |scale|)`
+/// rejects). A coefficient or slack that is negative only by this much is
+/// floating-point noise about an active constraint, not a real violation.
+const CONSTRAINT_NONNEGATIVITY_REL_TOL: f64 = 1e-10;
+
+/// Maximum number of Dykstra alternating-projection sweeps when projecting an
+/// initial coefficient guess onto the represented linear inequality
+/// constraints. The projection converges geometrically; this caps the rare
+/// near-degenerate constraint set and keeps the warm-start best-effort.
+const DYKSTRA_PROJECTION_MAX_SWEEPS: usize = 100;
+
+/// Absolute feasibility tolerance at which the Dykstra projection sweep is
+/// declared converged (max constraint violation below this stops the loop).
+const DYKSTRA_PROJECTION_TOL: f64 = 1e-10;
+
+/// Squared-row-norm floor below which a constraint row is treated as
+/// structurally empty and skipped during Dykstra projection (avoids dividing
+/// the projection step by a vanishing normal).
+const DYKSTRA_ROW_DEGENERACY_FLOOR: f64 = 1e-18;
+
+/// Relative tolerance (× the largest |eigenvalue|) for accepting a covariance
+/// block as positive semidefinite, floored by an absolute value so an
+/// all-tiny-eigenvalue block is not rejected on pure round-off. Eigenvalues
+/// below `-tol` flag a genuine indefinite block.
+const PSD_EIGENVALUE_REL_TOL: f64 = 1e-12;
+const PSD_EIGENVALUE_ABS_FLOOR: f64 = 1e-14;
+
+/// Levenberg damping schedule for the direct parametric-AFT Newton solve. When
+/// the Hessian is not Cholesky-factorizable, damping starts at
+/// `INITIAL × max(1, ‖diag H‖∞)`, grows by `GROWTH` per failed factorization,
+/// and the solve aborts once it would exceed `MAX × max(1, ‖diag H‖∞)` (the
+/// Hessian is then numerically unsalvageable). All three scale with the
+/// Hessian's diagonal magnitude so the schedule is units-invariant.
+const LEVENBERG_INITIAL_DAMPING_REL: f64 = 1e-8;
+const LEVENBERG_DAMPING_GROWTH: f64 = 10.0;
+const LEVENBERG_MAX_DAMPING_REL: f64 = 1e8;
+
+/// Outer (smoothing-parameter) loop budget for the blockwise location-scale
+/// fit: at most this many outer iterations, stopping once the outer relative
+/// change falls below the tolerance. The dead-flat time-smoothing ridge of the
+/// constant-scale case is what makes a finite cap necessary.
+const BLOCKWISE_OUTER_MAX_ITER: usize = 60;
+const BLOCKWISE_OUTER_TOL: f64 = 1e-5;
+
+/// Lower bound on the gradient tolerance handed to the reduced parametric-AFT
+/// direct MLE. The inner-solve tolerance can be configured arbitrarily small;
+/// flooring it here keeps the Newton stopping test above the noise of the
+/// log-likelihood gradient evaluation.
+const REDUCED_AFT_GRAD_TOL_FLOOR: f64 = 1e-8;
+
+/// Relative ridge added to the normal-equations diagonal of the structural
+/// time-coefficient warm-start least squares (× the largest diagonal of XᵀX,
+/// floored at 1). Stabilizes the best-effort guess against a rank-deficient
+/// derivative design without materially biasing it.
+const STRUCTURAL_GUESS_RIDGE_REL: f64 = 1e-6;
+
+/// Floor on the exit age when forming the `1/age` structural-derivative target
+/// for the time warm-start, guarding against a divide-by-zero at age 0.
+const STRUCTURAL_GUESS_AGE_FLOOR: f64 = 1e-9;
+
+/// Target byte budget for one row-chunk when streaming a design matrix's
+/// trailing columns into a dense buffer. The per-chunk row count is derived as
+/// `BUDGET / (p · sizeof(f64))`, so wide designs use proportionally fewer rows
+/// per chunk and the working set stays near this size regardless of `p`.
+const ROW_CHUNK_BYTE_BUDGET: usize = 8 * 1024 * 1024;
+
+/// Relative floor on the monotonicity-guard round-off slack: the compensated
+/// subtraction's low-part residual is the primary slack estimate, but this
+/// `1e-12 × (1 + ‖state‖∞)` term remains as a floor for moderate-magnitude
+/// inputs where the residual underestimates accumulated error.
+const MONOTONICITY_GUARD_SLACK_REL: f64 = 1e-12;
+
 /// Typed errors emitted by the survival location-scale family pipeline.
 ///
 /// Each variant carries a pre-formatted `reason` string so `Display` is
@@ -1791,7 +1864,7 @@ impl SurvivalLocationScaleFamily {
         let mut alpha = 1.0f64;
         for j in 0..beta.len() {
             let slack = beta[j];
-            if slack < -1e-10 {
+            if slack < -CONSTRAINT_NONNEGATIVITY_REL_TOL {
                 return Err(SurvivalLocationScaleError::ConstraintViolation { reason: format!(
                     "survival location-scale current linkwiggle block violates nonnegativity at coefficient {j}: beta={slack:.3e}"
                 ) }.into());
@@ -2966,7 +3039,7 @@ impl SurvivalLocationScaleFamily {
         // rounding error the d_eta/dt reconstruction may have accumulated.
         // The older state-scale heuristic remains as a floor for moderate
         // inputs.
-        let legacy_slack = 1e-12
+        let legacy_slack = MONOTONICITY_GUARD_SLACK_REL
             * (1.0
                 + state
                     .h0
@@ -3337,7 +3410,7 @@ fn design_column_tail(
         return Ok(DesignMatrix::from(Array2::<f64>::zeros((n, 0))));
     }
 
-    let chunk_rows = (8 * 1024 * 1024 / (p.max(1) * std::mem::size_of::<f64>()))
+    let chunk_rows = (ROW_CHUNK_BYTE_BUDGET / (p.max(1) * std::mem::size_of::<f64>()))
         .max(1)
         .min(n.max(1));
     let mut out = Array2::<f64>::zeros((n, active_p));
@@ -3835,13 +3908,14 @@ fn structural_time_initial_beta_guess(
 
     let mut target = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let desired = 1.0 / age_exit[i].max(1e-9);
+        let desired = 1.0 / age_exit[i].max(STRUCTURAL_GUESS_AGE_FLOOR);
         target[i] = (desired - derivative_offset_exit[i]).max(0.0);
     }
 
     let xtx = crate::faer_ndarray::fast_ata(design_derivative_exit);
     let xty = fast_atv(design_derivative_exit, &target);
-    let eps = 1e-6 * (0..p).map(|i| xtx[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
+    let eps =
+        STRUCTURAL_GUESS_RIDGE_REL * (0..p).map(|i| xtx[[i, i]]).fold(0.0_f64, f64::max).max(1.0);
     let mut lhs = xtx;
     for i in 0..p {
         lhs[[i, i]] += eps;
@@ -3897,8 +3971,8 @@ fn survival_blockwise_fit_options(spec: &SurvivalLocationScaleSpec) -> Blockwise
     BlockwiseFitOptions {
         inner_max_cycles: spec.max_iter,
         inner_tol: spec.tol,
-        outer_max_iter: 60,
-        outer_tol: 1e-5,
+        outer_max_iter: BLOCKWISE_OUTER_MAX_ITER,
+        outer_tol: BLOCKWISE_OUTER_TOL,
         compute_covariance: true,
         cache_session: spec.cache_session.clone(),
         cache_mirror_sessions: spec.cache_mirror_sessions.clone(),
@@ -4921,6 +4995,14 @@ fn structural_time_coefficient_lower_bounds(
 
     const DERIVATIVE_TOL: f64 = 1e-12;
     const FEASIBILITY_TOL: f64 = 1e-12;
+    // Diagnostics only: entries with magnitude in this open band are reported as
+    // "sub-tolerance nonzeros" to explain a missing structural lower bound. The
+    // lower edge separates genuine round-off from a hard zero; the upper edge is
+    // the derivative-activity tolerance above.
+    const SUBTOL_NONZERO_FLOOR: f64 = 1e-30;
+    // How many leading columns' max(|·|) to surface in the diagnostic message
+    // when no derivative-active column is found.
+    const DIAGNOSTIC_COLUMN_PREVIEW: usize = 8;
 
     let p = design_derivative_exit.ncols();
     let nrows = design_derivative_exit.nrows();
@@ -4942,7 +5024,7 @@ fn structural_time_coefficient_lower_bounds(
     // materialize as a single nrows×ncols dense buffer. `extract_column` is
     // O(n) for dense, O(nnz_j) for sparse, and O(matvec_n) for lazy operators
     // — the operator-form path the strict policy demands.
-    let mut col_maxes: Vec<(usize, f64)> = Vec::with_capacity(p.min(8));
+    let mut col_maxes: Vec<(usize, f64)> = Vec::with_capacity(p.min(DIAGNOSTIC_COLUMN_PREVIEW));
     let mut total_subtol_nonzeros = 0_usize;
     for col in 0..p {
         let column = design_derivative_exit.extract_column(col);
@@ -4972,7 +5054,7 @@ fn structural_time_coefficient_lower_bounds(
             if abs_value > col_max {
                 col_max = abs_value;
             }
-            if abs_value > 1e-30 && abs_value <= DERIVATIVE_TOL {
+            if abs_value > SUBTOL_NONZERO_FLOOR && abs_value <= DERIVATIVE_TOL {
                 total_subtol_nonzeros += 1;
             }
         }
@@ -4980,7 +5062,7 @@ fn structural_time_coefficient_lower_bounds(
             lower_bounds[col] = 0.0;
             has_structural_support = true;
         }
-        if col < 8 {
+        if col < DIAGNOSTIC_COLUMN_PREVIEW {
             col_maxes.push((col, col_max));
         }
     }
@@ -5018,11 +5100,13 @@ fn structural_time_coefficient_lower_bounds(
         // warn-level only in the surprising regime.
         if total_subtol_nonzeros > 0 {
             log::warn!(
-                "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows × {} cols, sub-tolerance nonzero entries (1e-30 < |v| ≤ {:.0e}): {}, first-8 col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
+                "structural time coefficient bounds: no derivative-active column on this candidate's exit-time design ({} rows × {} cols, sub-tolerance nonzero entries ({:.0e} < |v| ≤ {:.0e}): {}, first-{} col max(|.|): {:?}); skipping the structural lower-bound ridge — fit may converge to a non-monotone-in-time hazard",
                 nrows,
                 p,
+                SUBTOL_NONZERO_FLOOR,
                 DERIVATIVE_TOL,
                 total_subtol_nonzeros,
+                DIAGNOSTIC_COLUMN_PREVIEW,
                 col_maxes,
             );
         }
@@ -5115,12 +5199,12 @@ pub fn project_onto_linear_constraints(
         return Ok(beta);
     }
     let mut corrections = Array2::<f64>::zeros((constraints.a.nrows(), dim));
-    for _ in 0..100 {
+    for _ in 0..DYKSTRA_PROJECTION_MAX_SWEEPS {
         let mut max_violation = 0.0_f64;
         for i in 0..constraints.a.nrows() {
             let row = constraints.a.row(i);
             let row_norm_sq = row.dot(&row);
-            if row_norm_sq <= 1e-18 {
+            if row_norm_sq <= DYKSTRA_ROW_DEGENERACY_FLOOR {
                 continue;
             }
             let y = &beta + &corrections.row(i);
@@ -5135,7 +5219,7 @@ pub fn project_onto_linear_constraints(
             corrections.row_mut(i).assign(&(&y - &projected));
             beta.assign(&projected);
         }
-        if max_violation <= 1e-10 {
+        if max_violation <= DYKSTRA_PROJECTION_TOL {
             break;
         }
     }
@@ -5178,7 +5262,7 @@ fn validate_linear_constraints(
             .sum::<f64>()
             .max(constraints.b[row].abs())
             .max(1.0);
-        let tol = 1e-10 * scale;
+        let tol = CONSTRAINT_NONNEGATIVITY_REL_TOL * scale;
         if slack < -tol && (worst_row.is_none() || slack < worst_slack) {
             worst_row = Some(row);
             worst_slack = slack;
@@ -7108,7 +7192,7 @@ fn factorize_psd_covariance(
     let max_abs_eigenvalue = eigenvalues
         .iter()
         .fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
-    let tol = (max_abs_eigenvalue * 1e-12).max(1e-14);
+    let tol = (max_abs_eigenvalue * PSD_EIGENVALUE_REL_TOL).max(PSD_EIGENVALUE_ABS_FLOOR);
     if eigenvalues.iter().any(|&ev| ev < -tol) {
         return Err(SurvivalLocationScaleError::InvalidConfiguration {
             reason: format!(
@@ -7800,11 +7884,11 @@ impl SurvivalLocationScaleFamily {
                     Ok(chol) => break chol.solvevec(&g),
                     Err(_) => {
                         tau = if tau == 0.0 {
-                            1e-8 * h_scale
+                            LEVENBERG_INITIAL_DAMPING_REL * h_scale
                         } else {
-                            tau * 10.0
+                            tau * LEVENBERG_DAMPING_GROWTH
                         };
-                        if tau > 1e8 * h_scale {
+                        if tau > LEVENBERG_MAX_DAMPING_REL * h_scale {
                             return Err(SurvivalLocationScaleError::NumericalFailure {
                                 reason:
                                     "direct parametric-AFT MLE: Hessian not factorizable even with maximal damping"
@@ -9822,7 +9906,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             validate_linear_constraints("time post-update", &beta, constraints)?;
         } else if block_idx == Self::BLOCK_LINK_WIGGLE && self.x_link_wiggle.is_some() {
             for j in 0..beta.len() {
-                let tol = 1e-10 * beta[j].abs().max(1.0);
+                let tol = CONSTRAINT_NONNEGATIVITY_REL_TOL * beta[j].abs().max(1.0);
                 if !beta[j].is_finite() || beta[j] < -tol {
                     return Err(SurvivalLocationScaleError::ConstraintViolation {
                         reason: format!(
@@ -10779,7 +10863,7 @@ fn fit_reduced_parametric_aft(
     let (states, log_likelihood, h) = prepared.family.fit_parametric_aft_direct_mle(
         specs,
         options.inner_max_cycles.max(1),
-        options.inner_tol.max(1e-8),
+        options.inner_tol.max(REDUCED_AFT_GRAD_TOL_FLOOR),
     )?;
 
     let p_total = h.nrows();
