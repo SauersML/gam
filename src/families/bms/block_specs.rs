@@ -404,11 +404,12 @@ impl ReducedLogslopeReparam {
 }
 
 /// Build the reduced-basis logslope reparameterization (see
-/// [`ReducedLogslopeReparam`]) from the rigid-pilot effective Jacobian geometry,
-/// in the PIRLS row metric `W`. Returns `Ok(None)` when there is no logslope
-/// span, no marginal span, or no confounded direction to remove (`r == p_g`):
-/// in those cases the raw design already is its own reduced basis and the caller
-/// keeps it unchanged.
+/// [`ReducedLogslopeReparam`]) from the rigid-pilot EFFECTIVE Jacobian geometry,
+/// in the PIRLS row metric `W`. Extracts the dense pilot designs and delegates
+/// the geometry to [`reduced_logslope_transform_effective`]. Returns `Ok(None)`
+/// when there is no logslope/marginal span, no effective-confounded direction to
+/// remove (`r == p_g`), or the whole effective logslope image is in the effective
+/// marginal span (`r == 0`); in those cases the caller keeps the raw design.
 fn build_reduced_logslope_reparam(
     marginal_design: &TermCollectionDesign,
     logslope_design: &TermCollectionDesign,

@@ -41,7 +41,9 @@ use crate::families::transformation_normal::{
 };
 use crate::inference::model::TRANSFORMATION_SCORE_PIT_CLIP_EPS;
 use crate::matrix::FactorizedSystem;
-use crate::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
+use crate::probability::{
+    log1mexp_positive, normal_cdf, normal_logcdf, normal_pdf, standard_normal_quantile,
+};
 use crate::smooth::build_term_collection_design;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
@@ -236,23 +238,59 @@ pub fn score_influence_jacobian(
         // represents: u_pit = Φ(z) exactly inverts z = Φ⁻¹(u_clamped), so the
         // derivative coefficient and the reported score stay self-consistent
         // without recomputing the (less stable) direct ratio. The endpoint
-        // φ/Φ values below are the analytic derivatives of that ratio.
-        let phi_l = normal_cdf(l);
-        let phi_u = normal_cdf(u);
-        let denom_mass = phi_u - phi_l;
-        if !(denom_mass.is_finite() && denom_mass > 0.0) {
+        // φ/D ratios below are the analytic derivatives of that ratio.
+        //
+        // Compute log(D) = log(Φ(U)−Φ(L)) in log-space to avoid catastrophic
+        // cancellation when L and U both sit deep in the same tail (e.g. L=5,
+        // U=6 where normal_cdf returns 1.0 for both in direct form). This
+        // mirrors the `log_normal_cdf_diff` approach in `transformation_normal.rs`:
+        //
+        //   If L > 0 : Φ(U)−Φ(L) = Φ(−L)−Φ(−U)  (reflection, both < 0.5)
+        //              log_denom = normal_logcdf(−L) + log1mexp(normal_logcdf(−L) − normal_logcdf(−U))
+        //   Otherwise: log_denom = normal_logcdf(U) + log1mexp(normal_logcdf(U) − normal_logcdf(L))
+        let log_denom = if l > 0.0 {
+            let log_neg_l = normal_logcdf(-l);
+            let log_neg_u = normal_logcdf(-u);
+            let gap = log_neg_l - log_neg_u;
+            if !(gap.is_finite() && gap > 0.0) {
+                return Err(format!(
+                    "score_influence_jacobian: endpoint mass not resolvable at row {i}: l={l:.6e}, u={u:.6e}"
+                ));
+            }
+            log_neg_l + log1mexp_positive(gap)
+        } else {
+            let log_cu = normal_logcdf(u);
+            let log_cl = normal_logcdf(l);
+            let gap = log_cu - log_cl;
+            if !(gap.is_finite() && gap > 0.0) {
+                return Err(format!(
+                    "score_influence_jacobian: endpoint mass not resolvable at row {i}: l={l:.6e}, u={u:.6e}"
+                ));
+            }
+            log_cu + log1mexp_positive(gap)
+        };
+        if !log_denom.is_finite() {
             return Err(format!(
-                "score_influence_jacobian: endpoint mass not resolvable at row {i}: Φ(U)−Φ(L)={denom_mass:.6e}"
+                "score_influence_jacobian: log endpoint mass not finite at row {i}: l={l:.6e}, u={u:.6e}"
             ));
         }
+
         let u_pit = normal_cdf(z);
 
-        // φ at h/L/U and at z. The chain ∂u/∂θ uses φ at the *unclamped* h when
+        // φ(x)/D = exp(log φ(x) − log D).  Using log-space for these ratios
+        // keeps them accurate when D is tiny (deep-tail support intervals).
+        // log φ(x) = −½x² − log(√(2π)).
+        const LOG_SQRT_2PI: f64 = 0.918_938_533_204_672_7;
+        let log_phi = |x: f64| -0.5 * x * x - LOG_SQRT_2PI;
+
+        // φ at h/L/U. The chain ∂u/∂θ uses φ at the *unclamped* h when
         // h is inside [L,U]; at the boundary (h clamped) φ(h)·∂h is the limiting
         // contribution and the clamp keeps it finite.
-        let pdf_h = normal_pdf(h.clamp(l, u));
-        let pdf_l = normal_pdf(l);
-        let pdf_u = normal_pdf(u);
+        let h_clamped = h.clamp(l, u);
+        let c_h = (log_phi(h_clamped) - log_denom).exp();
+        let c_l = (log_phi(l) - log_denom).exp();
+        let c_u = (log_phi(u) - log_denom).exp();
+
         // ∂z = ∂u / φ(z). Where the score saturates (|z| large), φ(z) underflows;
         // the `pdf_z_floor` clamp keeps a saturated row's influence bounded.
         let pdf_z = normal_pdf(z).max(pdf_z_floor);
@@ -280,8 +318,8 @@ pub fn score_influence_jacobian(
                 let dl = dl_scalar * xij;
                 let du = du_scalar * xij;
                 // ∂u = [φ(h)∂h − u·(φ(U)∂U − φ(L)∂L) − φ(L)∂L] / (Φ(U)−Φ(L))
-                let du_pit =
-                    (pdf_h * dh - u_pit * (pdf_u * du - pdf_l * dl) - pdf_l * dl) / denom_mass;
+                //     = c_h·∂h − u_pit·(c_u·∂U − c_l·∂L) − c_l·∂L
+                let du_pit = c_h * dh - u_pit * (c_u * du - c_l * dl) - c_l * dl;
                 row[base + j] = du_pit / pdf_z;
             }
         }
