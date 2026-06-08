@@ -241,6 +241,54 @@ const CTN_INNER_MAX_CYCLES_BASE: usize = 64;
 const CTN_INNER_MAX_CYCLES_PER_DIM: usize = 2;
 const CTN_INNER_MAX_CYCLES_CEILING: usize = 400;
 
+/// Numerical floor on a Gram/penalty diagonal scale before it enters the
+/// `likelihood_scale / penalty_scale` ratio that seeds the outer log-λ search.
+/// A genuinely zero diagonal (an all-zero penalty block, or a degenerate
+/// likelihood Gram) would otherwise produce a `0/0` or `x/0` seed; flooring
+/// both scales at a value far below any meaningful curvature keeps the ratio
+/// finite without perturbing well-posed problems.
+const CTN_SEED_SCALE_FLOOR: f64 = 1.0e-8;
+
+/// Lower bound on the cold-start seed log-λ (i.e. λ ≥ 1). Keeps the outer
+/// optimizer out of the under-regularized regime where the CTN inner solve is
+/// structurally rank-deficient (small-n / p > n); the optimizer is free to step
+/// below this once the data support it. See `ctn_penalty_scale_log_lambdas`.
+const CTN_SEED_LOG_LAMBDA_MIN: f64 = 0.0;
+
+/// Upper bound on the cold-start seed log-λ, matching the outer ρ-bound used
+/// across the location-scale families: λ ≈ e¹² caps the seed in the strongly
+/// over-smoothed regime so a tiny penalty scale cannot seed an absurd λ.
+const CTN_SEED_LOG_LAMBDA_MAX: f64 = 12.0;
+
+/// Floor on the warm-start global residual scale `sqrt(weighted_ss / Σw)`.
+/// Guards the degenerate near-perfect-fit case (residuals collapse to numerical
+/// zero) so the per-residual `residual_floor` below — and the subsequent
+/// `ln(|y−μ|)` log-scale target — stay finite. Well below any real response
+/// spread, so it never perturbs a genuine fit.
+const WARMSTART_GLOBAL_SCALE_FLOOR: f64 = 1e-6;
+
+/// Per-residual floor used to form the log-scale warm-start target
+/// `ln(|y−μ|) − E[ln|N(0,1)|]`. Built as `global_scale · WARMSTART_RESIDUAL_REL_FLOOR
+/// + WARMSTART_RESIDUAL_ABS_FLOOR`: the relative term keeps an exactly-fit point
+/// (|y−μ| = 0) from sending `ln(0) → −∞` at 1/1000 of the data scale, and the
+/// absolute term backstops the case where `global_scale` itself sits at its floor.
+const WARMSTART_RESIDUAL_REL_FLOOR: f64 = 1e-3;
+const WARMSTART_RESIDUAL_ABS_FLOOR: f64 = 1e-12;
+
+/// Floor on a per-row warm-start scale τ before forming `1/τ` when building the
+/// affine transformation seed targets. A degenerate τ = 0 (a collapsed warm-start
+/// scale block) would otherwise produce a non-finite reciprocal; the floor sits
+/// far below any meaningful scale so it only fires on the degenerate path.
+const WARMSTART_INV_SCALE_FLOOR: f64 = 1e-12;
+
+/// Ridge stabilization floor for the penalized least-squares projections that
+/// produce the default warm-start location and log-scale coefficients. These
+/// seeds only need to land in the right basin (the outer solver refines them),
+/// so a mild ridge that keeps the projection well-posed under a near-rank-
+/// deficient covariate design is preferable to the tighter floor used for the
+/// production inner solve.
+const WARMSTART_PROJECTION_RIDGE_FLOOR: f64 = 1e-8;
+
 fn beta_bits_match(cached: &Array1<f64>, candidate: &Array1<f64>) -> bool {
     cached.len() == candidate.len()
         && cached
@@ -7722,9 +7770,9 @@ fn ctn_penalty_scale_log_lambdas(
         return Array1::zeros(0);
     }
 
-    let likelihood_scale = matrix_diag_mean_abs(likelihood_gram).max(1.0e-8);
+    let likelihood_scale = matrix_diag_mean_abs(likelihood_gram).max(CTN_SEED_SCALE_FLOOR);
     Array1::from_iter(penalties.iter().map(|penalty| {
-        let penalty_scale = penalty_diag_scale(penalty).max(1.0e-8);
+        let penalty_scale = penalty_diag_scale(penalty).max(CTN_SEED_SCALE_FLOOR);
         // Lower-bound the SEED log-lambda at 0 (i.e., λ ≥ 1) so we never
         // start the outer optimizer in the under-regularized regime where
         // the CTN inner is structurally rank-deficient (small-n / p > n).
@@ -7735,7 +7783,9 @@ fn ctn_penalty_scale_log_lambdas(
         // pick wild β coefficients and cascade into predict-time monotonicity
         // violations (h' < 0 on the response grid, observed as -1e15 spikes
         // in CI synthetic-biobank tests).
-        (likelihood_scale / penalty_scale).ln().clamp(0.0, 12.0)
+        (likelihood_scale / penalty_scale)
+            .ln()
+            .clamp(CTN_SEED_LOG_LAMBDA_MIN, CTN_SEED_LOG_LAMBDA_MAX)
     }))
 }
 
@@ -10710,7 +10760,7 @@ fn compute_warm_start(
     let mut target_h = Array1::<f64>::zeros(n);
     let mut target_hp = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let tau = ws.scale[i].max(1e-12);
+        let tau = ws.scale[i].max(WARMSTART_INV_SCALE_FLOOR);
         let inv_tau = 1.0 / tau;
         target_h[i] = (response[i] - ws.location[i]) * inv_tau - offset[i];
         target_hp[i] = inv_tau;
@@ -10829,7 +10879,7 @@ fn estimate_default_warm_start(
         weights,
         covariate_penalties,
         &log_lambdas,
-        1e-8,
+        WARMSTART_PROJECTION_RIDGE_FLOOR,
     )?;
     let location = covariate_design.matrixvectormultiply(&beta_location);
     let weight_sum = weights.iter().copied().sum::<f64>();
@@ -10854,8 +10904,9 @@ fn estimate_default_warm_start(
         }
         .into());
     }
-    let global_scale = (weighted_ss / weight_sum).sqrt().max(1e-6);
-    let residual_floor = global_scale * 1e-3 + 1e-12;
+    let global_scale = (weighted_ss / weight_sum).sqrt().max(WARMSTART_GLOBAL_SCALE_FLOOR);
+    let residual_floor =
+        global_scale * WARMSTART_RESIDUAL_REL_FLOOR + WARMSTART_RESIDUAL_ABS_FLOOR;
     let log_scale_target =
         Array1::from_iter(response.iter().zip(location.iter()).map(|(&y, &mu)| {
             (y - mu).abs().max(residual_floor).ln() - STANDARD_NORMAL_MEAN_LOG_ABS
@@ -10867,7 +10918,7 @@ fn estimate_default_warm_start(
         weights,
         covariate_penalties,
         &log_lambdas,
-        1e-8,
+        WARMSTART_PROJECTION_RIDGE_FLOOR,
     )?;
     let scale = covariate_design
         .matrixvectormultiply(&beta_log_scale)
