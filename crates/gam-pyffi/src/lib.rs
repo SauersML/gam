@@ -12440,10 +12440,17 @@ fn build_latent_outer_manifold(
 /// The embedding recovers the intrinsic coordinate up to monotone/rotation
 /// gauge; each axis is then affinely mapped from `[0, 1]` onto the span of the
 /// decoder `centers` for that axis so the seed lands where the basis `Φ` is
-/// well-conditioned. The seed is defined for the flat Euclidean latent (the
-/// default manifold); on a curved latent manifold (circle/sphere/torus) the
-/// embedding's scale and gauge are not directly comparable, so the caller's `t`
-/// is used unchanged and the optimizer relies on the caller's warm start.
+/// well-conditioned. On a *periodic* latent manifold (circle/torus) the natural
+/// seed is the circular coordinate recovered from the leading Laplacian modes
+/// (see [`latent_periodic_seed_start`]); the sphere has no closed-form spectral
+/// seed here, so the caller's `t` is used unchanged.
+///
+/// A spread seed is essential, not optional: the outer optimizer's REML
+/// objective is degenerate at a *collapsed* latent (all rows at the same
+/// coordinate give identical decoder rows → a rank-deficient inner solve and no
+/// usable descent direction). The default caller start is the all-zero vector,
+/// which on a periodic manifold is exactly the collapsed configuration; without
+/// a spread seed the circle/torus optimizer can never escape it (issue #876).
 fn latent_spectral_seed_start(
     y: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -12454,6 +12461,9 @@ fn latent_spectral_seed_start(
     caller_t: ArrayView1<'_, f64>,
 ) -> Result<Array1<f64>, String> {
     let manifold_norm = manifold.to_ascii_lowercase().replace('-', "_");
+    if matches!(manifold_norm.as_str(), "circle" | "s1" | "torus") {
+        return latent_periodic_seed_start(y, n_obs, latent_dim, seed_neighbors, caller_t);
+    }
     if !matches!(manifold_norm.as_str(), "euclidean" | "rn") {
         return Ok(caller_t.to_owned());
     }
@@ -12490,6 +12500,139 @@ fn latent_spectral_seed_start(
         }
     }
     Ok(start)
+}
+
+/// Spectral seed for a *periodic* latent (circle / torus), returning each row's
+/// angle in `[-π, π)` per axis.
+///
+/// On a circle the two leading non-trivial Laplacian-eigenmap modes of the
+/// responses are (up to rotation/reflection — exactly the circle's gauge) the
+/// `cos θ` / `sin θ` pair of the intrinsic angle, so `θ = atan2(sin-mode,
+/// cos-mode)` recovers the circular coordinate directly. A torus of dimension
+/// `d` is `d` independent circles; we recover one angle per axis from its own
+/// pair of modes, requesting `2·d` modes from the embedding and pairing them in
+/// order. The recovered angle is a *seed* — correct up to the periodic gauge the
+/// decoder is free in — that the Riemannian outer optimizer then polishes.
+///
+/// Crucially this seed is *spread* around the circle, breaking the collapsed
+/// all-zero start (issue #876). When there are too few rows to expose `2·d`
+/// non-trivial modes the embedding cannot run; rather than start collapsed we
+/// fall back to a deterministic equispaced angular sweep on each axis, which is
+/// still non-degenerate (distinct decoder rows) so the optimizer has a usable
+/// gradient.
+fn latent_periodic_seed_start(
+    y: ArrayView2<'_, f64>,
+    n_obs: usize,
+    latent_dim: usize,
+    seed_neighbors: usize,
+    caller_t: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    use std::f64::consts::TAU;
+
+    if latent_dim == 0 {
+        return Ok(caller_t.to_owned());
+    }
+    if y.nrows() != n_obs {
+        return Err(format!(
+            "periodic spectral seed: y has {} rows but n_obs = {n_obs}",
+            y.nrows()
+        ));
+    }
+    // A circle/torus axis needs two embedding modes (cos/sin); recover one angle
+    // per axis. If the caller already supplied a *spread* warm start (not the
+    // collapsed default), keep it — the optimizer can polish a good start, but it
+    // can never escape a collapsed one. "Spread" is measured per axis by the
+    // angular range the wrapped coordinates cover.
+    let caller_spread = caller_t.len() == n_obs * latent_dim
+        && (0..latent_dim).any(|a| {
+            let mut lo = f64::INFINITY;
+            let mut hi = f64::NEG_INFINITY;
+            for n in 0..n_obs {
+                let v = wrap_to_pi(caller_t[n * latent_dim + a]);
+                lo = lo.min(v);
+                hi = hi.max(v);
+            }
+            (hi - lo) > 1.0e-6
+        });
+    if caller_spread {
+        return Ok(caller_t.to_owned());
+    }
+
+    let modes = 2 * latent_dim;
+    // `laplacian_eigenmap_coords` needs `n >= modes + 2` rows to expose `modes`
+    // non-trivial eigenvectors. With fewer rows, sweep angles deterministically.
+    if n_obs < modes + 2 {
+        let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
+        for a in 0..latent_dim {
+            for n in 0..n_obs {
+                let frac = if n_obs > 0 { n as f64 / n_obs as f64 } else { 0.0 };
+                start[n * latent_dim + a] = wrap_to_pi(frac * TAU);
+            }
+        }
+        return Ok(start);
+    }
+
+    // The raw (un-rescaled) generalized eigenvectors are what carry the cos/sin
+    // structure; `laplacian_eigenmap_coords` already rescales each axis to
+    // [0, 1], which destroys the relative sign/scale needed for atan2. We
+    // instead read `2·d` modes and undo the per-axis affine map by recentering
+    // each mode to zero mean before pairing — the rescale is affine per mode, so
+    // recentering recovers the angle up to the same rotation gauge.
+    let coords = gam::geometry::laplacian_eigenmap_coords(y, modes, seed_neighbors)?;
+    let mut mode_mean = vec![0.0f64; modes];
+    for a in 0..modes {
+        let mut sum = 0.0;
+        for n in 0..n_obs {
+            sum += coords[[n, a]];
+        }
+        mode_mean[a] = sum / n_obs as f64;
+    }
+
+    let mut start = Array1::<f64>::zeros(n_obs * latent_dim);
+    for axis in 0..latent_dim {
+        let cos_mode = 2 * axis;
+        let sin_mode = 2 * axis + 1;
+        for n in 0..n_obs {
+            let c = coords[[n, cos_mode]] - mode_mean[cos_mode];
+            let s = coords[[n, sin_mode]] - mode_mean[sin_mode];
+            let angle = if c == 0.0 && s == 0.0 {
+                // Degenerate row (both modes vanish): place it deterministically
+                // around the circle so it does not coincide with its neighbours.
+                wrap_to_pi((n as f64 / n_obs as f64) * TAU)
+            } else {
+                s.atan2(c)
+            };
+            start[n * latent_dim + axis] = angle;
+        }
+        // Guard against a collapsed axis (both modes constant → all angles
+        // equal): fall back to an equispaced sweep on that axis only.
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for n in 0..n_obs {
+            let v = start[n * latent_dim + axis];
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        if !(hi - lo > 1.0e-6) {
+            for n in 0..n_obs {
+                let frac = if n_obs > 0 { n as f64 / n_obs as f64 } else { 0.0 };
+                start[n * latent_dim + axis] = wrap_to_pi(frac * TAU);
+            }
+        }
+    }
+    Ok(start)
+}
+
+/// Wrap an angle to the half-open interval `[-π, π)`.
+fn wrap_to_pi(angle: f64) -> f64 {
+    use std::f64::consts::{PI, TAU};
+    let mut a = angle % TAU;
+    if a >= PI {
+        a -= TAU;
+    } else if a < -PI {
+        a += TAU;
+    }
+    a
 }
 
 /// Optimize the latent coordinate `t` against the Gaussian-REML objective.
@@ -29042,6 +29185,138 @@ mod batch_tests {
                 fd
             );
         }
+    }
+
+    /// Issue #876: the circle latent optimizer must recover a *circular* latent
+    /// from clean on-circle data, not collapse every row to one coordinate.
+    ///
+    /// The data lie (up to tiny noise) exactly on a unit circle in the leading
+    /// two response columns. Started from the all-zero default latent — the
+    /// collapsed configuration — the periodic spectral seed spreads the rows
+    /// around the circle and the Riemannian trust region polishes them. We assert
+    /// (a) the recovered angles are *not collapsed* (their dispersion is large)
+    /// and (b) they track the true generating angle, up to the circle's
+    /// rotation/reflection gauge, via the circular correlation of the unit
+    /// vectors (cos/sin) — which is gauge-equivariant under a constant rotation.
+    #[test]
+    fn circle_latent_recovers_circle_not_collapse() {
+        use std::f64::consts::TAU;
+
+        let n_obs = 40usize;
+        let latent_dim = 1usize;
+        // Deterministic angles spread around the circle (sorted, distinct).
+        let true_theta: Vec<f64> = (0..n_obs)
+            .map(|i| -std::f64::consts::PI + (i as f64 + 0.5) / n_obs as f64 * TAU)
+            .collect();
+        // 5-D response: first two columns trace the unit circle, the rest are
+        // tiny deterministic perturbations (a near-noise pad).
+        let y = Array2::from_shape_fn((n_obs, 5), |(row, col)| {
+            let th = true_theta[row];
+            match col {
+                0 => th.cos(),
+                1 => th.sin(),
+                _ => 0.01 * ((row as f64 + 1.3) * (col as f64 + 0.7)).sin(),
+            }
+        });
+        // Duchon decoder centers (the issue's geometry: a 1-D linspace).
+        let n_centers = 12usize;
+        let centers = Array2::from_shape_fn((n_centers, 1), |(i, _)| {
+            -std::f64::consts::PI + i as f64 / (n_centers - 1) as f64 * TAU
+        });
+        let penalty = Array2::<f64>::eye(n_centers);
+
+        // Reproduce the optimize-latent driver on the circle manifold from the
+        // collapsed all-zero default start with the periodic spectral seed.
+        let caller_t = Array1::<f64>::zeros(n_obs * latent_dim);
+        let start = latent_spectral_seed_start(
+            y.view(),
+            centers.view(),
+            "circle",
+            n_obs,
+            latent_dim,
+            10,
+            caller_t.view(),
+        )
+        .expect("periodic spectral seed");
+        // The seed itself must already be spread (the whole point of #876).
+        let seed_std = {
+            let mean = start.iter().sum::<f64>() / start.len() as f64;
+            (start.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / start.len() as f64).sqrt()
+        };
+        assert!(
+            seed_std > 0.3,
+            "periodic seed must spread the latent, not start collapsed; std={seed_std}"
+        );
+
+        let problem = LatentOuterProblem {
+            y: y.clone(),
+            centers: centers.clone(),
+            penalty: penalty.clone(),
+            weights: None,
+            aux_u: None,
+            dim_selection: None,
+            family: AuxPriorFamily::Ridge,
+            aux_strength: None,
+            init_lambda: None,
+            sigma_eff_mode: SigmaEffMode::Profiled,
+            n_obs,
+            latent_dim,
+            m: 2,
+            basis_kind: "duchon".to_string(),
+            tensor_knots: None,
+            tensor_knot_offsets: None,
+            tensor_degrees: None,
+        };
+        let manifold_box = build_latent_outer_manifold("circle", n_obs, latent_dim)
+            .expect("circle latent manifold");
+        let manifold_ref: &dyn gam::geometry::RiemannianManifold = manifold_box.as_ref();
+        let trust_region = gam::geometry::RiemannianTrustRegion {
+            radius: 1.0,
+            max_radius: 1.0e6,
+            max_iter: 200,
+            grad_tol: 1.0e-8,
+        };
+        let mut objective = LatentOuterObjective { problem: &problem };
+        let recovered = trust_region
+            .minimize(manifold_ref, &mut objective, start.view())
+            .expect("circle latent optimize");
+
+        // (a) Not collapsed: the recovered angles keep a large spread.
+        let mean = recovered.iter().sum::<f64>() / recovered.len() as f64;
+        let rec_std =
+            (recovered.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / recovered.len() as f64)
+                .sqrt();
+        assert!(
+            rec_std > 0.3,
+            "circle latent collapsed (std={rec_std}); expected a spread circular latent"
+        );
+
+        // (b) Circular correlation with the true angle, gauge-equivariant: the
+        // mean resultant length of the angular differences θ̂ − θ. For a perfect
+        // recovery up to a constant rotation this is ≈ 1; an unrelated latent
+        // gives ≈ 0.
+        let (mut cs, mut ss) = (0.0f64, 0.0f64);
+        for n in 0..n_obs {
+            let diff = recovered[n] - true_theta[n];
+            cs += diff.cos();
+            ss += diff.sin();
+        }
+        let resultant = (cs * cs + ss * ss).sqrt() / n_obs as f64;
+        // Reflection gauge: the circle is also free to flip orientation, so test
+        // both θ̂ and −θ̂ and keep the better resultant.
+        let (mut cs_r, mut ss_r) = (0.0f64, 0.0f64);
+        for n in 0..n_obs {
+            let diff = -recovered[n] - true_theta[n];
+            cs_r += diff.cos();
+            ss_r += diff.sin();
+        }
+        let resultant_r = (cs_r * cs_r + ss_r * ss_r).sqrt() / n_obs as f64;
+        let best = resultant.max(resultant_r);
+        assert!(
+            best > 0.85,
+            "recovered circle latent does not track the true angle \
+             (mean resultant length={best}); collapse/degenerate recovery"
+        );
     }
 }
 
