@@ -1662,6 +1662,7 @@ mod tests {
         LinkWigglePosterior, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsPosterior,
         SharedData, cloglog_bernoulli_logp_and_residual, firth_jeffreys_logp_and_grad,
         joint_family_logp_and_grad, laplace_directional_cubic_diagnostic,
+        laplace_skewness_threshold, laplace_trustworthiness_from_skewness,
         run_joint_beta_rho_sampling, run_logit_polya_gamma_gibbs,
         run_nuts_sampling_flattened_family,
     };
@@ -3190,6 +3191,43 @@ mod tests {
             max_val,
             eig_max,
         );
+    }
+
+    #[test]
+    fn laplace_trustworthiness_is_block_local_and_threshold_shrinks_with_n() {
+        // Two directions: one nearly Gaussian (tiny skewness), one strongly
+        // skewed. The adaptive verdict must flag ONLY the skewed direction —
+        // this is the block-local behavior #784 requires (keep cheap Laplace
+        // where the Gaussian summary holds, correct only the curvature-heavy
+        // block).
+        let skew = array![0.01, 0.9];
+
+        // At a modest effective sample size the skewed direction dominates the
+        // Laplace floor and must be flagged; the near-Gaussian one must not.
+        let verdict = laplace_trustworthiness_from_skewness(&skew, 100.0);
+        assert_eq!(
+            verdict.untrustworthy_directions,
+            vec![1],
+            "only the strongly-skewed direction should be flagged (block-local)",
+        );
+        assert!(verdict.fallback_required());
+        assert!((verdict.max_abs_skewness - 0.9).abs() < 1e-12);
+
+        // The threshold must SHRINK as n grows (Laplace gets stricter): a
+        // direction tolerated at small n becomes untrustworthy at large n,
+        // because the Gaussian floor it must beat is O(1/n).
+        let t_small = laplace_skewness_threshold(25.0);
+        let t_large = laplace_skewness_threshold(10_000.0);
+        assert!(
+            t_large < t_small,
+            "validity threshold must tighten with sample size: {t_large} !< {t_small}",
+        );
+
+        // Degenerate / empty curvature support => everything trustworthy
+        // (nothing for the Gaussian summary to be wrong about).
+        let none = laplace_trustworthiness_from_skewness(&skew, 0.0);
+        assert!(!none.fallback_required());
+        assert!(none.threshold.is_infinite());
     }
 
     #[test]
@@ -5795,6 +5833,109 @@ fn cubic_power_iteration_refinement(
     }
 
     best
+}
+
+/// Per-direction adaptive Laplace-trustworthiness verdict for the inner
+/// marginalization loop (issue #784).
+///
+/// The Laplace approximation to the coefficient marginal likelihood replaces
+/// the local log-posterior `F(β) = −ℓ(β) + ½βᵀS(ρ)β` by its second-order
+/// Taylor expansion at the mode β̂.  In a whitened Hessian eigendirection
+/// `v_r` (curvature `λ_r`) the leading correction to that Gaussian summary is
+/// governed by the standardized third cumulant
+///   γ_r = T₃[v_r,v_r,v_r] / λ_r^{3/2},  T₃[a,b,c] = Σ_i c_i x_{ia} x_{ib} x_{ic}
+/// (`c_i = ∂W_i/∂η_i`, the same per-row weight the unified Hessian uses).  The
+/// Edgeworth/Tierney–Kadane expansion of the marginal integral contributes a
+/// *relative* correction `(5/24) γ_r²` from this direction; the Laplace floor
+/// error is `O(1/n)`.  A direction is therefore "Laplace-trustworthy" exactly
+/// when its skewness contribution sits at or below that floor.
+///
+/// This is the missing adaptive, block-local primitive #784 calls for: instead
+/// of an all-or-nothing Laplace-vs-sampling switch, each curvature direction is
+/// judged on its own, so the cheap Gaussian summary is kept where it holds and
+/// the higher-order correction (and, ultimately, directional sampling) is spent
+/// only on the curvature-heavy directions where it fails.
+#[derive(Clone, Debug)]
+pub struct LaplaceTrustworthiness {
+    /// Per-eigendirection standardized skewness `γ_r` (aligned with the
+    /// `directional` output of [`laplace_directional_cubic_diagnostic`]).
+    pub directional_skewness: Array1<f64>,
+    /// Indices of the directions whose skewness exceeds the auto-derived
+    /// validity threshold (the curvature-heavy, non-Gaussian block).
+    pub untrustworthy_directions: Vec<usize>,
+    /// The auto-derived per-direction skewness threshold `τ(n)` actually used.
+    pub threshold: f64,
+    /// `max_r |γ_r|` across all directions (the global non-Gaussianity scale).
+    pub max_abs_skewness: f64,
+}
+
+impl LaplaceTrustworthiness {
+    /// Whether any curvature direction is too non-Gaussian for the plain
+    /// Laplace summary, i.e. whether the adaptive higher-order correction /
+    /// directional sampling fallback should engage at all.
+    pub fn fallback_required(&self) -> bool {
+        !self.untrustworthy_directions.is_empty()
+    }
+}
+
+/// Auto-derive the per-direction skewness threshold `τ(n)` separating
+/// Laplace-trustworthy directions from those that need the higher-order
+/// correction / sampling fallback.  MAGIC: derived purely from problem
+/// characteristics (the effective sample size), with no tunable flag.
+///
+/// Derivation.  The standardized third cumulant of a well-specified GLM mode
+/// scales as `γ_r = O(n^{-1/2})`, so the Laplace skewness term `(5/24) γ_r²`
+/// is `O(1/n)` — the same order as the Laplace floor error that is always
+/// present and uncorrectable at this expansion order.  We declare a direction
+/// untrustworthy once its skewness term provably dominates that floor, i.e.
+///   (5/24) γ_r² > 1 / n_eff   ⇔   |γ_r| > sqrt( (24/5) / n_eff ).
+/// `n_eff` is the effective sample size carried by the curvature in that block
+/// (passed in by the caller as the trace-equivalent count); using the local
+/// count rather than the global `n` is what makes the verdict block-local.
+pub fn laplace_skewness_threshold(n_eff: f64) -> f64 {
+    // Guard a degenerate / empty effective count: with no curvature support
+    // there is nothing the Gaussian summary can be wrong about, so demand an
+    // unreachable skewness (treat every direction as trustworthy).
+    if !(n_eff > 0.0) {
+        return f64::INFINITY;
+    }
+    ((24.0 / 5.0) / n_eff).sqrt()
+}
+
+/// Adaptive, block-local Laplace-trustworthiness verdict (issue #784).
+///
+/// Given the per-direction standardized skewness `directional_skewness`
+/// (as produced by [`laplace_directional_cubic_diagnostic`]) and the effective
+/// sample size `n_eff` supporting the local curvature, flags exactly the
+/// directions whose skewness exceeds the auto-derived threshold
+/// [`laplace_skewness_threshold`].  Those flagged directions are the
+/// curvature-heavy block that the inner loop should hand to the higher-order
+/// correction / directional sampler instead of summarizing with plain Laplace.
+///
+/// This function performs no linear algebra of its own — it consumes the cubic
+/// diagnostic that already exists and converts it into an actionable, local
+/// activation set, which is precisely the seam the inner marginalization loop
+/// was missing.
+pub fn laplace_trustworthiness_from_skewness(
+    directional_skewness: &Array1<f64>,
+    n_eff: f64,
+) -> LaplaceTrustworthiness {
+    let threshold = laplace_skewness_threshold(n_eff);
+    let mut untrustworthy_directions = Vec::new();
+    let mut max_abs_skewness = 0.0_f64;
+    for (r, &gamma) in directional_skewness.iter().enumerate() {
+        let abs_gamma = if gamma.is_finite() { gamma.abs() } else { 0.0 };
+        max_abs_skewness = max_abs_skewness.max(abs_gamma);
+        if abs_gamma > threshold {
+            untrustworthy_directions.push(r);
+        }
+    }
+    LaplaceTrustworthiness {
+        directional_skewness: directional_skewness.clone(),
+        untrustworthy_directions,
+        threshold,
+        max_abs_skewness,
+    }
 }
 
 /// Result of joint (β, ρ) sampling.
