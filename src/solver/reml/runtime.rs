@@ -3463,7 +3463,15 @@ impl<'a> RemlState<'a> {
         let h_factor = if let Ok(chol) = h_tk_eval.cholesky(Side::Lower) {
             HFactor::Cholesky(chol)
         } else if let Ok((evals, evecs)) = h_tk_eval.eigh(Side::Lower) {
-            if let Some((idx, ev)) = evals.iter().enumerate().find(|(_, ev)| **ev <= 1e-12) {
+            // Smallest eigenvalue at or below this floor means the effective
+            // Hessian failed positive-definiteness (Cholesky already declined),
+            // so the Tierney–Kadane Laplace correction is undefined here.
+            const TK_HESSIAN_PD_EIGENVALUE_FLOOR: f64 = 1e-12;
+            if let Some((idx, ev)) = evals
+                .iter()
+                .enumerate()
+                .find(|(_, ev)| **ev <= TK_HESSIAN_PD_EIGENVALUE_FLOOR)
+            {
                 crate::bail_invalid_estim!(
                     "Tierney-Kadane correction requires a positive definite Hessian; eigenvalue {idx} is {ev}"
                 );
@@ -7324,19 +7332,34 @@ pub(crate) fn adaptive_lm_lambda_hint(
     last_iters: usize,
     last_converged: bool,
 ) -> Option<f64> {
+    // Iteration-count boundaries that classify the previous PIRLS solve's
+    // conditioning regime.
+    const NEWTON_FRIENDLY_MAX_ITERS: usize = 2;
+    const HARD_FIT_MIN_ITERS: usize = 10;
+    // Per-regime adaptive clamp bands for the cached LM damping hint (see the
+    // doc comment): Newton-friendly relaxes down to the LM-internal floor, a
+    // hard fit preserves the heavy-damping signal up to gradient-descent, and
+    // the default reproduces the historical static `[1e-6, 1e-3]` clamp.
+    const NEWTON_LAMBDA_FLOOR: f64 = 1e-9;
+    const NEWTON_LAMBDA_CEILING: f64 = 1e-3;
+    const HARD_FIT_LAMBDA_FLOOR: f64 = 1e-3;
+    const HARD_FIT_LAMBDA_CEILING: f64 = 1.0;
+    const DEFAULT_LAMBDA_FLOOR: f64 = 1e-6;
+    const DEFAULT_LAMBDA_CEILING: f64 = 1e-3;
     if !cached_lambda.is_finite() || cached_lambda <= 0.0 {
         return None;
     }
     if last_iters == 0 && !last_converged {
         return None;
     }
-    let (floor, ceiling) = if last_converged && (1..=2).contains(&last_iters) {
-        (1e-9_f64, 1e-3_f64)
-    } else if !last_converged || last_iters >= 10 {
-        (1e-3_f64, 1.0_f64)
-    } else {
-        (1e-6_f64, 1e-3_f64)
-    };
+    let (floor, ceiling) =
+        if last_converged && (1..=NEWTON_FRIENDLY_MAX_ITERS).contains(&last_iters) {
+            (NEWTON_LAMBDA_FLOOR, NEWTON_LAMBDA_CEILING)
+        } else if !last_converged || last_iters >= HARD_FIT_MIN_ITERS {
+            (HARD_FIT_LAMBDA_FLOOR, HARD_FIT_LAMBDA_CEILING)
+        } else {
+            (DEFAULT_LAMBDA_FLOOR, DEFAULT_LAMBDA_CEILING)
+        };
     Some(cached_lambda.clamp(floor, ceiling))
 }
 
