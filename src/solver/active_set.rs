@@ -21,6 +21,35 @@ use std::collections::HashSet;
 /// solver contract and will spuriously reject valid boundary solutions.
 pub const ACTIVE_SET_PRIMAL_FEASIBILITY_TOL: f64 = 1e-8;
 
+/// Stationarity tolerance for the strong-KKT acceptance gate: the projected
+/// (working-set) gradient residual ‖∇L − Aᵀλ‖∞, either absolute or relative to
+/// `max(1, ‖∇L‖∞)`, must fall below this to certify a constrained stationary
+/// point. Matched against `ACTIVE_SET_KKT_COMPLEMENTARITY_TOL` so both KKT
+/// residual channels are certified at compatible scales.
+const ACTIVE_SET_KKT_STATIONARITY_TOL: f64 = 2e-6;
+
+/// Complementarity-slackness tolerance for the KKT acceptance gate:
+/// `max_i |λ_i · slack_i|` must fall below this for the
+/// active-inactive partition to be consistent.
+const ACTIVE_SET_KKT_COMPLEMENTARITY_TOL: f64 = 1e-6;
+
+/// Dual-feasibility tolerance for the KKT acceptance gate: every working-set
+/// multiplier must satisfy `λ_i ≥ −ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL` (a
+/// strictly-negative multiplier means the constraint should be released).
+const ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL: f64 = 1e-8;
+
+/// Relaxed stationarity tolerance accepted only on a *degenerate boundary
+/// face* (linearly-dependent active rows), where the exact projected gradient
+/// cannot reach `ACTIVE_SET_KKT_STATIONARITY_TOL`. Still requires primal
+/// feasibility, complementarity, and a relative-stationarity backstop.
+const ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL: f64 = 1e-3;
+
+/// Relative scale on the predicted-decrease test `predicted_delta ≤
+/// −ε·(1 + ‖∇L‖∞·‖d‖∞)`: when the working-set Newton step still buys a
+/// quadratic-model decrease at this relative margin the step is a usable
+/// descent direction even if the KKT residual has not yet tightened.
+const ACTIVE_SET_MODEL_DESCENT_REL_TOL: f64 = 1e-10;
+
 #[derive(Clone, Debug)]
 pub struct LinearInequalityConstraints {
     pub a: Array2<f64>,
@@ -1189,16 +1218,20 @@ fn solve_newton_direction_with_linear_constraints_impl(
                 .zip(hd_total.iter())
                 .map(|(a, b)| a * b)
                 .sum::<f64>();
-    let kkt_strong_ok = (working_kkt.stationarity <= 2e-6 || stationarity_rel <= 2e-6)
-        && working_kkt.complementarity <= 1e-6;
-    let model_descent_ok = predicted_delta <= -1e-10 * (1.0 + grad_inf * step_inf);
+    let kkt_strong_ok = (working_kkt.stationarity <= ACTIVE_SET_KKT_STATIONARITY_TOL
+        || stationarity_rel <= ACTIVE_SET_KKT_STATIONARITY_TOL)
+        && working_kkt.complementarity <= ACTIVE_SET_KKT_COMPLEMENTARITY_TOL;
+    let model_descent_ok =
+        predicted_delta <= -ACTIVE_SET_MODEL_DESCENT_REL_TOL * (1.0 + grad_inf * step_inf);
     let degenerate_boundary_ok = compressed_working.is_degenerate_face()
         && worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         && working_kkt.primal_feasibility <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-        && working_kkt.complementarity <= 1e-6
-        && (working_kkt.stationarity <= 1e-3 || stationarity_rel <= 2e-6);
+        && working_kkt.complementarity <= ACTIVE_SET_KKT_COMPLEMENTARITY_TOL
+        && (working_kkt.stationarity <= ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL
+            || stationarity_rel <= ACTIVE_SET_KKT_STATIONARITY_TOL);
     if worst <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-        && ((working_kkt.dual_feasibility <= 1e-8 && (kkt_strong_ok || model_descent_ok))
+        && ((working_kkt.dual_feasibility <= ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL
+            && (kkt_strong_ok || model_descent_ok))
             || degenerate_boundary_ok)
     {
         if let Some(hint) = active_hint {
