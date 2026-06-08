@@ -22,6 +22,7 @@ fn anisotropic_axis_derivatives_are_independent() {
         double_penalty: false,
         identifiability: Default::default(),
         aniso_log_scales: Some(vec![0.3, -0.2, -0.1]),
+        nullspace_shrinkage_survived: None,
     };
     let d = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
     assert_eq!(

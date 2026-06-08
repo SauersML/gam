@@ -2008,6 +2008,11 @@ pub fn build_smooth_basis(
                     identifiability: parse_matern_identifiability(options)
                         .map_err(|e| e.to_string())?,
                     aniso_log_scales,
+                    // Cold build: let the bootstrap-κ spectral test decide whether
+                    // the double-penalty nullspace shrinkage survives; the freeze
+                    // step then pins that decision into the FrozenTransform so the
+                    // κ-optimizer's rebuilds keep the count invariant (gam#787/#860).
+                    nullspace_shrinkage_survived: None,
                 },
                 input_scales: None,
             })
