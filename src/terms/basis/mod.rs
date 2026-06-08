@@ -19279,6 +19279,7 @@ fn duchon_kernel_amplification(
 pub fn duchon_pure_kernel_amplification(
     centers: ArrayView2<'_, f64>,
     order: DuchonNullspaceOrder,
+    power: f64,
 ) -> f64 {
     let dim = centers.ncols();
     if dim == 0 || centers.nrows() == 0 {
@@ -19286,7 +19287,7 @@ pub fn duchon_pure_kernel_amplification(
     }
     let effective_order = duchon_effective_nullspace_order(centers, order);
     let p_order = duchon_p_from_nullspace_order(effective_order);
-    let s_order: f64 = 0.0;
+    let s_order: f64 = power;
     let pure_poly_coeff =
         PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
     duchon_kernel_amplification(
@@ -31301,6 +31302,48 @@ mod tests {
             msg.contains("Duchon pointwise kernel values require 2*(p+s) > dimension"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_duchon_orders_yields_existing_kernel_for_all_dims_issue_875() {
+        // Issue #875: the latent Duchon design hard-coded s = 0 and the m-derived
+        // null space, so the pure polyharmonic kernel `r^{2(p+s)-d}` failed to
+        // *exist* (`2(p+s) > d`) at latent_dim >= 4 with m = 2. The fix routes
+        // through `resolve_duchon_orders`, which must lift `s` (and, if pure-mode
+        // CPD requires it, the null-space order) until the kernel exists — for
+        // EVERY ambient dimension, including the even-d `2(p+s)=d` log boundary.
+        let requested = duchon_nullspace_from_test_m(2); // == DuchonNullspaceOrder::Linear
+        for dim in 1..=8usize {
+            let (nullspace, power) = resolve_duchon_orders(dim, requested, 0, None);
+            let p = duchon_p_from_nullspace_order(nullspace);
+            // Kernel-existence: 2(p+s) > d strictly.
+            assert!(
+                2 * (p + power) > dim,
+                "dim={dim}: resolved p={p}, s={power} violates 2(p+s) > d"
+            );
+            // Pure-mode CPD vs polynomial null space P_p: 2s < d.
+            assert!(
+                2 * power < dim,
+                "dim={dim}: resolved s={power} violates pure-mode CPD 2s < d"
+            );
+            // The resolver never weakens the requested null-space order.
+            assert!(
+                duchon_p_from_nullspace_order(nullspace) >= duchon_p_from_nullspace_order(requested),
+                "dim={dim}: resolver decreased the requested null-space order"
+            );
+            // And the concrete kernel-order validator accepts the resolved pair.
+            validate_duchon_kernel_orders(None, p, power as f64, dim).unwrap_or_else(|e| {
+                panic!("dim={dim}: resolved (p={p}, s={power}) rejected by validator: {e}")
+            });
+        }
+    }
+
+    fn duchon_nullspace_from_test_m(m: usize) -> DuchonNullspaceOrder {
+        match m {
+            1 => DuchonNullspaceOrder::Zero,
+            2 => DuchonNullspaceOrder::Linear,
+            other => DuchonNullspaceOrder::Degree(other - 1),
+        }
     }
 
     #[test]
