@@ -246,6 +246,15 @@ pub const SURVIVAL_TIME_FLOOR: f64 = 1e-9;
 /// reconstruction paths cannot drift apart.
 const SURVIVAL_TIME_SMOOTH_LAMBDA_SEED: f64 = 1e-2;
 
+/// Default initial Gompertz / Gompertz-Makeham shape parameter when the user
+/// does not supply `--baseline-shape`. The Gompertz hazard is
+/// `h(t) = rate · exp(shape · t)`; a near-zero shape seeds the baseline at an
+/// almost-flat (exponential-like) hazard, letting the fit grow the
+/// age-acceleration term from the data rather than committing to a strong
+/// curvature up front. Shared by the parse and fit-seed paths so both start
+/// from the same neutral shape.
+const GOMPERTZ_DEFAULT_SHAPE_SEED: f64 = 0.01;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SurvivalLikelihoodMode {
     Transformation,
@@ -374,7 +383,7 @@ pub fn parse_survival_baseline_config(
         }
         SurvivalBaselineTarget::Gompertz => {
             let rate = rate.unwrap_or(1.0);
-            let shape = shape.unwrap_or(0.01);
+            let shape = shape.unwrap_or(GOMPERTZ_DEFAULT_SHAPE_SEED);
             if !rate.is_finite() || rate <= 0.0 || !shape.is_finite() {
                 return Err(
                     "gompertz baseline requires finite --baseline-shape and positive --baseline-rate"
@@ -391,7 +400,7 @@ pub fn parse_survival_baseline_config(
         }
         SurvivalBaselineTarget::GompertzMakeham => {
             let rate = rate.unwrap_or(0.5);
-            let shape = shape.unwrap_or(0.01);
+            let shape = shape.unwrap_or(GOMPERTZ_DEFAULT_SHAPE_SEED);
             let makeham = makeham.unwrap_or(0.5);
             if !rate.is_finite()
                 || rate <= 0.0
@@ -525,14 +534,14 @@ pub fn initial_survival_baseline_config_for_fit(
         SurvivalBaselineTarget::Gompertz => SurvivalBaselineConfig {
             target,
             scale: None,
-            shape: Some(shape.unwrap_or(0.01)),
+            shape: Some(shape.unwrap_or(GOMPERTZ_DEFAULT_SHAPE_SEED)),
             rate: Some(rate.unwrap_or(1.0 / time_scale_seed)),
             makeham: None,
         },
         SurvivalBaselineTarget::GompertzMakeham => SurvivalBaselineConfig {
             target,
             scale: None,
-            shape: Some(shape.unwrap_or(0.01)),
+            shape: Some(shape.unwrap_or(GOMPERTZ_DEFAULT_SHAPE_SEED)),
             rate: Some(rate.unwrap_or(0.5 / time_scale_seed)),
             makeham: Some(makeham.unwrap_or(0.5 / time_scale_seed)),
         },
