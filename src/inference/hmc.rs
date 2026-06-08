@@ -6160,14 +6160,27 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
     }
 
     let n_draws = block_sampling_draws(m);
-    // Fixed seed → deterministic, jitter-free inner objective. The seed is
-    // mixed from the block geometry so different blocks/curvatures get
-    // independent streams without any external state.
+    // ρ-invariant fixed seed → deterministic AND smooth-in-ρ objective.
+    //
+    // The doc comment above promises "the outer optimizer sees a smooth,
+    // reproducible objective rather than Monte-Carlo jitter across
+    // evaluations." That smoothness holds only if the importance draws
+    // `z_s` themselves do NOT depend on ρ — ρ may enter the estimator
+    // only through the per-sample importance weights `exp(−ΔF(t_s))` and
+    // the rescaling `t_s = z_s / √λ_r`, both of which are continuous in
+    // ρ for fixed `z_s`. A seed mixed from `λ_r = exp(ρ_k)` (or any
+    // other ρ-dependent quantity such as the H-eigenvalues) permutes
+    // `z_s` for every ρ probe, so the FD `(F(ρ+h) − F(ρ−h))/2h`
+    // identity fails by O(MC_stdev/h) — exactly the order-10²–10³ FD
+    // blow-up observed in the iso-κ Duchon binomial FD probes — and
+    // every outer trust-region step lands on a different random face of
+    // the objective. Mix only the (ρ-invariant) block / outer dimensions
+    // so different problems still get independent streams.
     let mut seed_bits: u64 = 0x9E37_79B9_7F4A_7C15;
-    for &l in lambdas.iter() {
-        seed_bits ^= l.to_bits().rotate_left(17);
-        seed_bits = seed_bits.wrapping_mul(0x1000_0000_01B3);
-    }
+    seed_bits ^= (m as u64).rotate_left(17);
+    seed_bits = seed_bits.wrapping_mul(0x1000_0000_01B3);
+    seed_bits ^= (k as u64).rotate_left(31);
+    seed_bits = seed_bits.wrapping_mul(0x1000_0000_01B3);
     let mut rng = StdRng::seed_from_u64(seed_bits);
 
     // Accumulate log-weights w_s = −ΔF(t_s) (stable log-mean-exp) and the
