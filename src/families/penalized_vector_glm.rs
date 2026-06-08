@@ -73,6 +73,37 @@ use crate::solver::estimate::EstimationError;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 
+/// Base Levenberg–Marquardt ridge as a fraction of the penalized Hessian's
+/// largest diagonal entry (so it is invariant to the problem's overall
+/// curvature scale). At ~1e-10 of the dominant curvature it is negligible
+/// relative to identified-direction curvature — it never biases the identified
+/// optimum (at β̂ the unridged gradient still vanishes there) — yet large
+/// enough to lift an exactly rank-deficient null direction off zero so the
+/// Bunch–Kaufman fallback yields a finite, descent Newton step (gam#856).
+const BASE_RIDGE_FRACTION_OF_MAX_DIAG: f64 = 1.0e-10;
+
+/// Geometric ridge-escalation budget for a single Newton step. 30 doublings
+/// span ~9 orders of magnitude over the base ridge, which covers any
+/// conditioning a finite-curvature softmax/binomial block can present.
+const MAX_RIDGE_ESCALATIONS: usize = 30;
+
+/// Backtracking budget for the damped-Newton line search: full step first, then
+/// halve up to this many times if the penalized objective fails to decrease.
+const MAX_BACKTRACKS: usize = 8;
+
+/// Per-step line-search contraction factor (halving).
+const LINE_SEARCH_SHRINK: f64 = 0.5;
+
+/// Slack on the "objective decreased" acceptance test, absorbing floating-point
+/// round-off so a step that is flat to machine precision is not rejected.
+const OBJECTIVE_DECREASE_SLACK: f64 = 1.0e-12;
+
+/// First-order optimality gate (gam#856) as a fraction of `1 + max_diag`: the
+/// unridged penalized gradient norm must fall below this curvature-scaled
+/// threshold before convergence is declared, certifying stationarity on the
+/// identified subspace rather than a premature step-norm stall.
+const OPTIMALITY_GRAD_FRACTION: f64 = 1.0e-6;
+
 /// Inputs to [`fit_penalized_vector_glm`].
 ///
 /// `M` (the number of active outputs / linear-predictor columns) is taken from
@@ -344,15 +375,6 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         // gradient vanishes and the step → 0 regardless of τ.
         let max_diag =
             (0..beta_flat_dim).fold(0.0_f64, |acc, idx| acc.max(hessian[[idx, idx]].abs()));
-        let base_ridge = if max_diag.is_finite() && max_diag > 0.0 {
-            max_diag * 1.0e-10
-        } else {
-            1.0e-10
-        };
-        // 30 doublings span ~9 orders of magnitude over the base ridge, which
-        // covers any conditioning a finite-curvature softmax/binomial block can
-        // present.
-        //
         // The ridge floors at `base_ridge` (not 0) for every solve. An exactly
         // rank-deficient block (e.g. duplicate / collinear design columns under
         // a near-zero λ) leaves `H = block(XᵀWX) + diag_a(λ_a S)` singular along
@@ -363,13 +385,13 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         // subspace — the line search then shrinks α toward 0 and the step-norm
         // test declares a false convergence at a point where the unridged
         // penalized gradient on identified directions is still large (gam#856).
-        // A minimal Tikhonov ridge `base_ridge·I = max_diag·1e-10·I` resolves the
-        // null direction to its minimum-norm representative, giving a true
-        // descent direction. Because `base_ridge` is ~1e-10 of the dominant
-        // curvature, it is negligible relative to identified-direction curvature,
-        // so it never biases the identified optimum: at β̂ the unridged gradient
-        // still vanishes there.
-        const MAX_RIDGE_ESCALATIONS: usize = 30;
+        // A minimal Tikhonov ridge `base_ridge·I` resolves the null direction to
+        // its minimum-norm representative, giving a true descent direction.
+        let base_ridge = if max_diag.is_finite() && max_diag > 0.0 {
+            max_diag * BASE_RIDGE_FRACTION_OF_MAX_DIAG
+        } else {
+            BASE_RIDGE_FRACTION_OF_MAX_DIAG
+        };
         let mut delta = Array1::<f64>::zeros(beta_flat_dim);
         let mut ridge = base_ridge;
         let mut solved = false;
@@ -426,8 +448,8 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt(),
         );
 
-        // Damped acceptance: full step first, halve up to 8 times if the
-        // penalized negative log-likelihood fails to decrease. The first
+        // Damped acceptance: full step first, halve up to `MAX_BACKTRACKS` times
+        // if the penalized negative log-likelihood fails to decrease. The first
         // iteration seeds `last_objective` from the initial β.
         let proposed_beta = |alpha: f64| -> Array2<f64> {
             let mut out = beta.clone();
@@ -448,10 +470,11 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         let mut accepted_beta = proposed_beta(alpha);
         let mut new_objective = evaluate_objective(&accepted_beta);
         let mut backtrack = 0usize;
-        while (!new_objective.is_finite() || new_objective > last_objective + 1.0e-12)
-            && backtrack < 8
+        while (!new_objective.is_finite()
+            || new_objective > last_objective + OBJECTIVE_DECREASE_SLACK)
+            && backtrack < MAX_BACKTRACKS
         {
-            alpha *= 0.5;
+            alpha *= LINE_SEARCH_SHRINK;
             accepted_beta = proposed_beta(alpha);
             new_objective = evaluate_objective(&accepted_beta);
             backtrack += 1;
@@ -485,11 +508,11 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         // the data magnitude so it is invariant to problem scale.
         let grad_norm = grad_flat.iter().map(|v| v * v).sum::<f64>().sqrt();
         // Curvature-scaled optimality threshold: `max_diag` is the dominant
-        // penalized-Hessian diagonal entry, so `1e-6·max_diag` is a tiny
-        // gradient relative to the problem's curvature scale and is reached by
-        // a few quadratically-converging Newton steps on this smooth, bounded
-        // softmax/binomial likelihood.
-        let grad_optimal = grad_norm <= 1.0e-6 * (1.0 + max_diag);
+        // penalized-Hessian diagonal entry, so `OPTIMALITY_GRAD_FRACTION·max_diag`
+        // is a tiny gradient relative to the problem's curvature scale and is
+        // reached by a few quadratically-converging Newton steps on this smooth,
+        // bounded softmax/binomial likelihood.
+        let grad_optimal = grad_norm <= OPTIMALITY_GRAD_FRACTION * (1.0 + max_diag);
         if step_norm <= tol * (1.0 + beta_norm) && grad_optimal {
             converged = true;
             break;
