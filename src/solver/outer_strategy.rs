@@ -2550,10 +2550,24 @@ struct OuterFirstOrderBridge<'a> {
     layout: OuterThetaLayout,
     /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
     /// a coarsen-then-tighten cap into it on every accepted gradient eval
-    /// (see `first_order_inner_cap_schedule`). The cap is NEVER touched
-    /// in `eval_cost` so line-search probes within an outer iter see a
-    /// stable inner tolerance — Wolfe conditions assume constant cost
-    /// noise within a bracket.
+    /// (see `first_order_inner_cap_schedule`).
+    ///
+    /// The cap is a perf optimization for the GRADIENT inner solve only: at
+    /// the accepted ρ the warm-start is excellent, so a small cap converges
+    /// the inner Newton and a still-non-converged result is honestly rejected
+    /// as infeasible. But the line-search COST probe (`eval_cost`) evaluates a
+    /// DIFFERENT trial ρ whose warm-start is worse; the same small cap can stop
+    /// the inner solve short of its fixed point, returning a non-converged
+    /// `f64::INFINITY` cost for a point that is actually feasible. With every
+    /// trial step then reporting `∞`, no Wolfe/ARC step satisfies descent, the
+    /// optimizer never leaves the accepted ρ, and the gradient re-evaluated
+    /// there is identical iter after iter — the frozen-|g| outer stall in
+    /// gam#787 (bernoulli matern marginal-slope) and gam#808 (survival
+    /// marginal-slope). The line-search cost MUST be the same converged-inner
+    /// objective the analytic envelope gradient differentiates; a capped
+    /// surrogate is a different objective. So `eval_cost` UNCAPS the inner solve
+    /// (stores `0` = full `pirls_config.max_iterations`) before delegating, and
+    /// `eval_grad`/`eval_hessian` restore the scheduled cap on the next call.
     outer_inner_cap: Option<InnerProgressFeedback>,
     /// Counts gradient evaluations for logging only. Inner-PIRLS scheduling
     /// uses `InnerProgressFeedback.accepted_iter` so rejected line-search
@@ -2580,6 +2594,18 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         // sentinel cost. This entry point can therefore stay honest: any
         // call that lands here is a real line-search probe, not a too-far
         // attempt the bridge needs to swat away.
+        //
+        // Uncap the inner solve for the line-search cost probe (see the field
+        // doc on `outer_inner_cap`): the deciding cost MUST be the true
+        // converged-inner objective the analytic gradient differentiates, not
+        // the scheduled gradient-path cap which can stop a trial-ρ inner solve
+        // short of its fixed point and report a spurious `∞`. `eval_grad`
+        // restores the scheduled cap on the next call.
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
+            feedback
+                .cap
+                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+        }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
@@ -3193,6 +3219,19 @@ struct OuterSecondOrderBridge<'a> {
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        // Uncap the inner solve for the ARC line-search / trial-acceptance cost
+        // probe. Identical rationale to `OuterFirstOrderBridge::eval_cost`: the
+        // deciding cost must be the true converged-inner objective the analytic
+        // gradient/Hessian differentiate, never the scheduled gradient-path cap
+        // (which at a trial ρ can stop the inner solve short and report a
+        // spurious `∞`, freezing the ARC at constant cost / |g| — gam#808
+        // survival marginal-slope, gam#787 bernoulli matern marginal-slope).
+        // `eval_grad`/`eval_hessian` restore the scheduled cap on the next call.
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
+            feedback
+                .cap
+                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+        }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
@@ -3530,6 +3569,19 @@ struct OuterOperatorBridge<'a> {
 
 impl ZerothOrderObjective for OuterOperatorBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        // Uncap the inner solve for the matrix-free TR line-search cost probe.
+        // Identical rationale to the BFGS / ARC bridges: the deciding cost must
+        // be the true converged-inner objective the analytic gradient/operator
+        // Hessian differentiate, never the scheduled gradient-path cap (which at
+        // a trial ρ can stop the inner solve short and report a spurious `∞`,
+        // freezing the TR at constant cost / |g|). This is the route the
+        // ψ-bearing matern bernoulli marginal-slope fit takes (gam#787);
+        // `eval_value_grad_op` restores the scheduled cap on the next call.
+        if let Some(feedback) = self.outer_inner_cap.as_ref() {
+            feedback
+                .cap
+                .store(SEED_SCREENING_UNCAPPED, Ordering::Relaxed);
+        }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
         let cost = self
