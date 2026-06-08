@@ -1,4 +1,7 @@
 pub mod alo;
+pub mod fisher_rao;
+pub mod identifiability_diagnostics;
+pub mod posterior;
 pub mod conformal;
 pub mod data;
 pub mod diagnostics;

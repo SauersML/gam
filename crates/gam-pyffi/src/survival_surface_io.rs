@@ -507,7 +507,7 @@ pub(crate) fn survival_coerce_times<'py>(
     let array = np.call_method("asarray", (times,), Some(&kwargs))?;
     let flat = array.call_method1("reshape", (-1,))?;
     let typed = flat.cast_into::<PyArray1<f64>>().map_err(PyErr::from)?;
-    let values: Vec<f64> = typed.readonly().as_array().iter().copied().collect();
+    let values: Vec<f64> = typed.as_array().iter().copied().collect();
     if values.is_empty() {
         return Err(py_value_error(
             "survival prediction requires at least one time".to_string(),

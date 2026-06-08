@@ -1461,8 +1461,8 @@ fn numeric_matrix_validate<'py>(
 
     {
         let typed_array = array.cast::<PyArray2<f64>>()?;
-        let readonly = typed_array.readonly();
-        if !readonly.as_array().iter().all(|value| value.is_finite()) {
+        let readonly = typed_array.as_array();
+        if !readonly.iter().all(|value| value.is_finite()) {
             return Err(py_value_error(format!(
                 "{label} must contain only finite values"
             )));
@@ -21527,8 +21527,8 @@ fn sheaf_extract_array2(obj: &Bound<'_, PyAny>, label: &str) -> PyResult<Array2<
             "SheafConsistencyPenalty: {label} must be a 2-D numpy.ndarray of float64"
         ))
     })?;
-    let readonly = arr.readonly();
-    Ok(readonly.as_array().to_owned())
+    let readonly = arr.as_array();
+    Ok(readonly.to_owned())
 }
 
 fn sheaf_extract_restrictions(
