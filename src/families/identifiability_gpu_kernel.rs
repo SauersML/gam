@@ -38,10 +38,12 @@
 /// Kernel symbol exported by the NVRTC module.
 pub const KERNEL_NAME: &str = "fused_primary_state_gram_kernel";
 
-/// Tile / chunk constants — must match the kernel source.
+/// Tile constants — must match the `#define TILE_A` / `TILE_B` in `KERNEL_SRC`.
+/// The host-side launch reads these to compute the launch grid; `ROW_CHUNK` is
+/// only consumed by the kernel itself, so its `#define` in `KERNEL_SRC` is the
+/// single source of truth and no Rust mirror is needed.
 pub const TILE_A: u32 = 16;
 pub const TILE_B: u32 = 16;
-pub const ROW_CHUNK: u32 = 32;
 
 /// Compile-time NVRTC source for the fused Gram kernel.
 ///

@@ -982,8 +982,8 @@ mod linux_impl {
 
 #[cfg(target_os = "linux")]
 pub use linux_impl::{
-    GpuGaussianPlsInput, GpuPirlsDispatchInput, try_gpu_gaussian_pls_admit,
-    try_gpu_gaussian_pls_dispatch, try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
+    GpuGaussianPlsInput, GpuPirlsDispatchInput, try_gpu_gaussian_pls_dispatch,
+    try_gpu_pirls_loop_admit, try_gpu_pirls_loop_dispatch,
 };
 
 #[cfg(test)]
