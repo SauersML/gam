@@ -2,6 +2,24 @@ use ndarray::parallel::prelude::*;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis};
 use serde::{Deserialize, Serialize};
 
+/// Slack tolerance for the half-space membership test `aᵀx ≤ b`. Points within
+/// this distance of a facet (normals are unit-length, so slack is Euclidean
+/// distance) are treated as on-boundary / inside, absorbing round-off in the
+/// dot product.
+const MEMBERSHIP_SLACK_TOL: f64 = 1e-12;
+
+/// Maximum number of Dykstra cycles over all facet constraints before the
+/// projection returns its last (near-feasible) iterate.
+const DYKSTRA_MAX_CYCLES: usize = 200;
+
+/// Convergence tolerance on the per-cycle L¹ iterate change for Dykstra
+/// projection.
+const DYKSTRA_TOL: f64 = 1e-8;
+
+/// Floor on the squared facet-normal magnitude used when normalising the
+/// projection step, guarding against a degenerate (near-zero) normal.
+const FACET_NORM2_FLOOR: f64 = 1e-16;
+
 /// A peeled convex hull represented as an intersection of half-spaces a^T x <= b.
 /// Facet normals `a` are unit-length direction vectors used to generate supporting halfspaces
 /// after iterative peeling. This is a robust, outlier-insensitive boundary representation.
@@ -53,7 +71,7 @@ impl PeeledHull {
     pub fn is_inside(&self, x: ArrayView1<f64>) -> bool {
         for (a, b) in &self.facets {
             let s = a.dot(&x);
-            if s > *b + 1e-12 {
+            if s > *b + MEMBERSHIP_SLACK_TOL {
                 return false;
             }
         }
@@ -92,8 +110,8 @@ impl PeeledHull {
     fn project_point(&self, y: ArrayView1<f64>) -> Array1<f64> {
         let d = self.dim;
         let m = self.facets.len();
-        let max_cycles = 200; // cycles over all constraints
-        let tol = 1e-8;
+        let max_cycles = DYKSTRA_MAX_CYCLES;
+        let tol = DYKSTRA_TOL;
 
         // Dykstra variables
         let mut x = y.to_owned();
@@ -108,7 +126,7 @@ impl PeeledHull {
 
                 // Project y_i onto halfspace H_i: a^T z <= b
                 let a_tb = a.dot(&y_i) - *b;
-                let a_norm2 = a.dot(a).max(1e-16);
+                let a_norm2 = a.dot(a).max(FACET_NORM2_FLOOR);
                 if a_tb > 0.0 {
                     // Outside; move along normal inward
                     let alpha = a_tb / a_norm2;
