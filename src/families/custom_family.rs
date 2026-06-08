@@ -12919,46 +12919,6 @@ fn symmetric_gershgorin_spectral_radius(a: &Array2<f64>) -> f64 {
     radius
 }
 
-/// Return a copy of the symmetric PSD matrix `a` with every eigenvalue clamped to
-/// at most `max_eig` (eigenvectors unchanged). Used to bound the Firth curvature
-/// `H_Φ` to the data-Hessian scale before it enters the Newton step. When no
-/// eigenvalue exceeds `max_eig` (the well-identified case) the clamp is the
-/// identity, so this is a no-op exactly where Firth is not over-amplified.
-fn cap_symmetric_eigenvalues(a: &Array2<f64>, max_eig: f64) -> Array2<f64> {
-    if !(max_eig.is_finite() && max_eig > 0.0) {
-        return a.clone();
-    }
-    let mut sym = a.clone();
-    symmetrize_dense_in_place(&mut sym);
-    let (evals, evecs) = match FaerEigh::eigh(&sym, Side::Lower) {
-        Ok(pair) => pair,
-        Err(_) => return a.clone(),
-    };
-    // No eigenvalue exceeds the cap ⇒ identity (avoid the reconstruction cost and
-    // any round-off it would introduce on the fast path).
-    if evals.iter().all(|&lam| lam <= max_eig) {
-        return a.clone();
-    }
-    let p = sym.nrows();
-    let capped: Vec<f64> = evals.iter().map(|&lam| lam.min(max_eig)).collect();
-    let mut out = Array2::<f64>::zeros((p, p));
-    for k in 0..p {
-        let lam = capped[k];
-        if lam == 0.0 {
-            continue;
-        }
-        let u_k = evecs.column(k);
-        for i in 0..p {
-            let ui = lam * u_k[i];
-            for j in 0..p {
-                out[[i, j]] += ui * u_k[j];
-            }
-        }
-    }
-    symmetrize_dense_in_place(&mut out);
-    out
-}
-
 fn solve_joint_newton_step_on_spectral_range(
     h_pen: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -14938,6 +14898,41 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 } else {
                     None
                 };
+            // CONSISTENT FIRTH ATTENUATION (gam#826/#872/#715). On a severely
+            // near-separating coupled direction the reduced information `H_id` is
+            // tiny, so the floored inverse `1/max(λ,floor)` explodes and BOTH the
+            // Firth score `∇Φ = ½tr(H_id⁻¹ D)` AND its Gauss-Newton curvature
+            // `H_Φ = ½tr(H_id⁻¹ D H_id⁻¹ D)` blow up by many orders (observed
+            // ‖∇Φ‖ ≈ 1.8e9, ‖H_Φ‖ comparable). Capping ONLY the curvature would
+            // unbalance the Newton step `(H+Sλ+H_Φ)⁻¹(∇L−Sβ+∇Φ)` — bounded
+            // denominator over a 1e9 numerator gives a 1e6 step the line search
+            // can never accept (the matern location-scale / quasi-separating
+            // multinomial abort). Instead attenuate the WHOLE triple by one scalar
+            // `s = min(1, cap / ‖H_Φ‖)` with `cap = FIRTH_CURVATURE_MAX_RATIO ·
+            // λ_max(H+Sλ)`, so the Firth Newton DIRECTION is preserved exactly and
+            // both rhs and lhs (and the KKT residual / merit value, all built from
+            // this one triple) stay on one consistently-scaled objective. Firth is
+            // a prior; uniformly down-weighting it when it would dominate the data
+            // information by >`FIRTH_CURVATURE_MAX_RATIO`× still bounds a separating
+            // coefficient (s·∇Φ remains the largest O(1)-restoring force in the
+            // residual) while keeping `H+Sλ+s·H_Φ` well-conditioned so the solve
+            // converges. `s = 1` (no-op) whenever H_Φ is already within the cap —
+            // the well-identified fast path and #729 are byte-identical.
+            let head_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
+                head_jeffreys_term.map(|(grad_phi, hphi)| {
+                    let hphi_radius = symmetric_gershgorin_spectral_radius(&hphi);
+                    let h_pen_scale = joint_trust_metric_diag
+                        .iter()
+                        .map(|v| v.abs())
+                        .fold(0.0_f64, f64::max);
+                    let cap = FIRTH_CURVATURE_MAX_RATIO * h_pen_scale;
+                    if cap.is_finite() && cap > 0.0 && hphi_radius > cap {
+                        let s = cap / hphi_radius;
+                        (grad_phi.mapv(|v| s * v), hphi.mapv(|v| s * v))
+                    } else {
+                        (grad_phi, hphi)
+                    }
+                });
             // Fold the Firth/Jeffreys score `∇Φ` into the head-of-cycle KKT
             // residual when the term is armed, for the same reason as the
             // post-step residual below: the inner objective is `−ℓ + ½βᵀSβ − Φ`,
@@ -15018,22 +15013,16 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         joint_bundle,
                     );
                     let mut rhs_step = &grad_joint - &penalty_beta_joint;
-                    // Reuse the head-β Jeffreys triple (computed once this cycle).
-                    // Skipped when the cheap pre-check certifies well-conditioning:
-                    // ∇Φ = 0 and H_Φ = 0 there, so neither rhs_step nor lhs change.
-                    // H_Φ is capped to the data+penalty Hessian scale before folding
-                    // (see the spectral branch below for the full rationale,
-                    // gam#826/#715): the gradient ∇Φ in `rhs_step` is unchanged.
+                    // Reuse the head-β Jeffreys triple (consistently attenuated in
+                    // `head_jeffreys_term` — both ∇Φ and H_Φ scaled by one scalar,
+                    // gam#826/#872/#715). Skipped when the cheap pre-check certifies
+                    // well-conditioning: ∇Φ = 0 and H_Φ = 0 there, so neither
+                    // rhs_step nor lhs change.
                     if let Some((grad_phi, hphi)) = head_jeffreys_term.as_ref()
                         && grad_phi.len() == rhs_step.len()
                     {
                         rhs_step += grad_phi;
-                        let h_pen_lambda_max = symmetric_gershgorin_spectral_radius(&lhs);
-                        let hphi_capped = cap_symmetric_eigenvalues(
-                            hphi,
-                            FIRTH_CURVATURE_MAX_RATIO * h_pen_lambda_max,
-                        );
-                        lhs += &hphi_capped;
+                        lhs += hphi;
                     }
                     // Self-vanishing Levenberg–Marquardt damping for the
                     // CONSTRAINED active-set QP, mirroring the spectral-range
@@ -15357,34 +15346,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // SAME Jeffreys-augmented Newton system.
                         let spectral_rhs = rhs.clone();
                         if let Some((_grad_phi, hphi)) = inner_jeffreys_term.as_ref() {
-                            // Cap the Firth Gauss-Newton curvature `H_Φ` to the data
-                            // + penalty Hessian scale before folding it into the
-                            // Newton system (gam#826/#715). `H_Φ = ½ tr(I⁻¹ Iₐ I⁻¹ I_b)`
-                            // scales as `(1/floor)²` on a near-separating / weakly-
-                            // identified reduced-info direction (e.g. log_sigma at
-                            // β=0, or the quasi-separating multinomial penguins), so
-                            // it can exceed the data Hessian by ~1e20. Added raw, it
-                            // inflates `λ_max(H+Sλ+H_Φ)` so far that the spectral
-                            // Newton solve's numerical-rank floor
-                            // `λ_max·√p·ε` rises ABOVE the genuine O(1) data-curvature
-                            // directions, which are then DROPPED as null — the ∇Φ rhs
-                            // lands in that dropped direction, the step is zero, and
-                            // the cycle-0 cert refuses (phantom_multiplier) /the
-                            // multinomial over-damps to a standstill. Firth is a
-                            // bounded ~½-observation prior: its curvature must not
-                            // dominate the data information. Cap `H_Φ`'s eigenvalues
-                            // at `FIRTH_CURVATURE_MAX_RATIO · λ_max(H+Sλ)`; this
-                            // preserves the O(1)-bounding response (the gradient ∇Φ in
-                            // `rhs` is UNCHANGED — only the step curvature is bounded)
-                            // and keeps `H+Sλ+H_Φ` well-conditioned so the genuine
-                            // directions survive the rank test. No-op when `H_Φ` is
-                            // already within the cap (the well-identified fast path).
-                            let h_pen_lambda_max = symmetric_gershgorin_spectral_radius(&lhs_true);
-                            let hphi_capped = cap_symmetric_eigenvalues(
-                                hphi,
-                                FIRTH_CURVATURE_MAX_RATIO * h_pen_lambda_max,
-                            );
-                            lhs_true += &hphi_capped;
+                            // `hphi` (and the `∇Φ` already folded into `rhs`) are the
+                            // CONSISTENTLY-ATTENUATED Firth triple from
+                            // `head_jeffreys_term` — both scaled by the same scalar so
+                            // the Newton system `(H+Sλ+s·H_Φ)δ = ∇L−Sβ+s·∇Φ` stays
+                            // balanced and well-conditioned (gam#826/#872/#715). No
+                            // per-site capping here.
+                            lhs_true += hphi;
                         }
                         // Self-vanishing Levenberg–Marquardt damping for the
                         // range-restricted spectral step. Scaled to the current
@@ -15449,14 +15417,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         delta = Some(spectral_step.delta);
                     }
 
-                    {
-                        use std::io::Write as _;
-                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                            let dn = delta.as_ref().map(|d| d.iter().all(|v| v.is_finite()));
-                            let di = delta.as_ref().map(|d| d.iter().map(|v| v.abs()).fold(0.0_f64, f64::max));
-                            writeln!(f, "[DIAGD] cyc={cycle} screen={} delta_some={} delta_finite={dn:?} delta_inf={di:?} nullity={spectral_nullity_for_step}", options.seed_screening, delta.is_some()).ok();
-                        }
-                    }
                     let Some(delta) = delta else {
                         break; // Fall back to blockwise
                     };
