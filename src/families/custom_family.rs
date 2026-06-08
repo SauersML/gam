@@ -12880,9 +12880,36 @@ fn solve_joint_newton_step_on_spectral_range(
     // curvature blocks (an unpenalized intercept at small n) at a residual
     // plateau orders above `residual_tol`. So count the nullity first and use
     // μ only when the model is genuinely rank-deficient.
+    //
+    // CRITICAL (#826): the rank test that gates the damping must use the TRUE
+    // numerical rank floor `null_cutoff`, NOT the penalty-inflated RELATIVE
+    // `cutoff = 1e-10·λ_max`. At the maximally-oversmoothed continuation seed
+    // (λ ~ exp(2·EXACT_JOINT_RHO_BOUND) ≈ e²⁴) λ_max is dominated by the huge
+    // S_λ eigenvalues, so `cutoff` rises to O(1)–O(10) — right into the band of
+    // the GENUINE likelihood curvature of the penalty-null mean/threshold/wiggle
+    // trend directions (XᵀWX ~ O(n·w), but per-direction curvature can be O(1)).
+    // Counting those data-identified directions as "rank-deficient" engages the
+    // self-vanishing μ on them, and because μ = c·‖∇L − Sβ‖∞ is set by the
+    // PENALTY-inflated joint residual it can exceed their small likelihood
+    // curvature, throttling their Newton step by λ/(λ+μ) ≪ 1. β then barely
+    // moves while ‖∇L − Sβ‖∞ stays frozen — exactly the "block β ≈ 0, residual
+    // large" stall the issue reports, which leaves the inner solve unconverged
+    // at every oversmooth seed and forces the continuation to expand the offset
+    // outward (making the problem strictly worse) until it gives up.
+    //
+    // The genuine-rank test (`null_cutoff = min(cutoff, numerical_floor)`)
+    // separates penalty scale from likelihood scale: a likelihood-identified
+    // mean-trend direction sits far above `numerical_floor` even when the penalty
+    // eigenvalues are astronomically large, so it is correctly classified as
+    // identified, `effective_mu` stays 0 along it, and the EXACT undamped Newton
+    // step `component/λ` drives the trend to its oversmoothed optimum in O(1)
+    // cycles. Genuine numerical rank deficiency (curvature below the working-
+    // precision floor) still engages μ. The ill-conditioned-Newton branch below
+    // (gated on `engage_ill_conditioned_levenberg`) independently handles the
+    // full-rank-but-ill-conditioned survival regime (#808).
     let spectral_nullity = evals
         .iter()
-        .filter(|v| !v.is_finite() || v.abs() <= cutoff)
+        .filter(|v| !v.is_finite() || v.abs() <= null_cutoff)
         .count();
     // The `nullity > 0` gate above (which engages the self-vanishing μ) is too
     // narrow for the survival marginal-slope path: it assumes `nullity == 0 ⇒
@@ -14358,6 +14385,28 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         const RESIDUAL_STALL_BLOCK_GRADIENT_FACTOR: f64 = 50.0;
         let mut best_residual_seen: f64 = f64::INFINITY;
         let mut cycles_since_residual_improved: usize = 0;
+        // Number of consecutive non-improving cycles after which the
+        // conditioning-based self-vanishing Levenberg–Marquardt damping is
+        // ARMED inside the spectral-range Newton solve, for EVERY family
+        // (#826/#808). The undamped range-restricted Newton step oscillates on a
+        // full-rank-but-ill-conditioned penalized Hessian at the oversmoothed-ρ
+        // operating point: the tiny-but-above-cutoff curvature of the lightly
+        // identified mean/threshold/wiggle block takes an enormous `component/λ`
+        // proposal that the trust region clips every cycle, so the residual on
+        // that block freezes while its β stays ≈0 (the exact #826 signature).
+        // The conditioning-gated `μ = c·‖∇L − Sβ‖∞` caps that component into a
+        // bounded descent step. It is SELF-VANISHING (μ → 0 as the residual → 0)
+        // so the converged β and the KKT certificate are byte-identical to the
+        // undamped solve — zero REML/LAML bias. Arming it on OBSERVED non-
+        // progress rather than a static per-family flag keeps the AFT /
+        // constant-scale endgame (which converges quadratically and never
+        // stalls) byte-identical: a quadratically-converging solve reaches
+        // tolerance in a handful of cycles and never trips this threshold, so μ
+        // is never engaged there. Only a genuinely oscillating ill-conditioned
+        // solve crosses it, which is exactly when the damping is sound. Set a
+        // few cycles below the stall-exit window so the damping gets a chance to
+        // rescue the solve well before the early-exit / budget tripwire fires.
+        const COND_LEVENBERG_ARM_AFTER_NO_IMPROVE_CYCLES: usize = 4;
         // Recent KKT-residual values (oldest→newest) used to detect STEADY
         // geometric descent at the certificate-refusal gate. A still-converging
         // Newton direction (residual dropping by a steady factor < 1 each cycle)
@@ -15051,13 +15100,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         // binary-covariate CTM from settling (#733/#734).
                         let rhs_inf = spectral_rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
                         let spectral_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
+                        // Engage the conditioning-based self-vanishing μ when the
+                        // family always wants it (survival marginal-slope, #808)
+                        // OR when this solve has stopped making progress for a few
+                        // consecutive cycles — the universal oscillation signature
+                        // on a full-rank-but-ill-conditioned penalized Hessian at
+                        // the oversmoothed-ρ seed (#826). A quadratically
+                        // converging fit never trips the cycle threshold, so this
+                        // is byte-identical for well-conditioned / AFT endgames;
+                        // see `COND_LEVENBERG_ARM_AFTER_NO_IMPROVE_CYCLES`.
+                        let cond_levenberg_armed = family.levenberg_on_ill_conditioning()
+                            || cycles_since_residual_improved
+                                >= COND_LEVENBERG_ARM_AFTER_NO_IMPROVE_CYCLES;
                         let spectral_step = solve_joint_newton_step_on_spectral_range(
                             &lhs_true,
                             &spectral_rhs,
                             KKT_REFUSAL_RANK_TOL,
                             residual_tol_for_solve,
                             spectral_levenberg_mu,
-                            family.levenberg_on_ill_conditioning(),
+                            cond_levenberg_armed,
                         )?;
                         spectral_nullity_for_step = spectral_step.nullity;
                         if spectral_step.reflected_negative_modes > 0 {
