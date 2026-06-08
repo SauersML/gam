@@ -28,7 +28,7 @@ from ._compare import (
     _tierney_kadane_normalizer_from_null_dim,
     compare_models,
 )
-from ._tables import table_columns
+from ._tables import PreNormalizedTable, normalize_table, table_columns
 from .smooth import (
     BSpline,
     Duchon,
@@ -280,7 +280,28 @@ def select_topology(
     normalized = _normalize_candidates(candidates, feature_dim=feature_dim)
     _find_auto_smooth_call(formula)
 
-    def _screen_score(candidate: _Candidate, stage_kwargs: Mapping[str, Any]) -> float:
+    # Hoist topology-independent shared work above the AUTO candidate loop
+    # (#869). Two computations are invariant to the candidate topology and to
+    # the budget-cascade cap, yet were recomputed for every (candidate, stage)
+    # pair plus each survivor refit:
+    #
+    #   1. Table ingestion. ``gamfit.fit`` re-runs ``normalize_table(data)`` —
+    #      an O(n_rows * n_cols) cell-stringification — on every call. The same
+    #      table is fit up to (#cascade_stages * #candidates + #survivors)
+    #      times, so normalize it once here and pass a ``PreNormalizedTable``
+    #      that ``fit`` returns verbatim instead of re-coercing.
+    #   2. Candidate formula surgery. ``_formula_for_candidate`` depends only on
+    #      ``(formula, candidate)``, not on the cap or the eventual winner, so
+    #      build each candidate's formula once and reuse it across every
+    #      screening stage and the survivor refit.
+    headers, rows, table_kind = normalize_table(data)
+    shared_table = PreNormalizedTable(headers, rows, table_kind)
+    candidate_formulas: dict[int, str] = {}
+
+    def _candidate_formula_cached(candidate: _Candidate) -> str:
+        cached = candidate_formulas.get(id(candidate))
+        if cached is not None:
+            return cached
         candidate_formula = _formula_for_candidate(
             formula,
             candidate,
@@ -288,7 +309,12 @@ def select_topology(
         )
         if candidate_formula is None:  # defensive; strict_dimension=True raises.
             raise ValueError(f"candidate {candidate.name!r} is not constructible")
-        model = fit(data, candidate_formula, **stage_kwargs)
+        candidate_formulas[id(candidate)] = candidate_formula
+        return candidate_formula
+
+    def _screen_score(candidate: _Candidate, stage_kwargs: Mapping[str, Any]) -> float:
+        candidate_formula = _candidate_formula_cached(candidate)
+        model = fit(shared_table, candidate_formula, **stage_kwargs)
         reml_score = _extract_reml_score_raw(model)
         if not math.isfinite(reml_score):
             raise ValueError(f"degenerate REML score {reml_score!r}")
@@ -318,14 +344,8 @@ def select_topology(
     names: list[str] = []
     fit_list: list[Any] = []
     for candidate in survivors:
-        candidate_formula = _formula_for_candidate(
-            formula,
-            candidate,
-            strict_dimension=True,
-        )
-        if candidate_formula is None:
-            raise ValueError(f"candidate {candidate.name!r} is not constructible")
-        model = fit(data, candidate_formula, **fit_kwargs)
+        candidate_formula = _candidate_formula_cached(candidate)
+        model = fit(shared_table, candidate_formula, **fit_kwargs)
         reml_score = _extract_reml_score_raw(model)
         if not math.isfinite(reml_score):
             raise ValueError(

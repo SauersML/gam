@@ -7,6 +7,27 @@ from typing import Any, cast
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
 
 
+class PreNormalizedTable:
+    """A table already normalized to ``(headers, rows, kind)`` form.
+
+    ``normalize_table`` stringifies every cell of the input — an
+    ``O(n_rows * n_cols)`` pass that is invariant to the formula. Callers that
+    fit the *same* table many times (e.g. topology AUTO selection, which refits
+    one table across a budget cascade and several candidate topologies, #869)
+    can normalize once and wrap the result here; ``normalize_table`` then
+    short-circuits and returns the cached ``(headers, rows, kind)`` verbatim
+    instead of re-coercing and re-stringifying. ``kind`` is preserved so the
+    output-table restoration still reflects the original input library.
+    """
+
+    __slots__ = ("headers", "rows", "kind")
+
+    def __init__(self, headers: list[str], rows: list[list[str]], kind: str) -> None:
+        self.headers = headers
+        self.rows = rows
+        self.kind = kind
+
+
 def _try_import(name: str) -> Any | None:
     try:
         return importlib.import_module(name)
@@ -15,6 +36,8 @@ def _try_import(name: str) -> Any | None:
 
 
 def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
+    if isinstance(data, PreNormalizedTable):
+        return data.headers, data.rows, data.kind
     columns, kind = table_columns(data)
     headers = list(columns)
     if not headers:
