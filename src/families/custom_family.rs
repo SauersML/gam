@@ -8772,29 +8772,53 @@ fn weighted_normal_equations(
     Ok((xtwx, xtwy))
 }
 
+/// Smallest diagonal shift that makes the penalized joint Hessian
+/// Cholesky-factorable (i.e. positive definite at the solver floor), or `None`
+/// when the matrix is already PD and needs no shift.
+///
+/// PERF (gam#729/#826): the stabilizing shift is recomputed every inner Newton
+/// cycle. For a coupled K-block family (Dirichlet/multinomial) the joint Hessian
+/// is structurally near-singular along the cross-block gauge / sum-to-zero null
+/// space, so a shift fires on (almost) every cycle. The previous implementation
+/// ran a full dense self-adjoint eigendecomposition (`O(p³)`, all eigenpairs)
+/// just to read `min_eval` — the dominant per-cycle cost on the coupled inner
+/// solve. We only need a PD CERTIFICATE plus the smallest lifting ridge, which a
+/// Cholesky probe gives far more cheaply: a plain Cholesky succeeds in one shot
+/// on a well-conditioned cycle (no shift), and a geometric ridge escalation
+/// finds the lifting shift in a handful of `O(p³/3)` Cholesky attempts on the
+/// near-singular cycles — strictly cheaper than the full eigh and short-circuiting
+/// on the first PD factorization. The resulting shift makes `H_pen + δI` PD,
+/// which is exactly what the downstream solve requires.
 fn exact_newton_stabilizing_shift(lhs_dense: &Array2<f64>, ridge_floor: f64) -> Option<f64> {
     let floor = effective_solverridge(ridge_floor);
-    match FaerEigh::eigh(lhs_dense, Side::Lower) {
-        Ok((evals, _)) => {
-            let min_eval = evals.iter().copied().fold(f64::INFINITY, |a, b| {
-                if a.is_nan() || b.is_nan() {
-                    f64::NAN
-                } else {
-                    a.min(b)
-                }
-            });
-            if !min_eval.is_finite() || min_eval <= floor {
-                Some(floor - min_eval.min(0.0).max(-1e12))
-            } else {
-                None
-            }
-        }
-        Err(_) => {
-            let diag_max = (0..lhs_dense.nrows())
-                .map(|d| lhs_dense[[d, d]].abs())
-                .fold(0.0_f64, f64::max);
-            Some(floor.max(diag_max * 1e-6).max(1e-6))
-        }
+    // Fast path: already PD at zero shift ⇒ no stabilization needed. This is the
+    // common case on a well-conditioned cycle and costs a single Cholesky.
+    if lhs_dense.cholesky(Side::Lower).is_ok() {
+        return None;
+    }
+    // Near-singular / indefinite: find the smallest geometric ridge ≥ floor that
+    // restores positive definiteness. `try_cholesky_with_escalating_ridge` starts
+    // at `floor` and grows by 4× per attempt, short-circuiting on the first PD
+    // factorization. The scale ceiling tracks the diagonal magnitude so the
+    // search terminates even on a hard-singular block.
+    let diag_max = (0..lhs_dense.nrows())
+        .map(|d| lhs_dense[[d, d]].abs())
+        .fold(0.0_f64, f64::max);
+    let initial = floor.max(diag_max * 1e-12).max(f64::MIN_POSITIVE);
+    let found = try_cholesky_with_escalating_ridge(
+        lhs_dense,
+        initial,
+        // ~30 quadruplings spans floor·4³⁰ ≈ floor·1e18, enough to lift any
+        // finite-diagonal near-singular block past its smallest eigenvalue.
+        30,
+        4.0,
+        |_chol, _attempt, boost| Some(boost),
+    );
+    match found {
+        Some((boost, _, _)) => Some(boost.max(floor)),
+        // Cholesky never succeeded (non-finite entries): fall back to a
+        // diagonal-scaled ridge so the solve still receives a positive shift.
+        None => Some(floor.max(diag_max * 1e-6).max(1e-6)),
     }
 }
 
