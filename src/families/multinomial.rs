@@ -712,9 +712,51 @@ pub fn fit_penalized_multinomial_formula(
     let total_rho_dim = m.saturating_mul(penalties_arc.len());
     let use_outer_hessian = multinomial_formula_use_outer_hessian(total_rho_dim);
 
+    // ── Inner-vs-outer control split (#715 non-convergence root cause) ────────
+    // The legacy `max_iter` / `tol` parameters are the *outer* REML/LAML
+    // smoothing-parameter optimization controls — "how hard to search λ". The
+    // earlier wiring routed them straight into `inner_max_cycles` / `inner_tol`,
+    // capping the joint-Newton inner solve at `max_iter` (=50 in the quality
+    // suite) cycles with a `tol`-tight (=1e-8) KKT target. That is the #715
+    // hang: near the simplex boundary the softmax Fisher weight
+    // `W = diag(p) − p pᵀ` collapses, so `H = JᵀWJ + S_λ` is full-rank but
+    // ILL-CONDITIONED. The self-vanishing Levenberg–Marquardt damping
+    // (`levenberg_on_ill_conditioning()`) that keeps the inner solve from
+    // oscillating on those near-singular modes makes it converge only
+    // GEOMETRICALLY (linearly), not quadratically. Reaching a 1e-8 relative KKT
+    // residual under geometric descent needs FAR more than 50 cycles, so the
+    // inner returned `converged = false` on every outer ρ-evaluation; with the
+    // exact-Hessian outer optimizer on `FallbackPolicy::Disabled` that rejects
+    // every ρ-step — each rejected eval still paying a near-full 50-cycle inner
+    // solve plus the O(D²) pairwise outer-Hessian directional work — so the
+    // outer never certifies and the fit runs unbounded (the observed >8-minute
+    // non-termination). The certificate cannot be reached, not merely slow.
+    //
+    // Fix: give the INNER joint-Newton the framework's principled production
+    // budget (`DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES` cycles at the default
+    // `inner_tol`), which exists precisely so an ill-conditioned LM-damped solve
+    // can certify a stationary KKT point instead of being declared non-converged
+    // prematurely — and the KKT/objective certificates still exit in a handful
+    // of cycles on the well-conditioned interior fits, so this is free there.
+    // The caller's `max_iter` / `tol` become the OUTER controls they were always
+    // meant to be (smoothing-parameter search depth / accuracy). The inner KKT
+    // target is kept no tighter than the outer accuracy can consume: a 1e-8
+    // inner residual below a 1e-5 outer tolerance asks the inner to over-resolve
+    // gradient components the outer optimizer never reads, so we floor `inner_tol`
+    // at the default and never demand more inner precision than `tol` implies.
+    let outer_max_iter = max_iter.max(1);
+    let outer_tol = if tol.is_finite() && tol > 0.0 {
+        tol
+    } else {
+        BlockwiseFitOptions::default().outer_tol
+    };
+    let inner_tol = BlockwiseFitOptions::default().inner_tol.max(tol.max(0.0));
+
     let options = BlockwiseFitOptions {
-        inner_max_cycles: max_iter,
-        inner_tol: tol,
+        inner_max_cycles: crate::custom_family::DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES,
+        inner_tol,
+        outer_max_iter,
+        outer_tol,
         ridge_floor: MULTINOMIAL_FORMULA_RIDGE_FLOOR,
         // #747: the stabilization floor is SOLVER-ONLY — it keeps the inner
         // joint-Newton linear solve finite during screening (bounding the step
