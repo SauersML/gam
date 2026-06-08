@@ -929,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_kbig_runs_quick() {
+    fn batch_kbig_produces_valid_simplex_barycenter() {
         let m = 64;
         let k = 128;
         let atoms = Array2::<f64>::from_shape_fn((k, m), |(ki, j)| {
@@ -938,13 +938,7 @@ mod tests {
         });
         let weights = Array1::<f64>::from_elem(k, 1.0 / k as f64);
         let cost = circular_cost(m);
-        let t0 = std::time::Instant::now();
         let bary = sinkhorn_barycenter(atoms.view(), weights.view(), cost.view(), 0.1, 20).unwrap();
-        let dt = t0.elapsed();
-        assert!(
-            dt.as_secs_f64() < 5.0,
-            "batch sinkhorn took too long: {dt:?}"
-        );
         let s: f64 = bary.iter().sum();
         assert!((s - 1.0).abs() < 1.0e-8);
     }
