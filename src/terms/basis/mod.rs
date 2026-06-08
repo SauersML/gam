@@ -31,7 +31,21 @@ use std::sync::Arc;
 use thiserror::Error;
 
 mod polylog;
+mod sphere_kernels;
 mod sphere_spectral;
+
+/// Absolute floor below which a B-spline knot span (`t_{i+k} - t_i`) is treated
+/// as degenerate: the corresponding Cox–de Boor / derivative-recurrence
+/// denominator is then skipped (its term contributes zero), and a zero-support
+/// basis function is rejected. Set well above `f64::EPSILON` so that knot
+/// vectors with near-coincident knots are caught before the division amplifies
+/// rounding noise, yet far below any meaningful covariate-scale knot spacing.
+const KNOT_SPAN_DEGENERACY_FLOOR: f64 = 1e-12;
+
+/// Absolute distance by which a covariate value must lie outside the clamped
+/// B-spline domain before the linear extrapolation correction is applied; below
+/// this the point is treated as on-boundary and no extrapolation term is added.
+const BSPLINE_EXTRAPOLATION_THRESHOLD: f64 = 1e-12;
 
 /// Wrapper to send a raw pointer across thread boundaries for parallel buffer fills.
 /// SAFETY: every `SendPtr` value must be built from live, properly aligned `f64`
@@ -406,7 +420,7 @@ pub fn apply_linear_extension_from_first_derivative(
 
     let mut needs_ext = false;
     for i in 0..z_raw.len() {
-        if (z_raw[i] - z_clamped[i]).abs() > 1e-12 {
+        if (z_raw[i] - z_clamped[i]).abs() > BSPLINE_EXTRAPOLATION_THRESHOLD {
             needs_ext = true;
             break;
         }
@@ -428,7 +442,7 @@ pub fn apply_linear_extension_from_first_derivative(
 
     for i in 0..z_raw.len() {
         let dz = z_raw[i] - z_clamped[i];
-        if dz.abs() <= 1e-12 {
+        if dz.abs() <= BSPLINE_EXTRAPOLATION_THRESHOLD {
             continue;
         }
         for j in 0..basisvalues.ncols() {
@@ -717,7 +731,7 @@ fn validate_knot_spans_nondegenerate(
     let num_basis = knot_vector.len() - degree - 1;
     for i in 0..num_basis {
         let span = knot_vector[i + degree + 1] - knot_vector[i];
-        if span <= 1e-12 {
+        if span <= KNOT_SPAN_DEGENERACY_FLOOR {
             return Err(BasisError::InvalidKnotVector(format!(
                 "basis function {i} has zero support: t[i+degree+1]-t[i]={span:.3e} must be > 0"
             )));
@@ -813,12 +827,12 @@ fn evaluate_splines_derivative_sparse_intowith_lower(
         };
         let denom_left = knotview[i + degree] - knotview[i];
         let denom_right = knotview[i + degree + 1] - knotview[i + 1];
-        let left_term = if denom_left.abs() > 1e-12 {
+        let left_term = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
             left / denom_left
         } else {
             0.0
         };
-        let right_term = if denom_right.abs() > 1e-12 {
+        let right_term = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
             right / denom_right
         } else {
             0.0
@@ -929,12 +943,12 @@ fn evaluate_splinessecond_derivative_sparse_into(
         };
         let denom_left = knotview[i + degree] - knotview[i];
         let denom_right = knotview[i + degree + 1] - knotview[i + 1];
-        let left_term = if denom_left.abs() > 1e-12 {
+        let left_term = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
             left / denom_left
         } else {
             0.0
         };
-        let right_term = if denom_right.abs() > 1e-12 {
+        let right_term = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
             right / denom_right
         } else {
             0.0
@@ -1258,7 +1272,7 @@ pub fn create_difference_penalty_matrix(
             let nrows = d.nrows();
             for i in 0..nrows {
                 let span = g[i + o] - g[i];
-                if span.abs() <= 1e-12 {
+                if span.abs() <= KNOT_SPAN_DEGENERACY_FLOOR {
                     return Err(BasisError::InvalidKnotVector(format!(
                         "singular divided-difference span at order {o}, row {i}: Greville abscissae g[{}]={:.6e} and g[{i}]={:.6e} collapse",
                         i + o,
@@ -1793,19 +1807,31 @@ pub fn default_num_centers(n: usize, d: usize) -> usize {
     const K_MAX: usize = 2000;
     const ALPHA: f64 = 0.4;
     const C: f64 = 8.0;
+    /// Per-extra-dimension growth in the center count: each covariate axis
+    /// beyond the first widens the basis by 15% to keep the per-axis mesh
+    /// density roughly constant as the smooth's domain dimensionality grows.
+    const PER_DIM_GROWTH: f64 = 0.15;
+    /// Divisor for the data-proportional floor: the `K_MIN` floor only engages
+    /// once `n` exceeds `K_MIN * FLOOR_N_DIVISOR`, so small samples are not
+    /// forced up to a dense `K_MIN`-column design.
+    const FLOOR_N_DIVISOR: usize = 8;
+    /// Divisor for the conditioning cap: the center count never exceeds `n /
+    /// COND_N_DIVISOR`, keeping the penalty matrices well-conditioned relative
+    /// to the data.
+    const COND_N_DIVISOR: usize = 4;
 
-    let d_factor = 1.0 + 0.15 * (d.max(1) - 1) as f64;
+    let d_factor = 1.0 + PER_DIM_GROWTH * (d.max(1) - 1) as f64;
     let raw = (C * d_factor * (n as f64).powf(ALPHA)).ceil() as usize;
 
-    // Data-proportional floor: never inflate beyond n/8, so the 200-center
-    // floor only takes effect once n is large enough (~1600) to genuinely
-    // support that many basis columns.
-    let floor = K_MIN.min(n / 8);
+    // Data-proportional floor: never inflate beyond n/FLOOR_N_DIVISOR, so the
+    // K_MIN-center floor only takes effect once n is large enough (~1600) to
+    // genuinely support that many basis columns.
+    let floor = K_MIN.min(n / FLOOR_N_DIVISOR);
     let k = raw.clamp(floor, K_MAX);
 
-    // Never exceed n itself; cap at n/4 to keep the penalty matrices
-    // well-conditioned relative to the data.
-    k.min(n).min(n / 4)
+    // Never exceed n itself; cap at n/COND_N_DIVISOR to keep the penalty
+    // matrices well-conditioned relative to the data.
+    k.min(n).min(n / COND_N_DIVISOR)
 }
 
 /// Conservative center count for a *secondary* (distributional) predictor's
@@ -2191,8 +2217,10 @@ pub enum SphereWahbaKernel {
     },
 }
 
-pub(crate) use polylog::{dilog_unit, trilog_unit};
-pub(crate) use sphere_spectral::sphere_truncated_spectral_derivative_eval;
+pub(crate) use sphere_kernels::{
+    wahba_sphere_kernel_derivative_dcos_kind, wahba_sphere_kernel_from_cos_kind,
+    wahba_sphere_kernel_from_cos_simd_kind, wahba_sphere_kernel_sobolev_derivative_dcos,
+};
 pub use sphere_spectral::{
     pseudo_s2_truncated_coefficients, sobolev_s2_truncated_coefficients,
     sphere_truncated_spectral_eval,
@@ -14976,277 +15004,6 @@ fn validate_lat_lon_matrix(
     Ok(())
 }
 
-/// Pseudo-spline Wahba kernel on S² (mgcv `makeR`-style closed form).
-#[inline]
-fn wahba_sphere_kernel_pseudo_from_cos(cos_gamma: f64, m: usize) -> f64 {
-    let cg = cos_gamma.clamp(-1.0, 1.0);
-    let z = (1.0 - cg).max(f64::EPSILON * 1.0e-4);
-    let w = 0.5 * z;
-    let c0 = w.sqrt();
-    let a = (1.0 + 1.0 / c0).ln();
-    let c = 2.0 * c0;
-    let two_pi = 2.0 * std::f64::consts::PI;
-    match m {
-        1 => {
-            let q1 = 2.0 * a * w - c + 1.0;
-            (q1 - 0.5) / two_pi
-        }
-        2 => {
-            let w2 = w * w;
-            let q2 = a * (6.0 * w2 - 2.0 * w) - 3.0 * c * w + 3.0 * w + 0.5;
-            (q2 / 2.0 - 1.0 / 6.0) / two_pi
-        }
-        3 => {
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let q3 = (a * (60.0 * w3 - 36.0 * w2) + 30.0 * w2 + c * (8.0 * w - 30.0 * w2)
-                - 3.0 * w
-                + 1.0)
-                / 3.0;
-            (q3 / 6.0 - 1.0 / 24.0) / two_pi
-        }
-        _ => {
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let w4 = w3 * w;
-            let q4 = a * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
-                + 35.0 * w3 * (1.0 - c)
-                + c * 55.0 * w2 / 3.0
-                - 12.5 * w2
-                - w / 3.0
-                + 0.25;
-            (q4 / 24.0 - 1.0 / 120.0) / two_pi
-        }
-    }
-}
-
-/// Exact derivative `dK_m^{pseudo}/d(cos γ)` of the pseudo-spline Wahba kernel
-/// [`wahba_sphere_kernel_pseudo_from_cos`].
-///
-/// The forward kernel is a polynomial in `w = (1 − cos γ)/2` with the
-/// auxiliary terms `c0 = √w`, `c = 2 c0 = 2√w`, and `a = ln(1 + 1/c0)`.
-/// Differentiating in `w` and applying the chain factor `dw/d(cos γ) = −1/2`
-/// gives the analytic `dK/d(cos γ)` below. Matches the forward floor on `w`
-/// so the (logarithmic) `a` term stays finite at `γ = 0`.
-#[inline]
-fn wahba_sphere_kernel_pseudo_derivative_dcos(cos_gamma: f64, m: usize) -> f64 {
-    let cg = cos_gamma.clamp(-1.0, 1.0);
-    let z = (1.0 - cg).max(f64::EPSILON * 1.0e-4);
-    let w = 0.5 * z;
-    let c0 = w.sqrt();
-    let a = (1.0 + 1.0 / c0).ln();
-    let c = 2.0 * c0;
-    let two_pi = 2.0 * std::f64::consts::PI;
-    // da/dw = −1/(2 c0² (c0 + 1)),  dc/dw = 1/√w = 1/c0.
-    let da_dw = -1.0 / (2.0 * c0 * c0 * (c0 + 1.0));
-    let dc_dw = 1.0 / c0;
-    // dK/dw for the requested order m (mirrors the forward `match m`).
-    let dk_dw = match m {
-        1 => {
-            // q1 = 2 a w − c + 1 ; K1 = (q1 − 0.5)/2π.
-            let dq1_dw = 2.0 * a + 2.0 * w * da_dw - dc_dw;
-            dq1_dw / two_pi
-        }
-        2 => {
-            // q2 = a(6w² − 2w) − 3 c w + 3w + 0.5 ; K2 = (q2/2 − 1/6)/2π.
-            let dq2_dw = da_dw * (6.0 * w * w - 2.0 * w) + a * (12.0 * w - 2.0)
-                - 3.0 * (dc_dw * w + c)
-                + 3.0;
-            (dq2_dw / 2.0) / two_pi
-        }
-        3 => {
-            // q3 = [a(60w³ − 36w²) + 30w² + c(8w − 30w²) − 3w + 1]/3 ;
-            // K3 = (q3/6 − 1/24)/2π.
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let dinner_dw = da_dw * (60.0 * w3 - 36.0 * w2)
-                + a * (180.0 * w2 - 72.0 * w)
-                + 60.0 * w
-                + (dc_dw * (8.0 * w - 30.0 * w2) + c * (8.0 - 60.0 * w))
-                - 3.0;
-            let dq3_dw = dinner_dw / 3.0;
-            (dq3_dw / 6.0) / two_pi
-        }
-        _ => {
-            // q4 = a(70w⁴ − 60w³ + 6w²) + 35w³(1 − c) + c·55w²/3
-            //      − 12.5w² − w/3 + 0.25 ; K4 = (q4/24 − 1/120)/2π.
-            let w2 = w * w;
-            let w3 = w2 * w;
-            let w4 = w3 * w;
-            // d/dw[35w³(1 − c)] = 35(3w²(1 − c) − w³·dc/dw).
-            // d/dw[c·55w²/3] = (55/3)(dc/dw·w² + c·2w).
-            let dq4_dw = da_dw * (70.0 * w4 - 60.0 * w3 + 6.0 * w2)
-                + a * (280.0 * w3 - 180.0 * w2 + 12.0 * w)
-                + 35.0 * (3.0 * w2 * (1.0 - c) - w3 * dc_dw)
-                + (55.0 / 3.0) * (dc_dw * w2 + c * 2.0 * w)
-                - 25.0 * w
-                - 1.0 / 3.0;
-            (dq4_dw / 24.0) / two_pi
-        }
-    };
-    // dw/d(cos γ) = −1/2.
-    dk_dw * (-0.5)
-}
-
-// ============================================================================
-// Wahba/Sobolev kernel on S²
-// ============================================================================
-//
-// `K_m^{Sobolev}(γ) = (1/4π) · Σ_{l ≥ 1} (2l + 1) · [l(l + 1)]^{-m} · P_l(cos γ)`
-//
-// is the reproducing kernel of the canonical Sobolev space `H^m(S²)` with
-// the inner product `⟨f, g⟩ = Σ_l [l(l+1)]^m · f̂_l · ĝ_l`.
-//
-// For `m ∈ {1, 2, 3}` we use the closed-form expressions derived in
-// Beatson & zu Castell, "Thinplate Splines on the Sphere", SIGMA 14 (2018)
-// 083 (Section 6.2). In their notation `u = (1 − cos γ)/2 = sin²(γ/2)`:
-//
-//   k_{3,1}(x) =  −ln(u)  − 1
-//   k_{3,2}(x) =   Li_2(1 − u) + 1 − π²/6
-//   k_{3,3}(x) = −2 Li_3(u) − Li_2(1 − u) + ln(u) · Li_2(u)
-//                 + 2 ζ(3) + π²/6 − 2
-//
-// Beatson & zu Castell normalize so that the kernel is for the
-// `[f, g] = (1/σ_d) ∫ f g dσ` inner product (their eq. 3.2), i.e. surface
-// measure normalized to one. The basis pipeline here uses the
-// (1/4π)-scaled reproducing kernel (kernel for plain `∫ f g dσ`), so we
-// divide their expressions by `4π`.
-//
-// For `m = 4` no published elementary-plus-Li₄ form exists; we fall back
-// to the truncated spectral Legendre series (96 terms, error ≲ 1e-12).
-
-/// Sobolev `K_m^{Sobolev}` reproducing kernel on S², closed-form for
-/// `m ∈ {1, 2, 3}` plus spectral series for `m = 4`.
-#[inline]
-fn wahba_sphere_kernel_sobolev_closed_form(cos_gamma: f64, m: usize) -> f64 {
-    let cos_g = cos_gamma.clamp(-1.0, 1.0);
-    let four_pi = 4.0 * std::f64::consts::PI;
-    let pi2_6 = std::f64::consts::PI * std::f64::consts::PI / 6.0;
-    // u = sin²(γ/2). Floor away from zero so ln(u) is finite at γ = 0
-    // — the closed form has a logarithmic singularity there that the
-    // RKHS norm tames in any inner product but a finite-precision
-    // single evaluation cannot. The floor matches the existing
-    // `wahba_sphere_kernel_from_cos` behaviour.
-    let u = ((1.0 - cos_g) * 0.5).max(f64::EPSILON * 1.0e-4);
-    let one_minus_u = (1.0 - u).max(f64::EPSILON * 1.0e-4);
-    match m {
-        1 => (-u.ln() - 1.0) / four_pi,
-        2 => (dilog_unit(one_minus_u) + 1.0 - pi2_6) / four_pi,
-        3 => {
-            // k_{3,3}(x) = -2 Li_3(u) - Li_2(1-u) + ln(u)·Li_2(u)
-            //              + 2 ζ(3) + π²/6 - 2
-            const ZETA3: f64 = 1.2020569031595942853997381615114499907649862923404988817922;
-            let li3_u = trilog_unit(u);
-            let li2_one_minus_u = dilog_unit(one_minus_u);
-            let li2_u = dilog_unit(u);
-            (-2.0 * li3_u - li2_one_minus_u + u.ln() * li2_u + 2.0 * ZETA3 + pi2_6 - 2.0) / four_pi
-        }
-        // m = 4: no published closed form in elementary + Li_n functions.
-        // Use spectral series; 96 terms give ≲ 1e-12 truncation error.
-        _ => wahba_sphere_kernel_sobolev_spectral(cos_g, m),
-    }
-}
-
-/// Spectral Legendre-series evaluation of the Sobolev kernel
-/// `K_m^{Sobolev}(γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{-m} · P_l(cos γ)`.
-/// Used as the m=4 closed-form path and as cross-validation for m=1, 2, 3.
-#[inline]
-fn wahba_sphere_kernel_sobolev_spectral(cos_gamma: f64, m: usize) -> f64 {
-    let l_max = match m {
-        1 => 4096_usize, // l^{-1} terms — needs many for far-from-1 γ
-        2 => 256,
-        3 => 128,
-        _ => 96,
-    };
-    let x = cos_gamma.clamp(-1.0, 1.0);
-    let m_i = m as i32;
-    let four_pi = 4.0 * std::f64::consts::PI;
-    let mut p_l_minus_1 = 1.0_f64;
-    let mut p_l = x;
-    let mut sum = 3.0 * p_l / (four_pi * 2.0_f64.powi(m_i));
-    for l in 1..l_max {
-        let p_l_plus_1 =
-            ((2 * l + 1) as f64 * x * p_l - (l as f64) * p_l_minus_1) / ((l + 1) as f64);
-        let ell = (l + 1) as f64;
-        let eigen = (ell * (ell + 1.0)).powi(m_i);
-        let weight = (2.0 * ell + 1.0) / four_pi;
-        sum += weight * p_l_plus_1 / eigen;
-        p_l_minus_1 = p_l;
-        p_l = p_l_plus_1;
-    }
-    sum
-}
-
-/// Evaluate the Wahba sphere reproducing kernel at a single `cos γ`. The
-/// choice of underlying RKHS — Sobolev or pseudo-spline — is selected by
-/// `kernel`. Both options are positive-definite on S² for every supported
-/// `penalty_order ∈ {1, 2, 3, 4}`.
-#[inline]
-fn wahba_sphere_kernel_from_cos_kind(
-    cos_gamma: f64,
-    penalty_order: usize,
-    kernel: SphereWahbaKernel,
-) -> Result<f64, BasisError> {
-    if !(1..=4).contains(&penalty_order) {
-        crate::bail_invalid_basis!(
-            "spherical spline penalty_order must be one of 1, 2, 3, 4; got {penalty_order}"
-        );
-    }
-    let value = match kernel {
-        SphereWahbaKernel::Sobolev => {
-            wahba_sphere_kernel_sobolev_closed_form(cos_gamma, penalty_order)
-        }
-        SphereWahbaKernel::Pseudo => wahba_sphere_kernel_pseudo_from_cos(cos_gamma, penalty_order),
-        SphereWahbaKernel::SobolevTruncated { lmax } => {
-            let coeffs = sobolev_s2_truncated_coefficients(lmax as usize, penalty_order);
-            sphere_truncated_spectral_eval(cos_gamma, &coeffs)
-        }
-        SphereWahbaKernel::PseudoTruncated { lmax } => {
-            let coeffs = pseudo_s2_truncated_coefficients(lmax as usize, penalty_order);
-            sphere_truncated_spectral_eval(cos_gamma, &coeffs)
-        }
-    };
-    if !value.is_finite() {
-        crate::bail_invalid_basis!("spherical spline kernel produced a non-finite value");
-    }
-    Ok(value)
-}
-
-/// SIMD lane-wise evaluation. Both Sobolev and pseudo-spline branches are
-/// scalar-per-lane: the Sobolev path uses elementary functions
-/// (`log` / `Li_2` / `Li_3`) that don't vectorise cleanly across lanes,
-/// and the pseudo-spline path is already a fast closed form. The previous
-/// hand-vectorised polynomial-of-`w,c,a` path was dropped when the closed
-/// forms switched to polylogarithm-based formulas.
-#[inline]
-fn wahba_sphere_kernel_from_cos_simd_kind(
-    cos_gamma: wide::f64x4,
-    penalty_order: usize,
-    kernel: SphereWahbaKernel,
-) -> wide::f64x4 {
-    use wide::f64x4;
-    if !(1..=4).contains(&penalty_order) {
-        return f64x4::from(f64::NAN);
-    }
-    let cg = cos_gamma.fast_max(f64x4::from(-1.0)).fast_min(f64x4::ONE);
-    let lanes = cg.to_array();
-    let f = |x: f64| -> f64 {
-        match kernel {
-            SphereWahbaKernel::Sobolev => wahba_sphere_kernel_sobolev_closed_form(x, penalty_order),
-            SphereWahbaKernel::Pseudo => wahba_sphere_kernel_pseudo_from_cos(x, penalty_order),
-            SphereWahbaKernel::SobolevTruncated { lmax } => {
-                let coeffs = sobolev_s2_truncated_coefficients(lmax as usize, penalty_order);
-                sphere_truncated_spectral_eval(x, &coeffs)
-            }
-            SphereWahbaKernel::PseudoTruncated { lmax } => {
-                let coeffs = pseudo_s2_truncated_coefficients(lmax as usize, penalty_order);
-                sphere_truncated_spectral_eval(x, &coeffs)
-            }
-        }
-    };
-    f64x4::from(lanes.map(f))
-}
-
 pub fn spherical_wahba_kernel_matrix(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
@@ -21589,72 +21346,6 @@ pub fn matern_input_location_hessian_nd(
     Ok(out)
 }
 
-/// Spectral derivative of the Sobolev sphere kernel w.r.t. `cos γ`.
-///
-/// `dK_m/d(cos γ) = (1/4π) Σ_{l ≥ 1} (2l+1) · [l(l+1)]^{−m} · P_l'(cos γ)`,
-/// truncated to a series long enough for the requested `m`. Uses the
-/// standard `(1−x²) P_l'(x) = l (P_{l−1}(x) − x P_l(x))` identity to evaluate
-/// `P_l'` from a `P_l` recurrence without dividing through near the poles.
-///
-/// `x` should lie in `[−1, 1]`; values outside are clamped.
-fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
-    const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
-
-    let l_max = match m {
-        1 => 4096_usize,
-        2 => 256,
-        3 => 128,
-        _ => 96,
-    };
-    let x = x.clamp(-1.0, 1.0);
-    let m_i = m as i32;
-    let four_pi = 4.0 * std::f64::consts::PI;
-    if x.abs() > 1.0 - POLE_LIMIT_THRESHOLD {
-        // Within 1e-10 of the poles, the recurrence identity divides by
-        // 1-x^2 and loses the exact endpoint limit. Use
-        // P_l'(±1) = l(l+1)/2 * (±1)^(l+1) directly.
-        let pole = if x.is_sign_negative() {
-            -1.0_f64
-        } else {
-            1.0_f64
-        };
-        let mut sum = 0.0_f64;
-        for l in 1..=l_max {
-            let ell = l as f64;
-            let sign = if pole < 0.0 && l % 2 == 0 { -1.0 } else { 1.0 };
-            let p_l_prime = 0.5 * ell * (ell + 1.0) * sign;
-            let eigen = (ell * (ell + 1.0)).powi(m_i);
-            let weight = (2.0 * ell + 1.0) / four_pi;
-            sum += weight * p_l_prime / eigen;
-        }
-        return sum;
-    }
-    // P_l recurrence: P_0 = 1, P_1 = x, P_{l+1} = ((2l+1) x P_l − l P_{l−1}) / (l+1).
-    // P_l'(x) recovered from (1−x²) P_l' = l (P_{l−1} − x P_l), with l ≥ 1.
-    let one_minus_x2 = (1.0 - x * x).max(f64::EPSILON);
-    let mut p_lm1 = 1.0_f64; // P_{l-1}
-    let mut p_l = x; // P_l   (l starts at 1)
-    let mut l = 1_usize;
-    let mut sum = 0.0_f64;
-    loop {
-        // P_l' for current l ≥ 1.
-        let p_l_prime = (l as f64) * (p_lm1 - x * p_l) / one_minus_x2;
-        let ell = l as f64;
-        let eigen = (ell * (ell + 1.0)).powi(m_i);
-        let weight = (2.0 * ell + 1.0) / four_pi;
-        sum += weight * p_l_prime / eigen;
-        if l >= l_max {
-            break;
-        }
-        // advance recurrence
-        let p_lp1 = ((2 * l + 1) as f64 * x * p_l - (l as f64) * p_lm1) / ((l + 1) as f64);
-        p_lm1 = p_l;
-        p_l = p_lp1;
-        l += 1;
-    }
-    sum
-}
-
 /// N-D Sobolev-sphere first-derivative jet `∂Φ/∂t` per row, on the unit
 /// sphere `S^{dim−1}`.
 ///
@@ -21729,36 +21420,6 @@ pub fn sphere_first_derivative_nd(
         }
     }
     Ok(out)
-}
-
-/// Unified `dK/d(cos γ)` for any [`SphereWahbaKernel`] kind — the analytic
-/// derivative of [`wahba_sphere_kernel_from_cos_kind`]. Sobolev and pseudo use
-/// their dedicated closed forms; the truncated-spectral kinds differentiate
-/// the Legendre series term-by-term via the same
-/// `(1 − x²) P_ℓ'(x) = ℓ (P_{ℓ−1}(x) − x P_ℓ(x))` identity used by the
-/// Sobolev spectral derivative.
-#[inline]
-fn wahba_sphere_kernel_derivative_dcos_kind(
-    cos_gamma: f64,
-    penalty_order: usize,
-    kernel: SphereWahbaKernel,
-) -> f64 {
-    match kernel {
-        SphereWahbaKernel::Sobolev => {
-            wahba_sphere_kernel_sobolev_derivative_dcos(cos_gamma, penalty_order)
-        }
-        SphereWahbaKernel::Pseudo => {
-            wahba_sphere_kernel_pseudo_derivative_dcos(cos_gamma, penalty_order)
-        }
-        SphereWahbaKernel::SobolevTruncated { lmax } => {
-            let coeffs = sobolev_s2_truncated_coefficients(lmax as usize, penalty_order);
-            sphere_truncated_spectral_derivative_eval(cos_gamma, &coeffs)
-        }
-        SphereWahbaKernel::PseudoTruncated { lmax } => {
-            let coeffs = pseudo_s2_truncated_coefficients(lmax as usize, penalty_order);
-            sphere_truncated_spectral_derivative_eval(cos_gamma, &coeffs)
-        }
-    }
 }
 
 /// Raw (pre-identifiability) Wahba sphere DESIGN jet `∂Φ_raw/∂(lat, lon)`.
@@ -26346,13 +26007,15 @@ pub fn evaluate_bspline_derivative_scalar_into(
         let denom_left = knot_vector[i + degree] - knot_vector[i];
         let denom_right = knot_vector[i + degree + 1] - knot_vector[i + 1];
 
-        let left_term = if denom_left.abs() > 1e-12 && i < num_basis_lower {
+        let left_term = if denom_left.abs() > KNOT_SPAN_DEGENERACY_FLOOR && i < num_basis_lower {
             lower_basis[i] / denom_left
         } else {
             0.0
         };
 
-        let right_term = if denom_right.abs() > 1e-12 && (i + 1) < num_basis_lower {
+        let right_term = if denom_right.abs() > KNOT_SPAN_DEGENERACY_FLOOR
+            && (i + 1) < num_basis_lower
+        {
             lower_basis[i + 1] / denom_right
         } else {
             0.0
@@ -26463,7 +26126,7 @@ fn validate_mspline_normalization_spans(
     let num_basis = knot_vector.len().saturating_sub(degree + 1);
     for i in 0..num_basis {
         let span = knot_vector[i + degree + 1] - knot_vector[i];
-        if span <= 1e-12 {
+        if span <= KNOT_SPAN_DEGENERACY_FLOOR {
             crate::bail_invalid_basis!(
                 "invalid M-spline normalization span at i={i}: t[i+degree+1]-t[i]={span:.3e} must be > 0"
             );
@@ -26694,12 +26357,12 @@ fn evaluate_bspline_derivative_recurrence_into(
     for i in 0..num_basis {
         let denom1 = knot_vector[i + degree] - knot_vector[i];
         let denom2 = knot_vector[i + degree + 1] - knot_vector[i + 1];
-        let term1 = if denom1.abs() > 1e-12 {
+        let term1 = if denom1.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
             k * lower[i] / denom1
         } else {
             0.0
         };
-        let term2 = if denom2.abs() > 1e-12 {
+        let term2 = if denom2.abs() > KNOT_SPAN_DEGENERACY_FLOOR {
             k * lower[i + 1] / denom2
         } else {
             0.0
