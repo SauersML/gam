@@ -246,6 +246,38 @@ pub const SURVIVAL_TIME_FLOOR: f64 = 1e-9;
 /// reconstruction paths cannot drift apart.
 const SURVIVAL_TIME_SMOOTH_LAMBDA_SEED: f64 = 1e-2;
 
+/// Affine-direction identification floor for the value-space I-spline curvature
+/// penalty `S_I = Lᵀ S_B L` (#691).
+///
+/// `S_I` annihilates the affine log-cumulative-hazard baseline `q = a·log t + b`
+/// (that is the whole point of the value-space form — it stops over-shrinking the
+/// baseline slope and cures the upper-tail bias). But that exact null direction
+/// is only *weakly* identified by the survival likelihood (thin upper tail under
+/// right censoring), so the penalized inner Hessian `Hₗᵢₖ + λ·S_I + δ_stabᵢ`
+/// is near-singular along it and the constrained survival PIRLS stalls
+/// (`MaxIterationsReached`, grad_norm ≈ 0.5): the regression #691 reports.
+///
+/// The increment-space submatrix the original code fell back to converged only
+/// because it is *full rank* — its smallest penalty eigenvalue is positive, so
+/// the affine-ish direction always carries `λ·ε_min` curvature. We restore that
+/// conditioning regime at the penalty level, without touching the generic inner
+/// solver, by lifting *only* `S_I`'s exact null space by a tiny PSD ridge
+///   `S_I ← S_I + δ · P_null`,   δ = FRACTION · ε_min⁺(S_I),
+/// where `P_null` is the orthogonal projector onto `ker(S_I)` (the affine
+/// subspace) and `ε_min⁺` is the smallest *positive* eigenvalue of the
+/// (unit-mean-diagonal-scaled) `S_I`. The fraction is two orders of magnitude
+/// below the weakest genuinely-penalized curvature direction, so the affine
+/// slope carries `λ·δ` ≈ `λ·ε_min⁺/100` curvature — enough to make the inner
+/// Newton step well-defined and identify the slope, yet ~100× *less* shrinkage
+/// than the increment-space penalty applied, so the tail bias #691 set out to
+/// remove stays removed (strictly better than the documented converging-with-bias
+/// fallback). δ enters the REML criterion only through this tiny λ-scaled affine
+/// curvature, far below the existing fixed `SURVIVAL_STABILIZATION_RIDGE` regime
+/// in effect on every other direction, and the regularized penalty is genuinely
+/// full rank so the generalized-determinant REML needs no affine-nullspace
+/// special-casing (`nullspace_dims = 0`).
+const SURVIVAL_ISPLINE_AFFINE_RIDGE_FRACTION: f64 = 1e-2;
+
 /// Default initial Gompertz / Gompertz-Makeham shape parameter when the user
 /// does not supply `--baseline-shape`. The Gompertz hazard is
 /// `h(t) = rate · exp(shape · t)`; a near-zero shape seeds the baseline at an
@@ -1671,17 +1703,22 @@ pub fn build_survival_time_basis(
             // the wrong trend unpenalized — the source of the tail bias.
             //
             // Null space: `S_I` is rank-deficient by exactly the dimension of the
-            // affine baseline subspace surviving in the retained coordinates. That
-            // dimension is computed below from `S_I`'s eigenspectrum and reported
-            // through `nullspace_dims`, which the generic REML uses for the
-            // mgcv-style generalized determinant (#752: `log|H+Sλ|₊` over
-            // `range(H+Sλ)`, trace kernel over `range(Sλ)`), so the affine
-            // direction is treated as unpenalized-but-likelihood-identified. The
-            // survival inner PIRLS pins that direction through the likelihood
-            // curvature plus the `SURVIVAL_STABILIZATION_RIDGE` on `H`, and its
-            // KKT certificate normalizes the penalized residual by
-            // `1 + ‖score‖ + ‖S_λβ‖`, which stays scale-invariant even though the
-            // value-space `‖S_λβ‖` is larger than in the increment space.
+            // affine baseline subspace surviving in the retained coordinates.
+            // Leaving that direction *exactly* unpenalized desynced the inner
+            // survival PIRLS: the affine log-cumulative-hazard slope is only
+            // weakly identified by the likelihood (thin upper tail under right
+            // censoring), so `Hₗᵢₖ + λ·S_I + δ_stab·I` was near-singular along it
+            // and the constrained inner Newton stalled (#691 non-convergence
+            // regression). Rather than push affine-nullspace handling into the
+            // generic inner solver, we lift *only* that null space by a tiny PSD
+            // ridge `S_I ← S_I + δ·P_null` below (see
+            // `SURVIVAL_ISPLINE_AFFINE_RIDGE_FRACTION`): `δ` is a small fraction of
+            // `S_I`'s smallest *positive* eigenvalue, so the affine slope regains
+            // just enough curvature (`λ·δ`) to make the inner solve well-posed —
+            // ~100× less shrinkage than the increment-space penalty, so the tail
+            // bias #691 removed stays removed — and the regularized penalty is
+            // full rank (`nullspace_dims = 0`), needing no generalized-determinant
+            // special-casing.
             let mut penalties = Vec::<Array2<f64>>::new();
             for s_mat in &penalty_basis.penalties {
                 if s_mat.nrows() != p_time_full + 1 || s_mat.ncols() != p_time_full + 1 {
@@ -1716,43 +1753,97 @@ pub fn build_survival_time_basis(
                 // The value-space congruence `Lᵀ S_B L` inflates the penalty
                 // magnitude (the cumulative-sum `L` has growing entries), so against
                 // the absolute REML λ grid and the fixed inner stabilization ridge
-                // even the smallest λ over-penalizes and the survival inner PIRLS
-                // stalls (#691 non-convergence regression). Rescale to unit mean
-                // diagonal: a positive scalar that the REML-selected λ absorbs
-                // exactly (the penalty subspace and its affine null space are
-                // scale-invariant, and `nullspace_dims` below uses a relative
-                // threshold), restoring the conditioning regime the increment-space
-                // penalty enjoyed while keeping the correct affine nullspace.
+                // even the smallest λ over-penalizes. Rescale to unit mean diagonal:
+                // a positive scalar that the REML-selected λ absorbs exactly (the
+                // penalty subspace and its affine null space are scale-invariant),
+                // restoring the conditioning regime the increment-space penalty
+                // enjoyed while keeping the correct value-space penalized subspace.
+                // This also sets the natural scale (ε_min⁺ on a unit-diagonal
+                // penalty) for the affine-direction ridge `δ` applied next.
                 let tr_local: f64 = (0..p_time).map(|i| local[[i, i]]).sum();
                 if tr_local > 0.0 {
                     let scale = (p_time as f64) / tr_local;
                     local.mapv_inplace(|v| v * scale);
                 }
-                penalties.push(local);
-            }
 
-            let nullspace_dims: Vec<usize> = penalties
-                .iter()
-                .map(|s_mat| {
-                    let p = s_mat.nrows();
-                    if p == 0 {
-                        return 0;
-                    }
-                    match crate::faer_ndarray::FaerEigh::eigh(s_mat, faer::Side::Lower) {
-                        Ok((evals, _)) => {
+                // Affine-direction identification ridge (#691). Eigendecompose the
+                // (now unit-mean-diagonal) value-space penalty, split the spectrum
+                // into the exact-zero affine null space and the genuinely-penalized
+                // curvature directions, and lift *only* the null space by
+                //   δ = SURVIVAL_ISPLINE_AFFINE_RIDGE_FRACTION · ε_min⁺ ,
+                // ε_min⁺ = smallest positive eigenvalue. With eigenvectors `U`
+                // (columns) and the null-direction index set `N`, the orthogonal
+                // projector onto `ker(S_I)` is `P_null = Σ_{j∈N} u_j u_jᵀ`, and we
+                // form `S_I ← S_I + δ·P_null = U·diag(λ_j + δ·[j∈N])·Uᵀ`, i.e. the
+                // same eigenbasis with each null eigenvalue raised from 0 to δ. The
+                // result is PSD, full rank, and shares S_I's exact penalized
+                // subspace — only the affine slope changes, from unpenalized to
+                // negligibly penalized.
+                if p_time > 0 {
+                    match crate::faer_ndarray::FaerEigh::eigh(&local, faer::Side::Lower) {
+                        Ok((evals, evecs)) => {
                             let evals_slice: &[f64] = evals.as_slice().unwrap();
                             let max_ev = evals_slice
                                 .iter()
                                 .copied()
                                 .fold(0.0_f64, |a, b| a.max(b.abs()))
                                 .max(1.0);
-                            let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
-                            evals_slice.iter().filter(|&&e| e <= threshold).count()
+                            let threshold = 100.0 * (p_time as f64) * f64::EPSILON * max_ev;
+                            let eps_min_positive = evals_slice
+                                .iter()
+                                .copied()
+                                .filter(|&e| e > threshold)
+                                .fold(f64::INFINITY, f64::min);
+                            // Only regularize when there is BOTH a genuine null
+                            // space to lift and a positive curvature scale to set
+                            // `δ` from; otherwise leave `local` untouched.
+                            if eps_min_positive.is_finite()
+                                && evals_slice.iter().any(|&e| e <= threshold)
+                            {
+                                let delta =
+                                    SURVIVAL_ISPLINE_AFFINE_RIDGE_FRACTION * eps_min_positive;
+                                for (j, &ev) in evals_slice.iter().enumerate() {
+                                    if ev <= threshold {
+                                        // Add δ·u_j u_jᵀ for each null eigenvector.
+                                        let u_j = evecs.column(j);
+                                        for a in 0..p_time {
+                                            let ua = u_j[a];
+                                            if ua == 0.0 {
+                                                continue;
+                                            }
+                                            for b in 0..p_time {
+                                                local[[a, b]] += delta * ua * u_j[b];
+                                            }
+                                        }
+                                    }
+                                }
+                                // Re-symmetrize against floating-point drift from
+                                // the rank-1 accumulations.
+                                for a in 0..p_time {
+                                    for b in (a + 1)..p_time {
+                                        let avg = 0.5 * (local[[a, b]] + local[[b, a]]);
+                                        local[[a, b]] = avg;
+                                        local[[b, a]] = avg;
+                                    }
+                                }
+                            }
                         }
-                        Err(_) => 0,
+                        Err(_) => {
+                            // Eigendecomposition failure leaves the unregularized
+                            // value-space penalty in place; the inner solve's fixed
+                            // stabilization ridge remains the last-resort floor.
+                        }
                     }
-                })
-                .collect();
+                }
+
+                penalties.push(local);
+            }
+
+            // The affine null space has been lifted by `δ·P_null` above, so every
+            // emitted penalty is full rank. Report no penalty null space, so the
+            // generic REML treats these as ordinary penalties (no generalized-det
+            // affine special-casing) and the survival inner PIRLS is well-posed.
+            let nullspace_dims: Vec<usize> = penalties.iter().map(|_| 0usize).collect();
             Ok(SurvivalTimeBuildOutput {
                 x_entry_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_entry_time)),
                 x_exit_time: DesignMatrix::Dense(DenseDesignMatrix::from(x_exit_time)),
@@ -3615,12 +3706,18 @@ mod tests {
         );
     }
 
-    /// #691 end-to-end: the built I-spline survival time basis reports a
-    /// non-trivial penalty null space (the affine baseline direction), which is
-    /// what the generalized-determinant REML needs to leave the baseline slope
-    /// unpenalized. The old increment-space submatrix penalized that slope.
+    /// #691 end-to-end: the built I-spline survival time basis emits a value-space
+    /// curvature penalty whose affine baseline direction has been lifted from an
+    /// exact null direction to a *negligibly* penalized one
+    /// (`SURVIVAL_ISPLINE_AFFINE_RIDGE_FRACTION · ε_min⁺`). The emitted penalty is
+    /// therefore full rank (`nullspace_dims = 0`, no generalized-determinant
+    /// affine special-casing) — which is what makes the constrained survival inner
+    /// PIRLS well-posed — yet the affine slope is still penalized ~100× more softly
+    /// than the genuine curvature directions, so the value-space cure of the
+    /// upper-tail bias is preserved. The old increment-space submatrix instead
+    /// penalized the affine slope at full strength (the #691 tail bias).
     #[test]
-    fn ispline_build_reports_affine_penalty_nullspace() {
+    fn ispline_build_reports_softened_affine_penalty() {
         let age_entry = Array1::<f64>::from_elem(40, 0.0);
         let age_exit =
             Array1::<f64>::from_shape_fn(40, |i| 1.0 + (i as f64) * 0.5).mapv(|v| v.max(1e-3));
@@ -3643,21 +3740,18 @@ mod tests {
         );
         assert_eq!(build.nullspace_dims.len(), build.penalties.len());
         assert!(
-            build.nullspace_dims.iter().all(|&d| d >= 1),
-            "value-space I-spline penalty must carry an affine null direction, \
-             got nullspace_dims = {:?}",
+            build.nullspace_dims.iter().all(|&d| d == 0),
+            "the affine-direction ridge makes every emitted penalty full rank, \
+             so nullspace_dims must be all-zero, got {:?}",
             build.nullspace_dims
         );
 
-        // Independently confirm the emitted value-space penalty is genuinely
-        // rank-deficient (carries a null direction) — the property that
-        // distinguishes the correct `Lᵀ S_B L` from the old full-rank
-        // increment-space submatrix `S_B[1.., 1..]`, which had NO null space and
-        // so over-penalized the affine baseline (#691). A constant-coefficient
-        // probe is NOT the null direction once `keep_cols` drops columns (the
-        // retained-column sum is then a step function, not an affine baseline),
-        // so verify the spectrum directly rather than a fixed vector.
-        for (s_i, &reported) in build.penalties.iter().zip(build.nullspace_dims.iter()) {
+        // Verify the spectrum directly: the emitted penalty must be strictly
+        // positive definite (the affine direction was lifted off zero), and its
+        // smallest eigenvalue (the softened affine slope) must be far smaller than
+        // its largest curvature eigenvalue — i.e. the affine slope is penalized
+        // negligibly relative to genuine curvature, preserving the #691 cure.
+        for s_i in build.penalties.iter() {
             let p = s_i.nrows();
             let (evals, _) = crate::faer_ndarray::FaerEigh::eigh(s_i, faer::Side::Lower)
                 .expect("eigendecompose emitted value-space penalty");
@@ -3667,13 +3761,20 @@ mod tests {
                 .copied()
                 .fold(0.0_f64, |a, b| a.max(b.abs()))
                 .max(1.0);
-            let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
+            let hard_zero = 100.0 * (p as f64) * f64::EPSILON * max_ev;
             let min_ev = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
             assert!(
-                reported >= 1 && min_ev <= threshold,
-                "emitted value-space I-spline penalty must be rank-deficient (affine \
-                 null direction): reported nullspace_dims={reported}, smallest \
-                 eigenvalue={min_ev:.3e}, threshold={threshold:.3e}"
+                min_ev > hard_zero,
+                "affine-ridge must lift the penalty off exact rank deficiency: \
+                 smallest eigenvalue={min_ev:.3e}, hard-zero threshold={hard_zero:.3e}"
+            );
+            // The softened affine eigenvalue is the fraction times the smallest
+            // genuine-curvature eigenvalue, so it is at least ~50x below the top
+            // curvature scale — confirming negligible affine shrinkage.
+            assert!(
+                min_ev < 0.1 * max_ev,
+                "softened affine slope must remain far softer than genuine curvature: \
+                 smallest eigenvalue={min_ev:.3e}, largest={max_ev:.3e}"
             );
         }
     }
