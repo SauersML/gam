@@ -14434,9 +14434,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // first trust-region accept/reject compares like-for-like against the
         // Jeffreys-augmented trial objectives below. No-op when there is no
         // coefficient system or the term is condition-gated to zero.
+        //
+        // SIGN (gam#729/#715): Firth ADDS ½log|I| to the log-likelihood, i.e.
+        // SUBTRACTS Φ from the NLL objective the inner Newton minimizes:
+        // `−ℓ + ½βᵀSβ − Φ`. The Newton step rhs and the KKT residual already
+        // encode this (they ADD `∇Φ` to `∇L − Sβ`, the −gradient of `−Φ`), so the
+        // accept/reject MERIT must SUBTRACT Φ too. Adding it (the previous code)
+        // gave the line search the objective `−ℓ + ½βᵀSβ + Φ`, whose descent
+        // direction is OPPOSITE the augmented Newton step's — so for the coupled
+        // K-block fit near the Firth optimum every backtracking attempt saw the
+        // merit INCREASE (actual_reduction < 0) while the model predicted a
+        // decrease, rejected the step, and the inner solve exited "before
+        // convergence" with the residual pinned at ‖∇Φ‖.
         if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
             let phi0 = custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
-            current_penalty += phi0;
+            current_penalty -= phi0;
             lastobjective = -current_log_likelihood + current_penalty;
         }
 
@@ -15710,7 +15722,11 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 if !jeffreys_skippable_this_cycle
                     && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
                 {
-                    trial_penalty += custom_family_joint_jeffreys_value(
+                    // SUBTRACT Φ: the inner NLL objective is `−ℓ + ½βᵀSβ − Φ`
+                    // (Firth adds ½log|I| to the log-likelihood). Must match the
+                    // baseline (`current_penalty -= phi0`), the Newton step, and
+                    // the KKT residual (gam#729/#715 sign fix).
+                    trial_penalty -= custom_family_joint_jeffreys_value(
                         family, &states, specs, &ranges, z_joint,
                     );
                 }
@@ -15934,16 +15950,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_step_inf,
                     step_inf,
                 );
-                if cycle >= 3 && cycle <= 6 {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/gam_diag.log")
-                    {
-                        writeln!(f, "[DIAG-TR] cycle={cycle} attempt={line_search_attempts} {tr_attempt_sig}").ok();
-                    }
-                }
                 match tr_log_sig.as_deref() {
                     Some(prev) if prev == tr_attempt_sig.as_str() => {
                         tr_log_last = line_search_attempts;
@@ -16245,20 +16251,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
-            {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/gam_diag.log")
-                {
-                    writeln!(
-                        f,
-                        "[DIAG-CYC] cycle={cycle} residual={residual:.4e} step_inf={step_inf:.4e} accepted_step_inf={accepted_step_inf:.4e} model_rejects={model_rejects} tr={joint_trust_radius:.3e}"
-                    )
-                    .ok();
-                }
-            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
