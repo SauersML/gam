@@ -31,7 +31,7 @@ use crate::estimate::{
     EstimationError, UnifiedFitResult, validate_explicit_dense_hessian_for_whitening,
 };
 use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
-use crate::families::gamlss::monotone_wiggle_basis_with_derivative_order;
+use crate::families::wiggle::monotone_wiggle_basis_with_derivative_order;
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use crate::matrix::DesignMatrix;
 use crate::solver::mixture_link::{

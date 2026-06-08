@@ -14,7 +14,7 @@ use crate::basis::{
     BasisMetadata, BasisOptions, Dense, KnotSource, OneDimensionalBoundary, build_bspline_basis_1d,
     create_basis, evaluate_bspline_derivative_scalar,
 };
-use crate::families::gamlss::{
+use crate::families::wiggle::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };

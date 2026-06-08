@@ -21,6 +21,7 @@ pub mod marginal_slope_shared;
 pub mod monotone_root;
 pub mod multinomial;
 pub(crate) mod multinomial_reml;
+pub mod parameter_block;
 pub mod penalized_vector_glm;
 pub(crate) mod row_kernel;
 pub mod royston_parmar;
@@ -38,6 +39,7 @@ pub mod survival_predict;
 pub(crate) mod survival_time_constraints;
 pub mod transformation_normal;
 pub mod vector_response;
+pub mod wiggle;
 
 pub use identifiability_compiler::{
     AnchorRowEvaluator, BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian,

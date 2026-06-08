@@ -25,7 +25,8 @@ use crate::families::bms::{
     unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::gamlss::{ParameterBlockInput, monotone_wiggle_basis_with_derivative_order};
+use crate::families::parameter_block::ParameterBlockInput;
+use crate::families::wiggle::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
