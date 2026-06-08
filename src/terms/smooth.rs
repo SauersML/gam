@@ -4182,11 +4182,6 @@ impl LinearFitConditioning {
         self.transform_matrixrowswith_b_transpose(&right)
     }
 
-    fn backtransform_covariance(&self, cov_internal: &Array2<f64>) -> Array2<f64> {
-        let right = self.transform_matrix_columnswith_a(cov_internal);
-        self.transform_matrixrowswith_a_transpose(&right)
-    }
-
     fn internal_bounds_for(&self, col_idx: usize, min: f64, max: f64) -> (f64, f64) {
         if let Some(col) = self.columns.iter().find(|c| c.col_idx == col_idx) {
             (min * col.scale, max * col.scale)
@@ -13730,6 +13725,60 @@ fn exact_bounded_edf(
     Ok((edf_by_block, edf_total))
 }
 
+/// Symmetric posterior-precision inverse for the bounded-coefficient path.
+///
+/// The penalised Hessian at a strict posterior maximum is SPD, so its inverse
+/// is the posterior covariance. We eigendecompose the symmetric precision and
+/// invert the positive-eigenvalue subspace, projecting out the (rare)
+/// structural null directions a penalised model leaves flat rather than
+/// δ-ridging them — the same honest pseudo-inverse contract the strict
+/// pseudo-Laplace covariance uses (gam#748). A genuinely indefinite precision
+/// (a negative eigenvalue beyond rounding) means the reported mode is not a
+/// posterior maximum and is surfaced as a fit-quality error rather than
+/// masked.
+fn symmetric_positive_definite_inverse_or_pseudo(
+    precision: &Array2<f64>,
+) -> Result<Array2<f64>, EstimationError> {
+    use crate::faer_ndarray::FaerEigh;
+    let p = precision.nrows();
+    if precision.ncols() != p {
+        crate::bail_invalid_estim!(
+            "posterior precision inverse requires a square matrix, got {}x{}",
+            precision.nrows(),
+            precision.ncols()
+        );
+    }
+    if p == 0 {
+        return Ok(Array2::<f64>::zeros((0, 0)));
+    }
+    let symmetric = (precision + &precision.t().to_owned()) * 0.5;
+    let (evals, evecs) = symmetric
+        .eigh(faer::Side::Lower)
+        .map_err(|e| EstimationError::InvalidInput(format!("posterior precision eigendecomposition failed: {e}")))?;
+    let max_abs_eval = evals.iter().fold(0.0_f64, |acc, &ev| acc.max(ev.abs()));
+    let tol = (10.0 * f64::EPSILON * (p as f64) * (p as f64) * max_abs_eval)
+        .max(100.0 * f64::EPSILON);
+    if let Some(&min_eval) = evals
+        .iter()
+        .filter(|&&ev| ev < -tol)
+        .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        crate::bail_invalid_estim!(
+            "bounded posterior precision is non-PD at the converged optimum (min eigenvalue \
+             {min_eval:.6e} < -tol={tol:.6e}); the reported mode is not a strict posterior \
+             maximum, so a covariance would be meaningless"
+        );
+    }
+    // Σ = U diag(1/λ_+) Uᵀ over the positive-eigenvalue subspace.
+    let mut scaled = evecs.clone();
+    for (j, &ev) in evals.iter().enumerate() {
+        let inv = if ev > tol { 1.0 / ev } else { 0.0 };
+        scaled.column_mut(j).mapv_inplace(|v| v * inv);
+    }
+    let cov = scaled.dot(&evecs.t());
+    Ok((&cov + &cov.t().to_owned()) * 0.5)
+}
+
 fn transform_bounded_latent_precision_to_user_internal(
     latent_precision: &Array2<f64>,
     jac_diag: &Array1<f64>,
@@ -13907,12 +13956,16 @@ fn fit_bounded_term_collection_with_design(
             inner_tol: options.tol,
             outer_max_iter: options.max_iter,
             outer_tol: options.tol,
-            // When the caller requested inference, ask the custom-family solve
-            // for the latent-scale conditional covariance so the bounded path
-            // can delta-method it back to the user scale below. Without this
-            // the solve returns `covariance_conditional = None` and
-            // `beta_covariance()` reports `None` despite inference being on.
-            compute_covariance: options.compute_inference,
+            // The bounded path builds its own user-scale covariance below by
+            // inverting the user-scale penalised Hessian (delta-method through
+            // the bounded transform's Jacobian + the conditioning map), so it
+            // does not consume the inner solver's optional canonical-space
+            // `covariance_conditional`. Inverting the reported precision
+            // directly guarantees `inv(penalized_hessian) == covariance` and
+            // works on every bounded fit — including the common no-smoothing
+            // path where the inner solve surfaces no covariance at all (the
+            // gam#854 "bounded fit emits no user-scale covariance" symptom).
+            compute_covariance: false,
             ..BlockwiseFitOptions::default()
         },
     )
@@ -13921,20 +13974,6 @@ fn fit_bounded_term_collection_with_design(
     let latent_beta = fit.block_states[0].beta.clone();
     let (beta_user_internal, jac_diag) = family_adapter.user_beta_and_jacobian(&latent_beta);
     let beta_user = conditioning.backtransform_beta(&beta_user_internal);
-    let latent_cov = fit.covariance_conditional.clone();
-    let beta_covariance = latent_cov.as_ref().map(|cov| {
-        let mut out = cov.clone();
-        for i in 0..out.nrows() {
-            out.row_mut(i).mapv_inplace(|v| v * jac_diag[i]);
-        }
-        for j in 0..out.ncols() {
-            out.column_mut(j).mapv_inplace(|v| v * jac_diag[j]);
-        }
-        conditioning.backtransform_covariance(&out)
-    });
-    let beta_standard_errors = beta_covariance
-        .as_ref()
-        .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
 
     let (eta_state, h_data, _, _) = family_adapter
         .evaluation_from_latent(&latent_beta)
@@ -13955,12 +13994,50 @@ fn fit_bounded_term_collection_with_design(
             }
         }
     }
-    let mut penalized_hessian = h_data.clone();
-    penalized_hessian += &s_lambda_internal;
+    let mut latent_precision = h_data.clone();
+    latent_precision += &s_lambda_internal;
+    let user_precision_internal =
+        transform_bounded_latent_precision_to_user_internal(&latent_precision, &jac_diag)?;
     let penalized_hessian =
-        transform_bounded_latent_precision_to_user_internal(&penalized_hessian, &jac_diag)?;
-    let penalized_hessian =
-        conditioning.transform_penalized_hessian_to_original(&penalized_hessian);
+        conditioning.transform_penalized_hessian_to_original(&user_precision_internal);
+
+    // User-scale posterior covariance via the delta method. The reported
+    // geometry precision `penalized_hessian` is the user-scale penalized
+    // Hessian `H_user = C⁻ᵀ J⁻¹ (H_latent + S_λ) J⁻¹ C⁻¹` (latent precision
+    // pushed through the bounded transform's Jacobian `J = diag(dβ_user/dθ)`
+    // and the conditioning map `C`). The user-scale covariance is its exact
+    // inverse `H_user⁻¹`, which IS the delta-method pushforward of the latent
+    // posterior covariance `(H_latent + S_λ)⁻¹`. Inverting the same matrix the
+    // geometry reports guarantees `inv(penalized_hessian) == covariance`
+    // exactly and removes the dependency on the inner solver's optional,
+    // canonical-space `covariance_conditional` (which is `None` whenever the
+    // bounded blockspec carries no smoothing parameters — the no-rho fit path
+    // — leaving a bounded fit with a populated precision but no user-scale
+    // covariance, the gam#854 symptom). The latent precision is SPD at a
+    // strict posterior maximum; on a marginally-indefinite boundary Hessian we
+    // invert the positive-eigenvalue subspace (the structural null space of a
+    // penalised model is a flat posterior direction, not something to ridge
+    // away), matching the strict-pseudo-Laplace covariance contract (gam#748).
+    let beta_covariance = if options.compute_inference {
+        Some(symmetric_positive_definite_inverse_or_pseudo(&penalized_hessian)?)
+    } else {
+        None
+    };
+    let beta_standard_errors = beta_covariance
+        .as_ref()
+        .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
+    // EDF `p − Σ_k λ_k tr(H_latent⁻¹ S_k)` is computed in the *latent*
+    // (untransformed) coordinate system the penalties `fit_penalties` live in,
+    // so it needs the latent posterior covariance `(H_latent + S_λ)⁻¹`, not the
+    // user-scale one. Invert the same latent precision that produced the
+    // reported user precision so the two are an exact transform pair.
+    let latent_cov = if options.compute_inference {
+        Some(symmetric_positive_definite_inverse_or_pseudo(
+            &latent_precision,
+        )?)
+    } else {
+        None
+    };
     let s_lambda_original = weighted_blockwise_penalty_sum(
         &design.penalties,
         fit.lambdas.as_slice().unwrap(),
@@ -27708,6 +27785,27 @@ mod tests {
             .fit
             .beta_covariance()
             .expect("bounded user covariance");
+        // User-scale covariance must be present, square, span every user
+        // coefficient (intercept + the two linear terms), and be finite — a
+        // bounded() fit with inference on must not silently drop it (gam#854).
+        assert_eq!(
+            covariance.nrows(),
+            precision.nrows(),
+            "bounded user covariance must be square and match the precision dimension"
+        );
+        assert_eq!(
+            covariance.ncols(),
+            precision.ncols(),
+            "bounded user covariance must be square and match the precision dimension"
+        );
+        assert!(
+            covariance.iter().all(|v| v.is_finite()),
+            "bounded user covariance must be finite on every entry"
+        );
+        assert!(
+            (0..covariance.nrows()).all(|i| covariance[[i, i]] > 0.0),
+            "bounded user covariance must have a strictly positive variance on every coefficient"
+        );
         let chol = precision
             .cholesky(faer::Side::Lower)
             .expect("bounded user precision cholesky");
