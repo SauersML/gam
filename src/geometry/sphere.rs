@@ -495,6 +495,18 @@ fn sphere_orthogonal_unit(vector: ArrayView1<'_, f64>) -> Result<Array1<f64>, St
     Ok(tangent.mapv(|v| v / tangent_norm))
 }
 
+/// Fixed power-iteration step count used when seeding the spherical-mean search
+/// with the dominant axis of the weighted second-moment matrix. The seed only
+/// needs to land in the right basin (the subsequent Riemannian iteration
+/// refines it), so a modest fixed budget suffices and avoids a per-call
+/// convergence test on the hot seeding path.
+const SPHERE_SEED_POWER_ITERS: usize = 64;
+
+/// Power-iteration step count for the standalone dominant-axis helper. Larger
+/// than the seed budget because its result is consumed directly (not refined
+/// downstream), so it iterates further toward the true leading eigenvector.
+const SPHERE_DOMINANT_AXIS_POWER_ITERS: usize = 128;
+
 fn sphere_mean_candidates(
     values: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -512,7 +524,7 @@ fn sphere_mean_candidates(
     // weighted cross-product used by `sphere_second_moment`.
     let moment = sphere_second_moment(values, weights);
     let mut v = Array1::<f64>::from_elem(d, 1.0 / (d as f64).sqrt());
-    for _ in 0..64 {
+    for _ in 0..SPHERE_SEED_POWER_ITERS {
         let mut nv = Array1::<f64>::zeros(d);
         for r in 0..d {
             let mut acc = 0.0;
@@ -555,7 +567,7 @@ fn sphere_dominant_axis(moment: ArrayView2<'_, f64>) -> Option<Array1<f64>> {
         return None;
     }
     let mut v = Array1::<f64>::from_elem(d, 1.0 / (d as f64).sqrt());
-    for _ in 0..128 {
+    for _ in 0..SPHERE_DOMINANT_AXIS_POWER_ITERS {
         let mut nv = Array1::<f64>::zeros(d);
         for r in 0..d {
             let mut acc = 0.0;

@@ -376,7 +376,15 @@ pub fn spd_frechet_mean(
     const STALL_REL: f64 = 5.0e-3;
     const STALL_PATIENCE: usize = 10;
     let mut stall = 0_usize;
-    let armijo_c1 = 1.0e-4_f64;
+    // Armijo sufficient-decrease parameter c₁ (standard `1e-4`) and the
+    // backtracking-halving cap: starting from the unit Karcher step `t = 1` and
+    // halving, the budget reaches `t = 2⁻⁶⁰ ≈ 1e-18`, below `f64` resolution, so
+    // exhausting it means no positive step decreases the dispersion.
+    const ARMIJO_C1: f64 = 1.0e-4;
+    const MAX_BACKTRACK_HALVINGS: usize = 60;
+    // Round-off cushion on the Armijo test, in units of `f64::EPSILON`, so that
+    // near the flat optimum the test forbids only an increase beyond round-off.
+    const ARMIJO_ROUNDOFF_EPS_MULTIPLE: f64 = 8.0;
 
     for _ in 0..max_iter {
         // Riemannian descent direction ξ = Σ_i w_i log_P(X_i) (= −½ grad V).
@@ -422,14 +430,14 @@ pub fn spd_frechet_mean(
         // forbids an increase beyond round-off, admitting the convergent unit
         // Karcher step so the residual keeps descending below √ε.
         let pred = grad_norm * grad_norm; // ‖ξ‖²_P > 0 here.
-        let f_tol = 8.0 * f64::EPSILON * (1.0 + f_cur.abs());
+        let f_tol = ARMIJO_ROUNDOFF_EPS_MULTIPLE * f64::EPSILON * (1.0 + f_cur.abs());
         let mut t = 1.0_f64;
         let mut accepted = false;
-        for _ in 0..60 {
+        for _ in 0..MAX_BACKTRACK_HALVINGS {
             let step = &xi * t;
             let cand = spd.exp_map(p.view(), step.view())?;
             let f_cand = dispersion(cand.view())?;
-            if f_cand <= f_cur - 2.0 * armijo_c1 * t * pred + f_tol {
+            if f_cand <= f_cur - 2.0 * ARMIJO_C1 * t * pred + f_tol {
                 p = cand;
                 f_cur = f_cand;
                 accepted = true;
