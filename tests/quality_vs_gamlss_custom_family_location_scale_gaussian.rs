@@ -48,6 +48,17 @@ const N_GRID: usize = 50;
 const GRID_LO: f64 = 0.1;
 const GRID_HI: f64 = 4.9;
 
+/// gam's location-scale noise link floor: σ = LOGB_SIGMA_FLOOR + exp(η_scale),
+/// the same soft floor mgcv's `gaulss(b=0.01)` uses (see
+/// `gam::families::sigma_link::LOGB_SIGMA_FLOOR`). The scale block's predictor
+/// η_scale is therefore NOT log σ directly — the response-scale σ and its log
+/// must be reconstructed through this link, exactly as the sibling formula-path
+/// test (`quality_vs_gamlss_gaussian_location_scale`) does. Reading η_scale as
+/// log σ (dropping the floor) injects a coherent −LOGB_SIGMA_FLOOR/σ ≈ −1.5 %
+/// bias into gam's measured log σ that gamlss's floorless pure-log link does not
+/// carry, which is a measurement artifact, not a recovery deficit.
+const LOGB_SIGMA_FLOOR: f64 = 0.01;
+
 /// True mean function μ(x) = 1 + sin(x).
 fn true_mu(x: f64) -> f64 {
     1.0 + x.sin()
@@ -251,11 +262,16 @@ fn gam_custom_family_location_scale_matches_gamlss() {
     let beta_mu = &fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].beta;
     let beta_ls = &fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta;
 
-    // Predictions on the 50-point grid (identity link for μ, log link for σ).
-    // For σ we keep the predictor on the LOG scale: log σ(x) = X_σ β_σ. Comparing
-    // on the log scale is the well-conditioned choice (see the bounds below).
+    // Predictions on the 50-point grid (identity link for μ, logb link for σ).
+    // gam's scale link is σ = LOGB_SIGMA_FLOOR + exp(η_scale), so log σ(x) is
+    // log(LOGB_SIGMA_FLOOR + exp(X_σ β_σ)), NOT the raw predictor X_σ β_σ. We
+    // reconstruct it through the actual link (as the sibling formula-path test
+    // does); comparing on the log scale is the well-conditioned choice.
     let gam_mu_grid: Vec<f64> = grid_mu.dot(beta_mu).to_vec();
-    let gam_log_sigma_grid: Vec<f64> = grid_sigma.dot(beta_ls).to_vec();
+    let gam_log_sigma_grid: Vec<f64> = grid_sigma
+        .dot(beta_ls)
+        .mapv(|e| (LOGB_SIGMA_FLOOR + e.exp()).ln())
+        .to_vec();
 
     // Fitted (μ, σ) at the *training* points, for the LL comparison.
     let gam_mu_train: Vec<f64> = fit.block_states[GaussianLocationScaleFamily::BLOCK_MU]
@@ -263,7 +279,7 @@ fn gam_custom_family_location_scale_matches_gamlss() {
         .to_vec();
     let gam_sigma_train: Vec<f64> = fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
         .eta
-        .mapv(f64::exp)
+        .mapv(|e| LOGB_SIGMA_FLOOR + e.exp())
         .to_vec();
     let gam_ll = gaussian_locscale_ll(&y, &gam_mu_train, &gam_sigma_train);
 
@@ -463,9 +479,13 @@ fn gam_custom_family_location_scale_matches_gamlss_on_real_data() {
     let beta_mu = &fit.block_states[GaussianLocationScaleFamily::BLOCK_MU].beta;
     let beta_ls = &fit.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta;
 
-    // Held-out predictions: μ via identity link, σ via exp(log-σ predictor).
+    // Held-out predictions: μ via identity link, σ via gam's logb scale link
+    // σ = LOGB_SIGMA_FLOOR + exp(η_scale) (not bare exp of the predictor).
     let gam_mu_test: Vec<f64> = test_mu.dot(beta_mu).to_vec();
-    let gam_sigma_test: Vec<f64> = test_sigma.dot(beta_ls).mapv(f64::exp).to_vec();
+    let gam_sigma_test: Vec<f64> = test_sigma
+        .dot(beta_ls)
+        .mapv(|e| LOGB_SIGMA_FLOOR + e.exp())
+        .to_vec();
 
     // ---- gamlss: the mature distributional-regression BASELINE, same split -
     // One run, all columns equal length (n_train): the test rows ride along as
