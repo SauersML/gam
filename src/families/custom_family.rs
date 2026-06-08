@@ -11270,11 +11270,12 @@ fn exact_newton_dh_apply<F: CustomFamily + Sync>(
     check_finite: bool,
     v_k: &Array1<f64>,
 ) -> Result<Option<DriftDerivResult>, String> {
+    let mode_response = v_k.mapv(|value| -value);
     if use_outer_curvature_derivatives {
         let h_rho = family.exact_newton_outer_curvature_directional_derivative_with_specs(
             synced_states,
             specs,
-            v_k,
+            &mode_response,
         )?;
         return match h_rho {
             Some(h) => finalize_dh_dense(h, total, scale, check_finite),
@@ -11286,7 +11287,7 @@ fn exact_newton_dh_apply<F: CustomFamily + Sync>(
     }
 
     if let Some(workspace) = workspace
-        && let Some(operator) = workspace.directional_derivative_operator(v_k)?
+        && let Some(operator) = workspace.directional_derivative_operator(&mode_response)?
     {
         return Ok(Some(scale_drift_deriv_result(
             DriftDerivResult::Operator(operator),
@@ -11297,7 +11298,7 @@ fn exact_newton_dh_apply<F: CustomFamily + Sync>(
     match family.exact_newton_joint_hessian_directional_derivative_with_specs(
         synced_states,
         specs,
-        v_k,
+        &mode_response,
     )? {
         Some(h) => finalize_dh_dense(h, total, scale, check_finite),
         None => Err(CustomFamilyError::UnsupportedConfiguration {
@@ -11337,8 +11338,12 @@ fn exact_newton_dh_many_closure<'a>(
 ) -> Option<Box<DriftDerivManyFn<'a>>> {
     let workspace = workspace?;
     Some(Box::new(move |directions: &[Array1<f64>]| {
+        let mode_responses = directions
+            .iter()
+            .map(|direction| direction.mapv(|value| -value))
+            .collect::<Vec<_>>();
         workspace
-            .directional_derivative_operators(directions)?
+            .directional_derivative_operators(&mode_responses)?
             .into_iter()
             .map(|maybe_operator| {
                 Ok(maybe_operator.map(|operator| {
