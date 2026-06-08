@@ -15950,6 +15950,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_step_inf,
                     step_inf,
                 );
+                if cycle <= 2 {
+                    use std::io::Write as _;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                        writeln!(f, "[DIAG-TR] cyc={cycle} att={line_search_attempts} {tr_attempt_sig} firth_score={:.3e}",
+                            head_jeffreys_term.as_ref().map(|(g,_)| g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)).unwrap_or(0.0)).ok();
+                    }
+                }
                 match tr_log_sig.as_deref() {
                     Some(prev) if prev == tr_attempt_sig.as_str() => {
                         tr_log_last = line_search_attempts;
