@@ -59,6 +59,40 @@ use faer::Side;
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
 const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 
+/// Relative floor on the Newton directional decrease, expressed as a tiny
+/// multiple of `‖g‖·‖Δ‖`. A predicted decrease below this is at the level of
+/// f64 round-off in the quadratic model and is treated as no progress (the step
+/// is rejected). Scaling by the gradient/step norms makes the floor invariant
+/// to the problem's overall magnitude.
+const SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR: f64 = 1.0e-14;
+
+/// Relative tolerance on the undamped Newton step norm (scaled by the iterate
+/// scale) for accepting inner-solve convergence.
+const SAE_MANIFOLD_INNER_STEP_REL_TOL: f64 = 1.0e-4;
+
+/// Relative tolerance on the KKT gradient norm (scaled by the iterate scale) for
+/// accepting inner-solve convergence.
+const SAE_MANIFOLD_INNER_GRAD_REL_TOL: f64 = 1.0e-5;
+
+/// Relative spectral cutoff for counting the numerical rank / nullity of a
+/// symmetric penalty Gram: eigenvalues at or below `cutoff · λ_max` are treated
+/// as zero. Shared by [`SaeManifoldTerm::symmetric_rank`] and
+/// [`smooth_penalty_nullity`] so the two stay in lockstep.
+const SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF: f64 = 1.0e-9;
+
+/// Floor on the Levenberg-Marquardt ridge added to a per-row Hessian before
+/// Cholesky, so the first attempt is always strictly positive even when the
+/// caller passes a zero base ridge.
+const SAE_MANIFOLD_ROW_RIDGE_FLOOR: f64 = 1.0e-12;
+
+/// Multiplicative factor by which the LM ridge is escalated after a failed
+/// Cholesky factorisation of a per-row Hessian.
+const SAE_MANIFOLD_ROW_RIDGE_GROWTH: f64 = 10.0;
+
+/// Maximum number of LM ridge-escalation attempts before declaring the per-row
+/// Hessian unfactorable.
+const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
+
 /// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
 /// hard gate threshold. The forward gate value is hard-zero strictly below
 /// `threshold`, but an atom whose logit lies within `threshold − MARGIN·τ` is
@@ -2094,7 +2128,7 @@ fn smooth_penalty_nullity(s: &Array2<f64>) -> Result<usize, String> {
         // zero operator order so the reweighting is skipped.
         return Ok(0);
     }
-    let tol = 1.0e-9 * max_eig;
+    let tol = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
     Ok(evals.iter().filter(|&&v| v <= tol).count())
 }
 
@@ -4559,7 +4593,7 @@ impl SaeManifoldTerm {
         if !(max_eig > 0.0) {
             return Ok(0);
         }
-        let tol = 1.0e-9 * max_eig;
+        let tol = SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF * max_eig;
         Ok(evals.iter().filter(|&&v| v > tol).count())
     }
 
@@ -4850,8 +4884,8 @@ impl SaeManifoldTerm {
             // so the gradient tolerance is a standard relative KKT residual rather
             // than the 0.1.154-regression band-aid (3e-3) that masked the
             // non-convergence the indefinite curvature caused.
-            let step_tolerance = 1.0e-4 * iterate_scale;
-            let grad_tolerance = 1.0e-5 * iterate_scale;
+            let step_tolerance = SAE_MANIFOLD_INNER_STEP_REL_TOL * iterate_scale;
+            let grad_tolerance = SAE_MANIFOLD_INNER_GRAD_REL_TOL * iterate_scale;
             if grad_norm <= grad_tolerance || step_norm <= step_tolerance {
                 return Ok(cache);
             }
@@ -6496,9 +6530,9 @@ impl SaeManifoldTerm {
         if d == 0 {
             return Ok(Array1::<f64>::zeros(0));
         }
-        let mut ridge = base_ridge.max(1.0e-12);
+        let mut ridge = base_ridge.max(SAE_MANIFOLD_ROW_RIDGE_FLOOR);
         let mut last_err = String::new();
-        for _ in 0..12 {
+        for _ in 0..SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS {
             let mut a = h.to_owned();
             for axis in 0..d {
                 a[[axis, axis]] += ridge;
@@ -6507,7 +6541,7 @@ impl SaeManifoldTerm {
                 Ok(delta) => return Ok(delta),
                 Err(err) => {
                     last_err = err;
-                    ridge *= 10.0;
+                    ridge *= SAE_MANIFOLD_ROW_RIDGE_GROWTH;
                 }
             }
         }
@@ -6675,7 +6709,9 @@ impl SaeManifoldTerm {
                 .map(|&v| v * v)
                 .sum();
             let step_norm_sq: f64 = delta_ext_coord.iter().map(|&v| v * v).sum();
-            let directional_decrease_floor = 1.0e-14 * grad_norm_sq.sqrt() * step_norm_sq.sqrt();
+            let directional_decrease_floor = SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR
+                * grad_norm_sq.sqrt()
+                * step_norm_sq.sqrt();
             let snapshot = self.snapshot_mutable_state();
             if !(pre_step_total.is_finite()
                 && directional_decrease.is_finite()
@@ -6830,7 +6866,9 @@ impl SaeManifoldTerm {
             for &v in delta_beta.iter() {
                 step_norm_sq += v * v;
             }
-            let directional_decrease_floor = 1.0e-14 * grad_norm_sq.sqrt() * step_norm_sq.sqrt();
+            let directional_decrease_floor = SAE_MANIFOLD_DIRECTIONAL_DECREASE_REL_FLOOR
+                * grad_norm_sq.sqrt()
+                * step_norm_sq.sqrt();
             // Capture the exact state whose assembled gradient/Hessian produced
             // `sys`, then evaluate the Armijo baseline from that same state.
             // Assembly installs compact active-set layout in `last_row_layout`;
@@ -6885,7 +6923,9 @@ impl SaeManifoldTerm {
             if !accepted {
                 self.restore_mutable_state(&snapshot);
                 let correction = ArrowProximalCorrectionOptions {
-                    initial_ridge: ridge_ext_coord.max(ridge_beta).max(1.0e-12),
+                    initial_ridge: ridge_ext_coord
+                        .max(ridge_beta)
+                        .max(SAE_MANIFOLD_ROW_RIDGE_FLOOR),
                     armijo_c1: SAE_MANIFOLD_ARMIJO_C1,
                     ..ArrowProximalCorrectionOptions::default()
                 };
