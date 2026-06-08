@@ -15748,28 +15748,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             for trust_attempt in 0..JOINT_TRUST_MAX_ATTEMPTS {
                 line_search_attempts = trust_attempt + 1;
                 accepted_joint_workspace = None;
-                let mut trial_delta = search_delta.clone();
                 // Dogleg globalization (gam#826/#808): when the unconstrained
                 // Newton path is in force and a finite Cauchy leg was built,
                 // construct the dogleg blend of the Cauchy and Newton points at
                 // the current per-block radii. Otherwise (constrained-QP path,
                 // or after the preconditioned-descent fallback replaced
                 // `search_delta`) fall back to box-truncating the search step.
+                let mut trial_delta;
                 let mut block_step_norms = if let Some(cauchy) = dogleg_cauchy.as_ref()
                     && !tried_preconditioned_descent
                 {
-                    let mut dogleg = Array1::<f64>::zeros(total_p);
-                    let norms = joint_dogleg_step_to_block_metric_radii(
+                    trial_delta = Array1::<f64>::zeros(total_p);
+                    joint_dogleg_step_to_block_metric_radii(
                         &search_delta,
                         cauchy,
                         &ranges,
                         &joint_trust_metric_diag,
                         &joint_block_trust_radii,
-                        &mut dogleg,
-                    );
-                    trial_delta = dogleg;
-                    norms
+                        &mut trial_delta,
+                    )
                 } else {
+                    trial_delta = search_delta.clone();
                     truncate_joint_step_to_block_metric_radii(
                         &mut trial_delta,
                         &ranges,
