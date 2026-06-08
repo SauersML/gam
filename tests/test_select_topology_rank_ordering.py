@@ -14,7 +14,7 @@ def test_select_topology_uses_ranked_order_from_comparison_layer(monkeypatch):
         st._Candidate("a", object.__new__(st.PeriodicSplineCurve)),
         st._Candidate("b", object.__new__(st.PeriodicSplineCurve)),
     ])
-    monkeypatch.setattr(st, "_formula_for_candidate", lambda formula, auto, candidate, strict_dimension: formula)
+    monkeypatch.setattr(st, "_formula_for_candidate", lambda formula, candidate, *, strict_dimension: formula)
     monkeypatch.setattr(st, "fit", lambda data, formula, **kwargs: _Fit(-1.0 if "a" in formula else -2.0, 1.0))
     monkeypatch.setattr(st, "_extract_reml_score_raw", lambda m: float(m.summary()["reml_score"]))
     monkeypatch.setattr(st, "_basis_size", lambda m: 2)
