@@ -5406,10 +5406,29 @@ impl<'a> RemlState<'a> {
         let Some(kkt) = pr.constraint_kkt.as_ref() else {
             return Ok(());
         };
+        // On a degenerate boundary face (linearly-dependent active rows), the
+        // exact projected gradient is not unique and a strict 5e-6
+        // stationarity check is unreachable by construction. The inner
+        // active-set solver already certifies such iterates via its
+        // `degenerate_boundary_ok` clause at the relaxed
+        // `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` tolerance — without
+        // matching that here, the outer startup gate refuses a legitimately
+        // converged constrained optimum (root cause of the
+        // `shape=concave`/`shape=convex` curvature-constraint startup abort:
+        // a 2nd-difference operator forces dependence whenever more than `p`
+        // rows bind, and every cold seed lands on such a face). Primal /
+        // dual / complementarity stay on their strict tolerances; only the
+        // stationarity channel — the one mathematically unreachable on a
+        // rank-deficient face — gets the matching relaxation.
+        let stationarity_tol = if kkt.working_set_rank_deficient {
+            crate::solver::active_set::ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL
+        } else {
+            KKT_TOL_STAT
+        };
         if kkt.primal_feasibility > KKT_TOL_PRIMAL
             || kkt.dual_feasibility > KKT_TOL_DUAL
             || kkt.complementarity > KKT_TOL_COMP
-            || kkt.stationarity > KKT_TOL_STAT
+            || kkt.stationarity > stationarity_tol
         {
             let mut worstrow_msg = String::new();
             if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
@@ -5428,11 +5447,13 @@ impl<'a> RemlState<'a> {
                 }
             }
             return Err(EstimationError::ParameterConstraintViolation(format!(
-                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e}; active={}/{}{}",
+                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (tol={:.3e}{}); active={}/{}{}",
                 kkt.primal_feasibility,
                 kkt.dual_feasibility,
                 kkt.complementarity,
                 kkt.stationarity,
+                stationarity_tol,
+                if kkt.working_set_rank_deficient { ", degenerate face" } else { "" },
                 kkt.n_active,
                 kkt.n_constraints,
                 worstrow_msg

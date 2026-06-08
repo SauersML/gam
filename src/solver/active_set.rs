@@ -42,7 +42,15 @@ const ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL: f64 = 1e-8;
 /// face* (linearly-dependent active rows), where the exact projected gradient
 /// cannot reach `ACTIVE_SET_KKT_STATIONARITY_TOL`. Still requires primal
 /// feasibility, complementarity, and a relative-stationarity backstop.
-const ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL: f64 = 1e-3;
+///
+/// Public so the outer REML / PIRLS validation gate can apply the same
+/// relaxation when the diagnostic reports a rank-deficient active face — a
+/// strict 5e-6 check there would otherwise refuse iterates that the inner
+/// active-set solver legitimately certified via its own `degenerate_boundary_ok`
+/// clause, causing a startup-validation abort on curvature constraints
+/// (`shape=concave` / `shape=convex`) where the second-difference operator
+/// makes the active rows linearly dependent by construction.
+pub(crate) const ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL: f64 = 1e-3;
 
 /// Relative scale on the predicted-decrease test `predicted_delta ≤
 /// −ε·(1 + ‖∇L‖∞·‖d‖∞)`: when the working-set Newton step still buys a
@@ -131,6 +139,19 @@ pub struct ConstraintKktDiagnostics {
     pub stationarity: f64,
     /// Tolerance used to classify active constraints from slacks.
     pub active_tolerance: f64,
+    /// `true` when the active rows are linearly dependent (`rank(A_active) <
+    /// n_active`) — a *degenerate boundary face*. On such a face the exact
+    /// projected gradient is not unique and the strict stationarity tolerance
+    /// is unreachable by construction (curvature constraints — e.g.
+    /// `shape=concave`/`shape=convex` — encode a second-difference operator
+    /// whose active rows are linearly dependent whenever more than `p` of
+    /// them bind). The inner active-set solver certifies these iterates via
+    /// its `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` relaxation; the
+    /// outer validation gate must consult this flag to apply the matching
+    /// relaxation, or it will refuse a legitimately-converged constrained
+    /// optimum and abort the REML startup loop.
+    #[serde(default)]
+    pub working_set_rank_deficient: bool,
 }
 
 fn solve_newton_direction_dense(
@@ -244,6 +265,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
 
     let active_idx: Vec<usize> = (0..m).filter(|&i| slack[i] <= active_tolerance).collect();
     let mut lambda = Array1::<f64>::zeros(m);
+    let mut working_set_rank_deficient = false;
     if !active_idx.is_empty() {
         let n_active = active_idx.len();
         let mut a_active = Array2::<f64>::zeros((n_active, p));
@@ -257,6 +279,28 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
                 lambda[idx] = lambda_active[r];
             }
         }
+        // Rank-deficiency detection on the (scaled) active rows. Per-row
+        // positive scaling is rank-preserving, so this answers the same
+        // question the inner solver's `CompressedActiveWorkingSet::
+        // is_degenerate_face` does — `rank(A_active) < n_active`. For curvature
+        // constraints the second-difference operator forces dependence
+        // whenever more than `p` rows bind, and for monotonicity the
+        // first-difference operator does so beyond a similar count. The
+        // diagnostic exposes the flag so the outer validation gate can apply
+        // the same `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL` relaxation
+        // the inner solver does, instead of refusing the iterate at strict
+        // `ACTIVE_SET_KKT_STATIONARITY_TOL`.
+        working_set_rank_deficient = if n_active > p {
+            true
+        } else if n_active > 1 {
+            let groups: Vec<Vec<usize>> = (0..n_active).map(|i| vec![i]).collect();
+            let b_dummy = Array1::<f64>::zeros(n_active);
+            let (reduced_a, _, _, _) =
+                rank_reduce_rows_pivoted_qr_with_dependence(a_active, b_dummy, groups);
+            reduced_a.nrows() < n_active
+        } else {
+            false
+        };
     }
 
     let mut dual_feasibility: f64 = 0.0;
@@ -279,6 +323,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
         complementarity,
         stationarity,
         active_tolerance,
+        working_set_rank_deficient,
     }
 }
 
@@ -931,6 +976,13 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
         complementarity,
         stationarity,
         active_tolerance: ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+        // `working_constraints` is the already-rank-reduced compressed
+        // working set, so by construction `rank(working_constraints.a) ==
+        // n_active`. Whether the *original* (uncompressed) active set was
+        // rank-deficient is the caller's responsibility to track when it
+        // needs to surface that to a downstream gate; here we report the
+        // post-compression view honestly.
+        working_set_rank_deficient: false,
     })
 }
 
