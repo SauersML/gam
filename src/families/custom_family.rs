@@ -14529,6 +14529,19 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
         let mut tr_clamped_during_stall: bool = false;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
+        // Cross-cycle cache of the joint Jeffreys/Firth triple `(β_key, ∇Φ, H_Φ)`
+        // (gam#729/#826/#808). Computing `(∇Φ, H_Φ)` costs `p` family
+        // directional-derivative calls plus the `½ S Sᵀ` GEMM; for a K-block
+        // coupled family that is the dominant per-inner-cycle cost. The post-step
+        // KKT residual recomputes the triple at the just-accepted β; the NEXT
+        // cycle's head needs the SAME triple at that SAME β. Carry it forward
+        // keyed on the flattened β so the head reuses the post-step result instead
+        // of recomputing — collapsing two O(p)-directional-derivative evaluations
+        // per accepted cycle to one. The key is an exact-equality check on the
+        // flattened β (β is byte-identical between an accepted post-step residual
+        // and the next head), so the reused term is the exact term at the current
+        // iterate — no staleness, no tolerance fudge.
+        let mut jeffreys_triple_cache: Option<(Array1<f64>, Array1<f64>, Array2<f64>)> = None;
         // Stash for the structured cert-REFUSED report computed inside the
         // cycle loop, so the post-loop bubbled error (`coupled exact-joint
         // inner solve exited the joint Newton path …`) can emit the same
@@ -14770,12 +14783,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // O(p)-directional-derivative evaluations per cycle. The post-step
             // residual below is at the accepted β, so it correctly recomputes.
             // `None` when the term is condition-gated/skippable (∇Φ=0, H_Φ=0).
+            let head_beta_key: Array1<f64> = flatten_state_betas(&states, specs);
             let head_jeffreys_term: Option<(Array1<f64>, Array2<f64>)> =
                 if jeffreys_skippable_this_cycle {
                     None
+                } else if let Some((_, grad_phi, hphi)) = jeffreys_triple_cache
+                    .as_ref()
+                    .filter(|(key, _, _)| *key == head_beta_key)
+                {
+                    // Cross-cycle cache hit: the previous cycle's post-step KKT
+                    // residual already computed the exact triple at this β. Reuse.
+                    Some((grad_phi.clone(), hphi.clone()))
                 } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
-                    match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)?
-                    {
+                    let term = match custom_family_joint_jeffreys_term(
+                        family, &states, specs, &ranges, z_joint,
+                    )? {
                         Some((_phi, grad_phi, hphi))
                             if grad_phi.len() == grad_joint.len()
                                 && hphi.nrows() == total_p
@@ -14784,7 +14806,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             Some((grad_phi, hphi))
                         }
                         _ => None,
+                    };
+                    if let Some((grad_phi, hphi)) = term.as_ref() {
+                        jeffreys_triple_cache =
+                            Some((head_beta_key.clone(), grad_phi.clone(), hphi.clone()));
                     }
+                    term
                 } else {
                     None
                 };
@@ -16105,8 +16132,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 None
             } else if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                 match custom_family_joint_jeffreys_term(family, &states, specs, &ranges, z_joint)? {
-                    Some((_phi, grad_phi, _hphi)) if grad_phi.len() == gradient.len() => {
-                        Some(gradient + &grad_phi)
+                    Some((_phi, grad_phi, hphi))
+                        if grad_phi.len() == gradient.len()
+                            && hphi.nrows() == total_p
+                            && hphi.ncols() == total_p =>
+                    {
+                        let augmented = gradient + &grad_phi;
+                        // Cache the exact triple at the just-accepted β so the next
+                        // cycle's head reuses it instead of recomputing the
+                        // O(p)-directional-derivative + GEMM term (gam#729).
+                        let post_beta_key = flatten_state_betas(&states, specs);
+                        jeffreys_triple_cache = Some((post_beta_key, grad_phi, hphi));
+                        Some(augmented)
                     }
                     _ => None,
                 }
