@@ -127,6 +127,38 @@ pub fn padded_deviation_seed(seed: &Array1<f64>, min_iqr: f64, pad_fraction: f64
     Array1::from_vec(out)
 }
 
+// ── Pooled 2-D probit pilot Newton solver tuning ─────────────────────────────
+//
+// `pooled_probit_baseline` solves a 2-parameter (intercept, slope) penalised
+// probit by damped Newton. The values below are the standard convergence /
+// safeguard knobs; they are deliberately conservative because the pilot is a
+// cheap warm-start for the full fit, not the production estimator.
+
+/// Maximum damped-Newton outer iterations for the pooled probit pilot. A 2-D
+/// strictly-convex probit converges in well under this; the cap only guards a
+/// pathological non-finite data configuration.
+const POOLED_PILOT_MAX_NEWTON_ITERS: usize = 50;
+/// Initial Levenberg ridge added to the 2×2 Hessian diagonal before the solve.
+const POOLED_PILOT_RIDGE_INIT: f64 = 1e-8;
+/// Below this absolute determinant the ridged 2×2 system is treated as
+/// singular and the ridge is escalated.
+const POOLED_PILOT_DET_FLOOR: f64 = 1e-18;
+/// Geometric factor by which the ridge grows when the system is singular.
+const POOLED_PILOT_RIDGE_GROWTH: f64 = 10.0;
+/// Ridge ceiling; exceeding it means the Hessian is unusable and the pilot
+/// fails rather than returning a meaningless step.
+const POOLED_PILOT_RIDGE_MAX: f64 = 1e6;
+/// Maximum backtracking-line-search halvings per Newton step.
+const POOLED_PILOT_MAX_BACKTRACKS: usize = 25;
+/// Backtracking step contraction factor.
+const POOLED_PILOT_BACKTRACK_SHRINK: f64 = 0.5;
+/// Objective-change tolerance below which a stalled (rejected) line search is
+/// accepted as converged instead of erroring.
+const POOLED_PILOT_STALL_TOL: f64 = 1e-10;
+/// Minimum-magnitude signed slope returned by the pilot, so the downstream
+/// `b/√(1+b²)` rigid seed never collapses to an exactly flat (zero-slope) link.
+const POOLED_PILOT_MIN_ABS_SLOPE: f64 = 1e-6;
+
 pub(super) fn pooled_probit_baseline(
     y: &Array1<f64>,
     z: &Array1<f64>,
@@ -211,7 +243,7 @@ pub(super) fn pooled_probit_baseline(
         };
 
     let mut obj_prev = f64::INFINITY;
-    for _ in 0..50 {
+    for _ in 0..POOLED_PILOT_MAX_NEWTON_ITERS {
         let (obj, g0, g1, h00, h01, h11) = objective_grad_hess(beta0, beta1)?;
         if !obj.is_finite() || !g0.is_finite() || !g1.is_finite() {
             return Err(
@@ -223,20 +255,20 @@ pub(super) fn pooled_probit_baseline(
         if grad_max < BMS_DERIV_TOL {
             break;
         }
-        let mut ridge = 1e-8;
+        let mut ridge = POOLED_PILOT_RIDGE_INIT;
         let (step0, step1) = loop {
             let h00_r = h00 + ridge;
             let h11_r = h11 + ridge;
             let det = h00_r * h11_r - h01 * h01;
-            if det.is_finite() && det.abs() > 1e-18 {
+            if det.is_finite() && det.abs() > POOLED_PILOT_DET_FLOOR {
                 let s0 = (h11_r * g0 - h01 * g1) / det;
                 let s1 = (-h01 * g0 + h00_r * g1) / det;
                 if s0.is_finite() && s1.is_finite() {
                     break (s0, s1);
                 }
             }
-            ridge *= 10.0;
-            if ridge > 1e6 {
+            ridge *= POOLED_PILOT_RIDGE_GROWTH;
+            if ridge > POOLED_PILOT_RIDGE_MAX {
                 return Err(
                     "pooled bernoulli-marginal-slope pilot Hessian solve failed".to_string()
                 );
@@ -244,7 +276,7 @@ pub(super) fn pooled_probit_baseline(
         };
         let mut accepted = false;
         let mut step_scale = 1.0;
-        for _ in 0..25 {
+        for _ in 0..POOLED_PILOT_MAX_BACKTRACKS {
             let cand0 = beta0 - step_scale * step0;
             let cand1 = beta1 - step_scale * step1;
             let (cand_obj, _, _, _, _, _) = objective_grad_hess(cand0, cand1)?;
@@ -255,10 +287,10 @@ pub(super) fn pooled_probit_baseline(
                 accepted = true;
                 break;
             }
-            step_scale *= 0.5;
+            step_scale *= POOLED_PILOT_BACKTRACK_SHRINK;
         }
         if !accepted {
-            if (obj_prev - obj).abs() < 1e-10 {
+            if (obj_prev - obj).abs() < POOLED_PILOT_STALL_TOL {
                 break;
             }
             return Err("pooled bernoulli-marginal-slope pilot line search failed".to_string());
@@ -266,11 +298,11 @@ pub(super) fn pooled_probit_baseline(
     }
     let a = beta0;
     // Signed slope: preserve direction from pilot probit.
-    let b = if beta1.abs() < 1e-6 {
+    let b = if beta1.abs() < POOLED_PILOT_MIN_ABS_SLOPE {
         if beta1.is_sign_negative() {
-            -1e-6
+            -POOLED_PILOT_MIN_ABS_SLOPE
         } else {
-            1e-6
+            POOLED_PILOT_MIN_ABS_SLOPE
         }
     } else {
         beta1
@@ -361,6 +393,16 @@ pub(super) fn rigid_pooled_probit_pilot_eta(
     Ok(out)
 }
 
+/// Tikhonov ridge for the pilot IRLS marginal solve, as a fraction of the mean
+/// Hessian diagonal: `ridge = PILOT_RIDGE_DIAG_FRACTION * max(mean_diag, floor)`.
+/// Scaling by the diagonal keeps the ridge scale-invariant; the fraction is
+/// small enough to be numerically negligible against a well-conditioned design
+/// yet still regularise a near-singular pilot Gram.
+const PILOT_RIDGE_DIAG_FRACTION: f64 = 1e-6;
+/// Positivity floor on the mean Hessian diagonal used to scale the pilot ridge,
+/// so a degenerate (all-zero-diagonal) Gram still receives a tiny ridge.
+const PILOT_RIDGE_DIAG_FLOOR: f64 = 1e-12;
+
 pub(super) fn pilot_eta_for_link_dev_orthogonalisation(
     base_link: &InverseLink,
     y: &Array1<f64>,
@@ -409,7 +451,7 @@ pub(super) fn pilot_eta_for_link_dev_orthogonalisation(
     let xtwr = marginal_design.compute_xtwy(&w_irls, &residual)?;
     let mut xtwx = marginal_design.xt_diag_x_signed_op(SignedWeightsView::from_array(&w_irls))?;
     let trace_diag: f64 = (0..p_marg).map(|i| xtwx[[i, i]]).sum();
-    let ridge = (trace_diag / p_marg as f64).max(1e-12) * 1e-6;
+    let ridge = (trace_diag / p_marg as f64).max(PILOT_RIDGE_DIAG_FLOOR) * PILOT_RIDGE_DIAG_FRACTION;
     for i in 0..p_marg {
         xtwx[[i, i]] += ridge;
     }
@@ -691,6 +733,12 @@ pub enum MarginalSlopeCovariance {
     LowRank(Array2<f64>),
 }
 
+/// Negative-side tolerance on the covariance quadratic form `rᵀΣr`. The form
+/// is mathematically PSD but finite-precision accumulation in the dense / low-
+/// rank sums can produce a tiny negative value at a true zero; results within
+/// this tolerance are clamped to zero, anything more negative is a real error.
+const COVARIANCE_QUADRATIC_FORM_PSD_TOL: f64 = -1e-10;
+
 impl MarginalSlopeCovariance {
     pub fn shape(&self) -> MarginalSlopeCovarianceShape {
         match self {
@@ -812,7 +860,7 @@ impl MarginalSlopeCovariance {
                 total
             }
         };
-        if value.is_finite() && value >= -1e-10 {
+        if value.is_finite() && value >= COVARIANCE_QUADRATIC_FORM_PSD_TOL {
             Ok(value.max(0.0))
         } else {
             Err(format!(
