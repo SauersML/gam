@@ -10,8 +10,7 @@
 //!     `c * (7 - c) / 2 + d` (i.e. 0..10). The symmetric counterpart is
 //!     looked up by swapping the pair.
 //!   - `raw_block_ranges`: column slice for each raw block inside the
-//!     concatenated raw design — used purely to size and stride the
-//!     output Gram.
+//!     concatenated raw design, used to size and stride the output Gram.
 //!
 //! The kernel forms two block-Gram matrices:
 //!   - `gram_h`: ∑_{c,d} X_a^{(c)}ᵀ · diag(h_{cd}) · X_b^{(d)}
@@ -30,7 +29,6 @@ use std::ops::Range;
 pub struct GramBundle {
     pub gram_h: Array2<f64>,
     pub gram_struct: Array2<f64>,
-    pub raw_block_ranges: Vec<Range<usize>>,
 }
 
 /// Number of channels in the symmetric 4×4 weight matrix.
@@ -53,14 +51,6 @@ pub const fn packed_index(c: usize, d: usize) -> usize {
 /// Try to build the primary-state Gram bundle on the GPU. Returns `None`
 /// when no CUDA device is available or when any device call fails.
 ///
-/// This is a one-shot convenience wrapper: it builds a
-/// [`GpuIdentifiabilityCompileWorkspace`], runs a single
-/// `compute_grams`, and drops the workspace. Callers that compute Grams
-/// for the same `channel_blocks` more than once (e.g. structural-H
-/// compile followed by a recompile-after-PIRLS-accept with a
-/// data-adaptive H) should construct one workspace explicitly and reuse
-/// it across `compute_grams` calls to avoid re-uploading the
-/// channel-block designs.
 pub fn try_primary_state_gram_cuda(
     channel_blocks: &[Vec<Option<Array2<f64>>>],
     h_packed: &Array2<f64>,
@@ -82,102 +72,8 @@ pub fn try_primary_state_gram_cuda(
     }
     #[cfg(target_os = "linux")]
     {
-        let workspace =
-            GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
+        let workspace = cuda_impl::WorkspaceInner::try_new(channel_blocks, raw_block_ranges)?;
         workspace.compute_grams(h_packed)
-    }
-}
-
-/// Try the fused NVRTC primary-state Gram kernel. Returns `None` on any
-/// failure (no runtime, NVRTC compile failure, launch error, malformed
-/// inputs) so the caller can fall back. The default
-/// [`try_primary_state_gram_cuda`] entry point already attempts this path
-/// first and transparently falls back to the cuBLAS DDGMM+DGEMM kernel;
-/// this entry point is exported so parity tests can pin behavior to the
-/// fused path alone.
-pub fn try_primary_state_gram_fused_cuda(
-    channel_blocks: &[Vec<Option<Array2<f64>>>],
-    h_packed: &Array2<f64>,
-    raw_block_ranges: &[Range<usize>],
-) -> Option<GramBundle> {
-    #[cfg(not(target_os = "linux"))]
-    {
-        if channel_blocks.is_empty()
-            || h_packed.is_empty()
-            || raw_block_ranges.is_empty()
-            || channel_blocks.len() != raw_block_ranges.len()
-        {
-            return None;
-        }
-        None
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let workspace =
-            GpuIdentifiabilityCompileWorkspace::try_new(channel_blocks, raw_block_ranges)?;
-        workspace.inner.compute_grams_fused(h_packed)
-    }
-}
-
-/// Device-resident workspace that caches uploaded channel-block designs
-/// across multiple Gram builds for the same `(channel_blocks,
-/// raw_block_ranges)` topology. Only the per-row packed Hessian `H` is
-/// re-uploaded on each [`Self::compute_grams`] call.
-///
-/// Intended use: construct once at SMGS identifiability-compile time,
-/// then call [`Self::compute_grams`] for the structural-H pass and again
-/// for any recompile-after-PIRLS-accept pass with the data-adaptive H.
-///
-/// On non-Linux builds this is a stub that always reports unavailable
-/// via [`Self::try_new`] returning `None`.
-pub struct GpuIdentifiabilityCompileWorkspace {
-    #[cfg(target_os = "linux")]
-    pub(crate) inner: cuda_impl::WorkspaceInner,
-    #[cfg(not(target_os = "linux"))]
-    _never: std::marker::PhantomData<()>,
-}
-
-impl GpuIdentifiabilityCompileWorkspace {
-    /// Build a device-resident workspace by uploading each
-    /// `(block, channel)` raw design exactly once. Returns `None` when
-    /// no CUDA runtime is available, when inputs are malformed, or when
-    /// any device allocation/copy fails.
-    pub fn try_new(
-        channel_blocks: &[Vec<Option<Array2<f64>>>],
-        raw_block_ranges: &[Range<usize>],
-    ) -> Option<Self> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            if channel_blocks.is_empty()
-                || raw_block_ranges.is_empty()
-                || channel_blocks.len() != raw_block_ranges.len()
-            {
-                return None;
-            }
-            None
-        }
-        #[cfg(target_os = "linux")]
-        {
-            let inner = cuda_impl::WorkspaceInner::try_new(channel_blocks, raw_block_ranges)?;
-            Some(Self { inner })
-        }
-    }
-
-    /// Compute the `(gram_h, gram_struct)` bundle on device. Uploads
-    /// only the packed Hessian columns it actually needs; reuses the
-    /// cached channel-block designs.
-    pub fn compute_grams(&self, h_packed: &Array2<f64>) -> Option<GramBundle> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            if h_packed.is_empty() {
-                return None;
-            }
-            None
-        }
-        #[cfg(target_os = "linux")]
-        {
-            self.inner.compute_grams(h_packed)
-        }
     }
 }
 
@@ -498,7 +394,6 @@ mod cuda_impl {
             Some(GramBundle {
                 gram_h,
                 gram_struct,
-                raw_block_ranges: self.raw_block_ranges.clone(),
             })
         }
 
@@ -576,7 +471,6 @@ mod cuda_impl {
             Some(GramBundle {
                 gram_h,
                 gram_struct,
-                raw_block_ranges: self.raw_block_ranges.clone(),
             })
         }
     }
@@ -870,80 +764,6 @@ mod tests {
                     "gram_struct mismatch at {idx:?}: cpu={c} gpu={g}"
                 );
             }
-            assert_eq!(bundle.raw_block_ranges, ranges);
-        }
-    }
-
-    /// Parity test for the fused NVRTC kernel against the cuBLAS DDGMM+DGEMM
-    /// path. Skipped silently on hosts without a usable CUDA runtime, and
-    /// also when either path independently reports unavailable (CI infra
-    /// outage). On V100 with the fused kernel compiling, both bundles must
-    /// agree to 1e-10 elementwise.
-    #[test]
-    fn fused_kernel_matches_cublas_path() {
-        let (channel_blocks, h_packed, ranges) = make_fixture();
-        #[cfg(not(target_os = "linux"))]
-        {
-            assert!(
-                try_primary_state_gram_fused_cuda(&channel_blocks, &h_packed, &ranges).is_none(),
-                "non-Linux build must report no CUDA for the fused entry point"
-            );
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if crate::gpu::runtime::GpuRuntime::global().is_none() {
-                eprintln!(
-                    "[identifiability_compile] no CUDA runtime — skipping fused/cuBLAS parity check"
-                );
-                return;
-            }
-            let Some(fused_bundle) =
-                try_primary_state_gram_fused_cuda(&channel_blocks, &h_packed, &ranges)
-            else {
-                eprintln!(
-                    "[identifiability_compile] fused kernel build returned None — \
-                     treating as CI infra outage, not a parity regression"
-                );
-                return;
-            };
-            let Some(workspace) =
-                GpuIdentifiabilityCompileWorkspace::try_new(&channel_blocks, &ranges)
-            else {
-                eprintln!(
-                    "[identifiability_compile] workspace build returned None — \
-                     treating as CI infra outage, not a parity regression"
-                );
-                return;
-            };
-            let Some(blas_bundle) = workspace.inner.compute_grams_cublas(&h_packed) else {
-                eprintln!(
-                    "[identifiability_compile] cuBLAS Gram build returned None — \
-                     treating as CI infra outage, not a parity regression"
-                );
-                return;
-            };
-            let tol = 1e-10_f64;
-            for ((idx, &f), &b) in fused_bundle
-                .gram_h
-                .indexed_iter()
-                .zip(blas_bundle.gram_h.iter())
-            {
-                assert!(
-                    (f - b).abs() <= tol,
-                    "gram_h fused-vs-cuBLAS drift at {idx:?}: fused={f} blas={b}"
-                );
-            }
-            for ((idx, &f), &b) in fused_bundle
-                .gram_struct
-                .indexed_iter()
-                .zip(blas_bundle.gram_struct.iter())
-            {
-                assert!(
-                    (f - b).abs() <= tol,
-                    "gram_struct fused-vs-cuBLAS drift at {idx:?}: fused={f} blas={b}"
-                );
-            }
-            assert_eq!(fused_bundle.raw_block_ranges, ranges);
         }
     }
 }
