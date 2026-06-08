@@ -24624,6 +24624,164 @@ fn outer_startup_failure_is_escalatable(err: &EstimationError) -> bool {
     }
 }
 
+/// Minimum effective degrees of freedom a penalized term must retain in the
+/// outer λ-selection. One effective dimension is the smallest non-arbitrary
+/// floor: it asserts the penalized component must explain at least ONE effective
+/// direction of its own range space, i.e. it has not collapsed entirely onto its
+/// unpenalized polynomial null space. It is NOT a tuning constant — `1.0` is the
+/// boundary between "the smooth contributes" and "the smooth is statistically
+/// indistinguishable from its null-space limit".
+const EFFECTIVE_DF_FLOOR: f64 = 1.0;
+
+/// Unit-weight effective degrees of freedom of a single penalized term as a
+/// function of `ρ = log λ`, expressed through the design/penalty generalized
+/// eigenvalues `γ_j` on the penalty range space:
+///
+/// ```text
+/// edf(ρ) = Σ_j γ_j / (γ_j + e^ρ),   γ_j = (design range curvature)_j / (penalty)_j.
+/// ```
+///
+/// This is the data-FREE structural edf: it uses the design column Gram `XᵀX`
+/// (unit weights), NOT the family's Fisher weight, so it is the same regardless
+/// of where the inner solve sits on a near-flat Fisher surface. It is the
+/// quantity whose collapse the #715/#684 over-shrinkage describes — when the
+/// Fisher curvature vanishes the REML objective flattens in ρ and the optimizer
+/// lets λ drift past the point where this structural edf falls below the floor.
+fn unit_weight_term_edf(gammas: &[f64], rho: f64) -> f64 {
+    let lambda = rho.exp();
+    gammas
+        .iter()
+        .map(|&g| if g > 0.0 { g / (g + lambda) } else { 0.0 })
+        .sum()
+}
+
+/// Generalized eigenvalues `γ_j = g_j / s_j` of the design column Gram `XᵀX`
+/// against the penalty `S` on `range(S)`, computed structurally (unit weights).
+///
+/// Returns `None` (caller falls back to the uniform ρ bound) whenever the
+/// geometry cannot be materialized safely as a `p×p` block-local pair — Kronecker
+/// penalties are expanded, but `Blockwise`/total-dim penalties whose dense form
+/// is not `p×p` are skipped rather than risk a mis-projected curvature that could
+/// bias the REML selection.
+fn design_penalty_range_gammas(design: &DesignMatrix, penalty: &PenaltyMatrix) -> Option<Vec<f64>> {
+    let p = design.ncols();
+    if p == 0 {
+        return None;
+    }
+    let s_dense = penalty.to_dense();
+    if s_dense.nrows() != p || s_dense.ncols() != p {
+        // Blockwise/total-dim layout or shape mismatch: not safely projectable
+        // here. Fall back to the uniform bound.
+        return None;
+    }
+    let x = design.to_dense();
+    if x.ncols() != p {
+        return None;
+    }
+    let gram = x.t().dot(&x);
+    // Eigendecompose the penalty to find its range space.
+    let (s_evals, s_evecs) = s_dense.eigh(Side::Lower).ok()?;
+    let s_max = s_evals.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+    if !(s_max > 0.0) {
+        return None;
+    }
+    let s_thresh = positive_eigenvalue_threshold(s_evals.as_slice()?);
+    let mut gammas = Vec::new();
+    for (j, &sj) in s_evals.iter().enumerate() {
+        if sj <= s_thresh {
+            continue; // null space of S: not a penalized direction.
+        }
+        let u = s_evecs.column(j);
+        // Design curvature along this penalty eigenvector (unit weights):
+        //   g_j = uᵀ (XᵀX) u.
+        let gu = gram.dot(&u);
+        let gj = u.dot(&gu);
+        if gj.is_finite() && gj > 0.0 {
+            gammas.push(gj / sj);
+        } else {
+            // A penalized direction with no design support has γ→0: edf→0 for any
+            // λ>0, so it cannot be floored by bounding ρ. Skip it (it never
+            // contributes to the retained df sum).
+            gammas.push(0.0);
+        }
+    }
+    if gammas.is_empty() {
+        return None;
+    }
+    Some(gammas)
+}
+
+/// Per-outer-coordinate ρ UPPER bound enforcing the effective-df floor.
+///
+/// For each penalized term, the structural unit-weight edf `Σ_j γ_j/(γ_j+e^ρ)`
+/// is monotone decreasing in ρ. The bound is the ρ at which it equals
+/// `EFFECTIVE_DF_FLOOR` (when the term's max attainable edf exceeds the floor),
+/// found by bisection on the closed-form edf. Tied coordinates (shared precision
+/// label) take the LOOSEST (largest) per-term bound so the shared λ is never
+/// forced tighter than any single contributing term requires. Every coordinate
+/// is additionally capped at the caller's uniform `ceiling` so this can only
+/// TIGHTEN, never loosen, the existing bound.
+///
+/// This enters ONLY the λ-selection domain: the inner β solve at any selected ρ
+/// is unchanged and exact, so the converged β carries no bias (same discipline
+/// as the #747 solver-only ridge). It is the λ-upper-side dual of the #752
+/// full-subspace logdet work — there the value/gradient subspace was fixed on the
+/// λ→∞ side of a near-collinear block; here the selection domain is bounded so a
+/// flat Fisher surface cannot push a term past null-space collapse (#715/#684).
+fn effective_df_floor_rho_upper_bounds(
+    specs: &[ParameterBlockSpec],
+    layout: &PenaltyLabelLayout,
+    n_rho: usize,
+    ceiling: f64,
+) -> Array1<f64> {
+    let mut upper = Array1::<f64>::from_elem(n_rho, ceiling);
+    let mut physical = 0usize;
+    for spec in specs {
+        for penalty in &spec.penalties {
+            let outer = layout.physical_to_outer.get(physical).copied().flatten();
+            physical += 1;
+            let Some(outer) = outer else {
+                continue; // fixed penalty: not an outer coordinate.
+            };
+            let Some(gammas) = design_penalty_range_gammas(&spec.design, penalty) else {
+                continue; // un-projectable geometry: keep the uniform ceiling.
+            };
+            // Maximum attainable structural edf (ρ → −∞) is the number of
+            // design-supported penalized directions. If it cannot reach the
+            // floor even unpenalized, the floor is not enforceable for this term
+            // (a single-dimension range space with the floor at its own cap), so
+            // keep the uniform ceiling.
+            let edf_max = unit_weight_term_edf(&gammas, f64::NEG_INFINITY);
+            if !(edf_max > EFFECTIVE_DF_FLOOR) {
+                continue;
+            }
+            // Bisect for ρ* with edf(ρ*) = floor on [−ceiling, ceiling]; edf is
+            // monotone decreasing in ρ. If edf at the ceiling still exceeds the
+            // floor, the uniform ceiling already retains enough df — keep it.
+            if unit_weight_term_edf(&gammas, ceiling) >= EFFECTIVE_DF_FLOOR {
+                continue;
+            }
+            let mut lo = -ceiling;
+            let mut hi = ceiling;
+            for _ in 0..64 {
+                let mid = 0.5 * (lo + hi);
+                if unit_weight_term_edf(&gammas, mid) >= EFFECTIVE_DF_FLOOR {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            let rho_star = 0.5 * (lo + hi);
+            // Tied coordinates: take the loosest (largest) bound across terms.
+            let slot = &mut upper[outer];
+            if rho_star > -ceiling && rho_star < *slot {
+                *slot = rho_star;
+            }
+        }
+    }
+    upper
+}
+
 pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
@@ -24932,20 +25090,30 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_seed_config(family.outer_seed_config(n_rho))
         .with_initial_rho(rho0.clone())
         .with_screen_initial_rho(options.screen_initial_rho)
-        // Tighten the per-coord ρ bound from the OuterConfig default of 30
-        // to 10. λ = exp(10) ≈ 22k is already extremely strong shrinkage —
-        // any smooth whose data prefers more aggressive shrinkage is
-        // statistically indistinguishable from "shrunk to nullspace." The
-        // bound prevents the optimizer from wandering into the dead-flat
-        // region around λ = 10⁹ where ARC's quadratic model breaks down,
-        // the retry-stall detector fires on a flat surface, and downstream
-        // empty-block_states crashes surface as the cryptic "expects 3
-        // blocks, got 0" Python exception. The v0.3.31 projected-kernel
-        // fix in `runtime.rs` should make the gradient cancel correctly at
-        // large λ so the optimizer naturally converges before hitting any
-        // cap, but tightening this bound is cheap belt-and-suspenders
-        // against any path that bypasses the projected-kernel fix.
-        .with_rho_bound(10.0);
+        // Per-coordinate ρ box bounds. The uniform ceiling of 10 is the
+        // belt-and-suspenders cap: λ = exp(10) ≈ 22k is already extremely strong
+        // shrinkage, and the bound keeps the optimizer out of the dead-flat
+        // λ ≈ 10⁹ region where ARC's quadratic model breaks down, the retry-stall
+        // detector fires, and downstream empty-block_states crashes surface.
+        //
+        // ON TOP of that uniform ceiling, each penalized term's UPPER bound is
+        // tightened to the ρ at which its structural (unit-weight) effective df
+        // would fall to one — the EFFECTIVE_DF_FLOOR. Near a flat Fisher surface
+        // (multinomial simplex boundary diag(p)−ppᵀ→0, #715; Gaussian log-σ on a
+        // gently-varying scale, #684) the REML criterion loses ρ-curvature and
+        // the optimizer would otherwise let some λ_{class,term} drift past the
+        // point where the term collapses onto its unpenalized polynomial null
+        // space, over-smoothing the cubic/sigmoid/log-σ signal below the mature
+        // reference. The floor is derived from the penalty RANGE-SPACE
+        // eigenstructure (design/penalty generalized eigenvalues), not from the
+        // vanishing Fisher weight, and enters ONLY the λ-selection domain — the
+        // inner β solve at the selected ρ is unchanged and exact, so the
+        // converged β is unbiased (cf. the #747 solver-only ridge). This is the
+        // λ-upper-side dual of the #752 full-subspace logdet work.
+        .with_bounds(
+            Array1::<f64>::from_elem(n_rho, -10.0),
+            effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, 10.0),
+        );
     // Install the seed-screening cap only when initial-rho screening is
     // wanted. A caller that pins an already-identified `initial_rho` and
     // opts out (`screen_initial_rho == false`) leaves the OuterConfig
