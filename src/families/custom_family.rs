@@ -21237,6 +21237,38 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
         None => None,
     };
 
+    // EXPLICIT ∂_ρ H_Φ context (gam#854). The joint-Jeffreys curvature `H_Φ` is
+    // built from the JOINT Hessian `H_joint(β, ρ)`, so for a family whose
+    // `H_joint` depends on a ψ hyperparameter (the adaptive penalty's `λ_m`/`ε_m`,
+    // or any penalty folded into `H_joint`) it depends on ρ EXPLICITLY, not only
+    // through β̂. The augmented-LAML score `½ tr[(H+S_λ+H_Φ)⁻¹ ∂_ρ(H+S_λ+H_Φ)]` then
+    // needs the explicit term `∂_ρ_i H_Φ|_β` added to each ψ coord's drift (the
+    // mode-response part `D_β H_Φ[v_k]` is already folded in elsewhere). We form it
+    // from the SAME pieces the value path uses — the full identifiable Jeffreys span
+    // `Z_J` and the snapshot joint Hessian `H_joint(β̂)` — once per evaluation, and
+    // contract it per coord with `∂_ρ_i H_joint|_β` (the coord drift `dense_b`) and
+    // `∂_ρ_i Hdot[e_a]|_β` (the family's ψ-Hessian directional derivative). `None`
+    // unless the family uses the Jeffreys term and exposes a dense joint Hessian, so
+    // every non-Jeffreys / operator-only family is byte-unchanged.
+    let jeffreys_hphi_ctx: Option<(Array2<f64>, Array2<f64>)> = if family
+        .joint_jeffreys_term_required()
+        && derivative_blocks.iter().any(|block| !block.is_empty())
+    {
+        match (
+            build_joint_jeffreys_subspace(specs, &ranges)?,
+            family.exact_newton_joint_hessian_with_specs(synced_states, specs)?,
+        ) {
+            (Some(z), Some(h))
+                if z.nrows() == total && h.nrows() == total && h.ncols() == total =>
+            {
+                Some((z, h))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
     for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
         let (start, end) = ranges[block_idx];
         let p_block = end - start;
@@ -21307,6 +21339,38 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 dense_b
                     .slice_mut(ndarray::s![start..end, start..end])
                     .scaled_add(1.0, &s_psi_local);
+                // `dense_b` is now `∂_ρ_i H_joint|_β`. Add the explicit Jeffreys term
+                // `∂_ρ_i H_Φ|_β` (gam#854) using it as the H_joint perturbation, the
+                // family's base directional Hessian derivative `Hdot[e_a]`, and the
+                // ψ-Hessian directional derivative `∂_ρ_i Hdot[e_a]|_β`. The helper
+                // returns zeros when the conditioning gate skips the term or the
+                // family lacks the exact directional derivatives, so a clean /
+                // well-conditioned fit is byte-unchanged.
+                if let Some((z_j, h_joint)) = jeffreys_hphi_ctx.as_ref() {
+                    let explicit_hphi =
+                        crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_explicit_param_derivative(
+                            h_joint.view(),
+                            z_j.view(),
+                            &dense_b,
+                            |dir: &Array1<f64>| {
+                                family.exact_newton_joint_hessian_directional_derivative_with_specs(
+                                    synced_states,
+                                    specs,
+                                    dir,
+                                )
+                            },
+                            |dir: &Array1<f64>| {
+                                family.exact_newton_joint_psihessian_directional_derivative(
+                                    synced_states,
+                                    specs,
+                                    derivative_blocks,
+                                    psi_global,
+                                    dir,
+                                )
+                            },
+                        )?;
+                    dense_b += &explicit_hphi;
+                }
                 HyperCoordDrift::from_parts(Some(dense_b), psi_terms.hessian_psi_operator)
             };
 
