@@ -1,3 +1,49 @@
+## v0.3.107 — gam 0.3.107 / gamfit 0.1.186 (2026-06-08)
+
+Crate + wheel release. crates.io was last published at gam 0.3.105 and PyPI at
+gamfit 0.1.180; the intervening gam 0.3.106 / gamfit 0.1.185 tag failed to
+publish (its top changelog entry did not name the tag, so the publish gate
+rejected it), so this rolls up everything since — including the gamfit 0.1.185
+entry below — into one good release.
+
+Survival / monotone baseline:
+- fix(#691): monotone-baseline survival fits converge again. A value-space
+  I-spline curvature penalty (`Lᵀ S_B L`) was the principled fix for the
+  monotone tail bias, but it enlarges the penalty nullspace and the survival
+  inner PIRLS does not yet pin the likelihood-identified linear-trend direction
+  over it: the penalized Hessian stays full-rank (no near-null space to project
+  away) yet the constrained stationarity residual sticks at ‖g‖≈0.5 and the fit
+  hits MaxIterations — a hard `IntegrationFailed`. The accompanying "range(H)
+  stationarity rescue" rested on a misdiagnosis (it can never fire when H is
+  full-rank) and is removed. Restored the converging increment-space penalty;
+  the tail-bias trade-off is the documented #691 limitation, and the value-space
+  penalty remains the real fix pending survival-inner-solve work.
+
+Separation / Firth / inner solve:
+- fix(#729, #715, #826): correct the Jeffreys/Firth merit sign and fold it into
+  the coupled inner trust-region model so the baseline matches the trial and the
+  K-block converges; scale the inner KKT tolerance by Firth score magnitude.
+- perf(#729, #826, #808): O(p²) Gershgorin stabilizing shift, BLAS-3 assembly of
+  the joint-Jeffreys curvature, and a cross-cycle cache keyed on beta.
+
+Smooths / bases:
+- perf(#813): dimension-aware tensor margin `k` to stop the ∏k product blowup,
+  with a regression test.
+- fix(#784): block-local sampled correction is smooth in rho (lambda-independent
+  MC seed).
+- fix(#787, #860): freeze the matern double-penalty nullspace-shrinkage decision
+  across kappa rebuilds.
+- fix(#854): exact second directional Hessian derivative for the spatial-adaptive
+  family.
+- fix(#780): commit the cyclic basis seam module.
+
+Build / release hygiene:
+- fix(#871): gate dead-code removal on gam-pyffi cross-crate reachability;
+  restore modules the published wheel imports that looked dead to the `gam`
+  crate alone.
+- Unblock the workspace compile (stale bench/pyffi APIs), clear the rustfmt
+  drift across the tree, and drop a dead lint-flagged rebinding.
+
 ## 0.1.185
 
 - Revert matern double_penalty=false default regression (#787).
