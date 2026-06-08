@@ -1627,8 +1627,17 @@ fn factor_one_row(
     // relative to the block's diagonal scale, so a genuinely broken block
     // (non-finite, or unboundedly indefinite) still surfaces as
     // `PerRowFactorFailed` for the outer loop to handle rather than looping.
+    // Per-row ridge escalation policy. The escalation starts at the caller's
+    // base ridge (or, if that is zero, a tiny seed scaled by the block's
+    // diagonal magnitude), multiplies geometrically each rejection, and is
+    // capped at a large multiple of the base scale so a genuinely broken block
+    // surfaces as an error instead of looping forever.
+    const RIDGE_GROWTH_FACTOR: f64 = 10.0;
+    const RIDGE_SEED_DIAG_FRACTION: f64 = 1.0e-10;
+    const RIDGE_CAP_DIAG_FRACTION: f64 = 1.0e-12;
+    const RIDGE_CAP_SCALE: f64 = 1.0e12;
     let diag_scale = row_block_diag_scale(row, d);
-    let ridge_cap = ridge_t.max(1.0e-12 * diag_scale) * 1.0e12;
+    let ridge_cap = ridge_t.max(RIDGE_CAP_DIAG_FRACTION * diag_scale) * RIDGE_CAP_SCALE;
     let mut ridge_eff = ridge_t;
     // Escalate the per-row ridge until the block is BOTH positive-definite AND
     // well-conditioned. Previously the escalation only fired on a *failed*
@@ -1667,9 +1676,9 @@ fn factor_one_row(
                     break factor;
                 }
                 let next = if ridge_eff > 0.0 {
-                    ridge_eff * 10.0
+                    ridge_eff * RIDGE_GROWTH_FACTOR
                 } else {
-                    1.0e-10 * diag_scale
+                    RIDGE_SEED_DIAG_FRACTION * diag_scale
                 };
                 if !next.is_finite() || next > ridge_cap {
                     return Err(ArrowSchurError::PerRowFactorIllConditioned {
@@ -1698,9 +1707,9 @@ fn factor_one_row(
                     });
                 }
                 let next = if ridge_eff > 0.0 {
-                    ridge_eff * 10.0
+                    ridge_eff * RIDGE_GROWTH_FACTOR
                 } else {
-                    1.0e-10 * diag_scale
+                    RIDGE_SEED_DIAG_FRACTION * diag_scale
                 };
                 if !next.is_finite() || next > ridge_cap {
                     return Err(ArrowSchurError::PerRowFactorFailed {
@@ -5090,8 +5099,15 @@ fn solve_arrow_newton_step_cross_row(
     // Solve the linear Newton system to tight relative accuracy. The cross-row
     // path is exact-CG (no trust region), so we drive the residual to machine-
     // scale relative tolerance; the spectrum I + M⁻¹P_cross makes this cheap.
-    let tol = 1e-12_f64.max(1e-13 * b_norm);
-    let max_iter = (total_dt + k).max(64) * 4;
+    // Absolute floor guards b_norm → 0; relative term tracks the RHS scale.
+    const CROSS_ROW_CG_ABS_TOL: f64 = 1e-12;
+    const CROSS_ROW_CG_REL_TOL: f64 = 1e-13;
+    // CG converges in at most (dim) iterations; allow a few passes over the
+    // dimension to absorb round-off, with a small floor for tiny systems.
+    const CROSS_ROW_CG_MIN_ITER_BUDGET: usize = 64;
+    const CROSS_ROW_CG_ITER_MULTIPLE: usize = 4;
+    let tol = CROSS_ROW_CG_ABS_TOL.max(CROSS_ROW_CG_REL_TOL * b_norm);
+    let max_iter = (total_dt + k).max(CROSS_ROW_CG_MIN_ITER_BUDGET) * CROSS_ROW_CG_ITER_MULTIPLE;
 
     let mut iters = 0usize;
     let mut converged = b_norm == 0.0;
@@ -5747,6 +5763,12 @@ pub struct JacobiPreconditioner {
 /// Maximum block size for which we attempt dense block-Jacobi factorization.
 const BLOCK_JACOBI_MAX_BLOCK: usize = 256;
 
+/// Positive-definiteness floor on a Schur-complement Jacobi diagonal entry.
+/// A diagonal at or below this value (or non-finite) signals a non-PD reduced
+/// system: the preconditioner cannot invert it, so the PCG solve fails loudly
+/// and demands operator regularization rather than returning a garbage scale.
+const JACOBI_DIAGONAL_PD_FLOOR: f64 = 1e-18;
+
 impl JacobiPreconditioner {
     /// Build the block-Jacobi (or scalar fallback) preconditioner from the
     /// Arrow-Schur system without materializing the full dense Schur
@@ -5829,7 +5851,7 @@ impl JacobiPreconditioner {
         let mut blocks = Vec::with_capacity(k);
         for a in 0..k {
             let v = diag[a];
-            if !v.is_finite() || v <= 1e-18 {
+            if !v.is_finite() || v <= JACOBI_DIAGONAL_PD_FLOOR {
                 return Err(ArrowSchurError::PcgFailed {
                     reason: format!(
                         "invalid Schur Jacobi diagonal at index {a}: {v}; \
@@ -5937,7 +5959,7 @@ impl JacobiPreconditioner {
                 let mut inv = Array1::<f64>::zeros(b);
                 for bi in 0..b {
                     let v = schur_block[[bi, bi]];
-                    if !v.is_finite() || v <= 1e-18 {
+                    if !v.is_finite() || v <= JACOBI_DIAGONAL_PD_FLOOR {
                         return Err(ArrowSchurError::PcgFailed {
                             reason: format!(
                                 "block Jacobi scalar fallback: non-PD diagonal at \
@@ -6360,7 +6382,7 @@ fn build_schur_scalar_inv<B: BatchedBlockSolver>(
             }
             s -= acc;
         }
-        if !s.is_finite() || s <= 1e-18 {
+        if !s.is_finite() || s <= JACOBI_DIAGONAL_PD_FLOOR {
             return Err(ArrowSchurError::PcgFailed {
                 reason: format!(
                     "cluster Schur scalar fallback: non-PD diagonal at index {gi}: {s}"
