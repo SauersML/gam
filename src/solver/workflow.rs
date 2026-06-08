@@ -1179,7 +1179,26 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         &wiggle.wiggle.penalty_orders,
     )?;
 
-    let solved = fit_binomial_mean_wiggle_terms_with_selected_basis(
+    // A penalized, monotone-constrained link-offset spline shrinks to zero at
+    // large smoothing, so the no-wiggle pilot fit (`result`) is the *exact*
+    // large-`λ` limit of the wiggle model — the wiggle model contains the
+    // baseline as a limiting case. The wiggle refit is a coupled joint
+    // Newton solve (`BinomialMeanWiggleFamily`) on top of that pilot; on the
+    // hardest binomial regimes it can still fail to certify KKT convergence:
+    // the I-spline warp `q = η + B(η)·β_w` can drive the linear predictor
+    // toward link saturation, where the per-cycle data curvature collapses
+    // and the joint trust region shrinks faster than the active-set QP can
+    // pin the binding monotonicity rows (gam#872). Aborting the entire fit
+    // there is wrong: a model that *contains* a fittable baseline must never
+    // be less fittable than that baseline. Fall back to the pilot — a valid,
+    // finite-deviance fit no worse than the wiggle model's own limit — rather
+    // than surfacing an `IntegrationError` to the caller. (The separate
+    // divergence failure mode, where the unconditional Jeffreys/Firth
+    // augmentation blew the augmented objective up to ~1e9 on this path, is
+    // fixed at the root by `BinomialMeanWiggleFamily::joint_jeffreys_term_required
+    // = false`; this fallback only catches the residual trust-region/active-set
+    // non-convergence.)
+    let solved = match fit_binomial_mean_wiggle_terms_with_selected_basis(
         request.data.view(),
         &result.resolvedspec,
         &result.design,
@@ -1190,7 +1209,17 @@ fn fit_standard_model(request: StandardFitRequest<'_>) -> Result<StandardFitResu
         selected_wiggle_basis,
         &wiggle_options,
         &request.kappa_options,
-    )?;
+    ) {
+        Ok(solved) => solved,
+        Err(e) => {
+            log::warn!(
+                "[linkwiggle] binomial mean link-wiggle joint solve did not converge ({e}); \
+                 falling back to the no-wiggle baseline fit (the large-smoothing limit of the \
+                 penalized wiggle model, which contains it as a limiting case)"
+            );
+            return Ok(result);
+        }
+    };
 
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,
