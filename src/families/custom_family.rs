@@ -16258,8 +16258,31 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // panic on a fully resolved fit.
                 if last_cycle_residual_below_tol && last_cycle_obj_change_below_tol {
                     converged = true;
+                    break;
                 }
-                break; // Fall back to blockwise
+                // CONTINUE rather than break (gam#826/#872/#715). The comment
+                // above documents the intent — "retry the joint Newton loop from
+                // the same state after a failed trust-region search" — but the old
+                // code BROKE instead, giving up after a SINGLE cycle of failed line
+                // search. On a severely near-separating coupled fit (matern
+                // binomial location-scale, quasi-separating multinomial, flexible
+                // linkwiggle) the cycle-0 Newton proposal is huge (the separation
+                // gradient ÷ the Firth-bounded curvature), the trust region clamps
+                // it, and the clamped step does not yet reduce the merit — so the
+                // FIRST cycle's backtracking exhausts without acceptance. The
+                // attempt loop already shrank `joint_trust_radius` /
+                // `joint_block_trust_radii` (carried across cycles), so the NEXT
+                // cycle re-proposes under the tighter radius and eventually accepts
+                // a productive step — standard trust-region globalization. Breaking
+                // at cycle 0 aborted the coupled solve ("exited the joint Newton
+                // path before convergence — no math snapshot") before the trust
+                // region could adapt. The inner cycle cap and the residual-stall /
+                // trust-region-floor guards above still bound the loop, so a
+                // genuinely stuck fit exits with a diagnosed non-convergence rather
+                // than spinning. Falling through to blockwise (the old `break`)
+                // would switch the coupled exact-Hessian problem onto a
+                // principal-block surrogate (the ridge-drift mode this path avoids).
+                continue;
             }
 
             let grad_reload_started = std::time::Instant::now();
