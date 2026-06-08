@@ -3636,8 +3636,11 @@ impl<'a> RemlState<'a> {
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
         // Keep expensive diagnostics out of the hot path unless they can
         // be surfaced. This has zero effect on optimization math.
+        // Emit on the first eval and then once every this-many evals so a long
+        // outer optimization leaves a periodic trace without flooding the log.
+        const HOT_DIAGNOSTIC_EVAL_INTERVAL: u64 = 200;
         (log::log_enabled!(log::Level::Info) || log::log_enabled!(log::Level::Warn))
-            && (eval_idx == 1 || eval_idx.is_multiple_of(200))
+            && (eval_idx == 1 || eval_idx.is_multiple_of(HOT_DIAGNOSTIC_EVAL_INTERVAL))
     }
 
     fn invalidate_link_dependent_state(&self) {
