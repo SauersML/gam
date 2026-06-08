@@ -16251,12 +16251,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(cached_active_sets.as_slice()),
             )?;
             prev_kkt_norm = Some(residual);
-            {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                    writeln!(f, "[DIAG-CYC] cycle={cycle} residual={residual:.4e} step_inf={step_inf:.4e} accepted_step_inf={accepted_step_inf:.4e} model_rejects={model_rejects} tr={joint_trust_radius:.3e}").ok();
-                }
-            }
             // Record this cycle's KKT residual for the steady-geometric-descent
             // test at the certificate-refusal gate below (gam#787 centers≥20).
             if residual.is_finite() {
@@ -16322,7 +16316,24 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             }
             let grad_inf = block_gradient_norms.iter().copied().fold(0.0_f64, f64::max);
             let pen_inf = block_penalty_norms.iter().copied().fold(0.0_f64, f64::max);
-            let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf));
+            // Firth/Jeffreys score magnitude. The convergence residual is the
+            // AUGMENTED stationarity `∇L − Sβ + ∇Φ`, so `∇Φ` is a first-class term
+            // whose own numerical scale sets the achievable KKT floor: `∇Φ` is a
+            // trace `½ tr(H_id⁻¹ Z_Jᵀ Ḣ Z_J)` formed from a FLOORED reduced-info
+            // pseudo-inverse, so its components carry O(‖∇Φ‖·ε_floor) round-off
+            // that the augmented residual cannot polish below. Scaling the KKT
+            // tolerance by `max(grad, pen, ‖∇Φ‖)` (not just grad/pen) makes the
+            // certificate reachable for coupled K-block Firth fits whose data
+            // gradient is small but whose Firth score is O(1): otherwise the
+            // augmented residual plateaus a few × above an unattainably tight
+            // `inner_tol·(1+grad)` tol and the solve refuses just short of
+            // convergence (gam#729/#715 — the residual stalled at ~8.8e-6 against a
+            // ~1e-6 tol). No-op when the term is condition-gated (∇Φ=0).
+            let firth_score_inf = head_jeffreys_term
+                .as_ref()
+                .map(|(grad_phi, _hphi)| grad_phi.iter().map(|v| v.abs()).fold(0.0_f64, f64::max))
+                .unwrap_or(0.0);
+            let residual_tol = inner_tol * (1.0 + grad_inf.max(pen_inf).max(firth_score_inf));
             let block_stationarity_tolerances = block_gradient_norms
                 .iter()
                 .zip(&block_penalty_norms)
@@ -17203,12 +17214,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 log::info!("{verdict}");
             } else {
                 log::warn!("{verdict}");
-            }
-            {
-                use std::io::Write as _;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                    writeln!(f, "[DIAG-INNER] converged={converged} terminator={terminator} cycles={cycles_done}/{inner_max_cycles} best_resid={best_residual_seen:.3e} last_resid_below_tol={last_cycle_residual_below_tol} p={total_p}").ok();
-                }
             }
         }
 
@@ -25673,24 +25678,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     outer_result.iterations,
                     outer_result.final_grad_norm_report(),
                 );
-                {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/gam_diag.log")
-                    {
-                        writeln!(
-                            f,
-                            "[DIAG-OUTER] converged=false plan={} iters={} |g|={} rho={:?}",
-                            outer_result.plan_used,
-                            outer_result.iterations,
-                            outer_result.final_grad_norm_report(),
-                            outer_result.rho.as_slice(),
-                        )
-                        .ok();
-                    }
-                }
             }
             (
                 outer_result.rho,
@@ -25950,21 +25937,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     }
     let rho_star_physical = expand_labeled_log_lambdas(&rho_star, &label_layout)?;
     let outer_converged = !nonconvergence_escalation;
-    {
-        use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/gam_diag.log")
-        {
-            writeln!(
-                f,
-                "[DIAG-FINAL] outer_converged={outer_converged} nonconv_escalation={nonconvergence_escalation} outer_iters={outer_iters} |g|={outer_grad_norm:?} rho_star={:?}",
-                rho_star.as_slice()
-            )
-            .ok();
-        }
-    }
     assemble_custom_family_fit_result(
         inner,
         BlockwiseFitAssembly {
