@@ -1779,7 +1779,66 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let near_stationary = summary
             .state
             .near_stationary_kkt(summary.lastgradient_norm, effective_kkt_tolerance(&options));
-        progress_stopped && near_stationary
+        if progress_stopped && near_stationary {
+            return true;
+        }
+        // #752 principle on the inner solve (gam#691). When a penalty leaves a
+        // likelihood-WEAKLY-identified direction unpenalized — the value-space
+        // I-spline curvature `Lᵀ S_B L` puts a linear log-cumulative-hazard in
+        // `ker(Sλ)`, and the steep upper-tail data identify it only weakly — the
+        // penalized Hessian `H = XᵀWX + Sλ` is near-singular along that direction.
+        // The objective is then genuinely FLAT there (deviance change at machine
+        // precision), but the raw penalized-gradient KKT residual retains O(0.5)
+        // mass in that near-null direction, so the absolute/relative
+        // `near_stationary_kkt` band refuses and the fit hits MaxIterations even
+        // though it sits at the constrained penalized optimum.
+        //
+        // The honest certificate is stationarity over `range(H)` — the
+        // identifiable subspace. Project the (active-constraint-aware) gradient
+        // onto the range of the penalized Hessian, dropping only its numerical
+        // near-null space (the flat directions the data + penalty cannot resolve,
+        // exactly the directions the objective is flat in). If progress has
+        // stopped AND that range-projected residual is in the near-stationary band,
+        // the iterate is a valid minimum of the identifiable problem. This neither
+        // weakens the well-posed case (full-rank H ⇒ the projection is identity ⇒
+        // byte-identical to the test above) nor accepts a true non-optimum (a
+        // residual component in `range(H)` survives the projection and still
+        // refuses). Runs once, at the post-loop stall check, only when the cheap
+        // tests above already declined.
+        if !progress_stopped {
+            return false;
+        }
+        let Some(h_dense) = summary.state.hessian.as_dense() else {
+            return false;
+        };
+        let range_resid = match crate::faer_ndarray::FaerEigh::eigh(h_dense, faer::Side::Lower) {
+            Ok((evals, evecs)) => {
+                let max_ev = evals
+                    .iter()
+                    .copied()
+                    .fold(0.0_f64, |a, b| a.max(b.abs()))
+                    .max(1.0);
+                // Numerical range threshold: eigen-directions at/below this are
+                // indistinguishable from flat given the matrix's working precision.
+                let p = h_dense.nrows();
+                let threshold = 100.0 * (p as f64) * f64::EPSILON * max_ev;
+                let g = &summary.state.gradient;
+                // ‖P_range g‖₂ where P_range projects onto eigenvectors with
+                // eigenvalue > threshold: g_range = Σ_{λ>thr} u_k (u_kᵀ g).
+                let mut acc = 0.0_f64;
+                for (k, &lam) in evals.iter().enumerate() {
+                    if lam > threshold {
+                        let comp = evecs.column(k).dot(g);
+                        acc += comp * comp;
+                    }
+                }
+                acc.sqrt()
+            }
+            Err(_) => return false,
+        };
+        summary
+            .state
+            .near_stationary_kkt(range_resid, effective_kkt_tolerance(&options))
     };
 
     let mut status = working_summary.status;
