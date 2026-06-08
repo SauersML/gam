@@ -10922,7 +10922,27 @@ struct UnifiedOuterHessianOperator {
 }
 
 impl UnifiedOuterHessianOperator {
-    fn signed_mode_combo_for_correction(&self, alpha: &Array1<f64>) -> Array1<f64> {
+    /// Exact implicit-function-theorem mode response of the inner coefficient
+    /// solution along a θ-direction `α = (α_ρ, α_ψ)` (#740 primitive).
+    ///
+    /// At the inner optimum `g(β̂(θ), θ) = ∇_β F = 0`, differentiating gives
+    /// `β̇_j = −H⁻¹ ∂g/∂θ_j` for each coordinate j; the response along a θ
+    /// direction is the linear combination `β̇(α) = Σ_j α_j β̇_j`. Each
+    /// per-coordinate `coord.v = H⁻¹ a_j` is precomputed exactly via the shared
+    /// inner mode inverse `hop.solve_multi` (see `build_outer_hessian_operator`),
+    /// so this combination is the EXACT directional `β̇(α)` with no
+    /// finite-difference or low-rank approximation — the same object the profiled
+    /// θ-HVP needs as `β̇ = −H⁻¹ ∂g/∂θ·v`. Extended (ψ) coordinates carry the
+    /// opposite drift sign, matching the `b_depends_on_beta` convention.
+    ///
+    /// This is the reusable matrix-free primitive an O(K)-build θ-HVP matvec is
+    /// organized around (one IFT solve per applied direction instead of the K²
+    /// coordinate-pair assembly). The current `matvec` still consumes the
+    /// precomputed pair traces; this primitive is the exact directional β̇ those
+    /// pair traces are a (K²-amortized) re-expression of, exposed so the
+    /// pair-assembly precompute can be replaced incrementally without changing
+    /// the IFT mathematics.
+    pub(crate) fn theta_direction_mode_response(&self, alpha: &Array1<f64>) -> Array1<f64> {
         let mut out = Array1::<f64>::zeros(self.hop.dim());
         for (j, coord) in self.coords.iter().enumerate() {
             if alpha[j] == 0.0 {
@@ -11154,7 +11174,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                 a_alpha += alpha[idx] * coord.a;
             }
         }
-        let correction_m_alpha = self.signed_mode_combo_for_correction(alpha);
+        let correction_m_alpha = self.theta_direction_mode_response(alpha);
         let callback_neg_m_alpha =
             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
                 .then(|| -&correction_m_alpha);
@@ -11213,7 +11233,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                 a_alpha += alpha[idx] * coord.a;
             }
         }
-        let correction_m_alpha = self.signed_mode_combo_for_correction(alpha);
+        let correction_m_alpha = self.theta_direction_mode_response(alpha);
         let callback_neg_m_alpha =
             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
                 .then(|| -&correction_m_alpha);
