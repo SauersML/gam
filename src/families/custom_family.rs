@@ -15719,13 +15719,27 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // value/step consistency the term exists to enforce) and avoids the
                 // dense H/eigh at the trial point. The 8× conditioning margin makes
                 // a single damped Newton step incapable of crossing the gate.
-                if !jeffreys_skippable_this_cycle
-                    && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
-                {
-                    // SUBTRACT Φ: the inner NLL objective is `−ℓ + ½βᵀSβ − Φ`
-                    // (Firth adds ½log|I| to the log-likelihood). Must match the
-                    // baseline (`current_penalty -= phi0`), the Newton step, and
-                    // the KKT residual (gam#729/#715 sign fix).
+                // SUBTRACT Φ: the inner NLL objective is `−ℓ + ½βᵀSβ − Φ` (Firth
+                // adds ½log|I| to the log-likelihood). Must match the cycle-0
+                // baseline (`current_penalty -= phi0`), the Newton step, and the
+                // KKT residual (gam#729/#715 sign fix).
+                //
+                // CRITICAL (gam#826/#715): fold the VALUE Φ UNCONDITIONALLY — do
+                // NOT gate it on `jeffreys_skippable_this_cycle`. The cycle-0
+                // baseline subtracts `phi0` whenever the subspace exists (it is not
+                // gated on skippability), so gating the TRIAL value on skippable
+                // made the accept/reject objective inconsistent with its own
+                // baseline: on a well-conditioned cycle (skippable=true) the trial
+                // dropped Φ while `old_objective` still carried `−phi0`, so a
+                // ZERO-step trial reported a spurious `Δobj = ±Φ` (observed: a 0
+                // step with Δobj ≈ −20.8 = the firth value), the line search
+                // rejected every backtrack, and the coupled inner solve exited
+                // 'before convergence'. The value Φ is CHEAP (one reduced-info
+                // eigendecomposition via `custom_family_joint_jeffreys_value`, no
+                // per-axis directional-derivative loop), so `jeffreys_skippable`
+                // must gate ONLY the expensive gradient/curvature term, never this
+                // merit value.
+                if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
                     trial_penalty -= custom_family_joint_jeffreys_value(
                         family, &states, specs, &ranges, z_joint,
                     );
@@ -15950,13 +15964,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     trial_step_inf,
                     step_inf,
                 );
-                if cycle <= 2 {
-                    use std::io::Write as _;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
-                        writeln!(f, "[DIAG-TR] cyc={cycle} att={line_search_attempts} {tr_attempt_sig} firth_score={:.3e}",
-                            head_jeffreys_term.as_ref().map(|(g,_)| g.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)).unwrap_or(0.0)).ok();
-                    }
-                }
                 match tr_log_sig.as_deref() {
                     Some(prev) if prev == tr_attempt_sig.as_str() => {
                         tr_log_last = line_search_attempts;
@@ -16179,15 +16186,18 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 Some(specs),
             );
             // Re-fold the Jeffreys objective at the accepted iterate so the
-            // post-accept baseline matches the augmented objective the next
-            // cycle's trial points are compared against. No-op when the
-            // Jeffreys term is unavailable or condition-gated to zero, or when the
-            // cheap pre-check certified this cycle well-conditioned (Φ=0, matching
-            // the H_Φ=0 the step used — keeps the baseline on the same objective).
-            if !jeffreys_skippable_this_cycle
-                && let Some(z_joint) = joint_jeffreys_subspace.as_ref()
-            {
-                current_penalty +=
+            // post-accept baseline (`lastobjective`, the next cycle's
+            // `old_objective`) matches the augmented objective the trial points are
+            // compared against. SUBTRACT Φ (objective is `−ℓ + ½βᵀSβ − Φ`) and do
+            // so UNCONDITIONALLY — exactly mirroring the trial-penalty fold above
+            // and the cycle-0 baseline. Gating this on `jeffreys_skippable` or
+            // adding it (the previous code did both) desynced the post-accept
+            // baseline from the trial objective by ±Φ, so the next cycle's
+            // accept/reject saw a spurious Δobj of order Φ on a zero/small step and
+            // refused every backtrack (gam#826/#715). No-op when the term is
+            // unavailable (∇Φ subspace empty).
+            if let Some(z_joint) = joint_jeffreys_subspace.as_ref() {
+                current_penalty -=
                     custom_family_joint_jeffreys_value(family, &states, specs, &ranges, z_joint);
             }
             lastobjective = -current_log_likelihood + current_penalty;
