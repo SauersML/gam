@@ -18,6 +18,7 @@ pub mod protocol;
 pub(crate) mod riemannian_retraction;
 pub mod row_measure;
 pub mod seeding;
+pub mod sindy;
 pub(crate) mod startup_stats;
 pub mod topology_selector;
 pub mod visualizer;
