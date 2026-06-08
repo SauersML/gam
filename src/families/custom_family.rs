@@ -15378,6 +15378,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // single trial objective is accepted only when the actual decrease
             // is positive relative to the local quadratic model.
             let step_inf = delta.iter().copied().map(f64::abs).fold(0.0_f64, f64::max);
+            {
+                use std::io::Write as _;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/gam_diag.log") {
+                    let gj = grad_joint.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+                    let hjt = head_jeffreys_term.as_ref().map(|(g,_)| g.iter().map(|v| v.abs()).fold(0.0_f64,f64::max));
+                    writeln!(f, "[DIAG826] cyc={cycle} skip={jeffreys_skippable_this_cycle} current_kkt={current_kkt_norm:.4e} step_inf={step_inf:.4e} grad_joint_inf={gj:.4e} head_firth={hjt:?} nullity={joint_step_spectral_nullity}").ok();
+                }
+            }
 
             let old_beta: Vec<Array1<f64>> = states.iter().map(|s| s.beta.clone()).collect();
             // Firth value Φ at the OLD (start-of-cycle) β, folded under the SAME
