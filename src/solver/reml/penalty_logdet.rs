@@ -1110,6 +1110,63 @@ mod tests {
         assert!(det2[[0, 1]].abs() < 1e-12);
     }
 
+    /// Value↔ρ-gradient consistency across the ridge boundary
+    /// (gam#752/#748/#808 desync guard).
+    ///
+    /// The outer REML/LAML objective uses `value()` for the `log|S_λ|₊` term
+    /// and `rho_derivatives()` for its ρ-gradient. The two MUST be the exact
+    /// value/derivative of the SAME function — in particular, both must classify
+    /// the positive/null eigenspace identically. A previous custom-family value
+    /// path dropped the bottom eigenvalues *by structural count* while the
+    /// gradient dropped them *by magnitude* (> ridge + noise_band); near the
+    /// ridge a barely-active penalized mode `λσ → 0` was kept by one rule and
+    /// dropped by the other, so the value and gradient described different
+    /// functions. Sweep ρ through the regime where a penalized eigenvalue
+    /// crosses from well above the ridge to deep below it, and confirm a
+    /// central finite difference of `value()` matches `rho_derivatives()`.
+    #[test]
+    fn test_value_matches_rho_gradient_across_ridge_boundary() {
+        // S(ρ) = e^{ρ0} S0 + e^{ρ1} S1, with S0 large and S1 a tiny mode that
+        // dives toward (and below) the ridge as ρ1 decreases.
+        let s0 = array![[1.0, 0.0], [0.0, 0.0]];
+        let s1 = array![[0.0, 0.0], [0.0, 1.0]];
+        let ridge = 1e-8_f64;
+
+        let value_at = |rho: [f64; 2]| -> f64 {
+            let lambdas = [rho[0].exp(), rho[1].exp()];
+            PenaltyPseudologdet::from_components(&[s0.clone(), s1.clone()], &lambdas, ridge)
+                .unwrap()
+                .value()
+        };
+
+        // Sweep ρ1 from "mode well above ridge" to "mode well below ridge".
+        // At each interior point the central FD of value() in ρ1 must equal the
+        // analytic ∂_{ρ1} value from rho_derivatives(), regardless of whether the
+        // classifier currently counts the S1 mode as positive or null — because
+        // value() and rho_derivatives() share the classifier.
+        for &rho1 in &[5.0_f64, 1.0, -2.0, -8.0, -12.0, -20.0] {
+            let rho = [0.5_f64, rho1];
+            let lambdas = [rho[0].exp(), rho[1].exp()];
+            let pld =
+                PenaltyPseudologdet::from_components(&[s0.clone(), s1.clone()], &lambdas, ridge)
+                    .unwrap();
+            let (det1, _) = pld.rho_derivatives(&[s0.clone(), s1.clone()], &lambdas);
+
+            let h = 1e-5_f64;
+            let fd1 = (value_at([rho[0], rho1 + h]) - value_at([rho[0], rho1 - h])) / (2.0 * h);
+
+            // Loose bound: the classifier boundary makes the gradient exactly
+            // 0 in the "null" regime and exactly λσ/(λσ+ridge) in the active
+            // regime; the FD of value() tracks whichever branch is active,
+            // so they agree to FD truncation error.
+            assert!(
+                (det1[1] - fd1).abs() < 1e-5,
+                "ρ1={rho1}: analytic ∂_ρ1 value={}, FD of value()={fd1}",
+                det1[1]
+            );
+        }
+    }
+
     #[test]
     fn test_components_with_stale_nullity_uses_active_sum_when_lambda_zero() {
         let s1 = array![[4.0, 0.0], [0.0, 0.0]];
