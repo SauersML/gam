@@ -168,39 +168,69 @@ fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     best
 }
 
-fn max_abs_eta_location_from_block_states(
-    block_states: &[ParameterBlockState],
-) -> (f64, usize, usize) {
-    let mut best = (0.0_f64, 0usize, 0usize);
-    for (active_class, state) in block_states.iter().enumerate() {
-        for (row, &value) in state.eta.iter().enumerate() {
-            let abs = value.abs();
-            if abs > best.0 {
-                best = (abs, row, active_class);
-            }
-        }
-    }
-    best
-}
-
+/// Separation gate for the REML/LAML **formula** path.
+///
+/// Unlike the bare fixed-λ driver [`fit_penalized_multinomial`] (which has no
+/// proper prior and so must reject a saturated, non-converged iterate as a
+/// separation artifact at the [`MULTINOMIAL_SEPARATION_ETA_THRESHOLD`] logit
+/// magnitude), the formula path routes through
+/// [`fit_custom_family_with_rho_prior`] and therefore carries the UNIVERSAL,
+/// always-on full-span Jeffreys/Firth proper prior
+/// `Φ = ½ log|Z_Jᵀ H Z_J|` (see the [`MULTINOMIAL_FORMULA_RIDGE_FLOOR`] doc).
+/// That term supplies the missing `O(1)`-bounding curvature on any genuinely
+/// separating direction, so a separating multinomial formula fit converges to
+/// **finite, Firth-reduced** coefficients — even when those coefficients are
+/// *large* because the categories genuinely separate (the penguins
+/// `species ~ s(bill) + s(flipper) + body_mass` regime, #715 real-data arm:
+/// bill/flipper cleanly separate the species, so the truth-recovering logits
+/// legitimately exceed `±25`).
+///
+/// Two facts make a `|η| ≥ 25 ∧ ¬outer_converged` gate WRONG on this path:
+///   1. The Firth/Firth-Jeffreys term has already bias-reduced the optimum, so
+///      a large finite `η` is the *correct* recovered surface, not an artifact.
+///   2. `outer_converged == false` is not a failure signal here: when the outer
+///      LAML landscape is non-smooth near the simplex boundary (the saturated
+///      `diag(p)−ppᵀ→0` ill-conditioning that
+///      [`MultinomialFamily::levenberg_on_ill_conditioning`] damps), the driver
+///      legitimately AUTO-ESCALATES to never-fail posterior sampling about the
+///      best mode (custom_family.rs gam#860) and returns `converged = false`
+///      with a perfectly usable Firth-bounded mode. The earlier `|η| ≥ 25`
+///      gate then mis-rejected that valid escalated penguins fit as
+///      `MultinomialSeparationDetected` — the adapter-level face of the issue's
+///      "all REML startup seeds rejected".
+///
+/// The Firth/Jeffreys prior cannot, however, repair a genuinely NON-FINITE
+/// `η` (a NaN/Inf blow-up in the inner linear algebra): there is no finite mode
+/// to sample about and the softmax is poisoned. THAT — and only that — is a
+/// real fit failure on the formula path, so it is the sole condition that
+/// raises here. A finite (even saturated) `η` is accepted; the converged β is
+/// the Firth-reduced optimum and the truth-recovery / match-or-beat bars are
+/// evaluated against it.
 fn multinomial_formula_separation_diagnostic(
-    outer_converged: bool,
     inner_cycles: usize,
     outer_iterations: usize,
     block_states: &[ParameterBlockState],
 ) -> Option<EstimationError> {
-    let (max_abs_eta, row_index, active_class_index) =
-        max_abs_eta_location_from_block_states(block_states);
-    if !outer_converged && max_abs_eta >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
-        Some(EstimationError::MultinomialSeparationDetected {
+    let mut nonfinite: Option<(f64, usize, usize)> = None;
+    for (active_class, state) in block_states.iter().enumerate() {
+        for (row, &value) in state.eta.iter().enumerate() {
+            if !value.is_finite() {
+                nonfinite = Some((value, row, active_class));
+                break;
+            }
+        }
+        if nonfinite.is_some() {
+            break;
+        }
+    }
+    nonfinite.map(|(value, row_index, active_class_index)| {
+        EstimationError::MultinomialSeparationDetected {
             iteration: inner_cycles.max(outer_iterations),
-            max_abs_eta,
+            max_abs_eta: value.abs(),
             active_class_index,
             row_index,
-        })
-    } else {
-        None
-    }
+        }
+    })
 }
 
 /// Inputs to [`fit_penalized_multinomial`].
@@ -782,7 +812,6 @@ pub fn fit_penalized_multinomial_formula(
         fit_custom_family_with_rho_prior(&family, &blocks, &options, crate::types::RhoPrior::Flat)
             .map_err(|err| EstimationError::InvalidInput(format!("multinomial REML: {err}")))?;
     if let Some(err) = multinomial_formula_separation_diagnostic(
-        fit.outer_converged,
         fit.inner_cycles,
         fit.outer_iterations,
         &fit.block_states,
@@ -1042,8 +1071,16 @@ mod fisher_override_tests {
     }
 
     #[test]
-    fn formula_multinomial_reports_saturated_nonconvergence_as_separation() {
-        let block_states = vec![
+    fn formula_multinomial_accepts_finite_saturated_logits_as_firth_bounded() {
+        // The formula REML path carries the always-on Jeffreys/Firth proper
+        // prior, so a saturated-but-FINITE logit surface is the recovered
+        // Firth-reduced optimum (the #715 penguins regime: bill/flipper cleanly
+        // separate the species, so the truth-recovering logits legitimately
+        // exceed ±25). `outer_converged == false` then signals only that the
+        // driver auto-escalated to never-fail posterior sampling about that
+        // finite mode (gam#860), NOT a separation artifact — the adapter must
+        // accept it, never raise `MultinomialSeparationDetected`.
+        let saturated_states = vec![
             ParameterBlockState {
                 beta: Array1::from_vec(vec![1.0, 2.0]),
                 eta: Array1::from_vec(vec![0.2, 4.0, -7.0]),
@@ -1053,9 +1090,27 @@ mod fisher_override_tests {
                 eta: Array1::from_vec(vec![1.0, 25.5, -0.1]),
             },
         ];
+        assert!(
+            multinomial_formula_separation_diagnostic(17, 9, &saturated_states).is_none(),
+            "a finite (even saturated, |eta|>25) Firth-bounded formula optimum is a valid fit, \
+             not a separation diagnostic"
+        );
 
-        let err = multinomial_formula_separation_diagnostic(false, 17, 9, &block_states)
-            .expect("nonconverged formula fit at saturated logits must be diagnostic");
+        // Only a genuinely NON-FINITE logit — a NaN/Inf blow-up in the inner
+        // linear algebra, which the Firth prior cannot repair because there is
+        // no finite mode to sample about — is a real formula-path failure.
+        let blown_up = vec![
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![1.0, 2.0]),
+                eta: Array1::from_vec(vec![0.2, 4.0, -7.0]),
+            },
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![-1.0, 3.0]),
+                eta: Array1::from_vec(vec![1.0, f64::INFINITY, -0.1]),
+            },
+        ];
+        let err = multinomial_formula_separation_diagnostic(17, 9, &blown_up)
+            .expect("a non-finite formula logit must raise the separation diagnostic");
         assert!(
             matches!(
                 err,
@@ -1064,23 +1119,9 @@ mod fisher_override_tests {
                     max_abs_eta,
                     active_class_index: 1,
                     row_index: 1,
-                } if (max_abs_eta - 25.5).abs() <= f64::EPSILON
+                } if !max_abs_eta.is_finite()
             ),
-            "expected typed multinomial separation diagnostic with final max|eta| and channel location, got {err:?}"
-        );
-
-        assert!(
-            multinomial_formula_separation_diagnostic(true, 17, 9, &block_states).is_none(),
-            "a converged robust/Firth formula fit is a finite fit, not a separation diagnostic"
-        );
-
-        let finite_states = vec![ParameterBlockState {
-            beta: Array1::from_vec(vec![0.0]),
-            eta: Array1::from_vec(vec![24.9]),
-        }];
-        assert!(
-            multinomial_formula_separation_diagnostic(false, 3, 11, &finite_states).is_none(),
-            "nonconvergence below the saturation threshold should remain a convergence failure"
+            "expected typed multinomial separation diagnostic at the non-finite channel, got {err:?}"
         );
     }
 
