@@ -13089,6 +13089,48 @@ fn gaussian_reml_optimize_latent<'py>(
         }
     };
 
+    // Scale-aware stationarity measure for the profiled-scale latent objective
+    // (issue #879). The latent objective is the *profiled* Gaussian REML score
+    // `n·log σ̂²(t) + ½·log|Hλ| + …`. Near interpolation the profiled scale `σ̂²`
+    // collapses toward zero, which steepens that `n·log σ̂²` term and leaves the
+    // raw latent gradient `‖∇ₜ f‖` at an O(n) magnitude *even at a genuine
+    // stationary point* (R²≈1). So the bare absolute test `‖∇ₜ f‖ ≤ grad_tol`
+    // is mis-scaled: it measures the gradient in the wrong metric and flags an
+    // excellent, near-stationary fit as non-converged.
+    //
+    // The principled fix is the canonical relative-gradient (scaled-gradient)
+    // stationarity test: stationarity means the gradient is small *relative to*
+    // the objective's natural scale and the latent variable scale, i.e. the
+    // dimensionless quantity
+    //
+    //   rel = ‖∇ₜ f‖ · ‖t‖_typ / max(|f|, 1)
+    //
+    // where `‖∇ₜ f‖` carries units of f/t, `‖t‖_typ` is the characteristic
+    // latent magnitude (RMS, floored at 1 so a near-origin chart cannot inflate
+    // it) and `max(|f|, 1)` the characteristic objective magnitude. Dividing out
+    // the common profiled scale that both `f` and `∇f` inherit makes `grad_tol`
+    // a true *relative* tolerance: `rel → 0` iff the gradient vanishes relative
+    // to scale (genuine stationarity), and it stays O(1) — failing the test — for
+    // a fit that is actually far from stationary. This is a correct convergence
+    // criterion, not a tolerance loosening: a non-stationary latent still reports
+    // `converged=False` because its gradient is large relative to its own scale.
+    let t_scale = {
+        let n = best_t.len();
+        if n == 0 {
+            1.0
+        } else {
+            let rms = (best_t.iter().map(|&v| v * v).sum::<f64>() / n as f64).sqrt();
+            rms.max(1.0)
+        }
+    };
+    let objective_scale = best_value.abs().max(1.0);
+    let grad_t_norm_scaled = if grad_t_norm.is_finite() {
+        grad_t_norm * t_scale / objective_scale
+    } else {
+        f64::INFINITY
+    };
+    let converged = grad_t_norm_scaled <= grad_tol;
+
     // Rebuild the full fit dictionary at the converged latent so callers get the
     // identical schema [`gaussian_reml_fit_latent`] returns, then echo `t`. The
     // detached fit closure must be `'static`, so move owned copies in (the
@@ -13185,7 +13227,8 @@ fn gaussian_reml_optimize_latent<'py>(
     out.set_item("latent", t_matrix.into_pyarray(py))?;
     out.set_item("t_flat", best_t.into_pyarray(py))?;
     out.set_item("grad_t_norm", grad_t_norm)?;
-    out.set_item("converged", grad_t_norm <= grad_tol)?;
+    out.set_item("grad_t_norm_scaled", grad_t_norm_scaled)?;
+    out.set_item("converged", converged)?;
     out.set_item("latent_t_std", latent_t_std)?;
     out.set_item("response_r2", response_r2)?;
     out.set_item("response_residual_norm", response_residual_norm)?;

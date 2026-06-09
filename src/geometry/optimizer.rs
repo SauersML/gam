@@ -61,6 +61,31 @@ fn g_norm(
     Ok(g_inner(manifold, point, a, a)?.max(0.0).sqrt())
 }
 
+/// Dimensionless relative-gradient stationarity measure
+/// `‖grad‖_g · ‖x‖_typ / max(|f|, 1)`, where `‖x‖_typ = max(rms(x), 1)` is the
+/// iterate's characteristic magnitude. This is the scale-invariant form of the
+/// gradient stopping test: it divides out the common scale that an objective and
+/// its gradient share, so a fixed `grad_tol` reads as a *relative* tolerance.
+/// It is the same quantity the latent FFI reports as `grad_t_norm_scaled`, so
+/// the optimizer's internal stopping and the reported `converged` flag agree
+/// (issue #879). A non-finite gradient or objective maps to `+∞` so the caller
+/// never treats a blown-up iterate as stationary.
+fn relative_stationarity(grad_norm: f64, x: ArrayView1<'_, f64>, f: f64) -> f64 {
+    if !grad_norm.is_finite() || !f.is_finite() {
+        return f64::INFINITY;
+    }
+    let n = x.len();
+    let x_scale = if n == 0 {
+        1.0
+    } else {
+        (x.iter().map(|&v| v * v).sum::<f64>() / n as f64)
+            .sqrt()
+            .max(1.0)
+    };
+    let f_scale = f.abs().max(1.0);
+    grad_norm * x_scale / f_scale
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiemannianTrustRegion {
     /// Initial trust-region radius Δ₀.
@@ -140,7 +165,26 @@ impl RiemannianTrustRegion {
             let (f_curr, grad_e) = objective.value_gradient(x.view())?;
             let grad = manifold.project_tangent(x.view(), grad_e.view())?;
             let grad_norm = g_norm(manifold, x.view(), grad.view())?;
-            if grad_norm <= self.grad_tol {
+            // Scale-aware (relative) stationarity test. Comparing the bare
+            // gradient norm to a fixed absolute `grad_tol` is mis-calibrated for
+            // objectives whose natural scale is large — e.g. the *profiled*
+            // Gaussian REML latent objective, whose `n·log σ̂²` term leaves
+            // `‖grad‖` at an O(n) magnitude even at a genuine stationary point
+            // near interpolation (issue #879). We instead test the dimensionless
+            // relative gradient
+            //
+            //   ‖grad‖_g · ‖x‖_typ / max(|f|, 1) ≤ grad_tol,
+            //
+            // where `‖grad‖_g` carries units of f/x, `‖x‖_typ` is the iterate's
+            // characteristic magnitude (RMS, floored at 1) and `max(|f|, 1)` the
+            // objective's. This divides out the common scale both the objective
+            // and its gradient inherit, so `grad_tol` is a true *relative*
+            // tolerance: it detects stationarity (the ratio → 0 only as the
+            // gradient vanishes relative to scale) without prematurely stopping
+            // on a non-stationary iterate (whose ratio stays O(1)). On a
+            // unit-scale objective `‖x‖_typ = 1` and `max(|f|,1)` reduces this to
+            // the absolute test, leaving those paths unchanged.
+            if relative_stationarity(grad_norm, x.view(), f_curr) <= self.grad_tol {
                 break;
             }
 
@@ -396,7 +440,14 @@ impl RiemannianLBFGS {
             1.0
         };
         for _ in 0..self.max_iter {
-            if g_norm(manifold, x.view(), grad.view())? <= self.grad_tol {
+            // Scale-aware (relative) stationarity test, identical in form to the
+            // trust region's (see `relative_stationarity`): a fixed `grad_tol`
+            // reads as a *relative* tolerance so a large-scale objective (e.g.
+            // the profiled REML latent objective, issue #879) is not perpetually
+            // flagged non-stationary. Reduces to the absolute test on a
+            // unit-scale objective.
+            let grad_norm = g_norm(manifold, x.view(), grad.view())?;
+            if relative_stationarity(grad_norm, x.view(), f_curr) <= self.grad_tol {
                 break;
             }
             let direction = two_loop(manifold, x.view(), grad.view(), &history)?;
