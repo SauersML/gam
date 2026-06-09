@@ -40,6 +40,21 @@ fn outer_strategy_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
 }
 
+/// One recorded ContinuationPath demotion: a structural defect that, for a
+/// continuation-entry objective, routes a seed to a heavier path regime instead
+/// of disqualifying it. Carried in the seed-loop ledger so the startup stats
+/// surface a heavier-regime re-entry (with its reason) rather than a vanished
+/// candidate. Never fatal.
+#[derive(Clone, Debug)]
+struct PathDemotionRecord {
+    /// 0-based seed index whose structural defect triggered the demotion.
+    seed_idx: usize,
+    /// The path regime the seed was re-entered at after the demotion.
+    regime: crate::solver::continuation_path::PathRegime,
+    /// Human-readable reason (the underlying structural diagnosis message).
+    reason: String,
+}
+
 /// Bidirectional inner-PIRLS feedback channel.
 ///
 /// The outer-loop scheduler (BFGS or ARC bridge) writes a coarsened
@@ -1965,6 +1980,29 @@ pub trait OuterObjective {
     fn outer_device_admission(&self) -> Option<crate::gpu::policy::RemlOuterAdmission> {
         None
     }
+
+    /// Whether every joint fit of this objective must ENTER through the
+    /// [`crate::solver::continuation_path::ContinuationPath`] (heavy-smoothing
+    /// entry) rather than being solved cold at the seed ρ*.
+    ///
+    /// The SAE-manifold joint objective overrides this to `true`: its joint
+    /// `(logits, t, β)` block has a combinatorial active-set component that a
+    /// cold solve can collapse, so it is entered at a heavy-smoothing regime
+    /// and annealed down. Crucially, this flips the seed cascade's structural
+    /// failure handling from REJECT to **DEMOTE-WITH-REASON**: a "cold"
+    /// structural defect (rank/alias/active-set diagnosis from the seed
+    /// pre-warm or the uniform-structural early-exit) is not a disqualification
+    /// but a signal to RE-ENTER the same seed at a *heavier* ContinuationPath
+    /// regime. The candidate set therefore never empties on a structural
+    /// diagnosis — every demotion is recorded with its reason and routed to a
+    /// heavier regime.
+    ///
+    /// The default `false` preserves the existing contract for every other
+    /// objective: pre-warm stays an optimization (never a feasibility gate),
+    /// and a uniform structural rejection still short-circuits the cascade.
+    fn requires_continuation_path_entry(&self) -> bool {
+        false
+    }
 }
 
 // ─── Persistent warm-start checkpoint plumbing ────────────────────────
@@ -2260,6 +2298,10 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
 
     fn allow_continuation_prewarm(&self) -> bool {
         self.inner.allow_continuation_prewarm()
+    }
+
+    fn requires_continuation_path_entry(&self) -> bool {
+        self.inner.requires_continuation_path_entry()
     }
 
     fn reset(&mut self) {
@@ -5531,6 +5573,24 @@ fn run_outer_with_plan(
     }
 
     let mut best: Option<OuterResult> = None;
+    // Object 1 — ContinuationPath. Every SAE-manifold joint fit ENTERS through
+    // the continuation path at a heavy-smoothing regime. When the objective
+    // declares this requirement the seed cascade's structural-failure handling
+    // flips from REJECT (which can empty the candidate set and fall through to
+    // the fatal `format_no_seeds_passed`) to DEMOTE-WITH-REASON: a "cold"
+    // structural diagnosis becomes a heavier-regime RE-ENTRY of the same seed,
+    // recorded on the path, never a disqualification. Objectives that do not
+    // require continuation entry keep `None` and the legacy reject/early-exit
+    // contract is unchanged.
+    let mut continuation_path: Option<crate::solver::continuation_path::ContinuationPath> = obj
+        .requires_continuation_path_entry()
+        .then(crate::solver::continuation_path::ContinuationPath::heavy_entry);
+    // Demotion ledger: every structural defect that would historically have
+    // rejected a seed (or short-circuited the cascade) is instead recorded
+    // here with its reason and the regime it was demoted to, so the
+    // `SearchLedger` / startup stats surface a heavier-regime re-entry rather
+    // than a vanished candidate. Non-fatal by construction.
+    let mut path_demotions: Vec<PathDemotionRecord> = Vec::new();
     // Accumulate every per-seed rejection with its 0-based seed index and the
     // phase that rejected it (validation vs solver run). When all seeds fail
     // systematically (bad analytic gradient, rank-deficient penalty, etc.) the
@@ -5587,16 +5647,54 @@ fn run_outer_with_plan(
             if let Some(key) =
                 uniform_structural_key(&seed_rejections, STRUCTURAL_EARLY_EXIT_MIN_COUNT)
             {
-                log::warn!(
-                    "[OUTER] {context}: structural early-exit after {} uniform structural \
-                     rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
-                    seed_rejections.len(),
-                    key.0.as_str(),
-                    key.1.as_deref().unwrap_or("<unknown>"),
-                    seeds.len().saturating_sub(seed_idx),
-                );
-                structural_early_exit_key = Some(key);
-                break;
+                if let Some(path) = continuation_path.as_mut() {
+                    // Continuation-entry objective: a uniform structural
+                    // diagnosis is NOT a reason to skip the remaining seeds
+                    // (that would empty the candidate set and fall through to
+                    // the fatal "no seeds passed"). The seed cascade is only an
+                    // *optimization* over warm-starts, never a feasibility
+                    // gate — so we DEMOTE the cascade to a heavier path regime
+                    // and keep evaluating. The heavier-smoothing entry gives
+                    // the joint solver a feasible basin the cold seed could not
+                    // reach. Record the demotion with its reason; never fatal.
+                    let reason = format!(
+                        "uniform structural diagnosis={} carrying-block={} after {} consistent \
+                         rejection(s)",
+                        key.0.as_str(),
+                        key.1.as_deref().unwrap_or("<unknown>"),
+                        seed_rejections.len(),
+                    );
+                    let regime = path.demote_with_reason(
+                        crate::solver::continuation_path::PathDemotionReason::UniformStructural,
+                    );
+                    log::warn!(
+                        "[OUTER] {context}: continuation-entry objective demoted to heavier path \
+                         regime {regime:?} instead of structural early-exit ({reason}); \
+                         re-entering remaining seed(s) at the heavier regime"
+                    );
+                    path_demotions.push(PathDemotionRecord {
+                        seed_idx,
+                        regime,
+                        reason,
+                    });
+                    // Reset the structured mirror's structural signal so the
+                    // heavier-regime re-entries are judged on their own merits
+                    // and a single later defect does not immediately re-fire
+                    // the demotion at the same level.
+                    seed_rejections.clear();
+                    last_classified_reason_idx = rejection_reasons.len();
+                } else {
+                    log::warn!(
+                        "[OUTER] {context}: structural early-exit after {} uniform structural \
+                         rejections (diagnosis={}, carrying-block={}); skipping remaining {} seed(s)",
+                        seed_rejections.len(),
+                        key.0.as_str(),
+                        key.1.as_deref().unwrap_or("<unknown>"),
+                        seeds.len().saturating_sub(seed_idx),
+                    );
+                    structural_early_exit_key = Some(key);
+                    break;
+                }
             }
         }
         crate::solver::estimate::reml::runtime::record_current_outer_iter_for_ift(0);
@@ -5622,7 +5720,16 @@ fn run_outer_with_plan(
         // there would route straight into that error stub and reject every
         // seed, so skip it: the direct search starts from `seed` directly,
         // exactly as its dispatch (`Solver::CompassSearch` arm below) expects.
-        if the_plan.solver != Solver::CompassSearch && obj.allow_continuation_prewarm() {
+        // A continuation-entry objective (SAE-manifold joint fit) MUST enter
+        // every seed through the heavy-smoothing ContinuationPath walk, so it
+        // opts into the priming pass even though it does not advertise the
+        // generic `allow_continuation_prewarm` warm-start. The `CompassSearch`
+        // exclusion still applies (its eval closure is unreachable by
+        // construction). For a continuation-entry objective a refused walk is
+        // DEMOTED to a heavier regime below, not treated as a feasibility gate.
+        let enter_via_continuation_path =
+            obj.allow_continuation_prewarm() || continuation_path.is_some();
+        if the_plan.solver != Solver::CompassSearch && enter_via_continuation_path {
             let prewarm_start = std::time::Instant::now();
             match crate::solver::estimate::reml::continuation::prime_outer_seed(
                 obj,
@@ -5645,19 +5752,49 @@ fn run_outer_with_plan(
                 Err(cf) if cf.is_structural() => {
                     // The pre-warm surfaced a structural defect of the seed's
                     // joint design (rank/alias deficiency or a genuine
-                    // active-set KKT bug). A cold solve at the seed ρ* would
-                    // hit it identically, so disqualify the seed and route the
-                    // failure through the same structural accounting any other
-                    // pre-validation rejection takes.
+                    // active-set KKT bug).
                     let msg = format!(
                         "continuation pre-warm refused before seed eval: {}",
                         cf.message()
                     );
-                    log::warn!(
-                        "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
-                    );
-                    rejection_reasons.push((seed_idx, "validation", msg));
-                    continue 'seed_attempts;
+                    if let Some(path) = continuation_path.as_mut() {
+                        // Continuation-entry objective: a structural refusal at
+                        // the *current* path regime is a DEMOTE signal, not a
+                        // disqualification. Route the seed to a HEAVIER regime
+                        // and re-enter — the heavier-smoothing start gives the
+                        // joint solver a feasible basin the current regime could
+                        // not reach. We still preserve the
+                        // "pre-warm-is-an-optimization-never-a-feasibility-gate"
+                        // contract: after demoting we reset to a clean baseline
+                        // and fall through to the (heavier-regime) cold seed eval
+                        // below, which judges ρ* on its own merits. Recorded;
+                        // never fatal; never disqualifies the seed.
+                        let regime = path.demote_with_reason(
+                            crate::solver::continuation_path::PathDemotionReason::PrewarmStructural,
+                        );
+                        log::warn!(
+                            "[OUTER] {context}: continuation-entry objective demoted seed \
+                             {seed_idx} to heavier path regime {regime:?} instead of rejecting \
+                             ({msg}); re-entering at the heavier regime"
+                        );
+                        path_demotions.push(PathDemotionRecord {
+                            seed_idx,
+                            regime,
+                            reason: msg,
+                        });
+                        obj.reset();
+                    } else {
+                        // Legacy contract for non-continuation objectives: a
+                        // cold solve at the seed ρ* would hit the same defect,
+                        // so disqualify the seed and route the failure through
+                        // the same structural accounting any other
+                        // pre-validation rejection takes.
+                        log::warn!(
+                            "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
+                        );
+                        rejection_reasons.push((seed_idx, "validation", msg));
+                        continue 'seed_attempts;
+                    }
                 }
                 Err(cf) => {
                     // Non-structural pre-warm failure: the continuation walk
@@ -6641,7 +6778,7 @@ fn run_outer_with_plan(
         let structural = structural_early_exit_key
             .clone()
             .or_else(|| uniform_structural_key(&seed_rejections, 1));
-        let early_exit_note = if structural_early_exit_key.is_some() {
+        let mut early_exit_note = if structural_early_exit_key.is_some() {
             "early-exit triggered: every observed seed reported the same structural rejection"
                 .to_string()
         } else if stopped_early_due_to_limit {
@@ -6653,6 +6790,33 @@ fn run_outer_with_plan(
         } else {
             String::new()
         };
+        // Surface the ContinuationPath demotion ledger: for a continuation-entry
+        // objective, structural defects DEMOTED the cascade to heavier path
+        // regimes instead of rejecting seeds, so the final diagnosis must show
+        // the heavier-regime re-entries (with their reasons) rather than imply
+        // the candidate set was emptied by a structural early-exit.
+        if !path_demotions.is_empty() {
+            if !early_exit_note.is_empty() {
+                early_exit_note.push_str("; ");
+            }
+            let final_regime = continuation_path
+                .as_ref()
+                .map(|path| format!("{:?}", path.enter_regime()))
+                .unwrap_or_else(|| "<none>".to_string());
+            early_exit_note.push_str(&format!(
+                "continuation-path: {} structural defect(s) DEMOTED to heavier regime(s) \
+                 (never rejected); final regime={final_regime}; reasons: [{}]",
+                path_demotions.len(),
+                path_demotions
+                    .iter()
+                    .map(|d| format!(
+                        "seed {} -> {:?}: {}",
+                        d.seed_idx, d.regime, d.reason
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ));
+        }
         if started_seeds == 0 {
             EstimationError::RemlOptimizationFailed(format_no_seeds_passed(
                 context,

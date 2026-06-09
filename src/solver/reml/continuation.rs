@@ -361,7 +361,22 @@ pub(crate) fn prime_outer_seed(
 /// `initial_beta` seeds the inner solve at ρ₀ (zero vector is fine —
 /// ρ₀ is in the strongly-convex regime). `bounds_upper` clamps ρ₀ to
 /// the legal box.
-fn fit_with_continuation(
+///
+/// # Callable ρ-anneal spine primitive
+///
+/// This is the **ρ-anneal spine entry**: the single callable that walks the
+/// oversmoothing→target ρ homotopy with the full retry/ρ₀-expansion decision
+/// tree (`run_path` is the per-offset inner pass). It was historically a
+/// private helper reachable only through `prime_outer_seed` (the warm-start
+/// pre-screen fallback). It is now `pub(crate)` so the coupled
+/// [`crate::solver::continuation_path::ContinuationPath`] can drive the ρ leg
+/// of the joint K≥2 SAE homotopy through the SAME spine rather than cloning a
+/// parallel ρ-anneal — there is no second implementation of the schedule.
+///
+/// Callers that only want the warm-start pre-screen keep using
+/// [`prime_outer_seed`]; callers that own the coupled τ / isometry legs call
+/// this directly so the three schedules advance against one shared ρ walk.
+pub(crate) fn fit_with_continuation(
     obj: &mut dyn OuterObjective,
     target: &Array1<f64>,
     bounds_upper: &Array1<f64>,

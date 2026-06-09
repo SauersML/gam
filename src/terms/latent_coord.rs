@@ -1012,6 +1012,21 @@ impl LatentCoordValues {
         }
     }
 
+    /// Per-axis trust-region metric weights for the multi-atom assignment
+    /// hardening hook, in the public form
+    /// [`crate::terms::atom_selection`] consumes to scale per-iteration logit
+    /// caps. This is exactly [`Self::effective_metric_weights`] — the
+    /// authoritative `1/scale²` weights that already cover `Interval` /
+    /// `ProductWithMetric` / override-retraction — re-exported `pub` so the
+    /// atom-selection layer (a sibling module that holds a `LatentCoordValues`
+    /// per atom but cannot reach the `pub(crate)` accessor through its own
+    /// public API) can size the assignment-logit trust region per latent axis.
+    /// The returned `Vec` has length `latent_dim`; every weight is finite and
+    /// strictly positive by construction of the underlying manifold metric.
+    pub fn logit_trust_cap_weights(&self) -> Vec<f64> {
+        self.effective_metric_weights()
+    }
+
     /// Effective per-axis periodicity (`Some(period)` on wrapped axes). When
     /// the declared manifold is non-Euclidean it is authoritative; when it is
     /// Euclidean, an explicit override retraction (if any) decides. Returns a
@@ -1233,6 +1248,36 @@ impl LatentCoordValues {
             }
         }
     }
+}
+
+/// Minimum total active assignment mass a per-row atom code must retain after a
+/// hardened logit step. The assignment weights `a_{n,·}` live on the simplex
+/// (softmax) or are non-negative amplitudes (TopK / L¹); summed over the active
+/// support they measure how much explanatory mass the row still carries. When
+/// the cap-limited step nonetheless drives that sum below this floor the row has
+/// effectively gone dark — the active set collapsed — and the
+/// [`crate::terms::atom_selection`] hardening hook routes the breach to a
+/// re-seed-from-scaffold (recorded on the [`crate::solver::continuation_path`]
+/// path, never fatal). The floor is deliberately small: it fires only on a true
+/// collapse, not on a legitimately diffuse soft assignment.
+pub const LATENT_ACTIVE_MASS_FLOOR: f64 = 1.0e-6;
+
+/// Whether the active assignment mass of a per-row code has breached
+/// [`LATENT_ACTIVE_MASS_FLOOR`], i.e. the active set has effectively collapsed.
+///
+/// `active_weights` is the slice of per-atom assignment weights on the row's
+/// active support (inactive atoms contribute zero and may be omitted by the
+/// caller). Returns `true` when the summed magnitude has fallen at or below the
+/// floor — the signal the atom-selection hardening hook uses to trigger a
+/// recorded (never fatal) re-seed-from-scaffold. A non-finite sum is treated as
+/// a breach: a NaN/Inf assignment is exactly the degenerate state the floor
+/// guards against.
+pub fn active_mass_breached(active_weights: &[f64]) -> bool {
+    let mut mass = 0.0_f64;
+    for &w in active_weights {
+        mass += w.abs();
+    }
+    !mass.is_finite() || mass <= LATENT_ACTIVE_MASS_FLOOR
 }
 
 fn wrap_to_period(x: f64, period: f64) -> f64 {
