@@ -929,6 +929,586 @@ fn data_covariance(data: ArrayView2<'_, f64>, floor: f64) -> Array2<f64> {
     cov
 }
 
+// ---------------------------------------------------------------------------
+// Structured-union candidates (#907)
+// ---------------------------------------------------------------------------
+//
+// A *union* candidate is a small FIXED composite of named component structures
+// joined by a hard row-responsibility split. Unlike the discrete-mixture rung
+// (which is one free k-component Gaussian density), a union pins each component
+// to a specific generative STRUCTURE (a circle, a line, a point cluster) and
+// asks whether the data is better explained as the disjoint sum of those
+// structures than by any single pure rung.
+//
+// Each component is fit on its responsibility group as its own parametric
+// generative density and scored through the SAME rank-aware Laplace /
+// Tierney-Kadane normalizer used by the smooth rungs and the mixture rung:
+// `−V_c = loglik_c − ½ log|H_c| + ½ P_c log(2π)` with `H_c` the observed
+// empirical-Fisher (BHHH) information `I + Σ s_i s_iᵀ` at the component optimum
+// (`rank(S)=0`, fully likelihood-identified). The union's evidence is the SUM
+// `V = Σ_c V_c` (the components partition the rows, so their log-likelihoods
+// add and their Hessians are block-diagonal — `log|H| = Σ_c log|H_c|`). The
+// complexity price is the TOTAL free-parameter count across all components,
+// which is exactly what the summed `+ ½ Σ_c P_c log(2π)` normalizer charges.
+// A union is therefore strictly more expensive than either pure component, so
+// it can only win when the structured split buys enough likelihood to pay for
+// its extra parameters — the negative-control discipline of #907.
+
+/// The fixed ladder of structured-union composites. Deterministic and closed:
+/// open-ended structure search stays owned by #976's move set; these three are
+/// the only composites the topology race may select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnionStructure {
+    /// Two circles (two well-separated periodic loops).
+    CircleCircle,
+    /// One circle plus one isolated point cluster (a loop with an outlier blob).
+    CirclePointCluster,
+    /// One line (anisotropic cluster) plus one isolated point cluster.
+    LineCluster,
+}
+
+/// The fixed structured-union ladder, in stable order.
+pub const UNION_STRUCTURE_LADDER: &[UnionStructure] = &[
+    UnionStructure::CircleCircle,
+    UnionStructure::CirclePointCluster,
+    UnionStructure::LineCluster,
+];
+
+/// The per-component generative structure a union pins each responsibility group
+/// to. `Line` and `PointCluster` share the full-covariance Gaussian density
+/// (a line is an anisotropic Gaussian — the covariance, not a different
+/// parameterization, is what distinguishes them); `Circle` is a genuinely
+/// different density on `(radius, angle)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UnionComponentKind {
+    Circle,
+    Line,
+    PointCluster,
+}
+
+impl UnionStructure {
+    /// Stable display name, e.g. `"union_circle+circle"`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            UnionStructure::CircleCircle => "union_circle+circle",
+            UnionStructure::CirclePointCluster => "union_circle+cluster",
+            UnionStructure::LineCluster => "union_line+cluster",
+        }
+    }
+
+    /// The fixed ordered component structures of this union.
+    pub const fn components(self) -> &'static [UnionComponentKind] {
+        match self {
+            UnionStructure::CircleCircle => {
+                &[UnionComponentKind::Circle, UnionComponentKind::Circle]
+            }
+            UnionStructure::CirclePointCluster => {
+                &[UnionComponentKind::Circle, UnionComponentKind::PointCluster]
+            }
+            UnionStructure::LineCluster => {
+                &[UnionComponentKind::Line, UnionComponentKind::PointCluster]
+            }
+        }
+    }
+
+    /// Number of components (= the responsibility-split order `m`).
+    pub const fn num_components(self) -> usize {
+        self.components().len()
+    }
+}
+
+/// One fitted component of a union: its pinned structure, the rows it owns
+/// (after the hard responsibility split), its free-parameter count, and its
+/// rank-aware Laplace negative-log-evidence on the common scale.
+#[derive(Debug, Clone)]
+pub struct UnionComponentFit {
+    pub kind: UnionComponentKind,
+    pub row_count: usize,
+    pub num_parameters: usize,
+    pub negative_log_evidence: f64,
+}
+
+/// A fitted structured-union candidate: the composite kind, the per-component
+/// fits, the SUMMED rank-aware Laplace negative-log-evidence, and the TOTAL
+/// free-parameter count across components (the complexity price).
+#[derive(Debug, Clone)]
+pub struct UnionStructureFit {
+    pub structure: UnionStructure,
+    pub components: Vec<UnionComponentFit>,
+    /// `Σ_c V_c` — summed rank-aware Laplace negative-log-evidence (lower wins).
+    pub negative_log_evidence: f64,
+    /// `Σ_c P_c` — total free-parameter count across components.
+    pub total_parameters: usize,
+}
+
+/// Hard responsibility split of `0..n` into `m` groups by argmax of the
+/// deterministic `m`-component Gaussian-mixture responsibilities. Reuses the
+/// mixture rung's seeding + EM so the split is a pure function of the data and
+/// `m` (no clock). Returns one row-index vector per component.
+pub fn union_responsibility_split(
+    data: ArrayView2<'_, f64>,
+    m: usize,
+    config: GaussianMixtureConfig,
+) -> Result<Vec<Vec<usize>>, String> {
+    let n = data.nrows();
+    if m == 0 {
+        return Err("union split requires at least one component".to_string());
+    }
+    if m > n {
+        return Err(format!(
+            "union split requested {m} groups but data has {n} rows"
+        ));
+    }
+    if m == 1 {
+        return Ok(vec![(0..n).collect()]);
+    }
+    let fit = fit_gaussian_mixture(data, m, config)?;
+    let mut groups: Vec<Vec<usize>> = vec![Vec::new(); m];
+    // Hard assignment by argmax per-component log responsibility.
+    let mut comp = Vec::with_capacity(m);
+    for j in 0..m {
+        comp.push(GaussianComponentEval::factor(
+            fit.means.row(j),
+            &fit.covariances[j],
+        )?);
+    }
+    let log_w: Vec<f64> = fit
+        .weights
+        .iter()
+        .map(|w| w.max(f64::MIN_POSITIVE).ln())
+        .collect();
+    for i in 0..n {
+        let row = data.row(i);
+        let mut best_j = 0usize;
+        let mut best_lt = f64::NEG_INFINITY;
+        for j in 0..m {
+            let lt = log_w[j] + comp[j].log_density(row);
+            if lt > best_lt {
+                best_lt = lt;
+                best_j = j;
+            }
+        }
+        groups[best_j].push(i);
+    }
+    Ok(groups)
+}
+
+/// Fit one structured-union candidate: hard-split the rows into one group per
+/// component, fit each component's pinned density, and SUM the rank-aware
+/// Laplace negative-log-evidence. The complexity price is the total
+/// free-parameter count across components.
+///
+/// Returns an error if any component group is too small to identify its
+/// structure (so an over-priced or non-identifiable composite simply does not
+/// enter the race rather than scoring spuriously well).
+pub fn fit_union_structure(
+    data: ArrayView2<'_, f64>,
+    structure: UnionStructure,
+    config: GaussianMixtureConfig,
+) -> Result<UnionStructureFit, String> {
+    let comps = structure.components();
+    let m = comps.len();
+    let groups = union_responsibility_split(data, m, config)?;
+    let mut fits = Vec::with_capacity(m);
+    let mut total_nle = 0.0_f64;
+    let mut total_parameters = 0usize;
+    for (kind, rows) in comps.iter().zip(groups.iter()) {
+        let group = gather_union_rows(data, rows);
+        let (nle, p) = fit_union_component(group.view(), *kind, config)?;
+        if !nle.is_finite() {
+            return Err(format!(
+                "union {} component {:?} produced non-finite evidence",
+                structure.as_str(),
+                kind
+            ));
+        }
+        total_nle += nle;
+        total_parameters += p;
+        fits.push(UnionComponentFit {
+            kind: *kind,
+            row_count: rows.len(),
+            num_parameters: p,
+            negative_log_evidence: nle,
+        });
+    }
+    Ok(UnionStructureFit {
+        structure,
+        components: fits,
+        negative_log_evidence: total_nle,
+        total_parameters,
+    })
+}
+
+/// Fit the whole fixed union ladder and rank in-class by summed rank-aware
+/// Laplace evidence (lower wins). Composites that fail to fit (e.g. a group too
+/// small to identify a circle) are skipped. Returns the fitted ladder sorted
+/// best-first.
+pub fn fit_union_ladder(
+    data: ArrayView2<'_, f64>,
+    config: GaussianMixtureConfig,
+) -> Result<Vec<UnionStructureFit>, String> {
+    let mut fits = Vec::new();
+    let mut errors = Vec::new();
+    for &structure in UNION_STRUCTURE_LADDER {
+        match fit_union_structure(data, structure, config) {
+            Ok(fit) => fits.push(fit),
+            Err(e) => errors.push(format!("{}: {e}", structure.as_str())),
+        }
+    }
+    if fits.is_empty() {
+        return Err(format!(
+            "union ladder produced no fittable composites{}",
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", errors.join("; "))
+            }
+        ));
+    }
+    let ranked = rank_priority_candidates(
+        fits.into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let score = row.negative_log_evidence;
+                let tie = row.total_parameters; // cheaper composite wins ties
+                PriorityCandidate::new(row, idx, score, tie)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|row| row.item)
+    .collect::<Vec<_>>();
+    Ok(ranked)
+}
+
+fn gather_union_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
+    let d = data.ncols();
+    let mut out = Array2::<f64>::zeros((idx.len(), d));
+    for (r, &i) in idx.iter().enumerate() {
+        for c in 0..d {
+            out[[r, c]] = data[[i, c]];
+        }
+    }
+    out
+}
+
+/// Fit a single union component density on its responsibility group and return
+/// `(rank_aware_negative_log_evidence, free_parameter_count)`. `Line` and
+/// `PointCluster` use the full-covariance Gaussian density (a single mixture
+/// component); `Circle` uses the radius/angle generative density below.
+fn fit_union_component(
+    group: ArrayView2<'_, f64>,
+    kind: UnionComponentKind,
+    config: GaussianMixtureConfig,
+) -> Result<(f64, usize), String> {
+    match kind {
+        UnionComponentKind::Line | UnionComponentKind::PointCluster => {
+            // A single full-covariance Gaussian is the k=1 mixture: reuse its
+            // exact rank-aware Laplace evidence so a union component is on the
+            // identical scale as a mixture component.
+            if group.nrows() < group.ncols() + 1 {
+                return Err(format!(
+                    "union gaussian component needs >= {} rows, got {}",
+                    group.ncols() + 1,
+                    group.nrows()
+                ));
+            }
+            let fit = fit_gaussian_mixture(group, 1, config)?;
+            let nle = fit.laplace_negative_log_evidence(group)?;
+            Ok((nle, fit.num_free_parameters()))
+        }
+        UnionComponentKind::Circle => fit_circle_component_evidence(group, config),
+    }
+}
+
+/// Rank-aware Laplace negative-log-evidence of a 2-D *circle* component: data is
+/// modelled as `(r, θ)` with `r ~ N(ρ, σ_r²)` around a fitted center+radius and
+/// `θ` uniform on the circle. Free parameters: center `(cx, cy)`, radius `ρ`,
+/// radial variance `σ_r²` — `P = 4`. The angle is an ancillary uniform with no
+/// free parameter (it carries `−log(2π r)` of density). The Hessian is the
+/// observed empirical-Fisher `I + Σ s_i s_iᵀ` in `(cx, cy, ρ, log σ_r²)`
+/// coordinates, fed through the SAME [`laplace_evidence`] entry point.
+fn fit_circle_component_evidence(
+    group: ArrayView2<'_, f64>,
+    config: GaussianMixtureConfig,
+) -> Result<(f64, usize), String> {
+    let d = group.ncols();
+    if d != 2 {
+        return Err(format!(
+            "union circle component requires 2-D data, got {d} columns"
+        ));
+    }
+    let n = group.nrows();
+    let p = 4usize; // cx, cy, radius, radial-variance
+    if n < p + 1 {
+        return Err(format!(
+            "union circle component needs >= {} rows, got {n}",
+            p + 1
+        ));
+    }
+    // Center = data centroid; radius = mean distance to centroid; radial
+    // variance = mean squared radial residual (floored). This is the algebraic
+    // circle-fit optimum for the isotropic radial-Gaussian model and is a pure
+    // function of the data.
+    let mut cx = 0.0_f64;
+    let mut cy = 0.0_f64;
+    for i in 0..n {
+        cx += group[[i, 0]];
+        cy += group[[i, 1]];
+    }
+    cx /= n as f64;
+    cy /= n as f64;
+    let mut radii = vec![0.0_f64; n];
+    let mut radius = 0.0_f64;
+    for i in 0..n {
+        let dx = group[[i, 0]] - cx;
+        let dy = group[[i, 1]] - cy;
+        let r = (dx * dx + dy * dy).sqrt();
+        radii[i] = r;
+        radius += r;
+    }
+    radius /= n as f64;
+    let mut var_r = 0.0_f64;
+    for &r in &radii {
+        let e = r - radius;
+        var_r += e * e;
+    }
+    var_r = (var_r / n as f64).max(config.covariance_floor);
+    let inv_var = 1.0 / var_r;
+    // Total log-likelihood: Σ_i [ −½ log(2π σ_r²) − (r_i−ρ)²/(2σ_r²)
+    //                             − log(2π r_i) ]  (radial Gaussian × uniform θ).
+    let mut loglik = 0.0_f64;
+    let log_2pi = (2.0 * std::f64::consts::PI).ln();
+    for &r in &radii {
+        let e = r - radius;
+        let radial = -0.5 * (log_2pi + var_r.ln()) - 0.5 * e * e * inv_var;
+        let angular = -(log_2pi + r.max(f64::MIN_POSITIVE).ln());
+        loglik += radial + angular;
+    }
+    // Observed empirical-Fisher in (cx, cy, ρ, s) with s = log σ_r².
+    // Per-row scores:
+    //   ∂/∂cx log = (e/σ_r²) · (−dx/r)            (r decreases as center moves +x toward point)
+    //   ∂/∂cy log = (e/σ_r²) · (−dy/r)
+    //   ∂/∂ρ  log = e/σ_r²
+    //   ∂/∂s  log = −½ + e²/(2σ_r²)               (s = log σ_r²)
+    let mut info = Array2::<f64>::zeros((p, p));
+    let mut score = [0.0_f64; 4];
+    for i in 0..n {
+        let dx = group[[i, 0]] - cx;
+        let dy = group[[i, 1]] - cy;
+        let r = radii[i].max(f64::MIN_POSITIVE);
+        let e = radii[i] - radius;
+        let ee = e * inv_var;
+        score[0] = ee * (-dx / r);
+        score[1] = ee * (-dy / r);
+        score[2] = ee;
+        score[3] = -0.5 + 0.5 * e * e * inv_var;
+        for a in 0..p {
+            let sa = score[a];
+            if sa == 0.0 {
+                continue;
+            }
+            for b in 0..p {
+                info[[a, b]] += sa * score[b];
+            }
+        }
+    }
+    // Symmetrize and add the unit-information prior ridge `I` (same fixed prior
+    // as the mixture path) so `log|H|` is well-defined for any `n`.
+    for a in 0..p {
+        for b in (a + 1)..p {
+            let avg = 0.5 * (info[[a, b]] + info[[b, a]]);
+            info[[a, b]] = avg;
+            info[[b, a]] = avg;
+        }
+        info[[a, a]] += 1.0;
+    }
+    let apply_info = |x: &[f64]| -> Vec<f64> {
+        let mut out = vec![0.0_f64; p];
+        for r in 0..p {
+            let mut acc = 0.0_f64;
+            for c in 0..p {
+                acc += info[[r, c]] * x[c];
+            }
+            out[r] = acc;
+        }
+        out
+    };
+    let hvp = EvidenceHvpLogDet {
+        dim: p,
+        apply: &apply_info,
+    };
+    let v = laplace_evidence(EvidenceLogDetSource::Hvp(hvp), 0.0, -loglik, p as f64, 0.0);
+    if !v.is_finite() {
+        return Err("union circle component Laplace evidence is not finite".to_string());
+    }
+    Ok((v, p))
+}
+
+/// A fitted union component as a *predictive density* (not just an evidence
+/// scalar): either a full-covariance Gaussian (`Line`/`PointCluster`) or the
+/// radial-Gaussian×uniform-angle circle density. Carries the mixing weight
+/// `π_c = row_count_c / n_train` so a union can be evaluated as the soft mixture
+/// `Σ_c π_c p_c(y)` at held-out rows for cross-class stacking.
+#[derive(Debug, Clone)]
+enum UnionComponentDensity {
+    Gaussian {
+        log_weight: f64,
+        eval: GaussianComponentEval,
+    },
+    Circle {
+        log_weight: f64,
+        center: [f64; 2],
+        radius: f64,
+        var_r: f64,
+    },
+}
+
+impl UnionComponentDensity {
+    /// `log π_c + log p_c(y)` for one eval row.
+    fn weighted_log_density(&self, y: ArrayView1<'_, f64>) -> f64 {
+        match self {
+            UnionComponentDensity::Gaussian { log_weight, eval } => {
+                log_weight + eval.log_density(y)
+            }
+            UnionComponentDensity::Circle {
+                log_weight,
+                center,
+                radius,
+                var_r,
+            } => {
+                let dx = y[0] - center[0];
+                let dy = y[1] - center[1];
+                let r = (dx * dx + dy * dy).sqrt();
+                let log_2pi = (2.0 * std::f64::consts::PI).ln();
+                let e = r - radius;
+                let radial = -0.5 * (log_2pi + var_r.ln()) - 0.5 * e * e / var_r;
+                let angular = -(log_2pi + r.max(f64::MIN_POSITIVE).ln());
+                log_weight + radial + angular
+            }
+        }
+    }
+}
+
+/// Fit each union component's *density* on the training rows (hard
+/// responsibility split) so the composite can be evaluated as the soft mixture
+/// `Σ_c π_c p_c(y)` at new rows. Mixing weights are the training row shares.
+fn fit_union_component_densities(
+    train: ArrayView2<'_, f64>,
+    structure: UnionStructure,
+    config: GaussianMixtureConfig,
+) -> Result<Vec<UnionComponentDensity>, String> {
+    let comps = structure.components();
+    let m = comps.len();
+    let groups = union_responsibility_split(train, m, config)?;
+    let n_train = train.nrows().max(1) as f64;
+    let mut out = Vec::with_capacity(m);
+    for (kind, rows) in comps.iter().zip(groups.iter()) {
+        if rows.is_empty() {
+            return Err(format!(
+                "union {} held-out density: empty component group",
+                structure.as_str()
+            ));
+        }
+        let log_weight = (rows.len() as f64 / n_train).max(f64::MIN_POSITIVE).ln();
+        let group = gather_union_rows(train, rows);
+        match kind {
+            UnionComponentKind::Line | UnionComponentKind::PointCluster => {
+                if group.nrows() < group.ncols() + 1 {
+                    return Err(format!(
+                        "union gaussian component density needs >= {} rows, got {}",
+                        group.ncols() + 1,
+                        group.nrows()
+                    ));
+                }
+                let fit = fit_gaussian_mixture(group.view(), 1, config)?;
+                let eval = GaussianComponentEval::factor(fit.means.row(0), &fit.covariances[0])?;
+                out.push(UnionComponentDensity::Gaussian { log_weight, eval });
+            }
+            UnionComponentKind::Circle => {
+                let d = group.ncols();
+                if d != 2 {
+                    return Err(format!(
+                        "union circle component density requires 2-D data, got {d} columns"
+                    ));
+                }
+                let n = group.nrows();
+                if n < 5 {
+                    return Err(format!(
+                        "union circle component density needs >= 5 rows, got {n}"
+                    ));
+                }
+                let mut cx = 0.0_f64;
+                let mut cy = 0.0_f64;
+                for i in 0..n {
+                    cx += group[[i, 0]];
+                    cy += group[[i, 1]];
+                }
+                cx /= n as f64;
+                cy /= n as f64;
+                let mut radius = 0.0_f64;
+                let mut radii = vec![0.0_f64; n];
+                for i in 0..n {
+                    let dx = group[[i, 0]] - cx;
+                    let dy = group[[i, 1]] - cy;
+                    let r = (dx * dx + dy * dy).sqrt();
+                    radii[i] = r;
+                    radius += r;
+                }
+                radius /= n as f64;
+                let mut var_r = 0.0_f64;
+                for &r in &radii {
+                    let e = r - radius;
+                    var_r += e * e;
+                }
+                var_r = (var_r / n as f64).max(config.covariance_floor);
+                out.push(UnionComponentDensity::Circle {
+                    log_weight,
+                    center: [cx, cy],
+                    radius,
+                    var_r,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Per-point held-out log predictive density of a structured-union candidate:
+/// fit the component densities on `train` and score each row of `eval` as the
+/// soft mixture `log Σ_c π_c p_c(y)`. This is the cross-class stacking column
+/// source for a union (the analogue of [`GaussianMixtureFit::per_point_log_density`]).
+pub fn union_per_point_log_density(
+    train: ArrayView2<'_, f64>,
+    eval: ArrayView2<'_, f64>,
+    structure: UnionStructure,
+    config: GaussianMixtureConfig,
+) -> Result<Array1<f64>, String> {
+    if train.ncols() != eval.ncols() {
+        return Err(format!(
+            "union held-out density: train has {} columns, eval has {}",
+            train.ncols(),
+            eval.ncols()
+        ));
+    }
+    let densities = fit_union_component_densities(train, structure, config)?;
+    let mut out = Array1::<f64>::zeros(eval.nrows());
+    let mut terms = vec![f64::NEG_INFINITY; densities.len()];
+    for i in 0..eval.nrows() {
+        let row = eval.row(i);
+        let mut max_term = f64::NEG_INFINITY;
+        for (c, dens) in densities.iter().enumerate() {
+            let lt = dens.weighted_log_density(row);
+            terms[c] = lt;
+            if lt > max_term {
+                max_term = lt;
+            }
+        }
+        out[i] = log_sum_exp(&terms, max_term);
+    }
+    Ok(out)
+}
+
 /// One fitted model in a REML/LAML evidence comparison.
 #[derive(Clone, Debug)]
 pub struct RemlCandidate {
