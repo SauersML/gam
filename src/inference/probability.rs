@@ -1,5 +1,5 @@
 use crate::estimate::EstimationError;
-use crate::mixture_link::inverse_link_jet_for_family;
+use crate::mixture_link::inverse_link_jet_for_family_public;
 use crate::types::LikelihoodSpec;
 use ndarray::{Array1, ArrayView1};
 use statrs::function::erf::erfc;
@@ -519,7 +519,11 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
     x
 }
 
-/// Inverse-link transform per likelihood specification.
+/// Inverse-link transform per likelihood specification (response scale).
+///
+/// Uses the EXACT public inverse-link jet, so the log link reports `exp(η)`
+/// (finite wherever representable) rather than the solver's clamped value
+/// (issue #963).
 #[inline]
 pub fn try_inverse_link_array(
     likelihood: &LikelihoodSpec,
@@ -527,7 +531,7 @@ pub fn try_inverse_link_array(
 ) -> Result<Array1<f64>, EstimationError> {
     let mut out = Array1::<f64>::zeros(eta.len());
     for i in 0..eta.len() {
-        out[i] = inverse_link_jet_for_family(likelihood, eta[i])?.mu;
+        out[i] = inverse_link_jet_for_family_public(likelihood, eta[i])?.mu;
     }
     Ok(out)
 }

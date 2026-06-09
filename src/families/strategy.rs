@@ -1,7 +1,9 @@
 use crate::estimate::{EstimationError, FittedLinkState, UnifiedFitResult};
 use crate::families::lognormal_kernel::latent_cloglog_inverse_link_jet;
 use crate::inference::generative::NoiseModel;
-use crate::mixture_link::{InverseLinkJet, inverse_link_jet_for_family, mixture_inverse_link_jet};
+use crate::mixture_link::{
+    InverseLinkJet, inverse_link_jet_for_family_public, mixture_inverse_link_jet,
+};
 use crate::quadrature::{
     IntegratedMomentsJet, QuadratureContext, cloglog_posterior_meanvariance,
     integrated_family_moments_jet, integrated_inverse_link_jetwith_state,
@@ -232,7 +234,13 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
     }
 
     fn inverse_link_jet(&self, eta: f64) -> Result<InverseLinkJet, EstimationError> {
-        inverse_link_jet_for_family(&self.spec, eta)
+        // Public response-scale surface: use the EXACT inverse-link jet so the
+        // log link reports `exp(η)` (finite wherever representable) rather than
+        // the solver's `η.clamp(−700, 700).exp()` conditioning value. This funnel
+        // feeds `inverse_link`/`inverse_link_array` and the predict mean +
+        // delta-method SE path; the solver/REML/PIRLS engines keep the clamped
+        // jet. For `|η| ≤ 700` the two are byte-identical (issue #963).
+        inverse_link_jet_for_family_public(&self.spec, eta)
     }
 
     fn posterior_mean(
@@ -433,5 +441,91 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             eta,
             se_eta,
         )
+    }
+}
+
+#[cfg(test)]
+mod log_link_public_jet_tests {
+    use super::*;
+    use crate::mixture_link::inverse_link_jet_for_family;
+    use crate::types::LikelihoodSpec;
+    use ndarray::Array1;
+
+    /// The PUBLIC predict surface for a log-link family (Poisson/Gamma/Tweedie/
+    /// NB) must report the EXACT `exp(η)`, never the solver's
+    /// `η.clamp(−700, 700).exp()` conditioning value (issue #963). This drives
+    /// the exact funnel the predict path uses — `FamilyStrategy::inverse_link`
+    /// / `inverse_link_array` / `inverse_link_jet` (the predict mean +
+    /// delta-method SE source) — and pins the finite boundary η where the exact
+    /// and clamped transforms diverge.
+    #[test]
+    fn public_predict_log_inverse_link_is_exact_exp_at_boundary() {
+        let strategy = strategy_for_spec(&LikelihoodSpec::poisson_log());
+
+        // η = 705: exact exp(705) ≈ 1.505e306 is finite; the solver clamp would
+        // return exp(700) ≈ 1.014e304, wrong by exp(5) ≈ 148.
+        let exact = 705.0_f64.exp();
+        assert!(exact.is_finite(), "exp(705) must be representable in f64");
+        let jet = strategy.inverse_link_jet(705.0).expect("jet");
+        assert_eq!(jet.mu, exact, "predict mean must be exact exp(705)");
+        // All derivatives of exp are exp; the delta-method SE reads `d1`.
+        assert_eq!(jet.d1, exact, "predict dmu/deta must be exact exp(705)");
+        assert_eq!(jet.d2, exact);
+        assert_eq!(jet.d3, exact);
+        let clamped = 700.0_f64.exp();
+        assert!(
+            jet.mu > clamped * 100.0,
+            "exact exp(705) must exceed the clamped exp(700) by ~exp(5)"
+        );
+
+        // Array entry point used by `predict_plugin_response`/`response`.
+        let arr = strategy
+            .inverse_link_array(Array1::from(vec![705.0]).view())
+            .expect("array");
+        assert_eq!(arr[0], exact, "inverse_link_array must be exact exp(705)");
+
+        // η = −720: exact underflows toward 0 (≈2.03e−313); the clamp would pin
+        // it at exp(−700) ≈ 9.86e−305 (~4.85e8× too large).
+        let exact_neg = (-720.0_f64).exp();
+        let jet = strategy.inverse_link_jet(-720.0).expect("jet");
+        assert_eq!(jet.mu, exact_neg, "predict mean must be exact exp(-720)");
+        let clamped_neg = (-700.0_f64).exp();
+        assert!(
+            jet.mu < clamped_neg,
+            "exact exp(-720) must be strictly below the clamped exp(-700)"
+        );
+
+        // True IEEE limits honored exactly on the public surface.
+        let over = strategy.inverse_link_jet(710.0).expect("jet");
+        assert!(over.mu.is_infinite() && over.mu > 0.0, "exp(710) -> +inf");
+        let under = strategy.inverse_link_jet(-746.0).expect("jet");
+        assert_eq!(under.mu, 0.0, "exp(-746) -> 0.0");
+    }
+
+    /// No regression: for in-range η (|η| ≤ 700 — where the solver clamp is
+    /// inert) the public predict jet is BYTE-IDENTICAL to the pre-fix clamped
+    /// jet across mu and all derivatives. Only the out-of-range tails change.
+    #[test]
+    fn public_predict_log_jet_byte_identical_to_clamped_in_range() {
+        let spec = LikelihoodSpec::poisson_log();
+        let strategy = strategy_for_spec(&spec);
+        for &eta in &[
+            -700.0, -300.0, -12.5, -1.0, -0.25, 0.0, 0.25, 1.0, 12.5, 300.0, 700.0,
+        ] {
+            let public_jet = strategy.inverse_link_jet(eta).expect("public jet");
+            let clamped_jet = inverse_link_jet_for_family(&spec, eta).expect("clamped jet");
+            assert_eq!(
+                public_jet.mu.to_bits(),
+                clamped_jet.mu.to_bits(),
+                "mu must be byte-identical in range at eta={eta}"
+            );
+            assert_eq!(
+                public_jet.d1.to_bits(),
+                clamped_jet.d1.to_bits(),
+                "d1 must be byte-identical in range at eta={eta}"
+            );
+            assert_eq!(public_jet.d2.to_bits(), clamped_jet.d2.to_bits());
+            assert_eq!(public_jet.d3.to_bits(), clamped_jet.d3.to_bits());
+        }
     }
 }
