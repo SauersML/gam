@@ -285,6 +285,19 @@ impl RiemannianManifold for SphereManifold {
         Ok(vec.to_owned() - &(point.to_owned() * dot(point, vec)))
     }
 
+    /// The round sphere carries the metric *induced* from the ambient Euclidean
+    /// inner product, so the Riemannian gradient is the orthogonal projection of
+    /// the ambient gradient onto the tangent space `T_pS = p^⊥` — exactly
+    /// [`project_tangent`]. (The metric-raising default would give the same
+    /// vector but only after building the dense `m×m` identity metric.)
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.project_tangent(point, euclidean_grad)
+    }
+
     fn exp_map_vjp(
         &self,
         point: ArrayView1<'_, f64>,

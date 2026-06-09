@@ -230,6 +230,36 @@ impl RiemannianManifold for SpdManifold {
         Ok(flatten(&sym(&from_flat(vec, self.n, self.n)?)))
     }
 
+    /// Riemannian gradient under the affine-invariant metric
+    /// `⟨U,V⟩_P = tr(P⁻¹U P⁻¹V)`. For a scalar `f` with ambient differential
+    /// `E` (so `Df_P[ξ] = ⟨E, ξ⟩ = tr(Eᵀξ)`), the Riesz representative is the
+    /// closed form
+    ///
+    /// ```text
+    ///   grad f(P) = P · sym(E) · P,
+    /// ```
+    ///
+    /// which is symmetric (a genuine SPD tangent) and satisfies the defining
+    /// relation: for any symmetric tangent `ξ`,
+    /// `⟨grad, ξ⟩_P = tr(P⁻¹·P sym(E) P·P⁻¹·ξ) = tr(sym(E) ξ) = tr(Eᵀ ξ)`,
+    /// since the antisymmetric part of `E` contracts to zero against symmetric
+    /// `ξ`. This is the metric-raising default specialized to the affine metric —
+    /// computed directly here to avoid forming the `n²×n²` metric tensor, and to
+    /// stay exact. Merely projecting `E` to `sym(E)` ([`project_tangent`]) is the
+    /// *Euclidean*-metric gradient and is wrong off the identity (issue #955).
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        use crate::linalg::faer_ndarray::fast_ab;
+        let p = self.matrix(point)?;
+        let e = sym(&from_flat(euclidean_grad, self.n, self.n)?);
+        // P · sym(E) · P (dense n×n chain, GPU-dispatched via fast_ab).
+        let grad = fast_ab(&fast_ab(&p, &e), &p);
+        Ok(flatten(&sym(&grad)))
+    }
+
     fn exp_map_vjp(
         &self,
         point: ArrayView1<'_, f64>,

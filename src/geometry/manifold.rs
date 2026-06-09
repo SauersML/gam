@@ -104,6 +104,68 @@ pub trait RiemannianManifold: Send + Sync {
         Ok(vec.to_owned())
     }
 
+    /// Riemannian gradient of a scalar `f` raised from its **ambient Euclidean
+    /// differential** `e` — the vector `∂f/∂x` in ambient coordinates that an
+    /// objective returns from its `value_gradient`.
+    ///
+    /// The Riemannian gradient is the Riesz representative of the differential
+    /// under the manifold metric `g`: the unique tangent vector `v` satisfying
+    ///
+    /// ```text
+    ///   g_x(v, ξ) = Df_x[ξ] = ⟨e, ξ⟩   for every tangent ξ.
+    /// ```
+    ///
+    /// Orthogonally projecting `e` onto the tangent space ([`project_tangent`])
+    /// produces `v` **only** for the embedded/identity metric. For a genuine
+    /// Riemannian metric (affine-invariant SPD, canonical Stiefel, …) the
+    /// differential must be *raised through the metric* — projecting alone gives
+    /// the wrong direction and the wrong slope, so any model linear term or
+    /// Armijo slope built from it is not even first-order accurate (issue #955).
+    ///
+    /// The default raises `e` in a tangent basis `B = tangent_basis(x)` against
+    /// the metric `G = metric_tensor(x)`:
+    ///
+    /// ```text
+    ///   v = B (Bᵀ G B)⁻¹ Bᵀ e.
+    /// ```
+    ///
+    /// This is the Riesz representative for ANY basis `B` of `T_xM` (proof: for
+    /// `ξ = B c`, `g_x(v, ξ) = eᵀ B (Bᵀ G B)⁻¹ (Bᵀ G B) c = eᵀ B c = ⟨e, ξ⟩`),
+    /// and it collapses to the orthogonal tangent projection `B Bᵀ e` exactly
+    /// when `B` is metric-orthonormal / the metric is the embedded one. It is the
+    /// mathematically correct fallback, so a future non-identity-metric manifold
+    /// is never silently first-order wrong.
+    ///
+    /// Manifolds whose tangent projection already coincides with this (every
+    /// *embedded* manifold carrying the induced metric — Euclidean, Sphere,
+    /// Circle, Torus, Grassmann) override with the O(m) `project_tangent`;
+    /// manifolds with a slick closed form (SPD: `P·sym(E)·P`; Stiefel:
+    /// `E − Y Eᵀ Y`) override with that, avoiding the dense `m×m` metric tensor.
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        let m = self.ambient_dim();
+        check_len("riemannian_gradient point", point.len(), m)?;
+        check_len("riemannian_gradient euclidean_grad", euclidean_grad.len(), m)?;
+        let b = self.tangent_basis(point)?; // m × d
+        let g = self.metric_tensor(point)?; // m × m
+        // Bᵀ e  (length d) and the Gram matrix Bᵀ G B  (d × d).
+        let bt = b.t();
+        let bte = bt.dot(&euclidean_grad.to_owned());
+        let gb = g.dot(&b);
+        let btgb = bt.dot(&gb);
+        if btgb.nrows() == 0 {
+            // A zero-dimensional tangent space (no degrees of freedom): the only
+            // tangent vector is 0.
+            return Ok(Array1::<f64>::zeros(m));
+        }
+        // Solve (BᵀGB) c = Bᵀ e for the basis coordinates of v, then v = B c.
+        let c = inverse(&btgb)?.dot(&bte);
+        Ok(b.dot(&c))
+    }
+
     fn retract(
         &self,
         point: ArrayView1<'_, f64>,

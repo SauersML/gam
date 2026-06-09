@@ -61,6 +61,16 @@ impl RiemannianManifold for CircleManifold {
         Ok(identity(1))
     }
 
+    /// Flat unit metric: the Riemannian gradient is the ambient gradient (the
+    /// angular tangent line is the whole 1-D ambient space).
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.project_tangent(point, euclidean_grad)
+    }
+
     fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
         check_len("Circle Christoffel point", point.len(), 1)?;
         Ok(zero_christoffel(1))
