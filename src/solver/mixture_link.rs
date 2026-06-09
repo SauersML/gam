@@ -1436,6 +1436,48 @@ pub fn inverse_link_jet_for_family(
     spec.link.jet(eta)
 }
 
+/// Exact-public log inverse-link jet: `mu = d1 = d2 = d3 = exp(η)` with NO
+/// `η`-clamp. Sibling of the solver-internal `LinkFunction::Log` jet (which
+/// clamps `η` to `[−700, 700]` as an IRLS/REML conditioning hack); see issue
+/// #963. Every derivative of `exp` is `exp`, so all four jet slots carry the
+/// same exact value — finite wherever representable, `0.0` on underflow,
+/// `+∞` on overflow.
+#[inline]
+fn log_inverse_link_jet_exact(eta: f64) -> InverseLinkJet {
+    let e = eta.exp();
+    InverseLinkJet {
+        mu: e,
+        d1: e,
+        d2: e,
+        d3: e,
+    }
+}
+
+/// EXACT public inverse-link jet for response-scale prediction outputs.
+///
+/// Identical to [`inverse_link_jet_for_family`] for every link EXCEPT the
+/// standard `Log` link, where it returns the exact `exp(η)` jet instead of the
+/// solver's `η.clamp(−700, 700).exp()` conditioning transform. On finite `η`
+/// the two diverge (η = 705: exact `exp(705)` ≈ 1.5e306 vs clamped
+/// `exp(700)` ≈ 1.0e304; η = −720: exact ≈ 2e−313 vs clamped ≈ 9.9e−305), so
+/// public predictions (`FamilyStrategy::inverse_link_jet`/`inverse_link_array`,
+/// the predict response + delta-method SE path) route here. The solver/REML/
+/// PIRLS engines keep the clamped jet (issue #963). For `|η| ≤ 700` this is
+/// byte-identical to the clamped jet (the clamp is inert there), so no
+/// in-range prediction changes.
+pub fn inverse_link_jet_for_family_public(
+    spec: &LikelihoodSpec,
+    eta: f64,
+) -> Result<InverseLinkJet, EstimationError> {
+    if matches!(spec.response, ResponseFamily::RoystonParmar) {
+        return Ok(royston_parmar_inverse_link_jet(eta));
+    }
+    if let InverseLink::Standard(StandardLink::Log) = spec.link {
+        return Ok(log_inverse_link_jet_exact(eta));
+    }
+    spec.link.jet(eta)
+}
+
 #[inline]
 pub fn mixture_inverse_link_jet(state: &MixtureLinkState, eta: f64) -> InverseLinkJet {
     let mut mu = 0.0_f64;
