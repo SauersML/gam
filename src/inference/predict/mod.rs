@@ -3521,19 +3521,32 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
 /// Gaussian location-scale predictor: two blocks (mean + log-sigma).
 ///
 /// Predicts `mean = X_mu @ beta_mu` (identity link on mean) and
-/// `sigma = LOGB_SIGMA_FLOOR + exp(X_noise @ beta_noise + offset_noise)`.
+/// `sigma = sigma_floor + exp(X_noise @ beta_noise + offset_noise)`.
+///
+/// `sigma_floor` is the response-scale-relative σ floor `LOGB_SIGMA_FLOOR ·
+/// response_scale`. Gaussian location-scale fits standardize the response by
+/// `response_scale` and map the log-σ coefficients back to raw units by shifting
+/// the intercept by `+ln(response_scale)`. That intercept shift only multiplies
+/// the `exp(η)` term by `response_scale`; the floor must be scaled separately for
+/// the reconstructed σ to be response-scale-equivariant (#884), so it is carried
+/// here rather than left at the raw `LOGB_SIGMA_FLOOR`.
 pub struct GaussianLocationScalePredictor {
     pub beta_mu: Array1<f64>,
     pub beta_noise: Array1<f64>,
+    pub sigma_floor: f64,
     pub covariance: Option<Array2<f64>>,
     pub link_wiggle: Option<SavedLinkWiggleRuntime>,
 }
 
 impl GaussianLocationScalePredictor {
-    /// Compute σ = LOGB_SIGMA_FLOOR + exp(η_noise + offset_noise). Gaussian
-    /// location-scale fits standardize internally and map coefficients back to
-    /// raw response units before persistence, so prediction must not apply a
-    /// second response-scale multiplier.
+    /// Compute σ = sigma_floor + exp(η_noise + offset_noise). Gaussian
+    /// location-scale fits standardize internally and map the log-σ coefficients
+    /// back to raw response units (intercept shifted by `+ln(response_scale)`)
+    /// before persistence, so prediction must not apply a second response-scale
+    /// multiplier to η. The floor, however, is reconstructed with the
+    /// response-scale-relative value `sigma_floor = LOGB_SIGMA_FLOOR ·
+    /// response_scale`, because the intercept shift only scales the `exp(η)` term
+    /// — keeping the σ surface response-scale-equivariant (#884).
     fn compute_sigma(
         &self,
         design_noise: &DesignMatrix,
@@ -3550,7 +3563,10 @@ impl GaussianLocationScalePredictor {
             }
             eta_noise += offset_noise;
         }
-        Ok(eta_noise.mapv(crate::families::sigma_link::logb_sigma_from_eta_scalar))
+        let floor = self.sigma_floor;
+        Ok(eta_noise.mapv(|eta| {
+            crate::families::sigma_link::logb_sigma_from_eta_with_floor_scalar(floor, eta)
+        }))
     }
 
     fn eta_standard_error_from_backend(
@@ -7036,6 +7052,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
+            sigma_floor: crate::families::sigma_link::LOGB_SIGMA_FLOOR,
             covariance: None,
             link_wiggle: None,
         };
@@ -7067,6 +7084,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
+            sigma_floor: crate::families::sigma_link::LOGB_SIGMA_FLOOR,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
         };
@@ -7095,6 +7113,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
+            sigma_floor: crate::families::sigma_link::LOGB_SIGMA_FLOOR,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,
         };
