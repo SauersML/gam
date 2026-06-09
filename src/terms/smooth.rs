@@ -10366,11 +10366,9 @@ fn extract_spatial_operator_runtime_caches(
         let mut mass_local_idx = None;
         let mut tension_local_idx = None;
         let mut stiffness_local_idx = None;
-        let mut primary_local_idx = None;
         let mut mass_norm = None;
         let mut tension_norm = None;
         let mut stiffness_norm = None;
-        let mut primary_norm = None;
         for info in &term_fit.penaltyinfo_local {
             if !info.active {
                 continue;
@@ -10388,26 +10386,22 @@ fn extract_spatial_operator_runtime_caches(
                     stiffness_local_idx = Some(active_local_idx);
                     stiffness_norm = Some(info.normalization_scale);
                 }
-                PenaltySource::Primary => {
-                    primary_local_idx = Some(active_local_idx);
-                    primary_norm = Some(info.normalization_scale);
-                }
                 _ => {}
             }
             active_local_idx += 1;
         }
-        // The curvature channel maps onto the explicit D2 Stiffness operator when
-        // the term ships one (Matérn collocation / Duchon `all_active()`); for the
-        // *default* Duchon penalty Stiffness is deliberately disabled because the
-        // always-on Primary RKHS Gram is the exact curvature (#858). In that
-        // {mass, tension, Primary} layout the Primary penalty is the curvature
-        // channel: the adaptive Charbonnier surrogate (built from the D2
-        // collocation operator below) reweights and replaces it, so the curvature
-        // global index / normalization come from Primary.
-        let (curvature_local_idx, curvature_norm) = match (stiffness_local_idx, stiffness_norm) {
-            (Some(idx), Some(norm)) => (Some(idx), Some(norm)),
-            _ => (primary_local_idx, primary_norm),
-        };
+        // The Charbonnier adaptive overlay rebuilds the {mass, tension,
+        // stiffness} D-operator triplet from explicit collocation derivatives
+        // and reweights all three channels in tandem; the stiffness slot in
+        // particular is the D2 second-derivative operator. A term that does
+        // NOT ship an explicit Stiffness penalty (pure Duchon's RKHS-Primary-
+        // curvature layout — `DuchonOperatorPenaltySpec::default()`) has no
+        // matching shipped penalty for the Charbonnier D2 surrogate to reweight,
+        // so applying the overlay would smuggle a fresh D2 collocation
+        // operator into a basis whose curvature is the RKHS Primary Gram (a
+        // different mathematical object). Without an explicit Stiffness
+        // channel the term must be skipped — the runtime cache for the
+        // adaptive overlay simply doesn't apply.
         let (
             Some(mass_local),
             Some(tension_local),
@@ -10418,10 +10412,10 @@ fn extract_spatial_operator_runtime_caches(
         ) = (
             mass_local_idx,
             tension_local_idx,
-            curvature_local_idx,
+            stiffness_local_idx,
             mass_norm,
             tension_norm,
-            curvature_norm,
+            stiffness_norm,
         )
         else {
             continue;
