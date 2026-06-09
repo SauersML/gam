@@ -25999,59 +25999,26 @@ fn create_ispline_dense(
         left_offsets[j] = left_running;
     }
 
-    // First-order linear extension outside the knot domain. The plain B-spline
-    // basis (`BasisEvalKind::Basis`) already extends linearly past the boundary
-    // knots via `apply_linear_extension_from_first_derivative`; the I-spline must
-    // do the same or its cumulative time effect SATURATES flat beyond `right`,
-    // biasing the upper tail of `log Λ(t)` (it stops growing while the true
-    // log-cumulative-hazard keeps rising as log t). The I-spline derivative is
-    // the reverse-cumulative sum of the degree-`bs_degree` B-spline first
-    // derivative (the same identity the survival time-basis builder uses to
-    // assemble `x_derivative_time`), so we evaluate that derivative at each
-    // boundary knot and extend every column as
-    // `I_{j-1}(x) = I_{j-1}(boundary) + (x − boundary)·I_{j-1}'(boundary)`.
-    let boundary_ispline_derivative = |boundary: f64| -> Result<Vec<f64>, BasisError> {
-        let mut bspline_deriv = vec![0.0_f64; num_bspline_basis];
-        let mut lower_basis = vec![0.0_f64; knot_vector.len().saturating_sub(bs_degree)];
-        let mut lower_scratch = internal::BsplineScratch::new(bs_degree.saturating_sub(1));
-        evaluate_bspline_derivative_scalar_into(
-            boundary,
-            knot_vector,
-            bs_degree,
-            &mut bspline_deriv,
-            &mut lower_basis,
-            &mut lower_scratch,
-        )?;
-        // I_{j-1}'(x) = Σ_{m ≥ j} (B_m^{bs_degree})'(x): reverse-cumulative sum,
-        // matching the I-spline value relation `I_{j-1} = Σ_{m ≥ j} B_m − offset`.
-        let mut ispline_deriv = vec![0.0_f64; num_ispline_basis];
-        let mut running = 0.0_f64;
-        for j in (1..num_bspline_basis).rev() {
-            running += bspline_deriv[j];
-            ispline_deriv[j - 1] = running;
-        }
-        Ok(ispline_deriv)
-    };
-    let right_deriv = boundary_ispline_derivative(right)?;
-    let left_deriv = boundary_ispline_derivative(left)?;
-
+    // Outside the knot domain the I-spline saturates: every basis is anchored
+    // at 0 at `left` and reaches its right-cumulative mass (≈ 1 minus the
+    // left-boundary offset) by `right`. Saturation is the definition of the
+    // cumulative integral of an M-spline whose support is `[left, right]`, and
+    // it preserves the I-spline value range [0, 1] — linearly extending past
+    // the boundary would produce NEGATIVE basis entries for `x < left` and
+    // entries `> 1` for `x > right`, violating both monotonicity inside [0, 1]
+    // and the constraint that an I-spline is itself non-negative everywhere.
+    // Callers that need a different out-of-domain behavior (e.g. survival
+    // log-Λ that must keep growing past the right-most observation time) must
+    // clamp inputs and add their own extrapolation correction — the basis
+    // evaluator's contract is the same on the scalar and dense paths.
     for (row_i, &x) in data.iter().enumerate() {
         if x < left {
-            // Below the left boundary knot every interior I-spline value is 0;
-            // extend linearly with the boundary derivative so the cumulative
-            // effect does not clip flat to 0 (monotonicity is preserved because
-            // the I-spline derivative is non-negative).
-            let dx = x - left;
-            for j in 1..num_bspline_basis {
-                let value = dx * left_deriv[j - 1];
-                out[[row_i, j - 1]] = if value.abs() <= 1e-15 { 0.0 } else { value };
-            }
+            // No cumulative mass yet — I_j(x) = 0 for every column.
             continue;
         }
         if x >= right {
-            let dx = x - right;
             for j in 1..num_bspline_basis {
-                let value = (1.0 - left_offsets[j]) + dx * right_deriv[j - 1];
+                let value = 1.0 - left_offsets[j];
                 out[[row_i, j - 1]] = if value.abs() <= 1e-15 { 0.0 } else { value };
             }
             continue;
