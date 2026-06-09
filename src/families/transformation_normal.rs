@@ -34,7 +34,8 @@ use crate::families::custom_family::{
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
-    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, ParameterBlockSpec,
+    JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
+    ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
@@ -8815,6 +8816,33 @@ impl ExactNewtonJointHessianWorkspace for TransformationNormalJointHessianWorksp
 
     fn hessian_source_preference(&self) -> JointHessianSourcePreference {
         JointHessianSourcePreference::Operator
+    }
+
+    /// Intent-aware refinement (#738). CTN exposes both a streamed Khatri-Rao
+    /// HVP (`scop_hessian_matvec_into`, no `p_resp·p_cov` cross-product) and a
+    /// structural direct-dense build (`scop_gradient_and_negative_hessian`).
+    /// The right representation depends entirely on what the consumer does:
+    ///
+    /// - `InnerSolve` only applies `H · v`, so stream the HVP — building the
+    ///   dense matrix would be `O(p²)` memory and a `Θ(n·p²)` build paid up
+    ///   front for a solve that may take far fewer than `p` matvecs.
+    /// - `LogdetFactorization` factorizes `H + S_λ` and therefore needs a dense
+    ///   matrix regardless. Returning `Operator` here only makes the dispatch
+    ///   wrap the HVP and forces the logdet consumer to immediately re-densify
+    ///   it via `dense_forced` (the structural build) — a pointless round trip.
+    ///   Answer `Dense` so the consumer gets the structural build directly.
+    /// - `OuterEvaluation` / `OuterGradient` fall back to the blanket
+    ///   `Operator` preference (matrix-free, matching the prior behaviour).
+    fn hessian_source_preference_for_intent(
+        &self,
+        intent: MaterializationIntent,
+    ) -> JointHessianSourcePreference {
+        match intent {
+            MaterializationIntent::LogdetFactorization => JointHessianSourcePreference::Dense,
+            MaterializationIntent::InnerSolve
+            | MaterializationIntent::OuterEvaluation
+            | MaterializationIntent::OuterGradient => self.hessian_source_preference(),
+        }
     }
 
     fn hessian_matvec_available(&self) -> bool {
