@@ -7725,13 +7725,25 @@ fn build_term_collection_design_inner(
                         .into_par_iter()
                         .map(|j| {
                             let linear = &spec.linear_terms[j];
-                            if linear.feature_col >= p_data {
-                                crate::bail_dim_basis!(
-                                    "linear term '{}' feature column {} out of bounds for {} columns",
-                                    linear.name, linear.feature_col, p_data
-                                );
+                            // `:` interactions carry multiple feature columns; the
+                            // materialized column is their elementwise product (a
+                            // plain main effect has a single column). Mirror
+                            // `build_term_collection_fixed_blocks` so this path and
+                            // the incremental realizer agree on every interaction.
+                            let cols = linear.effective_feature_cols();
+                            for &col in &cols {
+                                if col >= p_data {
+                                    crate::bail_dim_basis!(
+                                        "linear term '{}' feature column {} out of bounds for {} columns",
+                                        linear.name, col, p_data
+                                    );
+                                }
                             }
-                            Ok(data.column(linear.feature_col).to_owned())
+                            let mut column = data.column(cols[0]).to_owned();
+                            for &c in cols.iter().skip(1) {
+                                column *= &data.column(c);
+                            }
+                            Ok(column)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
 
