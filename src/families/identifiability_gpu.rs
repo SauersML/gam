@@ -448,16 +448,25 @@ mod cuda_impl {
                                 range_b.len(),
                             )?;
                             contrib_h = contrib_h + &weighted_block;
-                            let struct_block = plain_gemm(
-                                &self.blas,
-                                &self.stream,
-                                x_a,
-                                x_b,
-                                self.n_rows,
-                                range_a.len(),
-                                range_b.len(),
-                            )?;
-                            contrib_s = contrib_s + &struct_block;
+                            // Structural Gram is `gram_h` evaluated with the
+                            // K×K identity Hessian, so only the diagonal
+                            // channel pair (c == d) survives — cross-channel
+                            // terms vanish. This mirrors the authoritative CPU
+                            // reference `build_raw_grams_structural`
+                            // (`K^S = Σ_c Xa^(c)ᵀ Xb^(c)`) and the fused
+                            // kernel's `if (c == d)` accumulation.
+                            if c == d {
+                                let struct_block = plain_gemm(
+                                    &self.blas,
+                                    &self.stream,
+                                    x_a,
+                                    x_b,
+                                    self.n_rows,
+                                    range_a.len(),
+                                    range_b.len(),
+                                )?;
+                                contrib_s = contrib_s + &struct_block;
+                            }
                         }
                     }
                     assign_block(&mut gram_h, range_a.start, range_b.start, &contrib_h);
@@ -643,6 +652,11 @@ mod tests {
                         let b_cols = x_b.ncols();
                         let row_off = raw_block_ranges[a].start;
                         let col_off = raw_block_ranges[b].start;
+                        // Structural Gram keeps only the diagonal channel pair
+                        // (c == d): it is `gram_h` under the identity Hessian,
+                        // so cross-channel terms vanish (see
+                        // `build_raw_grams_structural`).
+                        let diagonal_channel = c == d;
                         for i in 0..a_cols {
                             for j in 0..b_cols {
                                 let mut acc_h = 0.0_f64;
@@ -650,7 +664,9 @@ mod tests {
                                 for row in 0..n_rows {
                                     let prod = x_a[[row, i]] * x_b[[row, j]];
                                     acc_h += w_col[row] * prod;
-                                    acc_s += prod;
+                                    if diagonal_channel {
+                                        acc_s += prod;
+                                    }
                                 }
                                 gram_h[[row_off + i, col_off + j]] += acc_h;
                                 gram_struct[[row_off + i, col_off + j]] += acc_s;
