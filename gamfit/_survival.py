@@ -690,11 +690,16 @@ def default_survival_time_grid(
     formula: str,
     headers: list[str],
     rows: list[list[str]],
+    model_bytes: bytes | None = None,
 ) -> list[float] | None:
+    # When ``model_bytes`` is supplied the grid's upper edge is anchored to the
+    # fitted model's training time support rather than the prediction frame's
+    # ``exit`` placeholder, so an in-range query time cannot be silently
+    # truncated to the ``t -> inf`` asymptote (issue #896).
     from ._binding import rust_module
 
     result = rust_module().default_survival_time_grid(
-        model_class, formula, list(headers), [list(r) for r in rows]
+        model_class, formula, list(headers), [list(r) for r in rows], model_bytes
     )
     return list(result) if result is not None else None
 
