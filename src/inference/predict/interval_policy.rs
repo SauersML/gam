@@ -291,7 +291,22 @@ pub fn assemble_uncertainty_result(
     let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &mean, z, method)?;
     let (observation_lower, observation_upper) = match observation {
         Some(obs) => {
-            let half = obs.noise_sd.mapv(|s| z * s);
+            // A prediction (observation) interval covers a *future* response
+            // `Y = μ + ε` at the query point. The point `μ̂` is itself estimated
+            // (`Var(μ̂) = mean_standard_error²`) and the observation noise has
+            // `Var(Y|μ) = noise_sd²`; the two are independent, so the predictive
+            // variance is the sum and the band half-width is
+            //   z·√(SE(μ̂)² + σ²),
+            // NOT `z·σ`. Dropping the estimation term under-covers wherever the
+            // fit is uncertain. This matches `family_observation_band`'s
+            // `√(mean_se² + obsvar)` convention used by the dedicated engine.
+            let predictive_se = Array1::from_iter(
+                mean_standard_error
+                    .iter()
+                    .zip(obs.noise_sd.iter())
+                    .map(|(&mse, &sd)| (mse * mse + sd * sd).max(0.0).sqrt()),
+            );
+            let half = predictive_se.mapv(|s| z * s);
             let mut lower = &mean - &half;
             let mut upper = &mean + &half;
             // The predictive band must lie within the response support; a
@@ -870,7 +885,9 @@ mod parity_tests {
     }
 
     /// GaussianLocationScalePredictor shape: identity link (mean interval ==
-    /// η interval) plus an observation interval `μ ± z·σ`.
+    /// η interval) plus a prediction (observation) interval
+    /// `μ ± z·√(SE(μ̂)² + σ²)` — the predictive variance combines estimation
+    /// uncertainty with the response-scale observation noise.
     #[test]
     fn identity_eta_with_observation_matches_inline() {
         let eta = array![1.0, 2.0, -1.0];
@@ -881,8 +898,15 @@ mod parity_tests {
 
         let ref_eta_lower = &eta - &eta_se.mapv(|s| z * s);
         let ref_eta_upper = &eta + &eta_se.mapv(|s| z * s);
-        let ref_obs_lower = &mean - &sigma.mapv(|s| z * s);
-        let ref_obs_upper = &mean + &sigma.mapv(|s| z * s);
+        // Predictive SE folds the mean SE (== eta_se here) into the noise σ.
+        let predictive_se = Array1::from_iter(
+            eta_se
+                .iter()
+                .zip(sigma.iter())
+                .map(|(&mse, &sd)| (mse * mse + sd * sd).sqrt()),
+        );
+        let ref_obs_lower = &mean - &predictive_se.mapv(|s| z * s);
+        let ref_obs_upper = &mean + &predictive_se.mapv(|s| z * s);
 
         let out = assemble_uncertainty_result(
             LEVEL,
