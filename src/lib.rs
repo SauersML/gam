@@ -77,6 +77,7 @@ pub mod solver;
 mod span;
 pub mod terms;
 pub mod test_support;
+pub mod sparkline;
 pub mod types;
 pub mod util;
 
