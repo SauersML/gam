@@ -77,7 +77,38 @@ pub fn log1mexp_positive(a: f64) -> f64 {
 /// even when `p ≈ n` (catastrophic cancellation regime).  When all
 /// signs are zero or all magnitudes are `−∞`, returns
 /// `(NEG_INFINITY, 0.0)`.
+///
+/// A `+∞` log-magnitude denotes an infinite-magnitude term (`exp(+∞) = +∞`)
+/// and dominates the sum: if it appears only with positive sign the result
+/// is `(+∞, +1)`; only with negative sign, `(+∞, −1)` (a log-magnitude of
+/// `+∞` with sign `−1` encodes the value `−∞`); with both signs the sum is
+/// the indeterminate `+∞ − ∞`, returned as `(NaN, 0.0)`.  A `−∞`
+/// log-magnitude is `exp(−∞) = 0` and is correctly dropped.
 pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
+    // Infinite-magnitude terms dominate any finite contribution, so resolve
+    // them before the finite log-sum-exp reduction below. `−∞` log-magnitudes
+    // are `exp(−∞) = 0` and need no special handling.
+    let mut has_pos_inf = false;
+    let mut has_neg_inf = false;
+    for (idx, &lm) in log_mags.iter().enumerate() {
+        if lm == f64::INFINITY {
+            if signs[idx] > 0.0 {
+                has_pos_inf = true;
+            } else if signs[idx] < 0.0 {
+                has_neg_inf = true;
+            }
+        }
+    }
+    match (has_pos_inf, has_neg_inf) {
+        // P = +∞, N = +∞ ⇒ indeterminate +∞ − ∞.
+        (true, true) => return (f64::NAN, 0.0),
+        // P = +∞, N < ∞ ⇒ S = +∞.
+        (true, false) => return (f64::INFINITY, 1.0),
+        // N = +∞, P < ∞ ⇒ S = −∞, encoded as log-magnitude +∞ with sign −1.
+        (false, true) => return (f64::INFINITY, -1.0),
+        (false, false) => {}
+    }
+
     let mut pos_max = f64::NEG_INFINITY;
     let mut neg_max = f64::NEG_INFINITY;
     for (idx, &lm) in log_mags.iter().enumerate() {
@@ -509,6 +540,40 @@ mod tests {
         InverseLink, LinkComponent, MixtureLinkSpec, ResponseFamily, SasLinkSpec, StandardLink,
     };
     use ndarray::array;
+
+    #[test]
+    fn signed_log_sum_exp_propagates_positive_infinities() {
+        // A single +∞ positive-sign term dominates ⇒ S = +∞ ⇒ (+∞, +1).
+        let (lm, s) = signed_log_sum_exp(&[f64::INFINITY], &[1.0]);
+        assert_eq!(lm, f64::INFINITY);
+        assert_eq!(s, 1.0);
+
+        // A single +∞ negative-sign term ⇒ S = −∞, encoded as (+∞, −1).
+        let (lm, s) = signed_log_sum_exp(&[f64::INFINITY], &[-1.0]);
+        assert_eq!(lm, f64::INFINITY);
+        assert_eq!(s, -1.0);
+
+        // +∞ on both signs ⇒ indeterminate +∞ − ∞ ⇒ (NaN, 0).
+        let (lm, s) = signed_log_sum_exp(&[f64::INFINITY, f64::INFINITY], &[1.0, -1.0]);
+        assert!(lm.is_nan());
+        assert_eq!(s, 0.0);
+
+        // A finite positive term alongside a +∞ positive term still gives +∞.
+        let (lm, s) = signed_log_sum_exp(&[0.0, f64::INFINITY], &[1.0, 1.0]);
+        assert_eq!(lm, f64::INFINITY);
+        assert_eq!(s, 1.0);
+
+        // −∞ log-magnitudes are exp(−∞)=0 and must be dropped: mixing a finite
+        // term with a −∞ term reproduces the lone finite term unchanged.
+        let (lm, s) = signed_log_sum_exp(&[2.0, f64::NEG_INFINITY], &[1.0, -1.0]);
+        assert!((lm - 2.0).abs() < 1e-12);
+        assert_eq!(s, 1.0);
+
+        // Finite sanity check: exp(ln 3) − exp(ln 1) = 2 ⇒ (ln 2, +1).
+        let (lm, s) = signed_log_sum_exp(&[3.0_f64.ln(), 1.0_f64.ln()], &[1.0, -1.0]);
+        assert!((lm - 2.0_f64.ln()).abs() < 1e-12);
+        assert_eq!(s, 1.0);
+    }
 
     #[test]
     fn standard_inverse_link_specs_evaluate() {
