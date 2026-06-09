@@ -6946,6 +6946,39 @@ pub enum JointHessianSourcePreference {
     Operator,
 }
 
+/// What the consumer is going to *do* with the joint Hessian. This is the
+/// intent half of #738's capability-vs-representation split: the call site
+/// states what it needs, and the workspace picks the cheapest representation
+/// that serves that need (rather than a single per-workspace preference being
+/// applied uniformly regardless of how the result is consumed).
+///
+/// The distinction matters because the same workspace serves several
+/// consumers with opposite ideal representations:
+/// - the inner Newton/PCG solve only ever applies `H · v`, so a matrix-free
+///   HVP (`Operator`) is ideal and a dense build is pure waste;
+/// - the REML logdet term factorizes `H + S_λ` (Cholesky / eigendecomposition),
+///   so it must hold a dense matrix anyway — handing it an `Operator` only
+///   forces an immediate column-basis (or `dense_forced`) re-materialization,
+///   so a workspace with a structural direct-dense build should answer `Dense`
+///   here and skip the operator wrapper entirely.
+///
+/// Workspaces refine their representation choice per intent via
+/// [`ExactNewtonJointHessianWorkspace::hessian_source_preference_for_intent`];
+/// the default keeps the legacy single-preference behaviour so existing
+/// workspaces are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MaterializationIntent {
+    /// Inner Newton / PCG solve — only applies `H · v`. Matrix-free is ideal.
+    InnerSolve,
+    /// REML/LAML logdet term — factorizes `H + S_λ`, needs a dense matrix.
+    LogdetFactorization,
+    /// Outer-Hessian / EFS evaluation — builds the joint hyper terms; today
+    /// these route through the same source as the gradient path.
+    OuterEvaluation,
+    /// Outer-gradient / IFT term assembly.
+    OuterGradient,
+}
+
 pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Pre-build any per-row jet caches the workspace will hand to the
     /// outer-eval directional-derivative path. Called once when the
@@ -6972,6 +7005,23 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// coefficient Hessian or the matrix-free HVP source.
     fn hessian_source_preference(&self) -> JointHessianSourcePreference {
         JointHessianSourcePreference::Dense
+    }
+
+    /// Intent-aware representation choice (#738). Given what the consumer is
+    /// about to do with the Hessian ([`MaterializationIntent`]), return the
+    /// representation the workspace prefers to hand back. The default keeps the
+    /// legacy intent-blind behaviour by delegating to
+    /// [`Self::hessian_source_preference`], so existing workspaces are
+    /// unchanged. Workspaces with a structural direct-dense build that also
+    /// expose a matrix-free HVP override this to answer `Operator` for
+    /// [`MaterializationIntent::InnerSolve`] (stream the HVP) and `Dense` for
+    /// [`MaterializationIntent::LogdetFactorization`] (the consumer factorizes,
+    /// so building the operator wrapper only to re-densify it is pure waste).
+    fn hessian_source_preference_for_intent(
+        &self,
+        _: MaterializationIntent,
+    ) -> JointHessianSourcePreference {
+        self.hessian_source_preference()
     }
 
     /// Forced dense materialization that bypasses any amortization gate the
@@ -10539,11 +10589,14 @@ fn materialize_joint_hessian_source(
 fn exact_newton_joint_hessian_source_from_workspace(
     workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
     total: usize,
+    intent: MaterializationIntent,
     context: &str,
 ) -> Result<Option<JointHessianSource>, String> {
-    if workspace.hessian_source_preference() == JointHessianSourcePreference::Operator {
+    if workspace.hessian_source_preference_for_intent(intent)
+        == JointHessianSourcePreference::Operator
+    {
         return exact_newton_joint_hessian_operator_source_from_workspace(
-            workspace, total, context,
+            workspace, total, intent, context,
         );
     }
 
@@ -10568,16 +10621,19 @@ fn exact_newton_joint_hessian_source_from_workspace(
         return Ok(Some(JointHessianSource::Dense(hessian)));
     }
 
-    exact_newton_joint_hessian_operator_source_from_workspace(workspace, total, context)
+    exact_newton_joint_hessian_operator_source_from_workspace(workspace, total, intent, context)
 }
 
 fn exact_newton_joint_hessian_operator_source_from_workspace(
     workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
     total: usize,
+    intent: MaterializationIntent,
     context: &str,
 ) -> Result<Option<JointHessianSource>, String> {
     let Some(diagonal) = workspace.hessian_diagonal()? else {
-        if workspace.hessian_source_preference() == JointHessianSourcePreference::Operator {
+        if workspace.hessian_source_preference_for_intent(intent)
+            == JointHessianSourcePreference::Operator
+        {
             return Err(CustomFamilyError::UnsupportedConfiguration {
                 reason: format!(
                     "{context}: operator-preferred Hessian workspace did not provide a diagonal"
@@ -10605,7 +10661,9 @@ fn exact_newton_joint_hessian_operator_source_from_workspace(
     }
 
     if !workspace.hessian_matvec_available() {
-        if workspace.hessian_source_preference() == JointHessianSourcePreference::Operator {
+        if workspace.hessian_source_preference_for_intent(intent)
+            == JointHessianSourcePreference::Operator
+        {
             return Err(CustomFamilyError::UnsupportedConfiguration {
                 reason: format!(
                     "{context}: operator-preferred Hessian workspace did not provide HVPs"
@@ -10891,6 +10949,7 @@ fn build_joint_hessian_closures<'a, F: CustomFamily + Clone + Send + Sync + 'sta
         exact_newton_joint_hessian_source_from_workspace(
             workspace,
             total,
+            MaterializationIntent::OuterGradient,
             "joint exact-newton operator mismatch in outer gradient",
         )?
     } else {
@@ -11977,6 +12036,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         exact_newton_joint_hessian_source_from_workspace(
             workspace,
             total,
+            MaterializationIntent::LogdetFactorization,
             "joint exact-newton operator mismatch in logdet terms",
         )?
     } else if !strict_spd && use_joint_matrix_free_path(total, joint_observation_count(states)) {
@@ -11987,6 +12047,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
                 exact_newton_joint_hessian_source_from_workspace(
                     workspace,
                     total,
+                    MaterializationIntent::LogdetFactorization,
                     "joint exact-newton operator mismatch in logdet terms",
                 )
             })
@@ -14676,6 +14737,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         exact_newton_joint_hessian_source_from_workspace(
                             workspace,
                             total_p,
+                            MaterializationIntent::InnerSolve,
                             "joint Newton inner exact-newton operator mismatch",
                         )
                     })
@@ -22026,6 +22088,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 exact_newton_joint_hessian_source_from_workspace(
                     workspace,
                     total,
+                    MaterializationIntent::OuterEvaluation,
                     "joint exact-newton operator mismatch in joint hyper evaluator",
                 )?
             } else {
@@ -23111,6 +23174,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
             exact_newton_joint_hessian_source_from_workspace(
                 workspace,
                 total,
+                MaterializationIntent::OuterEvaluation,
                 "joint exact-newton operator mismatch in joint hyper EFS evaluator",
             )?
         } else {
@@ -27964,10 +28028,14 @@ mod tests {
                 source_preference: JointHessianSourcePreference::Dense,
             });
 
-        let source =
-            exact_newton_joint_hessian_source_from_workspace(&workspace, 2, "counting workspace")
-                .expect("hessian source should build")
-                .expect("hessian source should be present");
+        let source = exact_newton_joint_hessian_source_from_workspace(
+            &workspace,
+            2,
+            MaterializationIntent::InnerSolve,
+            "counting workspace",
+        )
+        .expect("hessian source should build")
+        .expect("hessian source should be present");
 
         assert_eq!(dense_calls.load(Ordering::Relaxed), 1);
         assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
@@ -27992,6 +28060,7 @@ mod tests {
         let source = exact_newton_joint_hessian_source_from_workspace(
             &workspace,
             2,
+            MaterializationIntent::InnerSolve,
             "operator-preferred counting workspace",
         )
         .expect("hessian source should build")
