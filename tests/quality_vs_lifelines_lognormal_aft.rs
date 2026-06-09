@@ -337,6 +337,24 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
         }
     }
     let surv_rel_vs_truth = relative_l2(&gam_surv, &true_surv);
+    // lifelines' reconstructed surface vs the SAME truth — the match-or-beat
+    // baseline for the surface arm, mirroring the slope and scale arms. Built
+    // from lifelines' recovered (slopes, sigma) on the same anchor `a` and grid.
+    // The surface is a deterministic function of the recovered slopes+sigma, so
+    // its truth-error is bounded below by the finite-sample slope/scale error —
+    // at n=150 the low-leverage x0:x1 interaction MLE (var(x0*x1) smallest) has
+    // large sampling variance, so even the gold-standard lifelines MLE
+    // reconstructs the true surface only to ~0.14 rel_l2. The absolute bar below
+    // is set to that finite-sample floor; the match-or-beat assert is the real
+    // gate (gam must be no worse than the mature reference on the same truth).
+    let mut ref_surv = Vec::with_capacity(grid_n * combos.len());
+    for &(c0, c1) in &combos {
+        let ref_mu = a + ref_b0 * c0 + ref_b1 * c1 + ref_g * c0 * c1;
+        for &tt in &time_grid {
+            ref_surv.push(lognormal_survival(tt, ref_mu, ref_sigma));
+        }
+    }
+    let ref_surv_rel = relative_l2(&ref_surv, &true_surv);
 
     eprintln!(
         "lognormal AFT truth recovery: n={n} \
@@ -386,12 +404,25 @@ emit("sigma", [float(np.exp(sigma_params["Intercept"]))])
     );
 
     // ---- PRIMARY: gam's survival surface matches the TRUE surface -----------
-    //  Bar 0.05 rel_l2: with the gauge offset removed, gam's reconstructed
-    //  S(t|x) tracks the true lognormal survival across the 20x4 grid to within
-    //  the finite-sample slope+scale noise above. Fully parametric, so tight.
+    //  The surface is reconstructed deterministically from the recovered
+    //  (slopes, sigma) — whose own bars above are 0.12 — so its truth-error
+    //  inherits that finite-sample noise (and then some, through the nonlinear
+    //  S = 1 - Phi map at the grid corners where the x0:x1 interaction lands).
+    //  Absolute bar 0.18: the n=150 surface floor that even the gold-standard
+    //  lifelines MLE incurs (its g-MLE ~0.37 vs true 0.2 on this draw moves the
+    //  corner surfaces); 0.05 was internally inconsistent with the 0.12 slope
+    //  bar and unachievable by ANY correct estimator here.
     assert!(
-        surv_rel_vs_truth <= 0.05,
+        surv_rel_vs_truth <= 0.18,
         "gam survival surface diverges from the TRUE surface: rel_l2={surv_rel_vs_truth:.4}"
+    );
+    //  Match-or-beat: gam's surface must be no worse than lifelines' on the same
+    //  truth (the real gate, mirroring the slope and scale arms).
+    assert!(
+        surv_rel_vs_truth <= ref_surv_rel * 1.10 + 1e-9,
+        "gam survival surface worse than lifelines baseline: gam={surv_rel_vs_truth:.4} \
+         lifelines={ref_surv_rel:.4} (allowed {:.4})",
+        ref_surv_rel * 1.10
     );
 }
 
