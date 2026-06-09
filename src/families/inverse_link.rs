@@ -60,6 +60,23 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
         }
         "log" => {
             for &e in eta {
+                // Canonical EXACT public log inverse link: bare `exp(η)` with the
+                // correct IEEE semantics — finite wherever `exp(η)` is representable,
+                // `0.0` on underflow (η ≲ −745.1), `+∞` on overflow (η ≳ 709.8).
+                //
+                // Deliberately NO `η.clamp(−700, 700)` here. That clamp lives only
+                // in the SOLVER's inverse-link jet (`LinkFunction::Log` in
+                // `solver/mixture_link.rs`) and PIRLS working-state engine
+                // (`solver/pirls/log_link_working_state.rs::ETA_CLAMP`), where it is
+                // an intentional conditioning hack that keeps the IRLS normal
+                // equations well posed. On FINITE η the two disagree: e.g. at
+                // η = 705 the exact value is exp(705) ≈ 1.5e306 (finite and correct)
+                // while the clamped solver value is exp(700) ≈ 1.0e304 (off by
+                // exp(5) ≈ 148×); at η = −720 the exact value underflows toward 0
+                // (≈ 2e−313) while the clamp pins it at exp(−700) ≈ 9.9e−305. Public
+                // response-scale outputs (FFI `apply_inverse_link_array`, posterior
+                // bands) must report the exact value, so they route here, never
+                // through the solver's clamped jet.
                 out.push(e.exp());
             }
         }
@@ -73,4 +90,64 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_inverse_link_vec;
+
+    /// The public log inverse link is the EXACT `exp(η)`, never the solver's
+    /// `η.clamp(−700, 700).exp()` conditioning transform. This pins the contract
+    /// at the finite boundary η values where the two implementations diverge, so
+    /// a future refactor cannot silently reroute a public response-scale output
+    /// through the clamped solver jet (issue #963).
+    #[test]
+    fn public_log_inverse_link_is_exact_exp_not_solver_clamp() {
+        // η = 705: exact exp(705) is finite (≈1.5e306); the solver clamp would
+        // return exp(700) (≈1.0e304), wrong by a factor of exp(5) ≈ 148.
+        let out = apply_inverse_link_vec(&[705.0], "log").expect("log inverse link");
+        assert_eq!(out.len(), 1);
+        let exact = 705.0_f64.exp();
+        assert!(exact.is_finite(), "exp(705) must be representable in f64");
+        assert_eq!(
+            out[0], exact,
+            "public log inverse link must be exact exp(705), not the solver clamp"
+        );
+        let clamped = 700.0_f64.exp();
+        assert!(
+            out[0] > clamped * 100.0,
+            "exact exp(705) must exceed the clamped exp(700) by ~exp(5); got {} vs {}",
+            out[0],
+            clamped
+        );
+
+        // η = −720: exact exp(−720) underflows toward 0 (≈2e−313, subnormal);
+        // the solver clamp would pin it at exp(−700) ≈ 9.9e−305, ~4.85e8× too
+        // large. Either way the exact value is strictly below the clamped one.
+        let out = apply_inverse_link_vec(&[-720.0], "log").expect("log inverse link");
+        let exact = (-720.0_f64).exp();
+        assert_eq!(
+            out[0], exact,
+            "public log inverse link must be exact exp(-720), not the solver clamp"
+        );
+        let clamped = (-700.0_f64).exp();
+        assert!(
+            out[0] < clamped,
+            "exact exp(-720) must be strictly below the clamped exp(-700); got {} vs {}",
+            out[0],
+            clamped
+        );
+
+        // True IEEE overflow/underflow limits are honored exactly.
+        let over = apply_inverse_link_vec(&[710.0], "log").expect("log inverse link");
+        assert!(
+            over[0].is_infinite() && over[0] > 0.0,
+            "exp(710) overflows to +inf under the exact public transform"
+        );
+        let under = apply_inverse_link_vec(&[-746.0], "log").expect("log inverse link");
+        assert_eq!(
+            under[0], 0.0,
+            "exp(-746) underflows to exactly 0.0 under the exact public transform"
+        );
+    }
 }

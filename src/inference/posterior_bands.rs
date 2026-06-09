@@ -222,6 +222,38 @@ mod tests {
         }
     }
 
+    /// The posterior response-scale band path is a PUBLIC consumer of the log
+    /// inverse link and must report the EXACT `exp(η)`, never the solver's
+    /// `η.clamp(−700, 700).exp()` conditioning transform (issue #963). Pin the
+    /// finite boundary η = 705 where the exact value (≈1.5e306) and the clamped
+    /// value (exp(700) ≈ 1.0e304) diverge by ~exp(5) ≈ 148.
+    #[test]
+    fn response_bands_use_exact_log_inverse_link_not_solver_clamp() {
+        // Single degenerate draw at η = 705 so every response-scale summary
+        // (point estimate + both band edges) collapses to exp(705) exactly.
+        let eta = Array2::from_shape_vec((1, 1), vec![705.0]).expect("shape");
+        let (_eta_mean, _eta_lower, _eta_upper, mean, mean_lower, mean_upper) =
+            eta_bands_from_matrix(eta.view(), "log", 0.90).expect("bands");
+
+        let exact = 705.0_f64.exp();
+        assert!(exact.is_finite(), "exp(705) must be representable in f64");
+        let clamped = 700.0_f64.exp();
+        for (label, v) in [
+            ("mean", mean[0]),
+            ("mean_lower", mean_lower[0]),
+            ("mean_upper", mean_upper[0]),
+        ] {
+            assert_eq!(
+                v, exact,
+                "{label} must be exact exp(705), not the solver-clamped exp(700)"
+            );
+            assert!(
+                v > clamped * 100.0,
+                "{label} must exceed the clamped exp(700) by ~exp(5); got {v} vs {clamped}"
+            );
+        }
+    }
+
     /// Levels outside (0, 1) are rejected rather than silently clamped.
     #[test]
     fn level_must_lie_in_open_unit_interval() {
