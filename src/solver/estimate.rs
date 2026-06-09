@@ -23,8 +23,6 @@
 //! each smooth term directly from the data.
 
 use crate::solver::estimate::reml::{DirectionalHyperParam, RemlState};
-// BlockwiseFitResult and SurvivalLocationScaleFitResult are now type aliases
-// for UnifiedFitResult, defined in their respective modules.
 use std::fmt;
 use std::time::Instant;
 
@@ -5161,10 +5159,6 @@ pub struct UnifiedFitResultParts {
 ///
 /// Standard models have a single block; GAMLSS and survival models have
 /// multiple blocks with different roles.
-///
-/// Backward-compatible field aliases are provided so that code written against
-/// the old `FitResult`, `BlockwiseFitResult`, and `SurvivalLocationScaleFitResult`
-/// types continues to compile after the unification.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnifiedFitResult {
     // ── canonical fields ──────────────────────────────────────────────────
