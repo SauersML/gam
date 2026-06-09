@@ -34,7 +34,7 @@ use gam::estimate::{
 };
 use gam::families::bms::LatentMeasureKind;
 use gam::families::cubic_cell_kernel as exact_kernel;
-use gam::gamlss::{
+use gam::families::wiggle::{
     buildwiggle_block_input_from_knots, monotone_wiggle_basis_with_derivative_order,
 };
 use gam::inference::data::{
@@ -5442,8 +5442,8 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
         seed[eta_entry.len() + i] = eta_exit[i];
     }
     let (primary_order, extra_orders) =
-        gam::gamlss::split_wiggle_penalty_orders(2, &saved_cfg.penalty_orders);
-    let mut block = gam::gamlss::buildwiggle_block_input_from_knots(
+        gam::families::wiggle::split_wiggle_penalty_orders(2, &saved_cfg.penalty_orders);
+    let mut block = gam::families::wiggle::buildwiggle_block_input_from_knots(
         seed.view(),
         &wiggle_knots,
         saved_cfg.degree,
@@ -5451,7 +5451,7 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
         saved_cfg.double_penalty,
     )
     .expect("rebuild saved baseline-timewiggle block");
-    gam::gamlss::append_selected_wiggle_penalty_orders(&mut block, &extra_orders)
+    gam::families::wiggle::append_selected_wiggle_penalty_orders(&mut block, &extra_orders)
         .expect("append saved extra penalties");
 
     assert_eq!(wiggle_cfg.penalty_orders, vec![1, 2, 3]);

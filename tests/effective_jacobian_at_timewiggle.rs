@@ -104,7 +104,7 @@ fn beta_nonzero() -> Array1<f64> {
 fn compute_q(h: f64, beta_tw: &[f64]) -> f64 {
     let knots = wiggle_knots();
     let h_arr = Array1::from_vec(vec![h]);
-    let basis = gam::gamlss::monotone_wiggle_basis_with_derivative_order(
+    let basis = gam::families::wiggle::monotone_wiggle_basis_with_derivative_order(
         h_arr.view(),
         &knots,
         WIGGLE_DEGREE,
@@ -161,7 +161,7 @@ fn row_eta(i: usize, beta: &[f64]) -> (f64, f64, f64) {
     // qd1 = dq/dh(h1) * d_raw
     let knots = wiggle_knots();
     let h1_arr = Array1::from_vec(vec![h1_base]);
-    let basis_d1 = gam::gamlss::monotone_wiggle_basis_with_derivative_order(
+    let basis_d1 = gam::families::wiggle::monotone_wiggle_basis_with_derivative_order(
         h1_arr.view(),
         &knots,
         WIGGLE_DEGREE,

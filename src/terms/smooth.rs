@@ -4371,7 +4371,6 @@ mod convex_divided_difference_transform_tests {
         // Clustered (clamped/quantile-like) abscissae: γ_{≥2} ≥ 0 must certify a
         // non-negative second *divided* difference (true function convexity).
         let g = Array1::from(vec![0.0, 0.1, 0.3, 0.7, 1.4, 2.6, 4.5]);
-        let p = g.len();
         let t = convex_divided_difference_transform_matrix(&g, 1.0).unwrap();
         // γ_0, γ_1 arbitrary (level/slope); γ_{≥2} ≥ 0 (convex cone interior).
         let gamma = Array1::from(vec![-2.0, 1.5, 0.4, 0.0, 1.2, 0.7, 0.9]);
