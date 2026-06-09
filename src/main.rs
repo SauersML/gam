@@ -6797,6 +6797,20 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     progress.advance_workflow(report_total_steps);
     progress.finish_progress("report complete");
     cli_out!("wrote report: {}", out.display());
+
+    // Terminal quick-look: a unicode sparkline of each smooth term's fitted
+    // partial effect, straight from the values we already computed for the
+    // HTML. This is purely a rendering of `input.smooth_plots` — it reads the
+    // fitted contributions and touches no fit/REML/prediction value.
+    if !input.smooth_plots.is_empty() {
+        cli_out!("smooth terms:");
+        for sp in &input.smooth_plots {
+            cli_out!(
+                "{}",
+                gam::sparkline::render_smooth_line(&sp.name, &sp.x, &sp.y)
+            );
+        }
+    }
     Ok(())
 }
 
