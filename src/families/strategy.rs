@@ -9,7 +9,10 @@ use crate::quadrature::{
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
+use crate::types::{
+    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, ResponseFamily,
+    StandardLink,
+};
 use ndarray::{Array1, ArrayView1};
 
 /// Floor on the Bernoulli posterior variance `p(1 - p)`. Keeps the reported
@@ -271,6 +274,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 integrated_family_moments_jet(
                     quadctx,
                     &LikelihoodSpec::binomial_mixture(state.clone()),
+                    // Binomial variance is pinned by the mean (φ ≡ 1); the mixture
+                    // mean does not depend on `scale`, so pass the canonical
+                    // unit-scale label explicitly.
+                    LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
                     eta,
                     se_eta,
                 )
@@ -349,6 +356,10 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 let m1 = integrated_family_moments_jet(
                     quadctx,
                     &LikelihoodSpec::binomial_mixture(state.clone()),
+                    // Binomial variance is pinned by the mean (φ ≡ 1); only the
+                    // integrated mean `m1` is read here, so pass the canonical
+                    // unit-scale label explicitly.
+                    LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
                     eta,
                     se_eta,
                 )?
@@ -409,6 +420,18 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 mode: jet.mode,
             });
         }
-        integrated_family_moments_jet(quadctx, &self.spec, eta, se_eta)
+        // The observation-model variance for Tweedie/Gamma depends on the
+        // exponential-dispersion metadata (Tweedie φ, Gamma shape). The strategy
+        // carries the (response, link) spec, so supply that spec's scale metadata
+        // — for Gamma/Tweedie this is the estimated-dispersion variant (seeded at
+        // the unit value, refined during fitting), never a silent hardcoded φ = 1
+        // baked into the integrator (issue #953).
+        integrated_family_moments_jet(
+            quadctx,
+            &self.spec,
+            self.spec.default_scale_metadata(),
+            eta,
+            se_eta,
+        )
     }
 }
