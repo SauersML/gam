@@ -562,26 +562,6 @@ impl DeclaredHessianForm {
     }
 }
 
-/// Bridge for the partial migration from the legacy `Derivative`-only
-/// declaration to the richer [`DeclaredHessianForm`] used by the
-/// outer-optimizer planner. Family call sites that still produce
-/// `Derivative` (the simple available/unavailable bit) lift through
-/// this `From` impl without each rewriting its capability probe:
-/// `Analytic` defaults to `Either` so the seed loop inspects the
-/// realized seed eval and locks the route at runtime, mirroring the
-/// historical seed-eval-branch behavior; `Unavailable` projects to
-/// `Unavailable`. New call sites that already know whether the
-/// Hessian is materialized as `Dense` or comes through an `Operator`
-/// can construct the richer variant directly.
-impl From<Derivative> for DeclaredHessianForm {
-    fn from(d: Derivative) -> Self {
-        match d {
-            Derivative::Analytic => DeclaredHessianForm::Either,
-            Derivative::Unavailable => DeclaredHessianForm::Unavailable,
-        }
-    }
-}
-
 /// Declares what a specific model path can provide to the outer optimizer.
 ///
 /// Each call site that optimizes smoothing parameters constructs one of these
