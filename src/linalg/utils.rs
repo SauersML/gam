@@ -57,6 +57,24 @@ pub(crate) fn stack_offsets(blocks: &[&Array1<f64>]) -> Array1<f64> {
     out
 }
 
+/// Rows per streaming chunk so each `chunk_rows × p` `f64` tile stays near an
+/// 8 MiB working-set budget, clamped to `[256, 65_536]` and never exceeding
+/// `n`. Canonical home for the row-chunk heuristic that previously lived as
+/// byte-identical module-local copies in `solver/pirls` (sparse-native nnz
+/// counting) and `terms/smooth` (linear-fit column conditioning). With `p == 0`
+/// there is no per-row footprint, so the whole design is one chunk.
+pub(crate) fn row_chunk_for_byte_budget(n: usize, p: usize) -> usize {
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_ROWS: usize = 256;
+    const MAX_ROWS: usize = 65_536;
+    if p == 0 {
+        return n.max(1);
+    }
+    (TARGET_BYTES / (p * 8))
+        .clamp(MIN_ROWS, MAX_ROWS)
+        .min(n.max(1))
+}
+
 /// Numerically stable softplus `log(1 + exp(x))`.
 ///
 /// Uses the identity `softplus(x) = max(x, 0) + log1p(exp(-|x|))`, which

@@ -42,7 +42,7 @@ pub use crate::solver::active_set::{
     ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintKktDiagnostics, LinearInequalityConstraints,
 };
 
-use crate::linalg::utils::{array_is_finite, inf_norm};
+use crate::linalg::utils::{array_is_finite, inf_norm, row_chunk_for_byte_budget};
 
 // ── Submodule split ─────────────────────────────────────────────────────────
 mod convergence;
@@ -3512,18 +3512,6 @@ pub(super) fn constrained_stationarity_norm(
     projected_gradient_norm(gradient, beta, lower_bounds)
 }
 
-fn chunk_rows_for_nnz_count(n: usize, p: usize) -> usize {
-    const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    const MIN_ROWS: usize = 256;
-    const MAX_ROWS: usize = 65_536;
-    if p == 0 {
-        return n.max(1);
-    }
-    (TARGET_BYTES / (p * 8))
-        .clamp(MIN_ROWS, MAX_ROWS)
-        .min(n.max(1))
-}
-
 fn count_dense_upper_nnz(matrix: &Array2<f64>, tol: f64) -> usize {
     let p = matrix.nrows().min(matrix.ncols());
     let mut nnz = 0usize;
@@ -3573,7 +3561,7 @@ fn estimate_sparse_native_decision(
         // path without forcing a full materialization.
         let row_chunk_start = std::time::Instant::now();
         let n = x_original.nrows();
-        let chunk = chunk_rows_for_nnz_count(n, x_original.ncols());
+        let chunk = row_chunk_for_byte_budget(n, x_original.ncols());
         let mut nnz: usize = 0;
         let mut chunks_processed = 0usize;
         if chunk > 0 && n > 0 {
