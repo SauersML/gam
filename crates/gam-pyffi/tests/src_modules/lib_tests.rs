@@ -35,15 +35,16 @@ fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>
     (headers, rows, y)
 }
 
-/// Regression for issue #381 adversarial review (flaw #2): the per-output
-/// residual-variance denominator must count the FULL effective df of each
-/// tangent coordinate's columns — unpenalized columns (intercept + the
-/// parametric `x`, `z`) included — matching the canonical Gaussian scale
-/// `n - edf_total`. The pre-fix denominator used only the penalized
-/// `edf_by_block`, overstating residual df by the unpenalized count and
-/// biasing sigma2 low.
+/// Regression for issue #381 adversarial review (flaw #2), carried into the
+/// shared-smoothing model (issue #967): the residual-variance denominator must
+/// count the FULL effective df — unpenalized columns (intercept + the
+/// parametric `x`, `z`) included — matching the canonical Gaussian scale. With
+/// one pooled isotropic σ² over the `D·n` stacked rows, that denominator is
+/// `D·n - edf_total`, `edf_total = (K·D - penalized_rank) + penalized_edf`. The
+/// pre-fix denominator used only the penalized `edf_by_block`, overstating
+/// residual df and biasing σ² low.
 #[test]
-fn shared_tangent_sigma2_counts_unpenalized_columns() {
+fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
     let (headers, rows, y) = shared_tangent_formula_table();
     let fit = gaussian_reml_fit_formula_table_impl(
         headers,
@@ -57,52 +58,54 @@ fn shared_tangent_sigma2_counts_unpenalized_columns() {
 
     let d = y.ncols();
     let n = y.nrows() as f64;
-    assert_eq!(fit.sigma2.len(), d);
-    assert_eq!(fit.edf.nrows(), d);
+    // Isotropic tangent noise: exactly one pooled scale, NOT a per-coordinate
+    // σ² (a per-output scale would itself break frame equivariance).
+    assert_eq!(fit.sigma2.len(), 1);
+    let m = fit.edf.len();
+    assert_eq!(fit.lambdas.len(), m);
+    assert!(m >= 2, "an s() smooth expands to >= 2 penalty blocks");
     assert!(fit.lambdas.iter().all(|v| v.is_finite()));
     assert!(fit.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
 
-    // `~ x + z + s(w)` has exactly three unpenalized columns per output:
-    // the intercept plus the two parametric terms `x` and `z`. The smooth
-    // `s(w)` is fully penalized, so each coordinate's effective df is
-    //   edf_output = 3 (unpenalized) + Σ_block edf_by_block.
-    const UNPENALIZED_COLS: f64 = 3.0;
+    // `~ x + z + s(w)` has exactly three unpenalized columns PER OUTPUT (the
+    // intercept plus the parametric `x`, `z`); the smooth `s(w)` is fully
+    // penalized. So the pooled effective df is
+    //   edf_total = 3·D (unpenalized) + Σ_block edf  (shared across all D).
+    const UNPENALIZED_PER_OUTPUT: f64 = 3.0;
+    let penalized_edf: f64 = fit.edf.iter().sum();
+    let edf_total = UNPENALIZED_PER_OUTPUT * d as f64 + penalized_edf;
+    let mut ss = 0.0;
     for output in 0..d {
-        let penalized_edf: f64 = fit.edf.row(output).iter().sum();
-        let edf_output = UNPENALIZED_COLS + penalized_edf;
-        let mut ss = 0.0;
         for row in 0..y.nrows() {
             let resid = y[[row, output]] - fit.fitted[[row, output]];
             ss += resid * resid;
         }
-        let expected = ss / (n - edf_output);
-        assert!(
-            (fit.sigma2[output] - expected).abs() <= 1.0e-9 * expected.max(1.0),
-            "sigma2[{output}] = {} but residual scale with full effective df is {expected} \
-                 (edf_output = {edf_output}, penalized_edf = {penalized_edf})",
-            fit.sigma2[output]
-        );
-        // The buggy denominator omitted the unpenalized columns; pinning the
-        // strict gap guards against a regression back to it.
-        let buggy = ss / (n - penalized_edf);
-        assert!(
-            fit.sigma2[output] > buggy * (1.0 + 1.0e-9),
-            "sigma2[{output}] = {} must exceed the unpenalized-omitting estimate {buggy}",
-            fit.sigma2[output]
-        );
     }
+    let expected = ss / (d as f64 * n - edf_total);
+    assert!(
+        (fit.sigma2[0] - expected).abs() <= 1.0e-9 * expected.max(1.0),
+        "pooled sigma2 = {} but residual scale with full pooled effective df is {expected} \
+             (edf_total = {edf_total}, penalized_edf = {penalized_edf})",
+        fit.sigma2[0]
+    );
+    // The buggy denominator omitted the unpenalized columns; pinning the strict
+    // gap guards against a regression back to it.
+    let buggy = ss / (d as f64 * n - penalized_edf);
+    assert!(
+        fit.sigma2[0] > buggy * (1.0 + 1.0e-9),
+        "pooled sigma2 = {} must exceed the unpenalized-omitting estimate {buggy}",
+        fit.sigma2[0]
+    );
 }
 
-/// Regression for issue #381 adversarial review (flaws #1/#3): per-output
-/// λ/edf diagnostics must be reported per tangent coordinate in a
-/// well-formed `(D, M)` grid. Each coordinate replicates the same penalty
-/// structure, so when no block canonicalizes away the grid is fully finite
-/// and every coordinate carries the same number of active smoothing
-/// parameters. (The fix also length-checks the canonical-compacted
-/// `lambdas`/`edf_by_block` against the surviving-block count so a dropped
-/// rank-0 block can never silently misalign the stride.)
+/// Regression for issue #381 (flaws #1/#3) carried into the shared-smoothing
+/// model: λ/edf are now reported as a SHARED per-smooth vector of length `M`
+/// (one smoothing parameter per formula smooth, common to every tangent
+/// coordinate) — not an `(D, M)` per-coordinate grid. The fix still
+/// length-checks the canonical-compacted `lambdas`/`edf_by_block` against the
+/// surviving-block count so a dropped rank-0 block can never silently misalign.
 #[test]
-fn shared_tangent_lambda_edf_grid_is_per_coordinate() {
+fn shared_tangent_lambda_edf_are_shared_per_smooth() {
     let (headers, rows, y) = shared_tangent_formula_table();
     let fit = gaussian_reml_fit_formula_table_impl(
         headers,
@@ -114,26 +117,92 @@ fn shared_tangent_lambda_edf_grid_is_per_coordinate() {
     )
     .expect("shared-tangent REML must fit ~ x + z + s(w)");
 
-    let d = y.ncols();
-    assert_eq!(fit.lambdas.nrows(), d);
-    assert_eq!(fit.edf.nrows(), d);
-    assert_eq!(fit.lambdas.ncols(), fit.edf.ncols());
-    assert!(
-        fit.lambdas.ncols() >= 2,
-        "an s() smooth expands to >= 2 blocks"
-    );
+    let m = fit.lambdas.len();
+    assert_eq!(fit.edf.len(), m, "lambdas and edf are both per-smooth");
+    assert!(m >= 2, "an s() smooth expands to >= 2 penalty blocks");
     assert!(
         fit.lambdas.iter().all(|v| v.is_finite()),
-        "no grid cell may be NaN-padded by an off-the-end stride"
+        "no cell may be NaN-padded by an off-the-end stride"
     );
-    // Every tangent coordinate fits the identical replicated design, so
-    // each row must carry the same count of active (nonzero-λ) blocks.
-    let active_per_row: Vec<usize> = (0..d)
-        .map(|output| fit.lambdas.row(output).iter().filter(|v| **v > 0.0).count())
-        .collect();
+    assert!(fit.edf.iter().all(|v| v.is_finite() && *v >= 0.0));
     assert!(
-        active_per_row.iter().all(|c| *c == active_per_row[0]),
-        "per-coordinate active-block counts diverged: {active_per_row:?}"
+        fit.lambdas.iter().any(|v| *v > 0.0),
+        "at least one smooth must carry an active (nonzero) smoothing parameter"
+    );
+}
+
+/// Frame-equivariance regression (issue #967): with one smoothing parameter
+/// shared across the tangent outputs, the multi-output fit is EXACTLY
+/// equivariant under an orthogonal mix of the outputs. Fitting `Y·Rᵀ` (an
+/// orthogonal rotation of the response frame) yields coefficients `B·Rᵀ`, so
+/// every prediction `X·B` rotates with the frame: `predict(fit(Y·Rᵀ)) =
+/// predict(fit(Y))·Rᵀ`. Per-output independent λ (the pre-fix scheme) broke
+/// this — a rotation that mixed a high-curvature output with a low-curvature
+/// one was smoothed differently after the mix, so the fit depended on the
+/// arbitrary ambient frame. This pins the property at the solver layer, from a
+/// different angle than the Python end-to-end spherical test.
+#[test]
+fn shared_tangent_fit_is_output_rotation_equivariant() {
+    let (headers, rows, y) = shared_tangent_formula_table(); // D = 2 outputs
+    // A genuine 2×2 rotation (orthogonal, det = 1) that mixes the two outputs.
+    let theta = 0.6_f64;
+    let (c, s) = (theta.cos(), theta.sin());
+    let rot = array![[c, -s], [s, c]];
+    let y_rot = y.dot(&rot.t());
+
+    let base = gaussian_reml_fit_formula_table_impl(
+        headers.clone(),
+        rows.clone(),
+        "~ x + z + s(w)".to_string(),
+        y.view(),
+        None,
+        None,
+    )
+    .expect("base shared-tangent fit");
+    let rotated = gaussian_reml_fit_formula_table_impl(
+        headers,
+        rows,
+        "~ x + z + s(w)".to_string(),
+        y_rot.view(),
+        None,
+        None,
+    )
+    .expect("rotated shared-tangent fit");
+
+    // Equivariance of the coefficients: B(Y·Rᵀ) == B(Y)·Rᵀ to the float floor.
+    let expected = base.coefficients.dot(&rot.t());
+    let max_err = rotated
+        .coefficients
+        .iter()
+        .zip(expected.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_err < 1.0e-7,
+        "coefficients are not output-rotation equivariant: \
+             max|B(Y·Rᵀ) - B(Y)·Rᵀ| = {max_err:.3e}"
+    );
+
+    // The shared λ is itself frame-invariant: the REML objective depends on the
+    // data only through rotation-invariant quantities (the stacked residual SS
+    // tr(YᵀMY) is invariant; the log-determinant terms are data-independent).
+    let lam_err = base
+        .lambdas
+        .iter()
+        .zip(rotated.lambdas.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        lam_err < 1.0e-6,
+        "shared smoothing parameters are not frame-invariant: max|Δλ| = {lam_err:.3e}"
+    );
+
+    // The pooled isotropic σ² is frame-invariant as well.
+    assert!(
+        (base.sigma2[0] - rotated.sigma2[0]).abs() <= 1.0e-9 * base.sigma2[0].max(1.0),
+        "pooled sigma2 is not frame-invariant: {} vs {}",
+        base.sigma2[0],
+        rotated.sigma2[0]
     );
 }
 
