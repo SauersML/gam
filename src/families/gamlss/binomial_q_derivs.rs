@@ -11,7 +11,7 @@
 //! other link falls back to the generic inverse-link jet plus the analytic
 //! fourth derivative of the inverse-link pdf. All functions here are pure.
 
-use crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link;
+use crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::types::{InverseLink, StandardLink};
 
@@ -429,7 +429,8 @@ pub(super) fn binomial_neglog_q_fourth_derivative_from_jet(
 // Closed forms remain the fast path for Probit, Logit, and CLogLog, but the
 // exact joint Newton calculus is not restricted to those links. When no
 // closed form is available, we use the generic inverse-link jet plus the
-// analytic fourth derivative of the inverse-link pdf.
+// analytic third derivative of the inverse-link pdf (f''' = μ'''', the fourth
+// derivative of the inverse-link CDF).
 // ---------------------------------------------------------------------------
 
 #[inline]
@@ -465,8 +466,13 @@ pub(super) fn binomial_neglog_q_fourth_derivative_dispatch(
             y, weight, q, link_kind,
         ));
     }
-    let d4 = inverse_link_pdffourth_derivative_for_inverse_link(link_kind, q)
-        .map_err(|e| format!("binomial inverse-link fourth derivative evaluation failed: {e}"))?;
+    // `binomial_neglog_q_fourth_derivative_from_jet` consumes `d4 = μ''''(q)`,
+    // the fourth derivative of the inverse link μ = G. Since the pdf f = G' = μ',
+    // this equals f''' — the THIRD derivative of the inverse-link pdf (= the
+    // fourth derivative of the inverse-link CDF). The `pdffourth` helper would
+    // return f'''' = μ''''', one order too high (issue #947).
+    let d4 = inverse_link_pdfthird_derivative_for_inverse_link(link_kind, q)
+        .map_err(|e| format!("binomial inverse-link third derivative evaluation failed: {e}"))?;
     Ok(binomial_neglog_q_fourth_derivative_from_jet(
         y, weight, mu, d1, d2, d3, d4,
     ))
