@@ -6121,12 +6121,6 @@ impl UnifiedFitResult {
             .and_then(|inf| inf.beta_covariance.as_ref())
     }
 
-    /// Boundary accessor returning the raw covariance array for out-of-scope
-    /// consumers (CLI, GPU, families) that don't need the newtype.
-    pub fn beta_covariance_array(&self) -> Option<&Array2<f64>> {
-        self.beta_covariance_phi_scaled().map(|c| c.as_array())
-    }
-
     /// Get working weights if available.
     pub fn working_weights(&self) -> Option<&Array1<f64>> {
         self.inference.as_ref().map(|inf| &inf.working_weights)
