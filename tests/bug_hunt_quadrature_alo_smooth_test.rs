@@ -4,7 +4,10 @@ use gam::inference::quadrature::{
 };
 use gam::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
 use gam::matrix::{PsdWeightsView, SignedWeightsView};
-use gam::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
+use gam::types::{
+    InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, ResponseFamily,
+    StandardLink,
+};
 use ndarray::{Array1, Array2, array};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use statrs::distribution::{ContinuousCDF, FisherSnedecor};
@@ -21,9 +24,15 @@ fn integrated_family_moments_jet_matches_lognormal_mean_for_poisson_log_link() {
     for _ in 0..32 {
         let eta = rng.random_range(-2.0..2.0);
         let sigma = rng.random_range(0.01..1.2);
-        let got = integrated_family_moments_jet(&ctx, &spec, eta, sigma)
-            .expect("integrated family moments should evaluate for finite eta and sigma")
-            .mean;
+        let got = integrated_family_moments_jet(
+            &ctx,
+            &spec,
+            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            eta,
+            sigma,
+        )
+        .expect("integrated family moments should evaluate for finite eta and sigma")
+        .mean;
         let expected = (eta + 0.5 * sigma * sigma).exp();
         let rel_err = ((got - expected) / expected).abs();
         assert!(
