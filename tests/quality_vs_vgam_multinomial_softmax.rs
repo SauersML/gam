@@ -390,6 +390,193 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// HETEROGENEOUS-SMOOTHNESS ARM (#715): gam's per-(class, term) REML advantage
+// made EXPLICIT and UNCONDITIONAL. The two smooth terms have genuinely DIFFERENT
+// roughness — `s(x1)` is high-frequency (wiggly, true df ≈ 8) while `s(x2)` is
+// nearly linear (true df ≈ 2). No SINGLE fixed smoothing df can fit both: a
+// fixed-df backfit (VGAM's df = 4) must over-smooth the wiggly term while
+// under-smoothing the linear one, biasing the surface. gam's independent
+// per-(class, term) λ REML can dial each term to its own roughness, so here it
+// must BEAT VGAM's fixed-df reference outright (not merely tie). This is the
+// situation where adaptivity is unambiguously the right answer, so we assert
+// against VGAM directly with a STRICT (beat, not 1.05×) bound.
+
+/// Heterogeneous true log-odds: a wiggly term in x1 and a near-linear term in x2.
+/// Reference class K-1 pinned to η ≡ 0. Identical math feeds the label draw AND
+/// the scored truth matrix.
+fn true_eta_hetero(x1: f64, x2: f64, x3: f64) -> [f64; K] {
+    // High-frequency, multi-oscillation shape in x1 (true df ≈ 8): a fixed df = 4
+    // backfit cannot resolve these wiggles and must over-smooth them away.
+    let wiggly = 1.6 * (3.3 * std::f64::consts::PI * x1).sin() + 0.8 * (2.0 * x1).cos();
+    // Near-linear shape in x2 (true df ≈ 2): a fixed df = 4 backfit over-fits it,
+    // chasing noise that gam's REML shrinks out.
+    let nearly_linear = 1.4 * x2;
+    let eta0 = 0.4 + wiggly + 0.3 * nearly_linear + 1.2 * x3;
+    let eta1 = -0.3 - 0.6 * wiggly + nearly_linear - 0.7 * x3;
+    [eta0, eta1, 0.0]
+}
+
+#[test]
+fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
+    init_parallelism();
+
+    // ---- synthesize the shared dataset (fixed seed) -----------------------
+    let mut rng = StdRng::seed_from_u64(0x5EED_C0DE_u64);
+    let ux = Uniform::new(-1.0_f64, 1.0_f64).expect("uniform x1");
+    let u01 = Uniform::new(0.0_f64, 1.0_f64).expect("uniform x2");
+    let ux3 = Uniform::new(-1.5_f64, 1.5_f64).expect("uniform x3");
+    let udraw = Uniform::new(0.0_f64, 1.0_f64).expect("uniform draw");
+
+    let mut x1 = Vec::with_capacity(N);
+    let mut x2 = Vec::with_capacity(N);
+    let mut x3 = Vec::with_capacity(N);
+    let mut cls_code = Vec::with_capacity(N);
+    let mut true_prob_by_code: Vec<[f64; K]> = Vec::with_capacity(N);
+    for _ in 0..N {
+        let a = ux.sample(&mut rng);
+        let b = u01.sample(&mut rng);
+        let c = ux3.sample(&mut rng);
+        let p = softmax(&true_eta_hetero(a, b, c));
+        let u = udraw.sample(&mut rng);
+        let mut acc = 0.0;
+        let mut chosen = K - 1;
+        for k in 0..K {
+            acc += p[k];
+            if u <= acc {
+                chosen = k;
+                break;
+            }
+        }
+        x1.push(a);
+        x2.push(b);
+        x3.push(c);
+        cls_code.push(chosen);
+        true_prob_by_code.push(p);
+    }
+
+    let label = |code: usize| format!("c{code}");
+    let headers: Vec<String> = ["x1", "x2", "x3", "y"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let rows: Vec<StringRecord> = (0..N)
+        .map(|i| {
+            StringRecord::from(vec![
+                x1[i].to_string(),
+                x2[i].to_string(),
+                x3[i].to_string(),
+                label(cls_code[i]),
+            ])
+        })
+        .collect();
+    let ds =
+        encode_recordswith_inferred_schema(headers, rows).expect("encode hetero multinomial dataset");
+
+    let cfg = FitConfig::default();
+    let model =
+        fit_penalized_multinomial_formula(&ds, "y ~ s(x1) + s(x2) + x3", &cfg, 1.0, 50, 1e-8)
+            .expect("gam hetero multinomial fit");
+    assert_eq!(model.class_levels.len(), K, "gam should recover K=3 classes");
+
+    let gam_probs = predict_multinomial_formula(&model, &ds).expect("gam predict probabilities");
+    assert_eq!(gam_probs.dim(), (N, K), "gam probability matrix shape");
+
+    // simplex closure
+    let mut worst_row_sum_err = 0.0_f64;
+    for i in 0..N {
+        let mut s = 0.0;
+        for k in 0..K {
+            s += gam_probs[[i, k]];
+        }
+        worst_row_sum_err = worst_row_sum_err.max((s - 1.0).abs());
+    }
+    assert!(
+        worst_row_sum_err < 1e-6,
+        "hetero fitted probabilities are not on the simplex: worst row-sum error={worst_row_sum_err:.2e}"
+    );
+
+    // truth in gam class_levels order (for the gam RMSE) and in code order (for
+    // the code-keyed VGAM response columns).
+    let gam_levels: Vec<String> = model.class_levels.clone();
+    let col_code: Vec<usize> = gam_levels
+        .iter()
+        .map(|lvl| {
+            lvl.trim_start_matches('c')
+                .parse::<usize>()
+                .expect("gam level label is c<code>")
+        })
+        .collect();
+    let mut gam_flat = Vec::with_capacity(N * K);
+    let mut truth_flat = Vec::with_capacity(N * K);
+    for k in 0..K {
+        let code = col_code[k];
+        for i in 0..N {
+            gam_flat.push(gam_probs[[i, k]]);
+            truth_flat.push(true_prob_by_code[i][code]);
+        }
+    }
+
+    // ---- VGAM fixed df = 4 backfit: the comparator that CANNOT fit both -----
+    // VGAM's s() is a fixed-df smoothing spline (default df = 4). With one term
+    // genuinely df ≈ 8 and the other df ≈ 2, a single fixed df is forced to
+    // over-smooth the wiggly term and over-fit the near-linear one — gam's
+    // per-term REML is not, so gam must BEAT VGAM here.
+    let level_codes: Vec<f64> = (0..N).map(|i| col_code[i % K] as f64).collect();
+    let cls_f64: Vec<f64> = cls_code.iter().map(|&c| c as f64).collect();
+    let r = run_r(
+        &[
+            Column::new("x1", &x1),
+            Column::new("x2", &x2),
+            Column::new("x3", &x3),
+            Column::new("cls", &cls_f64),
+            Column::new("levorder", &level_codes),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(VGAM))
+        lev_codes <- unique(round(df$levorder))
+        lev_labels <- paste0("c", lev_codes)
+        yfac <- factor(paste0("c", round(df$cls)), levels = lev_labels)
+        dat <- data.frame(x1 = df$x1, x2 = df$x2, x3 = df$x3, y = yfac)
+        m <- vgam(y ~ s(x1) + s(x2) + x3, family = multinomial(), data = dat)
+        pr <- predict(m, type = "response")
+        emit("nrow", nrow(pr))
+        emit("ncol", ncol(pr))
+        emit("probs", as.numeric(as.vector(pr)))
+        "#,
+    );
+    assert_eq!(r.scalar("nrow") as usize, N, "VGAM fitted-prob rows");
+    assert_eq!(r.scalar("ncol") as usize, K, "VGAM fitted-prob cols");
+    let vg_flat = r.vector("probs"); // column-major, gam level order
+    assert_eq!(vg_flat.len(), N * K, "VGAM flattened prob length");
+
+    let gam_err = rmse(&gam_flat, &truth_flat);
+    let vg_err = rmse(vg_flat, &truth_flat);
+
+    eprintln!(
+        "hetero multinomial s(x1:df8)+s(x2:df2)+x3: N={N} K={K} converged={} iters={} \
+         gam_RMSE_vs_truth={gam_err:.5} vgam_fixeddf_RMSE_vs_truth={vg_err:.5} \
+         row_sum_err={worst_row_sum_err:.2e} lambdas={:?}",
+        model.converged, model.iterations, model.lambdas
+    );
+
+    // gam must recover the heterogeneous surface in absolute terms ...
+    assert!(
+        gam_err <= PROB_RMSE_BAR,
+        "gam does not recover the heterogeneous true surface: \
+         RMSE(P_gam, P_true)={gam_err:.5} > bar={PROB_RMSE_BAR}"
+    );
+    // ... AND strictly BEAT the fixed-df backfit, which cannot match both terms'
+    // smoothness at once. This is gam's genuine adaptive advantage — no tie, no
+    // slack: gam's per-(class, term) REML is strictly more accurate.
+    assert!(
+        gam_err < vg_err,
+        "gam's adaptive per-term REML should BEAT VGAM's fixed df=4 backfit on a \
+         heterogeneous-smoothness DGP (one term df≈8, one df≈2): \
+         gam_RMSE={gam_err:.5} vgam_RMSE={vg_err:.5}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // REAL-DATA ARM: same multinomial-softmax GAM capability on the Palmer Penguins
 // dataset. Truth is UNKNOWN here, so the objective bar is OUT-OF-SAMPLE class
 // recovery on a held-out split, not recovery of a known surface.
