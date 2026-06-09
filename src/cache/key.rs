@@ -164,6 +164,44 @@ impl Fingerprinter {
         self.h.update(value.as_bytes());
     }
 
+    /// Absorb a length-prefixed `f64` slice using the per-element
+    /// [`Fingerprinter::write_f64`] contract (so `-0.0` is normalized to
+    /// `+0.0`). Canonical home for the byte-identical `len`-then-each-`f64`
+    /// hashing that previously lived as module-local `hash_f64_slice` /
+    /// `hash_vector` copies in `solver/latent_cache`. Use this — not
+    /// [`Fingerprinter::absorb_f64_slice`], whose bulk path does **not**
+    /// normalize signed zero — wherever warm-start keys depend on that
+    /// normalization.
+    pub fn write_f64_slice(&mut self, values: &[f64]) {
+        self.write_usize(values.len());
+        for &value in values {
+            self.write_f64(value);
+        }
+    }
+
+    /// Absorb a 1D `f64` array as `len` followed by every element via
+    /// [`Fingerprinter::write_f64`]. Canonical home for the byte-identical
+    /// `hash_vector` copy that previously lived in `solver/latent_cache`.
+    pub fn write_f64_array1(&mut self, values: &ndarray::Array1<f64>) {
+        self.write_usize(values.len());
+        for &value in values.iter() {
+            self.write_f64(value);
+        }
+    }
+
+    /// Absorb a 2D `f64` array as `(nrows, ncols)` followed by every element in
+    /// iteration order, each via [`Fingerprinter::write_f64`]. Canonical home
+    /// for the byte-identical heuristic that previously lived as module-local
+    /// `write_array2_fingerprint` (`solver/arrow_schur`) and `hash_matrix`
+    /// (`solver/latent_cache`) copies.
+    pub fn write_f64_array2(&mut self, values: &ndarray::Array2<f64>) {
+        self.write_usize(values.nrows());
+        self.write_usize(values.ncols());
+        for &value in values.iter() {
+            self.write_f64(value);
+        }
+    }
+
     /// Finalize and return the first 8 bytes of the SHA-256 digest as a
     /// little-endian `u64`. Used by callers that need a compact in-process
     /// identifier (manifold mode fingerprints, registry fingerprints, …)
