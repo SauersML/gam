@@ -51,20 +51,21 @@
 //!    so the value↔gradient consistency of *that* term is checked across
 //!    interior / boundary / near-degenerate ρ.
 //!
+//! 3. The SURVIVAL LAML objective
+//!    (`WorkingModelSurvival::unified_lamlobjective_and_rhogradient`),
+//!    reached through the public
+//!    `evaluate_survival_lamlcost_and_gradient(rho, β₀)` shim. That shim
+//!    re-converges the inner survival mode internally (set `λ = exp(ρ)` on
+//!    the active blocks → constrained inner PIRLS → `update_state` →
+//!    unified survival LAML at the re-fitted `β̂(ρ)`), so FD-checking `∇V`
+//!    by varying ρ alone is now possible — the survival counterpart of the
+//!    GLM path's `evaluate_externalgradient` value+gradient surface. The
+//!    survival LAML `½ log|H|` term is genuinely ρ-coupled through the
+//!    re-fitted mode, so its value↔gradient consistency is checked across
+//!    interior / ridge-floor (large-λ) boundary / near-degenerate ρ.
+//!
 //! # Objective NOT covered from this boundary (documented, not skipped)
 //!
-//! * Survival LAML (`SurvivalLikelihood::unified_lamlobjective_and_rho
-//!   gradient`) takes a *converged* `WorkingState` + `β̂` at the evaluated
-//!   ρ. FD-checking ∇V requires re-converging the inner survival mode at
-//!   each ρ±h, but the `WorkingState` constructor and the inner survival
-//!   solve are `pub(crate)` — unreachable from an integration test. The
-//!   minimal hook that would make it testable is a public
-//!   `evaluate_survival_lamlcost_and_gradient(rho)` shim that internally
-//!   re-fits β̂(ρ) (mirroring `evaluate_externalgradient`). Until then the
-//!   survival objective is FD-guarded only through
-//!   `bug_hunt_survival_location_scale_smooth_block_gradient_mismatch.rs`
-//!   and `survival_multi_z_covariance_autoderiv_hard.rs` at the
-//!   full-fit boundary. See the test report for the follow-up.
 //! * The multinomial and BMS marginal-surface objectives are likewise
 //!   `pub(crate)`; they share the unified evaluator that objective (1)
 //!   exercises directly, so the value↔gradient assembly they depend on is
@@ -80,6 +81,10 @@ use gam::estimate::{
 };
 use gam::families::custom_family::{
     CustomFamilyBlockPsiDerivative, EvalMode, evaluate_custom_family_joint_hyper,
+};
+use gam::families::survival::{
+    MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec,
+    WorkingModelSurvival,
 };
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam::smooth::BlockwisePenalty;
@@ -894,6 +899,302 @@ fn custom_family_lamlobjective_gradient_consistent_at_large_lambda_boundary() {
             &derivative_blocks,
             &rho,
             TOL_BOUNDARY,
+        );
+    }
+}
+
+// ======================================================================
+// Objective 3: SURVIVAL LAML objective
+// ======================================================================
+//
+// `WorkingModelSurvival::evaluate_survival_lamlcost_and_gradient(rho, β₀)`
+// re-converges the inner survival mode at the given ρ (set λ = exp(ρ) on
+// the active penalty blocks → constrained inner PIRLS → `update_state` →
+// the unified survival LAML at the re-fitted β̂(ρ)) and returns the LAML
+// VALUE and its analytic ρ-GRADIENT together. We FD-check `gradient`
+// against the centered difference of `value` across the same regimes the
+// GLM/custom gates use. Because the shim re-fits the inner mode at each
+// ρ±h, the FD is a true total derivative of V(ρ) — the survival closure
+// of the universal gate.
+
+/// 20-subject net-survival fixture: intercept + a single penalized,
+/// mean-centred log-age time covariate (positive exit derivative). Mirrors
+/// the in-crate `laml_fd_test_model` fixture: large enough that the
+/// observed-information Hessian is well-conditioned at the mode, so the
+/// inner PIRLS reaches the tight shim tolerance and V(ρ) is FD-smooth.
+/// The first block (λ = 0) is an inactive prefix; only block 1 is active,
+/// so the active-block ρ vector has length 1.
+fn survival_single_block_model(active_lambda: f64) -> WorkingModelSurvival {
+    let age_entry: Array1<f64> = Array1::from(vec![
+        30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 32.0, 37.0, 42.0, 47.0, 52.0, 57.0, 62.0, 34.0,
+        39.0, 44.0, 49.0, 54.0, 59.0,
+    ]);
+    let age_exit: Array1<f64> = Array1::from(vec![
+        45.0, 48.0, 55.0, 58.0, 62.0, 66.0, 68.0, 47.0, 52.0, 53.0, 55.0, 60.0, 63.0, 70.0, 48.0,
+        51.0, 58.0, 62.0, 66.0, 69.0,
+    ]);
+    let event_target = Array1::from(vec![
+        1u8, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    ]);
+    let n = age_entry.len();
+    let event_competing = Array1::<u8>::zeros(n);
+    let sampleweight = Array1::from_elem(n, 1.0_f64);
+    let ln_age_mean: f64 = {
+        let mut sum = 0.0;
+        for i in 0..n {
+            sum += age_entry[i].ln() + age_exit[i].ln();
+        }
+        sum / (2.0 * n as f64)
+    };
+    let mut x_entry = Array2::<f64>::zeros((n, 2));
+    let mut x_exit = Array2::<f64>::zeros((n, 2));
+    let mut x_derivative = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        x_entry[[i, 0]] = 1.0;
+        x_exit[[i, 0]] = 1.0;
+        x_entry[[i, 1]] = age_entry[i].ln() - ln_age_mean;
+        x_exit[[i, 1]] = age_exit[i].ln() - ln_age_mean;
+        x_derivative[[i, 0]] = 0.0;
+        x_derivative[[i, 1]] = 1.0 / age_exit[i];
+    }
+    let penalties = PenaltyBlocks::new(vec![
+        PenaltyBlock {
+            matrix: array![[3.0]],
+            lambda: 0.0,
+            range: 0..1,
+            nullspace_dim: 0,
+        },
+        PenaltyBlock {
+            matrix: array![[2.5]],
+            lambda: active_lambda,
+            range: 1..2,
+            nullspace_dim: 0,
+        },
+    ]);
+    WorkingModelSurvival::from_engine_inputs(
+        SurvivalEngineInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: event_target.view(),
+            event_competing: event_competing.view(),
+            sampleweight: sampleweight.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+            monotonicity_constraint_rows: None,
+            monotonicity_constraint_offsets: None,
+        },
+        penalties,
+        MonotonicityPenalty { tolerance: 1e-8 },
+        SurvivalSpec::Net,
+    )
+    .expect("construct single-block survival LAML FD model")
+}
+
+/// Same survival fixture but with TWO near-identical penalized log-age time
+/// covariates, each in its own active penalty block. With near-equal ρ on
+/// the two near-collinear columns the penalized Hessian carries a
+/// near-degenerate eigenvalue pair — the Daleckii–Krein regime — so the
+/// survival LAML `½ log|H|` ρ-gradient is FD-probed for the same
+/// matrix-function-form drift the GLM/custom near-degenerate regimes guard.
+fn survival_near_degenerate_two_block_model() -> WorkingModelSurvival {
+    let age_entry: Array1<f64> = Array1::from(vec![
+        30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0, 32.0, 37.0, 42.0, 47.0, 52.0, 57.0, 62.0, 34.0,
+        39.0, 44.0, 49.0, 54.0, 59.0,
+    ]);
+    let age_exit: Array1<f64> = Array1::from(vec![
+        45.0, 48.0, 55.0, 58.0, 62.0, 66.0, 68.0, 47.0, 52.0, 53.0, 55.0, 60.0, 63.0, 70.0, 48.0,
+        51.0, 58.0, 62.0, 66.0, 69.0,
+    ]);
+    let event_target = Array1::from(vec![
+        1u8, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+    ]);
+    let n = age_entry.len();
+    let event_competing = Array1::<u8>::zeros(n);
+    let sampleweight = Array1::from_elem(n, 1.0_f64);
+    let ln_age_mean: f64 = {
+        let mut sum = 0.0;
+        for i in 0..n {
+            sum += age_entry[i].ln() + age_exit[i].ln();
+        }
+        sum / (2.0 * n as f64)
+    };
+    // p = 3: intercept + two near-identical mean-centred log-age columns.
+    // Column 2 is column 1 plus a tiny deterministic jitter, so the two
+    // penalized columns span an almost-identical direction (near-collinear)
+    // ⇒ near-degenerate penalized-Hessian pair. Both carry a positive exit
+    // time-derivative (required for the survival event rows).
+    let p = 3usize;
+    let mut x_entry = Array2::<f64>::zeros((n, p));
+    let mut x_exit = Array2::<f64>::zeros((n, p));
+    let mut x_derivative = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        let le_entry = age_entry[i].ln() - ln_age_mean;
+        let le_exit = age_exit[i].ln() - ln_age_mean;
+        let jitter = 1e-3 * ((i as f64) - (n as f64) / 2.0) / (n as f64);
+        x_entry[[i, 0]] = 1.0;
+        x_exit[[i, 0]] = 1.0;
+        x_entry[[i, 1]] = le_entry;
+        x_exit[[i, 1]] = le_exit;
+        x_entry[[i, 2]] = le_entry + jitter;
+        x_exit[[i, 2]] = le_exit + jitter;
+        // d/dt of a mean-centred log-age column is 1/t; the jittered column
+        // shares the same derivative (jitter is constant in t).
+        x_derivative[[i, 0]] = 0.0;
+        x_derivative[[i, 1]] = 1.0 / age_exit[i];
+        x_derivative[[i, 2]] = 1.0 / age_exit[i];
+    }
+    let penalties = PenaltyBlocks::new(vec![
+        PenaltyBlock {
+            matrix: array![[2.0]],
+            lambda: 1.0,
+            range: 1..2,
+            nullspace_dim: 0,
+        },
+        PenaltyBlock {
+            matrix: array![[2.0]],
+            lambda: 1.0,
+            range: 2..3,
+            nullspace_dim: 0,
+        },
+    ]);
+    WorkingModelSurvival::from_engine_inputs(
+        SurvivalEngineInputs {
+            age_entry: age_entry.view(),
+            age_exit: age_exit.view(),
+            event_target: event_target.view(),
+            event_competing: event_competing.view(),
+            sampleweight: sampleweight.view(),
+            x_entry: x_entry.view(),
+            x_exit: x_exit.view(),
+            x_derivative: x_derivative.view(),
+            monotonicity_constraint_rows: None,
+            monotonicity_constraint_offsets: None,
+        },
+        penalties,
+        MonotonicityPenalty { tolerance: 1e-8 },
+        SurvivalSpec::Net,
+    )
+    .expect("construct near-degenerate two-block survival LAML FD model")
+}
+
+fn survival_cost(model: &WorkingModelSurvival, beta0: &Array1<f64>, rho: &Array1<f64>) -> f64 {
+    model
+        .evaluate_survival_lamlcost_and_gradient(rho.as_slice().expect("contiguous rho"), beta0)
+        .expect("survival LAML cost evaluation should succeed")
+        .0
+}
+
+fn survival_grad(
+    model: &WorkingModelSurvival,
+    beta0: &Array1<f64>,
+    rho: &Array1<f64>,
+) -> Array1<f64> {
+    model
+        .evaluate_survival_lamlcost_and_gradient(rho.as_slice().expect("contiguous rho"), beta0)
+        .expect("survival LAML analytic gradient evaluation should succeed")
+        .1
+}
+
+fn assert_survival_consistent(
+    regime: &str,
+    model: &WorkingModelSurvival,
+    beta0: &Array1<f64>,
+    rho: &Array1<f64>,
+    tol: f64,
+) {
+    let analytic = survival_grad(model, beta0, rho);
+    let k = rho.len();
+    let mut fd = Array1::<f64>::zeros(k);
+    for i in 0..k {
+        let mut rp = rho.clone();
+        rp[i] += FD_STEP;
+        let mut rm = rho.clone();
+        rm[i] -= FD_STEP;
+        fd[i] = (survival_cost(model, beta0, &rp) - survival_cost(model, beta0, &rm)) / (2.0 * FD_STEP);
+    }
+    assert!(
+        analytic.iter().all(|v| v.is_finite()) && fd.iter().all(|v| v.is_finite()),
+        "[{regime}] non-finite survival LAML gradient at rho={:?}: analytic={:?} fd={:?}",
+        rho.to_vec(),
+        analytic.to_vec(),
+        fd.to_vec(),
+    );
+    let rel = max_rel_err(&analytic, &fd);
+    assert!(
+        rel < tol,
+        "OBJECTIVE↔GRADIENT DESYNC in survival LAML regime [{regime}]: \
+         analytic ρ-gradient of the survival LAML objective disagrees with the \
+         centered finite difference of its own (inner-re-converged) value surface. \
+         rho={:?} analytic={:?} fd={:?} worst_rel_err={rel:.3e} (>= tol {tol:.1e}). \
+         The survival LAML value and its analytic ρ-gradient are computed in \
+         different code and have drifted apart.",
+        rho.to_vec(),
+        analytic.to_vec(),
+        fd.to_vec(),
+    );
+}
+
+// --- Regime R0: interior ρ (baseline) ----------------------------------
+
+#[test]
+fn survival_objective_gradient_consistent_interior() {
+    let model = survival_single_block_model(1.0);
+    // Inner warm-start: intercept ≈ log baseline level, mild slope.
+    let beta0 = array![-2.5_f64, 1.0];
+    for rho in [
+        Array1::from(vec![-0.5_f64]),
+        Array1::from(vec![0.0_f64]),
+        Array1::from(vec![0.8_f64]),
+    ] {
+        assert_survival_consistent("interior/survival-net", &model, &beta0, &rho, TOL_INTERIOR);
+    }
+}
+
+// --- Regime R1: ridge/floor (large-λ) boundary -------------------------
+//
+// Large ρ ⇒ λ = exp(ρ) huge: the penalized time-covariate deviation is
+// driven hard toward zero and the smallest effective curvature is pinned
+// against the penalty, the survival analogue of the GLM shrinkage-floor /
+// custom large-λ boundary. The unified survival LAML must keep its value
+// and ρ-gradient consistent there.
+
+#[test]
+fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
+    let model = survival_single_block_model(1.0);
+    let beta0 = array![-2.5_f64, 1.0];
+    for rho in [
+        Array1::from(vec![4.0_f64]),
+        Array1::from(vec![6.0_f64]),
+        Array1::from(vec![8.0_f64]),
+    ] {
+        assert_survival_consistent(
+            "boundary/large-lambda",
+            &model,
+            &beta0,
+            &rho,
+            TOL_BOUNDARY,
+        );
+    }
+}
+
+// --- Regime R2: near-degenerate eigenvalue pair (Daleckii–Krein) -------
+
+#[test]
+fn survival_objective_gradient_consistent_near_degenerate_eigenpair() {
+    let model = survival_near_degenerate_two_block_model();
+    let beta0 = array![-2.5_f64, 0.5, 0.5];
+    for rho in [
+        Array1::from(vec![0.30_f64, 0.30_f64]),
+        Array1::from(vec![0.50_f64, 0.5005_f64]),
+        Array1::from(vec![-0.20_f64, -0.20_f64]),
+    ] {
+        assert_survival_consistent(
+            "near-degenerate/eigenpair",
+            &model,
+            &beta0,
+            &rho,
+            TOL_DEGENERATE,
         );
     }
 }
