@@ -1586,15 +1586,21 @@ fn predict_survival_location_scale_batch(
     // baseline as a per-row LOCATION shift `η_t → η_t − log t`, so the
     // standardized residual is `u = inv_sigma·(log t − η_t) = (log t − μ)/σ` and
     // σ is identified through the event Jacobian's `−log σ` term (the
-    // survreg / lifelines / flexsurv AFT gauge). The saved model therefore has an
-    // EMPTY time-warp β (no other location-scale fit produces zero time columns).
-    // Predict must MIRROR the same shift instead of reconstructing a warp from the
-    // empty `beta_time`; otherwise `S(t|x)` carries no `log t` dependence and is
+    // survreg / lifelines / flexsurv AFT gauge). The saved model therefore carries
+    // a time-warp β that is identically ZERO: the reduced time block has zero free
+    // columns (`z` is p×0) and a zero affine lift (`affine_shift = 0_p`), so the
+    // finalized `beta_time = z·β_reduced + affine_shift` is an all-zero length-`p`
+    // vector (exact zeros — no arithmetic noise — or empty when p==0). A genuine
+    // flexible location-scale fit always retains a non-zero unpenalized monotone
+    // log-t trend in its warp (its affine null space is never shrunk away), so an
+    // all-zero `beta_time` uniquely identifies the reduced regime. Predict must
+    // MIRROR the `−log t` location shift instead of reconstructing a warp from the
+    // zero `beta_time`; otherwise `S(t|x)` carries no `log t` dependence and is
     // wrong for every saved reduced-AFT model. Detected from the saved payload
-    // alone (empty time-warp β + no learned baseline timewiggle), so no new
-    // persisted flag is needed.
-    let reduced_parametric_aft =
-        saved_fit.beta_time().is_empty() && !model.has_baseline_time_wiggle();
+    // alone (zero time-warp β + no learned baseline timewiggle), so no new
+    // persisted flag is needed. (`iter().all` is `true` on an empty β too.)
+    let reduced_parametric_aft = !model.has_baseline_time_wiggle()
+        && saved_fit.beta_time().iter().all(|&b| b == 0.0);
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(age_entry, age_exit, time_cfg.clone(), None)?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
