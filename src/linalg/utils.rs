@@ -75,6 +75,21 @@ pub(crate) fn row_chunk_for_byte_budget(n: usize, p: usize) -> usize {
         .min(n.max(1))
 }
 
+/// Trace of the matrix product `tr(A·B) = Σ_{i,j} A[i,j]·B[j,i]`, computed
+/// without forming the product. `A` is `m×k`, `B` is `k×m`. Canonical home for
+/// the byte-identical double-loop reduction that lived as module-local copies
+/// (`trace_product_dense` in `solver/gaussian_reml`, `trace_projected_cross` in
+/// `solver/reml/unified`).
+pub(crate) fn trace_of_product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> f64 {
+    let mut value = 0.0;
+    for i in 0..a.nrows() {
+        for j in 0..a.ncols() {
+            value += a[[i, j]] * b[[j, i]];
+        }
+    }
+    value
+}
+
 /// Numerically stable softplus `log(1 + exp(x))`.
 ///
 /// Uses the identity `softplus(x) = max(x, 0) + log1p(exp(-|x|))`, which
