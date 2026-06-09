@@ -2067,7 +2067,9 @@ fn python_float_display(value: f64) -> String {
 /// the prediction-frame range alone, preserving the prior behavior).
 fn saved_survival_training_time_upper_bound(model_bytes: &[u8]) -> Option<f64> {
     let saved: serde_json::Value = serde_json::from_slice(model_bytes).ok()?;
-    let payload = saved.get("payload").and_then(serde_json::Value::as_object)?;
+    let payload = saved
+        .get("payload")
+        .and_then(serde_json::Value::as_object)?;
 
     if let Some(knots) = payload
         .get("survival_time_knots")
@@ -2484,13 +2486,8 @@ fn build_model_predict_payload_json(
 ) -> PyResult<String> {
     let model_class = required_saved_model_payload_string_value(&model_bytes, "model_kind")?;
     let formula = required_saved_model_payload_string_value(&model_bytes, "formula")?;
-    let time_grid = default_survival_time_grid(
-        &model_class,
-        &formula,
-        headers,
-        rows,
-        Some(model_bytes),
-    )?;
+    let time_grid =
+        default_survival_time_grid(&model_class, &formula, headers, rows, Some(model_bytes))?;
     build_predict_payload_json(interval, time_grid, covariance_mode, observation_interval)
 }
 

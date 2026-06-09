@@ -5640,8 +5640,7 @@ fn rank1_reduced_time_warp_applies(
     if log_time_entry.len() != n || log_time_exit.len() != n {
         return false;
     }
-    if log_time_entry.iter().any(|v| !v.is_finite())
-        || log_time_exit.iter().any(|v| !v.is_finite())
+    if log_time_entry.iter().any(|v| !v.is_finite()) || log_time_exit.iter().any(|v| !v.is_finite())
     {
         return false;
     }
@@ -13644,8 +13643,16 @@ mod tests {
         // channel (u = inv_sigma·(log t − η_t)). The threshold keeps its intercept
         // (`pinned_free_row_constant == false`). A penalty `diag(0,1,1)` has the
         // 1-D null space {e0}; design column 0 is monotone in log t.
-        let design_entry = array![[0.0, 1.0, 0.2], [0.405_465_108, 1.0, 0.5], [0.916_290_731, 1.0, 1.0]];
-        let design_exit = array![[0.0, 0.5, 0.3], [0.405_465_108, 1.5, 0.8], [0.916_290_731, 2.5, 1.4]];
+        let design_entry = array![
+            [0.0, 1.0, 0.2],
+            [0.405_465_108, 1.0, 0.5],
+            [0.916_290_731, 1.0, 1.0]
+        ];
+        let design_exit = array![
+            [0.0, 0.5, 0.3],
+            [0.405_465_108, 1.5, 0.8],
+            [0.916_290_731, 2.5, 1.4]
+        ];
         let design_derivative_exit = array![[1.0, 1.0, 0.2], [0.5, 1.0, 0.3], [0.3, 1.0, 0.4]];
         let time_block = TimeBlockInput {
             design_entry: DesignMatrix::from(design_entry.clone()),

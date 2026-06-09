@@ -42,9 +42,7 @@ use crate::families::wiggle::{
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::SymmetricMatrix;
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix};
-use crate::mixture_link::{
-    inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link,
-};
+use crate::mixture_link::{inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_logcdf, normal_logsf, standard_normal_quantile};
 use crate::smooth::{
@@ -3855,7 +3853,6 @@ pub enum ParameterLink {
     /// Learnable smooth departure from a known base link.
     Wiggle,
 }
-
 
 struct BinomialLocationScaleCore {
     sigma: Array1<f64>,

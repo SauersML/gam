@@ -96,9 +96,7 @@ impl SplitMix64 {
 fn write_training_csv(path: &Path, n: usize) {
     let mut rng = SplitMix64::new(0x5EED_7E50_4ABC_1234);
     let mut writer = csv::Writer::from_path(path).expect("create training csv");
-    writer
-        .write_record(["x", "z", "y"])
-        .expect("write header");
+    writer.write_record(["x", "z", "y"]).expect("write header");
     for _ in 0..n {
         let x = (2.0 * rng.next_unit() - 1.0) * TRAIN_HALF_RANGE;
         let z = (2.0 * rng.next_unit() - 1.0) * TRAIN_HALF_RANGE;
@@ -114,9 +112,7 @@ fn write_training_csv(path: &Path, n: usize) {
 /// predict path ignores; the schema just needs the column.
 fn write_predict_csv(path: &Path, grid: &[(f64, f64)]) {
     let mut writer = csv::Writer::from_path(path).expect("create predict csv");
-    writer
-        .write_record(["x", "z", "y"])
-        .expect("write header");
+    writer.write_record(["x", "z", "y"]).expect("write header");
     for &(x, z) in grid {
         writer
             .write_record([format!("{x:.12}"), format!("{z:.12}"), "0.0".to_string()])

@@ -1038,10 +1038,7 @@ pub(crate) fn ift_dbeta_drho_coned(
 ) -> Option<Array2<f64>> {
     let beta_dim = dg_drho.nrows();
     let r = dg_drho.ncols();
-    if hessian.nrows() != beta_dim
-        || hessian.ncols() != beta_dim
-        || col_supports.len() != r
-    {
+    if hessian.nrows() != beta_dim || hessian.ncols() != beta_dim || col_supports.len() != r {
         return None;
     }
     let labels = coupling_components(hessian);
@@ -1743,11 +1740,8 @@ mod tests {
     fn coned_matches_full_solve_on_fully_coupled_hessian() {
         // Fully coupled SPD H: cone is the whole space, result must equal the
         // unconfined ift_dbeta_drho_from_solver bit-for-bit.
-        let h = Array2::from_shape_vec(
-            (3, 3),
-            vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.8, 0.5, 0.8, 2.5],
-        )
-        .unwrap();
+        let h = Array2::from_shape_vec((3, 3), vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.8, 0.5, 0.8, 2.5])
+            .unwrap();
         let inv = dense_inverse(&h);
         // Two ρ-columns, each supported on a single coefficient.
         let mut dg = Array2::<f64>::zeros((3, 2));
@@ -1755,8 +1749,7 @@ mod tests {
         dg[[2, 1]] = -0.7;
         let supports = vec![0..1usize, 2..3usize];
 
-        let full =
-            ift_dbeta_drho_from_solver(3, dg.view(), |rhs| inv.dot(rhs)).unwrap();
+        let full = ift_dbeta_drho_from_solver(3, dg.view(), |rhs| inv.dot(rhs)).unwrap();
         let coned =
             ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| inv.dot(rhs)).unwrap();
         for i in 0..3 {

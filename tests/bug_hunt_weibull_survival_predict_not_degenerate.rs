@@ -150,7 +150,8 @@ fn weibull_survival_predict_surface_is_not_degenerate_unit_survival() {
     run_or_panic(fit_cmd, "gam fit Surv ~ s(age) (weibull)");
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
-    let model = FittedModel::load_from_path(&model_path).expect("load saved Weibull survival model");
+    let model =
+        FittedModel::load_from_path(&model_path).expect("load saved Weibull survival model");
 
     let big_exit = exit.iter().cloned().fold(f64::MIN, f64::max) + 5.0;
     let dataset = predict_dataset(big_exit);

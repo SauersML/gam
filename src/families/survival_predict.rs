@@ -378,8 +378,8 @@ pub fn predict_survival(
     // fitted `beta[1] * (log t - log anchor)`. Weibull-WITH-timewiggle is a
     // different regime (the parametric offset is the baseline and beta carries
     // only the wiggle deviation), so it is excluded.
-    let weibull_baseline_in_beta =
-        saved_likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle();
+    let weibull_baseline_in_beta = saved_likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && !model.has_baseline_time_wiggle();
     let mut time_anchor: Option<f64> = None;
     let mut time_anchor_row_cached: Option<Array1<f64>> = None;
     if matches!(
@@ -779,13 +779,16 @@ pub fn predict_competing_risks_survival(
     // The ambient `time_build` is consumed only for the structural-basis check;
     // the per-(cause, row) loop rebuilds and centers its own `row_time`, so the
     // anchor row is all that needs threading through.
-    let weibull_baseline_in_beta =
-        saved_likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle();
+    let weibull_baseline_in_beta = saved_likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && !model.has_baseline_time_wiggle();
     let cr_time_anchor_row: Option<Array1<f64>> = if weibull_baseline_in_beta {
         let anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
-        Some(evaluate_survival_time_basis_row(anchor, &resolved_time_cfg)?)
+        Some(evaluate_survival_time_basis_row(
+            anchor,
+            &resolved_time_cfg,
+        )?)
     } else {
         None
     };
@@ -1599,8 +1602,8 @@ fn predict_survival_location_scale_batch(
     // wrong for every saved reduced-AFT model. Detected from the saved payload
     // alone (zero time-warp β + no learned baseline timewiggle), so no new
     // persisted flag is needed. (`iter().all` is `true` on an empty β too.)
-    let reduced_parametric_aft = !model.has_baseline_time_wiggle()
-        && saved_fit.beta_time().iter().all(|&b| b == 0.0);
+    let reduced_parametric_aft =
+        !model.has_baseline_time_wiggle() && saved_fit.beta_time().iter().all(|&b| b == 0.0);
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(age_entry, age_exit, time_cfg.clone(), None)?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
@@ -1806,7 +1809,9 @@ fn predict_survival_location_scale_batch(
         let mut offset = expand_vector(primary_offset);
         if reduced_parametric_aft {
             for (slot, &t) in offset.iter_mut().zip(eval_exit.iter()) {
-                *slot -= t.max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR).ln();
+                *slot -= t
+                    .max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+                    .ln();
             }
         }
         offset
@@ -1918,8 +1923,7 @@ fn predict_survival_location_scale_batch(
         // times rather than from the (empty) time-derivative design (issue #892).
         use crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar;
         let beta_log_sigma = saved_fit.beta_log_sigma();
-        let eta_ls = prepared_sigma_design_view(&pred_input)
-            .matrixvectormultiply(&beta_log_sigma)
+        let eta_ls = prepared_sigma_design_view(&pred_input).matrixvectormultiply(&beta_log_sigma)
             + &pred_input.eta_log_sigma_offset;
         let mut deriv = Array1::<f64>::zeros(eval_exit.len());
         for (k, slot) in deriv.iter_mut().enumerate() {
