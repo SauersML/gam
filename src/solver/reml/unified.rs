@@ -8367,9 +8367,20 @@ pub fn reml_laml_evaluate(
         debug_stash::store_terms(stash);
     }
 
-    // Add correction gradients (ρ-only).
-    if let Some(tk_grad) = &solution.tk_gradient {
-        {
+    // Add correction gradients (ρ-only). The Tierney–Kadane term is a
+    // frozen-curvature correction to the Laplace `½ log|H|` factor, so its
+    // VALUE is added to the cost ONLY when `include_logdet_h` is set (see the
+    // `if *include_logdet_h { cost += solution.tk_correction … }` guard in the
+    // cost branch). Its DERIVATIVE must follow the SAME guard, otherwise a
+    // `MaxPenalizedLikelihood`-style assembly (`include_logdet_h = false`) that
+    // also carried a nonzero `tk_correction` would expose a gradient term the
+    // value omits — precisely the value↔derivative desync this evaluator must
+    // never introduce. (The runtime `apply_tk_to_result` path keeps the two
+    // sides paired by always applying both; this guard keeps the
+    // `InnerAssembly`-field path paired the other way, so every TK route is
+    // value/gradient-consistent regardless of `include_logdet_h`.)
+    if incl_logdet_h {
+        if let Some(tk_grad) = &solution.tk_gradient {
             let mut sl = grad.slice_mut(ndarray::s![..k]);
             sl += tk_grad;
         }
