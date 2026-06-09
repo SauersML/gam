@@ -4253,18 +4253,36 @@ fn prepare_survival_location_scale_model(
         protected_timewiggle_cols,
     );
     let threshold_fixed_cols = if time_reduced_to_parametric {
-        // Reduced constant-scale parametric-AFT regime: the time-warp has
-        // collapsed to a constant-free affine shape basis (its reduced design
-        // columns are strictly monotone in t and span no constant-in-t
-        // direction), so it no longer carries the location intercept the gauge
-        // contract normally attributes to it. Keep the threshold (location)
-        // intercept here — it is the free location level b0, NOT aliased with
-        // the multiplicative scale constant nor with any time-warp constant
-        // (there is none) — exactly mirroring why the constant log_sigma block
-        // keeps its intercept (`log_sigma_fixed_cols = 0`). Dropping it (#736)
-        // left the raw covariate column to double as both level and slope,
-        // pinning the covariate to a wrong-signed level-matching value.
-        0
+        if time_prepared.pinned_free_row_constant {
+            // Reduced + unit-log-t warp PINNED (issue #892): the single surviving
+            // free time column `z_c` is ROW-CONSTANT — it now carries the
+            // location level. Keeping the threshold intercept too would put TWO
+            // constant columns into the direct-MLE joint design, making the
+            // Hessian PSD and rank-deficient by 1; the damped Newton then stalls
+            // along the alias and leaves the lowest-leverage coefficient (e.g. an
+            // x0:x1 interaction) stuck at its cold-start 0. Drop the LEADING
+            // threshold intercept(s) so the location level is owned solely by the
+            // pinned time constant `z_c`. The threshold then contributes only its
+            // genuine covariate slopes; finalize pads the dropped intercept slot
+            // with 0 (intercept-invariant for the g-contrast and the surface
+            // anchor). Use the same leading-intercept inference the flexible path
+            // uses (returns 0 for an intercept-free threshold design), so this is
+            // robust to designs that carry no constant column to alias.
+            infer_non_intercept_start_design(&threshold_prep.design_exit, &spec.weights)?
+                .min(threshold_full_ncols)
+        } else {
+            // Reduced but pin did NOT fire (both-columns-free fallback): the
+            // reduced I-spline columns are strictly monotone in t and span no
+            // constant-in-t direction, so the time block carries no location
+            // intercept the gauge contract would attribute to it. Keep the
+            // threshold (location) intercept here — it is the free location level
+            // b0, NOT aliased with the multiplicative scale constant nor with any
+            // time-warp constant (there is none) — mirroring why the constant
+            // log_sigma block keeps its intercept (`log_sigma_fixed_cols = 0`).
+            // Dropping it (#736) left the raw covariate column to double as both
+            // level and slope, pinning the covariate to a wrong-signed value.
+            0
+        }
     } else {
         infer_non_intercept_start_design(&threshold_prep.design_exit, &spec.weights)?
             .min(threshold_full_ncols)
@@ -4974,6 +4992,14 @@ struct TimeBlockPrepared {
     offset_entry: Array1<f64>,
     offset_exit: Array1<f64>,
     derivative_offset_exit: Array1<f64>,
+    /// True iff the unit-log-t warp-slope pin fired (issue #892), so the single
+    /// surviving free time column `z_c` is ROW-CONSTANT (it carries the location
+    /// level). The threshold block must then DROP its own intercept to avoid a
+    /// two-constant alias in the joint Hessian. False on every other path,
+    /// including the both-columns-free fallback reduce — there the reduced
+    /// I-spline columns are strictly monotone (not row-constant), so the
+    /// threshold keeps its intercept.
+    pinned_free_row_constant: bool,
 }
 
 fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalityConstraints> {
@@ -5715,6 +5741,9 @@ fn prepare_identified_time_block(
                 offset_entry,
                 offset_exit,
                 derivative_offset_exit,
+                // Pin fired: the free `z_c` column is row-constant, so the
+                // threshold intercept must be dropped to break the alias (#892).
+                pinned_free_row_constant: true,
             });
         }
         let reduced_entry = design_entry.dot(&z);
@@ -5772,6 +5801,9 @@ fn prepare_identified_time_block(
             offset_entry: input.offset_entry.clone(),
             offset_exit: input.offset_exit.clone(),
             derivative_offset_exit: input.derivative_offset_exit.clone(),
+            // Fallback reduce: the reduced I-spline columns are strictly
+            // monotone (not row-constant), so the threshold keeps its intercept.
+            pinned_free_row_constant: false,
         });
     }
 
@@ -5822,6 +5854,8 @@ fn prepare_identified_time_block(
         offset_entry: input.offset_entry.clone(),
         offset_exit: input.offset_exit.clone(),
         derivative_offset_exit: input.derivative_offset_exit.clone(),
+        // Full flexible I-spline: no pin, threshold keeps its intercept.
+        pinned_free_row_constant: false,
     })
 }
 
