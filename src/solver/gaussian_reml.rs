@@ -3394,9 +3394,15 @@ mod tests {
         weights: ArrayView1<'_, f64>,
         target: ForwardScalar,
     ) -> Option<f64> {
-        let fit =
-            gaussian_reml_multi_closed_form_with_cache(x, y, penalty, Some(weights), Some(0.85), None)
-                .ok()?;
+        let fit = gaussian_reml_multi_closed_form_with_cache(
+            x,
+            y,
+            penalty,
+            Some(weights),
+            Some(0.85),
+            None,
+        )
+        .ok()?;
         Some(match target {
             ForwardScalar::Lambda => fit.lambda,
             ForwardScalar::RemlScore => fit.reml_score,
@@ -3413,7 +3419,8 @@ mod tests {
         weights: ArrayView1<'_, f64>,
         target: ForwardScalar,
     ) -> f64 {
-        one_hot_objective_try(x, y, penalty, weights, target).expect("finite-difference forward fit")
+        one_hot_objective_try(x, y, penalty, weights, target)
+            .expect("finite-difference forward fit")
     }
 
     fn one_hot_backward(
@@ -3425,20 +3432,20 @@ mod tests {
     ) -> GaussianRemlBackwardResult {
         let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
-        let (grad_lambda, grad_score, grad_edf, coefficient_upstream, fitted_upstream) = match target
-        {
-            ForwardScalar::Lambda => (1.0, 0.0, 0.0, None, None),
-            ForwardScalar::RemlScore => (0.0, 1.0, 0.0, None, None),
-            ForwardScalar::Coefficient(row, col) => {
-                grad_coefficients[[row, col]] = 1.0;
-                (0.0, 0.0, 0.0, Some(grad_coefficients.view()), None)
-            }
-            ForwardScalar::Fitted(row, col) => {
-                grad_fitted[[row, col]] = 1.0;
-                (0.0, 0.0, 0.0, None, Some(grad_fitted.view()))
-            }
-            ForwardScalar::Edf => (0.0, 0.0, 1.0, None, None),
-        };
+        let (grad_lambda, grad_score, grad_edf, coefficient_upstream, fitted_upstream) =
+            match target {
+                ForwardScalar::Lambda => (1.0, 0.0, 0.0, None, None),
+                ForwardScalar::RemlScore => (0.0, 1.0, 0.0, None, None),
+                ForwardScalar::Coefficient(row, col) => {
+                    grad_coefficients[[row, col]] = 1.0;
+                    (0.0, 0.0, 0.0, Some(grad_coefficients.view()), None)
+                }
+                ForwardScalar::Fitted(row, col) => {
+                    grad_fitted[[row, col]] = 1.0;
+                    (0.0, 0.0, 0.0, None, Some(grad_fitted.view()))
+                }
+                ForwardScalar::Edf => (0.0, 0.0, 1.0, None, None),
+            };
         gaussian_reml_multi_closed_form_backward(
             x,
             y,
@@ -3607,8 +3614,14 @@ mod tests {
                         let mut s_minus = penalty.clone();
                         s_plus[[r, c]] += probe_h;
                         s_minus[[r, c]] -= probe_h;
-                        one_hot_objective_try(x.view(), y.view(), s_plus.view(), weights.view(), target)
-                            .is_some()
+                        one_hot_objective_try(
+                            x.view(),
+                            y.view(),
+                            s_plus.view(),
+                            weights.view(),
+                            target,
+                        )
+                        .is_some()
                             && one_hot_objective_try(
                                 x.view(),
                                 y.view(),
