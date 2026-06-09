@@ -1,5 +1,10 @@
 //! Dense triangular and Cholesky-factor solves.
 //!
+//! Solving `A x = b` once `A = L Lᵀ` is split is a tidy two-pass affair: walk
+//! down the staircase resolving one unknown per step (`L y = b`), then climb
+//! back up the transpose to recover `x`. Every unknown is already pinned down
+//! by the time we reach it — no guessing, no iteration, just substitution.
+//!
 //! A single home for the forward/back substitution kernels that several solver
 //! and GPU host paths previously hand-rolled (one per call site). Given a
 //! lower-triangular Cholesky factor `L` (so the symmetric positive-definite
