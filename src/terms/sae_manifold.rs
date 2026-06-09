@@ -2944,6 +2944,14 @@ pub struct SaeManifoldTerm {
     /// Active-set row layout from the most recent `assemble_arrow_schur` call.
     /// `None` for dense modes (Softmax / IBPMap) or when not yet assembled.
     last_row_layout: Option<SaeRowLayout>,
+    /// The single provenance-carrying per-row inner product (Object 2). The
+    /// reconstruction likelihood whitens residuals through it and the isometry
+    /// gauge's [`crate::terms::analytic_penalties::WeightField`] is constructed
+    /// from the same object, so a likelihood-metric ≠ gauge-metric state is
+    /// unrepresentable. `None` ⇒ Euclidean / isotropic (magic-by-default: the
+    /// metric is selected by whether per-row Fisher factors were installed, not
+    /// by a flag), which is bit-for-bit the historical isotropic `φ̂` path.
+    row_metric: Option<crate::inference::row_metric::RowMetric>,
 }
 
 /// Snapshot of exactly the mutable term state that an `apply_newton_step` +
@@ -3017,7 +3025,45 @@ impl SaeManifoldTerm {
             assignment,
             temperature_schedule: None,
             last_row_layout: None,
+            row_metric: None,
         })
+    }
+
+    /// Install the single per-row [`RowMetric`](crate::inference::row_metric::RowMetric)
+    /// that both the reconstruction likelihood and the isometry gauge read.
+    /// Installing per-row output-Fisher factors here flips the provenance to
+    /// `OutputFisher` *and* is the only way the gauge acquires a non-identity
+    /// weight, so the two inner products cannot diverge. Passing a Euclidean
+    /// metric (or never calling this) keeps the bit-identical isotropic path.
+    ///
+    /// The metric's row count and output dimension must match the term.
+    pub fn set_row_metric(
+        &mut self,
+        metric: crate::inference::row_metric::RowMetric,
+    ) -> Result<(), String> {
+        if metric.n_rows() != self.n_obs() {
+            return Err(format!(
+                "SaeManifoldTerm::set_row_metric: metric has {} rows but term has {}",
+                metric.n_rows(),
+                self.n_obs()
+            ));
+        }
+        if metric.p_out() != self.output_dim() {
+            return Err(format!(
+                "SaeManifoldTerm::set_row_metric: metric output dim {} but term has {}",
+                metric.p_out(),
+                self.output_dim()
+            ));
+        }
+        self.row_metric = Some(metric);
+        Ok(())
+    }
+
+    /// The installed per-row metric, if any. `None` ⇒ Euclidean / isotropic.
+    /// Consumed by the gauge wiring (to build the matching `WeightField`) and by
+    /// Object 4 (to read the [`MetricProvenance`](crate::inference::row_metric::MetricProvenance)).
+    pub fn row_metric(&self) -> Option<&crate::inference::row_metric::RowMetric> {
+        self.row_metric.as_ref()
     }
 
     pub fn set_temperature_schedule(
@@ -3412,10 +3458,27 @@ impl SaeManifoldTerm {
         }
         let fitted = self.try_fitted()?;
         let mut data_fit = 0.0_f64;
+        // Whiten every residual row through the single RowMetric. Under the
+        // Euclidean (default `None`) provenance the whitening is the identity,
+        // so `0.5 * Σ whitened²` is bit-for-bit `0.5 * Σ r²` — the historical
+        // isotropic data-fit. Under a factored provenance the same sum equals
+        // `0.5 * Σ_n rₙᵀ Wₙ rₙ` via `‖Uₙᵀ rₙ‖² = rₙᵀ Wₙ rₙ`.
+        let mut resid_row = ndarray::Array1::<f64>::zeros(target.ncols());
         for row in 0..target.nrows() {
             for out_col in 0..target.ncols() {
-                let r = target[[row, out_col]] - fitted[[row, out_col]];
-                data_fit += 0.5 * r * r;
+                resid_row[out_col] = target[[row, out_col]] - fitted[[row, out_col]];
+            }
+            match self.row_metric.as_ref() {
+                None => {
+                    for &r in resid_row.iter() {
+                        data_fit += 0.5 * r * r;
+                    }
+                }
+                Some(metric) => {
+                    for w in metric.whiten_residual_row(row, resid_row.view()) {
+                        data_fit += 0.5 * w * w;
+                    }
+                }
             }
         }
         let assignment_sparsity = assignment_prior_value(&self.assignment, rho);
@@ -5533,6 +5596,27 @@ impl SaeManifoldTerm {
         let p = atom.decoder_coefficients.ncols();
         let mut corrected: IsometryPenalty = (**iso).clone();
         corrected.p_out = p;
+        // Single-source-of-truth gauge metric: the isometry pullback weight is
+        // taken from the SAME RowMetric the reconstruction likelihood whitens
+        // through. There is no independent gauge-weight setter, so a
+        // likelihood-metric ≠ gauge-metric state is unrepresentable. When the
+        // term carries no RowMetric (Euclidean default) the gauge weight stays
+        // Identity, matching the isotropic likelihood exactly. The metric's
+        // p_out must agree with the atom's true decoder output dimension.
+        if let Some(metric) = self.row_metric.as_ref() {
+            if metric.p_out() == p {
+                corrected.weight = metric.to_weight_field();
+            } else {
+                return Err(ArrowSchurError::SchurFactorFailed {
+                    reason: format!(
+                        "corrected_isometry_penalty: RowMetric p_out {} disagrees with atom {} \
+                         decoder output dim {p}; the gauge metric must match the likelihood metric",
+                        metric.p_out(),
+                        atom_idx
+                    ),
+                });
+            }
+        }
         let coords_mat = coord.as_matrix();
         let second_jet_installed =
             refresh_isometry_caches_from_atom(&corrected, atom, coords_mat.view())

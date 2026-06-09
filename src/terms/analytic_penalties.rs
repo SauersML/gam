@@ -969,12 +969,22 @@ impl IsometryPenalty {
         self
     }
 
-    /// Attach a per-row behavioral metric in low-rank factored form
-    /// (`W_n = U_n U_n^T`). The contraction-order invariant is enforced by
-    /// the per-row builder `M_n = U_n^T J_n`; see [`WeightField`].
+    /// Attach the gauge metric **from the single
+    /// [`RowMetric`](crate::inference::row_metric::RowMetric)** that also drives
+    /// the reconstruction likelihood. This is the only way an `IsometryPenalty`
+    /// acquires a non-identity behavioral metric: the independent
+    /// `WeightField` setter has been removed so a gauge-metric ≠
+    /// likelihood-metric state is structurally unrepresentable. The
+    /// contraction-order invariant (`M_n = U_n^T J_n`, never materializing the
+    /// `p × p` `W_n`) is preserved by the [`WeightField::Factored`] layout the
+    /// metric emits.
+    ///
+    /// `p_out` is taken from the metric so the gauge's output dimension is
+    /// pinned to the metric's.
     #[must_use]
-    pub fn with_weight(mut self, weight: WeightField) -> Self {
-        self.weight = weight;
+    pub fn with_row_metric(mut self, metric: &crate::inference::row_metric::RowMetric) -> Self {
+        self.weight = metric.to_weight_field();
+        self.p_out = metric.p_out();
         self
     }
 
