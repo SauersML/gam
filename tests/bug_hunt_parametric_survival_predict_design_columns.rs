@@ -35,30 +35,33 @@ fn gam_binary() -> PathBuf {
 /// covariate `x` whose true effect is a positive log-hazard slope, so the
 /// fitted survival curve must differ across `x`.
 fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut state: u64 = 0x243F6A8885A308D3;
-    let mut next_u01 = || {
-        state = state
+    // Explicit-state RNG helpers (not nested closures: a closure capturing
+    // another closure's `&mut state` holds a persistent borrow that conflicts
+    // with direct calls to the inner closure).
+    fn next_u01(state: &mut u64) -> f64 {
+        *state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        ((state >> 11) as f64) / ((1u64 << 53) as f64)
-    };
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+    }
     // Box-Muller for a standard normal covariate.
-    let mut next_normal = || {
-        let u1 = next_u01().max(1e-12);
-        let u2 = next_u01();
+    fn next_normal(state: &mut u64) -> f64 {
+        let u1 = next_u01(state).max(1e-12);
+        let u2 = next_u01(state);
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-    };
+    }
+    let mut state: u64 = 0x243F6A8885A308D3;
 
     let shape = 1.5_f64;
     let mut x = Vec::with_capacity(N);
     let mut exit = Vec::with_capacity(N);
     let mut event = Vec::with_capacity(N);
     for _ in 0..N {
-        let xi = next_normal();
+        let xi = next_normal(&mut state);
         let eta = -1.5 + 0.7 * xi;
-        let u = next_u01().max(1e-9);
+        let u = next_u01(&mut state).max(1e-9);
         let t_lat = (-eta / shape).exp() * (-u.ln()).powf(1.0 / shape);
-        let cens = (-next_u01().max(1e-12).ln() * 12.0).min(20.0);
+        let cens = (-next_u01(&mut state).max(1e-12).ln() * 12.0).min(20.0);
         let ex = t_lat.min(cens);
         let ev = if t_lat <= cens { 1.0 } else { 0.0 };
         x.push(xi);
