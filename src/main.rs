@@ -4178,7 +4178,24 @@ fn build_survival_time_initial_beta(
     )
 }
 
-fn fitted_weibull_baseline_from_linear_time_beta(beta: &Array1<f64>) -> Option<(f64, f64)> {
+/// Recover the fitted Weibull `(scale, shape)` baseline from the anchor-CENTERED
+/// linear `[1, log t]` time-basis coefficients.
+///
+/// The fit centers the time basis at the survival time anchor
+/// (`center_survival_time_designs_at_anchor`), which zeroes the constant column,
+/// so the constant-column coefficient `beta[0]` is UNIDENTIFIED (left at its
+/// stale seed). The identified baseline the model actually carries is
+/// `eta(t) = beta[1] * (log t - log anchor)`, exactly the Weibull form
+/// `eta(t) = shape * (log t - log scale)` with `shape = beta[1]` and
+/// `scale = anchor`. Reconstructing `scale` from `beta[0]` (the old
+/// `exp(-beta[0]/shape)`) reads the stale constant column and produces a wrong
+/// scale, so any consumer that rebuilds `H0(t) = (t/scale)^shape` from the saved
+/// scale (e.g. competing-risks CIF) is misled. Recover `scale` from the
+/// identified anchor instead (issue #899).
+fn fitted_weibull_baseline_from_linear_time_beta(
+    beta: &Array1<f64>,
+    anchor: f64,
+) -> Option<(f64, f64)> {
     if beta.len() < 2 {
         return None;
     }
@@ -4186,11 +4203,10 @@ fn fitted_weibull_baseline_from_linear_time_beta(beta: &Array1<f64>) -> Option<(
     if !shape.is_finite() || shape <= 0.0 {
         return None;
     }
-    let log_scale = -beta[0] / shape;
-    let scale = log_scale.exp();
-    if !scale.is_finite() || scale <= 0.0 {
+    if !anchor.is_finite() || anchor <= 0.0 {
         return None;
     }
+    let scale = anchor;
     Some((scale, shape))
 }
 
@@ -6014,7 +6030,7 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let fitted_baseline_cfg =
         if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
             let time_beta = beta.slice(s![..p_time_total]).to_owned();
-            let (scale, shape) = fitted_weibull_baseline_from_linear_time_beta(&time_beta)
+            let (scale, shape) = fitted_weibull_baseline_from_linear_time_beta(&time_beta, time_anchor)
                 .ok_or_else(|| {
                     "failed to recover fitted Weibull scale/shape from the linear time coefficients"
                         .to_string()
