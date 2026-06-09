@@ -1,0 +1,426 @@
+//! `RowMetric` — the single provenance-carrying per-row inner product shared by
+//! the SAE-manifold **likelihood** (residual whitening) and the **gauge**
+//! ([`crate::terms::analytic_penalties::IsometryPenalty`] pullback weight).
+//!
+//! # Why this exists
+//!
+//! The SAE-manifold machine historically carried *two* independent inner
+//! products:
+//!
+//! * the **likelihood** measured reconstruction residuals isotropically — a
+//!   single scalar dispersion `φ̂ = RSS / residual-dof`, the data-fit loop
+//!   summing the bare `½ rᵀr`; there was no per-row metric at all; and
+//! * the **gauge** carried its own per-row metric in
+//!   `IsometryPenalty.weight: WeightField` — a low-rank `W_n = U_n U_nᵀ`
+//!   pullback `g_n = J_nᵀ W_n J_n`, settable independently of anything the
+//!   likelihood saw.
+//!
+//! Nothing structurally forced "the metric the likelihood whitens by" to equal
+//! "the metric the gauge pulls back through". That is exactly the
+//! objective↔gradient-desync bug class wearing geometry clothing: a
+//! likelihood-metric ≠ gauge-metric state was *representable*.
+//!
+//! `RowMetric` collapses the two into one object. The likelihood whitens
+//! through it; the gauge `WeightField` is *constructed from* it. A
+//! divergent-metric state is therefore unrepresentable — there is only one
+//! per-row factor stack `U_n`, with one [`MetricProvenance`] tag.
+//!
+//! # Magic-by-default selector
+//!
+//! There is no flag. The provenance is chosen by whether per-row Fisher factors
+//! exist:
+//!
+//! * no factors supplied ⇒ [`MetricProvenance::Euclidean`]; `W_n = I_p`;
+//!   whitening is the identity, so `φ̂` and the data-fit loop are
+//!   **bit-for-bit** the prior isotropic path; and
+//! * per-row Fisher factors supplied ⇒ [`MetricProvenance::OutputFisher`]; the
+//!   residual is whitened by `U_nᵀ` and the gauge pulls back through the same
+//!   `U_n`.
+//!
+//! # Validation
+//!
+//! Every metric block is constructed **through**
+//! [`crate::inference::fisher_rao::normalize_fisher_rao_blocks`], which
+//! broadcasts and eigenvalue-validates PSD-ness. `RowMetric` does not
+//! reimplement that validation; it materializes `W_n = U_n U_nᵀ` (which is PSD
+//! by construction) and runs it through the shared normalizer as the
+//! single point of truth for "is this a valid precision metric".
+//!
+//! Any rank floor used to make a block invertible for an internal solve is
+//! **solver-only** (mirroring `RidgePolicy::solver_only`, #747): it never enters
+//! the residual the objective sums, so `δ` cannot bias the criterion.
+
+use ndarray::{Array2, Array3, ArrayView1};
+use std::sync::Arc;
+
+use crate::inference::fisher_rao::normalize_fisher_rao_blocks;
+
+/// Where the per-row metric came from — the provenance that makes
+/// "likelihood-metric ≠ gauge-metric" diagnosable instead of silent.
+///
+/// Object 4 (the gauge object) reads this to certify which inner product the
+/// fit actually used; #974 fills [`MetricProvenance::WhitenedStructured`] with a
+/// factor-analytic residual-covariance whitening.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MetricProvenance {
+    /// `M_n = I_p` for every row. The likelihood is isotropic and the gauge
+    /// pullback reduces to the bare `J_nᵀ J_n`. This is the default and is
+    /// bit-for-bit the historical isotropic-`φ̂` path.
+    Euclidean,
+    /// `M_n = U_n U_nᵀ (+ solver-only δI)` from supplied per-row output-Fisher
+    /// factors `U_n ∈ ℝ^{p × rank}`. The canonical "one unit of latent motion ↦
+    /// one unit of behavioral change" metric: residuals are whitened in the
+    /// output-Fisher inner product and the gauge pulls back through the same
+    /// factors. The `rank` is carried in the provenance so a consumer (Object 4)
+    /// can certify the factor rank that produced the inner product.
+    OutputFisher { rank: usize },
+    /// Structured-residual whitening: `M_n` whitens by a factor-analytic
+    /// residual covariance with `factor_rank` factors. Scoped for #974; for now
+    /// it carries the same low-rank factor layout as
+    /// [`MetricProvenance::OutputFisher`] (the structured-covariance fill is the
+    /// #974 seam), so a constructed `WhitenedStructured` behaves like a
+    /// factored metric until #974 lands the residual-covariance factorization.
+    WhitenedStructured { factor_rank: usize },
+}
+
+/// The single per-row metric object. Holds one low-rank factor stack `U_n` (or
+/// none, for Euclidean) plus the validated PSD blocks, tagged with its
+/// [`MetricProvenance`].
+///
+/// `p` is the output dimensionality (residual / Jacobian-column dimension); the
+/// per-row factor `U_n ∈ ℝ^{p × rank}` so `W_n = U_n U_nᵀ ∈ ℝ^{p × p}` without
+/// ever being materialized as `p × p` in any hot path.
+#[derive(Clone, Debug)]
+pub struct RowMetric {
+    provenance: MetricProvenance,
+    n_rows: usize,
+    p: usize,
+    rank: usize,
+    /// `(n_rows, p * rank)` row-major: `U_n[i, k] = u[n, i * rank + k]`. `None`
+    /// for [`MetricProvenance::Euclidean`] (the identity factor is implicit).
+    factors: Option<Arc<Array2<f64>>>,
+    /// **Solver-only** Tikhonov floor `δ` added as `δ I_p` to make a
+    /// rank-deficient `U_n U_nᵀ` invertible for an *internal solve only*.
+    ///
+    /// Invariant (mirrors `RidgePolicy::solver_only`, #747): `δ` **never** enters
+    /// any quantity that feeds the evidence criterion. The criterion-facing
+    /// quad-form / whitening / fisher-mass methods all use the *un-floored*
+    /// `U_n U_nᵀ`; only [`Self::solve_floor`]-tagged solver helpers see `δ`. A
+    /// nonzero floor therefore cannot bias the objective the optimizer reports.
+    solver_delta: f64,
+    /// Validated PSD blocks `(n_rows, p, p)` produced **through**
+    /// [`normalize_fisher_rao_blocks`] (the *un-floored* `U_n U_nᵀ`). Retained as
+    /// the provenance-of-validation record; the hot paths use `factors` directly
+    /// to avoid `p × p` work. The solver `δ` is deliberately *not* baked in here,
+    /// so this is the criterion-facing metric.
+    blocks: Array3<f64>,
+}
+
+impl RowMetric {
+    /// Euclidean metric: `W_n = I_p` for all `n`. Whitening is the identity, so
+    /// the likelihood residual path is bit-for-bit the prior isotropic `φ̂`.
+    ///
+    /// Built through the shared normalizer (a length-`n` scalar `1.0` vector,
+    /// broadcast to per-row identity blocks) so the validation seam is the same
+    /// single source of truth as every other provenance.
+    pub fn euclidean(n_rows: usize, p: usize) -> Result<Self, String> {
+        let scale = ndarray::Array1::<f64>::ones(n_rows);
+        let blocks = normalize_fisher_rao_blocks(scale.view().into_dyn(), n_rows, p)
+            .map_err(|e| format!("RowMetric::euclidean: {e}"))?;
+        Ok(Self {
+            provenance: MetricProvenance::Euclidean,
+            n_rows,
+            p,
+            rank: p,
+            factors: None,
+            solver_delta: 0.0,
+            blocks,
+        })
+    }
+
+    /// Output-Fisher metric: per-row low-rank factors `U_n ∈ ℝ^{p × rank}`
+    /// supplied as a `(n_rows, p * rank)` row-major matrix (`U_n[i, k] =
+    /// u[n, i * rank + k]`). The induced `M_n = U_n U_nᵀ` is PSD by
+    /// construction; it is validated through [`normalize_fisher_rao_blocks`] so
+    /// the validation path is shared. No solver floor (`δ = 0`).
+    pub fn output_fisher(u: Arc<Array2<f64>>, p: usize, rank: usize) -> Result<Self, String> {
+        Self::from_factors(MetricProvenance::OutputFisher { rank }, u, p, rank, 0.0)
+    }
+
+    /// Like [`Self::output_fisher`] but with a **solver-only** Tikhonov floor
+    /// `δ ≥ 0`. The floor is recorded for solver helpers only; every
+    /// criterion-facing method (`quad_form`, `whiten_residual`, `fisher_mass`)
+    /// ignores it (#747 discipline), so the evidence criterion is `δ`-free.
+    pub fn output_fisher_with_solver_floor(
+        u: Arc<Array2<f64>>,
+        p: usize,
+        rank: usize,
+        solver_delta: f64,
+    ) -> Result<Self, String> {
+        if !(solver_delta.is_finite() && solver_delta >= 0.0) {
+            return Err(format!(
+                "RowMetric::output_fisher_with_solver_floor: solver_delta must be finite and \
+                 non-negative; got {solver_delta}"
+            ));
+        }
+        Self::from_factors(
+            MetricProvenance::OutputFisher { rank },
+            u,
+            p,
+            rank,
+            solver_delta,
+        )
+    }
+
+    /// Structured-residual whitening. For now this is a clearly-scoped path that
+    /// whitens by the supplied per-row factors exactly as
+    /// [`Self::output_fisher`] does — the factor-analytic residual-covariance
+    /// fill is the #974 seam. The block layout already holds the per-row
+    /// factors #974 will populate, so no layout change is needed when it lands.
+    pub fn whitened_structured(
+        u: Arc<Array2<f64>>,
+        p: usize,
+        rank: usize,
+    ) -> Result<Self, String> {
+        Self::from_factors(
+            MetricProvenance::WhitenedStructured { factor_rank: rank },
+            u,
+            p,
+            rank,
+            0.0,
+        )
+    }
+
+    fn from_factors(
+        provenance: MetricProvenance,
+        u: Arc<Array2<f64>>,
+        p: usize,
+        rank: usize,
+        solver_delta: f64,
+    ) -> Result<Self, String> {
+        let n_rows = u.nrows();
+        if u.ncols() != p * rank {
+            return Err(format!(
+                "RowMetric::from_factors: factor matrix has {} cols; expected p*rank = {}*{} = {}",
+                u.ncols(),
+                p,
+                rank,
+                p * rank
+            ));
+        }
+        if !u.iter().all(|v| v.is_finite()) {
+            return Err("RowMetric::from_factors: factors must be finite".to_string());
+        }
+        // Materialize W_n = U_n U_nᵀ once (PSD by construction) and validate it
+        // through the single shared normalizer rather than reimplementing the
+        // PSD check here.
+        let mut full = Array3::<f64>::zeros((n_rows, p, p));
+        for row in 0..n_rows {
+            for i in 0..p {
+                for j in 0..p {
+                    let mut acc = 0.0;
+                    for k in 0..rank {
+                        acc += u[[row, i * rank + k]] * u[[row, j * rank + k]];
+                    }
+                    full[[row, i, j]] = acc;
+                }
+            }
+        }
+        let blocks = normalize_fisher_rao_blocks(full.view().into_dyn(), n_rows, p)
+            .map_err(|e| format!("RowMetric::from_factors: {e}"))?;
+        Ok(Self {
+            provenance,
+            n_rows,
+            p,
+            rank,
+            factors: Some(u),
+            solver_delta,
+            blocks,
+        })
+    }
+
+    /// The provenance tag (consumed by Object 4 to certify the inner product).
+    pub fn provenance(&self) -> MetricProvenance {
+        self.provenance
+    }
+
+    /// Number of rows the metric is defined over.
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Output dimensionality `p` (residual / Jacobian-column dimension).
+    pub fn p_out(&self) -> usize {
+        self.p
+    }
+
+    /// Validated PSD blocks `(n_rows, p, p)`. The provenance-of-validation
+    /// record; consumers wanting the explicit `W_n` (e.g. a future dense
+    /// diagnostic) read this, the hot paths use the factors.
+    pub fn blocks(&self) -> &Array3<f64> {
+        &self.blocks
+    }
+
+    /// Whiten a single `p`-dimensional residual row `r` into the coordinates
+    /// whose squared Euclidean norm equals `rᵀ W_n r`.
+    ///
+    /// * Euclidean: returns `r` unchanged (`‖r‖² = rᵀ I r`), so the likelihood
+    ///   reproduces the isotropic `½ rᵀr` data-fit bit-for-bit.
+    /// * Factored: returns `U_nᵀ r ∈ ℝ^{rank}`, with
+    ///   `‖U_nᵀ r‖² = rᵀ U_n U_nᵀ r = rᵀ W_n r`.
+    ///
+    /// This is the load-bearing identity that lets the data-fit loop sum
+    /// `0.5 * Σ whitened²` and recover exactly `rᵀ W_n r` whatever the
+    /// provenance.
+    pub fn whiten_residual_row(&self, row: usize, r: ArrayView1<'_, f64>) -> Vec<f64> {
+        match &self.factors {
+            None => r.iter().copied().collect(),
+            Some(u) => {
+                let mut out = vec![0.0_f64; self.rank];
+                for k in 0..self.rank {
+                    let mut acc = 0.0;
+                    for i in 0..self.p {
+                        acc += u[[row, i * self.rank + k]] * r[i];
+                    }
+                    out[k] = acc;
+                }
+                out
+            }
+        }
+    }
+
+    /// Pullback metric `g_n = J_nᵀ W_n J_n` for one row, formed as
+    /// `(J_nᵀ U_n)(U_nᵀ J_n)` — never materializing the `p × p` `W_n`.
+    ///
+    /// `j_row` is the row's Jacobian `J_n ∈ ℝ^{p × d}` flattened row-major
+    /// (`J_n[i, a] = j_row[i * d + a]`). Returns the `d × d` `g_n`.
+    pub fn pullback(&self, row: usize, j_row: &[f64], d: usize) -> Array2<f64> {
+        match &self.factors {
+            None => {
+                // W_n = I_p ⇒ g_n = J_nᵀ J_n.
+                let mut g = Array2::<f64>::zeros((d, d));
+                for a in 0..d {
+                    for b in a..d {
+                        let mut acc = 0.0;
+                        for i in 0..self.p {
+                            acc += j_row[i * d + a] * j_row[i * d + b];
+                        }
+                        g[[a, b]] = acc;
+                        g[[b, a]] = acc;
+                    }
+                }
+                g
+            }
+            Some(u) => {
+                // M_n = U_nᵀ J_n ∈ ℝ^{rank × d}; g_n = M_nᵀ M_n.
+                let mut m = Array2::<f64>::zeros((self.rank, d));
+                for k in 0..self.rank {
+                    for a in 0..d {
+                        let mut acc = 0.0;
+                        for i in 0..self.p {
+                            acc += u[[row, i * self.rank + k]] * j_row[i * d + a];
+                        }
+                        m[[k, a]] = acc;
+                    }
+                }
+                let mut g = Array2::<f64>::zeros((d, d));
+                for a in 0..d {
+                    for b in a..d {
+                        let mut acc = 0.0;
+                        for k in 0..self.rank {
+                            acc += m[[k, a]] * m[[k, b]];
+                        }
+                        g[[a, b]] = acc;
+                        g[[b, a]] = acc;
+                    }
+                }
+                g
+            }
+        }
+    }
+
+    /// Quadratic form `r_nᵀ M_n r_n` for one row's residual `r_n ∈ ℝ^p`, formed
+    /// **factored** as `‖U_nᵀ r_n‖²` — never materializing the `p × p` `M_n`.
+    ///
+    /// This is the criterion-facing squared residual the likelihood sums; it uses
+    /// the **un-floored** `U_n U_nᵀ`, so the solver `δ` does not enter it
+    /// (#747 invariant). Euclidean provenance returns the bit-identical `‖r_n‖²`.
+    pub fn quad_form(&self, row: usize, r: ArrayView1<'_, f64>) -> f64 {
+        match &self.factors {
+            None => r.iter().map(|&v| v * v).sum(),
+            Some(_) => self
+                .whiten_residual_row(row, r)
+                .iter()
+                .map(|&w| w * w)
+                .sum(),
+        }
+    }
+
+    /// Whiten a per-row Jacobian `J_n ∈ ℝ^{p × d}` (row-major flat,
+    /// `J_n[i, a] = j_row[i * d + a]`) into `M_n = U_nᵀ J_n ∈ ℝ^{rank × d}` so
+    /// that `M_nᵀ M_n = J_nᵀ (U_n U_nᵀ) J_n = J_nᵀ W_n J_n` is the pullback
+    /// **without** any `p × p` intermediate. Euclidean returns `J_n` reshaped to
+    /// `(p, d)` (the identity whitening). Solver `δ` is not applied (criterion
+    /// face).
+    pub fn whiten_jacobian(&self, row: usize, j_row: &[f64], d: usize) -> Array2<f64> {
+        match &self.factors {
+            None => {
+                let mut out = Array2::<f64>::zeros((self.p, d));
+                for i in 0..self.p {
+                    for a in 0..d {
+                        out[[i, a]] = j_row[i * d + a];
+                    }
+                }
+                out
+            }
+            Some(u) => {
+                let mut m = Array2::<f64>::zeros((self.rank, d));
+                for k in 0..self.rank {
+                    for a in 0..d {
+                        let mut acc = 0.0;
+                        for i in 0..self.p {
+                            acc += u[[row, i * self.rank + k]] * j_row[i * d + a];
+                        }
+                        m[[k, a]] = acc;
+                    }
+                }
+                m
+            }
+        }
+    }
+
+    /// Fisher mass of a per-row output vector `x_n ∈ ℝ^p`: the scalar
+    /// `x_nᵀ M_n x_n` (alias of [`Self::quad_form`] read as an information mass
+    /// rather than a residual square). Factored, never `p × p`, `δ`-free.
+    pub fn fisher_mass(&self, row: usize, x: ArrayView1<'_, f64>) -> f64 {
+        self.quad_form(row, x)
+    }
+
+    /// The **solver-only** Tikhonov floor `δ` (#747). Returned for internal
+    /// solver helpers that need `U_n U_nᵀ + δ I` to be invertible; by contract
+    /// no caller may fold this into a criterion-facing quantity. Always `0` for
+    /// Euclidean and for factored metrics built without an explicit floor.
+    pub fn solver_floor(&self) -> f64 {
+        self.solver_delta
+    }
+
+    /// The gauge view of this metric: the
+    /// [`crate::terms::analytic_penalties::WeightField`] the
+    /// [`crate::terms::analytic_penalties::IsometryPenalty`] pulls back through.
+    ///
+    /// This is the **single** way an `IsometryPenalty` acquires a non-identity
+    /// gauge metric — the independent `WeightField` setter has been removed — so
+    /// the gauge metric is, by construction, the same object the likelihood
+    /// whitens with.
+    pub fn to_weight_field(&self) -> crate::terms::analytic_penalties::WeightField {
+        use crate::terms::analytic_penalties::WeightField;
+        match &self.factors {
+            None => WeightField::Identity,
+            Some(u) => WeightField::Factored {
+                u: Arc::clone(u),
+                rank: self.rank,
+                p_out: self.p,
+            },
+        }
+    }
+}
