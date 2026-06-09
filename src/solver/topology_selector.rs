@@ -36,8 +36,9 @@
 //! prediction path. That OOS-retention package is out of scope here.
 
 use crate::solver::evidence::{
-    GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
-    fit_gaussian_mixture, solve_stacking_weights,
+    GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale, UNION_STRUCTURE_LADDER,
+    UnionStructure, UnionStructureFit, fit_gaussian_mixture, fit_union_ladder, fit_union_structure,
+    solve_stacking_weights, union_per_point_log_density,
 };
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use ndarray::{Array2, ArrayView2};
@@ -68,6 +69,15 @@ pub enum AutoTopologyKind {
     Mixture {
         k: usize,
     },
+    /// Structured-union composite (#907): a small FIXED set of component
+    /// structures joined by a hard responsibility split (e.g. circle+circle,
+    /// circle+cluster, line+cluster). Like the mixture rung it is a discrete,
+    /// non-smooth density class — its evidence is the SUMMED rank-aware Laplace
+    /// evidence of its components, priced by total parameter count. Its presence
+    /// in a race triggers cross-class stacking adjudication.
+    Union {
+        structure: UnionStructure,
+    },
 }
 
 impl AutoTopologyKind {
@@ -83,10 +93,12 @@ impl AutoTopologyKind {
             AutoTopologyKind::Torus => "torus",
             AutoTopologyKind::Cylinder => "cylinder",
             AutoTopologyKind::Mixture { .. } => "mixture",
+            AutoTopologyKind::Union { structure } => structure.as_str(),
         }
     }
 
-    /// Owned display name including the mixture order, e.g. `"mixture_k7"`.
+    /// Owned display name including the mixture order, e.g. `"mixture_k7"`, or
+    /// the union composite tag, e.g. `"union_circle+circle"`.
     pub fn display_name(self) -> String {
         match self {
             AutoTopologyKind::Mixture { k } => format!("mixture_k{k}"),
@@ -100,8 +112,24 @@ impl AutoTopologyKind {
         matches!(self, AutoTopologyKind::Mixture { .. })
     }
 
+    /// `true` iff this candidate is the structured-union composite class (#907).
+    pub const fn is_structured_union(self) -> bool {
+        matches!(self, AutoTopologyKind::Union { .. })
+    }
+
+    /// `true` iff this candidate is a discrete (non-smooth) density class — the
+    /// mixture rung or a structured union. Cross-class stacking adjudication is
+    /// triggered when a race mixes a smooth/Euclidean candidate with any
+    /// discrete one.
+    pub const fn is_discrete_class(self) -> bool {
+        self.is_discrete_mixture() || self.is_structured_union()
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
         let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        if let Some(structure) = parse_union_name(&normalized) {
+            return Ok(AutoTopologyKind::Union { structure });
+        }
         if let Some(rest) = normalized.strip_prefix("mixture") {
             // Accept "mixture", "mixture_k7", "mixture7", "mixture_7".
             let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -130,7 +158,7 @@ impl AutoTopologyKind {
             "torus" => Ok(AutoTopologyKind::Torus),
             "cylinder" => Ok(AutoTopologyKind::Cylinder),
             other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, cylinder, or mixture[_k{{n}}]; got {other:?}"
+                "topology candidate must be euclidean, circle, sphere, torus, cylinder, mixture[_k{{n}}], or a union (union_circle+circle, union_circle+cluster, union_line+cluster); got {other:?}"
             )),
         }
     }
@@ -152,6 +180,46 @@ impl AutoTopologyKind {
             .iter()
             .map(|&k| AutoTopologyKind::Mixture { k })
             .collect()
+    }
+
+    /// The full structured-union rung: one candidate per composite in
+    /// [`UNION_STRUCTURE_LADDER`] (#907). Fixed and closed — no open-ended
+    /// structure search (that stays owned by #976's move set).
+    pub fn union_ladder() -> Vec<Self> {
+        UNION_STRUCTURE_LADDER
+            .iter()
+            .map(|&structure| AutoTopologyKind::Union { structure })
+            .collect()
+    }
+}
+
+/// Parse a structured-union composite name (#907). Accepts the canonical display
+/// tags (`union_circle+circle`, `union_circle+cluster`, `union_line+cluster`)
+/// and tolerant `_`/`-` separators in place of `+`. Returns `None` for any name
+/// that is not a union so [`AutoTopologyKind::parse`] can fall through to the
+/// smooth/mixture variants. Input is assumed already lowercased with `-`→`_`.
+pub fn parse_union_name(normalized: &str) -> Option<UnionStructure> {
+    let Some(rest) = normalized.strip_prefix("union") else {
+        return None;
+    };
+    // Canonicalize component separators: both `+` and the tolerant `_`/`-`
+    // forms collapse to `+`, and any leading separator after the `union`
+    // prefix is dropped (so `union_circle+circle` and `union__circle_circle`
+    // both normalize to `circle+circle`).
+    let body: String = rest
+        .chars()
+        .map(|c| if c == '_' || c == '-' { '+' } else { c })
+        .collect();
+    let body = body.trim_matches('+');
+    match body {
+        "circle+circle" => Some(UnionStructure::CircleCircle),
+        "circle+cluster" | "circle+point+cluster" | "circle+pointcluster" => {
+            Some(UnionStructure::CirclePointCluster)
+        }
+        "line+cluster" | "line+point+cluster" | "line+pointcluster" => {
+            Some(UnionStructure::LineCluster)
+        }
+        _ => None,
     }
 }
 
@@ -473,6 +541,95 @@ pub fn fit_mixture_rung(
     })
 }
 
+// ===========================================================================
+// Structured-union rung (#907)
+// ===========================================================================
+
+/// One fitted entry of the structured-union rung: the composite structure, its
+/// summed rank-aware Laplace **negative** log evidence (the SUM `Σ_c V_c` of its
+/// components, each scored through the identical [`crate::solver::evidence::laplace_evidence`]
+/// entry point used by the smooth rungs and the mixture rung), and the TOTAL
+/// free-parameter count across components (the complexity price). Lower
+/// negative-log-evidence wins.
+#[derive(Debug, Clone)]
+pub struct UnionRungFit {
+    pub structure: UnionStructure,
+    pub fit: UnionStructureFit,
+    /// `Σ_c P_c` — total free-parameter count across all components. This is the
+    /// complexity quantity that the summed `+ ½ Σ_c P_c log(2π)` normalizer
+    /// charges, so a union is strictly more expensive than either pure rung.
+    pub total_parameters: usize,
+    /// `Σ_c V_c` — summed rank-aware Laplace negative log evidence.
+    pub negative_log_evidence: f64,
+}
+
+/// Result of fitting the whole fixed union ladder: every fitted composite plus
+/// the index of the in-class winner (lowest summed rank-aware Laplace
+/// negative-log-evidence).
+#[derive(Debug, Clone)]
+pub struct UnionRungResult {
+    pub fits: Vec<UnionRungFit>,
+    pub winner_index: usize,
+}
+
+impl UnionRungResult {
+    pub fn winner(&self) -> &UnionRungFit {
+        &self.fits[self.winner_index]
+    }
+}
+
+/// Fit the structured-union rung over the FIXED ladder
+/// [`crate::solver::evidence::UNION_STRUCTURE_LADDER`] and rank in-class by
+/// summed rank-aware Laplace evidence. Each composite is hard-split into one
+/// responsibility group per component (reusing the mixture rung's deterministic
+/// seeding + EM), each component is REML/Laplace-fit on its group, and the
+/// per-component evidences are SUMMED. Composites whose groups are too small to
+/// identify their structure are skipped (they never enter the race rather than
+/// scoring spuriously well). Deterministic: the split and the component fits are
+/// pure functions of the data.
+pub fn fit_union_rung(
+    data: ArrayView2<'_, f64>,
+    config: GaussianMixtureConfig,
+) -> Result<UnionRungResult, String> {
+    // `fit_union_ladder` already fits the fixed ladder and ranks best-first by
+    // summed rank-aware evidence (cheaper composite wins ties). Re-wrap each
+    // fit with its complexity price for the rung view.
+    let ladder = fit_union_ladder(data, config)?;
+    let fits: Vec<UnionRungFit> = ladder
+        .into_iter()
+        .map(|fit| UnionRungFit {
+            structure: fit.structure,
+            total_parameters: fit.total_parameters,
+            negative_log_evidence: fit.negative_log_evidence,
+            fit,
+        })
+        .collect();
+    if fits.is_empty() {
+        return Err("union rung produced no fittable composites".to_string());
+    }
+    Ok(UnionRungResult {
+        fits,
+        winner_index: 0,
+    })
+}
+
+/// Fit a SINGLE structured-union composite and return it as a rung fit. Thin
+/// convenience over [`crate::solver::evidence::fit_union_structure`] for callers
+/// (and the race) that already chose a specific composite.
+pub fn fit_union_candidate(
+    data: ArrayView2<'_, f64>,
+    structure: UnionStructure,
+    config: GaussianMixtureConfig,
+) -> Result<UnionRungFit, String> {
+    let fit = fit_union_structure(data, structure, config)?;
+    Ok(UnionRungFit {
+        structure: fit.structure,
+        total_parameters: fit.total_parameters,
+        negative_log_evidence: fit.negative_log_evidence,
+        fit,
+    })
+}
+
 /// A selection-time predictive-density provider: given the row indices to TRAIN
 /// on and the row indices to EVALUATE on, it returns the per-eval-row held-out
 /// log predictive density `log p(y_eval | train)`. This is the decoupled seam
@@ -498,6 +655,26 @@ pub fn mixture_density_provider<'a>(
         let fit = fit_gaussian_mixture(train_mat.view(), k.min(train.len().max(1)), config)?;
         let eval_mat = gather_rows(owned.view(), eval);
         let dens = fit.per_point_log_density(eval_mat.view())?;
+        Ok(dens.to_vec())
+    })
+}
+
+/// Build a structured-union held-out-density provider for a fixed composite. It
+/// refits the union's component densities on the training rows and scores the
+/// eval rows under the soft mixture `log Σ_c π_c p_c(y)` (the union analogue of
+/// [`mixture_density_provider`]). Refits per fold, so the stacking table is
+/// genuinely held out.
+pub fn union_density_provider<'a>(
+    data: ArrayView2<'a, f64>,
+    structure: UnionStructure,
+    config: GaussianMixtureConfig,
+) -> HeldOutDensityProvider<'a> {
+    let owned = data.to_owned();
+    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+        let train_mat = gather_rows(owned.view(), train);
+        let eval_mat = gather_rows(owned.view(), eval);
+        let dens =
+            union_per_point_log_density(train_mat.view(), eval_mat.view(), structure, config)?;
         Ok(dens.to_vec())
     })
 }
@@ -614,10 +791,12 @@ pub struct CrossClassCandidate<'a> {
     pub density_provider: HeldOutDensityProvider<'a>,
 }
 
-/// Adjudicate a race that may mix smooth-manifold and discrete-mixture
-/// candidates. Cross-class mixing is auto-detected from the candidate kinds (a
-/// race is cross-class iff it contains BOTH at least one smooth/Euclidean
-/// candidate AND at least one [`AutoTopologyKind::Mixture`]). When cross-class,
+/// Adjudicate a race that may mix smooth-manifold and discrete candidates
+/// (the discrete-mixture rung and/or a structured union, #907). Cross-class
+/// mixing is auto-detected from the candidate kinds (a race is cross-class iff
+/// it contains BOTH at least one smooth/Euclidean candidate AND at least one
+/// discrete candidate — [`AutoTopologyKind::Mixture`] or
+/// [`AutoTopologyKind::Union`]). When cross-class,
 /// the headline switches to stacking over a selection-time CV held-out
 /// log-density table; otherwise the headline is the rank-aware evidence winner.
 pub fn adjudicate_cross_class_race(
@@ -635,9 +814,14 @@ pub fn adjudicate_cross_class_race(
         .map(|c| c.negative_log_evidence)
         .collect();
 
-    let has_mixture = candidates.iter().any(|c| c.kind.is_discrete_mixture());
-    let has_smooth = candidates.iter().any(|c| !c.kind.is_discrete_mixture());
-    let is_cross_class = has_mixture && has_smooth;
+    // Cross-class iff the race mixes at least one discrete (non-smooth) density
+    // class — the mixture rung OR a structured union (#907) — with at least one
+    // smooth/Euclidean manifold candidate. A union competing against a smooth
+    // ring must therefore adjudicate by held-out predictive stacking, exactly
+    // like the mixture rung does.
+    let has_discrete = candidates.iter().any(|c| c.kind.is_discrete_class());
+    let has_smooth = candidates.iter().any(|c| !c.kind.is_discrete_class());
+    let is_cross_class = has_discrete && has_smooth;
 
     if !is_cross_class {
         // Same-class: winner-take-all on rank-aware evidence (lower wins).
