@@ -2408,6 +2408,104 @@ impl WorkingModelSurvival {
         let gradient = result.gradient.unwrap_or_else(|| Array1::zeros(rho.len()));
         Ok((result.cost, gradient))
     }
+
+    /// Self-contained ρ → (LAML value, analytic ρ-gradient) surface for the
+    /// survival LAML objective.
+    ///
+    /// Unlike [`unified_lamlobjective_and_rhogradient`](Self::unified_lamlobjective_and_rhogradient),
+    /// which takes a *pre-converged* [`WorkingState`] and `β̂` at the evaluated
+    /// `ρ`, this shim re-converges the inner survival mode internally: it sets
+    /// the active-block smoothing parameters to `λ = exp(ρ)`, runs the same
+    /// constrained inner PIRLS that the survival outer loop uses
+    /// ([`runworking_model_pirls`](crate::pirls::runworking_model_pirls)), then
+    /// evaluates the unified survival LAML value and analytic ρ-gradient at the
+    /// re-fitted `β̂(ρ)`. The returned pair is therefore a single-source value+
+    /// gradient surface that a caller can finite-difference by varying `ρ`
+    /// alone — the survival counterpart of the GLM path's
+    /// `evaluate_externalgradient` / `evaluate_externalcost_andridge`.
+    ///
+    /// `rho` enumerates the **active** penalty blocks (those with `λ > 0`) in
+    /// block order, matching the convention of the unified evaluator. `beta0` is
+    /// the inner warm-start. The behaviour is identical to the existing survival
+    /// LAML path (set-λ → inner PIRLS → `update_state` → unified LAML); this is a
+    /// reachability shim, not a new objective.
+    pub fn evaluate_survival_lamlcost_and_gradient(
+        &self,
+        rho: &[f64],
+        beta0: &Array1<f64>,
+    ) -> Result<(f64, Array1<f64>), EstimationError> {
+        // Inner-PIRLS settings mirror the survival transformation outer loop's
+        // constrained inner solve. Tighter convergence than the production
+        // outer loop so the inner mode is converged well below the FD step's
+        // round-off floor, making ∇V finite-differentiable in ρ alone.
+        const SHIM_PIRLS_MAX_ITERATIONS: usize = 600;
+        const SHIM_PIRLS_CONVERGENCE_TOL: f64 = 1e-12;
+        const SHIM_PIRLS_MAX_STEP_HALVING: usize = 40;
+        const SHIM_PIRLS_MIN_STEP_SIZE: f64 = 1e-12;
+
+        let active_block_count = self
+            .penalties
+            .blocks
+            .iter()
+            .filter(|b| b.lambda > 0.0)
+            .count();
+        if rho.len() != active_block_count {
+            crate::bail_invalid_estim!(
+                "evaluate_survival_lamlcost_and_gradient: rho dimension {} does not match active penalty block count {}",
+                rho.len(),
+                active_block_count
+            );
+        }
+        if beta0.len() != self.coefficient_dim() {
+            crate::bail_invalid_estim!(
+                "evaluate_survival_lamlcost_and_gradient: beta0 dimension {} does not match coefficient dimension {}",
+                beta0.len(),
+                self.coefficient_dim()
+            );
+        }
+
+        // Set λ = exp(ρ) on the active blocks (block order), leaving inactive
+        // (λ = 0) blocks untouched, then re-converge the inner mode.
+        let mut candidate = self.clone();
+        let mut lambdas: Vec<f64> = candidate.penalties.blocks.iter().map(|b| b.lambda).collect();
+        let mut active_idx = 0usize;
+        for (block, lambda) in candidate.penalties.blocks.iter().zip(lambdas.iter_mut()) {
+            if block.lambda > 0.0 {
+                *lambda = rho[active_idx].exp();
+                active_idx += 1;
+            }
+        }
+        candidate.set_penalty_lambdas(&lambdas)?;
+
+        let opts = crate::pirls::WorkingModelPirlsOptions {
+            max_iterations: SHIM_PIRLS_MAX_ITERATIONS,
+            convergence_tolerance: SHIM_PIRLS_CONVERGENCE_TOL,
+            adaptive_kkt_tolerance: None,
+            max_step_halving: SHIM_PIRLS_MAX_STEP_HALVING,
+            min_step_size: SHIM_PIRLS_MIN_STEP_SIZE,
+            firth_bias_reduction: false,
+            coefficient_lower_bounds: None,
+            linear_constraints: None,
+            initial_lm_lambda: None,
+            geodesic_acceleration: false,
+            arrow_schur: None,
+        };
+        let summary = crate::pirls::runworking_model_pirls(
+            &mut candidate,
+            Coefficients::new(beta0.clone()),
+            &opts,
+            |_| {},
+        )?;
+        let beta = summary.beta.as_ref().to_owned();
+
+        // Re-converged β̂(ρ); evaluate the unified survival LAML value and
+        // analytic ρ-gradient at that mode. The ρ passed to the unified
+        // evaluator enumerates active blocks in block order, exactly the input
+        // convention of this shim.
+        let rho_arr = Array1::from_vec(rho.to_vec());
+        let state = candidate.update_state(&beta)?;
+        candidate.unified_lamlobjective_and_rhogradient(&beta, &state, &rho_arr)
+    }
 }
 
 /// Derivative provider that adapts survival third-derivative Hessian corrections
