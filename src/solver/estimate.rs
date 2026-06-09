@@ -5495,14 +5495,6 @@ pub fn validate_explicit_dense_hessian_for_whitening(
         })
 }
 
-fn array1_values_equal(lhs: &Array1<f64>, rhs: &Array1<f64>) -> bool {
-    lhs.len() == rhs.len() && lhs.iter().zip(rhs.iter()).all(|(a, b)| a == b)
-}
-
-fn array2_values_equal(lhs: &Array2<f64>, rhs: &Array2<f64>) -> bool {
-    lhs.dim() == rhs.dim() && lhs.iter().zip(rhs.iter()).all(|(a, b)| a == b)
-}
-
 fn log_lambdas_match_lambdas(log_lambdas: &Array1<f64>, lambdas: &Array1<f64>) -> bool {
     if log_lambdas.len() != lambdas.len() {
         return false;
@@ -5590,7 +5582,7 @@ impl UnifiedFitResult {
         }
         let beta = flatten_block_betas(&blocks);
         let block_lambdas = flatten_block_lambdas(&blocks);
-        if !array1_values_equal(&block_lambdas, &lambdas) {
+        if block_lambdas != lambdas {
             crate::bail_invalid_estim!("UnifiedFitResult top-level lambdas must match block lambdas concatenated in block order"
                     .to_string(),);
         }
@@ -5701,7 +5693,7 @@ impl UnifiedFitResult {
                     );
                 }
                 match covariance_conditional.as_ref() {
-                    Some(top) if array2_values_equal(cov, top) => {}
+                    Some(top) if cov == top => {}
                     Some(_) => {
                         crate::bail_invalid_estim!("UnifiedFitResult inference conditional covariance must match top-level covariance_conditional"
                                 .to_string(),);
@@ -5732,7 +5724,7 @@ impl UnifiedFitResult {
                     );
                 }
                 match covariance_corrected.as_ref() {
-                    Some(top) if array2_values_equal(cov, top) => {}
+                    Some(top) if cov == top => {}
                     Some(_) => {
                         crate::bail_invalid_estim!("UnifiedFitResult inference corrected covariance must match top-level covariance_corrected"
                                 .to_string(),);
@@ -5820,15 +5812,15 @@ impl UnifiedFitResult {
                 );
             }
             if let Some(inf) = inference.as_ref() {
-                if !array2_values_equal(&geom.penalized_hessian, &inf.penalized_hessian) {
+                if geom.penalized_hessian != inf.penalized_hessian {
                     crate::bail_invalid_estim!("UnifiedFitResult geometry penalized Hessian must match inference.penalized_hessian"
                             .to_string(),);
                 }
-                if !array1_values_equal(&geom.working_weights, &inf.working_weights) {
+                if geom.working_weights != inf.working_weights {
                     crate::bail_invalid_estim!("UnifiedFitResult geometry working_weights must match inference.working_weights"
                             .to_string(),);
                 }
-                if !array1_values_equal(&geom.working_response, &inf.working_response) {
+                if geom.working_response != inf.working_response {
                     crate::bail_invalid_estim!("UnifiedFitResult geometry working_response must match inference.working_response"
                             .to_string(),);
                 }
@@ -5874,7 +5866,7 @@ impl UnifiedFitResult {
     }
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {
         let expected_beta = flatten_block_betas(&self.blocks);
-        if !array1_values_equal(&self.beta, &expected_beta) {
+        if self.beta != expected_beta {
             crate::bail_invalid_estim!("UnifiedFitResult decoded beta must match coefficient blocks concatenated in block order"
                     .to_string(),);
         }
