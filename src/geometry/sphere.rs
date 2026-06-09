@@ -239,6 +239,38 @@ impl RiemannianManifold for SphereManifold {
             tangent_pair.1.len(),
             self.ambient_dim(),
         )?;
+        // Sectional curvature is the curvature of a *2-plane* in the tangent
+        // space. The intrinsic tangent space of S^d has dimension d, so no such
+        // plane exists for d < 2 (S^1 is a single tangent line) — returning the
+        // constant +1 would assert a curvature on a plane that does not exist.
+        if self.dim() < 2 {
+            return Err(GeometryError::Unsupported(
+                "sectional curvature is undefined on a sphere of dimension below 2",
+            ));
+        }
+        // A non-unit base point has no well-defined tangent projection, so the
+        // 2-plane is meaningless; reject before projecting.
+        self.require_unit(point)?;
+        // K(u, v) = ⟨R(u,v)v, u⟩ / (‖u‖²‖v‖² − ⟨u,v⟩²). On the unit sphere the
+        // numerator equals the squared parallelogram area of the *tangential*
+        // components, so K = +1 — but only when that area is nonzero. A zero,
+        // collinear, or purely-radial pair gives 0/0, which is undefined, not 1.
+        // Strip the radial component so the area is computed on genuine tangent
+        // vectors (a pair that is collinear only after projection still spans no
+        // tangent plane).
+        let pu = dot(point, tangent_pair.0);
+        let pv = dot(point, tangent_pair.1);
+        let u_t = tangent_pair.0.to_owned() - &(point.to_owned() * pu);
+        let v_t = tangent_pair.1.to_owned() - &(point.to_owned() * pv);
+        let uu = dot(u_t.view(), u_t.view());
+        let vv = dot(v_t.view(), v_t.view());
+        let uv = dot(u_t.view(), v_t.view());
+        let area_sq = uu * vv - uv * uv;
+        if !area_sq.is_finite() || area_sq <= GEOMETRY_EPS {
+            return Err(GeometryError::Singular(
+                "sectional curvature undefined for collinear/degenerate tangent pair",
+            ));
+        }
         Ok(1.0)
     }
 

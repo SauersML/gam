@@ -1,7 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GeometryResult, RiemannianManifold, check_len, identity, zero_christoffel,
+    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity,
+    zero_christoffel,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +84,26 @@ impl RiemannianManifold for EuclideanManifold {
             tangent_pair.1.len(),
             self.dim,
         )?;
+        // Sectional curvature lives on a 2-plane in the tangent space; a space of
+        // dimension < 2 has no such plane, so the quantity is undefined rather
+        // than flat-zero.
+        if self.dim < 2 {
+            return Err(GeometryError::Unsupported(
+                "sectional curvature is undefined on a manifold of dimension below 2",
+            ));
+        }
+        // Flat space has R ≡ 0, so K = 0 on any *nondegenerate* plane. But the
+        // value 0/0 is undefined when the pair spans no plane: the squared
+        // parallelogram area ‖u‖²‖v‖² − ⟨u,v⟩² must be nonzero.
+        let uu = dot(tangent_pair.0, tangent_pair.0);
+        let vv = dot(tangent_pair.1, tangent_pair.1);
+        let uv = dot(tangent_pair.0, tangent_pair.1);
+        let area_sq = uu * vv - uv * uv;
+        if !area_sq.is_finite() || area_sq <= GEOMETRY_EPS {
+            return Err(GeometryError::Singular(
+                "sectional curvature undefined for collinear/degenerate tangent pair",
+            ));
+        }
         Ok(0.0)
     }
 }
