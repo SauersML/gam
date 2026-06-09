@@ -29617,6 +29617,7 @@ mod batch_tests {
             tensor_knots: None,
             tensor_knot_offsets: None,
             tensor_degrees: None,
+            periodic: latent_manifold_periodic_descriptor("circle", latent_dim),
         };
         let manifold_box = build_latent_outer_manifold("circle", n_obs, latent_dim)
             .expect("circle latent manifold");
