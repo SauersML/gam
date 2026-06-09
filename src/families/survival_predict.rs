@@ -362,12 +362,31 @@ pub fn predict_survival(
         time_build.keep_cols.as_ref(),
         time_build.smooth_lambda,
     )?;
+    // Single-cause Weibull without a learned baseline timewiggle carries its
+    // ENTIRE log-cumulative-hazard baseline in the fitted `[1, log t]` linear
+    // time-basis coefficients, not in a parametric offset. The fit centers that
+    // basis at the survival time anchor (`center_survival_time_designs_at_anchor`
+    // in the workflow), which zeroes the constant column so `beta[0]` is
+    // unidentified and the fitted baseline is exactly
+    // `beta[1] * (log t - log anchor)`. The model still SAVES a `Weibull`
+    // baseline target (recovered scale/shape) for CIF/reporting, but that
+    // metadata must NOT re-enter prediction as a parametric offset: doing so
+    // double-counts the baseline (offset + beta) and, combined with predicting
+    // against the UN-centered basis, collapses the survival surface to the
+    // degenerate `S(t) == 1` (issue #897). Mirror the fit here: center the basis
+    // at the anchor and carry a zero baseline offset, so predict reproduces the
+    // fitted `beta[1] * (log t - log anchor)`. Weibull-WITH-timewiggle is a
+    // different regime (the parametric offset is the baseline and beta carries
+    // only the wiggle deviation), so it is excluded.
+    let weibull_baseline_in_beta =
+        saved_likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle();
     let mut time_anchor: Option<f64> = None;
     let mut time_anchor_row_cached: Option<Array1<f64>> = None;
     if matches!(
         saved_likelihood_mode,
         SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
-    ) {
+    ) || weibull_baseline_in_beta
+    {
         let anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
@@ -500,13 +519,25 @@ pub fn predict_survival(
                     )?;
                 }
                 let (mut r_eta_entry, mut r_eta_exit, mut r_deriv_exit) =
-                    build_survival_time_offsets_for_likelihood(
-                        &single_entry,
-                        &single_exit,
-                        &baseline_cfg,
-                        saved_likelihood_mode,
-                        None,
-                    )?;
+                    if weibull_baseline_in_beta {
+                        // The fitted Weibull baseline lives in the (anchor-centered)
+                        // linear time-basis coefficients; the saved `Weibull`
+                        // baseline target is reporting metadata only. Carry a zero
+                        // parametric offset so it is not double-counted (issue #897).
+                        (
+                            Array1::<f64>::zeros(1),
+                            Array1::<f64>::zeros(1),
+                            Array1::<f64>::zeros(1),
+                        )
+                    } else {
+                        build_survival_time_offsets_for_likelihood(
+                            &single_entry,
+                            &single_exit,
+                            &baseline_cfg,
+                            saved_likelihood_mode,
+                            None,
+                        )?
+                    };
                 if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
                     add_survival_time_derivative_guard_offset(
                         &single_entry,
@@ -733,6 +764,31 @@ pub fn predict_competing_risks_survival(
 
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let time_build = build_survival_time_basis(&age_entry, &age_exit, time_cfg.clone(), None)?;
+    let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
+        &time_build.basisname,
+        time_build.degree,
+        time_build.knots.as_ref(),
+        time_build.keep_cols.as_ref(),
+        time_build.smooth_lambda,
+    )?;
+    // See the single-cause `predict_survival` note: per-cause Weibull baselines
+    // (no learned timewiggle) live in the anchor-centered linear time-basis
+    // coefficients, so prediction must center the basis at the saved anchor and
+    // carry a zero parametric baseline offset rather than re-adding the saved
+    // (reporting-only) `Weibull` target as an offset (issues #897 / #689 / #690).
+    // The ambient `time_build` is consumed only for the structural-basis check;
+    // the per-(cause, row) loop rebuilds and centers its own `row_time`, so the
+    // anchor row is all that needs threading through.
+    let weibull_baseline_in_beta =
+        saved_likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle();
+    let cr_time_anchor_row: Option<Array1<f64>> = if weibull_baseline_in_beta {
+        let anchor = model
+            .survival_time_anchor
+            .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
+        Some(evaluate_survival_time_basis_row(anchor, &resolved_time_cfg)?)
+    } else {
+        None
+    };
     if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
     {
         require_structural_survival_time_basis(
@@ -803,22 +859,34 @@ pub fn predict_competing_risks_survival(
                 let t_entry = age_entry[i].min(t_query);
                 let single_entry = Array1::from_elem(1, t_entry);
                 let single_exit = Array1::from_elem(1, t_query);
-                let row_time =
+                let mut row_time =
                     build_survival_time_basis(&single_entry, &single_exit, time_cfg.clone(), None)?;
-                let (_, r_eta_exit, r_deriv_exit) = build_survival_time_offsets_for_likelihood(
-                    &single_entry,
-                    &single_exit,
-                    &baseline_cfg,
-                    saved_likelihood_mode,
-                    None,
-                )?;
+                if let Some(anchor_row) = cr_time_anchor_row.as_ref() {
+                    center_survival_time_designs_at_anchor(
+                        &mut row_time.x_entry_time,
+                        &mut row_time.x_exit_time,
+                        anchor_row,
+                    )?;
+                }
+                let (r_eta_exit, r_deriv_exit) = if weibull_baseline_in_beta {
+                    (0.0, 0.0)
+                } else {
+                    let (_, eta_exit, deriv_exit) = build_survival_time_offsets_for_likelihood(
+                        &single_entry,
+                        &single_exit,
+                        &baseline_cfg,
+                        saved_likelihood_mode,
+                        None,
+                    )?;
+                    (eta_exit[0], deriv_exit[0])
+                };
                 evaluate_rp_row_with_beta(
                     &block.beta,
                     timewiggle,
                     &row_time,
                     &cov_rows[i],
-                    r_eta_exit[0],
-                    r_deriv_exit[0],
+                    r_eta_exit,
+                    r_deriv_exit,
                     primary_offset[i],
                 )
             };
