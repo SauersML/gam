@@ -1,6 +1,9 @@
 //! End-to-end quality: gam's Grassmann `Gr(3, 8)` geodesic distance, exponential,
 //! and logarithm must reproduce the EXACT subspace geometry of real per-group PCA
-//! subspaces, judged against geomstats GROUND TRUTH on byte-identical bases.
+//! subspaces, judged against the ANALYTIC principal-angle arc length the test
+//! constructs itself from the bases — NOT against geomstats' output. geomstats'
+//! projector `metric.dist` is wrong near the `π/2` cut locus (#904), so it is only
+//! an informational match-or-beat cross-check away from that locus, never truth.
 //!
 //! DATA (real, freely downloadable, no auth):
 //!   Forina et al. Italian olive-oil dataset, 572 samples, eight fatty-acid
@@ -19,13 +22,19 @@
 //! use of gam's Grassmann distance / log map. The identical orthonormal bases (same
 //! entries, same column order) are handed to BOTH gam and geomstats.
 //!
-//! OBJECTIVE ACCURACY (the pass criteria), all vs ground truth on real subspaces:
+//! OBJECTIVE ACCURACY (the pass criteria), all vs ANALYTIC ground truth the test
+//! constructs itself on the real subspaces — geomstats is never the truth:
 //!   (A) **Geodesic distance.** For every ordered pair of areas, the Grassmann
-//!       geodesic distance `d(P_i, P_j) = ‖Log_{P_i}(P_j)‖_F = ‖θ‖₂` (root-sum of
-//!       squared principal angles) computed from gam's `log_map` must match
-//!       geomstats' canonical-metric distance to `< 1e-9`. The angle spectrum is an
-//!       exact closed form (SVD of `Y_iᵀ Y_j`), so geomstats is mathematical truth,
-//!       not a noisy peer fit.
+//!       geodesic distance `d(P_i, P_j) = ‖Log_{P_i}(P_j)‖_F` computed from gam's
+//!       `log_map` must equal the ANALYTIC principal-angle arc length
+//!       `‖θ‖₂ = √(Σ_i arccos²(σ_i))`, where `σ_i` are the singular values of
+//!       `Y_iᵀ Y_j` clamped to `[-1, 1]` — a closed form this test computes itself
+//!       from the subspace bases (the `principal_angles` helper below), to
+//!       `< 1e-9`. geomstats is retained ONLY as an informational match-or-beat
+//!       cross-check AWAY from the `π/2` cut locus: its canonical-metric `dist`
+//!       projector formula is known to be wrong near `π/2` (it disagrees with the
+//!       analytic arc length there, while gam matches it), so it cannot be the
+//!       ground truth — see issue #904.
 //!   (B) **log singular spectrum = principal angles.** The singular values of gam's
 //!       `log_map(P_i, P_j)` equal the principal angles `θ(P_i, P_j)` derived
 //!       independently from the SVD of `Y_iᵀ Y_j` — an absolute-accuracy claim
@@ -353,6 +362,11 @@ fn olive_oils_grassmann_distance_matches_geomstats() {
 
     // gam-side per-pair quantities, in the SAME pair order.
     let mut gam_dist: Vec<f64> = Vec::new();
+    // Analytic ground-truth distance per pair: √(Σ arccos²(σ)) from the principal
+    // angles between the two PCA frames, computed by this test (NOT geomstats).
+    let mut analytic_dist: Vec<f64> = Vec::new();
+    // Worst |gam geodesic distance − ANALYTIC arc length| over all pairs (metric A).
+    let mut max_dist_vs_analytic = 0.0_f64;
     // Worst |gam log-singular-values − analytic principal angles| over all pairs.
     let mut max_log_sigma_vs_angle = 0.0_f64;
     // Round-trip + isometry diagnostics (see metric C).
@@ -378,6 +392,14 @@ fn olive_oils_grassmann_distance_matches_geomstats() {
             let log_sigma = singular_values(&log_mat);
             let angles = principal_angles(&frames[i], &frames[j]);
             max_log_sigma_vs_angle = max_log_sigma_vs_angle.max(max_abs_diff(&log_sigma, &angles));
+
+            // (A) ANALYTIC ground-truth geodesic distance = root-sum-of-squared
+            // principal angles, derived by this test from the bases themselves.
+            // gam's geodesic distance must equal THIS, not geomstats' projector
+            // `metric.dist` (wrong near the π/2 cut locus, #904).
+            let arc_len: f64 = angles.iter().map(|t| t * t).sum::<f64>().sqrt();
+            analytic_dist.push(arc_len);
+            max_dist_vs_analytic = max_dist_vs_analytic.max((dist_ij - arc_len).abs());
 
             // (C) exp/log round-trip + isometry on a controlled tangent. Scale the
             // log toward area j down to a Frobenius norm safely inside the
@@ -405,12 +427,14 @@ fn olive_oils_grassmann_distance_matches_geomstats() {
     let n_pairs = gam_dist.len();
     assert_eq!(n_pairs, n_areas * (n_areas - 1), "ordered pair count");
 
-    // --- geomstats GROUND TRUTH on the identical PCA frames -----------------
+    // --- geomstats INFORMATIONAL cross-check on the identical PCA frames -----
     // geomstats represents a Grassmann point as the orthogonal projector P = YYᵀ.
-    // We feed the byte-identical row-major frames, rebuild Y_i, Y_j, and emit the
-    // canonical-metric geodesic distance for every ordered pair. The Grassmann
-    // distance is an exact closed form (the principal-angle root-sum-of-squares),
-    // so geomstats is mathematical truth, not a noisy peer fit.
+    // We feed the byte-identical row-major frames, rebuild Y_i, Y_j, and emit both
+    // its canonical-metric `metric.dist` AND the analytic angle root-sum-of-squares
+    // it computes itself. geomstats is NOT the ground truth here: its projector
+    // `metric.dist` is known to disagree with the analytic arc length near the π/2
+    // cut locus (#904). We use it only as a match-or-beat cross-check on the pairs
+    // that sit safely AWAY from π/2, where the closed form is well-conditioned.
     let py = run_python(
         &[
             Column::new("base_flat", &base_flat),
@@ -460,27 +484,57 @@ emit("ang_rss", ang_rss)
     assert_eq!(gs_dist.len(), n_pairs, "geomstats distance count");
     assert_eq!(gs_ang_rss.len(), n_pairs, "geomstats angle-rss count");
 
-    // geomstats self-consistency: its canonical distance equals the principal-angle
-    // root-sum-of-squares it computes independently (closed-form truth, both ways).
-    let gs_internal = max_abs_diff(gs_dist, gs_ang_rss);
+    // gam vs the ANALYTIC arc length the test built itself — this is the PRIMARY
+    // ground-truth comparison (metric A), independent of any external tool.
+    let dist_vs_analytic = max_abs_diff(&gam_dist, &analytic_dist);
+    debug_assert!((dist_vs_analytic - max_dist_vs_analytic).abs() < 1e-300);
 
-    // PRIMARY (A): gam's geodesic distance vs geomstats ground truth.
-    let dist_diff = max_abs_diff(&gam_dist, gs_dist);
+    // Cross-witness that the cut-locus disagreement lives in geomstats' PROJECTOR
+    // `metric.dist`, not in the angle spectrum: geomstats' OWN arc-length
+    // √(Σ arccos²(σ)) agrees with our Rust analytic arc length to the SVD floor on
+    // every pair (the two are the identical closed form on byte-identical frames).
+    let analytic_cross_tool = max_abs_diff(gs_ang_rss, &analytic_dist);
+
+    // INFORMATIONAL ONLY: geomstats' projector `metric.dist` vs the analytic arc
+    // length, restricted to pairs comfortably away from the π/2 cut locus (largest
+    // principal angle ≤ 1.4 rad). Near π/2 geomstats' projector formula is known to
+    // be wrong (#904); we never assert agreement there. On the well-conditioned
+    // pairs gam already equals the analytic truth, so gam is a match-or-beat of
+    // geomstats by construction; this block only reports the residuals.
+    let cut = std::f64::consts::FRAC_PI_2 - 0.17; // ≈ 1.4 rad
+    let mut gam_vs_gs_away = 0.0_f64;
+    let mut gs_vs_analytic_away = 0.0_f64;
+    let mut away_pairs = 0usize;
+    for p in 0..n_pairs {
+        // analytic_dist[p] is ‖θ‖₂; the cut-locus risk is in the LARGEST angle, but
+        // ‖θ‖₂ ≥ θ_max so gating on the arc length being below `cut` is a sound,
+        // conservative away-from-π/2 filter.
+        if analytic_dist[p] <= cut {
+            gam_vs_gs_away = gam_vs_gs_away.max((gam_dist[p] - gs_dist[p]).abs());
+            gs_vs_analytic_away = gs_vs_analytic_away.max((gs_dist[p] - analytic_dist[p]).abs());
+            away_pairs += 1;
+        }
+    }
 
     eprintln!(
         "Gr({K},{D}) olive-oil PCA subspaces: areas={n_areas} pairs={n_pairs} | \
-         gam_dist_vs_geomstats={dist_diff:.3e} (geomstats internal dist-vs-angles={gs_internal:.3e}) \
+         gam_dist_vs_ANALYTIC={dist_vs_analytic:.3e} (PRIMARY) | \
+         away-from-π/2 ({away_pairs} pairs): gam_vs_geomstats={gam_vs_gs_away:.3e} \
+         geomstats_vs_analytic={gs_vs_analytic_away:.3e} (informational) | \
+         geomstats_angle_rss_vs_analytic={analytic_cross_tool:.3e} (cross-tool angle witness) | \
          log_sigma_vs_angles={max_log_sigma_vs_angle:.3e} \
          roundtrip_abs={max_roundtrip_abs:.3e} isometry_err={max_isometry_err:.3e}"
     );
 
-    // ===================== (A) geodesic distance vs GROUND TRUTH =============
-    // The Grassmann geodesic distance is an exact closed form, so gam must match
-    // geomstats to its LAPACK-SVD noise floor on every real subspace pair.
+    // ===================== (A) geodesic distance vs ANALYTIC TRUTH ===========
+    // The Grassmann geodesic distance is the exact arc length √(Σ arccos²(σ)) the
+    // test derives from the SVD of YᵢᵀYⱼ. gam must match THAT to the LAPACK-SVD
+    // noise floor on every real subspace pair — never geomstats, whose projector
+    // distance is wrong at the π/2 cut locus (#904).
     assert!(
-        dist_diff < 1e-9,
-        "gam Grassmann geodesic distance disagrees with geomstats ground truth on \
-         the olive-oil PCA subspaces: max |Δ| = {dist_diff:.3e}"
+        dist_vs_analytic < 1e-9,
+        "gam Grassmann geodesic distance disagrees with the ANALYTIC principal-angle \
+         arc length on the olive-oil PCA subspaces: max |Δ| = {dist_vs_analytic:.3e}"
     );
 
     // ===================== (B) log spectrum = principal angles ==============
@@ -580,13 +634,22 @@ fn olive_oils_grassmann_distance_matches_geomstats_on_real_data() {
     // test). For each test subspace, the predicted area is argmin over train
     // prototypes; the full distance matrix is also handed to geomstats below.
     let mut dist_matrix: Vec<f64> = Vec::with_capacity(n_areas * n_areas);
+    // ANALYTIC ground-truth distance matrix: √(Σ arccos²(σ)) between every
+    // (test, train) pair, computed by this test from the frames themselves —
+    // the geometry truth gam's distance matrix must reproduce (NOT geomstats').
+    let mut analytic_matrix: Vec<f64> = Vec::with_capacity(n_areas * n_areas);
     let mut gam_correct = 0usize;
     for (ti, test) in test_frames.iter().enumerate() {
+        let test_mat = matrix_from_flat(test.as_slice().unwrap());
         let mut best_j = 0usize;
         let mut best_d = f64::INFINITY;
         for (tj, train) in train_frames.iter().enumerate() {
             let d = grassmann_dist(&gr, test, train);
             dist_matrix.push(d);
+            let train_mat = matrix_from_flat(train.as_slice().unwrap());
+            let angles = principal_angles(&test_mat, &train_mat);
+            let arc_len: f64 = angles.iter().map(|t| t * t).sum::<f64>().sqrt();
+            analytic_matrix.push(arc_len);
             if d < best_d {
                 best_d = d;
                 best_j = tj;
@@ -699,24 +762,39 @@ emit("gam_mean_variance_gs", [variance(P_gam_mean)])
         "geomstats distance-matrix size"
     );
 
-    // gam's distance matrix must agree with geomstats' to the SVD noise floor
-    // (this is the same closed-form geodesic distance the ground-truth test pins),
-    // confirming both classifiers see byte-identical geometry before we compare
-    // their decisions.
-    let dist_diff = max_abs_diff(&dist_matrix, gs_dist);
+    // gam's distance matrix must agree with the ANALYTIC arc length the test built
+    // itself (the closed-form geodesic distance the ground-truth test pins),
+    // confirming the geometry is correct before we compare classification
+    // decisions. This is gam-vs-self-constructed-truth, never gam-vs-geomstats.
+    let dist_diff = max_abs_diff(&dist_matrix, &analytic_matrix);
+
+    // INFORMATIONAL ONLY: geomstats' projector `metric.dist` vs the analytic arc
+    // length, restricted to (test, train) pairs away from the π/2 cut locus where
+    // geomstats' formula is sound (#904). We never assert gam == geomstats here.
+    let cut = std::f64::consts::FRAC_PI_2 - 0.17; // ≈ 1.4 rad
+    let mut gs_vs_analytic_away = 0.0_f64;
+    let mut away_pairs = 0usize;
+    for (k, &an) in analytic_matrix.iter().enumerate() {
+        if an <= cut {
+            gs_vs_analytic_away = gs_vs_analytic_away.max((gs_dist[k] - an).abs());
+            away_pairs += 1;
+        }
+    }
 
     eprintln!(
         "Gr({K},{D}) olive-oil held-out subspace classification: areas={n_areas} \
-         gam_accuracy={gam_accuracy:.3} gs_accuracy={gs_accuracy:.3} dist_vs_geomstats={dist_diff:.3e} | \
+         gam_accuracy={gam_accuracy:.3} gs_accuracy={gs_accuracy:.3} \
+         dist_vs_ANALYTIC={dist_diff:.3e} (PRIMARY) \
+         geomstats_vs_analytic_away-from-π/2={gs_vs_analytic_away:.3e} ({away_pairs} pairs, informational) | \
          Fréchet variance gam={gam_mean_variance:.4} (geomstats-recomputed={gam_mean_variance_gs:.4}) \
          geomstats={gs_mean_variance:.4}"
     );
 
-    // distance-matrix agreement gate (geometry parity before decision parity).
+    // distance-matrix geometry gate vs ANALYTIC truth (parity before decision parity).
     assert!(
         dist_diff < 1e-7,
-        "gam vs geomstats Grassmann distance matrix disagree on the held-out olive-oil \
-         subspaces: max |Δ| = {dist_diff:.3e}"
+        "gam Grassmann distance matrix disagrees with the ANALYTIC principal-angle \
+         arc length on the held-out olive-oil subspaces: max |Δ| = {dist_diff:.3e}"
     );
 
     // ===================== PRIMARY: absolute held-out accuracy ==============
