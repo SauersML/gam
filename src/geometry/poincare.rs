@@ -1,5 +1,13 @@
 //! Hyperbolic geometry: Poincaré ball and Lorentz (hyperboloid) model.
 //!
+//! Inside this disc there is *room to spare*: volume grows exponentially with
+//! radius, so a tree's worth of children fits near the rim with distances
+//! barely distorted. That is exactly why hyperbolic embeddings flatter
+//! hierarchies — the boundary is infinitely far away even though it looks a
+//! finger's width off. Mind the rim: every point with `k |y|² → 1` is racing
+//! off to infinity, which is why we project strictly *inside* the ball and
+//! never let a coordinate touch the edge.
+//!
 //! This module provides the pure-Rust primitives backing the Python wrapper
 //! `gamfit.PoincareAtoms`. Everything user-visible there — Möbius addition,
 //! geodesic distance, ball projection, log/exp at the origin, the tangent-
