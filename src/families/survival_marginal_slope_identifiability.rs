@@ -690,101 +690,6 @@ pub struct SurvivalParametricCompiled {
     pub drops_by_block: (usize, usize, usize),
 }
 
-/// Survival parametric block designs and penalties after applying the
-/// per-block V reparameterisation matrices from
-/// [`compile_survival_parametric_designs`]. Each design is wrapped via
-/// [`CoefficientTransformOperator`] so the operator interface is
-/// preserved (sparse / lazy inner designs stay sparse / lazy; the V
-/// multiplication is applied lazily per row chunk with an Arc-cached
-/// dense materialisation when affordable).
-///
-/// **Time block**: three designs (entry, exit, derivative_exit) share a
-/// single β, so they each get the same `V_time` applied. Their
-/// penalties are pulled back jointly because the time penalty matrices
-/// are over the shared β coordinate.
-///
-/// **Marginal / logslope**: one design + their respective penalty list,
-/// each independently V-transformed and Vᵀ-S-V-pulled-back.
-///
-/// The construction site replaces the raw `marginal_design`,
-/// `logslope_design`, and time-block triplet with these compiled
-/// variants, and uses the pulled-back penalty matrices in the
-/// `ParameterBlockSpec` list. The family's captured
-/// `marginal_design` / `logslope_design` / time triplet then carry the
-/// compiled widths too — so `evaluate_blockwise_exact_newton`'s
-/// `syr_row_into_view` / `row_outer_into_view` assertions remain
-/// width-consistent without further family-level changes.
-pub struct CompiledSurvivalDesigns {
-    pub time_design_entry: DesignMatrix,
-    pub time_design_exit: DesignMatrix,
-    pub time_design_derivative_exit: DesignMatrix,
-    pub marginal_design: DesignMatrix,
-    pub logslope_design: DesignMatrix,
-    pub time_penalties: Vec<PenaltyMatrix>,
-    pub marginal_penalties: Vec<PenaltyMatrix>,
-    pub logslope_penalties: Vec<PenaltyMatrix>,
-}
-
-/// Apply `compiled.v_*` to the raw survival parametric designs and pull
-/// back the per-block penalties as `Vᵀ S V`. Returns
-/// [`CompiledSurvivalDesigns`] ready to thread through
-/// `make_family` / `build_blocks` at the SMGS construction site.
-///
-/// Sparse designs are wrapped through `CoefficientTransformOperator`,
-/// which composes lazily by default and materialises the `(n × p_kept)`
-/// dense block on first hot use (gated by
-/// `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES = 1 GiB`).
-/// For biobank-scale survival shapes (`n ≈ 320 k`, `p_kept ≤ 50`) this
-/// is ≤ 130 MiB — well within budget and reused across PIRLS / outer
-/// iterations.
-///
-/// The penalty pullback `Vᵀ S V` is exact for selection-T (V is a
-/// column selector, so Vᵀ S V is just the slice of S to the kept
-/// rows / cols) and for rotation-V (V is a general orthogonal-
-/// complement basis from the compiler's eigendecomposition).
-pub fn apply_survival_parametric_compile_to_designs(
-    compiled: &SurvivalParametricCompiled,
-    time_design_entry: DesignMatrix,
-    time_design_exit: DesignMatrix,
-    time_design_derivative_exit: DesignMatrix,
-    marginal_design: DesignMatrix,
-    logslope_design: DesignMatrix,
-    time_penalties: &[PenaltyMatrix],
-    marginal_penalties: &[PenaltyMatrix],
-    logslope_penalties: &[PenaltyMatrix],
-) -> Result<CompiledSurvivalDesigns, String> {
-    Ok(CompiledSurvivalDesigns {
-        time_design_entry: wrap_design_with_transform(
-            time_design_entry,
-            &compiled.v_time,
-            "survival time block design_entry",
-        )?,
-        time_design_exit: wrap_design_with_transform(
-            time_design_exit,
-            &compiled.v_time,
-            "survival time block design_exit",
-        )?,
-        time_design_derivative_exit: wrap_design_with_transform(
-            time_design_derivative_exit,
-            &compiled.v_time,
-            "survival time block design_derivative_exit",
-        )?,
-        marginal_design: wrap_design_with_transform(
-            marginal_design,
-            &compiled.v_marginal,
-            "survival marginal block design",
-        )?,
-        logslope_design: wrap_design_with_transform(
-            logslope_design,
-            &compiled.v_logslope,
-            "survival logslope block design",
-        )?,
-        time_penalties: pull_back_penalties(time_penalties, &compiled.v_time),
-        marginal_penalties: pull_back_penalties(marginal_penalties, &compiled.v_marginal),
-        logslope_penalties: pull_back_penalties(logslope_penalties, &compiled.v_logslope),
-    })
-}
-
 fn wrap_design_with_transform(
     raw: DesignMatrix,
     v: &Array2<f64>,
@@ -811,35 +716,6 @@ fn wrap_design_with_transform(
     let op = CoefficientTransformOperator::new(inner_dense, v.clone())
         .map_err(|reason| format!("{context}: CoefficientTransformOperator::new: {reason}"))?;
     Ok(DesignMatrix::Dense(DenseDesignMatrix::from(Arc::new(op))))
-}
-
-fn pull_back_penalties(penalties: &[PenaltyMatrix], v: &Array2<f64>) -> Vec<PenaltyMatrix> {
-    penalties
-        .iter()
-        .map(|p| {
-            let label = p.precision_label().map(|s| s.to_string());
-            let s_dense = p.as_dense_cow();
-            // Vᵀ S V. With V as a selection matrix this collapses to
-            // S[kept, kept]; with V as a rotation (general orthogonal
-            // complement) this is the full pullback. Either way the
-            // result is (p_kept × p_kept) symmetric (modulo numerical
-            // noise — symmetrise explicitly).
-            let s_view = s_dense.view();
-            let s_v = fast_ab(&s_view.to_owned(), v);
-            let vt_s_v = fast_ab(&v.t().to_owned(), &s_v);
-            let mut sym = Array2::<f64>::zeros(vt_s_v.dim());
-            for i in 0..sym.nrows() {
-                for j in 0..sym.ncols() {
-                    sym[[i, j]] = 0.5 * (vt_s_v[[i, j]] + vt_s_v[[j, i]]);
-                }
-            }
-            let base = PenaltyMatrix::Dense(sym);
-            match label {
-                Some(lbl) => base.with_precision_label(lbl),
-                None => base,
-            }
-        })
-        .collect()
 }
 
 /// Per-term V reparameterisation matrices for the three parametric
@@ -1401,10 +1277,9 @@ pub fn pull_back_penalty_through_t(
 /// coordinate `θ_b`. The cross-block residualisation `R_{a→b}` carried
 /// in T's strict-upper triangle is absorbed into the *design* columns
 /// (the residualised emitted design `C_b V_b − A_{<b} R_b`), not into
-/// the penalty — exactly as the sibling per-block compile path
-/// [`apply_survival_parametric_compile_to_designs`] does via
-/// [`pull_back_penalties`]. Pulling the penalty back through the full
-/// joint T instead would yield a `(p_compiled × p_compiled)` dense
+/// the penalty — exactly as the VM-exact compile-map path
+/// [`apply_compiled_map_to_designs`] does. Pulling the penalty back
+/// through the full joint T instead would yield a `(p_compiled × p_compiled)` dense
 /// matrix that cannot live in a single block's `penalties` slot and
 /// would violate the `p_b × p_b` block-spec validation.
 pub fn pull_back_blockwise_penalty_through_block_v(
@@ -1934,9 +1809,7 @@ pub fn apply_compiled_map_to_designs(
     // penalty: in raw coords the model penalises `γ_bᵀ S_b γ_b` on block
     // b's own coefficients, and under the residualised reparameterisation
     // the cross-block carry `R_{a→b}` lives entirely in the *design*
-    // columns (`C_b V_b − A_{<b} R_b`), not in the penalty. This matches
-    // the sibling per-block compile path
-    // (`apply_survival_parametric_compile_to_designs` → `pull_back_penalties`).
+    // columns (`C_b V_b − A_{<b} R_b`), not in the penalty.
     //
     // Pulling penalties back through the full joint triangular T instead
     // (`pull_back_penalty_through_t`) yields a `(p_compiled × p_compiled)`
@@ -2844,146 +2717,6 @@ mod tests {
         // Valid partition.
         assert!(validate_partition(&[0..2, 2..5], 5, "test").is_ok());
         assert!(validate_partition(&[0..5], 5, "test").is_ok());
-    }
-
-    /// Phase-4b application step: take the V matrices from
-    /// `compile_survival_parametric_designs` and apply them to raw
-    /// designs + penalties via
-    /// `apply_survival_parametric_compile_to_designs`. Verify the
-    /// produced `CompiledSurvivalDesigns` has consistent widths
-    /// across the time triplet, the marginal/logslope singletons,
-    /// and their pulled-back penalty matrices.
-    #[test]
-    fn apply_compile_produces_width_consistent_designs_and_penalties() {
-        use crate::families::custom_family::PenaltyMatrix;
-        use crate::linalg::matrix::DenseDesignMatrix;
-
-        let n = 16;
-        let p_time = 3;
-        let p_marginal = 3;
-        let p_logslope = 2;
-        let x: Vec<f64> = (0..n)
-            .map(|i| -1.0 + 2.0 * (i as f64) / (n as f64 - 1.0))
-            .collect();
-        let mut time_dq0 = Array2::<f64>::zeros((n, p_time));
-        let mut time_dq1 = Array2::<f64>::zeros((n, p_time));
-        let mut time_dqd1 = Array2::<f64>::zeros((n, p_time));
-        let mut marg_dq = Array2::<f64>::zeros((n, p_marginal));
-        let marg_dqd1 = Array2::<f64>::zeros((n, p_marginal));
-        let mut log_dg = Array2::<f64>::zeros((n, p_logslope));
-        for i in 0..n {
-            time_dq0[[i, 0]] = 1.0;
-            time_dq0[[i, 1]] = x[i];
-            time_dq0[[i, 2]] = x[i] * x[i];
-            time_dq1[[i, 0]] = 1.0;
-            time_dq1[[i, 1]] = x[i];
-            time_dq1[[i, 2]] = x[i] * x[i];
-            time_dqd1[[i, 0]] = 0.0;
-            time_dqd1[[i, 1]] = 1.0;
-            time_dqd1[[i, 2]] = 2.0 * x[i];
-            marg_dq[[i, 0]] = 1.0;
-            marg_dq[[i, 1]] = x[i] * x[i] * x[i];
-            marg_dq[[i, 2]] = x[i].sin();
-            log_dg[[i, 0]] = (2.0 * x[i]).cos();
-            log_dg[[i, 1]] = x[i].tanh();
-        }
-        let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
-        for i in 0..n {
-            for k in 0..K_SURVIVAL {
-                h_full[[i, k, k]] = 1.0;
-            }
-        }
-        let row_hess = SurvivalRowHessian::from_full(h_full);
-        let compiled = compile_survival_parametric_designs(
-            time_dq0.clone(),
-            time_dq1.clone(),
-            time_dqd1.clone(),
-            marg_dq.clone(),
-            marg_dqd1.clone(),
-            log_dg.clone(),
-            &row_hess,
-        )
-        .expect("compile must succeed");
-
-        // Build raw DesignMatrix wrappers around the same dense data
-        // for the apply step (in production these come from the
-        // family's design accumulation; here we re-use the dense
-        // matrices we already built for the operator construction).
-        let raw_time_entry = DesignMatrix::Dense(DenseDesignMatrix::from(time_dq0.clone()));
-        let raw_time_exit = DesignMatrix::Dense(DenseDesignMatrix::from(time_dq1.clone()));
-        let raw_time_deriv = DesignMatrix::Dense(DenseDesignMatrix::from(time_dqd1.clone()));
-        let raw_marg = DesignMatrix::Dense(DenseDesignMatrix::from(marg_dq.clone()));
-        let raw_log = DesignMatrix::Dense(DenseDesignMatrix::from(log_dg.clone()));
-
-        // Penalties: simple diagonal placeholders at raw width so we
-        // can verify the pulled-back result has the expected shape.
-        let time_pens = vec![PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
-            (p_time, p_time),
-            |(i, j)| if i == j { (i + 1) as f64 } else { 0.0 },
-        ))];
-        let marg_pens = vec![PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
-            (p_marginal, p_marginal),
-            |(i, j)| if i == j { (i + 1) as f64 } else { 0.0 },
-        ))];
-        let log_pens = vec![PenaltyMatrix::Dense(Array2::<f64>::from_shape_fn(
-            (p_logslope, p_logslope),
-            |(i, j)| if i == j { (i + 1) as f64 } else { 0.0 },
-        ))];
-
-        let out = apply_survival_parametric_compile_to_designs(
-            &compiled,
-            raw_time_entry,
-            raw_time_exit,
-            raw_time_deriv,
-            raw_marg,
-            raw_log,
-            &time_pens,
-            &marg_pens,
-            &log_pens,
-        )
-        .expect("apply must succeed");
-
-        // Time triplet: all three designs share V_time, so all three
-        // have the same compiled width = V_time.ncols() = p_time (no
-        // drops on time block in this scenario).
-        assert_eq!(out.time_design_entry.ncols(), compiled.v_time.ncols());
-        assert_eq!(out.time_design_exit.ncols(), compiled.v_time.ncols());
-        assert_eq!(
-            out.time_design_derivative_exit.ncols(),
-            compiled.v_time.ncols()
-        );
-
-        // Marginal / logslope: widths equal their V's column count.
-        assert_eq!(out.marginal_design.ncols(), compiled.v_marginal.ncols());
-        assert_eq!(out.logslope_design.ncols(), compiled.v_logslope.ncols());
-
-        // Penalty pullbacks: each penalty matrix is (p_kept × p_kept).
-        for s in &out.time_penalties {
-            let dense = s.as_dense_cow();
-            assert_eq!(
-                dense.dim(),
-                (compiled.v_time.ncols(), compiled.v_time.ncols())
-            );
-        }
-        for s in &out.marginal_penalties {
-            let dense = s.as_dense_cow();
-            assert_eq!(
-                dense.dim(),
-                (compiled.v_marginal.ncols(), compiled.v_marginal.ncols())
-            );
-        }
-        for s in &out.logslope_penalties {
-            let dense = s.as_dense_cow();
-            assert_eq!(
-                dense.dim(),
-                (compiled.v_logslope.ncols(), compiled.v_logslope.ncols())
-            );
-        }
-
-        // Row count of every design must equal n.
-        assert_eq!(out.time_design_entry.nrows(), n);
-        assert_eq!(out.marginal_design.nrows(), n);
-        assert_eq!(out.logslope_design.nrows(), n);
     }
 
     /// Regression for #368: the phase-4b compiled-map penalty pullback must
