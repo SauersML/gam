@@ -407,7 +407,7 @@ impl BetaPenaltyOp for DensePenaltyOp {
 
     fn fingerprint(&self, hasher: &mut Fingerprinter) {
         hasher.write_str("dense-penalty-op-v1");
-        write_array2_fingerprint(hasher, &self.0);
+        hasher.write_f64_array2(&self.0);
     }
 }
 
@@ -512,7 +512,7 @@ impl BetaPenaltyOp for BlockPenaltyOp {
         hasher.write_usize(self.blocks.len());
         for (off, local) in &self.blocks {
             hasher.write_usize(*off);
-            write_array2_fingerprint(hasher, local);
+            hasher.write_f64_array2(local);
         }
     }
 }
@@ -650,8 +650,8 @@ impl BetaPenaltyOp for KroneckerPenaltyOp {
         hasher.write_str("kronecker-penalty-op-v1");
         hasher.write_usize(self.global_offset);
         hasher.write_usize(self.k);
-        write_array2_fingerprint(hasher, &self.factor_a);
-        write_array2_fingerprint(hasher, &self.factor_b);
+        hasher.write_f64_array2(&self.factor_a);
+        hasher.write_f64_array2(&self.factor_b);
     }
 }
 
@@ -819,7 +819,7 @@ impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
         for blk in &self.blocks {
             hasher.write_usize(blk.row_off);
             hasher.write_usize(blk.col_off);
-            write_array2_fingerprint(hasher, &blk.data);
+            hasher.write_f64_array2(&blk.data);
         }
     }
 }
@@ -1767,15 +1767,15 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
         .as_ref()
         .map(|op| Arc::as_ptr(op) as *const () as usize);
     for row in sys.rows.iter() {
-        write_array2_fingerprint(&mut hasher, &row.htt);
+        hasher.write_f64_array2(&row.htt);
         match htbeta_op_addr {
             Some(addr) => {
                 hasher.write_usize(addr);
                 if sys.htbeta_dense_supplement {
-                    write_array2_fingerprint(&mut hasher, &row.htbeta);
+                    hasher.write_f64_array2(&row.htbeta);
                 }
             }
-            None => write_array2_fingerprint(&mut hasher, &row.htbeta),
+            None => hasher.write_f64_array2(&row.htbeta),
         }
     }
     // Hash the β-block operator's defining state. When a structured
@@ -1790,7 +1790,7 @@ fn row_hessian_fingerprint_for_system(sys: &ArrowSchurSystem) -> u64 {
         }
         None => {
             hasher.write_bool(false);
-            write_array2_fingerprint(&mut hasher, &sys.hbb);
+            hasher.write_f64_array2(&sys.hbb);
         }
     }
     match sys.hbb_diag.as_ref() {
@@ -1815,14 +1815,6 @@ fn combine_row_and_registry_fingerprints(row: u64, registry: u64) -> u64 {
     hasher.write_u64(row);
     hasher.write_u64(registry);
     hasher.finish_u64()
-}
-
-fn write_array2_fingerprint(hasher: &mut Fingerprinter, values: &Array2<f64>) {
-    hasher.write_usize(values.nrows());
-    hasher.write_usize(values.ncols());
-    for &value in values.iter() {
-        hasher.write_f64(value);
-    }
 }
 
 fn analytic_penalty_row_hessian_fingerprint(
