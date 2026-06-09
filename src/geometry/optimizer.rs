@@ -172,7 +172,14 @@ impl RiemannianTrustRegion {
 
         for _ in 0..self.max_iter {
             let (f_curr, grad_e) = objective.value_gradient(x.view())?;
-            let grad = manifold.project_tangent(x.view(), grad_e.view())?;
+            // Raise the ambient Euclidean differential to the *Riemannian*
+            // gradient through the manifold metric. Merely projecting onto the
+            // tangent space is the Riemannian gradient only for the embedded
+            // (identity) metric; for a genuine metric (affine-invariant SPD,
+            // canonical Stiefel) it is the wrong direction, making the model
+            // linear term `g_x(grad, η)` not the differential `Df_x[η]` and the
+            // step not first-order correct (issue #955).
+            let grad = manifold.riemannian_gradient(x.view(), grad_e.view())?;
             let grad_norm = g_norm(manifold, x.view(), grad.view())?;
             // Scale-aware (relative) stationarity test. Comparing the bare
             // gradient norm to a fixed absolute `grad_tol` is mis-calibrated for
@@ -439,7 +446,11 @@ impl RiemannianLBFGS {
         check_len("L-BFGS initial point", x.len(), d)?;
         let mut history: Vec<SecantPair> = Vec::new();
         let (mut f_curr, grad_e0) = objective.value_gradient(x.view())?;
-        let mut grad = manifold.project_tangent(x.view(), grad_e0.view())?;
+        // Riemannian gradient (metric-raised), not a bare tangent projection —
+        // see the trust region above and issue #955. The secant pairs, two-loop
+        // recursion, and Armijo slope are all metric inner products, so they
+        // must operate on the true Riemannian gradient.
+        let mut grad = manifold.riemannian_gradient(x.view(), grad_e0.view())?;
         let armijo_c: f64 = 1.0e-4;
         let alpha_min: f64 = 1.0e-16;
         let alpha_max: f64 = 1.0e16;
@@ -493,7 +504,9 @@ impl RiemannianLBFGS {
                     best_alpha = alpha;
                     best_f = f_trial;
                     best_x = trial_x;
-                    best_grad = manifold.project_tangent(best_x.view(), g_trial_e.view())?;
+                    // Riemannian (metric-raised) gradient at the trial point —
+                    // the object the secant pair (s, y) is formed from (#955).
+                    best_grad = manifold.riemannian_gradient(best_x.view(), g_trial_e.view())?;
                     if alpha >= alpha_max {
                         break;
                     }
@@ -514,7 +527,8 @@ impl RiemannianLBFGS {
                         best_alpha = alpha;
                         best_f = f_trial;
                         best_x = trial_x;
-                        best_grad = manifold.project_tangent(best_x.view(), g_trial_e.view())?;
+                        // Riemannian (metric-raised) gradient at the trial point.
+                        best_grad = manifold.riemannian_gradient(best_x.view(), g_trial_e.view())?;
                         break;
                     }
                     alpha *= 0.5;

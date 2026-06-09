@@ -71,6 +71,16 @@ impl RiemannianManifold for TorusManifold {
         Ok(identity(self.dim))
     }
 
+    /// Flat product metric: the Riemannian gradient is the ambient gradient (the
+    /// per-angle tangent lines fill the whole ambient space).
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.project_tangent(point, euclidean_grad)
+    }
+
     fn christoffel_symbols(&self, point: ArrayView1<'_, f64>) -> GeometryResult<Vec<Array2<f64>>> {
         check_len("Torus Christoffel point", point.len(), self.dim)?;
         Ok(zero_christoffel(self.dim))

@@ -260,6 +260,41 @@ impl RiemannianManifold for StiefelManifold {
         Ok(flatten(&(z - correction)))
     }
 
+    /// Riemannian gradient under the **canonical metric**
+    /// `⟨Δ₁,Δ₂⟩ = tr(Δ₁ᵀ(I−½YYᵀ)Δ₂)`. For a scalar `f` with ambient
+    /// differential `E` (the `n×k` matrix of partials), the Riesz representative
+    /// is the Edelman–Arias–Smith closed form
+    ///
+    /// ```text
+    ///   grad f(Y) = E − Y Eᵀ Y.
+    /// ```
+    ///
+    /// It is tangent (`Yᵀgrad` is skew: `Yᵀgrad = YᵀE − EᵀY = −(Yᵀgrad)ᵀ`) and
+    /// satisfies `⟨grad, Δ⟩_canonical = tr(Eᵀ Δ) = ⟨E, Δ⟩` for every tangent `Δ`
+    /// (the half-trace corrections contract a *symmetric* matrix against the
+    /// skew `YᵀΔ` and vanish). This is the metric-raising default specialized to
+    /// the canonical metric — computed directly to avoid forming the `nk×nk`
+    /// metric tensor. The *embedded* projection `E − Y·sym(YᵀE)`
+    /// ([`project_tangent`]) is the Euclidean-metric gradient and is wrong off
+    /// the `YᵀΔ = 0` subspace for `k ≥ 2` (issue #955).
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        // For k == 1 the Stiefel manifold is the unit sphere, whose canonical
+        // metric is the embedded one; the gradient is the tangent projection.
+        if let Some(sphere) = self.as_sphere() {
+            return sphere.riemannian_gradient(point, euclidean_grad);
+        }
+        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        let y = from_flat(point, self.n, self.k)?;
+        let e = from_flat(euclidean_grad, self.n, self.k)?;
+        // grad = E − Y (Eᵀ Y): Eᵀ Y is k×k, Y·(EᵀY) carries the ambient n.
+        let correction = fast_ab(&y, &fast_atb(&e, &y));
+        Ok(flatten(&(e - correction)))
+    }
+
     /// QR retraction `R_Y(Δ) = qf(Y + Δ)`. This is a first-order retraction,
     /// distinct from the Riemannian [`exp_map`](Self::exp_map); the two agree
     /// only to first order in `Δ`.

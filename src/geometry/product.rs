@@ -294,4 +294,38 @@ impl RiemannianManifold for ProductManifold {
         }
         Ok(out)
     }
+
+    /// The product metric is block-diagonal across the factors, so the
+    /// Riemannian gradient raises **independently within each block**: a factor
+    /// with a genuine (non-identity) metric — an affine-invariant SPD or
+    /// canonical Stiefel component — must use *its own* metric-raising, not a
+    /// global tangent projection. Delegating per block keeps every factor's
+    /// gradient first-order correct (issue #955) rather than silently applying
+    /// the embedded projection across the whole product.
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        check_len("Product gradient point", point.len(), self.ambient_dim())?;
+        check_len(
+            "Product gradient vector",
+            euclidean_grad.len(),
+            self.ambient_dim(),
+        )?;
+        let mut out = Array1::<f64>::zeros(self.ambient_dim());
+        let mut off = 0usize;
+        for component in &self.components {
+            let m = component.ambient_dim();
+            let part = component.riemannian_gradient(
+                point.slice(s![off..off + m]),
+                euclidean_grad.slice(s![off..off + m]),
+            )?;
+            for i in 0..m {
+                out[off + i] = part[i];
+            }
+            off += m;
+        }
+        Ok(out)
+    }
 }

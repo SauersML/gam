@@ -389,6 +389,19 @@ impl RiemannianManifold for GrassmannManifold {
         Ok(flatten(&projected))
     }
 
+    /// The Grassmannian carries the canonical metric `⟨Δ₁,Δ₂⟩ = tr(Δ₁ᵀΔ₂)`,
+    /// which is the *embedded* Frobenius inner product restricted to the
+    /// horizontal tangent space. The Riemannian gradient is therefore the
+    /// horizontal (Frobenius-orthogonal) projection of the ambient gradient —
+    /// exactly [`project_tangent`] — not the dense metric-raising default.
+    fn riemannian_gradient(
+        &self,
+        point: ArrayView1<'_, f64>,
+        euclidean_grad: ArrayView1<'_, f64>,
+    ) -> GeometryResult<Array1<f64>> {
+        self.project_tangent(point, euclidean_grad)
+    }
+
     fn retract(
         &self,
         point: ArrayView1<'_, f64>,
