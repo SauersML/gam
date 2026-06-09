@@ -2415,14 +2415,10 @@ fn run_fitwith_predict_noise(
         }
         _ => None,
     };
-    // The response standardization factor applied inside
-    // `fit_gaussian_location_scale_model`. It must be persisted so prediction
-    // can reconstruct the σ floor at `response_scale·LOGB_SIGMA_FLOOR`, keeping
-    // the predictive σ response-scale-equivariant (#884). The location/mean
-    // coefficients and `exp(η_σ)` term are already in raw units (the intercept
-    // shift absorbed `+ln(response_scale)`); only the additive floor still needs
-    // the factor at reconstruction time.
-    let gaussian_response_scale = solved.response_scale;
+    // The binomial location-scale path links through a probit/threshold scale,
+    // not a standardized response, so there is no `response_scale` to persist
+    // (unlike the Gaussian path's #884 σ-floor factor). The σ contribution rides
+    // entirely on the persisted noise transform below.
     let fit = solved.fit.fit;
     let frozen_meanspec =
         freeze_term_collection_from_design(&solved.fit.meanspec_resolved, &solved.fit.mean_design)
