@@ -2137,10 +2137,24 @@ pub struct GaussianLocationScaleFitResult {
     /// link-wiggle knots/coefficients are already mapped back to **raw response
     /// units** (the Location/Mean block scaled by `response_scale`, the Scale
     /// block intercept shifted by `+ln(response_scale)`), so downstream
-    /// reconstruction `μ = X_mean·β` and `σ = 0.01 + exp(X_scale·β)` come out in
-    /// raw units with no further rescaling. This field records the factor that
-    /// was applied for transparency and covariance bookkeeping; it is `1.0`
-    /// when no standardization was needed (degenerate constant response).
+    /// reconstruction `μ = X_mean·β` comes out in raw units with no further
+    /// rescaling.
+    ///
+    /// The σ reconstruction, however, **must scale the floor too** to stay
+    /// response-scale-equivariant (#884):
+    ///
+    /// ```text
+    /// σ = response_scale·LOGB_SIGMA_FLOOR + exp(X_scale·β)
+    ///   = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal)).
+    /// ```
+    ///
+    /// The intercept shift carries only the `exp(η)` term; reconstructing with a
+    /// raw `LOGB_SIGMA_FLOOR` instead of `response_scale·LOGB_SIGMA_FLOOR` leaves
+    /// the non-equivariant residual `LOGB_SIGMA_FLOOR·(1 − response_scale)`.
+    ///
+    /// This field records the factor that was applied for transparency,
+    /// covariance bookkeeping, and the equivariant σ-floor reconstruction; it is
+    /// `1.0` when no standardization was needed (degenerate constant response).
     pub response_scale: f64,
 }
 
