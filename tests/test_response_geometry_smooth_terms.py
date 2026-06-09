@@ -63,11 +63,16 @@ def test_spherical_response_accepts_smooth_terms(formula: str) -> None:
     np.testing.assert_allclose(norms, np.ones(out.shape[0]), atol=1e-9)
     # The fit must have used multi-penalty REML: an s() smooth contributes more
     # than one penalty block per coordinate.
+    # The fit must have used multi-penalty REML: an s() smooth contributes more
+    # than one penalty block. The smoothing parameters are now SHARED across the
+    # tangent coordinates (issue #967), so `lambdas` is a single per-smooth
+    # vector of length M rather than a (D, M) per-coordinate grid — one lambda
+    # per formula smooth, common to every coordinate.
     summary = model.summary()
     assert summary["shared_smoothing"] is True
     lambdas = np.asarray(summary["shared_fit"]["lambdas"], dtype=float)
-    assert lambdas.shape[0] == 3  # one row per tangent coordinate
-    assert lambdas.shape[1] >= 2  # >= two penalty blocks per smooth coordinate
+    assert lambdas.ndim == 1  # shared per-smooth, not per-coordinate
+    assert lambdas.shape[0] >= 2  # >= two penalty blocks for an s() smooth
     assert np.all(np.isfinite(lambdas))
 
 
@@ -85,8 +90,11 @@ def test_simplex_response_accepts_smooth_terms(formula: str) -> None:
     # Compositional predictions must be positive and sum to one.
     assert np.all(out > 0.0)
     np.testing.assert_allclose(out.sum(axis=1), np.ones(out.shape[0]), atol=1e-9)
+    # Shared per-smooth smoothing parameters (issue #967): a length-M vector,
+    # one lambda per formula smooth common to every compositional coordinate.
     lambdas = np.asarray(model.summary()["shared_fit"]["lambdas"], dtype=float)
-    assert lambdas.shape[1] >= 2
+    assert lambdas.ndim == 1
+    assert lambdas.shape[0] >= 2
     assert np.all(np.isfinite(lambdas))
 
 
