@@ -613,6 +613,143 @@ mod tests {
         .expect("state")
     }
 
+    fn poisson_log_glm_spec() -> GlmLikelihoodSpec {
+        GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ))
+    }
+
+    /// Regression (issue #893): for a fixed-dispersion family a uniform prior
+    /// weight `w = c` is *exact* `c`-fold row replication. The two encodings must
+    /// therefore present a byte-identical LAML smoothing-selection surface — both
+    /// the cost `V(ρ)` and its gradient `∇V(ρ)` — because every term (penalised
+    /// deviance `D_p`, the working cross-product `XᵀWX`, the log-determinants)
+    /// is a sum of per-observation contributions that is identical whether a row
+    /// carries weight `c` or is stacked `c` times. This locks the *surface*
+    /// invariant that #893 ultimately reduces to: when the surfaces coincide,
+    /// the only remaining requirement for `λ̂(w=c) = λ̂(c×)` is that the outer
+    /// optimiser resolve the shared optimum (handled by the tightened outer
+    /// tolerance in `workflow.rs`). A regression that reintroduced a
+    /// row-count-vs-weight-sum asymmetry into the inner solve or the cost would
+    /// break this directly, independent of the optimiser tolerance.
+    #[test]
+    fn fixed_dispersion_laml_surface_is_replication_invariant() {
+        let n = 200usize;
+        let p = 8usize;
+        let c = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64);
+            let tau = std::f64::consts::TAU;
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = t;
+            x[[i, 2]] = (tau * t).sin();
+            x[[i, 3]] = (tau * t).cos();
+            x[[i, 4]] = (2.0 * tau * t).sin();
+            x[[i, 5]] = (2.0 * tau * t).cos();
+            x[[i, 6]] = (3.0 * tau * t).sin();
+            x[[i, 7]] = (3.0 * tau * t).cos();
+            let eta = 0.3 + 0.9 * (1.4 * (t - 0.5)).sin();
+            // Deterministic non-negative integer counts near exp(eta).
+            y[i] = (eta.exp() + 0.5 * ((i as f64) * 2.399_963).sin()).round().max(0.0);
+        }
+        let mut s = Array2::<f64>::zeros((p, p));
+        for j in 1..p {
+            s[[j, j]] = 1.0;
+        }
+
+        // Replicated design (c literal copies of each row).
+        let mut x_rep = Array2::<f64>::zeros((n * c, p));
+        let mut y_rep = Array1::<f64>::zeros(n * c);
+        for r in 0..c {
+            for i in 0..n {
+                let row = r * n + i;
+                for j in 0..p {
+                    x_rep[[row, j]] = x[[i, j]];
+                }
+                y_rep[row] = y[i];
+            }
+        }
+
+        let w_weighted = Array1::<f64>::from_elem(n, c as f64);
+        let w_rep = Array1::<f64>::ones(n * c);
+
+        let cfg = RemlConfig::external(poisson_log_glm_spec(), 1e-10, false);
+        let st_w = build_logit_state(&y, &w_weighted, &x, &s, &cfg);
+        let st_r = build_logit_state(&y_rep, &w_rep, &x_rep, &s, &cfg);
+
+        for &rho in &[-2.0_f64, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0] {
+            let r = Array1::from_elem(1, rho);
+            let cw = st_w.compute_cost(&r).expect("weighted cost");
+            let cr = st_r.compute_cost(&r).expect("replicated cost");
+            let gw = st_w.compute_gradient(&r).expect("weighted grad");
+            let gr = st_r.compute_gradient(&r).expect("replicated grad");
+            // Costs and gradients must coincide to optimiser precision; the only
+            // admissible difference is f64 summation order over n vs c·n rows.
+            assert!(
+                (cw - cr).abs() <= 1e-9 * (1.0 + cw.abs()),
+                "LAML cost differs between w=c and c× replication at rho={rho}: \
+                 cost_w={cw:.12e} cost_r={cr:.12e} diff={:.3e}",
+                cw - cr
+            );
+            assert!(
+                (gw[0] - gr[0]).abs() <= 1e-9 * (1.0 + gw[0].abs()),
+                "LAML gradient differs between w=c and c× replication at rho={rho}: \
+                 g_w={:.12e} g_r={:.12e} diff={:.3e}",
+                gw[0],
+                gr[0],
+                gw[0] - gr[0]
+            );
+        }
+    }
+
+    /// Regression (issue #893): the geometric-mean log-weight ρ-anchor
+    /// ([`RemlState::rho_weight_anchor`]) is a *profiled*-dispersion construct
+    /// (issue #877). For a fixed-dispersion family the optimum does not slide by
+    /// `log c` under a weight rescale in a way the prior should track, and a
+    /// nonzero anchor would evaluate the regularising ρ-prior at *different*
+    /// coordinates for the `w=c` vs `c×` encodings — breaking the very
+    /// equivalence #893 requires. The anchor must therefore be exactly `0` for a
+    /// fixed-dispersion family and the geometric mean for Gaussian-identity.
+    #[test]
+    fn rho_weight_anchor_is_zero_for_fixed_dispersion() {
+        let n = 50usize;
+        let p = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = (i as f64) / ((n - 1) as f64);
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = t;
+            x[[i, 2]] = t * t;
+            y[i] = (1.0 + (3.0 * t).sin()).round().max(0.0);
+        }
+        let mut s = Array2::<f64>::zeros((p, p));
+        s[[2, 2]] = 1.0;
+        // All weights = c: geometric-mean log-weight = ln(c) ≠ 0.
+        let c = 4.0_f64;
+        let w = Array1::<f64>::from_elem(n, c);
+
+        let cfg_pois = RemlConfig::external(poisson_log_glm_spec(), 1e-10, false);
+        let st_pois = build_logit_state(&y, &w, &x, &s, &cfg_pois);
+        assert_eq!(
+            st_pois.rho_weight_anchor(),
+            0.0,
+            "fixed-dispersion (Poisson) anchor must be 0, not the geometric-mean log-weight"
+        );
+
+        let cfg_gauss = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let st_gauss = build_logit_state(&y, &w, &x, &s, &cfg_gauss);
+        assert!(
+            (st_gauss.rho_weight_anchor() - c.ln()).abs() <= 1e-12,
+            "Gaussian-identity (profiled) anchor must be the geometric-mean log-weight ln(c)={:.6}, got {:.6}",
+            c.ln(),
+            st_gauss.rho_weight_anchor()
+        );
+    }
+
     fn beta_original_from_bundle(bundle: &EvalShared) -> Array1<f64> {
         let pr = bundle.pirls_result.as_ref();
         match pr.coordinate_frame {

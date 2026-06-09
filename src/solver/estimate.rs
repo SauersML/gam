@@ -3649,30 +3649,31 @@ where
             problem
         };
 
-        // Geometric-mean log prior-weight `log g(w) = (1/n₊)·Σ log wᵢ` over the
-        // positive-weight rows. The pure-REML optimum for a Gaussian fit drifts
-        // by `ρ̂ → ρ̂ + log c` under a global prior-weight rescale `w → c·w`
-        // (`H = XᵀWX + λS`, so λ → c·λ keeps the penalised curvature
-        // proportional to the data curvature, β̂ / EDF / predictions fixed). The
-        // outer ρ-search seed and the relative-from-seed convergence test would
-        // otherwise be referenced to a weight-independent origin (0), so a
-        // heavily up-weighted fit starts `log c` further from its (shifted)
-        // optimum and the optimiser stops short — exactly the weight-scale
-        // non-invariance of λ̂ reported in issue #877. Anchoring the seed at
-        // `log g(w)` makes the search start the SAME relative distance from the
-        // optimum regardless of the weight magnitude. With all weights 1 the
-        // anchor is exactly 0, so unweighted fits stay byte-identical.
-        let weight_log_geom_mean: f64 = {
-            let mut sum = 0.0;
-            let mut count = 0usize;
-            for &wi in w_o.iter() {
-                if wi > 0.0 {
-                    sum += wi.ln();
-                    count += 1;
-                }
-            }
-            if count == 0 { 0.0 } else { sum / count as f64 }
-        };
+        // Geometric-mean log prior-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ`
+        // over the positive-weight rows. The pure-REML optimum for a *profiled*
+        // (Gaussian-identity) fit drifts by `ρ̂ → ρ̂ + log c` under a global
+        // prior-weight rescale `w → c·w` (`H = XᵀWX + λS`, so λ → c·λ keeps the
+        // penalised curvature proportional to the data curvature, β̂ / EDF /
+        // predictions fixed). The outer ρ-search seed and the relative-from-seed
+        // convergence test would otherwise be referenced to a weight-independent
+        // origin (0), so a heavily up-weighted fit starts `log c` further from
+        // its (shifted) optimum and the optimiser stops short — exactly the
+        // weight-scale non-invariance of λ̂ reported in issue #877. Anchoring the
+        // seed at `log g(w)` makes the search start the SAME relative distance
+        // from the optimum regardless of the weight magnitude.
+        //
+        // This is the SAME gated anchor the outer ρ-prior uses
+        // ([`RemlState::rho_weight_anchor`]): it is the geometric-mean
+        // log-weight for a profiled-dispersion family and *exactly 0* for a
+        // fixed-dispersion family (Poisson, binomial, …). For fixed dispersion
+        // `w = c` is exact `c`-fold replication: the two encodings share an
+        // identical LAML objective and optimum, so anchoring the seed by their
+        // (differing) per-row log-weight mean would seed the weighted encoding
+        // `log c` above its true optimum and the relative-convergence test would
+        // stop it short — over-smoothing vs replication (issue #893). With all
+        // weights 1 (or any fixed-dispersion family) the anchor is exactly 0, so
+        // those fits stay byte-identical.
+        let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
         let gaussian_risk = matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian);
         // The Gaussian path historically skipped the objective-grid prepass and
         // seeded the outer search from the weight-independent origin 0. That is
