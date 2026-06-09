@@ -3660,9 +3660,7 @@ where
         // when the weight scale is non-trivial, so unweighted Gaussian fits stay
         // byte-identical while up-/down-weighted fits seed at the shifted optimum.
         let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
-        let prepass_seed: Option<Array1<f64>> = if gaussian_risk
-            && !run_gaussian_anchored_prepass
-        {
+        let prepass_seed: Option<Array1<f64>> = if gaussian_risk && !run_gaussian_anchored_prepass {
             None
         } else {
             let bnds = reml_seed_config.bounds;

@@ -14,16 +14,16 @@ use crate::basis::{
     BasisMetadata, BasisOptions, Dense, KnotSource, OneDimensionalBoundary, build_bspline_basis_1d,
     create_basis, evaluate_bspline_derivative_scalar,
 };
-use crate::families::wiggle::{
-    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
-    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
-};
 use crate::families::lognormal_kernel::HazardLoading;
 use crate::families::survival_location_scale::{
     DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD, ResidualDistribution,
     SurvivalCovariateTermBlockTemplate,
 };
 use crate::families::survival_marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD;
+use crate::families::wiggle::{
+    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
+    monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
+};
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix};
 use crate::probability::{normal_pdf, standard_normal_quantile};
@@ -1694,8 +1694,7 @@ pub fn build_survival_time_basis(
                 let mut local = Array2::<f64>::zeros((p_time, p_time));
                 for (i_new, &i_old) in keep_cols.iter().enumerate() {
                     for (j_new, &j_old) in keep_cols.iter().enumerate() {
-                        let v = 0.5
-                            * (s_increment[[i_old, j_old]] + s_increment[[j_old, i_old]]);
+                        let v = 0.5 * (s_increment[[i_old, j_old]] + s_increment[[j_old, i_old]]);
                         local[[i_new, j_new]] = v;
                     }
                 }

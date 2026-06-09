@@ -1707,7 +1707,8 @@ mod tests {
         // Genuine one-sided shape rows are pushed strictly interior.
         for i in 0..3 {
             assert!(
-                scaled_constraint_slack(&seed, &constraints, i) >= 0.4 * ACTIVE_SET_INTERIOR_SEED_MARGIN,
+                scaled_constraint_slack(&seed, &constraints, i)
+                    >= 0.4 * ACTIVE_SET_INTERIOR_SEED_MARGIN,
                 "shape row {i} not strictly interior: scaled slack = {:.3e}",
                 scaled_constraint_slack(&seed, &constraints, i)
             );

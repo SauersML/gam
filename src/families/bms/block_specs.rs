@@ -564,10 +564,13 @@ fn reduced_logslope_transform_effective(
     // B = M_effᵀ W G_eff (p_m × p_g);  Gtt = C − Bᵀ A⁻¹ B (p_g × p_g, PSD).
     let b_cross = crate::faer_ndarray::fast_xt_diag_y(&m_eff, row_metric, &g_eff);
     let a_view = crate::faer_ndarray::FaerArrayView::new(&a_gram);
-    let a_factor = crate::faer_ndarray::factorize_symmetricwith_fallback(a_view.as_ref(), Side::Lower)
-        .map_err(|e| {
-            format!("reduced logslope reparam: effective marginal Gram factorization failed: {e}")
-        })?;
+    let a_factor =
+        crate::faer_ndarray::factorize_symmetricwith_fallback(a_view.as_ref(), Side::Lower)
+            .map_err(|e| {
+                format!(
+                    "reduced logslope reparam: effective marginal Gram factorization failed: {e}"
+                )
+            })?;
     let b_view = crate::faer_ndarray::FaerArrayView::new(&b_cross);
     let solved = a_factor.solve(b_view.as_ref()); // A⁻¹ B  (p_m × p_g)
     let a_inv_b = Array2::from_shape_fn((p_m, p_g), |(i, j)| solved[(i, j)]);
@@ -576,7 +579,8 @@ fn reduced_logslope_transform_effective(
     stt = (&stt + &stt.t()) * 0.5;
     if stt.iter().any(|v| !v.is_finite()) {
         return Err(
-            "reduced logslope reparam: effective Schur Gram produced non-finite entries".to_string(),
+            "reduced logslope reparam: effective Schur Gram produced non-finite entries"
+                .to_string(),
         );
     }
 

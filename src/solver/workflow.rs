@@ -19,7 +19,6 @@ use crate::families::gamlss::{
     select_binomial_mean_link_wiggle_basis_from_pilot,
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
-use crate::families::wiggle::WiggleBlockConfig;
 use crate::families::latent_survival::{
     LatentBinaryTermFitResult, LatentBinaryTermSpec, LatentSurvivalTermFitResult,
     LatentSurvivalTermSpec, fit_latent_binary_terms, fit_latent_survival_terms,
@@ -39,6 +38,7 @@ use crate::families::transformation_normal::{
     TransformationNormalConfig, TransformationNormalFitResult, TransformationWarmStart,
     fit_transformation_normal,
 };
+use crate::families::wiggle::WiggleBlockConfig;
 use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use crate::smooth::{

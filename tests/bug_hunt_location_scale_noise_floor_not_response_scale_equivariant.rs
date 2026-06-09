@@ -80,9 +80,7 @@ fn fit_sigma_on_response(x: &[f64], y: &[f64]) -> Vec<f64> {
     let n = x.len();
     let headers: Vec<String> = vec!["x".to_string(), "y".to_string()];
     let rows: Vec<csv::StringRecord> = (0..n)
-        .map(|i| {
-            csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", y[i])])
-        })
+        .map(|i| csv::StringRecord::from(vec![format!("{:.17e}", x[i]), format!("{:.17e}", y[i])]))
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode loc-scale data");
     let col = ds.column_map();
@@ -94,8 +92,7 @@ fn fit_sigma_on_response(x: &[f64], y: &[f64]) -> Vec<f64> {
         noise_formula: Some("1 + s(x, bs='tp')".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
+    let result = fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,

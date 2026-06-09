@@ -3889,9 +3889,18 @@ mod tests {
 
         // The block-diagonal slices recovered by apply_compiled_map_to_designs
         // must equal the per-term V's exactly.
-        let v_time_slice = map.raw_from_compiled.slice(ndarray::s![0..2, 0..2]).to_owned();
-        let v_marg_slice = map.raw_from_compiled.slice(ndarray::s![2..4, 2..3]).to_owned();
-        let v_log_slice = map.raw_from_compiled.slice(ndarray::s![4..5, 3..4]).to_owned();
+        let v_time_slice = map
+            .raw_from_compiled
+            .slice(ndarray::s![0..2, 0..2])
+            .to_owned();
+        let v_marg_slice = map
+            .raw_from_compiled
+            .slice(ndarray::s![2..4, 2..3])
+            .to_owned();
+        let v_log_slice = map
+            .raw_from_compiled
+            .slice(ndarray::s![4..5, 3..4])
+            .to_owned();
         for i in 0..2 {
             for j in 0..2 {
                 assert!((v_time_slice[[i, j]] - v_time[[i, j]]).abs() < 1e-14);
@@ -3909,8 +3918,7 @@ mod tests {
         ];
         let lift_from_map = SmgsLiftViaT::from_compiled_map(&map, &ordering);
         let v_all = vec![v_time, v_marg, v_log];
-        let lift_direct =
-            SmgsLiftViaT::from_v_and_r(&v_all, &[None, Some(r_marg), Some(r_log)]);
+        let lift_direct = SmgsLiftViaT::from_v_and_r(&v_all, &[None, Some(r_marg), Some(r_log)]);
         assert_eq!(lift_from_map.t_full.dim(), lift_direct.t_full.dim());
         for i in 0..lift_from_map.t_full.nrows() {
             for j in 0..lift_from_map.t_full.ncols() {

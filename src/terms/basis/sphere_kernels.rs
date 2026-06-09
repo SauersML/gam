@@ -4,13 +4,13 @@
 //! smooths. Callers in `basis` handle data validation, coordinate transforms,
 //! and matrix assembly.
 
+use super::BasisError;
 use super::polylog::{dilog_unit, trilog_unit};
+use super::sphere_spec::SphereWahbaKernel;
 use super::sphere_spectral::{
     pseudo_s2_truncated_coefficients, sobolev_s2_truncated_coefficients,
     sphere_truncated_spectral_derivative_eval, sphere_truncated_spectral_eval,
 };
-use super::BasisError;
-use super::sphere_spec::SphereWahbaKernel;
 
 /// Pseudo-spline Wahba kernel on S² (mgcv `makeR`-style closed form).
 #[inline]

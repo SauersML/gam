@@ -8,10 +8,10 @@ use crate::custom_family::{
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiDirectCache,
     ExactNewtonJointPsiSecondOrderTerms, ExactNewtonJointPsiWorkspace, FamilyChannelHessian,
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, PsiDesignMap,
-    evaluate_custom_family_joint_hyper,
-    evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
-    resolve_custom_family_x_psi_map, resolve_custom_family_x_psi_psi_map, second_psi_linear_map,
-    shared_dense_arc, weighted_crossprod_psi_maps,
+    evaluate_custom_family_joint_hyper, evaluate_custom_family_joint_hyper_efs, fit_custom_family,
+    fit_custom_family_fixed_log_lambdas, resolve_custom_family_x_psi_map,
+    resolve_custom_family_x_psi_psi_map, second_psi_linear_map, shared_dense_arc,
+    weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
 use crate::faer_ndarray::{
@@ -22186,13 +22186,13 @@ mod tests {
     use super::*;
     // Helpers exercised only by these tests; imported here (not at module scope)
     // so they are not flagged unused in a non-test `--lib` build.
-    use crate::families::wiggle::{
-        initialize_monotone_wiggle_knots_from_seed, monotone_wiggle_internal_degree,
-        split_wiggle_penalty_orders,
-    };
     use crate::basis::{
         CenterStrategy, Dense, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
         create_basis,
+    };
+    use crate::families::wiggle::{
+        initialize_monotone_wiggle_knots_from_seed, monotone_wiggle_internal_degree,
+        split_wiggle_penalty_orders,
     };
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
     use crate::test_support::{binomial_location_scale_base_fixture, no_densify_design};
@@ -29228,13 +29228,7 @@ mod tests {
         }
 
         // Max |entry| over the rectangular block H[r0..r1, c0..c1].
-        fn block_max_abs(
-            h: &Array2<f64>,
-            r0: usize,
-            r1: usize,
-            c0: usize,
-            c1: usize,
-        ) -> f64 {
+        fn block_max_abs(h: &Array2<f64>, r0: usize, r1: usize, c0: usize, c1: usize) -> f64 {
             let mut m = 0.0_f64;
             for r in r0..r1 {
                 for c in c0..c1 {
@@ -29250,7 +29244,9 @@ mod tests {
         {
             let (family, states, specs) = gls_workspace_fixture();
             let p_mu = states[GaussianLocationScaleFamily::BLOCK_MU].beta.len();
-            let p_ls = states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].beta.len();
+            let p_ls = states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA]
+                .beta
+                .len();
             let total = p_mu + p_ls;
 
             // Nonzero ψ design-Jacobian on the MEAN (μ) block so psi_index 0
@@ -29313,8 +29309,11 @@ mod tests {
                 .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
                 .expect("psi 2nd-order call")
                 .expect("gaussian psi 2nd-order present");
-            let h_psi2 =
-                materialize(&psi2.hessian_psi_psi, psi2.hessian_psi_psi_operator.as_deref(), total);
+            let h_psi2 = materialize(
+                &psi2.hessian_psi_psi,
+                psi2.hessian_psi_psi_operator.as_deref(),
+                total,
+            );
             let cross2 = block_max_abs(&h_psi2, 0, p_mu, p_mu, total);
             assert!(
                 cross2 <= CROSS_TOL,
@@ -29346,7 +29345,9 @@ mod tests {
         // ---- Wiggle GaussianLocationScaleWiggleFamily --------------------
         {
             let (family, states, specs, ..) = gls_wiggle_workspace_fixture();
-            let p_mu = states[GaussianLocationScaleWiggleFamily::BLOCK_MU].beta.len();
+            let p_mu = states[GaussianLocationScaleWiggleFamily::BLOCK_MU]
+                .beta
+                .len();
             let p_ls = states[GaussianLocationScaleWiggleFamily::BLOCK_LOG_SIGMA]
                 .beta
                 .len();
@@ -29430,8 +29431,11 @@ mod tests {
                 .exact_newton_joint_psisecond_order_terms(&states, &specs, &derivative_blocks, 0, 0)
                 .expect("wiggle psi 2nd-order call")
                 .expect("wiggle psi 2nd-order present");
-            let h_psi2 =
-                materialize(&psi2.hessian_psi_psi, psi2.hessian_psi_psi_operator.as_deref(), total);
+            let h_psi2 = materialize(
+                &psi2.hessian_psi_psi,
+                psi2.hessian_psi_psi_operator.as_deref(),
+                total,
+            );
             assert_wiggle_crosses_zero(&h_psi2, "2nd-order ψ");
 
             // Mixed β·ψ.

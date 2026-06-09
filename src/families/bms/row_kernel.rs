@@ -478,7 +478,10 @@ mod early_exit_soundness_tests {
         // Threshold above the full NLL → must accept with the exact LL.
         let ll = bernoulli_margslope_line_search_ll_with_early_exit(&rows, 150.0, row_ll)
             .expect("full-data NLL 100 < threshold 150 must accept");
-        assert!((ll - (-100.0)).abs() < 1e-9, "accepted LL must be exact, got {ll}");
+        assert!(
+            (ll - (-100.0)).abs() < 1e-9,
+            "accepted LL must be exact, got {ll}"
+        );
     }
 
     /// Regression for the biobank `IntegrationError`: a Horvitz-Thompson
@@ -492,15 +495,14 @@ mod early_exit_soundness_tests {
     fn ht_subsample_against_full_data_threshold_can_falsely_reject() {
         // True per-row NLL: rows 0..10 contribute 10 each, rows 10..100
         // contribute 0. Full-data NLL = 100.
-        let row_ll = |i: usize| -> Result<f64, String> {
-            if i < 10 { Ok(-10.0) } else { Ok(0.0) }
-        };
+        let row_ll = |i: usize| -> Result<f64, String> { if i < 10 { Ok(-10.0) } else { Ok(0.0) } };
         let threshold = 500.0;
 
         // Full-data decision: NLL 100 < 500 → accept (the correct decision).
         let full_rows = full_data_rows(100);
-        let full = bernoulli_margslope_line_search_ll_with_early_exit(&full_rows, threshold, row_ll)
-            .expect("full-data NLL 100 < threshold 500 must accept");
+        let full =
+            bernoulli_margslope_line_search_ll_with_early_exit(&full_rows, threshold, row_ll)
+                .expect("full-data NLL 100 < threshold 500 must accept");
         assert!((full - (-100.0)).abs() < 1e-9);
 
         // HT subsample that happens to draw the 10 high-NLL rows with
@@ -516,7 +518,8 @@ mod early_exit_soundness_tests {
             })
             .collect();
         assert!(
-            bernoulli_margslope_line_search_ll_with_early_exit(&ht_rows, threshold, row_ll).is_err(),
+            bernoulli_margslope_line_search_ll_with_early_exit(&ht_rows, threshold, row_ll)
+                .is_err(),
             "HT-weighted sum 1000 spuriously exceeds the full-data threshold 500 — \
              demonstrates why an HT subsample must never certify a line-search reject"
         );

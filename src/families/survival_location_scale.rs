@@ -18,13 +18,8 @@ use crate::faer_ndarray::{
     FaerEigh, fast_atb_with_parallelism, fast_atv, fast_av, fast_xt_diag_x,
     fast_xt_diag_x_with_parallelism,
 };
-use crate::families::parameter_block::ParameterBlockInput;
-use crate::families::wiggle::{
-    SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
-    monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
-    validate_monotone_wiggle_beta_nonnegative,
-};
 use crate::families::location_scale_engine::build_location_scale_exact_joint_setup;
+use crate::families::parameter_block::ParameterBlockInput;
 use crate::families::scale_design::{
     build_scale_deviation_operator, build_scale_deviation_transform_design,
     infer_non_intercept_start_design,
@@ -34,6 +29,11 @@ use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals}
 use crate::families::survival_time_constraints::{
     FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
     build_time_derivative_guard_constraints,
+};
+use crate::families::wiggle::{
+    SelectedWiggleBasis, WiggleBlockConfig, monotone_wiggle_basis_with_derivative_order,
+    monotone_wiggle_nonnegative_constraints, select_wiggle_basis_from_seed,
+    validate_monotone_wiggle_beta_nonnegative,
 };
 use crate::matrix::{
     BlockDesignOperator, DenseDesignMatrix, DesignBlock, DesignMatrix, MultiChannelOperator,
@@ -3775,7 +3775,9 @@ struct SurvivalTimeVaryingPsiTransform {
     time_basis_derivative_exit: Array2<f64>,
 }
 
-impl crate::families::spatial_psi_bridge::SpatialPsiBlockTransform for SurvivalTimeVaryingPsiTransform {
+impl crate::families::spatial_psi_bridge::SpatialPsiBlockTransform
+    for SurvivalTimeVaryingPsiTransform
+{
     fn transform_operator(
         &self,
         op: Arc<dyn crate::custom_family::CustomFamilyPsiDerivativeOperator>,

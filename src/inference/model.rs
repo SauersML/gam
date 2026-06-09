@@ -1,14 +1,14 @@
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
 use crate::families::bms::{LatentMeasureKind, LatentZRankIntCalibration};
-use crate::families::wiggle::{
-    monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
-};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
 use crate::families::survival_location_scale::ResidualDistribution;
+use crate::families::wiggle::{
+    monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
+};
 use crate::inference::formula_dsl::{
     inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
     parse_surv_response, parsed_term_column_names,
@@ -3063,8 +3063,7 @@ impl FittedModel {
                 // spread). A model fitted without standardization persists
                 // `gaussian_response_scale = 1`, recovering the raw floor.
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor =
-                    crate::families::sigma_link::LOGB_SIGMA_FLOOR * response_scale;
+                let sigma_floor = crate::families::sigma_link::LOGB_SIGMA_FLOOR * response_scale;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,

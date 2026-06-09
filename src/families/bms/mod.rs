@@ -8,12 +8,9 @@ use crate::custom_family::{
     evaluate_custom_family_joint_hyper_shared, fit_custom_family,
     joint_hyper_options_for_outer_tolerance,
 };
-use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::estimate::UnifiedFitResult;
 use crate::estimate::reml::unified::{DenseSpectralOperator, HessianOperator, HyperOperator};
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::parameter_block::ParameterBlockInput;
-use crate::families::wiggle::initialize_monotone_wiggle_knots_from_seed;
 use crate::families::jet_partitions::MultiDirJet;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
@@ -25,10 +22,13 @@ use crate::families::marginal_slope_shared::{
     outer_weighted_rows, parameter_block_specs_match_rows, probit_frailty_scale,
     probit_frailty_scale_multi_dir_jet, psi_derivative_location, scale_coeff4,
 };
+use crate::families::parameter_block::ParameterBlockInput;
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
+use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+use crate::families::wiggle::initialize_monotone_wiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{

@@ -7158,8 +7158,7 @@ fn build_latent_forward_design(
             // "stationary" at the start and collapsed every row to one latent
             // coordinate (issue #876). Build the matching periodic jet here and
             // return early, mirroring the per-manifold forward choice exactly.
-            if let Some(jet) =
-                build_latent_duchon_periodic_jet(t_mat.view(), centers, m, periodic)?
+            if let Some(jet) = build_latent_duchon_periodic_jet(t_mat.view(), centers, m, periodic)?
             {
                 if jet.shape()[1] != design.ncols() {
                     return Err(format!(
@@ -13355,8 +13354,7 @@ fn glm_reml_fit_latent_impl(
     }
     // GLM standalone latent fit: no manifold/chart concept here, so the latent
     // Duchon decoder stays the open Euclidean basis (byte-identical).
-    let (design, t_mat) =
-        build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, None)?;
+    let (design, t_mat) = build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, None)?;
     if penalty.dim() != (design.ncols(), design.ncols()) {
         return Err(format!(
             "penalty shape mismatch: expected {}x{}, got {}x{}",
