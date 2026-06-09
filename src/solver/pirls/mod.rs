@@ -2293,7 +2293,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             //
             // Rule: use X_transformed if available; fall back to X_original only
             // when PIRLS is operating directly in the original basis.
-            let (hat_diag, jeffreys_logdet) = match &self.coordinate_design {
+            let (hat_diag, jeffreys_logdet, firth_score_shift) = match &self.coordinate_design {
                 WorkingCoordinateDesign::TransformedExplicit {
                     x_transformed,
                     x_csr,
@@ -2368,13 +2368,21 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 jeffreys_logdet,
                 hat_diag: hat_diag.clone(),
             };
+            // Apply the link-general Firth working-response shift `Δ_i` built by
+            // the operator (`½ (w'_i/w_i) h_diag_i`). PIRLS then solves
+            // `Xᵀ W (z* − η) = 0`, so the Firth term it adds to the score is
+            // `Σ_i w_i Δ_i x_i = ½ Σ_i w'_i h_diag_i x_i = ∂Φ/∂β` — exactly the
+            // Jeffreys score the outer REML differentiates. For the canonical
+            // logit `Δ_i` equals the historical `h_i (½ − μ_i)/w_i`; for probit /
+            // cloglog it carries the correct non-canonical `w'_i/w_i` instead of
+            // the logit-pinned `(½ − μ_i)`, so the inner mode and the outer
+            // objective no longer disagree.
             ndarray::Zip::from(&mut self.lastz)
-                .and(&hat_diag)
+                .and(&firth_score_shift)
                 .and(&self.lastweights)
-                .and(&self.lastmu)
-                .par_for_each(|zi, &hii, &wi, &mui| {
+                .par_for_each(|zi, &delta_i, &wi| {
                     if wi > 0.0 {
-                        *zi += hii * (0.5 - mui) / wi;
+                        *zi += delta_i;
                     }
                 });
         }
@@ -2932,7 +2940,7 @@ pub(super) fn compute_jeffreys_pirls_diagnostics_sparse(
     x_design_csr: &SparseRowMat<usize, f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
-) -> Result<(Array1<f64>, f64), EstimationError> {
+) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
     let n = x_design_csr.nrows();
     let p = x_design_csr.ncols();
     let mut x_dense = Array2::<f64>::zeros((n, p));
@@ -2957,21 +2965,27 @@ pub(super) fn compute_jeffreys_pirls_diagnostics(
     x_design: ArrayView2<f64>,
     eta: ArrayView1<f64>,
     observation_weights: ArrayView1<f64>,
-) -> Result<(Array1<f64>, f64), EstimationError> {
+) -> Result<(Array1<f64>, f64, Array1<f64>), EstimationError> {
     // PIRLS must use the same identifiable-subspace Jeffreys functional as the
     // outer REML code:
     //   Φ(β) = 0.5 log|Xᵀ W(η) X|_+.
-    // The operator below is the single source of truth for both the Jeffreys
-    // scalar value and the PIRLS hat-diagonal correction derived from it. The
-    // Fisher working weight `W(η)` is evaluated for the resolved inverse link;
-    // `StandardLink::Logit` reproduces the released logit diagnostics exactly.
+    // The operator below is the single source of truth for the Jeffreys scalar
+    // value, the PIRLS hat-diagonal, AND the working-response score shift the
+    // inner solve applies. The Fisher working weight `W(η)` is evaluated for the
+    // resolved inverse link; `StandardLink::Logit` reproduces the released logit
+    // diagnostics exactly while non-canonical links (probit, cloglog) get the
+    // correct link-general shift instead of the logit-pinned `(½ − μ)` term.
     let op = FirthDenseOperator::build_with_observation_weights_for_link(
         link,
         &x_design.to_owned(),
         &eta.to_owned(),
         observation_weights,
     )?;
-    Ok((op.pirls_hat_diag(), op.jeffreys_logdet()))
+    Ok((
+        op.pirls_hat_diag(),
+        op.jeffreys_logdet(),
+        op.pirls_firth_score_shift(),
+    ))
 }
 
 fn ensure_positive_definitewithridge(
@@ -7143,7 +7157,7 @@ mod tests {
         );
 
         for link in [&cloglog, &mixture] {
-            let (hat, logdet) = compute_jeffreys_pirls_diagnostics(
+            let (hat, logdet, shift) = compute_jeffreys_pirls_diagnostics(
                 link,
                 x.view(),
                 eta.view(),
@@ -7151,6 +7165,7 @@ mod tests {
             )
             .expect("supported Firth inverse link");
             assert_eq!(hat.len(), x.nrows());
+            assert_eq!(shift.len(), x.nrows());
             assert!(
                 logdet.is_finite(),
                 "Jeffreys logdet must stay finite for {link:?}"
@@ -7158,6 +7173,10 @@ mod tests {
             assert!(
                 hat.iter().all(|value| value.is_finite() && *value >= 0.0),
                 "hat diagonal must stay finite and non-negative for {link:?}: {hat:?}"
+            );
+            assert!(
+                shift.iter().all(|value| value.is_finite()),
+                "Firth score shift must stay finite for {link:?}: {shift:?}"
             );
         }
     }

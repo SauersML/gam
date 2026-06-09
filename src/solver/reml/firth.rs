@@ -439,6 +439,37 @@ impl FirthDenseOperator {
         &self.w * &self.h_diag
     }
 
+    /// Per-observation Firth working-response shift `Δ_i` for the single-eta
+    /// PIRLS inner solve, so the inner stationary point is the SAME penalized
+    /// objective the outer REML differentiates through `jeffreys_beta_gradient`.
+    ///
+    /// PIRLS solves `Xᵀ W (z* − η) = 0` with `z*_i = z_i + Δ_i`, so the Firth
+    /// term it adds to the score is `Σ_i w_i Δ_i x_i`. The Jeffreys score is
+    /// `∂Φ/∂β = ½ Σ_i w'_i h_i x_i` (see `jeffreys_beta_gradient`, with
+    /// `h_i = [X_r K_r X_rᵀ]_ii = h_diag_i` and `w'_i = ∂w_i/∂η_i = w1`). Matching
+    /// the two gives `w_i Δ_i = ½ w'_i h_i`, i.e.
+    ///   `Δ_i = ½ · (w'_i / w_i) · h_diag_i`.
+    ///
+    /// For the canonical logit this collapses to `h_i (½ − μ_i) / w_i` because
+    /// `w'_i / w_i = (1 − 2μ_i)` and `h_i = w_i h_diag_i`; but for a NON-canonical
+    /// binomial link (probit, cloglog, …) `w'_i / w_i ≠ (1 − 2μ_i)`, so the
+    /// logit-pinned `(½ − μ_i)` shift solved a DIFFERENT objective than the one
+    /// the outer REML/`hphi_direction` machinery differentiates. This builds the
+    /// correct link-general shift from the same `w`, `w1`, `h_diag` the operator
+    /// already caches. `w_i ≤ 0` rows contribute no curvature and get a zero
+    /// shift (they cannot enter `Xᵀ W (z*−η)` anyway).
+    #[inline]
+    pub(crate) fn pirls_firth_score_shift(&self) -> Array1<f64> {
+        let mut shift = Array1::<f64>::zeros(self.w.len());
+        for i in 0..self.w.len() {
+            let wi = self.w[i];
+            if wi > 0.0 {
+                shift[i] = 0.5 * (self.w1[i] / wi) * self.h_diag[i];
+            }
+        }
+        shift
+    }
+
     fn build_with_observation_weights_impl(
         link: &InverseLink,
         x_dense: &Array2<f64>,
