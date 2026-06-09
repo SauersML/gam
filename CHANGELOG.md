@@ -4,8 +4,10 @@ Crate + wheel release rolling up everything since gam 0.3.107. crates.io is at
 gam 0.3.107 and PyPI has been stuck at gamfit 0.1.180 — the intervening
 gamfit 0.1.181–0.1.187 wheels never published because the wheel build broke on
 lib compile errors (`-D warnings`) that the per-push CI does not catch (Rust CI
-runs nightly only). Those breaks are fixed here, so this is the first green
-wheel since 0.1.180.
+runs nightly only). Those breaks are fixed here, so the wheels build green again
+for the first time since 0.1.180. The `gam` 0.3.108 crate published to
+crates.io; the gamfit 0.1.188 PyPI upload is separately blocked on the project's
+10 GB storage quota (the wheels build but `twine` is rejected) — see #894.
 
 New:
 - feat(report): terminal smooth visualizer. `gam report` now prints a unicode
