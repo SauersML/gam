@@ -33512,7 +33512,7 @@ mod tests {
         let lambda_likelihood = 5.0; // small mean/wiggle curvature.
         let h = array![[lambda_penalty, 0.0], [0.0, lambda_likelihood]];
         // Residual dominated by the penalty mode (β off its penalized optimum).
-        let rhs = array![1.0e11, 10.0];
+        let rhs: Array1<f64> = array![1.0e11, 10.0];
         let rhs_inf = rhs.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
         let levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
         // Engage the ill-conditioned-for-Newton damping (cond = 2e11 ≫
