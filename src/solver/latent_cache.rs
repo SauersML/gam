@@ -218,9 +218,9 @@ impl LatentBasisKind {
                 hasher.write_usize(centers.ncols());
                 hasher.write_f64(*length_scale);
                 hasher.write_usize(matern_nu_signature(*nu));
-                hash_f64_slice(aniso_log_scales, &mut hasher);
+                hasher.write_f64_slice(aniso_log_scales);
                 hash_optional_usize(*chunk_size, &mut hasher);
-                hash_matrix(centers, &mut hasher);
+                hasher.write_f64_array2(centers);
             }
             Self::Duchon {
                 centers,
@@ -235,8 +235,8 @@ impl LatentBasisKind {
                 hash_optional_f64(*length_scale, &mut hasher);
                 hasher.write_u64(power.to_bits());
                 hash_duchon_nullspace_order(*nullspace_order, &mut hasher);
-                hash_f64_slice(aniso_log_scales, &mut hasher);
-                hash_matrix(centers, &mut hasher);
+                hasher.write_f64_slice(aniso_log_scales);
+                hasher.write_f64_array2(centers);
             }
             Self::Sphere {
                 centers,
@@ -248,7 +248,7 @@ impl LatentBasisKind {
                 hasher.write_usize(centers.ncols());
                 hasher.write_usize(*penalty_order);
                 hash_optional_usize(*chunk_size, &mut hasher);
-                hash_matrix(centers, &mut hasher);
+                hasher.write_f64_array2(centers);
             }
             Self::PeriodicBspline {
                 domain_start,
@@ -277,7 +277,7 @@ impl LatentBasisKind {
                 hash_optional_usize(*chunk_size, &mut hasher);
                 hasher.write_usize(knots.len());
                 for axis_knots in knots {
-                    hash_vector(axis_knots, &mut hasher);
+                    hasher.write_f64_array1(axis_knots);
                 }
             }
             Self::Pca {
@@ -313,7 +313,7 @@ impl LatentBasisKind {
                 hasher.write_usize(*chunk_size);
                 hasher.write_usize(basis_matrix.nrows());
                 hasher.write_usize(basis_matrix.ncols());
-                hash_matrix(basis_matrix, &mut hasher);
+                hasher.write_f64_array2(basis_matrix);
             }
         }
         hasher.finalize()
@@ -378,28 +378,6 @@ fn hash_optional_usize(value: Option<usize>, hasher: &mut Fingerprinter) {
     }
 }
 
-fn hash_f64_slice(values: &[f64], hasher: &mut Fingerprinter) {
-    hasher.write_usize(values.len());
-    for &value in values {
-        hasher.write_f64(value);
-    }
-}
-
-fn hash_matrix(matrix: &Array2<f64>, hasher: &mut Fingerprinter) {
-    hasher.write_usize(matrix.nrows());
-    hasher.write_usize(matrix.ncols());
-    for &value in matrix.iter() {
-        hasher.write_f64(value);
-    }
-}
-
-fn hash_vector(vector: &Array1<f64>, hasher: &mut Fingerprinter) {
-    hasher.write_usize(vector.len());
-    for &value in vector.iter() {
-        hasher.write_f64(value);
-    }
-}
-
 fn latent_metadata_cache_digest(latent: &LatentCoordValues) -> CacheDigest {
     let mut hasher = cache_digest_builder("latent-cache-metadata-v1");
     hasher.write_usize(latent.n_obs());
@@ -448,7 +426,7 @@ fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut Fingerprinter) {
             strength,
         } => {
             hasher.write_usize(0);
-            hash_matrix(u, hasher);
+            hasher.write_f64_array2(u);
             hash_aux_prior_family(*family, hasher);
             hash_aux_prior_strength(*strength, hasher);
         }
@@ -459,7 +437,7 @@ fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut Fingerprinter) {
             init_log_precision,
         } => {
             hasher.write_usize(1);
-            hash_matrix(u, hasher);
+            hasher.write_f64_array2(u);
             hash_aux_prior_family(*family, hasher);
             hash_aux_prior_strength(*strength, hasher);
             hash_optional_vector(init_log_precision.as_ref(), hasher);
@@ -497,7 +475,7 @@ fn hash_optional_vector(vector: Option<&Array1<f64>>, hasher: &mut Fingerprinter
     match vector {
         Some(vector) => {
             hasher.write_bool(true);
-            hash_vector(vector, hasher);
+            hasher.write_f64_array1(vector);
         }
         None => {
             hasher.write_bool(false);
@@ -536,7 +514,7 @@ fn hash_latent_manifold(manifold: &LatentManifold, hasher: &mut Fingerprinter) {
             for part in manifolds {
                 hash_latent_manifold(part, hasher);
             }
-            hash_f64_slice(weights, hasher);
+            hasher.write_f64_slice(weights);
         }
     }
 }
