@@ -61,29 +61,29 @@ fn g_norm(
     Ok(g_inner(manifold, point, a, a)?.max(0.0).sqrt())
 }
 
-/// Dimensionless relative-gradient stationarity measure
-/// `‖grad‖_g · ‖x‖_typ / max(|f|, 1)`, where `‖x‖_typ = max(rms(x), 1)` is the
-/// iterate's characteristic magnitude. This is the scale-invariant form of the
-/// gradient stopping test: it divides out the common scale that an objective and
-/// its gradient share, so a fixed `grad_tol` reads as a *relative* tolerance.
-/// It is the same quantity the latent FFI reports as `grad_t_norm_scaled`, so
-/// the optimizer's internal stopping and the reported `converged` flag agree
-/// (issue #879). A non-finite gradient or objective maps to `+∞` so the caller
-/// never treats a blown-up iterate as stationary.
-fn relative_stationarity(grad_norm: f64, x: ArrayView1<'_, f64>, f: f64) -> f64 {
-    if !grad_norm.is_finite() || !f.is_finite() {
+/// Shift-invariant relative-gradient stationarity measure
+/// `‖grad_k‖_g / max(‖grad_0‖_g, 1)`, comparing the current Riemannian gradient
+/// norm to the gradient norm at the INITIAL iterate. The initial gradient norm
+/// carries the same *multiplicative* scale the objective and its gradient share
+/// (`f → c·f` ⇒ `grad → c·grad`), so a fixed `grad_tol` still reads as a
+/// *relative* tolerance — but, unlike dividing by `max(|f|, 1)`, `‖grad_0‖` is
+/// invariant under an additive shift `f → f + C`, which leaves the minimizers,
+/// gradient, trust-region model reduction, Armijo slope, and accepted path all
+/// unchanged. Dividing by `|f|` was non-invariant: a large additive constant
+/// inflates the denominator and can falsely certify convergence at a
+/// non-stationary iterate (e.g. `f̃(x) = C + x²` at `x = 1` with `C > 2/τ − 1`),
+/// issue #954. The `max(·, 1)` floor reduces this to the absolute test
+/// `‖grad_k‖ ≤ grad_tol` on a unit-scale objective and preserves the
+/// O(n)-gradient calibration of the profiled REML latent objective (whose
+/// `‖grad_0‖` is itself O(n), issue #879). The non-intrinsic `‖x‖_typ` factor is
+/// dropped: ambient iterate magnitude is not coordinate/chart invariant on a
+/// manifold, so it does not belong in a Riemannian stationarity test. A
+/// non-finite gradient maps to `+∞` so a blown-up iterate is never stationary.
+fn relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
+    if !grad_norm.is_finite() || !grad0_norm.is_finite() {
         return f64::INFINITY;
     }
-    let n = x.len();
-    let x_scale = if n == 0 {
-        1.0
-    } else {
-        (x.iter().map(|&v| v * v).sum::<f64>() / n as f64)
-            .sqrt()
-            .max(1.0)
-    };
-    let f_scale = f.abs().max(1.0);
-    grad_norm * x_scale / f_scale
+    grad_norm / grad0_norm.max(1.0)
 }
 
 #[derive(Debug, Clone, PartialEq)]
