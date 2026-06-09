@@ -3333,6 +3333,7 @@ mod tests {
         RemlScore,
         Coefficient(usize, usize),
         Fitted(usize, usize),
+        Edf,
     }
 
     fn finite_difference_design() -> Array2<f64> {
@@ -3401,6 +3402,7 @@ mod tests {
             ForwardScalar::RemlScore => fit.reml_score,
             ForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
             ForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
+            ForwardScalar::Edf => fit.edf,
         }
     }
 
@@ -3413,17 +3415,19 @@ mod tests {
     ) -> GaussianRemlBackwardResult {
         let mut grad_coefficients = Array2::<f64>::zeros((x.ncols(), y.ncols()));
         let mut grad_fitted = Array2::<f64>::zeros(y.dim());
-        let (grad_lambda, grad_score, coefficient_upstream, fitted_upstream) = match target {
-            ForwardScalar::Lambda => (1.0, 0.0, None, None),
-            ForwardScalar::RemlScore => (0.0, 1.0, None, None),
+        let (grad_lambda, grad_score, grad_edf, coefficient_upstream, fitted_upstream) = match target
+        {
+            ForwardScalar::Lambda => (1.0, 0.0, 0.0, None, None),
+            ForwardScalar::RemlScore => (0.0, 1.0, 0.0, None, None),
             ForwardScalar::Coefficient(row, col) => {
                 grad_coefficients[[row, col]] = 1.0;
-                (0.0, 0.0, Some(grad_coefficients.view()), None)
+                (0.0, 0.0, 0.0, Some(grad_coefficients.view()), None)
             }
             ForwardScalar::Fitted(row, col) => {
                 grad_fitted[[row, col]] = 1.0;
-                (0.0, 0.0, None, Some(grad_fitted.view()))
+                (0.0, 0.0, 0.0, None, Some(grad_fitted.view()))
             }
+            ForwardScalar::Edf => (0.0, 0.0, 1.0, None, None),
         };
         gaussian_reml_multi_closed_form_backward(
             x,
@@ -3435,7 +3439,7 @@ mod tests {
             coefficient_upstream,
             fitted_upstream,
             grad_score,
-            0.0,
+            grad_edf,
         )
         .expect("analytic backward VJP")
     }
@@ -3485,6 +3489,7 @@ mod tests {
             ForwardScalar::RemlScore,
             ForwardScalar::Coefficient(3, outputs - 1),
             ForwardScalar::Fitted(12, outputs - 1),
+            ForwardScalar::Edf,
         ];
         for target in targets {
             let backward =
@@ -3546,6 +3551,39 @@ mod tests {
                     backward.grad_weights[row],
                     fd,
                 );
+            }
+
+            // ∂L/∂S over EVERY penalty entry. The fixture penalty is
+            // diag([0.0, 0.8, 1.2, 1.7, 2.3]) — nullity 1 with the (0,0) entry
+            // and the whole row/column 0 touching the null direction — so this
+            // loop is the decisive check on the rank-deficient pseudoinverse the
+            // score-VJP forms (`penalty_pinv` = L⁻ᵀ T⁺ L⁻¹). The forward consumes
+            // only `S_canon = 0.5(S + Sᵀ)` and the backward returns the
+            // symmetrized gradient, so a single-entry bump of S[r, c] (asymmetric)
+            // is compared directly against `grad_penalty[r, c]`: by the chain rule
+            // through the symmetrization the analytic entry already equals
+            // `0.5(G[r, c] + G[c, r])`, which is exactly what FD on that one entry
+            // measures.
+            for r in 0..penalty.nrows() {
+                for c in 0..penalty.ncols() {
+                    let eval = |delta: f64| {
+                        let mut candidate = penalty.clone();
+                        candidate[[r, c]] += delta;
+                        one_hot_objective(
+                            x.view(),
+                            y.view(),
+                            candidate.view(),
+                            weights.view(),
+                            target,
+                        )
+                    };
+                    let fd = adaptive_central_difference(eval);
+                    assert_fd_close(
+                        &format!("target={target:?} penalty[{r},{c}]"),
+                        backward.grad_penalty[[r, c]],
+                        fd,
+                    );
+                }
             }
         }
     }
@@ -3663,6 +3701,44 @@ mod tests {
             backward.grad_weights[2],
             fd_w
         );
+
+        // Combined-seed ∂L/∂S spot-check: perturb individual penalty entries with
+        // x/y/w held at base. The penalty [[0,0,0],[0,1,0.2],[0,0.2,1.7]] is
+        // nullity 1 (row/column 0 is the null direction), so this exercises the
+        // rank-deficient pseudoinverse path AND the backward symmetrization under
+        // mixed (λ, score, β, fitted) seeds. A single-entry asymmetric bump of
+        // S[r, c] is compared directly to grad_penalty[[r, c]], which the backward
+        // already returns symmetrized to 0.5(G[r,c] + G[c,r]).
+        let objective_s = |s_eval: &Array2<f64>| {
+            let fit = gaussian_reml_multi_closed_form_with_cache(
+                x.view(),
+                y.view(),
+                s_eval.view(),
+                Some(weights.view()),
+                Some(0.8),
+                None,
+            )
+            .expect("fit for penalty objective");
+            upstream_lambda * fit.lambda
+                + upstream_score * fit.reml_score
+                + (&fit.coefficients * &upstream_coefficients).sum()
+                + (&fit.fitted * &upstream_fitted).sum()
+        };
+        // (0,0) null diagonal; (0,1) null-touching off-diagonal; (1,1) full-rank
+        // diagonal; (1,2) pure off-diagonal between two penalized directions.
+        for (r, c) in [(0usize, 0usize), (0, 1), (1, 1), (1, 2)] {
+            let mut s_plus = penalty.clone();
+            let mut s_minus = penalty.clone();
+            s_plus[[r, c]] += eps;
+            s_minus[[r, c]] -= eps;
+            let fd_s = (objective_s(&s_plus) - objective_s(&s_minus)) / (2.0 * eps);
+            assert!(
+                (fd_s - backward.grad_penalty[[r, c]]).abs() <= 2.0e-4,
+                "grad_penalty[{r},{c}] mismatch: analytic={} fd={}",
+                backward.grad_penalty[[r, c]],
+                fd_s
+            );
+        }
     }
 
     #[test]
