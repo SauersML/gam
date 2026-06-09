@@ -28,12 +28,16 @@ impl SphereManifold {
         Ok(x / nrm)
     }
 
-    /// Reject base points that are not on the unit sphere. Every closed-form
-    /// here (`exp`, `log`, projection, transport) assumes `‖p‖ = 1`; for a
-    /// non-unit `p` the projection `v − p(pᵀv)` is not even tangent and
-    /// `exp` leaves the sphere. The tolerance is loose enough to absorb the
-    /// float drift of on-manifold iterates (retraction renormalizes to
-    /// ~1e-15) yet still rejects genuinely off-manifold inputs.
+    /// Reject base points that are not on the unit sphere. This guards the maps
+    /// that are only meaningful at a genuine manifold point — `log_map`,
+    /// `metric_tensor`, `parallel_transport`, `tangent_basis`, `project_tangent`
+    /// — where a non-unit `p` makes `v − p(pᵀv)` not even tangent. It is
+    /// deliberately *not* applied to `exp_map` / `exp_map_vjp`, which are the
+    /// honest-ambient forward/adjoint pair used by reverse-mode autodiff: they
+    /// consume `point` verbatim so finite-difference probes can step off the
+    /// sphere (see `exp_map`). The tolerance is loose enough to absorb the float
+    /// drift of on-manifold iterates (retraction renormalizes to ~1e-15) yet
+    /// still rejects genuinely off-manifold inputs.
     fn require_unit(&self, point: ArrayView1<'_, f64>) -> GeometryResult<()> {
         let n2 = dot(point, point);
         if !n2.is_finite() || (n2 - 1.0).abs() > Self::UNIT_TOL {
@@ -105,8 +109,18 @@ impl RiemannianManifold for SphereManifold {
         let m = self.ambient_dim();
         check_len("Sphere point", point.len(), m)?;
         check_len("Sphere tangent", tangent_vec.len(), m)?;
-        self.require_unit(point)?;
-        let xi = self.project_tangent(point, tangent_vec)?;
+        // Honest-ambient exponential: `point` is used verbatim and is NOT
+        // required to satisfy ‖p‖ = 1. This is the forward whose reverse mode
+        // [`exp_map_vjp`](Self::exp_map_vjp) differentiates, and the
+        // finite-difference pins (`tests/sphere_exp_map_vjp_matches_finite_difference.rs`)
+        // step `point` off the unit sphere on purpose to exercise the general
+        // `|p|² ≠ 1` branch — so this map must stay smooth in the raw ambient
+        // coordinates rather than reject them. With `c = p·v`, the tangent
+        // component is `xi = v − c·p` (the orthogonal projection only when
+        // ‖p‖ = 1); `require_unit` is reserved for the maps that genuinely need
+        // a manifold point (`log_map`, `metric_tensor`, `parallel_transport`).
+        let c = dot(point, tangent_vec);
+        let xi = &tangent_vec.to_owned() - &(point.to_owned() * c);
         let theta = norm(xi.view());
         if theta < 1.0e-10 {
             return self.normalize(&point + &xi);
@@ -249,7 +263,11 @@ impl RiemannianManifold for SphereManifold {
         check_len("Sphere exp_map_vjp point", point.len(), m)?;
         check_len("Sphere exp_map_vjp tangent", tangent_vec.len(), m)?;
         check_len("Sphere exp_map_vjp grad", grad_output.len(), m)?;
-        self.require_unit(point)?;
+        // No `require_unit` here: this is the exact adjoint of the honest-ambient
+        // [`exp_map`](Self::exp_map), which uses `point` verbatim. The general
+        // branch below carries the `c(1 − |p|²)` terms, so it is correct for any
+        // ambient `p`; gating on ‖p‖ = 1 would make that branch unreachable and
+        // break the off-sphere finite-difference contract the VJP exists for.
 
         // Forward map: with `xi = (I - p p^T) v`, `theta = |xi|`,
         //   y = cos(theta) p + (sin(theta)/theta) xi.
