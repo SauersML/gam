@@ -24420,7 +24420,11 @@ mod tests {
 
     #[test]
     fn survival_marginal_slope_advertises_outer_hvp_at_large_psi_dim() {
-        let n = 2usize;
+        // `dummy_penalized_blockspec` materializes single-row designs, so the
+        // family row count must be 1 to satisfy the HVP availability row guard
+        // (`parameter_block_specs_match_rows`, added in 28a1c035f). The
+        // "large psi dim" under test is the 32-column block below, not `n`.
+        let n = 1usize;
         let family = make_block_psi_test_family(n);
         let specs = vec![
             dummy_penalized_blockspec(0, 0),
