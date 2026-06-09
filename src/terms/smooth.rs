@@ -1336,6 +1336,18 @@ impl TermCollectionSpec {
         let mut out = self.clone();
         for lt in &mut out.linear_terms {
             lt.feature_col = remap(lt.feature_col)?;
+            // Also remap the full interaction-factor list. The design builder
+            // (`build_term_collection_design_inner`) materializes the column from
+            // `effective_feature_cols()` — which returns `feature_cols` whenever
+            // it is non-empty (i.e. essentially always, including a plain linear
+            // term where `feature_cols == [feature_col]`). Remapping only the
+            // singular `feature_col` left these at their saved *training* indices
+            // at predict time, so a parametric `Surv(...) ~ x` (and any `:`
+            // interaction) bailed with "feature column N out of bounds" once the
+            // response/time columns shift the runtime layout (issue #898).
+            for fc in lt.feature_cols.iter_mut() {
+                *fc = remap(*fc)?;
+            }
         }
         for rt in &mut out.random_effect_terms {
             rt.feature_col = remap(rt.feature_col)?;
@@ -20869,7 +20881,10 @@ mod tests {
             linear_terms: vec![LinearTermSpec {
                 name: "lin".to_string(),
                 feature_col: 1,
-                feature_cols: vec![1],
+                // Interaction term (distinct second factor) so a walk that
+                // remaps only `feature_col` and skips `feature_cols` is caught
+                // — exactly the #898 predict-time regression.
+                feature_cols: vec![1, 12],
                 double_penalty: false,
                 coefficient_geometry: LinearCoefficientGeometry::Unconstrained,
                 coefficient_min: None,
@@ -20953,6 +20968,10 @@ mod tests {
             .expect("remap must succeed");
 
         assert_eq!(remapped.linear_terms[0].feature_col, 101);
+        // Every interaction factor in `feature_cols` must be remapped too — the
+        // design builder reads `effective_feature_cols()` (i.e. `feature_cols`),
+        // so a walk that skips it leaves stale training indices at predict (#898).
+        assert_eq!(remapped.linear_terms[0].feature_cols, vec![101, 112]);
         assert_eq!(remapped.random_effect_terms[0].feature_col, 102);
 
         let collected = collect_feature_columns(&remapped);
