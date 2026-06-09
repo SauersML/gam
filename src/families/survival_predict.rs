@@ -1580,6 +1580,21 @@ fn predict_survival_location_scale_batch(
     let eval_width = if per_row_eval { 1 } else { t_cols + 1 };
     let saved_likelihood_mode = SurvivalLikelihoodMode::LocationScale;
     let baseline_cfg = saved_survival_runtime_baseline_config(model)?;
+    let saved_fit = saved_survival_location_scale_fit_result(model)?;
+    // Reduced parametric-AFT regime (issue #892): the fit removed the time warp
+    // entirely (`h ≡ 0`, zero free time columns) and carried the σ-scaled `log t`
+    // baseline as a per-row LOCATION shift `η_t → η_t − log t`, so the
+    // standardized residual is `u = inv_sigma·(log t − η_t) = (log t − μ)/σ` and
+    // σ is identified through the event Jacobian's `−log σ` term (the
+    // survreg / lifelines / flexsurv AFT gauge). The saved model therefore has an
+    // EMPTY time-warp β (no other location-scale fit produces zero time columns).
+    // Predict must MIRROR the same shift instead of reconstructing a warp from the
+    // empty `beta_time`; otherwise `S(t|x)` carries no `log t` dependence and is
+    // wrong for every saved reduced-AFT model. Detected from the saved payload
+    // alone (empty time-warp β + no learned baseline timewiggle), so no new
+    // persisted flag is needed.
+    let reduced_parametric_aft =
+        saved_fit.beta_time().is_empty() && !model.has_baseline_time_wiggle();
     let time_cfg = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(age_entry, age_exit, time_cfg.clone(), None)?;
     let resolved_time_cfg = resolved_survival_time_basis_config_from_build(
@@ -1598,7 +1613,10 @@ fn predict_survival_location_scale_batch(
         &mut time_build.x_exit_time,
         &time_anchor_row,
     )?;
-    if !model.has_baseline_time_wiggle() {
+    // The reduced-AFT regime has no structural time warp (the monotone baseline
+    // rides the location channel), so the structural-basis requirement does not
+    // apply to it.
+    if !model.has_baseline_time_wiggle() && !reduced_parametric_aft {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
     let saved_inverse_link = resolve_survival_inverse_link_from_saved(model)?;
@@ -1654,8 +1672,20 @@ fn predict_survival_location_scale_batch(
         &mut eta_offset_exit,
         &mut derivative_offset_exit,
     )?;
+    if reduced_parametric_aft {
+        // The warp is removed in this regime (`h ≡ 0`); the σ-scaled log-t baseline
+        // rides the location channel via the `−log t` threshold shift applied
+        // below. Drop the time-warp design (the fit carried zero free time
+        // columns) and zero the time offsets so `h_base = 0`.
+        let zero_cols = Array2::<f64>::zeros((eval_exit.len(), 0));
+        time_build.x_entry_time = DesignMatrix::from(zero_cols.clone());
+        time_build.x_exit_time = DesignMatrix::from(zero_cols.clone());
+        time_build.x_derivative_time = DesignMatrix::from(zero_cols);
+        eta_offset_entry = Array1::<f64>::zeros(eval_entry.len());
+        eta_offset_exit = Array1::<f64>::zeros(eval_exit.len());
+        derivative_offset_exit = Array1::<f64>::zeros(eval_exit.len());
+    }
 
-    let saved_fit = saved_survival_location_scale_fit_result(model)?;
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
 
     // Build threshold + log-sigma designs from the frozen saved specs. Re-using
@@ -1753,6 +1783,23 @@ fn predict_survival_location_scale_batch(
             Array1::from_shape_fn(total_rows, |k| values[k / eval_width])
         }
     };
+    // Threshold (location) offset. In the reduced parametric-AFT regime the
+    // σ-scaled `log t` baseline rides the location channel: shift the effective
+    // location `η_t → η_t − log t` per query time so the predicted standardized
+    // residual reproduces `u = inv_sigma·(log t − η_t) = (log t − μ)/σ`, exactly
+    // as the fit's `LocationLogTimeOffset` does. `eval_exit` already carries the
+    // per-(row, time) query exit times in the same flattened layout as the
+    // expanded offsets; `−log t` uses the same `SURVIVAL_TIME_FLOOR` floor as the
+    // fit's `checked_log_survival_times` (issue #892).
+    let eta_threshold_offset = {
+        let mut offset = expand_vector(primary_offset);
+        if reduced_parametric_aft {
+            for (slot, &t) in offset.iter_mut().zip(eval_exit.iter()) {
+                *slot -= t.max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR).ln();
+            }
+        }
+        offset
+    };
     // Build the SurvivalLocationScalePredictInput once, with replicated /
     // expanded designs and offsets, regardless of `per_row_eval`.  This
     // unifies the mean-only and uncertainty paths and lets the
@@ -1764,7 +1811,7 @@ fn predict_survival_location_scale_batch(
         time_wiggle_degree,
         time_wiggle_ncols,
         x_threshold: threshold_matrix,
-        eta_threshold_offset: expand_vector(primary_offset),
+        eta_threshold_offset,
         x_log_sigma: prepared_sigma_design,
         eta_log_sigma_offset: expand_vector(noise_offset),
         x_link_wiggle: None,
@@ -1821,7 +1868,19 @@ fn predict_survival_location_scale_batch(
         let eta_ls_subject = prepared_sigma_design_view(&pred_input)
             .matrixvectormultiply(&beta_log_sigma)
             + &pred_input.eta_log_sigma_offset;
-        let eta_t = expand_vector(&eta_t_subject);
+        // This explicit-grid branch rebuilds the per-(row, time) location predictor
+        // from the per-subject `eta_t_subject` directly (bypassing
+        // `pred_input.eta_threshold_offset`), so it must apply the reduced-AFT
+        // `−log t` location shift here too — otherwise the grid path would predict a
+        // `log t`-flat surface even though the per-row path is shifted (issue #892).
+        let mut eta_t = expand_vector(&eta_t_subject);
+        if reduced_parametric_aft {
+            for (slot, &t) in eta_t.iter_mut().zip(eval_exit.iter()) {
+                *slot -= t
+                    .max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+                    .ln();
+            }
+        }
         let pred = predict_survival_location_scale_from_linear_components(
             &pred_input.x_time_exit,
             &eta_offset_exit,
@@ -1839,19 +1898,40 @@ fn predict_survival_location_scale_batch(
         (pred.eta, pred.survival_prob, None, None)
     };
 
-    let x_time_derivative = time_build
-        .x_derivative_time
-        .try_to_dense_by_chunks("survival location-scale prediction time-derivative design")?;
-    let eta_derivative_full = location_scale_eta_derivative_components(
-        &x_time_derivative,
-        &derivative_offset_exit,
-        &pred_input.x_time_exit,
-        &pred_input.eta_time_offset_exit,
-        time_wiggle_knots.as_ref(),
-        time_wiggle_degree,
-        time_wiggle_ncols,
-        &saved_fit,
-    )?;
+    let eta_derivative_full = if reduced_parametric_aft {
+        // Reduced-AFT regime: the warp is `h ≡ 0` and the location carries the
+        // `−log t` shift, so the standardized-residual time derivative is
+        // `du/dt = d/dt[inv_sigma·(log t − μ)] = inv_sigma / t` (the fit's
+        // `qdot = inv_sigma/t`). The time-warp design contributes nothing, so
+        // reconstruct `eta_derivative` directly from `inv_sigma` and the query
+        // times rather than from the (empty) time-derivative design (issue #892).
+        use crate::families::sigma_link::exp_sigma_inverse_from_eta_scalar;
+        let beta_log_sigma = saved_fit.beta_log_sigma();
+        let eta_ls = prepared_sigma_design_view(&pred_input)
+            .matrixvectormultiply(&beta_log_sigma)
+            + &pred_input.eta_log_sigma_offset;
+        let mut deriv = Array1::<f64>::zeros(eval_exit.len());
+        for (k, slot) in deriv.iter_mut().enumerate() {
+            let inv_sigma = exp_sigma_inverse_from_eta_scalar(eta_ls[k]);
+            let t = eval_exit[k].max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR);
+            *slot = inv_sigma / t;
+        }
+        deriv
+    } else {
+        let x_time_derivative = time_build
+            .x_derivative_time
+            .try_to_dense_by_chunks("survival location-scale prediction time-derivative design")?;
+        location_scale_eta_derivative_components(
+            &x_time_derivative,
+            &derivative_offset_exit,
+            &pred_input.x_time_exit,
+            &pred_input.eta_time_offset_exit,
+            time_wiggle_knots.as_ref(),
+            time_wiggle_degree,
+            time_wiggle_ncols,
+            &saved_fit,
+        )?
+    };
     let hazard_full = location_scale_hazard_from_eta_derivative(
         &eta_full,
         &eta_derivative_full,
