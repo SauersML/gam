@@ -357,6 +357,20 @@ class ManifoldSAE:
     # rank-r subspace. ``None`` when no shard (or no mass_residual) was supplied.
     # Surfaced so a too-small rank ``r`` is visible, not silent.
     fisher_mass_residual: np.ndarray | None = None
+    # Additive two-score per-atom lens (#980): for each atom, ``presence``
+    # (representational, activation-side, Fisher-free), ``coupling`` (behavioral
+    # output-Fisher mass; ``NaN`` under a Euclidean / no-harvest provenance), and
+    # ``discrepancy = presence_normalized - coupling_normalized`` (the
+    # "represented but not currently used" headline; ``NaN`` when coupling is
+    # unavailable). A pure read of the fitted model; it feeds no loss or
+    # criterion. ``None`` only for payloads predating the diagnostic.
+    atom_two_lens: dict[str, Any] | None = None
+    # Residual-gauge certificate (#980): which symmetry group the fit is
+    # identified up to. ``group_signature`` names the surviving generator
+    # families; ``generators`` lists each enumerated symmetry's pinned/unpinned
+    # verdict; ``metric_provenance`` records the inner product it was computed in.
+    # Pure read; ``None`` only for payloads predating the diagnostic.
+    residual_gauge: dict[str, Any] | None = None
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -435,6 +449,19 @@ class ManifoldSAE:
                 None
                 if payload.get("fisher_mass_residual") is None
                 else np.asarray(payload["fisher_mass_residual"], dtype=float)
+            ),
+            # Additive post-fit diagnostics (#980): the two-score per-atom lens
+            # and the residual-gauge certificate. Absent ⇒ ``None`` (payloads
+            # predating the diagnostic); present ⇒ the Rust report dict verbatim.
+            atom_two_lens=(
+                None
+                if payload.get("atom_two_lens") is None
+                else dict(payload["atom_two_lens"])
+            ),
+            residual_gauge=(
+                None
+                if payload.get("residual_gauge") is None
+                else dict(payload["residual_gauge"])
             ),
         )
 
