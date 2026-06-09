@@ -806,6 +806,42 @@ pub fn fit_penalized_multinomial_formula(
         // solely by their own REML-selected `λ`.
         ridge_policy: crate::types::RidgePolicy::solver_only(),
         use_outer_hessian,
+        // #715 real-data arm ("canonical-gauge null direction rejects all REML
+        // seeds"): skip the multi-seed outer screening cascade and let the
+        // pinned `init_lambda` ρ flow straight to the outer optimizer.
+        //
+        // The multinomial family declares `levenberg_on_ill_conditioning() ->
+        // true`: near the simplex boundary (the near-separable penguins regime)
+        // the softmax Fisher weight `W = diag(p) − p pᵀ → 0`, so the joint
+        // information `H = JᵀWJ + S_λ` is full rank (the always-on
+        // Jeffreys/Firth term supplies O(1) curvature on any separating
+        // direction) but ILL-CONDITIONED, and the self-vanishing LM damping that
+        // keeps the inner joint-Newton from oscillating on those near-singular
+        // modes converges only GEOMETRICALLY. The default screening policy ranks
+        // candidate seeds with a 2-cycle inner cap (`outer_seed_config`); under
+        // geometric LM-damped descent two cycles never reach a finite,
+        // meaningful proxy objective, so EVERY capped seed collapses to
+        // non-finite cost and the cascade escalates to ×4, ×16, then an UNCAPPED
+        // full inner solve PER SEED on the near-singular Hessian — every one of
+        // those rejected, which is the adapter-level face of "all REML startup
+        // seeds rejected" (and the multi-minute timeout). This is the identical
+        // pathology the survival parametric-AFT path documents at the
+        // `screen_initial_rho` field: a flat REML ridge where capped proxy fits
+        // collapse and the cascade drives a full inner solve per seed.
+        //
+        // The pinned seed is already principled here: `init_lambda` gives every
+        // (class, term) ρ a sensible moderate warm start, the per-term effective-
+        // df-floor upper bounds (`effective_df_floor_rho_upper_bounds`, #715
+        // arm (a)) keep any λ from collapsing the smooth onto its polynomial null
+        // space, and the always-on Jeffreys/Firth prior bounds any separating
+        // direction. So the outer ARC/BFGS optimizer performs the real REML ρ
+        // search from this seed and converges to the same penalized optimum the
+        // screening cascade would have started near — screening only adds the
+        // cascade cost (and, on the near-separable arm, the rejection stall). The
+        // converged β / selected λ / KKT certificate are unchanged, so the
+        // truth-recovery and match-or-beat bars are evaluated against the same
+        // optimum and never weakened.
+        screen_initial_rho: false,
         ..BlockwiseFitOptions::default()
     };
     let fit =
