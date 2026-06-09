@@ -487,7 +487,11 @@ emit("ang_rss", ang_rss)
     // gam vs the ANALYTIC arc length the test built itself — this is the PRIMARY
     // ground-truth comparison (metric A), independent of any external tool.
     let dist_vs_analytic = max_abs_diff(&gam_dist, &analytic_dist);
-    debug_assert!((dist_vs_analytic - max_dist_vs_analytic).abs() < 1e-300);
+    assert!(
+        (dist_vs_analytic - max_dist_vs_analytic).abs() < 1e-300,
+        "per-pair and aggregate gam-vs-analytic distance error must agree: \
+         {dist_vs_analytic:.3e} vs {max_dist_vs_analytic:.3e}"
+    );
 
     // Cross-witness that the cut-locus disagreement lives in geomstats' PROJECTOR
     // `metric.dist`, not in the angle spectrum: geomstats' OWN arc-length
