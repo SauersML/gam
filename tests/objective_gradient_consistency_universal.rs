@@ -1111,7 +1111,8 @@ fn assert_survival_consistent(
         rp[i] += FD_STEP;
         let mut rm = rho.clone();
         rm[i] -= FD_STEP;
-        fd[i] = (survival_cost(model, beta0, &rp) - survival_cost(model, beta0, &rm)) / (2.0 * FD_STEP);
+        fd[i] =
+            (survival_cost(model, beta0, &rp) - survival_cost(model, beta0, &rm)) / (2.0 * FD_STEP);
     }
     assert!(
         analytic.iter().all(|v| v.is_finite()) && fd.iter().all(|v| v.is_finite()),
@@ -1168,13 +1169,7 @@ fn survival_objective_gradient_consistent_at_large_lambda_boundary() {
         Array1::from(vec![6.0_f64]),
         Array1::from(vec![8.0_f64]),
     ] {
-        assert_survival_consistent(
-            "boundary/large-lambda",
-            &model,
-            &beta0,
-            &rho,
-            TOL_BOUNDARY,
-        );
+        assert_survival_consistent("boundary/large-lambda", &model, &beta0, &rho, TOL_BOUNDARY);
     }
 }
 

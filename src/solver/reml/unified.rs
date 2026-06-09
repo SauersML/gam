@@ -1315,21 +1315,6 @@ impl GuardedCorrection {
         }
     }
 
-    /// Apply BOTH contributions through one call: under the single `include`
-    /// guard, add `value` to `cost` AND `gradient` to the leading
-    /// `gradient.len()` entries of `rho_grad`. When `include` is `false`, this
-    /// is a no-op for both — the can't-desync invariant.
-    ///
-    /// Used directly where the cost and gradient are both in hand. When the
-    /// evaluator must commit the cost before the gradient exists (the
-    /// `EvalMode::ValueOnly` early return), use [`Self::apply_value`] +
-    /// [`Self::apply_gradient`]: both read `self.include` from the SAME object,
-    /// so the guard is still single-sourced and the two sides cannot drift.
-    pub(crate) fn apply(&self, cost: &mut f64, rho_grad: &mut Array1<f64>) {
-        self.apply_value(cost);
-        self.apply_gradient(rho_grad);
-    }
-
     /// Apply the VALUE contribution to `cost` under the single `include` guard.
     pub(crate) fn apply_value(&self, cost: &mut f64) {
         if self.include {
@@ -17420,8 +17405,9 @@ mod tests {
     // half-applied (the objective↔gradient desync class behind #752/#748/#808
     // and the latent Tierney–Kadane correction desync). With `include = false`
     // NEITHER the cost nor the ρ-gradient moves; with `include = true` BOTH do —
-    // and `apply_value` + `apply_gradient` (the split the evaluator uses across
-    // the value-only early return) read the SAME guard from the SAME object.
+    // and because `apply_value` + `apply_gradient` (the split the evaluator
+    // uses across the value-only early return) read the SAME guard from the
+    // SAME object, the two sides cannot drift.
     #[test]
     fn guarded_correction_include_false_applies_neither() {
         let value = 3.5_f64;
@@ -17429,18 +17415,8 @@ mod tests {
         let correction =
             GuardedCorrection::new(value, Some(gradient.clone()), /* include = */ false);
 
-        // Combined apply: cost and gradient must both be untouched.
-        let mut cost = 10.0;
-        let mut grad = array![0.0, 0.0, 0.0];
-        correction.apply(&mut cost, &mut grad);
-        assert_eq!(cost, 10.0, "include=false must not move the cost");
-        assert_eq!(
-            grad,
-            array![0.0, 0.0, 0.0],
-            "include=false must not move the ρ-gradient"
-        );
-
-        // Split apply (the value-only-early-return path): same no-op guarantee.
+        // Split apply (the value-only-early-return path): no-op guarantee on
+        // both sides under the single `include = false` guard.
         let mut cost_split = 10.0;
         let mut grad_split = array![0.0, 0.0, 0.0];
         correction.apply_value(&mut cost_split);
@@ -17460,18 +17436,9 @@ mod tests {
         let correction =
             GuardedCorrection::new(value, Some(gradient.clone()), /* include = */ true);
 
-        // Combined apply: BOTH the cost and the ρ-gradient must move.
-        let mut cost = 10.0;
-        let mut grad = array![0.0, 0.0, 0.0];
-        correction.apply(&mut cost, &mut grad);
-        assert_eq!(cost, 13.5, "include=true must add the value to cost");
-        assert_eq!(
-            grad, gradient,
-            "include=true must add the gradient to the ρ-gradient"
-        );
-
-        // Split apply must agree with the combined apply, and the gradient is
-        // added only to the LEADING entries (extra ρ-coordinates untouched).
+        // Split apply: both sides must move under the single `include = true`
+        // guard, and the gradient is added only to the LEADING entries (extra
+        // ρ-coordinates untouched).
         let mut cost_split = 10.0;
         let mut grad_split = array![0.0, 0.0, 0.0, 42.0];
         correction.apply_value(&mut cost_split);

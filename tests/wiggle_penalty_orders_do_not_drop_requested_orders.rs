@@ -1,5 +1,6 @@
-use gam::families::gamlss::{
-    WiggleBlockConfig, buildwiggle_block_input_from_seed, split_wiggle_penalty_orders,
+use gam::families::wiggle::{
+    WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
+    split_wiggle_penalty_orders,
 };
 use ndarray::array;
 
@@ -22,7 +23,7 @@ fn wiggle_penalty_orders_requested_by_spec_are_not_silently_dropped() {
         .expect("setup must build wiggle block");
 
     let baseline_penalty_count = block.penalties.len();
-    gam::families::gamlss::append_selected_wiggle_penalty_orders(&mut block, &extras)
+    append_selected_wiggle_penalty_orders(&mut block, &extras)
         .expect("appending selected wiggle penalties must succeed");
 
     let appended_count = block.penalties.len() - baseline_penalty_count;

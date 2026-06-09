@@ -2467,7 +2467,12 @@ impl WorkingModelSurvival {
         // Set λ = exp(ρ) on the active blocks (block order), leaving inactive
         // (λ = 0) blocks untouched, then re-converge the inner mode.
         let mut candidate = self.clone();
-        let mut lambdas: Vec<f64> = candidate.penalties.blocks.iter().map(|b| b.lambda).collect();
+        let mut lambdas: Vec<f64> = candidate
+            .penalties
+            .blocks
+            .iter()
+            .map(|b| b.lambda)
+            .collect();
         let mut active_idx = 0usize;
         for (block, lambda) in candidate.penalties.blocks.iter().zip(lambdas.iter_mut()) {
             if block.lambda > 0.0 {
