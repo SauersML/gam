@@ -3856,4 +3856,71 @@ mod tests {
             compiled_q0.drops_by_block,
         );
     }
+
+    #[test]
+    fn compiled_map_from_per_term_partitions_and_lift_round_trip() {
+        // Build a per-term compile by hand: time has one term (raw 2, kept 2),
+        // marginal one term (raw 2, kept 1 — a drop), logslope one term
+        // (raw 1, kept 1). No required channel is fully collapsed.
+        let v_time = Array2::<f64>::eye(2);
+        let mut v_marg = Array2::<f64>::zeros((2, 1));
+        v_marg[[0, 0]] = 1.0;
+        v_marg[[1, 0]] = 0.5;
+        let v_log = Array2::<f64>::eye(1);
+        // R for the marginal block (anchor = time, raw width 2) and logslope
+        // block (anchors = time + marginal, raw width 2 + 2 = 4).
+        let r_marg = Array2::<f64>::from_shape_fn((2, 1), |(i, _)| 0.25 + i as f64);
+        let r_log = Array2::<f64>::from_shape_fn((4, 1), |(i, _)| 0.1 * (i as f64 + 1.0));
+        let per_term = SurvivalParametricCompiledPerTerm {
+            v_time_per_term: vec![v_time.clone()],
+            v_marginal_per_term: vec![v_marg.clone()],
+            v_logslope_per_term: vec![v_log.clone()],
+            r_lw_per_term: vec![None, Some(r_marg.clone()), Some(r_log.clone())],
+            drops_by_block: (0, 1, 0),
+        };
+
+        let map = compiled_map_from_per_term(&per_term);
+
+        // Raw block ranges: time 0..2, marginal 2..4, logslope 4..5.
+        assert_eq!(map.raw_block_ranges, vec![0..2, 2..4, 4..5]);
+        // Compiled block ranges: time 0..2, marginal 2..3, logslope 3..4.
+        assert_eq!(map.compiled_block_ranges, vec![0..2, 2..3, 3..4]);
+        assert_eq!(map.raw_from_compiled.dim(), (5, 4));
+
+        // The block-diagonal slices recovered by apply_compiled_map_to_designs
+        // must equal the per-term V's exactly.
+        let v_time_slice = map.raw_from_compiled.slice(ndarray::s![0..2, 0..2]).to_owned();
+        let v_marg_slice = map.raw_from_compiled.slice(ndarray::s![2..4, 2..3]).to_owned();
+        let v_log_slice = map.raw_from_compiled.slice(ndarray::s![4..5, 3..4]).to_owned();
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!((v_time_slice[[i, j]] - v_time[[i, j]]).abs() < 1e-14);
+            }
+            assert!((v_marg_slice[[i, 0]] - v_marg[[i, 0]]).abs() < 1e-14);
+        }
+        assert!((v_log_slice[[0, 0]] - v_log[[0, 0]]).abs() < 1e-14);
+
+        // The cross-block carry (-R) must sit in the strict upper triangle, so
+        // the map agrees with the lift assembled directly from V and R.
+        let ordering = [
+            crate::families::identifiability_compiler::BlockOrder::Time,
+            crate::families::identifiability_compiler::BlockOrder::Marginal,
+            crate::families::identifiability_compiler::BlockOrder::Logslope,
+        ];
+        let lift_from_map = SmgsLiftViaT::from_compiled_map(&map, &ordering);
+        let v_all = vec![v_time, v_marg, v_log];
+        let lift_direct =
+            SmgsLiftViaT::from_v_and_r(&v_all, &[None, Some(r_marg), Some(r_log)]);
+        assert_eq!(lift_from_map.t_full.dim(), lift_direct.t_full.dim());
+        for i in 0..lift_from_map.t_full.nrows() {
+            for j in 0..lift_from_map.t_full.ncols() {
+                assert!(
+                    (lift_from_map.t_full[[i, j]] - lift_direct.t_full[[i, j]]).abs() < 1e-14,
+                    "T mismatch at ({i},{j}): map={} direct={}",
+                    lift_from_map.t_full[[i, j]],
+                    lift_direct.t_full[[i, j]],
+                );
+            }
+        }
+    }
 }
