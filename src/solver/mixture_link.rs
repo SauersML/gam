@@ -965,6 +965,17 @@ impl InverseLinkKernel for LinkFunction {
                 d3: 0.0,
             }),
             LinkFunction::Log => {
+                // SOLVER-INTERNAL inverse-link jet: `η.clamp(−700, 700).exp()`.
+                // The clamp is an intentional conditioning hack so the IRLS/REML
+                // normal equations stay well posed when η wanders into the tails
+                // during a trust-region step — it is NOT the public response
+                // transform. Public response-scale outputs (predictions, FFI
+                // `apply_inverse_link_array`, posterior bands) must use the EXACT
+                // `exp(η)` in `families::inverse_link::apply_inverse_link_vec`,
+                // which is finite wherever representable. Do not reroute a public
+                // output through this clamped jet (issue #963). Keep the clamp:
+                // solver consumers (e.g. `reml/runtime.rs` trust-region `excess`)
+                // pass raw η and rely on it to keep μ finite.
                 let e = eta.clamp(-700.0, 700.0).exp();
                 Ok(InverseLinkJet {
                     mu: e,
@@ -1109,6 +1120,10 @@ fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), Estim
     match link {
         LinkFunction::Identity => Ok((eta, 1.0)),
         LinkFunction::Log => {
+            // SOLVER-INTERNAL clamped `(μ, dμ/dη)`; see the matching note on the
+            // full `LinkFunction::Log` jet above. Public response transforms use
+            // exact `exp(η)` via `families::inverse_link::apply_inverse_link_vec`
+            // (issue #963).
             let e = eta.clamp(-700.0, 700.0).exp();
             Ok((e, e))
         }
