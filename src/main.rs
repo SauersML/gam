@@ -2555,6 +2555,37 @@ fn report_offset_for(
     )
 }
 
+/// Dispersion φ to feed the geometry-based ALO path for a saved model.
+///
+/// The PIRLS-backed ALO path (`compute_alo_diagnostics_from_pirls`) keys φ on
+/// the link: Identity (Gaussian) gets the estimated dispersion `RSS/(n−edf)`,
+/// every other link gets 1.0. The saved-model geometry path was instead
+/// hard-coding φ = 1.0, so for any Gaussian fit `diagnose --alo` / `report`
+/// reported `se_bayes` / `se_sandwich` wrong by exactly `√φ̂` relative to the
+/// refit fallback path — the two ALO routes disagreed on the SE scale for the
+/// same model. The model already stores its converged dispersion as the
+/// residual standard deviation `σ̂` (`UnifiedFitResult::standard_deviation`,
+/// set to `√(weighted_rss / (n−edf))` for Gaussian), so φ̂ = σ̂² reproduces the
+/// PIRLS formula exactly and keeps the geometry and refit SE columns identical.
+fn geometry_alo_phi(unified: &UnifiedFitResult, link: LinkFunction) -> f64 {
+    match link {
+        LinkFunction::Identity => {
+            let sigma = unified.standard_deviation;
+            if sigma.is_finite() && sigma > 0.0 {
+                sigma * sigma
+            } else {
+                1.0
+            }
+        }
+        LinkFunction::Log
+        | LinkFunction::Logit
+        | LinkFunction::Probit
+        | LinkFunction::CLogLog
+        | LinkFunction::Sas
+        | LinkFunction::BetaLogistic => 1.0,
+    }
+}
+
 fn resolve_predict_offsets(
     model: &SavedModel,
     data: &Dataset,
@@ -3961,7 +3992,10 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
     let (offset, _noise_offset) = report_offset_for(&model, &ds, &col_map)?;
 
     // Try geometry-based ALO from the unified result first (avoids refit).
-    let alo = if let Some(geom) = model.unified().and_then(|u| u.geometry.as_ref()) {
+    let alo = if let Some((unified, geom)) = model
+        .unified()
+        .and_then(|u| u.geometry.as_ref().map(|g| (u, g)))
+    {
         progress.set_stage("diagnose", "computing alo from saved geometry");
         let fit_saved = fit_result_from_saved_model_for_prediction(&model)?;
         // ALO's `from_geometry` expects the *full* linear predictor (offset
@@ -3975,8 +4009,12 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
         // matrix-vector products"), which broke `diagnose --alo` for every
         // matern/duchon/sphere fit since those default to lazy storage.
         let alo_design_dense = design.design.to_dense();
+        // φ must match the PIRLS-backed refit fallback: Gaussian (Identity) uses
+        // the model's estimated dispersion σ̂², not a hard-coded 1.0 (#881-class
+        // SE-scale bug). `geometry_alo_phi` reads the saved σ̂.
+        let phi = geometry_alo_phi(unified, link);
         let input =
-            gam::alo::AloInput::from_geometry(geom, &alo_design_dense, &eta, &offset, link, 1.0);
+            gam::alo::AloInput::from_geometry(geom, &alo_design_dense, &eta, &offset, link, phi);
         progress.advance_workflow(4);
         gam::alo::compute_alo_from_input(&input)
             .map_err(|e| format!("compute_alo_from_input (geometry path) failed: {e}"))?
@@ -6658,13 +6696,17 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
                             report_offset_for(&model, &ds, &col_map)?;
                         let eta = &design.design.dot(&fit.beta) + &report_offset;
                         let dense_alo_design = design.design.to_dense();
+                        // φ must match the PIRLS-backed refit fallback: Gaussian
+                        // (Identity) uses σ̂², not a hard-coded 1.0, or the
+                        // reported ALO SEs are off by √φ̂ (#881-class).
+                        let phi = geometry_alo_phi(unified, link);
                         gam::alo::compute_alo_diagnostics_from_unified(
                             unified,
                             &dense_alo_design,
                             &eta,
                             &report_offset,
                             link,
-                            1.0,
+                            phi,
                         )
                     } else {
                         compute_alo_diagnostics_from_fit(&fit, y.view(), link)
