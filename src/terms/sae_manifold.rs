@@ -2935,6 +2935,24 @@ impl SaeRowLayout {
     }
 }
 
+/// The additive post-fit diagnostics for a fitted [`SaeManifoldTerm`]: the
+/// two-score per-atom lens and the residual-gauge certificate.
+///
+/// Built by [`SaeManifoldTerm::fit_diagnostics_report`]. Both reports are pure
+/// reads of the fitted term + its single per-row metric; nothing here feeds back
+/// into any loss, criterion, penalty, or optimizer state. Under a Euclidean /
+/// no-harvest provenance the lens coupling degrades to `None` and the gauge is
+/// certified under Euclidean provenance — never an error, never flag-gated.
+#[derive(Clone, Debug)]
+pub struct SaeManifoldFitDiagnostics {
+    /// Per-atom presence / behavioral coupling / discrepancy
+    /// ([`crate::inference::atom_lens::atom_two_lens`]).
+    pub atom_two_lens: crate::inference::atom_lens::AtomTwoLensReport,
+    /// Residual-gauge certificate: which symmetry group the fit is identified up
+    /// to ([`crate::sae_identifiability::residual_gauge`]).
+    pub residual_gauge: crate::sae_identifiability::ResidualGaugeReport,
+}
+
 /// Full SAE-manifold term.
 #[derive(Debug, Clone)]
 pub struct SaeManifoldTerm {
@@ -3064,6 +3082,229 @@ impl SaeManifoldTerm {
     /// Object 4 (to read the [`MetricProvenance`](crate::inference::row_metric::MetricProvenance)).
     pub fn row_metric(&self) -> Option<&crate::inference::row_metric::RowMetric> {
         self.row_metric.as_ref()
+    }
+
+    /// The per-row inner product the additive diagnostics read through: the
+    /// installed [`RowMetric`](crate::inference::row_metric::RowMetric) when one
+    /// was set (output-Fisher harvest present), otherwise a freshly-built
+    /// Euclidean metric of the term's own `(n_obs, output_dim)` shape. Either way
+    /// a metric always exists, so the diagnostics are never gated by a flag — the
+    /// Euclidean fallback is the bit-identical isotropic path.
+    fn diagnostic_metric(&self) -> Result<crate::inference::row_metric::RowMetric, String> {
+        match self.row_metric() {
+            Some(metric) => Ok(metric.clone()),
+            None => crate::inference::row_metric::RowMetric::euclidean(
+                self.n_obs(),
+                self.output_dim(),
+            ),
+        }
+    }
+
+    /// Build the additive post-fit diagnostic report for this fitted term: the
+    /// two-score per-atom [`AtomTwoLensReport`](crate::inference::atom_lens::AtomTwoLensReport)
+    /// (presence / behavioral coupling / discrepancy) and the residual-gauge
+    /// [`ResidualGaugeReport`](crate::sae_identifiability::ResidualGaugeReport)
+    /// certificate.
+    ///
+    /// Both reports are read through the same single metric
+    /// ([`Self::diagnostic_metric`]): under a Euclidean / no-harvest provenance
+    /// the lens coupling is `None` and the gauge is certified under Euclidean
+    /// provenance — never an error, never gated by a flag (magic-by-default,
+    /// mirroring the metric selection itself).
+    ///
+    /// `per_atom_ard_variances`, when supplied, is one ARD variance vector per
+    /// atom (length = `latent_dim_k`), threaded into the certificate's
+    /// equal-ARD-rotation detection. `None` (or a per-atom `None`) ⇒ no ARD prior
+    /// on that atom. `isometry_pin_active` records whether an isometry gauge
+    /// penalty was installed on the fit: `false` escalates the certificate to the
+    /// `diffeomorphism-unpinned` verdict (the honest "no metric pin" statement),
+    /// exactly as the certificate's own escalation flag specifies.
+    ///
+    /// Pure read: it never mutates the term, never touches a loss / criterion /
+    /// penalty / optimizer state.
+    pub fn fit_diagnostics_report(
+        &self,
+        per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
+        isometry_pin_active: bool,
+    ) -> Result<SaeManifoldFitDiagnostics, String> {
+        let metric = self.diagnostic_metric()?;
+        let atom_two_lens = crate::inference::atom_lens::atom_two_lens(self, &metric);
+
+        let certificate_model =
+            self.to_residual_gauge_model(metric, per_atom_ard_variances, isometry_pin_active)?;
+        let residual_gauge = crate::sae_identifiability::residual_gauge(&certificate_model)?;
+
+        Ok(SaeManifoldFitDiagnostics {
+            atom_two_lens,
+            residual_gauge,
+        })
+    }
+
+    /// Lower this fitted term into the self-contained
+    /// [`FittedSaeManifold`](crate::sae_identifiability::FittedSaeManifold) the
+    /// residual-gauge certificate consumes.
+    ///
+    /// The certificate's parameter space is the per-atom decoder **frame** — the
+    /// `(output_dim, latent_dim)` image of the atom's latent axes in output space.
+    /// We realise it as the active-mass-weighted mean decoder tangent
+    /// `frame_k[:, a] = (Σ_n a_{nk} · ∂g_k/∂t_a(n)) / Σ_n a_{nk}` over the atom's
+    /// active rows (the centroid decoder Jacobian columns the certificate docs
+    /// name). The per-row pinning Jacobian block `J_n ∈ ℝ^{p × param_dim}` is the
+    /// assignment-weighted per-row decoder tangent placed at each atom's frame
+    /// slot: column `(k, i, a)` of `J_n` is `a_{nk} · ∂g_k/∂t_a(n)[i]` — exactly
+    /// the directions the reconstruction data gives cost to, in the same metric
+    /// the fit used (whitened by the certificate through `RowMetric`).
+    ///
+    /// The flattened frame layout matches the certificate's
+    /// `vec(frame_0) ⊕ vec(frame_1) ⊕ …`, row-major within each frame
+    /// (`frame_k[i, a]` at offset `atom_offset(k) + i·latent_dim_k + a`).
+    fn to_residual_gauge_model(
+        &self,
+        metric: crate::inference::row_metric::RowMetric,
+        per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
+        isometry_pin_active: bool,
+    ) -> Result<crate::sae_identifiability::FittedSaeManifold, String> {
+        use crate::sae_identifiability::{AtomTopology, FittedAtom, FittedSaeManifold};
+
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k = self.k_atoms();
+        let assignments = self.assignment.assignments();
+
+        // Per-atom frame `(p, d)` = active-mass-weighted mean decoder tangent,
+        // and the flattened-frame column offset bookkeeping for the joint
+        // parameter vector (`vec(frame_0) ⊕ …`, row-major within each frame).
+        let mut fitted_atoms: Vec<FittedAtom> = Vec::with_capacity(k);
+        let mut atom_offsets: Vec<usize> = Vec::with_capacity(k);
+        let mut atom_axis_dim: Vec<usize> = Vec::with_capacity(k);
+        let mut cursor = 0usize;
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let d = atom.latent_dim;
+            let topology = match (&atom.basis_kind, d) {
+                (SaeAtomBasisKind::Periodic, 1) | (SaeAtomBasisKind::Torus, 1) => {
+                    AtomTopology::Circle
+                }
+                (SaeAtomBasisKind::Periodic, _) | (SaeAtomBasisKind::Torus, _) => {
+                    AtomTopology::Torus { latent_dim: d }
+                }
+                (SaeAtomBasisKind::Sphere, _) => AtomTopology::Sphere,
+                (
+                    SaeAtomBasisKind::Duchon
+                    | SaeAtomBasisKind::EuclideanPatch
+                    | SaeAtomBasisKind::Precomputed(_),
+                    _,
+                ) => AtomTopology::EuclideanPatch { latent_dim: d },
+            };
+
+            let mut frame = Array2::<f64>::zeros((p, d));
+            let mut active_mass = 0.0_f64;
+            let mut tangent = vec![0.0_f64; p];
+            for row in 0..n {
+                let a_nk = assignments[[row, atom_idx]];
+                if !(a_nk > 0.0) {
+                    continue;
+                }
+                active_mass += a_nk;
+                for axis in 0..d {
+                    atom.fill_decoded_derivative_row(row, axis, &mut tangent);
+                    for i in 0..p {
+                        frame[[i, axis]] += a_nk * tangent[i];
+                    }
+                }
+            }
+            if active_mass > 0.0 {
+                let inv = 1.0 / active_mass;
+                frame.mapv_inplace(|v| v * inv);
+            }
+
+            let ard_variances = per_atom_ard_variances
+                .and_then(|all| all.get(atom_idx))
+                .and_then(|opt| opt.clone())
+                .filter(|v| v.len() == d);
+
+            fitted_atoms.push(FittedAtom {
+                name: atom.name.clone(),
+                topology,
+                frame,
+                ard_variances,
+            });
+            atom_offsets.push(cursor);
+            atom_axis_dim.push(d);
+            cursor += p * d;
+        }
+        let param_dim = cursor;
+
+        // Per-row pinning Jacobian `J_n ∈ ℝ^{p × param_dim}` flattened row-major
+        // (`J_n[i, c] = jacobian_rows[n][i · param_dim + c]`). Column `(k, i', a)`
+        // of `J_n` is `a_{nk} · ∂g_k/∂t_a(n)[i']` placed at the atom-k frame slot
+        // and read out on output coordinate `i = i'` (a frame perturbation of
+        // output `i'` moves only the row's output coordinate `i'`).
+        let mut jacobian_rows: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut tangent = vec![0.0_f64; p];
+        for row in 0..n {
+            let mut j_flat = vec![0.0_f64; p * param_dim];
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let a_nk = assignments[[row, atom_idx]];
+                if !(a_nk > 0.0) {
+                    continue;
+                }
+                let d = atom_axis_dim[atom_idx];
+                let base = atom_offsets[atom_idx];
+                for axis in 0..d {
+                    atom.fill_decoded_derivative_row(row, axis, &mut tangent);
+                    for i in 0..p {
+                        // Frame coordinate `(k, i, axis)` sits at column
+                        // `base + i·d + axis`; it sources output coordinate `i`.
+                        j_flat[i * param_dim + base + i * d + axis] += a_nk * tangent[i];
+                    }
+                }
+            }
+            jacobian_rows.push(j_flat);
+        }
+
+        // Isometry-penalty curvature root over the frame parameter space. When
+        // the isometry gauge pin is active it gives curvature along every fitted
+        // frame direction (it resists deviation of the decoder image from its
+        // arc-length parameterization), so its row space is the span of the
+        // per-atom frame columns: one root row per `(k, axis)` carrying that
+        // atom's frame column at the atom's frame slot. Empty (`0 × param_dim`)
+        // when the pin is inactive — exactly the certificate's escalation
+        // condition to `diffeomorphism-unpinned`.
+        let isometry_penalty_root = if isometry_pin_active && param_dim > 0 {
+            let mut root_rows: Vec<Array1<f64>> = Vec::new();
+            for (atom_idx, fitted) in fitted_atoms.iter().enumerate() {
+                let d = atom_axis_dim[atom_idx];
+                let base = atom_offsets[atom_idx];
+                for axis in 0..d {
+                    let mut r = Array1::<f64>::zeros(param_dim);
+                    let mut any = false;
+                    for i in 0..p {
+                        let v = fitted.frame[[i, axis]];
+                        if v != 0.0 {
+                            any = true;
+                        }
+                        r[base + i * d + axis] = v;
+                    }
+                    if any {
+                        root_rows.push(r);
+                    }
+                }
+            }
+            let mut root = Array2::<f64>::zeros((root_rows.len(), param_dim));
+            for (ri, r) in root_rows.iter().enumerate() {
+                root.row_mut(ri).assign(r);
+            }
+            root
+        } else {
+            Array2::<f64>::zeros((0, param_dim))
+        };
+
+        Ok(FittedSaeManifold {
+            atoms: fitted_atoms,
+            jacobian_rows,
+            isometry_penalty_root,
+            metric,
+        })
     }
 
     pub fn set_temperature_schedule(
@@ -6676,6 +6917,54 @@ impl SaeManifoldTerm {
         Ok(delta)
     }
 
+    /// Row visitation order for the discovery/seeding pass, drawn from the
+    /// per-row Fisher-mass enrichment measure (#980, role (c)).
+    ///
+    /// Builds [`RowMeasure::from_metric`](crate::inference::row_measure::RowMeasure::from_metric)
+    /// from the term's installed [`RowMetric`] (Euclidean fallback when none is
+    /// installed), draws a length-`n` systematic-resampling
+    /// [`enrichment_order`](crate::inference::row_measure::RowMeasure::enrichment_order),
+    /// and reduces it to a first-seen unique permutation. Behaviorally-live rows
+    /// (high Fisher mass) appear earliest; any row the measure never named is
+    /// appended in index order so **every** row is still visited exactly once.
+    ///
+    /// Under a Euclidean / no-harvest metric the measure is exactly uniform, the
+    /// systematic-resampling draw is an even round-robin, and the first-seen
+    /// reduction is the plain `0..n` index order — bit-for-bit today's behavior.
+    ///
+    /// Pure attention: the order is consumed only to decide *which row is looked
+    /// at first*; each visited row runs the identical unmodified per-row
+    /// objective, so this touches no loss / criterion / penalty.
+    fn enrichment_visit_order(&self) -> Vec<usize> {
+        let n = self.n_obs();
+        let metric = match self.diagnostic_metric() {
+            Ok(m) => m,
+            // A metric build failure cannot occur for the term's own validated
+            // shape, but degrade to the plain index sweep rather than propagate:
+            // the order is attention-only and must never gate the seed.
+            Err(_) => return (0..n).collect(),
+        };
+        let measure = crate::inference::row_measure::RowMeasure::from_metric(&metric);
+        // Seed the deterministic systematic-resampling draw from the row count so
+        // the ordering is reproducible across runs (no clock randomness).
+        let drawn = measure.enrichment_order(n, n as u64);
+        let mut order = Vec::with_capacity(n);
+        let mut seen = vec![false; n];
+        for row in drawn {
+            if row < n && !seen[row] {
+                seen[row] = true;
+                order.push(row);
+            }
+        }
+        // Append any row the enrichment draw never named so every row is seeded.
+        for (row, &was_seen) in seen.iter().enumerate() {
+            if !was_seen {
+                order.push(row);
+            }
+        }
+        order
+    }
+
     /// Globally seed every atom's per-row latent coordinate by projecting each
     /// target row onto that atom's **frozen** decoder image manifold.
     ///
@@ -6711,6 +7000,18 @@ impl SaeManifoldTerm {
                 target.dim()
             ));
         }
+        // ENRICHMENT (#980, role (c)): the order in which this discovery/seeding
+        // pass *visits* rows is drawn from the per-row Fisher-mass sampling
+        // measure when an output-Fisher harvest is present, so behaviorally-live
+        // rows get attention FIRST. This is attention-only: every visited row
+        // runs the identical, unmodified per-row argmin projection objective
+        // below — the measure reweights *which row is looked at first*, never the
+        // loss. Under a Euclidean / no-harvest metric the measure is exactly
+        // uniform, so the order degrades to the plain `0..n` index sweep and the
+        // result is bit-for-bit today's behavior. Because each row's seed is
+        // computed independently and written exactly once, the visitation order
+        // cannot change any seed value — confirming the attention-only invariant.
+        let visit_order = self.enrichment_visit_order();
         for atom_idx in 0..self.k_atoms() {
             let d = self.atoms[atom_idx].latent_dim;
             let Some(grid) = self.atoms[atom_idx]
@@ -6742,9 +7043,12 @@ impl SaeManifoldTerm {
                 ));
             }
             let decoded = phi_grid.dot(&self.atoms[atom_idx].decoder_coefficients);
-            // Per-row global argmin of ‖x_i − decoded_g‖² over the grid.
+            // Per-row global argmin of ‖x_i − decoded_g‖² over the grid. Rows are
+            // *visited* in the enrichment order (live rows first); the projection
+            // objective for each row is unchanged, and each row is seeded exactly
+            // once, so the order is pure attention and cannot move any seed.
             let mut seeded = Array2::<f64>::zeros((n, d));
-            for row in 0..n {
+            for &row in &visit_order {
                 let mut best_idx = 0usize;
                 let mut best_err = f64::INFINITY;
                 for grid_idx in 0..g {

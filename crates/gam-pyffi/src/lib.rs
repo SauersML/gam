@@ -9560,6 +9560,16 @@ fn sae_manifold_fit_inner<'py>(
     let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard);
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
+    // Whether an isometry gauge penalty is installed on this fit. Read here,
+    // before the registry is moved into the objective, and threaded into the
+    // residual-gauge certificate below: an inactive isometry pin escalates the
+    // certificate to the `diffeomorphism-unpinned` verdict.
+    let isometry_pin_active = registry.penalties.iter().any(|p| {
+        matches!(
+            p,
+            gam::terms::analytic_penalties::AnalyticPenaltyKind::Isometry(_)
+        )
+    });
     // Route every problem size through the full-batch objective on the owned
     // `target`: the inner Arrow-Schur fit materializes the `(N × M_total)`
     // basis, `(N × M_total × d)` jacobian, and `(N × K)` logit buffers in full,
@@ -9590,6 +9600,29 @@ fn sae_manifold_fit_inner<'py>(
         .decoder_shape_uncertainty()
         .map_err(py_value_error)?;
     let (term, rho, loss) = objective.into_fitted();
+
+    // Additive post-fit diagnostics (#980): the two-score per-atom lens
+    // (presence / behavioral coupling / discrepancy) and the residual-gauge
+    // certificate. Both read the fitted term + its single per-row metric; under a
+    // Euclidean / no-harvest provenance the lens coupling is `None` and the gauge
+    // is certified under Euclidean provenance — never an error, never flag-gated.
+    // Per-atom ARD variances (∝ exp(−log_precision); equality-preserving for the
+    // certificate's equal-ARD-rotation detection) are threaded in when native ARD
+    // was enabled, else `None` per atom.
+    let ard_variances: Vec<Option<Array1<f64>>> = rho
+        .log_ard
+        .iter()
+        .map(|log_prec| {
+            if log_prec.is_empty() {
+                None
+            } else {
+                Some(log_prec.mapv(|lp| (-lp).exp()))
+            }
+        })
+        .collect();
+    let fit_diagnostics = term
+        .fit_diagnostics_report(Some(&ard_variances), isometry_pin_active)
+        .map_err(py_value_error)?;
 
     let mut assignments = term.assignment.assignments();
     let mut fitted = term.fitted();
@@ -9752,7 +9785,94 @@ fn sae_manifold_fit_inner<'py>(
     if let Some(mr) = fisher_mass_residual {
         out.set_item("fisher_mass_residual", mr.to_owned().into_pyarray(py))?;
     }
+    // Additive post-fit diagnostics (#980): the two-score per-atom lens and the
+    // residual-gauge certificate. Both are read through the same single metric;
+    // coupling is `None` (NaN array entries) under a Euclidean / no-harvest
+    // provenance, and the gauge is then certified under Euclidean provenance.
+    out.set_item("atom_two_lens", sae_atom_two_lens_dict(py, &fit_diagnostics.atom_two_lens)?)?;
+    out.set_item(
+        "residual_gauge",
+        sae_residual_gauge_dict(py, &fit_diagnostics.residual_gauge)?,
+    )?;
     Ok(out.unbind())
+}
+
+/// Build the result-dict entry for the two-score per-atom lens
+/// ([`gam::inference::atom_lens::AtomTwoLensReport`]). Per-atom presence /
+/// coupling / discrepancy arrays plus the coupling provenance string. Coupling /
+/// coupling_normalized / discrepancy are `NaN` for atoms whose behavioral axis is
+/// unavailable (Euclidean / no-harvest provenance), mirroring the Rust `None`.
+fn sae_atom_two_lens_dict<'py>(
+    py: Python<'py>,
+    report: &gam::inference::atom_lens::AtomTwoLensReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    let names = PyList::empty(py);
+    let mut presence = Vec::with_capacity(report.atoms.len());
+    let mut presence_norm = Vec::with_capacity(report.atoms.len());
+    let mut coupling = Vec::with_capacity(report.atoms.len());
+    let mut coupling_norm = Vec::with_capacity(report.atoms.len());
+    let mut discrepancy = Vec::with_capacity(report.atoms.len());
+    for atom in &report.atoms {
+        names.append(atom.name.clone())?;
+        presence.push(atom.presence);
+        presence_norm.push(atom.presence_normalized);
+        coupling.push(atom.coupling.unwrap_or(f64::NAN));
+        coupling_norm.push(atom.coupling_normalized.unwrap_or(f64::NAN));
+        discrepancy.push(atom.discrepancy.unwrap_or(f64::NAN));
+    }
+    d.set_item("names", names)?;
+    d.set_item("presence", Array1::from_vec(presence).into_pyarray(py))?;
+    d.set_item(
+        "presence_normalized",
+        Array1::from_vec(presence_norm).into_pyarray(py),
+    )?;
+    d.set_item("coupling", Array1::from_vec(coupling).into_pyarray(py))?;
+    d.set_item(
+        "coupling_normalized",
+        Array1::from_vec(coupling_norm).into_pyarray(py),
+    )?;
+    d.set_item("discrepancy", Array1::from_vec(discrepancy).into_pyarray(py))?;
+    d.set_item("coupling_available", report.coupling_available())?;
+    d.set_item(
+        "coupling_provenance",
+        report
+            .coupling_provenance
+            .map(|p| format!("{p:?}")),
+    )?;
+    Ok(d)
+}
+
+/// Build the result-dict entry for the residual-gauge certificate
+/// ([`gam::sae_identifiability::ResidualGaugeReport`]). Group signature +
+/// per-generator pinned/unpinned verdicts + the metric provenance the
+/// certificate was computed in.
+fn sae_residual_gauge_dict<'py>(
+    py: Python<'py>,
+    report: &gam::sae_identifiability::ResidualGaugeReport,
+) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("group_signature", report.group_signature())?;
+    d.set_item("metric_provenance", format!("{:?}", report.metric_provenance))?;
+    d.set_item("pinning_rank", report.pinning_rank)?;
+    d.set_item("residual_gauge_dim", report.residual_gauge_dim)?;
+    d.set_item("diffeomorphism_unpinned", report.diffeomorphism_unpinned)?;
+    d.set_item(
+        "sym_f_trivial_under_output_fisher",
+        report.sym_f_trivial_under_output_fisher,
+    )?;
+    d.set_item("summary", report.summary.clone())?;
+    let generators = PyList::empty(py);
+    for g in &report.generators {
+        let gd = PyDict::new(py);
+        gd.set_item("family", format!("{:?}", g.family))?;
+        gd.set_item("description", g.description.clone())?;
+        gd.set_item("unpinned", g.unpinned)?;
+        gd.set_item("generator_norm", g.generator_norm)?;
+        generators.append(gd)?;
+    }
+    d.set_item("generators", generators)?;
+    Ok(d)
 }
 
 #[pyfunction(signature = (
