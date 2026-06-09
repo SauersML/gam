@@ -3458,25 +3458,35 @@ impl SaeManifoldTerm {
         }
         let fitted = self.try_fitted()?;
         let mut data_fit = 0.0_f64;
-        // Whiten every residual row through the single RowMetric. Under the
-        // Euclidean (default `None`) provenance the whitening is the identity,
-        // so `0.5 * Σ whitened²` is bit-for-bit `0.5 * Σ r²` — the historical
-        // isotropic data-fit. Under a factored provenance the same sum equals
-        // `0.5 * Σ_n rₙᵀ Wₙ rₙ` via `‖Uₙᵀ rₙ‖² = rₙᵀ Wₙ rₙ`.
+        // The likelihood whitens through the RowMetric **only** when the metric
+        // is a genuinely estimated noise model (`metric.whitens_likelihood()`,
+        // i.e. `WhitenedStructured` — the #974 residual-covariance seam). For
+        // Euclidean (default `None`) and for the OutputFisher *gauge* metric the
+        // reconstruction data-fit stays the isotropic `0.5 * Σ r²`: a gauge /
+        // output-Fisher inner product must NOT silently replace the
+        // reconstruction loss with a Fisher pullback (#980). It only drives the
+        // gauge (see `analytic_penalties::corrected_isometry_penalty`). With no
+        // producer of `WhitenedStructured` at the SAE surface today, this path is
+        // bit-for-bit the historical isotropic data-fit and value/gradient stay
+        // trivially in sync (no whitening happens).
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
         let mut resid_row = ndarray::Array1::<f64>::zeros(target.ncols());
         for row in 0..target.nrows() {
             for out_col in 0..target.ncols() {
                 resid_row[out_col] = target[[row, out_col]] - fitted[[row, out_col]];
             }
             match self.row_metric.as_ref() {
-                None => {
-                    for &r in resid_row.iter() {
-                        data_fit += 0.5 * r * r;
-                    }
-                }
-                Some(metric) => {
+                Some(metric) if whitens => {
                     for w in metric.whiten_residual_row(row, resid_row.view()) {
                         data_fit += 0.5 * w * w;
+                    }
+                }
+                _ => {
+                    for &r in resid_row.iter() {
+                        data_fit += 0.5 * r * r;
                     }
                 }
             }
@@ -5604,17 +5614,26 @@ impl SaeManifoldTerm {
         // Identity, matching the isotropic likelihood exactly. The metric's
         // p_out must agree with the atom's true decoder output dimension.
         if let Some(metric) = self.row_metric.as_ref() {
-            if metric.p_out() == p {
-                corrected.weight = metric.to_weight_field();
-            } else {
-                return Err(ArrowSchurError::SchurFactorFailed {
-                    reason: format!(
-                        "corrected_isometry_penalty: RowMetric p_out {} disagrees with atom {} \
-                         decoder output dim {p}; the gauge metric must match the likelihood metric",
-                        metric.p_out(),
-                        atom_idx
-                    ),
-                });
+            // Only a metric that actually drives the gauge installs a non-identity
+            // pullback weight: any non-Euclidean provenance (OutputFisher or the
+            // #974 WhitenedStructured) pulls the isometry penalty back through its
+            // per-row inner product. A Euclidean metric reduces the gauge to the
+            // bare `J_nᵀ J_n` (Identity weight), so it is left untouched and the
+            // gauge is bit-for-bit the historical isotropic pullback.
+            if metric.drives_gauge() {
+                if metric.p_out() == p {
+                    corrected.weight = metric.to_weight_field();
+                } else {
+                    return Err(ArrowSchurError::SchurFactorFailed {
+                        reason: format!(
+                            "corrected_isometry_penalty: RowMetric p_out {} disagrees with atom \
+                             {} decoder output dim {p}; the gauge metric must match the likelihood \
+                             metric",
+                            metric.p_out(),
+                            atom_idx
+                        ),
+                    });
+                }
             }
         }
         let coords_mat = coord.as_matrix();

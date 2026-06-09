@@ -1007,6 +1007,16 @@ fn group_signature_of(generators: &[GeneratorVerdict], diffeomorphism_unpinned: 
 /// realised as the unit tangent along each frame column).
 fn atom_isometry_generators(atom: &FittedAtom) -> Vec<(Array1<f64>, String)> {
     let (p, d) = atom.frame.dim();
+    // The intrinsic latent dimension of the manifold fixes `dim Isom(M_k)` (the
+    // number of independent isometry generators we must enumerate). The fitted
+    // decoder frame's column count `d` must realise exactly that many latent
+    // axes; a frame whose column count disagrees with the topology's intrinsic
+    // dimension is a structurally inconsistent atom and we refuse to fabricate
+    // generators for it (returning none, so it cannot masquerade as either
+    // pinned or a spurious residual freedom in the certificate).
+    if d != atom.topology.latent_dim() {
+        return Vec::new();
+    }
     let mut out: Vec<(Array1<f64>, String)> = Vec::new();
     match &atom.topology {
         AtomTopology::Circle => {

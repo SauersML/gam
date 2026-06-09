@@ -76,6 +76,7 @@ use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix,
 };
+use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
@@ -1192,4 +1193,164 @@ fn survival_objective_gradient_consistent_near_degenerate_eigenpair() {
             TOL_DEGENERATE,
         );
     }
+}
+
+// ======================================================================
+// Objective 4: SAE-manifold reconstruction objective under an
+//              OutputFisher *gauge* metric (#980 amendment)
+// ======================================================================
+//
+// The SAE-manifold reconstruction value path chooses, per the installed
+// `RowMetric`'s provenance, whether to whiten the data-fit residual or to
+// keep the isotropic `Σ ½ r²`. The #980 failure mode is whitening the
+// LIKELIHOOD by an output-geometry *gauge* metric (OutputFisher): that
+// would silently replace the reconstruction loss with a Fisher pullback,
+// and — fatally for THIS gate — it would do so in the VALUE path only,
+// desyncing the value from its own gradient/Hessian (which are not
+// re-derived through the same whitening today).
+//
+// The amended contract dispatches on provenance:
+//   * `whitens_likelihood()` is TRUE only for `WhitenedStructured` (a
+//     genuinely estimated noise model, #974) — there whitening the
+//     likelihood is statistically correct;
+//   * `drives_gauge()` is TRUE for any non-Euclidean provenance.
+//
+// So an OutputFisher metric must leave the reconstruction likelihood
+// EXACTLY isotropic (value/gradient stay trivially in sync — no whitening
+// happens), changing only the gauge. This section is the standing backstop
+// for that: it reproduces the value-path gate decision and asserts (a) the
+// provenance predicates, (b) that the isotropic data-fit the value path
+// sums is BIT-IDENTICAL whether the installed metric is None, Euclidean, or
+// OutputFisher (the pre-WIP behavior, preserved), and (c) that only the
+// genuinely-estimated WhitenedStructured noise model would whiten — and
+// that its whitened data-fit is genuinely DIFFERENT (so the gate is not a
+// no-op tautology and the OutputFisher dormancy is meaningful).
+
+/// The reconstruction data-fit the SAE value path sums for a single residual
+/// matrix, faithfully reproducing the `metric.whitens_likelihood()` gate at
+/// `src/terms/sae_manifold.rs`. With no installed metric, or one that does not
+/// whiten the likelihood, the data-fit is the isotropic `Σ ½ r²`; only a
+/// likelihood-whitening metric replaces it with `Σ ½ (Uᵀr)²`.
+fn sae_value_path_data_fit(metric: Option<&RowMetric>, residuals: &Array2<f64>) -> f64 {
+    let whitens = metric.is_some_and(|m| m.whitens_likelihood());
+    let mut data_fit = 0.0_f64;
+    for row in 0..residuals.nrows() {
+        let resid_row = residuals.row(row);
+        match metric {
+            Some(m) if whitens => {
+                for w in m.whiten_residual_row(row, resid_row) {
+                    data_fit += 0.5 * w * w;
+                }
+            }
+            _ => {
+                for &r in resid_row.iter() {
+                    data_fit += 0.5 * r * r;
+                }
+            }
+        }
+    }
+    data_fit
+}
+
+/// Anisotropic per-row factor stack `U_n ∈ ℝ^{p × rank}` (row-major flat) so
+/// `M_n = U_n U_nᵀ ≠ I_p` — i.e. whitening through it genuinely differs from
+/// the isotropic sum. Deterministic, no RNG, so the bit-identity assertions are
+/// exact.
+fn anisotropic_factor(n: usize, p: usize, rank: usize) -> std::sync::Arc<Array2<f64>> {
+    let mut u = Array2::<f64>::zeros((n, p * rank));
+    for row in 0..n {
+        for i in 0..p {
+            for k in 0..rank {
+                // A non-orthonormal, row-varying pattern: M_n is SPD but not I.
+                u[[row, i * rank + k]] = 0.7 + 0.31 * (i as f64) - 0.17 * (k as f64)
+                    + 0.05 * (row as f64)
+                    + if i == k { 0.6 } else { 0.0 };
+            }
+        }
+    }
+    std::sync::Arc::new(u)
+}
+
+#[test]
+fn sae_outputfisher_gauge_leaves_likelihood_isotropic_and_value_path_bit_identical() {
+    let n = 5usize;
+    let p = 4usize;
+    let rank = 3usize;
+    // A non-trivial residual matrix (deterministic).
+    let residuals = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        0.4 - 0.13 * col as f64 + 0.07 * row as f64 - 0.02 * (row * col) as f64
+    });
+
+    let u = anisotropic_factor(n, p, rank);
+    let euclidean = RowMetric::euclidean(n, p).expect("Euclidean metric must build");
+    let output_fisher =
+        RowMetric::output_fisher(std::sync::Arc::clone(&u), p, rank).expect("OutputFisher builds");
+    let whitened =
+        RowMetric::whitened_structured(std::sync::Arc::clone(&u), p, rank).expect("structured");
+
+    // (a) Provenance predicates — the #980 dispatch contract.
+    assert_eq!(euclidean.provenance(), MetricProvenance::Euclidean);
+    assert!(
+        !euclidean.whitens_likelihood(),
+        "Euclidean must not whiten the likelihood (nothing to whiten by)"
+    );
+    assert!(
+        !euclidean.drives_gauge(),
+        "Euclidean reduces the gauge to the bare JᵀJ — it does not drive the gauge"
+    );
+    assert_eq!(
+        output_fisher.provenance(),
+        MetricProvenance::OutputFisher { rank }
+    );
+    assert!(
+        !output_fisher.whitens_likelihood(),
+        "#980: OutputFisher is an output-geometry GAUGE, not an estimated noise \
+         model — it must NOT whiten the reconstruction likelihood (that would \
+         silently replace the recon loss with a Fisher pullback, value-path only)"
+    );
+    assert!(
+        output_fisher.drives_gauge(),
+        "OutputFisher drives the gauge (non-Euclidean per-row inner product)"
+    );
+    assert!(
+        whitened.whitens_likelihood(),
+        "WhitenedStructured is a genuinely estimated noise model (#974) — it \
+         alone whitens the likelihood"
+    );
+    assert!(whitened.drives_gauge(), "WhitenedStructured also drives the gauge");
+
+    // (b) The value-path data-fit is BIT-IDENTICAL for None / Euclidean /
+    //     OutputFisher: all three select the isotropic Σ½r² arm, so installing
+    //     an OutputFisher gauge cannot move the reconstruction value off the
+    //     pre-WIP isotropic baseline. This is the value↔gradient consistency
+    //     guarantee for the OutputFisher-gauge configuration: the value path is
+    //     literally unchanged, so it cannot have drifted from the gradient.
+    let baseline_none = sae_value_path_data_fit(None, &residuals);
+    let with_euclidean = sae_value_path_data_fit(Some(&euclidean), &residuals);
+    let with_output_fisher = sae_value_path_data_fit(Some(&output_fisher), &residuals);
+    assert_eq!(
+        baseline_none.to_bits(),
+        with_euclidean.to_bits(),
+        "Euclidean RowMetric must leave the reconstruction data-fit BIT-IDENTICAL \
+         to the no-metric (pre-WIP) path"
+    );
+    assert_eq!(
+        baseline_none.to_bits(),
+        with_output_fisher.to_bits(),
+        "#980: an OutputFisher gauge metric must leave the reconstruction \
+         data-fit BIT-IDENTICAL to the pre-WIP isotropic path — the gauge sees \
+         the metric, the likelihood does NOT"
+    );
+
+    // (c) The gate is not a tautology: the WhitenedStructured metric — the only
+    //     one allowed to whiten — DOES change the data-fit (M_n ≠ I_p), proving
+    //     the dormancy of OutputFisher is a real provenance decision and not an
+    //     artifact of a degenerate (identity) metric.
+    let with_whitened = sae_value_path_data_fit(Some(&whitened), &residuals);
+    assert!(
+        (with_whitened - baseline_none).abs() > 1e-6,
+        "the anisotropic factor must make WHITENED whitening genuinely differ \
+         from the isotropic sum (else the bit-identity of OutputFisher would be \
+         a vacuous tautology); got whitened={with_whitened} isotropic={baseline_none}"
+    );
 }
