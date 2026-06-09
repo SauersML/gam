@@ -2043,12 +2043,72 @@ fn python_float_display(value: f64) -> String {
     }
 }
 
-#[pyfunction]
+/// Training-time upper bound for the default survival surface grid, read from
+/// the saved model rather than the prediction frame.
+///
+/// The default surface grid must be a property of the FITTED model, not of the
+/// `exit` placeholder a caller happens to put in the prediction frame. A small
+/// placeholder `exit` previously shrank the grid to `[entry, exit]` and silently
+/// truncated the surface, so `survival_at(t)` for an ordinary in-fitted-range
+/// `t` past that placeholder fell through to the `t -> inf` asymptote (`S = 0`)
+/// — issue #896. Anchoring the grid's upper edge to the training time support
+/// keeps every in-range query time inside the surface regardless of the
+/// placeholder.
+///
+/// Sources, in order:
+///   * `survival_time_knots` (bspline / ispline bases) live on the `log(t)`
+///     axis spanning the training entry/exit range, so `exp(max knot)` is the
+///     largest training time the basis was fit over.
+///   * `survival_baseline_scale` (the linear Weibull basis stores no knots) is
+///     the Weibull characteristic time; a few multiples of it comfortably cover
+///     the fitted range, which is all a grid UPPER bound needs.
+///
+/// Returns `None` when the model carries neither (the caller then falls back to
+/// the prediction-frame range alone, preserving the prior behavior).
+fn saved_survival_training_time_upper_bound(model_bytes: &[u8]) -> Option<f64> {
+    let saved: serde_json::Value = serde_json::from_slice(model_bytes).ok()?;
+    let payload = saved.get("payload").and_then(serde_json::Value::as_object)?;
+
+    if let Some(knots) = payload
+        .get("survival_time_knots")
+        .and_then(serde_json::Value::as_array)
+    {
+        let max_log_knot = knots
+            .iter()
+            .filter_map(serde_json::Value::as_f64)
+            .filter(|value| value.is_finite())
+            .fold(f64::NEG_INFINITY, f64::max);
+        if max_log_knot.is_finite() {
+            let hi = max_log_knot.exp();
+            if hi.is_finite() && hi > 0.0 {
+                return Some(hi);
+            }
+        }
+    }
+
+    // Linear Weibull basis: no knots. Use a margin over the Weibull scale so the
+    // grid reaches well into the right tail of the fitted distribution.
+    let scale = payload
+        .get("survival_baseline_scale")
+        .and_then(serde_json::Value::as_f64)?;
+    if scale.is_finite() && scale > 0.0 {
+        return Some(scale * SURVIVAL_DEFAULT_GRID_SCALE_MARGIN);
+    }
+    None
+}
+
+/// Multiplier applied to the Weibull baseline scale when no time-basis knots are
+/// available, so the default surface grid reaches into the right tail of the
+/// fitted distribution rather than stopping at the characteristic time.
+const SURVIVAL_DEFAULT_GRID_SCALE_MARGIN: f64 = 5.0;
+
+#[pyfunction(signature = (model_class, formula, headers, rows, model_bytes = None))]
 fn default_survival_time_grid(
     model_class: &str,
     formula: &str,
     headers: Vec<String>,
     rows: Vec<Vec<String>>,
+    model_bytes: Option<Vec<u8>>,
 ) -> PyResult<Option<Vec<f64>>> {
     match model_class {
         "survival"
@@ -2155,6 +2215,18 @@ fn default_survival_time_grid(
     }
     if !observed {
         return Ok(None);
+    }
+    // Anchor the grid's upper edge to the training time support so a small
+    // prediction-frame `exit` placeholder cannot truncate the surface below the
+    // fitted range (issue #896). The grid still extends to the prediction
+    // frame's own max exit when that is larger (the caller is explicitly asking
+    // about those later times). When the model carries no training-time signal
+    // the prediction-frame range is used alone, exactly as before.
+    if let Some(bytes) = model_bytes.as_deref()
+        && let Some(training_hi) = saved_survival_training_time_upper_bound(bytes)
+        && training_hi.is_finite()
+    {
+        hi = hi.max(training_hi);
     }
     if hi <= lo {
         let lo_display = python_float_display(lo);
@@ -2412,7 +2484,13 @@ fn build_model_predict_payload_json(
 ) -> PyResult<String> {
     let model_class = required_saved_model_payload_string_value(&model_bytes, "model_kind")?;
     let formula = required_saved_model_payload_string_value(&model_bytes, "formula")?;
-    let time_grid = default_survival_time_grid(&model_class, &formula, headers, rows)?;
+    let time_grid = default_survival_time_grid(
+        &model_class,
+        &formula,
+        headers,
+        rows,
+        Some(model_bytes),
+    )?;
     build_predict_payload_json(interval, time_grid, covariance_mode, observation_interval)
 }
 
