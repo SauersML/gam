@@ -7019,9 +7019,17 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// so building the operator wrapper only to re-densify it is pure waste).
     fn hessian_source_preference_for_intent(
         &self,
-        _: MaterializationIntent,
+        intent: MaterializationIntent,
     ) -> JointHessianSourcePreference {
-        self.hessian_source_preference()
+        // Intent-agnostic default: every intent maps to the single legacy
+        // preference. Implementors that benefit from per-intent representation
+        // (e.g. CTN: dense for logdet, operator for inner solve) override this.
+        match intent {
+            MaterializationIntent::InnerSolve
+            | MaterializationIntent::LogdetFactorization
+            | MaterializationIntent::OuterEvaluation
+            | MaterializationIntent::OuterGradient => self.hessian_source_preference(),
+        }
     }
 
     /// Forced dense materialization that bypasses any amortization gate the
