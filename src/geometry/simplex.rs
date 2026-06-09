@@ -257,6 +257,7 @@ pub fn simplex_exp_map(
             if tangent.ncols() != d {
                 return Err("CLR tangent dimension must equal simplex dimension".to_string());
             }
+            require_positive(base_comp.view(), "simplex exp map")?;
             let n = tangent.nrows();
             let mut out = Array2::<f64>::zeros((n, d));
             for row in 0..n {
@@ -294,6 +295,62 @@ pub fn simplex_exp_map(
                 }
             }
             inverse_alr(shifted.view(), reference)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{array, Array1};
+
+    /// CLR exp map at a strictly-interior base with a finite tangent succeeds
+    /// and lands in the open simplex (all components strictly positive, summing
+    /// to one).
+    #[test]
+    fn clr_exp_map_interior_base_lands_in_open_simplex() {
+        let base: Array1<f64> = array![0.2, 0.5, 0.3];
+        let tangent = array![[0.4_f64, -0.1, -0.3]];
+        let out = simplex_exp_map(tangent.view(), base.view(), SimplexCoord::Clr, 0)
+            .expect("interior base with finite tangent must succeed");
+        let sum: f64 = out.row(0).sum();
+        assert!((sum - 1.0).abs() < 1e-12, "components must sum to one");
+        for v in out.iter() {
+            assert!(*v > 0.0, "components must be strictly positive; got {v}");
+        }
+    }
+
+    /// CLR exp map at a boundary base (a zero component, on the closed simplex
+    /// but off the Aitchison manifold) must error rather than produce NaN.
+    #[test]
+    fn clr_exp_map_boundary_base_errors() {
+        let base: Array1<f64> = array![1.0, 0.0, 0.0];
+        let tangent = array![[0.1_f64, -0.05, -0.05]];
+        let err = simplex_exp_map(tangent.view(), base.view(), SimplexCoord::Clr, 0)
+            .expect_err("boundary base must be rejected, not yield NaN");
+        assert!(
+            err.contains("strictly positive"),
+            "error must explain the positivity domain; got {err}"
+        );
+    }
+
+    /// CLR log map followed by exp map at the same interior base recovers the
+    /// original interior point.
+    #[test]
+    fn clr_log_exp_round_trip_recovers_interior_point() {
+        let base: Array1<f64> = array![0.25, 0.45, 0.30];
+        let point = array![[0.1_f64, 0.6, 0.3]];
+        let tangent = simplex_log_map(point.view(), base.view(), SimplexCoord::Clr, 0)
+            .expect("log map at interior base must succeed");
+        let recovered = simplex_exp_map(tangent.view(), base.view(), SimplexCoord::Clr, 0)
+            .expect("exp map at interior base must succeed");
+        for col in 0..3 {
+            assert!(
+                (recovered[[0, col]] - point[[0, col]]).abs() < 1e-12,
+                "round-trip must recover input at column {col}: {} vs {}",
+                recovered[[0, col]],
+                point[[0, col]]
+            );
         }
     }
 }
