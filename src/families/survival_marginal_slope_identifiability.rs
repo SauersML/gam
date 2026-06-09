@@ -1547,6 +1547,67 @@ pub fn apply_per_term_survival_parametric_compile_to_designs(
     })
 }
 
+/// Assemble a 3-block [`CompiledMap`] (time, marginal, logslope) from a
+/// [`SurvivalParametricCompiledPerTerm`] produced by the full 4×4 row-Hessian
+/// driver [`compile_survival_parametric_designs_per_term`].
+///
+/// The full global triangular `T` is built from the per-term `V`/`R` blocks
+/// (diagonal `V_b`, strict-upper `−R_{a→b}` — identical to the matrix the
+/// result-time lift [`SmgsLiftViaT::from_v_and_r`] uses), then partitioned
+/// into the three *block* ranges (raw = summed per-term raw widths, compiled =
+/// summed per-term kept widths). The resulting `CompiledMap` is interchangeable
+/// with one from
+/// [`crate::families::identifiability_compiler::compile_from_raw_grams`], so the
+/// existing [`apply_compiled_map_to_designs`] +
+/// [`SmgsLiftViaT::from_compiled_map`] machinery consumes it unchanged.
+///
+/// This is the seam that lets the survival closed-form fast path engage on the
+/// *correct* identifiable quotient: the cheap η₁-only rawstack metric can
+/// falsely collapse a whole channel (marginal/logslope share a PC surface in
+/// the η₁ row curvature), but the full survival row Hessian is 4×4 in
+/// `(q0, q1, qd1, g)` and chains differently into each block, so it keeps the
+/// channels distinct when no *true* alias exists. The reduced basis it emits
+/// goes to Newton in place of the rank-deficient raw basis.
+pub fn compiled_map_from_per_term(
+    compiled: &SurvivalParametricCompiledPerTerm,
+) -> crate::families::identifiability_compiler::CompiledMap {
+    // Per-term V's and R's in global compile order: time terms, then marginal,
+    // then logslope — exactly the order `r_lw_per_term` is stored in.
+    let mut v_all: Vec<Array2<f64>> = Vec::new();
+    v_all.extend(compiled.v_time_per_term.iter().cloned());
+    v_all.extend(compiled.v_marginal_per_term.iter().cloned());
+    v_all.extend(compiled.v_logslope_per_term.iter().cloned());
+
+    let t_full = build_full_t_matrix(&v_all, &compiled.r_lw_per_term);
+
+    // Per-block raw / compiled widths = summed per-term widths within the block.
+    let raw_w = |terms: &[Array2<f64>]| -> usize { terms.iter().map(|v| v.nrows()).sum() };
+    let kept_w = |terms: &[Array2<f64>]| -> usize { terms.iter().map(|v| v.ncols()).sum() };
+    let raw_time = raw_w(&compiled.v_time_per_term);
+    let raw_marg = raw_w(&compiled.v_marginal_per_term);
+    let raw_log = raw_w(&compiled.v_logslope_per_term);
+    let kept_time = kept_w(&compiled.v_time_per_term);
+    let kept_marg = kept_w(&compiled.v_marginal_per_term);
+    let kept_log = kept_w(&compiled.v_logslope_per_term);
+
+    let raw_block_ranges = vec![
+        0..raw_time,
+        raw_time..(raw_time + raw_marg),
+        (raw_time + raw_marg)..(raw_time + raw_marg + raw_log),
+    ];
+    let compiled_block_ranges = vec![
+        0..kept_time,
+        kept_time..(kept_time + kept_marg),
+        (kept_time + kept_marg)..(kept_time + kept_marg + kept_log),
+    ];
+
+    crate::families::identifiability_compiler::CompiledMap {
+        raw_from_compiled: t_full,
+        compiled_block_ranges,
+        raw_block_ranges,
+    }
+}
+
 /// Per-block V matrices for the SMGS result-time β lift. The block
 /// order is: index 0 = time, 1 = marginal, 2 = logslope, 3+ = flex
 /// (score_warp_dev, link_dev) which are NOT compiled by this path —
