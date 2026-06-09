@@ -49,7 +49,7 @@ pub use crate::solver::estimate::Dispersion;
 /// `Deref<Target = Array2<f64>>` lets out-of-scope read sites continue
 /// calling `Array2` methods (`.iter()`, `.nrows()`, `.dim()`, …) on the
 /// wrapper without modification.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(transparent)]
 pub struct PhiScaledCovariance(pub Array2<f64>);
 
@@ -114,7 +114,7 @@ impl DerefMut for PhiScaledCovariance {
 /// scaling. Equivalent to `phi * Vb^{-1}` only when `phi == 1`. Use this
 /// for whitening / precision-matrix paths, and pair it with a
 /// [`Dispersion`] at the boundary if the consumer cares about `phi`.
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(transparent)]
 pub struct UnscaledPrecision(pub Array2<f64>);
 
