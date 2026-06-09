@@ -26868,11 +26868,41 @@ mod tests {
             psi_terms.hessian_psi[[0, 0]],
             h_mu_mu_psi
         );
+        // The (μ, log-σ) cross block of the analytic coefficient Hessian uses
+        // Fisher information `E[H_{μ,ls}] = 2κ·E[m] = 0` (`hmu_ls[i] = 0` in
+        // `gaussian_joint_psi_firstweights`; #684), so its ψ-derivative is
+        // identically 0. The AD reference is the observed `∂³N/∂β_μ∂β_ls∂ψ`,
+        // which carries the observed contribution `Σ_i X_μ_i · (2 m_i κ_i)·
+        // X_ls,i(ψ)`. Subtracting that observed ψ-drift puts the AD reference
+        // back on the same Fisher footing as the analytic block. Per-row,
+        // `∂(2mκ)/∂η_ls = -2 m·P` with `P = 2κ² − κ'` (from `dm/dη_ls = -2κm`
+        // and `dκ/dη_ls = κ'`), and `dX_ls/dψ = x_ls_psi`, so the chain rule
+        // gives `∂(observed cross)/∂ψ = Σ_i X_μ_i·[-2 m P·z_ls_psi·X_ls,i
+        // + 2 m κ·x_ls_psi,i]` with `z_ls_psi = X_ls_psi·β_ls`.
+        let rows_gap =
+            gaussian_jointrow_scalars(&y, &(&x_mu0 * beta_mu0), &(&x_ls0 * beta_ls0), &weights)
+                .expect("gaussian row scalars for psi corrections");
+        let mu_ls_psi_correction: f64 = (0..y.len())
+            .map(|i| {
+                let m = rows_gap.m[i];
+                let k = rows_gap.kappa[i];
+                let kp = rows_gap.kappa_prime[i];
+                let p = 2.0 * k * k - kp;
+                let xm = x_mu0[i];
+                let xl = x_ls0[i];
+                let xp = x_ls_psi[i];
+                let z_ls_psi = xp * beta_ls0;
+                // Fisher − observed = 0 − ∂(2mκ·X_ls)/∂ψ at ψ=0
+                xm * (2.0 * m * p * z_ls_psi * xl - 2.0 * m * k * xp)
+            })
+            .sum();
         assert!(
-            (psi_terms.hessian_psi[[0, 1]] - h_mu_ls_psi).abs() <= 1e-9,
-            "Gaussian log-sigma psi hessian(mu,ls) mismatch: analytic={} autodiff={}",
+            (psi_terms.hessian_psi[[0, 1]] - (h_mu_ls_psi + mu_ls_psi_correction)).abs() <= 1e-9,
+            "Gaussian log-sigma psi hessian(mu,ls) mismatch: analytic={} reference={} (ad={} + Fisher correction={})",
             psi_terms.hessian_psi[[0, 1]],
-            h_mu_ls_psi
+            h_mu_ls_psi + mu_ls_psi_correction,
+            h_mu_ls_psi,
+            mu_ls_psi_correction
         );
         // The (ls,ls) coefficient-Hessian block uses the Fisher curvature
         // `2κ²a` (#566), so its ψ-derivative `hessian_psi[[1,1]]` is the Fisher
@@ -26885,9 +26915,6 @@ mod tests {
         // gives the per-row correction below. The η-drift is the code's own
         // `z_ls_psi = X_ls_psi·β_ls` (the η_ls induced by the design ψ-drift)
         // and the design drift is `dX_ls/dψ = x_ls_psi`. η_μ is ψ-independent.
-        let rows_gap =
-            gaussian_jointrow_scalars(&y, &(&x_mu0 * beta_mu0), &(&x_ls0 * beta_ls0), &weights)
-                .expect("gaussian row scalars for ls,ls psi correction");
         let ls_ls_psi_correction: f64 = (0..y.len())
             .map(|i| {
                 let a = rows_gap.obs_weight[i];
@@ -27230,21 +27257,22 @@ mod tests {
             }
         }
 
-        // The (log-σ, log-σ) block is the Fisher/expected information `2κ²a`, by
-        // deliberate design (#566): the score stays the exact observed gradient
-        // so the joint Newton lands on the true MLE, but the curvature that
-        // feeds the REML log-determinant / EDF is the expectation, exactly as
-        // gamlss/mgcv `gaulss` Fisher-scores the scale channel. The observed
-        // second derivative is `∂²ℓ/∂η_ls² = 2κ²n + κ'(a−n)` (what the AD
-        // reference computes), so on the (ls,ls) entries the analytic Fisher
-        // block differs from AD by the per-row amount `fisher − observed =
-        // 2κ²a − (2κ²n + κ'(a−n))`. We add that exact, separately derived
-        // correction to the AD observed Hessian so the comparison both
-        // (a) validates the AD machinery against the analytic mean/cross blocks
-        // and (b) pins the analytic (ls,ls) block to the Fisher closed form via
-        // a non-circular `observed + (Fisher − observed)` reference.
+        // Both the (log-σ, log-σ) and (μ, log-σ) blocks ship the Fisher/expected
+        // information by deliberate design (#566 / #684): the score stays the
+        // exact observed gradient so the joint Newton lands on the true MLE, but
+        // the curvature feeding the REML log-determinant / EDF is the
+        // expectation, exactly as gamlss/mgcv `gaulss` Fisher-scores the scale
+        // channel and as `gaussian_joint_psi_firstweights` already pins
+        // (`hmu_ls = 0`, `h_ls_ls = 2κ²a`). The AD reference computes the
+        // observed Hessian, so on each Fisher-replaced block the analytic value
+        // differs from AD by the per-row amount `fisher − observed`. We add
+        // those exact, separately derived corrections to the AD observed
+        // Hessian so the comparison both
+        //   (a) validates the AD machinery against the analytic mean blocks,
+        //   (b) pins each analytic Fisher block to its closed form via a
+        //       non-circular `observed + (Fisher − observed)` reference.
         let mut reference = ad.clone();
-        let fisher_minus_observed: Array1<f64> = Array1::from_shape_fn(y.len(), |i| {
+        let fisher_minus_observed_ls_ls: Array1<f64> = Array1::from_shape_fn(y.len(), |i| {
             let a = rows.obs_weight[i];
             let n = rows.n[i];
             let k = rows.kappa[i];
@@ -27255,10 +27283,27 @@ mod tests {
         });
         let ls_correction = x_ls
             .t()
-            .dot(&Array2::from_diag(&fisher_minus_observed).dot(&x_ls));
+            .dot(&Array2::from_diag(&fisher_minus_observed_ls_ls).dot(&x_ls));
         for a in 0..p_ls {
             for b in 0..p_ls {
                 reference[[pmu + a, pmu + b]] += ls_correction[[a, b]];
+            }
+        }
+        // (μ, log-σ) cross block: observed ∂²ℓ/∂η_μ∂η_ls = 2 m κ (zero in
+        // expectation since E[m] = 0 under correct model), Fisher = 0.
+        // Correction = fisher − observed = −2 m κ.
+        let fisher_minus_observed_mu_ls: Array1<f64> = Array1::from_shape_fn(y.len(), |i| {
+            let m = rows.m[i];
+            let k = rows.kappa[i];
+            -2.0 * m * k
+        });
+        let mu_ls_correction = xmu
+            .t()
+            .dot(&Array2::from_diag(&fisher_minus_observed_mu_ls).dot(&x_ls));
+        for a in 0..pmu {
+            for b in 0..p_ls {
+                reference[[a, pmu + b]] += mu_ls_correction[[a, b]];
+                reference[[pmu + b, a]] += mu_ls_correction[[a, b]];
             }
         }
 
