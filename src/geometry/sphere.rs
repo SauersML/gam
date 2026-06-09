@@ -947,4 +947,70 @@ mod tests {
         // Mean should be close to e1 (dominant direction), not on the equator.
         assert!(mean[0] > 0.9, "expected near-e1 mean, got {mean:?}");
     }
+
+    #[test]
+    fn sectional_curvature_is_one_on_nondegenerate_plane() {
+        // S^2 has constant sectional curvature +1 on any genuine tangent plane.
+        let m = SphereManifold::new(2);
+        let point = array![1.0, 0.0, 0.0];
+        // Two orthogonal tangent vectors at e1.
+        let u = array![0.0, 1.0, 0.0];
+        let v = array![0.0, 0.0, 1.0];
+        let k = m
+            .sectional_curvature(point.view(), (u.view(), v.view()))
+            .expect("unit sphere has defined curvature on a nondegenerate plane");
+        assert!((k - 1.0).abs() < 1.0e-12, "expected +1, got {k}");
+    }
+
+    #[test]
+    fn sectional_curvature_is_singular_for_collinear_pair() {
+        let m = SphereManifold::new(2);
+        let point = array![1.0, 0.0, 0.0];
+        let u = array![0.0, 1.0, 0.0];
+        // v parallel to u in the tangent space: zero parallelogram area.
+        let v = array![0.0, 2.0, 0.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Singular(_)) => {}
+            other => panic!("expected Singular for collinear pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_is_singular_for_purely_radial_pair() {
+        // Vectors that vanish after projecting off the radial direction span no
+        // tangent plane, even though they look independent in ambient space.
+        let m = SphereManifold::new(2);
+        let point = array![1.0, 0.0, 0.0];
+        let u = array![1.0, 0.0, 0.0];
+        let v = array![2.0, 0.0, 0.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Singular(_)) => {}
+            other => panic!("expected Singular for radial pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_is_unsupported_below_two_dimensions() {
+        // S^1 has a one-dimensional tangent space — no 2-plane exists.
+        let m = SphereManifold::new(1);
+        let point = array![1.0, 0.0];
+        let u = array![0.0, 1.0];
+        let v = array![0.0, 1.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported on S^1, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_rejects_non_unit_base_point() {
+        let m = SphereManifold::new(2);
+        let point = array![2.0, 0.0, 0.0];
+        let u = array![0.0, 1.0, 0.0];
+        let v = array![0.0, 0.0, 1.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::InvalidPoint(_)) => {}
+            other => panic!("expected InvalidPoint on non-unit base, got {other:?}"),
+        }
+    }
 }
