@@ -721,19 +721,56 @@ fn block_orthogonal_eval(
     })
 }
 
+/// Block-orthogonal shared-scale REML objective VALUE together with its
+/// analytic ρ-gradient and ρ-Hessian.
+///
+/// Single source of truth: the value `½d·logdet − ½·fit − ½d·rank·ρ` and its
+/// ρ-derivatives are returned from ONE function body, so a future edit to the
+/// objective cannot leave the Newton gradient/Hessian (previously written at a
+/// physically separate site inside `solve_block_orthogonal_rho`) stale. This
+/// closes a genuine `(value_here, gradient_there)` loose pair. Mirrors the
+/// `PenaltyLogdetDerivs` single-source pattern; behavior is identical (the same
+/// closed-form formulas, reorganized).
+struct BlockOrthogonalScaleDerivs {
+    value: f64,
+    grad: f64,
+    hess: f64,
+}
+
 fn block_orthogonal_scale_objective(
     eval: &BlockOrthogonalEval,
     rho: f64,
     scale_precision: ArrayView1<'_, f64>,
     rank: usize,
-) -> f64 {
+) -> BlockOrthogonalScaleDerivs {
     let d = scale_precision.len() as f64;
     let fit_term = scale_precision
         .iter()
         .zip(eval.fitted_energy.iter())
         .map(|(scale, energy)| scale * energy)
         .sum::<f64>();
-    0.5 * d * eval.logdet - 0.5 * fit_term - 0.5 * d * (rank as f64) * rho
+    // VALUE: ½d·log|H| − ½ Σ_o w_o ⟨y_o, fit_o⟩ − ½d·rank·ρ.
+    let value = 0.5 * d * eval.logdet - 0.5 * fit_term - 0.5 * d * (rank as f64) * rho;
+    // ρ-GRADIENT: d/dρ of the same scalar. The logdet term contributes
+    // ½d·(tr(H⁻¹λS) − rank); the (data-independent-at-fixed-β envelope) fit term
+    // contributes +½ Σ_o w_o βᵀ(λS)β. Both share `eval`'s cached energies.
+    let grad = 0.5 * d * (eval.trace - rank as f64)
+        + 0.5
+            * scale_precision
+                .iter()
+                .zip(eval.penalty_energy.iter())
+                .map(|(scale, energy)| scale * energy)
+                .sum::<f64>();
+    // ρ-HESSIAN: d²/dρ². Logdet term: ½d·(tr(H⁻¹λS) − tr((H⁻¹λS)²)); penalty
+    // term: ½ Σ_o w_o (βᵀλSβ − 2 βᵀλS H⁻¹ λS β).
+    let hess = 0.5 * d * (eval.trace - eval.trace_pair)
+        + 0.5
+            * scale_precision
+                .iter()
+                .zip(eval.penalty_energy.iter().zip(eval.curvature_energy.iter()))
+                .map(|(scale, (energy, curvature))| scale * (energy - 2.0 * curvature))
+                .sum::<f64>();
+    BlockOrthogonalScaleDerivs { value, grad, hess }
 }
 
 fn solve_block_orthogonal_rho(
@@ -746,28 +783,13 @@ fn solve_block_orthogonal_rho(
     max_iter: usize,
 ) -> Result<(f64, BlockOrthogonalEval), EstimationError> {
     let mut rho = rho0;
-    let d = rhs.ncols() as f64;
     let mut current = block_orthogonal_eval(gram, rhs, penalty, rho)?;
     for _ in 0..max_iter {
-        let grad = 0.5 * d * (current.trace - rank as f64)
-            + 0.5
-                * scale_precision
-                    .iter()
-                    .zip(current.penalty_energy.iter())
-                    .map(|(scale, energy)| scale * energy)
-                    .sum::<f64>();
-        let hess = 0.5 * d * (current.trace - current.trace_pair)
-            + 0.5
-                * scale_precision
-                    .iter()
-                    .zip(
-                        current
-                            .penalty_energy
-                            .iter()
-                            .zip(current.curvature_energy.iter()),
-                    )
-                    .map(|(scale, (energy, curvature))| scale * (energy - 2.0 * curvature))
-                    .sum::<f64>();
+        // Value, ρ-gradient, and ρ-Hessian all come from the SINGLE
+        // single-source objective evaluation — they cannot desync.
+        let derivs = block_orthogonal_scale_objective(&current, rho, scale_precision, rank);
+        let grad = derivs.grad;
+        let hess = derivs.hess;
         if !(grad.is_finite() && hess.is_finite()) {
             return Err(EstimationError::ModelIsIllConditioned {
                 condition_number: f64::INFINITY,
@@ -784,7 +806,7 @@ fn solve_block_orthogonal_rho(
         let mut best_rho = rho;
         let mut best_eval = current;
         let mut best_phi =
-            block_orthogonal_scale_objective(&best_eval, best_rho, scale_precision, rank);
+            block_orthogonal_scale_objective(&best_eval, best_rho, scale_precision, rank).value;
         let descent = grad.signum();
         for candidate_rho in [
             rho - step,
@@ -799,7 +821,8 @@ fn solve_block_orthogonal_rho(
                 candidate_rho,
                 scale_precision,
                 rank,
-            );
+            )
+            .value;
             if candidate_phi < best_phi {
                 best_rho = candidate_rho;
                 best_eval = candidate_eval;
