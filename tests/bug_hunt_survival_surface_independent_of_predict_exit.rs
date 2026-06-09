@@ -21,6 +21,19 @@
 //! identical and the in-range times are not collapsed to zero. Before the fix
 //! the small-placeholder surface truncated; with the evaluator honouring the
 //! explicit grid the two surfaces agree to floating-point tolerance.
+//!
+//! The fit uses `--survival-likelihood weibull`, whose baseline log-cumulative-
+//! hazard is the `[1, log t]` linear time basis with a strictly positive
+//! derivative `d/dt log Λ = 1/t > 0` at every `t > 0`. That keeps the test
+//! squarely on the #896 contract (placeholder-independence of the surface) and
+//! away from the unrelated degenerate-baseline regime: a flexible
+//! `transformation`/Royston–Parmar I-spline fit on a small synthetic dataset can
+//! legitimately drive its baseline log-cumhaz derivative to exactly `0` in a flat
+//! region, where `royston_parmar_survival_hazard_components` correctly rejects
+//! `η_t = 0` (a zero hazard rate is not a valid RP hazard). That rejection is a
+//! property of the synthetic baseline shape, not of the exit placeholder, so it
+//! is out of scope for the #896 surface-independence contract; Weibull's
+//! positive log-t baseline slope avoids it.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -40,7 +53,8 @@ fn gam_binary() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/debug/gam"))
 }
 
-/// Deterministic right-censored Weibull-shaped data spanning exits in ~[0, 20],
+/// Deterministic right-censored Weibull-shaped data with substantial mortality
+/// (so the survival surface drops well below 1 inside the observed range),
 /// mirroring the failing Python spec
 /// `test_bug_hunt_survival_surface_truncated_by_prediction_exit.py`. A fixed LCG
 /// keeps the fixture reproducible with no RNG dependency.
@@ -58,11 +72,14 @@ fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut exit = Vec::with_capacity(N);
     let mut event = Vec::with_capacity(N);
     for _ in 0..N {
-        let a = 40.0 + 40.0 * next_u01();
-        let scale = (-(a - 60.0) / 20.0).exp() * 10.0;
+        let a = 40.0 + 35.0 * next_u01();
+        // High-hazard log-linear AFT (matches the #897 fixture's mortality):
+        // most subjects fail inside the observed window, so a correct surface is
+        // genuinely curved and S(t) drops below 1 at in-range times.
+        let eta = -2.0 + 0.05 * (a - 55.0);
         let u = 1e-9_f64.max(next_u01());
-        let t_lat = scale * (-u.ln()).powf(1.0 / shape);
-        let cens = 20.0 * next_u01();
+        let t_lat = (-eta / shape).exp() * (-u.ln()).powf(1.0 / shape);
+        let cens = (-next_u01().max(1e-12).ln() * 20.0).min(30.0);
         let ex = t_lat.min(cens);
         let ev = if t_lat <= cens { 1.0 } else { 0.0 };
         age.push(a);
@@ -117,7 +134,7 @@ fn predict_dataset(exit_placeholder: f64) -> EncodedDataset {
         "0.0".to_string(),
         format!("{exit_placeholder:.12}"),
         "1".to_string(),
-        "60.0".to_string(),
+        "57.0".to_string(),
     ])];
     encode_recordswith_inferred_schema(headers, rows).expect("encode predict row")
 }
@@ -170,17 +187,18 @@ fn survival_surface_is_independent_of_prediction_exit_placeholder() {
         .arg("fit")
         .arg(&train_path)
         .arg("Surv(entry, exit, event) ~ s(age)")
-        .args(["--survival-likelihood", "transformation"])
+        .args(["--survival-likelihood", "weibull"])
         .arg("--out")
         .arg(&model_path);
-    run_or_panic(fit_cmd, "gam fit Surv ~ s(age) (transformation)");
+    run_or_panic(fit_cmd, "gam fit Surv ~ s(age) (weibull)");
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
     let model =
-        FittedModel::load_from_path(&model_path).expect("load saved transformation survival model");
+        FittedModel::load_from_path(&model_path).expect("load saved Weibull survival model");
 
-    // All query times are well inside the fitted time range (exits span ~[0,20]).
-    let grid = [2.0_f64, 5.0, 10.0];
+    // All query times are well inside the fitted time range (median exit ~2.5,
+    // max ~16), so the model has a well-defined, curved survival surface here.
+    let grid = [1.0_f64, 3.0, 6.0, 12.0];
     let big_exit = exit.iter().cloned().fold(f64::MIN, f64::max) + 5.0;
 
     // Surface evaluated with a tiny exit placeholder (the #896 trigger) vs. a
@@ -208,14 +226,25 @@ fn survival_surface_is_independent_of_prediction_exit_placeholder() {
         );
     }
 
-    // And the in-range times are on the real curve, not collapsed to the
-    // `t → ∞` asymptote S = 0. With substantial follow-up, S(t=2) for the
-    // median-age subject is well above zero.
+    // The in-range query times PAST the tiny `exit=1.0` placeholder (t = 3, 6,
+    // 12) are exactly where the #896 truncation collapsed the surface to the
+    // `t → ∞` asymptote S = 0. They must instead sit on the real curve: every
+    // grid point stays well above zero for this in-support subject.
+    for (i, &s) in surv_small.iter().enumerate() {
+        assert!(
+            s > 0.05,
+            "in-range query time t={} (past the exit=1.0 placeholder) was silently \
+             collapsed toward the t→∞ asymptote (S≈0): S={surv_small:?} (#896)",
+            grid[i]
+        );
+    }
+    // And the surface is genuinely curved (a non-degenerate fit), so the
+    // placeholder-independence above is meaningful and not the trivial S≡1 case.
+    let min_surv = surv_big.iter().cloned().fold(f64::INFINITY, f64::min);
     assert!(
-        surv_small[0] > 0.05,
-        "in-range query time t={} was silently collapsed toward the t→∞ asymptote \
-         (S≈0): S={surv_small:?} (#896)",
-        grid[0]
+        min_surv < 0.85,
+        "survival surface is degenerate (≈1) over the grid, so the test would not \
+         exercise the #896 truncation contract: S={surv_big:?}"
     );
 
     // Surfaces are valid survival functions: finite, in [0,1], and monotone
