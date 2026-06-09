@@ -4054,13 +4054,18 @@ fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
                 })?;
                 let eta = &fitted.design.design.dot(&fitted.fit.beta) + &offset;
                 let dense_alo_design = fitted.design.design.to_dense();
+                // φ for Gaussian (Identity) is the estimated dispersion σ̂², not
+                // 1.0 — same SE-scale bug as the geometry path. Mirrors the
+                // StandardGam sibling route, which computes φ inside
+                // compute_alo_diagnostics_from_fit.
+                let phi = geometry_alo_phi(&fitted.fit, link);
                 gam::alo::compute_alo_diagnostics_from_unified(
                     &fitted.fit,
                     &dense_alo_design,
                     &eta,
                     &offset,
                     link,
-                    1.0,
+                    phi,
                 )
                 .map_err(|e| {
                     format!(
