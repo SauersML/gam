@@ -3381,6 +3381,31 @@ mod tests {
         })
     }
 
+    /// Fallible forward-scalar probe. Returns `None` when the closed-form fit
+    /// rejects the inputs — the relevant case being a penalty perturbation that
+    /// pushes `S` out of the PSD cone (a single-entry central bump on a
+    /// null-direction entry drives one eigenvalue slightly negative). Such a
+    /// point has no well-defined REML objective, so the caller skips it rather
+    /// than panicking.
+    fn one_hot_objective_try(
+        x: ArrayView2<'_, f64>,
+        y: ArrayView2<'_, f64>,
+        penalty: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        target: ForwardScalar,
+    ) -> Option<f64> {
+        let fit =
+            gaussian_reml_multi_closed_form_with_cache(x, y, penalty, Some(weights), Some(0.85), None)
+                .ok()?;
+        Some(match target {
+            ForwardScalar::Lambda => fit.lambda,
+            ForwardScalar::RemlScore => fit.reml_score,
+            ForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
+            ForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
+            ForwardScalar::Edf => fit.edf,
+        })
+    }
+
     fn one_hot_objective(
         x: ArrayView2<'_, f64>,
         y: ArrayView2<'_, f64>,
@@ -3388,22 +3413,7 @@ mod tests {
         weights: ArrayView1<'_, f64>,
         target: ForwardScalar,
     ) -> f64 {
-        let fit = gaussian_reml_multi_closed_form_with_cache(
-            x,
-            y,
-            penalty,
-            Some(weights),
-            Some(0.85),
-            None,
-        )
-        .expect("finite-difference forward fit");
-        match target {
-            ForwardScalar::Lambda => fit.lambda,
-            ForwardScalar::RemlScore => fit.reml_score,
-            ForwardScalar::Coefficient(row, col) => fit.coefficients[[row, col]],
-            ForwardScalar::Fitted(row, col) => fit.fitted[[row, col]],
-            ForwardScalar::Edf => fit.edf,
-        }
+        one_hot_objective_try(x, y, penalty, weights, target).expect("finite-difference forward fit")
     }
 
     fn one_hot_backward(
@@ -3553,19 +3563,34 @@ mod tests {
                 );
             }
 
-            // ∂L/∂S over EVERY penalty entry. The fixture penalty is
-            // diag([0.0, 0.8, 1.2, 1.7, 2.3]) — nullity 1 with the (0,0) entry
-            // and the whole row/column 0 touching the null direction — so this
-            // loop is the decisive check on the rank-deficient pseudoinverse the
-            // score-VJP forms (`penalty_pinv` = L⁻ᵀ T⁺ L⁻¹). The forward consumes
-            // only `S_canon = 0.5(S + Sᵀ)` and the backward returns the
-            // symmetrized gradient, so a single-entry bump of S[r, c] (asymmetric)
-            // is compared directly against `grad_penalty[r, c]`: by the chain rule
-            // through the symmetrization the analytic entry already equals
-            // `0.5(G[r, c] + G[c, r])`, which is exactly what FD on that one entry
-            // measures.
+            // ∂L/∂S over the RANGE-SPACE penalty entries. The REML objective
+            // carries −½d·log|S|₊ (the pseudo-determinant over the NONZERO
+            // eigenvalues), so ∂L/∂S is only a finite, FD-verifiable derivative
+            // where a central ±h bump keeps S inside the PSD cone WITHOUT
+            // changing its rank. A single-entry bump touching the null
+            // direction violates both: the −h side drives an eigenvalue
+            // slightly negative (leaves the cone → fit Err) and the +h side
+            // turns the zero eigenvalue into a tiny positive one that joins
+            // log|S|₊ as a −log(ε) term (a rank-change discontinuity in L).
+            // The null-direction component of the analytic S-gradient is a
+            // gauge convention for the null space (the L-metric pseudoinverse
+            // `penalty_pinv` = L⁻ᵀ T⁺ L⁻¹), validated by algebra/consumer, not
+            // FD. So restrict to the strictly-positive diagonal block (both
+            // indices in 1..p for the diag([0, 0.8, 1.2, 1.7, 2.3]) fixture,
+            // where S_rr > 0 and ±h stays PSD at full rank). The forward
+            // consumes only `S_canon = 0.5(S + Sᵀ)` and the backward returns
+            // the symmetrized gradient, so a single-entry bump of S[r, c]
+            // (asymmetric) compares directly against `grad_penalty[r, c]` =
+            // 0.5(G[r, c] + G[c, r]). Defensively, any entry whose largest ±h
+            // probe leaves the cone is skipped (cone membership is monotone in
+            // |h| here, so probing the largest step suffices).
+            let null_index = 0usize; // diag([0.0, ...]) ⇒ coordinate 0 is the null direction.
+            let probe_h = 1.0e-3_f64; // matches the largest adaptive_central_difference step.
             for r in 0..penalty.nrows() {
                 for c in 0..penalty.ncols() {
+                    if r == null_index || c == null_index {
+                        continue;
+                    }
                     let eval = |delta: f64| {
                         let mut candidate = penalty.clone();
                         candidate[[r, c]] += delta;
@@ -3577,6 +3602,25 @@ mod tests {
                             target,
                         )
                     };
+                    let cone_safe = {
+                        let mut s_plus = penalty.clone();
+                        let mut s_minus = penalty.clone();
+                        s_plus[[r, c]] += probe_h;
+                        s_minus[[r, c]] -= probe_h;
+                        one_hot_objective_try(x.view(), y.view(), s_plus.view(), weights.view(), target)
+                            .is_some()
+                            && one_hot_objective_try(
+                                x.view(),
+                                y.view(),
+                                s_minus.view(),
+                                weights.view(),
+                                target,
+                            )
+                            .is_some()
+                    };
+                    if !cone_safe {
+                        continue;
+                    }
                     let fd = adaptive_central_difference(eval);
                     assert_fd_close(
                         &format!("target={target:?} penalty[{r},{c}]"),
@@ -3703,12 +3747,16 @@ mod tests {
         );
 
         // Combined-seed ∂L/∂S spot-check: perturb individual penalty entries with
-        // x/y/w held at base. The penalty [[0,0,0],[0,1,0.2],[0,0.2,1.7]] is
-        // nullity 1 (row/column 0 is the null direction), so this exercises the
-        // rank-deficient pseudoinverse path AND the backward symmetrization under
-        // mixed (λ, score, β, fitted) seeds. A single-entry asymmetric bump of
-        // S[r, c] is compared directly to grad_penalty[[r, c]], which the backward
-        // already returns symmetrized to 0.5(G[r,c] + G[c,r]).
+        // x/y/w held at base, under mixed (λ, score, β, fitted) seeds. The penalty
+        // [[0,0,0],[0,1,0.2],[0,0.2,1.7]] is nullity 1 (coordinate 0 is the null
+        // direction); ∂L/∂S is FD-verifiable only on the strictly-positive
+        // RANGE block (indices 1,2), where a central ±h bump keeps S PSD at full
+        // rank. Null-touching entries (any index 0) are non-FD-verifiable — the
+        // −½d·log|S|₊ pseudo-determinant term makes L either cone-leaving or
+        // rank-change-discontinuous there (see the exhaustive S loop above). A
+        // single-entry asymmetric bump of S[r, c] compares directly to
+        // grad_penalty[[r, c]] = 0.5(G[r,c] + G[c,r]), exercising the backward
+        // symmetrization.
         let objective_s = |s_eval: &Array2<f64>| {
             let fit = gaussian_reml_multi_closed_form_with_cache(
                 x.view(),
@@ -3724,9 +3772,10 @@ mod tests {
                 + (&fit.coefficients * &upstream_coefficients).sum()
                 + (&fit.fitted * &upstream_fitted).sum()
         };
-        // (0,0) null diagonal; (0,1) null-touching off-diagonal; (1,1) full-rank
-        // diagonal; (1,2) pure off-diagonal between two penalized directions.
-        for (r, c) in [(0usize, 0usize), (0, 1), (1, 1), (1, 2)] {
+        // (1,1) full-rank diagonal; (1,2) pure off-diagonal between two penalized
+        // directions; (2,2) full-rank diagonal. All in the strictly-positive
+        // range block, so ±h stays PSD at full rank.
+        for (r, c) in [(1usize, 1usize), (1, 2), (2, 2)] {
             let mut s_plus = penalty.clone();
             let mut s_minus = penalty.clone();
             s_plus[[r, c]] += eps;
