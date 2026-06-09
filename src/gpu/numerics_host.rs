@@ -9,32 +9,18 @@
 
 /// Complementary error function `erfc(x) = 1 − erf(x)` evaluated on the host.
 ///
-/// Branchless Chebyshev rational approximation (Cody 1969): matches f64 libm
-/// to within ~1 ULP across the input range and is what the GPU kernels'
-/// analytic implementation derives from. Used so the CPU reference does not
-/// depend on a feature-gated `libm` dependency.
+/// Routes to `libm::erfc`, the SunOS msun double-precision implementation
+/// (accurate to within ~1 ulp across the entire real line). The CUDA kernel
+/// side calls device `erfc`, which is itself msun-derived, so the host CPU
+/// reference matches the device path to within a ULP. The previous
+/// branchless Cody 1969 Chebyshev rational here was only ~1.2e-7 accurate
+/// in relative terms; that ate seven digits of every probit `Mills =
+/// φ/Φ = pdf / (½·erfc(-x/√2))` evaluation and made any sufficiently
+/// tight finite-difference probe of `∂neglog/∂e = -w·s·Mills` (which the
+/// analytic side computes from this same `cdf`, while the FD side
+/// differences `log cdf` and cancels the erfc bias) break against itself
+/// at the ~2e-7 floor instead of the genuine 5-point-stencil truncation
+/// floor near 1e-12.
 pub(crate) fn erfc(x: f64) -> f64 {
-    if !x.is_finite() {
-        return if x.is_nan() {
-            f64::NAN
-        } else if x > 0.0 {
-            0.0
-        } else {
-            2.0
-        };
-    }
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + 0.5 * ax);
-    let r = t
-        * (-ax * ax - 1.265_512_23
-            + t * (1.000_023_68
-                + t * (0.374_091_96
-                    + t * (0.096_784_18
-                        + t * (-0.186_288_06
-                            + t * (0.278_868_07
-                                + t * (-1.135_203_98
-                                    + t * (1.488_515_87
-                                        + t * (-0.822_152_23 + t * 0.170_872_77)))))))))
-            .exp();
-    if x >= 0.0 { r } else { 2.0 - r }
+    libm::erfc(x)
 }
