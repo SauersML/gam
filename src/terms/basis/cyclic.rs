@@ -1,5 +1,10 @@
 //! Cyclic (periodic) B-spline basis and finite-difference penalty.
 //!
+//! For a periodic covariate — angle, time-of-day, day-of-year — December must
+//! meet January without a seam. We bend the coefficient axis into a ring so
+//! the smooth has no endpoints to privilege: the last coefficient is the first
+//! one's neighbour, full stop.
+//!
 //! This module owns the self-contained periodic-domain math for 1-D cyclic
 //! smooths: the wrap-around finite-difference penalty `S = D'D`, the half-open
 //! period folding used by every periodic evaluator, the period-aware great-arc
