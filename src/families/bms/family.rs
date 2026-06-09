@@ -421,7 +421,7 @@ pub(super) fn build_deviation_block_from_knots_and_design_seed(
         ));
     }
     let penalty_orders = resolve_deviation_operator_orders(cfg)?;
-    let knots = initialize_monotone_wiggle_knots_from_seed(
+    let knots = initializewiggle_knots_from_seed(
         knot_seed.view(),
         cfg.degree,
         cfg.num_internal_knots,
