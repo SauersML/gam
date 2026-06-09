@@ -9099,7 +9099,10 @@ fn build_sae_basis_evaluators(
     analytic_penalties = None,
     top_k = None,
     jumprelu_threshold = 0.0,
+    fisher_factors = None,
+    fisher_mass_residual = None,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -9126,6 +9129,12 @@ fn sae_manifold_fit<'py>(
     analytic_penalties: Option<String>,
     top_k: Option<usize>,
     jumprelu_threshold: f64,
+    // WP-D output-Fisher shard (#980). `fisher_factors` is `(n, p, r)` f64 (the
+    // harvest shard's `U`); its presence activates `RowMetric::OutputFisher`. No
+    // flag — magic-by-default. `fisher_mass_residual` is the optional `(n,)`
+    // truncation diagnostic that rides into the report.
+    fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
+    fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     // The precomputed-basis entry point carries no Duchon centers / kernel
     // metadata, so any basis kind whose refresh needs them cannot re-evaluate
@@ -9134,6 +9143,8 @@ fn sae_manifold_fit<'py>(
     // the seed snapshot). Kinds with an analytic, centers-free basis
     // (periodic, sphere, torus) refresh as usual.
     let atom_centers: Vec<Option<Array2<f64>>> = vec![None; atom_basis.len()];
+    let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
+    let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
     sae_manifold_fit_inner(
         py,
         z.as_array(),
@@ -9167,6 +9178,8 @@ fn sae_manifold_fit<'py>(
         // auto path, so do not re-seed here (random_state unused when off).
         false,
         0,
+        fisher_u,
+        fisher_mr,
     )
 }
 
@@ -9200,6 +9213,14 @@ fn sae_manifold_fit_inner<'py>(
     native_ard_enabled: bool,
     seed_refine_routing: bool,
     seed_refine_random_state: u64,
+    // WP-D output-Fisher shard (#980). Magic-by-default: the *presence* of
+    // `fisher_u` activates `RowMetric::OutputFisher` — there is no flag. `fisher_u`
+    // is `(n_obs, p_out, rank)` row-major (`U[n, i, k]`), exactly the harvest
+    // shard's `U`; `fisher_mass_residual` is the per-row truncation diagnostic
+    // `trace(G_n) − Σ_{k≤r} λ_k` that rides into the report so a too-small rank is
+    // visible, not silent. Absent ⇒ the bit-identical Euclidean / isotropic path.
+    fisher_u: Option<ArrayView3<'_, f64>>,
+    fisher_mass_residual: Option<ArrayView1<'_, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let analytic_penalties: Option<serde_json::Value> = match analytic_penalties {
         Some(s) => Some(serde_json::from_str(&s).map_err(|e| py_value_error(e.to_string()))?),
@@ -9454,6 +9475,66 @@ fn sae_manifold_fit_inner<'py>(
         .map_err(py_value_error)?;
     }
 
+    // WP-D → fit wiring (#980): if a per-row output-Fisher shard was supplied,
+    // build the single `RowMetric::OutputFisher` and install it on the term via
+    // `set_row_metric` *before* the objective consumes the term. This is the only
+    // way the gauge acquires a non-identity weight, and it flips the provenance to
+    // `OutputFisher` (the likelihood stays untouched — the inner product only
+    // drives the isometry gauge, per `RowMetric::whitens_likelihood` == false for
+    // `OutputFisher`). Magic-by-default: presence of `fisher_u` activates it; no
+    // flag. The factor stack is `(n_obs, p_out, rank)` row-major, reshaped to the
+    // `(n_obs, p_out * rank)` layout `RowMetric::output_fisher` expects
+    // (`u[n, i * rank + k] = U[n, i, k]`). Shapes are validated at the boundary.
+    let metric_provenance: &'static str = if let Some(u3) = fisher_u {
+        let u_shape = u3.shape();
+        if u_shape[0] != n_obs || u_shape[1] != p_out {
+            return Err(py_value_error(format!(
+                "sae_manifold_fit: fisher_factors U must be (n, p, r)=({n_obs}, {p_out}, r); \
+                 got leading dims ({}, {})",
+                u_shape[0], u_shape[1]
+            )));
+        }
+        let rank = u_shape[2];
+        if rank == 0 {
+            return Err(py_value_error(
+                "sae_manifold_fit: fisher_factors U rank (last axis) must be >= 1".to_string(),
+            ));
+        }
+        if rank > p_out {
+            return Err(py_value_error(format!(
+                "sae_manifold_fit: fisher_factors U rank {rank} exceeds output dim p={p_out}"
+            )));
+        }
+        if let Some(mr) = fisher_mass_residual.as_ref() {
+            if mr.len() != n_obs {
+                return Err(py_value_error(format!(
+                    "sae_manifold_fit: fisher_factors mass_residual must be (n,)=({n_obs},); got \
+                     length {}",
+                    mr.len()
+                )));
+            }
+        }
+        // Flatten (n, p, r) row-major -> (n, p*r) with u[n, i*r + k] = U[n, i, k].
+        let mut u_flat = Array2::<f64>::zeros((n_obs, p_out * rank));
+        for row in 0..n_obs {
+            for i in 0..p_out {
+                for k in 0..rank {
+                    u_flat[[row, i * rank + k]] = u3[[row, i, k]];
+                }
+            }
+        }
+        let metric = gam::inference::row_metric::RowMetric::output_fisher(
+            std::sync::Arc::new(u_flat),
+            p_out,
+            rank,
+        )
+        .map_err(py_value_error)?;
+        base_term.set_row_metric(metric).map_err(py_value_error)?;
+        "OutputFisher"
+    } else {
+        "Euclidean"
+    };
+
     let log_ard: Vec<Array1<f64>> = atom_dim
         .iter()
         .map(|&d| {
@@ -9659,6 +9740,18 @@ fn sae_manifold_fit_inner<'py>(
     // Gaussian reconstruction scale φ̂ used to scale every per-atom decoder
     // covariance (Cov(β_k) = φ̂·S_β⁻¹[block]).
     out.set_item("dispersion", shape_uncertainty.dispersion)?;
+    // Provenance of the per-row inner product the fit installed (#980). Object 4
+    // reads this to certify which metric the gauge pulled back through:
+    // "Euclidean" (no shard, bit-identical isotropic path) or "OutputFisher"
+    // (a WP-D shard was supplied and `RowMetric::OutputFisher` was installed).
+    out.set_item("metric_provenance", metric_provenance)?;
+    // Truncation diagnostic: per-row output-Fisher mass `trace(G_n) − Σ_{k≤r} λ_k`
+    // that fell off the captured rank-r subspace. Surfaced so a too-small rank is
+    // visible, not silent. Present only when a Fisher shard with a mass_residual
+    // was supplied.
+    if let Some(mr) = fisher_mass_residual {
+        out.set_item("fisher_mass_residual", mr.to_owned().into_pyarray(py))?;
+    }
     Ok(out.unbind())
 }
 
@@ -9736,6 +9829,11 @@ fn sae_manifold_fit_ibp<'py>(
         None,
         // IBP-MAP never reaches the JumpReLU dispatch; threshold is inert here.
         0.0,
+        // No output-Fisher shard on this convenience IBP entry point; the
+        // metric stays Euclidean (the precomputed-basis `sae_manifold_fit` and
+        // the auto `sae_manifold_fit_minimal` entry points carry the shard).
+        None,
+        None,
     )
 }
 
@@ -11187,7 +11285,10 @@ fn sae_build_atom_plans(
     initial_coords = None,
     jumprelu_threshold = 0.0,
     native_ard_enabled = true,
+    fisher_factors = None,
+    fisher_mass_residual = None,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -11211,6 +11312,12 @@ fn sae_manifold_fit_minimal<'py>(
     initial_coords: Option<PyReadonlyArray3<'py, f64>>,
     jumprelu_threshold: f64,
     native_ard_enabled: bool,
+    // WP-D output-Fisher shard (#980). `(n, p, r)` f64 factors; presence activates
+    // `RowMetric::OutputFisher`. This is the entry point the high-level Python
+    // `sae_manifold_fit` facade routes through, so it carries the shard the same
+    // magic-by-default way as the precomputed-basis `sae_manifold_fit`.
+    fisher_factors: Option<PyReadonlyArray3<'py, f64>>,
+    fisher_mass_residual: Option<PyReadonlyArray1<'py, f64>>,
 ) -> PyResult<Py<PyDict>> {
     let z_view = z.as_array();
     let (n_obs, _p_out) = z_view.dim();
@@ -11422,6 +11529,8 @@ fn sae_manifold_fit_minimal<'py>(
         .iter()
         .map(|plan| plan.duchon_centers.clone())
         .collect();
+    let fisher_u = fisher_factors.as_ref().map(|f| f.as_array());
+    let fisher_mr = fisher_mass_residual.as_ref().map(|m| m.as_array());
     let result_dict = sae_manifold_fit_inner(
         py,
         z_view,
@@ -11456,6 +11565,12 @@ fn sae_manifold_fit_minimal<'py>(
         // start (amortized encoder, #357) is respected verbatim.
         logits_are_cold && initial_coords.is_none(),
         random_state,
+        // WP-D → fit wiring (#980): thread the optional output-Fisher shard
+        // through so the auto facade installs `RowMetric::OutputFisher` the same
+        // magic-by-default way as the precomputed-basis `sae_manifold_fit`.
+        // Absent ⇒ the bit-identical Euclidean path.
+        fisher_u,
+        fisher_mr,
     )?;
     // Attach per-atom build plans so OOS predict can rebuild design without Python.
     let plans_py = PyList::empty(py);

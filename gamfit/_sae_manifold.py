@@ -346,6 +346,17 @@ class ManifoldSAE:
     # Gaussian reconstruction scale phi-hat that scales every per-atom decoder
     # covariance (Cov(beta_k) = phi * S_beta^{-1}[block]).
     dispersion: float = 1.0
+    # Provenance of the per-row inner product the fit installed (#980):
+    # ``"Euclidean"`` (no shard, bit-identical isotropic path) or
+    # ``"OutputFisher"`` (a WP-D output-Fisher shard was supplied and
+    # ``RowMetric::OutputFisher`` was installed for the gauge/lens). The
+    # likelihood is untouched either way.
+    metric_provenance: str = "Euclidean"
+    # Per-row output-Fisher truncation diagnostic ``(n,)`` =
+    # ``trace(G_n) - sum_{k<=r} lambda_k``, the mass that fell off the captured
+    # rank-r subspace. ``None`` when no shard (or no mass_residual) was supplied.
+    # Surfaced so a too-small rank ``r`` is visible, not silent.
+    fisher_mass_residual: np.ndarray | None = None
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -416,6 +427,15 @@ class ManifoldSAE:
             top_k=None if top_k is None else int(top_k),
             jumprelu_threshold=float(jumprelu_threshold),
             dispersion=float(payload["dispersion"]),
+            # WP-D → fit wiring (#980): surface the metric provenance and the
+            # per-row truncation diagnostic the Rust fit reports. Absent ⇒ the
+            # Euclidean default (no output-Fisher shard was installed).
+            metric_provenance=str(payload.get("metric_provenance", "Euclidean")),
+            fisher_mass_residual=(
+                None
+                if payload.get("fisher_mass_residual") is None
+                else np.asarray(payload["fisher_mass_residual"], dtype=float)
+            ),
         )
 
     def _periodic_top1_projection_payload(self, x: np.ndarray) -> dict[str, Any]:
@@ -960,7 +980,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                      decoder_incoherence_weight: float = 1.0,
                      top_k: int | None = None, t_init: Any = None, a_init: Any = None,
                      tau: float | None = None, jumprelu_threshold: float = 0.0,
-                     atom_basis: Any = None) -> ManifoldSAE:
+                     atom_basis: Any = None, fisher_factors: Any = None) -> ManifoldSAE:
     """Fit an SAE-manifold model.
 
     Parameters
@@ -1072,6 +1092,17 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
     atom_basis
         Per-atom basis kind(s). If supplied with ``atom_topology``, both must
         resolve to the same topology.
+    fisher_factors
+        Optional WP-D output-Fisher shard (#980). Accepts a
+        :class:`gamfit.torch.harvest.HarvestShard`, the dict returned by
+        :func:`gamfit.torch.harvest.load_harvest_shard`, or a raw ``(n, p, r)``
+        factor array. Its *presence* installs ``RowMetric::OutputFisher`` for the
+        isometry gauge / lens — there is no flag (magic by default). The metric
+        does not whiten the reconstruction likelihood, so with the isometry gauge
+        off (the default) the data-fit is identical to the Euclidean fit; the
+        result's ``metric_provenance`` reports ``"OutputFisher"`` and the per-row
+        ``fisher_mass_residual`` truncation diagnostic rides into the model.
+        ``None`` (default) keeps the bit-identical Euclidean path.
 
     Returns
     -------
@@ -1137,6 +1168,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
             f"sae_manifold_fit requires n > K (more observations than atoms); "
             f"got n={n_obs}, K={k_atoms}"
         )
+    # WP-D output-Fisher shard (#980). Magic-by-default: a non-None
+    # `fisher_factors` (HarvestShard / load_harvest_shard dict / raw (n, p, r)
+    # array) activates `RowMetric::OutputFisher` in the Rust core. Validate +
+    # coerce here against the (n, p) response; ship the (n, p, r) U and the
+    # optional (n,) mass_residual through the FFI. Absent ⇒ Euclidean path.
+    fisher_shard = _normalize_fisher_factors(fisher_factors, n_obs, int(x.shape[1]))
     dims = _dims(k_atoms, d_atom)
     # Eager d_atom validation (issue #184). A zero-dimensional atom carries
     # no manifold coordinate, contributes nothing to reconstruction, and
@@ -1308,7 +1345,11 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
                 f"sae_manifold_fit: t_init D_max={coords_init.shape[2]} is too small for "
                 f"max atom dim {d_max}"
             )
-    if logits_init is None and coords_init is None:
+    # The closed-form disjoint-periodic fast path solves each atom in the
+    # Euclidean response geometry and never reaches the FFI that installs
+    # `RowMetric::OutputFisher`. When a WP-D shard is supplied the metric must
+    # be honoured, so skip the shortcut and route through the joint FFI fit.
+    if logits_init is None and coords_init is None and fisher_shard is None:
         separable_fit = _fit_disjoint_periodic_top1(
             x,
             bases=[str(b) for b in bases],
@@ -1348,6 +1389,8 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         initial_logits=logits_init,
         initial_coords=coords_init,
         jumprelu_threshold=float(jumprelu_threshold),
+        fisher_factors=None if fisher_shard is None else fisher_shard[0],
+        fisher_mass_residual=None if fisher_shard is None else fisher_shard[1],
     )
     payload_dict = dict(payload)
     return ManifoldSAE.from_payload(
@@ -1542,6 +1585,72 @@ def _as_2d_float(value: Any, name: str) -> np.ndarray:
     if arr.ndim != 2 or not np.all(np.isfinite(arr)):
         raise ValueError(f"{name} must be a finite 1D or 2D numeric array")
     return np.ascontiguousarray(arr)
+
+
+def _normalize_fisher_factors(
+    fisher_factors: Any, n_obs: int, p_out: int
+) -> tuple[np.ndarray, np.ndarray | None] | None:
+    """Coerce a WP-D output-Fisher shard into the ``(U, mass_residual)`` the
+    Rust ``sae_manifold_fit_minimal`` FFI consumes (#980).
+
+    ``fisher_factors`` may be: ``None`` (Euclidean, no shard); a
+    :class:`gamfit.torch.harvest.HarvestShard` (``.U`` ``(n, p, r)`` /
+    ``.mass_residual`` ``(n,)``); the dict returned by
+    :func:`gamfit.torch.harvest.load_harvest_shard` (keys ``"U"`` /
+    ``"mass_residual"``); or a raw ``(n, p, r)`` array (no diagnostic). The
+    *presence* of a non-``None`` value activates ``RowMetric::OutputFisher`` —
+    there is no flag (magic by default). The U layout ``U[n, i, k]`` is shipped
+    verbatim as a contiguous ``(n, p, r)`` f64 array; the Rust boundary flattens
+    it row-major to ``u[n, i * r + k]`` for ``RowMetric::output_fisher``.
+    """
+    if fisher_factors is None:
+        return None
+    # HarvestShard dataclass or load_harvest_shard() dict — both carry U +
+    # mass_residual; a bare array carries only U.
+    if hasattr(fisher_factors, "U") and hasattr(fisher_factors, "mass_residual"):
+        u_src: Any = fisher_factors.U
+        mr_src: Any = fisher_factors.mass_residual
+    elif isinstance(fisher_factors, Mapping):
+        if "U" not in fisher_factors:
+            raise ValueError(
+                "fisher_factors mapping must contain a 'U' (n, p, r) array"
+            )
+        u_src = fisher_factors["U"]
+        mr_src = fisher_factors.get("mass_residual")
+    else:
+        u_src = fisher_factors
+        mr_src = None
+    u = np.asarray(u_src, dtype=np.float64)
+    if u.ndim != 3:
+        raise ValueError(
+            f"fisher_factors U must be (n, p, r); got shape {u.shape}"
+        )
+    if u.shape[0] != n_obs or u.shape[1] != p_out:
+        raise ValueError(
+            f"fisher_factors U must be (n, p, r) = ({n_obs}, {p_out}, r); "
+            f"got leading dims {u.shape[:2]}"
+        )
+    rank = int(u.shape[2])
+    if rank < 1:
+        raise ValueError("fisher_factors U rank (last axis) must be >= 1")
+    if rank > p_out:
+        raise ValueError(
+            f"fisher_factors U rank {rank} exceeds output dim p={p_out}"
+        )
+    if not np.all(np.isfinite(u)):
+        raise ValueError("fisher_factors U must be finite")
+    u = np.ascontiguousarray(u)
+    if mr_src is None:
+        return u, None
+    mr = np.asarray(mr_src, dtype=np.float64)
+    if mr.shape != (n_obs,):
+        raise ValueError(
+            f"fisher_factors mass_residual must be (n,) = ({n_obs},); "
+            f"got shape {mr.shape}"
+        )
+    if not np.all(np.isfinite(mr)):
+        raise ValueError("fisher_factors mass_residual must be finite")
+    return u, np.ascontiguousarray(mr)
 
 
 def _dims(k_atoms: int, d_atom: Any) -> list[int]:
