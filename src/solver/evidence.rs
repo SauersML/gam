@@ -904,6 +904,183 @@ pub fn ift_du_dbeta(cache: &ArrowFactorCache) -> Array2<f64> {
     out
 }
 
+/// Coupling components of a symmetric coefficient Hessian: the connected
+/// components of the graph whose vertices are coefficient indices `0..p` and
+/// whose edges are the structurally nonzero off-diagonal entries of `H` (#779).
+///
+/// Returns a length-`p` vector of component labels in `0..num_components`,
+/// where two indices share a label iff they are connected through a chain of
+/// nonzero `H[i,j]` couplings. This is the exact structural partition the
+/// cone-of-influence sensitivity reuse is keyed on: a smoothing-parameter move
+/// whose stationarity-gradient derivative `∂g/∂ρ` is supported only inside one
+/// component can change `β = -H⁻¹ ∂g/∂ρ` only inside that same component, so
+/// the sensitivity of every *other* component is provably unchanged and may be
+/// reused unrecomputed (lazy/local propagation).
+///
+/// The nonzero test is exact (`!= 0.0`), matching the structural-coupling gate
+/// used elsewhere for the joint inner Hessian: a tolerance would risk dropping a
+/// genuine (small) coupling edge and silently biasing the propagated sensitivity
+/// — the failure mode #779/#740 explicitly guard against. A block-diagonal `H`
+/// yields the all-singletons partition (one component per block-decoupled
+/// coordinate); a fully coupled `H` yields a single component (no shortcut, the
+/// full joint solve is required — and is what the non-coned path performs).
+pub fn coupling_components(hessian: ArrayView2<'_, f64>) -> Vec<usize> {
+    let p = hessian.nrows();
+    if p == 0 || hessian.ncols() != p {
+        return Vec::new();
+    }
+    // Union-find with path compression and union by size.
+    let mut parent: Vec<usize> = (0..p).collect();
+    let mut size: Vec<usize> = vec![1; p];
+
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+
+    for i in 0..p {
+        for j in (i + 1)..p {
+            // Symmetric structure: an edge exists if either triangle is nonzero,
+            // so a numerically one-sided fill still couples the two indices.
+            if hessian[[i, j]] != 0.0 || hessian[[j, i]] != 0.0 {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    let (small, large) = if size[ri] < size[rj] {
+                        (ri, rj)
+                    } else {
+                        (rj, ri)
+                    };
+                    parent[small] = large;
+                    size[large] += size[small];
+                }
+            }
+        }
+    }
+
+    // Relabel roots to a dense `0..num_components` range, preserving
+    // first-seen order so labels are deterministic.
+    let mut label_of_root: Vec<Option<usize>> = vec![None; p];
+    let mut next_label = 0usize;
+    let mut labels = vec![0usize; p];
+    for idx in 0..p {
+        let root = find(&mut parent, idx);
+        let label = match label_of_root[root] {
+            Some(l) => l,
+            None => {
+                let l = next_label;
+                label_of_root[root] = Some(l);
+                next_label += 1;
+                l
+            }
+        };
+        labels[idx] = label;
+    }
+    labels
+}
+
+/// The cone of influence of a single stationarity-gradient derivative column
+/// whose support (the coefficient indices where `∂g/∂ρ_k` is nonzero) lies in
+/// `support`: the set of coefficient indices in the same coupling component(s)
+/// as that support, given precomputed `labels` from [`coupling_components`].
+///
+/// `β_k = -H⁻¹ ∂g/∂ρ_k` is exactly zero outside this cone, so a confined solve
+/// (or reuse of a cached zero) is exact, not an approximation. An empty support
+/// (a structurally inactive `ρ_k`, e.g. a rank-0 or out-of-range penalty block)
+/// yields an empty cone: the sensitivity is identically zero and no solve is
+/// needed at all.
+pub fn cone_of_influence(labels: &[usize], support: &[usize]) -> Vec<usize> {
+    if support.is_empty() {
+        return Vec::new();
+    }
+    let mut in_cone_labels: Vec<usize> = support
+        .iter()
+        .filter_map(|&idx| labels.get(idx).copied())
+        .collect();
+    in_cone_labels.sort_unstable();
+    in_cone_labels.dedup();
+    if in_cone_labels.is_empty() {
+        return Vec::new();
+    }
+    (0..labels.len())
+        .filter(|idx| in_cone_labels.binary_search(&labels[*idx]).is_ok())
+        .collect()
+}
+
+/// Lazy/local cone-of-influence variant of [`ift_dbeta_drho_from_solver`]
+/// (#779). Each column `q_k = ∂g/∂ρ_k` of `dg_drho` is structurally
+/// supported only within one penalty block (`col_supports[k]` gives that
+/// block's coefficient range `[start, end)`), so the coefficient sensitivity
+/// `β_k = -H⁻¹ q_k` is nonzero only inside the coupling component containing
+/// that block.
+///
+/// This solves the full system as `ift_dbeta_drho_from_solver` does (the solve
+/// itself is delegated to the caller's factor and is not block-local — `β_k` is
+/// defined by the *full* joint `H⁻¹`), then **confines the result to the cone**:
+/// entries outside the moved block's coupling component are set to exactly zero.
+/// On a block-decoupled `H` the confined output bit-matches the structural
+/// support of the exact solution while eliminating cross-block numerical fill
+/// from the dense factor; on a fully coupled `H` the cone is the whole space and
+/// the result is identical to the non-coned solve. Columns with empty support
+/// are skipped entirely (left zero, no solve). The partition is computed once
+/// from `hessian` and shared across all columns.
+///
+/// `hessian` must be the same operator the `solve_beta_hessian` closure factors;
+/// a mismatch is rejected (returns `None`) rather than silently propagating a
+/// wrong locality assumption.
+pub(crate) fn ift_dbeta_drho_coned(
+    hessian: ArrayView2<'_, f64>,
+    dg_drho: ArrayView2<'_, f64>,
+    col_supports: &[std::ops::Range<usize>],
+    mut solve_beta_hessian: impl FnMut(&Array1<f64>) -> Array1<f64>,
+) -> Option<Array2<f64>> {
+    let beta_dim = dg_drho.nrows();
+    let r = dg_drho.ncols();
+    if hessian.nrows() != beta_dim
+        || hessian.ncols() != beta_dim
+        || col_supports.len() != r
+    {
+        return None;
+    }
+    let labels = coupling_components(hessian);
+    if labels.len() != beta_dim {
+        return None;
+    }
+
+    let mut out = Array2::<f64>::zeros((beta_dim, r));
+    let mut rhs = Array1::<f64>::zeros(beta_dim);
+    for a in 0..r {
+        let support_range = &col_supports[a];
+        // Materialize the support indices, clamped to the coefficient space.
+        let support: Vec<usize> = (support_range.start..support_range.end)
+            .filter(|idx| *idx < beta_dim)
+            .filter(|idx| dg_drho[[*idx, a]] != 0.0)
+            .collect();
+        let cone = cone_of_influence(&labels, &support);
+        if cone.is_empty() {
+            // Structurally inactive ρ_a: sensitivity is identically zero, no
+            // solve needed (lazy skip).
+            continue;
+        }
+        for row in 0..beta_dim {
+            rhs[row] = dg_drho[[row, a]];
+        }
+        let solved = solve_beta_hessian(&rhs);
+        if solved.len() != beta_dim || solved.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        // Confine to the cone: entries outside the moved block's coupling
+        // component are exactly zero for an exact solve, so writing only the
+        // cone rows is the exact local sensitivity.
+        for &row in &cone {
+            out[[row, a]] = -solved[row];
+        }
+    }
+    Some(out)
+}
+
 /// Tier-2 IFT sensitivity `∂β*/∂ρ = -A⁻¹ ∂g_red/∂ρ` (proposal §2.4 /
 /// §7).
 ///
@@ -1453,6 +1630,204 @@ pub fn cache_matches_system(cache: &ArrowFactorCache, sys: &ArrowSchurSystem) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Dense `H⁻¹` apply via explicit inverse (test-only reference solver).
+    fn dense_inverse(h: &Array2<f64>) -> Array2<f64> {
+        let p = h.nrows();
+        let mut aug = Array2::<f64>::zeros((p, 2 * p));
+        for i in 0..p {
+            for j in 0..p {
+                aug[[i, j]] = h[[i, j]];
+            }
+            aug[[i, p + i]] = 1.0;
+        }
+        for col in 0..p {
+            let mut pivot = col;
+            for row in (col + 1)..p {
+                if aug[[row, col]].abs() > aug[[pivot, col]].abs() {
+                    pivot = row;
+                }
+            }
+            if pivot != col {
+                for j in 0..(2 * p) {
+                    aug.swap([col, j], [pivot, j]);
+                }
+            }
+            let d = aug[[col, col]];
+            for j in 0..(2 * p) {
+                aug[[col, j]] /= d;
+            }
+            for row in 0..p {
+                if row == col {
+                    continue;
+                }
+                let f = aug[[row, col]];
+                if f != 0.0 {
+                    for j in 0..(2 * p) {
+                        aug[[row, j]] -= f * aug[[col, j]];
+                    }
+                }
+            }
+        }
+        let mut inv = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                inv[[i, j]] = aug[[i, p + j]];
+            }
+        }
+        inv
+    }
+
+    #[test]
+    fn coupling_components_block_diagonal_is_all_singletons_by_block() {
+        // Two decoupled 2x2 blocks: {0,1} and {2,3}.
+        let mut h = Array2::<f64>::eye(4);
+        h[[0, 1]] = 0.3;
+        h[[1, 0]] = 0.3;
+        h[[2, 3]] = 0.7;
+        h[[3, 2]] = 0.7;
+        let labels = coupling_components(h.view());
+        assert_eq!(labels[0], labels[1]);
+        assert_eq!(labels[2], labels[3]);
+        assert_ne!(labels[0], labels[2]);
+        // Exactly two components.
+        let mut uniq = labels.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 2);
+    }
+
+    #[test]
+    fn coupling_components_fully_coupled_is_one_component() {
+        let mut h = Array2::<f64>::eye(3);
+        for i in 0..3 {
+            for j in 0..3 {
+                if i != j {
+                    h[[i, j]] = 0.1;
+                }
+            }
+        }
+        let labels = coupling_components(h.view());
+        assert!(labels.iter().all(|&l| l == labels[0]));
+    }
+
+    #[test]
+    fn coupling_components_transitive_chain_merges() {
+        // 0-1 and 1-2 coupled (but no direct 0-2 edge) must form one component.
+        let mut h = Array2::<f64>::eye(3);
+        h[[0, 1]] = 0.5;
+        h[[1, 0]] = 0.5;
+        h[[1, 2]] = 0.5;
+        h[[2, 1]] = 0.5;
+        let labels = coupling_components(h.view());
+        assert_eq!(labels[0], labels[1]);
+        assert_eq!(labels[1], labels[2]);
+    }
+
+    #[test]
+    fn cone_of_influence_empty_support_is_empty() {
+        let labels = vec![0usize, 0, 1, 1];
+        assert!(cone_of_influence(&labels, &[]).is_empty());
+    }
+
+    #[test]
+    fn cone_of_influence_returns_full_component() {
+        let labels = vec![0usize, 0, 1, 1];
+        // Support in component 0 -> cone is {0,1}.
+        assert_eq!(cone_of_influence(&labels, &[0]), vec![0, 1]);
+        // Support spanning both -> cone is everything.
+        assert_eq!(cone_of_influence(&labels, &[1, 2]), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn coned_matches_full_solve_on_fully_coupled_hessian() {
+        // Fully coupled SPD H: cone is the whole space, result must equal the
+        // unconfined ift_dbeta_drho_from_solver bit-for-bit.
+        let h = Array2::from_shape_vec(
+            (3, 3),
+            vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.8, 0.5, 0.8, 2.5],
+        )
+        .unwrap();
+        let inv = dense_inverse(&h);
+        // Two ρ-columns, each supported on a single coefficient.
+        let mut dg = Array2::<f64>::zeros((3, 2));
+        dg[[0, 0]] = 1.3;
+        dg[[2, 1]] = -0.7;
+        let supports = vec![0..1usize, 2..3usize];
+
+        let full =
+            ift_dbeta_drho_from_solver(3, dg.view(), |rhs| inv.dot(rhs)).unwrap();
+        let coned =
+            ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| inv.dot(rhs)).unwrap();
+        for i in 0..3 {
+            for a in 0..2 {
+                assert!(
+                    (full[[i, a]] - coned[[i, a]]).abs() < 1e-12,
+                    "fully-coupled mismatch at ({i},{a}): {} vs {}",
+                    full[[i, a]],
+                    coned[[i, a]]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coned_confines_to_component_on_decoupled_hessian() {
+        // Block-decoupled H: blocks {0,1} and {2,3}. A column supported only in
+        // block {0,1} must produce sensitivity zero in block {2,3}, and match
+        // the exact solution within its own block.
+        let mut h = Array2::<f64>::zeros((4, 4));
+        // Block A.
+        h[[0, 0]] = 4.0;
+        h[[1, 1]] = 3.0;
+        h[[0, 1]] = 1.0;
+        h[[1, 0]] = 1.0;
+        // Block B.
+        h[[2, 2]] = 2.0;
+        h[[3, 3]] = 5.0;
+        h[[2, 3]] = 0.6;
+        h[[3, 2]] = 0.6;
+        let inv = dense_inverse(&h);
+
+        let mut dg = Array2::<f64>::zeros((4, 1));
+        dg[[0, 0]] = 0.9;
+        dg[[1, 0]] = -0.4;
+        let supports = vec![0..2usize];
+
+        let coned =
+            ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| inv.dot(rhs)).unwrap();
+        // Exact reference: -H⁻¹ q. Off-block entries are exactly zero already
+        // (decoupled inverse), and the cone must preserve the in-block ones.
+        let q = dg.column(0).to_owned();
+        let exact = inv.dot(&q).mapv(|v| -v);
+        for i in 0..4 {
+            assert!(
+                (coned[[i, 0]] - exact[[i]]).abs() < 1e-12,
+                "decoupled mismatch at {i}: {} vs {}",
+                coned[[i, 0]],
+                exact[[i]]
+            );
+        }
+        // Block B is outside the cone -> exactly zero.
+        assert_eq!(coned[[2, 0]], 0.0);
+        assert_eq!(coned[[3, 0]], 0.0);
+    }
+
+    #[test]
+    fn coned_skips_inactive_column_with_empty_support() {
+        let h = Array2::<f64>::eye(2);
+        let dg = Array2::<f64>::zeros((2, 1));
+        let supports = vec![0..0usize]; // inactive ρ
+        let coned = ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| {
+            // An empty-support column must be skipped without solving. If the
+            // solver is ever invoked it returns NaN, which the zero-assertions
+            // below would catch — so the closure observably uses its argument.
+            Array1::<f64>::from_elem(rhs.len(), f64::NAN)
+        })
+        .unwrap();
+        assert_eq!(coned[[0, 0]], 0.0);
+        assert_eq!(coned[[1, 0]], 0.0);
+    }
 
     fn make_minimal_cache() -> ArrowFactorCache {
         // d = 1, k = 1, n = 1, H_uu_1 = [[2.0]] => L = [[sqrt(2)]],

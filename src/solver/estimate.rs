@@ -1479,6 +1479,12 @@ fn compute_smoothing_correction(
     // coefficient-space prediction correction and the joint-evidence
     // Arrow-Schur path on the same hand-derived IFT identity.
     let mut dg_drho_trans = Array2::<f64>::zeros((n_coeffs_trans, n_rho));
+    // Per-ρ_k support: the coefficient range its stationarity-gradient
+    // derivative ∂g/∂ρ_k is nonzero on. Each column is block-local (only the
+    // k-th penalty block), so this is exactly cp.col_range; structurally
+    // inactive columns keep an empty support and the cone-of-influence solve
+    // skips them entirely (their sensitivity is identically zero). See #779.
+    let mut col_supports: Vec<std::ops::Range<usize>> = vec![0..0; n_rho];
     for k in 0..n_rho {
         if k >= ct.len() {
             continue;
@@ -1489,6 +1495,7 @@ fn compute_smoothing_correction(
         }
         // S_k(β - μ) — block-local: R^T (R (β[block] - μ)), embedded into p-vector.
         let r = &cp.col_range;
+        col_supports[k] = r.start..r.end;
         let beta_block = beta_trans.slice(s![r.start..r.end]);
         let centered = &beta_block - &cp.prior_mean;
         let r_beta = cp.root.dot(&centered);
@@ -1499,9 +1506,15 @@ fn compute_smoothing_correction(
                     .sum::<f64>();
         }
     }
-    let jacobian_trans = match crate::solver::evidence::ift_dbeta_drho_from_solver(
-        n_coeffs_trans,
+    // Lazy/local cone-of-influence propagation (#779): confine each column's
+    // sensitivity to the coupling component of `h_trans` containing the moved
+    // penalty block, and skip structurally inactive columns. Exact on a
+    // block-decoupled Hessian (entries outside the cone are identically zero)
+    // and identical to the full joint solve on a fully coupled Hessian.
+    let jacobian_trans = match crate::solver::evidence::ift_dbeta_drho_coned(
+        h_trans.view(),
         dg_drho_trans.view(),
+        &col_supports,
         |rhs| h_chol.solvevec(rhs),
     ) {
         Some(jacobian) => jacobian,
