@@ -24,6 +24,31 @@ The software is an engine for **penalized maximum-likelihood / generalized addit
 
 The three technical sections that follow are self-contained. Read each section's notation block first.
 
+## Triage — do not spend cognition rediscovering what we already have
+
+For several problems below **we already hold a candidate answer** (stated here). For those, **do not re-derive from scratch**: your job is exactly one of (a) supply the *rigorous proof* we cannot fully certify without running anything, ideally with a self-checking identity; (b) find a *flaw or counterexample*; or (c) *generalize* beyond the regime we have solved. We flag these **[KNOWN — verify / refute / generalize]**. The remaining problems are genuinely open and are where your effort should go — flagged **[OPEN FRONTIER]**.
+
+**[KNOWN — verify / refute / generalize]:**
+
+- **Grassmann distance / cut-locus (Sec. 3 P1).** Our answer: the Riemannian geodesic distance is `d = sqrt(Σ_i arccos²(σ_i))`, `σ_i =` singular values of `YᵀZ` (orthonormal bases), i.e. the principal-angle arc-length. The projector/chordal metric `‖P_Y−P_Z‖_F = √2·sqrt(Σ_i sin²θ_i)` is a *different* metric — it agrees with the geodesic only to 2nd order as `θ→0` and diverges as `θ→π/2`, so a reference tool reporting the projector metric is simply not computing the geodesic. At the cut locus (`θ_i = π/2`) the minimizing geodesic is non-unique. Optimal numerical conditioning: recover small angles from the *sine* (`arcsin`/`atan2` of the singular values of the rejection block `Y − Z(ZᵀY)`), never from `arccos(σ)` near `σ=1` (infinite slope). **Your job:** prove the closed-form gap between the two metrics; prove the sine-based extraction attains uniform machine precision over `θ∈[0,π/2]`; give the correct distance/log-map at the cut locus.
+
+- **Profiled outer-Hessian θ-HVP (Sec. 1 P2).** Our answer: `Hess_θ[g]·v = (V_θθ − V_θβ H⁻¹ V_βθ)·v` (Schur complement of the full KKT Hessian), realized matrix-free via the IFT sensitivity `β̇[v] = −H⁻¹ (∂²F/∂β∂θ) v` plus the log-determinant directional-trace terms; `H = ∂²F/∂β²`. **Your job:** prove it equals the dense pairwise outer Hessian; derive the *exact* first- and second-order log-det directional-trace terms (the fiddly part); prove symmetry and give a symmetry-preserving quadratic-form realization; give an FD-free correctness certificate (a scalar two-route identity).
+
+- **Projected log-det gradient (Sec. 1 P1).** Our candidate: the moving-subspace pathology is an artifact of differentiating the *range(S_λ)-projected* realization `log|U_Sᵀ H U_S|`; reformulating onto the full generalized determinant `log|H+S_λ|₊` over `range(H+S_λ)` gives a gradient `½ tr((H+S_λ)⁺ Ḣ)` with **no** moving-subspace term, valid for every θ-direction. **Your job (real teeth here):** *prove or refute* that the full-subspace realization equals the intended LAML semantics up to a θ-independent constant for the rank-deficient GLM case — or exhibit the exact regime where they differ and give the corrected object. (If you must keep the projected form, give the exact moving-projector derivative `Ṗ = S_λ⁺ Ṡ_λ (I−P) + (·)ᵀ` and the resulting trace identity, and prove it matches the finite-difference limit.)
+
+- **Survival warp↔scale gauge (Sec. 2 P2).** SOLVED — included only as a worked exemplar of the gauge-breaking principle. The reduced regime is fully resolved (route `log t` through the σ-scaled location channel so the event-Jacobian gains the `−log σ` term that breaks the multiplicative degeneracy). **Your job:** only the *flexible* (free monotone I-spline warp) generalization is open — the residual affine-null-space degeneracy and its minimal non-biasing identifying constraint.
+
+- **Random-slope BLUP / EDF (Sec. 2 P3 addendum).** Largely known (penalized-spline REML ↔ mixed-model BLUP equivalence). Verify/strengthen only.
+
+- **Cone of influence (Sec. 1 P3).** Largely known (connected components of the coupling graph of `H` and the support of `∂²F/∂β∂θ_i`; exactness from structural — not numerical — zeros). Verify/strengthen + give the exact per-row attribution.
+
+**[OPEN FRONTIER — spend your cognition here]:**
+
+- **Conditional-shift identification (Sec. 2 P1, #905/#461).** The *sharp* results: the unique minimal-sufficient conditional correction for `z | PC`; the **exact finite-sample null distribution** of the conditional-shift diagnostic; the **semiparametric efficiency bound** of the orthogonalized marginal-slope score; and a proof of uniqueness of the minimal correction. (The bias form `b(PC)·m(PC)` and "use a Neyman-orthogonal score" we already have — the sharp characterizations we do not.)
+- **Multinomial gauge-invariant well-posed REML (Sec. 2 P3, #715).** A gauge-invariant REML criterion and a *provably well-posed* smoothing-parameter seed under BOTH the sum-to-zero null space AND the `W = diag(p)−ppᵀ → 0` near-separation degeneracy; an optimal preconditioner with a proven conditioning bound. Genuinely open.
+- **Matérn admissible-penalty rule (Sec. 3 P2, #902).** The precise `(ν, d) →` admissible derivative-seminorm-penalty-set rule from Matérn-RKHS = Sobolev `H^{ν+d/2}` theory (which seminorms are finite), stated exactly.
+- **The unification.** A single theorem on differentiating a profiled/constrained criterion through a *moving subspace*, plus gauge-breaking + Neyman-orthogonality, that subsumes the projected-log-det gradient, the warp gauge, the multinomial gauge, and the conditional-shift correction as instances. This is pure upside — attempt it.
+
 
 ---
 
