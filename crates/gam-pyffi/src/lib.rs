@@ -6855,6 +6855,92 @@ fn build_latent_duchon_design(
     Ok((design, t_mat))
 }
 
+/// Input-location jet `∂Φ/∂t` of the PERIODIC latent Duchon design, matching the
+/// per-manifold forward `build_latent_duchon_design` builds: the 1-D circle
+/// routes through the Bernoulli Green's-function design (gam#580) and the
+/// multi-axis torus through the chord-distance polyharmonic design. Returns
+/// `Ok(None)` when no axis is periodic (the caller then uses the open Euclidean
+/// jet, which is correct for euclidean / sphere / matern latents).
+///
+/// The two branches differentiate the SAME kernel, with the SAME resolved orders
+/// and the SAME constraint nullspace `Z`, as the forward — so the returned jet is
+/// the exact derivative of the forward design column-for-column. Building the
+/// open Euclidean jet here instead (the issue #876 bug) gave a wrong gradient and
+/// a column-count mismatch that nulled the outer gradient and collapsed the
+/// latent.
+fn build_latent_duchon_periodic_jet(
+    t_mat: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    m: usize,
+    periodic: Option<&[Option<f64>]>,
+) -> Result<Option<Array3<f64>>, String> {
+    let latent_dim = t_mat.ncols();
+    // Mirror `build_latent_duchon_design`'s gate: a per-axis period descriptor of
+    // the right arity with at least one periodic axis.
+    let axes = match periodic {
+        Some(axes) if axes.len() == latent_dim && axes.iter().any(|p| p.is_some()) => axes,
+        _ => return Ok(None),
+    };
+    // Same resolved (nullspace_order, power) the forward design uses for this
+    // ambient latent dimension, so the kernel smoothness order and the Bernoulli
+    // order (`user_m = duchon_p_from_nullspace_order(resolved_nullspace)`) match.
+    let (resolved_nullspace, resolved_power) =
+        resolve_duchon_orders(latent_dim, duchon_nullspace_from_m(m), 0, None);
+
+    if latent_dim == 1 {
+        // 1-D circle: the forward routes to `build_periodic_duchon_basis_1d`
+        // (Bernoulli kernel). `create_duchon_basis_1d_derivative_dense` with
+        // `periodic = true, order = 1` differentiates that exact forward — same
+        // collapsed centers, same domain wrap, same constant-only constraint
+        // nullspace — and returns the dense `(n, kernel_cols + 1)` first
+        // derivative `∂Φ/∂t` (the trailing constant column's derivative is 0).
+        let period = axes[0].expect("latent_dim == 1 periodic axis carries a period");
+        let dphi_dt = create_duchon_basis_1d_derivative_dense(
+            t_mat.column(0),
+            centers.column(0),
+            resolved_power as f64,
+            resolved_nullspace,
+            true,
+            Some(period),
+            1,
+        )
+        .map_err(|err| format!("failed to evaluate periodic latent Duchon jet: {err}"))?;
+        let n_rows = dphi_dt.nrows();
+        let n_cols = dphi_dt.ncols();
+        let mut jet = Array3::<f64>::zeros((n_rows, n_cols, 1));
+        jet.slice_mut(s![.., .., 0]).assign(&dphi_dt);
+        return Ok(Some(jet));
+    }
+
+    // Multi-axis torus: the forward routes to `build_duchon_basis_mixed_periodicity`
+    // (chord-distance polyharmonic, pure spectrum, constant-only nullspace). The
+    // `build_duchon_basis_design_and_jets` builder reproduces that SAME design and
+    // returns its exact chord-embedding jet, so we take its `J` block. The mixed
+    // periodicity path requires the pure polyharmonic spectrum (`power = 0`); the
+    // resolver returns `power = 0` for the periodic latent configurations, but
+    // assert it so a future order change fails loudly rather than silently
+    // diverging from the forward.
+    if resolved_power != 0 {
+        return Err(format!(
+            "periodic torus latent Duchon requires pure polyharmonic spectrum (power = 0); \
+             resolver returned power = {resolved_power}"
+        ));
+    }
+    let periodic_flags: Vec<bool> = axes.iter().map(|p| p.is_some()).collect();
+    let periods: Vec<f64> = axes.iter().map(|p| p.unwrap_or(1.0)).collect();
+    let (_phi, jet, _hess) = gam::basis::build_duchon_basis_design_and_jets(
+        t_mat,
+        centers,
+        None,
+        0.0,
+        resolved_nullspace,
+        &periodic_flags,
+        &periods,
+    )
+    .map_err(|err| format!("failed to evaluate periodic torus latent Duchon jet: {err}"))?;
+    Ok(Some(jet))
+}
+
 fn t_matrix_from_flat(
     t_flat: ArrayView1<'_, f64>,
     n_obs: usize,
@@ -7038,7 +7124,38 @@ fn build_latent_forward_design(
 ) -> Result<(Array2<f64>, Array2<f64>, Array3<f64>), String> {
     let basis_kind = latent_basis_kind(basis_kind)?;
     let (design, t_mat) = match basis_kind {
-        "duchon" => build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, periodic)?,
+        "duchon" => {
+            let (design, t_mat) =
+                build_latent_duchon_design(t_flat, n_obs, latent_dim, centers, m, periodic)?;
+            // On a PERIODIC latent manifold (circle / torus) the forward design is
+            // the periodic Duchon basis (1-D Bernoulli Green's function or the
+            // multi-axis chord-distance polyharmonic) — a DIFFERENT kernel and
+            // column layout than the open Euclidean Duchon. Its input-location
+            // jet must differentiate that SAME periodic forward, not the open
+            // Euclidean basis the generic `latent_input_location_jet` builds.
+            // Routing the periodic forward through the open jet produced both a
+            // wrong gradient direction AND a column-count mismatch (the open jet
+            // carries `d+1` polynomial columns vs. the periodic design's single
+            // constant column), which made `value_and_grad` fail the
+            // design/jet shape check, return `(+∞, None)`, and hand the outer
+            // trust region a zero gradient — so the circle/torus optimizer read
+            // "stationary" at the start and collapsed every row to one latent
+            // coordinate (issue #876). Build the matching periodic jet here and
+            // return early, mirroring the per-manifold forward choice exactly.
+            if let Some(jet) =
+                build_latent_duchon_periodic_jet(t_mat.view(), centers, m, periodic)?
+            {
+                if jet.shape()[1] != design.ncols() {
+                    return Err(format!(
+                        "periodic latent Duchon design/jet column mismatch: design has {}, jet has {}",
+                        design.ncols(),
+                        jet.shape()[1]
+                    ));
+                }
+                return Ok((design, t_mat, jet));
+            }
+            (design, t_mat)
+        }
         "matern" => {
             if centers.ncols() != latent_dim {
                 return Err(format!(
