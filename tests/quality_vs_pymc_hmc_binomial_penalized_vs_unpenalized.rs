@@ -297,6 +297,7 @@ fn gam_penalized_binomial_posterior_matches_pymc_and_concentrates_with_lambda() 
                 gamma_shape: None,
                 dispersion: Dispersion::Known(1.0),
                 firth_bias_reduction: false,
+                offset: None,
             }),
             &nuts_cfg,
         )
