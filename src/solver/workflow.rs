@@ -1863,8 +1863,23 @@ fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
     0.5 * (state.deviance + state.penalty_term)
 }
 
+/// Recover the fitted Weibull baseline config from the anchor-CENTERED linear
+/// `[1, log t]` time-basis coefficients.
+///
+/// The fit centers the time basis at the survival time anchor
+/// (`center_survival_time_designs_at_anchor`), which zeroes the constant column,
+/// so the constant-column coefficient `beta[0]` is UNIDENTIFIED (left at its
+/// stale seed). The identified baseline the model carries is
+/// `eta(t) = beta[1] * (log t - log anchor)`, exactly the Weibull form
+/// `eta(t) = shape * (log t - log scale)` with `shape = beta[1]` and
+/// `scale = anchor`. Reconstructing `scale` from `beta[0]` (the old
+/// `exp(-beta[0]/shape)`) reads the stale constant column and produces a wrong
+/// saved scale, misleading every consumer that rebuilds `H0(t) = (t/scale)^shape`
+/// from the saved scale (e.g. competing-risks CIF). Recover `scale` from the
+/// identified anchor instead (issue #899).
 fn fitted_weibull_baseline_from_linear_time_beta(
     beta: &Array1<f64>,
+    anchor: f64,
 ) -> Option<crate::families::survival_construction::SurvivalBaselineConfig> {
     if beta.len() < 2 {
         return None;
@@ -1873,10 +1888,10 @@ fn fitted_weibull_baseline_from_linear_time_beta(
     if !shape.is_finite() || shape <= 0.0 {
         return None;
     }
-    let scale = (-beta[0] / shape).exp();
-    if !scale.is_finite() || scale <= 0.0 {
+    if !anchor.is_finite() || anchor <= 0.0 {
         return None;
     }
+    let scale = anchor;
     Some(
         crate::families::survival_construction::SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::Weibull,
@@ -2392,8 +2407,10 @@ fn fit_cause_specific_survival_transformation_custom(
     // would build the CIF from the uninitialized baseline and collapse it to
     // null. For Weibull-without-timewiggle the time basis is the 2-column
     // `[1, log t]` linear basis whose per-cause coefficients carry the full
-    // log-cumulative-hazard, so the fitted scale/shape are recoverable from
-    // each cause's time-beta. The shared `SurvivalBaselineConfig` holds a
+    // log-cumulative-hazard. Because the basis is anchor-centered the constant
+    // column (and thus `beta[0]`) is unidentified, so the fitted scale is the
+    // identified anchor (`scale = anchor`, `shape = beta[1]`), not `beta[0]`
+    // (issue #899). The shared `SurvivalBaselineConfig` holds a
     // single (scale, shape), so we report the first cause's fitted baseline as
     // the representative shared value — the same pooled-baseline convention the
     // seed used, but post-fit rather than uninitialized.
@@ -2407,7 +2424,7 @@ fn fit_cause_specific_survival_transformation_custom(
             .beta
             .slice(s![..spec.time_build.x_exit_time.ncols()])
             .to_owned();
-        fitted_weibull_baseline_from_linear_time_beta(&time_beta).ok_or_else(|| {
+        fitted_weibull_baseline_from_linear_time_beta(&time_beta, spec.time_anchor).ok_or_else(|| {
             "failed to recover fitted Weibull scale/shape from the cause-specific linear time coefficients"
                 .to_string()
         })?
@@ -3037,7 +3054,7 @@ fn fit_survival_transformation_model(
             let time_beta = beta
                 .slice(s![..spec.time_build.x_exit_time.ncols()])
                 .to_owned();
-            fitted_weibull_baseline_from_linear_time_beta(&time_beta).ok_or_else(|| {
+            fitted_weibull_baseline_from_linear_time_beta(&time_beta, spec.time_anchor).ok_or_else(|| {
                 "failed to recover fitted Weibull scale/shape from the linear time coefficients"
                     .to_string()
             })?
