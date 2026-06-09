@@ -32,7 +32,7 @@ use crate::inference::diagnostics::should_emit_h_min_eig_diag;
 use crate::inference::predict::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, add_relative_diag_ridge, enforce_symmetry, matrix_inversewith_regularization,
-    row_mismatch_message,
+    row_mismatch_message, stack_offsets,
 };
 use crate::matrix::{DesignMatrix, FactorizedSystem, LinearOperator};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
@@ -5517,30 +5517,23 @@ fn log_lambdas_match_lambdas(log_lambdas: &Array1<f64>, lambdas: &Array1<f64>) -
         })
 }
 
+/// Vertically stack a per-block `Array1<f64>` field (selected by `field`) into
+/// one contiguous vector, in block order. Single helper shared by the β and λ
+/// flatteners, routed through the canonical [`stack_offsets`] concatenation.
+fn flatten_blocks_field(
+    blocks: &[FittedBlock],
+    field: impl Fn(&FittedBlock) -> &Array1<f64>,
+) -> Array1<f64> {
+    let parts: Vec<&Array1<f64>> = blocks.iter().map(field).collect();
+    stack_offsets(&parts)
+}
+
 fn flatten_block_betas(blocks: &[FittedBlock]) -> Array1<f64> {
-    let total: usize = blocks.iter().map(|b| b.beta.len()).sum();
-    let mut flat = Array1::zeros(total);
-    let mut off = 0;
-    for block in blocks {
-        let p = block.beta.len();
-        flat.slice_mut(ndarray::s![off..off + p])
-            .assign(&block.beta);
-        off += p;
-    }
-    flat
+    flatten_blocks_field(blocks, |b| &b.beta)
 }
 
 fn flatten_block_lambdas(blocks: &[FittedBlock]) -> Array1<f64> {
-    let total: usize = blocks.iter().map(|b| b.lambdas.len()).sum();
-    let mut flat = Array1::zeros(total);
-    let mut off = 0;
-    for block in blocks {
-        let p = block.lambdas.len();
-        flat.slice_mut(ndarray::s![off..off + p])
-            .assign(&block.lambdas);
-        off += p;
-    }
-    flat
+    flatten_blocks_field(blocks, |b| &b.lambdas)
 }
 
 impl UnifiedFitResult {
