@@ -157,9 +157,9 @@ use manifold_pyclasses::{
 };
 use survival_surface_io::{
     hazard_from_cumulative, interpolate_rows, interpolate_survival_surface, survival_block,
-    survival_chunk_iter_collect, survival_coerce_times, survival_collect_chunks,
-    survival_cumulative_from_survival, survival_ffi_surface, survival_parameters_matrix,
-    write_survival_csv,
+    survival_block_hazard, survival_chunk_iter_collect, survival_coerce_times,
+    survival_collect_chunks, survival_cumulative_from_survival, survival_ffi_surface,
+    survival_parameters_matrix, write_survival_csv,
 };
 
 #[derive(Default, Deserialize)]
@@ -23022,6 +23022,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(hazard_from_cumulative, module)?)?;
     module.add_function(wrap_pyfunction!(survival_cumulative_from_survival, module)?)?;
     module.add_function(wrap_pyfunction!(survival_block, module)?)?;
+    module.add_function(wrap_pyfunction!(survival_block_hazard, module)?)?;
     module.add_function(wrap_pyfunction!(survival_ffi_surface, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_validate, module)?)?;
     module.add_function(wrap_pyfunction!(numeric_matrix_f64, module)?)?;

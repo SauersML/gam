@@ -514,10 +514,21 @@ pub(crate) fn survival_coerce_times<'py>(
             "survival prediction requires at least one time".to_string(),
         ));
     }
-    if !values.iter().all(|value| value.is_finite()) {
-        return Err(py_value_error(
-            "survival prediction times must be finite".to_string(),
-        ));
+    // The Rust prediction core requires finite, non-negative times (see
+    // `src/families/survival_predict.rs` time-grid validation: `!t.is_finite()
+    // || t < 0.0` is rejected). The FFI validator must enforce the same
+    // contract so the two representations agree (issue #965): a negative time
+    // is meaningless for a survival/hazard surface and would otherwise produce
+    // `exp(-hazard * t) > 1` in the parametric fallback or a left-extrapolated
+    // `1` from a saved surface, depending purely on representation.
+    if let Some((idx, value)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite() || **value < 0.0)
+    {
+        return Err(py_value_error(format!(
+            "survival prediction times must be finite and non-negative (index {idx} = {value})"
+        )));
     }
     Ok(Array1::from_vec(values).into_pyarray(py).unbind())
 }
@@ -611,27 +622,94 @@ pub(crate) fn hazard_from_cumulative<'py>(
         }
         None => Array2::<f64>::zeros((n_rows, 1)),
     };
+    hazard_from_cumulative_impl(times_view, cum_view, previous.view(), previous_time)
+        .map(|out| out.into_pyarray(py))
+        .map_err(py_value_error)
+}
+
+/// Forward-difference the sampled cumulative hazard into an instantaneous
+/// hazard, with the discretization preconditions a finite difference requires
+/// (issue #966).
+///
+/// For each row the hazard at query `j` is the slope of the cumulative-hazard
+/// interpolant over the interval ending at `times[j]`:
+/// `(H(times[j]) - H(prev_t)) / (times[j] - prev_t)`, where the predecessor of
+/// the first query is the `(previous_time, previous_cumulative)` carry from the
+/// prior chunk. This is only meaningful when the evaluation times are strictly
+/// increasing (a forward difference needs a positive, well-defined width) and
+/// the cumulative hazard is non-decreasing (it is monotone by definition, so a
+/// decrease signals a corrupt input rather than a hazard the slope should
+/// "invent"). The previous code instead forced `width = 1.0` whenever the gap
+/// was non-positive, which silently changed the time unit, manufactured a zero
+/// hazard at repeated times, and produced a negative hazard from unsorted
+/// query times. We reject those inputs rather than fabricate a slope; callers
+/// that need hazards from an arbitrary order must sort their query times first.
+fn hazard_from_cumulative_impl(
+    times: ndarray::ArrayView1<'_, f64>,
+    cumulative: ndarray::ArrayView2<'_, f64>,
+    previous_cumulative: ndarray::ArrayView2<'_, f64>,
+    previous_time: f64,
+) -> Result<Array2<f64>, String> {
+    let (n_rows, n_times) = cumulative.dim();
     let mut out = Array2::<f64>::zeros((n_rows, n_times));
     for j in 0..n_times {
         let prev_t = if j == 0 {
             previous_time
         } else {
-            times_view[j - 1]
+            times[j - 1]
         };
-        let mut width = times_view[j] - prev_t;
-        if width <= 0.0 {
-            width = 1.0;
+        let width = times[j] - prev_t;
+        if !(width > 0.0) {
+            return Err(format!(
+                "hazard_from_cumulative requires strictly increasing query times; \
+                 width {width} at index {j} (time {} after {prev_t}) is not positive. \
+                 Sort the query times (and de-duplicate) before differencing.",
+                times[j]
+            ));
         }
         for i in 0..n_rows {
             let prev_h = if j == 0 {
-                previous[[i, 0]]
+                previous_cumulative[[i, 0]]
             } else {
-                cum_view[[i, j - 1]]
+                cumulative[[i, j - 1]]
             };
-            out[[i, j]] = (cum_view[[i, j]] - prev_h) / width;
+            let delta = cumulative[[i, j]] - prev_h;
+            if delta < 0.0 {
+                return Err(format!(
+                    "cumulative hazard must be non-decreasing in time; row {i} drops by \
+                     {} between index {} and {j}",
+                    -delta,
+                    j.wrapping_sub(1)
+                ));
+            }
+            out[[i, j]] = delta / width;
         }
     }
-    Ok(out.into_pyarray(py))
+    Ok(out)
+}
+
+/// Convert a survival probability to a cumulative hazard via `H = -ln S`.
+///
+/// This is exact, not floored: a valid but tiny survival probability (e.g.
+/// `S = e^-100`) maps to the correspondingly large `H = 100`, instead of being
+/// capped at `-ln(1e-12) = 27.63` as an earlier clamp did (issue #964). The
+/// only special cases are the mathematically forced ones:
+///   * `S = 0`   -> `H = +inf`     (`-ln 0 = +inf`, produced naturally),
+///   * `S = NaN` -> `H = NaN`      (propagate undefined input),
+///   * `S` outside `[0, 1]`        -> `Err` (not a survival probability).
+/// Any flooring for display belongs in formatting, never in this S->H math.
+fn cumulative_hazard_from_survival_value(s: f64) -> Result<f64, String> {
+    if s.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if !(0.0..=1.0).contains(&s) {
+        return Err(format!(
+            "survival probability must lie in [0, 1] to convert to cumulative hazard, got {s}"
+        ));
+    }
+    // `-ln S` is exact across the full representable range; `S = 0` yields the
+    // mathematically correct `+inf`, `S = 1` yields `0`.
+    Ok(-s.ln())
 }
 
 #[pyfunction]
@@ -644,11 +722,25 @@ pub(crate) fn survival_cumulative_from_survival<'py>(
     let mut out = Array2::<f64>::zeros((n_rows, n_cols));
     for i in 0..n_rows {
         for j in 0..n_cols {
-            let s = view[[i, j]].clamp(1e-12, 1.0);
-            out[[i, j]] = -s.ln();
+            out[[i, j]] =
+                cumulative_hazard_from_survival_value(view[[i, j]]).map_err(py_value_error)?;
         }
     }
     Ok(out.into_pyarray(py).unbind())
+}
+
+/// Survival probability of the parametric exponential fallback at one time.
+///
+/// `S(t) = exp(-hazard * t)` for the constant-hazard exponential model, with
+/// `S(0) = 1` enforced exactly. The explicit `t == 0` branch matters because
+/// when `exp(log_hazard)` overflows to `+inf`, the naive `exp(-inf * 0)`
+/// evaluates `(-inf * 0) = NaN`, then `exp(NaN) = NaN`, even though every
+/// survival function satisfies `S(0) = 1` (issue #965).
+fn exponential_survival_at(hazard: f64, t: f64) -> f64 {
+    if t == 0.0 {
+        return 1.0;
+    }
+    (-hazard * t).exp()
 }
 
 #[pyfunction]
@@ -670,7 +762,40 @@ pub(crate) fn survival_block<'py>(
     for i in 0..n_rows {
         let hazard = params[[i, 0]].exp();
         for j in 0..n_times {
-            out[[i, j]] = (-hazard * times_view[j]).exp();
+            out[[i, j]] = exponential_survival_at(hazard, times_view[j]);
+        }
+    }
+    Ok(out.into_pyarray(py))
+}
+
+#[pyfunction]
+pub(crate) fn survival_block_hazard<'py>(
+    py: Python<'py>,
+    params: PyReadonlyArray2<'py, f64>,
+    times: PyReadonlyArray1<'py, f64>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    // Hazard of the parametric exponential fallback. For a constant-hazard
+    // exponential model the hazard is `exp(log_hazard)` at every time, so we
+    // return it directly rather than finite-differencing the sampled
+    // cumulative hazard. Differencing query-ordered cumulatives invents zero
+    // hazards at repeated times and negative hazards at unsorted times (issue
+    // #966); the closed-form constant is exact and order-independent.
+    let params = params.as_array();
+    let times_view = times.as_array();
+    let n_rows = params.shape()[0];
+    let n_times = times_view.len();
+    if params.shape()[1] == 0 {
+        return Err(py_value_error(
+            "survival parameter matrix must have at least one column".to_string(),
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((n_rows, n_times));
+    for i in 0..n_rows {
+        let hazard = params[[i, 0]].exp();
+        for j in 0..n_times {
+            // Hazard is constant in `t`; `times_view[j]` selects the column
+            // only. (Times are already validated finite and non-negative.)
+            out[[i, j]] = hazard;
         }
     }
     Ok(out.into_pyarray(py))
@@ -704,4 +829,134 @@ pub(crate) fn survival_ffi_surface<'py>(
         grid_arr.into_pyarray(py).unbind(),
         surface_arr.into_pyarray(py).unbind(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    // ---- issue #964: S -> H conversion must not floor a valid survival prob ----
+
+    #[test]
+    fn cumulative_hazard_does_not_cap_small_survival() {
+        // S = e^-100 is a valid, finite, representable survival probability for
+        // constant hazard 1 at t = 100; the cumulative hazard must be 100, not
+        // the clamped -ln(1e-12) = 27.63 the previous implementation returned.
+        let s = (-100.0_f64).exp();
+        let h = cumulative_hazard_from_survival_value(s).expect("valid survival prob");
+        assert!(
+            (h - 100.0).abs() < 1e-9,
+            "expected H = 100 from S = e^-100, got {h}"
+        );
+        // Guard against regressing to the old clamp value.
+        assert!(h > 50.0, "cumulative hazard was capped: {h}");
+    }
+
+    #[test]
+    fn cumulative_hazard_maps_zero_survival_to_infinity() {
+        let h = cumulative_hazard_from_survival_value(0.0).expect("S = 0 is valid");
+        assert!(h.is_infinite() && h > 0.0, "S = 0 must map to +inf, got {h}");
+    }
+
+    #[test]
+    fn cumulative_hazard_maps_unit_survival_to_zero() {
+        let h = cumulative_hazard_from_survival_value(1.0).expect("S = 1 is valid");
+        assert_eq!(h, 0.0);
+    }
+
+    #[test]
+    fn cumulative_hazard_passes_nan_through() {
+        let h = cumulative_hazard_from_survival_value(f64::NAN).expect("NaN propagates");
+        assert!(h.is_nan(), "NaN survival probability must propagate as NaN");
+    }
+
+    #[test]
+    fn cumulative_hazard_rejects_out_of_range_survival() {
+        assert!(cumulative_hazard_from_survival_value(1.5).is_err());
+        assert!(cumulative_hazard_from_survival_value(-0.1).is_err());
+        assert!(cumulative_hazard_from_survival_value(f64::INFINITY).is_err());
+    }
+
+    // ---- issue #965: parametric survival fallback is S(0) = 1 exactly ----
+
+    #[test]
+    fn exponential_survival_at_origin_is_one() {
+        // exp(log_hazard) overflowing to +inf must still give S(0) = 1, not the
+        // naive exp(-inf * 0) = exp(NaN) = NaN.
+        let huge_hazard = f64::MAX;
+        assert_eq!(exponential_survival_at(huge_hazard, 0.0), 1.0);
+        // A finite hazard at t = 0 is likewise exactly 1.
+        assert_eq!(exponential_survival_at(2.0, 0.0), 1.0);
+    }
+
+    #[test]
+    fn exponential_survival_matches_closed_form_for_positive_time() {
+        let s = exponential_survival_at(1.0, 100.0);
+        assert!((s - (-100.0_f64).exp()).abs() < 1e-300);
+    }
+
+    // ---- issue #966: hazard differencing requires strictly increasing times ----
+
+    #[test]
+    fn hazard_from_cumulative_matches_constant_slope() {
+        // H(t) = 2 t over strictly increasing times sampled from the origin
+        // carry (previous_time = 0, previous_cumulative = 0) yields hazard 2.
+        let times = array![1.0, 2.0, 3.0];
+        let cumulative = array![[2.0, 4.0, 6.0]];
+        let previous = array![[0.0]];
+        let out = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+            .expect("strictly increasing times");
+        for &h in out.iter() {
+            assert!((h - 2.0).abs() < 1e-12, "expected constant hazard 2, got {h}");
+        }
+    }
+
+    #[test]
+    fn hazard_from_cumulative_rejects_repeated_times() {
+        // Repeated times (width 0) previously invented a zero hazard via the
+        // forced width = 1; now they are rejected.
+        let times = array![1.0, 1.0];
+        let cumulative = array![[2.0, 2.0]];
+        let previous = array![[0.0]];
+        let err = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+            .expect_err("repeated times must error");
+        assert!(err.contains("strictly increasing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn hazard_from_cumulative_rejects_unsorted_times() {
+        // Unsorted times previously produced a negative hazard from a negative
+        // width forced to 1; now they are rejected rather than fabricated.
+        let times = array![2.0, 1.0];
+        let cumulative = array![[4.0, 2.0]];
+        let previous = array![[0.0]];
+        let err = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+            .expect_err("unsorted times must error");
+        assert!(err.contains("strictly increasing"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn hazard_from_cumulative_rejects_origin_collision_with_carry() {
+        // First query equal to the previous-time carry has zero width.
+        let times = array![0.0, 1.0];
+        let cumulative = array![[0.0, 1.0]];
+        let previous = array![[0.0]];
+        assert!(
+            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn hazard_from_cumulative_rejects_decreasing_cumulative() {
+        // Cumulative hazard is monotone non-decreasing by definition; a drop
+        // signals corrupt input rather than a (nonsensical) negative hazard.
+        let times = array![1.0, 2.0];
+        let cumulative = array![[4.0, 2.0]];
+        let previous = array![[0.0]];
+        let err = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+            .expect_err("decreasing cumulative must error");
+        assert!(err.contains("non-decreasing"), "unexpected error: {err}");
+    }
 }

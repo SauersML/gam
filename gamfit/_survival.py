@@ -165,13 +165,6 @@ class SurvivalPrediction:
             ],
         )
 
-    def _prediction_row_count(self) -> int:
-        for kind in ("hazard", "cumulative_hazard", "survival"):
-            _grid, surface = self._ffi_surface(kind)
-            if surface is not None:
-                return int(surface.shape[0])
-        return int(self._parameters_array().shape[0])
-
     def _hazard_from_cumulative(
         self,
         times_arr: Any,
@@ -184,12 +177,45 @@ class SurvivalPrediction:
             times_arr, cumulative, previous_cumulative, previous_time
         )
 
+    def _has_nonparametric_surface(self) -> bool:
+        """Whether a saved (non-parametric) survival/cumulative-hazard surface
+        is available to differentiate into a hazard.
+
+        When no such surface exists the prediction is the parametric
+        exponential fallback, whose hazard is the closed-form constant
+        ``exp(log_hazard)`` and does not need finite differencing.
+        """
+        for kind in ("cumulative_hazard", "survival"):
+            _grid, surface = self._ffi_surface(kind)
+            if surface is not None:
+                return True
+        return False
+
     def hazard_at(self, times: Any) -> Any:
         times_arr = self._coerce_times(times)
         hazard = self._ffi_surface_at("hazard", times_arr, clip=(0.0, None))
         if hazard is not None:
             return hazard
-        n_rows = self._prediction_row_count()
+        if not self._has_nonparametric_surface():
+            # Parametric exponential fallback: hazard is the constant
+            # ``exp(log_hazard)`` at every time. Return it in closed form
+            # rather than finite-differencing the sampled cumulative hazard,
+            # which would invent zero hazards at repeated times and negative
+            # hazards at unsorted times (issue #966).
+            params = self._parameters_array()
+            if self._should_auto_chunk_dense(params.shape[0], times_arr.size):
+                return self._collect_chunks(
+                    self.hazard_at_chunks(times_arr),
+                    n_rows=params.shape[0],
+                    n_times=times_arr.size,
+                )
+            return rust_module().survival_block_hazard(params, times_arr)
+        # A saved cumulative-hazard / survival surface exists but no hazard
+        # surface: differentiate the cumulative-hazard interpolant. The Rust
+        # ``hazard_from_cumulative`` differencing requires strictly increasing
+        # query times (and rejects non-monotone cumulative hazards), so a
+        # forward difference is well defined (issue #966).
+        n_rows = self._cumulative_surface_row_count()
         if self._should_auto_chunk_dense(n_rows, times_arr.size):
             return self._collect_chunks(
                 self.hazard_at_chunks(times_arr),
@@ -198,6 +224,13 @@ class SurvivalPrediction:
             )
         cumulative = self.cumulative_hazard_at(times_arr)
         return self._hazard_from_cumulative(times_arr, cumulative)
+
+    def _cumulative_surface_row_count(self) -> int:
+        for kind in ("cumulative_hazard", "survival", "hazard"):
+            _grid, surface = self._ffi_surface(kind)
+            if surface is not None:
+                return int(surface.shape[0])
+        return int(self._parameters_array().shape[0])
 
     def cumulative_hazard_at(self, times: Any) -> Any:
         times_arr = self._coerce_times(times)
@@ -406,6 +439,31 @@ class SurvivalPrediction:
         if ffi_chunks is not None:
             yield from ffi_chunks
             return
+        if not self._has_nonparametric_surface():
+            # Parametric exponential fallback: hazard is the closed-form
+            # constant ``exp(log_hazard)`` per row, so each tile is evaluated
+            # directly rather than finite-differenced from sampled cumulatives
+            # (issue #966).
+            params = self._parameters_array()
+
+            def block_fn(row_slice: slice, time_slice: slice) -> Any:
+                return rust_module().survival_block_hazard(
+                    params[row_slice, :], times_arr[time_slice]
+                )
+
+            yield from self._surface_chunks(
+                n_rows=params.shape[0],
+                times_arr=times_arr,
+                people_chunk=people_chunk,
+                time_grid_chunk=time_grid_chunk,
+                block_fn=block_fn,
+            )
+            return
+        # A saved cumulative-hazard / survival surface exists but no hazard
+        # surface: forward-difference the cumulative-hazard chunks, carrying the
+        # right boundary of each tile as the predecessor of the next. The Rust
+        # differencing rejects non-increasing query times and non-monotone
+        # cumulative hazards (issue #966).
         previous_row_key: tuple[int | None, int | None] | None = None
         previous_cumulative = None
         previous_time = 0.0
