@@ -202,6 +202,15 @@ path = "examples/perf/arrow_schur_hill_climb.rs"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+# Strip the symbol table from release artifacts. Release builds already emit no
+# DWARF (`debug = 0`), but the unstripped symbol table of a large Rust crate is
+# several MB per `.so`; shipping it in every gamfit wheel (8 platform wheels ×
+# every published version) is the avoidable bulk of the PyPI project-size growth
+# that hit the 10 GB limit (#894). The linker keeps the dynamic symbols PyO3
+# needs (`PyInit_*`), so the extension still loads; only the static symbol table
+# is removed. No functional change; release-mode panic backtraces already lack
+# symbolication.
+strip = true
 
 # Test profile — strip full DWARF and only keep line tables. With ~300
 # integration test targets under `tests/`, the default `debug = true` profile
