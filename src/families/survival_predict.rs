@@ -1661,21 +1661,6 @@ fn predict_survival_location_scale_batch(
         &mut time_build.x_exit_time,
         &time_anchor_row,
     )?;
-    // The fit builds the scale-deviation transform's primary against the FULL
-    // centered time-exit basis (`prepared.time_design_exit`, main.rs payload
-    // assembly). In the reduced parametric-AFT regime the hazard-path time design
-    // is dropped to zero columns below (the warp is removed, `h ≡ 0`), but the σ
-    // (log-σ) design must STILL be residualized against that same full primary —
-    // otherwise the saved transform's primary-column count (full basis + threshold)
-    // cannot match the predict-time primary and the scale-deviation operator errors
-    // out (#892). Capture the full centered exit design here, before the reduction.
-    let reduced_scale_primary_time_exit = if reduced_parametric_aft {
-        Some(time_build.x_exit_time.try_to_dense_by_chunks(
-            "survival location-scale scale-deviation primary time design",
-        )?)
-    } else {
-        None
-    };
     let (mut eta_offset_entry, mut eta_offset_exit, mut derivative_offset_exit) =
         build_survival_time_offsets_for_likelihood(
             &eval_entry,
@@ -1696,12 +1681,15 @@ fn predict_survival_location_scale_batch(
     if reduced_parametric_aft {
         // The warp is removed in this regime (`h ≡ 0`); the σ-scaled log-t baseline
         // rides the location channel via the `−log t` threshold shift applied
-        // below. Drop the exit time-warp design to zero columns (matching the
-        // empty `beta_time`) and zero its value offset so `h_base = 0`. The
-        // derivative is handled separately from `inv_sigma / t` in the hazard
-        // computation, so the (unused-here) entry/derivative designs and offsets
-        // are left as built.
-        time_build.x_exit_time = DesignMatrix::from(Array2::<f64>::zeros((eval_exit.len(), 0)));
+        // below. The saved `beta_time` is an all-zero length-`p` vector (the
+        // reduced time block has zero free columns and a zero affine lift), so the
+        // time-warp contribution `x_exit_time · beta_time` is identically zero for
+        // ANY design — we therefore KEEP the full-width centered basis (so the
+        // hazard's `beta.len() == x_exit_time.ncols()` check holds and the
+        // scale-deviation primary keeps its full column count to match the saved
+        // transform) and only zero the value OFFSET so `h_base = 0`. The derivative
+        // is handled separately from `inv_sigma / t` in the hazard computation, so
+        // the entry/derivative designs and offsets are left as built.
         eta_offset_exit = Array1::<f64>::zeros(eval_exit.len());
     }
 
@@ -1774,14 +1762,11 @@ fn predict_survival_location_scale_batch(
         "survival location-scale prediction log-sigma design",
     )?;
 
-    // Scale-deviation primary must mirror the fit's full location design. In the
-    // reduced regime use the captured full time basis (the hazard-path `x_time_exit`
-    // has been zeroed to n×0); otherwise `x_time_exit` already carries the full
-    // basis (plus any timewiggle columns), matching the fit's `time_design_exit`.
-    let time_design = match reduced_scale_primary_time_exit.as_ref() {
-        Some(full) => DesignMatrix::from(full.clone()),
-        None => DesignMatrix::from(x_time_exit.clone()),
-    };
+    // Scale-deviation primary mirrors the fit's full location design: `x_time_exit`
+    // carries the full centered basis (plus any timewiggle columns) in every regime
+    // — including the reduced parametric-AFT regime, where the basis is retained at
+    // full width with an all-zero `beta_time` — matching the fit's `time_design_exit`.
+    let time_design = DesignMatrix::from(x_time_exit.clone());
     let survival_primary_design =
         DesignMatrix::hstack(vec![time_design, threshold_matrix.clone()])?;
     let prepared_sigma_design = if let Some(transform) = survival_noise_transform.as_ref() {
