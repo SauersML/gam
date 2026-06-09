@@ -31586,9 +31586,21 @@ mod tests {
         let centers = array![[0.0_f64], [0.2], [0.45], [0.7], [1.0]];
         let length_scale = 0.4_f64;
         let include_intercept = false;
-        // ν=1/2, d=1 ⇒ RKHS Sobolev order m = ν + d/2 = 1.0, exactly on the
-        // tension boundary: the strict gate admits ONLY the mass (j=0) penalty.
-        let nu = MaternNu::Half;
+        // ν=3/2, d=1 ⇒ RKHS Sobolev order m = ν + d/2 = 2.0. The strict gate
+        // admits mass (j=0) and tension (j=1) but DROPS stiffness (j=2, since
+        // 2.0 is not > 2.0). That gated-out stiffness is exactly the operator
+        // whose ψ-derivative the pre-fix builder emitted anyway, so this config
+        // genuinely exercises the index-alignment invariant.
+        //
+        // ν=3/2 (not ν=1/2): the exponential ν=1/2 kernel φ(r)=exp(−s r) has a
+        // cusp at r=0 (q = φ'/r → −∞), so its discrete collocation gradient /
+        // Hessian operators cannot be formed at all — its operator ψ-derivatives
+        // surface `DegenerateAtCollision`, and the forward gate's "only mass for
+        // ν=1/2" is the kernel's own non-differentiability, not a dropped valid
+        // penalty. ν=3/2's radial operator triplet is finite at r=0, so the
+        // tension/stiffness blocks are constructible and the alignment is the
+        // thing under test.
+        let nu = MaternNu::ThreeHalves;
 
         // Forward penalty list, post-filter, in build order.
         let forward = build_matern_operator_penalty_candidates(
@@ -31609,8 +31621,11 @@ mod tests {
             .collect();
         assert_eq!(
             forward_sources,
-            vec![PenaltySource::OperatorMass],
-            "rough ν=1/2 (m=1) must admit only the mass operator penalty"
+            vec![
+                PenaltySource::OperatorMass,
+                PenaltySource::OperatorTension
+            ],
+            "ν=3/2 (m=2) must admit mass+tension and gate out stiffness"
         );
 
         // ψ-derivative list for the same config.
@@ -31645,11 +31660,14 @@ mod tests {
             );
         }
 
-        // Finite-difference the mass κ-gradient against the analytic
-        // ψ-derivative. ψ = log κ with κ = 1/length_scale, so
-        // length_scale(ψ) = exp(-ψ) and a +h step in ψ scales length_scale by
-        // exp(-h).
-        let mass_penalty = |ls: f64| -> Array2<f64> {
+        // Finite-difference each SURVIVING operator's κ-gradient against its
+        // analytic ψ-derivative, positionally (mass at index 0, tension at
+        // index 1). ψ = log κ with κ = 1/length_scale, so length_scale(ψ) =
+        // exp(-ψ) and a +h step in ψ scales length_scale by exp(-h). A pre-fix
+        // misalignment (an extra stiffness ψ-derivative shifting the indices,
+        // or the analytic deriv paired with the wrong forward penalty) would
+        // blow up this FD comparison.
+        let penalty_for = |ls: f64, source: PenaltySource| -> Array2<f64> {
             let cands = build_matern_operator_penalty_candidates(
                 centers.view(),
                 ls,
@@ -31661,30 +31679,28 @@ mod tests {
             .expect("FD forward penalties");
             cands
                 .into_iter()
-                .find(|c| matches!(c.source, PenaltySource::OperatorMass))
-                .expect("mass penalty present")
+                .find(|c| c.source == source)
+                .unwrap_or_else(|| panic!("forward penalty {source:?} present"))
                 .matrix
         };
         let h = 1e-5_f64;
-        let s_plus = mass_penalty(length_scale * (-h).exp());
-        let s_minus = mass_penalty(length_scale * h.exp());
-        let fd = (&s_plus - &s_minus).mapv(|v| v / (2.0 * h));
-        let analytic = &psi_derivatives[0];
-        let err = (&fd - analytic)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        let scale = analytic
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt()
-            .max(1.0);
-        assert!(
-            err / scale < 1e-5,
-            "mass κ-gradient FD mismatch: err={err:.3e}, analytic_norm={scale:.3e}"
-        );
+        for (idx, source) in forward_sources.iter().enumerate() {
+            let s_plus = penalty_for(length_scale * (-h).exp(), source.clone());
+            let s_minus = penalty_for(length_scale * h.exp(), source.clone());
+            let fd = (&s_plus - &s_minus).mapv(|v| v / (2.0 * h));
+            let analytic = &psi_derivatives[idx];
+            let err = (&fd - analytic).iter().map(|v| v * v).sum::<f64>().sqrt();
+            let scale = analytic
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt()
+                .max(1.0);
+            assert!(
+                err / scale < 1e-5,
+                "{source:?} κ-gradient FD mismatch: err={err:.3e}, analytic_norm={scale:.3e}"
+            );
+        }
     }
 
     #[test]
