@@ -28081,6 +28081,112 @@ mod tests {
         }
     }
 
+    /// A workspace that exposes both a dense build and a matrix-free HVP and
+    /// refines its representation per intent (#738): matrix-free for the inner
+    /// solve, dense for logdet factorization. Mirrors CTN's contract.
+    struct IntentRefiningHessianWorkspace {
+        dense_calls: Arc<AtomicUsize>,
+        matvec_calls: Arc<AtomicUsize>,
+    }
+
+    impl ExactNewtonJointHessianWorkspace for IntentRefiningHessianWorkspace {
+        fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
+            self.dense_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(Array2::eye(2)))
+        }
+
+        fn hessian_source_preference(&self) -> JointHessianSourcePreference {
+            JointHessianSourcePreference::Operator
+        }
+
+        fn hessian_source_preference_for_intent(
+            &self,
+            intent: MaterializationIntent,
+        ) -> JointHessianSourcePreference {
+            match intent {
+                MaterializationIntent::LogdetFactorization => JointHessianSourcePreference::Dense,
+                MaterializationIntent::InnerSolve
+                | MaterializationIntent::OuterEvaluation
+                | MaterializationIntent::OuterGradient => JointHessianSourcePreference::Operator,
+            }
+        }
+
+        fn hessian_matvec_available(&self) -> bool {
+            true
+        }
+
+        fn hessian_matvec(&self, v: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
+            self.matvec_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(v.clone()))
+        }
+
+        fn hessian_diagonal(&self) -> Result<Option<Array1<f64>>, String> {
+            Ok(Some(Array1::ones(2)))
+        }
+
+        fn directional_derivative(&self, arr: &Array1<f64>) -> Result<Option<Array2<f64>>, String> {
+            assert!(arr.iter().all(|v| !v.is_nan()));
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn logdet_intent_takes_dense_while_inner_solve_takes_operator() {
+        let dense_calls = Arc::new(AtomicUsize::new(0));
+        let matvec_calls = Arc::new(AtomicUsize::new(0));
+        let workspace: Arc<dyn ExactNewtonJointHessianWorkspace> =
+            Arc::new(IntentRefiningHessianWorkspace {
+                dense_calls: Arc::clone(&dense_calls),
+                matvec_calls: Arc::clone(&matvec_calls),
+            });
+
+        // Logdet factorization intent: the consumer factorizes H + S_lambda,
+        // so the workspace hands back the structural dense build directly,
+        // probing hessian_dense and skipping the operator wrapper.
+        let logdet_source = exact_newton_joint_hessian_source_from_workspace(
+            &workspace,
+            2,
+            MaterializationIntent::LogdetFactorization,
+            "intent-refining logdet",
+        )
+        .expect("logdet source should build")
+        .expect("logdet source should be present");
+        assert_eq!(dense_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(matvec_calls.load(Ordering::Relaxed), 0);
+        match logdet_source {
+            JointHessianSource::Dense(hessian) => assert_eq!(hessian, Array2::<f64>::eye(2)),
+            JointHessianSource::Operator { .. } => {
+                panic!("logdet intent must take the dense representation")
+            }
+        }
+
+        // Inner solve intent: only H · v is applied, so the same workspace
+        // hands back the matrix-free operator without touching hessian_dense.
+        let inner_source = exact_newton_joint_hessian_source_from_workspace(
+            &workspace,
+            2,
+            MaterializationIntent::InnerSolve,
+            "intent-refining inner solve",
+        )
+        .expect("inner source should build")
+        .expect("inner source should be present");
+        assert_eq!(
+            dense_calls.load(Ordering::Relaxed),
+            1,
+            "inner-solve intent must not probe hessian_dense"
+        );
+        match inner_source {
+            JointHessianSource::Operator { apply, .. } => {
+                let v = array![1.5, -4.0];
+                assert_eq!(apply(&v).expect("operator apply should succeed"), v);
+                assert_eq!(matvec_calls.load(Ordering::Relaxed), 1);
+            }
+            JointHessianSource::Dense(_) => {
+                panic!("inner-solve intent must take the operator representation")
+            }
+        }
+    }
+
     #[test]
     fn default_coefficient_gradient_cost_is_half_of_hessian_cost() {
         // The gradient-only sweep through the inner Newton solve does
