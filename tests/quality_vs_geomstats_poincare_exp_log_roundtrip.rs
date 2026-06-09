@@ -9,9 +9,11 @@
 //!      exact arithmetic; away from the saturation boundary the only deviation
 //!      is f64 rounding of tanh/atanh — a handful of ULPs.
 //!   2. RADIAL GEODESIC ISOMETRY (manifold axiom): the exp map at the origin is
-//!      a radial isometry, so `d_c(0, exp_0(v)) = |v|` exactly. This pins the
-//!      geodesic distance, the exp map and the metric together against an
-//!      independently-known scalar (the tangent norm) — no reference involved.
+//!      a radial isometry in the RIEMANNIAN tangent norm, so
+//!      `d_c(0, exp_0(v)) = λ_0|v| = 2|v|` exactly (at the origin the conformal
+//!      factor is `λ_0 = 2/(1-0) = 2`). This pins the geodesic distance, the
+//!      exp map and the metric together against an independently-known scalar
+//!      (the Riemannian tangent norm) — no reference involved.
 //!   3. CLOSED-FORM GROUND TRUTH: `exp_0(v)` equals the textbook analytic
 //!      coefficient `tanh(√k|v|)/(√k|v|)` recomputed independently inside the
 //!      test from `v`'s own norm. Matching that analytic expression is a
@@ -151,14 +153,22 @@ fn gam_poincare_exp_log_satisfies_manifold_axioms() {
         gam_roundtrip_l2_max = gam_roundtrip_l2_max.max(l2);
         gam_roundtrip_maxabs = gam_roundtrip_maxabs.max(mab);
 
-        // (2) radial geodesic isometry: d_c(0, exp_0(v)) == |v|.
+        // (2) radial geodesic isometry: d_c(0, exp_0(v)) == λ_0|v| == 2|v|.
+        // The exp map at the origin is a radial isometry in the RIEMANNIAN
+        // (not Euclidean) tangent norm: the conformal factor is
+        // λ_x = 2/(1 - k|x|²), so at the origin λ_0 = 2/(1-0) = 2 and the
+        // Riemannian length of the tangent v is λ_0|v| = 2|v|. Concretely
+        // |exp_0(v)| = tanh(s)/√k (s = √k|v|), so the standard distance
+        // d = 2·asinh(√δ)/√k = 2s/√k = 2|v| — matching geomstats'
+        // `PoincareBallMetric.dist` (acosh(1+2δ)) and the in-crate textbook
+        // formula test, not the bare Euclidean |v|.
         let d_geo = poincare_distance(
             origin_max.slice(ndarray::s![0..v.len()]),
             y.view(),
             CURVATURE,
         )
         .expect("gam poincare_distance");
-        gam_isometry_maxabs = gam_isometry_maxabs.max((d_geo - norm(v)).abs());
+        gam_isometry_maxabs = gam_isometry_maxabs.max((d_geo - 2.0 * norm(v)).abs());
 
         // (3) closed-form ground truth: exp_0(v) == phi * v with the textbook
         // radial coefficient phi = tanh(sqrt_k*|v|)/(sqrt_k*|v|), recomputed
@@ -304,15 +314,17 @@ emit("closed_maxabs_max", [float(np.max(closed_maxabs))])
     );
 
     // --- PRIMARY OBJECTIVE BOUND 2: radial geodesic isometry ---
-    // The origin exp map is a radial isometry, so the geodesic distance from
-    // the origin to exp_0(v) must equal the tangent norm |v| exactly. This
-    // pins exp, log-free, the geodesic distance, and the metric simultaneously
-    // against |v| (recomputed from v alone). acosh near arg=1 amplifies ULPs
-    // by ~1/√(2(arg-1)); the worst case here (|v|=1e-8) gives ~1e-12 slack, so
-    // 1e-10 is a safe absolute bar that still catches any √k or formula error.
+    // The origin exp map is a radial isometry in the RIEMANNIAN tangent norm,
+    // so the geodesic distance from the origin to exp_0(v) must equal the
+    // Riemannian tangent length λ_0|v| = 2|v| exactly (the conformal factor at
+    // the origin is λ_0 = 2/(1-0) = 2). This pins exp, log-free, the geodesic
+    // distance, and the metric simultaneously against 2|v| (recomputed from v
+    // alone). acosh near arg=1 amplifies ULPs by ~1/√(2(arg-1)); the worst case
+    // here (|v|=1e-8) gives ~1e-12 slack, so 1e-10 is a safe absolute bar that
+    // still catches any √k or formula error.
     assert!(
         gam_isometry_maxabs < 1.0e-10,
-        "gam exp map must be a radial geodesic isometry d_c(0,exp(v))==|v|: \
+        "gam exp map must be a radial geodesic isometry d_c(0,exp(v))==2|v|: \
          maxabs deviation={gam_isometry_maxabs:.3e}"
     );
 
