@@ -1,3 +1,86 @@
+## v0.3.108 — gam 0.3.108 / gamfit 0.1.188 (2026-06-09)
+
+Crate + wheel release rolling up everything since gam 0.3.107. crates.io is at
+gam 0.3.107 and PyPI has been stuck at gamfit 0.1.180 — the intervening
+gamfit 0.1.181–0.1.187 wheels never published because the wheel build broke on
+lib compile errors (`-D warnings`) that the per-push CI does not catch (Rust CI
+runs nightly only). Those breaks are fixed here, so this is the first green
+wheel since 0.1.180.
+
+New:
+- feat(report): terminal smooth visualizer. `gam report` now prints a unicode
+  block-glyph sparkline (`▁▂▃▄▅▆▇█`) of each smooth term's fitted partial effect,
+  labelled with its x- and y-ranges — instant shape diagnostics with no plotting
+  backend. Pure, read-only renderer in the new `gam::sparkline` module; faithful
+  min→bottom / max→top mapping with graceful constant/NaN/empty handling.
+
+Location-scale (GAMLSS) correctness:
+- fix(#884): Gaussian location-scale models now persist and reconstruct the
+  actual `response_scale`, and the noise σ-floor is response-scale equivariant —
+  rescaling the response rescales σ̂ exactly instead of silently clamping at a
+  fixed floor. Wired through the predictor, the CLI save path, and the gamfit
+  FFI payload.
+- fix(#684): Gaussian loc-scale uses a Gaussian (not GLM-upward-biased) seed risk
+  profile, and the matrix-free workspace mean↔scale cross-block is the Fisher
+  zero, not the observed `2κm` term.
+- fix(gamlss): the Gaussian wiggle mean↔scale Fisher cross blocks are exactly
+  zero (static, 1st- and 2nd-directional, and the μ↔logσ / logσ↔wiggle mixed
+  β·ψ crosses), removing a spurious coupling in the joint Hessian.
+- fix(#826): true dogleg globalization + scale-invariant Marquardt damping for
+  the coupled location-scale inner Newton, which previously froze on tightly
+  coupled problems.
+
+REML / LAML:
+- fix(#877): Gaussian REML is weight-scale invariant — λ̂ now scales exactly with
+  weight magnitude via complete normalization and a weight-anchored seed +
+  ρ-prior, so multiplying all weights by a constant no longer moves the fit.
+- fix(#715): structural EDF floor uses true generalized eigenvalues; multinomial
+  inner-Newton budget is decoupled from the outer `max_iter`/`tol`; Firth-bounded
+  finite-saturated multinomial formula fits are accepted instead of mis-rejected
+  as separation.
+- fix(reml): custom-family LAML `log|S_λ|₊` value is synced to the gradient's
+  pseudo-logdet classifier; the InnerAssembly TK correction value and gradient
+  are guarded together (single `include_logdet_h`) so they cannot desync.
+- fix(#808, #854): exact floored-pseudo-inverse and second-directional Hessian
+  derivatives for the joint-Jeffreys spatial-adaptive family.
+
+Smooths / latent / shape constraints:
+- fix(#876): periodic latent Duchon decoder recovers a circle/torus instead of
+  collapsing (spectral seed + seam-consistent jet that differentiates the
+  periodic forward).
+- fix(#873): shape-constrained smooths get a strictly-interior cold-start seed,
+  equality-pair-safe interior projection, scale-invariant complementarity, and
+  outer-KKT-gated soft acceptance.
+- fix(#879): honest latent-fit diagnostics (projected gradient + reconstruction
+  quality, scale-aware stationarity for the profiled-scale objective).
+- fix(#880): hardened `duchon_function_norm_penalty` wrapper with regression
+  tests.
+- fix(#691): survival monotone-baseline I-spline — keep the convergent
+  increment-space penalty (the value-space `Lᵀ S_B L` penalty remains the
+  documented limitation pending survival-inner-solve work).
+
+Prediction / diagnostics:
+- fix(predict): prediction (observation) intervals now fold in estimation
+  variance, not just the noise term.
+- fix(survival-predict): a 2-arg `Surv(time, event)` predict builds a default
+  time grid instead of erroring.
+- fix(#881, #882, #883): post-fit diagnostic loaders carry the response and
+  offset through, so diagnostics on reloaded models are correct.
+- fix(alo): approximate-LOO standard errors use the estimated dispersion on both
+  the geometry path and the diagnose refit route.
+- fix(firth): link-general single-eta PIRLS Firth score shift.
+- feat(#738, #741): the joint-Hessian path selects its representation by intent
+  (matrix-free HVP for the inner solve, dense for the log-determinant) and
+  exposes the full row-Hessian quotient as a `CompiledMap`.
+
+Build / release hygiene:
+- Restored workspace compilation: derived `PartialEq` on the
+  `PhiScaledCovariance` / `UnscaledPrecision` covariance newtypes (the
+  `array_values_equal` → native `==` cutover), removed a dead combined
+  `GuardedCorrection::apply`, repointed the relocated `families::wiggle` helpers
+  in the integration tests, and reformatted post-relocation lines. The release
+  also rolls up the unpublished gamfit 0.1.181–0.1.187 changes.
+
 ## v0.3.107 — gam 0.3.107 / gamfit 0.1.186 (2026-06-08)
 
 Crate + wheel release. crates.io was last published at gam 0.3.105 and PyPI at
