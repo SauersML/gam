@@ -3698,14 +3698,19 @@ fn crossfit_score_calibration(
         )?;
 
         // Evaluate the OOF score z and the OOF influence Jacobian J on fold f's
-        // held-out rows from this fold's fitted CTN.
+        // held-out rows from this fold's fitted CTN. The held-out offset rows
+        // enter the PIT operating point identically to the Stage-1 row build, so
+        // the emitted z matches the fitted model when the recipe carries an
+        // offset column (zeros otherwise ⇒ no-op).
         let held_cov = data.values.select(Axis(0), held);
         let held_resp = crossfit_select_rows_1d(&response_full, held);
+        let held_offset = crossfit_select_rows_1d(&offset_full, held);
 
         let jac = crate::families::marginal_slope_orthogonal::score_influence_jacobian(
             &fold_fit,
             &held_resp,
             held_cov.view(),
+            &held_offset,
         )?;
 
         if jac.columns.nrows() != held.len() {
