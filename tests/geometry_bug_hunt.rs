@@ -297,31 +297,22 @@ fn sphere_exp_map_vjp_matches_finite_difference() {
 }
 
 // Curved manifolds without a closed-form backward must REFUSE rather than
-// inherit the silently-wrong flat identity default. Grassmann/Stiefel/SPD all
-// route through `GeometryError::Unsupported`.
+// inherit the silently-wrong flat identity default. Grassmann (for k>1) and
+// SPD route through `GeometryError::Unsupported`. Stiefel has a closed-form
+// canonical VJP via the n×n skew exponential `Exp_Y(Δ) = exp(W) Y`
+// (exercised by `tests/stiefel_exp_map_vjp.rs`), and `Gr(1, n)` is the
+// sphere whose VJP is also closed form, so neither belongs here.
 #[test]
 fn closed_form_less_manifolds_refuse_exp_map_vjp() {
-    let gr = GrassmannManifold::new(1, 3).unwrap();
-    let p = array![1.0, 0.0, 0.0];
-    let v = array![0.0, 0.2, 0.1];
-    let g = array![0.3, -0.4, 0.5];
+    // Gr(2, 4) is a genuinely curved Grassmann manifold with no sphere
+    // delegation (k > 1) and no analytic VJP wired up.
+    let gr = GrassmannManifold::new(2, 4).unwrap();
+    let p = array![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let v = array![0.0, 0.1, 0.2, 0.3, 0.0, 0.0, 0.4, 0.5];
+    let g = array![0.3, -0.4, 0.5, 0.1, -0.2, 0.6, 0.7, -0.8];
     assert!(
         gr.exp_map_vjp(p.view(), v.view(), g.view()).is_err(),
         "Grassmann exp_map_vjp must refuse instead of returning identity grads"
-    );
-
-    // St(2, 4) is a genuinely curved Stiefel manifold with no closed-form
-    // geodesic backward (St(n, 1) = S^{n-1} now correctly delegates to the
-    // sphere, which *does* have an analytic VJP, so it is no longer the
-    // closed-form-less case to test here).
-    let st = StiefelManifold::new(2, 4).unwrap();
-    let p_st = array![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-    let v_st = array![0.0, 0.1, 0.2, 0.3, 0.0, 0.0, 0.4, 0.5];
-    let g_st = array![0.3, -0.4, 0.5, 0.1, -0.2, 0.6, 0.7, -0.8];
-    assert!(
-        st.exp_map_vjp(p_st.view(), v_st.view(), g_st.view())
-            .is_err(),
-        "Stiefel exp_map_vjp must refuse instead of returning identity grads"
     );
 
     let spd = SpdManifold::new(2);
