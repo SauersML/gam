@@ -73,7 +73,10 @@ pub const BASE_CHUNK: usize = 128;
 /// balanced, length-only tree shape.
 #[inline]
 const fn left_split(len: usize) -> usize {
-    debug_assert!(len > BASE_CHUNK);
+    assert!(
+        len > BASE_CHUNK,
+        "left_split: caller must guarantee len > BASE_CHUNK"
+    );
     // Number of whole base blocks needed to cover `len`, rounded down to the
     // span that fits in the left subtree. We want the largest `k = BASE_CHUNK *
     // 2^p` with `k < len`.
