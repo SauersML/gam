@@ -4131,10 +4131,17 @@ fn prepare_survival_location_scale_model(
     // present) or an active timewiggle keeps the full monotone I-spline because
     // the varying σ / wiggle DOES identify the non-affine baseline shape.
     let reduce_time_to_parametric = survival_constant_scale(spec) && protected_timewiggle_cols == 0;
-    // Log exit times for the unit-log-t warp-slope normalization (issue #892).
-    // The I-spline time basis is built over `log t` (survival_construction.rs),
-    // mapped through the same floor as `checked_log_survival_times`, so the
-    // canonical pin regresses the warp direction on these values.
+    // Log entry/exit times for the canonical unit-log-t warp pin (issue #892).
+    // The reduced AFT warp is folded into the geometry offsets as the EXACT
+    // `log t` transform built straight from the event times — `log t` value at
+    // entry/exit and `1/t` derivative at exit — bypassing the I-spline's curved
+    // image of log t (the residual curvature was what kept σ miscalibrated). The
+    // floor matches `checked_log_survival_times` (survival_construction.rs), the
+    // same map under which the I-spline time basis is built over `log t`.
+    let log_time_entry = spec.age_entry.mapv(|t| {
+        t.max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+            .ln()
+    });
     let log_time_exit = spec.age_exit.mapv(|t| {
         t.max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
             .ln()
@@ -4144,6 +4151,7 @@ fn prepare_survival_location_scale_model(
         spec.derivative_guard,
         protected_timewiggle_cols,
         reduce_time_to_parametric,
+        log_time_entry.view(),
         log_time_exit.view(),
     )?;
 
@@ -5551,6 +5559,35 @@ fn unit_log_time_slope(
     Some(slope)
 }
 
+/// The pinned rank-1 reduced parametric-AFT time warp on the canonical
+/// unit-log-t gauge (issue #892).
+///
+/// The warp the GEOMETRY consumes during the fit is the EXACT `h(t) = log t`
+/// transform built directly from the event times — value `log t` at entry/exit
+/// and derivative `1/t` at exit — NOT the I-spline's monotone-trend image of it.
+/// This is the precise survreg / lifelines / flexsurv AFT gauge: with the warp
+/// pinned to exactly `log t`, the single global σ is the sole remaining scale,
+/// so it recovers to truth instead of absorbing the free I-spline warp slope.
+/// (The earlier pin normalized the I-spline null-space trend column to unit
+/// log-t SLOPE and folded its design IMAGE; but that trend has curvature, so its
+/// image ≠ log t and σ stayed miscalibrated.)
+///
+/// `report_coefficient` is the I-spline coefficient whose design image best
+/// represents the same log-t trend (the unit-log-t-slope-normalized null-space
+/// direction). It is lifted back at finalize via `affine_shift` so the reported
+/// raw time coefficients — and the I-spline-basis prediction path that consumes
+/// them — carry a meaningful, monotone log-t warp rather than a zero vector.
+struct PinnedRank1Warp {
+    /// I-spline coefficient reported as the raw time-warp coefficient.
+    report_coefficient: Array1<f64>,
+    /// Exact `log t_entry` warp value (folded into `offset_entry`).
+    warp_entry: Array1<f64>,
+    /// Exact `log t_exit` warp value (folded into `offset_exit`).
+    warp_exit: Array1<f64>,
+    /// Exact `1/t_exit` warp derivative (folded into `derivative_offset_exit`).
+    warp_derivative_exit: Array1<f64>,
+}
+
 /// Pin the rank-1 reduced parametric-AFT time warp to the canonical unit-log-t
 /// gauge (issue #892). The real survival time penalty is a 1st-difference
 /// penalty, so its null space is DIMENSION 1: a single monotone log-t trend
@@ -5558,23 +5595,62 @@ fn unit_log_time_slope(
 /// `θ` in `h(t) = θ · m(t)` is exactly degenerate with σ (a 1-parameter ridge),
 /// so the unconstrained direct-MLE Newton picks an arbitrary scale — miscalibrating
 /// absolute S(t|x) AND stalling low-leverage location coefficients along the
-/// alias. Fix: normalize `z` to unit data-scale slope vs log t and fold it
-/// ENTIRELY into the geometry offsets, leaving ZERO free time columns (the warp
-/// becomes a fixed unit-log-t offset, exactly the survreg/lifelines gauge). The
-/// pinned raw coefficient `z_norm` is lifted back at finalize via `affine_shift`.
-/// Returns the normalized direction `z_norm` (p-vector), or `None` when the
-/// single column has no usable log-t slope (keep the prior reduce behavior).
+/// alias.
+///
+/// Fix: build the folded warp as the EXACT `log t` transform straight from the
+/// event times — `h(t_entry) = log t_entry`, `h(t_exit) = log t_exit`,
+/// `h'(t_exit) = 1/t_exit` — and fold it ENTIRELY into the geometry offsets,
+/// leaving ZERO free time columns. With the warp pinned to exactly `log t`
+/// (not the I-spline's curved approximation of it) σ recovers to truth, exactly
+/// as survreg/lifelines/flexsurv parameterize the AFT baseline. The `log t`
+/// values come from the same floor (`SURVIVAL_TIME_FLOOR`) as the I-spline
+/// builder's `checked_log_survival_times`, so `1/t_exit = exp(−log t_exit)`.
+///
+/// Returns `None` when the single null-space column has no usable log-t slope
+/// (keep the prior reduce behavior), the entry/exit time views are mis-shaped,
+/// or any floored time is non-finite — in which case the exact warp cannot be
+/// formed and the caller falls through to the both-columns-free reduce.
 fn pin_reduced_time_warp_rank1(
     z: &Array2<f64>,
     design_exit: &Array2<f64>,
+    log_time_entry: ndarray::ArrayView1<f64>,
     log_time_exit: ndarray::ArrayView1<f64>,
-) -> Option<Array1<f64>> {
+) -> Option<PinnedRank1Warp> {
     if z.ncols() != 1 {
         return None;
     }
+    let n = design_exit.nrows();
+    if log_time_entry.len() != n || log_time_exit.len() != n {
+        return None;
+    }
+    // The reported I-spline coefficient is still the unit-log-t-slope-normalized
+    // null-space direction (the I-spline's best monotone log-t representation),
+    // so the raw time-warp coefficient and the basis-driven prediction path stay
+    // meaningful. Its design image only approximates log t — which is exactly why
+    // it must NOT drive the fit; the fit uses the exact log-t warp below.
     let z_dir = z.column(0).to_owned();
     let slope = unit_log_time_slope(design_exit, &z_dir, log_time_exit)?;
-    Some(&z_dir / slope)
+    let report_coefficient = &z_dir / slope;
+
+    // Exact log-t warp consumed by the geometry. `1/t_exit = exp(−log t_exit)`
+    // because `log t_exit = ln(max(t, SURVIVAL_TIME_FLOOR))`, so the derivative
+    // is strictly positive and finite at every observed exit time — the row-wise
+    // monotonicity of `h(t) = log t` holds structurally with no free column.
+    let warp_entry = log_time_entry.to_owned();
+    let warp_exit = log_time_exit.to_owned();
+    let warp_derivative_exit = log_time_exit.mapv(|lt| (-lt).exp());
+    if warp_entry.iter().any(|v| !v.is_finite())
+        || warp_exit.iter().any(|v| !v.is_finite())
+        || warp_derivative_exit.iter().any(|v| !v.is_finite())
+    {
+        return None;
+    }
+    Some(PinnedRank1Warp {
+        report_coefficient,
+        warp_entry,
+        warp_exit,
+        warp_derivative_exit,
+    })
 }
 
 /// Result of pinning the reduced parametric-AFT time-warp slope to the canonical
@@ -5668,6 +5744,7 @@ fn prepare_identified_time_block(
     derivative_guard: f64,
     monotone_time_wiggle_ncols: usize,
     reduce_to_parametric: bool,
+    log_time_entry: ndarray::ArrayView1<f64>,
     log_time_exit: ndarray::ArrayView1<f64>,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
@@ -5734,19 +5811,28 @@ fn prepare_identified_time_block(
         // stays false.
         if r == 1
             && z.nrows() == p
-            && let Some(z_norm) = pin_reduced_time_warp_rank1(&z, &design_exit, log_time_exit)
+            && let Some(pinned) =
+                pin_reduced_time_warp_rank1(&z, &design_exit, log_time_entry, log_time_exit)
         {
-            // Fold the pinned unit-log-t warp entirely into the offsets:
-            // value at entry/exit and derivative at exit. With zero free
-            // columns the geometry h is offset-only; monotonicity holds
-            // structurally because the folded derivative is exactly
-            // `X' z_norm = u'(t) = 1/t > 0` at every observed time.
-            let offset_entry = &input.offset_entry + &design_entry.dot(&z_norm);
-            let offset_exit = &input.offset_exit + &design_exit.dot(&z_norm);
-            let derivative_offset_exit =
-                &input.derivative_offset_exit + &design_derivative_exit.dot(&z_norm);
+            let PinnedRank1Warp {
+                report_coefficient,
+                warp_entry,
+                warp_exit,
+                warp_derivative_exit,
+            } = pinned;
+            // Fold the EXACT log-t warp entirely into the offsets: value
+            // `log t` at entry/exit and derivative `1/t` at exit (built directly
+            // from the event times, NOT the I-spline's curved image of them — that
+            // residual curvature is what kept σ miscalibrated). With zero free
+            // columns the geometry h is offset-only and equals exactly `log t`;
+            // monotonicity holds structurally because the folded derivative is
+            // exactly `1/t > 0` at every observed time.
+            let offset_entry = &input.offset_entry + &warp_entry;
+            let offset_exit = &input.offset_exit + &warp_exit;
+            let derivative_offset_exit = &input.derivative_offset_exit + &warp_derivative_exit;
             // Zero free time coefficients: empty n×0 designs, empty transform `z`
-            // (p×0), the pinned coefficient carried by `affine_shift = z_norm`.
+            // (p×0). The reported raw time-warp coefficient (the I-spline's best
+            // monotone log-t representation) is carried by `affine_shift`.
             let empty_entry = Array2::<f64>::zeros((design_entry.nrows(), 0));
             let empty_exit = Array2::<f64>::zeros((design_exit.nrows(), 0));
             let empty_derivative = Array2::<f64>::zeros((design_derivative_exit.nrows(), 0));
@@ -5766,7 +5852,7 @@ fn prepare_identified_time_block(
                 initial_beta: Some(Array1::<f64>::zeros(0)),
                 transform: TimeIdentifiabilityTransform {
                     z: Array2::<f64>::zeros((p, 0)),
-                    affine_shift: z_norm,
+                    affine_shift: report_coefficient,
                 },
                 offset_entry,
                 offset_exit,
@@ -13317,6 +13403,7 @@ mod tests {
             1e-6,
             0,
             false,
+            array![-1.0_f64, -0.5, 0.0].view(),
             array![0.0_f64, 0.5, 1.0].view(),
         )
         .expect("prepare time block");
@@ -13349,6 +13436,7 @@ mod tests {
             1e-6,
             0,
             false,
+            array![-1.0_f64, -0.5, 0.0].view(),
             array![0.0_f64, 0.5, 1.0].view(),
         )
         .expect("prepare time block");
@@ -13397,10 +13485,17 @@ mod tests {
         };
 
         // log(t_exit) for the unit-log-t warp-slope pin (issue #892).
+        let log_time_entry = array![-1.0_f64, -0.5, 0.0];
         let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, true, log_time_exit.view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            true,
+            log_time_entry.view(),
+            log_time_exit.view(),
+        )
+        .expect("prepare time block");
         // Canonical gauge pin (#892): the warp slope is folded into the offset,
         // so the FREE time block collapses to the single row-constant direction.
         // The identifiability map is now p×1 (was p×2), with the pinned unit-log-t
@@ -13465,10 +13560,17 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
+        let log_time_entry = array![-1.0_f64, -0.5, 0.0];
         let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, true, log_time_exit.view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            true,
+            log_time_entry.view(),
+            log_time_exit.view(),
+        )
+        .expect("prepare time block");
         // Pin fired: single free column + non-zero pinned warp.
         assert_eq!(prepared.transform.z.ncols(), 1);
         let theta = array![0.731_f64];
@@ -13535,10 +13637,17 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
+        let log_time_entry = array![-1.0_f64, -0.5, 0.0];
         let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, true, log_time_exit.view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            true,
+            log_time_entry.view(),
+            log_time_exit.view(),
+        )
+        .expect("prepare time block");
 
         // Zero free time columns: empty designs + p×0 transform.
         assert_eq!(prepared.transform.z.ncols(), 0);
@@ -13609,6 +13718,7 @@ mod tests {
             1e-6,
             0,
             false,
+            array![-1.0_f64, -0.5, 0.0].view(),
             array![0.0_f64, 0.5, 1.0].view(),
         )
         .expect("prepare time block");
@@ -13661,6 +13771,7 @@ mod tests {
             1e-6,
             1,
             false,
+            array![-1.0_f64, -0.5, 0.0].view(),
             array![0.0_f64, 0.5, 1.0].view(),
         )
         .expect("prepare time block");
@@ -13700,6 +13811,7 @@ mod tests {
             1e-6,
             0,
             false,
+            array![-1.0_f64, -0.5, 0.0].view(),
             array![0.0_f64, 0.5, 1.0].view(),
         ) {
             Ok(_) => panic!("offsets below the guard must be rejected"),
@@ -14109,6 +14221,7 @@ mod tests {
             1e-6,
             0,
             false,
+            array![-1.0_f64, -0.5, 0.0].view(),
             array![0.0_f64, 0.5, 1.0].view(),
         )
         .expect("prepare time block");
