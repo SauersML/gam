@@ -1,0 +1,452 @@
+"""WP-D — the harvest contract: per-token output-Fisher factors from a model.
+
+This module is the *torch end* of the output-Fisher pullback metric (#980). It
+harvests, for each token, the exact low-rank input shard that gam's
+``RowMetric::OutputFisher`` consumes:
+
+* ``x_n`` — the activation at a chosen hook site, ``x_n ∈ ℝ^p``;
+* ``U_n`` — the **top-r factors** of the pullback ``G_n = J_nᵀ F J_n``, where
+  ``J_n = ∂logits/∂x_n`` is the model's output Jacobian *at that activation* and
+  ``F = diag(p) − p pᵀ`` is the softmax (output) Fisher. ``U_n ∈ ℝ^{p × r}`` is
+  scaled so that ``U_n U_nᵀ`` reconstructs the rank-r truncation of ``G_n``
+  (column ``k`` is ``√λ_k · v_k``). This is exactly the factor convention
+  ``RowMetric::output_fisher`` expects: it forms ``W_n = U_n U_nᵀ`` directly;
+* ``mass_residual`` — ``trace(G_n) − Σ_{k≤r} λ_k``, the output-Fisher mass that
+  falls *off* the captured top-r subspace. This is what makes the rank-r cut
+  honest downstream: it bounds the whitening error the truncation incurs.
+
+Everything is matrix-free. The Jacobian ``J_n`` (``C × p``) and the pullback
+``G_n`` (``p × p``) are **never materialized**. The only primitive used is the
+pullback matvec ``v ↦ G_n v = J_nᵀ (F (J_n v))``, assembled from one
+JVP (``J_n v``), a Fisher-apply (``F u = p ⊙ u − p (pᵀu)``), and one VJP
+(``J_nᵀ w``). The top-r eigenpairs come from subspace iteration + a small
+``m × m`` Rayleigh–Ritz eigendecomposition (``m = r + oversample``); ``trace``
+is a matrix-free Hutchinson estimate using the same matvec. No ``C × p`` or
+``p × p`` object is ever allocated in the harvest loop.
+
+Policy note: heavy gam math stays in the Rust core, but *harvesting from a torch
+model* is the sanctioned torch-interop path — these are torch autograd ops on a
+user-supplied model, not a reimplementation of any gam primitive. The shard is
+written f32 (factors are inherently low-precision) and promoted to f64 only at
+the gam boundary (``load_harvest_shard`` returns f64 arrays).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
+import torch
+
+__all__ = [
+    "HarvestShard",
+    "harvest_output_fisher_factors",
+    "save_harvest_shard",
+    "load_harvest_shard",
+]
+
+
+# ---------------------------------------------------------------------------
+# Shard container — the (X, U, mass_residual) contract
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HarvestShard:
+    """The exact input shard ``RowMetric::OutputFisher`` consumes.
+
+    Attributes
+    ----------
+    X
+        ``(n, p)`` activations at the hook site, one row per harvested token.
+    U
+        ``(n, p, r)`` per-row output-Fisher factors. ``U[n]`` is ``U_n`` with
+        ``U_n U_nᵀ`` equal to the rank-r truncation of ``G_n = J_nᵀ F J_n``;
+        column ``k`` is ``√λ_k · v_k`` for the ``k``-th largest eigenpair.
+        Flattened row-major this matches the gam layout
+        ``u[n, i * r + k] = U[n, i, k]``.
+    mass_residual
+        ``(n,)`` truncation diagnostic: ``trace(G_n) − Σ_{k≤r} λ_k ≥ 0``, the
+        output-Fisher mass off the captured top-r subspace.
+    rank
+        ``r``, the number of factors per row (``U.shape[2]``).
+    """
+
+    X: Any
+    U: Any
+    mass_residual: Any
+    rank: int
+
+    def __post_init__(self) -> None:
+        X = np.asarray(self.X)
+        U = np.asarray(self.U)
+        mr = np.asarray(self.mass_residual)
+        if X.ndim != 2:
+            raise ValueError(f"X must be (n, p); got shape {X.shape}")
+        n, p = X.shape
+        if U.shape != (n, p, self.rank):
+            raise ValueError(
+                f"U must be (n, p, r) = ({n}, {p}, {self.rank}); got shape {U.shape}"
+            )
+        if mr.shape != (n,):
+            raise ValueError(f"mass_residual must be (n,) = ({n},); got shape {mr.shape}")
+
+
+# ---------------------------------------------------------------------------
+# Matrix-free output-Fisher pullback matvec
+# ---------------------------------------------------------------------------
+
+
+def _softmax_fisher_apply(probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """Apply the softmax Fisher ``F = diag(p) − p pᵀ`` to ``u``, matrix-free.
+
+    ``probs`` is ``(..., C)`` softmax probabilities; ``u`` is ``(..., C)``. The
+    ``C × C`` matrix ``F`` is never formed: ``F u = p ⊙ u − p (pᵀ u)``.
+    """
+    weighted = probs * u
+    inner = (probs * u).sum(dim=-1, keepdim=True)
+    return weighted - probs * inner
+
+
+def _pullback_matvec(
+    jvp_fn: Callable[[torch.Tensor], torch.Tensor],
+    vjp_fn: Callable[[torch.Tensor], torch.Tensor],
+    probs: torch.Tensor,
+    V: torch.Tensor,
+) -> torch.Tensor:
+    """``V ↦ G V`` for ``G = Jᵀ F J`` applied to a stack of ``m`` directions.
+
+    ``V`` is ``(p, m)``. Returns ``(p, m)``. Internally: ``J V`` is ``(C, m)``
+    via a vectorized JVP, ``F (J V)`` is the matrix-free Fisher-apply, and
+    ``Jᵀ (F J V)`` is a vectorized VJP. No ``C × p`` or ``p × p`` matrix exists.
+    """
+    # J V : (C, m) — one JVP per column, vectorized over the trailing axis.
+    jv = jvp_fn(V)  # (C, m)
+    # F (J V): Fisher contracts the C-axis independently per column. Put C last
+    # ((m, C)), broadcast probs (C,) over the m rows, apply, then restore (C, m).
+    fjv = _softmax_fisher_apply(probs, jv.transpose(0, 1)).transpose(0, 1)  # (C, m)
+    # Jᵀ (F J V) : (p, m) — one VJP per column.
+    return vjp_fn(fjv)  # (p, m)
+
+
+def _orthonormalize(M: torch.Tensor) -> torch.Tensor:
+    """Thin QR returning an orthonormal ``(p, m)`` basis for ``range(M)``."""
+    q, _ = torch.linalg.qr(M, mode="reduced")
+    return q
+
+
+def _top_r_eigenpairs(
+    matvec: Callable[[torch.Tensor], torch.Tensor],
+    p: int,
+    r: int,
+    *,
+    oversample: int,
+    n_iter: int,
+    generator: torch.Generator,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-r eigenpairs of a PSD operator given only its matvec ``V ↦ G V``.
+
+    Randomized subspace iteration with ``m = min(p, r + oversample)`` columns,
+    ``n_iter`` power steps, then a Rayleigh–Ritz step: the only dense linear
+    algebra is an ``m × m`` symmetric eig (``m`` small, never ``p × p``).
+
+    Returns ``(eigvals, eigvecs)`` with ``eigvals`` ``(r,)`` descending and
+    ``eigvecs`` ``(p, r)`` orthonormal (the leading-r Ritz vectors).
+    """
+    m = min(p, r + oversample)
+    # Sample on the generator's device (CPU) then move to the operator device,
+    # so the fixed seed gives identical bases on CPU and GPU.
+    Q = torch.randn(p, m, generator=generator, dtype=dtype).to(device)
+    Q = _orthonormalize(Q)
+    for _ in range(n_iter):
+        Q = _orthonormalize(matvec(Q))
+    # Rayleigh–Ritz on the captured subspace: T = Qᵀ G Q is (m, m).
+    GQ = matvec(Q)
+    T = Q.transpose(0, 1) @ GQ
+    T = 0.5 * (T + T.transpose(0, 1))  # symmetrize against round-off
+    evals, evecs = torch.linalg.eigh(T)  # ascending
+    # Descending, take leading r.
+    order = torch.argsort(evals, descending=True)
+    top = order[:r]
+    ritz_vals = evals[top].clamp_min(0.0)  # PSD: clamp tiny negative round-off
+    ritz_vecs = Q @ evecs[:, top]  # (p, r)
+    return ritz_vals, ritz_vecs
+
+
+def _trace_estimate(
+    matvec: Callable[[torch.Tensor], torch.Tensor],
+    p: int,
+    *,
+    n_probes: int,
+    generator: torch.Generator,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Matrix-free ``trace(G)`` from the matvec.
+
+    Exact when ``n_probes >= p``: probe with the standard basis ``I_p`` so
+    ``Σ_i e_iᵀ G e_i = trace(G)`` exactly (still only matvecs, no ``p × p``).
+    Otherwise a Rademacher Hutchinson estimate ``E[zᵀ G z] = trace(G)``. Probes
+    are batched as a ``(p, n_probes)`` block through a single matvec call.
+    """
+    if n_probes >= p:
+        # Exact: identity-basis probes, no randomness, fully deterministic.
+        Z = torch.eye(p, dtype=dtype, device=device)
+        GZ = matvec(Z)  # (p, p)
+        return (Z * GZ).sum()  # = trace(G) exactly
+    n_probes = max(1, n_probes)
+    # Sample Rademacher ±1 on the generator's device (CPU), then move.
+    Z = (
+        torch.randint(0, 2, (p, n_probes), generator=generator, dtype=torch.int64)
+        .to(dtype)
+        * 2
+        - 1
+    ).to(device)
+    GZ = matvec(Z)  # (p, n_probes)
+    quad = (Z * GZ).sum(dim=0)  # (n_probes,)
+    return quad.mean()
+
+
+# ---------------------------------------------------------------------------
+# Hook-site activation capture
+# ---------------------------------------------------------------------------
+
+
+def _capture_activations(
+    model: torch.nn.Module,
+    hook_module: torch.nn.Module,
+    inputs: Any,
+) -> tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]:
+    """Run ``model(inputs)`` capturing the output of ``hook_module``.
+
+    Returns ``(acts, logits_from_acts)`` where ``acts`` is the detached hook-site
+    activation tensor ``(n, p)`` (flattened over any leading token/batch axes)
+    and ``logits_from_acts`` recomputes logits as a differentiable function of a
+    *single* hook-site activation row ``ℝ^p → ℝ^C`` (the local map whose
+    Jacobian is ``J_n``). The recompute splices a candidate activation back in at
+    the hook site for one forward pass, so ``J_n`` is the true end-to-end
+    ``∂logits/∂x_n`` through the rest of the network.
+    """
+    captured: dict[str, torch.Tensor] = {}
+
+    def _grab(_mod: torch.nn.Module, _inp: Any, out: torch.Tensor) -> None:
+        captured["act"] = out
+
+    handle = hook_module.register_forward_hook(_grab)
+    try:
+        with torch.no_grad():
+            logits = model(inputs)
+        act = captured["act"]
+    finally:
+        handle.remove()
+
+    # Flatten leading axes to a token list: act (..., p) -> (n, p).
+    act_flat = act.reshape(-1, act.shape[-1]).detach()
+    feature_shape = act.shape
+
+    def logits_from_act(single_row: torch.Tensor, row_index: int) -> torch.Tensor:
+        """Logits as a function of one spliced-in activation row ``ℝ^p → ℝ^C``."""
+        replacement = {"value": None, "index": row_index, "shape": feature_shape}
+
+        def _splice(_mod: torch.nn.Module, _inp: Any, out: torch.Tensor) -> torch.Tensor:
+            flat = out.reshape(-1, out.shape[-1])
+            rows = [flat[i] for i in range(flat.shape[0])]
+            rows[replacement["index"]] = single_row
+            new_flat = torch.stack(rows, dim=0)
+            return new_flat.reshape(out.shape)
+
+        h = hook_module.register_forward_hook(_splice)
+        try:
+            out_logits = model(inputs)
+        finally:
+            h.remove()
+        return out_logits.reshape(-1, out_logits.shape[-1])[row_index]
+
+    return act_flat, logits_from_act
+
+
+# ---------------------------------------------------------------------------
+# Public harvest entry point
+# ---------------------------------------------------------------------------
+
+
+def harvest_output_fisher_factors(
+    model: torch.nn.Module,
+    hook_module: torch.nn.Module,
+    inputs: Any,
+    *,
+    rank: int,
+    oversample: int = 4,
+    n_iter: int = 2,
+    trace_probes: int = 8,
+    seed: int = 0,
+) -> HarvestShard:
+    """Harvest per-token output-Fisher factors at ``hook_module``.
+
+    Parameters
+    ----------
+    model
+        The torch model. Called as ``model(inputs)`` and assumed to return
+        logits of shape ``(..., C)`` (the leading axes are flattened to tokens).
+    hook_module
+        A submodule of ``model`` whose *output* is the hook-site activation
+        ``x_n``. Its forward output's last axis is the activation dimension ``p``.
+    inputs
+        Whatever ``model.forward`` accepts (e.g. token ids). Harvesting is done
+        for every token row produced at the hook site.
+    rank
+        ``r``, the number of output-Fisher factors retained per row.
+    oversample, n_iter
+        Subspace-iteration controls. ``m = min(p, r + oversample)`` subspace
+        width and ``n_iter`` power steps before the Rayleigh–Ritz eig.
+    trace_probes
+        Number of Hutchinson probes for the ``trace(G_n)`` estimate that feeds
+        ``mass_residual``.
+    seed
+        Fixed RNG seed for the randomized subspace + Hutchinson probes — fully
+        deterministic, no clock entropy.
+
+    Returns
+    -------
+    HarvestShard
+        ``X (n, p)``, ``U (n, p, r)``, ``mass_residual (n,)`` — the exact shard
+        ``RowMetric::output_fisher`` consumes. Factors are computed in the
+        model's working dtype/device and returned as f32 numpy on CPU; f64
+        promotion happens at the gam boundary in :func:`load_harvest_shard`.
+    """
+    if rank < 1:
+        raise ValueError(f"rank must be >= 1; got {rank}")
+
+    act_flat, logits_from_act = _capture_activations(model, hook_module, inputs)
+    n, p = int(act_flat.shape[0]), int(act_flat.shape[1])
+    if rank > p:
+        raise ValueError(f"rank {rank} exceeds activation dimension p = {p}")
+    device = act_flat.device
+    # Work in the activation dtype but force at least f32 for the eig.
+    work_dtype = act_flat.dtype if act_flat.dtype in (torch.float32, torch.float64) else torch.float32
+
+    U = np.empty((n, p, rank), dtype=np.float32)
+    X = act_flat.to(torch.float32).cpu().numpy().astype(np.float32, copy=False)
+    mass_residual = np.empty((n,), dtype=np.float32)
+
+    for row in range(n):
+        x_row = act_flat[row].to(work_dtype).detach().requires_grad_(False)
+
+        # Local map f_row : ℝ^p → ℝ^C whose Jacobian is J_n.
+        def f_row(x: torch.Tensor, _row: int = row) -> torch.Tensor:
+            return logits_from_act(x, _row).to(work_dtype)
+
+        # Softmax probabilities at this token (for the Fisher F = diag(p) − p pᵀ).
+        with torch.no_grad():
+            probs = torch.softmax(f_row(x_row), dim=-1)  # (C,)
+
+        # JVP: V (p, m) -> J_n V (C, m). One torch.func.jvp per column; J_n is
+        # never formed. Columns are looped explicitly (m is small: r+oversample
+        # or a handful of trace probes) — robust through the model's forward
+        # hooks, which vmap would have to trace through.
+        def jvp_fn(V: torch.Tensor, _f=f_row, _x=x_row) -> torch.Tensor:
+            cols = []
+            for j in range(V.shape[1]):
+                _out, jv = torch.func.jvp(_f, (_x,), (V[:, j].contiguous(),))
+                cols.append(jv)
+            return torch.stack(cols, dim=1)  # (C, m)
+
+        # VJP: W (C, m) -> J_nᵀ W (p, m). Build the pullback closure once per row.
+        _out0, vjp_raw = torch.func.vjp(f_row, x_row)
+
+        def vjp_fn(W: torch.Tensor, _vjp=vjp_raw) -> torch.Tensor:
+            cols = []
+            for j in range(W.shape[1]):
+                (gx,) = _vjp(W[:, j].contiguous())  # (p,)
+                cols.append(gx)
+            return torch.stack(cols, dim=1)  # (p, m)
+
+        def matvec(V: torch.Tensor, _j=jvp_fn, _vj=vjp_fn, _p=probs) -> torch.Tensor:
+            return _pullback_matvec(_j, _vj, _p, V)
+
+        gen = torch.Generator(device="cpu")
+        gen.manual_seed(seed + row)
+        # Generators sample on CPU (randn/randint are CPU-portable), then the
+        # basis is moved onto the activation device so the seed is honored
+        # identically regardless of where the model lives.
+        evals, evecs = _top_r_eigenpairs(
+            matvec,
+            p,
+            rank,
+            oversample=oversample,
+            n_iter=n_iter,
+            generator=gen,
+            dtype=work_dtype,
+            device=device,
+        )
+        # Factors: column k = sqrt(λ_k) · v_k, so U_n U_nᵀ = Σ_k λ_k v_k v_kᵀ.
+        scaled = evecs * evals.clamp_min(0.0).sqrt().unsqueeze(0)  # (p, r)
+
+        gen_tr = torch.Generator(device="cpu")
+        gen_tr.manual_seed(seed + 10_000 + row)
+        trace = _trace_estimate(
+            matvec,
+            p,
+            n_probes=trace_probes,
+            generator=gen_tr,
+            dtype=work_dtype,
+            device=device,
+        )
+        residual = float(trace.item() - float(evals.sum().item()))
+        # PSD ⇒ residual ≥ 0; clamp tiny Hutchinson noise that dips below.
+        mass_residual[row] = max(residual, 0.0)
+        U[row] = scaled.detach().to(torch.float32).cpu().numpy()
+
+    return HarvestShard(X=X, U=U, mass_residual=mass_residual, rank=rank)
+
+
+# ---------------------------------------------------------------------------
+# Shard I/O — the on-disk (X, U, mass_residual) contract
+# ---------------------------------------------------------------------------
+
+
+def save_harvest_shard(shard: HarvestShard, path: str | Path) -> str:
+    """Write ``shard`` to a ``.npz`` archive: ``X``, ``U``, ``mass_residual``.
+
+    Mirrors :mod:`gamfit._sampling`'s ``.npz`` suffix rule. Factors are stored
+    f32 (their working precision); ``rank`` is recorded so the loader can assert
+    the ``(n, p, r)`` layout. Returns the path that actually landed on disk.
+    """
+    out = Path(path)
+    if out.suffix != ".npz":
+        out = out.with_name(out.name + ".npz")
+    np.savez(
+        out,
+        X=np.ascontiguousarray(shard.X, dtype=np.float32),
+        U=np.ascontiguousarray(shard.U, dtype=np.float32),
+        mass_residual=np.ascontiguousarray(shard.mass_residual, dtype=np.float32),
+        rank=np.int64(shard.rank),
+    )
+    return str(out)
+
+
+def load_harvest_shard(path: str | Path) -> dict[str, Any]:
+    """Load a harvest shard, promoting to f64 at the gam boundary.
+
+    Returns a dict with f64 ``X (n, p)``, ``U (n, p, r)``, ``mass_residual (n,)``
+    and the int ``rank``. The f32 → f64 promotion happens here: the torch side
+    keeps factors in their natural low precision; gam (which runs f64 CPU)
+    consumes them promoted. The flattened ``U`` row-major layout
+    ``u[n, i * r + k] = U[n, i, k]`` is exactly ``RowMetric::output_fisher``'s.
+    """
+    target = Path(path)
+    if not target.exists() and target.suffix != ".npz":
+        suffixed = target.with_name(target.name + ".npz")
+        if suffixed.exists():
+            target = suffixed
+    npz = np.load(target)
+    return {
+        "X": np.asarray(npz["X"], dtype=np.float64),
+        "U": np.asarray(npz["U"], dtype=np.float64),
+        "mass_residual": np.asarray(npz["mass_residual"], dtype=np.float64),
+        "rank": int(npz["rank"].item()),
+    }
