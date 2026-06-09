@@ -1,5 +1,6 @@
 pub(crate) mod active_set;
 pub mod arrow_schur;
+pub mod continuation_path;
 pub mod estimate;
 pub mod evidence;
 pub mod gaussian_reml;
@@ -27,14 +28,18 @@ pub mod visualizer;
 pub(crate) mod workflow;
 
 pub use evidence::{
-    EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, SelectedTopology,
-    TopologyCandidate, TopologyKind, TopologyScoreScale, TopologySelectOptions, evidence_grad_rho,
-    evidence_hessian_log_det, evidence_ift_gradient_correction, hessian_log_det_from_hvp,
-    laplace_evidence, select_topology,
+    EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,
+    GaussianMixtureFit, SelectedTopology, StackingConfig, StackingWeights, TopologyCandidate,
+    TopologyKind, TopologyScoreScale, TopologySelectOptions, evidence_grad_rho,
+    evidence_hessian_log_det, evidence_ift_gradient_correction, fit_gaussian_mixture,
+    hessian_log_det_from_hvp, laplace_evidence, select_topology, solve_stacking_weights,
 };
 pub use topology_selector::{
-    AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
-    TopologyAutoSelectorResult, select_topology_with_fit, tk_normalized_score,
+    AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, Headline, HeldOutDensityProvider,
+    MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS, TopologyAutoFitEvidence,
+    TopologyAutoRankedFit, TopologyAutoSelector, TopologyAutoSelectorResult,
+    adjudicate_cross_class_race, build_cv_log_density_table, deterministic_cv_folds,
+    fit_mixture_rung, mixture_density_provider, select_topology_with_fit, tk_normalized_score,
 };
 
 /// Process-wide counter of smoothing-corrections that took the sigma-cubature

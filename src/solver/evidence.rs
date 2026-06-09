@@ -368,6 +368,567 @@ pub fn stacked_predictive_mean(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Discrete mixture rung (Object 3a / WP-C)
+// ---------------------------------------------------------------------------
+//
+// A `k`-component full-covariance Gaussian mixture fitted by deterministic
+// k-means++-style seeding (reusing `terms::basis` farthest-point k-means) plus
+// EM to a tolerance. It is priced by its free-parameter count and scored
+// through the SAME rank-aware Laplace/Tierney-Kadane normalizer as the smooth
+// topology candidates: `−V = loglik − ½ log|H| + ½ P log(2π)` with the
+// `−½ (dim(H) − rank(S)) log(2π)` normalizer evaluated at `dim(H) = P`,
+// `rank(S) = 0` (a fully likelihood-identified, unpenalized parametric model,
+// so every free parameter is unpenalized null-space). The Hessian log-det
+// `log|H|` is the observed (empirical-Fisher / BHHH) information
+// `H = Σ_i s_i s_iᵀ`, the exact, finite, SPD observed-information surrogate at
+// the EM optimum, fed through the same `laplace_evidence` entry point used by
+// the smooth rungs so the two model classes are comparable on the evidence
+// scale.
+
+/// Convergence + ladder controls for the discrete-mixture rung. All fields are
+/// fixed (no clock randomness, no env): deterministic seeding makes the fitted
+/// mixture a pure function of the data and `k`.
+#[derive(Debug, Clone, Copy)]
+pub struct GaussianMixtureConfig {
+    /// Maximum EM iterations.
+    pub max_iter: usize,
+    /// Relative mean-log-likelihood improvement tolerance for EM stopping.
+    pub loglik_tol: f64,
+    /// Ridge added to each component covariance for numerical SPD safety
+    /// (variance floor). A small fixed value, not a tuned knob.
+    pub covariance_floor: f64,
+    /// Maximum iterations for the deterministic k-means seeding pass.
+    pub kmeans_max_iter: usize,
+}
+
+impl Default for GaussianMixtureConfig {
+    fn default() -> Self {
+        Self {
+            max_iter: 200,
+            loglik_tol: 1e-7,
+            covariance_floor: 1e-6,
+            kmeans_max_iter: 25,
+        }
+    }
+}
+
+/// A fitted `k`-component full-covariance Gaussian mixture.
+#[derive(Debug, Clone)]
+pub struct GaussianMixtureFit {
+    /// Mixing weights, length `k`, on the simplex.
+    pub weights: Array1<f64>,
+    /// Component means, `k × d`.
+    pub means: Array2<f64>,
+    /// Component covariances, `k` matrices of shape `d × d` (SPD).
+    pub covariances: Vec<Array2<f64>>,
+    /// Number of mixture components.
+    pub k: usize,
+    /// Data dimension.
+    pub d: usize,
+    /// Number of rows used to fit.
+    pub n_obs: usize,
+    /// Maximised total log-likelihood `Σ_i log Σ_j w_j N(y_i; μ_j, Σ_j)`.
+    pub loglik: f64,
+    /// EM iterations taken.
+    pub iterations: usize,
+}
+
+impl GaussianMixtureFit {
+    /// Free-parameter count `P` of a `k`-component full-covariance mixture in
+    /// `d` dimensions: `(k − 1)` mixing weights on the simplex, `k·d` mean
+    /// coordinates, and `k · d(d+1)/2` covariance entries. This is the exact
+    /// quantity that enters the rank-aware normalizer as `dim(H) − rank(S)`.
+    pub fn num_free_parameters(&self) -> usize {
+        let cov_per = self.d * (self.d + 1) / 2;
+        (self.k - 1) + self.k * self.d + self.k * cov_per
+    }
+
+    /// Per-observation log predictive density `log p(y_i)` under the fitted
+    /// mixture, length `n`. This is the held-out-density column source for
+    /// cross-class stacking when the mixture is evaluated on a held-out fold.
+    pub fn per_point_log_density(&self, data: ArrayView2<'_, f64>) -> Result<Array1<f64>, String> {
+        if data.ncols() != self.d {
+            return Err(format!(
+                "mixture log-density expects {} columns, got {}",
+                self.d,
+                data.ncols()
+            ));
+        }
+        let n = data.nrows();
+        let mut comp = vec![GaussianComponentEval::new(self.d); self.k];
+        for j in 0..self.k {
+            comp[j] = GaussianComponentEval::factor(
+                self.means.row(j),
+                &self.covariances[j],
+            )?;
+        }
+        let mut out = Array1::<f64>::zeros(n);
+        let log_w: Vec<f64> = self.weights.iter().map(|w| w.max(f64::MIN_POSITIVE).ln()).collect();
+        for i in 0..n {
+            let row = data.row(i);
+            let mut log_terms = vec![f64::NEG_INFINITY; self.k];
+            let mut max_term = f64::NEG_INFINITY;
+            for j in 0..self.k {
+                let lt = log_w[j] + comp[j].log_density(row);
+                log_terms[j] = lt;
+                if lt > max_term {
+                    max_term = lt;
+                }
+            }
+            out[i] = log_sum_exp(&log_terms, max_term);
+        }
+        Ok(out)
+    }
+
+    /// Rank-aware Laplace **negative** log evidence on the SAME scale as the
+    /// smooth topology rungs. `−V = loglik − ½ log|H| + ½ P log(2π)`, realised
+    /// by calling [`laplace_evidence`] with `residual_objective = −loglik`,
+    /// `penalty_log_det = 0`, `penalty_rank = 0`, `effective_dim = P`, and
+    /// `log|H|` the observed empirical-Fisher information at the optimum.
+    pub fn laplace_negative_log_evidence(
+        &self,
+        data: ArrayView2<'_, f64>,
+    ) -> Result<f64, String> {
+        let p = self.num_free_parameters();
+        let information = self.empirical_fisher_information(data)?;
+        if information.nrows() != p {
+            return Err(format!(
+                "mixture empirical-Fisher information has dim {} but expected free-parameter count {p}",
+                information.nrows()
+            ));
+        }
+        let apply_info = |x: &[f64]| -> Vec<f64> {
+            let mut out = vec![0.0_f64; p];
+            for r in 0..p {
+                let mut acc = 0.0_f64;
+                for c in 0..p {
+                    acc += information[[r, c]] * x[c];
+                }
+                out[r] = acc;
+            }
+            out
+        };
+        let hvp = EvidenceHvpLogDet {
+            dim: p,
+            apply: &apply_info,
+        };
+        let v = laplace_evidence(
+            EvidenceLogDetSource::Hvp(hvp),
+            0.0,
+            -self.loglik,
+            p as f64,
+            0.0,
+        );
+        if !v.is_finite() {
+            return Err("mixture Laplace evidence is not finite".to_string());
+        }
+        Ok(v)
+    }
+
+    /// Observed empirical-Fisher (BHHH) information `H = Σ_i s_i s_iᵀ`, where
+    /// `s_i = ∇_θ log p(y_i)` is the per-observation score in the
+    /// free-parameter coordinates: softmax-logit mixing weights (`k − 1`),
+    /// component means (`k·d`), and the lower-triangular covariance entries
+    /// (`k · d(d+1)/2`) of each component, in that block order. This SPD matrix
+    /// is the genuine observed-information surrogate evaluated at the EM
+    /// optimum — its dimension is exactly `P`, which is what enters the
+    /// rank-aware normalizer.
+    fn empirical_fisher_information(
+        &self,
+        data: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        if data.ncols() != self.d {
+            return Err(format!(
+                "mixture information expects {} columns, got {}",
+                self.d,
+                data.ncols()
+            ));
+        }
+        let n = data.nrows();
+        let p = self.num_free_parameters();
+        let cov_per = self.d * (self.d + 1) / 2;
+        // Precompute per-component evaluators (mean, precision = Σ⁻¹).
+        let mut comp = Vec::with_capacity(self.k);
+        for j in 0..self.k {
+            comp.push(GaussianComponentEval::factor(
+                self.means.row(j),
+                &self.covariances[j],
+            )?);
+        }
+        let log_w: Vec<f64> = self
+            .weights
+            .iter()
+            .map(|w| w.max(f64::MIN_POSITIVE).ln())
+            .collect();
+
+        let mean_base = self.k - 1;
+        let cov_base = mean_base + self.k * self.d;
+
+        let mut info = Array2::<f64>::zeros((p, p));
+        let mut score = vec![0.0_f64; p];
+        for i in 0..n {
+            let row = data.row(i);
+            // Responsibilities r_j = w_j N_j / Σ.
+            let mut log_terms = vec![0.0_f64; self.k];
+            let mut max_term = f64::NEG_INFINITY;
+            for j in 0..self.k {
+                let lt = log_w[j] + comp[j].log_density(row);
+                log_terms[j] = lt;
+                if lt > max_term {
+                    max_term = lt;
+                }
+            }
+            let log_mix = log_sum_exp(&log_terms, max_term);
+            let resp: Vec<f64> = log_terms.iter().map(|lt| (lt - log_mix).exp()).collect();
+
+            for s in score.iter_mut() {
+                *s = 0.0;
+            }
+            // Softmax-logit mixing score: ∂/∂α_j log p = r_j − w_j for the free
+            // logits j = 1..k-1 (component 0 is the reference / pinned logit).
+            for j in 1..self.k {
+                score[j - 1] = resp[j] - self.weights[j];
+            }
+            // Mean score: ∂/∂μ_j log p = r_j · Σ_j⁻¹ (y − μ_j).
+            // Covariance score (lower-tri entries): ∂/∂Σ_j contracted through
+            // the symmetric chain rule, r_j · ½ (Σ⁻¹ v vᵀ Σ⁻¹ − Σ⁻¹) with
+            // off-diagonal entries doubled for the symmetric parameterization.
+            for j in 0..self.k {
+                let prec_v = comp[j].precision_times_residual(row); // Σ⁻¹ (y − μ_j)
+                let mbo = mean_base + j * self.d;
+                for c in 0..self.d {
+                    score[mbo + c] = resp[j] * prec_v[c];
+                }
+                let cbo = cov_base + j * cov_per;
+                let mut idx = 0usize;
+                for a in 0..self.d {
+                    for b in 0..=a {
+                        let outer = prec_v[a] * prec_v[b];
+                        let prec_ab = comp[j].precision[[a, b]];
+                        let mut g = 0.5 * (outer - prec_ab);
+                        if a != b {
+                            // Off-diagonal entry appears twice in the symmetric
+                            // matrix, so its free-parameter derivative doubles.
+                            g *= 2.0;
+                        }
+                        score[cbo + idx] = resp[j] * g;
+                        idx += 1;
+                    }
+                }
+            }
+            // Accumulate outer product s_i s_iᵀ.
+            for r in 0..p {
+                let sr = score[r];
+                if sr == 0.0 {
+                    continue;
+                }
+                for c in 0..p {
+                    info[[r, c]] += sr * score[c];
+                }
+            }
+        }
+        // Symmetrize and add a unit-precision ridge `I`. This is the Hessian
+        // contribution of a standard-normal prior on the (natural) parameters,
+        // making the object a proper MAP observed-information `H = I_prior +
+        // Σ_i s_i s_iᵀ`. It guarantees SPD (well-defined `log|H|`) for any `n`
+        // and is a fixed prior, not a tuned knob — the same unit-information
+        // prior the rank-aware normalizer assumes when it credits each free
+        // parameter one `log(2π)` of integration volume.
+        for r in 0..p {
+            for c in (r + 1)..p {
+                let avg = 0.5 * (info[[r, c]] + info[[c, r]]);
+                info[[r, c]] = avg;
+                info[[c, r]] = avg;
+            }
+            info[[r, r]] += 1.0;
+        }
+        Ok(info)
+    }
+}
+
+/// Cached per-component Gaussian evaluator: mean, precision `Σ⁻¹`, and the
+/// log-normalizing constant `−½(d log 2π + log|Σ|)`.
+#[derive(Debug, Clone)]
+struct GaussianComponentEval {
+    mean: Array1<f64>,
+    precision: Array2<f64>,
+    log_norm: f64,
+    d: usize,
+}
+
+impl GaussianComponentEval {
+    fn new(d: usize) -> Self {
+        Self {
+            mean: Array1::zeros(d),
+            precision: Array2::eye(d),
+            log_norm: 0.0,
+            d,
+        }
+    }
+
+    fn factor(mean: ArrayView1<'_, f64>, cov: &Array2<f64>) -> Result<Self, String> {
+        let d = mean.len();
+        if cov.nrows() != d || cov.ncols() != d {
+            return Err(format!(
+                "mixture component covariance must be {d}x{d}, got {}x{}",
+                cov.nrows(),
+                cov.ncols()
+            ));
+        }
+        let (evals, evecs) = cov
+            .eigh(Side::Lower)
+            .map_err(|e| format!("mixture component covariance eigendecomposition failed: {e}"))?;
+        let mut log_det = 0.0_f64;
+        let mut inv_evals = Array1::<f64>::zeros(d);
+        for (idx, &ev) in evals.iter().enumerate() {
+            if !ev.is_finite() || ev <= 0.0 {
+                return Err(format!(
+                    "mixture component covariance is not SPD: eigenvalue {idx} is {ev:.3e}"
+                ));
+            }
+            log_det += ev.ln();
+            inv_evals[idx] = 1.0 / ev;
+        }
+        // Σ⁻¹ = V diag(1/λ) Vᵀ.
+        let mut precision = Array2::<f64>::zeros((d, d));
+        for a in 0..d {
+            for b in 0..d {
+                let mut acc = 0.0_f64;
+                for m in 0..d {
+                    acc += evecs[[a, m]] * inv_evals[m] * evecs[[b, m]];
+                }
+                precision[[a, b]] = acc;
+            }
+        }
+        let log_norm = -0.5 * (d as f64 * (2.0 * std::f64::consts::PI).ln() + log_det);
+        Ok(Self {
+            mean: mean.to_owned(),
+            precision,
+            log_norm,
+            d,
+        })
+    }
+
+    #[inline]
+    fn log_density(&self, y: ArrayView1<'_, f64>) -> f64 {
+        let pv = self.precision_times_residual(y);
+        let mut quad = 0.0_f64;
+        for c in 0..self.d {
+            quad += (y[c] - self.mean[c]) * pv[c];
+        }
+        self.log_norm - 0.5 * quad
+    }
+
+    /// `Σ⁻¹ (y − μ)`.
+    #[inline]
+    fn precision_times_residual(&self, y: ArrayView1<'_, f64>) -> Vec<f64> {
+        let mut out = vec![0.0_f64; self.d];
+        for a in 0..self.d {
+            let mut acc = 0.0_f64;
+            for b in 0..self.d {
+                acc += self.precision[[a, b]] * (y[b] - self.mean[b]);
+            }
+            out[a] = acc;
+        }
+        out
+    }
+}
+
+#[inline]
+fn log_sum_exp(terms: &[f64], max_term: f64) -> f64 {
+    if !max_term.is_finite() {
+        return f64::NEG_INFINITY;
+    }
+    let mut acc = 0.0_f64;
+    for &t in terms {
+        acc += (t - max_term).exp();
+    }
+    max_term + acc.ln()
+}
+
+/// Fit a `k`-component full-covariance Gaussian mixture by deterministic
+/// k-means++-style seeding (reusing the `terms::basis` farthest-point k-means,
+/// a pure function of the data — no clock randomness) followed by EM to the
+/// configured tolerance.
+///
+/// The fit is deterministic given `(data, k, config)`: the seed is the
+/// farthest-point/k-means center selection, EM is a deterministic map, so
+/// re-running yields the identical mixture.
+pub fn fit_gaussian_mixture(
+    data: ArrayView2<'_, f64>,
+    k: usize,
+    config: GaussianMixtureConfig,
+) -> Result<GaussianMixtureFit, String> {
+    let n = data.nrows();
+    let d = data.ncols();
+    if k == 0 {
+        return Err("gaussian mixture requires k >= 1".to_string());
+    }
+    if d == 0 {
+        return Err("gaussian mixture requires at least one column".to_string());
+    }
+    if k > n {
+        return Err(format!(
+            "gaussian mixture requested {k} components but data has {n} rows"
+        ));
+    }
+    // Deterministic k-means++-style seeding via the shared basis k-means
+    // (farthest-point init + Lloyd iterations). Fixed by construction.
+    let centers = crate::basis::select_centers_by_strategy(
+        data,
+        &crate::basis::CenterStrategy::KMeans {
+            num_centers: k,
+            max_iter: config.kmeans_max_iter,
+        },
+    )
+    .map_err(|e| format!("gaussian mixture k-means seeding failed: {e}"))?;
+    if centers.nrows() != k || centers.ncols() != d {
+        return Err(format!(
+            "gaussian mixture seeding returned {}x{} centers, expected {k}x{d}",
+            centers.nrows(),
+            centers.ncols()
+        ));
+    }
+
+    let mut means = centers;
+    // Seed covariances from the global data covariance (shared start).
+    let global_cov = data_covariance(data, config.covariance_floor);
+    let mut covariances = vec![global_cov; k];
+    let mut weights = Array1::<f64>::from_elem(k, 1.0 / k as f64);
+
+    let mut resp = Array2::<f64>::zeros((n, k));
+    let mut prev_mean_ll = f64::NEG_INFINITY;
+    let mut total_loglik = f64::NEG_INFINITY;
+    let mut iterations = 0usize;
+
+    for iter in 0..config.max_iter.max(1) {
+        iterations = iter + 1;
+        // E-step: responsibilities and total log-likelihood.
+        let mut comp = Vec::with_capacity(k);
+        for j in 0..k {
+            comp.push(GaussianComponentEval::factor(means.row(j), &covariances[j])?);
+        }
+        let log_w: Vec<f64> = weights
+            .iter()
+            .map(|w| w.max(f64::MIN_POSITIVE).ln())
+            .collect();
+        total_loglik = 0.0;
+        for i in 0..n {
+            let yrow = data.row(i);
+            let mut log_terms = vec![0.0_f64; k];
+            let mut max_term = f64::NEG_INFINITY;
+            for j in 0..k {
+                let lt = log_w[j] + comp[j].log_density(yrow);
+                log_terms[j] = lt;
+                if lt > max_term {
+                    max_term = lt;
+                }
+            }
+            let log_mix = log_sum_exp(&log_terms, max_term);
+            total_loglik += log_mix;
+            for j in 0..k {
+                resp[[i, j]] = (log_terms[j] - log_mix).exp();
+            }
+        }
+        let mean_ll = total_loglik / n as f64;
+        if iter > 0 {
+            let denom = prev_mean_ll.abs().max(1.0);
+            if (mean_ll - prev_mean_ll).abs() / denom <= config.loglik_tol {
+                prev_mean_ll = mean_ll;
+                break;
+            }
+        }
+        prev_mean_ll = mean_ll;
+
+        // M-step.
+        let mut nk = vec![0.0_f64; k];
+        for j in 0..k {
+            let mut sum = 0.0_f64;
+            for i in 0..n {
+                sum += resp[[i, j]];
+            }
+            nk[j] = sum.max(f64::MIN_POSITIVE);
+        }
+        for j in 0..k {
+            weights[j] = nk[j] / n as f64;
+            // Means.
+            let mut mu = Array1::<f64>::zeros(d);
+            for i in 0..n {
+                let r = resp[[i, j]];
+                if r == 0.0 {
+                    continue;
+                }
+                for c in 0..d {
+                    mu[c] += r * data[[i, c]];
+                }
+            }
+            mu.mapv_inplace(|v| v / nk[j]);
+            for c in 0..d {
+                means[[j, c]] = mu[c];
+            }
+            // Covariance with a fixed diagonal floor for SPD safety.
+            let mut cov = Array2::<f64>::zeros((d, d));
+            for i in 0..n {
+                let r = resp[[i, j]];
+                if r == 0.0 {
+                    continue;
+                }
+                for a in 0..d {
+                    let da = data[[i, a]] - mu[a];
+                    for b in 0..d {
+                        cov[[a, b]] += r * da * (data[[i, b]] - mu[b]);
+                    }
+                }
+            }
+            cov.mapv_inplace(|v| v / nk[j]);
+            for a in 0..d {
+                cov[[a, a]] += config.covariance_floor;
+            }
+            covariances[j] = cov;
+        }
+    }
+
+    Ok(GaussianMixtureFit {
+        weights,
+        means,
+        covariances,
+        k,
+        d,
+        n_obs: n,
+        loglik: total_loglik,
+        iterations,
+    })
+}
+
+/// Global data covariance with a fixed diagonal floor (used to seed EM).
+fn data_covariance(data: ArrayView2<'_, f64>, floor: f64) -> Array2<f64> {
+    let n = data.nrows();
+    let d = data.ncols();
+    let mut mean = Array1::<f64>::zeros(d);
+    for i in 0..n {
+        for c in 0..d {
+            mean[c] += data[[i, c]];
+        }
+    }
+    mean.mapv_inplace(|v| v / n.max(1) as f64);
+    let mut cov = Array2::<f64>::zeros((d, d));
+    for i in 0..n {
+        for a in 0..d {
+            let da = data[[i, a]] - mean[a];
+            for b in 0..d {
+                cov[[a, b]] += da * (data[[i, b]] - mean[b]);
+            }
+        }
+    }
+    let inv = 1.0 / (n.max(1) as f64);
+    cov.mapv_inplace(|v| v * inv);
+    for a in 0..d {
+        cov[[a, a]] += floor;
+    }
+    cov
+}
+
 /// One fitted model in a REML/LAML evidence comparison.
 #[derive(Clone, Debug)]
 pub struct RemlCandidate {
