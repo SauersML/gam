@@ -1135,6 +1135,8 @@ pub fn canonicalize_penalty_spec(
 ) -> Result<Option<CanonicalPenalty>, EstimationError> {
     use crate::estimate::PenaltySpec;
 
+    crate::estimate::validate_penalty_spec_shape(idx, spec, p, context)?;
+
     let (local_matrix, col_range, prior_mean_spec, hint, op) = match spec {
         PenaltySpec::Block {
             local,
@@ -1142,54 +1144,21 @@ pub fn canonicalize_penalty_spec(
             prior_mean,
             structure_hint,
             op,
-        } => {
-            let bd = col_range.len();
-            if local.nrows() != bd || local.ncols() != bd {
-                crate::bail_invalid_estim!(
-                    "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
-                    local.nrows(),
-                    local.ncols()
-                );
-            }
-            if col_range.end > p {
-                crate::bail_invalid_estim!(
-                    "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
-                    col_range.start,
-                    col_range.end
-                );
-            }
-            (
-                local.view(),
-                col_range.clone(),
-                prior_mean,
-                structure_hint.as_ref(),
-                op.clone(),
-            )
-        }
-        PenaltySpec::Dense(m) => {
-            if m.nrows() != p || m.ncols() != p {
-                crate::bail_invalid_estim!(
-                    "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
-                    m.nrows(),
-                    m.ncols()
-                );
-            }
-            (
-                m.view(),
-                0..p,
-                &crate::estimate::CoefficientPriorMean::Zero,
-                None,
-                None,
-            )
-        }
+        } => (
+            local.view(),
+            col_range.clone(),
+            prior_mean,
+            structure_hint.as_ref(),
+            op.clone(),
+        ),
+        PenaltySpec::Dense(m) => (
+            m.view(),
+            0..p,
+            &crate::estimate::CoefficientPriorMean::Zero,
+            None,
+            None,
+        ),
         PenaltySpec::DenseWithMean { matrix, prior_mean } => {
-            if matrix.nrows() != p || matrix.ncols() != p {
-                crate::bail_invalid_estim!(
-                    "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
-                    matrix.nrows(),
-                    matrix.ncols()
-                );
-            }
             (matrix.view(), 0..p, prior_mean, None, None)
         }
     };
