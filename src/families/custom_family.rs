@@ -12779,17 +12779,23 @@ const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
 
 /// Self-vanishing Levenberg–Marquardt damping factor for the range-restricted
 /// spectral Newton step (`solve_joint_newton_step_on_spectral_range`). The
-/// per-cycle damping is `μ = JOINT_SPECTRAL_LEVENBERG_FACTOR · ‖∇L − Sβ‖∞`:
-/// proportional to the current stationarity residual so it is large enough to
-/// cap the unbounded `component/λ` step along near-singular (ill-conditioned but
-/// above-`KKT_REFUSAL_RANK_TOL`) eigen-directions of a degenerate small-n
-/// Hessian — the modes that make the undamped step oscillate and prevent the
-/// inner solve from settling — yet `→ 0` as the iterate converges, recovering
-/// the exact Moore–Penrose Newton step so the KKT fixed point and the
-/// well-identified fast path are unchanged. `1e-3` keeps the damping two to
-/// three orders below the dominant curvature on a well-conditioned problem (so
-/// it never perturbs a healthy quadratic Newton step) while still dominating the
-/// near-zero curvatures that drive the degenerate-design oscillation.
+/// caller forms the residual-scaled magnitude
+/// `μ = JOINT_SPECTRAL_LEVENBERG_FACTOR · ‖∇L − Sβ‖∞`, which the solve converts
+/// to a DIMENSIONLESS, scale-invariant Marquardt damping `ν = μ / λ_max` applied
+/// MULTIPLICATIVELY to each range curvature (`curvature·(1 + ν)`), not added
+/// (`curvature + μ`). The multiplicative form is essential on a coupled
+/// location-scale joint Hessian whose spectrum spans the penalty scale
+/// (`λ ~ e²⁴` at the oversmoothed seed) and the likelihood scale (the
+/// mean/wiggle XᵀWX curvature): an ADDITIVE μ — set by the penalty-inflated
+/// residual — swamps the small likelihood curvature and freezes that block
+/// (#826), whereas the multiplicative `1/(1+ν)` throttle is identical across all
+/// scales so no block stalls. Both forms cap the unbounded `component/λ` step
+/// along near-singular (ill-conditioned but above-`KKT_REFUSAL_RANK_TOL`)
+/// eigen-directions — the modes that make the undamped step oscillate — and both
+/// vanish as the iterate converges (`ν → 0`), recovering the exact Moore–Penrose
+/// Newton step so the KKT fixed point and the well-identified fast path are
+/// unchanged. `1e-3` keeps the damping two to three orders below the dominant
+/// curvature on a well-conditioned problem.
 const JOINT_SPECTRAL_LEVENBERG_FACTOR: f64 = 1.0e-3;
 
 /// Condition number above which the range-restricted spectral Newton step is
@@ -12901,7 +12907,7 @@ fn solve_joint_newton_step_on_spectral_range(
     // Fix: only directions below the TRUE numerical floor are dropped as null.
     // Directions in the band `(numerical_floor, cutoff]` carry small-but-real
     // curvature; they are solved (range branch below) with the self-vanishing LM
-    // damping `effective_mu` that already caps the `component/λ` step on the
+    // damping `relative_mu` that already caps the `component/λ` step on the
     // near-singular modes the relative `cutoff` was meant to tame. Because μ ∝
     // ‖∇L − Sβ‖∞ → 0 at the KKT fixed point, the converged β and the
     // well-identified fast path are unchanged; far from the optimum the band is
@@ -12991,7 +12997,9 @@ fn solve_joint_newton_step_on_spectral_range(
     // separates penalty scale from likelihood scale: a likelihood-identified
     // mean-trend direction sits far above `numerical_floor` even when the penalty
     // eigenvalues are astronomically large, so it is correctly classified as
-    // identified, `effective_mu` stays 0 along it, and the EXACT undamped Newton
+    // identified and — under the scale-invariant multiplicative damping below —
+    // takes the same `1/(1+ν)` fraction of its Newton component as every other
+    // mode (ν → 0 at the fixed point), so the near-exact Newton
     // step `component/λ` drives the trend to its oversmoothed optimum in O(1)
     // cycles. Genuine numerical rank deficiency (curvature below the working-
     // precision floor) still engages μ. The ill-conditioned-Newton branch below
@@ -13047,8 +13055,42 @@ fn solve_joint_newton_step_on_spectral_range(
     } else {
         false
     };
-    let effective_mu = if spectral_nullity > 0 || ill_conditioned_for_newton {
+    // CRITICAL (#826, scale-invariant damping). The caller passes
+    // `levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR · ‖∇L − Sβ‖∞`, an
+    // ABSOLUTE damping in the units of the residual. Adding it directly to a
+    // range curvature (`curvature + μ`) is correct on a single-scale Hessian,
+    // but it is the residual stall on a coupled location-scale joint Hessian:
+    // there the spectrum spans the penalty scale (`λ ~ exp(2·ρ_bound) ≈ e²⁴`
+    // at the oversmoothed continuation seed) AND the likelihood scale (the
+    // mean/threshold/wiggle block's XᵀWX curvature, per-direction O(n·w)). The
+    // residual ‖∇L − Sβ‖∞ that sets μ is dominated by the huge `Sβ` term, so μ
+    // is astronomically larger than the small likelihood curvature of the
+    // mean/wiggle directions. The additive throttle on those directions is then
+    // `λ/(λ+μ) ≈ λ/μ → 0`: β in that block barely moves while its stationarity
+    // residual stays frozen — EXACTLY the "block β ≈ 0, residual large" stall
+    // the issue reports, which never escapes the oversmooth seed and forces the
+    // continuation to expand outward until it gives up.
+    //
+    // Fix: damp MULTIPLICATIVELY (Marquardt's diagonal scaling), not additively.
+    // In the eigenbasis `diag(H)` per-direction IS the curvature, so Marquardt
+    // damping `H + ν·diag(H)` is `curvature·(1 + ν)`, giving the SCALE-INVARIANT
+    // per-direction throttle `λ/(λ·(1+ν)) = 1/(1+ν)` — identical for the huge
+    // penalty modes and the small likelihood modes. No block is frozen relative
+    // to another: a near-singular mode is bounded relative to its OWN curvature
+    // scale (stopping the `component/λ` oscillation the absolute μ existed to
+    // tame), while the small mean/wiggle modes still take a full `1/(1+ν)`
+    // fraction of their exact Newton component and descend normally. `ν` is the
+    // dimensionless residual-to-spectrum ratio `μ/λ_max`, self-vanishing as the
+    // residual → 0, so at the KKT fixed point ν → 0 and the step collapses to
+    // the EXACT range-restricted (Moore–Penrose) Newton step — the converged β,
+    // the KKT certificate, and the well-identified fast path are all unchanged.
+    let raw_mu = if spectral_nullity > 0 || ill_conditioned_for_newton {
         levenberg_mu.max(0.0)
+    } else {
+        0.0
+    };
+    let relative_mu = if raw_mu > 0.0 && lambda_max_abs > 0.0 {
+        raw_mu / lambda_max_abs
     } else {
         0.0
     };
@@ -13074,13 +13116,14 @@ fn solve_joint_newton_step_on_spectral_range(
         };
         range_rhs_inf = range_rhs_inf.max(component.abs());
         lambda_min_positive = lambda_min_positive.min(curvature);
-        // Self-vanishing Levenberg–Marquardt damping on the range-space
+        // Scale-invariant (Marquardt) self-vanishing damping on the range-space
         // curvature, applied only when the Hessian is genuinely rank-deficient
-        // (`effective_mu` is `0.0` on a full-rank identified model — see the
-        // `spectral_nullity` gate above). `μ ≥ 0` and `curvature > cutoff > 0`,
-        // so the denominator stays strictly positive and the descent property
-        // (∇L − Sβ)·δ = Σ_k (u_kᵀ rhs)²/(|λ_k| + μ) > 0 is preserved.
-        let damped_curvature = curvature + effective_mu;
+        // OR full-rank-but-ill-conditioned-for-Newton (`relative_mu` is `0.0` on
+        // a well-conditioned identified model — see the gate above). `ν ≥ 0` and
+        // `curvature > null_cutoff > 0`, so the denominator stays strictly
+        // positive and the descent property
+        // (∇L − Sβ)·δ = Σ_k (u_kᵀ rhs)²/(|λ_k|·(1+ν)) > 0 is preserved.
+        let damped_curvature = curvature * (1.0 + relative_mu);
         let scale = component / damped_curvature;
         for i in 0..p {
             delta[i] += scale * u_k[i];
@@ -33283,6 +33326,65 @@ mod tests {
         // caller can distinguish "stationary on the identified subspace" from a
         // genuine non-stationarity in the curved subspace.
         assert_relative_eq!(step.null_rhs_inf, 0.25, epsilon = 1.0e-12);
+        assert!(step.delta.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn spectral_joint_newton_levenberg_is_scale_invariant_across_blocks() {
+        // #826 cross-scale stall: the coupled location-scale joint Hessian at the
+        // oversmoothed continuation seed spans the penalty scale (a huge `Sλ`
+        // eigenvalue) and the likelihood scale (a small mean/wiggle XᵀWX
+        // curvature). When the ill-conditioned-Newton damping engages, the
+        // damping magnitude `μ = factor·‖∇L − Sβ‖∞` is set by the penalty-
+        // inflated residual. An ADDITIVE damping (`curvature + μ`) would then
+        // swamp the small likelihood curvature — `λ_small/(λ_small + μ) → 0` —
+        // freezing that block's step at ≈ 0 while the residual stays large (the
+        // reported stall). The scale-invariant MULTIPLICATIVE (Marquardt) form
+        // `curvature·(1 + μ/λ_max)` throttles every direction by the same factor
+        // `1/(1+ν)`, so the small block still takes a healthy fraction of its
+        // exact Newton component.
+        let lambda_penalty = 1.0e12; // oversmoothed `Sλ` eigenvalue.
+        let lambda_likelihood = 5.0; // small mean/wiggle curvature.
+        let h = array![[lambda_penalty, 0.0], [0.0, lambda_likelihood]];
+        // Residual dominated by the penalty mode (β off its penalized optimum).
+        let rhs = array![1.0e11, 10.0];
+        let rhs_inf = rhs.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
+        // Engage the ill-conditioned-for-Newton damping (cond = 2e11 ≫
+        // COND_NEWTON_SAFETY): this is the regime where the additive form froze.
+        let step = solve_joint_newton_step_on_spectral_range(
+            &h,
+            &rhs,
+            KKT_REFUSAL_RANK_TOL,
+            1.0e-12,
+            levenberg_mu,
+            true,
+        )
+        .expect("ill-conditioned cross-scale solve must produce a finite step");
+
+        // Both blocks are identified (above the numerical floor), so the damping
+        // is purely multiplicative: ν = μ/λ_max with μ = 1e-3·1e11 = 1e8 and
+        // λ_max = 1e12, so ν = 1e-4. Each direction's step is
+        // `component/(λ·(1+ν))`.
+        let nu = levenberg_mu / lambda_penalty;
+        let expected_penalty = rhs[0] / (lambda_penalty * (1.0 + nu));
+        let expected_likelihood = rhs[1] / (lambda_likelihood * (1.0 + nu));
+        assert_relative_eq!(step.delta[0], expected_penalty, epsilon = 1.0e-9);
+        assert_relative_eq!(step.delta[1], expected_likelihood, epsilon = 1.0e-9);
+
+        // The load-bearing assertion: the small-curvature block is NOT frozen.
+        // Its exact (undamped) Newton component is 10/5 = 2; the multiplicative
+        // throttle 1/(1+1e-4) leaves it ≈ 2, far from the 0 the additive form
+        // produced (10/(5 + 1e8) ≈ 1e-7). Require it stays within 1% of the
+        // exact Newton step.
+        let exact_likelihood_step = rhs[1] / lambda_likelihood;
+        assert!(
+            (step.delta[1] - exact_likelihood_step).abs() / exact_likelihood_step < 1.0e-2,
+            "small-curvature block must take ~full Newton step, got {} vs exact {}",
+            step.delta[1],
+            exact_likelihood_step,
+        );
+        assert_eq!(step.nullity, 0);
         assert!(step.delta.iter().all(|v| v.is_finite()));
     }
 
