@@ -2898,7 +2898,7 @@ impl SpatialLogKappaCoords {
     }
 }
 
-fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
+pub(crate) fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
     if eta.len() <= 1 {
         return eta.to_vec();
     }
