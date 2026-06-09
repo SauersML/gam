@@ -1824,10 +1824,14 @@ impl SurvivalLocationScaleFamily {
         delta: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
         let Some(constraints) = self.time_linear_constraints.as_ref() else {
-            return Err(SurvivalLocationScaleError::InvalidConfiguration {
-                reason: "survival location-scale time block missing linear constraints".to_string(),
-            }
-            .into());
+            // No time constraints. With the rank-1 unit-log-t warp pin (#892) the
+            // time block has ZERO free coefficients and its monotone warp is a
+            // fixed positive offset (X' z_norm = 1/t > 0), so there is no
+            // derivative-guard half-space to cap against — the step is uncapped.
+            // (Every constrained time block, reduced or flexible, carries ≥1
+            // column and a guard, so this `None` arises only for the pinned
+            // empty block.)
+            return Ok(None);
         };
         crate::families::marginal_slope_shared::feasible_step_fraction(
             constraints,
@@ -5512,6 +5516,67 @@ fn block_penalties_all_parametric_ridges(nullspace_dims: &[usize], npenalties: u
     nullspace_dims.len() == npenalties && nullspace_dims.iter().all(|&d| d == 0)
 }
 
+/// Data-scale slope of `design_exit · direction` regressed on `log_time_exit`
+/// (centered). `Some(s)` where `s = Σ(logt_c · y) / Σ(logt_c²)`; `None` when
+/// `log t` has no spread (all exit times equal) or the time direction is flat
+/// (zero slope), so the unit-log-t normalization would be undefined. Dividing the
+/// raw direction by `s` yields a design image with unit slope vs log t — the
+/// canonical survreg/lifelines AFT gauge.
+fn unit_log_time_slope(
+    design_exit: &Array2<f64>,
+    direction: &Array1<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
+) -> Option<f64> {
+    let n = design_exit.nrows();
+    if n == 0 || log_time_exit.len() != n {
+        return None;
+    }
+    let y = design_exit.dot(direction);
+    let log_mean = log_time_exit.sum() / n as f64;
+    let mut sxx = 0.0_f64;
+    let mut sxy = 0.0_f64;
+    for i in 0..n {
+        let xc = log_time_exit[i] - log_mean;
+        sxx += xc * xc;
+        sxy += xc * y[i];
+    }
+    let y_scale = y.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
+    if !sxx.is_finite() || sxx <= f64::EPSILON {
+        return None;
+    }
+    let slope = sxy / sxx;
+    if !slope.is_finite() || slope.abs() <= f64::EPSILON * y_scale {
+        return None;
+    }
+    Some(slope)
+}
+
+/// Pin the rank-1 reduced parametric-AFT time warp to the canonical unit-log-t
+/// gauge (issue #892). The real survival time penalty is a 1st-difference
+/// penalty, so its null space is DIMENSION 1: a single monotone log-t trend
+/// column `z` (p×1), with NO separate constant direction. The free warp scale
+/// `θ` in `h(t) = θ · m(t)` is exactly degenerate with σ (a 1-parameter ridge),
+/// so the unconstrained direct-MLE Newton picks an arbitrary scale — miscalibrating
+/// absolute S(t|x) AND stalling low-leverage location coefficients along the
+/// alias. Fix: normalize `z` to unit data-scale slope vs log t and fold it
+/// ENTIRELY into the geometry offsets, leaving ZERO free time columns (the warp
+/// becomes a fixed unit-log-t offset, exactly the survreg/lifelines gauge). The
+/// pinned raw coefficient `z_norm` is lifted back at finalize via `affine_shift`.
+/// Returns the normalized direction `z_norm` (p-vector), or `None` when the
+/// single column has no usable log-t slope (keep the prior reduce behavior).
+fn pin_reduced_time_warp_rank1(
+    z: &Array2<f64>,
+    design_exit: &Array2<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
+) -> Option<Array1<f64>> {
+    if z.ncols() != 1 {
+        return None;
+    }
+    let z_dir = z.column(0).to_owned();
+    let slope = unit_log_time_slope(design_exit, &z_dir, log_time_exit)?;
+    Some(&z_dir / slope)
+}
+
 /// Result of pinning the reduced parametric-AFT time-warp slope to the canonical
 /// unit-log-t gauge (issue #892). `z_c` (p×1) is the kept-free row-constant
 /// direction; `z_t` (p-vector) is the pinned unit-log-t direction folded into
@@ -5579,31 +5644,10 @@ fn pin_reduced_time_warp_slope(
     // non-constant (log-t trend) warp.
     let a_perp = Array1::from(vec![-a1, a0]);
     let z_t_raw = z.dot(&a_perp);
-    // Normalize `z_t` to unit data-scale slope vs log t: regress
-    // `design_exit · z_t_raw` on centered `log_time_exit`; the slope is
-    // s = Σ(x_c · y) / Σ(x_c²), and `z_t = z_t_raw / s` makes `design_exit · z_t`
-    // rise by exactly 1 per unit of log t (so the derivative design reproduces
-    // u'(t) = 1/t, matching the unit-log-t AFT gauge).
-    let y = design_exit.dot(&z_t_raw);
-    let log_mean = log_time_exit.sum() / n as f64;
-    let mut sxx = 0.0_f64;
-    let mut sxy = 0.0_f64;
-    for i in 0..n {
-        let xc = log_time_exit[i] - log_mean;
-        sxx += xc * xc;
-        sxy += xc * y[i];
-    }
-    // Degenerate guard: no spread in log t (all exit times equal) or a flat
-    // (zero-slope) time direction leaves the slope undefined — keep the prior
-    // both-columns-free reduce behavior.
-    let y_scale = y.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
-    if !sxx.is_finite() || sxx <= f64::EPSILON {
-        return None;
-    }
-    let slope = sxy / sxx;
-    if !slope.is_finite() || slope.abs() <= f64::EPSILON * y_scale {
-        return None;
-    }
+    // Normalize `z_t` to unit data-scale slope vs log t (the canonical
+    // unit-log-t AFT gauge): `design_exit · z_t` rises by exactly 1 per unit of
+    // log t, so the derivative design reproduces u'(t) = 1/t.
+    let slope = unit_log_time_slope(design_exit, &z_t_raw, log_time_exit)?;
     let z_t = &z_t_raw / slope;
     // p×1 free design columns and the kept-free basis matrix.
     let z_c = z_c_vec.insert_axis(ndarray::Axis(1));
@@ -5676,9 +5720,64 @@ fn prepare_identified_time_block(
         // matching the survreg / lifelines / flexsurv AFT gauge. The solver
         // honors only the derivative-guard step cap, not general linear equality
         // constraints, so the slope MUST be removed structurally rather than
-        // constrained. This fires ONLY for a clean `r == 2` split; any other
-        // rank or a degenerate split keeps the prior both-columns-free reduce
-        // behavior unchanged.
+        // constrained.
+        //
+        // RANK-1 case (the one that actually fires for real fits): the survival
+        // time penalty is a 1st-difference penalty, so its null space is
+        // DIMENSION 1 — a single monotone log-t trend column, NOT the
+        // 2nd-difference `{1, log t}` pair. There is no separate constant
+        // direction to keep free; the free warp scale `θ` is degenerate with σ.
+        // Fold the whole (unit-log-t-normalized) column into the geometry
+        // offsets and leave ZERO free time columns. The threshold KEEPS its
+        // intercept (it is then the sole constant → joint Hessian PD → the
+        // low-leverage interaction recovers), so `pinned_free_row_constant`
+        // stays false.
+        if r == 1
+            && z.nrows() == p
+            && let Some(z_norm) = pin_reduced_time_warp_rank1(&z, &design_exit, log_time_exit)
+        {
+            // Fold the pinned unit-log-t warp entirely into the offsets:
+            // value at entry/exit and derivative at exit. With zero free
+            // columns the geometry h is offset-only; monotonicity holds
+            // structurally because the folded derivative is exactly
+            // `X' z_norm = u'(t) = 1/t > 0` at every observed time.
+            let offset_entry = &input.offset_entry + &design_entry.dot(&z_norm);
+            let offset_exit = &input.offset_exit + &design_exit.dot(&z_norm);
+            let derivative_offset_exit =
+                &input.derivative_offset_exit + &design_derivative_exit.dot(&z_norm);
+            // Zero free time coefficients: empty n×0 designs, empty transform `z`
+            // (p×0), the pinned coefficient carried by `affine_shift = z_norm`.
+            let empty_entry = Array2::<f64>::zeros((design_entry.nrows(), 0));
+            let empty_exit = Array2::<f64>::zeros((design_exit.nrows(), 0));
+            let empty_derivative = Array2::<f64>::zeros((design_derivative_exit.nrows(), 0));
+            return Ok(TimeBlockPrepared {
+                design_entry: empty_entry,
+                design_exit: empty_exit,
+                design_derivative_exit: empty_derivative,
+                coefficient_lower_bounds: None,
+                // No free coefficients → no derivative-guard constraint (the
+                // warp derivative is fixed positive in the offset). The solver's
+                // time-step feasibility treats a constraint-free time block as
+                // uncapped (`max_feasible_time_step`).
+                linear_constraints: None,
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                // Empty free block: cold-start β is the zero-length vector.
+                initial_beta: Some(Array1::<f64>::zeros(0)),
+                transform: TimeIdentifiabilityTransform {
+                    z: Array2::<f64>::zeros((p, 0)),
+                    affine_shift: z_norm,
+                },
+                offset_entry,
+                offset_exit,
+                derivative_offset_exit,
+                // No free time column at all → no row-constant time direction →
+                // the threshold keeps its intercept (the sole location constant).
+                pinned_free_row_constant: false,
+            });
+        }
+        // RANK-2 case (2nd-difference penalty `{1, log t}`): kept for correctness
+        // where it occurs (golden unit test), though real fits use rank-1 above.
         if r == 2
             && z.nrows() == p
             && let Some(pinned) = pin_reduced_time_warp_slope(
@@ -13407,6 +13506,76 @@ mod tests {
         assert!(
             (sxy / sxx - 1.0).abs() <= 1e-9,
             "pinned warp must have unit data-scale slope vs log t, got {}",
+            sxy / sxx
+        );
+    }
+
+    #[test]
+    fn rank1_time_warp_pin_folds_to_offset_only_block() {
+        // The real survival regime (issue #892): a 1st-difference time penalty
+        // gives a DIMENSION-1 null space — a single monotone log-t column. The
+        // pin must fold that whole column into the offsets, leave ZERO free time
+        // columns (empty design + p×0 transform), carry the pinned coefficient on
+        // `affine_shift`, and KEEP the threshold intercept
+        // (`pinned_free_row_constant == false`). A penalty `diag(0,1,1)` has the
+        // 1-D null space {e0}; design column 0 is monotone in log t.
+        let design_entry = array![[0.0, 1.0, 0.2], [0.405_465_108, 1.0, 0.5], [0.916_290_731, 1.0, 1.0]];
+        let design_exit = array![[0.0, 0.5, 0.3], [0.405_465_108, 1.5, 0.8], [0.916_290_731, 2.5, 1.4]];
+        let design_derivative_exit = array![[1.0, 1.0, 0.2], [0.5, 1.0, 0.3], [0.3, 1.0, 0.4]];
+        let time_block = TimeBlockInput {
+            design_entry: DesignMatrix::from(design_entry.clone()),
+            design_exit: DesignMatrix::from(design_exit.clone()),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
+            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            penalties: vec![array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
+            nullspace_dims: vec![],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+        let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6, 0, true, log_time_exit.view())
+                .expect("prepare time block");
+
+        // Zero free time columns: empty designs + p×0 transform.
+        assert_eq!(prepared.transform.z.ncols(), 0);
+        assert_eq!(prepared.transform.z.nrows(), 3);
+        assert_eq!(prepared.design_exit.ncols(), 0);
+        assert_eq!(prepared.design_entry.ncols(), 0);
+        assert_eq!(prepared.design_derivative_exit.ncols(), 0);
+        assert_eq!(prepared.design_exit.nrows(), 3);
+        assert!(prepared.linear_constraints.is_none());
+        assert_eq!(prepared.initial_beta, Some(Array1::<f64>::zeros(0)));
+        // Pinned coefficient carried entirely by affine_shift (the e0 direction).
+        assert_eq!(prepared.transform.affine_shift.len(), 3);
+        assert!(prepared.transform.affine_shift[0].abs() > 1e-9);
+        // No free time constant → threshold keeps its intercept.
+        assert!(!prepared.pinned_free_row_constant);
+
+        // Finalize lift with an empty reduced β: β_time_raw = z·[] + affine_shift
+        // = affine_shift (the pinned unit-log-t warp coefficient).
+        let beta_reduced = Array1::<f64>::zeros(0);
+        let beta_raw = prepared.transform.z.dot(&beta_reduced) + &prepared.transform.affine_shift;
+        for (got, want) in beta_raw.iter().zip(prepared.transform.affine_shift.iter()) {
+            assert!((got - want).abs() <= 1e-12);
+        }
+        // The folded exit offset has unit slope vs log t (the canonical gauge).
+        let delta = &prepared.offset_exit - &time_block.offset_exit;
+        let log_mean = log_time_exit.sum() / 3.0;
+        let dmean = delta.sum() / 3.0;
+        let mut sxx = 0.0_f64;
+        let mut sxy = 0.0_f64;
+        for i in 0..3 {
+            let xc = log_time_exit[i] - log_mean;
+            sxx += xc * xc;
+            sxy += xc * (delta[i] - dmean);
+        }
+        assert!(
+            (sxy / sxx - 1.0).abs() <= 1e-9,
+            "rank-1 pinned warp must have unit slope vs log t, got {}",
             sxy / sxx
         );
     }
