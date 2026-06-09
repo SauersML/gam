@@ -378,6 +378,71 @@ impl ReseedLedger {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+//  Regime-escalation view of re-entry (#969 seed-cascade demotion).
+//
+//  The seed cascade in `outer_strategy.rs` observes the path through a coarser
+//  lens than the per-waypoint `s`: it only needs to know "which heavier regime
+//  did this seed get demoted to". `PathRegime` is that coarse view — a band of
+//  the path parameter `s` — and `PathDemotionReason` records *why* the cascade
+//  asked for the demotion. A demotion is exactly a re-entry into a heavier
+//  regime (it routes onto the same `reenter_heavier` mechanism as a spine
+//  struggle or a mass-floor breach); there is NO rejection / disqualification
+//  arm, mirroring `ContinuationStep`.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// The coarse "which heavy-smoothing regime is the path currently entering at"
+/// view the seed cascade reports against. Banded from the live path parameter
+/// `s ∈ [0, 1]`: heavier regime ⇒ larger `s` ⇒ deeper into the contraction
+/// basin. Every variant is a *re-entry* the cascade re-evaluates a seed at;
+/// none of them is a rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathRegime {
+    /// `s` near the real objective (`s ≤ 1/4`): the path is at or close to ρ*,
+    /// the lightest smoothing the path ever sits at. The nominal entry band
+    /// only on a fully-descended path.
+    Target,
+    /// Mid-path (`1/4 < s ≤ 3/4`): partially annealed, intermediate smoothing.
+    Annealing,
+    /// Heavy-smoothing entry band (`s > 3/4`): the deepest contraction regime,
+    /// where the joint inner solve is provably a contraction. The band a fresh
+    /// `heavy_entry` starts in and the band repeated demotions converge toward.
+    Heavy,
+}
+
+impl PathRegime {
+    /// Band the live path parameter `s` into the coarse regime the seed cascade
+    /// reports. Monotone in `s`: larger `s` ⇒ heavier regime.
+    #[must_use]
+    fn from_s(s: f64) -> Self {
+        let s = s.clamp(0.0, 1.0);
+        if s > 0.75 {
+            PathRegime::Heavy
+        } else if s > 0.25 {
+            PathRegime::Annealing
+        } else {
+            PathRegime::Target
+        }
+    }
+}
+
+/// Why the seed cascade asked the path to demote a seed to a heavier regime.
+/// Purely a diagnostic tag carried into the demotion ledger — every variant
+/// resolves to "re-enter the same seed at a heavier `s`", never to a rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathDemotionReason {
+    /// A uniform structural diagnosis (rank / alias / active-set defect seen
+    /// consistently across seeds) that the legacy contract would have used to
+    /// short-circuit the cascade. For a continuation-entry objective it instead
+    /// demotes to a heavier regime and keeps evaluating.
+    UniformStructural,
+    /// The continuation pre-warm refused to reach a seed at the current regime
+    /// (a structural refusal of the seed's joint design). Demoted to a heavier
+    /// regime so the joint solver gets a feasible basin the current regime could
+    /// not reach.
+    PrewarmStructural,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 //  The per-step outcome enum. Note: NO Reject / Failed / NoUsableSeed arm.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -460,6 +525,12 @@ pub struct ContinuationPath {
     /// the current τ.
     logit_tr: LogitTrustRegion,
     mass_floor: ActiveMassFloor,
+    /// Path-owned re-seed ledger for breaches reported through the bare,
+    /// no-ledger hardening hook ([`ContinuationPath::note_active_mass_breach`]).
+    /// The richer ledger-threading API ([`ContinuationPath::note_mass_breach`])
+    /// is unchanged; this internal ledger backs the inner-loop call site that
+    /// does not thread its own ledger. Append-only, never fatal.
+    reseed_ledger: ReseedLedger,
 }
 
 impl ContinuationPath {
@@ -478,7 +549,85 @@ impl ContinuationPath {
             s_step: 1.0 / CONTINUATION_WAYPOINTS as f64,
             logit_tr,
             mass_floor: ActiveMassFloor::default_floor(),
+            reseed_ledger: ReseedLedger::new(),
         }
+    }
+
+    /// No-argument heavy-smoothing entry for a continuation-entry objective
+    /// (the seed cascade ctor). Builds the default coupled schedules — a
+    /// single-component oversmoothed ρ leg, the standard diffuse→sharp τ leg and
+    /// the loose→tight isometry gauge leg — and enters at `s = 1`, the
+    /// heavy-smoothing contraction regime. The seed cascade only reads the
+    /// coarse [`PathRegime`] and the logit step radius from the path; the
+    /// concrete ρ vector is replaced by the spine's own per-component target at
+    /// each waypoint via [`ContinuationPath::current_rho_target`], so the
+    /// single-component default here is the entry placeholder, not a constraint
+    /// on the real fit's dimensionality.
+    #[must_use]
+    pub fn heavy_entry() -> Self {
+        Self::enter(default_coupled_schedules())
+    }
+
+    /// The coarse heavy-smoothing regime the path is currently entering at. The
+    /// seed cascade reports this in its demotion ledger and final diagnosis. A
+    /// fresh [`ContinuationPath::heavy_entry`] is in [`PathRegime::Heavy`].
+    #[must_use]
+    pub fn enter_regime(&self) -> PathRegime {
+        PathRegime::from_s(self.s)
+    }
+
+    /// Demote the seed cascade to a heavier path regime with a recorded reason
+    /// and return the regime re-entered at. This is the regime-escalation view
+    /// of re-entry: it routes onto the same [`ContinuationPath::reenter_heavier`]
+    /// mechanism a spine struggle or a mass-floor breach uses (raise `s` toward
+    /// the entry regime, refine the step), so a structural diagnosis becomes a
+    /// heavier-regime RE-ENTRY of the same seed — **never** a rejection. The
+    /// `reason` is a diagnostic tag the caller records alongside the returned
+    /// regime; the demotion mechanism is identical for every reason.
+    pub fn demote_with_reason(&mut self, reason: PathDemotionReason) -> PathRegime {
+        // The reason is diagnostic only: every demotion is a re-entry into a
+        // heavier regime. Naming it explicitly keeps the value live (no silent
+        // discard) while documenting that the escalation path is reason-agnostic.
+        match reason {
+            PathDemotionReason::UniformStructural | PathDemotionReason::PrewarmStructural => {
+                self.reenter_heavier();
+            }
+        }
+        self.enter_regime()
+    }
+
+    /// The base radius the per-iteration assignment-logit trust region is built
+    /// from (`outer_strategy.rs` / `atom_selection.rs` hardening hook). This is
+    /// the ∞-norm logit step radius at the current waypoint; heavier regimes
+    /// (after a demotion / re-entry) cool τ and so hand back a tighter radius,
+    /// shrinking every atom's logit cap with no separate knob.
+    #[must_use]
+    pub fn logit_step_radius(&self) -> f64 {
+        self.logit_tr.radius
+    }
+
+    /// Bare active-mass-floor breach hook for the inner-loop call site that does
+    /// not thread its own [`ReseedLedger`]. Records the breach in the
+    /// path-owned ledger at the current `s` and re-enters a heavier regime —
+    /// the same non-fatal response as [`ContinuationPath::note_mass_breach`],
+    /// without requiring the caller to carry a ledger. Returns the heavier
+    /// [`PathRegime`] re-entered at so the call site can report it. **Never
+    /// fatal** — a breach is a re-entry, never a rejection.
+    pub fn note_active_mass_breach(&mut self) -> PathRegime {
+        let breach = MassFloorBreach {
+            observed_mean_mass: self.mass_floor.floor,
+            floor: self.mass_floor.floor,
+        };
+        self.reseed_ledger.record(self.s, breach);
+        self.reenter_heavier();
+        self.enter_regime()
+    }
+
+    /// Number of scaffold re-seeds recorded through the bare
+    /// [`ContinuationPath::note_active_mass_breach`] hook (diagnostics).
+    #[must_use]
+    pub fn reseed_count(&self) -> usize {
+        self.reseed_ledger.reseed_count()
     }
 
     /// Current path parameter `s ∈ [0, 1]`.
@@ -714,6 +863,58 @@ pub fn couple_schedules(
     }
 }
 
+/// Default coupled schedules for a no-argument [`ContinuationPath::heavy_entry`].
+///
+/// Builds the standard three legs at their smoothing-extreme entry values:
+/// * ρ — a single-component oversmoothed entry `ρ₀` descending to `ρ* = 0`,
+///   inside a generous legal box. The seed cascade's spine replaces this with
+///   the real per-component ρ target at each waypoint, so the single component
+///   here is only the entry placeholder.
+/// * τ — the diffuse→sharp assignment-temperature leg (`DEFAULT_ENTRY_TAU` down
+///   to `DEFAULT_TARGET_TAU`) over the standard waypoint count.
+/// * isometry — the loose→tight gauge leg (`DEFAULT_ENTRY_ISOMETRY` up to the
+///   tight target weight) over the same waypoint count.
+///
+/// These endpoints match the smoothing-extreme entry regime every leg is at at
+/// `s = 1`; the path walks them down in lockstep exactly as a caller-supplied
+/// [`CoupledSchedules`] would.
+#[must_use]
+fn default_coupled_schedules() -> CoupledSchedules {
+    /// Diffuse entry τ (the schedule's `tau_start`) at `s = 1`.
+    const DEFAULT_ENTRY_TAU: f64 = 2.0;
+    /// Sharp target τ (`tau_min`) at `s = 0`.
+    const DEFAULT_TARGET_TAU: f64 = 0.1;
+    /// Loose entry isometry weight (`w_start`) at `s = 1`.
+    const DEFAULT_ENTRY_ISOMETRY: f64 = 0.01;
+    /// Tight target isometry weight (`w_end`) at `s = 0`.
+    const DEFAULT_TARGET_ISOMETRY: f64 = 1.0;
+    /// Oversmoothed entry ρ₀ for the single-component placeholder leg.
+    const DEFAULT_ENTRY_RHO: f64 = 5.0;
+    /// Legal ρ upper bound for the placeholder leg.
+    const DEFAULT_RHO_UPPER: f64 = 10.0;
+
+    let steps = ScheduleKind::Linear {
+        steps: CONTINUATION_WAYPOINTS,
+    };
+    let temperature = GumbelTemperatureSchedule::new(DEFAULT_ENTRY_TAU, DEFAULT_TARGET_TAU, steps)
+        .expect("default continuation temperature schedule must be valid");
+    let isometry = ScalarWeightSchedule::new(
+        DEFAULT_ENTRY_ISOMETRY,
+        DEFAULT_TARGET_ISOMETRY,
+        ScheduleKind::Linear {
+            steps: CONTINUATION_WAYPOINTS,
+        },
+    )
+    .expect("default continuation isometry schedule must be valid");
+    couple_schedules(
+        Array1::from_elem(1, DEFAULT_ENTRY_RHO),
+        Array1::zeros(1),
+        Array1::from_elem(1, DEFAULT_RHO_UPPER),
+        temperature,
+        isometry,
+    )
+}
+
 /// View helper: the wiring agent passes the SAE assignment matrix (rows ×
 /// atoms) to compute the mean active mass for the [`ActiveMassFloor`] check.
 /// Defined here so the floor's input convention has one owner.
@@ -900,6 +1101,59 @@ mod tests {
             "uniform 0.5 is above the 0.2 floor — saddle detection is about \
              collapse below 0.2, the routing-collapse threshold"
         );
+    }
+
+    #[test]
+    fn heavy_entry_starts_in_the_heavy_regime() {
+        let path = ContinuationPath::heavy_entry();
+        assert_eq!(path.s(), 1.0, "heavy_entry must enter at s = 1");
+        assert_eq!(
+            path.enter_regime(),
+            PathRegime::Heavy,
+            "a fresh heavy_entry is in the heavy-smoothing regime"
+        );
+        assert!(
+            path.logit_step_radius().is_finite() && path.logit_step_radius() > 0.0,
+            "logit step radius must be finite and positive at entry"
+        );
+    }
+
+    #[test]
+    fn demote_with_reason_reenters_heavier_never_rejects() {
+        let mut path = ContinuationPath::heavy_entry();
+        // Walk down so a demotion visibly raises s back toward the entry regime.
+        path.s = 0.3;
+        path.s_step = 0.1;
+        let before = path.s;
+        let regime = path.demote_with_reason(PathDemotionReason::UniformStructural);
+        assert!(path.s > before, "demotion must raise s toward the entry regime");
+        // The returned regime is the coarse band of the (heavier) live s.
+        assert_eq!(regime, path.enter_regime());
+        // A second reason demotes the same way — reason-agnostic escalation.
+        let regime2 = path.demote_with_reason(PathDemotionReason::PrewarmStructural);
+        assert_eq!(regime2, path.enter_regime());
+        assert!(path.s >= before, "repeated demotions never lower s");
+    }
+
+    #[test]
+    fn bare_active_mass_breach_records_and_reenters() {
+        let mut path = ContinuationPath::heavy_entry();
+        path.s = 0.4;
+        assert_eq!(path.reseed_count(), 0);
+        let before = path.s;
+        let regime = path.note_active_mass_breach();
+        assert_eq!(path.reseed_count(), 1, "breach must be recorded in the path ledger");
+        assert!(path.s > before, "breach must re-enter a heavier regime");
+        assert_eq!(regime, path.enter_regime());
+    }
+
+    #[test]
+    fn path_regime_bands_are_monotone_in_s() {
+        assert_eq!(PathRegime::from_s(0.0), PathRegime::Target);
+        assert_eq!(PathRegime::from_s(0.2), PathRegime::Target);
+        assert_eq!(PathRegime::from_s(0.5), PathRegime::Annealing);
+        assert_eq!(PathRegime::from_s(0.9), PathRegime::Heavy);
+        assert_eq!(PathRegime::from_s(1.0), PathRegime::Heavy);
     }
 
     #[test]
