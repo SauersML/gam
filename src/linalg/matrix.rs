@@ -2897,9 +2897,19 @@ impl LinearOperator for MultiChannelOperator {
                 self.nrows()
             ));
         }
+        // PSD-clamp the weights to match this operator's own `diag_xtw_x` and
+        // `compute_xtwy` semantics. Per-channel `diag_gram_view` is backed by
+        // `PsdWeights::try_new`, which rejects negative entries outright: a
+        // negative working weight would surface as a hard error here while
+        // `diag_xtw_x(weights)` succeeds, so the operator's own Gram diagonal
+        // would disagree with the diagonal of its full Gram for the same
+        // signed weights. Multi-channel Grams are always consumed as PSD
+        // preconditioners (gam#846), so clamping is the correct shared
+        // semantics.
+        let w_pos = weights.mapv(|w: f64| w.max(0.0));
         let mut diag = Array1::<f64>::zeros(self.p);
         for (i, ch) in self.channels.iter().enumerate() {
-            diag += &ch.diag_gram_view(weights.slice(s![i * n..(i + 1) * n]))?;
+            diag += &ch.diag_gram_view(w_pos.slice(s![i * n..(i + 1) * n]))?;
         }
         Ok(diag)
     }
@@ -2921,10 +2931,19 @@ impl DenseDesignOperator for MultiChannelOperator {
                 total
             ));
         }
+        // Clamp signed weights to non-negative to match this operator's
+        // `diag_xtw_x` / `diag_gram` semantics (multi-channel Grams are PSD
+        // preconditioners — gam#846). The dense per-channel
+        // `compute_xtwy_view` path is signed-safe by design (it preserves the
+        // sign through XᵀWy so observed-Hessian assembly is exact), while the
+        // sparse path clamps internally — passing raw signed weights would
+        // therefore produce different XᵀWy depending on which channels are
+        // sparse vs dense for the same operator+weights.
+        let w_pos = weights.mapv(|w: f64| w.max(0.0));
         let mut out = Array1::<f64>::zeros(self.p);
         for (i, ch) in self.channels.iter().enumerate() {
             out += &ch.compute_xtwy_view(
-                weights.slice(s![i * n..(i + 1) * n]),
+                w_pos.slice(s![i * n..(i + 1) * n]),
                 y.slice(s![i * n..(i + 1) * n]),
             )?;
         }
