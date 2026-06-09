@@ -51,8 +51,15 @@
 //! the floor is carried back to raw units. The equivariance deviation is thus
 //! exactly `0.01·(1 − c)`, free of optimizer / λ-selection drift.
 //!
-//! When the floor is scaled with the response (the fix), this test passes
-//! without edits.
+//! ## The fix
+//!
+//! σ is reconstructed from the persisted raw-unit log-σ coefficients with the
+//! response-scale-relative floor `response_scale·LOGB_SIGMA_FLOOR` (so
+//! `σ = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal))`), matching the
+//! production predictor (`GaussianLocationScalePredictor::sigma_floor`). The raw
+//! `0.01` floor cannot ride the `+ln(response_scale)` intercept shift, so the
+//! floor is carried as data (`GaussianLocationScaleFitResult::response_scale`)
+//! and applied at reconstruction. With the floor scaled, this assertion holds.
 
 use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
@@ -89,7 +96,11 @@ fn fit_sigma_on_response(x: &[f64], y: &[f64]) -> Vec<f64> {
     };
     let result =
         fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg).expect("gam location-scale fit");
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit");
     };
@@ -108,7 +119,13 @@ fn fit_sigma_on_response(x: &[f64], y: &[f64]) -> Vec<f64> {
     let scale_design = build_term_collection_design(grid.view(), &fit.noisespec_resolved)
         .expect("rebuild log-sigma design at grid");
     let eta_sigma = scale_design.design.apply(&beta_scale);
-    eta_sigma.iter().map(|&e| LOGB_SIGMA_FLOOR + e.exp()).collect()
+    // Equivariant σ reconstruction: the standardized→raw remap shifts the log-σ
+    // intercept by `+ln(response_scale)` (scaling only the `exp(η)` term), so the
+    // soft floor must be reconstructed at `response_scale·LOGB_SIGMA_FLOOR` for
+    // σ = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal)) to scale with the
+    // response (#884). The persisted production predictor uses exactly this floor.
+    let sigma_floor = LOGB_SIGMA_FLOOR * response_scale;
+    eta_sigma.iter().map(|&e| sigma_floor + e.exp()).collect()
 }
 
 #[test]
@@ -172,10 +189,10 @@ fn location_scale_noise_is_response_scale_equivariant() {
          fitting on c·y (c={c}) gives σ̂ that differs from c·σ̂(y) by up to {:.1}% \
          (worst at i={}: σ̂_scaled={:.6e}, expected c·σ̂_base={:.6e}, \
          abs diff={:.6e} ≈ 0.01·(1−c)={:.6e}). \
-         Root cause: the soft floor LOGB_SIGMA_FLOOR=0.01 is added in raw \
-         response units in rescale_gaussian_location_scale_to_raw \
-         (src/solver/workflow.rs:1660) instead of being scaled with the \
-         response, so σ_raw = 0.01 + c·(σ̂_unit − 0.01) rather than c·σ̂_unit.",
+         Root cause (#884): the soft floor LOGB_SIGMA_FLOOR=0.01 must be \
+         reconstructed at response_scale·0.01, not a raw 0.01 — the log-σ \
+         intercept shift `+ln(response_scale)` only scales the exp(η) term, so a \
+         raw floor leaves σ_raw = 0.01 + c·(σ̂_unit − 0.01) instead of c·σ̂_unit.",
         max_rel * 100.0,
         worst.0,
         worst.1,
