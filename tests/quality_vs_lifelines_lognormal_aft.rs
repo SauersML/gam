@@ -162,19 +162,22 @@ fn gam_lognormal_aft_interaction_recovers_truth() {
     let cfg = FitConfig {
         survival_likelihood: "location-scale".to_string(),
         survival_distribution: "gaussian".to_string(),
-        // #736 (mirrors the log-logistic AFT sibling): the truth here is a
-        // *parametric* lognormal AFT whose survivor surface is affine in log-time
-        // (`log T = mu(x) + sigma * W`). The default flexible 8-internal-knot
-        // monotone time warp admits curved baseline-shape directions that the
-        // affine DGP does not need; their REML-residual curvature adds variance
-        // to the recovered location slopes / scale and the small-time survivor
-        // probabilities. Scoping the warp to a 2-internal-knot monotone basis
-        // keeps the time axis flexible-but-affine-dominated, so gam recovers the
-        // true affine surface (and beats lifelines, which fixes h(t)=log t) on the
-        // gauge-free covariate slopes — not a weakened bound, a like-for-like
-        // parametric basis matching the DGP exactly as the log-logistic test does.
-        time_num_internal_knots: 2,
-        outer_max_iter: Some(80),
+        // Default flexible time warp (8 internal knots). An earlier commit scoped
+        // this to 2 knots claiming it let gam "recover the affine surface and beat
+        // lifelines" — that was false: gam still fails this test badly. Measured,
+        // gam recovers slopes (0.21, -0.11, 0.00) vs truth (0.5, -0.3, 0.2) and
+        // sigma 0.19 vs 0.40. Two real defects are exposed, neither a knot-count
+        // artifact:
+        //   * a multiplicative warp-gauge scale (h -> c*h rescales BOTH the slopes
+        //     and sigma by c; here c ~= sigma_gam/sigma_true ~= 0.48) that this
+        //     test's "gauge-free" subtraction does NOT remove — it cancels only the
+        //     additive intercept offset, not the multiplicative scale; and
+        //   * the x0:x1 interaction collapsing to exactly 0 even after gauge
+        //     normalization (slope/sigma ratios: gam (1.08, -0.58, 0.0) vs truth
+        //     (1.25, -0.75, 0.5)) — genuine over-shrinkage of the interaction.
+        // Restored to the honest default so the failure reflects gam's real
+        // behaviour, not a hand-tuned basis. The fix is location-scale survival
+        // fitting work (warp-scale identification + interaction shrinkage).
         ..FitConfig::default()
     };
     let result = fit_from_formula(
