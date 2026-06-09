@@ -81,6 +81,16 @@ pub struct ScoreInfluenceJacobian {
 /// coefficient vector θ̂₁, the response basis (re-evaluated at these `y` via the
 /// fitted knots), and the resolved covariate spec (re-built at these `x`).
 ///
+/// `offset` (length `n`) is the per-row additive transformation linear-predictor
+/// offset on these rows. The CTN row build adds this offset identically to
+/// `h`, `L`, and `U` (`row_quantities`: `h_acc = … + offset_i`, and likewise for
+/// the lower/upper endpoints), so the finite-support PIT — and hence the latent
+/// score `z` reported here — depends on it. The Jacobian itself (`∂z/∂θ₁`) does
+/// NOT depend on the offset (it is θ₁-independent), but the *operating point*
+/// at which the φ/Φ ratios are evaluated does; omitting a non-zero offset would
+/// place `h/L/U` (and the emitted `z`) at the wrong point. For an offset-free
+/// Stage-1 (`offset ≡ 0`) this is a no-op. Pass the held-out fold's offset rows.
+///
 /// Implements design §2:
 ///
 /// ```text
@@ -99,6 +109,7 @@ pub fn score_influence_jacobian(
     fit: &TransformationNormalFitResult,
     response: &Array1<f64>,
     covariate_data: ArrayView2<f64>,
+    offset: &Array1<f64>,
 ) -> Result<ScoreInfluenceJacobian, String> {
     let family = &fit.family;
     let n = response.len();
@@ -106,6 +117,12 @@ pub fn score_influence_jacobian(
         return Err(format!(
             "score_influence_jacobian: covariate rows ({}) != response rows ({n})",
             covariate_data.nrows()
+        ));
+    }
+    if offset.len() != n {
+        return Err(format!(
+            "score_influence_jacobian: offset rows ({}) != response rows ({n})",
+            offset.len()
         ));
     }
     if n == 0 {
@@ -196,14 +213,17 @@ pub fn score_influence_jacobian(
         let x_row = x_cov.row(i);
         let g0 = gamma_row[0];
 
-        // h, L, U exactly as the CTN row-quantity build assembles them. At
-        // out-of-sample rows the additive linear-predictor offset is absent
-        // (predict semantics); the per-row monotonicity floor ε·(y − median)
-        // and the endpoint floors are recomputed from the fitted median.
+        // h, L, U exactly as the CTN row-quantity build assembles them
+        // (`row_quantities`): the additive linear-predictor offset enters h, L,
+        // and U identically, so it is added here at all three to place the PIT
+        // operating point (and the emitted z) where the fitted model evaluates
+        // it. The per-row monotonicity floor ε·(y − median) and the endpoint
+        // floors are recomputed from the fitted median.
+        let offset_i = offset[i];
         let value_floor = TRANSFORMATION_MONOTONICITY_EPS * (response[i] - median);
-        let mut h = val_row[0] * g0 + value_floor;
-        let mut l = lower_basis[0] * g0 + lower_floor;
-        let mut u = upper_basis[0] * g0 + upper_floor;
+        let mut h = val_row[0] * g0 + offset_i + value_floor;
+        let mut l = lower_basis[0] * g0 + offset_i + lower_floor;
+        let mut u = upper_basis[0] * g0 + offset_i + upper_floor;
         for k in 1..p_resp {
             let gk = gamma_row[k];
             let gk_sq = gk * gk;

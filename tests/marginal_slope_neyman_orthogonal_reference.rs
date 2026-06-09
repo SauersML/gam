@@ -257,7 +257,8 @@ fn full_data_ctn_z(x: &[f64], score: &[f64]) -> Array1<f64> {
         .expect("build CTN covariate design from frozen spec");
     let cov_rows = design.design.to_dense();
     let score_arr = Array1::from_vec(score.to_vec());
-    let jac = score_influence_jacobian(&tn, &score_arr, cov_rows.view())
+    let zero_offset = Array1::<f64>::zeros(score_arr.len());
+    let jac = score_influence_jacobian(&tn, &score_arr, cov_rows.view(), &zero_offset)
         .expect("full-data Stage-1 score-influence Jacobian (for z)");
     jac.z
 }
