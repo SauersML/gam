@@ -535,3 +535,83 @@ pub(super) fn binomial_link_has_closed_form(link_kind: &InverseLink) -> bool {
             | InverseLink::Standard(StandardLink::CLogLog)
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Cauchit inverse link μ(q) = ½ + atan(q)/π and its eta-derivatives, derived
+    // independently of the production link machinery. With u = 1 + q²:
+    //   μ'    = 1 / (π u)
+    //   μ''   = −2 q / (π u²)
+    //   μ'''  = 2 (3 q² − 1) / (π u³)
+    //   μ'''' = 24 q (1 − q²) / (π u⁴)
+    fn cauchit_jet(q: f64) -> (f64, f64, f64, f64, f64) {
+        let u = 1.0 + q * q;
+        let mu = 0.5 + q.atan() / std::f64::consts::PI;
+        let d1 = 1.0 / (std::f64::consts::PI * u);
+        let d2 = -2.0 * q / (std::f64::consts::PI * u.powi(2));
+        let d3 = 2.0 * (3.0 * q * q - 1.0) / (std::f64::consts::PI * u.powi(3));
+        let d4 = 24.0 * q * (1.0 - q * q) / (std::f64::consts::PI * u.powi(4));
+        (mu, d1, d2, d3, d4)
+    }
+
+    // Analytic generic m4 for the cauchit link via the jet path, matching the
+    // dispatch's `from_jet` consumer exactly.
+    fn cauchit_m4(y: f64, weight: f64, q: f64) -> f64 {
+        let (mu, d1, d2, d3, d4) = cauchit_jet(q);
+        binomial_neglog_q_fourth_derivative_from_jet(y, weight, mu, d1, d2, d3, d4)
+    }
+
+    // Analytic generic m3 for the cauchit link via the jet path (third entry of
+    // the returned (m1, m2, m3) tuple).
+    fn cauchit_m3(y: f64, weight: f64, q: f64) -> f64 {
+        let (mu, d1, d2, d3, _d4) = cauchit_jet(q);
+        binomial_neglog_q_derivatives_from_jet(y, weight, mu, d1, d2, d3).2
+    }
+
+    #[test]
+    fn generic_binomial_m4_matches_finite_difference_of_m3_cauchit() {
+        // High-order (5-point) central finite difference of m3 = dF³/dq³ should
+        // equal the analytic m4 = dF⁴/dq⁴. This independently pins the receiving
+        // fourth-derivative formula and is blind to the dispatch helper naming
+        // (regression for issue #947: the wrong helper injected a spurious μ'''''
+        // term, flipping both sign and magnitude).
+        let h = 1e-4;
+        for &(y, weight, q) in &[
+            (0.3_f64, 2.0_f64, 0.7_f64),
+            (0.8_f64, 1.0_f64, -0.4_f64),
+            (0.1_f64, 3.0_f64, 1.3_f64),
+            (0.6_f64, 0.5_f64, -1.1_f64),
+        ] {
+            let fd = (-cauchit_m3(y, weight, q + 2.0 * h)
+                + 8.0 * cauchit_m3(y, weight, q + h)
+                - 8.0 * cauchit_m3(y, weight, q - h)
+                + cauchit_m3(y, weight, q - 2.0 * h))
+                / (12.0 * h);
+            let analytic = cauchit_m4(y, weight, q);
+            let tol = 1e-5 * (1.0 + analytic.abs());
+            assert!(
+                (analytic - fd).abs() < tol,
+                "cauchit m4 (y={y}, w={weight}, q={q}): analytic={analytic}, fd={fd}, diff={}",
+                (analytic - fd).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn generic_binomial_m4_matches_analytic_cauchit_ground_truth() {
+        // Issue #947 concrete check: at q=0.7, y=0.3, w=2 the correct generic m4
+        // is +2.1168155916; the off-by-one bug produced −10.3779706944.
+        let analytic = cauchit_m4(0.3, 2.0, 0.7);
+        assert!(
+            (analytic - 2.1168155916).abs() < 1e-7,
+            "expected +2.1168155916, got {analytic}"
+        );
+        // Guard against regression to the buggy fifth-derivative value.
+        assert!(
+            (analytic - (-10.3779706944)).abs() > 1.0,
+            "matched the buggy m4 value {analytic}"
+        );
+    }
+}
