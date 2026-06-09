@@ -5707,7 +5707,7 @@ impl UnifiedFitResult {
                     );
                 }
                 match covariance_conditional.as_ref() {
-                    Some(top) if cov == top => {}
+                    Some(top) if **cov == *top => {}
                     Some(_) => {
                         crate::bail_invalid_estim!("UnifiedFitResult inference conditional covariance must match top-level covariance_conditional"
                                 .to_string(),);
@@ -5738,7 +5738,7 @@ impl UnifiedFitResult {
                     );
                 }
                 match covariance_corrected.as_ref() {
-                    Some(top) if cov == top => {}
+                    Some(top) if **cov == *top => {}
                     Some(_) => {
                         crate::bail_invalid_estim!("UnifiedFitResult inference corrected covariance must match top-level covariance_corrected"
                                 .to_string(),);
