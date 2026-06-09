@@ -142,3 +142,129 @@ fn materialize_standard_request_keeps_full_likelihood_spec_for_sas_link() {
         "standard request should store the family as LikelihoodSpec with the SAS inverse-link state intact"
     );
 }
+
+/// Regression for GitHub issue #961: when an explicit response family is given
+/// together with `link(type=...)`, the resolver must validate the link against
+/// that family rather than re-inferring a (conflicting) family from the link.
+/// These legal pairings used to be wrongly rejected because the link inferred
+/// its own family (logit -> Binomial, log -> Poisson/Gamma) and the explicit
+/// family's discriminant did not match.
+#[test]
+fn resolve_family_explicit_family_does_not_infer_conflicting_family_from_link() {
+    // beta + logit: legal (logit-inferred Binomial must not displace Beta).
+    let y_unit = array![0.1, 0.5, 0.9, 0.3];
+    let logit = parse_link_choice(Some("logit"), false)
+        .expect("logit parses")
+        .expect("logit choice present");
+    for family in ["beta", "beta-logit"] {
+        let resolved = resolve_family(
+            Some(family),
+            None,
+            Some(&logit),
+            y_unit.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .unwrap_or_else(|err| panic!("{family} + logit must resolve, got: {err}"));
+        assert!(
+            matches!(resolved.response, ResponseFamily::Beta { .. }),
+            "{family} + logit should keep the Beta response family, got {:?}",
+            resolved.response
+        );
+        assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Logit));
+    }
+
+    // tweedie + log: legal (log-inferred Poisson/Gamma must not displace Tweedie).
+    let y_count = array![0.0, 1.0, 2.0, 3.0];
+    let log = parse_link_choice(Some("log"), false)
+        .expect("log parses")
+        .expect("log choice present");
+    for family in ["tweedie", "tweedie-log"] {
+        let resolved = resolve_family(
+            Some(family),
+            None,
+            Some(&log),
+            y_count.view(),
+            ResponseColumnKind::Numeric,
+            "y",
+        )
+        .unwrap_or_else(|err| panic!("{family} + log must resolve, got: {err}"));
+        assert!(
+            matches!(resolved.response, ResponseFamily::Tweedie { .. }),
+            "{family} + log should keep the Tweedie response family, got {:?}",
+            resolved.response
+        );
+        assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Log));
+    }
+
+    // gamma + log: legal even when y is integer-like (the no-family log path
+    // would infer Poisson, but an explicit gamma must win).
+    let resolved = resolve_family(
+        Some("gamma"),
+        None,
+        Some(&log),
+        y_count.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect("gamma + log must resolve even with integer-like y");
+    assert_eq!(resolved.response, ResponseFamily::Gamma);
+    assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Log));
+}
+
+/// Regression for GitHub issue #961: genuinely-illegal (family, link) pairings
+/// must still be rejected with a clear, family-specific message.
+#[test]
+fn resolve_family_rejects_genuinely_illegal_family_link_pairs() {
+    let y_unit = array![0.1, 0.5, 0.9, 0.3];
+    let log = parse_link_choice(Some("log"), false)
+        .expect("log parses")
+        .expect("log choice present");
+    let err = resolve_family(
+        Some("beta"),
+        None,
+        Some(&log),
+        y_unit.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect_err("beta + log is illegal and must be rejected");
+    assert!(
+        err.contains("not supported for family 'beta'"),
+        "beta + log rejection should name the family and link, got: {err}"
+    );
+
+    let y = array![0.0, 1.0, 1.0, 0.0];
+    let logit = parse_link_choice(Some("logit"), false)
+        .expect("logit parses")
+        .expect("logit choice present");
+    let err = resolve_family(
+        Some("gaussian"),
+        None,
+        Some(&logit),
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect_err("gaussian + logit is illegal and must be rejected");
+    assert!(
+        err.contains("not supported for family 'gaussian'"),
+        "gaussian + logit rejection should name the family and link, got: {err}"
+    );
+
+    // A family name that pins its own link may not be re-pointed at a different
+    // link via `link(type=...)`.
+    let err = resolve_family(
+        Some("binomial-probit"),
+        None,
+        Some(&logit),
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect_err("binomial-probit + logit is a pinned-link conflict and must be rejected");
+    assert!(
+        err.contains("pins link"),
+        "pinned-link conflict should explain the pin, got: {err}"
+    );
+}

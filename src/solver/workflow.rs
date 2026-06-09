@@ -4393,6 +4393,43 @@ pub(crate) fn response_column_kind(data: &Dataset, y_col: usize) -> ResponseColu
     }
 }
 
+/// Legality of a `(response family, link)` pairing.
+///
+/// This is the single source of truth for which links a given response family
+/// accepts. It is consulted only when the caller supplied an *explicit* family
+/// together with a link (`family=..., link(type=...)`): the link must be
+/// validated against that family rather than the family re-inferred from the
+/// link. The legal pairings are:
+///
+/// * `Gaussian` + `Identity`
+/// * `{Poisson, Gamma, Tweedie, NegativeBinomial}` + `Log`
+/// * `Beta` + `Logit`
+/// * `Binomial` + `{Logit, Probit, CLogLog, Sas, BetaLogistic}` (and the
+///   Logit-shaped `Mixture`, handled by the caller via `mixture_components`)
+///
+/// `RoystonParmar` is a flexible-parametric survival family whose link is fixed
+/// at construction and is never reached through the scalar link-choice path, so
+/// it accepts no link override here.
+fn link_legal_for_family(response: &ResponseFamily, link: LinkFunction) -> bool {
+    match response {
+        ResponseFamily::Gaussian => matches!(link, LinkFunction::Identity),
+        ResponseFamily::Poisson
+        | ResponseFamily::Gamma
+        | ResponseFamily::Tweedie { .. }
+        | ResponseFamily::NegativeBinomial { .. } => matches!(link, LinkFunction::Log),
+        ResponseFamily::Beta { .. } => matches!(link, LinkFunction::Logit),
+        ResponseFamily::Binomial => matches!(
+            link,
+            LinkFunction::Logit
+                | LinkFunction::Probit
+                | LinkFunction::CLogLog
+                | LinkFunction::Sas
+                | LinkFunction::BetaLogistic
+        ),
+        ResponseFamily::RoystonParmar => false,
+    }
+}
+
 /// Resolve a family from an optional name, optional link choice, and response data.
 ///
 /// `y_kind` describes the *source* representation of the response column
@@ -4672,40 +4709,49 @@ pub fn resolve_family(
             }
         };
         if let Some((explicit_spec, link_pinned)) = explicit.as_ref() {
-            let compatible_log_nb = matches!(
-                (
-                    &explicit_spec.response,
-                    choice.link,
-                    choice.mixture_components.as_ref(),
-                ),
-                (
-                    ResponseFamily::NegativeBinomial { .. },
-                    LinkFunction::Log,
-                    None,
-                )
-            );
-            // When the user only declared a bare family name (e.g. "binomial")
-            // the link suffix is unpinned, so a user-supplied link is allowed
-            // to refine it as long as the response family agrees with what the
-            // link implies (Binomial vs Gaussian/Poisson/etc.).
-            let response_compatible = std::mem::discriminant(&explicit_spec.response)
-                == std::mem::discriminant(&from_link.response);
-            if !*link_pinned && response_compatible {
-                // Preserve user-chosen link (e.g. SAS state) but keep the
-                // explicit family's response variant (e.g. NB theta).
-                return Ok(LikelihoodSpec::new(
-                    explicit_spec.response.clone(),
-                    from_link.link,
-                ));
-            }
-            if explicit_spec.name() != from_link.name() && !compatible_log_nb {
+            // An explicit response family was supplied: never re-infer the
+            // family from the link. Validate that the requested link is legal
+            // for *this* family, then apply the link (carrying any embedded
+            // Sas/BetaLogistic/Mixture state, which `from_link.link` already
+            // holds) to the explicit family's response variant (preserving e.g.
+            // NB theta, Tweedie p, Beta phi).
+            let mixture_requested = choice.mixture_components.is_some();
+            let legal = if mixture_requested {
+                // The mixture link is a Binomial latent construct; it has no
+                // legal pairing with any other response family.
+                matches!(explicit_spec.response, ResponseFamily::Binomial)
+            } else {
+                link_legal_for_family(&explicit_spec.response, choice.link)
+            };
+            if !legal {
                 return Err(WorkflowError::InvalidConfig {
-                    reason: format!("family '{}' conflicts with link", explicit_spec.name()),
+                    reason: format!(
+                        "link '{}' is not supported for family '{}'",
+                        choice.link.name(),
+                        explicit_spec.response.name()
+                    ),
                 }
                 .into());
             }
+            // A family name that pinned its own link (e.g. "binomial-probit")
+            // may not be re-pointed at a different link by `link(type=...)`.
+            if *link_pinned && explicit_spec.link.link_function() != from_link.link.link_function() {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "family '{}' pins link '{}', which conflicts with requested link '{}'",
+                        explicit_spec.name(),
+                        explicit_spec.link.link_function().name(),
+                        choice.link.name(),
+                    ),
+                }
+                .into());
+            }
+            return Ok(LikelihoodSpec::new(
+                explicit_spec.response.clone(),
+                from_link.link,
+            ));
         }
-        return Ok(explicit.map(|(spec, _)| spec).unwrap_or(from_link));
+        return Ok(from_link);
     }
 
     if let Some((spec, _)) = explicit {
