@@ -75,28 +75,31 @@ fn lognormal_survival(t: f64, mu: f64, sigma: f64) -> f64 {
 
 /// Deterministic lognormal-AFT data with right censoring.
 fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut state: u64 = 0xB5297A4D_68E31DA4;
-    let mut next_u01 = || {
-        state = state
+    // Explicit-state RNG helpers (not nested closures: a closure capturing
+    // another closure's `&mut state` holds a persistent borrow that conflicts
+    // with direct calls to the inner closure).
+    fn next_u01(state: &mut u64) -> f64 {
+        *state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        ((state >> 11) as f64) / ((1u64 << 53) as f64)
-    };
-    let mut next_normal = || {
-        let u1 = next_u01().max(1e-12);
-        let u2 = next_u01();
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+    fn next_normal(state: &mut u64) -> f64 {
+        let u1 = next_u01(state).max(1e-12);
+        let u2 = next_u01(state);
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
-    };
+    }
+    let mut state: u64 = 0xB5297A4D_68E31DA4;
 
     let mut x = Vec::with_capacity(N);
     let mut exit = Vec::with_capacity(N);
     let mut event = Vec::with_capacity(N);
     for _ in 0..N {
-        let xi = if next_u01() < 0.5 { -1.0 } else { 1.0 };
+        let xi = if next_u01(&mut state) < 0.5 { -1.0 } else { 1.0 };
         let mu = A + B * xi;
-        let t_lat = (mu + SIGMA_TRUE * next_normal()).exp();
+        let t_lat = (mu + SIGMA_TRUE * next_normal(&mut state)).exp();
         // Light censoring so most subjects have an event and sigma is identified.
-        let cens = (-next_u01().max(1e-12).ln() * 30.0).min(60.0);
+        let cens = (-next_u01(&mut state).max(1e-12).ln() * 30.0).min(60.0);
         let ex = t_lat.min(cens);
         let ev = if t_lat <= cens { 1.0 } else { 0.0 };
         x.push(xi);
@@ -246,7 +249,7 @@ fn reduced_aft_location_scale_predicts_correct_log_t_surface() {
     // catching a flat / mis-scaled surface (which sits at rel-l2 ~ 0.3+).
     let mut num = 0.0_f64;
     let mut den = 0.0_f64;
-    for (&xv, surv) in [(-1.0_f64, &surv_lo), (1.0_f64, &surv_hi)] {
+    for (xv, surv) in [(-1.0_f64, &surv_lo), (1.0_f64, &surv_hi)] {
         let mu = A + B * xv;
         for (j, &t) in grid.iter().enumerate() {
             let truth = lognormal_survival(t, mu, SIGMA_TRUE);
