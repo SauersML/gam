@@ -244,6 +244,35 @@ impl RowMetric {
         self.provenance
     }
 
+    /// Whether this metric is allowed to **whiten the likelihood** (i.e. replace
+    /// the isotropic reconstruction data-fit `½ rᵀr` with the whitened
+    /// `½ rᵀ M_n r`).
+    ///
+    /// This is TRUE **only** for [`MetricProvenance::WhitenedStructured`] — a
+    /// genuinely *estimated noise model* (a factor-analytic residual covariance,
+    /// #974), for which whitening the likelihood is the statistically correct
+    /// thing to do. For [`MetricProvenance::Euclidean`] there is nothing to
+    /// whiten by, and for [`MetricProvenance::OutputFisher`] the inner product is
+    /// an **output-geometry gauge**, not an estimated noise model — whitening the
+    /// likelihood by it would silently replace the reconstruction loss with a
+    /// Fisher pullback (the #980 failure mode). So both leave the likelihood
+    /// untouched and only the gauge sees the metric (see [`Self::drives_gauge`]).
+    pub fn whitens_likelihood(&self) -> bool {
+        matches!(self.provenance, MetricProvenance::WhitenedStructured { .. })
+    }
+
+    /// Whether this metric **drives the gauge** — i.e. the isometry-penalty
+    /// pullback weight is taken from it rather than the identity.
+    ///
+    /// TRUE for any non-[`MetricProvenance::Euclidean`] provenance: both
+    /// [`MetricProvenance::OutputFisher`] and
+    /// [`MetricProvenance::WhitenedStructured`] supply a non-identity per-row
+    /// inner product the gauge pulls back through. Euclidean reduces the gauge
+    /// pullback to the bare `J_nᵀ J_n`, so it does not drive the gauge.
+    pub fn drives_gauge(&self) -> bool {
+        !matches!(self.provenance, MetricProvenance::Euclidean)
+    }
+
     /// Number of rows the metric is defined over.
     pub fn n_rows(&self) -> usize {
         self.n_rows

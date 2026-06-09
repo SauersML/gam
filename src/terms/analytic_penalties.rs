@@ -983,7 +983,15 @@ impl IsometryPenalty {
     /// pinned to the metric's.
     #[must_use]
     pub fn with_row_metric(mut self, metric: &crate::inference::row_metric::RowMetric) -> Self {
-        self.weight = metric.to_weight_field();
+        // Only a metric that drives the gauge installs a non-identity pullback
+        // weight. A Euclidean metric reduces the gauge pullback to the bare
+        // `J_nᵀ J_n`, so its `to_weight_field()` is `Identity` and the existing
+        // (default-Identity) weight is left exactly as is — bit-for-bit the
+        // pre-metric isotropic gauge. The output dimension is pinned to the
+        // metric's regardless, so the gauge and likelihood agree on `p_out`.
+        if metric.drives_gauge() {
+            self.weight = metric.to_weight_field();
+        }
         self.p_out = metric.p_out();
         self
     }

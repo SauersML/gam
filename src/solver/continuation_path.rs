@@ -452,7 +452,7 @@ pub enum PathDemotionReason {
 /// means "give up"; the tail is a floor, not a gate. The absence of a `Reject`
 /// variant is the whole point — the type cannot represent "no usable seed".
 #[derive(Debug, Clone)]
-pub enum ContinuationStep {
+pub(crate) enum ContinuationStep {
     /// `s` was lowered toward `0` and the inner solve at the new waypoint
     /// succeeded. Carries the accepted spine state and the new `s`.
     Descended {
@@ -481,7 +481,7 @@ pub enum ContinuationStep {
 /// Why a waypoint re-entered a heavier regime. Purely diagnostic — every
 /// variant resolves to "re-descend from a heavier `s`", never to a rejection.
 #[derive(Debug, Clone)]
-pub enum ReentryReason {
+pub(crate) enum ReentryReason {
     /// The ρ-anneal spine could not complete the descent to this waypoint's ρ
     /// target from the current regime. The underlying `ContinuationFailure` is
     /// kept for logging; the path's response is unconditionally to re-enter a
@@ -618,9 +618,24 @@ impl ContinuationPath {
             observed_mean_mass: self.mass_floor.floor,
             floor: self.mass_floor.floor,
         };
-        self.reseed_ledger.record(self.s, breach);
-        self.reenter_heavier();
-        self.enter_regime()
+        // Single source of truth for the breach response: route through
+        // `note_mass_breach` so the record-then-re-enter logic is not
+        // duplicated. The bare hook differs only in *which* ledger it threads —
+        // the path-owned one — so we lend that ledger to the shared driver and
+        // hand it back afterwards.
+        let mut owned = std::mem::take(&mut self.reseed_ledger);
+        let step = self.note_mass_breach(breach, &mut owned);
+        self.reseed_ledger = owned;
+        // The shared driver always re-enters a heavier regime (never rejects);
+        // the bare hook's contract is the coarse regime it landed in. Match the
+        // step exhaustively so the outcome is observed (no silent discard) and
+        // the "every breach is progress" invariant is documented at the use
+        // site: every arm resolves to the heavier live regime.
+        match step {
+            ContinuationStep::Reentered { .. }
+            | ContinuationStep::Descended { .. }
+            | ContinuationStep::Arrived { .. } => self.enter_regime(),
+        }
     }
 
     /// Number of scaffold re-seeds recorded through the bare
@@ -670,7 +685,7 @@ impl ContinuationPath {
     /// agent should act on. **Never fatal** — a breach is a re-entry, never a
     /// rejection. This is the hook the wiring agent calls when
     /// [`ActiveMassFloor::check`] returns `Some` from inside the inner solve.
-    pub fn note_mass_breach(
+    pub(crate) fn note_mass_breach(
         &mut self,
         breach: MassFloorBreach,
         ledger: &mut ReseedLedger,
@@ -709,7 +724,7 @@ impl ContinuationPath {
     /// which is an [`OuterObjective`]). `initial_beta` warms the inner solve;
     /// pass the empty array for cold entry (warm-invariance, #969, guarantees
     /// the same destination either way).
-    pub fn step(
+    pub(crate) fn step(
         &mut self,
         obj: &mut dyn OuterObjective,
         initial_beta: &Array1<f64>,
