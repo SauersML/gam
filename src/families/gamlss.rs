@@ -14,9 +14,7 @@ use crate::custom_family::{
     weighted_crossprod_psi_maps,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::faer_ndarray::{
-    fast_ab, fast_atv, fast_av, fast_joint_hessian_2x2, fast_xt_diag_x, fast_xt_diag_y,
-};
+use crate::faer_ndarray::{fast_ab, fast_atv, fast_av, fast_joint_hessian_2x2};
 use crate::families::location_scale_engine::build_location_scale_exact_joint_setup;
 use crate::families::parameter_block::ParameterBlockInput;
 use crate::families::scale_design::{
@@ -44,7 +42,7 @@ use crate::families::wiggle::{
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::SymmetricMatrix;
 use crate::matrix::{
-    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator, SignedWeightsView,
+    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator,
 };
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link,
@@ -79,6 +77,12 @@ use validation::{
     validate_binomial_location_scalewiggle_termspec, validate_binomial_response, validate_blockrows,
     validate_gaussian_location_scale_termspec, validate_gaussian_location_scalewiggle_termspec,
     validate_len_match, validate_term_weights, validateweights,
+};
+
+mod weighted_design_products;
+use weighted_design_products::{
+    mirror_upper_to_lower, scaled_outer_add, signedwith_floor, xt_diag_x_dense, xt_diag_x_design,
+    xt_diag_y_dense, xt_diag_y_design,
 };
 
 /// Typed errors surfaced from this module's helpers and family
@@ -675,7 +679,10 @@ fn dense_blocks_planned_budget(blocks: &[&DesignMatrix]) -> Vec<usize> {
     planned
 }
 
-fn exact_design_row_chunks(n: usize, p: usize) -> impl Iterator<Item = std::ops::Range<usize>> {
+pub(super) fn exact_design_row_chunks(
+    n: usize,
+    p: usize,
+) -> impl Iterator<Item = std::ops::Range<usize>> {
     const TARGET_BYTES: usize = 8 * 1024 * 1024;
     const MIN_ROWS: usize = 512;
     const MAX_ROWS: usize = 131_072;
@@ -3851,130 +3858,6 @@ pub enum ParameterLink {
     Wiggle,
 }
 
-fn signedwith_floor(v: f64, floor: f64) -> f64 {
-    let a = v.abs().max(floor);
-    if v >= 0.0 { a } else { -a }
-}
-
-fn xt_diag_x_dense(design: &Array2<f64>, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
-    if design.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "xt_diag_x_dense row mismatch: design has {} rows but diag has {} entries",
-                design.nrows(),
-                diag.len()
-            ),
-        }
-        .into());
-    }
-    Ok(fast_xt_diag_x(design, diag))
-}
-
-fn xt_diag_y_dense(
-    left: &Array2<f64>,
-    diag: &Array1<f64>,
-    right: &Array2<f64>,
-) -> Result<Array2<f64>, String> {
-    if left.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "xt_diag_y_dense row mismatch: left has {} rows but diag has {} entries",
-                left.nrows(),
-                diag.len()
-            ),
-        }
-        .into());
-    }
-    if right.nrows() != diag.len() {
-        return Err(GamlssError::DimensionMismatch {
-            reason: format!(
-                "xt_diag_y_dense row mismatch: right has {} rows but diag has {} entries",
-                right.nrows(),
-                diag.len()
-            ),
-        }
-        .into());
-    }
-    Ok(fast_xt_diag_y(left, diag, right))
-}
-
-fn xt_diag_x_design(design: &DesignMatrix, diag: &Array1<f64>) -> Result<Array2<f64>, String> {
-    if design.nrows() != diag.len() {
-        return Err(format!(
-            "xt_diag_x_design row mismatch: design has {} rows but diag has {} entries",
-            design.nrows(),
-            diag.len()
-        ));
-    }
-    design.xt_diag_x_signed_op(SignedWeightsView::from_array(diag))
-}
-
-fn xt_diag_y_design(
-    left: &DesignMatrix,
-    diag: &Array1<f64>,
-    right: &DesignMatrix,
-) -> Result<Array2<f64>, String> {
-    if left.nrows() != diag.len() {
-        return Err(format!(
-            "xt_diag_y_design row mismatch: left has {} rows but diag has {} entries",
-            left.nrows(),
-            diag.len()
-        ));
-    }
-    if right.nrows() != diag.len() {
-        return Err(format!(
-            "xt_diag_y_design row mismatch: right has {} rows but diag has {} entries",
-            right.nrows(),
-            diag.len()
-        ));
-    }
-    if let (Some(left_dense), Some(right_dense)) = (left.as_dense_ref(), right.as_dense_ref()) {
-        return xt_diag_y_dense(left_dense, diag, right_dense);
-    }
-
-    let mut out = Array2::<f64>::zeros((left.ncols(), right.ncols()));
-    for rows in exact_design_row_chunks(diag.len(), left.ncols() + right.ncols()) {
-        let left_chunk = left
-            .try_row_chunk(rows.clone())
-            .map_err(|e| format!("xt_diag_y_design left row chunk materialization failed: {e}"))?;
-        let right_chunk = right
-            .try_row_chunk(rows.clone())
-            .map_err(|e| format!("xt_diag_y_design right row chunk materialization failed: {e}"))?;
-        out += &fast_xt_diag_y(&left_chunk, &diag.slice(s![rows]), &right_chunk);
-    }
-    Ok(out)
-}
-
-fn mirror_upper_to_lower(target: &mut Array2<f64>) {
-    for i in 0..target.nrows() {
-        for j in 0..i {
-            target[[i, j]] = target[[j, i]];
-        }
-    }
-}
-
-#[inline]
-fn scaled_outer_add(
-    mut target: ArrayViewMut2<'_, f64>,
-    scale: f64,
-    left: ArrayView1<'_, f64>,
-    right: ArrayView1<'_, f64>,
-) {
-    let n_left = left.len();
-    let n_right = right.len();
-    for i in 0..n_left {
-        // SAFETY: `i < left.len()` by loop construction; target rows match the
-        // caller-selected left block.
-        let scaled_left = unsafe { *left.uget(i) } * scale;
-        for j in 0..n_right {
-            // SAFETY: `j < right.len()` by loop construction; target columns
-            // match the caller-selected right block.
-            unsafe {
-                *target.uget_mut((i, j)) += scaled_left * *right.uget(j);
-            }
-        }
-    }
-}
 
 struct BinomialLocationScaleCore {
     sigma: Array1<f64>,
