@@ -23955,14 +23955,31 @@ fn apply_joint_block_penalty_into(
 /// Penalty-aware Jacobi preconditioner used by every matrix-free PCG path
 /// in the inner coefficient solve.
 ///
-/// Builds `diag(H) + Σ_k diag(S_k(λ)) + ridge`, clamped at 1e-10. This is
-/// the diagonal of the full penalized joint Hessian `H + Σ_k λ_k S_k`, so it
-/// already incorporates contributions from every penalty operator the model
-/// uses — including the cubic-Duchon `[mass, tension, stiffness]` triple
-/// (orders [1,2,3] in `WigglePenaltyConfig::cubic_triple_operator_default`).
+/// Builds `diag(H) + Σ_k gershgorin(S_k(λ)) + ridge`, clamped at 1e-10, where
+/// `gershgorin(S)[i] = Σ_j |S[i,j]|` is the absolute row-sum (Gershgorin
+/// radius) of each penalty block. This strictly dominates `diag(S)` for any
+/// penalty with off-diagonal mass — the high-order difference / thin-plate
+/// smooths (the cubic-Duchon `[mass, tension, stiffness]` triple, orders
+/// [1,2,3] in `WigglePenaltyConfig::cubic_triple_operator_default`) are
+/// strongly off-diagonal-dominant, so `S[i,i]` alone understates the
+/// operator's true row scale by orders of magnitude there.
+///
+/// Why the row-sum and not just the diagonal: a plain Jacobi (diagonal-only)
+/// preconditioner collapses to `diag(S_λ)` exactly in the saturated-softmax
+/// regime, where the data Fisher weight `W = diag(p) − ppᵀ → 0` near the
+/// simplex boundary and the data part of `diag(H)` vanishes. When the penalty
+/// is off-diagonal-dominant, `diag(S_λ)` is a poor spectral match for
+/// `H + S_λ`, leaving PCG with a large effective condition number and only
+/// geometric (linear) convergence — the multinomial-penguins grind in #715.
+/// The Gershgorin row-sum diagonal tracks the operator's per-coordinate scale
+/// (`|S| 𝟙` bounds `S`'s action), tightening the preconditioned spectrum and
+/// cutting CG iterations sharply in that regime. It is `≥ diag(S)` entrywise
+/// for SPD `S`, so it stays strictly positive and SPD: it changes only the
+/// PCG trajectory, never the converged Newton step or the KKT certificate
+/// (PCG converges to the same `(H + S_λ)⁻¹ rhs` under any SPD preconditioner).
 /// Design docs sometimes call this the "triple-operator penalty
-/// preconditioner" for that reason; in code it is the single, unified
-/// preconditioner shared by all PCG callsites.
+/// preconditioner"; in code it is the single, unified preconditioner shared by
+/// all PCG callsites.
 ///
 /// Callers in the PIRLS inner Newton PCG path feed the result as the diagonal
 /// rescale every CG iteration: PCG applies `M^{-1}` to residuals directly.
@@ -23989,8 +24006,19 @@ fn joint_penalty_preconditioner_diag(
         let (start, end) = ranges[b];
         assert_eq!(s_lambda.nrows(), end - start);
         assert_eq!(s_lambda.ncols(), end - start);
+        // Gershgorin radius: the absolute row-sum `Σ_j |S[i,j]|` of the penalty
+        // block, not just its diagonal `S[i,i]`. For an off-diagonal-dominant
+        // smooth penalty (high-order difference / thin-plate) this tracks the
+        // operator's true per-coordinate scale, where `S[i,i]` understates it.
+        // For SPD `S` the row-sum is `≥ |S[i,i]| = S[i,i]`, so the result still
+        // strictly dominates the plain-diagonal preconditioner and stays SPD.
         for (local_idx, global_idx) in (start..end).enumerate() {
-            diag[global_idx] += s_lambda[[local_idx, local_idx]];
+            let row_abs_sum: f64 = s_lambda
+                .row(local_idx)
+                .iter()
+                .map(|value| value.abs())
+                .sum();
+            diag[global_idx] += row_abs_sum;
         }
     }
     if diagonal_ridge > 0.0 {
