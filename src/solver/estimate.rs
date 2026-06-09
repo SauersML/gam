@@ -2101,51 +2101,65 @@ fn resolved_external_config(
     Ok((cfg, effective_sas_link))
 }
 
+/// Shape/bounds validation for a single [`PenaltySpec`] against the total
+/// coefficient width `p`. Canonical home for the block/dense shape checks that
+/// were duplicated inline in `terms::construction`'s fused validate-and-
+/// destructure path; both call this so the diagnostics stay identical.
+pub(crate) fn validate_penalty_spec_shape(
+    idx: usize,
+    spec: &PenaltySpec,
+    p: usize,
+    context: &str,
+) -> Result<(), EstimationError> {
+    match spec {
+        PenaltySpec::Block {
+            local, col_range, ..
+        } => {
+            let bd = col_range.len();
+            if local.nrows() != bd || local.ncols() != bd {
+                crate::bail_invalid_estim!(
+                    "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
+                    local.nrows(),
+                    local.ncols()
+                );
+            }
+            if col_range.end > p {
+                crate::bail_invalid_estim!(
+                    "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
+                    col_range.start,
+                    col_range.end
+                );
+            }
+        }
+        PenaltySpec::Dense(m) => {
+            if m.nrows() != p || m.ncols() != p {
+                crate::bail_invalid_estim!(
+                    "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
+                    m.nrows(),
+                    m.ncols()
+                );
+            }
+        }
+        PenaltySpec::DenseWithMean { matrix, .. } => {
+            if matrix.nrows() != p || matrix.ncols() != p {
+                crate::bail_invalid_estim!(
+                    "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
+                    matrix.nrows(),
+                    matrix.ncols()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_penalty_specs(
     specs: &[PenaltySpec],
     p: usize,
     context: &str,
 ) -> Result<(), EstimationError> {
     for (idx, spec) in specs.iter().enumerate() {
-        match spec {
-            PenaltySpec::Block {
-                local, col_range, ..
-            } => {
-                let bd = col_range.len();
-                if local.nrows() != bd || local.ncols() != bd {
-                    crate::bail_invalid_estim!(
-                        "{context}: block penalty {idx} local matrix must be {bd}x{bd}, got {}x{}",
-                        local.nrows(),
-                        local.ncols()
-                    );
-                }
-                if col_range.end > p {
-                    crate::bail_invalid_estim!(
-                        "{context}: block penalty {idx} col_range {}..{} exceeds p={p}",
-                        col_range.start,
-                        col_range.end
-                    );
-                }
-            }
-            PenaltySpec::Dense(m) => {
-                if m.nrows() != p || m.ncols() != p {
-                    crate::bail_invalid_estim!(
-                        "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
-                        m.nrows(),
-                        m.ncols()
-                    );
-                }
-            }
-            PenaltySpec::DenseWithMean { matrix, .. } => {
-                if matrix.nrows() != p || matrix.ncols() != p {
-                    crate::bail_invalid_estim!(
-                        "{context}: dense penalty {idx} must be {p}x{p}, got {}x{}",
-                        matrix.nrows(),
-                        matrix.ncols()
-                    );
-                }
-            }
-        }
+        validate_penalty_spec_shape(idx, spec, p, context)?;
     }
     Ok(())
 }
