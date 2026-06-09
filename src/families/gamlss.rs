@@ -41,9 +41,7 @@ use crate::families::wiggle::{
 };
 use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 use crate::matrix::SymmetricMatrix;
-use crate::matrix::{
-    DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator,
-};
+use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix};
 use crate::mixture_link::{
     inverse_link_jet_for_inverse_link, inverse_link_mu_d1_for_inverse_link,
 };
@@ -58,7 +56,7 @@ use crate::smooth::{
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, RidgePolicy, StandardLink};
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, Axis, s};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::DefaultHasher};

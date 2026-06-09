@@ -11,7 +11,7 @@
 //! no behavior change.
 
 use crate::faer_ndarray::{fast_xt_diag_x, fast_xt_diag_y};
-use crate::matrix::{DesignMatrix, SignedWeightsView};
+use crate::matrix::{DesignMatrix, LinearOperator, SignedWeightsView};
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, s};
 
 use super::GamlssError;
