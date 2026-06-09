@@ -424,3 +424,121 @@ impl RiemannianManifold for GrassmannManifold {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array1, Array2};
+
+    /// Row-major flatten of an `n×k` frame into the `vec[r*k + c] = M[r, c]`
+    /// layout `from_flat`/`flatten` use.
+    fn flat(m: &Array2<f64>) -> Array1<f64> {
+        let (rows, cols) = m.dim();
+        let mut v = Array1::<f64>::zeros(rows * cols);
+        for r in 0..rows {
+            for c in 0..cols {
+                v[r * cols + c] = m[[r, c]];
+            }
+        }
+        v
+    }
+
+    /// Build two orthonormal `n×k` frames whose principal angles are EXACTLY the
+    /// supplied `angles`, by rotating column `j` of the identity frame inside the
+    /// disjoint coordinate 2-plane `(e_j, e_{k+j})`. With the `k` rotation planes
+    /// pairwise orthogonal, `Y = [e_0 … e_{k-1}]` and
+    /// `Z = [cosθ_j e_j + sinθ_j e_{k+j}]_j` satisfy `YᵀZ = diag(cosθ_j)`, so the
+    /// principal angles of `span(Y), span(Z)` are precisely `θ_j` — analytic
+    /// ground truth, no SVD/`arccos` conditioning and no external tool. Requires
+    /// `n ≥ 2k` so the rotation planes do not overlap.
+    fn frames_with_angles(n: usize, k: usize, angles: &[f64]) -> (Array2<f64>, Array2<f64>) {
+        assert!(n >= 2 * k, "disjoint rotation planes need n >= 2k");
+        assert_eq!(angles.len(), k);
+        let mut y = Array2::<f64>::zeros((n, k));
+        let mut z = Array2::<f64>::zeros((n, k));
+        for (j, &theta) in angles.iter().enumerate() {
+            y[[j, j]] = 1.0;
+            z[[j, j]] = theta.cos();
+            z[[k + j, j]] = theta.sin();
+        }
+        (y, z)
+    }
+
+    #[test]
+    fn geodesic_distance_equals_analytic_principal_angle_arc_length() {
+        // Gr(2, 6): two subspaces with KNOWN principal angles spanning the whole
+        // injectivity-radius range, including an angle essentially at the π/2 cut
+        // (where the `(YᵀZ)⁻¹` form is most stressed). The geodesic distance must
+        // equal sqrt(Σ θ_j²) — the exact arc-length — to f64 linear-algebra noise.
+        let gr = GrassmannManifold::new(2, 6).expect("Gr(2,6)");
+        let cases: [[f64; 2]; 4] = [
+            [0.1, 0.7],
+            [0.9, 1.4],
+            [0.3, 1.5705], // one angle a hair below π/2 ≈ 1.5708
+            [1.2, 1.2],    // degenerate (repeated) angle: V-block is an arbitrary rotation
+        ];
+        for angles in cases {
+            let (y, z) = frames_with_angles(6, 2, &angles);
+            let log = gr
+                .log_map(flat(&y).view(), flat(&z).view())
+                .expect("log_map between known-angle frames");
+            let dist: f64 = log.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let analytic: f64 = angles.iter().map(|t| t * t).sum::<f64>().sqrt();
+            assert!(
+                (dist - analytic).abs() < 1e-12,
+                "geodesic distance {dist:.16} != analytic arc-length {analytic:.16} for \
+                 angles {angles:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exp_log_roundtrip_recovers_tangent_to_machine_precision() {
+        // exp_P(v) then log back must return v componentwise, and the recovered
+        // tangent's singular spectrum must equal the input principal angles — at
+        // both tiny (sub-microradian) and near-π/2 scales. This pins gam's exp/log
+        // involution against analytic truth (atan-recovered, well-conditioned),
+        // independent of the arccos-near-1 endpoint extraction the e2e test uses.
+        let gr = GrassmannManifold::new(3, 9).expect("Gr(3,9)");
+        let scales: [f64; 5] = [1e-7, 1e-4, 0.3, 1.0, 1.5];
+        let dirs: [[f64; 3]; 1] = [[0.4, 0.7, 1.0]]; // distinct so V is well separated
+        for s in scales {
+            for d in dirs {
+                let angles = [d[0] * s, d[1] * s, d[2] * s];
+                // Tangent matrix Δ = U Σ Vᵀ with U the rotation-plane image axes,
+                // V = I, Σ = diag(angles): a horizontal tangent at Y whose compact
+                // SVD spectrum is exactly `angles`.
+                let (y, _z) = frames_with_angles(9, 3, &angles);
+                let mut tangent = Array2::<f64>::zeros((9, 3));
+                for (j, &theta) in angles.iter().enumerate() {
+                    tangent[[3 + j, j]] = theta; // e_{k+j} direction, magnitude θ_j
+                }
+                let y_flat = flat(&y);
+                let v_flat = flat(&tangent);
+                // The tangent is horizontal (YᵀΔ = 0 by construction).
+                let endpoint = gr
+                    .exp_map(y_flat.view(), v_flat.view())
+                    .expect("exp_map of horizontal tangent");
+                let v_rec = gr
+                    .log_map(y_flat.view(), endpoint.view())
+                    .expect("log_map of geodesic endpoint");
+                let mut max_abs = 0.0_f64;
+                for (a, b) in v_rec.iter().zip(v_flat.iter()) {
+                    max_abs = max_abs.max((a - b).abs());
+                }
+                assert!(
+                    max_abs < 1e-10,
+                    "exp/log roundtrip error {max_abs:.3e} at scale {s:.1e} (angles {angles:?})"
+                );
+                // Isometry: ‖log(exp v)‖_F == ‖v‖_F == ‖angles‖₂.
+                let rec_norm: f64 = v_rec.iter().map(|x| x * x).sum::<f64>().sqrt();
+                let truth_norm: f64 = angles.iter().map(|t| t * t).sum::<f64>().sqrt();
+                assert!(
+                    (rec_norm - truth_norm).abs() < 1e-10,
+                    "isometry error {:.3e} at scale {s:.1e}",
+                    (rec_norm - truth_norm).abs()
+                );
+            }
+        }
+    }
+}
