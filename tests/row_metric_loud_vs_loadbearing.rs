@@ -1,283 +1,300 @@
-//! Planted-fixture payoff for Object 2 (the `RowMetric`).
+//! Honest negative control for the amended #980 metric design: the two-score
+//! per-atom **lens** ([`gam::inference::atom_lens::atom_two_lens`]).
 //!
-//! The headline this test makes falsifiable: the inner product the
-//! SAE-manifold *likelihood* whitens residuals through decides which structure
-//! a least-squares reconstruction recovers. With a **Euclidean** metric a
-//! "loud-but-inert" high-variance artifact dominates the residual sum of
-//! squares and the fit spends its coefficient explaining it — the **wrong**
-//! answer. With an **OutputFisher** metric whose per-row factor down-weights the
-//! noisy channel and up-weights the informative one, the same data-fit objective
-//! is minimized by the "quiet-but-load-bearing" feature — the **right** answer.
+//! # The corrected headline
 //!
-//! The test drives the *real* migrated code path: the objective each fit
-//! minimizes is exactly `Σ_n ½ ‖whiten_residual_row(r_n)‖²`, the identical sum
-//! the reconstruction likelihood (`SaeManifoldTerm::loss_scaled`) now forms. The
-//! only metric input is the `RowMetric`; there is no separate gauge metric to
-//! disagree with it, which is the whole point of Object 2.
+//! The *wrong* (original) headline was "the metric the likelihood whitens by
+//! decides which structure the reconstruction recovers" — i.e. fold the
+//! output-Fisher metric into the SAE loss so the loud-but-inert structure is
+//! *suppressed* and only the load-bearing one survives. That is the
+//! loss-replacement mistake #980 was amended to remove: it makes the gauge drive
+//! the fit and silently deletes anything *represented but not currently used*.
 //!
-//! Because the data-fit objective is quadratic in the reconstruction coefficient
-//! vector, its minimizer is the solution of the whitened normal equations. We
-//! assemble those normal equations row-by-row strictly through
-//! `RowMetric::whiten_residual_row`, so the coefficients this test recovers are
-//! exactly the ones that minimize the likelihood's data-fit term under the given
-//! provenance. No tolerance is weakened: the assertions are decisive gaps
-//! against planted truth.
+//! The corrected design:
+//!
+//! * **The SAE fit stays on activations.** The reconstruction loss is Euclidean
+//!   (the only loss). *Everything represented survives* — both a loud-but-inert
+//!   high-variance structure and a quiet-but-load-bearing low-variance feature
+//!   are recovered/represented by the fit. Neither is suppressed.
+//! * **The Fisher metric is an additive report, never a loss.** Output-Fisher
+//!   factors enter *only* through the lens's `coupling` score; they do not touch
+//!   the activation fit. A loud atom that carries (by construction) near-zero
+//!   behavioral coupling is **flagged** "represented-not-used" but is **not**
+//!   removed; a quiet atom with high coupling is flagged "used".
+//!
+//! This test plants exactly that situation and asserts the lens reads it
+//! correctly. It is the falsifiable negative control for the whole metric design:
+//! if the lens ever *suppressed* the loud structure (instead of reporting it), or
+//! failed to surface the represented-not-used discrepancy, this test fails.
+//!
+//! ## Why this is the negative control
+//!
+//! "Loud-but-inert" is the adversarial case for any metric that drives the loss:
+//! a high-variance artifact dominates the residual sum of squares, so a
+//! Fisher-weighted *loss* would have to fight it, and a naive whitening would
+//! erase it. Here the activation fit keeps it (Euclidean loss, nothing erased),
+//! and the lens — reading the synthesized OutputFisher metric — correctly reports
+//! that the loud atom's *behavioral* coupling is ~zero while its
+//! *representational* presence is large. That gap is the headline safety number.
 
 use std::sync::Arc;
 
+use gam::inference::atom_lens::{atom_two_lens, AtomTwoLensReport};
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
-use ndarray::{Array1, Array2, ArrayView1};
+use gam::terms::sae_manifold::{
+    AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldTerm,
+};
+use ndarray::{Array2, Array3};
 
-const N: usize = 400;
-const P: usize = 2; // output channels: 0 = loud-but-inert, 1 = quiet-but-load-bearing.
-const D: usize = 2; // reconstruction coefficients: [loud_feature, loadbearing_feature].
+const N: usize = 200;
+const P: usize = 2; // output channels: 0 = loud atom's channel, 1 = quiet atom's channel.
 
-/// One observation's design row `X_n ∈ ℝ^{p × d}` (maps the coefficient vector
-/// `c ∈ ℝ^d` to a predicted output `ẑ = X_n c ∈ ℝ^p`) and target `z_n ∈ ℝ^p`.
-struct Fixture {
-    design: Vec<Array2<f64>>, // length N, each (P, D)
-    target: Array2<f64>,      // (N, P)
-}
+/// Loud-but-inert atom amplitude: a large decoder magnitude living entirely in
+/// output channel 0. High representational presence (it is loud), but the
+/// synthesized OutputFisher metric carries almost no precision on channel 0, so
+/// its behavioral coupling is ~zero.
+const LOUD_AMPLITUDE: f64 = 6.0;
+/// Quiet-but-load-bearing atom amplitude: a small decoder magnitude living
+/// entirely in output channel 1. Low presence, but the OutputFisher metric puts
+/// full precision on channel 1, so its behavioral coupling is high.
+const QUIET_AMPLITUDE: f64 = 1.0;
 
-/// Plant the truth.
-///
-/// * The **load-bearing** feature (column 1 of the design) drives channel 1 with
-///   a clean unit-amplitude sinusoid and a tiny amount of noise. The true
-///   coefficient on it is `1.0`.
-/// * The **loud** feature (column 0 of the design) only ever appears in
-///   channel 0. Channel 0's target is pure high-variance noise that the loud
-///   feature *correlates with by construction* — fitting it drives channel-0 RSS
-///   down hard, but it is inert: it explains none of the real signal. Its true
-///   coefficient is `0.0`.
-///
-/// So the planted truth is `c* = [0 (loud), 1 (load-bearing)]`. A fit that
-/// reports a large loud coefficient and a small load-bearing one has recovered
-/// the artifact; the reverse has recovered the signal.
-fn planted() -> Fixture {
-    // Deterministic pseudo-random streams (no rand dependency): a hashed LCG.
-    let mut rng = 0x2545_F491_4F6C_DD1Du64;
-    let mut next_unit = move || {
-        // xorshift* — deterministic, decent spread, in [-1, 1].
-        rng ^= rng >> 12;
-        rng ^= rng << 25;
-        rng ^= rng >> 27;
-        let v = rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        ((v >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
-    };
-
-    let loud_amplitude = 6.0; // channel-0 noise is ~6× the load-bearing signal.
-    let mut design = Vec::with_capacity(N);
-    let mut target = Array2::<f64>::zeros((N, P));
-    for n in 0..N {
-        let x = (n as f64 + 0.5) / N as f64;
-
-        // Load-bearing feature column: a clean sinusoid living in channel 1.
-        let load_feat = (std::f64::consts::TAU * x).sin();
-        // Loud feature column: a high-variance noise pattern living in channel 0.
-        let loud_feat = loud_amplitude * next_unit();
-
-        // Design: channel 0 sees only the loud feature, channel 1 sees only the
-        // load-bearing feature. (Block-diagonal in (channel, feature).)
-        let mut xn = Array2::<f64>::zeros((P, D));
-        xn[[0, 0]] = loud_feat; // loud feature -> channel 0
-        xn[[1, 1]] = load_feat; // load-bearing feature -> channel 1
-        design.push(xn);
-
-        // Targets:
-        //   channel 0 = loud_feat itself (so the loud coefficient 1.0 fits it
-        //               perfectly in the Euclidean metric) PLUS extra noise so it
-        //               stays genuinely high-variance and inert,
-        //   channel 1 = the load-bearing signal (true coeff 1.0) + tiny noise.
-        let channel0 = loud_feat + 0.5 * loud_amplitude * next_unit();
-        let channel1 = 1.0 * load_feat + 0.02 * next_unit();
-        target[[n, 0]] = channel0;
-        target[[n, 1]] = channel1;
+/// Build a single-basis atom whose decoder maps the (constant) basis to a single
+/// output channel with the given amplitude, and whose basis Jacobian is a unit
+/// slope so the decoder tangent `dg/dt` is exactly the decoder row (a nonzero
+/// vector living in `channel`). Caller-managed basis (no evaluator): the
+/// construction-time `basis_values` / `basis_jacobian` are authoritative, which
+/// is all the read-only lens needs.
+fn single_channel_atom(name: &str, channel: usize, amplitude: f64) -> SaeManifoldAtom {
+    let m = 1usize; // one basis function.
+    let latent_dim = 1usize;
+    // Constant basis value 1 on every row.
+    let mut basis_values = Array2::<f64>::zeros((N, m));
+    for row in 0..N {
+        basis_values[[row, 0]] = 1.0;
     }
-    Fixture { design, target }
-}
-
-/// Minimize the *exact* likelihood data-fit objective
-/// `J(c) = Σ_n ½ ‖whiten_residual_row(z_n − X_n c)‖²` over `c ∈ ℝ^d` for the
-/// given `RowMetric`. Because `J` is a convex quadratic in `c`, its minimizer
-/// solves the whitened normal equations `(Σ_n X̃_nᵀ X̃_n) c = Σ_n X̃_nᵀ z̃_n`,
-/// where `X̃_n` and `z̃_n` are the whitened design and target.
-///
-/// We whiten *through* `RowMetric::whiten_residual_row` — the identical function
-/// the reconstruction likelihood now sums — so the recovered `c` is exactly the
-/// likelihood-optimal coefficient under this provenance.
-fn fit_data_fit_optimal(fixture: &Fixture, metric: &RowMetric) -> Array1<f64> {
-    let mut ata = Array2::<f64>::zeros((D, D));
-    let mut atb = Array1::<f64>::zeros(D);
-    for n in 0..N {
-        let xn = &fixture.design[n];
-        let zn = fixture.target.row(n);
-        // Whiten the target row.
-        let z_tilde = metric.whiten_residual_row(n, zn);
-        // Whiten each design column (the metric is linear, so whitening the
-        // residual z_n − X_n c is whitening z_n minus whitening each column of
-        // X_n times c).
-        let mut x_tilde_cols: Vec<Vec<f64>> = Vec::with_capacity(D);
-        for j in 0..D {
-            let col: Array1<f64> = xn.column(j).to_owned();
-            let col_view: ArrayView1<'_, f64> = col.view();
-            x_tilde_cols.push(metric.whiten_residual_row(n, col_view));
-        }
-        let m = z_tilde.len();
-        for j in 0..D {
-            for k in 0..D {
-                let mut acc = 0.0;
-                for r in 0..m {
-                    acc += x_tilde_cols[j][r] * x_tilde_cols[k][r];
-                }
-                ata[[j, k]] += acc;
-            }
-            let mut acc_b = 0.0;
-            for r in 0..m {
-                acc_b += x_tilde_cols[j][r] * z_tilde[r];
-            }
-            atb[j] += acc_b;
-        }
+    // Unit slope on every row: dΦ/dt = 1 ⇒ tangent dg/dt = 1 · B_k = B_k.
+    let mut basis_jacobian = Array3::<f64>::zeros((N, m, latent_dim));
+    for row in 0..N {
+        basis_jacobian[[row, 0, 0]] = 1.0;
     }
-    solve_2x2(&ata, &atb)
+    // Decoder maps the basis to exactly one output channel with `amplitude`.
+    let mut decoder = Array2::<f64>::zeros((m, P));
+    decoder[[0, channel]] = amplitude;
+    // No roughness penalty: a 1×1 zero Gram (order 0, reweighting skipped).
+    let smooth_penalty = Array2::<f64>::zeros((m, m));
+    SaeManifoldAtom::new(
+        name,
+        SaeAtomBasisKind::EuclideanPatch,
+        latent_dim,
+        basis_values,
+        basis_jacobian,
+        decoder,
+        smooth_penalty,
+    )
+    .expect("single-channel atom must build")
 }
 
-/// Exact 2×2 solve (the reconstruction coefficient dimension is `D = 2`).
-fn solve_2x2(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
-    let det = a[[0, 0]] * a[[1, 1]] - a[[0, 1]] * a[[1, 0]];
-    assert!(
-        det.abs() > 1e-12,
-        "whitened normal-equation matrix is singular (det={det}); the fixture must keep both \
-         reconstruction directions identifiable"
-    );
-    let inv00 = a[[1, 1]] / det;
-    let inv01 = -a[[0, 1]] / det;
-    let inv10 = -a[[1, 0]] / det;
-    let inv11 = a[[0, 0]] / det;
-    Array1::from(vec![
-        inv00 * b[0] + inv01 * b[1],
-        inv10 * b[0] + inv11 * b[1],
-    ])
+/// Build the planted two-atom fitted term. Both atoms are *active on every row*
+/// (high JumpReLU gate logits), so the Euclidean activation fit represents BOTH
+/// — nothing is suppressed. The loud atom lives in channel 0 with large
+/// amplitude (high presence); the quiet atom in channel 1 with small amplitude
+/// (low presence).
+fn planted_term() -> SaeManifoldTerm {
+    let loud = single_channel_atom("loud_inert", 0, LOUD_AMPLITUDE);
+    let quiet = single_channel_atom("quiet_loadbearing", 1, QUIET_AMPLITUDE);
+
+    // Two latent-coordinate blocks (one scalar coord per atom), at t = 0.
+    let coord_blocks = vec![Array2::<f64>::zeros((N, 1)), Array2::<f64>::zeros((N, 1))];
+
+    // JumpReLU gate logits well above threshold for BOTH atoms on every row, so
+    // both gates are ~1 (σ((10−0)/0.1) ≈ 1). This is the "everything represented
+    // survives" condition: the activation fit keeps both atoms maximally active.
+    let mut logits = Array2::<f64>::zeros((N, 2));
+    for row in 0..N {
+        logits[[row, 0]] = 10.0;
+        logits[[row, 1]] = 10.0;
+    }
+    let assignment = SaeAssignment::from_blocks_with_mode(
+        logits,
+        coord_blocks,
+        AssignmentMode::jumprelu(0.1, 0.0),
+    )
+    .expect("assignment must build");
+
+    SaeManifoldTerm::new(vec![loud, quiet], assignment).expect("term must build")
 }
 
-/// Build the OutputFisher metric that the load-bearing channel deserves: a
-/// per-row rank-1 factor `U_n ∈ ℝ^{p × 1}` that puts (almost) all of the
-/// precision on the informative channel 1 and (almost) none on the noisy
-/// channel 0. `W_n = U_n U_nᵀ` then weights the residual by output-channel
-/// reliability — the output-Fisher inner product (high precision where the
-/// observation is informative, low where it is pure noise).
+/// Synthesize the OutputFisher factors that make the loud channel near-inert and
+/// the quiet channel fully load-bearing *behaviorally*. Per-row rank-1 factor
+/// `U_n ∈ ℝ^{P × 1}` with sqrt-precision ~0 on channel 0 (loud) and ~1 on
+/// channel 1 (quiet). The Fisher mass of a tangent `x` is `‖U_nᵀ x‖²`:
+///   * loud tangent `[LOUD_AMPLITUDE, 0]` ⇒ `(0.02·LOUD_AMPLITUDE)²` ≈ 0,
+///   * quiet tangent `[0, QUIET_AMPLITUDE]` ⇒ `(1·QUIET_AMPLITUDE)²`, large.
 fn output_fisher_metric() -> RowMetric {
     let rank = 1usize;
-    // U_n[i, k] = u[n, i * rank + k]; here rank = 1 so column layout is just the
-    // per-channel weight. sqrt-precision: channel 0 ~ 0 (noise), channel 1 ~ 1.
     let mut u = Array2::<f64>::zeros((N, P * rank));
-    for n in 0..N {
-        u[[n, 0 * rank]] = 0.02; // loud/noisy channel: almost no precision.
-        u[[n, 1 * rank]] = 1.0; // load-bearing channel: full precision.
+    for row in 0..N {
+        u[[row, 0 * rank]] = 0.02; // loud / channel 0: almost no precision.
+        u[[row, 1 * rank]] = 1.0; // quiet / channel 1: full precision.
     }
     RowMetric::output_fisher(Arc::new(u), P, rank).expect("OutputFisher metric must be valid PSD")
 }
 
-#[test]
-fn euclidean_recovers_loud_artifact_output_fisher_recovers_load_bearing() {
-    let fixture = planted();
-
-    // --- Euclidean provenance: isotropic, the historical path. ---
-    let euclid = RowMetric::euclidean(N, P).expect("Euclidean metric must build");
-    assert_eq!(euclid.provenance(), MetricProvenance::Euclidean);
-    let c_euclid = fit_data_fit_optimal(&fixture, &euclid);
-    let loud_euclid = c_euclid[0];
-    let load_euclid = c_euclid[1];
-
-    // --- OutputFisher provenance: down-weight the noisy channel. ---
-    let fisher = output_fisher_metric();
-    assert!(matches!(
-        fisher.provenance(),
-        MetricProvenance::OutputFisher { .. }
-    ));
-    let c_fisher = fit_data_fit_optimal(&fixture, &fisher);
-    let loud_fisher = c_fisher[0];
-    let load_fisher = c_fisher[1];
-
-    println!("planted truth: c* = [loud=0.0, load_bearing=1.0]");
-    println!("Euclidean    : loud={loud_euclid:.6}  load_bearing={load_euclid:.6}");
-    println!("OutputFisher : loud={loud_fisher:.6}  load_bearing={load_fisher:.6}");
-
-    // HEADLINE 1 — Euclidean recovers the LOUD ARTIFACT (wrong): the loud
-    // coefficient is large (near its planted-correlation value ~1) and the
-    // fit's explained structure is dominated by the noisy channel. The loud
-    // coefficient is the *bigger* of the two in the Euclidean inner product
-    // because channel-0 RSS dwarfs channel-1 RSS.
-    assert!(
-        loud_euclid.abs() > 0.5,
-        "Euclidean fit should latch onto the loud artifact (|loud| large); got loud={loud_euclid}"
-    );
-    assert!(
-        loud_euclid.abs() > load_euclid.abs(),
-        "under Euclidean the loud artifact must dominate the load-bearing feature: \
-         |loud|={} vs |load|={}",
-        loud_euclid.abs(),
-        load_euclid.abs()
-    );
-
-    // HEADLINE 2 — OutputFisher recovers the LOAD-BEARING feature (right): the
-    // load-bearing coefficient is recovered near its planted value 1.0, and the
-    // loud coefficient is driven to (near) irrelevance because its channel
-    // carries almost no precision.
-    assert!(
-        (load_fisher - 1.0).abs() < 0.05,
-        "OutputFisher fit must recover the load-bearing coefficient ~1.0; got {load_fisher}"
-    );
-    assert!(
-        load_fisher.abs() > 5.0 * loud_fisher.abs(),
-        "under OutputFisher the load-bearing feature must dominate the loud artifact: \
-         |load|={} vs |loud|={}",
-        load_fisher.abs(),
-        loud_fisher.abs()
-    );
-
-    // Decisive cross-over: the SAME data, the SAME objective form, opposite
-    // recovered structure — selected solely by the metric's provenance. This is
-    // the falsifiable payoff of collapsing the two inner products into one
-    // provenance-carrying object.
-    assert!(
-        loud_euclid.abs() > load_euclid.abs() && load_fisher.abs() > loud_fisher.abs(),
-        "the provenance must flip which structure is recovered"
-    );
+/// Locate an atom's entry by name.
+fn entry<'a>(report: &'a AtomTwoLensReport, name: &str) -> &'a gam::inference::atom_lens::AtomLensEntry {
+    report
+        .atoms
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("atom {name} must be in the lens report"))
 }
 
-/// Confirms the Euclidean provenance reproduces the prior isotropic data-fit
-/// **bit-for-bit**: `whiten_residual_row` is the identity, so summing
-/// `½ ‖whiten(r)‖²` equals the historical `½ Σ r²` exactly (not merely within a
-/// tolerance). This is the guarantee that installing Object 2 with no per-row
-/// factors changes nothing in the default path.
 #[test]
-fn euclidean_whitening_is_bit_for_bit_isotropic() {
-    let fixture = planted();
-    let euclid = RowMetric::euclidean(N, P).expect("Euclidean metric must build");
+fn lens_flags_loud_represented_not_used_and_quiet_used() {
+    let term = planted_term();
 
-    let mut whitened_data_fit = 0.0_f64;
-    let mut isotropic_data_fit = 0.0_f64;
-    // Use an arbitrary nonzero "fitted" so residuals are nontrivial.
-    for n in 0..N {
-        let z = fixture.target.row(n);
-        let mut resid = Array1::<f64>::zeros(P);
-        for c in 0..P {
-            // pretend a fixed predictor 0.1 so the residual is z - 0.1.
-            resid[c] = z[c] - 0.1;
-        }
-        // Historical isotropic path.
-        for &r in resid.iter() {
-            isotropic_data_fit += 0.5 * r * r;
-        }
-        // Object-2 whitened path under Euclidean provenance.
-        for w in euclid.whiten_residual_row(n, resid.view()) {
-            whitened_data_fit += 0.5 * w * w;
-        }
-    }
-    // Bit-for-bit: the two accumulations execute the identical float operations
-    // in the identical order, so equality is exact.
-    assert_eq!(
-        whitened_data_fit, isotropic_data_fit,
-        "Euclidean whitening must reproduce the isotropic data-fit bit-for-bit"
+    // --- The activation fit is Euclidean-on-activations: both atoms present. ---
+    // Reading the lens under the Euclidean (default) metric exercises the
+    // representational presence axis with NO Fisher. Both atoms must be present
+    // (nonzero), because the Euclidean activation fit represents everything — the
+    // loud structure is NOT suppressed.
+    let euclid = RowMetric::euclidean(N, P).expect("Euclidean metric must build");
+    let euclid_report = atom_two_lens(&term, &euclid);
+    assert_eq!(euclid_report.coupling_provenance, Some(MetricProvenance::Euclidean));
+    assert!(
+        !euclid_report.coupling_available(),
+        "Euclidean provenance carries no behavioral coupling axis"
+    );
+    let loud_e = entry(&euclid_report, "loud_inert");
+    let quiet_e = entry(&euclid_report, "quiet_loadbearing");
+    assert!(
+        loud_e.presence > 0.0 && quiet_e.presence > 0.0,
+        "both atoms must be represented by the Euclidean activation fit \
+         (loud={}, quiet={})",
+        loud_e.presence,
+        quiet_e.presence
+    );
+    assert!(
+        loud_e.presence > quiet_e.presence,
+        "the loud atom is louder (higher presence) than the quiet one: {} vs {}",
+        loud_e.presence,
+        quiet_e.presence
+    );
+    // Graceful degradation: with no Fisher, coupling / discrepancy are None, and
+    // nothing is flagged (the lens is optional, the behavioral axis simply absent).
+    assert!(loud_e.coupling.is_none() && loud_e.discrepancy.is_none());
+    assert!(quiet_e.coupling.is_none() && quiet_e.discrepancy.is_none());
+    assert!(!loud_e.is_represented_not_used() && !loud_e.is_used());
+    assert!(!quiet_e.is_represented_not_used() && !quiet_e.is_used());
+
+    // --- The additive lens: Fisher enters ONLY here, as a report. ---
+    let fisher = output_fisher_metric();
+    let report = atom_two_lens(&term, &fisher);
+    assert!(matches!(
+        report.coupling_provenance,
+        Some(MetricProvenance::OutputFisher { .. })
+    ));
+    assert!(
+        report.coupling_available(),
+        "OutputFisher provenance makes the behavioral coupling axis available"
+    );
+
+    let loud = entry(&report, "loud_inert");
+    let quiet = entry(&report, "quiet_loadbearing");
+
+    let loud_coupling = loud.coupling.expect("loud coupling available under OutputFisher");
+    let quiet_coupling = quiet.coupling.expect("quiet coupling available under OutputFisher");
+    let loud_cn = loud
+        .coupling_normalized
+        .expect("loud normalized coupling available");
+    let quiet_cn = quiet
+        .coupling_normalized
+        .expect("quiet normalized coupling available");
+
+    println!("LOUD : presence={:.6} (norm {:.4})  coupling={:.6} (norm {:.4})  discrepancy={:?}",
+        loud.presence, loud.presence_normalized, loud_coupling, loud_cn, loud.discrepancy);
+    println!("QUIET: presence={:.6} (norm {:.4})  coupling={:.6} (norm {:.4})  discrepancy={:?}",
+        quiet.presence, quiet.presence_normalized, quiet_coupling, quiet_cn, quiet.discrepancy);
+
+    // PRESENCE is unchanged by the metric (it never touches Fisher): both still
+    // present, loud still louder. *Everything represented survives* — the loud
+    // atom is NOT suppressed by the presence of a Fisher metric.
+    assert!(
+        loud.presence > 0.0 && quiet.presence > 0.0,
+        "the additive lens must not suppress representation: loud={}, quiet={}",
+        loud.presence,
+        quiet.presence
+    );
+    assert!(
+        loud.presence > quiet.presence,
+        "loud is still the louder (more present) atom under the OutputFisher lens"
+    );
+
+    // COUPLING: the synthesized factors put the loud atom's behavioral mass at
+    // ~zero and the quiet atom's near its full amplitude. Normalized, quiet is
+    // the max-coupling atom (1.0) and loud is near 0.
+    assert!(
+        loud_cn < 0.05,
+        "loud atom must have ~ZERO behavioral coupling (normalized): {loud_cn}"
+    );
+    assert!(
+        quiet_cn > 0.9,
+        "quiet atom must carry HIGH behavioral coupling (normalized): {quiet_cn}"
+    );
+    assert!(
+        quiet_coupling > 50.0 * loud_coupling,
+        "quiet behavioral coupling must dominate the loud one by a wide margin: \
+         quiet={quiet_coupling} vs loud={loud_coupling}"
+    );
+
+    // HEADLINE — the loud atom is REPRESENTED-BUT-NOT-USED, and crucially it is
+    // *flagged*, not *suppressed*: its presence is still large. "Thinking it, not
+    // saying it."
+    let loud_disc = loud.discrepancy.expect("loud discrepancy available");
+    assert!(
+        loud_disc > 0.5,
+        "loud atom's discrepancy (presence − coupling) must be a large positive \
+         'represented-not-used' signal; got {loud_disc}"
+    );
+    assert!(
+        loud.is_represented_not_used(),
+        "loud atom must be FLAGGED represented-not-used"
+    );
+    assert!(
+        !loud.is_used(),
+        "loud atom must NOT read as behaviorally used"
+    );
+    // Not suppressed: it remains the most-present atom in the report.
+    assert!(
+        (loud.presence_normalized - 1.0).abs() < 1e-12,
+        "loud atom must remain maximally present (normalized presence 1.0), i.e. \
+         flagged but not removed; got {}",
+        loud.presence_normalized
+    );
+
+    // The quiet load-bearing atom reads as USED: its behavioral coupling matches
+    // or exceeds its presence (non-positive discrepancy).
+    let quiet_disc = quiet.discrepancy.expect("quiet discrepancy available");
+    assert!(
+        quiet_disc <= 0.0,
+        "quiet atom's coupling must match-or-exceed its presence (non-positive \
+         discrepancy); got {quiet_disc}"
+    );
+    assert!(
+        quiet.is_used(),
+        "quiet load-bearing atom must be FLAGGED used"
+    );
+    assert!(
+        !quiet.is_represented_not_used(),
+        "quiet atom must NOT read as represented-not-used"
+    );
+
+    // Decisive cross-over: SAME activation fit (both represented), opposite
+    // behavioral reading — selected solely by the additive Fisher report, never
+    // by the loss. This is the honest negative control for the metric design.
+    assert!(
+        loud.is_represented_not_used() && quiet.is_used(),
+        "the lens must separate represented-not-used (loud) from used (quiet)"
     );
 }
