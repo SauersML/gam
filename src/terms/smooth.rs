@@ -60,76 +60,9 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 
-// ---------------------------------------------------------------------------
-// Typed errors
-// ---------------------------------------------------------------------------
+mod error;
 
-/// Typed errors emitted by smooth-term helpers in this module. `Display`
-/// reproduces the exact pre-refactor `format!(...)` text byte-for-byte, so
-/// string-matching callers (tests, log assertions) keep working unchanged.
-/// Public boundaries that interface with `term_builder.rs` / `construction`
-/// continue to return `Result<_, String>`; typed `Err(...)` values flow
-/// through `From<SmoothError> for String` at those boundaries via `.into()`.
-#[derive(Clone, Debug)]
-pub enum SmoothError {
-    /// Spec-level configuration error: unfrozen knots/centers, invalid
-    /// numeric bounds on coefficient priors, length-scale optimizer options
-    /// that violate `min > 0 < max` / `min < max` invariants, etc.
-    InvalidConfig { reason: String },
-    /// Shape / length disagreement between design columns, penalty blocks,
-    /// coefficient ranges, directional-derivative vectors, theta length, and
-    /// other bookkeeping invariants that are checked at runtime.
-    DimensionMismatch { reason: String },
-    /// Out-of-range index into adaptive hyperparameter components, psi
-    /// derivative blocks, or non-zero block indices for single-block
-    /// custom-family impls that only support `block_idx == 0`.
-    InvalidIndex { reason: String },
-}
-
-impl std::fmt::Display for SmoothError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SmoothError::InvalidConfig { reason }
-            | SmoothError::DimensionMismatch { reason }
-            | SmoothError::InvalidIndex { reason } => f.write_str(reason),
-        }
-    }
-}
-
-impl std::error::Error for SmoothError {}
-
-impl From<SmoothError> for String {
-    fn from(err: SmoothError) -> String {
-        err.to_string()
-    }
-}
-
-impl From<crate::util::block_count::BlockCountMismatch> for SmoothError {
-    fn from(err: crate::util::block_count::BlockCountMismatch) -> SmoothError {
-        SmoothError::invalid_index(err.message())
-    }
-}
-
-impl SmoothError {
-    #[inline]
-    fn invalid_config(reason: impl Into<String>) -> Self {
-        SmoothError::InvalidConfig {
-            reason: reason.into(),
-        }
-    }
-    #[inline]
-    fn dimension_mismatch(reason: impl Into<String>) -> Self {
-        SmoothError::DimensionMismatch {
-            reason: reason.into(),
-        }
-    }
-    #[inline]
-    fn invalid_index(reason: impl Into<String>) -> Self {
-        SmoothError::InvalidIndex {
-            reason: reason.into(),
-        }
-    }
-}
+pub use error::SmoothError;
 
 fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
     match strategy {
