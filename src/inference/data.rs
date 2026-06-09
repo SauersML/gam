@@ -313,19 +313,11 @@ pub fn load_datasetwith_schema_projected(
 }
 
 // ---------------------------------------------------------------------------
-// Legacy wrappers — keep existing call-sites compiling
+// CSV convenience loader — infers the schema from the file header.
 // ---------------------------------------------------------------------------
 
 pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, DataError> {
     load_delimited_inferred(path, b',', &[])
-}
-
-pub fn load_csvwith_schema(
-    path: &Path,
-    schema: &DataSchema,
-    unseen_policy: UnseenCategoryPolicy,
-) -> Result<EncodedDataset, DataError> {
-    load_delimited_with_schema(path, b',', schema, unseen_policy, &[])
 }
 
 // ---------------------------------------------------------------------------
