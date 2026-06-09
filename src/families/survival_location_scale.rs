@@ -4127,17 +4127,30 @@ fn prepare_survival_location_scale_model(
     // present) or an active timewiggle keeps the full monotone I-spline because
     // the varying σ / wiggle DOES identify the non-affine baseline shape.
     let reduce_time_to_parametric = survival_constant_scale(spec) && protected_timewiggle_cols == 0;
+    // Log exit times for the unit-log-t warp-slope normalization (issue #892).
+    // The I-spline time basis is built over `log t` (survival_construction.rs),
+    // mapped through the same floor as `checked_log_survival_times`, so the
+    // canonical pin regresses the warp direction on these values.
+    let log_time_exit = spec.age_exit.mapv(|t| {
+        t.max(crate::families::survival_construction::SURVIVAL_TIME_FLOOR)
+            .ln()
+    });
     let mut time_prepared = prepare_identified_time_block(
         &spec.time_block,
         spec.derivative_guard,
         protected_timewiggle_cols,
         reduce_time_to_parametric,
+        log_time_exit.view(),
     )?;
 
     if time_prepared.initial_beta.is_none() {
+        // Use the AUGMENTED derivative offset (issue #892): on the pinned-warp
+        // path the guard `(X' z_c) β_c + offset' ≥ guard` is built against the
+        // folded offset, so the seed must satisfy the same offset to land
+        // feasible.
         time_prepared.initial_beta = structural_time_initial_beta_guess(
             &time_prepared.design_derivative_exit,
-            &spec.time_block.derivative_offset_exit,
+            &time_prepared.derivative_offset_exit,
             &spec.age_exit,
             spec.derivative_guard,
             time_prepared.coefficient_lower_bounds.as_ref(),
@@ -4157,10 +4170,13 @@ fn prepare_survival_location_scale_model(
             ))),
         ])?,
     )));
+    // Augmented offsets (issue #892): on the pinned-warp reduce path these carry
+    // the folded unit-log-t value/derivative contributions; on every other path
+    // they equal `spec.time_block.offset_*` verbatim.
     let time_stacked_offset = crate::linalg::utils::stack_offsets(&[
-        &spec.time_block.offset_entry,
-        &spec.time_block.offset_exit,
-        &spec.time_block.derivative_offset_exit,
+        &time_prepared.offset_entry,
+        &time_prepared.offset_exit,
+        &time_prepared.derivative_offset_exit,
     ]);
     // Canonical n-row view of the time block: `spec.design` is the n-row
     // exit design (one row per observation, len(eta_canonical) = n).
@@ -4175,7 +4191,7 @@ fn prepare_survival_location_scale_model(
     let timespec = ParameterBlockSpec {
         name: "time_transform".to_string(),
         design: time_canonical_design,
-        offset: spec.time_block.offset_exit.clone(),
+        offset: time_prepared.offset_exit.clone(),
         penalties: time_prepared
             .penalties
             .iter()
@@ -4653,7 +4669,10 @@ fn finalize_survival_location_scale_fit(
     let beta_time_reduced = fit.block_states[SurvivalLocationScaleFamily::BLOCK_TIME]
         .beta
         .clone();
-    let beta_time = prepared.time_transform.z.dot(&beta_time_reduced);
+    // Affine lift (issue #892): `β_time_raw = z · β_reduced + affine_shift`. The
+    // `affine_shift` is the pinned unit-log-t warp coefficient on the canonical
+    // gauge (zero on the non-pin/identity paths, so the lift stays plain linear).
+    let beta_time = prepared.time_transform.z.dot(&beta_time_reduced) + &prepared.time_transform.affine_shift;
     let beta_threshold_active = fit.block_states[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         .beta
         .clone();
@@ -4921,7 +4940,14 @@ fn validate_time_block(
 
 #[derive(Clone, Debug)]
 struct TimeIdentifiabilityTransform {
+    /// Maps the inner solver's reduced (active) time coefficients back to the
+    /// raw I-spline layout: `β_time_raw = z · β_time_reduced + affine_shift`.
     z: Array2<f64>,
+    /// Fixed raw-coefficient contribution folded out of the free design when the
+    /// reduced parametric-AFT warp slope is pinned to the canonical unit-log-t
+    /// gauge (issue #892). For the non-pin/identity paths this is the zero
+    /// vector (length `z.nrows()`), so the lift is the plain linear `z · β`.
+    affine_shift: Array1<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -4939,6 +4965,14 @@ struct TimeBlockPrepared {
     nullspace_dims: Vec<usize>,
     initial_beta: Option<Array1<f64>>,
     transform: TimeIdentifiabilityTransform,
+    /// Augmented geometry offsets the caller must use in place of
+    /// `spec.time_block.offset_*`. They equal the input offsets passed through
+    /// unchanged on the non-reduce / identity / non-clean-split paths, and the
+    /// input offsets plus the folded unit-log-t value/derivative contributions
+    /// when the warp slope is pinned (issue #892).
+    offset_entry: Array1<f64>,
+    offset_exit: Array1<f64>,
+    derivative_offset_exit: Array1<f64>,
 }
 
 fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalityConstraints> {
@@ -5451,11 +5485,119 @@ fn block_penalties_all_parametric_ridges(nullspace_dims: &[usize], npenalties: u
     nullspace_dims.len() == npenalties && nullspace_dims.iter().all(|&d| d == 0)
 }
 
+/// Result of pinning the reduced parametric-AFT time-warp slope to the canonical
+/// unit-log-t gauge (issue #892). `z_c` (p×1) is the kept-free row-constant
+/// direction; `z_t` (p-vector) is the pinned unit-log-t direction folded into
+/// the geometry offsets; the three `reduced_*` matrices (n×1) are the free design
+/// `X · z_c` for entry / exit / derivative-exit.
+struct PinnedTimeWarp {
+    z_c: Array2<f64>,
+    z_t: Array1<f64>,
+    reduced_entry: Array2<f64>,
+    reduced_exit: Array2<f64>,
+    reduced_derivative_exit: Array2<f64>,
+}
+
+/// Split the 2-D affine null-space basis `z` (p×2, orthonormal columns) into the
+/// row-constant location direction `z_c` (kept free) and the time-varying warp
+/// direction `z_t`, normalized so `design_exit · z_t` has unit data-scale slope
+/// versus `log t_exit` (the canonical survreg/lifelines AFT gauge). Returns
+/// `None` when the split is not clean — no usable row-constant direction
+/// (`‖z_c_raw‖` tiny) or a degenerate log-t slope (`|s|` tiny) — so the caller
+/// can fall back to the prior both-columns-free reduce behavior without
+/// regressing the non-pin case.
+fn pin_reduced_time_warp_slope(
+    z: &Array2<f64>,
+    design_entry: &Array2<f64>,
+    design_exit: &Array2<f64>,
+    design_derivative_exit: &Array2<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
+) -> Option<PinnedTimeWarp> {
+    let p = z.nrows();
+    let n = design_exit.nrows();
+    if z.ncols() != 2 || n == 0 || log_time_exit.len() != n {
+        return None;
+    }
+    // `G = design_exit · z` (n×2). The row-constant direction `a` minimizes
+    // ‖G a − 1_n‖² (least-squares constant fit): a = (GᵀG)⁻¹ Gᵀ 1_n. Solving the
+    // 2×2 normal equations in closed form keeps the helper self-contained.
+    let g = design_exit.dot(z);
+    let m00 = g.column(0).dot(&g.column(0));
+    let m01 = g.column(0).dot(&g.column(1));
+    let m11 = g.column(1).dot(&g.column(1));
+    let ones = Array1::<f64>::ones(n);
+    let r0 = g.column(0).dot(&ones);
+    let r1 = g.column(1).dot(&ones);
+    let det = m00 * m11 - m01 * m01;
+    // Scale-relative singularity guard for the 2×2 GramGram: a degenerate G has
+    // no distinct constant/time split to exploit.
+    let gram_scale = m00.max(m11).max(1.0);
+    if !det.is_finite() || det.abs() <= f64::EPSILON * gram_scale * gram_scale {
+        return None;
+    }
+    let a0 = (m11 * r0 - m01 * r1) / det;
+    let a1 = (m00 * r1 - m01 * r0) / det;
+    // `z_c_raw = z · a` (p-vector): the raw-coefficient direction whose design
+    // image `G a` is the best row-constant column. Normalize to a unit-norm
+    // basis vector so the reduced free coefficient is well scaled.
+    let z_c_raw = z.dot(&Array1::from(vec![a0, a1]));
+    let z_c_norm = z_c_raw.dot(&z_c_raw).sqrt();
+    if !z_c_norm.is_finite() || z_c_norm <= f64::EPSILON * (p as f64).sqrt() {
+        return None;
+    }
+    let z_c_vec = &z_c_raw / z_c_norm;
+    // Time-varying direction: the in-span(z) complement of `a` in the 2-D
+    // coefficient plane. With `a = [a0, a1]`, `a_perp = [-a1, a0]` is orthogonal
+    // to `a`, so `z_t_raw = z · a_perp` is the part of span(z) carrying the
+    // non-constant (log-t trend) warp.
+    let a_perp = Array1::from(vec![-a1, a0]);
+    let z_t_raw = z.dot(&a_perp);
+    // Normalize `z_t` to unit data-scale slope vs log t: regress
+    // `design_exit · z_t_raw` on centered `log_time_exit`; the slope is
+    // s = Σ(x_c · y) / Σ(x_c²), and `z_t = z_t_raw / s` makes `design_exit · z_t`
+    // rise by exactly 1 per unit of log t (so the derivative design reproduces
+    // u'(t) = 1/t, matching the unit-log-t AFT gauge).
+    let y = design_exit.dot(&z_t_raw);
+    let log_mean = log_time_exit.sum() / n as f64;
+    let mut sxx = 0.0_f64;
+    let mut sxy = 0.0_f64;
+    for i in 0..n {
+        let xc = log_time_exit[i] - log_mean;
+        sxx += xc * xc;
+        sxy += xc * y[i];
+    }
+    // Degenerate guard: no spread in log t (all exit times equal) or a flat
+    // (zero-slope) time direction leaves the slope undefined — keep the prior
+    // both-columns-free reduce behavior.
+    let y_scale = y.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
+    if !sxx.is_finite() || sxx <= f64::EPSILON {
+        return None;
+    }
+    let slope = sxy / sxx;
+    if !slope.is_finite() || slope.abs() <= f64::EPSILON * y_scale {
+        return None;
+    }
+    let z_t = &z_t_raw / slope;
+    // p×1 free design columns and the kept-free basis matrix.
+    let z_c = z_c_vec.insert_axis(ndarray::Axis(1));
+    let reduced_entry = design_entry.dot(&z_c);
+    let reduced_exit = design_exit.dot(&z_c);
+    let reduced_derivative_exit = design_derivative_exit.dot(&z_c);
+    Some(PinnedTimeWarp {
+        z_c,
+        z_t,
+        reduced_entry,
+        reduced_exit,
+        reduced_derivative_exit,
+    })
+}
+
 fn prepare_identified_time_block(
     input: &TimeBlockInput,
     derivative_guard: f64,
     monotone_time_wiggle_ncols: usize,
     reduce_to_parametric: bool,
+    log_time_exit: ndarray::ArrayView1<f64>,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
     if !input.time_monotonicity.is_coordinate_cone() {
@@ -5494,6 +5636,86 @@ fn prepare_identified_time_block(
     // that role exactly.)
     if reduce_to_parametric && let Some(z) = time_parametric_null_space_basis(&input.penalties, p) {
         let r = z.ncols();
+        // Canonical unit-log-t gauge pin (issue #892). In the reduced
+        // constant-scale parametric-AFT regime the I-spline time-warp collapses
+        // onto its 2-D affine null space `{1, log t}` (the basis is over
+        // `log t`, survival_construction.rs). The warp slope `b` in
+        // `h(t) = a + b·log t` is exactly degenerate with σ (a flat ridge), so
+        // the unconstrained direct-MLE Newton picks an arbitrary scale and
+        // miscalibrates the absolute survival curve. Fix: physically remove the
+        // slope DOF by pinning `b ≡ 1` — split `z` into the row-constant
+        // direction `z_c` (kept FREE) and the time-varying direction `z_t`
+        // (folded into the geometry offset with unit data-scale slope vs log t),
+        // matching the survreg / lifelines / flexsurv AFT gauge. The solver
+        // honors only the derivative-guard step cap, not general linear equality
+        // constraints, so the slope MUST be removed structurally rather than
+        // constrained. This fires ONLY for a clean `r == 2` split; any other
+        // rank or a degenerate split keeps the prior both-columns-free reduce
+        // behavior unchanged.
+        if r == 2
+            && z.nrows() == p
+            && let Some(pinned) = pin_reduced_time_warp_slope(
+                &z,
+                &design_entry,
+                &design_exit,
+                &design_derivative_exit,
+                log_time_exit,
+            )
+        {
+            let PinnedTimeWarp {
+                z_c,
+                z_t,
+                reduced_entry,
+                reduced_exit,
+                reduced_derivative_exit,
+            } = pinned;
+            // Augmented offsets carry the pinned unit-log-t warp out of the free
+            // design. `design_* · z_t` is the fixed value/derivative
+            // contribution of the unit-slope `log t` direction.
+            let offset_entry = &input.offset_entry + &design_entry.dot(&z_t);
+            let offset_exit = &input.offset_exit + &design_exit.dot(&z_t);
+            let derivative_offset_exit =
+                &input.derivative_offset_exit + &design_derivative_exit.dot(&z_t);
+            let reduced_derivative_design =
+                DesignMatrix::Dense(DenseDesignMatrix::from(reduced_derivative_exit.clone()));
+            // Pointwise monotonicity uses the AUGMENTED derivative offset so the
+            // guard `(X' z_c) β_c + offset' ≥ guard` accounts for the pinned
+            // warp's own (positive, unit-log-t) derivative.
+            let linear_constraints = time_derivative_guard_constraints(
+                &reduced_derivative_design,
+                &derivative_offset_exit,
+                derivative_guard,
+            )?;
+            // Project the caller seed onto the single free constant direction.
+            // The pinned warp lives entirely in the offset, so the reduced seed
+            // only needs the `z_c` component.
+            let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
+                (Some(constraints), Some(beta0)) => Some(project_onto_linear_constraints(
+                    1,
+                    constraints,
+                    Some(&z_c.t().dot(beta0)),
+                )?),
+                (_, Some(beta0)) => Some(z_c.t().dot(beta0)),
+                _ => None,
+            };
+            return Ok(TimeBlockPrepared {
+                design_entry: reduced_entry,
+                design_exit: reduced_exit,
+                design_derivative_exit: reduced_derivative_exit,
+                coefficient_lower_bounds: None,
+                linear_constraints,
+                penalties: Vec::new(),
+                nullspace_dims: Vec::new(),
+                initial_beta,
+                transform: TimeIdentifiabilityTransform {
+                    z: z_c,
+                    affine_shift: z_t,
+                },
+                offset_entry,
+                offset_exit,
+                derivative_offset_exit,
+            });
+        }
         let reduced_entry = design_entry.dot(&z);
         let reduced_exit = design_exit.dot(&z);
         let reduced_derivative_exit = design_derivative_exit.dot(&z);
@@ -5540,7 +5762,15 @@ fn prepare_identified_time_block(
             penalties: reduced_penalties,
             nullspace_dims: reduced_nullspace_dims,
             initial_beta,
-            transform: TimeIdentifiabilityTransform { z },
+            // Non-clean split (r != 2 or degenerate constant/time split): keep
+            // both affine columns free with no pinned warp, offsets passthrough.
+            transform: TimeIdentifiabilityTransform {
+                z,
+                affine_shift: Array1::zeros(p),
+            },
+            offset_entry: input.offset_entry.clone(),
+            offset_exit: input.offset_exit.clone(),
+            derivative_offset_exit: input.derivative_offset_exit.clone(),
         });
     }
 
@@ -5582,7 +5812,15 @@ fn prepare_identified_time_block(
         penalties,
         nullspace_dims: input.nullspace_dims.clone(),
         initial_beta,
-        transform: TimeIdentifiabilityTransform { z: Array2::eye(p) },
+        // Identity (non-reduce) path: the raw time block passes through
+        // unchanged, so the lift is `z = I`, no pinned warp, offsets verbatim.
+        transform: TimeIdentifiabilityTransform {
+            z: Array2::eye(p),
+            affine_shift: Array1::zeros(p),
+        },
+        offset_entry: input.offset_entry.clone(),
+        offset_exit: input.offset_exit.clone(),
+        derivative_offset_exit: input.derivative_offset_exit.clone(),
     })
 }
 
@@ -12941,7 +13179,8 @@ mod tests {
             initial_beta: None,
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
+                .expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
@@ -12967,7 +13206,8 @@ mod tests {
         };
 
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
+                .expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -13012,13 +13252,25 @@ mod tests {
             initial_beta: Some(array![0.5, 0.2, 9.0]),
         };
 
+        // log(t_exit) for the unit-log-t warp-slope pin (issue #892).
+        let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, true).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, true, log_time_exit.view())
+                .expect("prepare time block");
+        // Canonical gauge pin (#892): the warp slope is folded into the offset,
+        // so the FREE time block collapses to the single row-constant direction.
+        // The identifiability map is now p×1 (was p×2), with the pinned unit-log-t
+        // warp carried by `affine_shift` rather than a free column.
         assert_eq!(prepared.transform.z.nrows(), 3);
-        assert_eq!(prepared.transform.z.ncols(), 2);
-        assert_eq!(prepared.design_entry.ncols(), 2);
-        assert_eq!(prepared.design_exit.ncols(), 2);
-        assert_eq!(prepared.design_derivative_exit.ncols(), 2);
+        assert_eq!(prepared.transform.z.ncols(), 1);
+        assert_eq!(prepared.transform.affine_shift.len(), 3);
+        assert!(
+            prepared.transform.affine_shift.iter().any(|&v| v.abs() > 1e-9),
+            "pinned warp must contribute a non-zero unit-log-t affine_shift"
+        );
+        assert_eq!(prepared.design_entry.ncols(), 1);
+        assert_eq!(prepared.design_exit.ncols(), 1);
+        assert_eq!(prepared.design_derivative_exit.ncols(), 1);
         assert!(prepared.coefficient_lower_bounds.is_none());
         // The reduced block lives on the penalty null space, so `zᵀ S z` is
         // exactly zero: there is no curvature left to penalize. An unpenalized
@@ -13034,6 +13286,80 @@ mod tests {
         assert!(
             prepared.nullspace_dims.is_empty(),
             "reduced parametric time block carries no penalty null-space bookkeeping"
+        );
+    }
+
+    #[test]
+    fn pinned_time_warp_affine_lift_round_trips() {
+        // Golden round-trip (issue #892): on a rank-clean pinned reduced fit the
+        // raw time coefficients must be reconstructed EXACTLY through the affine
+        // transform `β_raw = z · β_reduced + affine_shift`. A wrong lift silently
+        // corrupts every reported survival time-coefficient, so this guards the
+        // finalize math directly. Choose a known reduced free coefficient `θ` and
+        // verify the lifted raw coefficient reproduces both the free constant
+        // direction (`θ · z_c`) and the pinned unit-log-t warp (`affine_shift`),
+        // and that the design image `X · β_raw` equals
+        // `(X · z_c) θ + X · affine_shift` (the free design plus the folded
+        // offset), which is what the geometry actually consumes.
+        let design_entry = array![[1.0, 0.0, 0.2], [1.0, 1.0, 0.5], [1.0, 2.0, 1.0]];
+        let design_exit = array![[1.0, 0.5, 0.3], [1.0, 1.5, 0.8], [1.0, 2.5, 1.4]];
+        let design_derivative_exit = array![[0.0, 1.0, 0.2], [0.0, 1.0, 0.3], [0.0, 1.0, 0.4]];
+        let time_block = TimeBlockInput {
+            design_entry: DesignMatrix::from(design_entry.clone()),
+            design_exit: DesignMatrix::from(design_exit.clone()),
+            design_derivative_exit: DesignMatrix::from(design_derivative_exit.clone()),
+            offset_entry: Array1::zeros(3),
+            offset_exit: Array1::zeros(3),
+            derivative_offset_exit: Array1::from_elem(3, 1e-6),
+            time_monotonicity: TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            penalties: vec![array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]]],
+            nullspace_dims: vec![],
+            initial_log_lambdas: None,
+            initial_beta: None,
+        };
+        let log_time_exit = array![0.0_f64, 0.405_465_108, 0.916_290_731];
+        let prepared =
+            prepare_identified_time_block(&time_block, 1e-6, 0, true, log_time_exit.view())
+                .expect("prepare time block");
+        // Pin fired: single free column + non-zero pinned warp.
+        assert_eq!(prepared.transform.z.ncols(), 1);
+        let theta = array![0.731_f64];
+        let beta_raw =
+            prepared.transform.z.dot(&theta) + &prepared.transform.affine_shift;
+        // β_raw equals the free contribution plus the pinned warp, exactly.
+        let expected_raw =
+            &(&prepared.transform.z.column(0).to_owned() * theta[0]) + &prepared.transform.affine_shift;
+        for (got, want) in beta_raw.iter().zip(expected_raw.iter()) {
+            assert!(
+                (got - want).abs() <= 1e-12,
+                "affine lift must reconstruct raw coefficients exactly: got {got}, want {want}"
+            );
+        }
+        // The raw design image matches free-design·θ + augmented offset delta,
+        // i.e. what the solver geometry sees: X·β_raw = (X·z_c)·θ + X·z_t.
+        let raw_image = design_exit.dot(&beta_raw);
+        let folded = &prepared.design_exit.column(0).to_owned() * theta[0]
+            + &(&prepared.offset_exit - &time_block.offset_exit);
+        for (got, want) in raw_image.iter().zip(folded.iter()) {
+            assert!(
+                (got - want).abs() <= 1e-9,
+                "raw design image must equal free image plus folded offset: got {got}, want {want}"
+            );
+        }
+        // The folded exit offset has unit slope vs log t (the canonical gauge).
+        let delta = &prepared.offset_exit - &time_block.offset_exit;
+        let log_mean = log_time_exit.sum() / 3.0;
+        let mut sxx = 0.0_f64;
+        let mut sxy = 0.0_f64;
+        for i in 0..3 {
+            let xc = log_time_exit[i] - log_mean;
+            sxx += xc * xc;
+            sxy += xc * (delta[i] - delta.sum() / 3.0);
+        }
+        assert!(
+            (sxy / sxx - 1.0).abs() <= 1e-9,
+            "pinned warp must have unit data-scale slope vs log t, got {}",
+            sxy / sxx
         );
     }
 
@@ -13062,7 +13388,8 @@ mod tests {
             initial_beta: Some(array![-0.5, 0.2, -1.5]),
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
+                .expect("prepare time block");
         assert_eq!(
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0])
@@ -13108,7 +13435,8 @@ mod tests {
             initial_beta: Some(array![-0.5, 0.2, -1.5, -2.0]),
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 1, false).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 1, false, array![0.0_f64, 0.5, 1.0].view())
+                .expect("prepare time block");
         assert_eq!(
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0, 0.0])
@@ -13140,7 +13468,13 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let err = match prepare_identified_time_block(&time_block, 1e-6, 0, false) {
+        let err = match prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            false,
+            array![0.0_f64, 0.5, 1.0].view(),
+        ) {
             Ok(_) => panic!("offsets below the guard must be rejected"),
             Err(err) => err,
         };
@@ -13544,7 +13878,8 @@ mod tests {
             initial_beta: None,
         };
         let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false).expect("prepare time block");
+            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
+                .expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
