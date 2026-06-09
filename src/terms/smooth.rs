@@ -4349,14 +4349,28 @@ mod convex_divided_difference_transform_tests {
     #[test]
     fn uniform_greville_matches_integer_transform_up_to_column_scale() {
         // Uniformly spaced abscissae must reproduce the integer second-difference
-        // transform up to a positive per-column scale (so the γ ≥ 0 cone is
-        // identical), guaranteeing no regression on the common uniform case.
+        // transform on the *cone coordinates* up to a positive per-column scale,
+        // so the γ ≥ 0 convexity cone (columns c ≥ 2) is identical — guaranteeing
+        // no regression on the common uniform case.
+        //
+        // The two *affine* columns (c ∈ {0, 1}) are NOT individually column-scaled
+        // multiples of the plain transform's first two columns: the divided-
+        // difference transform parameterizes the affine null space as
+        // θ_j = γ_0 + γ_1·(ξ_j − ξ_0) (a genuine level + slope), whereas the plain
+        // double-cumulative-sum's column 0 is the discrete second integral of e_0,
+        // a non-constant ramp θ_{i,0} = i + 1. Both bases span the *same* 2-D space
+        // of vectors affine in ξ, so the cone (which lives entirely on c ≥ 2) is
+        // unchanged. The correct uniform-reduction identity is therefore: per-column
+        // positive scale on the cone columns, and affine-subspace equality on the
+        // first two columns — asserting a per-column scale there would be wrong.
         let p = 7;
         let g = Array1::from_iter((0..p).map(|i| i as f64));
         for &sign in &[1.0_f64, -1.0] {
             let t = convex_divided_difference_transform_matrix(&g, sign).unwrap();
             let plain = cumulative_sum_transform_matrix(p, 2, sign);
-            for c in 0..p {
+
+            // Cone coordinates (c ≥ 2): identical up to a positive per-column scale.
+            for c in 2..p {
                 // Find a non-zero reference entry in the plain column to fix the scale.
                 let mut scale: Option<f64> = None;
                 for i in 0..p {
@@ -4365,12 +4379,40 @@ mod convex_divided_difference_transform_tests {
                         break;
                     }
                 }
-                if let Some(s) = scale {
-                    assert!(s > 0.0, "column {c} scale must be positive, got {s}");
+                let s = scale.expect("plain cone column must have a non-zero entry");
+                assert!(s > 0.0, "column {c} scale must be positive, got {s}");
+                for i in 0..p {
+                    assert!(
+                        (t[[i, c]] - s * plain[[i, c]]).abs() < 1e-9,
+                        "uniform reduction mismatch at ({i},{c})"
+                    );
+                }
+            }
+
+            // Affine columns (c ∈ {0, 1}): each column of *both* transforms must be
+            // exactly affine in the abscissae ξ (i.e. lie in span{1, ξ}). With p ≥ 3
+            // the affine fit is overdetermined, so an exact fit on all p rows proves
+            // the column lies in the 2-D affine null space — hence the two transforms
+            // share that null space and the convexity cone is identical.
+            for c in 0..2usize {
+                for col in [&t, &plain] {
+                    // Closed-form least-squares fit of θ_i = a + b·g_i, then assert
+                    // the residual is zero (an exact affine relation).
+                    let n = p as f64;
+                    let sum_g: f64 = g.iter().copied().sum();
+                    let sum_gg: f64 = g.iter().map(|&x| x * x).sum();
+                    let sum_y: f64 = (0..p).map(|i| col[[i, c]]).sum();
+                    let sum_gy: f64 = (0..p).map(|i| g[i] * col[[i, c]]).sum();
+                    let det = n * sum_gg - sum_g * sum_g;
+                    let b = (n * sum_gy - sum_g * sum_y) / det;
+                    let a = (sum_y - b * sum_g) / n;
                     for i in 0..p {
+                        let fit = a + b * g[i];
                         assert!(
-                            (t[[i, c]] - s * plain[[i, c]]).abs() < 1e-9,
-                            "uniform reduction mismatch at ({i},{c})"
+                            (col[[i, c]] - fit).abs() < 1e-9,
+                            "affine column {c} entry {i} is not affine in ξ: \
+                             got {}, affine fit {fit}",
+                            col[[i, c]]
                         );
                     }
                 }
