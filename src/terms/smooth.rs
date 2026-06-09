@@ -28751,7 +28751,20 @@ mod tests {
                         nullspace_order: DuchonNullspaceOrder::Degree(2),
                         identifiability: SpatialIdentifiability::default(),
                         aniso_log_scales: None,
-                        operator_penalties: DuchonOperatorPenaltySpec::default(),
+                        // Truly "pure" Duchon: every operator dial off, leaving
+                        // only the always-on `Primary` RKHS Gram. The Charbonnier
+                        // adaptive overlay reweights the {mass, tension, curvature}
+                        // operator triplet, with `Primary` substituting for the
+                        // explicit `Stiffness` D2 (see the curvature-channel
+                        // comment in `extract_spatial_operator_runtime_caches`):
+                        // when mass and tension are also off the cache requires
+                        // none of the three operators, so the overlay's dispatch
+                        // gate yields an empty `runtime_caches` and the adaptive
+                        // path is skipped. `DuchonOperatorPenaltySpec::default()`
+                        // ships mass + tension active, which DOES feed the
+                        // overlay (Primary as curvature) and so is NOT the "pure"
+                        // case under test here.
+                        operator_penalties: DuchonOperatorPenaltySpec::all_disabled(),
                         periodic: None,
                         boundary: OneDimensionalBoundary::Open,
                     },
@@ -28771,17 +28784,6 @@ mod tests {
             LikelihoodSpec::gaussian_identity(),
             &FitOptions {
                 compute_inference: false,
-                // The scale-free Duchon mass candidate is now the centered
-                // design Gram at data points (commit 718810d1), which has
-                // an exact zero eigenvalue in the constant direction
-                // instead of the rank-full collocation Gram the test was
-                // first calibrated against. The outer REML iteration
-                // sees a rank-deficient `S_mass` and converges in a few
-                // more iterations than under the old construction; the
-                // *fit quality* matches (final grad norm ≈ 6e-5 at iter
-                // 18). Budget bumped to 28 so the convergence check
-                // stays a real assertion rather than an iter-budget
-                // artefact.
                 max_iter: 28,
                 tol: 1e-5,
                 adaptive_regularization: Some(AdaptiveRegularizationOptions {
@@ -28798,14 +28800,16 @@ mod tests {
         )
         .expect("pure Duchon exact adaptive fit should succeed");
 
-        // The Charbonnier spatial-adaptive overlay reweights the full
-        // mass/tension/stiffness operator triplet. A redesigned Duchon basis
-        // deliberately ships its exact RKHS `Primary` curvature plus the lower
-        // mass/tension dials — never the stiffness order — so it does not carry
-        // the triplet the overlay consumes (see `extract_spatial_operator_runtime_caches`,
-        // which has no Duchon arm). Requesting adaptive regularization on a pure
-        // Duchon must therefore still fit finitely, but produces no operator-triplet
-        // overlay: only Matérn collocation bases feed the adaptive path.
+        // Pure Duchon (every operator dial off) ships only the always-on `Primary`
+        // RKHS Gram. The Charbonnier spatial-adaptive overlay consumes a
+        // {mass, tension, curvature} operator triplet, so with no operator
+        // penalties shipped the per-term cache gate in
+        // `extract_spatial_operator_runtime_caches` rejects the term and the
+        // overlay's runtime-caches set is empty — the adaptive path is skipped
+        // and the fit collapses to the plain quadratic REML over the lone
+        // `Primary` penalty. (Default Duchon — `DuchonOperatorPenaltySpec::default()`
+        // — does feed the overlay because mass + tension are active and Primary
+        // substitutes for the Stiffness curvature channel, per #858.)
         assert!(
             fit.adaptive_diagnostics.is_none(),
             "pure Duchon carries no operator triplet, so the Charbonnier overlay must not run"
