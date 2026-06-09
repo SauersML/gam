@@ -170,6 +170,11 @@ impl RiemannianTrustRegion {
         // so we clamp the initial radius into `(0, max_radius]` here.
         let mut delta = self.radius.min(self.max_radius);
 
+        // Initial Riemannian gradient norm, captured on the first iteration and
+        // used as the shift-invariant scale in the relative stationarity test
+        // (see `relative_stationarity`).
+        let mut grad0_norm: Option<f64> = None;
+
         for _ in 0..self.max_iter {
             let (f_curr, grad_e) = objective.value_gradient(x.view())?;
             // Raise the ambient Euclidean differential to the *Riemannian*
@@ -181,26 +186,20 @@ impl RiemannianTrustRegion {
             // step not first-order correct (issue #955).
             let grad = manifold.riemannian_gradient(x.view(), grad_e.view())?;
             let grad_norm = g_norm(manifold, x.view(), grad.view())?;
-            // Scale-aware (relative) stationarity test. Comparing the bare
+            // Shift-invariant (relative) stationarity test. Comparing the bare
             // gradient norm to a fixed absolute `grad_tol` is mis-calibrated for
             // objectives whose natural scale is large — e.g. the *profiled*
             // Gaussian REML latent objective, whose `n·log σ̂²` term leaves
             // `‖grad‖` at an O(n) magnitude even at a genuine stationary point
             // near interpolation (issue #879). We instead test the dimensionless
-            // relative gradient
-            //
-            //   ‖grad‖_g · ‖x‖_typ / max(|f|, 1) ≤ grad_tol,
-            //
-            // where `‖grad‖_g` carries units of f/x, `‖x‖_typ` is the iterate's
-            // characteristic magnitude (RMS, floored at 1) and `max(|f|, 1)` the
-            // objective's. This divides out the common scale both the objective
-            // and its gradient inherit, so `grad_tol` is a true *relative*
-            // tolerance: it detects stationarity (the ratio → 0 only as the
-            // gradient vanishes relative to scale) without prematurely stopping
-            // on a non-stationary iterate (whose ratio stays O(1)). On a
-            // unit-scale objective `‖x‖_typ = 1` and `max(|f|,1)` reduces this to
-            // the absolute test, leaving those paths unchanged.
-            if relative_stationarity(grad_norm, x.view(), f_curr) <= self.grad_tol {
+            // ratio `‖grad_k‖_g / max(‖grad_0‖_g, 1)`, where `‖grad_0‖_g` is the
+            // gradient norm at the initial iterate. It carries the same
+            // *multiplicative* scale the objective and its gradient share but is
+            // invariant under an additive shift `f → f + C` (unlike `max(|f|,1)`,
+            // which a large constant inflates into a false convergence, #954),
+            // and reduces to the absolute test on a unit-scale objective.
+            let grad0 = *grad0_norm.get_or_insert(grad_norm);
+            if relative_stationarity(grad_norm, grad0) <= self.grad_tol {
                 break;
             }
 
@@ -451,6 +450,9 @@ impl RiemannianLBFGS {
         // recursion, and Armijo slope are all metric inner products, so they
         // must operate on the true Riemannian gradient.
         let mut grad = manifold.riemannian_gradient(x.view(), grad_e0.view())?;
+        // Initial Riemannian gradient norm: the shift-invariant scale of the
+        // relative stationarity test (see `relative_stationarity`).
+        let grad0_norm = g_norm(manifold, x.view(), grad.view())?;
         let armijo_c: f64 = 1.0e-4;
         let alpha_min: f64 = 1.0e-16;
         let alpha_max: f64 = 1.0e16;
@@ -460,14 +462,15 @@ impl RiemannianLBFGS {
             1.0
         };
         for _ in 0..self.max_iter {
-            // Scale-aware (relative) stationarity test, identical in form to the
-            // trust region's (see `relative_stationarity`): a fixed `grad_tol`
-            // reads as a *relative* tolerance so a large-scale objective (e.g.
-            // the profiled REML latent objective, issue #879) is not perpetually
-            // flagged non-stationary. Reduces to the absolute test on a
-            // unit-scale objective.
+            // Shift-invariant (relative) stationarity test, identical in form to
+            // the trust region's (see `relative_stationarity`): the current
+            // gradient norm is measured against the initial one, so a fixed
+            // `grad_tol` reads as a *relative* tolerance for a large-scale
+            // objective (e.g. the profiled REML latent objective, issue #879)
+            // while staying invariant under an additive shift of `f` (#954).
+            // Reduces to the absolute test on a unit-scale objective.
             let grad_norm = g_norm(manifold, x.view(), grad.view())?;
-            if relative_stationarity(grad_norm, x.view(), f_curr) <= self.grad_tol {
+            if relative_stationarity(grad_norm, grad0_norm) <= self.grad_tol {
                 break;
             }
             let direction = two_loop(manifold, x.view(), grad.view(), &history)?;
