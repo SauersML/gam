@@ -3055,9 +3055,20 @@ impl FittedModel {
                 let beta_mu = gaussian_location_scale_mean_beta(fit)?;
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                // The log-σ coefficients were mapped to raw response units by
+                // shifting the intercept by `+ln(response_scale)`, which scales
+                // only the `exp(η)` term. The σ floor must be scaled separately
+                // so reconstructed σ is response-scale-equivariant (#884): use
+                // `LOGB_SIGMA_FLOOR · response_scale` (≈ 1 % of the response
+                // spread). A model fitted without standardization persists
+                // `gaussian_response_scale = 1`, recovering the raw floor.
+                let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
+                let sigma_floor =
+                    crate::families::sigma_link::LOGB_SIGMA_FLOOR * response_scale;
                 Some(Box::new(GaussianLocationScalePredictor {
                     beta_mu,
                     beta_noise,
+                    sigma_floor,
                     covariance: fit.beta_covariance().cloned(),
                     link_wiggle: runtime.link_wiggle,
                 }) as Box<dyn PredictableModel>)

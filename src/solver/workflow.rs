@@ -1608,12 +1608,18 @@ fn gaussian_response_sample_std(v: ArrayView1<'_, f64>) -> f64 {
 /// Reconstructing raw outputs requires
 ///
 ///   μ_raw  = s · μ_internal           ⇒ scale every Location/Mean coefficient by `s`,
-///   σ_raw  = s · σ_internal           ⇒ since σ = 0.01 + exp(η_σ), shifting the
+///   σ_raw  = s · σ_internal           ⇒ since σ = b + exp(η_σ), shifting the
 ///                                         log-σ **intercept** by `+ln(s)` turns
-///                                         `0.01 + exp(η)` into `0.01 + s·exp(η)`
-///                                         = s·σ_internal − 0.01·(s−1); the residual
-///                                         floor error `0.01·(s−1)` is negligible
-///                                         because σ ≫ floor in every realistic fit.
+///                                         `b + exp(η)` into `b + s·exp(η)`; the
+///                                         multiplicative `exp(η)` part is now
+///                                         correct, but the **floor must also be
+///                                         scaled** to `s·b` so the reconstructed
+///                                         σ = s·b + exp(η_raw) = s·σ_internal is
+///                                         response-scale-equivariant (#884). The
+///                                         floor cannot ride the intercept shift
+///                                         (it sits outside the exp), so consumers
+///                                         reconstruct with floor `s·LOGB_SIGMA_FLOOR`
+///                                         (see `GaussianLocationScalePredictor`).
 ///
 /// The link-wiggle lives on the mean (identity) channel, so its knots and
 /// coefficients scale by `s` exactly like the Location block. Doing the remap
