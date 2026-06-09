@@ -1675,15 +1675,13 @@ fn predict_survival_location_scale_batch(
     if reduced_parametric_aft {
         // The warp is removed in this regime (`h ≡ 0`); the σ-scaled log-t baseline
         // rides the location channel via the `−log t` threshold shift applied
-        // below. Drop the time-warp design (the fit carried zero free time
-        // columns) and zero the time offsets so `h_base = 0`.
-        let zero_cols = Array2::<f64>::zeros((eval_exit.len(), 0));
-        time_build.x_entry_time = DesignMatrix::from(zero_cols.clone());
-        time_build.x_exit_time = DesignMatrix::from(zero_cols.clone());
-        time_build.x_derivative_time = DesignMatrix::from(zero_cols);
-        eta_offset_entry = Array1::<f64>::zeros(eval_entry.len());
+        // below. Drop the exit time-warp design to zero columns (matching the
+        // empty `beta_time`) and zero its value offset so `h_base = 0`. The
+        // derivative is handled separately from `inv_sigma / t` in the hazard
+        // computation, so the (unused-here) entry/derivative designs and offsets
+        // are left as built.
+        time_build.x_exit_time = DesignMatrix::from(Array2::<f64>::zeros((eval_exit.len(), 0)));
         eta_offset_exit = Array1::<f64>::zeros(eval_exit.len());
-        derivative_offset_exit = Array1::<f64>::zeros(eval_exit.len());
     }
 
     let saved_timewiggle_runtime = model.saved_baseline_time_wiggle()?;
