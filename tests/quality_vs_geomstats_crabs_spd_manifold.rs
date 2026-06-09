@@ -1,7 +1,11 @@
 //! End-to-end OBJECTIVE quality: gam's affine-invariant SPD manifold primitives
 //! (`exp_map` / `log_map` / `metric_tensor`) must reproduce the affine-invariant
 //! Riemannian geometry of real-data covariance matrices to LAPACK precision,
-//! checked against Python **geomstats** as MATHEMATICAL GROUND TRUTH.
+//! checked against the ANALYTIC affine-invariant distance closed form the test
+//! constructs itself — NOT against geomstats' output. geomstats' affine-invariant
+//! `metric.dist` carries the same eigendecomposition-convention / cut-locus risk
+//! as its Grassmann projector distance (#904), so it is only an informational
+//! match-or-beat baseline here, never the ground truth.
 //!
 //! Source data: the Leptograpsus crabs morphology dataset (`MASS::crabs`),
 //!   https://raw.githubusercontent.com/vincentarelbundock/Rdatasets/master/csv/MASS/crabs.csv
@@ -15,21 +19,24 @@
 //! summarising them by a Fréchet (Karcher) mean, is the canonical applied use
 //! of this manifold.
 //!
-//! Ground-truth comparators (geomstats, the affine-invariant SPD geodesic is an
-//! exact closed form — geomstats is independent mathematical truth, not a noisy
-//! peer fit):
+//! Self-constructed ground truth + intrinsic axioms (geomstats only informational):
 //!
-//!   1. GEODESIC DISTANCE MATRIX. The full 4×4 matrix of pairwise
+//!   1. GEODESIC DISTANCE MATRIX vs ANALYTIC TRUTH. The full 4×4 matrix of pairwise
 //!      affine-invariant distances `d(Pᵢ, Pⱼ) = ‖log_{Pᵢ}(Pⱼ)‖_{Pᵢ}`, computed
-//!      entirely with gam's `log_map` + `metric_tensor`, must match
-//!      `SPDMatrices(5)` under `SPDAffineMetric` (`metric.dist`) to a tight
-//!      absolute tolerance.
+//!      entirely with gam's `log_map` + `metric_tensor`, must equal the EXACT
+//!      closed form `d(A, B) = √(Σ_i log²(λ_i))` — λ_i the generalized eigenvalues
+//!      of `(A, B)` (eigenvalues of `A^{-1/2} B A^{-1/2}`) — which the test
+//!      computes itself in Rust from the covariances, to a tight absolute
+//!      tolerance. geomstats' `metric.dist` is reported only as an informational
+//!      match-or-beat, never asserted as truth.
 //!
-//!   2. FRÉCHET (KARCHER) MEAN. The affine-invariant center of mass of the four
-//!      covariances — computed via gam's canonical gradient fixed point
-//!      `P ← exp_P((1/M) Σ_i log_P(Xᵢ))` — must match geomstats'
-//!      `FrechetMean(SPDMatrices(5), SPDAffineMetric).fit(...).estimate_` to a
-//!      tight relative tolerance.
+//!   2. FRÉCHET (KARCHER) MEAN — INTRINSIC + MATCH-OR-BEAT. The affine-invariant
+//!      Karcher mean has no elementary closed form, so gam's center (the gradient
+//!      fixed point `P ← exp_P((1/M) Σ_i log_P(Xᵢ))`) is pinned by (a) the
+//!      intrinsic first-order optimality axiom below and (b) a match-or-beat on
+//!      the Fréchet variance objective: gam's mean squared geodesic distance must
+//!      be no worse than geomstats' `FrechetMean` achieves. We never assert
+//!      gam == geomstats' center.
 //!
 //! Two intrinsic ground-truth axioms (no reference involved) sharpen the claim:
 //!
@@ -120,6 +127,102 @@ fn sample_covariance(rows: &[[f64; P]]) -> Array2<f64> {
     }
     cov /= (n - 1) as f64;
     symmetrize(&cov)
+}
+
+/// Symmetric-eigenvalue solver (cyclic Jacobi) for a small SPD/symmetric matrix;
+/// returns `(eigenvalues_descending, eigenvectors_as_columns)`. Used to build the
+/// ANALYTIC affine-invariant SPD distance closed form in Rust — no external
+/// linear-algebra crate, no dependency on gam's own maps, so it is an independent
+/// ground-truth calculator.
+fn sym_eig(mat: &Array2<f64>) -> (Vec<f64>, Array2<f64>) {
+    let m = mat.nrows();
+    let mut a = mat.clone();
+    let mut v = Array2::<f64>::eye(m);
+    for _ in 0..200 {
+        let mut off = 0.0;
+        for p in 0..m {
+            for q in (p + 1)..m {
+                off += a[[p, q]] * a[[p, q]];
+            }
+        }
+        if off < 1e-30 {
+            break;
+        }
+        for p in 0..m {
+            for q in (p + 1)..m {
+                if a[[p, q]].abs() < 1e-300 {
+                    continue;
+                }
+                let theta = (a[[q, q]] - a[[p, p]]) / (2.0 * a[[p, q]]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for r in 0..m {
+                    let arp = a[[r, p]];
+                    let arq = a[[r, q]];
+                    a[[r, p]] = c * arp - s * arq;
+                    a[[r, q]] = s * arp + c * arq;
+                }
+                for r in 0..m {
+                    let apr = a[[p, r]];
+                    let aqr = a[[q, r]];
+                    a[[p, r]] = c * apr - s * aqr;
+                    a[[q, r]] = s * apr + c * aqr;
+                }
+                for r in 0..m {
+                    let vrp = v[[r, p]];
+                    let vrq = v[[r, q]];
+                    v[[r, p]] = c * vrp - s * vrq;
+                    v[[r, q]] = s * vrp + c * vrq;
+                }
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..m).collect();
+    let evals: Vec<f64> = (0..m).map(|i| a[[i, i]]).collect();
+    order.sort_by(|&x, &y| evals[y].partial_cmp(&evals[x]).unwrap());
+    let evals_sorted: Vec<f64> = order.iter().map(|&i| evals[i]).collect();
+    let mut vecs = Array2::<f64>::zeros((m, m));
+    for (newc, &oldc) in order.iter().enumerate() {
+        for r in 0..m {
+            vecs[[r, newc]] = v[[r, oldc]];
+        }
+    }
+    (evals_sorted, vecs)
+}
+
+/// ANALYTIC affine-invariant SPD geodesic distance — the self-constructed math
+/// ground truth (NOT geomstats): `d(A, B) = √(Σ_i log²(λ_i))`, where `λ_i` are
+/// the eigenvalues of `A^{-1/2} B A^{-1/2}` (equivalently the generalized
+/// eigenvalues of the pair `(A, B)`). `A^{-1/2}` is formed from `A`'s own
+/// eigendecomposition `A = V diag(α) Vᵀ`, so the whole quantity is a closed-form
+/// function of the two SPD matrices the test already holds.
+fn spd_affine_distance(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
+    let (alpha, va) = sym_eig(a);
+    // A^{-1/2} = V diag(α^{-1/2}) Vᵀ (A is SPD, so every α_i > 0).
+    let mut a_inv_half = Array2::<f64>::zeros((P, P));
+    for i in 0..P {
+        for j in 0..P {
+            let mut acc = 0.0;
+            for k in 0..P {
+                acc += va[[i, k]] * (1.0 / alpha[k].sqrt()) * va[[j, k]];
+            }
+            a_inv_half[[i, j]] = acc;
+        }
+    }
+    // C = A^{-1/2} B A^{-1/2}; its eigenvalues are the generalized eigenvalues of
+    // (A, B). Symmetrize to clean the Jacobi solver's off-diagonal round-off.
+    let c = a_inv_half.dot(b).dot(&a_inv_half);
+    let c = symmetrize(&c);
+    let (lambda, _) = sym_eig(&c);
+    lambda
+        .iter()
+        .map(|&l| {
+            let lg = l.max(f64::MIN_POSITIVE).ln();
+            lg * lg
+        })
+        .sum::<f64>()
+        .sqrt()
 }
 
 /// Squared affine-invariant geodesic distance `d²(P, X) = ‖log_P(X)‖²_P`,
@@ -235,13 +338,20 @@ fn crabs_group_covariances_match_geomstats_spd_geometry() {
     // first group against each other group implicitly Cholesky-checks them).
 
     // ---- (1) gam pairwise affine-invariant geodesic distance matrix -------
+    // alongside the ANALYTIC closed-form distance matrix the test computes itself
+    // from the covariances (√(Σ log²(λ_i)) of the generalized eigenvalues) — the
+    // self-constructed math ground truth gam must reproduce, NOT geomstats.
     let mut gam_dist = vec![0.0_f64; M * M];
+    let mut analytic_dist = vec![0.0_f64; M * M];
     for i in 0..M {
         for j in 0..M {
             let d2 = gam_sq_dist(&spd, flat_covs[i].view(), flat_covs[j].view());
             gam_dist[i * M + j] = d2.max(0.0).sqrt();
+            analytic_dist[i * M + j] = spd_affine_distance(&covs[i], &covs[j]);
         }
     }
+    // gam vs the ANALYTIC closed form — the PRIMARY ground-truth comparison.
+    let dist_vs_analytic = max_abs_diff(&gam_dist, &analytic_dist);
 
     // ---- (3) INTRINSIC metric axioms on gam's distance matrix -------------
     let mut max_diag = 0.0_f64;
@@ -290,6 +400,19 @@ fn crabs_group_covariances_match_geomstats_spd_geometry() {
         "gam's SPD center is not a Fréchet mean: residual Riemannian gradient \
          norm ‖(1/M)Σ log_P(Xᵢ)‖_P = {grad_norm:.3e} (>=1e-7)"
     );
+
+    // gam's Fréchet variance (mean squared geodesic distance from its center to
+    // the four covariances), measured with the SELF-CONSTRUCTED analytic distance
+    // — the objective the Karcher mean minimizes, on which geomstats is a
+    // match-or-beat baseline below (never a center gam must echo).
+    let gam_frechet_variance: f64 = covs
+        .iter()
+        .map(|c| {
+            let d = spd_affine_distance(&gam_mean, c);
+            d * d
+        })
+        .sum::<f64>()
+        / M as f64;
 
     // ---- geomstats GROUND TRUTH on the IDENTICAL covariances --------------
     // Hand Python the raw 200×5 measurements plus the group-id column; it forms
@@ -352,12 +475,16 @@ for i in range(M):
         D[i, j] = float(metric.dist(covs[i], covs[j]))
 emit("dist", D.reshape(-1))
 
-# Affine-invariant Fréchet (Karcher) mean of the four covariances.
+# Affine-invariant Fréchet (Karcher) mean of the four covariances, and the
+# Fréchet variance (mean squared geodesic distance) it achieves — the OBJECTIVE
+# both engines are scored on (gam must match-or-beat this centrality).
 fm = FrechetMean(space)
 fm.fit(covs)
 mean = np.asarray(fm.estimate_, dtype=float)
 mean = 0.5 * (mean + mean.T)
 emit("frechet_mean", mean.reshape(-1))
+gs_var = float(np.mean([metric.dist(mean, covs[i]) ** 2 for i in range(M)]))
+emit("gs_frechet_variance", [gs_var])
 
 # Solver-independent ground truth: at the TRUE Fréchet mean the Riemannian
 # gradient (1/M) Σ log_{P}(X_i) vanishes. Verify this for gam's mean using
@@ -380,53 +507,70 @@ emit("gam_mean_grad_norm", [float(metric.norm(grad, G))])
     let ref_dist = r.vector("dist");
     let ref_mean = r.vector("frechet_mean");
     let gs_grad_norm = r.scalar("gam_mean_grad_norm");
+    let gs_frechet_variance = r.scalar("gs_frechet_variance");
     assert_eq!(ref_dist.len(), M * M, "geomstats distance matrix size");
     assert_eq!(ref_mean.len(), P * P, "geomstats Fréchet mean size");
 
-    // ===================== (1) distance matrix vs geomstats =================
-    let dist_err = max_abs_diff(&gam_dist, ref_dist);
-    // ===================== (2) Fréchet mean vs geomstats ====================
+    // INFORMATIONAL ONLY: geomstats' projector `metric.dist` vs the analytic
+    // closed form, and gam's center vs geomstats' center. geomstats is NOT the
+    // truth — its affine-invariant `metric.dist` carries the same cut-locus /
+    // eigendecomposition-convention risk as its Grassmann projector (#904), so we
+    // never assert gam == geomstats output. gam already equals the analytic truth.
+    let dist_gs_vs_analytic = max_abs_diff(ref_dist, &analytic_dist);
     let gam_mean_flat: Vec<f64> = gam_mean.iter().copied().collect();
-    let mean_rel = relative_l2(&gam_mean_flat, ref_mean);
-    let mean_abs = max_abs_diff(&gam_mean_flat, ref_mean);
+    let mean_rel_vs_gs = relative_l2(&gam_mean_flat, ref_mean);
 
     eprintln!(
         "SPD(5) crabs (M={M} groups, {ITERS} iters) | intrinsic: max_diag={max_diag:.3e} \
-         max_asym={max_asym:.3e} min_off_dist={min_off:.4} grad_norm={grad_norm:.3e} | \
-         vs geomstats: dist_matrix_max_abs={dist_err:.3e} frechet_rel_l2={mean_rel:.3e} \
-         frechet_max_abs={mean_abs:.3e} gam_mean_grad_in_geomstats={gs_grad_norm:.3e}"
+         max_asym={max_asym:.3e} min_off_dist={min_off:.4} grad_norm={grad_norm:.3e} \
+         frechet_variance={gam_frechet_variance:.6} | \
+         gam_dist_vs_ANALYTIC={dist_vs_analytic:.3e} (PRIMARY) | \
+         informational: geomstats_dist_vs_analytic={dist_gs_vs_analytic:.3e} \
+         gam_mean_rel_vs_geomstats={mean_rel_vs_gs:.3e} \
+         geomstats_frechet_variance={gs_frechet_variance:.6} \
+         gam_mean_grad_in_geomstats={gs_grad_norm:.3e}"
     );
 
-    // The affine-invariant geodesic distance is a closed form; gam must match
-    // geomstats' eigendecomposition-based value to LAPACK precision. The crab
+    // ===================== (1) distance vs ANALYTIC GROUND TRUTH =============
+    // The affine-invariant geodesic distance is the exact closed form
+    // √(Σ log²(λ_i)) the test derives from the generalized eigenvalues of each
+    // covariance pair. gam must match THAT to the Jacobi/LAPACK noise floor on
+    // every real crab-group pair — never geomstats' `metric.dist`. The crab
     // covariances have O(10) entries and distances of order 1, so 1e-8 absolute
     // is a tight, principled bound well above the f64 noise floor.
     assert!(
-        dist_err < 1e-8,
-        "gam SPD affine-invariant distance matrix disagrees with geomstats ground \
-         truth: max |Δd| = {dist_err:.3e} (>=1e-8)"
+        dist_vs_analytic < 1e-8,
+        "gam SPD affine-invariant distance matrix disagrees with the ANALYTIC \
+         closed form √(Σ log²(λ_i)): max |Δd| = {dist_vs_analytic:.3e} (>=1e-8)"
     );
 
-    // The Fréchet mean is the unique minimizer of an analytic functional; both
-    // engines converge to the same SPD point. 1e-6 relative leaves margin for
-    // the differing iteration schemes (gam's fixed point vs geomstats' solver
-    // stopping tolerance) while still catching any wrong P^{1/2} conjugation or
-    // exp/log defect — such a defect would shift the center by O(1), not 1e-6.
+    // ===================== (2) Fréchet mean: intrinsic + match-or-beat =======
+    // The affine-invariant Karcher mean has no elementary closed form, so we do
+    // NOT assert gam == geomstats' center. Centrality is pinned two ways instead:
+    //   (a) INTRINSIC first-order optimality (asserted above): at gam's center the
+    //       Riemannian gradient (1/M)Σ log_P(Xᵢ) has ~0 metric norm — the defining
+    //       Karcher stationarity, in gam's own geometry.
+    //   (b) MATCH-OR-BEAT on the Fréchet variance OBJECTIVE: gam's center must be
+    //       at least as central as geomstats' mean, i.e. its mean squared geodesic
+    //       distance (analytic metric) is no worse than geomstats' (+ a tiny
+    //       relative slack so a tie at the optimum never flips).
+    let var_margin = 1e-6 * gs_frechet_variance.max(1.0);
     assert!(
-        mean_rel < 1e-6,
-        "gam SPD Fréchet mean disagrees with geomstats ground truth: \
-         rel_l2 = {mean_rel:.3e} (max_abs = {mean_abs:.3e}) (>=1e-6)"
+        gam_frechet_variance <= gs_frechet_variance + var_margin,
+        "gam SPD Fréchet mean is less central than geomstats: gam variance \
+         {gam_frechet_variance:.6} > geomstats {gs_frechet_variance:.6} + {var_margin:.3e}"
     );
 
-    // Sharper, solver-independent confirmation: geomstats' OWN affine-invariant
-    // log map and norm see gam's center as a stationary point of the dispersion
-    // functional (Riemannian gradient ≈ 0). This does not depend on geomstats'
-    // iterative FrechetMean converging to gam's tolerance — it is the defining
-    // Karcher axiom evaluated entirely with the reference's geometry.
+    // Solver-independent intrinsic confirmation: geomstats' OWN affine-invariant
+    // log map and norm (a calculator of the analytic log, not a fitted output)
+    // see gam's center as a stationary point of the dispersion functional
+    // (Riemannian gradient ≈ 0) — the defining Karcher axiom, evaluated in an
+    // independent geometry. This is an intrinsic-optimality check, not a
+    // gam-equals-geomstats-output claim.
     assert!(
         gs_grad_norm < 1e-7,
-        "geomstats does not see gam's SPD center as a Fréchet mean: Riemannian \
-         gradient norm in geomstats' affine-invariant metric = {gs_grad_norm:.3e} (>=1e-7)"
+        "gam's SPD center is not a Fréchet stationary point under geomstats' \
+         independent affine-invariant metric: gradient norm = {gs_grad_norm:.3e} (>=1e-7)"
     );
 }
 
@@ -509,25 +653,28 @@ fn crabs_group_covariances_match_geomstats_spd_geometry_on_real_data() {
 
     // SPD covariances: four train centroids, four held-out test points. Same
     // unbiased (ddof=1) estimator on both sides; n>p keeps every block full-rank.
-    let train_covs: Vec<Array1<f64>> = train_rows
-        .iter()
-        .map(|rs| flat(&sample_covariance(rs)))
-        .collect();
-    let test_covs: Vec<Array1<f64>> = test_rows
-        .iter()
-        .map(|rs| flat(&sample_covariance(rs)))
-        .collect();
+    // Keep the P×P matrices too, for the ANALYTIC closed-form distance matrix.
+    let train_cov_mats: Vec<Array2<f64>> =
+        train_rows.iter().map(|rs| sample_covariance(rs)).collect();
+    let test_cov_mats: Vec<Array2<f64>> =
+        test_rows.iter().map(|rs| sample_covariance(rs)).collect();
+    let train_covs: Vec<Array1<f64>> = train_cov_mats.iter().map(flat).collect();
+    let test_covs: Vec<Array1<f64>> = test_cov_mats.iter().map(flat).collect();
 
     let spd = SpdManifold::new(P);
 
     // ---- gam: held-out test→train distance matrix + classification ---------
+    // alongside the ANALYTIC closed-form distance matrix (self-constructed truth).
     let mut gam_dist = vec![0.0_f64; M * M]; // row = test group, col = train centroid
+    let mut analytic_dist = vec![0.0_f64; M * M];
     for ti in 0..M {
         for tj in 0..M {
             let d2 = gam_sq_dist(&spd, test_covs[ti].view(), train_covs[tj].view());
             gam_dist[ti * M + tj] = d2.max(0.0).sqrt();
+            analytic_dist[ti * M + tj] = spd_affine_distance(&test_cov_mats[ti], &train_cov_mats[tj]);
         }
     }
+    let dist_vs_analytic = max_abs_diff(&gam_dist, &analytic_dist);
     let mut gam_correct = 0usize;
     for ti in 0..M {
         if gam_nearest(&spd, &test_covs[ti], &train_covs) == ti {
@@ -608,12 +755,15 @@ emit("acc", [correct / M])
         "geomstats held-out distance matrix size"
     );
 
-    let dist_err = max_abs_diff(&gam_dist, ref_dist);
+    // INFORMATIONAL ONLY: geomstats' `metric.dist` vs the analytic closed form;
+    // never asserted (geomstats is not the truth, #904-class risk).
+    let dist_gs_vs_analytic = max_abs_diff(ref_dist, &analytic_dist);
 
     eprintln!(
         "SPD(5) crabs HELD-OUT classify (train {N_TRAIN_PER_GROUP}/group, test \
          {N_TEST_PER_GROUP}/group) | gam_acc={gam_acc:.3} geomstats_acc={gs_acc:.3} \
-         test_to_train_dist_max_abs={dist_err:.3e}"
+         gam_dist_vs_ANALYTIC={dist_vs_analytic:.3e} (PRIMARY) \
+         geomstats_dist_vs_analytic={dist_gs_vs_analytic:.3e} (informational)"
     );
 
     // ---- PRIMARY objective assertion: perfect held-out recovery ------------
@@ -630,13 +780,14 @@ emit("acc", [correct / M])
          geomstats baseline {gs_acc:.3}"
     );
 
-    // ---- the agreement is EARNED by correct geometry, not a tie-break ------
-    // The affine-invariant geodesic distance is a closed form; gam must match
-    // geomstats' eigendecomposition value on these O(10)-scale covariances to
-    // LAPACK precision. 1e-8 absolute sits well above the f64 noise floor.
+    // ---- the agreement is EARNED by correct geometry, vs ANALYTIC truth ----
+    // The affine-invariant geodesic distance is the exact closed form
+    // √(Σ log²(λ_i)); gam must match THAT (computed in Rust from the covariances)
+    // on these O(10)-scale matrices to the Jacobi/LAPACK noise floor, never
+    // geomstats. 1e-8 absolute sits well above the f64 noise floor.
     assert!(
-        dist_err < 1e-8,
-        "gam SPD affine-invariant held-out distance matrix disagrees with \
-         geomstats: max |Δd| = {dist_err:.3e} (>=1e-8)"
+        dist_vs_analytic < 1e-8,
+        "gam SPD affine-invariant held-out distance matrix disagrees with the \
+         ANALYTIC closed form √(Σ log²(λ_i)): max |Δd| = {dist_vs_analytic:.3e} (>=1e-8)"
     );
 }
