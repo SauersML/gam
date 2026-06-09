@@ -83,9 +83,7 @@ pub mod util;
 #[path = "heartbeat.rs"]
 pub mod process_monitor;
 
-pub use data::{
-    encode_recordswith_inferred_schema, load_csvwith_inferred_schema, load_csvwith_schema,
-};
+pub use data::{encode_recordswith_inferred_schema, load_csvwith_inferred_schema};
 pub use geometry::{
     CircleManifold, EuclideanManifold, GeodesicIntegrator, GeometryError, GeometryResult,
     GrassmannManifold, ManifoldSpec, ProductManifold, RiemannianLBFGS, RiemannianManifold,
