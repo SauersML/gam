@@ -4658,18 +4658,30 @@ impl<'a> RemlState<'a> {
         Ok((c_array, d_array, e_array, f_array))
     }
 
-    /// Compute soft prior cost without needing workspace
+    /// Compute soft prior cost without needing workspace.
+    ///
+    /// The `log cosh` bound is evaluated at the weight-anchored coordinate
+    /// `ρ̃ = ρ − log g(w)` (see [`rho_weight_anchor`](Self::rho_weight_anchor))
+    /// so the selected λ̂ stays exactly invariant to a global prior-weight
+    /// rescale `w → c·w` (issue #877). The pure-REML optimum drifts by
+    /// `ρ̂ → ρ̂ + log c`; a barrier on *raw* ρ would then exert a different
+    /// (asymmetric) pull at the shifted optimum, breaking the invariance. The
+    /// anchor `log g(c·w) = log c + log g(w)` drifts identically to ρ̂, so the
+    /// barrier's view ρ̃ — hence its cost, gradient and curvature — is identical
+    /// at the rescaled optimum. With all weights 1 the anchor is exactly 0, so
+    /// unweighted fits stay byte-identical.
     pub(super) fn compute_soft_priorcost(&self, rho: &Array1<f64>) -> f64 {
         let len = rho.len();
         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
             return 0.0;
         }
 
+        let anchor = self.rho_weight_anchor();
         let inv_bound = 1.0 / RHO_BOUND;
         let sharp = RHO_SOFT_PRIOR_SHARPNESS;
         let mut cost = 0.0;
         for &ri in rho.iter() {
-            let scaled = sharp * ri * inv_bound;
+            let scaled = sharp * (ri - anchor) * inv_bound;
             cost += scaled.cosh().ln();
         }
 
@@ -4683,10 +4695,14 @@ impl<'a> RemlState<'a> {
         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
             return grad;
         }
+        // Anchored at `ρ̃ = ρ − log g(w)` for weight-scale invariance (issue
+        // #877); the anchor is ρ-independent so `d/dρ = d/dρ̃` and the gradient
+        // form is unchanged — only the argument shifts.
+        let anchor = self.rho_weight_anchor();
         let inv_bound = 1.0 / RHO_BOUND;
         let sharp = RHO_SOFT_PRIOR_SHARPNESS;
         for (g, &ri) in grad.iter_mut().zip(rho.iter()) {
-            let scaled = sharp * ri * inv_bound;
+            let scaled = sharp * (ri - anchor) * inv_bound;
             *g = sharp * inv_bound * scaled.tanh() * RHO_SOFT_PRIOR_WEIGHT;
         }
         grad
@@ -4705,15 +4721,20 @@ impl<'a> RemlState<'a> {
     ///                = w * a² * (1 - tanh²(a * rho_i)).
     ///
     /// The prior is separable across coordinates, so off-diagonals are zero.
+    ///
+    /// Evaluated at the weight-anchored coordinate `ρ̃ = ρ − log g(w)` for
+    /// weight-scale invariance (issue #877); the anchor is ρ-independent so the
+    /// curvature form is unchanged — only the argument shifts.
     pub(super) fn add_soft_priorhessian_in_place(&self, rho: &Array1<f64>, hess: &mut Array2<f64>) {
         let len = rho.len();
         if len == 0 || RHO_SOFT_PRIOR_WEIGHT == 0.0 {
             return;
         }
+        let anchor = self.rho_weight_anchor();
         let a = RHO_SOFT_PRIOR_SHARPNESS / RHO_BOUND;
         let prefactor = RHO_SOFT_PRIOR_WEIGHT * a * a;
         for i in 0..len {
-            let t = (a * rho[i]).tanh();
+            let t = (a * (rho[i] - anchor)).tanh();
             hess[[i, i]] += prefactor * (1.0 - t * t);
         }
     }

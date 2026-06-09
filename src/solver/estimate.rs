@@ -3627,49 +3627,91 @@ where
             problem
         };
 
-        let prepass_seed: Option<Array1<f64>> =
-            if matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian) {
-                None
-            } else {
-                let bnds = reml_seed_config.bounds;
-                let (lo, hi) = if bnds.0 <= bnds.1 {
-                    bnds
-                } else {
-                    (bnds.1, bnds.0)
-                };
-                // risk_shift is the default seed bias when no caller warm-start is given;
-                // it is NOT applied on top of a caller-supplied heuristic_lambdas.
-                let risk_shift: f64 = match reml_seed_config.risk_profile {
-                    SeedRiskProfile::Gaussian => 0.0,
-                    SeedRiskProfile::GeneralizedLinear => 1.0,
-                    SeedRiskProfile::Survival => 2.0,
-                };
-                let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
-                    Array1::from_iter(h.iter().map(|&v| v.max(1e-12).ln().clamp(lo, hi)))
-                } else {
-                    Array1::from_elem(k, risk_shift.clamp(lo, hi))
-                };
-                let refined = crate::seeding::select_objective_seed_on_log_lambda_grid(
-                    &base,
-                    (lo, hi),
-                    k,
-                    |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
-                );
-                if refined
-                    .iter()
-                    .zip(base.iter())
-                    .any(|(&a, &b)| (a - b).abs() > 1e-12)
-                {
-                    log::info!(
-                        "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
-                        base.as_slice().unwrap_or(&[]),
-                        refined.as_slice().unwrap_or(&[])
-                    );
-                    Some(refined)
-                } else {
-                    None
+        // Geometric-mean log prior-weight `log g(w) = (1/n₊)·Σ log wᵢ` over the
+        // positive-weight rows. The pure-REML optimum for a Gaussian fit drifts
+        // by `ρ̂ → ρ̂ + log c` under a global prior-weight rescale `w → c·w`
+        // (`H = XᵀWX + λS`, so λ → c·λ keeps the penalised curvature
+        // proportional to the data curvature, β̂ / EDF / predictions fixed). The
+        // outer ρ-search seed and the relative-from-seed convergence test would
+        // otherwise be referenced to a weight-independent origin (0), so a
+        // heavily up-weighted fit starts `log c` further from its (shifted)
+        // optimum and the optimiser stops short — exactly the weight-scale
+        // non-invariance of λ̂ reported in issue #877. Anchoring the seed at
+        // `log g(w)` makes the search start the SAME relative distance from the
+        // optimum regardless of the weight magnitude. With all weights 1 the
+        // anchor is exactly 0, so unweighted fits stay byte-identical.
+        let weight_log_geom_mean: f64 = {
+            let mut sum = 0.0;
+            let mut count = 0usize;
+            for &wi in w_o.iter() {
+                if wi > 0.0 {
+                    sum += wi.ln();
+                    count += 1;
                 }
+            }
+            if count == 0 { 0.0 } else { sum / count as f64 }
+        };
+        let gaussian_risk = matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian);
+        // The Gaussian path historically skipped the objective-grid prepass and
+        // seeded the outer search from the weight-independent origin 0. That is
+        // exactly correct for an UNWEIGHTED fit (anchor 0), but breaks the
+        // weight-scale invariance of λ̂ the moment a global rescale shifts the
+        // optimum off 0 (issue #877). Run the anchored prepass for Gaussian ONLY
+        // when the weight scale is non-trivial, so unweighted Gaussian fits stay
+        // byte-identical while up-/down-weighted fits seed at the shifted optimum.
+        let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
+        let prepass_seed: Option<Array1<f64>> = if gaussian_risk
+            && !run_gaussian_anchored_prepass
+        {
+            None
+        } else {
+            let bnds = reml_seed_config.bounds;
+            let (lo, hi) = if bnds.0 <= bnds.1 {
+                bnds
+            } else {
+                (bnds.1, bnds.0)
             };
+            // risk_shift is the default seed bias when no caller warm-start is given;
+            // it is NOT applied on top of a caller-supplied heuristic_lambdas.
+            let risk_shift: f64 = match reml_seed_config.risk_profile {
+                SeedRiskProfile::Gaussian => 0.0,
+                SeedRiskProfile::GeneralizedLinear => 1.0,
+                SeedRiskProfile::Survival => 2.0,
+            };
+            // Anchor the default seed origin to the weight scale (issue #877). A
+            // caller-supplied `heuristic_lambdas` already carries the absolute λ
+            // scale, so it is used as-is; only the default risk-shift origin is
+            // weight-anchored.
+            let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
+                Array1::from_iter(h.iter().map(|&v| v.max(1e-12).ln().clamp(lo, hi)))
+            } else {
+                Array1::from_elem(k, (risk_shift + weight_log_geom_mean).clamp(lo, hi))
+            };
+            let refined = crate::seeding::select_objective_seed_on_log_lambda_grid(
+                &base,
+                (lo, hi),
+                k,
+                |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
+            );
+            // Emit the seed when the grid moved it, or — on the Gaussian
+            // weight-anchored path — whenever the anchored `base` is itself
+            // offset from the unanchored origin (so the shifted optimum is
+            // actually seeded even if the coarse grid leaves `base` unchanged).
+            let grid_moved = refined
+                .iter()
+                .zip(base.iter())
+                .any(|(&a, &b)| (a - b).abs() > 1e-12);
+            if grid_moved || run_gaussian_anchored_prepass {
+                log::info!(
+                    "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
+                    base.as_slice().unwrap_or(&[]),
+                    refined.as_slice().unwrap_or(&[])
+                );
+                Some(refined)
+            } else {
+                None
+            }
+        };
         let problem = if let Some(seed) = prepass_seed {
             problem.with_initial_rho(seed)
         } else {
