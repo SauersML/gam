@@ -21476,14 +21476,91 @@ pub fn fit_survival_marginal_slope_terms(
                     if let Some(channel) = smgs_deleted_required_channel_reason(
                         p_time, p_marg, p_log, w_time, w_marg, w_log,
                     ) {
-                        log::warn!(
-                            "[smgs phase-4b compiled-map] rejected destructive rawstack reduction \
-                             for #808: channel {channel} would be deleted \
-                             (time {p_time}→{w_time}, marginal {p_marg}→{w_marg}, \
-                             logslope {p_log}→{w_log}); using the unreduced design and \
-                             leaving the near-null direction to Jeffreys conditioning",
-                        );
-                        Ok(None)
+                        // #741: the η₁-only rawstack W-metric collapsed a whole
+                        // required channel. That metric is only the η₁-channel
+                        // row curvature; the true survival row Hessian is 4×4 in
+                        // (q₀,q₁,qd₁,g) and chains DIFFERENTLY into each block, so
+                        // marginal/logslope that look identical in η₁ are kept
+                        // distinct by the full driver. Before falling back to the
+                        // unreduced (rank-deficient) raw design, retry the
+                        // reduction with the full row-Hessian per-term compiler.
+                        // If it preserves every required channel, the η₁ collapse
+                        // was a FALSE alias — emit its CompiledMap so Newton runs
+                        // in the correct identifiable quotient (the closed-form
+                        // fast path engages). Only when the full row Hessian ALSO
+                        // deletes the channel is the alias real → unreduced design.
+                        use crate::families::survival_marginal_slope_identifiability::{
+                            SurvivalRowHessian, compile_survival_parametric_designs_per_term,
+                            compiled_map_from_per_term,
+                        };
+                        let full_row_hess = (|| -> Result<
+                            Option<(
+                                crate::families::identifiability_compiler::CompiledMap,
+                                (usize, usize, usize),
+                            )>,
+                            String,
+                        > {
+                            let row_hess = SurvivalRowHessian::from_pilot_primary_state(
+                                &q0_pilot,
+                                &q1_pilot,
+                                &qd1_pilot,
+                                &g_pilot,
+                                &z_primary,
+                                &spec.weights,
+                                &spec.event_target,
+                                derivative_guard,
+                                probit_scale,
+                            )?;
+                            let per_term = compile_survival_parametric_designs_per_term(
+                                dq0.clone(),
+                                dq1.clone(),
+                                dqd1.clone(),
+                                &time_partition,
+                                m_dq.clone(),
+                                m_dqd1.clone(),
+                                &marginal_partition,
+                                g_dg.clone(),
+                                &logslope_partition,
+                                &row_hess,
+                            )?;
+                            let map = compiled_map_from_per_term(&per_term);
+                            let fw_time = map.compiled_block_ranges[0].len();
+                            let fw_marg = map.compiled_block_ranges[1].len();
+                            let fw_log = map.compiled_block_ranges[2].len();
+                            if let Some(real) = smgs_deleted_required_channel_reason(
+                                p_time, p_marg, p_log, fw_time, fw_marg, fw_log,
+                            ) {
+                                log::warn!(
+                                    "[smgs phase-4b compiled-map] full row-Hessian compile also \
+                                     deletes channel {real} (time {p_time}→{fw_time}, \
+                                     marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}); \
+                                     alias is genuine — using the unreduced design and leaving \
+                                     the near-null direction to Jeffreys conditioning",
+                                );
+                                Ok(None)
+                            } else {
+                                log::info!(
+                                    "[smgs phase-4b compiled-map] #741: η₁-only metric falsely \
+                                     collapsed channel {channel}; full 4×4 row-Hessian quotient \
+                                     keeps all channels (time {p_time}→{fw_time}, \
+                                     marginal {p_marg}→{fw_marg}, logslope {p_log}→{fw_log}); \
+                                     engaging closed-form fast path on the correct quotient",
+                                );
+                                Ok(Some((map, (fw_time, fw_marg, fw_log))))
+                            }
+                        })();
+                        match full_row_hess {
+                            Ok(some) => Ok(some),
+                            Err(reason) => {
+                                log::warn!(
+                                    "[smgs phase-4b compiled-map] full row-Hessian retry failed \
+                                     ({reason}); rawstack metric collapsed channel {channel} — \
+                                     using the unreduced design and leaving the near-null \
+                                     direction to Jeffreys conditioning",
+                                );
+                                Ok(None)
+                            }
+                        }
                     } else {
                         Ok(Some((map, (w_time, w_marg, w_log))))
                     }
