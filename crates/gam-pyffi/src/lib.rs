@@ -24025,12 +24025,19 @@ fn fit_dataset_impl(
                     });
                 }
             };
+            // Persist the response standardization factor the fit applied so
+            // prediction reconstructs the σ floor at `response_scale·0.01`,
+            // keeping predictive σ response-scale-equivariant (#884). The fit
+            // already mapped the log-σ `exp(η)` term to raw units via the
+            // `+ln(response_scale)` intercept shift; only the additive floor
+            // still needs the factor at reconstruction time.
+            let response_scale = ls_result.response_scale;
             build_gaussian_location_scale_ffi_payload(
                 formula,
                 &dataset,
                 &fit_config,
                 ls_result,
-                1.0,
+                response_scale,
             )?
         }
         FitRequest::BinomialLocationScale(ls_request) => {
