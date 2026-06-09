@@ -4672,7 +4672,8 @@ fn finalize_survival_location_scale_fit(
     // Affine lift (issue #892): `β_time_raw = z · β_reduced + affine_shift`. The
     // `affine_shift` is the pinned unit-log-t warp coefficient on the canonical
     // gauge (zero on the non-pin/identity paths, so the lift stays plain linear).
-    let beta_time = prepared.time_transform.z.dot(&beta_time_reduced) + &prepared.time_transform.affine_shift;
+    let beta_time =
+        prepared.time_transform.z.dot(&beta_time_reduced) + &prepared.time_transform.affine_shift;
     let beta_threshold_active = fit.block_states[SurvivalLocationScaleFamily::BLOCK_THRESHOLD]
         .beta
         .clone();
@@ -13178,9 +13179,14 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            false,
+            array![0.0_f64, 0.5, 1.0].view(),
+        )
+        .expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
@@ -13205,9 +13211,14 @@ mod tests {
             initial_beta: None,
         };
 
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            false,
+            array![0.0_f64, 0.5, 1.0].view(),
+        )
+        .expect("prepare time block");
         let p = time_block.design_entry.ncols();
 
         assert_eq!(
@@ -13265,7 +13276,11 @@ mod tests {
         assert_eq!(prepared.transform.z.ncols(), 1);
         assert_eq!(prepared.transform.affine_shift.len(), 3);
         assert!(
-            prepared.transform.affine_shift.iter().any(|&v| v.abs() > 1e-9),
+            prepared
+                .transform
+                .affine_shift
+                .iter()
+                .any(|&v| v.abs() > 1e-9),
             "pinned warp must contribute a non-zero unit-log-t affine_shift"
         );
         assert_eq!(prepared.design_entry.ncols(), 1);
@@ -13324,11 +13339,10 @@ mod tests {
         // Pin fired: single free column + non-zero pinned warp.
         assert_eq!(prepared.transform.z.ncols(), 1);
         let theta = array![0.731_f64];
-        let beta_raw =
-            prepared.transform.z.dot(&theta) + &prepared.transform.affine_shift;
+        let beta_raw = prepared.transform.z.dot(&theta) + &prepared.transform.affine_shift;
         // β_raw equals the free contribution plus the pinned warp, exactly.
-        let expected_raw =
-            &(&prepared.transform.z.column(0).to_owned() * theta[0]) + &prepared.transform.affine_shift;
+        let expected_raw = &(&prepared.transform.z.column(0).to_owned() * theta[0])
+            + &prepared.transform.affine_shift;
         for (got, want) in beta_raw.iter().zip(expected_raw.iter()) {
             assert!(
                 (got - want).abs() <= 1e-12,
@@ -13387,9 +13401,14 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: Some(array![-0.5, 0.2, -1.5]),
         };
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            false,
+            array![0.0_f64, 0.5, 1.0].view(),
+        )
+        .expect("prepare time block");
         assert_eq!(
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0])
@@ -13434,9 +13453,14 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: Some(array![-0.5, 0.2, -1.5, -2.0]),
         };
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 1, false, array![0.0_f64, 0.5, 1.0].view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            1,
+            false,
+            array![0.0_f64, 0.5, 1.0].view(),
+        )
+        .expect("prepare time block");
         assert_eq!(
             prepared.coefficient_lower_bounds,
             Some(array![f64::NEG_INFINITY, 0.0, 0.0, 0.0])
@@ -13877,9 +13901,14 @@ mod tests {
             initial_log_lambdas: None,
             initial_beta: None,
         };
-        let prepared =
-            prepare_identified_time_block(&time_block, 1e-6, 0, false, array![0.0_f64, 0.5, 1.0].view())
-                .expect("prepare time block");
+        let prepared = prepare_identified_time_block(
+            &time_block,
+            1e-6,
+            0,
+            false,
+            array![0.0_f64, 0.5, 1.0].view(),
+        )
+        .expect("prepare time block");
         assert_eq!(prepared.design_entry, design_entry);
         assert_eq!(prepared.design_exit, design_exit);
         assert_eq!(prepared.design_derivative_exit, design_derivative_exit);
