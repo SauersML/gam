@@ -2251,10 +2251,12 @@ fn run_fitwith_predict_noise(
             // `fit` already carries raw-unit coefficients, covariance, and a
             // raw-unit residual-scale summary (the standardization and its
             // inverse remap live in `fit_gaussian_location_scale_model`), so the
-            // save path persists them verbatim and records
-            // `gaussian_response_scale = 1.0` — predict reconstructs raw σ as
-            // `0.01 + exp(Xβ)` with no further multiply, applying the response
-            // scale exactly once (inside the fit).
+            // save path persists them verbatim and records the actual
+            // `gaussian_response_scale` — predict reconstructs raw σ as
+            // `response_scale·0.01 + exp(Xβ)`, scaling the σ floor with the
+            // response so predictive σ is response-scale-equivariant (#884). The
+            // unrelated `compact_saved_multiblock_fit_result` scalar below is the
+            // fit's dispersion summary (1.0 for Gaussian), not the response scale.
             let fit_result = compact_saved_multiblock_fit_result(
                 fit.blocks.clone(),
                 fit.lambdas.clone(),
@@ -2290,7 +2292,7 @@ fn run_fitwith_predict_noise(
                     wiggle,
                 },
                 LocationScaleResponse::Gaussian {
-                    response_scale: 1.0,
+                    response_scale: gaussian_response_scale,
                     base_link: resolved_base_link,
                 },
                 SavedModelSourceMetadata {
@@ -2413,6 +2415,14 @@ fn run_fitwith_predict_noise(
         }
         _ => None,
     };
+    // The response standardization factor applied inside
+    // `fit_gaussian_location_scale_model`. It must be persisted so prediction
+    // can reconstruct the σ floor at `response_scale·LOGB_SIGMA_FLOOR`, keeping
+    // the predictive σ response-scale-equivariant (#884). The location/mean
+    // coefficients and `exp(η_σ)` term are already in raw units (the intercept
+    // shift absorbed `+ln(response_scale)`); only the additive floor still needs
+    // the factor at reconstruction time.
+    let gaussian_response_scale = solved.response_scale;
     let fit = solved.fit.fit;
     let frozen_meanspec =
         freeze_term_collection_from_design(&solved.fit.meanspec_resolved, &solved.fit.mean_design)
