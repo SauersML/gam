@@ -435,7 +435,7 @@ fn matrix_exp_vjp(b: &Array2<f64>, cotangent: &Array2<f64>) -> GeometryResult<Ar
 /// Given the output cotangents `Q̄` and `R̄`, returns `normal̄`:
 ///
 /// ```text
-///   M      = Rᵀ·R̄ − Q̄ᵀ·Q
+///   M      = R·R̄ᵀ − Q̄ᵀ·Q
 ///   normal̄ = (Q̄ + Q·copyltu(M)) · R⁻ᵀ
 /// ```
 ///
@@ -443,6 +443,11 @@ fn matrix_exp_vjp(b: &Array2<f64>, cotangent: &Array2<f64>) -> GeometryResult<Ar
 /// `M` (lower triangle incl. diagonal, plus the strictly-lower part reflected
 /// into the upper triangle). The trailing `R⁻ᵀ` is realized by forward
 /// substitution solving `normal̄·Rᵀ = RHS` (`R` upper-triangular).
+///
+/// This is the Walter / Seeger formula for the thin-QR adjoint. The asymmetric
+/// pairing (`R·R̄ᵀ`, not `Rᵀ·R̄`) matters because `copyltu` extracts the lower
+/// triangle: `copyltu(M) ≠ copyltu(Mᵀ)` in general, so transposing the factors
+/// produces a genuinely different symmetric matrix and the wrong `normal̄`.
 fn qr_thin_vjp(
     q: &Array2<f64>,
     r: &Array2<f64>,
@@ -450,9 +455,9 @@ fn qr_thin_vjp(
     r_bar: &Array2<f64>,
 ) -> GeometryResult<Array2<f64>> {
     let k = r.nrows();
-    // Mqr = Rᵀ·R̄ − Q̄ᵀ·Q  (k×k).
-    use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
-    let mqr = r.t().dot(r_bar) - fast_atb(q_bar, q);
+    // Mqr = R·R̄ᵀ − Q̄ᵀ·Q  (k×k).
+    use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+    let mqr = fast_abt(r, r_bar) - fast_atb(q_bar, q);
     // copyltu: symmetric matrix from the lower triangle of Mqr.
     let mut sym_low = Array2::<f64>::zeros((k, k));
     for i in 0..k {
