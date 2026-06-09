@@ -11,12 +11,49 @@
 //! predictive distributions. Until a real per-point LOO/ALO density consumer is
 //! introduced alongside retained candidate predictors, the principled live path
 //! is winner-take-all with deterministic score ordering.
+//!
+//! ## Selection-time stacking is now wired (WP-C / Object 3a)
+//!
+//! The winner-take-all blocker above is specifically about the SAVED-MODEL
+//! PREDICTION path: that path does not retain alternative candidate predictors,
+//! so it cannot evaluate a mixture (or any losing candidate) at new rows. That
+//! blocker still stands for out-of-sample prediction.
+//!
+//! It does NOT, however, block stacking *at selection time*. During the race
+//! the candidate fits all exist, so we can build a per-observation held-out
+//! predictive log-density table by cross-validation folds within the race and
+//! feed it to [`crate::solver::evidence::solve_stacking_weights`]. This module
+//! does exactly that when a race mixes model classes (smooth manifold vs the
+//! discrete-mixture rung): the HEADLINE ranking statistic switches to held-out
+//! predictive log-density / stacking weights, with the rank-aware Laplace
+//! evidence retained as corroboration. Same-class races keep today's
+//! winner-take-all evidence behavior. The class mix is auto-detected from the
+//! candidate kinds — there is no flag.
+//!
+//! What is still future work: persisting a mixture predictor for OOS prediction
+//! on new rows. The selection-time stacking table is computed from fits that
+//! exist only during the race; it is not retained for the saved-model
+//! prediction path. That OOS-retention package is out of scope here.
 
-use crate::solver::evidence::TopologyScoreScale;
+use crate::solver::evidence::{
+    GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
+    fit_gaussian_mixture, solve_stacking_weights,
+};
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
+use ndarray::{Array2, ArrayView2};
 use serde_json::Value as JsonValue;
 
 const TK_LOG_2PI: f64 = 1.8378770664093453_f64;
+
+/// Fixed component ladder swept for the discrete-mixture rung. Deterministic;
+/// each `k` is priced by its own free-parameter count via the rank-aware
+/// Laplace evidence and ranked against the others in-class before the winning
+/// mixture order competes cross-class.
+pub const MIXTURE_K_LADDER: &[usize] = &[1, 2, 3, 5, 7, 9];
+
+/// Number of cross-validation folds used to build the selection-time held-out
+/// predictive log-density table for cross-class stacking. Fixed (no flag).
+pub const STACKING_CV_FOLDS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AutoTopologyKind {
@@ -25,9 +62,19 @@ pub enum AutoTopologyKind {
     Sphere,
     Torus,
     Cylinder,
+    /// Discrete `k`-component Gaussian-mixture rung (Object 3a / WP-C). Not a
+    /// smooth manifold: a finite-parameter clustered density. Its presence in a
+    /// race triggers cross-class stacking adjudication.
+    Mixture {
+        k: usize,
+    },
 }
 
 impl AutoTopologyKind {
+    /// Stable display name. The mixture variant carries its order `k`, so its
+    /// label is rendered with [`AutoTopologyKind::display_name`]; the borrowed
+    /// `as_str` returns the class tag for the smooth variants and the bare
+    /// `"mixture"` tag for the discrete rung.
     pub const fn as_str(self) -> &'static str {
         match self {
             AutoTopologyKind::Euclidean => "euclidean",
@@ -35,11 +82,46 @@ impl AutoTopologyKind {
             AutoTopologyKind::Sphere => "sphere",
             AutoTopologyKind::Torus => "torus",
             AutoTopologyKind::Cylinder => "cylinder",
+            AutoTopologyKind::Mixture { .. } => "mixture",
         }
     }
 
+    /// Owned display name including the mixture order, e.g. `"mixture_k7"`.
+    pub fn display_name(self) -> String {
+        match self {
+            AutoTopologyKind::Mixture { k } => format!("mixture_k{k}"),
+            other => other.as_str().to_string(),
+        }
+    }
+
+    /// `true` iff this candidate is the discrete-mixture model class (as
+    /// opposed to a smooth manifold / Euclidean latent topology).
+    pub const fn is_discrete_mixture(self) -> bool {
+        matches!(self, AutoTopologyKind::Mixture { .. })
+    }
+
     pub fn parse(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        let normalized = value.trim().to_ascii_lowercase().replace('-', "_");
+        if let Some(rest) = normalized.strip_prefix("mixture") {
+            // Accept "mixture", "mixture_k7", "mixture7", "mixture_7".
+            let digits: String = rest.chars().filter(|c| c.is_ascii_digit()).collect();
+            if digits.is_empty() {
+                // Bare "mixture" expands to the full ladder; callers that want a
+                // single order pass "mixture_k{n}". Here we default to the
+                // richest ladder order so a singleton request is still valid.
+                return Ok(AutoTopologyKind::Mixture {
+                    k: *MIXTURE_K_LADDER.last().unwrap_or(&7),
+                });
+            }
+            let k: usize = digits
+                .parse()
+                .map_err(|_| format!("mixture order must be a positive integer; got {value:?}"))?;
+            if k == 0 {
+                return Err("mixture order k must be >= 1".to_string());
+            }
+            return Ok(AutoTopologyKind::Mixture { k });
+        }
+        match normalized.as_str() {
             "euclidean" | "flat" | "euclidean_patch" | "euclideanpatch" => {
                 Ok(AutoTopologyKind::Euclidean)
             }
@@ -48,7 +130,7 @@ impl AutoTopologyKind {
             "torus" => Ok(AutoTopologyKind::Torus),
             "cylinder" => Ok(AutoTopologyKind::Cylinder),
             other => Err(format!(
-                "topology candidate must be euclidean, circle, sphere, torus, or cylinder; got {other:?}"
+                "topology candidate must be euclidean, circle, sphere, torus, cylinder, or mixture[_k{{n}}]; got {other:?}"
             )),
         }
     }
@@ -61,6 +143,15 @@ impl AutoTopologyKind {
             AutoTopologyKind::Torus,
             AutoTopologyKind::Cylinder,
         ]
+    }
+
+    /// The full discrete-mixture rung: one candidate per `k` in
+    /// [`MIXTURE_K_LADDER`].
+    pub fn mixture_ladder() -> Vec<Self> {
+        MIXTURE_K_LADDER
+            .iter()
+            .map(|&k| AutoTopologyKind::Mixture { k })
+            .collect()
     }
 }
 
@@ -285,4 +376,309 @@ pub fn tk_normalized_score(
             }
         }
     }
+}
+
+// ===========================================================================
+// Discrete-mixture rung + cross-class adjudication (Object 3a / WP-C)
+// ===========================================================================
+
+/// One fitted entry of the discrete-mixture rung: the mixture order `k`, the
+/// fitted Gaussian mixture, and its rank-aware Laplace **negative** log evidence
+/// computed through the SAME [`crate::solver::evidence::laplace_evidence`]
+/// entry point used by the smooth rungs. Lower negative-log-evidence is better.
+#[derive(Debug, Clone)]
+pub struct MixtureRungFit {
+    pub k: usize,
+    pub fit: crate::solver::evidence::GaussianMixtureFit,
+    /// Free-parameter count `P` — the quantity that enters the rank-aware
+    /// normalizer as `dim(H) − rank(S) = P − 0`.
+    pub num_parameters: usize,
+    /// Rank-aware Laplace negative log evidence on the smooth-rung scale.
+    pub negative_log_evidence: f64,
+}
+
+/// Result of fitting the whole mixture ladder: every fitted order plus the index
+/// of the in-class winner (lowest rank-aware Laplace negative-log-evidence).
+#[derive(Debug, Clone)]
+pub struct MixtureRungResult {
+    pub fits: Vec<MixtureRungFit>,
+    pub winner_index: usize,
+}
+
+impl MixtureRungResult {
+    pub fn winner(&self) -> &MixtureRungFit {
+        &self.fits[self.winner_index]
+    }
+}
+
+/// Fit the discrete-mixture rung over a fixed `k`-ladder and rank in-class by
+/// rank-aware Laplace evidence. Each order is priced by its own free-parameter
+/// count entering the `−½ (dim(H) − rank(S)) log(2π)` normalizer. Deterministic:
+/// the seeding is the basis k-means farthest-point init and EM is a pure map.
+pub fn fit_mixture_rung(
+    data: ArrayView2<'_, f64>,
+    ladder: &[usize],
+    config: GaussianMixtureConfig,
+) -> Result<MixtureRungResult, String> {
+    let n = data.nrows();
+    let mut fits = Vec::new();
+    let mut errors = Vec::new();
+    for &k in ladder {
+        if k == 0 || k > n {
+            continue;
+        }
+        match fit_gaussian_mixture(data, k, config) {
+            Ok(fit) => match fit.laplace_negative_log_evidence(data) {
+                Ok(nle) => {
+                    let num_parameters = fit.num_free_parameters();
+                    fits.push(MixtureRungFit {
+                        k,
+                        fit,
+                        num_parameters,
+                        negative_log_evidence: nle,
+                    });
+                }
+                Err(e) => errors.push(format!("mixture k={k} evidence: {e}")),
+            },
+            Err(e) => errors.push(format!("mixture k={k} fit: {e}")),
+        }
+    }
+    if fits.is_empty() {
+        return Err(format!(
+            "mixture rung produced no fittable orders{}",
+            if errors.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", errors.join("; "))
+            }
+        ));
+    }
+    // In-class winner-take-all on the rank-aware evidence scale (lower wins).
+    let ranked = rank_priority_candidates(
+        fits.into_iter()
+            .enumerate()
+            .map(|(idx, row)| {
+                let score = row.negative_log_evidence;
+                let tie = row.k; // simpler (smaller k) wins ties
+                PriorityCandidate::new(row, idx, score, tie)
+            })
+            .collect(),
+    )
+    .into_iter()
+    .map(|row| row.item)
+    .collect::<Vec<_>>();
+    Ok(MixtureRungResult {
+        fits: ranked,
+        winner_index: 0,
+    })
+}
+
+/// A selection-time predictive-density provider: given the row indices to TRAIN
+/// on and the row indices to EVALUATE on, it returns the per-eval-row held-out
+/// log predictive density `log p(y_eval | train)`. This is the decoupled seam
+/// that lets the cross-class race build a stacking table without persisting any
+/// predictor: the closure refits on each fold's training rows.
+///
+/// The mixture provider is constructed here ([`mixture_density_provider`]); a
+/// smooth-manifold provider is supplied by the caller (it owns the smooth
+/// fitting machinery). Both refit per fold so the table is genuinely held-out.
+pub type HeldOutDensityProvider<'a> =
+    Box<dyn Fn(&[usize], &[usize]) -> Result<Vec<f64>, String> + 'a>;
+
+/// Build a mixture held-out-density provider for a fixed order `k`. It refits a
+/// `k`-component mixture on the training rows and scores the eval rows.
+pub fn mixture_density_provider<'a>(
+    data: ArrayView2<'a, f64>,
+    k: usize,
+    config: GaussianMixtureConfig,
+) -> HeldOutDensityProvider<'a> {
+    let owned = data.to_owned();
+    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+        let train_mat = gather_rows(owned.view(), train);
+        let fit = fit_gaussian_mixture(train_mat.view(), k.min(train.len().max(1)), config)?;
+        let eval_mat = gather_rows(owned.view(), eval);
+        let dens = fit.per_point_log_density(eval_mat.view())?;
+        Ok(dens.to_vec())
+    })
+}
+
+fn gather_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
+    let d = data.ncols();
+    let mut out = Array2::<f64>::zeros((idx.len(), d));
+    for (r, &i) in idx.iter().enumerate() {
+        for c in 0..d {
+            out[[r, c]] = data[[i, c]];
+        }
+    }
+    out
+}
+
+/// Deterministic contiguous `folds`-way CV partition of `0..n` (no clock
+/// randomness). Returns, for each fold, `(train_indices, eval_indices)`.
+pub fn deterministic_cv_folds(n: usize, folds: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
+    let folds = folds.clamp(2, n.max(2));
+    let mut out = Vec::with_capacity(folds);
+    for f in 0..folds {
+        let mut train = Vec::new();
+        let mut eval = Vec::new();
+        for i in 0..n {
+            // Strided assignment is deterministic and balances fold sizes.
+            if i % folds == f {
+                eval.push(i);
+            } else {
+                train.push(i);
+            }
+        }
+        if !eval.is_empty() && !train.is_empty() {
+            out.push((train, eval));
+        }
+    }
+    out
+}
+
+/// Build the selection-time held-out predictive log-density table
+/// `log_density[i, c] = log p_c(y_i | train_fold(i))`, with one column per
+/// candidate provider. Each row `i` is scored by the candidate refit on the CV
+/// fold whose eval set contains `i`, so every entry is genuinely held out. This
+/// is exactly the table that feeds
+/// [`crate::solver::evidence::solve_stacking_weights`].
+pub fn build_cv_log_density_table(
+    n: usize,
+    folds: usize,
+    providers: &[HeldOutDensityProvider<'_>],
+) -> Result<Array2<f64>, String> {
+    if providers.is_empty() {
+        return Err("stacking table requires at least one candidate provider".to_string());
+    }
+    let partition = deterministic_cv_folds(n, folds);
+    if partition.is_empty() {
+        return Err("stacking CV partition is empty (n too small for folds)".to_string());
+    }
+    let mut table = Array2::<f64>::from_elem((n, providers.len()), f64::NEG_INFINITY);
+    for (train, eval) in &partition {
+        for (col, provider) in providers.iter().enumerate() {
+            let dens = provider(train, eval)?;
+            if dens.len() != eval.len() {
+                return Err(format!(
+                    "provider {col} returned {} densities for {} eval rows",
+                    dens.len(),
+                    eval.len()
+                ));
+            }
+            for (slot, &row) in eval.iter().enumerate() {
+                table[[row, col]] = dens[slot];
+            }
+        }
+    }
+    Ok(table)
+}
+
+/// Adjudicated outcome of a cross-class race. When the race mixes a smooth
+/// manifold candidate with the discrete-mixture rung, `headline` is the stacking
+/// verdict (held-out predictive log-density), and the rank-aware Laplace
+/// evidence is retained per-candidate as corroboration. Same-class races report
+/// `Headline::Evidence` (winner-take-all on rank-aware evidence).
+#[derive(Debug, Clone)]
+pub struct CrossClassRaceVerdict {
+    /// Candidate display names, column-aligned with the stacking table / weights.
+    pub candidate_names: Vec<String>,
+    /// Whether the race actually mixed model classes (smooth vs discrete).
+    pub is_cross_class: bool,
+    /// Rank-aware Laplace negative-log-evidence per candidate (corroboration;
+    /// lower is better).
+    pub negative_log_evidence: Vec<f64>,
+    /// Stacking weights over the candidates (present iff `is_cross_class`).
+    pub stacking: Option<StackingWeights>,
+    /// Index of the headline winner. For cross-class races this is the max
+    /// stacking-weight candidate; for same-class it is the min-evidence one.
+    pub winner_index: usize,
+    /// Which statistic drove the headline.
+    pub headline: Headline,
+}
+
+/// Which statistic adjudicated the headline ranking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Headline {
+    /// Rank-aware Laplace evidence (same-class race, winner-take-all).
+    Evidence,
+    /// Held-out predictive log-density / stacking weights (cross-class race).
+    Stacking,
+}
+
+/// One candidate entering the cross-class adjudicator: its kind, its rank-aware
+/// Laplace negative-log-evidence (already computed on the common scale), and a
+/// selection-time held-out-density provider that refits per CV fold.
+pub struct CrossClassCandidate<'a> {
+    pub kind: AutoTopologyKind,
+    pub negative_log_evidence: f64,
+    pub density_provider: HeldOutDensityProvider<'a>,
+}
+
+/// Adjudicate a race that may mix smooth-manifold and discrete-mixture
+/// candidates. Cross-class mixing is auto-detected from the candidate kinds (a
+/// race is cross-class iff it contains BOTH at least one smooth/Euclidean
+/// candidate AND at least one [`AutoTopologyKind::Mixture`]). When cross-class,
+/// the headline switches to stacking over a selection-time CV held-out
+/// log-density table; otherwise the headline is the rank-aware evidence winner.
+pub fn adjudicate_cross_class_race(
+    n: usize,
+    candidates: Vec<CrossClassCandidate<'_>>,
+    folds: usize,
+    stacking_config: StackingConfig,
+) -> Result<CrossClassRaceVerdict, String> {
+    if candidates.is_empty() {
+        return Err("cross-class race requires at least one candidate".to_string());
+    }
+    let names: Vec<String> = candidates.iter().map(|c| c.kind.display_name()).collect();
+    let evidence: Vec<f64> = candidates
+        .iter()
+        .map(|c| c.negative_log_evidence)
+        .collect();
+
+    let has_mixture = candidates.iter().any(|c| c.kind.is_discrete_mixture());
+    let has_smooth = candidates.iter().any(|c| !c.kind.is_discrete_mixture());
+    let is_cross_class = has_mixture && has_smooth;
+
+    if !is_cross_class {
+        // Same-class: winner-take-all on rank-aware evidence (lower wins).
+        let mut winner_index = 0usize;
+        let mut best = f64::INFINITY;
+        for (idx, &nle) in evidence.iter().enumerate() {
+            if nle.is_finite() && nle < best {
+                best = nle;
+                winner_index = idx;
+            }
+        }
+        return Ok(CrossClassRaceVerdict {
+            candidate_names: names,
+            is_cross_class: false,
+            negative_log_evidence: evidence,
+            stacking: None,
+            winner_index,
+            headline: Headline::Evidence,
+        });
+    }
+
+    // Cross-class: build the selection-time held-out density table and stack.
+    let providers: Vec<HeldOutDensityProvider<'_>> =
+        candidates.into_iter().map(|c| c.density_provider).collect();
+    let table = build_cv_log_density_table(n, folds, &providers)?;
+    let stacking = solve_stacking_weights(table.view(), stacking_config)?;
+    // Headline winner = max stacking weight (most predictive mass).
+    let mut winner_index = 0usize;
+    let mut best_w = f64::NEG_INFINITY;
+    for (idx, &w) in stacking.weights.iter().enumerate() {
+        if w > best_w {
+            best_w = w;
+            winner_index = idx;
+        }
+    }
+    Ok(CrossClassRaceVerdict {
+        candidate_names: names,
+        is_cross_class: true,
+        negative_log_evidence: evidence,
+        stacking: Some(stacking),
+        winner_index,
+        headline: Headline::Stacking,
+    })
 }
