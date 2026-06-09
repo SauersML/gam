@@ -141,7 +141,6 @@ pub(crate) type PyObject = pyo3::Py<pyo3::PyAny>;
 use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyFloat, PyList, PyString, PyTuple, PyType};
-use regex::Regex;
 use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -2059,68 +2058,85 @@ fn default_survival_time_grid(
         _ => return Ok(None),
     }
 
-    let re = Regex::new(r"\s*Surv\s*\(\s*([^\s,]+)\s*,\s*([^\s,]+)\s*,\s*[^\s,]+\s*\)")
-        .map_err(|err| py_value_error(format!("invalid survival formula regex: {err}")))?;
-    let Some(captures) = re.captures(formula) else {
+    // Parse the survival response with the canonical formula parser rather
+    // than a bespoke regex. The previous regex only matched the three-argument
+    // `Surv(entry, exit, event)` form, so models fit with the right-censored
+    // shorthand `Surv(time, event)` (entry synthesized as zero per row) fell
+    // through to `None`. That collapsed `model.predict` to a degenerate
+    // single-column per-row surface, which `cumulative_hazard_at(grid)` then
+    // re-evaluated as a flat constant for every requested time (the time basis
+    // never got re-evaluated because there was no real grid). Routing through
+    // `parse_surv_response` returns `entry_name: None` for the shorthand, and
+    // we span the grid from a synthesized zero entry.
+    let parsed = parse_formula(formula)
+        .map_err(|err| py_value_error(format!("failed to parse survival formula: {err}")))?;
+    let Some((entry_name, exit_name, _event_name)) = parse_surv_response(&parsed.response)
+        .map_err(|err| py_value_error(format!("failed to parse Surv(...) response: {err}")))?
+    else {
         return Ok(None);
     };
-    let entry_name = captures
-        .get(1)
-        .map(|matched| matched.as_str())
-        .unwrap_or_default();
-    let exit_name = captures
-        .get(2)
-        .map(|matched| matched.as_str())
-        .unwrap_or_default();
 
     let header_to_index: HashMap<&str, usize> = headers
         .iter()
         .enumerate()
         .map(|(index, name)| (name.as_str(), index))
         .collect();
-    let entry_idx = header_to_index.get(entry_name).copied();
-    let exit_idx = header_to_index.get(exit_name).copied();
-    if entry_idx.is_none() || exit_idx.is_none() {
-        let mut missing = Vec::new();
-        if entry_idx.is_none() {
-            missing.push(entry_name);
+    // `entry_name == None` is the two-argument shorthand `Surv(time, event)`:
+    // every subject enters at time zero, so the grid lower bound is zero and
+    // there is no entry column to read per row.
+    let entry_idx = match entry_name.as_deref() {
+        Some(name) => match header_to_index.get(name).copied() {
+            Some(idx) => Some(idx),
+            None => {
+                return Err(py_value_error(format!(
+                    "survival prediction data is missing required time column(s): {name}"
+                )));
+            }
+        },
+        None => None,
+    };
+    let exit_idx = match header_to_index.get(exit_name.as_str()).copied() {
+        Some(idx) => idx,
+        None => {
+            return Err(py_value_error(format!(
+                "survival prediction data is missing required time column(s): {exit_name}"
+            )));
         }
-        if exit_idx.is_none() {
-            missing.push(exit_name);
-        }
-        return Err(py_value_error(format!(
-            "survival prediction data is missing required time column(s): {}",
-            missing.join(", ")
-        )));
-    }
-    let entry_idx = entry_idx.unwrap();
-    let exit_idx = exit_idx.unwrap();
+    };
 
-    let entry_name_repr = python_string_repr(entry_name);
-    let exit_name_repr = python_string_repr(exit_name);
+    let entry_name_repr = entry_name
+        .as_deref()
+        .map(python_string_repr)
+        .unwrap_or_else(|| "<implicit zero entry>".to_string());
+    let exit_name_repr = python_string_repr(&exit_name);
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     let mut observed = false;
     for (row_index, row) in rows.iter().enumerate() {
-        let entry_cell = row.get(entry_idx).ok_or_else(|| {
-            py_value_error(format!(
-                "survival entry column {entry_name_repr} is missing at row {}",
-                row_index + 1
-            ))
-        })?;
         let exit_cell = row.get(exit_idx).ok_or_else(|| {
             py_value_error(format!(
                 "survival exit column {exit_name_repr} is missing at row {}",
                 row_index + 1
             ))
         })?;
-        let entry_value = entry_cell.parse::<f64>().map_err(|_| {
-            let entry_cell_repr = python_string_repr(entry_cell);
-            py_value_error(format!(
-                "survival entry column {entry_name_repr} has a non-numeric value at row {}: {entry_cell_repr}",
-                row_index + 1
-            ))
-        })?;
+        let entry_value = match entry_idx {
+            None => 0.0,
+            Some(idx) => {
+                let entry_cell = row.get(idx).ok_or_else(|| {
+                    py_value_error(format!(
+                        "survival entry column {entry_name_repr} is missing at row {}",
+                        row_index + 1
+                    ))
+                })?;
+                entry_cell.parse::<f64>().map_err(|_| {
+                    let entry_cell_repr = python_string_repr(entry_cell);
+                    py_value_error(format!(
+                        "survival entry column {entry_name_repr} has a non-numeric value at row {}: {entry_cell_repr}",
+                        row_index + 1
+                    ))
+                })?
+            }
+        };
         let exit_value = exit_cell.parse::<f64>().map_err(|_| {
             let exit_cell_repr = python_string_repr(exit_cell);
             py_value_error(format!(
