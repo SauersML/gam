@@ -65,6 +65,60 @@ pub(super) fn madsen_lm_accept_factor(rho: f64) -> f64 {
     (1.0 - cube).clamp(1.0 / 3.0, 2.0)
 }
 
+/// Whether a constrained iterate `(beta, gradient)` sits within the SAME
+/// degeneracy-aware constraint-KKT acceptance band the outer REML startup gate
+/// (`enforce_constraint_kkt`) applies, and so may be soft-accepted as a valid
+/// constrained minimum.
+///
+/// A soft acceptance based on an objective plateau or an `objective_scale`-
+/// relative gradient band is not, on its own, a constrained-stationarity
+/// certificate: the inner solve can flatten the penalized deviance on a
+/// near-vertex face of a curvature cone (shape=convex/concave) while the
+/// constrained KKT residual still stalls far above the outer gate's *absolute*
+/// tolerance. Accepting such a point lets the fit's success hinge on which ρ
+/// the seed loop started from — the warm-start cache vs cold-cache divergence
+/// of #873. Gating every constrained soft-acceptance on this band keeps the
+/// inner verdict in lockstep with the outer gate, so the fit is cache-
+/// independent.
+///
+/// The band mirrors the outer gate exactly: a genuinely rank-deficient active
+/// face (the underdetermined I-spline case the plateau branch was built for)
+/// gets the relaxed `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL`; a
+/// non-degenerate face is held to a strict band (`10 · kkt_tolerance`, the same
+/// near-stationary band `near_stationary_kkt` uses), kept well under the outer
+/// gate's absolute stationarity tolerance. Returns `true` for an unconstrained
+/// fit (no constraint-KKT gate to honour) and when no constraint rows can be
+/// derived (no bound is finite).
+fn constraint_kkt_admits_soft_accept(
+    options: &WorkingModelPirlsOptions,
+    beta: &Array1<f64>,
+    gradient: &Array1<f64>,
+    kkt_tolerance: f64,
+) -> bool {
+    // Mirror the exported-diagnostic construction in the result assembly (and
+    // the outer gate's input): prefer explicit linear constraints, else derive
+    // the constraint rows from the coordinate lower bounds.
+    let diag = match options.linear_constraints.as_ref() {
+        Some(lin) => Some(compute_constraint_kkt_diagnostics(beta, gradient, lin)),
+        None => options.coefficient_lower_bounds.as_ref().and_then(|lb| {
+            linear_constraints_from_lower_bounds(lb)
+                .map(|lin| compute_constraint_kkt_diagnostics(beta, gradient, &lin))
+        }),
+    };
+    match diag {
+        None => true,
+        Some(kkt) => {
+            let stationarity_band = if kkt.working_set_rank_deficient {
+                crate::solver::active_set::ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL
+            } else {
+                kkt_tolerance * 10.0
+            };
+            kkt.primal_feasibility <= crate::solver::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                && kkt.stationarity <= stationarity_band
+        }
+    }
+}
+
 pub fn runworking_model_pirls<M, F>(
     model: &mut M,
     mut beta: Coefficients,
@@ -1406,6 +1460,41 @@ where
                             break 'pirls_loop;
                         }
 
+                        // An objective plateau or a relative-band soft
+                        // acceptance is NOT, on its own, a constrained
+                        // stationarity certificate: the inner solve can flatten
+                        // the penalized deviance — or drive the projected
+                        // gradient below an `objective_scale`-relative band — on
+                        // a near-vertex face of a curvature cone
+                        // (shape=convex/concave) while the constrained KKT
+                        // residual still stalls at ~1e-4, far above the outer
+                        // startup gate's *absolute* acceptance tolerance.
+                        // Soft-accepting such a point makes the fit's *success*
+                        // depend on which ρ the seed loop happens to start from
+                        // (a warm-start cache hands a pre-converged ρ whose
+                        // constrained optimum binds fewer rows and certifies
+                        // cleanly; a cold cache starts at an over-smoothed ρ
+                        // whose optimum sits on the stalled face), so the same
+                        // data+formula returns a different curve — or aborts —
+                        // depending on cache state (#873). Gate every
+                        // soft-acceptance exit of a *constrained* fit on the SAME
+                        // degeneracy-aware constraint-KKT band the outer
+                        // validation gate (`enforce_constraint_kkt`) applies, so
+                        // a point the inner solve declares a valid minimum is one
+                        // the outer gate will also accept regardless of the seed
+                        // ρ. A genuinely rank-deficient active face (the
+                        // underdetermined I-spline case the plateau branch was
+                        // built for) keeps its relaxed stationarity band; a
+                        // non-degenerate stall (the #873 face) is held to the
+                        // strict band and the solve keeps iterating.
+                        let soft_accept_kkt_ok = !has_explicit_constraints
+                            || constraint_kkt_admits_soft_accept(
+                                options,
+                                beta.as_ref(),
+                                &final_state_ref.gradient,
+                                kkt_tolerance,
+                            );
+
                         // Soft acceptance: every criterion the post-loop
                         // rescue would apply to a fit that has hit
                         // MaxIterations, evaluated per-iter so a fit that
@@ -1418,7 +1507,12 @@ where
                         // the band — when the optimizer has truly settled,
                         // two consecutive matches cost only one extra
                         // iteration of inner work and give principled
-                        // protection against false positives.
+                        // protection against false positives. For a
+                        // constrained fit the soft acceptance additionally
+                        // requires the constraint-KKT band above, so a
+                        // relative-band / boundary-saturation plateau on a
+                        // non-degenerate cone face cannot mask a stalled,
+                        // outer-gate-rejected iterate (#873).
                         match pirls_soft_acceptance(
                             final_state_ref,
                             convergence_grad_norm,
@@ -1428,7 +1522,9 @@ where
                             max_abs_eta,
                             options.convergence_tolerance,
                             kkt_tolerance,
-                        ) {
+                        )
+                        .filter(|_| soft_accept_kkt_ok)
+                        {
                             Some(reason) => {
                                 plateau_streak += 1;
                                 if plateau_streak >= 2 {
@@ -1456,13 +1552,17 @@ where
                         // clipping boundary. This is deliberately separate
                         // from the two-iteration soft-acceptance gate above:
                         // unconstrained one-off plateaus must still run out
-                        // as MaxIterationsReached.
+                        // as MaxIterationsReached. The same constraint-KKT
+                        // band (`constraint_kkt_admits_soft_accept`) gates this
+                        // plateau too, so a non-degenerate near-vertex stall is
+                        // not accepted as a valid minimum (#873).
                         let objective_scale = final_state_ref
                             .deviance
                             .abs()
                             .max(final_state_ref.penalty_term.abs())
                             .max(1.0);
                         let strict_objective_plateau = has_explicit_constraints
+                            && soft_accept_kkt_ok
                             && deviance_change.is_finite()
                             && deviance_change >= 0.0
                             && deviance_change.abs()
@@ -1848,7 +1948,23 @@ where
                 _ => false,
             };
 
-            if iter_cheap && deviance_ok && grad_ok {
+            // (d) For a constrained fit, a relative gradient collapse is not a
+            // constrained-stationarity certificate (the absolute constraint-KKT
+            // residual can stall on a non-degenerate cone face while ‖g‖/‖g₀‖
+            // looks small for a large ‖g₀‖). Hold the timing exit to the SAME
+            // degeneracy-aware band the outer gate uses, so a cold-cache fit
+            // cannot coast off a stalled face the outer gate would reject (#873).
+            let constrained_kkt_ok = !has_explicit_constraints
+                || final_state.as_ref().is_some_and(|st| {
+                    constraint_kkt_admits_soft_accept(
+                        options,
+                        beta.as_ref(),
+                        &st.gradient,
+                        kkt_tolerance,
+                    )
+                });
+
+            if iter_cheap && deviance_ok && grad_ok && constrained_kkt_ok {
                 log::info!(
                     "[PIRLS] iter {iter} timing-driven adaptive early-exit: \
                      iter={:.4}s ema={:.4}s dev_rel={:.3e} grad_ratio={:.3e}",
@@ -1924,7 +2040,7 @@ where
                  (‖g‖={final_projected_grad:.3e})"
             );
             status = PirlsStatus::StalledAtValidMinimum;
-        } else if let Some(reason) = pirls_soft_acceptance(
+        } else if pirls_soft_acceptance(
             &state,
             final_projected_grad,
             SoftAcceptProgress::Realized {
@@ -1933,9 +2049,25 @@ where
             max_abs_eta,
             options.convergence_tolerance,
             kkt_tolerance,
-        ) {
+        )
+        // A constrained fit may only be rescued onto a plateau / relative-band /
+        // boundary-saturation soft acceptance when its constraint-KKT residual
+        // is within the SAME degeneracy-aware band the outer gate applies, so
+        // the rescue cannot certify a stalled non-degenerate cone face the outer
+        // gate would reject (#873). Unconstrained fits keep the existing rescue.
+        .filter(|_| {
+            !has_explicit_constraints
+                || constraint_kkt_admits_soft_accept(
+                    options,
+                    beta.as_ref(),
+                    &state.gradient,
+                    kkt_tolerance,
+                )
+        })
+        .is_some()
+        {
             log::debug!(
-                "[PIRLS] post-loop rescue on soft acceptance: {reason:?} \
+                "[PIRLS] post-loop rescue on soft acceptance \
                  (‖g‖={final_projected_grad:.3e}, \
                  Δdev={last_deviance_change:.3e})"
             );
