@@ -48,7 +48,7 @@ itself, and the library is provably wrong at the cut locus.
 
 | count | classification |
 |------:|----------------|
-| 3 | OFFENDER (manifold-library-as-truth) — **2 converted this pass**, 1 remaining |
+| 3 | OFFENDER (manifold-library-as-truth) — **ALL 3 CONVERTED** (Grassmann pair + SPD crabs) |
 | ~8 | BORDERLINE / GOOD-by-exception (analytic calculator: closed geometric mean, CLR, normal CDF / PIT, sinh-arcsinh CDF + FD derivatives, exact conjugate posterior) |
 | ~137 | GOOD (truth-recovery vs DGP / analytic / held-out + match-or-beat) |
 
@@ -58,7 +58,7 @@ itself, and the library is provably wrong at the cut locus.
 |---|---|---|---|
 | `quality_vs_geomstats_olive_oils_grassmann.rs` | OFFENDER → **CONVERTED** (commit `debfa0325`) | was `assert!(dist_diff < 1e-9)` with `dist_diff = max_abs_diff(&gam_dist, gs_dist)` (geomstats `metric.dist`); 2nd fn `assert!(dist_diff < 1e-7)` with `dist_diff = max_abs_diff(&dist_matrix, gs_dist)` | Now asserts gam geodesic distance == ANALYTIC arc length `√(Σ arccos²(σ_i))` (σ = SVD of YᵢᵀYⱼ), computed in Rust via the existing `principal_angles` helper. geomstats kept only as informational match-or-beat AWAY from the π/2 cut locus + a cross-tool witness that geomstats' OWN angle-rss matches the analytic arc length (isolating the bug to its projector `metric.dist`). |
 | `quality_vs_geomstats_grassmann_exp_log_roundtrip.rs` | OFFENDER (trailing cross-check only; primary was already analytic) → **CONVERTED** (commit `c40927b95`) | was `assert!(exp_angle_diff < 1e-9)` / `assert!(log_angle_diff < 1e-9)` with `*_diff = max_abs_diff(&gam_*_angles, gs_*)` calling geomstats "mathematical truth" | Cross-check is now a match-or-beat ACCURACY baseline: geomstats scores its OWN axiom errors (endpoint angles vs σ, log spectrum vs σ, isometry) against the SAME analytic σ the test builds, and gam's error must be `<=` geomstats' (+1e-12 float slack). Both helpers (Rust + Python) hardened to the well-conditioned `atan2(sin θ, cos θ)` path (no `arccos(~1)`). Primary analytic axioms (1e-10/1e-9) untouched. |
-| `quality_vs_geomstats_crabs_spd_manifold.rs` | **OFFENDER (remaining — top conversion target for next pass)** | `assert!(dist_err < 1e-8)` at L405 and L638 with `dist_err = max_abs_diff(&gam_dist, ref_dist)`; `assert!(mean_rel < 1e-6)` at L416 with `mean_rel = relative_l2(&gam_mean_flat, ref_mean)` — all vs geomstats output, called "geomstats ground truth" | Replace the distance assertion with gam's affine-invariant SPD distance == the ANALYTIC closed form `d(A,B) = √(Σ log²(λ_i))`, where λ_i are the generalized eigenvalues of (A,B) (equivalently eigenvalues of `A^{-1/2} B A^{-1/2}`), computed in Rust directly from the SPD matrices. Replace the Fréchet-mean-vs-geomstats equality with a match-or-beat on the Fréchet-variance OBJECTIVE (gam's intrinsic mean must be at least as central as geomstats', evaluated on a common metric) — exactly as the olive-oils real-data arm now does. The held-out classification accuracy assertions (L621 `gam_acc≈1`, L629 match-or-beat geomstats) are already GOOD; only the distance/mean equality gates are the offense. Same #904 cut-locus risk applies to the affine-invariant metric. |
+| `quality_vs_geomstats_crabs_spd_manifold.rs` | OFFENDER → **CONVERTED** (same commit as this audit update) | was `assert!(dist_err < 1e-8)` (both fns) with `dist_err = max_abs_diff(&gam_dist, ref_dist)`; `assert!(mean_rel < 1e-6)` with `mean_rel = relative_l2(&gam_mean_flat, ref_mean)` — all vs geomstats output, called "geomstats ground truth" | Distance now asserts gam's affine-invariant SPD distance == the ANALYTIC closed form `d(A,B) = √(Σ log²(λ_i))` (λ_i = eigenvalues of `A^{-1/2} B A^{-1/2}`), computed in Rust via a new cyclic-Jacobi `sym_eig` + `spd_affine_distance` (no external linalg, independent of gam's maps). Fréchet-mean-vs-geomstats equality replaced by (a) the existing INTRINSIC first-order optimality axiom (gradient ≈ 0 at gam's center) and (b) a match-or-beat on the Fréchet-variance objective (gam's mean squared analytic geodesic distance ≤ geomstats' + 1e-6 rel slack). geomstats `metric.dist` / center / its-own-log-of-gam-center now informational only. Both fns (synthetic + held-out) converted; the held-out accuracy gates (`gam_acc≈1`, match-or-beat geomstats) were already GOOD and kept. |
 
 ## BORDERLINE (GOOD-by-exception — reference is a calculator of exact math)
 
@@ -96,11 +96,10 @@ reference only as a `gam_err <= ref_err * 1.10` match-or-beat baseline, with any
 
 ## Recommended next-pass conversions (seeded for future work, not done here)
 
-1. **`quality_vs_geomstats_crabs_spd_manifold.rs`** — the one remaining proven
-   OFFENDER. Same #904 fix as Grassmann: assert gam's affine-invariant SPD
-   distance vs the analytic `√(Σ log²(λ_i))` closed form computed in Rust;
-   convert the Fréchet-mean-vs-geomstats equality to a match-or-beat on the
-   Fréchet-variance objective.
+1. ~~`quality_vs_geomstats_crabs_spd_manifold.rs`~~ — **DONE** (all 3 proven
+   offenders now converted): asserts gam's affine-invariant SPD distance vs the
+   analytic `√(Σ log²(λ_i))` closed form computed in Rust; Fréchet-mean equality
+   replaced by intrinsic optimality + Fréchet-variance match-or-beat.
 2. De-reference the BORDERLINE composition tests (robcompositions / skye_afm) by
    computing the closed geometric mean + CLR in Rust rather than asserting tight
    equality to the R library's output — removes the library from the truth path
