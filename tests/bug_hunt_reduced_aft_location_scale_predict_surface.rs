@@ -184,7 +184,11 @@ fn reduced_aft_location_scale_predicts_correct_log_t_surface() {
         .arg(&train_path)
         // Lognormal location-scale AFT: the reduced parametric-AFT regime fires
         // (a single parametric covariate, constant scale, no smooth time warp).
-        .arg(r#"Surv(t, d) ~ x + survmodel(spec="transformation", distribution="lognormal")"#)
+        // `--survival-likelihood location-scale` with the default Gaussian
+        // residual on log-time IS the lognormal AFT; the `survmodel(...)` term
+        // is library-transformation-only syntax the CLI one-hazard fitter
+        // rejects, so the formula is the bare `Surv(t, d) ~ x`.
+        .arg("Surv(t, d) ~ x")
         .args(["--survival-likelihood", "location-scale"])
         .arg("--out")
         .arg(&model_path);
