@@ -142,82 +142,105 @@ pub fn sindy_stlsq_solve(
     let mut xi = ridge_full_solve(theta, dz_dt, lam_seed)?;
     let lqa_eps = (tol * 1.0e-2).max(1.0e-10);
 
-    let mut active = vec![true; p];
-    let mut prev_active = vec![false; p];
+    // Support is tracked as a `p × d` boolean mask: STLSQ is defined per output
+    // column, so each output `c` carries its own active feature set `mask[.,c]`
+    // and is refit and thresholded independently. (Tracking a single per-feature
+    // boolean and refitting every column on the feature UNION returns matrices
+    // that are not STLSQ fixed points — issue #958.)
+    let mut mask = Array2::<bool>::from_elem((p, d), true);
+    let mut prev_mask = Array2::<bool>::from_elem((p, d), false);
     let mut rounds_used = 0usize;
     let mut converged = false;
 
     for round in 0..max_rounds {
         rounds_used = round + 1;
-        // Hard-threshold: an entry is kept active for column c iff
-        // |xi[j,c]| >= tol AND already in the active set. The active-set per
-        // output column can differ; we operate per column.
-        // Active union (any state-var needs it) determines theta column slice
-        // for sharing the same Gram factorization across outputs.
+        // Hard-threshold each coefficient independently: an entry `(j, c)` is
+        // kept active iff it was active and `|xi[j,c]| >= tol`; otherwise it is
+        // zeroed and dropped from this output column's support.
         for j in 0..p {
-            let mut keep = false;
             for c in 0..d {
-                if active[j] && xi[(j, c)].abs() >= tol {
-                    keep = true;
-                } else {
+                if !(mask[(j, c)] && xi[(j, c)].abs() >= tol) {
+                    mask[(j, c)] = false;
                     xi[(j, c)] = 0.0;
                 }
             }
-            active[j] = keep;
         }
-        if active.iter().all(|x| !*x) {
-            // Everything thresholded out: nothing to refit.
-            converged = prev_active == active;
-            if converged {
-                break;
-            }
-            prev_active.copy_from_slice(&active);
-            continue;
-        }
-        if active == prev_active {
+        // Convergence compares the FULL per-column mask: STLSQ has reached a
+        // fixed point only when no output column's support changed.
+        if mask == prev_mask {
             converged = true;
             break;
         }
-        prev_active.copy_from_slice(&active);
-
-        // Refit on the active set with LQA-weighted ridge.
-        let active_idx: Vec<usize> = active
-            .iter()
-            .enumerate()
-            .filter_map(|(j, &on)| if on { Some(j) } else { None })
-            .collect();
-        let p_act = active_idx.len();
-        let mut theta_act = Array2::<f64>::zeros((n, p_act));
-        for (k, &j) in active_idx.iter().enumerate() {
-            theta_act.column_mut(k).assign(&theta.column(j));
+        prev_mask.assign(&mask);
+        if mask.iter().all(|&on| !on) {
+            // Everything thresholded out: the next round's mask is identical, so
+            // continue to let the convergence check above fire.
+            continue;
         }
 
-        // Build per-coordinate ridge diagonal from current |xi| magnitudes
-        // (averaged across output columns: SCAD/MCP are scalar penalties on
-        // |ξ| — we use the row-max magnitude as the conservative LQA anchor
-        // so a coefficient ever "large" in one column relaxes its surrogate
-        // shrinkage uniformly, matching the elementwise-row interpretation
-        // used in the Brunton extensions).
-        let mut diag = Array1::<f64>::zeros(p_act);
-        for (k, &j) in active_idx.iter().enumerate() {
-            let mut mag = 0.0_f64;
-            for c in 0..d {
-                let v = xi[(j, c)].abs();
-                if v > mag {
-                    mag = v;
+        // Refit each output column on ITS OWN active feature set with
+        // per-coordinate LQA-weighted ridge. Output columns that share the
+        // exact same support are grouped so they can share the Gram assembly;
+        // within a group, ridge shares one factorization (constant diagonal),
+        // while SCAD/MCP factor per column (the per-coordinate weight differs).
+        let mut refit = Array2::<f64>::zeros((p, d));
+        let mut handled = vec![false; d];
+        for c0 in 0..d {
+            if handled[c0] {
+                continue;
+            }
+            let active_idx: Vec<usize> = (0..p).filter(|&j| mask[(j, c0)]).collect();
+            if active_idx.is_empty() {
+                handled[c0] = true;
+                continue;
+            }
+            // Gather all output columns sharing exactly this support.
+            let group: Vec<usize> = (c0..d)
+                .filter(|&c| (0..p).all(|j| mask[(j, c)] == mask[(j, c0)]))
+                .collect();
+
+            let p_act = active_idx.len();
+            let mut theta_act = Array2::<f64>::zeros((n, p_act));
+            for (k, &j) in active_idx.iter().enumerate() {
+                theta_act.column_mut(k).assign(&theta.column(j));
+            }
+
+            if matches!(kind, SindyPenaltyKind::Ridge) {
+                // Constant ridge diagonal `lam` across the group → one
+                // factorization solves every group column at once.
+                let diag = Array1::<f64>::from_elem(p_act, lam);
+                let mut rhs = Array2::<f64>::zeros((n, group.len()));
+                for (gk, &c) in group.iter().enumerate() {
+                    rhs.column_mut(gk).assign(&dz_dt.column(c));
+                }
+                let sol = ridge_diag_solve(theta_act.view(), rhs.view(), diag.view())?;
+                for (gk, &c) in group.iter().enumerate() {
+                    for (k, &j) in active_idx.iter().enumerate() {
+                        refit[(j, c)] = sol[(k, gk)];
+                    }
+                    handled[c] = true;
+                }
+            } else {
+                // SCAD/MCP: the LQA weight is per coefficient `(j, c)` —
+                // `p'(|ξ_jc|)/max(|ξ_jc|, ε)` — so each output column carries
+                // its own diagonal and is solved separately (issue #959: a
+                // single row-max weight is not a majorizer of the separable
+                // penalty).
+                for &c in &group {
+                    let mut diag = Array1::<f64>::zeros(p_act);
+                    for (k, &j) in active_idx.iter().enumerate() {
+                        diag[k] = lqa_weight(kind, xi[(j, c)].abs(), lam, concave_a, lqa_eps);
+                    }
+                    let rhs = dz_dt.column(c).to_owned().insert_axis(Axis(1));
+                    let sol = ridge_diag_solve(theta_act.view(), rhs.view(), diag.view())?;
+                    for (k, &j) in active_idx.iter().enumerate() {
+                        refit[(j, c)] = sol[(k, 0)];
+                    }
+                    handled[c] = true;
                 }
             }
-            diag[k] = lqa_weight(kind, mag, lam, concave_a, lqa_eps);
         }
-
-        let xi_act = ridge_diag_solve(theta_act.view(), dz_dt, diag.view())?;
-        // Scatter back.
-        xi.fill(0.0);
-        for (k, &j) in active_idx.iter().enumerate() {
-            for c in 0..d {
-                xi[(j, c)] = xi_act[(k, c)];
-            }
-        }
+        xi = refit;
     }
 
     // Final hard-threshold pass.
@@ -601,5 +624,161 @@ mod tests {
         assert!((res.coefficients[(1, 1)] + 1.0).abs() < 0.05);
         assert!(res.coefficients[(0, 0)].abs() < 1.0e-6);
         assert!(res.coefficients[(2, 1)].abs() < 1.0e-6);
+    }
+
+    /// Regression for #958: each output column must be refit on its OWN active
+    /// set, not on the feature UNION across outputs. With two correlated
+    /// features θ0, θ1 and outputs y1 = 2·θ1, y2 = θ0 + 0.4·θ1 at tol = 0.5:
+    ///   * y1 keeps θ1 (coef 2 ≥ tol) and drops θ0;
+    ///   * y2's θ1 coefficient (0.4) is below tol, so per-output STLSQ drops θ1
+    ///     and refits y2 on support {θ0} ⇒ coef = θ0ᵀy2 / θ0ᵀθ0 ≠ 1.
+    /// The old union-support code would keep θ1 for y2 (because y1 needs it),
+    /// refit y2 to [1, 0.4], then entrywise-threshold 0.4→0 and return [1, 0] —
+    /// which is NOT the STLSQ fixed point on {θ0}.
+    #[test]
+    fn stlsq_refits_each_output_on_its_own_support_958() {
+        // Two correlated columns with θ0ᵀθ1 = r·(unit norms). Deterministic.
+        let theta0 = [1.0_f64, 0.0, 0.0, 0.0];
+        // θ1 chosen so cos-angle r ≈ 0.89 with θ0 and a clean second component.
+        let r = 0.89_f64;
+        let s = (1.0_f64 - r * r).sqrt();
+        let theta1 = [r, s, 0.0, 0.0];
+
+        let n = 4;
+        let mut theta = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            theta[(i, 0)] = theta0[i];
+            theta[(i, 1)] = theta1[i];
+        }
+        // Outputs: y1 = 2·θ1 (needs θ1), y2 = θ0 + 0.4·θ1 (θ1 below tol).
+        let mut dz = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            dz[(i, 0)] = 2.0 * theta1[i];
+            dz[(i, 1)] = theta0[i] + 0.4 * theta1[i];
+        }
+
+        // Tiny ridge so the hard threshold (not L2) governs the support.
+        let res = sindy_stlsq_solve(
+            theta.view(),
+            dz.view(),
+            0.5,
+            20,
+            1.0e-9,
+            SindyPenaltyKind::Ridge,
+            3.7,
+        )
+        .expect("stlsq must succeed");
+        assert!(res.converged);
+
+        // y2 (column 1) support is exactly {θ0}: θ1 dropped.
+        assert!(
+            res.coefficients[(1, 1)].abs() < 1.0e-12,
+            "y2 must drop θ1 (its coef 0.4 < tol 0.5); got {}",
+            res.coefficients[(1, 1)]
+        );
+
+        // The surviving θ0 coefficient is the per-output ridge refit on {θ0}:
+        // θ0ᵀy2 / (θ0ᵀθ0 + ridge). With near-zero ridge this is θ0ᵀy2/θ0ᵀθ0.
+        let g0: f64 = (0..n).map(|i| theta0[i] * theta0[i]).sum::<f64>() + 1.0e-9;
+        let xy: f64 = (0..n).map(|i| theta0[i] * dz[(i, 1)]).sum();
+        let expected = xy / g0; // = 1 + 0.4·r ≈ 1.356, NOT 1.
+        assert!(
+            (res.coefficients[(0, 1)] - expected).abs() < 1.0e-6,
+            "y2 θ0 coef must be the per-output refit {expected} (≈1.356), not the \
+             union-support value 1; got {}",
+            res.coefficients[(0, 1)]
+        );
+        // Guard: the union-support bug returned exactly 1.0 here.
+        assert!(
+            (res.coefficients[(0, 1)] - 1.0).abs() > 1.0e-3,
+            "y2 θ0 coef collapsed to the union-support value 1.0 (#958 regression)"
+        );
+
+        // y1 (column 0) keeps θ1 and drops θ0.
+        assert!(
+            res.coefficients[(0, 0)].abs() < 1.0e-12,
+            "y1 must drop θ0; got {}",
+            res.coefficients[(0, 0)]
+        );
+        assert!(
+            (res.coefficients[(1, 0)] - 2.0).abs() < 1.0e-6,
+            "y1 θ1 coef must be 2; got {}",
+            res.coefficients[(1, 0)]
+        );
+    }
+
+    /// Regression for #959: SCAD/MCP LQA weights must be per coefficient
+    /// `(j, c)`, not one row-max weight applied to a whole feature row. With one
+    /// feature carrying a large coefficient (10) in one output and a tiny one
+    /// (0.01) in another, the row-max bug assigns the row weight from |10| (SCAD
+    /// p'(10)=0 for a·λ<10 ⇒ weight 0), so the tiny 0.01 — which needs a large
+    /// weight ≈ λ/0.01 = 100 — would be left UNPENALIZED. Per-coordinate weights
+    /// must shrink the small coefficient toward zero.
+    #[test]
+    fn stlsq_scad_uses_per_coordinate_lqa_weights_959() {
+        // One feature, two outputs, orthonormal design so the unpenalized refit
+        // of each output reproduces its target coefficient exactly and the only
+        // shrinkage is the per-coordinate SCAD weight.
+        //   output 0 target coefficient: 10   (large; SCAD weight 0 — un-shrunk)
+        //   output 1 target coefficient: 0.01 (small; SCAD weight ≈ λ/0.01)
+        let n = 16;
+        let mut theta = Array2::<f64>::zeros((n, 1));
+        for i in 0..n {
+            theta[(i, 0)] = 1.0; // θᵀθ = n
+        }
+        // Targets: constant columns so the LS solution of θ·ξ = y is ξ = mean(y).
+        let mut dz = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            dz[(i, 0)] = 10.0;
+            dz[(i, 1)] = 0.01;
+        }
+
+        let lam = 1.0_f64;
+        let a = 3.7_f64;
+        // tol below 0.01 so neither coefficient is hard-thresholded out: the
+        // test isolates the LQA weighting, not the threshold.
+        let res = sindy_stlsq_solve(
+            theta.view(),
+            dz.view(),
+            1.0e-4,
+            20,
+            lam,
+            SindyPenaltyKind::Scad,
+            a,
+        )
+        .expect("stlsq must succeed");
+
+        // Large coefficient: SCAD p'(10)=0 (since 10 > a·λ = 3.7) ⇒ weight 0 ⇒
+        // unpenalized ⇒ recovered ≈ 10.
+        assert!(
+            (res.coefficients[(0, 0)] - 10.0).abs() < 1.0e-6,
+            "large coef must be left essentially un-shrunk by SCAD; got {}",
+            res.coefficients[(0, 0)]
+        );
+
+        // Small coefficient: it gets its OWN large per-coordinate SCAD weight.
+        // The LQA weight is anchored at the previous iterate; STLSQ converges in
+        // one refit here (the support never changes), so the value reflects the
+        // SEED magnitude. Seed (full-library ridge, lam): ξ₀ = n·0.01/(n+lam).
+        // Its SCAD weight w = p'(|ξ₀|)/max(|ξ₀|,ε) = λ/|ξ₀| (|ξ₀| ≤ λ ⇒ p'=λ),
+        // then the refit is θᵀy/(θᵀθ + w) = n·0.01/(n + w) — heavily shrunk, NOT
+        // the un-penalized 0.01 the row-max bug (weight 0) would leave.
+        let nf = n as f64;
+        let eps = (1.0e-4_f64 * 1.0e-2).max(1.0e-10);
+        let seed_small = nf * 0.01 / (nf + lam.max(1.0e-12));
+        let w_small = scad_grad(seed_small, lam, a) / seed_small.max(eps);
+        let expected_small = (nf * 0.01) / (nf + w_small);
+        assert!(
+            (res.coefficients[(1, 0)] - expected_small).abs() < 1.0e-6,
+            "small coef must get its own large SCAD weight ({w_small}) and be \
+             shrunk to {expected_small}, not the row-max weight 0; got {}",
+            res.coefficients[(1, 0)]
+        );
+        // Guard: the row-max bug would leave the small coef at ~0.01 (weight 0).
+        assert!(
+            res.coefficients[(1, 0)] < 0.01 - 1.0e-4,
+            "small coef was not shrunk — row-max LQA weight bug (#959) present; got {}",
+            res.coefficients[(1, 0)]
+        );
     }
 }
