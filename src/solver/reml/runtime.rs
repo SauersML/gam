@@ -4903,7 +4903,8 @@ impl<'a> RemlState<'a> {
     }
 
     /// Geometric-mean log-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ` over the
-    /// positive-weight rows.
+    /// positive-weight rows — **but only for a profiled-dispersion family**
+    /// (Gaussian-identity). Fixed-dispersion families return exactly `0`.
     ///
     /// The configured outer ρ-prior is evaluated at the weight-anchored
     /// coordinate `ρ̃ = ρ − log g(w)` so that the selected λ̂ is *exactly*
@@ -4920,7 +4921,42 @@ impl<'a> RemlState<'a> {
     /// term keeps the objective *value* invariant; this keeps its *argmin*
     /// invariant. With all weights 1 the anchor is exactly 0, so unweighted fits
     /// (the overwhelming majority) stay byte-identical.
-    fn rho_weight_anchor(&self) -> f64 {
+    ///
+    /// # Why this is gated on profiled dispersion (issue #893)
+    ///
+    /// The drift `ρ̂ → ρ̂ + log c` and the fit-invariance it compensates are a
+    /// *profiled*-dispersion phenomenon: only when the scale φ̂ absorbs the
+    /// weight magnitude (`Var = φ/w`, φ profiled) does a global rescale leave
+    /// β̂/EDF fixed, so that the only correct response is to slide λ̂ — and the
+    /// prior must slide with it. For a **fixed-dispersion** family (φ ≡ 1:
+    /// Poisson, binomial, …) the weight has a *different* meaning entirely: a
+    /// uniform prior weight `w = c` is exact `c`-fold row replication, and
+    /// genuinely more data. Two encodings of the same data — one row with
+    /// weight `c` vs `c` literal copies — share an identical penalized deviance
+    /// `D_p` and identical `XᵀWX`, hence an identical fixed-dispersion LAML
+    /// objective `V(ρ)` and an identical pure-LAML optimum `ρ̂₀` (there is no
+    /// `log c` drift; the data and Occam terms are weighted differently, but
+    /// *identically* between the two encodings). They differ only in their
+    /// per-row log-weight mean — `log c` for the weighted row, `0` for the
+    /// replicated copies. Applying the geometric-mean anchor would therefore
+    /// evaluate the regularizing prior at *different* `ρ̃` for the two encodings
+    /// (`ρ − log c` vs `ρ`), pulling λ̂ apart and making the weighted encoding
+    /// systematically over-smooth (issue #893). The encoding-invariant choice
+    /// is anchor `0`: the prior then acts identically on both encodings (it does
+    /// not need to track the optimum — being O(1) against the O(Σwᵢ) data
+    /// curvature, it is negligible either way; what matters is that it is the
+    /// *same* for the two encodings). Concretely the only weight summary that is
+    /// invariant under `w=c ↔ c-fold replication` is the total weight `Σwᵢ`, not
+    /// the per-row geometric mean `log g(w)` or the row count `n₊`.
+    pub(crate) fn rho_weight_anchor(&self) -> f64 {
+        // Fixed-dispersion families: no profiled scale to absorb the weight
+        // magnitude, so there is no `log c` optimum drift to compensate and a
+        // nonzero anchor would break the `w=c ⇔ c-fold replication` equivalence
+        // in λ-selection (issue #893). Only Gaussian-identity is profiled here
+        // (see the `ProfiledGaussian` vs `Fixed` split in `build_*_context`).
+        if !reml_is_gaussian_identity(&self.config.likelihood) {
+            return 0.0;
+        }
         let mut sum = 0.0;
         let mut count = 0usize;
         for &wi in self.weights.iter() {

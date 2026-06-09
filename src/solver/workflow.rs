@@ -6184,7 +6184,29 @@ fn materialize_standard<'a>(
         optimize_sas: false,
         compute_inference: true,
         max_iter: config.outer_max_iter.unwrap_or(200),
-        tol: 1e-7,
+        // Outer REML/LAML smoothing-selection tolerance. The outer convergence
+        // test (`outer_gradient_tolerance`) uses a `rel_cost` criterion whose
+        // effective projected-gradient threshold is ≈ `tol · (1 + |V(ρ)|)`. The
+        // LAML cost grows like O(n), so at the old `1e-7` the effective gradient
+        // threshold was ≈ `1e-7 · |V|` ≈ 1e-4 for a typical fit — far too coarse
+        // to *resolve* the smoothing parameter: the descent halted while λ̂ could
+        // still move several percent. That under-resolution is benign for a
+        // single fit but breaks an exact invariance — for a fixed-dispersion
+        // family a uniform prior weight `w = c` is exact `c`-fold replication, so
+        // the two encodings share a byte-identical LAML surface and an identical
+        // optimum, yet their (replication-equal) surfaces carry O(1e-7)
+        // floating-point differences AWAY from the optimum. With the coarse
+        // threshold the descent stopped at those encoding-dependent points,
+        // systematically over-smoothing the weighted encoding (gam#893; up to a
+        // ~22× λ ratio across seeds). Tightening to `1e-10` (effective gradient
+        // threshold ≈ 1e-7, ~100× below the FP-noise floor) drives both
+        // encodings to the shared optimum, restoring `w=c ⇔ c-fold replication`
+        // in smoothing selection to optimiser precision. Max-iter is handled
+        // best-effort (the optimiser returns its best ρ on budget exhaustion, it
+        // does not hard-fail), so a harder problem that cannot reach 1e-10 in
+        // `outer_max_iter` is no worse off than before — just better-resolved
+        // when it can.
+        tol: 1e-10,
         nullspace_dims: vec![],
         linear_constraints: None,
         firth_bias_reduction: config.firth,
