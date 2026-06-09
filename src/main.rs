@@ -2225,6 +2225,11 @@ fn run_fitwith_predict_noise(
             (Some(knots), Some(degree), Some(beta)) => Some((knots, degree, beta)),
             _ => None,
         };
+        // Capture the response standardization factor before moving `solved.fit`
+        // out below; the Gaussian σ floor is persisted at
+        // `response_scale·LOGB_SIGMA_FLOOR` so prediction stays
+        // response-scale-equivariant (#884).
+        let gaussian_response_scale = solved.response_scale;
         let BlockwiseTermFitResult {
             fit,
             meanspec_resolved,
