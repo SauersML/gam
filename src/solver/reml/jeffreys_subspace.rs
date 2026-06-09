@@ -1323,6 +1323,97 @@ mod tests {
         );
     }
 
+    /// `joint_jeffreys_hphi_directional_derivative` (the mode-response drift
+    /// `D_β H_Φ[δ]`) must equal the central finite difference of the value-path gated
+    /// curvature `H_Φ` along the coefficient direction `δ`, INCLUDING the below-floor
+    /// regime — the regime the earlier `δK = −K Ḋ K` got wrong and that produced the
+    /// gam#808 frozen-|g| survival-marginal-slope outer stall.
+    ///
+    /// Setup: a β-linear joint Hessian `H(β) = H0 + Σ_a β_a A_a` (so `Hdot[e_a] = A_a`
+    /// constant and the joint second directional derivative is identically zero). We
+    /// FD `H_Φ(t)` along `β = t·δ` with `δ = e_0`, so `pert_h = Hdot[δ] = A_0` and
+    /// `pert_hessian_dir(δ, e_a) = 0`. `H0` is engineered with one reduced eigenvalue
+    /// BELOW the relative floor (a near-separating direction), exactly where the
+    /// floored pseudo-inverse and its moving floor matter.
+    #[test]
+    fn perturbation_derivative_matches_finite_difference_below_floor() {
+        let p = 3usize;
+        let z = Array2::<f64>::eye(p);
+        // H0: large dominant curvature (λ_max ≈ 5e8 ⇒ relative floor = 1e-10·λ_max
+        // ≈ 5e-2) and one tiny eigenvalue (≈1e-4) comfortably BELOW that floor — the
+        // separating direction. The margin (floor ≈ 5e-2 vs λ ≈ 1e-4) keeps the small
+        // eigenvalue below the floor across the whole FD window, so the floored branch
+        // is exercised cleanly without crossing the floor knot.
+        let h0 = array![
+            [5.0e8, 2.0e3, 1.0e2],
+            [2.0e3, 4.0e8, 5.0e1],
+            [1.0e2, 5.0e1, 1.0e-4],
+        ];
+        let make_sym = |seed: f64| -> Array2<f64> {
+            let mut a = Array2::<f64>::zeros((p, p));
+            for i in 0..p {
+                for j in 0..p {
+                    a[[i, j]] = (seed + 0.41 * (i as f64) - 0.23 * (j as f64)).sin()
+                        + 0.6 * ((i + j) as f64 * seed).cos();
+                }
+            }
+            let at = a.t().to_owned();
+            (&a + &at).mapv(|v| 0.5 * v)
+        };
+        // A_a = ∂H/∂β_a, the per-axis first directional derivative (constant in β).
+        let a_mats: Vec<Array2<f64>> = (0..p).map(|a| make_sym(2.3 + 1.7 * a as f64)).collect();
+        let axis_index = |axis: &Array1<f64>| -> usize {
+            axis.iter().position(|&x| x != 0.0).expect("one-hot axis")
+        };
+        // β = t·δ with δ = e_0 ⇒ H(t) = H0 + t·A_0, Hdot[e_a] ≡ A_a.
+        let hphi_at = |t: f64| -> Array2<f64> {
+            let h = &h0 + &a_mats[0].mapv(|v| t * v);
+            joint_jeffreys_term(h.view(), z.view(), |axis: &Array1<f64>| {
+                Ok(Some(a_mats[axis_index(axis)].clone()))
+            })
+            .expect("value-path H_Φ")
+            .2
+        };
+
+        let hh = 1e-5;
+        let fd = (&hphi_at(hh) - &hphi_at(-hh)).mapv(|v| v / (2.0 * hh));
+
+        let mut delta = Array1::<f64>::zeros(p);
+        delta[0] = 1.0;
+        let analytic = joint_jeffreys_hphi_directional_derivative(
+            h0.view(),
+            z.view(),
+            &delta,
+            // Hdot[d] = Σ_a d_a A_a (linear in the direction).
+            |d: &Array1<f64>| {
+                let mut acc = Array2::<f64>::zeros((p, p));
+                for a in 0..p {
+                    if d[a] != 0.0 {
+                        acc.scaled_add(d[a], &a_mats[a]);
+                    }
+                }
+                Ok(Some(acc))
+            },
+            // H²dot[u, v] = 0 (H is β-linear).
+            |_u: &Array1<f64>, _v: &Array1<f64>| Ok(Some(Array2::<f64>::zeros((p, p)))),
+        )
+        .expect("mode-response drift D_β H_Φ[δ]");
+
+        // Relative tolerance against the FD magnitude: the below-floor entries carry
+        // O(1/floor)≈1e10-scale curvature, so an absolute bound is meaningless.
+        let mut max_rel = 0.0_f64;
+        for i in 0..p {
+            for j in 0..p {
+                let scale = fd[[i, j]].abs().max(analytic[[i, j]].abs()).max(1.0);
+                max_rel = max_rel.max((analytic[[i, j]] - fd[[i, j]]).abs() / scale);
+            }
+        }
+        assert!(
+            max_rel < 1e-4,
+            "mode-response drift D_β H_Φ[δ] mismatch vs FD (below-floor): max_rel={max_rel}"
+        );
+    }
+
     /// Test-only convenience predicate: `true` when the smooth gate weight is exactly
     /// `0` (the term is fully skippable). Non-test code uses `conditioning_gate_weight`
     /// directly so the transition band stays continuous; the cheap matrix-free
