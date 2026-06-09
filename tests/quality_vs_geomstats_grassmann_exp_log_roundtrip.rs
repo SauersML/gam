@@ -29,12 +29,13 @@
 //! All three are asserted against quantities the test derives itself; the worst
 //! deviation across all `N_CASES` must clear the bar.
 //!
-//! geomstats is retained ONLY as an independent GROUND-TRUTH cross-check (the
-//! Grassmann geodesic is an exact closed form, so geomstats is mathematical
-//! truth, not a noisy peer fit — the EXCEPTION case): we hand it the identical
-//! base/tangent and additionally require gam to match its exact endpoint and
-//! log invariants. But the primary, sufficient pass criterion is gam-vs-analytic
-//! axioms above; geomstats only sharpens it.
+//! geomstats is retained ONLY as a MATCH-OR-BEAT accuracy baseline, never the
+//! truth: we hand it the identical base/tangent, have it score its OWN axiom
+//! errors against the SAME analytic spectrum σ this test constructs, and require
+//! gam's worst axiom error to be no worse than geomstats' (with a tiny float-floor
+//! slack). The primary, sufficient pass criterion is the gam-vs-analytic axioms
+//! above; geomstats is a peer to equal-or-beat on the self-constructed truth, not
+//! a quantity gam must reproduce.
 //!
 //! There is no skip path: if `python3` or `geomstats` is missing the reference
 //! body fails loudly and so does this test.
@@ -135,14 +136,33 @@ fn sym_eigvals(mat: &Array2<f64>) -> Vec<f64> {
     ev
 }
 
-/// Principal angles (descending) between two orthonormal `n×k` frames `y`, `z`:
-/// `θ = arccos(σ(yᵀz))`, the canonical `O(k)`-invariant subspace distance.
+/// Principal angles (ascending) between two orthonormal `n×k` frames `y`, `z`,
+/// via the WELL-CONDITIONED `atan2(sin θ, cos θ)` path (never `arccos` near 1,
+/// which loses precision at small angles). `cos θ` are the singular values of
+/// `yᵀz`; `sin θ` are the singular values of the residual `z − y(yᵀz)` (the
+/// projection of `z` onto the orthogonal complement of `y`). Pairing the two
+/// spectra by descending-cos / ascending-sin and taking `atan2` is accurate
+/// across the whole `[0, π/2]` range. The canonical `O(k)`-invariant distance.
 fn principal_angles(y: &Array2<f64>, z: &Array2<f64>) -> Vec<f64> {
-    let c = y.t().dot(z); // k×k
-    let gram = c.t().dot(&c); // (yᵀz)ᵀ(yᵀz), eigenvalues = cos² θ
-    let mut angles: Vec<f64> = sym_eigvals(&gram)
+    let c = y.t().dot(z); // k×k, singular values = cos θ
+    let cos2: Vec<f64> = sym_eigvals(&c.t().dot(&c)) // descending eigenvalues = cos² θ
         .into_iter()
-        .map(|e| e.max(0.0).min(1.0).sqrt().acos())
+        .map(|e| e.max(0.0))
+        .collect();
+    // Residual r = z − y (yᵀz): its singular values are sin θ. r is n×k.
+    let r = z - &y.dot(&c);
+    let mut sin2: Vec<f64> = sym_eigvals(&r.t().dot(&r)) // descending eigenvalues = sin² θ
+        .into_iter()
+        .map(|e| e.max(0.0))
+        .collect();
+    // cos² is descending (largest cos = smallest angle); sin² is descending
+    // (largest sin = largest angle). Reverse sin² so both index the SAME angle
+    // ascending, then θ_i = atan2(√sin²_i, √cos²_i).
+    // cos² descending eigenvalues already index angle ascending (largest cos =
+    // smallest angle); reversing sin² descending makes it index angle ascending too.
+    sin2.reverse();
+    let mut angles: Vec<f64> = (0..K)
+        .map(|i| sin2[i].sqrt().atan2(cos2[i].sqrt()))
         .collect();
     angles.sort_by(|a, b| a.partial_cmp(b).unwrap()); // ascending, matches geomstats side
     angles
@@ -166,11 +186,9 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
     let mut max_exp_angle_truth_err = 0.0_f64;
     let mut max_log_sigma_truth_err = 0.0_f64;
     let mut max_isometry_err = 0.0_f64;
-    // gam's principal angles of the geodesic endpoint and of its recovered log,
-    // per case (flattened K-vectors), retained for the geomstats ground-truth
-    // cross-check only.
-    let mut gam_exp_angles: Vec<f64> = Vec::with_capacity(N_CASES * K);
-    let mut gam_log_angles: Vec<f64> = Vec::with_capacity(N_CASES * K);
+    // The analytic spectrum σ per case (ascending), shipped to geomstats so it can
+    // score its OWN axiom errors against the SAME self-constructed truth.
+    let mut truth_sigma_flat: Vec<f64> = Vec::with_capacity(N_CASES * K);
 
     for case in 0..N_CASES {
         // --- base subspace: orthonormalize a random n×k matrix -------------
@@ -255,6 +273,7 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
             .collect();
         truth_sigma.sort_by(|a, b| a.partial_cmp(b).unwrap()); // ascending
         let truth_dist: f64 = truth_sigma.iter().map(|s| s * s).sum::<f64>().sqrt();
+        truth_sigma_flat.extend(truth_sigma.iter().copied());
 
         // gam's principal angles at the endpoint and from the recovered log.
         let z = {
@@ -270,7 +289,6 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
         // (b) endpoint principal angles must equal the analytic spectrum σ.
         max_exp_angle_truth_err =
             max_exp_angle_truth_err.max(max_abs_diff(&exp_angles, &truth_sigma));
-        gam_exp_angles.extend(exp_angles.iter().copied());
 
         // Recovered-log principal angles = singular values of the recovered
         // tangent matrix = sqrt of eigenvalues of (V_recᵀ V_rec).
@@ -294,22 +312,25 @@ fn grassmann_exp_log_roundtrip_matches_geomstats() {
         // (c) isometry: geodesic distance ‖log_P(exp_P v)‖_F must equal ‖v‖_F.
         let gam_dist: f64 = v_rec.iter().map(|x| x * x).sum::<f64>().sqrt();
         max_isometry_err = max_isometry_err.max((gam_dist - truth_dist).abs());
-        gam_log_angles.extend(log_sigma);
 
         base_flat.extend(y_flat.iter().copied());
         tangent_flat.extend(v_flat.iter().copied());
     }
 
-    // --- geomstats reference on the identical base frames + tangents -------
+    // --- geomstats MATCH-OR-BEAT baseline on the identical base/tangents ----
     // geomstats represents a Grassmann point as the orthogonal projector
     // P = YYᵀ (n×n) and a tangent as W = HYᵀ + YHᵀ. We rebuild Y and H from
     // the shared row-major flat vectors, hand geomstats the projector forms,
-    // and read back the principal angles of exp's endpoint and log's recovered
-    // tangent — the representation-invariant invariants gam also reports.
+    // and score geomstats' OWN axiom errors against the SAME analytic spectrum σ
+    // the test built (its endpoint principal angles vs σ, its log singular
+    // spectrum vs σ). geomstats is NOT the truth; it is a peer whose accuracy on
+    // the same axioms gam must equal or beat. The principal angles are read via
+    // the well-conditioned atan2(sin, cos) path (never arccos near 1).
     let py = run_python(
         &[
             Column::new("base_flat", &base_flat),
             Column::new("tangent_flat", &tangent_flat),
+            Column::new("truth_sigma", &truth_sigma_flat),
         ],
         &format!(
             r#"
@@ -319,41 +340,54 @@ from geomstats.geometry.grassmannian import Grassmannian
 N, K, NCASES = {n}, {k}, {ncases}
 base = np.asarray(df["base_flat"], dtype=float).reshape(NCASES, N, K)
 tang = np.asarray(df["tangent_flat"], dtype=float).reshape(NCASES, N, K)
+truth = np.asarray(df["truth_sigma"], dtype=float).reshape(NCASES, K)  # analytic σ
 
 space = Grassmannian(N, K)
 metric = space.metric
 
 def principal_angles(Y, Z):
-    # Y, Z: orthonormal n x k frames.  theta = arccos(sigma(Y^T Z)).
-    s = np.linalg.svd(Y.T @ Z, compute_uv=False)
-    s = np.clip(s, -1.0, 1.0)
-    return np.sort(np.arccos(s))  # ascending, matches the gam side
+    # Y, Z: orthonormal n x k frames. Well-conditioned atan2(sin, cos) path:
+    # cos θ = sing. values of Y^T Z; sin θ = sing. values of the residual
+    # Z − Y(Y^T Z). atan2 stays accurate at small angles where arccos(~1) does not.
+    C = Y.T @ Z
+    cos = np.clip(np.linalg.svd(C, compute_uv=False), 0.0, 1.0)            # descending
+    R = Z - Y @ C
+    sin = np.clip(np.linalg.svd(R, compute_uv=False), 0.0, 1.0)            # descending
+    # cos descending and sin ascending index the same angle ascending.
+    ang = np.arctan2(sin[::-1], cos)
+    return np.sort(ang)  # ascending, matches the gam side
 
 def frame_of_projector(P):
     # Top-k eigenvectors of the symmetric projector P span the subspace.
     w, V = np.linalg.eigh(P)
     return V[:, ::-1][:, :K]
 
-exp_angles = []
-log_angles = []
+# geomstats' OWN worst axiom errors vs the analytic spectrum σ (match-or-beat).
+gs_exp_angle_err = 0.0   # |endpoint principal angles − σ|
+gs_log_sigma_err = 0.0   # |log-recovered singular spectrum − σ|
+gs_isometry_err = 0.0    # |‖log(exp v)‖_F − ‖σ‖₂|
 for i in range(NCASES):
     Y = base[i]                      # n x k, orthonormal
     H = tang[i]                      # n x k, horizontal (Y^T H = 0)
+    sigma = np.sort(truth[i])        # ascending analytic spectrum
     P0 = Y @ Y.T                     # projector representation of the base
     W = H @ Y.T + Y @ H.T            # projector-tangent representation
     P1 = metric.exp(W, P0)           # geodesic endpoint (projector)
     Z = frame_of_projector(P1)
     ang = principal_angles(Y, Z)
-    exp_angles.extend(ang.tolist())
+    gs_exp_angle_err = max(gs_exp_angle_err, float(np.max(np.abs(ang - sigma))))
     # log recovers a projector-tangent W_rec = Hr Y^T + Y Hr^T; its principal
     # angles are the singular values of the frame block Hr = W_rec @ Y.
     W_rec = metric.log(P1, P0)
     Hr = W_rec @ Y
-    s = np.linalg.svd(Hr, compute_uv=False)
-    log_angles.extend(np.sort(s).tolist())  # ascending, matches the gam side
+    s = np.sort(np.linalg.svd(Hr, compute_uv=False))  # ascending
+    gs_log_sigma_err = max(gs_log_sigma_err, float(np.max(np.abs(s - sigma))))
+    gs_dist = float(np.linalg.norm(s))
+    gs_isometry_err = max(gs_isometry_err, abs(gs_dist - float(np.linalg.norm(sigma))))
 
-emit("exp_angles", exp_angles)
-emit("log_angles", log_angles)
+emit("gs_exp_angle_err", [gs_exp_angle_err])
+emit("gs_log_sigma_err", [gs_log_sigma_err])
+emit("gs_isometry_err", [gs_isometry_err])
 "#,
             n = N,
             k = K,
@@ -361,20 +395,17 @@ emit("log_angles", log_angles)
         ),
     );
 
-    let gs_exp = py.vector("exp_angles");
-    let gs_log = py.vector("log_angles");
-    assert_eq!(gs_exp.len(), N_CASES * K, "geomstats exp angle count");
-    assert_eq!(gs_log.len(), N_CASES * K, "geomstats log angle count");
-
-    let exp_angle_diff = max_abs_diff(&gam_exp_angles, gs_exp);
-    let log_angle_diff = max_abs_diff(&gam_log_angles, gs_log);
+    // geomstats' OWN worst axiom errors against the SAME analytic spectrum σ.
+    let gs_exp_angle_err = py.scalar("gs_exp_angle_err");
+    let gs_log_sigma_err = py.scalar("gs_log_sigma_err");
+    let gs_isometry_err = py.scalar("gs_isometry_err");
 
     eprintln!(
         "Gr({K},{N}) n_cases={N_CASES} | gam vs ANALYTIC truth: roundtrip_abs={max_roundtrip_abs:.3e} \
          roundtrip_frob={max_roundtrip_frob:.3e} exp_angle_vs_σ={max_exp_angle_truth_err:.3e} \
          log_σ_vs_σ={max_log_sigma_truth_err:.3e} isometry_dist_err={max_isometry_err:.3e} | \
-         geomstats ground-truth cross-check: exp_endpoint_diff={exp_angle_diff:.3e} \
-         log_recovered_diff={log_angle_diff:.3e}"
+         geomstats match-or-beat (its own errors vs σ): exp_angle_vs_σ={gs_exp_angle_err:.3e} \
+         log_σ_vs_σ={gs_log_sigma_err:.3e} isometry_dist_err={gs_isometry_err:.3e}"
     );
 
     // ===================== PRIMARY: gam vs ANALYTIC geodesic axioms =========
@@ -411,19 +442,28 @@ emit("log_angles", log_angles)
         "gam Grassmann geodesic violates the metric isometry ‖log(exp(v))‖ = ‖v‖: {max_isometry_err:.3e}"
     );
 
-    // ===================== GROUND-TRUTH CROSS-CHECK vs geomstats ============
-    // The Grassmann geodesic is an exact closed form (no fit, no noise), so
-    // geomstats is an independent computation of the SAME mathematical truth,
-    // not a peer tool whose noisy fit we chase. We require gam to additionally
-    // match geomstats' exact endpoint and log invariants to its LAPACK-SVD
-    // noise floor (1e-9) — a sharper, redundant confirmation of the axioms
-    // above, not the primary claim.
+    // ===================== MATCH-OR-BEAT: gam vs geomstats accuracy =========
+    // geomstats also satisfies the same closed-form axioms, so we use it as a
+    // peer ACCURACY baseline on the SAME self-constructed truth: gam's worst
+    // axiom error (endpoint angles vs σ, log spectrum vs σ, isometry) must be no
+    // worse than geomstats' own error against that identical analytic σ, with a
+    // tiny additive slack so a tie at the float floor never flips. This is NOT
+    // "gam reproduces geomstats' output" — both are scored against the analytic
+    // spectrum the test constructed, and gam must equal or beat the peer.
+    let slack = 1.0e-12;
     assert!(
-        exp_angle_diff < 1e-9,
-        "gam exp-endpoint principal angles disagree with geomstats ground truth: {exp_angle_diff:.3e}"
+        max_exp_angle_truth_err <= gs_exp_angle_err + slack,
+        "gam exp-endpoint angle error {max_exp_angle_truth_err:.3e} should be <= geomstats \
+         baseline {gs_exp_angle_err:.3e} (+slack), both vs analytic σ"
     );
     assert!(
-        log_angle_diff < 1e-9,
-        "gam log-recovered principal angles disagree with geomstats ground truth: {log_angle_diff:.3e}"
+        max_log_sigma_truth_err <= gs_log_sigma_err + slack,
+        "gam log-recovered spectrum error {max_log_sigma_truth_err:.3e} should be <= geomstats \
+         baseline {gs_log_sigma_err:.3e} (+slack), both vs analytic σ"
+    );
+    assert!(
+        max_isometry_err <= gs_isometry_err + slack,
+        "gam isometry error {max_isometry_err:.3e} should be <= geomstats baseline \
+         {gs_isometry_err:.3e} (+slack), both vs analytic σ"
     );
 }
