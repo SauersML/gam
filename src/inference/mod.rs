@@ -18,5 +18,6 @@ pub mod predict;
 pub mod probability;
 pub mod psis;
 pub mod quadrature;
+pub mod row_metric;
 pub mod sample;
 pub mod smooth_test;
