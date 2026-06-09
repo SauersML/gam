@@ -107,3 +107,47 @@ impl RiemannianManifold for EuclideanManifold {
         Ok(0.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::EuclideanManifold;
+    use crate::geometry::manifold::{GeometryError, RiemannianManifold};
+    use ndarray::array;
+
+    #[test]
+    fn sectional_curvature_is_zero_on_nondegenerate_plane() {
+        let m = EuclideanManifold::new(2);
+        let point = array![0.0, 0.0];
+        let u = array![1.0, 0.0];
+        let v = array![0.0, 1.0];
+        let k = m
+            .sectional_curvature(point.view(), (u.view(), v.view()))
+            .expect("flat space has defined curvature on a nondegenerate plane");
+        assert!(k.abs() < 1.0e-12, "expected 0, got {k}");
+    }
+
+    #[test]
+    fn sectional_curvature_is_singular_for_collinear_pair() {
+        let m = EuclideanManifold::new(2);
+        let point = array![0.0, 0.0];
+        let u = array![1.0, 0.0];
+        // v parallel to u: zero parallelogram area.
+        let v = array![3.0, 0.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Singular(_)) => {}
+            other => panic!("expected Singular for collinear pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sectional_curvature_is_unsupported_below_two_dimensions() {
+        let m = EuclideanManifold::new(1);
+        let point = array![0.0];
+        let u = array![1.0];
+        let v = array![1.0];
+        match m.sectional_curvature(point.view(), (u.view(), v.view())) {
+            Err(GeometryError::Unsupported(_)) => {}
+            other => panic!("expected Unsupported in 1-D, got {other:?}"),
+        }
+    }
+}
