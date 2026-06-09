@@ -631,10 +631,24 @@ impl<'a> FamilyFitRequest for GaussianLocationScaleFitRequest<'a> {
         h.write_str("gauss-ls");
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
+        // Topology identity (#869, extended): the location-scale outer
+        // cache session keys on this hash; an `ExactFinal` hit on it
+        // short-circuits the whole fit (see
+        // `outer_strategy::classify_cache_entry_for_outer`). Raw
+        // `data.ncols()` is blind to the smooth basis, so two AUTO-topology
+        // candidates (sphere vs euclidean) on the same data with the same
+        // penalty count would collide on one key and one would return the
+        // other's converged ρ as its own result. Fold each block's
+        // term-collection structural shape in so each candidate keys
+        // distinctly while same-topology refits still hit.
+        self.spec.meanspec.write_structural_shape_hash(h);
+        self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("gauss-ls-seed");
         h.write_usize(self.data.ncols());
+        self.spec.meanspec.write_structural_shape_hash(h);
+        self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
@@ -657,11 +671,16 @@ impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.link_kind));
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.thresholdspec.write_structural_shape_hash(h);
+        self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("binom-ls-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.link_kind));
+        self.spec.thresholdspec.write_structural_shape_hash(h);
+        self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
@@ -684,11 +703,16 @@ impl<'a> FamilyFitRequest for SurvivalLocationScaleFitRequest<'a> {
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.inverse_link));
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.thresholdspec.write_structural_shape_hash(h);
+        self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-ls-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.inverse_link));
+        self.spec.thresholdspec.write_structural_shape_hash(h);
+        self.spec.log_sigmaspec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         // Request-level slot is mirrored into the spec slot so the family
@@ -720,12 +744,15 @@ impl<'a> FamilyFitRequest for SurvivalTransformationFitRequest<'a> {
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.likelihood_mode));
         h.write_str(&self.spec.time_build.basisname);
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.covariate_spec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-tn-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.likelihood_mode));
         h.write_str(&self.spec.time_build.basisname);
+        self.spec.covariate_spec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         // SurvivalTransformation uses WorkingModelPirlsOptions (different
@@ -756,11 +783,16 @@ impl<'a> FamilyFitRequest for BernoulliMarginalSlopeFitRequest<'a> {
         h.write_usize(self.spec.y.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.marginalspec.write_structural_shape_hash(h);
+        self.spec.logslopespec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("bern-ms-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
+        self.spec.marginalspec.write_structural_shape_hash(h);
+        self.spec.logslopespec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
@@ -784,12 +816,37 @@ impl<'a> FamilyFitRequest for SurvivalMarginalSlopeFitRequest<'a> {
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
         h.write_str(&format!("{:?}", self.spec.frailty));
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.marginalspec.write_structural_shape_hash(h);
+        self.spec.logslopespec.write_structural_shape_hash(h);
+        match self.spec.logslopespecs.as_ref() {
+            Some(specs) => {
+                h.write_bool(true);
+                h.write_usize(specs.len());
+                for spec in specs {
+                    spec.write_structural_shape_hash(h);
+                }
+            }
+            None => h.write_bool(false),
+        }
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("surv-ms-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.spec.base_link));
         h.write_str(&format!("{:?}", self.spec.frailty));
+        self.spec.marginalspec.write_structural_shape_hash(h);
+        self.spec.logslopespec.write_structural_shape_hash(h);
+        match self.spec.logslopespecs.as_ref() {
+            Some(specs) => {
+                h.write_bool(true);
+                h.write_usize(specs.len());
+                for spec in specs {
+                    spec.write_structural_shape_hash(h);
+                }
+            }
+            None => h.write_bool(false),
+        }
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
@@ -812,11 +869,14 @@ impl<'a> FamilyFitRequest for LatentSurvivalFitRequest<'a> {
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.meanspec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("lat-surv-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
+        self.spec.meanspec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
@@ -839,11 +899,14 @@ impl<'a> FamilyFitRequest for LatentBinaryFitRequest<'a> {
         h.write_usize(self.spec.age_entry.len());
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.meanspec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("lat-bin-seed");
         h.write_usize(self.data.ncols());
         h.write_str(&format!("{:?}", self.frailty));
+        self.spec.meanspec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
@@ -865,10 +928,13 @@ impl<'a> FamilyFitRequest for TransformationNormalFitRequest<'a> {
         h.write_str("tn");
         h.write_usize(self.response.len());
         h.write_usize(self.data.ncols());
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.covariate_spec.write_structural_shape_hash(h);
     }
     fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
         h.write_str("tn-seed");
         h.write_usize(self.data.ncols());
+        self.covariate_spec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
