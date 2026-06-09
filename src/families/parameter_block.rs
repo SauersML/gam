@@ -97,8 +97,9 @@ impl ParameterBlockInput {
                             col_range,
                             total_dim: p,
                         },
-                        PenaltySpec::Dense(m)
-                        | PenaltySpec::DenseWithMean { matrix: m, .. } => PenaltyMatrix::Dense(m),
+                        PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                            PenaltyMatrix::Dense(m)
+                        }
                     })
                     .collect()
             },

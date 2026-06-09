@@ -1326,20 +1326,18 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // where *every* row is simultaneously tight.
         let cone_is_homogeneous = constraints.b.iter().all(|v| v.abs() <= 1e-14);
         if min_scaled_slack < active_set::interior_seed_margin() {
-            let projected = active_set::project_point_strictly_into_feasible_cone(
-                &initial_beta,
-                constraints,
-            )
-            .or_else(|| {
-                if cone_is_homogeneous {
-                    None
-                } else {
-                    active_set::feasible_point_for_linear_constraints(
-                        constraints,
-                        initial_beta.len(),
-                    )
-                }
-            });
+            let projected =
+                active_set::project_point_strictly_into_feasible_cone(&initial_beta, constraints)
+                    .or_else(|| {
+                        if cone_is_homogeneous {
+                            None
+                        } else {
+                            active_set::feasible_point_for_linear_constraints(
+                                constraints,
+                                initial_beta.len(),
+                            )
+                        }
+                    });
             projected.unwrap_or(initial_beta)
         } else {
             initial_beta

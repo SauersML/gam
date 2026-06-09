@@ -2,8 +2,8 @@ use crate::cache::Fingerprinter;
 use crate::faer_ndarray::FaerEigh;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atb, fast_av};
 use crate::matrix::{
-    DesignMatrix, EmbeddedColumnBlock, LinearOperator, SignedWeightsView,
-    SymmetricMatrix, dense_rowwise_kronecker,
+    DesignMatrix, EmbeddedColumnBlock, LinearOperator, SignedWeightsView, SymmetricMatrix,
+    dense_rowwise_kronecker,
 };
 use crate::pirls::{LinearInequalityConstraints, solve_newton_directionwith_lower_bounds};
 use crate::resource::{DerivativeStorageMode, ResourcePolicy};

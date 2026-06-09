@@ -1571,8 +1571,7 @@ fn issue_876_periodic_latent_duchon_decoder_is_seam_consistent_and_recovers_circ
 
     // (b) Recovery on a clean circular signal across the whole circle, including
     // the seam. The truth is a genuine function on the circle.
-    let y: Array1<f64> =
-        Array1::from_iter(theta.iter().map(|&a| a.cos() + 0.5 * (2.0 * a).sin()));
+    let y: Array1<f64> = Array1::from_iter(theta.iter().map(|&a| a.cos() + 0.5 * (2.0 * a).sin()));
 
     let r2_periodic = latent_decoder_ols_r2(&design_per, &y);
     let r2_open = latent_decoder_ols_r2(&design_open, &y);

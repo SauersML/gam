@@ -252,7 +252,11 @@ fn gam_multinomial_softmax_recovers_true_simplex() {
     assert_eq!(mgcv_nrow, N, "mgcv multinom fitted-prob rows");
     assert_eq!(mgcv_ncol, K, "mgcv multinom fitted-prob cols");
     let mgcv_flat = r_mgcv.vector("probs");
-    assert_eq!(mgcv_flat.len(), N * K, "mgcv multinom flattened prob length");
+    assert_eq!(
+        mgcv_flat.len(),
+        N * K,
+        "mgcv multinom flattened prob length"
+    );
 
     // ---- VGAM fixed-df = 4 fit: PRINTED CONTEXT ONLY (documents its luck) ----
     // VGAM's s() is a fixed df = 4 smoothing-spline backfit with no data-adaptive
@@ -469,14 +473,18 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
             ])
         })
         .collect();
-    let ds =
-        encode_recordswith_inferred_schema(headers, rows).expect("encode hetero multinomial dataset");
+    let ds = encode_recordswith_inferred_schema(headers, rows)
+        .expect("encode hetero multinomial dataset");
 
     let cfg = FitConfig::default();
     let model =
         fit_penalized_multinomial_formula(&ds, "y ~ s(x1) + s(x2) + x3", &cfg, 1.0, 50, 1e-8)
             .expect("gam hetero multinomial fit");
-    assert_eq!(model.class_levels.len(), K, "gam should recover K=3 classes");
+    assert_eq!(
+        model.class_levels.len(),
+        K,
+        "gam should recover K=3 classes"
+    );
 
     let gam_probs = predict_multinomial_formula(&model, &ds).expect("gam predict probabilities");
     assert_eq!(gam_probs.dim(), (N, K), "gam probability matrix shape");

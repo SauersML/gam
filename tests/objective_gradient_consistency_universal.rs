@@ -463,7 +463,13 @@ fn glm_objective_gradient_consistent_interior_multifamily() {
         vec![1],
     );
     for rho in [Array1::from(vec![-0.1_f64]), Array1::from(vec![0.7_f64])] {
-        assert_glm_consistent("interior/poisson-log", &pois, &pois_opts, &rho, TOL_INTERIOR);
+        assert_glm_consistent(
+            "interior/poisson-log",
+            &pois,
+            &pois_opts,
+            &rho,
+            TOL_INTERIOR,
+        );
     }
 
     // Gamma-log.
@@ -473,7 +479,13 @@ fn glm_objective_gradient_consistent_interior_multifamily() {
         vec![1],
     );
     for rho in [Array1::from(vec![0.0_f64]), Array1::from(vec![0.9_f64])] {
-        assert_glm_consistent("interior/gamma-log", &gamma, &gamma_opts, &rho, TOL_INTERIOR);
+        assert_glm_consistent(
+            "interior/gamma-log",
+            &gamma,
+            &gamma_opts,
+            &rho,
+            TOL_INTERIOR,
+        );
     }
 }
 
@@ -504,13 +516,7 @@ fn glm_objective_gradient_consistent_at_shrinkage_floor_boundary() {
         Array1::from(vec![9.0_f64]),
         Array1::from(vec![12.0_f64]),
     ] {
-        assert_glm_consistent(
-            "boundary/shrinkage-floor",
-            &fix,
-            &opts,
-            &rho,
-            TOL_BOUNDARY,
-        );
+        assert_glm_consistent("boundary/shrinkage-floor", &fix, &opts, &rho, TOL_BOUNDARY);
     }
 }
 
@@ -673,7 +679,10 @@ impl CustomFamily for PenalizedQuadraticFamily {
     }
 }
 
-fn penalized_quadratic_specs(target: &Array1<f64>, penalty: Array2<f64>) -> Vec<ParameterBlockSpec> {
+fn penalized_quadratic_specs(
+    target: &Array1<f64>,
+    penalty: Array2<f64>,
+) -> Vec<ParameterBlockSpec> {
     let m = target.len();
     vec![ParameterBlockSpec {
         name: "penalized-quadratic".to_string(),

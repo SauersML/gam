@@ -35,8 +35,7 @@ use crate::families::custom_family::{
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, FamilyEvaluation,
     JointHessianSourcePreference, MaterializablePsiDerivativeOperator, MaterializationIntent,
-    ParameterBlockSpec,
-    ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
+    ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
 use crate::families::gamlss::solve_penalizedweighted_projection;

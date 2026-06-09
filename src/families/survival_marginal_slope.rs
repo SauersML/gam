@@ -8,7 +8,6 @@ use crate::custom_family::{
     fit_custom_family_fixed_log_lambda_warm_start, joint_hyper_options_for_outer_tolerance,
 };
 use crate::estimate::UnifiedFitResult;
-use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atv, fast_av, fast_xt_diag_x};
 use crate::families::bms::{
     CrossBlockIdentifiabilityWarning, DeviationBlockConfig, DeviationRuntime, LatentZNormalization,
@@ -25,8 +24,6 @@ use crate::families::bms::{
     unary_derivatives_sqrt,
 };
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::parameter_block::ParameterBlockInput;
-use crate::families::wiggle::monotone_wiggle_basis_with_derivative_order;
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
@@ -38,10 +35,12 @@ use crate::families::marginal_slope_shared::{
     probit_frailty_scale, probit_frailty_scale_multi_dir_jet, psi_derivative_location,
     scale_coeff4,
 };
+use crate::families::parameter_block::ParameterBlockInput;
 use crate::families::row_kernel::{
     RowKernel, RowKernelHessianWorkspace, build_row_kernel_cache, row_kernel_gradient,
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
+use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 use crate::families::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
 use crate::families::survival_location_scale::{
     TimeBlockInput, TimeWiggleBlockInput, project_onto_linear_constraints,
@@ -50,6 +49,7 @@ use crate::families::survival_time_constraints::{
     FeasibilityTolerance, GuardConstraintFailure, GuardConstraintPolicy, GuardPolicy,
     build_time_derivative_guard_constraints,
 };
+use crate::families::wiggle::monotone_wiggle_basis_with_derivative_order;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
