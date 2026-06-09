@@ -155,6 +155,7 @@ fn gam_nuts_posterior_matches_scipy_exact_conjugate_gaussian() {
             gamma_shape: None,
             dispersion,
             firth_bias_reduction: false,
+            offset: None,
         }),
         &nuts_cfg,
     )
