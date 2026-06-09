@@ -1276,6 +1276,82 @@ impl ExactJeffreysTerm {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Guarded scalar correction (value + ρ-gradient under ONE include flag)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A scalar objective correction whose VALUE and analytic ρ-GRADIENT are
+/// carried together and applied through a SINGLE site under a SINGLE guard.
+///
+/// This is the structural cure for the recurring objective↔gradient desync
+/// bug class (issues #752/#748/#808 and the latent Tierney–Kadane desync):
+/// when a correction's value and its derivative are added to the cost and the
+/// ρ-gradient in physically separate statements — each with its own
+/// hand-written `if include_logdet_h { … }` guard — the two drift apart. Here
+/// the `include` flag is read ONCE and gates BOTH contributions in
+/// [`GuardedCorrection::apply`], so a future edit cannot re-introduce the
+/// half-applied/half-omitted state by construction.
+///
+/// Mirrors the already-paired `PenaltyLogdetDerivs` / `joint_jeffreys_term`
+/// objects, which return value+derivative together for exactly this reason.
+pub(crate) struct GuardedCorrection {
+    /// Scalar contribution to the outer REML/LAML cost.
+    value: f64,
+    /// Contribution to the ρ-gradient (one entry per active ρ coordinate),
+    /// `None` when the correction is value-only (derivative-free regime).
+    gradient: Option<Array1<f64>>,
+    /// The SINGLE guard. When `false`, NEITHER the value nor the gradient is
+    /// applied; when `true`, BOTH are.
+    include: bool,
+}
+
+impl GuardedCorrection {
+    /// Construct a guarded correction from a loose `(value, gradient)` pair and
+    /// the include flag that must gate both.
+    pub(crate) fn new(value: f64, gradient: Option<Array1<f64>>, include: bool) -> Self {
+        Self {
+            value,
+            gradient,
+            include,
+        }
+    }
+
+    /// Apply BOTH contributions through one call: under the single `include`
+    /// guard, add `value` to `cost` AND `gradient` to the leading
+    /// `gradient.len()` entries of `rho_grad`. When `include` is `false`, this
+    /// is a no-op for both — the can't-desync invariant.
+    ///
+    /// Used directly where the cost and gradient are both in hand. When the
+    /// evaluator must commit the cost before the gradient exists (the
+    /// `EvalMode::ValueOnly` early return), use [`Self::apply_value`] +
+    /// [`Self::apply_gradient`]: both read `self.include` from the SAME object,
+    /// so the guard is still single-sourced and the two sides cannot drift.
+    pub(crate) fn apply(&self, cost: &mut f64, rho_grad: &mut Array1<f64>) {
+        self.apply_value(cost);
+        self.apply_gradient(rho_grad);
+    }
+
+    /// Apply the VALUE contribution to `cost` under the single `include` guard.
+    pub(crate) fn apply_value(&self, cost: &mut f64) {
+        if self.include {
+            *cost += self.value;
+        }
+    }
+
+    /// Apply the ρ-GRADIENT contribution to the leading entries of `rho_grad`
+    /// under the SAME single `include` guard read from `self`.
+    pub(crate) fn apply_gradient(&self, rho_grad: &mut Array1<f64>) {
+        if !self.include {
+            return;
+        }
+        if let Some(grad) = self.gradient.as_ref() {
+            let k = grad.len();
+            let mut sl = rho_grad.slice_mut(ndarray::s![..k]);
+            sl += grad;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Log-barrier support for constrained coefficients
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -7335,11 +7411,18 @@ pub fn reml_laml_evaluate(
             let mut cost =
                 cost_logdet_diff + (-solution.log_likelihood) + 0.5 * solution.penalty_quadratic;
             if *include_logdet_h {
-                cost += solution.tk_correction
-                    - solution
-                        .firth
-                        .as_ref()
-                        .map_or(0.0, ExactJeffreysTerm::value);
+                // Firth `−½ log|J|`: VALUE here, ρ-DERIVATIVE folded into the
+                // per-coordinate LAML trace (`a_i`) below — already paired by
+                // construction, so it is NOT routed through `GuardedCorrection`.
+                // The Tierney–Kadane correction, by contrast, is a genuinely
+                // loose `(tk_correction, tk_gradient)` pair; it flows through a
+                // single `GuardedCorrection` object (built below) whose one
+                // `include` guard gates BOTH its value and its ρ-gradient, so
+                // the two can never desync.
+                cost -= solution
+                    .firth
+                    .as_ref()
+                    .map_or(0.0, ExactJeffreysTerm::value);
             }
             (cost, *phi, 0.0, 0.0)
         }
@@ -7478,6 +7561,34 @@ pub fn reml_laml_evaluate(
         }
     }
 
+    // Extract logdet flags once (same for all coordinates) — needed here for
+    // the guarded TK correction, and reused for the gradient/Hessian below.
+    let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
+        DispersionHandling::ProfiledGaussian => (true, true),
+        DispersionHandling::Fixed {
+            include_logdet_h,
+            include_logdet_s,
+            ..
+        } => (*include_logdet_h, *include_logdet_s),
+    };
+
+    // Build the Tierney–Kadane frozen-curvature correction as ONE object that
+    // owns the single `include` guard. Its VALUE must land on the cost before
+    // the `EvalMode::ValueOnly` early return below, and its ρ-GRADIENT lands on
+    // `grad` further down — but BOTH read `include` from this same object, so
+    // the two contributions cannot desync (the structural cure for the
+    // objective↔gradient drift class behind #752/#748/#808). Historically the
+    // value was added inside the dispersion match and the gradient added at the
+    // gradient site, each under an independently hand-written
+    // `if include_logdet_h { … }` guard — exactly the divergence shape this
+    // type makes impossible.
+    let tk_correction = GuardedCorrection::new(
+        solution.tk_correction,
+        solution.tk_gradient.clone(),
+        incl_logdet_h,
+    );
+    tk_correction.apply_value(&mut cost);
+
     if !cost.is_finite() {
         return Err(RemlError::NonFiniteValue {
             reason: format!(
@@ -7530,15 +7641,8 @@ pub fn reml_laml_evaluate(
         None => &*solution.deriv_provider,
     };
 
-    // Extract logdet flags once (same for all coordinates).
-    let (incl_logdet_h, incl_logdet_s) = match &solution.dispersion {
-        DispersionHandling::ProfiledGaussian => (true, true),
-        DispersionHandling::Fixed {
-            include_logdet_h,
-            include_logdet_s,
-            ..
-        } => (*include_logdet_h, *include_logdet_s),
-    };
+    // `incl_logdet_h` / `incl_logdet_s` were extracted once above (before the
+    // value-only early return) and are reused here for the gradient/Hessian.
 
     let ext_dim = solution.ext_coords.len();
     let mut grad = Array1::zeros(k + ext_dim);
@@ -8367,24 +8471,15 @@ pub fn reml_laml_evaluate(
         debug_stash::store_terms(stash);
     }
 
-    // Add correction gradients (ρ-only). The Tierney–Kadane term is a
-    // frozen-curvature correction to the Laplace `½ log|H|` factor, so its
-    // VALUE is added to the cost ONLY when `include_logdet_h` is set (see the
-    // `if *include_logdet_h { cost += solution.tk_correction … }` guard in the
-    // cost branch). Its DERIVATIVE must follow the SAME guard, otherwise a
-    // `MaxPenalizedLikelihood`-style assembly (`include_logdet_h = false`) that
-    // also carried a nonzero `tk_correction` would expose a gradient term the
-    // value omits — precisely the value↔derivative desync this evaluator must
-    // never introduce. (The runtime `apply_tk_to_result` path keeps the two
-    // sides paired by always applying both; this guard keeps the
-    // `InnerAssembly`-field path paired the other way, so every TK route is
-    // value/gradient-consistent regardless of `include_logdet_h`.)
-    if incl_logdet_h {
-        if let Some(tk_grad) = &solution.tk_gradient {
-            let mut sl = grad.slice_mut(ndarray::s![..k]);
-            sl += tk_grad;
-        }
-    }
+    // Apply the ρ-GRADIENT half of the guarded Tierney–Kadane correction built
+    // above (its VALUE half was applied to `cost` before the value-only early
+    // return). Both halves read the SAME `include` guard from the SAME
+    // `tk_correction` object, so the value and derivative cannot desync — a
+    // `MaxPenalizedLikelihood`-style assembly (`include_logdet_h = false`)
+    // carrying a nonzero `tk_correction` omits BOTH, never one without the
+    // other. (The runtime `apply_tk_to_result` path is independently paired —
+    // it always applies value+gradient+hessian together.)
+    tk_correction.apply_gradient(&mut grad);
 
     // Add prior gradient (ρ-only).
     if let Some((_, ref pg, _)) = prior_cost_gradient {
@@ -17421,6 +17516,78 @@ mod tests {
     use crate::solver::estimate::DP_FLOOR;
     use approx::assert_relative_eq;
     use ndarray::array;
+
+    // ─── Can't-desync invariant for GuardedCorrection ────────────────────
+    //
+    // A `GuardedCorrection` carries a scalar VALUE and its analytic ρ-GRADIENT
+    // under ONE `include` flag. The invariant this pins: the SAME flag gates
+    // BOTH contributions, so the value and the gradient can never be
+    // half-applied (the objective↔gradient desync class behind #752/#748/#808
+    // and the latent Tierney–Kadane correction desync). With `include = false`
+    // NEITHER the cost nor the ρ-gradient moves; with `include = true` BOTH do —
+    // and `apply_value` + `apply_gradient` (the split the evaluator uses across
+    // the value-only early return) read the SAME guard from the SAME object.
+    #[test]
+    fn guarded_correction_include_false_applies_neither() {
+        let value = 3.5_f64;
+        let gradient = array![0.25, -0.75, 1.5];
+        let correction =
+            GuardedCorrection::new(value, Some(gradient.clone()), /* include = */ false);
+
+        // Combined apply: cost and gradient must both be untouched.
+        let mut cost = 10.0;
+        let mut grad = array![0.0, 0.0, 0.0];
+        correction.apply(&mut cost, &mut grad);
+        assert_eq!(cost, 10.0, "include=false must not move the cost");
+        assert_eq!(
+            grad,
+            array![0.0, 0.0, 0.0],
+            "include=false must not move the ρ-gradient"
+        );
+
+        // Split apply (the value-only-early-return path): same no-op guarantee.
+        let mut cost_split = 10.0;
+        let mut grad_split = array![0.0, 0.0, 0.0];
+        correction.apply_value(&mut cost_split);
+        correction.apply_gradient(&mut grad_split);
+        assert_eq!(cost_split, 10.0, "apply_value must respect include=false");
+        assert_eq!(
+            grad_split,
+            array![0.0, 0.0, 0.0],
+            "apply_gradient must respect include=false"
+        );
+    }
+
+    #[test]
+    fn guarded_correction_include_true_applies_both() {
+        let value = 3.5_f64;
+        let gradient = array![0.25, -0.75, 1.5];
+        let correction =
+            GuardedCorrection::new(value, Some(gradient.clone()), /* include = */ true);
+
+        // Combined apply: BOTH the cost and the ρ-gradient must move.
+        let mut cost = 10.0;
+        let mut grad = array![0.0, 0.0, 0.0];
+        correction.apply(&mut cost, &mut grad);
+        assert_eq!(cost, 13.5, "include=true must add the value to cost");
+        assert_eq!(
+            grad, gradient,
+            "include=true must add the gradient to the ρ-gradient"
+        );
+
+        // Split apply must agree with the combined apply, and the gradient is
+        // added only to the LEADING entries (extra ρ-coordinates untouched).
+        let mut cost_split = 10.0;
+        let mut grad_split = array![0.0, 0.0, 0.0, 42.0];
+        correction.apply_value(&mut cost_split);
+        correction.apply_gradient(&mut grad_split);
+        assert_eq!(cost_split, 13.5);
+        assert_eq!(
+            grad_split,
+            array![0.25, -0.75, 1.5, 42.0],
+            "gradient applies to leading entries; trailing ext coords untouched"
+        );
+    }
 
     // ─── Regression for #376 ─────────────────────────────────────────────
     //
