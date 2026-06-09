@@ -159,7 +159,16 @@ impl RiemannianTrustRegion {
         let d = manifold.ambient_dim();
         check_len("trust-region initial point", x.len(), d)?;
 
-        let mut delta = self.radius;
+        // Establish the trust-region invariant `0 < Δ_k ≤ Δmax` *before* the
+        // first step, not just on later expansions. The expansion rule below
+        // caps via `min(·, max_radius)` and contraction only shrinks, so once
+        // `0 < Δ₀ ≤ Δmax` holds we have `0 < Δ_k ≤ Δmax` for all `k` by
+        // induction; every subproblem then obeys `‖η_k‖_g ≤ Δ_k ≤ Δmax`,
+        // restoring `max_radius` as the documented hard cap. A configured
+        // `radius > max_radius` (or a non-finite `radius`) would otherwise let
+        // the very first Cauchy/Steihaug step overshoot the advertised maximum,
+        // so we clamp the initial radius into `(0, max_radius]` here.
+        let mut delta = self.radius.min(self.max_radius);
 
         for _ in 0..self.max_iter {
             let (f_curr, grad_e) = objective.value_gradient(x.view())?;
