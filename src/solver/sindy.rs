@@ -768,17 +768,19 @@ mod tests {
         let seed_small = nf * 0.01 / (nf + lam.max(1.0e-12));
         let w_small = scad_grad(seed_small, lam, a) / seed_small.max(eps);
         let expected_small = (nf * 0.01) / (nf + w_small);
+        // coefficients are laid out [n_features, n_outputs]; the small coef is
+        // the single feature of OUTPUT 1, i.e. index (0, 1) — not (1, 0).
         assert!(
-            (res.coefficients[(1, 0)] - expected_small).abs() < 1.0e-6,
+            (res.coefficients[(0, 1)] - expected_small).abs() < 1.0e-6,
             "small coef must get its own large SCAD weight ({w_small}) and be \
              shrunk to {expected_small}, not the row-max weight 0; got {}",
-            res.coefficients[(1, 0)]
+            res.coefficients[(0, 1)]
         );
         // Guard: the row-max bug would leave the small coef at ~0.01 (weight 0).
         assert!(
-            res.coefficients[(1, 0)] < 0.01 - 1.0e-4,
+            res.coefficients[(0, 1)] < 0.01 - 1.0e-4,
             "small coef was not shrunk — row-max LQA weight bug (#959) present; got {}",
-            res.coefficients[(1, 0)]
+            res.coefficients[(0, 1)]
         );
     }
 }
