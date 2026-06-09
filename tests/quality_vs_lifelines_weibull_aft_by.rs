@@ -48,12 +48,13 @@
 //!
 //! ## Data (fixed seed, n=200, 100 per group)
 //!
-//! Group A baseline ~ Weibull(scale=0.8, shape=1.2); Group B baseline ~
-//! Weibull(scale=1.5, shape=0.9); both with x ~ N(0,1) and a group-specific
-//! AFT acceleration of x (the slope of x on log-time differs by group, which
-//! the by-factor smooth must capture). Right-censoring via an independent
-//! exponential keeps ~20-35% censored — realistic, and identical rows go to
-//! both engines.
+//! Group A baseline ~ Weibull(scale=0.8, shape=1.1); Group B baseline ~
+//! Weibull(scale=1.5, shape=1.1) — a COMMON shape (the shared-baseline `log t`
+//! slope gam's single baseline can represent) with distinct scales and distinct,
+//! opposite-sign AFT acceleration slopes of x (the per-group signal the by-factor
+//! smooth must capture as a proportional log-hazard shift). Both with x ~ N(0,1).
+//! Right-censoring via an independent exponential keeps ~20-35% censored —
+//! realistic, and identical rows go to both engines.
 
 use csv::StringRecord;
 use gam::smooth::build_term_collection_design;
@@ -73,10 +74,26 @@ const N_PER_GROUP: usize = 100;
 const SEED: u64 = 20260529;
 
 // Group baselines (rand_distr::Weibull::new(scale, shape): CDF 1 - exp(-(t/scale)^shape)).
+//
+// The two strata share a COMMON Weibull SHAPE and differ only in scale and in the
+// AFT acceleration slope of `x`. This is deliberate and load-bearing: the gam
+// model this test fits is `s(x, by=group)` over a SINGLE shared baseline
+// cumulative hazard `H0(t) = (t/scale)^shape` (one shape coefficient — the slope
+// of `log H0` in `log t`). A by-factor smooth can express a *proportional*
+// per-group log-hazard shift (a different scale and a different x-acceleration per
+// group), but it CANNOT bend the shared baseline's `log t` slope per group, so a
+// per-group shape would make gam's shared-baseline model structurally
+// mis-specified — it could never recover the truth, and the comparison against
+// lifelines (which fits a fully independent Weibull, including its own shape, per
+// stratum) would be apples-to-oranges. With a shared shape the gam model is
+// correctly specified for the DGP, so the truth-recovery and match-or-beat claims
+// are a fair, like-for-like test of the by-factor acceleration signal. Distinct
+// scales (0.8 vs 1.5) and opposite-sign acceleration slopes (BETA_A vs BETA_B)
+// keep the per-group by-factor signal the smooth must recover.
 const SCALE_A: f64 = 0.8;
-const SHAPE_A: f64 = 1.2;
+const SHAPE_A: f64 = 1.1;
 const SCALE_B: f64 = 1.5;
-const SHAPE_B: f64 = 0.9;
+const SHAPE_B: f64 = 1.1;
 // Group-specific AFT acceleration of x: log(T) gets `BETA_g * x` added, so the
 // x slope differs by group — the signal the by-factor smooth must recover.
 const BETA_A: f64 = 0.35;
