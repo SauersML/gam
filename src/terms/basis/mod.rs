@@ -31605,7 +31605,7 @@ mod tests {
         let forward_sources: Vec<PenaltySource> = forward_info
             .iter()
             .filter(|info| info.active)
-            .map(|info| info.source)
+            .map(|info| info.source.clone())
             .collect();
         assert_eq!(
             forward_sources,
