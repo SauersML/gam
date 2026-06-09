@@ -1,3 +1,35 @@
+## gamfit 0.1.189 (2026-06-09)
+
+PyPI wheel release on top of gam 0.3.108, rolling up the survival + predict
+correctness work landed since gamfit 0.1.188:
+
+Survival (transformation / location-scale AFT):
+- fix(#892): reduced parametric-AFT time-warp gauge is now identified and
+  verified end-to-end. The fit routes σ-scaling through the location channel
+  (`η_t → η_t − log t`, warp `h ≡ 0`, so `u = (log t − μ)/σ`) and the predict
+  path mirrors it — a 3-bug chain fixed forward: regime detection by all-zero
+  `beta_time` (not `is_empty`, since finalize emits a non-empty length-`p` zero
+  vector), keep the full-width zero-β time basis (warp nulls via β=0) so the
+  scale-deviation primary keeps its full column count and the hazard dim guard
+  holds. New e2e CLI fit→save→load→predict test tracks the lognormal truth.
+- fix(#899): saved Weibull baseline scale recovered from the time anchor, not a
+  stale/unidentified `exp(−β[0]/shape)`.
+- fix(#900): factor-by-level smooths centered against their gated level
+  indicator, so each `s(x, by=g)` group keeps its own per-group baseline.
+
+Multinomial / GAMLSS:
+- fix(#715): multinomial REML adapter skips the outer seed-screening cascade on
+  the LM-damped formula path so a valid REML seed survives the canonical-gauge
+  null direction.
+- refactor(#780): extracted the binomial neg-log-q derivative math and the
+  location-scale validators out of the gamlss.rs mega-file into
+  `gamlss/binomial_q_derivs.rs` + `gamlss/validation.rs` (pure, no behavior
+  change).
+
+Predict guard tests:
+- Added e2e truth-recovery regressions for tensor `te(x,z)` and by-factor
+  `s(x, by=g)` predict on fresh grids (both paths verified correct).
+
 ## v0.3.108 — gam 0.3.108 / gamfit 0.1.188 (2026-06-09)
 
 Crate + wheel release rolling up everything since gam 0.3.107. crates.io is at
