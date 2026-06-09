@@ -39,7 +39,7 @@ pub(super) fn calculate_edfwithworkspace_from_factor(
         PirlsPenalty::Dense { e_transformed, .. } => {
             let p = factor.n();
             let r = e_transformed.nrows();
-            let mp = ((p - r) as f64).max(0.0);
+            let mp = (p as f64 - r as f64).max(0.0);
             if r == 0 {
                 return Ok(p as f64);
             }
@@ -74,7 +74,7 @@ pub(super) fn calculate_edfwithworkspace_from_factor(
         } => {
             let p = factor.n();
             let r = positive_indices.len();
-            let mp = ((p - r) as f64).max(0.0);
+            let mp = (p as f64 - r as f64).max(0.0);
             if r == 0 {
                 return Ok(p as f64);
             }
@@ -117,7 +117,7 @@ pub(super) fn calculate_edf_from_sparse_factor(
     // e_transformed has shape (r, p) — cols give the coefficient dimension p.
     let p = e_transformed.ncols();
     let r = e_transformed.nrows();
-    let mp = ((p - r) as f64).max(0.0);
+    let mp = (p as f64 - r as f64).max(0.0);
     if r == 0 {
         return Ok(p as f64);
     }
@@ -144,7 +144,7 @@ pub(super) fn calculate_edf(
 ) -> Result<f64, EstimationError> {
     let p = penalized_hessian.ncols();
     let r = e_transformed.nrows();
-    let mp = ((p - r) as f64).max(0.0);
+    let mp = (p as f64 - r as f64).max(0.0);
     if r == 0 {
         return Ok(p as f64);
     }
@@ -196,7 +196,7 @@ pub(super) fn calculate_edfwithworkspace(
 ) -> Result<f64, EstimationError> {
     let p = penalized_hessian.ncols();
     let r = e_transformed.nrows();
-    let mp = ((p - r) as f64).max(0.0);
+    let mp = (p as f64 - r as f64).max(0.0);
     if r == 0 {
         return Ok(p as f64);
     }
@@ -261,7 +261,7 @@ pub(super) fn calculate_edf_from_diagonal_penalty(
 ) -> Result<f64, EstimationError> {
     let p = penalized_hessian.ncols();
     let r = positive_indices.len();
-    let mp = ((p - r) as f64).max(0.0);
+    let mp = (p as f64 - r as f64).max(0.0);
     if r == 0 {
         return Ok(p as f64);
     }
@@ -295,7 +295,7 @@ pub(super) fn calculate_edfwithworkspace_from_diagonal_penalty(
 ) -> Result<f64, EstimationError> {
     let p = penalized_hessian.ncols();
     let r = positive_indices.len();
-    let mp = ((p - r) as f64).max(0.0);
+    let mp = (p as f64 - r as f64).max(0.0);
     if r == 0 {
         return Ok(p as f64);
     }
@@ -342,4 +342,45 @@ where
         }
     }
     (p as f64 - tr).clamp(mp, p as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linalg::matrix::SymmetricMatrix;
+    use ndarray::array;
+
+    /// Regression: a penalty with MORE rows than coefficient columns (`r > p`)
+    /// is legitimate for factor-smooth / random-slope / random-effect
+    /// structures whose penalty roots are stacked or full-rank. The
+    /// min-penalty-dof floor `mp = max(p - r, 0)` must be computed in `f64`,
+    /// because the `usize` subtraction `p - r` underflows and panics with
+    /// "attempt to subtract with overflow" when `r > p`. This exercises the
+    /// `r > p` path on the dense EDF entry point and asserts that the floor is
+    /// honored (no panic, finite EDF in `[0, p]`).
+    #[test]
+    fn calculate_edf_floors_when_penalty_rank_exceeds_coefficient_dim() {
+        // p = 2 coefficients, r = 3 penalty rows (r > p).
+        let p = 2usize;
+        // SPD penalized Hessian (well-conditioned, dense path).
+        let hessian = SymmetricMatrix::Dense(array![[4.0, 1.0], [1.0, 3.0]]);
+        // e_transformed has shape (r, p) = (3, 2): more penalty rows than
+        // coefficient columns — the factor/random-slope structure.
+        let e_transformed = array![[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        assert_eq!(e_transformed.nrows(), 3);
+        assert_eq!(e_transformed.ncols(), p);
+
+        let edf = calculate_edf(&hessian, &e_transformed)
+            .expect("EDF solve should succeed for an SPD Hessian with r > p");
+
+        // mp = max(p - r, 0) = 0, so the EDF is floored at 0 and capped at p.
+        assert!(
+            edf.is_finite(),
+            "EDF must be finite for r > p penalty, got {edf}"
+        );
+        assert!(
+            (0.0..=p as f64).contains(&edf),
+            "EDF must lie in [0, {p}] for r > p penalty, got {edf}"
+        );
+    }
 }
