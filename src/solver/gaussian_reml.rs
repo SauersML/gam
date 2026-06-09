@@ -251,6 +251,99 @@ struct ObjectiveEval {
     edf: f64,
 }
 
+/// A single Gaussian closed-form REML objective term, carrying its analytic
+/// VALUE together with its analytic ρ-GRADIENT and ρ-HESSIAN.
+///
+/// Single source of truth: each term's value and its (already hand-derived,
+/// closed-form) ρ-derivatives are returned from ONE function body, so a future
+/// edit to the value formula cannot silently leave the derivatives stale.
+/// Mirrors the `PenaltyLogdetDerivs`-returning-tuple pattern used by the
+/// unified outer evaluator — the structural cure for the objective↔gradient
+/// desync class (#752/#748/#808). The three contributions are accumulated
+/// through [`ObjectiveEval`] at one site, so they cannot drift apart.
+#[derive(Clone, Copy)]
+struct TermDerivs {
+    value: f64,
+    grad: f64,
+    hess: f64,
+}
+
+impl std::ops::AddAssign<TermDerivs> for ObjectiveEval {
+    /// Fold a term's `(value, grad, hess)` triple into the running totals in
+    /// lock-step, so value and derivative can never be added at separate sites.
+    fn add_assign(&mut self, rhs: TermDerivs) {
+        self.cost += rhs.value;
+        self.grad += rhs.grad;
+        self.hess += rhs.hess;
+    }
+}
+
+/// `½d·(log|H| − log|S|_+)` value with its analytic ρ-gradient/Hessian.
+///
+/// The penalty-eigenvalue sum produces all three quantities from the SAME
+/// `t = λδ` intermediates in one pass, so the value (`log|1+t|`) and its
+/// derivatives (`t/(1+t)`, `t/(1+t)²`) are single-sourced.
+fn gaussian_reml_logdet_term(
+    cache: &GaussianRemlEigenCache,
+    rho: f64,
+    n_outputs: f64,
+) -> (TermDerivs, f64) {
+    let lambda = rho.exp();
+    let mut logdet_h = cache.logdet_xtwx;
+    let mut trace_h = 0.0;
+    let mut trace_h_deriv = 0.0;
+    let mut edf = 0.0;
+    for &delta in &cache.penalty_eigenvalues {
+        let t = lambda * delta;
+        logdet_h += (1.0 + t).ln();
+        if delta > 0.0 {
+            trace_h += t / (1.0 + t);
+            trace_h_deriv += t / ((1.0 + t) * (1.0 + t));
+        }
+        edf += 1.0 / (1.0 + t);
+    }
+    let logdet_s = cache.logdet_penalty_positive + (cache.penalty_rank as f64) * rho;
+    let term = TermDerivs {
+        value: 0.5 * n_outputs * (logdet_h - logdet_s),
+        grad: 0.5 * n_outputs * (trace_h - cache.penalty_rank as f64),
+        hess: 0.5 * n_outputs * trace_h_deriv,
+    };
+    (term, edf)
+}
+
+/// Per-output dispersion-prior term `½ν·(1 + log(2π·dp/ν))` with its analytic
+/// ρ-gradient/Hessian.
+///
+/// `dp`, `dp_grad`, `dp_hess` are computed from the SAME eigenvalue sum, then
+/// the value `log(dp)` and its derivatives `dp_grad/dp`,
+/// `dp_hess/dp − (dp_grad/dp)²` are returned together so they cannot desync.
+fn gaussian_reml_dispersion_term(
+    cache: &GaussianRemlEigenCache,
+    ywy: ArrayView1<'_, f64>,
+    projected_rhs_squared: ArrayView2<'_, f64>,
+    output: usize,
+    nu: f64,
+    lambda: f64,
+) -> TermDerivs {
+    let mut fitted_quadratic = 0.0;
+    let mut dp_grad = 0.0;
+    let mut dp_hess = 0.0;
+    for eig in 0..cache.penalty_eigenvalues.len() {
+        let c2 = projected_rhs_squared[[eig, output]];
+        let t = lambda * cache.penalty_eigenvalues[eig];
+        let denom = 1.0 + t;
+        fitted_quadratic += c2 / denom;
+        dp_grad += c2 * t / (denom * denom);
+        dp_hess += c2 * t * (1.0 - t) / (denom * denom * denom);
+    }
+    let dp = (ywy[output] - fitted_quadratic).max(MIN_DEVIANCE);
+    TermDerivs {
+        value: 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln()),
+        grad: 0.5 * nu * dp_grad / dp,
+        hess: 0.5 * nu * (dp_hess / dp - (dp_grad * dp_grad) / (dp * dp)),
+    }
+}
+
 pub fn gaussian_reml_closed_form(
     x: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -2630,47 +2723,28 @@ fn evaluate_reml_parts(
     let lambda = rho.exp();
     let nu = n_observations as f64 - cache.nullity as f64;
     let d = n_outputs as f64;
-    let mut logdet_h = cache.logdet_xtwx;
-    let mut trace_h = 0.0;
-    let mut trace_h_deriv = 0.0;
-    let mut edf = 0.0;
-    for &delta in &cache.penalty_eigenvalues {
-        let t = lambda * delta;
-        logdet_h += (1.0 + t).ln();
-        if delta > 0.0 {
-            trace_h += t / (1.0 + t);
-            trace_h_deriv += t / ((1.0 + t) * (1.0 + t));
-        }
-        edf += 1.0 / (1.0 + t);
-    }
-    let logdet_s = cache.logdet_penalty_positive + (cache.penalty_rank as f64) * rho;
 
-    let mut cost = 0.5 * d * (logdet_h - logdet_s);
-    let mut grad = 0.5 * d * (trace_h - cache.penalty_rank as f64);
-    let mut hess = 0.5 * d * trace_h_deriv;
-    for output in 0..n_outputs {
-        let mut fitted_quadratic = 0.0;
-        let mut dp_grad = 0.0;
-        let mut dp_hess = 0.0;
-        for eig in 0..cache.penalty_eigenvalues.len() {
-            let c2 = projected_rhs_squared[[eig, output]];
-            let t = lambda * cache.penalty_eigenvalues[eig];
-            let denom = 1.0 + t;
-            fitted_quadratic += c2 / denom;
-            dp_grad += c2 * t / (denom * denom);
-            dp_hess += c2 * t * (1.0 - t) / (denom * denom * denom);
-        }
-        let dp = (ywy[output] - fitted_quadratic).max(MIN_DEVIANCE);
-        cost += 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
-        grad += 0.5 * nu * dp_grad / dp;
-        hess += 0.5 * nu * (dp_hess / dp - (dp_grad * dp_grad) / (dp * dp));
-    }
-    ObjectiveEval {
-        cost,
-        grad,
-        hess,
+    // Each term's value and its ρ-derivatives come back from ONE function so
+    // they cannot be edited independently; `+=` folds the triple in lock-step.
+    let (logdet_term, edf) = gaussian_reml_logdet_term(cache, rho, d);
+    let mut eval = ObjectiveEval {
+        cost: 0.0,
+        grad: 0.0,
+        hess: 0.0,
         edf,
+    };
+    eval += logdet_term;
+    for output in 0..n_outputs {
+        eval += gaussian_reml_dispersion_term(
+            cache,
+            ywy,
+            projected_rhs_squared,
+            output,
+            nu,
+            lambda,
+        );
     }
+    eval
 }
 
 fn optimize_rho_no_alloc(
