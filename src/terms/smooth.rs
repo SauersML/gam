@@ -8514,7 +8514,13 @@ fn apply_global_smooth_identifiability(
         let needs_parametric_block = !skip_global_transform
             && (smooth_has_overlapping_linear_terms(linear_terms, termspec)
                 || !smooth_intrinsic_parametric_feature_cols(linear_terms, termspec).is_empty()
-                || smooth_requires_parametric_orthogonality(termspec));
+                || smooth_requires_parametric_orthogonality(termspec)
+                // A factor-by-level smooth must always be centered against its
+                // gated level indicator (see `factor_by_level_gate`) so its
+                // within-level constant cannot collide with the treatment-coded
+                // factor main effect — even when no continuous linear term
+                // overlaps it (e.g. `s(x, by=fac)` with no `+ x`).
+                || factor_by_level_gate(termspec).is_some());
         let parametric_block = if !needs_parametric_block {
             None
         } else {
@@ -8802,6 +8808,39 @@ fn apply_global_smooth_identifiability(
     })
 }
 
+/// If `termspec` is a single-level factor-by smooth (`s(x, by=fac)` expanded
+/// into one `ByVariable { kind: Level }` block per factor level), return the
+/// `(by_col, value_bits)` pair identifying which rows that level's block gates
+/// to. `None` for numeric-by smooths and every other basis.
+///
+/// A factor-by smooth's per-level block is the inner basis multiplied by the
+/// level indicator (zero on every other level's rows). Its column span
+/// therefore contains the per-level CONSTANT — a vector that is `1` on this
+/// level's rows and `0` elsewhere — which is exactly the column the
+/// treatment-coded factor main effect (`build_termspec` auto-adds one as an
+/// unpenalized random-effect term) already carries. Centering each level's
+/// smooth against the *global* intercept (`build_parametric_constraint_block_for_term`'s
+/// default) removes only its global mean, leaving that within-level constant
+/// to collide with the factor main effect: a rank-1 collinearity that lets the
+/// penalty/ridge split the per-group baseline level between the two blocks and
+/// under-recover it (the per-group log-cumulative-hazard offset leaks out — the
+/// #900 weibull-AFT-by-factor surface miscalibration). Centering against the
+/// gated level indicator instead removes the within-level constant cleanly,
+/// leaving the per-group level entirely to the factor main effect (mgcv's
+/// by-factor convention), while the per-level slope/curvature deviation stays
+/// in the smooth (we deliberately do NOT project the overlapping continuous
+/// axis out of a by-level smooth — that deviation is the by-factor signal).
+fn factor_by_level_gate(termspec: &SmoothTermSpec) -> Option<(usize, u64)> {
+    match &termspec.basis {
+        SmoothBasisSpec::ByVariable {
+            by_col,
+            by: ByVariableSpec::Level { value_bits, .. },
+            ..
+        } => Some((*by_col, *value_bits)),
+        _ => None,
+    }
+}
+
 fn build_parametric_constraint_block_for_term(
     data: ArrayView2<'_, f64>,
     linear_terms: &[LinearTermSpec],
@@ -8809,6 +8848,27 @@ fn build_parametric_constraint_block_for_term(
 ) -> Result<Array2<f64>, BasisError> {
     let n = data.nrows();
     let p_data = data.ncols();
+
+    // Factor-by-level smooth: center against the gated level indicator so the
+    // within-level constant is removed (it belongs to the treatment-coded
+    // factor main effect), not against the global `[1 | overlapping axes]`.
+    if let Some((by_col, value_bits)) = factor_by_level_gate(termspec) {
+        if by_col >= p_data {
+            crate::bail_dim_basis!(
+                "factor-by smooth term '{}' by column {by_col} out of bounds for {p_data} columns",
+                termspec.name
+            );
+        }
+        let mut c = Array2::<f64>::zeros((n, 1));
+        let by = data.column(by_col);
+        for (row, &value) in by.iter().enumerate() {
+            if value.to_bits() == value_bits {
+                c[[row, 0]] = 1.0;
+            }
+        }
+        return Ok(c);
+    }
+
     let feature_cols = smooth_term_feature_cols(termspec);
     let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(linear_terms, termspec);
     for &feature_col in &parametric_cols {
