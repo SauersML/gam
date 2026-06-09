@@ -1594,7 +1594,29 @@ struct SurvivalLocationScaleFamily {
     x_link_wiggle: Option<DesignMatrix>,
     wiggle_knots: Option<Array1<f64>>,
     wiggle_degree: Option<usize>,
+    /// σ-scaled log-t AFT location baseline (issue #892). `Some` only in the
+    /// rank-1 reduced parametric-AFT regime, where the time warp is removed
+    /// (`h ≡ 0`) and the `log t` baseline rides the σ-scaled `q` (location)
+    /// channel instead: the effective location is shifted to `η_t − log t` with a
+    /// time-derivative `−1/t`, so `u = inv_sigma·(log t − η_t) = (log t − μ)/σ`
+    /// and the event Jacobian gains `−log σ − log t`. `None` everywhere else.
+    location_log_time: Option<LocationLogTimeOffset>,
     policy: crate::resource::ResourcePolicy,
+}
+
+/// The σ-scaled log-t AFT location baseline (issue #892), applied to the `q`
+/// channel in the rank-1 reduced parametric-AFT regime. Each field is a per-row
+/// shift of the effective location predictor (`η_t → η_t + value`, derivative
+/// `+ deriv`), so the standardized residual becomes `inv_sigma·(log t − η_t)`.
+#[derive(Clone, Debug)]
+struct LocationLogTimeOffset {
+    /// `−log t_exit`: shifts the exit-time effective location by `−log t`.
+    value_exit: Array1<f64>,
+    /// `−log t_entry`: shifts the entry-time effective location by `−log t`.
+    value_entry: Array1<f64>,
+    /// `−1/t_exit`: the exit-time derivative of the `−log t` location shift,
+    /// feeding the `q`-channel `qdot` so `g` carries `inv_sigma/t`.
+    deriv_exit: Array1<f64>,
 }
 
 #[derive(Clone, Copy)]
@@ -4617,12 +4639,31 @@ fn prepare_survival_location_scale_model(
         None
     };
 
+    // σ-scaled log-t AFT location baseline (issue #892). When the rank-1 reduced
+    // parametric-AFT regime fired, the time warp was removed (`h ≡ 0`); the `log t`
+    // baseline is instead applied here as a per-row shift of the effective
+    // location predictor on the σ-scaled `q` channel: value `−log t` at entry/exit
+    // and derivative `−1/t` at exit. Then `u = inv_sigma·(log t − η_t)` and the
+    // event Jacobian gains `log_g = −η_ls − log t`, the `−log σ` term that
+    // identifies σ. `log_time_*` already carry the `SURVIVAL_TIME_FLOOR` floor, so
+    // `1/t_exit = exp(−log t_exit)` is finite and positive.
+    let location_log_time = if time_prepared.location_log_time_offset {
+        Some(LocationLogTimeOffset {
+            value_exit: log_time_exit.mapv(|lt| -lt),
+            value_entry: log_time_entry.mapv(|lt| -lt),
+            deriv_exit: log_time_exit.mapv(|lt| -((-lt).exp())),
+        })
+    } else {
+        None
+    };
+
     let family = SurvivalLocationScaleFamily {
         n,
         y: spec.event_target.clone(),
         w: spec.weights.clone(),
         inverse_link: spec.inverse_link.clone(),
         derivative_guard: spec.derivative_guard,
+        location_log_time,
         x_time_entry: Arc::new(time_prepared.design_entry.clone()),
         x_time_exit: Arc::new(time_prepared.design_exit.clone()),
         x_time_deriv: Arc::new(time_prepared.design_derivative_exit.clone()),
@@ -5012,6 +5053,16 @@ struct TimeBlockPrepared {
     /// I-spline columns are strictly monotone (not row-constant), so the
     /// threshold keeps its intercept.
     pinned_free_row_constant: bool,
+    /// True iff the rank-1 reduced parametric-AFT regime fired (issue #892), in
+    /// which the time warp is removed entirely (zero free columns, `h ≡ 0`) and
+    /// the `log t` baseline is instead applied as a per-row LOCATION offset that
+    /// rides the existing σ-scaled `q` channel: `u = inv_sigma·(log t − η_t)`.
+    /// The caller threads the exact `−log t` (value at entry/exit) and `−1/t`
+    /// (time-derivative at exit) into the family so the standardized residual
+    /// carries the canonical survreg/lifelines AFT gauge — the event Jacobian
+    /// then contributes `log_g = −η_ls − log t = −log σ − log t`, the `−log σ`
+    /// term that identifies σ. On every other path this is `false`.
+    location_log_time_offset: bool,
 }
 
 fn lower_bound_constraints(lower_bounds: &Array1<f64>) -> Option<LinearInequalityConstraints> {
@@ -5559,107 +5610,46 @@ fn unit_log_time_slope(
     Some(slope)
 }
 
-/// The rank-1 reduced parametric-AFT time warp on the canonical log-t gauge
-/// (issue #892).
-///
-/// The warp shape is pinned to EXACTLY `log t` — built directly from the event
-/// times (value `log t` at entry/exit, derivative `1/t` at exit), bypassing the
-/// I-spline's curved monotone-trend image of it — but its SCALE `θ` is a single
-/// FREE coefficient: `h(t) = θ · log t`. This is the precise survreg / lifelines
-/// / flexsurv AFT gauge.
-///
-/// Why `θ` must stay FREE (not folded to a fixed `θ ≡ 1` offset): the
-/// standardized residual the likelihood consumes is `u = h(t) − η_loc/σ`, with
-/// the warp entering UN-scaled by σ. For a lognormal/loglogistic AFT
-/// `(log t − μ)/σ`, the warp must therefore carry slope `1/σ` versus log t —
-/// `h(t) = (1/σ) log t`. Folding `h ≡ log t` (slope 1) forces the residual's
-/// log-t slope to 1, so σ can no longer act through the warp and is left
-/// over-determined (it overshoots and the location slopes compress). Keeping a
-/// single free `θ` lets the MLE drive `θ → 1/σ`, recovering σ to truth.
-///
-/// `θ` is identified (no flat ridge): the event Jacobian contributes
-/// `log|h′(t)| = log(θ/t) = log θ − log t`, whose `log θ` term pins the warp
-/// scale — the multiplicative `(θ, σ, slopes)` symmetry that made the FULL
-/// multi-column I-spline ridge numerically unidentifiable does not survive the
-/// collapse to one log-t column. The block is unpenalized parametric (like the
-/// constant `log_sigma` / rigid `threshold` blocks), so it carries no outer ρ.
-struct PinnedRank1Warp {
-    /// Lift from the single free reduced coefficient `θ` to the raw I-spline
-    /// layout: `β_time_raw = z_report · θ`. `z_report` is the unit-log-t-slope-
-    /// normalized null-space direction (the I-spline's best monotone log-t
-    /// representation), so the reported raw coefficients and the I-spline-basis
-    /// prediction path reconstruct `θ · log t` consistently with the fit.
-    z_report: Array2<f64>,
-    /// Free design columns for the single `θ` coefficient: exact `log t` at
-    /// entry / exit and exact `1/t` at exit (each n×1).
-    design_entry: Array2<f64>,
-    design_exit: Array2<f64>,
-    design_derivative_exit: Array2<f64>,
-}
-
-/// Pin the rank-1 reduced parametric-AFT time-warp SHAPE to exactly `log t`
-/// while keeping its SCALE `θ` a single free coefficient (issue #892).
+/// Does the rank-1 reduced parametric-AFT regime apply (issue #892)?
 ///
 /// The real survival time penalty is a 1st-difference penalty, so its null space
-/// is DIMENSION 1: a single monotone log-t trend column `z` (p×1). The earlier
-/// reduce kept that whole I-spline column free, whose curved image ≠ log t left
-/// σ miscalibrated; a later attempt folded an exact `log t` offset with `θ ≡ 1`,
-/// which fixed the σ-collapse but then over-determined σ (slope-1 warp ⇒ residual
-/// log-t slope locked at 1, σ overshoots). The principled gauge keeps the exact
-/// log-t shape AND a free scale `θ = 1/σ`.
+/// is DIMENSION 1: a single monotone log-t trend column `z` (p×1). When it does,
+/// the time warp is REMOVED entirely (`h ≡ 0`) and the `log t` baseline is
+/// carried as a per-row σ-scaled LOCATION offset instead — `u = inv_sigma·(log t
+/// − η_t) = (log t − μ)/σ` — so the event Jacobian gains the `−log σ` term that
+/// identifies σ (the survreg / lifelines / flexsurv AFT gauge).
 ///
-/// Returns the free n×1 log-t designs plus the report lift `z_report = z_norm`
-/// (so `β_time_raw = z_norm · θ`). The exact `log t` values come from the same
-/// floor (`SURVIVAL_TIME_FLOOR`) as `checked_log_survival_times`, so
-/// `1/t_exit = exp(−log t_exit)`. Returns `None` (fall through to the prior
-/// both-columns-free reduce) when the single column has no usable log-t slope,
-/// the time views are mis-shaped, or any floored time is non-finite.
-fn pin_reduced_time_warp_rank1(
+/// This predicate only certifies the regime is genuinely log-t parametric: the
+/// null space is rank-1, sized to the basis, and the single null-space direction
+/// has a usable data-scale slope versus log t (so `log t` actually varies and the
+/// floored times are finite). It does NOT build any design — the warp is gone and
+/// the log-t baseline rides the location channel, threaded from the caller. When
+/// it returns `false` the caller falls through to the prior both-columns-free
+/// reduce. `log t` values come from the same floor (`SURVIVAL_TIME_FLOOR`) as
+/// `checked_log_survival_times`.
+fn rank1_reduced_time_warp_applies(
     z: &Array2<f64>,
     design_exit: &Array2<f64>,
     log_time_entry: ndarray::ArrayView1<f64>,
     log_time_exit: ndarray::ArrayView1<f64>,
-) -> Option<PinnedRank1Warp> {
+) -> bool {
     if z.ncols() != 1 {
-        return None;
+        return false;
     }
     let n = design_exit.nrows();
     if log_time_entry.len() != n || log_time_exit.len() != n {
-        return None;
+        return false;
     }
-    // Report lift: the unit-log-t-slope-normalized null-space direction (the
-    // I-spline's best monotone log-t representation). `β_time_raw = z_norm · θ`
-    // makes the reported raw coefficient and the basis-driven prediction path
-    // reconstruct the same `θ · log t` the free fit uses — without that
-    // approximate image ever driving the fit (the fit uses the exact log-t
-    // columns below).
-    let z_dir = z.column(0).to_owned();
-    let slope = unit_log_time_slope(design_exit, &z_dir, log_time_exit)?;
-    let z_report = (&z_dir / slope).insert_axis(ndarray::Axis(1));
-
-    // Exact log-t free design for the single `θ` coefficient: `log t` value at
-    // entry/exit and `1/t` derivative at exit. `1/t_exit = exp(−log t_exit)`
-    // because `log t_exit = ln(max(t, SURVIVAL_TIME_FLOOR))`, so the derivative
-    // is strictly positive and finite — the derivative guard `θ · (1/t) ≥ guard`
-    // then keeps `θ > 0` (a non-decreasing warp).
-    let value_entry = log_time_entry.to_owned();
-    let value_exit = log_time_exit.to_owned();
-    let derivative_exit = log_time_exit.mapv(|lt| (-lt).exp());
-    if value_entry.iter().any(|v| !v.is_finite())
-        || value_exit.iter().any(|v| !v.is_finite())
-        || derivative_exit.iter().any(|v| !v.is_finite())
+    if log_time_entry.iter().any(|v| !v.is_finite())
+        || log_time_exit.iter().any(|v| !v.is_finite())
     {
-        return None;
+        return false;
     }
-    let design_entry = value_entry.insert_axis(ndarray::Axis(1));
-    let design_exit_col = value_exit.insert_axis(ndarray::Axis(1));
-    let design_derivative_exit = derivative_exit.insert_axis(ndarray::Axis(1));
-    Some(PinnedRank1Warp {
-        z_report,
-        design_entry,
-        design_exit: design_exit_col,
-        design_derivative_exit,
-    })
+    // The null-space direction must have a usable data-scale slope versus log t —
+    // i.e. `log t` genuinely varies across the sample — else the σ-scaled log-t
+    // gauge is degenerate and the prior reduce should handle it instead.
+    let z_dir = z.column(0).to_owned();
+    unit_log_time_slope(design_exit, &z_dir, log_time_exit).is_some()
 }
 
 /// Result of pinning the reduced parametric-AFT time-warp slope to the canonical
@@ -5816,72 +5806,56 @@ fn prepare_identified_time_block(
         // keeps its intercept and `pinned_free_row_constant` stays false.
         if r == 1
             && z.nrows() == p
-            && let Some(pinned) =
-                pin_reduced_time_warp_rank1(&z, &design_exit, log_time_entry, log_time_exit)
+            && rank1_reduced_time_warp_applies(&z, &design_exit, log_time_entry, log_time_exit)
         {
-            let PinnedRank1Warp {
-                z_report,
-                design_entry: warp_entry_design,
-                design_exit: warp_exit_design,
-                design_derivative_exit: warp_derivative_design,
-            } = pinned;
-            // Single FREE log-t column `h(t) = θ · log t` (θ = warp scale). The
-            // design is the EXACT log-t transform straight from the event times
-            // (value `log t` at entry/exit, derivative `1/t` at exit) — NOT the
-            // I-spline's curved image of it — so the only freedom is the scalar
-            // scale θ. The likelihood drives θ → 1/σ (the survreg/lifelines AFT
-            // gauge), recovering σ; θ is identified by the event Jacobian's
-            // `log θ` term. Offsets pass through unchanged (no fold).
-            let reduced_derivative_design =
-                DesignMatrix::Dense(DenseDesignMatrix::from(warp_derivative_design.clone()));
-            // Pointwise monotonicity: `θ · (1/t) + offset′ ≥ guard` keeps the warp
-            // non-decreasing. Because `1/t > 0`, this is a one-sided lower bound on
-            // θ (θ ≥ (guard − offset′)·t), so the warp scale stays positive.
-            let linear_constraints = time_derivative_guard_constraints(
-                &reduced_derivative_design,
-                &input.derivative_offset_exit,
-                derivative_guard,
-            )?;
-            // Seed the warp scale θ. Project the caller's raw I-spline seed onto
-            // the single free column through the report lift (`θ₀ = z_reportᵀ β₀`,
-            // matching the rank-2 path's `z_cᵀ β₀`); absent a caller seed start at
-            // θ = 1 (a unit-slope log-t warp). Project onto the derivative guard so
-            // the seed lands feasible.
-            let seed_theta = match input.initial_beta.as_ref() {
-                Some(beta0) => z_report.t().dot(beta0),
-                None => Array1::from_elem(1, 1.0),
-            };
-            let initial_beta = match linear_constraints.as_ref() {
-                Some(constraints) => Some(project_onto_linear_constraints(
-                    1,
-                    constraints,
-                    Some(&seed_theta),
-                )?),
-                None => Some(seed_theta),
-            };
+            // σ-scaled log-t AFT gauge (issue #892). REMOVE the time warp entirely
+            // (`h ≡ 0`, zero free time columns) and instead carry the `log t`
+            // baseline as a per-row LOCATION offset on the existing σ-scaled `q`
+            // channel: `u = inv_sigma·(log t − η_t) = (log t − μ)/σ`. The caller
+            // threads the exact `−log t` value (entry/exit) and `−1/t` derivative
+            // into the family (`location_log_time_offset = true` below), so the
+            // standardized residual matches survreg/lifelines and the event
+            // Jacobian gains `log_g = −η_ls − log t = −log σ − log t` — the `−log σ`
+            // term that IDENTIFIES σ.
+            //
+            // Why not a free warp scale θ (the prior attempt): with the warp
+            // un-scaled by σ the pair `(η_t, σ)` co-scaled freely (only `η_t/σ`
+            // identified, no `−log σ` term), so every parameter shrank by a common
+            // factor. Routing `log t` through the σ-scaled `q` channel supplies the
+            // missing `−log σ` Jacobian and pins σ. The warp is gone, so the time
+            // block is empty (no free columns, no penalties, no constraints); all
+            // the σ-coupling rides the existing `q`-derivative/Hessian stack, with
+            // no new time×log_sigma cross-terms.
+            let empty_entry = Array2::<f64>::zeros((design_entry.nrows(), 0));
+            let empty_exit = Array2::<f64>::zeros((design_exit.nrows(), 0));
+            let empty_derivative = Array2::<f64>::zeros((design_derivative_exit.nrows(), 0));
             return Ok(TimeBlockPrepared {
-                design_entry: warp_entry_design,
-                design_exit: warp_exit_design,
-                design_derivative_exit: warp_derivative_design,
+                design_entry: empty_entry,
+                design_exit: empty_exit,
+                design_derivative_exit: empty_derivative,
                 coefficient_lower_bounds: None,
-                linear_constraints,
+                // No free time coefficients → no derivative-guard constraint. The
+                // warp derivative is `h′ ≡ 0`; monotonicity holds because the q
+                // channel contributes `qdot = inv_sigma/t > 0` to `g`.
+                linear_constraints: None,
                 penalties: Vec::new(),
                 nullspace_dims: Vec::new(),
-                initial_beta,
-                // Report lift `β_time_raw = z_report · θ` (no affine shift — the
-                // whole warp is the single free column, not a fixed offset).
+                // Empty free block: cold-start β is the zero-length vector.
+                initial_beta: Some(Array1::<f64>::zeros(0)),
                 transform: TimeIdentifiabilityTransform {
-                    z: z_report,
+                    z: Array2::<f64>::zeros((p, 0)),
                     affine_shift: Array1::zeros(p),
                 },
-                // Offsets pass through unchanged: the warp is the free design, not
-                // a folded offset.
-                offset_entry: input.offset_entry.clone(),
-                offset_exit: input.offset_exit.clone(),
-                derivative_offset_exit: input.derivative_offset_exit.clone(),
-                // The single free column is the (non-constant) log-t warp, not a
-                // row-constant direction, so the threshold keeps its intercept.
+                // Time block contributes nothing to `u`: zero value offsets (so
+                // `h ≡ 0`) and a zero derivative offset (so `h′ ≡ 0`). The log-t
+                // baseline lives entirely on the location channel.
+                offset_entry: Array1::zeros(design_entry.nrows()),
+                offset_exit: Array1::zeros(design_exit.nrows()),
+                derivative_offset_exit: Array1::zeros(design_derivative_exit.nrows()),
+                // No free time column → threshold keeps its intercept.
                 pinned_free_row_constant: false,
+                // Apply the σ-scaled log-t baseline on the location channel.
+                location_log_time_offset: true,
             });
         }
         // RANK-2 case (2nd-difference penalty `{1, log t}`): kept for correctness
@@ -5951,6 +5925,8 @@ fn prepare_identified_time_block(
                 // Pin fired: the free `z_c` column is row-constant, so the
                 // threshold intercept must be dropped to break the alias (#892).
                 pinned_free_row_constant: true,
+                // Rank-2 path keeps a free warp; no location-channel log-t offset.
+                location_log_time_offset: false,
             });
         }
         let reduced_entry = design_entry.dot(&z);
@@ -6011,6 +5987,8 @@ fn prepare_identified_time_block(
             // Fallback reduce: the reduced I-spline columns are strictly
             // monotone (not row-constant), so the threshold keeps its intercept.
             pinned_free_row_constant: false,
+            // Fallback reduce keeps a free warp; no location-channel log-t offset.
+            location_log_time_offset: false,
         });
     }
 
@@ -6063,6 +6041,8 @@ fn prepare_identified_time_block(
         derivative_offset_exit: input.derivative_offset_exit.clone(),
         // Full flexible I-spline: no pin, threshold keeps its intercept.
         pinned_free_row_constant: false,
+        // Flexible regime keeps the full warp; no location-channel log-t offset.
+        location_log_time_offset: false,
     })
 }
 
@@ -7044,18 +7024,36 @@ impl SurvivalLocationScaleFamily {
         let h_entry_base = joint_states.0.to_owned();
         let h_exit_base = joint_states.1.to_owned();
         let d_base = joint_states.2.to_owned();
-        let eta_t_exit = joint_states.3;
+        let eta_t_exit_view = joint_states.3;
         let eta_ls_exit = joint_states.4;
-        let eta_t_entry = joint_states.5;
+        let eta_t_entry_view = joint_states.5;
         let eta_ls_entry = joint_states.6;
         let eta_t_deriv_exit = joint_states.7;
         let eta_ls_deriv_exit = joint_states.8;
-        let eta_t_deriv_exit = eta_t_deriv_exit
+        let mut eta_t_deriv_exit = eta_t_deriv_exit
             .map(|v| v.to_owned())
             .unwrap_or_else(|| Array1::zeros(n));
         let eta_ls_deriv_exit = eta_ls_deriv_exit
             .map(|v| v.to_owned())
             .unwrap_or_else(|| Array1::zeros(n));
+        // σ-scaled log-t AFT location baseline (issue #892). In the rank-1 reduced
+        // parametric-AFT regime the time warp is removed (`h ≡ 0`); the `log t`
+        // baseline instead shifts the effective location predictor on the σ-scaled
+        // `q` channel — `η_t → η_t − log t` (value) with derivative `−1/t` — so the
+        // standardized residual is `u = inv_sigma·(log t − η_t) = (log t − μ)/σ`
+        // and the event Jacobian gains `qdot = inv_sigma/t → log_g = −η_ls − log t`,
+        // the `−log σ` term that identifies σ. Shifting the effective location here
+        // (before q0 / the q-row kernel) routes the whole σ coupling through the
+        // existing `q`-derivative/Hessian stack — no new time×log_sigma cross-terms.
+        let (eta_t_exit, eta_t_entry) = if let Some(loc) = self.location_log_time.as_ref() {
+            eta_t_deriv_exit += &loc.deriv_exit;
+            (
+                &eta_t_exit_view + &loc.value_exit,
+                &eta_t_entry_view + &loc.value_entry,
+            )
+        } else {
+            (eta_t_exit_view.to_owned(), eta_t_entry_view.to_owned())
+        };
         let inv_sigma_exit = eta_ls_exit.mapv(exp_sigma_inverse_from_eta_scalar);
         let inv_sigma_entry = eta_ls_entry.mapv(exp_sigma_inverse_from_eta_scalar);
         let q0_exit = Array1::from_iter(
@@ -7216,9 +7214,9 @@ impl SurvivalLocationScaleFamily {
         let mut d2qdot_lslsd = Array1::<f64>::zeros(n);
 
         let dynamic_row_inputs = SurvivalDynamicGeometryRowInputs {
-            eta_t_exit,
+            eta_t_exit: eta_t_exit.view(),
             eta_ls_exit,
-            eta_t_entry,
+            eta_t_entry: eta_t_entry.view(),
             eta_ls_entry,
             eta_t_deriv_exit: &eta_t_deriv_exit,
             eta_ls_deriv_exit: &eta_ls_deriv_exit,
@@ -12774,6 +12772,7 @@ mod tests {
             x_link_wiggle: None,
             wiggle_knots: None,
             wiggle_degree: None,
+            location_log_time: None,
             policy: crate::resource::ResourcePolicy::default_library(),
         }
     }
@@ -13635,16 +13634,16 @@ mod tests {
     }
 
     #[test]
-    fn rank1_time_warp_pin_builds_single_free_log_t_column() {
+    fn rank1_reduced_time_warp_removes_warp_and_flags_location_log_time() {
         // The real survival regime (issue #892): a 1st-difference time penalty
         // gives a DIMENSION-1 null space — a single monotone log-t column. The
-        // pin must collapse the time block to a SINGLE FREE column whose design is
-        // EXACTLY the log-t transform (value `log t` at entry/exit, `1/t` at exit)
-        // with the warp scale θ free (h = θ·log t, MLE drives θ → 1/σ), passthrough
-        // offsets, a derivative-guard constraint keeping θ > 0, a p×1 report lift
-        // (β_time_raw = z_report·θ) with ZERO affine_shift, and a KEPT threshold
-        // intercept (`pinned_free_row_constant == false`). A penalty `diag(0,1,1)`
-        // has the 1-D null space {e0}; design column 0 is monotone in log t.
+        // reduce must REMOVE the time warp entirely (zero free columns, empty
+        // designs + p×0 transform, zero value/derivative offsets so `h ≡ 0`, no
+        // constraint, no penalties) and instead FLAG `location_log_time_offset`,
+        // so the caller carries the σ-scaled `log t` baseline on the location `q`
+        // channel (u = inv_sigma·(log t − η_t)). The threshold keeps its intercept
+        // (`pinned_free_row_constant == false`). A penalty `diag(0,1,1)` has the
+        // 1-D null space {e0}; design column 0 is monotone in log t.
         let design_entry = array![[0.0, 1.0, 0.2], [0.405_465_108, 1.0, 0.5], [0.916_290_731, 1.0, 1.0]];
         let design_exit = array![[0.0, 0.5, 0.3], [0.405_465_108, 1.5, 0.8], [0.916_290_731, 2.5, 1.4]];
         let design_derivative_exit = array![[1.0, 1.0, 0.2], [0.5, 1.0, 0.3], [0.3, 1.0, 0.4]];
@@ -13673,60 +13672,36 @@ mod tests {
         )
         .expect("prepare time block");
 
-        // Single free time column: p×1 report transform, n×1 designs.
-        assert_eq!(prepared.transform.z.ncols(), 1);
+        // Warp removed: zero free columns, empty designs + p×0 transform.
+        assert_eq!(prepared.transform.z.ncols(), 0);
         assert_eq!(prepared.transform.z.nrows(), 3);
-        assert_eq!(prepared.design_exit.ncols(), 1);
-        assert_eq!(prepared.design_entry.ncols(), 1);
-        assert_eq!(prepared.design_derivative_exit.ncols(), 1);
-        // The free design is EXACTLY the log-t transform: value `log t` at
-        // entry/exit, derivative `1/t = exp(−log t)` at exit.
-        for i in 0..3 {
-            assert!((prepared.design_entry[[i, 0]] - log_time_entry[i]).abs() <= 1e-12);
-            assert!((prepared.design_exit[[i, 0]] - log_time_exit[i]).abs() <= 1e-12);
-            assert!(
-                (prepared.design_derivative_exit[[i, 0]] - (-log_time_exit[i]).exp()).abs() <= 1e-12
-            );
-        }
-        // Derivative-guard constraint present (keeps θ > 0); offsets pass through.
-        assert!(prepared.linear_constraints.is_some());
-        assert_eq!(prepared.offset_exit, time_block.offset_exit);
-        assert_eq!(prepared.offset_entry, time_block.offset_entry);
-        assert_eq!(prepared.derivative_offset_exit, time_block.derivative_offset_exit);
-        // No affine shift — the whole warp is the free column, not a fixed offset.
-        assert_eq!(prepared.transform.affine_shift.len(), 3);
+        assert_eq!(prepared.design_exit.ncols(), 0);
+        assert_eq!(prepared.design_entry.ncols(), 0);
+        assert_eq!(prepared.design_derivative_exit.ncols(), 0);
+        assert_eq!(prepared.design_exit.nrows(), 3);
+        assert_eq!(prepared.initial_beta, Some(Array1::<f64>::zeros(0)));
+        // No free coefficients → no derivative-guard constraint, no penalties.
+        assert!(prepared.linear_constraints.is_none());
+        assert!(prepared.penalties.is_empty());
+        // `h ≡ 0`: zero value offsets and zero derivative offset (the warp is gone;
+        // the log-t baseline lives on the location channel, not here).
+        assert_eq!(prepared.offset_exit, Array1::<f64>::zeros(3));
+        assert_eq!(prepared.offset_entry, Array1::<f64>::zeros(3));
+        assert_eq!(prepared.derivative_offset_exit, Array1::<f64>::zeros(3));
+        // No affine shift; the location-log-time flag is set.
         assert!(
             prepared
                 .transform
                 .affine_shift
                 .iter()
-                .all(|&v| v.abs() <= 1e-12),
-            "free-column rank-1 pin must carry a zero affine_shift"
+                .all(|&v| v.abs() <= 1e-12)
         );
-        // Single free column is the non-constant log-t warp → threshold keeps its
-        // intercept.
-        assert!(!prepared.pinned_free_row_constant);
-
-        // Report lift: β_time_raw = z_report·θ. z_report is the unit-log-t-slope-
-        // normalized null-space direction (the e0 monotone column), so its design
-        // image has unit slope vs log t — making β_time_raw = z_report reconstruct
-        // exactly `1·log t` at θ = 1.
-        let z_report = prepared.transform.z.column(0).to_owned();
-        let image = design_exit.dot(&z_report);
-        let log_mean = log_time_exit.sum() / 3.0;
-        let imean = image.sum() / 3.0;
-        let mut sxx = 0.0_f64;
-        let mut sxy = 0.0_f64;
-        for i in 0..3 {
-            let xc = log_time_exit[i] - log_mean;
-            sxx += xc * xc;
-            sxy += xc * (image[i] - imean);
-        }
         assert!(
-            (sxy / sxx - 1.0).abs() <= 1e-9,
-            "rank-1 report lift must have unit slope vs log t, got {}",
-            sxy / sxx
+            prepared.location_log_time_offset,
+            "rank-1 reduce must flag the σ-scaled log-t location baseline"
         );
+        // No free time column → threshold keeps its intercept.
+        assert!(!prepared.pinned_free_row_constant);
     }
 
     #[test]
@@ -16280,6 +16255,7 @@ mod tests {
             x_link_wiggle: None,
             wiggle_knots: None,
             wiggle_degree: None,
+            location_log_time: None,
             policy: crate::resource::ResourcePolicy::default_library(),
         };
 
@@ -16408,6 +16384,7 @@ mod tests {
             x_link_wiggle: None,
             wiggle_knots: None,
             wiggle_degree: None,
+            location_log_time: None,
             policy: crate::resource::ResourcePolicy::default_library(),
         };
 
