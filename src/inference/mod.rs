@@ -23,3 +23,4 @@ pub mod row_measure;
 pub mod row_metric;
 pub mod sample;
 pub mod smooth_test;
+pub mod steering;
