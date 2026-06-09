@@ -141,7 +141,11 @@ fn predict_dataset(exit_placeholder: f64) -> EncodedDataset {
 
 /// Drive `predict_survival` on `grid` for a single predict row carrying the
 /// given `exit` placeholder, returning the survival and cumulative-hazard rows.
-fn surface_for_exit(model: &FittedModel, exit_placeholder: f64, grid: &[f64]) -> (Vec<f64>, Vec<f64>) {
+fn surface_for_exit(
+    model: &FittedModel,
+    exit_placeholder: f64,
+    grid: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
     let dataset = predict_dataset(exit_placeholder);
     let col_map = dataset.column_map();
     let payload = model.payload();
@@ -256,7 +260,8 @@ fn survival_surface_is_independent_of_prediction_exit_placeholder() {
     // non-increasing, with S = exp(-H) holding on the shared grid.
     for surf in [&surv_small, &surv_big] {
         assert!(
-            surf.iter().all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
+            surf.iter()
+                .all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
             "survival surface must be finite and in [0,1]: {surf:?}"
         );
         for w in surf.windows(2) {

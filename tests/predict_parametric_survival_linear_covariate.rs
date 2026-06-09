@@ -176,7 +176,10 @@ fn parametric_survival_linear_covariate_predicts_a_valid_varying_surface() {
         .arg("Surv(entry, exit, event) ~ x")
         .arg("--out")
         .arg(&model_path);
-    run_or_panic(fit_cmd, "gam fit Surv(...) ~ x (default transformation, parametric-only)");
+    run_or_panic(
+        fit_cmd,
+        "gam fit Surv(...) ~ x (default transformation, parametric-only)",
+    );
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
     let model = FittedModel::load_from_path(&model_path).expect("load parametric survival model");
@@ -191,7 +194,8 @@ fn parametric_survival_linear_covariate_predicts_a_valid_varying_surface() {
     for (label, surv) in [("x=-1", &surv_lo), ("x=+1", &surv_hi)] {
         assert_eq!(surv.len(), grid.len(), "{label}: surface width mismatch");
         assert!(
-            surv.iter().all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
+            surv.iter()
+                .all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
             "{label}: survival surface must lie in [0, 1]: {surv:?}"
         );
         // A survival surface must be monotone non-increasing in t.
