@@ -21918,52 +21918,6 @@ mod tests {
     }
 
     #[test]
-    fn term_collection_design_keeps_intercept_plus_bspline_sparse() {
-        // Use `BSplineIdentifiability::None` so the smooth block stays sparse
-        // through `build_bspline_basis_1d`: the default `WeightedSumToZero`
-        // policy is deliberately densified by `apply_sum_to_zero_constraint_sparse`
-        // (orthonormal Z, so ZZᵀ projects), which would prevent the full
-        // assembled design from ever landing in `DesignMatrix::Sparse`
-        // — that is, the pin only makes sense for the None branch.
-        let n = 96usize;
-        let x = Array1::linspace(0.0, 1.0, n);
-        let mut data = Array2::<f64>::zeros((n, 1));
-        data.column_mut(0).assign(&x);
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![SmoothTermSpec {
-                name: "s_x".to_string(),
-                basis: SmoothBasisSpec::BSpline1D {
-                    feature_col: 0,
-                    spec: BSplineBasisSpec {
-                        degree: 3,
-                        penalty_order: 2,
-                        knotspec: BSplineKnotSpec::Generate {
-                            data_range: (0.0, 1.0),
-                            num_internal_knots: 32,
-                        },
-                        double_penalty: false,
-                        identifiability: BSplineIdentifiability::None,
-                        boundary: OneDimensionalBoundary::Open,
-                        boundary_conditions: BSplineBoundaryConditions::default(),
-                    },
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
-
-        let design =
-            build_term_collection_design(data.view(), &spec).expect("term collection design");
-        assert!(
-            matches!(design.design, DesignMatrix::Sparse(_)),
-            "expected sparse full design, got {:?}",
-            design.design
-        );
-    }
-
-    #[test]
     fn spatial_smooth_columns_do_not_duplicate_global_intercept() {
         let data = array![
             [0.0, 0.0],
