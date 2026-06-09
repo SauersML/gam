@@ -36927,7 +36927,16 @@ mod tests {
         for sum in col_sums.iter() {
             assert_abs_diff_eq!(*sum, 0.0, epsilon = 1e-10);
         }
-        assert_eq!(built.penalties.len(), 2);
+        // Cyclic basis must emit a single wiggliness penalty even when
+        // `double_penalty=true`: the cyclic difference penalty has a single
+        // null direction (the constant) which the periodic sum-to-zero
+        // identifiability constraint removes wholesale, so the
+        // null-space-shrinkage projector reduces to `Tᵀ(z·zᵀ)T = 0` — an
+        // identically zero penalty carrying its own smoothing parameter
+        // would leave that λ unidentified and prevent outer-REML termination
+        // (see #874 / the comment in `build_bspline_basis_1d`'s cyclic arm).
+        // Match mgcv `bs="cc"`, which is likewise a single-penalty smooth.
+        assert_eq!(built.penalties.len(), 1);
     }
 
     #[test]
