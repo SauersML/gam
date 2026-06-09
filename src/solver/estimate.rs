@@ -2333,7 +2333,17 @@ fn detect_prefit_unpenalized_rank_deficiency_in_design(
         .iter()
         .fold(0.0_f64, |scale, &value| scale.max(value.abs()))
         .max(1.0);
-    let tolerance = 1e-10 * spectral_scale;
+    // Rank tolerance is the floating-point noise floor for the Gram entries.
+    // Each Gram entry is a sum of `active_rows` products with error ~eps per
+    // term; the spectral perturbation bound is `O(active_rows · eps ·
+    // λ_max(Gram))`. A looser cutoff (the previous `1e-10 · λ_max`) demotes
+    // genuine full-rank-but-ill-conditioned designs as rank-deficient — e.g.
+    // two columns differing by a 1e-7 input perturbation yield λ_min ≈ 1e-14,
+    // well above the noise floor but inside the old 1e-10 cutoff. Such cases
+    // must be classified as NearDegenerate via the condition-number branch
+    // below, not as exact rank loss.
+    let noise_floor = (active_rows.max(q) as f64) * f64::EPSILON * spectral_scale;
+    let tolerance = noise_floor.max(8.0 * f64::EPSILON);
     let rank = eigenvalues
         .iter()
         .filter(|&&value| value > tolerance)
@@ -2355,8 +2365,8 @@ fn detect_prefit_unpenalized_rank_deficiency_in_design(
     // beyond CONDITION_TOL the unpenalized solve loses too many digits and the
     // fit grinds/diverges instead of converging. CONDITION_TOL is a Gram
     // condition number (≈ design condition squared); 1e12 corresponds to a
-    // design condition ≈ 1e6, strictly looser than the 1e-10 exact-rank floor
-    // above so the two checks are nested and consistent.
+    // design condition ≈ 1e6, strictly looser than the noise-floor exact-rank
+    // tolerance above so the two checks are nested and consistent.
     const CONDITION_TOL: f64 = 1e12;
     let max_eigenvalue = eigenvalues
         .iter()
