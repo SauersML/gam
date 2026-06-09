@@ -75,9 +75,9 @@ pub mod resource;
 pub mod sae_identifiability;
 pub mod solver;
 mod span;
+pub mod sparkline;
 pub mod terms;
 pub mod test_support;
-pub mod sparkline;
 pub mod types;
 pub mod util;
 

@@ -693,10 +693,8 @@ fn block_orthogonal_eval(
     let trace = (0..solved_penalty.nrows())
         .map(|i| solved_penalty[[i, i]])
         .sum::<f64>();
-    let trace_pair = crate::linalg::utils::trace_of_product(
-        solved_penalty.view(),
-        solved_penalty.view(),
-    );
+    let trace_pair =
+        crate::linalg::utils::trace_of_product(solved_penalty.view(), solved_penalty.view());
     let fitted_energy = (rhs * &beta).sum_axis(Axis(0));
     let p_beta = scaled_penalty.dot(&beta);
     let penalty_energy = (&beta * &p_beta).sum_axis(Axis(0));
@@ -2751,14 +2749,8 @@ fn evaluate_reml_parts(
     };
     eval += logdet_term;
     for output in 0..n_outputs {
-        eval += gaussian_reml_dispersion_term(
-            cache,
-            ywy,
-            projected_rhs_squared,
-            output,
-            nu,
-            lambda,
-        );
+        eval +=
+            gaussian_reml_dispersion_term(cache, ywy, projected_rhs_squared, output, nu, lambda);
     }
     eval
 }
@@ -4273,8 +4265,10 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
     let mut trace_pairs = Array2::<f64>::zeros((f_blocks, f_blocks));
     for i in 0..f_blocks {
         for j in 0..f_blocks {
-            trace_pairs[[i, j]] =
-                crate::linalg::utils::trace_of_product(rp_matrices[i].view(), rp_matrices[j].view());
+            trace_pairs[[i, j]] = crate::linalg::utils::trace_of_product(
+                rp_matrices[i].view(),
+                rp_matrices[j].view(),
+            );
         }
     }
 
