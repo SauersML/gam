@@ -835,7 +835,6 @@ pub fn fit_gaussian_mixture(
         if iter > 0 {
             let denom = prev_mean_ll.abs().max(1.0);
             if (mean_ll - prev_mean_ll).abs() / denom <= config.loglik_tol {
-                prev_mean_ll = mean_ll;
                 break;
             }
         }

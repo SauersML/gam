@@ -254,7 +254,7 @@ pub fn atom_two_lens(model: &SaeManifoldTerm, metric: &RowMetric) -> AtomTwoLens
     let coupling_max = coupling_raw
         .iter()
         .zip(any_coupling.iter())
-        .filter(|(_, &has)| has)
+        .filter(|&(_, &has)| has)
         .map(|(&c, _)| c)
         .fold(0.0_f64, f64::max);
 
