@@ -34,7 +34,7 @@ use crate::families::custom_family::{FamilyChannelHessian, PenaltyMatrix};
 use crate::families::identifiability_compiler::{
     AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
-use crate::linalg::faer_ndarray::{FaerEigh, fast_ab};
+use crate::linalg::faer_ndarray::{FaerEigh, fast_ab, fast_abt};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use faer::Side;
 
@@ -1660,6 +1660,59 @@ impl SmgsLiftViaT {
         out
     }
 
+    /// Push a *compiled-width* joint posterior covariance forward to the
+    /// raw coordinate frame via the exact linear lift `Σ_raw = T · Σ_θ ·
+    /// Tᵀ`.
+    ///
+    /// The inner Newton solves in compiled coordinates θ and reports the
+    /// posterior covariance `Σ_θ` of those `Σ p_b_compiled` parameters.
+    /// Raw-width inference (predict-time standard errors, Wald tests on
+    /// the original β columns) needs the covariance of `β_raw = T · θ`.
+    /// For an affine reparameterisation that is exactly the sandwich
+    /// `Σ_raw = T · Σ_θ · Tᵀ` — the same `T` (`V` on the diagonal,
+    /// `−R_{a→b}` off-diagonals) that [`lift_block_betas_via_t`] applies
+    /// to the point estimate, so the mean and its uncertainty stay
+    /// coordinate-consistent.
+    ///
+    /// Dropped raw directions (columns of `T` that are zero because the
+    /// audit removed that raw coordinate) receive exactly zero variance
+    /// and zero covariance with every other coordinate, which is correct:
+    /// a coordinate the reduced fit cannot move carries no posterior
+    /// uncertainty in raw space.
+    ///
+    /// `cov_compiled` must be `(total_compiled × total_compiled)` where
+    /// `total_compiled = Σ_b (block_starts_compiled[b+1] −
+    /// block_starts_compiled[b])`. The returned matrix is
+    /// `(total_raw × total_raw)` and symmetric (modulo floating noise —
+    /// symmetrised explicitly so downstream Cholesky / eigensolves see an
+    /// exactly symmetric input).
+    ///
+    /// [`lift_block_betas_via_t`]: SmgsLiftViaT::lift_block_betas_via_t
+    pub fn lift_covariance_via_t(&self, cov_compiled: &Array2<f64>) -> Array2<f64> {
+        let total_compiled = *self.block_starts_compiled.last().unwrap_or(&0);
+        assert_eq!(
+            cov_compiled.dim(),
+            (total_compiled, total_compiled),
+            "SmgsLiftViaT::lift_covariance_via_t: cov has shape {:?}, expected ({total_compiled}, {total_compiled})",
+            cov_compiled.dim(),
+        );
+        // Σ_raw = T · Σ_θ · Tᵀ, formed as (T · Σ_θ) · Tᵀ.
+        let t_cov = fast_ab(&self.t_full, cov_compiled);
+        let mut raw = fast_abt(&t_cov, &self.t_full);
+        // Symmetrise: T · Σ · Tᵀ is symmetric for symmetric Σ, but the
+        // two matmuls accumulate independent rounding, so average the
+        // transpose pair to land an exactly symmetric result.
+        let n = raw.nrows();
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let avg = 0.5 * (raw[[i, j]] + raw[[j, i]]);
+                raw[[i, j]] = avg;
+                raw[[j, i]] = avg;
+            }
+        }
+        raw
+    }
+
     /// Build directly from a [`CompiledMap`] emitted by
     /// [`crate::families::identifiability_compiler::compile_from_raw_grams`].
     ///
@@ -3149,6 +3202,101 @@ mod tests {
         assert!((lifted[1][0] - theta_b[0]).abs() < 1e-12);
         assert!(lifted[1][1].abs() < 1e-12);
         assert!((lifted[1][2] - theta_b[1]).abs() < 1e-12);
+    }
+
+    /// Covariance pushforward `Σ_raw = T · Σ_θ · Tᵀ` must be the exact
+    /// inference companion of the point-estimate lift. Two invariants:
+    ///
+    /// 1. Identity T (V = I, R = None): the lifted covariance equals the
+    ///    input covariance — a true no-op for a rank-clean fit.
+    /// 2. Rank-1 consistency with the β lift: for a degenerate posterior
+    ///    `Σ_θ = θ θᵀ`, the pushforward must equal `(T θ)(T θ)ᵀ`, i.e.
+    ///    lifting the covariance of a point mass agrees with lifting the
+    ///    point itself. This couples `lift_covariance_via_t` to
+    ///    `lift_block_betas_via_t` exactly, so the mean and its
+    ///    uncertainty can never drift into inconsistent coordinates.
+    #[test]
+    fn smgs_lift_covariance_via_t_identity_and_rank1_consistency() {
+        // ── Invariant 1: identity T leaves the covariance unchanged. ──
+        let lift_id = SmgsLiftViaT::from_v_and_r(
+            &[Array2::<f64>::eye(2), Array2::<f64>::eye(2)],
+            &[None, None],
+        );
+        let mut cov = Array2::<f64>::zeros((4, 4));
+        // An arbitrary symmetric PSD-ish covariance.
+        for i in 0..4 {
+            for j in 0..4 {
+                cov[[i, j]] = 1.0 / (1.0 + (i as f64 - j as f64).abs());
+            }
+        }
+        let lifted_id = lift_id.lift_covariance_via_t(&cov);
+        assert_eq!(lifted_id.dim(), (4, 4));
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (lifted_id[[i, j]] - cov[[i, j]]).abs() < 1e-12,
+                    "identity-T covariance lift must be a no-op at [{i},{j}]",
+                );
+            }
+        }
+
+        // ── Invariant 2: rank-1 Σ_θ = θθᵀ pushes to (Tθ)(Tθ)ᵀ. ──
+        // Reuse the two-block-with-residualisation geometry: V_a = I_3,
+        // V_b drops the middle raw column, R_b non-trivial → raw width 6,
+        // compiled width 5.
+        let v_a = Array2::<f64>::eye(3);
+        let mut v_b = Array2::<f64>::zeros((3, 2));
+        v_b[[0, 0]] = 1.0;
+        v_b[[2, 1]] = 1.0;
+        let mut r_b = Array2::<f64>::zeros((3, 2));
+        r_b[[0, 0]] = 0.4;
+        r_b[[0, 1]] = -0.1;
+        r_b[[1, 0]] = 0.7;
+        r_b[[1, 1]] = 1.3;
+        r_b[[2, 0]] = -0.2;
+        r_b[[2, 1]] = 0.5;
+        let lift = SmgsLiftViaT::from_v_and_r(&[v_a, v_b], &[None, Some(r_b)]);
+
+        let theta_a = Array1::from(vec![1.0_f64, 2.0, -1.5]);
+        let theta_b = Array1::from(vec![0.5_f64, -0.25]);
+        // Concatenated compiled θ (width 5).
+        let theta_full = Array1::from(vec![
+            theta_a[0], theta_a[1], theta_a[2], theta_b[0], theta_b[1],
+        ]);
+        // Σ_θ = θ θᵀ (rank-1).
+        let mut cov_rank1 = Array2::<f64>::zeros((5, 5));
+        for i in 0..5 {
+            for j in 0..5 {
+                cov_rank1[[i, j]] = theta_full[i] * theta_full[j];
+            }
+        }
+        let lifted_cov = lift.lift_covariance_via_t(&cov_rank1);
+        // Reference: (T θ)(T θ)ᵀ via the point-estimate lift.
+        let lifted_blocks = lift.lift_block_betas_via_t(&[theta_a, theta_b]);
+        let beta_raw = Array1::from(
+            lifted_blocks
+                .iter()
+                .flat_map(|b| b.iter().copied())
+                .collect::<Vec<f64>>(),
+        );
+        assert_eq!(lifted_cov.dim(), (6, 6));
+        assert_eq!(beta_raw.len(), 6);
+        for i in 0..6 {
+            for j in 0..6 {
+                let want = beta_raw[i] * beta_raw[j];
+                assert!(
+                    (lifted_cov[[i, j]] - want).abs() < 1e-10,
+                    "rank-1 covariance pushforward must equal (Tθ)(Tθ)ᵀ at [{i},{j}]: got {}, want {want}",
+                    lifted_cov[[i, j]],
+                );
+            }
+        }
+        // Symmetry sanity.
+        for i in 0..6 {
+            for j in 0..6 {
+                assert!((lifted_cov[[i, j]] - lifted_cov[[j, i]]).abs() < 1e-14);
+            }
+        }
     }
 
     /// When all R's are None, lift_block_betas_via_t must equal the
