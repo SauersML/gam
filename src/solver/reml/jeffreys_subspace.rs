@@ -1062,7 +1062,82 @@ where
 
     // Ḋ = Z_Jᵀ (∂H_joint) Z_J, the reduced perturbation of the reduced information.
     let dbar = z_j.t().dot(&pert_h.dot(&z_j)); // m x m
-    let k_dbar = h_id_inv.dot(&dbar); // K Ḋ
+
+    // EXACT DERIVATIVE OF THE FLOORED PSEUDO-INVERSE K (value↔gradient consistency,
+    // gam#808). The value path builds `H_Φ[a,b] = ½⟨K D_a, K D_b⟩` with the FLOORED
+    // signed pseudo-inverse `K = V diag(d_i) Vᵀ`, `d_i = 1/λ_i` if `|λ_i| ≥ floor`
+    // else `1/floor`. The earlier drift used `δK = −K Ḋ K`, which is the directional
+    // derivative of the UNfloored inverse `1/λ` only. On a separating direction one
+    // or more reduced eigenvalues sit BELOW the floor (exactly the regime that
+    // activates this term), where `d_i = 1/floor` is flat in λ_i (∂d_i/∂λ_i = 0) and
+    // the floor itself moves with `λ_max(β)`. `−K Ḋ K` then assigns those entries the
+    // wrong divided differences `−d_i d_j` (it pretends `d'(λ_i) = −d_i²` and ignores
+    // the floor motion), so the analytic outer-LAML drift `D_β H_Φ[v_k]` differed from
+    // the value the inner Newton converged on — no outer step satisfied descent
+    // (the frozen `|g|` survival-marginal-slope stall). We instead form the EXACT
+    // directional derivative of the floored matrix function via the Daleckii–Krein
+    // divided-difference formula in the eigenbasis, plus the floor-motion term.
+    //
+    //   δK = V (Ψ ∘ (Vᵀ Ḋ V)) Vᵀ  +  V diag(∂d_i/∂floor · δfloor) Vᵀ,
+    //
+    // with divided differences of the floored `d(λ)`:
+    //   Ψ_ij = (d_i − d_j)/(λ_i − λ_j)  (i ≠ j, well-separated),
+    //   Ψ_ii = d'(λ_i) = −1/λ_i² if |λ_i| ≥ floor else 0 (floor frozen),
+    // and the limit `Ψ_ij → d'(λ_i)` as `λ_i → λ_j` (continuous divided difference).
+    // The floor-motion term fires only in the active RELATIVE regime, mirroring the
+    // value path's floor-response gradient: `δfloor = REL · δλ_max = REL · (Vᵀ Ḋ V)_{mm}`
+    // for the dominant eigenvalue index `m`, and `∂d_i/∂floor = −1/floor²` on below-
+    // floor entries (0 otherwise). On a fully-PSD/above-floor fit every `|λ_i| ≥ floor`
+    // and the floor is constant, so Ψ reduces to `−d_i d_j` and the floor-motion term
+    // vanishes — `δK` is byte-identical to the previous `−K Ḋ K` there.
+    let delta_k = {
+        let dbar_red = evecs.t().dot(&dbar).dot(&evecs); // Vᵀ Ḋ V (m × m)
+        let floor_in_relative_regime = lambda_max > 0.0
+            && REDUCED_INFO_RELATIVE_FLOOR * lambda_max >= REDUCED_INFO_ABSOLUTE_FLOOR;
+        let mut idx_max = 0usize;
+        for i in 1..m {
+            if evals[i] > evals[idx_max] {
+                idx_max = i;
+            }
+        }
+        // d'(λ_i) for the floored signed inverse (floor held fixed).
+        let d_prime = |i: usize| -> f64 {
+            if evals[i].abs() >= floor {
+                -inv_diag[i] * inv_diag[i] // −1/λ_i²
+            } else {
+                0.0
+            }
+        };
+        let mut psi_dbar = Array2::<f64>::zeros((m, m));
+        for i in 0..m {
+            for j in 0..m {
+                let denom = evals[i] - evals[j];
+                let weight = if denom.abs() <= REDUCED_INFO_ABSOLUTE_FLOOR {
+                    // Confluent / tied eigenvalues: the divided difference is the
+                    // diagonal derivative limit.
+                    d_prime(i)
+                } else {
+                    (inv_diag[i] - inv_diag[j]) / denom
+                };
+                psi_dbar[[i, j]] = weight * dbar_red[[i, j]];
+            }
+        }
+        // Floor-motion term (active relative regime only). δfloor = REL · δλ_max,
+        // δλ_max = v_maxᵀ Ḋ v_max = (Vᵀ Ḋ V)_{idx_max, idx_max}.
+        if floor_in_relative_regime {
+            let dfloor = REDUCED_INFO_RELATIVE_FLOOR * dbar_red[[idx_max, idx_max]];
+            if dfloor != 0.0 {
+                let inv_floor_sq = 1.0 / (floor * floor);
+                for i in 0..m {
+                    if evals[i].abs() < floor {
+                        // ∂d_i/∂floor = −1/floor², contributes only to the diagonal.
+                        psi_dbar[[i, i]] += -inv_floor_sq * dfloor;
+                    }
+                }
+            }
+        }
+        evecs.dot(&psi_dbar).dot(&evecs.t()) // δK (m × m), back to the standard basis
+    };
 
     // For each canonical axis e_a: base M_a = K D_a and its perturbation δM_a. We
     // assemble flattened vec(M_a) and vec(δM_a) so the final contraction is a pair
@@ -1100,8 +1175,10 @@ where
         }
         let d_a_pert = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
 
-        // δM_a = (∂K) D_a + K (∂D_a) = −K Ḋ M_a + K D_a^pert.
-        let dm_a = &h_id_inv.dot(&d_a_pert) - &k_dbar.dot(&m_a);
+        // δM_a = (δK) D_a + K (∂D_a), with the EXACT floored-pseudo-inverse
+        // derivative `δK` formed above (Daleckii–Krein + floor motion) — NOT the
+        // unfloored `−K Ḋ K`, which is wrong on below-floor (separating) directions.
+        let dm_a = &delta_k.dot(&d_a) + &h_id_inv.dot(&d_a_pert);
 
         let mut col = 0usize;
         for i in 0..m {
