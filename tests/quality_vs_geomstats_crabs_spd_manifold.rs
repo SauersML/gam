@@ -671,7 +671,8 @@ fn crabs_group_covariances_match_geomstats_spd_geometry_on_real_data() {
         for tj in 0..M {
             let d2 = gam_sq_dist(&spd, test_covs[ti].view(), train_covs[tj].view());
             gam_dist[ti * M + tj] = d2.max(0.0).sqrt();
-            analytic_dist[ti * M + tj] = spd_affine_distance(&test_cov_mats[ti], &train_cov_mats[tj]);
+            analytic_dist[ti * M + tj] =
+                spd_affine_distance(&test_cov_mats[ti], &train_cov_mats[tj]);
         }
     }
     let dist_vs_analytic = max_abs_diff(&gam_dist, &analytic_dist);
