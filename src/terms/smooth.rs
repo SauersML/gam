@@ -3921,18 +3921,6 @@ fn auto_init_length_scale_in_basis(data: ArrayView2<'_, f64>, basis: &mut Smooth
     }
 }
 
-fn linear_conditioning_chunk_rows(n: usize, p: usize) -> usize {
-    const TARGET_BYTES: usize = 8 * 1024 * 1024;
-    const MIN_ROWS: usize = 256;
-    const MAX_ROWS: usize = 65_536;
-    if p == 0 {
-        return n.max(1);
-    }
-    (TARGET_BYTES / (p * 8))
-        .clamp(MIN_ROWS, MAX_ROWS)
-        .min(n.max(1))
-}
-
 impl LinearFitConditioning {
     fn from_columns(design: &TermCollectionDesign, selected_cols: &[usize]) -> Self {
         const SCALE_EPS: f64 = 1e-12;
@@ -3945,7 +3933,7 @@ impl LinearFitConditioning {
                 columns,
             };
         }
-        let chunk_rows = linear_conditioning_chunk_rows(n, p);
+        let chunk_rows = crate::linalg::utils::row_chunk_for_byte_budget(n, p);
         // Two-pass mean/variance so operator-backed designs don't need to
         // materialize the full dense matrix. Pass 1 accumulates per-column
         // sums; pass 2 accumulates the sum of squared deviations from the
