@@ -16346,32 +16346,55 @@ fn build_matern_operator_penalty_psi_derivatives(
         normalize_penaltywith_psi_derivatives(&s1, &s1_psi, &s1_psi_psi);
     let (s2_norm, s2_norm_psi, s2_norm_psi_psi, c2) =
         normalize_penaltywith_psi_derivatives(&s2, &s2_psi, &s2_psi_psi);
-    let candidates = vec![
-        PenaltyCandidate {
-            matrix: s0_norm,
+    // Gate the operator dials on the Matérn-ν RKHS smoothness EXACTLY as the
+    // forward builder `build_matern_operator_penalty_candidates` does (via
+    // `operator_penalty_candidates_from_collocation` /
+    // `matern_for_smoothness(nu, d)`): a rough kernel (e.g. ν=1/2, d=1) emits
+    // only the admitted operator penalties, so the candidate list — and hence
+    // its ψ-derivative list below — stays index-aligned with the forward penalty
+    // construction. Omitting the gate here let a rough-ν, non-double-penalty
+    // Matérn produce ψ-derivatives for tension/stiffness penalties the forward
+    // path never built, desyncing the κ-gradient against a mismatched penalty
+    // set (gam#902).
+    let matern_spec = DuchonOperatorPenaltySpec::matern_for_smoothness(nu, d);
+    let mut candidates = Vec::with_capacity(3);
+    for (spec_gate, source, matrix, normalization_scale) in [
+        (
+            &matern_spec.mass,
+            PenaltySource::OperatorMass,
+            s0_norm,
+            c0,
+        ),
+        (
+            &matern_spec.tension,
+            PenaltySource::OperatorTension,
+            s1_norm,
+            c1,
+        ),
+        (
+            &matern_spec.stiffness,
+            PenaltySource::OperatorStiffness,
+            s2_norm,
+            c2,
+        ),
+    ] {
+        if !matches!(spec_gate, OperatorPenaltySpec::Active { .. }) {
+            continue;
+        }
+        candidates.push(PenaltyCandidate {
+            matrix,
             nullspace_dim_hint: 0,
-            source: PenaltySource::OperatorMass,
-            normalization_scale: c0,
+            source,
+            normalization_scale,
             kronecker_factors: None,
             op: None,
-        },
-        PenaltyCandidate {
-            matrix: s1_norm,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::OperatorTension,
-            normalization_scale: c1,
-            kronecker_factors: None,
-            op: None,
-        },
-        PenaltyCandidate {
-            matrix: s2_norm,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::OperatorStiffness,
-            normalization_scale: c2,
-            kronecker_factors: None,
-            op: None,
-        },
-    ];
+        });
+    }
+    // `active_operator_penalty_derivatives` selects the κ-derivative for each
+    // SURVIVING penalty by its `source` kind out of the canonical
+    // `[mass, tension, stiffness]` triple, so a gated-out (or rank-0-dropped)
+    // operator is simply never requested and the returned derivative list stays
+    // index-aligned with the forward penalty list.
     let (_, _, penaltyinfo) = filter_active_penalty_candidates(candidates)?;
     let penalties_derivative = active_operator_penalty_derivatives(
         &penaltyinfo,
@@ -31545,6 +31568,122 @@ mod tests {
                 PenaltySource::OperatorTension,
                 PenaltySource::OperatorStiffness
             ]
+        );
+    }
+
+    /// gam#902: the ψ=log κ derivative builder
+    /// (`build_matern_operator_penalty_psi_derivatives`) must apply the SAME
+    /// `matern_for_smoothness(ν, d)` admissibility gate as the forward penalty
+    /// builder (`build_matern_operator_penalty_candidates`), so for a rough-ν,
+    /// non-double-penalty Matérn the derivative penalty list is index-aligned
+    /// with the forward penalty list. Before the fix the derivative builder
+    /// unconditionally emitted mass+tension+stiffness ψ-derivatives while the
+    /// forward build gated tension/stiffness out — desyncing the κ-gradient
+    /// against a mismatched penalty set.
+    #[test]
+    fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
+        use ndarray::array;
+        let centers = array![[0.0_f64], [0.2], [0.45], [0.7], [1.0]];
+        let length_scale = 0.4_f64;
+        let include_intercept = false;
+        // ν=1/2, d=1 ⇒ RKHS Sobolev order m = ν + d/2 = 1.0, exactly on the
+        // tension boundary: the strict gate admits ONLY the mass (j=0) penalty.
+        let nu = MaternNu::Half;
+
+        // Forward penalty list, post-filter, in build order.
+        let forward = build_matern_operator_penalty_candidates(
+            centers.view(),
+            length_scale,
+            nu,
+            include_intercept,
+            None,
+            None,
+        )
+        .expect("forward Matérn operator penalties should build");
+        let (forward_penalties, _, forward_info) =
+            filter_active_penalty_candidates(forward).expect("forward filter");
+        let forward_sources: Vec<PenaltySource> = forward_info
+            .iter()
+            .filter(|info| info.active)
+            .map(|info| info.source)
+            .collect();
+        assert_eq!(
+            forward_sources,
+            vec![PenaltySource::OperatorMass],
+            "rough ν=1/2 (m=1) must admit only the mass operator penalty"
+        );
+
+        // ψ-derivative list for the same config.
+        let (psi_derivatives, psisecond_derivatives) =
+            build_matern_operator_penalty_psi_derivatives(
+                centers.view(),
+                length_scale,
+                nu,
+                include_intercept,
+                None,
+                None,
+            )
+            .expect("Matérn operator ψ-derivatives should build");
+        assert_eq!(
+            psi_derivatives.len(),
+            forward_sources.len(),
+            "ψ-derivative count must equal the forward (gated) penalty count"
+        );
+        assert_eq!(
+            psisecond_derivatives.len(),
+            forward_sources.len(),
+            "ψ-second-derivative count must equal the forward penalty count"
+        );
+        // Each surviving penalty and its ψ-derivative share the same shape, so
+        // the consumer's positional pairing of penalty[a] with ∂S/∂ψ[a] is
+        // well-formed.
+        for (penalty, deriv) in forward_penalties.iter().zip(psi_derivatives.iter()) {
+            assert_eq!(
+                penalty.dim(),
+                deriv.dim(),
+                "ψ-derivative must match its penalty's shape"
+            );
+        }
+
+        // Finite-difference the mass κ-gradient against the analytic
+        // ψ-derivative. ψ = log κ with κ = 1/length_scale, so
+        // length_scale(ψ) = exp(-ψ) and a +h step in ψ scales length_scale by
+        // exp(-h).
+        let mass_penalty = |ls: f64| -> Array2<f64> {
+            let cands = build_matern_operator_penalty_candidates(
+                centers.view(),
+                ls,
+                nu,
+                include_intercept,
+                None,
+                None,
+            )
+            .expect("FD forward penalties");
+            cands
+                .into_iter()
+                .find(|c| matches!(c.source, PenaltySource::OperatorMass))
+                .expect("mass penalty present")
+                .matrix
+        };
+        let h = 1e-5_f64;
+        let s_plus = mass_penalty(length_scale * (-h).exp());
+        let s_minus = mass_penalty(length_scale * h.exp());
+        let fd = (&s_plus - &s_minus).mapv(|v| v / (2.0 * h));
+        let analytic = &psi_derivatives[0];
+        let err = (&fd - analytic)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
+        let scale = analytic
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt()
+            .max(1.0);
+        assert!(
+            err / scale < 1e-5,
+            "mass κ-gradient FD mismatch: err={err:.3e}, analytic_norm={scale:.3e}"
         );
     }
 
