@@ -209,26 +209,29 @@ pub fn exp_sigma_derivs_up_to_fourth(
 /// shifted by `+ln(response_scale)`) via `rescale_gaussian_location_scale_to_raw`.
 /// Reconstructing σ from the returned coefficients is therefore
 ///
-///   σ_response = LOGB_SIGMA_FLOOR + exp(η_raw)
-///              = LOGB_SIGMA_FLOOR + response_scale · exp(η_internal),
+///   σ_response = response_scale · σ_internal
+///              = response_scale · (LOGB_SIGMA_FLOOR + exp(η_internal))
+///              = (response_scale · LOGB_SIGMA_FLOOR) + exp(η_internal + ln(response_scale)),
 ///
-/// so the effective floor on the *internal* (standardized) scale is `0.01`,
-/// i.e. `0.01 · sample_std(y)` in response units — exactly 1 % of the spread of
-/// `y`. This keeps κ = dlogσ/dη ≈ 1 across the realistic σ range, so the
-/// scale-block Fisher information matches gamlss's floorless 2a and the log-σ
-/// smooth traces the variance envelope instead of being over-smoothed. Under a
-/// rescaling `y → c·y` the prefit divides by `c` again, leaving the
-/// dimensionless internal floor unchanged. The single lingering breakage is the
-/// underflow guard `response_scale.max(1e-6)`: if the user feeds responses with
-/// `sample_std(y) < 1e-6` the floor stops tracking the data scale. That is a
-/// deliberate guard against a pathological constant-y input rather than a model
-/// assumption, and 1e-6 sits well below any sensible measurement-noise floor.
+/// so the effective floor in response units is `0.01 · sample_std(y)` — exactly
+/// 1 % of the spread of `y`. This keeps κ = dlogσ/dη ≈ 1 across the realistic σ
+/// range, so the scale-block Fisher information matches gamlss's floorless 2a
+/// and the log-σ smooth traces the variance envelope instead of being
+/// over-smoothed. Under a rescaling `y → c·y` the prefit divides by `c` again,
+/// leaving the dimensionless internal floor unchanged. The single lingering
+/// breakage is the underflow guard `response_scale.max(1e-6)`: if the user feeds
+/// responses with `sample_std(y) < 1e-6` the floor stops tracking the data
+/// scale. That is a deliberate guard against a pathological constant-y input
+/// rather than a model assumption, and 1e-6 sits well below any sensible
+/// measurement-noise floor.
 ///
-/// The residual floor error from absorbing the response scale into the
-/// intercept is `0.01·(response_scale − 1)` (since the floor itself is not
-/// multiplied by `response_scale`); it is negligible because σ ≫ floor in every
-/// realistic fit, and the reference tests reconstruct σ with the same hardcoded
-/// `0.01`.
+/// Equivariance requires the floor to scale **with** the response, not just the
+/// `exp(η)` term: the `+ln(response_scale)` intercept shift only multiplies the
+/// exponential by `response_scale`, leaving a residual `0.01·(1 − response_scale)`
+/// if the floor stayed at a raw `0.01`. The reconstruction therefore carries an
+/// explicit floor `response_scale · 0.01`
+/// ([`logb_sigma_from_eta_with_floor_scalar`]) so that
+/// `σ̂_{c·y}(x) = c · σ̂_y(x)` holds exactly (#884).
 pub const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 #[inline]
@@ -243,6 +246,22 @@ pub fn logb_sigma_jet1_scalar(eta: f64) -> SigmaJet1 {
 #[inline]
 pub fn logb_sigma_from_eta_scalar(eta: f64) -> f64 {
     LOGB_SIGMA_FLOOR + safe_exp(eta)
+}
+
+/// Reconstruct σ from η with an explicit, response-scale-relative floor.
+///
+/// The internal fit standardizes the response by `s = response_scale` and is
+/// solved with the dimensionless floor [`LOGB_SIGMA_FLOOR`]. Mapping back to
+/// raw response units the σ surface must scale uniformly,
+/// `σ_raw(η) = s · σ_internal(η)`, i.e. **both** the `exp(η)` term and the floor
+/// are multiplied by `s`. The `exp` term is carried by shifting the log-σ
+/// intercept by `+ln(s)`; the floor cannot ride an intercept shift (it sits
+/// outside the exponential), so the equivariant floor `floor = s · 0.01` is
+/// supplied here directly. With `floor = LOGB_SIGMA_FLOOR` this reduces to
+/// [`logb_sigma_from_eta_scalar`].
+#[inline]
+pub fn logb_sigma_from_eta_with_floor_scalar(floor: f64, eta: f64) -> f64 {
+    floor + safe_exp(eta)
 }
 
 #[inline]
