@@ -53,14 +53,6 @@ pub(crate) fn initializewiggle_knots_from_seed(
     Ok(knots)
 }
 
-pub(crate) fn initialize_monotone_wiggle_knots_from_seed(
-    seed: ArrayView1<'_, f64>,
-    degree: usize,
-    num_internal_knots: usize,
-) -> Result<Array1<f64>, String> {
-    initializewiggle_knots_from_seed(seed, degree, num_internal_knots)
-}
-
 #[inline]
 pub(crate) fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, String> {
     // Public monotone-wiggle degree refers to the value basis. The low-level
@@ -119,8 +111,7 @@ pub fn buildwiggle_block_input_from_seed(
     seed: ArrayView1<'_, f64>,
     cfg: &WiggleBlockConfig,
 ) -> Result<(ParameterBlockInput, Array1<f64>), String> {
-    let knots =
-        initialize_monotone_wiggle_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
+    let knots = initializewiggle_knots_from_seed(seed, cfg.degree, cfg.num_internal_knots)?;
     let block = buildwiggle_block_input_from_knots(
         seed,
         &knots,

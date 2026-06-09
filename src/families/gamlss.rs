@@ -31,7 +31,7 @@ use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
 // The monotone-wiggle helpers live in the neutral `families::wiggle` module
 // (decoupling refactor); this block imports only the ones gamlss's own non-test
 // code uses. Symbols used solely by this module's `#[cfg(test)]` block
-// (`initialize_monotone_wiggle_knots_from_seed`, `monotone_wiggle_internal_degree`,
+// (`initializewiggle_knots_from_seed`, `monotone_wiggle_internal_degree`,
 // `split_wiggle_penalty_orders`) are imported inside that block instead, so they
 // are not flagged unused in a non-test `--lib` build; downstream consumers import
 // from `families::wiggle` directly.
@@ -22191,7 +22191,7 @@ mod tests {
         create_basis,
     };
     use crate::families::wiggle::{
-        initialize_monotone_wiggle_knots_from_seed, monotone_wiggle_internal_degree,
+        initializewiggle_knots_from_seed, monotone_wiggle_internal_degree,
         split_wiggle_penalty_orders,
     };
     use crate::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
@@ -28645,7 +28645,7 @@ mod tests {
     fn degeneratewiggle_seed_uses_broad_fallback_domain() {
         let q_seed = Array1::zeros(9);
         let degree = 3usize;
-        let knots = initialize_monotone_wiggle_knots_from_seed(q_seed.view(), degree, 5)
+        let knots = initializewiggle_knots_from_seed(q_seed.view(), degree, 5)
             .expect("initialize degenerate wiggle knots");
         let bs_degree = monotone_wiggle_internal_degree(degree).expect("cubic wiggle degree") + 1;
         let domain_min = knots[bs_degree];
@@ -29008,7 +29008,7 @@ mod tests {
         let beta_eta = array![-0.15, 0.7];
         let eta = x_eta.dot(&beta_eta);
         let degree = 3usize;
-        let knots = initialize_monotone_wiggle_knots_from_seed(eta.view(), degree, 4)
+        let knots = initializewiggle_knots_from_seed(eta.view(), degree, 4)
             .expect("mean-wiggle knots");
         let family = BinomialMeanWiggleFamily {
             y: array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
@@ -29147,7 +29147,7 @@ mod tests {
             y: Array1::zeros(n),
             weights: Array1::ones(n),
             link_kind: InverseLink::Standard(StandardLink::Logit),
-            wiggle_knots: initialize_monotone_wiggle_knots_from_seed(
+            wiggle_knots: initializewiggle_knots_from_seed(
                 Array1::linspace(-1.0, 1.0, 9).view(),
                 3,
                 4,

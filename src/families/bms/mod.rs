@@ -28,7 +28,7 @@ use crate::families::row_kernel::{
     row_kernel_hessian_dense, row_kernel_log_likelihood,
 };
 use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
-use crate::families::wiggle::initialize_monotone_wiggle_knots_from_seed;
+use crate::families::wiggle::initializewiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
