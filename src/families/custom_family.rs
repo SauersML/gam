@@ -9829,7 +9829,7 @@ fn penalty_logdet_cholesky_fallback(
     existing_ridge: f64,
     block: usize,
     p: usize,
-    eigh_err: &crate::faer_ndarray::FaerLinalgError,
+    eigh_err: &str,
 ) -> Result<f64, String> {
     let diag_scale = s_ridged
         .diag()
@@ -11866,62 +11866,52 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
             s.add_scaled_to(lambdas[k], &mut s_lambda);
         }
         let block_logdet = if include_logdet_s {
-            // Exact pseudo-logdet on the positive eigenspace, consistent with
-            // the derivatives in compute_block_penalty_logdet_derivs.
-            // Uses structural nullity from spec.nullspace_dims to partition
-            // the eigenspace exactly, avoiding numerical thresholds.
+            // Pseudo-logdet of S_λ on the positive eigenspace.
+            //
+            // CONSISTENCY REQUIREMENT (gam#752/#748/#808 class): this VALUE is
+            // the `log|S_λ|₊` term of the outer REML/LAML objective, and its
+            // ρ-gradient is supplied separately by
+            // `compute_block_penalty_logdet_derivs`, which differentiates the
+            // canonical `PenaltyPseudologdet`. If the value used a *different*
+            // positive/null eigenspace split (e.g. structural-count `skip(m0)`
+            // by COUNT, or a ridge-blind `positive_eigenvalue_threshold`) than
+            // the gradient's by-magnitude `> ridge + noise_band` rule, the
+            // outer optimizer would see an objective and a gradient that
+            // describe different functions near the ridge boundary (a barely-
+            // active mode `λ_k σ_k → 0` whose ridged eigenvalue dips below
+            // `ridge + noise_band` is kept by the count rule but dropped by the
+            // magnitude rule). To guarantee value↔gradient agree by
+            // construction, compute the value from the SAME canonical
+            // `PenaltyPseudologdet` the gradient differentiates, with the same
+            // dense penalty components, the same λ, and the same ridge.
             let ridge = if options.ridge_policy.include_penalty_logdet {
                 effective_solverridge(options.ridge_floor)
             } else {
                 0.0
             };
-            let mut s_for_logdet = s_lambda.clone();
-            if ridge > 0.0 {
-                for i in 0..p {
-                    s_for_logdet[[i, i]] += ridge;
-                }
-            }
-            match s_for_logdet.eigh(faer::Side::Lower) {
-                Ok((evals, _)) => {
-                    // Structural nullity determines the split: bottom m₀ eigenvalues
-                    // are structural zeros, top (p - m₀) are the positive subspace.
-                    let m0 = if !spec.nullspace_dims.is_empty()
-                        && spec.nullspace_dims.len() == spec.penalties.len()
-                    {
-                        let penalties_dense: Vec<Array2<f64>> =
-                            spec.penalties.iter().map(|p| p.to_dense()).collect();
-                        crate::estimate::reml::unified::exact_intersection_nullity(
-                            &penalties_dense,
-                            &spec.nullspace_dims,
-                        )
-                    } else {
-                        let eval_buffer;
-                        let eval_slice = if let Some(slice) = evals.as_slice() {
-                            slice
-                        } else {
-                            eval_buffer = evals.iter().copied().collect::<Vec<_>>();
-                            &eval_buffer
-                        };
-                        let threshold =
-                            crate::estimate::reml::unified::positive_eigenvalue_threshold(
-                                eval_slice,
-                            );
-                        evals.iter().filter(|&&e| e <= threshold).count()
-                    };
-                    evals
-                        .iter()
-                        .skip(m0)
-                        .map(|&e| e.max(f64::MIN_POSITIVE).ln())
-                        .sum::<f64>()
-                }
-                Err(eigh_err) => {
-                    // Penalty matrices are PSD by construction, so eigh failure
-                    // here is purely numerical.  Fall back to Cholesky on the
-                    // ridged matrix (which should be SPD).  The Cholesky logdet
-                    // includes null-space contributions (~m₀ × ln(ridge)), making
-                    // it a slight overestimate, but this is a smooth bias that
-                    // does not corrupt REML gradients.
-                    penalty_logdet_cholesky_fallback(&s_for_logdet, ridge, b, p, &eigh_err)?
+            let penalties_dense: Vec<Array2<f64>> =
+                spec.penalties.iter().map(|pen| pen.to_dense()).collect();
+            let lambdas_vec: Vec<f64> = lambdas.to_vec();
+            match crate::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
+                &penalties_dense,
+                &lambdas_vec,
+                ridge,
+            ) {
+                Ok(pld) => pld.value(),
+                Err(eigh_err_msg) => {
+                    // `from_components` only fails when the single internal
+                    // eigendecomposition fails, which for PSD penalties is
+                    // purely numerical. Fall back to Cholesky on the ridged
+                    // matrix (which should be SPD). The Cholesky logdet
+                    // includes null-space contributions (~m₀ × ln(ridge)),
+                    // a smooth bias that does not corrupt the REML gradient.
+                    let mut s_for_logdet = s_lambda.clone();
+                    if ridge > 0.0 {
+                        for i in 0..p {
+                            s_for_logdet[[i, i]] += ridge;
+                        }
+                    }
+                    penalty_logdet_cholesky_fallback(&s_for_logdet, ridge, b, p, &eigh_err_msg)?
                 }
             }
         } else {
