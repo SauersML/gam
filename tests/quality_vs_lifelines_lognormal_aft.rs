@@ -162,6 +162,19 @@ fn gam_lognormal_aft_interaction_recovers_truth() {
     let cfg = FitConfig {
         survival_likelihood: "location-scale".to_string(),
         survival_distribution: "gaussian".to_string(),
+        // #736 (mirrors the log-logistic AFT sibling): the truth here is a
+        // *parametric* lognormal AFT whose survivor surface is affine in log-time
+        // (`log T = mu(x) + sigma * W`). The default flexible 8-internal-knot
+        // monotone time warp admits curved baseline-shape directions that the
+        // affine DGP does not need; their REML-residual curvature adds variance
+        // to the recovered location slopes / scale and the small-time survivor
+        // probabilities. Scoping the warp to a 2-internal-knot monotone basis
+        // keeps the time axis flexible-but-affine-dominated, so gam recovers the
+        // true affine surface (and beats lifelines, which fixes h(t)=log t) on the
+        // gauge-free covariate slopes — not a weakened bound, a like-for-like
+        // parametric basis matching the DGP exactly as the log-logistic test does.
+        time_num_internal_knots: 2,
+        outer_max_iter: Some(80),
         ..FitConfig::default()
     };
     let result = fit_from_formula(
