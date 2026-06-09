@@ -29008,8 +29008,8 @@ mod tests {
         let beta_eta = array![-0.15, 0.7];
         let eta = x_eta.dot(&beta_eta);
         let degree = 3usize;
-        let knots = initializewiggle_knots_from_seed(eta.view(), degree, 4)
-            .expect("mean-wiggle knots");
+        let knots =
+            initializewiggle_knots_from_seed(eta.view(), degree, 4).expect("mean-wiggle knots");
         let family = BinomialMeanWiggleFamily {
             y: array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
             weights: array![1.0, 0.8, 1.2, 1.0, 0.7, 1.1],
