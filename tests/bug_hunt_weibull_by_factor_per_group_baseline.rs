@@ -40,12 +40,12 @@
 //!      collapses the per-group level would predict the two groups on top of
 //!      each other.
 
+use csv::StringRecord;
 use gam::smooth::build_term_collection_design;
 use gam::survival_construction::evaluate_survival_baseline;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array2, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;

@@ -3054,10 +3054,12 @@ fn fit_survival_transformation_model(
             let time_beta = beta
                 .slice(s![..spec.time_build.x_exit_time.ncols()])
                 .to_owned();
-            fitted_weibull_baseline_from_linear_time_beta(&time_beta, spec.time_anchor).ok_or_else(|| {
-                "failed to recover fitted Weibull scale/shape from the linear time coefficients"
-                    .to_string()
-            })?
+            fitted_weibull_baseline_from_linear_time_beta(&time_beta, spec.time_anchor).ok_or_else(
+                || {
+                    "failed to recover fitted Weibull scale/shape from the linear time coefficients"
+                        .to_string()
+                },
+            )?
         } else {
             baseline_cfg
         };

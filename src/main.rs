@@ -6027,24 +6027,25 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         }
     }
 
-    let fitted_baseline_cfg =
-        if likelihood_mode == SurvivalLikelihoodMode::Weibull && !learn_timewiggle {
-            let time_beta = beta.slice(s![..p_time_total]).to_owned();
-            let (scale, shape) = fitted_weibull_baseline_from_linear_time_beta(&time_beta, time_anchor)
-                .ok_or_else(|| {
-                    "failed to recover fitted Weibull scale/shape from the linear time coefficients"
-                        .to_string()
-                })?;
-            SurvivalBaselineConfig {
-                target: SurvivalBaselineTarget::Weibull,
-                scale: Some(scale),
-                shape: Some(shape),
-                rate: None,
-                makeham: None,
-            }
-        } else {
-            baseline_cfg.clone()
-        };
+    let fitted_baseline_cfg = if likelihood_mode == SurvivalLikelihoodMode::Weibull
+        && !learn_timewiggle
+    {
+        let time_beta = beta.slice(s![..p_time_total]).to_owned();
+        let (scale, shape) = fitted_weibull_baseline_from_linear_time_beta(&time_beta, time_anchor)
+            .ok_or_else(|| {
+                "failed to recover fitted Weibull scale/shape from the linear time coefficients"
+                    .to_string()
+            })?;
+        SurvivalBaselineConfig {
+            target: SurvivalBaselineTarget::Weibull,
+            scale: Some(scale),
+            shape: Some(shape),
+            rate: None,
+            makeham: None,
+        }
+    } else {
+        baseline_cfg.clone()
+    };
 
     cli_out!();
     cli_out!(

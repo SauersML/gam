@@ -105,11 +105,7 @@ fn write_training_csv(path: &Path, n: usize) {
         let x1 = (2.0 * rng.next_unit() - 1.0) * TRAIN_HALF_RANGE;
         let y = truth_mean(x0, x1) + NOISE_SD * rng.next_normal();
         writer
-            .write_record([
-                format!("{x0:.12}"),
-                format!("{x1:.12}"),
-                format!("{y:.12}"),
-            ])
+            .write_record([format!("{x0:.12}"), format!("{x1:.12}"), format!("{y:.12}")])
             .expect("write training row");
     }
     writer.flush().expect("flush training csv");
@@ -124,11 +120,7 @@ fn write_predict_csv(path: &Path, grid: &[(f64, f64)]) {
         .expect("write header");
     for &(x0, x1) in grid {
         writer
-            .write_record([
-                format!("{x0:.12}"),
-                format!("{x1:.12}"),
-                "0.0".to_string(),
-            ])
+            .write_record([format!("{x0:.12}"), format!("{x1:.12}"), "0.0".to_string()])
             .expect("write predict row");
     }
     writer.flush().expect("flush predict csv");

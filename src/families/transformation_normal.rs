@@ -65,8 +65,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 mod endpoint_normalizer;
 use endpoint_normalizer::{
-    LogNormalCdfDiffDerivatives, endpoint_chain_first, endpoint_chain_fourth, endpoint_chain_second,
-    endpoint_chain_third, log_normal_cdf_diff, log_normal_cdf_diff_derivatives,
+    LogNormalCdfDiffDerivatives, endpoint_chain_first, endpoint_chain_fourth,
+    endpoint_chain_second, endpoint_chain_third, log_normal_cdf_diff,
+    log_normal_cdf_diff_derivatives,
 };
 
 // ---------------------------------------------------------------------------

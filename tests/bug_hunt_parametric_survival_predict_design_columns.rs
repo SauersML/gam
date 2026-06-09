@@ -176,7 +176,8 @@ fn parametric_only_survival_model_predicts_a_valid_varying_surface() {
     for (label, surv) in [("x=-1", &surv_lo), ("x=+1", &surv_hi)] {
         assert_eq!(surv.len(), grid.len(), "{label}: surface width mismatch");
         assert!(
-            surv.iter().all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
+            surv.iter()
+                .all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
             "{label}: survival surface must lie in [0, 1]: {surv:?}"
         );
         for w in surv.windows(2) {

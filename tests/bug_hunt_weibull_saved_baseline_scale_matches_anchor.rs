@@ -114,11 +114,7 @@ fn write_training_csv(path: &Path, entry: &[f64], exit: &[f64], event: &[f64]) {
 /// One predict row with a large `exit` placeholder so every grid time is inside
 /// the surface frame.
 fn predict_dataset(entry: f64, big_exit: f64) -> EncodedDataset {
-    let headers = vec![
-        "entry".to_string(),
-        "exit".to_string(),
-        "event".to_string(),
-    ];
+    let headers = vec!["entry".to_string(), "exit".to_string(), "event".to_string()];
     let rows = vec![StringRecord::from(vec![
         format!("{entry:.12}"),
         format!("{big_exit:.12}"),
@@ -155,7 +151,8 @@ fn weibull_saved_baseline_scale_recovered_from_anchor_not_stale_beta0() {
     run_or_panic(fit_cmd, "gam fit Surv(entry, exit, event) ~ 1 (weibull)");
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
-    let model = FittedModel::load_from_path(&model_path).expect("load saved Weibull survival model");
+    let model =
+        FittedModel::load_from_path(&model_path).expect("load saved Weibull survival model");
     let payload = model.payload();
 
     let anchor = payload
@@ -209,12 +206,7 @@ fn weibull_saved_baseline_scale_recovered_from_anchor_not_stale_beta0() {
     let primary_offset = Array1::<f64>::zeros(n);
     let noise_offset = Array1::<f64>::zeros(n);
 
-    let grid = [
-        anchor * 1.2,
-        anchor * 1.6,
-        anchor * 2.0,
-        anchor * 2.6,
-    ];
+    let grid = [anchor * 1.2, anchor * 1.6, anchor * 2.0, anchor * 2.6];
     let request = SurvivalPredictRequest {
         model: &model,
         data: dataset.values.view(),

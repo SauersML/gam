@@ -653,7 +653,9 @@ mod tests {
             x[[i, 7]] = (3.0 * tau * t).cos();
             let eta = 0.3 + 0.9 * (1.4 * (t - 0.5)).sin();
             // Deterministic non-negative integer counts near exp(eta).
-            y[i] = (eta.exp() + 0.5 * ((i as f64) * 2.399_963).sin()).round().max(0.0);
+            y[i] = (eta.exp() + 0.5 * ((i as f64) * 2.399_963).sin())
+                .round()
+                .max(0.0);
         }
         let mut s = Array2::<f64>::zeros((p, p));
         for j in 1..p {

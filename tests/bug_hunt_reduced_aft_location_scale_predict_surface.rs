@@ -95,7 +95,11 @@ fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut exit = Vec::with_capacity(N);
     let mut event = Vec::with_capacity(N);
     for _ in 0..N {
-        let xi = if next_u01(&mut state) < 0.5 { -1.0 } else { 1.0 };
+        let xi = if next_u01(&mut state) < 0.5 {
+            -1.0
+        } else {
+            1.0
+        };
         let mu = A + B * xi;
         let t_lat = (mu + SIGMA_TRUE * next_normal(&mut state)).exp();
         // Light censoring so most subjects have an event and sigma is identified.
@@ -124,9 +128,7 @@ fn run_or_panic(mut command: Command, label: &str) {
 
 fn write_training_csv(path: &Path, x: &[f64], exit: &[f64], event: &[f64]) {
     let mut writer = csv::Writer::from_path(path).expect("create training csv");
-    writer
-        .write_record(["t", "d", "x"])
-        .expect("write header");
+    writer.write_record(["t", "d", "x"]).expect("write header");
     for i in 0..x.len() {
         writer
             .write_record([
@@ -165,8 +167,8 @@ fn predict_surface(model: &FittedModel, dataset: &EncodedDataset, grid: &[f64]) 
         time_grid: Some(grid),
         with_uncertainty: false,
     };
-    let result =
-        predict_survival(request).expect("reduced-AFT location-scale survival predict must succeed");
+    let result = predict_survival(request)
+        .expect("reduced-AFT location-scale survival predict must succeed");
     result.survival.row(0).to_vec()
 }
 
@@ -207,7 +209,8 @@ fn reduced_aft_location_scale_predicts_correct_log_t_surface() {
     for (label, surv) in [("x=-1", &surv_lo), ("x=+1", &surv_hi)] {
         assert_eq!(surv.len(), grid.len(), "{label}: surface width mismatch");
         assert!(
-            surv.iter().all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
+            surv.iter()
+                .all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
             "{label}: survival surface must lie in [0, 1]: {surv:?}"
         );
         // The whole point of #892: S(t|x) must DECREASE in t. Before the fix the
