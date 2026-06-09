@@ -105,12 +105,22 @@ from ..smooth import (
 )
 from .fit import FitResult, fit
 from .module import GAM
+from .harvest import (
+    HarvestShard,
+    harvest_output_fisher_factors,
+    load_harvest_shard,
+    save_harvest_shard,
+)
 
 __all__ = [
     # Recommended user-facing API
     "fit",
     "FitResult",
     "GAM",
+    "HarvestShard",
+    "harvest_output_fisher_factors",
+    "load_harvest_shard",
+    "save_harvest_shard",
     "AdaptiveTopK",
     "ARDPenalty",
     "BlockOrthogonalityPenalty",
