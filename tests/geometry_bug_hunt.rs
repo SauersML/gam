@@ -299,9 +299,9 @@ fn sphere_exp_map_vjp_matches_finite_difference() {
 // Curved manifolds without a closed-form backward must REFUSE rather than
 // inherit the silently-wrong flat identity default. Grassmann (for k>1) and
 // SPD route through `GeometryError::Unsupported`. Stiefel has a closed-form
-// canonical VJP via the n×n skew exponential `Exp_Y(Δ) = exp(W) Y`
-// (exercised by `tests/stiefel_exp_map_vjp.rs`), and `Gr(1, n)` is the
-// sphere whose VJP is also closed form, so neither belongs here.
+// canonical VJP (see `stiefel_now_has_analytic_exp_map_vjp` below and the
+// finite-difference suite in `tests/stiefel_exp_map_vjp.rs`), and `Gr(1, n)`
+// is the sphere whose VJP is also closed form, so neither belongs here.
 #[test]
 fn closed_form_less_manifolds_refuse_exp_map_vjp() {
     // Gr(2, 4) is a genuinely curved Grassmann manifold with no sphere
@@ -324,6 +324,64 @@ fn closed_form_less_manifolds_refuse_exp_map_vjp() {
             .is_err(),
         "SPD exp_map_vjp must refuse instead of returning identity grads"
     );
+}
+
+// Regression guard for #895 from the structurally rank-deficient angle. On
+// St(3, 2) the orthogonal complement of the columns of `Y` is only
+// `n − k = 1`-dimensional, so the normal component `N = (I − YYᵀ)z` can have
+// rank at most 1 < k = 2: it is rank-deficient *by construction*, for every
+// tangent. This is precisely the regime where the old thin-QR adjoint divided
+// by a singular `R` (`GeometryError::Singular`); whenever `2k > n` the whole
+// manifold lives here. The gauge-free `S = NᵀN` form must instead return a
+// finite gradient that matches central finite differences of the forward
+// `exp_map`, including the off-manifold `Y`-perturbation directions the probe
+// sweeps (`Y + h·eᵢ` leaves `YᵀY = I`).
+#[test]
+fn stiefel_now_has_analytic_exp_map_vjp() {
+    let st = StiefelManifold::new(2, 3).unwrap();
+    let p_st = array![1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let v_st = array![0.2, -0.1, 0.4, 0.5, 0.3, 0.6];
+    let g_st = array![0.3, -0.4, 0.5, 0.1, -0.2, 0.6];
+
+    let (grad_p, grad_v) = st
+        .exp_map_vjp(p_st.view(), v_st.view(), g_st.view())
+        .expect("Stiefel exp_map_vjp must now succeed (was Singular on rank-deficient R)");
+    assert!(
+        grad_p.iter().chain(grad_v.iter()).all(|x| x.is_finite()),
+        "Stiefel VJP gradients must be finite, got grad_p={grad_p:?} grad_v={grad_v:?}"
+    );
+
+    // Adjoint identity ⟨Ḡ, d Exp_Y(v)⟩ = ⟨grad_p, δY⟩ + ⟨grad_v, δv⟩ against
+    // central finite differences, with δY taken OFF the manifold (raw ambient).
+    let scalar_loss = |yy: &Array1<f64>, vv: &Array1<f64>| -> f64 {
+        g_st.dot(&st.exp_map(yy.view(), vv.view()).expect("exp_map"))
+    };
+    let h = 1e-6;
+    for i in 0..p_st.len() {
+        let mut yp = p_st.clone();
+        yp[i] += h;
+        let mut ym = p_st.clone();
+        ym[i] -= h;
+        let fd_p = (scalar_loss(&yp, &v_st) - scalar_loss(&ym, &v_st)) / (2.0 * h);
+        assert!(
+            (fd_p - grad_p[i]).abs() < 1e-6,
+            "grad_p[{i}]: analytic {} vs FD {}",
+            grad_p[i],
+            fd_p
+        );
+
+        let mut vp = v_st.clone();
+        vp[i] += h;
+        let mut vm = v_st.clone();
+        vm[i] -= h;
+        let fd_v = (scalar_loss(&p_st, &vp) - scalar_loss(&p_st, &vm)) / (2.0 * h);
+        assert!(
+            (fd_v - grad_v[i]).abs() < 1e-6,
+            "grad_v[{i}]: analytic {} vs FD {}",
+            grad_v[i],
+            fd_v
+        );
+    }
 }
 
 // Flat manifolds (and products thereof) keep the exact identity VJP, and a
