@@ -1,8 +1,8 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::manifold::{
-    GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat,
-    identity, matrix_exp, qr_thin, sym, tangent_basis_metric_orthonormal,
+    GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity,
+    matrix_exp, qr_thin, sym, tangent_basis_metric_orthonormal,
 };
 use crate::geometry::sphere::SphereManifold;
 
@@ -78,13 +78,19 @@ impl RiemannianManifold for StiefelManifold {
 
     /// Riemannian exponential under the **canonical metric**
     /// `⟨Δ₁, Δ₂⟩ = tr(Δ₁ᵀ(I − ½YYᵀ)Δ₂)`. For `k == 1` this is the sphere
-    /// exponential. For general `k`, with `A = YᵀΔ` (skew-symmetric on the
-    /// tangent space), compact QR `(I − YYᵀ)Δ = QR`, the geodesic is the
-    /// Edelman–Arias–Smith closed form
+    /// exponential. For general `k`, the canonical-metric geodesic at `Y`
+    /// with tangent `Δ` is `exp(W) · Y`, where
     ///
     /// ```text
-    ///   Exp_Y(Δ) = [Y  Q] · exp([[A, −Rᵀ], [R, 0]]) · [[I_k], [0]].
+    ///   W = Δ Yᵀ − Y Δᵀ − Y (YᵀΔ) Yᵀ      (n×n, skew)
     /// ```
+    ///
+    /// is the unique skew matrix satisfying `W·Y = Δ` (using `YᵀΔ + ΔᵀY = 0`
+    /// for a canonical-metric tangent). Since `W` is skew, `exp(W)` is
+    /// orthogonal and `exp(W)·Y` lies on the Stiefel manifold for any
+    /// `n ≥ k`. This avoids the Edelman–Arias–Smith `2k`-block form, whose
+    /// thin QR of `(I − YYᵀ)Δ` is structurally rank-deficient when `n < 2k`
+    /// and admits no canonical extension over the rank-deficient subspace.
     fn exp_map(
         &self,
         point: ArrayView1<'_, f64>,
@@ -99,34 +105,16 @@ impl RiemannianManifold for StiefelManifold {
             self.n,
             self.k,
         )?;
-        // YᵀΔ (k×n · n×k) and Y·A (n×k · k×k) both carry the large ambient
-        // dimension n, so route them through the GPU-dispatched fast_atb/fast_ab
-        // shims; small frames stay on faer.
-        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
-        let a = fast_atb(&y, &delta); // k×k skew-symmetric
-        let normal = &delta - &fast_ab(&y, &a); // (I − YYᵀ)Δ
-        let (q, r) = qr_thin(&normal); // n×k, k×k
-
-        // Block generator [[A, −Rᵀ], [R, 0]] of size 2k×2k.
-        let two_k = 2 * self.k;
-        let mut block = Array2::<f64>::zeros((two_k, two_k));
-        for i in 0..self.k {
-            for j in 0..self.k {
-                block[[i, j]] = a[[i, j]];
-                block[[i, self.k + j]] = -r[[j, i]];
-                block[[self.k + i, j]] = r[[i, j]];
-            }
-        }
-        let exp_block = matrix_exp(&block)?;
-
-        // Result = [Y Q] · exp_block[:, 0..k]; only the first k columns of the
-        // exponential survive against the [[I_k], [0]] selector, so this splits
-        // into Y·exp_block[0..k, 0..k] + Q·exp_block[k.., 0..k] — two n×k · k×k
-        // products carrying the large ambient dimension n, GPU-dispatched via
-        // fast_ab.
-        let top = exp_block.slice(ndarray::s![0..self.k, 0..self.k]);
-        let bot = exp_block.slice(ndarray::s![self.k..two_k, 0..self.k]);
-        let result = &fast_ab(&y, &top) + &fast_ab(&q, &bot);
+        // Route the four large-n products (n×k · k×n and n×n · n×k) through
+        // the GPU-dispatched shims; small frames stay on faer.
+        use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+        let a = fast_atb(&y, &delta); // k×k: A = YᵀΔ (skew on the tangent space)
+        let delta_yt = fast_abt(&delta, &y); // n×n: Δ Yᵀ
+        let y_dt = fast_abt(&y, &delta); // n×n: Y Δᵀ = (Δ Yᵀ)ᵀ
+        let yayt = fast_abt(&fast_ab(&y, &a), &y); // n×n: (Y A) Yᵀ
+        let w = &(&delta_yt - &y_dt) - &yayt; // skew n×n
+        let expw = matrix_exp(&w)?; // n×n orthogonal
+        let result = fast_ab(&expw, &y); // n×k point on St(n, k)
         Ok(flatten(&result))
     }
 
@@ -293,13 +281,11 @@ impl RiemannianManifold for StiefelManifold {
     ///
     /// Given the output cotangent `Ḡ = ∂L/∂result` (n×k), returns
     /// `(∂L/∂point, ∂L/∂tangent_vec)` flattened. The derivation is the exact
-    /// adjoint of the seven forward steps (project → A → normal → thin-QR →
-    /// block → matrix-exp → assemble), with the matrix-exponential adjoint
-    /// obtained from the Mathias augmented identity
-    /// `adj(dexp_B)·M̄ = dexp_{Bᵀ}(M̄)` and the thin-QR adjoint from the
-    /// standard `copyltu` formula (`Q` full column rank, `n ≥ k`). No
-    /// approximations: every intermediate is recomputed exactly as the forward
-    /// produced it.
+    /// adjoint of the five forward steps (project → A → W → matrix-exp →
+    /// multiply by Y), with the matrix-exponential adjoint obtained from
+    /// the Mathias augmented identity `adj(dexp_W)·E = dexp_{Wᵀ}(E)`. No
+    /// approximations: every intermediate is recomputed exactly as the
+    /// forward produced it.
     fn exp_map_vjp(
         &self,
         point: ArrayView1<'_, f64>,
@@ -313,81 +299,54 @@ impl RiemannianManifold for StiefelManifold {
         check_len("Stiefel exp_map_vjp point", point.len(), m)?;
         check_len("Stiefel exp_map_vjp tangent", tangent_vec.len(), m)?;
         check_len("Stiefel exp_map_vjp grad", grad_output.len(), m)?;
-        let k = self.k;
-        let two_k = 2 * k;
 
         // ── Recompute the forward intermediates exactly as `exp_map` does. ──
         // Every dense product below either contracts or carries the large
-        // ambient dimension n (k×n · n×k or n×k · k×k); route them all through
-        // the GPU-dispatched fast_ab/fast_atb/fast_abt shims.
+        // ambient dimension n (k×n · n×k, n×k · k×n, or n×n · n×k); route
+        // them all through the GPU-dispatched fast_ab/fast_atb/fast_abt shims.
         use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
-        let y = from_flat(point, self.n, k)?;
-        let z = from_flat(tangent_vec, self.n, k)?; // raw (unprojected) input
+        let y = from_flat(point, self.n, self.k)?;
+        let z = from_flat(tangent_vec, self.n, self.k)?; // raw (unprojected) input
         let s_proj = sym(&fast_atb(&y, &z)); // S = sym(Yᵀz)
         let delta = &z - &fast_ab(&y, &s_proj); // Δ = z − Y·S
-        let a = fast_atb(&y, &delta); // A = YᵀΔ (skew)
-        let normal = &delta - &fast_ab(&y, &a); // (I − YYᵀ)Δ
-        let (q, r) = qr_thin(&normal); // n×k, k×k upper-triangular
+        let a = fast_atb(&y, &delta); // A = YᵀΔ
+        let delta_yt = fast_abt(&delta, &y); // ΔYᵀ
+        let y_dt = fast_abt(&y, &delta); // YΔᵀ
+        let yayt = fast_abt(&fast_ab(&y, &a), &y); // (YA)Yᵀ
+        let w = &(&delta_yt - &y_dt) - &yayt; // W (n×n skew)
+        let expw = matrix_exp(&w)?; // n×n orthogonal
 
-        let mut block = Array2::<f64>::zeros((two_k, two_k));
-        for i in 0..k {
-            for j in 0..k {
-                block[[i, j]] = a[[i, j]];
-                block[[i, k + j]] = -r[[j, i]];
-                block[[k + i, j]] = r[[i, j]];
-            }
-        }
-        let exp_block = matrix_exp(&block)?;
+        let grad = from_flat(grad_output, self.n, self.k)?; // Ḡ (n×k)
 
-        let grad = from_flat(grad_output, self.n, k)?; // Ḡ (n×k)
+        // ── Step 5 (result = expW · Y). ──
+        //   ⟨Ḡ, dexpW · Y⟩    ⇒  W̄ ← Ḡ · Yᵀ      via matrix_exp_vjp.
+        //   ⟨Ḡ, expW · dY⟩    ⇒  Ȳ += expWᵀ · Ḡ.
+        let expw_bar = fast_abt(&grad, &y); // Ḡ·Yᵀ (n×n)
+        let mut y_bar = fast_atb(&expw, &grad); // expWᵀ·Ḡ (n×k)
 
-        // ── Step 7 (assemble): result = Y·M_tl + Q·M_bl. ──
-        // M_tl = exp_block[0:k, 0:k], M_bl = exp_block[k:2k, 0:k].
-        let m_tl = exp_block.slice(ndarray::s![0..k, 0..k]).to_owned();
-        let m_bl = exp_block.slice(ndarray::s![k..two_k, 0..k]).to_owned();
-        let mut y_bar = fast_abt(&grad, &m_tl); // Ȳ += Ḡ·M_tlᵀ
-        let q_bar = fast_abt(&grad, &m_bl); // Q̄ = Ḡ·M_blᵀ
+        // ── Step 4 (W → expW): W̄ = adjoint of dexp_W applied to Ḡ·Yᵀ. ──
+        let w_bar = matrix_exp_vjp(&w, &expw_bar)?; // n×n
 
-        // M̄ (2k×2k): top-left = Yᵀ·Ḡ, bottom-left = Qᵀ·Ḡ, rest zero.
-        let mut m_bar = Array2::<f64>::zeros((two_k, two_k));
-        let yt_g = fast_atb(&y, &grad);
-        let qt_g = fast_atb(&q, &grad);
-        for i in 0..k {
-            for j in 0..k {
-                m_bar[[i, j]] = yt_g[[i, j]];
-                m_bar[[k + i, j]] = qt_g[[i, j]];
-            }
-        }
+        // ── Step 3 (W = ΔYᵀ − YΔᵀ − Y A Yᵀ): split W̄ across (Δ, Y, A). ──
+        //   ΔYᵀ      → Δ̄ += W̄·Y          and  Ȳ += W̄ᵀ·Δ.
+        //   −YΔᵀ     → Δ̄ += −W̄ᵀ·Y         and  Ȳ += −W̄·Δ.
+        //   −Y A Yᵀ  → Ȳ += −W̄·Y·Aᵀ − W̄ᵀ·Y·A     and   Ā = −Yᵀ·W̄·Y.
+        let wb_y = fast_ab(&w_bar, &y); // W̄·Y (n×k)
+        let wbt_y = fast_atb(&w_bar, &y); // W̄ᵀ·Y (n×k)
+        let mut delta_bar = &wb_y - &wbt_y; // n×k
+        y_bar = y_bar + &fast_atb(&w_bar, &delta); // + W̄ᵀ·Δ
+        y_bar = y_bar - &fast_ab(&w_bar, &delta); // − W̄·Δ
+        y_bar = y_bar - &fast_abt(&wb_y, &a); // − W̄·Y·Aᵀ
+        y_bar = y_bar - &fast_ab(&wbt_y, &a); // − W̄ᵀ·Y·A
+        let a_bar = -fast_ab(&fast_atb(&y, &w_bar), &y); // −Yᵀ·W̄·Y (k×k)
 
-        // ── Step 6 (matrix-exp): B̄ = adjoint of dexp at B applied to M̄. ──
-        let b_bar = matrix_exp_vjp(&block, &m_bar)?;
-
-        // ── Step 5 (block assembly B = [[A, −Rᵀ], [R, 0]]). ──
-        let mut a_bar = b_bar.slice(ndarray::s![0..k, 0..k]).to_owned();
-        let mut r_bar = b_bar.slice(ndarray::s![k..two_k, 0..k]).to_owned();
-        // R̄ += −(B̄[0:k, k:2k])ᵀ.
-        let br_tr = b_bar.slice(ndarray::s![0..k, k..two_k]).to_owned();
-        for i in 0..k {
-            for j in 0..k {
-                r_bar[[i, j]] -= br_tr[[j, i]];
-            }
-        }
-
-        // ── Step 4 (thin-QR): normal̄ from (Q̄, R̄). ──
-        let normal_bar = qr_thin_vjp(&q, &r, &q_bar, &r_bar)?;
-
-        // ── Step 3 (normal = Δ − Y·A). ──
-        let mut delta_bar = normal_bar.clone();
-        y_bar = y_bar - &fast_abt(&normal_bar, &a); // Ȳ += −normal̄·Aᵀ
-        a_bar = a_bar - &fast_atb(&y, &normal_bar); // Ā += −(Yᵀ·normal̄)
-
-        // ── Step 2 (A = Yᵀ·Δ). ──
+        // ── Step 2 (A = Yᵀ·Δ): Ā → (Y, Δ) via dA = dYᵀ·Δ + Yᵀ·dΔ. ──
         y_bar = y_bar + &fast_abt(&delta, &a_bar); // Ȳ += Δ·Āᵀ
         delta_bar = delta_bar + &fast_ab(&y, &a_bar); // Δ̄ += Y·Ā
 
-        // ── Step 1 (Δ = z − Y·sym(Yᵀz)). ──
-        // z̄ = Δ̄ − Y·sym(Yᵀ·Δ̄)
-        // Ȳ += −Δ̄·S − z·sym(Yᵀ·Δ̄)
+        // ── Step 1 (Δ = z − Y·sym(Yᵀz)): Δ̄ → (Y, z). ──
+        //   z̄ = Δ̄ − Y·sym(Yᵀ·Δ̄).
+        //   Ȳ += −Δ̄·S − z·sym(Yᵀ·Δ̄).
         let sym_yt_db = sym(&fast_atb(&y, &delta_bar));
         let z_bar = &delta_bar - &fast_ab(&y, &sym_yt_db);
         y_bar = y_bar - &fast_ab(&delta_bar, &s_proj) - &fast_ab(&z, &sym_yt_db);
@@ -428,74 +387,6 @@ fn matrix_exp_vjp(b: &Array2<f64>, cotangent: &Array2<f64>) -> GeometryResult<Ar
     let exp_aug = matrix_exp(&aug)?;
     // Top-right block is dexp_{Bᵀ}(M̄) = adjoint(dexp_B)(M̄).
     Ok(exp_aug.slice(ndarray::s![0..m, m..two_m]).to_owned())
-}
-
-/// Adjoint (VJP) of the thin/compact QR factorization `normal = Q·R` for a
-/// full-column-rank `n×k` input (`n ≥ k`, `R` invertible upper-triangular).
-/// Given the output cotangents `Q̄` and `R̄`, returns `normal̄`:
-///
-/// ```text
-///   M      = R·R̄ᵀ − Q̄ᵀ·Q
-///   normal̄ = (Q̄ + Q·copyltu(M)) · R⁻ᵀ
-/// ```
-///
-/// where `copyltu(M)` is the symmetric matrix built from the lower triangle of
-/// `M` (lower triangle incl. diagonal, plus the strictly-lower part reflected
-/// into the upper triangle). The trailing `R⁻ᵀ` is realized by forward
-/// substitution solving `normal̄·Rᵀ = RHS` (`R` upper-triangular).
-///
-/// This is the Walter / Seeger formula for the thin-QR adjoint. The asymmetric
-/// pairing (`R·R̄ᵀ`, not `Rᵀ·R̄`) matters because `copyltu` extracts the lower
-/// triangle: `copyltu(M) ≠ copyltu(Mᵀ)` in general, so transposing the factors
-/// produces a genuinely different symmetric matrix and the wrong `normal̄`.
-fn qr_thin_vjp(
-    q: &Array2<f64>,
-    r: &Array2<f64>,
-    q_bar: &Array2<f64>,
-    r_bar: &Array2<f64>,
-) -> GeometryResult<Array2<f64>> {
-    let k = r.nrows();
-    // Mqr = R·R̄ᵀ − Q̄ᵀ·Q  (k×k).
-    use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
-    let mqr = fast_abt(r, r_bar) - fast_atb(q_bar, q);
-    // copyltu: symmetric matrix from the lower triangle of Mqr.
-    let mut sym_low = Array2::<f64>::zeros((k, k));
-    for i in 0..k {
-        for j in 0..k {
-            if i > j {
-                sym_low[[i, j]] = mqr[[i, j]];
-                sym_low[[j, i]] = mqr[[i, j]];
-            } else if i == j {
-                sym_low[[i, j]] = mqr[[i, j]];
-            }
-        }
-    }
-    // RHS = Q̄ + Q·copyltu(Mqr)  (n×k).
-    let rhs = q_bar + &fast_ab(q, &sym_low);
-    // Solve normal̄·Rᵀ = RHS for normal̄ (so normal̄ = RHS·R⁻ᵀ). `R` is upper
-    // triangular, hence `Rᵀ` is lower triangular, so column `j` of the product
-    // couples columns `l ≥ j` of normal̄:
-    //   (normal̄·Rᵀ)[row, j] = Σ_{l ≥ j} normal̄[row, l]·R[j, l] = RHS[row, j].
-    // This is a back substitution in the column index `j` (descending):
-    //   normal̄[row, j]·R[j, j] = RHS[row, j] − Σ_{l > j} normal̄[row, l]·R[j, l].
-    let n = rhs.nrows();
-    let mut out = Array2::<f64>::zeros((n, k));
-    for row in 0..n {
-        for j in (0..k).rev() {
-            let mut acc = rhs[[row, j]];
-            for l in (j + 1)..k {
-                acc -= out[[row, l]] * r[[j, l]];
-            }
-            let diag = r[[j, j]];
-            if diag.abs() <= GEOMETRY_EPS {
-                return Err(GeometryError::Singular(
-                    "qr_thin_vjp requires full-column-rank input (R invertible)",
-                ));
-            }
-            out[[row, j]] = acc / diag;
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
