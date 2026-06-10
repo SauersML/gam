@@ -2,38 +2,40 @@
 //! this whole `tests/` suite, the `gam` CLI binary, the `gamfit` Python wheel,
 //! any downstream consumer — can be built.
 //!
-//! Root cause at the SHA this test is committed at (files/lines read): commit
-//! `0058c08bb feat(#935): one sensitivity operator — FitSensitivity unifies the
-//! fit's H⁻¹` introduced a type error in the new sensitivity operator:
+//! `main` is *chronically* red: in the concurrent commit stream, every few
+//! commits introduce a fresh compile error that a sibling repairs minutes later,
+//! so the crate is non-compiling at most snapshots. Observed, distinct breaks
+//! while this ticket was being written (each fixed before the next appeared):
 //!
-//!  * `src/solver/sensitivity.rs:109` calls
-//!    `crate::linalg::triangular::cholesky_solve_vector(factor, rhs)` inside the
-//!    `FittedInverse::LowerTriangular(factor)` arm, where `factor` is a
-//!    `&Array2<f64>`. `cholesky_solve_vector` (`src/linalg/triangular.rs:179`)
-//!    binds its matrix argument by `Into<ArrayView2<f64>>`, which a `&Array2`
-//!    (auto-ref'd to `&&Array2` by the call) does not satisfy:
-//!    ```text
-//!    error[E0277]: the trait bound
-//!      `ArrayBase<ViewRepr<&f64>, Dim<[usize; 2]>>: From<&&ArrayBase<OwnedRepr<f64>, …>>`
-//!      is not satisfied
-//!       --> src/solver/sensitivity.rs:109:66
-//!    ```
-//!    The fix is to pass a view (`factor.view()` / `&**factor`).
+//!  1. #983/#978 widened `ResponseFamily::NegativeBinomial` with a `theta_fixed`
+//!     field and added `LikelihoodScaleMetadata::FixedNegBinTheta` /
+//!     `SmoothBasisSpec::frozen_global_orthogonality` without updating ~23 match
+//!     arms / initializers (E0027 / E0063 / E0004).
+//!  2. #935 (`0058c08bb`, the new `FitSensitivity` operator) passed a `&Array2`
+//!     where a view was required at `src/solver/sensitivity.rs:109`
+//!     (E0277: `cholesky_solve_vector(factor, rhs)` — needs `factor.view()`).
+//!  3. The SAE frontier commits (#985/#986/#987) leave `-D warnings`-fatal dead
+//!     code and a privacy leak — the live break at the SHA this test is
+//!     committed at:
+//!       * `src/solver/outer_strategy.rs:5473` / `:4436` — `error: type
+//!         `OuterConfig` is more private than the item
+//!         `run_per_atom_efs_if_frontier``;
+//!       * `src/solver/reml/per_atom_efs.rs:188` — assoc fns `new` /
+//!         `fully_coupled` never used;
+//!       * `src/terms/sae_candidate_index.rs:271` — field `bits_per_table`
+//!         never read;
+//!       * `src/terms/sae_corpus/shard_reader.rs:170` — field `path` never read.
+//!     `cargo build` → "could not compile `gam` (lib) due to 4 previous errors".
 //!
-//! `cargo build` (debug or release) fails with "could not compile `gam` (lib)
-//! due to 1 previous error". (`main` has been red across several recent commits
-//! in the concurrent commit stream — an earlier break from the #983/#978
-//! `theta_fixed` / `*_global_orthogonality` field additions was repaired by a
-//! sibling commit before this one landed; the sensitivity-operator error is the
-//! live cause at HEAD.) The published wheel / prebuilt CLI predate the break,
-//! but the source tree is red.
-//!
-//! Per the established pattern for build-break tickets (see e.g. the closed
+//! The published wheel / prebuilt CLI predate the breaks, but the source tree at
+//! HEAD does not build, so the whole `tests/` suite + `gamfit` wheel cannot be
+//! built. Per the established pattern for build-break tickets (see the closed
 //! `gpu_err!`-unscoped and `uv.lock`-stale tickets), this test is a real
-//! end-to-end negative-binomial smooth fit. While the crate does not compile the
-//! test (like everything else) cannot build, so it cannot pass; once the
-//! sensitivity operator (and any other red edit) compiles, this fit runs and its
-//! assertion holds unchanged.
+//! end-to-end negative-binomial smooth fit: while the crate does not compile the
+//! test (like everything else) cannot build, so it cannot pass; once the tree is
+//! green this fit runs and its assertion holds unchanged. The durable ask is a
+//! green-`main` gate (a `cargo build`/`clippy -D warnings` check before merge),
+//! independent of which specific edit is red on any given day.
 //!
 //! The assertion is meaningful, not a tautology: the negative-binomial smooth
 //! must recover a known log-mean surface `μ(x) = exp(0.4 + 1.2·sin(2π·x))` from
