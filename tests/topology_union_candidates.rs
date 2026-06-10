@@ -107,7 +107,16 @@ fn sample_two_circles(seed: u64) -> Array2<f64> {
     let mut out = Array2::<f64>::zeros((N_OBS, 2));
     // Two rings separated by 8 radii along x — disjoint, no overlap.
     fill_ring(&mut out, &mut rng, 0, half, -4.0, 0.0, radius, noise);
-    fill_ring(&mut out, &mut rng, half, N_OBS - half, 4.0, 0.0, radius, noise);
+    fill_ring(
+        &mut out,
+        &mut rng,
+        half,
+        N_OBS - half,
+        4.0,
+        0.0,
+        radius,
+        noise,
+    );
     out
 }
 
@@ -149,68 +158,73 @@ fn sample_single_circle(seed: u64) -> Array2<f64> {
 
 fn ring_density_provider<'a>(data: ArrayView2<'a, f64>) -> HeldOutDensityProvider<'a> {
     let owned = data.to_owned();
-    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-        if train.is_empty() {
-            return Err("ring provider got empty training set".to_string());
-        }
-        let n = train.len() as f64;
-        let cx = train.iter().map(|&i| owned[[i, 0]]).sum::<f64>() / n;
-        let cy = train.iter().map(|&i| owned[[i, 1]]).sum::<f64>() / n;
-        let r_of = |i: usize| -> f64 {
-            ((owned[[i, 0]] - cx).powi(2) + (owned[[i, 1]] - cy).powi(2)).sqrt()
-        };
-        let mean: f64 = train.iter().map(|&i| r_of(i)).sum::<f64>() / n;
-        let var: f64 = (train.iter().map(|&i| (r_of(i) - mean).powi(2)).sum::<f64>() / n).max(1e-9);
-        let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
-        let log_angle = -(std::f64::consts::TAU).ln();
-        let mut out = Vec::with_capacity(eval.len());
-        for &i in eval {
-            let r = r_of(i).max(1e-9);
-            let log_r_density = log_norm - 0.5 * (r - mean).powi(2) / var;
-            out.push(log_r_density + log_angle - r.ln());
-        }
-        Ok(out)
-    })
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            if train.is_empty() {
+                return Err("ring provider got empty training set".to_string());
+            }
+            let n = train.len() as f64;
+            let cx = train.iter().map(|&i| owned[[i, 0]]).sum::<f64>() / n;
+            let cy = train.iter().map(|&i| owned[[i, 1]]).sum::<f64>() / n;
+            let r_of = |i: usize| -> f64 {
+                ((owned[[i, 0]] - cx).powi(2) + (owned[[i, 1]] - cy).powi(2)).sqrt()
+            };
+            let mean: f64 = train.iter().map(|&i| r_of(i)).sum::<f64>() / n;
+            let var: f64 =
+                (train.iter().map(|&i| (r_of(i) - mean).powi(2)).sum::<f64>() / n).max(1e-9);
+            let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
+            let log_angle = -(std::f64::consts::TAU).ln();
+            let mut out = Vec::with_capacity(eval.len());
+            for &i in eval {
+                let r = r_of(i).max(1e-9);
+                let log_r_density = log_norm - 0.5 * (r - mean).powi(2) / var;
+                out.push(log_r_density + log_angle - r.ln());
+            }
+            Ok(out)
+        },
+    )
 }
 
 fn torus_density_provider<'a>(data: ArrayView2<'a, f64>) -> HeldOutDensityProvider<'a> {
     // A single anisotropic 2-D Gaussian chart (a flat torus patch fit as one
     // smooth manifold). Diagonal-plus-cross covariance estimated from the fold.
     let owned = data.to_owned();
-    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-        if train.len() < 3 {
-            return Err("torus provider got too few training rows".to_string());
-        }
-        let n = train.len() as f64;
-        let mx = train.iter().map(|&i| owned[[i, 0]]).sum::<f64>() / n;
-        let my = train.iter().map(|&i| owned[[i, 1]]).sum::<f64>() / n;
-        let mut sxx = 0.0_f64;
-        let mut syy = 0.0_f64;
-        let mut sxy = 0.0_f64;
-        for &i in train {
-            let dx = owned[[i, 0]] - mx;
-            let dy = owned[[i, 1]] - my;
-            sxx += dx * dx;
-            syy += dy * dy;
-            sxy += dx * dy;
-        }
-        sxx = (sxx / n).max(1e-9);
-        syy = (syy / n).max(1e-9);
-        sxy /= n;
-        let det = (sxx * syy - sxy * sxy).max(1e-12);
-        let inv_xx = syy / det;
-        let inv_yy = sxx / det;
-        let inv_xy = -sxy / det;
-        let log_norm = -(std::f64::consts::TAU).ln() - 0.5 * det.ln();
-        let mut out = Vec::with_capacity(eval.len());
-        for &i in eval {
-            let dx = owned[[i, 0]] - mx;
-            let dy = owned[[i, 1]] - my;
-            let q = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy;
-            out.push(log_norm - 0.5 * q);
-        }
-        Ok(out)
-    })
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            if train.len() < 3 {
+                return Err("torus provider got too few training rows".to_string());
+            }
+            let n = train.len() as f64;
+            let mx = train.iter().map(|&i| owned[[i, 0]]).sum::<f64>() / n;
+            let my = train.iter().map(|&i| owned[[i, 1]]).sum::<f64>() / n;
+            let mut sxx = 0.0_f64;
+            let mut syy = 0.0_f64;
+            let mut sxy = 0.0_f64;
+            for &i in train {
+                let dx = owned[[i, 0]] - mx;
+                let dy = owned[[i, 1]] - my;
+                sxx += dx * dx;
+                syy += dy * dy;
+                sxy += dx * dy;
+            }
+            sxx = (sxx / n).max(1e-9);
+            syy = (syy / n).max(1e-9);
+            sxy /= n;
+            let det = (sxx * syy - sxy * sxy).max(1e-12);
+            let inv_xx = syy / det;
+            let inv_yy = sxx / det;
+            let inv_xy = -sxy / det;
+            let log_norm = -(std::f64::consts::TAU).ln() - 0.5 * det.ln();
+            let mut out = Vec::with_capacity(eval.len());
+            for &i in eval {
+                let dx = owned[[i, 0]] - mx;
+                let dy = owned[[i, 1]] - my;
+                let q = inv_xx * dx * dx + 2.0 * inv_xy * dx * dy + inv_yy * dy * dy;
+                out.push(log_norm - 0.5 * q);
+            }
+            Ok(out)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +250,8 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
     let cfg = GaussianMixtureConfig::default();
     // In-class union rung: fit the FIXED ladder, take the summed rank-aware
     // evidence winner. This is the composite that competes cross-class.
-    let rung = fit_union_rung(data.view(), cfg).expect("union rung must fit at least one composite");
+    let rung =
+        fit_union_rung(data.view(), cfg).expect("union rung must fit at least one composite");
     let union_winner = rung.winner();
     let union_structure = union_winner.structure;
     let union_evidence = union_winner.negative_log_evidence;
@@ -474,8 +489,7 @@ fn fit_union_candidate_prices_by_total_parameter_count() {
         "circle+circle total parameter count must be the sum across components (4 + 4)"
     );
     assert_eq!(
-        fit.total_parameters,
-        fit.fit.total_parameters,
+        fit.total_parameters, fit.fit.total_parameters,
         "rung total_parameters must mirror the inner UnionStructureFit"
     );
     // Summed evidence equals the sum of the per-component negative-log-evidences.
@@ -496,8 +510,7 @@ fn fit_union_candidate_prices_by_total_parameter_count() {
         fit.negative_log_evidence.is_finite(),
         "summed rank-aware Laplace evidence must be finite"
     );
-    let total_component_params: usize =
-        fit.fit.components.iter().map(|c| c.num_parameters).sum();
+    let total_component_params: usize = fit.fit.components.iter().map(|c| c.num_parameters).sum();
     assert_eq!(
         fit.total_parameters, total_component_params,
         "total_parameters must equal the sum of per-component parameter counts"

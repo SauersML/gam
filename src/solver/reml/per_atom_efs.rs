@@ -61,12 +61,12 @@
 //! design invariant of routing every layer through the same `eval`/`eval_efs`
 //! hooks that the dense path consumes, not a separately maintained surrogate.
 
+use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
+use crate::matrix::FactorizedSystem;
 use crate::solver::estimate::EstimationError;
 use crate::solver::outer_strategy::{
     HessianResult, OuterCapability, OuterHessianOperator, OuterObjective, OuterPlan, OuterResult,
 };
-use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
-use crate::matrix::FactorizedSystem;
 use faer::Side;
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -633,14 +633,13 @@ pub fn run_per_atom_efs(
                     // the θ-HVP signature requires a gradient re-evaluator; this
                     // closure errors loudly if the operator branch ever defers
                     // to it, which it does not while `operator.is_some()`.
-                    let degraded_eval =
-                        |_p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-                            Err(EstimationError::RemlOptimizationFailed(
-                                "per-atom border FD probe unavailable without an \
+                    let degraded_eval = |_p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+                        Err(EstimationError::RemlOptimizationFailed(
+                            "per-atom border FD probe unavailable without an \
                                  outer-Hessian operator"
-                                    .to_string(),
-                            ))
-                        };
+                                .to_string(),
+                        ))
+                    };
                     match shared_border_correction(
                         topology,
                         operator.as_ref(),
@@ -657,9 +656,7 @@ pub fn run_per_atom_efs(
                             // A border-correction failure is non-fatal: keep the
                             // decoupled layer-1 step. Log via the cost path's
                             // own diagnostics on the next stall.
-                            log::debug!(
-                                "[PER-ATOM-EFS] shared-border correction skipped: {err}"
-                            );
+                            log::debug!("[PER-ATOM-EFS] shared-border correction skipped: {err}");
                         }
                     }
                 } else {

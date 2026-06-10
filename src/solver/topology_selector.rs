@@ -36,9 +36,9 @@
 //! prediction path. That OOS-retention package is out of scope here.
 
 use crate::solver::evidence::{
-    GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale, UNION_STRUCTURE_LADDER,
-    UnionStructure, UnionStructureFit, fit_gaussian_mixture, fit_union_ladder, fit_union_structure,
-    solve_stacking_weights, union_per_point_log_density,
+    GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
+    UNION_STRUCTURE_LADDER, UnionStructure, UnionStructureFit, fit_gaussian_mixture,
+    fit_union_ladder, fit_union_structure, solve_stacking_weights, union_per_point_log_density,
 };
 use crate::solver::priority_selection::{PriorityCandidate, rank_priority_candidates};
 use ndarray::{Array2, ArrayView2};
@@ -650,13 +650,15 @@ pub fn mixture_density_provider<'a>(
     config: GaussianMixtureConfig,
 ) -> HeldOutDensityProvider<'a> {
     let owned = data.to_owned();
-    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-        let train_mat = gather_rows(owned.view(), train);
-        let fit = fit_gaussian_mixture(train_mat.view(), k.min(train.len().max(1)), config)?;
-        let eval_mat = gather_rows(owned.view(), eval);
-        let dens = fit.per_point_log_density(eval_mat.view())?;
-        Ok(dens.to_vec())
-    })
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            let train_mat = gather_rows(owned.view(), train);
+            let fit = fit_gaussian_mixture(train_mat.view(), k.min(train.len().max(1)), config)?;
+            let eval_mat = gather_rows(owned.view(), eval);
+            let dens = fit.per_point_log_density(eval_mat.view())?;
+            Ok(dens.to_vec())
+        },
+    )
 }
 
 /// Build a structured-union held-out-density provider for a fixed composite. It
@@ -670,13 +672,15 @@ pub fn union_density_provider<'a>(
     config: GaussianMixtureConfig,
 ) -> HeldOutDensityProvider<'a> {
     let owned = data.to_owned();
-    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-        let train_mat = gather_rows(owned.view(), train);
-        let eval_mat = gather_rows(owned.view(), eval);
-        let dens =
-            union_per_point_log_density(train_mat.view(), eval_mat.view(), structure, config)?;
-        Ok(dens.to_vec())
-    })
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            let train_mat = gather_rows(owned.view(), train);
+            let eval_mat = gather_rows(owned.view(), eval);
+            let dens =
+                union_per_point_log_density(train_mat.view(), eval_mat.view(), structure, config)?;
+            Ok(dens.to_vec())
+        },
+    )
 }
 
 fn gather_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
@@ -809,10 +813,7 @@ pub fn adjudicate_cross_class_race(
         return Err("cross-class race requires at least one candidate".to_string());
     }
     let names: Vec<String> = candidates.iter().map(|c| c.kind.display_name()).collect();
-    let evidence: Vec<f64> = candidates
-        .iter()
-        .map(|c| c.negative_log_evidence)
-        .collect();
+    let evidence: Vec<f64> = candidates.iter().map(|c| c.negative_log_evidence).collect();
 
     // Cross-class iff the race mixes at least one discrete (non-smooth) density
     // class — the mixture rung OR a structured union (#907) — with at least one

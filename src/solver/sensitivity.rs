@@ -457,7 +457,10 @@ mod tests {
             for j in 0..2 {
                 assert!((ma[[i, j]] - mb[[i, j]]).abs() <= 1e-12);
                 assert!((ma[[i, j]] - mc[[i, j]]).abs() <= 1e-12);
-                assert!((resp[[i, j]] + ma[[i, j]]).abs() <= 1e-15, "mode response sign");
+                assert!(
+                    (resp[[i, j]] + ma[[i, j]]).abs() <= 1e-15,
+                    "mode response sign"
+                );
             }
         }
         // H · apply(rhs) must reproduce rhs (it is a true inverse here).

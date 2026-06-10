@@ -9988,10 +9988,11 @@ impl<'a> RemlState<'a> {
                 .cholesky(Side::Lower)
             {
                 Ok(chol) => {
-                    let sensitivity = crate::solver::sensitivity::FitSensitivity::from_faer_cholesky(
-                        &chol,
-                        x.ncols(),
-                    );
+                    let sensitivity =
+                        crate::solver::sensitivity::FitSensitivity::from_faer_cholesky(
+                            &chol,
+                            x.ncols(),
+                        );
                     let h_inv_xt = sensitivity.leverage_block(&x);
                     self.alo_stabilization_gradient(
                         rho,

@@ -13,8 +13,8 @@
 
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
-    AutoTopologyKind, CrossClassCandidate, Headline, HeldOutDensityProvider,
-    adjudicate_cross_class_race, fit_mixture_rung, MIXTURE_K_LADDER, STACKING_CV_FOLDS,
+    AutoTopologyKind, CrossClassCandidate, Headline, HeldOutDensityProvider, MIXTURE_K_LADDER,
+    STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -118,32 +118,28 @@ fn sample_clusters(seed: u64) -> Array2<f64> {
 
 fn ring_density_provider<'a>(data: ArrayView2<'a, f64>) -> HeldOutDensityProvider<'a> {
     let owned = data.to_owned();
-    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-        if train.is_empty() {
-            return Err("ring provider got empty training set".to_string());
-        }
-        let r_of = |i: usize| -> f64 {
-            (owned[[i, 0]].powi(2) + owned[[i, 1]].powi(2)).sqrt()
-        };
-        let n = train.len() as f64;
-        let mean: f64 = train.iter().map(|&i| r_of(i)).sum::<f64>() / n;
-        let var: f64 = train
-            .iter()
-            .map(|&i| (r_of(i) - mean).powi(2))
-            .sum::<f64>()
-            / n;
-        let var = var.max(1e-9);
-        let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
-        let log_angle = -(std::f64::consts::TAU).ln();
-        let mut out = Vec::with_capacity(eval.len());
-        for &i in eval {
-            let r = r_of(i).max(1e-9);
-            let log_r_density = log_norm - 0.5 * (r - mean).powi(2) / var;
-            // + log(1/r) Jacobian + uniform angle.
-            out.push(log_r_density + log_angle - r.ln());
-        }
-        Ok(out)
-    })
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            if train.is_empty() {
+                return Err("ring provider got empty training set".to_string());
+            }
+            let r_of = |i: usize| -> f64 { (owned[[i, 0]].powi(2) + owned[[i, 1]].powi(2)).sqrt() };
+            let n = train.len() as f64;
+            let mean: f64 = train.iter().map(|&i| r_of(i)).sum::<f64>() / n;
+            let var: f64 = train.iter().map(|&i| (r_of(i) - mean).powi(2)).sum::<f64>() / n;
+            let var = var.max(1e-9);
+            let log_norm = -0.5 * (std::f64::consts::TAU * var).ln();
+            let log_angle = -(std::f64::consts::TAU).ln();
+            let mut out = Vec::with_capacity(eval.len());
+            for &i in eval {
+                let r = r_of(i).max(1e-9);
+                let log_r_density = log_norm - 0.5 * (r - mean).powi(2) / var;
+                // + log(1/r) Jacobian + uniform angle.
+                out.push(log_r_density + log_angle - r.ln());
+            }
+            Ok(out)
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -327,8 +323,12 @@ fn mixture_rung_prices_order_by_free_parameters() {
     // The ladder is fixed and each order is priced by its own free-parameter
     // count entering the rank-aware normalizer.
     let data = sample_clusters(7);
-    let rung = fit_mixture_rung(data.view(), MIXTURE_K_LADDER, GaussianMixtureConfig::default())
-        .expect("rung fit");
+    let rung = fit_mixture_rung(
+        data.view(),
+        MIXTURE_K_LADDER,
+        GaussianMixtureConfig::default(),
+    )
+    .expect("rung fit");
     for fit in &rung.fits {
         let d = 2usize;
         let cov_per = d * (d + 1) / 2;

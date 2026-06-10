@@ -126,8 +126,15 @@ fn predicted_nats_match_analytic_kl_within_validity_radius() {
 
     assert_eq!(plan.atom, 0);
     assert_eq!(plan.atom_name, "circle");
-    assert_eq!(plan.metric_provenance, MetricProvenance::OutputFisher { rank: 2 });
-    assert!((plan.amplitude - 1.0).abs() < 1e-12, "amplitude {}", plan.amplitude);
+    assert_eq!(
+        plan.metric_provenance,
+        MetricProvenance::OutputFisher { rank: 2 }
+    );
+    assert!(
+        (plan.amplitude - 1.0).abs() < 1e-12,
+        "amplitude {}",
+        plan.amplitude
+    );
 
     let nats = plan.predicted_nats.expect("behavioral dose available");
     let kl = analytic_kl(delta);
@@ -141,7 +148,10 @@ fn predicted_nats_match_analytic_kl_within_validity_radius() {
     // The off-manifold component is ~0: the chord of a tiny arc lies on the
     // tangent line. Scale tolerance to the move size.
     let move_norm = plan.delta.iter().map(|&v| v * v).sum::<f64>().sqrt();
-    println!("off_manifold_norm={:.3e} move_norm={move_norm:.3e}", plan.off_manifold_norm);
+    println!(
+        "off_manifold_norm={:.3e} move_norm={move_norm:.3e}",
+        plan.off_manifold_norm
+    );
     assert!(
         plan.off_manifold_norm < 1e-3 * move_norm,
         "off-manifold residual {:.3e} must be ~0 vs move {move_norm:.3e}",
@@ -212,13 +222,22 @@ fn euclidean_metric_yields_geometry_but_no_dose() {
     let plan = steer_delta(&term, &euclid, 0, &[t0], &[t0 + delta]).expect("plan");
 
     assert_eq!(plan.metric_provenance, MetricProvenance::Euclidean);
-    assert!(plan.predicted_nats.is_none(), "no behavioral axis ⇒ dose unavailable");
-    assert!(plan.validity_radius.is_none(), "no dose ⇒ no validity radius");
+    assert!(
+        plan.predicted_nats.is_none(),
+        "no behavioral axis ⇒ dose unavailable"
+    );
+    assert!(
+        plan.validity_radius.is_none(),
+        "no dose ⇒ no validity radius"
+    );
 
     // The geometry is still there: a nonzero on-manifold move and a ~0
     // off-manifold residual.
     let move_norm = plan.delta.iter().map(|&v| v * v).sum::<f64>().sqrt();
-    assert!(move_norm > 0.0, "the activation-space delta must be nonzero");
+    assert!(
+        move_norm > 0.0,
+        "the activation-space delta must be nonzero"
+    );
     assert!(
         plan.off_manifold_norm < 1e-3 * move_norm,
         "off-manifold residual {:.3e} must be ~0 vs move {move_norm:.3e}",
@@ -236,7 +255,10 @@ fn delta_is_the_activation_space_chord() {
 
     // g(t) = R·[cos(2πt), sin(2πt)]; chord at amplitude 1.
     let g_from = [R * (TWO_PI * t0).cos(), R * (TWO_PI * t0).sin()];
-    let g_to = [R * (TWO_PI * (t0 + delta)).cos(), R * (TWO_PI * (t0 + delta)).sin()];
+    let g_to = [
+        R * (TWO_PI * (t0 + delta)).cos(),
+        R * (TWO_PI * (t0 + delta)).sin(),
+    ];
     let expect0 = g_to[0] - g_from[0];
     let expect1 = g_to[1] - g_from[1];
     println!(

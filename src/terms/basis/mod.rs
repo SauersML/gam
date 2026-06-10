@@ -16359,12 +16359,7 @@ fn build_matern_operator_penalty_psi_derivatives(
     let matern_spec = DuchonOperatorPenaltySpec::matern_for_smoothness(nu, d);
     let mut candidates = Vec::with_capacity(3);
     for (spec_gate, source, matrix, normalization_scale) in [
-        (
-            &matern_spec.mass,
-            PenaltySource::OperatorMass,
-            s0_norm,
-            c0,
-        ),
+        (&matern_spec.mass, PenaltySource::OperatorMass, s0_norm, c0),
         (
             &matern_spec.tension,
             PenaltySource::OperatorTension,
@@ -31621,10 +31616,7 @@ mod tests {
             .collect();
         assert_eq!(
             forward_sources,
-            vec![
-                PenaltySource::OperatorMass,
-                PenaltySource::OperatorTension
-            ],
+            vec![PenaltySource::OperatorMass, PenaltySource::OperatorTension],
             "ν=3/2 (m=2) must admit mass+tension and gate out stiffness"
         );
 
@@ -31690,12 +31682,7 @@ mod tests {
             let fd = (&s_plus - &s_minus).mapv(|v| v / (2.0 * h));
             let analytic = &psi_derivatives[idx];
             let err = (&fd - analytic).iter().map(|v| v * v).sum::<f64>().sqrt();
-            let scale = analytic
-                .iter()
-                .map(|v| v * v)
-                .sum::<f64>()
-                .sqrt()
-                .max(1.0);
+            let scale = analytic.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
             assert!(
                 err / scale < 1e-5,
                 "{source:?} κ-gradient FD mismatch: err={err:.3e}, analytic_norm={scale:.3e}"

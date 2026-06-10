@@ -450,19 +450,15 @@ mod tests {
         rows: &Array2<f64>,
         chunk_size: usize,
     ) -> (StreamingBorderGram, Vec<usize>) {
-        let acc = StreamingBorderGram::new(rows.ncols(), rows.nrows(), chunk_size)
-            .expect("accumulator");
+        let acc =
+            StreamingBorderGram::new(rows.ncols(), rows.nrows(), chunk_size).expect("accumulator");
         let order: Vec<usize> = (0..acc.n_chunks()).collect();
         (acc, order)
     }
 
-    fn run_with_order(
-        rows: &Array2<f64>,
-        chunk_size: usize,
-        order: &[usize],
-    ) -> Array2<f64> {
-        let mut acc = StreamingBorderGram::new(rows.ncols(), rows.nrows(), chunk_size)
-            .expect("accumulator");
+    fn run_with_order(rows: &Array2<f64>, chunk_size: usize, order: &[usize]) -> Array2<f64> {
+        let mut acc =
+            StreamingBorderGram::new(rows.ncols(), rows.nrows(), chunk_size).expect("accumulator");
         for &j in order {
             let range = acc.chunk_rows(j);
             acc.submit_chunk(j, rows.slice(ndarray::s![range, ..]))
@@ -655,7 +651,10 @@ mod tests {
 
         // finish() with chunk 1 missing must fail and name it.
         let err = acc.finish().expect_err("missing chunk must fail finish");
-        assert!(err.contains("[1]"), "missing-chunk message must name chunk 1: {err}");
+        assert!(
+            err.contains("[1]"),
+            "missing-chunk message must name chunk 1: {err}"
+        );
     }
 
     #[test]

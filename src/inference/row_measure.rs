@@ -373,7 +373,10 @@ mod tests {
         let loud = order.iter().filter(|&&r| r == 1).count();
         let quiet0 = order.iter().filter(|&&r| r == 0).count();
         // Expected: 9/11 of 110 = 90 for the loud row, 10 each for the quiet.
-        assert!(loud > quiet0 * 5, "loud row must be oversampled: loud={loud} quiet0={quiet0}");
+        assert!(
+            loud > quiet0 * 5,
+            "loud row must be oversampled: loud={loud} quiet0={quiet0}"
+        );
     }
 
     #[test]

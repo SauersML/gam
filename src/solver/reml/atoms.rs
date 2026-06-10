@@ -491,7 +491,10 @@ mod tests {
         // value = ½ log|H|₊.
         assert_eq!(hess.name(), "hessian_logdet");
         assert!((hess.value() - 0.5 * 8.0_f64.ln()).abs() < 1e-12);
-        assert!(hess.beta_channel().is_none(), "logdet atom has no β-channel");
+        assert!(
+            hess.beta_channel().is_none(),
+            "logdet atom has no β-channel"
+        );
         assert_eq!(hess.stratum().expect("declared stratum").kept_rank, 2);
 
         // Shared drift Ḣ = [[1, 0.3], [0.3, 1]]. frozen_d1 = ½ tr(H⁺ Ḣ)

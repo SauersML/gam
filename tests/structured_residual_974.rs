@@ -162,13 +162,7 @@ fn fitted_factor_recovers_planted_interference_subspace() {
     let r0 = 2usize;
     // Planted interference factor Λ₀ (p × r0): two fixed, well-separated
     // directions, scaled large so the factor dominates the idiosyncratic noise.
-    let lambda0 = ndarray::array![
-        [1.6, 0.2],
-        [1.4, -0.3],
-        [0.1, 1.5],
-        [-0.2, 1.3],
-        [0.3, 0.1],
-    ];
+    let lambda0 = ndarray::array![[1.6, 0.2], [1.4, -0.3], [0.1, 1.5], [-0.2, 1.3], [0.3, 0.1],];
     let sigma_eps = 0.25_f64;
     let mut seed = 0x9E3779B97F4A7C15_u64;
     let mut residuals = Array2::<f64>::zeros((n, p));
@@ -331,12 +325,9 @@ fn structured_likelihood_removes_spurious_topology_preference() {
         }
     }
     let activity = Array1::<f64>::zeros(n);
-    let metric = RowMetric::from_estimated_residual_covariance(
-        residuals.view(),
-        activity.view(),
-        2,
-    )
-    .expect("structured metric fits");
+    let metric =
+        RowMetric::from_estimated_residual_covariance(residuals.view(), activity.view(), 2)
+            .expect("structured metric fits");
     assert!(
         metric.whitens_likelihood(),
         "the fitted structured covariance must produce a likelihood-whitening metric"
@@ -517,8 +508,7 @@ fn euclidean_metric_leaves_assembled_gradient_bit_identical() {
     // metric and with a Euclidean metric installed; the β gradient must match
     // bit-for-bit.
     let (k, m, d, n, p) = (3usize, 4usize, 1usize, 12usize, 3usize);
-    let (mut term_none, target, rho) =
-        build_sae_term(k, m, d, n, p, 0x0BADF00DCAFEBABE);
+    let (mut term_none, target, rho) = build_sae_term(k, m, d, n, p, 0x0BADF00DCAFEBABE);
     let mut term_euc = term_none.clone();
 
     let sys_none = term_none

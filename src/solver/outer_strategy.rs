@@ -7082,10 +7082,7 @@ fn run_outer_with_plan(
                 path_demotions.len(),
                 path_demotions
                     .iter()
-                    .map(|d| format!(
-                        "seed {} -> {:?}: {}",
-                        d.seed_idx, d.regime, d.reason
-                    ))
+                    .map(|d| format!("seed {} -> {:?}: {}", d.seed_idx, d.regime, d.reason))
                     .collect::<Vec<_>>()
                     .join("; "),
             ));

@@ -531,7 +531,8 @@ impl RiemannianLBFGS {
                         best_f = f_trial;
                         best_x = trial_x;
                         // Riemannian (metric-raised) gradient at the trial point.
-                        best_grad = manifold.riemannian_gradient(best_x.view(), g_trial_e.view())?;
+                        best_grad =
+                            manifold.riemannian_gradient(best_x.view(), g_trial_e.view())?;
                         break;
                     }
                     alpha *= 0.5;

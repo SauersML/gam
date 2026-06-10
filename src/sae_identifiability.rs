@@ -1424,17 +1424,15 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
     let residual_gauge_dim = verdicts.iter().filter(|v| v.unpinned).count();
 
     // Sym(F)-triviality under OutputFisher provenance.
-    let sym_f_trivial_under_output_fisher = if matches!(
-        metric_provenance,
-        MetricProvenance::OutputFisher { .. }
-    ) {
-        let any_perm_unpinned = verdicts
-            .iter()
-            .any(|v| v.family == GeneratorFamily::AtomPermutation && v.unpinned);
-        Some(!any_perm_unpinned)
-    } else {
-        None
-    };
+    let sym_f_trivial_under_output_fisher =
+        if matches!(metric_provenance, MetricProvenance::OutputFisher { .. }) {
+            let any_perm_unpinned = verdicts
+                .iter()
+                .any(|v| v.family == GeneratorFamily::AtomPermutation && v.unpinned);
+            Some(!any_perm_unpinned)
+        } else {
+            None
+        };
 
     let summary = format!(
         "residual gauge certificate (computed in metric {metric_provenance:?}): \

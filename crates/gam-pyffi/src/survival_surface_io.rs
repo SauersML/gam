@@ -653,11 +653,7 @@ fn hazard_from_cumulative_impl(
     let (n_rows, n_times) = cumulative.dim();
     let mut out = Array2::<f64>::zeros((n_rows, n_times));
     for j in 0..n_times {
-        let prev_t = if j == 0 {
-            previous_time
-        } else {
-            times[j - 1]
-        };
+        let prev_t = if j == 0 { previous_time } else { times[j - 1] };
         let width = times[j] - prev_t;
         if !(width > 0.0) {
             return Err(format!(
@@ -856,7 +852,10 @@ mod tests {
     #[test]
     fn cumulative_hazard_maps_zero_survival_to_infinity() {
         let h = cumulative_hazard_from_survival_value(0.0).expect("S = 0 is valid");
-        assert!(h.is_infinite() && h > 0.0, "S = 0 must map to +inf, got {h}");
+        assert!(
+            h.is_infinite() && h > 0.0,
+            "S = 0 must map to +inf, got {h}"
+        );
     }
 
     #[test]
@@ -905,10 +904,14 @@ mod tests {
         let times = array![1.0, 2.0, 3.0];
         let cumulative = array![[2.0, 4.0, 6.0]];
         let previous = array![[0.0]];
-        let out = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-            .expect("strictly increasing times");
+        let out =
+            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+                .expect("strictly increasing times");
         for &h in out.iter() {
-            assert!((h - 2.0).abs() < 1e-12, "expected constant hazard 2, got {h}");
+            assert!(
+                (h - 2.0).abs() < 1e-12,
+                "expected constant hazard 2, got {h}"
+            );
         }
     }
 
@@ -919,9 +922,13 @@ mod tests {
         let times = array![1.0, 1.0];
         let cumulative = array![[2.0, 2.0]];
         let previous = array![[0.0]];
-        let err = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-            .expect_err("repeated times must error");
-        assert!(err.contains("strictly increasing"), "unexpected error: {err}");
+        let err =
+            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+                .expect_err("repeated times must error");
+        assert!(
+            err.contains("strictly increasing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -931,9 +938,13 @@ mod tests {
         let times = array![2.0, 1.0];
         let cumulative = array![[4.0, 2.0]];
         let previous = array![[0.0]];
-        let err = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-            .expect_err("unsorted times must error");
-        assert!(err.contains("strictly increasing"), "unexpected error: {err}");
+        let err =
+            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+                .expect_err("unsorted times must error");
+        assert!(
+            err.contains("strictly increasing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -955,8 +966,9 @@ mod tests {
         let times = array![1.0, 2.0];
         let cumulative = array![[4.0, 2.0]];
         let previous = array![[0.0]];
-        let err = hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
-            .expect_err("decreasing cumulative must error");
+        let err =
+            hazard_from_cumulative_impl(times.view(), cumulative.view(), previous.view(), 0.0)
+                .expect_err("decreasing cumulative must error");
         assert!(err.contains("non-decreasing"), "unexpected error: {err}");
     }
 }

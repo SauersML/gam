@@ -76,7 +76,6 @@ use gam::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, FamilyEvaluation, ParameterBlockSpec,
     ParameterBlockState, PenaltyMatrix,
 };
-use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::estimate::{
     ExternalOptimOptions, evaluate_externalcost_andridge, evaluate_externalgradient,
 };
@@ -87,6 +86,7 @@ use gam::families::survival::{
     MonotonicityPenalty, PenaltyBlock, PenaltyBlocks, SurvivalEngineInputs, SurvivalSpec,
     WorkingModelSurvival,
 };
+use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use gam::smooth::BlockwisePenalty;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
@@ -1317,7 +1317,10 @@ fn sae_outputfisher_gauge_leaves_likelihood_isotropic_and_value_path_bit_identic
         "WhitenedStructured is a genuinely estimated noise model (#974) — it \
          alone whitens the likelihood"
     );
-    assert!(whitened.drives_gauge(), "WhitenedStructured also drives the gauge");
+    assert!(
+        whitened.drives_gauge(),
+        "WhitenedStructured also drives the gauge"
+    );
 
     // (b) The value-path data-fit is BIT-IDENTICAL for None / Euclidean /
     //     OutputFisher: all three select the isotropic Σ½r² arm, so installing

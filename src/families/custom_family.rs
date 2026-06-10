@@ -12896,390 +12896,395 @@ struct JointSpectralNewtonStep {
 mod whitened_spectrum_tests {
     use super::*;
 
-/// Eigendecomposition of the metric-whitened penalized Hessian, retained so
-/// every trust-radius shrink within one Newton cycle re-solves the
-/// trust-region subproblem from the SAME `O(p³)` factorization at `O(p)` cost.
-///
-/// # Why this exists (gam#979)
-///
-/// The coupled marginal↔logslope inner Newton needs ONE globalization, not a
-/// stack of approximations. Historically the joint step was a *modified-Newton*
-/// (reflect indefinite eigenvalues to `|λ|`) wrapped in a *heuristically gated*
-/// multiplicative Marquardt damping (engaged on `nullity>0`, or condition number
-/// over a threshold, or after N non-improving cycles) and then a *dogleg* between
-/// that step and the Cauchy point, truncated to per-block step-norm trust radii.
-/// Each piece approximates a different facet of the one exact object below, and
-/// each had to be gated so it would not re-break the case another piece was added
-/// for (#826 vs #808 vs #733/#734 vs #787). When none of the gates matched the
-/// operating point — well-conditioned `H_pen`, yet a coupled near-aliased
-/// direction with a huge raw Newton component — the truncated direction made only
-/// Cauchy-sized progress, the gain ratio never justified growing the radius, and
-/// the residual crawled for hundreds of cycles (the #979 "phantom multiplier"
-/// grind / survival hang).
-///
-/// [`Self::trust_region_step`] replaces all of that with the *exact* solution of
-/// the trust-region subproblem
-///   minimize  `−rhsᵀδ + ½ δᵀ H_pen δ`   subject to  `‖δ‖_D ≤ r`,
-/// via the Moré–Sorensen characterization: the minimizer is `δ(λ) = (H_pen +
-/// λD)⁻¹ rhs` for the unique `λ ≥ max(0, −γ_min)` with `‖δ(λ)‖_D = r` (or `λ = 0`
-/// when the Newton step is interior and `H_pen ≻ 0`). Working in the `D`-metric
-/// generalized eigenbasis this is a scalar secular equation in `λ`, solved by a
-/// safeguarded Newton iteration on the already-computed spectrum. Properties that
-/// make it the right object:
-///   * indefiniteness is handled exactly (`λ ≥ −γ_min` makes `H_pen+λD ⪰ 0` on
-///     the boundary — no reflection heuristic, no negative-curvature special case
-///     other than the rigorous hard case);
-///   * the damping `λ` is determined by the trust radius, not by nullity /
-///     condition / stall gates — those gates disappear;
-///   * it self-vanishes: at the KKT fixed point `rhs → 0 ⇒ δ → 0`, and once the
-///     iterate is in a region where `H_pen ≻ 0` the Newton step goes interior so
-///     `λ = 0` and convergence is quadratic — the converged β, the KKT
-///     certificate, and the REML/LAML the residual feeds are byte-identical to an
-///     undamped exact-Newton solve;
-///   * it is affine covariant in the `D` metric, so blocks at wildly different
-///     curvature scales (the penalty `λ ~ e²⁴` modes vs the `XᵀWX` likelihood
-///     modes at an oversmoothed seed) are damped uniformly by `1/(γ_k+λ)` — the
-///     scale-invariance the per-block radii and the multiplicative-Marquardt form
-///     were each hand-built to approximate.
-///
-/// The genuine penalty null space (`|γ_k| ≤ null_cutoff`) is still projected out
-/// (the gam#553 Moore–Penrose range restriction): an unidentified gauge direction
-/// carries no finite Newton step and is left unchanged, its stationarity-residual
-/// component reported via [`JointSpectralNewtonStep::null_rhs_inf`].
-pub(super) struct WhitenedHessianSpectrum {
-    /// Generalized eigenvalues `γ_k` of `(H_pen, D)` = eigenvalues of the
-    /// whitened matrix `A = D^{-1/2} H_pen D^{-1/2}`.
-    gamma: Array1<f64>,
-    /// Whitened eigenvectors `v_k` (columns) of `A`.
-    evecs: Array2<f64>,
-    /// rhs in the whitened eigenbasis: `c_k = v_kᵀ D^{-1/2} rhs`.
-    c: Array1<f64>,
-    /// `D^{-1/2}` diagonal, mapping a whitened step `η` back to `δ = D^{-1/2} η`.
-    d_inv_sqrt: Array1<f64>,
-    /// `max_k |γ_k|` (the curvature scale; `D`-whitened).
-    lambda_max_abs: f64,
-    /// Curvature magnitude at/below which a direction is treated as genuinely
-    /// unidentified (penalty null space) and dropped from the step.
-    null_cutoff: f64,
-}
-
-impl WhitenedHessianSpectrum {
-    /// Eigendecompose the `D`-whitened penalized Hessian once. `metric_diag`
-    /// supplies the positive trust-region metric `D` (each entry is passed
-    /// through [`positive_joint_diagonal_entry`] so a non-positive curvature
-    /// estimate becomes a safe positive scale). `rank_tol` is the relative
-    /// near-singularity cutoff; the genuine numerical-rank floor is derived from
-    /// the whitened spectrum exactly as the legacy spectral solve did.
-    pub(super) fn decompose(
-        h_pen: &Array2<f64>,
-        rhs: &Array1<f64>,
-        metric_diag: &Array1<f64>,
-        rank_tol: f64,
-    ) -> Result<Self, String> {
-        let p = h_pen.nrows();
-        if h_pen.ncols() != p || rhs.len() != p || metric_diag.len() != p {
-            return Err(format!(
-                "whitened trust-region decomposition dimension mismatch: H={}x{}, rhs={}, metric={}",
-                h_pen.nrows(),
-                h_pen.ncols(),
-                rhs.len(),
-                metric_diag.len()
-            ));
-        }
-        let d_inv_sqrt = Array1::from_iter(
-            metric_diag
-                .iter()
-                .map(|w| 1.0 / positive_joint_diagonal_entry(*w).sqrt()),
-        );
-        // A = D^{-1/2} H D^{-1/2}; symmetric since H is symmetric and D diagonal.
-        let mut a = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            for j in 0..p {
-                a[[i, j]] = h_pen[[i, j]] * d_inv_sqrt[i] * d_inv_sqrt[j];
-            }
-        }
-        symmetrize_dense_in_place(&mut a);
-        let (gamma, evecs) = FaerEigh::eigh(&a, Side::Lower)
-            .map_err(|e| format!("whitened trust-region eigendecomposition failed: {e}"))?;
-        // c = Vᵀ (D^{-1/2} rhs).
-        let whitened_rhs = &d_inv_sqrt * rhs;
-        let c = evecs.t().dot(&whitened_rhs);
-        let lambda_max_abs = gamma.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
-        let cutoff = rank_tol * lambda_max_abs;
-        let null_cutoff = cutoff.min(numerical_floor);
-        Ok(Self {
-            gamma,
-            evecs,
-            c,
-            d_inv_sqrt,
-            lambda_max_abs,
-            null_cutoff,
-        })
+    /// Eigendecomposition of the metric-whitened penalized Hessian, retained so
+    /// every trust-radius shrink within one Newton cycle re-solves the
+    /// trust-region subproblem from the SAME `O(p³)` factorization at `O(p)` cost.
+    ///
+    /// # Why this exists (gam#979)
+    ///
+    /// The coupled marginal↔logslope inner Newton needs ONE globalization, not a
+    /// stack of approximations. Historically the joint step was a *modified-Newton*
+    /// (reflect indefinite eigenvalues to `|λ|`) wrapped in a *heuristically gated*
+    /// multiplicative Marquardt damping (engaged on `nullity>0`, or condition number
+    /// over a threshold, or after N non-improving cycles) and then a *dogleg* between
+    /// that step and the Cauchy point, truncated to per-block step-norm trust radii.
+    /// Each piece approximates a different facet of the one exact object below, and
+    /// each had to be gated so it would not re-break the case another piece was added
+    /// for (#826 vs #808 vs #733/#734 vs #787). When none of the gates matched the
+    /// operating point — well-conditioned `H_pen`, yet a coupled near-aliased
+    /// direction with a huge raw Newton component — the truncated direction made only
+    /// Cauchy-sized progress, the gain ratio never justified growing the radius, and
+    /// the residual crawled for hundreds of cycles (the #979 "phantom multiplier"
+    /// grind / survival hang).
+    ///
+    /// [`Self::trust_region_step`] replaces all of that with the *exact* solution of
+    /// the trust-region subproblem
+    ///   minimize  `−rhsᵀδ + ½ δᵀ H_pen δ`   subject to  `‖δ‖_D ≤ r`,
+    /// via the Moré–Sorensen characterization: the minimizer is `δ(λ) = (H_pen +
+    /// λD)⁻¹ rhs` for the unique `λ ≥ max(0, −γ_min)` with `‖δ(λ)‖_D = r` (or `λ = 0`
+    /// when the Newton step is interior and `H_pen ≻ 0`). Working in the `D`-metric
+    /// generalized eigenbasis this is a scalar secular equation in `λ`, solved by a
+    /// safeguarded Newton iteration on the already-computed spectrum. Properties that
+    /// make it the right object:
+    ///   * indefiniteness is handled exactly (`λ ≥ −γ_min` makes `H_pen+λD ⪰ 0` on
+    ///     the boundary — no reflection heuristic, no negative-curvature special case
+    ///     other than the rigorous hard case);
+    ///   * the damping `λ` is determined by the trust radius, not by nullity /
+    ///     condition / stall gates — those gates disappear;
+    ///   * it self-vanishes: at the KKT fixed point `rhs → 0 ⇒ δ → 0`, and once the
+    ///     iterate is in a region where `H_pen ≻ 0` the Newton step goes interior so
+    ///     `λ = 0` and convergence is quadratic — the converged β, the KKT
+    ///     certificate, and the REML/LAML the residual feeds are byte-identical to an
+    ///     undamped exact-Newton solve;
+    ///   * it is affine covariant in the `D` metric, so blocks at wildly different
+    ///     curvature scales (the penalty `λ ~ e²⁴` modes vs the `XᵀWX` likelihood
+    ///     modes at an oversmoothed seed) are damped uniformly by `1/(γ_k+λ)` — the
+    ///     scale-invariance the per-block radii and the multiplicative-Marquardt form
+    ///     were each hand-built to approximate.
+    ///
+    /// The genuine penalty null space (`|γ_k| ≤ null_cutoff`) is still projected out
+    /// (the gam#553 Moore–Penrose range restriction): an unidentified gauge direction
+    /// carries no finite Newton step and is left unchanged, its stationarity-residual
+    /// component reported via [`JointSpectralNewtonStep::null_rhs_inf`].
+    pub(super) struct WhitenedHessianSpectrum {
+        /// Generalized eigenvalues `γ_k` of `(H_pen, D)` = eigenvalues of the
+        /// whitened matrix `A = D^{-1/2} H_pen D^{-1/2}`.
+        gamma: Array1<f64>,
+        /// Whitened eigenvectors `v_k` (columns) of `A`.
+        evecs: Array2<f64>,
+        /// rhs in the whitened eigenbasis: `c_k = v_kᵀ D^{-1/2} rhs`.
+        c: Array1<f64>,
+        /// `D^{-1/2}` diagonal, mapping a whitened step `η` back to `δ = D^{-1/2} η`.
+        d_inv_sqrt: Array1<f64>,
+        /// `max_k |γ_k|` (the curvature scale; `D`-whitened).
+        lambda_max_abs: f64,
+        /// Curvature magnitude at/below which a direction is treated as genuinely
+        /// unidentified (penalty null space) and dropped from the step.
+        null_cutoff: f64,
     }
 
-    /// `‖η(λ)‖²_2 = Σ_{identified k} c_k² / (γ_k + λ)²` — the squared `D`-metric
-    /// norm of the trial step as a function of the Levenberg shift `λ`. Only
-    /// identified (above-`null_cutoff`) modes participate; the null space carries
-    /// no step.
-    fn step_norm_sq(&self, lambda: f64) -> f64 {
-        let mut acc = 0.0;
-        for k in 0..self.gamma.len() {
-            if self.gamma[k].abs() <= self.null_cutoff {
-                continue;
+    impl WhitenedHessianSpectrum {
+        /// Eigendecompose the `D`-whitened penalized Hessian once. `metric_diag`
+        /// supplies the positive trust-region metric `D` (each entry is passed
+        /// through [`positive_joint_diagonal_entry`] so a non-positive curvature
+        /// estimate becomes a safe positive scale). `rank_tol` is the relative
+        /// near-singularity cutoff; the genuine numerical-rank floor is derived from
+        /// the whitened spectrum exactly as the legacy spectral solve did.
+        pub(super) fn decompose(
+            h_pen: &Array2<f64>,
+            rhs: &Array1<f64>,
+            metric_diag: &Array1<f64>,
+            rank_tol: f64,
+        ) -> Result<Self, String> {
+            let p = h_pen.nrows();
+            if h_pen.ncols() != p || rhs.len() != p || metric_diag.len() != p {
+                return Err(format!(
+                    "whitened trust-region decomposition dimension mismatch: H={}x{}, rhs={}, metric={}",
+                    h_pen.nrows(),
+                    h_pen.ncols(),
+                    rhs.len(),
+                    metric_diag.len()
+                ));
             }
-            let denom = self.gamma[k] + lambda;
-            if denom.abs() <= f64::MIN_POSITIVE {
-                return f64::INFINITY;
-            }
-            let t = self.c[k] / denom;
-            acc += t * t;
-        }
-        acc
-    }
-
-    /// Assemble the whitened step `η(λ) = Σ c_k/(γ_k+λ) v_k` over identified
-    /// modes and map it back to `δ = D^{-1/2} η`. Returns `(δ, range_rhs_inf,
-    /// null_rhs_inf, nullity, lambda_min_positive, reflected_negative_modes,
-    /// most_negative)` diagnostics consistent with the legacy spectral step.
-    fn assemble(&self, lambda: f64, extra_min_mode: Option<(usize, f64)>) -> JointSpectralNewtonStep {
-        let p = self.gamma.len();
-        let mut eta = Array1::<f64>::zeros(p);
-        let mut range_rhs_inf = 0.0_f64;
-        let mut null_rhs_inf = 0.0_f64;
-        let mut lambda_min_positive = f64::INFINITY;
-        let mut nullity = 0usize;
-        let mut reflected_negative_modes = 0usize;
-        let mut most_negative = 0.0_f64;
-        for k in 0..p {
-            let g = self.gamma[k];
-            if g.abs() <= self.null_cutoff {
-                nullity += 1;
-                null_rhs_inf = null_rhs_inf.max(self.c[k].abs());
-                continue;
-            }
-            range_rhs_inf = range_rhs_inf.max(self.c[k].abs());
-            if g < 0.0 {
-                reflected_negative_modes += 1;
-                most_negative = most_negative.min(g);
-            } else {
-                lambda_min_positive = lambda_min_positive.min(g);
-            }
-            let denom = g + lambda;
-            if denom.abs() > f64::MIN_POSITIVE {
-                let coeff = self.c[k] / denom;
-                for i in 0..p {
-                    eta[i] += coeff * self.evecs[[i, k]];
-                }
-            }
-        }
-        // Hard case: add τ·v_min along a minimal-curvature eigenvector to reach
-        // the trust boundary when rhs has no component there.
-        if let Some((k_min, tau)) = extra_min_mode {
+            let d_inv_sqrt = Array1::from_iter(
+                metric_diag
+                    .iter()
+                    .map(|w| 1.0 / positive_joint_diagonal_entry(*w).sqrt()),
+            );
+            // A = D^{-1/2} H D^{-1/2}; symmetric since H is symmetric and D diagonal.
+            let mut a = Array2::<f64>::zeros((p, p));
             for i in 0..p {
-                eta[i] += tau * self.evecs[[i, k_min]];
-            }
-        }
-        // δ = D^{-1/2} η.
-        let delta = &self.d_inv_sqrt * &eta;
-        JointSpectralNewtonStep {
-            delta,
-            range_rhs_inf,
-            null_rhs_inf,
-            lambda_max_abs: self.lambda_max_abs,
-            lambda_min_positive,
-            nullity,
-            rank_tol: KKT_REFUSAL_RANK_TOL,
-            reflected_negative_modes,
-            most_negative_eigenvalue: most_negative,
-        }
-    }
-
-    /// Exact solution of the trust-region subproblem inside the `D`-metric ball
-    /// of radius `trust_radius`. When `trust_radius` is non-finite or `≤ 0` the
-    /// unconstrained (Moore–Penrose, range-restricted) Newton step is returned —
-    /// i.e. the caller opted out of the trust region.
-    pub(super) fn trust_region_step(&self, trust_radius: f64) -> JointSpectralNewtonStep {
-        // Smallest identified curvature (signed). Empty identified set ⇒ pure
-        // null space ⇒ zero step.
-        let mut gamma_min_id = f64::INFINITY;
-        let mut any_identified = false;
-        for k in 0..self.gamma.len() {
-            if self.gamma[k].abs() <= self.null_cutoff {
-                continue;
-            }
-            any_identified = true;
-            gamma_min_id = gamma_min_id.min(self.gamma[k]);
-        }
-        if !any_identified {
-            return self.assemble(0.0, None);
-        }
-
-        let unconstrained_radius = !(trust_radius.is_finite() && trust_radius > 0.0);
-        // Interior Newton step is admissible only when the model is convex on the
-        // identified range (γ_min > 0); then λ = 0 gives the exact Newton step.
-        if gamma_min_id > 0.0 {
-            let newton_norm = self.step_norm_sq(0.0).sqrt();
-            if unconstrained_radius || newton_norm <= trust_radius {
-                return self.assemble(0.0, None);
-            }
-        } else if unconstrained_radius {
-            // No trust region but an indefinite/semidefinite model: the
-            // unconstrained problem is unbounded below. Fall back to the
-            // reflected modified-Newton step (|γ| curvature) so the caller still
-            // receives a finite descent direction; the downstream accept/reject
-            // validates it. This path is only hit when a caller explicitly
-            // disables the trust region on an indefinite model.
-            return self.assemble_reflected();
-        }
-
-        // Boundary solution: find λ ≥ λ_lo with ‖η(λ)‖ = trust_radius.
-        let lambda_lo = (-gamma_min_id).max(0.0);
-        // Hard case detection: is rhs orthogonal to the minimal-curvature
-        // eigenspace? If so ‖η(λ_lo)‖ is finite and may be below the radius.
-        let min_mode_tol = self.null_cutoff.max(self.lambda_max_abs * 1e-12);
-        let mut hard_case_component_sq = 0.0;
-        let mut k_min_witness = None;
-        for k in 0..self.gamma.len() {
-            if self.gamma[k].abs() <= self.null_cutoff {
-                continue;
-            }
-            if (self.gamma[k] - gamma_min_id).abs() <= min_mode_tol {
-                hard_case_component_sq += self.c[k] * self.c[k];
-                k_min_witness = Some(k);
-            }
-        }
-        // Evaluate the norm just above the pole. With a real rhs component at the
-        // minimal mode the norm diverges at λ_lo, so the secular root is interior
-        // to (λ_lo, ∞) and a small relative offset brackets it. With no such
-        // component (hard case) the norm at λ_lo is finite.
-        let lambda_lo_eval = lambda_lo + self.lambda_max_abs.max(1.0) * 1e-12;
-        if hard_case_component_sq <= (self.lambda_max_abs.max(1.0) * 1e-12).powi(2) {
-            let norm_at_lo = self.step_norm_sq(lambda_lo_eval).sqrt();
-            if norm_at_lo < trust_radius {
-                // Hard case: λ = λ_lo, then add τ·v_min to reach the boundary.
-                if let Some(k_min) = k_min_witness {
-                    let deficit = (trust_radius * trust_radius - norm_at_lo * norm_at_lo).max(0.0);
-                    let tau = deficit.sqrt();
-                    return self.assemble(lambda_lo, Some((k_min, tau)));
+                for j in 0..p {
+                    a[[i, j]] = h_pen[[i, j]] * d_inv_sqrt[i] * d_inv_sqrt[j];
                 }
-                return self.assemble(lambda_lo, None);
             }
+            symmetrize_dense_in_place(&mut a);
+            let (gamma, evecs) = FaerEigh::eigh(&a, Side::Lower)
+                .map_err(|e| format!("whitened trust-region eigendecomposition failed: {e}"))?;
+            // c = Vᵀ (D^{-1/2} rhs).
+            let whitened_rhs = &d_inv_sqrt * rhs;
+            let c = evecs.t().dot(&whitened_rhs);
+            let lambda_max_abs = gamma.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
+            let cutoff = rank_tol * lambda_max_abs;
+            let null_cutoff = cutoff.min(numerical_floor);
+            Ok(Self {
+                gamma,
+                evecs,
+                c,
+                d_inv_sqrt,
+                lambda_max_abs,
+                null_cutoff,
+            })
         }
-        // Safeguarded Newton on φ(λ) = 1/‖η(λ)‖ − 1/r (well-behaved, ~linear),
-        // bracketed in [lo, hi]. φ is increasing in λ (‖η‖ decreasing), φ(lo)<0,
-        // and we grow hi until φ(hi)>0.
-        let target = trust_radius;
-        let mut lo = lambda_lo_eval;
-        let mut hi = lambda_lo_eval.max(self.lambda_max_abs).max(1.0);
-        let mut grow_guard = 0;
-        while self.step_norm_sq(hi).sqrt() > target && grow_guard < 200 {
-            hi *= 2.0;
-            grow_guard += 1;
-        }
-        let mut lambda = 0.5 * (lo + hi);
-        for _ in 0..100 {
-            let q = self.step_norm_sq(lambda);
-            let norm = q.sqrt();
-            if !norm.is_finite() {
-                lo = lambda;
-                lambda = 0.5 * (lo + hi);
-                continue;
-            }
-            // Maintain the bracket on φ(λ) = 1/norm − 1/target.
-            if norm > target {
-                lo = lambda;
-            } else {
-                hi = lambda;
-            }
-            let phi = 1.0 / norm - 1.0 / target;
-            if phi.abs() <= 1e-12 / target {
-                break;
-            }
-            // q'(λ) = -2 Σ c_k²/(γ_k+λ)³ ⇒ d/dλ (1/norm) = -½ q^{-3/2} q'.
-            let mut q_prime = 0.0;
+
+        /// `‖η(λ)‖²_2 = Σ_{identified k} c_k² / (γ_k + λ)²` — the squared `D`-metric
+        /// norm of the trial step as a function of the Levenberg shift `λ`. Only
+        /// identified (above-`null_cutoff`) modes participate; the null space carries
+        /// no step.
+        fn step_norm_sq(&self, lambda: f64) -> f64 {
+            let mut acc = 0.0;
             for k in 0..self.gamma.len() {
                 if self.gamma[k].abs() <= self.null_cutoff {
                     continue;
                 }
                 let denom = self.gamma[k] + lambda;
                 if denom.abs() <= f64::MIN_POSITIVE {
+                    return f64::INFINITY;
+                }
+                let t = self.c[k] / denom;
+                acc += t * t;
+            }
+            acc
+        }
+
+        /// Assemble the whitened step `η(λ) = Σ c_k/(γ_k+λ) v_k` over identified
+        /// modes and map it back to `δ = D^{-1/2} η`. Returns `(δ, range_rhs_inf,
+        /// null_rhs_inf, nullity, lambda_min_positive, reflected_negative_modes,
+        /// most_negative)` diagnostics consistent with the legacy spectral step.
+        fn assemble(
+            &self,
+            lambda: f64,
+            extra_min_mode: Option<(usize, f64)>,
+        ) -> JointSpectralNewtonStep {
+            let p = self.gamma.len();
+            let mut eta = Array1::<f64>::zeros(p);
+            let mut range_rhs_inf = 0.0_f64;
+            let mut null_rhs_inf = 0.0_f64;
+            let mut lambda_min_positive = f64::INFINITY;
+            let mut nullity = 0usize;
+            let mut reflected_negative_modes = 0usize;
+            let mut most_negative = 0.0_f64;
+            for k in 0..p {
+                let g = self.gamma[k];
+                if g.abs() <= self.null_cutoff {
+                    nullity += 1;
+                    null_rhs_inf = null_rhs_inf.max(self.c[k].abs());
                     continue;
                 }
-                q_prime += -2.0 * self.c[k] * self.c[k] / (denom * denom * denom);
+                range_rhs_inf = range_rhs_inf.max(self.c[k].abs());
+                if g < 0.0 {
+                    reflected_negative_modes += 1;
+                    most_negative = most_negative.min(g);
+                } else {
+                    lambda_min_positive = lambda_min_positive.min(g);
+                }
+                let denom = g + lambda;
+                if denom.abs() > f64::MIN_POSITIVE {
+                    let coeff = self.c[k] / denom;
+                    for i in 0..p {
+                        eta[i] += coeff * self.evecs[[i, k]];
+                    }
+                }
             }
-            let phi_prime = -0.5 * q.powf(-1.5) * q_prime;
-            let next = if phi_prime.abs() > f64::MIN_POSITIVE {
-                lambda - phi / phi_prime
-            } else {
-                0.5 * (lo + hi)
-            };
-            // Safeguard into the bracket.
-            lambda = if next.is_finite() && next > lo && next < hi {
-                next
-            } else {
-                0.5 * (lo + hi)
-            };
-            if (hi - lo) <= 1e-14 * (1.0 + hi.abs()) {
-                break;
+            // Hard case: add τ·v_min along a minimal-curvature eigenvector to reach
+            // the trust boundary when rhs has no component there.
+            if let Some((k_min, tau)) = extra_min_mode {
+                for i in 0..p {
+                    eta[i] += tau * self.evecs[[i, k_min]];
+                }
+            }
+            // δ = D^{-1/2} η.
+            let delta = &self.d_inv_sqrt * &eta;
+            JointSpectralNewtonStep {
+                delta,
+                range_rhs_inf,
+                null_rhs_inf,
+                lambda_max_abs: self.lambda_max_abs,
+                lambda_min_positive,
+                nullity,
+                rank_tol: KKT_REFUSAL_RANK_TOL,
+                reflected_negative_modes,
+                most_negative_eigenvalue: most_negative,
             }
         }
-        self.assemble(lambda, None)
-    }
 
-    /// Reflected modified-Newton step (`|γ_k|` curvature, no trust region). Only
-    /// used when a caller disables the trust region on an indefinite model — the
-    /// trust-region path proper never reflects.
-    fn assemble_reflected(&self) -> JointSpectralNewtonStep {
-        let p = self.gamma.len();
-        let mut eta = Array1::<f64>::zeros(p);
-        let mut range_rhs_inf = 0.0_f64;
-        let mut null_rhs_inf = 0.0_f64;
-        let mut lambda_min_positive = f64::INFINITY;
-        let mut nullity = 0usize;
-        let mut reflected_negative_modes = 0usize;
-        let mut most_negative = 0.0_f64;
-        for k in 0..p {
-            let g = self.gamma[k];
-            if g.abs() <= self.null_cutoff {
-                nullity += 1;
-                null_rhs_inf = null_rhs_inf.max(self.c[k].abs());
-                continue;
+        /// Exact solution of the trust-region subproblem inside the `D`-metric ball
+        /// of radius `trust_radius`. When `trust_radius` is non-finite or `≤ 0` the
+        /// unconstrained (Moore–Penrose, range-restricted) Newton step is returned —
+        /// i.e. the caller opted out of the trust region.
+        pub(super) fn trust_region_step(&self, trust_radius: f64) -> JointSpectralNewtonStep {
+            // Smallest identified curvature (signed). Empty identified set ⇒ pure
+            // null space ⇒ zero step.
+            let mut gamma_min_id = f64::INFINITY;
+            let mut any_identified = false;
+            for k in 0..self.gamma.len() {
+                if self.gamma[k].abs() <= self.null_cutoff {
+                    continue;
+                }
+                any_identified = true;
+                gamma_min_id = gamma_min_id.min(self.gamma[k]);
             }
-            range_rhs_inf = range_rhs_inf.max(self.c[k].abs());
-            let curvature = if g < 0.0 {
-                reflected_negative_modes += 1;
-                most_negative = most_negative.min(g);
-                g.abs()
-            } else {
-                lambda_min_positive = lambda_min_positive.min(g);
-                g
-            };
-            let coeff = self.c[k] / curvature;
-            for i in 0..p {
-                eta[i] += coeff * self.evecs[[i, k]];
+            if !any_identified {
+                return self.assemble(0.0, None);
             }
+
+            let unconstrained_radius = !(trust_radius.is_finite() && trust_radius > 0.0);
+            // Interior Newton step is admissible only when the model is convex on the
+            // identified range (γ_min > 0); then λ = 0 gives the exact Newton step.
+            if gamma_min_id > 0.0 {
+                let newton_norm = self.step_norm_sq(0.0).sqrt();
+                if unconstrained_radius || newton_norm <= trust_radius {
+                    return self.assemble(0.0, None);
+                }
+            } else if unconstrained_radius {
+                // No trust region but an indefinite/semidefinite model: the
+                // unconstrained problem is unbounded below. Fall back to the
+                // reflected modified-Newton step (|γ| curvature) so the caller still
+                // receives a finite descent direction; the downstream accept/reject
+                // validates it. This path is only hit when a caller explicitly
+                // disables the trust region on an indefinite model.
+                return self.assemble_reflected();
+            }
+
+            // Boundary solution: find λ ≥ λ_lo with ‖η(λ)‖ = trust_radius.
+            let lambda_lo = (-gamma_min_id).max(0.0);
+            // Hard case detection: is rhs orthogonal to the minimal-curvature
+            // eigenspace? If so ‖η(λ_lo)‖ is finite and may be below the radius.
+            let min_mode_tol = self.null_cutoff.max(self.lambda_max_abs * 1e-12);
+            let mut hard_case_component_sq = 0.0;
+            let mut k_min_witness = None;
+            for k in 0..self.gamma.len() {
+                if self.gamma[k].abs() <= self.null_cutoff {
+                    continue;
+                }
+                if (self.gamma[k] - gamma_min_id).abs() <= min_mode_tol {
+                    hard_case_component_sq += self.c[k] * self.c[k];
+                    k_min_witness = Some(k);
+                }
+            }
+            // Evaluate the norm just above the pole. With a real rhs component at the
+            // minimal mode the norm diverges at λ_lo, so the secular root is interior
+            // to (λ_lo, ∞) and a small relative offset brackets it. With no such
+            // component (hard case) the norm at λ_lo is finite.
+            let lambda_lo_eval = lambda_lo + self.lambda_max_abs.max(1.0) * 1e-12;
+            if hard_case_component_sq <= (self.lambda_max_abs.max(1.0) * 1e-12).powi(2) {
+                let norm_at_lo = self.step_norm_sq(lambda_lo_eval).sqrt();
+                if norm_at_lo < trust_radius {
+                    // Hard case: λ = λ_lo, then add τ·v_min to reach the boundary.
+                    if let Some(k_min) = k_min_witness {
+                        let deficit =
+                            (trust_radius * trust_radius - norm_at_lo * norm_at_lo).max(0.0);
+                        let tau = deficit.sqrt();
+                        return self.assemble(lambda_lo, Some((k_min, tau)));
+                    }
+                    return self.assemble(lambda_lo, None);
+                }
+            }
+            // Safeguarded Newton on φ(λ) = 1/‖η(λ)‖ − 1/r (well-behaved, ~linear),
+            // bracketed in [lo, hi]. φ is increasing in λ (‖η‖ decreasing), φ(lo)<0,
+            // and we grow hi until φ(hi)>0.
+            let target = trust_radius;
+            let mut lo = lambda_lo_eval;
+            let mut hi = lambda_lo_eval.max(self.lambda_max_abs).max(1.0);
+            let mut grow_guard = 0;
+            while self.step_norm_sq(hi).sqrt() > target && grow_guard < 200 {
+                hi *= 2.0;
+                grow_guard += 1;
+            }
+            let mut lambda = 0.5 * (lo + hi);
+            for _ in 0..100 {
+                let q = self.step_norm_sq(lambda);
+                let norm = q.sqrt();
+                if !norm.is_finite() {
+                    lo = lambda;
+                    lambda = 0.5 * (lo + hi);
+                    continue;
+                }
+                // Maintain the bracket on φ(λ) = 1/norm − 1/target.
+                if norm > target {
+                    lo = lambda;
+                } else {
+                    hi = lambda;
+                }
+                let phi = 1.0 / norm - 1.0 / target;
+                if phi.abs() <= 1e-12 / target {
+                    break;
+                }
+                // q'(λ) = -2 Σ c_k²/(γ_k+λ)³ ⇒ d/dλ (1/norm) = -½ q^{-3/2} q'.
+                let mut q_prime = 0.0;
+                for k in 0..self.gamma.len() {
+                    if self.gamma[k].abs() <= self.null_cutoff {
+                        continue;
+                    }
+                    let denom = self.gamma[k] + lambda;
+                    if denom.abs() <= f64::MIN_POSITIVE {
+                        continue;
+                    }
+                    q_prime += -2.0 * self.c[k] * self.c[k] / (denom * denom * denom);
+                }
+                let phi_prime = -0.5 * q.powf(-1.5) * q_prime;
+                let next = if phi_prime.abs() > f64::MIN_POSITIVE {
+                    lambda - phi / phi_prime
+                } else {
+                    0.5 * (lo + hi)
+                };
+                // Safeguard into the bracket.
+                lambda = if next.is_finite() && next > lo && next < hi {
+                    next
+                } else {
+                    0.5 * (lo + hi)
+                };
+                if (hi - lo) <= 1e-14 * (1.0 + hi.abs()) {
+                    break;
+                }
+            }
+            self.assemble(lambda, None)
         }
-        let delta = &self.d_inv_sqrt * &eta;
-        JointSpectralNewtonStep {
-            delta,
-            range_rhs_inf,
-            null_rhs_inf,
-            lambda_max_abs: self.lambda_max_abs,
-            lambda_min_positive,
-            nullity,
-            rank_tol: KKT_REFUSAL_RANK_TOL,
-            reflected_negative_modes,
-            most_negative_eigenvalue: most_negative,
+
+        /// Reflected modified-Newton step (`|γ_k|` curvature, no trust region). Only
+        /// used when a caller disables the trust region on an indefinite model — the
+        /// trust-region path proper never reflects.
+        fn assemble_reflected(&self) -> JointSpectralNewtonStep {
+            let p = self.gamma.len();
+            let mut eta = Array1::<f64>::zeros(p);
+            let mut range_rhs_inf = 0.0_f64;
+            let mut null_rhs_inf = 0.0_f64;
+            let mut lambda_min_positive = f64::INFINITY;
+            let mut nullity = 0usize;
+            let mut reflected_negative_modes = 0usize;
+            let mut most_negative = 0.0_f64;
+            for k in 0..p {
+                let g = self.gamma[k];
+                if g.abs() <= self.null_cutoff {
+                    nullity += 1;
+                    null_rhs_inf = null_rhs_inf.max(self.c[k].abs());
+                    continue;
+                }
+                range_rhs_inf = range_rhs_inf.max(self.c[k].abs());
+                let curvature = if g < 0.0 {
+                    reflected_negative_modes += 1;
+                    most_negative = most_negative.min(g);
+                    g.abs()
+                } else {
+                    lambda_min_positive = lambda_min_positive.min(g);
+                    g
+                };
+                let coeff = self.c[k] / curvature;
+                for i in 0..p {
+                    eta[i] += coeff * self.evecs[[i, k]];
+                }
+            }
+            let delta = &self.d_inv_sqrt * &eta;
+            JointSpectralNewtonStep {
+                delta,
+                range_rhs_inf,
+                null_rhs_inf,
+                lambda_max_abs: self.lambda_max_abs,
+                lambda_min_positive,
+                nullity,
+                rank_tol: KKT_REFUSAL_RANK_TOL,
+                reflected_negative_modes,
+                most_negative_eigenvalue: most_negative,
+            }
         }
     }
-}
 }
 
 #[cfg(test)]
 mod trust_region_subproblem_tests {
-    use super::*;
     use super::whitened_spectrum_tests::WhitenedHessianSpectrum;
+    use super::*;
     use ndarray::array;
 
     fn metric_norm(delta: &Array1<f64>, d: &Array1<f64>) -> f64 {

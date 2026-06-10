@@ -264,7 +264,10 @@ mod tests {
             .map(|_| weight)
             .sum();
         let rel_err = (sub_sum - full_sum).abs() / full_sum;
-        assert!(rel_err < 0.02, "weighted subsample {sub_sum} vs full {full_sum}");
+        assert!(
+            rel_err < 0.02,
+            "weighted subsample {sub_sum} vs full {full_sum}"
+        );
     }
 
     #[test]

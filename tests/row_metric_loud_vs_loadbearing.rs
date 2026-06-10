@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use gam::inference::atom_lens::{atom_two_lens, AtomTwoLensReport};
+use gam::inference::atom_lens::{AtomTwoLensReport, atom_two_lens};
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::terms::sae_manifold::{
     AssignmentMode, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldTerm,
@@ -142,7 +142,10 @@ fn output_fisher_metric() -> RowMetric {
 }
 
 /// Locate an atom's entry by name.
-fn entry<'a>(report: &'a AtomTwoLensReport, name: &str) -> &'a gam::inference::atom_lens::AtomLensEntry {
+fn entry<'a>(
+    report: &'a AtomTwoLensReport,
+    name: &str,
+) -> &'a gam::inference::atom_lens::AtomLensEntry {
     report
         .atoms
         .iter()
@@ -161,7 +164,10 @@ fn lens_flags_loud_represented_not_used_and_quiet_used() {
     // loud structure is NOT suppressed.
     let euclid = RowMetric::euclidean(N, P).expect("Euclidean metric must build");
     let euclid_report = atom_two_lens(&term, &euclid);
-    assert_eq!(euclid_report.coupling_provenance, Some(MetricProvenance::Euclidean));
+    assert_eq!(
+        euclid_report.coupling_provenance,
+        Some(MetricProvenance::Euclidean)
+    );
     assert!(
         !euclid_report.coupling_available(),
         "Euclidean provenance carries no behavioral coupling axis"
@@ -203,8 +209,12 @@ fn lens_flags_loud_represented_not_used_and_quiet_used() {
     let loud = entry(&report, "loud_inert");
     let quiet = entry(&report, "quiet_loadbearing");
 
-    let loud_coupling = loud.coupling.expect("loud coupling available under OutputFisher");
-    let quiet_coupling = quiet.coupling.expect("quiet coupling available under OutputFisher");
+    let loud_coupling = loud
+        .coupling
+        .expect("loud coupling available under OutputFisher");
+    let quiet_coupling = quiet
+        .coupling
+        .expect("quiet coupling available under OutputFisher");
     let loud_cn = loud
         .coupling_normalized
         .expect("loud normalized coupling available");
@@ -212,10 +222,14 @@ fn lens_flags_loud_represented_not_used_and_quiet_used() {
         .coupling_normalized
         .expect("quiet normalized coupling available");
 
-    println!("LOUD : presence={:.6} (norm {:.4})  coupling={:.6} (norm {:.4})  discrepancy={:?}",
-        loud.presence, loud.presence_normalized, loud_coupling, loud_cn, loud.discrepancy);
-    println!("QUIET: presence={:.6} (norm {:.4})  coupling={:.6} (norm {:.4})  discrepancy={:?}",
-        quiet.presence, quiet.presence_normalized, quiet_coupling, quiet_cn, quiet.discrepancy);
+    println!(
+        "LOUD : presence={:.6} (norm {:.4})  coupling={:.6} (norm {:.4})  discrepancy={:?}",
+        loud.presence, loud.presence_normalized, loud_coupling, loud_cn, loud.discrepancy
+    );
+    println!(
+        "QUIET: presence={:.6} (norm {:.4})  coupling={:.6} (norm {:.4})  discrepancy={:?}",
+        quiet.presence, quiet.presence_normalized, quiet_coupling, quiet_cn, quiet.discrepancy
+    );
 
     // PRESENCE is unchanged by the metric (it never touches Fisher): both still
     // present, loud still louder. *Everything represented survives* — the loud

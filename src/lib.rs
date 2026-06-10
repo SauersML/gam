@@ -114,12 +114,12 @@ pub use solver::estimate::reml::unified::PenaltySubspaceTrace;
 // arrow-border overlap drive `run_per_atom_efs` directly with an explicit
 // `SharedBorderTopology` (`new` for a named border set, `disjoint` /
 // `fully_coupled` for the two extremes).
-pub use solver::estimate::reml::per_atom_efs::{
-    PerAtomEfsConfig, SharedBorderTopology, run_per_atom_efs,
-};
 pub use resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
+};
+pub use solver::estimate::reml::per_atom_efs::{
+    PerAtomEfsConfig, SharedBorderTopology, run_per_atom_efs,
 };
 pub use solver::{
     estimate, gaussian_reml, mixture_link, pirls, seeding, topology_selector, visualizer,
