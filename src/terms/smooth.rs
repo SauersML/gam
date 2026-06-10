@@ -655,11 +655,10 @@ pub struct FactorSmoothSpec {
     pub marginal: BSplineBasisSpec,
     pub flavour: FactorSmoothFlavour,
     pub group_frozen_levels: Option<Vec<u64>>,
-    /// Fit-time global-orthogonality chart for this term (`s(x) + fs(x, g)`
-    /// overlap residualization, #978). Unlike the per-marginal `sz` case this
-    /// stores the FULL realized raw→coefficient transform (any joint-null `Q`
-    /// composed with the overlap `Z`), because the `fs` raw rebuild applies no
-    /// rotation of its own at predict time. Training-row dependent, hence
+    /// Fit-time global-orthogonality chart `Z` for this term (`s(x) + fs(x, g)`
+    /// overlap residualization, #978), in the post-joint-null-`Q` coordinates
+    /// (the raw rebuild recomputes any `Q` itself; `fs` penalties are
+    /// typically full-rank so `Q` is absent). Training-row dependent, hence
     /// persisted; replayed verbatim by `apply_global_smooth_identifiability`.
     #[serde(default)]
     pub frozen_global_orthogonality: Option<Array2<f64>>,
@@ -8531,6 +8530,7 @@ fn apply_global_smooth_identifiability(
     let mut local_metadata = vec![None; smooth.terms.len()];
     let mut local_dims = vec![0usize; smooth.terms.len()];
     let mut local_linear_constraints = vec![None; smooth.terms.len()];
+    let mut local_unabsorbed_z = vec![None::<Array2<f64>>; smooth.terms.len()];
 
     let SmoothStructureAnalysis {
         ownership_order,
@@ -8621,7 +8621,17 @@ fn apply_global_smooth_identifiability(
                     &owner_blocks,
                 )?)
             };
-        let z_opt = if skip_global_transform {
+        let z_opt = if let Some(z) = replay_z {
+            if design_local.ncols() != z.nrows() {
+                crate::bail_dim_basis!(
+                    "frozen global-orthogonality transform mismatch for term '{}': rebuilt design has {} columns but the persisted fit-time transform has {} rows",
+                    term.name,
+                    design_local.ncols(),
+                    z.nrows()
+                );
+            }
+            Some(z.clone())
+        } else if skip_global_transform {
             None
         } else {
             match maybe_smooth_identifiability_transform(
@@ -8732,27 +8742,42 @@ fn apply_global_smooth_identifiability(
             (None, Some(z)) => Some(z.clone()),
             (None, None) => None,
         };
-        // Block-replicated factor smooths (`bs="sz"` → `FactorSumToZero`) carry a
-        // PER-MARGINAL metadata (predict rebuilds the single inner marginal then
-        // re-stacks the `L-1` sum-to-zero deviation blocks). Their realized
-        // transform — the joint-null absorption rotation `Q` (and any global
-        // orthogonality `Z`) — lives in the FULL `p·(L-1)`-column design space, so
-        // it cannot be folded into the per-marginal metadata (the dimensions don't
-        // compose: `existing pxr` vs `extra (p·(L-1))x(p·(L-1))`). The raw design
-        // builder already applies `Q` to the re-stacked design and recomputes it
-        // deterministically from the (frozen) penalties at predict time, so the
-        // per-marginal metadata must be left untouched here; folding it in both
-        // crashed basis generation and would double-count `Q` on rebuild (#700).
-        let metadata_is_per_marginal_block =
-            matches!(termspec.basis, SmoothBasisSpec::FactorSumToZero { .. });
-        local_metadata[idx] = if metadata_is_per_marginal_block {
-            Some(term.metadata.clone())
-        } else {
-            Some(with_identifiability_transform(
-                &term.metadata,
-                realized_transform.as_ref(),
-            )?)
-        };
+        // Factor-smooth kinds cannot absorb the realized transform into their
+        // metadata, so it is exported on the term instead and persisted onto
+        // the spec by `freeze_term_collection_from_design` (#978):
+        //
+        // - Block-replicated factor smooths (`bs="sz"` → `FactorSumToZero`)
+        //   carry PER-MARGINAL metadata (predict rebuilds the single inner
+        //   marginal then re-stacks the `L-1` sum-to-zero deviation blocks).
+        //   The realized transform lives in the FULL `p·(L-1)`-column design
+        //   space, so it cannot be folded into the per-marginal metadata (the
+        //   dimensions don't compose; folding it in both crashed basis
+        //   generation and would double-count `Q` on rebuild, #700). The raw
+        //   design builder reapplies `Q` deterministically at predict time, so
+        //   only the global-orthogonality `Z` (post-`Q` chart) is exported.
+        //
+        // - `FactorSmooth` (`fs`/`re`) metadata has no transform slot at all
+        //   (its `with_identifiability_transform` arm rejects one). Like `sz`,
+        //   any stage-2 joint-null `Q` is recomputed by the raw builder on
+        //   rebuild (and is typically absent: `fs` penalties are full-rank),
+        //   so the exported chart is likewise the post-`Q` `Z` alone.
+        //
+        // Without this export the overlap residualization of
+        // `s(x) + s(g, x, bs=sz)` / `s(x) + fs(x, g)` was silently dropped:
+        // the fit used the narrowed `X·Z` design while every predict rebuilt
+        // the full-width design, making the model unpredictable (#978).
+        match &termspec.basis {
+            SmoothBasisSpec::FactorSumToZero { .. } | SmoothBasisSpec::FactorSmooth { .. } => {
+                local_metadata[idx] = Some(term.metadata.clone());
+                local_unabsorbed_z[idx] = z_opt.clone();
+            }
+            _ => {
+                local_metadata[idx] = Some(with_identifiability_transform(
+                    &term.metadata,
+                    realized_transform.as_ref(),
+                )?);
+            }
+        }
     }
 
     let total_p: usize = local_dims.iter().sum();
@@ -8826,6 +8851,9 @@ fn apply_global_smooth_identifiability(
             // on frozen rebuilds and would put derivative operators in a
             // different chart from the value path.
             joint_null_rotation: None,
+            // Factor-smooth kinds export the chart their metadata could not
+            // absorb; the freeze persists it onto the spec for replay (#978).
+            unabsorbed_global_orthogonality: local_unabsorbed_z[idx].clone(),
         });
         if let Some(lin_local) = &local_linear_constraints[idx] {
             for r in 0..lin_local.a.nrows() {
@@ -9380,15 +9408,29 @@ fn with_identifiability_transform(
             periodic,
             group_levels,
             flavour,
-        } => Ok(BasisMetadata::FactorSmooth {
-            continuous_cols: continuous_cols.clone(),
-            group_col: *group_col,
-            knots: knots.clone(),
-            degree: *degree,
-            periodic: *periodic,
-            group_levels: group_levels.clone(),
-            flavour: flavour.clone(),
-        }),
+        } => {
+            // Factor-smooth metadata has no transform slot; the global pass
+            // exports its transform via `SmoothTerm::unabsorbed_global_orthogonality`
+            // instead (#978). Silently dropping a transform here is what made
+            // `s(x) + fs(x, g)` unpredictable — reject loudly so any future
+            // caller that reaches this arm with a transform fails at fit time
+            // rather than corrupting the saved coefficient chart.
+            if transform.is_some() {
+                crate::bail_invalid_basis!(
+                    "FactorSmooth metadata cannot absorb an identifiability transform; \
+                     route it through the term-level frozen_global_orthogonality carrier"
+                );
+            }
+            Ok(BasisMetadata::FactorSmooth {
+                continuous_cols: continuous_cols.clone(),
+                group_col: *group_col,
+                knots: knots.clone(),
+                degree: *degree,
+                periodic: *periodic,
+                group_levels: group_levels.clone(),
+                flavour: flavour.clone(),
+            })
+        }
         BasisMetadata::Pca {
             feature_cols,
             basis_matrix,
@@ -18302,6 +18344,28 @@ pub fn freeze_term_collection_from_design(
         // produce wrong η at predict-time for any smooth with `Some(Q)`.
         term.joint_null_rotation = fitted.joint_null_rotation.clone();
         freeze_smooth_basis_from_metadata(&mut term.basis, &fitted.metadata, &term.name)?;
+        // Persist the global-orthogonality chart the metadata could not absorb
+        // (factor-smooth kinds residualized against an overlapping owner
+        // smooth, #978). Without this, save → load → predict rebuilds the
+        // unresidualized full-width design and the fitted coefficients no
+        // longer match it.
+        if let Some(z) = fitted.unabsorbed_global_orthogonality.as_ref() {
+            match &mut term.basis {
+                SmoothBasisSpec::FactorSumToZero {
+                    frozen_global_orthogonality,
+                    ..
+                } => *frozen_global_orthogonality = Some(z.clone()),
+                SmoothBasisSpec::FactorSmooth { spec } => {
+                    spec.frozen_global_orthogonality = Some(z.clone());
+                }
+                _ => {
+                    crate::bail_invalid_estim!(
+                        "freeze: term '{}' carries an unabsorbed global-orthogonality transform but its basis kind has no frozen carrier for it",
+                        term.name
+                    );
+                }
+            }
+        }
     }
 
     // ── random-effect terms ─────────────────────────────────────────────
@@ -18452,6 +18516,9 @@ fn wrap_local_build_as_realization(
         linear_constraints_local: local.linear_constraints.clone(),
         kronecker_factored: local.kronecker_factored.take(),
         joint_null_rotation: applied_rotation,
+        // Single-term realizations never run the global ownership pass, so
+        // there is no overlap residualization to export here (#978).
+        unabsorbed_global_orthogonality: None,
     };
 
     Ok(SingleSmoothTermRealization {
