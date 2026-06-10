@@ -7312,6 +7312,10 @@ fn try_tangent_projected_evaluate(
         ext_coords: solution.ext_coords.clone(),
         ext_coord_pair_fn: None,
         rho_ext_pair_fn: None,
+        // Second-order pair callbacks are dropped on the projected path (same
+        // reason as the ext-coord/rho pair fns: the tangent hessian wrapper
+        // cannot re-project their p-space second-drift outputs).
+        contracted_psi_second_order: None,
         fixed_drift_deriv: None,
         barrier_config: solution.barrier_config.clone(),
         kkt_residual: projected_kkt,
@@ -11216,6 +11220,18 @@ struct UnifiedOuterHessianOperator {
     leverage: Option<Array1<f64>>,
     fourth_trace: Option<Array2<f64>>,
     callback_second_modes: Option<Vec<Array1<f64>>>,
+    /// Number of ρ (penalty) coordinates; coords `k_rho..` are the ψ rows. Used
+    /// only when `contracted_psi` is present, to map an output index to its ψ
+    /// output row.
+    k_rho: usize,
+    /// Direction-contracted ψψ second-order hook (#740). When `Some`, the build
+    /// SKIPPED the `K²` per-pair `ext_coord_pair_fn` ψψ assembly (the `pair_a` /
+    /// `pair_ld_s` / `base_h2` ψψ-block entries and the ψψ `pair_g` are left
+    /// zero / `None`), and `matvec`/`apply_into` apply this once per call to add
+    /// the ψ-row ψψ contributions in a single family row pass. The ρρ and ρψ
+    /// blocks remain in the precomputed tables (cheap), so this changes only the
+    /// representation of the ψψ block, not the math.
+    contracted_psi: Option<ContractedPsiSecondOrderFn>,
 }
 
 impl UnifiedOuterHessianOperator {
