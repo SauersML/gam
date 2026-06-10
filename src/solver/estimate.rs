@@ -507,14 +507,9 @@ impl ParametricColumnConditioning {
     ///
     /// The RHS `b` is unchanged, so [`Self::transform_linear_constraints_to_internal`]
     /// carries it through verbatim. `A_orig · M` is precisely `M` applied to the
-    /// columns of `A_orig`, which is the canonical back-transform primitive
-    /// [`Self::transform_matrix_columnswith_a`] already used by
-    /// [`Self::backtransform_covariance`] — so delegate to it rather than carry a
-    /// second copy of the per-column algebra. The previous hand-rolled body applied
-    /// the *inverse* conditioning map ([`Self::transform_matrix_columnswith_b`]:
-    /// `+mean`, `×scale`) instead, which let a box constraint escape its interval
-    /// by exactly `1/scale_j²` (and mixed the intercept column with the wrong sign,
-    /// harmless only because a single-coefficient box has a zero intercept entry).
+    /// columns of `A_orig`, which is the canonical column-conditioning primitive
+    /// [`Self::transform_matrix_columnswith_a`] — so delegate to it rather than
+    /// carry a second copy of the per-column algebra.
     fn transform_constraint_matrix_to_internal(&self, a_original: &Array2<f64>) -> Array2<f64> {
         self.transform_matrix_columnswith_a(a_original)
     }
@@ -564,65 +559,159 @@ impl ParametricColumnConditioning {
         }
     }
 
-    fn transform_matrixrowswith_a_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
-        let mut out = mat.clone();
-        for &(j, mean, scale) in &self.columns {
-            let interceptrow = self.intercept_idx.map(|idx| out.row(idx).to_owned());
-            let mut target = out.row_mut(j);
-            if mean != 0.0
-                && let Some(interceptrow) = interceptrow
-            {
-                target -= &(interceptrow * mean);
+    /// Left-multiply `mat_internal` by `M`, where `M` is the coefficient
+    /// back-transform: `β_orig = M · β_int` (the same map
+    /// [`Self::backtransform_beta`] applies to a single vector).
+    ///
+    /// `M` has the structure
+    /// ```text
+    ///   M[intercept, intercept] = 1
+    ///   M[intercept, j]        = −mean_j / scale_j     (conditioned column j)
+    ///   M[j, j]                = 1 / scale_j           (conditioned column j)
+    /// ```
+    /// and is the identity elsewhere. Acts on each column of `mat_internal`
+    /// the same way `backtransform_beta` acts on a single vector.
+    fn left_multiply_by_m(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            // (M·X)[intercept, :] = X[intercept, :] − Σ_j (mean_j/scale_j) · X[j, :]
+            // Each conditioned column reads from the ORIGINAL `mat_internal`
+            // row j (snapshot), so the contributions accumulate independently
+            // — identical semantics to `backtransform_beta`'s use of
+            // `beta_internal[j]` rather than the running `beta[j]`.
+            for &(j, mean, scale) in &self.columns {
+                if mean != 0.0 {
+                    let factor = mean / scale;
+                    let row_j_snapshot = mat_internal.row(j).to_owned();
+                    let mut interceptrow = out.row_mut(intercept_idx);
+                    interceptrow -= &(&row_j_snapshot * factor);
+                }
             }
+        }
+        // (M·X)[j, :] = X[j, :] / scale_j
+        for &(j, _mean, scale) in &self.columns {
             if scale != 1.0 {
-                target.mapv_inplace(|v| v / scale);
+                out.row_mut(j).mapv_inplace(|v| v / scale);
             }
         }
         out
     }
 
-    fn transform_matrix_columnswith_b(&self, mat: &Array2<f64>) -> Array2<f64> {
-        let mut out = mat.clone();
-        for &(j, mean, scale) in &self.columns {
-            let intercept_col = self.intercept_idx.map(|idx| out.column(idx).to_owned());
-            let mut target = out.column_mut(j);
-            if mean != 0.0
-                && let Some(intercept_col) = intercept_col
-            {
-                target += &(intercept_col * mean);
+    /// Right-multiply `mat_internal` by `Mᵀ` (the transpose of the
+    /// coefficient back-transform). Mirror of [`Self::left_multiply_by_m`]
+    /// on columns.
+    fn right_multiply_by_m_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            // (X·Mᵀ)[:, intercept] = X[:, intercept] − Σ_j (mean_j/scale_j) · X[:, j]
+            for &(j, mean, scale) in &self.columns {
+                if mean != 0.0 {
+                    let factor = mean / scale;
+                    let col_j_snapshot = mat_internal.column(j).to_owned();
+                    let mut intercept_col = out.column_mut(intercept_idx);
+                    intercept_col -= &(&col_j_snapshot * factor);
+                }
             }
+        }
+        // (X·Mᵀ)[:, j] = X[:, j] / scale_j
+        for &(j, _mean, scale) in &self.columns {
             if scale != 1.0 {
-                target.mapv_inplace(|v| v * scale);
+                out.column_mut(j).mapv_inplace(|v| v / scale);
             }
         }
         out
     }
 
-    fn transform_matrixrowswith_b_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
-        let mut out = mat.clone();
-        for &(j, mean, scale) in &self.columns {
-            let interceptrow = self.intercept_idx.map(|idx| out.row(idx).to_owned());
-            let mut target = out.row_mut(j);
-            if mean != 0.0
-                && let Some(interceptrow) = interceptrow
-            {
-                target += &(interceptrow * mean);
+    /// Left-multiply `mat_internal` by `M⁻ᵀ`. The inverse basis map is
+    /// ```text
+    ///   M⁻¹[intercept, intercept] = 1
+    ///   M⁻¹[intercept, j]         = mean_j     (conditioned column j)
+    ///   M⁻¹[j, j]                 = scale_j    (conditioned column j)
+    /// ```
+    /// so `(M⁻ᵀ · X)[j, :] = scale_j · X[j, :] + mean_j · X[intercept, :]`
+    /// and `(M⁻ᵀ · X)[intercept, :] = X[intercept, :]`.
+    fn left_multiply_by_m_inv_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            let interceptrow_snapshot = mat_internal.row(intercept_idx).to_owned();
+            for &(j, mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.row_mut(j).mapv_inplace(|v| v * scale);
+                }
+                if mean != 0.0 {
+                    let mut row_j = out.row_mut(j);
+                    row_j += &(&interceptrow_snapshot * mean);
+                }
             }
-            if scale != 1.0 {
-                target.mapv_inplace(|v| v * scale);
+        } else {
+            for &(j, _mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.row_mut(j).mapv_inplace(|v| v * scale);
+                }
             }
         }
         out
     }
 
+    /// Right-multiply `mat_internal` by `M⁻¹`. Mirror of
+    /// [`Self::left_multiply_by_m_inv_transpose`] on columns.
+    fn right_multiply_by_m_inv(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
+        if !self.is_active() {
+            return out;
+        }
+        if let Some(intercept_idx) = self.intercept_idx {
+            let intercept_col_snapshot = mat_internal.column(intercept_idx).to_owned();
+            for &(j, mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.column_mut(j).mapv_inplace(|v| v * scale);
+                }
+                if mean != 0.0 {
+                    let mut col_j = out.column_mut(j);
+                    col_j += &(&intercept_col_snapshot * mean);
+                }
+            }
+        } else {
+            for &(j, _mean, scale) in &self.columns {
+                if scale != 1.0 {
+                    out.column_mut(j).mapv_inplace(|v| v * scale);
+                }
+            }
+        }
+        out
+    }
+
+    /// `Cov(β_orig) = M · Cov(β_int) · Mᵀ`.
+    ///
+    /// Since `β_orig = M · β_int`, the covariance back-transform is the
+    /// congruence `M · Σ · Mᵀ`, NOT `Mᵀ · Σ · M`. The latter (the prior
+    /// implementation) silently swapped the variance of every conditioned
+    /// parametric column with the variance of the intercept, off by exactly
+    /// the basis change the intercept absorbs when columns are centered.
     fn backtransform_covariance(&self, cov_internal: &Array2<f64>) -> Array2<f64> {
-        let right = self.transform_matrix_columnswith_a(cov_internal);
-        self.transform_matrixrowswith_a_transpose(&right)
+        let right = self.right_multiply_by_m_transpose(cov_internal);
+        self.left_multiply_by_m(&right)
     }
 
+    /// `H_orig = M⁻ᵀ · H_int · M⁻¹`.
+    ///
+    /// Derived from `L_int(β_int) = L_orig(M · β_int)`: the chain rule gives
+    /// `H_int = Mᵀ · H_orig · M`, so `H_orig = M⁻ᵀ · H_int · M⁻¹`. The prior
+    /// implementation multiplied the intercept entry of `M⁻¹` by `scale_j`,
+    /// silently scaling the Hessian by `scale_j²` along every conditioned
+    /// column whenever scaling (not just centering) was active.
     fn backtransform_penalized_hessian(&self, h_internal: &Array2<f64>) -> Array2<f64> {
-        let right = self.transform_matrix_columnswith_b(h_internal);
-        self.transform_matrixrowswith_b_transpose(&right)
+        let right = self.right_multiply_by_m_inv(h_internal);
+        self.left_multiply_by_m_inv_transpose(&right)
     }
 
     fn backtransform_external_result(
@@ -7716,6 +7805,163 @@ mod estimate_policy_tests {
         // carried through untouched.
         assert_eq!(a_int[[2, 0]], 1.0);
         assert_eq!(a_int[[2, 2]], -3.0);
+    }
+
+    /// `backtransform_covariance` must compute `M·Σ_int·Mᵀ` — the unique
+    /// congruence consistent with `β_orig = M·β_int`. The old implementation
+    /// computed `Mᵀ·Σ_int·M`, which silently swapped the conditioned slope's
+    /// variance with the intercept's whenever the parametric column was
+    /// centered or scaled.
+    #[test]
+    fn backtransform_covariance_uses_correct_basis_congruence() {
+        // Intercept at col 0, plus two conditioned parametric columns to
+        // exercise off-diagonal mixing (single column would only exercise the
+        // diagonal swap symptom).
+        let conditioning = ParametricColumnConditioning {
+            intercept_idx: Some(0),
+            columns: vec![(1, 0.7, 2.5), (2, -1.3, 0.4)],
+        };
+
+        // Build M explicitly so the congruence can be verified by direct
+        // matrix algebra rather than re-derived inside the test.
+        let mut m = Array2::<f64>::eye(3);
+        m[[0, 1]] = -0.7 / 2.5;
+        m[[0, 2]] = -(-1.3) / 0.4;
+        m[[1, 1]] = 1.0 / 2.5;
+        m[[2, 2]] = 1.0 / 0.4;
+
+        // A non-trivial symmetric PD `Σ_int`. The off-diagonals matter:
+        // they're exactly the entries `Mᵀ·Σ·M` mishandles vs `M·Σ·Mᵀ`.
+        let sigma_int = array![[1.7, -0.4, 0.9], [-0.4, 2.1, -0.2], [0.9, -0.2, 3.0],];
+
+        let expected = m.dot(&sigma_int).dot(&m.t());
+        let actual = conditioning.backtransform_covariance(&sigma_int);
+
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (actual[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                    "backtransform_covariance mismatch at ({i},{j}): \
+                     got {}, expected {} = (M·Σ·Mᵀ)[{i},{j}]",
+                    actual[[i, j]],
+                    expected[[i, j]],
+                );
+            }
+        }
+
+        // Pin the user-visible symptom directly: a `y ~ x` Gaussian fit with
+        // a non-zero-mean x. After conditioning, `Σ_int` is the
+        // diag(σ²/n, σ²/Sxx_centered) covariance of the orthogonalized
+        // (intercept, centered slope) coefficients. The raw-basis variances
+        // (M·Σ·Mᵀ) must be the textbook OLS expressions:
+        //   Var(intercept_raw) = σ² (1/n + x̄² / Sxx)
+        //   Var(slope_raw)     = σ² / Sxx
+        // Anything that reports `σ²/n` as the intercept variance is the old
+        // bug — the conditioned-basis intercept variance leaking through.
+        let one_x_only = ParametricColumnConditioning {
+            intercept_idx: Some(0),
+            columns: vec![(1, 5.0, 2.0)], // x̄ = 5, sd(x) = 2
+        };
+        let sigma_sq = 1.7;
+        let n = 250.0;
+        let sxx = (n - 1.0) * 4.0; // sd² · (n−1) for a sample with sd(x)=2
+        let sigma_int_yx = array![
+            [sigma_sq / n, 0.0],
+            [0.0, sigma_sq / (sxx / 4.0)], // centered+scaled (divide by sd² for the conditioned scale)
+        ];
+        let cov_raw = one_x_only.backtransform_covariance(&sigma_int_yx);
+        let expected_var_intercept = sigma_sq * (1.0 / n + 25.0 / sxx);
+        let expected_var_slope = sigma_sq / sxx;
+        assert!(
+            (cov_raw[[0, 0]] - expected_var_intercept).abs() < 1e-10,
+            "raw intercept variance: got {}, expected {} (= σ²(1/n + x̄²/Sxx))",
+            cov_raw[[0, 0]],
+            expected_var_intercept
+        );
+        assert!(
+            (cov_raw[[1, 1]] - expected_var_slope).abs() < 1e-10,
+            "raw slope variance: got {}, expected {} (= σ²/Sxx)",
+            cov_raw[[1, 1]],
+            expected_var_slope
+        );
+    }
+
+    /// `backtransform_penalized_hessian` must compute `M⁻ᵀ·H_int·M⁻¹` —
+    /// derived from `L_int(β_int) = L_orig(M·β_int)` and the chain rule.
+    /// Together with `backtransform_covariance`, this preserves the exact
+    /// inverse pair `inv(H_orig) == Σ_orig` whenever `inv(H_int) == Σ_int`.
+    #[test]
+    fn backtransform_penalized_hessian_is_inverse_of_covariance_backtransform() {
+        let conditioning = ParametricColumnConditioning {
+            intercept_idx: Some(0),
+            columns: vec![(1, 0.7, 2.5), (2, -1.3, 0.4)],
+        };
+
+        // Build M and M⁻¹ explicitly.
+        let mut m = Array2::<f64>::eye(3);
+        m[[0, 1]] = -0.7 / 2.5;
+        m[[0, 2]] = -(-1.3) / 0.4;
+        m[[1, 1]] = 1.0 / 2.5;
+        m[[2, 2]] = 1.0 / 0.4;
+        let mut m_inv = Array2::<f64>::eye(3);
+        m_inv[[0, 1]] = 0.7;
+        m_inv[[0, 2]] = -1.3;
+        m_inv[[1, 1]] = 2.5;
+        m_inv[[2, 2]] = 0.4;
+
+        let h_int = array![[3.2, 0.5, -0.3], [0.5, 1.4, 0.2], [-0.3, 0.2, 2.0],];
+
+        let expected = m_inv.t().dot(&h_int).dot(&m_inv);
+        let actual = conditioning.backtransform_penalized_hessian(&h_int);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (actual[[i, j]] - expected[[i, j]]).abs() < 1e-12,
+                    "backtransform_penalized_hessian mismatch at ({i},{j}): \
+                     got {}, expected {} = (M⁻ᵀ·H·M⁻¹)[{i},{j}]",
+                    actual[[i, j]],
+                    expected[[i, j]],
+                );
+            }
+        }
+
+        // And the covariance/Hessian back-transforms compose so that
+        // `Σ_orig = inv(H_orig)` holds whenever `Σ_int = inv(H_int)`. Pick a
+        // `Σ_int = inv(H_int)` (smoothly invertible above), back-transform
+        // each, and confirm they are mutual inverses to working precision.
+        let sigma_int = {
+            // 3×3 inverse via cofactors — small enough to hand-roll.
+            let det = h_int[[0, 0]]
+                * (h_int[[1, 1]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 1]])
+                - h_int[[0, 1]]
+                    * (h_int[[1, 0]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 0]])
+                + h_int[[0, 2]]
+                    * (h_int[[1, 0]] * h_int[[2, 1]] - h_int[[1, 1]] * h_int[[2, 0]]);
+            let mut inv = Array2::<f64>::zeros((3, 3));
+            inv[[0, 0]] = (h_int[[1, 1]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 1]]) / det;
+            inv[[0, 1]] = -(h_int[[0, 1]] * h_int[[2, 2]] - h_int[[0, 2]] * h_int[[2, 1]]) / det;
+            inv[[0, 2]] = (h_int[[0, 1]] * h_int[[1, 2]] - h_int[[0, 2]] * h_int[[1, 1]]) / det;
+            inv[[1, 0]] = -(h_int[[1, 0]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 0]]) / det;
+            inv[[1, 1]] = (h_int[[0, 0]] * h_int[[2, 2]] - h_int[[0, 2]] * h_int[[2, 0]]) / det;
+            inv[[1, 2]] = -(h_int[[0, 0]] * h_int[[1, 2]] - h_int[[0, 2]] * h_int[[1, 0]]) / det;
+            inv[[2, 0]] = (h_int[[1, 0]] * h_int[[2, 1]] - h_int[[1, 1]] * h_int[[2, 0]]) / det;
+            inv[[2, 1]] = -(h_int[[0, 0]] * h_int[[2, 1]] - h_int[[0, 1]] * h_int[[2, 0]]) / det;
+            inv[[2, 2]] = (h_int[[0, 0]] * h_int[[1, 1]] - h_int[[0, 1]] * h_int[[1, 0]]) / det;
+            inv
+        };
+        let cov_orig = conditioning.backtransform_covariance(&sigma_int);
+        let h_orig = conditioning.backtransform_penalized_hessian(&h_int);
+        let product = cov_orig.dot(&h_orig);
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (product[[i, j]] - expected).abs() < 1e-10,
+                    "Σ_orig · H_orig should be identity at ({i},{j}): got {}",
+                    product[[i, j]]
+                );
+            }
+        }
     }
 
     #[test]
