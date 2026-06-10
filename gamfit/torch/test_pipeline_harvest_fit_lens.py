@@ -55,6 +55,7 @@ torch = pytest.importorskip("torch")
 gamfit = pytest.importorskip("gamfit")
 
 from gamfit import ManifoldSAE, sae_manifold_fit  # noqa: E402
+from gamfit._binding import rust_module  # noqa: E402
 from gamfit.torch.harvest import (  # noqa: E402
     HarvestShard,
     harvest_output_fisher_factors,
@@ -332,59 +333,47 @@ def _analytic_softmax_kl(W: np.ndarray, x_from: np.ndarray, x_to: np.ndarray) ->
     return float(np.sum(p * (np.log(p) - np.log(q))))
 
 
-@pytest.mark.xfail(
-    reason=(
-        "steer_delta (gam::inference::steering) is Rust-only: no FFI/Python "
-        "surface exposes SteerPlan/predicted_nats from the fitted payload. "
-        "Enable once a `steer` entry point is wired through gam-pyffi and "
-        "surfaced on ManifoldSAE. See report: the missing FFI is a pyfunction "
-        "that takes the fitted SaeManifoldTerm + RowMetric + atom_k + "
-        "(t_from, t_to) and returns the SteerPlan dosimetry dict."
-    ),
-    strict=False,
-    raises=(AttributeError, NotImplementedError, ImportError),
-)
 def test_steer_dosimetry_against_analytic_kl(
     fit_with_shard: ManifoldSAE, harvest_shard: HarvestShard
 ) -> None:
     """Path-integrated output-Fisher dose ≈ analytic KL for a small steer move.
 
-    SKELETON — pending the steering FFI surface. The intended assertion, once a
-    steer entry point is reachable from the fitted payload:
+    The steering FFI (``ManifoldSAE.steer`` → ``gam-pyffi::sae_steer_delta`` →
+    ``gam::inference::steering::steer_delta``) drives the planted atom a small
+    latent step along the recovered circle and returns the SteerPlan dosimetry:
 
     1. Pick the planted atom (k=0) and two nearby on-manifold coordinates
        ``t_from`` / ``t_to`` (a small latent step along the recovered circle).
-    2. Decode them to activation-space points ``x_from = g_k(t_from)`` and
-       ``x_to = g_k(t_to)`` (the move ``δ = a·(x_to − x_from)`` the SteerPlan
-       returns).
+    2. The decoder maps them to activation-space points ``x_from = g_k(t_from)``
+       and ``x_to = g_k(t_to)``; the SteerPlan's ``delta`` is the move
+       ``δ = a·(x_to − x_from)`` (amplitude ``a = 1`` for this single-atom
+       softmax fit, where the only atom carries unit assignment mass on every
+       row).
     3. The SteerPlan's ``predicted_nats`` (output-Fisher path integral) must
        match the analytic KL of the synthetic head between those two activations
-       to second order: small move ⇒ ``predicted_nats ≈ KL`` within a tight
-       relative tolerance; ``off_manifold_norm ≈ 0``; ``validity_radius`` ≥ the
-       move length.
+       to second order: small move ⇒ ``predicted_nats ≈ KL`` within a relative
+       tolerance; ``off_manifold_norm ≈ 0``; ``validity_radius`` ≥ the move
+       length.
 
-    The model weight ``W`` is not currently surfaced on ``ManifoldSAE`` (only the
-    decoder is), so the analytic KL here is computed against the *decoder*-decoded
-    activations — which is exactly what ``δ`` moves through. The xfail trips on
-    the missing ``steer`` attribute below; remove the marker and implement
-    against the real API once it lands.
+    The synthetic ``_LinearHead`` makes the output distribution at an activation
+    ``x`` exactly ``softmax(W x)``, so the *true* behavioral effect of the move is
+    the analytic softmax-KL between the decoded endpoints under the model weight
+    ``W``. ``W`` is reconstructed here from the same fixed seed the
+    ``harvest_shard`` fixture used, so the harvested output-Fisher factors
+    (``G_n = Wᵀ F_n W``) and this analytic ground truth are the SAME geometry.
     """
-    # The steer entry point does not exist yet on the fitted model. This probe
-    # is what the xfail catches; when the FFI lands, replace it with the real
-    # call and the analytic-KL comparison sketched in the docstring.
+    # The steer entry point is now FFI-exposed and surfaced on the fitted model.
     steer = getattr(fit_with_shard, "steer", None)
-    if steer is None:
-        raise AttributeError(
-            "ManifoldSAE has no `steer` entry point yet (steer_delta is "
-            "Rust-only, not FFI-exposed)."
-        )
+    assert steer is not None, "ManifoldSAE must expose a `steer` entry point"
 
-    # --- the assertion this skeleton will become (unreachable until FFI lands).
     # Drive the planted atom a small latent step along the recovered circle.
     atom_k = 0
     coords = np.asarray(fit_with_shard.coords[atom_k], dtype=float)
-    t_from = coords[0]
-    t_to = coords[min(1, coords.shape[0] - 1)]
+    # Two nearby coordinates: a genuinely small latent step keeps the move in the
+    # second-order regime where the path-integrated dose matches the analytic KL.
+    order = np.argsort(coords[:, 0])
+    t_from = coords[order[0]]
+    t_to = coords[order[1]]
     plan = steer(atom_k, t_from=t_from, t_to=t_to)
     # Geometry self-checks: the move stays on the learned surface, the dose is
     # measured through OutputFisher, and the linearization is trusted past the
@@ -394,17 +383,40 @@ def test_steer_dosimetry_against_analytic_kl(
     assert plan["off_manifold_norm"] == pytest.approx(0.0, abs=1e-6)
     move_len = float(np.linalg.norm(np.asarray(t_to) - np.asarray(t_from)))
     assert float(plan["validity_radius"]) >= move_len - 1e-9
-    # Dosimetry ground truth: the synthetic head makes the output distribution
-    # at an activation x exactly softmax(W x), so the true behavioral effect of
-    # the activation-space move δ is the analytic KL between the decoded
-    # endpoints under the model weight W. Match the path-integrated output-Fisher
-    # dose to the analytic KL to second order for the small step.
-    #
-    #   W ... model head weight (to be surfaced alongside the steer FFI);
-    #   x_from, x_to ... the decoder-decoded activations the move δ traverses.
-    #   kl = _analytic_softmax_kl(W, x_from, x_to)
-    #   assert plan["predicted_nats"] == pytest.approx(kl, rel=0.2)
-    assert callable(_analytic_softmax_kl)  # placeholder: ground-truth wired at FFI time
+
+    # Dosimetry ground truth: reconstruct the synthetic head weight W from the
+    # same fixed seed the harvest fixture used (rng default_rng(7)), so the
+    # harvested output-Fisher factors and this analytic KL share one geometry.
+    rng = np.random.default_rng(7)
+    W = rng.standard_normal((_C, _P))
+    # The decoder-decoded activations the move δ traverses. amplitude == 1 here
+    # (single-atom softmax ⇒ unit mass), so δ == x_to − x_from and the SteerPlan
+    # delta equals that chord.
+    assert float(plan["amplitude"]) == pytest.approx(1.0, abs=1e-9)
+    decoder = np.asarray(fit_with_shard.decoder_blocks[atom_k], dtype=float)
+    phi = np.asarray(
+        rust_module().basis_with_jet(
+            "periodic",
+            np.ascontiguousarray(np.asarray([t_from, t_to], dtype=float).reshape(2, 1)),
+            {"n_harmonics": int(fit_with_shard._n_harmonics[atom_k])},
+        )[0],
+        dtype=float,
+    )
+    decoded = phi @ decoder  # (2, p): rows are g_k(t_from), g_k(t_to)
+    x_from, x_to = decoded[0], decoded[1]
+    # The SteerPlan delta is exactly the decoded chord (amplitude 1).
+    np.testing.assert_allclose(
+        np.asarray(plan["delta"], dtype=float), x_to - x_from, rtol=0.0, atol=1e-8
+    )
+    kl = _analytic_softmax_kl(W, x_from, x_to)
+    # Second-order agreement for the small step. The path-integrated output-Fisher
+    # dose is the quadratic (Fisher) model of the KL; for a genuinely small move it
+    # matches the exact KL to a loose relative tolerance. Two gaps keep this from
+    # being exact: (i) the softmax KL has third-order curvature beyond the Fisher
+    # quadratic, and (ii) the dose reads the harvested per-row Fisher at the atom's
+    # most-active row (`measured_row`), whose base activation differs slightly from
+    # the decoded `x_from`; both are O(move) on this well-recovered circle.
+    assert plan["predicted_nats"] == pytest.approx(kl, rel=0.3, abs=1e-9)
 
 
 # ---------------------------------------------------------------------------

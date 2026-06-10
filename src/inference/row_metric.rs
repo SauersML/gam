@@ -172,11 +172,17 @@ impl RowMetric {
         )
     }
 
-    /// Structured-residual whitening. For now this is a clearly-scoped path that
-    /// whitens by the supplied per-row factors exactly as
-    /// [`Self::output_fisher`] does — the factor-analytic residual-covariance
-    /// fill is the #974 seam. The block layout already holds the per-row
-    /// factors #974 will populate, so no layout change is needed when it lands.
+    /// Structured-residual whitening from supplied per-row precision factors.
+    ///
+    /// `u` carries the per-row factor stack `U_n ∈ ℝ^{p × rank}` (row-major flat)
+    /// with `U_n U_nᵀ = M_n = Σ_n^{-1}` — the precision of the **estimated**
+    /// residual-covariance noise model. This is the low-level constructor; the
+    /// #974 producer that *fits* `Σ_n` (a low-rank factor + diagonal + smooth
+    /// activity-scale) and assembles these factors is
+    /// [`crate::inference::residual_factor::StructuredResidualModel`], which calls
+    /// through here. Because the provenance is
+    /// [`MetricProvenance::WhitenedStructured`], [`Self::whitens_likelihood`] is
+    /// `true`: a metric built this way is the first that whitens the likelihood.
     pub fn whitened_structured(
         u: Arc<Array2<f64>>,
         p: usize,
@@ -189,6 +195,32 @@ impl RowMetric {
             rank,
             0.0,
         )
+    }
+
+    /// Fit the #974 structured residual-covariance model to the residual matrix
+    /// `R ∈ ℝ^{n×p}` against the smooth activity coordinate `z ∈ ℝ^n`, and return
+    /// the resulting likelihood-whitening [`RowMetric`].
+    ///
+    /// This is the convenience entry point that ties the estimator to its
+    /// consumer in one call: it runs
+    /// [`StructuredResidualModel::fit`](crate::inference::residual_factor::StructuredResidualModel::fit)
+    /// (deterministic fixed-iteration alternation + evidence-ladder rank
+    /// selection) and lowers the fitted per-row precisions into a
+    /// [`MetricProvenance::WhitenedStructured`] metric. `max_factor_rank` caps the
+    /// factor count the ladder may select.
+    pub fn from_estimated_residual_covariance(
+        residuals: ndarray::ArrayView2<'_, f64>,
+        activity: ArrayView1<'_, f64>,
+        max_factor_rank: usize,
+    ) -> Result<Self, String> {
+        use crate::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
+        let n = residuals.nrows();
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals,
+            activity,
+            max_factor_rank,
+        })?;
+        model.row_metric(n)
     }
 
     fn from_factors(
@@ -283,6 +315,15 @@ impl RowMetric {
         self.p
     }
 
+    /// The factor rank: the dimension of the whitened residual
+    /// [`Self::whiten_residual_row`] returns (and the column count of the per-row
+    /// factor `U_n ∈ ℝ^{p × rank}`). For [`MetricProvenance::Euclidean`] this is
+    /// `p` (the implicit identity factor), so a consumer that sizes a whitened
+    /// buffer by `metric_rank()` gets the right length in every provenance.
+    pub fn metric_rank(&self) -> usize {
+        self.rank
+    }
+
     /// Validated PSD blocks `(n_rows, p, p)`. The provenance-of-validation
     /// record; consumers wanting the explicit `W_n` (e.g. a future dense
     /// diagnostic) read this, the hot paths use the factors.
@@ -312,6 +353,40 @@ impl RowMetric {
                         acc += u[[row, i * self.rank + k]] * r[i];
                     }
                     out[k] = acc;
+                }
+                out
+            }
+        }
+    }
+
+    /// Apply the full per-row metric `M_n x = U_n (U_nᵀ x) ∈ ℝ^p` for one
+    /// `p`-vector `x`, formed factored (`rank` flops in, `p` flops out) — never
+    /// materializing `M_n` as `p × p`. Euclidean returns `x` unchanged
+    /// (`M_n = I_p`). This is the p-space metric-applied vector the SAE β-tier
+    /// data-fit gradient contracts (β lives in p-output space, so its gradient
+    /// needs `M_n r_n`, not the rank-space whitened residual `U_nᵀ r_n`). Uses the
+    /// **un-floored** factors (criterion face, `δ`-free, #747 invariant).
+    pub fn apply_metric_row(&self, row: usize, x: ArrayView1<'_, f64>) -> Vec<f64> {
+        match &self.factors {
+            None => x.iter().copied().collect(),
+            Some(u) => {
+                // w = U_nᵀ x ∈ ℝ^{rank}.
+                let mut w = vec![0.0_f64; self.rank];
+                for k in 0..self.rank {
+                    let mut acc = 0.0;
+                    for i in 0..self.p {
+                        acc += u[[row, i * self.rank + k]] * x[i];
+                    }
+                    w[k] = acc;
+                }
+                // out = U_n w ∈ ℝ^p.
+                let mut out = vec![0.0_f64; self.p];
+                for i in 0..self.p {
+                    let mut acc = 0.0;
+                    for k in 0..self.rank {
+                        acc += u[[row, i * self.rank + k]] * w[k];
+                    }
+                    out[i] = acc;
                 }
                 out
             }
