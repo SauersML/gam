@@ -476,29 +476,14 @@ class Poincare(ManifoldDescriptor):
     def __repr__(self) -> str:
         return f"Poincare(dim={self._dim}, curvature={self.curvature})"
 
-    # -- low-level single-point primitives (direct poincare_* FFI) --------
-    def _mobius_add(self, u: np.ndarray, v: np.ndarray) -> np.ndarray:
-        out = _rust_module().poincare_mobius_add(u, v, self.curvature)
-        return np.asarray(out, dtype=np.float64)
-
-    def _exp_origin(self, v: np.ndarray) -> np.ndarray:
-        out = _rust_module().poincare_exp_origin(v, self.curvature)
-        return np.asarray(out, dtype=np.float64)
-
-    def _log_origin(self, y: np.ndarray) -> np.ndarray:
-        out = _rust_module().poincare_log_origin(y, self.curvature)
-        return np.asarray(out, dtype=np.float64)
-
-    def _lambda(self, p: np.ndarray) -> float:
-        """Conformal factor ``lambda_p = 2 / (1 + c |p|^2)`` at ``p``."""
-        return 2.0 / (1.0 + self.curvature * float(np.dot(p, p)))
-
+    # -- single-point primitives (direct poincare_* FFI; all math in Rust) --
     def _exp_one(self, p: np.ndarray, v: np.ndarray) -> np.ndarray:
-        return self._mobius_add(p, self._exp_origin(0.5 * self._lambda(p) * v))
+        out = _rust_module().poincare_exp_map(p, v, self.curvature)
+        return np.asarray(out, dtype=np.float64)
 
     def _log_one(self, p: np.ndarray, q: np.ndarray) -> np.ndarray:
-        neg_p = -p
-        return (2.0 / self._lambda(p)) * self._log_origin(self._mobius_add(neg_p, q))
+        out = _rust_module().poincare_log_map(p, q, self.curvature)
+        return np.asarray(out, dtype=np.float64)
 
     def _distance_one(self, a: np.ndarray, b: np.ndarray) -> float:
         return float(_rust_module().poincare_distance(a, b, self.curvature))
@@ -561,7 +546,7 @@ class Poincare(ManifoldDescriptor):
         torch_mod = _maybe_import_torch()
         p_arr, _ = _to_2d_numpy(p)
         point = p_arr[0]
-        lam = self._lambda(point)
+        lam = float(_rust_module().poincare_conformal_factor(point, self.curvature))
         g = (lam * lam) * np.eye(self._dim, dtype=np.float64)
         if torch_mod is not None and isinstance(p, torch_mod.Tensor):
             return torch_mod.as_tensor(g, dtype=p.dtype, device=p.device)

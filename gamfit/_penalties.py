@@ -610,12 +610,9 @@ JumpReLUPenalty = _rust_descriptor_class("JumpReLUPenalty")
 
 
 def _inverse_softplus(x: np.ndarray) -> np.ndarray:
-    # Numerics live in Rust (see crates/gam-pyffi `numerics_inverse_softplus`).
+    # Single source of truth: numerics live in Rust (`numerics_inverse_softplus`).
     arr = np.ascontiguousarray(x, dtype=float)
-    inverse = getattr(_rust_module(), "numerics_inverse_softplus", None)
-    if inverse is not None:
-        return inverse(arr)
-    return np.log(np.expm1(arr))
+    return _rust_module().numerics_inverse_softplus(arr)
 
 
 SparsityPenalty = _rust_descriptor_class("SparsityPenalty")
@@ -795,12 +792,9 @@ class GatedSAEDecoder:
 
 
 def _sigmoid_numpy(x: np.ndarray) -> np.ndarray:
-    # Numerics live in Rust (see crates/gam-pyffi `numerics_sigmoid_stable`).
+    # Single source of truth: numerics live in Rust (`numerics_sigmoid_stable`).
     arr = np.ascontiguousarray(x, dtype=float)
-    sigmoid = getattr(_rust_module(), "numerics_sigmoid_stable", None)
-    if sigmoid is not None:
-        return sigmoid(arr)
-    return np.where(arr >= 0.0, 1.0 / (1.0 + np.exp(-arr)), np.exp(arr) / (1.0 + np.exp(arr)))
+    return _rust_module().numerics_sigmoid_stable(arr)
 
 
 # Sum type for type hints on `gamfit.fit(..., penalties=...)` and similar.

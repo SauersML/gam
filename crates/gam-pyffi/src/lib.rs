@@ -26,8 +26,9 @@ use gam::gaussian_reml::{
 };
 use gam::geometry::manifold::GeometryError as EngineGeometryError;
 use gam::geometry::poincare::{
+    conformal_factor as poincare_conformal_factor_impl, exp_map as poincare_exp_map_impl,
     exp_origin as poincare_exp_origin_impl, from_lorentz as poincare_from_lorentz_impl,
-    log_origin as poincare_log_origin_impl,
+    log_map as poincare_log_map_impl, log_origin as poincare_log_origin_impl,
     lorentz_decode_backward as poincare_lorentz_decode_backward_impl,
     lorentz_decode_forward as poincare_lorentz_decode_forward_impl,
     lorentz_exp_origin as poincare_lorentz_exp_origin_impl,
@@ -19869,6 +19870,48 @@ fn poincare_exp_origin<'py>(
 }
 
 #[pyfunction]
+fn poincare_conformal_factor<'py>(
+    py: Python<'py>,
+    p: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<f64> {
+    let p_owned = p.as_array().to_owned();
+    detach_geometry_result(py, "poincare_conformal_factor", move || {
+        poincare_conformal_factor_impl(p_owned.view(), curvature)
+    })
+}
+
+#[pyfunction]
+fn poincare_exp_map<'py>(
+    py: Python<'py>,
+    p: PyReadonlyArray1<'py, f64>,
+    v: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let p_owned = p.as_array().to_owned();
+    let v_owned = v.as_array().to_owned();
+    let out = detach_geometry_result(py, "poincare_exp_map", move || {
+        poincare_exp_map_impl(p_owned.view(), v_owned.view(), curvature)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
+fn poincare_log_map<'py>(
+    py: Python<'py>,
+    p: PyReadonlyArray1<'py, f64>,
+    q: PyReadonlyArray1<'py, f64>,
+    curvature: f64,
+) -> PyResult<Py<PyArray1<f64>>> {
+    let p_owned = p.as_array().to_owned();
+    let q_owned = q.as_array().to_owned();
+    let out = detach_geometry_result(py, "poincare_log_map", move || {
+        poincare_log_map_impl(p_owned.view(), q_owned.view(), curvature)
+    })?;
+    Ok(out.into_pyarray(py).unbind())
+}
+
+#[pyfunction]
 fn poincare_to_lorentz<'py>(
     py: Python<'py>,
     y: PyReadonlyArray1<'py, f64>,
@@ -23731,6 +23774,9 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(poincare_project_into_ball, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_log_origin, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_exp_origin, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_conformal_factor, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_exp_map, module)?)?;
+    module.add_function(wrap_pyfunction!(poincare_log_map, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_to_lorentz, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_from_lorentz, module)?)?;
     module.add_function(wrap_pyfunction!(poincare_lorentz_log_origin, module)?)?;
