@@ -1,3 +1,35 @@
+## v0.3.111 — gam 0.3.111 / gamfit 0.1.193 (2026-06-10)
+
+Crate + wheel release rolling up the factor-smooth predictive-quality fix and
+the SAE-manifold streaming/LLM-scale restoration on top of the green tree.
+
+Factor-smooth / random-slope quality (#903):
+- fix(fs): the `bs="fs"` factor smooth now penalizes **each null-space
+  dimension separately** (one rank-1 `I_L ⊗ z_k z_kᵀ` per null direction, each
+  its own shared smoothing parameter), mirroring mgcv's
+  `smooth.construct.fs.smooth.spec`, and drops the non-mgcv range ridge. The
+  prior single *combined* null penalty (one λ for intercept + slope) could not
+  express the distinct random-intercept vs random-slope variances, so
+  per-group slopes got no partial pooling and the held-out per-subject forecast
+  inherited full no-pooling variance. REML now fits both variances, tracking
+  lme4's correlated-RE BLUP.
+
+SAE-manifold streaming (LLM-scale fitting):
+- restore + wire the out-of-core streaming joint-fit driver
+  `run_joint_fit_arrow_schur_streaming` (re-seeds each chunk via `chunk_init`,
+  never materializes the `(N×M)`/`(N×K)` per-row buffers) plus an in-memory
+  entry `fit_streaming_in_memory`, with a chunk-size-invariance contract test.
+  This is the memory-bounded fit path for the LLM-scale teacher; the in-core
+  driver cannot scale to N = billions of tokens.
+- feat(#972/#977): closed-form streaming polar frame refresh
+  (`refresh_active_frames_from_data`) — the U-block of the alternating
+  block-coordinate ascent that complements the border C-block Newton step.
+
+Build / correctness:
+- bms #905 conditional `E[z|C]`/`Var(z|C)` Auto gate; #740 contracted ψψ
+  second-order hook; #1000 centered Gaussian outer-REML λ-search; assorted
+  ban-gate and unused-symbol cleanups to keep `cargo check --tests` green.
+
 ## v0.3.110 — gam 0.3.110 / gamfit 0.1.192 (2026-06-10)
 
 Crate + wheel release rolling up the SAE-manifold identifiability-certificate
