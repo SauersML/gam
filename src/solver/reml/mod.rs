@@ -23,6 +23,7 @@ pub(super) mod hyper;
 mod inner_strategy;
 pub(crate) mod jeffreys_subspace;
 pub(crate) mod penalty_logdet;
+pub(crate) mod per_atom_efs;
 pub(crate) mod rho_prior_eval;
 pub(crate) mod runtime;
 mod trace;
