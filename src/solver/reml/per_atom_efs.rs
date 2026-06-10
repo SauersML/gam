@@ -737,3 +737,29 @@ pub fn run_per_atom_efs(
         converged,
     })
 }
+
+#[cfg(test)]
+mod topology_tests {
+    use super::SharedBorderTopology;
+
+    /// `new` must sort, deduplicate, and drop out-of-range axes so the
+    /// restricted border correction has a deterministic ordering; `disjoint`
+    /// and `fully_coupled` are its two extremes (m = 0 and m = rho_dim).
+    #[test]
+    fn shared_border_topology_constructors_pin_their_semantics() {
+        let t = SharedBorderTopology::new(5, [4usize, 1, 4, 9, 1]);
+        assert_eq!(t.border_axes(), &[1, 4], "sorted, deduped, in-range");
+        assert_eq!(t.border_count(), 2);
+
+        let d = SharedBorderTopology::disjoint(5);
+        assert_eq!(d.border_count(), 0, "disjoint = exact decoupled step");
+
+        let f = SharedBorderTopology::fully_coupled(3);
+        assert_eq!(f.border_axes(), &[0, 1, 2]);
+        assert_eq!(
+            f.border_count(),
+            3,
+            "fully coupled = dense Newton on the whole rho vector"
+        );
+    }
+}
