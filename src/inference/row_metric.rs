@@ -74,12 +74,14 @@ pub enum MetricProvenance {
     /// factors. The `rank` is carried in the provenance so a consumer (Object 4)
     /// can certify the factor rank that produced the inner product.
     OutputFisher { rank: usize },
-    /// Structured-residual whitening: `M_n` whitens by a factor-analytic
-    /// residual covariance with `factor_rank` factors. Scoped for #974; for now
-    /// it carries the same low-rank factor layout as
-    /// [`MetricProvenance::OutputFisher`] (the structured-covariance fill is the
-    /// #974 seam), so a constructed `WhitenedStructured` behaves like a
-    /// factored metric until #974 lands the residual-covariance factorization.
+    /// Structured-residual whitening: `M_n = Σ_n^{-1}` from the **estimated**
+    /// factor-analytic residual covariance `Σ_n = Λ c(z_n) Λᵀ + D` (#974), with
+    /// `factor_rank` the selected factor count. Produced by
+    /// [`crate::inference::residual_factor::StructuredResidualModel::row_metric`];
+    /// the only provenance for which
+    /// [`whitens_likelihood`](RowMetric::whitens_likelihood) is `true`. It
+    /// carries the same low-rank factor layout as
+    /// [`MetricProvenance::OutputFisher`].
     WhitenedStructured { factor_rank: usize },
 }
 
