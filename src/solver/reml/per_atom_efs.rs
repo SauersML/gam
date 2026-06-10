@@ -191,6 +191,32 @@ impl SharedBorderTopology {
         }
     }
 
+    /// A topology with a populated shared border: `axes` are the ρ-coordinates
+    /// whose penalty blocks overlap through the arrow border (shared global
+    /// block / shared design columns) and therefore receive the coupled
+    /// `m × m` Newton correction on top of their decoupled step.
+    ///
+    /// Axes are sorted and deduplicated; an out-of-range axis is rejected
+    /// loudly. A caller passing every axis (`axes == 0..rho_dim`) recovers the
+    /// exact dense Newton correction on the full ρ-vector — the small-K
+    /// FD-consistency configuration the module docs describe.
+    pub fn with_border_axes(rho_dim: usize, axes: Vec<usize>) -> Result<Self, String> {
+        let mut border_axes = axes;
+        border_axes.sort_unstable();
+        border_axes.dedup();
+        if let Some(&last) = border_axes.last() {
+            if last >= rho_dim {
+                return Err(format!(
+                    "SharedBorderTopology: border axis {last} out of range (rho_dim = {rho_dim})"
+                ));
+            }
+        }
+        Ok(Self {
+            border_axes,
+            rho_dim,
+        })
+    }
+
     /// Indices of the shared-border axes (sorted, deduplicated, in range).
     #[inline]
     pub fn border_axes(&self) -> &[usize] {
@@ -708,4 +734,242 @@ pub fn run_per_atom_efs(
         final_step_inf_norm: final_step_inf,
         converged,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::solver::outer_strategy::{
+        DeclaredHessianForm, Derivative, EfsEval, OuterEval, SeedOutcome,
+    };
+    use ndarray::array;
+
+    /// Exact outer-Hessian operator for the quadratic mock: `v ↦ A·v`.
+    struct QuadraticOperator {
+        a: Array2<f64>,
+    }
+
+    impl OuterHessianOperator for QuadraticOperator {
+        fn dim(&self) -> usize {
+            self.a.nrows()
+        }
+        fn matvec(&self, v: &Array1<f64>) -> Result<Array1<f64>, String> {
+            Ok(self.a.dot(v))
+        }
+    }
+
+    /// Quadratic mock objective `f(ρ) = ½ (ρ − t)ᵀ A (ρ − t)`.
+    ///
+    /// The FD-consistency discipline of the module docs, made executable:
+    /// `eval_efs` returns the **decoupled** per-coordinate step
+    /// `−g_i / A_ii` (each coordinate's own Newton step from its own gradient
+    /// entry and curvature scale — the shape of `compute_efs_update`), `eval`
+    /// returns the *same* analytic gradient `A(ρ − t)` plus the exact
+    /// operator, and `eval_cost` the same cost. Every layer of the per-atom
+    /// runner is thereby probed against one shared ground truth.
+    struct QuadraticObjective {
+        a: Array2<f64>,
+        target: Array1<f64>,
+    }
+
+    impl QuadraticObjective {
+        fn grad(&self, rho: &Array1<f64>) -> Array1<f64> {
+            self.a.dot(&(rho - &self.target))
+        }
+        fn cost(&self, rho: &Array1<f64>) -> f64 {
+            let e = rho - &self.target;
+            0.5 * e.dot(&self.a.dot(&e))
+        }
+    }
+
+    impl OuterObjective for QuadraticObjective {
+        fn capability(&self) -> OuterCapability {
+            OuterCapability {
+                gradient: Derivative::Analytic,
+                hessian: DeclaredHessianForm::Dense,
+                n_params: self.a.nrows(),
+                psi_dim: 0,
+                fixed_point_available: true,
+                barrier_config: None,
+                prefer_gradient_only: false,
+                disable_fixed_point: false,
+            }
+        }
+        fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+            Ok(self.cost(rho))
+        }
+        fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+            Ok(OuterEval {
+                cost: self.cost(rho),
+                gradient: self.grad(rho),
+                hessian: HessianResult::Operator(Arc::new(QuadraticOperator {
+                    a: self.a.clone(),
+                })),
+                inner_beta_hint: None,
+            })
+        }
+        fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+            let g = self.grad(rho);
+            let steps: Vec<f64> = (0..rho.len()).map(|i| -g[i] / self.a[[i, i]]).collect();
+            Ok(EfsEval {
+                cost: self.cost(rho),
+                steps,
+                beta: None,
+                psi_gradient: None,
+                psi_indices: None,
+                inner_hessian_scale: None,
+            })
+        }
+        fn reset(&mut self) {}
+        fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+            Ok(SeedOutcome::NoSlot)
+        }
+    }
+
+    fn wide_bounds(dim: usize) -> PerAtomEfsConfig {
+        PerAtomEfsConfig::new(
+            1e-9,
+            200,
+            Array1::from_elem(dim, -50.0),
+            Array1::from_elem(dim, 50.0),
+        )
+    }
+
+    #[test]
+    fn with_border_axes_sorts_dedups_and_validates() {
+        let t = SharedBorderTopology::with_border_axes(8, vec![5, 1, 5, 3]).expect("topology");
+        assert_eq!(t.border_axes(), &[1, 3, 5]);
+        assert_eq!(t.border_count(), 3);
+        let err = SharedBorderTopology::with_border_axes(4, vec![0, 4]).unwrap_err();
+        assert!(err.contains("out of range"), "got: {err}");
+        // Empty border is the disjoint topology.
+        let t = SharedBorderTopology::with_border_axes(4, Vec::new()).expect("empty");
+        assert_eq!(t.border_count(), 0);
+    }
+
+    #[test]
+    fn decoupled_primary_converges_on_separable_objective() {
+        // Diagonal A: the per-atom decoupled step IS the exact Newton step for
+        // every coordinate, so the frontier primary must converge to the
+        // target with no border correction at all.
+        let dim = 96; // above PER_ATOM_EFS_MIN_RHO_DIM: a frontier-shaped K
+        let a = Array2::from_shape_fn((dim, dim), |(i, j)| {
+            if i == j { 1.0 + (i % 5) as f64 } else { 0.0 }
+        });
+        let target = Array1::from_shape_fn(dim, |i| ((i as f64) * 0.37).sin() * 2.0);
+        let mut obj = QuadraticObjective {
+            a,
+            target: target.clone(),
+        };
+        let cfg = wide_bounds(dim);
+        let topology = SharedBorderTopology::disjoint(dim);
+        let seed = Array1::zeros(dim);
+        let result = run_per_atom_efs(&mut obj, &seed, &cfg, &topology).expect("run");
+        assert!(result.converged, "separable quadratic must converge");
+        for i in 0..dim {
+            assert!(
+                (result.rho[i] - target[i]).abs() < 1e-6,
+                "coord {i}: {} vs target {}",
+                result.rho[i],
+                target[i]
+            );
+        }
+        assert!(result.final_value < 1e-10);
+    }
+
+    #[test]
+    fn border_correction_solves_the_coupled_block() {
+        // Axes 0 and 1 are coupled through an off-diagonal Hessian block (the
+        // arrow-border overlap); the rest are diagonal. With the populated
+        // topology and the exact operator the runner must land on the global
+        // optimum, and at that optimum the correction nulls (the
+        // FD-consistency invariant: zero outer gradient ⇒ zero step).
+        let dim = 6;
+        let mut a = Array2::<f64>::eye(dim) * 2.0;
+        a[[0, 1]] = 0.4;
+        a[[1, 0]] = 0.4;
+        let target = array![1.0, -2.0, 0.5, 0.0, -1.0, 3.0];
+        let mut obj = QuadraticObjective {
+            a,
+            target: target.clone(),
+        };
+        let cfg = wide_bounds(dim);
+        let topology = SharedBorderTopology::with_border_axes(dim, vec![0, 1]).expect("topology");
+        let seed = Array1::zeros(dim);
+        let result = run_per_atom_efs(&mut obj, &seed, &cfg, &topology).expect("run");
+        assert!(result.converged, "coupled quadratic must converge");
+        for i in 0..dim {
+            assert!(
+                (result.rho[i] - target[i]).abs() < 1e-5,
+                "coord {i}: {} vs target {}",
+                result.rho[i],
+                target[i]
+            );
+        }
+        assert!(
+            result.final_step_inf_norm < 1e-8,
+            "correction must null at the stationary point (got {})",
+            result.final_step_inf_norm
+        );
+    }
+
+    #[test]
+    fn theta_hvp_fd_fallback_matches_the_analytic_action() {
+        // The matrix-free θ-HVP's central-difference branch must reproduce
+        // H·v of the analytic quadratic to O(h²).
+        let a = array![[2.0, 0.3, 0.0], [0.3, 1.5, -0.2], [0.0, -0.2, 4.0]];
+        let target = array![0.5, -1.0, 2.0];
+        let rho = array![1.0, 0.2, -0.7];
+        let v = array![0.3, -1.1, 0.9];
+        let grad_at = |p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
+            Ok(a.dot(&(p - &target)))
+        };
+        let hv = theta_hvp_matrix_free(None, &rho, &v, grad_at).expect("hvp");
+        let exact = a.dot(&v);
+        for i in 0..3 {
+            assert!(
+                (hv[i] - exact[i]).abs() < 1e-6,
+                "component {i}: FD {} vs exact {}",
+                hv[i],
+                exact[i]
+            );
+        }
+        // Operator path: forwards to the exact matvec, bit-for-bit.
+        let op: Arc<dyn OuterHessianOperator> = Arc::new(QuadraticOperator { a: a.clone() });
+        let hv_op = theta_hvp_matrix_free(Some(&op), &rho, &v, grad_at).expect("op hvp");
+        for i in 0..3 {
+            assert_eq!(hv_op[i].to_bits(), exact[i].to_bits());
+        }
+    }
+
+    #[test]
+    fn full_border_reduces_to_dense_newton_in_one_correction() {
+        // When the border is the WHOLE ρ-vector (small K), layer 2 is the
+        // exact dense Newton step on the same gradient — so from any seed a
+        // pure quadratic should converge essentially immediately (Newton is
+        // exact; layer 1's decoupled part is then repaired by the line
+        // search). This is the "reduction to the coupled objective at small
+        // K" property of the module docs.
+        let dim = 4;
+        let a = array![
+            [3.0, 0.2, 0.0, 0.1],
+            [0.2, 2.0, 0.1, 0.0],
+            [0.0, 0.1, 1.5, 0.2],
+            [0.1, 0.0, 0.2, 2.5]
+        ];
+        let target = array![0.3, -0.6, 1.2, -0.1];
+        let mut obj = QuadraticObjective {
+            a,
+            target: target.clone(),
+        };
+        let cfg = wide_bounds(dim);
+        let topology =
+            SharedBorderTopology::with_border_axes(dim, (0..dim).collect()).expect("topology");
+        let seed = Array1::from_elem(dim, 2.0);
+        let result = run_per_atom_efs(&mut obj, &seed, &cfg, &topology).expect("run");
+        assert!(result.converged);
+        for i in 0..dim {
+            assert!((result.rho[i] - target[i]).abs() < 1e-5);
+        }
+    }
 }
