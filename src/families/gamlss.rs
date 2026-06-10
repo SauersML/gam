@@ -3477,7 +3477,6 @@ pub(crate) struct DispersionGlmLocationScaleFamily {
     kind: DispersionFamilyKind,
     y: Array1<f64>,
     weights: Array1<f64>,
-    policy: crate::resource::ResourcePolicy,
 }
 
 impl DispersionGlmLocationScaleFamily {
@@ -3770,7 +3769,6 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
             kind: self.kind,
             y: self.y.clone(),
             weights: self.weights.clone(),
-            policy: crate::resource::ResourcePolicy::default_library(),
         }
     }
 
