@@ -485,6 +485,7 @@ fn equal_ard_patch_atom(ard: [f64; 2]) -> FittedAtom {
         topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
         frame,
         ard_variances: Some(Array1::from(ard.to_vec())),
+        lowering_error: 0.0,
     }
 }
 

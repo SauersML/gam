@@ -75,6 +75,7 @@ fn identity_frame_atom() -> FittedAtom {
         topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
         frame: Array2::<f64>::eye(2),
         ard_variances: None,
+        lowering_error: 0.0,
     }
 }
 

@@ -3452,9 +3452,13 @@ fn dispersion_row_kernel(
                 // ∂ℓ/∂φ = c/φ²; chain to η_d = −log φ.
                 let s_phi = c / (phi * phi);
                 let s_eta = -phi * s_phi;
-                // −∂²ℓ/∂φ² = 2c/φ³ ⇒ wrt η_d weight = 2c/φ.
-                let disp_weight = (wi * 2.0 * c / phi).max(DISPERSION_MIN_CURVATURE);
-                let disp_response = ed + s_eta / (disp_weight / wi.max(DISPERSION_MIN_CURVATURE));
+                // −∂²ℓ/∂φ² = 2c/φ³ ⇒ Fisher information wrt η_d is 2c/φ. The
+                // working response divides by this per-row curvature so the
+                // prior weight cancels (and a zero-prior-weight row stays
+                // excluded via `disp_weight = 0`).
+                let curvature_eta = (2.0 * c / phi).max(DISPERSION_MIN_CURVATURE);
+                let disp_weight = wi * curvature_eta;
+                let disp_response = ed + s_eta / curvature_eta;
                 DispersionRowKernel {
                     loglik,
                     mean_weight,
