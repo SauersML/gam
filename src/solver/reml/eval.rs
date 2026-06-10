@@ -383,6 +383,29 @@ impl<'a> RemlState<'a> {
         lambdas: &Array1<f64>,
         ridge: f64,
     ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+        let (_, _, det1, det2) =
+            self.structural_penalty_logdet_value_and_derivatives(rs_transformed, lambdas, ridge)?;
+        Ok((det1, det2))
+    }
+
+    /// Same as [`structural_penalty_logdet_derivatives`] but also returns the
+    /// pseudo-logdet VALUE and rank from the SAME [`PenaltyPseudologdet`] the
+    /// derivatives are taken on.
+    ///
+    /// The value `log|Σ λ_k S_k|₊` and its ρ-derivatives `λ_k tr(S⁺ S_k)` must
+    /// range over the SAME positive eigenspace, or the analytic gradient
+    /// differentiates a different function than the cost reports (the
+    /// objective↔gradient desync class). Sourcing both from one
+    /// eigendecomposition is the structural cure — the rank convention
+    /// (eigenvalue-threshold over `Σ λ_k S_k + ridge·I`) is identical on both
+    /// sides by construction (#901: a separate structural-rank value path
+    /// desynced the GLM ρ-gradient against FD).
+    pub(super) fn structural_penalty_logdet_value_and_derivatives(
+        &self,
+        rs_transformed: &[Array2<f64>],
+        lambdas: &Array1<f64>,
+        ridge: f64,
+    ) -> Result<(f64, usize, Array1<f64>, Array2<f64>), EstimationError> {
         let k_count = lambdas.len();
         if rs_transformed.len() != k_count {
             return Err(EstimationError::LayoutError(format!(
@@ -392,7 +415,7 @@ impl<'a> RemlState<'a> {
             )));
         }
         if k_count == 0 {
-            return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+            return Ok((0.0, 0, Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
         }
 
         // Build S_k = R_k^T R_k for each penalty component.
@@ -406,8 +429,10 @@ impl<'a> RemlState<'a> {
         let pld = PenaltyPseudologdet::from_components(&s_k_matrices, lambdas_slice, ridge)
             .map_err(EstimationError::LayoutError)?;
 
+        let value = pld.value();
+        let rank = pld.rank();
         let (det1, det2) = pld.rho_derivatives(&s_k_matrices, lambdas_slice);
-        Ok((det1, det2))
+        Ok((value, rank, det1, det2))
     }
 
     /// Block-local penalty logdet derivatives using `CanonicalPenalty`.
@@ -420,6 +445,21 @@ impl<'a> RemlState<'a> {
         lambdas: &Array1<f64>,
         ridge: f64,
     ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
+        let (_, _, det1, det2) =
+            self.structural_penalty_logdet_value_and_derivatives_block_local(lambdas, ridge)?;
+        Ok((det1, det2))
+    }
+
+    /// Same as [`structural_penalty_logdet_derivatives_block_local`] but also
+    /// returns the pseudo-logdet VALUE and rank from the SAME object the
+    /// derivatives are taken on — see
+    /// [`structural_penalty_logdet_value_and_derivatives`] for why value and
+    /// derivative must share one positive eigenspace (#901).
+    pub(super) fn structural_penalty_logdet_value_and_derivatives_block_local(
+        &self,
+        lambdas: &Array1<f64>,
+        ridge: f64,
+    ) -> Result<(f64, usize, Array1<f64>, Array2<f64>), EstimationError> {
         // Kronecker fast path: compute logdet derivatives directly from the
         // marginal eigenvalue grid.  O(d · ∏q_j) with no coordinate-frame
         // dependence — eigenvalues of Σ_k λ_k (I⊗...⊗S_k⊗...⊗I) are invariant
@@ -427,13 +467,13 @@ impl<'a> RemlState<'a> {
         // whether P-IRLS uses standard or factored Qs.
         if let Some(ref kron) = self.kronecker_penalty_system {
             let lambdas_slice = lambdas.as_slice().unwrap();
-            let (_, det1, det2) = kron.logdet_and_derivatives(lambdas_slice, ridge);
-            return Ok((det1, det2));
+            let (logdet, rank, det1, det2) = kron.logdet_rank_and_derivatives(lambdas_slice, ridge);
+            return Ok((logdet, rank, det1, det2));
         }
 
         let k_count = self.canonical_penalties.len();
         if k_count == 0 || lambdas.len() != k_count {
-            return Ok((Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
+            return Ok((0.0, 0, Array1::zeros(k_count), Array2::zeros((k_count, k_count))));
         }
 
         let lambdas_slice = lambdas.as_slice().unwrap();
@@ -446,9 +486,11 @@ impl<'a> RemlState<'a> {
         )
         .map_err(EstimationError::LayoutError)?;
 
+        let value = pld.value();
+        let rank = pld.rank();
         let (det1, det2) =
             pld.rho_derivatives_from_penalties(&self.canonical_penalties, lambdas_slice);
-        Ok((det1, det2))
+        Ok((value, rank, det1, det2))
     }
 
     pub(super) fn compute_lamlhessian_exact_from_bundle(
