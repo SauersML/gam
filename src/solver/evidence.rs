@@ -2905,7 +2905,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn coned_confines_to_component_on_decoupled_hessian() {
         // Block-decoupled H: blocks {0,1} and {2,3}. A column supported only in
         // block {0,1} must produce sensitivity zero in block {2,3}, and match
@@ -2926,7 +2925,7 @@ mod tests {
         let mut dg = Array2::<f64>::zeros((4, 1));
         dg[[0, 0]] = 0.9;
         dg[[1, 0]] = -0.4;
-        let supports = vec![0..2usize];
+        let supports = [0..2usize];
 
         let coned =
             ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| inv.dot(rhs)).unwrap();
@@ -2948,11 +2947,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn coned_skips_inactive_column_with_empty_support() {
         let h = Array2::<f64>::eye(2);
         let dg = Array2::<f64>::zeros((2, 1));
-        let supports = vec![0..0usize]; // inactive ρ
+        let supports = [0..0usize]; // inactive ρ
         let coned = ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| {
             // An empty-support column must be skipped without solving. If the
             // solver is ever invoked it returns NaN, which the zero-assertions

@@ -37,7 +37,7 @@
 
 use std::sync::Arc;
 
-use ndarray::{Array2, Array3};
+use ndarray::Array2;
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::inference::steering::steer_delta;

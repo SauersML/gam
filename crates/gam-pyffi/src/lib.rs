@@ -14583,13 +14583,17 @@ struct TangentRemlMultiResult {
     coefficients: Array2<f64>,
     /// Per-output fitted tangent values `X · β_d`, shape `(N, D)`.
     fitted: Array2<f64>,
-    /// Per-output residual variance, length `D`.
+    /// Pooled isotropic residual variance, length 1. Isotropic tangent noise
+    /// (`Cov = σ²·I_D`) is the rotation-invariant noise model; a per-coordinate
+    /// scale would itself break frame equivariance.
     sigma2: Array1<f64>,
-    /// Per-output, per-block fitted smoothing parameters, shape `(D, M)`.
-    lambdas: Array2<f64>,
-    /// Per-output, per-block effective degrees of freedom, shape `(D, M)`.
-    edf: Array2<f64>,
-    /// Joint REML score (summed over coordinates).
+    /// Shared per-smooth fitted smoothing parameters, length `M`. One λ per
+    /// formula smooth, common to every tangent output coordinate.
+    lambdas: Array1<f64>,
+    /// Shared per-smooth effective degrees of freedom, length `M` (the full
+    /// effective df of the `Sᵇ ⊗ I_D` block across all `D` outputs).
+    edf: Array1<f64>,
+    /// Joint REML score.
     reml_score: f64,
 }
 
@@ -14671,13 +14675,27 @@ fn gaussian_reml_fit_formula_table_impl(
         validate_dense_fisher_w(n, d, *w)?;
     }
 
-    // Build the joint block-diagonal multi-output system. Tangent coordinate
-    // (output) `o` owns coefficient columns `o*K .. (o+1)*K`. Each observation
-    // contributes `D` stacked rows indexed by a metric axis; the per-row
-    // whitening factor `L Lᵀ = W_row · diag(weight)` couples the coordinate
-    // blocks across outputs. Without a Fisher-Rao metric `L = sqrt(weight)·I`,
-    // which decouples the system into `D` independent per-coordinate GAMs — the
-    // documented behaviour.
+    // Build the joint multi-output system with a SHARED smoothing parameter per
+    // formula smooth, common to all `D` tangent output coordinates. This is what
+    // makes the fit frame-equivariant: the tangent vector field `f: x ↦ T_μ M` is
+    // a single vector-valued function whose smoothness is a property of the
+    // predictor `x`, NOT of the arbitrary ambient coordinate axis. One λ per
+    // smooth (shared across outputs) makes the smoother output-isotropic,
+    // `B = S(λ)·Y`, so a rotation `Y ↦ Y Rᵀ` of the response frame maps
+    // `B ↦ B Rᵀ` and the predictions `X B ↦ (X B) Rᵀ` exactly. Per-output
+    // independent λ (the old scheme) broke this: a rotation that mixes a
+    // high-curvature tangent direction with a low-curvature one is smoothed
+    // differently after the mix, so the fitted surface — and the predictions —
+    // depended on the axis labelling.
+    //
+    // Coefficients use an INTERLEAVED layout: basis column `c` (0..K) of output
+    // `o` (0..D) lives at global index `c*D + o` (the row-major flatten of the
+    // `(K, D)` coefficient matrix). Interleaving makes the `D` copies of every
+    // formula penalty block contiguous, so a single shared λ can drive the
+    // Kronecker penalty `Sᵇ ⊗ I_D` over them. Each observation still contributes
+    // `D` stacked rows indexed by a metric axis; the per-row whitening factor
+    // `L Lᵀ = W_row · metric` couples the coordinate blocks across outputs
+    // (`L = sqrt(weight)·I` without a Fisher-Rao metric).
     let p_total = k * d;
     let mut joint_x = Array2::<f64>::zeros((n * d, p_total));
     let mut joint_y = Array1::<f64>::zeros(n * d);
@@ -14720,40 +14738,51 @@ fn gaussian_reml_fit_formula_table_impl(
                     continue;
                 }
                 y_value += l_t * y[[row, output]];
-                let col_offset = output * k;
                 for col in 0..k {
-                    joint_x[[stacked_row, col_offset + col]] = l_t * x[[row, col]];
+                    joint_x[[stacked_row, col * d + output]] = l_t * x[[row, col]];
                 }
             }
             joint_y[stacked_row] = y_value;
         }
     }
 
-    // Replicate every formula penalty block once per output, shifted into that
-    // output's coefficient sub-range. Each replicated block gets its own λ, so
-    // the general REML driver estimates per-coordinate, per-smooth smoothing
-    // parameters — exactly one scalar GAM's worth of penalties per coordinate.
+    // One SHARED penalty per formula smooth: the Kronecker block `Sᵇ ⊗ I_D` over
+    // the interleaved columns `bs*D .. be*D`, driven by a single λ_b common to all
+    // `D` outputs. The general REML driver assigns one λ per `BlockwisePenalty`, so
+    // emitting `M` blocks — not `M*D` — is exactly what ties the smoothing across
+    // tangent coordinates and yields the output-isotropic, frame-equivariant fit.
     let m = design.penalties.len();
-    let mut s_list: Vec<gam::smooth::BlockwisePenalty> = Vec::with_capacity(m * d);
-    for output in 0..d {
-        let offset = output * k;
-        for penalty in &design.penalties {
-            if penalty.col_range.start > penalty.col_range.end
-                || penalty.col_range.end > k
-                || penalty.col_range.len() != penalty.local.nrows()
-                || penalty.col_range.len() != penalty.local.ncols()
-            {
-                return Err(format!(
-                    "formula penalty range {:?} is incompatible with design width {k}",
-                    penalty.col_range
-                ));
-            }
-            let shifted = (offset + penalty.col_range.start)..(offset + penalty.col_range.end);
-            s_list.push(gam::smooth::BlockwisePenalty::new(
-                shifted,
-                penalty.local.clone(),
+    let mut s_list: Vec<gam::smooth::BlockwisePenalty> = Vec::with_capacity(m);
+    for penalty in &design.penalties {
+        if penalty.col_range.start > penalty.col_range.end
+            || penalty.col_range.end > k
+            || penalty.col_range.len() != penalty.local.nrows()
+            || penalty.col_range.len() != penalty.local.ncols()
+        {
+            return Err(format!(
+                "formula penalty range {:?} is incompatible with design width {k}",
+                penalty.col_range
             ));
         }
+        let q = penalty.col_range.len();
+        // `Sᵇ ⊗ I_D` over the interleaved columns: the entry at local
+        // `(i*D + o, j*D + p)` is `Sᵇ[i, j]·δ(o, p)`, so output `o`'s copy of
+        // the block sees exactly `Sᵇ` and the single λ penalizes every output's
+        // copy identically — the shared-smoothing coupling.
+        let mut kron = Array2::<f64>::zeros((q * d, q * d));
+        for i in 0..q {
+            for j in 0..q {
+                let value = penalty.local[[i, j]];
+                if value == 0.0 {
+                    continue;
+                }
+                for o in 0..d {
+                    kron[[i * d + o, j * d + o]] = value;
+                }
+            }
+        }
+        let shifted = (penalty.col_range.start * d)..(penalty.col_range.end * d);
+        s_list.push(gam::smooth::BlockwisePenalty::new(shifted, kron));
     }
     if s_list.is_empty() {
         return Err(
@@ -14810,103 +14839,98 @@ fn gaussian_reml_fit_formula_table_impl(
     // ridge with non-positive scale): see
     // `construction::canonicalize_penalty_specs`. The surviving penalties are
     // compacted, so `fit.lambdas` / `inference.edf_by_block` are reported in
-    // canonical-compacted order — NOT in `s_list` order. A rigid
-    // `output * m + block` stride would therefore misalign per-coordinate λ/edf
-    // across tangent coordinates whenever any block canonicalizes away.
+    // canonical-compacted order — NOT in `s_list` order. A rigid `block` stride
+    // would therefore misalign the shared λ/edf whenever a block canonicalizes
+    // away.
     //
-    // Recover the canonical→`s_list` mapping by replaying the exact same
-    // per-spec canonicalization the solver ran. `s_list` was built in
-    // `for output { for block }` order, so entry `i` originates from tangent
-    // coordinate `i / m`, formula block `i % m`. We record, for each surviving
-    // canonical position, its origin `(output, block)` and its penalty rank
-    // (needed to partition the joint effective df into per-coordinate shares).
+    // Recover the canonical→`s_list` mapping by replaying the exact same per-spec
+    // canonicalization the solver ran. `s_list` entry `b` is formula smooth `b`
+    // (its shared `Sᵇ ⊗ I_D` block). We record, for each surviving canonical
+    // position, its origin block and the block's penalty rank (`rank(Sᵇ)·D` —
+    // the full rank across all `D` outputs), needed for the residual-df total.
     let specs: Vec<gam::estimate::PenaltySpec> = s_list
         .iter()
         .map(gam::estimate::PenaltySpec::from_blockwise_ref)
         .collect();
-    let mut survivor_origin: Vec<(usize, usize, f64)> = Vec::with_capacity(s_list.len());
-    for (i, spec) in specs.iter().enumerate() {
+    let mut survivor_block: Vec<(usize, f64)> = Vec::with_capacity(s_list.len());
+    for (b, spec) in specs.iter().enumerate() {
         if let Some(canonical) = gam::construction::canonicalize_penalty_spec(
             spec,
             p_total,
-            i,
+            b,
             "shared_tangent_gaussian_reml",
         )
         .map_err(|err| err.to_string())?
         {
-            survivor_origin.push((i / m, i % m, canonical.rank() as f64));
+            survivor_block.push((b, canonical.rank() as f64));
         }
     }
 
-    // Unpack per-output coefficients and recover the unwhitened fitted tangent
-    // values, residual variance, and per-coordinate smoothing diagnostics.
+    // Unpack the interleaved coefficients into the `(K, D)` grid: output `o`,
+    // basis column `c` lives at joint index `c*D + o`. Recover the unwhitened
+    // fitted tangent values and the smoothing diagnostics.
     let mut coefficients = Array2::<f64>::zeros((k, d));
-    for output in 0..d {
-        let offset = output * k;
-        for col in 0..k {
-            coefficients[[col, output]] = fit.beta[offset + col];
+    for col in 0..k {
+        for output in 0..d {
+            coefficients[[col, output]] = fit.beta[col * d + output];
         }
     }
     let fitted = x.dot(&coefficients);
-    let mut weight_sum = 0.0;
-    for row in 0..n {
-        weight_sum += weights[row];
-    }
+    let weight_sum: f64 = weights.iter().copied().sum();
     let edf_by_block = fit
         .inference
         .as_ref()
         .map(|inf| inf.edf_by_block.clone())
-        .unwrap_or_else(|| vec![0.0; survivor_origin.len()]);
-    if fit.lambdas.len() != survivor_origin.len() || edf_by_block.len() != survivor_origin.len() {
+        .unwrap_or_else(|| vec![0.0; survivor_block.len()]);
+    if fit.lambdas.len() != survivor_block.len() || edf_by_block.len() != survivor_block.len() {
         return Err(format!(
             "shared-tangent Gaussian REML smoothing-diagnostic length mismatch: solver reported \
              {} lambdas and {} edf entries but {} penalty blocks survived canonicalization",
             fit.lambdas.len(),
             edf_by_block.len(),
-            survivor_origin.len()
+            survivor_block.len()
         ));
     }
 
-    // Scatter the canonical-order λ/edf back into the `(D, M)` grid by origin.
-    // A block dropped during canonicalization (numerical rank 0) carries no
-    // smoothing parameter and contributes zero effective df, so its grid cell
-    // is left at 0 — never NaN-padded by a stride that ran off the end.
-    let mut edf = Array2::<f64>::zeros((d, m));
-    let mut lambdas = Array2::<f64>::zeros((d, m));
-    // Per-output penalized-block rank and effective df, used to partition the
-    // joint effective df into per-coordinate residual-variance denominators.
-    let mut penalized_rank = vec![0.0_f64; d];
-    let mut penalized_edf = vec![0.0_f64; d];
-    for (canonical_pos, &(output, block, rank)) in survivor_origin.iter().enumerate() {
+    // Scatter the canonical-order shared λ/edf back into the per-smooth vectors
+    // (length `M`). A block dropped during canonicalization (numerical rank 0)
+    // carries no smoothing parameter and contributes zero effective df, so its
+    // cell stays 0 — never NaN-padded by a stride that ran off the end. The
+    // `edf_by_block` value already accounts for all `D` outputs of the shared
+    // Kronecker block, and `rank = rank(Sᵇ)·D` likewise.
+    let mut edf = Array1::<f64>::zeros(m);
+    let mut lambdas = Array1::<f64>::zeros(m);
+    let mut penalized_rank_total = 0.0_f64;
+    let mut penalized_edf_total = 0.0_f64;
+    for (canonical_pos, &(block, rank)) in survivor_block.iter().enumerate() {
         let edf_value = edf_by_block[canonical_pos];
-        edf[[output, block]] = edf_value;
-        lambdas[[output, block]] = fit.lambdas[canonical_pos];
-        penalized_rank[output] += rank;
-        penalized_edf[output] += edf_value;
+        edf[block] = edf_value;
+        lambdas[block] = fit.lambdas[canonical_pos];
+        penalized_rank_total += rank;
+        penalized_edf_total += edf_value;
     }
 
-    // Per-coordinate residual scale uses the canonical Gaussian denominator
-    // `n - edf_output`, where `edf_output` is the FULL effective df owned by
-    // that coordinate's `k` columns — unpenalized columns (intercept,
-    // parametric terms) each count 1, penalized columns count their bounded
-    // edf. This mirrors `n - edf_total` in the core Gaussian scale
-    // (`smooth.rs`) and `n - k` in the sibling closed-form multi-output path:
-    //   edf_output = (k - penalized_rank_output) + penalized_edf_output
-    // i.e. the `penalized_rank` columns shrink to `penalized_edf` df while the
-    // remaining `k - penalized_rank` columns are unpenalized and count fully.
-    // Omitting the `(k - penalized_rank)` unpenalized term (as the prior code
-    // did) overstates residual df and biases sigma2 low.
-    let mut sigma2 = Array1::<f64>::zeros(d);
-    for output in 0..d {
-        let edf_output = (k as f64 - penalized_rank[output]) + penalized_edf[output];
-        let denom = (weight_sum - edf_output).max(1.0);
-        let mut ss = 0.0;
-        for row in 0..n {
+    // Pooled, isotropic residual variance. Isotropic tangent noise
+    // (`Cov = σ²·I_D`) is the rotation-invariant noise model; a per-coordinate
+    // scale would itself break frame equivariance. The joint system is a single
+    // Gaussian model with one scale over the `n·D` stacked rows, so we report one
+    // pooled σ̂² with the canonical Gaussian denominator `D·W − edf_total`, where
+    //   edf_total = (K·D − penalized_rank_total) + penalized_edf_total
+    // counts each unpenalized column (intercept, parametric terms, of which there
+    // are `K·D − penalized_rank_total`) once and shrinks the penalized columns to
+    // their bounded effective df — the multi-output analogue of `n − edf` in the
+    // scalar Gaussian scale (`smooth.rs`). Omitting the unpenalized term would
+    // overstate residual df and bias σ² low.
+    let edf_total = (k as f64 * d as f64 - penalized_rank_total) + penalized_edf_total;
+    let denom = (d as f64 * weight_sum - edf_total).max(1.0);
+    let mut ss = 0.0;
+    for row in 0..n {
+        for output in 0..d {
             let resid = y[[row, output]] - fitted[[row, output]];
             ss += weights[row] * resid * resid;
         }
-        sigma2[output] = ss / denom;
     }
+    let sigma2 = Array1::<f64>::from_elem(1, ss / denom);
 
     Ok(TangentRemlMultiResult {
         coefficients,
