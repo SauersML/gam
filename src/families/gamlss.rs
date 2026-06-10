@@ -3566,19 +3566,21 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
 
     /// The mean and precision working weights couple across both blocks, which
     /// the block-local diagonal drift hook cannot represent, so decline the
-    /// dense outer Hessian capability and let the engine select the
-    /// first-order (gradient-only) outer optimizer.
+    /// dense outer Hessian capability whenever the actual two-block (or
+    /// larger) geometry is in play; a degenerate single-block probe — there
+    /// is no cross-block coupling to reject — keeps the trait default's
+    /// availability verdict.
     ///
-    /// Mirrors the trait default's spec-consistency contract — every override
-    /// must still validate the block-spec slice it is handed before answering
-    /// the capability question; the only difference here is the verdict.
+    /// The override still validates the block-spec slice it is handed (the
+    /// same consistency check the trait default's assertion bottoms out in)
+    /// so a malformed probe is reported here rather than downstream.
     fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
         assert!(
             crate::custom_family::validate_blockspec_consistency(specs).is_ok(),
             "DispersionGlmLocationScale outer hyper-Hessian dense availability: \
              inconsistent parameter block specs"
         );
-        false
+        specs.len() < 2
     }
 }
 
@@ -3745,9 +3747,25 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
 
     fn build_family(
         &self,
-        _mean_design: &TermCollectionDesign,
-        _noise_design: &TermCollectionDesign,
+        mean_design: &TermCollectionDesign,
+        noise_design: &TermCollectionDesign,
     ) -> Self::Family {
+        // The family stores y/weights/kind directly and does not need the
+        // designs at construction time, but the row geometry of the offered
+        // designs is the only cross-check that ties this family back to the
+        // builder's data — assert it before handing the family to the engine
+        // so a misaligned design surfaces here rather than downstream in the
+        // inner solver.
+        assert_eq!(
+            mean_design.design.nrows(),
+            self.y.len(),
+            "DispersionGlmLocationScale::build_family: mean design row count must match y"
+        );
+        assert_eq!(
+            noise_design.design.nrows(),
+            self.y.len(),
+            "DispersionGlmLocationScale::build_family: noise design row count must match y"
+        );
         DispersionGlmLocationScaleFamily {
             kind: self.kind,
             y: self.y.clone(),
