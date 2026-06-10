@@ -1779,9 +1779,9 @@ const SAE_FRAME_ACTIVATION_MARGIN: f64 = 0.25;
 /// span (the Grassmann point) is invariant. For deterministic serialization we
 /// pin a canonical representative: the frame is the left-singular subspace of
 /// the cross-moment, ordered by descending singular value, with each column's
-/// sign fixed so its largest-magnitude entry is non-negative. This is recorded
-/// by [`Self::singular_value_gauge`] so the same span always serializes to the
-/// same bytes (no run-to-run rotation drift).
+/// sign fixed so its largest-magnitude entry is non-negative. The ordering is
+/// recorded by the `gauge_singular_values` field so the same span always
+/// serializes to the same bytes (no run-to-run rotation drift).
 #[derive(Debug, Clone)]
 pub struct GrassmannFrame {
     /// Column-orthonormal frame `U`, shape `(p, r)` with `Uᵀ U = I_r`.

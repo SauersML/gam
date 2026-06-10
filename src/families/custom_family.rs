@@ -6911,6 +6911,43 @@ pub struct ExactNewtonJointPsiSecondOrderTerms {
     pub hessian_psi_psi_operator: Option<Box<dyn HyperOperator>>,
 }
 
+/// Direction-contracted second-order ψ terms for the profiled θ-HVP (#740).
+///
+/// The per-pair [`ExactNewtonJointPsiSecondOrderTerms`] are the `(ψ_i, ψ_j)`
+/// entries of the joint hyper-Hessian; assembling the full outer Hessian from
+/// them costs one O(n) family row pass per pair, i.e. `K²·n`. A matrix-free
+/// profiled θ-HVP never needs the individual pairs — it needs, for one applied
+/// outer direction with ψ-weights `α_ψ`, the `α`-contraction of those pairs
+/// against the combined ψ-direction `ψ(α) = Σ_j α_j ψ_j`:
+///
+/// ```text
+///   objective[i] = Σ_j α_j V_{ψ_i ψ_j}
+///   score[i]     = Σ_j α_j g_{ψ_i ψ_j}          (a p-vector per output row i)
+///   hessian[i]   = Σ_j α_j D²_β H_L[ψ_i, ψ_j]
+///                = D²_β H_L[ψ_i, ψ(α)]            (bilinearity)
+/// ```
+///
+/// All `psi_dim` output rows share the SAME contracted second leg `ψ(α)`, so a
+/// family that streams its rows once over `ψ(α)` (carrying every fixed first
+/// leg `ψ_i` as a batched factor column) produces every row in a SINGLE n-pass.
+/// That is the cost the profiled θ-HVP turns into `K·n`-to-densify /
+/// `m·n`-in-CG instead of the dense path's `K²·n`.
+///
+/// Indexing is over the flattened ψ coordinates in the same order as
+/// [`ExactNewtonJointPsiWorkspace::second_order_terms`]; `hessian[i]` carries
+/// the `D²_β H_L[ψ_i, ψ(α)]` drift as a [`DriftDerivResult`] (dense or
+/// operator-backed) plus any block-local `S_{ψ_i ψ_j}` penalty motion folded by
+/// the family, exactly mirroring the per-pair `hessian_psi_psi(_operator)`.
+pub struct ExactNewtonJointPsiSecondOrderContracted {
+    /// `objective[i] = Σ_j α_j V_{ψ_i ψ_j}`, one scalar per ψ output row.
+    pub objective: Array1<f64>,
+    /// `score[i] = Σ_j α_j g_{ψ_i ψ_j}`, the `psi_dim × total` matrix whose
+    /// row `i` is the contracted fixed-β score derivative for output row `i`.
+    pub score: Array2<f64>,
+    /// `hessian[i] = D²_β H_L[ψ_i, ψ(α)]` for each ψ output row `i`.
+    pub hessian: Vec<DriftDerivResult>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JointHessianSourcePreference {
     Dense,
