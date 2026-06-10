@@ -3997,7 +3997,13 @@ impl<'a> RemlState<'a> {
 
         // `Δ_b` is added to the marginal log-likelihood ⇒ subtracted from the
         // REML cost. The gradient ∂Δ_b/∂ρ likewise enters the cost with a
-        // negative sign. Zero-extend over external coordinates.
+        // negative sign. Zero-extend over external coordinates — note this is
+        // a further truncation on top of the explicit-channel-only ρ-gradient:
+        // Δ_b moves with ψ through η̂, H's eigenpairs, and the penalty scores,
+        // so the ψ-entries of the exact gradient are NOT zero. See the
+        // "Gradient exactness contract" on `block_sampled_marginal_correction`
+        // for the four-channel pathwise derivative this splice still owes and
+        // the sufficient-statistics seam designed to deliver it.
         let mut gradient = Array1::<f64>::zeros(n_rho + n_ext);
         for k in 0..n_rho.min(sampled.rho_gradient.len()) {
             gradient[k] = -sampled.rho_gradient[k];

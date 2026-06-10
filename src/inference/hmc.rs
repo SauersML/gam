@@ -6149,8 +6149,58 @@ pub trait BlockExcessTarget {
 /// `value` is `Δ_b = A_exact − A_Lap`, the log-ratio of the true block free
 /// energy to its Laplace value, to be **added** to the marginal log-likelihood
 /// (equivalently **subtracted** from the REML/LAML cost).  `rho_gradient` is
-/// `∂Δ_b/∂ρ`, the consistent outer-coordinate gradient computed from the same
-/// importance draws.  Both are exactly zero when the block is Gaussian.
+/// `∂Δ_b/∂ρ` restricted to the explicit penalty-score channel, computed from
+/// the same importance draws.  Both are exactly zero when the block is
+/// Gaussian.
+///
+/// ## Gradient exactness contract (#901 follow-up): the explicit channel is
+/// ## NOT the total derivative of the realized estimator
+///
+/// With a fixed-seed draw set `z_s`, the realized estimator is a
+/// deterministic function of θ = (ρ, ψ):
+///
+/// ```text
+///   Δ_b(θ) = log mean_s exp(−ΔF(t_s(θ); fields(θ))),   t_{s,r} = z_{s,r}/√λ_r(θ)
+/// ```
+///
+/// and a centered finite difference of the outer cost differentiates THIS
+/// function. Its exact derivative is the importance-weighted average of the
+/// TOTAL per-draw derivative, which has four channels:
+///
+/// ```text
+///   dΔF_s/dθ_j = (a) ∂ΔF/∂θ_j |_{t, fields}          explicit penalty score
+///              + (b) Σ_r (∂ΔF/∂t_r)(−½ t_{s,r}) d log λ_r/dθ_j   draw rescale
+///              + (c) Σ_r t_{s,r} (∂ΔF/∂δ)ᵀ dV_b[:,r]/dθ_j        frame rotation
+///              + (d) (∂ΔF/∂β̂-fields) · dβ̂/dθ_j                   mode motion
+/// ```
+///
+/// where `dλ_r/dθ_j = u_rᵀ Ḣ_j u_r` and `dV_b[:,r]/dθ_j = Σ_{q≠r} u_q
+/// (u_qᵀ Ḣ_j u_r)/(λ_r − λ_q)` are first-order eigenpair perturbations under
+/// the TOTAL Hessian drift `Ḣ_j = A_j + D_β H[v_j]`, and `v_j = dβ̂/dθ_j` is
+/// the IFT mode response. Channel (d) is NOT absorbed by the envelope
+/// theorem: the envelope argument kills `∂V/∂β̂ · dβ̂/dθ` only for the
+/// Laplace objective in which β̂ is stationary — `Δ_b` is an additional
+/// functional of β̂ (through η̂, the base deviance, the penalty scores, and
+/// W) with no stationarity of its own.
+///
+/// Only channel (a) is implemented. The consequence is an
+/// objective↔gradient desync (the #752/#748/#808 bug class): whenever the
+/// fallback ENGAGES on a fit, the spliced gradient differs from the
+/// derivative of the spliced cost by channels (b)–(d), and the outer
+/// optimizer descends a surface that is not the one being evaluated.
+///
+/// The principled completion (deliberately NOT a partial sum of cheap
+/// channels — a half-exact gradient still desyncs): the sampler returns
+/// per-draw sufficient statistics — importance weights `w_s`, draws `t_s`,
+/// and the per-draw integrand gradients `∂ΔF/∂δ|_s` (one displaced-score
+/// pass per draw) plus the field-channel moments — and the OUTER gradient
+/// assembly, which already owns `Ḣ_j`, `v_j`, and the spectral
+/// decomposition of `H`, contracts them per coordinate. That keeps a single
+/// source of truth: the same `Ḣ_j` that drives the logdet trace also drives
+/// the eigenpair perturbations here, so the two corrections cannot disagree
+/// about what "the direction θ_j" means. Until that seam exists, treat an
+/// engaged #784 fallback as gradient-degrading and FD drivers that engage
+/// it as measuring channels (b)–(d), not Monte-Carlo noise.
 #[derive(Clone, Debug)]
 pub struct BlockSampledMarginal {
     /// `Δ_b`: additive correction to the block marginal log-likelihood.
