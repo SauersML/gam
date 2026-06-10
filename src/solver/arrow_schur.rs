@@ -90,7 +90,7 @@
 //! find yourself extending `ArrowSchurSystem` with an outer-REML gradient
 //! hook, re-read the inner/outer cost split documented above first.
 
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -876,6 +876,31 @@ pub struct FactoredFrameKroneckerOp {
     pub blocks: Vec<FactoredFrameGBlock>,
 }
 
+/// Frame output Gram `U_iᵀ U_j` (`r_i × r_j`) between two per-atom output
+/// frames (each `p × r`). This is the dense principal-angle cosine matrix that
+/// becomes the `w` factor of a [`FactoredFrameGBlock`]; for `i == j` with an
+/// orthonormal frame it is `I_{r_i}`. Shared with `sae_manifold.rs`, which
+/// builds the same factors when profiling decoders onto Grassmann frames.
+pub fn frame_output_gram(u_i: ArrayView2<f64>, u_j: ArrayView2<f64>) -> Array2<f64> {
+    let (p_i, r_i) = u_i.dim();
+    let (p_j, r_j) = u_j.dim();
+    assert_eq!(
+        p_i, p_j,
+        "frame_output_gram: frames live in different ambient dims ({p_i} vs {p_j})"
+    );
+    let mut w = Array2::<f64>::zeros((r_i, r_j));
+    for a in 0..r_i {
+        for b in 0..r_j {
+            let mut acc = 0.0;
+            for c in 0..p_i {
+                acc += u_i[[c, a]] * u_j[[c, b]];
+            }
+            w[[a, b]] = acc;
+        }
+    }
+    w
+}
+
 impl FactoredFrameKroneckerOp {
     /// Build from per-atom ranks + basis sizes and the co-occurring blocks.
     /// Computes the β offsets (prefix sum of `M_k·r_k`) and validates that each
@@ -936,6 +961,82 @@ impl FactoredFrameKroneckerOp {
             dim,
             blocks,
         })
+    }
+
+    /// Convenience constructor that builds the operator directly from per-atom
+    /// output frames + the basis-space Gram block map, computing the per-pair
+    /// frame factors `W_ij = U_iᵀ U_j` itself.
+    ///
+    /// `frames[k]` is either `Some(U_k)` — a `p × r_k` (`r_k ≤ p`) output frame
+    /// (a Grassmann representative `St(p, r_k)` need not be orthonormal here; the
+    /// `W` factor carries whatever frame is supplied) — or `None`, meaning atom
+    /// `k` keeps the full ambient output (`U_k = I_p`, so `r_k = p`). For each
+    /// non-empty Gram block `(atom_i, atom_j)` the factor `W` is
+    /// `U_iᵀ U_j` (`r_i × r_j`), with the `None` frame standing in for `I_p`:
+    /// a framed×unframed cross gives `W = U_iᵀ` (`r_i × p`) and an unframed
+    /// diagonal gives `W = I_p` — exactly reproducing the `g ⊗ I_p` full-`B`
+    /// block. The resulting blocks are handed to [`Self::new`], which validates
+    /// the `(M, r)` shapes and computes the β offsets.
+    pub fn from_frames_and_blocks(
+        frames: &[Option<Array2<f64>>],
+        basis_sizes: &[usize],
+        p: usize,
+        g_blocks: &std::collections::BTreeMap<(usize, usize), Array2<f64>>,
+    ) -> Result<Self, String> {
+        if frames.len() != basis_sizes.len() {
+            return Err(format!(
+                "FactoredFrameKroneckerOp::from_frames_and_blocks: {} frames but {} basis sizes",
+                frames.len(),
+                basis_sizes.len()
+            ));
+        }
+        let n_atoms = frames.len();
+        // Per-atom rank: ncols of a supplied frame, else the ambient dim p.
+        let mut ranks = Vec::with_capacity(n_atoms);
+        for (k, frame) in frames.iter().enumerate() {
+            match frame {
+                Some(u) => {
+                    let (pr, r) = u.dim();
+                    if pr != p {
+                        return Err(format!(
+                            "FactoredFrameKroneckerOp::from_frames_and_blocks: frame {k} has {pr} rows but ambient dim is {p}"
+                        ));
+                    }
+                    if r > p {
+                        return Err(format!(
+                            "FactoredFrameKroneckerOp::from_frames_and_blocks: frame {k} has rank {r} > ambient dim {p}"
+                        ));
+                    }
+                    ranks.push(r);
+                }
+                None => ranks.push(p),
+            }
+        }
+        // Materialize each atom's frame as a `p × r_k` view source: the supplied
+        // `U_k`, or `I_p` for the unframed atoms.
+        let identity = Array2::<f64>::eye(p);
+        let frame_or_ident = |k: usize| -> ArrayView2<f64> {
+            match &frames[k] {
+                Some(u) => u.view(),
+                None => identity.view(),
+            }
+        };
+        let mut blocks = Vec::with_capacity(g_blocks.len());
+        for (&(atom_i, atom_j), g) in g_blocks {
+            if atom_i >= n_atoms || atom_j >= n_atoms {
+                return Err(format!(
+                    "FactoredFrameKroneckerOp::from_frames_and_blocks: block atom indices ({atom_i}, {atom_j}) out of range (n_atoms = {n_atoms})"
+                ));
+            }
+            let w = frame_output_gram(frame_or_ident(atom_i), frame_or_ident(atom_j));
+            blocks.push(FactoredFrameGBlock {
+                atom_i,
+                atom_j,
+                g: g.clone(),
+                w,
+            });
+        }
+        Self::new(ranks, basis_sizes.to_vec(), blocks)
     }
 }
 
@@ -7272,6 +7373,234 @@ mod tests {
                 "full-rank factored op must equal SparseBlockKronecker at {i}: {} vs {}",
                 yf[i],
                 ys[i]
+            );
+        }
+    }
+
+    /// Modified Gram–Schmidt orthonormalization of the columns of a `p × r`
+    /// matrix (`r ≤ p`), used by the frame-constructor tests to build genuine
+    /// `St(p, r)` representatives. Returns the orthonormal `Q` (`p × r`).
+    fn mgs_orthonormalize(a: &Array2<f64>) -> Array2<f64> {
+        let (p, r) = a.dim();
+        let mut q = a.clone();
+        for j in 0..r {
+            // Subtract projections onto the already-orthonormalized columns.
+            for i in 0..j {
+                let mut dot = 0.0;
+                for c in 0..p {
+                    dot += q[[c, i]] * q[[c, j]];
+                }
+                for c in 0..p {
+                    q[[c, j]] -= dot * q[[c, i]];
+                }
+            }
+            let mut nrm = 0.0;
+            for c in 0..p {
+                nrm += q[[c, j]] * q[[c, j]];
+            }
+            let nrm = nrm.sqrt();
+            assert!(nrm > 1e-9, "mgs column {j} degenerate");
+            for c in 0..p {
+                q[[c, j]] /= nrm;
+            }
+        }
+        q
+    }
+
+    /// `frame_output_gram` of an orthonormal frame with itself is the identity.
+    #[test]
+    fn frame_output_gram_orthonormal_is_identity() {
+        let p = 5usize;
+        let r = 3usize;
+        // A deterministic-but-generic p×r seed, then orthonormalize.
+        let mut seed = Array2::<f64>::zeros((p, r));
+        for c in 0..p {
+            for a in 0..r {
+                seed[[c, a]] = ((c as f64) * 0.37 + (a as f64) * 1.31).sin() + 0.1 * (a as f64);
+            }
+        }
+        let u = mgs_orthonormalize(&seed);
+        let g = frame_output_gram(u.view(), u.view());
+        assert_eq!(g.dim(), (r, r));
+        for a in 0..r {
+            for b in 0..r {
+                let expect = if a == b { 1.0 } else { 0.0 };
+                assert!(
+                    (g[[a, b]] - expect).abs() < 1e-12,
+                    "UᵀU not identity at ({a},{b}): {}",
+                    g[[a, b]]
+                );
+            }
+        }
+    }
+
+    /// `from_frames_and_blocks` with two genuinely orthonormal frames must
+    /// reproduce the hand-built dense `g ⊗ (UᵀU)` reference on every interface,
+    /// computing the `W_ij` factors itself from the supplied frames.
+    #[test]
+    fn from_frames_and_blocks_matches_dense_reference() {
+        let p = 4usize;
+        // Atom 0: M_0 = 2, r_0 = 2. Atom 1: M_1 = 3, r_1 = 3.
+        let basis_sizes = vec![2usize, 3];
+        // Build two generic seeds and orthonormalize into St(p, r) frames.
+        let mut seed0 = Array2::<f64>::zeros((p, 2));
+        let mut seed1 = Array2::<f64>::zeros((p, 3));
+        for c in 0..p {
+            for a in 0..2 {
+                seed0[[c, a]] = ((c as f64) * 0.91 - (a as f64) * 0.5).cos() + 0.2 * (c as f64);
+            }
+            for a in 0..3 {
+                seed1[[c, a]] = ((c as f64) * 0.23 + (a as f64) * 1.7).sin() - 0.3 * (a as f64);
+            }
+        }
+        let u0 = mgs_orthonormalize(&seed0);
+        let u1 = mgs_orthonormalize(&seed1);
+
+        let g00 = array![[3.0_f64, 0.5], [0.5, 4.0]];
+        let g11 = array![[2.0_f64, 0.4, -0.2], [0.4, 5.0, 0.6], [-0.2, 0.6, 1.5]];
+        let g01 = array![[0.2_f64, -0.1, 0.0], [0.3, 0.1, -0.2]];
+        let g10 = g01.t().to_owned();
+
+        let mut g_blocks: std::collections::BTreeMap<(usize, usize), Array2<f64>> =
+            std::collections::BTreeMap::new();
+        g_blocks.insert((0, 0), g00.clone());
+        g_blocks.insert((1, 1), g11.clone());
+        g_blocks.insert((0, 1), g01.clone());
+        g_blocks.insert((1, 0), g10.clone());
+
+        let frames = vec![Some(u0.clone()), Some(u1.clone())];
+        let op = FactoredFrameKroneckerOp::from_frames_and_blocks(&frames, &basis_sizes, p, &g_blocks)
+            .expect("from_frames_and_blocks");
+        // dim = M_0·r_0 + M_1·r_1 = 2·2 + 3·3 = 13.
+        assert_eq!(op.dim(), 13);
+
+        // Hand-built dense reference: W_ij = U_iᵀ U_j computed independently.
+        let ranks = vec![2usize, 3];
+        let w00 = frame_output_gram(u0.view(), u0.view());
+        let w11 = frame_output_gram(u1.view(), u1.view());
+        let w01 = frame_output_gram(u0.view(), u1.view());
+        let w10 = frame_output_gram(u1.view(), u0.view());
+        let ref_blocks = vec![
+            FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00, w: w00 },
+            FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11, w: w11 },
+            FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01, w: w01 },
+            FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10, w: w10 },
+        ];
+        let reference = factored_reference_dense(&ranks, &basis_sizes, &ref_blocks);
+
+        let dense = op.to_dense();
+        for i in 0..13 {
+            for j in 0..13 {
+                assert!(
+                    (dense[[i, j]] - reference[[i, j]]).abs() < 1e-12,
+                    "to_dense mismatch at ({i},{j}): {} vs {}",
+                    dense[[i, j]],
+                    reference[[i, j]]
+                );
+            }
+        }
+        // matvec == reference·x.
+        let x: Vec<f64> = (0..13).map(|i| 0.17 * (i as f64) - 0.6).collect();
+        let mut y = vec![0.0_f64; 13];
+        op.matvec(&x, &mut y);
+        for i in 0..13 {
+            let mut expect = 0.0;
+            for j in 0..13 {
+                expect += reference[[i, j]] * x[j];
+            }
+            assert!(
+                (y[i] - expect).abs() < 1e-10,
+                "matvec mismatch at {i}: {} vs {expect}",
+                y[i]
+            );
+        }
+    }
+
+    /// Mixed framed/unframed case: atom 0 framed (`r_0 = 2 < p = 4`), atom 1
+    /// unframed (`None → r_1 = p = 4`). The constructor must stand `I_p` in for
+    /// the missing frame, so the within-atom-1 block is exactly `g_11 ⊗ I_4`.
+    #[test]
+    fn from_frames_and_blocks_mixed_framed_unframed() {
+        let p = 4usize;
+        let basis_sizes = vec![2usize, 2]; // M_0 = 2, M_1 = 2.
+        // Atom 0 gets a genuine orthonormal 4×2 frame; atom 1 stays full-B.
+        let mut seed0 = Array2::<f64>::zeros((p, 2));
+        for c in 0..p {
+            for a in 0..2 {
+                seed0[[c, a]] = ((c as f64) * 0.61 + (a as f64) * 0.9).cos() - 0.15 * (c as f64);
+            }
+        }
+        let u0 = mgs_orthonormalize(&seed0);
+
+        let g00 = array![[3.0_f64, 0.5], [0.5, 4.0]];
+        let g11 = array![[2.0_f64, 0.4], [0.4, 5.0]];
+        let g01 = array![[0.2_f64, -0.1], [0.3, 0.1]];
+        let g10 = g01.t().to_owned();
+
+        let mut g_blocks: std::collections::BTreeMap<(usize, usize), Array2<f64>> =
+            std::collections::BTreeMap::new();
+        g_blocks.insert((0, 0), g00.clone());
+        g_blocks.insert((1, 1), g11.clone());
+        g_blocks.insert((0, 1), g01.clone());
+        g_blocks.insert((1, 0), g10.clone());
+
+        let frames = vec![Some(u0.clone()), None];
+        let op = FactoredFrameKroneckerOp::from_frames_and_blocks(&frames, &basis_sizes, p, &g_blocks)
+            .expect("from_frames_and_blocks mixed");
+
+        // dim = M_0·r_0 + M_1·r_1 = 2·2 + 2·4 = 12.
+        assert_eq!(op.ranks, vec![2usize, 4]);
+        assert_eq!(op.dim(), 12);
+
+        // The within-unframed-atom block (atom 1) must be exactly g_11 ⊗ I_4.
+        // Atom 1's β range starts at offset M_0·r_0 = 4 and spans M_1·r_1 = 8.
+        let dense = op.to_dense();
+        let off1 = 4usize;
+        for li in 0..2 {
+            for lj in 0..2 {
+                for a in 0..4 {
+                    for b in 0..4 {
+                        let gi = off1 + li * 4 + a;
+                        let gj = off1 + lj * 4 + b;
+                        let expect = if a == b { g11[[li, lj]] } else { 0.0 };
+                        assert!(
+                            (dense[[gi, gj]] - expect).abs() < 1e-12,
+                            "g_11 ⊗ I_4 mismatch at ({gi},{gj}): {} vs {expect}",
+                            dense[[gi, gj]]
+                        );
+                    }
+                }
+            }
+        }
+
+        // Full dense reference: W computed with U_1 = I_p for the unframed atom.
+        let ranks = vec![2usize, 4];
+        let ident_p = Array2::<f64>::eye(p);
+        let w00 = frame_output_gram(u0.view(), u0.view());
+        let w11 = frame_output_gram(ident_p.view(), ident_p.view());
+        let w01 = frame_output_gram(u0.view(), ident_p.view());
+        let w10 = frame_output_gram(ident_p.view(), u0.view());
+        let ref_blocks = vec![
+            FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00, w: w00 },
+            FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11.clone(), w: w11 },
+            FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01, w: w01 },
+            FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10, w: w10 },
+        ];
+        let reference = factored_reference_dense(&ranks, &basis_sizes, &ref_blocks);
+
+        // matvec == reference·x.
+        let x: Vec<f64> = (0..12).map(|i| 0.11 * (i as f64) - 0.4).collect();
+        let mut y = vec![0.0_f64; 12];
+        op.matvec(&x, &mut y);
+        for i in 0..12 {
+            let mut expect = 0.0;
+            for j in 0..12 {
+                expect += reference[[i, j]] * x[j];
+            }
+            assert!(
+                (y[i] - expect).abs() < 1e-10,
+                "mixed matvec mismatch at {i}: {} vs {expect}",
+                y[i]
             );
         }
     }
