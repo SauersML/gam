@@ -1661,8 +1661,29 @@ pub fn fit_bernoulli_marginal_slope_terms(
     .map_err(|e| format!("failed to rebuild frozen probe BMS joint designs: {e}"))?;
     let marginal_design = joint_designs.remove(0);
     let logslope_design = joint_designs.remove(0);
-    let (latent_measure, latent_z_calibration) =
-        build_latent_measure_with_geometry(&spec.z, &spec.weights, &spec.latent_z_policy)?;
+    // #905: the conditional `E[z|C]`/`Var(z|C)` Rao gate conditions on the
+    // marginal-index span a(C) (= the marginal design columns), which is
+    // exactly where the `b(C)·m(C)` leakage lives. It is engaged only on the
+    // raw-z path (no CTN Stage-1 influence absorber); when an absorber is
+    // active the conditional leakage is already absorbed (#461) and the
+    // widened-marginal predict seam must not be perturbed by replacing z.
+    let absorber_active = spec
+        .score_influence_jacobian
+        .as_ref()
+        .is_some_and(|j| j.ncols() > 0);
+    let conditioning_dense = if absorber_active {
+        None
+    } else {
+        Some(marginal_design.design.try_to_dense_arc(
+            "bernoulli marginal-slope conditional latent-z gate",
+        )?)
+    };
+    let (latent_measure, latent_z_calibration) = build_latent_measure_with_geometry(
+        &spec.z,
+        &spec.weights,
+        &spec.latent_z_policy,
+        conditioning_dense.as_ref().map(|d| d.view()),
+    )?;
     if latent_measure.is_empirical() && sigma_learnable {
         return Err("empirical latent-measure marginal-slope calibration requires fixed GaussianShift sigma; learnable sigma derivatives must be fit under the standard-normal latent measure"
                     .to_string());
@@ -1678,6 +1699,15 @@ pub fn fit_bernoulli_marginal_slope_terms(
         LatentMeasureCalibration::None => Arc::new(spec.z.clone()),
         LatentMeasureCalibration::RankInverseNormal(cal) => {
             Arc::new(cal.apply_to_training(&spec.z)?)
+        }
+        LatentMeasureCalibration::ConditionalLocationScale(cal) => {
+            // ζ = (z − m(C))/√v(C) on the marginal-index span. The conditioning
+            // block was built above (raw-z path only), so it is present here.
+            let a_block = conditioning_dense.as_ref().ok_or_else(|| {
+                "conditional latent calibration requires the marginal conditioning block"
+                    .to_string()
+            })?;
+            Arc::new(cal.apply(spec.z.view(), a_block.view())?)
         }
     };
     let z_train = z.as_ref();
@@ -2501,10 +2531,12 @@ pub fn fit_bernoulli_marginal_slope_terms(
             state.beta = reparam.recover_original_logslope_beta(&state.beta)?;
         }
     }
-    let latent_z_rank_int_calibration = match latent_z_calibration {
-        LatentMeasureCalibration::None => None,
-        LatentMeasureCalibration::RankInverseNormal(cal) => Some(cal),
-    };
+    let (latent_z_rank_int_calibration, latent_z_conditional_calibration) =
+        match latent_z_calibration {
+            LatentMeasureCalibration::None => (None, None),
+            LatentMeasureCalibration::RankInverseNormal(cal) => (Some(cal), None),
+            LatentMeasureCalibration::ConditionalLocationScale(cal) => (None, Some(cal)),
+        };
     // #461: PREDICT SEAM — when the Stage-1 influence absorber is active
     // (spec.score_influence_jacobian.is_some()), `fit.block_states[0].beta` is
     // the WIDENED marginal coefficient `[β_m; γ]` (length p_m + p₁), but
@@ -2532,5 +2564,6 @@ pub fn fit_bernoulli_marginal_slope_terms(
         gaussian_frailty_sd: final_sigma_cell.get(),
         cross_block_warnings,
         latent_z_rank_int_calibration,
+        latent_z_conditional_calibration,
     })
 }

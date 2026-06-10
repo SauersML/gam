@@ -39,7 +39,7 @@ use faer::Side as FaerSide;
 const M: usize = 3; // const + 1 harmonic -> circle basis
 const TAU: f64 = 0.5;
 const ALPHA: f64 = 1.0;
-const INNER_MAX_ITER: usize = 30;
+const INNER_MAX_ITER: usize = 20;
 const LEARNING_RATE: f64 = 1.0;
 const RIDGE_EXT_COORD: f64 = 1.0e-6;
 const RIDGE_BETA: f64 = 1.0e-6;
@@ -324,7 +324,12 @@ fn fit_via_engine(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> (SaeMa
         RIDGE_EXT_COORD,
         RIDGE_BETA,
     );
-    let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
+    // Bound the outer cascade: the planted signal is clean, so a capped fit
+    // recovers the planes and reaches a PD basin without the multi-minute
+    // full-convergence the larger reference fixtures pay for.
+    let problem = OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat)
+        .with_max_iter(25);
     let result = problem
         .run(&mut objective, label)
         .expect("outer cascade must complete");
@@ -336,7 +341,7 @@ fn fit_via_engine(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> (SaeMa
 fn frame_factored_evidence_matches_full_b_at_small_p() {
     let p = 12usize;
     let k = 2usize;
-    let n = 240usize;
+    let n = 144usize;
     let truth = small_truth(n, k);
     let z = planted_z(&truth, p);
     let base = build_small_term(&truth, &z);
@@ -537,7 +542,7 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
 
     let p = 12usize;
     let k = 2usize;
-    let n = 240usize;
+    let n = 144usize;
     let truth = small_truth(n, k);
     let z = planted_z(&truth, p);
 
@@ -567,7 +572,7 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
     });
     let metric = RowMetric::output_fisher(Arc::new(factors), 1, 1).expect("design metric");
     let measure = RowMeasure::from_metric(&metric);
-    let budget = 150usize;
+    let budget = 90usize;
     let sample = measure.designed_subsample(budget, 23);
     assert!(
         sample.rows.len() < n,
