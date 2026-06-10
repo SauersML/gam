@@ -2771,13 +2771,22 @@ impl FittedModel {
     /// over the coefficient posterior — reporting the posterior mean
     /// `E[g⁻¹(Xβ)]` — rather than plugging in the posterior mode `g⁻¹(Xβ̂)`.
     ///
-    /// SPEC: the posterior mean is *always* the default point estimate (never
-    /// MAP). It is only observably distinct from the plug-in when the inverse
-    /// link is curved over the posterior's support: Binomial standard / SAS /
-    /// BetaLogistic / Mixture / LatentCLogLog links, or any model carrying a
-    /// link wiggle or baseline-time wiggle. For effectively-linear cases
-    /// (identity-link Gaussian, …) the integral collapses to the plug-in, so
-    /// the cheaper plug-in path is exact and is taken instead.
+    /// SPEC (issue #960): the posterior mean is *always* the default point
+    /// estimate (never MAP). It is observably distinct from the plug-in exactly
+    /// when the inverse link is *curved* over the posterior's uncertainty, so
+    /// `E[g⁻¹(η)] ≠ g⁻¹(E[η])` by Jensen. The curvature-based classification is:
+    ///   * all log-link families (Poisson / Gamma / Tweedie / NegativeBinomial):
+    ///     `E[exp η] = exp(η + se²/2) ≠ exp(η)` (log-normal MGF);
+    ///   * all Binomial links (logit / probit / cloglog / SAS / BetaLogistic /
+    ///     Mixture / LatentCLogLog): bounded sigmoidal inverse links;
+    ///   * Beta (logit link): `E[σ(η)] ≠ σ(E[η])`;
+    ///   * Royston–Parmar (curved survival-probability inverse link).
+    /// The integral collapses to the plug-in (so the cheaper plug-in path is
+    /// exact and taken instead) only for the effectively-linear identity-link
+    /// Gaussian. Any model carrying a link wiggle or baseline-time wiggle is
+    /// curved regardless of family. This curvature partition mirrors
+    /// `families::strategy::posterior_mean`, the compute path that produces the
+    /// corrected mean for each of these families.
     ///
     /// This is the single source of truth shared by the CLI (`gam predict`)
     /// and the Python FFI prediction path so the two can never drift on which
@@ -2785,15 +2794,31 @@ impl FittedModel {
     #[inline]
     pub fn prediction_uses_posterior_mean(&self) -> bool {
         let family = self.likelihood();
-        matches!(
-            (&family.response, &family.link),
-            (ResponseFamily::Binomial, InverseLink::Standard(_))
-                | (ResponseFamily::Binomial, InverseLink::Sas(_))
-                | (ResponseFamily::Binomial, InverseLink::BetaLogistic(_))
-                | (ResponseFamily::Binomial, InverseLink::Mixture(_))
-                | (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_))
-        ) || self.has_link_wiggle()
-            || self.has_baseline_time_wiggle()
+        let curved_family = match &family.response {
+            // Identity-link Gaussian: inverse link is linear, so the posterior
+            // mean equals the plug-in and the cheaper exact path is taken.
+            ResponseFamily::Gaussian => false,
+            // Log-link families: E[exp η] = exp(η + se²/2) ≠ exp(η).
+            ResponseFamily::Poisson
+            | ResponseFamily::Gamma
+            | ResponseFamily::Tweedie { .. }
+            | ResponseFamily::NegativeBinomial { .. } => true,
+            // Beta (logit link): E[σ(η)] ≠ σ(E[η]).
+            ResponseFamily::Beta { .. } => true,
+            // Royston–Parmar: curved survival-probability inverse link.
+            ResponseFamily::RoystonParmar => true,
+            // Binomial: every link variant (logit / probit / cloglog / SAS /
+            // BetaLogistic / Mixture / LatentCLogLog) is a curved sigmoid.
+            ResponseFamily::Binomial => matches!(
+                &family.link,
+                InverseLink::Standard(_)
+                    | InverseLink::Sas(_)
+                    | InverseLink::BetaLogistic(_)
+                    | InverseLink::Mixture(_)
+                    | InverseLink::LatentCLogLog(_)
+            ),
+        };
+        curved_family || self.has_link_wiggle() || self.has_baseline_time_wiggle()
     }
 
     pub fn saved_prediction_runtime(&self) -> Result<SavedPredictionRuntime, FittedModelError> {

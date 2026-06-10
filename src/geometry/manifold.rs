@@ -178,6 +178,25 @@ pub trait RiemannianManifold: Send + Sync {
         self.exp_map(point, tangent_vec)
     }
 
+    /// Whether [`retract`](Self::retract) is at least a SECOND-ORDER retraction,
+    /// i.e. `D²(f∘R_x)(0) = Hess f(x)` for all `f`, so the trust-region quadratic
+    /// model built from the Riemannian Hessian is a valid second-order model of
+    /// `f` along the retraction (issue #956).
+    ///
+    /// Manifolds whose `retract` is the exponential map or another second-order
+    /// retraction return `true` (the default — the default `retract` *is*
+    /// `exp_map`, which is second-order). A manifold exposing only a FIRST-ORDER
+    /// retraction (e.g. the Stiefel/Grassmann QR retraction `qf(Y + Δ)`, whose
+    /// acceleration at `0` is not normal to the manifold) must override this to
+    /// `false`: the linear model term `Df_x[η]` is retraction-independent and
+    /// stays correct, but the Riemannian-Hessian quadratic term is *not* the
+    /// second derivative of `f∘R_x` and would corrupt the predicted-vs-actual
+    /// reduction ratio `ρ` and hence the trust-region radius control. The trust
+    /// region falls back to the first-order-correct Cauchy model in that case.
+    fn retraction_is_second_order(&self) -> bool {
+        true
+    }
+
     /// Vector–Jacobian product of the ambient map `exp_p(v)`.
     ///
     /// Given a cotangent `grad_output` w.r.t. the ambient output of
