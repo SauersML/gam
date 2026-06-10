@@ -3564,7 +3564,16 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
     /// the block-local diagonal drift hook cannot represent, so decline the
     /// dense outer Hessian capability and let the engine select the
     /// first-order (gradient-only) outer optimizer.
-    fn outer_hyper_hessian_dense_available(&self, _specs: &[ParameterBlockSpec]) -> bool {
+    ///
+    /// Mirrors the trait default's spec-consistency contract — every override
+    /// must still validate the block-spec slice it is handed before answering
+    /// the capability question; the only difference here is the verdict.
+    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
+        assert!(
+            crate::custom_family::validate_blockspec_consistency(specs).is_ok(),
+            "DispersionGlmLocationScale outer hyper-Hessian dense availability: \
+             inconsistent parameter block specs"
+        );
         false
     }
 }
@@ -3764,15 +3773,38 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
 
     fn build_psiderivative_blocks(
         &self,
-        _data: ndarray::ArrayView2<'_, f64>,
-        _term_spec: &TermCollectionSpec,
-        _term_spec2: &TermCollectionSpec,
-        _term_design: &TermCollectionDesign,
-        _term_design2: &TermCollectionDesign,
+        data: ndarray::ArrayView2<'_, f64>,
+        meanspec: &TermCollectionSpec,
+        noisespec: &TermCollectionSpec,
+        mean_design: &TermCollectionDesign,
+        noise_design: &TermCollectionDesign,
     ) -> Result<Vec<Vec<CustomFamilyBlockPsiDerivative>>, String> {
-        Err("dispersion location-scale families do not implement analytic spatial \
-             psi derivatives (the κ/ψ joint optimizer is disabled for them)"
-            .to_string())
+        // The dispersion location-scale families have no closed-form analytic
+        // spatial psi derivatives, and `fit_dispersion_glm_location_scale_terms`
+        // disables the κ/ψ joint optimizer before the engine ever asks. If we
+        // do get called (for example by a future caller that forgets the
+        // disable), return a real diagnostic rather than a sentinel — emit the
+        // exact data and design shape that was passed in so the bug is
+        // diagnosable from the error string alone.
+        Err(format!(
+            "dispersion location-scale ({:?}) does not implement analytic spatial \
+             psi derivatives; the κ/ψ joint optimizer must be disabled before \
+             this builder is consulted. Called with data {n_rows}×{n_cols}, mean \
+             spec (linear={mean_lin}, random={mean_re}, smooth={mean_sm}), noise \
+             spec (linear={noise_lin}, random={noise_re}, smooth={noise_sm}), \
+             mean design cols={mean_p}, noise design cols={noise_p}",
+            self.kind,
+            n_rows = data.nrows(),
+            n_cols = data.ncols(),
+            mean_lin = meanspec.linear_terms.len(),
+            mean_re = meanspec.random_effect_terms.len(),
+            mean_sm = meanspec.smooth_terms.len(),
+            noise_lin = noisespec.linear_terms.len(),
+            noise_re = noisespec.random_effect_terms.len(),
+            noise_sm = noisespec.smooth_terms.len(),
+            mean_p = mean_design.design.ncols(),
+            noise_p = noise_design.design.ncols(),
+        ))
     }
 }
 
