@@ -226,6 +226,9 @@ fn gam_nuts_poisson_loglink_predicts_heldout_counts() {
         },
         "poisson".to_string(),
     );
+    payload.fit_result = Some(fit.fit.clone());
+    payload.unified = Some(fit.fit.clone());
+    payload.data_schema = Some(agg_ds.schema.clone());
     payload.resolved_termspec = Some(frozen);
     payload.set_training_feature_metadata(agg_ds.headers.clone(), agg_ds.feature_ranges());
     let model = FittedModel::from_payload(payload);
