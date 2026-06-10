@@ -6191,16 +6191,50 @@ pub trait BlockExcessTarget {
 ///
 /// The principled completion (deliberately NOT a partial sum of cheap
 /// channels — a half-exact gradient still desyncs): the sampler returns
-/// per-draw sufficient statistics — importance weights `w_s`, draws `t_s`,
-/// and the per-draw integrand gradients `∂ΔF/∂δ|_s` (one displaced-score
-/// pass per draw) plus the field-channel moments — and the OUTER gradient
-/// assembly, which already owns `Ḣ_j`, `v_j`, and the spectral
-/// decomposition of `H`, contracts them per coordinate. That keeps a single
-/// source of truth: the same `Ḣ_j` that drives the logdet trace also drives
-/// the eigenpair perturbations here, so the two corrections cannot disagree
-/// about what "the direction θ_j" means. Until that seam exists, treat an
-/// engaged #784 fallback as gradient-degrading and FD drivers that engage
-/// it as measuring channels (b)–(d), not Monte-Carlo noise.
+/// importance-weighted MOMENTS, and the OUTER gradient assembly — which
+/// already owns the total drift `Ḣ_j = A_j + D_β H[v_j]`, the IFT mode
+/// response `v_j`, and the spectral decomposition of `H` — contracts them
+/// per coordinate. The decisive reduction (this is what makes the exact
+/// gradient cheap) is that channels (b) and (c) collapse into ONE extra
+/// low-rank trace against the SAME `Ḣ_j` the logdet gradient already
+/// traces, and channel (d) into one dot product with the SAME `v_j`:
+///
+/// ```text
+///   sampler moments (self-normalized, same draws as the value):
+///     M_r  = E_p[ (∂ΔF/∂t_r) · (−½ t_r) ]               (m scalars)
+///     R_r  = E_p[ t_r · ∂ΔF/∂δ ]                        (m p-vectors)
+///     g_d  = E_p[ ∂ΔF/∂β̂ ]                              (one p-vector)
+///
+///   assembly-side fixed matrices (built once per evaluation):
+///     Q_b  = Σ_r (M_r / λ_r) · u_r u_rᵀ                  (rank m)
+///     Q_c  = sym( Σ_r Σ_{q≠r} u_q (R_rᵀ u_q)/(λ_r − λ_q) · u_rᵀ )
+///            (rank ≤ 2m; q ranges over ALL eigenpairs of H, so the
+///             frame-rotation channel is exact, not block-restricted)
+///
+///   then for EVERY outer coordinate θ_j:
+///     dΔ_b/dθ_j = −( explicit_j + tr(Ḣ_j · (Q_b + Q_c)) + v_jᵀ g_d )
+/// ```
+///
+/// `∂ΔF/∂t = V_bᵀ ∂ΔF/∂δ`; `∂ΔF/∂δ = Xᵀ score(η̂+s) + Σ_k λ_k S_k β̂ −
+/// XᵀW(Xδ)` costs one displaced-score pass per draw (the link jet is already
+/// evaluated for the value); `∂ΔF/∂β̂[v] = (score_disp − score_base)ᵀXv +
+/// Σ_k λ_k vᵀS_k δ − ½ Σ_i c_i (Xv)_i (Xδ)_i²`, whose E_p-moment is the
+/// p-vector `g_d = Xᵀ E_p[score_disp − score_base] + Σ_k λ_k S_k E_p[δ] −
+/// ½ Xᵀ(c ⊙ E_p[(Xδ)²])`. Because draws are pathwise (`t = z/√λ`, fixed z),
+/// there is NO density-score term: the q-Gaussian reparameterization is
+/// exactly the channels above. Eigenvalue near-degeneracies `λ_r ≈ λ_q`
+/// make `Q_c` blow up — those are genuine non-differentiability points of
+/// the eigenframe (same constant-stratum caveat as the pseudo-logdet rank);
+/// the correct response is to decline the splice there, not to clamp.
+///
+/// This keeps a single source of truth: the same `Ḣ_j` that drives the
+/// logdet trace drives the eigenpair perturbations here, so the two
+/// corrections cannot disagree about what "the direction θ_j" means — and
+/// the trace plumbing (`DriftDerivResult` dense/operator probing) is reused
+/// verbatim, with `Q_b + Q_c` probed as a rank-≤3m factor pair. Until that
+/// seam exists, treat an engaged #784 fallback as gradient-degrading and FD
+/// drivers that engage it as measuring channels (b)–(d), not Monte-Carlo
+/// noise.
 #[derive(Clone, Debug)]
 pub struct BlockSampledMarginal {
     /// `Δ_b`: additive correction to the block marginal log-likelihood.
