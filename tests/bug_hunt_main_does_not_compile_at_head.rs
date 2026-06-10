@@ -2,41 +2,38 @@
 //! this whole `tests/` suite, the `gam` CLI binary, the `gamfit` Python wheel,
 //! any downstream consumer — can be built.
 //!
-//! Root cause (files/lines read): the latest commit on `main`
-//! (`a414a6c25 fix(#982,#983-core,#978): …`) widened two core data-model types
-//! but left ~23 of their consumers on the old shape:
+//! Root cause at the SHA this test is committed at (files/lines read): commit
+//! `0058c08bb feat(#935): one sensitivity operator — FitSensitivity unifies the
+//! fit's H⁻¹` introduced a type error in the new sensitivity operator:
 //!
-//!  * `src/types.rs:362-376` added a field to the negative-binomial family:
-//!    `ResponseFamily::NegativeBinomial { theta, theta_fixed: bool }` (the
-//!    "fixed θ" knob of #983), and `src/types.rs:1507` added the enum variant
-//!    `LikelihoodScaleMetadata::FixedNegBinTheta { theta }`.
-//!  * Match arms across the crate still destructure the old
-//!    `NegativeBinomial { theta }` without `theta_fixed`, e.g.
-//!    `src/inference/generative.rs:108`, `src/inference/hmc.rs:1334`,
-//!    `src/inference/hmc.rs:5069`, `src/inference/predict/mod.rs:5753`,
-//!    `src/inference/quadrature.rs:3320`, `src/inference/sample.rs:152`,
-//!    `src/solver/estimate.rs:750` (E0027: "pattern does not mention field
-//!    `theta_fixed`"), and struct literals still omit it, e.g.
-//!    `src/inference/hmc.rs:553` `NegativeBinomial { theta: 1.0 }` (E0063).
-//!    A `match` over `LikelihoodScaleMetadata` (`src/solver/estimate.rs:4740`)
-//!    is left non-exhaustive for the new `FixedNegBinTheta` variant (E0004).
-//!  * The sibling #978 commit likewise added `frozen_global_orthogonality` to
-//!    `SmoothBasisSpec`/`FactorSmoothSpec` and `unabsorbed_global_orthogonality`
-//!    to `SmoothTerm` without updating every initializer (E0063 at
-//!    `src/terms/smooth.rs:6505/6823/7719`, `src/terms/term_builder.rs:1509`).
+//!  * `src/solver/sensitivity.rs:109` calls
+//!    `crate::linalg::triangular::cholesky_solve_vector(factor, rhs)` inside the
+//!    `FittedInverse::LowerTriangular(factor)` arm, where `factor` is a
+//!    `&Array2<f64>`. `cholesky_solve_vector` (`src/linalg/triangular.rs:179`)
+//!    binds its matrix argument by `Into<ArrayView2<f64>>`, which a `&Array2`
+//!    (auto-ref'd to `&&Array2` by the call) does not satisfy:
+//!    ```text
+//!    error[E0277]: the trait bound
+//!      `ArrayBase<ViewRepr<&f64>, Dim<[usize; 2]>>: From<&&ArrayBase<OwnedRepr<f64>, …>>`
+//!      is not satisfied
+//!       --> src/solver/sensitivity.rs:109:66
+//!    ```
+//!    The fix is to pass a view (`factor.view()` / `&**factor`).
 //!
-//! `cargo build` (debug or release) therefore fails with 23 errors
-//! (`E0027` / `E0063` / `E0004`) and "could not compile `gam` (lib)". The
-//! published wheel / prebuilt CLI predate the break, but the source tree at HEAD
-//! is red.
+//! `cargo build` (debug or release) fails with "could not compile `gam` (lib)
+//! due to 1 previous error". (`main` has been red across several recent commits
+//! in the concurrent commit stream — an earlier break from the #983/#978
+//! `theta_fixed` / `*_global_orthogonality` field additions was repaired by a
+//! sibling commit before this one landed; the sensitivity-operator error is the
+//! live cause at HEAD.) The published wheel / prebuilt CLI predate the break,
+//! but the source tree is red.
 //!
 //! Per the established pattern for build-break tickets (see e.g. the closed
 //! `gpu_err!`-unscoped and `uv.lock`-stale tickets), this test is a real
-//! end-to-end fit of the *neighbour* of the broken data-model change: a
-//! negative-binomial smooth. While the crate does not compile the test (like
-//! everything else) cannot build, so it cannot pass; once every `theta_fixed` /
-//! `frozen_global_orthogonality` consumer is updated and the crate compiles,
-//! this fit runs and its assertion holds unchanged.
+//! end-to-end negative-binomial smooth fit. While the crate does not compile the
+//! test (like everything else) cannot build, so it cannot pass; once the
+//! sensitivity operator (and any other red edit) compiles, this fit runs and its
+//! assertion holds unchanged.
 //!
 //! The assertion is meaningful, not a tautology: the negative-binomial smooth
 //! must recover a known log-mean surface `μ(x) = exp(0.4 + 1.2·sin(2π·x))` from
