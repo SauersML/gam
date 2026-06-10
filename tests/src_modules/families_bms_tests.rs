@@ -8828,3 +8828,208 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         "#740 penalty-fold test is vacuous: ½βᵀS_ψψβ penalty contributes ~0 to the objective"
     );
 }
+
+/// #740 (option B): the INDEPENDENT ground-truth gate — the analytic outer
+/// Hessian over θ=(ρ,ψ) must equal a CENTERED FINITE DIFFERENCE of the outer
+/// gradient, across pure-ψ AND mixed-ρψ directions, on a real BMS spatial
+/// length-scale fit.
+///
+/// The machine-precision operator==dense and contracted==per-pair gates certify
+/// "#740 reproduces the trusted per-pair path", but that is first-order /
+/// self-referential: only Hessian == centered-FD-of-gradient over ψ is
+/// independent ground truth that the ψψ second-order block is actually correct
+/// (gradient==FD-of-value, which other tests cover, cannot catch a ψψ Hessian
+/// error). For a change flagged highest-REML-bias-risk this is the close-out.
+///
+/// ψ = −log(length_scale): perturbing ψ rebuilds the matern design + ψ
+/// derivative blocks at the shifted length-scale (centers frozen once, so the FD
+/// is well-defined — same pattern as basis_matern_log_kappa_*_derivative_fd).
+/// The outer (ρ,ψ) gradient/Hessian come from evaluate_custom_family_joint_hyper.
+#[test]
+fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
+    use crate::custom_family::PenaltyMatrix;
+    use crate::families::custom_family::evaluate_custom_family_joint_hyper;
+    use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+    use crate::solver::estimate::reml::unified::EvalMode;
+    use crate::terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu};
+    use crate::terms::smooth::{
+        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
+        freeze_term_collection_from_design,
+    };
+
+    crate::init_parallelism();
+
+    let n = 80usize;
+    // 2D spatial covariate for the matern logslope smooth + a binary response.
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        let x0 = (i as f64 / (n as f64 - 1.0)) * 2.0 - 1.0;
+        let x1 = (0.41 * i as f64).sin() * 0.6 + 0.25 * x0;
+        data[[i, 0]] = x0;
+        data[[i, 1]] = x1;
+    }
+    let y: Array1<f64> = Array1::from_iter((0..n).map(|i| {
+        let lin = 0.4 * data[[i, 0]] - 0.3 * data[[i, 1]];
+        if lin + 0.2 * ((i * 7 + 3) % 5) as f64 / 5.0 - 0.2 > 0.0 {
+            1.0
+        } else {
+            0.0
+        }
+    }));
+    let z: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * ((i % 9) as f64 + 0.5) / 9.0));
+    let weights = Array1::from_elem(n, 1.0);
+
+    // Base matern logslope spec. Freeze the centers ONCE at the base
+    // length-scale so the FD perturbations only move `length_scale`, not the
+    // basis centers (centers held fixed ⇒ the ψ FD is well-defined).
+    let base_length_scale = 0.9_f64;
+    let make_spec = |length_scale: f64| TermCollectionSpec {
+        linear_terms: Vec::new(),
+        random_effect_terms: Vec::new(),
+        smooth_terms: vec![SmoothTermSpec {
+            name: "spatial_logslope".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    periodic: None,
+                    center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                    length_scale,
+                    nu: MaternNu::ThreeHalves,
+                    include_intercept: false,
+                    double_penalty: false,
+                    identifiability: Default::default(),
+                    aniso_log_scales: None,
+                    nullspace_shrinkage_survived: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+    let base_spec = make_spec(base_length_scale);
+    let base_design =
+        build_term_collection_design(data.view(), &base_spec).expect("base spatial design");
+    let frozen_spec = freeze_term_collection_from_design(&base_spec, &base_design)
+        .expect("freeze spatial spec (locks centers)");
+
+    // Build (family, specs, derivative_blocks, gradient, Hessian) for a given ψ
+    // offset (in −log(length_scale)) and ρ offset. ψ-offset δ ⇒ length_scale =
+    // base * exp(−δ); the frozen centers are reused, so only the kernel
+    // length-scale moves. Returns the full θ=(ρ,ψ) outer gradient + dense
+    // Hessian from the profiled joint-hyper evaluator.
+    let y_arc = Arc::new(y);
+    let z_arc = Arc::new(z);
+    let w_arc = Arc::new(weights);
+    let outer_at = |psi_offset: f64, rho_offset: f64, mode: EvalMode| {
+        // Rebuild the frozen spec at the perturbed length-scale by mutating only
+        // the matern `length_scale` field (centers stay frozen).
+        let mut spec = frozen_spec.clone();
+        if let SmoothBasisSpec::Matern { spec: ms, .. } = &mut spec.smooth_terms[0].basis {
+            ms.length_scale = base_length_scale * (-psi_offset).exp();
+        }
+        let design = build_term_collection_design(data.view(), &spec).expect("perturbed design");
+        // ψ derivative blocks for the logslope spatial block at this length-scale.
+        let logslope_psi = build_block_spatial_psi_derivatives(data.view(), &spec, &design)
+            .expect("spatial psi derivatives")
+            .expect("spatial psi derivative rows");
+        let derivative_blocks = vec![Vec::new(), logslope_psi];
+
+        // Intercept-only marginal block; matern logslope block carries the
+        // spatial design + its penalty.
+        let p_log = design.design.ncols();
+        let marginal_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem((n, 1), 1.0)));
+        let logslope_design = design.design.clone();
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::clone(&y_arc),
+            weights: Arc::clone(&w_arc),
+            z: Arc::clone(&z_arc),
+            marginal_design: marginal_design.clone(),
+            logslope_design: logslope_design.clone(),
+            ..default_test_family()
+        };
+
+        // Block specs: marginal (intercept, no penalty), logslope (matern design
+        // + its penalty/penalties). The matern block carries one (double_penalty
+        // off) penalty.
+        let logslope_penalties: Vec<PenaltyMatrix> = design.penalties_as_penalty_matrix();
+        assert_eq!(
+            logslope_penalties.len(),
+            1,
+            "fixture expects a single matern penalty on the logslope block"
+        );
+        let mut marginal_spec = dummy_blockspec(1, n);
+        marginal_spec.design = marginal_design;
+        let mut logslope_spec = dummy_blockspec(p_log, n);
+        logslope_spec.design = logslope_design;
+        // initial_log_lambdas MUST match penalty count (validate_blockspec_consistency).
+        logslope_spec.initial_log_lambdas = Array1::zeros(logslope_penalties.len());
+        logslope_spec.nullspace_dims = design.nullspace_dims.clone();
+        logslope_spec.penalties = logslope_penalties;
+        let specs = vec![marginal_spec, logslope_spec];
+
+        // θ = [ρ_logslope, ψ]. One ρ on the logslope penalty; ψ_dim from the
+        // spatial derivative blocks (evaluated at ψ=0 of the perturbed center).
+        let rho = array![0.1_f64 + rho_offset];
+
+        let opts = BlockwiseFitOptions::default();
+        let res = evaluate_custom_family_joint_hyper(
+            &family, &specs, &opts, &rho, &derivative_blocks, None, mode,
+        )
+        .expect("joint hyper eval");
+        assert!(res.inner_converged, "inner solve must converge for valid outer derivatives");
+        (res.gradient, res.outer_hessian)
+    };
+
+    // Base point: analytic gradient + Hessian over θ=(ρ,ψ).
+    let (grad0, hess0) =
+        outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
+    let theta_dim = grad0.len();
+    let psi_dim = theta_dim - 1; // one ρ
+    assert!(psi_dim >= 1, "fixture must expose at least one spatial ψ axis");
+    let hess0 = hess0
+        .into_option()
+        .expect("analytic outer Hessian over (ρ,ψ)");
+
+    let eps = 1e-4_f64;
+
+    // Centered FD of the outer GRADIENT along a θ direction `dir`
+    // (dir = [d_ρ, d_ψ...]): rebuild design+blocks at ±eps·dir, take
+    // (g(+)-g(-))/(2eps). For the ρ component we shift `rho`; for ψ we shift the
+    // length-scale (−log scale). Compare to H·dir.
+    let fd_along = |dir: &Array1<f64>| -> Array1<f64> {
+        let rho_step = dir[0];
+        // ψ direction packed into a single length-scale offset is only
+        // well-defined for a single ψ axis; assert that and use dir[1].
+        assert_eq!(psi_dim, 1, "FD ψ arm assumes one spatial ψ axis");
+        let psi_step = dir[1];
+        let (gp, _) = outer_at(eps * psi_step, eps * rho_step, EvalMode::ValueAndGradient);
+        let (gm, _) = outer_at(-eps * psi_step, -eps * rho_step, EvalMode::ValueAndGradient);
+        (&gp - &gm).mapv(|v| v / (2.0 * eps))
+    };
+
+    let check = |dir: Array1<f64>, label: &str| {
+        let analytic = hess0.dot(&dir);
+        let fd = fd_along(&dir);
+        for k in 0..theta_dim {
+            let scale = 1.0 + analytic[k].abs().max(fd[k].abs());
+            let rel = (analytic[k] - fd[k]).abs() / scale;
+            assert!(
+                rel < 2e-3,
+                "[{label}] outer Hessian·dir component {k} disagrees with centered FD of the \
+                 outer gradient: analytic={}, fd={}, rel={rel:.3e}",
+                analytic[k],
+                fd[k]
+            );
+        }
+    };
+
+    // Pure-ψ: dir = [0, 1].
+    check(array![0.0, 1.0], "pure-ψ");
+    // Mixed-ρψ: dir = [1, 1] — perturbs ρ and ψ together; exposes a ρψ/ψψ
+    // block-split error that pure-ρ and pure-ψ would both miss.
+    check(array![1.0, 1.0], "mixed-ρψ");
+}
