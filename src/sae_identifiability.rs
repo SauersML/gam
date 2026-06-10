@@ -945,6 +945,54 @@ pub struct GeneratorVerdict {
     pub pinned_energy_fraction: f64,
 }
 
+/// The #972 decoder-frame **inner-rotation gauge**, enumerated for the
+/// certificate.
+///
+/// A frame-factored atom `B_k = U_k C_k` is *exactly* invariant under
+/// `U_k → U_k R`, `C_k → Rᵀ C_k` for any `R ∈ O(r_k)`: the reconstruction,
+/// the likelihood, the penalty — every objective term — sees only the
+/// product. Unlike the latent-isometry / ARD-rotation / permutation
+/// generators, this freedom is therefore **not** a candidate to be pinned by
+/// data or penalty curvature (its orbit direction is identically zero in
+/// function space), so running it through the pinning-span test would be a
+/// category error: it would always come back "unpinned" and pollute the
+/// verdict list with freedoms the parameterization already handles. The
+/// honest certificate treatment is what this struct is: *enumerate* the
+/// group and its dimension `Σ_k r_k(r_k−1)/2`, and record how it is fixed —
+/// by the canonical orientation gauge
+/// ([`crate::terms::sae_manifold::GrassmannFrame`]'s SVD-ordered
+/// representative), which picks one point per `O(r_k)` orbit for
+/// serialization/comparison stability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameInnerRotationGauge {
+    /// Active frame rank `r_k` per frame-factored atom (atoms on the full-`B`
+    /// path contribute no entry).
+    pub per_atom_ranks: Vec<usize>,
+    /// Total group dimension `Σ_k r_k (r_k − 1) / 2` (`dim O(r) = r(r−1)/2`).
+    pub dim: usize,
+}
+
+impl FrameInnerRotationGauge {
+    /// Enumerate the gauge from the active frame ranks.
+    pub fn from_ranks(per_atom_ranks: Vec<usize>) -> Self {
+        let dim = frame_inner_rotation_dim(&per_atom_ranks);
+        Self {
+            per_atom_ranks,
+            dim,
+        }
+    }
+}
+
+/// `Σ_k r_k (r_k − 1) / 2` — the dimension of the #972 inner-rotation gauge
+/// group `∏_k O(r_k)` over the active frame ranks. Rank-1 frames contribute
+/// `0` (`O(1)` is finite, a sign — absorbed by the orientation gauge), so a
+/// dictionary of single-direction atoms reports a zero-dimensional inner
+/// gauge, matching the intuition that one direction has no inner rotation to
+/// fix.
+pub fn frame_inner_rotation_dim(ranks: &[usize]) -> usize {
+    ranks.iter().map(|&r| r * r.saturating_sub(1) / 2).sum()
+}
+
 /// The certificate produced by [`residual_gauge`].
 #[derive(Debug, Clone)]
 pub struct ResidualGaugeReport {
@@ -974,6 +1022,12 @@ pub struct ResidualGaugeReport {
     /// surface. `None` ⇒ provenance is not `OutputFisher`, so the check does
     /// not apply.
     pub sym_f_trivial_under_output_fisher: Option<bool>,
+    /// The #972 decoder-frame inner-rotation gauge `∏_k O(r_k)` — enumerated,
+    /// never curvature-tested (see [`FrameInnerRotationGauge`] for why).
+    /// `None` when the caller declared no frame factorization (full-`B`
+    /// dictionaries, or a pre-#972 caller using [`residual_gauge`] directly);
+    /// attach via [`ResidualGaugeReport::with_frame_inner_rotation`].
+    pub frame_inner_rotation: Option<FrameInnerRotationGauge>,
     /// Human-readable one-line summary.
     pub summary: String,
 }
@@ -982,8 +1036,38 @@ impl ResidualGaugeReport {
     /// The certified residual gauge group, as a compact string naming the
     /// surviving generator families and their multiplicities. Two replicate
     /// fits are "identified up to the same group" iff this string is equal.
+    ///
+    /// When a frame inner-rotation gauge is enumerated it is appended with its
+    /// dimension and its `[canonical-fixed]` marker — it is part of the group
+    /// two replicate fits must agree on, even though it is fixed by
+    /// convention rather than by curvature.
     pub fn group_signature(&self) -> String {
-        group_signature_of(&self.generators, self.diffeomorphism_unpinned)
+        let base = group_signature_of(&self.generators, self.diffeomorphism_unpinned);
+        match &self.frame_inner_rotation {
+            Some(gauge) if gauge.dim > 0 => format!(
+                "{base} ⊕ frame-inner ∏O(r_k)×{} [dim {}, canonical-fixed]",
+                gauge.per_atom_ranks.len(),
+                gauge.dim
+            ),
+            _ => base,
+        }
+    }
+
+    /// Attach the #972 frame inner-rotation enumeration to the certificate
+    /// (consumed by frame-factored dictionaries; `ranks` are the active frame
+    /// ranks `r_k`, one per factored atom). Extends the summary so the
+    /// one-line report names the enumerated-but-convention-fixed gauge.
+    pub fn with_frame_inner_rotation(mut self, ranks: Vec<usize>) -> Self {
+        let gauge = FrameInnerRotationGauge::from_ranks(ranks);
+        if gauge.dim > 0 {
+            self.summary.push_str(&format!(
+                "; frame inner-rotation gauge ∏O(r_k) of dim {} enumerated \
+                 (exact reparameterization, fixed by the canonical orientation gauge)",
+                gauge.dim
+            ));
+        }
+        self.frame_inner_rotation = Some(gauge);
+        self
     }
 }
 
@@ -1495,6 +1579,11 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
         residual_gauge_dim,
         diffeomorphism_unpinned,
         sym_f_trivial_under_output_fisher,
+        // The #972 inner-rotation gauge is declared by the caller (it lives in
+        // the (U_k, C_k) parameterization, not in the latent-frame coordinates
+        // this certificate's generators are tangent to); frame-factored
+        // dictionaries attach it via `with_frame_inner_rotation`.
+        frame_inner_rotation: None,
         summary,
     })
 }
@@ -1577,6 +1666,78 @@ mod tests {
     fn mechanism_sparsity_jacobian_rejects_bad_input() {
         assert!(MechanismSparsityJacobian::new(-1.0, 1e-6).is_err());
         assert!(MechanismSparsityJacobian::new(1.0, 0.0).is_err());
+    }
+
+    #[test]
+    fn frame_inner_rotation_dim_is_sum_of_so_r_dims() {
+        // dim O(r) = r(r−1)/2 per factored atom; rank-1 frames contribute 0.
+        assert_eq!(frame_inner_rotation_dim(&[]), 0);
+        assert_eq!(frame_inner_rotation_dim(&[1]), 0);
+        assert_eq!(frame_inner_rotation_dim(&[2]), 1);
+        assert_eq!(frame_inner_rotation_dim(&[4]), 6);
+        assert_eq!(frame_inner_rotation_dim(&[1, 4, 8]), 0 + 6 + 28);
+        assert_eq!(
+            FrameInnerRotationGauge::from_ranks(vec![3, 3]).dim,
+            6,
+            "two rank-3 frames carry 2·3 inner-rotation dims"
+        );
+    }
+
+    /// The #972 inner-rotation gauge is enumerated in the certificate, never
+    /// curvature-tested: attaching it must not change any generator verdict
+    /// or the residual_gauge_dim, but it MUST change the group signature and
+    /// the summary — two replicate frame-factored fits agree on their gauge
+    /// iff they also agree on this enumerated, convention-fixed part.
+    #[test]
+    fn frame_inner_rotation_attaches_to_the_certificate_without_verdict_change() {
+        let base = ResidualGaugeReport {
+            metric_provenance: MetricProvenance::Euclidean,
+            generators: Vec::new(),
+            pinning_rank: 5,
+            residual_gauge_dim: 0,
+            diffeomorphism_unpinned: false,
+            sym_f_trivial_under_output_fisher: None,
+            frame_inner_rotation: None,
+            summary: "base".to_string(),
+        };
+        let sig_before = base.group_signature();
+        let report = base.with_frame_inner_rotation(vec![1, 4, 8]);
+        assert_eq!(
+            report.frame_inner_rotation,
+            Some(FrameInnerRotationGauge {
+                per_atom_ranks: vec![1, 4, 8],
+                dim: 34,
+            })
+        );
+        // Verdict-side facts untouched.
+        assert_eq!(report.residual_gauge_dim, 0);
+        assert!(report.generators.is_empty());
+        // Signature and summary carry the enumeration.
+        let sig_after = report.group_signature();
+        assert_ne!(sig_before, sig_after);
+        assert!(sig_after.contains("frame-inner"), "got: {sig_after}");
+        assert!(sig_after.contains("dim 34"), "got: {sig_after}");
+        assert!(sig_after.contains("canonical-fixed"), "got: {sig_after}");
+        assert!(report.summary.contains("inner-rotation gauge"));
+
+        // A dictionary of rank-1 atoms has a zero-dimensional inner gauge:
+        // enumerated (Some), but the signature is unchanged — there is
+        // nothing to fix beyond the orientation sign convention.
+        let trivial = ResidualGaugeReport {
+            metric_provenance: MetricProvenance::Euclidean,
+            generators: Vec::new(),
+            pinning_rank: 0,
+            residual_gauge_dim: 0,
+            diffeomorphism_unpinned: false,
+            sym_f_trivial_under_output_fisher: None,
+            frame_inner_rotation: None,
+            summary: "base".to_string(),
+        };
+        let sig_trivial_before = trivial.group_signature();
+        let trivial = trivial.with_frame_inner_rotation(vec![1, 1, 1]);
+        assert_eq!(trivial.frame_inner_rotation.as_ref().map(|g| g.dim), Some(0));
+        assert_eq!(trivial.group_signature(), sig_trivial_before);
+        assert_eq!(trivial.summary, "base");
     }
 
     /// Build a `(n, d)` `(mean, scale)` pair whose stacked signature

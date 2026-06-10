@@ -4008,6 +4008,21 @@ impl SaeManifoldTerm {
             .sum()
     }
 
+    /// Active frame ranks `r_k`, one per frame-factored atom, in atom order
+    /// (atoms on the full-`B` path contribute no entry). This is the input to
+    /// the identifiability certificate's inner-rotation enumeration
+    /// (`ResidualGaugeReport::with_frame_inner_rotation`, issue #972): the
+    /// `U_k → U_k R, C_k → Rᵀ C_k` gauge is exact in the product, so the
+    /// certificate enumerates `∏_k O(r_k)` (dim `Σ_k r_k(r_k−1)/2`) and
+    /// records that the canonical orientation gauge fixes it, instead of
+    /// curvature-testing a freedom the parameterization already handles.
+    pub fn active_frame_ranks(&self) -> Vec<usize> {
+        self.atoms
+            .iter()
+            .filter_map(|a| a.decoder_frame.as_ref().map(|f| f.rank()))
+            .collect()
+    }
+
     /// True iff any atom has an active low-rank Grassmann frame (issue #972).
     pub fn frames_active(&self) -> bool {
         self.atoms.iter().any(|a| a.decoder_frame.is_some())
