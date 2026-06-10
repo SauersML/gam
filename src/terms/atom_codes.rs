@@ -259,6 +259,107 @@ impl SparseAtomCodes {
         }
         out
     }
+
+    /// Co-activation statistics for one atom pair `(a, b)` — the #976
+    /// code-dependence trigger. Pure popcount ratios over the active masks:
+    /// `P(a|b) = #{rows: a∧b} / #{rows: b}` and symmetrically.
+    ///
+    /// Two derived readings drive the structure search:
+    ///
+    /// * [`CoactivationStats::dependence`] (symmetric, the FUSION trigger) —
+    ///   independent atoms with marginal activation rates `π_a, π_b` co-activate
+    ///   at rate `π_a·π_b`, so both conditionals stay near the marginals; a
+    ///   shattered curved family re-encoded as several near-duplicate atoms
+    ///   pushes *both* conditionals toward 1.
+    /// * [`CoactivationStats::absorption_asymmetry`] (the ABSORPTION-audit
+    ///   trigger) — an A⇒B hierarchy where sparsity folded B's content into A
+    ///   shows `P(parent|child) ≈ 1` without the converse, so a large asymmetry
+    ///   with one conditional near 1 flags the pair for the within-atom
+    ///   substructure audit (#907 race on the atom's own code distribution).
+    ///
+    /// These are *triggers*, not decisions: they rank move proposals
+    /// deterministically; acceptance is owned by the e-process gates in
+    /// [`crate::solver::structure_search`].
+    pub fn coactivation(&self, a: usize, b: usize) -> CoactivationStats {
+        assert!(
+            a < self.k_atoms && b < self.k_atoms,
+            "SparseAtomCodes::coactivation: atoms ({a}, {b}) out of range K={}",
+            self.k_atoms
+        );
+        let n_obs = self.n_obs();
+        let mut n_a = 0usize;
+        let mut n_b = 0usize;
+        let mut n_joint = 0usize;
+        for code in &self.codes {
+            let on_a = code.active_mask.get(a);
+            let on_b = code.active_mask.get(b);
+            n_a += usize::from(on_a);
+            n_b += usize::from(on_b);
+            n_joint += usize::from(on_a && on_b);
+        }
+        let cond = |joint: usize, marg: usize| {
+            if marg == 0 {
+                0.0
+            } else {
+                joint as f64 / marg as f64
+            }
+        };
+        let lift = if n_a == 0 || n_b == 0 || n_obs == 0 {
+            0.0
+        } else {
+            (n_joint as f64 * n_obs as f64) / (n_a as f64 * n_b as f64)
+        };
+        CoactivationStats {
+            n_obs,
+            n_a,
+            n_b,
+            n_joint,
+            p_a_given_b: cond(n_joint, n_b),
+            p_b_given_a: cond(n_joint, n_a),
+            lift,
+        }
+    }
+}
+
+/// Pairwise co-activation summary for two atoms (see
+/// [`SparseAtomCodes::coactivation`]). All probabilities are empirical
+/// popcount ratios over the active-support masks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoactivationStats {
+    /// Total number of observations the codes cover.
+    pub n_obs: usize,
+    /// Rows where atom `a` is active.
+    pub n_a: usize,
+    /// Rows where atom `b` is active.
+    pub n_b: usize,
+    /// Rows where both are active.
+    pub n_joint: usize,
+    /// `P(a active | b active)`; `0` when `b` is never active.
+    pub p_a_given_b: f64,
+    /// `P(b active | a active)`; `0` when `a` is never active.
+    pub p_b_given_a: f64,
+    /// `P(a∧b) / (P(a)·P(b))`; `1` for independent atoms, `0` when either
+    /// marginal is empty.
+    pub lift: f64,
+}
+
+impl CoactivationStats {
+    /// Symmetric code dependence `min(P(a|b), P(b|a))` — the canonical-order
+    /// trigger for FUSION proposals (descending). Near 0 for independent or
+    /// disjoint atoms; near 1 only when the two supports essentially coincide,
+    /// which is the shattering signature.
+    pub fn dependence(&self) -> f64 {
+        self.p_a_given_b.min(self.p_b_given_a)
+    }
+
+    /// Conditional asymmetry `|P(a|b) − P(b|a)|` — large when one atom's
+    /// support nests inside the other's (the A⇒B absorption signature, where
+    /// `P(parent|child) ≈ 1` but not conversely). Flags the pair for a
+    /// targeted within-atom substructure audit; it is never itself an
+    /// acceptance criterion.
+    pub fn absorption_asymmetry(&self) -> f64 {
+        (self.p_a_given_b - self.p_b_given_a).abs()
+    }
 }
 
 #[cfg(test)]
@@ -302,5 +403,64 @@ mod tests {
         assert_eq!(m[[0, 1]], 0.5);
         assert_eq!(m[[2, 3]], 0.9);
         assert_eq!(m[[1, 0]], 0.0);
+    }
+
+    /// Co-activation triggers separate the three planted regimes: independent
+    /// atoms (low dependence), a shattered duplicate pair (dependence ≈ 1,
+    /// symmetric), and an absorption hierarchy (high asymmetry, parent
+    /// conditional ≈ 1).
+    #[test]
+    fn coactivation_separates_independent_shattered_and_absorbed() {
+        let n = 100usize;
+        let mut codes = SparseAtomCodes::empty(n, 4);
+        for row in 0..n {
+            // Atom 0: active on even rows; atom 1: active on rows ≡ 0 (mod 5)
+            // — independent-ish supports (joint = rows ≡ 0 mod 10).
+            if row % 2 == 0 {
+                codes.row_mut(row).assign(0, 1.0);
+            }
+            if row % 5 == 0 {
+                codes.row_mut(row).assign(1, 1.0);
+            }
+            // Atoms 2 and 3: a nested pair — 3 (child) active on rows ≡ 0
+            // (mod 4), 2 (parent) active whenever 3 is plus half of the rest.
+            if row % 4 == 0 || row % 2 == 1 {
+                codes.row_mut(row).assign(2, 1.0);
+            }
+            if row % 4 == 0 {
+                codes.row_mut(row).assign(3, 1.0);
+            }
+        }
+
+        // Independent pair: P(0|1) = 0.5 (even rows among multiples of 5),
+        // P(1|0) = 10/50 = 0.2 → low symmetric dependence, lift = 1.
+        let indep = codes.coactivation(0, 1);
+        assert_eq!(indep.n_joint, 10);
+        assert!((indep.p_a_given_b - 0.5).abs() < 1e-12);
+        assert!((indep.p_b_given_a - 0.2).abs() < 1e-12);
+        assert!((indep.lift - 1.0).abs() < 1e-12);
+        assert!(indep.dependence() < 0.25);
+
+        // Nested (absorption-suspect) pair: P(parent|child) = 1, converse
+        // small → near-maximal asymmetry.
+        let nested = codes.coactivation(2, 3);
+        assert!((nested.p_a_given_b - 1.0).abs() < 1e-12);
+        assert!(nested.p_b_given_a < 0.5);
+        assert!(nested.absorption_asymmetry() > 0.6);
+
+        // Shattered pair: identical supports → dependence = 1, asymmetry = 0.
+        let mut dup = SparseAtomCodes::empty(n, 2);
+        for row in (0..n).step_by(3) {
+            dup.row_mut(row).assign(0, 1.0);
+            dup.row_mut(row).assign(1, 1.0);
+        }
+        let shat = dup.coactivation(0, 1);
+        assert!((shat.dependence() - 1.0).abs() < 1e-12);
+        assert!(shat.absorption_asymmetry() < 1e-12);
+
+        // Empty marginals are total, not NaN.
+        let empty = SparseAtomCodes::empty(4, 2).coactivation(0, 1);
+        assert_eq!(empty.dependence(), 0.0);
+        assert_eq!(empty.lift, 0.0);
     }
 }
