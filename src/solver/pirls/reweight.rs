@@ -23,6 +23,7 @@ use super::{
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::FaerSymmetricFactor;
+use crate::solver::loop_guard::{FlatStreak, IterationBound, LoopVerdict, RejectEscalator};
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd_into, sparse_symmetric_upper_matvec_public,
 };
@@ -381,13 +382,12 @@ where
         }
     }
     // Exhaustion policy is owned by the shared loop guard (#968) — the #874
-    // hang was guard drift between sibling branches; these adapters exist so
-    // no branch in this file can re-derive the predicate locally.
+    // hang was guard drift between sibling branches. The damping-window
+    // question delegates here; the count-or-window exhaustion question is
+    // `IterationBound::exhausted_at`, answered from guard-owned state, so
+    // no branch in this file can re-derive either predicate locally.
     fn lm_can_retry(loop_lambda: f64) -> bool {
         crate::solver::loop_guard::madsen_can_retry(loop_lambda)
-    }
-    fn lm_retry_exhausted(loop_lambda: f64, attempts: usize, max_attempts: usize) -> bool {
-        crate::solver::loop_guard::madsen_retry_exhausted(loop_lambda, attempts, max_attempts)
     }
     fn lm_nonconvergence_error(
         options: &WorkingModelPirlsOptions,
@@ -424,8 +424,9 @@ where
     // can fake it), so we require two consecutive matches before exiting
     // — virtually free when the optimizer has truly settled, and a
     // principled defence against false positives otherwise.
-    let mut plateau_streak = 0usize;
-    let mut constrained_objective_plateau_streak = 0usize;
+    let mut plateau_streak = FlatStreak::new(2);
+    let mut constrained_objective_plateau_streak =
+        FlatStreak::new(CONSTRAINED_OBJECTIVE_PLATEAU_STREAK);
     let has_explicit_constraints =
         options.coefficient_lower_bounds.is_some() || options.linear_constraints.is_some();
     let mut min_penalized_deviance = f64::INFINITY;
@@ -686,7 +687,13 @@ where
         // Loop to adjust lambda until we accept a step or fail
         // In standard LM, we solve (H + λI)δ = -g
         let mut loop_lambda = lambda;
-        let mut attempts = 0;
+        // Per-iteration hard bound (#968): ticks at the top of EVERY LM
+        // pass — including `continue` paths that reach no reject ritual
+        // (Fisher fallback, special cases) — so the unbounded `loop {}`
+        // below is structurally bounded no matter which branch a pass
+        // takes. Distinct from the reject escalator by design; see the
+        // loop_guard module docs.
+        let mut lm_bound = IterationBound::new(lm_max_attempts);
         // Snapshot the LM trajectory's starting λ for the
         // `[PIRLS lm-trajectory]` log emitted at iter-end. This is what
         // the runtime-layer adaptive clamp (commit 43be42be) selected for
@@ -715,9 +722,12 @@ where
         // `lm_can_retry` declares MADSEN_DAMPING_CAP exhausted; the older ×10
         // hit the ceiling in just 12 rejections (10^12 = MADSEN_DAMPING_CAP),
         // while ×2 doubling needs 40 rejections to exceed the same
-        // ceiling — well past `lm_max_attempts`. Resets to 2.0 on
+        // ceiling — well past `lm_max_attempts`. Restarts on
         // Fisher-fallback (different problem, restart the LM trajectory).
-        let mut madsen_reject_factor = 2.0_f64;
+        // The doubling discipline itself is owned by the shared escalator
+        // (#968) so no reject branch can apply the damping bump without
+        // advancing the schedule.
+        let mut madsen_escalator = RejectEscalator::new();
         let mut pending_arrow_latent_restore: Option<Array1<f64>> = None;
         let mut pending_arrow_predicted_reduction: Option<f64>;
 
@@ -742,7 +752,7 @@ where
         loop {
             restore_pending_arrow_latent_if_needed(options, &mut pending_arrow_latent_restore);
             pending_arrow_predicted_reduction = None;
-            attempts += 1;
+            lm_bound.tick();
             lm_attempts_done += 1;
             let attempt_solve_start = std::time::Instant::now();
 
