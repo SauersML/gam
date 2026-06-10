@@ -568,6 +568,37 @@ impl ContinuationPath {
         Self::enter(default_coupled_schedules())
     }
 
+    /// Heavy-smoothing entry coupled to a CONCRETE ρ target and legal box. The
+    /// seed cascade rebuilds the path per-seed with this once it knows the
+    /// objective's real ρ dimension (the no-argument [`ContinuationPath::heavy_entry`]
+    /// is a dimension-1 placeholder used only before the seed is in hand). The
+    /// ρ leg rides the spine from the spine's own oversmoothed ρ₀ down to
+    /// `rho_target` (the real objective ρ\*); `bounds_upper` is the legal ρ box.
+    /// The τ / isometry legs use the standard diffuse→sharp / loose→tight
+    /// default endpoints. Enters at `s = 1`, the heavy-smoothing contraction
+    /// regime. `rho_target` and `bounds_upper` must share length.
+    #[must_use]
+    pub fn heavy_entry_for_rho(rho_target: Array1<f64>, bounds_upper: Array1<f64>) -> Self {
+        assert_eq!(
+            rho_target.len(),
+            bounds_upper.len(),
+            "ContinuationPath::heavy_entry_for_rho: ρ target/bounds dim mismatch"
+        );
+        // Passing `rho_target` as both entry and target lets the spine own the
+        // entire oversmoothing offset (it builds ρ₀ = ρ* + OVERSMOOTH_OFFSET_INIT
+        // internally and anneals down), while the path simply rides at `s` along
+        // ρ*. This keeps a single source of truth for the ρ anneal — the spine —
+        // and the path couples the τ / isometry legs against that shared walk.
+        let schedules = couple_schedules(
+            rho_target.clone(),
+            rho_target,
+            bounds_upper,
+            default_temperature_schedule(),
+            default_isometry_schedule(),
+        );
+        Self::enter(schedules)
+    }
+
     /// The coarse heavy-smoothing regime the path is currently entering at. The
     /// seed cascade reports this in its demotion ledger and final diagnosis. A
     /// fresh [`ContinuationPath::heavy_entry`] is in [`PathRegime::Heavy`].
@@ -707,6 +738,14 @@ impl ContinuationPath {
         self.s = (self.s + REENTRY_BACKOFF).min(1.0);
         self.s_step = (self.s_step * 0.5).max(S_STEP_FLOOR);
         self.logit_tr = LogitTrustRegion::for_tau(self.schedules.scalar_targets_at(self.s).tau);
+    }
+
+    /// Whether the path has arrived at (or below) the real objective `s = 0`.
+    /// The outer driver stops driving [`ContinuationPath::step`] once this is
+    /// true and hands the warm iterate to the normal optimizer at ρ\*.
+    #[must_use]
+    pub fn arrived(&self) -> bool {
+        self.s <= 0.0
     }
 
     /// Take one waypoint step down the coupled homotopy.
@@ -895,39 +934,57 @@ pub fn couple_schedules(
 /// [`CoupledSchedules`] would.
 #[must_use]
 fn default_coupled_schedules() -> CoupledSchedules {
-    /// Diffuse entry τ (the schedule's `tau_start`) at `s = 1`.
-    const DEFAULT_ENTRY_TAU: f64 = 2.0;
-    /// Sharp target τ (`tau_min`) at `s = 0`.
-    const DEFAULT_TARGET_TAU: f64 = 0.1;
-    /// Loose entry isometry weight (`w_start`) at `s = 1`.
-    const DEFAULT_ENTRY_ISOMETRY: f64 = 0.01;
-    /// Tight target isometry weight (`w_end`) at `s = 0`.
-    const DEFAULT_TARGET_ISOMETRY: f64 = 1.0;
     /// Oversmoothed entry ρ₀ for the single-component placeholder leg.
     const DEFAULT_ENTRY_RHO: f64 = 5.0;
     /// Legal ρ upper bound for the placeholder leg.
     const DEFAULT_RHO_UPPER: f64 = 10.0;
 
-    let steps = ScheduleKind::Linear {
-        steps: CONTINUATION_WAYPOINTS,
-    };
-    let temperature = GumbelTemperatureSchedule::new(DEFAULT_ENTRY_TAU, DEFAULT_TARGET_TAU, steps)
-        .expect("default continuation temperature schedule must be valid");
-    let isometry = ScalarWeightSchedule::new(
+    couple_schedules(
+        Array1::from_elem(1, DEFAULT_ENTRY_RHO),
+        Array1::zeros(1),
+        Array1::from_elem(1, DEFAULT_RHO_UPPER),
+        default_temperature_schedule(),
+        default_isometry_schedule(),
+    )
+}
+
+/// The standard diffuse→sharp assignment-temperature leg (`DEFAULT_ENTRY_TAU`
+/// down to `DEFAULT_TARGET_TAU`) over the standard waypoint count. Shared by
+/// both [`ContinuationPath::heavy_entry`] and
+/// [`ContinuationPath::heavy_entry_for_rho`] so the τ leg has one source.
+#[must_use]
+fn default_temperature_schedule() -> GumbelTemperatureSchedule {
+    /// Diffuse entry τ (the schedule's `tau_start`) at `s = 1`.
+    const DEFAULT_ENTRY_TAU: f64 = 2.0;
+    /// Sharp target τ (`tau_min`) at `s = 0`.
+    const DEFAULT_TARGET_TAU: f64 = 0.1;
+    GumbelTemperatureSchedule::new(
+        DEFAULT_ENTRY_TAU,
+        DEFAULT_TARGET_TAU,
+        ScheduleKind::Linear {
+            steps: CONTINUATION_WAYPOINTS,
+        },
+    )
+    .expect("default continuation temperature schedule must be valid")
+}
+
+/// The standard loose→tight isometry gauge leg (`DEFAULT_ENTRY_ISOMETRY` up to
+/// `DEFAULT_TARGET_ISOMETRY`) over the standard waypoint count. Shared source
+/// for the isometry leg across both heavy-entry constructors.
+#[must_use]
+fn default_isometry_schedule() -> ScalarWeightSchedule {
+    /// Loose entry isometry weight (`w_start`) at `s = 1`.
+    const DEFAULT_ENTRY_ISOMETRY: f64 = 0.01;
+    /// Tight target isometry weight (`w_end`) at `s = 0`.
+    const DEFAULT_TARGET_ISOMETRY: f64 = 1.0;
+    ScalarWeightSchedule::new(
         DEFAULT_ENTRY_ISOMETRY,
         DEFAULT_TARGET_ISOMETRY,
         ScheduleKind::Linear {
             steps: CONTINUATION_WAYPOINTS,
         },
     )
-    .expect("default continuation isometry schedule must be valid");
-    couple_schedules(
-        Array1::from_elem(1, DEFAULT_ENTRY_RHO),
-        Array1::zeros(1),
-        Array1::from_elem(1, DEFAULT_RHO_UPPER),
-        temperature,
-        isometry,
-    )
+    .expect("default continuation isometry schedule must be valid")
 }
 
 /// View helper: the wiring agent passes the SAE assignment matrix (rows ×
@@ -1076,9 +1133,9 @@ mod tests {
     #[test]
     fn continuation_step_has_no_reject_arm() {
         // Compile-time + exhaustiveness witness: every ContinuationStep value
-        // resolves to descend / arrive / re-enter. There is no rejection arm,
-        // so a `match` over the enum cannot bind a "give up" case. If a Reject
-        // variant were ever added, this match would fail to compile against the
+        // resolves to a heavier-regime re-entry. There is no rejection arm, so a
+        // `match` over the enum cannot bind a "give up" case. If a Reject variant
+        // were ever added, this match would fail to compile against the
         // documented invariant.
         fn is_progress(step: &ContinuationStep) -> bool {
             match step {

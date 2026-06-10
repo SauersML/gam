@@ -8446,6 +8446,18 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.seeded_beta = Some(beta.clone());
         Ok(SeedOutcome::Installed)
     }
+
+    /// The SAE-manifold joint fit MUST enter through the heavy-smoothing
+    /// [`crate::solver::continuation_path::ContinuationPath`]: its joint
+    /// `(logits, t, β)` block has a combinatorial active-set component that a
+    /// cold solve at ρ* can collapse (the K≥2 routing-collapse failure class).
+    /// Returning `true` routes every seed through the coupled ρ / τ / isometry
+    /// homotopy walk (Object 1) and flips the seed cascade's structural-failure
+    /// handling from REJECT to DEMOTE-WITH-REASON, so the candidate set never
+    /// empties on a structural diagnosis.
+    fn requires_continuation_path_entry(&self) -> bool {
+        true
+    }
 }
 
 fn sae_manifold_newton_directional_decrease(

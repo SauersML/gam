@@ -5729,7 +5729,180 @@ fn run_outer_with_plan(
         // DEMOTED to a heavier regime below, not treated as a feasibility gate.
         let enter_via_continuation_path =
             obj.allow_continuation_prewarm() || continuation_path.is_some();
-        if the_plan.solver != Solver::CompassSearch && enter_via_continuation_path {
+        // Continuation-entry objective (SAE-manifold joint fit): DRIVE the
+        // coupled `ContinuationPath` homotopy explicitly. This is the missing
+        // half of Object 1 — the descent walk. Rather than a single ρ-only
+        // `prime_outer_seed` pre-screen, we step the path waypoint by waypoint:
+        // each `step` runs the ρ-anneal spine for that waypoint and advances
+        // the τ / isometry legs in lockstep, so all three knobs arrive at the
+        // real objective together (the one-monotone-walk invariant). The
+        // converged inner β of each accepted descent leg warm-starts the next,
+        // and the warm iterate at `Arrived` is handed to the normal solver at
+        // ρ*. Re-entry / breach / underflow are non-fatal floor behaviors,
+        // each consumed below — never a rejection.
+        //
+        // Unlike the ρ-only `prime_outer_seed` pre-warm (which the CompassSearch
+        // exclusion below skips for the survival aux baseline whose
+        // `eval_with_order` is unreachable by construction), the walk runs for
+        // EVERY continuation-entry objective regardless of the primary solver
+        // class: the only objective that sets `requires_continuation_path_entry`
+        // is the SAE-manifold joint fit, whose `eval` / `seed_inner_state` /
+        // inner arrow-Schur ARE reachable. A small-ρ SAE fit dispatches to the
+        // derivative-free `CompassSearch` primary, and that direct search drives
+        // purely on `eval_cost` — which is exactly the cold inner solve the
+        // heavy-smoothing walk must warm first, or the cold `eval_cost` hits a
+        // non-PD inner block (the K≥2 routing-collapse failure Object 1 exists
+        // to prevent).
+        if continuation_path.is_some() {
+            {
+                // Rebuild the path per-seed against the OBJECTIVE's real ρ
+                // dimension and legal box. The seed-loop-scoped `heavy_entry`
+                // placeholder is dimension-1 (built before any seed is in hand);
+                // the spine call inside `step` requires the ρ target to match
+                // the objective's ρ dim, so we re-enter the heavy-smoothing
+                // regime coupled to this seed's ρ\* and bounds. Re-entry resets
+                // the path to a fresh `s = 1` for every seed, which is correct:
+                // each seed is its own descent from the contraction regime.
+                let path = continuation_path.insert(
+                    crate::solver::continuation_path::ContinuationPath::heavy_entry_for_rho(
+                        seed.clone(),
+                        bounds_template.1.clone(),
+                    ),
+                );
+                let walk_start = std::time::Instant::now();
+                // β carried warm across legs. Empty = cold entry (#969:
+                // warm-invariance funnels cold and warm to the same s=1
+                // contraction fixed point).
+                let mut warm_beta: Array1<f64> = Array1::zeros(0);
+                let mut legs_descended = 0usize;
+                let mut arrived = false;
+                // Bound the walk: CONTINUATION_WAYPOINTS clean descents plus a
+                // modest re-entry allowance (every re-entry is progress toward
+                // the contraction floor, reachable in finitely many back-offs).
+                // Each `step` runs the ρ-anneal spine, which is itself an inner
+                // homotopy — so the budget is deliberately tight (descents +
+                // half-as-many re-entries) to keep the coupled walk's total
+                // inner-solve count bounded; the spine warm-starts from the
+                // previous leg's β, so post-entry legs are cheap. The loop only
+                // ever exits on `Arrived` or this budget — there is no rejection
+                // exit.
+                let walk_budget = crate::solver::continuation_path::CONTINUATION_WAYPOINTS
+                    + crate::solver::continuation_path::CONTINUATION_WAYPOINTS / 2;
+                for _ in 0..walk_budget {
+                    if path.arrived() {
+                        arrived = true;
+                        break;
+                    }
+                    match path.step(obj, &warm_beta) {
+                        crate::solver::continuation_path::ContinuationStep::Descended {
+                            s,
+                            state,
+                        } => {
+                            // Warm-start the next leg from this leg's converged
+                            // inner β. `NoSlot` is fine (the objective simply
+                            // starts the next spine pass cold); a genuine
+                            // dimension error resets to a clean baseline and the
+                            // walk re-enters heavier on the next iteration.
+                            warm_beta = state.last_beta.clone();
+                            if let Err(err) = obj.seed_inner_state(&warm_beta) {
+                                log::warn!(
+                                    "[OUTER] {context}: continuation descent seed {seed_idx} \
+                                     warm-start at s={s:.4} unusable ({err}); proceeding cold"
+                                );
+                                warm_beta = Array1::zeros(0);
+                                obj.reset();
+                            }
+                            legs_descended += 1;
+                        }
+                        crate::solver::continuation_path::ContinuationStep::Arrived { state } => {
+                            // The path reached ρ* / τ_min / tight isometry along
+                            // the coupled walk. Install the warm iterate so the
+                            // normal solver below starts from the contraction's
+                            // image at the real objective, not cold.
+                            warm_beta = state.last_beta.clone();
+                            if let Err(err) = obj.seed_inner_state(&warm_beta) {
+                                log::warn!(
+                                    "[OUTER] {context}: continuation arrival seed {seed_idx} \
+                                     warm-start unusable ({err}); solver starts cold at ρ*"
+                                );
+                                obj.reset();
+                            }
+                            legs_descended += 1;
+                            arrived = true;
+                            break;
+                        }
+                        crate::solver::continuation_path::ContinuationStep::Reentered {
+                            s,
+                            reason,
+                        } => {
+                            use crate::solver::continuation_path::ReentryReason;
+                            // The homotopy FLOOR: never reject. Each reason is a
+                            // re-entry into a heavier regime (the path already
+                            // raised `s`); we consume its payload for diagnostics
+                            // and continue descending from the heavier regime.
+                            match reason {
+                                ReentryReason::SpineStruggled(failure) => {
+                                    log::info!(
+                                        "[OUTER] {context}: continuation seed {seed_idx} spine \
+                                         struggled at s={s:.4} ({}); re-entered heavier regime {:?}",
+                                        failure.message(),
+                                        path.enter_regime(),
+                                    );
+                                }
+                                ReentryReason::StepUnderflow => {
+                                    // The descent step underflowed: demote with a
+                                    // recorded reason so the ledger surfaces the
+                                    // heavier-regime re-entry, then keep
+                                    // descending from the pinned floor.
+                                    let regime = path.demote_with_reason(
+                                        crate::solver::continuation_path::PathDemotionReason::PrewarmStructural,
+                                    );
+                                    path_demotions.push(PathDemotionRecord {
+                                        seed_idx,
+                                        regime,
+                                        reason: format!(
+                                            "continuation step underflow at s={s:.4}; pinned to \
+                                             the homotopy floor and re-descending"
+                                        ),
+                                    });
+                                }
+                                ReentryReason::MassFloorBreached(breach) => {
+                                    // Active-mass collapse toward the uniform
+                                    // saddle: reset to the pristine seeded
+                                    // baseline (the scaffold) so the assignment
+                                    // re-diffuses, and record the breach with its
+                                    // observed mass / floor in the demotion
+                                    // ledger. Never fatal.
+                                    obj.reset();
+                                    warm_beta = Array1::zeros(0);
+                                    let regime = path.enter_regime();
+                                    path_demotions.push(PathDemotionRecord {
+                                        seed_idx,
+                                        regime,
+                                        reason: format!(
+                                            "active-mass breach (observed mean {:.4} < floor \
+                                             {:.4}); re-seeded from scaffold, re-entered heavier \
+                                             regime",
+                                            breach.observed_mean_mass, breach.floor,
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                log::info!(
+                    "[OUTER] {context}: continuation-path walk seed {seed_idx} legs={legs_descended} \
+                     arrived={arrived} reseeds={} elapsed={:.3}s",
+                    path.reseed_count(),
+                    walk_start.elapsed().as_secs_f64(),
+                );
+            }
+        }
+        if the_plan.solver != Solver::CompassSearch
+            && continuation_path.is_none()
+            && enter_via_continuation_path
+        {
             let prewarm_start = std::time::Instant::now();
             match crate::solver::estimate::reml::continuation::prime_outer_seed(
                 obj,
@@ -5752,49 +5925,23 @@ fn run_outer_with_plan(
                 Err(cf) if cf.is_structural() => {
                     // The pre-warm surfaced a structural defect of the seed's
                     // joint design (rank/alias deficiency or a genuine
-                    // active-set KKT bug).
+                    // active-set KKT bug). This block runs only for
+                    // NON-continuation-entry objectives (continuation-entry
+                    // objectives drive the explicit `ContinuationPath` walk
+                    // above, where a structural refusal is a heavier-regime
+                    // demotion, never a rejection). Legacy contract: a cold solve
+                    // at the seed ρ* would hit the same defect, so disqualify the
+                    // seed and route the failure through the same structural
+                    // accounting any other pre-validation rejection takes.
                     let msg = format!(
                         "continuation pre-warm refused before seed eval: {}",
                         cf.message()
                     );
-                    if let Some(path) = continuation_path.as_mut() {
-                        // Continuation-entry objective: a structural refusal at
-                        // the *current* path regime is a DEMOTE signal, not a
-                        // disqualification. Route the seed to a HEAVIER regime
-                        // and re-enter — the heavier-smoothing start gives the
-                        // joint solver a feasible basin the current regime could
-                        // not reach. We still preserve the
-                        // "pre-warm-is-an-optimization-never-a-feasibility-gate"
-                        // contract: after demoting we reset to a clean baseline
-                        // and fall through to the (heavier-regime) cold seed eval
-                        // below, which judges ρ* on its own merits. Recorded;
-                        // never fatal; never disqualifies the seed.
-                        let regime = path.demote_with_reason(
-                            crate::solver::continuation_path::PathDemotionReason::PrewarmStructural,
-                        );
-                        log::warn!(
-                            "[OUTER] {context}: continuation-entry objective demoted seed \
-                             {seed_idx} to heavier path regime {regime:?} instead of rejecting \
-                             ({msg}); re-entering at the heavier regime"
-                        );
-                        path_demotions.push(PathDemotionRecord {
-                            seed_idx,
-                            regime,
-                            reason: msg,
-                        });
-                        obj.reset();
-                    } else {
-                        // Legacy contract for non-continuation objectives: a
-                        // cold solve at the seed ρ* would hit the same defect,
-                        // so disqualify the seed and route the failure through
-                        // the same structural accounting any other
-                        // pre-validation rejection takes.
-                        log::warn!(
-                            "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
-                        );
-                        rejection_reasons.push((seed_idx, "validation", msg));
-                        continue 'seed_attempts;
-                    }
+                    log::warn!(
+                        "[OUTER] {context}: rejecting seed {seed_idx} (continuation): {msg}"
+                    );
+                    rejection_reasons.push((seed_idx, "validation", msg));
+                    continue 'seed_attempts;
                 }
                 Err(cf) => {
                     // Non-structural pre-warm failure: the continuation walk
