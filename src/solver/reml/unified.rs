@@ -8793,7 +8793,14 @@ pub fn reml_laml_evaluate(
             callback_operator_kernel,
             has_subspace_trace,
         );
-        let use_operator = route_plan.use_operator;
+        // #740: when the direction-contracted ψψ hook is installed, the operator
+        // route is strictly cheaper than dense at every scale — the dense
+        // `compute_outer_hessian` path would re-run the `K²` per-pair ψψ
+        // assembly the hook exists to avoid, whereas the operator applies the
+        // hook once per matvec. So force the operator representation whenever the
+        // hook is present (it still requires a kernel to build the operator).
+        let use_operator = route_plan.use_operator
+            || (solution.contracted_psi_second_order.is_some() && hessian_kernel.is_some());
         let route_choice = route_plan.choice();
         let route_reason = route_plan.reason;
         log::info!(
