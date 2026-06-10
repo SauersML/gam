@@ -9,35 +9,47 @@
 //!   ∂β̂/∂t = −H⁻¹ · ∂g/∂t
 //! ```
 //!
-//! for ANY perturbation channel t: smoothing parameters (the REML outer
+//! for ANY perturbation channel `t`: smoothing parameters (the REML outer
 //! gradient), case weights (ALO / leave-one-out / Cook's distance),
-//! responses (data attribution), stage-1 nuisances (the #461 influence
-//! absorber). The tree computed this in independent dialects with
-//! independent factorizations — `AloFactoredHessian` (runtime.rs),
-//! `ift_dbeta_drho_from_solver` (evidence.rs), the outer-assembly mode
-//! responses and the projected pseudo-inverse of the rank-deficient LAML
-//! kernel (unified.rs) — and each site had to independently answer the
+//! responses (data attribution). One identity, read off in whichever
+//! direction a diagnostic needs it.
+//!
+//! Before this, the tree computed `H⁻¹·` in independent dialects with
+//! independent factorizations — `AloFactoredHessian` (runtime.rs), an
+//! `ift_dbeta_drho_from_solver` solve-closure and a separate coned variant
+//! (evidence.rs), and the projected pseudo-inverse of the rank-deficient
+//! LAML kernel (unified.rs) — so each site had to answer on its own the
 //! question that actually causes bugs: **which inverse is "H⁻¹"?** The
 //! biobank fix 0dc469bd and the #901 layer-2 investigation are both
 //! incidents of two sites answering differently.
 //!
-//! [`FitSensitivity`] is the single answer. It is built once at the
-//! optimum from whichever factored form the solver already has — a faer
-//! Cholesky factor, a raw lower-triangular factor, or the projected
+//! [`FitSensitivity`] is the single answer. It is built once at the optimum
+//! from whichever factored form the solver already has — a faer Cholesky
+//! factor, a raw lower-triangular (arrow-Schur) factor, or the projected
 //! pseudo-inverse `U · M⁻¹ · Uᵀ` (the #752/#901 intrinsic-quotient
 //! convention) — and every consumer asks it, never a factor directly.
 //! Consumers therefore cannot disagree about the inverse, and every
-//! batching/cone/caching improvement made inside [`FitSensitivity::apply_multi`]
-//! is inherited by all of them at once (#779's cone-of-influence becomes
-//! an optimization here instead of a ρ-path-only feature).
+//! batching/cone improvement made inside [`FitSensitivity::apply_multi`] is
+//! inherited by all of them at once.
 //!
-//! Migration ladder (each step DELETES a factorization site):
-//! 1. (this commit) `AloFactoredHessian` holds a `FitSensitivity` instead
-//!    of a bare factor; `ift_dbeta_drho` routes through
-//!    [`FitSensitivity::mode_response`].
-//! 2. unified.rs mode-response stacks + `PenaltySubspaceTrace`
-//!    pseudo-inverse construct the [`FittedInverse::Projected`] variant.
-//! 3. #461 `score_influence_jacobian` sites.
+//! The channels, each a one-line restatement of the identity above:
+//!
+//! - [`mode_response`](FitSensitivity::mode_response) — `−H⁻¹ ∂g/∂t`, the
+//!   REML outer gradient's `∂β̂/∂ρ` (evidence `ift_dbeta_drho`).
+//! - [`mode_response_coned`](FitSensitivity::mode_response_coned) — the same
+//!   response confined to its cone of influence (#779); the lazy/local form
+//!   the smoothing-correction IFT uses.
+//! - [`leverage_block`](FitSensitivity::leverage_block) — `H⁻¹Xᵀ`, whose
+//!   column `i` is at once ALO's per-row solve and the case/response channel.
+//! - [`case_deletion`](FitSensitivity::case_deletion) — dfbetas + Cook's
+//!   distance, the leave-one-out channel, one scaled column of `H⁻¹Xᵀ` each.
+//!
+//! What is deliberately NOT folded in: the matrix-free `hop.solve_multi`
+//! (PCG/GPU), the constrained kernel `K_T = K_S − K_S Aᵀ(A K_S Aᵀ)⁻¹A K_S`,
+//! and `alo.rs`'s zero-copy `StableSolver` loop. Those are distinct inverse
+//! *representations*, not duplicate spellings of the same factored inverse —
+//! routing them through here would regress performance and couple unrelated
+//! concerns rather than remove the bug class.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -273,11 +285,12 @@ impl<'a> FitSensitivity<'a> {
     ///
     /// ```text
     ///   D_i = (β̂−β̂₍ᵢ₎)ᵀ H (β̂−β̂₍ᵢ₎) / (p · φ)
-    ///       = (w_i r_i / (1 − h_ii))² · (h_ii / w_i) / (p · φ),
+    ///       = scale_i² · (x_iᵀ H⁻¹ x_i) / (p · φ),   scale_i = w_i r_i / (1 − h_ii),
     /// ```
     ///
     /// the second form following from `(H⁻¹x_i)ᵀ H (H⁻¹x_i) = x_iᵀ H⁻¹ x_i`,
-    /// so no separate `H` apply is needed.
+    /// so the single quadratic form `x_iᵀ H⁻¹ x_i` gates the leverage, the
+    /// deletion denominator, and Cook's distance alike — no separate `H` apply.
     ///
     /// This is an *opt-in* diagnostic: `dfbeta` is `n × p` and is never
     /// materialized on the default fit path (it would be ruinous at biobank
@@ -306,29 +319,24 @@ impl<'a> FitSensitivity<'a> {
         let mut dfbeta = Array2::<f64>::zeros((n, p));
         let mut leverage = Array1::<f64>::zeros(n);
         let mut cooks = Array1::<f64>::zeros(n);
+        let p_phi = p as f64 * phi;
         for i in 0..n {
-            let x_i = design.row(i);
+            // hinv_xi = H⁻¹x_i is column i of the leverage block; the single
+            // quadratic form x_iᵀ H⁻¹ x_i gates everything below.
             let hinv_xi = h_inv_xt.column(i);
-            let w_i = working_weights[i];
-            // x_iᵀ H⁻¹ x_i appears in both the leverage and Cook's distance.
-            let xhx = x_i.dot(&hinv_xi);
-            let h_ii = w_i * xhx;
+            let xhx = design.row(i).dot(&hinv_xi);
+            let h_ii = working_weights[i] * xhx;
             let denom = 1.0 - h_ii;
-            // A leverage of exactly 1 means the row pins its own fit; the
-            // closed-form deletion is singular there and we refuse rather
-            // than emit an infinity.
+            // Leverage 1 pins the row to its own fit: the closed-form
+            // deletion is singular there, so we refuse rather than emit ∞.
             if !denom.is_finite() || denom.abs() < f64::EPSILON {
                 return None;
             }
-            let scale = w_i * working_residual[i] / denom;
-            for j in 0..p {
-                dfbeta[[i, j]] = scale * hinv_xi[j];
-            }
+            // β̂ − β̂₍ᵢ₎ = scale · H⁻¹x_i — one scaled column, no refit.
+            let scale = working_weights[i] * working_residual[i] / denom;
+            dfbeta.row_mut(i).assign(&(&hinv_xi * scale));
             leverage[i] = h_ii;
-            // D_i = (β̂−β̂₍ᵢ₎)ᵀ H (β̂−β̂₍ᵢ₎) / (p·φ) and
-            // (H⁻¹x_i)ᵀ H (H⁻¹x_i) = x_iᵀ H⁻¹ x_i = xhx, so the quadratic
-            // form is scale²·xhx with no separate `H` apply.
-            cooks[i] = scale * scale * xhx / (p as f64 * phi);
+            cooks[i] = scale * scale * xhx / p_phi;
         }
         Some(CaseDeletionInfluence {
             dfbeta,
