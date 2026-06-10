@@ -13,7 +13,7 @@
 //! objective↔gradient desync class, and the cure is the same: a single
 //! source of truth that branches consume and cannot locally re-derive.
 //!
-//! # The two policies
+//! # The policy pieces
 //!
 //! [`madsen_can_retry`] / [`madsen_retry_exhausted`] own the damped-retry
 //! exhaustion question for Madsen-style Levenberg–Marquardt loops: a retry
@@ -23,13 +23,34 @@
 //! Newton) must answer this question through these functions — never
 //! through a local predicate.
 //!
-//! [`PlateauDetector`] owns the question attempt caps cannot see: a loop
-//! that still "makes progress" every iteration but whose MERIT is frozen.
-//! #744 ran to cycle 1199/1200 at a flat residual; #826 burned a CI
-//! timeout on a frozen joint residual. The detector watches the loop's
-//! descent quantity (penalized NLL, residual norm, |g|) and reports a
-//! plateau once the relative improvement stays below a tolerance for a
-//! consecutive window — long before any iteration cap.
+//! [`IterationBound`] and [`RejectEscalator`] are the two *distinct*
+//! safety mechanisms of an unbounded damped-retry loop, kept as two types
+//! on purpose. The bound owns the per-iteration hard count: it ticks once
+//! at the top of EVERY pass — including `continue` paths that neither
+//! accept a step nor reach a reject ritual (Fisher fallback, special
+//! cases) — and is the net that makes an unbounded `loop {}` safe. The
+//! escalator owns the geometric damping discipline applied on REJECTS
+//! only. A single type coupling "count++" to "reject" would either
+//! double-count iterations or silently assume every non-accepting pass
+//! reaches a reject ritual — the exact unbounded-loop hole the guard
+//! exists to close (see the #968 thread's design note).
+//!
+//! [`FlatStreak`] owns the consecutive-window discipline every stagnation
+//! detector shares: a streak that grows on "flat" readings, resets on
+//! recovery, and fires once it spans the window. Loops that own a
+//! scale-aware flatness predicate of their own (the custom_family
+//! joint-Newton objective-flat counter, the blockwise frozen-loglik
+//! divergence detector) consume it directly; [`PlateauDetector`] composes
+//! it with the default relative-improvement predicate for loops that just
+//! hand over their merit stream.
+//!
+//! [`PlateauDetector`] answers the question attempt caps cannot see: a
+//! loop that still "makes progress" every iteration but whose MERIT is
+//! frozen. #744 ran to cycle 1199/1200 at a flat residual; #826 burned a
+//! CI timeout on a frozen joint residual. Feed it the loop's descent
+//! quantity (penalized NLL, residual norm, |g|) once per iteration; it
+//! reports a plateau once the relative improvement stays below a
+//! tolerance for a consecutive window — long before any iteration cap.
 //!
 //! # Verdicts, not panics
 //!
@@ -39,22 +60,28 @@
 //! `LmStepSearchExhausted`, …) and unwinds. Never a hang, never a panic,
 //! never a silent wrong answer.
 //!
-//! # Migration map (each step deletes a hand-rolled guard)
+//! # Migration map (each step deleted a hand-rolled guard)
 //!
-//! 1. (this commit) reweight.rs `lm_can_retry`/`lm_retry_exhausted` local
-//!    fns + the local `LM_MAX_LAMBDA` const are deleted; the 10 call
-//!    sites consume this module's policy.
-//! 2. The 7 copies of the reject ritual
-//!    (`loop_lambda *= factor; factor *= 2.0; continue`) collapse onto
-//!    [`MadsenGuard::escalate`] so the doubling discipline cannot drift
-//!    per-branch either.
-//! 3. custom_family.rs Newton cycle: `outer_inner_max_iterations`
-//!    (the shared `Arc<AtomicUsize>` countdown) becomes a `MadsenGuard`
-//!    field, and the cycle gains a `PlateauDetector` on its joint
-//!    residual — the guard that would have caught #826 in seconds.
-//! 4. Terminal verdicts report into the heartbeat scope (heartbeat.rs
-//!    stays a monitor; the 60s liveness log then shows WHY a loop ended,
-//!    not just where it was).
+//! 1. (done) reweight.rs `lm_can_retry`/`lm_retry_exhausted` local fns +
+//!    the local `LM_MAX_LAMBDA` const deleted; call sites consume this
+//!    module's policy.
+//! 2. (done) The 7 copies of the reweight.rs reject ritual
+//!    (`loop_lambda *= factor; factor *= 2.0; continue`) collapsed onto
+//!    [`RejectEscalator::escalate`], and the per-iteration hard count
+//!    moved into [`IterationBound`], so neither discipline can drift
+//!    per-branch.
+//! 3. (done) custom_family.rs: the joint-Newton objective-flat counter
+//!    and the blockwise frozen-loglik divergence streak both ride
+//!    [`FlatStreak`] — the #826-class exit discipline now lives here, not
+//!    in per-loop counters. The richer certificate machinery those loops
+//!    layer on top (geometric-tail bound, clamped-step side condition)
+//!    stays local: it is *policy about what counts as flat*, which the
+//!    loops rightly own; the streak/window discipline is what must not
+//!    fork.
+//! 4. (dropped) Terminal-verdict reporting into heartbeat scopes: the
+//!    `[JN-EXIT]`/`[PIRLS]` per-exit log lines already name why a loop
+//!    ended; a parallel verdict channel in the process monitor would be
+//!    redundant global state.
 
 /// Damping ceiling for Madsen-style LM retries. Beyond this the proposed
 /// step is numerically a zero step — retrying cannot make progress, so the
@@ -104,7 +131,53 @@ pub enum LoopVerdict {
     Exhausted,
 }
 
-/// Stagnation detector on a loop's merit stream.
+/// Consecutive-flatness streak: the window discipline shared by every
+/// stagnation detector in the tree. The caller owns the flatness
+/// predicate (scale-aware objective tolerance, frozen log-likelihood,
+/// sub-tolerance relative improvement, …); this type owns the part that
+/// historically forked per loop — grow on flat, reset on recovery, fire
+/// once the streak spans the window, and keep firing while it persists.
+#[derive(Clone, Debug)]
+pub struct FlatStreak {
+    window: usize,
+    streak: usize,
+}
+
+impl FlatStreak {
+    pub fn new(window: usize) -> Self {
+        Self {
+            window: window.max(1),
+            streak: 0,
+        }
+    }
+
+    /// Record one pre-judged flatness reading; returns the current verdict.
+    pub fn note(&mut self, flat: bool) -> LoopVerdict {
+        if flat {
+            self.streak += 1;
+            if self.streak >= self.window {
+                return LoopVerdict::Plateaued;
+            }
+        } else {
+            self.streak = 0;
+        }
+        LoopVerdict::Continue
+    }
+
+    /// Hard reset, e.g. after a non-finite merit re-baselines the stream.
+    pub fn reset(&mut self) {
+        self.streak = 0;
+    }
+
+    /// Current consecutive-flat count (diagnostic; the verdict is the
+    /// contract).
+    pub fn streak(&self) -> usize {
+        self.streak
+    }
+}
+
+/// Stagnation detector on a loop's merit stream: [`FlatStreak`] composed
+/// with the default relative-improvement flatness predicate.
 ///
 /// Feed it the loop's descent quantity once per iteration; it answers
 /// "has the relative improvement stayed below `rel_tol` for `window`
@@ -113,18 +186,16 @@ pub enum LoopVerdict {
 /// and gradient norms all work unaltered.
 #[derive(Clone, Debug)]
 pub struct PlateauDetector {
-    window: usize,
     rel_tol: f64,
-    streak: usize,
+    streak: FlatStreak,
     last_merit: Option<f64>,
 }
 
 impl PlateauDetector {
     pub fn new(window: usize, rel_tol: f64) -> Self {
         Self {
-            window: window.max(1),
             rel_tol,
-            streak: 0,
+            streak: FlatStreak::new(window),
             last_merit: None,
         }
     }
@@ -140,24 +211,14 @@ impl PlateauDetector {
     /// streak so recovery is observed from scratch.
     pub fn note(&mut self, merit: f64) -> LoopVerdict {
         if !merit.is_finite() {
-            self.streak = 0;
+            self.streak.reset();
             self.last_merit = None;
             return LoopVerdict::Continue;
         }
         let verdict = match self.last_merit {
             Some(prev) => {
                 let scale = prev.abs().max(merit.abs()).max(1.0);
-                if (prev - merit).abs() <= self.rel_tol * scale {
-                    self.streak += 1;
-                    if self.streak >= self.window {
-                        LoopVerdict::Plateaued
-                    } else {
-                        LoopVerdict::Continue
-                    }
-                } else {
-                    self.streak = 0;
-                    LoopVerdict::Continue
-                }
+                self.streak.note((prev - merit).abs() <= self.rel_tol * scale)
             }
             None => LoopVerdict::Continue,
         };
@@ -166,16 +227,60 @@ impl PlateauDetector {
     }
 }
 
-/// Stateful retry guard for one damped reject chain: owns the attempt
-/// count AND the geometric escalation discipline, so no branch can apply
-/// one without the other (the #874 drift mode). Created fresh per
-/// outer iteration (`attempts` resets); the damping itself stays a solver
-/// local (it enters the linear system) and is escalated through the guard.
+/// Per-iteration hard bound for a damped retry loop: the net that makes
+/// an unbounded `loop {}` safe. Tick it once at the top of EVERY pass —
+/// accepted, rejected, or any `continue` path that reaches neither — and
+/// ask [`IterationBound::exhausted_at`] wherever the loop's exhaustion
+/// question is posed. Created fresh per outer iteration.
 #[derive(Clone, Debug)]
-pub struct MadsenGuard {
-    attempts: usize,
-    max_attempts: usize,
-    reject_factor: f64,
+pub struct IterationBound {
+    used: usize,
+    max: usize,
+}
+
+impl IterationBound {
+    pub fn new(max: usize) -> Self {
+        Self {
+            used: 0,
+            max: max.max(1),
+        }
+    }
+
+    /// Count one loop pass. Top-of-loop, unconditionally.
+    pub fn tick(&mut self) {
+        self.used += 1;
+    }
+
+    /// Passes counted so far (diagnostics: `last_step_halving`, logs).
+    pub fn used(&self) -> usize {
+        self.used
+    }
+
+    /// The configured cap (diagnostics).
+    pub fn max(&self) -> usize {
+        self.max
+    }
+
+    /// Has the pass count alone exhausted the budget?
+    pub fn count_exhausted(&self) -> bool {
+        self.used >= self.max
+    }
+
+    /// The single exhaustion question: count OR damping window
+    /// ([`madsen_retry_exhausted`], answered from owned state).
+    pub fn exhausted_at(&self, damping: f64) -> bool {
+        madsen_retry_exhausted(damping, self.used, self.max)
+    }
+
+    /// [`IterationBound::exhausted_at`] as a verdict, for consumers that
+    /// speak [`LoopVerdict`].
+    pub fn verdict_at(&self, damping: f64) -> LoopVerdict {
+        if self.exhausted_at(damping) {
+            LoopVerdict::Exhausted
+        } else {
+            LoopVerdict::Continue
+        }
+    }
 }
 
 /// Initial damping multiplier on the first rejection of an iteration.
@@ -184,34 +289,53 @@ pub struct MadsenGuard {
 /// reweight.rs schedule, now owned here.
 pub const MADSEN_INITIAL_REJECT_FACTOR: f64 = 2.0;
 
-impl MadsenGuard {
-    pub fn new(max_attempts: usize) -> Self {
+/// Geometric damping escalator for one reject chain
+/// (Madsen–Nielsen–Tingleff eq 3.16: the multiplier starts at 2 and
+/// doubles on every rejection, so successive bumps are ×2, ×4, ×8, …).
+/// Owns the factor and the reject count as one indivisible discipline —
+/// no branch can bump the damping without advancing the schedule, the
+/// drift mode behind #874. Deliberately does NOT own the per-iteration
+/// count; that is [`IterationBound`]'s job (see module docs for why the
+/// two must not be one type).
+#[derive(Clone, Debug)]
+pub struct RejectEscalator {
+    factor: f64,
+    rejects: usize,
+}
+
+impl Default for RejectEscalator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RejectEscalator {
+    pub fn new() -> Self {
         Self {
-            attempts: 0,
-            max_attempts: max_attempts.max(1),
-            reject_factor: MADSEN_INITIAL_REJECT_FACTOR,
+            factor: MADSEN_INITIAL_REJECT_FACTOR,
+            rejects: 0,
         }
     }
 
-    /// Record a rejection: bumps the attempt count and applies the
-    /// geometric damping escalation in one indivisible step.
+    /// Record a rejection: bumps the damping and advances the geometric
+    /// schedule in one indivisible step.
     pub fn escalate(&mut self, damping: &mut f64) {
-        self.attempts += 1;
-        *damping *= self.reject_factor;
-        self.reject_factor *= 2.0;
+        *damping *= self.factor;
+        self.factor *= 2.0;
+        self.rejects += 1;
     }
 
-    /// The single exhaustion question, answered from owned state.
-    pub fn verdict(&self, damping: f64) -> LoopVerdict {
-        if madsen_retry_exhausted(damping, self.attempts, self.max_attempts) {
-            LoopVerdict::Exhausted
-        } else {
-            LoopVerdict::Continue
-        }
+    /// Restart the schedule — the problem changed under the chain (e.g. a
+    /// Fisher fallback swapped the Hessian curvature), so the trajectory
+    /// begins anew. Pairs with the caller resetting its damping baseline.
+    pub fn restart(&mut self) {
+        self.factor = MADSEN_INITIAL_REJECT_FACTOR;
+        self.rejects = 0;
     }
 
-    pub fn attempts(&self) -> usize {
-        self.attempts
+    /// Rejections recorded since construction/restart (diagnostics).
+    pub fn rejects(&self) -> usize {
+        self.rejects
     }
 }
 
@@ -219,36 +343,76 @@ impl MadsenGuard {
 mod tests {
     use super::*;
 
-    /// #874 regression shape: a reject storm must reach Exhausted in a
-    /// bounded number of escalations no matter which branch asks — the
-    /// guard owns both the count and the damping window.
+    /// #874 regression shape: a reject storm must reach the damping
+    /// ceiling in a bounded number of escalations no matter which branch
+    /// asks — the escalator owns the schedule, the predicates own the
+    /// window.
     #[test]
     fn reject_storm_exhausts_in_bounded_steps() {
-        let mut guard = MadsenGuard::new(usize::MAX); // no attempt cap:
+        let mut esc = RejectEscalator::new();
         let mut damping = 1.0;
         let mut steps = 0usize;
-        while guard.verdict(damping) == LoopVerdict::Continue {
-            guard.escalate(&mut damping);
+        while madsen_can_retry(damping) {
+            esc.escalate(&mut damping);
             steps += 1;
             assert!(steps <= 64, "escalation must reach the damping cap");
         }
         // Geometric doubling of the factor reaches 1e12 in ~9 escalations.
         assert!(steps <= 16, "escalation took {steps} steps");
-        assert!(!madsen_can_retry(damping));
+        assert_eq!(esc.rejects(), steps);
+        assert!(madsen_retry_exhausted(damping, 0, usize::MAX));
+    }
+
+    /// The design split the #968 thread demanded: a loop pass that never
+    /// reaches a reject ritual (Fisher fallback / special-case `continue`)
+    /// still burns the iteration budget, because the bound ticks at the
+    /// top of every pass — independent of the escalator.
+    #[test]
+    fn continue_paths_without_rejects_still_exhaust_the_bound() {
+        let mut bound = IterationBound::new(5);
+        let esc = RejectEscalator::new();
+        let damping = 1e-6; // benign forever: only the count can kill it
+        let mut passes = 0usize;
+        while !bound.exhausted_at(damping) {
+            bound.tick();
+            passes += 1;
+            assert!(passes <= 5, "bound must stop a reject-free spin");
+            // No escalate(): this pass `continue`d past every reject site.
+        }
+        assert_eq!(passes, 5);
+        assert_eq!(esc.rejects(), 0, "no reject was ever recorded");
+        assert_eq!(bound.verdict_at(damping), LoopVerdict::Exhausted);
+    }
+
+    /// And the dual: escalations do NOT advance the iteration bound on
+    /// their own — collapsing the rituals onto the escalator must not
+    /// double-count attempts against the per-iteration budget.
+    #[test]
+    fn escalations_do_not_double_count_iterations() {
+        let mut bound = IterationBound::new(10);
+        let mut esc = RejectEscalator::new();
+        let mut damping = 1.0;
+        bound.tick();
+        for _ in 0..3 {
+            esc.escalate(&mut damping);
+        }
+        assert_eq!(bound.used(), 1);
+        assert_eq!(esc.rejects(), 3);
+        assert!(!bound.count_exhausted());
     }
 
     #[test]
-    fn attempt_cap_exhausts_even_at_benign_damping() {
-        let mut guard = MadsenGuard::new(3);
-        let mut damping = 1e-6;
-        for _ in 0..3 {
-            assert_eq!(guard.verdict(1e-6), LoopVerdict::Continue);
-            // Keep damping benign: only the attempt count should kill it.
-            let mut local = damping;
-            guard.escalate(&mut local);
-            damping = 1e-6;
-        }
-        assert_eq!(guard.verdict(damping), LoopVerdict::Exhausted);
+    fn restart_rewinds_the_geometric_schedule() {
+        let mut esc = RejectEscalator::new();
+        let mut damping = 1.0;
+        esc.escalate(&mut damping); // ×2
+        esc.escalate(&mut damping); // ×4
+        assert_eq!(damping, 8.0);
+        esc.restart();
+        assert_eq!(esc.rejects(), 0);
+        let mut fresh = 1.0;
+        esc.escalate(&mut fresh);
+        assert_eq!(fresh, MADSEN_INITIAL_REJECT_FACTOR, "schedule restarts at ×2");
     }
 
     /// #744 trace shape: merit descends, then freezes. The detector must
@@ -284,6 +448,23 @@ mod tests {
         assert_eq!(det.note(9.0), LoopVerdict::Continue); // re-baseline
         assert_eq!(det.note(9.0), LoopVerdict::Continue); // streak 1
         assert_eq!(det.note(9.0), LoopVerdict::Plateaued); // streak 2 fires
+    }
+
+    /// The streak discipline alone (caller-owned flatness predicate, the
+    /// custom_family consumption shape): grows on flat, resets on
+    /// recovery, fires at the window and keeps firing while flat.
+    #[test]
+    fn flat_streak_pins_the_window_discipline() {
+        let mut streak = FlatStreak::new(3);
+        assert_eq!(streak.note(true), LoopVerdict::Continue); // 1
+        assert_eq!(streak.note(true), LoopVerdict::Continue); // 2
+        assert_eq!(streak.note(false), LoopVerdict::Continue); // reset
+        assert_eq!(streak.streak(), 0);
+        assert_eq!(streak.note(true), LoopVerdict::Continue); // 1
+        assert_eq!(streak.note(true), LoopVerdict::Continue); // 2
+        assert_eq!(streak.note(true), LoopVerdict::Plateaued); // 3 fires
+        assert_eq!(streak.note(true), LoopVerdict::Plateaued); // persists
+        assert_eq!(streak.streak(), 4);
     }
 
     /// The shared predicates pin the exact reweight.rs semantics they
