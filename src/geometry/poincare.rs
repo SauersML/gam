@@ -291,6 +291,53 @@ pub fn exp_origin(v: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
     Ok(out)
 }
 
+/// Conformal factor `lambda_p = 2 / (1 + curvature * |p|^2)` of the Poincaré
+/// ball at base point `p` (curvature `< 0`, so the denominator is `1 - |c||p|^2`).
+///
+/// The metric is the closed-form diagonal `g_p = lambda_p^2 I`; this is the
+/// single source of truth for that factor across all front-ends.
+pub fn conformal_factor(p: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<f64> {
+    require_negative_curvature(curvature)?;
+    let sq = p.iter().map(|x| x * x).sum::<f64>();
+    Ok(2.0 / (1.0 + curvature * sq))
+}
+
+/// Poincaré exponential map at an arbitrary base point `p`:
+/// `exp_p(v) = p ⊕ exp_0(0.5 * lambda_p * v)`.
+///
+/// This is the single source of truth for the gyrovector composition of the
+/// conformal factor with the origin-anchored map; front-ends (CLI, library,
+/// `gamfit`) must call it rather than recomposing `lambda_p` themselves.
+pub fn exp_map(
+    p: ArrayView1<'_, f64>,
+    v: ArrayView1<'_, f64>,
+    curvature: f64,
+) -> GeometryResult<Array1<f64>> {
+    check_same_len(p, v)?;
+    let lam = conformal_factor(p, curvature)?;
+    let scaled = v.mapv(|x| 0.5 * lam * x);
+    let exp0 = exp_origin(scaled.view(), curvature)?;
+    mobius_add(p, exp0.view(), curvature)
+}
+
+/// Poincaré logarithm map at an arbitrary base point `p`:
+/// `log_p(q) = (2 / lambda_p) * log_0((-p) ⊕ q)`.
+///
+/// Inverse of [`exp_map`] and the single source of truth for the base-point
+/// logarithm; front-ends must call it rather than recomposing `lambda_p`.
+pub fn log_map(
+    p: ArrayView1<'_, f64>,
+    q: ArrayView1<'_, f64>,
+    curvature: f64,
+) -> GeometryResult<Array1<f64>> {
+    check_same_len(p, q)?;
+    let lam = conformal_factor(p, curvature)?;
+    let neg_p = p.mapv(|x| -x);
+    let shifted = mobius_add(neg_p.view(), q, curvature)?;
+    let log0 = log_origin(shifted.view(), curvature)?;
+    Ok(log0.mapv(|x| (2.0 / lam) * x))
+}
+
 // ---------------------------------------------------------------------------
 // Tangent-space-at-origin decoder
 // ---------------------------------------------------------------------------
