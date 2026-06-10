@@ -259,6 +259,42 @@ impl<'a> FitSensitivity<'a> {
         self.apply_multi(design.t())
     }
 
+    /// Data attribution `∂β̂/∂y` (p × n) — how each fitted coefficient
+    /// responds to each response value, the `t = y` channel of the one
+    /// identity `∂β̂/∂t = −H⁻¹ ∂g/∂t`.
+    ///
+    /// The response enters the penalized score only through the working
+    /// residual, so `∂g/∂y_i = −w_i x_i` and therefore
+    ///
+    /// ```text
+    ///   ∂β̂/∂y_i = w_i · H⁻¹ x_i,
+    /// ```
+    /// i.e. column `i` of [`Self::leverage_block`] scaled by the working
+    /// weight `w_i`. Contracting back through the design recovers the
+    /// smoother/hat matrix `A = X (∂β̂/∂y) = X H⁻¹ Xᵀ W`, whose diagonal is
+    /// the leverage already reported elsewhere. For a Gaussian penalized fit
+    /// `β̂ = H⁻¹ Xᵀ y`, so this Jacobian is exact (and weight-free); for a GLM
+    /// it is the one-step attribution at the fitted working weights.
+    ///
+    /// Returns `None` on a shape mismatch.
+    pub fn response_jacobian(
+        &self,
+        design: &Array2<f64>,
+        working_weights: ArrayView1<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        let n = design.nrows();
+        if design.ncols() != self.dim || working_weights.len() != n {
+            return None;
+        }
+        // Column i is H⁻¹ x_i; scale it by w_i to get ∂β̂/∂y_i.
+        let mut dbeta_dy = self.leverage_block(design);
+        for i in 0..n {
+            let w_i = working_weights[i];
+            dbeta_dy.column_mut(i).mapv_inplace(|v| w_i * v);
+        }
+        Some(dbeta_dy)
+    }
+
     /// Case-deletion influence (dfbetas + Cook's distance) for every
     /// observation, built from the one sensitivity operator — the
     /// "leave-one-out" channel #935 was designed to unify.
@@ -517,6 +553,52 @@ mod tests {
             // Leverage must match the hat value x_iᵀ H⁻¹ x_i (w_i = 1).
             let h_ii = x_i.dot(&h_inv.dot(&x_i));
             assert!((infl.leverage[i] - h_ii).abs() < 1e-12, "leverage[{i}]");
+        }
+    }
+
+    /// Data attribution `∂β̂/∂y` must equal the actual change in the fitted
+    /// coefficients when a response value is perturbed and the ridge fit is
+    /// re-solved — exact for the Gaussian penalized model (`β̂ = H⁻¹Xᵀy`).
+    #[test]
+    fn response_jacobian_matches_refit_perturbation() {
+        let x = array![
+            [1.0, 0.2, -0.5],
+            [1.0, -1.1, 0.3],
+            [1.0, 0.7, 1.4],
+            [1.0, 2.0, -0.8],
+            [1.0, -0.4, 0.9],
+        ];
+        let y = array![0.5, -1.2, 2.1, 0.3, -0.7];
+        let n = x.nrows();
+        let p = x.ncols();
+        let mut s = Array2::<f64>::zeros((p, p));
+        s[[1, 1]] = 0.4;
+        s[[2, 2]] = 0.4;
+        let h = &x.t().dot(&x) + &s;
+        let faer = h.cholesky(Side::Lower).expect("SPD");
+
+        let solve = |rhs: &Array1<f64>| faer.solvevec(rhs);
+        let beta = solve(&x.t().dot(&y));
+
+        let op = FitSensitivity::from_faer_cholesky(&faer, p);
+        let w = Array1::<f64>::ones(n);
+        let dbeta_dy = op.response_jacobian(&x, w.view()).expect("jacobian");
+
+        // Exact (linear) refit: bump y_j, re-solve, compare (β'−β)/ε to col j.
+        let eps = 1e-6;
+        for j in 0..n {
+            let mut yp = y.clone();
+            yp[j] += eps;
+            let beta_p = solve(&x.t().dot(&yp));
+            for c in 0..p {
+                let fd = (beta_p[c] - beta[c]) / eps;
+                assert!(
+                    (dbeta_dy[[c, j]] - fd).abs() < 1e-7,
+                    "∂β̂_{c}/∂y_{j}: analytic {} vs refit {}",
+                    dbeta_dy[[c, j]],
+                    fd
+                );
+            }
         }
     }
 
