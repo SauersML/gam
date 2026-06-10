@@ -1028,8 +1028,7 @@ where
                     // Singular even with ridge (unlikely unless huge). Increase lambda.
                     if lm_can_retry(loop_lambda) {
                         lm_solve_total += attempt_solve_start.elapsed();
-                        loop_lambda *= madsen_reject_factor;
-                        madsen_reject_factor *= 2.0;
+                        madsen_escalator.escalate(&mut loop_lambda);
                         continue;
                     } else {
                         // Fallback to gradient descent
@@ -1042,8 +1041,7 @@ where
             lm_solve_total += attempt_solve_start.elapsed();
             if !array_is_finite(direction) {
                 if lm_can_retry(loop_lambda) {
-                    loop_lambda *= madsen_reject_factor;
-                    madsen_reject_factor *= 2.0;
+                    madsen_escalator.escalate(&mut loop_lambda);
                     continue;
                 }
                 let detail = if has_constraints {
@@ -1276,7 +1274,7 @@ where
                                         );
                                         return Err(err);
                                     }
-                                    if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                                    if lm_bound.exhausted_at(loop_lambda) {
                                         restore_pending_arrow_latent_if_needed(
                                             options,
                                             &mut pending_arrow_latent_restore,
@@ -1292,13 +1290,11 @@ where
                                         ));
                                     }
                                     candidate_buf = candidate_beta.into();
-                                    if lm_can_retry(loop_lambda) {
-                                        loop_lambda *= madsen_reject_factor;
-                                        madsen_reject_factor *= 2.0;
-                                        continue;
-                                    }
-                                    loop_lambda *= madsen_reject_factor;
-                                    madsen_reject_factor *= 2.0;
+                                    // Exhaustion was ruled out just above, so
+                                    // the retry is unconditional; the two
+                                    // historical branches here were identical
+                                    // (one indivisible escalation either way).
+                                    madsen_escalator.escalate(&mut loop_lambda);
                                     continue;
                                 }
                             }
@@ -1366,7 +1362,7 @@ where
                                 lastgradient_norm = projected_grad;
                                 last_deviance_change = 0.0;
                                 last_step_size = 0.0;
-                                last_step_halving = attempts;
+                                last_step_halving = lm_bound.used();
                                 max_abs_eta = inf_norm(state.eta.iter().copied());
                                 restore_pending_arrow_latent_if_needed(
                                     options,
@@ -1376,7 +1372,7 @@ where
                                 status = PirlsStatus::StalledAtValidMinimum;
                                 break 'pirls_loop;
                             }
-                            if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                            if lm_bound.exhausted_at(loop_lambda) {
                                 lastgradient_norm = projected_grad;
                                 if state.near_stationary_kkt(projected_grad, kkt_tolerance) {
                                     status = PirlsStatus::StalledAtValidMinimum;
@@ -1390,8 +1386,7 @@ where
                                 final_state = Some(state);
                                 break 'pirls_loop;
                             }
-                            loop_lambda *= madsen_reject_factor;
-                            madsen_reject_factor *= 2.0;
+                            madsen_escalator.escalate(&mut loop_lambda);
                             continue;
                         }
                         if preferred_curvature == HessianCurvatureKind::Observed
@@ -1445,13 +1440,13 @@ where
                             deviance: accepted_state.deviance,
                             gradient_norm: candidategrad_norm,
                             step_size: 1.0,
-                            step_halving: attempts, // repurpose as attempt count
+                            step_halving: lm_bound.used(), // repurpose as attempt count
                         });
 
                         lastgradient_norm = candidategrad_norm;
                         last_deviance_change = deviance_change;
                         last_step_size = 1.0;
-                        last_step_halving = attempts;
+                        last_step_halving = lm_bound.used();
                         max_abs_eta = accepted_state
                             .eta
                             .iter()
@@ -1599,8 +1594,7 @@ where
                         .filter(|_| soft_accept_kkt_ok)
                         {
                             Some(reason) => {
-                                plateau_streak += 1;
-                                if plateau_streak >= 2 {
+                                if plateau_streak.note(true) == LoopVerdict::Plateaued {
                                     log::debug!(
                                         "[PIRLS] iter {iter} early-exit on soft acceptance: \
                                          {reason:?} (‖g‖={convergence_grad_norm:.3e}, \
@@ -1611,7 +1605,7 @@ where
                                 }
                             }
                             None => {
-                                plateau_streak = 0;
+                                plateau_streak.note(false);
                             }
                         }
 
@@ -1678,22 +1672,17 @@ where
                                 &final_state_ref.gradient,
                                 kkt_tolerance,
                             );
-                        if strict_objective_plateau {
-                            constrained_objective_plateau_streak += 1;
-                            if constrained_objective_plateau_streak
-                                >= CONSTRAINED_OBJECTIVE_PLATEAU_STREAK
-                            {
-                                log::debug!(
-                                    "[PIRLS] iter {iter} early-exit on constrained objective \
-                                     plateau (streak={}, ‖g‖={convergence_grad_norm:.3e}, \
-                                     Δdev={deviance_change:.3e})",
-                                    constrained_objective_plateau_streak,
-                                );
-                                status = PirlsStatus::StalledAtValidMinimum;
-                                break 'pirls_loop;
-                            }
-                        } else {
-                            constrained_objective_plateau_streak = 0;
+                        if constrained_objective_plateau_streak.note(strict_objective_plateau)
+                            == LoopVerdict::Plateaued
+                        {
+                            log::debug!(
+                                "[PIRLS] iter {iter} early-exit on constrained objective \
+                                 plateau (streak={}, ‖g‖={convergence_grad_norm:.3e}, \
+                                 Δdev={deviance_change:.3e})",
+                                constrained_objective_plateau_streak.streak(),
+                            );
+                            status = PirlsStatus::StalledAtValidMinimum;
+                            break 'pirls_loop;
                         }
 
                         break; // Break inner lambda loop, continue outer pirls loop
@@ -1746,7 +1735,7 @@ where
                             lm_d2 = compute_lm_d2(&state.hessian);
                             // Different problem (Hessian curvature changed):
                             // restart the Madsen rejection-factor trajectory.
-                            madsen_reject_factor = 2.0;
+                            madsen_escalator.restart();
                             continue;
                         }
                         // Reject Step
@@ -1793,7 +1782,7 @@ where
                             lastgradient_norm = stategrad_norm;
                             last_deviance_change = 0.0;
                             last_step_size = 0.0;
-                            last_step_halving = attempts;
+                            last_step_halving = lm_bound.used();
                             max_abs_eta = inf_norm(state.eta.iter().copied());
                             // `state` is unused after `break 'pirls_loop` — move it
                             // instead of cloning to avoid an n+p² full-state copy.
@@ -1806,7 +1795,7 @@ where
                             break 'pirls_loop;
                         }
 
-                        if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                        if lm_bound.exhausted_at(loop_lambda) {
                             lastgradient_norm = stategrad_norm;
                             // Only accept "stalled but valid" when we are near stationarity.
                             // Otherwise report MaxIterationsReached so callers can fail fast.
@@ -1818,7 +1807,7 @@ where
                                 // finite. The collapsed status hides that distinction;
                                 // this debug log restores it.
                                 let ceiling = !lm_can_retry(loop_lambda);
-                                let attempts_used = attempts >= lm_max_attempts;
+                                let attempts_used = lm_bound.count_exhausted();
                                 let max_abs_eta_now = state
                                     .eta
                                     .iter()
@@ -1833,8 +1822,8 @@ where
                                      current_pen={:.6e} predicted_reduction={:.3e} \
                                      max|eta|={:.1} attempts_exhausted={}",
                                     iter,
-                                    attempts,
-                                    lm_max_attempts,
+                                    lm_bound.used(),
+                                    lm_bound.max(),
                                     loop_lambda,
                                     ceiling,
                                     projected_grad,
@@ -1856,8 +1845,7 @@ where
                             final_state = Some(state);
                             break 'pirls_loop;
                         }
-                        loop_lambda *= madsen_reject_factor;
-                        madsen_reject_factor *= 2.0;
+                        madsen_escalator.escalate(&mut loop_lambda);
                     }
                 }
                 Err(err) => {
@@ -1903,7 +1891,7 @@ where
                         lm_d2 = compute_lm_d2(&state.hessian);
                         // Different problem (Hessian curvature changed):
                         // restart the Madsen rejection-factor trajectory.
-                        madsen_reject_factor = 2.0;
+                        madsen_escalator.restart();
                         continue;
                     }
                     if !is_lm_retriable_candidate_error(&err) {
@@ -1913,7 +1901,7 @@ where
                         );
                         return Err(err);
                     }
-                    if lm_retry_exhausted(loop_lambda, attempts, lm_max_attempts) {
+                    if lm_bound.exhausted_at(loop_lambda) {
                         restore_pending_arrow_latent_if_needed(
                             options,
                             &mut pending_arrow_latent_restore,
@@ -1929,8 +1917,7 @@ where
                         ));
                     }
                     // Retry only clearly numerical candidate-evaluation failures.
-                    loop_lambda *= madsen_reject_factor;
-                    madsen_reject_factor *= 2.0;
+                    madsen_escalator.escalate(&mut loop_lambda);
                 }
             }
         } // end loop (lambda search)
