@@ -11527,7 +11527,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         })
     };
 
-    let mut obj = problem.build_objective_with_eval_order(
+    let mut obj = problem.build_objective_with_screening_proxy(
         SpatialAdaptiveOuterState {
             warm_cache: None,
             last_eval: None,
@@ -11607,6 +11607,39 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             st.warm_cache = Some(result.warm_start);
             Ok(result.efs_eval)
         }),
+        // Seed-screening ranking proxy (#969). The regular cost closure
+        // above hard-errors on a non-converged inner solve — correct for
+        // line-search costs, but under the screening cap
+        // (`screening_max_inner_iterations`, wired into `outer_opts`) the
+        // inner solve is truncated BY DESIGN, so screening through that
+        // closure rejects every seed and re-creates the all-seeds-rejected
+        // front-door failure genus. Screening only RANKS candidates: the
+        // penalized objective of the capped solve is a meaningful ranking
+        // signal even unconverged (the same contract as the custom-family
+        // labeled proxy), so accept it and let the cascade pick the best
+        // seed; the selected seed is then fit with the full budget.
+        |st: &mut SpatialAdaptiveOuterState, theta: &Array1<f64>| {
+            let theta = clamp_theta(theta);
+            let (rho, adaptive_params) = decode_theta(&theta);
+            let family_eval =
+                base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
+            let result = evaluate_custom_family_joint_hyper(
+                &family_eval,
+                std::slice::from_ref(&blockspec),
+                &outer_opts,
+                &rho,
+                &derivative_blocks,
+                st.warm_cache.as_ref(),
+                crate::solver::estimate::reml::unified::EvalMode::ValueOnly,
+            )
+            .map_err(|e| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "spatial adaptive screening eval failed: {e}"
+                ))
+            })?;
+            st.warm_cache = Some(result.warm_start);
+            Ok(result.objective)
+        },
     );
 
     let outer_result = problem
