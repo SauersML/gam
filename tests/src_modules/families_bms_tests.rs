@@ -8990,9 +8990,16 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let theta_dim = grad0.len();
     let psi_dim = theta_dim - 1; // one ρ
     assert!(psi_dim >= 1, "fixture must expose at least one spatial ψ axis");
+    // The ψ-active path returns the outer Hessian as a matrix-free OPERATOR
+    // (#740 forces the operator route when the contracted hook is present, and
+    // it advertises Unavailable materialization for the PRODUCTION planner).
+    // `into_option()` is None for the Operator variant; `materialize_dense()`
+    // builds the dense matrix via K column matvecs — which is exactly what this
+    // FD comparison needs.
     let hess0 = hess0
-        .into_option()
-        .expect("analytic outer Hessian over (ρ,ψ)");
+        .materialize_dense()
+        .expect("materialize outer Hessian")
+        .expect("outer Hessian over (ρ,ψ) present");
 
     let eps = 1e-4_f64;
 
