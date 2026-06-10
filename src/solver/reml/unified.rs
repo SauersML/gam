@@ -8380,11 +8380,17 @@ pub fn reml_laml_evaluate(
             // gate in `build_dense_assembly` / `build_dense_original_assembly`.
             // Drops into the `None` arm below in that branch.
             // Diagnostic stash for the iso-κ Duchon FD investigation. Filled
-            // only for the first extended coordinate (`ext_idx == 0`) and only
-            // when the log|H| contribution is included; pushed back to the
-            // calling thread via the per-call sink after the par_iter loop.
+            // only for the first extended coordinate (`ext_idx == 0`), only
+            // when the log|H| contribution is included, and only while a test
+            // holds a `debug_stash::CaptureGuard`. The capture is far from
+            // free — it re-derives the drift, runs three extra spectral
+            // traces (one of them the unprojected full-space trace) and a
+            // second cubic IFT-correction pass — which at biobank scale
+            // multiplied the dominant `ext_coord_trace` stage several-fold
+            // per outer eval. Production gradient evals therefore skip it
+            // entirely; the consuming FD tests opt in via the guard.
             let mut diag_stash: Option<debug_stash::TermStash> =
-                if incl_logdet_h && ext_idx == 0 {
+                if incl_logdet_h && ext_idx == 0 && debug_stash::capture_requested() {
                     Some(debug_stash::TermStash::default())
                 } else {
                     None

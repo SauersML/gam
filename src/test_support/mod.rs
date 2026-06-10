@@ -247,6 +247,42 @@ pub fn assert_matrix_derivativefd(fd: &Array2<f64>, analytic: &Array2<f64>, tol:
 
 pub mod debug_stash {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Number of live [`CaptureGuard`]s. The ext-gradient path in
+    /// `solver::reml::unified` only assembles the EIG-DECOMP diagnostic stash
+    /// while this is non-zero. Filling the stash is NOT free — it recomputes
+    /// the ψ-drift, runs three additional spectral traces (including the
+    /// unprojected full-space one) and a second cubic IFT-correction pass per
+    /// outer gradient eval — so production fits must never pay for it. Tests
+    /// that consume [`take_terms`] opt in by holding a guard across the eval.
+    static CAPTURE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+    /// True while at least one [`CaptureGuard`] is alive.
+    pub fn capture_requested() -> bool {
+        CAPTURE_REQUESTS.load(Ordering::Relaxed) > 0
+    }
+
+    /// RAII opt-in to EIG-DECOMP stash capture; see [`capture_requested`].
+    /// Counted (not boolean) so concurrently-running tests cannot disable
+    /// each other's capture: the flag stays up until every guard drops.
+    /// Stash delivery itself stays per-thread (TLS via the per-call sink),
+    /// so concurrent captures do not interleave.
+    #[must_use = "capture stops when the guard is dropped"]
+    pub struct CaptureGuard(());
+
+    impl CaptureGuard {
+        pub fn request() -> Self {
+            CAPTURE_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            Self(())
+        }
+    }
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            CAPTURE_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 
     #[derive(Clone, Debug, Default)]
     pub struct TermStash {
