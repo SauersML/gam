@@ -8577,3 +8577,254 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
         );
     }
 }
+
+/// #740: the GENERIC ψψ penalty fold inside `build_contracted_psi_hook` must
+/// reproduce the per-pair `ext_ext` penalty contraction exactly, ON A FIXTURE
+/// WHERE PENALTY AND LIKELIHOOD ψψ ARE BOTH NONZERO.
+///
+/// The operator's ψψ block is supplied by `build_contracted_psi_hook` =
+/// family likelihood contraction (the workspace kernel, gated elsewhere) PLUS
+/// the generic penalty motion (½βᵀS_ψψβ → objective, S_ψψβ → score, S_ψψ
+/// BlockLocalDrift → hessian, τ-Hessian → ld_s). The per-pair `ext_ext(i, j)`
+/// folds the IDENTICAL penalty, so it is the exact oracle:
+///   `build_contracted_psi_hook(α).row(i) == Σ_j α_j · ext_ext(i, j)`.
+/// The fixture puts a real penalty on the marginal block AND ψ axes that carry
+/// nonzero `x_psi` (likelihood) AND nonzero `s_psi`/`s_psi_psi` (penalty moves),
+/// so a bug in EITHER the generic penalty contraction OR the likelihood
+/// contraction — or a double-count between them — breaks the equality.
+#[test]
+fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
+    use crate::custom_family::CustomFamilyBlockPsiDerivative;
+    use crate::families::custom_family::{build_contracted_psi_hook, build_psi_pair_callbacks};
+    use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+    use crate::solver::estimate::reml::unified::DriftDerivResult;
+
+    let n = 40usize;
+    let y: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| if (i * 41 + 13) % 5 >= 3 { 1.0 } else { 0.0 }));
+    let weights = Array1::from_elem(n, 1.0);
+    let z: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| -1.1 + 2.2 * ((i % 6) as f64 + 0.5) / 6.0));
+    let marginal = Array2::from_shape_fn((n, 2), |(r, c)| {
+        if c == 0 {
+            1.0
+        } else {
+            ((r * 17 + 3) % 13) as f64 / 13.0 - 0.5
+        }
+    });
+    let logslope = Array2::from_shape_fn((n, 1), |_| 1.0);
+    let family = BernoulliMarginalSlopeFamily {
+        y: Arc::new(y),
+        weights: Arc::new(weights),
+        z: Arc::new(z),
+        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            marginal.clone(),
+        )),
+        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(logslope)),
+        ..default_test_family()
+    };
+
+    let beta_marginal = array![0.3, -0.2];
+    let states = vec![
+        ParameterBlockState {
+            beta: beta_marginal.clone(),
+            eta: marginal.dot(&beta_marginal),
+        },
+        ParameterBlockState {
+            beta: array![0.25],
+            eta: Array1::from_elem(n, 0.25),
+        },
+    ];
+
+    // Marginal block carries one SPD penalty so `s_logdet_blocks` (the
+    // PenaltyPseudologdet) is non-trivial and the τ-Hessian / ld_s path fires.
+    let s_pen = array![[1.4_f64, 0.2], [0.2, 1.1]];
+    let mut marginal_spec = dummy_blockspec(2, n);
+    marginal_spec.penalties = vec![crate::custom_family::PenaltyMatrix::Dense(s_pen.clone())];
+    let specs = vec![marginal_spec, dummy_blockspec(1, n)];
+    let penalty_counts = vec![1usize, 0usize];
+    let rho = array![0.15_f64]; // one ρ on the marginal block penalty
+
+    // Two ψ axes on the marginal block: each carries a distinct likelihood
+    // design-derivative `x_psi` AND moves the penalty (`s_psi` + `s_psi_psi`),
+    // referencing penalty index 0 of the block.
+    let x_psi_0 = Array2::from_shape_fn((n, 2), |(r, c)| ((r * 7 + c * 3 + 1) % 9) as f64 / 9.0 - 0.4);
+    let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55);
+    let s_psi_0 = array![[0.30_f64, 0.05], [0.05, 0.12]];
+    let s_psi_1 = array![[0.18_f64, -0.07], [-0.07, 0.22]];
+    // s_psi_psi[i] is indexed by the SECOND axis j (per assemble_block_local_s_psi_psi):
+    // axis i's vector holds ∂²S/∂ψ_i∂ψ_j for each j.
+    let s_pp_0 = vec![
+        array![[0.06_f64, 0.01], [0.01, 0.03]], // (0,0)
+        array![[0.04_f64, -0.02], [-0.02, 0.05]], // (0,1)
+    ];
+    let s_pp_1 = vec![
+        array![[0.04_f64, -0.02], [-0.02, 0.05]], // (1,0) = (0,1)^sym
+        array![[0.09_f64, 0.015], [0.015, 0.07]], // (1,1)
+    ];
+    let derivative_blocks: std::sync::Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>> =
+        std::sync::Arc::new(vec![
+            vec![
+                CustomFamilyBlockPsiDerivative::new(
+                    Some(0),
+                    x_psi_0,
+                    s_psi_0,
+                    None,
+                    None,
+                    Some(s_pp_0),
+                    None,
+                ),
+                CustomFamilyBlockPsiDerivative::new(
+                    Some(0),
+                    x_psi_1,
+                    s_psi_1,
+                    None,
+                    None,
+                    Some(s_pp_1),
+                    None,
+                ),
+            ],
+            Vec::new(),
+        ]);
+
+    let opts = BlockwiseFitOptions::default();
+    let psi_workspace = family
+        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &derivative_blocks, &opts)
+        .expect("psi workspace")
+        .expect("psi workspace some");
+
+    // Build the exact pseudologdet eigenspace exactly as the evaluator does
+    // (custom_family.rs), so the τ-Hessian leg is live in BOTH paths.
+    let lambda0 = rho[0].exp();
+    let s_lambda = s_pen.mapv(|v| lambda0 * v);
+    let pld = PenaltyPseudologdet::from_assembled(s_lambda, None).expect("pseudologdet");
+    let s_logdet_blocks = vec![pld];
+
+    let beta_flat = array![0.3_f64, -0.2, 0.25];
+    let rho_slice = rho.as_slice().unwrap();
+
+    let (ext_ext, _rho_ext) = build_psi_pair_callbacks(
+        &family,
+        &states,
+        &specs,
+        std::sync::Arc::clone(&derivative_blocks),
+        &beta_flat,
+        rho_slice,
+        &penalty_counts,
+        Some(&s_logdet_blocks),
+        Some(std::sync::Arc::clone(&psi_workspace)),
+    )
+    .expect("per-pair callbacks");
+
+    let hook = build_contracted_psi_hook(
+        &specs,
+        std::sync::Arc::clone(&derivative_blocks),
+        &beta_flat,
+        rho_slice,
+        &penalty_counts,
+        Some(&s_logdet_blocks),
+        Some(std::sync::Arc::clone(&psi_workspace)),
+    )
+    .expect("contracted hook build")
+    .expect("contracted hook some (likelihood kernel available)");
+
+    let psi_dim = 2usize;
+    let alpha = [0.7_f64, -1.3_f64];
+    let contracted = hook(&alpha).expect("hook call").expect("hook some");
+
+    for i in 0..psi_dim {
+        let mut ref_a = 0.0_f64;
+        let mut ref_g: Option<Array1<f64>> = None;
+        let mut ref_b: Option<Array2<f64>> = None;
+        let mut ref_ld = 0.0_f64;
+        for (j, &aj) in alpha.iter().enumerate() {
+            if aj == 0.0 {
+                continue;
+            }
+            let pair = ext_ext(i, j);
+            ref_a += aj * pair.a;
+            ref_ld += aj * pair.ld_s;
+            let g_j = pair.g.mapv(|v| aj * v);
+            ref_g = Some(match ref_g {
+                Some(acc) => acc + &g_j,
+                None => g_j,
+            });
+            // The per-pair Hessian drift is `b_mat` (dense) + `b_operator` (the
+            // S_ψψ BlockLocalDrift composite); sum their dense forms.
+            let mut b_dense = if pair.b_mat.nrows() > 0 {
+                pair.b_mat.clone()
+            } else {
+                Array2::<f64>::zeros((beta_flat.len(), beta_flat.len()))
+            };
+            if let Some(op) = pair.b_operator.as_ref() {
+                b_dense = b_dense + op.to_dense();
+            }
+            let b_j = b_dense.mapv(|v| aj * v);
+            ref_b = Some(match ref_b {
+                Some(acc) => acc + &b_j,
+                None => b_j,
+            });
+        }
+        let ref_g = ref_g.expect("nonempty alpha");
+        let ref_b = ref_b.expect("nonempty alpha");
+
+        let a_err = (contracted.objective[i] - ref_a).abs() / (1.0 + ref_a.abs());
+        assert!(
+            a_err < 1e-9,
+            "row {i}: hook objective {} != Σ_j α_j ext_ext.a {} (rel {a_err:.3e})",
+            contracted.objective[i],
+            ref_a
+        );
+        let ld_err = (contracted.ld_s[i] - ref_ld).abs() / (1.0 + ref_ld.abs());
+        assert!(
+            ld_err < 1e-9,
+            "row {i}: hook ld_s {} != Σ_j α_j ext_ext.ld_s {} (rel {ld_err:.3e}) \
+             — the τ-Hessian penalty-logdet fold diverged",
+            contracted.ld_s[i],
+            ref_ld
+        );
+        let g_err = rel_diff_array1(&contracted.score.row(i).to_owned(), &ref_g);
+        assert!(g_err < 1e-9, "row {i}: hook score diverged from Σ_j α_j ext_ext.g (rel {g_err:.3e})");
+
+        let hess_dense = match &contracted.hessian[i] {
+            DriftDerivResult::Operator(op) => op.to_dense(),
+            DriftDerivResult::Dense(m) => m.clone(),
+        };
+        let b_err = rel_diff_array2(&hess_dense, &ref_b);
+        assert!(
+            b_err < 1e-9,
+            "row {i}: hook Hessian (likelihood + S_ψψ) diverged from Σ_j α_j ext_ext drift (rel {b_err:.3e})"
+        );
+    }
+
+    // The penalty must be LIVE: zero ld_s/objective penalty contribution would
+    // make this a likelihood-only test. Assert the penalty fold actually moves
+    // the contracted result vs a no-penalty (s_logdet=None, penalty-free) hook.
+    let hook_no_pen = build_contracted_psi_hook(
+        &specs,
+        std::sync::Arc::clone(&derivative_blocks),
+        &beta_flat,
+        rho_slice,
+        &penalty_counts,
+        None,
+        Some(std::sync::Arc::clone(&psi_workspace)),
+    )
+    .expect("no-penalty hook build")
+    .expect("no-penalty hook some");
+    let contracted_no_pen = hook_no_pen(&alpha).expect("call").expect("some");
+    let ld_total: f64 = contracted.ld_s.iter().map(|v| v.abs()).sum();
+    assert!(
+        ld_total > 1e-6,
+        "#740 penalty-fold test is vacuous: τ-Hessian ld_s ~0 across all ψ rows"
+    );
+    let obj_shift: f64 = contracted
+        .objective
+        .iter()
+        .zip(contracted_no_pen.objective.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum();
+    assert!(
+        obj_shift > 1e-6,
+        "#740 penalty-fold test is vacuous: ½βᵀS_ψψβ penalty contributes ~0 to the objective"
+    );
+}
