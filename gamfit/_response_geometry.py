@@ -211,12 +211,17 @@ class SharedGaussianRemlTangentFit:
         return x @ self.coefficients
 
     def summary(self) -> dict[str, Any]:
+        # ``lambdas`` / ``edf`` are shared per-smooth (length M, common to every
+        # tangent coordinate); ``sigma2`` is the single pooled isotropic residual
+        # variance. They are reported as lists so callers need not special-case
+        # the array rank.
         return {
             "model_class": "joint-tangent-gaussian-reml",
             "reml_score": float(self.fit["reml_score"]),
             "lambdas": self.fit["lambdas"].tolist(),
             "edf": self.fit["edf"].tolist(),
             "sigma2": self.fit["sigma2"].tolist(),
+            "shared_smoothing": True,
             "template": self.template_model.summary(),
         }
 
@@ -225,10 +230,15 @@ class SharedGaussianRemlTangentFit:
 class ResponseGeometryModel:
     """A fitted response-geometry GAM.
 
-    Each tangent coordinate is fitted as its own scalar Gaussian GAM (with its
-    own per-smooth smoothing parameters) through the general multi-penalty REML
-    solver. The coordinates are estimated jointly so an optional Fisher-Rao
-    precision metric can couple their residuals.
+    The tangent coordinates are fitted jointly as one vector-valued Gaussian GAM
+    through the general multi-penalty REML solver, with **one smoothing
+    parameter per smooth shared across every coordinate** (the penalty is
+    ``Sᵇ ⊗ I_D`` with a single λ_b) and a single pooled isotropic residual
+    variance. Sharing the smoothing is what makes the fit *frame-equivariant*:
+    the tangent vector field is a single function of the predictor, so its
+    smoothness is a property of the predictor, not of the arbitrary ambient
+    coordinate axis. An optional Fisher-Rao precision metric couples the
+    coordinate residuals on top of the shared smoothing.
     """
 
     models: Sequence[Any]
