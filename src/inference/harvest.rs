@@ -44,7 +44,7 @@
 //! from the tier — the same #973 honesty discipline, applied to the metric's
 //! estimation roles instead of the likelihood.
 
-use crate::inference::row_measure::{MeasureProvenance, RowMeasure, per_row_fisher_mass};
+use crate::inference::row_measure::{RowMeasure, per_row_fisher_mass};
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
 
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
@@ -273,6 +273,7 @@ impl TieredHarvest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::row_measure::MeasureProvenance;
     use ndarray::Array2;
     use std::sync::Arc;
 

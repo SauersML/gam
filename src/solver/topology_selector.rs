@@ -516,10 +516,10 @@ pub fn fit_mixture_rung(
     // re-propose a failed order forever.
     let mut attempted: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
-    let mut try_order = |k: usize,
-                         fits: &mut Vec<MixtureRungFit>,
-                         errors: &mut Vec<String>,
-                         attempted: &mut std::collections::BTreeSet<usize>| {
+    let try_order = |k: usize,
+                     fits: &mut Vec<MixtureRungFit>,
+                     errors: &mut Vec<String>,
+                     attempted: &mut std::collections::BTreeSet<usize>| {
         if k == 0 || k > n || !attempted.insert(k) {
             return;
         }
