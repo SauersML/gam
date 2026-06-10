@@ -91,11 +91,24 @@ def test_latent_optimize_diagnostics_keys_879():
     assert converged == (grad_t_norm_scaled <= grad_tol)
 
 
-def test_latent_optimize_near_perfect_fit_converges_879():
-    """A near-interpolating Euclidean Duchon fit (R²≈1) must be flagged
-    ``converged=True`` by the scale-aware criterion even though the raw
-    ``grad_t_norm`` of the profiled-scale objective stays large -- the core
-    complaint of #879."""
+def test_latent_optimize_convergence_is_shift_invariant_and_honest_954():
+    """#954 + #879: ``converged`` is decided by the SHIFT-INVARIANT relative
+    gradient measure ``‖∇ₜf(t̂)‖ / max(‖∇ₜf(t₀)‖, 1)`` -- the objective magnitude
+    never enters -- and it honestly reflects latent *stationarity*, which is a
+    distinct quantity from decoder *reconstruction quality* (``response_r2``).
+
+    This replaces an earlier test that asserted ``converged=True`` for this exact
+    scenario "being near-stationary at an excellent optimum". That premise is
+    false: the latent here is NOT stationary -- the REML objective is still
+    strictly decreasing (see the longer run below), so the large raw gradient is
+    genuine non-stationarity, not merely profiled-scale stiffness. The retired
+    ``‖∇ₜf‖·‖t‖_typ/max(|f|,1)`` measure also yields ``≈ grad/|f| ≈ 9 ≫ grad_tol``
+    here, i.e. ``converged=False`` too -- the old test never actually passed. The
+    #954 fix makes the decision *shift-invariant* (independent of ``|f|``); #879's
+    own first test (above) already separates "good reconstruction" from
+    "converged", and this test pins that separation with a hard, self-justifying
+    proof of non-stationarity.
+    """
     rng = np.random.RandomState(7)
     n = 30
     t_true = np.sort(rng.uniform(-1.0, 1.0, n))
@@ -107,39 +120,66 @@ def test_latent_optimize_near_perfect_fit_converges_879():
         np.cos(1.5 * t_true),
     ] + 1e-4 * rng.randn(n, 3)
     C = np.linspace(-1.0, 1.0, 16).reshape(-1, 1)
+    P = np.eye(16)
 
-    r = gamfit.gaussian_reml_optimize_latent(
-        y=Y.astype(float),
-        n_obs=n,
-        latent_dim=1,
-        centers=C,
-        penalty=np.eye(16),
-        m=2,
-        manifold="euclidean",
-        basis_kind="duchon",
-        max_iter=300,
-        init="caller",
-        t=t_true.astype(float),
-        seed=0,
-    )
+    def run(max_iter):
+        return gamfit.gaussian_reml_optimize_latent(
+            y=Y.astype(float),
+            n_obs=n,
+            latent_dim=1,
+            centers=C,
+            penalty=P,
+            m=2,
+            manifold="euclidean",
+            basis_kind="duchon",
+            max_iter=max_iter,
+            init="caller",
+            t=t_true.astype(float),
+            seed=0,
+        )
 
-    response_r2 = float(r["response_r2"])
+    r = run(300)
     grad_t_norm = float(r["grad_t_norm"])
+    grad_t_norm_init = float(r["grad_t_norm_init"])
     grad_t_norm_scaled = float(r["grad_t_norm_scaled"])
+    response_r2 = float(r["response_r2"])
+    objective_value = float(r["objective_value"])
     converged = bool(r["converged"])
+    grad_tol = 1.0e-8  # the default `grad_tol` of gaussian_reml_optimize_latent
 
-    # The decoder near-interpolates the response.
+    # The decoder near-interpolates the response (reconstruction is excellent).
     assert response_r2 > 0.99, f"expected near-perfect fit, got response_r2={response_r2}"
 
-    # The scale-aware measure must be far smaller than the raw absolute gradient
-    # norm: the profiled scale that inflates the raw gradient is divided out.
+    # (1) #954: the convergence measure is the relative gradient computed PURELY
+    # from gradient norms -- `grad_t_norm / max(grad_t_norm_init, 1)`. The
+    # objective value (which an additive shift f -> f + C would move) does not
+    # enter. The retired formula divided by `max(|f|, 1)` and was thus
+    # shift-non-invariant.
+    expected = grad_t_norm / max(grad_t_norm_init, 1.0)
+    assert grad_t_norm_scaled == pytest.approx(expected, rel=1e-9, abs=1e-18), (
+        "grad_t_norm_scaled must be the shift-invariant relative gradient "
+        f"grad_t_norm/max(grad_t_norm_init,1)={expected}, got {grad_t_norm_scaled}"
+    )
+    # Dividing by max(., 1) >= 1 can only shrink the raw gradient norm.
     assert grad_t_norm_scaled <= grad_t_norm + 1e-12
+    # `converged` is exactly the relative-gradient test, decoupled from |f|.
+    assert converged == (grad_t_norm_scaled <= grad_tol)
 
-    # And the fit -- being near-stationary at an excellent optimum -- is now
-    # reported as converged, which the old absolute `grad_t_norm <= grad_tol`
-    # test could not deliver for the profiled-scale objective.
-    assert converged, (
-        "near-perfect near-stationary fit reported non-converged: "
+    # (2) #879 separation: near-perfect RECONSTRUCTION does not imply latent
+    # STATIONARITY. Run 4x longer; the REML objective strictly decreases (so the
+    # 300-iter latent was provably non-stationary) while response_r2 stays ~1.
+    # `converged` honestly tracks stationarity -- here False -- not the decoder's
+    # reconstruction quality. A caller distinguishes the two via `response_r2`.
+    r_long = run(1200)
+    assert float(r_long["objective_value"]) < objective_value - 1e-6, (
+        "the REML objective must strictly decrease with more iterations, proving "
+        f"the 300-iter latent was non-stationary (f@300={objective_value}, "
+        f"f@1200={float(r_long['objective_value'])})"
+    )
+    assert float(r_long["response_r2"]) > 0.99
+    assert converged is False, (
+        "a still-descending (non-stationary) latent must not be reported "
+        "converged, even though its decoder reconstruction is near-perfect: "
         f"grad_t_norm={grad_t_norm}, grad_t_norm_scaled={grad_t_norm_scaled}, "
         f"response_r2={response_r2}"
     )
