@@ -46,11 +46,8 @@
 //! it re-enters a heavier regime (raises `s` back toward 1 by a back-off
 //! fraction) and re-descends with a finer step. This is a *floor* the iterate
 //! bounces off, never a trapdoor it falls through. The structural guarantee is
-//! encoded in the type: [`ContinuationStep`] — the per-step outcome enum — has
-//! **no `Reject` / `Failed` / `NoUsableSeed` arm**. The worst a step can report
-//! is [`ContinuationStep::Reentered`] (bounced off the floor, re-descending),
-//! which is progress toward, not abandonment of, the fit. There is no value of
-//! the outcome type that means "give up".
+//! encoded in the API: every hook on the path either succeeds-by-descending or
+//! reports a [`PathRegime`] it re-entered — nothing surfaces "give up".
 //!
 //! # How this absorbs #969 (warm-invariance) and #976 (hardening)
 //!
@@ -79,10 +76,6 @@
 
 use ndarray::{Array1, ArrayView2};
 
-use crate::solver::estimate::reml::continuation::{
-    ContinuationFailure, ContinuationState, fit_with_continuation,
-};
-use crate::solver::outer_strategy::{OuterEvalOrder, OuterObjective};
 use crate::terms::analytic_penalties::ScalarWeightSchedule;
 use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 
@@ -387,7 +380,7 @@ impl ReseedLedger {
 //  asked for the demotion. A demotion is exactly a re-entry into a heavier
 //  regime (it routes onto the same `reenter_heavier` mechanism as a spine
 //  struggle or a mass-floor breach); there is NO rejection / disqualification
-//  arm, mirroring `ContinuationStep`.
+//  arm.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The coarse "which heavy-smoothing regime is the path currently entering at"
@@ -443,62 +436,6 @@ pub enum PathDemotionReason {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//  The per-step outcome enum. Note: NO Reject / Failed / NoUsableSeed arm.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Outcome of one [`ContinuationPath`] waypoint step. The defining structural
-/// property: **there is no rejection arm.** A step either descends, arrives, or
-/// bounces off the homotopy floor back into a heavier regime. None of these
-/// means "give up"; the tail is a floor, not a gate. The absence of a `Reject`
-/// variant is the whole point — the type cannot represent "no usable seed".
-#[derive(Debug, Clone)]
-pub(crate) enum ContinuationStep {
-    /// `s` was lowered toward `0` and the inner solve at the new waypoint
-    /// succeeded. Carries the accepted spine state and the new `s`.
-    Descended {
-        s: f64,
-        state: ContinuationState,
-    },
-    /// `s` reached `0`: the path arrived at the real objective (ρ\*, τ_min,
-    /// tight isometry). Terminal-but-successful; the criterion is the real
-    /// objective's, identical for cold and warm entry (#969).
-    Arrived {
-        state: ContinuationState,
-    },
-    /// The inner solve at the attempted waypoint struggled, so the path
-    /// re-entered a heavier regime (`s` raised back toward `1` by the back-off
-    /// fraction) and will re-descend with a finer step. This is the homotopy
-    /// floor in action — progress toward the fit, never abandonment. Carries
-    /// the heavier `s` to descend from next and the underlying spine signal
-    /// that prompted the back-off (for diagnostics only; it is **not** an
-    /// error the path surfaces upward).
-    Reentered {
-        s: f64,
-        reason: ReentryReason,
-    },
-}
-
-/// Why a waypoint re-entered a heavier regime. Purely diagnostic — every
-/// variant resolves to "re-descend from a heavier `s`", never to a rejection.
-#[derive(Debug, Clone)]
-pub(crate) enum ReentryReason {
-    /// The ρ-anneal spine could not complete the descent to this waypoint's ρ
-    /// target from the current regime. The underlying `ContinuationFailure` is
-    /// kept for logging; the path's response is unconditionally to re-enter a
-    /// heavier regime, because at the heaviest regime the inner solve is a
-    /// contraction and *must* converge.
-    SpineStruggled(ContinuationFailure),
-    /// The active-mass floor was breached at this waypoint; a scaffold re-seed
-    /// was recorded and the path re-enters a heavier regime to let τ re-diffuse
-    /// the assignment before re-sharpening.
-    MassFloorBreached(MassFloorBreach),
-    /// The descent step in `s` underflowed `S_STEP_FLOOR`; the path pins `s` at
-    /// the current heavier regime and keeps re-descending from there rather
-    /// than taking vanishing steps. Still not a rejection — the floor holds.
-    StepUnderflow,
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 //  The ContinuationPath object.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -507,11 +444,9 @@ pub(crate) enum ReentryReason {
 /// homotopy. Entry is always `s = 1` (heavy-smoothing contraction regime); the
 /// tail is a homotopy floor with no rejection exit.
 ///
-/// The wiring agent drives the path one waypoint at a time:
-/// `let step = path.step(obj, &mut ledger);` and, per [`ContinuationStep`],
-/// installs the next waypoint's [`ScalarLegTargets`] (τ on the SAE term,
-/// isometry weight on the gauge penalty) and applies the [`LogitTrustRegion`] /
-/// [`ActiveMassFloor`] hooks inside the inner solve.
+/// The wiring agent installs the current waypoint's [`ScalarLegTargets`]
+/// (τ on the SAE term, isometry weight on the gauge penalty) and applies the
+/// [`LogitTrustRegion`] / [`ActiveMassFloor`] hooks inside the inner solve.
 #[derive(Debug, Clone)]
 pub struct ContinuationPath {
     schedules: CoupledSchedules,
@@ -624,18 +559,9 @@ impl ContinuationPath {
         // the path-owned one — so we lend that ledger to the shared driver and
         // hand it back afterwards.
         let mut owned = std::mem::take(&mut self.reseed_ledger);
-        let step = self.note_mass_breach(breach, &mut owned);
+        let regime = self.note_mass_breach(breach, &mut owned);
         self.reseed_ledger = owned;
-        // The shared driver always re-enters a heavier regime (never rejects);
-        // the bare hook's contract is the coarse regime it landed in. Match the
-        // step exhaustively so the outcome is observed (no silent discard) and
-        // the "every breach is progress" invariant is documented at the use
-        // site: every arm resolves to the heavier live regime.
-        match step {
-            ContinuationStep::Reentered { .. }
-            | ContinuationStep::Descended { .. }
-            | ContinuationStep::Arrived { .. } => self.enter_regime(),
-        }
+        regime
     }
 
     /// Number of scaffold re-seeds recorded through the bare
@@ -681,21 +607,18 @@ impl ContinuationPath {
     }
 
     /// Record an active-mass-floor breach into the ledger and re-enter a
-    /// heavier regime. Returns the [`ContinuationStep::Reentered`] the wiring
-    /// agent should act on. **Never fatal** — a breach is a re-entry, never a
-    /// rejection. This is the hook the wiring agent calls when
-    /// [`ActiveMassFloor::check`] returns `Some` from inside the inner solve.
+    /// heavier regime. Returns the [`PathRegime`] the path landed in. **Never
+    /// fatal** — a breach is a re-entry, never a rejection. This is the hook
+    /// the wiring agent calls when [`ActiveMassFloor::check`] returns `Some`
+    /// from inside the inner solve.
     pub(crate) fn note_mass_breach(
         &mut self,
         breach: MassFloorBreach,
         ledger: &mut ReseedLedger,
-    ) -> ContinuationStep {
+    ) -> PathRegime {
         ledger.record(self.s, breach);
         self.reenter_heavier();
-        ContinuationStep::Reentered {
-            s: self.s,
-            reason: ReentryReason::MassFloorBreached(breach),
-        }
+        self.enter_regime()
     }
 
     /// Raise `s` back toward the entry regime by the back-off fraction and
@@ -707,150 +630,6 @@ impl ContinuationPath {
         self.s = (self.s + REENTRY_BACKOFF).min(1.0);
         self.s_step = (self.s_step * 0.5).max(S_STEP_FLOOR);
         self.logit_tr = LogitTrustRegion::for_tau(self.schedules.scalar_targets_at(self.s).tau);
-    }
-
-    /// Take one waypoint step down the coupled homotopy.
-    ///
-    /// 1. Lower `s` by the current step toward `0`.
-    /// 2. Advance the τ and isometry schedules to the new waypoint (lockstep).
-    /// 3. Run the ρ-anneal **spine** ([`fit_with_continuation`]) toward the new
-    ///    `s`'s ρ target, with the inner β carried warm.
-    /// 4. On spine success: [`ContinuationStep::Descended`] (or
-    ///    [`ContinuationStep::Arrived`] if `s` reached `0`).
-    /// 5. On spine struggle: re-enter a heavier regime and return
-    ///    [`ContinuationStep::Reentered`]. **No rejection branch exists.**
-    ///
-    /// `obj` is the SAE joint outer objective (`SaeManifoldOuterObjective`,
-    /// which is an [`OuterObjective`]). `initial_beta` warms the inner solve;
-    /// pass the empty array for cold entry (warm-invariance, #969, guarantees
-    /// the same destination either way).
-    pub(crate) fn step(
-        &mut self,
-        obj: &mut dyn OuterObjective,
-        initial_beta: &Array1<f64>,
-    ) -> ContinuationStep {
-        // Descent step in s, floored. If the step has already underflowed, the
-        // path pins the heavier regime and re-descends from there — still no
-        // rejection.
-        if self.s_step < S_STEP_FLOOR {
-            self.reenter_heavier();
-            return ContinuationStep::Reentered {
-                s: self.s,
-                reason: ReentryReason::StepUnderflow,
-            };
-        }
-
-        let s_next = (self.s - self.s_step).max(0.0);
-
-        // Advance the coupled scalar legs to the new waypoint. The schedule
-        // objects are stepped in lockstep so τ and the isometry weight track
-        // exactly the same path parameter the ρ leg is about to anneal to.
-        self.advance_scalar_legs_to(s_next);
-
-        // The ρ leg rides the spine: anneal from the spine's own oversmoothed
-        // ρ₀ down to this waypoint's ρ target. At s = 1 the waypoint ρ target
-        // is ρ₀ itself, so the spine's oversmoothing stacks into the deepest
-        // contraction; at s = 0 it is ρ*.
-        let rho_target = self.schedules.rho_target_at(s_next);
-        let spine = fit_with_continuation(
-            obj,
-            &rho_target,
-            &self.schedules.rho_bounds_upper,
-            initial_beta,
-            OuterEvalOrder::ValueAndGradient,
-        );
-
-        match spine {
-            Ok(state) => {
-                self.s = s_next;
-                // Clean descent: restore the nominal step (grow back toward the
-                // coarse schedule) and refresh the τ-tied logit trust region.
-                self.s_step = (1.0 / CONTINUATION_WAYPOINTS as f64).min(self.s.max(S_STEP_FLOOR));
-                self.logit_tr =
-                    LogitTrustRegion::for_tau(self.schedules.scalar_targets_at(self.s).tau);
-                if self.s <= 0.0 {
-                    ContinuationStep::Arrived { state }
-                } else {
-                    ContinuationStep::Descended { s: self.s, state }
-                }
-            }
-            Err(failure) => {
-                // The homotopy FLOOR: never reject. Re-enter a heavier regime
-                // and re-descend with a finer step. At the heaviest regime the
-                // inner solve is a contraction and must converge, so the floor
-                // is reachable in finitely many back-offs.
-                self.reenter_heavier();
-                ContinuationStep::Reentered {
-                    s: self.s,
-                    reason: ReentryReason::SpineStruggled(failure),
-                }
-            }
-        }
-    }
-
-    /// Advance the τ and isometry schedule objects so their live values match
-    /// the lockstep targets at `s_next`. Consumes the schedules' own
-    /// `current_*` laws by selecting the schedule iteration whose output is
-    /// closest to the coupled target, keeping a single source of truth for each
-    /// leg's interpolation (no parallel re-derivation of the decay law).
-    fn advance_scalar_legs_to(&mut self, s_next: f64) {
-        let targets = self.schedules.scalar_targets_at(s_next);
-        // τ: walk the schedule's iteration counter to the step whose
-        // `current_tau` first reaches (≤) the coupled target, so the live τ on
-        // the SAE term equals the coupled-path value. Monotone-decreasing, so a
-        // forward scan from the current count is correct and terminates at
-        // tau_min.
-        Self::advance_temperature_to(&mut self.schedules.temperature, targets.tau);
-        Self::advance_isometry_to(&mut self.schedules.isometry, targets.isometry_weight);
-        self.logit_tr = LogitTrustRegion::for_tau(targets.tau);
-    }
-
-    /// Step `schedule.iter_count` forward until `current_tau` is ≤ `target_tau`
-    /// (τ is monotone non-increasing in iter). Leaves the counter pointing at
-    /// the waypoint so the SAE term reads the coupled τ. Bounded by the
-    /// schedule's own `tau_min` floor — never spins past it.
-    fn advance_temperature_to(schedule: &mut GumbelTemperatureSchedule, target_tau: f64) {
-        // Guard: a malformed schedule can't make progress; clamp to one step so
-        // the live τ is still the schedule's current value, never NaN.
-        let max_scan = temperature_scan_budget(schedule);
-        let mut scanned = 0;
-        while scanned < max_scan && schedule.current_tau(schedule.iter_count) > target_tau {
-            schedule.iter_count += 1;
-            scanned += 1;
-        }
-    }
-
-    /// Step `schedule.iter_count` forward until `current_weight` is ≥
-    /// `target_weight` (isometry weight is monotone non-decreasing in iter when
-    /// `w_end ≥ w_start`, the tightening direction). Bounded by `w_end`.
-    fn advance_isometry_to(schedule: &mut ScalarWeightSchedule, target_weight: f64) {
-        let max_scan = isometry_scan_budget(schedule);
-        let mut scanned = 0;
-        while scanned < max_scan && schedule.current_weight(schedule.iter_count) < target_weight {
-            schedule.iter_count += 1;
-            scanned += 1;
-        }
-    }
-}
-
-/// Scan budget for advancing the temperature schedule. For a `Linear` schedule
-/// the number of steps is known; for geometric / reciprocal it is bounded by a
-/// generous waypoint multiple so the lockstep scan always terminates.
-fn temperature_scan_budget(schedule: &GumbelTemperatureSchedule) -> usize {
-    const GEOMETRIC_SCAN_CAP: usize = 4096;
-    match &schedule.decay {
-        ScheduleKind::Linear { steps } => *steps + 1,
-        ScheduleKind::Geometric { .. } | ScheduleKind::ReciprocalIter => GEOMETRIC_SCAN_CAP,
-    }
-}
-
-/// Scan budget for advancing the isometry-weight schedule (mirrors
-/// [`temperature_scan_budget`]).
-fn isometry_scan_budget(schedule: &ScalarWeightSchedule) -> usize {
-    const GEOMETRIC_SCAN_CAP: usize = 4096;
-    match &schedule.kind {
-        ScheduleKind::Linear { steps } => *steps + 1,
-        ScheduleKind::Geometric { .. } | ScheduleKind::ReciprocalIter => GEOMETRIC_SCAN_CAP,
     }
 }
 
@@ -1061,44 +840,14 @@ mod tests {
             observed_mean_mass: 0.05,
             floor: ActiveMassFloor::DEFAULT_FLOOR,
         };
-        let step = path.note_mass_breach(breach, &mut ledger);
-        assert!(matches!(
-            step,
-            ContinuationStep::Reentered {
-                reason: ReentryReason::MassFloorBreached(_),
-                ..
-            }
-        ));
+        let regime = path.note_mass_breach(breach, &mut ledger);
+        assert_eq!(
+            regime,
+            path.enter_regime(),
+            "note_mass_breach must report the heavier regime it landed in"
+        );
         assert!(path.s() > 0.5, "re-entry must raise s toward the entry regime");
         assert_eq!(ledger.reseed_count(), 1);
-    }
-
-    #[test]
-    fn continuation_step_has_no_reject_arm() {
-        // Compile-time + exhaustiveness witness: every ContinuationStep value
-        // resolves to descend / arrive / re-enter. There is no rejection arm,
-        // so a `match` over the enum cannot bind a "give up" case. If a Reject
-        // variant were ever added, this match would fail to compile against the
-        // documented invariant.
-        fn is_progress(step: &ContinuationStep) -> bool {
-            match step {
-                ContinuationStep::Descended { .. }
-                | ContinuationStep::Arrived { .. }
-                | ContinuationStep::Reentered { .. } => true,
-            }
-        }
-        let breach = MassFloorBreach {
-            observed_mean_mass: 0.0,
-            floor: 0.2,
-        };
-        assert!(is_progress(&ContinuationStep::Reentered {
-            s: 1.0,
-            reason: ReentryReason::MassFloorBreached(breach),
-        }));
-        assert!(is_progress(&ContinuationStep::Reentered {
-            s: 1.0,
-            reason: ReentryReason::StepUnderflow,
-        }));
     }
 
     #[test]

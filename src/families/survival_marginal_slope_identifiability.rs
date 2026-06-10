@@ -2417,14 +2417,13 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn extract_term_partition_simple_cases() {
         // No penalties: whole block is one term.
         let part = extract_term_partition_from_penalty_ranges(5, &[]);
-        assert_eq!(part, vec![0..5]);
+        assert_eq!(part, [0..5].to_vec());
         // One penalty covering the whole block.
         let part = extract_term_partition_from_penalty_ranges(5, &[0..5]);
-        assert_eq!(part, vec![0..5]);
+        assert_eq!(part, [0..5].to_vec());
         // Two penalties with a gap: produces three terms (pen1, gap, pen2).
         let part = extract_term_partition_from_penalty_ranges(10, &[0..3, 6..10]);
         assert_eq!(part, vec![0..3, 3..6, 6..10]);
@@ -2458,13 +2457,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn pull_back_blockwise_penalty_per_term_full_term_identity_v() {
         use crate::terms::smooth::BlockwisePenalty;
         // Single-term partition, identity V → pullback returns input.
         let v_term = Array2::<f64>::eye(3);
         let v_per_term = vec![v_term];
-        let partition = vec![0..3];
+        let partition = [0..3];
         let local = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| (i + j) as f64);
         let pen = BlockwisePenalty::new(0..3, local.clone());
         let out = pull_back_blockwise_penalty_per_term(&pen, &partition, &v_per_term)
@@ -2478,7 +2476,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn pull_back_blockwise_penalty_per_term_drops_one_column() {
         use crate::terms::smooth::BlockwisePenalty;
         // 3-column term, V drops one column (3 → 2): V is the 3×2
@@ -2486,7 +2483,7 @@ mod tests {
         let mut v_term = Array2::<f64>::zeros((3, 2));
         v_term[[1, 0]] = 1.0;
         v_term[[2, 1]] = 1.0;
-        let partition = vec![0..3];
+        let partition = [0..3];
         let local = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| (i + j + 1) as f64);
         let pen = BlockwisePenalty::new(0..3, local.clone());
         let out = pull_back_blockwise_penalty_per_term(&pen, &partition, &[v_term])
@@ -2753,7 +2750,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::single_range_in_vec_init)]
     fn validate_partition_rejects_bad_partitions() {
         // Doesn't start at 0.
         assert!(validate_partition(&[1..5], 5, "test").is_err());
