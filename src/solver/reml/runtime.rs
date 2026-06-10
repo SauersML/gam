@@ -5643,23 +5643,66 @@ impl<'a> RemlState<'a> {
         (penalty_subspace.rank, log_det)
     }
 
-    /// Compute the projected logdet `log|U_Sᵀ H U_S|_+` together with the
-    /// matching trace kernel `(U_S, (U_Sᵀ H U_S)⁻¹)` — the [`PenaltySubspaceTrace`]
-    /// that pairs the rank-deficient LAML cost with a gradient-consistent
-    /// `tr(U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ · Ḣ)` on the identified subspace.
+    /// Intrinsic pseudo-logdet of the penalized Hessian `H_pen = X'WX + Sλ
+    /// (− H_φ)` over its own identified subspace `range(H_pen)`, together with
+    /// the matching trace kernel `H_pen⁺` in spectral form: `u_s` holds the
+    /// kept eigenvectors `U_H` (σ above the pseudo-determinant threshold) and
+    /// `h_proj_inverse = diag(1/σ_a)`, so the [`PenaltySubspaceTrace`]
+    /// identities reproduce exactly `tr(H_pen⁺ · A)` for ANY drift `A`.
     ///
-    /// Computing both in one pass amortises the `U_S` + `H_proj` work that
-    /// otherwise has to be redone separately in the cost path and the
-    /// gradient trace path.  The kernel is `None` only when the penalty is
-    /// structurally null (no identified subspace to project onto).
+    /// ## Why the identified quotient, not range(Sλ) (#901)
     ///
-    /// See [`PenaltySubspaceTrace`] for the full Schur-complement derivation
-    /// of why the full-space `G_ε(H)` kernel mismatches the projected cost
-    /// for non-Gaussian families.
-    pub(super) fn fixed_subspace_hessian_projected_parts(
-        &self,
+    /// The previous realization projected onto `range(Sλ)`: value
+    /// `log|U_Sᵀ H U_S|₊` with kernel `(U_Sᵀ H U_S)⁻¹`. That is the wrong
+    /// object. Split `H` over `range(S) ⊕ ker(S)` as `[[A, B], [Bᵀ, C]]`:
+    /// the projected logdet is `log det A`, while the determinant on the
+    /// identified quotient is `log det A + log det(C − BᵀA⁻¹B)`. The dropped
+    /// Schur term is the curvature of likelihood-identified but penalty-null
+    /// directions (the unpenalized trend/intercept block), and for non-Gaussian
+    /// families it is θ-dependent through the GLM weights `W(β̂(θ))` — so both
+    /// the projected VALUE and every ρ/ψ trace built on the projected kernel
+    /// were genuinely wrong, not numerically noisy (sign-flipped ρ-gradients
+    /// and ~1e5 κ-gradient blow-ups in the iso-κ Duchon FD drivers). Gaussian
+    /// identity passes only because `c ≡ 0` keeps this path uninstalled.
+    ///
+    /// The correct LAML determinant term (mgcv's generalized determinant, and
+    /// the dual of the #752 fix which moved the BMS joint path to
+    /// `range(H+Sλ)`) is the intrinsic pseudo-logdet
+    ///
+    /// ```text
+    ///   ½ log|H_pen|₊ = ½ Σ_{σ_a > thr} log σ_a ,
+    /// ```
+    ///
+    /// dropping only the truly unidentified directions `ker(H_pen) =
+    /// ker(X'WX) ∩ ker(Sλ)` — exactly the directions `½ log|Sλ|₊` also omits,
+    /// keeping the LAML ratio consistent.
+    ///
+    /// ## Why one spectral kernel serves ρ AND ψ (moving subspaces included)
+    ///
+    /// On a constant-rank stratum the first derivative of a pseudo-logdet
+    /// along ANY symmetric drift `Ḣ` is
+    ///
+    /// ```text
+    ///   d log|H|₊ [Ḣ] = tr(H⁺ · Ḣ)
+    /// ```
+    ///
+    /// — first-order eigenvector motion cancels (`u̇_aᵀ H u_a + u_aᵀ H u̇_a =
+    /// 2 σ_a u_aᵀ u̇_a = 0` by normalization), so there is NO moving-subspace
+    /// correction term to track. This is what kills the ψ = log κ bug class:
+    /// `range(Sλ(ψ))` rotates with ψ and the old fixed-`U_S` kernel dropped
+    /// the `dU_S/dψ` term that finite differences capture; `range(H_pen)` as
+    /// the intrinsic spectral object needs no external basis bookkeeping at
+    /// all. Likewise the GLM IFT correction `D_β H[v] = X' diag(c ⊙ X v) X`,
+    /// which leaks onto `null(Sλ)` (intercept column), is now traced against
+    /// the SAME object whose logdet the cost reports — value and gradient are
+    /// one spectral decomposition and cannot drift apart (the structural cure
+    /// for the objective↔gradient desync class, #752/#748/#808).
+    ///
+    /// Rank-change points (an eigenvalue crossing the threshold) are genuine
+    /// non-differentiability points of the criterion; the domain is a union
+    /// of constant-rank strata and FD probes are only meaningful within one.
+    pub(super) fn intrinsic_hessian_pseudo_logdet_parts(
         h_total: &Array2<f64>,
-        penalty_subspace: &PenaltySubspace,
     ) -> Result<(f64, Option<super::unified::PenaltySubspaceTrace>), EstimationError> {
         let p = h_total.ncols();
         if p == 0 {
@@ -5667,70 +5710,43 @@ impl<'a> RemlState<'a> {
         }
         if h_total.nrows() != p {
             crate::bail_invalid_estim!(
-                "fixed_subspace_hessian_projected_parts: H must be square, got {}x{}",
+                "intrinsic_hessian_pseudo_logdet_parts: H must be square, got {}x{}",
                 h_total.nrows(),
                 p
             );
         }
-        if penalty_subspace.evecs.nrows() != p || penalty_subspace.evecs.ncols() != p {
-            crate::bail_invalid_estim!(
-                "fixed_subspace_hessian_projected_parts: penalty eigenspace dim {}x{} does not match H dim {}",
-                penalty_subspace.evecs.nrows(),
-                penalty_subspace.evecs.ncols(),
-                p
-            );
-        }
 
-        let r = penalty_subspace.rank;
-        if r == 0 {
-            // Penalty is structurally null → there is no identified
-            // subspace to project onto.  Returning 0.0 lets the caller
-            // leave the correction untouched; no penalty means there is
-            // no pair to balance in the LAML ratio.
-            return Ok((0.0, None));
-        }
-        // Use the canonical structural rank, not a threshold on eigenvalues:
-        // ridge-lifted null directions can otherwise enter the active range.
-        let positive_cols: Vec<usize> = (p - r..p).collect();
-
-        // Build U_S: p × r basis of range(S_+).
-        let mut u_s = Array2::<f64>::zeros((p, r));
-        for (out_col, &src_col) in positive_cols.iter().enumerate() {
-            for row in 0..p {
-                u_s[[row, out_col]] = penalty_subspace.evecs[[row, src_col]];
-            }
-        }
-
-        // H_proj = U_S^T · H · U_S is r × r, symmetric in exact
-        // arithmetic.  Force exact symmetry before eigh — faer rejects
-        // visibly non-symmetric input, and the two halves should match
-        // up to roundoff.
-        let h_times_u = crate::faer_ndarray::fast_ab(h_total, &u_s);
-        let mut h_proj = crate::faer_ndarray::fast_atb(&u_s, &h_times_u);
-        enforce_symmetry(&mut h_proj);
-
-        let (h_proj_evals, h_proj_evecs) = h_proj
+        // Symmetrize before eigh: H_pen is symmetric in exact arithmetic and
+        // faer rejects visibly asymmetric input.
+        let mut h_sym = h_total.clone();
+        enforce_symmetry(&mut h_sym);
+        let (h_evals, h_evecs) = h_sym
             .eigh(Side::Lower)
             .map_err(EstimationError::EigendecompositionFailed)?;
-        let h_thr = super::unified::positive_eigenvalue_threshold(h_proj_evals.as_slice().unwrap());
-        let log_det = super::unified::exact_pseudo_logdet(h_proj_evals.as_slice().unwrap(), h_thr);
+        let h_thr = super::unified::positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
+        let log_det = super::unified::exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_thr);
+        let kept: Vec<usize> = (0..p).filter(|&j| h_evals[j] > h_thr).collect();
+        if kept.is_empty() {
+            // No positive curvature anywhere: nothing identified, nothing to
+            // correct — mirrors the structurally-null-penalty contract.
+            return Ok((0.0, None));
+        }
 
-        // H_proj⁻¹ on the positive eigenspace.  Directions whose eigenvalue
-        // sits at or below the pseudo-determinant threshold are excluded so
-        // the kernel does not pick up divergent contributions from numerical
-        // zeros — matching the filter applied to `log_det`.
+        // Spectral form of H_pen⁺: U_H (p × r) and diag(1/σ). In this basis
+        // `h_proj_inverse = (U_Hᵀ H U_H)⁻¹ = diag(1/σ)` EXACTLY, so the two
+        // historical readings of the kernel ("projected inverse" vs "range
+        // block of the full pseudo-inverse") coincide and every
+        // `PenaltySubspaceTrace` consumer — drift traces, the IFT
+        // `bilinear_pseudo_inverse` cost correction, KKT-residual reduction,
+        // projected leverages — operates on the one true `H_pen⁺`.
+        let r = kept.len();
+        let mut u_s = Array2::<f64>::zeros((p, r));
         let mut h_proj_inverse = Array2::<f64>::zeros((r, r));
-        for a in 0..r {
-            let sigma = h_proj_evals[a];
-            if sigma <= h_thr {
-                continue;
+        for (out_col, &src_col) in kept.iter().enumerate() {
+            for row in 0..p {
+                u_s[[row, out_col]] = h_evecs[[row, src_col]];
             }
-            let inv = 1.0 / sigma;
-            for i in 0..r {
-                for j in 0..r {
-                    h_proj_inverse[[i, j]] += inv * h_proj_evecs[[i, a]] * h_proj_evecs[[j, a]];
-                }
-            }
+            h_proj_inverse[[out_col, out_col]] = 1.0 / h_evals[src_col];
         }
 
         Ok((
@@ -9278,9 +9294,10 @@ impl<'a> RemlState<'a> {
         let uses_kron_penalty_logdet = self.kronecker_penalty_system.as_ref().is_some_and(|kron| {
             self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
         });
-        let needs_penalty_subspace = !uses_kron_penalty_logdet
-            || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
-        let penalty_subspace = if needs_penalty_subspace {
+        // Only the penalty-side `log|S|₊` machinery consumes the penalty
+        // subspace now; the Hessian-side kernel is intrinsic to H_pen (#901)
+        // and no longer needs `range(S_+)`.
+        let penalty_subspace = if !uses_kron_penalty_logdet {
             Some(self.compute_penalty_subspace(e_for_logdet.as_ref(), ridge_passport)?)
         } else {
             None
@@ -9302,79 +9319,47 @@ impl<'a> RemlState<'a> {
 
         let nullspace_dim = h_for_operator.ncols().saturating_sub(penalty_rank) as f64;
 
-        // Rank-deficient LAML fix: under `Smooth` the spectral operator's
-        // cached logdet sums `ln r_ε(σ_j(H))` over ALL eigenvalues, so
-        // genuinely null directions contribute `(p − rank) · ln ε` — very
-        // negative — and make `½(log|H| − log|S|_+)` diverge to −∞
-        // whenever `rank(X'WX) + rank(S) < p`.  Project H onto
-        // `range(S_+)` and pass the scalar correction through
+        // Rank-deficient LAML fix (#901 corrected object): under `Smooth` the
+        // spectral operator's cached logdet sums `ln r_ε(σ_j(H))` over ALL
+        // eigenvalues, so genuinely null directions contribute `(p − rank) ·
+        // ln ε` — very negative — and make `½(log|H| − log|S|_+)` diverge to
+        // −∞ whenever `rank(X'WX) + rank(S) < p`. Replace it with the
+        // intrinsic pseudo-logdet `log|H_pen|₊` over `range(H_pen)` (mgcv's
+        // generalized determinant) by routing the scalar difference through
         // `hessian_logdet_correction`; `reml_laml_evaluate` already sums
-        // `hop.logdet() + correction`, so the evaluator sees
-        // `log|H_proj|_+` paired with `log|S|_+` on the same rank-r
-        // identified subspace.
+        // `hop.logdet() + correction`.
         //
-        // The gradient trace kernel must pair with the **projected** logdet,
-        // not the full-space `G_ε(H)`: for non-Gaussian families the IFT
-        // correction `D_β H[v] = X' diag(c ⊙ X v) X` does NOT vanish on
-        // `null(S)` (the intercept column of X is all-ones, typically in
-        // `null(S)`), so `tr(G_ε · Ḣ)` picks up a spurious null-direction
-        // contribution that is absent from `d log|U_Sᵀ H U_S|/dτ`.  Carry
-        // the `PenaltySubspaceTrace { U_S, (U_Sᵀ H U_S)⁻¹ }` alongside the
-        // scalar correction so `reml_laml_evaluate` can trace through the
-        // identified subspace via `tr(U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ · Ḣ)`.
-        // For Gaussian identity `c = 0`, so `D_β H = 0` and the leakage
-        // does not arise — setting this kernel for Gaussian is still
-        // correct (the traces agree) but strictly unnecessary.
+        // The matching gradient kernel is the SAME spectral object: `H_pen⁺`
+        // carried as `PenaltySubspaceTrace { U_H, diag(1/σ) }`, whose trace
+        // `tr(H_pen⁺ · Ḣ)` is the exact pseudo-logdet derivative for EVERY
+        // drift — ρ-direction penalty drifts `λ_k S_k`, ψ-direction basis
+        // drifts `λ_k ∂S_k/∂ψ` (whose `range(Sλ(ψ))` rotates with ψ), and the
+        // non-Gaussian IFT correction `D_β H[v] = X' diag(c ⊙ X v) X` (which
+        // leaks onto `null(S)` through the intercept column). The previous
+        // realization projected value AND kernel onto `range(S_+)` — see
+        // `intrinsic_hessian_pseudo_logdet_parts` for why that object drops
+        // the θ-dependent Schur curvature `log det(C − BᵀA⁻¹B)` of the
+        // penalty-null block and produced sign-flipped ρ-gradients and ~1e5
+        // ψ-gradient blow-ups against FD (#901).
         //
         // Under `HardPseudo` the operator already masks null eigenpairs
         // consistently in `logdet`, `trace_logdet_*`, and `solve`, so the
-        // correction is zero there and no projected-trace kernel is needed.
+        // correction is zero there and no kernel is needed.
         //
-        // Previously this kernel was only constructed when
-        // `penalty_rank < h_for_operator.ncols()` — i.e. only when the
-        // penalty matrix itself was structurally rank-deficient. That
-        // condition is wrong for non-Gaussian families: the leakage
-        // described above is driven by the third-derivative correction
-        // `D_β H[v]`, not by the rank of `S`. Even when `S_λ` has full
-        // rank (penalty_rank == p_total), the correction term still spills
-        // onto `null(S_λ_term)` for individual penalty components `S_k`
-        // whose ranges don't cover all of `range(S_λ)`. The result is a
-        // spurious nonzero outer gradient at large `λ_k` (where the
-        // unbalanced trace term dominates the `λ_k tr(S_λ⁺ S_k)` and
-        // `λ_k(β-μ_k)'S_k(β-μ_k)` terms that should cancel to zero), which makes
-        // ARC's deterministic-replay detector fire on a flat REML surface
-        // and surfaces "SurvivalLocationScaleFamily expects 3 blocks,
-        // got 0" panics in the downstream refit path.
-        //
-        // Gate on `c_nontrivial`: only build the projected kernel when
-        // the IRLS cubic coefficient `c = w'/(2η')` has nonzero support,
-        // i.e. when `D_β H[v] = X' diag(c ⊙ X v) X` can leak onto
-        // `null(S)`. For canonical Gaussian (Identity link) the IRLS
-        // weights `W = 1/σ²` are η-independent so `c ≡ 0` and
-        // `D_β H ≡ 0` — there is no leakage to project away. Activating
-        // the projection there would silently switch the cost identity
-        // from `log|H|` to `log|H_proj|`, putting the analytic ψ-gradient
-        // on a different cost surface than a centered finite difference
-        // of the cost (the missing `dU_S/dψ` contribution shows up as a
-        // ~6e-3 rel error in the Gaussian identity projection test).
-        // Skipping the projection
-        // when `c ≡ 0` preserves the classical Gaussian REML cost identity
-        // (`log|H|`) and keeps that test on its analytic match.  For
-        // every c-nontrivial family (Probit / Logit / cloglog / Poisson /
-        // Gamma / SAS / GAMLSS noise blocks / etc.) the projection is
-        // still built unconditionally — that is the rank-deficient LAML
-        // fix the comment above motivates.
+        // Gate on `c_nontrivial`: for canonical Gaussian (Identity link) the
+        // IRLS weights are η-independent, `c ≡ 0`, `D_β H ≡ 0`, and the
+        // classical Gaussian REML cost identity (`log|H|` through the smooth
+        // spectral floor) is already FD-consistent — installing the exact
+        // pseudo-logdet there would change the cost surface for no gradient
+        // benefit. Every c-nontrivial family (Probit / Logit / cloglog /
+        // Poisson / Gamma / SAS / GAMLSS noise blocks / …) gets the intrinsic
+        // object unconditionally.
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
-                let Some(penalty_subspace) = penalty_subspace.as_ref() else {
-                    crate::bail_invalid_estim!(
-                        "projected Hessian logdet requires penalty subspace"
-                    );
-                };
-                let (log_det_h_proj, kernel) =
-                    self.fixed_subspace_hessian_projected_parts(&h_for_operator, penalty_subspace)?;
+                let (log_det_h_plus, kernel) =
+                    Self::intrinsic_hessian_pseudo_logdet_parts(h_for_operator.as_ref())?;
                 (
-                    log_det_h_proj - hessian_op.logdet(),
+                    log_det_h_plus - hessian_op.logdet(),
                     kernel.map(std::sync::Arc::new),
                 )
             } else {
@@ -9650,9 +9635,9 @@ impl<'a> RemlState<'a> {
         let uses_kron_penalty_logdet = self.kronecker_penalty_system.as_ref().is_some_and(|kron| {
             self.kronecker_factored.is_some() && kron.num_penalties() == rho.len()
         });
-        let needs_penalty_subspace = !uses_kron_penalty_logdet
-            || (matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial);
-        let penalty_subspace = if needs_penalty_subspace {
+        // Penalty-side `log|S|₊` machinery only; the Hessian-side kernel is
+        // intrinsic to H_pen (#901) and no longer consumes `range(S_+)`.
+        let penalty_subspace = if !uses_kron_penalty_logdet {
             Some(self.compute_penalty_subspace(e_for_logdet, ridge_passport)?)
         } else {
             None
@@ -9668,75 +9653,30 @@ impl<'a> RemlState<'a> {
 
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
 
-        // Same rank-deficient LAML fix as `build_dense_assembly`, adapted
-        // to the original-basis Hessian.  Under `Smooth` the spectral
-        // operator's cached logdet sums `ln r_ε(σ_j(H))` over ALL
-        // eigenvalues; projecting H onto `range(S_+)` and passing the
-        // scalar difference through `hessian_logdet_correction` restores
-        // pairing with `log|S|_+`.  Under `HardPseudo` null eigenpairs
-        // are already masked consistently in logdet / solves / traces,
-        // so the correction is zero.
+        // Same rank-deficient LAML fix as `build_dense_assembly` (#901
+        // corrected object), adapted to the original-basis Hessian. The
+        // intrinsic pseudo-logdet `log|H_pen|₊` and its spectral kernel
+        // `H_pen⁺` are properties of `H_pen` ALONE — no external `range(S_+)`
+        // basis is involved — so the historical rotate-into-transformed-basis
+        // / project / rotate-`U_S`-back-via-`Qs` dance is gone: build the
+        // parts directly from `h_total_original` in the basis the ψ/τ drift
+        // matrices are produced in. (The pseudo-logdet scalar is invariant
+        // under the orthogonal Qs change of basis, so the value pairing with
+        // `hessian_op.logdet()` — also original-basis — is unchanged.)
         //
-        // `h_total_original` lives in the original basis; `e_for_logdet`
-        // lives in the transformed basis (carries the reparameterization
-        // that defines `range(S_+)`).  Rotate H into the transformed
-        // basis via `Qs` before projecting so both inputs agree on which
-        // subspace is "range(S_+)"; the scalar log-determinant is
-        // invariant under the orthogonal Qs rotation, and comparing with
-        // `hessian_op.logdet()` (original basis) is valid because the
-        // two logdets agree to roundoff for the same matrix under
-        // orthogonal change of basis.
-        // As in `build_dense_assembly`: the gradient trace kernel must pair
-        // with the projected cost `log|U_Sᵀ H U_S|_+`, not the full-space
-        // `G_ε(H)`, on non-Gaussian families where the IFT correction
-        // `D_β H[v] = X' diag(c ⊙ X v) X` leaks onto `null(S)`.  Build the
-        // projected kernel in the transformed basis (where `e_for_logdet`
-        // lives) and rotate `U_S` back into the original basis via `Qs`
-        // since the ψ/τ drift matrices consumed by the trace are produced
-        // in the original basis by this assembly path.
-        //
-        // The kernel is built when (a) the spectral mode is `Smooth` and
-        // (b) the IRLS cubic coefficient `c = w'/(2η')` has nontrivial
-        // support — i.e. the family's `D_β H[v] = X' diag(c ⊙ X v) X` can
-        // actually leak onto `null(S)`.  An earlier version of this path
-        // gated only on `penalty_rank < h_total_original.ncols()`, which
-        // missed `c`-nontrivial-but-full-rank designs.  A subsequent
-        // iteration removed the gate entirely, which over-projected
-        // canonical Gaussian (Identity link, `c ≡ 0`): the cost identity
-        // then silently shifts from `log|H|` to `log|H_proj|`, and the
-        // analytic ψ-gradient (still computed via `K · op_total`) no
-        // longer matches a centered finite difference of the cost within
-        // the projection's numerical roundoff — surfacing as a ~6e-3 rel error in
-        // the Gaussian identity projection test. The `c_nontrivial`
-        // gate keeps the rank-deficient LAML fix active for every
-        // non-Gaussian-Identity family (where the leakage is real and
-        // the projected kernel is the only formula that matches the
-        // cost identity — pinned by
-        // `iso_kappa_duchon_penalty_subspace_projection_pins_trace`)
-        // while keeping the classical `log|H|` cost identity for
-        // canonical Gaussian, where the leakage is identically zero.
+        // Gate `c_nontrivial` and the `HardPseudo` skip: same rationale as
+        // `build_dense_assembly`; see `intrinsic_hessian_pseudo_logdet_parts`
+        // for the full #901 derivation (why range(Sλ)-projected value+kernel
+        // was the wrong object, and why `tr(H_pen⁺ Ḣ)` is exact for every
+        // drift including moving-subspace ψ directions).
         let (hessian_logdet_correction, penalty_subspace_trace) =
             if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
-                let Some(penalty_subspace) = penalty_subspace.as_ref() else {
-                    crate::bail_invalid_estim!(
-                        "projected Hessian logdet requires penalty subspace"
-                    );
-                };
-                let qs = &pirls_result.reparam_result.qs;
-                let h_transformed = crate::faer_ndarray::fast_ab(
-                    &crate::faer_ndarray::fast_atb(qs, &h_total_original),
-                    qs,
-                );
-                let (log_det_h_proj, kernel_trans) =
-                    self.fixed_subspace_hessian_projected_parts(&h_transformed, penalty_subspace)?;
-                let kernel_orig = kernel_trans.map(|kernel_trans| {
-                    let u_s_orig = qs.dot(&kernel_trans.u_s);
-                    std::sync::Arc::new(super::unified::PenaltySubspaceTrace {
-                        u_s: u_s_orig,
-                        h_proj_inverse: kernel_trans.h_proj_inverse,
-                    })
-                });
-                (log_det_h_proj - hessian_op.logdet(), kernel_orig)
+                let (log_det_h_plus, kernel) =
+                    Self::intrinsic_hessian_pseudo_logdet_parts(&h_total_original)?;
+                (
+                    log_det_h_plus - hessian_op.logdet(),
+                    kernel.map(std::sync::Arc::new),
+                )
             } else {
                 (0.0, None)
             };
@@ -12709,12 +12649,14 @@ mod tests_diagnostics {
     use super::*;
 
     impl<'a> RemlState<'a> {
-        /// Debug-only: return `log|U_Sᵀ H U_S|_+` — the projected Hessian
-        /// log-determinant on the identified `range(S_+)` subspace,
+        /// Debug-only: return the Hessian log-determinant term exactly as the
+        /// production REML/LAML cost sees it — `hop.logdet() +
+        /// hessian_logdet_correction`, i.e. the intrinsic `log|H_pen|₊` over
+        /// `range(H_pen)` when the rank-deficient LAML fix is active (#901) —
         /// evaluated at the PIRLS state driven to convergence at this `rho`.
-        /// Matches production REML/LAML cost's `hop.logdet() +
-        /// hessian_logdet_correction` so centered-differencing across nearby
-        /// `theta` reproduces the analytic projected-logdet trace.
+        /// Centered-differencing across nearby `theta` therefore reproduces
+        /// whatever trace kernel production installs, with no separately
+        /// maintained debug formula to drift out of sync.
         pub(crate) fn objective_logdet_h_proj(
             &self,
             rho: &Array1<f64>,
