@@ -5228,6 +5228,14 @@ fn run_outer(
     }
     crate::solver::estimate::reml::runtime::clear_outer_ift_residual_energy_for_fit();
 
+    // Frontier ρ-scaling auto-switch (#986): at per-atom-EFS-eligible frontier
+    // rho dimension the decoupled per-atom fixed point is the primary outer
+    // iteration; everything else falls through to the dense / standard path
+    // below. Routed here so every entry point inherits it (magic by default).
+    if let Some(result) = run_per_atom_efs_if_frontier(obj, config, context)? {
+        return Ok(result);
+    }
+
     if cap.n_params == 0 {
         let cost = obj.eval_cost(&Array1::zeros(0))?;
         let the_plan = plan_with_class(&cap, config.solver_class);
@@ -5468,9 +5476,9 @@ pub fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
 /// the module's `run_per_atom_efs` directly with a populated
 /// `SharedBorderTopology`.
 ///
-/// Additive: this function neither mutates nor bypasses the dense path; it is a
-/// pre-dispatch shortcut the coordinator can call ahead of `run`.
-pub fn run_per_atom_efs_if_frontier(
+/// Additive: this function neither mutates nor bypasses the dense path; it is
+/// the pre-dispatch shortcut [`run_outer`] calls before the dense ladder.
+fn run_per_atom_efs_if_frontier(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,

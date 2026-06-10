@@ -267,8 +267,6 @@ pub struct SaeCandidateIndex {
     tables: Vec<HashMap<u64, Vec<usize>>>,
     /// Sketch dimension shared by every atom.
     sketch_dim: usize,
-    /// Number of bits (hyperplanes) per table.
-    bits_per_table: usize,
     /// Number of atoms indexed.
     num_atoms: usize,
 }
@@ -358,7 +356,6 @@ impl SaeCandidateIndex {
             hyperplanes,
             tables,
             sketch_dim,
-            bits_per_table: config.bits_per_table,
             num_atoms,
         })
     }

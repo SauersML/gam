@@ -167,7 +167,6 @@ pub trait CorpusRowSource {
 /// A single memory-mapped shard.
 struct MappedShard {
     mmap: Arc<Mmap>,
-    path: PathBuf,
     n_rows: usize,
     p: usize,
     data_offset: usize,
@@ -216,7 +215,6 @@ impl MappedShard {
         }
         Ok(Self {
             mmap: Arc::new(mmap),
-            path,
             n_rows,
             p,
             data_offset: HEADER_LEN,
