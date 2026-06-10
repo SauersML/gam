@@ -866,4 +866,51 @@ mod tests {
             .expect("sectional");
         assert!((k + 0.37).abs() <= 1e-15);
     }
+
+    /// The closed-form conformal Christoffels (`∂_i ln λ = −κλx_i`) must equal
+    /// the Levi-Civita symbols rebuilt from a finite difference of
+    /// `metric_tensor` alone:
+    /// `Γ^k_{ij} = ½ Σ_l g^{kl}(∂_i g_{jl} + ∂_j g_{il} − ∂_l g_{ij})`.
+    /// This pins the analytic `christoffel_symbols` against the metric it is
+    /// supposed to be the connection of — independent of the `∂ln λ` algebra —
+    /// at every sign of κ.
+    #[test]
+    fn christoffel_matches_fd_of_metric() {
+        let d = 2usize;
+        let x = array![0.22, -0.13];
+        let h = 1e-5;
+        for &kappa in &[-1.4, -0.5, 0.0, 0.7, 1.9] {
+            let m = ConstantCurvature::new(d, kappa);
+            // Inverse of the conformal metric g = λ²δ is g^{-1} = λ^{-2}δ.
+            let lam = m.conformal_factor(x.view()).expect("λ");
+            let g_inv_diag = 1.0 / (lam * lam);
+            // ∂_a g_{ij} via central FD of metric_tensor (dg[a][[i,j]]).
+            let mut dg: Vec<Array2<f64>> = Vec::with_capacity(d);
+            for a in 0..d {
+                let mut xp = x.clone();
+                xp[a] += h;
+                let mut xn = x.clone();
+                xn[a] -= h;
+                let gp = m.metric_tensor(xp.view()).expect("g+");
+                let gn = m.metric_tensor(xn.view()).expect("g-");
+                dg.push((&gp - &gn).mapv(|v| v / (2.0 * h)));
+            }
+            let gamma = m.christoffel_symbols(x.view()).expect("Γ");
+            for k in 0..d {
+                for i in 0..d {
+                    for j in 0..d {
+                        // g^{kl} is diagonal, so only l = k contributes.
+                        let expected = 0.5
+                            * g_inv_diag
+                            * (dg[i][[j, k]] + dg[j][[i, k]] - dg[k][[i, j]]);
+                        assert!(
+                            (gamma[k][[i, j]] - expected).abs() <= 1e-6 * expected.abs().max(1.0),
+                            "κ={kappa}: Γ^{k}_{{{i}{j}}} analytic {} vs FD-metric {expected}",
+                            gamma[k][[i, j]]
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
