@@ -106,7 +106,7 @@ impl<'a> FitSensitivity<'a> {
         match &self.inverse {
             FittedInverse::FaerCholesky(factor) => factor.solvevec(rhs),
             FittedInverse::LowerTriangular(factor) => {
-                crate::linalg::triangular::cholesky_solve_vector(factor, rhs)
+                crate::linalg::triangular::cholesky_solve_vector(factor.view(), rhs.view())
             }
             FittedInverse::Projected {
                 basis,
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn mode_response_refuses_non_finite_channels() {
         let h = array![[2.0, 0.0], [0.0, 1.0]];
-        let faer = h.faer_cholesky().expect("SPD factor");
+        let faer = h.cholesky(Side::Lower).expect("SPD factor");
         let s = FitSensitivity::from_faer_cholesky(&faer, 2);
         let bad = array![[1.0], [f64::NAN]];
         assert!(s.mode_response(bad.view()).is_none());
