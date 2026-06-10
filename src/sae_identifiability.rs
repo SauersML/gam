@@ -1464,6 +1464,42 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
     })
 }
 
+/// The model's two certificates, shipped together (#984 work-plan step 2):
+/// the residual-gauge report says what NO data could distinguish (the
+/// symmetry group the fit is identified up to — a statement about the
+/// model class), the structure certificate says what THIS data
+/// established (the e-BH-confirmed subset of the dictionary's structural
+/// claims, FDR ≤ α, valid at the caller's stopping time — a statement
+/// about the world). A claim can fail both ways, and the failure modes
+/// are independent: an atom can be perfectly identified yet statistically
+/// unestablished, or strongly evidenced yet gauge-ambiguous with a twin.
+#[derive(Debug, Clone)]
+pub struct DictionaryReport {
+    /// What cannot be distinguished in principle ([`residual_gauge`]).
+    pub gauge: ResidualGaugeReport,
+    /// What the data established
+    /// ([`crate::inference::structure_evidence::StructureLedger::certify`]).
+    pub structure: StructureCertificate,
+}
+
+/// Produce the paired certificate for a fitted model: the residual-gauge
+/// report computed here plus the anytime-valid structure certificate from
+/// the discovery run's evidence ledger at level `alpha`. The ledger is the
+/// one the structure search absorbed its shard evidence into
+/// (`structure_evidence::StructureLedger`); certifying at any
+/// data-dependent stopping time is sound — that is the ledger's whole
+/// design.
+pub fn dictionary_report(
+    model: &FittedSaeManifold,
+    ledger: &StructureLedger,
+    alpha: f64,
+) -> Result<DictionaryReport, String> {
+    Ok(DictionaryReport {
+        gauge: residual_gauge(model)?,
+        structure: ledger.certify(alpha),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
