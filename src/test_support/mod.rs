@@ -263,6 +263,12 @@ pub mod debug_stash {
         pub production_tr: Option<f64>,
         /// Whether `penalty_subspace_trace` was Some for this coordinate.
         pub projection_active: Option<bool>,
+        /// #901-layer-2 split: `tr(K · B_i)` — the FROZEN-β̂ basis/penalty
+        /// drift component of the ψ logdet trace (no cubic IFT correction).
+        pub frozen_tr: Option<f64>,
+        /// #901-layer-2 split: `tr(K · D_βH[−v_i])` — the cubic IFT-correction
+        /// component of the ψ logdet trace.
+        pub correction_tr: Option<f64>,
     }
 
     thread_local! {
@@ -272,6 +278,8 @@ pub mod debug_stash {
             unprojected_tr: None,
             production_tr: None,
             projection_active: None,
+            frozen_tr: None,
+            correction_tr: None,
         }) };
     }
 

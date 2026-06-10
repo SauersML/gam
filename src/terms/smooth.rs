@@ -24958,6 +24958,18 @@ mod tests {
             )
             .expect("debug_logdet_h_proj -h");
         let fd_d_logdet_h_proj = (log_det_p - log_det_m) / (2.0 * h);
+
+        // #901-layer-2 diagnostic: split the analytic ψ logdet trace into its
+        // frozen-B_i and cubic-IFT-correction components so we can attribute
+        // the desync against the total FD reference.
+        eprintln!(
+            "[#901-L2 split] production_tr={:+.6e} fd_total={:+.6e} frozen_tr={:?} correction_tr={:?}",
+            production_tr,
+            fd_d_logdet_h_proj,
+            stash.frozen_tr,
+            stash.correction_tr,
+        );
+
         let rel_to_fd =
             (production_tr - fd_d_logdet_h_proj).abs() / fd_d_logdet_h_proj.abs().max(1e-30);
         assert!(
