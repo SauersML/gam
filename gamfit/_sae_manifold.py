@@ -371,6 +371,14 @@ class ManifoldSAE:
     # verdict; ``metric_provenance`` records the inner product it was computed in.
     # Pure read; ``None`` only for payloads predating the diagnostic.
     residual_gauge: dict[str, Any] | None = None
+    # WP-D output-Fisher shard the fit installed (#980), retained so a follow-up
+    # :meth:`steer` call can re-install ``RowMetric::OutputFisher`` and report the
+    # path-integrated KL dose. The ``(n, p, r)`` factor stack ``U`` exactly as
+    # supplied to ``sae_manifold_fit(..., fisher_factors=...)``. ``None`` under the
+    # Euclidean (no-shard) path: steering still returns the geometry (delta /
+    # off_manifold_norm) but ``predicted_nats`` / ``validity_radius`` are ``None``
+    # (no behavioral axis to measure the dose through).
+    fisher_factors: np.ndarray | None = None
 
     def __repr__(self) -> str:
         d_atom = int(self.coords[0].shape[1]) if self.coords else 0
@@ -754,6 +762,84 @@ class ManifoldSAE:
             return self.coords[k].copy()
         payload = self._oos_payload(x)
         return np.asarray(payload["atoms"][k]["on_atom_coords_t"], dtype=float)
+
+    def steer(self, atom_k: int, t_from: Any, t_to: Any) -> dict[str, Any]:
+        """Steering plan with output dosimetry for one atom (#980).
+
+        Drives atom ``atom_k``'s latent coordinate from ``t_from`` to ``t_to``
+        and reports the *actionable* steering payload of the SAE-manifold machine
+        (``gam::inference::steering::steer_delta``): the activation-space move and
+        its predicted output effect, measured through the fitted model's installed
+        per-row output-Fisher metric.
+
+        Parameters
+        ----------
+        atom_k
+            Atom index in ``[0, K)``.
+        t_from, t_to
+            Source / target latent coordinates, each length ``d_k`` (the atom's
+            ``atom_dim``), in the atom's raw latent-coordinate units (the same
+            units as ``self.coords[atom_k]``).
+
+        Returns
+        -------
+        dict
+            The :class:`gam::inference::steering::SteerPlan` fields:
+
+            * ``atom`` / ``atom_name`` — the steered atom and its name;
+            * ``t_from`` / ``t_to`` — the latent endpoints (lists);
+            * ``amplitude`` — the atom's mean active assignment mass the move was
+              scaled by;
+            * ``measured_row`` — the most-active row whose per-row metric the dose
+              was read through;
+            * ``delta`` — ``(p,)`` activation-space move ``a·(g_k(t_to) −
+              g_k(t_from))`` to add to a hidden state;
+            * ``predicted_nats`` — path-integrated output-Fisher KL dose in nats,
+              or ``None`` under a Euclidean (no behavioral axis) metric;
+            * ``validity_radius`` — latent step length the linearization is
+              trusted to, or ``None`` under a Euclidean metric;
+            * ``off_manifold_norm`` — ``δ``'s component off the local decoder
+              tangents (``≈ 0`` for an on-manifold move);
+            * ``metric_provenance`` — ``"OutputFisher"`` when a Fisher shard was
+              installed at fit time (and retained), else ``"Euclidean"``.
+
+        The dose (``predicted_nats`` / ``validity_radius``) is available only when
+        the fit installed an output-Fisher metric (``fisher_factors`` was supplied
+        to :func:`sae_manifold_fit` and retained on this model); otherwise the
+        geometry (``delta`` / ``off_manifold_norm``) is still returned but the dose
+        degrades to ``None`` — not zero.
+        """
+        k = self._atom_index(atom_k)
+        t_from_arr = np.ascontiguousarray(np.asarray(t_from, dtype=np.float64).reshape(-1))
+        t_to_arr = np.ascontiguousarray(np.asarray(t_to, dtype=np.float64).reshape(-1))
+        kind = _canonical_assignment(self.assignment, "assignment")
+        n_obs, p_out = (int(self.fitted.shape[0]), int(self.fitted.shape[1]))
+        fisher = None if self.fisher_factors is None else np.ascontiguousarray(
+            np.asarray(self.fisher_factors, dtype=np.float64)
+        )
+        plan = rust_module().sae_steer_delta(
+            int(k),
+            t_from_arr,
+            t_to_arr,
+            n_obs,
+            p_out,
+            list(self._basis_kinds),
+            list(self._atom_dims),
+            [np.ascontiguousarray(b) for b in self.decoder_blocks],
+            [None if c is None else np.ascontiguousarray(c) for c in self._duchon_centers],
+            [
+                (int(h) if bk in {"periodic", "torus"} else None)
+                for bk, h in zip(self._basis_kinds, self._n_harmonics)
+            ],
+            [np.ascontiguousarray(c) for c in self.coords],
+            np.ascontiguousarray(np.asarray(self.low_level_logits, dtype=np.float64)),
+            str(kind),
+            float(self.tau),
+            alpha=float(self.alpha),
+            jumprelu_threshold=float(self.jumprelu_threshold),
+            fisher_factors=fisher,
+        )
+        return dict(plan)
 
     def per_atom_active_set(self, X: Any, threshold: float | None = None) -> np.ndarray:
         """Per-token active atom set ``(N, K)`` boolean mask for ``X``.
@@ -1420,7 +1506,7 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         fisher_mass_residual=None if fisher_shard is None else fisher_shard[1],
     )
     payload_dict = dict(payload)
-    return ManifoldSAE.from_payload(
+    model = ManifoldSAE.from_payload(
         x, payload_dict, resolved_topology, kind, penalties,
         assignment_label=str(assignment),
         alpha=float(alpha_value), learnable_alpha=bool(alpha == "auto"),
@@ -1429,6 +1515,12 @@ def sae_manifold_fit(X: Any = None, K: int | None = None, d_atom: int = 2, atom_
         random_state=int(random_state), top_k=top_k_arg,
         jumprelu_threshold=float(jumprelu_threshold),
     )
+    # Retain the WP-D shard's (n, p, r) U so a follow-up `model.steer(...)` can
+    # re-install `RowMetric::OutputFisher` and report the KL dose (#980). Under the
+    # Euclidean (no-shard) path this stays None and steering is geometry-only.
+    if fisher_shard is not None:
+        model.fisher_factors = np.ascontiguousarray(fisher_shard[0])
+    return model
 
 
 def _require_sae_row_block_penalty(kind: str, kwarg: str) -> None:

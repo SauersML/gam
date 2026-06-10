@@ -4281,6 +4281,39 @@ impl SaeManifoldTerm {
         let mut dg_buf = vec![0.0_f64; p];
         let mut fitted = Array1::<f64>::zeros(p);
         let mut error = Array1::<f64>::zeros(p);
+        // #974 likelihood-whitening seam. The single per-row decision: when the
+        // installed `RowMetric` is a genuinely estimated noise model
+        // (`whitens_likelihood()` — only `WhitenedStructured`), the
+        // reconstruction data-fit, its t-block Gauss-Newton row block, AND the
+        // β-tier data-fit gradient are all assembled through the SAME per-row
+        // metric `M_n = U_n U_nᵀ = Σ_n^{-1}`. There is exactly ONE construction
+        // site (the `whiten_rows` closure below), so the value the line-search
+        // sums and the gradient/Hessian the Newton step solves cannot drift apart
+        // (the objective↔gradient-desync cure). For Euclidean / OutputFisher /
+        // no-metric the closure is the identity and every downstream loop is
+        // byte-identical to the historical isotropic path.
+        let whitens_likelihood = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        // `w_dim` is the whitened output dimension: `rank` of the metric factor
+        // when whitening, else `p` (identity). `error_white` is the whitened
+        // residual `U_nᵀ r_n ∈ ℝ^{w_dim}` whose squared norm is `r_nᵀ M_n r_n`,
+        // shared by the value path, the t-block GN, and (lifted back to p-space)
+        // the β-tier gradient.
+        let w_dim = match self.row_metric.as_ref() {
+            Some(metric) if whitens_likelihood => metric.metric_rank(),
+            _ => p,
+        };
+        // p-space metric-applied error `M_n r_n = U_n (U_nᵀ r_n)`, used by the
+        // β-tier data-fit gradient (β lives in p-output space, so its gradient
+        // contracts the residual through the full p×p metric, not the rank-space
+        // whitened residual). Identity (`= error`) when not whitening.
+        let mut error_white = vec![0.0_f64; w_dim];
+        let mut error_metric = Array1::<f64>::zeros(p);
+        // Whitened per-row Jacobian `J̃ = U_nᵀ J ∈ ℝ^{q_row × w_dim}` (row-major
+        // flat) reused for the t-block htt = J̃ J̃ᵀ and gt = J̃ ẽ.
+        let mut jac_white = vec![0.0_f64; q * w_dim.max(p)];
         // Data-fit Gauss-Newton β-Hessian is block-diagonal across the `p`
         // output channels and identical in each: with the flat β layout
         // `β[μ·p + oc] = B[μ, oc]` (μ enumerating (atom, basis_col)) the GN
@@ -4371,6 +4404,32 @@ impl SaeManifoldTerm {
             }
             for out_col in 0..p {
                 error[out_col] = fitted[out_col] - target[[row, out_col]];
+            }
+            // #974 seam (step 1/2): whiten the per-row residual ONCE.
+            //   * not whitening ⇒ `error_white == error` (length p) and
+            //     `error_metric == error`; every downstream loop is the
+            //     historical isotropic path bit-for-bit.
+            //   * whitening ⇒ `error_white = U_nᵀ r_n ∈ ℝ^{w_dim}` (its squared
+            //     norm is `r_nᵀ M_n r_n`, the value the data-fit sums) and
+            //     `error_metric = U_n (U_nᵀ r_n) = M_n r_n ∈ ℝ^p` (the p-space
+            //     metric-applied residual the β-tier gradient contracts).
+            match self.row_metric.as_ref() {
+                Some(metric) if whitens_likelihood => {
+                    let wr = metric.whiten_residual_row(row, error.view());
+                    for (slot, &v) in error_white.iter_mut().zip(wr.iter()) {
+                        *slot = v;
+                    }
+                    let mr = metric.apply_metric_row(row, error.view());
+                    for (slot, &v) in error_metric.iter_mut().zip(mr.iter()) {
+                        *slot = v;
+                    }
+                }
+                _ => {
+                    for out_col in 0..p {
+                        error_white[out_col] = error[out_col];
+                        error_metric[out_col] = error[out_col];
+                    }
+                }
             }
 
             // Determine whether this row uses the compact active-set layout.

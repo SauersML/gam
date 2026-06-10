@@ -1,0 +1,711 @@
+//! #974 — the structured-residual covariance estimator and the single producer
+//! of [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured).
+//!
+//! # What this estimates
+//!
+//! Given a residual matrix `R ∈ ℝ^{n×p}` (one `p`-dimensional reconstruction
+//! residual per row) and a smooth *activity coordinate* `z ∈ ℝ^n`, this fits the
+//! **structured residual-covariance model**
+//!
+//! ```text
+//!     Cov(r_n) = Σ_n = Λ · c(z_n) · Λᵀ + D ,
+//! ```
+//!
+//! where
+//!
+//! * `Λ ∈ ℝ^{p×r}` is a **low-rank interference factor** (the shared
+//!   off-isotropic subspace the residuals correlate along — e.g. a planted
+//!   interference subspace or a topology-race confound),
+//! * `D = diag(d) ≻ 0` is the **idiosyncratic diagonal** (per-channel
+//!   independent noise), and
+//! * `c(z) > 0` is the **smooth activity-scale law**: a strictly-positive scalar
+//!   that modulates the factor energy with the activity coordinate, recovered as
+//!   a binned-then-smoothed function of `z`.
+//!
+//! The fit is a deterministic, fixed-iteration **alternation** (no clock, no
+//! RNG; any tie is broken by index): it alternates
+//!
+//! 1. *(scale | Λ, D)* — re-estimate the per-row factor activity `c(z_n)` and
+//!    smooth it across `z`, holding the factor model fixed; and
+//! 2. *(Λ, D | scale)* — re-estimate the factor and diagonal from the
+//!    scale-deflated second-moment, holding the activity law fixed,
+//!
+//! a fixed small number of times. The **factor count `r`** is chosen by an
+//! evidence ladder: each candidate `r` is scored by its penalized Gaussian
+//! log-evidence and the best is kept.
+//!
+//! # What it produces
+//!
+//! [`StructuredResidualModel::row_metric`] materializes the **per-row precision
+//! factor** `U_n ∈ ℝ^{p×p}` with `U_n U_nᵀ = Σ_n^{-1}`, packaged as a
+//! [`RowMetric`](crate::inference::row_metric::RowMetric) with
+//! [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured).
+//! Whitening a residual `r_n` through it (`U_nᵀ r_n`) yields a vector whose
+//! squared Euclidean norm is `r_nᵀ Σ_n^{-1} r_n` — the Mahalanobis residual under
+//! the estimated noise model, which is exactly the likelihood-correct data-fit.
+//! The factor is built from `Σ_n^{-1}` computed in **Woodbury form** (an
+//! `r × r` solve, never a `p × p` inverse), so the estimator scales with the
+//! factor rank, not the dense output dimension.
+//!
+//! This is the first real producer of `WhitenedStructured`, and therefore the
+//! first metric whose `whitens_likelihood()` is `true`: see
+//! [`RowMetric::whitens_likelihood`](crate::inference::row_metric::RowMetric::whitens_likelihood).
+
+use std::sync::Arc;
+
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+
+use crate::inference::row_metric::RowMetric;
+use crate::linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use faer::Side;
+
+/// Number of (scale | factor) ↔ (factor | scale) alternation sweeps. Fixed and
+/// deterministic: the alternation is a smooth descent on the structured-Gaussian
+/// objective and converges geometrically, so a small fixed budget is both
+/// sufficient and reproducible (no clock/RNG-driven stopping).
+const ALTERNATION_SWEEPS: usize = 8;
+
+/// Number of bins the activity coordinate `z` is partitioned into for the smooth
+/// activity-scale `c(z)`. The per-bin factor activity is estimated then linearly
+/// interpolated across bin centers, giving a continuous piecewise-linear scale
+/// law. Chosen as a fixed structural constant (magic-by-default): enough bins to
+/// resolve a smooth monotone or unimodal scale trend without over-fitting the
+/// per-row noise.
+const ACTIVITY_SCALE_BINS: usize = 8;
+
+/// Relative floor on the idiosyncratic diagonal `D`, as a fraction of the mean
+/// residual variance. Keeps `Σ_n ≻ 0` and the Woodbury `r × r` capacitance
+/// invertible even when a channel is (near-)perfectly explained by the factor.
+const DIAGONAL_REL_FLOOR: f64 = 1e-6;
+
+/// Relative floor on the activity scale `c(z)`, as a fraction of its mean. Keeps
+/// `c(z) > 0` (a covariance scale) across the whole `z` range.
+const SCALE_REL_FLOOR: f64 = 1e-4;
+
+/// The fitted structured residual-covariance model: low-rank factor `Λ`,
+/// idiosyncratic diagonal `D`, and the smooth activity-scale `c(z)` evaluated at
+/// every row. Produces per-row precision factors and the
+/// [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured)
+/// [`RowMetric`](crate::inference::row_metric::RowMetric).
+#[derive(Clone, Debug)]
+pub struct StructuredResidualModel {
+    /// Output dimensionality `p` (residual width).
+    p: usize,
+    /// Selected factor rank `r` (`0 ≤ r ≤ p`). `0` ⇒ pure-diagonal noise model.
+    factor_rank: usize,
+    /// Interference factor `Λ ∈ ℝ^{p×r}` (the shared off-diagonal subspace).
+    lambda: Array2<f64>,
+    /// Idiosyncratic diagonal `d ∈ ℝ^p` (`D = diag(d)`), floored `≻ 0`.
+    diagonal: Array1<f64>,
+    /// Per-row activity scale `c(z_n) > 0`, length `n`.
+    row_scale: Array1<f64>,
+    /// Penalized Gaussian log-evidence of the selected model (higher is better).
+    /// The value the evidence ladder maximized over the candidate ranks.
+    log_evidence: f64,
+}
+
+/// Estimator inputs: the residual matrix and the smooth activity coordinate.
+///
+/// `residuals` is `R ∈ ℝ^{n×p}`. `activity` is `z ∈ ℝ^n` — the coordinate the
+/// scale law `c(z)` is smooth in (e.g. an assignment-mass or activation-strength
+/// summary per row). When no genuine activity coordinate is available, passing a
+/// constant `z` recovers a homoscedastic factor model (`c(z) ≡ const`).
+pub struct ResidualFactorInput<'a> {
+    /// Residual matrix `R ∈ ℝ^{n×p}`.
+    pub residuals: ArrayView2<'a, f64>,
+    /// Activity coordinate `z ∈ ℝ^n` the scale law is smooth in.
+    pub activity: ArrayView1<'a, f64>,
+    /// Maximum factor rank the evidence ladder is allowed to consider. The
+    /// ladder scores `r = 0, 1, …, min(max_factor_rank, p−1)` and keeps the
+    /// penalized-evidence maximizer. `0` forces the pure-diagonal model.
+    pub max_factor_rank: usize,
+}
+
+impl StructuredResidualModel {
+    /// Fit the structured residual-covariance model by the deterministic
+    /// fixed-iteration alternation, selecting the factor rank by the evidence
+    /// ladder. Returns an error only on shape / non-finite-input violations; the
+    /// numerical path is total (every floor and solve is guarded).
+    pub fn fit(input: ResidualFactorInput<'_>) -> Result<Self, String> {
+        let r = input.residuals;
+        let z = input.activity;
+        let n = r.nrows();
+        let p = r.ncols();
+        if n == 0 || p == 0 {
+            return Err(format!(
+                "StructuredResidualModel::fit: residuals must be non-empty; got ({n}, {p})"
+            ));
+        }
+        if z.len() != n {
+            return Err(format!(
+                "StructuredResidualModel::fit: activity length {} != residual rows {n}",
+                z.len()
+            ));
+        }
+        if !r.iter().all(|v| v.is_finite()) {
+            return Err("StructuredResidualModel::fit: residuals must be finite".to_string());
+        }
+        if !z.iter().all(|v| v.is_finite()) {
+            return Err("StructuredResidualModel::fit: activity must be finite".to_string());
+        }
+
+        // Bin assignment for the activity-scale law: deterministic equal-width
+        // bins over the observed z-range. A degenerate (zero-width) range maps
+        // every row to bin 0, recovering a single homoscedastic scale.
+        let bins = ACTIVITY_SCALE_BINS.max(1);
+        let z_min = z.iter().copied().fold(f64::INFINITY, f64::min);
+        let z_max = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let z_span = z_max - z_min;
+        let row_bin: Vec<usize> = (0..n)
+            .map(|i| {
+                if z_span <= 0.0 {
+                    0
+                } else {
+                    let frac = (z[i] - z_min) / z_span;
+                    let idx = (frac * bins as f64).floor() as isize;
+                    idx.clamp(0, bins as isize - 1) as usize
+                }
+            })
+            .collect();
+
+        let max_rank = input.max_factor_rank.min(p.saturating_sub(1));
+
+        // Evidence ladder over candidate factor ranks. Each candidate is fit by
+        // the full alternation and scored by its penalized Gaussian log-evidence;
+        // the maximizer is kept. Index order breaks any tie (lowest rank wins on
+        // an exact tie — Occam).
+        let mut best: Option<StructuredResidualModel> = None;
+        for rank in 0..=max_rank {
+            let model = Self::fit_fixed_rank(r, &row_bin, bins, rank)?;
+            let take = match &best {
+                None => true,
+                Some(b) => model.log_evidence > b.log_evidence,
+            };
+            if take {
+                best = Some(model);
+            }
+        }
+        best.ok_or_else(|| "StructuredResidualModel::fit: evidence ladder empty".to_string())
+    }
+
+    /// Fit the model at a fixed factor rank by the deterministic alternation.
+    fn fit_fixed_rank(
+        r: ArrayView2<'_, f64>,
+        row_bin: &[usize],
+        bins: usize,
+        rank: usize,
+    ) -> Result<Self, String> {
+        let n = r.nrows();
+        let p = r.ncols();
+
+        // Mean residual variance — the scale reference for the diagonal floor.
+        let mut total_var = 0.0_f64;
+        for i in 0..n {
+            for j in 0..p {
+                total_var += r[[i, j]] * r[[i, j]];
+            }
+        }
+        let mean_var = (total_var / (n as f64 * p as f64)).max(f64::MIN_POSITIVE);
+        let diag_floor = DIAGONAL_REL_FLOOR * mean_var;
+
+        // Initialize the per-row scale to 1 (homoscedastic start), the diagonal
+        // to the per-channel sample variance, and Λ to the leading eigenvectors
+        // of the (scale-1) second moment. The alternation refines all three.
+        let mut row_scale = Array1::<f64>::ones(n);
+        let mut bin_scale = Array1::<f64>::ones(bins);
+        let mut diagonal = column_variances(r).mapv(|v| v.max(diag_floor));
+        let mut lambda = Array2::<f64>::zeros((p, rank));
+
+        for _sweep in 0..ALTERNATION_SWEEPS {
+            // (Λ, D | scale): scale-deflated second moment
+            //   S = (1/n) Σ_n (r_n r_nᵀ) / c(z_n).
+            // Under the model E[r_n r_nᵀ] = c_n ΛΛᵀ + D, so S ≈ ΛΛᵀ + D̄ with
+            // D̄ the scale-averaged diagonal; the leading eigenpairs of S − D
+            // give Λ, the residual diagonal gives D.
+            let s = scaled_second_moment(r, &row_scale);
+            let (evals, evecs) = symmetric_eig_ascending(&s)?;
+            // Leading `rank` eigenpairs (eigenvalues ascending ⇒ take the tail).
+            if rank > 0 {
+                for k in 0..rank {
+                    let col = p - 1 - k;
+                    // Factor energy above the idiosyncratic floor: the part of
+                    // the eigenvalue not explained by the mean diagonal.
+                    let mean_diag = diagonal.iter().copied().sum::<f64>() / p as f64;
+                    let energy = (evals[col] - mean_diag).max(0.0);
+                    let amp = energy.sqrt();
+                    for row in 0..p {
+                        lambda[[row, k]] = amp * evecs[[row, col]];
+                    }
+                }
+            }
+            // D update: per-channel residual variance after removing the factor
+            // contribution, floored ≻ 0.
+            for j in 0..p {
+                let mut factor_var = 0.0_f64;
+                for k in 0..rank {
+                    factor_var += lambda[[j, k]] * lambda[[j, k]];
+                }
+                diagonal[j] = (s[[j, j]] - factor_var).max(diag_floor);
+            }
+
+            // (scale | Λ, D): per-row factor activity. With residual r_n, the
+            // factor-subspace energy is r_nᵀ P r_n where P projects onto
+            // range(Λ) in the D-whitened metric; the maximum-likelihood scalar
+            // multiplier on ΛΛᵀ that matches the row's factor-subspace energy is
+            //   c_n = (r̃_nᵀ B (BᵀB)^{-1} Bᵀ r̃_n) / tr(...)-normalizer.
+            // We use a stable closed-form proxy: the row's factor-coordinate
+            // energy ‖Λ⁺ r_n‖² normalized by the unit-scale expectation, then
+            // bin-smoothed across z. With rank 0 there is no factor ⇒ c ≡ 1.
+            if rank > 0 {
+                let mut bin_num = Array1::<f64>::zeros(bins);
+                let mut bin_den = Array1::<f64>::zeros(bins);
+                let coords = factor_coordinates(&lambda, &diagonal, r)?;
+                for i in 0..n {
+                    let mut energy = 0.0_f64;
+                    for k in 0..rank {
+                        energy += coords[[i, k]] * coords[[i, k]];
+                    }
+                    let b = row_bin[i];
+                    bin_num[b] += energy;
+                    bin_den[b] += rank as f64;
+                }
+                // Per-bin mean factor energy = activity scale. Empty bins inherit
+                // the global mean so the scale law stays defined everywhere.
+                let global = {
+                    let num: f64 = bin_num.iter().sum();
+                    let den: f64 = bin_den.iter().sum();
+                    if den > 0.0 { num / den } else { 1.0 }
+                };
+                for b in 0..bins {
+                    bin_scale[b] = if bin_den[b] > 0.0 {
+                        bin_num[b] / bin_den[b]
+                    } else {
+                        global
+                    };
+                }
+                // Smooth (3-point moving average over bins) for a continuous law,
+                // then floor ≻ 0.
+                let scale_floor = SCALE_REL_FLOOR * global.max(f64::MIN_POSITIVE);
+                let smoothed = moving_average_3(&bin_scale);
+                for b in 0..bins {
+                    bin_scale[b] = smoothed[b].max(scale_floor);
+                }
+                // Re-normalize so the mean scale is 1 (the factor amplitude lives
+                // in Λ; c(z) carries only the relative activity law). This keeps
+                // the (Λ, D) ↔ (scale) split identified.
+                let mean_scale = bin_scale.iter().copied().sum::<f64>() / bins as f64;
+                if mean_scale > 0.0 {
+                    bin_scale.mapv_inplace(|v| v / mean_scale);
+                }
+                for i in 0..n {
+                    row_scale[i] = bin_scale[row_bin[i]].max(scale_floor);
+                }
+            }
+        }
+
+        let log_evidence = penalized_log_evidence(r, &lambda, &diagonal, &row_scale, rank);
+        let mut model = Self {
+            p,
+            factor_rank: rank,
+            lambda,
+            diagonal,
+            row_scale,
+            log_evidence,
+        };
+        // Guard against any non-finite leak from a degenerate fit: fall back to a
+        // pure-diagonal model with the same evidence accounting.
+        if !model.is_finite() {
+            model.lambda = Array2::<f64>::zeros((p, rank));
+            model.row_scale = Array1::<f64>::ones(n);
+        }
+        Ok(model)
+    }
+
+    fn is_finite(&self) -> bool {
+        self.lambda.iter().all(|v| v.is_finite())
+            && self.diagonal.iter().all(|v| v.is_finite() && *v > 0.0)
+            && self.row_scale.iter().all(|v| v.is_finite() && *v > 0.0)
+            && self.log_evidence.is_finite()
+    }
+
+    /// Selected factor rank `r`.
+    pub fn factor_rank(&self) -> usize {
+        self.factor_rank
+    }
+
+    /// The fitted interference factor `Λ ∈ ℝ^{p×r}` (the shared off-isotropic
+    /// residual subspace). Consumed by the planted-subspace recovery test to
+    /// compare `range(Λ)` against the planted interference subspace.
+    pub fn factor(&self) -> ArrayView2<'_, f64> {
+        self.lambda.view()
+    }
+
+    /// The idiosyncratic diagonal `d ∈ ℝ^p` (`D = diag(d)`).
+    pub fn diagonal(&self) -> ArrayView1<'_, f64> {
+        self.diagonal.view()
+    }
+
+    /// The per-row activity scale `c(z_n) > 0`, length `n`. Recovers the smooth
+    /// activity-scale law evaluated at every observed `z_n`.
+    pub fn row_scale(&self) -> ArrayView1<'_, f64> {
+        self.row_scale.view()
+    }
+
+    /// The penalized Gaussian log-evidence the rank-selection ladder maximized.
+    pub fn log_evidence(&self) -> f64 {
+        self.log_evidence
+    }
+
+    /// Per-row covariance `Σ_n = Λ c(z_n) Λᵀ + D` (dense `p × p`). Diagnostic /
+    /// test surface; the hot path uses the factored precision via
+    /// [`Self::row_metric`].
+    pub fn row_covariance(&self, row: usize) -> Array2<f64> {
+        let p = self.p;
+        let c = self.row_scale[row];
+        let mut sigma = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            sigma[[i, i]] = self.diagonal[i];
+        }
+        for i in 0..p {
+            for j in 0..p {
+                let mut acc = 0.0_f64;
+                for k in 0..self.factor_rank {
+                    acc += self.lambda[[i, k]] * self.lambda[[j, k]];
+                }
+                sigma[[i, j]] += c * acc;
+            }
+        }
+        sigma
+    }
+
+    /// Build the per-row precision factor stack `U_n ∈ ℝ^{p×p}` with
+    /// `U_n U_nᵀ = Σ_n^{-1}` and package it as a
+    /// [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured)
+    /// [`RowMetric`](crate::inference::row_metric::RowMetric). This is the single
+    /// production site of `WhitenedStructured`.
+    ///
+    /// The precision is formed in **Woodbury form**:
+    /// ```text
+    ///   Σ_n^{-1} = D^{-1} − D^{-1} Λ ( c^{-1} I_r + Λᵀ D^{-1} Λ )^{-1} Λᵀ D^{-1},
+    /// ```
+    /// an `r × r` capacitance solve (never a `p × p` inverse). The factor `U_n`
+    /// is the lower-Cholesky of the assembled `Σ_n^{-1}` (`rank = p`), so
+    /// `whiten_residual_row` returns coordinates whose squared norm is the exact
+    /// Mahalanobis residual `r_nᵀ Σ_n^{-1} r_n`.
+    pub fn row_metric(&self, n_rows: usize) -> Result<RowMetric, String> {
+        if n_rows != self.row_scale.len() {
+            return Err(format!(
+                "StructuredResidualModel::row_metric: requested {n_rows} rows but model has {}",
+                self.row_scale.len()
+            ));
+        }
+        let p = self.p;
+        // Row-major flat factor matrix: u[n, i*p + k] = U_n[i, k].
+        let mut u = Array2::<f64>::zeros((n_rows, p * p));
+        for row in 0..n_rows {
+            let precision = self.row_precision(row)?;
+            let factor = lower_cholesky_psd(&precision)?;
+            for i in 0..p {
+                for k in 0..p {
+                    u[[row, i * p + k]] = factor[[i, k]];
+                }
+            }
+        }
+        RowMetric::whitened_structured(Arc::new(u), p, p)
+    }
+
+    /// Per-row precision `Σ_n^{-1}` via the Woodbury identity (an `r × r` solve).
+    fn row_precision(&self, row: usize) -> Result<Array2<f64>, String> {
+        let p = self.p;
+        let r = self.factor_rank;
+        let c = self.row_scale[row].max(f64::MIN_POSITIVE);
+        // D^{-1}.
+        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / self.diagonal[i]).collect();
+        // Start from D^{-1}.
+        let mut precision = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            precision[[i, i]] = d_inv[i];
+        }
+        if r == 0 {
+            return Ok(precision);
+        }
+        // B = D^{-1} Λ  ∈ ℝ^{p×r}.
+        let mut b = Array2::<f64>::zeros((p, r));
+        for i in 0..p {
+            for k in 0..r {
+                b[[i, k]] = d_inv[i] * self.lambda[[i, k]];
+            }
+        }
+        // Capacitance M = c^{-1} I_r + Λᵀ D^{-1} Λ  ∈ ℝ^{r×r}.
+        let mut cap = Array2::<f64>::zeros((r, r));
+        for a in 0..r {
+            for bk in 0..r {
+                let mut acc = 0.0_f64;
+                for i in 0..p {
+                    acc += self.lambda[[i, a]] * b[[i, bk]];
+                }
+                cap[[a, bk]] = acc;
+            }
+            cap[[a, a]] += 1.0 / c;
+        }
+        // Σ_n^{-1} = D^{-1} − B M^{-1} Bᵀ. Solve M X = Bᵀ for X = M^{-1} Bᵀ
+        // (r × p) via Cholesky (M ≻ 0 since c^{-1} > 0 and ΛᵀD^{-1}Λ ⪰ 0).
+        let chol = cap
+            .cholesky(Side::Lower)
+            .map_err(|e| format!("StructuredResidualModel::row_precision capacitance: {e:?}"))?;
+        let mut bt = Array2::<f64>::zeros((r, p));
+        for k in 0..r {
+            for i in 0..p {
+                bt[[k, i]] = b[[i, k]];
+            }
+        }
+        let x = chol.solve_mat(&bt); // r × p
+        for i in 0..p {
+            for j in 0..p {
+                let mut acc = 0.0_f64;
+                for k in 0..r {
+                    acc += b[[i, k]] * x[[k, j]];
+                }
+                precision[[i, j]] -= acc;
+            }
+        }
+        // Symmetrize against round-off so the Cholesky downstream sees an exactly
+        // symmetric PSD matrix.
+        for i in 0..p {
+            for j in (i + 1)..p {
+                let avg = 0.5 * (precision[[i, j]] + precision[[j, i]]);
+                precision[[i, j]] = avg;
+                precision[[j, i]] = avg;
+            }
+        }
+        Ok(precision)
+    }
+}
+
+/// Per-channel (column) sample second moment of the residual matrix.
+fn column_variances(r: ArrayView2<'_, f64>) -> Array1<f64> {
+    let n = r.nrows();
+    let p = r.ncols();
+    let mut v = Array1::<f64>::zeros(p);
+    for j in 0..p {
+        let mut acc = 0.0_f64;
+        for i in 0..n {
+            acc += r[[i, j]] * r[[i, j]];
+        }
+        v[j] = acc / n as f64;
+    }
+    v
+}
+
+/// Scale-deflated second moment `S = (1/n) Σ_n (r_n r_nᵀ) / c_n`.
+fn scaled_second_moment(r: ArrayView2<'_, f64>, row_scale: &Array1<f64>) -> Array2<f64> {
+    let n = r.nrows();
+    let p = r.ncols();
+    let mut s = Array2::<f64>::zeros((p, p));
+    for i in 0..n {
+        let w = 1.0 / row_scale[i].max(f64::MIN_POSITIVE);
+        for a in 0..p {
+            let ra = r[[i, a]];
+            for b in 0..p {
+                s[[a, b]] += w * ra * r[[i, b]];
+            }
+        }
+    }
+    s.mapv_inplace(|v| v / n as f64);
+    // Symmetrize against accumulation round-off.
+    for a in 0..p {
+        for b in (a + 1)..p {
+            let avg = 0.5 * (s[[a, b]] + s[[b, a]]);
+            s[[a, b]] = avg;
+            s[[b, a]] = avg;
+        }
+    }
+    s
+}
+
+/// Factor coordinates `Λ⁺_D r_n` per row: the generalized-least-squares
+/// projection of each residual onto `range(Λ)` in the `D^{-1}` metric, returned
+/// as an `n × r` matrix. Solves the `r × r` normal equations
+/// `(Λᵀ D^{-1} Λ) γ = Λᵀ D^{-1} r_n` per row (shared factorization).
+fn factor_coordinates(
+    lambda: &Array2<f64>,
+    diagonal: &Array1<f64>,
+    r: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let p = lambda.nrows();
+    let rank = lambda.ncols();
+    let n = r.nrows();
+    let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
+    // Normal matrix ΛᵀD^{-1}Λ (+ tiny ridge for invertibility).
+    let mut normal = Array2::<f64>::zeros((rank, rank));
+    for a in 0..rank {
+        for b in 0..rank {
+            let mut acc = 0.0_f64;
+            for i in 0..p {
+                acc += lambda[[i, a]] * d_inv[i] * lambda[[i, b]];
+            }
+            normal[[a, b]] = acc;
+        }
+    }
+    let trace = (0..rank).map(|k| normal[[k, k]]).sum::<f64>().max(1.0);
+    let ridge = 1e-10 * trace / rank.max(1) as f64;
+    for k in 0..rank {
+        normal[[k, k]] += ridge;
+    }
+    let chol = normal
+        .cholesky(Side::Lower)
+        .map_err(|e| format!("factor_coordinates normal solve: {e:?}"))?;
+    let mut coords = Array2::<f64>::zeros((n, rank));
+    let mut rhs = Array1::<f64>::zeros(rank);
+    for i in 0..n {
+        for a in 0..rank {
+            let mut acc = 0.0_f64;
+            for j in 0..p {
+                acc += lambda[[j, a]] * d_inv[j] * r[[i, j]];
+            }
+            rhs[a] = acc;
+        }
+        let gamma = chol.solvevec(&rhs);
+        for a in 0..rank {
+            coords[[i, a]] = gamma[a];
+        }
+    }
+    Ok(coords)
+}
+
+/// 3-point moving average over a bin vector (edge-clamped), giving the smooth
+/// activity-scale law a continuous, low-curvature shape.
+fn moving_average_3(v: &Array1<f64>) -> Array1<f64> {
+    let m = v.len();
+    let mut out = Array1::<f64>::zeros(m);
+    for i in 0..m {
+        let lo = i.saturating_sub(1);
+        let hi = (i + 1).min(m - 1);
+        let mut acc = 0.0_f64;
+        let mut cnt = 0.0_f64;
+        for j in lo..=hi {
+            acc += v[j];
+            cnt += 1.0;
+        }
+        out[i] = acc / cnt;
+    }
+    out
+}
+
+/// Ascending-eigenvalue symmetric eigendecomposition (faer convention).
+fn symmetric_eig_ascending(m: &Array2<f64>) -> Result<(Array1<f64>, Array2<f64>), String> {
+    m.eigh(Side::Lower)
+        .map_err(|e| format!("symmetric_eig: {e:?}"))
+}
+
+/// Lower-triangular Cholesky factor `L` of a (numerically) PSD matrix `A` with
+/// `L Lᵀ = A`, with a relative spectral floor so a marginally-indefinite
+/// precision (round-off) still factors. Used to turn `Σ_n^{-1}` into the
+/// `RowMetric` factor `U_n` (here `U_n = L`).
+fn lower_cholesky_psd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
+    if let Ok(chol) = a.cholesky(Side::Lower) {
+        return Ok(chol.lower_triangular());
+    }
+    // Eigen-repair: clamp eigenvalues to a small positive floor and rebuild a
+    // symmetric square root, then Cholesky that (always succeeds, PD).
+    let (evals, evecs) = symmetric_eig_ascending(a)?;
+    let max_ev = evals.iter().copied().fold(0.0_f64, f64::max).max(1.0);
+    let floor = 1e-10 * max_ev;
+    let p = a.nrows();
+    let mut sqrt = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..p {
+            let mut acc = 0.0_f64;
+            for k in 0..p {
+                let ev = evals[k].max(floor);
+                acc += evecs[[i, k]] * ev.sqrt() * evecs[[j, k]];
+            }
+            sqrt[[i, j]] = acc;
+        }
+    }
+    sqrt.cholesky(Side::Lower)
+        .map(|c| c.lower_triangular())
+        .map_err(|e| format!("lower_cholesky_psd eigen-repair: {e:?}"))
+}
+
+/// Penalized Gaussian log-evidence of the structured model at the fitted
+/// parameters — the evidence ladder's rank-selection score.
+///
+/// The per-row log-density of `r_n ~ N(0, Σ_n)` is
+/// `−½ ( log|Σ_n| + r_nᵀ Σ_n^{-1} r_n + p log 2π )`. We sum it across rows and
+/// subtract a parameter-count penalty `½ k_params · log n` (a BIC-style Occam
+/// term over the `p·r` factor entries + `p` diagonal entries + the bin scales),
+/// so adding a spurious factor that does not improve the fit is rejected. Both
+/// `log|Σ_n|` and the quadratic use the Woodbury / matrix-determinant lemma so no
+/// dense `p × p` inverse or determinant is formed.
+fn penalized_log_evidence(
+    r: ArrayView2<'_, f64>,
+    lambda: &Array2<f64>,
+    diagonal: &Array1<f64>,
+    row_scale: &Array1<f64>,
+    rank: usize,
+) -> f64 {
+    let n = r.nrows();
+    let p = r.ncols();
+    let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
+    let log_det_d: f64 = diagonal.iter().map(|&d| d.ln()).sum();
+    let two_pi_ln = (2.0 * std::f64::consts::PI).ln();
+
+    let mut log_lik = 0.0_f64;
+    for i in 0..n {
+        let c = row_scale[i].max(f64::MIN_POSITIVE);
+        // Quadratic r_nᵀ Σ_n^{-1} r_n via Woodbury:
+        //   r_nᵀ D^{-1} r_n − (Bᵀ r_n)ᵀ M^{-1} (Bᵀ r_n),
+        // with B = D^{-1}Λ and M = c^{-1}I + ΛᵀD^{-1}Λ.
+        let mut quad = 0.0_f64;
+        for j in 0..p {
+            quad += r[[i, j]] * d_inv[j] * r[[i, j]];
+        }
+        let mut log_det = log_det_d;
+        if rank > 0 {
+            // M (r × r) and w = Bᵀ r_n = ΛᵀD^{-1} r_n.
+            let mut m = Array2::<f64>::zeros((rank, rank));
+            let mut w = Array1::<f64>::zeros(rank);
+            for a in 0..rank {
+                let mut wa = 0.0_f64;
+                for j in 0..p {
+                    wa += lambda[[j, a]] * d_inv[j] * r[[i, j]];
+                }
+                w[a] = wa;
+                for b in 0..rank {
+                    let mut acc = 0.0_f64;
+                    for j in 0..p {
+                        acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
+                    }
+                    m[[a, b]] = acc;
+                }
+                m[[a, a]] += 1.0 / c;
+            }
+            // Cholesky M = R Rᵀ → log|M|, and solve M y = w.
+            match m.cholesky(Side::Lower) {
+                Ok(chol) => {
+                    let y = chol.solvevec(&w);
+                    let mut wy = 0.0_f64;
+                    for a in 0..rank {
+                        wy += w[a] * y[a];
+                    }
+                    quad -= wy;
+                    // log|Σ_n| = log|D| + log|M| + r·log c   (matrix-determinant
+                    // lemma; the c^{-1}I shift carries the +r·log c).
+                    let diag = chol.diag();
+                    let log_det_m: f64 = diag.iter().map(|&l| (l * l).ln()).sum();
+                    log_det = log_det_d + log_det_m + rank as f64 * c.ln();
+                }
+                Err(_) => {
+                    // Degenerate capacitance — fall back to the diagonal model's
+                    // accounting for this row (no factor correction).
+                    log_det = log_det_d;
+                }
+            }
+        }
+        log_lik += -0.5 * (log_det + quad + p as f64 * two_pi_ln);
+    }
+
+    let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
+    log_lik - 0.5 * k_params * (n.max(2) as f64).ln()
+}
