@@ -1895,7 +1895,24 @@ impl GrassmannFrame {
     /// Largest principal angle (radians) between this frame's column span and
     /// another `p × r'` orthonormal frame's span — the Grassmann geodesic
     /// distance component used by the planted-atom recovery verifier (issue
-    /// #972). Computed from the singular values of `Uᵀ U_other` (`cos θ_i`).
+    /// #972).
+    ///
+    /// The naive formula `arccos(min σ_i(UᵀV))` loses half the available
+    /// precision for near-parallel spans: when `cos θ = 1 − ε` (the
+    /// `ε ~ fp64.eps` regime hit by a polar update of an already-orthonormal
+    /// frame), `arccos(1 − ε) ≈ √(2ε)` ≈ `1.49e-8`, so a planted span the
+    /// solver actually recovered to machine precision was being reported as
+    /// `O(√fp64.eps)` off. The stable form uses BOTH the cosines from
+    /// `M = UᵀV` (small-angle limit: `cos θ ≈ 1 − θ²/2`, sensitive to noise)
+    /// AND the sines from the orthogonal complement
+    /// `V_⊥ = (I − UUᵀ) V` (small-angle limit: `sin θ ≈ θ`, sensitive to the
+    /// quantity we actually want), then combines them with `atan2(sin, cos)`.
+    /// `atan2` returns a precise angle across the whole `[0, π/2]` interval
+    /// regardless of which leg is small — so an exactly-equal-frame test now
+    /// reports the genuine ~fp64.eps residual instead of an inflated
+    /// `√fp64.eps`. The pairing is exact because the singular values of
+    /// `M` and `V_⊥` are matched component-wise to the same principal
+    /// angle: `σ_r(M) = cos θ_max` and `σ_1(V_⊥) = sin θ_max`.
     pub fn max_principal_angle(&self, other: ArrayView2<'_, f64>) -> Result<f64, String> {
         if other.nrows() != self.output_dim() {
             return Err(format!(
@@ -1904,13 +1921,25 @@ impl GrassmannFrame {
                 self.output_dim()
             ));
         }
-        let overlap = fast_atb(&self.frame, &other.to_owned());
-        let (_u, sv, _vt) = overlap
+        let other_owned = other.to_owned();
+        let overlap = fast_atb(&self.frame, &other_owned);
+        let (_u, sv_cos, _vt) = overlap
             .svd(false, false)
-            .map_err(|e| format!("GrassmannFrame::max_principal_angle: SVD failed: {e}"))?;
-        // Smallest cosine ⇒ largest principal angle. Clamp for acos domain.
-        let min_cos = sv.iter().copied().fold(1.0_f64, f64::min).clamp(-1.0, 1.0);
-        Ok(min_cos.acos())
+            .map_err(|e| format!("GrassmannFrame::max_principal_angle: cos-SVD failed: {e}"))?;
+        // V_⊥ = V − U·(UᵀV); its largest singular value is sin(θ_max).
+        let u_overlap = fast_ab(&self.frame, &overlap);
+        let v_perp = &other_owned - &u_overlap;
+        let (_u, sv_sin, _vt) = v_perp
+            .svd(false, false)
+            .map_err(|e| format!("GrassmannFrame::max_principal_angle: sin-SVD failed: {e}"))?;
+        // Smallest cosine and largest sine both correspond to θ_max; combine
+        // via atan2 for full precision across [0, π/2]. Clamp the SVD outputs
+        // into [0, 1] before pairing — both arise from singular values of
+        // matrices whose true norms are ≤ 1, so any drift above 1 or below
+        // 0 is pure floating-point noise.
+        let min_cos = sv_cos.iter().copied().fold(1.0_f64, f64::min).clamp(0.0, 1.0);
+        let max_sin = sv_sin.iter().copied().fold(0.0_f64, f64::max).clamp(0.0, 1.0);
+        Ok(max_sin.atan2(min_cos))
     }
 }
 
