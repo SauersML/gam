@@ -14830,10 +14830,14 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // per-block + spectrum breakdown without re-materializing H_pen.
         let mut last_kkt_refusal_report: Option<KktRefusalReport> = None;
         let mut prev_kkt_norm: Option<f64> = None;
-        // Plateau detector: count consecutive cycles whose |Δobj| sits
-        // below `objective_tol`; when the streak hits the threshold
-        // the linearized stall exit fires.
-        let mut consecutive_obj_flat_cycles: usize = 0;
+        // Plateau streak on |Δobj| ≤ objective_tol. The scale-aware
+        // flatness predicate stays local to this loop; the streak/window
+        // discipline (grow on flat, reset on recovery) is the shared
+        // loop_guard::FlatStreak so it cannot drift from the other
+        // stagnation detectors in the tree (#968).
+        let mut obj_flat_streak = crate::solver::loop_guard::FlatStreak::new(
+            crate::solver::loop_guard::PLATEAU_DEFAULT_WINDOW,
+        );
         // Total descent budget across the joint-Newton loop, used by
         // the end-of-loop summary to report `descent_total`.
         let initial_joint_objective: f64 = lastobjective;
@@ -17628,16 +17632,13 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     || superconverged_stationarity)
             {
                 log::info!(
-                    "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} consecutive_flat={consecutive_obj_flat_cycles} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
+                    "[JN-EXIT] cycle={cycle} reason=plateau_objective_flat residual={residual:.3e} residual_tol={residual_tol:.3e} obj_change={objective_change:.3e} objective_tol={objective_tol:.3e} consecutive_flat={} accepted_step_inf={accepted_step_inf:.3e} step_tol={step_tol:.3e}",
+                    obj_flat_streak.streak(),
                 );
                 converged = true;
                 break;
             }
-            if objective_change <= objective_tol {
-                consecutive_obj_flat_cycles = consecutive_obj_flat_cycles.saturating_add(1);
-            } else {
-                consecutive_obj_flat_cycles = 0;
-            }
+            obj_flat_streak.note(objective_change <= objective_tol);
             // Carry the KKT-stationarity / objective-stagnation signals
             // into the next cycle so the line-search-failure path above
             // can recognise a true KKT optimum on a rank-deficient null
@@ -18072,7 +18073,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     let mut block_max_step: Vec<f64> = vec![BLOCK_NEWTON_STEP_INITIAL; specs.len()];
 
     let mut prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
-    let mut consecutive_frozen_loglik_cycles: usize = 0;
+    // Frozen-loglik streak rides the shared window discipline
+    // (loop_guard::FlatStreak, #968); the frozen-loglik predicate and the
+    // clamped-step side condition below stay local — they are policy about
+    // what counts as flat, which this loop rightly owns.
+    let mut frozen_loglik_streak =
+        crate::solver::loop_guard::FlatStreak::new(DIVERGENCE_FROZEN_LOGLIK_CYCLES);
     // Coordinate descent visits each block in turn, so `max_proposed_step`
     // (the per-cycle max across blocks) only fires the cap on cycles where
     // the divergent block is the active one. On a near-null direction this
@@ -18565,24 +18571,25 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         let loglik_frozen_tol_for_divergence_check =
             inner_tol * (1.0 + cached_eval.log_likelihood.abs());
         let step_clamped_for_divergence_check = trust_boundary_hit_in_cycle;
-        if loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check {
-            consecutive_frozen_loglik_cycles += 1;
+        let loglik_frozen =
+            loglik_change_for_divergence_check <= loglik_frozen_tol_for_divergence_check;
+        let frozen_verdict = frozen_loglik_streak.note(loglik_frozen);
+        if loglik_frozen {
             if step_clamped_for_divergence_check {
                 clamped_step_in_frozen_run = true;
             }
         } else {
-            consecutive_frozen_loglik_cycles = 0;
             clamped_step_in_frozen_run = false;
         }
         prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
-        if consecutive_frozen_loglik_cycles >= DIVERGENCE_FROZEN_LOGLIK_CYCLES
+        if frozen_verdict == crate::solver::loop_guard::LoopVerdict::Plateaued
             && clamped_step_in_frozen_run
         {
             log::warn!(
                 "[PIRLS/blockwise convergence] divergence early-exit at cycle {} | -loglik={:.6e} frozen for {} consecutive cycles | max_proposed_step={:.3e} (trust-boundary hit observed in frozen run) | step_tol={:.3e}; near-null Hessian direction detected — returning unconverged so the outer optimizer backs off this region instead of running to inner_max_cycles.",
                 cycle,
                 -cached_eval.log_likelihood,
-                consecutive_frozen_loglik_cycles,
+                frozen_loglik_streak.streak(),
                 max_proposed_beta_step,
                 step_tol,
             );
