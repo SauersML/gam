@@ -13562,6 +13562,38 @@ fn wrap_to_pi(angle: f64) -> f64 {
 /// non-Euclidean `manifold`). Pass `init="caller"` to start from `t` unchanged
 /// (a pure local solve / explicit warm start), and `n_restarts > 1` to also
 /// optimize from perturbed starts and keep the lowest-score result.
+///
+/// Shift-invariant relative-gradient stationarity measure for the latent outer
+/// solve: `‖∇ₜ f(t̂)‖_g / max(‖∇ₜ f(t₀)‖_g, 1)`, comparing the projected
+/// Riemannian gradient norm at the chosen latent to the gradient norm at the
+/// INITIAL iterate `t₀`. This is the FFI analogue of `relative_stationarity` in
+/// `src/geometry/optimizer.rs` (issue #954), kept byte-for-byte identical to it
+/// so the diagnostic `converged` flag agrees with the optimizer's own stopping
+/// rule:
+///
+/// * **Shift-invariant** — the objective value `f` does not enter at all, so an
+///   additive shift `f → f + C` (which leaves the minimizer, gradient, Hessian,
+///   and model reduction unchanged) cannot move the measure. The earlier
+///   `‖∇ₜ f‖·‖t‖_typ / max(|f|, 1)` divided by the objective magnitude, so a
+///   large `C` inflated the denominator and could falsely certify a
+///   non-stationary latent as converged (#954).
+/// * **Scale-invariant** — under `f → c·f` both `‖∇ₜ f(t̂)‖` and `‖∇ₜ f(t₀)‖`
+///   scale by `c`, so the ratio is unchanged and a fixed `grad_tol` reads as a
+///   true *relative* tolerance.
+/// * **#879 O(n) calibration** — the profiled REML objective leaves `‖∇ₜ f‖` at
+///   an O(n) magnitude even at a genuine stationary point near interpolation;
+///   anchoring to `‖∇ₜ f(t₀)‖` (itself O(n)) divides that magnitude out, while
+///   the `max(·, 1)` floor reduces the test to the bare absolute
+///   `‖∇ₜ f‖ ≤ grad_tol` on a unit-scale objective.
+/// * **Non-finite** — a blown-up iterate (`‖∇ₜ f‖` or `‖∇ₜ f(t₀)‖` not finite)
+///   maps to `+∞`, so it is never reported stationary.
+fn latent_relative_stationarity(grad_norm: f64, grad0_norm: f64) -> f64 {
+    if !grad_norm.is_finite() || !grad0_norm.is_finite() {
+        return f64::INFINITY;
+    }
+    grad_norm / grad0_norm.max(1.0)
+}
+
 #[pyfunction(signature = (
     t,
     y,
@@ -13846,11 +13878,7 @@ fn gaussian_reml_optimize_latent<'py>(
     // wrap to `[-π, π)`), so it does not belong in a Riemannian stationarity
     // test. Anchoring to `‖∇ₜ f(t₀)‖` is both shift-invariant (the gradient does
     // not depend on `C`) and scale-invariant.
-    let grad_t_norm_scaled = if grad_t_norm.is_finite() && grad0_norm.is_finite() {
-        grad_t_norm / grad0_norm.max(1.0)
-    } else {
-        f64::INFINITY
-    };
+    let grad_t_norm_scaled = latent_relative_stationarity(grad_t_norm, grad0_norm);
     let converged = grad_t_norm_scaled <= grad_tol;
 
     // Rebuild the full fit dictionary at the converged latent so callers get the
@@ -29981,6 +30009,141 @@ fn smoothness_penalty_impl(
     )
     .map_err(|err| format!("failed to build penalty null basis: {err}"))?;
     Ok((penalty, null_basis))
+}
+
+#[cfg(test)]
+mod latent_stationarity_tests {
+    //! Regression tests for the latent outer-solve convergence test (issue
+    //! #954). `gaussian_reml_optimize_latent` decides `converged` from
+    //! [`latent_relative_stationarity`], which must be shift-invariant (the
+    //! objective value cannot enter), scale-invariant, preserve the #879 O(n)
+    //! calibration via the initial-iterate gradient, and never certify a
+    //! blown-up iterate.
+    use super::latent_relative_stationarity;
+
+    const GRAD_TOL: f64 = 1.0e-8;
+
+    /// #954 from the FFI angle: the convergence decision must not depend on the
+    /// objective *magnitude*. The retired formula was
+    /// `rel_old = ‖∇f‖ · ‖t‖_typ / max(|f|, 1)`; a large objective value drove
+    /// it below `grad_tol` and falsely certified a non-stationary latent. The
+    /// new measure does not take `f` at all, so for a FIXED gradient pair it is
+    /// constant across every objective value — and a genuinely non-stationary
+    /// gradient ratio never passes, no matter how large `|f|` grows.
+    #[test]
+    fn convergence_is_invariant_to_objective_shift() {
+        // A latent that is NOT stationary: its gradient is twice the initial
+        // gradient scale (the optimizer made no progress).
+        let grad_norm = 2.0;
+        let grad0_norm = 1.0;
+        let new_measure = latent_relative_stationarity(grad_norm, grad0_norm);
+
+        // The shift-invariant measure flags it as non-stationary, period.
+        assert!(
+            new_measure > GRAD_TOL,
+            "non-stationary latent (‖∇f‖={grad_norm}, ‖∇f₀‖={grad0_norm}) must never \
+             certify converged; rel={new_measure}"
+        );
+
+        // And it is bit-identical regardless of the objective value `f`, which
+        // the new formula does not reference. The OLD formula, recomputed here,
+        // WOULD flip to "converged" once |f| is large enough — the #954 bug.
+        let t_scale = 1.0_f64; // ‖t‖_typ floored at 1
+        for &f in &[0.0_f64, 1.0, 1.0e3, 1.0e9, 1.0e15] {
+            // New: objective never enters, so the decision is unchanged.
+            assert_eq!(
+                latent_relative_stationarity(grad_norm, grad0_norm),
+                new_measure,
+                "objective value {f} must not change the stationarity measure"
+            );
+            // Old (buggy) formula, for contrast.
+            let rel_old = grad_norm * t_scale / f.abs().max(1.0);
+            if f >= 1.0e9 {
+                assert!(
+                    rel_old <= GRAD_TOL,
+                    "sanity: the retired formula DID falsely converge at |f|={f} \
+                     (rel_old={rel_old}), which is exactly the #954 bug the new \
+                     measure removes"
+                );
+            }
+        }
+    }
+
+    /// Scale-invariance: `f → c·f` scales both gradient norms by `c`, leaving the
+    /// ratio fixed, so `grad_tol` is a genuine *relative* tolerance. This holds
+    /// in the floor-inactive regime `c·‖∇f₀‖ ≥ 1`; the `max(·, 1)` floor
+    /// deliberately breaks exact scale-invariance near unit scale to recover the
+    /// absolute test (see [`small_initial_gradient_floors_to_absolute_test`]).
+    #[test]
+    fn convergence_is_scale_invariant() {
+        let grad_norm = 3.0e-9;
+        let grad0_norm = 100.0;
+        let base = latent_relative_stationarity(grad_norm, grad0_norm);
+        // Every c keeps c·grad0_norm ≥ 50 ≫ 1, so the floor stays inactive.
+        for &c in &[0.5_f64, 2.0, 1.0e3, 1.0e6] {
+            assert!(c * grad0_norm >= 1.0);
+            let scaled = latent_relative_stationarity(c * grad_norm, c * grad0_norm);
+            assert!(
+                (scaled - base).abs() <= 1.0e-18 + 1.0e-12 * base.abs(),
+                "scaling the objective by {c} must not change the relative measure: \
+                 base={base}, scaled={scaled}"
+            );
+        }
+    }
+
+    /// #879 O(n) calibration: a genuinely stationary latent near interpolation
+    /// has an O(n) raw gradient AND an O(n) initial gradient. The bare absolute
+    /// test `‖∇f‖ ≤ grad_tol` would reject it, but the relative measure divides
+    /// the O(n) magnitude out and correctly reports converged.
+    #[test]
+    fn on_calibration_relative_measure_certifies_near_interpolation() {
+        let n = 5_000.0;
+        let grad0_norm = 4.0 * n; // O(n) gradient at the seed
+        // A genuinely stationary latent near interpolation: its raw gradient is
+        // still O(n) (the profiled `n·log σ̂²` term), so the bare absolute test
+        // would reject it.
+        let grad_norm = 1.0e-9 * n; // = 5e-6, far above grad_tol = 1e-8
+        assert!(
+            grad_norm > GRAD_TOL,
+            "the raw O(n) gradient {grad_norm} would fail the absolute test"
+        );
+        // The relative measure divides the O(n) magnitude out and certifies it:
+        // (1e-9·n) / (4·n) = 2.5e-10 ≤ grad_tol.
+        let rel = latent_relative_stationarity(grad_norm, grad0_norm);
+        assert!(
+            rel <= GRAD_TOL,
+            "a stationary latent (‖∇f‖/‖∇f₀‖ = {rel}) must report converged despite \
+             its O(n) raw gradient {grad_norm}"
+        );
+    }
+
+    /// The `max(·, 1)` floor reduces the test to the absolute `‖∇f‖ ≤ grad_tol`
+    /// when the initial gradient is itself small (a near-stationary or
+    /// degenerate seed), matching `relative_stationarity` in optimizer.rs.
+    #[test]
+    fn small_initial_gradient_floors_to_absolute_test() {
+        let grad0_norm = 0.0; // degenerate seed → floor to 1
+        assert_eq!(latent_relative_stationarity(1.0e-9, grad0_norm), 1.0e-9);
+        assert_eq!(latent_relative_stationarity(5.0, grad0_norm), 5.0);
+        // A tiny but nonzero seed gradient (< 1) is also floored to 1.
+        assert_eq!(latent_relative_stationarity(2.0e-9, 0.3), 2.0e-9);
+    }
+
+    /// A blown-up iterate (non-finite gradient at either point) is never
+    /// stationary.
+    #[test]
+    fn non_finite_gradient_is_never_stationary() {
+        assert_eq!(
+            latent_relative_stationarity(f64::INFINITY, 1.0),
+            f64::INFINITY
+        );
+        assert_eq!(latent_relative_stationarity(f64::NAN, 1.0), f64::INFINITY);
+        assert_eq!(
+            latent_relative_stationarity(1.0, f64::INFINITY),
+            f64::INFINITY
+        );
+        assert_eq!(latent_relative_stationarity(1.0, f64::NAN), f64::INFINITY);
+    }
 }
 
 #[cfg(test)]
