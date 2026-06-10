@@ -97,6 +97,18 @@ pub use inference::{
     sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
+// #931-#935 criterion calculus: the profiled-criterion abstraction
+// (CriterionAtom / CriterionSum / Sensitivity) that kills the objective↔gradient
+// desync class. Exposed as the staged public criterion-calculus interface it is
+// designed to be; the #935 calculus that consumes it inside the inner REML path
+// lands per the module's Migration law (one term per pass, FD-verified, old code
+// deleted in the same commit). `PenaltySubspaceTrace` is the #901 spectral kernel
+// the logdet atom's `Sensitivity` is built from.
+pub use solver::estimate::reml::atoms::{
+    BetaChannel, CriterionAtom, CriterionSum, HessianLogdetAtom, SampledBlockAtom, Sensitivity,
+    StratumFingerprint, ThetaDirection,
+};
+pub use solver::estimate::reml::unified::PenaltySubspaceTrace;
 pub use resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
