@@ -34,7 +34,17 @@
 //!   linear in `z` and the EXACT set is computable from one factorization
 //!   and ≤ 2n linear breakpoints — the ridge result generalized to
 //!   arbitrary penalized smooths (any Sλ, any basis).
-//! - **Layer 2 (contract below):** GLM families via certified
+//! - **Layer 2 — discrete arm (implemented below, exact):** Binomial /
+//!   Poisson and any finite-or-windowed response support, by ENUMERATION
+//!   with one symmetric refit per candidate (`SymmetricAugmentedFit`).
+//!   Bernoulli's honest full-conformal set — smoothing re-selection
+//!   included — costs exactly two cold fits; windowed counts carry honest
+//!   tail-resolution flags instead of an unprovable monotone-tail
+//!   assumption. Exactness is by construction: every retained candidate
+//!   was actually refit. Validity is proven in the test module by FULL
+//!   ENUMERATION of every Bernoulli dataset at small n (exact coverage
+//!   ≥ 1 − α as a theorem check, not a simulation).
+//! - **Layer 2 — continuous GLM (contract below):** certified
 //!   predictor–corrector homotopy in `z` — exact at corrector points
 //!   because each correction is a Newton solve of the SAME symmetric KKT
 //!   system a cold fit would solve.
@@ -443,6 +453,187 @@ impl ExactGaussianFullConformal {
     }
 }
 
+/// The symmetric augmented fitting map the discrete enumeration arm walks.
+///
+/// `scores(z)` must: fit the n+1 augmented rows `{(x_i, y_i)} ∪ {(x_*, z)}`
+/// and return all n+1 nonconformity scores with the TEST row's score LAST.
+/// The single requirement backing the coverage guarantee is SYMMETRY: the
+/// fitting map must treat the augmented row exactly like a training row
+/// (same loss term, same weight, same participation in any smoothing /
+/// hyperparameter selection the map performs). A map that freezes anything
+/// it selected by looking at the training responses but not at `z` breaks
+/// symmetry and voids the guarantee — for discrete families that honesty is
+/// CHEAP, because the support is walked by enumeration (2 refits for
+/// Bernoulli), so the map can simply be the full cold fit, ρ-selection
+/// included.
+///
+/// `&mut self` so implementations can warm-start across consecutive
+/// candidates (a speed optimization that cannot affect the answer when each
+/// solve is run to its deterministic optimum).
+pub trait SymmetricAugmentedFit {
+    fn scores(&mut self, z: f64) -> Result<Array1<f64>, String>;
+}
+
+/// Blanket impl so plain closures can serve as the fitting map (tests, and
+/// adapter shims that capture a fit configuration).
+impl<F> SymmetricAugmentedFit for F
+where
+    F: FnMut(f64) -> Result<Array1<f64>, String>,
+{
+    fn scores(&mut self, z: f64) -> Result<Array1<f64>, String> {
+        self(z)
+    }
+}
+
+/// One enumerated candidate's conformal verdict.
+#[derive(Clone, Debug)]
+pub struct DiscreteCandidate {
+    pub z: f64,
+    /// Conformal p-value `(1 + #{i ≤ n : e_i ≥ e_*}) / (n+1)`. Ties count
+    /// FOR the candidate (the `≥` convention) — the conservative direction;
+    /// strict-inequality ranking would under-cover under ties.
+    pub p_value: f64,
+    pub member: bool,
+}
+
+/// Exact full-conformal prediction set for a DISCRETE response family,
+/// computed by enumeration of candidate responses with one symmetric refit
+/// per candidate (#942 Layer 2, discrete arm).
+///
+/// There is no homotopy and no approximation anywhere in this object: for
+/// each candidate `z` the fitting map is run to its optimum, the n+1 scores
+/// are ranked, and the candidate is kept iff its conformal p-value exceeds
+/// α. Validity is the standard full-conformal argument — exchangeability of
+/// the n+1 rows plus symmetry of the map — and EXACTNESS is by construction
+/// (the support is finite or explicitly windowed; every retained candidate
+/// was actually refit).
+#[derive(Clone, Debug)]
+pub struct DiscreteFullConformalSet {
+    /// Retained candidates, ascending.
+    pub members: Vec<f64>,
+    /// Every enumerated candidate with its p-value (diagnostics; the
+    /// boundary-adjacent p-values are the discrete analogue of Layer 1's
+    /// `boundary_margin`).
+    pub candidates: Vec<DiscreteCandidate>,
+    pub alpha: f64,
+    /// `n + 1`.
+    pub n_augmented: usize,
+    /// `Some(z_first)` when the SMALLEST enumerated candidate was a member
+    /// of a WINDOWED enumeration — the set may extend below the window, and
+    /// this implementation refuses to guess. Always `None` for exhaustive
+    /// supports (the Bernoulli arm) and when the window's edge candidate
+    /// was excluded (the boundary is then resolved by monotone rank
+    /// inclusion: nothing outside was retained because the edge itself
+    /// already failed... it was REFIT and failed — outside candidates were
+    /// simply not examined, which is exactly what this flag reports).
+    pub lower_tail_unresolved: Option<f64>,
+    /// Mirror of `lower_tail_unresolved` for the largest candidate.
+    pub upper_tail_unresolved: Option<f64>,
+}
+
+/// Walk an EXHAUSTIVE discrete support (e.g. Bernoulli `{0, 1}`). The
+/// returned set is the exact full-conformal set, period — no tail
+/// semantics, because there is nothing outside the support.
+pub fn discrete_full_conformal_exhaustive<M: SymmetricAugmentedFit>(
+    fit: &mut M,
+    support: &[f64],
+    alpha: f64,
+) -> Result<DiscreteFullConformalSet, String> {
+    let mut set = discrete_walk(fit, support, alpha)?;
+    set.lower_tail_unresolved = None;
+    set.upper_tail_unresolved = None;
+    Ok(set)
+}
+
+/// Walk a WINDOW of an unbounded discrete support (e.g. Poisson counts
+/// `lo..=hi`). Exact ON THE WINDOW; the tail flags report honestly whether
+/// the set might continue past either edge (edge candidate retained ⇒
+/// unresolved). Callers widen the window and re-walk until both flags
+/// clear — the deterministic, certificate-style alternative to assuming a
+/// monotone tail this engine cannot prove for an arbitrary fitting map.
+pub fn discrete_full_conformal_window<M: SymmetricAugmentedFit>(
+    fit: &mut M,
+    window: &[f64],
+    alpha: f64,
+) -> Result<DiscreteFullConformalSet, String> {
+    discrete_walk(fit, window, alpha)
+}
+
+/// Bernoulli convenience arm: the support is `{0, 1}`, so the honest
+/// (ρ-re-selecting) full-conformal set costs exactly two cold fits.
+pub fn bernoulli_full_conformal<M: SymmetricAugmentedFit>(
+    fit: &mut M,
+    alpha: f64,
+) -> Result<DiscreteFullConformalSet, String> {
+    discrete_full_conformal_exhaustive(fit, &[0.0, 1.0], alpha)
+}
+
+fn discrete_walk<M: SymmetricAugmentedFit>(
+    fit: &mut M,
+    candidates: &[f64],
+    alpha: f64,
+) -> Result<DiscreteFullConformalSet, String> {
+    if candidates.is_empty() {
+        return Err("discrete full conformal: empty candidate list".to_string());
+    }
+    if !(0.0..1.0).contains(&alpha) {
+        return Err(format!(
+            "discrete full conformal: alpha must be in [0, 1), got {alpha}"
+        ));
+    }
+    if candidates.windows(2).any(|w| !(w[0] < w[1])) {
+        return Err(
+            "discrete full conformal: candidates must be strictly increasing".to_string(),
+        );
+    }
+
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut members = Vec::new();
+    let mut n_augmented = 0usize;
+    for &z in candidates {
+        let scores = fit.scores(z)?;
+        let n1 = scores.len();
+        if n1 < 2 {
+            return Err(
+                "discrete full conformal: fitting map must score at least two rows".to_string(),
+            );
+        }
+        if n_augmented == 0 {
+            n_augmented = n1;
+        } else if n_augmented != n1 {
+            return Err(format!(
+                "discrete full conformal: fitting map returned {n1} scores after returning \
+                 {n_augmented}; the augmented row count cannot change across candidates"
+            ));
+        }
+        if scores.iter().any(|s| !s.is_finite()) {
+            return Err(format!(
+                "discrete full conformal: non-finite nonconformity score at candidate {z}; \
+                 refusing to rank garbage"
+            ));
+        }
+        let e_star = scores[n1 - 1];
+        let count = scores.iter().take(n1 - 1).filter(|&&e| e >= e_star).count();
+        let p_value = (1.0 + count as f64) / (n1 as f64);
+        let member = p_value > alpha;
+        if member {
+            members.push(z);
+        }
+        out.push(DiscreteCandidate { z, p_value, member });
+    }
+
+    let lower_tail_unresolved = out.first().filter(|c| c.member).map(|c| c.z);
+    let upper_tail_unresolved = out.last().filter(|c| c.member).map(|c| c.z);
+    Ok(DiscreteFullConformalSet {
+        members,
+        candidates: out,
+        alpha,
+        n_augmented,
+        lower_tail_unresolved,
+        upper_tail_unresolved,
+    })
+}
+
 /// Layer-3 certificate verdict for the frozen-ρ shortcut. Produced by
 /// comparing the integrated ρ-excursion bound against the exact engine's
 /// `boundary_margin` (see module doc). `Certified` means the frozen-ρ set
@@ -570,5 +761,168 @@ mod tests {
 
         // Margin must be a positive finite diagnostic when boundaries exist.
         assert!(set.boundary_margin >= 0.0);
+    }
+
+    /// Scalar penalized intercept-only logistic fit on augmented Bernoulli
+    /// data: maximize `Σ_{n+1 rows} [y η − log(1+eʸ)] − ½λη²` by Newton.
+    /// The map is symmetric BY CONSTRUCTION (it sees the responses only
+    /// through their sum over the n+1 exchangeable rows), so it satisfies
+    /// the `SymmetricAugmentedFit` contract exactly — making the coverage
+    /// theorem checkable by enumeration below.
+    fn bernoulli_intercept_scores(train: &[f64], z: f64, lambda: f64) -> Array1<f64> {
+        let n1 = train.len() + 1;
+        let sum_y: f64 = train.iter().sum::<f64>() + z;
+        let mut eta = 0.0_f64;
+        for _ in 0..200 {
+            let mu = 1.0 / (1.0 + (-eta).exp());
+            let g = sum_y - (n1 as f64) * mu - lambda * eta;
+            let h = -(n1 as f64) * mu * (1.0 - mu) - lambda;
+            let step = g / h;
+            eta -= step;
+            if step.abs() < 1e-14 {
+                break;
+            }
+        }
+        let mu = 1.0 / (1.0 + (-eta).exp());
+        let mut scores = Array1::<f64>::zeros(n1);
+        for (i, &yi) in train.iter().enumerate() {
+            scores[i] = (yi - mu).abs();
+        }
+        scores[n1 - 1] = (z - mu).abs();
+        scores
+    }
+
+    /// Finite-sample validity as a THEOREM CHECK, not a simulation: for the
+    /// intercept-only penalized-logistic map above, enumerate EVERY Bernoulli
+    /// training dataset (2ⁿ of them) and both test outcomes, and compute the
+    /// exact coverage probability `P(y_* ∈ C_α)` under iid Bernoulli(θ).
+    /// Full conformal guarantees ≥ 1 − α for every θ and every α — if the
+    /// rank convention, the p-value denominator, or the tie handling were
+    /// wrong by even one unit, some (θ, α) cell here would dip below the
+    /// bound. Also pins informativeness: the set is not the trivial {0, 1}
+    /// on every dataset (an always-trivial set would satisfy coverage
+    /// vacuously).
+    #[test]
+    fn bernoulli_full_conformal_exact_coverage_by_total_enumeration() {
+        let n = 7usize;
+        let lambda = 0.5_f64;
+        for &theta in &[0.2_f64, 0.5, 0.8] {
+            for &alpha in &[0.10_f64, 0.25] {
+                let mut coverage = 0.0_f64;
+                let mut any_strict_subset = false;
+                for mask in 0u32..(1u32 << n) {
+                    let train: Vec<f64> =
+                        (0..n).map(|i| f64::from((mask >> i) & 1)).collect();
+                    let p_train: f64 = train
+                        .iter()
+                        .map(|&y| if y > 0.5 { theta } else { 1.0 - theta })
+                        .product();
+                    let mut map =
+                        |z: f64| -> Result<Array1<f64>, String> {
+                            Ok(bernoulli_intercept_scores(&train, z, lambda))
+                        };
+                    let set = bernoulli_full_conformal(&mut map, alpha).expect("bernoulli set");
+                    assert!(set.lower_tail_unresolved.is_none());
+                    assert!(set.upper_tail_unresolved.is_none());
+                    let holds_zero = set.members.contains(&0.0);
+                    let holds_one = set.members.contains(&1.0);
+                    if !(holds_zero && holds_one) {
+                        any_strict_subset = true;
+                    }
+                    coverage += p_train
+                        * ((1.0 - theta) * f64::from(u8::from(holds_zero))
+                            + theta * f64::from(u8::from(holds_one)));
+                }
+                assert!(
+                    coverage >= 1.0 - alpha - 1e-12,
+                    "exact full-conformal coverage must be ≥ 1−α for every θ: \
+                     θ={theta} α={alpha} coverage={coverage}"
+                );
+                if alpha == 0.25 {
+                    assert!(
+                        any_strict_subset,
+                        "θ={theta} α={alpha}: the set must be informative (a strict \
+                         subset of the support on at least one dataset), otherwise \
+                         the coverage bound is satisfied vacuously"
+                    );
+                }
+            }
+        }
+
+        // Concrete informativeness pin: an all-zeros training run at α=0.25
+        // must exclude z=1 — the augmented fit at z=1 has μ̂ ≈ 0.21, so the
+        // test row's score 1−μ̂ ≈ 0.79 strictly dominates every training
+        // score (≈ 0.21) and its p-value is 1/8 = 0.125 ≤ α.
+        let train = vec![0.0; n];
+        let mut map =
+            |z: f64| -> Result<Array1<f64>, String> { Ok(bernoulli_intercept_scores(&train, z, lambda)) };
+        let set = bernoulli_full_conformal(&mut map, 0.25).expect("set");
+        assert_eq!(
+            set.members,
+            vec![0.0],
+            "all-zeros training data at α=0.25 must yield the set {{0}}"
+        );
+    }
+
+    /// Windowed (count-style) enumeration: tail flags must report exactly
+    /// whether the window edge was retained — the honest alternative to
+    /// assuming the set cannot continue past an unexamined candidate.
+    #[test]
+    fn windowed_discrete_tail_flags_are_honest() {
+        // Score map: the augmented "fit" is the mean of the n+1 responses;
+        // scores are absolute deviations from it. Symmetric trivially.
+        let train = [3.0_f64, 4.0, 5.0, 4.0, 3.0, 5.0, 4.0];
+        let mut map = |z: f64| -> Result<Array1<f64>, String> {
+            let n1 = train.len() + 1;
+            let mean = (train.iter().sum::<f64>() + z) / n1 as f64;
+            let mut s = Array1::<f64>::zeros(n1);
+            for (i, &yi) in train.iter().enumerate() {
+                s[i] = (yi - mean).abs();
+            }
+            s[n1 - 1] = (z - mean).abs();
+            Ok(s)
+        };
+        let alpha = 0.2;
+
+        // Wide window: the set sits strictly inside, both edges excluded,
+        // both flags clear.
+        let wide: Vec<f64> = (0..=12).map(|k| k as f64).collect();
+        let set = discrete_full_conformal_window(&mut map, &wide, alpha).expect("wide");
+        assert!(!set.members.is_empty(), "wide window must retain the bulk");
+        assert!(set.lower_tail_unresolved.is_none());
+        assert!(set.upper_tail_unresolved.is_none());
+        let lo_member = *set.members.first().expect("non-empty");
+        let hi_member = *set.members.last().expect("non-empty");
+
+        // Window cut INSIDE the set: the corresponding flag must fire.
+        let cut: Vec<f64> = (0..=(hi_member as i64 - 1)).map(|k| k as f64).collect();
+        let cut_set = discrete_full_conformal_window(&mut map, &cut, alpha).expect("cut");
+        assert_eq!(
+            cut_set.upper_tail_unresolved,
+            Some(cut[cut.len() - 1]),
+            "a window whose top edge is retained must report the upper tail unresolved"
+        );
+        assert!(
+            lo_member > 0.0 || cut_set.lower_tail_unresolved.is_some(),
+            "lower flag must mirror the same contract"
+        );
+
+        // Exhaustive constructor clears flags by definition.
+        let exhaustive =
+            discrete_full_conformal_exhaustive(&mut map, &wide, alpha).expect("exhaustive");
+        assert!(exhaustive.lower_tail_unresolved.is_none());
+        assert!(exhaustive.upper_tail_unresolved.is_none());
+
+        // Engine contract errors: unsorted candidates and shrinking score
+        // vectors are refused loudly.
+        assert!(discrete_full_conformal_window(&mut map, &[2.0, 1.0], alpha).is_err());
+        let mut bad_map = {
+            let mut flip = false;
+            move |_z: f64| -> Result<Array1<f64>, String> {
+                flip = !flip;
+                Ok(Array1::<f64>::zeros(if flip { 5 } else { 4 }))
+            }
+        };
+        assert!(discrete_full_conformal_window(&mut bad_map, &[0.0, 1.0], alpha).is_err());
     }
 }
