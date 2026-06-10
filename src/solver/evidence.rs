@@ -2838,11 +2838,12 @@ mod tests {
         let mut dg = Array2::<f64>::zeros((4, 1));
         dg[[0, 0]] = 0.9;
         dg[[1, 0]] = -0.4;
-        let supports = [0..2usize];
+        let support_range = 0..2usize;
+        let supports = std::slice::from_ref(&support_range);
 
         let eye: Array2<f64> = Array2::eye(4);
         let coned = crate::solver::sensitivity::FitSensitivity::from_projected(&eye, &inv)
-            .mode_response_coned(h.view(), dg.view(), &supports)
+            .mode_response_coned(h.view(), dg.view(), supports)
             .unwrap();
         // Exact reference: -H⁻¹ q. Off-block entries are exactly zero already
         // (decoupled inverse), and the cone must preserve the in-block ones.
@@ -2865,7 +2866,9 @@ mod tests {
     fn coned_skips_inactive_column_with_empty_support() {
         let h = Array2::<f64>::eye(2);
         let dg = Array2::<f64>::zeros((2, 1));
-        let supports = [0..0usize]; // inactive ρ
+        // Inactive ρ: empty support, must be skipped without solving.
+        let empty_support = 0..0usize;
+        let supports = std::slice::from_ref(&empty_support);
         // A NaN inverse: an empty-support column must be skipped WITHOUT
         // solving, so the operator's finite-check never sees the NaN and the
         // result is `Some(zeros)`. Were the inactive column ever solved, the
@@ -2873,7 +2876,7 @@ mod tests {
         let eye: Array2<f64> = Array2::eye(2);
         let nan_inv = Array2::<f64>::from_elem((2, 2), f64::NAN);
         let coned = crate::solver::sensitivity::FitSensitivity::from_projected(&eye, &nan_inv)
-            .mode_response_coned(h.view(), dg.view(), &supports)
+            .mode_response_coned(h.view(), dg.view(), supports)
             .unwrap();
         assert_eq!(coned[[0, 0]], 0.0);
         assert_eq!(coned[[1, 0]], 0.0);

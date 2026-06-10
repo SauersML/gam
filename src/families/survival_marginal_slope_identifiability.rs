@@ -2418,12 +2418,13 @@ mod tests {
 
     #[test]
     fn extract_term_partition_simple_cases() {
+        let full = 0..5usize;
         // No penalties: whole block is one term.
         let part = extract_term_partition_from_penalty_ranges(5, &[]);
-        assert_eq!(part, [0..5].to_vec());
+        assert_eq!(part.as_slice(), std::slice::from_ref(&full));
         // One penalty covering the whole block.
-        let part = extract_term_partition_from_penalty_ranges(5, &[0..5]);
-        assert_eq!(part, [0..5].to_vec());
+        let part = extract_term_partition_from_penalty_ranges(5, std::slice::from_ref(&full));
+        assert_eq!(part.as_slice(), std::slice::from_ref(&full));
         // Two penalties with a gap: produces three terms (pen1, gap, pen2).
         let part = extract_term_partition_from_penalty_ranges(10, &[0..3, 6..10]);
         assert_eq!(part, vec![0..3, 3..6, 6..10]);
@@ -2462,10 +2463,11 @@ mod tests {
         // Single-term partition, identity V → pullback returns input.
         let v_term = Array2::<f64>::eye(3);
         let v_per_term = vec![v_term];
-        let partition = [0..3];
+        let term_range = 0..3usize;
+        let partition = std::slice::from_ref(&term_range);
         let local = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| (i + j) as f64);
         let pen = BlockwisePenalty::new(0..3, local.clone());
-        let out = pull_back_blockwise_penalty_per_term(&pen, &partition, &v_per_term)
+        let out = pull_back_blockwise_penalty_per_term(&pen, partition, &v_per_term)
             .expect("identity-V pullback must succeed");
         assert_eq!(out.col_range, 0..3);
         for i in 0..3 {
@@ -2483,10 +2485,11 @@ mod tests {
         let mut v_term = Array2::<f64>::zeros((3, 2));
         v_term[[1, 0]] = 1.0;
         v_term[[2, 1]] = 1.0;
-        let partition = [0..3];
+        let term_range = 0..3usize;
+        let partition = std::slice::from_ref(&term_range);
         let local = Array2::<f64>::from_shape_fn((3, 3), |(i, j)| (i + j + 1) as f64);
         let pen = BlockwisePenalty::new(0..3, local.clone());
-        let out = pull_back_blockwise_penalty_per_term(&pen, &partition, &[v_term])
+        let out = pull_back_blockwise_penalty_per_term(&pen, partition, &[v_term])
             .expect("selection-V pullback must succeed");
         assert_eq!(out.col_range, 0..2);
         // Expected: pullback is the (1..3, 1..3) sub-block of the
@@ -2751,10 +2754,13 @@ mod tests {
 
     #[test]
     fn validate_partition_rejects_bad_partitions() {
+        let bad_start = 1..5usize;
+        let short_cover = 0..3usize;
+        let full_cover = 0..5usize;
         // Doesn't start at 0.
-        assert!(validate_partition(&[1..5], 5, "test").is_err());
+        assert!(validate_partition(std::slice::from_ref(&bad_start), 5, "test").is_err());
         // Doesn't cover the block.
-        assert!(validate_partition(&[0..3], 5, "test").is_err());
+        assert!(validate_partition(std::slice::from_ref(&short_cover), 5, "test").is_err());
         // Has a gap.
         assert!(validate_partition(&[0..2, 3..5], 5, "test").is_err());
         // Has overlap.
@@ -2765,7 +2771,7 @@ mod tests {
         assert!(validate_partition(&[], 0, "test").is_ok());
         // Valid partition.
         assert!(validate_partition(&[0..2, 2..5], 5, "test").is_ok());
-        assert!(validate_partition(&[0..5], 5, "test").is_ok());
+        assert!(validate_partition(std::slice::from_ref(&full_cover), 5, "test").is_ok());
     }
 
     /// Regression for #368: the phase-4b compiled-map penalty pullback must
