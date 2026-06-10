@@ -2149,75 +2149,6 @@ pub fn cone_of_influence(labels: &[usize], support: &[usize]) -> Vec<usize> {
         .collect()
 }
 
-/// Lazy/local cone-of-influence variant of [`ift_dbeta_drho_from_solver`]
-/// (#779). Each column `q_k = ∂g/∂ρ_k` of `dg_drho` is structurally
-/// supported only within one penalty block (`col_supports[k]` gives that
-/// block's coefficient range `[start, end)`), so the coefficient sensitivity
-/// `β_k = -H⁻¹ q_k` is nonzero only inside the coupling component containing
-/// that block.
-///
-/// This solves the full system as `ift_dbeta_drho_from_solver` does (the solve
-/// itself is delegated to the caller's factor and is not block-local — `β_k` is
-/// defined by the *full* joint `H⁻¹`), then **confines the result to the cone**:
-/// entries outside the moved block's coupling component are set to exactly zero.
-/// On a block-decoupled `H` the confined output bit-matches the structural
-/// support of the exact solution while eliminating cross-block numerical fill
-/// from the dense factor; on a fully coupled `H` the cone is the whole space and
-/// the result is identical to the non-coned solve. Columns with empty support
-/// are skipped entirely (left zero, no solve). The partition is computed once
-/// from `hessian` and shared across all columns.
-///
-/// `hessian` must be the same operator the `solve_beta_hessian` closure factors;
-/// a mismatch is rejected (returns `None`) rather than silently propagating a
-/// wrong locality assumption.
-pub(crate) fn ift_dbeta_drho_coned(
-    hessian: ArrayView2<'_, f64>,
-    dg_drho: ArrayView2<'_, f64>,
-    col_supports: &[std::ops::Range<usize>],
-    mut solve_beta_hessian: impl FnMut(&Array1<f64>) -> Array1<f64>,
-) -> Option<Array2<f64>> {
-    let beta_dim = dg_drho.nrows();
-    let r = dg_drho.ncols();
-    if hessian.nrows() != beta_dim || hessian.ncols() != beta_dim || col_supports.len() != r {
-        return None;
-    }
-    let labels = coupling_components(hessian);
-    if labels.len() != beta_dim {
-        return None;
-    }
-
-    let mut out = Array2::<f64>::zeros((beta_dim, r));
-    let mut rhs = Array1::<f64>::zeros(beta_dim);
-    for a in 0..r {
-        let support_range = &col_supports[a];
-        // Materialize the support indices, clamped to the coefficient space.
-        let support: Vec<usize> = (support_range.start..support_range.end)
-            .filter(|idx| *idx < beta_dim)
-            .filter(|idx| dg_drho[[*idx, a]] != 0.0)
-            .collect();
-        let cone = cone_of_influence(&labels, &support);
-        if cone.is_empty() {
-            // Structurally inactive ρ_a: sensitivity is identically zero, no
-            // solve needed (lazy skip).
-            continue;
-        }
-        for row in 0..beta_dim {
-            rhs[row] = dg_drho[[row, a]];
-        }
-        let solved = solve_beta_hessian(&rhs);
-        if solved.len() != beta_dim || solved.iter().any(|value| !value.is_finite()) {
-            return None;
-        }
-        // Confine to the cone: entries outside the moved block's coupling
-        // component are exactly zero for an exact solve, so writing only the
-        // cone rows is the exact local sensitivity.
-        for &row in &cone {
-            out[[row, a]] = -solved[row];
-        }
-    }
-    Some(out)
-}
-
 /// Tier-2 IFT sensitivity `∂β*/∂ρ = -A⁻¹ ∂g_red/∂ρ` (proposal §2.4 /
 /// §7).
 ///
@@ -2868,11 +2799,11 @@ mod tests {
         let supports = vec![0..1usize, 2..3usize];
 
         let eye: Array2<f64> = Array2::eye(3);
-        let full = crate::solver::sensitivity::FitSensitivity::from_projected(&eye, &inv)
-            .mode_response(dg.view())
+        let op = crate::solver::sensitivity::FitSensitivity::from_projected(&eye, &inv);
+        let full = op.mode_response(dg.view()).unwrap();
+        let coned = op
+            .mode_response_coned(h.view(), dg.view(), &supports)
             .unwrap();
-        let coned =
-            ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| inv.dot(rhs)).unwrap();
         for i in 0..3 {
             for a in 0..2 {
                 assert!(
@@ -2908,8 +2839,10 @@ mod tests {
         dg[[1, 0]] = -0.4;
         let supports = [0..2usize];
 
-        let coned =
-            ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| inv.dot(rhs)).unwrap();
+        let eye: Array2<f64> = Array2::eye(4);
+        let coned = crate::solver::sensitivity::FitSensitivity::from_projected(&eye, &inv)
+            .mode_response_coned(h.view(), dg.view(), &supports)
+            .unwrap();
         // Exact reference: -H⁻¹ q. Off-block entries are exactly zero already
         // (decoupled inverse), and the cone must preserve the in-block ones.
         let q = dg.column(0).to_owned();
@@ -2932,13 +2865,15 @@ mod tests {
         let h = Array2::<f64>::eye(2);
         let dg = Array2::<f64>::zeros((2, 1));
         let supports = [0..0usize]; // inactive ρ
-        let coned = ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| {
-            // An empty-support column must be skipped without solving. If the
-            // solver is ever invoked it returns NaN, which the zero-assertions
-            // below would catch — so the closure observably uses its argument.
-            Array1::<f64>::from_elem(rhs.len(), f64::NAN)
-        })
-        .unwrap();
+        // A NaN inverse: an empty-support column must be skipped WITHOUT
+        // solving, so the operator's finite-check never sees the NaN and the
+        // result is `Some(zeros)`. Were the inactive column ever solved, the
+        // NaN would propagate and `mode_response_coned` would return `None`.
+        let eye: Array2<f64> = Array2::eye(2);
+        let nan_inv = Array2::<f64>::from_elem((2, 2), f64::NAN);
+        let coned = crate::solver::sensitivity::FitSensitivity::from_projected(&eye, &nan_inv)
+            .mode_response_coned(h.view(), dg.view(), &supports)
+            .unwrap();
         assert_eq!(coned[[0, 0]], 0.0);
         assert_eq!(coned[[1, 0]], 0.0);
     }

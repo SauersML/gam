@@ -112,8 +112,12 @@ impl<'a> FitSensitivity<'a> {
                 basis,
                 reduced_inverse,
             } => {
-                let reduced = basis.t().dot(rhs);
-                basis.dot(&reduced_inverse.dot(&reduced))
+                // `U · (M⁻¹ · (Uᵀ · a))` via faer SIMD contractions — the
+                // single spelling of the projected (rank-deficient LAML)
+                // inverse, shared with `PenaltySubspaceTrace`.
+                let proj = crate::linalg::faer_ndarray::fast_atv(basis, rhs);
+                let reduced = reduced_inverse.dot(&proj);
+                crate::linalg::faer_ndarray::fast_av(basis, &reduced)
             }
         }
     }
@@ -159,6 +163,78 @@ impl<'a> FitSensitivity<'a> {
             return None;
         }
         out.mapv_inplace(|value| -value);
+        Some(out)
+    }
+
+    /// Cone-of-influence mode response (#779), the lazy/local form of
+    /// [`Self::mode_response`]. Each perturbation column `∂g/∂t_a` is
+    /// structurally supported only within `col_supports[a]`, so its response
+    /// `−H⁻¹ ∂g/∂t_a` is exactly zero outside the coupling component of
+    /// `hessian` containing that support. Columns whose support is empty (a
+    /// structurally inactive channel) are skipped with no solve; the active
+    /// columns are solved as ONE batched block through [`Self::apply_multi`]
+    /// — strictly better than the per-column BLAS-2 loop this replaces — and
+    /// each result confined to its cone. On a fully coupled `hessian` every
+    /// cone is the whole space and the result equals [`Self::mode_response`]
+    /// bit-for-bit.
+    ///
+    /// `hessian` must be the same curvature this operator inverts; a
+    /// dimension mismatch (or any non-finite solved entry) returns `None`
+    /// rather than silently substituting an approximation.
+    pub fn mode_response_coned(
+        &self,
+        hessian: ArrayView2<'_, f64>,
+        dg_dt: ArrayView2<'_, f64>,
+        col_supports: &[std::ops::Range<usize>],
+    ) -> Option<Array2<f64>> {
+        let p = self.dim;
+        let r = dg_dt.ncols();
+        if dg_dt.nrows() != p
+            || hessian.nrows() != p
+            || hessian.ncols() != p
+            || col_supports.len() != r
+        {
+            return None;
+        }
+        let labels = crate::solver::evidence::coupling_components(hessian);
+        if labels.len() != p {
+            return None;
+        }
+
+        // Active columns + their cones; structurally inactive columns (empty
+        // support → empty cone) contribute an identically-zero sensitivity
+        // and are skipped entirely (no solve).
+        let mut active: Vec<(usize, Vec<usize>)> = Vec::new();
+        for a in 0..r {
+            let sr = &col_supports[a];
+            let support: Vec<usize> = (sr.start..sr.end)
+                .filter(|idx| *idx < p)
+                .filter(|idx| dg_dt[[*idx, a]] != 0.0)
+                .collect();
+            let cone = crate::solver::evidence::cone_of_influence(&labels, &support);
+            if !cone.is_empty() {
+                active.push((a, cone));
+            }
+        }
+
+        let mut out = Array2::<f64>::zeros((p, r));
+        if active.is_empty() {
+            return Some(out);
+        }
+        // One batched solve over only the active columns.
+        let mut rhs = Array2::<f64>::zeros((p, active.len()));
+        for (j, (a, _)) in active.iter().enumerate() {
+            rhs.column_mut(j).assign(&dg_dt.column(*a));
+        }
+        let solved = self.apply_multi(rhs.view());
+        if solved.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        for (j, (a, cone)) in active.iter().enumerate() {
+            for &row in cone {
+                out[[row, *a]] = -solved[[row, j]];
+            }
+        }
         Some(out)
     }
 
