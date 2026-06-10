@@ -9808,17 +9808,24 @@ fn matern_aniso_extended_radial_scalars(
             let e = (-a).exp();
             let phi = e;
             if r < 1e-14 {
-                // Collision: φ(r) = exp(−s r) has a cusp at r = 0, so
-                // q = φ'/r = −s exp(−s r)/r diverges to −∞. There is no
-                // finite limit; surface a `DegenerateAtCollision` rather
-                // than emit silent zero gradients/Hessians.
-                return Err(BasisError::DegenerateAtCollision {
-                    kernel: "Matérn ν = 1/2",
-                    dim: 0,
-                    m: 0.5,
-                    message: "exponential kernel φ(r) = exp(−s r) is not \
-                              differentiable at r = 0 (cusp); q = φ'/r → −∞",
-                });
+                // Center collision. φ(r) = exp(−s r) has a cusp at r = 0, so
+                // the radial scalars q = φ'/r and t = (φ'' − q)/r² diverge.
+                // But every consumer multiplies them by displacement factors
+                // that vanish identically at a coincident center:
+                //   * the design-matrix η-derivatives are q·s_a and t·s_a·s_b
+                //     (true value 0 — φ ≡ 1 there, independent of length scale);
+                //   * the operator-collocation gradient row is q·h_b (h_b = 0);
+                //   * the only term not pre-multiplied by a vanishing factor is
+                //     the D₂ operator diagonal q·w_b, which the *value* path
+                //     defines via the same convention — `phi_r_over_r = 0` for
+                //     ν = 1/2 in 1D (the 1D Laplacian Δφ = φ'' carries no φ'/r
+                //     term; see the base assembly below), and bails for d ≥ 2
+                //     (already rejected at term construction).
+                // Returning the convention-consistent zeros keeps the analytic
+                // κ-gradient in lockstep with its own value surface — mirroring
+                // the ν = 3/2 branch — rather than hard-erroring on a quantity
+                // that is multiplied away.
+                return Ok((phi, 0.0, 0.0, 0.0, 0.0));
             }
             let q = -s * e / r;
             let phi_rr = s * s * e;
