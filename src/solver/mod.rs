@@ -9,6 +9,7 @@ pub mod identifiability_audit;
 pub mod identifiability_canonical;
 pub mod inner_status;
 pub(crate) mod latent_cache;
+pub mod loop_guard;
 pub mod latent_inner;
 pub mod mixture_link;
 pub mod orthogonal_reparam;
