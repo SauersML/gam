@@ -15,7 +15,69 @@ use crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::types::{InverseLink, StandardLink};
 
-use super::MIN_PROB;
+/// Exact derivatives of the per-row binomial log-likelihood in μ-space,
+///   ℓ(μ) = y·ln μ + (1−y)·ln(1−μ),
+/// through fourth order, returned as `(ℓ', ℓ'', ℓ''', ℓ'''')`.
+///
+/// This is a pure function of the **raw, unclamped** probability `mu` and the
+/// observed proportion `y ∈ [0, 1]`. There is no flooring: the values are the
+/// exact derivatives of the loss the family actually evaluates. The closed
+/// forms are
+///   ℓ'    =  y/μ − (1−y)/(1−μ)
+///   ℓ''   = −y/μ² − (1−y)/(1−μ)²
+///   ℓ'''  =  2y/μ³ − 2(1−y)/(1−μ)³
+///   ℓ'''' = −6y/μ⁴ − 6(1−y)/(1−μ)⁴
+///
+/// Each half is split by its numerator (`y` and `1−y`) so that a saturated
+/// **compatible** observation — `y = 0` at any μ, or `y = 1` at any μ — cannot
+/// manufacture a `0/0 = NaN`: the dead half is forced to exactly zero, which is
+/// its true value (that branch of the likelihood is constant). Callers must
+/// have already screened `μ ∈ (0, 1)`; an incompatible saturated boundary
+/// (`y > 0` with `μ = 0`, or `y < 1` with `μ = 1`) is a genuine ±∞ and is the
+/// caller's responsibility (see the saturation guard in the `*_from_jet`
+/// consumers).
+#[inline]
+pub(super) fn binomial_loglik_mu_derivatives(y: f64, mu: f64) -> (f64, f64, f64, f64) {
+    // y-branch (numerator y): y/μ, −y/μ², 2y/μ³, −6y/μ⁴.
+    let (a1, a2, a3, a4) = if y == 0.0 {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let im = 1.0 / mu;
+        let y_im = y * im;
+        (
+            y_im,
+            -y_im * im,
+            2.0 * y_im * im * im,
+            -6.0 * y_im * im * im * im,
+        )
+    };
+    // (1−y)-branch (numerator z = 1−y): −z/(1−μ), −z/(1−μ)², −2z/(1−μ)³, −6z/(1−μ)⁴.
+    let z = 1.0 - y;
+    let (b1, b2, b3, b4) = if z == 0.0 {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        let io = 1.0 / (1.0 - mu);
+        let z_io = z * io;
+        (
+            -z_io,
+            -z_io * io,
+            -2.0 * z_io * io * io,
+            -6.0 * z_io * io * io * io,
+        )
+    };
+    (a1 + b1, a2 + b2, a3 + b3, a4 + b4)
+}
+
+/// True iff `mu` is strictly interior, i.e. the inverse link has NOT saturated
+/// past the representable range. When this is false the μ-space tower above has
+/// no finite f64 representation, but the q-space derivatives built on top of it
+/// have collapsed below precision (the inverse-link density `d1 = μ'` and its
+/// successors underflow at least as fast as μ reaches the boundary), so the
+/// honest q-space limit is zero — NOT a clipped-μ surrogate (issue #948).
+#[inline]
+fn binomial_mu_is_interior(mu: f64) -> bool {
+    mu > 0.0 && mu < 1.0
+}
 
 #[inline]
 pub(super) fn binomial_score_curvaturethird_from_jet(
@@ -31,22 +93,22 @@ pub(super) fn binomial_score_curvaturethird_from_jet(
     //   ell_i = m_i * [ y_i log(mu_i) + (1-y_i) log(1-mu_i) ],
     // where `weight = m_i` and `y` is the observed proportion in [0,1].
     //
-    // mu-space derivatives:
-    //   ellmu    = y/mu - (1-y)/(1-mu)
-    //   ellmumu  = -y/mu^2 - (1-y)/(1-mu)^2
-    //   ellmumum = 2y/mu^3 - 2(1-y)/(1-mu)^3
-    //
-    // q-jet using mu(q) derivatives d1=mu', d2=mu'', d3=mu''':
+    // q-jet using the EXACT mu-space derivatives (binomial_loglik_mu_derivatives)
+    // and the inverse-link mu(q) derivatives d1=mu', d2=mu'', d3=mu''':
     //   s = dell/dq   = ellmu * mu'
     //   c = d2ell/dq2 = ellmumu*(mu')^2 + ellmu*mu''
     //   t = d3ell/dq3 = ellmumum*(mu')^3 + 3*ellmumu*mu'*mu'' + ellmu*mu'''
     //
     // Returns (score_q, curvature_q, third_q) with curvature_q = -d2ell/dq2.
-    let m = mu;
-    let one_minus = 1.0 - m;
-    let ellmu = y / m - (1.0 - y) / one_minus;
-    let ellmumu = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
-    let ellmumum = 2.0 * y / (m * m * m) - 2.0 * (1.0 - y) / (one_minus * one_minus * one_minus);
+    //
+    // `mu` is the RAW inverse-link value (no flooring): the result is the exact
+    // derivative of the evaluated loss for every representable mu in (0,1). A
+    // saturated boundary mu collapses the q-space tower below precision, so we
+    // return zero there rather than a clipped surrogate (issue #948).
+    if weight == 0.0 || !binomial_mu_is_interior(mu) {
+        return (0.0, 0.0, 0.0);
+    }
+    let (ellmu, ellmumu, ellmumum, _) = binomial_loglik_mu_derivatives(y, mu);
 
     let score_q = weight * ellmu * d1;
     let d2ell_dq2 = weight * (ellmumu * d1 * d1 + ellmu * d2);
@@ -167,6 +229,32 @@ pub(super) fn binomial_neglog_q_fourth_derivative_probit_closed_form(
 // Reference: response.md Section 1a.
 // ---------------------------------------------------------------------------
 
+/// Stable logistic probability `p = σ(q)` and its variance `s = p(1−p)`, with
+/// NO flooring.
+///
+/// `p` uses the branched expit (avoids overflow of `e^{±q}`), and `s` is formed
+/// directly from the tail exponential as `s = t/(1+t)²` with `t = e^{−|q|}`,
+/// the cancellation-free spelling of `p(1−p)`:
+///   q ≥ 0: p = 1/(1+t),  1−p = t/(1+t)  ⇒  p(1−p) = t/(1+t)²
+///   q < 0: p = t/(1+t),  1−p = 1/(1+t)  ⇒  p(1−p) = t/(1+t)²
+/// This is exact across the whole range and underflows *gracefully to the true
+/// value 0* in the saturated tail — the Bernoulli curvature genuinely vanishes
+/// there. It is never recovered as `1 − p` after `p` has rounded to 1 (which
+/// would catastrophically cancel) nor floored to a surrogate (issue #948). At
+/// `q = 40`, `s ≈ e^{−40} ≈ 4.25e−18`, the true variance — not `1e−10`.
+#[inline]
+fn logit_probability_and_variance(q: f64) -> (f64, f64) {
+    if q >= 0.0 {
+        let t = (-q).exp();
+        let denom = 1.0 + t;
+        (1.0 / denom, t / (denom * denom))
+    } else {
+        let t = q.exp();
+        let denom = 1.0 + t;
+        (t / denom, t / (denom * denom))
+    }
+}
+
 #[inline]
 pub(super) fn binomial_neglog_q_derivatives_logit_closed_form(
     y: f64,
@@ -174,37 +262,16 @@ pub(super) fn binomial_neglog_q_derivatives_logit_closed_form(
     q: f64,
 ) -> (f64, f64, f64) {
     // Returns (m1, m2, m3) for F(q) = -w[y log G(q) + (1-y) log(1-G(q))]
-    // with G = logistic CDF.
+    // with G = logistic CDF. All three are exact derivatives of the evaluated
+    // softplus loss F(q) = w[(1-y)q + softplus(-q)]:
+    //   m1 = w(p - y),  m2 = ws,  m3 = ws(1 - 2p),  with s = p(1-p).
     if weight == 0.0 || !q.is_finite() {
         return (0.0, 0.0, 0.0);
     }
-    // Branched expit for numerical stability:
-    //   q >= 0: p = 1/(1+e^{-q}), avoids overflow in e^q
-    //   q < 0:  p = e^q/(1+e^q),  avoids overflow in e^{-q}
-    let p = if q >= 0.0 {
-        1.0 / (1.0 + (-q).exp())
-    } else {
-        let eq = q.exp();
-        eq / (1.0 + eq)
-    };
-    // Clamp `p` AND its complement `1 - p` separately so that the
-    // saturated-boundary product `p_var * one_minus_p_var` equals the
-    // mathematical `MIN_PROB · (1 − MIN_PROB)` exactly. Recomputing
-    // `1 - p_var` after clamping `p` would catastrophically cancel near the
-    // boundary (e.g. `1 - (1 − 1e-10)` yields `1.0000000827e-10`, not the
-    // intended `1e-10`), inflating the variance by ~8e-18 — small in
-    // absolute terms but enough to corrupt the Fisher information used by
-    // the GAMLSS exact-Newton step in the deep tail.
-    let p_var = p.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let one_minus_p_var = (1.0 - p).clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let s = p_var * one_minus_p_var;
-    // For extreme |q|, s settles at the clamped floor `MIN_PROB·(1−MIN_PROB)`
-    // — never below — so the second-order Newton block stays bounded away
-    // from zero curvature on saturated rows.
+    let (p, s) = logit_probability_and_variance(q);
 
     let m1 = weight * (p - y);
     let m2 = weight * s;
-    // m3 = ws(1 - 2p). Using the identity 1-2p = -tanh(q/2) for stability:
     let m3 = weight * s * (1.0 - 2.0 * p);
     (m1, m2, m3)
 }
@@ -226,18 +293,9 @@ pub(super) fn binomial_neglog_q_fourth_derivative_logit_closed_form(
     if weight == 0.0 || !q.is_finite() {
         return 0.0;
     }
-    let p = if q >= 0.0 {
-        1.0 / (1.0 + (-q).exp())
-    } else {
-        let eq = q.exp();
-        eq / (1.0 + eq)
-    };
-    // Same cancellation-free `p · (1 − p)` form as
-    // `binomial_neglog_q_derivatives_logit_closed_form` above — see the
-    // note there.
-    let p_var = p.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let one_minus_p_var = (1.0 - p).clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let s = p_var * one_minus_p_var;
+    // Exact `s = p(1-p)` via the cancellation-free tail form — see
+    // `logit_probability_and_variance`. m4 depends only on s.
+    let (_p, s) = logit_probability_and_variance(q);
     weight * s * (1.0 - 6.0 * s)
 }
 
@@ -396,11 +454,13 @@ pub(super) fn binomial_neglog_q_fourth_derivative_from_jet(
     d3: f64,
     d4: f64,
 ) -> f64 {
-    // Stability (Issue 5): floor μ inside divisions but allow the chain
-    // rule to propagate; non-finite inputs still short-circuit (the LM
-    // gain-ratio guard rejects non-finite candidate gradients).
+    // Exact m4 from the RAW inverse-link value (no flooring). A saturated
+    // boundary mu, or any non-finite jet input, collapses the q-space tower
+    // below precision, so we short-circuit to zero rather than a clipped
+    // surrogate (issue #948). Non-finite inputs short-circuiting also matches
+    // the LM gain-ratio guard, which rejects non-finite candidate gradients.
     if weight == 0.0
-        || !mu.is_finite()
+        || !binomial_mu_is_interior(mu)
         || !d1.is_finite()
         || !d2.is_finite()
         || !d3.is_finite()
@@ -408,12 +468,7 @@ pub(super) fn binomial_neglog_q_fourth_derivative_from_jet(
     {
         return 0.0;
     }
-    let m = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    let one_minus = 1.0 - m;
-    let ellmu = y / m - (1.0 - y) / one_minus;
-    let ellmumu = -y / (m * m) - (1.0 - y) / (one_minus * one_minus);
-    let ellmumum = 2.0 * y / (m * m * m) - 2.0 * (1.0 - y) / (one_minus * one_minus * one_minus);
-    let ellmumumum = -6.0 * y / m.powi(4) - 6.0 * (1.0 - y) / one_minus.powi(4);
+    let (ellmu, ellmumu, ellmumum, ellmumumum) = binomial_loglik_mu_derivatives(y, mu);
     let fourth_q = weight
         * (ellmumumum * d1.powi(4)
             + 6.0 * ellmumum * d1 * d1 * d2
