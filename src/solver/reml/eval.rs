@@ -367,39 +367,23 @@ pub(crate) fn accumulate_sigma_cubature_total_covariance(
 pub static SMOOTHING_CORRECTION_CUBATURE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 impl<'a> RemlState<'a> {
-    /// Compute first and second derivatives of the exact pseudo-logdet
-    /// log|S|₊ with respect to ρ.
+    /// Compute the pseudo-logdet `log|Σ λ_k S_k|₊`, its rank, and its first and
+    /// second derivatives with respect to ρ — all from one eigendecomposition.
     ///
-    /// Uses eigendecomposition to identify the positive eigenspace, then
-    /// computes exact derivatives on that subspace:
+    /// On the positive eigenspace of `Σ λ_k S_k`:
     ///
     ///   ∂_k L = tr(S⁺ Aₖ)
     ///   ∂²_kl L = δ_{kl} ∂_k L − λₖ λₗ tr(S⁺ Sₖ S⁺ Sₗ)
     ///
-    /// where Aₖ = λₖ Sₖ and S⁺ is the pseudoinverse on the positive eigenspace.
-    pub(super) fn structural_penalty_logdet_derivatives(
-        &self,
-        rs_transformed: &[Array2<f64>],
-        lambdas: &Array1<f64>,
-        ridge: f64,
-    ) -> Result<(Array1<f64>, Array2<f64>), EstimationError> {
-        let (_, _, det1, det2) =
-            self.structural_penalty_logdet_value_and_derivatives(rs_transformed, lambdas, ridge)?;
-        Ok((det1, det2))
-    }
-
-    /// Same as [`structural_penalty_logdet_derivatives`] but also returns the
-    /// pseudo-logdet VALUE and rank from the SAME [`PenaltyPseudologdet`] the
-    /// derivatives are taken on.
+    /// where Aₖ = λₖ Sₖ and S⁺ is the pseudoinverse on that eigenspace.
     ///
-    /// The value `log|Σ λ_k S_k|₊` and its ρ-derivatives `λ_k tr(S⁺ S_k)` must
-    /// range over the SAME positive eigenspace, or the analytic gradient
-    /// differentiates a different function than the cost reports (the
-    /// objective↔gradient desync class). Sourcing both from one
-    /// eigendecomposition is the structural cure — the rank convention
-    /// (eigenvalue-threshold over `Σ λ_k S_k + ridge·I`) is identical on both
-    /// sides by construction (#901: a separate structural-rank value path
-    /// desynced the GLM ρ-gradient against FD).
+    /// The value `log|Σ λ_k S_k|₊` and its ρ-derivatives must range over the
+    /// SAME positive eigenspace, or the analytic gradient differentiates a
+    /// different function than the cost reports (the objective↔gradient desync
+    /// class). Sourcing both from one [`PenaltyPseudologdet`] is the structural
+    /// cure — the rank convention (eigenvalue-threshold over `Σ λ_k S_k +
+    /// ridge·I`) is identical on both sides by construction (#901: a separate
+    /// structural-rank value path desynced the GLM ρ-gradient against FD).
     pub(super) fn structural_penalty_logdet_value_and_derivatives(
         &self,
         rs_transformed: &[Array2<f64>],
