@@ -9978,11 +9978,16 @@ fn compute_outer_hessian(
     //   - Ḣₖ (first derivative of H) is needed for cross-trace Y_k = H⁻¹ Ḣₖ
     //   - Aₖ (penalty derivative only) is needed for the Ḧ_{kl} base and for
     //     the second implicit derivative β_{kl} = H⁻¹(Ḣₗ vₖ + Aₖ vₗ − δₖₗ Aₖ β̂)
-    let mut a_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
+    //
+    // `a_k_matrices[idx]` holds the *pure* Aₖ only when it differs from Ḣₖ, i.e.
+    // when a correction was applied to that coordinate; otherwise it is `None`
+    // and the diagonal base term reuses `h_k_matrices[idx]` directly. This drops
+    // the per-coordinate Aₖ clone (issue #922) in the common no-correction
+    // (Gaussian) path where Aₖ ≡ Ḣₖ.
+    let mut a_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
     let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
     for idx in 0..k {
         let mut a_k = solution.penalty_coords[idx].scaled_dense_matrix(curvature_lambdas[idx]);
-        a_k_matrices.push(a_k.clone());
 
         let correction: Option<Array2<f64>> = match workspace {
             Some(ws) => match ws.coord_corrections[idx].as_ref() {
@@ -10005,7 +10010,10 @@ fn compute_outer_hessian(
             }
         };
         if let Some(corr) = correction {
+            a_k_matrices.push(Some(a_k.clone()));
             a_k += &corr;
+        } else {
+            a_k_matrices.push(None);
         }
         h_k_matrices.push(a_k);
     }
@@ -10173,13 +10181,16 @@ fn compute_outer_hessian(
     // The outer Hessian uses -tr(H^{-1} Hj H^{-1} Hi) = -(this value).
     let stochastic_cross_traces: Option<Array2<f64>> = if use_stochastic_cross_traces {
         let total_coords = k + ext_dim;
-        let mut dense_mats: Vec<Array2<f64>> = Vec::new();
+        // Borrow the rho-coordinate Ḣₖ drifts and the dense ext drifts directly
+        // — the estimator only ever reads them, so the previous per-coordinate
+        // clones (issue #922) were pure copies of `h_k_matrices` / `ext_h_drifts`.
+        let mut dense_mats: Vec<&Array2<f64>> = Vec::new();
         let mut coord_has_operator: Vec<bool> = Vec::with_capacity(total_coords);
         let mut operator_arcs: Vec<Arc<dyn HyperOperator>> = Vec::new();
 
         // rho coordinates: always dense.
-        for idx in 0..k {
-            dense_mats.push(h_k_matrices[idx].clone());
+        for h_k in h_k_matrices.iter().take(k) {
+            dense_mats.push(h_k);
             coord_has_operator.push(false);
         }
 
@@ -10189,7 +10200,7 @@ fn compute_outer_hessian(
         for drift in &ext_h_drifts {
             match drift {
                 DriftDerivResult::Dense(matrix) => {
-                    dense_mats.push(matrix.clone());
+                    dense_mats.push(matrix);
                     coord_has_operator.push(false);
                 }
                 DriftDerivResult::Operator(operator) => {
@@ -14324,6 +14335,17 @@ impl HessianOperator for DenseSpectralOperator {
         if n == 0 || p == 0 || rank == 0 {
             return h;
         }
+        // Issue #922: offload this n-dependent pass to the device pool when a
+        // GPU was probed and n·p² clears the dispatch floor. The result is the
+        // same f64 arithmetic (X·G then row-wise ‖·‖²), just relocated across
+        // every device via `scatter_batched`; any failure falls through to the
+        // faer CPU stream below so the REML criterion is byte-for-byte
+        // unchanged on machines without a GPU.
+        if let Some(gpu) =
+            crate::gpu::linalg::try_fast_spectral_leverage_diagonal(x, self.g_factor.view())
+        {
+            return gpu;
+        }
         let chunk_rows = byte_balanced_row_chunk(p + rank, n);
         let mut start = 0usize;
         while start < n {
@@ -17196,7 +17218,7 @@ fn stochastic_trace_hinv_crosses<'a>(
 
 fn stochastic_trace_hinv_crosses_with_floor<'a>(
     hop: &dyn HessianOperator,
-    dense_matrices: &'a [Array2<f64>],
+    dense_matrices: &[&'a Array2<f64>],
     coord_has_operator: &[bool],
     generic_ops: &[&'a dyn HyperOperator],
     implicit_ops: &[&'a ImplicitHyperOperator],
@@ -17210,11 +17232,10 @@ fn stochastic_trace_hinv_crosses_with_floor<'a>(
         ),
         None => StochasticTraceEstimator::for_outer_hessian(hop.dim(), coord_has_operator.len()),
     };
-    let dense_refs: Vec<&Array2<f64>> = dense_matrices.iter().collect();
     let raw_cross = if generic_ops.len() == implicit_ops.len() {
-        estimator.estimate_second_order_traces(hop, &dense_refs, implicit_ops)
+        estimator.estimate_second_order_traces(hop, dense_matrices, implicit_ops)
     } else {
-        estimator.estimate_second_order_traces_with_operators(hop, &dense_refs, generic_ops)
+        estimator.estimate_second_order_traces_with_operators(hop, dense_matrices, generic_ops)
     };
 
     let total_coords = coord_has_operator.len();

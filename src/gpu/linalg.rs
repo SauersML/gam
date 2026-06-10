@@ -458,6 +458,107 @@ pub fn try_fast_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Opt
     }
 }
 
+/// Number of row-chunks to carve per device for the spectral leverage stream
+/// so [`super::pool::balanced_partition`] can keep every GPU busy. With fewer
+/// chunks than devices the pool would idle the surplus devices; oversubscribing
+/// modestly amortizes the per-tile launch without bloating staging memory.
+/// Magic-by-default; no flag.
+#[cfg(target_os = "linux")]
+const LEVERAGE_CHUNKS_PER_DEVICE: usize = 4;
+
+/// Byte-balanced row-chunk width for the spectral leverage stream, mirroring
+/// the CPU `byte_balanced_row_chunk` sizing (≈8 MiB live blocks) so a single
+/// tile's `(chunk × p)` row slice plus `(chunk × rank)` GEMM output stay within
+/// the per-device staging budget.
+#[cfg(target_os = "linux")]
+#[inline]
+fn leverage_chunk_rows(cols: usize, n_rows: usize) -> usize {
+    const TARGET_BYTES: usize = 8 * 1024 * 1024;
+    const MIN_CHUNK_ROWS: usize = 512;
+    let bytes_per_row = cols.max(1) * std::mem::size_of::<f64>();
+    (TARGET_BYTES / bytes_per_row)
+        .max(MIN_CHUNK_ROWS)
+        .min(n_rows.max(1))
+}
+
+/// GPU-offloaded spectral leverage diagonal `h[i] = ‖(X G)_{i,:}‖²`.
+///
+/// `G` is the `(p × rank)` spectral factor with `G_ε(H) = G Gᵀ`; the per-row
+/// leverage is the squared norm of the i-th row of `X G`. This is the dominant
+/// n-dependent cost of every REML outer evaluation at biobank scale (issue
+/// #922), and historically ran only on the CPU while the device pool idled.
+///
+/// The row dimension is split into byte-balanced chunks scattered across the
+/// whole device pool via [`super::pool::scatter_batched`] — the same
+/// whole-solve row-block granularity as Arrow-Schur — and each tile runs one
+/// cuBLAS GEMM `X_chunk · G` on its bound ordinal before reducing row-wise
+/// sum-of-squares. The arithmetic is identical f64 to the CPU faer path (modulo
+/// IEEE-754 reduction order); on no device, a below-threshold shape, or any
+/// tile failure the function returns `None` and the caller runs its
+/// deterministic CPU stream.
+#[inline]
+#[must_use]
+pub fn try_fast_spectral_leverage_diagonal(
+    x: &crate::linalg::matrix::DesignMatrix,
+    g: ArrayView2<'_, f64>,
+) -> Option<Array1<f64>> {
+    let n = x.nrows();
+    let p = x.ncols();
+    let rank = g.ncols();
+    if n == 0 || p == 0 || rank == 0 || g.nrows() != p {
+        return None;
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        return None;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // n·p² gate is shared with the X^T diag(w) X reduction — the leverage
+        // diagonal is the same O(n·p·rank)-class dense pass over the design.
+        let runtime = route_through_gpu(DispatchOp::XtDiagX { n, p })?;
+        let device_count = runtime.device_count().max(1);
+        let byte_chunk = leverage_chunk_rows(p + rank, n);
+        let target_chunks = device_count
+            .saturating_mul(LEVERAGE_CHUNKS_PER_DEVICE)
+            .max(1);
+        let chunk_rows = byte_chunk.min(n.div_ceil(target_chunks).max(1)).max(1);
+
+        // One slot per row-chunk; the slot carries its row range and receives
+        // its own output buffer so each tile owns disjoint memory.
+        let mut tiles: Vec<(std::ops::Range<usize>, Option<Array1<f64>>)> = Vec::new();
+        let mut start = 0usize;
+        while start < n {
+            let end = (start + chunk_rows).min(n);
+            tiles.push((start..end, None));
+            start = end;
+        }
+
+        super::pool::scatter_batched(runtime, &mut tiles, |ordinal, tile| {
+            for (range, slot) in tile.iter_mut() {
+                let rows = x.try_row_chunk(range.clone()).ok()?;
+                let xg = cuda_backend::gemm_on_ordinal(ordinal, rows.view(), g, false, false)?;
+                let mut out = Array1::<f64>::zeros(range.end - range.start);
+                for (local, row) in xg.outer_iter().enumerate() {
+                    out[local] = row.iter().map(|&v| v * v).sum();
+                }
+                *slot = Some(out);
+            }
+            Some(())
+        })?;
+
+        let mut h = Array1::<f64>::zeros(n);
+        for (range, slot) in tiles {
+            let vals = slot?;
+            if vals.len() != range.end - range.start {
+                return None;
+            }
+            h.slice_mut(ndarray::s![range]).assign(&vals);
+        }
+        Some(h)
+    }
+}
+
 #[inline]
 #[must_use]
 pub fn try_fast_xt_diag_y(

@@ -183,6 +183,17 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// is `latent_z_rank_int_calibration` — Agent D's persistence
     /// pipeline reads it under that exact identifier.
     pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    /// Optional conditional location-scale calibration of the latent score
+    /// (#905). `Some(_)` ⇒ the Auto path's conditional `E[z|C]`/`Var(z|C)` Rao
+    /// gate detected PC/ancestry-dependence that the pooled-marginal gate
+    /// cannot see, so the training z was replaced in place by
+    /// `ζ = (z − m(C))/√v(C)` (via [`LatentZConditionalCalibration::apply`])
+    /// before any downstream consumer saw it. Mutually exclusive with
+    /// `latent_z_rank_int_calibration`: rank-INT fixes a pooled-marginal
+    /// defect, the conditional correction fixes a conditional-shift defect that
+    /// rank-INT provably cannot. Persisted so prediction rebuilds `a(C)` from
+    /// the (reproducible) marginal design and applies the identical map.
+    pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +233,26 @@ const AUTO_Z_NORMAL_TAIL_FLOOR_INNER: f64 = 1e-5;
 /// Absolute additive floor on the outer-σ tail comparison; smaller than the
 /// inner floor because the 6σ Gaussian tail is many orders smaller than 4σ.
 const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
+/// Significance level for the conditional `E[z|C]` / `Var(z|C)` Rao gate in the
+/// core Auto path (#905). When the latent score's conditional mean or variance
+/// on the marginal-index span `a(C)` is significant at this level, the Auto
+/// path escalates from the pooled-marginal rank-INT to a conditional
+/// location-scale correction. Chosen small (0.1%) so the escalation fires only
+/// on clear conditional structure, not finite-sample noise — the gate runs once
+/// over the whole training sample, so a per-test α this tight still has ample
+/// power against the ancestry mean-shift the issue names.
+const AUTO_Z_CONDITIONAL_RAO_ALPHA: f64 = 1.0e-3;
+/// Relative ridge added to the weighted normal equations when regressing the
+/// latent score on the marginal-index span for the conditional correction.
+/// Stabilizes the solve when `a(C)` is rank-deficient or collinear (penalized
+/// spline marginal indices routinely are) without materially biasing the
+/// conditional mean/variance fit.
+const AUTO_Z_CONDITIONAL_RIDGE_REL: f64 = 1.0e-8;
+/// Floor on the fitted conditional variance `v(C)`, as a fraction of the global
+/// weighted variance of the latent score. Keeps `ζ = (z−m)/√v` finite and
+/// well-scaled where the linear variance model would otherwise fit a
+/// non-positive or vanishing conditional variance.
+const AUTO_Z_CONDITIONAL_VAR_FLOOR_FRAC: f64 = 1.0e-3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LatentMeasureSpec {
