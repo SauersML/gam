@@ -4076,33 +4076,40 @@ impl LinearFitConditioning {
         out
     }
 
-    fn transform_matrix_columnswith_b(&self, mat: &Array2<f64>) -> Array2<f64> {
-        let mut out = mat.clone();
+    /// Left-multiply `mat_internal` by `M⁻ᵀ` where `M⁻¹[intercept, j] = mean_j`
+    /// and `M⁻¹[j, j] = scale_j` for each conditioned column. Used together
+    /// with [`Self::right_multiply_by_m_inv`] to back-transform an internal
+    /// penalized Hessian to the original coefficient basis.
+    fn left_multiply_by_m_inv_transpose(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
         let intercept = self.intercept_idx;
+        let interceptrow_snapshot = mat_internal.row(intercept).to_owned();
         for col in &self.columns {
-            let intercept_col = out.column(intercept).to_owned();
-            let mut target = out.column_mut(col.col_idx);
-            if col.mean != 0.0 {
-                target += &(intercept_col * col.mean);
-            }
             if col.scale != 1.0 {
-                target.mapv_inplace(|v| v * col.scale);
+                out.row_mut(col.col_idx).mapv_inplace(|v| v * col.scale);
+            }
+            if col.mean != 0.0 {
+                let mut target = out.row_mut(col.col_idx);
+                target += &(&interceptrow_snapshot * col.mean);
             }
         }
         out
     }
 
-    fn transform_matrixrowswith_b_transpose(&self, mat: &Array2<f64>) -> Array2<f64> {
-        let mut out = mat.clone();
+    /// Right-multiply `mat_internal` by `M⁻¹`. Mirror of
+    /// [`Self::left_multiply_by_m_inv_transpose`] on columns.
+    fn right_multiply_by_m_inv(&self, mat_internal: &Array2<f64>) -> Array2<f64> {
+        let mut out = mat_internal.clone();
         let intercept = self.intercept_idx;
+        let intercept_col_snapshot = mat_internal.column(intercept).to_owned();
         for col in &self.columns {
-            let interceptrow = out.row(intercept).to_owned();
-            let mut target = out.row_mut(col.col_idx);
-            if col.mean != 0.0 {
-                target += &(interceptrow * col.mean);
-            }
             if col.scale != 1.0 {
-                target.mapv_inplace(|v| v * col.scale);
+                out.column_mut(col.col_idx)
+                    .mapv_inplace(|v| v * col.scale);
+            }
+            if col.mean != 0.0 {
+                let mut target = out.column_mut(col.col_idx);
+                target += &(&intercept_col_snapshot * col.mean);
             }
         }
         out
@@ -4152,9 +4159,11 @@ impl LinearFitConditioning {
         beta
     }
 
+    /// `H_orig = M⁻ᵀ · H_int · M⁻¹`, derived from
+    /// `L_int(β_int) = L_orig(M · β_int)` via the chain rule.
     fn transform_penalized_hessian_to_original(&self, h_internal: &Array2<f64>) -> Array2<f64> {
-        let right = self.transform_matrix_columnswith_b(h_internal);
-        self.transform_matrixrowswith_b_transpose(&right)
+        let right = self.right_multiply_by_m_inv(h_internal);
+        self.left_multiply_by_m_inv_transpose(&right)
     }
 
     fn internal_bounds_for(&self, col_idx: usize, min: f64, max: f64) -> (f64, f64) {
