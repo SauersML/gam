@@ -25024,6 +25024,9 @@ mod tests {
         )
         .expect("hyper dirs build")
         .expect("hyper dirs present");
+        // EIG-DECOMP stash capture is opt-in (production gradient evals skip
+        // the diagnostic's extra traces); hold the guard across the eval.
+        let _capture = crate::test_support::debug_stash::CaptureGuard::request();
         let (cost_at_zero, grad_at_zero, _hess) = evaluate_joint_reml_outer_eval_at_theta(
             &mut evaluator,
             cache.design(),
@@ -25295,6 +25298,9 @@ mod tests {
         )
         .expect("hyper dirs build")
         .expect("hyper dirs present");
+        // Opt in to EIG-DECOMP stash capture for this eval (production
+        // gradient evals skip the diagnostic's extra traces entirely).
+        let _capture = crate::test_support::debug_stash::CaptureGuard::request();
         let (analytic_cost, analytic_gradient, _) = evaluate_joint_reml_outer_eval_at_theta(
             &mut evaluator,
             cache.design(),
