@@ -3092,13 +3092,19 @@ def gaussian_reml_optimize_latent(
     basis exactly as in :func:`gaussian_reml_fit_latent`; the spectral seed is
     affinely mapped onto the span of ``centers`` so it lands where ``Φ`` is
     well-conditioned. The result also carries ``"grad_t_norm"``,
-    ``"grad_t_norm_scaled"``, ``"converged"``, ``"objective_value"``,
-    ``"n_restarts"``, and ``"init"`` diagnostics. ``"converged"`` is decided from
-    ``"grad_t_norm_scaled"`` -- the *scale-aware* (relative) latent-gradient
-    stationarity measure ``‖∇ₜ f‖ · ‖t‖_typ / max(|f|, 1)`` -- rather than the
-    raw ``"grad_t_norm"``, because the *profiled* Gaussian REML objective leaves
-    the raw gradient at an O(n) magnitude near interpolation (R²≈1) even at a
-    genuine stationary point.
+    ``"grad_t_norm_init"``, ``"grad_t_norm_scaled"``, ``"converged"``,
+    ``"objective_value"``, ``"n_restarts"``, and ``"init"`` diagnostics.
+    ``"converged"`` is decided from ``"grad_t_norm_scaled"`` -- the *relative*
+    latent-gradient stationarity measure
+    ``‖∇ₜ f(t̂)‖ / max(‖∇ₜ f(t₀)‖, 1)`` (``"grad_t_norm"`` divided by
+    ``max("grad_t_norm_init", 1)``) -- rather than the raw ``"grad_t_norm"``,
+    because the *profiled* Gaussian REML objective leaves the raw gradient at an
+    O(n) magnitude near interpolation (R²≈1) even at a genuine stationary point.
+    Anchoring to the gradient norm at the initial iterate ``t₀`` divides out that
+    common O(n)/multiplicative scale while staying invariant under an additive
+    shift ``f → f + C`` of the objective -- unlike the earlier
+    ``‖∇ₜ f‖ · ‖t‖_typ / max(|f|, 1)``, whose ``max(|f|, 1)`` denominator a large
+    additive constant could inflate into a false convergence (issue #954).
     """
     import numpy as np
 
