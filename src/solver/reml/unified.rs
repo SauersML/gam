@@ -19593,6 +19593,193 @@ mod tests {
         }
     }
 
+    /// #740: the operator built with a direction-contracted ψψ hook (which
+    /// SKIPS the per-pair ψψ `base_h2`/`pair_a`/`pair_ld_s`/`pair_g` assembly and
+    /// applies the hook once per matvec) must materialize to the SAME dense outer
+    /// Hessian as the exact per-pair `compute_outer_hessian` path. The hook here
+    /// returns precisely the `α`-contraction of the same constant ψψ
+    /// `HyperCoordPair` the per-pair `ext_coord_pair_fn` produces, so any
+    /// divergence is a bug in the operator's hook injection (zeroed tables, the
+    /// `pair_a`/`ld_s`/`base_h2` adds, or the `-score` rhs replacement), not in
+    /// the contraction math. This is the solver-side half of the #740 exactness
+    /// gate (the family-side half — contracted kernel == per-pair — lives in
+    /// `bernoulli_contracted_psi_second_order_matches_per_pair_contraction`).
+    #[test]
+    fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense() {
+        let h = array![[1.0e-7, 0.0], [0.0, 2.7]];
+        let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
+        let beta = array![0.4, -0.7];
+        let penalty_root = array![[1.2, 0.1], [0.0, 0.8]];
+        let ext_drift = array![[0.45, -0.15], [-0.15, 0.35]];
+        let x = array![[1.0, 0.2], [-0.4, 1.1], [0.7, -0.8]];
+        let c_array = array![0.31, -0.27, 0.19];
+        let d_array = array![0.17, -0.11, 0.23];
+
+        // The constant ψψ pair the per-pair `ext_coord_pair_fn` returns; the hook
+        // must reproduce its `α`-contraction exactly (ext_dim = 1, so the only
+        // ψψ pair is (0, 0)).
+        let psi_pair_a = 0.09_f64;
+        let psi_pair_g = array![0.16_f64, -0.12];
+        let psi_pair_b = array![[0.08_f64, 0.03], [0.03, -0.04]];
+        let psi_pair_ld_s = -0.05_f64;
+
+        // Build the solution twice from a shared closure so the per-pair fixture
+        // (used by the dense path) and the hook (used by the operator) draw from
+        // the SAME constant ψψ pair.
+        let build_solution = |with_hook: bool| {
+            let deriv_provider = SinglePredictorGlmDerivatives {
+                c_array: c_array.clone(),
+                d_array: Some(d_array.clone()),
+                hessian_weights: Array1::ones(3),
+                x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
+            };
+            let contracted_psi_second_order: Option<ContractedPsiSecondOrderFn> = if with_hook {
+                let g = psi_pair_g.clone();
+                let b = psi_pair_b.clone();
+                Some(Arc::new(move |alpha_psi: &[f64]| {
+                    let a0 = alpha_psi[0];
+                    Ok(Some(ContractedPsiSecondOrder {
+                        objective: array![a0 * psi_pair_a],
+                        score: {
+                            let mut s = Array2::<f64>::zeros((1, 2));
+                            s.row_mut(0).assign(&g.mapv(|v| a0 * v));
+                            s
+                        },
+                        hessian: vec![DriftDerivResult::Dense(b.mapv(|v| a0 * v))],
+                        ld_s: array![a0 * psi_pair_ld_s],
+                    }))
+                }) as ContractedPsiSecondOrderFn)
+            } else {
+                None
+            };
+            InnerSolution {
+                log_likelihood: -2.3,
+                penalty_quadratic: 0.6,
+                hessian_op: hop.clone(),
+                beta: beta.clone(),
+                penalty_coords: vec![PenaltyCoordinate::from_dense_root(penalty_root.clone())],
+                penalty_logdet: PenaltyLogdetDerivs {
+                    value: 0.0,
+                    first: array![0.4],
+                    second: Some(array![[0.13]]),
+                },
+                deriv_provider: Box::new(deriv_provider),
+                tk_correction: 0.0,
+                tk_gradient: None,
+                firth: None,
+                hessian_logdet_correction: 0.0,
+                penalty_subspace_trace: None,
+                rho_curvature_scale: 1.0,
+                rho_prior: crate::types::RhoPrior::Flat,
+                n_observations: 3,
+                nullspace_dim: 0.0,
+                gaussian_weight_log_sum_half: 0.0,
+                dispersion: DispersionHandling::Fixed {
+                    phi: 1.0,
+                    include_logdet_h: true,
+                    include_logdet_s: true,
+                },
+                ext_coords: vec![HyperCoord {
+                    a: -0.21,
+                    g: array![0.33, -0.42],
+                    drift: HyperCoordDrift::from_operator(Arc::new(DenseMatrixHyperOperator {
+                        matrix: ext_drift.clone(),
+                    })),
+                    ld_s: 0.07,
+                    b_depends_on_beta: false,
+                    is_penalty_like: false,
+                    firth_g: None,
+                    tk_eta_fixed: None,
+                    tk_x_fixed: None,
+                }],
+                ext_coord_pair_fn: Some(Box::new(move |_, _| HyperCoordPair {
+                    a: psi_pair_a,
+                    g: array![0.16, -0.12],
+                    b_mat: array![[0.08, 0.03], [0.03, -0.04]],
+                    b_operator: None,
+                    ld_s: psi_pair_ld_s,
+                })),
+                rho_ext_pair_fn: Some(Box::new(|_, _| HyperCoordPair {
+                    a: -0.14,
+                    g: array![-0.18, 0.22],
+                    b_mat: array![[0.05, -0.02], [-0.02, 0.07]],
+                    b_operator: None,
+                    ld_s: 0.04,
+                })),
+                fixed_drift_deriv: None,
+                contracted_psi_second_order,
+                barrier_config: None,
+                kkt_residual: None,
+                active_constraints: None,
+                stochastic_trace_state: Arc::new(Mutex::new(StochasticTraceState::default())),
+            }
+        };
+
+        let rho: Vec<f64> = vec![0.2_f64];
+        let lambdas: Vec<f64> = rho.iter().map(|value| value.exp()).collect();
+
+        // Per-pair dense path (no hook).
+        let dense_solution = build_solution(false);
+        let dense = compute_outer_hessian(
+            &dense_solution,
+            &rho,
+            &lambdas,
+            dense_solution.hessian_op.as_ref(),
+            dense_solution.deriv_provider.as_ref(),
+            None,
+        )
+        .unwrap();
+
+        // Operator path WITH the contracted hook (ψψ tables skipped at build,
+        // hook applied per matvec).
+        let hook_solution = build_solution(true);
+        let kernel = hook_solution
+            .deriv_provider
+            .outer_hessian_derivative_kernel()
+            .unwrap();
+        let operator = build_outer_hessian_operator(
+            &hook_solution,
+            &lambdas,
+            hook_solution.deriv_provider.as_ref(),
+            kernel,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // #740 pin: the operator must NOT advertise dense materialization, so the
+        // outer solver consumes it matrix-free (m CG matvecs) instead of
+        // re-paying K basis-column probes — the asymptotic win. A future edit
+        // flipping this to a cheap-to-materialize capability would silently
+        // re-introduce K-column densification and kill the win; this pin fails
+        // if that happens.
+        assert!(
+            matches!(
+                crate::solver::outer_strategy::OuterHessianOperator::materialization_capability(
+                    &operator
+                ),
+                crate::solver::outer_strategy::OuterHessianMaterialization::Unavailable
+            ),
+            "#740 operator must advertise Unavailable materialization to stay matrix-free"
+        );
+
+        let materialized =
+            crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
+                .unwrap();
+
+        for row in 0..dense.nrows() {
+            for col in 0..dense.ncols() {
+                let m = materialized[[row, col]];
+                let d = dense[[row, col]];
+                let tol = 1e-10_f64.max(1e-10 * d.abs());
+                assert!(
+                    (m - d).abs() <= tol,
+                    "#740 contracted-hook operator mismatch at ({row}, {col}): hook-operator={m}, per-pair-dense={d}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn subspace_projected_leverage_and_adjoint_shortcut_match_dense() {
         // Locks down both production identities used by the subspace
