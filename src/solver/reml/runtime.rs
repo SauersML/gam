@@ -2321,14 +2321,41 @@ impl<'a> RemlState<'a> {
         let logdet_s_start = std::time::Instant::now();
         let lambdas = rho.mapv(f64::exp);
         let ridge = ridge_passport.penalty_logdet_ridge();
-        let kron_logdet = self
-            .kronecker_penalty_system
-            .as_ref()
-            .filter(|kron| self.kronecker_factored.is_some() && kron.num_penalties() == rho.len())
-            .map(|kron| kron.logdet_rank_and_derivatives(lambdas.as_slice().unwrap(), ridge));
-        let (penalty_rank, log_det_s) = if let Some((logdet, rank, _, _)) = kron_logdet.as_ref() {
-            (*rank, *logdet)
+        // Value, rank, and ρ-derivatives of `log|Σ λ_k S_k|₊` ALL come from one
+        // [`PenaltyPseudologdet`] (one eigendecomposition, one positive
+        // eigenspace) so the analytic gradient differentiates exactly the value
+        // the cost reports. A previous split — value from the structural-rank
+        // `fixed_subspace_penalty_rank_and_logdet_from_subspace` (top-`rank`
+        // eigenvalues) but derivatives from the eigenvalue-thresholded
+        // `PenaltyPseudologdet` — let the two range over different eigenspaces
+        // whenever a penalty eigenvalue sat near the ridge/noise band, which
+        // sign-/scale-corrupted the GLM ρ-gradient against FD while the cost
+        // stayed FD-consistent (#901: the canonical-empty Gaussian path was
+        // immune because there BOTH value and derivative use the same
+        // threshold). The penalty logdet is orthogonal-invariant, so the
+        // original-basis canonical penalties give the same result as
+        // transformed-basis roots.
+        let (penalty_rank, log_det_s, det1, det2_full) = if let Some(ref kron) =
+            self.kronecker_penalty_system
+            && self.kronecker_factored.is_some()
+            && kron.num_penalties() == rho.len()
+        {
+            let (logdet, rank, det1, det2) =
+                kron.logdet_rank_and_derivatives(lambdas.as_slice().unwrap(), ridge);
+            (rank, logdet, det1, det2)
+        } else if !self.canonical_penalties.is_empty()
+            && self.canonical_penalties.len() == rho.len()
+        {
+            let (value, rank, det1, det2) =
+                self.structural_penalty_logdet_value_and_derivatives_block_local(&lambdas, ridge)?;
+            (rank, value, det1, det2)
+        } else if !penalty_roots.is_empty() {
+            let (value, rank, det1, det2) = self
+                .structural_penalty_logdet_value_and_derivatives(penalty_roots, &lambdas, ridge)?;
+            (rank, value, det1, det2)
         } else {
+            // No canonical penalties and no roots: fall back to the subspace
+            // eigensystem for value+rank (no derivative information available).
             let owned_subspace;
             let subspace = if let Some(penalty_subspace) = penalty_subspace {
                 penalty_subspace
@@ -2336,7 +2363,14 @@ impl<'a> RemlState<'a> {
                 owned_subspace = self.compute_penalty_subspace(e_for_logdet, ridge_passport)?;
                 &owned_subspace
             };
-            self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace)
+            let (rank, value) =
+                self.fixed_subspace_penalty_rank_and_logdet_from_subspace(subspace);
+            (
+                rank,
+                value,
+                Array1::zeros(rho.len()),
+                Array2::zeros((rho.len(), rho.len())),
+            )
         };
         log::info!(
             "[STAGE] logdet S rho_dim={} penalty_rank={} elapsed={:.3}s",
@@ -2344,25 +2378,6 @@ impl<'a> RemlState<'a> {
             penalty_rank,
             logdet_s_start.elapsed().as_secs_f64(),
         );
-
-        // Use block-local path from canonical penalties (basis-invariant logdet).
-        // The penalty logdet log|Σ λ_k S_k|₊ is invariant under orthogonal
-        // transformation, so the original-basis canonical penalties give the
-        // same result as transformed-basis roots.
-        let (det1, det2_full) = if let Some((_, _, det1, det2)) = kron_logdet {
-            (det1, det2)
-        } else if !self.canonical_penalties.is_empty()
-            && self.canonical_penalties.len() == rho.len()
-        {
-            self.structural_penalty_logdet_derivatives_block_local(&lambdas, ridge)?
-        } else if !penalty_roots.is_empty() {
-            self.structural_penalty_logdet_derivatives(penalty_roots, &lambdas, ridge)?
-        } else {
-            (
-                Array1::zeros(rho.len()),
-                Array2::zeros((rho.len(), rho.len())),
-            )
-        };
 
         let det2 = if mode == super::unified::EvalMode::ValueGradientHessian {
             Some(det2_full)
