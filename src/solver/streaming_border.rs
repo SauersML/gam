@@ -921,10 +921,15 @@ mod tests {
 
         let mut asm = ChunkAssembler::new(k, n, chunk_size).expect("assembler");
         // 7 rows: mid-chunk, no checkpoint available.
-        asm.push_rows(rows.slice(ndarray::s![0..7, ..])).expect("push");
-        assert!(asm.checkpoint().is_none(), "mid-chunk checkpoint must be None");
+        asm.push_rows(rows.slice(ndarray::s![0..7, ..]))
+            .expect("push");
+        assert!(
+            asm.checkpoint().is_none(),
+            "mid-chunk checkpoint must be None"
+        );
         // Up to row 30: exactly 3 chunks folded, boundary checkpoint.
-        asm.push_rows(rows.slice(ndarray::s![7..30, ..])).expect("push");
+        asm.push_rows(rows.slice(ndarray::s![7..30, ..]))
+            .expect("push");
         let cp = asm.checkpoint().expect("boundary checkpoint");
         assert_eq!(cp.frontier, 3);
         drop(asm);
@@ -944,7 +949,8 @@ mod tests {
         let rows = planted_rows(30, k);
         // Truncated: declared 30 rows, stream ends at 25 (mid-chunk).
         let mut asm = ChunkAssembler::new(k, 30, 8).expect("assembler");
-        asm.push_rows(rows.slice(ndarray::s![0..25, ..])).expect("push");
+        asm.push_rows(rows.slice(ndarray::s![0..25, ..]))
+            .expect("push");
         let err = asm.finish().expect_err("truncated stream must fail finish");
         assert!(err.contains("mid-chunk"), "got: {err}");
         // Overrun: more rows than declared.

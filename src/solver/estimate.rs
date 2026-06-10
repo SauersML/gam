@@ -7933,10 +7933,8 @@ mod estimate_policy_tests {
             // 3×3 inverse via cofactors — small enough to hand-roll.
             let det = h_int[[0, 0]]
                 * (h_int[[1, 1]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 1]])
-                - h_int[[0, 1]]
-                    * (h_int[[1, 0]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 0]])
-                + h_int[[0, 2]]
-                    * (h_int[[1, 0]] * h_int[[2, 1]] - h_int[[1, 1]] * h_int[[2, 0]]);
+                - h_int[[0, 1]] * (h_int[[1, 0]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 0]])
+                + h_int[[0, 2]] * (h_int[[1, 0]] * h_int[[2, 1]] - h_int[[1, 1]] * h_int[[2, 0]]);
             let mut inv = Array2::<f64>::zeros((3, 3));
             inv[[0, 0]] = (h_int[[1, 1]] * h_int[[2, 2]] - h_int[[1, 2]] * h_int[[2, 1]]) / det;
             inv[[0, 1]] = -(h_int[[0, 1]] * h_int[[2, 2]] - h_int[[0, 2]] * h_int[[2, 1]]) / det;

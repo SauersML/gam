@@ -90,8 +90,12 @@ fn sample_circle(seed: u64) -> Array2<f64> {
 }
 
 fn fit(data: &Array2<f64>) -> MixtureRungResult {
-    fit_mixture_rung(data.view(), MIXTURE_K_LADDER, GaussianMixtureConfig::default())
-        .expect("mixture rung must fit")
+    fit_mixture_rung(
+        data.view(),
+        MIXTURE_K_LADDER,
+        GaussianMixtureConfig::default(),
+    )
+    .expect("mixture rung must fit")
 }
 
 /// Assert the winner is BRACKETED: both immediate neighbours were fitted
@@ -146,7 +150,8 @@ fn off_ladder_truths_k4_and_k6_are_recovered_exactly() {
             let rung = fit(&data);
             let winner = rung.winner();
             assert_eq!(
-                winner.k, k_true,
+                winner.k,
+                k_true,
                 "k_true={k_true} seed={seed}: the refined rung must NAME the \
                  planted off-ladder order exactly (got k={}, fitted orders: {:?})",
                 winner.k,

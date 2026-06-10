@@ -115,12 +115,12 @@ use gam::types::{
 };
 use gam::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
-    DispersionLocationScaleFitRequest, FitRequest, FitResult,
-    GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
-    LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
-    SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
-    SurvivalTransformationFitRequest, TransformationNormalFitRequest, fit_model,
-    prepare_survival_time_stack, resolve_offset_column, resolve_weight_column,
+    DispersionLocationScaleFitRequest, FitRequest, FitResult, GaussianLocationScaleFitRequest,
+    LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, PreparedSurvivalTimeStack,
+    StandardBinomialWiggleConfig, StandardFitRequest, SurvivalLocationScaleFitRequest,
+    SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
+    TransformationNormalFitRequest, fit_model, prepare_survival_time_stack, resolve_offset_column,
+    resolve_weight_column,
 };
 use ndarray::{Array1, Array2, ArrayView1, Axis, array, s};
 use rand::{SeedableRng, rngs::StdRng};

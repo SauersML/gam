@@ -317,14 +317,14 @@ fn exchangeable_atom_pair_yields_the_permutation_factor() {
                 topology: AtomTopology::EuclideanPatch { latent_dim: 1 },
                 frame: frame_a,
                 ard_variances: None,
-        lowering_error: 0.0,
+                lowering_error: 0.0,
             },
             FittedAtom {
                 name: "b".to_string(),
                 topology: AtomTopology::EuclideanPatch { latent_dim: 1 },
                 frame: frame_b,
                 ard_variances: None,
-        lowering_error: 0.0,
+                lowering_error: 0.0,
             },
         ]
     };

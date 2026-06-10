@@ -802,9 +802,7 @@ mod tests {
             Ok(OuterEval {
                 cost: self.cost(rho),
                 gradient: self.grad(rho),
-                hessian: HessianResult::Operator(Arc::new(QuadraticOperator {
-                    a: self.a.clone(),
-                })),
+                hessian: HessianResult::Operator(Arc::new(QuadraticOperator { a: self.a.clone() })),
                 inner_beta_hint: None,
             })
         }
@@ -860,9 +858,12 @@ mod tests {
         // every coordinate, so the frontier primary must converge to the
         // target with no border correction at all.
         let dim = 96; // above PER_ATOM_EFS_MIN_RHO_DIM: a frontier-shaped K
-        let a = Array2::from_shape_fn((dim, dim), |(i, j)| {
-            if i == j { 1.0 + (i % 5) as f64 } else { 0.0 }
-        });
+        let a = Array2::from_shape_fn(
+            (dim, dim),
+            |(i, j)| {
+                if i == j { 1.0 + (i % 5) as f64 } else { 0.0 }
+            },
+        );
         let target = Array1::from_shape_fn(dim, |i| ((i as f64) * 0.37).sin() * 2.0);
         let mut obj = QuadraticObjective {
             a,
@@ -928,9 +929,8 @@ mod tests {
         let target = array![0.5, -1.0, 2.0];
         let rho = array![1.0, 0.2, -0.7];
         let v = array![0.3, -1.1, 0.9];
-        let grad_at = |p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(a.dot(&(p - &target)))
-        };
+        let grad_at =
+            |p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(a.dot(&(p - &target))) };
         let hv = theta_hvp_matrix_free(None, &rho, &v, grad_at).expect("hvp");
         let exact = a.dot(&v);
         for i in 0..3 {

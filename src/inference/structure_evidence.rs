@@ -353,7 +353,9 @@ pub struct AtomBirthGate {
 impl AtomBirthGate {
     pub fn new(alpha: f64) -> Result<Self, String> {
         if !(alpha > 0.0 && alpha < 1.0) {
-            return Err(format!("AtomBirthGate: alpha must be in (0,1), got {alpha}"));
+            return Err(format!(
+                "AtomBirthGate: alpha must be in (0,1), got {alpha}"
+            ));
         }
         Ok(Self {
             test: PredictablePluginEProcess::new(),
@@ -532,10 +534,9 @@ impl StructureLedger {
     /// caller's contract is per-source, documented on the producing gate).
     pub fn absorb_log(&mut self, idx: usize, log_e_value: f64) -> Result<(), String> {
         let n = self.claims.len();
-        let claim = self
-            .claims
-            .get_mut(idx)
-            .ok_or_else(|| format!("StructureLedger: claim index {idx} out of range ({n} claims)"))?;
+        let claim = self.claims.get_mut(idx).ok_or_else(|| {
+            format!("StructureLedger: claim index {idx} out of range ({n} claims)")
+        })?;
         claim.evidence.absorb_log(log_e_value);
         Ok(())
     }
@@ -954,18 +955,15 @@ mod tests {
             predicted_mean_alt: array![1.0, 0.2],
         }];
         // growth = 1.01 nats/obs (checked above); α=0.05 → need ln(20) ≈ 3.0 nats.
-        let from_zero =
-            plan_probe_for_contested_claim(&probes, &fisher, 0.05, 0.0).expect("plan");
+        let from_zero = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 0.0).expect("plan");
         assert_eq!(from_zero.probe, 0);
         assert!((from_zero.budget_remaining - from_zero.budget_from_scratch).abs() < 1e-12);
 
-        let halfway =
-            plan_probe_for_contested_claim(&probes, &fisher, 0.05, 1.5).expect("plan");
+        let halfway = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 1.5).expect("plan");
         assert!(halfway.budget_remaining < from_zero.budget_remaining);
         assert!((halfway.budget_remaining - (-(0.05f64.ln()) - 1.5) / 1.01).abs() < 1e-12);
 
-        let across =
-            plan_probe_for_contested_claim(&probes, &fisher, 0.05, 10.0).expect("plan");
+        let across = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 10.0).expect("plan");
         assert_eq!(across.budget_remaining, 0.0);
 
         // No discriminating probe → no plan (undecidable by steering).
@@ -1136,8 +1134,9 @@ mod tests {
                 .expect("absorb");
         }
         let cert = ledger.certify(alpha);
-        assert!(cert
-            .confirmed()
-            .any(|e| matches!(e.kind, ClaimKind::GeometryKind { atom: 0, .. })));
+        assert!(
+            cert.confirmed()
+                .any(|e| matches!(e.kind, ClaimKind::GeometryKind { atom: 0, .. }))
+        );
     }
 }

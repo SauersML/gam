@@ -853,8 +853,7 @@ mod tests {
             let f1 = amp1 * lcg_normal(&mut seed);
             let f2 = amp2 * lcg_normal(&mut seed);
             for i in 0..p {
-                residuals[[row, i]] =
-                    f1 * v1[i] + f2 * v2[i] + sigma_eps * lcg_normal(&mut seed);
+                residuals[[row, i]] = f1 * v1[i] + f2 * v2[i] + sigma_eps * lcg_normal(&mut seed);
             }
         }
 

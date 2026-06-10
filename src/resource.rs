@@ -361,7 +361,12 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     pub fn resident_bytes(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap_or_else(|p| p.into_inner()).resident_bytes)
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .resident_bytes
+            })
             .sum()
     }
 
@@ -569,8 +574,7 @@ mod byte_lru_tests {
         // budget (shard_bytes * shard_count, rounded up).
         let shard_count = 8usize;
         let max_bytes = 8 * 64; // 64 entries' worth, 8 per shard on average.
-        let cache: ByteLruCache<u64, Payload> =
-            ByteLruCache::new_sharded(max_bytes, shard_count);
+        let cache: ByteLruCache<u64, Payload> = ByteLruCache::new_sharded(max_bytes, shard_count);
         for k in 0..64u64 {
             cache.insert(k, Payload(k));
         }

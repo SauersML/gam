@@ -1836,9 +1836,7 @@ fn residual_gauge_inner(
     // Each generator carries its #995 lowering-error tolerance scale: the
     // largest `lowering_error` over the atoms it touches.
     let scale_of = |k: usize| -> f64 { model.atoms[k].lowering_error.clamp(0.0, 1.0) };
-    let global_scale = (0..model.atoms.len())
-        .map(scale_of)
-        .fold(0.0_f64, f64::max);
+    let global_scale = (0..model.atoms.len()).map(scale_of).fold(0.0_f64, f64::max);
     let mut gens: Vec<(GeneratorFamily, Array1<f64>, String, f64)> = Vec::new();
     for (k, atom) in model.atoms.iter().enumerate() {
         // Atoms whose within-atom families are realised exactly (#998) are
@@ -2145,7 +2143,10 @@ mod tests {
         };
         let sig_trivial_before = trivial.group_signature();
         let trivial = trivial.with_frame_inner_rotation(vec![1, 1, 1]);
-        assert_eq!(trivial.frame_inner_rotation.as_ref().map(|g| g.dim), Some(0));
+        assert_eq!(
+            trivial.frame_inner_rotation.as_ref().map(|g| g.dim),
+            Some(0)
+        );
         assert_eq!(trivial.group_signature(), sig_trivial_before);
         assert_eq!(trivial.summary, "base");
     }

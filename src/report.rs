@@ -328,7 +328,10 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
     // so a reader can immediately tell a healthy fit from one that hit the
     // iteration cap, exhausted the LM step search, or went unstable.
     let conv_value = if input.converged {
-        format!("<span class=\"conv-ok\">{}</span>", esc(&input.convergence_status))
+        format!(
+            "<span class=\"conv-ok\">{}</span>",
+            esc(&input.convergence_status)
+        )
     } else {
         format!(
             "<span class=\"conv-warn\">\u{26A0} {}</span>",

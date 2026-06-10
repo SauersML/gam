@@ -29136,9 +29136,11 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::TransformationNormal(_) => {
             ("Transformation-normal", "transformation-normal", true)
         }
-        FitRequest::DispersionLocationScale(_) => {
-            ("Dispersion location-scale", "dispersion location-scale", true)
-        }
+        FitRequest::DispersionLocationScale(_) => (
+            "Dispersion location-scale",
+            "dispersion location-scale",
+            true,
+        ),
     }
 }
 

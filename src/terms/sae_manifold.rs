@@ -3775,9 +3775,7 @@ impl SaeManifoldTerm {
     /// path), as does any atom whose coordinate chart width disagrees with its
     /// latent dimension (a structurally inconsistent atom must not masquerade
     /// as exactly certified).
-    fn atom_parameter_views(
-        &self,
-    ) -> Vec<Option<crate::sae_identifiability::AtomParameterView>> {
+    fn atom_parameter_views(&self) -> Vec<Option<crate::sae_identifiability::AtomParameterView>> {
         let assignments = self.assignment.assignments();
         let n = self.n_obs();
         self.atoms
@@ -11516,8 +11514,7 @@ mod tests {
         let (mut term, _target, _rho) = small_two_atom_periodic_term();
         let n = term.assignment.n_obs();
         let q = term.assignment.row_block_dim();
-        let diff_before =
-            term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
+        let diff_before = term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
 
         let mut delta = Array1::<f64>::zeros(n * q);
         // Softmax K=2 has one free logit per row at offset 0 of the row block.
@@ -11527,8 +11524,7 @@ mod tests {
             .expect("step applies");
 
         let cap = SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * term.assignment.mode.temperature();
-        let diff_after =
-            term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
+        let diff_after = term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
         assert!(
             ((diff_after - diff_before) - cap).abs() < 1.0e-9,
             "a 1e6 raw logit delta must realise exactly the {cap}-cap, moved {}",

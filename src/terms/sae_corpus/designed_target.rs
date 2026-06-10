@@ -265,8 +265,7 @@ mod tests {
 
         let budget = 40usize;
         let seed = 17u64;
-        let collected =
-            collect_designed_target(&mut src, None, budget, seed).expect("collect");
+        let collected = collect_designed_target(&mut src, None, budget, seed).expect("collect");
         assert!(collected.is_designed_subsample());
 
         // The selection must be the measure's own design, row for row,

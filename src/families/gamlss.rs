@@ -54,9 +54,9 @@ use crate::smooth::{
 };
 use crate::solver::estimate::validate_all_finite_estimation;
 use crate::types::{InverseLink, RidgePolicy, StandardLink};
-use statrs::function::gamma::{digamma, ln_gamma};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
+use statrs::function::gamma::{digamma, ln_gamma};
 use std::borrow::Cow;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
@@ -3287,10 +3287,7 @@ fn dispersion_trigamma(mut x: f64) -> f64 {
     let inv = 1.0 / x;
     let inv2 = inv * inv;
     // ψ'(x) ≈ 1/x + 1/(2x²) + 1/(6x³) − 1/(30x⁵) + 1/(42x⁷)
-    acc + inv
-        + 0.5 * inv2
-        + inv * inv2 / 6.0
-        - inv * inv2 * inv2 / 30.0
+    acc + inv + 0.5 * inv2 + inv * inv2 / 6.0 - inv * inv2 * inv2 / 30.0
         + inv * inv2 * inv2 * inv2 / 42.0
 }
 
@@ -3335,9 +3332,8 @@ fn dispersion_row_kernel(
             let mean_response = em + (yi - mu) / mu;
             // Precision block (log link on θ): MASS glm.nb θ score / observed
             // information, chained to η_d = log θ.
-            let s_theta = digamma(yi + theta) - digamma(theta) + theta.ln() + 1.0
-                - tpm.ln()
-                - tpy / tpm;
+            let s_theta =
+                digamma(yi + theta) - digamma(theta) + theta.ln() + 1.0 - tpm.ln() - tpy / tpm;
             let info_theta = -dispersion_trigamma(yi + theta) + dispersion_trigamma(theta)
                 - 1.0 / theta
                 + 2.0 / tpm
@@ -3511,13 +3507,8 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         let mut disp_weights = Array1::<f64>::zeros(n);
         let mut disp_response = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let row = dispersion_row_kernel(
-                self.kind,
-                self.y[i],
-                eta_mu[i],
-                eta_d[i],
-                self.weights[i],
-            );
+            let row =
+                dispersion_row_kernel(self.kind, self.y[i], eta_mu[i], eta_d[i], self.weights[i]);
             if row.loglik.is_finite() {
                 log_likelihood += row.loglik;
             }
