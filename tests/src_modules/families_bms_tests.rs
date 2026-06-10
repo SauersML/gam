@@ -3153,7 +3153,7 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
 }
 
 #[test]
-fn exact_outer_order_stays_second_order_at_biobank_work_scale() {
+fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     use crate::custom_family::{
         default_coefficient_hessian_cost, exact_outer_order_from_capability,
     };
@@ -3187,7 +3187,7 @@ fn exact_outer_order_stays_second_order_at_biobank_work_scale() {
         ExactOuterDerivativeOrder::Second
     );
 
-    // Biobank-shape problem. This used to demote to first-order BFGS based
+    // Large-scale problem. This used to demote to first-order BFGS based
     // on a K²·n·p² work estimate. The new contract keeps exact analytic
     // Hessians exposed; representation and runtime cost are handled by the
     // Hessian operator layer.
@@ -6125,7 +6125,7 @@ fn auto_latent_measure_uses_rank_int_calibration_for_bad_normal_diagnostics() {
         ..LatentZPolicy::default()
     };
     let (measure, calibration) =
-        build_latent_measure_with_geometry(&z, &weights, &policy).expect("auto latent measure");
+        build_latent_measure_with_geometry(&z, &weights, &policy, None).expect("auto latent measure");
     assert!(
         matches!(measure, LatentMeasureKind::StandardNormal),
         "bad-normal latent z must route through rank-INT to the standard-normal kernel"
@@ -6502,6 +6502,128 @@ fn empirical_intercept_recovers_from_far_right_warm_start() {
     );
 }
 
+/// Weighted covariance of two equal-length vectors. Test helper for the
+/// conditional latent-z calibration tests below.
+fn weighted_cov_for_test(a: &Array1<f64>, b: &Array1<f64>, w: &Array1<f64>) -> f64 {
+    let sw = w.sum();
+    let ma = a.iter().zip(w.iter()).map(|(&x, &wi)| wi * x).sum::<f64>() / sw;
+    let mb = b.iter().zip(w.iter()).map(|(&x, &wi)| wi * x).sum::<f64>() / sw;
+    a.iter()
+        .zip(b.iter())
+        .zip(w.iter())
+        .map(|((&x, &y), &wi)| wi * (x - ma) * (y - mb))
+        .sum::<f64>()
+        / sw
+}
+
+/// #905: the conditional `E[z|C]`/`Var(z|C)` Rao gate must fire when the
+/// latent score has a conditional mean shift on the marginal-index span — the
+/// `b(C)·m(C)` leakage the pooled-marginal gate cannot see — and the resulting
+/// `ζ = (z − m(C))/√v(C)` must be conditionally centered (the leakage removed).
+#[test]
+fn conditional_latent_gate_detects_and_removes_conditional_mean_shift() {
+    let n = 400usize;
+    // Conditioning covariate c (the "PC"): a centered linspace.
+    let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
+    // z = 0.8·c + mean-zero noise decorrelated from c. Marginally this carries
+    // a conditional mean shift E[z|c] = 0.8·c ≠ 0.
+    let z = Array1::from_iter(
+        (0..n).map(|i| 0.8 * c[i] + if i % 2 == 0 { 0.35 } else { -0.35 }),
+    );
+    let weights = Array1::ones(n);
+    let a_block = c.clone().insert_axis(ndarray::Axis(1));
+
+    // Pre-correction: z is strongly correlated with c.
+    let cov_before = weighted_cov_for_test(&c, &z, &weights);
+    assert!(
+        cov_before.abs() > 0.1,
+        "synthetic z must carry a conditional mean shift on c (cov={cov_before})"
+    );
+
+    let cal = fit_conditional_latent_calibration_if_needed(&z, &weights, a_block.view())
+        .expect("conditional gate must not error")
+        .expect("conditional Rao gate must fire on a clear conditional mean shift");
+    assert_eq!(cal.basis_ncols, 1);
+
+    let zeta = cal
+        .apply(z.view(), a_block.view())
+        .expect("conditional calibration applies");
+    let cov_after = weighted_cov_for_test(&c, &zeta, &weights);
+    assert!(
+        cov_after.abs() < 1.0e-6,
+        "ζ must be conditionally centered on c (cov_before={cov_before}, cov_after={cov_after})"
+    );
+    // The post-correction sanity-check moments are recorded.
+    assert!(cal.post_mean.abs() < 1.0e-6, "post_mean={}", cal.post_mean);
+}
+
+/// #905: with NO conditional structure (z independent of the conditioning
+/// span), the Rao gate must NOT fire — the conditional correction is reserved
+/// for genuine conditional shifts, leaving the pooled-marginal gate in charge.
+#[test]
+fn conditional_latent_gate_silent_without_conditional_structure() {
+    let n = 400usize;
+    let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
+    // z alternates sign independently of the smooth c: cov(c, z) ≈ 0 and the
+    // squared residual is constant, so neither the mean nor the variance Rao
+    // block has anything to detect.
+    let z = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }));
+    let weights = Array1::ones(n);
+    let a_block = c.insert_axis(ndarray::Axis(1));
+
+    let result = fit_conditional_latent_calibration_if_needed(&z, &weights, a_block.view())
+        .expect("conditional gate must not error");
+    assert!(
+        result.is_none(),
+        "conditional gate must stay silent when z carries no conditional structure"
+    );
+}
+
+/// #905: the Auto path routes a conditional shift to the conditional
+/// location-scale calibration when a conditioning span is supplied, but falls
+/// back to the pooled-marginal path when none is (the no-CTN raw-z gap the
+/// issue names is closed only when the marginal-index span is available).
+#[test]
+fn auto_latent_measure_routes_conditional_shift_to_location_scale() {
+    let n = 400usize;
+    let c = Array1::from_iter((0..n).map(|i| (i as f64) / (n as f64 - 1.0) * 2.0 - 1.0));
+    let z = Array1::from_iter(
+        (0..n).map(|i| 0.8 * c[i] + if i % 2 == 0 { 0.35 } else { -0.35 }),
+    );
+    let weights = Array1::ones(n);
+    let a_block = c.insert_axis(ndarray::Axis(1));
+    let policy = LatentZPolicy {
+        check_mode: LatentZCheckMode::Off,
+        normalization: LatentZNormalizationMode::None,
+        latent_measure: LatentMeasureSpec::Auto { grid_size: 5 },
+        ..LatentZPolicy::default()
+    };
+
+    let (measure, calibration) =
+        build_latent_measure_with_geometry(&z, &weights, &policy, Some(a_block.view()))
+            .expect("auto latent measure with conditioning");
+    assert!(matches!(measure, LatentMeasureKind::StandardNormal));
+    assert!(
+        matches!(calibration, LatentMeasureCalibration::ConditionalLocationScale(_)),
+        "a conditional shift with a conditioning span must route to the conditional correction"
+    );
+
+    // Without the conditioning span the Auto path cannot see the conditional
+    // shift and falls back to the pooled-marginal decision (here: no
+    // calibration, since this z passes the pooled-normal diagnostics well
+    // enough — exactly the leak the issue describes).
+    let (_measure_blind, calibration_blind) =
+        build_latent_measure_with_geometry(&z, &weights, &policy, None)
+            .expect("auto latent measure without conditioning");
+    assert!(
+        !matches!(
+            calibration_blind,
+            LatentMeasureCalibration::ConditionalLocationScale(_)
+        ),
+        "without a conditioning span the conditional correction cannot be selected"
+    );
+}
+
 #[test]
 fn auto_latent_measure_preserves_standard_normal_fast_path() {
     let n = 2001usize;
@@ -6515,7 +6637,7 @@ fn auto_latent_measure_preserves_standard_normal_fast_path() {
         ..LatentZPolicy::default()
     };
     let (measure, calibration) =
-        build_latent_measure_with_geometry(&z, &weights, &policy).expect("measure");
+        build_latent_measure_with_geometry(&z, &weights, &policy, None).expect("measure");
 
     assert!(matches!(measure, LatentMeasureKind::StandardNormal));
     assert!(
@@ -7675,7 +7797,7 @@ fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
 
 #[test]
 fn bernoulli_flex_row_primary_hessian_cache_policy_materializes_aou_shape() {
-    // AoU-shaped cache (~629 MiB) under a 16 GiB available-RAM budget:
+    // large-scale-shaped cache (~629 MiB) under a 16 GiB available-RAM budget:
     // single-cache budget is 4 GiB and the global pin budget is 8 GiB, so
     // even though the cache is hundreds of MiB it amortizes the build.
     // The full row-primary shape is neglog (1) + grad (r) + hess (r*r)
@@ -7751,7 +7873,7 @@ fn bernoulli_flex_row_primary_hessian_cache_policy_streams_low_reuse() {
 
 #[test]
 fn bernoulli_flex_row_primary_hessian_cache_policy_no_flip_under_memory_pressure() {
-    // Regression for the AoU 16d-flex shape (n=320k, r=20 → 1.08 GB cache)
+    // Regression for the large-scale 16d-flex shape (n=320k, r=20 → 1.08 GB cache)
     // that flipped materialize→stream mid-fit, dropping the inner solve from
     // the fast dense route onto the matrix-free CG path that never finished.
     let n = 320_000usize;
@@ -7971,7 +8093,7 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
 }
 
 #[test]
-fn bernoulli_flex_hvp_cache_timing_biobank_shape_pattern() {
+fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
     // Wall-clock micro-benchmark for the per-row primary-Hessian cache
     // (`row_primary_hessians`).  The matrix-free CG / inner-Newton loops
     // contract the same per-row primary Hessian against many trial

@@ -2663,6 +2663,9 @@ pub fn build_saved_survival_marginal_slope_predictor(
         saved_score_runtime,
         saved_link_runtime,
         model.latent_z_rank_int_calibration.clone(),
+        // Survival marginal-slope never engages the BMS-only conditional Auto
+        // gate (#905); the field is always `None` for survival fits.
+        model.latent_z_conditional_calibration.clone(),
     )?;
 
     let pred_input = PredictInput {

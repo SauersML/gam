@@ -2202,7 +2202,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
             joint_gradient,
             crate::solver::outer_strategy::Derivative::Analytic
         );
-    // Keep the analytic outer Hessian advertised at biobank scale. The
+    // Keep the analytic outer Hessian advertised at large scale. The
     // row-tensor terms below are represented through block-local
     // `HyperOperator`s and cached exact-Hessian workspaces, so ARC/trust-region
     // can consume exact HVPs without falling back to BFGS merely because the
