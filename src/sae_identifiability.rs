@@ -836,6 +836,21 @@ pub struct FittedAtom {
     /// a candidate generator, pinned-or-not decided solely by the data + the
     /// isometry penalty).
     pub ard_variances: Option<Array1<f64>>,
+    /// **Lowering-error scale** (#995), in `[0, 1]`: the mass-weighted relative
+    /// dispersion of the atom's per-row decoder tangents around the mean
+    /// `frame` the certificate compresses them into,
+    /// `Σ_n a_n Σ_ax ‖t_ax(n) − frame[:,ax]‖² / Σ_n a_n Σ_ax ‖t_ax(n)‖²`.
+    ///
+    /// `0` ⇒ the frame represents every row exactly (hand-built fixtures, flat
+    /// decoders) and the certificate's verdicts within this atom are at full
+    /// resolution. Values toward `1` ⇒ a curved decoder whose tangent field
+    /// disperses strongly (e.g. a full circle, whose tangents average to ≈ 0):
+    /// the mean-frame lowering then cannot distinguish gauge motion from
+    /// genuine curvature, so the verdict tolerance for generators touching
+    /// this atom is *calibrated up to this scale* — the certificate refuses to
+    /// claim a pin it cannot resolve, the same honesty contract as the
+    /// `diffeomorphism-unpinned` escalation.
+    pub lowering_error: f64,
 }
 
 /// The fitted SAE-manifold model the certificate consumes.
