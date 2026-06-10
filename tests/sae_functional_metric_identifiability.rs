@@ -206,3 +206,80 @@ fn euclidean_pin_leaves_the_rotation_free_functional_pin_identifies() {
         report_fn.summary
     );
 }
+
+/// #995 falsification: the SAME mixed-curvature fixture (relative curvature
+/// fraction 9/128 along the rotation) must flip its verdict with the lowering
+/// fidelity — and ONLY with it:
+///
+/// * `lowering_error = 0` (exact frames, as every hand-built fixture is): the
+///   partial curvature is real, the rotation is **pinned** — the strict
+///   Theorem-2 verdict above.
+/// * `lowering_error = 0.5 > 9/128`: the same numerical curvature is now
+///   within what the mean-frame compression cannot distinguish from gauge
+///   motion, so the calibrated verdict must report the rotation **unpinned**
+///   and carry the scale on the verdict — the certificate refuses to claim a
+///   pin it cannot resolve, instead of laundering compression error as
+///   identification.
+#[test]
+fn lowering_error_calibration_forgives_compression_scale_curvature_only() {
+    let frame = Array2::<f64>::eye(2);
+    let mut w_fisher = Array2::<f64>::zeros((2, 2));
+    w_fisher[[0, 0]] = 1.0;
+    w_fisher[[1, 1]] = 4.0;
+    let mut u_flat = Array2::<f64>::zeros((1, 4));
+    u_flat[[0, 0]] = 1.0;
+    u_flat[[0, 3]] = 2.0;
+
+    let make_model = |lowering_error: f64| FittedSaeManifold {
+        atoms: vec![FittedAtom {
+            name: "patch".to_string(),
+            topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
+            frame: Array2::<f64>::eye(2),
+            ard_variances: None,
+            lowering_error,
+        }],
+        jacobian_rows: Vec::new(),
+        isometry_penalty_root: isometry_gram_derivative_root(&frame, &w_fisher),
+        metric: RowMetric::output_fisher(Arc::new(u_flat.clone()), 2, 2)
+            .expect("output-fisher metric"),
+    };
+
+    // Exact frames: the mixed curvature is a genuine pin.
+    let exact = residual_gauge(&make_model(0.0)).expect("exact-frame certificate");
+    let rot_exact = exact
+        .generators
+        .iter()
+        .find(|g| g.family == GeneratorFamily::IsomAtom)
+        .expect("rotation generator");
+    assert!(
+        !rot_exact.unpinned && rot_exact.lowering_error_scale == 0.0,
+        "with exact frames the 9/128 curvature must pin the rotation. {}",
+        exact.summary
+    );
+
+    // Lossy lowering: the same curvature sits below the compression scale —
+    // the calibrated verdict must NOT read it as a pin.
+    let lossy = residual_gauge(&make_model(0.5)).expect("lossy-frame certificate");
+    let rot_lossy = lossy
+        .generators
+        .iter()
+        .find(|g| g.family == GeneratorFamily::IsomAtom)
+        .expect("rotation generator");
+    assert!(
+        (rot_lossy.lowering_error_scale - 0.5).abs() < 1.0e-12,
+        "the verdict must carry the atom's lowering-error scale, got {}",
+        rot_lossy.lowering_error_scale
+    );
+    assert!(
+        (rot_lossy.pinned_energy_fraction - 9.0 / 128.0).abs() < 1.0e-9,
+        "the reported curvature fraction itself must not change — only the \
+         tolerance is calibrated; got {}",
+        rot_lossy.pinned_energy_fraction
+    );
+    assert!(
+        rot_lossy.unpinned,
+        "curvature below the lowering-error scale must not be claimed as a \
+         pin (over-claim guard). {}",
+        lossy.summary
+    );
+}
