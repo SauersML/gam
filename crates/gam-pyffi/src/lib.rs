@@ -13779,6 +13779,28 @@ fn gaussian_reml_optimize_latent<'py>(
         }
         None => f64::INFINITY,
     };
+    // Gradient norm at the INITIAL iterate (`base_start`: the spectral seed, or
+    // the caller's `t` under `init="caller"`), measured in the SAME projected
+    // (Riemannian) metric as `grad_t_norm`. This is the scale anchor of the
+    // shift-invariant relative-stationarity test below — the FFI analogue of the
+    // optimizer's own `grad0_norm` (`relative_stationarity` in optimizer.rs),
+    // which records the gradient norm at the first iterate of each `minimize`.
+    // The restarts all perturb `base_start` in its tangent space, so its
+    // gradient norm is the representative initial scale for the chosen latent.
+    // A non-finite (degenerate) initial gradient maps to `0`, which the `max(·,
+    // 1)` floor below turns into the bare absolute test — matching the optimizer
+    // adapter, which sanitises a degenerate point to a zero gradient.
+    let (_, init_grad) = problem.value_and_grad(base_start.view(), true);
+    let grad0_norm = match init_grad.as_ref() {
+        Some(g) => {
+            let projected = manifold_box
+                .as_ref()
+                .project_tangent(base_start.view(), g.view())
+                .unwrap_or_else(|_| g.clone());
+            projected.iter().map(|v| v * v).sum::<f64>().sqrt()
+        }
+        None => 0.0,
+    };
     // Latent spread: a genuine collapse (all rows retract to one latent
     // coordinate, the issue #876 failure mode) leaves `latent_t_std ≈ 0`, which
     // distinguishes it from a healthy fit whose latent gradient merely failed to
@@ -13793,43 +13815,39 @@ fn gaussian_reml_optimize_latent<'py>(
         }
     };
 
-    // Scale-aware stationarity measure for the profiled-scale latent objective
-    // (issue #879). The latent objective is the *profiled* Gaussian REML score
-    // `n·log σ̂²(t) + ½·log|Hλ| + …`. Near interpolation the profiled scale `σ̂²`
-    // collapses toward zero, which steepens that `n·log σ̂²` term and leaves the
-    // raw latent gradient `‖∇ₜ f‖` at an O(n) magnitude *even at a genuine
-    // stationary point* (R²≈1). So the bare absolute test `‖∇ₜ f‖ ≤ grad_tol`
-    // is mis-scaled: it measures the gradient in the wrong metric and flags an
-    // excellent, near-stationary fit as non-converged.
+    // Relative-gradient stationarity measure for the profiled-scale latent
+    // objective (issue #879). The latent objective is the *profiled* Gaussian
+    // REML score `n·log σ̂²(t) + ½·log|Hλ| + …`. Near interpolation the profiled
+    // scale `σ̂²` collapses toward zero, which steepens that `n·log σ̂²` term and
+    // leaves the raw latent gradient `‖∇ₜ f‖` at an O(n) magnitude *even at a
+    // genuine stationary point* (R²≈1). So the bare absolute test
+    // `‖∇ₜ f‖ ≤ grad_tol` is mis-calibrated: it flags an excellent,
+    // near-stationary fit as non-converged.
     //
-    // The principled fix is the canonical relative-gradient (scaled-gradient)
-    // stationarity test: stationarity means the gradient is small *relative to*
-    // the objective's natural scale and the latent variable scale, i.e. the
-    // dimensionless quantity
+    // We use the SAME shift-invariant relative-gradient test the optimizer's own
+    // stopping rule uses (`relative_stationarity` in optimizer.rs, issue #954):
     //
-    //   rel = ‖∇ₜ f‖ · ‖t‖_typ / max(|f|, 1)
+    //   rel = ‖∇ₜ f(t̂)‖_g / max(‖∇ₜ f(t₀)‖_g, 1)
     //
-    // where `‖∇ₜ f‖` carries units of f/t, `‖t‖_typ` is the characteristic
-    // latent magnitude (RMS, floored at 1 so a near-origin chart cannot inflate
-    // it) and `max(|f|, 1)` the characteristic objective magnitude. Dividing out
-    // the common profiled scale that both `f` and `∇f` inherit makes `grad_tol`
-    // a true *relative* tolerance: `rel → 0` iff the gradient vanishes relative
-    // to scale (genuine stationarity), and it stays O(1) — failing the test — for
-    // a fit that is actually far from stationary. This is a correct convergence
-    // criterion, not a tolerance loosening: a non-stationary latent still reports
-    // `converged=False` because its gradient is large relative to its own scale.
-    let t_scale = {
-        let n = best_t.len();
-        if n == 0 {
-            1.0
-        } else {
-            let rms = (best_t.iter().map(|&v| v * v).sum::<f64>() / n as f64).sqrt();
-            rms.max(1.0)
-        }
-    };
-    let objective_scale = best_value.abs().max(1.0);
-    let grad_t_norm_scaled = if grad_t_norm.is_finite() {
-        grad_t_norm * t_scale / objective_scale
+    // where `t₀` is the initial iterate. The denominator carries the SAME
+    // multiplicative scale `f` and `∇f` share (`f → c·f ⇒ ∇f → c·∇f`), so a
+    // fixed `grad_tol` still reads as a *relative* tolerance — and, crucially,
+    // because the profiled objective's gradient is O(n) at the seed too, the
+    // O(n) magnitude divides out (#879). The `max(·, 1)` floor reduces this to
+    // the absolute test `‖∇ₜ f‖ ≤ grad_tol` on a unit-scale objective.
+    //
+    // This REPLACES the earlier `‖∇ₜ f‖ · ‖t‖_typ / max(|f|, 1)`, which was
+    // *not* shift-invariant: minimization is invariant under `f → f + C`
+    // (minimizer, gradient, Hessian, model reduction all unchanged), yet the old
+    // `max(|f|, 1)` denominator grows with an additive constant `C` and could
+    // falsely certify a non-stationary latent as converged (issue #954). The
+    // `‖t‖_typ` factor was also non-intrinsic — the ambient latent magnitude is
+    // not chart/translation invariant on a manifold (the circle/torus charts
+    // wrap to `[-π, π)`), so it does not belong in a Riemannian stationarity
+    // test. Anchoring to `‖∇ₜ f(t₀)‖` is both shift-invariant (the gradient does
+    // not depend on `C`) and scale-invariant.
+    let grad_t_norm_scaled = if grad_t_norm.is_finite() && grad0_norm.is_finite() {
+        grad_t_norm / grad0_norm.max(1.0)
     } else {
         f64::INFINITY
     };
@@ -13931,6 +13949,7 @@ fn gaussian_reml_optimize_latent<'py>(
     out.set_item("latent", t_matrix.into_pyarray(py))?;
     out.set_item("t_flat", best_t.into_pyarray(py))?;
     out.set_item("grad_t_norm", grad_t_norm)?;
+    out.set_item("grad_t_norm_init", grad0_norm)?;
     out.set_item("grad_t_norm_scaled", grad_t_norm_scaled)?;
     out.set_item("converged", converged)?;
     out.set_item("latent_t_std", latent_t_std)?;
