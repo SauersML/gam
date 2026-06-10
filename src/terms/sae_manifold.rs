@@ -3742,12 +3742,68 @@ impl SaeManifoldTerm {
 
         let certificate_model =
             self.to_residual_gauge_model(metric, per_atom_ard_variances, isometry_pin_active)?;
-        let residual_gauge = crate::sae_identifiability::residual_gauge(&certificate_model)?;
+        // #998: when no isometry pin is installed, within-atom gauge families
+        // are certified on their EXACT orbits in the model's own
+        // (decoder, coordinate) parameter space — compensated symmetries are
+        // data-nulls by construction there, no lowering-error calibration
+        // involved. With a pin active the exact path would need the pin's
+        // orbit-space curvature operator to avoid over-claiming freedom; until
+        // that operator is lowered (it needs the second-derivative jets), the
+        // pinned case stays on the calibrated frame path, which is the honest
+        // floor. Magic-by-default either way: the choice is derived from the
+        // fit, never a flag.
+        let residual_gauge = if isometry_pin_active {
+            crate::sae_identifiability::residual_gauge(&certificate_model)?
+        } else {
+            let views = self.atom_parameter_views();
+            let ops: Vec<Option<crate::sae_identifiability::OrbitPenaltyOperator>> =
+                (0..self.k_atoms()).map(|_| None).collect();
+            crate::sae_identifiability::residual_gauge_exact(&certificate_model, &views, &ops)?
+        };
 
         Ok(SaeManifoldFitDiagnostics {
             atom_two_lens,
             residual_gauge,
         })
+    }
+
+    /// Per-atom exact parameter-space views for the #998 certificate path:
+    /// the basis values / first-derivative jet, decoder coefficients, latent
+    /// coordinates, and assignment mass each atom was actually fitted with.
+    /// Sphere atoms get `None` (their chart's group action is nonlinear, so
+    /// the exact-orbit realisation does not apply and they stay on the frame
+    /// path), as does any atom whose coordinate chart width disagrees with its
+    /// latent dimension (a structurally inconsistent atom must not masquerade
+    /// as exactly certified).
+    fn atom_parameter_views(
+        &self,
+    ) -> Vec<Option<crate::sae_identifiability::AtomParameterView>> {
+        let assignments = self.assignment.assignments();
+        let n = self.n_obs();
+        self.atoms
+            .iter()
+            .enumerate()
+            .map(|(k, atom)| {
+                if matches!(atom.basis_kind, SaeAtomBasisKind::Sphere) {
+                    return None;
+                }
+                let coords = self.assignment.coords[k].as_matrix().to_owned();
+                if coords.nrows() != n || coords.ncols() != atom.latent_dim {
+                    return None;
+                }
+                let mut activations = Array1::<f64>::zeros(n);
+                for row in 0..n {
+                    activations[row] = assignments[[row, k]];
+                }
+                Some(crate::sae_identifiability::AtomParameterView {
+                    basis_values: atom.basis_values.clone(),
+                    basis_jacobian: atom.basis_jacobian.clone(),
+                    decoder: atom.decoder_coefficients.clone(),
+                    coords,
+                    activations,
+                })
+            })
+            .collect()
     }
 
     /// Lower this fitted term into the self-contained

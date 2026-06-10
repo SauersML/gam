@@ -338,39 +338,65 @@ fn replicate_fits_agree_up_to_exactly_the_reported_gauge() {
         report_b.summary
     );
 
-    // ---- #995 oracle: the production lowering must not over-claim ---------
-    // A fitted circle's per-row decoder tangents rotate all the way around, so
-    // the mean-frame compression is severely lossy — the lowering must SAY so
-    // (a large reported lowering-error scale on the within-atom generators),
-    // and the calibrated verdict must then refuse to claim any within-atom
-    // pin: the U(1) phase freedom the replicates demonstrably differ by (the
-    // alignment block below) must never come back "pinned". Before the #995
-    // calibration this is exactly where the certificate over-claimed
-    // identification: the full-rank data span swallowed every generator.
+    // ---- #998 oracle: the U(1) phase freedom is an EXACT data-null --------
+    // With no isometry pin installed, the production path certifies the
+    // circle's within-atom gauge on its exact orbit in (decoder, coordinate)
+    // space: the harmonic basis is closed under phase shifts, so the
+    // LS-compensated orbit motion is a data-null by construction — the
+    // verdict must be unpinned with the compensation residual at the noise
+    // floor and NO lowering-error calibration involved (scale 0; nothing is
+    // compressed on this path). This closes the loop the frame certificate
+    // could only refuse: the freedom the replicates demonstrably differ by
+    // (the alignment block below) is now positively certified, exactly.
     for (label, report) in [("A", &report_a), ("B", &report_b)] {
-        for g in report
+        let phase = report
             .generators
             .iter()
-            .filter(|g| g.family == GeneratorFamily::IsomAtom)
-        {
-            assert!(
-                g.lowering_error_scale > 0.5,
-                "replicate {label}: a full circle's tangent field disperses \
-                 strongly around its mean — the lowering must report a large \
-                 lowering-error scale, got {} ({})",
-                g.lowering_error_scale,
-                g.description
-            );
-            assert!(
-                g.unpinned || g.generator_norm == 0.0,
-                "replicate {label}: with the lowering this lossy the \
-                 certificate must not claim the within-atom gauge pinned \
-                 (over-claim guard); got pinned {} with fraction {} at scale {}",
-                g.description,
-                g.pinned_energy_fraction,
-                g.lowering_error_scale
-            );
-        }
+            .find(|g| {
+                g.family == GeneratorFamily::IsomAtom && g.description.contains("exact orbit")
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "replicate {label}: the circle atom must carry an exact-orbit \
+                     Isom generator; got: {:?}",
+                    report
+                        .generators
+                        .iter()
+                        .map(|g| g.description.clone())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            phase.generator_norm > 0.0,
+            "replicate {label}: the phase orbit moves the fit (nonzero \
+             uncompensated motion) — a zero norm means the view was empty"
+        );
+        assert!(
+            phase.pinned_energy_fraction <= 1.0e-6,
+            "replicate {label}: the harmonic basis is closed under phase \
+             shifts, so the compensation residual must sit at the numerical \
+             noise floor, got {} ({})",
+            phase.pinned_energy_fraction,
+            phase.description
+        );
+        assert_eq!(
+            phase.lowering_error_scale, 0.0,
+            "replicate {label}: the exact path needs no lowering-error \
+             calibration"
+        );
+        assert!(
+            phase.unpinned,
+            "replicate {label}: the U(1) phase freedom must be certified \
+             unpinned — this is the over-claim guard the frame certificate \
+             could only satisfy by refusing. {}",
+            report.summary
+        );
+        assert!(
+            report.group_signature().contains("Isom(M_k)"),
+            "replicate {label}: the certified group must name the surviving \
+             O(2)/Isom factor, got: {}",
+            report.group_signature()
+        );
     }
 
     // ---- both replicates recover the planted circle (truth guard) ---------
