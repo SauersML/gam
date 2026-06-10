@@ -19969,23 +19969,21 @@ fn joint_penalty_subspace_trace_parts(
         return Ok((0.0, None));
     }
 
+    // Structural-null gate: with no positive penalty eigenvalue there is no
+    // `log|Sλ|₊` term in the LAML ratio, hence no Hessian-side correction to
+    // pair with it — the caller keeps the operator's own logdet untouched.
+    // (The kernel itself no longer uses the Sλ eigenvectors: since #901 it is
+    // the full spectral `M⁺`, built from M's own eigendecomposition below.)
     let mut s_lambda = Array2::<f64>::zeros((total, total));
     add_joint_penalty_to_matrix(&mut s_lambda, ranges, s_lambdas, 0.0, None);
-    let (s_evals, s_evecs) = s_lambda
+    let s_evals = s_lambda
         .eigh(Side::Lower)
-        .map_err(|e| format!("joint penalty subspace eigendecomposition failed: {e}"))?;
+        .map_err(|e| format!("joint penalty subspace eigendecomposition failed: {e}"))?
+        .0;
     let s_threshold = positive_eigenvalue_threshold(s_evals.as_slice().unwrap());
-    let positive_cols: Vec<usize> = (0..total).filter(|&j| s_evals[j] > s_threshold).collect();
-    let rank = positive_cols.len();
+    let rank = (0..total).filter(|&j| s_evals[j] > s_threshold).count();
     if rank == 0 {
         return Ok((0.0, None));
-    }
-
-    let mut u_s = Array2::<f64>::zeros((total, rank));
-    for (out_col, &src_col) in positive_cols.iter().enumerate() {
-        for row in 0..total {
-            u_s[[row, out_col]] = s_evecs[[row, src_col]];
-        }
     }
 
     // ── REML log|H + Sλ|₊ and its trace kernel over the FULL identifiable
@@ -20018,11 +20016,20 @@ fn joint_penalty_subspace_trace_parts(
     // directions `½ log|Sλ|₊` also omits, keeping value and gradient consistent.
     //
     // To preserve value/gradient consistency the trace kernel must be the
-    // range(Sλ) BLOCK of the FULL pseudo-inverse `(H+Sλ)⁺` (its Schur reduction
-    // onto range(Sλ)), NOT `M_rr⁻¹`. Then
-    //   tr(h_proj_inverse · U_Sᵀ ∂Sλ U_S) = tr((H+Sλ)⁺ ∂Sλ) = ∂_ρ log|H+Sλ|₊,
-    // since ∂Sλ/∂ρ is supported on range(Sλ). Both are derived from the same
-    // materialized `M = H + Sλ` so they cannot drift apart.
+    // FULL pseudo-inverse `M⁺ = (H+Sλ)⁺` itself, carried in spectral form
+    // `(U_M, diag(1/σ_a))` over the kept eigenpairs (#901; supersedes the
+    // intermediate #752 realization that reduced `M⁺` to its range(Sλ)
+    // block). For penalty-supported drifts `∂Sλ/∂ρ` the two coincide:
+    //   tr(M⁺ ∂Sλ) = tr(U_Sᵀ M⁺ U_S · U_Sᵀ ∂Sλ U_S) = ∂_ρ log|H+Sλ|₊.
+    // But the joint adaptive/ψ hyper-coordinates trace drifts with
+    // null(Sλ) support (basis κ-derivatives, the GLM cubic correction
+    // `D_β H[v]` through the intercept column), for which the range(Sλ)
+    // reduction silently discards the leaked component while the FD of
+    // `log|M|₊` keeps it. `tr(M⁺ Ḣ)` is the exact pseudo-logdet derivative
+    // for EVERY drift on a constant-rank stratum (first-order eigenvector
+    // motion cancels), so one spectral object serves the whole θ-vector.
+    // Value and kernel come from the same eigendecomposition of the same
+    // materialized `M` so they cannot drift apart.
     //
     // The #752 fix requires the full identifiable-subspace determinant. There
     // is no lower-dimensional fallback that preserves that objective: the old
@@ -20044,30 +20051,32 @@ fn joint_penalty_subspace_trace_parts(
     })?;
     let m_threshold = positive_eigenvalue_threshold(m_evals.as_slice().unwrap());
     let logdet = exact_pseudo_logdet(m_evals.as_slice().unwrap(), m_threshold);
-    // Full Moore-Penrose pseudo-inverse `M+` (drop ker(H+Sλ)), then its
-    // range(Sλ) block `U_S^T M+ U_S` as the trace kernel.
-    let mut m_pinv = Array2::<f64>::zeros((total, total));
-    for eig_idx in 0..total {
-        let sigma = m_evals[eig_idx];
-        if sigma <= m_threshold {
-            continue;
-        }
-        let inv = 1.0 / sigma;
-        for i in 0..total {
-            let vi = inv * m_evecs[[i, eig_idx]];
-            for j in 0..total {
-                m_pinv[[i, j]] += vi * m_evecs[[j, eig_idx]];
-            }
-        }
+    // Full Moore–Penrose pseudo-inverse `M⁺` (drop ker(H+Sλ)) in spectral
+    // form: kept eigenvectors as the kernel basis, diag(1/σ) as the reduced
+    // kernel. In this basis `h_proj_inverse = (U_Mᵀ M U_M)⁻¹ = diag(1/σ)`
+    // exactly, so every `PenaltySubspaceTrace` consumer evaluates the one
+    // true `tr(M⁺ ·)` / `M⁺`-bilinear — exact for penalty-supported AND
+    // null(Sλ)-leaking drifts alike (#901).
+    let kept: Vec<usize> = (0..total)
+        .filter(|&eig_idx| m_evals[eig_idx] > m_threshold)
+        .collect();
+    if kept.is_empty() {
+        return Ok((0.0, None));
     }
-    symmetrize_dense_in_place(&mut m_pinv);
-    let mut h_proj_inverse = fast_atb(&u_s, &fast_ab(&m_pinv, &u_s));
-    symmetrize_dense_in_place(&mut h_proj_inverse);
+    let r_kept = kept.len();
+    let mut u_m = Array2::<f64>::zeros((total, r_kept));
+    let mut h_proj_inverse = Array2::<f64>::zeros((r_kept, r_kept));
+    for (out_col, &src_col) in kept.iter().enumerate() {
+        for row in 0..total {
+            u_m[[row, out_col]] = m_evecs[[row, src_col]];
+        }
+        h_proj_inverse[[out_col, out_col]] = 1.0 / m_evals[src_col];
+    }
 
     Ok((
         logdet,
         Some(PenaltySubspaceTrace {
-            u_s,
+            u_s: u_m,
             h_proj_inverse,
         }),
     ))
@@ -26946,10 +26955,12 @@ mod tests {
         let penalties = vec![s_lambda];
         let h = array![[4.0, 0.2, 7.0], [0.2, 9.0, -3.0], [7.0, -3.0, 30.0]];
         // `∂Sλ/∂ρ` is supported on range(Sλ) (here the leading 2×2 block, the
-        // positive-eigenvalue subspace of `S`); the trace kernel differentiates
-        // the FULL `log|H+Sλ|₊` only for such penalty-supported perturbations.
-        // Use a range(Sλ)-supported drift so the FD exercises the same contract
-        // the production `∂Sλ/∂ρ` does.
+        // positive-eigenvalue subspace of `S`). Since #901 the kernel is the
+        // full spectral `M⁺`, whose trace differentiates `log|H+Sλ|₊` exactly
+        // for EVERY drift; a range(Sλ)-supported drift exercises the same
+        // contract the production `∂Sλ/∂ρ` does (and is where the old
+        // range(Sλ)-block kernel and `M⁺` agree, so this pin is stable
+        // across the kernel generalization).
         let drift = array![[0.7, -0.4, 0.0], [-0.4, 1.3, 0.0], [0.0, 0.0, 0.0]];
 
         let (logdet, kernel) = joint_penalty_subspace_trace_parts(
@@ -26962,7 +26973,9 @@ mod tests {
         )
         .expect("projection parts build");
         let kernel = kernel.expect("rank-deficient penalty still has an identified subspace");
-        assert_eq!(kernel.u_s.ncols(), 2);
+        // Kernel basis = kept eigenvectors of M = H + Sλ (full rank 3 here),
+        // NOT the rank-2 range(Sλ) basis of the pre-#901 reduced kernel.
+        assert_eq!(kernel.u_s.ncols(), 3);
         // logdet is the FULL identifiable-subspace `log|H + Sλ|₊`. Here H + Sλ
         // is full rank (3), so this is the ordinary log-det of
         //   M = [[5, 0.2, 7], [0.2, 11, -3], [7, -3, 30]],  det(M) = 1056.4.
