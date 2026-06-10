@@ -137,25 +137,29 @@ use super::unified::PenaltySubspaceTrace;
 ///
 /// Channels are filled lazily by [`Sensitivity`] (β̇ needs the factored
 /// solve; Ḣ_total needs β̇) so a value-only evaluation pays nothing.
+///
+/// Only the channels the LANDED first-order calculus reads live here:
+/// `index` (unit θ-coordinate), `beta_dot` (the shared β̇), and
+/// `h_dot_total` (the total drift Ḣ every atom traces). The further channels
+/// the design names — a dense `dir` for general (non-unit) directions, and
+/// the staged `s_dot` (∂Sλ/∂θ) / `h_dot_frozen` (∂H/∂θ at fixed β̂) inputs
+/// from which the [`Sensitivity`] operator assembles `h_dot_total =
+/// h_dot_frozen + D_βH[β̇]` — re-land as fields together with that operator
+/// (#935), the code that fills AND reads them. Carrying them now would be
+/// unread design surface (the same no-stub discipline this module applies to
+/// its second-order and certify passes).
 pub struct ThetaDirection {
     /// Coordinate index in the packed θ = (ρ‖ψ) layout, with the unit
-    /// direction implied; general directions carry a dense `dir` instead.
+    /// direction implied. (A dense general-direction channel re-lands with
+    /// the #935 calculus that consumes it.)
     pub index: Option<usize>,
-    /// Dense direction in θ-space (None ⇒ unit vector at `index`).
-    pub dir: Option<Array1<f64>>,
-    /// Explicit penalty drift `∂Sλ/∂θ[dir]` (ρ: λ_k S_k; ψ: λ-weighted
-    /// basis κ-derivatives from the penalty atom's own factorization).
-    pub s_dot: Option<Arc<Array2<f64>>>,
-    /// Frozen-state Hessian drift `∂H/∂θ[dir]` at fixed β̂ (for GLMs this is
-    /// `s_dot` plus the explicit design-motion term `X_θᵀWX + XᵀWX_θ` when
-    /// the design itself moves with ψ).
-    pub h_dot_frozen: Option<Arc<Array2<f64>>>,
     /// Induced mode motion `β̇ = −H⁺ F_{βθ}[dir]`, the ONE chain-rule vector
     /// every atom's profiled derivative contracts against.
     pub beta_dot: Option<Arc<Array1<f64>>>,
-    /// Total Hessian drift `Ḣ = h_dot_frozen + D_βH[β̇]` (the cubic
-    /// correction `Xᵀdiag(c ⊙ Xβ̇)X` applied to the SAME β̇ above). This is
-    /// the matrix the logdet trace, the #784 Q_b/Q_c trace, and the θ-HVP
+    /// Total Hessian drift `Ḣ = ∂H/∂θ[dir]|_{β̂} + D_βH[β̇]` (the frozen
+    /// penalty/design drift plus the cubic correction `Xᵀdiag(c ⊙ Xβ̇)X`
+    /// applied to the SAME β̇ above), assembled once by [`Sensitivity`]. This
+    /// is the matrix the logdet trace, the #784 Q_b/Q_c trace, and the θ-HVP
     /// all consume — one construction, no per-consumer reassembly.
     pub h_dot_total: Option<Arc<Array2<f64>>>,
 }
@@ -495,9 +499,6 @@ mod tests {
         let h_dot = Arc::new(array![[1.0, 0.3], [0.3, 1.0]]);
         let dir = ThetaDirection {
             index: Some(0),
-            dir: None,
-            s_dot: None,
-            h_dot_frozen: None,
             beta_dot: Some(Arc::new(array![0.5, 0.5])),
             h_dot_total: Some(h_dot.clone()),
         };
