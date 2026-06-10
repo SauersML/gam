@@ -41,7 +41,7 @@
 //! couples to *only the active subset* `S_n` of decoder borders, not to all
 //! K of them. That is the structural fact this module records.
 
-use ndarray::{Array1, ArrayView1};
+use ndarray::Array1;
 
 /// Minimal bit-vector. Backing storage is `Vec<u64>` words.
 ///
@@ -184,11 +184,6 @@ impl SparseAtomCode {
         assert!(k < self.k_atoms());
         self.active_mask.set(k, false);
         self.weights[k] = 0.0;
-    }
-
-    /// View the dense weight vector as an `ArrayView1`.
-    pub fn weights_view(&self) -> ArrayView1<'_, f64> {
-        ArrayView1::from(&self.weights[..])
     }
 
     /// Materialize the *effective* weight vector (zeros at inactive indices)

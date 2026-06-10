@@ -20836,7 +20836,7 @@ pub fn fit_survival_marginal_slope_terms(
         // logslope_surface, producing the alias pencil
         //   link_dev[k] ≡ marginal_surface[m] ≡ logslope_surface[ℓ]
         // documented by the identifiability audit (joint rank collapse
-        // from 51 → 38 on the large-scale hypertension fit). After
+        // from 51 → 38 on the large-scale binary-outcome fit). After
         // the W-metric eigendecomposition installs `T_lw` on the
         // DeviationRuntime, the joint design has full numerical column
         // rank with respect to (marginal, logslope) and the joint

@@ -1,4 +1,4 @@
-//! Regression for the hypertension Bernoulli marginal-slope audit refusal.
+//! Regression for the binary-outcome Bernoulli marginal-slope audit refusal.
 //!
 //! The production failure had the marginal formula
 //!
@@ -21,7 +21,7 @@ use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::{FitConfig, FitResult, fit_from_formula};
 use ndarray::Array2;
 
-fn hypertension_shape_dataset() -> EncodedDataset {
+fn binary_outcome_shape_dataset() -> EncodedDataset {
     let n = 96usize;
     let headers = vec![
         "event",
@@ -75,7 +75,7 @@ fn hypertension_shape_dataset() -> EncodedDataset {
     }
     EncodedDataset {
         headers,
-        values: Array2::from_shape_vec((n, 11), values).expect("hypertension-shape BMS data shape"),
+        values: Array2::from_shape_vec((n, 11), values).expect("binary-outcome-shape BMS data shape"),
         schema: DataSchema {
             columns: vec![
                 SchemaColumn {
@@ -151,7 +151,7 @@ fn hypertension_shape_dataset() -> EncodedDataset {
     }
 }
 
-fn duplicate_pc_hypertension_shape_dataset() -> EncodedDataset {
+fn duplicate_pc_binary_outcome_shape_dataset() -> EncodedDataset {
     let n = 160usize;
     let headers = vec![
         "event",
@@ -206,7 +206,7 @@ fn duplicate_pc_hypertension_shape_dataset() -> EncodedDataset {
     EncodedDataset {
         headers,
         values: Array2::from_shape_vec((n, 11), values)
-            .expect("duplicate-PC hypertension-shape BMS data shape"),
+            .expect("duplicate-PC binary-outcome-shape BMS data shape"),
         schema: DataSchema {
             columns: vec![
                 SchemaColumn {
@@ -342,7 +342,7 @@ fn production_like_pc_confound_dataset() -> EncodedDataset {
     EncodedDataset {
         headers,
         values: Array2::from_shape_vec((n, 11), values)
-            .expect("production-like hypertension BMS data shape"),
+            .expect("production-like binary-outcome BMS data shape"),
         schema: DataSchema {
             columns: vec![
                 SchemaColumn {
@@ -419,9 +419,9 @@ fn production_like_pc_confound_dataset() -> EncodedDataset {
 }
 
 #[test]
-fn hypertension_shape_bms_matern_fit_is_not_refused_by_identifiability_audit() {
+fn binary_outcome_shape_bms_matern_fit_is_not_refused_by_identifiability_audit() {
     gam::init_parallelism();
-    let data = hypertension_shape_dataset();
+    let data = binary_outcome_shape_dataset();
     let cfg = FitConfig {
         logslope_formula: Some("matern(PC1, PC2, PC3, centers=4)".to_string()),
         z_column: Some("prs_z".to_string()),
@@ -436,27 +436,27 @@ fn hypertension_shape_bms_matern_fit_is_not_refused_by_identifiability_audit() {
         Ok(FitResult::BernoulliMarginalSlope(out)) => {
             assert!(
                 out.fit.beta.iter().all(|coef| coef.is_finite()),
-                "hypertension-shape BMS fit should produce finite coefficients, got {:?}",
+                "binary-outcome-shape BMS fit should produce finite coefficients, got {:?}",
                 out.fit.beta
             );
         }
-        Ok(_) => panic!("hypertension-shape fit returned the wrong family variant"),
+        Ok(_) => panic!("binary-outcome-shape fit returned the wrong family variant"),
         Err(err) => {
             let msg = err.to_string();
             assert!(
                 !msg.contains("identifiability audit refused")
                     && !msg.contains("pre-fit identifiability audit"),
-                "hypertension-shape BMS fit was still refused by the identifiability audit: {msg}"
+                "binary-outcome-shape BMS fit was still refused by the identifiability audit: {msg}"
             );
-            panic!("hypertension-shape BMS fit failed after passing the audit: {msg}");
+            panic!("binary-outcome-shape BMS fit failed after passing the audit: {msg}");
         }
     }
 }
 
 #[test]
-fn hypertension_shape_bms_matern_centers60_are_rank_reduced() {
+fn binary_outcome_shape_bms_matern_centers60_are_rank_reduced() {
     gam::init_parallelism();
-    let data = duplicate_pc_hypertension_shape_dataset();
+    let data = duplicate_pc_binary_outcome_shape_dataset();
     let cfg = FitConfig {
         logslope_formula: Some("matern(PC1, PC2, PC3, centers=60, length_scale=1.0)".to_string()),
         z_column: Some("prs_z".to_string()),
@@ -490,9 +490,9 @@ fn hypertension_shape_bms_matern_centers60_are_rank_reduced() {
 }
 
 #[test]
-fn hypertension_shape_bms_shared_matern_prs_pc_confound_starts_outer_solver() {
+fn binary_outcome_shape_bms_shared_matern_prs_pc_confound_starts_outer_solver() {
     gam::init_parallelism();
-    let mut data = hypertension_shape_dataset();
+    let mut data = binary_outcome_shape_dataset();
     let prs_idx = data
         .headers
         .iter()
@@ -547,7 +547,7 @@ fn hypertension_shape_bms_shared_matern_prs_pc_confound_starts_outer_solver() {
 }
 
 #[test]
-fn production_like_hypertension_shared_matern_centers10_confound_starts_outer_solver() {
+fn production_like_binary_outcome_shared_matern_centers10_confound_starts_outer_solver() {
     gam::init_parallelism();
     let data = production_like_pc_confound_dataset();
     let cfg = FitConfig {
@@ -590,7 +590,7 @@ fn production_like_hypertension_shared_matern_centers10_confound_starts_outer_so
 }
 
 #[test]
-fn production_like_hypertension_shared_matern_learned_kappa_starts_outer_solver() {
+fn production_like_binary_outcome_shared_matern_learned_kappa_starts_outer_solver() {
     gam::init_parallelism();
     let data = production_like_pc_confound_dataset();
     let cfg = FitConfig {

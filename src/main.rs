@@ -379,7 +379,7 @@ struct FitArgs {
     /// want a non-default binomial link.
     #[arg(long = "predict-noise")]
     predict_noise: Option<String>,
-    /// Secondary RHS-only formula for ancestry-varying log-slope surface(s)
+    /// Secondary RHS-only formula for grouping-varying log-slope surface(s)
     /// in the Bernoulli marginal-slope family. Pass terms only, not `y ~ ...`.
     /// Use additive `logslope(z_col, terms...)` declarations for vector-z
     /// marginal-slope models.

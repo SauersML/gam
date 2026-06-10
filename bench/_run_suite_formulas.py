@@ -307,7 +307,7 @@ _PC_COL_PATTERN = re.compile(r"^pc\d+(?:_std)?$")
 
 
 def _is_pc_column(name: typing.Any) -> bool:
-    """A column is a PC ancestry axis iff its name matches `pc{N}` or `pc{N}_std`."""
+    """A column is a PC grouping axis iff its name matches `pc{N}` or `pc{N}_std`."""
     return bool(_PC_COL_PATTERN.match(str(name).strip()))
 
 
@@ -358,7 +358,7 @@ def _emit_joint_pc_term(
     pc_basis: str,
     double_penalty: bool = True,
 ) -> str:
-    """Build a single joint multi-D smooth over the PC ancestry axes for `backend`.
+    """Build a single joint multi-D smooth over the PC grouping axes for `backend`.
 
     Returns one term string. Always emits a multi-D term — never N separate
     1D smooths. Raises if the backend can't represent a multi-D smooth in

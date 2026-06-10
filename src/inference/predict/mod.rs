@@ -1299,7 +1299,7 @@ pub struct BernoulliMarginalSlopePredictor {
     /// `ζ = (z − m(C))/√v(C)`, with the conditioning span `a(C)` rebuilt from
     /// the marginal prediction design — mirroring the fit-time correction the
     /// Auto path applied when its conditional `E[z|C]`/`Var(z|C)` Rao gate
-    /// detected PC/ancestry-dependence. Mutually exclusive with
+    /// detected PC/grouping-dependence. Mutually exclusive with
     /// `latent_z_calibration`.
     pub(crate) latent_z_conditional_calibration:
         Option<crate::families::bms::LatentZConditionalCalibration>,

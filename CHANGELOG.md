@@ -542,7 +542,7 @@ under-identification robustness layer (off by default).
 
 ### Fixed
 
-- **Probit BMS marginal-slope: release the marginal/logslope overlap ridge (#754, completing the fix).** The #754 nullspace-shrinkage ridge (shipped in 0.1.165/0.1.166) bounds the marginal block's *unpenalized* directions, but a production-scale run (`duchon(PC1,PC2,PC3,centers=20)`, n≈195k, 1:1 balanced) showed the runaway coefficient (β≈61) actually lives on a **penalized smooth** direction that is degenerate with the score-weighted logslope surface — the marginal↔logslope confound — which the nullspace ridge does not touch. This release ships the additional fixed **overlap ridge** that shrinks exactly those cross-channel directions, plus the production-shaped hypertension BMS regression test. The nullspace ridge alone was necessary but not sufficient at scale; the two ridges together bound both the null-space and the confound directions.
+- **Probit BMS marginal-slope: release the marginal/logslope overlap ridge (#754, completing the fix).** The #754 nullspace-shrinkage ridge (shipped in 0.1.165/0.1.166) bounds the marginal block's *unpenalized* directions, but a production-scale run (`duchon(PC1,PC2,PC3,centers=20)`, n≈195k, 1:1 balanced) showed the runaway coefficient (β≈61) actually lives on a **penalized smooth** direction that is degenerate with the score-weighted logslope surface — the marginal↔logslope confound — which the nullspace ridge does not touch. This release ships the additional fixed **overlap ridge** that shrinks exactly those cross-channel directions, plus the production-shaped binary-outcome BMS regression test. The nullspace ridge alone was necessary but not sufficient at scale; the two ridges together bound both the null-space and the confound directions.
 
 ## v0.3.94 — gam 0.3.94 / gamfit 0.1.166 (2026-06-04)
 
@@ -566,13 +566,13 @@ under-identification robustness layer (off by default).
 
 ### Fixed
 
-- **Hypertension-style Bernoulli marginal-slope Matérn fits now have full audit-level regression coverage.** The release includes a formula-to-fit test for the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout, proving the scalar-pruned model passes the actual pre-fit identifiability audit and produces finite coefficients.
+- **Binary-outcome-style Bernoulli marginal-slope Matérn fits now have full audit-level regression coverage.** The release includes a formula-to-fit test for the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout, proving the scalar-pruned model passes the actual pre-fit identifiability audit and produces finite coefficients.
 
 ## v0.3.90 — gam 0.3.90 / gamfit 0.1.162 (2026-06-04)
 
 ### Fixed
 
-- **Hypertension-style Bernoulli marginal-slope formulas now have an exact regression for scalar-alias pruning.** The release includes a materialization test matching the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout and proves the local-column-3 scalar alias is removed before the identifiability audit while the Matérn blocks remain intact.
+- **Binary-outcome-style Bernoulli marginal-slope formulas now have an exact regression for scalar-alias pruning.** The release includes a materialization test matching the reported `matern(...) + sex + entry_age_z + current_age_ns_*` layout and proves the local-column-3 scalar alias is removed before the identifiability audit while the Matérn blocks remain intact.
 
 ## v0.3.89 — gam 0.3.89 / gamfit 0.1.161 (2026-06-04)
 
@@ -581,7 +581,7 @@ under-identification robustness layer (off by default).
 - **Bernoulli marginal-slope redundant-scalar handling now has fail-closed
   regression coverage.** Tests now lock in that constrained or explicitly
   penalized duplicate scalar columns are rejected rather than pruned, preserving
-  the hardened identifiability audit contract for hypertension-style BMS
+  the hardened identifiability audit contract for binary-outcome-style BMS
   formulas with redundant scalar covariates.
 
 ## v0.3.88 — gam 0.3.88 / gamfit 0.1.160 (2026-06-04)
@@ -594,7 +594,7 @@ under-identification robustness layer (off by default).
 
 ### Fixed
 
-- **Bernoulli marginal-slope Matérn fits with redundant scalar covariates no longer fail the identifiability audit.** The workflow now removes unpenalized scalar columns that add no direction beyond the implicit intercept and earlier scalar terms before BMS block construction, and rejects constrained or explicitly-penalized duplicates instead of using a ridge or constraint to mask non-identifiability. This keeps the hardened audit fail-closed while allowing large-scale hypertension-style `matern(...) + scalar covariates` fits whose precomputed scalar spline column is constant or redundant.
+- **Bernoulli marginal-slope Matérn fits with redundant scalar covariates no longer fail the identifiability audit.** The workflow now removes unpenalized scalar columns that add no direction beyond the implicit intercept and earlier scalar terms before BMS block construction, and rejects constrained or explicitly-penalized duplicates instead of using a ridge or constraint to mask non-identifiability. This keeps the hardened audit fail-closed while allowing large-scale binary-outcome-style `matern(...) + scalar covariates` fits whose precomputed scalar spline column is constant or redundant.
 
 ## v0.3.86 — gam 0.3.86 / gamfit 0.1.158 (2026-06-04)
 

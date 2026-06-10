@@ -34,7 +34,7 @@ You have:
 2. A continuous risk score that is, or can be made, conditionally
    `N(0, 1)`.
 3. Reason to believe the score's effect size varies across covariates
-   (e.g. across age, ancestry PCs).
+   (e.g. across age, grouping PCs).
 
 A single-coefficient logistic or Cox fit on `outcome ~ score + ...`
 forces one slope on the score. Marginal-slope makes the slope itself a
