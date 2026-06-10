@@ -495,7 +495,7 @@ fn run_path(
         }
     };
 
-    let mut state = ContinuationState {
+    let state = ContinuationState {
         last_rho: rho_first,
         last_eval: eval0,
         last_beta: beta_seed.clone(),
