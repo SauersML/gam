@@ -22,12 +22,18 @@
 //! the isometry-penalty curvature). It is *pinned* (broken by the data or the
 //! isometry penalty) iff `ξ` has a component in `range(H)`.
 //!
-//! The RRQR decides exactly that "is this column in the span of the
-//! higher-priority columns" question: we stack `[ P | G ]` with `P` an
-//! orthonormal basis for `range(H)` (high gauge priority) and `G` the generator
-//! columns (lower priority); a generator demoted past the rank threshold lies in
-//! `span(P)` and is **pinned**, a generator that survives the pivot carries an
-//! orthogonal-complement component and is an **unpinned** residual gauge freedom.
+//! The RRQR builds the pinning span: an orthonormal basis `P` for `range(H)`
+//! via the same penalty-aware, leverage-scaled rank decision the audit uses.
+//! Each generator is then tested by **projection onto that span**: the pinned
+//! energy fraction `‖Pᵀξ‖²/‖ξ‖²` is the share of the generator's energy lying
+//! in curvature-carrying directions. A generator is **unpinned** iff that
+//! fraction is at the numerical noise floor ([`GENERATOR_FLAT_ENERGY_TOL`]) —
+//! the objective is genuinely flat along it. Any larger component means the
+//! orbit costs objective, so the exact symmetry is broken and the generator is
+//! **pinned** — including the *mixed* case (partly curved, partly flat), where
+//! replicate fits do NOT differ by that group element even though some flat
+//! directions remain nearby. The fraction itself is reported per generator so
+//! partial flatness stays visible instead of being collapsed into the boolean.
 //!
 //! The whole computation is performed in the inner product carried by the fit's
 //! [`crate::inference::row_metric::RowMetric`]: the curvature span `P` is built
@@ -902,6 +908,17 @@ impl GeneratorFamily {
     }
 }
 
+/// Pinned-energy noise floor for the per-generator flatness verdict: a
+/// generator is certified **unpinned** iff the fraction of its energy lying in
+/// the pinning span, `‖Pᵀξ‖²/‖ξ‖²`, is at or below this tolerance. An exact
+/// residual symmetry of the converged objective has fraction 0 up to
+/// orthonormalization roundoff; any genuinely curved component — however
+/// partial — means the orbit costs objective and the exact group element is
+/// broken, so a *mixed* generator (e.g. a frame rotation the anisotropic
+/// output-Fisher isometry pin gives partial curvature, the #980 Theorem-2
+/// situation) must be reported pinned, never as a surviving freedom.
+pub const GENERATOR_FLAT_ENERGY_TOL: f64 = 1.0e-3;
+
 /// One enumerated symmetry generator and the certificate's verdict on it.
 #[derive(Debug, Clone)]
 pub struct GeneratorVerdict {
@@ -912,13 +929,20 @@ pub struct GeneratorVerdict {
     /// `true` ⇒ the converged objective is flat along this generator
     /// (`ξ ∈ ker(H)`): a genuine residual gauge freedom the data + isometry
     /// penalty leave unbroken. `false` ⇒ the generator is pinned — the data or
-    /// the isometry penalty gives it curvature (`ξ` demoted into `span(P)` by
-    /// the RRQR).
+    /// the isometry penalty gives it curvature (a pinned-energy fraction above
+    /// [`GENERATOR_FLAT_ENERGY_TOL`]).
     pub unpinned: bool,
     /// `‖ξ‖₂` of the realised tangent direction (0 ⇒ the generator was
     /// structurally trivial — e.g. a rotation of a rank-deficient frame — and
     /// is reported as pinned/absent, never as a spurious freedom).
     pub generator_norm: f64,
+    /// `‖Pᵀξ‖²/‖ξ‖²` ∈ [0, 1]: the share of the generator's energy lying in
+    /// the pinning span `range(H)`. `0` ⇒ exactly flat (unpinned), `1` ⇒ fully
+    /// pinned; strictly-interior values are the *mixed* regime — partial
+    /// curvature that breaks the exact symmetry (verdict pinned) while leaving
+    /// nearby flat directions, kept visible here rather than collapsed into the
+    /// boolean. Structurally trivial generators (zero norm) report `1.0`.
+    pub pinned_energy_fraction: f64,
 }
 
 /// The certificate produced by [`residual_gauge`].
@@ -1324,14 +1348,19 @@ fn pinning_span_basis(model: &FittedSaeManifold) -> Result<Array2<f64>, String> 
 /// 2. Build an orthonormal basis `P` for the pinning span `range(H)` =
 ///    `range(H_data) + range(H_isometry)` in the fit's [`RowMetric`]
 ///    ([`pinning_span_basis`]).
-/// 3. For each generator `ξ`, stack `[ P | ξ ]` and run
-///    [`rrqr_with_permutation`]: `ξ` is **pinned** iff the rank does not
-///    increase (i.e. `ξ ∈ span(P)`, the generator demoted past the rank
-///    threshold), **unpinned** (a residual gauge freedom) iff the rank
-///    increases (its orthogonal-complement component survives). This is the same
-///    penalty-aware, leverage-scaled rank decision
-///    [`crate::solver::identifiability_audit::audit_identifiability`] makes on
-///    design columns, applied to generators.
+/// 3. For each generator `ξ`, project onto the span: the pinned energy
+///    fraction `‖Pᵀξ‖²/‖ξ‖²` is the share of the generator's energy lying in
+///    curvature-carrying directions. `ξ` is **unpinned** (a residual gauge
+///    freedom) iff that fraction is at the noise floor
+///    ([`GENERATOR_FLAT_ENERGY_TOL`]) — the converged objective is genuinely
+///    flat along it (`ξ ∈ ker(H)`). Any larger fraction — including the
+///    *mixed* regime where `ξ` carries both a curved and a flat component —
+///    means the orbit costs objective, the exact group element is broken, and
+///    the generator is **pinned**. (A rank-increase test on `[ P | ξ ]` would
+///    misclassify the mixed regime as a surviving freedom: rank increases
+///    whenever ANY flat component exists, even though replicate fits do not
+///    differ by `exp(tξ)` when part of `ξ` is curved.) The fraction is
+///    reported per generator so partial flatness stays visible.
 ///
 /// # Escalations
 ///
@@ -1385,7 +1414,7 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
     // The isometry pin is inactive ⇒ diffeomorphism-unpinned escalation.
     let diffeomorphism_unpinned = model.isometry_penalty_root.nrows() == 0;
 
-    // 3. Per-generator RRQR rank test against `[ P | ξ ]`.
+    // 3. Per-generator flatness verdict by projection onto the pinning span.
     let mut verdicts: Vec<GeneratorVerdict> = Vec::with_capacity(gens.len());
     for (family, g, description) in &gens {
         let norm = g.iter().map(|v| v * v).sum::<f64>().sqrt();
@@ -1398,27 +1427,33 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
                 description: description.clone(),
                 unpinned: false,
                 generator_norm: 0.0,
+                pinned_energy_fraction: 1.0,
             });
             continue;
         }
-        // Stack [ P | ξ ] (param_dim × (pinning_rank + 1)) and rank-test.
-        let mut stacked = Array2::<f64>::zeros((param_dim, pinning_rank + 1));
-        if pinning_rank > 0 {
-            stacked.slice_mut(s![.., ..pinning_rank]).assign(&p_basis);
-        }
-        stacked.column_mut(pinning_rank).assign(g);
-        let rrqr = rrqr_with_permutation(&stacked, default_rrqr_rank_alpha())
-            .map_err(|e| format!("residual_gauge: RRQR on [P|ξ] failed: {e:?}"))?;
-        // The generator is the trailing column. It is UNPINNED iff the stacked
-        // rank strictly exceeds the pinning rank — i.e. ξ added a new direction
-        // outside span(P). Because P is orthonormal of full column rank, that is
-        // exactly `rank == pinning_rank + 1`.
-        let unpinned = rrqr.rank > pinning_rank;
+        // Pinned energy fraction ‖Pᵀξ̂‖² of the unit generator ξ̂ = ξ/‖ξ‖.
+        // P is orthonormal (thin QR of the pivoted curvature root), so this is
+        // exactly the squared cosine of the principal angle between ξ and
+        // range(H). Unpinned ⇔ flat ⇔ fraction at the noise floor. A MIXED
+        // generator (strictly interior fraction) is pinned: its orbit costs
+        // objective, so the exact symmetry does not survive — the old
+        // rank-increase test on [P|ξ] would have called any nonzero flat
+        // component a freedom, under-claiming identification (#980 Theorem-2
+        // arm is exactly such a mixed case).
+        let pinned_energy_fraction = if pinning_rank == 0 {
+            0.0
+        } else {
+            let unit = g.mapv(|v| v / norm);
+            let coeffs = p_basis.t().dot(&unit);
+            coeffs.iter().map(|c| c * c).sum::<f64>().clamp(0.0, 1.0)
+        };
+        let unpinned = pinned_energy_fraction <= GENERATOR_FLAT_ENERGY_TOL;
         verdicts.push(GeneratorVerdict {
             family: *family,
             description: description.clone(),
             unpinned,
             generator_norm: norm,
+            pinned_energy_fraction,
         });
     }
 
