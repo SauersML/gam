@@ -12887,13 +12887,11 @@ struct JointSpectralNewtonStep {
     most_negative_eigenvalue: f64,
 }
 
-/// Test-support home for the exact trust-region engine below: it is exercised
-/// only by `trust_region_subproblem_tests` until the owning actor's production
-/// cutover of the joint trust-region step lands, and the ban-gate's sanctioned
-/// scoping for src items in that state is a `*_tests` module (the non-test
-/// profile carries no unwired code).
-#[cfg(test)]
-mod whitened_spectrum_tests {
+/// Production home for the exact trust-region engine ([`WhitenedHessianSpectrum`]),
+/// wired into the unconstrained dense-spectral joint-Newton step in
+/// `inner_blockwise_fit` (gam#979). Kept in its own module so the engine's
+/// helpers stay namespaced; the parent reaches it via `whitened_spectrum::`.
+mod whitened_spectrum {
     use super::*;
 
     /// Eigendecomposition of the metric-whitened penalized Hessian, retained so
@@ -13283,7 +13281,7 @@ mod whitened_spectrum_tests {
 
 #[cfg(test)]
 mod trust_region_subproblem_tests {
-    use super::whitened_spectrum_tests::WhitenedHessianSpectrum;
+    use super::whitened_spectrum::WhitenedHessianSpectrum;
     use super::*;
     use ndarray::array;
 
@@ -15490,6 +15488,15 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let solve_joint_constraints_dense = joint_constraints.is_some()
                 || !matrix_free_joint_requested
                 || joint_hessian_is_dense;
+            // Exact trust-region subproblem factorization (gam#979). Populated on
+            // the unconstrained dense-spectral path with the metric-whitened
+            // eigendecomposition of the penalized Hessian, so the trust loop below
+            // re-solves the *exact* Moré–Sorensen subproblem at each trust radius
+            // from one factorization — replacing the dogleg/Cauchy/box-truncation
+            // globalization with the single object they all approximate. `None` on
+            // the constrained-QP and matrix-free PCG paths, which keep their
+            // existing globalization untouched.
+            let mut joint_spectrum: Option<whitened_spectrum::WhitenedHessianSpectrum> = None;
             let (candidate_beta, joint_active_set, joint_step_spectral_nullity) =
                 if solve_joint_constraints_dense
                     && let Some(constraints) = joint_constraints.as_ref()
@@ -15940,6 +15947,22 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             );
                         }
                         delta = Some(spectral_step.delta);
+                        // Retain the metric-whitened factorization so the trust
+                        // loop below re-solves the EXACT Moré–Sorensen subproblem
+                        // at each radius (gam#979). `lhs_true` already carries the
+                        // penalty and the Firth/Jeffreys curvature H_Φ, and
+                        // `spectral_rhs` the augmented stationarity RHS, so the
+                        // subproblem model matches the predicted-reduction model
+                        // and the accept/reject gain ratio exactly. The reflected
+                        // `spectral_step` above still seeds candidate_beta / the
+                        // cycle-0 radius / the pre-line-search step_inf.
+                        joint_spectrum =
+                            Some(whitened_spectrum::WhitenedHessianSpectrum::decompose(
+                                &lhs_true,
+                                &spectral_rhs,
+                                &joint_trust_metric_diag,
+                                KKT_REFUSAL_RANK_TOL,
+                            )?);
                     }
 
                     let Some(delta) = delta else {
@@ -16185,7 +16208,20 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // or after the preconditioned-descent fallback replaced
                 // `search_delta`) fall back to box-truncating the search step.
                 let mut trial_delta;
-                let mut block_step_norms = if let Some(cauchy) = dogleg_cauchy.as_ref()
+                let mut block_step_norms = if let Some(spectrum) = joint_spectrum.as_ref() {
+                    // Exact Moré–Sorensen trust-region step at the current radius
+                    // (gam#979). The step already lies in the `D`-metric ball, so
+                    // no dogleg blend or box-truncation is applied: on a shrink the
+                    // direction is RE-SOLVED (bending toward the gradient), the
+                    // property the dogleg/truncation lacked. Re-solving reuses the
+                    // cached factorization at O(p) cost.
+                    trial_delta = spectrum.trust_region_step(joint_trust_radius).delta;
+                    joint_trust_region_block_metric_norms(
+                        &trial_delta,
+                        &ranges,
+                        &joint_trust_metric_diag,
+                    )
+                } else if let Some(cauchy) = dogleg_cauchy.as_ref()
                     && !tried_preconditioned_descent
                 {
                     trial_delta = Array1::<f64>::zeros(total_p);
