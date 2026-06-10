@@ -200,12 +200,14 @@ const ALO_GRADIENT_MAX_WORK: usize = 4_000_000;
 
 /// Shared factorization of the stabilized penalized Hessian, computed once on
 /// the value path and threaded into the ALO ρ-gradient so the gradient never
-/// re-materializes dense `X` or re-factorizes the same matrix (#862).
+/// re-materializes dense `X` or re-factorizes the same matrix (#862). The
+/// inverse itself lives behind the one sensitivity operator (#935), so this
+/// site holds no private H⁻¹ convention.
 struct AloFactoredHessian<'a> {
     /// Dense transformed design `X` (n × p).
     x: &'a Array2<f64>,
-    /// Lower-triangular Cholesky factor of the stabilized penalized Hessian.
-    chol: &'a crate::linalg::faer_ndarray::FaerCholeskyFactor,
+    /// The fit's sensitivity operator over the stabilized penalized Hessian.
+    sensitivity: &'a crate::solver::sensitivity::FitSensitivity<'a>,
     /// `H⁻¹Xᵀ` (p × n), the column-solve the gradient reuses per observation.
     h_inv_xt: &'a Array2<f64>,
 }
@@ -9986,8 +9988,11 @@ impl<'a> RemlState<'a> {
                 .cholesky(Side::Lower)
             {
                 Ok(chol) => {
-                    let mut h_inv_xt = x.t().to_owned();
-                    chol.solve_mat_in_place(&mut h_inv_xt);
+                    let sensitivity = crate::solver::sensitivity::FitSensitivity::from_faer_cholesky(
+                        &chol,
+                        x.ncols(),
+                    );
+                    let h_inv_xt = sensitivity.leverage_block(&x);
                     self.alo_stabilization_gradient(
                         rho,
                         bundle,
@@ -9996,7 +10001,7 @@ impl<'a> RemlState<'a> {
                         phi,
                         &AloFactoredHessian {
                             x: &x,
-                            chol: &chol,
+                            sensitivity: &sensitivity,
                             h_inv_xt: &h_inv_xt,
                         },
                     )?
@@ -10151,7 +10156,11 @@ impl<'a> RemlState<'a> {
         phi: f64,
         factored: &AloFactoredHessian<'_>,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        let &AloFactoredHessian { x, chol, h_inv_xt } = factored;
+        let &AloFactoredHessian {
+            x,
+            sensitivity,
+            h_inv_xt,
+        } = factored;
         let beta = bundle.pirls_result.beta_transformed.as_ref();
         let k = rho.len();
         let nrows = x.nrows();
@@ -10166,7 +10175,7 @@ impl<'a> RemlState<'a> {
                 beta,
             )
             .mapv(|v| lambda * v);
-            let mut mode_deriv = chol.solvevec(&sbeta);
+            let mut mode_deriv = sensitivity.apply(&sbeta);
             mode_deriv.mapv_inplace(|v| -v);
             let eta_deriv = x.dot(&mode_deriv);
 

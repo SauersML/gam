@@ -786,7 +786,6 @@ fn global_query_sketch<S: AtomFrameSketch>(
 mod tests {
     use super::*;
     use rand::RngExt as _;
-    use rand::SeedableRng as _;
     use rand::rngs::StdRng;
 
     /// Draw a unit vector in `p` dims from a seeded RNG.

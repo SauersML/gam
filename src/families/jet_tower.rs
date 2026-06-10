@@ -766,49 +766,90 @@ mod tests {
     /// every tower channel is checked against central finite differences
     /// of the channel one order below — value→grad, grad→hess, hess→t3,
     /// t3→t4 — so each order is independently anchored.
-    struct GnarlyProgram;
+    ///
+    /// The program carries a per-row primary fixture plus a per-row offset
+    /// `tau[row]` that enters the loss as a constant, so `row` genuinely
+    /// drives both the seed point and the evaluated expression.
+    struct GnarlyProgram {
+        primaries: Vec<[f64; 3]>,
+        tau: Vec<f64>,
+    }
+
+    impl GnarlyProgram {
+        fn fixture() -> Self {
+            Self {
+                primaries: vec![[0.4, -0.7, 1.2], [-0.9, 0.6, 0.3], [1.1, -0.2, -0.8]],
+                tau: vec![0.15, -0.35, 0.5],
+            }
+        }
+    }
 
     impl RowNllProgram<3> for GnarlyProgram {
         fn n_rows(&self) -> usize {
-            1
+            self.primaries.len()
         }
         fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
-            assert_eq!(row, 0, "single-row program");
-            Ok([0.4, -0.7, 1.2])
+            self.primaries
+                .get(row)
+                .copied()
+                .ok_or_else(|| format!("gnarly: row {row} out of range"))
         }
         fn row_nll(&self, row: usize, p: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
-            assert_eq!(row, 0, "single-row program");
+            let tau = *self
+                .tau
+                .get(row)
+                .ok_or_else(|| format!("gnarly: tau row {row} out of range"))?;
             let a = (p[0] * p[1]).exp();
             let b = (p[2] * p[2] + 1.0).sqrt();
-            let c = (a + b).ln();
+            let c = (a + b + tau).ln();
             let d = (p[1] * 0.5 + 2.0).powf(1.7);
             Ok(c / d + (p[0] - p[2]) * (p[0] - p[2]) * 0.25)
         }
     }
 
-    fn gnarly_tower_at(p: [f64; 3]) -> Tower4<3> {
-        struct At {
+    /// Evaluate the gnarly program's tower at an ARBITRARY seed point for
+    /// `row` (used to drive central differences off the fixture grid),
+    /// while keeping `row`'s per-row data (`tau`) in the loss.
+    fn gnarly_tower_at(prog: &GnarlyProgram, row: usize, p: [f64; 3]) -> Tower4<3> {
+        struct At<'a> {
+            base: &'a GnarlyProgram,
+            row: usize,
             p: [f64; 3],
         }
-        impl RowNllProgram<3> for At {
+        impl RowNllProgram<3> for At<'_> {
             fn n_rows(&self) -> usize {
                 1
             }
             fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
-                assert_eq!(row, 0, "single-row program");
+                if row != 0 {
+                    return Err(format!("gnarly-at: row {row} out of range"));
+                }
                 Ok(self.p)
             }
-            fn row_nll(&self, row: usize, vars: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
-                GnarlyProgram.row_nll(row, vars)
+            fn row_nll(&self, eval_row: usize, vars: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
+                if eval_row != 0 {
+                    return Err(format!("gnarly-at: eval row {eval_row} out of range"));
+                }
+                self.base.row_nll(self.row, vars)
             }
         }
-        evaluate_program(&At { p }, 0).expect("gnarly tower")
+        evaluate_program(
+            &At {
+                base: prog,
+                row,
+                p,
+            },
+            0,
+        )
+        .expect("gnarly tower")
     }
 
     #[test]
     fn gnarly_tower_is_fd_consistent_order_by_order() {
-        let base = GnarlyProgram.primaries(0).expect("primaries");
-        let t = gnarly_tower_at(base);
+        let prog = GnarlyProgram::fixture();
+        for row in 0..prog.n_rows() {
+        let base = prog.primaries(row).expect("primaries");
+        let t = gnarly_tower_at(&prog, row, base);
         let h_step = 1e-5;
         let tol = 1e-6;
         for c in 0..3 {
@@ -816,8 +857,8 @@ mod tests {
             let mut dn = base;
             up[c] += h_step;
             dn[c] -= h_step;
-            let t_up = gnarly_tower_at(up);
-            let t_dn = gnarly_tower_at(dn);
+            let t_up = gnarly_tower_at(&prog, row, up);
+            let t_dn = gnarly_tower_at(&prog, row, dn);
             // value → gradient.
             let fd_g = (t_up.v - t_dn.v) / (2.0 * h_step);
             assert!(
@@ -857,6 +898,7 @@ mod tests {
                 }
             }
         }
+        }
     }
 
     /// The oracle harness catches a planted #736-style sign flip in a
@@ -895,5 +937,79 @@ mod tests {
             err.contains("third[0][0][1]"),
             "oracle must name the flipped channel, got: {err}"
         );
+    }
+
+    /// The third- and fourth-order tensors must be FULLY symmetric under
+    /// index permutation (mixed partials commute). The tower stores them
+    /// unsymmetrized, so equal-by-construction is a real invariant of the
+    /// Leibniz/Faà di Bruno writes — a cheap typo tripwire. Asserted on a
+    /// nontrivial K=3 tower with all of div/sqrt/powf/exp/ln exercised, so
+    /// every composition path contributes. Lives in a test (not the hot
+    /// per-op path) on purpose.
+    #[test]
+    fn t3_t4_are_fully_index_symmetric() {
+        let prog = GnarlyProgram::fixture();
+        // 3! = 6 permutations of three indices.
+        let perms3: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        // 4! = 24 permutations of four indices.
+        let perms4: [[usize; 4]; 24] = [
+            [0, 1, 2, 3], [0, 1, 3, 2], [0, 2, 1, 3], [0, 2, 3, 1], [0, 3, 1, 2], [0, 3, 2, 1],
+            [1, 0, 2, 3], [1, 0, 3, 2], [1, 2, 0, 3], [1, 2, 3, 0], [1, 3, 0, 2], [1, 3, 2, 0],
+            [2, 0, 1, 3], [2, 0, 3, 1], [2, 1, 0, 3], [2, 1, 3, 0], [2, 3, 0, 1], [2, 3, 1, 0],
+            [3, 0, 1, 2], [3, 0, 2, 1], [3, 1, 0, 2], [3, 1, 2, 0], [3, 2, 0, 1], [3, 2, 1, 0],
+        ];
+        for row in 0..prog.n_rows() {
+            let t = evaluate_program(&prog, row).expect("gnarly tower");
+            let scale_t3 = t
+                .t3
+                .iter()
+                .flatten()
+                .flatten()
+                .fold(0.0_f64, |m, x| m.max(x.abs()))
+                .max(1.0);
+            let scale_t4 = t
+                .t4
+                .iter()
+                .flatten()
+                .flatten()
+                .flatten()
+                .fold(0.0_f64, |m, x| m.max(x.abs()))
+                .max(1.0);
+            for i in 0..3 {
+                for j in 0..3 {
+                    for k in 0..3 {
+                        let base = t.t3[i][j][k];
+                        let idx = [i, j, k];
+                        for p in &perms3 {
+                            let permed = t.t3[idx[p[0]]][idx[p[1]]][idx[p[2]]];
+                            assert!(
+                                (base - permed).abs() <= 1e-12 * scale_t3,
+                                "row {row}: t3[{i}][{j}][{k}]={base:+.15e} != \
+                                 permuted {permed:+.15e} under {p:?}"
+                            );
+                        }
+                        for l in 0..3 {
+                            let base4 = t.t4[i][j][k][l];
+                            let idx4 = [i, j, k, l];
+                            for p in &perms4 {
+                                let permed = t.t4[idx4[p[0]]][idx4[p[1]]][idx4[p[2]]][idx4[p[3]]];
+                                assert!(
+                                    (base4 - permed).abs() <= 1e-12 * scale_t4,
+                                    "row {row}: t4[{i}][{j}][{k}][{l}]={base4:+.15e} != \
+                                     permuted {permed:+.15e} under {p:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
