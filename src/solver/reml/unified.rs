@@ -17209,9 +17209,12 @@ fn stochastic_trace_hinv_crosses<'a>(
     generic_ops: &[&'a dyn HyperOperator],
     implicit_ops: &[&'a ImplicitHyperOperator],
 ) -> Array2<f64> {
+    // The `_with_floor` variant takes a slice of references; adapt the owned
+    // slice without copying the matrices.
+    let dense_refs: Vec<&'a Array2<f64>> = dense_matrices.iter().collect();
     stochastic_trace_hinv_crosses_with_floor(
         hop,
-        dense_matrices,
+        &dense_refs,
         coord_has_operator,
         generic_ops,
         implicit_ops,

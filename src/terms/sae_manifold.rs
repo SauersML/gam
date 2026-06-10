@@ -36,10 +36,10 @@ use crate::solver::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
     ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp,
     SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur,
-    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
+    solve_arrow_newton_step_with_proximal_correction,
 };
 use crate::terms::analytic_penalties::{
-    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
+    AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
     DecoderIncoherencePenalty, IBPAssignmentPenalty, IsometryPenalty, MechanismSparsityPenalty,
     NuclearNormPenalty, PenaltyTier, PsiSlice, SoftmaxAssignmentSparsityPenalty, WeightField,
     resolve_learnable_weight,
