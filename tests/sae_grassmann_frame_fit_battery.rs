@@ -393,52 +393,110 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
     // property, not an optimized-fit property.)
     //
     // We first drive the term to a PD inner basin through the engine, then
-    // evaluate the criterion at the fixed log λ = 0 ρ on both representations
-    // (re-solving the inner state from the converged decoder stays PD).
+    // evaluate the criterion at FIXED log λ values on both representations
+    // (re-solving the inner state from the converged decoder stays PD). Working
+    // out the difference Δ(log λ) = V_framed − V_full from the criterion
+    // `V = data_fit + penalty + ½ log|H| − occam`:
+    //
+    //   * data_fit, penalty value, and ½ log|H| are assembled on the full
+    //     decoder in BOTH arms (the frame never enters `assemble_arrow_schur`),
+    //     and the inner re-fit at a given λ is frame-independent, so all three
+    //     are identical across arms at every λ.
+    //   * the only frame-dependent term is the occam normalizer:
+    //       occam_full   = ½ logλ · Σ_k p·rank(S_k)
+    //       occam_framed = ½ logλ · Σ_k r_k·rank(S_k) − ½ logλ · Σ_k r_k(p−r_k)
+    //     so V = … − occam gives
+    //       Δ(logλ) = occam_full − occam_framed
+    //               = ½ logλ · [ Σ_k (p−r_k)·rank(S_k) + Σ_k r_k(p−r_k) ]
+    //               = C · logλ,  with C > 0.
+    //
+    // Hence Δ is EXACTLY linear in log λ and passes through 0: Δ(0)=0,
+    // Δ(2)=2·Δ(1), Δ(1)>0. This pins that the frame's sole criterion effect is
+    // the documented Grassmann-dimension accounting term — a leak of the
+    // factored representation into the data-fit / log-det, or a drift in
+    // `grassmann_evidence_dimension`/`reml_occam_term`, breaks the linearity or
+    // the Δ(0)=0 anchor. (At the *optimized* λ̂ the two criteria correctly
+    // DIFFER by C·logλ̂; equality is a fixed-λ=0 property, not a fit property.
+    // NOTE: this Δ is a pure normalizer term because the factored border solve
+    // is not yet wired into the assembly — see the companion issue. When it
+    // lands, the data-fit/log-det arms diverge too and these assertions must be
+    // re-derived against the factored log-det.)
     let (converged, _) = fit_via_engine(base.clone(), &z, "frame battery seed fit");
-    let rho0 = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(0); k]);
 
-    let mut full = converged.clone();
-    for atom in &mut full.atoms {
-        atom.deactivate_decoder_frame();
-    }
-    let mut framed = converged.clone();
-    for atom in &mut framed.atoms {
-        atom.maybe_activate_decoder_frame().expect("activate");
-    }
-    let (v_full, _) = full
-        .reml_criterion(
-            z.view(),
-            &rho0,
-            None,
-            INNER_MAX_ITER,
-            LEARNING_RATE,
-            RIDGE_EXT_COORD,
-            RIDGE_BETA,
-        )
-        .expect("full-B criterion at log λ=0");
-    let (v_framed, _) = framed
-        .reml_criterion(
-            z.view(),
-            &rho0,
-            None,
-            INNER_MAX_ITER,
-            LEARNING_RATE,
-            RIDGE_EXT_COORD,
-            RIDGE_BETA,
-        )
-        .expect("framed criterion at log λ=0");
-    let scale = v_full.abs().max(1.0);
-    let gap = (v_framed - v_full).abs();
+    // Evaluate (V_full, V_framed) at a fixed smoothness log λ, re-solving each
+    // arm's inner state from the converged decoder.
+    let eval_arms = |log_lambda_smooth: f64| -> (f64, f64) {
+        let rho = SaeManifoldRho::new(0.0, log_lambda_smooth, vec![Array1::<f64>::zeros(0); k]);
+        let mut full = converged.clone();
+        for atom in &mut full.atoms {
+            atom.deactivate_decoder_frame();
+        }
+        let mut framed = converged.clone();
+        for atom in &mut framed.atoms {
+            atom.maybe_activate_decoder_frame().expect("activate");
+        }
+        let (v_full, _) = full
+            .reml_criterion(
+                z.view(),
+                &rho,
+                None,
+                INNER_MAX_ITER,
+                LEARNING_RATE,
+                RIDGE_EXT_COORD,
+                RIDGE_BETA,
+            )
+            .expect("full-B criterion");
+        let (v_framed, _) = framed
+            .reml_criterion(
+                z.view(),
+                &rho,
+                None,
+                INNER_MAX_ITER,
+                LEARNING_RATE,
+                RIDGE_EXT_COORD,
+                RIDGE_BETA,
+            )
+            .expect("framed criterion");
+        (v_full, v_framed)
+    };
+
+    let (vf0, vfr0) = eval_arms(0.0);
+    let (vf1, vfr1) = eval_arms(1.0);
+    let (vf2, vfr2) = eval_arms(2.0);
+    let d0 = vfr0 - vf0;
+    let d1 = vfr1 - vf1;
+    let d2 = vfr2 - vf2;
+    let scale = vf0.abs().max(1.0);
     println!(
-        "evidence@logλ=0: full={v_full:.8} framed={v_framed:.8} gap={gap:.3e} (rel {:.3e})",
-        gap / scale
+        "evidence: V_full(0)={vf0:.8} V_framed(0)={vfr0:.8} | \
+         Δ(0)={d0:.3e} Δ(1)={d1:.6} Δ(2)={d2:.6}  (Δ(2)/Δ(1)={:.6})",
+        d2 / d1
     );
+
+    // (a) Δ(0) = 0: at log λ = 0 the occam term vanishes, so the framed and
+    //     full-B criteria must agree to round-off. A gap means the factored
+    //     representation leaked into the data-fit / log-det.
     assert!(
-        gap <= 1.0e-6 * scale,
-        "EVIDENCE DRIFT: frame-factored criterion {v_framed:.8} vs full-B {v_full:.8} \
-         (gap {gap:.3e}) at log λ=0 — the factored representation leaked into the \
-         log-det / data-fit, or grassmann_evidence_dimension/reml_occam_term drifted"
+        d0.abs() <= 1.0e-6 * scale,
+        "EVIDENCE DRIFT: Δ(0) = {d0:.3e} (rel {:.3e}) must be ~0 — frame activation \
+         perturbed the data-fit / log-det at log λ = 0",
+        d0.abs() / scale
+    );
+    // (b) Δ(1) > 0: the Grassmann-dimension accounting is actually engaged
+    //     (C > 0), not silently dropped.
+    assert!(
+        d1 > 1.0e-6 * scale,
+        "EVIDENCE: Δ(1) = {d1:.3e} must be strictly positive — the profiled-frame \
+         dimension term is not entering reml_occam_term"
+    );
+    // (c) Δ(2) = 2·Δ(1): the frame's only effect is the term LINEAR in log λ.
+    //     Any nonlinearity is a leak of the factored representation into a
+    //     λ-nonlinear quantity (data-fit / log-det).
+    assert!(
+        (d2 - 2.0 * d1).abs() <= 1.0e-6 * d1.abs().max(scale),
+        "EVIDENCE DRIFT: Δ(2) = {d2:.6} ≠ 2·Δ(1) = {:.6} — the frame's criterion \
+         effect is not the pure linear Grassmann-dimension accounting term",
+        2.0 * d1
     );
 }
 
