@@ -1,6 +1,7 @@
 pub(crate) mod active_set;
 pub mod arrow_schur;
 pub mod continuation_path;
+pub mod cross_node;
 pub mod estimate;
 pub mod evidence;
 pub mod gaussian_reml;
