@@ -88,6 +88,16 @@ pub enum ShardError {
         found: usize,
         path: PathBuf,
     },
+    /// After a window fill the front resident shard does not match the read
+    /// cursor. The window is contractually a contiguous run of shard indices
+    /// starting at `cursor_shard`, so the front must equal it; a mismatch is an
+    /// internal window-maintenance logic error. Surfaced (rather than silently
+    /// reading a payload from one shard against another shard's row metadata)
+    /// so corruption never reaches a returned batch.
+    ResidencyInvariant {
+        cursor_shard: usize,
+        front_shard: usize,
+    },
     Empty,
 }
 
@@ -120,6 +130,13 @@ impl std::fmt::Display for ShardError {
                 f,
                 "shard '{}' has width p={found}, expected p={expected}",
                 path.display()
+            ),
+            ShardError::ResidencyInvariant {
+                cursor_shard,
+                front_shard,
+            } => write!(
+                f,
+                "shard window residency invariant violated: read cursor is at shard {cursor_shard} but the window front is shard {front_shard}"
             ),
             ShardError::Empty => write!(f, "shard source has no shards / no rows"),
         }
