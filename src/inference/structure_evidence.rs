@@ -544,6 +544,33 @@ impl StructureLedger {
         &self.claims
     }
 
+    /// The likelihood half of the probe-design loop (work-plan step 4):
+    /// after running a planned probe ([`ProbePlan`] →
+    /// `crate::inference::steering::steer_delta`), evaluate the REALIZED
+    /// outcomes under both hypotheses' predictive densities and absorb the
+    /// log-ratio into the contested claim's e-process.
+    ///
+    /// Validity contract: both predictive densities must be FROZEN before the
+    /// probe outcome is observed — which the design loop satisfies by
+    /// construction, since both hypotheses' dictionaries were fitted before
+    /// the probe was even chosen. For a composite null, the null density must
+    /// be the honest constrained fit (the same rule as
+    /// [`split_likelihood_log_e_value`], which this delegates to); for a
+    /// simple null the predictive density is the sup. Probe outcomes are new
+    /// data by construction (the model was steered to produce them), so they
+    /// compound validly with the claim's prior shard evidence.
+    pub fn absorb_probe_outcome(
+        &mut self,
+        idx: usize,
+        log_lik_alt_on_outcome: f64,
+        log_lik_null_on_outcome: f64,
+    ) -> Result<(), String> {
+        self.absorb_log(
+            idx,
+            split_likelihood_log_e_value(log_lik_alt_on_outcome, log_lik_null_on_outcome),
+        )
+    }
+
     /// The dictionary certificate: e-BH over the ledger's CURRENT
     /// e-values at level α. FDR ≤ α over the confirmed set under arbitrary
     /// dependence — atoms sharing every token is fine — and valid at any
@@ -1049,5 +1076,68 @@ mod tests {
         assert_eq!(gate.test.process.steps(), 6);
         // The alternative state saw the whole stream despite early stopping.
         assert_eq!(alt_state, 20);
+    }
+
+    /// Work-plan step 4, closed end-to-end: a contested claim gets a probe
+    /// plan, the probe's realized outcomes are scored under both FROZEN
+    /// hypotheses via [`StructureLedger::absorb_probe_outcome`], and the
+    /// banked evidence flips the claim to confirmed within a small multiple
+    /// of the plan's predicted resolution budget. Outcome noise is a
+    /// deterministic bounded surrogate (zero-mean sinusoid), so under the
+    /// true alternative each probe's expected log-growth is exactly the
+    /// design value.
+    #[test]
+    fn design_loop_resolves_contested_claim_within_predicted_budget() {
+        let mut ledger = StructureLedger::new();
+        let idx = ledger.register(ClaimKind::GeometryKind {
+            atom: 0,
+            kind: "circle".to_string(),
+        });
+
+        // Local Gaussian output model, unit-isotropic noise in the
+        // Fisher-whitened coordinates: per-observation expected log-growth
+        // under H1 is exactly the planned ½‖μ₁−μ₀‖²_F.
+        let fisher = array![[1.0, 0.0], [0.0, 1.0]];
+        let mu0 = array![0.0, 0.0];
+        let mu1 = array![1.2, 0.5];
+        let probes = vec![CandidateProbe {
+            delta: array![0.0, 1.0],
+            predicted_mean_null: mu0.clone(),
+            predicted_mean_alt: mu1.clone(),
+        }];
+        let alpha = 0.05;
+        let plan = plan_probe_for_contested_claim(&probes, &fisher, alpha, 0.0).expect("plan");
+        assert_eq!(plan.probe, 0);
+        // ½‖μ₁−μ₀‖² = ½(1.44 + 0.25) = 0.845 nats/obs; ln 20 ≈ 3.0 ⇒ ~3.6 obs.
+        assert!((plan.expected_log_growth - 0.845).abs() < 1e-12);
+        let budget = plan.budget_remaining.ceil().max(1.0) as usize;
+
+        // Run the probe loop: outcomes realized under the TRUE alternative
+        // (mean μ₁ plus bounded zero-mean fluctuation); both hypotheses'
+        // densities were frozen above, before any outcome existed.
+        let mut observations = 0usize;
+        while !ledger.claims()[idx].evidence.rejects_at(alpha) {
+            observations += 1;
+            assert!(
+                observations <= 4 * budget,
+                "claim must resolve within a small multiple of the predicted \
+                 budget {budget}; still contested after {observations} probes"
+            );
+            let t = observations as f64;
+            let eps0 = 0.8 * (t * 0.7321).sin();
+            let eps1 = 0.8 * (t * 1.1173).cos();
+            let y = array![mu1[0] + eps0, mu1[1] + eps1];
+            // Unit-Gaussian log-densities under each frozen hypothesis; the
+            // shared normalizer cancels in the ratio.
+            let d1 = &y - &mu1;
+            let d0 = &y - &mu0;
+            ledger
+                .absorb_probe_outcome(idx, -0.5 * d1.dot(&d1), -0.5 * d0.dot(&d0))
+                .expect("absorb");
+        }
+        let cert = ledger.certify(alpha);
+        assert!(cert
+            .confirmed()
+            .any(|e| matches!(e.kind, ClaimKind::GeometryKind { atom: 0, .. })));
     }
 }
