@@ -1920,10 +1920,10 @@ fn run_fit_bernoulli_marginal_slope(
             .map_err(|e| e.to_string())?;
     progress.advance_workflow(4);
     cli_out!(
-        "model fit complete | family={} | outer_iter={} | converged={}",
+        "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_BERNOULLI_MARGINAL_SLOPE,
         solved.fit.outer_iterations,
-        solved.fit.outer_converged
+        solved.fit.pirls_status.label()
     );
     print_spatial_aniso_scales(&solved.marginalspec_resolved);
     print_spatial_aniso_scales(&solved.logslopespec_resolved);
@@ -2074,10 +2074,10 @@ fn run_fit_transformation_normal(
     let frozen_covariate = solved.covariate_spec_resolved.clone();
     progress.advance_workflow(4);
     cli_out!(
-        "model fit complete | family={} | outer_iter={} | converged={}",
+        "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_TRANSFORMATION_NORMAL,
         solved.fit.outer_iterations,
-        solved.fit.outer_converged
+        solved.fit.pirls_status.label()
     );
     print_spatial_aniso_scales(&solved.covariate_spec_resolved);
 
@@ -2244,10 +2244,10 @@ fn run_fitwith_predict_noise(
                 .map_err(|e| e.to_string())?;
         progress.advance_workflow(4);
         cli_out!(
-            "model fit complete | family={} | outer_iter={} | converged={}",
+            "model fit complete | family={} | outer_iter={} | status={}",
             FAMILY_GAUSSIAN_LOCATION_SCALE,
             fit.outer_iterations,
-            fit.outer_converged
+            fit.pirls_status.label()
         );
         print_spatial_aniso_scales(&meanspec_resolved);
         print_spatial_aniso_scales(&noisespec_resolved);
@@ -2435,10 +2435,10 @@ fn run_fitwith_predict_noise(
     .map_err(|e| e.to_string())?;
     progress.advance_workflow(4);
     cli_out!(
-        "model fit complete | family={} | outer_iter={} | converged={}",
+        "model fit complete | family={} | outer_iter={} | status={}",
         FAMILY_BINOMIAL_LOCATION_SCALE,
         fit.outer_iterations,
-        fit.outer_converged
+        fit.pirls_status.label()
     );
     print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
     print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
@@ -4882,8 +4882,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         let fitted_inverse_link = fit.inverse_link.clone();
         cli_out!(
-            "survival location-scale fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
-            fit.fit.fit.outer_converged,
+            "survival location-scale fit | status={} | iterations={} | loglik={:.6e} | objective={:.6e}",
+            fit.fit.fit.pirls_status.label(),
             fit.fit.fit.outer_iterations,
             fit.fit.fit.log_likelihood,
             fit.fit.fit.reml_score
@@ -5231,8 +5231,8 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
         };
         cli_out!(
-            "survival marginal-slope fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e} | baseline_slope={:.4}",
-            fit.fit.outer_converged,
+            "survival marginal-slope fit | status={} | iterations={} | loglik={:.6e} | objective={:.6e} | baseline_slope={:.4}",
+            fit.fit.pirls_status.label(),
             fit.fit.outer_iterations,
             fit.fit.log_likelihood,
             fit.fit.reml_score,
@@ -5503,13 +5503,13 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
             }
         };
         cli_out!(
-            "{} fit | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
+            "{} fit | status={} | iterations={} | loglik={:.6e} | objective={:.6e}",
             if likelihood_mode == SurvivalLikelihoodMode::Latent {
                 "latent survival"
             } else {
                 "latent binary"
             },
-            fit.outer_converged,
+            fit.pirls_status.label(),
             fit.outer_iterations,
             fit.log_likelihood,
             fit.reml_score,
@@ -6795,6 +6795,9 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
+        convergence_status: fit.pirls_status.label().to_string(),
+        converged: fit.pirls_status.is_converged(),
+        outer_gradient_norm: fit.outer_gradient_norm,
         edf_total: model
             .unified()
             .and_then(|u| u.edf_total())
@@ -7718,11 +7721,16 @@ impl SavedFitSummary {
             // gradient measurement (cache hit / gradient-free), persist 0.0
             // and rely on `pirls_status` for convergence quality.
             finalgrad_norm: fit.outer_gradient_norm.unwrap_or(0.0),
-            pirls_status: if fit.outer_converged {
-                gam::pirls::PirlsStatus::Converged
-            } else {
-                gam::pirls::PirlsStatus::StalledAtValidMinimum
-            },
+            // Persist the *real* status the fit carries (set at construction,
+            // see `UnifiedFitResultParts::pirls_status`). Deriving it from the
+            // `outer_converged` bool here would collapse the five-way taxonomy
+            // (MaxIterationsReached / LmStepSearchExhausted / Unstable / …) into
+            // a single "StalledAtValidMinimum" bucket, silently relabeling
+            // genuinely broken fits as healthy for any downstream consumer that
+            // gates on status. The bool is itself just a projection of this
+            // field (`outer_converged == matches!(status, Converged)`), so the
+            // status is strictly more informative.
+            pirls_status: fit.pirls_status,
             deviance: fit.deviance,
             stable_penalty_term,
             max_abs_eta,

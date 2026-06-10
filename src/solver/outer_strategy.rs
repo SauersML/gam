@@ -1899,6 +1899,24 @@ pub trait OuterObjective {
     /// than random). The proxy fires *only* in screening mode; outside
     /// screening it must return the regular V_LAML cost so the optimization
     /// objective is unchanged.
+    ///
+    /// # Why the `eval_cost` default is correct for everyone else (#969)
+    ///
+    /// The partial-fit pathology is CAUSED by the screening cap: it is the
+    /// `0.5·log|H|` term evaluated at a β̂ whose inner solve was truncated
+    /// by `screening_max_inner_iterations`. An objective only suffers it if
+    /// it (a) consumes that cap atomic AND (b) ranks on a curvature-bearing
+    /// criterion at the truncated iterate — which is exactly the REML/LAML
+    /// state-objective family, all of which override this method (or are
+    /// built via `build_objective_with_screening_proxy`). Objectives that
+    /// never wire the cap pay the full inner solve during screening, so
+    /// their screened cost IS the true criterion — slower, but a correct
+    /// ranking by definition, and a proxy could only degrade it. Any future
+    /// objective that starts honoring the screening cap on a
+    /// curvature-bearing criterion must override this with its own
+    /// monotonically-descending inner quantity (the penalized-deviance
+    /// pattern above generalizes: rank on the best inner merit seen, never
+    /// on a curvature term at a truncated iterate).
     fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         self.eval_cost(rho)
     }
