@@ -95,6 +95,7 @@ fn fit_result_kind(fit: &FitResult) -> &'static str {
         FitResult::LatentSurvival(_) => "LatentSurvival",
         FitResult::LatentBinary(_) => "LatentBinary",
         FitResult::TransformationNormal(_) => "TransformationNormal",
+        FitResult::DispersionLocationScale(_) => "DispersionLocationScale",
     }
 }
 

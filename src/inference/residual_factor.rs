@@ -839,8 +839,8 @@ mod tests {
         let n = 6000usize;
         let p = 6usize;
         // Two orthogonal planted unit directions.
-        let raw1 = ndarray::array![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-        let raw2 = ndarray::array![1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+        let raw1: Array1<f64> = ndarray::array![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let raw2: Array1<f64> = ndarray::array![1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
         let v1 = &raw1 / raw1.dot(&raw1).sqrt();
         let v2 = &raw2 / raw2.dot(&raw2).sqrt();
         let (amp1, amp2) = (1.4_f64, 0.9_f64);
