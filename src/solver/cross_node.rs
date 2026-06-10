@@ -571,7 +571,7 @@ mod tests {
                 rank1_cursor = Some(json);
             }
         }
-        drop(workers.remove(1)); // the death
+        let _ = workers.remove(1); // the death
 
         // Coordinator also survives a checkpoint round-trip mid-pass.
         let coord_json = serde_json::to_string(&coordinator.checkpoint()).unwrap();

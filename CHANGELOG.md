@@ -1,3 +1,36 @@
+## v0.3.110 — gam 0.3.110 / gamfit 0.1.192 (2026-06-10)
+
+Crate + wheel release rolling up the SAE-manifold identifiability-certificate
+work (#980/#981/#907/#995/#996/#998) plus the build/lint fixes that unblock a
+green `cargo check --tests` + Rustfmt across the workspace.
+
+Identifiability / SAE-manifold certificate:
+- feat(#998): the residual-gauge certificate now realises within-atom gauge
+  orbits **exactly** in the model's own (decoder, coordinate) parameter space.
+  The coordinate-motion field comes from the group action (circle/torus
+  shifts, flat-patch so(d) rotations); the decoder compensation is profiled
+  out by least squares; the leftover residual is the orbit's true data cost —
+  exactly zero for a basis closed under the action, positive otherwise, so
+  **basis closure is computed, not declared**. All pinning of true model-class
+  symmetries flows through the injectable `OrbitPenaltyOperator` channel.
+  `residual_gauge_exact` merges exact within-atom verdicts with the calibrated
+  frame path for spheres / unviewed atoms / cross-atom families.
+- fix(#995): the per-generator verdict uses the relative curvature fraction
+  `‖R ξ̂‖² / σ_max(R)²` (kept magnitudes, survives a full-rank pinning span)
+  calibrated by a computed mean-frame `lowering_error` scale, so compression
+  artifacts are never read as a pin. Shipped per-generator through the FFI.
+- feat(#996): the discrete-mixture rung refines locally around the coarse
+  `MIXTURE_K_LADDER` winner until bracketed, so off-ladder truths (k = 4/6/8)
+  are named exactly instead of snapping to the nearest rung.
+- test(#980/#981/#907): Theorem-2 arm, the circle-read-discretely two-verdict
+  race, and the repeated-draw calibration sweep.
+
+Build / lint:
+- fix: drop a dead `policy` field (gamlss dispersion family), wire the new
+  `DispersionLocationScale` `FitRequest`/`FitResult` arms + `ReportInput`
+  convergence fields through the Python FFI, annotate ambiguous-float arrays
+  in the #974 residual-factor test, and `cargo fmt --all`.
+
 ## v0.3.109 — gam 0.3.109 / gamfit 0.1.190 (2026-06-10)
 
 Crate + wheel release rolling up the correctness fixes and the new
