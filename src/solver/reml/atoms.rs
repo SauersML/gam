@@ -83,8 +83,9 @@
 //!
 //! ## Directional-first derivatives (#740 falls out)
 //!
-//! Atoms expose `frozen_d1(dir)` / `frozen_d2(dir_i, dir_j)`, never "the
-//! gradient vector". The expensive moving data (β̇, Ẇ, Ḣ) is attached to the
+//! Atoms expose `frozen_d1(dir)` — and, once the second-order pass lands,
+//! a directional `frozen_d2(dir_i, dir_j)` capability — never "the gradient
+//! vector". The expensive moving data (β̇, Ẇ, Ḣ) is attached to the
 //! DIRECTION object and computed once per direction — so the outer gradient
 //! costs K direction-builds (not K per-atom chains), the outer Hessian is a
 //! θ-HVP per direction pair with no O(K²) dense pair assembly, and a
@@ -245,11 +246,16 @@ pub trait CriterionAtom {
     fn value(&self) -> f64;
     /// Frozen partial ∂A/∂θ[dir] at fixed inner state.
     fn frozen_d1(&self, dir: &ThetaDirection) -> f64;
-    /// Frozen second partial (directional). Default for atoms migrated
-    /// gradient-first is to be ported in a later pass — second order keeps
-    /// flowing through the existing assembly until then; there is NO
-    /// approximate fallback inside the calculus.
-    fn frozen_d2(&self, dir_i: &ThetaDirection, dir_j: &ThetaDirection) -> Option<f64>;
+    // NOTE: the directional SECOND derivative (#740) is intentionally NOT a
+    // method on this trait yet. Until an atom actually computes it from its
+    // own factorization, an `-> Option<f64>` whose body is `None` is a stub —
+    // banned, and precisely the desync-by-placeholder this module exists to
+    // forbid (a half-emitted second order is the #901-layer-2 failure all
+    // over again). It lands as a capability, not a stub: its own
+    // `SecondOrderAtom` impl carrying a REAL `−½ tr(H⁺ Ḣ_i H⁺ Ḣ_j) +
+    // ½ tr(H⁺ Ḧ_ij)` body, in the second-order pass. Second order keeps
+    // flowing through the existing assembly until then, with NO approximate
+    // fallback inside the calculus.
     /// The atom's exact ∂A/∂β̂ data, if it depends on the inner state.
     fn beta_channel(&self) -> Option<BetaChannel>;
     /// The smoothness stratum this atom's emissions are valid on.
@@ -293,33 +299,15 @@ impl CriterionSum {
         frozen + chained
     }
 
-    /// First-order optimality certificate (#934): per-atom FD audit at the
-    /// optimum, ~2 evaluations per atom, naming the desyncing term. Probes
-    /// that would cross a declared stratum boundary (rank change /
-    /// collapsed eigengap within ±h) are refused, not reported as bugs.
-    ///
-    /// This is the structural replacement for the multi-week #901-style
-    /// triangulation: the certificate output IS the diagnosis.
-    pub fn certify(&self, _dir: &ThetaDirection, _h: f64) -> Vec<CertificateEntry> {
-        // Sketch: for each atom, re-evaluate value() at θ±h·dir holding the
-        // OTHER atoms' state fixed (each atom owns its factorization, so
-        // per-atom re-evaluation is local), compare the centered difference
-        // against frozen_d1 + its β-chain share, and emit a named verdict.
-        // Refuse when stratum().kept_rank differs across ±h or the minimal
-        // eigengap is below the frame-derivative floor.
-        Vec::new()
-    }
-}
-
-/// Per-atom certificate verdict — the unit of blame.
-pub struct CertificateEntry {
-    pub atom: &'static str,
-    pub analytic: f64,
-    pub finite_difference: f64,
-    pub relative_error: f64,
-    /// True when the probe was refused because ±h crosses a declared
-    /// stratum boundary; `relative_error` is meaningless in that case.
-    pub stratum_refusal: bool,
+    // First-order optimality certificate (#934): a per-atom FD audit at the
+    // optimum (~2 evaluations per atom) that names the desyncing term and
+    // refuses probes crossing a declared stratum boundary (rank change /
+    // collapsed eigengap within ±h). It lands with a REAL body — the per-atom
+    // re-evaluation closure it requires does not exist yet — in the #934 pass,
+    // not as a `Vec::new()` placeholder (a stub certifier that always
+    // certifies is worse than none). The "## Self-certification" design above
+    // is the spec; see the module Migration law for the port-with-real-body
+    // discipline.
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -360,12 +348,6 @@ impl CriterionAtom for HessianLogdetAtom {
             .as_ref()
             .expect("calculus fills h_dot_total before logdet d1");
         0.5 * self.sensitivity.kernel.trace_projected_logdet(h_dot)
-    }
-    fn frozen_d2(&self, _dir_i: &ThetaDirection, _dir_j: &ThetaDirection) -> Option<f64> {
-        // −½ tr(H⁺ Ḣ_i H⁺ Ḣ_j) + ½ tr(H⁺ Ḧ_ij) via the same kernel
-        // (trace_projected_logdet_cross_reduced); ported in the
-        // second-order pass.
-        None
     }
     fn beta_channel(&self) -> Option<BetaChannel> {
         None
@@ -437,9 +419,6 @@ impl CriterionAtom for SampledBlockAtom {
             }
         }
         explicit + trace
-    }
-    fn frozen_d2(&self, _dir_i: &ThetaDirection, _dir_j: &ThetaDirection) -> Option<f64> {
-        None
     }
     fn beta_channel(&self) -> Option<BetaChannel> {
         Some(BetaChannel {
