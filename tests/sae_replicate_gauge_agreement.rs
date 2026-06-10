@@ -28,6 +28,7 @@
 use faer::Side as FaerSide;
 use gam::inference::row_metric::MetricProvenance;
 use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
+use gam::sae_identifiability::GeneratorFamily;
 use gam::solver::outer_strategy::OuterProblem;
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
@@ -336,6 +337,41 @@ fn replicate_fits_agree_up_to_exactly_the_reported_gauge() {
         report_a.summary,
         report_b.summary
     );
+
+    // ---- #995 oracle: the production lowering must not over-claim ---------
+    // A fitted circle's per-row decoder tangents rotate all the way around, so
+    // the mean-frame compression is severely lossy — the lowering must SAY so
+    // (a large reported lowering-error scale on the within-atom generators),
+    // and the calibrated verdict must then refuse to claim any within-atom
+    // pin: the U(1) phase freedom the replicates demonstrably differ by (the
+    // alignment block below) must never come back "pinned". Before the #995
+    // calibration this is exactly where the certificate over-claimed
+    // identification: the full-rank data span swallowed every generator.
+    for (label, report) in [("A", &report_a), ("B", &report_b)] {
+        for g in report
+            .generators
+            .iter()
+            .filter(|g| g.family == GeneratorFamily::IsomAtom)
+        {
+            assert!(
+                g.lowering_error_scale > 0.5,
+                "replicate {label}: a full circle's tangent field disperses \
+                 strongly around its mean — the lowering must report a large \
+                 lowering-error scale, got {} ({})",
+                g.lowering_error_scale,
+                g.description
+            );
+            assert!(
+                g.unpinned || g.generator_norm == 0.0,
+                "replicate {label}: with the lowering this lossy the \
+                 certificate must not claim the within-atom gauge pinned \
+                 (over-claim guard); got pinned {} with fraction {} at scale {}",
+                g.description,
+                g.pinned_energy_fraction,
+                g.lowering_error_scale
+            );
+        }
+    }
 
     // ---- both replicates recover the planted circle (truth guard) ---------
     let truth_cos_a = o2_aligned_mean_cos(&theta_true, &theta_a);
