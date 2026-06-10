@@ -2225,34 +2225,10 @@ pub(crate) fn ift_dbeta_drho_coned(
 /// ∂g_red/∂ρ_a`. Returns the `K × R` matrix `β_ρ`.
 ///
 /// Returns `None` if the Schur factor is unavailable (PCG mode) or was
-/// built from a damped operator; callers must not silently substitute an
-/// approximation.
-pub(crate) fn ift_dbeta_drho_from_solver(
-    beta_dim: usize,
-    dg_drho: ArrayView2<'_, f64>,
-    mut solve_beta_hessian: impl FnMut(&Array1<f64>) -> Array1<f64>,
-) -> Option<Array2<f64>> {
-    let r = dg_drho.ncols();
-    if dg_drho.nrows() != beta_dim {
-        return None;
-    }
-    let mut out = Array2::<f64>::zeros((beta_dim, r));
-    let mut rhs = Array1::<f64>::zeros(beta_dim);
-    for a in 0..r {
-        for row in 0..beta_dim {
-            rhs[row] = dg_drho[[row, a]];
-        }
-        let solved = solve_beta_hessian(&rhs);
-        if solved.len() != beta_dim || solved.iter().any(|value| !value.is_finite()) {
-            return None;
-        }
-        for row in 0..beta_dim {
-            out[[row, a]] = -solved[row];
-        }
-    }
-    Some(out)
-}
-
+/// built from a damped operator, or if any solved entry is non-finite;
+/// callers must not silently substitute an approximation. The solve is
+/// the one sensitivity operator (#935) — this site holds no private H⁻¹
+/// convention of its own.
 pub fn ift_dbeta_drho(
     cache: &ArrowFactorCache,
     dg_red_drho: ArrayView2<'_, f64>,
@@ -2261,9 +2237,11 @@ pub fn ift_dbeta_drho(
         return None;
     }
     let schur = cache.schur_factor.as_ref()?;
-    ift_dbeta_drho_from_solver(cache.k, dg_red_drho, |rhs| {
-        cholesky_solve_vector(schur, rhs)
-    })
+    if dg_red_drho.nrows() != cache.k || schur.nrows() != cache.k {
+        return None;
+    }
+    crate::solver::sensitivity::FitSensitivity::from_lower_triangular(schur)
+        .mode_response(dg_red_drho)
 }
 
 /// Tier-3 IFT sensitivity `∂u*/∂ρ` (proposal §2.6 / §7).
@@ -2879,7 +2857,7 @@ mod tests {
     #[test]
     fn coned_matches_full_solve_on_fully_coupled_hessian() {
         // Fully coupled SPD H: cone is the whole space, result must equal the
-        // unconfined ift_dbeta_drho_from_solver bit-for-bit.
+        // unconfined sensitivity-operator mode response bit-for-bit.
         let h = Array2::from_shape_vec((3, 3), vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.8, 0.5, 0.8, 2.5])
             .unwrap();
         let inv = dense_inverse(&h);
@@ -2889,7 +2867,10 @@ mod tests {
         dg[[2, 1]] = -0.7;
         let supports = vec![0..1usize, 2..3usize];
 
-        let full = ift_dbeta_drho_from_solver(3, dg.view(), |rhs| inv.dot(rhs)).unwrap();
+        let eye: Array2<f64> = Array2::eye(3);
+        let full = crate::solver::sensitivity::FitSensitivity::from_projected(&eye, &inv)
+            .mode_response(dg.view())
+            .unwrap();
         let coned =
             ift_dbeta_drho_coned(h.view(), dg.view(), &supports, |rhs| inv.dot(rhs)).unwrap();
         for i in 0..3 {
