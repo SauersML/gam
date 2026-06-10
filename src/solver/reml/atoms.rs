@@ -441,3 +441,101 @@ impl CriterionAtom for SampledBlockAtom {
 // the explicit ½λ_k quadratic; beta_channel = Sλ(β̂−μ) = the KKT residual's
 // penalty half) and should be ported alongside the inner-objective atom so
 // the envelope/noise-floor correction emerges from the calculus on day one.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    /// Per-atom isolation check the Migration law demands: build the landed
+    /// #901 `HessianLogdetAtom` anchor from a hand-chosen spectral kernel and
+    /// confirm its `value` / `frozen_d1` emissions are exactly the closed-form
+    /// `½ log|H_pen|₊` and `½ tr(H_pen⁺ Ḣ)`, then confirm the `CriterionSum`
+    /// fold assembles the profiled total derivative `Σ frozen_d1 + ⟨Σ ∂_βA,
+    /// β̇⟩` from those emissions plus one shared β̇ contraction.
+    ///
+    /// `H_pen⁺` is taken diagonal in the identity basis (`u_s = I`,
+    /// `h_proj_inverse = diag(1/σ)`) so every quantity is verifiable by hand:
+    /// `tr(H⁺ A) = Σ_a A_aa / σ_a`. This is the same spectral object
+    /// `intrinsic_hessian_pseudo_logdet_parts` emits, so the test pins the
+    /// atom's contract against the production kernel, not a re-derivation.
+    #[test]
+    fn hessian_logdet_atom_emits_closed_form_value_and_directional_derivative() {
+        // σ = (2, 4) ⇒ H⁺ = diag(1/2, 1/4), log|H|₊ = ln 2 + ln 4 = ln 8.
+        let kernel = Arc::new(PenaltySubspaceTrace {
+            u_s: array![[1.0, 0.0], [0.0, 1.0]],
+            h_proj_inverse: array![[0.5, 0.0], [0.0, 0.25]],
+        });
+        let stratum = StratumFingerprint {
+            kept_rank: 2,
+            // smallest relative gap (4 − 2)/4 = 0.5 — well clear of any frame
+            // floor, so this evaluation lives on a single constant-rank stratum.
+            min_relative_eigengap: 0.5,
+        };
+        let sensitivity = Arc::new(Sensitivity {
+            kernel: kernel.clone(),
+            logdet: 8.0_f64.ln(),
+            stratum: StratumFingerprint {
+                kept_rank: stratum.kept_rank,
+                min_relative_eigengap: stratum.min_relative_eigengap,
+            },
+        });
+        let hess = HessianLogdetAtom {
+            sensitivity: sensitivity.clone(),
+        };
+
+        // value = ½ log|H|₊.
+        assert_eq!(hess.name(), "hessian_logdet");
+        assert!((hess.value() - 0.5 * 8.0_f64.ln()).abs() < 1e-12);
+        assert!(hess.beta_channel().is_none(), "logdet atom has no β-channel");
+        assert_eq!(hess.stratum().expect("declared stratum").kept_rank, 2);
+
+        // Shared drift Ḣ = [[1, 0.3], [0.3, 1]]. frozen_d1 = ½ tr(H⁺ Ḣ)
+        //   = ½ (1/2 · 1 + 1/4 · 1) = ½ · 0.75 = 0.375.
+        let h_dot = Arc::new(array![[1.0, 0.3], [0.3, 1.0]]);
+        let dir = ThetaDirection {
+            index: Some(0),
+            dir: None,
+            s_dot: None,
+            h_dot_frozen: None,
+            beta_dot: Some(Arc::new(array![0.5, 0.5])),
+            h_dot_total: Some(h_dot.clone()),
+        };
+        assert!((hess.frozen_d1(&dir) - 0.375).abs() < 1e-12);
+
+        // Sampled atom (#784): frozen_d1 = explicit[idx] + tr(Ḣ · Q_bc);
+        // β-channel = g_d. With explicit[0] = 0.2 and symmetric
+        // Q_bc = [[0.5, 0.1], [0.1, 0.3]]: tr(Ḣ Q_bc) = 1·0.5 + 0.3·0.1 +
+        // 0.3·0.1 + 1·0.3 = 0.86, so frozen_d1 = 1.06.
+        let sampled = SampledBlockAtom {
+            value: -0.4,
+            explicit: array![0.2, -0.1],
+            q_bc: Arc::new(array![[0.5, 0.1], [0.1, 0.3]]),
+            g_d: array![1.0, -2.0],
+            stratum,
+        };
+        assert!((sampled.value() - (-0.4)).abs() < 1e-12);
+        assert!((sampled.frozen_d1(&dir) - 1.06).abs() < 1e-12);
+        assert!(
+            (sampled
+                .beta_channel()
+                .expect("sampled atom declares a β-channel")
+                .grad_beta
+                .dot(&array![0.5, 0.5])
+                - (-0.5))
+                .abs()
+                < 1e-12
+        );
+
+        // CriterionSum fold: value sums, and the profiled d1 adds ONE shared
+        // β̇ contraction of the SUMMED β-channels (here only the sampled atom
+        // contributes g_d). β̇ = [0.5, 0.5] ⇒ ⟨g_d, β̇⟩ = 0.5 − 1.0 = −0.5.
+        //   value = ½ ln 8 − 0.4
+        //   d1    = 0.375 + 1.06 + (−0.5) = 0.935
+        let sum = CriterionSum {
+            atoms: vec![Box::new(hess), Box::new(sampled)],
+        };
+        assert!((sum.value() - (0.5 * 8.0_f64.ln() - 0.4)).abs() < 1e-12);
+        assert!((sum.d1(&dir) - 0.935).abs() < 1e-12);
+    }
+}
