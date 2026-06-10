@@ -71,7 +71,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use crate::inference::structure_evidence::{
-    run_atom_birth_gate, ClaimKind, GateVerdict, StructureLedger,
+    ClaimKind, GateVerdict, StructureLedger, run_atom_birth_gate,
 };
 
 /// One proposed structural move. Atom indices are STABLE IDENTIFIERS for the
@@ -470,7 +470,9 @@ mod tests {
             mv: StructureMove::Birth { candidate },
             trigger,
             structure_hash: hash,
-            claim: ClaimKind::AtomExists { atom: 100 + candidate },
+            claim: ClaimKind::AtomExists {
+                atom: 100 + candidate,
+            },
         }
     }
 
@@ -560,9 +562,10 @@ mod tests {
         let cert = ledger.certify(0.05);
         let confirmed: Vec<_> = cert.confirmed().map(|e| e.kind.clone()).collect();
         assert!(confirmed.contains(&ClaimKind::AtomExists { atom: 100 }));
-        assert!(cert
-            .contested()
-            .any(|e| e.kind == ClaimKind::BindingEdge { a: 0, b: 1 } && e.log_e < 0.0));
+        assert!(
+            cert.contested()
+                .any(|e| e.kind == ClaimKind::BindingEdge { a: 0, b: 1 } && e.log_e < 0.0)
+        );
     }
 
     /// Death is vetoed for a certified atom (Ville permanence) and demotes a

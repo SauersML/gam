@@ -753,8 +753,7 @@ fn run_rung(rung: &Rung) {
         );
     }
     assert!(
-        !ev1
-            .iter()
+        !ev1.iter()
             .any(|e| e.action == gam::solver::structure_search::CollapseAction::Terminal),
         "LEDGER FAIL at K={k}: terminal collapse recorded on a rung whose mass/recovery \
          assertions passed: {ev1:?}"

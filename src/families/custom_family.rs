@@ -12857,7 +12857,6 @@ const KKT_REFUSAL_RANK_TOL: f64 = 1e-10;
 /// curvature on a well-conditioned problem.
 const JOINT_SPECTRAL_LEVENBERG_FACTOR: f64 = 1.0e-3;
 
-
 #[derive(Clone, Debug)]
 struct JointSpectralNewtonStep {
     delta: Array1<f64>,

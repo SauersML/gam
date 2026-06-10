@@ -582,9 +582,7 @@ fn discrete_walk<M: SymmetricAugmentedFit>(
         ));
     }
     if candidates.windows(2).any(|w| !(w[0] < w[1])) {
-        return Err(
-            "discrete full conformal: candidates must be strictly increasing".to_string(),
-        );
+        return Err("discrete full conformal: candidates must be strictly increasing".to_string());
     }
 
     let mut out = Vec::with_capacity(candidates.len());
@@ -811,16 +809,14 @@ mod tests {
                 let mut coverage = 0.0_f64;
                 let mut any_strict_subset = false;
                 for mask in 0u32..(1u32 << n) {
-                    let train: Vec<f64> =
-                        (0..n).map(|i| f64::from((mask >> i) & 1)).collect();
+                    let train: Vec<f64> = (0..n).map(|i| f64::from((mask >> i) & 1)).collect();
                     let p_train: f64 = train
                         .iter()
                         .map(|&y| if y > 0.5 { theta } else { 1.0 - theta })
                         .product();
-                    let mut map =
-                        |z: f64| -> Result<Array1<f64>, String> {
-                            Ok(bernoulli_intercept_scores(&train, z, lambda))
-                        };
+                    let mut map = |z: f64| -> Result<Array1<f64>, String> {
+                        Ok(bernoulli_intercept_scores(&train, z, lambda))
+                    };
                     let set = bernoulli_full_conformal(&mut map, alpha).expect("bernoulli set");
                     assert!(set.lower_tail_unresolved.is_none());
                     assert!(set.upper_tail_unresolved.is_none());
@@ -854,8 +850,9 @@ mod tests {
         // test row's score 1−μ̂ ≈ 0.79 strictly dominates every training
         // score (≈ 0.21) and its p-value is 1/8 = 0.125 ≤ α.
         let train = vec![0.0; n];
-        let mut map =
-            |z: f64| -> Result<Array1<f64>, String> { Ok(bernoulli_intercept_scores(&train, z, lambda)) };
+        let mut map = |z: f64| -> Result<Array1<f64>, String> {
+            Ok(bernoulli_intercept_scores(&train, z, lambda))
+        };
         let set = bernoulli_full_conformal(&mut map, 0.25).expect("set");
         assert_eq!(
             set.members,

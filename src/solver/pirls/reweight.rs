@@ -23,11 +23,11 @@ use super::{
 };
 use crate::estimate::EstimationError;
 use crate::faer_ndarray::FaerSymmetricFactor;
-use crate::solver::loop_guard::{FlatStreak, IterationBound, LoopVerdict, RejectEscalator};
 use crate::linalg::sparse_exact::{
     factorize_sparse_spd, solve_sparse_spd_into, sparse_symmetric_upper_matvec_public,
 };
 use crate::linalg::utils::{array_is_finite, inf_norm};
+use crate::solver::loop_guard::{FlatStreak, IterationBound, LoopVerdict, RejectEscalator};
 use crate::types::Coefficients;
 use faer::sparse::SparseColMat;
 use ndarray::{Array1, Zip};
@@ -1653,8 +1653,7 @@ where
                             .abs()
                             .max(final_state_ref.penalty_term.abs())
                             .max(1.0);
-                        let plateau_band =
-                            options.convergence_tolerance * objective_scale * 0.1;
+                        let plateau_band = options.convergence_tolerance * objective_scale * 0.1;
                         let model_progress_exhausted = predicted_reduction.is_finite()
                             && predicted_reduction.abs() <= plateau_band;
                         let strict_objective_plateau = has_explicit_constraints

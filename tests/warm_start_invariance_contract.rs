@@ -73,7 +73,10 @@ fn gaussian_smooth_data() -> (Vec<f64>, Vec<f64>) {
         .map(|i| {
             let x = i as f64 / (n as f64 - 1.0);
             let noise = 0.1 * (lcg_uniform(&mut rng) - 0.5);
-            (x, (2.0 * std::f64::consts::PI * x).sin() + 0.5 * (5.0 * x).cos() + noise)
+            (
+                x,
+                (2.0 * std::f64::consts::PI * x).sin() + 0.5 * (5.0 * x).cos() + noise,
+            )
         })
         .unzip()
 }
@@ -87,7 +90,9 @@ fn poisson_count_data() -> (Vec<f64>, Vec<f64>) {
             let lambda = (0.5 + (2.0 * std::f64::consts::PI * x).sin()).exp();
             // Deterministic count draw: invert a uniform through a crude
             // discretization (lambda + centered jitter, floored at 0).
-            let y = (lambda + 2.0 * (lcg_uniform(&mut rng) - 0.5)).round().max(0.0);
+            let y = (lambda + 2.0 * (lcg_uniform(&mut rng) - 0.5))
+                .round()
+                .max(0.0);
             (x, y)
         })
         .unzip()

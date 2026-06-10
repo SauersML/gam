@@ -52,9 +52,7 @@
 //! transport (MPI, gRPC, files on a shared filesystem) is the caller's; this
 //! module owns the deterministic topology, the cursors, and the validation.
 
-use crate::solver::streaming_border::{
-    BorderGramCheckpoint, StreamingBorderGram, chunk_gram_flat,
-};
+use crate::solver::streaming_border::{BorderGramCheckpoint, StreamingBorderGram, chunk_gram_flat};
 use ndarray::{Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 
@@ -127,7 +125,11 @@ impl CrossNodePartition {
             return 0;
         }
         // Chunks r, r + n_ranks, r + 2·n_ranks, … below n.
-        if rank < n { (n - rank - 1) / self.n_ranks + 1 } else { 0 }
+        if rank < n {
+            (n - rank - 1) / self.n_ranks + 1
+        } else {
+            0
+        }
     }
 
     /// The `ordinal`-th (0-based) global chunk index owned by `rank`, or `None`
@@ -138,7 +140,11 @@ impl CrossNodePartition {
             return None;
         }
         let idx = rank + ordinal * self.n_ranks;
-        if idx < self.n_chunks() { Some(idx) } else { None }
+        if idx < self.n_chunks() {
+            Some(idx)
+        } else {
+            None
+        }
     }
 }
 

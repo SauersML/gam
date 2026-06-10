@@ -218,7 +218,8 @@ impl PlateauDetector {
         let verdict = match self.last_merit {
             Some(prev) => {
                 let scale = prev.abs().max(merit.abs()).max(1.0);
-                self.streak.note((prev - merit).abs() <= self.rel_tol * scale)
+                self.streak
+                    .note((prev - merit).abs() <= self.rel_tol * scale)
             }
             None => LoopVerdict::Continue,
         };
@@ -412,7 +413,10 @@ mod tests {
         assert_eq!(esc.rejects(), 0);
         let mut fresh = 1.0;
         esc.escalate(&mut fresh);
-        assert_eq!(fresh, MADSEN_INITIAL_REJECT_FACTOR, "schedule restarts at ×2");
+        assert_eq!(
+            fresh, MADSEN_INITIAL_REJECT_FACTOR,
+            "schedule restarts at ×2"
+        );
     }
 
     /// #744 trace shape: merit descends, then freezes. The detector must

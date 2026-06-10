@@ -211,8 +211,7 @@ fn run_race(data: &Array2<f64>) -> Draw {
 
 #[test]
 fn repeated_draws_are_accurate_and_decisive_calls_are_never_wrong() {
-    let mut draws: Vec<(bool /* truth_is_circle */, Draw)> =
-        Vec::with_capacity(2 * N_REPLICATES);
+    let mut draws: Vec<(bool /* truth_is_circle */, Draw)> = Vec::with_capacity(2 * N_REPLICATES);
     for r in 0..N_REPLICATES {
         let seed = 1000 + 37 * r as u64;
         draws.push((true, run_race(&sample_circle(seed))));
@@ -243,7 +242,8 @@ fn repeated_draws_are_accurate_and_decisive_calls_are_never_wrong() {
         let decisive_bf = d.log_bf_circle_over_mixture.abs() >= DECISIVE_LOG_BF;
         if decisive_stacking || decisive_bf {
             assert_eq!(
-                d.circle_won, *truth_is_circle,
+                d.circle_won,
+                *truth_is_circle,
                 "a decisive call (stacking weight {:.3}, |log BF| {:.1}) must \
                  never be wrong",
                 d.winner_weight,

@@ -1238,8 +1238,7 @@ mod tests {
         let d = unit_vec(&mut rng, p);
         let mut block = Array2::<f64>::zeros((p, 1));
         block.column_mut(0).assign(&d);
-        let sketch =
-            RandomProjectionFrameSketch::from_decoder_blocks(&[block], 8, 21).unwrap();
+        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&[block], 8, 21).unwrap();
         let via_probe = sketch.query_sketch(d.view());
         let via_atom = sketch.atom_sketch(0);
         let diff = vec_norm((&via_probe - &via_atom).view());

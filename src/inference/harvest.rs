@@ -310,7 +310,10 @@ mod tests {
         assert_eq!(h.tier_row_for(4), None);
         assert!(h.has_factors(9));
         assert!(!h.has_factors(0));
-        assert_eq!(h.tier_provenance(), Some(h.tier_metric().unwrap().provenance()));
+        assert_eq!(
+            h.tier_provenance(),
+            Some(h.tier_metric().unwrap().provenance())
+        );
     }
 
     #[test]
@@ -361,15 +364,24 @@ mod tests {
     fn validation_rejects_malformed_tiers() {
         let metric = tier_metric(&[1.0, 2.0]);
         // Unsorted.
-        assert!(TieredHarvest::with_unweighted_tier(5, vec![3, 1], tier_metric(&[1.0, 2.0])).is_err());
+        assert!(
+            TieredHarvest::with_unweighted_tier(5, vec![3, 1], tier_metric(&[1.0, 2.0])).is_err()
+        );
         // Out of range.
-        assert!(TieredHarvest::with_unweighted_tier(3, vec![1, 3], tier_metric(&[1.0, 2.0])).is_err());
+        assert!(
+            TieredHarvest::with_unweighted_tier(3, vec![1, 3], tier_metric(&[1.0, 2.0])).is_err()
+        );
         // Metric/tier length mismatch.
         assert!(TieredHarvest::with_unweighted_tier(5, vec![0, 1, 2], metric).is_err());
         // Bad inclusion probability.
         assert!(
-            TieredHarvest::with_designed_tier(5, vec![0, 1], vec![0.0, 1.0], tier_metric(&[1.0, 2.0]))
-                .is_err()
+            TieredHarvest::with_designed_tier(
+                5,
+                vec![0, 1],
+                vec![0.0, 1.0],
+                tier_metric(&[1.0, 2.0])
+            )
+            .is_err()
         );
     }
 

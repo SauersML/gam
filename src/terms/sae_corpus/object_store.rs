@@ -314,10 +314,7 @@ impl ObjectStoreShardSource {
                 actual: HEADER_LEN + payload.len(),
             });
         }
-        Ok(ResidentShard {
-            shard_idx,
-            payload,
-        })
+        Ok(ResidentShard { shard_idx, payload })
     }
 
     /// Ensure the window holds the current shard plus up to
@@ -544,8 +541,8 @@ mod tests {
             inner: FsObjectStore::new(dir.clone()),
             payload_fetches: Mutex::new(Vec::new()),
         });
-        let mut src = ObjectStoreShardSource::open(Arc::clone(&store) as Arc<dyn ObjectStore>)
-            .expect("open");
+        let mut src =
+            ObjectStoreShardSource::open(Arc::clone(&store) as Arc<dyn ObjectStore>).expect("open");
         let first = src.next_batch().expect("batch").expect("some");
         assert_eq!(first.row_ids, vec![0]);
         {

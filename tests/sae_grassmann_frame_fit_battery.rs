@@ -24,13 +24,14 @@
 //!   frame refresh uses.
 
 use gam::linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
+use gam::solver::outer_strategy::OuterProblem;
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::sae_manifold::{GrassmannCrossMoment, GrassmannFrame};
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3};
 use std::sync::Arc;
 
 use faer::Side as FaerSide;
@@ -112,9 +113,8 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>, p: usize) -> SaeManifol
     let mut coords_k = Vec::with_capacity(k);
     let mut logits = Array2::<f64>::zeros((n, k));
     for a in 0..k {
-        let coords = Array2::from_shape_fn((n, 1), |(i, _)| {
-            (truth.theta[a][i] + 0.03).rem_euclid(1.0)
-        });
+        let coords =
+            Array2::from_shape_fn((n, 1), |(i, _)| (truth.theta[a][i] + 0.03).rem_euclid(1.0));
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
         // Ridge LS decoder over the atom's active rows: B_a = (ΦᵀΦ+εI)⁻¹ΦᵀZ.
         let act_rows: Vec<usize> = (0..n).filter(|&i| truth.active[a][i]).collect();
@@ -332,7 +332,11 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
     // atom-1 rows (p_metric = 1, rank = 1 ⇒ mass = u²), so the design
     // oversamples atom 0 and the 1/π weights must undo exactly that bias.
     let factors = Array2::from_shape_fn((n, 1), |(i, _)| {
-        if truth.active[0][i] { 3.0_f64.sqrt() } else { 1.0 }
+        if truth.active[0][i] {
+            3.0_f64.sqrt()
+        } else {
+            1.0
+        }
     });
     let metric = RowMetric::output_fisher(Arc::new(factors), 1, 1).expect("design metric");
     let measure = RowMeasure::from_metric(&metric);
@@ -449,9 +453,7 @@ fn alternating_polar_ls_fixed_point_is_jointly_stationary() {
         u0[[1, 1]] = 1.0;
         u0
     };
-    let c_star = Array2::from_shape_fn((M, r), |(a, b)| {
-        1.0 + 0.3 * ((a * r + b) as f64)
-    });
+    let c_star = Array2::from_shape_fn((M, r), |(a, b)| 1.0 + 0.3 * ((a * r + b) as f64));
     let mut z = phi.dot(&c_star).dot(&u_star.t());
     for (idx, v) in z.iter_mut().enumerate() {
         *v += 1.0e-3 * (idx_uniform(idx as u64 ^ 0x5EED) - 0.5);

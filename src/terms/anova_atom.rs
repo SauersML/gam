@@ -708,11 +708,7 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
         )
         .map(|t| t.p_value),
         None => {
-            let ran: Vec<f64> = binding_tests
-                .iter()
-                .flatten()
-                .map(|t| t.p_value)
-                .collect();
+            let ran: Vec<f64> = binding_tests.iter().flatten().map(|t| t.p_value).collect();
             ran.iter()
                 .cloned()
                 .fold(None, |acc: Option<f64>, p| {
@@ -974,8 +970,7 @@ mod tests {
             let pa_c: Array1<f64> = &pa.to_owned() - &mean_a;
             let pb_c: Array1<f64> = &pb.to_owned() - &mean_b;
             let f12 = pa_c.dot(&c.dot(&pb_c));
-            let rebuilt =
-                blocks.mean + pa_c.dot(&blocks.main_a) + pb_c.dot(&blocks.main_b) + f12;
+            let rebuilt = blocks.mean + pa_c.dot(&blocks.main_a) + pb_c.dot(&blocks.main_b) + f12;
             assert!(
                 (raw - rebuilt).abs() < 1e-12,
                 "row {row}: raw {raw} vs rebuilt {rebuilt}"
@@ -1013,7 +1008,10 @@ mod tests {
         };
         let report = carve(&input, 0.05).expect("carve");
         assert!(report.interaction_fraction < 1e-24);
-        let plan = report.fission.as_ref().expect("additive surface must fission");
+        let plan = report
+            .fission
+            .as_ref()
+            .expect("additive surface must fission");
         assert!(plan.reconstruction_defect < 1e-24);
 
         // Children reassemble the parent surface exactly.
@@ -1169,11 +1167,7 @@ mod tests {
         (phi_a, phi_b)
     }
 
-    fn surface_values(
-        phi_a: &Array2<f64>,
-        phi_b: &Array2<f64>,
-        c: &Array2<f64>,
-    ) -> Array1<f64> {
+    fn surface_values(phi_a: &Array2<f64>, phi_b: &Array2<f64>, c: &Array2<f64>) -> Array1<f64> {
         let n = phi_a.nrows();
         let mut y = Array1::<f64>::zeros(n);
         for r in 0..n {
@@ -1231,9 +1225,7 @@ mod tests {
         for i in 0..mm {
             for j in 0..mm {
                 assert!((joint[[i, j]] - fit.coeff_covariance[0][[i, j]]).abs() < 1e-15);
-                assert!(
-                    (joint[[mm + i, mm + j]] - fit.coeff_covariance[1][[i, j]]).abs() < 1e-15
-                );
+                assert!((joint[[mm + i, mm + j]] - fit.coeff_covariance[1][[i, j]]).abs() < 1e-15);
             }
         }
 

@@ -4104,8 +4104,7 @@ impl LinearFitConditioning {
         let intercept_col_snapshot = mat_internal.column(intercept).to_owned();
         for col in &self.columns {
             if col.scale != 1.0 {
-                out.column_mut(col.col_idx)
-                    .mapv_inplace(|v| v * col.scale);
+                out.column_mut(col.col_idx).mapv_inplace(|v| v * col.scale);
             }
             if col.mean != 0.0 {
                 let mut target = out.column_mut(col.col_idx);

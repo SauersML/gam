@@ -80,8 +80,7 @@
 use ndarray::{Array1, ArrayView2};
 
 use crate::solver::estimate::reml::continuation::{
-    ContinuationFailure, ContinuationState, PATH_BUDGET, continue_path_from,
-    fit_with_continuation,
+    ContinuationFailure, ContinuationState, PATH_BUDGET, continue_path_from, fit_with_continuation,
 };
 use crate::solver::outer_strategy::{OuterEvalOrder, OuterObjective};
 use crate::terms::analytic_penalties::ScalarWeightSchedule;

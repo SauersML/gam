@@ -105,7 +105,11 @@ fn patch_view(quadratic: bool) -> (FittedAtom, AtomParameterView) {
     let mut decoder = Array2::<f64>::zeros((m, p));
     for r in 0..m {
         for c in 0..p {
-            decoder[[r, c]] = if r == c { 1.0 } else { 0.2 * (r as f64 - c as f64) };
+            decoder[[r, c]] = if r == c {
+                1.0
+            } else {
+                0.2 * (r as f64 - c as f64)
+            };
         }
     }
     let atom = FittedAtom {
@@ -172,9 +176,7 @@ fn closed_basis_circle_phase_shift_is_an_exact_data_null() {
     let frame_isom = report
         .generators
         .iter()
-        .filter(|g| {
-            g.family == GeneratorFamily::IsomAtom && !g.description.contains("exact orbit")
-        })
+        .filter(|g| g.family == GeneratorFamily::IsomAtom && !g.description.contains("exact orbit"))
         .count();
     assert_eq!(
         frame_isom, 0,

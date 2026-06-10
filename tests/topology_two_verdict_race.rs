@@ -234,7 +234,10 @@ fn run_race(data: &Array2<f64>) -> Verdict {
     )
     .expect("cross-class adjudication must succeed");
 
-    assert!(verdict.is_cross_class, "Circle + Mixture race is cross-class");
+    assert!(
+        verdict.is_cross_class,
+        "Circle + Mixture race is cross-class"
+    );
     assert_eq!(
         verdict.headline,
         Headline::Stacking,
