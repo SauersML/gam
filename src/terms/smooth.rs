@@ -24804,19 +24804,19 @@ mod tests {
     }
 
     /// Architectural pin: for the iso-κ Duchon ψ-axis under BinomialProbit,
-    /// the penalty-subspace projection (`solution.penalty_subspace_trace =
-    /// Some(...)`) must be *active* AND must change the trace by an order of
-    /// magnitude relative to the full-space `G_ε(H)` kernel.
+    /// the intrinsic pseudo-logdet kernel (`solution.penalty_subspace_trace =
+    /// Some(H_pen⁺)`, #901) must be *active*, its trace must match FD of the
+    /// production cost's Hessian-logdet term, and on a healthy spectrum it
+    /// must AGREE with the full-space `G_ε(H)` trace (the two differ only on
+    /// sub-threshold eigendirections).
     ///
-    /// Specifically:
-    ///   * `unprojected_tr ≈ tr(G_ε(H) · op_total)`
-    ///     ≫ `production_tr ≈ tr_projected(...)` in magnitude.
-    ///   * `production_tr ≈ ∂log|H|/∂ψ` (FD truth).
-    ///
-    /// If either invariant breaks, the cost identity for Duchon ψ silently
-    /// drifts and the joint-gradient test (and any downstream optimizer) is
-    /// solving the wrong problem. This test exists to make the projection's
-    /// role legible: it captures the mechanism, not just the outcome.
+    /// The pre-#901 ancestor of this pin asserted a ≫ separation between the
+    /// projected kernel and `G_ε(H)` — that separation was the range(S₊)
+    /// projection dropping real likelihood-identified curvature (the #901
+    /// bug), so the pin enforced the bug. If any invariant breaks now, the
+    /// cost identity for Duchon ψ silently drifts and the joint-gradient
+    /// test (and any downstream optimizer) is solving the wrong problem.
+    /// This test makes the kernel's role legible: mechanism, not outcome.
     #[test]
     fn iso_kappa_duchon_penalty_subspace_projection_pins_trace() {
         let DuchonProbitSetup {
@@ -24908,28 +24908,23 @@ mod tests {
             "Duchon ψ axis must route the trace through penalty_subspace_trace"
         );
 
-        // INVARIANT 2: Production trace agrees with FD ∂log|H_proj|/∂ψ —
-        // i.e. the centered derivative of the **projected** Hessian
-        // log-determinant `log|U_Sᵀ H U_S|_+`, evaluated through the same
-        // assembly path the outer cost identity uses.
-        //
-        // Why the projected logdet, not the full one: under the
-        // rank-deficient LAML fix the REML/LAML cost reads
-        // `log|H_proj|`, not `log|H_full|`.  These two scalars differ by
-        // the `null(S)` directions' contribution to `log|X'WX|` — visible
-        // here as `hop_logdet ≠ log_det_h_proj` whenever
-        // `range(S_+)` is a strict subspace (for this 1-D Duchon test
-        // `S_λ` has rank 5 in a 7-dim transformed basis, so two
-        // directions of H sit outside `range(S)` and contribute their
-        // own ψ-dependence to `log|H_full|`).  Finite-differencing the
-        // full-space logdet picks up that extra contribution; finite-
-        // differencing the projected logdet exposes exactly what the
-        // analytic trace formula `kernel.trace_projected_logdet(op_total)`
-        // computes.  Pinning against the wrong finite-difference reference
-        // made this invariant fire even on mathematically-correct
-        // production output, so the test pinned an impossible identity.
-        // The corrected finite-difference reference is the only one the
-        // production code actually claims to satisfy.
+        // INVARIANT 2: Production trace agrees with FD of the Hessian
+        // log-determinant term exactly as the production cost identity
+        // evaluates it (`hop.logdet() + hessian_logdet_correction`, read
+        // back via `debug_logdet_h_proj`). Since the #901 corrected object
+        // this is the intrinsic pseudo-logdet `log|H_pen|₊` over
+        // `range(H_pen)` — the `null(S)` directions' ψ-dependence is REAL
+        // likelihood-identified curvature and is included on both sides:
+        // the analytic side traces the total drift against the spectral
+        // kernel `H_pen⁺`, the FD side re-eigendecomposes `H_pen` at ψ±h.
+        // (The pre-#901 version of this pin compared against FD of the
+        // range(S₊)-projected logdet `log|U_Sᵀ H U_S|₊` — the wrong object
+        // whose dropped Schur curvature produced the sign-flipped ρ and
+        // exploding ψ gradients this cluster red-lined on.) Because the FD
+        // reference reads through the SAME assembly the production cost
+        // uses, this pin keeps following whatever value production
+        // installs — there is no separately maintained debug formula to
+        // drift out of sync.
         let h = 1e-5_f64;
         let psi_idx = rho_dim;
         let mut theta_p = theta_zero.clone();
@@ -24974,15 +24969,21 @@ mod tests {
             rel_to_fd
         );
 
-        // INVARIANT 3: The penalty-subspace projection must change the trace
-        // substantially — otherwise it's a no-op. For this Duchon ψ test
-        // unprojected ≈ +22.5 while production ≈ −1.05.  A gap collapse to
-        // near zero indicates the projection is broken or disabled.
+        // INVARIANT 3 (re-pinned for the #901 corrected object): on a healthy
+        // spectrum the intrinsic kernel `H_pen⁺` and the smooth-floored
+        // full-space `G_ε(H)` must now AGREE — they differ only in the
+        // treatment of sub-threshold eigendirections, of which this fixture
+        // has none. The pre-#901 version of this pin asserted the OPPOSITE
+        // (gap > 5): that gap was the range(S₊) projection discarding the
+        // real, likelihood-identified ψ-dependence of the penalty-null
+        // directions — i.e. it pinned the bug signature as a feature. A
+        // large gap reappearing here means someone reintroduced a kernel
+        // whose subspace is narrower than the cost's `range(H_pen)`.
         let gap = (unprojected_tr - production_tr).abs();
         assert!(
-            gap > 5.0,
-            "penalty-subspace projection should eliminate a substantial \
-             null-space contribution (unprojected={:+.4e}, production={:+.4e}, \
+            gap <= 1e-3 * production_tr.abs().max(1.0),
+            "intrinsic H_pen⁺ kernel must agree with the full-space trace on \
+             a healthy spectrum (unprojected={:+.4e}, production={:+.4e}, \
              gap={:+.4e})",
             unprojected_tr,
             production_tr,
