@@ -1937,8 +1937,16 @@ impl GrassmannFrame {
         // into [0, 1] before pairing — both arise from singular values of
         // matrices whose true norms are ≤ 1, so any drift above 1 or below
         // 0 is pure floating-point noise.
-        let min_cos = sv_cos.iter().copied().fold(1.0_f64, f64::min).clamp(0.0, 1.0);
-        let max_sin = sv_sin.iter().copied().fold(0.0_f64, f64::max).clamp(0.0, 1.0);
+        let min_cos = sv_cos
+            .iter()
+            .copied()
+            .fold(1.0_f64, f64::min)
+            .clamp(0.0, 1.0);
+        let max_sin = sv_sin
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .clamp(0.0, 1.0);
         Ok(max_sin.atan2(min_cos))
     }
 }
