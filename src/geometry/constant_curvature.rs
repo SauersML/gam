@@ -442,6 +442,34 @@ impl RiemannianManifold for ConstantCurvature {
         self.chart_gauge(point)?;
         Ok(self.kappa)
     }
+
+    /// A curved manifold MUST NOT inherit the trait's flat identity VJP — that
+    /// default is the exact Jacobian only when `exp_p(v) = p + v`, and using it
+    /// on a curved member would silently return wrong reverse-mode gradients
+    /// (the exact objective↔gradient-desync the trait doc warns against).
+    ///
+    /// At `κ = 0` the family IS genuinely flat: in the doubled gauge
+    /// `exp_p(v) = p ⊕_0 v = p + v`, so both Jacobians are the identity and the
+    /// flat VJP is exact. For `κ ≠ 0` the analytic Jacobi-field VJP is not yet
+    /// landed (the κ-jet API differentiates w.r.t. κ, not w.r.t. p/v), so we
+    /// refuse loudly rather than hand back a straight-through identity.
+    fn exp_map_vjp(
+        &self,
+        point: ArrayView1<'_, f64>,
+        tangent_vec: ArrayView1<'_, f64>,
+        grad_output: ArrayView1<'_, f64>,
+    ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
+        self.check_len("constant-curvature exp_map_vjp point", point.len())?;
+        self.check_len("constant-curvature exp_map_vjp tangent", tangent_vec.len())?;
+        self.check_len("constant-curvature exp_map_vjp grad_output", grad_output.len())?;
+        if self.kappa.abs() <= GEOMETRY_EPS {
+            return Ok((grad_output.to_owned(), grad_output.to_owned()));
+        }
+        Err(GeometryError::Unsupported(
+            "constant-curvature exp_map_vjp: analytic Jacobi-field VJP not yet implemented \
+             for κ ≠ 0 — do not inherit the flat identity (it is wrong for curved κ)",
+        ))
+    }
 }
 
 // ── κ-jets: stage 2 of #944, powered by the #932 tower ───────────────
@@ -541,6 +569,79 @@ pub fn log_map_kappa_jet(
     Ok((value, dk, dkk))
 }
 
+/// `(exp, ∂exp/∂κ, ∂²exp/∂κ²)` of the geodesic exp map, componentwise — the
+/// κ-movement of the exponential chart, completing the κ-jet trio. Same
+/// program as [`ConstantCurvature::exp_map`] (`x ⊕_κ [tn_κ(λ_x‖v‖/2)·v̂]`)
+/// evaluated over `Tower4<1>` with κ seeded: the gauge `1+κ‖x‖²`, the
+/// generalized tangent `tn_κ(t) = t·S(κt²)/C(κt²)`, and the Möbius addition
+/// all become towers, with `C`/`S` entering through their certified stacks via
+/// `compose_unary`. Value and κ-derivatives are one expression, so they cannot
+/// desync. The conjugate-point guard (`C(κt²)=0`) and the antipodal-denominator
+/// guard are checked on the value channel.
+pub fn exp_map_kappa_jet(
+    manifold: &ConstantCurvature,
+    point: ArrayView1<'_, f64>,
+    tangent_vec: ArrayView1<'_, f64>,
+) -> GeometryResult<(Array1<f64>, Array1<f64>, Array1<f64>)> {
+    manifold.check_len("constant-curvature exp-jet point", point.len())?;
+    manifold.check_len("constant-curvature exp-jet tangent", tangent_vec.len())?;
+    manifold.chart_gauge(point)?;
+    let d = point.len();
+    let n = tangent_vec.dot(&tangent_vec).sqrt();
+    if n <= GEOMETRY_EPS {
+        // Zero tangent ⇒ exp_x(0) = x for every κ along the path.
+        return Ok((point.to_owned(), Array1::zeros(d), Array1::zeros(d)));
+    }
+    let kappa = KJet::variable(manifold.kappa, 0);
+    let xx = point.dot(&point);
+    // gauge = 1 + κ‖x‖²  (tower);  t = ‖v‖ / gauge = λ_x‖v‖/2.
+    let gauge = kappa * xx + 1.0;
+    let t = gauge.recip() * n;
+    // tn_κ(t) = t·S(κt²)/C(κt²), the primitives composed at the tower arg κt².
+    let arg = kappa * (t * t);
+    let (cstk, sstk) = cs_stacks(arg.v);
+    let c = arg.compose_unary(cstk);
+    if c.v.abs() <= GEOMETRY_EPS {
+        return Err(GeometryError::Singular(
+            "constant-curvature exp-jet at a conjugate point (cos(√κ t) = 0)",
+        ));
+    }
+    let s = arg.compose_unary(sstk);
+    let tn = t * s * c.recip();
+    // step = (tn / ‖v‖) · v   (tower vector; v is a chart constant).
+    let scale = tn * (1.0 / n);
+    let step: Vec<KJet> = (0..d).map(|i| scale * tangent_vec[i]).collect();
+    // out = x ⊕_κ step, mirroring `mobius_add` with x constant and step a tower.
+    let mut xs = KJet::constant(0.0); // ⟨x, step⟩
+    let mut ss = KJet::constant(0.0); // ‖step‖²
+    for i in 0..d {
+        xs = xs + step[i] * point[i];
+        ss = ss + step[i] * step[i];
+    }
+    let two_k_xs = (kappa * 2.0) * xs; // 2κ⟨x,step⟩
+    // denom = 1 − 2κ⟨x,step⟩ + κ²‖x‖²‖step‖²  (no Sub on the tower; Neg+Add).
+    let denom = -two_k_xs + (kappa * kappa) * (ss * xx) + 1.0;
+    if denom.v.abs() <= MOBIUS_DENOM_EPS {
+        return Err(GeometryError::Singular(
+            "Möbius addition at the κ>0 antipodal point",
+        ));
+    }
+    // a = 1 − 2κ⟨x,step⟩ − κ‖step‖²;  b = 1 + κ‖x‖² = gauge.
+    let a = -two_k_xs + (-(kappa * ss)) + 1.0;
+    let b = gauge;
+    let inv = denom.recip();
+    let mut value = Array1::zeros(d);
+    let mut dk = Array1::zeros(d);
+    let mut dkk = Array1::zeros(d);
+    for i in 0..d {
+        let oi = (a * point[i] + b * step[i]) * inv;
+        value[i] = oi.v;
+        dk[i] = oi.g[0];
+        dkk[i] = oi.h[0][0];
+    }
+    Ok((value, dk, dkk))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,9 +698,9 @@ mod tests {
     /// d = 2‖x − y‖ with exp/log the plain chart translation.
     #[test]
     fn classical_members_match_closed_forms() {
-        let y = array![0.3, -0.2, 0.1];
-        let origin = array![0.0, 0.0, 0.0];
-        let r = y.dot(&y).sqrt();
+        let y: ndarray::Array1<f64> = array![0.3, -0.2, 0.1];
+        let origin: ndarray::Array1<f64> = array![0.0, 0.0, 0.0];
+        let r: f64 = y.dot(&y).sqrt();
 
         let hyper = ConstantCurvature::new(3, -1.0);
         let d = hyper.distance(origin.view(), y.view()).expect("hyper d");
@@ -719,6 +820,34 @@ mod tests {
                     (l_kk[i] - fd2).abs() <= 1e-4 * fd2.abs().max(1.0),
                     "κ={kappa}: ∂²log/∂κ²[{i}] analytic {} fd {fd2}",
                     l_kk[i]
+                );
+            }
+
+            // exp-map κ-jet against central FD of exp_map at κ±h. Tangent kept
+            // small so the geodesic stays well inside the chart for every κ.
+            let v = array![0.12, -0.08];
+            let (e, e_k, e_kk) = exp_map_kappa_jet(&m, x.view(), v.view()).expect("ejet");
+            let e_up = up.exp_map(x.view(), v.view()).expect("e+");
+            let e_dn = dn.exp_map(x.view(), v.view()).expect("e-");
+            let e_at = m.exp_map(x.view(), v.view()).expect("e0");
+            for i in 0..2 {
+                assert!(
+                    (e[i] - e_at[i]).abs() <= 1e-13 * e_at[i].abs().max(1.0),
+                    "κ={kappa}: exp-jet value channel[{i}] {} vs {}",
+                    e[i],
+                    e_at[i]
+                );
+                let fd1 = (e_up[i] - e_dn[i]) / (2.0 * h);
+                let fd2 = (e_up[i] - 2.0 * e_at[i] + e_dn[i]) / (h * h);
+                assert!(
+                    (e_k[i] - fd1).abs() <= 1e-6 * fd1.abs().max(1.0),
+                    "κ={kappa}: ∂exp/∂κ[{i}] analytic {} fd {fd1}",
+                    e_k[i]
+                );
+                assert!(
+                    (e_kk[i] - fd2).abs() <= 1e-4 * fd2.abs().max(1.0),
+                    "κ={kappa}: ∂²exp/∂κ²[{i}] analytic {} fd {fd2}",
+                    e_kk[i]
                 );
             }
         }
