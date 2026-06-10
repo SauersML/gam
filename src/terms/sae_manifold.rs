@@ -3508,6 +3508,28 @@ pub struct SaeManifoldTerm {
     /// [`SaeManifoldTerm::collapse_events`] and carried onto the
     /// structure-search [`crate::solver::structure_search::SearchLedger`].
     collapse_events: Vec<CollapseEvent>,
+    /// Per-row **design honesty weights** (#991): Horvitz–Thompson inclusion
+    /// corrections from a designed corpus subsample
+    /// ([`crate::inference::row_measure::RowMeasure::designed_subsample`] /
+    /// [`crate::terms::sae_corpus::designed_target`]), self-normalized to
+    /// mean `1.0` over the term's rows so dispersion, dof, and the
+    /// data-vs-penalty balance stay consistent at the fitted sample size while
+    /// the design's selection bias is removed (oversampled loud rows are
+    /// downweighted back).
+    ///
+    /// The weights enter the objective as a per-row scalar metric `w_i · I_p`
+    /// on the reconstruction channel ONLY, realized as a `√w_i` scaling of the
+    /// per-row residual, latent Jacobian, and β basis load at their single
+    /// construction sites in the assembly — so the data-fit value, the t-block
+    /// Gauss-Newton, the β gradient/Gram, and the cross blocks all carry
+    /// exactly one factor of `w_i` and cannot desync (the same discipline as
+    /// the #974 whitening seam). Per-row latent priors (assignment prior, ARD
+    /// coordinate prior) are deliberately NOT weighted: included rows' latent
+    /// states are genuine model components of the subsampled model,
+    /// conditional on inclusion; the HT correction applies to the row
+    /// *evidence* about shared structure (decoder β, ρ), not to the latent
+    /// priors. `None` ⇒ the exact unweighted path, bit-for-bit.
+    row_loss_weights: Option<Vec<f64>>,
 }
 
 /// Snapshot of exactly the mutable term state that an `apply_newton_step` +

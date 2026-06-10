@@ -10,11 +10,12 @@ use crate::families::bms::{
 };
 use crate::families::gamlss::{
     BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
-    BlockwiseTermFitResultParts, BlockwiseTermWiggleFitResult, GaussianLocationScaleFitResult,
+    BlockwiseTermFitResultParts, BlockwiseTermWiggleFitResult, DispersionFamilyKind,
+    DispersionGlmLocationScaleTermSpec, GaussianLocationScaleFitResult,
     GaussianLocationScaleTermSpec, fit_binomial_location_scale_terms,
     fit_binomial_location_scale_terms_with_selected_wiggle,
-    fit_binomial_mean_wiggle_terms_with_selected_basis, fit_gaussian_location_scale_terms,
-    fit_gaussian_location_scale_terms_with_selected_wiggle,
+    fit_binomial_mean_wiggle_terms_with_selected_basis, fit_dispersion_glm_location_scale_terms,
+    fit_gaussian_location_scale_terms, fit_gaussian_location_scale_terms_with_selected_wiggle,
     select_binomial_location_scale_link_wiggle_basis_from_pilot,
     select_binomial_mean_link_wiggle_basis_from_pilot,
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,

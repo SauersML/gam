@@ -87,8 +87,9 @@
 //! gauge quotient (`C ↦ P₁ C P₂`, `P_i = I − û_i û_iᵀ`) before testing;
 //! the quotient dimension `(M₁−1)(M₂−1)` is the test's honest rank.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 
+use crate::faer_ndarray::FaerEigh;
 use crate::inference::smooth_test::{
     SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
 };
@@ -252,6 +253,280 @@ pub enum FissionDecision {
     Keep,
 }
 
+/// Width of the deterministic log-λ grid the REML profile is scanned on
+/// before golden-section refinement. 121 points over 18 decades resolves
+/// the criterion's single basin to ~0.15 decades before refinement; the
+/// refinement then closes to machine-level. Fixed (no adaptivity) so the
+/// fit is a pure function of its inputs.
+const REML_LAMBDA_GRID: usize = 121;
+/// Golden-section refinement iterations after the grid scan (~1e-9
+/// relative bracket width — far past where the criterion is flat).
+const REML_GOLDEN_ITERS: usize = 60;
+
+/// A penalized tensor-surface fit over the code sample: the producer of
+/// [`CarveInput`]s for BOTH binding notions (#993 items 1–2).
+///
+/// `coeffs[d]` is the fitted `M₁ × M₂` coefficient matrix for response
+/// dimension `d`; `coeff_covariance[d]` is the matching SCALE-INCLUDED
+/// posterior covariance of its row-major vec (the mgcv-`Vb` object
+/// [`wood_smooth_test`] contracts for); `joint_covariance()` assembles
+/// the cross-dimension covariance for the joint binding test. The fit is
+/// evaluated against the SAME empirical code measure the carve centers
+/// against — the test and its covariance live on one measure by
+/// construction, which is the coherence the production fit's own Hessian
+/// (a different parameterization: tangent frames, not tensor
+/// coefficients) cannot offer the carve.
+#[derive(Clone, Debug)]
+pub struct TensorSurfaceFit {
+    /// Per response dimension, `M₁ × M₂`.
+    pub coeffs: Vec<Array2<f64>>,
+    /// Per response dimension, scale-included `Vb` of the row-major vec.
+    pub coeff_covariance: Vec<Array2<f64>>,
+    /// Scale-included residual cross-covariance between response
+    /// dimensions (`D × D`, entries `r_dᵀ r_e / (n − edf)`). Diagonal
+    /// entries are the per-dimension scales the `Vb`s carry.
+    pub residual_cross_cov: Array2<f64>,
+    /// Scale-FREE coefficient covariance shared by all dimensions
+    /// (`V (Λ+λI)⁻¹ Vᵀ`, `M₁M₂ × M₁M₂`); `coeff_covariance[d]` is this
+    /// times `residual_cross_cov[d,d]`.
+    pub unit_covariance: Array2<f64>,
+    /// REML-selected ridge strength.
+    pub lambda: f64,
+    /// Effective degrees of freedom `Σ dᵢ/(dᵢ+λ)` (per dimension; the
+    /// design and λ are shared).
+    pub edf: f64,
+    /// Residual degrees of freedom `n − edf` (the denominator d.f. for
+    /// the `Estimated`-scale F branch).
+    pub residual_df: f64,
+}
+
+impl TensorSurfaceFit {
+    /// Joint covariance of the dimension-major stacked coefficient vector
+    /// `[vec(C₀); vec(C₁); …]`: with a shared design and shared λ the
+    /// posterior is the Kronecker product
+    /// `residual_cross_cov ⊗ unit_covariance` — index `(d·M + i, e·M + j)
+    /// = S[d,e]·U[i,j]`. Feed to [`CarveInput::joint_coeff_covariance`].
+    pub fn joint_covariance(&self) -> Array2<f64> {
+        let d_dims = self.residual_cross_cov.nrows();
+        let m = self.unit_covariance.nrows();
+        let mut joint = Array2::<f64>::zeros((d_dims * m, d_dims * m));
+        for d in 0..d_dims {
+            for e in 0..d_dims {
+                let s_de = self.residual_cross_cov[[d, e]];
+                if s_de == 0.0 {
+                    continue;
+                }
+                for i in 0..m {
+                    for j in 0..m {
+                        joint[[d * m + i, e * m + j]] = s_de * self.unit_covariance[[i, j]];
+                    }
+                }
+            }
+        }
+        joint
+    }
+}
+
+/// Fit the tensor-product surface `y_d(θ₁,θ₂) ≈ φ¹(θ₁)ᵀ C_d φ²(θ₂)` to
+/// sampled responses by ridge-penalized least squares with the ridge
+/// strength chosen by GAUSSIAN REML (profiled σ², exact 1-D criterion on
+/// the design's eigenbasis — no GCV, per policy), returning coefficients
+/// AND their scale-included posterior covariance.
+///
+/// This is the missing producer #993 names for both carve arms:
+/// - **representational**: `responses` = the atom's activation
+///   contributions over the code sample (its reconstruction targets);
+/// - **computational**: `responses` = the pulled-back readout
+///   `h(θ₁,θ₂) = F(g(θ))` rows from the #980 output-Fisher harvest.
+///
+/// `phi_a`/`phi_b` are the factor bases on the code sample (`n × M_i`,
+/// the same matrices the carve consumes — one measure end to end);
+/// `responses` is `n × D`. The design column for `(j, k)` is
+/// `φ¹_j·φ²_k` at row-major index `j·M₂+k`, matching the carve's vec
+/// convention exactly. One λ is shared across response dimensions (one
+/// surface smoothness), chosen by the pooled REML criterion; per-dim
+/// scales are estimated from residuals at `n − edf`.
+pub fn fit_tensor_surface(
+    phi_a: ArrayView2<'_, f64>,
+    phi_b: ArrayView2<'_, f64>,
+    responses: ArrayView2<'_, f64>,
+) -> Result<TensorSurfaceFit, String> {
+    let n = phi_a.nrows();
+    let m1 = phi_a.ncols();
+    let m2 = phi_b.ncols();
+    let mm = m1 * m2;
+    let d_dims = responses.ncols();
+    if phi_b.nrows() != n || responses.nrows() != n {
+        return Err(format!(
+            "fit_tensor_surface: sample sizes disagree (phi_a {n}, phi_b {}, responses {})",
+            phi_b.nrows(),
+            responses.nrows()
+        ));
+    }
+    if mm == 0 || d_dims == 0 || n < 2 {
+        return Err(format!(
+            "fit_tensor_surface: degenerate problem (n={n}, M₁M₂={mm}, D={d_dims})"
+        ));
+    }
+
+    // Design X (n × M₁M₂), row-major column convention j·M₂+k.
+    let mut x = Array2::<f64>::zeros((n, mm));
+    for r in 0..n {
+        for j in 0..m1 {
+            let pa = phi_a[[r, j]];
+            if pa == 0.0 {
+                continue;
+            }
+            for k in 0..m2 {
+                x[[r, j * m2 + k]] = pa * phi_b[[r, k]];
+            }
+        }
+    }
+    let xtx = x.t().dot(&x);
+    let xty = x.t().dot(&responses); // mm × D
+    let (evals, evecs) = xtx
+        .eigh(faer::Side::Lower)
+        .map_err(|e| format!("fit_tensor_surface: design eigendecomposition failed: {e:?}"))?;
+    let d_max = evals.iter().cloned().fold(0.0f64, f64::max);
+    if !(d_max > 0.0) {
+        return Err("fit_tensor_surface: design is identically zero".to_string());
+    }
+    let b = evecs.t().dot(&xty); // mm × D, rotated cross-products
+    let yty: Vec<f64> = (0..d_dims)
+        .map(|d| responses.column(d).dot(&responses.column(d)))
+        .collect();
+
+    // Pooled Gaussian REML criterion in the eigenbasis, σ² profiled per
+    // dimension: V(λ) = Σ_d n·log PRSS_d(λ) + D·[Σᵢ log(dᵢ+λ) − M·log λ],
+    // with PRSS_d = yᵀy − Σᵢ bᵢ²/(dᵢ+λ). Exact and O(M·D) per evaluation.
+    let criterion = |lambda: f64| -> f64 {
+        let mut v = 0.0f64;
+        for d in 0..d_dims {
+            let mut prss = yty[d];
+            for i in 0..mm {
+                prss -= b[[i, d]] * b[[i, d]] / (evals[i].max(0.0) + lambda);
+            }
+            v += (n as f64) * prss.max(f64::MIN_POSITIVE).ln();
+        }
+        let mut logdet = 0.0f64;
+        for i in 0..mm {
+            logdet += (evals[i].max(0.0) + lambda).ln();
+        }
+        v + (d_dims as f64) * (logdet - (mm as f64) * lambda.ln())
+    };
+
+    // Deterministic grid scan over 18 decades anchored at the design's
+    // spectral scale, then golden-section refinement in the best bracket.
+    let lo = d_max * 1e-9;
+    let hi = d_max * 1e9;
+    let mut best_idx = 0usize;
+    let mut best_val = f64::INFINITY;
+    let grid: Vec<f64> = (0..REML_LAMBDA_GRID)
+        .map(|i| {
+            let t = i as f64 / (REML_LAMBDA_GRID - 1) as f64;
+            lo * (hi / lo).powf(t)
+        })
+        .collect();
+    for (i, &lam) in grid.iter().enumerate() {
+        let v = criterion(lam);
+        if v < best_val {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    let mut a_log = grid[best_idx.saturating_sub(1)].ln();
+    let mut c_log = grid[(best_idx + 1).min(REML_LAMBDA_GRID - 1)].ln();
+    let phi = (5.0f64.sqrt() - 1.0) / 2.0;
+    let mut x1 = c_log - phi * (c_log - a_log);
+    let mut x2 = a_log + phi * (c_log - a_log);
+    let mut f1 = criterion(x1.exp());
+    let mut f2 = criterion(x2.exp());
+    for _ in 0..REML_GOLDEN_ITERS {
+        if f1 <= f2 {
+            c_log = x2;
+            x2 = x1;
+            f2 = f1;
+            x1 = c_log - phi * (c_log - a_log);
+            f1 = criterion(x1.exp());
+        } else {
+            a_log = x1;
+            x1 = x2;
+            f1 = f2;
+            x2 = a_log + phi * (c_log - a_log);
+            f2 = criterion(x2.exp());
+        }
+    }
+    let lambda = (0.5 * (a_log + c_log)).exp();
+
+    // Coefficients, EDF, residuals, covariances at the selected λ.
+    let mut edf = 0.0f64;
+    for i in 0..mm {
+        let d_i = evals[i].max(0.0);
+        edf += d_i / (d_i + lambda);
+    }
+    let residual_df = n as f64 - edf;
+    if residual_df < 1.0 {
+        return Err(format!(
+            "fit_tensor_surface: too few samples for the surface (n={n}, edf={edf:.2}); \
+             the scale estimate needs n − edf ≥ 1"
+        ));
+    }
+    // β̂ in the eigenbasis, then rotate back: beta = V (Λ+λ)⁻¹ b.
+    let mut beta_rot = Array2::<f64>::zeros((mm, d_dims));
+    for i in 0..mm {
+        let denom = evals[i].max(0.0) + lambda;
+        for d in 0..d_dims {
+            beta_rot[[i, d]] = b[[i, d]] / denom;
+        }
+    }
+    let beta = evecs.dot(&beta_rot); // mm × D
+    let fitted = x.dot(&beta); // n × D
+    let mut residual_cross_cov = Array2::<f64>::zeros((d_dims, d_dims));
+    for d in 0..d_dims {
+        for e in d..d_dims {
+            let mut acc = 0.0f64;
+            for r in 0..n {
+                acc += (responses[[r, d]] - fitted[[r, d]]) * (responses[[r, e]] - fitted[[r, e]]);
+            }
+            let v = acc / residual_df;
+            residual_cross_cov[[d, e]] = v;
+            residual_cross_cov[[e, d]] = v;
+        }
+    }
+    // Scale-free V (Λ+λ)⁻¹ Vᵀ.
+    let mut scaled_evecs = evecs.clone();
+    for i in 0..mm {
+        let denom = evals[i].max(0.0) + lambda;
+        for row in 0..mm {
+            scaled_evecs[[row, i]] = evecs[[row, i]] / denom;
+        }
+    }
+    let unit_covariance = scaled_evecs.dot(&evecs.t());
+
+    let mut coeffs = Vec::with_capacity(d_dims);
+    let mut coeff_covariance = Vec::with_capacity(d_dims);
+    for d in 0..d_dims {
+        let mut c = Array2::<f64>::zeros((m1, m2));
+        for j in 0..m1 {
+            for k in 0..m2 {
+                c[[j, k]] = beta[[j * m2 + k, d]];
+            }
+        }
+        coeffs.push(c);
+        coeff_covariance.push(&unit_covariance * residual_cross_cov[[d, d]]);
+    }
+
+    Ok(TensorSurfaceFit {
+        coeffs,
+        coeff_covariance,
+        residual_cross_cov,
+        unit_covariance,
+        lambda,
+        edf,
+        residual_df,
+    })
+}
+
 /// Inputs for one notion's carve over one fitted product atom.
 ///
 /// `phi_a`/`phi_b`: factor bases evaluated on the code sample (`n × M_i`).
@@ -272,6 +547,14 @@ pub struct CarveInput<'a> {
     pub phi_b: ArrayView2<'a, f64>,
     pub coeffs: &'a [Array2<f64>],
     pub coeff_covariance: Option<&'a [Array2<f64>]>,
+    /// Covariance of the dimension-major STACKED coefficient vector
+    /// `[vec(C₀); vec(C₁); …]` (`D·M₁M₂` square, scale-included), e.g.
+    /// [`TensorSurfaceFit::joint_covariance`]. When present, the
+    /// edge-level binding p-value comes from ONE joint Wald over the
+    /// stacked gauge-projected blocks at rank `D·(M₁−1)(M₂−1)` instead of
+    /// the conservative Bonferroni min-p across dimensions (the per-dim
+    /// tests share every code row, so Bonferroni over-corrects).
+    pub joint_coeff_covariance: Option<&'a Array2<f64>>,
     pub kernel_a: Option<Array1<f64>>,
     pub kernel_b: Option<Array1<f64>>,
     pub edf: Option<f64>,
@@ -339,9 +622,12 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
         p
     };
 
-    // Gauge projectors P_i = I − û ûᵀ for the centered-basis dependence.
+    // Gauge projectors P_i = I − û ûᵀ for the centered-basis dependence,
+    // and their Kronecker product (the row-major-vec transform shared by
+    // the per-dimension and joint Wald tests).
     let proj_a = gauge_projector(m1, input.kernel_a.as_ref())?;
     let proj_b = gauge_projector(m2, input.kernel_b.as_ref())?;
+    let gauge_kron = gauge_kron_rowmajor(&proj_a, &proj_b);
 
     let mut child_a: Vec<ChildDecoder> = Vec::with_capacity(input.coeffs.len());
     let mut child_b: Vec<ChildDecoder> = Vec::with_capacity(input.coeffs.len());
@@ -381,6 +667,7 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
                 &covs[dim],
                 &proj_a,
                 &proj_b,
+                &gauge_kron,
                 input.edf,
                 input.residual_df,
                 input.scale,
@@ -403,18 +690,37 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     } else {
         0.0
     };
-    let ran: Vec<f64> = binding_tests
-        .iter()
-        .flatten()
-        .map(|t| t.p_value)
-        .collect();
-    let edge_p_value = ran
-        .iter()
-        .cloned()
-        .fold(None, |acc: Option<f64>, p| {
-            Some(acc.map_or(p, |a| a.min(p)))
-        })
-        .map(|min_p| (min_p * ran.len() as f64).min(1.0));
+    // Edge-level p: the joint Wald over the stacked gauge-projected
+    // blocks when the cross-dimension covariance is available (exact
+    // rank, no Bonferroni slack), else Bonferroni min-p across the
+    // per-dimension tests (valid under their arbitrary dependence,
+    // conservative).
+    let edge_p_value = match input.joint_coeff_covariance {
+        Some(joint_cov) => joint_binding_wald_test(
+            input.coeffs,
+            joint_cov,
+            &proj_a,
+            &proj_b,
+            &gauge_kron,
+            input.edf,
+            input.residual_df,
+            input.scale,
+        )
+        .map(|t| t.p_value),
+        None => {
+            let ran: Vec<f64> = binding_tests
+                .iter()
+                .flatten()
+                .map(|t| t.p_value)
+                .collect();
+            ran.iter()
+                .cloned()
+                .fold(None, |acc: Option<f64>, p| {
+                    Some(acc.map_or(p, |a| a.min(p)))
+                })
+                .map(|min_p| (min_p * ran.len() as f64).min(1.0))
+        }
+    };
 
     let binding_proven = edge_p_value.is_some_and(|p| p <= alpha);
     let negligible = interaction_fraction <= FISSION_MAX_INTERACTION_FRACTION;
@@ -491,6 +797,32 @@ fn gauge_projector(m: usize, kernel: Option<&Array1<f64>>) -> Result<Array2<f64>
     Ok(p)
 }
 
+/// `K = P₁ ⊗ P₂` under the row-major vec convention
+/// (`vec(A X B)[a·M₂+c] = Σ A[a,j]·B[k,c]·vec(X)[j·M₂+k]`; `P₂`
+/// symmetric) — the coefficient-space transform realizing the gauge
+/// projection `C ↦ P₁ C P₂` on row-major vecs. Built once per carve and
+/// shared by the per-dimension and joint Wald tests.
+fn gauge_kron_rowmajor(proj_a: &Array2<f64>, proj_b: &Array2<f64>) -> Array2<f64> {
+    let m1 = proj_a.nrows();
+    let m2 = proj_b.nrows();
+    let mm = m1 * m2;
+    let mut kron = Array2::<f64>::zeros((mm, mm));
+    for a in 0..m1 {
+        for j in 0..m1 {
+            let pa = proj_a[[a, j]];
+            if pa == 0.0 {
+                continue;
+            }
+            for cc in 0..m2 {
+                for k in 0..m2 {
+                    kron[[a * m2 + cc, j * m2 + k]] = pa * proj_b[[k, cc]];
+                }
+            }
+        }
+    }
+    kron
+}
+
 /// Wald test of `f₁₂ ≡ 0` for one output dimension: transform the raw
 /// interaction coefficients to the gauge quotient (`z = vec(P₁ C P₂)`,
 /// row-major; `Σ_z = K Σ Kᵀ` with `K = P₁ ⊗ P₂`) and hand the projected
@@ -502,6 +834,7 @@ fn binding_wald_test(
     cov: &Array2<f64>,
     proj_a: &Array2<f64>,
     proj_b: &Array2<f64>,
+    gauge_kron: &Array2<f64>,
     edf: Option<f64>,
     residual_df: f64,
     scale: SmoothTestScale,
@@ -519,23 +852,7 @@ fn binding_wald_test(
             z[j * m2 + k] = projected[[j, k]];
         }
     }
-    // K = P₁ ⊗ P₂ under the row-major vec convention
-    // (vec(A X B)[a·M₂+c] = Σ A[a,j]·B[k,c]·vec(X)[j·M₂+k]; P₂ symmetric).
-    let mut kron = Array2::<f64>::zeros((mm, mm));
-    for a in 0..m1 {
-        for j in 0..m1 {
-            let pa = proj_a[[a, j]];
-            if pa == 0.0 {
-                continue;
-            }
-            for cc in 0..m2 {
-                for k in 0..m2 {
-                    kron[[a * m2 + cc, j * m2 + k]] = pa * proj_b[[k, cc]];
-                }
-            }
-        }
-    }
-    let cov_z = kron.dot(cov).dot(&kron.t());
+    let cov_z = gauge_kron.dot(cov).dot(&gauge_kron.t());
     let quotient_rank = ((m1.saturating_sub(1)) * (m2.saturating_sub(1))).max(1) as f64;
     let edf = edf.unwrap_or(quotient_rank).min(quotient_rank);
     wood_smooth_test(SmoothTestInput {
@@ -544,6 +861,68 @@ fn binding_wald_test(
         influence_matrix: None,
         coeff_range: 0..mm,
         edf,
+        nullspace_dim: 0,
+        residual_df,
+        scale,
+    })
+}
+
+/// ONE Wald test of `f₁₂ ≡ 0 across all output dimensions jointly` (#993
+/// item 4): stack the gauge-projected interaction vecs dimension-major,
+/// transform the supplied joint covariance by the block-diagonal
+/// `I_D ⊗ K`, and test at the joint quotient rank `D·(M₁−1)(M₂−1)`. This
+/// replaces the Bonferroni combination exactly where Bonferroni is
+/// loosest — strongly cross-correlated output dimensions (they share
+/// every code row).
+fn joint_binding_wald_test(
+    coeffs: &[Array2<f64>],
+    joint_cov: &Array2<f64>,
+    proj_a: &Array2<f64>,
+    proj_b: &Array2<f64>,
+    gauge_kron: &Array2<f64>,
+    edf: Option<f64>,
+    residual_df: f64,
+    scale: SmoothTestScale,
+) -> Option<SmoothTestResult> {
+    let d_dims = coeffs.len();
+    if d_dims == 0 {
+        return None;
+    }
+    let (m1, m2) = coeffs[0].dim();
+    let mm = m1 * m2;
+    let total = d_dims * mm;
+    if joint_cov.dim() != (total, total) {
+        return None;
+    }
+    // Stacked z: dimension-major [vec(P₁C₀P₂); vec(P₁C₁P₂); …].
+    let mut z = Array1::<f64>::zeros(total);
+    for (d, c) in coeffs.iter().enumerate() {
+        let projected = proj_a.dot(c).dot(proj_b);
+        for j in 0..m1 {
+            for k in 0..m2 {
+                z[d * mm + j * m2 + k] = projected[[j, k]];
+            }
+        }
+    }
+    // Σ_z = (I_D ⊗ K) · J · (I_D ⊗ K)ᵀ, computed blockwise.
+    let mut cov_z = Array2::<f64>::zeros((total, total));
+    for d in 0..d_dims {
+        for e in 0..d_dims {
+            let block = joint_cov.slice(s![d * mm..(d + 1) * mm, e * mm..(e + 1) * mm]);
+            let transformed = gauge_kron.dot(&block).dot(&gauge_kron.t());
+            cov_z
+                .slice_mut(s![d * mm..(d + 1) * mm, e * mm..(e + 1) * mm])
+                .assign(&transformed);
+        }
+    }
+    let quotient_rank = ((m1.saturating_sub(1)) * (m2.saturating_sub(1))).max(1) as f64;
+    let per_dim_edf = edf.unwrap_or(quotient_rank).min(quotient_rank);
+    wood_smooth_test(SmoothTestInput {
+        beta: z.view(),
+        covariance: &cov_z,
+        influence_matrix: None,
+        coeff_range: 0..total,
+        edf: per_dim_edf * d_dims as f64,
         nullspace_dim: 0,
         residual_df,
         scale,
@@ -624,6 +1003,7 @@ mod tests {
             phi_b: phi_b.view(),
             coeffs: &[c.clone()],
             coeff_covariance: None,
+            joint_coeff_covariance: None,
             kernel_a: None,
             kernel_b: None,
             edf: None,
@@ -687,6 +1067,7 @@ mod tests {
             phi_b: phi_b.view(),
             coeffs: &[c],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
+            joint_coeff_covariance: None,
             kernel_a: None,
             kernel_b: None,
             edf: None,
@@ -714,6 +1095,7 @@ mod tests {
             phi_b: phi_b.view(),
             coeffs: &[c_add],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
+            joint_coeff_covariance: None,
             kernel_a: None,
             kernel_b: None,
             edf: None,
@@ -752,6 +1134,7 @@ mod tests {
             phi_b: phi_b.view(),
             coeffs: &[c],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
+            joint_coeff_covariance: None,
             kernel_a: None,
             kernel_b: None,
             edf: None,
@@ -765,6 +1148,158 @@ mod tests {
         assert!(report.interaction_fraction < 1e-24);
         let p = report.edge_p_value.expect("test ran");
         assert!(p > 0.99, "pure-gauge coefficients must not reject, p = {p}");
+    }
+
+    /// A deterministic Bernstein (degree-2, partition-of-unity) basis
+    /// evaluated on `n` scattered points, with two decorrelated sample
+    /// mappings so the tensor design is well-conditioned.
+    fn bernstein_pair(n: usize) -> (Array2<f64>, Array2<f64>) {
+        let mut phi_a = Array2::<f64>::zeros((n, 3));
+        let mut phi_b = Array2::<f64>::zeros((n, 3));
+        for t in 0..n {
+            let x = t as f64 / (n - 1) as f64;
+            let z = ((t * 17) % n) as f64 / (n - 1) as f64;
+            phi_a[[t, 0]] = (1.0 - x) * (1.0 - x);
+            phi_a[[t, 1]] = 2.0 * x * (1.0 - x);
+            phi_a[[t, 2]] = x * x;
+            phi_b[[t, 0]] = (1.0 - z) * (1.0 - z);
+            phi_b[[t, 1]] = 2.0 * z * (1.0 - z);
+            phi_b[[t, 2]] = z * z;
+        }
+        (phi_a, phi_b)
+    }
+
+    fn surface_values(
+        phi_a: &Array2<f64>,
+        phi_b: &Array2<f64>,
+        c: &Array2<f64>,
+    ) -> Array1<f64> {
+        let n = phi_a.nrows();
+        let mut y = Array1::<f64>::zeros(n);
+        for r in 0..n {
+            y[r] = phi_a.row(r).dot(&c.dot(&phi_b.row(r).to_owned()));
+        }
+        y
+    }
+
+    /// END-TO-END (#993 items 1+2+4): fit_tensor_surface recovers a
+    /// planted BOUND two-dimensional surface from noisy samples, its
+    /// covariance feeds the carve, and the JOINT cross-dim Wald (via
+    /// `joint_covariance`) proves the binding while fission refuses.
+    #[test]
+    fn tensor_surface_fit_to_carve_proves_planted_binding_jointly() {
+        let n = 40usize;
+        let (phi_a, phi_b) = bernstein_pair(n);
+        // Two distinct bound surfaces (additive part + centered rank-1
+        // interaction) so the residual cross-covariance is well-conditioned.
+        let at = array![1.0, -1.0, 0.0];
+        let bt = array![0.0, 1.0, -1.0];
+        let mut c0 = Array2::<f64>::zeros((3, 3));
+        let mut c1 = Array2::<f64>::zeros((3, 3));
+        let a = array![1.0, -0.5, 2.0];
+        let b = array![0.3, 1.7, -1.0];
+        for j in 0..3 {
+            for k in 0..3 {
+                c0[[j, k]] = a[j] + b[k] + 2.0 * at[j] * bt[k];
+                c1[[j, k]] = 0.5 * a[j] - b[k] - 1.5 * at[j] * bt[k];
+            }
+        }
+        let y0 = surface_values(&phi_a, &phi_b, &c0);
+        let y1 = surface_values(&phi_a, &phi_b, &c1);
+        let mut responses = Array2::<f64>::zeros((n, 2));
+        for t in 0..n {
+            responses[[t, 0]] = y0[t] + 1e-3 * (1.3 * t as f64).sin();
+            responses[[t, 1]] = y1[t] + 1e-3 * (2.1 * t as f64).cos();
+        }
+
+        let fit = fit_tensor_surface(phi_a.view(), phi_b.view(), responses.view()).expect("fit");
+        // Coefficient recovery within noise scale (ridge bias included).
+        for j in 0..3 {
+            for k in 0..3 {
+                assert!(
+                    (fit.coeffs[0][[j, k]] - c0[[j, k]]).abs() < 0.05,
+                    "C₀[{j},{k}]: fit {} vs planted {}",
+                    fit.coeffs[0][[j, k]],
+                    c0[[j, k]]
+                );
+            }
+        }
+        // Kronecker consistency: the joint covariance's diagonal block d
+        // equals the per-dimension Vb exactly.
+        let joint = fit.joint_covariance();
+        let mm = 9usize;
+        for i in 0..mm {
+            for j in 0..mm {
+                assert!((joint[[i, j]] - fit.coeff_covariance[0][[i, j]]).abs() < 1e-15);
+                assert!(
+                    (joint[[mm + i, mm + j]] - fit.coeff_covariance[1][[i, j]]).abs() < 1e-15
+                );
+            }
+        }
+
+        let input = CarveInput {
+            phi_a: phi_a.view(),
+            phi_b: phi_b.view(),
+            coeffs: &fit.coeffs,
+            coeff_covariance: Some(&fit.coeff_covariance),
+            joint_coeff_covariance: Some(&joint),
+            kernel_a: None,
+            kernel_b: None,
+            edf: None,
+            residual_df: fit.residual_df,
+            scale: SmoothTestScale::Estimated,
+            notion: BindingNotion::Representational,
+        };
+        let report = carve(&input, 0.05).expect("carve");
+        let p = report.edge_p_value.expect("joint test ran");
+        assert!(p < 1e-3, "planted joint binding must reject, p = {p}");
+        assert!(report.fission.is_none(), "bound surface must not fission");
+        assert!(report.interaction_fraction > 0.05);
+    }
+
+    /// END-TO-END, additive side: a planted ADDITIVE surface fit from
+    /// near-noiseless samples carries negligible interaction energy and
+    /// fissions (energy-only path — no covariance handed to the carve, so
+    /// the decision rests on the dial alone).
+    #[test]
+    fn tensor_surface_fit_additive_surface_fissions() {
+        let n = 40usize;
+        let (phi_a, phi_b) = bernstein_pair(n);
+        let a = array![1.0, -0.5, 2.0];
+        let b = array![0.3, 1.7, -1.0];
+        let mut c_add = Array2::<f64>::zeros((3, 3));
+        for j in 0..3 {
+            for k in 0..3 {
+                c_add[[j, k]] = a[j] + b[k];
+            }
+        }
+        let y = surface_values(&phi_a, &phi_b, &c_add);
+        let mut responses = Array2::<f64>::zeros((n, 1));
+        for t in 0..n {
+            responses[[t, 0]] = y[t] + 1e-5 * (0.9 * t as f64).sin();
+        }
+        let fit = fit_tensor_surface(phi_a.view(), phi_b.view(), responses.view()).expect("fit");
+        let input = CarveInput {
+            phi_a: phi_a.view(),
+            phi_b: phi_b.view(),
+            coeffs: &fit.coeffs,
+            coeff_covariance: None,
+            joint_coeff_covariance: None,
+            kernel_a: None,
+            kernel_b: None,
+            edf: None,
+            residual_df: fit.residual_df,
+            scale: SmoothTestScale::Estimated,
+            notion: BindingNotion::Representational,
+        };
+        let report = carve(&input, 0.05).expect("carve");
+        assert!(
+            report.interaction_fraction < FISSION_MAX_INTERACTION_FRACTION,
+            "additive surface fit must carry negligible interaction \
+             (fraction = {})",
+            report.interaction_fraction
+        );
+        assert!(report.fission.is_some());
     }
 
     /// The three-valued joint decision: both arms additive → joint

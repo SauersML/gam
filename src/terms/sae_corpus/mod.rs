@@ -61,6 +61,7 @@
 //! pieces in on its side of the seam.
 
 pub mod kernels;
+pub mod ledger_store;
 pub mod object_store;
 pub mod rho_cascade;
 pub mod shard_reader;
