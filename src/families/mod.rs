@@ -11,6 +11,7 @@ pub(crate) mod identifiability_gpu;
 pub(crate) mod identifiability_gpu_kernel;
 pub mod inverse_link;
 pub(crate) mod jet_partitions;
+pub mod jet_tower;
 pub mod joint_penalty;
 pub(crate) mod latent_interval;
 pub mod latent_survival;
