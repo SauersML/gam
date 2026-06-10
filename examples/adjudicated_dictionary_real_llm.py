@@ -37,13 +37,17 @@ import numpy as np
 import torch
 
 
-def load_normalized(path: str, n: int | None, npy_key: str | None = None):
+def load_normalized(path: str, n: int | None, npy_key: str | None = None,
+                    shuffle_seed: int | None = None):
     """Load activations and apply the per-dim z-score the baselines use."""
     if path.endswith(".npy"):
         X = torch.from_numpy(np.load(path, allow_pickle=False).astype(np.float32))
     else:
         d = torch.load(path, map_location="cpu", weights_only=False)
         X = d[npy_key or "X"]
+    if shuffle_seed is not None:
+        g = torch.Generator().manual_seed(shuffle_seed)
+        X = X[torch.randperm(X.shape[0], generator=g)]
     if n is not None and n > 0:
         X = X[:n]
     X = X.float()
@@ -183,6 +187,8 @@ def main() -> None:
     ap.add_argument("--acts", required=True)
     ap.add_argument("--npy-key", default=None)
     ap.add_argument("--n", type=int, default=None)
+    ap.add_argument("--shuffle-seed", type=int, default=None,
+                    help="shuffle rows with this seed before --n truncation")
     ap.add_argument("--k", type=int, default=16)
     ap.add_argument("--topologies", default="euclidean,circle,sphere")
     ap.add_argument("--d-atom", type=int, default=None,
@@ -203,7 +209,7 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    Xn = load_normalized(args.acts, args.n, args.npy_key)
+    Xn = load_normalized(args.acts, args.n, args.npy_key, args.shuffle_seed)
     report: dict = {
         "acts": args.acts,
         "n": int(Xn.shape[0]),
