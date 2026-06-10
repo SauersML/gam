@@ -15,10 +15,22 @@ fn symmetric_curvature_solve_preserves_negative_modes() {
 
 /// Builds a deterministic formula-table dataset for the shared-tangent
 /// Gaussian REML path with two unpenalized parametric columns plus one
-/// smooth: `~ x + z + s(w)` over `D = 2` outputs.
+/// smooth, fitted via the formula `r ~ x + z + s(w)` over `D = 2` outputs.
+///
+/// The design comes from the RHS `x + z + s(w)` (intercept + the two parametric
+/// columns + the `s(w)` smooth basis); the multi-output tangent response is the
+/// separate `y` matrix below, exactly as the Python response-geometry wrapper
+/// drives it (`f"{target} ~ {rhs}"` with the tangent matrix supplied out-of-band).
+/// `r` is a placeholder LHS the materializer needs to parse the formula — the
+/// impl discards the materialized response and uses `y`.
 fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>) {
     let n = 80usize;
-    let headers = vec!["x".to_string(), "z".to_string(), "w".to_string()];
+    let headers = vec![
+        "r".to_string(),
+        "x".to_string(),
+        "z".to_string(),
+        "w".to_string(),
+    ];
     let mut rows = Vec::with_capacity(n);
     let mut y = Array2::<f64>::zeros((n, 2));
     for row in 0..n {
@@ -26,11 +38,21 @@ fn shared_tangent_formula_table() -> (Vec<String>, Vec<Vec<String>>, Array2<f64>
         let x = (0.7 * t).sin() + 0.05 * t;
         let z = (1.1 * t).cos() - 0.1 * t * t;
         let w = t;
-        rows.push(vec![format!("{x}"), format!("{z}"), format!("{w}")]);
         // Two distinct tangent signals: each a parametric trend plus a
         // genuinely wiggly component that the smooth must absorb.
-        y[[row, 0]] = 0.4 * x - 0.3 * z + 0.6 * (1.8 * w).sin() + 0.02 * t;
-        y[[row, 1]] = -0.2 * x + 0.5 * z + 0.4 * (2.3 * w).cos() - 0.03 * t;
+        let y0 = 0.4 * x - 0.3 * z + 0.6 * (1.8 * w).sin() + 0.02 * t;
+        let y1 = -0.2 * x + 0.5 * z + 0.4 * (2.3 * w).cos() - 0.03 * t;
+        // `r` is a non-constant placeholder LHS the materializer needs to parse
+        // the formula; the impl discards the materialized response and uses `y`.
+        // (It must vary — a constant Gaussian response is rejected up front.)
+        rows.push(vec![
+            format!("{y0}"),
+            format!("{x}"),
+            format!("{z}"),
+            format!("{w}"),
+        ]);
+        y[[row, 0]] = y0;
+        y[[row, 1]] = y1;
     }
     (headers, rows, y)
 }
@@ -49,7 +71,7 @@ fn shared_tangent_sigma2_pools_and_counts_unpenalized_columns() {
     let fit = gaussian_reml_fit_formula_table_impl(
         headers,
         rows,
-        "~ x + z + s(w)".to_string(),
+        "r ~ x + z + s(w)".to_string(),
         y.view(),
         None,
         None,
@@ -110,7 +132,7 @@ fn shared_tangent_lambda_edf_are_shared_per_smooth() {
     let fit = gaussian_reml_fit_formula_table_impl(
         headers,
         rows,
-        "~ x + z + s(w)".to_string(),
+        "r ~ x + z + s(w)".to_string(),
         y.view(),
         None,
         None,
@@ -153,7 +175,7 @@ fn shared_tangent_fit_is_output_rotation_equivariant() {
     let base = gaussian_reml_fit_formula_table_impl(
         headers.clone(),
         rows.clone(),
-        "~ x + z + s(w)".to_string(),
+        "r ~ x + z + s(w)".to_string(),
         y.view(),
         None,
         None,
@@ -162,7 +184,7 @@ fn shared_tangent_fit_is_output_rotation_equivariant() {
     let rotated = gaussian_reml_fit_formula_table_impl(
         headers,
         rows,
-        "~ x + z + s(w)".to_string(),
+        "r ~ x + z + s(w)".to_string(),
         y_rot.view(),
         None,
         None,
