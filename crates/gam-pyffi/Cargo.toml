@@ -9,11 +9,23 @@ license = "AGPL-3.0-or-later"
 
 [lib]
 name = "gam_pyffi"
-crate-type = ["cdylib"]
+# `cdylib` is what maturin packages into the `gamfit._rust` wheel. `rlib` is
+# added so `cargo test -p gam-pyffi` can build a unit-test harness against the
+# crate — a `cdylib`-only crate produces no test binary, which is why the
+# survival-surface / latent-stationarity `#[test]`s (issues #954/#964/#965/#966)
+# were silently never exercised by CI.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gam = { path = "../.." }
-pyo3 = { version = "0.28.3", features = ["abi3-py310", "extension-module"] }
+# `extension-module` tells PyO3 NOT to link libpython (the host interpreter
+# supplies the symbols at import time). That is correct for the published wheel
+# but makes a standalone `cargo test` binary fail to link. So it lives behind a
+# default-on Cargo feature (the maturin/PyO3-recommended layout): maturin builds
+# with default features → the wheel is unchanged, while
+# `cargo test --no-default-features` drops it so the test harness links
+# libpython and the gam-pyffi unit tests actually run. See `[features]` below.
+pyo3 = { version = "0.28.3", features = ["abi3-py310"] }
 numpy = "0.28.0"
 csv = "1.4.0"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -26,3 +38,11 @@ statrs = "0.18.0"
 rand = "0.10.1"
 rand_distr = "0.6.0"
 regex = "1.12.2"
+
+[features]
+# Default-on so `maturin build`/`pip install` (which build with default
+# features) produce a proper Python extension module. `cargo test
+# --no-default-features` turns it off so the unit-test harness links libpython
+# instead of relying on the host interpreter, letting the crate's `#[test]`s run.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
