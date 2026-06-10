@@ -269,6 +269,10 @@ pub mod debug_stash {
         /// #901-layer-2 split: `tr(K · D_βH[−v_i])` — the cubic IFT-correction
         /// component of the ψ logdet trace.
         pub correction_tr: Option<f64>,
+        /// #901-layer-2 candidate fix: the cubic correction recomputed with
+        /// the IFT direction taken from the kernel's own pseudo-inverse
+        /// `v = H_pen⁺·coord.g` instead of the full `hop.solve`.
+        pub correction_tr_proj: Option<f64>,
     }
 
     thread_local! {
@@ -280,6 +284,7 @@ pub mod debug_stash {
             projection_active: None,
             frozen_tr: None,
             correction_tr: None,
+            correction_tr_proj: None,
         }) };
     }
 

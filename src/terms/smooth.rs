@@ -24963,11 +24963,13 @@ mod tests {
         // frozen-B_i and cubic-IFT-correction components so we can attribute
         // the desync against the total FD reference.
         eprintln!(
-            "[#901-L2 split] production_tr={:+.6e} fd_total={:+.6e} frozen_tr={:?} correction_tr={:?}",
+            "[#901-L2 split] production_tr={:+.6e} fd_total={:+.6e} frozen_tr={:?} correction_tr={:?} correction_tr_proj={:?} (true_cubic={:+.6e})",
             production_tr,
             fd_d_logdet_h_proj,
             stash.frozen_tr,
             stash.correction_tr,
+            stash.correction_tr_proj,
+            fd_d_logdet_h_proj - stash.frozen_tr.unwrap_or(f64::NAN),
         );
 
         let rel_to_fd =
