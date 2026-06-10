@@ -40,6 +40,12 @@
 //!   must see a designed, honesty-weighted subsample
 //!   ([`crate::inference::row_measure::RowMeasure::designed_subsample`]), not
 //!   a full exact pass.
+//! * [`designed_target`] (#991) — the consumer bridge: design a row sample
+//!   from a [`crate::inference::row_measure::RowMeasure`] (uniform cold start,
+//!   or a previous harvest's lifted Fisher measure), stream-collect exactly
+//!   those rows into the `budget × p` fit target, and hand the `1/π` honesty
+//!   weights to `SaeManifoldTerm::set_row_loss_weights`. Full budget ⇒ the
+//!   exact pass, bit-for-bit (weights collapse to the unweighted path).
 //!
 //! # The seam
 //!
@@ -60,6 +66,7 @@
 //! Nothing in this module references `sae_manifold.rs`; the term wires these
 //! pieces in on its side of the seam.
 
+pub mod designed_target;
 pub mod kernels;
 pub mod ledger_store;
 pub mod object_store;
@@ -82,6 +89,13 @@ pub use warm_state::{DiskRowWarmCache, RowWarmCache, RowWarmState};
 
 /// Subsample → full-pass ρ schedule with importance weights.
 pub use rho_cascade::{RhoCascadeSchedule, RhoStepPlan, row_in_fraction};
+
+/// Designed corpus target collection (#991): stream → designed sample +
+/// honesty weights, the row set the term actually fits.
+pub use designed_target::{
+    DESIGNED_SAMPLE_DEFAULT_BUDGET_ROWS, DesignedCorpusTarget, auto_designed_budget,
+    collect_designed_target, collect_designed_target_auto, collect_designed_target_from_harvest,
+};
 
 /// Mixed-precision fused kernels (read `f32`, accumulate `f64`).
 pub use kernels::{

@@ -140,7 +140,8 @@ pub use solver::protocol::{
 };
 pub use solver::workflow::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
-    CtnStage1Recipe, FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest,
+    CtnStage1Recipe, DispersionLocationScaleFitRequest, DispersionLocationScaleFitResult, FitConfig,
+    FitRequest, FitResult, GaussianLocationScaleFitRequest,
     LatentBinaryFitRequest, LatentSurvivalFitRequest, LinkWiggleConfig, MaterializedModel,
     PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest, StandardFitResult,
     SurvivalLocationScaleFitRequest, SurvivalLocationScaleFitResult,

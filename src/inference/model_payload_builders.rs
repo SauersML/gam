@@ -466,6 +466,16 @@ pub enum LocationScaleResponse<'a> {
         link: InverseLink,
         noise_transform: &'a ScaleDeviationTransform,
     },
+    /// A genuine-dispersion mean family (NegativeBinomial / Gamma / Beta /
+    /// Tweedie) whose log-precision channel carries `noise_formula` (#913). The
+    /// `likelihood` is the family's own [`LikelihoodSpec`]; `base_link` is the
+    /// mean inverse link (log, or logit for Beta). The log-precision block
+    /// coefficients ride in [`LocationScaleInputs::beta_noise`].
+    Dispersion {
+        likelihood: LikelihoodSpec,
+        base_link: InverseLink,
+        family_tag: &'static str,
+    },
 }
 
 /// Optional link-wiggle metadata persisted alongside a location-scale model.
@@ -533,6 +543,18 @@ pub fn assemble_location_scale_payload(
                 Some(noise_transform),
             )
         }
+        LocationScaleResponse::Dispersion {
+            likelihood,
+            base_link,
+            family_tag,
+        } => (
+            family_tag.to_string(),
+            likelihood,
+            Some(base_link.clone()),
+            Some(base_link),
+            None,
+            None,
+        ),
     };
 
     let mut payload = FittedModelPayload::new(

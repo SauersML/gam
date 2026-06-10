@@ -364,6 +364,13 @@ pub struct BinomialLocationScaleFitRequest<'a> {
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
 }
 
+pub struct DispersionLocationScaleFitRequest<'a> {
+    pub data: ArrayView2<'a, f64>,
+    pub spec: DispersionGlmLocationScaleTermSpec,
+    pub options: BlockwiseFitOptions,
+    pub kappa_options: SpatialLengthScaleOptimizationOptions,
+}
+
 pub struct SurvivalLocationScaleFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: SurvivalLocationScaleTermSpec,
@@ -499,6 +506,7 @@ pub enum FitRequest<'a> {
     Standard(StandardFitRequest<'a>),
     GaussianLocationScale(GaussianLocationScaleFitRequest<'a>),
     BinomialLocationScale(BinomialLocationScaleFitRequest<'a>),
+    DispersionLocationScale(DispersionLocationScaleFitRequest<'a>),
     SurvivalLocationScale(SurvivalLocationScaleFitRequest<'a>),
     SurvivalTransformation(SurvivalTransformationFitRequest<'a>),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest<'a>),
@@ -568,6 +576,7 @@ macro_rules! family_dispatch {
             FitRequest::Standard($req) => $body,
             FitRequest::GaussianLocationScale($req) => $body,
             FitRequest::BinomialLocationScale($req) => $body,
+            FitRequest::DispersionLocationScale($req) => $body,
             FitRequest::SurvivalLocationScale($req) => $body,
             FitRequest::SurvivalTransformation($req) => $body,
             FitRequest::BernoulliMarginalSlope($req) => $body,
@@ -682,6 +691,38 @@ impl<'a> FamilyFitRequest for BinomialLocationScaleFitRequest<'a> {
         h.write_str(&format!("{:?}", self.spec.link_kind));
         self.spec.thresholdspec.write_structural_shape_hash(h);
         self.spec.log_sigmaspec.write_structural_shape_hash(h);
+    }
+    fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_session.get_or_insert(session);
+    }
+    fn attach_cache_mirror(&mut self, mirror: std::sync::Arc<crate::cache::Session>) {
+        self.options.cache_mirror_sessions.push(mirror);
+    }
+}
+
+impl<'a> FamilyFitRequest for DispersionLocationScaleFitRequest<'a> {
+    const TAG: &'static str = "dispersion-location-scale";
+    fn n_obs(&self) -> usize {
+        self.spec.y.len()
+    }
+    fn n_cols(&self) -> usize {
+        self.data.ncols()
+    }
+    fn write_shape_hash(&self, h: &mut crate::cache::Fingerprinter) {
+        h.write_str("disp-ls");
+        h.write_str(self.spec.kind.family_tag());
+        h.write_usize(self.spec.y.len());
+        h.write_usize(self.data.ncols());
+        // Topology identity (#869, extended): see GaussianLocationScale.
+        self.spec.meanspec.write_structural_shape_hash(h);
+        self.spec.log_dispspec.write_structural_shape_hash(h);
+    }
+    fn write_seed_hash(&self, h: &mut crate::cache::Fingerprinter) {
+        h.write_str("disp-ls-seed");
+        h.write_str(self.spec.kind.family_tag());
+        h.write_usize(self.data.ncols());
+        self.spec.meanspec.write_structural_shape_hash(h);
+        self.spec.log_dispspec.write_structural_shape_hash(h);
     }
     fn attach_cache_session(&mut self, session: std::sync::Arc<crate::cache::Session>) {
         self.options.cache_session.get_or_insert(session);
@@ -1087,6 +1128,7 @@ pub enum FitResult {
     Standard(StandardFitResult),
     GaussianLocationScale(GaussianLocationScaleFitResult),
     BinomialLocationScale(BinomialLocationScaleFitResult),
+    DispersionLocationScale(DispersionLocationScaleFitResult),
     SurvivalLocationScale(SurvivalLocationScaleFitResult),
     SurvivalTransformation(SurvivalTransformationFitResult),
     BernoulliMarginalSlope(BernoulliMarginalSlopeFitResult),
@@ -1094,6 +1136,16 @@ pub enum FitResult {
     LatentSurvival(LatentSurvivalTermFitResult),
     LatentBinary(LatentBinaryTermFitResult),
     TransformationNormal(TransformationNormalFitResult),
+}
+
+/// Result of a dispersion-channel GAMLSS location-scale fit (#913). Wraps the
+/// shared two-block [`BlockwiseTermFitResult`] (mean + log-precision designs
+/// and coefficients) plus the family kind so the save path can stamp the right
+/// likelihood. These families have no link-wiggle and no response
+/// standardization, so the result is a thin wrapper.
+pub struct DispersionLocationScaleFitResult {
+    pub fit: BlockwiseTermFitResult,
+    pub kind: DispersionFamilyKind,
 }
 
 fn resolved_wiggle_inverse_link(
@@ -1852,6 +1904,19 @@ fn fit_gaussian_location_scale_model(
 
     rescale_gaussian_location_scale_to_raw(&mut result, response_scale);
     Ok(result)
+}
+
+fn fit_dispersion_location_scale_model(
+    request: DispersionLocationScaleFitRequest<'_>,
+) -> Result<DispersionLocationScaleFitResult, String> {
+    let kind = request.spec.kind;
+    let fit = fit_dispersion_glm_location_scale_terms(
+        request.data,
+        request.spec,
+        &request.options,
+        &request.kappa_options,
+    )?;
+    Ok(DispersionLocationScaleFitResult { fit, kind })
 }
 
 fn fit_binomial_location_scale_model(
@@ -3833,6 +3898,11 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
         FitRequest::BinomialLocationScale(request) => fit_binomial_location_scale_model(request)
             .map(FitResult::BinomialLocationScale)
             .map_err(wrap_solver_err),
+        FitRequest::DispersionLocationScale(request) => {
+            fit_dispersion_location_scale_model(request)
+                .map(FitResult::DispersionLocationScale)
+                .map_err(wrap_solver_err)
+        }
         FitRequest::SurvivalLocationScale(request) => {
             // Outermost defensive catch: any path that surfaces empty
             // `block_states` to a family method (multiple possible —
@@ -7941,6 +8011,36 @@ fn materialize_location_scale<'a>(
             }),
             inference_notes,
         })
+    } else if let Some(kind) = dispersion_location_scale_kind(&family.response) {
+        // Genuine-dispersion mean families (NegativeBinomial / Gamma / Beta /
+        // Tweedie): `noise_formula` models the overdispersion channel (#913).
+        // A link-wiggle is mean-only and not defined here.
+        if wiggle_cfg.is_some() {
+            return Err(WorkflowError::InvalidConfig {
+                reason: format!(
+                    "link-wiggle is not supported for {} location-scale models",
+                    kind.family_tag()
+                ),
+            }
+            .into());
+        }
+        Ok(MaterializedModel {
+            request: FitRequest::DispersionLocationScale(DispersionLocationScaleFitRequest {
+                data: data.values.view(),
+                spec: DispersionGlmLocationScaleTermSpec {
+                    kind,
+                    y,
+                    weights,
+                    meanspec,
+                    log_dispspec: log_sigmaspec,
+                    mean_offset,
+                    log_disp_offset: noise_offset,
+                },
+                options,
+                kappa_options,
+            }),
+            inference_notes,
+        })
     } else {
         Ok(MaterializedModel {
             request: FitRequest::GaussianLocationScale(GaussianLocationScaleFitRequest {
@@ -7959,6 +8059,19 @@ fn materialize_location_scale<'a>(
             }),
             inference_notes,
         })
+    }
+}
+
+/// Map a [`ResponseFamily`] to the dispersion-GAM kind whose overdispersion
+/// channel can carry a `noise_formula` (#913), or `None` for families handled
+/// by the Gaussian/Binomial location-scale paths.
+fn dispersion_location_scale_kind(response: &ResponseFamily) -> Option<DispersionFamilyKind> {
+    match response {
+        ResponseFamily::NegativeBinomial { .. } => Some(DispersionFamilyKind::NegativeBinomial),
+        ResponseFamily::Gamma => Some(DispersionFamilyKind::Gamma),
+        ResponseFamily::Beta { .. } => Some(DispersionFamilyKind::Beta),
+        ResponseFamily::Tweedie { p } => Some(DispersionFamilyKind::Tweedie { p: *p }),
+        _ => None,
     }
 }
 
