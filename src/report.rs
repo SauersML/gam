@@ -13,6 +13,16 @@ pub struct ReportInput {
     pub deviance: f64,
     pub reml_score: f64,
     pub iterations: usize,
+    /// Human-readable P-IRLS / outer convergence status (e.g. "Converged",
+    /// "Max iterations reached"). Plain text so report.rs stays free of gam
+    /// library types; main.rs supplies `PirlsStatus::label()`.
+    pub convergence_status: String,
+    /// Whether the fit cleanly converged. Drives the visual flag on the
+    /// convergence line — any non-converged state is highlighted.
+    pub converged: bool,
+    /// Final outer-objective gradient norm at the recorded solution, when the
+    /// outer loop measured it (`None` for cache-hit / gradient-free exits).
+    pub outer_gradient_norm: Option<f64>,
     pub edf_total: f64,
     pub r_squared: Option<f64>,
     pub coefficients: Vec<CoefficientRow>,
@@ -303,7 +313,32 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
         summary_pairs.push(("R-squared", format!("{:.6}", r2)));
     }
     summary_pairs.push(("EDF (total)", format!("{:.4}", input.edf_total)));
-    summary_pairs.push(("Outer Iterations", format!("{}", input.iterations)));
+    // Outer iterations, annotated with the cap when the solver did not
+    // converge cleanly so "47" cannot be misread as "converged at 47".
+    let iter_value = if input.converged {
+        format!("{}", input.iterations)
+    } else {
+        format!(
+            "{} <span class=\"conv-warn\">(did not converge)</span>",
+            input.iterations
+        )
+    };
+    summary_pairs.push(("Outer Iterations", iter_value));
+    // Convergence status: always shown, visually flagged when not `Converged`,
+    // so a reader can immediately tell a healthy fit from one that hit the
+    // iteration cap, exhausted the LM step search, or went unstable.
+    let conv_value = if input.converged {
+        format!("<span class=\"conv-ok\">{}</span>", esc(&input.convergence_status))
+    } else {
+        format!(
+            "<span class=\"conv-warn\">\u{26A0} {}</span>",
+            esc(&input.convergence_status)
+        )
+    };
+    summary_pairs.push(("Convergence", conv_value));
+    if let Some(g) = input.outer_gradient_norm {
+        summary_pairs.push(("Outer Gradient Norm", format!("{g:.3e}")));
+    }
 
     let summary_items = summary_pairs
         .iter()
@@ -648,6 +683,8 @@ body {{ font-family:var(--font);background:var(--bg);color:var(--text);line-heig
 }}
 .stat-label {{ font-size:11px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.05em; }}
 .stat-value {{ font-size:15px;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums;margin-top:2px; }}
+.conv-ok {{ color:#15803d; }}
+.conv-warn {{ color:#b45309;font-weight:700; }}
 
 .alert {{
   background:#fffbeb;border:1px solid #fde68a;border-radius:var(--radius);
