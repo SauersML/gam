@@ -110,10 +110,14 @@ fn negbin_log_coefficient_se_matches_statsmodels_no_theta_inflation() {
     assert_eq!(dense.nrows(), n, "design row count must match data");
 
     // gam's per-point linear-predictor SE SE(eta_i) = sqrt(xᵢᵀ Vb xᵢ).
+    // `theta` was supplied to the fit as a held-fixed user value (via
+    // `FitConfig::negative_binomial_theta`); the prediction-time spec must
+    // mirror that contract so the IRLS weight `W = μθ/(θ+μ)` used to build
+    // `Vb` is computed with the exact same overdispersion.
     let nb_log = LikelihoodSpec::new(
         ResponseFamily::NegativeBinomial {
             theta,
-            theta_fixed: false,
+            theta_fixed: true,
         },
         InverseLink::Standard(StandardLink::Log),
     );
