@@ -231,6 +231,25 @@ jobs:
             exit "$test_status"
           fi
 
+      - name: Run gam-pyffi unit tests
+        # The `gam` package tested above is the workspace root; the FFI crate
+        # `gam-pyffi` is a separate member whose `#[test]`s (the survival
+        # surface-IO conversions for #964/#965/#966 and the latent-stationarity
+        # checks for #954) were never run by CI: the crate used to be
+        # `crate-type = ["cdylib"]` (no test harness) and the command above does
+        # not target it. With the crate now exposing an `rlib` and gating the
+        # PyO3 `extension-module` feature behind a default, we can build and run
+        # its harness here. `--no-default-features` drops `extension-module` so
+        # the test binary links libpython (the host interpreter is only present
+        # at import time for the real extension, not for a standalone test exe).
+        env:
+          RUSTFLAGS: "-C link-arg=-Wl,--threads=1"
+        run: |
+          set -uo pipefail
+          cargo test -p gam-pyffi --no-default-features \
+            --config profile.dev.debug=0 --jobs 1 2>&1 | tee -a /tmp/cargo-test.log
+          exit "${PIPESTATUS[0]}"
+
   python-tests:
     name: Python API tests
     runs-on: ubuntu-latest
