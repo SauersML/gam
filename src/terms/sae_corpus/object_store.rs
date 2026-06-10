@@ -392,7 +392,17 @@ impl CorpusRowSource for ObjectStoreShardSource {
             .window
             .front()
             .expect("fill_window leaves the current shard resident");
-        debug_assert_eq!(front.shard_idx, self.cursor_shard);
+        // The window is a contiguous run of shard indices starting at the read
+        // cursor, so after a fill the front must be `cursor_shard`. A release
+        // build cannot drop this check (a stale front would read the wrong
+        // payload against `meta`'s row metadata and silently corrupt the
+        // batch), so it is a real error rather than a `debug_assert`.
+        if front.shard_idx != self.cursor_shard {
+            return Err(ShardError::ResidencyInvariant {
+                cursor_shard: self.cursor_shard,
+                front_shard: front.shard_idx,
+            });
+        }
 
         // A batch never crosses a shard boundary (same contract as the mmap
         // source): contiguous rows of one payload, bounded by the batch size.
