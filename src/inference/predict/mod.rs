@@ -1294,6 +1294,15 @@ pub struct BernoulliMarginalSlopePredictor {
     /// training-time z already passed the strict normality check and no
     /// transform was applied.
     pub(crate) latent_z_calibration: Option<crate::families::bms::LatentZRankIntCalibration>,
+    /// Optional conditional location-scale latent-z calibration (#905). When
+    /// `Some`, predict-time z (after `latent_z_normalization`) is replaced by
+    /// `ζ = (z − m(C))/√v(C)`, with the conditioning span `a(C)` rebuilt from
+    /// the marginal prediction design — mirroring the fit-time correction the
+    /// Auto path applied when its conditional `E[z|C]`/`Var(z|C)` Rao gate
+    /// detected PC/ancestry-dependence. Mutually exclusive with
+    /// `latent_z_calibration`.
+    pub(crate) latent_z_conditional_calibration:
+        Option<crate::families::bms::LatentZConditionalCalibration>,
 }
 
 /// Per-runtime predict-time anchor correction matrices.
@@ -1375,7 +1384,7 @@ impl BernoulliMarginalSlopePredictor {
             return Ok(BmsAnchorCorrections::default());
         }
         // Materialise the marginal + logslope designs at predict rows.
-        // For biobank-scale predict batches the caller already chunks via
+        // For large-scale predict batches the caller already chunks via
         // `prediction_chunk_rows`, so this densification is bounded per
         // chunk by `chunk_size × (p_marginal + p_logslope)`.
         let marginal_dense = input
@@ -1581,6 +1590,29 @@ impl BernoulliMarginalSlopePredictor {
             Some(cal) => Array1::from_iter(z.iter().map(|&zi| cal.apply_at_predict(zi))),
             None => z.clone(),
         }
+    }
+
+    /// Apply the (optional) conditional location-scale latent-z calibration
+    /// (#905) to a batch of normalized predict-time z values.
+    ///
+    /// When `Some`, training detected a conditional `E[z|C]`/`Var(z|C)` shift
+    /// and replaced its latent score by `ζ = (z − m(C))/√v(C)`. The predictor
+    /// MUST apply the identical map, rebuilding the conditioning span `a(C)`
+    /// from the marginal prediction design (`input.design`) — the same span the
+    /// fit regressed z on. `None` ⇒ no conditional calibration was applied at
+    /// fit time, so z passes through unchanged (mutually exclusive with the
+    /// rank-INT calibration above).
+    fn apply_latent_z_conditional_calibration(
+        &self,
+        z: &Array1<f64>,
+        input: &PredictInput,
+    ) -> Result<Array1<f64>, EstimationError> {
+        let Some(cal) = self.latent_z_conditional_calibration.as_ref() else {
+            return Ok(z.clone());
+        };
+        let a_block = input.design.to_dense();
+        cal.apply(z.view(), a_block.view())
+            .map_err(EstimationError::InvalidInput)
     }
 
     fn rigid_intercept_from_marginal(&self, marginal_eta: f64, slope: f64) -> f64 {
@@ -2154,6 +2186,9 @@ impl BernoulliMarginalSlopePredictor {
         score_warp_runtime: Option<SavedCompiledFlexBlock>,
         link_deviation_runtime: Option<SavedCompiledFlexBlock>,
         latent_z_calibration: Option<crate::families::bms::LatentZRankIntCalibration>,
+        latent_z_conditional_calibration: Option<
+            crate::families::bms::LatentZConditionalCalibration,
+        >,
     ) -> Result<Self, String> {
         let gaussian_frailty_sd = match frailty {
             FrailtySpec::None => None,
@@ -2254,6 +2289,7 @@ impl BernoulliMarginalSlopePredictor {
             link_deviation_runtime,
             gaussian_frailty_sd,
             latent_z_calibration,
+            latent_z_conditional_calibration,
         })
     }
 
@@ -2419,6 +2455,10 @@ impl BernoulliMarginalSlopePredictor {
         // CDF resolution. `None` ⇒ training-time z passed the strict
         // normality check, no transform was applied, leave z unchanged.
         let z = self.apply_latent_z_calibration(&z_normalized);
+        // #905: replace z by ζ = (z − m(C))/√v(C) when training engaged the
+        // conditional Auto gate (no-op otherwise; mutually exclusive with the
+        // rank-INT calibration above).
+        let z = self.apply_latent_z_conditional_calibration(&z, input)?;
         let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "bernoulli marginal-slope prediction requires logslope design".to_string(),
@@ -3156,6 +3196,10 @@ impl BernoulliMarginalSlopePredictor {
         // implicit-function chain rule consume the calibrated z, never
         // the raw normalized z, exactly mirroring fit-time semantics.
         let z = self.apply_latent_z_calibration(&z_normalized);
+        // #905: replace z by ζ = (z − m(C))/√v(C) when training engaged the
+        // conditional Auto gate (no-op otherwise; mutually exclusive with the
+        // rank-INT calibration above).
+        let z = self.apply_latent_z_conditional_calibration(&z, input)?;
         let design_logslope = input.design_noise.as_ref().ok_or_else(|| {
             EstimationError::InvalidInput(
                 "bernoulli marginal-slope prediction requires logslope design".to_string(),
@@ -6596,6 +6640,7 @@ mod tests {
             link_deviation_runtime: None,
             gaussian_frailty_sd: None,
             latent_z_calibration: None,
+            latent_z_conditional_calibration: None,
         };
         let err = score_only
             .score_warp_runtime
@@ -6771,6 +6816,7 @@ mod tests {
             link_deviation_runtime: None,
             gaussian_frailty_sd: Some(0.8),
             latent_z_calibration: None,
+            latent_z_conditional_calibration: None,
         };
         let theta = predictor.theta();
         let input = PredictInput {
@@ -6840,6 +6886,7 @@ mod tests {
             link_deviation_runtime: None,
             gaussian_frailty_sd: None,
             latent_z_calibration: None,
+            latent_z_conditional_calibration: None,
         };
         let input = PredictInput {
             design: DesignMatrix::from(array![[1.0], [1.0]]),
@@ -6892,6 +6939,7 @@ mod tests {
             link_deviation_runtime: None,
             gaussian_frailty_sd: Some(0.8),
             latent_z_calibration: None,
+            latent_z_conditional_calibration: None,
         };
         let theta = predictor.theta();
         let input = PredictInput {

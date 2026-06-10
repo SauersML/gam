@@ -548,7 +548,7 @@ struct PredictionPayload {
 /// matrix.  The Python side rebuilds the numpy array via
 /// `np.asarray(samples_flat).reshape(n_draws, n_coeffs)` — flat lists round
 /// trip through `serde_json` faster than nested ones at the sizes typical
-/// for biobank-scale work (millions of doubles), and they sidestep the
+/// for large-scale work (millions of doubles), and they sidestep the
 /// per-row Python list construction cost.
 #[derive(Serialize)]
 struct SamplePayload {
@@ -30920,6 +30920,7 @@ fn build_bernoulli_marginal_slope_ffi_payload(
             },
             latent_measure: ms_result.latent_measure.clone(),
             latent_z_rank_int_calibration: ms_result.latent_z_rank_int_calibration.clone(),
+            latent_z_conditional_calibration: ms_result.latent_z_conditional_calibration.clone(),
             score_warp_runtime: ms_result.score_warp_runtime.as_ref(),
             link_dev_runtime: ms_result.link_dev_runtime.as_ref(),
             base_link,

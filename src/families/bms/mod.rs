@@ -525,7 +525,7 @@ impl LatentZPolicy {
         // Defaults relaxed to `WarnOnly` with the same thresholds the
         // exploratory-weighted preset uses (skew ≤ 4.0, |excess kurt| ≤ 20.0).
         // Rationale: the upstream conditional transformation-normal
-        // preprocessor may be fit isotropically (no per-axis κ). At biobank
+        // preprocessor may be fit isotropically (no per-axis κ). At large-scale
         // dimensionality (16 PCs, 15 ancestries) an isotropic fit can leave
         // the global latent-z distribution mildly heavy-tailed (skew ≈ 4,
         // excess kurt ≈ 30–40 in synthetic studies) without violating per-
@@ -595,7 +595,7 @@ impl LatentZNormalization {
 /// global-empirical latent measure) is *mathematically correct* but
 /// triggers the per-row intercept Newton solve in the empirical-grid
 /// closed-form kernels (`empirical_rigid_primary_grad_hess_closed_form`
-/// and its higher-order siblings); at biobank scale that is the dominant
+/// and its higher-order siblings); at large scale that is the dominant
 /// cost.
 ///
 /// **Rank-INT is exact under monotone re-parameterisation.** The Blom rankit assigns

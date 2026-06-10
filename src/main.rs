@@ -1294,7 +1294,7 @@ fn run_fit(args: FitArgs) -> Result<(), String> {
     }
 
     progress.set_stage("fit", "building term specification");
-    // Shape-derived resource policy: at biobank-scale n we auto-select strict
+    // Shape-derived resource policy: at large-scale n we auto-select strict
     // (analytic-operator-required) so any silent dense fallback in the
     // term-construction layer fails fast.
     let bare_fit_policy = gam::resource::ResourcePolicy::for_problem(
@@ -1959,6 +1959,7 @@ fn run_fit_bernoulli_marginal_slope(
             },
             solved.latent_measure.clone(),
             solved.latent_z_rank_int_calibration.clone(),
+            solved.latent_z_conditional_calibration.clone(),
             solved.score_warp_runtime.as_ref(),
             solved.link_dev_runtime.as_ref(),
             base_link,
@@ -7604,6 +7605,7 @@ fn build_bernoulli_marginal_slope_saved_model(
     latent_z_normalization: SavedLatentZNormalization,
     latent_measure: LatentMeasureKind,
     latent_z_rank_int_calibration: Option<gam::families::bms::LatentZRankIntCalibration>,
+    latent_z_conditional_calibration: Option<gam::families::bms::LatentZConditionalCalibration>,
     score_warp_runtime: Option<&DeviationRuntime>,
     link_dev_runtime: Option<&DeviationRuntime>,
     base_link: InverseLink,
@@ -7632,6 +7634,7 @@ fn build_bernoulli_marginal_slope_saved_model(
             latent_z_normalization,
             latent_measure,
             latent_z_rank_int_calibration,
+            latent_z_conditional_calibration,
             score_warp_runtime,
             link_dev_runtime,
             base_link,

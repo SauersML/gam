@@ -1,6 +1,8 @@
 use crate::basis::BasisOptions;
 use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::families::bms::{LatentMeasureKind, LatentZRankIntCalibration};
+use crate::families::bms::{
+    LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
+};
 use crate::families::lognormal_kernel::FrailtySpec;
 use crate::families::survival_construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
@@ -1934,20 +1936,6 @@ impl SavedCompiledFlexBlock {
             BasisOptions::second_derivative().derivative_order,
         )
     }
-
-    pub fn third_derivative_design(
-        &self,
-        values: &Array1<f64>,
-    ) -> Result<Array2<f64>, FittedModelError> {
-        self.evaluate_span_polynomial_design(values, 3)
-    }
-
-    pub fn fourth_derivative_design(
-        &self,
-        values: &Array1<f64>,
-    ) -> Result<Array2<f64>, FittedModelError> {
-        self.evaluate_span_polynomial_design(values, 4)
-    }
 }
 
 impl FittedFamily {
@@ -3203,6 +3191,7 @@ impl FittedModel {
                     runtime.score_warp,
                     runtime.link_deviation,
                     runtime.latent_z_rank_int_calibration,
+                    runtime.latent_z_conditional_calibration,
                 )
                 .ok()?;
                 Some(Box::new(predictor) as Box<dyn PredictableModel>)
