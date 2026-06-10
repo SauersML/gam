@@ -1615,24 +1615,59 @@ where
                         // clipping boundary. This is deliberately separate
                         // from the two-iteration soft-acceptance gate above:
                         // unconstrained one-off plateaus must still run out
-                        // as MaxIterationsReached. The same constraint-KKT
-                        // band (`constraint_kkt_admits_soft_accept`) gates this
-                        // plateau too, so a non-degenerate near-vertex stall is
-                        // not accepted as a valid minimum (#873).
+                        // as MaxIterationsReached.
+                        //
+                        // Gate composition for the long streak (vs the fast
+                        // path's stationarity band):
+                        //
+                        // * `model_progress_exhausted` — the accepted step's
+                        //   OWN quadratic model predicted only sub-tolerance
+                        //   progress. This is the discriminator that keeps a
+                        //   value↔gradient desync (analytic gradient
+                        //   promising progress the value never realizes) from
+                        //   ever certifying: a desynced model keeps predicting
+                        //   above-tolerance reductions, breaking the streak,
+                        //   while a genuinely exhausted direction predicts
+                        //   next-to-nothing for 20 consecutive accepted steps.
+                        //   A small-but-not-tiny gradient along an almost-flat
+                        //   ray (e.g. ‖g‖ ~ 50× the near-stationary band with
+                        //   per-step gains ~10⁻⁹·scale) is exactly the
+                        //   progress-exhausted stall this branch certifies —
+                        //   the stationarity band would starve it into
+                        //   MaxIterationsReached after burning the entire
+                        //   budget on numerically invisible progress.
+                        // * `constraint_kkt_admits_progress_exhausted_stall`
+                        //   — primal/dual/complementarity cleanliness inside
+                        //   the outer gate's bands plus a hard refusal of
+                        //   rank-deficient working sets, so the #873
+                        //   degenerate-vertex stall still cannot be accepted
+                        //   here (it remains confined to the fast path's
+                        //   relaxed degenerate band, which demands
+                        //   stationarity).
                         let objective_scale = final_state_ref
                             .deviance
                             .abs()
                             .max(final_state_ref.penalty_term.abs())
                             .max(1.0);
+                        let plateau_band =
+                            options.convergence_tolerance * objective_scale * 0.1;
+                        let model_progress_exhausted = predicted_reduction.is_finite()
+                            && predicted_reduction.abs() <= plateau_band;
                         let strict_objective_plateau = has_explicit_constraints
-                            && soft_accept_kkt_ok
                             && deviance_change.is_finite()
                             && deviance_change >= 0.0
                             && deviance_change.abs()
                                 // Objective-plateau progress test, not a KKT certificate.
-                                <= options.convergence_tolerance * objective_scale * 0.1
+                                <= plateau_band
+                            && model_progress_exhausted
                             && max_abs_eta.is_finite()
-                            && max_abs_eta < PIRLS_ETA_ABS_CAP * 0.5;
+                            && max_abs_eta < PIRLS_ETA_ABS_CAP * 0.5
+                            && constraint_kkt_admits_progress_exhausted_stall(
+                                options,
+                                beta.as_ref(),
+                                &final_state_ref.gradient,
+                                kkt_tolerance,
+                            );
                         if strict_objective_plateau {
                             constrained_objective_plateau_streak += 1;
                             if constrained_objective_plateau_streak
