@@ -1118,22 +1118,37 @@ impl TailCellMomentCacheStats {
 /// caller needs deterministic hit/miss bookkeeping that is not polluted by
 /// concurrent traffic on the global memo. The production path uses the
 /// global instance behind [`evaluate_cell_moments`].
+///
+/// All methods take `&self`: the LRU is internally synchronized (sharded for
+/// the concurrent global memo) and the counters are atomics, so the global
+/// instance needs no outer `Mutex`. The previous `OnceLock<Mutex<…>>` wrapper
+/// serialized every tail-cell evaluation across all rayon workers of the
+/// marginal-slope exact-cache build — the same contention class the sharded
+/// per-family cell-moment LRU fix removed.
 #[derive(Debug)]
 pub struct TailCellMomentCache {
     moments: ByteLruCache<TailCellMomentCacheKey, CellMomentState>,
-    hits: usize,
-    misses: usize,
+    hits: std::sync::atomic::AtomicUsize,
+    misses: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for TailCellMomentCache {
     fn default() -> Self {
+        // Tail-cell entries are small (a short moment vector), so sharding
+        // the byte/entry budgets is harmless; size the shard count off the
+        // worker pool exactly like the per-family cell-moment LRU.
+        let shard_count = std::thread::available_parallelism()
+            .map(|workers| workers.get().saturating_mul(8))
+            .unwrap_or(32)
+            .clamp(8, 256);
         Self {
-            moments: ByteLruCache::with_max_entries(
+            moments: ByteLruCache::with_max_entries_sharded(
                 TAIL_CELL_MOMENT_CACHE_MAX_BYTES,
                 TAIL_CELL_MOMENT_CACHE_MAX_ENTRIES,
+                shard_count,
             ),
-            hits: 0,
-            misses: 0,
+            hits: std::sync::atomic::AtomicUsize::new(0),
+            misses: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -1148,18 +1163,18 @@ impl TailCellMomentCache {
     /// Reset the cache to its empty state. Existing entries are dropped and
     /// the hit/miss counters are zeroed.
     #[inline]
-    pub fn clear(&mut self) {
+    pub fn clear(&self) {
         self.moments.clear();
-        self.hits = 0;
-        self.misses = 0;
+        self.hits.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.misses.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Snapshot of the cache's current usage stats.
     #[inline]
     pub fn stats(&self) -> TailCellMomentCacheStats {
         TailCellMomentCacheStats {
-            hits: self.hits,
-            misses: self.misses,
+            hits: self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            misses: self.misses.load(std::sync::atomic::Ordering::Relaxed),
             entries: self.moments.len(),
         }
     }
@@ -1168,10 +1183,13 @@ impl TailCellMomentCache {
     /// miss. Cells outside the affine-tail keyset bypass the cache and run
     /// the uncached evaluator directly without touching the counters.
     ///
-    /// Stat semantics: a **miss** is counted iff this call inserted a new
-    /// entry into the bounded LRU; every cache hit increments `hits`.
+    /// Stat semantics: every cache hit increments `hits`; a **miss** is
+    /// counted when this call computed the value itself. Under concurrent
+    /// access two workers racing on the same cold key may both count a miss
+    /// (each computes the identical pure-function value); single-threaded
+    /// bookkeeping is exact.
     pub fn evaluate(
-        &mut self,
+        &self,
         cell: DenestedCubicCell,
         max_degree: usize,
     ) -> Result<CellMomentState, String> {
@@ -1179,23 +1197,24 @@ impl TailCellMomentCache {
             return evaluate_cell_moments_uncached(cell, max_degree);
         };
         if let Some(state) = self.moments.get(&key) {
-            self.hits += 1;
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(state);
         }
         let state = evaluate_cell_moments_uncached(cell, max_degree)?;
-        self.misses += 1;
+        self.misses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.moments.insert(key, state.clone());
         Ok(state)
     }
 }
 
-static TAIL_CELL_MOMENT_CACHE: std::sync::OnceLock<std::sync::Mutex<TailCellMomentCache>> =
+static TAIL_CELL_MOMENT_CACHE: std::sync::OnceLock<TailCellMomentCache> =
     std::sync::OnceLock::new();
 static TAIL_CELL_MOMENT_CACHE_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
-fn tail_cell_moment_cache() -> &'static std::sync::Mutex<TailCellMomentCache> {
-    TAIL_CELL_MOMENT_CACHE.get_or_init(|| std::sync::Mutex::new(TailCellMomentCache::default()))
+fn tail_cell_moment_cache() -> &'static TailCellMomentCache {
+    TAIL_CELL_MOMENT_CACHE.get_or_init(TailCellMomentCache::default)
 }
 
 #[inline]
@@ -1230,17 +1249,11 @@ pub fn set_tail_cell_moment_cache_enabled(enabled: bool) {
 }
 
 pub fn reset_tail_cell_moment_cache() {
-    let mut cache = tail_cell_moment_cache()
-        .lock()
-        .expect("tail cell moment cache mutex poisoned");
-    cache.clear();
+    tail_cell_moment_cache().clear();
 }
 
 pub fn tail_cell_moment_cache_stats() -> TailCellMomentCacheStats {
-    let cache = tail_cell_moment_cache()
-        .lock()
-        .expect("tail cell moment cache mutex poisoned");
-    cache.stats()
+    tail_cell_moment_cache().stats()
 }
 
 #[derive(Clone, Copy, Debug, Eq)]
@@ -3458,33 +3471,7 @@ pub fn evaluate_cell_moments(
     if !TAIL_CELL_MOMENT_CACHE_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
         return evaluate_cell_moments_uncached(cell, max_degree);
     }
-    let Some(key) = tail_cell_cache_key(cell, max_degree) else {
-        return evaluate_cell_moments_uncached(cell, max_degree);
-    };
-    // Fast probe: serve cached state without holding the mutex during the
-    // uncached evaluator below.
-    {
-        let mut cache = tail_cell_moment_cache()
-            .lock()
-            .expect("tail cell moment cache mutex poisoned");
-        if let Some(state) = cache.moments.get(&key) {
-            cache.hits += 1;
-            return Ok(state);
-        }
-    }
-    let state = evaluate_cell_moments_uncached(cell, max_degree)?;
-    let mut cache = tail_cell_moment_cache()
-        .lock()
-        .expect("tail cell moment cache mutex poisoned");
-    let cache = &mut *cache;
-    if let Some(value) = cache.moments.get(&key) {
-        cache.hits += 1;
-        Ok(value)
-    } else {
-        cache.misses += 1;
-        cache.moments.insert(key, state.clone());
-        Ok(state)
-    }
+    tail_cell_moment_cache().evaluate(cell, max_degree)
 }
 
 /// Evaluate cell moments without consulting the global affine-tail memo.
@@ -3799,7 +3786,7 @@ mod tests {
         // global memo through `evaluate_cell_moments`. Asserting on the
         // global counters made this test race-flaky when the suite ran in
         // parallel.
-        let mut cache = TailCellMomentCache::new();
+        let cache = TailCellMomentCache::new();
         let c0s = [-2.0, -0.25, 0.0, 1.5];
         let c1s = [-1.2, -0.05, 0.0, 0.8];
         let endpoints = [-4.0, -1.0, 0.0, 2.5, 6.0];
