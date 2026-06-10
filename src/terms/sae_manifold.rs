@@ -3706,10 +3706,13 @@ impl SaeManifoldTerm {
         // reconstruction data-fit stays the isotropic `0.5 * Σ r²`: a gauge /
         // output-Fisher inner product must NOT silently replace the
         // reconstruction loss with a Fisher pullback (#980). It only drives the
-        // gauge (see `analytic_penalties::corrected_isometry_penalty`). With no
-        // producer of `WhitenedStructured` at the SAE surface today, this path is
-        // bit-for-bit the historical isotropic data-fit and value/gradient stay
-        // trivially in sync (no whitening happens).
+        // gauge (see `analytic_penalties::corrected_isometry_penalty`). The
+        // producer of `WhitenedStructured` is
+        // `inference::residual_factor::StructuredResidualModel::row_metric`; the
+        // SAME metric whitens the assembled gradient/Hessian in
+        // `assemble_arrow_schur` (the single #974 seam), so this value and that
+        // gradient cannot desync. Without a whitening metric this path is
+        // bit-for-bit the historical isotropic data-fit.
         let whitens = self
             .row_metric
             .as_ref()
