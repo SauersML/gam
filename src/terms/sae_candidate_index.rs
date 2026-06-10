@@ -125,6 +125,53 @@ pub trait AtomFrameSketch {
     /// lies fully in the atom's range, `0.0` means it is orthogonal. Used to
     /// rank the (small) candidate set the index returns.
     fn alignment(&self, atom_id: usize, direction: ArrayView1<f64>) -> f64;
+
+    /// Sketch-space **probe** for a raw query direction (length
+    /// [`AtomFrameSketch::sketch_dim`]), comparable to the
+    /// [`AtomFrameSketch::atom_sketch`] representatives the LSH tables were
+    /// built from (#994).
+    ///
+    /// Implementors whose atoms share one projection `R` (the default sketch,
+    /// and the post-#972 Grassmann-frame sketch) **must** override this with
+    /// the exact `normalize(R · d)` — `O(p · s)` per query, touching no atom,
+    /// and exactly the cosine-LSH probe the sign-signature tables expect.
+    ///
+    /// The default is the legacy fallback for frame sources with *per-atom*
+    /// projections only: average the masked per-atom query projections over a
+    /// deterministic stratified `O(√K)` subset of atoms and renormalize. It
+    /// concentrates on the shared-projection direction only when the sampled
+    /// frames are spread near-isotropically — on coherent atom clusters it
+    /// degrades (the #994 defect) — so it exists for trait-compatibility, not
+    /// as a recommendation.
+    fn query_sketch(&self, direction: ArrayView1<f64>) -> Array1<f64> {
+        let sketch_dim = self.sketch_dim();
+        let num = self.num_atoms();
+        if num == 0 {
+            return Array1::<f64>::zeros(sketch_dim);
+        }
+        let sample = ((num as f64).sqrt().ceil() as usize).clamp(1, num);
+        let stride = (num / sample).max(1);
+        let mut acc = Array1::<f64>::zeros(sketch_dim);
+        let mut count = 0usize;
+        let mut id = 0usize;
+        while id < num {
+            let q = self.project_direction(id, direction);
+            if q.len() == sketch_dim {
+                for (a, &v) in acc.iter_mut().zip(q.iter()) {
+                    *a += v;
+                }
+                count += 1;
+            }
+            id += stride;
+        }
+        if count > 0 {
+            for a in acc.iter_mut() {
+                *a /= count as f64;
+            }
+        }
+        normalize_in_place(&mut acc);
+        acc
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +299,16 @@ impl AtomFrameSketch for RandomProjectionFrameSketch {
     fn project_direction(&self, atom_id: usize, direction: ArrayView1<f64>) -> Array1<f64> {
         let comp = self.in_range_component(atom_id, direction);
         mat_vec(&self.projection, comp.view())
+    }
+
+    /// Exact `O(p·s)` probe (#994): every atom shares the one projection `R`,
+    /// and the table representatives are `normalize(R · u_k0)`, so the correct
+    /// cosine-LSH probe for a direction is simply `normalize(R · d)` — no atom
+    /// is touched, and no masked-average approximation is involved.
+    fn query_sketch(&self, direction: ArrayView1<f64>) -> Array1<f64> {
+        let mut s = mat_vec(&self.projection, direction);
+        normalize_in_place(&mut s);
+        s
     }
 
     fn alignment(&self, atom_id: usize, direction: ArrayView1<f64>) -> f64 {
