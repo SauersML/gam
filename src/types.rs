@@ -926,11 +926,78 @@ impl std::error::Error for ResponseInferenceRefusal {}
 /// `ResponseFamily` carries the per-family scalars (Tweedie p, NegBin theta,
 /// Beta phi); `InverseLink` carries the parameterized link state. Together
 /// they replace the former flat likelihood enum.
+///
+/// Only the legal `(response, link)` cells enumerated by [`LikelihoodSpec::kind`]
+/// are representable through the public surface: [`LikelihoodSpec::try_new`]
+/// validates the legal matrix on construction, and deserialization routes
+/// through [`LikelihoodSpecWire`] (`#[serde(try_from / into)]`) so saved bytes
+/// cannot resurrect an illegal cell. The on-wire shape is byte-identical to the
+/// historical `{ response, link }` struct, so legal saved models load unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "LikelihoodSpecWire", into = "LikelihoodSpecWire")]
 pub struct LikelihoodSpec {
     pub response: ResponseFamily,
     pub link: InverseLink,
 }
+
+/// Transparent serde shadow of [`LikelihoodSpec`] with the identical wire shape
+/// (`response`, `link`). All (de)serialization of `LikelihoodSpec` routes
+/// through this type so the legal-matrix check in
+/// [`TryFrom<LikelihoodSpecWire>`] runs on every load, closing the
+/// saved-bytes hole: an illegal `(response, link)` cell deserializes into a
+/// serde error instead of a silently-masked spec.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LikelihoodSpecWire {
+    pub response: ResponseFamily,
+    pub link: InverseLink,
+}
+
+impl From<LikelihoodSpec> for LikelihoodSpecWire {
+    #[inline]
+    fn from(spec: LikelihoodSpec) -> Self {
+        Self {
+            response: spec.response,
+            link: spec.link,
+        }
+    }
+}
+
+impl TryFrom<LikelihoodSpecWire> for LikelihoodSpec {
+    type Error = IllegalLikelihoodCell;
+
+    #[inline]
+    fn try_from(wire: LikelihoodSpecWire) -> Result<Self, Self::Error> {
+        Self::try_new(wire.response, wire.link)
+    }
+}
+
+/// Error returned when an illegal `(ResponseFamily, InverseLink)` cell is
+/// presented to [`LikelihoodSpec::try_new`] or surfaced during
+/// deserialization. Only the cells enumerated by [`LikelihoodSpec::kind`] are
+/// legal; every other product cell would silently mask a wrong response
+/// transformation (e.g. `Poisson + Identity` predicting `μ = η`, which can go
+/// negative).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IllegalLikelihoodCell {
+    pub response: &'static str,
+    pub link: &'static str,
+}
+
+impl std::fmt::Display for IllegalLikelihoodCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "illegal likelihood cell: response `{}` does not admit inverse link `{}`. \
+             Each non-binomial family is pinned to one link (Gaussian/Royston-Parmar→identity, \
+             Poisson/Gamma/Tweedie/Negative-Binomial→log, Beta→logit); the binomial family \
+             admits logit/probit/cloglog and the latent-cloglog/SAS/beta-logistic/blended \
+             links, but not identity/log.",
+            self.response, self.link
+        )
+    }
+}
+
+impl std::error::Error for IllegalLikelihoodCell {}
 
 /// Legal-only enumeration of the `(ResponseFamily, InverseLink)` cells the
 /// engine recognises. `LikelihoodSpec` is the product type with ~40 nominal
@@ -1060,9 +1127,74 @@ impl FamilySpecKind {
 }
 
 impl LikelihoodSpec {
+    /// Unchecked constructor: assembles a `(response, link)` cell *without*
+    /// validating the legal matrix. Reserved for the in-crate named const
+    /// constructors below (`gaussian_identity`, `poisson_log`, `beta_logit`,
+    /// the `binomial_*` family, …), every one of which builds a cell that is
+    /// legal by construction. The public, fallible entry point for an arbitrary
+    /// `(response, link)` pair is [`LikelihoodSpec::try_new`]; the serde path
+    /// also validates via [`LikelihoodSpecWire`]. Do not expose illegal cells
+    /// through this method.
     #[inline]
     pub const fn new(response: ResponseFamily, link: InverseLink) -> Self {
         Self { response, link }
+    }
+
+    /// Returns `true` when the `(response, link)` pair is one of the legal cells
+    /// the family math honours — exactly the cells enumerated by
+    /// [`LikelihoodSpec::kind`] before any masking. Each non-binomial response
+    /// is pinned to a single inverse link; the binomial family admits its full
+    /// set of probability links but never the identity/log standard links.
+    #[inline]
+    pub fn is_legal_cell(response: &ResponseFamily, link: &InverseLink) -> bool {
+        match response {
+            // Pure-identity families.
+            ResponseFamily::Gaussian | ResponseFamily::RoystonParmar => {
+                matches!(link, InverseLink::Standard(StandardLink::Identity))
+            }
+            // Log-link families.
+            ResponseFamily::Poisson
+            | ResponseFamily::Gamma
+            | ResponseFamily::Tweedie { .. }
+            | ResponseFamily::NegativeBinomial { .. } => {
+                matches!(link, InverseLink::Standard(StandardLink::Log))
+            }
+            // Logit-link family.
+            ResponseFamily::Beta { .. } => {
+                matches!(link, InverseLink::Standard(StandardLink::Logit))
+            }
+            // Binomial admits every probability link except the inert
+            // identity/log standard links.
+            ResponseFamily::Binomial => match link {
+                InverseLink::Standard(
+                    StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,
+                ) => true,
+                InverseLink::Standard(StandardLink::Identity | StandardLink::Log) => false,
+                InverseLink::LatentCLogLog(_)
+                | InverseLink::Sas(_)
+                | InverseLink::BetaLogistic(_)
+                | InverseLink::Mixture(_) => true,
+            },
+        }
+    }
+
+    /// Fallible constructor over an arbitrary `(response, link)` pair. Validates
+    /// the legal matrix ([`LikelihoodSpec::is_legal_cell`]) so that an illegal
+    /// cell — one whose stored link would drive a wrong response transformation
+    /// — is rejected instead of silently masked by [`LikelihoodSpec::kind`].
+    #[inline]
+    pub fn try_new(
+        response: ResponseFamily,
+        link: InverseLink,
+    ) -> Result<Self, IllegalLikelihoodCell> {
+        if Self::is_legal_cell(&response, &link) {
+            Ok(Self::new(response, link))
+        } else {
+            Err(IllegalLikelihoodCell {
+                response: response.name(),
+                link: link.link_function().name(),
+            })
+        }
     }
 
     #[inline]
@@ -1190,26 +1322,40 @@ impl LikelihoodSpec {
 
     /// Once-and-for-all classification into the legal-only `FamilySpecKind`.
     ///
-    /// `(ResponseFamily, InverseLink)` is a 35-cell product (7 response × 5
-    /// inverse-link); only the cells listed here are recognised by the family
-    /// math. With `InverseLink::Standard` carrying `StandardLink` (not
-    /// `LinkFunction`), the historical "state-less Sas/BetaLogistic
-    /// placeholder" cells are no longer representable, so the match is
-    /// exhaustive over the legal cells. `Standard(Identity)` / `Standard(Log)`
-    /// for the binomial family are structurally inert (no construction site
-    /// reaches them) and are routed to `BinomialLogit` as the nearest legal
-    /// classification.
+    /// `(ResponseFamily, InverseLink)` is a 40-cell product (8 response × 5
+    /// inverse-link); only the cells listed here are legal. Construction
+    /// ([`LikelihoodSpec::try_new`]) and deserialization (the
+    /// [`LikelihoodSpecWire`] `try_from`) both enforce
+    /// [`LikelihoodSpec::is_legal_cell`], so an illegal cell can never reach
+    /// this method. Each link-pinned family therefore matches its *one* legal
+    /// link explicitly; the remaining (now-unreachable) illegal combinations
+    /// are `unreachable!()` so the historical silent masking — collapsing e.g.
+    /// `Poisson + Identity` to `PoissonLog` while the transform predicted
+    /// `μ = η` — can never silently happen again.
     pub fn kind(&self) -> FamilySpecKind {
         match (&self.response, &self.link) {
-            (ResponseFamily::Gaussian, _) => FamilySpecKind::GaussianIdentity,
-            (ResponseFamily::Poisson, _) => FamilySpecKind::PoissonLog,
-            (ResponseFamily::Tweedie { p }, _) => FamilySpecKind::TweedieLog { p: *p },
-            (ResponseFamily::NegativeBinomial { theta, .. }, _) => {
-                FamilySpecKind::NegativeBinomialLog { theta: *theta }
+            (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {
+                FamilySpecKind::GaussianIdentity
             }
-            (ResponseFamily::Beta { phi }, _) => FamilySpecKind::BetaLogit { phi: *phi },
-            (ResponseFamily::Gamma, _) => FamilySpecKind::GammaLog,
-            (ResponseFamily::RoystonParmar, _) => FamilySpecKind::RoystonParmar,
+            (ResponseFamily::RoystonParmar, InverseLink::Standard(StandardLink::Identity)) => {
+                FamilySpecKind::RoystonParmar
+            }
+            (ResponseFamily::Poisson, InverseLink::Standard(StandardLink::Log)) => {
+                FamilySpecKind::PoissonLog
+            }
+            (ResponseFamily::Gamma, InverseLink::Standard(StandardLink::Log)) => {
+                FamilySpecKind::GammaLog
+            }
+            (ResponseFamily::Tweedie { p }, InverseLink::Standard(StandardLink::Log)) => {
+                FamilySpecKind::TweedieLog { p: *p }
+            }
+            (
+                ResponseFamily::NegativeBinomial { theta, .. },
+                InverseLink::Standard(StandardLink::Log),
+            ) => FamilySpecKind::NegativeBinomialLog { theta: *theta },
+            (ResponseFamily::Beta { phi }, InverseLink::Standard(StandardLink::Logit)) => {
+                FamilySpecKind::BetaLogit { phi: *phi }
+            }
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit)) => {
                 FamilySpecKind::BinomialLogit
             }
@@ -1219,10 +1365,6 @@ impl LikelihoodSpec {
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 FamilySpecKind::BinomialCLogLog
             }
-            (
-                ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Identity | StandardLink::Log),
-            ) => FamilySpecKind::BinomialLogit,
             (ResponseFamily::Binomial, InverseLink::LatentCLogLog(state)) => {
                 FamilySpecKind::BinomialLatentCLogLog(*state)
             }
@@ -1235,6 +1377,15 @@ impl LikelihoodSpec {
             (ResponseFamily::Binomial, InverseLink::Mixture(state)) => {
                 FamilySpecKind::BinomialMixture(state.clone())
             }
+            // Every remaining product cell is illegal. `try_new` /
+            // `LikelihoodSpecWire::try_from` reject these, so construction and
+            // deserialization guarantee they are unreachable here.
+            (response, link) => unreachable!(
+                "illegal likelihood cell reached kind(): response `{}` with inverse link `{}`; \
+                 construction (try_new) and deserialization (LikelihoodSpecWire) guarantee legality",
+                response.name(),
+                link.link_function().name()
+            ),
         }
     }
 

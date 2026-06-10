@@ -312,6 +312,15 @@ impl RiemannianManifold for StiefelManifold {
         Ok(flatten(&self.qr_retraction(&(y + tangent))))
     }
 
+    /// The QR retraction `qf(Y + Δ)` is only a FIRST-ORDER retraction (its
+    /// acceleration at `Δ = 0` is not normal to the manifold), so
+    /// `D²(f∘R_Y)(0) ≠ Hess f(Y)` in general. The trust region must therefore
+    /// not score the Riemannian-Hessian quadratic term against this retraction;
+    /// it falls back to the first-order-correct Cauchy model (issue #956).
+    fn retraction_is_second_order(&self) -> bool {
+        false
+    }
+
     /// Reverse-mode (vector–Jacobian product) of [`exp_map`](Self::exp_map).
     ///
     /// Given the output cotangent `Ḡ = ∂L/∂result` (n×k), returns

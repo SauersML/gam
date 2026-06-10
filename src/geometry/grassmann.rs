@@ -402,6 +402,9 @@ impl RiemannianManifold for GrassmannManifold {
         self.project_tangent(point, euclidean_grad)
     }
 
+    /// QR retraction `R_Y(Δ) = qf(Y + Δ)`. This is a first-order retraction,
+    /// distinct from the Riemannian [`exp_map`](Self::exp_map); the two agree
+    /// only to first order in `Δ`.
     fn retract(
         &self,
         point: ArrayView1<'_, f64>,
@@ -414,6 +417,14 @@ impl RiemannianManifold for GrassmannManifold {
             self.k,
         )?;
         Ok(flatten(&self.orthonormalize(&(y + tangent))))
+    }
+
+    /// The QR retraction `qf(Y + Δ)` is only a FIRST-ORDER retraction, so
+    /// `D²(f∘R_Y)(0) ≠ Hess f(Y)` in general. The trust region must therefore
+    /// not score the Riemannian-Hessian quadratic term against this retraction;
+    /// it falls back to the first-order-correct Cauchy model (issue #956).
+    fn retraction_is_second_order(&self) -> bool {
+        false
     }
 
     fn exp_map_vjp(
