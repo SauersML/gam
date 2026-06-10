@@ -67,6 +67,7 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use crate::inference::structure_evidence::CandidateProbe;
 use crate::terms::sae_manifold::SaeManifoldTerm;
 
 /// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for
@@ -264,6 +265,102 @@ pub fn steer_delta(
     })
 }
 
+/// The model's predicted output-mean response to an applied activation push
+/// `δ`, under the LOCAL-LINEAR reading of its fitted surface: the projection
+/// of `δ` onto the span of atom `atom_k`'s decoder tangents `∂g_k/∂t` at the
+/// operating point `t_at`. A dictionary "predicts" exactly the component of a
+/// push it can carry along its learned surface; the transverse component is
+/// off-manifold and predicted to die (this is the same local model the
+/// off-manifold guard and the dosimetry chord trust, used in the same radius).
+///
+/// This is `μ(δ)` for the design loop of
+/// [`crate::inference::structure_evidence`]: two structural hypotheses about
+/// the same activations (e.g. "one curved atom" vs "two flat atoms") are two
+/// fitted terms whose tangent spans differ, so they predict DIFFERENT
+/// responses to the same probe — and that disagreement, in the output-Fisher
+/// metric, is what `select_probe_by_expected_evidence` maximizes.
+pub fn predicted_response(
+    model: &SaeManifoldTerm,
+    atom_k: usize,
+    t_at: &[f64],
+    delta: ArrayView1<'_, f64>,
+) -> Result<Array1<f64>, String> {
+    let k = model.k_atoms();
+    if atom_k >= k {
+        return Err(format!(
+            "predicted_response: atom index {atom_k} out of range (term has {k} atoms)"
+        ));
+    }
+    let atom = &model.atoms[atom_k];
+    let d = atom.latent_dim;
+    let p = atom.output_dim();
+    if t_at.len() != d {
+        return Err(format!(
+            "predicted_response: t_at must have length latent_dim={d}; got {}",
+            t_at.len()
+        ));
+    }
+    if delta.len() != p {
+        return Err(format!(
+            "predicted_response: delta must have length output_dim={p}; got {}",
+            delta.len()
+        ));
+    }
+    let evaluator = atom.basis_evaluator.as_ref().ok_or_else(|| {
+        format!(
+            "predicted_response: atom {atom_k} ('{}') has no installed basis evaluator",
+            atom.name
+        )
+    })?;
+    let tangents = decode_tangents_at(evaluator.as_ref(), &atom.decoder_coefficients, t_at, p, d)?;
+    Ok(project_onto_tangent_span(&tangents, delta))
+}
+
+/// Build the [`CandidateProbe`] for one contested structural claim from the
+/// two hypotheses' FITTED dictionaries — the bridge that closes the design
+/// loop (probe → dosimetry → likelihood → absorb): the probe's δ comes from a
+/// [`SteerPlan`] (so the steering primitive's validity radius and dosimetry
+/// govern it), and each hypothesis predicts its own response via
+/// [`predicted_response`] at its own operating point (its atom + latent
+/// coordinate representing the same activations — under "one curved atom vs
+/// two flat atoms" the hypotheses do not even share an atom index, hence the
+/// per-hypothesis anchors). Feed the result to
+/// `structure_evidence::select_probe_by_expected_evidence` /
+/// `plan_probe_for_contested_claim` with the #980 output-Fisher metric.
+pub struct HypothesisAnchor<'a> {
+    pub model: &'a SaeManifoldTerm,
+    /// The atom whose local surface represents the probed activations under
+    /// this hypothesis.
+    pub atom: usize,
+    /// The latent operating point on that atom.
+    pub t_at: &'a [f64],
+}
+
+/// See [`HypothesisAnchor`].
+pub fn candidate_probe_from_hypotheses(
+    plan: &SteerPlan,
+    null_hypothesis: HypothesisAnchor<'_>,
+    alt_hypothesis: HypothesisAnchor<'_>,
+) -> Result<CandidateProbe, String> {
+    let predicted_mean_null = predicted_response(
+        null_hypothesis.model,
+        null_hypothesis.atom,
+        null_hypothesis.t_at,
+        plan.delta.view(),
+    )?;
+    let predicted_mean_alt = predicted_response(
+        alt_hypothesis.model,
+        alt_hypothesis.atom,
+        alt_hypothesis.t_at,
+        plan.delta.view(),
+    )?;
+    Ok(CandidateProbe {
+        delta: plan.delta.clone(),
+        predicted_mean_null,
+        predicted_mean_alt,
+    })
+}
+
 /// Does this provenance carry behavioral (output-Fisher) information? Euclidean
 /// is the isotropic activation-only path and carries none; the factored
 /// provenances do. (Mirrors `atom_lens::metric_carries_behavior`.)
@@ -341,15 +438,15 @@ fn decode_tangents_at(
     Ok(tang)
 }
 
-/// Norm of `δ`'s component orthogonal to the span of the local tangents
-/// (columns of `tangents`, shape `p × d`). Computes the least-squares projection
-/// `δ̂ = T (TᵀT)⁻¹ Tᵀ δ` via a small `d × d` Gram solve (with a tiny diagonal jitter
-/// to absorb a rank-deficient tangent frame), and reports `‖δ − δ̂‖`.
-fn off_manifold_residual_norm(tangents: &Array2<f64>, delta: ArrayView1<'_, f64>) -> f64 {
+/// Least-squares projection of `δ` onto the span of the local tangents
+/// (columns of `tangents`, shape `p × d`): `δ̂ = T (TᵀT)⁻¹ Tᵀ δ` via a small
+/// `d × d` Gram solve (with a tiny diagonal jitter to absorb a rank-deficient
+/// tangent frame; the jitter only shrinks the projection, never inflates it).
+fn project_onto_tangent_span(tangents: &Array2<f64>, delta: ArrayView1<'_, f64>) -> Array1<f64> {
     let p = tangents.nrows();
     let d = tangents.ncols();
     if d == 0 {
-        return delta.iter().map(|&v| v * v).sum::<f64>().sqrt();
+        return Array1::<f64>::zeros(p);
     }
     // Gram = TᵀT (d × d) and rhs = Tᵀδ (d).
     let mut gram = Array2::<f64>::zeros((d, d));
@@ -369,23 +466,28 @@ fn off_manifold_residual_norm(tangents: &Array2<f64>, delta: ArrayView1<'_, f64>
             gram[[b, a]] = acc;
         }
     }
-    // Jitter proportional to the Gram trace so a degenerate frame does not blow
-    // up the solve; it only shrinks the projection slightly, which can never
-    // make the off-manifold residual spuriously small.
     let trace: f64 = (0..d).map(|a| gram[[a, a]]).sum();
     let jitter = if trace > 0.0 { 1e-12 * trace } else { 1e-12 };
     for a in 0..d {
         gram[[a, a]] += jitter;
     }
     let coeffs = solve_spd_small(&gram, &rhs);
-    // δ̂ = T coeffs, residual = δ − δ̂.
-    let mut res_sq = 0.0_f64;
+    let mut proj = Array1::<f64>::zeros(p);
     for i in 0..p {
-        let mut proj = 0.0_f64;
         for a in 0..d {
-            proj += tangents[[i, a]] * coeffs[a];
+            proj[i] += tangents[[i, a]] * coeffs[a];
         }
-        let r = delta[i] - proj;
+    }
+    proj
+}
+
+/// Norm of `δ`'s component orthogonal to the span of the local tangents:
+/// `‖δ − δ̂‖` with `δ̂` the [`project_onto_tangent_span`] projection.
+fn off_manifold_residual_norm(tangents: &Array2<f64>, delta: ArrayView1<'_, f64>) -> f64 {
+    let proj = project_onto_tangent_span(tangents, delta);
+    let mut res_sq = 0.0_f64;
+    for i in 0..delta.len() {
+        let r = delta[i] - proj[i];
         res_sq += r * r;
     }
     res_sq.max(0.0).sqrt()

@@ -57,12 +57,15 @@ pub const HEADER_LEN: usize = 32;
 
 /// Default bounded read-ahead window. Auto-derived; not a CLI knob. Large
 /// enough to hide fault latency for a healthy batch, small enough that the
-/// resident set stays bounded regardless of shard size.
-const DEFAULT_PREFETCH_WINDOW_BYTES: usize = 8 * 1024 * 1024;
+/// resident set stays bounded regardless of shard size. Shared with the
+/// object-store source ([`super::object_store`]) so both backends apply the
+/// same bounded-prefetch policy.
+pub(super) const DEFAULT_PREFETCH_WINDOW_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default number of rows handed back per [`CorpusRowSource::next_batch`].
 /// Auto-derived from the activation width at open time; this is the floor.
-const DEFAULT_BATCH_ROWS: usize = 1024;
+/// Shared with [`super::object_store`].
+pub(super) const DEFAULT_BATCH_ROWS: usize = 1024;
 
 #[derive(Debug)]
 pub enum ShardError {

@@ -384,6 +384,51 @@ impl AtomBirthGate {
     }
 }
 
+/// Run the atom-birth gate over a shard stream with the predictability
+/// contract enforced BY CONSTRUCTION: on each shard the alternative is
+/// evaluated strictly before it is refit with that shard, so the plug-in
+/// is always predictable and the product is always a supermartingale
+/// under H0. This is the orchestration the SAE structure search calls;
+/// the closures are the only fitter-specific surface.
+///
+/// - `alternative_log_lik(alt, shard)`: evaluation-fold log-likelihood of
+///   shard under the CURRENT alternative state (fit on prior shards only —
+///   guaranteed here by call order).
+/// - `null_sup_log_lik(shard)`: the honest constrained sup — the K-atom
+///   null REFIT on this shard (any fitter; this side must genuinely
+///   maximize over H0 on the shard, an under-maximized null inflates the
+///   e-value and voids validity).
+/// - `refit_alternative(alt, shard)`: fold the shard into the alternative
+///   (warm-started production fit, GPU, anything — zero conditions).
+///
+/// `initial_alternative` is the K+1 fit from data BEFORE the stream (or a
+/// prior-driven init; validity never depends on its quality — a bad init
+/// only costs power). Stops absorbing early once certified (the crossing
+/// is permanent; further shards only cost compute), but still folds the
+/// remaining shards into the alternative so the returned state has seen
+/// the whole stream. Returns the gate (verdict + resumable evidence) and
+/// the final alternative state.
+pub fn run_atom_birth_gate<S, A>(
+    alpha: f64,
+    initial_alternative: A,
+    shards: impl IntoIterator<Item = S>,
+    mut alternative_log_lik: impl FnMut(&A, &S) -> f64,
+    mut null_sup_log_lik: impl FnMut(&S) -> f64,
+    mut refit_alternative: impl FnMut(A, &S) -> A,
+) -> Result<(AtomBirthGate, A), String> {
+    let mut gate = AtomBirthGate::new(alpha)?;
+    let mut alt = initial_alternative;
+    for shard in shards {
+        if !matches!(gate.verdict(), GateVerdict::Certified { .. }) {
+            let log_lik_alt = alternative_log_lik(&alt, &shard);
+            let log_lik_null = null_sup_log_lik(&shard);
+            gate.absorb_shard(log_lik_alt, log_lik_null);
+        }
+        alt = refit_alternative(alt, &shard);
+    }
+    Ok((gate, alt))
+}
+
 /// e-BH: FDR control over m structural claims under ARBITRARY dependence
 /// (Wang–Ramdas). Input: per-claim log-e-values. Output: indices of
 /// rejected (i.e. CONFIRMED-STRUCTURE) claims, FDR ≤ α.

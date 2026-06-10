@@ -37,6 +37,7 @@
 //! there is only one metric object.
 
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
