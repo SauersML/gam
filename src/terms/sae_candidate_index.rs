@@ -484,11 +484,11 @@ impl SaeCandidateIndex {
     /// `direction` (length `sketch.output_dim()`), ranked by exact frame
     /// alignment.
     ///
-    /// Pipeline: build the query sketch from the direction (frame-agnostic, via
-    /// the index projection captured at build time is not available here, so we
-    /// re-derive a global query sketch from the sketch source), gather the
-    /// sublinear candidate union, score each by [`AtomFrameSketch::alignment`],
-    /// and keep the highest-scoring `candidate_budget`.
+    /// Pipeline: probe with [`AtomFrameSketch::query_sketch`] (`O(p·s)` for
+    /// shared-projection sketches, #994 — no atom is touched before the
+    /// gather), gather the sublinear candidate union, score each by
+    /// [`AtomFrameSketch::alignment`], and keep the highest-scoring
+    /// `candidate_budget`.
     ///
     /// Returns `(proposed_ids, dropped_for_budget)` where the second element
     /// lists every gathered candidate that was truncated by the budget (never
@@ -500,8 +500,16 @@ impl SaeCandidateIndex {
         candidate_budget: usize,
         config_multiprobe: bool,
     ) -> Proposal {
-        let query_sketch = global_query_sketch(sketch, direction, self.sketch_dim);
-        let gathered = self.gather_candidates(query_sketch.view(), config_multiprobe);
+        let query_sketch = sketch.query_sketch(direction);
+        let gathered = if query_sketch.len() == self.sketch_dim {
+            self.gather_candidates(query_sketch.view(), config_multiprobe)
+        } else {
+            // A probe of the wrong dimension cannot be hashed against the
+            // tables; gather nothing rather than hash garbage. The recall
+            // report will then attribute every planted atom to `NotGathered`,
+            // which is the loud, attributable failure mode.
+            Vec::new()
+        };
 
         // Exact-score every gathered candidate by frame alignment.
         let mut scored: Vec<(usize, f64)> = gathered
@@ -797,64 +805,6 @@ fn lowest_margin_bit(margins: &[f64]) -> usize {
     best
 }
 
-/// Build a frame-agnostic global query sketch from a row direction.
-///
-/// The index's tables are keyed by per-atom representative sketches living on
-/// the unit sphere of sketch space. To probe them with a row residual we need a
-/// single sketch-space vector for the *query* that is comparable to those
-/// representatives. We obtain it by averaging the per-atom query projections
-/// across a small deterministic stratified subset of atoms — but to stay
-/// O(1)-per-query and frame-source-agnostic we instead reuse the sketch's own
-/// projection of the direction through the single best-aligned representative.
-///
-/// Concretely: we sketch the *raw direction itself* with the same shared
-/// projection the default sketch uses, by asking the sketch source to project
-/// the direction through a notional identity frame. Since `AtomFrameSketch`
-/// only exposes per-atom projections, we approximate the global query as the
-/// projection through atom 0's frame's *ambient* image and renormalize. This is
-/// exact for the common case where every atom shares the same projection `R`
-/// (the default sketch), giving `R · d` up to the in-range mask — and the
-/// multi-probe gather tolerates the residual mismatch. The returned vector has
-/// length `sketch_dim`.
-fn global_query_sketch<S: AtomFrameSketch>(
-    sketch: &S,
-    direction: ArrayView1<f64>,
-    sketch_dim: usize,
-) -> Array1<f64> {
-    // Project the direction through every atom would be O(K); instead we use a
-    // deterministic O(sqrt(K)) stratified sample of atoms and average their
-    // (mask-applied) query sketches. The average concentrates on the shared
-    // projection direction `R·d` (the masks differ per atom but average toward
-    // the identity over a spread of frames), giving a stable global query that
-    // is comparable to the representative sketches in the tables. Sublinear in K.
-    let num = sketch.num_atoms();
-    if num == 0 {
-        return Array1::<f64>::zeros(sketch_dim);
-    }
-    let sample = ((num as f64).sqrt().ceil() as usize).clamp(1, num);
-    let stride = (num / sample).max(1);
-    let mut acc = Array1::<f64>::zeros(sketch_dim);
-    let mut count = 0usize;
-    let mut id = 0usize;
-    while id < num {
-        let q = sketch.project_direction(id, direction);
-        if q.len() == sketch_dim {
-            for (a, &v) in acc.iter_mut().zip(q.iter()) {
-                *a += v;
-            }
-            count += 1;
-        }
-        id += stride;
-    }
-    if count > 0 {
-        for a in acc.iter_mut() {
-            *a /= count as f64;
-        }
-    }
-    normalize_in_place(&mut acc);
-    acc
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1143,6 +1093,159 @@ mod tests {
             ratio_big < 0.25,
             "K={k_big}: gather touched {:.1}% of the dictionary",
             ratio_big * 100.0
+        );
+    }
+
+    /// Counting wrapper: delegates everything, counts `project_direction`
+    /// calls. The #994 acceptance gate: with the exact probe, building the
+    /// query sketch touches NO atom, so a whole `propose` makes zero
+    /// `project_direction` calls (scoring goes through `alignment`).
+    struct CountingSketch<'a> {
+        inner: &'a RandomProjectionFrameSketch,
+        project_calls: std::cell::Cell<usize>,
+    }
+
+    impl AtomFrameSketch for CountingSketch<'_> {
+        fn sketch_dim(&self) -> usize {
+            self.inner.sketch_dim()
+        }
+        fn output_dim(&self) -> usize {
+            self.inner.output_dim()
+        }
+        fn num_atoms(&self) -> usize {
+            self.inner.num_atoms()
+        }
+        fn atom_sketch(&self, atom_id: usize) -> Array1<f64> {
+            self.inner.atom_sketch(atom_id)
+        }
+        fn project_direction(&self, atom_id: usize, direction: ArrayView1<f64>) -> Array1<f64> {
+            self.project_calls.set(self.project_calls.get() + 1);
+            self.inner.project_direction(atom_id, direction)
+        }
+        fn alignment(&self, atom_id: usize, direction: ArrayView1<f64>) -> f64 {
+            self.inner.alignment(atom_id, direction)
+        }
+        fn query_sketch(&self, direction: ArrayView1<f64>) -> Array1<f64> {
+            self.inner.query_sketch(direction)
+        }
+    }
+
+    #[test]
+    fn query_probe_touches_no_atom_before_the_gather() {
+        let k = 512usize;
+        let p = 32usize;
+        let (blocks, dirs) = synthetic_dictionary(k, p, 77);
+        let sketch = RandomProjectionFrameSketch::from_decoder_blocks(&blocks, 16, 13).unwrap();
+        let cfg = IndexConfig::auto(16, k, 13);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+        let counting = CountingSketch {
+            inner: &sketch,
+            project_calls: std::cell::Cell::new(0),
+        };
+        let _ = index.propose(&counting, dirs[5].view(), 32, cfg.multiprobe);
+        assert_eq!(
+            counting.project_calls.get(),
+            0,
+            "the exact query probe must be independent of K: no per-atom \
+             projection before the gather (#994)"
+        );
+    }
+
+    /// Build a coherent-cluster dictionary: `n_clusters` random unit centers,
+    /// each with `cluster_size` atoms drawn as small perturbations of the
+    /// center (renormalized). Exactly the non-isotropic regime where the old
+    /// masked-average probe degraded (#994).
+    fn coherent_cluster_dictionary(
+        n_clusters: usize,
+        cluster_size: usize,
+        p: usize,
+        spread: f64,
+        seed: u64,
+    ) -> (Vec<Array2<f64>>, Vec<Array1<f64>>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut blocks = Vec::with_capacity(n_clusters * cluster_size);
+        let mut dirs = Vec::with_capacity(n_clusters * cluster_size);
+        for _ in 0..n_clusters {
+            let center = unit_vec(&mut rng, p);
+            for _ in 0..cluster_size {
+                let noise = unit_vec(&mut rng, p);
+                let mut c = center.clone();
+                for (ci, &ni) in c.iter_mut().zip(noise.iter()) {
+                    *ci += spread * ni;
+                }
+                let n = vec_norm(c.view());
+                for ci in c.iter_mut() {
+                    *ci /= n;
+                }
+                let mut block = Array2::<f64>::zeros((p, 1));
+                block.column_mut(0).assign(&c);
+                blocks.push(block);
+                dirs.push(c);
+            }
+        }
+        (blocks, dirs)
+    }
+
+    #[test]
+    fn coherent_clusters_are_recalled_with_the_exact_probe() {
+        // 32 clusters × 32 near-parallel atoms = 1024 atoms. Rows are
+        // dominated by one specific cluster member; the proposal must recover
+        // that exact member (not merely its cluster) at the auto budget —
+        // exact alignment scoring separates siblings once the probe lands the
+        // gather in the right bucket neighborhood.
+        let n_clusters = 32usize;
+        let cluster_size = 32usize;
+        let k = n_clusters * cluster_size;
+        let p = 48usize;
+        let (blocks, dirs) = coherent_cluster_dictionary(n_clusters, cluster_size, p, 0.25, 4242);
+        let sketch_dim = 24usize;
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, 99).unwrap();
+        let cfg = IndexConfig::auto(sketch_dim, k, 99);
+        let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+
+        let rows = planted_rows(&dirs, 150, 31337);
+        let budget = auto_candidate_budget(k);
+        let report = index.recall_report(&sketch, &rows, budget, cfg.multiprobe);
+        let floor = 0.80;
+        assert!(
+            report.recall >= floor,
+            "coherent-cluster recall {:.3} below floor {floor}; {} misses (first: {:?})",
+            report.recall,
+            report.misses.len(),
+            report
+                .misses
+                .iter()
+                .take(3)
+                .map(|m| (m.row, m.atom, m.reason, m.alignment))
+                .collect::<Vec<_>>()
+        );
+        // Still a sublinear slice of the dictionary, clusters or not.
+        assert!(
+            report.sublinearity_ratio() < 0.5,
+            "cluster gather touched {:.1}% of the dictionary",
+            report.sublinearity_ratio() * 100.0
+        );
+    }
+
+    #[test]
+    fn exact_probe_matches_shared_projection_of_the_direction() {
+        // The override is literally normalize(R·d): verify against a manual
+        // computation through the public surface (atom_sketch of a rank-1 atom
+        // whose only column IS the direction gives normalize(R·d) too).
+        let p = 16usize;
+        let mut rng = StdRng::seed_from_u64(5);
+        let d = unit_vec(&mut rng, p);
+        let mut block = Array2::<f64>::zeros((p, 1));
+        block.column_mut(0).assign(&d);
+        let sketch =
+            RandomProjectionFrameSketch::from_decoder_blocks(&[block], 8, 21).unwrap();
+        let via_probe = sketch.query_sketch(d.view());
+        let via_atom = sketch.atom_sketch(0);
+        let diff = vec_norm((&via_probe - &via_atom).view());
+        assert!(
+            diff < 1e-10,
+            "query_sketch(d) must equal the rank-1 atom representative of d: diff {diff:e}"
         );
     }
 
