@@ -85,10 +85,14 @@ pub(super) fn madsen_lm_accept_factor(rho: f64) -> f64 {
 /// face (the underdetermined I-spline case the plateau branch was built for)
 /// gets the relaxed `ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL`; a
 /// non-degenerate face is held to a strict band (`10 · kkt_tolerance`, the same
-/// near-stationary band `near_stationary_kkt` uses), kept well under the outer
-/// gate's absolute stationarity tolerance. Returns `true` for an unconstrained
-/// fit (no constraint-KKT gate to honour) and when no constraint rows can be
-/// derived (no bound is finite).
+/// near-stationary band `near_stationary_kkt` uses). Stationarity is checked
+/// scale-invariantly — absolute residual OR the relative ratio
+/// `stationarity / max(‖grad‖∞, 1)` within the band — exactly as the outer gate
+/// and the inner active-set solver do, so an O(n) gradient scale (issue #879)
+/// does not leave a converged optimum stranded above a fixed absolute band
+/// (issue #989). Returns `true` for an unconstrained fit (no constraint-KKT
+/// gate to honour) and when no constraint rows can be derived (no bound is
+/// finite).
 fn constraint_kkt_admits_soft_accept(
     options: &WorkingModelPirlsOptions,
     beta: &Array1<f64>,
@@ -113,8 +117,16 @@ fn constraint_kkt_admits_soft_accept(
             } else {
                 kkt_tolerance * 10.0
             };
+            // Scale-invariant stationarity, in lockstep with the outer gate
+            // (`enforce_constraint_kkt`) and the inner active-set solver: accept
+            // when EITHER the absolute residual OR the relative ratio
+            // `stationarity / max(‖grad‖∞, 1)` is within the band. An O(n)
+            // gradient scale (issue #879) leaves the absolute residual above any
+            // fixed band at a genuine optimum; gating only on it would refuse a
+            // converged soft-accept the outer gate now admits (issue #989).
+            let stationarity_rel = kkt.stationarity / kkt.gradient_scale.max(1.0);
             kkt.primal_feasibility <= crate::solver::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
-                && kkt.stationarity <= stationarity_band
+                && (kkt.stationarity <= stationarity_band || stationarity_rel <= stationarity_band)
         }
     }
 }
