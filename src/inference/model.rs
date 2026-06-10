@@ -317,6 +317,16 @@ pub struct FittedModelPayload {
     /// continue to deserialize cleanly (interpreted as: no calibration).
     #[serde(default)]
     pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    /// Optional conditional location-scale calibration of the latent score
+    /// (#905, BMS family). When `Some`, the marginal-slope predictor replaces
+    /// the (normalized) input `z` by `ζ = (z − m(C))/√v(C)` — rebuilding the
+    /// conditioning span `a(C)` from the marginal prediction design — before
+    /// the closed-form standard-normal kernel, matching fit-time semantics.
+    /// Mutually exclusive with `latent_z_rank_int_calibration`. `#[serde(default)]`
+    /// so pre-existing models deserialize cleanly (interpreted as: no
+    /// conditional calibration).
+    #[serde(default)]
+    pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
     #[serde(default)]
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
@@ -637,6 +647,7 @@ impl FittedModelPayload {
             latent_score_contract: None,
             latent_measure: None,
             latent_z_rank_int_calibration: None,
+            latent_z_conditional_calibration: None,
             marginal_baseline: None,
             logslope_baseline: None,
             logslope_baselines: None,
@@ -895,6 +906,12 @@ pub struct SavedPredictionRuntime {
     /// `None` for non-BMS models and for BMS fits whose latent measure
     /// did not require rank-INT calibration.
     pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
+    /// Conditional location-scale latent-z calibration (#905) carried into the
+    /// predictor build. `None` for non-BMS models and for BMS fits whose Auto
+    /// path did not detect a conditional `E[z|C]`/`Var(z|C)` shift. When
+    /// `Some`, the predictor replaces the normalized `z` by `ζ = (z−m(C))/√v(C)`
+    /// using the marginal prediction design as the conditioning span.
+    pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
     /// Width `p₁` of the absorbed Stage-1 influence block (#461) when the
     /// survival marginal-slope fit hosted a dedicated additive absorber (the
     /// trailing block). `None` when no CTN Stage-1 chain produced an influence
@@ -2851,6 +2868,10 @@ impl FittedModel {
             score_warp: self.payload().score_warp_runtime.clone(),
             link_deviation: self.payload().link_deviation_runtime.clone(),
             latent_z_rank_int_calibration: self.payload().latent_z_rank_int_calibration.clone(),
+            latent_z_conditional_calibration: self
+                .payload()
+                .latent_z_conditional_calibration
+                .clone(),
             influence_absorber_width: self.payload().influence_absorber_width,
         };
         if matches!(

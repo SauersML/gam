@@ -807,15 +807,409 @@ impl LatentZRankIntCalibration {
 pub enum LatentMeasureCalibration {
     None,
     RankInverseNormal(LatentZRankIntCalibration),
+    ConditionalLocationScale(LatentZConditionalCalibration),
+}
+
+/// Conditional location-scale calibration of the latent score (#905).
+///
+/// The marginal-slope Auto trigger's pooled-z gate (KS / skewness / kurtosis +
+/// the rank inverse-normal transform) only inspects the **marginal** law of
+/// `z`. A conditional shift `E[z | C] = m(C) ≠ 0` — the allele-frequency-driven
+/// ancestry mean shift — passes the marginal gate while leaving `z | C`
+/// off-center, so the slope contribution `b(C)·m(C)` leaks into the influence
+/// channel `q`. Rank-INT provably cannot fix this: no transform `T` depending
+/// only on the marginal `F_Z` can enforce `E[T(Z) | C] ≡ const` for all joint
+/// laws.
+///
+/// The unique Fisher-orthogonal location-scale correction (for the Gaussian
+/// working metric the closed-form probit kernel assumes) is
+/// `ζ = (z − m(C)) / √v(C)`, where `m(C) = E[z|C]` and `v(C) = Var(z|C)` are
+/// estimated by weighted ridge regression of `z` (and its squared residual) on
+/// the marginal-index span `a(C) = [1 | X_marginal]`. The corrected `ζ` is
+/// conditionally centered (and homoskedastic when the variance block is
+/// active) by construction, so the `b(C)·m(C)` leakage vanishes and the
+/// standard-normal closed-form kernel is exact on `ζ`. Persisted so prediction
+/// rebuilds `a(C)` from the (reproducible) marginal design and applies the
+/// identical map to incoming z.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct LatentZConditionalCalibration {
+    /// Coefficients for the conditional mean `m(C) = β_m·[1 | a(C)]` over the
+    /// basis `[1 | marginal-design row]`. Length `1 + basis_ncols` (leading
+    /// entry is the intercept).
+    pub mean_coeffs: Vec<f64>,
+    /// Coefficients for the conditional variance
+    /// `v(C) = max(β_v·[1 | a(C)], var_floor)`. Length `1 + basis_ncols`, or
+    /// empty when the conditional-variance block of the Rao gate was not
+    /// significant (mean-only correction); then `v(C) ≡ global_var`.
+    pub var_coeffs: Vec<f64>,
+    /// Number of marginal-design columns in the basis (excludes the leading
+    /// intercept). The predict-time marginal design must present exactly this
+    /// many columns.
+    pub basis_ncols: usize,
+    /// Floor on the fitted conditional variance, in the (normalized)
+    /// latent-score scale (= `AUTO_Z_CONDITIONAL_VAR_FLOOR_FRAC · global_var`).
+    pub var_floor: f64,
+    /// Global weighted variance of the (normalized) training latent score. Used
+    /// as `v(C)` when `var_coeffs` is empty.
+    pub global_var: f64,
+    /// Weighted mean of the calibrated training sample (sanity-check, ≈ 0).
+    pub post_mean: f64,
+    /// Weighted SD of the calibrated training sample (sanity-check, ≈ 1).
+    pub post_sd: f64,
+}
+
+impl LatentZConditionalCalibration {
+    #[inline]
+    fn affine(coeffs: &[f64], a_row: ArrayView1<'_, f64>) -> f64 {
+        let mut acc = coeffs[0];
+        for (c, &x) in coeffs[1..].iter().zip(a_row.iter()) {
+            acc += c * x;
+        }
+        acc
+    }
+
+    fn conditional_mean(&self, a_row: ArrayView1<'_, f64>) -> f64 {
+        Self::affine(&self.mean_coeffs, a_row)
+    }
+
+    fn conditional_var(&self, a_row: ArrayView1<'_, f64>) -> f64 {
+        if self.var_coeffs.is_empty() {
+            self.global_var.max(self.var_floor)
+        } else {
+            Self::affine(&self.var_coeffs, a_row).max(self.var_floor)
+        }
+    }
+
+    /// Apply `ζ = (z − m(C))/√v(C)` to a batch. `a_block` is the marginal
+    /// design (`n × basis_ncols`); `z` is the (normalized) latent score. Used
+    /// at both training and predict time, so the map is identical.
+    pub fn apply(
+        &self,
+        z: ArrayView1<'_, f64>,
+        a_block: ArrayView2<'_, f64>,
+    ) -> Result<Array1<f64>, String> {
+        if a_block.ncols() != self.basis_ncols {
+            return Err(format!(
+                "conditional latent calibration expects {} basis columns, got {}",
+                self.basis_ncols,
+                a_block.ncols()
+            ));
+        }
+        if a_block.nrows() != z.len() {
+            return Err(format!(
+                "conditional latent calibration row mismatch: z={}, basis rows={}",
+                z.len(),
+                a_block.nrows()
+            ));
+        }
+        if self.mean_coeffs.len() != self.basis_ncols + 1 {
+            return Err(format!(
+                "conditional latent calibration mean coefficient length {} != basis_ncols+1 ({})",
+                self.mean_coeffs.len(),
+                self.basis_ncols + 1
+            ));
+        }
+        let mut out = Array1::<f64>::zeros(z.len());
+        for i in 0..z.len() {
+            let a_row = a_block.row(i);
+            if !z[i].is_finite() {
+                return Err(format!(
+                    "conditional latent calibration: z[{i}] = {} not finite",
+                    z[i]
+                ));
+            }
+            let m = self.conditional_mean(a_row);
+            let v = self.conditional_var(a_row);
+            if !(v.is_finite() && v > 0.0) {
+                return Err(format!(
+                    "conditional latent calibration produced non-positive variance {v} at row {i}"
+                ));
+            }
+            let zeta = (z[i] - m) / v.sqrt();
+            if !zeta.is_finite() {
+                return Err(format!(
+                    "conditional latent calibration produced non-finite zeta at row {i}"
+                ));
+            }
+            out[i] = zeta;
+        }
+        Ok(out)
+    }
+}
+
+/// Weighted mean of a slice of values.
+fn weighted_mean(values: &[f64], weights: ArrayView1<'_, f64>, total_weight: f64) -> f64 {
+    values
+        .iter()
+        .zip(weights.iter())
+        .map(|(&v, &w)| w * v)
+        .sum::<f64>()
+        / total_weight
+}
+
+/// Robust (heteroskedasticity-consistent) Rao/LM score-test p-value for the
+/// null that the centered basis columns `ã(C)` carry no information about the
+/// centered response `u`. This is the LAN locally-optimal statistic the issue
+/// names: `s = Σ_i w_i u_i ã(C_i)`, `Ω̂ = Σ_i w_i² u_i² ã(C_i)ã(C_i)ᵀ`,
+/// `D = sᵀ Ω̂⁺ s ⟶ χ²_{rank Ω̂}`. Both the conditional-mean test
+/// (`u_i = z_i − z̄`) and the conditional-variance / Breusch-Pagan test
+/// (`u_i = (z_i − z̄)² − σ̂²`) are this statistic with the same centered basis.
+///
+/// Returns `None` when the test is degenerate (no usable basis directions),
+/// otherwise the asymptotic p-value.
+fn robust_conditional_score_pvalue(
+    a_centered: ArrayView2<'_, f64>,
+    u: &[f64],
+    weights: ArrayView1<'_, f64>,
+) -> Result<Option<f64>, String> {
+    let n = a_centered.nrows();
+    let r = a_centered.ncols();
+    if r == 0 || n == 0 {
+        return Ok(None);
+    }
+    if u.len() != n || weights.len() != n {
+        return Err(format!(
+            "conditional score test length mismatch: rows={n}, u={}, weights={}",
+            u.len(),
+            weights.len()
+        ));
+    }
+    let mut s = Array1::<f64>::zeros(r);
+    let mut omega = Array2::<f64>::zeros((r, r));
+    for i in 0..n {
+        let wi = weights[i];
+        if wi <= 0.0 {
+            continue;
+        }
+        let ui = u[i];
+        let a_row = a_centered.row(i);
+        let wu = wi * ui;
+        for j in 0..r {
+            s[j] += wu * a_row[j];
+        }
+        // HC0 robust meat: Σ wᵢ² uᵢ² ãᵢ ãᵢᵀ.
+        let w2u2 = wi * wi * ui * ui;
+        if w2u2 == 0.0 {
+            continue;
+        }
+        for j in 0..r {
+            let aj = a_row[j];
+            if aj == 0.0 {
+                continue;
+            }
+            let scaled = w2u2 * aj;
+            for k in j..r {
+                let inc = scaled * a_row[k];
+                omega[[j, k]] += inc;
+                if k != j {
+                    omega[[k, j]] += inc;
+                }
+            }
+        }
+    }
+    if !s.iter().all(|v| v.is_finite()) || !omega.iter().all(|v| v.is_finite()) {
+        return Ok(None);
+    }
+    let (rank, omega_pinv) = crate::linalg::utils::block_penalty_rank_and_pinv(&omega)
+        .map_err(|e| format!("conditional score test pseudo-inverse failed: {e}"))?;
+    if rank == 0 {
+        return Ok(None);
+    }
+    let d_stat = s.dot(&omega_pinv.dot(&s));
+    if !(d_stat.is_finite() && d_stat >= 0.0) {
+        return Ok(None);
+    }
+    // p = 1 − CDF_{χ²_rank}(D) = 1 − P(rank/2, D/2) (regularized lower gamma).
+    let p_lower = statrs::function::gamma::gamma_lr(rank as f64 / 2.0, d_stat / 2.0);
+    let p_value = (1.0 - p_lower).clamp(0.0, 1.0);
+    Ok(Some(p_value))
+}
+
+/// Fit the conditional location-scale calibration (#905) if the conditional
+/// `E[z|C]`/`Var(z|C)` Rao gate fires on the marginal-index basis `a_block`.
+///
+/// Returns `None` when there is no conditional structure to correct (the gate
+/// does not fire, or the basis is degenerate) — in that case the caller falls
+/// back to the existing pooled-marginal gate (rank-INT or no calibration).
+fn fit_conditional_latent_calibration_if_needed(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    a_block: ArrayView2<'_, f64>,
+) -> Result<Option<LatentZConditionalCalibration>, String> {
+    let n = z.len();
+    let p = a_block.ncols();
+    if n != weights.len() {
+        return Err(format!(
+            "conditional latent gate length mismatch: z={n}, weights={}",
+            weights.len()
+        ));
+    }
+    if a_block.nrows() != n {
+        return Err(format!(
+            "conditional latent gate row mismatch: z={n}, basis rows={}",
+            a_block.nrows()
+        ));
+    }
+    if p == 0 {
+        return Ok(None);
+    }
+    let total_weight = weights.iter().copied().sum::<f64>();
+    if !(total_weight.is_finite() && total_weight > 0.0) {
+        return Ok(None);
+    }
+    if z.iter().any(|v| !v.is_finite()) || a_block.iter().any(|v| !v.is_finite()) {
+        return Ok(None);
+    }
+
+    let z_mean = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * zi)
+        .sum::<f64>()
+        / total_weight;
+    let global_var = z
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * (zi - z_mean) * (zi - z_mean))
+        .sum::<f64>()
+        / total_weight;
+    if !(global_var.is_finite() && global_var > 0.0) {
+        return Ok(None);
+    }
+
+    // Center each basis column by its weighted mean so the score test is about
+    // conditional structure *beyond* the global level (the intercept nuisance).
+    // A constant marginal-design column collapses to ~0 and is dropped by the
+    // pseudo-inverse rank, so an intercept already present in a(C) is harmless.
+    let mut a_centered = a_block.to_owned();
+    for j in 0..p {
+        let col = a_block.column(j);
+        let col_mean = col
+            .iter()
+            .zip(weights.iter())
+            .map(|(&v, &w)| w * v)
+            .sum::<f64>()
+            / total_weight;
+        a_centered.column_mut(j).mapv_inplace(|v| v - col_mean);
+    }
+
+    // Conditional-mean Rao test: u = z − z̄.
+    let u_mean: Vec<f64> = z.iter().map(|&zi| zi - z_mean).collect();
+    let p_mean = robust_conditional_score_pvalue(a_centered.view(), &u_mean, weights.view())?;
+    // Conditional-variance (Breusch-Pagan) Rao test: u = (z − z̄)² − σ̂².
+    let u_var: Vec<f64> = u_mean.iter().map(|&e| e * e - global_var).collect();
+    let p_var = robust_conditional_score_pvalue(a_centered.view(), &u_var, weights.view())?;
+
+    let mean_fires = p_mean.is_some_and(|p| p < AUTO_Z_CONDITIONAL_RAO_ALPHA);
+    let var_fires = p_var.is_some_and(|p| p < AUTO_Z_CONDITIONAL_RAO_ALPHA);
+    if !mean_fires && !var_fires {
+        return Ok(None);
+    }
+
+    // Escalation fires. Fit the conditional mean over the full basis
+    // [1 | a(C)] via a weighted ridge (the ridge stabilizes a rank-deficient
+    // marginal-index span; it does not meaningfully shrink the few directions
+    // that triggered the gate). The conditional-mean correction is applied
+    // whenever the gate fires (a pure-variance trigger leaves the C-slopes of
+    // m(C) ≈ 0, so it reduces to harmless global centering).
+    let basis = build_intercept_basis(a_block);
+    let penalty = Array2::<f64>::eye(basis.ncols());
+    let z_col = z.view().insert_axis(ndarray::Axis(1));
+    let (mean_coeffs_mat, mean_fitted) = crate::linalg::utils::gaussian_weighted_ridge(
+        basis.view(),
+        z_col,
+        penalty.view(),
+        weights.view(),
+        AUTO_Z_CONDITIONAL_RIDGE_REL,
+    )?;
+    let mean_coeffs: Vec<f64> = mean_coeffs_mat.column(0).to_vec();
+
+    let var_floor = (AUTO_Z_CONDITIONAL_VAR_FLOOR_FRAC * global_var).max(f64::MIN_POSITIVE);
+    let var_coeffs: Vec<f64> = if var_fires {
+        // Conditional-variance correction: regress the squared mean-residual on
+        // the same basis. Fitted values are floored at `var_floor` when applied.
+        let resid_sq: Array1<f64> = z
+            .iter()
+            .zip(mean_fitted.column(0).iter())
+            .map(|(&zi, &mi)| (zi - mi) * (zi - mi))
+            .collect();
+        let resid_col = resid_sq.view().insert_axis(ndarray::Axis(1));
+        let (var_coeffs_mat, _) = crate::linalg::utils::gaussian_weighted_ridge(
+            basis.view(),
+            resid_col,
+            penalty.view(),
+            weights.view(),
+            AUTO_Z_CONDITIONAL_RIDGE_REL,
+        )?;
+        var_coeffs_mat.column(0).to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let mut calibration = LatentZConditionalCalibration {
+        mean_coeffs,
+        var_coeffs,
+        basis_ncols: p,
+        var_floor,
+        global_var,
+        post_mean: 0.0,
+        post_sd: 1.0,
+    };
+
+    // Sanity-check post-correction moments on the training sample.
+    let calibrated = calibration.apply(z.view(), a_block)?;
+    let post_mean = weighted_mean(calibrated.as_slice().unwrap(), weights.view(), total_weight);
+    let post_var = calibrated
+        .iter()
+        .zip(weights.iter())
+        .map(|(&zi, &wi)| wi * (zi - post_mean) * (zi - post_mean))
+        .sum::<f64>()
+        / total_weight;
+    calibration.post_mean = post_mean;
+    calibration.post_sd = post_var.max(0.0).sqrt();
+
+    Ok(Some(calibration))
+}
+
+/// Prepend a column of ones to `a_block`, producing the `[1 | a(C)]` regression
+/// basis used by the conditional location-scale fit.
+fn build_intercept_basis(a_block: ArrayView2<'_, f64>) -> Array2<f64> {
+    let n = a_block.nrows();
+    let p = a_block.ncols();
+    let mut basis = Array2::<f64>::ones((n, p + 1));
+    basis.slice_mut(s![.., 1..]).assign(&a_block);
+    basis
 }
 
 fn build_latent_measure_with_geometry(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     policy: &LatentZPolicy,
+    conditioning: Option<ArrayView2<'_, f64>>,
 ) -> Result<(LatentMeasureKind, LatentMeasureCalibration), String> {
     match policy.latent_measure {
         LatentMeasureSpec::Auto { grid_size: _ } => {
+            // #905: conditional `E[z|C]`/`Var(z|C)` Rao gate. Inspect the latent
+            // score's conditional moments on the marginal-index span a(C)
+            // BEFORE the pooled-marginal gate. A significant conditional shift
+            // is the `b(C)·m(C)` leakage the pooled gate cannot see and that
+            // rank-INT provably cannot fix, so it takes precedence: route to the
+            // conditional location-scale correction `ζ = (z−m(C))/√v(C)`.
+            if let Some(a_block) = conditioning
+                && let Some(cal) = fit_conditional_latent_calibration_if_needed(z, weights, a_block)?
+            {
+                log::info!(
+                    "[BMS latent-z] conditional location-scale calibrated: basis_ncols={} var_active={} post_mean={:.3e} post_sd={:.3e} (E[z|C]/Var(z|C) Rao gate fired)",
+                    cal.basis_ncols,
+                    !cal.var_coeffs.is_empty(),
+                    cal.post_mean,
+                    cal.post_sd,
+                );
+                return Ok((
+                    LatentMeasureKind::StandardNormal,
+                    LatentMeasureCalibration::ConditionalLocationScale(cal),
+                ));
+            }
             if latent_z_is_standard_normal_enough(z, weights, policy)? {
                 Ok((
                     LatentMeasureKind::StandardNormal,
