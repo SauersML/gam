@@ -8650,17 +8650,20 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     // referencing penalty index 0 of the block.
     let x_psi_0 = Array2::from_shape_fn((n, 2), |(r, c)| ((r * 7 + c * 3 + 1) % 9) as f64 / 9.0 - 0.4);
     let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55);
-    let s_psi_0 = array![[0.30_f64, 0.05], [0.05, 0.12]];
-    let s_psi_1 = array![[0.18_f64, -0.07], [-0.07, 0.22]];
+    // Penalty motion sized clearly above the vacuity floor (s_psi/s_psi_psi
+    // entries O(1)) so ½βᵀS_ψψβ and the τ-Hessian are unambiguously live, not
+    // borderline against 1e-6.
+    let s_psi_0 = array![[1.10_f64, 0.25], [0.25, 0.80]];
+    let s_psi_1 = array![[0.90_f64, -0.30], [-0.30, 1.05]];
     // s_psi_psi[i] is indexed by the SECOND axis j (per assemble_block_local_s_psi_psi):
     // axis i's vector holds ∂²S/∂ψ_i∂ψ_j for each j.
     let s_pp_0 = vec![
-        array![[0.06_f64, 0.01], [0.01, 0.03]], // (0,0)
-        array![[0.04_f64, -0.02], [-0.02, 0.05]], // (0,1)
+        array![[0.70_f64, 0.12], [0.12, 0.40]], // (0,0)
+        array![[0.45_f64, -0.18], [-0.18, 0.55]], // (0,1)
     ];
     let s_pp_1 = vec![
-        array![[0.04_f64, -0.02], [-0.02, 0.05]], // (1,0) = (0,1)^sym
-        array![[0.09_f64, 0.015], [0.015, 0.07]], // (1,1)
+        array![[0.45_f64, -0.18], [-0.18, 0.55]], // (1,0) = (0,1)^sym
+        array![[0.95_f64, 0.20], [0.20, 0.65]], // (1,1)
     ];
     let derivative_blocks: std::sync::Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>> =
         std::sync::Arc::new(vec![
@@ -8797,16 +8800,45 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         );
     }
 
-    // The penalty must be LIVE: zero ld_s/objective penalty contribution would
-    // make this a likelihood-only test. Assert the penalty fold actually moves
-    // the contracted result vs a no-penalty (s_logdet=None, penalty-free) hook.
+    // The penalty must be LIVE: a likelihood-only fixture would make this gate
+    // vacuous. Compare against a GENUINELY penalty-free baseline — derivative
+    // blocks with the SAME x_psi (identical likelihood) but ZERO s_psi/s_psi_psi
+    // (no penalty motion at all). Passing `None` for s_logdet_blocks is NOT
+    // sufficient: build_contracted_psi_hook still adds the ½βᵀS_ψψβ objective and
+    // S_ψψβ score terms from s_psi_psi regardless of s_logdet (only the
+    // τ-Hessian ld_s is gated on it), so a same-derivative-blocks baseline would
+    // be identical in objective/score and the guard would falsely fire.
+    let derivative_blocks_no_pen: std::sync::Arc<Vec<Vec<CustomFamilyBlockPsiDerivative>>> =
+        std::sync::Arc::new(vec![
+            vec![
+                CustomFamilyBlockPsiDerivative::new(
+                    None,
+                    derivative_blocks[0][0].x_psi.clone(),
+                    Array2::zeros((2, 2)),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                CustomFamilyBlockPsiDerivative::new(
+                    None,
+                    derivative_blocks[0][1].x_psi.clone(),
+                    Array2::zeros((2, 2)),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ],
+            Vec::new(),
+        ]);
     let hook_no_pen = build_contracted_psi_hook(
         &specs,
-        std::sync::Arc::clone(&derivative_blocks),
+        std::sync::Arc::clone(&derivative_blocks_no_pen),
         &beta_flat,
         rho_slice,
         &penalty_counts,
-        None,
+        Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
     )
     .expect("no-penalty hook build")
