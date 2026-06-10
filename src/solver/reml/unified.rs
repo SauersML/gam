@@ -2949,11 +2949,25 @@ fn penalty_subspace_trace_factor(kernel: &PenaltySubspaceTrace) -> Array2<f64> {
         .eigh(faer::Side::Lower)
         .expect("PenaltySubspaceTrace kernel factor eigendecomposition failed");
     let r = evals.len();
-    let max_eval = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let floor = f64::EPSILON.sqrt() * (r as f64).max(1.0) * max_eval.max(1.0);
+    // F must satisfy F·Fᵀ = K exactly: the batched `tr(FᵀAF)` is consumed as
+    // the gradient of the SAME pseudo-logdet criterion whose exact kernel the
+    // per-coordinate path contracts via `h_proj_inverse` directly. The kernel
+    // eigenvalues are `1/σ_a` over the kept Hessian spectrum, so their
+    // dynamic range is the Hessian condition number — clamp ONLY the
+    // roundoff-negative tail to zero (K is PSD by construction; a negative
+    // eigenvalue is O(ε)·‖K‖ eigensolver noise, and √(max(λ,0)) is the
+    // honest PSD square root). A relative floor here is NOT a stabilization:
+    // raising `1/σ_max` to `√ε·r·(1/σ_min)` rewrites the criterion's
+    // sensitivity along exactly the stiffest directions — where the ρ-drifts
+    // `λ_k·S_k` live — inflating the analytic trace by up to `√ε·r·κ(H_pen)`
+    // (O(1) once κ ≳ 1e7) while FD differentiates the true criterion. That
+    // desync red-lined every iso-κ Duchon probit/logit FD test and starved
+    // the spatial κ-optimizer of descent directions; Gaussian was immune
+    // because the intrinsic kernel is only installed for c-nontrivial
+    // families (#901).
     let mut root = evecs.clone();
     for col in 0..r {
-        let scale = evals[col].max(floor).sqrt();
+        let scale = evals[col].max(0.0).sqrt();
         for row in 0..r {
             root[[row, col]] *= scale;
         }
@@ -17578,6 +17592,75 @@ mod tests {
     use crate::solver::estimate::DP_FLOOR;
     use approx::assert_relative_eq;
     use ndarray::array;
+
+    // ─── Batched kernel-trace factor must reproduce the exact kernel ─────
+    //
+    // `penalty_subspace_trace_drifts_batched` evaluates `tr(K·A_i)` for the
+    // intrinsic pseudo-logdet kernel `K = U·M·Uᵀ` through a square-root
+    // factor `F` with `F·Fᵀ = K`. The per-coordinate path contracts `M`
+    // exactly, so the batched values must agree to roundoff — for ANY kernel
+    // spectrum. The regression this pins: a relative eigenvalue floor inside
+    // the factor (√ε·r·‖M‖) silently rewrote the kernel's stiffest-direction
+    // sensitivities once the Hessian condition number exceeded ~1/(√ε·r),
+    // biasing every ρ-trace whose drift `λ_k S_k` concentrates on those
+    // directions — the iso-κ Duchon probit/logit FD red-line. The spectrum
+    // below spans 12 decades, comfortably past the old floor.
+    #[test]
+    fn batched_penalty_subspace_traces_match_exact_kernel_on_ill_conditioned_spectrum() {
+        let p = 6usize;
+        let r = 4usize;
+        // Orthonormal U (p × r): columns of a fixed Householder-style basis.
+        let mut u_s = Array2::<f64>::zeros((p, r));
+        for col in 0..r {
+            for row in 0..p {
+                let x = ((row * r + col) as f64 * 0.7311).sin();
+                u_s[[row, col]] = x;
+            }
+        }
+        // Gram-Schmidt to make the columns exactly orthonormal.
+        for col in 0..r {
+            for prev in 0..col {
+                let dot = u_s.column(col).dot(&u_s.column(prev));
+                let prev_col = u_s.column(prev).to_owned();
+                let mut c = u_s.column_mut(col);
+                c.scaled_add(-dot, &prev_col);
+            }
+            let norm = u_s.column(col).dot(&u_s.column(col)).sqrt();
+            u_s.column_mut(col).mapv_inplace(|v| v / norm);
+        }
+        // Kernel reduced block M = diag(1/σ) over a 12-decade spectrum:
+        // σ ∈ {1e-6, 1e-2, 1e2, 1e6} ⇒ kernel evals {1e6, 1e2, 1e-2, 1e-6}.
+        let sigmas = [1.0e-6_f64, 1.0e-2, 1.0e2, 1.0e6];
+        let mut m = Array2::<f64>::zeros((r, r));
+        for (a, &s) in sigmas.iter().enumerate() {
+            m[[a, a]] = 1.0 / s;
+        }
+        let kernel = PenaltySubspaceTrace {
+            u_s: u_s.clone(),
+            h_proj_inverse: m,
+        };
+        // Drift concentrated on the STIFFEST direction (kernel eval 1e-6):
+        // A = σ_max · u₃u₃ᵀ + a mild symmetric background.
+        let u3 = u_s.column(r - 1).to_owned();
+        let mut a_drift = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                a_drift[[i, j]] = 1.0e6 * u3[i] * u3[j]
+                    + 0.5 * (((i + 2 * j) as f64) * 0.3719).cos()
+                    + 0.5 * (((j + 2 * i) as f64) * 0.3719).cos();
+            }
+        }
+        let drifts = vec![DriftDerivResult::Dense(a_drift.clone())];
+        let batched = penalty_subspace_trace_drifts_batched(&kernel, &drifts);
+        let exact = kernel.trace_projected_logdet(&a_drift);
+        assert!(
+            (batched[0] - exact).abs() <= 1e-10 * (1.0 + exact.abs()),
+            "batched kernel trace must reproduce the exact per-coordinate \
+             contraction on an ill-conditioned spectrum: batched={} exact={}",
+            batched[0],
+            exact
+        );
+    }
 
     // ─── Can't-desync invariant for GuardedCorrection ────────────────────
     //
