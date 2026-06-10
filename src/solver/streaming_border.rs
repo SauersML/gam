@@ -496,6 +496,130 @@ impl StreamingBorderGram {
     }
 }
 
+/// Bridges arbitrary-length row batches onto the fixed chunk partition.
+///
+/// A streaming row source ([`crate::terms::sae_corpus`]) yields batches whose
+/// lengths are set by I/O policy (batch size, shard boundaries) — they do
+/// **not** align with the deterministic chunk partition the accumulation tree
+/// is keyed on. This assembler buffers incoming rows and submits exact chunks
+/// in order, so the resulting Gram is bit-identical to having sliced the
+/// partition directly: the batching of the producer can never leak into the
+/// bits.
+///
+/// Checkpointing is exposed **at chunk granularity only**:
+/// [`ChunkAssembler::checkpoint`] returns `Some` exactly when the internal
+/// buffer is empty (a chunk boundary), because buffered raw rows are not part
+/// of the accumulation state contract — a resumed pass re-reads its row
+/// stream from the checkpointed chunk cursor
+/// ([`StreamingBorderGram::chunk_rows`] of the frontier names the next row).
+pub struct ChunkAssembler {
+    gram: StreamingBorderGram,
+    /// Row-major buffered rows (`buffered_rows × border_dim`), not yet a full
+    /// chunk.
+    buffer: Vec<f64>,
+    /// Next chunk index to submit (in-order by construction).
+    next_chunk: usize,
+}
+
+impl ChunkAssembler {
+    /// New assembler over the same partition parameters as
+    /// [`StreamingBorderGram::new`].
+    pub fn new(border_dim: usize, n_rows: usize, chunk_size: usize) -> Result<Self, String> {
+        Ok(Self {
+            gram: StreamingBorderGram::new(border_dim, n_rows, chunk_size)?,
+            buffer: Vec::new(),
+            next_chunk: 0,
+        })
+    }
+
+    /// Number of buffered rows not yet folded into a chunk.
+    fn buffered_rows(&self) -> usize {
+        let k = self.gram.border_dim;
+        debug_assert!(self.buffer.len() % k == 0);
+        self.buffer.len() / k
+    }
+
+    /// Append a batch of rows (any length, including empty) in stream order,
+    /// submitting every chunk the buffer completes.
+    pub fn push_rows(&mut self, rows: ArrayView2<'_, f64>) -> Result<(), String> {
+        let k = self.gram.border_dim;
+        if rows.ncols() != k {
+            return Err(format!(
+                "ChunkAssembler: batch has {} cols but border_dim is {k}",
+                rows.ncols()
+            ));
+        }
+        let n_chunks = self.gram.n_chunks();
+        // Rows consumed by completed chunks: the final chunk may be short, so
+        // clamp to the declared total.
+        let consumed = (self.gram.frontier() * self.gram.chunk_size).min(self.gram.n_rows);
+        let total_seen = consumed + self.buffered_rows() + rows.nrows();
+        if total_seen > self.gram.n_rows {
+            return Err(format!(
+                "ChunkAssembler: stream overran the declared row count ({} > {})",
+                total_seen, self.gram.n_rows
+            ));
+        }
+        for row in rows.outer_iter() {
+            self.buffer.extend(row.iter().copied());
+        }
+        // Submit every completed chunk in order.
+        while self.next_chunk < n_chunks {
+            let need = self.gram.chunk_rows(self.next_chunk).len();
+            if self.buffered_rows() < need {
+                break;
+            }
+            let chunk: Vec<f64> = self.buffer.drain(..need * k).collect();
+            let view = ndarray::ArrayView2::from_shape((need, k), &chunk)
+                .map_err(|e| format!("ChunkAssembler: chunk reshape failed: {e}"))?;
+            self.gram.submit_chunk(self.next_chunk, view)?;
+            self.next_chunk += 1;
+        }
+        Ok(())
+    }
+
+    /// Serialize the accumulation state — only at a chunk boundary. `None`
+    /// while rows are buffered mid-chunk (checkpoint after the next boundary,
+    /// or size batches to the chunk size for checkpoint-every-batch).
+    pub fn checkpoint(&self) -> Option<BorderGramCheckpoint> {
+        if self.buffer.is_empty() {
+            Some(self.gram.checkpoint())
+        } else {
+            None
+        }
+    }
+
+    /// Resume an assembler at the chunk boundary a checkpoint names. The
+    /// caller re-positions its row stream at row
+    /// `checkpoint.frontier * checkpoint.chunk_size` (the partition is pure,
+    /// so that index is exact) and replays from there.
+    pub fn resume(state: BorderGramCheckpoint) -> Result<Self, String> {
+        let gram = StreamingBorderGram::resume(state)?;
+        let next_chunk = gram.frontier();
+        Ok(Self {
+            gram,
+            buffer: Vec::new(),
+            next_chunk,
+        })
+    }
+
+    /// Finish the pass. Errors if the stream ended mid-chunk or short of the
+    /// declared row count — a truncated stream is rejected loudly, never
+    /// folded as a silently shorter corpus.
+    pub fn finish(self) -> Result<Array2<f64>, String> {
+        if !self.buffer.is_empty() {
+            let k = self.gram.border_dim;
+            return Err(format!(
+                "ChunkAssembler: stream ended mid-chunk with {} buffered rows \
+                 (declared n_rows = {})",
+                self.buffer.len() / k,
+                self.gram.n_rows
+            ));
+        }
+        self.gram.finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +869,121 @@ mod tests {
         let mut bad = good;
         bad.frontier = 99; // beyond n_chunks
         assert!(StreamingBorderGram::resume(bad).is_err());
+    }
+
+    #[test]
+    fn chunk_assembler_is_batching_invariant() {
+        // Whatever batch lengths the I/O layer produces, the assembled Gram is
+        // bit-identical to slicing the fixed partition directly.
+        let n = 463;
+        let k = 4;
+        let chunk_size = 16;
+        let rows = planted_rows(n, k);
+        let direct = {
+            let (acc, order) = accumulate_in_order(&rows, chunk_size);
+            drop(acc);
+            run_with_order(&rows, chunk_size, &order)
+        };
+
+        // Misaligned, varying batch lengths (3, 5, 7, 11, 13, cycling).
+        let mut asm = ChunkAssembler::new(k, n, chunk_size).expect("assembler");
+        let sizes = [3usize, 5, 7, 11, 13];
+        let mut at = 0usize;
+        let mut s = 0usize;
+        while at < n {
+            let take = sizes[s % sizes.len()].min(n - at);
+            asm.push_rows(rows.slice(ndarray::s![at..at + take, ..]))
+                .expect("push");
+            at += take;
+            s += 1;
+        }
+        let assembled = asm.finish().expect("finish");
+        assert_bit_identical(&direct, &assembled, "direct vs assembled batching");
+    }
+
+    #[test]
+    fn chunk_assembler_checkpoints_only_at_boundaries_and_resumes() {
+        let n = 200;
+        let k = 3;
+        let chunk_size = 10;
+        let rows = planted_rows(n, k);
+        let direct = run_with_order(&rows, chunk_size, &(0..20).collect::<Vec<_>>());
+
+        let mut asm = ChunkAssembler::new(k, n, chunk_size).expect("assembler");
+        // 7 rows: mid-chunk, no checkpoint available.
+        asm.push_rows(rows.slice(ndarray::s![0..7, ..])).expect("push");
+        assert!(asm.checkpoint().is_none(), "mid-chunk checkpoint must be None");
+        // Up to row 30: exactly 3 chunks folded, boundary checkpoint.
+        asm.push_rows(rows.slice(ndarray::s![7..30, ..])).expect("push");
+        let cp = asm.checkpoint().expect("boundary checkpoint");
+        assert_eq!(cp.frontier, 3);
+        drop(asm);
+
+        // Resume: re-read the stream from row frontier * chunk_size.
+        let mut resumed = ChunkAssembler::resume(cp).expect("resume");
+        resumed
+            .push_rows(rows.slice(ndarray::s![30..n, ..]))
+            .expect("push rest");
+        let gram = resumed.finish().expect("finish");
+        assert_bit_identical(&direct, &gram, "assembler resume vs straight-through");
+    }
+
+    #[test]
+    fn chunk_assembler_rejects_truncated_and_overrunning_streams() {
+        let k = 2;
+        let rows = planted_rows(30, k);
+        // Truncated: declared 30 rows, stream ends at 25 (mid-chunk).
+        let mut asm = ChunkAssembler::new(k, 30, 8).expect("assembler");
+        asm.push_rows(rows.slice(ndarray::s![0..25, ..])).expect("push");
+        let err = asm.finish().expect_err("truncated stream must fail finish");
+        assert!(err.contains("mid-chunk"), "got: {err}");
+        // Overrun: more rows than declared.
+        let mut asm = ChunkAssembler::new(k, 20, 8).expect("assembler");
+        let err = asm
+            .push_rows(rows.slice(ndarray::s![0..25, ..]))
+            .expect_err("overrun must be rejected");
+        assert!(err.contains("overran"), "got: {err}");
+    }
+
+    /// Mixed-precision error budget (#973): rows stored `f32` (the shard
+    /// format) and accumulated in `f64` must reproduce the all-`f64` border
+    /// Gram within a **named tolerance**, entry-wise relative to the Gram's
+    /// scale. `f32` storage rounds each value to ~6e-8 relative; products
+    /// double that; the deterministic f64 pairwise accumulation adds nothing
+    /// material. The budget below is ~100× that floor — tight enough to catch
+    /// any f32 accumulation sneaking into the path, loose enough to never
+    /// flake on legitimate storage rounding.
+    const MIXED_PRECISION_BORDER_RTOL: f64 = 1.0e-5;
+
+    #[test]
+    fn f32_storage_f64_accumulation_meets_the_error_budget() {
+        let n = 700;
+        let k = 5;
+        let chunk_size = 32;
+        let rows = planted_rows(n, k);
+        // The storage path: round every value through f32 (exactly what the
+        // shard writer + reader do), then accumulate in f64.
+        let stored = rows.mapv(|v| f64::from(v as f32));
+        let mut acc = StreamingBorderGram::new(k, n, chunk_size).expect("accumulator");
+        for j in 0..acc.n_chunks() {
+            let range = acc.chunk_rows(j);
+            acc.submit_chunk(j, stored.slice(ndarray::s![range, ..]))
+                .expect("submit");
+        }
+        let mixed = acc.finish().expect("finish");
+        // All-f64 reference.
+        let exact = rows.t().dot(&rows);
+        let scale = exact.iter().fold(0.0_f64, |m, &v| m.max(v.abs())).max(1.0);
+        for i in 0..k {
+            for j in 0..k {
+                let d = (mixed[[i, j]] - exact[[i, j]]).abs();
+                assert!(
+                    d <= MIXED_PRECISION_BORDER_RTOL * scale,
+                    "Gram[{i},{j}] mixed-precision delta {d:.3e} exceeds budget \
+                     {MIXED_PRECISION_BORDER_RTOL:.0e} × scale {scale:.3e}"
+                );
+            }
+        }
     }
 
     #[test]
