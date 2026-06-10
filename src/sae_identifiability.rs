@@ -53,7 +53,7 @@ use crate::linalg::faer_ndarray::{
     FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
 use faer::Side;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, s};
 
 /// Smoothed column-2-norm of the decoder Jacobian.
 ///
@@ -1348,6 +1348,297 @@ fn atom_permutation_generators(
     out
 }
 
+// ============================================================================
+// #998 — the full-resolution certificate: exact gauge orbits in the model's
+// own (decoder, coordinate) parameter space.
+// ============================================================================
+
+/// One atom's exact parameter-space view (#998): the raw objects the fit
+/// actually optimizes, in which the model-class gauge orbits live.
+///
+/// The mean-frame certificate ([`FittedAtom::frame`]) is a lossy compression:
+/// the true gauge orbits are **compensated** motions — the latent coordinates
+/// move AND the decoder counter-rotates (e.g. `Φ(t+ε)·R(−ε)B = Φ(t)B` for the
+/// harmonic circle) — whose net action on the mean frame is identically zero,
+/// so no frame-space realisation can measure them (#995's calibrated tolerance
+/// is the honest *floor* there). With this view the certificate realises each
+/// orbit exactly: the coordinate motion field `δt` comes from the group
+/// action, and the decoder compensation `δB` is **profiled out by least
+/// squares** against the data motion. The leftover residual is the orbit's
+/// true data cost — exactly zero when the basis family is closed under the
+/// action (harmonics under shifts, linear charts under rotations), genuinely
+/// positive when it is not (a Duchon patch under so(d)). Basis closure is
+/// therefore a *computed* per-generator quantity, not a declared flag.
+#[derive(Debug, Clone)]
+pub struct AtomParameterView {
+    /// Basis values `Φ`, `(n, M)`.
+    pub basis_values: Array2<f64>,
+    /// Basis first-derivative jet `Φ'`, `(n, M, latent_dim)`.
+    pub basis_jacobian: Array3<f64>,
+    /// Decoder coefficients `B`, `(M, p)`.
+    pub decoder: Array2<f64>,
+    /// Latent coordinates `t`, `(n, latent_dim)` — the chart the group acts on.
+    pub coords: Array2<f64>,
+    /// Per-row assignment mass `a_nk`, length `n`.
+    pub activations: Array1<f64>,
+}
+
+/// The penalty/prior channel of the exact certificate: an operator returning
+/// the penalty curvature root's image of an orbit direction `(δB, δt)`,
+/// together with its stiffness scale `σ_max²`. With exact orbits the data can
+/// never pin a model-class symmetry (the LS-compensated motion is a data-null
+/// by construction for closed bases), so **all** pinning of such symmetries
+/// flows through this channel — exactly where the #981 gauge-reduction ladder
+/// says identification lives (the isometry pin does the collapsing, rungs 2
+/// and 4, in whichever metric it is computed). `None` ⇒ no pin installed on
+/// this atom; the orbit's verdict is then decided by the data residual alone.
+pub struct OrbitPenaltyOperator {
+    /// Maps an orbit direction `(δB (M, p), δt (n, latent_dim))` to the
+    /// penalty curvature root's image (any length); the penalty cost along the
+    /// direction is the squared norm of the image.
+    #[allow(clippy::type_complexity)]
+    pub apply: Box<dyn Fn(ArrayView2<f64>, ArrayView2<f64>) -> Array1<f64> + Send + Sync>,
+    /// `σ_max²` of the penalty curvature root — the stiffness scale the
+    /// orbit's penalty cost is reported relative to (the same
+    /// relative-curvature convention as the frame certificate).
+    pub stiffness_sq: f64,
+}
+
+/// Enumerate one atom's exact orbit coordinate-motion fields `δt ∈ ℝ^{n×d}`.
+///
+/// Supported charts are the ones the group acts on **linearly** (so the
+/// first-order field is exact, not a linearisation): circle/torus axis shifts
+/// (`δt = e_ax`, chart-free) and flat-patch `so(d)` rotations
+/// (`δt_n = A_{ab} t_n`). The sphere's `so(3)` action on an intrinsic chart is
+/// nonlinear, so sphere atoms stay on the frame path (the caller must not
+/// build a view for them). Equal-ARD rotations reuse the rotation field for
+/// the tied axis pairs (the ARD prior is their pinning channel).
+fn exact_orbit_fields(
+    atom: &FittedAtom,
+    view: &AtomParameterView,
+) -> Vec<(GeneratorFamily, Array2<f64>, String)> {
+    let n = view.coords.nrows();
+    let d = view.coords.ncols();
+    let mut out: Vec<(GeneratorFamily, Array2<f64>, String)> = Vec::new();
+    let rotation_field = |a: usize, b: usize| -> Array2<f64> {
+        let mut dt = Array2::<f64>::zeros((n, d));
+        for row in 0..n {
+            dt[[row, a]] = -view.coords[[row, b]];
+            dt[[row, b]] = view.coords[[row, a]];
+        }
+        dt
+    };
+    match &atom.topology {
+        AtomTopology::Circle => {
+            out.push((
+                GeneratorFamily::IsomAtom,
+                Array2::<f64>::ones((n, 1)),
+                format!("{}: S¹ U(1) phase shift [exact orbit]", atom.name),
+            ));
+        }
+        AtomTopology::Torus { .. } => {
+            for ax in 0..d {
+                let mut dt = Array2::<f64>::zeros((n, d));
+                dt.column_mut(ax).fill(1.0);
+                out.push((
+                    GeneratorFamily::IsomAtom,
+                    dt,
+                    format!("{}: Tᵈ circle shift axis {ax} [exact orbit]", atom.name),
+                ));
+            }
+        }
+        AtomTopology::EuclideanPatch { .. } => {
+            for a in 0..d {
+                for b in (a + 1)..d {
+                    out.push((
+                        GeneratorFamily::IsomAtom,
+                        rotation_field(a, b),
+                        format!(
+                            "{}: patch so(d) rotation axes ({a},{b}) [exact orbit]",
+                            atom.name
+                        ),
+                    ));
+                }
+            }
+        }
+        AtomTopology::Sphere => {}
+    }
+    // Equal-ARD rotations between tied axes, on linearly-acting charts only.
+    if !matches!(atom.topology, AtomTopology::Circle | AtomTopology::Sphere) {
+        if let Some(ard) = atom.ard_variances.as_ref() {
+            if ard.len() == d {
+                const ARD_EQUAL_REL_TOL: f64 = 1.0e-9;
+                for a in 0..d {
+                    for b in (a + 1)..d {
+                        let scale = ard[a].abs().max(ard[b].abs()).max(f64::MIN_POSITIVE);
+                        if (ard[a] - ard[b]).abs() <= ARD_EQUAL_REL_TOL * scale {
+                            out.push((
+                                GeneratorFamily::EqualArdRotation,
+                                rotation_field(a, b),
+                                format!(
+                                    "{}: equal-ARD rotation axes ({a},{b}) [exact orbit]",
+                                    atom.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Exact-orbit verdicts for one viewed atom (#998).
+///
+/// For each orbit field `δt`: the uncompensated data motion is
+/// `u_n = a_n · (Φ'_n B) δt_n ∈ ℝ^p`; the decoder compensation `δB` minimizing
+/// `Σ_n ‖a_n Φ_n δB + u_n‖²` is profiled out through one shared SVD
+/// pseudo-inverse of the activation-weighted basis `D = diag(a) Φ`; and the
+/// **compensation residual fraction** `r²/‖u‖²` is the orbit's true relative
+/// data cost — exactly 0 for a basis closed under the group action, genuinely
+/// positive otherwise (computed closure). The penalty channel, when installed,
+/// contributes `‖penalty_root(δB, δt)‖² / σ_max²` on the same
+/// relative-curvature convention. The verdict needs **no lowering-error
+/// calibration** (`lowering_error_scale = 0`): nothing here is compressed.
+///
+/// The data likelihood this measures against is the activation-reconstruction
+/// objective in its own (Euclidean) inner product — which per the amended #980
+/// dispatch rule is the only thing that ever whitens the likelihood unless a
+/// `WhitenedStructured` noise model is installed; the output-Fisher metric
+/// reaches gauge verdicts only through the penalty operator.
+fn exact_orbit_verdicts(
+    atom: &FittedAtom,
+    view: &AtomParameterView,
+    penalty: Option<&OrbitPenaltyOperator>,
+) -> Result<Vec<GeneratorVerdict>, String> {
+    let (n, m) = view.basis_values.dim();
+    let d = view.coords.ncols();
+    let p = view.decoder.ncols();
+    if view.basis_jacobian.dim() != (n, m, d) {
+        return Err(format!(
+            "exact_orbit_verdicts({}): basis_jacobian shape {:?} must be ({n}, {m}, {d})",
+            atom.name,
+            view.basis_jacobian.dim()
+        ));
+    }
+    if view.decoder.nrows() != m {
+        return Err(format!(
+            "exact_orbit_verdicts({}): decoder has {} rows but basis has {m} columns",
+            atom.name,
+            view.decoder.nrows()
+        ));
+    }
+    if view.coords.nrows() != n || view.activations.len() != n {
+        return Err(format!(
+            "exact_orbit_verdicts({}): coords/activations rows must match basis rows {n}",
+            atom.name
+        ));
+    }
+
+    let fields = exact_orbit_fields(atom, view);
+    if fields.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Shared compensation operator: thin SVD of D = diag(a)·Φ, computed once.
+    let mut design = Array2::<f64>::zeros((n, m));
+    for row in 0..n {
+        let a = view.activations[row];
+        for c in 0..m {
+            design[[row, c]] = a * view.basis_values[[row, c]];
+        }
+    }
+    let (u_opt, sigma, vt_opt) = design
+        .svd(true, true)
+        .map_err(|e| format!("exact_orbit_verdicts({}): SVD of D failed: {e}", atom.name))?;
+    let u_svd =
+        u_opt.ok_or_else(|| format!("exact_orbit_verdicts({}): SVD lacked U", atom.name))?;
+    let vt = vt_opt.ok_or_else(|| format!("exact_orbit_verdicts({}): SVD lacked Vᵀ", atom.name))?;
+    let smax = sigma.iter().cloned().fold(0.0_f64, f64::max);
+    let cutoff = smax * f64::EPSILON * (n.max(m) as f64);
+
+    let mut out: Vec<GeneratorVerdict> = Vec::with_capacity(fields.len());
+    for (family, dt, description) in fields {
+        // Uncompensated data motion u_n = a_n (Φ'_n B) δt_n.
+        let mut u_mot = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let a = view.activations[row];
+            if !(a != 0.0) {
+                continue;
+            }
+            for ax in 0..d {
+                let step = dt[[row, ax]];
+                if step == 0.0 {
+                    continue;
+                }
+                for bm in 0..m {
+                    let dphi = view.basis_jacobian[[row, bm, ax]];
+                    if dphi == 0.0 {
+                        continue;
+                    }
+                    let w = a * step * dphi;
+                    for j in 0..p {
+                        u_mot[[row, j]] += w * view.decoder[[bm, j]];
+                    }
+                }
+            }
+        }
+        let raw: f64 = u_mot.iter().map(|v| v * v).sum();
+        if raw <= f64::MIN_POSITIVE {
+            // The orbit does not move the fit at all (zero tangents / zero
+            // mass): structurally trivial, reported pinned with zero norm,
+            // mirroring the frame certificate's convention.
+            out.push(GeneratorVerdict {
+                family,
+                description,
+                unpinned: false,
+                generator_norm: 0.0,
+                pinned_energy_fraction: 1.0,
+                lowering_error_scale: 0.0,
+            });
+            continue;
+        }
+        // Profile out the decoder compensation: c = Uᵀu, keep σ > cutoff.
+        // Residual cost r² = ‖u‖² − ‖c_kept‖² (Pythagoras on the projection).
+        let coeffs = u_svd.t().dot(&u_mot);
+        let mut kept_sq = 0.0_f64;
+        let mut scaled = Array2::<f64>::zeros((sigma.len(), p));
+        for r in 0..sigma.len() {
+            if sigma[r] > cutoff {
+                let inv = 1.0 / sigma[r];
+                for j in 0..p {
+                    kept_sq += coeffs[[r, j]] * coeffs[[r, j]];
+                    scaled[[r, j]] = -inv * coeffs[[r, j]];
+                }
+            }
+        }
+        let resid_sq = (raw - kept_sq).max(0.0);
+        let data_fraction = (resid_sq / raw).clamp(0.0, 1.0);
+
+        let penalty_fraction = match penalty {
+            Some(op) if op.stiffness_sq > f64::MIN_POSITIVE => {
+                let delta_b = vt.t().dot(&scaled); // δB = −V Σ⁺ Uᵀ u, (M, p)
+                let image = (op.apply)(delta_b.view(), dt.view());
+                let cost: f64 = image.iter().map(|v| v * v).sum();
+                (cost / op.stiffness_sq).clamp(0.0, 1.0)
+            }
+            _ => 0.0,
+        };
+
+        let pinned_energy_fraction = data_fraction.max(penalty_fraction);
+        out.push(GeneratorVerdict {
+            family,
+            description,
+            unpinned: pinned_energy_fraction <= GENERATOR_FLAT_ENERGY_TOL,
+            generator_norm: raw.sqrt(),
+            pinned_energy_fraction,
+            lowering_error_scale: 0.0,
+        });
+    }
+    Ok(out)
+}
+
 /// The stacked curvature root `R` of the pinning operator, in the fit's
 /// metric: `(m, param_dim)` with `H = H_data + H_isometry = RᵀR`.
 ///
@@ -1475,8 +1766,66 @@ fn stacked_curvature_root(model: &FittedSaeManifold) -> Result<Array2<f64>, Stri
 ///   (the output-Fisher metric separates the atoms behaviorally). The result is
 ///   carried in `sym_f_trivial_under_output_fisher`.
 pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, String> {
+    residual_gauge_inner(model, None)
+}
+
+/// The #998 full-resolution certificate: within-atom gauge families are
+/// realised as **exact orbits** in the model's own (decoder, coordinate)
+/// parameter space for every atom that supplies an [`AtomParameterView`],
+/// while cross-atom families (output-frame rotations, atom permutations) and
+/// any unviewed atom (e.g. spheres, whose chart action is nonlinear) keep the
+/// frame-space path with its #995 lowering-error calibration.
+///
+/// For a viewed atom the compensated orbit is a data-null **by construction**
+/// when the basis family is closed under the group action — the verdict
+/// carries no calibration (`lowering_error_scale = 0`), the compensation
+/// residual is the computed closure, and all pinning of true model-class
+/// symmetries flows through the per-atom [`OrbitPenaltyOperator`] channel
+/// (the isometry pin / ARD prior — rungs 2 and 4 of the #981 ladder).
+///
+/// `views` and `penalty_ops` are aligned with `model.atoms`; a `None` view
+/// keeps that atom entirely on the frame path. Supplying a view for an atom
+/// whose pin is active without also supplying its penalty operator would
+/// over-claim freedom, so callers must pass the operator (or no view) for
+/// pinned atoms.
+pub fn residual_gauge_exact(
+    model: &FittedSaeManifold,
+    views: &[Option<AtomParameterView>],
+    penalty_ops: &[Option<OrbitPenaltyOperator>],
+) -> Result<ResidualGaugeReport, String> {
+    if views.len() != model.atoms.len() || penalty_ops.len() != model.atoms.len() {
+        return Err(format!(
+            "residual_gauge_exact: views ({}) and penalty_ops ({}) must align with atoms ({})",
+            views.len(),
+            penalty_ops.len(),
+            model.atoms.len()
+        ));
+    }
+    let mut mask = vec![false; model.atoms.len()];
+    let mut exact_verdicts: Vec<GeneratorVerdict> = Vec::new();
+    for (k, (atom, view)) in model.atoms.iter().zip(views.iter()).enumerate() {
+        let Some(view) = view else { continue };
+        // Sphere charts: nonlinear group action — refuse exactness, keep the
+        // calibrated frame path for this atom rather than pretending.
+        if matches!(atom.topology, AtomTopology::Sphere) {
+            continue;
+        }
+        exact_verdicts.extend(exact_orbit_verdicts(atom, view, penalty_ops[k].as_ref())?);
+        mask[k] = true;
+    }
+    residual_gauge_inner(model, Some((&mask, exact_verdicts)))
+}
+
+fn residual_gauge_inner(
+    model: &FittedSaeManifold,
+    exact: Option<(&[bool], Vec<GeneratorVerdict>)>,
+) -> Result<ResidualGaugeReport, String> {
     let metric_provenance = model.metric.provenance();
     let param_dim = model.param_dim();
+    let (exact_mask, exact_verdicts) = match exact {
+        Some((mask, verdicts)) => (Some(mask), verdicts),
+        None => (None, Vec::new()),
+    };
 
     // 1. Enumerate generators, tagged by family. The per-atom builders speak
     // the atom's LOCAL flattened-frame coordinates (length `frame.len()`); the
@@ -1492,6 +1841,13 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
         .fold(0.0_f64, f64::max);
     let mut gens: Vec<(GeneratorFamily, Array1<f64>, String, f64)> = Vec::new();
     for (k, atom) in model.atoms.iter().enumerate() {
+        // Atoms whose within-atom families are realised exactly (#998) are
+        // skipped here: the frame-space lift of a compensated orbit measures
+        // compression, not the symmetry, and the report must not carry both a
+        // lossy and an exact verdict for the same group element.
+        if exact_mask.is_some_and(|mask| mask[k]) {
+            continue;
+        }
         let base = model.atom_offset(k);
         for (g, desc) in atom_isometry_generators(atom) {
             gens.push((
@@ -1589,6 +1945,11 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
             lowering_error_scale: *lowering_error_scale,
         });
     }
+
+    // Exact-orbit verdicts (#998) join the report on equal footing: the
+    // group signature, residual dimension, and Sym(F) check all range over
+    // the union.
+    verdicts.extend(exact_verdicts);
 
     let residual_gauge_dim = verdicts.iter().filter(|v| v.unpinned).count();
 
