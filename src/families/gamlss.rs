@@ -4041,15 +4041,6 @@ fn nonwiggle_q_directional(
 }
 
 #[inline]
-fn clamped_binomial_probability(mu: f64) -> (f64, bool) {
-    if !mu.is_finite() {
-        return (0.5, true);
-    }
-    let clamped = mu.clamp(MIN_PROB, 1.0 - MIN_PROB);
-    (clamped, clamped != mu)
-}
-
-#[inline]
 fn log1mexp_neg_positive(z: f64) -> f64 {
     assert!(z >= 0.0);
     if z == 0.0 {
@@ -4157,17 +4148,18 @@ fn binomial_location_scalerow(
     } = exp_sigma_jet1_scalar(eta_ls);
     let q0 = binomial_location_scale_q0(eta_t, sigma);
     let q = q0 + etawiggle;
-    let mut jet = inverse_link_jet_for_inverse_link(link_kind, q)
+    let jet = inverse_link_jet_for_inverse_link(link_kind, q)
         .map_err(|e| format!("location-scale inverse-link evaluation failed: {e}"))?;
     let raw_mu = jet.mu;
-    // Stability (Issue 5): floor μ for downstream 1/μ divisions but DO
-    // NOT zero d1/d2/d3 — those are derivatives of the inverse link
-    // (dμ/dq, ...) which are bounded for any sane link and carry the
-    // legitimate gradient signal. Zeroing them created a phantom flat
-    // region that the optimizer would converge to as a stationary point,
-    // silently misreporting separated/saturated fits as well-fit modes.
-    let (mu_clamped, _clamp_active) = clamped_binomial_probability(jet.mu);
-    jet.mu = mu_clamped;
+    // μ is stored RAW (unclamped). The q-derivative tower built downstream
+    // (binomial_neglog_q_derivatives_dispatch et al.) is the EXACT derivative
+    // of the loss evaluated here, computed via the per-branch reciprocals in
+    // `binomial_loglik_mu_derivatives` plus the saturation guard in the
+    // `*_from_jet` consumers. Flooring μ at MIN_PROB here would replace every
+    // representable sub-MIN_PROB tail probability with a 1e-10 surrogate,
+    // corrupting the Fisher curvature throughout the saturated tail (#948).
+    // The inverse-link derivatives d1/d2/d3 carry the legitimate gradient
+    // signal and are likewise preserved.
     let inverse_link = jet;
     let ll = binomial_location_scale_log_likelihood(y, weight, q, link_kind, raw_mu)?;
     Ok(BinomialLocationScaleRow {
@@ -11656,13 +11648,11 @@ impl BinomialMeanWiggleFamily {
     }
 
     fn neglog_q_derivatives(&self, y: f64, weight: f64, q: f64) -> Result<(f64, f64, f64), String> {
-        let mut jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
+        let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
             .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-        // Stability (Issue 5): floor μ for downstream divisions only;
-        // preserve d1/d2/d3 so the chain rule reflects the true geometry.
-        // See binomial_location_scalerow for the full rationale.
-        let (mu_clamped, _clamp_active) = clamped_binomial_probability(jet.mu);
-        jet.mu = mu_clamped;
+        // Pass μ RAW: the dispatch returns the exact q-derivatives of the
+        // evaluated loss for every representable μ in (0,1) and handles the
+        // saturated boundary itself. See binomial_location_scalerow (#948).
         Ok(binomial_neglog_q_derivatives_dispatch(
             y,
             weight,
@@ -11678,12 +11668,12 @@ impl BinomialMeanWiggleFamily {
     fn neglog_q_fourth_derivative(&self, y: f64, weight: f64, q: f64) -> Result<f64, String> {
         let jet = inverse_link_jet_for_inverse_link(&self.link_kind, q)
             .map_err(|e| format!("fixed-link wiggle inverse-link evaluation failed: {e}"))?;
-        let (mu_clamped, _) = clamped_binomial_probability(jet.mu);
+        // Pass μ RAW — see neglog_q_derivatives above (#948).
         binomial_neglog_q_fourth_derivative_dispatch(
             y,
             weight,
             q,
-            mu_clamped,
+            jet.mu,
             jet.d1,
             jet.d2,
             jet.d3,
@@ -21784,20 +21774,41 @@ mod tests {
     }
 
     #[test]
-    fn logit_binomial_tail_derivatives_clip_probability_variance() {
+    fn logit_binomial_tail_derivatives_are_exact_not_clipped() {
+        // Regression for issue #948 (2b): the logit curvature/4th derivative
+        // must be the EXACT Bernoulli variance s = p(1-p) in the saturated
+        // tail — never floored to MIN_PROB·(1−MIN_PROB) ≈ 1e-10. At q=50 the
+        // true variance is s = e^{-50}/(1+e^{-50})² ≈ e^{-50} ≈ 1.93e-22.
         let q = 50.0;
-        let (_, m2, m3) = binomial_neglog_q_derivatives_logit_closed_form(1.0, 1.0, q);
-        let m4 = binomial_neglog_q_fourth_derivative_logit_closed_form(1.0, 1.0, q);
-        let expected_variance = MIN_PROB * (1.0 - MIN_PROB);
+        let t = (-q).exp();
+        let denom = 1.0 + t;
+        let s_exact = t / (denom * denom);
 
+        let (m1, m2, m3) = binomial_neglog_q_derivatives_logit_closed_form(1.0, 1.0, q);
+        let m4 = binomial_neglog_q_fourth_derivative_logit_closed_form(1.0, 1.0, q);
+
+        // The clipped surrogate would have reported ~1e-10; the exact value is
+        // ~1.9e-22, twelve orders of magnitude smaller.
         assert!(
-            (m2 - expected_variance).abs() <= 1e-20,
-            "logit curvature should use clipped p*(1-p) in the saturated tail; got {m2}"
+            s_exact < 1e-21,
+            "sanity: exact tail variance should be ~1e-22, got {s_exact}"
+        );
+        // m1 = w(p - y); at q=50, p rounds to 1.0 exactly, so m1 = 0.
+        assert!(m1.abs() <= 1e-15, "m1 should be ~0 at p≈1, got {m1}");
+        assert!(
+            (m2 - s_exact).abs() <= 1e-30,
+            "logit curvature must equal exact s=p(1-p) in the tail, got {m2}, want {s_exact}"
+        );
+        // The clipped floor would be ~5e-12 larger than the truth: assert we
+        // are nowhere near it.
+        assert!(
+            m2 < 1e-15,
+            "logit curvature must NOT be floored at MIN_PROB·(1−MIN_PROB)≈1e-10, got {m2}"
         );
         assert!(m3.is_finite());
         assert!(
-            (m4 - expected_variance * (1.0 - 6.0 * expected_variance)).abs() <= 1e-20,
-            "logit fourth derivative should use clipped p*(1-p) in the saturated tail; got {m4}"
+            (m4 - s_exact * (1.0 - 6.0 * s_exact)).abs() <= 1e-30,
+            "logit fourth derivative must equal exact ws(1-6s) in the tail, got {m4}"
         );
     }
 
