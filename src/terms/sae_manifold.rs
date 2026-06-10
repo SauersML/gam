@@ -2350,6 +2350,21 @@ impl SaeManifoldAtom {
             gauge[i] = sv.get(i).copied().unwrap_or(0.0);
         }
         self.decoder_frame = Some(GrassmannFrame::from_oriented(frame, gauge));
+        // Project the decoder onto the activated frame so the authoritative
+        // `B_k = C_k U_kᵀ` holds EXACTLY from the first factored assembly
+        // (issue #972 / #977 T1). Without this, `B_k` keeps its off-frame
+        // component while the factored C-block solve only moves within
+        // `range(U_k)`, leaving an irreducible residual the solver cannot
+        // reduce — the fit then never converges. `B ← (B U) Uᵀ` is a no-op in
+        // span for a truly rank-`r` decoder (the common, beneficial case).
+        let u_proj = self
+            .decoder_frame
+            .as_ref()
+            .expect("frame just set")
+            .frame()
+            .to_owned();
+        let c_proj = self.decoder_coefficients.dot(&u_proj);
+        self.decoder_coefficients = c_proj.dot(&u_proj.t());
         Ok(Some(r_eff))
     }
 
@@ -4488,6 +4503,16 @@ impl SaeManifoldTerm {
     pub fn auto_activate_decoder_frames(&mut self) -> Result<usize, String> {
         let mut activated = 0usize;
         for atom in &mut self.atoms {
+            // Idempotent (issue #972 / #977 T1): an atom that is already framed
+            // keeps its frame — the polar refresh adapts it during the fit.
+            // Re-running activation every outer eval (this is called at the top
+            // of every `run_joint_fit`) would re-SVD and RESET the frame each
+            // time, discarding the polar refinement and making the objective the
+            // outer engine sees non-stationary (it would never converge). Only
+            // atoms WITHOUT a frame are considered for activation here.
+            if atom.decoder_frame.is_some() {
+                continue;
+            }
             if atom.maybe_activate_decoder_frame()?.is_some() {
                 activated += 1;
             }
