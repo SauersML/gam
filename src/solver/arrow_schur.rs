@@ -824,6 +824,264 @@ impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
     }
 }
 
+/// One co-occurring `(atom_i, atom_j)` block of the **frame-factored** data-fit
+/// Gauss–Newton β-Hessian (issue #972 / #977 T1). Carries the basis-space Gram
+/// `g` (`m_i × m_j`) AND the per-pair frame output factor `w = U_iᵀ U_j`
+/// (`r_i × r_j`); the contributed Hessian sub-block is the Kronecker product
+/// `g ⊗ w`.
+#[derive(Debug, Clone)]
+pub struct FactoredFrameGBlock {
+    /// Atom index of the row factor (selects rank `r_i` and β offset).
+    pub atom_i: usize,
+    /// Atom index of the column factor (selects rank `r_j` and β offset).
+    pub atom_j: usize,
+    /// Basis-space coupling `G_{ij}` (`m_i × m_j`).
+    pub g: Array2<f64>,
+    /// Frame output factor `U_iᵀ U_j` (`r_i × r_j`). For `i == j` with an
+    /// orthonormal frame this is `I_{r_i}` (the clean within-atom `g ⊗ I_r`
+    /// collapse); across atoms it is the dense principal-angle cosine matrix
+    /// between the two frames.
+    pub w: Array2<f64>,
+}
+
+/// Frame-factored data-fit Gauss–Newton β-Hessian operator (#972 / #977 T1):
+/// the `Σ_k M_k·r_k` reduced-border analogue of [`SparseBlockKroneckerPenaltyOp`].
+///
+/// When every atom's decoder `B_k = C_k U_kᵀ` is profiled onto a Grassmann
+/// frame `U_k ∈ St(p, r_k)`, the border carries only the shape coefficients
+/// `C_k` (`M_k · r_k` entries) instead of the full `B_k` (`M_k · p`). The data
+/// Gram in this reduced space is, for the isotropic likelihood,
+/// `H[(i,li,a),(j,lj,b)] = G_{ij}[li,lj] · (U_iᵀ U_j)[a,b]` — within an atom the
+/// orthonormal frame gives `U_iᵀU_i = I_{r_i}` and the block is the clean
+/// `G ⊗ I_r` collapse; across co-active atoms the frames do not share a basis
+/// so the output factor is the dense `U_iᵀU_j`.
+///
+/// The β layout is `μ`-major / frame-minor with a **variable** per-atom width
+/// `r_k`: the index of (atom `k`, basis `li`, frame coord `a`) is
+/// `offset[k] + li·r_k + a`, where `offset` is the prefix sum of `M_k · r_k`.
+/// With every `r_k = p` and `U_k = I_p` this reproduces
+/// [`SparseBlockKroneckerPenaltyOp`] exactly (a unit test pins the reduction),
+/// so it is a strict generalization, not a separate code path.
+pub struct FactoredFrameKroneckerOp {
+    /// Per-atom frame rank `r_k` (the factored output width).
+    pub ranks: Vec<usize>,
+    /// Per-atom basis size `M_k`.
+    pub basis_sizes: Vec<usize>,
+    /// Per-atom β offset (prefix sum of `M_k · r_k`); `offsets[k]` is the start
+    /// of atom `k`'s `C_k` block, `offsets[n_atoms]` the total dim.
+    pub offsets: Vec<usize>,
+    /// Total reduced β dimension `Σ_k M_k · r_k`.
+    pub dim: usize,
+    /// Non-empty co-occurring `(atom_i, atom_j)` blocks.
+    pub blocks: Vec<FactoredFrameGBlock>,
+}
+
+impl FactoredFrameKroneckerOp {
+    /// Build from per-atom ranks + basis sizes and the co-occurring blocks.
+    /// Computes the β offsets (prefix sum of `M_k·r_k`) and validates that each
+    /// block's `g`/`w` shapes match the atoms' `(M, r)`.
+    pub fn new(
+        ranks: Vec<usize>,
+        basis_sizes: Vec<usize>,
+        blocks: Vec<FactoredFrameGBlock>,
+    ) -> Result<Self, String> {
+        if ranks.len() != basis_sizes.len() {
+            return Err(format!(
+                "FactoredFrameKroneckerOp: {} ranks but {} basis sizes",
+                ranks.len(),
+                basis_sizes.len()
+            ));
+        }
+        let n_atoms = ranks.len();
+        let mut offsets = Vec::with_capacity(n_atoms + 1);
+        let mut acc = 0usize;
+        for k in 0..n_atoms {
+            offsets.push(acc);
+            acc += basis_sizes[k] * ranks[k];
+        }
+        offsets.push(acc);
+        let dim = acc;
+        for blk in &blocks {
+            if blk.atom_i >= n_atoms || blk.atom_j >= n_atoms {
+                return Err(format!(
+                    "FactoredFrameKroneckerOp: block atom indices ({}, {}) out of range (n_atoms = {n_atoms})",
+                    blk.atom_i, blk.atom_j
+                ));
+            }
+            if blk.g.dim() != (basis_sizes[blk.atom_i], basis_sizes[blk.atom_j]) {
+                return Err(format!(
+                    "FactoredFrameKroneckerOp: block ({}, {}) g has shape {:?} but expected ({}, {})",
+                    blk.atom_i,
+                    blk.atom_j,
+                    blk.g.dim(),
+                    basis_sizes[blk.atom_i],
+                    basis_sizes[blk.atom_j]
+                ));
+            }
+            if blk.w.dim() != (ranks[blk.atom_i], ranks[blk.atom_j]) {
+                return Err(format!(
+                    "FactoredFrameKroneckerOp: block ({}, {}) w has shape {:?} but expected ({}, {})",
+                    blk.atom_i,
+                    blk.atom_j,
+                    blk.w.dim(),
+                    ranks[blk.atom_i],
+                    ranks[blk.atom_j]
+                ));
+            }
+        }
+        Ok(Self {
+            ranks,
+            basis_sizes,
+            offsets,
+            dim,
+            blocks,
+        })
+    }
+}
+
+impl BetaPenaltyOp for FactoredFrameKroneckerOp {
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        for blk in &self.blocks {
+            let r_i = self.ranks[blk.atom_i];
+            let r_j = self.ranks[blk.atom_j];
+            let off_i = self.offsets[blk.atom_i];
+            let off_j = self.offsets[blk.atom_j];
+            let (m_i, m_j) = blk.g.dim();
+            for li in 0..m_i {
+                let yi_base = off_i + li * r_i;
+                for lj in 0..m_j {
+                    let g = blk.g[[li, lj]];
+                    if g == 0.0 {
+                        continue;
+                    }
+                    let xj_base = off_j + lj * r_j;
+                    // y_block[li, a] += g · Σ_b w[a, b] · x_block[lj, b]
+                    for a in 0..r_i {
+                        let mut acc = 0.0;
+                        for b in 0..r_j {
+                            acc += blk.w[[a, b]] * x[xj_base + b];
+                        }
+                        y[yi_base + a] += g * acc;
+                    }
+                }
+            }
+        }
+    }
+
+    fn gradient(&self, beta: &[f64], out: &mut [f64]) {
+        self.matvec(beta, out);
+    }
+
+    fn diagonal(&self, diag: &mut [f64]) {
+        for blk in &self.blocks {
+            // Only on-diagonal atom blocks carry diagonal mass; the entry at
+            // (atom k, basis li, coord a) is g[li,li]·w[a,a].
+            if blk.atom_i != blk.atom_j {
+                continue;
+            }
+            let r = self.ranks[blk.atom_i];
+            let off = self.offsets[blk.atom_i];
+            let (m_i, m_j) = blk.g.dim();
+            let m = m_i.min(m_j);
+            for li in 0..m {
+                let gii = blk.g[[li, li]];
+                let base = off + li * r;
+                for a in 0..r {
+                    diag[base + a] += gii * blk.w[[a, a]];
+                }
+            }
+        }
+    }
+
+    fn block(&self, id: BetaBlockId, offsets: &[Range<usize>], out: &mut Array2<f64>) {
+        // Dense sub-block over the β index range `offsets[id.0]`. Mirror the
+        // global (i,a) ↔ (j,b) coupling, keeping only indices inside the range.
+        let range = &offsets[id.0];
+        let b_dim = range.end - range.start;
+        for blk in &self.blocks {
+            let r_i = self.ranks[blk.atom_i];
+            let r_j = self.ranks[blk.atom_j];
+            let off_i = self.offsets[blk.atom_i];
+            let off_j = self.offsets[blk.atom_j];
+            let (m_i, m_j) = blk.g.dim();
+            for li in 0..m_i {
+                for a in 0..r_i {
+                    let gi = off_i + li * r_i + a;
+                    if gi < range.start || gi >= range.end {
+                        continue;
+                    }
+                    let bi = gi - range.start;
+                    for lj in 0..m_j {
+                        let g = blk.g[[li, lj]];
+                        if g == 0.0 {
+                            continue;
+                        }
+                        for b in 0..r_j {
+                            let gj = off_j + lj * r_j + b;
+                            if gj < range.start || gj >= range.end {
+                                continue;
+                            }
+                            let bj = gj - range.start;
+                            if bi < b_dim && bj < b_dim {
+                                out[[bi, bj]] += g * blk.w[[a, b]];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn to_dense(&self) -> Array2<f64> {
+        let mut out = Array2::<f64>::zeros((self.dim, self.dim));
+        for blk in &self.blocks {
+            let r_i = self.ranks[blk.atom_i];
+            let r_j = self.ranks[blk.atom_j];
+            let off_i = self.offsets[blk.atom_i];
+            let off_j = self.offsets[blk.atom_j];
+            let (m_i, m_j) = blk.g.dim();
+            for li in 0..m_i {
+                for lj in 0..m_j {
+                    let g = blk.g[[li, lj]];
+                    if g == 0.0 {
+                        continue;
+                    }
+                    for a in 0..r_i {
+                        let gi = off_i + li * r_i + a;
+                        for b in 0..r_j {
+                            let gj = off_j + lj * r_j + b;
+                            out[[gi, gj]] += g * blk.w[[a, b]];
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn fingerprint(&self, hasher: &mut Fingerprinter) {
+        hasher.write_str("factored-frame-kronecker-op-v1");
+        hasher.write_usize(self.dim);
+        for &r in &self.ranks {
+            hasher.write_usize(r);
+        }
+        for &m in &self.basis_sizes {
+            hasher.write_usize(m);
+        }
+        hasher.write_usize(self.blocks.len());
+        for blk in &self.blocks {
+            hasher.write_usize(blk.atom_i);
+            hasher.write_usize(blk.atom_j);
+            hasher.write_f64_array2(&blk.g);
+            hasher.write_f64_array2(&blk.w);
+        }
+    }
+}
+
 /// Composite penalty: sum of multiple `BetaPenaltyOp` operators.
 pub struct CompositePenaltyOp {
     /// Full β dimension `K`.
@@ -6845,6 +7103,176 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Hand-built dense reference for the frame-factored Gram
+    /// `H[(i,li,a),(j,lj,b)] = g_ij[li,lj]·(U_iᵀU_j)[a,b]`, with the variable
+    /// per-atom width `r_k`.
+    fn factored_reference_dense(
+        ranks: &[usize],
+        basis_sizes: &[usize],
+        blocks: &[FactoredFrameGBlock],
+    ) -> Array2<f64> {
+        let n_atoms = ranks.len();
+        let mut offsets = vec![0usize; n_atoms + 1];
+        for k in 0..n_atoms {
+            offsets[k + 1] = offsets[k] + basis_sizes[k] * ranks[k];
+        }
+        let dim = offsets[n_atoms];
+        let mut h = Array2::<f64>::zeros((dim, dim));
+        for blk in blocks {
+            let (r_i, r_j) = (ranks[blk.atom_i], ranks[blk.atom_j]);
+            let (off_i, off_j) = (offsets[blk.atom_i], offsets[blk.atom_j]);
+            let (m_i, m_j) = blk.g.dim();
+            for li in 0..m_i {
+                for lj in 0..m_j {
+                    for a in 0..r_i {
+                        for b in 0..r_j {
+                            h[[off_i + li * r_i + a, off_j + lj * r_j + b]] +=
+                                blk.g[[li, lj]] * blk.w[[a, b]];
+                        }
+                    }
+                }
+            }
+        }
+        h
+    }
+
+    /// `FactoredFrameKroneckerOp` must equal its dense `g ⊗ (UᵀU)` reference on
+    /// every interface, with VARIABLE per-atom rank (`r_0 = 2`, `r_1 = 3`) and a
+    /// genuine cross-atom output factor `U_0ᵀU_1 ≠ 0`.
+    #[test]
+    fn factored_frame_kronecker_matches_dense_reference() {
+        // Atom 0: M_0 = 2, r_0 = 2. Atom 1: M_1 = 3, r_1 = 3. dim = 4 + 9 = 13.
+        let ranks = vec![2usize, 3];
+        let basis_sizes = vec![2usize, 3];
+        let g00 = array![[3.0_f64, 0.5], [0.5, 4.0]];
+        let g11 = array![[2.0_f64, 0.4, -0.2], [0.4, 5.0, 0.6], [-0.2, 0.6, 1.5]];
+        let g01 = array![[0.2_f64, -0.1, 0.0], [0.3, 0.1, -0.2]];
+        let g10 = g01.t().to_owned();
+        // Within-atom frame factors are identity (orthonormal U); the cross
+        // factor U_0ᵀU_1 (2×3) is a generic dense principal-angle matrix.
+        let w00 = Array2::<f64>::eye(2);
+        let w11 = Array2::<f64>::eye(3);
+        let w01 = array![[0.8_f64, 0.1, -0.05], [0.0, 0.7, 0.2]];
+        let w10 = w01.t().to_owned();
+        let blocks = vec![
+            FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00.clone(), w: w00.clone() },
+            FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11.clone(), w: w11.clone() },
+            FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01.clone(), w: w01.clone() },
+            FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10.clone(), w: w10.clone() },
+        ];
+        let op = FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), blocks.clone())
+            .expect("op");
+        assert_eq!(op.dim(), 13);
+        let reference = factored_reference_dense(&ranks, &basis_sizes, &blocks);
+
+        // to_dense.
+        let dense = op.to_dense();
+        for i in 0..13 {
+            for j in 0..13 {
+                assert!(
+                    (dense[[i, j]] - reference[[i, j]]).abs() < 1e-12,
+                    "to_dense mismatch at ({i},{j}): {} vs {}",
+                    dense[[i, j]],
+                    reference[[i, j]]
+                );
+            }
+        }
+        // matvec == reference·x.
+        let x: Vec<f64> = (0..13).map(|i| 0.13 * (i as f64) - 0.4).collect();
+        let mut y = vec![0.0_f64; 13];
+        op.matvec(&x, &mut y);
+        for i in 0..13 {
+            let mut expect = 0.0;
+            for j in 0..13 {
+                expect += reference[[i, j]] * x[j];
+            }
+            assert!(
+                (y[i] - expect).abs() < 1e-10,
+                "matvec mismatch at {i}: {} vs {expect}",
+                y[i]
+            );
+        }
+        // diagonal.
+        let mut diag = vec![0.0_f64; 13];
+        op.diagonal(&mut diag);
+        for i in 0..13 {
+            assert!(
+                (diag[i] - reference[[i, i]]).abs() < 1e-12,
+                "diagonal mismatch at {i}"
+            );
+        }
+        // block over each atom's β range.
+        let offsets_ranges = [0..4usize, 4..13usize];
+        for id in 0..2 {
+            let b = offsets_ranges[id].end - offsets_ranges[id].start;
+            let mut blk = Array2::<f64>::zeros((b, b));
+            op.block(BetaBlockId(id), &offsets_ranges, &mut blk);
+            for bi in 0..b {
+                for bj in 0..b {
+                    let gi = offsets_ranges[id].start + bi;
+                    let gj = offsets_ranges[id].start + bj;
+                    assert!(
+                        (blk[[bi, bj]] - reference[[gi, gj]]).abs() < 1e-12,
+                        "block {id} mismatch at ({bi},{bj})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Strict-generalization pin: with every `r_k = p` and `U_k = I_p` (so all
+    /// frame factors are identity), `FactoredFrameKroneckerOp` reproduces
+    /// `SparseBlockKroneckerPenaltyOp` (the `G ⊗ I_p` data Gram) bit-for-bit on
+    /// matvec — i.e. the full-`B` border is the `r = p` special case of the
+    /// factored op, not a separate path.
+    #[test]
+    fn factored_frame_kronecker_reduces_to_sparse_block_at_full_rank() {
+        let p = 2usize;
+        let g00 = array![[3.0_f64, 0.5], [0.5, 4.0]];
+        let g11 = array![[2.0_f64, 0.4], [0.4, 5.0]];
+        let g01 = array![[0.2_f64, -0.1], [0.3, 0.1]];
+        let g10 = g01.t().to_owned();
+        // Factored op with r_k = p, U = I_p (w = I_p everywhere).
+        let ident = Array2::<f64>::eye(p);
+        let factored = FactoredFrameKroneckerOp::new(
+            vec![p, p],
+            vec![2, 2],
+            vec![
+                FactoredFrameGBlock { atom_i: 0, atom_j: 0, g: g00.clone(), w: ident.clone() },
+                FactoredFrameGBlock { atom_i: 1, atom_j: 1, g: g11.clone(), w: ident.clone() },
+                FactoredFrameGBlock { atom_i: 0, atom_j: 1, g: g01.clone(), w: ident.clone() },
+                FactoredFrameGBlock { atom_i: 1, atom_j: 0, g: g10.clone(), w: ident.clone() },
+            ],
+        )
+        .expect("factored op");
+        // Equivalent SparseBlockKroneckerPenaltyOp (μ-major / oc-minor, p=2).
+        let sparse = SparseBlockKroneckerPenaltyOp {
+            p,
+            dim_a: 4,
+            k: 8,
+            blocks: vec![
+                SparseGBlock { row_off: 0, col_off: 0, data: g00 },
+                SparseGBlock { row_off: 2, col_off: 2, data: g11 },
+                SparseGBlock { row_off: 0, col_off: 2, data: g01 },
+                SparseGBlock { row_off: 2, col_off: 0, data: g10 },
+            ],
+        };
+        assert_eq!(factored.dim(), sparse.dim());
+        let x: Vec<f64> = (0..8).map(|i| 0.2 * (i as f64) - 0.5).collect();
+        let mut yf = vec![0.0_f64; 8];
+        let mut ys = vec![0.0_f64; 8];
+        factored.matvec(&x, &mut yf);
+        sparse.matvec(&x, &mut ys);
+        for i in 0..8 {
+            assert!(
+                (yf[i] - ys[i]).abs() < 1e-12,
+                "full-rank factored op must equal SparseBlockKronecker at {i}: {} vs {}",
+                yf[i],
+                ys[i]
+            );
         }
     }
 
