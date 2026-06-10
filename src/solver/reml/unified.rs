@@ -1985,24 +1985,27 @@ impl DriftDerivResult {
 pub type FixedDriftDerivFn =
     Box<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
 
-/// Direction-contracted second-order ψ terms for the profiled θ-HVP (#740).
+/// Direction-contracted ψψ-block second-order terms for the profiled θ-HVP
+/// (#740).
 ///
-/// One applied outer direction `α = (α_ρ, α_ψ)` contracted against the combined
-/// ψ-direction `ψ(α) = Σ_j α_ψ[j] ψ_j`, returned per ψ output row `i`. Carries
-/// BOTH the family likelihood ψψ second-order terms AND the generic penalty
-/// motion (S_ψψ and the ρψ cross S_ρψ from the ρ part of `α`), so the consumer
-/// reproduces exactly the `α`-contraction of the per-pair ψ rows the dense path
-/// assembles via `rho_ext_pair_fn` / `ext_coord_pair_fn`.
+/// The argument `alpha_psi` is the ψ slice (length `ext_dim`) of one applied
+/// outer direction. The result is the `α`-contraction over the ψ COLUMNS of
+/// every `(ψ_i, ψ_j)` second-order term against the combined ψ-direction
+/// `ψ(α) = Σ_j alpha_psi[j] ψ_j`, returned per ψ output row `i`. This covers
+/// the ψψ block ONLY — the ρρ and ρψ blocks stay in the operator's precomputed
+/// tables (they are cheap, `O(K·p²)`, and carry no family row pass), so each
+/// block is assembled in exactly one place with no overlap.
 ///
-/// Indexing of every field is the ψ output row (`ext_dim` of them, the order of
-/// `solution.ext_coords`):
-/// - `objective[i] = Σ_j α_ψ[j] V_{ψ_i ψ_j}` (+ penalty `½βᵀS_{ψ_iψ_j}β`),
-/// - `score.row(i) = Σ_j α_ψ[j] g_{ψ_i ψ_j}` (+ penalty `S_{ψ_iψ_j}β` and the
-///   ρψ cross `Σ_k α_ρ[k] S_{ρ_k ψ_i}β`), an `ext_dim × p` matrix,
+/// Indexing of every field is the ψ output row (`ext_dim` of them, in the order
+/// of `solution.ext_coords`):
+/// - `objective[i] = Σ_j α_ψ[j] V_{ψ_i ψ_j}` (likelihood + penalty
+///   `½βᵀS_{ψ_iψ_j}β`),
+/// - `score.row(i) = Σ_j α_ψ[j] g_{ψ_i ψ_j}` (likelihood + penalty
+///   `S_{ψ_iψ_j}β`), an `ext_dim × p` matrix,
 /// - `hessian[i] = Σ_j α_ψ[j] D²_ψ H_L[ψ_i, ψ_j]` (+ penalty `S_{ψ_iψ_j}`), the
 ///   `base_h2` ψψ contribution as a `tr`-able drift,
-/// - `ld_s[i] = Σ_j α_ψ[j] ∂²log|S|/∂ψ_i∂ψ_j` (+ the ρψ cross), the
-///   `pair_ld_s` ψ-row contribution.
+/// - `ld_s[i] = Σ_j α_ψ[j] ∂²log|S|/∂ψ_i∂ψ_j`, the `pair_ld_s` ψ-row
+///   contribution.
 ///
 /// One call produces every output row in a single family row pass (the family
 /// likelihood part) plus cheap block-local penalty assembly, so densifying the
@@ -11174,6 +11177,16 @@ impl HyperOperator for WeightedHyperOperator {
     }
 }
 
+/// Per-matvec contraction of the ψψ-block second-order hook (#740), with each
+/// `D²_ψ H_L` drift already traced through the logdet kernel into `base_h2`.
+/// Indexed by ψ output row `i = idx - k_rho`.
+struct PsiContractedContrib {
+    objective: Array1<f64>,
+    score: Array2<f64>,
+    ld_s: Array1<f64>,
+    base_h2: Vec<f64>,
+}
+
 struct OuterHessianCoord {
     a: f64,
     g: Array1<f64>,
@@ -11399,10 +11412,59 @@ impl UnifiedOuterHessianOperator {
         }
     }
 
+    /// Per-call contraction of the ψψ-block second-order hook (#740).
+    ///
+    /// Calls `contracted_psi` once with the ψ slice of `alpha` and pre-traces
+    /// each per-output-row `D²_ψ H_L[ψ_i, ψ(α)]` drift through the logdet kernel
+    /// so `outer_hessian_index_entry` reads scalars. Returns `None` when no hook
+    /// is installed (the ψψ block then lives entirely in the precomputed
+    /// tables). The `score` rows are carried through unchanged for injection
+    /// into the callback-correction rhs (they replace the ψψ `pair_g` the build
+    /// skipped). Indexed by ψ output row `i = idx - k_rho`.
+    fn psi_contracted_contrib(
+        &self,
+        alpha: &Array1<f64>,
+    ) -> Result<Option<PsiContractedContrib>, String> {
+        let Some(hook) = self.contracted_psi.as_ref() else {
+            return Ok(None);
+        };
+        let alpha_psi: Vec<f64> = alpha.iter().skip(self.k_rho).copied().collect();
+        let Some(contracted) = hook(&alpha_psi)? else {
+            // The hook declined this direction (e.g. a σ-aux axis carried
+            // weight): this operator must not have been built with a skipped
+            // ψψ assembly, so a decline here is a contract violation.
+            return Err(RemlError::InvalidKernelMode {
+                reason: "contracted ψψ hook declined a direction after the outer-Hessian \
+                         build skipped per-pair ψψ assembly; the build-time and apply-time \
+                         hook availability disagree"
+                    .to_string(),
+            }
+            .into());
+        };
+        let base_h2: Vec<f64> = contracted
+            .hessian
+            .iter()
+            .map(|drift| match (self.subspace.as_deref(), drift) {
+                (Some(kernel), DriftDerivResult::Dense(m)) => kernel.trace_projected_logdet(m),
+                (Some(kernel), DriftDerivResult::Operator(op)) => kernel.trace_operator(op.as_ref()),
+                (None, DriftDerivResult::Dense(m)) => self.hop.trace_logdet_gradient(m),
+                (None, DriftDerivResult::Operator(op)) => self.hop.trace_logdet_operator(op.as_ref()),
+            })
+            .collect();
+        Ok(Some(PsiContractedContrib {
+            objective: contracted.objective,
+            score: contracted.score,
+            ld_s: contracted.ld_s,
+            base_h2,
+        }))
+    }
+
     /// Per-coordinate outer-Hessian-row × `alpha` contraction shared by the
     /// `matvec` and zero-alloc `apply_into` paths. `a_alpha`,
     /// `correction_m_alpha`, and `callback_neg_m_alpha` are the
     /// alpha-dependent quantities precomputed once per call by the caller.
+    /// `psi_contrib` carries the per-call ψψ-block hook contraction (#740);
+    /// `None` keeps the ψψ block in the precomputed tables.
     fn outer_hessian_index_entry(
         &self,
         idx: usize,
@@ -11410,13 +11472,26 @@ impl UnifiedOuterHessianOperator {
         a_alpha: f64,
         correction_m_alpha: &Array1<f64>,
         callback_neg_m_alpha: Option<&Array1<f64>>,
+        psi_contrib: Option<&PsiContractedContrib>,
     ) -> Result<f64, String> {
         let coord = &self.coords[idx];
-        let pair_a = self.pair_a.row(idx).dot(alpha);
-        let pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
+        // ψ output row index into the hook contraction (when this idx is a ψ
+        // coordinate and the hook is active); `None` for ρ rows or no hook.
+        let psi_row = psi_contrib.and_then(|contrib| {
+            (idx >= self.k_rho).then(|| (contrib, idx - self.k_rho))
+        });
+        let mut pair_a = self.pair_a.row(idx).dot(alpha);
+        let mut pair_ld_s = self.pair_ld_s.row(idx).dot(alpha);
         let g_dot_v_alpha = self.g_dot_v.row(idx).dot(alpha);
-        let base_h2 = self.base_h2.row(idx).dot(alpha);
+        let mut base_h2 = self.base_h2.row(idx).dot(alpha);
         let m_terms = self.m_pair_trace.row(idx).dot(alpha);
+        if let Some((contrib, i)) = psi_row {
+            // The build skipped the ψψ-block entries of these tables; add the
+            // hook's α-contraction of the ψψ block (likelihood + ψψ penalty).
+            pair_a += contrib.objective[i];
+            pair_ld_s += contrib.ld_s[i];
+            base_h2 += contrib.base_h2[i];
+        }
 
         let cross_trace = match self.cross_trace.as_ref() {
             Some(ct) => ct.row(idx).dot(alpha),
@@ -11434,7 +11509,14 @@ impl UnifiedOuterHessianOperator {
                         .callback_second_modes
                         .as_ref()
                         .expect("callback second modes")[idx];
-                    let rhs = self.pair_rhs_combo(idx, alpha);
+                    let mut rhs = self.pair_rhs_combo(idx, alpha);
+                    // The build skipped the ψψ `pair_g`; the callback-correction
+                    // second mode-response rhs needs `−Σ_j α_j g_{ψ_i ψ_j}`,
+                    // which the hook supplies as `score.row(i)`. Inject it so the
+                    // rhs matches the dense path's `pair_rhs_combo` exactly.
+                    if let Some((contrib, i)) = psi_row {
+                        rhs.scaled_add(-1.0, &contrib.score.row(i));
+                    }
                     self.callback_correction_trace(
                         &rhs,
                         second_v,
@@ -11491,6 +11573,9 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
         let callback_neg_m_alpha =
             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
                 .then(|| -&correction_m_alpha);
+        // #740: one ψψ-block hook contraction per matvec (one family row pass),
+        // shared read-only across the parallel per-row entries below.
+        let psi_contrib = self.psi_contracted_contrib(alpha)?;
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
         let values: Result<Vec<f64>, String> = (0..self.coords.len())
@@ -11502,6 +11587,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                     a_alpha,
                     &correction_m_alpha,
                     callback_neg_m_alpha.as_ref(),
+                    psi_contrib.as_ref(),
                 )
             })
             .collect();
@@ -11550,6 +11636,8 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
         let callback_neg_m_alpha =
             matches!(self.kernel, OuterHessianDerivativeKernel::Callback { .. })
                 .then(|| -&correction_m_alpha);
+        // #740: one ψψ-block hook contraction per matvec (see `matvec`).
+        let psi_contrib = self.psi_contracted_contrib(alpha)?;
         let slice = out
             .as_slice_mut()
             .ok_or_else(|| "outer Hessian apply_into: non-contiguous output buffer".to_string())?;
@@ -11563,6 +11651,7 @@ impl crate::solver::outer_strategy::OuterHessianOperator for UnifiedOuterHessian
                     a_alpha,
                     &correction_m_alpha,
                     callback_neg_m_alpha.as_ref(),
+                    psi_contrib.as_ref(),
                 )?;
                 Ok(())
             })
@@ -11896,7 +11985,18 @@ fn build_outer_hessian_operator(
         }
     }
 
-    if let Some(ext_pair_fn) = solution.ext_coord_pair_fn.as_ref() {
+    // #740: when the direction-contracted ψψ hook is installed, the ψψ-block
+    // entries of pair_a / pair_ld_s / base_h2 and the ψψ pair_g are supplied
+    // per-matvec by the hook in a single family row pass — so SKIP this `K²`
+    // per-pair assembly entirely (each `ext_pair_fn(ii,jj)` is an O(n) family
+    // row fold and `compute_base_h2_traces` then traces each at O(n·r)). The ρρ
+    // and ρψ blocks above stay in the tables (cheap, no family row pass). The
+    // ψψ entries left zero here are exactly the ones the hook adds in
+    // `outer_hessian_index_entry`.
+    if let (Some(ext_pair_fn), None) = (
+        solution.ext_coord_pair_fn.as_ref(),
+        solution.contracted_psi_second_order.as_ref(),
+    ) {
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let pair_count = ext_dim * (ext_dim + 1) / 2;
         let entries: Vec<(usize, usize, HyperCoordPair)> = (0..pair_count)
@@ -12362,6 +12462,8 @@ fn build_outer_hessian_operator(
         leverage,
         fourth_trace,
         callback_second_modes,
+        k_rho: k,
+        contracted_psi: solution.contracted_psi_second_order.clone(),
     })
 }
 
