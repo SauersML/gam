@@ -135,8 +135,8 @@ fn output_fisher_metric() -> RowMetric {
     let rank = 1usize;
     let mut u = Array2::<f64>::zeros((N, P * rank));
     for row in 0..N {
-        u[[row, 0 * rank]] = 0.02; // loud / channel 0: almost no precision.
-        u[[row, 1 * rank]] = 1.0; // quiet / channel 1: full precision.
+        u[[row, 0]] = 0.02; // loud / channel 0: almost no precision.
+        u[[row, rank]] = 1.0; // quiet / channel 1: full precision.
     }
     RowMetric::output_fisher(Arc::new(u), P, rank).expect("OutputFisher metric must be valid PSD")
 }
