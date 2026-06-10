@@ -108,7 +108,7 @@ fn sample_circle_activations(seed: u64) -> Array2<f64> {
 }
 
 /// The synthetic quantizing readout `F: ℝ² → ℝ²`: a sharp von-Mises-weighted
-/// average of the `N_ARCS` arc-center unit vectors,
+/// average of the `n_arcs` arc-center unit vectors,
 ///
 /// ```text
 /// F(x) = Σ_j w_j(θ) (cos φ_j, sin φ_j),   w_j ∝ exp(κ cos(θ − φ_j)),
@@ -116,19 +116,19 @@ fn sample_circle_activations(seed: u64) -> Array2<f64> {
 ///
 /// with `θ = atan2(x_1, x_0)`. Smooth and differentiable everywhere, but with
 /// `κ = READOUT_SHARPNESS` it saturates to the nearest arc center across all
-/// but a thin boundary zone: the circle is *consumed as 7 arcs*. Plus
+/// but a thin boundary zone: the circle is *consumed as `n_arcs` arcs*. Plus
 /// isotropic observation noise on the image.
-fn readout_image(activations: &Array2<f64>, seed: u64) -> Array2<f64> {
+fn readout_image(activations: &Array2<f64>, n_arcs: usize, seed: u64) -> Array2<f64> {
     let mut rng = SplitMix64::new(seed ^ 0xF15_4E_AD_u64);
     let n = activations.nrows();
     let mut out = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
         let theta = activations[[i, 1]].atan2(activations[[i, 0]]);
         // Log-sum-exp-stable von-Mises weights over the arc centers.
-        let mut log_w = [0.0_f64; N_ARCS];
+        let mut log_w = vec![0.0_f64; n_arcs];
         let mut max_log = f64::NEG_INFINITY;
         for (j, lw) in log_w.iter_mut().enumerate() {
-            let phi = std::f64::consts::TAU * j as f64 / N_ARCS as f64;
+            let phi = std::f64::consts::TAU * j as f64 / n_arcs as f64;
             *lw = READOUT_SHARPNESS * (theta - phi).cos();
             max_log = max_log.max(*lw);
         }
@@ -137,7 +137,7 @@ fn readout_image(activations: &Array2<f64>, seed: u64) -> Array2<f64> {
         let mut fy = 0.0_f64;
         for (j, lw) in log_w.iter().enumerate() {
             let w = (lw - max_log).exp();
-            let phi = std::f64::consts::TAU * j as f64 / N_ARCS as f64;
+            let phi = std::f64::consts::TAU * j as f64 / n_arcs as f64;
             fx += w * phi.cos();
             fy += w * phi.sin();
             total += w;
@@ -262,7 +262,7 @@ fn circle_read_discretely_yields_two_different_verdicts() {
     let seeds = [17_u64, 59, 113];
     for &seed in &seeds {
         let activations = sample_circle_activations(seed);
-        let image = readout_image(&activations, seed);
+        let image = readout_image(&activations, N_ARCS, seed);
 
         // ---- representational verdict: the activation cloud is a circle ----
         let representational = run_race(&activations);
@@ -326,6 +326,37 @@ fn circle_read_discretely_yields_two_different_verdicts() {
             representational.circle_weight,
             computational.winner_name,
             computational.mixture_weight,
+            computational.mixture_k,
+        );
+    }
+}
+
+/// The natural first-choice readout — a 4-arc *quadrant* quantizer — which the
+/// fixture originally had to route around because the coarse mixture ladder
+/// could not name `k = 4`. With the #996 local refinement the ladder can, so
+/// the computational verdict must now recover the planted quadrant order
+/// exactly. (The representational arm on the same activations is covered by
+/// the 7-arc test above; this arm pins the off-ladder order recovery.)
+#[test]
+fn quadrant_readout_computational_verdict_recovers_k4() {
+    const QUADRANTS: usize = 4;
+    for &seed in &[23_u64, 71] {
+        let activations = sample_circle_activations(seed);
+        let image = readout_image(&activations, QUADRANTS, seed);
+        let computational = run_race(&image);
+        assert!(
+            computational.winner_name.starts_with("mixture"),
+            "seed {seed}: quadrant readout image must adjudicate DISCRETE \
+             MIXTURE, got {} (circle_w={:.4}, mixture_w={:.4}, k={})",
+            computational.winner_name,
+            computational.circle_weight,
+            computational.mixture_weight,
+            computational.mixture_k,
+        );
+        assert_eq!(
+            computational.mixture_k, QUADRANTS,
+            "seed {seed}: the refined ladder must name the planted quadrant \
+             order exactly (got k={}, planted {QUADRANTS})",
             computational.mixture_k,
         );
     }
