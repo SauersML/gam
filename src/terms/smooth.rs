@@ -6506,6 +6506,7 @@ fn build_factor_smooth(
                 inner: Box::new(inner),
                 by_col: group_col,
                 levels,
+                frozen_global_orthogonality: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
@@ -6824,6 +6825,7 @@ fn build_single_local_smooth_term(
             inner,
             by_col,
             levels,
+            ..
         } => {
             if *by_col >= data.ncols() {
                 crate::bail_dim_basis!(
@@ -7728,6 +7730,7 @@ fn build_smooth_design_withworkspace_unvalidated(
             linear_constraints_local: built.linear_constraints,
             kronecker_factored: built.kronecker_factored.take(),
             joint_null_rotation: applied_rotation,
+            unabsorbed_global_orthogonality: None,
         });
 
         col_start = col_end;
@@ -21160,6 +21163,7 @@ mod tests {
                             },
                             flavour: FactorSmoothFlavour::Sz,
                             group_frozen_levels: Some(vec![0, 1]),
+                            frozen_global_orthogonality: None,
                         },
                     },
                     shape: ShapeConstraint::None,

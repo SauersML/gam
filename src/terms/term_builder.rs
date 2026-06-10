@@ -573,6 +573,7 @@ pub fn build_termspec(
                             inner: Box::new(inner_basis),
                             by_col,
                             levels,
+                            frozen_global_orthogonality: None,
                         },
                         shape,
                         joint_null_rotation: None,
@@ -1512,6 +1513,7 @@ pub fn build_smooth_basis(
                 marginal,
                 flavour,
                 group_frozen_levels: None,
+                frozen_global_orthogonality: None,
             },
         });
     }
