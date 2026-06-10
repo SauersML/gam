@@ -772,10 +772,12 @@ mod tests {
         fn n_rows(&self) -> usize {
             1
         }
-        fn primaries(&self, _row: usize) -> Result<[f64; 3], String> {
+        fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
+            assert_eq!(row, 0, "single-row program");
             Ok([0.4, -0.7, 1.2])
         }
-        fn row_nll(&self, _row: usize, p: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
+        fn row_nll(&self, row: usize, p: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
+            assert_eq!(row, 0, "single-row program");
             let a = (p[0] * p[1]).exp();
             let b = (p[2] * p[2] + 1.0).sqrt();
             let c = (a + b).ln();
@@ -792,7 +794,8 @@ mod tests {
             fn n_rows(&self) -> usize {
                 1
             }
-            fn primaries(&self, _row: usize) -> Result<[f64; 3], String> {
+            fn primaries(&self, row: usize) -> Result<[f64; 3], String> {
+                assert_eq!(row, 0, "single-row program");
                 Ok(self.p)
             }
             fn row_nll(&self, row: usize, vars: &[Tower4<3>; 3]) -> Result<Tower4<3>, String> {
