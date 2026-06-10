@@ -950,6 +950,18 @@ mod tests {
         assert!(plan_probe_for_contested_claim(&blind, &fisher, 0.05, 0.0).is_none());
     }
 
+    /// The p→e calibrator on hand-checkable values, including its edges.
+    #[test]
+    fn p_to_e_calibrator_hand_values() {
+        // e(p) = ½ p^{−1/2}: p = 1 → e = 0.5; p = 0.04 → e = 2.5; p = 1e-4 → e = 50.
+        assert!((log_e_from_p_calibrator(1.0).unwrap() - 0.5f64.ln()).abs() < 1e-12);
+        assert!((log_e_from_p_calibrator(0.04).unwrap() - 2.5f64.ln()).abs() < 1e-12);
+        assert!((log_e_from_p_calibrator(1e-4).unwrap() - 50.0f64.ln()).abs() < 1e-12);
+        assert!(log_e_from_p_calibrator(0.0).is_err());
+        assert!(log_e_from_p_calibrator(1.5).is_err());
+        assert!(log_e_from_p_calibrator(f64::NAN).is_err());
+    }
+
     /// POWER STUDY, null side: the heuristic gate every dictionary paper
     /// runs — "accept the K+1-th atom the first time the cumulative
     /// likelihood ratio shows improvement" — versus the e-gate, on a
