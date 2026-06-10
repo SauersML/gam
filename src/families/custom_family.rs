@@ -1,6 +1,6 @@
 use crate::cache::Fingerprinter;
 use crate::faer_ndarray::FaerEigh;
-use crate::faer_ndarray::{FaerCholesky, fast_ab, fast_atb, fast_av};
+use crate::faer_ndarray::{FaerCholesky, fast_atb, fast_av};
 use crate::matrix::{
     DesignMatrix, EmbeddedColumnBlock, LinearOperator, SignedWeightsView, SymmetricMatrix,
     dense_rowwise_kronecker,
