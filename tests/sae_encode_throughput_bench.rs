@@ -30,8 +30,8 @@
 
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
-    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
-    SaeManifoldRho, SaeManifoldTerm,
+    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
+    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
