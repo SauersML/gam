@@ -22,21 +22,26 @@
 //! the isometry-penalty curvature). It is *pinned* (broken by the data or the
 //! isometry penalty) iff `ξ` has a component in `range(H)`.
 //!
-//! The RRQR builds the pinning span: an orthonormal basis `P` for `range(H)`
-//! via the same penalty-aware, leverage-scaled rank decision the audit uses.
-//! Each generator is then tested by **projection onto that span**: the pinned
-//! energy fraction `‖Pᵀξ‖²/‖ξ‖²` is the share of the generator's energy lying
-//! in curvature-carrying directions. A generator is **unpinned** iff that
-//! fraction is at the numerical noise floor ([`GENERATOR_FLAT_ENERGY_TOL`]) —
-//! the objective is genuinely flat along it. Any larger component means the
-//! orbit costs objective, so the exact symmetry is broken and the generator is
-//! **pinned** — including the *mixed* case (partly curved, partly flat), where
-//! replicate fits do NOT differ by that group element even though some flat
-//! directions remain nearby. The fraction itself is reported per generator so
-//! partial flatness stays visible instead of being collapsed into the boolean.
+//! The RRQR supplies the pinning RANK via the same penalty-aware,
+//! leverage-scaled rank decision the audit uses. Each generator's verdict,
+//! however, keeps the curvature **magnitudes**: the relative curvature
+//! fraction `‖R ξ̂‖² / σ_max(R)²` measures how much objective curvature the
+//! unit generator carries, relative to the model's stiffest direction. A
+//! generator is **unpinned** iff that fraction is within the calibrated
+//! tolerance `max(`[`GENERATOR_FLAT_ENERGY_TOL`]`, lowering_error_scale)` —
+//! genuinely flat up to numerical noise and up to the mean-frame lowering's
+//! own resolution ([`FittedAtom::lowering_error`], #995). Anything larger
+//! means the orbit costs objective, so the exact symmetry is broken and the
+//! generator is **pinned** — including the *mixed* case (partly curved,
+//! partly flat), where replicate fits do NOT differ by that group element
+//! even though some flat directions remain nearby. Magnitudes (not span
+//! membership) keep the statistic informative when `range(H)` is full-rank,
+//! which production fits always are. The fraction and the calibration scale
+//! are reported per generator so partial flatness stays visible instead of
+//! being collapsed into the boolean.
 //!
 //! The whole computation is performed in the inner product carried by the fit's
-//! [`crate::inference::row_metric::RowMetric`]: the curvature span `P` is built
+//! [`crate::inference::row_metric::RowMetric`]: the curvature root `R` is built
 //! from the metric-whitened Jacobian, so the certificate's "computed in metric
 //! X" line reads straight off [`crate::inference::row_metric::RowMetric::provenance`]
 //! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
@@ -923,15 +928,20 @@ impl GeneratorFamily {
     }
 }
 
-/// Pinned-energy noise floor for the per-generator flatness verdict: a
-/// generator is certified **unpinned** iff the fraction of its energy lying in
-/// the pinning span, `‖Pᵀξ‖²/‖ξ‖²`, is at or below this tolerance. An exact
-/// residual symmetry of the converged objective has fraction 0 up to
-/// orthonormalization roundoff; any genuinely curved component — however
-/// partial — means the orbit costs objective and the exact group element is
-/// broken, so a *mixed* generator (e.g. a frame rotation the anisotropic
-/// output-Fisher isometry pin gives partial curvature, the #980 Theorem-2
-/// situation) must be reported pinned, never as a surviving freedom.
+/// Noise floor for the per-generator flatness verdict: a generator is
+/// certified **unpinned** iff its relative curvature fraction
+/// `‖R ξ̂‖² / σ_max(R)²` (curvature along the unit generator, relative to the
+/// stiffest direction of the stacked curvature root `R`) is at or below the
+/// verdict tolerance `max(GENERATOR_FLAT_ENERGY_TOL, lowering_error_scale)`.
+///
+/// An exact residual symmetry of the converged objective has fraction 0 up to
+/// roundoff; any genuinely curved component — however partial — means the
+/// orbit costs objective and the exact group element is broken, so a *mixed*
+/// generator (e.g. a frame rotation the anisotropic output-Fisher isometry pin
+/// gives partial curvature, the #980 Theorem-2 situation) must be reported
+/// pinned, never as a surviving freedom. The `lowering_error_scale` arm of the
+/// tolerance is the #995 calibration: curvature attributable to the mean-frame
+/// compression of a curved decoder must not be read as a pin.
 pub const GENERATOR_FLAT_ENERGY_TOL: f64 = 1.0e-3;
 
 /// One enumerated symmetry generator and the certificate's verdict on it.
@@ -951,13 +961,26 @@ pub struct GeneratorVerdict {
     /// structurally trivial — e.g. a rotation of a rank-deficient frame — and
     /// is reported as pinned/absent, never as a spurious freedom).
     pub generator_norm: f64,
-    /// `‖Pᵀξ‖²/‖ξ‖²` ∈ [0, 1]: the share of the generator's energy lying in
-    /// the pinning span `range(H)`. `0` ⇒ exactly flat (unpinned), `1` ⇒ fully
-    /// pinned; strictly-interior values are the *mixed* regime — partial
-    /// curvature that breaks the exact symmetry (verdict pinned) while leaving
-    /// nearby flat directions, kept visible here rather than collapsed into the
-    /// boolean. Structurally trivial generators (zero norm) report `1.0`.
+    /// `‖R ξ̂‖² / σ_max(R)²` ∈ [0, 1]: curvature along the unit generator,
+    /// relative to the stiffest direction of the stacked curvature root `R`
+    /// (data + isometry penalty, in the metric). `0` ⇒ exactly flat, `1` ⇒ as
+    /// stiff as the stiffest direction; strictly-interior values are the
+    /// *mixed* regime — partial curvature that breaks the exact symmetry
+    /// (verdict pinned when above the tolerance) while leaving nearby flat
+    /// directions, kept visible here rather than collapsed into the boolean.
+    /// Relative-to-σ_max (not span membership) so the statistic stays
+    /// informative when the pinning span is full-rank, which production fits
+    /// always are. Structurally trivial generators (zero norm) report `1.0`.
     pub pinned_energy_fraction: f64,
+    /// The #995 lowering-error arm of this generator's verdict tolerance: the
+    /// largest [`FittedAtom::lowering_error`] over the atoms the generator
+    /// touches (its own atom for within-atom families, the exchanged pair for
+    /// permutations, all atoms for global output-frame rotations). The verdict
+    /// is `unpinned ⇔ pinned_energy_fraction ≤
+    /// max(GENERATOR_FLAT_ENERGY_TOL, lowering_error_scale)` — curvature the
+    /// mean-frame compression cannot distinguish from gauge motion is never
+    /// read as a pin.
+    pub lowering_error_scale: f64,
 }
 
 /// The #972 decoder-frame **inner-rotation gauge**, enumerated for the
@@ -1296,8 +1319,10 @@ fn embed_local_generator(offset: usize, local: &Array1<f64>, param_dim: usize) -
     g
 }
 
-fn atom_permutation_generators(model: &FittedSaeManifold) -> Vec<(Array1<f64>, String)> {
-    let mut out: Vec<(Array1<f64>, String)> = Vec::new();
+fn atom_permutation_generators(
+    model: &FittedSaeManifold,
+) -> Vec<(Array1<f64>, String, usize, usize)> {
+    let mut out: Vec<(Array1<f64>, String, usize, usize)> = Vec::new();
     let param_dim = model.param_dim();
     for ka in 0..model.atoms.len() {
         for kb in (ka + 1)..model.atoms.len() {
@@ -1317,23 +1342,25 @@ fn atom_permutation_generators(model: &FittedSaeManifold) -> Vec<(Array1<f64>, S
                     g[base_b + i * ad + c] = -diff;
                 }
             }
-            out.push((g, format!("atom-exchange {} ↔ {}", a.name, b.name)));
+            out.push((g, format!("atom-exchange {} ↔ {}", a.name, b.name), ka, kb));
         }
     }
     out
 }
 
-/// Orthonormal basis for the pinning span `range(H)` in the fit's metric.
+/// The stacked curvature root `R` of the pinning operator, in the fit's
+/// metric: `(m, param_dim)` with `H = H_data + H_isometry = RᵀR`.
 ///
-/// `H = H_data + H_isometry`. We assemble the stacked root
-/// `R = [ W^{½} J ; R_isom ]` whose row space is `range(H_data) + range(H_isometry)`
-/// (since `H = RᵀR`), where `W^{½} J` is the metric-whitened decoder Jacobian
-/// (the metric whitening is the `RowMetric`'s `whiten_residual_row` applied to
-/// each output residual basis vector — i.e. each Jacobian row is whitened in the
-/// same inner product the likelihood sums). An orthonormal basis for that row
-/// space — equivalently for `range(H)` — is the kept-column space of an RRQR on
-/// `Rᵀ`; we return it as `(param_dim, pinning_rank)`.
-fn pinning_span_basis(model: &FittedSaeManifold) -> Result<Array2<f64>, String> {
+/// We assemble `R = [ W^{½} J ; R_isom ]` whose row space is
+/// `range(H_data) + range(H_isometry)`, where `W^{½} J` is the metric-whitened
+/// decoder Jacobian (the metric whitening is the `RowMetric`'s
+/// `whiten_residual_row` applied to each output residual basis vector — i.e.
+/// each Jacobian row is whitened in the same inner product the likelihood
+/// sums). The caller derives both faces from this one object: the pinning
+/// RANK (RRQR on `Rᵀ`, the audit's leverage-scaled rank decision) and the
+/// per-generator relative curvature `‖R ξ̂‖² / σ_max(R)²` — magnitudes kept,
+/// not orthonormalized away, so the statistic survives a full-rank span.
+fn stacked_curvature_root(model: &FittedSaeManifold) -> Result<Array2<f64>, String> {
     let param_dim = model.param_dim();
     if param_dim == 0 {
         return Ok(Array2::<f64>::zeros((0, 0)));
@@ -1348,7 +1375,7 @@ fn pinning_span_basis(model: &FittedSaeManifold) -> Result<Array2<f64>, String> 
     for (n, j_flat) in model.jacobian_rows.iter().enumerate() {
         if j_flat.len() != p * param_dim {
             return Err(format!(
-                "pinning_span_basis: jacobian_rows[{n}] has len {} but expected p*param_dim = {}*{} = {}",
+                "stacked_curvature_root: jacobian_rows[{n}] has len {} but expected p*param_dim = {}*{} = {}",
                 j_flat.len(),
                 p,
                 param_dim,
@@ -1384,7 +1411,7 @@ fn pinning_span_basis(model: &FittedSaeManifold) -> Result<Array2<f64>, String> 
     if model.isometry_penalty_root.ncols() != 0 {
         if model.isometry_penalty_root.ncols() != param_dim {
             return Err(format!(
-                "pinning_span_basis: isometry_penalty_root has {} cols but param_dim = {param_dim}",
+                "stacked_curvature_root: isometry_penalty_root has {} cols but param_dim = {param_dim}",
                 model.isometry_penalty_root.ncols()
             ));
         }
@@ -1393,43 +1420,14 @@ fn pinning_span_basis(model: &FittedSaeManifold) -> Result<Array2<f64>, String> 
         }
     }
     if stacked_rows.is_empty() {
-        return Ok(Array2::<f64>::zeros((param_dim, 0)));
+        return Ok(Array2::<f64>::zeros((0, param_dim)));
     }
     let m = stacked_rows.len();
     let mut r_mat = Array2::<f64>::zeros((m, param_dim));
     for (i, row) in stacked_rows.iter().enumerate() {
         r_mat.row_mut(i).assign(row);
     }
-    // Orthonormal basis for row-space of R = range(H): RRQR on Rᵀ
-    // (param_dim × m) reveals the rank AND names which `rank` columns of `Rᵀ`
-    // are linearly independent (the leading entries of `column_permutation`).
-    // This is the same penalty-aware, leverage-scaled rank decision the
-    // identifiability audit uses — here applied to the curvature root.
-    let r_t = r_mat.t().to_owned();
-    let rrqr = rrqr_with_permutation(&r_t, default_rrqr_rank_alpha())
-        .map_err(|e| format!("pinning_span_basis: RRQR on Rᵀ failed: {e:?}"))?;
-    let rank = rrqr.rank;
-    if rank == 0 {
-        return Ok(Array2::<f64>::zeros((param_dim, 0)));
-    }
-    // Gather exactly the `rank` independent columns of `Rᵀ` named by the RRQR
-    // pivot, then thin-QR that full-rank `(param_dim, rank)` block to get an
-    // orthonormal basis of range(R) = range(H). Using the pivoted subset (not
-    // the leading `rank` raw columns) is essential: the raw leading columns may
-    // be rank-deficient, in which case a plain QR of them would NOT span
-    // range(H).
-    let mut r_t_indep = Array2::<f64>::zeros((param_dim, rank));
-    for (out_c, &src_c) in rrqr.column_permutation[..rank].iter().enumerate() {
-        r_t_indep.column_mut(out_c).assign(&r_t.column(src_c));
-    }
-    // The thin Q is (param_dim, rank); its columns are an orthonormal basis of
-    // range(H). Guard the column count in case the bridge returns a wider Q.
-    let q = r_t_indep
-        .qr()
-        .map_err(|e| format!("pinning_span_basis: thin QR of pivoted subset failed: {e:?}"))?
-        .0;
-    let kept = q.slice(s![.., ..rank.min(q.ncols())]).to_owned();
-    Ok(kept)
+    Ok(r_mat)
 }
 
 /// Evaluate the identifiability rank machinery on the symmetry generators of a
@@ -1444,22 +1442,27 @@ fn pinning_span_basis(model: &FittedSaeManifold) -> Result<Array2<f64>, String> 
 ///    ([`equal_ard_rotation_generators`]), global output-frame rotations
 ///    ([`frame_rotation_generators`]), and exchangeable-atom permutations
 ///    ([`atom_permutation_generators`]).
-/// 2. Build an orthonormal basis `P` for the pinning span `range(H)` =
-///    `range(H_data) + range(H_isometry)` in the fit's [`RowMetric`]
-///    ([`pinning_span_basis`]).
-/// 3. For each generator `ξ`, project onto the span: the pinned energy
-///    fraction `‖Pᵀξ‖²/‖ξ‖²` is the share of the generator's energy lying in
-///    curvature-carrying directions. `ξ` is **unpinned** (a residual gauge
-///    freedom) iff that fraction is at the noise floor
-///    ([`GENERATOR_FLAT_ENERGY_TOL`]) — the converged objective is genuinely
-///    flat along it (`ξ ∈ ker(H)`). Any larger fraction — including the
-///    *mixed* regime where `ξ` carries both a curved and a flat component —
-///    means the orbit costs objective, the exact group element is broken, and
-///    the generator is **pinned**. (A rank-increase test on `[ P | ξ ]` would
-///    misclassify the mixed regime as a surviving freedom: rank increases
-///    whenever ANY flat component exists, even though replicate fits do not
-///    differ by `exp(tξ)` when part of `ξ` is curved.) The fraction is
-///    reported per generator so partial flatness stays visible.
+/// 2. Build the stacked curvature root `R` of the pinning operator
+///    `H = H_data + H_isometry = RᵀR` in the fit's [`RowMetric`]
+///    ([`stacked_curvature_root`]); the pinning RANK is the audit's RRQR rank
+///    of `R`, reported alongside.
+/// 3. For each generator `ξ`, the **relative curvature fraction**
+///    `‖R ξ̂‖² / σ_max(R)²` measures the curvature the converged objective has
+///    along the unit generator, relative to the model's stiffest direction.
+///    `ξ` is **unpinned** (a residual gauge freedom) iff that fraction is at
+///    or below the calibrated tolerance
+///    `max(`[`GENERATOR_FLAT_ENERGY_TOL`]`, lowering_error_scale)` — flat up
+///    to numerical noise and the mean-frame lowering's own resolution
+///    ([`FittedAtom::lowering_error`], #995). Any larger fraction — including
+///    the *mixed* regime where `ξ` carries both a curved and a flat component
+///    — means the orbit costs objective, the exact group element is broken,
+///    and the generator is **pinned**. (A span-membership or rank-increase
+///    test degenerates when `R` is full-rank, which production fits always
+///    are: every direction is "in the span", so verdicts would collapse to
+///    all-pinned regardless of magnitudes. Keeping the curvature magnitudes
+///    is what lets a genuinely flat direction stay visible inside a full-rank
+///    span.) The fraction and the calibration scale are reported per
+///    generator so partial flatness stays visible.
 ///
 /// # Escalations
 ///
@@ -1481,7 +1484,13 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
     // local generator is embedded at its atom's offset here. (Single-atom
     // models have local == joint, which is why only multi-atom models can
     // expose a missed embedding.)
-    let mut gens: Vec<(GeneratorFamily, Array1<f64>, String)> = Vec::new();
+    // Each generator carries its #995 lowering-error tolerance scale: the
+    // largest `lowering_error` over the atoms it touches.
+    let scale_of = |k: usize| -> f64 { model.atoms[k].lowering_error.clamp(0.0, 1.0) };
+    let global_scale = (0..model.atoms.len())
+        .map(scale_of)
+        .fold(0.0_f64, f64::max);
+    let mut gens: Vec<(GeneratorFamily, Array1<f64>, String, f64)> = Vec::new();
     for (k, atom) in model.atoms.iter().enumerate() {
         let base = model.atom_offset(k);
         for (g, desc) in atom_isometry_generators(atom) {
@@ -1489,6 +1498,7 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
                 GeneratorFamily::IsomAtom,
                 embed_local_generator(base, &g, param_dim),
                 desc,
+                scale_of(k),
             ));
         }
         for (g, desc) in equal_ard_rotation_generators(atom) {
@@ -1496,26 +1506,46 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
                 GeneratorFamily::EqualArdRotation,
                 embed_local_generator(base, &g, param_dim),
                 desc,
+                scale_of(k),
             ));
         }
     }
     for (g, desc) in frame_rotation_generators(model) {
-        gens.push((GeneratorFamily::FrameRotation, g, desc));
+        // A global output rotation moves every atom's frame at once.
+        gens.push((GeneratorFamily::FrameRotation, g, desc, global_scale));
     }
-    for (g, desc) in atom_permutation_generators(model) {
-        gens.push((GeneratorFamily::AtomPermutation, g, desc));
+    for (g, desc, ka, kb) in atom_permutation_generators(model) {
+        gens.push((
+            GeneratorFamily::AtomPermutation,
+            g,
+            desc,
+            scale_of(ka).max(scale_of(kb)),
+        ));
     }
 
-    // 2. Pinning span basis in the metric.
-    let p_basis = pinning_span_basis(model)?;
-    let pinning_rank = p_basis.ncols();
+    // 2. Stacked curvature root in the metric; pinning rank via the audit's
+    // RRQR on Rᵀ, stiffness scale σ_max via SVD (magnitudes kept).
+    let root = stacked_curvature_root(model)?;
+    let (pinning_rank, sigma_max_sq) = if root.nrows() == 0 {
+        (0usize, 0.0_f64)
+    } else {
+        let r_t = root.t().to_owned();
+        let rrqr = rrqr_with_permutation(&r_t, default_rrqr_rank_alpha())
+            .map_err(|e| format!("residual_gauge: RRQR on Rᵀ failed: {e:?}"))?;
+        let (_u, sv, _vt) = root
+            .svd(false, false)
+            .map_err(|e| format!("residual_gauge: SVD of curvature root failed: {e}"))?;
+        let smax = sv.iter().cloned().fold(0.0_f64, f64::max);
+        (rrqr.rank, smax * smax)
+    };
 
     // The isometry pin is inactive ⇒ diffeomorphism-unpinned escalation.
     let diffeomorphism_unpinned = model.isometry_penalty_root.nrows() == 0;
 
-    // 3. Per-generator flatness verdict by projection onto the pinning span.
+    // 3. Per-generator flatness verdict: relative curvature vs the calibrated
+    // tolerance.
     let mut verdicts: Vec<GeneratorVerdict> = Vec::with_capacity(gens.len());
-    for (family, g, description) in &gens {
+    for (family, g, description, lowering_error_scale) in &gens {
         let norm = g.iter().map(|v| v * v).sum::<f64>().sqrt();
         // A structurally trivial generator (rotation of a rank-deficient frame,
         // zero swap) carries no direction — it cannot be a residual freedom.
@@ -1527,32 +1557,36 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
                 unpinned: false,
                 generator_norm: 0.0,
                 pinned_energy_fraction: 1.0,
+                lowering_error_scale: *lowering_error_scale,
             });
             continue;
         }
-        // Pinned energy fraction ‖Pᵀξ̂‖² of the unit generator ξ̂ = ξ/‖ξ‖.
-        // P is orthonormal (thin QR of the pivoted curvature root), so this is
-        // exactly the squared cosine of the principal angle between ξ and
-        // range(H). Unpinned ⇔ flat ⇔ fraction at the noise floor. A MIXED
-        // generator (strictly interior fraction) is pinned: its orbit costs
-        // objective, so the exact symmetry does not survive — the old
-        // rank-increase test on [P|ξ] would have called any nonzero flat
-        // component a freedom, under-claiming identification (#980 Theorem-2
-        // arm is exactly such a mixed case).
-        let pinned_energy_fraction = if pinning_rank == 0 {
+        // Relative curvature fraction ‖R ξ̂‖² / σ_max(R)² of the unit
+        // generator ξ̂ = ξ/‖ξ‖. Exactly flat directions score 0 even inside a
+        // full-rank span (production fits!), where the previous
+        // span-membership rule degenerated to all-pinned. A MIXED generator
+        // (strictly interior fraction) above the tolerance is pinned: its
+        // orbit costs objective, so the exact symmetry does not survive
+        // (#980 Theorem-2 arm). The tolerance is calibrated by the #995
+        // lowering-error scale: curvature the mean-frame compression cannot
+        // distinguish from gauge motion must not be read as a pin — the
+        // certificate refuses to claim resolution it does not have.
+        let pinned_energy_fraction = if sigma_max_sq <= f64::MIN_POSITIVE {
             0.0
         } else {
             let unit = g.mapv(|v| v / norm);
-            let coeffs = p_basis.t().dot(&unit);
-            coeffs.iter().map(|c| c * c).sum::<f64>().clamp(0.0, 1.0)
+            let r_xi = root.dot(&unit);
+            (r_xi.iter().map(|c| c * c).sum::<f64>() / sigma_max_sq).clamp(0.0, 1.0)
         };
-        let unpinned = pinned_energy_fraction <= GENERATOR_FLAT_ENERGY_TOL;
+        let tolerance = GENERATOR_FLAT_ENERGY_TOL.max(*lowering_error_scale);
+        let unpinned = pinned_energy_fraction <= tolerance;
         verdicts.push(GeneratorVerdict {
             family: *family,
             description: description.clone(),
             unpinned,
             generator_norm: norm,
             pinned_energy_fraction,
+            lowering_error_scale: *lowering_error_scale,
         });
     }
 

@@ -3224,7 +3224,7 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
 /// The genuine-dispersion mean family whose precision (overdispersion) channel
 /// can carry a second `noise_formula` linear predictor (issue #913).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum DispersionFamilyKind {
+pub enum DispersionFamilyKind {
     /// NB2: `Var = μ + μ²/θ`; the precision channel models `log θ`.
     NegativeBinomial,
     /// Gamma with `Var = μ²/ν`; the precision channel models `log ν` (shape).
@@ -3242,7 +3242,7 @@ pub(crate) enum DispersionFamilyKind {
 }
 
 impl DispersionFamilyKind {
-    pub(crate) const fn family_tag(self) -> &'static str {
+    pub const fn family_tag(self) -> &'static str {
         match self {
             DispersionFamilyKind::NegativeBinomial => FAMILY_NEGBIN_LOCATION_SCALE,
             DispersionFamilyKind::Gamma => FAMILY_GAMMA_LOCATION_SCALE,
@@ -3257,10 +3257,10 @@ impl DispersionFamilyKind {
     }
 }
 
-pub(crate) const FAMILY_NEGBIN_LOCATION_SCALE: &str = "negbin-location-scale";
-pub(crate) const FAMILY_GAMMA_LOCATION_SCALE: &str = "gamma-location-scale";
-pub(crate) const FAMILY_BETA_LOCATION_SCALE: &str = "beta-location-scale";
-pub(crate) const FAMILY_TWEEDIE_LOCATION_SCALE: &str = "tweedie-location-scale";
+pub const FAMILY_NEGBIN_LOCATION_SCALE: &str = "negbin-location-scale";
+pub const FAMILY_GAMMA_LOCATION_SCALE: &str = "gamma-location-scale";
+pub const FAMILY_BETA_LOCATION_SCALE: &str = "beta-location-scale";
+pub const FAMILY_TWEEDIE_LOCATION_SCALE: &str = "tweedie-location-scale";
 
 /// `η` magnitude clamp shared by both channels (mirrors PIRLS `ETA_CLAMP`):
 /// keeps `exp(η)` and the logit jet away from overflow while staying in the
@@ -3581,7 +3581,7 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
 /// Term spec consumed by [`fit_dispersion_glm_location_scale_terms`]; mirrors
 /// [`GaussianLocationScaleTermSpec`] with the dispersion channel in place of
 /// the Gaussian log-σ channel.
-pub(crate) struct DispersionGlmLocationScaleTermSpec {
+pub struct DispersionGlmLocationScaleTermSpec {
     pub kind: DispersionFamilyKind,
     pub y: Array1<f64>,
     pub weights: Array1<f64>,
@@ -3811,7 +3811,7 @@ impl LocationScaleFamilyBuilder for DispersionGlmLocationScaleTermBuilder {
 /// Fit a dispersion-channel GAMLSS location-scale model (#913). All four
 /// genuine-dispersion mean families share this single entry; the per-family
 /// likelihood lives in [`dispersion_row_kernel`].
-pub(crate) fn fit_dispersion_glm_location_scale_terms(
+pub fn fit_dispersion_glm_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: DispersionGlmLocationScaleTermSpec,
     options: &BlockwiseFitOptions,

@@ -3605,7 +3605,57 @@ impl SaeManifoldTerm {
             last_row_layout: None,
             row_metric: None,
             collapse_events: Vec::new(),
+            row_loss_weights: None,
         })
+    }
+
+    /// Install per-row design honesty weights (#991) — the `1/π` inclusion
+    /// corrections of a designed corpus subsample (see the field docs on
+    /// `row_loss_weights` for exactly where they enter the objective).
+    ///
+    /// Weights must be finite and strictly positive, one per term row. They
+    /// are self-normalized to mean `1.0` here (only the *relative* design
+    /// correction matters at the fitted sample size; the absolute `n/budget`
+    /// scale would silently inflate the dispersion estimate against the
+    /// sample-sized dof). Weights that are identically equal after
+    /// normalization (an exact full pass, or any uniform design) are stored
+    /// as `None`, so the unweighted path stays bit-for-bit identical rather
+    /// than "multiplied by 1.0".
+    pub fn set_row_loss_weights(&mut self, weights: Vec<f64>) -> Result<(), String> {
+        if weights.len() != self.n_obs() {
+            return Err(format!(
+                "SaeManifoldTerm::set_row_loss_weights: {} weights for {} rows",
+                weights.len(),
+                self.n_obs()
+            ));
+        }
+        if weights.is_empty() {
+            self.row_loss_weights = None;
+            return Ok(());
+        }
+        if !weights.iter().all(|w| w.is_finite() && *w > 0.0) {
+            return Err(
+                "SaeManifoldTerm::set_row_loss_weights: weights must be finite and strictly \
+                 positive"
+                    .to_string(),
+            );
+        }
+        let first = weights[0];
+        if weights.iter().all(|w| *w == first) {
+            // Uniform design (full pass, or flat measure): the normalized
+            // weight is exactly 1 everywhere — take the unweighted path.
+            self.row_loss_weights = None;
+            return Ok(());
+        }
+        let mean = weights.iter().sum::<f64>() / weights.len() as f64;
+        self.row_loss_weights = Some(weights.into_iter().map(|w| w / mean).collect());
+        Ok(())
+    }
+
+    /// The installed (mean-1 normalized) design honesty weights, `None` on the
+    /// exact unweighted path.
+    pub fn row_loss_weights(&self) -> Option<&[f64]> {
+        self.row_loss_weights.as_deref()
     }
 
     /// Install the single per-row [`RowMetric`](crate::inference::row_metric::RowMetric)
@@ -3777,6 +3827,37 @@ impl SaeManifoldTerm {
                 frame.mapv_inplace(|v| v * inv);
             }
 
+            // #995 lowering-error scale: mass-weighted relative dispersion of
+            // the per-row tangents around the mean frame just built,
+            //   Σ_n a_n Σ_ax ‖t_ax(n) − frame[:,ax]‖² / Σ_n a_n Σ_ax ‖t_ax(n)‖².
+            // 0 ⇒ the frame represents every active row exactly (flat
+            // decoder); → 1 ⇒ the tangent field disperses so strongly (e.g. a
+            // full circle, whose tangents average out) that the mean-frame
+            // compression cannot distinguish gauge motion from curvature. The
+            // certificate calibrates its per-generator verdict tolerance to
+            // this scale so it never claims a pin it cannot resolve.
+            let mut disp_num = 0.0_f64;
+            let mut disp_den = 0.0_f64;
+            for row in 0..n {
+                let a_nk = assignments[[row, atom_idx]];
+                if !(a_nk > 0.0) {
+                    continue;
+                }
+                for axis in 0..d {
+                    atom.fill_decoded_derivative_row(row, axis, &mut tangent);
+                    for i in 0..p {
+                        let dev = tangent[i] - frame[[i, axis]];
+                        disp_num += a_nk * dev * dev;
+                        disp_den += a_nk * tangent[i] * tangent[i];
+                    }
+                }
+            }
+            let lowering_error = if disp_den > 0.0 {
+                (disp_num / disp_den).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+
             let ard_variances = per_atom_ard_variances
                 .and_then(|all| all.get(atom_idx))
                 .and_then(|opt| opt.clone())
@@ -3787,6 +3868,7 @@ impl SaeManifoldTerm {
                 topology,
                 frame,
                 ard_variances,
+                lowering_error,
             });
             atom_offsets.push(cursor);
             atom_axis_dim.push(d);
@@ -4432,19 +4514,27 @@ impl SaeManifoldTerm {
             .as_ref()
             .is_some_and(|metric| metric.whitens_likelihood());
         let mut resid_row = ndarray::Array1::<f64>::zeros(target.ncols());
+        // #991 design honesty weights: the reconstruction channel of row `i`
+        // is weighted by `w_i` (mean-1 HT inclusion correction). The assembly
+        // applies the same `w_i` via a `√w_i` scaling of the row residual /
+        // Jacobian / β load at its single seam, so this value and that
+        // gradient/Hessian carry the identical per-row factor. `None` ⇒ the
+        // historical unweighted sum, bit-for-bit.
+        let row_loss_w = self.row_loss_weights.as_deref();
         for row in 0..target.nrows() {
+            let w_row = row_loss_w.map_or(1.0, |w| w[row]);
             for out_col in 0..target.ncols() {
                 resid_row[out_col] = target[[row, out_col]] - fitted[[row, out_col]];
             }
             match self.row_metric.as_ref() {
                 Some(metric) if whitens => {
                     for w in metric.whiten_residual_row(row, resid_row.view()) {
-                        data_fit += 0.5 * w * w;
+                        data_fit += 0.5 * w_row * w * w;
                     }
                 }
                 _ => {
                     for &r in resid_row.iter() {
-                        data_fit += 0.5 * r * r;
+                        data_fit += 0.5 * w_row * r * r;
                     }
                 }
             }
@@ -5065,6 +5155,9 @@ impl SaeManifoldTerm {
             _ => None,
         };
         let ibp_prior_slice = ibp_prior_vec.as_deref();
+        // #991 design honesty weights (mean-1 HT inclusion corrections); see
+        // the seam comment at the per-row residual below.
+        let row_loss_w = self.row_loss_weights.as_deref();
         // Scratch buffer for per-(row, atom) decoded outputs. The full `decoded`
         // matrix retains all atoms for this row so the assignment-Jacobian
         // helper can read it.
@@ -5122,6 +5215,24 @@ impl SaeManifoldTerm {
             for out_col in 0..p {
                 error[out_col] = fitted[out_col] - target[[row, out_col]];
             }
+            // #991 design-honesty seam: a per-row scalar weight `w_row` on the
+            // reconstruction channel is exactly the metric `w_row · I_p`, so it
+            // is realized as a `√w_row` scaling of the THREE row-local data
+            // quantities at their construction sites — this residual, the
+            // latent Jacobian (below), and the β basis load `a·φ` (below).
+            // Every downstream data object then carries exactly one factor of
+            // `w_row` (gt, htt, htbeta, the β Gram `G`, and the β gradient),
+            // matching the `w_row`-weighted value `loss_scaled` sums; the
+            // per-row latent priors (assignment / ARD, added to `gt`/`htt`
+            // further down) are deliberately unweighted — see the
+            // `row_loss_weights` field docs. `None` ⇒ `sqrt_row_w == 1.0` and
+            // no multiply is applied (bit-identical unweighted path).
+            let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
+            if sqrt_row_w != 1.0 {
+                for out_col in 0..p {
+                    error[out_col] *= sqrt_row_w;
+                }
+            }
             // #974 seam (step 1/2): whiten the per-row residual ONCE.
             //   * not whitening ⇒ `error_white == error` (length p) and
             //     `error_metric == error`; every downstream loop is the
@@ -5154,7 +5265,7 @@ impl SaeManifoldTerm {
             //     (logit > threshold − MARGIN·τ) enter.
             //   * IBP-MAP at large K: only the top-`k_active` atoms.
             //   * Otherwise (small K): the dense uniform-q layout.
-            let (q_row, local_jac_row) = if let Some(ref layout) = row_layout {
+            let (q_row, mut local_jac_row) = if let Some(ref layout) = row_layout {
                 let active = &layout.active_atoms[row];
                 let starts = &layout.coord_starts[row];
                 let q_active = layout.row_q_active(row);
@@ -5221,6 +5332,20 @@ impl SaeManifoldTerm {
                 }
                 (q, jac_row)
             };
+
+            // #991 design-honesty seam, Jacobian leg: scale the row's latent
+            // Jacobian by `√w_row` BEFORE the whitening / Kronecker capture so
+            // htt (= J̃J̃ᵀ), the data part of gt (= J̃ẽ, the residual already
+            // carries its own √w_row), and the htbeta cross block (J paired
+            // with the √w_row-scaled β load below) each carry exactly one
+            // factor of `w_row`. No-op on the unweighted path.
+            if sqrt_row_w != 1.0 {
+                for a in 0..q_row {
+                    for out_col in 0..p {
+                        local_jac_row[[a, out_col]] *= sqrt_row_w;
+                    }
+                }
+            }
 
             // #974 seam (step 2/2): whiten the per-row Jacobian through the SAME
             // metric the residual was whitened by. `jac_white[a*w_dim + k]` holds
@@ -5408,7 +5533,11 @@ impl SaeManifoldTerm {
                 let mut wphi = Vec::with_capacity(m);
                 for basis_col in 0..m {
                     let phi = atom.basis_values[[row, basis_col]];
-                    let w = a_k * phi;
+                    // #991 design-honesty seam, β leg: the `√w_row` here pairs
+                    // with the `√w_row` on the residual (β gradient =
+                    // `a·φ · M r` ⇒ w_row) and with itself (β Gram `G` and the
+                    // htbeta Kronecker capture ⇒ w_row). `1.0` when unweighted.
+                    let w = a_k * phi * sqrt_row_w;
                     a_phi.push((atom_beta_off + basis_col * p, w));
                     wphi.push(w);
                 }
@@ -6171,6 +6300,13 @@ impl SaeManifoldTerm {
                 .map(|coord| coord.as_matrix().slice(s![start..end, ..]).to_owned())
                 .collect();
             let mut chunk = self.materialize_chunk(chunk_logits, chunk_coords)?;
+            // #991: chunk terms inherit the row's design honesty weight slice
+            // (global mean-1 normalization preserved — NOT re-normalized per
+            // chunk — so the per-chunk sums reconstruct the global weighted
+            // objective exactly).
+            if let Some(w) = self.row_loss_weights.as_deref() {
+                chunk.row_loss_weights = Some(w[start..end].to_vec());
+            }
             let z_chunk = target.slice(s![start..end, ..]);
             let sys = chunk
                 .assemble_arrow_schur_scaled(z_chunk, rho, registry, penalty_scale)
@@ -8757,6 +8893,11 @@ impl SaeManifoldTerm {
                     ));
                 }
                 let mut chunk = self.materialize_chunk(logits, coords)?;
+                // #991: inherit the design honesty weight slice (see
+                // streaming_exact_arrow_log_det for the no-renormalize rule).
+                if let Some(w) = self.row_loss_weights.as_deref() {
+                    chunk.row_loss_weights = Some(w[start..end].to_vec());
+                }
                 chunk_ranges.push((start, end));
                 pre_step_total += chunk.penalized_objective_total(
                     z_chunk.view(),
@@ -8927,7 +9068,12 @@ impl SaeManifoldTerm {
             let n_chunk = end - start;
             let penalty_scale = n_chunk as f64 / n_total as f64;
             let (logits, coords, z_chunk) = chunk_init(start, end)?;
-            let chunk = self.materialize_chunk(logits, coords)?;
+            let mut chunk = self.materialize_chunk(logits, coords)?;
+            // #991: inherit the design honesty weight slice (global mean-1
+            // normalization preserved; see streaming_exact_arrow_log_det).
+            if let Some(w) = self.row_loss_weights.as_deref() {
+                chunk.row_loss_weights = Some(w[start..end].to_vec());
+            }
             let loss = chunk.loss_scaled(z_chunk.view(), rho, penalty_scale)?;
             data_fit += loss.data_fit;
             assignment_sparsity += loss.assignment_sparsity;
@@ -8962,7 +9108,12 @@ impl SaeManifoldTerm {
             let n_chunk = end - start;
             let penalty_scale = n_chunk as f64 / n_total as f64;
             let (logits, coords, z_chunk) = chunk_init(start, end)?;
-            let chunk = self.materialize_chunk(logits, coords)?;
+            let mut chunk = self.materialize_chunk(logits, coords)?;
+            // #991: inherit the design honesty weight slice (global mean-1
+            // normalization preserved; see streaming_exact_arrow_log_det).
+            if let Some(w) = self.row_loss_weights.as_deref() {
+                chunk.row_loss_weights = Some(w[start..end].to_vec());
+            }
             let loss = chunk.loss_scaled(z_chunk.view(), rho, penalty_scale)?;
             data_fit += loss.data_fit;
             assignment_sparsity += loss.assignment_sparsity;

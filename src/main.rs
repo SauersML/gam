@@ -114,7 +114,8 @@ use gam::types::{
     WigglePenaltyConfig,
 };
 use gam::{
-    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, FitRequest, FitResult,
+    BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest,
+    DispersionLocationScaleFitRequest, FitRequest, FitResult,
     GaussianLocationScaleFitRequest, LatentBinaryFitRequest, LatentSurvivalFitRequest,
     LinkWiggleConfig, PreparedSurvivalTimeStack, StandardBinomialWiggleConfig, StandardFitRequest,
     SurvivalLocationScaleFitRequest, SurvivalMarginalSlopeFitRequest,
@@ -2315,9 +2316,133 @@ fn run_fitwith_predict_noise(
         return Ok(());
     }
 
+    // Genuine-dispersion mean families (NegativeBinomial / Gamma / Beta /
+    // Tweedie): `noise_formula` models the overdispersion channel (#913).
+    if let Some(kind) = dispersion_location_scale_kind_for_cli(&family.response) {
+        if formula_linkwiggle.is_some() {
+            return Err(format!(
+                "link-wiggle is not supported for {} location-scale models",
+                kind.family_tag()
+            ));
+        }
+        let options = blockwise_options_from_fit_args()?;
+        progress.set_stage("fit", "optimizing dispersion location-scale model");
+        let phase_start = std::time::Instant::now();
+        log::info!(
+            "[PHASE] dispersion-location-scale ({}) fit start n={}",
+            kind.family_tag(),
+            ds.values.nrows()
+        );
+        let solved = match fit_model(FitRequest::DispersionLocationScale(
+            DispersionLocationScaleFitRequest {
+                data: ds.values.view(),
+                spec: gam::gamlss::DispersionGlmLocationScaleTermSpec {
+                    kind,
+                    y: y.clone(),
+                    weights: weights.clone(),
+                    meanspec: meanspec.clone(),
+                    log_dispspec: noisespec.clone(),
+                    mean_offset,
+                    log_disp_offset: noise_offset,
+                },
+                options,
+                kappa_options: kappa_options.clone(),
+            },
+        )) {
+            Ok(FitResult::DispersionLocationScale(result)) => {
+                log::info!(
+                    "[PHASE] dispersion-location-scale fit end elapsed={:.3}s",
+                    phase_start.elapsed().as_secs_f64()
+                );
+                result
+            }
+            Ok(_) => {
+                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
+                return Err(
+                    "internal dispersion location-scale workflow returned the wrong result variant"
+                        .to_string(),
+                );
+            }
+            Err(e) => {
+                emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
+                return Err(format!("dispersion location-scale fit failed: {e}"));
+            }
+        };
+        progress.advance_workflow(3);
+        let fit = solved.fit.fit;
+        let frozen_meanspec = freeze_term_collection_from_design(
+            &solved.fit.meanspec_resolved,
+            &solved.fit.mean_design,
+        )
+        .map_err(|e| e.to_string())?;
+        let frozen_noisespec = freeze_term_collection_from_design(
+            &solved.fit.noisespec_resolved,
+            &solved.fit.noise_design,
+        )
+        .map_err(|e| e.to_string())?;
+        progress.advance_workflow(4);
+        cli_out!(
+            "model fit complete | family={} | outer_iter={} | status={}",
+            kind.family_tag(),
+            fit.outer_iterations,
+            fit.pirls_status.label()
+        );
+        print_spatial_aniso_scales(&solved.fit.meanspec_resolved);
+        print_spatial_aniso_scales(&solved.fit.noisespec_resolved);
+        if let Some(out) = args.out.as_ref() {
+            progress.set_stage("fit", "writing dispersion location-scale model");
+            let fit_result = compact_saved_multiblock_fit_result(
+                fit.blocks.clone(),
+                fit.lambdas.clone(),
+                1.0,
+                fit.covariance_conditional.clone(),
+                fit.covariance_corrected.clone(),
+                fit.geometry.clone(),
+                SavedFitSummary::from_blockwise_fit(&fit)?,
+            );
+            let base_link = if matches!(kind, gam::gamlss::DispersionFamilyKind::Beta) {
+                InverseLink::Standard(StandardLink::Logit)
+            } else {
+                InverseLink::Standard(StandardLink::Log)
+            };
+            let payload = assemble_location_scale_payload(
+                LocationScaleInputs {
+                    formula: formula_text.to_string(),
+                    data_schema: ds.schema.clone(),
+                    noise_formula: noise_formula.clone(),
+                    resolved_termspec: frozen_meanspec,
+                    resolved_termspec_noise: frozen_noisespec,
+                    fit_result,
+                    beta_noise: fit
+                        .block_by_role(BlockRole::Scale)
+                        .map(|block| block.beta.to_vec()),
+                    wiggle: None,
+                },
+                LocationScaleResponse::Dispersion {
+                    likelihood: family.clone(),
+                    base_link,
+                    family_tag: kind.family_tag(),
+                },
+                SavedModelSourceMetadata {
+                    training_headers: ds.headers.clone(),
+                    training_feature_ranges: Some(ds.feature_ranges()),
+                    offset_column: args.offset_column.clone(),
+                    noise_offset_column: args.noise_offset_column.clone(),
+                },
+            )?;
+            write_payload_json(out, payload)?;
+            progress.advance_workflow(fit_total_steps);
+        }
+        emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
+        progress.finish_progress("dispersion location-scale fit complete");
+        return Ok(());
+    }
+
     if !family.is_binomial() {
         return Err(
-            "--predict-noise currently supports Gaussian and binomial families".to_string(),
+            "--predict-noise currently supports Gaussian, dispersion (negbin/gamma/beta/tweedie), \
+             and binomial families"
+                .to_string(),
         );
     }
     // family is already gated as binomial by is_binomial() above, so we
@@ -2500,6 +2625,22 @@ fn run_fitwith_predict_noise(
     emit_smooth_structure_warnings("fit-end", &spatial_usagewarnings);
     progress.finish_progress("binomial location-scale fit complete");
     Ok(())
+}
+
+/// Map a [`ResponseFamily`] to the dispersion-GAM kind whose log-precision
+/// channel can carry a `noise_formula` in the CLI `--predict-noise` path
+/// (#913). Mirrors `workflow::dispersion_location_scale_kind`.
+fn dispersion_location_scale_kind_for_cli(
+    response: &ResponseFamily,
+) -> Option<gam::gamlss::DispersionFamilyKind> {
+    use gam::gamlss::DispersionFamilyKind;
+    match response {
+        ResponseFamily::NegativeBinomial { .. } => Some(DispersionFamilyKind::NegativeBinomial),
+        ResponseFamily::Gamma => Some(DispersionFamilyKind::Gamma),
+        ResponseFamily::Beta { .. } => Some(DispersionFamilyKind::Beta),
+        ResponseFamily::Tweedie { p } => Some(DispersionFamilyKind::Tweedie { p: *p }),
+        _ => None,
+    }
 }
 
 fn pretty_predict_model_class(class: PredictModelClass) -> &'static str {

@@ -9877,6 +9877,7 @@ fn sae_residual_gauge_dict<'py>(
         gd.set_item("unpinned", g.unpinned)?;
         gd.set_item("generator_norm", g.generator_norm)?;
         gd.set_item("pinned_energy_fraction", g.pinned_energy_fraction)?;
+        gd.set_item("lowering_error_scale", g.lowering_error_scale)?;
         generators.append(gd)?;
     }
     d.set_item("generators", generators)?;

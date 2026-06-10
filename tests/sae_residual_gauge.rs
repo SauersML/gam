@@ -37,6 +37,7 @@ fn identity_patch_atom() -> FittedAtom {
         // No ARD prior here — the rotation's pinned/unpinned status is decided
         // purely by the data + isometry penalty, which is what we want to test.
         ard_variances: None,
+        lowering_error: 0.0,
     }
 }
 
@@ -243,6 +244,7 @@ fn equal_ard_axes_name_the_rotation_subgroup_of_exactly_the_right_dimension() {
             topology: AtomTopology::EuclideanPatch { latent_dim: 3 },
             frame: Array2::<f64>::eye(3),
             ard_variances: Some(ard),
+            lowering_error: 0.0,
         }],
         jacobian_rows: Vec::new(),
         isometry_penalty_root: Array2::<f64>::zeros((0, 9)),
@@ -315,12 +317,14 @@ fn exchangeable_atom_pair_yields_the_permutation_factor() {
                 topology: AtomTopology::EuclideanPatch { latent_dim: 1 },
                 frame: frame_a,
                 ard_variances: None,
+        lowering_error: 0.0,
             },
             FittedAtom {
                 name: "b".to_string(),
                 topology: AtomTopology::EuclideanPatch { latent_dim: 1 },
                 frame: frame_b,
                 ard_variances: None,
+        lowering_error: 0.0,
             },
         ]
     };
@@ -397,6 +401,7 @@ fn sym_f_triviality_checked_only_under_output_fisher() {
         topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
         frame,
         ard_variances: None,
+        lowering_error: 0.0,
     };
     let frame_a = Array2::<f64>::eye(2);
     let mut frame_b = Array2::<f64>::zeros((2, 2));
@@ -550,6 +555,7 @@ fn exchangeable_atom_pair_surfaces_the_permutation_factor_under_euclidean() {
         topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
         frame,
         ard_variances: None,
+        lowering_error: 0.0,
     };
     let frame_a = Array2::<f64>::eye(2);
     let mut frame_b = Array2::<f64>::zeros((2, 2));
