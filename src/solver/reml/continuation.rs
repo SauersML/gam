@@ -466,7 +466,7 @@ fn run_path(
     let collapsed = rho_zero_is_target(&rho0, target);
     let rho_first = if collapsed { target.clone() } else { rho0 };
 
-    let mut beta_seed = initial_beta.clone();
+    let beta_seed = initial_beta.clone();
 
     let eval0 = match eval_step(obj, &rho_first, &beta_seed, order) {
         Ok(eval) => eval,
@@ -506,12 +506,70 @@ fn run_path(
         return Ok(state);
     }
 
+    walk_state_toward(obj, state, target, order, PATH_BUDGET, 1)
+}
+
+/// One **warm** continuation leg (the ContinuationPath waypoint primitive):
+/// walk from an existing converged state to `target` under a small eval
+/// budget. Unlike [`fit_with_continuation`] this never re-enters from the
+/// oversmoothed ρ₀ — the caller owns the heavier-regime fallback (the coupled
+/// path re-enters a heavier waypoint on failure) — so Stuck/ExpandRhoZero
+/// outcomes surface as [`ContinuationFailure::PathStuck`] with
+/// `rho_zero_offset = 0.0` (no oversmooth expansion is involved in a warm leg;
+/// `final_rho` reports the leg's target as the diagnostic anchor).
+pub(crate) fn continue_path_from(
+    obj: &mut dyn OuterObjective,
+    start: ContinuationState,
+    target: &Array1<f64>,
+    order: OuterEvalOrder,
+    leg_budget: usize,
+) -> ContinuationResult {
+    if reached_target(&start.last_rho, target) {
+        return Ok(start);
+    }
+    match walk_state_toward(obj, start, target, order, leg_budget, 0) {
+        Ok(state) => Ok(state),
+        Err(PathOutcome::PathBudgetExhausted {
+            last,
+            steps_taken,
+            final_rho,
+        }) => Err(ContinuationFailure::PathBudgetExhausted {
+            last,
+            steps_taken,
+            final_rho,
+        }),
+        Err(PathOutcome::ExpandRhoZero(last)) | Err(PathOutcome::Stuck(last)) => {
+            Err(ContinuationFailure::PathStuck {
+                last,
+                rho_zero_offset: 0.0,
+                final_rho: target.clone(),
+            })
+        }
+        Err(PathOutcome::Propagate(last)) | Err(PathOutcome::DomainAtStart(last)) => {
+            Err(ContinuationFailure::StructuralPropagate(last))
+        }
+    }
+}
+
+/// Walk an already-seeded continuation state toward `target`, spending eval
+/// slots `steps_taken_start..budget`. Extracted from [`run_path`] so the cold
+/// ρ₀ spine and the warm per-waypoint leg ([`continue_path_from`]) share ONE
+/// descent loop — the step/shrink/expand semantics cannot fork between the two
+/// entries (the objective↔gradient-desync lesson applied to control flow).
+fn walk_state_toward(
+    obj: &mut dyn OuterObjective,
+    mut state: ContinuationState,
+    target: &Array1<f64>,
+    order: OuterEvalOrder,
+    budget: usize,
+    steps_taken_start: usize,
+) -> Result<ContinuationState, PathOutcome> {
     let mut alpha = ALPHA_INIT;
-    let mut steps_taken: usize = 1;
+    let mut steps_taken: usize = steps_taken_start;
     let mut last_failure: Option<InnerFailure> = None;
     let mut consecutive_trust_floor: usize = 0;
 
-    while steps_taken < PATH_BUDGET {
+    while steps_taken < budget {
         if reached_target(&state.last_rho, target) {
             return Ok(state);
         }
@@ -520,7 +578,7 @@ fn run_path(
         // Prefer the previous eval's published inner-β hint over our
         // own carried β. The objective itself knows its converged β at
         // ρ_k; if it surfaces it, that is the best warm-start for ρ_{k+1}.
-        beta_seed = state
+        let beta_seed = state
             .last_eval
             .inner_beta_hint
             .clone()

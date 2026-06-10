@@ -80,7 +80,8 @@
 use ndarray::{Array1, ArrayView2};
 
 use crate::solver::estimate::reml::continuation::{
-    ContinuationFailure, ContinuationState, fit_with_continuation,
+    ContinuationFailure, ContinuationState, PATH_BUDGET, continue_path_from,
+    fit_with_continuation,
 };
 use crate::solver::outer_strategy::{OuterEvalOrder, OuterObjective};
 use crate::terms::analytic_penalties::ScalarWeightSchedule;
@@ -118,6 +119,23 @@ pub const REENTRY_BACKOFF: f64 = 1.0 / CONTINUATION_WAYPOINTS as f64;
 /// total inner-solve count bounded. The previous 1.5× budget tolerated only
 /// ~1 two-notch bounce, so any mass-floor bounce ended the walk un-arrived.
 pub const CONTINUATION_WALK_BUDGET: usize = 2 * CONTINUATION_WAYPOINTS;
+
+/// Eval budget for one **warm** waypoint leg. A warm leg starts at the
+/// previous waypoint's converged state and walks one waypoint of ρ, so it
+/// needs a handful of evals, not the full cold spine: the coupled path's
+/// waypoints ARE the anneal. (Re-running the whole ρ₀→target spine per
+/// waypoint multiplies the walk's cost by the spine budget — the K=2 existence
+/// fixture burned 7 CPU-hours exactly that way before warm legs existed.)
+pub const WARM_LEG_EVAL_BUDGET: usize = 8;
+
+/// Hard ceiling on *budgeted* spine evals across one coupled walk — the #968
+/// termination guarantee made structural. A clean walk budgets
+/// `PATH_BUDGET + (CONTINUATION_WAYPOINTS − 1) · WARM_LEG_EVAL_BUDGET` (one
+/// cold entry spine, then warm legs); the ceiling leaves ~3× that for
+/// homotopy-floor bounces. At the ceiling the path **arrives with its best
+/// converged state** instead of spending another leg: a walk cannot spin.
+pub const WALK_EVAL_CEILING: usize =
+    3 * (PATH_BUDGET + CONTINUATION_WAYPOINTS * WARM_LEG_EVAL_BUDGET);
 
 /// Floor on the per-waypoint descent step in `s`. Below this the path is
 /// taking near-zero steps; it does not give up — it pins `s` at its current
@@ -552,6 +570,16 @@ pub struct ContinuationPath {
     /// is unchanged; this internal ledger backs the inner-loop call site that
     /// does not thread its own ledger. Append-only, never fatal.
     reseed_ledger: ReseedLedger,
+    /// The most recent converged waypoint state. `None` until the first leg
+    /// converges (that leg runs the full cold spine); every later waypoint is
+    /// a WARM leg from here — the structural fix for the per-waypoint
+    /// cold-spine cost blowup. Kept across re-entries (a heavier waypoint is
+    /// still downstream of a converged lighter-ρ state in walk distance).
+    warm: Option<ContinuationState>,
+    /// Budgeted spine evals spent so far (cold legs budget the full spine,
+    /// warm legs budget [`WARM_LEG_EVAL_BUDGET`]). Compared against
+    /// [`WALK_EVAL_CEILING`] for the #968 structural-termination guarantee.
+    evals_budgeted: usize,
 }
 
 impl ContinuationPath {
@@ -571,6 +599,8 @@ impl ContinuationPath {
             logit_tr,
             mass_floor: ActiveMassFloor::default_floor(),
             reseed_ledger: ReseedLedger::new(),
+            warm: None,
+            evals_budgeted: 0,
         }
     }
 
@@ -789,6 +819,25 @@ impl ContinuationPath {
         obj: &mut dyn OuterObjective,
         initial_beta: &Array1<f64>,
     ) -> ContinuationStep {
+        // #968 hard ceiling: total budgeted spine evals across the walk are
+        // bounded. At the ceiling the path hands its best converged state to
+        // the real optimizer (legs advanced to the target regime) instead of
+        // spending another leg — termination is structural, not statistical.
+        // With no converged state yet the walk keeps trying (the consumer's
+        // own `CONTINUATION_WALK_BUDGET` loop bounds that case).
+        if self.evals_budgeted >= WALK_EVAL_CEILING {
+            if let Some(state) = self.warm.clone() {
+                log::warn!(
+                    "[PATH] walk eval ceiling {WALK_EVAL_CEILING} reached at s={:.4}; arriving \
+                     with the best converged waypoint state (scalar legs advanced to target)",
+                    self.s
+                );
+                self.advance_scalar_legs_to(0.0);
+                self.s = 0.0;
+                return ContinuationStep::Arrived { state };
+            }
+        }
+
         // Descent step in s, floored. If the step has already underflowed, the
         // path pins the heavier regime and re-descends from there — still no
         // rejection.
@@ -812,16 +861,38 @@ impl ContinuationPath {
         // is ρ₀ itself, so the spine's oversmoothing stacks into the deepest
         // contraction; at s = 0 it is ρ*.
         let rho_target = self.schedules.rho_target_at(s_next);
-        let spine = fit_with_continuation(
-            obj,
-            &rho_target,
-            &self.schedules.rho_bounds_upper,
-            initial_beta,
-            OuterEvalOrder::ValueAndGradient,
-        );
+        // First leg (no converged waypoint yet): the full oversmoothed spine —
+        // the documented deepest-contraction entry. Every later waypoint is a
+        // WARM leg from the previous waypoint's converged state. The coupled
+        // path's waypoints ARE the anneal; re-running the whole ρ₀→target
+        // spine per waypoint multiplies the walk's cost by the spine budget
+        // (the K=2 existence fixture burned 7 CPU-hours exactly that way).
+        let spine = match self.warm.clone() {
+            Some(start) => {
+                self.evals_budgeted += WARM_LEG_EVAL_BUDGET;
+                continue_path_from(
+                    obj,
+                    start,
+                    &rho_target,
+                    OuterEvalOrder::ValueAndGradient,
+                    WARM_LEG_EVAL_BUDGET,
+                )
+            }
+            None => {
+                self.evals_budgeted += PATH_BUDGET;
+                fit_with_continuation(
+                    obj,
+                    &rho_target,
+                    &self.schedules.rho_bounds_upper,
+                    initial_beta,
+                    OuterEvalOrder::ValueAndGradient,
+                )
+            }
+        };
 
         match spine {
             Ok(state) => {
+                self.warm = Some(state.clone());
                 self.s = s_next;
                 // Clean descent: restore the nominal step (grow back toward the
                 // coarse schedule) and refresh the τ-tied logit trust region.
