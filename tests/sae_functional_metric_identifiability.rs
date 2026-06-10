@@ -29,10 +29,10 @@
 //!   (single atom ⇒ "identified up to atom permutation" is the trivial group).
 //!
 //! The functional arm is also the *mixed-generator* regime the verdict rule
-//! must get right: the rotation's pinned energy fraction is strictly interior
-//! (≈ 9/34 here) — partial curvature. A rank-increase test would call that a
-//! surviving freedom (under-claiming identification); the pinned-energy rule
-//! must call it pinned and report the fraction.
+//! must get right: the rotation's relative curvature fraction is strictly
+//! interior (= 9/128 here) — partial curvature. A rank-increase test would
+//! call that a surviving freedom (under-claiming identification); the
+//! relative-curvature rule must call it pinned and report the fraction.
 
 use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::sae_identifiability::{
@@ -167,7 +167,10 @@ fn euclidean_pin_leaves_the_rotation_free_functional_pin_identifies() {
         report_fn.summary
     );
     // The mixed-generator regime, explicitly: the rotation is PARTIALLY
-    // curved (analytic fraction 9/34 ≈ 0.265 for this fixture), strictly
+    // curved: the curvature-root rows are {[2,0,0,0],[0,1,4,0],[0,0,0,8]}
+    // (mutually orthogonal, σ_max = 8) and the unit rotation ξ̂ = [0,1,−1,0]/√2
+    // has ‖Rξ̂‖² = (−3/√2)² = 4.5, so the relative curvature fraction is
+    // 4.5/64 = 9/128 ≈ 0.070 for this fixture — strictly
     // between the noise floor and full pinning. A rank-increase verdict
     // would have called this a surviving freedom.
     assert!(
@@ -178,8 +181,8 @@ fn euclidean_pin_leaves_the_rotation_free_functional_pin_identifies() {
         rot_fn.pinned_energy_fraction
     );
     assert!(
-        (rot_fn.pinned_energy_fraction - 9.0 / 34.0).abs() < 1.0e-9,
-        "analytic pinned energy fraction is 9/34, got {}",
+        (rot_fn.pinned_energy_fraction - 9.0 / 128.0).abs() < 1.0e-9,
+        "analytic relative curvature fraction is 9/128, got {}",
         rot_fn.pinned_energy_fraction
     );
     assert_eq!(
