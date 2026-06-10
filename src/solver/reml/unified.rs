@@ -19842,6 +19842,29 @@ mod tests {
              diagonal (full={psi_diag_full}, base_h2-only={dense_no_term2}); pick a fixture \
              where it is live"
         );
+
+        // Mixed ρψ-direction HVP arm: a pure-ρ and a pure-ψ matvec can both be
+        // green while a ρψ/ψψ block-split error (a double-count, or a ψψ table
+        // entry zeroed at build but not re-added by the hook) hides in the
+        // cross. Apply the operator to a direction with BOTH a ρ and a ψ
+        // component nonzero and require operator·v == dense·v — the matvec mixes
+        // the blocks, so this is what exposes such a split error. (This is the
+        // matvec path, distinct from the materialize column-probes above, so it
+        // also exercises the hook's per-matvec injection directly.)
+        let mixed = array![0.6_f64, -1.1_f64]; // [ρ, ψ], both live
+        let hvp = crate::solver::outer_strategy::OuterHessianOperator::matvec(&operator, &mixed)
+            .expect("mixed-direction operator HVP");
+        let dense_hvp = dense.dot(&mixed);
+        for i in 0..hvp.len() {
+            let tol = 1e-10_f64.max(1e-10 * dense_hvp[i].abs());
+            assert!(
+                (hvp[i] - dense_hvp[i]).abs() <= tol,
+                "#740 mixed-ρψ HVP mismatch at {i}: hook-operator={}, per-pair-dense={} \
+                 — a ρψ/ψψ block-split error (double-count or dropped entry) in the cross",
+                hvp[i],
+                dense_hvp[i]
+            );
+        }
     }
 
     #[test]
