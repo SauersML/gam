@@ -1985,6 +1985,32 @@ impl DriftDerivResult {
 pub type FixedDriftDerivFn =
     Box<dyn Fn(usize, &Array1<f64>) -> Option<DriftDerivResult> + Send + Sync>;
 
+/// Direction-contracted second-order ψ terms for the profiled θ-HVP (#740).
+///
+/// Given the ψ-block weights `α_ψ` (the ψ slice of one applied outer
+/// direction), returns the `α`-contraction of every `(ψ_i, ψ_j)` second-order
+/// likelihood term against the combined ψ-direction `ψ(α) = Σ_j α_j ψ_j`, as a
+/// per-ψ-output-row triple:
+///
+/// - `objective[i] = Σ_j α_j V_{ψ_i ψ_j}`,
+/// - `score` rows `score.row(i) = Σ_j α_j g_{ψ_i ψ_j}` (`ψ_dim × p`),
+/// - `hessian[i] = D²_ψ H_L[ψ_i, ψ(α)]` (the fixed-β ψ-design second drift
+///   `tr`-able through the logdet kernel, i.e. the `base_h2` ψψ contribution).
+///
+/// This is the single-pass replacement for the `K²` per-pair callbacks the
+/// outer-Hessian builder would otherwise enumerate (each tracing a distinct
+/// `D²_ψ H_L[ψ_i, ψ_j]` operator at `O(n·r)`): one call produces every output
+/// row in one family row pass, so densifying the operator costs `K` such passes
+/// instead of `K²`.  Returns `None` to decline the fast path (the builder then
+/// keeps the exact per-pair assembly).  Defined over solver-level types so the
+/// solver layer carries no `families::*` coupling; the family side fills it from
+/// `ExactNewtonJointPsiSecondOrderContracted`.
+pub type ContractedPsiSecondOrderFn = Arc<
+    dyn Fn(&[f64]) -> Result<Option<(Array1<f64>, Array2<f64>, Vec<DriftDerivResult>)>, String>
+        + Send
+        + Sync,
+>;
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Implicit Hessian-drift operators for scalable anisotropic REML
 // ═══════════════════════════════════════════════════════════════════════════
@@ -5684,6 +5710,14 @@ pub struct InnerSolution<'dp> {
     /// Arguments: (ext_index, direction) → correction matrix.
     pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
 
+    /// Direction-contracted second-order ψ hook for the profiled θ-HVP (#740).
+    /// When present, the outer-Hessian operator builder skips the `K²` per-pair
+    /// `base_h2` ψψ assembly and instead applies this once per matvec to obtain
+    /// every output row's `tr(K · D²_ψ H_L[ψ_i, ψ(α)])` in a single family row
+    /// pass. `None` keeps the exact per-pair assembly. See
+    /// [`ContractedPsiSecondOrderFn`].
+    pub contracted_psi_second_order: Option<ContractedPsiSecondOrderFn>,
+
     /// Optional log-barrier configuration for monotonicity-constrained coefficients.
     /// When present, the barrier cost and Hessian corrections are added to the
     /// outer REML/LAML objective.
@@ -5757,6 +5791,7 @@ pub struct InnerSolutionBuilder<'dp> {
     ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     fixed_drift_deriv: Option<FixedDriftDerivFn>,
+    contracted_psi_second_order: Option<ContractedPsiSecondOrderFn>,
     barrier_config: Option<BarrierConfig>,
     kkt_residual: Option<ProjectedKktResidual>,
     active_constraints: Option<Arc<ActiveLinearConstraintBlock>>,
@@ -5797,6 +5832,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             ext_coord_pair_fn: None,
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
+            contracted_psi_second_order: None,
             barrier_config: None,
             kkt_residual: None,
             active_constraints: None,
@@ -5877,6 +5913,14 @@ impl<'dp> InnerSolutionBuilder<'dp> {
 
     pub fn fixed_drift_deriv(mut self, f: FixedDriftDerivFn) -> Self {
         self.fixed_drift_deriv = Some(f);
+        self
+    }
+
+    /// Install the direction-contracted second-order ψ hook (#740). When set,
+    /// the outer-Hessian operator builder uses it instead of the `K²` per-pair
+    /// `base_h2` ψψ assembly. See [`ContractedPsiSecondOrderFn`].
+    pub fn contracted_psi_second_order(mut self, f: Option<ContractedPsiSecondOrderFn>) -> Self {
+        self.contracted_psi_second_order = f;
         self
     }
 
@@ -6025,6 +6069,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             ext_coord_pair_fn: self.ext_coord_pair_fn,
             rho_ext_pair_fn: self.rho_ext_pair_fn,
             fixed_drift_deriv: self.fixed_drift_deriv,
+            contracted_psi_second_order: self.contracted_psi_second_order,
             barrier_config: self.barrier_config,
             kkt_residual: self.kkt_residual,
             active_constraints: self.active_constraints,
