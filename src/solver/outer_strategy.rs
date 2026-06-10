@@ -5777,17 +5777,18 @@ fn run_outer_with_plan(
                 let mut legs_descended = 0usize;
                 let mut arrived = false;
                 // Bound the walk: CONTINUATION_WAYPOINTS clean descents plus a
-                // modest re-entry allowance (every re-entry is progress toward
-                // the contraction floor, reachable in finitely many back-offs).
+                // re-entry allowance (every re-entry is progress toward the
+                // contraction floor, reachable in finitely many back-offs).
                 // Each `step` runs the ρ-anneal spine, which is itself an inner
-                // homotopy — so the budget is deliberately tight (descents +
-                // half-as-many re-entries) to keep the coupled walk's total
-                // inner-solve count bounded; the spine warm-starts from the
-                // previous leg's β, so post-entry legs are cheap. The loop only
-                // ever exits on `Arrived` or this budget — there is no rejection
-                // exit.
-                let walk_budget = crate::solver::continuation_path::CONTINUATION_WAYPOINTS
-                    + crate::solver::continuation_path::CONTINUATION_WAYPOINTS / 2;
+                // homotopy, so the budget stays bounded — but it must tolerate
+                // the expected near-cliff floor bounces: at the one-waypoint
+                // `REENTRY_BACKOFF` each bounce costs ~2 legs, and the shared
+                // `CONTINUATION_WALK_BUDGET` (2× waypoints) absorbs ~half-a-
+                // walk's worth of bounces before cutoff. The spine warm-starts
+                // from the previous leg's β, so post-entry legs are cheap. The
+                // loop only ever exits on `Arrived` or this budget — there is
+                // no rejection exit.
+                let walk_budget = crate::solver::continuation_path::CONTINUATION_WALK_BUDGET;
                 for _ in 0..walk_budget {
                     if path.arrived() {
                         arrived = true;
