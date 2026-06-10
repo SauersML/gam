@@ -19778,6 +19778,70 @@ mod tests {
                 );
             }
         }
+
+        // The ψ-row diagonal must carry BOTH second-order terms that legitimately
+        // appear in ddot_H_ij, so the operator-vs-dense match above genuinely
+        // rules out a DOUBLE-COUNT or a dropped term (a ρ-only comparison would
+        // not):
+        //   * base_h2 ψψ  = tr(K · D²_ψ H_L[ψ,ψ])  — the per-pair pair.b_mat /
+        //     the hook's `hessian`; and
+        //   * the callback `correction` (term2) = tr(K · D²_β H_L[β̇,·]) via the
+        //     family compute_d2h on the ext mode response.
+        // Both must be individually NONZERO at the ψ diagonal (coord index 1).
+        // Recompute the dense ψ diagonal with each term suppressed and require a
+        // measurable shift, so the equivalence test sits on a point where the
+        // two distinct curvature terms both contribute.
+        let psi_diag_full = dense[[1, 1]];
+        // term2-only: zero the ψψ second drift (pair.b_mat) → removes base_h2 ψψ.
+        let dense_no_base = {
+            let mut sol = build_solution(false);
+            sol.ext_coord_pair_fn = Some(Box::new(move |_, _| HyperCoordPair {
+                a: psi_pair_a,
+                g: array![0.16, -0.12],
+                b_mat: Array2::zeros((2, 2)),
+                b_operator: None,
+                ld_s: psi_pair_ld_s,
+            }));
+            compute_outer_hessian(
+                &sol,
+                &rho,
+                &lambdas,
+                sol.hessian_op.as_ref(),
+                sol.deriv_provider.as_ref(),
+                None,
+            )
+            .unwrap()[[1, 1]]
+        };
+        // base_h2-only: zero c/d so the family correction (term2) vanishes.
+        let dense_no_term2 = {
+            let mut sol = build_solution(false);
+            sol.deriv_provider = Box::new(SinglePredictorGlmDerivatives {
+                c_array: Array1::zeros(3),
+                d_array: Some(Array1::zeros(3)),
+                hessian_weights: Array1::ones(3),
+                x_transformed: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x.clone())),
+            });
+            compute_outer_hessian(
+                &sol,
+                &rho,
+                &lambdas,
+                sol.hessian_op.as_ref(),
+                sol.deriv_provider.as_ref(),
+                None,
+            )
+            .unwrap()[[1, 1]]
+        };
+        assert!(
+            (psi_diag_full - dense_no_base).abs() > 1e-6,
+            "#740 test is vacuous: base_h2 ψψ contributes ~0 at the ψ diagonal \
+             (full={psi_diag_full}, term2-only={dense_no_base}); pick a fixture where it is live"
+        );
+        assert!(
+            (psi_diag_full - dense_no_term2).abs() > 1e-6,
+            "#740 test is vacuous: the family correction (term2) contributes ~0 at the ψ \
+             diagonal (full={psi_diag_full}, base_h2-only={dense_no_term2}); pick a fixture \
+             where it is live"
+        );
     }
 
     #[test]
