@@ -175,28 +175,37 @@ jobs:
           # full disk and rust-lld dies with "ld terminated with signal 7
           # [Bus error]" inside llvm::parallelFor, which has been the
           # recurring `cargo test --test <name>` failure mode on this job.
-          if [ "$test_status" -eq 0 ]; then
-            find target/debug/deps -maxdepth 1 -type f \
-                  ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' \
-                  ! -name '*.so' ! -name '*.so.*' \
-                  -size +10M -delete || true
-            df -h /
-          fi
+          #
+          # This prune (and the integration loop below) run UNCONDITIONALLY —
+          # NOT gated on the lib phase passing. main's lib suite is frequently
+          # red on purpose (a scheduled bug-hunt agent commits failing
+          # regression tests), so gating the integration tests behind a green
+          # lib phase meant the entire `tests/*.rs` suite — including the
+          # committed bug-repro tests that gate issue fixes — silently never
+          # ran. The lib binaries are already executed regardless of their
+          # pass/fail outcome, so pruning them here is always safe.
+          find target/debug/deps -maxdepth 1 -type f \
+                ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' \
+                ! -name '*.so' ! -name '*.so.*' \
+                -size +10M -delete || true
+          df -h /
 
-          if [ "$test_status" -eq 0 ]; then
-            for test_file in tests/*.rs; do
-              test_name="$(basename "$test_file" .rs)"
-              if ! run_cargo_test --test "$test_name"; then
-                test_status=1
-                break
-              fi
-              rm -f "target/debug/deps/${test_name}"-* \
-                    "target/debug/deps/${test_name//-/_}"-* \
-                    "target/debug/incremental/${test_name}"-* \
-                    "target/debug/incremental/${test_name//-/_}"-* || true
-              df -h /
-            done
-          fi
+          # Run every integration-test binary and record any failure, but do
+          # NOT fail-fast: a single failing `tests/*.rs` must not suppress the
+          # results of the others. The per-iteration rm below frees each
+          # binary's disk after it runs (failed or not), keeping the
+          # serialized link job within the runner's disk budget.
+          for test_file in tests/*.rs; do
+            test_name="$(basename "$test_file" .rs)"
+            if ! run_cargo_test --test "$test_name"; then
+              test_status=1
+            fi
+            rm -f "target/debug/deps/${test_name}"-* \
+                  "target/debug/deps/${test_name//-/_}"-* \
+                  "target/debug/incremental/${test_name}"-* \
+                  "target/debug/incremental/${test_name//-/_}"-* || true
+            df -h /
+          done
 
           # The patterns here are literal/ERE substrings that match the
           # exact log::warn!/log::error!/Display strings emitted at runtime
