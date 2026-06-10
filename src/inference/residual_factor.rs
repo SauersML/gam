@@ -213,7 +213,10 @@ impl StructuredResidualModel {
         // of the (scale-1) second moment. The alternation refines all three.
         let mut row_scale = Array1::<f64>::ones(n);
         let mut bin_scale = Array1::<f64>::ones(bins);
-        let mut diagonal = column_variances(r).mapv(|v| v.max(diag_floor));
+        // Raw (undeflated) per-channel second moment — the D estimator's data
+        // term. Constant across sweeps.
+        let raw_diag = column_variances(r);
+        let mut diagonal = raw_diag.mapv(|v| v.max(diag_floor));
         let mut lambda = Array2::<f64>::zeros((p, rank));
 
         for _sweep in 0..ALTERNATION_SWEEPS {
@@ -238,14 +241,21 @@ impl StructuredResidualModel {
                     }
                 }
             }
-            // D update: per-channel residual variance after removing the factor
-            // contribution, floored ≻ 0.
+            // D update from the RAW (undeflated) moment, floored ≻ 0. The model
+            // is Σ_n = c_n·ΛΛᵀ + D with D NOT scale-multiplied, and c is mean-1
+            // normalized, so E[(1/n)Σ r_n r_nᵀ] = ΛΛᵀ + D exactly. The deflated
+            // moment `s` is the right object for the FACTOR block (its factor
+            // part is scale-free) but its diagonal carries D·mean(1/c) — a
+            // Jensen-inflated D (mean(1/c) > 1 for any non-constant law), which
+            // biased D upward by exactly mean(1/c̃) and let a spurious
+            // higher-rank candidate win the evidence ladder on a better D
+            // alone (the probe's rank-2 winner had a zero second column).
             for j in 0..p {
                 let mut factor_var = 0.0_f64;
                 for k in 0..rank {
                     factor_var += lambda[[j, k]] * lambda[[j, k]];
                 }
-                diagonal[j] = (s[[j, j]] - factor_var).max(diag_floor);
+                diagonal[j] = (raw_diag[j] - factor_var).max(diag_floor);
             }
 
             // (scale | Λ, D): per-row factor activity. With residual r_n, the

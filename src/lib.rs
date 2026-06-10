@@ -109,6 +109,14 @@ pub use solver::estimate::reml::atoms::{
     StratumFingerprint, ThetaDirection,
 };
 pub use solver::estimate::reml::unified::PenaltySubspaceTrace;
+// #986 frontier ρ-scaling: the per-atom decoupled EFS outer engine. `run_outer`
+// auto-routes to it at frontier rho dimension; callers with a known
+// arrow-border overlap drive `run_per_atom_efs` directly with an explicit
+// `SharedBorderTopology` (`new` for a named border set, `disjoint` /
+// `fully_coupled` for the two extremes).
+pub use solver::estimate::reml::per_atom_efs::{
+    PerAtomEfsConfig, SharedBorderTopology, run_per_atom_efs,
+};
 pub use resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
