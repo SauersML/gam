@@ -8294,6 +8294,29 @@ pub fn reml_laml_evaluate(
                     DriftDerivResult::Operator(op) => hop.trace_logdet_operator(op.as_ref()),
                 };
                 stash.unprojected_tr = Some(unprojected);
+
+                // #901-layer-2 split: the same kernel K traced against the
+                // FROZEN drift B_i (no cubic correction) and against the
+                // cubic correction D_βH[−v_i] alone, so the FD reference can
+                // attribute the desync to one component.
+                let frozen_only = hyper_coord_total_drift_result(&coord.drift, None, hop.dim());
+                let trace_with_kernel = |d: &DriftDerivResult| -> f64 {
+                    match (&solution.penalty_subspace_trace, d) {
+                        (Some(kernel), DriftDerivResult::Dense(m)) => {
+                            kernel.trace_projected_logdet(m)
+                        }
+                        (Some(kernel), DriftDerivResult::Operator(op)) => {
+                            kernel.trace_operator(op.as_ref())
+                        }
+                        (None, DriftDerivResult::Dense(m)) => hop.trace_logdet_h_k(m, None),
+                        (None, DriftDerivResult::Operator(op)) => {
+                            hop.trace_logdet_operator(op.as_ref())
+                        }
+                    }
+                };
+                let frozen_tr = trace_with_kernel(&frozen_only);
+                stash.frozen_tr = Some(frozen_tr);
+                stash.correction_tr = Some(trace_logdet_i - frozen_tr);
             }
 
             // Per-row diagnostic stash: captures term4's `c · X_τβ̂` diagonal
