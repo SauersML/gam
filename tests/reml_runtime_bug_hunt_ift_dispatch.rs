@@ -96,7 +96,10 @@ fn reml_fixed_dispersion_contract_matches_response_family_rules() {
     );
 
     let nb = glm(LikelihoodSpec::new(
-        ResponseFamily::NegativeBinomial { theta: 3.5 },
+        ResponseFamily::NegativeBinomial {
+            theta: 3.5,
+            theta_fixed: false,
+        },
         InverseLink::Standard(StandardLink::Log),
     ));
     assert_eq!(

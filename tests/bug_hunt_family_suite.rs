@@ -55,7 +55,10 @@ fn bug_strategy_for_spec_preserves_family_marker_for_all_response_variants() {
             InverseLink::Standard(StandardLink::Log),
         ),
         LikelihoodSpec::new(
-            ResponseFamily::NegativeBinomial { theta: 2.0 },
+            ResponseFamily::NegativeBinomial {
+                theta: 2.0,
+                theta_fixed: false,
+            },
             InverseLink::Standard(StandardLink::Log),
         ),
         LikelihoodSpec::new(
