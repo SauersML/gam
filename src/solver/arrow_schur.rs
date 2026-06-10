@@ -7576,9 +7576,17 @@ mod tests {
     /// keep the *dense Schur complement* PD (gam#845), the single-shot solve
     /// correctly reports a recoverable factorization error and the
     /// LM-escalating wrapper recovers it with a finite, well-conditioned step.
-    /// `with_ill_conditioning_tolerated()` accepts the RAW (undamped) blocks
-    /// and returns a usable cache whose log-determinant equals the exact dense
-    /// `log|H|`. This is the SAE evidence path under a wide ARD α sweep.
+    ///
+    /// `with_ill_conditioning_tolerated()` accepts the RAW (undamped) blocks.
+    /// Its contract has two sides, pinned on two fixtures:
+    ///   * row-PD but assembled-INDEFINITE H (strong coupling into near-null
+    ///     t-directions) → honest refusal. Per-row PD does not imply bordered-
+    ///     system PD, and an exact `log|H|` does not exist on the Cholesky
+    ///     branch — fabricating one would corrupt the evidence.
+    ///   * row κ ≈ 1e9 but assembled H genuinely PD (coupling subordinate to
+    ///     the weak curvature) → a usable cache whose log-determinant equals
+    ///     the exact dense `log|H|`, undistorted by any κ-ceiling ridge. This
+    ///     is the SAE evidence path under a wide ARD α sweep.
     #[test]
     fn ill_conditioning_tolerated_returns_cache_with_exact_logdet() {
         let n = 2usize;
@@ -7642,10 +7650,45 @@ mod tests {
             strict_diag.ridge_escalations
         );
 
-        // Evidence mode accepts the RAW (undamped) block and returns a cache —
-        // the genuinely PD factor whose diagonal gives the EXACT log|H|.
+        // Evidence mode accepts the RAW (undamped) blocks. For THIS system the
+        // honest answer is refusal: each per-row `H_tt` is PD in isolation, but
+        // the strong coupling into the near-null t-directions makes the
+        // assembled bordered H indefinite (its true Schur complement has a
+        // ≈ −7.5e6 leading pivot; the full spectrum has two negative
+        // eigenvalues). An exact log|H| does not exist on the Cholesky branch,
+        // and tolerating ill-CONDITIONING must never fabricate a determinant
+        // for an in-DEFINITE system — the SchurFactorFailed refusal is the
+        // contract, not a defect.
         let opts = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
-        let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &opts)
+        let tolerate_indefinite = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &opts);
+        assert!(
+            matches!(
+                tolerate_indefinite,
+                Err(ArrowSchurError::SchurFactorFailed { .. })
+            ),
+            "tolerate mode must refuse the indefinite assembled H rather than fabricate \
+             a log-determinant; got {tolerate_indefinite:?}"
+        );
+
+        // The regime the tolerate flag exists for: per-row κ ≈ 1e9 (above the
+        // safe-Schur ceiling, so the strict path would ridge-condition the row
+        // and distort the determinant) yet the assembled H is genuinely PD
+        // because the coupling into the near-null t-directions is subordinate
+        // to their curvature (‖H_tβ row‖² ≲ λ_min(H_tt)·λ_min(H_ββ)). Evidence
+        // mode must factor the RAW blocks and report the EXACT dense log|H|,
+        // undistorted by any κ-ceiling ridge.
+        let mut pd_sys = ArrowSchurSystem::new(n, d, k);
+        pd_sys.rows[0].htt = array![[1.0_f64, 0.0], [0.0, 1e-9]];
+        pd_sys.rows[0].htbeta = array![[0.3_f64, 0.1], [3e-6, 1e-6]];
+        pd_sys.rows[1].htt = array![[2.0_f64, 0.0], [0.0, 2e-9]];
+        pd_sys.rows[1].htbeta = array![[0.2_f64, -0.1], [2e-6, 4e-6]];
+        for row in pd_sys.rows.iter_mut() {
+            row.gt = array![0.0_f64, 0.0];
+        }
+        pd_sys.hbb = array![[5.0_f64, 0.3], [0.3, 4.0]];
+        pd_sys.gb = array![0.0_f64, 0.0];
+
+        let (_dt, _db, cache) = solve_arrow_newton_step_with_options(&pd_sys, 0.0, 0.0, &opts)
             .expect("tolerate mode must factor the ill-conditioned-but-PD system");
 
         // Cache log-determinant (Σ log|H_tt^i| + log|S_β|) must equal the exact
@@ -7660,12 +7703,12 @@ mod tests {
             let base = i * d;
             for r in 0..d {
                 for c in 0..d {
-                    h[[base + r, base + c]] = sys.rows[i].htt[[r, c]];
+                    h[[base + r, base + c]] = pd_sys.rows[i].htt[[r, c]];
                 }
             }
             for r in 0..d {
                 for c in 0..k {
-                    let v = sys.rows[i].htbeta[[r, c]];
+                    let v = pd_sys.rows[i].htbeta[[r, c]];
                     h[[base + r, n * d + c]] = v;
                     h[[n * d + c, base + r]] = v;
                 }
@@ -7673,7 +7716,7 @@ mod tests {
         }
         for r in 0..k {
             for c in 0..k {
-                h[[n * d + r, n * d + c]] = sys.hbb[[r, c]];
+                h[[n * d + r, n * d + c]] = pd_sys.hbb[[r, c]];
             }
         }
         let lh = cholesky_lower(&h).expect("assembled bordered H must be SPD");
