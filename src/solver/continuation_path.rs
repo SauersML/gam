@@ -97,7 +97,27 @@ pub const CONTINUATION_WAYPOINTS: usize = 8;
 /// `s ← min(1, s + REENTRY_BACKOFF)`. Re-entering a heavier regime and
 /// re-descending with a halved step is the *floor* behavior — there is no
 /// rejection alternative.
-pub const REENTRY_BACKOFF: f64 = 0.25;
+///
+/// Exactly **one waypoint** of the lockstep grid (`1/CONTINUATION_WAYPOINTS`):
+/// a bounce off the homotopy floor re-enters the *previous* waypoint's heavier
+/// regime, the lightest regime already proven solvable on this walk. Combined
+/// with the halved re-descent step, a one-notch bounce costs ~2 walk legs
+/// (the re-entry plus one finer re-descent). The previous two-notch back-off
+/// (0.25) cost ~4 legs per bounce, which starved the bounded walk budget under
+/// repeated mass-floor bounces and left the K≥2 joint fit stranded mid-path —
+/// handed to the solver half-annealed, the routing-collapse signature.
+pub const REENTRY_BACKOFF: f64 = 1.0 / CONTINUATION_WAYPOINTS as f64;
+
+/// Total leg budget for one coupled walk (`outer_strategy.rs` drives
+/// [`ContinuationPath::step`] at most this many times per seed). Two legs per
+/// waypoint: a clean walk uses `CONTINUATION_WAYPOINTS` descents, and each
+/// homotopy-floor bounce costs ~2 extra legs at the one-notch
+/// [`REENTRY_BACKOFF`] (the re-entry leg plus one finer re-descent leg), so a
+/// 2× budget tolerates ~`CONTINUATION_WAYPOINTS/2` bounces before the walk is
+/// cut off — enough for the expected near-cliff re-entries while keeping the
+/// total inner-solve count bounded. The previous 1.5× budget tolerated only
+/// ~1 two-notch bounce, so any mass-floor bounce ended the walk un-arrived.
+pub const CONTINUATION_WALK_BUDGET: usize = 2 * CONTINUATION_WAYPOINTS;
 
 /// Floor on the per-waypoint descent step in `s`. Below this the path is
 /// taking near-zero steps; it does not give up — it pins `s` at its current
@@ -296,10 +316,19 @@ pub struct ActiveMassFloor {
 }
 
 impl ActiveMassFloor {
-    /// Default floor: the same `0.2` mean-active-mass threshold the SAE
-    /// routing-collapse quality assertion uses, so the live hardening floor and
-    /// the test oracle agree by construction.
-    pub const DEFAULT_FLOOR: f64 = 0.2;
+    /// Default floor: the **failure boundary**, not the healthy operating
+    /// point. The SAE routing-collapse quality oracle plants a healthy
+    /// codes'-units active mass of ~`0.2` and asserts recovery of at least
+    /// half of it; the floor therefore sits at `0.5 × 0.2 = 0.1` — breach
+    /// exactly when the fit enters the region the quality assertion already
+    /// calls collapsed. Placing the floor *at* the healthy operating mass
+    /// (the previous `0.2`) made a healthy converging IBP-MAP fit oscillate
+    /// across the floor, and every spurious breach re-seeds from the scaffold
+    /// (`obj.reset()`) and re-enters a heavier regime — re-seed thrash that
+    /// discards converged routing mass each bounce and pins the fit near the
+    /// cold seed: itself a collapse mechanism. Genuine saddle collapse
+    /// (~`0.03` observed mass) is still far below this floor.
+    pub const DEFAULT_FLOOR: f64 = 0.1;
 
     #[must_use]
     pub fn default_floor() -> Self {
@@ -954,10 +983,25 @@ fn default_coupled_schedules() -> CoupledSchedules {
 /// [`ContinuationPath::heavy_entry_for_rho`] so the τ leg has one source.
 #[must_use]
 fn default_temperature_schedule() -> GumbelTemperatureSchedule {
-    /// Diffuse entry τ (the schedule's `tau_start`) at `s = 1`.
-    const DEFAULT_ENTRY_TAU: f64 = 2.0;
-    /// Sharp target τ (`tau_min`) at `s = 0`.
-    const DEFAULT_TARGET_TAU: f64 = 0.1;
+    /// Diffuse entry τ (the schedule's `tau_start`) at `s = 1`. Entry
+    /// heaviness is tied to the cold-seed logit scale: the production IBP
+    /// residual-energy seed emits logits at gain `4.0`
+    /// (`SAE_RESIDUAL_SEED_GAIN` in `gam-pyffi`), so seeded logits span
+    /// roughly `±4`. Entry τ ≥ that gain keeps every seeded row in the
+    /// near-linear band of the gate (`|logit|/τ ≤ 1`), where the assignment
+    /// map is smooth and contractive — no row enters pre-saturated against
+    /// the argmax cliff. The previous `2.0` entry let ±4-gain seeds start at
+    /// `|logit|/τ = 2`, already in the saturated tail.
+    const DEFAULT_ENTRY_TAU: f64 = 4.0;
+    /// Target τ (`tau_min`) at `s = 0`. The `s = 0` endpoint of every leg
+    /// must be the REAL objective's value, and the production IBP-MAP
+    /// assignment temperature (gamfit `sae_manifold_fit`, `ibp_map` path) is
+    /// `τ = 0.5`. The previous `0.1` target over-sharpened the leg *past*
+    /// the real objective, which tightened the τ-tied logit trust region at
+    /// arrival to radius `0.4` (vs `2.0` at the true operating τ) — choking
+    /// exactly the late-walk logit growth the routing mass needs to climb
+    /// from the diffuse entry to the planted level.
+    const DEFAULT_TARGET_TAU: f64 = 0.5;
     GumbelTemperatureSchedule::new(
         DEFAULT_ENTRY_TAU,
         DEFAULT_TARGET_TAU,
@@ -1170,8 +1214,9 @@ mod tests {
             ActiveMassFloor::default_floor()
                 .check(mean_active_mass(saddle.view()))
                 .is_none(),
-            "uniform 0.5 is above the 0.2 floor — saddle detection is about \
-             collapse below 0.2, the routing-collapse threshold"
+            "uniform 0.5 is above the floor — saddle detection is about \
+             collapse below the failure boundary (0.5× the planted healthy \
+             mass), not the healthy operating point"
         );
     }
 
