@@ -813,6 +813,73 @@ struct IsometryHvpState<'a> {
     wj_rows: Vec<Array2<f64>>,
 }
 
+/// Build the per-row Gauss-Newton Hessian-vector product for `IsometryPenalty`,
+/// shared between the exact `hvp` (where it is the GN piece, added to the K
+/// residual term) and `psd_majorizer_hvp` (where it is the full PSD operator).
+///
+/// Computes `dgdt[a, b, c] = ∂g_{ab}/∂t_c
+///                          = Σ_i (J²_{i,a,c}·WJ_{i,b} + WJ_{i,a}·J²_{i,b,c})`
+/// once, then derives
+///   `delta_g[a, b] = Σ_c dgdt[a, b, c]·v[n·d+c]`           (directional dG)
+///   `gn_out[c]     = Σ_{a,b} dgdt[a, b, c]·delta_g[a, b]`  (GN HVP row)
+///
+/// The caller multiplies `gn_out` by μ and writes it into the per-row output
+/// slice. `delta_g` is returned so `hvp` can reuse it inside the K residual
+/// loop, where `(g − g_ref)·B·v` is summed against `dgdt` and the third
+/// decoder jet `K`.
+///
+/// Returning a single tensor + contraction (instead of recomputing `dgdt`
+/// inline in two functions) collapses four duplicated O(d²·d·p) loops into
+/// a single O(d³·p) build, and — crucially — makes the GN summation order
+/// identical across `hvp` and `psd_majorizer_hvp` so the two paths agree
+/// bit-exactly when the residual `g − g_ref` vanishes. Without that
+/// identity the exact-vs-PSD-equality regression test fails by ~1 ULP at
+/// values of magnitude 10⁶ purely from `(vc · Σ_i …)` vs `Σ_i (vc · …)`
+/// reassociating differently in fp64.
+fn isometry_row_gn_hvp(
+    jac2: ArrayView2<'_, f64>,
+    wj: ArrayView2<'_, f64>,
+    v: ArrayView1<'_, f64>,
+    n: usize,
+    d: usize,
+    p: usize,
+) -> (Array2<f64>, Array1<f64>) {
+    let mut dgdt = ndarray::Array3::<f64>::zeros((d, d, d));
+    for a in 0..d {
+        for b in 0..d {
+            for c in 0..d {
+                let mut s = 0.0;
+                for i in 0..p {
+                    s += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
+                    s += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
+                }
+                dgdt[[a, b, c]] = s;
+            }
+        }
+    }
+    let mut delta_g = Array2::<f64>::zeros((d, d));
+    for a in 0..d {
+        for b in 0..d {
+            let mut s = 0.0;
+            for c in 0..d {
+                s += dgdt[[a, b, c]] * v[n * d + c];
+            }
+            delta_g[[a, b]] = s;
+        }
+    }
+    let mut gn_out = Array1::<f64>::zeros(d);
+    for c in 0..d {
+        let mut s = 0.0;
+        for a in 0..d {
+            for b in 0..d {
+                s += dgdt[[a, b, c]] * delta_g[[a, b]];
+            }
+        }
+        gn_out[c] = s;
+    }
+    (delta_g, gn_out)
+}
+
 impl IsometryPenalty {
     pub const DEFAULT_VALUE_ON_MISSING_CACHE: f64 = 0.0;
 
@@ -1316,36 +1383,9 @@ impl IsometryPenalty {
 
         for n in 0..n_obs {
             let wj = &state.wj_rows[n];
-            let mut delta_g = Array2::<f64>::zeros((d, d));
-            for a in 0..d {
-                for b in 0..d {
-                    let mut s = 0.0;
-                    for c in 0..d {
-                        let vc = v[n * d + c];
-                        if vc == 0.0 {
-                            continue;
-                        }
-                        for i in 0..p {
-                            s += vc * jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                            s += vc * wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-                        }
-                    }
-                    delta_g[[a, b]] = s;
-                }
-            }
+            let (_delta_g, gn_out) = isometry_row_gn_hvp(jac2.view(), wj.view(), v, n, d, p);
             for c in 0..d {
-                let mut acc = 0.0;
-                for a in 0..d {
-                    for b in 0..d {
-                        let mut dg_c = 0.0;
-                        for i in 0..p {
-                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-                        }
-                        acc += dg_c * delta_g[[a, b]];
-                    }
-                }
-                out[n * d + c] = mu * acc;
+                out[n * d + c] = mu * gn_out[c];
             }
 
             for c in 0..d {
@@ -1715,41 +1755,9 @@ impl AnalyticPenalty for IsometryPenalty {
             let Some(wj) = self.weighted_jacobian_row(n, d) else {
                 return Array1::<f64>::zeros(v.len());
             };
-            // s_{ab} = Σ_c (∂g_{ab}/∂t_c) v_c — the directional derivative of
-            // the pullback metric entry g_{ab} along v at row n.
-            let mut sg = Array2::<f64>::zeros((d, d));
-            for a in 0..d {
-                for b in 0..d {
-                    let mut s = 0.0;
-                    for c in 0..d {
-                        let vc = v[n * d + c];
-                        if vc == 0.0 {
-                            continue;
-                        }
-                        let mut dg_c = 0.0;
-                        for i in 0..p {
-                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-                        }
-                        s += dg_c * vc;
-                    }
-                    sg[[a, b]] = s;
-                }
-            }
-            // (B_GN v)_c = μ Σ_{a,b} (∂g_{ab}/∂t_c) · s_{ab}.
+            let (_delta_g, gn_out) = isometry_row_gn_hvp(jac2.view(), wj.view(), v, n, d, p);
             for c in 0..d {
-                let mut acc = 0.0;
-                for a in 0..d {
-                    for b in 0..d {
-                        let mut dg_c = 0.0;
-                        for i in 0..p {
-                            dg_c += jac2[[n, (i * d + a) * d + c]] * wj[[i, b]];
-                            dg_c += wj[[i, a]] * jac2[[n, (i * d + b) * d + c]];
-                        }
-                        acc += dg_c * sg[[a, b]];
-                    }
-                }
-                out[n * d + c] = mu * acc;
+                out[n * d + c] = mu * gn_out[c];
             }
         }
         out
