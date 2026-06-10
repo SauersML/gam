@@ -89,7 +89,7 @@
 //! `O(m · k_directions)` row passes vs the existing single row pass.
 //! See `bernoulli_marginal_slope::row_primary_third_trace_gradient_with_moments`.
 //!
-//! ## Orthogonal axis: row subsampling for biobank-scale fits
+//! ## Orthogonal axis: row subsampling for large-scale fits
 //!
 //! Trace estimators here reduce work *within* the Hessian structure
 //! for a fixed row set. The marginal-slope families have a separate,
@@ -460,7 +460,7 @@ pub trait HessianOperator: Send + Sync {
     ///
     /// Streams the rows of `X` through the design's `try_row_chunk` so
     /// operator-backed (Lazy) designs never materialize the full (n×p)
-    /// block at biobank scale.
+    /// block at large scale.
     fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
         assert!(self.logdet_traces_match_hinv_kernel());
         let n = x.nrows();
@@ -1055,7 +1055,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         //
         // This method returns the correction (dH/dρₖ − Aₖ), which is NEGATIVE.
         // Stays matrix-free: `matrixvectormultiply` and `xt_diag_x_signed_op`
-        // route through the operator-backed design's chunked kernels at biobank
+        // route through the operator-backed design's chunked kernels at large-scale
         // scale, so we never materialize the full (n×p) dense block.
         let x_v = self.x_transformed.matrixvectormultiply(v_k); // X vₖ: n-vector
 
@@ -1117,7 +1117,7 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         // H_{kl} includes contributions from both c (third) and d (fourth) derivatives:
         //   Xᵀ diag(c ⊙ X u_{kl} + d ⊙ (X vₖ) ⊙ (X vₗ)) X
         // Stays matrix-free via the design's `matrixvectormultiply` and
-        // `xt_diag_x_signed_op` so biobank-scale designs never densify the (n×p)
+        // `xt_diag_x_signed_op` so large-scale designs never densify the (n×p)
         // block.
         let x_vk = self.x_transformed.matrixvectormultiply(v_k);
         let x_vl = self.x_transformed.matrixvectormultiply(v_l);
@@ -2263,7 +2263,7 @@ fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64)
 ///
 /// The cache trades memory for arithmetic: a 32-axis ψ-sweep that would
 /// otherwise repeat the same `O(n · p · rank)` GEMM for every axis hits
-/// the same cache slot 32 times. At biobank scale that is the
+/// the same cache slot 32 times. At large scale that is the
 /// difference between minutes and seconds of design-GEMM work (see
 /// [`ImplicitHyperOperator::trace_projected_factor_cached`] for the
 /// usage rationale).
@@ -2273,7 +2273,7 @@ fn projected_factor_value_fingerprint(factor: ArrayView2<'_, f64>) -> (u64, u64)
 /// evicted until it fits. A budget of `0` (or `usize::MAX`) disables
 /// eviction. The default is `Self::DEFAULT_BUDGET_BYTES` — large
 /// enough to hold any realistic working set for in-memory problems
-/// while still bounding worst-case peak resident memory at biobank
+/// while still bounding worst-case peak resident memory at large-scale
 /// scale, where a single `(n, rank) = (320K, 95)` projection consumes
 /// ~243 MiB and a sweep over many distinct factors could otherwise
 /// pin tens of GiB.
@@ -2320,7 +2320,7 @@ impl Default for ProjectedFactorCache {
 }
 
 impl ProjectedFactorCache {
-    /// Default byte budget for the cache. Aligned with the biobank-scale
+    /// Default byte budget for the cache. Aligned with the large-scale
     /// `ResourcePolicy::max_single_materialization_bytes` (2 GiB) so
     /// production REML evaluations on typical hardware stay bounded
     /// without artificially throttling small problems whose entire
@@ -3720,9 +3720,9 @@ impl HyperOperator for ImplicitHyperOperator {
     /// which calls `mul_vec_into` per column of `F` (rank columns). On a
     /// lazy Duchon / Matérn / CTN design each `mul_vec_into` triggers a
     /// full `O(n · p · kernel_eval)` row-streamed matvec — and with rank ≈ p
-    /// at biobank shape (16D-Duchon-aniso 32 ψ-axes, p ≈ 95, n = 320 K)
+    /// at large-scale shape (16D-Duchon-aniso 32 ψ-axes, p ≈ 95, n = 320 K)
     /// the per-axis trace landed at ~30 s. With 32 axes per outer Hessian
-    /// eval and ~5 outer iters that's the ~1 hr biobank timeout.
+    /// eval and ~5 outer iters that's the ~1 hr large-scale timeout.
     ///
     /// Algebra:
     /// ```text
@@ -3743,7 +3743,7 @@ impl HyperOperator for ImplicitHyperOperator {
     /// the chunk, never materialising full XF or DXF.
     ///
     /// This replaces the previous `rank`-many `forward_mul` apply loop. On
-    /// the biobank-shape margslope-aniso-duchon16d shard each per-axis trace
+    /// the large-scale margslope-aniso-duchon16d shard each per-axis trace
     /// drops from ~30 s to a single chunked-GEMM cost.
     fn trace_projected_factor(&self, factor: &Array2<f64>) -> f64 {
         assert_eq!(factor.nrows(), self.p);
@@ -3756,7 +3756,7 @@ impl HyperOperator for ImplicitHyperOperator {
         self.trace_projected_factor_with_xf(factor, xf.view())
     }
 
-    /// Cached variant — *the* hot-path optimisation for biobank-shape outer
+    /// Cached variant — *the* hot-path optimisation for large-scale outer
     /// gradient/Hessian sweeps. Every ψ-axis built atop the same `x_design`
     /// (e.g. all 32 ψ-axes of a marginal-slope model, or the same axis hit
     /// from `g_factor` and `w_factor` traces) shares one chunked
@@ -3764,7 +3764,7 @@ impl HyperOperator for ImplicitHyperOperator {
     /// [`ProjectedFactorCache`]. With 32 axes per outer-gradient sweep and
     /// O(rank) more cross-axis traces inside the outer-Hessian build, the
     /// cache turns 32× redundant `O(n · p · rank)` GEMMs into a single one
-    /// per outer iter. At biobank shape (`n = 320 K`, `p = rank = 95`) that
+    /// per outer iter. At large-scale shape (`n = 320 K`, `p = rank = 95`) that
     /// is the difference between minutes and seconds of design-GEMM work.
     fn trace_projected_factor_cached(
         &self,
@@ -3798,7 +3798,7 @@ fn byte_balanced_row_chunk(cols: usize, n_rows: usize) -> usize {
 impl ImplicitHyperOperator {
     /// Chunked `X · F` via faer SIMD-parallel GEMM. The chunk-row sizing
     /// targets ~8 MiB live blocks so the (chunk_n × p) row slice and
-    /// (chunk_n × rank) result both stay in L2/L3 across realistic biobank
+    /// (chunk_n × rank) result both stay in L2/L3 across realistic large-scale
     /// shapes; the kernel mirrors `xt_logdet_kernel_x_diagonal`'s sizing
     /// rule. Caller wraps this in [`Self::cached_xf`] when invariance
     /// across ψ-axes lets one matrix serve every axis at this `(x_design,
@@ -3860,7 +3860,7 @@ impl ImplicitHyperOperator {
         let u_knot = self.implicit_deriv.unproject_matrix(&factor.view());
 
         // Match the chunk sizing `xt_logdet_kernel_x_diagonal` uses so the
-        // live block stays in L2/L3 across realistic biobank shapes.
+        // live block stays in L2/L3 across realistic large-scale shapes.
         let chunk_rows = byte_balanced_row_chunk(self.p + rank, n_obs);
 
         let w = self.w_diag.as_ref();
@@ -5075,7 +5075,7 @@ impl PenaltySubspaceTrace {
     /// total cost `O(n · p · r + n · r²)` — strictly cheaper than `n` calls
     /// to [`Self::apply`] because the `n × p · p × r` GEMM streams the
     /// `p`-axis once.  Streams `X` through `try_row_chunk` so operator-backed
-    /// (Lazy) designs at biobank scale never densify the full `(n × p)` block.
+    /// (Lazy) designs at large scale never densify the full `(n × p)` block.
     pub fn xt_projected_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
         let n = x.nrows();
         let p = x.ncols();
@@ -5154,7 +5154,7 @@ impl PenaltySubspaceTrace {
     /// outer-gradient/Hessian formulas when the rank-deficient LAML fix is
     /// active (`penalty_subspace_trace = Some`). The full `H⁻¹ · a` solve
     /// amplifies any component of `a` outside `range(H_free)` by
-    /// `1/σ_min(H_active_normal)` — which on biobank-scale survival
+    /// `1/σ_min(H_active_normal)` — which on large-scale survival
     /// marginal-slope is ~10¹² and propagates into outer gradients of
     /// magnitude 10¹⁴, suppressed by the envelope tripwire downstream and
     /// killing every seed before the fit can take a step. This operator may
@@ -7556,7 +7556,7 @@ pub fn reml_laml_evaluate(
         // pseudo-inverse on the kernel's identified subspace (`range(H_pen)`
         // in the intrinsic #901 form; historically `range(S_+)`) — not the
         // regularized full `H⁻¹`. The full-H solve at near-singular boundary
-        // states (the biobank survival marginal-slope pathology) amplifies
+        // states (the large-scale survival marginal-slope pathology) amplifies
         // floating-point noise in `r` along sub-threshold directions by
         // `1/σ_min(H) ≈ 10¹²`, which then propagates into a 10¹³-magnitude
         // gradient component and traps the outer optimizer at max-iter.
@@ -7730,7 +7730,7 @@ pub fn reml_laml_evaluate(
         //     lives in T and the lifted kernel gives the minimum-norm
         //     solution there. The full `hop.solve_multi` amplifies any
         //     component of `a` outside `range(H_free)` by
-        //     `1/σ_min(H_active_normal)` — which on biobank-scale
+        //     `1/σ_min(H_active_normal)` — which on large-scale
         //     survival marginal-slope (commit d6b17a7f) is ~10¹² and
         //     trips the envelope-consistency check downstream; the
         //     lifted kernel drops that null-space contribution by
@@ -8120,7 +8120,7 @@ pub fn reml_laml_evaluate(
     // Both ρ and ext coordinates are processed through outer_gradient_entry()
     // so that the three-term formula (penalty + trace − det) is written once.
 
-    // Exact trace batching for operator-backed ρ corrections.  The hot biobank
+    // Exact trace batching for operator-backed ρ corrections.  The hot large-scale
     // GAMLSS path has many Duchon smoothing coordinates whose correction
     // operators share the same design and spectral factor.  Evaluating them one
     // by one repeats the same `X·F` projection and row-kernel setup for every
@@ -8298,7 +8298,7 @@ pub fn reml_laml_evaluate(
     //
     // The correction strictly vanishes when r = 0.  When the inner exit
     // accepts ‖r‖ > 0 on a coordinate whose H block is poorly conditioned
-    // (e.g., the failing biobank survival marginal-slope case where ‖H⁻¹‖
+    // (e.g., the failing large-scale survival marginal-slope case where ‖H⁻¹‖
     // is ~10¹² on the one unpinned λ), the dropped term inflates by
     // ‖H⁻¹‖·‖r‖ and the envelope reports a gradient component orders of
     // magnitude past anything the function can actually produce — TR
@@ -8385,7 +8385,7 @@ pub fn reml_laml_evaluate(
             // holds a `debug_stash::CaptureGuard`. The capture is far from
             // free — it re-derives the drift, runs three extra spectral
             // traces (one of them the unprojected full-space trace) and a
-            // second cubic IFT-correction pass — which at biobank scale
+            // second cubic IFT-correction pass — which at large scale
             // multiplied the dominant `ext_coord_trace` stage several-fold
             // per outer eval. Production gradient evals therefore skip it
             // entirely; the consuming FD tests opt in via the guard.
@@ -8584,7 +8584,7 @@ pub fn reml_laml_evaluate(
     // still predicts a sqrt(eps)-step cost change > 4*|cost|, it is not a
     // valid local derivative of this cost surface. The Hessian computed from
     // the same ill-conditioned inner state would also be untrustworthy and
-    // would just be discarded by the outer optimizer, and for biobank-scale
+    // would just be discarded by the outer optimizer, and for large-scale
     // custom families the assembly can take 20+ minutes per evaluation.
     // Decide once here, then reuse the verdict for both the gradient and
     // Hessian outputs.
@@ -8703,9 +8703,9 @@ pub fn reml_laml_evaluate(
         }
         let hessian_kernel = effective_deriv.outer_hessian_derivative_kernel();
         // Cost selects representation (operator vs dense), not capability.
-        // The (n, p, K) scale rule routes biobank-scale problems through the
+        // The (n, p, K) scale rule routes large-scale problems through the
         // matrix-free Hv operator path even when the per-axis thresholds
-        // (`p >= 512` or `K >= 32`) alone do not fire.  At Matern biobank
+        // (`p >= 512` or `K >= 32`) alone do not fire.  At Matern large-scale
         // scale (n=320 000, p=101, K=6) the dense path's per-outer-eval
         // O(K·n·p²) assembly is ≈ 2·10¹⁰ FLOPs and dominates wall-clock; the
         // operator path absorbs it via O(n·p) HVPs.
@@ -9130,7 +9130,7 @@ fn compute_adjoint_z_c(
         .and(leverage)
         .for_each(|w, &c, &h| *w = c * h);
     // Matrix-free Xᵀ · weighted via DesignMatrix transpose-apply, so
-    // operator-backed (Lazy) designs at biobank scale never densify.
+    // operator-backed (Lazy) designs at large scale never densify.
     let v = ing.x.transpose_vector_multiply(&weighted);
     // Adjoint identity: tr(Kernel · C[u]) = uᵀ · Xᵀ(c ⊙ h^G), where the
     // kernel and the leverage `h^G` must come from the SAME operator.
@@ -9174,7 +9174,7 @@ fn compute_fourth_derivative_trace(
         return Ok(None);
     };
     // Matrix-free X·v via DesignMatrix matvec; operator-backed (Lazy)
-    // designs at biobank scale stream through their chunked kernels
+    // designs at large scale stream through their chunked kernels
     // instead of materializing the full (n×p) block.
     let x_vk = ing.x.matrixvectormultiply(v_k);
     let x_vl = ing.x.matrixvectormultiply(v_l);
@@ -9437,7 +9437,7 @@ fn compute_base_h2_traces(
     // Dense-spectral batched path: collect every operator-backed pair into a
     // single chunked sweep so the implicit design (compute_xf + per-axis
     // kernel scalars) is traversed once instead of `pairs.len()` times. At
-    // biobank scale this turns the 16+ per-call `trace_logdet_operator`
+    // large scale this turns the 16+ per-call `trace_logdet_operator`
     // hot spots into a single batched evaluation.
     if subspace.is_none()
         && let Some(ds) = hop.as_exact_dense_spectral()
@@ -9974,16 +9974,16 @@ fn compute_outer_hessian(
 
     // Build pure Aₖ = λₖ Rₖᵀ Rₖ and Ḣₖ = Aₖ + correction for all k.
     //
-    // We store both because:
-    //   - Ḣₖ (first derivative of H) is needed for cross-trace Y_k = H⁻¹ Ḣₖ
-    //   - Aₖ (penalty derivative only) is needed for the Ḧ_{kl} base and for
-    //     the second implicit derivative β_{kl} = H⁻¹(Ḣₗ vₖ + Aₖ vₗ − δₖₗ Aₖ β̂)
+    // Both quantities are consumed downstream:
+    //   - Ḣₖ (first derivative of H) drives the cross-trace Y_k = H⁻¹ Ḣₖ
+    //   - Aₖ (penalty derivative only) drives the Ḧ_{kl} base and the second
+    //     implicit derivative β_{kl} = H⁻¹(Ḣₗ vₖ + Aₖ vₗ − δₖₗ Aₖ β̂)
     //
-    // `a_k_matrices[idx]` holds the *pure* Aₖ only when it differs from Ḣₖ, i.e.
-    // when a correction was applied to that coordinate; otherwise it is `None`
-    // and the diagonal base term reuses `h_k_matrices[idx]` directly. This drops
-    // the per-coordinate Aₖ clone (issue #922) in the common no-correction
-    // (Gaussian) path where Aₖ ≡ Ḣₖ.
+    // But Aₖ ≡ Ḣₖ unless a correction was applied to that coordinate, so
+    // `a_k_matrices[idx]` stores the pure Aₖ only in that case; otherwise it is
+    // `None` and the diagonal base term reads `h_k_matrices[idx]` directly. This
+    // drops the per-coordinate Aₖ clone (issue #922) in the common no-correction
+    // (Gaussian) path.
     let mut a_k_matrices: Vec<Option<Array2<f64>>> = Vec::with_capacity(k);
     let mut h_k_matrices: Vec<Array2<f64>> = Vec::with_capacity(k);
     for idx in 0..k {
@@ -10320,7 +10320,7 @@ fn compute_outer_hessian(
     // disjoint hess[[kk, ll]]/hess[[ll, kk]] cell pair) and the dominant
     // per-pair cost — `compute_ift_correction_trace` → `kernel.trace_operator`
     // → `op.mul_mat(U_S)` materialising a CompositeHyperOperator over a
-    // (p × r) factor — scales like O(family_callback × r × n). At biobank
+    // (p × r) factor — scales like O(family_callback × r × n). At large-scale
     // shape (n ≈ 2·10⁵, r ≈ 24, K = 8) the sequential walk dominates the
     // outer-Hessian wall-clock by 1–2 orders of magnitude, so we dispatch
     // the pair list through rayon and stitch the symmetric Array2 sequentially.
@@ -14324,13 +14324,13 @@ impl HessianOperator for DenseSpectralOperator {
 
     fn xt_logdet_kernel_x_diagonal(&self, x: &DesignMatrix) -> Array1<f64> {
         // h^G_i = ‖(X G)_{i,:}‖² where G_ε = G Gᵀ and G = self.g_factor.
-        // The dominant cost at biobank scale is the (n × p)·(p × rank) matmul
+        // The dominant cost at large scale is the (n × p)·(p × rank) matmul
         // — for matern60 with n=320K, p=101 that's ~3.3 GFLOPs and the
         // ndarray default `.dot()` runs single-threaded (no BLAS feature
         // enabled in this crate's build), so we route through faer's parallel
         // SIMD GEMM. For operator-backed (Lazy) designs we additionally
         // stream by row chunk so we never materialize the full (n×p) block
-        // at biobank scale.
+        // at large scale.
         let n = x.nrows();
         let p = x.ncols();
         let rank = self.g_factor.ncols();
@@ -17957,7 +17957,7 @@ mod tests {
 
     /// **Mechanism test, line of evidence 1**: when the near-null
     /// eigenvalue of H sits in `null(S_+)` (the unpenalized parametric
-    /// direction — intercept/sex/prs_z for the failing biobank survival
+    /// direction — intercept/sex/prs_z for the failing large-scale survival
     /// marginal-slope), the full-H `r ↦ H⁻¹ r` solve amplifies any
     /// spurious noise component of `r` in that direction by
     /// `1/σ_min(H)`, while the projected pseudo-inverse drops that
@@ -18000,7 +18000,7 @@ mod tests {
     /// **Mechanism test, line of evidence 2** — the failure mode itself:
     /// when `r` AND `a_k` both have spurious components in the near-null
     /// direction (the realistic floating-point pattern at the failing
-    /// biobank iterate), the full-H solve produces a `~ηξ/σ_min`-scale
+    /// large-scale iterate), the full-H solve produces a `~ηξ/σ_min`-scale
     /// blow-up while the projected pseudo-inverse stays bounded. With
     /// `η = ξ = 1e-3` and `σ_min = 1e-12`, the full-H result is `1e6`
     /// while the projection drops it to 0 — six orders of magnitude
@@ -18029,7 +18029,7 @@ mod tests {
         );
         // Full-H solve: `η · (1/σ_min) · ξ = 1e-3 · 1e12 · 1e-3 = 1e6`.
         // This is the noise-amplification mechanism behind the observed
-        // |g|∞ ≈ 10¹³ on the failing biobank iterate (scale it by the
+        // |g|∞ ≈ 10¹³ on the failing large-scale iterate (scale it by the
         // tighter noise floor and the per-coord magnitude of a_k).
         let expected_full = eta * xi / small_eig;
         assert_relative_eq!(corr_full, expected_full, max_relative = 1e-12);
@@ -18048,7 +18048,7 @@ mod tests {
     /// projection cannot help — `H_proj` inherits the same small
     /// eigenvalue and the bilinear form has the same amplification. This
     /// test pins that limit so future readers know exactly where the fix
-    /// breaks down; if the failing-biobank H matches this geometry the
+    /// breaks down; if the failing-large-scale H matches this geometry the
     /// fix is the wrong remediation and we need truncated-SVD /
     /// Tikhonov regularization instead. The current production
     /// experience (gradient drops by orders of magnitude after the fix)
@@ -18136,7 +18136,7 @@ mod tests {
 
     /// **Mechanism test, line of evidence 5 (production geometry)**: an
     /// SPD `H` with a small eigenvalue whose eigenvector MIXES
-    /// `range(S_+)` and `null(S_+)`. This is the geometry the biobank
+    /// `range(S_+)` and `null(S_+)`. This is the geometry the large-scale
     /// survival marginal-slope hits at the failing iterate: the unpenalized
     /// parametric columns (intercept, sex, prs_z) interact with the
     /// penalized Duchon centers via `Xᵀ W X` off-diagonal coupling, so the
@@ -18167,7 +18167,7 @@ mod tests {
     ///         the other eigenvalues; `H_proj⁻¹` stays `O(1)`).
     ///       - Result: `r_S · H_proj⁻¹ · a_k_S` is `O(1)`.
     ///
-    /// This test reproduces the FAILING-BIOBANK geometry and asserts
+    /// This test reproduces the FAILING-LARGE_SCALE geometry and asserts
     /// FOUR INDEPENDENT properties:
     ///   (P1) helper matches an independent eigendecomposition-based
     ///        ground-truth bilinear to 1e-12 (validates the inversion
@@ -18756,7 +18756,7 @@ mod tests {
     }
 
     // ───────────────────────────────────────────────────────────────────────
-    // Replicates the AoU biobank marginal-slope failure mechanism in three
+    // Replicates the large-scale large-scale marginal-slope failure mechanism in three
     // tiers, each pinning a distinct code-level math issue observed in
     // the failing log:
     //
@@ -18995,7 +18995,7 @@ mod tests {
         }
     }
 
-    /// Hard reproducer for the AoU missing-residual path. In fixed-dispersion
+    /// Hard reproducer for the large-scale missing-residual path. In fixed-dispersion
     /// LAML, an envelope-inconsistent derivative request with
     /// `kkt_residual=None` is not a recoverable value-gradient result: the
     /// evaluator cannot distinguish "exact KKT" from "convergent inner path
@@ -23085,7 +23085,7 @@ mod tests {
         // This is the parameterisation under which the IFT correction is
         // exact (∂V/∂β = r, no `denom/dp` chain factor as in the profiled
         // Gaussian path).  Matches the production survival-marginal-slope
-        // path that the biobank failure exercises.
+        // path that the large-scale failure exercises.
         fn to_fixed<'a>(mut sol: InnerSolution<'a>) -> InnerSolution<'a> {
             sol.dispersion = DispersionHandling::Fixed {
                 phi: 1.0,
@@ -23211,7 +23211,7 @@ mod tests {
 
     /// The analytic rho Hessian must differentiate the same KKT-residual
     /// correction used by the value and gradient. This is the minimized
-    /// reproduction of the biobank failure mode: an off-KKT inner mode with a
+    /// reproduction of the large-scale failure mode: an off-KKT inner mode with a
     /// finite residual made the envelope Hessian inconsistent, so ARC chased a
     /// curvature model for the wrong objective.
     #[test]

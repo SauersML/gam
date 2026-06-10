@@ -127,7 +127,7 @@ pub fn route_through_gpu(op: DispatchOp) -> Option<&'static GpuRuntime> {
 /// second device costs more than the GEMM time it saves, so a small batch stays
 /// on the single primary device. This is a fixed, conservatively-large constant
 /// (magic-by-default; no flag) — multi-GPU only kicks in for genuinely large
-/// batches such as biobank-scale Arrow-Schur / Stage-3 blocks.
+/// batches such as large-scale Arrow-Schur / Stage-3 blocks.
 #[cfg(target_os = "linux")]
 const MULTI_GPU_BATCH_FLOOR: usize = 64;
 
@@ -485,7 +485,7 @@ fn leverage_chunk_rows(cols: usize, n_rows: usize) -> usize {
 ///
 /// `G` is the `(p × rank)` spectral factor with `G_ε(H) = G Gᵀ`; the per-row
 /// leverage is the squared norm of the i-th row of `X G`. This is the dominant
-/// n-dependent cost of every REML outer evaluation at biobank scale (issue
+/// n-dependent cost of every REML outer evaluation at large scale (issue
 /// #922), and historically ran only on the CPU while the device pool idled.
 ///
 /// The row dimension is split into byte-balanced chunks scattered across the
@@ -605,24 +605,6 @@ pub fn try_fast_joint_hessian_2x2(
         let runtime = route_through_gpu(DispatchOp::JointHessian2x2 { n, pa, pb })?;
         cuda_backend::joint_hessian_2x2(runtime, x_a, x_b, w_aa, w_ab, w_bb)
     }
-}
-
-#[inline]
-#[must_use]
-pub fn should_dispatch_xt_diag_x(n: usize, p: usize) -> bool {
-    route_through_gpu(DispatchOp::XtDiagX { n, p }).is_some()
-}
-
-#[inline]
-#[must_use]
-pub fn should_dispatch_xt_diag_y(n: usize, px: usize, q: usize) -> bool {
-    route_through_gpu(DispatchOp::XtDiagY { n, px, q }).is_some()
-}
-
-#[inline]
-#[must_use]
-pub fn should_dispatch_joint_hessian(n: usize, pa: usize, pb: usize) -> bool {
-    route_through_gpu(DispatchOp::JointHessian2x2 { n, pa, pb }).is_some()
 }
 
 #[inline]

@@ -14,10 +14,6 @@ use gam::gpu;
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::Array2;
 
-fn close(a: f64, b: f64, tol: f64) -> bool {
-    (a - b).abs() <= tol * a.abs().max(b.abs()).max(1.0)
-}
-
 #[test]
 fn gpu_spectral_leverage_diagonal_matches_cpu_when_available() {
     // n·p² = 60_000·40² = 9.6e7 → 2·n·p² = 1.92e8 ≥ xtwx_flops_min (1e8) and
@@ -46,14 +42,18 @@ fn gpu_spectral_leverage_diagonal_matches_cpu_when_available() {
         "GPU leverage diagonal must have one entry per design row"
     );
 
-    // Reference: h[i] = ‖(X G)_{i,:}‖² computed on the CPU.
+    // Reference: h[i] = ‖(X G)_{i,:}‖² computed on the CPU. The only operation
+    // relocated to the device is the X·G GEMM, so the worst relative error
+    // reflects cuBLAS-vs-faer reduction order alone and must sit at f64 noise.
     let xg = x.dot(&g);
-    for i in 0..n {
-        let cpu: f64 = xg.row(i).iter().map(|&v| v * v).sum();
-        assert!(
-            close(gpu_lev[i], cpu, 1e-8),
-            "GPU spectral leverage row {i} ({}) must match CPU reference ({cpu}) to 1e-8",
-            gpu_lev[i]
-        );
+    let mut worst_rel = 0.0f64;
+    for (i, row) in xg.outer_iter().enumerate() {
+        let cpu: f64 = row.iter().map(|&v| v * v).sum();
+        let rel = (gpu_lev[i] - cpu).abs() / cpu.abs().max(1.0);
+        worst_rel = worst_rel.max(rel);
     }
+    assert!(
+        worst_rel <= 1e-8,
+        "GPU spectral leverage worst relative error {worst_rel:e} must be ≤ 1e-8 vs CPU ‖X·G‖²"
+    );
 }
