@@ -8891,31 +8891,41 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
 
     crate::init_parallelism();
 
-    let n = 80usize;
-    // 2D spatial covariate for the matern logslope smooth + a binary response.
-    let mut data = Array2::<f64>::zeros((n, 2));
+    // Larger, well-identified, NON-separable fixture so the coupled
+    // marginal-slope inner Newton converges (a hard-threshold y on small n +
+    // an intercept-only marginal triggers the #979 phantom-multiplier grind).
+    let n = 160usize;
+    // 2D spatial covariate for the matern logslope smooth + a marginal covariate.
+    let mut data = Array2::<f64>::zeros((n, 3));
     for i in 0..n {
         let x0 = (i as f64 / (n as f64 - 1.0)) * 2.0 - 1.0;
         let x1 = (0.41 * i as f64).sin() * 0.6 + 0.25 * x0;
+        let xm = (0.23 * i as f64).cos() * 0.8; // marginal covariate (col 2)
         data[[i, 0]] = x0;
         data[[i, 1]] = x1;
+        data[[i, 2]] = xm;
     }
+    // Bernoulli draw from a SMOOTH probability (logit) with a deterministic
+    // pseudo-uniform, so the data is genuinely non-separable (no hard threshold)
+    // and both blocks are identified.
     let y: Array1<f64> = Array1::from_iter((0..n).map(|i| {
-        let lin = 0.4 * data[[i, 0]] - 0.3 * data[[i, 1]];
-        if lin + 0.2 * ((i * 7 + 3) % 5) as f64 / 5.0 - 0.2 > 0.0 {
-            1.0
-        } else {
-            0.0
-        }
+        let lin = 0.5 + 0.7 * data[[i, 2]] - 0.4 * data[[i, 0]] + 0.3 * data[[i, 1]];
+        let p = 1.0 / (1.0 + (-lin).exp());
+        let u = ((i * 2654435761usize) % 1000) as f64 / 1000.0;
+        if u < p { 1.0 } else { 0.0 }
     }));
     let z: Array1<f64> =
         Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * ((i % 9) as f64 + 0.5) / 9.0));
     let weights = Array1::from_elem(n, 1.0);
+    // Marginal covariate column (intercept + this) for a well-identified,
+    // less-coupled marginal block.
+    let marginal_cov: Array1<f64> = data.column(2).to_owned();
 
     // Base matern logslope spec. Freeze the centers ONCE at the base
     // length-scale so the FD perturbations only move `length_scale`, not the
-    // basis centers (centers held fixed ⇒ the ψ FD is well-defined).
-    let base_length_scale = 0.9_f64;
+    // basis centers (centers held fixed ⇒ the ψ FD is well-defined). Fewer
+    // centers ⇒ fewer penalty components ⇒ less marginal/logslope coupling.
+    let base_length_scale = 1.1_f64;
     let make_spec = |length_scale: f64| TermCollectionSpec {
         linear_terms: Vec::new(),
         random_effect_terms: Vec::new(),
@@ -8925,7 +8935,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
                 feature_cols: vec![0, 1],
                 spec: MaternBasisSpec {
                     periodic: None,
-                    center_strategy: CenterStrategy::EqualMass { num_centers: 6 },
+                    center_strategy: CenterStrategy::EqualMass { num_centers: 4 },
                     length_scale,
                     nu: MaternNu::ThreeHalves,
                     include_intercept: false,
@@ -8975,11 +8985,15 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             .expect("spatial psi derivative rows");
         let derivative_blocks = vec![Vec::new(), logslope_psi];
 
-        // Intercept-only marginal block; matern logslope block carries the
-        // spatial design + its penalty.
+        // Well-identified marginal block: [intercept | covariate] (p=2), so the
+        // marginal is not degenerate and is less coupled to the logslope block.
+        // The matern logslope block carries the spatial design + its penalties.
         let p_log = design.design.ncols();
+        let marginal_mat = Array2::from_shape_fn((n, 2), |(r, c)| {
+            if c == 0 { 1.0 } else { marginal_cov[r] }
+        });
         let marginal_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem((n, 1), 1.0)));
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(marginal_mat));
         let logslope_design = design.design.clone();
 
         let family = BernoulliMarginalSlopeFamily {
@@ -8999,7 +9013,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
             n_rho,
             "matern penalty count must be structural (same as the base design)"
         );
-        let mut marginal_spec = dummy_blockspec(1, n);
+        let mut marginal_spec = dummy_blockspec(2, n);
         marginal_spec.design = marginal_design;
         let mut logslope_spec = dummy_blockspec(p_log, n);
         logslope_spec.design = logslope_design;
