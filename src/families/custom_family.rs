@@ -12887,6 +12887,15 @@ struct JointSpectralNewtonStep {
     most_negative_eigenvalue: f64,
 }
 
+/// Test-support home for the exact trust-region engine below: it is exercised
+/// only by `trust_region_subproblem_tests` until the owning actor's production
+/// cutover of the joint trust-region step lands, and the ban-gate's sanctioned
+/// scoping for src items in that state is a `*_tests` module (the non-test
+/// profile carries no unwired code).
+#[cfg(test)]
+mod whitened_spectrum_tests {
+    use super::*;
+
 /// Eigendecomposition of the metric-whitened penalized Hessian, retained so
 /// every trust-radius shrink within one Newton cycle re-solves the
 /// trust-region subproblem from the SAME `O(p³)` factorization at `O(p)` cost.
@@ -12937,13 +12946,7 @@ struct JointSpectralNewtonStep {
 /// (the gam#553 Moore–Penrose range restriction): an unidentified gauge direction
 /// carries no finite Newton step and is left unchanged, its stationarity-residual
 /// component reported via [`JointSpectralNewtonStep::null_rhs_inf`].
-///
-/// Currently exercised only by `trust_region_subproblem_tests` — the production
-/// cutover of the joint trust-region step onto this spectrum is the owning
-/// actor's in-flight work, so the type is test-scoped until that lands (scoping
-/// beats a dead-code suppression: the non-test profile carries no unwired code).
-#[cfg(test)]
-struct WhitenedHessianSpectrum {
+pub(super) struct WhitenedHessianSpectrum {
     /// Generalized eigenvalues `γ_k` of `(H_pen, D)` = eigenvalues of the
     /// whitened matrix `A = D^{-1/2} H_pen D^{-1/2}`.
     gamma: Array1<f64>,
@@ -12960,7 +12963,6 @@ struct WhitenedHessianSpectrum {
     null_cutoff: f64,
 }
 
-#[cfg(test)]
 impl WhitenedHessianSpectrum {
     /// Eigendecompose the `D`-whitened penalized Hessian once. `metric_diag`
     /// supplies the positive trust-region metric `D` (each entry is passed
@@ -12968,7 +12970,7 @@ impl WhitenedHessianSpectrum {
     /// estimate becomes a safe positive scale). `rank_tol` is the relative
     /// near-singularity cutoff; the genuine numerical-rank floor is derived from
     /// the whitened spectrum exactly as the legacy spectral solve did.
-    fn decompose(
+    pub(super) fn decompose(
         h_pen: &Array2<f64>,
         rhs: &Array1<f64>,
         metric_diag: &Array1<f64>,
@@ -13097,7 +13099,7 @@ impl WhitenedHessianSpectrum {
     /// of radius `trust_radius`. When `trust_radius` is non-finite or `≤ 0` the
     /// unconstrained (Moore–Penrose, range-restricted) Newton step is returned —
     /// i.e. the caller opted out of the trust region.
-    fn trust_region_step(&self, trust_radius: f64) -> JointSpectralNewtonStep {
+    pub(super) fn trust_region_step(&self, trust_radius: f64) -> JointSpectralNewtonStep {
         // Smallest identified curvature (signed). Empty identified set ⇒ pure
         // null space ⇒ zero step.
         let mut gamma_min_id = f64::INFINITY;
@@ -13272,10 +13274,12 @@ impl WhitenedHessianSpectrum {
         }
     }
 }
+}
 
 #[cfg(test)]
 mod trust_region_subproblem_tests {
     use super::*;
+    use super::whitened_spectrum_tests::WhitenedHessianSpectrum;
     use ndarray::array;
 
     fn metric_norm(delta: &Array1<f64>, d: &Array1<f64>) -> f64 {
