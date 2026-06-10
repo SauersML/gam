@@ -34,9 +34,10 @@ use std::sync::Arc;
 
 use crate::solver::arrow_schur::{
     ArrowProximalCorrectionOptions, ArrowRowBlock, ArrowSchurError, ArrowSchurSystem,
-    ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, KroneckerPenaltyOp,
-    SparseBlockKroneckerPenaltyOp, SparseGBlock, StreamingArrowSchur,
-    solve_arrow_newton_step_with_proximal_correction, solve_streaming_reduced_beta,
+    ArrowSolveOptions, BetaPenaltyOp, CompositePenaltyOp, DensePenaltyOp, FactoredFrameGBlock,
+    FactoredFrameKroneckerOp, KroneckerPenaltyOp, SparseBlockKroneckerPenaltyOp, SparseGBlock,
+    StreamingArrowSchur, solve_arrow_newton_step_with_proximal_correction,
+    solve_streaming_reduced_beta,
 };
 use crate::terms::analytic_penalties::{
     AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
@@ -3229,6 +3230,148 @@ impl SaeKroneckerRow for SaeKroneckerRows {
     }
 }
 
+/// FRAME-FACTORED variant of [`SaeKroneckerRows`] (issue #972 / #977 T1): the
+/// per-row cross-block operator when the decoders are profiled onto Grassmann
+/// frames so the border carries the reduced coordinates `C_k` instead of the
+/// full `B_k`.
+///
+/// The factorization is identical except the `J_β = φᵀ ⊗ I_p` (output-channel)
+/// factor is replaced by the C-space map `J_C` that folds each atom's frame
+/// `U_k` (`p × r_k`):
+///   forward  `(J_C · c)[i]   = Σ_entries φ · Σ_j U_k[i,j] · c[c_base+j]`,
+///   transpose `(J_Cᵀ · u)[c_base+j] += φ · Σ_i U_k[i,j] · u[i]`.
+/// The t-side local Jacobian `L` (`local_jac`) is FRAME-INDEPENDENT and reused
+/// verbatim, so `apply_l` / `apply_l_t` are inherited unchanged from the
+/// full-`B` path via the shared `SaeKroneckerRows` instance held inside.
+///
+/// Each per-row support entry stores the C-space base `c_base = off_C[k] +
+/// basis_col·r_k` plus the weight `φ = a_k·φ_k[basis_col]·√w_row` and the atom
+/// index `k` (to select `U_k` / `r_k`). Un-framed atoms have `U_k = I_p`,
+/// `r_k = p`, so their entries reduce to the plain `SaeKroneckerRows` scatter.
+struct SaeFrameKroneckerRows {
+    /// Inner full-`B` operator: holds `local_jac` (the frame-independent t-side
+    /// factor) and is the source of `apply_l` / `apply_l_t`. Its `a_phi` is
+    /// retained but UNUSED here (the factored support below replaces it).
+    inner: SaeKroneckerRows,
+    /// Per-atom frame `U_k` (`p × r_k`); `I_p` for un-framed atoms.
+    frames: Vec<Array2<f64>>,
+    /// Per-atom frame rank `r_k`.
+    ranks: Vec<usize>,
+    /// Per-row C-space support: `(c_base, phi, atom_idx)`.
+    factored_a_phi: Vec<Vec<(usize, f64, usize)>>,
+}
+
+impl SaeFrameKroneckerRows {
+    /// Build from the full-`B` per-row support (`a_phi`, with bases
+    /// `off_B[k] + basis_col·p`) by remapping each load into the factored
+    /// C-space. `beta_offsets` / `off_c` are the per-atom full-`B` / factored
+    /// offsets; `basis_sizes` / `ranks` the per-atom `M_k` / `r_k`.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        p: usize,
+        beta_offsets: &[usize],
+        off_c: &[usize],
+        basis_sizes: Vec<usize>,
+        ranks: Vec<usize>,
+        frames: Vec<Array2<f64>>,
+        a_phi: Vec<Vec<(usize, f64)>>,
+        local_jac: Vec<Vec<f64>>,
+    ) -> Result<Self, String> {
+        let n_atoms = basis_sizes.len();
+        // Remap each full-`B` load `(beta_base, phi)` to `(c_base, phi, atom)`.
+        // `beta_base = off_B[k] + basis_col·p`; locate the atom by its full-`B`
+        // offset range and derive `basis_col`, then the factored base.
+        let mut factored_a_phi: Vec<Vec<(usize, f64, usize)>> = Vec::with_capacity(a_phi.len());
+        for row_loads in &a_phi {
+            let mut row_out: Vec<(usize, f64, usize)> = Vec::with_capacity(row_loads.len());
+            for &(beta_base, phi) in row_loads {
+                // Find the owning atom: largest `k` with `off_B[k] <= beta_base`
+                // and `beta_base < off_B[k] + M_k·p`.
+                let mut atom_idx = None;
+                for k in 0..n_atoms {
+                    let lo = beta_offsets[k];
+                    let hi = lo + basis_sizes[k] * p;
+                    if beta_base >= lo && beta_base < hi {
+                        atom_idx = Some(k);
+                        break;
+                    }
+                }
+                let k = atom_idx.ok_or_else(|| {
+                    format!(
+                        "SaeFrameKroneckerRows::new: beta_base {beta_base} not in any atom block"
+                    )
+                })?;
+                let basis_col = (beta_base - beta_offsets[k]) / p;
+                let c_base = off_c[k] + basis_col * ranks[k];
+                row_out.push((c_base, phi, k));
+            }
+            factored_a_phi.push(row_out);
+        }
+        let inner = SaeKroneckerRows::new(p, a_phi, local_jac);
+        Ok(Self {
+            inner,
+            frames,
+            ranks,
+            factored_a_phi,
+        })
+    }
+
+    /// `u_p = J_C · x_C`: contract each C-space basis load through its atom's
+    /// frame into the p-dimensional decoded-output space.
+    fn apply_jbeta_factored(&self, row: usize, x_c: &[f64], u_out: &mut [f64]) {
+        for val in u_out.iter_mut() {
+            *val = 0.0;
+        }
+        let p = self.inner.p;
+        for &(c_base, phi, atom) in &self.factored_a_phi[row] {
+            if phi == 0.0 {
+                continue;
+            }
+            let r = self.ranks[atom];
+            let uk = &self.frames[atom];
+            // u_p[i] += phi · Σ_j U_k[i,j] · x_C[c_base + j].
+            for i in 0..p {
+                let mut acc = 0.0_f64;
+                for j in 0..r {
+                    acc += uk[[i, j]] * x_c[c_base + j];
+                }
+                u_out[i] += phi * acc;
+            }
+        }
+    }
+
+    /// `y_C += J_Cᵀ · u`: scatter the p-space vector back into C-space through
+    /// each atom's frame transpose.
+    fn scatter_jbeta_factored_t(&self, row: usize, u: &[f64], y_c: &mut [f64]) {
+        let p = self.inner.p;
+        for &(c_base, phi, atom) in &self.factored_a_phi[row] {
+            if phi == 0.0 {
+                continue;
+            }
+            let r = self.ranks[atom];
+            let uk = &self.frames[atom];
+            // y_C[c_base + j] += phi · Σ_i U_k[i,j] · u[i].
+            for j in 0..r {
+                let mut acc = 0.0_f64;
+                for i in 0..p {
+                    acc += uk[[i, j]] * u[i];
+                }
+                y_c[c_base + j] += phi * acc;
+            }
+        }
+    }
+
+    /// Inherited frame-independent t-side multiply `w = L_i · u`.
+    fn apply_l(&self, row: usize, u: &[f64], w_out: &mut [f64]) {
+        self.inner.apply_l(row, u, w_out);
+    }
+
+    /// Inherited frame-independent t-side transpose `u += L_iᵀ · v`.
+    fn apply_l_t(&self, row: usize, v: &[f64], u_out: &mut [f64]) {
+        self.inner.apply_l_t(row, v, u_out);
+    }
+}
+
 /// Loss breakdown for diagnostics and evidence ranking.
 #[derive(Debug, Clone, Copy)]
 pub struct SaeManifoldLoss {
@@ -3506,6 +3649,17 @@ pub struct SaeManifoldTerm {
     /// *evidence* about shared structure (decoder β, ρ), not to the latent
     /// priors. `None` ⇒ the exact unweighted path, bit-for-bit.
     row_loss_weights: Option<Vec<f64>>,
+    /// #972 / #977 T1: whether the MOST RECENT `assemble_arrow_schur` built the
+    /// β-tier in the *factored* Grassmann-coordinate layout (border width
+    /// [`Self::factored_border_dim`], the per-atom `C_k` blocks) rather than the
+    /// full-`B` layout ([`Self::beta_dim`]). When `true`, the `delta_beta` the
+    /// arrow solver returns is a `ΔC` (factored coordinates) that
+    /// [`Self::apply_newton_step_impl`] must LIFT through each active frame
+    /// (`ΔB_k = ΔC_k U_kᵀ`) before applying it to the decoder. `false` ⇒ the
+    /// historical full-`B` path, where `delta_beta` is `ΔB` directly. Set in
+    /// lock-step with the assembled system so the step interpretation cannot
+    /// drift from the layout the system was built in.
+    last_frames_active: bool,
 }
 
 /// Snapshot of exactly the mutable term state that an `apply_newton_step` +
@@ -3582,6 +3736,7 @@ impl SaeManifoldTerm {
             row_metric: None,
             collapse_events: Vec::new(),
             row_loss_weights: None,
+            last_frames_active: false,
         })
     }
 
@@ -4182,6 +4337,52 @@ impl SaeManifoldTerm {
     /// True iff any atom has an active low-rank Grassmann frame (issue #972).
     pub fn frames_active(&self) -> bool {
         self.atoms.iter().any(|a| a.decoder_frame.is_some())
+    }
+
+    /// Alias of [`Self::frames_active`] (issue #972 / #977 T1): the predicate the
+    /// assembly / step-lift branch on to decide whether the β-tier is built in
+    /// the factored coordinate layout. Named to read as the question
+    /// "is the factored path engaged?" at its call sites.
+    pub fn any_frame_active(&self) -> bool {
+        self.frames_active()
+    }
+
+    /// Per-atom column offsets of the *factored* border (issue #972 / #977 T1):
+    /// the running prefix sum of `M_k · r_k`, one entry per atom (the same
+    /// convention as [`Self::beta_offsets`]). This is the start of each atom's
+    /// `C_k` block in the reduced border vector; on the all-full-`B` path it
+    /// equals `beta_offsets`. Distinct from [`Self::factored_border_offsets`]
+    /// only in name (both compute the identical prefix sum) — this method is the
+    /// one the frame transform reads, mirroring `beta_offsets` at the call site.
+    pub fn factored_beta_offsets(&self) -> Vec<usize> {
+        self.factored_border_offsets()
+    }
+
+    /// Frame output matrix `U_k ∈ St(p, r_k)` for atom `k` (issue #972 / #977 T1).
+    /// Returns the active frame `U_k` (`p × r_k`) when atom `k` is framed, else
+    /// the identity `I_p` (the `r_k == p`, `U_k == I_p` full-`B` special case) so
+    /// the projection / lift code is uniform across a mixed dictionary.
+    pub fn frame_output_matrix(&self, atom_idx: usize) -> Array2<f64> {
+        let atom = &self.atoms[atom_idx];
+        match &atom.decoder_frame {
+            Some(frame) => frame.frame().to_owned(),
+            None => Array2::<f64>::eye(atom.output_dim()),
+        }
+    }
+
+    /// Per-pair frame factor `W_{ij} = U_iᵀ U_j` (`r_i × r_j`) used as the output
+    /// factor of the factored data β-Hessian block `G_{ij} ⊗ W_{ij}` (issue #972
+    /// / #977 T1). When both atoms are framed this is the dense principal-angle
+    /// cosine matrix between the two frames; for `i == j` with an orthonormal
+    /// frame it is exactly `I_{r_i}`; for any un-framed atom the corresponding
+    /// `U` is `I_p`, so a same-atom un-framed pair gives `I_p` (the clean full-`B`
+    /// `G ⊗ I_p` collapse) and a framed/un-framed cross pair gives the rectangular
+    /// `U_iᵀ` / `U_j` overlap.
+    pub fn frame_cross_factor(&self, atom_i: usize, atom_j: usize) -> Array2<f64> {
+        let ui = self.frame_output_matrix(atom_i);
+        let uj = self.frame_output_matrix(atom_j);
+        // `U_iᵀ U_j`: `(r_i × p) · (p × r_j)`. `fast_atb` forms `U_iᵀ U_j` directly.
+        fast_atb(&ui, &uj)
     }
 
     /// Per-atom column offsets of the *factored* border (issue #972): the
@@ -4977,6 +5178,12 @@ impl SaeManifoldTerm {
         // accumulated into `smooth_grad_gb` and written into sys.gb after sys
         // is constructed (#296).
         let mut smooth_ops: Vec<Arc<dyn BetaPenaltyOp>> = Vec::with_capacity(self.atoms.len());
+        // #972 / #977 T1: retain each atom's symmetrised `λ S_k` (`M_k × M_k`) so
+        // the frame transform can rebuild the smooth penalty in the factored
+        // coordinate space as `λ S_k ⊗ I_{r_k}` (the `tr(C_kᵀ S_k C_k)` form,
+        // using `U_kᵀU_k = I`). Unused — and not even read — on the full-`B`
+        // path, so this is a zero-cost capture there.
+        let mut smooth_scaled_s: Vec<Array2<f64>> = Vec::with_capacity(self.atoms.len());
         let mut smooth_grad_gb = vec![0.0_f64; beta_dim];
         // Per-atom smoothness-gradient GEMMs `½(S_k+S_kᵀ)·B_k` are independent
         // across atoms; batch them across ALL GPUs (uniform-shape tiles) and
@@ -5013,11 +5220,13 @@ impl SaeManifoldTerm {
             // KroneckerPenaltyOp: factor_a = λ·S_k (m×m), factor_b = I_p (p×p).
             let identity_p = Array2::<f64>::eye(p);
             smooth_ops.push(Arc::new(KroneckerPenaltyOp {
-                factor_a: scaled_s,
+                factor_a: scaled_s.clone(),
                 factor_b: identity_p,
                 global_offset: off,
                 k: beta_dim,
             }));
+            // Retain `λ S_k` for the factored rebuild (no-op cost on full-`B`).
+            smooth_scaled_s.push(scaled_s);
         }
 
         // Per-row active-set layout. Engaged for two regimes:
@@ -5118,6 +5327,17 @@ impl SaeManifoldTerm {
             .row_metric
             .as_ref()
             .is_some_and(|metric| metric.whitens_likelihood());
+        // #972 / #977 T1: engage the FACTORED Grassmann-coordinate β-tier when
+        // any atom has an active decoder frame. The closed-form factorization
+        // `Φᵀ(G ⊗ I_p)Φ = G ⊗ (U_iᵀU_j)` is EXACT only for the isotropic
+        // likelihood; under an active whitening metric (`whitens_likelihood()`,
+        // only `WhitenedStructured`) the per-row output factor would be
+        // `U_iᵀ M_n U_j` and does NOT factor out of the basis Gram, so we fall
+        // back to the full-`B` path there (frames + whitening is out of scope —
+        // see #974). The common Euclidean / OutputFisher / no-metric case factors
+        // cleanly. When `frames_engaged` is false, EVERY β-tier object below is
+        // assembled bit-for-bit as the historical full-`B` path.
+        let frames_engaged = self.any_frame_active() && !whitens_likelihood;
         // `w_dim` is the whitened output dimension: `rank` of the metric factor
         // when whitening, else `p` (identity). `error_white` is the whitened
         // residual `U_nᵀ r_n ∈ ℝ^{w_dim}` whose squared norm is `r_nᵀ M_n r_n`,
@@ -5683,7 +5903,59 @@ impl SaeManifoldTerm {
         // Symmetric for the transpose: `H_βt = J_βᵀ · Lᵀ`, so apply `Lᵀ`
         // first to map the q_i-vector back to p-space, then scatter through
         // the support.
-        {
+        if frames_engaged {
+            // #972 / #977 T1 — FACTORED cross block `H_tC = H_tB · Φ`. The full-`B`
+            // cross factorises `H_tB = L · J_β` with `J_β = φᵀ ⊗ I_p`; folding the
+            // block-diagonal projector `Φ = blkdiag(I_{M_k} ⊗ U_k)` turns the
+            // `J_β` (output-channel) factor into the C-space map
+            // `(J_C · c)[i] = Σ_{k,m} φ_k[m] · Σ_j U_k[i,j] · c[off_C[k]+m·r_k+j]`.
+            // `L` (the t-side local Jacobian) is frame-INDEPENDENT, so `kron_jac`
+            // is reused verbatim; only the basis-load factor folds `U`. The
+            // C-space support is built from the same per-row `a_phi` (full-`B`
+            // bases) by mapping each `(atom_beta_off + m·p, φ)` load to atom `k`'s
+            // factored base `off_C[k] + m·r_k` and attaching `U_k`.
+            let off_c = self.factored_beta_offsets();
+            let frames: Vec<Array2<f64>> =
+                (0..self.atoms.len()).map(|k| self.frame_output_matrix(k)).collect();
+            let kron = Arc::new(SaeFrameKroneckerRows::new(
+                p,
+                &beta_offsets,
+                &off_c,
+                self.atoms.iter().map(|a| a.basis_size()).collect(),
+                self.atoms.iter().map(|a| a.border_frame_rank()).collect(),
+                frames,
+                kron_a_phi,
+                kron_jac,
+            )?);
+            let kron_t = Arc::clone(&kron);
+            let p_dim = p;
+            sys.set_row_htbeta_operator(
+                move |row_idx, x, out| {
+                    // out = L_i · (J_C · x); `x` is a factored ΔC vector.
+                    let out_slice = out.as_slice_mut().expect("out is always standard-layout");
+                    let mut u_p = vec![0.0_f64; p_dim];
+                    if let Some(xs) = x.as_slice() {
+                        kron.apply_jbeta_factored(row_idx, xs, &mut u_p);
+                    } else {
+                        let x_vec: Vec<f64> = x.iter().copied().collect();
+                        kron.apply_jbeta_factored(row_idx, &x_vec, &mut u_p);
+                    }
+                    kron.apply_l(row_idx, &u_p, out_slice);
+                },
+                move |row_idx, v, out| {
+                    // out += J_Cᵀ · (Lᵀ · v); scatter into the factored C-space.
+                    let out_slice = out.as_slice_mut().expect("out is always standard-layout");
+                    let mut u_p = vec![0.0_f64; p_dim];
+                    if let Some(vs) = v.as_slice() {
+                        kron_t.apply_l_t(row_idx, vs, &mut u_p);
+                    } else {
+                        let v_vec: Vec<f64> = v.iter().copied().collect();
+                        kron_t.apply_l_t(row_idx, &v_vec, &mut u_p);
+                    }
+                    kron_t.scatter_jbeta_factored_t(row_idx, &u_p, out_slice);
+                },
+            );
+        } else {
             let kron = Arc::new(SaeKroneckerRows::new(p, kron_a_phi, kron_jac));
             let kron_t = Arc::clone(&kron);
             let p_dim = p;
@@ -5738,23 +6010,141 @@ impl SaeManifoldTerm {
                 )
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         }
-        // Wire per-atom β block ranges so the Jacobi preconditioner builds one
-        // dense Schur sub-block per atom (block-Jacobi) instead of scalar-diagonal
-        // inversion.  Each atom's decoder coefficients form a natural block:
-        // `[beta_offsets[k] .. beta_offsets[k] + basis_size[k] * p_out]`.
-        sys.set_block_offsets(self.beta_block_offsets());
-        // Install the composite BetaPenaltyOp (#296): smoothness contributions
-        // via per-atom KroneckerPenaltyOp (avoid dense K×K materialisation), the
-        // data-fit Gauss-Newton β-Hessian as the structured `G ⊗ I_p`
-        // SparseBlockKroneckerPenaltyOp (block-sparse over co-occurring
-        // `(atom, atom')` pairs, block-diagonal across the `p` output channels,
-        // identical per channel), plus — only when a Beta-tier analytic penalty
-        // was written — the dense `sys.hbb` residual contribution. When no beta
-        // penalty fired, `sys.hbb` is all-zero and the dense `(K·p)²` operator
-        // is skipped entirely. The sparse data op tracks only the active-atom
-        // couplings, so its storage and matvec cost scale with `k_active`, not
-        // `K`, at `K = 100K`.
-        {
+        if frames_engaged {
+            // ── #972 / #977 T1 — FACTORED β-tier transform ──────────────────
+            //
+            // The entire β-tier above was assembled in the full-`B` (p-wide)
+            // layout: `sys.gb` is `g_B` (length `beta_dim`), `sys.hbb` carries
+            // any analytic Beta-tier penalty, and `g_blocks` is the
+            // FRAME-INDEPENDENT basis Gram. We now rebuild the β-tier in the
+            // factored coordinate space `C` (width `factored_border_dim`), the
+            // full-`B` system sandwiched by `Φ = blkdiag(I_{M_k} ⊗ U_k)`:
+            //   * gradient   `g_C = Φᵀ g_B`              (per atom `(g_B U_k)`),
+            //   * data H      `Φᵀ(G⊗I_p)Φ = G_{ij}⊗(U_iᵀU_j)`,
+            //   * smooth      `λ S_k ⊗ I_{r_k}`          (since `U_kᵀU_k = I`),
+            //   * analytic    `Φᵀ hbb Φ`                 (dense, only if written).
+            // Un-framed atoms ride the `r_k = p, U_k = I_p` identity special case.
+            let off_c = self.factored_beta_offsets();
+            let ranks: Vec<usize> =
+                self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+            let basis_sizes: Vec<usize> =
+                self.atoms.iter().map(|a| a.basis_size()).collect();
+            let border_dim = self.factored_border_dim();
+            let frames: Vec<Array2<f64>> =
+                (0..self.atoms.len()).map(|k| self.frame_output_matrix(k)).collect();
+
+            // Project the full-`B` gradient `g_B` → factored `g_C = Φᵀ g_B`:
+            //   g_C[off_C[k] + m·r_k + j] = Σ_i U_k[i,j] · g_B[off_B[k] + m·p + i].
+            // `sys.gb` already holds the SUM of the data gradient and the smooth
+            // gradient (both in p-space), so projecting it once carries both the
+            // `Φᵀ g_data` and the `(λ S_k B_k) U_k` smooth-gradient contributions.
+            let mut gb_c = Array1::<f64>::zeros(border_dim);
+            for k in 0..self.atoms.len() {
+                let m = basis_sizes[k];
+                let r = ranks[k];
+                let ob = beta_offsets[k];
+                let oc = off_c[k];
+                let uk = &frames[k];
+                for basis_col in 0..m {
+                    let base_b = ob + basis_col * p;
+                    let base_c = oc + basis_col * r;
+                    for j in 0..r {
+                        let mut acc = 0.0_f64;
+                        for i in 0..p {
+                            acc += uk[[i, j]] * sys.gb[base_b + i];
+                        }
+                        gb_c[base_c + j] = acc;
+                    }
+                }
+            }
+
+            // Data β-Hessian: `G_{ij} ⊗ W_{ij}` with `W_{ij} = U_iᵀU_j`. The
+            // basis Gram `g_blocks` is unchanged; only the output factor is the
+            // per-pair frame overlap (`I_{r_k}` within a framed atom, `I_p` for
+            // un-framed).
+            let mut frame_blocks: Vec<FactoredFrameGBlock> = Vec::with_capacity(g_blocks.len());
+            for ((atom_i, atom_j), data) in g_blocks.into_iter() {
+                if data.iter().all(|&v| v == 0.0) {
+                    continue;
+                }
+                let w = self.frame_cross_factor(atom_i, atom_j);
+                frame_blocks.push(FactoredFrameGBlock {
+                    atom_i,
+                    atom_j,
+                    g: data,
+                    w,
+                });
+            }
+            let data_op = FactoredFrameKroneckerOp::new(
+                ranks.clone(),
+                basis_sizes.clone(),
+                frame_blocks,
+            )?;
+
+            // Smooth penalty in factored space: `λ S_k ⊗ I_{r_k}` at `off_C[k]`.
+            let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = Vec::with_capacity(self.atoms.len() + 2);
+            for k in 0..self.atoms.len() {
+                let r = ranks[k];
+                ops.push(Arc::new(KroneckerPenaltyOp {
+                    factor_a: smooth_scaled_s[k].clone(),
+                    factor_b: Array2::<f64>::eye(r),
+                    global_offset: off_c[k],
+                    k: border_dim,
+                }));
+            }
+            ops.push(Arc::new(data_op));
+            // Analytic Beta-tier penalty: project the dense full-`B` `hbb` block
+            // `Φᵀ hbb Φ` into the factored space. Only present when a Beta-tier
+            // penalty actually wrote `hbb` (else `hbb` is all-zero and the dense
+            // `(border_dim)²` op is skipped entirely, exactly as full-`B`).
+            if beta_penalty_written {
+                let hbb_c = self.project_dense_penalty_to_factored(
+                    sys.hbb.view(),
+                    &beta_offsets,
+                    &off_c,
+                    &basis_sizes,
+                    &ranks,
+                    &frames,
+                    border_dim,
+                );
+                ops.push(Arc::new(DensePenaltyOp(hbb_c)));
+            }
+
+            // Re-point the system's β-tier to the factored width. The t-tier
+            // (per-row `htt`, `gt`) is frame-independent and untouched; the
+            // per-row dense `htbeta` slabs stay `(q × beta_dim)` zeros and are
+            // skipped by the shape guard in `sys_htbeta_apply_row` (the
+            // matrix-free factored operator carries the cross block).
+            sys.k = border_dim;
+            sys.gb = gb_c;
+            sys.hbb = Array2::<f64>::zeros((0, 0));
+            // Factored per-atom block ranges for the block-Jacobi Schur
+            // preconditioner: `[off_C[k] .. off_C[k] + M_k·r_k]`.
+            let mut block_ranges: Vec<std::ops::Range<usize>> =
+                Vec::with_capacity(self.atoms.len());
+            for k in 0..self.atoms.len() {
+                let start = off_c[k];
+                block_ranges.push(start..start + basis_sizes[k] * ranks[k]);
+            }
+            sys.set_block_offsets(Arc::from(block_ranges.into_boxed_slice()));
+            sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: border_dim, ops }));
+        } else {
+            // Wire per-atom β block ranges so the Jacobi preconditioner builds one
+            // dense Schur sub-block per atom (block-Jacobi) instead of scalar-diagonal
+            // inversion.  Each atom's decoder coefficients form a natural block:
+            // `[beta_offsets[k] .. beta_offsets[k] + basis_size[k] * p_out]`.
+            sys.set_block_offsets(self.beta_block_offsets());
+            // Install the composite BetaPenaltyOp (#296): smoothness contributions
+            // via per-atom KroneckerPenaltyOp (avoid dense K×K materialisation), the
+            // data-fit Gauss-Newton β-Hessian as the structured `G ⊗ I_p`
+            // SparseBlockKroneckerPenaltyOp (block-sparse over co-occurring
+            // `(atom, atom')` pairs, block-diagonal across the `p` output channels,
+            // identical per channel), plus — only when a Beta-tier analytic penalty
+            // was written — the dense `sys.hbb` residual contribution. When no beta
+            // penalty fired, `sys.hbb` is all-zero and the dense `(K·p)²` operator
+            // is skipped entirely. The sparse data op tracks only the active-atom
+            // couplings, so its storage and matvec cost scale with `k_active`, not
+            // `K`, at `K = 100K`.
             // Convert the per-atom-pair coupling map into `SparseGBlock`s keyed
             // by μ-space offsets. Empty blocks (no co-occurrence) are simply
             // absent from the map.
@@ -5786,7 +6176,85 @@ impl SaeManifoldTerm {
         }
         // Store the active-set layout for `apply_newton_step`.
         self.last_row_layout = row_layout;
+        // Record whether `delta_beta` from this system is a factored ΔC (needs a
+        // frame lift) or a full-`B` ΔB. Read by `apply_newton_step_impl`.
+        self.last_frames_active = frames_engaged;
         Ok(sys)
+    }
+
+    /// Project a dense full-`B` Beta-tier penalty Hessian `hbb` (`beta_dim ×
+    /// beta_dim`, the analytic `∂²P/∂B∂B` block) into the factored coordinate
+    /// space `Φᵀ hbb Φ` (`border_dim × border_dim`) for the #972 / #977 T1
+    /// frame transform. `Φ = blkdiag(I_{M_k} ⊗ U_k)` maps C-space → B-space, so
+    /// the projected block contracts both index legs through the per-atom frames.
+    ///
+    /// The projection is done in two passes to stay `O(beta_dim · border_dim +
+    /// border_dim²)` instead of forming the dense `Φ` explicitly: first
+    /// `T = hbb · Φ` (right multiply, columns fold `U`), then `Φᵀ · T` (left
+    /// multiply, rows fold `U`). Analytic Beta-tier penalties are rare and small,
+    /// so this only fires when one is actually installed.
+    #[allow(clippy::too_many_arguments)]
+    fn project_dense_penalty_to_factored(
+        &self,
+        hbb: ArrayView2<'_, f64>,
+        beta_offsets: &[usize],
+        off_c: &[usize],
+        basis_sizes: &[usize],
+        ranks: &[usize],
+        frames: &[Array2<f64>],
+        border_dim: usize,
+    ) -> Array2<f64> {
+        let p = self.output_dim();
+        let beta_dim = hbb.nrows();
+        // Pass 1: `T = hbb · Φ`, shape `(beta_dim × border_dim)`. Column `(k, m,
+        // j)` of `Φ` has support on B-rows `(k, m, i)` with entry `U_k[i, j]`, so
+        //   T[b, off_C[k]+m·r_k+j] = Σ_i hbb[b, off_B[k]+m·p+i] · U_k[i, j].
+        let mut t = Array2::<f64>::zeros((beta_dim, border_dim));
+        for k in 0..self.atoms.len() {
+            let m = basis_sizes[k];
+            let r = ranks[k];
+            let ob = beta_offsets[k];
+            let oc = off_c[k];
+            let uk = &frames[k];
+            for basis_col in 0..m {
+                let base_b = ob + basis_col * p;
+                let base_c = oc + basis_col * r;
+                for b in 0..beta_dim {
+                    for j in 0..r {
+                        let mut acc = 0.0_f64;
+                        for i in 0..p {
+                            acc += hbb[[b, base_b + i]] * uk[[i, j]];
+                        }
+                        t[[b, base_c + j]] += acc;
+                    }
+                }
+            }
+        }
+        // Pass 2: `Φᵀ · T`, shape `(border_dim × border_dim)`. Row `(k, m, j)` of
+        // `Φᵀ` reads B-rows `(k, m, i)` with entry `U_k[i, j]`, so
+        //   out[off_C[k]+m·r_k+j, c] = Σ_i U_k[i, j] · T[off_B[k]+m·p+i, c].
+        let mut out = Array2::<f64>::zeros((border_dim, border_dim));
+        for k in 0..self.atoms.len() {
+            let m = basis_sizes[k];
+            let r = ranks[k];
+            let ob = beta_offsets[k];
+            let oc = off_c[k];
+            let uk = &frames[k];
+            for basis_col in 0..m {
+                let base_b = ob + basis_col * p;
+                let base_c = oc + basis_col * r;
+                for j in 0..r {
+                    for c in 0..border_dim {
+                        let mut acc = 0.0_f64;
+                        for i in 0..p {
+                            acc += uk[[i, j]] * t[[base_b + i, c]];
+                        }
+                        out[[base_c + j, c]] += acc;
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn ext_coord_matrix(&self) -> Array2<f64> {
