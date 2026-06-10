@@ -4505,18 +4505,50 @@ impl SaeManifoldTerm {
                 (q, jac_row)
             };
 
+            // #974 seam (step 2/2): whiten the per-row Jacobian through the SAME
+            // metric the residual was whitened by. `jac_white[a*w_dim + k]` holds
+            // `J̃[a, k] = Σ_out U_n[out, k] · J_n[a, out]` so the t-block
+            // Gauss-Newton row block is `htt = J̃ J̃ᵀ = J_n M_n J_nᵀ` and
+            // `gt = J̃ ẽ = J_nᵀ M_n r_n`. When not whitening, `w_dim == p` and the
+            // whitened jac equals the raw Jacobian, so htt/gt are byte-identical
+            // to the historical isotropic assembly. Because the SAME `error_white`
+            // feeds both the value-path data-fit (Σ½ ẽ²) and this gradient
+            // (J̃ ẽ), the objective and its t-block gradient share one whitening
+            // — they cannot desync.
+            if whitens_likelihood {
+                if let Some(metric) = self.row_metric.as_ref() {
+                    for a in 0..q_row {
+                        for k in 0..w_dim {
+                            let mut acc = 0.0;
+                            // U_n[out, k] read through the metric's factor layout.
+                            for out_col in 0..p {
+                                acc += metric.factor_entry(row, out_col, k)
+                                    * local_jac_row[[a, out_col]];
+                            }
+                            jac_white[a * w_dim + k] = acc;
+                        }
+                    }
+                }
+            } else {
+                for a in 0..q_row {
+                    for out_col in 0..p {
+                        jac_white[a * w_dim + out_col] = local_jac_row[[a, out_col]];
+                    }
+                }
+            }
+
             // Build the per-row Arrow-Schur block at the row's active dim.
             let mut block = ArrowRowBlock::new(q_row, beta_dim);
             for a in 0..q_row {
                 let mut g = 0.0;
-                for out_col in 0..p {
-                    g += local_jac_row[[a, out_col]] * error[out_col];
+                for k in 0..w_dim {
+                    g += jac_white[a * w_dim + k] * error_white[k];
                 }
                 block.gt[a] += g;
                 for b in 0..q_row {
                     let mut h = 0.0;
-                    for out_col in 0..p {
-                        h += local_jac_row[[a, out_col]] * local_jac_row[[b, out_col]];
+                    for k in 0..w_dim {
+                        h += jac_white[a * w_dim + k] * jac_white[b * w_dim + k];
                     }
                     block.htt[[a, b]] += h;
                 }
@@ -4665,13 +4697,18 @@ impl SaeManifoldTerm {
                 }
                 weighted_phi.push((atom_idx, wphi));
             }
-            // β data-fit gradient `gᵦ += J_βᵀ error`.
+            // β data-fit gradient `gᵦ += J_βᵀ M_n r_n`. The β-Jacobian is
+            // `J_β = φ_nᵀ ⊗ I_p`, so `J_βᵀ M_n r_n = φ_n ⊗ (M_n r_n)` —
+            // contract the basis weight `a·φ` against the p-space metric-applied
+            // residual `error_metric` (= `M_n r_n`), the SAME whitening the value
+            // path and t-block share. When not whitening, `error_metric == error`
+            // and this is byte-identical to the historical `J_βᵀ r`.
             for &(beta_base_i, j_beta_i) in a_phi.iter() {
                 if j_beta_i == 0.0 {
                     continue;
                 }
                 for out_col in 0..p {
-                    sys.gb[beta_base_i + out_col] += j_beta_i * error[out_col];
+                    sys.gb[beta_base_i + out_col] += j_beta_i * error_metric[out_col];
                     // No htbeta write — the Kronecker matvec handles this.
                     // No dense hbb write — the sparse `G ⊗ I_p` op installed
                     // after the loop carries the data-fit GN β-Hessian.
