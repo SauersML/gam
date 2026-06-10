@@ -1113,7 +1113,23 @@ fn fit_conditional_latent_calibration_if_needed(
     // whenever the gate fires (a pure-variance trigger leaves the C-slopes of
     // m(C) ≈ 0, so it reduces to harmless global centering).
     let basis = build_intercept_basis(a_block);
-    let penalty = Array2::<f64>::eye(basis.ncols());
+    // Per-column Tikhonov penalty scaled by the weighted Gram diagonal, so the
+    // ridge is *relative* to each column's scale (a 1e-8 absolute ridge would
+    // be negligible against an O(n) Gram and would not stabilize a
+    // rank-deficient penalized-spline marginal index). `diag_jj = Σ_i w_i a_ij²`;
+    // floored positive so the all-zero (already-dropped) directions still
+    // receive a finite ridge and the factorization cannot fail.
+    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
+    for j in 0..basis.ncols() {
+        let diag_jj = basis
+            .column(j)
+            .iter()
+            .zip(weights.iter())
+            .map(|(&x, &w)| w * x * x)
+            .sum::<f64>()
+            .max(f64::MIN_POSITIVE);
+        penalty[[j, j]] = diag_jj;
+    }
     let z_col = z.view().insert_axis(ndarray::Axis(1));
     let (mean_coeffs_mat, mean_fitted) = crate::linalg::utils::gaussian_weighted_ridge(
         basis.view(),
