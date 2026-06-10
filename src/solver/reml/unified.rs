@@ -2978,10 +2978,16 @@ fn penalty_subspace_reduce_drifts_batched(
         .iter()
         .map(|drift| match drift {
             DriftDerivResult::Dense(matrix) => kernel.reduce(matrix),
-            DriftDerivResult::Operator(op) => {
-                let dense = op.to_dense();
-                kernel.reduce(&dense)
-            }
+            // #901 layer-2 (outer-Hessian path): reduce the operator via
+            // `U_Sᵀ·A·U_S = U_Sᵀ·A.mul_mat(U_S)` — NOT `op.to_dense()` then
+            // reduce. For the GLM cubic correction `C[v] = Xᵀdiag(c⊙Xv)X` the
+            // dense materialization computes near-null quadratic forms by
+            // cancelling O(‖C‖) entries, and the spectral kernel's `1/σ_min`
+            // then amplifies the roundoff (the +39-vs-−0.30 / ~−7.7e5 blow-up).
+            // `reduce_operator` probes through the `X·U_S` matvecs instead, so
+            // tiny² stays tiny — the same stability cure as the first-order
+            // `trace_operator` path.
+            DriftDerivResult::Operator(op) => kernel.reduce_operator(op.as_ref()),
         })
         .collect()
 }
