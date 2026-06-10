@@ -6,7 +6,7 @@
 //! the mission's "MEASURE FIRST" rule by refusing to extrapolate when the
 //! fit is poor — which means a regression in this analyzer (e.g. swapping
 //! `<` and `<=` on the R² gate, or letting NaN through the residual
-//! computation) silently lets bad data drive biobank-budget verdicts.
+//! computation) silently lets bad data drive large-scale-budget verdicts.
 //! Pin the policy down with these tests.
 
 mod power_law_common;
@@ -187,7 +187,7 @@ fn report_refuses_extrapolation_when_fit_poor() {
         (4.0, 100.0),
         (5.0, 1.0),
     ];
-    let extrapolate = [("biobank", 320_000.0)];
+    let extrapolate = [("large-scale", 320_000.0)];
     let fit = report_power_law_full("[NOISY]", &points, &extrapolate, 1e9);
     assert!(
         fit.is_none(),

@@ -295,7 +295,7 @@ def _is_joint_spatial_basis(basis: str) -> bool:
 # never a mixture of smoothed-leading-PCs + linear-trailing-PCs. The PC
 # eigenbasis has been deliberately decorrelated, so per-axis additivity is
 # both statistically misspecified (the meaningful heterogeneity lives on the
-# joint manifold) and a wallclock disaster at biobank scale (16 separate
+# joint manifold) and a wallclock disaster at large scale (16 separate
 # `s(pcN, ...)` blocks instead of one multi-D Duchon).
 #
 # Every formula builder in this file routes PC-named columns through these

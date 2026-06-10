@@ -27,7 +27,7 @@ use gam::gpu::arrow_schur::{
 use gam::solver::arrow_schur::ArrowSchurSystem;
 use ndarray::Array2;
 
-/// Charter biobank shape (math block 3 §16).
+/// Charter large-scale shape (math block 3 §16).
 const N: usize = 5_000;
 const D: usize = 16;
 const K: usize = 6;

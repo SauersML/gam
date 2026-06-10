@@ -7,19 +7,17 @@
 //!     `W_i = w_i · φ(η_i)² / (Φ(η_i) · Φ(−η_i))`
 //! evaluated at the pilot η.
 //!
-//! Phase 4a delivery: trait impls + an input-builder. Phase 4b migrates the
-//! BMS fit driver onto the compiler; Phase 4c deletes the legacy
-//! `install_compiled_flex_block_into_runtime` path.
-
-use std::sync::Arc;
+//! These concrete impls (`BernoulliRowHessian`, `BernoulliDenseDesignOperator`)
+//! feed the live BMS fit driver via `bms::install_flex`, whose
+//! `install_compiled_flex_block_into_runtime` is the entry point that
+//! residualises each flex block against the compiled parametric anchors.
 
 use ndarray::{Array1, Array2, Array3};
 
 use crate::families::custom_family::FamilyChannelHessian;
 use crate::families::identifiability_compiler::{
-    AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
+    RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
-use crate::linalg::faer_ndarray::fast_ab;
 
 /// Standard normal pdf.
 #[inline]
@@ -198,122 +196,6 @@ impl RowJacobianOperator for BernoulliDenseDesignOperator {
     }
 }
 
-/// Predict-time anchor row evaluator for a parametric block. Returns the
-/// supplied dense design as-is — the predict-time argument is unused
-/// because the design is already materialised at the requested rows.
-///
-/// Phase 4b will introduce a "build-from-predict-arg" variant that recomputes
-/// the parametric design at predict rows via the family's design constructor.
-pub struct ParametricAnchorEvaluator {
-    design: Array2<f64>,
-}
-
-impl ParametricAnchorEvaluator {
-    pub fn new(design: Array2<f64>) -> Self {
-        Self { design }
-    }
-}
-
-impl AnchorRowEvaluator for ParametricAnchorEvaluator {
-    fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if predict_arg.len() != self.design.nrows() {
-            return Err(format!(
-                "ParametricAnchorEvaluator: predict_arg length {} must match \
-                 materialised design rows {}",
-                predict_arg.len(),
-                self.design.nrows()
-            ));
-        }
-        Ok(self.design.clone())
-    }
-    fn ncols(&self) -> usize {
-        self.design.ncols()
-    }
-}
-
-/// Predict-time anchor row evaluator for a compiled flex block. Composes
-/// the residualised row operator `C(x)·V − A(x)·M` where `C(x)` is the raw
-/// span-basis at the predict argument, `V` is `t_lw`, `A(x)` is the parent
-/// anchor evaluator's output, and `M` is `anchor_correction`.
-///
-/// Phase 4a delivery: the constructor takes a raw-basis closure plus a
-/// parent evaluator and the compiled block's V/M. Phase 4b wires this up to
-/// `DeviationRuntime::span_basis_at` so flex anchors compose naturally in
-/// downstream block residualisation.
-pub struct CompiledFlexAnchorEvaluator {
-    raw_basis: Arc<dyn Fn(&Array1<f64>) -> Result<Array2<f64>, String> + Send + Sync>,
-    t_lw: Array2<f64>,
-    anchor_correction: Option<Array2<f64>>,
-    parent: Option<Arc<dyn AnchorRowEvaluator>>,
-}
-
-impl CompiledFlexAnchorEvaluator {
-    pub fn new(
-        raw_basis: Arc<dyn Fn(&Array1<f64>) -> Result<Array2<f64>, String> + Send + Sync>,
-        t_lw: Array2<f64>,
-        anchor_correction: Option<Array2<f64>>,
-        parent: Option<Arc<dyn AnchorRowEvaluator>>,
-    ) -> Self {
-        Self {
-            raw_basis,
-            t_lw,
-            anchor_correction,
-            parent,
-        }
-    }
-}
-
-impl AnchorRowEvaluator for CompiledFlexAnchorEvaluator {
-    fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
-        let raw = (self.raw_basis)(predict_arg)?;
-        let rotated = fast_ab(&raw, &self.t_lw);
-        match (&self.anchor_correction, &self.parent) {
-            (Some(m), Some(parent)) => {
-                let anchor = parent.anchor_rows(predict_arg)?;
-                let correction = fast_ab(&anchor, m);
-                Ok(&rotated - &correction)
-            }
-            (None, _) | (_, None) => Ok(rotated),
-        }
-    }
-    fn ncols(&self) -> usize {
-        self.t_lw.ncols()
-    }
-}
-
-/// Build a stack of row-Jacobian operators from raw dense designs in the
-/// order the BMS fit driver presents them. Mirrors the `[marginal, logslope,
-/// score_warp, link_dev]` ordering implied by `gauge_priority` (parametric
-/// blocks at 100 ahead of the flex bases at lower priorities).
-///
-/// `score_warp_design` / `link_dev_design` are `None` when the corresponding
-/// flex block is inactive. Operators are returned in the same order as the
-/// returned `BlockOrder` tags; Phase 4b's call-site update will route the
-/// compiled outputs back to the right runtime slot via these tags.
-pub fn build_bernoulli_compiler_inputs(
-    marginal_design: Array2<f64>,
-    logslope_design: Array2<f64>,
-    score_warp_design: Option<Array2<f64>>,
-    link_dev_design: Option<Array2<f64>>,
-) -> (Vec<Arc<dyn RowJacobianOperator>>, Vec<BlockOrder>) {
-    let mut ops: Vec<Arc<dyn RowJacobianOperator>> = Vec::with_capacity(4);
-    let mut order: Vec<BlockOrder> = Vec::with_capacity(4);
-
-    ops.push(Arc::new(BernoulliDenseDesignOperator::new(marginal_design)));
-    order.push(BlockOrder::Marginal);
-    ops.push(Arc::new(BernoulliDenseDesignOperator::new(logslope_design)));
-    order.push(BlockOrder::Logslope);
-    if let Some(sw) = score_warp_design {
-        ops.push(Arc::new(BernoulliDenseDesignOperator::new(sw)));
-        order.push(BlockOrder::ScoreWarp);
-    }
-    if let Some(ld) = link_dev_design {
-        ops.push(Arc::new(BernoulliDenseDesignOperator::new(ld)));
-        order.push(BlockOrder::LinkDev);
-    }
-    (ops, order)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,14 +226,5 @@ mod tests {
                 assert_eq!(full[[i, j, 0]], design[[i, j]]);
             }
         }
-    }
-
-    #[test]
-    fn parametric_anchor_evaluator_returns_design_verbatim() {
-        let design = Array2::from_shape_fn((4, 2), |(i, j)| (i + j) as f64);
-        let ev = ParametricAnchorEvaluator::new(design.clone());
-        let predict_arg = Array1::from(vec![0.0_f64; 4]);
-        let rows = ev.anchor_rows(&predict_arg).expect("anchor_rows ok");
-        assert_eq!(rows, design);
     }
 }

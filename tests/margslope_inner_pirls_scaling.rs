@@ -1,5 +1,5 @@
 //! Scaling-law probe for the bernoulli marginal-slope INNER PIRLS Newton
-//! solve at biobank shape.
+//! solve at large-scale shape.
 //!
 //! The outer-score probes established that the OUTER ψ first-order eval is
 //! small relative to the full command budget. The hypothesis under test here
@@ -15,12 +15,12 @@
 //!    described in `BernoulliMarginalSlopeFamily::log_likelihood_only_with_options`,
 //!    so the inner-Newton trivialises (`inner_cycles=1`). Useful as a
 //!    NEGATIVE control: confirms that the rigid path is NOT the
-//!    biobank bottleneck.
+//!    large-scale bottleneck.
 //!
 //! 2. `margslope_inner_pirls_flex_scaling_law` — FLEX probit (cubic
 //!    score_warp + link_dev deviation blocks). The per-row sextic-kernel
 //!    cell evaluator (`solve_row_intercept_base` + `observed_denested_cell_partials`)
-//!    runs at every inner-PIRLS iteration. This is the biobank
+//!    runs at every inner-PIRLS iteration. This is the large-scale
 //!    production setup; this probe times its scaling.
 //!
 //! Run with:
@@ -319,13 +319,13 @@ fn margslope_inner_pirls_scaling_law() {
         );
         if pred_320k <= 2400.0 {
             eprintln!(
-                "[MS-INNER-SCALING-VERDICT] rigid path NOT the biobank bottleneck (pred {:.0}s ≤ 2400s by {:.0}× headroom)",
+                "[MS-INNER-SCALING-VERDICT] rigid path NOT the large-scale bottleneck (pred {:.0}s ≤ 2400s by {:.0}× headroom)",
                 pred_320k,
                 2400.0 / pred_320k
             );
         } else {
             eprintln!(
-                "[MS-INNER-SCALING-VERDICT] rigid path WOULD over-budget at biobank: pred={:.0}s > 2400s by {:.1}×",
+                "[MS-INNER-SCALING-VERDICT] rigid path WOULD over-budget at large-scale: pred={:.0}s > 2400s by {:.1}×",
                 pred_320k,
                 pred_320k / 2400.0
             );
@@ -344,11 +344,11 @@ fn margslope_inner_pirls_flex_scaling_law() {
 
     // FLEXIBLE margslope: score_warp + link_dev cubic deviations engaged.
     // The per-row sextic-kernel intercept root-find runs at every inner-
-    // PIRLS iteration, so this is the biobank-realistic configuration.
+    // PIRLS iteration, so this is the large-scale-realistic configuration.
     // The configuration scales VERY steeply with n (a probe sweep across
     // n=2k–100k took >17 min and was still in the second fit), so we cap
     // n at 8k locally. The window 500..8000 (16×) is enough for an
-    // honest power-law fit, though biobank-distance extrapolation is
+    // honest power-law fit, though large-scale-distance extrapolation is
     // wide; the extrapolation guard refuses to extrapolate when R²<0.85
     // or max log-resid >0.5.
     let ns: Vec<usize> = vec![500, 1_000, 2_000, 4_000, 8_000];

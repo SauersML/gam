@@ -43,7 +43,7 @@ fn default_degree_large_n_caps_at_l12() {
     for n in [10_000usize, 100_000, 1_000_000] {
         let l = default_spherical_harmonic_degree(n);
         assert!(l <= 12, "n={n} default L={l} exceeded L=12 cap");
-        assert!(l >= 6, "n={n} default L={l} too small for biobank-scale");
+        assert!(l >= 6, "n={n} default L={l} too small for large-scale");
     }
 }
 

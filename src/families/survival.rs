@@ -2759,7 +2759,7 @@ fn gauss_legendre_quadrature() -> &'static [(f64, f64)] {
 ///   at time u, i.e. x_dot_j(u) = d/d(beta_j) [d eta_d(u)/du].
 /// - `design_m[j]`: same as design_d but for the mortality linear predictor eta_m.
 ///
-/// This keeps biology/data wiring out of `gam` while centralizing the
+/// This keeps domain/data wiring out of `gam` while centralizing the
 /// integration engine in one place.
 pub fn calculate_crude_risk_quadrature<F>(
     t0: f64,

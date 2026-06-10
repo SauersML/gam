@@ -1,8 +1,8 @@
-//! Ignored-by-default Criterion workload for the biobank-shape de-nested cell
+//! Ignored-by-default Criterion workload for the large-scale de-nested cell
 //! moment Hv pattern. It compares cold uncached evaluation with a fit-lifetime
 //! byte-LRU warmed across repeated PIRLS-like cycles.
 //!
-//! Run with: `cargo bench --bench cell_moment_lru_biobank_shape`
+//! Run with: `cargo bench --bench cell_moment_lru_large_scale_shape`
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use gam::families::cubic_cell_kernel::{
@@ -11,7 +11,7 @@ use gam::families::cubic_cell_kernel::{
 };
 use std::hint::black_box;
 
-fn biobank_shape_cells() -> Vec<DenestedCubicCell> {
+fn large_scale_shape_cells() -> Vec<DenestedCubicCell> {
     let mut cells = Vec::new();
     let bounds = [
         (-3.0, -1.5),
@@ -40,9 +40,9 @@ fn biobank_shape_cells() -> Vec<DenestedCubicCell> {
     cells
 }
 
-fn bench_cell_moment_lru_biobank_shape(c: &mut Criterion) {
-    let cells = biobank_shape_cells();
-    c.bench_function("cell_moments_biobank_shape_uncached", |b| {
+fn bench_cell_moment_lru_large_scale_shape(c: &mut Criterion) {
+    let cells = large_scale_shape_cells();
+    c.bench_function("cell_moments_large_scale_shape_uncached", |b| {
         b.iter(|| {
             let mut acc = 0.0;
             for _cycle in 0..8 {
@@ -58,7 +58,7 @@ fn bench_cell_moment_lru_biobank_shape(c: &mut Criterion) {
         })
     });
 
-    c.bench_function("cell_moments_biobank_shape_fit_lru", |b| {
+    c.bench_function("cell_moments_large_scale_shape_fit_lru", |b| {
         b.iter(|| {
             let cache = CellMomentLruCache::new(256 * 1024 * 1024);
             let stats = CellMomentCacheStats::default();
@@ -79,5 +79,5 @@ fn bench_cell_moment_lru_biobank_shape(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_cell_moment_lru_biobank_shape);
+criterion_group!(benches, bench_cell_moment_lru_large_scale_shape);
 criterion_main!(benches);

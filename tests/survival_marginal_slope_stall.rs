@@ -1,5 +1,5 @@
 //! Red test: reproduce the PIRLS joint-Newton residual-stall early-exit
-//! observed in production survival_marginal_slope fits at biobank scale.
+//! observed in production survival_marginal_slope fits at large scale.
 //!
 //! Production signature (n=195,780, p=33, 5/5 outer seeds failed):
 //!
@@ -119,7 +119,7 @@ fn clip(x: f64, lo: f64, hi: f64) -> f64 {
 }
 
 /// Build the same frame shape and first-order column statistics as the
-/// failing biobank survival-marginal-slope run:
+/// failing large-scale survival-marginal-slope run:
 ///
 ///   rows=195,780 columns=[entry_age, exit_age, event, sex, prs_z, PC1..PC3]
 ///   event mean=0.5, sex mean≈0.391, entry_age mean≈45, exit_age mean≈53
@@ -231,7 +231,7 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
 }
 
 /// Reproduce the PIRLS joint-Newton residual-stall early-exit observed
-/// at biobank scale.  This test is currently expected to FAIL — assert
+/// at large scale.  This test is currently expected to FAIL — assert
 /// `outer_converged == true`; the production code returns false because
 /// the inner joint-Newton stalls on the time block.
 #[test]
@@ -241,7 +241,7 @@ fn survival_marginal_slope_stall_reproduces_residual_stall_early_exit() {
     let data = build_dataset();
 
     // Build the PC-Duchon log-slope formula with the same PC dimensionality
-    // and center count as the failing biobank fit:
+    // and center count as the failing large-scale fit:
     // `duchon(PC1, PC2, PC3, centers=10, order=1)` on both sides.
     let pcs: Vec<String> = (0..N_PCS).map(|i| format!("PC{}", i + 1)).collect();
     let duchon_term = format!("duchon({}, centers=10, order=1)", pcs.join(", "));

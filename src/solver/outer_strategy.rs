@@ -976,7 +976,7 @@ fn rank_seeds_with_screening(
 
     // Geometric cap cascade: each stage exits the moment any seed produces
     // a finite cost. The original two-stage protocol (initial cap → fully
-    // uncapped on every seed) has a degenerate worst case at biobank scale
+    // uncapped on every seed) has a degenerate worst case at large scale
     // — when every seed at the shallow cap collapses, we re-evaluate every
     // seed at the *full* inner budget, costing `N_seeds × full_pirls_work`
     // just to pick a starting point. The cascade replaces that all-or-
@@ -1303,7 +1303,7 @@ impl std::fmt::Display for OuterPlan {
 }
 
 impl OuterPlan {
-    /// Stable, grep-friendly routing token for biobank/log regression
+    /// Stable, grep-friendly routing token for large-scale/log regression
     /// assertions. Emits `solver=<Solver>;hessian=<Source>;matrix-free=<bool>`.
     /// Planning alone does not prove the runtime Hessian representation;
     /// matrix-free routing is decided after the seed evaluation returns an
@@ -2755,7 +2755,7 @@ const INNER_CAP_CONVERGENCE_OVERRIDE_RATIO: f64 = 0.01;
 const INNER_CAP_FLOOR: usize = 3;
 
 /// Ceiling on the adaptive inner-PIRLS cap, set at the inner-Newton noise
-/// floor at biobank scale; further iterations are pure waste once the warm
+/// floor at large scale; further iterations are pure waste once the warm
 /// start is close.
 const INNER_CAP_CEILING: usize = 64;
 
@@ -2781,7 +2781,7 @@ const INNER_CAP_CEILING: usize = 64;
 /// A cap of 0 means "no cap from this source"; the inner solver still
 /// honors `pirls_max_iterations` and the screening cap. The cap is
 /// floored at 3 (anything less is below noise) and ceilinged at 64
-/// (the inner noise floor at biobank scale; further iters would be
+/// (the inner noise floor at large scale; further iters would be
 /// pure waste).
 fn first_order_inner_cap_schedule(
     iter_count: usize,
@@ -3738,7 +3738,7 @@ fn project_to_bounds(x: &Array1<f64>, bounds: Option<&(Array1<f64>, Array1<f64>)
 /// invite `opt::SecondOrderCache::finite_difference_hessian` to silently
 /// estimate the Hessian by finite-differencing the gradient, which (a)
 /// throws away the analytic structure the route was selected for, and
-/// (b) costs O(K) full outer evaluations per ARC iteration — at biobank
+/// (b) costs O(K) full outer evaluations per ARC iteration — at large-scale
 /// scale, hours of work per silently-mis-routed step. The right
 /// behavior on a planner/runtime mismatch is to surface it loudly so
 /// the seed loop can either retry, demote the plan, or fail the seed.
@@ -3899,7 +3899,7 @@ const EFS_COST_DESCENT_TOL: f64 = 1e-12;
 /// Maximum number of consecutive HybridEFS iterations whose ψ block was
 /// zeroed before the bridge bails out and triggers a solver switch.
 ///
-/// On hard problems (Matérn additive at biobank scale, Duchon60, anisotropic
+/// On hard problems (Matérn additive at large scale, Duchon60, anisotropic
 /// joint penalties) a single zeroed-ψ iteration after exhausted backtracking
 /// is already strong evidence the EFS ψ direction is not descent-correlated
 /// at the current iterate; continuing on ρ alone with Δψ = 0 cannot enforce
@@ -4716,7 +4716,7 @@ impl OuterProblem {
     /// first step → larger first move on benign objectives. The matrix-
     /// free Newton-TR analog is `with_operator_initial_trust_radius`.
     ///
-    /// Used by Gaussian-identity REML at biobank n: the objective is
+    /// Used by Gaussian-identity REML at large-scale n: the objective is
     /// quadratic-like in log-λ near the optimum (sigma is the right
     /// scale), and log-λ moves of 2–4 units in the early iters
     /// otherwise burn 4–8 iters of trust-region expansion before the
@@ -4734,7 +4734,7 @@ impl OuterProblem {
     /// Rationale: a fixed `abs = tol` (e.g. 1e-6) is appropriate when the
     /// objective and its gradient live on a unit scale, but Gaussian-
     /// identity REML carries an O(n) likelihood constant that flows into
-    /// ∂/∂logλ. At biobank n the floor becomes binding even when the
+    /// ∂/∂logλ. At large-scale n the floor becomes binding even when the
     /// relative-from-seed component (`rel_initial_grad * ‖g0‖`) declared
     /// convergence iters earlier — chasing sub-ULP changes in log-λ at
     /// the cost of repeated k²·n·p² analytic-Hessian assemblies.
@@ -4761,7 +4761,7 @@ impl OuterProblem {
     /// than log-λ (≈ ln 2 per iter keeps kappa from oscillating). Without
     /// this split, a uniform rho-scale cap lets psi explode while a uniform
     /// psi-scale cap throttles rho — both fail the survival-marginal-slope
-    /// path at biobank scale, where rho needs |d|≈5 while psi wants |d|≤1.
+    /// path at large scale, where rho needs |d|≈5 while psi wants |d|≤1.
     pub fn with_bfgs_step_cap_psi(mut self, cap: Option<f64>) -> Self {
         self.bfgs_step_cap_psi = cap.filter(|v| v.is_finite() && *v > 0.0);
         self
@@ -6042,7 +6042,7 @@ fn run_outer_with_plan(
                     // Skip the log line on collapse — that's the
                     // zero-overhead easy-fit case and a log per seed would
                     // be noise. Anything else is a real anneal worth
-                    // surfacing so biobank-scale runs are diagnosable.
+                    // surfacing so large-scale runs are diagnosable.
                     if !summary.collapsed {
                         log::info!(
                             "[OUTER] {context}: continuation pre-warm seed {seed_idx} steps={} elapsed={:.3}s",
@@ -6225,7 +6225,7 @@ fn run_outer_with_plan(
                         // standard inexact-Newton-Krylov 0.5 forcing
                         // factor wins: one extra outer-TR iter is cheap
                         // versus halving the number of inner Hv applies
-                        // per outer iter. At biobank shape (n=300 K,
+                        // per outer iter. At large-scale shape (n=300 K,
                         // ~64 outer-TR iters × ~30 trace_logdet calls per
                         // Hv) this halves the dominant per-fit work.
                         .with_cg_tolerance(0.5)
@@ -6638,7 +6638,7 @@ fn run_outer_with_plan(
                     // `opt::Bfgs` so its first internal `eval_grad` call is
                     // served from cache instead of re-running the outer
                     // objective. Inner P-IRLS solves dominate outer cost
-                    // at biobank scale; skipping one re-eval at the seed
+                    // at large scale; skipping one re-eval at the seed
                     // is one of the cheapest wins available. (opt 0.3.0
                     // API; before that this was implemented via a
                     // gam-side cache on the bridge.)
@@ -8001,7 +8001,7 @@ mod tests {
     /// fatal error rather than producing `SecondOrderSample { hessian: None }`
     /// when the runtime returns `HessianResult::Unavailable`. A `None` here
     /// would let `opt::SecondOrderCache::finite_difference_hessian` silently
-    /// estimate the Hessian by finite-differencing the gradient — at biobank
+    /// estimate the Hessian by finite-differencing the gradient — at large-scale
     /// scale, hours of work per silently-mis-routed step. The seed loop
     /// should retry, demote, or fail loudly instead.
     #[test]
@@ -8143,8 +8143,8 @@ mod tests {
     //                                              by the family — BFGS is
     //                                              still the right choice)
     //
-    // `routing_log_line()` exposes a stable token that biobank log
-    // regressions in tests/bench_biobank_scale_runner_test.py pin against.
+    // `routing_log_line()` exposes a stable token that large-scale log
+    // regressions in tests/bench_large_scale_runner_test.py pin against.
     // ----------------------------------------------------------------------
 
     fn cap_for_routing(
@@ -8165,8 +8165,8 @@ mod tests {
     }
 
     #[test]
-    fn routing_analytic_analytic_stays_arc_at_biobank_scale() {
-        // Biobank-scale standard GAM (n=320K, p=65, k=6) used to trigger the
+    fn routing_analytic_analytic_stays_arc_at_large_scale() {
+        // Large-scale standard GAM (n=320K, p=65, k=6) used to trigger the
         // aggregate `k·n·p²` cost-driven downgrade. Post-#1 the planner has
         // no scale-driven downgrade, so `(Analytic, Analytic)` must stay on
         // ARC + Analytic regardless of the problem dimensions.
@@ -8211,7 +8211,7 @@ mod tests {
 
     #[test]
     fn routing_log_line_arc_analytic_does_not_advertise_matrix_free() {
-        // Token pinned by tests/bench_biobank_scale_runner_test.py. Renaming
+        // Token pinned by tests/bench_large_scale_runner_test.py. Renaming
         // any of these substrings is a log-regression and breaks downstream
         // grep patterns.
         let p = OuterPlan {
@@ -8482,7 +8482,7 @@ mod tests {
 
     #[test]
     fn disabled_fallback_hybrid_efs_capability_routes_to_bfgs_primary() {
-        // Production Matérn60 exact adaptive regularization at biobank scale:
+        // Production Matérn60 exact adaptive regularization at large scale:
         // rho_dim=3 retained quadratic penalties, psi_dim=6 adaptive λ/ε
         // coordinates, n_params=9, analytic gradient, and exact outer Hessian
         // cost-gated unavailable. Structurally this is HybridEFS-shaped, but
@@ -8510,7 +8510,7 @@ mod tests {
         let primary_cap = primary_capability_for_config(
             trapped_cap.clone(),
             &disabled_config,
-            "biobank exact adaptive",
+            "large-scale exact adaptive",
         );
         assert!(primary_cap.disable_fixed_point);
         assert_eq!(plan(&primary_cap).solver, Solver::Bfgs);
@@ -8542,7 +8542,7 @@ mod tests {
         let automatic_cap = primary_capability_for_config(
             trapped_cap.clone(),
             &automatic_config,
-            "biobank exact adaptive",
+            "large-scale exact adaptive",
         );
         assert!(!automatic_cap.disable_fixed_point);
         assert_eq!(plan(&automatic_cap).solver, Solver::HybridEfs);
@@ -8580,7 +8580,7 @@ mod tests {
                 Some(move |_: &mut (), _: &Array1<f64>| {
                     efs_calls.fetch_add(1, Ordering::Relaxed);
                     Err(EstimationError::RemlOptimizationFailed(format!(
-                        "{} synthetic biobank adaptive HybridEFS escape",
+                        "{} synthetic large-scale adaptive HybridEFS escape",
                         EFS_FIRST_ORDER_FALLBACK_MARKER,
                     )))
                 })

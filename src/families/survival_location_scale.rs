@@ -2236,7 +2236,7 @@ impl SurvivalLocationScaleFamily {
         // Write each row's 21 derivative scalars directly into the
         // preallocated output arrays in parallel. The previous path collected
         // a `Vec<Option<SurvivalRowDerivatives>>` (21 fields per row) and then
-        // serially scattered into 21 `Array1`s — at biobank scale that is the
+        // serially scattered into 21 `Array1`s — at large scale that is the
         // worst-case transient allocation among the family row builders.
         // Rows where `row_derivatives_rescaled` returns `Ok(None)` keep their
         // zero-initialized slots (matching the previous `continue` branch).
@@ -5204,7 +5204,7 @@ fn structural_time_coefficient_lower_bounds(
         // Two distinct regimes reach this branch and only one of them is
         // surprising:
         //
-        // 1. `learn_timewiggle = true` (the biobank-scale survival
+        // 1. `learn_timewiggle = true` (the large-scale survival
         //    marginal-slope path). `main.rs:3846` deliberately routes to
         //    `SurvivalTimeBasisConfig::None`, which produces an `(n, 0)`
         //    empty time-basis: the parametric baseline plus the timewiggle
@@ -8455,7 +8455,7 @@ impl SurvivalLocationScaleFamily {
     /// link-wiggle is configured) principal diagonal blocks of the joint
     /// Hessian without ever materializing the cross blocks. Used by
     /// `evaluate()` so the inner solver gets per-block working sets at
-    /// Θ(n · Σ p_b²) instead of Θ(n · (Σ p_b)²) — for biobank scale
+    /// Θ(n · Σ p_b²) instead of Θ(n · (Σ p_b)²) — for large scale
     /// (n ≈ 3·10⁵, Σ p_b ≈ 200) this avoids ~12·10⁹ scalar multiplies and
     /// the corresponding p² dense allocation per evaluate.
     fn assemble_block_diagonal_hessians_from_quantities(
@@ -9889,7 +9889,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // Survival location-scale couples its blocks (threshold/time/log-σ
         // and any link/time wiggles) through the survival likelihood: every
         // row contributes a dense outer-product over (Σ p_b) coefficients.
-        // At biobank scale the joint outer evaluator routes the coefficient
+        // At large scale the joint outer evaluator routes the coefficient
         // Hessian through its matrix-free HVP path; the cost remains an honest
         // dense-assembly diagnostic, while exact outer derivative order is now
         // driven by the explicit outer-HVP capability below rather than by a
@@ -12823,7 +12823,7 @@ mod tests {
     /// equal the spec widths for the HVP-availability path to be exercised
     /// (gam#848); the previous fixture left the family at 1-column designs
     /// while building width-200 specs, so the guard correctly rejected them.
-    fn survival_biobank_block_test_family(p: usize) -> SurvivalLocationScaleFamily {
+    fn survival_large_scale_block_test_family(p: usize) -> SurvivalLocationScaleFamily {
         let n = 3usize;
         let mut family = survival_exact_newton_test_family();
         family.x_threshold =
@@ -12841,8 +12841,8 @@ mod tests {
     }
 
     #[test]
-    fn survival_location_scale_advertises_outer_hvp_at_biobank_dimensions() {
-        let family = survival_biobank_block_test_family(200);
+    fn survival_location_scale_advertises_outer_hvp_at_large_scale_dimensions() {
+        let family = survival_large_scale_block_test_family(200);
         let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
             name: name.to_string(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((
@@ -12871,13 +12871,13 @@ mod tests {
         ));
         assert!(
             !family.outer_hyper_hessian_dense_available(&specs),
-            "biobank-scale survival location-scale should expose the outer Hessian through HVPs, not dense pairwise assembly"
+            "large-scale survival location-scale should expose the outer Hessian through HVPs, not dense pairwise assembly"
         );
     }
 
     #[test]
-    fn survival_location_scale_planner_keeps_analytic_hessian_at_biobank_dimensions() {
-        let family = survival_biobank_block_test_family(200);
+    fn survival_location_scale_planner_keeps_analytic_hessian_at_large_scale_dimensions() {
+        let family = survival_large_scale_block_test_family(200);
         let mk_spec = |name: &str, p: usize| ParameterBlockSpec {
             name: name.to_string(),
             design: DesignMatrix::Dense(DenseDesignMatrix::from(Array2::<f64>::zeros((

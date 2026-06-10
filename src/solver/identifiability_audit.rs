@@ -381,7 +381,7 @@ fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
 /// K_report is Bonferroni-corrected across the m_pairs total column pairs:
 ///   K_report = max(3, √(2 · ln(2 · m_pairs / α)))
 /// with α = 0.05.  For m_pairs = 1 this gives K = 3 (three-sigma).
-/// For m_pairs = 1000 (large biobank audit) this gives K ≈ 5.1.
+/// For m_pairs = 1000 (large large-scale audit) this gives K ≈ 5.1.
 ///
 /// # Floor — the near-exact-alias boundary, NOT 0.10
 ///
@@ -481,7 +481,7 @@ fn signed_cosine(dot: f64, norm_a: f64, norm_b: f64) -> f64 {
 /// inspects the post-rotation columns only.
 ///
 /// The algorithm:
-///   1. Densify each block once (chunked, n × p_block; biobank n,
+///   1. Densify each block once (chunked, n × p_block; large-scale n,
 ///      small p_block — total joint width is the GAM smooth budget,
 ///      not n). Each block's penalty-aware numerical rank is recorded
 ///      as `design_range_rank`.
@@ -2906,13 +2906,13 @@ mod tests {
         );
     }
 
-    /// Test 5: end-to-end shape on a biobank-like configuration —
+    /// Test 5: end-to-end shape on a large-scale-like configuration —
     /// 4 blocks, ~50 total columns, with one intentional cross-block
     /// linear alias seeded in. The audit must complete in well under
     /// a second and produce a single attributed drop with the
     /// expected joint rank.
     #[test]
-    fn audit_biobank_shape_end_to_end() {
+    fn audit_large_scale_shape_end_to_end() {
         let n = 1024;
         let x = linspace_minus_one_to_one(n);
         // Block 0: parametric intercept + age-linear.
@@ -2962,13 +2962,13 @@ mod tests {
             spec_from_dense("s_sin", s_sin),
             spec_from_dense("alias_block", alias_block),
         ];
-        let audit = audit_identifiability(&specs).expect("biobank-shape audit must succeed");
-        // The seeded x~x alias is exactly the biobank failure shape the
+        let audit = audit_identifiability(&specs).expect("large-scale audit must succeed");
+        // The seeded x~x alias is exactly the large-scale failure shape the
         // task #5 halt gate exists to refuse: two distinct blocks
         // contributing the same direction at overlap 1.0. Must be fatal.
         assert!(
             audit.fatal,
-            "seeded biobank-shape exact x~x alias must be fatal under the halt gate: {}",
+            "seeded large-scale exact x~x alias must be fatal under the halt gate: {}",
             audit.summary,
         );
         assert!(
@@ -2979,7 +2979,7 @@ mod tests {
         assert_eq!(
             audit.dropped_columns.len(),
             1,
-            "biobank-shape audit should attribute exactly the seeded alias; \
+            "large-scale audit should attribute exactly the seeded alias; \
              got {:?}",
             audit.dropped_columns,
         );
@@ -2987,7 +2987,7 @@ mod tests {
         let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
         assert_eq!(
             total_kept, 19,
-            "biobank-shape: expected 19 kept directions; got {total_kept} ({})",
+            "large-scale: expected 19 kept directions; got {total_kept} ({})",
             audit.summary,
         );
     }

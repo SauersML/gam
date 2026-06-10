@@ -1,4 +1,4 @@
-//! Biobank-scale fit-time benchmark across all geometric smooths.
+//! Large-scale fit-time benchmark across all geometric smooths.
 //!
 //! Measures `fit_from_formula` end-to-end at N=1M for every geometric
 //! feature we ship. Goal: prove the literal 150× target on the FIT path
@@ -96,7 +96,7 @@ fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) ->
 }
 
 #[test]
-fn biobank_perf_cylinder_n1m() {
+fn large_scale_perf_cylinder_n1m() {
     assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
@@ -109,11 +109,11 @@ fn biobank_perf_cylinder_n1m() {
         &data,
         &cfg,
     );
-    eprintln!("[biobank-fit] cylinder N=1M p={p}: {ms:.0} ms");
+    eprintln!("[large-scale-fit] cylinder N=1M p={p}: {ms:.0} ms");
 }
 
 #[test]
-fn biobank_perf_periodic_1d_n1m() {
+fn large_scale_perf_periodic_1d_n1m() {
     assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
@@ -126,11 +126,11 @@ fn biobank_perf_periodic_1d_n1m() {
         &data,
         &cfg,
     );
-    eprintln!("[biobank-fit] periodic_1d N=1M p={p}: {ms:.0} ms");
+    eprintln!("[large-scale-fit] periodic_1d N=1M p={p}: {ms:.0} ms");
 }
 
 #[test]
-fn biobank_perf_bc_1d_n1m() {
+fn large_scale_perf_bc_1d_n1m() {
     assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
@@ -139,11 +139,11 @@ fn biobank_perf_bc_1d_n1m() {
     };
     let data = bc_1d_data(1_000_000);
     let (ms, p) = time_fit("y ~ s(x, bc=anchored)", &data, &cfg);
-    eprintln!("[biobank-fit] bc_anchored 1D N=1M p={p}: {ms:.0} ms");
+    eprintln!("[large-scale-fit] bc_anchored 1D N=1M p={p}: {ms:.0} ms");
 }
 
 #[test]
-fn biobank_perf_sphere_wahba_n100k() {
+fn large_scale_perf_sphere_wahba_n100k() {
     assert!(file!().ends_with(".rs"));
     // Sphere Wahba kernel is O(N·K), so at N=1M K=50 = 50M kernel evals,
     // which dominates. Cap at N=100K for now to keep the test under a
@@ -155,11 +155,11 @@ fn biobank_perf_sphere_wahba_n100k() {
     };
     let data = sphere_data(100_000);
     let (ms, p) = time_fit("y ~ sphere(lat, lon, k=24)", &data, &cfg);
-    eprintln!("[biobank-fit] sphere_wahba N=100K K=24 p={p}: {ms:.0} ms");
+    eprintln!("[large-scale-fit] sphere_wahba N=100K K=24 p={p}: {ms:.0} ms");
 }
 
 #[test]
-fn biobank_perf_sphere_harmonic_n1m() {
+fn large_scale_perf_sphere_harmonic_n1m() {
     assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
@@ -172,7 +172,7 @@ fn biobank_perf_sphere_harmonic_n1m() {
         &data,
         &cfg,
     );
-    eprintln!("[biobank-fit] sphere_harmonic N=1M L=4 p={p}: {ms:.0} ms");
+    eprintln!("[large-scale-fit] sphere_harmonic N=1M L=4 p={p}: {ms:.0} ms");
 }
 
 // ----- accuracy & robustness: NOISY data, multiple families -----
@@ -205,7 +205,7 @@ fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::Encoded
 }
 
 #[test]
-fn biobank_perf_cylinder_noisy_n100k_accuracy() {
+fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
     assert!(file!().ends_with(".rs"));
     // Fit on noisy data, check that |residuals| has expected scale.
     init_parallelism();
@@ -221,14 +221,14 @@ fn biobank_perf_cylinder_noisy_n100k_accuracy() {
         &data,
         &cfg,
     );
-    eprintln!("[biobank-fit] cylinder_noisy N={n} p={p}: {ms:.0} ms (target ≤ 200 ms)");
+    eprintln!("[large-scale-fit] cylinder_noisy N={n} p={p}: {ms:.0} ms (target ≤ 200 ms)");
 }
 
 #[test]
-fn biobank_perf_mixed_three_smooths_n100k() {
+fn large_scale_perf_mixed_three_smooths_n100k() {
     assert!(file!().ends_with(".rs"));
     // Compound model: periodic 1D + BC 1D + sphere harmonic. Tests that
-    // mixed-feature models build and fit at biobank scale.
+    // mixed-feature models build and fit at large scale.
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -267,11 +267,11 @@ fn biobank_perf_mixed_three_smooths_n100k() {
         &data,
         &cfg,
     );
-    eprintln!("[biobank-fit] mixed 3-smooth N={n} p={p}: {ms:.0} ms");
+    eprintln!("[large-scale-fit] mixed 3-smooth N={n} p={p}: {ms:.0} ms");
 }
 
 #[test]
-fn biobank_perf_binomial_cylinder_n100k() {
+fn large_scale_perf_binomial_cylinder_n100k() {
     assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 100_000;
@@ -300,7 +300,7 @@ fn biobank_perf_binomial_cylinder_n100k() {
         &data,
         &cfg,
     );
-    eprintln!("[biobank-fit] binomial cylinder N={n} p={p}: {ms:.0} ms");
+    eprintln!("[large-scale-fit] binomial cylinder N={n} p={p}: {ms:.0} ms");
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -308,7 +308,7 @@ fn biobank_perf_binomial_cylinder_n100k() {
 // ────────────────────────────────────────────────────────────────────────────
 //
 // These tests time `build_term_collection_design` for a 2D `te(x, h)` smooth at
-// biobank N. The same problem is built twice:
+// large-scale N. The same problem is built twice:
 //
 //   * `identifiability = None`  → triggers the new sparse Khatri-Rao path
 //     (`build_tensor_bspline_basis` returns `DesignMatrix::Sparse`).
@@ -424,8 +424,8 @@ fn time_design_build_and_apply(
 }
 
 #[test]
-fn biobank_perf_sparse_vs_dense_te_n1m_p128() {
-    // p = 8 × 16 = 128 (matches the user's "p=128 at biobank N" scenario).
+fn large_scale_perf_sparse_vs_dense_te_n1m_p128() {
+    // p = 8 × 16 = 128 (matches the user's "p=128 at large-scale N" scenario).
     init_parallelism();
     let n = 1_000_000;
     let data = quasi_random_2d(n);
@@ -452,7 +452,7 @@ fn biobank_perf_sparse_vs_dense_te_n1m_p128() {
     let total_d = ms_build_d + ms_apply_d;
     let total_speedup = total_d / total_s.max(1e-6);
     eprintln!(
-        "[biobank-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
+        "[large-scale-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
          BUILD sparse={ms_build_s:.0} ms vs dense={ms_build_d:.0} ms ({build_speedup:.2}×), \
          APPLY×8 sparse={ms_apply_s:.0} ms vs dense={ms_apply_d:.0} ms ({apply_speedup:.2}×), \
          TOTAL sparse={total_s:.0} ms vs dense={total_d:.0} ms ({total_speedup:.2}×)"
@@ -460,7 +460,7 @@ fn biobank_perf_sparse_vs_dense_te_n1m_p128() {
 }
 
 #[test]
-fn biobank_perf_sparse_vs_dense_te_n100k_p128() {
+fn large_scale_perf_sparse_vs_dense_te_n100k_p128() {
     init_parallelism();
     let n = 100_000;
     let data = quasi_random_2d(n);
@@ -479,7 +479,7 @@ fn biobank_perf_sparse_vs_dense_te_n100k_p128() {
     let total_d = ms_build_d + ms_apply_d;
     let total_speedup = total_d / total_s.max(1e-6);
     eprintln!(
-        "[biobank-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
+        "[large-scale-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
          BUILD sparse={ms_build_s:.1} ms vs dense={ms_build_d:.1} ms ({build_speedup:.2}×), \
          APPLY×8 sparse={ms_apply_s:.1} ms vs dense={ms_apply_d:.1} ms ({apply_speedup:.2}×), \
          TOTAL sparse={total_s:.1} ms vs dense={total_d:.1} ms ({total_speedup:.2}×)"

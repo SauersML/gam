@@ -3,7 +3,7 @@
 //!
 //! # Outer-row subsampling
 //!
-//! At biobank scale (n ≥ tens of thousands) the outer rho-gradient is
+//! At large scale (n ≥ tens of thousands) the outer rho-gradient is
 //! a sum-over-rows trace whose per-row cost is dominated by the cubic
 //! cell-moment kernel. The pieces here — [`AutoOuterSubsampleOptions`],
 //! [`auto_outer_score_subsample`], [`maybe_install_auto_outer_subsample`],
@@ -799,7 +799,7 @@ impl<'a> SparsePrimaryCoeffJetView<'a> {
 // ---------------------------------------------------------------------------
 // Outer-only stratified row subsample (Phase 1 scaffolding).
 //
-// The biobank-scale outer-loop score/gradient passes do O(n) work per outer
+// The large-scale outer-loop score/gradient passes do O(n) work per outer
 // evaluation, which dominates wall-clock once n grows past ~10^5. To keep
 // outer-loop iterations tractable while leaving the inner PIRLS solve and the
 // final covariance assembly untouched, outer-only hot loops can be redirected
@@ -965,7 +965,7 @@ const fn splitmix64(state: &mut u64) -> u64 {
 
 /// Configuration for the automatic outer-score subsampler.
 ///
-/// At biobank scale (n ≥ tens of thousands) the marginal-slope outer
+/// At large scale (n ≥ tens of thousands) the marginal-slope outer
 /// rho-gradient computes a sum-over-rows trace
 /// `tr(F Fᵀ M_k) = Σ_i row_i(k)` whose per-row work is dominated by
 /// the cell-moment kernel. Stratified Horvitz–Thompson subsampling
@@ -1023,7 +1023,7 @@ pub struct AutoOuterSubsampleOptions {
     ///
     /// Calibration recipe: from a profiled run,
     ///     outer_work_per_k_unit = predicted_gradient_work / K.
-    /// For the biobank survival marginal-slope reference
+    /// For the large-scale survival marginal-slope reference
     /// (predicted_gradient_work ≈ 4.33×10⁹ at K=19_661), this gives
     /// ~220_000; we use 250_000 as a conservative upper bound. With
     /// `AUTO_OUTER_WORK_BUDGET = 5×10⁸` that caps K at ~2_000.
@@ -1261,9 +1261,9 @@ pub fn maybe_install_auto_outer_subsample(
     // `outer_work_per_k_unit` to 1, making the work-budget cap
     // (`K_work = AUTO_OUTER_WORK_BUDGET / outer_work_per_k_unit`)
     // never bind, and letting the noise-only rule pick K ≈ 0.10·n —
-    // which at biobank n=195_780 is K≈19_578 instead of the survival
+    // which at large-scale n=195_780 is K≈19_578 instead of the survival
     // family's intended K≈2_000. That ~9× inflation drove the
-    // documented 8h biobank hang (exit 137 from resource exhaustion).
+    // documented 8h large-scale hang (exit 137 from resource exhaustion).
     let auto_options = AutoOuterSubsampleOptions {
         outer_work_per_k_unit: outer_work_per_k_unit.max(1),
         ..AutoOuterSubsampleOptions::default()

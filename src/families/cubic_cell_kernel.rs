@@ -135,7 +135,7 @@ impl LocalSpanCubic {
 pub const ANCHORED_DEVIATION_KERNEL: &str = "DenestedCubicTransport";
 /// Default normalized non-affine branch tolerance used by [`branch_cell`].
 ///
-/// Keep this cutoff explicit and hill-climbable: the biobank-shape cycle-0
+/// Keep this cutoff explicit and hill-climbable: the large-scale cycle-0
 /// sweep evaluated `{1e-12, 1e-10, 1e-8, 1e-6, 1e-4, 1e-3}` against the
 /// legacy transport path.  The more aggressive candidates require an
 /// end-to-end beta acceptance run before promotion; the default therefore
@@ -1916,7 +1916,7 @@ fn moment_dot_with_coefficients_unchecked(coefficients: &[f64], moments: &[f64])
 /// Used by the multi-derivative reductions to fold `eta · r · s · …` triple
 /// and quadruple sums into a single moment dot, eliminating the
 /// `O(deg^3)`/`O(deg^4)` inner-loop work that dominated the
-/// `cell_*_derivative_from_moments` hot leaves on biobank-scale fits.
+/// `cell_*_derivative_from_moments` hot leaves on large-scale fits.
 #[inline]
 fn poly_conv_into(lhs: &[f64], rhs: &[f64], out: &mut [f64]) -> usize {
     if lhs.is_empty() || rhs.is_empty() {

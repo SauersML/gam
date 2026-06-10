@@ -27,7 +27,7 @@ import numpy as np
 
 BENCH_DIR = Path(__file__).resolve().parent
 ROOT = BENCH_DIR.parents[1]
-DEFAULT_CONFIG = BENCH_DIR / "biobank_scale.yml"
+DEFAULT_CONFIG = BENCH_DIR / "large_scale.yml"
 HEARTBEAT_INTERVAL_SEC = 15.0
 HEARTBEAT_INITIAL_WINDOW_SEC = 2.0
 HEARTBEAT_INITIAL_INTERVAL_SEC = 0.25
@@ -127,7 +127,7 @@ def _env_int_optional(name: str) -> int | None:
 _CMD_TIMEOUT_SEC = _env_int_optional("BENCH_CMD_TIMEOUT_SEC")
 
 # Routing-log scraping. When `--emit-routing-log` is passed to `run-method`,
-# `do_run_method` sets `BIOBANK_ROUTING_LOG_PATH` to the destination file.
+# `do_run_method` sets `LARGE_SCALE_ROUTING_LOG_PATH` to the destination file.
 # `run_cmd_stream` then appends every captured stderr line that contains the
 # `[OUTER]` log marker emitted by `crate::solver::outer_strategy::log_plan` —
 # the line carries the stable `solver=...;hessian=...;matrix-free=...` token
@@ -136,7 +136,7 @@ _ROUTING_LOG_OUTER_MARKER = "[OUTER]"
 
 
 def _routing_log_path() -> Path | None:
-    raw = os.environ.get("BIOBANK_ROUTING_LOG_PATH")
+    raw = os.environ.get("LARGE_SCALE_ROUTING_LOG_PATH")
     if not raw:
         return None
     return Path(raw)
@@ -242,10 +242,10 @@ def _detect_host_memory_bytes() -> int:
     return min(candidates)
 
 
-DEFAULT_BIOBANK_RAM_BUDGET_BYTES = _detect_host_memory_bytes()
-BIOBANK_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
-BIOBANK_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
-BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
+DEFAULT_LARGE_SCALE_RAM_BUDGET_BYTES = _detect_host_memory_bytes()
+LARGE_SCALE_MAX_DENSE_BLOCK_BYTES = 2 * 1024**3
+LARGE_SCALE_MAX_DERIVATIVE_DENSE_BYTES = 2 * 1024**3
+LARGE_SCALE_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
 
 
 # Mirrors of constants in src/families/transformation_normal.rs governing the
@@ -254,7 +254,7 @@ BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS = 8192
 TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES = 129
 TRANSFORMATION_RESPONSE_GRID_SUBDIVISIONS = 4
 # Upper-bound estimate for the number of internal knots used by the CTN
-# response-direction basis at biobank scale. The exact count is computed
+# response-direction basis at large scale. The exact count is computed
 # inside `effective_response_num_internal_knots` in the Rust code; the
 # preflight uses a conservative cap so the modelled grid size does not
 # under-report. Bumping this up is safe (only loosens the preflight check).
@@ -268,26 +268,26 @@ CTN_RESPONSE_INTERNAL_KNOTS_CAP = 32
 # exercises. (Kernel existence and D1/D2 collocation are all satisfied at 9, and
 # length_scale=1 makes the hybrid kernel strictly PD so the pure-mode CPD bound
 # 2*power < d does not apply.)
-BIOBANK_DUCHON16D_ORDER = 0
-BIOBANK_DUCHON16D_POWER = 9
-BIOBANK_DUCHON16D_LENGTH_SCALE = 1.0
+LARGE_SCALE_DUCHON16D_ORDER = 0
+LARGE_SCALE_DUCHON16D_POWER = 9
+LARGE_SCALE_DUCHON16D_LENGTH_SCALE = 1.0
 PGS_RAW_COLUMN = "pgs_raw"
 PGS_CTN_Z_COLUMN = "pgs_ctn_z"
 PGS_CTN_FIT_SUBSAMPLE_N = 5000
-# At biobank n=320k the fixed 5000-row subsample only covers ~1.6% of the
+# At large-scale n=320k the fixed 5000-row subsample only covers ~1.6% of the
 # 16D continuous PC distribution, which left CTN-z with kurt≈3733 (CI run
 # 25338491995). Local n=16k with the same 5000 covers ~31% and got kurt≈7.7.
 # Scale K with sqrt(n_train) — keeps O(K^2) cost manageable while ~4×-ing
-# the per-cell coverage at biobank scale.
-PGS_CTN_FIT_SUBSAMPLE_N_BIOBANK = 20000
-PGS_CTN_FIT_SUBSAMPLE_BIOBANK_THRESHOLD = 50000
+# the per-cell coverage at large scale.
+PGS_CTN_FIT_SUBSAMPLE_N_LARGE_SCALE = 20000
+PGS_CTN_FIT_SUBSAMPLE_LARGE_SCALE_THRESHOLD = 50000
 PGS_CTN_FIT_SUBSAMPLE_SEED = 20260430
 PGS_CTN_DIAGNOSTIC_MIN_N = 40
 PGS_CTN_DIAGNOSTIC_MAX_ABS_MEAN = 0.30
 PGS_CTN_DIAGNOSTIC_MIN_VAR = 0.50
 PGS_CTN_DIAGNOSTIC_MAX_VAR = 1.75
-SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale", "marginal-slope"}
-SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS = {
+SUPPORTED_LARGE_SCALE_SURVIVAL_LIKELIHOODS = {"transformation", "location-scale", "marginal-slope"}
+SUPPORTED_LARGE_SCALE_SURVIVAL_DISTRIBUTIONS = {
     "gaussian",
     "probit",
     "gumbel",
@@ -319,7 +319,7 @@ class MethodSpec:
 
 
 @dataclass(frozen=True)
-class BiobankPreflightReport:
+class LargeScalePreflightReport:
     status: str
     lines: list[str]
     largest_single_allocation_bytes: int
@@ -334,17 +334,17 @@ def _preflight_status_line(status: str) -> str:
     return f"status: {status}"
 
 
-def preflight_marginal_slope_biobank(
+def preflight_marginal_slope_large_scale(
     *,
     n_train: int,
     d_pc: int,
     centers: int,
     linkwiggle_knots: int | None = None,
     scorewarp_knots: int | None = None,
-    ram_budget_bytes: int = DEFAULT_BIOBANK_RAM_BUDGET_BYTES,
-) -> BiobankPreflightReport:
+    ram_budget_bytes: int = DEFAULT_LARGE_SCALE_RAM_BUDGET_BYTES,
+) -> LargeScalePreflightReport:
     if n_train <= 0 or d_pc <= 0 or centers <= 0:
-        raise RuntimeError("biobank preflight dimensions must be positive")
+        raise RuntimeError("large-scale preflight dimensions must be positive")
     p_pc = centers + 1
     dense_block_bytes = n_train * p_pc * F64_BYTES
     derivative_dense_bytes = d_pc * dense_block_bytes
@@ -359,7 +359,7 @@ def preflight_marginal_slope_biobank(
     # factors are kept separate, so the peak working allocation is just the
     # h'(grid) and delta-h'(grid) vectors of length n_train * n_grid each.
     # Pre-fix (row-replicated factors) the peak was n_train * n_grid * (p_resp +
-    # p_cov) * 8 — surfaced here for reporting so the OOM regression at biobank
+    # p_cov) * 8 — surfaced here for reporting so the OOM regression at large-scale
     # scale stays visible if anyone removes the factored representation.
     n_grid_estimate = (
         TRANSFORMATION_RESPONSE_GRID_MAX_QUANTILES
@@ -389,13 +389,13 @@ def preflight_marginal_slope_biobank(
         ctn_prep_factored_peak_bytes,
     )
     failures: list[str] = []
-    if dense_block_bytes > BIOBANK_MAX_DENSE_BLOCK_BYTES:
+    if dense_block_bytes > LARGE_SCALE_MAX_DENSE_BLOCK_BYTES:
         failures.append(
-            f"estimated dense block: {gibibytes(dense_block_bytes):.1f} GiB exceeds {gibibytes(BIOBANK_MAX_DENSE_BLOCK_BYTES):.1f} GiB"
+            f"estimated dense block: {gibibytes(dense_block_bytes):.1f} GiB exceeds {gibibytes(LARGE_SCALE_MAX_DENSE_BLOCK_BYTES):.1f} GiB"
         )
-    if derivative_dense_bytes > BIOBANK_MAX_DERIVATIVE_DENSE_BYTES:
+    if derivative_dense_bytes > LARGE_SCALE_MAX_DERIVATIVE_DENSE_BYTES:
         failures.append(
-            f"anisotropic derivative dense estimate: {gibibytes(derivative_dense_bytes):.1f} GiB exceeds {gibibytes(BIOBANK_MAX_DERIVATIVE_DENSE_BYTES):.1f} GiB"
+            f"anisotropic derivative dense estimate: {gibibytes(derivative_dense_bytes):.1f} GiB exceeds {gibibytes(LARGE_SCALE_MAX_DERIVATIVE_DENSE_BYTES):.1f} GiB"
         )
     if estimated_peak > int(0.80 * ram_budget_bytes):
         failures.append(
@@ -407,11 +407,11 @@ def preflight_marginal_slope_biobank(
         )
     status = "FAIL" if failures else "PASS"
     lines = [
-        "BIOBANK PREFLIGHT",
+        "LARGE_SCALE PREFLIGHT",
         f"n_train: {n_train:,}",
         f"d_pc: {d_pc}",
         f"K_pc: {centers}",
-        f"Duchon tuple: order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g}",
+        f"Duchon tuple: order={LARGE_SCALE_DUCHON16D_ORDER}, power={LARGE_SCALE_DUCHON16D_POWER}, length_scale={LARGE_SCALE_DUCHON16D_LENGTH_SCALE:g}",
         "Duchon smooth: lazy chunked",
         "marginal-slope anisotropy derivatives: implicit streaming",
         "conditional PGS CTN geometry: isotropic joint-PC Duchon (no scale dimensions)",
@@ -434,7 +434,7 @@ def preflight_marginal_slope_biobank(
         _preflight_status_line(status),
     ]
     lines.extend(f"failure: {failure}" for failure in failures)
-    return BiobankPreflightReport(status, lines, largest)
+    return LargeScalePreflightReport(status, lines, largest)
 
 
 def preflight_ctn_score_warp(
@@ -442,8 +442,8 @@ def preflight_ctn_score_warp(
     n_train: int,
     p_response: int,
     p_cov: int,
-    ram_budget_bytes: int = DEFAULT_BIOBANK_RAM_BUDGET_BYTES,
-) -> BiobankPreflightReport:
+    ram_budget_bytes: int = DEFAULT_LARGE_SCALE_RAM_BUDGET_BYTES,
+) -> LargeScalePreflightReport:
     if n_train <= 0 or p_response <= 0 or p_cov <= 0:
         raise RuntimeError("CTN preflight dimensions must be positive")
     dense_kron_bytes = n_train * p_response * p_cov * F64_BYTES
@@ -455,7 +455,7 @@ def preflight_ctn_score_warp(
         status = "ROUTE"
         failures.append("factored CTN design exceeds RAM budget")
     lines = [
-        "BIOBANK PREFLIGHT",
+        "LARGE_SCALE PREFLIGHT",
         f"n_train: {n_train:,}",
         "CTN Kronecker: factored",
         f"p_response: {p_response}",
@@ -466,7 +466,7 @@ def preflight_ctn_score_warp(
         _preflight_status_line(status),
     ]
     lines.extend(f"route note: {failure}" for failure in failures)
-    return BiobankPreflightReport(
+    return LargeScalePreflightReport(
         status,
         lines,
         max(factored_bytes, p_response * p_cov * F64_BYTES),
@@ -477,22 +477,22 @@ def preflight_survival_prediction(
     *,
     n_rows: int,
     grid_points: int,
-    chunk_rows: int = BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS,
-    ram_budget_bytes: int = DEFAULT_BIOBANK_RAM_BUDGET_BYTES,
-) -> BiobankPreflightReport:
+    chunk_rows: int = LARGE_SCALE_SURVIVAL_PREDICTION_CHUNK_ROWS,
+    ram_budget_bytes: int = DEFAULT_LARGE_SCALE_RAM_BUDGET_BYTES,
+) -> LargeScalePreflightReport:
     if n_rows <= 0 or grid_points <= 0 or chunk_rows <= 0:
         raise RuntimeError("survival prediction preflight dimensions must be positive")
     dense_time_tensor_bytes = n_rows * grid_points * F64_BYTES
     chunked_bytes = min(n_rows, chunk_rows) * grid_points * F64_BYTES
     estimated_peak = chunked_bytes + 256 * 1024**2
     failures: list[str] = []
-    if chunked_bytes > BIOBANK_MAX_DENSE_BLOCK_BYTES:
+    if chunked_bytes > LARGE_SCALE_MAX_DENSE_BLOCK_BYTES:
         failures.append("survival prediction chunk is too large")
     if estimated_peak > int(0.80 * ram_budget_bytes):
         failures.append("chunked survival prediction exceeds RAM budget")
     status = "ROUTE" if failures else "PASS"
     lines = [
-        "BIOBANK PREFLIGHT",
+        "LARGE_SCALE PREFLIGHT",
         f"n_predict: {n_rows:,}",
         f"survival grid: {grid_points}",
         f"survival time tensor: chunked rows={chunk_rows}",
@@ -502,7 +502,7 @@ def preflight_survival_prediction(
         _preflight_status_line(status),
     ]
     lines.extend(f"route note: {failure}" for failure in failures)
-    return BiobankPreflightReport(status, lines, chunked_bytes, chunk_rows=chunk_rows)
+    return LargeScalePreflightReport(status, lines, chunked_bytes, chunk_rows=chunk_rows)
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -561,16 +561,16 @@ def validate_method_spec(spec: MethodSpec) -> None:
             "use backend='rust_survival' with explicit survival_likelihood and survival_distribution"
         )
     if spec.backend == "rust_survival":
-        if spec.survival_likelihood not in SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS:
-            supported = "|".join(sorted(SUPPORTED_BIOBANK_SURVIVAL_LIKELIHOODS))
+        if spec.survival_likelihood not in SUPPORTED_LARGE_SCALE_SURVIVAL_LIKELIHOODS:
+            supported = "|".join(sorted(SUPPORTED_LARGE_SCALE_SURVIVAL_LIKELIHOODS))
             raise RuntimeError(
                 f"survival method '{spec.name}' requires survival_likelihood in {supported}"
             )
         if (
             spec.survival_likelihood != "marginal-slope"
-            and spec.survival_distribution not in SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS
+            and spec.survival_distribution not in SUPPORTED_LARGE_SCALE_SURVIVAL_DISTRIBUTIONS
         ):
-            supported = "|".join(sorted(SUPPORTED_BIOBANK_SURVIVAL_DISTRIBUTIONS))
+            supported = "|".join(sorted(SUPPORTED_LARGE_SCALE_SURVIVAL_DISTRIBUTIONS))
             raise RuntimeError(
                 f"survival method '{spec.name}' requires survival_distribution in {supported}"
             )
@@ -656,26 +656,26 @@ def _pc_std_columns(pc_count: int) -> list[str]:
     return [f"pc{i}_std" for i in range(1, int(pc_count) + 1)]
 
 
-def _biobank_duchon_pc_term(pc_count: int, centers: int) -> str:
+def _large_scale_duchon_pc_term(pc_count: int, centers: int) -> str:
     pc_cols = ", ".join(_pc_std_columns(pc_count))
     return (
         f"duchon({pc_cols}, centers={centers}, "
-        f"order={BIOBANK_DUCHON16D_ORDER}, power={BIOBANK_DUCHON16D_POWER}, "
-        f"length_scale={BIOBANK_DUCHON16D_LENGTH_SCALE:g})"
+        f"order={LARGE_SCALE_DUCHON16D_ORDER}, power={LARGE_SCALE_DUCHON16D_POWER}, "
+        f"length_scale={LARGE_SCALE_DUCHON16D_LENGTH_SCALE:g})"
     )
 
 
-def _biobank_pc_smooth_term(spatial_basis: str, pc_count: int, centers: int) -> str:
+def _large_scale_pc_smooth_term(spatial_basis: str, pc_count: int, centers: int) -> str:
     """Joint multi-D smooth over the PC ancestry axes.
 
-    All biobank lanes treat ancestry as a single object on the joint PC space
+    All large-scale lanes treat ancestry as a single object on the joint PC space
     (the production-pipeline strategic goal: PGS calibration via Duchon/TPS on
     joint PC). Lat/lon geographic coordinates are deliberately excluded — the
     relevant continuous structure is genetic ancestry, not geography.
     """
     pc_cols = ", ".join(_pc_std_columns(pc_count))
     if spatial_basis == "duchon":
-        return _biobank_duchon_pc_term(pc_count, centers)
+        return _large_scale_duchon_pc_term(pc_count, centers)
     if spatial_basis == "thinplate":
         return f"thinplate({pc_cols}, knots={centers})"
     if spatial_basis == "matern":
@@ -687,7 +687,7 @@ def _biobank_pc_smooth_term(spatial_basis: str, pc_count: int, centers: int) -> 
 
 
 def _ctn_formula(pc_count: int, centers: int) -> str:
-    return f"{PGS_RAW_COLUMN} ~ {_biobank_duchon_pc_term(pc_count, centers)}"
+    return f"{PGS_RAW_COLUMN} ~ {_large_scale_duchon_pc_term(pc_count, centers)}"
 
 
 def _attach_column(rows: list[dict[str, str]], column: str, values: list[float]) -> list[dict[str, Any]]:
@@ -732,7 +732,7 @@ def _z_moment_report(
         )
         # Soft per-group calibration diagnostics. Violations are surfaced as
         # warnings rather than RuntimeError so an isotropic CTN preprocessor
-        # (the speed-friendly default at biobank dimensionality) can proceed
+        # (the speed-friendly default at large-scale dimensionality) can proceed
         # even when its global z distribution carries heavier tails than the
         # downstream marginal-slope model strictly assumes; the gam binary
         # itself enforces a separate (also-warn-by-default) latent-z policy
@@ -818,7 +818,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     # **64× further into the tail** in the full data than in any uniform
     # subsample. Predict-time rows beyond the fit-time PC envelope get
     # linearly extrapolated, which sends the conditional CDF estimate to
-    # ~0 or ~1 spuriously, and `z = Φ⁻¹(F)` then blows up: at biobank
+    # ~0 or ~1 spuriously, and `z = Φ⁻¹(F)` then blows up: at large-scale
     # scale we measured `sd(z) ≈ 1.88`, `skew(z) ≈ 209`,
     # `excess_kurt(z) ≈ 19711` — a few-row tail of |z| ~ 20+ that the
     # downstream marginal-slope BFGS gradient cannot escape from in the
@@ -831,14 +831,14 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
     # axis. The remaining budget is filled uniformly at random. The total
     # subsample size stays close to `PGS_CTN_FIT_SUBSAMPLE_N` (slightly
     # larger when many rows are in multiple per-axis extremes; we dedupe).
-    # Pick the CTN fit subsample size adaptively. At biobank scale we use
-    # PGS_CTN_FIT_SUBSAMPLE_N_BIOBANK to give the CTN basis enough coverage
+    # Pick the CTN fit subsample size adaptively. At large scale we use
+    # PGS_CTN_FIT_SUBSAMPLE_N_LARGE_SCALE to give the CTN basis enough coverage
     # of the 16D continuous PC distribution (the 5000-row default leaves
     # ~1.6% coverage at n=320k vs ~31% at n=16k local; kurt(z) drops from
     # ~3700 toward ~10 with 4× more rows in fit).
     effective_subsample_n = (
-        PGS_CTN_FIT_SUBSAMPLE_N_BIOBANK
-        if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_BIOBANK_THRESHOLD
+        PGS_CTN_FIT_SUBSAMPLE_N_LARGE_SCALE
+        if len(train_rows) > PGS_CTN_FIT_SUBSAMPLE_LARGE_SCALE_THRESHOLD
         else PGS_CTN_FIT_SUBSAMPLE_N
     )
     if len(train_rows) > effective_subsample_n:
@@ -848,7 +848,7 @@ def fit_conditional_pgs_ctn_for_marginal_slope(
         # n_pcs). Why: with the prior formula at SUBSAMPLE_N=5000, pc_count=16
         # we forced 78 rows from each end of every PC. At local n=16k this
         # picks rows at the 0.49% quantile, which the CTN can fit cleanly
-        # (kurt(z) ≈ 7.7 in test runs). At biobank n=320k the SAME 78 rows
+        # (kurt(z) ≈ 7.7 in test runs). At large-scale n=320k the SAME 78 rows
         # land at the 0.024% quantile — 20× further into the tail — so the
         # CTN training distribution is dominated by extreme outliers and the
         # fitted basis cannot generalize to interior PCs (CI run 25338491995
@@ -1859,7 +1859,7 @@ def effective_marginal_slope_centers(
 
 
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
-    """Build mean + sigma formulas for biobank classification lanes.
+    """Build mean + sigma formulas for large-scale classification lanes.
 
     PCs enter as a SINGLE JOINT smooth over the ancestry manifold using the
     lane's `spatial_basis`; no per-PC linear terms, no separate per-axis
@@ -1873,12 +1873,12 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
     Logit + ``--predict-noise`` path is gated on an explicit mixture/blended
     link spec. The marginal-slope companion already pins ``link(type=probit)``
     for the same reason, so we use the same standard-link choice here to
-    keep all biobank ancestry-manifold lanes routed through a comparable
+    keep all large-scale ancestry-manifold lanes routed through a comparable
     binomial inverse-link.
     """
     centers = int(spec.centers or 60)
     pc_count = int(spec.pc_count)
-    spatial = _biobank_pc_smooth_term(spec.spatial_basis, pc_count, centers)
+    spatial = _large_scale_pc_smooth_term(spec.spatial_basis, pc_count, centers)
     mean_terms = [
         "pgs_std",
         "sex",
@@ -1895,12 +1895,12 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
 
 
 def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -> tuple[str, str]:
-    """Build mean and logslope formulas for biobank marginal-slope classification.
+    """Build mean and logslope formulas for large-scale marginal-slope classification.
 
     Uses the shared joint-PC helper so duchon / thinplate / matern lanes all
     route through the same ancestry-manifold contract.
     """
-    spatial = _biobank_pc_smooth_term(spec.spatial_basis, int(spec.pc_count), centers)
+    spatial = _large_scale_pc_smooth_term(spec.spatial_basis, int(spec.pc_count), centers)
     mean_terms = [
         "link(type=probit)",
         "sex",
@@ -1934,7 +1934,7 @@ def run_rust_marginal_slope_classification(
     rust_bin = load_or_build_rust_binary()
     train_rows = count_csv_rows(train_csv)
     centers = effective_marginal_slope_centers(spec, train_rows=train_rows)
-    preflight = preflight_marginal_slope_biobank(
+    preflight = preflight_marginal_slope_large_scale(
         n_train=train_rows,
         d_pc=int(spec.pc_count),
         centers=centers,
@@ -2003,7 +2003,7 @@ def run_rust_marginal_slope_classification(
 
 
 def rust_survival_marginal_slope_formula_parts(spec: MethodSpec, centers: int) -> tuple[str, str]:
-    spatial = _biobank_pc_smooth_term(spec.spatial_basis, int(spec.pc_count), centers)
+    spatial = _large_scale_pc_smooth_term(spec.spatial_basis, int(spec.pc_count), centers)
     mean_terms = ["sex", "smooth(age_entry_std)", spatial]
     if spec.timewiggle_knots is not None:
         mean_terms.append(f"timewiggle(internal_knots={int(spec.timewiggle_knots)})")
@@ -2034,7 +2034,7 @@ def rust_survival_formula_rhs(spec: MethodSpec) -> str:
         )
     pc_count = int(spec.pc_count)
     centers = int(spec.centers or 60)
-    pc_term = _biobank_pc_smooth_term(spec.spatial_basis, pc_count, centers)
+    pc_term = _large_scale_pc_smooth_term(spec.spatial_basis, pc_count, centers)
     terms = [
         "pgs_std",
         "sex",
@@ -2156,7 +2156,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     train_metric_rows_raw = train_rows_raw
     if likelihood_mode == "marginal-slope":
         centers = effective_marginal_slope_centers(spec, train_rows=len(train_rows_raw))
-        preflight = preflight_marginal_slope_biobank(
+        preflight = preflight_marginal_slope_large_scale(
             n_train=len(train_rows_raw),
             d_pc=int(spec.pc_count),
             centers=centers,
@@ -2191,7 +2191,7 @@ def run_rust_survival(spec: MethodSpec, train_csv: Path, test_csv: Path, out_dir
     )
     print("\n".join(prediction_preflight.lines), file=sys.stderr, flush=True)
     horizon = survival_eval_horizon_from_rows(train_rows_raw)
-    with tempfile.TemporaryDirectory(prefix="gam_biobank_survival_", dir=out_dir) as td:
+    with tempfile.TemporaryDirectory(prefix="gam_large_scale_survival_", dir=out_dir) as td:
         td_path = Path(td)
         train_fit_path = td_path / "train_fit.csv"
         test_pred_input_path = td_path / "test_predict.csv"
@@ -2332,7 +2332,7 @@ def do_run_method(args: argparse.Namespace) -> int:
         routing_log_path = out_dir / f"{spec.name}.routing.log"
         # Truncate so re-runs do not accumulate stale routing tokens.
         routing_log_path.write_text("", encoding="utf-8")
-        os.environ["BIOBANK_ROUTING_LOG_PATH"] = str(routing_log_path)
+        os.environ["LARGE_SCALE_ROUTING_LOG_PATH"] = str(routing_log_path)
         # log_plan emits at info level. If RUST_LOG is already configured by
         # the caller we leave it alone; otherwise default to gam=info so the
         # `[OUTER]` line reaches stderr.
@@ -2346,7 +2346,7 @@ def do_run_method(args: argparse.Namespace) -> int:
         }
     except TimeoutError as exc:
         # Per-command wall-clock budget exhausted. This is an EXPECTED
-        # failure mode at biobank scale (the [HEARTBEAT] line and
+        # failure mode at large scale (the [HEARTBEAT] line and
         # [PHASE summary] above already explain WHICH phase was running
         # when the budget ran out, so a Python stack trace adds no
         # information and just clutters the log). Emit a one-line
@@ -2440,7 +2440,7 @@ def do_aggregate(args: argparse.Namespace) -> int:
     plot_dir = out_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
     plot_paths = plot_aggregate(results, args.prep_dir.resolve(), plot_dir)
-    zip_path = out_dir / "biobank_scale_bundle.zip"
+    zip_path = out_dir / "large_scale_bundle.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         already_added: set[str] = set()
         core_paths = [
@@ -2474,7 +2474,7 @@ def do_matrix(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Biobank-scale synthetic benchmark runner")
+    parser = argparse.ArgumentParser(description="Large-scale synthetic benchmark runner")
     sub = parser.add_subparsers(dest="command", required=True)
 
     prep = sub.add_parser("prepare")

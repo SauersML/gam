@@ -329,7 +329,7 @@ impl<'a> StableSolver<'a> {
     /// projected residual.
     ///
     /// The cutoff is `rank_tol × max(|λ|)`, the standard rank-revealing
-    /// threshold. For p ≲ a few hundred (joint Newton at biobank scale
+    /// threshold. For p ≲ a few hundred (joint Newton at large scale
     /// has p = 33) the eigendecomposition is sub-millisecond and saves
     /// the entire outer optimisation from rejecting ill-conditioned ρ.
     pub(crate) fn solve_with_pseudoinverse_fallback(
@@ -879,7 +879,7 @@ where
         }
         diagnostics.push_iteration(alpha, Some(beta), r_norm);
         // p <- z + beta * p (fused, SIMD-friendly via ndarray::Zip; parallel
-        // over coefficient dimension at biobank-scale p).
+        // over coefficient dimension at large-scale p).
         Zip::from(&mut p_dir).and(&z).par_for_each(|pi, &zi| {
             *pi = zi + beta * *pi;
         });

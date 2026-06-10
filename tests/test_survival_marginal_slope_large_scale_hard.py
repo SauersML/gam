@@ -15,7 +15,7 @@ HARD_N = 195_780
 HARD_TIMEOUT_SECONDS = 420.0
 
 
-def _biobank_survival_marginal_slope_frame(seed: int, n: int) -> pd.DataFrame:
+def _large_scale_survival_marginal_slope_frame(seed: int, n: int) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
 
     pc1 = np.clip(rng.normal(0.0243522, 0.042, n), -0.339466, 0.118391)
@@ -55,9 +55,9 @@ def _biobank_survival_marginal_slope_frame(seed: int, n: int) -> pd.DataFrame:
     )
 
 
-def _fit_biobank_survival_marginal_slope_worker(result_queue: typing.Any) -> None:
+def _fit_large_scale_survival_marginal_slope_worker(result_queue: typing.Any) -> None:
     try:
-        df = _biobank_survival_marginal_slope_frame(seed=0xA0B10B, n=HARD_N)
+        df = _large_scale_survival_marginal_slope_frame(seed=0xA0B10B, n=HARD_N)
         duchon = "duchon(PC1, PC2, PC3, centers=10, order=1)"
         started = time.monotonic()
         model = gamfit.fit(
@@ -84,8 +84,8 @@ def _fit_biobank_survival_marginal_slope_worker(result_queue: typing.Any) -> Non
         result_queue.put(("error", type(exc).__name__, str(exc)))
 
 
-def test_survival_marginal_slope_biobank_startup_seeds_do_not_all_reject() -> None:
-    """Hard red repro for the AoU survival marginal-slope startup failure.
+def test_survival_marginal_slope_large_scale_startup_seeds_do_not_all_reject() -> None:
+    """Hard red repro for the large-scale survival marginal-slope startup failure.
 
     The production failure is not a small scalar-kernel bug. It happens only
     after the Python FFI builds the full survival marginal-slope model shape,
@@ -93,17 +93,17 @@ def test_survival_marginal_slope_biobank_startup_seeds_do_not_all_reject() -> No
     the Newton path before convergence.
     """
     if not gamfit.build_info().get("available"):
-        raise AssertionError("rust extension is required for the hard biobank startup repro")
+        raise AssertionError("rust extension is required for the hard large-scale startup repro")
 
     result_queue = mp.Queue()
-    proc = mp.Process(target=_fit_biobank_survival_marginal_slope_worker, args=(result_queue,))
+    proc = mp.Process(target=_fit_large_scale_survival_marginal_slope_worker, args=(result_queue,))
     proc.start()
     proc.join(HARD_TIMEOUT_SECONDS)
     if proc.is_alive():
         proc.terminate()
         proc.join(10.0)
         raise AssertionError(
-            f"survival marginal-slope hard biobank startup repro did not return within "
+            f"survival marginal-slope hard large-scale startup repro did not return within "
             f"{HARD_TIMEOUT_SECONDS:.0f}s"
         )
 

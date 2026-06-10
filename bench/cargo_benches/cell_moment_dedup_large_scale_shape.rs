@@ -5,7 +5,7 @@ use gam::families::cubic_cell_kernel::{
 use std::collections::HashMap;
 use std::hint::black_box;
 
-fn synthetic_biobank_cells(n_rows: usize, cells_per_row: usize) -> Vec<DenestedCubicCell> {
+fn synthetic_large_scale_cells(n_rows: usize, cells_per_row: usize) -> Vec<DenestedCubicCell> {
     let prototypes: Vec<_> = (0..128)
         .map(|i| {
             let t = i as f64 / 127.0;
@@ -51,11 +51,11 @@ fn evaluate_dedup(cells: &[DenestedCubicCell], epsilon: f64) -> (f64, usize, usi
     (total, hits, misses)
 }
 
-fn bench_cell_moment_dedup_biobank_shape(c: &mut Criterion) {
+fn bench_cell_moment_dedup_large_scale_shape(c: &mut Criterion) {
     // Criterion benchmarks are opt-in (run explicitly with this bench target),
-    // which keeps the biobank-shaped workload out of normal test runs.
-    let cells = synthetic_biobank_cells(8_192, 4);
-    let mut group = c.benchmark_group("cell_moment_dedup_biobank_shape");
+    // which keeps the large-scale-shaped workload out of normal test runs.
+    let cells = synthetic_large_scale_cells(8_192, 4);
+    let mut group = c.benchmark_group("cell_moment_dedup_large_scale_shape");
     group.bench_function("uncached", |b| {
         b.iter(|| black_box(evaluate_uncached(&cells)))
     });
@@ -67,5 +67,5 @@ fn bench_cell_moment_dedup_biobank_shape(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_cell_moment_dedup_biobank_shape);
+criterion_group!(benches, bench_cell_moment_dedup_large_scale_shape);
 criterion_main!(benches);

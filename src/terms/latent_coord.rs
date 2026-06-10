@@ -1012,21 +1012,6 @@ impl LatentCoordValues {
         }
     }
 
-    /// Per-axis trust-region metric weights for the multi-atom assignment
-    /// hardening hook, in the public form
-    /// [`crate::terms::atom_selection`] consumes to scale per-iteration logit
-    /// caps. This is exactly [`Self::effective_metric_weights`] — the
-    /// authoritative `1/scale²` weights that already cover `Interval` /
-    /// `ProductWithMetric` / override-retraction — re-exported `pub` so the
-    /// atom-selection layer (a sibling module that holds a `LatentCoordValues`
-    /// per atom but cannot reach the `pub(crate)` accessor through its own
-    /// public API) can size the assignment-logit trust region per latent axis.
-    /// The returned `Vec` has length `latent_dim`; every weight is finite and
-    /// strictly positive by construction of the underlying manifold metric.
-    pub fn logit_trust_cap_weights(&self) -> Vec<f64> {
-        self.effective_metric_weights()
-    }
-
     /// Effective per-axis periodicity (`Some(period)` on wrapped axes). When
     /// the declared manifold is non-Euclidean it is authoritative; when it is
     /// Euclidean, an explicit override retraction (if any) decides. Returns a

@@ -780,7 +780,7 @@ extern "C" __global__ void chol_logdet_col_major(
     /// gradient). Only the penalty matrix still crosses the host
     /// boundary because the outer REML loop updates Sλ + LM ridge
     /// between PIRLS steps; the penalty is p×p which is independent of
-    /// n, so for biobank-scale n it is a negligible transfer.
+    /// n, so for large-scale n it is a negligible transfer.
     ///
     /// Outputs match `solve_step_on_stream`: returns the assembled
     /// penalised Hessian, the Newton descent direction `δ = H⁻¹·rhs`
@@ -3438,7 +3438,7 @@ pub fn solve_gaussian_pls_gpu(
 // operator.
 //
 // The inner Newton solve in `BernoulliMarginalSlope` (matrix-free path,
-// biobank shape n=195k, p=44, r=20) currently reaches the GPU as a
+// large-scale shape n=195k, p=44, r=20) currently reaches the GPU as a
 // per-CG-iteration call to `launch_bms_flex_row_hvp` returning a host
 // `Vec<f64>`. With ~6400 inner CG iterations per outer iteration that round-
 // trip cost dominates: each iter pays one `stream.synchronize()` plus one
@@ -4267,7 +4267,7 @@ mod stream_device_parity_tests {
         }
     }
 
-    /// V100 hill-climb gate: at biobank-shape (n=80k, p=44,
+    /// V100 hill-climb gate: at large-scale (n=80k, p=44,
     /// BernoulliLogit/Fisher) the device-resident loop must be ≥10×
     /// faster than the CPU reference. Marked `#[ignore]` so it only
     /// runs when explicitly invoked (`cargo test -- --ignored
@@ -4276,7 +4276,7 @@ mod stream_device_parity_tests {
     /// PIRLS reference loop to avoid dragging in `solver::pirls`'s
     /// 13k-line state machine.
     #[test]
-    fn hill_climb_loop_beats_cpu_10x_on_biobank_logit() {
+    fn hill_climb_loop_beats_cpu_10x_on_large_scale_logit() {
         use crate::gpu::pirls_row::{CurvatureMode, PirlsRowFamily, RowInput, row_reweight_cpu};
         use std::time::Instant;
         if crate::gpu::runtime::GpuRuntime::global().is_none() {
@@ -4394,7 +4394,7 @@ mod stream_device_parity_tests {
         );
         assert!(
             speedup >= 10.0,
-            "GPU PIRLS loop must be ≥10× CPU at biobank shape; got speedup={speedup:.2}× (gpu={gpu_secs:.3}s cpu={cpu_secs:.3}s)"
+            "GPU PIRLS loop must be ≥10× CPU at large-scale shape; got speedup={speedup:.2}× (gpu={gpu_secs:.3}s cpu={cpu_secs:.3}s)"
         );
     }
 

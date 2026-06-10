@@ -3279,7 +3279,7 @@ pub struct SpatialLengthScaleOptimizationOptions {
     pub min_length_scale: f64,
     /// Maximum allowed length_scale during κ search.
     pub max_length_scale: f64,
-    /// Automatic geometry-initializer threshold for biobank-scale spatial fits.
+    /// Automatic geometry-initializer threshold for large-scale spatial fits.
     ///
     /// When n exceeds twice this value, the fitter uses a spatially stratified
     /// subsample only to seed κ/anisotropy geometry: centers are resolved,
@@ -5606,7 +5606,7 @@ fn tensor_product_design_from_marginals(
     // where j is the multi-index (j_1, ..., j_D) flattened. Independent
     // across rows; parallelize row chunks and fill the pre-allocated
     // contiguous Array2 in place (no Vec-flatten-collect intermediate,
-    // which doubled the peak memory at biobank N).
+    // which doubled the peak memory at large-scale N).
     use ndarray::parallel::prelude::*;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
     let mut design = Array2::<f64>::zeros((n, total_cols));
@@ -7641,7 +7641,7 @@ fn build_smooth_design_withworkspace_unvalidated(
         //     penalties[k]  ← Qᵀ · S_k · Q   (block-diag, zero null tail)
         // yields a model whose fitted γ is invariant to the rotation
         // (since likelihood depends only on `X · β_raw = X · Q · γ`), but
-        // whose penalty is full-rank on the range columns. The biobank
+        // whose penalty is full-rank on the range columns. The large-scale
         // failing case (cert refusal in the joint-Newton inner solve)
         // resolves because `H_pen = H_loglik + S` becomes full rank on
         // the smooth's range columns.
@@ -15230,7 +15230,7 @@ fn exact_joint_spatial_outer_hessian_available(
     // variants supply scalar-GLM derivative ingredients consumed by
     // `compute_outer_hessian` / `build_outer_hessian_operator`, and the
     // (n, p, K) crossover in `prefer_outer_hessian_operator` chooses the
-    // matrix-free `HessianResult::Operator` representation at biobank scale
+    // matrix-free `HessianResult::Operator` representation at large scale
     // for dense-lazy designs.  The previous `Identity || sparse_design`
     // gate predates that operator routing and forced binomial+logit+Matern
     // (and any other non-Gaussian dense-lazy spatial design) onto the
@@ -16339,7 +16339,7 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     let log_kappa_dim = info_list.len();
     // Layout-only metadata (group_id per axis) is cheap to snapshot up front so
     // the consumption loop below can MOVE the dense (n × p) derivative arrays
-    // out of each entry instead of cloning. At biobank scale (n≈3×10⁵, 16-axis
+    // out of each entry instead of cloning. At large scale (n≈3×10⁵, 16-axis
     // CTN) the prior `.clone()` sites doubled peak working memory for the
     // psi-derivative pass through several GiB.
     let group_ids: Vec<Option<usize>> = info_list.iter().map(|e| e.aniso_group_id).collect();
@@ -17691,7 +17691,7 @@ fn run_exact_joint_spatial_optimization(
     // problem size. The unified REML evaluator now exposes exact matrix-free
     // outer Hessian operators for the costly third/fourth-derivative
     // contractions used by spatial ψ coordinates; its internal
-    // `(n, p, K)` work model chooses `HessianResult::Operator` at biobank
+    // `(n, p, K)` work model chooses `HessianResult::Operator` at large-scale
     // scale and the dense analytic matrix only below that crossover. Keeping
     // `Derivative::Analytic` here preserves ARC / trust-region-CG second-order
     // optimization for `n > 50_000` and `coord_dim > 30` instead of forcing the
@@ -19900,7 +19900,7 @@ where
     // exact MLE — it just takes more line-search iterations. This is **not**
     // a feature drop: quasi-Newton picks up curvature from successive
     // analytic gradients, and the per-eval cost saving (`O(p)` instead of
-    // `O(p²)`) more than pays for the iteration overhead at biobank scale.
+    // `O(p²)`) more than pays for the iteration overhead at large scale.
     let policy_hessian_form = outer_derivative_policy.declared_hessian_form();
     let analytic_outer_hessian_available = analytic_joint_hessian_available
         && matches!(
@@ -19934,7 +19934,7 @@ where
     //
     // The κ MLE for a stationary spatial process is asymptotically
     // *invariant* in `n` once `n` is past the Monte-Carlo resolution of
-    // the cell-moment kernel. At biobank scale (`n ≥ STAGED_KAPPA_*`) the
+    // the cell-moment kernel. At large scale (`n ≥ STAGED_KAPPA_*`) the
     // Monte-Carlo error of a `K = 5_000`-row pilot is ≪ the κ posterior
     // width, so estimating θ on a stratified `K`-row pilot returns
     // statistically the *same* estimate as the full-data fit at a
@@ -20049,7 +20049,7 @@ where
     // particular trajectory regions. A single `[KAPPA-PHASE-SUMMARY]`
     // line is emitted on optimization exit. Grepping these is the
     // production-fit κ-scaling probe (task #32) — measurement happens
-    // in real biobank fits rather than a synthetic harness, so the
+    // in real large-scale fits rather than a synthetic harness, so the
     // scaling law reflects the actual workload.
     use std::cell::Cell;
     let kphase_cost_calls: Cell<usize> = Cell::new(0);
@@ -24296,7 +24296,7 @@ mod tests {
         // Both Gaussian and BinomialLogit on a dense design now report
         // analytic Hessian available; the unified evaluator routes
         // non-Gaussian dense-lazy designs through `build_outer_hessian_operator`
-        // at biobank scale and through `compute_outer_hessian` otherwise.
+        // at large scale and through `compute_outer_hessian` otherwise.
         assert!(exact_joint_spatial_outer_hessian_available(
             &LikelihoodSpec::binomial_logit(),
             &design,

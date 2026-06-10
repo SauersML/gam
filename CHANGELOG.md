@@ -327,7 +327,7 @@ Tests:
 ## gam v0.3.104 / gamfit v0.1.178
 
 - fix(#787/#785): C1 antiderivative for floored Jeffreys eigenvalue + line-search early-exit threshold (bernoulli marginal-slope inner KKT now converges; centers=12 PGS config that previously froze ~20min now returns).
-- fix(#859): pin CTN cross-fit response knot count across folds (skewed-PGS biobank calibration no longer raises p1 mismatch).
+- fix(#859): pin CTN cross-fit response knot count across folds (skewed-PGS large-scale calibration no longer raises p1 mismatch).
 - fix(#813/#821): freeze ALO influence_scale/phi per fit (te() outer-REML no longer grinds; value<->gradient consistency).
 - wip(#808): eta1-channel cross-block reduction for survival marginal-slope.
 
@@ -535,7 +535,7 @@ under-identification robustness layer (off by default).
 - **Publish the post-0.1.167 BMS spatial/kappa rho fix to PyPI (#754).** The
   0.1.167 wheel was built before the follow-up fix that removed fixed physical
   BMS ridges from the learned spatial/kappa REML `rho` layout. This wheel bump
-  publishes the already-merged code needed by the AoU Workbench driver, whose
+  publishes the already-merged code needed by the large-scale Workbench driver, whose
   `uv --with gamfit --upgrade-package gamfit` path resolves from PyPI.
 
 ## v0.3.95 — gam 0.3.95 / gamfit 0.1.167 (2026-06-04)
@@ -594,7 +594,7 @@ under-identification robustness layer (off by default).
 
 ### Fixed
 
-- **Bernoulli marginal-slope Matérn fits with redundant scalar covariates no longer fail the identifiability audit.** The workflow now removes unpenalized scalar columns that add no direction beyond the implicit intercept and earlier scalar terms before BMS block construction, and rejects constrained or explicitly-penalized duplicates instead of using a ridge or constraint to mask non-identifiability. This keeps the hardened audit fail-closed while allowing biobank hypertension-style `matern(...) + scalar covariates` fits whose precomputed scalar spline column is constant or redundant.
+- **Bernoulli marginal-slope Matérn fits with redundant scalar covariates no longer fail the identifiability audit.** The workflow now removes unpenalized scalar columns that add no direction beyond the implicit intercept and earlier scalar terms before BMS block construction, and rejects constrained or explicitly-penalized duplicates instead of using a ridge or constraint to mask non-identifiability. This keeps the hardened audit fail-closed while allowing large-scale hypertension-style `matern(...) + scalar covariates` fits whose precomputed scalar spline column is constant or redundant.
 
 ## v0.3.86 — gam 0.3.86 / gamfit 0.1.158 (2026-06-04)
 
@@ -741,7 +741,7 @@ publish paths.
   hyperparameter vector: the n-block exact-joint spatial optimizer planned a
   per-axis `θ` layout (`rho_dim + Σ d_term`) while the inner unified evaluator
   emitted one `ψ` per term, tripping the `OuterThetaLayout` contract and failing
-  every nightly Biobank-scale `duchon16d` shard before the solver even started.
+  every nightly Large-scale `duchon16d` shard before the solver even started.
   A single shared predicate now drives the `ψ` count at all four sites: Duchon
   anisotropy `η` is a fixed, geometry-derived basis parameter (one isotropic
   `ψ̄` slot per term), so the outer plan and the inner gradient agree by
@@ -1809,7 +1809,7 @@ publish paths.
 
 ### Changed
 
-- Improved biobank-scale performance with rank-INT latent-z handling,
+- Improved large-scale performance with rank-INT latent-z handling,
   line-search subsampling, row-set threading, and predict-time anchor
   correction.
 - Added BMS residual plumbing, cross-block identifiability regressions for
@@ -1952,7 +1952,7 @@ publish paths.
   performance, inner-Newton line-search, and Python-binding cleanup from the
   long pre-release diff.
 - Added NUTS posterior sampling exposure, marginal-slope and GAMLSS performance
-  work, BMS LRU derivative paths, BLAS-3 Bernoulli rigid-row kernels, biobank
+  work, BMS LRU derivative paths, BLAS-3 Bernoulli rigid-row kernels, large-scale
   design dense-conversion fixes, and broader Python packaging cleanup.
 
 ## v0.1.16 — gam 0.1.16 / gamfit 0.1.16 (2026-05-07)
@@ -1980,7 +1980,7 @@ publish paths.
 - Published the large REML / LAML sparse-calculus pass: block-local Takahashi
   traces, sparse exact outer calculus, exact penalty pseudo-logdet on positive
   eigenspaces, structural nullspace dimensions, survival fourth derivatives,
-  GAMLSS observed weights, Firth drift fixes, and biobank-scale PCG /
+  GAMLSS observed weights, Firth drift fixes, and large-scale PCG /
   compositional hyper-drift work.
 
 ## v0.1.11 — gam 0.1.11 / gamfit - (2026-02-25)

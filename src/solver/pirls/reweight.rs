@@ -514,7 +514,7 @@ where
     // Both certificates are scale-invariant under F → c·F (the additive 1
     // is a NaN-safe floor; for non-trivial fits the natural scale dominates
     // it within one PIRLS iteration). The absolute test ‖g‖ < τ that this
-    // replaces was systematically too tight at biobank n because ‖g‖₂ grows
+    // replaces was systematically too tight at large-scale n because ‖g‖₂ grows
     // as O(√n) for standardized columns.
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
@@ -541,7 +541,7 @@ where
         // adaptive-convergence work (replacing the path #3 schedule
         // bandaid) — we need to see what fraction of inner cost is
         // curvature update vs LM solve vs deviance check, plus per-iter
-        // timing distribution at biobank scale.
+        // timing distribution at large scale.
         // ApproxKind: TemporarySolverDamping — LM ridge + step-halving
         // schedule are inactive at convergence; fixed point is exact Newton.
         let iter_start = std::time::Instant::now();
@@ -571,7 +571,7 @@ where
         // are already populated at this beta. Rebuilding the curvature here
         // would reproduce identical numbers at the cost of a full sweep
         // (XᵀWX assembly + PD ridge + gradient) — measured 23 s / iter on
-        // the biobank duchon60 lane (n=320 K, p_eff=42), where it doubled
+        // the large-scale duchon60 lane (n=320 K, p_eff=42), where it doubled
         // wall-clock per iter on top of the candidate eval that already paid
         // the same cost. Reuse `final_state` only when the cached curvature
         // kind, Firth mode, exact coefficient bits, and any arrow-Schur latent
@@ -620,7 +620,7 @@ where
         // preferred_curvature here would systematically under-count
         // Fisher fallbacks for the bench runner's `pirls_fisher_frac`
         // diagnostic (commit 971e67ad), masking observed-Hessian PD
-        // failures at biobank scale.
+        // failures at large scale.
         log::info!(
             "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s source={}",
             iter,
@@ -636,7 +636,7 @@ where
         // spends time when the LM has to halve repeatedly: solve-direction
         // work (assemble + factorize + back-solve), candidate evaluation
         // (model.update_candidate — for FLEX margslope this is the per-row
-        // sextic-kernel intercept root-find, the dominant cost at biobank
+        // sextic-kernel intercept root-find, the dominant cost at large-scale
         // shape per memory/scaling_law_margslope_inner_pirls.md), and the
         // predicted-reduction quadratic form. The breakdown emits at
         // iter-end alongside the existing [PIRLS iter-end] line, giving a
@@ -701,7 +701,7 @@ where
         // shrink/expand) reveals how the LM trajectory moved this iter.
         // Aggregating start→final ratios across a fit tells us whether
         // the textbook LM updates (commits 58ae42d1, d37626e6) are
-        // actually moving λ in useful directions at biobank scale.
+        // actually moving λ in useful directions at large scale.
         let lm_start_lambda = lambda;
         // Track the gain ratio of the accepted step. Aggregating ρ
         // accepted across iters tells us whether the LM model is
@@ -1944,7 +1944,7 @@ where
         // spent time. Sum of (curvature + solve + predred + candidate) is
         // a lower bound on iter_elapsed; the residual is everything else
         // (bookkeeping, soft-acceptance checks, KKT certification, etc).
-        // For FLEX margslope at biobank shape we expect candidate to
+        // For FLEX margslope at large-scale shape we expect candidate to
         // dominate (per-row sextic-kernel intercept root-find, see
         // memory/scaling_law_margslope_inner_pirls.md). For dense
         // standard-GAM with no per-row Newton inner, solve typically

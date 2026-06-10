@@ -3600,7 +3600,7 @@ impl CtnStage1Recipe {
 /// Number of cross-fit folds for a problem of `n` rows.
 ///
 /// Cross-fitting refits the CTN once per fold, so the cost is `K` full Stage-1
-/// fits. The standard DML default is `K = 5` for moderate `n`. At biobank scale
+/// fits. The standard DML default is `K = 5` for moderate `n`. At large scale
 /// each CTN refit is expensive while the out-of-fold bias from a single split is
 /// already negligible (θ̂₁ is precisely estimated on a complement of ≈ `n·(K−1)/K`
 /// rows), so `K` is reduced toward 2 as `n` grows — keeping the refit budget
@@ -3612,8 +3612,8 @@ impl CtnStage1Recipe {
 /// The schedule (no flag, no env — derived purely from `n`):
 ///   - `n < 250`               : `K = min(n, 3)` (tiny data; keep ≥ 2 folds)
 ///   - `250 ≤ n < 200_000`      : `K = 5` (DML moderate-n default)
-///   - `200_000 ≤ n < 2_000_000` : `K = 3` (biobank: bound refit cost, ≈ ⅔ train)
-///   - `n ≥ 2_000_000`          : `K = 2` (mega-biobank: ½ train still ample)
+///   - `200_000 ≤ n < 2_000_000` : `K = 3` (large-scale: bound refit cost, ≈ ⅔ train)
+///   - `n ≥ 2_000_000`          : `K = 2` (mega-large-scale: ½ train still ample)
 fn crossfit_fold_count(n: usize) -> usize {
     if n < 250 {
         n.min(3).max(2)
@@ -4191,8 +4191,8 @@ impl Default for FitConfig {
 ///
 /// If the caller hasn't supplied an explicit policy override, derive one from
 /// the shape of the problem via
-/// [`crate::resource::ResourcePolicy::for_problem`]. At biobank scale (n_rows
-/// >= 100k or the marginal-slope biobank path active) this returns
+/// [`crate::resource::ResourcePolicy::for_problem`]. At large scale (n_rows
+/// >= 100k or the marginal-slope large-scale path active) this returns
 /// > `analytic_operator_required` so that any silent dense materialization in
 /// > the term-construction layer fails fast rather than allocating tens of GiB;
 /// > at small scale it falls through to the permissive default-library policy
@@ -4214,7 +4214,7 @@ pub(crate) fn resolved_resource_policy(
 
 fn marginal_slope_hints(config: &FitConfig) -> crate::resource::ProblemHints {
     crate::resource::ProblemHints {
-        marginal_slope_biobank_active: config.logslope_formula.is_some()
+        marginal_slope_large_scale_active: config.logslope_formula.is_some()
             || config.z_column.is_some(),
     }
 }
@@ -6482,13 +6482,13 @@ fn materialize_bernoulli_marginal_slope<'a>(
     }
 
     let mut inference_notes = Vec::new();
-    // Bernoulli marginal-slope: structurally operator-only at biobank scale, so
+    // Bernoulli marginal-slope: structurally operator-only at large scale, so
     // flip the hint regardless of n to keep dense fallbacks blocked.
     let policy = resolved_resource_policy(
         config,
         data,
         crate::resource::ProblemHints {
-            marginal_slope_biobank_active: true,
+            marginal_slope_large_scale_active: true,
         },
     );
     // Alias `z` to the dose column only when a raw z_column is supplied; with a
@@ -6829,7 +6829,7 @@ fn materialize_survival<'a>(
             // Survival marginal-slope shares the operator-only invariant with
             // the Bernoulli path; flag it as such so strict mode is selected
             // even at small n.
-            marginal_slope_biobank_active: survival_mode == SurvivalLikelihoodMode::MarginalSlope,
+            marginal_slope_large_scale_active: survival_mode == SurvivalLikelihoodMode::MarginalSlope,
         },
     );
     // Alias `z` to the dose column for the marginal termspec only when a raw

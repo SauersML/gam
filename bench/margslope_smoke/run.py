@@ -1,18 +1,18 @@
-"""Biobank-shape margslope-Duchon perf probe.
+"""Large-scale margslope-Duchon perf probe.
 
-Mirrors the failing biobank shard `rust_margslope_aniso_duchon16d_rigid`
+Mirrors the failing large-scale shard `rust_margslope_aniso_duchon16d_rigid`
 exactly (16 PCs, 24 centers, order=0, power=9, length_scale=1, with
 --scale-dimensions for anisotropy). Runs at multiple sizes with a hard
 per-fit wall budget so we can locate the dominant cost without burning
 hours.
 
 Outputs:
-  - <outdir>/dch_<N>.csv          (synthetic biobank-shape data)
+  - <outdir>/dch_<N>.csv          (synthetic large-scale data)
   - <outdir>/dch_<N>.log          (full gam fit stdout/stderr)
   - <outdir>/summary.tsv          (n, total_s, ext_coord_traces, max_per_call)
 
 After the run, parse summary.tsv plus the logs to identify the bottleneck
-stages. The dominant cost on the biobank-failing shard is repeated
+stages. The dominant cost on the large-scale-failing shard is repeated
 `DenseSpectralOperator::trace_logdet_operator` calls, one per ψ-axis of
 the anisotropy block, each ~50s at n=200/p=95.
 
@@ -24,7 +24,7 @@ Typical use:
         --budget-sec 60
 
 The binary can be any prebuilt gam release (same family + flag set as
-biobank). When `--binary` is omitted, the script falls back to
+large-scale). When `--binary` is omitted, the script falls back to
 `target/release/gam` and refuses to build.
 """
 import argparse

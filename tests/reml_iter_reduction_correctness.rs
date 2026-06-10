@@ -34,7 +34,7 @@ use gam::{
 use ndarray::Array1;
 use std::f64::consts::{PI, TAU};
 
-/// Deterministic LCG + Box-Muller; matches `biobank_accuracy_sweep.rs`.
+/// Deterministic LCG + Box-Muller; matches `large_scale_accuracy_sweep.rs`.
 struct LcgNormal {
     state: u64,
 }

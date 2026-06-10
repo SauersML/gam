@@ -7,12 +7,12 @@
 //!    two distinct blocks contributing the same direction (to within 1%)
 //!    is a structural identifiability failure: the inner KKT system has
 //!    no unique minimiser in that direction, and the outer optimiser
-//!    will spin (the biobank failure mode).
+//!    will spin (the large-scale failure mode).
 //!
 //! 2. `joint_rank < joint_cols` AFTER attribution is a hard refusal.
 //!    The existing `fatal` flag only fires when the deficiency cannot be
 //!    attributed AT ALL (`aliased_pairs.is_empty() && dropped_columns.is_empty()`).
-//!    That gate misses the biobank case (179 pairs >=0.95, 13 cols dropped,
+//!    That gate misses the large-scale case (179 pairs >=0.95, 13 cols dropped,
 //!    rank 38/51) entirely. The new gate must halt whenever the residual
 //!    rank after attribution is still below the column count.
 //!
@@ -59,7 +59,7 @@ mod common {
 }
 
 /// Hard-halt case (a): a pair with overlap == 1.0 (exact alias) between
-/// two named blocks must be fatal. The biobank failing run reported 179
+/// two named blocks must be fatal. The large-scale failing run reported 179
 /// pairs in this regime; today's gate lets them through.
 #[test]
 fn audit_exact_alias_pair_must_halt() {
@@ -109,7 +109,7 @@ fn audit_exact_alias_pair_must_halt() {
 /// Hard-halt case (b): joint_rank < joint_cols after attribution is fatal
 /// even when RRQR populated `dropped_columns`. Today's predicate
 /// `fatal = joint_rank_deficient && aliased_pairs.is_empty() && dropped_columns.is_empty()`
-/// declares this case non-fatal (alias-attributed) — the biobank hang
+/// declares this case non-fatal (alias-attributed) — the large-scale hang
 /// pattern.
 #[test]
 fn audit_rank_deficient_with_attribution_must_halt() {
@@ -232,7 +232,7 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
     use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::Array1;
 
-    // n = 200 (representative of biobank scale, small enough for fast test)
+    // n = 200 (representative of large scale, small enough for fast test)
     let n = 200usize;
     let x: ndarray::Array1<f64> =
         ndarray::Array1::from_iter((0..n).map(|i| -1.0 + 2.0 * i as f64 / (n as f64 - 1.0)));
@@ -254,7 +254,7 @@ fn cross_block_alias_with_distinct_priorities_is_not_fatal() {
         }
     }
 
-    // logslope_surface: 10 columns — SAME basis as marginal (the biobank case:
+    // logslope_surface: 10 columns — SAME basis as marginal (the large-scale case:
     // marginal and logslope share the Duchon-PC basis evaluated at training
     // rows). The raw audit sees overlap=1.0 between marginal[:,k] and
     // logslope[:,k] for every k.

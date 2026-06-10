@@ -2,8 +2,8 @@
 //! well-conditioned problem.
 //!
 //! This is a guard against regressions in the inner-Newton / outer-κ
-//! interplay that turn small problems into slow problems. The biobank-scale
-//! reproducers (`tests/biobank_margslope_repro.rs`,
+//! interplay that turn small problems into slow problems. The large-scale
+//! reproducers (`tests/large_scale_margslope_repro.rs`,
 //! `tests/margslope_inner_pirls_scaling.rs`) are `#[ignore]`d because they
 //! sweep n up to 100k+ — this file runs a single n=2000 fit and asserts
 //! both convergence and a wall-clock budget that is generous for a healthy
@@ -188,7 +188,7 @@ fn margslope_flex_small_good_condition_completes_quickly() {
     assert!(file!().ends_with(".rs"));
     // Flex probit: cubic score_warp + link_dev deviation blocks exercise
     // the per-row sextic-kernel cell evaluator at every inner-PIRLS
-    // iteration. At n=2000 this is the biobank production code path on
+    // iteration. At n=2000 this is the large-scale production code path on
     // small data — must still finish well within 60s on a healthy solver.
     run_one(true, "MS-FLEX-SMOKE", 60.0);
 }

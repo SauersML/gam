@@ -33,7 +33,7 @@ fn cpu_xtwx(x: &Array2<f64>, weights: &Array1<f64>, penalty: &Array2<f64>) -> Ar
 
 fn bench_pirls_gpu(c: &mut Criterion) {
     let (x, weights, penalty, gradient) = design();
-    let mut group = c.benchmark_group("pirls_biobank_n100k_p2k");
+    let mut group = c.benchmark_group("pirls_large_scale_n100k_p2k");
     group.sample_size(10);
 
     group.bench_function("cpu_xtwx_reference", |b| {

@@ -1,4 +1,4 @@
-//! Biobank-shape repro for the V+M-exact cutover (team `smgs-vm-exact`).
+//! Large-scale repro for the V+M-exact cutover (team `smgs-vm-exact`).
 //!
 //! Original failure: at n = 195_780 a survival marginal-slope fit using
 //! the formulas
@@ -136,11 +136,11 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
     }
 
     encode_recordswith_inferred_schema(headers, rows)
-        .expect("encode synthetic biobank-shape survival marginal-slope dataset")
+        .expect("encode synthetic large-scale survival marginal-slope dataset")
 }
 
 #[test]
-fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
+fn survival_marginal_slope_large_scale_repro_vm_exact_engages_and_converges() {
     install_logger();
     init_parallelism();
     #[cfg(target_os = "macos")]
@@ -150,7 +150,7 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
 
     // The duplicated duchon term across mean and log-slope formulas, plus
     // a parametric `sex` term and a `linkwiggle()` deviation block,
-    // recreates the original biobank failure shape that overwhelmed the
+    // recreates the original large-scale failure shape that overwhelmed the
     // V-only canonicalize path. centers=CENTERS keeps p_total small.
     let duchon = format!("duchon(PC1, PC2, PC3, centers={}, order=1)", CENTERS);
     let formula = format!(
@@ -173,7 +173,7 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
     };
 
     let outcome = fit_from_formula(&formula, &data, &config)
-        .expect("biobank-shape survival marginal-slope fit should succeed under V+M");
+        .expect("large-scale survival marginal-slope fit should succeed under V+M");
 
     let result = match outcome {
         FitResult::SurvivalMarginalSlope(r) => r,
@@ -185,7 +185,7 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
 
     assert!(
         result.fit.outer_converged,
-        "biobank-shape V+M fit must converge; outer_converged=false (iters={}, reml={:.6})",
+        "large-scale V+M fit must converge; outer_converged=false (iters={}, reml={:.6})",
         result.fit.outer_iterations, result.fit.reml_score
     );
 
@@ -200,7 +200,7 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
     assert!(
         !compiled_map_lines.is_empty(),
         "expected log line containing {:?}; this proves the closed-form compiled-map \
-         cutover engaged on the biobank-shape formula. Captured {} log lines.",
+         cutover engaged on the large-scale formula. Captured {} log lines.",
         compiled_map_marker,
         logs.len(),
     );
@@ -219,7 +219,7 @@ fn survival_marginal_slope_biobank_repro_vm_exact_engages_and_converges() {
     assert!(
         saw_drop,
         "no compiled-map log line reported a non-zero drop on the duplicated-duchon \
-         biobank repro; captured {} compiled-map lines, e.g. {:?}",
+         large-scale repro; captured {} compiled-map lines, e.g. {:?}",
         compiled_map_lines.len(),
         compiled_map_lines.first()
     );

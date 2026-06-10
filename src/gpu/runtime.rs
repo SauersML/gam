@@ -80,13 +80,13 @@ impl GpuRuntime {
             // `cudarc 0.19`'s entry points lazily initialize the CUDA driver
             // through generated `culib()` helpers. On CPU-only Linux hosts the
             // first such call emits `panic_no_lib_found` before unwinding, which
-            // polluted biobank logs even when the panic was later caught and the
+            // polluted large-scale logs even when the panic was later caught and the
             // fit fell back to CPU. Keep the preflight completely outside
             // cudarc: use gam's own `libloading` probe first, and only touch
             // cudarc after the platform loader can open `libcuda`.
             //
             // The preflight does not always agree with cudarc's own loader
-            // candidate list (e.g. AoU workbench images expose CUDA *runtime*
+            // candidate list (e.g. large-scale workbench images expose CUDA *runtime*
             // stub libraries under `/usr/local/cuda-*/targets/.../lib` but no
             // driver `libcuda.so` in any loader path), so we additionally
             // install a panic-hook filter that suppresses cudarc's
@@ -104,7 +104,7 @@ impl GpuRuntime {
                 });
             }
 
-            // Driver-only environments (e.g. AoU workbench images that expose
+            // Driver-only environments (e.g. large-scale workbench images that expose
             // `libcuda.so.1` but ship no cuBLAS/cuSOLVER/cuSPARSE) used to slip
             // past the libcuda preflight, enable the runtime, and then panic
             // out of cudarc's `panic_no_lib_found` on the first `CudaBlas::new`

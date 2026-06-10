@@ -16,7 +16,7 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     pub(super) link_dev: Option<DeviationRuntime>,
     /// Resource policy controlling materialization decisions for psi design
     /// resolution and other size-sensitive helpers invoked during exact-Newton
-    /// joint psi calculus. Threaded from the fit entry point so biobank-scale
+    /// joint psi calculus. Threaded from the fit entry point so large-scale
     /// runs pick up the caller's analytic-operator preference instead of an
     /// inline default.
     pub(super) policy: crate::resource::ResourcePolicy,
@@ -510,7 +510,7 @@ pub(super) fn append_deviation_function_penalty(
 // Hessian: a linear combination of `β` across blocks produces zero net
 // η-contribution at training rows yet costs only the (penalised) basis
 // norm. Newton steps blow up along that direction and the inner solver
-// either drifts indefinitely along the null mode or, at biobank scale,
+// either drifts indefinitely along the null mode or, at large scale,
 // breaks the constrained QP active-set iteration once `W = p(1−p)` further
 // degrades the data Hessian.
 //
@@ -526,7 +526,7 @@ pub(super) fn append_deviation_function_penalty(
 // stored alongside the runtime so each evaluated row computes
 // `design_row = pure_span_row · V − n_row · M`. The joint design then has
 // full numerical column rank under the W inner product (the actual row
-// metric of the Hessian build at biobank scale), `σ_min(joint H + S) ≥
+// metric of the Hessian build at large scale), `σ_min(joint H + S) ≥
 // λ_min(S₊)` regardless of how β shifts the linear-predictor distribution,
 // and the soft "+∞" / divergence-detection / trust-region-collapse-as-KKT
 // scaffolding in the inner solver becomes vestigial rather than

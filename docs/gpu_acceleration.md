@@ -38,7 +38,7 @@ The dense PIRLS path checks `cuda_selected()` before CPU `X'WX` assembly and bef
 
 ## Transfer And Precision Policy
 
-Host-to-device copies use cudarc pinned allocations and a CUDA stream. The current operations are dependency ordered on one stream because `Ddgmm -> Dgemm -> Dgeam -> Dpotrf -> Dpotrs` is a true data dependency chain. Large biobank inputs amortize transfer cost over `O(N p^2)` GEMM and `O(p^3)` factorization work.
+Host-to-device copies use cudarc pinned allocations and a CUDA stream. The current operations are dependency ordered on one stream because `Ddgmm -> Dgemm -> Dgeam -> Dpotrf -> Dpotrs` is a true data dependency chain. Large large-scale inputs amortize transfer cost over `O(N p^2)` GEMM and `O(p^3)` factorization work.
 
 The production solve keeps Hessian assembly, factorization, master weights, and REML traces in `f64` to preserve CPU parity. The GPU dispatch policy currently defaults mixed precision to `Off`, and the solver boundary uses `f64` before any Cholesky or evidence derivative is evaluated.
 
@@ -52,7 +52,7 @@ reml_gpu_bench.rs
 arrow_schur_gpu_bench.rs
 ```
 
-Each benchmark builds deterministic biobank-shaped synthetic inputs and reports CPU reference timings next to the CUDA path.
+Each benchmark builds deterministic large-scale-shaped synthetic inputs and reports CPU reference timings next to the CUDA path.
 
 ## Numerical Stability
 

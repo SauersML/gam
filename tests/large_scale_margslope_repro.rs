@@ -1,6 +1,6 @@
-//! Ignored biobank-shape repro for the Bernoulli marginal-slope FLEX lane.
+//! Ignored large-scale repro for the Bernoulli marginal-slope FLEX lane.
 //!
-//! Reproduces the CI lane formulas from `bench/biobank_scale/runner.py`:
+//! Reproduces the CI lane formulas from `bench/large_scale/runner.py`:
 //! mean:     `phenotype ~ link(type=probit) + sex + smooth(age_entry_std) + duchon(pc1_std, ..., pc16_std, centers=24, order=1, power=8, length_scale=1) + linkwiggle(internal_knots=8)`
 //! logslope: `smooth(age_entry_std) + duchon(pc1_std, ..., pc16_std, centers=24, order=1, power=8, length_scale=1) + linkwiggle(internal_knots=8)`
 
@@ -58,7 +58,7 @@ fn init() {
     });
 }
 
-struct BiobankProblem {
+struct LargeScaleProblem {
     data: Array2<f64>,
     spec: BernoulliMarginalSlopeTermSpec,
 }
@@ -133,7 +133,7 @@ fn duchon_pc_smooth(name: &str) -> SmoothTermSpec {
     }
 }
 
-fn build_problem(n: usize) -> BiobankProblem {
+fn build_problem(n: usize) -> LargeScaleProblem {
     let mut rng = StdRng::seed_from_u64(SEED.wrapping_add(n as u64));
     let normal = Normal::new(0.0, 1.0).unwrap();
     let mut data = Array2::<f64>::zeros((n, 18));
@@ -175,7 +175,7 @@ fn build_problem(n: usize) -> BiobankProblem {
         ],
     };
 
-    BiobankProblem {
+    LargeScaleProblem {
         data,
         spec: BernoulliMarginalSlopeTermSpec {
             y,
@@ -195,7 +195,7 @@ fn build_problem(n: usize) -> BiobankProblem {
     }
 }
 
-fn fit_biobank_problem(
+fn fit_large_scale_problem(
     n: usize,
     options: BlockwiseFitOptions,
 ) -> gam::families::bms::BernoulliMarginalSlopeFitResult {
@@ -207,21 +207,21 @@ fn fit_biobank_problem(
         kappa_options: SpatialLengthScaleOptimizationOptions::default(),
         policy: ResourcePolicy::default_library(),
     });
-    match fit_model(request).expect("biobank-shape Bernoulli marginal-slope fit should succeed") {
+    match fit_model(request).expect("large-scale Bernoulli marginal-slope fit should succeed") {
         FitResult::BernoulliMarginalSlope(out) => out,
         _ => panic!("wrong fit result variant"),
     }
 }
 
 #[test]
-fn biobank_margslope_repro_completes_under_ci_budget() {
+fn large_scale_margslope_repro_completes_under_ci_budget() {
     init();
     let options = BlockwiseFitOptions::default();
     let start = Instant::now();
-    let fit = fit_biobank_problem(FULL_N, options);
+    let fit = fit_large_scale_problem(FULL_N, options);
     let elapsed = start.elapsed();
     eprintln!(
-        "[BIOBANK-MARGSLOPE-REPRO] n={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={}",
+        "[LARGE_SCALE-MARGSLOPE-REPRO] n={} elapsed_s={:.3} outer_iters={} inner_cycles={} converged={}",
         FULL_N,
         elapsed.as_secs_f64(),
         fit.fit.outer_iterations,
@@ -234,7 +234,7 @@ fn biobank_margslope_repro_completes_under_ci_budget() {
     );
     assert!(
         fit.fit.outer_converged,
-        "expected the biobank-shape fit to converge within budget"
+        "expected the large-scale fit to converge within budget"
     );
     assert!(
         fit.fit.inner_cycles >= 1,
@@ -244,7 +244,7 @@ fn biobank_margslope_repro_completes_under_ci_budget() {
 }
 
 #[test]
-fn biobank_margslope_hessian_build_regression_baseline() {
+fn large_scale_margslope_hessian_build_regression_baseline() {
     init();
     let options = BlockwiseFitOptions {
         outer_max_iter: 1,
@@ -255,10 +255,10 @@ fn biobank_margslope_hessian_build_regression_baseline() {
         ..BlockwiseFitOptions::default()
     };
     let start = Instant::now();
-    let fit = fit_biobank_problem(FULL_N, options);
+    let fit = fit_large_scale_problem(FULL_N, options);
     let elapsed = start.elapsed();
     eprintln!(
-        "[BIOBANK-MARGSLOPE-HESSIAN] n={} elapsed_s={:.3} inner_cycles={} beta_dim={}",
+        "[LARGE_SCALE-MARGSLOPE-HESSIAN] n={} elapsed_s={:.3} inner_cycles={} beta_dim={}",
         FULL_N,
         elapsed.as_secs_f64(),
         fit.fit.inner_cycles,
@@ -271,15 +271,15 @@ fn biobank_margslope_hessian_build_regression_baseline() {
 }
 
 #[test]
-fn biobank_margslope_known_good_beta_numerical_fixture() {
+fn large_scale_margslope_known_good_beta_numerical_fixture() {
     init();
     let options = BlockwiseFitOptions {
         outer_max_iter: 3,
         compute_covariance: false,
         ..BlockwiseFitOptions::default()
     };
-    let fit_a = fit_biobank_problem(SMALL_N, options.clone());
-    let fit_b = fit_biobank_problem(SMALL_N, options);
+    let fit_a = fit_large_scale_problem(SMALL_N, options.clone());
+    let fit_b = fit_large_scale_problem(SMALL_N, options);
     let beta_a = fit_a.fit.beta;
     let beta_b = fit_b.fit.beta;
     assert_eq!(beta_a.len(), beta_b.len());
@@ -294,7 +294,7 @@ fn biobank_margslope_known_good_beta_numerical_fixture() {
         .map(|(i, b)| (i as f64 + 1.0) * b)
         .sum();
     eprintln!(
-        "[BIOBANK-MARGSLOPE-BETA] n={} beta_dim={} checksum={:.17e} repeated_fit_max_abs={:.3e}",
+        "[LARGE_SCALE-MARGSLOPE-BETA] n={} beta_dim={} checksum={:.17e} repeated_fit_max_abs={:.3e}",
         SMALL_N,
         beta_a.len(),
         checksum,

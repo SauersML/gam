@@ -45,7 +45,7 @@ fn arrow_system() -> ArrowSchurSystem {
 fn bench_arrow_gpu(c: &mut Criterion) {
     let sys = arrow_system();
     let direct = ArrowSolveOptions::direct();
-    let mut group = c.benchmark_group("arrow_schur_biobank_n100k_p2k_atoms10k");
+    let mut group = c.benchmark_group("arrow_schur_large_scale_n100k_p2k_atoms10k");
     group.sample_size(10);
 
     group.bench_function("cpu_direct_arrow_schur", |b| {

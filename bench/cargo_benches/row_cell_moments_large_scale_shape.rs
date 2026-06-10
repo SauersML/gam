@@ -2,7 +2,7 @@
 //! moment access pattern.
 //!
 //! This is intentionally not run by default test commands. Run explicitly with:
-//! `cargo bench --bench row_cell_moments_biobank_shape`.
+//! `cargo bench --bench row_cell_moments_large_scale_shape`.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
@@ -54,11 +54,11 @@ fn synthetic_row_cells(row: usize) -> [DenestedCubicCell; 5] {
     ]
 }
 
-fn bench_row_cell_moments_biobank_shape(c: &mut Criterion) {
+fn bench_row_cell_moments_large_scale_shape(c: &mut Criterion) {
     const ROWS: usize = 512;
     const HV_CALLS: usize = 64;
     let rows: Vec<_> = (0..ROWS).map(synthetic_row_cells).collect();
-    let mut group = c.benchmark_group("row_cell_moments_biobank_shape");
+    let mut group = c.benchmark_group("row_cell_moments_large_scale_shape");
     group.sample_size(10);
 
     group.bench_function("before_scattered_degree9_per_hv", |b| {
@@ -101,5 +101,5 @@ fn bench_row_cell_moments_biobank_shape(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_row_cell_moments_biobank_shape);
+criterion_group!(benches, bench_row_cell_moments_large_scale_shape);
 criterion_main!(benches);

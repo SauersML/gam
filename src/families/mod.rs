@@ -44,7 +44,7 @@ pub mod vector_response;
 pub mod wiggle;
 
 pub use identifiability_compiler::{
-    AnchorRowEvaluator, BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian,
+    BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian,
     RowJacobianOperator, compile,
 };
 pub use vector_response::{

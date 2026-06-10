@@ -18,7 +18,7 @@
 //! * scalar-by-scalar gather of trace estimates from the host orchestrator
 //!   between Hutchinson probes and the gradient assembler.
 //!
-//! At biobank scale (n ≈ 200k–500k, p ≈ 32–128, `num_rho` ≈ 8–32) those hops
+//! At large scale (n ≈ 200k–500k, p ≈ 32–128, `num_rho` ≈ 8–32) those hops
 //! dominate the wall-clock cost of the outer BFGS-over-ρ loop. This module
 //! collapses them into a single device-resident driver that:
 //!

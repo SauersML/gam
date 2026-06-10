@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
 use std::hint::black_box;
 
-fn biobank_shape_cells(n: usize) -> Vec<(f64, [DenestedCubicCell; 3])> {
+fn large_scale_shape_cells(n: usize) -> Vec<(f64, [DenestedCubicCell; 3])> {
     (0..n)
         .map(|i| {
             let phase = (i as f64 * 0.00137).sin();
@@ -63,8 +63,8 @@ fn run_hv_shape(rows: &[(f64, [DenestedCubicCell; 3])], tau: f64) -> f64 {
 }
 
 fn bench_bms_hv_row_skip(c: &mut Criterion) {
-    let rows = biobank_shape_cells(32_000);
-    let mut group = c.benchmark_group("bms_hv_row_skip_biobank_shape");
+    let rows = large_scale_shape_cells(32_000);
+    let mut group = c.benchmark_group("bms_hv_row_skip_large_scale_shape");
     for tau in [0.0, 1e-12, 1e-10, 1e-8, 1e-6, 1e-4] {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("tau={tau:.0e}")),

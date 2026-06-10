@@ -1767,7 +1767,7 @@ mod tests {
     // ────────────────────────────────────────────────────────────────────
 
     /// Hill-climb gate: pure Bernoulli (b = 1) at n = 200 000 must run on the
-    /// GPU at ≥ 50× the CPU oracle's draw rate. This is the dominant biobank
+    /// GPU at ≥ 50× the CPU oracle's draw rate. This is the dominant large-scale
     /// PG draw shape (one PG variate per data row per Gibbs iteration), so a
     /// 50× win here is the actual ship gate for the device sampler.
     #[test]

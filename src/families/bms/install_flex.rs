@@ -266,7 +266,7 @@ pub struct CrossBlockIdentifiabilityWarning {
 /// matmul on the sqrt-W-scaled `A`. `K_w` is one `Q_wᵀ · (W^½ C)` matmul
 /// of size `r × p_c`. `C̃ᵀ W C̃` is `p_c × p_c`. Two `eigh`s, both small
 /// (`d ≲ a few dozen`, `p_c ≲ 50`); negligible against the per-cycle
-/// dense Hessian build at biobank scale. `DesignMatrix` parametric
+/// dense Hessian build at large scale. `DesignMatrix` parametric
 /// anchors are densified once into a contiguous `n × d` block (a few
 /// dozen columns).
 ///

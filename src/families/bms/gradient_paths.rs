@@ -328,7 +328,7 @@ pub(super) fn pooled_probit_baseline(
 // One probit Gauss-Newton step from the rigid pilot, projected onto the
 // full marginal design at the W-IRLS working response, picks up that PC /
 // age structure cheaply (one `p_marg × p_marg` Cholesky plus a few matvecs
-// — `<<1 s` at biobank scale because `p_marg` is `O(10²)` whereas the
+// — `<<1 s` at large scale because `p_marg` is `O(10²)` whereas the
 // PIRLS dense Hessian build is `O(n·p²)` per cycle). The resulting
 // `η_pilot[i]` has the same row-by-row variation pattern PIRLS will see at
 // any non-degenerate β, so the orthogonalisation transform `T` drops only
@@ -971,7 +971,7 @@ pub fn marginal_slope_covariance_from_scores(
     //     (independent population columns) the asymptotic SE of an
     //     off-diagonal sample covariance is √(σ_aa σ_bb / N_eff) with
     //     N_eff = (Σw)² / Σw² (Kish).  Pass ⇒ Diagonal (sample noise was
-    //     not real correlation), fail ⇒ Full.  At biobank N_eff the 4σ
+    //     not real correlation), fail ⇒ Full.  At large-scale N_eff the 4σ
     //     statistical floor collapses below the numerical floor, so
     //     production behaviour is unchanged.
     if k == 1 {

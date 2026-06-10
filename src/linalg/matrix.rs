@@ -120,7 +120,7 @@ fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usi
         })
 }
 
-pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
+pub fn panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
     context: &str,
     n: usize,
     p: usize,
@@ -130,7 +130,7 @@ pub fn panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
     // size.  Callers in this mode have committed to operator-only math; any
     // dense fallback (cache or otherwise) violates that contract and would
     // silently turn an analytic-operator path into a hidden dense path at
-    // biobank scale.
+    // large scale.
     if matches!(
         policy.derivative_storage_mode,
         crate::resource::DerivativeStorageMode::AnalyticOperatorRequired
@@ -1131,7 +1131,7 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
     /// Shared dense materialization via the required row-chunk API.
     ///
     /// This deliberately does not fall back through `to_dense()`: operator-backed
-    /// designs can be biobank-scale, and their chunked row path is the bounded
+    /// designs can be large-scale, and their chunked row path is the bounded
     /// memory materialization contract. Implementations that already own an
     /// `Arc<Array2<_>>` should override this to return it directly.
     fn to_dense_arc(&self) -> Arc<Array2<f64>> {
@@ -1302,7 +1302,7 @@ impl DenseDesignMatrix {
         match self {
             Self::Materialized(matrix) => Ok(Arc::clone(matrix)),
             Self::Lazy(op) => {
-                panic_or_error_if_biobank_mode_and_to_dense_called_with_policy(
+                panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
                     context,
                     op.nrows(),
                     op.ncols(),
@@ -1579,7 +1579,7 @@ impl DenseDesignOperator for DenseDesignMatrix {
                 {
                     // Parallel per-row clamped quadratic-form diagonal with
                     // stride-1 reads from both row-major operands. Avoids the
-                    // per-row `Array1::dot` call's overhead at biobank shapes
+                    // per-row `Array1::dot` call's overhead at large-scale shapes
                     // (n ≈ 2e5, p ≈ 33).
                     use rayon::iter::{IndexedParallelIterator, ParallelIterator};
                     use rayon::slice::ParallelSliceMut;
@@ -3002,7 +3002,7 @@ impl DenseDesignOperator for MultiChannelOperator {
 /// Rowwise-Kronecker design operator: represents the (n, p_cov × p_time) matrix
 /// whose row i is the Kronecker product cov[i,:] ⊗ time[i,:].
 ///
-/// This avoids materializing the full tensor product design, which at biobank
+/// This avoids materializing the full tensor product design, which at large-scale
 /// scale can be tens of GB.
 ///
 ///   X[i, j*p_time + t] = cov[i, j] * time[i, t]
@@ -3575,7 +3575,7 @@ impl<K: SpatialKernelEvaluator> ChunkedKernelDesignOperator<K> {
     /// [K_eff | poly] block. The lazy operator was originally selected because
     /// the *initial* fit-time allocation budget was tight, but once PIRLS is
     /// running we will pay the kernel-evaluation cost on every iteration unless
-    /// we cache the result. 1 GB is generous enough to cover biobank-scale
+    /// we cache the result. 1 GB is generous enough to cover large-scale
     /// dense Duchon / TPS (n = 320k, p = 117 → ~300 MiB) while still rejecting
     /// pathological dense kernels.
     const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
@@ -3856,14 +3856,14 @@ pub struct CoefficientTransformOperator {
     /// this cache, `BlockDesignOperator::cross_block` (used by per-iter
     /// curvature builds) calls `row_chunk_into` repeatedly, each time
     /// re-running `fast_ab(inner_chunk, transform)` — measured ~3.7 s / iter
-    /// at biobank duchon60 shape (n=320 K, p_out=42 effective) for a single
+    /// at large-scale duchon60 shape (n=320 K, p_out=42 effective) for a single
     /// `update_with_curvature`, all of it allocations + chunked GEMM.
     materialized: OnceLock<Option<Arc<Array2<f64>>>>,
 }
 
 impl CoefficientTransformOperator {
     /// Maximum bytes for the one-shot X · T materialization. 1 GiB is generous
-    /// enough to cover biobank-scale (n = 320 K, p_out = 42 → ~107 MiB) and
+    /// enough to cover large-scale (n = 320 K, p_out = 42 → ~107 MiB) and
     /// rejects pathological designs. Matches ChunkedKernelDesignOperator.
     const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -3913,7 +3913,7 @@ impl CoefficientTransformOperator {
             .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()));
         let computed = match bytes {
             Some(b) if b <= Self::MATERIALIZE_MAX_BYTES => {
-                // Auto-strict at biobank shape: even though the cache's
+                // Auto-strict at large-scale shape: even though the cache's
                 // own MATERIALIZE_MAX_BYTES budget would admit this
                 // block, refuse densification when the operator's
                 // outer shape says we're in strict territory. Falls
@@ -3990,7 +3990,7 @@ impl DenseDesignOperator for CoefficientTransformOperator {
     /// route to `weighted_crossprod_dense` (BLAS-3 GEMM) instead of the
     /// scalar `weighted_cross_chunked` triple loop. Without this override the
     /// default trait impl returns `None`, the fast path is skipped, and a
-    /// 4-block biobank fit (pgs + sex + smooth_age + duchon) pays a 24 s
+    /// 4-block large-scale fit (pgs + sex + smooth_age + duchon) pays a 24 s
     /// cross-block cost per PIRLS curvature build.
     fn as_dense_ref(&self) -> Option<&Array2<f64>> {
         self.materialized_combined()
@@ -4047,7 +4047,7 @@ pub struct ResidualisedDesignOperator {
 
 impl ResidualisedDesignOperator {
     /// Matches `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`: 1 GiB
-    /// covers biobank-scale shapes (n=320 K, p_out≈40 → ~100 MiB) and rejects
+    /// covers large-scale shapes (n=320 K, p_out≈40 → ~100 MiB) and rejects
     /// pathological designs.
     const MATERIALIZE_MAX_BYTES: usize = 1024 * 1024 * 1024;
 
@@ -4589,7 +4589,7 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
             .saturating_mul(std::mem::size_of::<f64>());
         // SAFETY: `RowwiseKroneckerOperator` is explicitly an operator-only
         // representation: the wrapping `LazyOperator::to_dense` contract
-        // forbids dense materialization for biobank-scale n*p_cov*p_time
+        // forbids dense materialization for large-scale n*p_cov*p_time
         // tensors. Any caller that reaches this point bypassed the
         // operator-aware dispatch and would otherwise silently allocate a
         // matrix sized to crash the process.
@@ -4799,7 +4799,7 @@ impl DenseDesignOperator for ConditionedDesign {
 
 /// Unified design matrix representation for dense and sparse workflows.
 ///
-/// Dense matrices are wrapped in Arc for O(1) cloning — at biobank scale
+/// Dense matrices are wrapped in Arc for O(1) cloning — at large scale
 /// design matrices are 100-500MB and get cloned repeatedly during GAMLSS
 /// family construction, warm-start caching, and prediction.
 ///
@@ -7015,14 +7015,14 @@ impl DesignMatrix {
     /// reaching this method has already committed to a dense
     /// `Array2<f64>` consumer and owns the memory budget; consulting a
     /// conservative byte cap here would refuse legitimate workloads
-    /// (e.g. the 4194304×10 Duchon basis at biobank scale that
+    /// (e.g. the 4194304×10 Duchon basis at large scale that
     /// historically panicked with "refusing to densify operator-backed
     /// design").
     ///
     /// Strict-operator math (`DerivativeStorageMode::AnalyticOperatorRequired`)
     /// must instead call
     /// `try_to_dense_arc_with_policy(ctx, &ResourcePolicy::analytic_operator_required())`,
-    /// which keeps refusal semantics intact for biobank invariants.
+    /// which keeps refusal semantics intact for large-scale invariants.
     ///
     /// Sparse designs still honor their own internal
     /// `MAX_SPARSE_TO_DENSE_BYTES` cap (which is a separate hard limit
@@ -8114,7 +8114,7 @@ mod tests {
         assert_eq!(dense.dim(), (128, 4));
 
         // Strict operator-required policy still refuses on the explicit
-        // policy-aware API — biobank-scale invariants preserved.
+        // policy-aware API — large-scale invariants preserved.
         let strict = ResourcePolicy::analytic_operator_required();
         let err = design
             .try_to_dense_arc_with_policy("regression strict refuses", &strict)

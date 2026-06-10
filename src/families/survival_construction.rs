@@ -2164,7 +2164,7 @@ where
     // non-associative IEEE-754 sum order across thread chunks made the
     // engine drift in the low-order bits from row to row. The serial
     // accumulator below mirrors the inline reference exactly (and remains
-    // ~memory-bandwidth-bound at biobank `n`), so the engine is now a
+    // ~memory-bandwidth-bound at large-scale `n`), so the engine is now a
     // bit-for-bit replacement for the legacy path, not just a
     // floating-point-noise-equivalent one.
     let mut grad = Array1::<f64>::zeros(theta_dim);

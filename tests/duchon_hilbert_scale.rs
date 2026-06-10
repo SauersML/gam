@@ -318,7 +318,7 @@ fn null_recovery() {
 /// polynomial block) and its dimension does NOT grow with `n`. Build the basis
 /// at n=2_000 and n=40_000 with the same `k`; assert every emitted penalty's
 /// `nrows()` is bounded by ~`k + poly`, never by `n`. This is what makes the
-/// collocated tension/mass penalties affordable at biobank scale.
+/// collocated tension/mass penalties affordable at large scale.
 #[test]
 fn penalty_cost_is_n_independent() {
     let k = 30usize;

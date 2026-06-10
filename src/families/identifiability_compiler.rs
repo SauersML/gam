@@ -28,7 +28,7 @@ use faer::Side;
 /// eigenvalue (and matrix size accounts for the worst-case roundoff
 /// accumulation in the `O(size)` inner products forming each Gram entry). 64×
 /// keeps numerically-zero directions out of the kept subspace while preserving
-/// every genuinely identified direction at biobank-scale conditioning.
+/// every genuinely identified direction at large-scale conditioning.
 const RANK_REVEAL_EPS_SLACK: f64 = 64.0;
 
 /// Maps a coefficient perturbation `δβ ∈ R^p` for one parameter block into
@@ -170,17 +170,9 @@ impl RowHessian for IdentityRowHessian {
     }
 }
 
-/// Predict-time anchor row evaluator. For parametric blocks this is the
-/// block's design at `predict_arg`. For compiled flex blocks it is the
-/// residualised row operator `C(x)·V − A(x)·M`.
-pub trait AnchorRowEvaluator: Send + Sync {
-    fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String>;
-    fn ncols(&self) -> usize;
-}
-
-/// One compiled block: reparam matrix `V` (`t_lw`), the optional anchor
-/// correction matrix `M`, and the predict-time anchor evaluator that
-/// downstream blocks consume as a first-class anchor.
+/// One compiled block: reparam matrix `V` (`t_lw`) and the optional anchor
+/// correction matrix `M` that downstream blocks consume as a first-class
+/// anchor.
 pub struct CompiledBlock {
     /// Orthogonal-complement reparam matrix `V ∈ R^{p × p'}` (right-selector).
     pub t_lw: Array2<f64>,
@@ -196,9 +188,6 @@ pub struct CompiledBlock {
     /// evaluator uses to subtract the anchor portion. `None` for the first
     /// block in the ordering (no anchor). Equal to `anchor_correction`.
     pub r_lw: Option<Array2<f64>>,
-    /// Predict-time anchor row evaluator. `None` for purely-parametric
-    /// blocks that downstream stages do not consume as an anchor.
-    pub anchor_evaluator: Option<Arc<dyn AnchorRowEvaluator>>,
 }
 
 /// Output of [`compile`]: one [`CompiledBlock`] per input block plus the
@@ -395,7 +384,7 @@ pub fn compile_with_dual_metric(
     // correct unchanged; a streaming operator (e.g. `BlockJacobianAsRowOp`)
     // overrides it to scale straight out of its stored layout, dropping the
     // `O(n·p·K)` tensor clone that `evaluate_full()` performs per block at
-    // biobank `n`. (#738: a capability is not a representation — the compiler
+    // large-scale `n`. (#738: a capability is not a representation — the compiler
     // asks for the scaled design it needs, never the dense tensor.)
     let scaled_h: Vec<Array2<f64>> = operators
         .iter()
@@ -464,7 +453,6 @@ pub fn compile_with_dual_metric(
                 t_lw: Array2::<f64>::zeros((p_b, 0)),
                 anchor_correction: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
                 r_lw: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
-                anchor_evaluator: None,
             });
             // The structural pass fully absorbed all `p_b` raw columns into the
             // higher-priority anchor: record each as a drop so the per-block
@@ -507,7 +495,6 @@ pub fn compile_with_dual_metric(
                 t_lw: Array2::<f64>::zeros((p_b, 0)),
                 anchor_correction: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
                 r_lw: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
-                anchor_evaluator: None,
             });
             // The structural pass kept `p_d` directions, but the curvature pass
             // absorbed all of them into the higher-priority anchor. Record each
@@ -591,7 +578,6 @@ pub fn compile_with_dual_metric(
             t_lw: v,
             anchor_correction: m_compiled.clone(),
             r_lw: m_compiled,
-            anchor_evaluator: None,
         });
 
         // Append this block's raw curvature-scaled columns to the raw anchor
@@ -2005,7 +1991,7 @@ mod tests {
     /// asserting `anchor_correction.ncols() == k_kept` then failed with
     /// `cross-block identifiability: anchor_correction shape D×P does
     /// not match expected d_total=D × k_kept=K` — surfaced via the
-    /// biobank V+M repro test.
+    /// large-scale V+M repro test.
     #[test]
     fn audit_truncation_keeps_t_lw_and_anchor_correction_in_lockstep() {
         let n = 40;

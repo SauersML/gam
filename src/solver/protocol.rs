@@ -62,7 +62,7 @@ pub struct MarginalSlopeCalibrationProtocol {
 impl MarginalSlopeCalibrationProtocol {
     fn default_latent_score() -> LatentScoreSemantics {
         // WarnOnly mirrors `LatentZPolicy::frozen_transformation_normal`'s
-        // own default: at biobank dimensionality the upstream conditional
+        // own default: at large-scale dimensionality the upstream conditional
         // transformation-normal preprocessor can leave the global latent z
         // mildly heavy-tailed without violating per-strata calibration.
         LatentScoreSemantics::FrozenConditionalNormal {

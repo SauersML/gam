@@ -1,16 +1,16 @@
 //! End-to-end stress test for the closed-form Duchon pipeline at
-//! biobank-relevant scale.
+//! large-scale-relevant scale.
 //!
 //! Runs in the default suite. The fit can take many minutes and use a
 //! lot of memory — run under `--release` if iteration time matters:
 //!
 //! ```text
-//! cargo test --release biobank_reml_stress
+//! cargo test --release large_scale_reml_stress
 //! ```
 //!
 //! It exercises the full Duchon-on-PC GAM pipeline end-to-end:
 //!
-//!   * Pure-Rust deterministic biobank-style simulator producing
+//!   * Pure-Rust deterministic large-scale-style simulator producing
 //!     `n` rows of `pc_dim` PC features sampled from N(0, I) and a
 //!     continuous response `y = f_true(X) + ε`.
 //!   * Hybrid anisotropic Duchon smooth (`length_scale = Some(...)`,
@@ -72,13 +72,13 @@ fn gaussian_identity_likelihood() -> LikelihoodSpec {
     )
 }
 
-// ─── Synthetic biobank simulator ────────────────────────────────────────
+// ─── Synthetic large-scale simulator ────────────────────────────────────────
 
 /// Smooth ground-truth function on PC coordinates. Used both for
 /// generating `y` and for evaluating reconstruction error.
 ///
 /// The functional form mirrors the pipeline contract in
-/// `production_pipeline_spec.md` and `biobank_sim.py`: a sum of a
+/// `production_pipeline_spec.md` and `large_scale_sim.py`: a sum of a
 /// linear PC trend, a radial bump centered near the origin, and a
 /// sinusoid on PC0. It is smooth, bounded, and not separable into
 /// per-axis pieces — all properties an anisotropic Duchon smooth
@@ -249,7 +249,7 @@ fn gaussian_identity_bias_corrected_mean_interval(
 // ─── Main stress test ───────────────────────────────────────────────────
 
 #[test]
-fn biobank_reml_stress_main() {
+fn large_scale_reml_stress_main() {
     let (x_train, y_train, _y_true_train) = simulate(N_TRAIN, PC_DIM, SEED_BASE);
     let (x_holdout, _y_holdout, y_true_holdout) =
         simulate(N_HOLDOUT, PC_DIM, SEED_BASE.wrapping_add(0xDEAD));
@@ -268,7 +268,7 @@ fn biobank_reml_stress_main() {
         gaussian_identity_likelihood(),
         &fit_options(40),
     )
-    .expect("biobank-scale Duchon-on-PC fit should succeed");
+    .expect("large-scale Duchon-on-PC fit should succeed");
     let elapsed = start.elapsed();
 
     // (1) REML outer loop converged.
@@ -333,14 +333,14 @@ fn biobank_reml_stress_main() {
     // (4) Wallclock budget.
     assert!(
         elapsed.as_secs_f64() < WALLCLOCK_BUDGET_MAIN_SECS,
-        "main biobank stress fit exceeded wallclock budget: \
+        "main large-scale stress fit exceeded wallclock budget: \
          {:.1}s >= {:.1}s",
         elapsed.as_secs_f64(),
         WALLCLOCK_BUDGET_MAIN_SECS,
     );
 
     eprintln!(
-        "[biobank_reml_stress_main] n={N_TRAIN}, K={K_CENTERS}, pc_dim={PC_DIM} \
+        "[large_scale_reml_stress_main] n={N_TRAIN}, K={K_CENTERS}, pc_dim={PC_DIM} \
          | wall_clock={:.2}s, outer_iter={}, rel_l2_holdout={:.4}",
         elapsed.as_secs_f64(),
         fitted.fit.outer_iterations,
@@ -358,7 +358,7 @@ fn biobank_reml_stress_main() {
 /// well-known REML-conservativeness/anti-conservativeness drift at
 /// this dimensionality).
 #[test]
-fn biobank_reml_stress_coverage() {
+fn large_scale_reml_stress_coverage() {
     let mut total_in = 0usize;
     let mut total_pts = 0usize;
 
@@ -432,7 +432,7 @@ fn biobank_reml_stress_coverage() {
          {total_in}/{total_pts})",
     );
     eprintln!(
-        "[biobank_reml_stress_coverage] sims={N_COVERAGE_SIMS}, points={total_pts}, \
+        "[large_scale_reml_stress_coverage] sims={N_COVERAGE_SIMS}, points={total_pts}, \
          coverage={coverage:.4}",
     );
 }

@@ -67,13 +67,6 @@ impl PhiScaledCovariance {
         &self.0
     }
 
-    /// Mutable borrow of the underlying `φ · H⁻¹` matrix; useful for
-    /// in-place numeric polish (e.g. enforcing exact symmetry).
-    #[inline]
-    pub fn as_array_mut(&mut self) -> &mut Array2<f64> {
-        &mut self.0
-    }
-
     /// Consume the wrapper and return the raw `φ · H⁻¹` matrix.
     #[inline]
     pub fn into_array(self) -> Array2<f64> {
@@ -131,13 +124,6 @@ impl UnscaledPrecision {
     #[inline]
     pub fn as_array(&self) -> &Array2<f64> {
         &self.0
-    }
-
-    /// Mutable borrow of `H`, for in-place adjustments such as
-    /// symmetrization or ridge-stabilisation polishing.
-    #[inline]
-    pub fn as_array_mut(&mut self) -> &mut Array2<f64> {
-        &mut self.0
     }
 
     /// Consume the wrapper and return the raw `H` matrix.

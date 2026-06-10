@@ -1238,7 +1238,7 @@ impl BernoulliMarginalSlopeFamily {
     /// implementation. When it is `Some`, only the sampled rows contribute,
     /// with their Horvitz-Thompson inverse-inclusion weights taken from
     /// `OuterScoreSubsample::rows`. This is the row-iter swap that lets outer-only
-    /// score/gradient passes scale to biobank `n` without distorting the
+    /// score/gradient passes scale to large-scale `n` without distorting the
     /// full-data inner-PIRLS or covariance code paths.
     pub(crate) fn log_likelihood_only_with_options(
         &self,
@@ -1991,7 +1991,7 @@ impl BernoulliMarginalSlopeFamily {
     /// Returns `(f, f', 0.0)`: the third slot — `F''(a)` — is reported as
     /// zero, which makes [`monotone_root::solve_monotone_root`]'s safeguarded
     /// Halley step reduce to a Newton step. A measured degree-9 `F''(a)` path
-    /// did not reduce calibration evaluations on the biobank FLEX repro, and
+    /// did not reduce calibration evaluations on the large-scale FLEX repro, and
     /// it made each value-bearing cell evaluation slower; degree 4 is the
     /// correct cost/accuracy point for this solver.
     pub(super) fn evaluate_denested_calibration_newton(
@@ -2689,7 +2689,7 @@ impl BernoulliMarginalSlopeFamily {
         // equation becomes numerically flat and tight absolute precision is
         // not achievable. We accept any bracketed solution at this level, so
         // pass the same tolerance to the root solver — driving it tighter
-        // than `abs_tol` is wasted cell-moment work, since at biobank scale
+        // than `abs_tol` is wasted cell-moment work, since at large scale
         // (n=320k, FLEX active with linkwiggle + score-warp) the solver is
         // called once per row per Hessian build and the per-row cell-moment
         // kernel dominates wall time. With this tolerance the closed-form /
@@ -2697,7 +2697,7 @@ impl BernoulliMarginalSlopeFamily {
         // common case, instead of forcing 30+ refinement iters down to 1e-10.
 
         // Local Newton probe before paying for the safeguarded bracket.
-        // Cycle-0 is cold at biobank scale, so forcing every row through the
+        // Cycle-0 is cold at large scale, so forcing every row through the
         // bracket spends most of the wall time rebuilding identical cell
         // value integrals. The rigid/affine seed is exact when deviations vanish
         // and first-order accurate when they are small; probe that local
@@ -3276,7 +3276,7 @@ impl BernoulliMarginalSlopeFamily {
         // substrate's pub(crate) entry point and surfaces any divergence
         // from the existing LRU evaluator the moment it appears. We sample
         // a small prefix of rows so the debug-build cost stays bounded for
-        // biobank-scale fits; the production build pays nothing because the
+        // large-scale fits; the production build pays nothing because the
         // block is `cfg(debug_assertions)`-gated.
         #[cfg(debug_assertions)]
         {
@@ -3636,7 +3636,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut cell_sbw = vec![0.0_f64; total_cells_us * p_w * coeff4];
         // When `build_device_moments` is set, the host `cell_moments` vec
         // is unused (the launcher consumes the device buffer); we leave
-        // it empty so it doesn't waste RAM in biobank-scale jobs.
+        // it empty so it doesn't waste RAM in large-scale jobs.
         let mut cell_moments: Vec<f64> = if build_device_moments {
             Vec::new()
         } else {
@@ -12051,7 +12051,7 @@ impl BernoulliMarginalSlopeFamily {
         // already inside a rayon worker (so an outer par_iter is holding pool
         // slots and a nested `into_par_iter` here would risk pool starvation
         // on the LRU mutex inside `evaluate_cell_derivative_moments_lru`,
-        // etc.). At biobank n_rows the per-row body's design materialization
+        // etc.). At large-scale n_rows the per-row body's design materialization
         // and pullback work dominates dispatch, so the par_iter is preserved.
         const ROW_PAR_MIN_ROWS: usize = 4_096;
         let run_rows_serial = rayon::current_thread_index().is_some()
@@ -13300,7 +13300,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 // BMS uses a Polya–Gamma augmentation with a per-row
                 // pseudo-Bernoulli factorisation that is materially cheaper
                 // than the survival marginal-slope risk-set scan. Empirical
-                // cost is ~50_000 units per K-unit at biobank scale, which
+                // cost is ~50_000 units per K-unit at large scale, which
                 // with `AUTO_OUTER_WORK_BUDGET = 5×10⁸` caps
                 //   K_work ≈ 5e8 / 50_000 = 10_000,
                 // matching the existing default `min_k = 10_000` and so
@@ -13582,24 +13582,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         true
     }
 
-    fn joint_line_search_log_likelihood_workspace(
-        &self,
-        block_states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        let Some(workspace) =
-            self.exact_newton_joint_hessian_workspace_with_options(block_states, specs, options)?
-        else {
-            return Ok(None);
-        };
-        let log_likelihood = match workspace.joint_log_likelihood_evaluation()? {
-            Some(value) => value,
-            None => Self::log_likelihood_only_with_options(self, block_states, options)?,
-        };
-        Ok(Some((log_likelihood, workspace)))
-    }
-
     fn has_explicit_joint_hessian(&self) -> bool {
         true
     }
@@ -13751,7 +13733,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         parameter_block_specs_match_rows(specs, self.y.len())
     }
 
-    /// Force the matrix-free inner-Newton/PCG path for BMS flex at biobank
+    /// Force the matrix-free inner-Newton/PCG path for BMS flex at large-scale
     /// scale, on top of the generic `use_joint_matrix_free_path` heuristic.
     ///
     /// At n≈195k with `linkwiggle()` / `logslope_formula linkwiggle()`, dense
@@ -14102,7 +14084,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     /// not be materialized (`n*r*r*8 > row_primary_cache_budget`). In that
     /// regime the dense joint-H build streams all `n` rows and pays the full
     /// flex row-kernel cost per chunk plus a BLAS-3 design-matrix gram on top;
-    /// at biobank shape (n≈195k, p≈44) that pushes one dense build past 60s
+    /// at large-scale shape (n≈195k, p≈44) that pushes one dense build past 60s
     /// while each HVP reuses the same row stream at ~gradient-pass cost (~3s).
     /// PCG with the joint penalty preconditioner typically converges in a
     /// handful of HVPs, so routing the inner solve through the operator path

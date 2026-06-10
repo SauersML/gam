@@ -285,14 +285,6 @@ pub fn load_dataset_projected(
     }
 }
 
-pub fn load_datasetwith_schema(
-    path: &Path,
-    schema: &DataSchema,
-    unseen_policy: UnseenCategoryPolicy,
-) -> Result<EncodedDataset, DataError> {
-    load_datasetwith_schema_projected(path, schema, unseen_policy, &[])
-}
-
 pub fn load_datasetwith_schema_projected(
     path: &Path,
     schema: &DataSchema,

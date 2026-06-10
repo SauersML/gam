@@ -1,4 +1,4 @@
-//! Reusable synthetic bernoulli marginal-slope FLEX harness for biobank-shape
+//! Reusable synthetic bernoulli marginal-slope FLEX harness for large-scale
 //! performance repros and coefficient-equivalence checks.
 //!
 //! Integration tests can include this helper with:
@@ -30,12 +30,12 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::{Duration, Instant};
 
-pub const BIOBANK_SHAPE_SEED: u64 = 0xB10B_AA1C_F13E_2026;
-pub const BIOBANK_SHAPE_PC_DIM: usize = 16;
+pub const LARGE_SCALE_SHAPE_SEED: u64 = 0xB10B_AA1C_F13E_2026;
+pub const LARGE_SCALE_SHAPE_PC_DIM: usize = 16;
 pub const DEFAULT_REPRO_N: usize = 50_000;
 
 #[derive(Clone)]
-pub struct BiobankShapeProblem {
+pub struct LargeScaleShapeProblem {
     pub data: Array2<f64>,
     pub spec: BernoulliMarginalSlopeTermSpec,
 }
@@ -96,14 +96,14 @@ fn pc16_duchon_smooth(name: &str) -> SmoothTermSpec {
     SmoothTermSpec {
         name: name.to_string(),
         basis: SmoothBasisSpec::Duchon {
-            feature_cols: (0..BIOBANK_SHAPE_PC_DIM).collect(),
+            feature_cols: (0..LARGE_SCALE_SHAPE_PC_DIM).collect(),
             spec: DuchonBasisSpec {
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                 length_scale: Some(1.0),
                 power: 8.0,
                 nullspace_order: DuchonNullspaceOrder::Linear,
                 identifiability: Default::default(),
-                aniso_log_scales: Some(vec![0.0; BIOBANK_SHAPE_PC_DIM]),
+                aniso_log_scales: Some(vec![0.0; LARGE_SCALE_SHAPE_PC_DIM]),
                 operator_penalties: DuchonOperatorPenaltySpec::default(),
 
                 periodic: None,
@@ -116,9 +116,9 @@ fn pc16_duchon_smooth(name: &str) -> SmoothTermSpec {
     }
 }
 
-pub fn build_biobank_shape_problem(n: usize) -> BiobankShapeProblem {
-    let mut rng = StdRng::seed_from_u64(BIOBANK_SHAPE_SEED.wrapping_add(n as u64));
-    let mut data = Array2::<f64>::zeros((n, BIOBANK_SHAPE_PC_DIM + 1));
+pub fn build_large_scale_shape_problem(n: usize) -> LargeScaleShapeProblem {
+    let mut rng = StdRng::seed_from_u64(LARGE_SCALE_SHAPE_SEED.wrapping_add(n as u64));
+    let mut data = Array2::<f64>::zeros((n, LARGE_SCALE_SHAPE_PC_DIM + 1));
     let mut z = Array1::<f64>::zeros(n);
     for i in 0..n {
         if i % 2 == 0 {
@@ -128,19 +128,19 @@ pub fn build_biobank_shape_problem(n: usize) -> BiobankShapeProblem {
                 z[i + 1] = b;
             }
         }
-        data[[i, BIOBANK_SHAPE_PC_DIM]] = rng.random_range(35.0..75.0);
-        for j in 0..BIOBANK_SHAPE_PC_DIM {
+        data[[i, LARGE_SCALE_SHAPE_PC_DIM]] = rng.random_range(35.0..75.0);
+        for j in 0..LARGE_SCALE_SHAPE_PC_DIM {
             data[[i, j]] = 0.65 * z[i] + 0.35 * rng.random_range(-1.0..1.0) + (j as f64) * 0.01;
         }
     }
     for i in 0..n {
-        data[[i, BIOBANK_SHAPE_PC_DIM]] = (data[[i, BIOBANK_SHAPE_PC_DIM]] - 55.0) / 12.0;
+        data[[i, LARGE_SCALE_SHAPE_PC_DIM]] = (data[[i, LARGE_SCALE_SHAPE_PC_DIM]] - 55.0) / 12.0;
     }
 
     let mut y = Array1::<f64>::zeros(n);
     for i in 0..n {
-        let age = data[[i, BIOBANK_SHAPE_PC_DIM]];
-        let pc_signal = (0..BIOBANK_SHAPE_PC_DIM)
+        let age = data[[i, LARGE_SCALE_SHAPE_PC_DIM]];
+        let pc_signal = (0..LARGE_SCALE_SHAPE_PC_DIM)
             .map(|j| data[[i, j]] * (0.08 / ((j + 1) as f64).sqrt()))
             .sum::<f64>();
         let eta = -0.15 + 0.35 * age - 0.12 * age * age + pc_signal + 0.30 * z[i];
@@ -153,7 +153,7 @@ pub fn build_biobank_shape_problem(n: usize) -> BiobankShapeProblem {
         random_effect_terms: vec![],
         smooth_terms: vec![
             pc16_duchon_smooth("pc16_duchon_mean"),
-            age_smooth(BIOBANK_SHAPE_PC_DIM, "age_entry_std_mean"),
+            age_smooth(LARGE_SCALE_SHAPE_PC_DIM, "age_entry_std_mean"),
         ],
     };
     let logslopespec = TermCollectionSpec {
@@ -161,11 +161,11 @@ pub fn build_biobank_shape_problem(n: usize) -> BiobankShapeProblem {
         random_effect_terms: vec![],
         smooth_terms: vec![
             pc16_duchon_smooth("pc16_duchon_logslope"),
-            age_smooth(BIOBANK_SHAPE_PC_DIM, "age_entry_std_logslope"),
+            age_smooth(LARGE_SCALE_SHAPE_PC_DIM, "age_entry_std_logslope"),
         ],
     };
     let dev_cfg = DeviationBlockConfig::triple_penalty_default();
-    BiobankShapeProblem {
+    LargeScaleShapeProblem {
         data,
         spec: BernoulliMarginalSlopeTermSpec {
             y,
@@ -195,7 +195,7 @@ pub fn cycle_capped_options(inner_max_cycles: usize) -> BlockwiseFitOptions {
 }
 
 pub fn fit_problem(
-    problem: BiobankShapeProblem,
+    problem: LargeScaleShapeProblem,
     options: BlockwiseFitOptions,
 ) -> Result<(BernoulliMarginalSlopeFitResult, FitTiming), String> {
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {

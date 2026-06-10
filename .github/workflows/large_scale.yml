@@ -1,4 +1,4 @@
-name: Biobank Scale
+name: Large-scale
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ on:
     - cron: "0 7 * * *"
 
 concurrency:
-  group: biobank-scale-${{ github.ref }}
+  group: large-scale-${{ github.ref }}
   cancel-in-progress: false
 
 permissions:
@@ -55,14 +55,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          key="biobank-scale-${{ runner.os }}-${{ hashFiles('bench/biobank_scale/runner.py', 'bench/biobank_scale/biobank_scale.yml', '.github/workflows/biobank_scale.yml', 'Cargo.toml') }}"
+          key="large-scale-${{ runner.os }}-${{ hashFiles('bench/large_scale/runner.py', 'bench/large_scale/large_scale.yml', '.github/workflows/large_scale.yml', 'Cargo.toml') }}"
           echo "cache_key=${key}" >> "${GITHUB_OUTPUT}"
 
       - name: Restore prepared cohort cache
         id: prep_cache
         uses: actions/cache/restore@v4
         with:
-          path: bench/biobank_scale/prepared
+          path: bench/large_scale/prepared
           key: ${{ steps.cache_key.outputs.cache_key }}
 
       - name: Prepare full cohort
@@ -70,13 +70,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 bench/biobank_scale/runner.py prepare --config bench/biobank_scale/biobank_scale.yml --out-dir bench/biobank_scale/prepared
+          python3 bench/large_scale/runner.py prepare --config bench/large_scale/large_scale.yml --out-dir bench/large_scale/prepared
 
       - name: Save prepared cohort cache
         if: ${{ steps.prep_cache.outputs.cache-hit != 'true' }}
         uses: actions/cache/save@v4
         with:
-          path: bench/biobank_scale/prepared
+          path: bench/large_scale/prepared
           key: ${{ steps.cache_key.outputs.cache_key }}
 
       - name: Build method matrix
@@ -84,14 +84,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          matrix=$(python3 bench/biobank_scale/runner.py matrix --config bench/biobank_scale/biobank_scale.yml)
+          matrix=$(python3 bench/large_scale/runner.py matrix --config bench/large_scale/large_scale.yml)
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload prepared cohort
         uses: actions/upload-artifact@v4
         with:
-          name: biobank-scale-prepared
-          path: bench/biobank_scale/prepared
+          name: large-scale-prepared
+          path: bench/large_scale/prepared
           if-no-files-found: error
 
   bootstrap-runtime:
@@ -121,7 +121,7 @@ jobs:
           ls -l target/release/gam
 
       - name: Build gamfit._rust Python extension
-        # bench/biobank_scale/runner.py loads `gamfit._rust` via
+        # bench/large_scale/runner.py loads `gamfit._rust` via
         # bench/_rust_loader.py for survival_* and classification_*
         # helpers (e.g. _survival_score_grid, survival_concordance,
         # classification_metrics). Without this step the runner aborts the
@@ -170,7 +170,7 @@ jobs:
       - name: Upload gam binary and Python extension
         uses: actions/upload-artifact@v4
         with:
-          name: biobank-scale-gam-binary
+          name: large-scale-gam-binary
           path: |
             target/release/gam
             target/release/_rust*.so
@@ -218,14 +218,14 @@ jobs:
       - name: Download prepared cohort
         uses: actions/download-artifact@v4
         with:
-          name: biobank-scale-prepared
-          path: bench/biobank_scale/prepared
+          name: large-scale-prepared
+          path: bench/large_scale/prepared
 
       - name: Download prebuilt gam binary and Python extension
         uses: actions/download-artifact@v4
         with:
-          name: biobank-scale-gam-binary
-          path: bench/biobank_scale/bin
+          name: large-scale-gam-binary
+          path: bench/large_scale/bin
 
       - name: Stage gam binary and gamfit._rust extension
         # The runner imports gamfit._rust via bench/_rust_loader.py, which
@@ -240,16 +240,16 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           mkdir -p target/release
-          cp bench/biobank_scale/bin/gam target/release/gam
+          cp bench/large_scale/bin/gam target/release/gam
           chmod +x target/release/gam
           ls -l target/release/gam
           installed=0
-          for so in bench/biobank_scale/bin/_rust*.so; do
+          for so in bench/large_scale/bin/_rust*.so; do
             cp "$so" "gamfit/$(basename "$so")"
             installed=$((installed + 1))
           done
           if [ "${installed}" -eq 0 ]; then
-            echo "::error title=Missing gamfit extension::No _rust*.so in biobank-scale-gam-binary artifact (bootstrap-runtime did not build gamfit._rust)"
+            echo "::error title=Missing gamfit extension::No _rust*.so in large-scale-gam-binary artifact (bootstrap-runtime did not build gamfit._rust)"
             exit 1
           fi
           ls -l gamfit/_rust*.so
@@ -260,22 +260,22 @@ jobs:
           GAM_RUST_BINARY: ${{ github.workspace }}/target/release/gam
         run: |
           set -euo pipefail
-          mkdir -p bench/biobank_scale/results bench/biobank_scale/runs/${{ matrix.name }}
-          python3 bench/biobank_scale/runner.py run-method \
-            --config bench/biobank_scale/biobank_scale.yml \
-            --prep-dir bench/biobank_scale/prepared \
+          mkdir -p bench/large_scale/results bench/large_scale/runs/${{ matrix.name }}
+          python3 bench/large_scale/runner.py run-method \
+            --config bench/large_scale/large_scale.yml \
+            --prep-dir bench/large_scale/prepared \
             --method "${{ matrix.name }}" \
-            --out-dir "bench/biobank_scale/runs/${{ matrix.name }}" \
-            --out-json "bench/biobank_scale/results/${{ matrix.name }}.json"
+            --out-dir "bench/large_scale/runs/${{ matrix.name }}" \
+            --out-json "bench/large_scale/results/${{ matrix.name }}.json"
 
       - name: Upload method artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: biobank-scale-${{ matrix.name }}
+          name: large-scale-${{ matrix.name }}
           path: |
-            bench/biobank_scale/results/${{ matrix.name }}.json
-            bench/biobank_scale/runs/${{ matrix.name }}
+            bench/large_scale/results/${{ matrix.name }}.json
+            bench/large_scale/runs/${{ matrix.name }}
           if-no-files-found: warn
 
   aggregate:
@@ -301,34 +301,34 @@ jobs:
       - name: Download prepared cohort
         uses: actions/download-artifact@v4
         with:
-          name: biobank-scale-prepared
-          path: bench/biobank_scale/prepared
+          name: large-scale-prepared
+          path: bench/large_scale/prepared
 
       - name: Download method artifacts
         uses: actions/download-artifact@v4
         with:
-          path: bench/biobank_scale/artifacts
+          path: bench/large_scale/artifacts
 
       - name: Collect result jsons
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p bench/biobank_scale/results
-          find bench/biobank_scale/artifacts -path '*/results/*.json' -type f -print -exec cp {} bench/biobank_scale/results/ \;
+          mkdir -p bench/large_scale/results
+          find bench/large_scale/artifacts -path '*/results/*.json' -type f -print -exec cp {} bench/large_scale/results/ \;
 
       - name: Aggregate outputs
         shell: bash
         run: |
           set -euo pipefail
-          python3 bench/biobank_scale/runner.py aggregate \
-            --config bench/biobank_scale/biobank_scale.yml \
-            --prep-dir bench/biobank_scale/prepared \
-            --results-dir bench/biobank_scale/results \
-            --out-dir bench/biobank_scale/final
+          python3 bench/large_scale/runner.py aggregate \
+            --config bench/large_scale/large_scale.yml \
+            --prep-dir bench/large_scale/prepared \
+            --results-dir bench/large_scale/results \
+            --out-dir bench/large_scale/final
 
       - name: Upload aggregate bundle
         uses: actions/upload-artifact@v4
         with:
-          name: biobank-scale-bundle
-          path: bench/biobank_scale/final/biobank_scale_bundle.zip
+          name: large-scale-bundle
+          path: bench/large_scale/final/large_scale_bundle.zip
           if-no-files-found: error

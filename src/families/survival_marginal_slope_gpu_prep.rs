@@ -1,7 +1,7 @@
 //! Survival-flex per-row **prep-step** dispatchers.
 //!
 //! These two `try_device_*` entries are the GPU-shaped seam for the per-row
-//! prep work that currently dominates biobank survival-flex wall time:
+//! prep work that currently dominates large-scale survival-flex wall time:
 //!
 //! * [`try_device_partition_cells`] — batched version of
 //!   `SurvivalMarginalSlopeFamily::denested_partition_cells`
