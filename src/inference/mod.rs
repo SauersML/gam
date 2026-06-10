@@ -6,6 +6,7 @@ pub mod diagnostics;
 pub mod dispersion_cov;
 pub mod fisher_rao;
 pub mod formula_dsl;
+pub mod full_conformal;
 pub mod generative;
 pub mod hmc;
 pub mod identifiability_diagnostics;
