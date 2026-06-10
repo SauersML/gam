@@ -29,6 +29,12 @@
 //!       alignment / smallest principal angle).
 //!   (c) DETERMINISM: two runs with identical seed produce bit-identical fitted
 //!       coords / masses.
+//!   (d) LEDGER DETERMINISM (#992 / #976): the collapse-guard event ledger
+//!       replays identically across the two runs, and a green rung records no
+//!       terminal collapse.
+//!   (e) ACTIVE-SET SPARSITY (#992): mean fitted per-row active-set size stays
+//!       within a factor-2 band of the planted count, and mean off-support
+//!       assignment mass stays below a quarter of the planted active mass.
 
 use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
@@ -719,6 +725,87 @@ fn run_rung(rung: &Rung) {
     assert!(
         deterministic,
         "DETERMINISM FAIL at K={k}: final_bits_eq={final_bit_identical} coords_bits_eq={coords_bit_identical} masses_bits_eq={mass_bit_identical} (gap {determinism_gap:.3e})"
+    );
+    // (d) LEDGER DETERMINISM (#992 / #976): the structure ledger the search
+    //     reads — the collapse-guard event sequence — must be identical across
+    //     the two runs (same breaches, same iterations, same actions, masses
+    //     bit-equal), and a green rung must contain no TERMINAL collapse (a
+    //     terminal event contradicts the (a)/(b) assertions above by
+    //     construction). Reseed events are legal (the guard giving an atom a
+    //     second basin) but must replay identically.
+    let ev1 = term1.collapse_events();
+    let ev2 = term2.collapse_events();
+    assert_eq!(
+        ev1.len(),
+        ev2.len(),
+        "LEDGER DETERMINISM FAIL at K={k}: {} vs {} collapse events",
+        ev1.len(),
+        ev2.len()
+    );
+    for (e1, e2) in ev1.iter().zip(ev2.iter()) {
+        assert!(
+            e1.iteration == e2.iteration
+                && e1.atom == e2.atom
+                && e1.action == e2.action
+                && e1.max_active_mass.to_bits() == e2.max_active_mass.to_bits()
+                && e1.floor.to_bits() == e2.floor.to_bits(),
+            "LEDGER DETERMINISM FAIL at K={k}: event mismatch {e1:?} vs {e2:?}"
+        );
+    }
+    assert!(
+        !ev1
+            .iter()
+            .any(|e| e.action == gam::solver::structure_search::CollapseAction::Terminal),
+        "LEDGER FAIL at K={k}: terminal collapse recorded on a rung whose mass/recovery \
+         assertions passed: {ev1:?}"
+    );
+    // (e) ACTIVE-SET SPARSITY (#992): the fitted per-row active set must stay
+    //     near the planted one — scaling K must not smear mass across the
+    //     dictionary. Two checks: (i) the mean fitted active-set size (atoms
+    //     whose mass exceeds half the planted level on a row) stays within a
+    //     factor-2 band of the planted per-row active count; (ii) the mean
+    //     OFF-SUPPORT mass (assignment mass on (row, atom) pairs the plant
+    //     left inactive) stays below a quarter of the planted active mass —
+    //     the smear statistic that row-level set sizes alone can miss.
+    let set_threshold = 0.5 * PLANTED_ACTIVE_MASS;
+    let mut fitted_set_total = 0usize;
+    let mut planted_set_total = 0usize;
+    let mut off_mass_acc = 0.0_f64;
+    let mut off_pairs = 0usize;
+    for i in 0..truth.n {
+        for t in 0..k {
+            let f = matched[t];
+            if truth.active[t][i] {
+                planted_set_total += 1;
+            } else {
+                off_mass_acc += assign1[[i, f]];
+                off_pairs += 1;
+            }
+            if assign1[[i, f]] > set_threshold {
+                fitted_set_total += 1;
+            }
+        }
+    }
+    let mean_fitted_set = fitted_set_total as f64 / truth.n as f64;
+    let mean_planted_set = planted_set_total as f64 / truth.n as f64;
+    let mean_off_mass = if off_pairs > 0 {
+        off_mass_acc / off_pairs as f64
+    } else {
+        0.0
+    };
+    println!(
+        "active set: mean fitted size={mean_fitted_set:.3} planted={mean_planted_set:.3} \
+         (threshold {set_threshold:.3}); mean off-support mass={mean_off_mass:.6}"
+    );
+    assert!(
+        mean_fitted_set <= 2.0 * mean_planted_set && mean_fitted_set >= 0.5 * mean_planted_set,
+        "SPARSITY FAIL at K={k}: mean fitted active-set size {mean_fitted_set:.3} outside \
+         [0.5, 2.0]x planted {mean_planted_set:.3}"
+    );
+    assert!(
+        mean_off_mass <= 0.25 * PLANTED_ACTIVE_MASS,
+        "SPARSITY FAIL at K={k}: mean off-support mass {mean_off_mass:.6} exceeds a quarter \
+         of the planted active mass {PLANTED_ACTIVE_MASS}"
     );
     // Reconstruction sanity: the dictionary must explain the planted signal.
     assert!(
