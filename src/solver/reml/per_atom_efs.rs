@@ -821,7 +821,14 @@ mod tests {
             })
         }
         fn reset(&mut self) {}
-        fn seed_inner_state(&mut self, _beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+            // A quadratic objective carries no inner P-IRLS state to warm-start,
+            // so there is no slot to seed. A populated β must still match the
+            // parameter dimension (an empty β is the "no warm-start" sentinel);
+            // validating it keeps the mock honest about the seeding contract.
+            if !beta.is_empty() {
+                assert_eq!(beta.len(), self.a.nrows());
+            }
             Ok(SeedOutcome::NoSlot)
         }
     }

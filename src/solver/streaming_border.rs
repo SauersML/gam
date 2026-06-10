@@ -535,7 +535,17 @@ impl ChunkAssembler {
     /// Number of buffered rows not yet folded into a chunk.
     fn buffered_rows(&self) -> usize {
         let k = self.gram.border_dim;
-        debug_assert!(self.buffer.len() % k == 0);
+        // Structural invariant: rows enter the buffer only via `push_rows`,
+        // which rejects any batch whose width is not `k`, and leave only in
+        // `need * k` drains — so the length is always a whole multiple of `k`.
+        // Kept as a real (release-surviving) assert rather than a `debug_assert`
+        // so a future buffer-maintenance bug cannot silently round the row count
+        // down.
+        assert!(
+            self.buffer.len() % k == 0,
+            "ChunkAssembler buffer length {} is not a multiple of border_dim {k}",
+            self.buffer.len()
+        );
         self.buffer.len() / k
     }
 
