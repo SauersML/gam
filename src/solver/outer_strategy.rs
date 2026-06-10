@@ -5428,6 +5428,108 @@ fn run_outer(
     }))
 }
 
+// ─── Frontier ρ-scaling auto-switch (issue #986) ─────────────────────────
+//
+// ARD-per-atom assigns one smoothing coordinate per dictionary atom, so the
+// ρ-vector reaches 10^4–10^5 coordinates. A dense outer quasi-Newton over that
+// materializes an O(K²) Hessian and is impossible at scale. When the ρ-dimension
+// is frontier-scale AND every coordinate is penalty-like with a working
+// fixed-point hook, route the PRIMARY outer iteration to the per-atom decoupled
+// EFS path (`crate::solver::estimate::reml::per_atom_efs`) instead of the dense
+// ARC/BFGS lane. The decision is auto-derived from the coordinate count alone —
+// there is no flag — and it is additive: the dense path is unchanged for small K
+// and for any objective that is not per-atom-EFS-eligible.
+
+/// Whether this capability is in the frontier ρ-scaling regime where the
+/// per-atom decoupled EFS primary should take over from the dense outer.
+///
+/// Delegates the eligibility decision to
+/// [`crate::solver::estimate::reml::per_atom_efs::per_atom_efs_eligible`], which
+/// requires all-penalty-like coordinates, a working `eval_efs` hook,
+/// fixed-point not disabled, and a frontier-scale ρ-dimension. This is the
+/// single auto-switch predicate; `plan`/`plan_with_class` keep selecting the
+/// dense or standard-EFS solver for everything below the frontier threshold.
+pub fn is_per_atom_efs_frontier(cap: &OuterCapability) -> bool {
+    crate::solver::estimate::reml::per_atom_efs::per_atom_efs_eligible(cap)
+}
+
+/// Auto-switch entry point: when `cap` is frontier-scale per-atom-EFS-eligible,
+/// run the per-atom decoupled EFS primary and return its [`OuterResult`];
+/// otherwise return `Ok(None)` so the caller falls through to the existing dense
+/// / standard-EFS path via [`OuterProblem::run`] / [`run_outer`].
+///
+/// Builds the same bounded seed and tolerance/budget the standard plan path
+/// uses, picks the seed (initial-ρ if supplied, else the first generated
+/// candidate — the per-atom fixed point is a contraction near the optimum and
+/// does not need the multi-seed cascade the dense path runs for its non-convex
+/// quasi-Newton surface), then drives the per-atom EFS loop. The shared-border
+/// topology defaults to disjoint (every atom owns a private penalty block — the
+/// common ARD-per-atom case); callers with a known arrow-border overlap can run
+/// the module's `run_per_atom_efs` directly with a populated
+/// `SharedBorderTopology`.
+///
+/// Additive: this function neither mutates nor bypasses the dense path; it is a
+/// pre-dispatch shortcut the coordinator can call ahead of `run`.
+pub fn run_per_atom_efs_if_frontier(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+) -> Result<Option<OuterResult>, EstimationError> {
+    let cap = primary_capability_for_config(obj.capability(), config, context);
+    cap.validate_layout(context)?;
+    if !is_per_atom_efs_frontier(&cap) {
+        return Ok(None);
+    }
+
+    let the_plan = plan_with_class(&cap, config.solver_class);
+    let rho_dim = cap.theta_layout().rho_dim();
+
+    let (lower, upper) = config.bounds.clone().unwrap_or_else(|| {
+        (
+            Array1::<f64>::from_elem(cap.n_params, -config.rho_bound),
+            Array1::<f64>::from_elem(cap.n_params, config.rho_bound),
+        )
+    });
+
+    // Seed: cache/explicit initial ρ if present, otherwise the first generated
+    // candidate. The per-atom multiplicative fixed point is locally
+    // contractive, so a single seed suffices; the heavy multi-seed cascade
+    // exists for the dense quasi-Newton's non-convex surface, not for EFS.
+    let seed = match config.initial_rho.as_ref() {
+        Some(initial) if initial.len() == cap.n_params => initial.clone(),
+        _ => {
+            let generated = crate::seeding::generate_rho_candidates(
+                cap.n_params,
+                config.heuristic_lambdas.as_deref(),
+                &config.seed_config,
+            );
+            match generated.into_iter().next() {
+                Some(first) => first,
+                None => Array1::<f64>::zeros(cap.n_params),
+            }
+        }
+    };
+
+    log::info!(
+        "[OUTER] {context}: frontier ρ-scaling (rho_dim={rho_dim}) → per-atom decoupled EFS primary"
+    );
+
+    let pa_cfg = crate::solver::estimate::reml::per_atom_efs::PerAtomEfsConfig::new(
+        config.tolerance,
+        config.max_iter,
+        lower,
+        upper,
+    );
+    let topology =
+        crate::solver::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
+
+    obj.reset();
+    let result = crate::solver::estimate::reml::per_atom_efs::run_per_atom_efs(
+        obj, &seed, &pa_cfg, &topology,
+    )?;
+    Ok(Some(result.into_outer_result(the_plan)))
+}
+
 fn outer_bounds(lo: &Array1<f64>, hi: &Array1<f64>) -> Result<Bounds, EstimationError> {
     Bounds::new(lo.clone(), hi.clone(), 1e-6).map_err(|err| {
         EstimationError::InvalidInput(format!("outer rho bounds are invalid: {err}"))
