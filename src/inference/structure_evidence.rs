@@ -53,6 +53,16 @@
 //! safe error control over its discovered structure. This module is the
 //! statistical substrate; the SAE structure search plugs its gates in.
 //!
+//! The instruments, bottom-up: [`EProcess`] (running evidence, Ville
+//! semantics) → [`PredictablePluginEProcess`] (streaming universal
+//! inference) → [`AtomBirthGate`] (the K vs K+1 gate with
+//! demote-never-reject [`GateVerdict`]s) → [`StructureLedger`] (one
+//! e-process per claim, serializable across #973 shards) →
+//! [`StructureLedger::certify`] (the e-BH [`StructureCertificate`]) →
+//! [`plan_probe_for_contested_claim`] (the design loop: contested claims
+//! get a [`ProbePlan`] whose δ runs through
+//! `crate::inference::steering::steer_delta`).
+//!
 //! # The math, fixed here so implementations cannot drift
 //!
 //! **E-value / e-process.** A nonnegative statistic `E` with `E_{H0}[E] ≤ 1`.
@@ -135,12 +145,14 @@
 //! - Probe selection by intuition → probe selection by information.
 
 use ndarray::{Array1, Array2};
+use serde::{Deserialize, Serialize};
 
 /// Running anytime-valid evidence against one null hypothesis, in log
 /// space. Multiplicative absorption of conditionally-valid e-values;
 /// Ville's inequality converts the running product into a sequential test
-/// that survives optional stopping.
-#[derive(Clone, Debug)]
+/// that survives optional stopping. Serializable so evidence is resumable
+/// across corpus shards (#973): persist, reload, keep absorbing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EProcess {
     /// log E_t — the running log-evidence. Starts at 0 (E_0 = 1).
     log_e: f64,
@@ -174,6 +186,18 @@ impl EProcess {
             self.log_e_max = self.log_e;
         }
         Ok(())
+    }
+
+    /// The #907 bridge, made literal: absorb one per-batch Bayes factor
+    /// whose prior was FROZEN before any of this stream's data was seen.
+    /// A fixed-prior BF against a simple (or sup-dominated) null satisfies
+    /// `E_{H0}[BF] ≤ 1`, so it is a conditionally-valid e-value and the
+    /// geometry-adjudication harness inherits anytime validity by routing
+    /// its per-batch BFs here instead of comparing a final BF to a
+    /// threshold. The caller owns the freeze: a prior tuned on data this
+    /// stream has touched voids the guarantee.
+    pub fn absorb_frozen_prior_log_bayes_factor(&mut self, log_bf: f64) {
+        self.absorb_log(log_bf);
     }
 
     /// Absorb a batch e-value supplied in log space (the only numerically
@@ -244,6 +268,7 @@ pub fn split_likelihood_log_e_value(
 /// optional-stopping form the corpus-scale pipeline (#973 shards) needs —
 /// evidence is resumable: serialize `EProcess`, keep absorbing on the next
 /// shard.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PredictablePluginEProcess {
     pub process: EProcess,
 }
@@ -275,6 +300,87 @@ impl PredictablePluginEProcess {
 impl Default for PredictablePluginEProcess {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// The anytime-valid verdict on one structural claim. Deliberately
+/// two-valued — there is NO "rejected" arm. Demote-never-reject (#969
+/// philosophy): an e-process that has not crossed 1/α has failed to prove
+/// the claim, not disproven it; the claim stays contested, keeps its
+/// evidence, and earns a design-optimal probe budget instead of being
+/// silently dropped (or worse, silently accepted the way a threshold gate
+/// accepts whatever clears it).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GateVerdict {
+    /// The running supremum crossed 1/α: the claim is proven with type-I
+    /// error ≤ α, permanently (Ville applies to the sup, so later evidence
+    /// retreat cannot un-prove it).
+    Certified { log_e: f64 },
+    /// Not (yet) proven. Carries the CURRENT log-evidence — the value the
+    /// dictionary certificate's e-BH consumes, and the state a probe loop
+    /// resumes from.
+    Contested { log_e: f64 },
+}
+
+/// The atom-birth gate (#976's threshold comparison, replaced): a
+/// universal-inference e-process over corpus shards deciding "does the
+/// K+1-th atom exist?", the boundary/Davies-regime question where the χ²
+/// gate every dictionary paper runs is broken.
+///
+/// Per shard t the integration contract is exactly the work plan's:
+/// - `log_lik_alternative_prefit`: the K+1-atom dictionary fit on shards
+///   BEFORE t (the PREVIOUS shard's fit — predictability is the one rule;
+///   handing in the current shard's fit voids the guarantee), evaluated on
+///   shard t. Any fitter, warm starts, GPU — no conditions.
+/// - `log_lik_null_sup_on_shard`: the K-atom dictionary REFIT on shard t
+///   (the honest constrained sup on the evaluation data).
+///
+/// The gate never rejects: [`GateVerdict::Contested`] is the only
+/// alternative to certification, and a contested atom's next move is a
+/// probe plan ([`plan_probe_for_contested_claim`]), not deletion.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AtomBirthGate {
+    pub test: PredictablePluginEProcess,
+    /// The level the certificate is claimed at; fixed at construction so a
+    /// verdict can never be shopped across α after seeing the evidence.
+    alpha: f64,
+}
+
+impl AtomBirthGate {
+    pub fn new(alpha: f64) -> Result<Self, String> {
+        if !(alpha > 0.0 && alpha < 1.0) {
+            return Err(format!("AtomBirthGate: alpha must be in (0,1), got {alpha}"));
+        }
+        Ok(Self {
+            test: PredictablePluginEProcess::new(),
+            alpha,
+        })
+    }
+
+    pub fn alpha(&self) -> f64 {
+        self.alpha
+    }
+
+    /// Absorb one shard's split-likelihood ratio (see type-level contract).
+    pub fn absorb_shard(
+        &mut self,
+        log_lik_alternative_prefit: f64,
+        log_lik_null_sup_on_shard: f64,
+    ) {
+        self.test
+            .absorb_batch(log_lik_alternative_prefit, log_lik_null_sup_on_shard);
+    }
+
+    pub fn verdict(&self) -> GateVerdict {
+        if self.test.process.rejects_at(self.alpha) {
+            GateVerdict::Certified {
+                log_e: self.test.process.log_evidence(),
+            }
+        } else {
+            GateVerdict::Contested {
+                log_e: self.test.process.log_evidence(),
+            }
+        }
     }
 }
 
@@ -314,6 +420,143 @@ pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Vec<usize> {
     }
     order.truncate(k_star);
     order
+}
+
+/// What one structural claim asserts about the dictionary. One e-process
+/// runs per claim; the kinds mirror the discovery stack's claim surface:
+/// atom existence (#976 birth), binding edges (#975), geometry
+/// adjudication (#907). `Custom` keeps the ledger open to claim types
+/// that do not exist yet without an enum churn per new discovery gate.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClaimKind {
+    /// "Atom `atom` is statistically real" — the K vs K+1 birth claim.
+    AtomExists { atom: usize },
+    /// "Atoms `a` and `b` are bound" — a #975 binding edge.
+    BindingEdge { a: usize, b: usize },
+    /// "Atom `atom`'s latent geometry is `kind`" (e.g. "circle",
+    /// "clusters", "line") — a #907 adjudication claim.
+    GeometryKind { atom: usize, kind: String },
+    /// Any other structural claim, labeled.
+    Custom { label: String },
+}
+
+/// One claim plus its running evidence.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StructuralClaim {
+    pub kind: ClaimKind,
+    pub evidence: EProcess,
+}
+
+/// The dictionary's claim ledger: every structural claim the discovery
+/// stack makes, each with its own e-process. Serializable — evidence
+/// resumes across corpus shards (#973) by persisting the ledger, not by
+/// refitting. Calling [`StructureLedger::certify`] at ANY data-dependent
+/// stopping time yields a valid certificate; that is the entire point.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct StructureLedger {
+    claims: Vec<StructuralClaim>,
+}
+
+impl StructureLedger {
+    pub fn new() -> Self {
+        Self { claims: Vec::new() }
+    }
+
+    /// Register a claim and return its ledger index. Idempotent on the
+    /// claim kind: re-registering an existing claim (a resumed shard loop
+    /// re-announcing its claim surface) returns the existing index and
+    /// PRESERVES its accumulated evidence — a fresh e-process here would
+    /// silently discard the stream's history.
+    pub fn register(&mut self, kind: ClaimKind) -> usize {
+        if let Some(idx) = self.claims.iter().position(|c| c.kind == kind) {
+            return idx;
+        }
+        self.claims.push(StructuralClaim {
+            kind,
+            evidence: EProcess::new(),
+        });
+        self.claims.len() - 1
+    }
+
+    /// Absorb one conditionally-valid log e-value for claim `idx` (a
+    /// universal-inference shard ratio, a frozen-prior log-BF — the
+    /// caller's contract is per-source, documented on the producing gate).
+    pub fn absorb_log(&mut self, idx: usize, log_e_value: f64) -> Result<(), String> {
+        let n = self.claims.len();
+        let claim = self
+            .claims
+            .get_mut(idx)
+            .ok_or_else(|| format!("StructureLedger: claim index {idx} out of range ({n} claims)"))?;
+        claim.evidence.absorb_log(log_e_value);
+        Ok(())
+    }
+
+    pub fn claims(&self) -> &[StructuralClaim] {
+        &self.claims
+    }
+
+    /// The dictionary certificate: e-BH over the ledger's CURRENT
+    /// e-values at level α. FDR ≤ α over the confirmed set under arbitrary
+    /// dependence — atoms sharing every token is fine — and valid at any
+    /// stopping time because each entry is an e-process. Claims not
+    /// confirmed are CONTESTED, never rejected (demote-never-reject); they
+    /// keep their evidence and are the inputs to the probe-design loop.
+    pub fn certify(&self, alpha: f64) -> StructureCertificate {
+        let log_e: Vec<f64> = self
+            .claims
+            .iter()
+            .map(|c| c.evidence.current_e_value_log())
+            .collect();
+        let confirmed_idx = e_benjamini_hochberg(&log_e, alpha);
+        let mut entries: Vec<CertificateEntry> = self
+            .claims
+            .iter()
+            .zip(&log_e)
+            .map(|(c, &le)| CertificateEntry {
+                kind: c.kind.clone(),
+                log_e: le,
+                steps: c.evidence.steps(),
+                confirmed: false,
+            })
+            .collect();
+        for &i in &confirmed_idx {
+            entries[i].confirmed = true;
+        }
+        StructureCertificate { alpha, entries }
+    }
+}
+
+/// One line of the certificate's e-value ledger: the claim, its
+/// log-evidence at the stop, how many batches produced it, and the e-BH
+/// outcome. The full entry list IS the reproducibility artifact: anyone
+/// holding it can re-run [`e_benjamini_hochberg`] and re-derive the
+/// confirmed set.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CertificateEntry {
+    pub kind: ClaimKind,
+    pub log_e: f64,
+    pub steps: usize,
+    pub confirmed: bool,
+}
+
+/// The deliverable: "we found N structures at FDR ≤ α, certificate
+/// attached". Ships next to the identifiability certificate
+/// ([`crate::sae_identifiability::residual_gauge`], #981) — that one says
+/// what the GAUGE cannot distinguish, this one says what the DATA can.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StructureCertificate {
+    pub alpha: f64,
+    pub entries: Vec<CertificateEntry>,
+}
+
+impl StructureCertificate {
+    pub fn confirmed(&self) -> impl Iterator<Item = &CertificateEntry> {
+        self.entries.iter().filter(|e| e.confirmed)
+    }
+
+    pub fn contested(&self) -> impl Iterator<Item = &CertificateEntry> {
+        self.entries.iter().filter(|e| !e.confirmed)
+    }
 }
 
 /// A candidate steering probe for resolving one contested structural
@@ -378,6 +621,59 @@ pub fn expected_resolution_budget(alpha: f64, growth_nats_per_obs: f64) -> Optio
         return None;
     }
     Some(-(alpha.ln()) / growth_nats_per_obs)
+}
+
+/// The experiment plan for one contested claim: which probe to run, the
+/// expected per-observation evidence growth under the alternative, and the
+/// design-time resolution budget. This is the loop's actionable output —
+/// hand `probes[probe]`'s δ to `crate::inference::steering::steer_delta`
+/// (which enforces the validity radius and reports realized dosimetry),
+/// evaluate both hypotheses' likelihoods on the realized outputs, absorb
+/// the log-ratio into the claim's e-process, re-certify.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProbePlan {
+    /// Index into the candidate probe list.
+    pub probe: usize,
+    /// Expected log-growth of the deciding e-process, nats/observation,
+    /// under the alternative (the KL of the hypotheses' predicted
+    /// responses in the output-Fisher metric).
+    pub expected_log_growth: f64,
+    /// Expected observations to cross 1/α from ZERO evidence — the
+    /// conservative from-scratch budget.
+    pub budget_from_scratch: f64,
+    /// Expected observations to cross 1/α from the claim's CURRENT
+    /// log-evidence — the remaining budget; 0 when already across.
+    pub budget_remaining: f64,
+}
+
+/// Close the design loop for one contested claim: pick the probe whose
+/// predicted hypothesis-disagreement (not raw effect) buys evidence
+/// fastest, and convert the claim's current evidence into a remaining
+/// budget — "this probe should resolve the claim in ~N more observations
+/// at level α; if it does not, the alternative is weaker than
+/// hypothesized, which is itself evidence."
+///
+/// `current_log_e` is the contested claim's running log-evidence (from its
+/// [`StructuralClaim`] / [`GateVerdict::Contested`]). Returns `None` when
+/// no probe discriminates (all candidates score zero growth: the
+/// hypotheses agree on everything reachable inside the validity radius —
+/// the claim is undecidable by steering and needs a different instrument,
+/// which is a finding, not a failure).
+pub fn plan_probe_for_contested_claim(
+    probes: &[CandidateProbe],
+    fisher: &Array2<f64>,
+    alpha: f64,
+    current_log_e: f64,
+) -> Option<ProbePlan> {
+    let (probe, expected_log_growth) = select_probe_by_expected_evidence(probes, fisher)?;
+    let budget_from_scratch = expected_resolution_budget(alpha, expected_log_growth)?;
+    let nats_remaining = (-(alpha.ln()) - current_log_e).max(0.0);
+    Some(ProbePlan {
+        probe,
+        expected_log_growth,
+        budget_from_scratch,
+        budget_remaining: nats_remaining / expected_log_growth,
+    })
 }
 
 #[cfg(test)]
@@ -463,5 +759,124 @@ mod tests {
         // Budget: ~3 observations to certify at α=0.05.
         let budget = expected_resolution_budget(0.05, growth).expect("budget");
         assert!(budget > 2.0 && budget < 4.0);
+    }
+
+    /// The birth gate certifies under a true alternative, stays contested
+    /// under the null, and never emits anything but those two verdicts.
+    #[test]
+    fn birth_gate_certifies_alternative_and_demotes_never_rejects() {
+        let mut gate = AtomBirthGate::new(0.05).expect("valid alpha");
+        // Strong shards: alternative beats the honest null sup by 1 nat each.
+        for _ in 0..5 {
+            gate.absorb_shard(-100.0, -101.0);
+        }
+        match gate.verdict() {
+            GateVerdict::Certified { log_e } => assert!((log_e - 5.0).abs() < 1e-12),
+            v => panic!("5 nats must certify at α=0.05, got {v:?}"),
+        }
+        // Permanence: a later evidence retreat cannot un-certify.
+        gate.absorb_shard(-110.0, -100.0);
+        assert!(matches!(gate.verdict(), GateVerdict::Certified { .. }));
+
+        // Null-ish stream: the prefit alternative loses to the on-shard sup
+        // (it must, on average — the sup is fit on the eval shard itself).
+        let mut null_gate = AtomBirthGate::new(0.05).expect("valid alpha");
+        for _ in 0..50 {
+            null_gate.absorb_shard(-100.3, -100.0);
+        }
+        match null_gate.verdict() {
+            GateVerdict::Contested { log_e } => assert!(log_e < 0.0),
+            v => panic!("null stream must stay contested, got {v:?}"),
+        }
+        assert!(AtomBirthGate::new(0.0).is_err());
+        assert!(AtomBirthGate::new(1.0).is_err());
+    }
+
+    /// Ledger: idempotent registration preserves evidence; the certificate
+    /// splits confirmed/contested by e-BH and the entry list reproduces it.
+    #[test]
+    fn ledger_certificate_splits_confirmed_and_contested() {
+        let mut ledger = StructureLedger::new();
+        let a0 = ledger.register(ClaimKind::AtomExists { atom: 0 });
+        let a1 = ledger.register(ClaimKind::AtomExists { atom: 1 });
+        let edge = ledger.register(ClaimKind::BindingEdge { a: 0, b: 1 });
+
+        // m = 3, α = 0.1 → e-BH thresholds m/(αk) = 30, 15, 10.
+        ledger.absorb_log(a0, 40.0f64.ln()).unwrap();
+        ledger.absorb_log(a1, 20.0f64.ln()).unwrap();
+        ledger.absorb_log(edge, 2.0f64.ln()).unwrap();
+
+        // Re-registering must return the same slot with evidence intact.
+        let a0_again = ledger.register(ClaimKind::AtomExists { atom: 0 });
+        assert_eq!(a0_again, a0);
+        assert_eq!(ledger.claims()[a0].evidence.steps(), 1);
+
+        let cert = ledger.certify(0.1);
+        // e_(1)=40 ≥ 30 ✓, e_(2)=20 ≥ 15 ✓, e_(3)=2 < 10 ✗ → atoms confirmed,
+        // the binding edge stays contested.
+        let confirmed: Vec<&ClaimKind> = cert.confirmed().map(|e| &e.kind).collect();
+        assert_eq!(confirmed.len(), 2);
+        assert!(confirmed.contains(&&ClaimKind::AtomExists { atom: 0 }));
+        assert!(confirmed.contains(&&ClaimKind::AtomExists { atom: 1 }));
+        let contested: Vec<&CertificateEntry> = cert.contested().collect();
+        assert_eq!(contested.len(), 1);
+        assert_eq!(contested[0].kind, ClaimKind::BindingEdge { a: 0, b: 1 });
+
+        assert!(ledger.absorb_log(99, 0.0).is_err());
+    }
+
+    /// Resumability: a serialized ledger reloads with its evidence and
+    /// keeps absorbing — the #973 shard contract.
+    #[test]
+    fn ledger_evidence_resumes_across_serialization() {
+        let mut ledger = StructureLedger::new();
+        let idx = ledger.register(ClaimKind::GeometryKind {
+            atom: 3,
+            kind: "circle".to_string(),
+        });
+        ledger.absorb_log(idx, 1.25).unwrap();
+
+        let persisted = serde_json::to_string(&ledger).expect("serialize ledger");
+        let mut resumed: StructureLedger =
+            serde_json::from_str(&persisted).expect("deserialize ledger");
+        assert_eq!(resumed.claims()[idx].evidence.steps(), 1);
+
+        resumed.absorb_log(idx, 0.75).unwrap();
+        let log_e = resumed.claims()[idx].evidence.log_evidence();
+        assert!((log_e - 2.0).abs() < 1e-12);
+    }
+
+    /// The probe plan discounts the remaining budget by evidence already
+    /// banked, and floors at zero once the claim is across the line.
+    #[test]
+    fn probe_plan_discounts_remaining_budget_by_current_evidence() {
+        let fisher = array![[2.0, 0.0], [0.0, 0.5]];
+        let probes = vec![CandidateProbe {
+            delta: array![0.0, 1.0],
+            predicted_mean_null: array![0.0, 0.0],
+            predicted_mean_alt: array![1.0, 0.2],
+        }];
+        // growth = 1.01 nats/obs (checked above); α=0.05 → need ln(20) ≈ 3.0 nats.
+        let from_zero =
+            plan_probe_for_contested_claim(&probes, &fisher, 0.05, 0.0).expect("plan");
+        assert_eq!(from_zero.probe, 0);
+        assert!((from_zero.budget_remaining - from_zero.budget_from_scratch).abs() < 1e-12);
+
+        let halfway =
+            plan_probe_for_contested_claim(&probes, &fisher, 0.05, 1.5).expect("plan");
+        assert!(halfway.budget_remaining < from_zero.budget_remaining);
+        assert!((halfway.budget_remaining - (-(0.05f64.ln()) - 1.5) / 1.01).abs() < 1e-12);
+
+        let across =
+            plan_probe_for_contested_claim(&probes, &fisher, 0.05, 10.0).expect("plan");
+        assert_eq!(across.budget_remaining, 0.0);
+
+        // No discriminating probe → no plan (undecidable by steering).
+        let blind = vec![CandidateProbe {
+            delta: array![1.0, 0.0],
+            predicted_mean_null: array![5.0, 5.0],
+            predicted_mean_alt: array![5.0, 5.0],
+        }];
+        assert!(plan_probe_for_contested_claim(&blind, &fisher, 0.05, 0.0).is_none());
     }
 }
