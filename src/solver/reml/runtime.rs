@@ -5535,10 +5535,29 @@ impl<'a> RemlState<'a> {
         } else {
             KKT_TOL_STAT
         };
+        // Scale-invariant stationarity, matching the inner active-set solver's
+        // own acceptance contract (`stationarity_rel` in
+        // `solve_newton_direction_with_linear_constraints_impl`): the
+        // stationarity residual `‖grad − Aᵀλ‖∞` is certified relative to the
+        // gradient scale `‖grad‖∞`, not against a bare absolute floor. The
+        // profiled-REML / least-squares gradient is O(n) in magnitude even at a
+        // genuine constrained optimum (issue #879), so the residual bottoms out
+        // at an absolute value (≈5.8e-5 on the n=400 #989 repro) that the fixed
+        // `5e-6` gate can never meet — even though the inner solver already
+        // converged on the relative ratio. We accept when EITHER the absolute
+        // residual is below the gate OR the relative ratio
+        // `stationarity / max(‖grad‖∞, 1)` is, so the outer gate stops on the
+        // same point the solver does instead of spuriously aborting a reachable
+        // constrained optimum (issue #989). `bounded()`, which solves via the
+        // exact-interval path rather than this active-set gate, was unaffected —
+        // hence the two documented ways to bound a coefficient disagreed.
+        let stationarity_rel = kkt.stationarity / kkt.gradient_scale.max(1.0);
+        let stationarity_ok =
+            kkt.stationarity <= stationarity_tol || stationarity_rel <= stationarity_tol;
         if kkt.primal_feasibility > KKT_TOL_PRIMAL
             || kkt.dual_feasibility > KKT_TOL_DUAL
             || kkt.complementarity > KKT_TOL_COMP
-            || kkt.stationarity > stationarity_tol
+            || !stationarity_ok
         {
             let mut worstrow_msg = String::new();
             if let Some(lin) = pr.linear_constraints_transformed.as_ref() {
@@ -5557,17 +5576,19 @@ impl<'a> RemlState<'a> {
                 }
             }
             return Err(EstimationError::ParameterConstraintViolation(format!(
-                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (tol={:.3e}{}); active={}/{}{}",
+                "KKT residuals exceed tolerance: primal={:.3e}, dual={:.3e}, comp={:.3e}, stat={:.3e} (stat_rel={:.3e} vs tol={:.3e}{}; ‖grad‖∞={:.3e}); active={}/{}{}",
                 kkt.primal_feasibility,
                 kkt.dual_feasibility,
                 kkt.complementarity,
                 kkt.stationarity,
+                stationarity_rel,
                 stationarity_tol,
                 if kkt.working_set_rank_deficient {
                     ", degenerate face"
                 } else {
                     ""
                 },
+                kkt.gradient_scale,
                 kkt.n_active,
                 kkt.n_constraints,
                 worstrow_msg

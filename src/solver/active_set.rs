@@ -166,6 +166,31 @@ pub struct ConstraintKktDiagnostics {
     /// strictly-interior seed, not by this relaxation.
     #[serde(default)]
     pub working_set_rank_deficient: bool,
+    /// Inf-norm of the (raw, unprojected) gradient at `beta`, `‖gradient‖∞` —
+    /// the natural scale of the stationarity residual. A converged constrained
+    /// optimum drives `stationarity = ‖grad − Aᵀλ‖∞` to zero *relative to* this
+    /// scale, not to a fixed absolute floor: the profiled REML latent objective
+    /// carries an O(n) gradient magnitude even at a genuine stationary point
+    /// (issue #879), so a bare absolute stationarity gate is unreachable there
+    /// by construction. The inner active-set solver already certifies
+    /// convergence on the scale-invariant ratio
+    /// `stationarity / max(gradient_scale, 1)` (its `stationarity_rel` path
+    /// against `ACTIVE_SET_KKT_STATIONARITY_TOL`); the outer validation gate
+    /// [`crate::solver::reml::runtime`]`::enforce_constraint_kkt` consults this
+    /// field to apply the identical relative test, so the two stop on the same
+    /// contract instead of the gate spuriously aborting a constrained optimum
+    /// the solver legitimately reached (issue #989). Defaults to `0.0` when
+    /// deserialized from a model saved before this field existed, which makes
+    /// `max(gradient_scale, 1) = 1` and recovers the bare absolute test.
+    #[serde(default)]
+    pub gradient_scale: f64,
+}
+
+/// Inf-norm `‖g‖∞` used as the scale of the stationarity residual in the
+/// relative KKT criterion shared by the inner active-set solver and the outer
+/// validation gate (see [`ConstraintKktDiagnostics::gradient_scale`]).
+fn gradient_inf_norm(gradient: &Array1<f64>) -> f64 {
+    gradient.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()))
 }
 
 fn solve_newton_direction_dense(
@@ -338,6 +363,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
         stationarity,
         active_tolerance,
         working_set_rank_deficient,
+        gradient_scale: gradient_inf_norm(gradient),
     }
 }
 
@@ -1143,6 +1169,7 @@ pub(crate) fn working_set_kkt_diagnostics_from_multipliers(
         // needs to surface that to a downstream gate; here we report the
         // post-compression view honestly.
         working_set_rank_deficient: false,
+        gradient_scale: gradient_inf_norm(gradient),
     })
 }
 
@@ -1505,7 +1532,7 @@ fn solve_newton_direction_with_linear_constraints_impl(
         m,
     )?;
     let kkt = compute_constraint_kkt_diagnostics(&x, &g_cur, constraints);
-    let grad_inf = g_cur.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let grad_inf = gradient_inf_norm(&g_cur);
     let stationarity_rel = working_kkt.stationarity / grad_inf.max(1.0);
     let step_inf = d_total.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
     let hd_total = hessian.dot(&d_total);
