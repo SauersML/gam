@@ -187,8 +187,11 @@ for lam in grid:
     # like gam's `ridge_diag_solve` (gam never does the OLS de-biasing pass that
     # pysindy applies by default); this makes the coefficient comparison a true
     # head-to-head of the same estimator, not ridge-vs-OLS.
+    # No intercept is fit: pysindy >= 2.0 removed STLSQ's `fit_intercept`
+    # kwarg and the optimizer never fits one (identical to the old
+    # fit_intercept=False), so no kwarg is needed.
     opt = STLSQ(threshold=tol, alpha=lam, max_iter=max_rounds,
-                normalize_columns=False, fit_intercept=False, unbias=False)
+                normalize_columns=False, unbias=False)
     opt.fit(Theta, Xdot)
     Xi = np.asarray(opt.coef_).T  # -> (p, d)
     score = bic(Theta, Xdot, Xi)

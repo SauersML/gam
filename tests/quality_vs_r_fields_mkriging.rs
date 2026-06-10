@@ -126,21 +126,38 @@ fn gam_matern_kriging_matches_fields_mkrig() {
     // predicts on the grid. smoothness=1.5 matches gam's nu=1.5. We emit the
     // grid predictions and the MLE range so the length-scale agreement can be
     // checked.
+    // The CSV bridge demands every wire column share one row count, but the
+    // training columns (n=120) and the grid columns (225) have different
+    // natural lengths. Right-pad the shorter training columns with NaN to the
+    // grid length; the R side drops the NaN tail (`!is.na(df$y)`) before
+    // fitting, so the padding is inert.
+    let pad_to_grid = |v: &[f64]| -> Vec<f64> {
+        let mut out = v.to_vec();
+        out.resize(ngrid, f64::NAN);
+        out
+    };
+    let x1_wire = pad_to_grid(&x1);
+    let x2_wire = pad_to_grid(&x2);
+    let y_wire = pad_to_grid(&y);
     let r = run_r(
         &[
-            Column::new("x1", &x1),
-            Column::new("x2", &x2),
-            Column::new("y", &y),
+            Column::new("x1", &x1_wire),
+            Column::new("x2", &x2_wire),
+            Column::new("y", &y_wire),
             Column::new("gx1", &gx1),
             Column::new("gx2", &gx2),
         ],
         r#"
         suppressPackageStartupMessages(library(fields))
-        s    <- cbind(df$x1, df$x2)
+        # Training columns are NaN-padded to the grid length on the wire;
+        # slice back to the true n observed rows before fitting.
+        ok   <- !is.na(df$y)
+        s    <- cbind(df$x1[ok], df$x2[ok])
+        yv   <- df$y[ok]
         grid <- cbind(df$gx1, df$gx2)
         # True Bayesian kriging: Matern covariance, range/nugget by marginal
         # likelihood (MLESpatialProcess), smoothness fixed to nu=1.5 to match gam.
-        fit <- spatialProcess(s, df$y, cov.args = list(Covariance = "Matern", smoothness = 1.5))
+        fit <- spatialProcess(s, yv, cov.args = list(Covariance = "Matern", smoothness = 1.5))
         pred <- predict(fit, xnew = grid)
         emit("grid_fit", as.numeric(pred))
         # MLE Matern range parameter (aRange == theta, the length scale).
