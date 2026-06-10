@@ -252,6 +252,38 @@ pub fn sindy_stlsq_solve(
         }
     }
 
+    // Ridge branch: unbias the converged support with a final UNPENALIZED
+    // least-squares refit per output column. In STLSQ the ridge term exists to
+    // stabilize the thresholding iterations, not to define the estimator — the
+    // estimator on the final support is OLS (pysindy's `BaseOptimizer`
+    // `unbias=True` default does exactly this), so keeping the λ-shrunk
+    // coefficients leaves an O(λ) bias toward zero on every recovered
+    // dynamics coefficient. SCAD/MCP are NOT polished: their penalty defines
+    // the estimator (near-unbiased by construction past `a·λ`, deliberately
+    // shrunk inside it), and an OLS polish would collapse them to plain
+    // hard-threshold OLS. If the support's Gram is singular the polish is
+    // skipped for that column and the stabilized ridge solution is kept.
+    if matches!(kind, SindyPenaltyKind::Ridge) {
+        for c in 0..d {
+            let active_idx: Vec<usize> = (0..p).filter(|&j| xi[(j, c)] != 0.0).collect();
+            if active_idx.is_empty() {
+                continue;
+            }
+            let p_act = active_idx.len();
+            let mut theta_act = Array2::<f64>::zeros((n, p_act));
+            for (k, &j) in active_idx.iter().enumerate() {
+                theta_act.column_mut(k).assign(&theta.column(j));
+            }
+            let rhs = dz_dt.column(c).to_owned().insert_axis(Axis(1));
+            let diag = Array1::<f64>::zeros(p_act);
+            if let Ok(sol) = ridge_diag_solve(theta_act.view(), rhs.view(), diag.view()) {
+                for (k, &j) in active_idx.iter().enumerate() {
+                    xi[(j, c)] = sol[(k, 0)];
+                }
+            }
+        }
+    }
+
     Ok(SindyStlsqResult {
         coefficients: xi,
         rounds_used,
