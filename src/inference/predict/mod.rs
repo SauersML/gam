@@ -5750,7 +5750,7 @@ where
             let response_var = mean.mapv(|mu| mu.max(0.0));
             response_observation_bounds(response_var)
         }
-        ResponseFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta, .. } => {
             // `theta` is estimated jointly with the mean (#802) and recorded
             // in `likelihood_scale` (`EstimatedNegBinTheta`). Read the fitted
             // value via `observation_theta()` (the saved family variant also

@@ -3317,7 +3317,7 @@ pub fn integrated_family_moments_jet(
                     })?;
                     phi * mean.powf(*p)
                 }
-                ResponseFamily::NegativeBinomial { theta } => {
+                ResponseFamily::NegativeBinomial { theta, .. } => {
                     mean + mean * mean / theta.max(1e-12)
                 }
                 ResponseFamily::Gamma => {

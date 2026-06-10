@@ -149,7 +149,7 @@ fn family_noise_parameter_from_scale(
     standard_deviation: f64,
     likelihood: &LikelihoodSpec,
 ) -> Option<f64> {
-    if let ResponseFamily::NegativeBinomial { theta } = likelihood.response {
+    if let ResponseFamily::NegativeBinomial { theta, .. } = likelihood.response {
         return Some(theta);
     }
     if let ResponseFamily::Tweedie { .. } = likelihood.response {

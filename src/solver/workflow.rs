@@ -4517,16 +4517,27 @@ pub fn resolve_family(
                     ),
                     false,
                 ),
+                // #983: a user-supplied `--negative-binomial-theta` holds θ
+                // fixed at exactly that value (`theta_fixed = true` →
+                // `FixedNegBinTheta` scale → the PIRLS refresh gate
+                // `negbin_theta_is_estimated()` stays closed). With no flag,
+                // θ is the running ML estimate (the #802 default seed 1.0).
                 "nb" | "negbin" | "negative-binomial" => (
                     LikelihoodSpec::new(
-                        ResponseFamily::NegativeBinomial { theta: nb_theta },
+                        ResponseFamily::NegativeBinomial {
+                            theta: nb_theta,
+                            theta_fixed: negative_binomial_theta.is_some(),
+                        },
                         InverseLink::Standard(StandardLink::Log),
                     ),
                     false,
                 ),
                 "negative-binomial-log" => (
                     LikelihoodSpec::new(
-                        ResponseFamily::NegativeBinomial { theta: nb_theta },
+                        ResponseFamily::NegativeBinomial {
+                            theta: nb_theta,
+                            theta_fixed: negative_binomial_theta.is_some(),
+                        },
                         InverseLink::Standard(StandardLink::Log),
                     ),
                     true,

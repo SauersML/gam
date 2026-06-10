@@ -550,7 +550,10 @@ impl NutsFamily {
                 link: InverseLink::Standard(StandardLink::Log),
             },
             Self::NegativeBinomialLog => LikelihoodSpec {
-                response: ResponseFamily::NegativeBinomial { theta: 1.0 },
+                response: ResponseFamily::NegativeBinomial {
+                    theta: 1.0,
+                    theta_fixed: false,
+                },
                 link: InverseLink::Standard(StandardLink::Log),
             },
             Self::GammaLog => LikelihoodSpec {
@@ -1331,7 +1334,7 @@ fn joint_family_logp_and_grad(
             }
             Ok(tweedie_log_quasilogp_and_grad(data, eta, p))
         }
-        ResponseFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta, .. } => {
             // Family mapping: NegativeBinomial payload theta is overdispersion.
             // NB keeps unit REML scale and never reads fixed_phi for theta.
             Ok(negative_binomial_log_logp_and_grad(data, eta, *theta))
@@ -5066,7 +5069,7 @@ pub fn run_nuts_sampling_flattened_family(
                 config,
             )
         }
-        (ResponseFamily::NegativeBinomial { theta }, _, FamilyNutsInputs::Glm(glm)) => {
+        (ResponseFamily::NegativeBinomial { theta, .. }, _, FamilyNutsInputs::Glm(glm)) => {
             // Family mapping: NegativeBinomial payload theta is passed through the family slot.
             // NB dispersion scale is unit; theta is not derived from fixed_phi.
             run_nuts_sampling(

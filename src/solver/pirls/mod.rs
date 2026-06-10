@@ -1153,7 +1153,7 @@ impl WorkingLikelihood for GlmLikelihoodSpec {
                 )?;
                 Ok(())
             }
-            (ResponseFamily::NegativeBinomial { theta }, _, _) => {
+            (ResponseFamily::NegativeBinomial { theta, .. }, _, _) => {
                 let theta = *theta;
                 write_negative_binomial_log_working_state(
                     y,
@@ -5265,7 +5265,7 @@ pub(crate) fn computeworkingweight_derivatives_from_eta(
                 },
             )?;
         }
-        ResponseFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta, .. } => {
             let theta = *theta;
             if !valid_negbin_theta(theta) {
                 crate::bail_invalid_estim!(
@@ -5687,7 +5687,7 @@ pub fn weight_family_for_glm_likelihood(likelihood: &GlmLikelihoodSpec) -> Weigh
         ResponseFamily::Gaussian => WeightFamily::Gaussian,
         ResponseFamily::Poisson => WeightFamily::Poisson,
         ResponseFamily::Tweedie { p } => WeightFamily::Tweedie { p: *p },
-        ResponseFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta, .. } => {
             WeightFamily::NegativeBinomial { theta: *theta }
         }
         ResponseFamily::Beta { phi } => WeightFamily::Beta { phi: *phi },
@@ -6494,7 +6494,7 @@ pub fn calculate_deviance(
                 .sum();
             2.0 * total
         }
-        ResponseFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta, .. } => {
             let theta = *theta;
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let total: f64 = (0..y.len())
@@ -6595,7 +6595,7 @@ pub(crate) fn calculate_loglikelihood_omitting_constants(
             }
             -0.5 * calculate_deviance(y, mu, likelihood, priorweights)
         }
-        ResponseFamily::NegativeBinomial { theta } => {
+        ResponseFamily::NegativeBinomial { theta, .. } => {
             let theta = *theta;
             (0..n)
                 .into_par_iter()
