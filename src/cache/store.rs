@@ -98,6 +98,15 @@ pub struct WarmStartStore {
     /// Monotonically increasing per-instance save counter. Used together
     /// with `byte_total` to throttle the eviction directory walk.
     save_counter: AtomicU64,
+    /// Per-store test-only monotonic time offset (nanoseconds) added to every
+    /// `*_now` reading. Always zero in production. Tests mutate it through
+    /// [`Self::test_advance_time`] to simulate elapsed time without
+    /// `thread::sleep`. Lives on the store rather than as a process-wide
+    /// static so parallel tests with their own stores cannot pollute each
+    /// other's clocks — a global clock made `cargo test` non-deterministic
+    /// (gam test infra: one test's +1.5s TTL advance was bumping another
+    /// test's just-saved entry past its 1s TTL on immediate lookup).
+    test_time_offset_ns: AtomicU64,
 }
 
 impl Clone for WarmStartStore {
@@ -109,6 +118,9 @@ impl Clone for WarmStartStore {
             // will sweep once on its first save and resync from disk.
             byte_total: AtomicU64::new(self.byte_total.load(Ordering::Relaxed)),
             save_counter: AtomicU64::new(0),
+            test_time_offset_ns: AtomicU64::new(
+                self.test_time_offset_ns.load(Ordering::Relaxed),
+            ),
         }
     }
 }
@@ -122,6 +134,7 @@ impl WarmStartStore {
             opts,
             byte_total: AtomicU64::new(0),
             save_counter: AtomicU64::new(0),
+            test_time_offset_ns: AtomicU64::new(0),
         })
     }
 
@@ -181,7 +194,7 @@ impl WarmStartStore {
         // poll loop cannot keep returning an expired entry between eviction
         // sweeps (eviction is throttled via `EVICT_EVERY_N_SAVES`).
         let cache_key = LookupCacheKey { fp: *key, mode };
-        let now_nanos = nanos_now();
+        let now_nanos = self.nanos_now();
         if let Some(hit) = lookup_cache_get(&cache_key) {
             if let Ok(md) = fs::metadata(&hit.meta_path)
                 && md.modified().ok() == Some(hit.meta_mtime)
@@ -315,7 +328,7 @@ impl WarmStartStore {
         iteration: Option<u64>,
         kind: EntryKind,
     ) -> Result<String, StoreError> {
-        let run_id = fresh_run_id();
+        let run_id = self.fresh_run_id();
         self.save_overwrite(key, &run_id, payload, objective, iteration, kind)?;
         Ok(run_id)
     }
@@ -355,7 +368,7 @@ impl WarmStartStore {
         // non-finite objective is no better than "unknown" for ranking
         // purposes, so collapse it to `None` rather than failing the save.
         let objective_finite = objective.filter(|o| o.is_finite());
-        let (secs, subsec_nanos) = unix_now_parts();
+        let (secs, subsec_nanos) = self.unix_now_parts();
         let meta = OnDiskMeta {
             schema_version: SCHEMA_VERSION,
             written_unix_secs: secs,
@@ -384,7 +397,7 @@ impl WarmStartStore {
         //    in-memory `payload` / `meta_json` we still hold. A single retry is
         //    sufficient — the eviction window is one `remove_dir` syscall wide —
         //    and a second genuine `NotFound` is propagated as before.
-        let nonce = nanos_now();
+        let nonce = self.nanos_now();
         let bin_final = dir.join(format!("{run_id}.bin"));
         let meta_final = dir.join(format!("{run_id}.json"));
         let mut attempt = 0u8;
@@ -463,7 +476,7 @@ impl WarmStartStore {
         };
         // Collect (meta_path, bin_path, total_bytes, write_nanos_since_epoch).
         let mut all: Vec<(PathBuf, PathBuf, u64, u128)> = Vec::new();
-        let now_nanos = nanos_now();
+        let now_nanos = self.nanos_now();
         for key_dir_entry in read_dir {
             let key_dir = match key_dir_entry {
                 Ok(e) => e.path(),
@@ -799,45 +812,51 @@ fn checksum_hex(payload: &[u8]) -> String {
     s
 }
 
-/// Monotonic offset (in nanoseconds) added to every `*_now` reading. The
-/// offset is always zero in production runs; tests mutate it via
-/// `tests::TEST_TIME_OFFSET_NS` to simulate elapsed time without
-/// `thread::sleep`. Reads atomically; production code never mutates this.
-static TEST_TIME_OFFSET_NS: AtomicU64 = AtomicU64::new(0);
+impl WarmStartStore {
+    fn test_time_offset_ns(&self) -> u64 {
+        self.test_time_offset_ns.load(Ordering::Relaxed)
+    }
 
-fn test_time_offset_ns() -> u64 {
-    TEST_TIME_OFFSET_NS.load(Ordering::Relaxed)
-}
+    fn unix_now_parts(&self) -> (u64, u32) {
+        let base = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let total = base.saturating_add(u128::from(self.test_time_offset_ns()));
+        let secs = (total / 1_000_000_000u128) as u64;
+        let nanos = (total % 1_000_000_000u128) as u32;
+        (secs, nanos)
+    }
 
-fn unix_now_parts() -> (u64, u32) {
-    let base = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let total = base.saturating_add(u128::from(test_time_offset_ns()));
-    let secs = (total / 1_000_000_000u128) as u64;
-    let nanos = (total % 1_000_000_000u128) as u32;
-    (secs, nanos)
-}
+    fn nanos_now(&self) -> u128 {
+        let base = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        base.saturating_add(u128::from(self.test_time_offset_ns()))
+    }
 
-fn nanos_now() -> u128 {
-    let base = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    base.saturating_add(u128::from(test_time_offset_ns()))
-}
-
-fn fresh_run_id() -> String {
-    let pid = std::process::id();
-    let nanos = nanos_now();
-    format!("r{pid:x}-{nanos:x}")
+    fn fresh_run_id(&self) -> String {
+        let pid = std::process::id();
+        let nanos = self.nanos_now();
+        format!("r{pid:x}-{nanos:x}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::key::Fingerprinter;
+
+    impl WarmStartStore {
+        /// Advance this store's simulated monotonic clock by `dur`. Only
+        /// available in tests — production code reads the real wall clock and
+        /// never mutates the per-store offset.
+        fn test_advance_time(&self, dur: Duration) {
+            self.test_time_offset_ns
+                .fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
 
     fn temp_store() -> (tempfile::TempDir, WarmStartStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -903,7 +922,7 @@ mod tests {
         store
             .save(&key, b"low-objective", Some(1.0), Some(1), EntryKind::Final)
             .unwrap();
-        TEST_TIME_OFFSET_NS.fetch_add(2_000_000, Ordering::Relaxed);
+        store.test_advance_time(Duration::from_millis(2));
         store
             .save(
                 &key,
@@ -945,7 +964,7 @@ mod tests {
         store
             .save(&key, b"first", None, None, EntryKind::Checkpoint)
             .unwrap();
-        TEST_TIME_OFFSET_NS.fetch_add(1_100_000_000, Ordering::Relaxed);
+        store.test_advance_time(Duration::from_millis(1_100));
         store
             .save(&key, b"second", None, None, EntryKind::Checkpoint)
             .unwrap();
@@ -1095,7 +1114,7 @@ mod tests {
             .save(&key, b"x", None, None, EntryKind::Checkpoint)
             .unwrap();
         assert!(store.lookup(&key).unwrap().is_some());
-        TEST_TIME_OFFSET_NS.fetch_add(1_500_000_000, Ordering::Relaxed);
+        store.test_advance_time(Duration::from_millis(1_500));
         // Trigger eviction via a save under an unrelated key.
         let other = key_for("ttl-other");
         store
