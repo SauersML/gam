@@ -357,6 +357,7 @@ fn decoder_lsq_init(
 fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>, p: usize) -> SaeManifoldTerm {
     let k = truth.k;
     let n = truth.n;
+    assert_eq!(z.ncols(), p, "ambient dim of z must match the caller's p");
     let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
     // Seed latent coordinates from the planted angles (slightly offset, per the
     // inline torus oracle, so coordinate recovery is not what is under test).
