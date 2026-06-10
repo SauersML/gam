@@ -3778,6 +3778,27 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             state.warm_cache = Some(eval.warm_start);
             Ok(eval.efs_eval)
         }),
+        // Seed-screening ranking proxy (#969). The cost closure above
+        // hard-errors on a non-converged inner solve — correct for
+        // line-search costs, but under the screening cap (wired into the
+        // outer options and installed by the cascade) the inner solve is
+        // truncated BY DESIGN, so screening through it rejects every seed
+        // — the all-seeds-rejected front-door genus. Screening only RANKS
+        // candidates: the truncated solve's penalized objective is the
+        // ranking signal; convergence is demanded of the selected seed's
+        // full-budget fit, not of capped probes.
+        |state: &mut MeanWiggleOuterState, theta: &Array1<f64>| {
+            if let Some((cached_theta, cached_cost, _, _, cached_warm)) = &state.last_eval
+                && cached_theta == theta
+            {
+                state.warm_cache = Some(cached_warm.clone());
+                return Ok(*cached_cost);
+            }
+            let (eval, _, _) = build_eval(theta, state.warm_cache.as_ref(), false)
+                .map_err(EstimationError::InvalidInput)?;
+            state.warm_cache = Some(eval.warm_start);
+            Ok(eval.objective)
+        },
     );
 
     let outer = problem
