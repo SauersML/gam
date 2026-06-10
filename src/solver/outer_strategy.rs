@@ -6732,11 +6732,26 @@ fn run_outer_with_plan(
                 // gradient or Hessian. config.tolerance is the step-length
                 // floor, config.max_iter is the requested poll budget.
                 let projected_seed = project_to_bounds(seed, Some(&bounds_template));
-                let seed_cost = obj.eval_cost(&projected_seed).map_err(|err| {
-                    EstimationError::RemlOptimizationFailed(format!(
-                        "aux direct-search seed cost failed ({context}): {err}"
-                    ))
-                })?;
+                let seed_cost = match obj.eval_cost(&projected_seed) {
+                    Ok(cost) => cost,
+                    Err(err) => {
+                        // A seed whose cost cannot even be evaluated — e.g. the SAE
+                        // pre-fit identifiability audit rejecting a seed whose
+                        // assignment has already starved an atom to a rank-0
+                        // weighted design — is a property of THIS seed, not a fatal
+                        // condition for the whole cascade. Demote it with a reason
+                        // and try the next seed rather than hard-rejecting the outer
+                        // run (mirrors the non-finite-cost demotion just below, and
+                        // honors the ContinuationPath "never reject" contract for the
+                        // aux direct-search seed path).
+                        rejection_reasons.push((
+                            seed_idx,
+                            "validation",
+                            format!("aux direct-search seed cost failed ({context}): {err}"),
+                        ));
+                        continue 'seed_attempts;
+                    }
+                };
                 if !seed_cost.is_finite() {
                     rejection_reasons.push((
                         seed_idx,
