@@ -608,6 +608,27 @@ impl StructureCertificate {
     }
 }
 
+/// Calibrate one (super)uniform p-value into a single e-value, in log
+/// space: `e(p) = ½ p^{−1/2}` (the κ = ½ member of the calibrator family
+/// `e_κ(p) = κ p^{κ−1}`; `∫₀¹ e_κ(p) dp = 1`, so `E_{H0}[e(P)] ≤ 1` for
+/// any valid p — superuniformity only, no other conditions).
+///
+/// This is the bridge from p-value-shaped instruments into the ledger —
+/// e.g. the feature-binding Wald test (`terms::anova_atom::carve`'s
+/// `edge_p_value` → a [`ClaimKind::BindingEdge`] entry). It spends
+/// calibration slack (a p of 0.01 becomes e = 5, not 100), which is the
+/// honest price of converting a fixed-sample test into anytime-valid
+/// currency; instruments that can produce e-values natively should.
+/// CONTRACT: one calibrated e-value per INDEPENDENT data batch — feeding
+/// repeated tests of the same accumulating data into one e-process is the
+/// p-hacking this module exists to kill.
+pub fn log_e_from_p_calibrator(p_value: f64) -> Result<f64, String> {
+    if !(p_value > 0.0) || p_value > 1.0 {
+        return Err(format!("p-value must be in (0, 1], got {p_value}"));
+    }
+    Ok(0.5f64.ln() - 0.5 * p_value.ln())
+}
+
 /// A candidate steering probe for resolving one contested structural
 /// claim: the intervention direction (in the steering primitive's
 /// coordinates), and the two hypotheses' PREDICTED output-mean responses
