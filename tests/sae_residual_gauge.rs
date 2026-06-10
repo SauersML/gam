@@ -225,6 +225,164 @@ fn under_claim_is_caught_data_pins_rotation_directly() {
 }
 
 #[test]
+fn equal_ard_axes_name_the_rotation_subgroup_of_exactly_the_right_dimension() {
+    // Planted ARD degeneracy (#981 verification §planted-degeneracies): the
+    // certificate must enumerate an equal-ARD rotation generator for EXACTLY
+    // the axis pairs whose ARD variances tie — no more (distinct-variance
+    // pairs must not appear) and no less (every tied pair must appear).
+    //
+    // One 3-latent-axis patch atom with a full-rank identity frame (p = 3) so
+    // every axis-pair rotation acts non-trivially on the fitted frame. No data
+    // rows and no isometry pin: the pinning span is empty, so every
+    // non-trivial generator must come back unpinned — the test isolates the
+    // ENUMERATED DIMENSION of the equal-ARD subgroup, which is the planted
+    // quantity.
+    let make = |ard: ndarray::Array1<f64>| FittedSaeManifold {
+        atoms: vec![FittedAtom {
+            name: "patch".to_string(),
+            topology: AtomTopology::EuclideanPatch { latent_dim: 3 },
+            frame: Array2::<f64>::eye(3),
+            ard_variances: Some(ard),
+        }],
+        jacobian_rows: Vec::new(),
+        isometry_penalty_root: Array2::<f64>::zeros((0, 9)),
+        metric: euclidean_metric(1, 3),
+    };
+
+    // ARD = (4, 4, 9): exactly ONE tied pair (0,1) ⇒ the prior-unpinned
+    // rotation subgroup is the so(2) in the (0,1)-plane, dimension 1.
+    let report_pair = residual_gauge(&make(ndarray::array![4.0, 4.0, 9.0])).expect("certificate");
+    let ard_gens: Vec<_> = report_pair
+        .generators
+        .iter()
+        .filter(|g| g.family == GeneratorFamily::EqualArdRotation)
+        .collect();
+    assert_eq!(
+        ard_gens.len(),
+        1,
+        "ARD (4,4,9) ties exactly one axis pair; the certificate must \
+         enumerate exactly one equal-ARD rotation generator, got {}. {}",
+        ard_gens.len(),
+        report_pair.summary
+    );
+    assert!(
+        ard_gens[0].description.contains("(0,1)"),
+        "the tied pair is (0,1), got: {}",
+        ard_gens[0].description
+    );
+    assert!(
+        ard_gens[0].unpinned && ard_gens[0].generator_norm > 0.0,
+        "with an empty pinning span the tied-pair rotation must be a \
+         non-trivial residual freedom. {}",
+        report_pair.summary
+    );
+
+    // ARD = (4, 4, 4): all three pairs tie ⇒ the full so(3), dimension 3.
+    let report_full = residual_gauge(&make(ndarray::array![4.0, 4.0, 4.0])).expect("certificate");
+    let full_unpinned = report_full
+        .generators
+        .iter()
+        .filter(|g| g.family == GeneratorFamily::EqualArdRotation && g.unpinned)
+        .count();
+    assert_eq!(
+        full_unpinned, 3,
+        "ARD (4,4,4) ties every axis pair; the equal-ARD subgroup is the \
+         full so(3) of dimension 3, got {full_unpinned}. {}",
+        report_full.summary
+    );
+}
+
+#[test]
+fn exchangeable_atom_pair_yields_the_permutation_factor() {
+    // Constructed exchangeable atom pair (#981 verification
+    // §planted-degeneracies): two topology-identical atoms the data cannot
+    // tell apart must surface the `Sym(F)` permutation factor in the certified
+    // group; data that DOES distinguish them must pin it away.
+    //
+    // Two 1-latent-axis patch atoms (p = 1, param_dim = 2) with distinct
+    // frames so the atom-exchange swap tangent ξ_swap = [f_b − f_a, f_a − f_b]
+    // = [1, −1] is non-trivial. With latent_dim = 1 and p = 1 there are no
+    // so(d) isometry generators and no output-frame rotations, so the swap is
+    // the ONLY generator and the verdict is fully isolated.
+    let make_atoms = || {
+        let mut frame_a = Array2::<f64>::zeros((1, 1));
+        frame_a[[0, 0]] = 1.0;
+        let mut frame_b = Array2::<f64>::zeros((1, 1));
+        frame_b[[0, 0]] = 2.0;
+        vec![
+            FittedAtom {
+                name: "a".to_string(),
+                topology: AtomTopology::EuclideanPatch { latent_dim: 1 },
+                frame: frame_a,
+                ard_variances: None,
+            },
+            FittedAtom {
+                name: "b".to_string(),
+                topology: AtomTopology::EuclideanPatch { latent_dim: 1 },
+                frame: frame_b,
+                ard_variances: None,
+            },
+        ]
+    };
+
+    // Case 1: the data only measures the SUM of the two atoms' contributions
+    // (Jacobian row [1, 1]) — behaviorally exchangeable. The swap direction
+    // [1, −1] is orthogonal to the pinning span, so the permutation factor
+    // must be certified as a residual freedom and named in the group.
+    let exchangeable = FittedSaeManifold {
+        atoms: make_atoms(),
+        jacobian_rows: vec![vec![1.0, 1.0]],
+        isometry_penalty_root: Array2::<f64>::zeros((0, 2)),
+        metric: euclidean_metric(1, 1),
+    };
+    let report = residual_gauge(&exchangeable).expect("certificate");
+    let perm = report
+        .generators
+        .iter()
+        .find(|g| g.family == GeneratorFamily::AtomPermutation)
+        .expect("an atom-permutation generator must be enumerated");
+    assert!(
+        perm.unpinned && perm.generator_norm > 0.0,
+        "data invariant to the atom exchange must leave the permutation \
+         factor as a residual freedom. {}",
+        report.summary
+    );
+    assert!(
+        report
+            .group_signature()
+            .contains("Sym(F) atom permutation×1"),
+        "the certified group must name the permutation factor, got: {}",
+        report.group_signature()
+    );
+    assert_eq!(report.residual_gauge_dim, 1, "{}", report.summary);
+
+    // Case 2: one extra data row along the swap direction [1, −1] — the data
+    // now distinguishes the atoms, so the permutation factor must be pinned.
+    let distinguished = FittedSaeManifold {
+        atoms: make_atoms(),
+        jacobian_rows: vec![vec![1.0, 1.0], vec![1.0, -1.0]],
+        isometry_penalty_root: Array2::<f64>::zeros((0, 2)),
+        metric: euclidean_metric(2, 1),
+    };
+    let report_pinned = residual_gauge(&distinguished).expect("certificate");
+    let perm_pinned = report_pinned
+        .generators
+        .iter()
+        .find(|g| g.family == GeneratorFamily::AtomPermutation)
+        .expect("atom-permutation generator");
+    assert!(
+        !perm_pinned.unpinned,
+        "data that separates the atoms must pin the permutation factor. {}",
+        report_pinned.summary
+    );
+    assert_eq!(
+        report_pinned.residual_gauge_dim, 0,
+        "{}",
+        report_pinned.summary
+    );
+}
+
+#[test]
 fn sym_f_triviality_checked_only_under_output_fisher() {
     // Build a two-atom, topology-identical model under an OutputFisher metric.
     // The Sym(F) atom-permutation generator must be PINNED (output-Fisher
