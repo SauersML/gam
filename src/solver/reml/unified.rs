@@ -19606,7 +19606,14 @@ mod tests {
     /// `bernoulli_contracted_psi_second_order_matches_per_pair_contraction`).
     #[test]
     fn operator_hessian_with_contracted_psi_hook_matches_per_pair_dense() {
-        let h = array![[1.0e-7, 0.0], [0.0, 2.7]];
+        // WELL-CONDITIONED inner Hessian: both eigenvalues are O(1). A
+        // near-singular H (e.g. a 1e-7 diagonal entry, as the sibling
+        // spectral-regularization test deliberately uses) sends H⁻¹ ~1e7 and the
+        // logdet-Hessian / IFT-correction terms to ~1e26, which drowns the O(1)
+        // base_h2 ψψ contribution and makes the no-double-count guard see it as
+        // ~0. With a sane H both ddot_H_ij terms are comparable, so the guard and
+        // the equivalence both exercise a live base_h2 ψψ.
+        let h = array![[1.3, 0.2], [0.2, 2.1]];
         let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
         let beta = array![0.4, -0.7];
         let penalty_root = array![[1.2, 0.1], [0.0, 0.8]];
@@ -19617,10 +19624,13 @@ mod tests {
 
         // The constant ψψ pair the per-pair `ext_coord_pair_fn` returns; the hook
         // must reproduce its `α`-contraction exactly (ext_dim = 1, so the only
-        // ψψ pair is (0, 0)).
+        // ψψ pair is (0, 0)). `psi_pair_b` (the ψψ second drift = base_h2 source)
+        // is sized O(1) so its trace is a meaningful fraction of the total ψ-row
+        // diagonal once H is well-conditioned — the no-double-count guard then
+        // sees a genuinely live base_h2 ψψ.
         let psi_pair_a = 0.09_f64;
         let psi_pair_g = array![0.16_f64, -0.12];
-        let psi_pair_b = array![[0.08_f64, 0.03], [0.03, -0.04]];
+        let psi_pair_b = array![[0.85_f64, 0.30], [0.30, 0.62]];
         let psi_pair_ld_s = -0.05_f64;
 
         // Build the solution twice from a shared closure so the per-pair fixture
