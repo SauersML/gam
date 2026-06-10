@@ -3723,7 +3723,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         })
     };
 
-    let mut obj = problem.build_objective_with_eval_order(
+    let mut obj = problem.build_objective_with_screening_proxy(
         MeanWiggleOuterState {
             warm_cache: None,
             last_eval: None,

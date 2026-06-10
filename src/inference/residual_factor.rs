@@ -805,4 +805,147 @@ mod tests {
             "evidence ladder must prefer the planted rank 1; breakdown:\n{report}"
         );
     }
+
+    /// Orthonormalize the columns of `m` (modified Gram–Schmidt), dropping
+    /// numerically-null columns. Test-side helper for subspace comparisons.
+    fn orthonormal_columns(m: ArrayView2<'_, f64>) -> Vec<Array1<f64>> {
+        let mut basis: Vec<Array1<f64>> = Vec::new();
+        for k in 0..m.ncols() {
+            let mut v = m.column(k).to_owned();
+            for q in &basis {
+                let c = v.dot(q);
+                v = &v - &(q * c);
+            }
+            let norm = v.dot(&v).sqrt();
+            if norm > 1e-10 {
+                basis.push(v / norm);
+            }
+        }
+        basis
+    }
+
+    /// Squared norm of the projection of unit vector `v` onto span(basis) —
+    /// `cos²` of the principal angle between `v` and the subspace.
+    fn projection_energy(v: &Array1<f64>, basis: &[Array1<f64>]) -> f64 {
+        basis.iter().map(|q| v.dot(q).powi(2)).sum()
+    }
+
+    /// #974 verification arm (a): the fitted factor must recover the PLANTED
+    /// interference subspace. Two orthogonal planted directions with distinct
+    /// strengths; the principal angles between each planted direction and
+    /// range(Λ̂) must be small, and the evidence ladder must select rank 2.
+    #[test]
+    fn factor_recovers_planted_interference_subspace() {
+        let n = 6000usize;
+        let p = 6usize;
+        // Two orthogonal planted unit directions.
+        let raw1 = ndarray::array![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let raw2 = ndarray::array![1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+        let v1 = &raw1 / raw1.dot(&raw1).sqrt();
+        let v2 = &raw2 / raw2.dot(&raw2).sqrt();
+        let (amp1, amp2) = (1.4_f64, 0.9_f64);
+        let sigma_eps = 0.15_f64;
+
+        let mut seed = 0x9E3779B97F4A7C15_u64;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let activity = Array1::<f64>::zeros(n); // constant ⇒ homoscedastic law
+        for row in 0..n {
+            let f1 = amp1 * lcg_normal(&mut seed);
+            let f2 = amp2 * lcg_normal(&mut seed);
+            for i in 0..p {
+                residuals[[row, i]] =
+                    f1 * v1[i] + f2 * v2[i] + sigma_eps * lcg_normal(&mut seed);
+            }
+        }
+
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+            max_factor_rank: 4,
+        })
+        .expect("fit");
+
+        assert_eq!(
+            model.factor_rank(),
+            2,
+            "ladder must select the planted rank 2 (got {}, evidence {:.3})",
+            model.factor_rank(),
+            model.log_evidence()
+        );
+        let basis = orthonormal_columns(model.factor());
+        assert_eq!(basis.len(), 2, "fitted factor must span 2 directions");
+        let e1 = projection_energy(&v1, &basis);
+        let e2 = projection_energy(&v2, &basis);
+        // cos² of each principal angle ≥ 0.95 ⇒ angle ≤ ~13°.
+        assert!(
+            e1 > 0.95 && e2 > 0.95,
+            "planted directions must lie in range(Λ̂): cos² = ({e1:.4}, {e2:.4})"
+        );
+    }
+
+    /// #974 verification arm (d): recovery of the planted activity-variance
+    /// law. Single planted factor with per-row energy `exp(slope·z)`; the
+    /// fitted `c(z_n)` must reproduce the law's shape — strongly correlated
+    /// with the planted log-scale and with the right dynamic range.
+    #[test]
+    fn fitted_scale_recovers_planted_activity_law() {
+        let n = 6000usize;
+        let p = 4usize;
+        let lambda0 = ndarray::array![1.5, 1.2, -0.4, 0.3];
+        let sigma_eps = 0.2_f64;
+        let slope = 1.3_f64;
+        let mut seed = 0xD1B54A32D192ED03_u64;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let mut activity = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let z = (row as f64) / (n as f64 - 1.0);
+            activity[row] = z;
+            let amp = (slope * z).exp().sqrt();
+            let f = lcg_normal(&mut seed);
+            for i in 0..p {
+                residuals[[row, i]] = amp * lambda0[i] * f + sigma_eps * lcg_normal(&mut seed);
+            }
+        }
+
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+            max_factor_rank: 2,
+        })
+        .expect("fit");
+        assert_eq!(model.factor_rank(), 1, "planted rank is 1");
+
+        // Pearson correlation between fitted log c(z_n) and the planted
+        // log-law slope·z (mean-1 normalization cancels in the correlation).
+        let fitted_log: Vec<f64> = model.row_scale().iter().map(|c| c.ln()).collect();
+        let planted_log: Vec<f64> = activity.iter().map(|z| slope * z).collect();
+        let mean_f = fitted_log.iter().sum::<f64>() / n as f64;
+        let mean_p = planted_log.iter().sum::<f64>() / n as f64;
+        let mut cov = 0.0_f64;
+        let mut var_f = 0.0_f64;
+        let mut var_p = 0.0_f64;
+        for i in 0..n {
+            let df = fitted_log[i] - mean_f;
+            let dp = planted_log[i] - mean_p;
+            cov += df * dp;
+            var_f += df * df;
+            var_p += dp * dp;
+        }
+        let corr = cov / (var_f.sqrt() * var_p.sqrt());
+        assert!(
+            corr > 0.9,
+            "fitted activity law must track the planted exp({slope}·z): corr = {corr:.4}"
+        );
+
+        // Dynamic range: planted c(top)/c(bottom) over the inner bin centers
+        // is exp(slope·7/8) ≈ 3.1; the binned/smoothed estimate must land in
+        // a generous bracket around it (smoothing shrinks the edges).
+        let lo = model.row_scale()[n / 16]; // first-bin interior
+        let hi = model.row_scale()[n - 1 - n / 16]; // last-bin interior
+        let ratio = hi / lo;
+        assert!(
+            ratio > 1.8 && ratio < 5.5,
+            "fitted dynamic range {ratio:.3} must bracket the planted ≈3.1"
+        );
+    }
 }
