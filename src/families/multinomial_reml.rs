@@ -71,7 +71,7 @@ use crate::families::vector_response::{
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::dense_block_xtwx;
 use ndarray::{Array1, Array2, Array3, ArrayView2};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Joint-coupled multinomial-logit family with shared design and shared
 /// smoothing penalty across active classes.
@@ -129,6 +129,69 @@ pub struct MultinomialFamily {
     /// Cached likelihood evaluator. Constructed once with the same row
     /// weights as `weights` and reused across every `evaluate` call.
     likelihood: MultinomialLogitLikelihood,
+    /// Memo for the FULL set of canonical-axis joint-Hessian directional
+    /// derivatives `{ Hdot[e_k] }_{k=0..(K-1)·P}` at one frozen `β`.
+    ///
+    /// The Tier-B Jeffreys/Firth term (`joint_jeffreys_term`) drives the inner
+    /// loop `for k in 0..p { hessian_dir(e_k) }`, calling
+    /// [`Self::exact_newton_joint_hessian_directional_derivative`] once PER
+    /// canonical axis at the SAME `block_states`. Each call independently
+    /// recomputed the full `(N,K)` softmax and re-formed a generic
+    /// `dense_block_xtwx` Gram — `O(p)` redundant softmax passes per term, and
+    /// the term itself is rebuilt at every accepted inner-Newton β and every
+    /// outer LAML eval (#715/#722/#753: the multinomial Firth grind). This memo
+    /// assembles the WHOLE axis set in one softmax pass the first time an axis
+    /// is requested at a given β, then serves every subsequent axis (the rest of
+    /// that Jeffreys loop) from the cache. Keyed on an η fingerprint so a moved
+    /// β recomputes; a single-slot cache suffices because the Jeffreys loop
+    /// requests all `p` axes consecutively before β changes.
+    ///
+    /// `Arc<Mutex<…>>` (interior mutability) because the family is shared
+    /// `&self` and `Clone`; the per-axis derivative is a pure function of the
+    /// frozen `β`, so a stale clone simply recomputes — never returns a wrong
+    /// value. Cheap clones share the slot.
+    axis_derivative_cache: Arc<Mutex<Option<AxisDerivativeCache>>>,
+}
+
+/// One frozen-`β` snapshot of every canonical-axis joint-Hessian directional
+/// derivative, shared across the `p` sequential per-axis requests the Tier-B
+/// Jeffreys loop makes at that `β` (see [`MultinomialFamily::axis_derivative_cache`]).
+#[derive(Clone, Debug)]
+struct AxisDerivativeCache {
+    /// Fingerprint of the stacked per-class `η` the derivatives were built at.
+    eta_key: EtaFingerprint,
+    /// `Hdot[e_k]` for every canonical axis `k = a·P + i`, laid out in the same
+    /// output-major flat order as the joint Hessian.
+    derivatives: Vec<Array2<f64>>,
+}
+
+/// Cheap, exact fingerprint of a stacked `(N, M)` η matrix: its raw `f64` bit
+/// patterns hashed. Two identical `β` snapshots produce identical η bit-for-bit
+/// (the Jeffreys loop never perturbs β between axis requests), so this keys the
+/// single-slot axis-derivative memo without storing the whole η.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EtaFingerprint {
+    rows: usize,
+    cols: usize,
+    hash: u64,
+}
+
+impl EtaFingerprint {
+    fn of(eta: ArrayView2<'_, f64>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let (rows, cols) = eta.dim();
+        rows.hash(&mut hasher);
+        cols.hash(&mut hasher);
+        for &v in eta.iter() {
+            v.to_bits().hash(&mut hasher);
+        }
+        EtaFingerprint {
+            rows,
+            cols,
+            hash: hasher.finish(),
+        }
+    }
 }
 
 impl MultinomialFamily {
@@ -227,6 +290,7 @@ impl MultinomialFamily {
             penalties,
             penalty_nullspace_dims,
             likelihood,
+            axis_derivative_cache: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -803,6 +867,210 @@ impl MultinomialFamily {
         }
         Ok(out)
     }
+
+    /// Assemble the FULL set of canonical-axis joint-Hessian directional
+    /// derivatives `{ Hdot[e_k] }` for every axis `k = a0·P + i0`, in a SINGLE
+    /// shared softmax pass and one fused parallel row sweep — the exact value
+    /// the Tier-B Jeffreys loop needs (it calls
+    /// [`Self::exact_newton_joint_hessian_directional_derivative`] once per
+    /// canonical axis at the SAME `β`).
+    ///
+    /// EXACTNESS. For the canonical axis `e_{(a0,i0)}` the design-projected
+    /// η-direction is `d_η[row, b] = X[row, i0]·δ_{b,a0}` (only class `a0`'s
+    /// channel moves, by `X[row, i0]`). Substituting into
+    /// [`Self::directional_fisher_jet`] the per-row scalar collapses to
+    /// `s = p_{a0}·X[row, i0]` and `∂p_c/∂t = p_c·X[row, i0]·(δ_{c,a0} − p_{a0})`,
+    /// so the directional Fisher jet for this axis is `X[row, i0]·Ĵ_{a0}[row]`
+    /// with `Ĵ_{a0}` the `M×M` per-row jet built from `dp̂_c = p_c (δ_{c,a0} −
+    /// p_{a0})` (the `X[row, i0]` factor pulled out). Contracting through
+    /// [`dense_block_xtwx`]'s `Σ_row J[c,d] X[row,i] X[row,j]` then gives
+    ///
+    /// ```text
+    ///   Hdot[e_{(a0,i0)}][(c,i),(d,j)] = Σ_row Ĵ_{a0}[row,c,d] · X[row,i0] X[row,i] X[row,j].
+    /// ```
+    ///
+    /// This is BIT-FAITHFUL to the per-axis `directional_fisher_jet` →
+    /// `dense_block_xtwx` path it replaces up to the associativity of the row
+    /// sum, computed once for all `p` axes instead of `p` times with `p`
+    /// redundant softmax passes and `p` generic `(M·P)²` Gram allocations
+    /// (#715/#722/#753 Firth grind). The row sweep is fanned across the rayon
+    /// pool with per-thread accumulators reduced by addition, mirroring
+    /// `dense_block_xtwx`.
+    fn assemble_all_axis_directional_derivatives(
+        &self,
+        eta: ArrayView2<'_, f64>,
+    ) -> Vec<Array2<f64>> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let dim = m * p;
+        let n_axes = m * p;
+        let probs_full = self.row_probabilities(eta);
+        let design = self.design.view();
+        // Per-thread accumulator: one dense `(dim, dim)` buffer per axis, stored
+        // as a flat `n_axes · dim · dim` block so the inner scatter writes are
+        // contiguous and the parallel reduce is a single elementwise add.
+        let mut flat = (0..n)
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; n_axes * dim * dim],
+                |mut acc, row| {
+                    let w = self.weights[row];
+                    if w == 0.0 {
+                        return acc;
+                    }
+                    // dp̂_c = p_c (δ_{c,a0} − p_{a0}) for the active axis class a0,
+                    // computed per a0 below. The per-axis directional jet is then
+                    // `X[row,i0] · Ĵ_{a0}` (Ĵ shared across all i0 for that a0).
+                    for a0 in 0..m {
+                        let pa0 = probs_full[[row, a0]];
+                        // Ĵ_{a0}[c,d] (the X[row,i0]-free per-row jet) using the
+                        // SAME closed form as `directional_fisher_jet`:
+                        //   dp̂_c = p_c (δ_{c,a0} − p_{a0}),
+                        //   Ĵ[c,c] = w (dp̂_c − 2 dp̂_c p_c),
+                        //   Ĵ[c,d] = −w (dp̂_c p_d + p_c dp̂_d)   (c ≠ d).
+                        // Symmetric in (c,d), so store the full M×M.
+                        let mut jhat = vec![0.0_f64; m * m];
+                        for c in 0..m {
+                            let pc = probs_full[[row, c]];
+                            let dpc = pc * (if c == a0 { 1.0 } else { 0.0 } - pa0);
+                            jhat[c * m + c] = w * (dpc - 2.0 * dpc * pc);
+                            for d in (c + 1)..m {
+                                let pd = probs_full[[row, d]];
+                                let dpd = pd * (if d == a0 { 1.0 } else { 0.0 } - pa0);
+                                let off = w * (-(dpc * pd + pc * dpd));
+                                jhat[c * m + d] = off;
+                                jhat[d * m + c] = off;
+                            }
+                        }
+                        // Scatter `X[row,i0] · Ĵ_{a0}[c,d] · X[row,i] X[row,j]`
+                        // into axis `(a0,i0)`'s `(dim,dim)` buffer. The block
+                        // `(c,d)` lives at rows `c·P .. c·P+P`, cols `d·P .. d·P+P`
+                        // — the output-major layout `dense_block_xtwx` produces.
+                        for i0 in 0..p {
+                            let xi0 = design[[row, i0]];
+                            if xi0 == 0.0 {
+                                continue;
+                            }
+                            let axis = a0 * p + i0;
+                            let axis_base = axis * dim * dim;
+                            for c in 0..m {
+                                let row_c = c * p;
+                                for d in 0..m {
+                                    let jcd = jhat[c * m + d];
+                                    if jcd == 0.0 {
+                                        continue;
+                                    }
+                                    let wcd = xi0 * jcd;
+                                    let col_d = d * p;
+                                    for i in 0..p {
+                                        let xi = design[[row, i]];
+                                        if xi == 0.0 {
+                                            continue;
+                                        }
+                                        let scaled = wcd * xi;
+                                        let out_row = axis_base + (row_c + i) * dim;
+                                        for j in 0..p {
+                                            acc[out_row + col_d + j] +=
+                                                scaled * design[[row, j]];
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0_f64; n_axes * dim * dim],
+                |mut a, b| {
+                    for (av, bv) in a.iter_mut().zip(b.iter()) {
+                        *av += *bv;
+                    }
+                    a
+                },
+            );
+        // Slice the flat buffer into per-axis `(dim, dim)` matrices, symmetrising
+        // each to cancel accumulator drift (matching `dense_block_xtwx`'s final
+        // pass so the result is identical to the per-axis route).
+        let mut out = Vec::with_capacity(n_axes);
+        for axis in 0..n_axes {
+            let start = axis * dim * dim;
+            let mut mat =
+                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
+                    .expect("axis derivative buffer is dim·dim");
+            for i in 0..dim {
+                for j in (i + 1)..dim {
+                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                    mat[[i, j]] = avg;
+                    mat[[j, i]] = avg;
+                }
+            }
+            out.push(mat);
+        }
+        // Release the large flat buffer promptly.
+        flat.clear();
+        flat.shrink_to_fit();
+        out
+    }
+
+    /// Index of the single canonical axis `k` if `d_beta_flat` is the unit
+    /// vector `e_k` (the Tier-B Jeffreys loop's request shape), else `None`.
+    fn canonical_axis_index(&self, d_beta_flat: &Array1<f64>) -> Option<usize> {
+        let mut axis: Option<usize> = None;
+        for (k, &v) in d_beta_flat.iter().enumerate() {
+            if v == 0.0 {
+                continue;
+            }
+            if v != 1.0 || axis.is_some() {
+                return None;
+            }
+            axis = Some(k);
+        }
+        axis
+    }
+
+    /// Joint-Hessian directional derivative along a single canonical axis `e_k`,
+    /// served from the shared per-`β` memo. The first axis requested at a fresh
+    /// `β` assembles the WHOLE set in one softmax pass
+    /// ([`Self::assemble_all_axis_directional_derivatives`]); every subsequent
+    /// axis of that Jeffreys loop is a cache read — turning the term's `O(p)`
+    /// redundant softmax/Gram rebuilds into a single shared pass (#715/#722).
+    fn cached_axis_directional_derivative(
+        &self,
+        eta: ArrayView2<'_, f64>,
+        axis: usize,
+    ) -> Array2<f64> {
+        let key = EtaFingerprint::of(eta);
+        {
+            let guard = self
+                .axis_derivative_cache
+                .lock()
+                .expect("axis derivative cache mutex poisoned");
+            if let Some(cache) = guard.as_ref()
+                && cache.eta_key == key
+            {
+                return cache.derivatives[axis].clone();
+            }
+        }
+        // Cache miss (fresh β): assemble the full axis set ONCE, store it, return
+        // the requested axis. Assembly happens outside the lock so concurrent
+        // requesters at the same β never block on each other's full sweep — a
+        // redundant assemble is wasteful but never wrong (pure function of β).
+        let derivatives = self.assemble_all_axis_directional_derivatives(eta);
+        let result = derivatives[axis].clone();
+        let mut guard = self
+            .axis_derivative_cache
+            .lock()
+            .expect("axis derivative cache mutex poisoned");
+        *guard = Some(AxisDerivativeCache {
+            eta_key: key,
+            derivatives,
+        });
+        result
+    }
 }
 
 impl CustomFamily for MultinomialFamily {
@@ -939,6 +1207,24 @@ impl CustomFamily for MultinomialFamily {
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         let eta = self.collect_eta_matrix(block_states)?;
+        if d_beta_flat.len() != self.beta_flat_dim() {
+            return Err(format!(
+                "MultinomialFamily direction length {} != (K-1)·P = {}",
+                d_beta_flat.len(),
+                self.beta_flat_dim()
+            ));
+        }
+        // FAST PATH (the Tier-B Jeffreys/Firth loop): the term requests every
+        // canonical axis `e_k` at the same β. Serve from the shared per-β memo so
+        // the full set is assembled in ONE softmax pass and each axis is a cache
+        // read, instead of `p` independent softmax + `dense_block_xtwx` rebuilds
+        // (#715/#722/#753). The cached value is bit-faithful to the generic path
+        // up to row-sum associativity.
+        if let Some(axis) = self.canonical_axis_index(d_beta_flat) {
+            return Ok(Some(self.cached_axis_directional_derivative(eta.view(), axis)));
+        }
+        // General direction (e.g. the outer mode-response drift `Hdot[δ]`): the
+        // exact per-direction jet → dense contraction.
         let dh_fisher = self.directional_fisher_jet(eta.view(), d_beta_flat)?;
         let dh = dense_block_xtwx(self.design.view(), dh_fisher.view(), None)
             .map_err(|e| format!("MultinomialFamily directional H assembly: {e}"))?;
