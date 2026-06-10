@@ -37,7 +37,7 @@
 //! Determinism: every random choice is seeded by an explicit index seed; no
 //! clock, no global RNG.
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use std::collections::{HashMap, HashSet};
