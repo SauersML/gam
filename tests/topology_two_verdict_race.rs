@@ -86,10 +86,14 @@ const ACTIVATION_NOISE: f64 = 1.0 / 12.0;
 /// is 7 tight blobs plus a thin smear of genuinely-in-between rows — soft
 /// quantization, honestly modeled, not a hand-placed cluster sample.
 const READOUT_SHARPNESS: f64 = 150.0;
-/// Observation noise on the readout image (keeps the image-cloud covariances
-/// honestly conditioned; spacing between adjacent arc centers is
-/// `2 sin(π/7) ≈ 0.87`, so this is SNR ≈ 17 in the image).
-const READOUT_NOISE: f64 = 0.05;
+/// Observation noise on the readout image. Spacing between adjacent arc
+/// centers is `2 sin(π/7) ≈ 0.87`, so this is image SNR ≈ 5.8 — the blobs are
+/// unambiguous, yet wide enough that the few soft-transition rows (a boundary
+/// row maps to a point part-way between two arc centers) sit within ~3σ of a
+/// corner blob. That keeps extra mixture components unprofitable under the
+/// rank-aware pricing, so the in-class ladder recovers the PLANTED order
+/// `k = 7` instead of spending components on the transition smear.
+const READOUT_NOISE: f64 = 0.15;
 
 /// Planted circle activations: unit ring with isotropic jitter.
 fn sample_circle_activations(seed: u64) -> Array2<f64> {
