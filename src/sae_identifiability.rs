@@ -1161,6 +1161,17 @@ fn frame_rotation_generators(model: &FittedSaeManifold) -> Vec<(Array1<f64>, Str
 /// antisymmetric "swap" tangent `(frame_b − frame_a)` placed on atom a's slot and
 /// `(frame_a − frame_b)` on atom b's slot — the first-order direction of the
 /// one-parameter family interpolating the swap.
+/// Embed an atom-local generator (length = that atom's flattened frame length)
+/// into the joint parameter vector at the atom's column offset. The per-atom
+/// generator builders do not know the joint layout; the certificate does, and
+/// mixing the two coordinate systems is a shape error for every model with more
+/// than one atom.
+fn embed_local_generator(offset: usize, local: &Array1<f64>, param_dim: usize) -> Array1<f64> {
+    let mut g = Array1::<f64>::zeros(param_dim);
+    g.slice_mut(s![offset..offset + local.len()]).assign(local);
+    g
+}
+
 fn atom_permutation_generators(model: &FittedSaeManifold) -> Vec<(Array1<f64>, String)> {
     let mut out: Vec<(Array1<f64>, String)> = Vec::new();
     let param_dim = model.param_dim();
@@ -1335,14 +1346,28 @@ pub fn residual_gauge(model: &FittedSaeManifold) -> Result<ResidualGaugeReport, 
     let metric_provenance = model.metric.provenance();
     let param_dim = model.param_dim();
 
-    // 1. Enumerate generators, tagged by family.
+    // 1. Enumerate generators, tagged by family. The per-atom builders speak
+    // the atom's LOCAL flattened-frame coordinates (length `frame.len()`); the
+    // certificate's rank arithmetic runs in the joint parameter vector, so each
+    // local generator is embedded at its atom's offset here. (Single-atom
+    // models have local == joint, which is why only multi-atom models can
+    // expose a missed embedding.)
     let mut gens: Vec<(GeneratorFamily, Array1<f64>, String)> = Vec::new();
-    for atom in &model.atoms {
+    for (k, atom) in model.atoms.iter().enumerate() {
+        let base = model.atom_offset(k);
         for (g, desc) in atom_isometry_generators(atom) {
-            gens.push((GeneratorFamily::IsomAtom, g, desc));
+            gens.push((
+                GeneratorFamily::IsomAtom,
+                embed_local_generator(base, &g, param_dim),
+                desc,
+            ));
         }
         for (g, desc) in equal_ard_rotation_generators(atom) {
-            gens.push((GeneratorFamily::EqualArdRotation, g, desc));
+            gens.push((
+                GeneratorFamily::EqualArdRotation,
+                embed_local_generator(base, &g, param_dim),
+                desc,
+            ));
         }
     }
     for (g, desc) in frame_rotation_generators(model) {
