@@ -22,6 +22,7 @@ pub mod row_measure;
 pub mod seeding;
 pub mod sindy;
 pub(crate) mod startup_stats;
+pub mod streaming_border;
 pub mod topology_formula;
 pub mod topology_selector;
 pub mod visualizer;
