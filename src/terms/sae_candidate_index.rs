@@ -53,6 +53,34 @@ const SKETCH_PROJECTION_SALT: u64 = 0xC2B2_AE3D_27D4_EB4F;
 /// Numerical floor below which a direction / column is treated as zero.
 const DIRECTION_NORM_FLOOR: f64 = 1e-12;
 
+/// Lower bound of the auto-derived per-row candidate budget `C` (#985). Below
+/// this the proposal set is too small for the solver's accepted active set to
+/// have headroom over the planted/active atom count.
+pub const CANDIDATE_BUDGET_MIN: usize = 32;
+
+/// Upper bound of the auto-derived per-row candidate budget `C` (#985). The
+/// per-row local block stays a small dense solve no matter how large the
+/// dictionary grows; beyond this the proposal step stops being the bottleneck
+/// reduction it exists to be.
+pub const CANDIDATE_BUDGET_MAX: usize = 128;
+
+/// Auto-derive the per-row candidate budget `C` from the dictionary size `K`
+/// (#985): `C = 8·⌈log₂ K⌉`, clamped to
+/// [[`CANDIDATE_BUDGET_MIN`], [`CANDIDATE_BUDGET_MAX`]]. Logarithmic growth
+/// keeps the per-row local block effectively constant-size while giving larger
+/// dictionaries a little more recall headroom; the clamp realizes the issue's
+/// `C ≈ 32–128` band. Magic-by-default: derived from `K` alone, no flag.
+///
+/// Concretely: `K = 64 → 48`, `K = 1024 → 80`, `K = 10⁵ → 128`.
+pub fn auto_candidate_budget(num_atoms: usize) -> usize {
+    let log2 = if num_atoms <= 1 {
+        1
+    } else {
+        (usize::BITS - (num_atoms - 1).leading_zeros()) as usize
+    };
+    (8 * log2).clamp(CANDIDATE_BUDGET_MIN, CANDIDATE_BUDGET_MAX)
+}
+
 // ---------------------------------------------------------------------------
 // Sketch interface
 // ---------------------------------------------------------------------------
@@ -927,6 +955,137 @@ mod tests {
             report.total_planted - recovered,
             report.misses.len(),
             "miss list must account for every unrecovered planted atom"
+        );
+    }
+
+    #[test]
+    fn auto_candidate_budget_tracks_the_issue_band() {
+        assert_eq!(auto_candidate_budget(2), CANDIDATE_BUDGET_MIN);
+        assert_eq!(auto_candidate_budget(64), 48);
+        assert_eq!(auto_candidate_budget(1024), 80);
+        assert_eq!(auto_candidate_budget(100_000), CANDIDATE_BUDGET_MAX);
+        // Monotone non-decreasing in K and always inside the band.
+        let mut prev = 0usize;
+        for k in [2usize, 16, 64, 256, 1024, 4096, 65_536, 1_000_000] {
+            let c = auto_candidate_budget(k);
+            assert!(c >= prev, "budget must be monotone in K");
+            assert!((CANDIDATE_BUDGET_MIN..=CANDIDATE_BUDGET_MAX).contains(&c));
+            prev = c;
+        }
+    }
+
+    /// Build a planted row set for a dictionary: each row's residual direction
+    /// is dominated by one chosen atom (plus cross-talk from a second), and
+    /// the planted-active set is the dominant atom.
+    fn planted_rows(
+        dirs: &[Array1<f64>],
+        n_rows: usize,
+        seed: u64,
+    ) -> Vec<(Array1<f64>, Vec<usize>)> {
+        let k = dirs.len();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut rows = Vec::with_capacity(n_rows);
+        for _ in 0..n_rows {
+            let primary = rng.random_range(0..k);
+            let secondary = rng.random_range(0..k);
+            let mut d = dirs[primary].clone();
+            for (di, &si) in d.iter_mut().zip(dirs[secondary].iter()) {
+                *di += 0.15 * si;
+            }
+            let n = vec_norm(d.view());
+            for di in d.iter_mut() {
+                *di /= n;
+            }
+            rows.push((d, vec![primary]));
+        }
+        rows
+    }
+
+    #[test]
+    fn k_ladder_recall_determinism_and_sublinearity() {
+        // #985 part 2 (index tier): the K=2-era assumptions say nothing about
+        // frontier K, so gate the proposal machinery on a planted ladder at
+        // K = 64 and K = 1024 with the SAME battery per rung — recall above a
+        // stated floor at the auto-derived budget, every miss accounted for,
+        // and byte-identical proposals across two independent builds. The
+        // gather must also become *relatively* sparser as K grows (the
+        // sublinearity witness): what is allowed to touch half the dictionary
+        // at K = 64 must not at K = 1024.
+        let p = 48usize;
+        let n_rows = 150usize;
+        let mut ladder_ratios = Vec::new();
+        for &k in &[64usize, 1024] {
+            let (blocks, dirs) = synthetic_dictionary(k, p, 9000 + k as u64);
+            let sketch_dim = 24usize;
+            let sketch_seed = 71 + k as u64;
+            let sketch =
+                RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, sketch_seed)
+                    .unwrap();
+            let cfg = IndexConfig::auto(sketch_dim, k, sketch_seed);
+            let index = SaeCandidateIndex::build(&sketch, cfg).unwrap();
+
+            let rows = planted_rows(&dirs, n_rows, 555 + k as u64);
+            let budget = auto_candidate_budget(k);
+            let report = index.recall_report(&sketch, &rows, budget, cfg.multiprobe);
+
+            // Recall floor at the auto-derived budget, with every miss carrying
+            // a reason — the no-silent-truncation contract, per rung.
+            let floor = 0.80;
+            assert!(
+                report.recall >= floor,
+                "K={k}: recall {:.3} below floor {floor}; {} misses (first: {:?})",
+                report.recall,
+                report.misses.len(),
+                report
+                    .misses
+                    .iter()
+                    .take(3)
+                    .map(|m| (m.row, m.atom, m.reason, m.alignment))
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                report.total_planted - report.total_recovered,
+                report.misses.len(),
+                "K={k}: miss list must account for every unrecovered planted atom"
+            );
+
+            // Search determinism: an independent rebuild from the same inputs
+            // proposes the identical candidate set for every probed row.
+            let sketch2 =
+                RandomProjectionFrameSketch::from_decoder_blocks(&blocks, sketch_dim, sketch_seed)
+                    .unwrap();
+            let index2 = SaeCandidateIndex::build(&sketch2, cfg).unwrap();
+            for (direction, _) in rows.iter().take(20) {
+                let a = index.propose(&sketch, direction.view(), budget, cfg.multiprobe);
+                let b = index2.propose(&sketch2, direction.view(), budget, cfg.multiprobe);
+                assert_eq!(
+                    a.proposed, b.proposed,
+                    "K={k}: rebuild must propose identically"
+                );
+            }
+
+            // Proposal size is the budget, never the dictionary: the per-row
+            // local block stays near the planted/active scale.
+            for (direction, _) in rows.iter().take(20) {
+                let prop = index.propose(&sketch, direction.view(), budget, cfg.multiprobe);
+                assert!(prop.proposed.len() <= budget);
+            }
+
+            ladder_ratios.push((k, report.sublinearity_ratio()));
+        }
+        // Relative sparsity must improve up the ladder: the gathered fraction
+        // of the dictionary shrinks as K grows (sublinear gather), and at the
+        // frontier-shaped rung it must be a small slice outright.
+        let (_, ratio_small) = ladder_ratios[0];
+        let (k_big, ratio_big) = ladder_ratios[1];
+        assert!(
+            ratio_big < ratio_small,
+            "sublinearity must improve along the ladder: {ladder_ratios:?}"
+        );
+        assert!(
+            ratio_big < 0.25,
+            "K={k_big}: gather touched {:.1}% of the dictionary",
+            ratio_big * 100.0
         );
     }
 
