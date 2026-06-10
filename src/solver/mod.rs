@@ -25,6 +25,7 @@ pub mod seeding;
 pub mod sensitivity;
 pub(crate) mod startup_stats;
 pub mod streaming_border;
+pub mod structure_search;
 pub mod topology_formula;
 pub mod topology_selector;
 pub mod visualizer;
