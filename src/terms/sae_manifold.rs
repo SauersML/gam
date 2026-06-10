@@ -9046,6 +9046,18 @@ impl SaeManifoldTerm {
         // #976 Layer-1 guard ledger is per joint fit: each inner solve gets a
         // fresh re-seed budget and reports only its own breaches.
         self.collapse_events.clear();
+        // #1003 — run the active-mass guard at ENTRY (iteration 0), before the
+        // pre-fit identifiability audit. A cold seed can hand the fit an atom
+        // whose gates are vacuous on every row (the outer seed cascade sweeps
+        // ρ states the seeding heuristics never saw); without this call the
+        // audit below reports that atom as a fatal rank-0 weighted design and
+        // the whole seed dies, even though the #976 guard exists precisely to
+        // answer a support collapse with one observable re-seed. The guard's
+        // shared per-fit budget applies unchanged: an atom re-seeded here that
+        // collapses again mid-fit goes Terminal, which is the structure
+        // search's signal, not the inner loop's. Genuinely degenerate bases
+        // (zero rows regardless of gates) still fail the audit — correctly.
+        self.enforce_active_mass_guard(0)?;
         // ── Pre-fit decoder identifiability audit ──────────────────────────
         //
         // Each decoder atom `k` contributes `η_i += a_ik · Φ_k(t_ik) · B_k`,
