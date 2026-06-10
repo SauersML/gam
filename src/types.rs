@@ -1380,7 +1380,13 @@ impl LikelihoodSpec {
             // Every remaining product cell is illegal. `try_new` /
             // `LikelihoodSpecWire::try_from` reject these, so construction and
             // deserialization guarantee they are unreachable here.
-            (response, link) => unreachable!(
+            // SAFETY: `LikelihoodSpec` is validated at every construction
+            // boundary (`try_new`, `LikelihoodSpecWire::try_from`), so this
+            // arm is reachable only via a future constructor that bypasses
+            // validation. Abort loudly rather than misclassify the family —
+            // a wrong `FamilySpecKind` would silently corrupt every
+            // downstream likelihood/gradient evaluation.
+            (response, link) => panic!(
                 "illegal likelihood cell reached kind(): response `{}` with inverse link `{}`; \
                  construction (try_new) and deserialization (LikelihoodSpecWire) guarantee legality",
                 response.name(),
