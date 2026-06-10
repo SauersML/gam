@@ -54,6 +54,7 @@ use crate::solver::outer_strategy::{
     DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
     OuterObjective, SeedOutcome,
 };
+use crate::solver::structure_search::{CollapseAction, CollapseEvent};
 use faer::Side;
 
 const SAE_MANIFOLD_ARMIJO_C1: f64 = 1.0e-4;
@@ -92,6 +93,35 @@ const SAE_MANIFOLD_ROW_RIDGE_GROWTH: f64 = 10.0;
 /// Maximum number of LM ridge-escalation attempts before declaring the per-row
 /// Hessian unfactorable.
 const SAE_MANIFOLD_ROW_RIDGE_MAX_ATTEMPTS: usize = 12;
+
+/// #976 Layer-1 guard: cap on one accepted iteration's assignment-logit
+/// update, in units of the gate temperature τ (the gate's natural length
+/// scale — every assignment mode reads logits through `σ(·/τ)` /
+/// `softmax(·/τ)`). A 4τ move spans the gate's whole soft range, so healthy
+/// convergence is never throttled, but no single inner iteration can carry a
+/// gate from contention to numerically-zero support: a collapse takes
+/// multiple accepted iterations, which guarantees the per-iteration
+/// active-mass guard observes the decay before it completes. The clamp is
+/// applied where the step is realised; when it binds, the realised objective
+/// is evaluated on the clamped state, so the Armijo comparison stays
+/// value-consistent (the unclamped quadratic model is merely conservative,
+/// and step halvings shrink the trial below the cap).
+const SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS: f64 = 4.0;
+
+/// #976 Layer-1 guard: per-atom active-mass floor. The collapse statistic is
+/// the atom's MAXIMUM assignment mass over rows, not its mean: a legitimately
+/// sparse atom has a small mean but high mass on its own rows, while only an
+/// atom with no material support anywhere — the #853 failure — has a small
+/// max. An atom whose max mass falls below this floor is re-seeded (once) or
+/// recorded as terminally collapsed; never a silent death, never a fit error.
+const SAE_ATOM_ACTIVE_MASS_FLOOR: f64 = 1.0e-3;
+
+/// #976 Layer-1 guard: re-seed budget per atom per joint fit. One second
+/// chance from a fresh basin; a second breach means the collapse is (locally)
+/// the objective's verdict at the current hyperparameters, which is recorded
+/// as a terminal collapse event and left for the structure-search death move
+/// to adjudicate — re-seeding in a loop would fight the optimizer.
+const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 
 /// Reactivation band width (in units of the JumpReLU temperature `τ`) below the
 /// hard gate threshold. The forward gate value is hard-zero strictly below
@@ -3472,6 +3502,12 @@ pub struct SaeManifoldTerm {
     /// metric is selected by whether per-row Fisher factors were installed, not
     /// by a flag), which is bit-for-bit the historical isotropic `φ̂` path.
     row_metric: Option<crate::inference::row_metric::RowMetric>,
+    /// #976 Layer-1 guard ledger for the most recent joint fit: every
+    /// active-mass breach with the action taken (re-seed / terminal). Cleared
+    /// at the start of each `run_joint_fit_arrow_schur`; read post-fit via
+    /// [`SaeManifoldTerm::collapse_events`] and carried onto the
+    /// structure-search [`crate::solver::structure_search::SearchLedger`].
+    collapse_events: Vec<CollapseEvent>,
 }
 
 /// Snapshot of exactly the mutable term state that an `apply_newton_step` +
@@ -3546,6 +3582,7 @@ impl SaeManifoldTerm {
             temperature_schedule: None,
             last_row_layout: None,
             row_metric: None,
+            collapse_events: Vec::new(),
         })
     }
 
@@ -7518,6 +7555,128 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// #976 Layer-1 guard ledger for the most recent joint fit (empty when no
+    /// atom ever breached the active-mass floor). A terminal event here is the
+    /// canonical death-proposal feed for the structure search.
+    pub fn collapse_events(&self) -> &[CollapseEvent] {
+        &self.collapse_events
+    }
+
+    /// #976 Layer-1 guard 3: the per-atom active-mass floor, checked once per
+    /// accepted outer iteration of the joint fit.
+    ///
+    /// The collapse statistic is each atom's MAXIMUM assignment mass over rows
+    /// (see [`SAE_ATOM_ACTIVE_MASS_FLOOR`] for why max, not mean). A breach is
+    /// answered with a gate-logit re-seed — once per atom per fit
+    /// ([`SAE_ATOM_COLLAPSE_RESEED_BUDGET`]) — and recorded as a
+    /// [`CollapseEvent`]; a breach after the budget is recorded once as
+    /// terminal and otherwise left alone: at that point the collapse is the
+    /// objective's (local) verdict at the current hyperparameters, and the
+    /// keep-or-kill decision belongs to the evidence-gated structure search,
+    /// not to an inner-loop heuristic. Observable events, never silent deaths,
+    /// never fit errors.
+    fn enforce_active_mass_guard(&mut self, iteration: usize) -> Result<(), String> {
+        let n = self.n_obs();
+        let k = self.k_atoms();
+        if n == 0 || k == 0 {
+            return Ok(());
+        }
+        let mut max_mass = vec![0.0_f64; k];
+        for row in 0..n {
+            let a = self
+                .assignment
+                .try_assignments_row(row)
+                .map_err(|e| format!("SaeManifoldTerm::enforce_active_mass_guard: {e}"))?;
+            for atom in 0..k {
+                if a[atom] > max_mass[atom] {
+                    max_mass[atom] = a[atom];
+                }
+            }
+        }
+        for atom in 0..k {
+            if max_mass[atom] >= SAE_ATOM_ACTIVE_MASS_FLOOR {
+                continue;
+            }
+            let reseeds_used = self
+                .collapse_events
+                .iter()
+                .filter(|e| e.atom == atom && e.action == CollapseAction::Reseeded)
+                .count();
+            if reseeds_used < SAE_ATOM_COLLAPSE_RESEED_BUDGET {
+                self.reseed_collapsed_atom_logits(atom);
+                self.collapse_events.push(CollapseEvent {
+                    iteration,
+                    atom,
+                    max_active_mass: max_mass[atom],
+                    floor: SAE_ATOM_ACTIVE_MASS_FLOOR,
+                    action: CollapseAction::Reseeded,
+                });
+            } else {
+                let already_terminal = self
+                    .collapse_events
+                    .iter()
+                    .any(|e| e.atom == atom && e.action == CollapseAction::Terminal);
+                if !already_terminal {
+                    self.collapse_events.push(CollapseEvent {
+                        iteration,
+                        atom,
+                        max_active_mass: max_mass[atom],
+                        floor: SAE_ATOM_ACTIVE_MASS_FLOOR,
+                        action: CollapseAction::Terminal,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-seed one collapsed atom's gate logits to the mode-appropriate
+    /// neutral that restores material support — the data-fit term can then
+    /// hold the atom active iff it carries signal. Latent coordinates are
+    /// deliberately left untouched: gate-driven collapse kills the support,
+    /// not the (still data-adjacent) coordinates, and a coordinate re-seed
+    /// would discard exactly the warm state that makes the second chance
+    /// cheap.
+    fn reseed_collapsed_atom_logits(&mut self, atom: usize) {
+        let n = self.n_obs();
+        match self.assignment.mode {
+            AssignmentMode::Softmax { .. } => {
+                // Tie the re-seeded atom with each row's current winner so it
+                // re-enters the simplex at parity instead of inheriting a
+                // saturated deficit.
+                for row in 0..n {
+                    let row_max = self
+                        .assignment
+                        .logits
+                        .row(row)
+                        .iter()
+                        .copied()
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    self.assignment.logits[[row, atom]] =
+                        if row_max.is_finite() { row_max } else { 0.0 };
+                }
+                canonicalize_softmax_logits(&mut self.assignment.logits);
+            }
+            AssignmentMode::IBPMap { .. } => {
+                // σ(0/τ) = ½ — the gate's neutral point; the IBP prior π_k
+                // still applies its geometric damping, as it should.
+                for row in 0..n {
+                    self.assignment.logits[[row, atom]] = 0.0;
+                }
+            }
+            AssignmentMode::JumpReLU {
+                temperature,
+                threshold,
+            } => {
+                // One temperature unit above the hard gate threshold:
+                // just-active, inside the smooth transition band.
+                for row in 0..n {
+                    self.assignment.logits[[row, atom]] = threshold + temperature;
+                }
+            }
+        }
+    }
+
     fn apply_newton_step_impl(
         &mut self,
         delta_ext_coord: ArrayView1<'_, f64>,
@@ -7570,12 +7729,17 @@ impl SaeManifoldTerm {
                 layout.expand_row(row, &compact_row, &mut full_delta[row * q..(row + 1) * q]);
                 compact_off += q_active;
             }
-            // Apply logits from expanded buffer.
+            // Apply logits from expanded buffer, clamped to the #976 gate-scale
+            // step cap (see SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS for the Armijo
+            // consistency argument).
+            let logit_step_cap =
+                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
             for row in 0..n {
                 let row_base = row * q;
                 for atom_idx in 0..assignment_dim {
-                    self.assignment.logits[[row, atom_idx]] +=
-                        step_size * full_delta[row_base + atom_idx];
+                    self.assignment.logits[[row, atom_idx]] += (step_size
+                        * full_delta[row_base + atom_idx])
+                        .clamp(-logit_step_cap, logit_step_cap);
                 }
             }
             // Apply coords from expanded buffer.
@@ -7605,11 +7769,15 @@ impl SaeManifoldTerm {
                 ));
             }
             let coord_offsets = self.assignment.coord_offsets();
+            // #976 gate-scale step cap, as in the compact branch above.
+            let logit_step_cap =
+                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
             for row in 0..n {
                 let row_base = row * q;
                 for atom_idx in 0..assignment_dim {
-                    self.assignment.logits[[row, atom_idx]] +=
-                        step_size * delta_ext_coord[row_base + atom_idx];
+                    self.assignment.logits[[row, atom_idx]] += (step_size
+                        * delta_ext_coord[row_base + atom_idx])
+                        .clamp(-logit_step_cap, logit_step_cap);
                 }
             }
             for atom_idx in 0..k_atoms {
@@ -7961,6 +8129,9 @@ impl SaeManifoldTerm {
         }
         self.refresh_basis_from_current_coords()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+        // #976 Layer-1 guard ledger is per joint fit: each inner solve gets a
+        // fresh re-seed budget and reports only its own breaches.
+        self.collapse_events.clear();
         // ── Pre-fit decoder identifiability audit ──────────────────────────
         //
         // Each decoder atom `k` contributes `η_i += a_ik · Φ_k(t_ik) · B_k`,
@@ -7993,7 +8164,7 @@ impl SaeManifoldTerm {
             self.accumulate_decoder_gram(&mut grams);
             self.finalize_decoder_identifiability_audit(&grams, self.n_obs())?;
         }
-        for _ in 0..max_iter {
+        for outer_iteration in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ρ (including the ARD precisions) is owned by the outer engine
             // (`SaeManifoldOuterObjective`) and held FIXED across this inner
@@ -8146,6 +8317,13 @@ impl SaeManifoldTerm {
                     break;
                 }
             }
+            // #976 Layer-1 guard 3: after an accepted step (Armijo or proximal
+            // — the rejection paths `break` above), check every atom's support
+            // and answer breaches with a bounded re-seed or a terminal
+            // CollapseEvent. Runs post-acceptance so it never perturbs a
+            // line-search trial, and any re-seed is simply the next
+            // iteration's starting state.
+            self.enforce_active_mass_guard(outer_iteration)?;
         }
         // ρ is owned by the outer engine and unchanged here; just return the
         // converged inner loss at the fixed ρ.
@@ -11098,6 +11276,84 @@ mod tests {
             vec![array![0.9_f64.ln()], array![1.1_f64.ln()]],
         );
         (term, target, rho)
+    }
+
+    /// #976 Layer-1 guard 2: a single Newton application cannot move a gate
+    /// logit by more than the gate-scale cap, however large the solver's raw
+    /// delta. Softmax canonicalization shifts whole rows, so the invariant is
+    /// checked on the within-row logit DIFFERENCE, which the shift preserves.
+    #[test]
+    fn assignment_logit_step_cap_bounds_single_iteration_gate_motion() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        let n = term.assignment.n_obs();
+        let q = term.assignment.row_block_dim();
+        let diff_before =
+            term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
+
+        let mut delta = Array1::<f64>::zeros(n * q);
+        // Softmax K=2 has one free logit per row at offset 0 of the row block.
+        delta[0] = 1.0e6;
+        let delta_beta = Array1::<f64>::zeros(term.beta_dim());
+        term.apply_newton_step(delta.view(), delta_beta.view(), 1.0)
+            .expect("step applies");
+
+        let cap = SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * term.assignment.mode.temperature();
+        let diff_after =
+            term.assignment.logits[[0, 0]] - term.assignment.logits[[0, 1]];
+        assert!(
+            ((diff_after - diff_before) - cap).abs() < 1.0e-9,
+            "a 1e6 raw logit delta must realise exactly the {cap}-cap, moved {}",
+            diff_after - diff_before
+        );
+    }
+
+    /// #976 Layer-1 guard 3: a gate-collapsed atom (max active mass below the
+    /// floor) is re-seeded back into contention exactly once, every breach is
+    /// an observable CollapseEvent, and the second collapse is recorded as
+    /// terminal — once — instead of fighting the optimizer.
+    #[test]
+    fn active_mass_guard_reseeds_once_then_records_terminal_collapse() {
+        let (mut term, _target, _rho) = small_two_atom_periodic_term();
+        let n = term.assignment.n_obs();
+        let slam = |term: &mut SaeManifoldTerm| {
+            for row in 0..n {
+                term.assignment.logits[[row, 0]] = 0.0;
+                term.assignment.logits[[row, 1]] = -1.0e3;
+            }
+        };
+
+        slam(&mut term);
+        term.enforce_active_mass_guard(0).expect("guard runs");
+        assert_eq!(term.collapse_events().len(), 1);
+        let ev = term.collapse_events()[0];
+        assert_eq!(ev.atom, 1);
+        assert_eq!(ev.action, CollapseAction::Reseeded);
+        assert!(ev.max_active_mass < ev.floor);
+
+        // The re-seed restored material support (softmax parity with the
+        // row winner), so a healthy follow-up check records nothing.
+        let masses = term.assignment.assignments();
+        let max1 = (0..n).map(|r| masses[[r, 1]]).fold(0.0_f64, f64::max);
+        assert!(max1 > SAE_ATOM_ACTIVE_MASS_FLOOR);
+        term.enforce_active_mass_guard(1).expect("guard runs");
+        assert_eq!(term.collapse_events().len(), 1);
+
+        // Second collapse: budget exhausted ⇒ terminal, recorded exactly once
+        // across repeated checks; the logits are left to the objective.
+        slam(&mut term);
+        term.enforce_active_mass_guard(2).expect("guard runs");
+        term.enforce_active_mass_guard(3).expect("guard runs");
+        let terminals: Vec<_> = term
+            .collapse_events()
+            .iter()
+            .filter(|e| e.action == CollapseAction::Terminal)
+            .collect();
+        assert_eq!(terminals.len(), 1);
+        assert_eq!(terminals[0].atom, 1);
+        assert!(
+            term.collapse_events().iter().all(|e| e.atom == 1),
+            "the healthy atom must never be flagged"
+        );
     }
 
     #[test]
