@@ -3546,6 +3546,52 @@ fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedConfig {
     }
 }
 
+/// The weighted-mean response level an unpenalized intercept would absorb, used
+/// to center the response during outer REML λ-selection (issue #1000).
+///
+/// For an identity-link Gaussian fit, adding a constant to the response only
+/// shifts the intercept, so λ̂ and the smooth shape must be invariant to the
+/// response mean. The outer score/gradient nonetheless accumulate
+/// `yᵀy`-magnitude sufficient statistics, so a large response mean costs
+/// precision and drifts λ̂. Returns `Some(m)` with
+/// `m = Σ wᵢ (yᵢ − offsetᵢ) / Σ wᵢ` — the constant a pure offset relabeling
+/// moves into the intercept — so the caller can subtract it and keep the working
+/// response `O(σ)` regardless of the mean.
+///
+/// Returns `None` (do not center, exact previous behaviour) unless the fit is
+/// identity-link Gaussian and carries an unpenalized intercept column to absorb
+/// the shift, and has no linear constraints that could pin the intercept. A zero
+/// or non-finite mean also returns `None` — there is nothing to gain.
+fn gaussian_identity_response_center(
+    cfg: &RemlConfig,
+    conditioning: &ParametricColumnConditioning,
+    has_linear_constraints: bool,
+    y: ArrayView1<'_, f64>,
+    w: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+) -> Option<f64> {
+    if has_linear_constraints
+        || conditioning.intercept_idx.is_none()
+        || !matches!(cfg.likelihood.spec.response, ResponseFamily::Gaussian)
+        || !matches!(cfg.link_function(), LinkFunction::Identity)
+    {
+        return None;
+    }
+    let mut weight_sum = 0.0_f64;
+    let mut weighted = KahanSum::default();
+    for ((&yi, &wi), &oi) in y.iter().zip(w.iter()).zip(offset.iter()) {
+        if wi > 0.0 {
+            weight_sum += wi;
+            weighted.add(wi * (yi - oi));
+        }
+    }
+    if weight_sum <= 0.0 {
+        return None;
+    }
+    let m = weighted.sum() / weight_sum;
+    (m.is_finite() && m != 0.0).then_some(m)
+}
+
 fn optimize_external_designwith_heuristic_lambdas_andwarm_start<X>(
     y: ArrayView1<'_, f64>,
     w: ArrayView1<'_, f64>,
@@ -3613,8 +3659,42 @@ where
     let offset_o = offset.to_owned();
     let canonical_shared = Arc::new(canonical);
     let cfg_shared = Arc::new(cfg.clone());
-    let mut reml_state = RemlState::newwith_offset_shared(
+
+    // Issue #1000: for an identity-link Gaussian fit with an unpenalized
+    // intercept, adding a constant `c` to the response is a *pure relabeling of
+    // the intercept* — the hat matrix annihilates the constant column, so the
+    // residuals, the profiled REML criterion, λ̂, and the smooth shape are all
+    // invariant to `c`. Numerically, though, the outer REML score/gradient
+    // accumulate `yᵀy`-magnitude sufficient statistics (e.g. the cached
+    // `XᵀW(y−offset)`), so an uncentered large-mean response injects a `c²`
+    // term that loses precision and drifts λ̂ — silently over-smoothing
+    // large-mean responses (Kelvin temperatures, financial levels, calendar
+    // years). Center the response by the (weighted) mean the intercept would
+    // absorb for the duration of the outer λ-search only: the constant lands in
+    // the intercept, which the final accept-fit below recovers *exactly* by
+    // re-fitting the original (uncentered) response at the REML-selected λ̂.
+    // This mirrors the existing column conditioning, which centers the design
+    // columns into the intercept for the same numerical reason.
+    let response_center = gaussian_identity_response_center(
+        &cfg,
+        &conditioning,
+        opts.linear_constraints.is_some(),
         y_o.view(),
+        w_o.view(),
+        offset_o.view(),
+    );
+    // The outer loop borrows the response for the lifetime of `reml_state`;
+    // the centered copy (when any) is owned at function scope so the borrow
+    // outlives the state. Off the Gaussian-identity path `response_center` is
+    // `None` and the outer loop borrows the original response verbatim — no
+    // allocation, no behavioural change.
+    let reml_y_centered: Option<Array1<f64>> = response_center.map(|m| &y_o - m);
+    let reml_y_view = reml_y_centered
+        .as_ref()
+        .map_or_else(|| y_o.view(), |centered| centered.view());
+
+    let mut reml_state = RemlState::newwith_offset_shared(
+        reml_y_view,
         x_fit,
         w_o.view(),
         offset_o.view(),
@@ -4298,7 +4378,19 @@ where
     let iters = std::cmp::max(1, outer_result.iterations);
     // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
     // so the final accept-fit skips the streaming GEMM as well.
-    let final_cache_handle = reml_state.gaussian_fixed_cache_if_eligible();
+    //
+    // When the outer loop centered the response (issue #1000), that cache holds
+    // `XᵀW(centered_y − offset)`; the accept-fit runs on the *original*
+    // (uncentered) response `y_o`, so reusing the centered `XᵀWy` would solve
+    // for the centered intercept and report every fitted value, residual and
+    // scale on the shifted scale. Rebuild the cross-product from the original
+    // response in that case — the constant `XᵀWX` block is the only part the
+    // cache would have saved, a one-off cost paid only on large-mean responses.
+    let final_cache_handle = if response_center.is_some() {
+        None
+    } else {
+        reml_state.gaussian_fixed_cache_if_eligible()
+    };
     let (pirls_res, _) = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
         LogSmoothingParamsView::new(final_rho.view()),
         pirls::PirlsProblem {
