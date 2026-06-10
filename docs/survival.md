@@ -217,7 +217,7 @@ print(pred.survival_at([1, 5, 10, 20]))
 
 ## Marginal-slope for risk scores
 
-When a risk score (e.g. a polygenic score) has an effect that varies
+When a risk score (e.g. a risk score) has an effect that varies
 across covariate space, `survival_likelihood="marginal-slope"` with
 `logslope_formula=` models the score's spatially-varying effect separately
 from the baseline. Supply `transformation_normal_stage1=gamfit.CtnStage1(...)`

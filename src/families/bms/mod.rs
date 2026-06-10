@@ -185,7 +185,7 @@ pub struct BernoulliMarginalSlopeFitResult {
     pub latent_z_rank_int_calibration: Option<LatentZRankIntCalibration>,
     /// Optional conditional location-scale calibration of the latent score
     /// (#905). `Some(_)` ⇒ the Auto path's conditional `E[z|C]`/`Var(z|C)` Rao
-    /// gate detected PC/ancestry-dependence that the pooled-marginal gate
+    /// gate detected PC/grouping-dependence that the pooled-marginal gate
     /// cannot see, so the training z was replaced in place by
     /// `ζ = (z − m(C))/√v(C)` (via [`LatentZConditionalCalibration::apply`])
     /// before any downstream consumer saw it. Mutually exclusive with
@@ -240,7 +240,7 @@ const AUTO_Z_NORMAL_TAIL_FLOOR_OUTER: f64 = 1e-8;
 /// location-scale correction. Chosen small (0.1%) so the escalation fires only
 /// on clear conditional structure, not finite-sample noise — the gate runs once
 /// over the whole training sample, so a per-test α this tight still has ample
-/// power against the ancestry mean-shift the issue names.
+/// power against the grouping mean-shift the issue names.
 const AUTO_Z_CONDITIONAL_RAO_ALPHA: f64 = 1.0e-3;
 /// Relative ridge added to the weighted normal equations when regressing the
 /// latent score on the marginal-index span for the conditional correction.
@@ -529,7 +529,7 @@ impl LatentZPolicy {
         // dimensionality (16 PCs, 15 ancestries) an isotropic fit can leave
         // the global latent-z distribution mildly heavy-tailed (skew ≈ 4,
         // excess kurt ≈ 30–40 in synthetic studies) without violating per-
-        // ancestry mean/variance calibration. The downstream marginal-slope
+        // grouping mean/variance calibration. The downstream marginal-slope
         // model still uses the latent-Gaussian probit/score-warp link; the
         // emitted warning makes the deviation visible without aborting the
         // fit. Callers that need strict enforcement can construct a custom
@@ -815,7 +815,7 @@ pub enum LatentMeasureCalibration {
 /// The marginal-slope Auto trigger's pooled-z gate (KS / skewness / kurtosis +
 /// the rank inverse-normal transform) only inspects the **marginal** law of
 /// `z`. A conditional shift `E[z | C] = m(C) ≠ 0` — the allele-frequency-driven
-/// ancestry mean shift — passes the marginal gate while leaving `z | C`
+/// grouping mean shift — passes the marginal gate while leaving `z | C`
 /// off-center, so the slope contribution `b(C)·m(C)` leaks into the influence
 /// channel `q`. Rank-INT provably cannot fix this: no transform `T` depending
 /// only on the marginal `F_Z` can enforce `E[T(Z) | C] ≡ const` for all joint

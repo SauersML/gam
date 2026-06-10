@@ -27565,7 +27565,7 @@ mod tests {
     //
     #[test]
     fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_bounded() {
-        // LargeScale-realistic dimensions for hypertension marginal-slope.
+        // LargeScale-realistic dimensions for binary-outcome marginal-slope.
         // Duchon(PC1,PC2,PC3, centers=10, order=1) → p_basis = centers +
         // null_basis(d+1=4) = 14 columns per spatial block, nullspace dim=4.
         // The actual fit has time_surface with a different basis (B-spline

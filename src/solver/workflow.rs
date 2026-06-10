@@ -8770,7 +8770,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_bernoulli_marginal_slope_prunes_hypertension_style_scalar_alias() {
+    fn materialize_bernoulli_marginal_slope_prunes_binary_outcome_style_scalar_alias() {
         let data = Dataset {
             headers: vec![
                 "event".to_string(),
@@ -8797,7 +8797,7 @@ mod tests {
                     -1.1, 0.6,
                 ],
             )
-            .expect("hypertension-style BMS scalar-alias test data shape"),
+            .expect("binary-outcome-style BMS scalar-alias test data shape"),
             schema: DataSchema {
                 columns: vec![
                     SchemaColumn {
@@ -8909,7 +8909,7 @@ mod tests {
                 .inference_notes
                 .iter()
                 .any(|note| note.contains("current_age_ns_1")),
-            "materialization should report the removed hypertension-style scalar alias; notes={:?}",
+            "materialization should report the removed binary-outcome-style scalar alias; notes={:?}",
             materialized.inference_notes
         );
     }

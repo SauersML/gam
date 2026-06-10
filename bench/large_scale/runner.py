@@ -666,12 +666,12 @@ def _large_scale_duchon_pc_term(pc_count: int, centers: int) -> str:
 
 
 def _large_scale_pc_smooth_term(spatial_basis: str, pc_count: int, centers: int) -> str:
-    """Joint multi-D smooth over the PC ancestry axes.
+    """Joint multi-D smooth over the PC grouping axes.
 
-    All large-scale lanes treat ancestry as a single object on the joint PC space
+    All large-scale lanes treat grouping as a single object on the joint PC space
     (the production-pipeline strategic goal: PGS calibration via Duchon/TPS on
     joint PC). Lat/lon geographic coordinates are deliberately excluded — the
-    relevant continuous structure is genetic ancestry, not geography.
+    relevant continuous structure is latent grouping, not geography.
     """
     pc_cols = ", ".join(_pc_std_columns(pc_count))
     if spatial_basis == "duchon":
@@ -1861,11 +1861,11 @@ def effective_marginal_slope_centers(
 def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
     """Build mean + sigma formulas for large-scale classification lanes.
 
-    PCs enter as a SINGLE JOINT smooth over the ancestry manifold using the
+    PCs enter as a SINGLE JOINT smooth over the grouping manifold using the
     lane's `spatial_basis`; no per-PC linear terms, no separate per-axis
     smooths. Lat/lon coordinates are NOT used as predictors. The mean and
     sigma blocks share the joint-PC term so any heteroscedastic structure
-    is over the same ancestry surface as the location surface.
+    is over the same grouping surface as the location surface.
 
     For binomial location-scale lanes (``include_sigma=True``) the CLI
     rejects the default logit link with ``binomial blended-inverse-link
@@ -1873,7 +1873,7 @@ def rust_formula_classification(spec: MethodSpec) -> tuple[str, str]:
     Logit + ``--predict-noise`` path is gated on an explicit mixture/blended
     link spec. The marginal-slope companion already pins ``link(type=probit)``
     for the same reason, so we use the same standard-link choice here to
-    keep all large-scale ancestry-manifold lanes routed through a comparable
+    keep all large-scale grouping-manifold lanes routed through a comparable
     binomial inverse-link.
     """
     centers = int(spec.centers or 60)
@@ -1898,7 +1898,7 @@ def rust_marginal_slope_formula_classification(spec: MethodSpec, centers: int) -
     """Build mean and logslope formulas for large-scale marginal-slope classification.
 
     Uses the shared joint-PC helper so duchon / thinplate / matern lanes all
-    route through the same ancestry-manifold contract.
+    route through the same grouping-manifold contract.
     """
     spatial = _large_scale_pc_smooth_term(spec.spatial_basis, int(spec.pc_count), centers)
     mean_terms = [
