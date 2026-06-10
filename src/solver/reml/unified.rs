@@ -8317,6 +8317,30 @@ pub fn reml_laml_evaluate(
                 let frozen_tr = trace_with_kernel(&frozen_only);
                 stash.frozen_tr = Some(frozen_tr);
                 stash.correction_tr = Some(trace_logdet_i - frozen_tr);
+
+                // #901-layer-2 candidate fix: recompute the cubic correction
+                // with the IFT direction taken from the SAME pseudo-inverse the
+                // cost uses (`v = H_pen⁺·coord.g`) instead of the full
+                // `hop.solve`. The intrinsic kernel keeps the null(S₊)
+                // curvature the old range(S₊) projection dropped AND floors the
+                // truly-unidentified `ker(H_pen)` directions the full solve
+                // over-amplifies. If this matches the FD cubic (≈ fd_total −
+                // frozen_tr), the desync is the IFT direction using a different
+                // inverse than the criterion.
+                if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
+                    let v_proj = kernel.apply_pseudo_inverse(&coord.g);
+                    if let Ok(corr_proj) =
+                        effective_deriv.hessian_derivative_correction_result(&v_proj)
+                    {
+                        let total_proj = hyper_coord_total_drift_result(
+                            &coord.drift,
+                            corr_proj.as_ref(),
+                            hop.dim(),
+                        );
+                        let proj_total_tr = trace_with_kernel(&total_proj);
+                        stash.correction_tr_proj = Some(proj_total_tr - frozen_tr);
+                    }
+                }
             }
 
             // Per-row diagnostic stash: captures term4's `c · X_τβ̂` diagonal
