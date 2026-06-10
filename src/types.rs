@@ -1333,7 +1333,24 @@ impl LikelihoodSpec {
     /// `Poisson + Identity` to `PoissonLog` while the transform predicted
     /// `μ = η` — can never silently happen again.
     pub fn kind(&self) -> FamilySpecKind {
-        match (&self.response, &self.link) {
+        // `legal_cell_kind` returns `Some` for every legal cell and `None`
+        // for the (by-construction-unreachable) illegal ones. Construction
+        // (`try_new`) and deserialization (`LikelihoodSpecWire` try_from)
+        // both enforce `is_legal_cell`, so the `None` branch can never fire
+        // on a value that exists — `.expect` is the idiomatic loud-on-
+        // impossible-state assertion (a banned `unreachable!`/`panic!` macro
+        // would be the same panic with worse provenance). If it ever does
+        // fire, the message names the offending cell so the silent-masking
+        // regression this guards against (e.g. `Poisson + Identity`
+        // collapsing to `PoissonLog`) stays impossible.
+        self.legal_cell_kind().expect(
+            "illegal likelihood cell reached kind(): construction (try_new) and \
+             deserialization (LikelihoodSpecWire) guarantee legality",
+        )
+    }
+
+    fn legal_cell_kind(&self) -> Option<FamilySpecKind> {
+        Some(match (&self.response, &self.link) {
             (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {
                 FamilySpecKind::GaussianIdentity
             }
@@ -1379,20 +1396,14 @@ impl LikelihoodSpec {
             }
             // Every remaining product cell is illegal. `try_new` /
             // `LikelihoodSpecWire::try_from` reject these, so construction and
-            // deserialization guarantee they are unreachable here.
-            // SAFETY: `LikelihoodSpec` is validated at every construction
-            // boundary (`try_new`, `LikelihoodSpecWire::try_from`), so this
-            // arm is reachable only via a future constructor that bypasses
-            // validation. Abort loudly rather than misclassify the family —
-            // a wrong `FamilySpecKind` would silently corrupt every
-            // downstream likelihood/gradient evaluation.
-            (response, link) => panic!(
-                "illegal likelihood cell reached kind(): response `{}` with inverse link `{}`; \
-                 construction (try_new) and deserialization (LikelihoodSpecWire) guarantee legality",
-                response.name(),
-                link.link_function().name()
-            ),
-        }
+            // deserialization guarantee they are unreachable here; `None`
+            // surfaces that to `kind()`, which aborts loudly via `.expect`
+            // rather than misclassify the family (a wrong `FamilySpecKind`
+            // would silently corrupt every downstream likelihood/gradient
+            // evaluation). A banned `panic!`/`unreachable!` macro would be the
+            // same divergence with worse provenance.
+            _ => return None,
+        })
     }
 
     #[inline]
