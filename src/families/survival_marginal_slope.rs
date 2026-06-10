@@ -24167,6 +24167,270 @@ mod tests {
         assert!(err.contains("non-finite signed margin"));
     }
 
+    /// The single-expression Taylor-jet tower (#932) of the rigid K=1
+    /// survival marginal-slope row NLL, written ONCE over `Tower4<4>`
+    /// primaries `(q0, q1, qd1, g)`. It reuses the family's OWN hand-certified
+    /// `[f64; 5]` special-function derivative stacks (`unary_derivatives_sqrt`
+    /// / `_neglog_phi` / `_log_normal_pdf` / `_log`) through
+    /// `Tower4::compose_unary`, so no probit/log primitive is re-derived here:
+    /// the tower mechanizes only the Leibniz / Faà di Bruno composition that
+    /// the hand-written `row_primary_closed_form` + directional MultiDirJet
+    /// path code by hand (where #736's cross-block sign flip lived). The
+    /// value channel of the returned tower IS the production row NLL — it
+    /// mirrors the verified directional path in
+    /// `row_neglog_directional_with_scale_jet` term for term — so every
+    /// derivative channel is exact by construction and the oracle audit below
+    /// is a true correctness proof of the hand kernel.
+    struct SurvivalMarginalSlopeRigidNllProgram {
+        primaries: Vec<[f64; 4]>,
+        z: Vec<f64>,
+        w: Vec<f64>,
+        d: Vec<f64>,
+        probit_scale: f64,
+    }
+
+    impl crate::families::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRigidNllProgram {
+        fn n_rows(&self) -> usize {
+            self.primaries.len()
+        }
+
+        fn primaries(&self, row: usize) -> Result<[f64; 4], String> {
+            self.primaries
+                .get(row)
+                .copied()
+                .ok_or_else(|| format!("rigid nll program: row {row} out of range"))
+        }
+
+        fn row_nll(
+            &self,
+            row: usize,
+            p: &[crate::families::jet_tower::Tower4<4>; 4],
+        ) -> Result<crate::families::jet_tower::Tower4<4>, String> {
+            use crate::families::jet_tower::Tower4;
+            let z = *self
+                .z
+                .get(row)
+                .ok_or_else(|| format!("rigid nll program: z row {row} out of range"))?;
+            let w = self.w[row];
+            let d = self.d[row];
+            let s_f = self.probit_scale;
+            let q0 = p[0];
+            let q1 = p[1];
+            let qd1 = p[2];
+            let g = p[3];
+
+            // c(g) = sqrt(1 + (s_f g)^2)  — K=1 covariance_ones = 1, exactly the
+            // shared MultiDirJet `one_plus_b2 -> sqrt` composition.
+            let observed_g = g * s_f;
+            let one_plus_b2 = observed_g * observed_g + 1.0;
+            let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.v));
+
+            let eta0 = q0 * c + observed_g * z;
+            let eta1 = q1 * c + observed_g * z;
+            let ad1 = qd1 * c;
+
+            // Entry survival: +w logΦ(-η0) = -1 * (-w logΦ(-η0)).
+            let neg_eta0 = -eta0;
+            let entry = neg_eta0
+                .compose_unary(unary_derivatives_neglog_phi(neg_eta0.v, w))
+                .scale(-1.0);
+            // Exit survival: (1-d) * (-w logΦ(-η1)) carried with weight w(1-d).
+            let neg_eta1 = -eta1;
+            let exit =
+                neg_eta1.compose_unary(unary_derivatives_neglog_phi(neg_eta1.v, w * (1.0 - d)));
+            // Event density: -w d logφ(η1).
+            let event_density = if d > 0.0 {
+                eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.v))
+                    .scale(-w * d)
+            } else {
+                Tower4::<4>::zero()
+            };
+            // Time derivative: -w d log(ad1).
+            let time_deriv = if d > 0.0 {
+                ad1.compose_unary(unary_derivatives_log(ad1.v))
+                    .scale(-w * d)
+            } else {
+                Tower4::<4>::zero()
+            };
+
+            Ok(exit + entry + event_density + time_deriv)
+        }
+    }
+
+    /// Build a rigid K=1 survival marginal-slope family whose entry/exit/
+    /// derivative/marginal/logslope designs are all nontrivial dense blocks,
+    /// so every one of the four primaries `(q0, q1, qd1, g)` is exercised
+    /// when the kernel reads its designs. `n` rows, `event` per row.
+    fn oracle_rigid_family(
+        n: usize,
+        z: &[f64],
+        weights: &[f64],
+        event: &[f64],
+        gaussian_frailty_sd: Option<f64>,
+    ) -> SurvivalMarginalSlopeFamily {
+        let z_col = Array2::from_shape_fn((n, 1), |(r, _)| z[r]);
+        // Distinct entry/exit/derivative rows so q0 != q1 != qd1.
+        let design_entry =
+            Array2::from_shape_fn((n, 1), |(r, _)| 0.4 + 0.13 * (r as f64) - 0.05 * (r as f64).cos());
+        let design_exit =
+            Array2::from_shape_fn((n, 1), |(r, _)| 0.9 + 0.07 * (r as f64) + 0.04 * (r as f64).sin());
+        // Strictly positive derivative-exit design so qd1 > 0 (monotone).
+        let design_deriv =
+            Array2::from_shape_fn((n, 1), |(r, _)| 1.2 + 0.21 * (r as f64).abs().sqrt());
+        SurvivalMarginalSlopeFamily {
+            n,
+            event: Arc::new(Array1::from(event.to_vec())),
+            weights: Arc::new(Array1::from(weights.to_vec())),
+            z: Arc::new(z_col),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd,
+            derivative_guard: 1e-8,
+            design_entry: DesignMatrix::from(design_entry),
+            design_exit: DesignMatrix::from(design_exit),
+            design_derivative_exit: DesignMatrix::from(design_deriv),
+            offset_entry: Arc::new(Array1::from_shape_fn(n, |r| 0.05 * (r as f64) - 0.2)),
+            offset_exit: Arc::new(Array1::from_shape_fn(n, |r| 0.15 - 0.03 * (r as f64))),
+            derivative_offset_exit: Arc::new(Array1::from_elem(n, 0.0)),
+            marginal_design: DesignMatrix::from(Array2::zeros((n, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((n, 0))),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: None,
+            link_dev: None,
+            influence_absorber: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// #932 universal oracle on the ONLY production `RowKernel` impl.
+    ///
+    /// Audits every channel the hand-written `SurvivalMarginalSlopeRowKernel`
+    /// emits — value / gradient / Hessian / `row_third_contracted(dir)` /
+    /// `row_fourth_contracted(u, v)` — against the single-expression
+    /// `RowNllProgram<4>`-derived tower truth, over several fixture rows
+    /// (mixed event/censored, with and without Gaussian frailty so the probit
+    /// scale ≠ 1) and several random direction vectors. The cross blocks that
+    /// #736's sign flip corrupted are contracted explicitly. Agreement here is
+    /// the proof the hand kernel is correct; the planted-flip test in
+    /// `jet_tower` proves the same harness is loud on disagreement.
+    #[test]
+    fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
+        use crate::families::jet_tower::{
+            evaluate_program, verify_kernel_channels, KernelChannels,
+        };
+        use crate::families::row_kernel::RowKernel;
+
+        let n = 5;
+        let z = [0.4, -1.1, 0.0, 0.7, -0.3];
+        let weights = [1.0, 0.8, 1.3, 0.9, 1.1];
+        // Mix of events (d=1) and censored (d=0); row 2 censored, row 4 event.
+        let event = [1.0, 0.0, 0.0, 1.0, 1.0];
+        // logslope eta (g) per row, fed through block 2.
+        let g_eta = array![0.2, -0.5, 0.35, -0.15, 0.6];
+        // marginal eta (block 1) — additive index shared by η0 and η1.
+        let marginal_eta = array![0.1, -0.2, 0.05, 0.12, -0.08];
+
+        // Deterministic pseudo-random direction vectors (no RNG dependency).
+        let dirs: [[f64; 4]; 3] = [
+            [0.7, -1.3, 0.5, 0.9],
+            [-0.4, 0.6, -1.1, 0.3],
+            [1.2, 0.2, -0.7, -0.5],
+        ];
+
+        for frailty in [None, Some(0.6_f64)] {
+            let family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+            let probit_scale = family.probit_frailty_scale();
+            let beta_time = array![0.85]; // single time coefficient
+            let block_states = vec![
+                ParameterBlockState {
+                    beta: beta_time.clone(),
+                    eta: Array1::zeros(n),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(0),
+                    eta: marginal_eta.clone(),
+                },
+                ParameterBlockState {
+                    beta: Array1::zeros(0),
+                    eta: g_eta.clone(),
+                },
+            ];
+
+            let kernel =
+                SurvivalMarginalSlopeRowKernel::new(family.clone(), block_states.clone());
+
+            // Build the tower program's primaries exactly as `row_kernel` reads
+            // them (designs · beta_time + offsets + shared marginal/logslope eta).
+            let mut primaries = Vec::with_capacity(n);
+            for row in 0..n {
+                let q0 = family.design_entry.dot_row(row, &beta_time)
+                    + family.offset_entry[row]
+                    + marginal_eta[row];
+                let q1 = family.design_exit.dot_row(row, &beta_time)
+                    + family.offset_exit[row]
+                    + marginal_eta[row];
+                let qd1 = family.design_derivative_exit.dot_row(row, &beta_time)
+                    + family.derivative_offset_exit[row];
+                let g = g_eta[row];
+                primaries.push([q0, q1, qd1, g]);
+            }
+
+            let program = SurvivalMarginalSlopeRigidNllProgram {
+                primaries,
+                z: z.to_vec(),
+                w: weights.to_vec(),
+                d: event.to_vec(),
+                probit_scale,
+            };
+
+            for row in 0..n {
+                let tower = evaluate_program(&program, row).expect("tower evaluation");
+
+                let (value, gradient, hessian) =
+                    RowKernel::row_kernel(&kernel, row).expect("hand kernel value/grad/hess");
+
+                let third: Vec<([f64; 4], [[f64; 4]; 4])> = dirs
+                    .iter()
+                    .map(|dir| {
+                        let claim = RowKernel::row_third_contracted(&kernel, row, dir)
+                            .expect("hand kernel third");
+                        (*dir, claim)
+                    })
+                    .collect();
+
+                let fourth: Vec<([f64; 4], [f64; 4], [[f64; 4]; 4])> = dirs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, u)| {
+                        let v = dirs[(i + 1) % dirs.len()];
+                        let claim = RowKernel::row_fourth_contracted(&kernel, row, u, &v)
+                            .expect("hand kernel fourth");
+                        (*u, v, claim)
+                    })
+                    .collect();
+
+                let claims = KernelChannels {
+                    value,
+                    gradient,
+                    hessian,
+                    third,
+                    fourth,
+                };
+
+                verify_kernel_channels(&tower, &claims, 1e-9).unwrap_or_else(|e| {
+                    panic!(
+                        "frailty {frailty:?} row {row}: hand RowKernel disagrees with #932 jet-tower truth: {e}"
+                    )
+                });
+            }
+        }
+    }
+
     #[test]
     fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         let score_runtime = test_deviation_runtime();

@@ -129,7 +129,6 @@ where
     M: WorkingModel + ?Sized,
     F: FnMut(&WorkingModelIterationInfo),
 {
-    const LM_MAX_LAMBDA: f64 = 1e12;
     const CONSTRAINED_OBJECTIVE_PLATEAU_STREAK: usize = 20;
     // Minimum reduced-system dimension K at which building the GPU Y_i matvec
     // backend for matrix-free InexactPCG pays for the device round-trip; below
@@ -314,11 +313,14 @@ where
             _ => false,
         }
     }
+    // Exhaustion policy is owned by the shared loop guard (#968) — the #874
+    // hang was guard drift between sibling branches; these adapters exist so
+    // no branch in this file can re-derive the predicate locally.
     fn lm_can_retry(loop_lambda: f64) -> bool {
-        loop_lambda.is_finite() && loop_lambda < LM_MAX_LAMBDA
+        crate::solver::loop_guard::madsen_can_retry(loop_lambda)
     }
     fn lm_retry_exhausted(loop_lambda: f64, attempts: usize, max_attempts: usize) -> bool {
-        attempts >= max_attempts || !loop_lambda.is_finite() || loop_lambda > LM_MAX_LAMBDA
+        crate::solver::loop_guard::madsen_retry_exhausted(loop_lambda, attempts, max_attempts)
     }
     fn lm_nonconvergence_error(
         options: &WorkingModelPirlsOptions,
@@ -401,11 +403,6 @@ where
     // Pre-allocated buffer for the regularized hessian to avoid O(p²) clone
     // per PIRLS iteration. Reused across iterations when dimensions match.
     let mut regularized_buf: Option<crate::linalg::matrix::SymmetricMatrix> = None;
-    // EMA of per-iter wall-clock for the timing-driven adaptive early-exit.
-    // α = 0.3 gives a short memory (~3 iters) so the EMA tracks the recent
-    // cost trend without over-reacting to a single cheap iteration.
-    // None until the first iter completes.
-    let mut ema_iter_elapsed_secs: Option<f64> = None;
 
     let penalizedobjective = |state: &WorkingState| {
         let mut value = state.deviance + state.penalty_term;
@@ -428,7 +425,7 @@ where
     //     post-multiply `.max(1e-9)` enforces this absolute lower bound),
     //     so any positive cached value gets through unchanged.
     //   * ceiling 1.0 covers the gradient-descent regime; values above
-    //     that are pathological (the LM_MAX_LAMBDA = 1e12 ceiling is the
+    //     that are pathological (the MADSEN_DAMPING_CAP = 1e12 ceiling is the
     //     LM exit condition, well above any sensible warm-start).
     // The runtime layer (`solver/reml/runtime.rs::execute_pirls_if_needed`)
     // applies an *adaptive* clamp before this one, narrowing the range
@@ -589,8 +586,7 @@ where
 
         // Capture the initial gradient norm at iter 1 (the first iter
         // where `state.gradient` has been computed by `update_with_curvature`).
-        // Used by both the [PIRLS solve-end] summary log and the
-        // timing-driven adaptive early-exit predicate.
+        // Used by the [PIRLS solve-end] summary log's convergence-rate report.
         if initial_gradient_norm.is_none() {
             let g0_sq: f64 = state
                 .gradient
@@ -649,8 +645,8 @@ where
         // rejection, so successive bumps are ×2, ×4, ×8, ×16, ... vs the
         // older fixed ×10 every time. The textbook progression gives
         // more chances to find a usable trust radius before
-        // `lm_can_retry` declares LM_MAX_LAMBDA exhausted; the older ×10
-        // hit the ceiling in just 12 rejections (10^12 = LM_MAX_LAMBDA),
+        // `lm_can_retry` declares MADSEN_DAMPING_CAP exhausted; the older ×10
+        // hit the ceiling in just 12 rejections (10^12 = MADSEN_DAMPING_CAP),
         // while ×2 doubling needs 40 rejections to exceed the same
         // ceiling — well past `lm_max_attempts`. Resets to 2.0 on
         // Fisher-fallback (different problem, restart the LM trajectory).
@@ -1709,8 +1705,7 @@ where
                                 // ceiling, retry counter exhausted, or lambda went non-
                                 // finite. The collapsed status hides that distinction;
                                 // this debug log restores it.
-                                let ceiling =
-                                    !loop_lambda.is_finite() || loop_lambda > LM_MAX_LAMBDA;
+                                let ceiling = !lm_can_retry(loop_lambda);
                                 let attempts_used = attempts >= lm_max_attempts;
                                 let max_abs_eta_now = state
                                     .eta
@@ -1909,80 +1904,17 @@ where
             );
         }
 
-        // ── Timing-driven adaptive early-exit ──────────────────────────────
-        // Update the short EMA of per-iter wall-clock. The smoothing factor α
-        // gives a memory of roughly 1/α ≈ 3 iters.
-        const ITER_TIME_EMA_ALPHA: f64 = 0.3;
-        let iter_secs = iter_elapsed.as_secs_f64();
-        let ema = match ema_iter_elapsed_secs {
-            None => iter_secs,
-            Some(prev) => ITER_TIME_EMA_ALPHA * iter_secs + (1.0 - ITER_TIME_EMA_ALPHA) * prev,
-        };
-        ema_iter_elapsed_secs = Some(ema);
-
-        // Only attempt the predicate after we have at least 2 data points
-        // (so the EMA is meaningful) and when the hard convergence checks
-        // above have NOT already exited (we are still in the loop).
-        //
-        // Constants (baked in, no CLI flags):
-        //   the iter must run in under this fraction of the EMA to be
-        //   "trivially cheap", and the relaxed deviance / grad-ratio bands sit
-        //   at this multiple of the hard convergence tolerance.
-        const TRIVIALLY_CHEAP_ITER_EMA_FRACTION: f64 = 0.25;
-        const RELAXED_CONVERGENCE_BAND_MULTIPLE: f64 = 10.0;
-        if iter >= 2 {
-            // (a) Iteration has become trivially cheap: the solver is coasting.
-            let iter_cheap = ema > 0.0 && iter_secs < TRIVIALLY_CHEAP_ITER_EMA_FRACTION * ema;
-
-            // (b) Deviance change is negligible relative to |F|.
-            let f_abs = current_penalized.abs().max(1.0);
-            let deviance_ok = (last_deviance_change / f_abs).abs()
-                < options.convergence_tolerance * RELAXED_CONVERGENCE_BAND_MULTIPLE;
-
-            // (c) Gradient has collapsed relative to its initial value.
-            let grad_ok = match initial_gradient_norm {
-                Some(g0) if g0 > 0.0 && lastgradient_norm.is_finite() => {
-                    lastgradient_norm / g0
-                        < options.convergence_tolerance * RELAXED_CONVERGENCE_BAND_MULTIPLE
-                }
-                _ => false,
-            };
-
-            // (d) For a constrained fit, a relative gradient collapse is not a
-            // constrained-stationarity certificate (the absolute constraint-KKT
-            // residual can stall on a non-degenerate cone face while ‖g‖/‖g₀‖
-            // looks small for a large ‖g₀‖). Hold the timing exit to the SAME
-            // degeneracy-aware band the outer gate uses, so a cold-cache fit
-            // cannot coast off a stalled face the outer gate would reject (#873).
-            let constrained_kkt_ok = !has_explicit_constraints
-                || final_state.as_ref().is_some_and(|st| {
-                    constraint_kkt_admits_soft_accept(
-                        options,
-                        beta.as_ref(),
-                        &st.gradient,
-                        kkt_tolerance,
-                    )
-                });
-
-            if iter_cheap && deviance_ok && grad_ok && constrained_kkt_ok {
-                log::info!(
-                    "[PIRLS] iter {iter} timing-driven adaptive early-exit: \
-                     iter={:.4}s ema={:.4}s dev_rel={:.3e} grad_ratio={:.3e}",
-                    iter_secs,
-                    ema,
-                    (last_deviance_change / f_abs).abs(),
-                    match initial_gradient_norm {
-                        Some(g0) if g0 > 0.0 => lastgradient_norm / g0,
-                        _ => f64::NAN,
-                    },
-                );
-                // Use the best accepted state we have (set by the accept
-                // branch earlier this iteration, or the previous iter).
-                status = PirlsStatus::Converged;
-                break 'pirls_loop;
-            }
-        }
-        // ── end timing-driven adaptive early-exit ──────────────────────────
+        // NOTE: there is deliberately NO wall-clock-driven "adaptive
+        // early-exit" here (formerly: accept convergence when an iter ran
+        // in <25% of the per-iter EMA while deviance/gradient sat within a
+        // 10× relaxed band). A convergence verdict keyed on wall-clock is
+        // non-deterministic under CPU contention — the same fit converges to
+        // a different β in a parallel sweep than it does run alone, which
+        // cascades into different outer seed screening and load-unstable
+        // fire/collapse decisions downstream (gam#979). It also accepted
+        // iterates up to 10× outside `convergence_tolerance`, an
+        // unrequested weakening of the inner certificate. Convergence is
+        // certified only by the deterministic mathematical tests above.
     }
 
     // Solve-end summary: one line per accepted (or rescued) PIRLS solve
