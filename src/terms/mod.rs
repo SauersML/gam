@@ -14,6 +14,7 @@ pub mod latent_coord;
 pub mod matern_gradient;
 pub mod penalties;
 pub mod penalty_op;
+pub mod sae_candidate_index;
 pub mod sae_manifold;
 pub mod sheaf;
 pub mod skip_transcoder;
