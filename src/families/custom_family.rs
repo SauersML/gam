@@ -7253,6 +7253,32 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String>;
 
+    /// Direction-contracted second-order ψ terms for the profiled θ-HVP (#740).
+    ///
+    /// Given the ψ-block weights `alpha_psi` (length `psi_dim`, the ψ slice of
+    /// one applied outer direction α), return the `α`-contraction of every
+    /// `(ψ_i, ψ_j)` second-order term against the combined ψ-direction
+    /// `ψ(α) = Σ_j alpha_psi[j] · ψ_j`, as
+    /// [`ExactNewtonJointPsiSecondOrderContracted`]. A family that can stream
+    /// its rows once over `ψ(α)` overrides this so the profiled outer-Hessian
+    /// operator applies one combined-direction n-pass per matvec instead of the
+    /// dense path's `K²` per-pair [`Self::second_order_terms`] passes.
+    ///
+    /// Default returns `None`: the profiled θ-HVP operator is then not built and
+    /// the evaluator keeps the exact per-pair assembly (dense
+    /// `compute_outer_hessian` / `build_outer_hessian_operator`). Overriding
+    /// this method is purely a representation/cost choice — it must produce the
+    /// exact same contraction the per-pair terms would, which the
+    /// `profiled_theta_hvp_outer_hessian_fd` finite-difference cross-check
+    /// guards.
+    fn second_order_terms_contracted(
+        &self,
+        alpha_psi: &[f64],
+    ) -> Result<Option<ExactNewtonJointPsiSecondOrderContracted>, String> {
+        assert!(alpha_psi.len() < usize::MAX);
+        Ok(None)
+    }
+
     fn hessian_directional_derivative(
         &self,
         psi_index: usize,
