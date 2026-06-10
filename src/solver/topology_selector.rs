@@ -479,21 +479,49 @@ impl MixtureRungResult {
     }
 }
 
-/// Fit the discrete-mixture rung over a fixed `k`-ladder and rank in-class by
-/// rank-aware Laplace evidence. Each order is priced by its own free-parameter
-/// count entering the `−½ (dim(H) − rank(S)) log(2π)` normalizer. Deterministic:
-/// the seeding is the basis k-means farthest-point init and EM is a pure map.
+/// Hard cap on the number of EXTRA orders the local refinement around the
+/// coarse-ladder winner may probe. Refinement walks one neighbour at a time
+/// and stops as soon as the running winner is bracketed (both immediate
+/// neighbours fitted and worse), so this cap only binds on a pathological
+/// evidence profile that keeps improving monotonically past the ladder — a
+/// regime the rank-aware parameter pricing rules out for any real cluster
+/// structure. It exists so the sweep stays a bounded pure function of the
+/// data, never a runaway loop.
+pub const MIXTURE_REFINEMENT_MAX_PROBES: usize = 16;
+
+/// Fit the discrete-mixture rung over a fixed `k`-ladder, then **refine
+/// locally around the winner**, and rank in-class by rank-aware Laplace
+/// evidence. Each order is priced by its own free-parameter count entering the
+/// `−½ (dim(H) − rank(S)) log(2π)` normalizer. Deterministic: the seeding is
+/// the basis k-means farthest-point init, EM is a pure map, and the refinement
+/// order is a pure function of the fitted scores.
+///
+/// The coarse ladder ([`MIXTURE_K_LADDER`]) keeps the sweep cheap but cannot
+/// *name* every order (it skips 4, 6, 8, …). Refinement closes that hole: after
+/// the sweep, the immediate missing neighbours `k*−1`, `k*+1` of the running
+/// winner are fitted, repeating until the winner is **bracketed** — both
+/// neighbours present and scoring worse — so a planted `k = 4` truth is
+/// recovered as exactly 4, not as the nearest ladder rung. On an in-ladder
+/// winner the bracketing typically costs two extra EM fits and terminates at
+/// the same order the coarse sweep found.
 pub fn fit_mixture_rung(
     data: ArrayView2<'_, f64>,
     ladder: &[usize],
     config: GaussianMixtureConfig,
 ) -> Result<MixtureRungResult, String> {
     let n = data.nrows();
-    let mut fits = Vec::new();
-    let mut errors = Vec::new();
-    for &k in ladder {
-        if k == 0 || k > n {
-            continue;
+    let mut fits: Vec<MixtureRungFit> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    // Every order ever attempted (fitted OR failed): refinement must not
+    // re-propose a failed order forever.
+    let mut attempted: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+
+    let mut try_order = |k: usize,
+                         fits: &mut Vec<MixtureRungFit>,
+                         errors: &mut Vec<String>,
+                         attempted: &mut std::collections::BTreeSet<usize>| {
+        if k == 0 || k > n || !attempted.insert(k) {
+            return;
         }
         match fit_gaussian_mixture(data, k, config) {
             Ok(fit) => match fit.laplace_negative_log_evidence(data) {
@@ -510,6 +538,10 @@ pub fn fit_mixture_rung(
             },
             Err(e) => errors.push(format!("mixture k={k} fit: {e}")),
         }
+    };
+
+    for &k in ladder {
+        try_order(k, &mut fits, &mut errors, &mut attempted);
     }
     if fits.is_empty() {
         return Err(format!(
@@ -520,6 +552,32 @@ pub fn fit_mixture_rung(
                 format!(" ({})", errors.join("; "))
             }
         ));
+    }
+
+    // Local refinement: bracket the running winner. The running winner uses
+    // the same rule as the final ranking (lower negative-log-evidence, ties to
+    // the smaller k), so refinement and ranking can never disagree about who
+    // the winner is.
+    let mut probes = 0usize;
+    while probes < MIXTURE_REFINEMENT_MAX_PROBES {
+        let best_k = fits
+            .iter()
+            .min_by(|a, b| {
+                a.negative_log_evidence
+                    .partial_cmp(&b.negative_log_evidence)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.k.cmp(&b.k))
+            })
+            .map(|f| f.k)
+            .unwrap_or(1);
+        let next = [best_k.saturating_sub(1), best_k + 1]
+            .into_iter()
+            .find(|&k| k >= 1 && k <= n && !attempted.contains(&k));
+        let Some(k) = next else {
+            break; // bracketed: both neighbours attempted (or out of range).
+        };
+        try_order(k, &mut fits, &mut errors, &mut attempted);
+        probes += 1;
     }
     // In-class winner-take-all on the rank-aware evidence scale (lower wins).
     let ranked = rank_priority_candidates(
