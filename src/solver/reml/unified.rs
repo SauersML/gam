@@ -4826,27 +4826,40 @@ pub(crate) fn exact_pseudo_logdet(eigenvalues: &[f64], threshold: f64) -> f64 {
 // have been replaced by the canonical PenaltyPseudologdet in
 // super::penalty_logdet. All callers now use that module directly.
 
-/// Projected-logdet trace kernel for rank-deficient penalty geometries.
+/// Reduced trace kernel `K = U · M · Uᵀ` for pseudo-logdet REML/LAML
+/// criteria: an orthonormal column basis `u_s` (p × r) plus the r × r
+/// symmetric reduced kernel `h_proj_inverse`, with `tr(K · A)` evaluated as
+/// `tr(M · Uᵀ A U)` so contractions run on the r-dimensional subspace.
 ///
-/// When the outer cost is evaluated as `log|U_Sᵀ H U_S|_+` on the positive
-/// eigenspace of `S_λ` (see `hessian_logdet_correction`), the derivative
-/// `d log|U_Sᵀ H U_S|/dτ = tr(U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ · Ḣ)` uses the
-/// **projected** inverse kernel, not the full-space `H⁻¹`.  The two agree
-/// only when `Ḣ` has no support on `null(S)` — true for ρ-direction
-/// penalty drifts `A_k = λ_k S_k` (S_k vanishes on null(S) by construction),
-/// but **false** for the IFT correction `D_β H[v] = X' diag(c ⊙ X v) X`
-/// of non-Gaussian GLMs, because the intercept column `X[:,0] = 1_n`
-/// typically lies in `null(S)` and gives `D_β H[v]` non-zero rows/columns
-/// on that direction.
+/// Two producers install it, with different (documented) exactness domains:
 ///
-/// Evaluating `tr(H⁻¹ · Ḣ)` then picks up a spurious null-space
-/// contribution that is absent from the cost's projected logdet derivative.
-/// For Gaussian identity, `c = 0` so `D_β H[v] = 0` and the leakage vanishes,
-/// which is why Gaussian fixtures pass untouched.
+/// 1. **Intrinsic spectral form (#901, the GLM dense paths in runtime.rs —
+///    `intrinsic_hessian_pseudo_logdet_parts`):** `u_s = U_H`, the kept
+///    eigenvectors of the penalized Hessian `H_pen`, and `h_proj_inverse =
+///    diag(1/σ_a)`. Then `K = H_pen⁺` exactly, and `tr(K · Ḣ)` is the exact
+///    first derivative of the cost's `log|H_pen|₊` along **every** drift
+///    direction — penalty-supported or not, moving-subspace ψ drifts
+///    included — because on a constant-rank stratum first-order eigenvector
+///    motion cancels out of the pseudo-logdet derivative. This object can be
+///    traced against the GLM IFT correction `D_β H[v] = X' diag(c ⊙ X v) X`
+///    (which leaks onto `null(S)` via the intercept column) without error.
 ///
-/// `u_s`           — p × r orthonormal basis of `range(S_+)`.
-/// `h_proj_inverse` — r × r symmetric matrix `(U_Sᵀ H U_S)⁻¹`, precomputed
-/// from the same `H_proj = U_Sᵀ · H · U_S` that feeds `log|H_proj|_+`.
+/// 2. **Range(Sλ) Schur block (#752, `joint_penalty_subspace_trace_parts`
+///    in custom_family.rs):** `u_s` spans `range(Sλ)` and `h_proj_inverse =
+///    U_Sᵀ (H+Sλ)⁺ U_S`. For penalty-supported `A` (`A = ∂Sλ/∂ρ`), the
+///    identity `U_S U_Sᵀ A U_S U_Sᵀ = A` gives `tr(K · A) = tr((H+Sλ)⁺ A) =
+///    d log|H+Sλ|₊/dρ` — exact for the ρ family. It is **not** exact for
+///    drifts with `null(Sλ)` support (GLM cubic corrections, ψ basis
+///    drifts); paths that carry such drifts must install form 1.
+///
+/// Historically this struct carried a third reading — `(U_Sᵀ H U_S)⁻¹`, the
+/// plain projected inverse paired with the projected cost `log|U_Sᵀ H U_S|₊`.
+/// That object is WRONG as a REML determinant term: splitting `H` over
+/// `range(S) ⊕ ker(S)` as `[[A,B],[Bᵀ,C]]`, the projected logdet is
+/// `log det A`, dropping the θ-dependent Schur curvature
+/// `log det(C − BᵀA⁻¹B)` of the likelihood-identified, penalty-null block
+/// (sign-flipped ρ-gradients, ~1e5 ψ blow-ups vs FD — #901). No producer
+/// builds it anymore.
 #[derive(Clone, Debug)]
 pub struct PenaltySubspaceTrace {
     pub u_s: Array2<f64>,
@@ -4854,19 +4867,11 @@ pub struct PenaltySubspaceTrace {
 }
 
 impl PenaltySubspaceTrace {
-    /// Compute `tr(K · A)` where `K = U_S · H_proj⁻¹ · U_Sᵀ` — the
-    /// projected logdet kernel.
+    /// Compute `tr(K · A)` where `K = U_S · h_proj_inverse · U_Sᵀ` — the
+    /// pseudo-logdet trace kernel (see the struct doc for the two producer
+    /// forms and their exactness domains).
     ///
-    /// `H_proj⁻¹` is the range(Sλ) block of the FULL pseudo-inverse `(H+Sλ)⁺`
-    /// (its Schur reduction onto range(Sλ)). For a penalty-supported `A`
-    /// (`A = ∂Sλ/∂τ`, whose support lies in range(Sλ)), the identity
-    /// `U_S U_Sᵀ A U_S U_Sᵀ = A` gives
-    ///   `tr(K · A) = tr((H+Sλ)⁺ · A) = d log|H + Sλ|₊ / dτ`,
-    /// i.e. the kernel differentiates the FULL identifiable-subspace logdet
-    /// `log|H + Sλ|₊` (not the narrower `log|U_Sᵀ(H+Sλ)U_S|`). See
-    /// `joint_penalty_subspace_trace_parts`.
-    ///
-    /// Uses the identity `tr(K · A) = tr(H_proj⁻¹ · U_Sᵀ A U_S)` so the
+    /// Uses the identity `tr(K · A) = tr(h_proj_inverse · U_Sᵀ A U_S)` so the
     /// reduction runs on the r × r subspace rather than materializing K.
     pub fn trace_projected_logdet(&self, a: &Array2<f64>) -> f64 {
         crate::construction::trace_penalty_covariance_in_orthogonal_basis(
@@ -7407,15 +7412,17 @@ pub fn reml_laml_evaluate(
         // Cost-side IFT correction `−½ rᵀ H⁻¹ r`. When the rank-deficient
         // LAML fix is active (`penalty_subspace_trace = Some`), the
         // mathematically correct inverse here is the Moore-Penrose
-        // pseudo-inverse projected onto `range(S_+)` — not the full
-        // `H⁻¹`. The full-H solve at near-singular boundary states
-        // (the biobank survival marginal-slope pathology) amplifies
-        // floating-point noise in `r` outside `range(S_+)` by
+        // pseudo-inverse on the kernel's identified subspace (`range(H_pen)`
+        // in the intrinsic #901 form; historically `range(S_+)`) — not the
+        // regularized full `H⁻¹`. The full-H solve at near-singular boundary
+        // states (the biobank survival marginal-slope pathology) amplifies
+        // floating-point noise in `r` along sub-threshold directions by
         // `1/σ_min(H) ≈ 10¹²`, which then propagates into a 10¹³-magnitude
         // gradient component and traps the outer optimizer at max-iter.
-        // The projected pseudo-inverse kills any spurious null-space
-        // component of `r` before the inverse is applied, recovering
-        // the honest correction.
+        // The spectral pseudo-inverse zeroes any component of `r` on
+        // directions excluded from the cost's pseudo-logdet before the
+        // inverse is applied — the same threshold for value and correction —
+        // recovering the honest correction.
         let (cost_correction, branch) =
             if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
                 (-0.5_f64 * kernel.bilinear_pseudo_inverse(r, r), "projected")
@@ -8048,13 +8055,15 @@ pub fn reml_laml_evaluate(
             // Trace term: tr(K · Ḣₖ) where Ḣₖ = Aₖ + C[vₖ].
             //
             // Kernel choice mirrors the ψ/τ block: full-space `G_ε(H)` when the
-            // cost uses the unprojected `log|H|`, or the identified-subspace
-            // kernel `U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ` when the rank-deficient LAML
-            // fix is active.  `Aₖ = λₖ Sₖ` is zero on `null(S)` by construction,
-            // but the third-derivative correction `C[vₖ] = X'·diag(c ⊙ X vₖ)·X`
-            // leaks onto the intercept direction for non-Gaussian families — so
-            // the two kernels disagree whenever `hessian_logdet_correction ≠ 0`
-            // and `c_array ≠ 0`.
+            // cost uses the smooth-floored `log|H|`, or the intrinsic spectral
+            // kernel `K = H_pen⁺` when the rank-deficient LAML fix is active
+            // (#901) — the exact derivative of the cost's `log|H_pen|₊` for the
+            // TOTAL drift, including the third-derivative correction
+            // `C[vₖ] = X'·diag(c ⊙ X vₖ)·X` that leaks onto `null(S)` for
+            // non-Gaussian families. The two kernels disagree whenever
+            // `hessian_logdet_correction ≠ 0` (they treat sub-threshold
+            // eigendirections differently), so the pairing with the cost
+            // identity is what keeps analytic and FD gradients on one surface.
             let trace_logdet_i = if !incl_logdet_h {
                 0.0
             } else if let Some(ref stoch_traces) = stochastic_trace_values {
@@ -8209,26 +8218,25 @@ pub fn reml_laml_evaluate(
             // Kernel choice pairs with the cost:
             //   * Default cost `½ log|H|` (or `Σ log r_ε(σ_j)` under Smooth spectral
             //     regularization) → K = G_ε(H), computed full-space.
-            //   * Rank-deficient LAML fix (`hessian_logdet_correction ≠ 0`) uses
-            //     cost `½ log|U_Sᵀ H U_S|_+` on the identified subspace, which
-            //     pairs with K = U_S · (U_Sᵀ H U_S)⁻¹ · U_Sᵀ.
+            //   * Rank-deficient LAML fix (`hessian_logdet_correction ≠ 0`, #901)
+            //     uses cost `½ log|H_pen|₊` over `range(H_pen)`, which pairs with
+            //     the intrinsic spectral kernel K = H_pen⁺.
             //
-            // For non-Gaussian families the total drift includes
-            // `D_β H[−v_i]`, which has non-zero
-            // support on `null(S)` whenever `X` contains an all-ones intercept
-            // column — the null direction of `S_λ`.  Using the full-space
-            // `G_ε(H)` there picks up a spurious null-space contribution absent
-            // from `d log|U_Sᵀ H U_S|_+/dτ`; the projected kernel reroutes the
-            // trace through `range(S_+)` only, matching the cost exactly.
+            // `tr(H_pen⁺ · Ḣ)` is the exact pseudo-logdet derivative for the
+            // TOTAL drift on a constant-rank stratum: the ψ basis drift `B_i`
+            // (whose `range(Sλ(ψ))` rotates with ψ — first-order eigenvector
+            // motion cancels, so no `dU/dψ` term exists for the intrinsic
+            // object) AND the non-Gaussian IFT correction `D_β H[−v_i]`,
+            // which has support on `null(S)` whenever `X` contains an
+            // all-ones intercept column. The historical range(S_+)-projected
+            // kernel dropped both the penalty-null Schur curvature (ρ sign
+            // flips) and the moving-subspace ψ term (~1e5 FD blow-ups).
             // For canonical Gaussian (Identity link) the assembly skips
             // installing `penalty_subspace_trace` at all — `c ≡ 0` forces
             // `D_β H ≡ 0`, the classical Gaussian REML cost identity reads
-            // `log|H|` (not `log|H_proj|`), and the unprojected `G_ε(H)`
-            // kernel is the formula that matches that cost surface within
-            // FD precision (the moving-`U_S(ψ)` projection would otherwise
-            // add a `dU_S/dψ` term to the cost that the analytic gradient
-            // does not capture — see the `c_nontrivial` gate in
-            // `build_dense_assembly` / `build_dense_original_assembly`).
+            // smooth-floored `log|H|`, and `G_ε(H)` is the kernel matching
+            // that cost surface within FD precision — see the `c_nontrivial`
+            // gate in `build_dense_assembly` / `build_dense_original_assembly`.
             // Drops into the `None` arm below in that branch.
             // Diagnostic stash for the iso-κ Duchon FD investigation. Filled
             // only for the first extended coordinate (`ext_idx == 0`) and only
