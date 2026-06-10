@@ -747,7 +747,7 @@ fn dispersion_from_likelihood(
                 Dispersion::Known(phi)
             }
         }
-        ResponseFamily::NegativeBinomial { theta } => Dispersion::Known(
+        ResponseFamily::NegativeBinomial { theta, .. } => Dispersion::Known(
             likelihood
                 .fixed_phi()
                 .unwrap_or(*theta)
@@ -4737,7 +4737,7 @@ where
     // scale metadata), preserving the existing seed-in-family convention.
     let mut reported_family = opts.family.clone();
     if let (
-        ResponseFamily::NegativeBinomial { theta },
+        ResponseFamily::NegativeBinomial { theta, .. },
         LikelihoodScaleMetadata::EstimatedNegBinTheta {
             theta: fitted_theta,
         },
@@ -5320,7 +5320,11 @@ fn validate_likelihood_scale_estimation(
                 )))
             }
         }
-        LikelihoodScaleMetadata::EstimatedNegBinTheta { theta } => {
+        // A user-fixed θ (#983) carries the identical positivity contract as an
+        // estimated one — only the PIRLS refresh gate differs, not the validity
+        // of the recorded value.
+        LikelihoodScaleMetadata::EstimatedNegBinTheta { theta }
+        | LikelihoodScaleMetadata::FixedNegBinTheta { theta } => {
             ensure_finite_scalar_estimation("fit_result.likelihood_scale.theta", theta)?;
             if theta > 0.0 {
                 Ok(())

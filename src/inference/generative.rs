@@ -105,7 +105,7 @@ impl NoiseModel {
                     )?,
                 })
             }
-            ResponseFamily::NegativeBinomial { theta } => {
+            ResponseFamily::NegativeBinomial { theta, .. } => {
                 let theta = *theta;
                 if !(theta.is_finite() && theta > 0.0) {
                     crate::bail_invalid_estim!(

@@ -7660,7 +7660,7 @@ fn family_noise_parameter(fit: &UnifiedFitResult, family: LikelihoodSpec) -> Opt
         // metadata, falling back to a unit dispersion only if the fit recorded
         // none.
         ResponseFamily::Tweedie { .. } => fit.likelihood_scale.fixed_phi().or(Some(1.0)),
-        ResponseFamily::NegativeBinomial { theta } => Some(theta),
+        ResponseFamily::NegativeBinomial { theta, .. } => Some(theta),
         // Beta precision φ is estimated jointly with the mean (issue #567), so
         // the authoritative value is the fit's scale metadata, not the seed φ on
         // the original family spec. Fall back to the spec φ only if the fit did
