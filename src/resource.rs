@@ -191,7 +191,7 @@ pub const fn rows_for_target_bytes(target_bytes: usize, cols: usize) -> usize {
 }
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
 /// Byte-limited LRU cache with an optional entry cap.
@@ -205,9 +205,22 @@ use std::sync::{Arc, Mutex};
 /// for payloads with known shape, such as owned PC data matrices shared across
 /// model blocks.
 pub struct ByteLruCache<K: Eq + Hash + Clone, V> {
-    inner: Mutex<ByteLruInner<K, V>>,
+    /// One independent LRU partition per shard. A single shard (the default)
+    /// is byte-for-byte equivalent to the original single-`Mutex` cache; with
+    /// `shard_count > 1` the key hash selects the shard, so concurrent traffic
+    /// on distinct keys contends `1/shard_count` as often and each shard's
+    /// recency `VecDeque` is `1/shard_count` as long (the hit-path rescan is a
+    /// linear `position` lookup, so shrinking the per-shard order also cuts
+    /// per-access cost). Sharding is opt-in (`new_sharded`) precisely because
+    /// the byte budget is split across shards — that is correct for caches of
+    /// many small entries (e.g. cell-moment memos) but wrong for caches of a
+    /// few multi-GiB entries (distance matrices), which keep `shard_count == 1`.
+    shards: Box<[Mutex<ByteLruInner<K, V>>]>,
+    /// Per-shard byte budget. `shard_bytes * shards.len() >= max_bytes`.
+    shard_bytes: usize,
+    /// Per-shard entry budget, if any (`0` disables caching, as before).
+    shard_entries: Option<usize>,
     max_bytes: usize,
-    max_entries: Option<usize>,
 }
 
 struct ByteLruInner<K, V> {
@@ -218,32 +231,76 @@ struct ByteLruInner<K, V> {
 
 impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     pub fn new(max_bytes: usize) -> Self {
-        Self {
-            inner: Mutex::new(ByteLruInner {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-                resident_bytes: 0,
-            }),
-            max_bytes,
-            max_entries: None,
-        }
+        Self::build(max_bytes, None, 1)
     }
 
     pub fn with_max_entries(max_bytes: usize, max_entries: usize) -> Self {
+        Self::build(max_bytes, Some(max_entries), 1)
+    }
+
+    /// Like [`new`](Self::new) but partitions the cache across `shard_count`
+    /// independently-locked LRU shards to cut lock contention under heavy
+    /// concurrent access. The byte budget is divided evenly across shards, so
+    /// this is only appropriate for caches holding many small entries.
+    pub fn new_sharded(max_bytes: usize, shard_count: usize) -> Self {
+        Self::build(max_bytes, None, shard_count)
+    }
+
+    /// Like [`with_max_entries`](Self::with_max_entries) but sharded; see
+    /// [`new_sharded`](Self::new_sharded).
+    pub fn with_max_entries_sharded(
+        max_bytes: usize,
+        max_entries: usize,
+        shard_count: usize,
+    ) -> Self {
+        Self::build(max_bytes, Some(max_entries), shard_count)
+    }
+
+    fn build(max_bytes: usize, max_entries: Option<usize>, shard_count: usize) -> Self {
+        let shard_count = shard_count.max(1);
+        // Split the global budgets across shards, rounding up so the aggregate
+        // capacity never falls below the requested budget. With a single shard
+        // these equal the global budgets exactly (legacy behavior). A `0`
+        // entry budget still disables caching and must not be rounded up to 1.
+        let shard_bytes = max_bytes.div_ceil(shard_count);
+        let shard_entries = max_entries.map(|m| {
+            if m == 0 {
+                0
+            } else {
+                m.div_ceil(shard_count).max(1)
+            }
+        });
+        let shards = (0..shard_count)
+            .map(|_| {
+                Mutex::new(ByteLruInner {
+                    map: HashMap::new(),
+                    order: VecDeque::new(),
+                    resident_bytes: 0,
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
-            inner: Mutex::new(ByteLruInner {
-                map: HashMap::new(),
-                order: VecDeque::new(),
-                resident_bytes: 0,
-            }),
+            shards,
+            shard_bytes,
+            shard_entries,
             max_bytes,
-            max_entries: Some(max_entries),
         }
+    }
+
+    #[inline]
+    fn shard(&self, key: &K) -> &Mutex<ByteLruInner<K, V>> {
+        if self.shards.len() == 1 {
+            return &self.shards[0];
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
     }
 
     pub fn get(&self, key: &K) -> Option<V> {
         // recover from poison
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.shard(key).lock().unwrap_or_else(|p| p.into_inner());
         let v = g.map.get(key)?.0.clone();
         // move to back (most-recently-used)
         if let Some(pos) = g.order.iter().position(|k| k == key) {
@@ -255,7 +312,7 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
 
     pub fn insert(&self, key: K, value: V) {
         let charge = value.resident_bytes();
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let mut g = self.shard(&key).lock().unwrap_or_else(|p| p.into_inner());
 
         // If already present, remove the old entry first so resident bytes stay
         // accurate and the LRU ordering reflects this insertion.
@@ -266,12 +323,12 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
             }
         }
 
-        if charge > self.max_bytes {
+        if charge > self.shard_bytes {
             // Too large to cache; skip insertion.
             return;
         }
 
-        if let Some(max_entries) = self.max_entries {
+        if let Some(max_entries) = self.shard_entries {
             if max_entries == 0 {
                 return;
             }
@@ -286,7 +343,7 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
             }
         }
 
-        while g.resident_bytes + charge > self.max_bytes {
+        while g.resident_bytes + charge > self.shard_bytes {
             if let Some(evict_key) = g.order.pop_front() {
                 if let Some((_v, c)) = g.map.remove(&evict_key) {
                     g.resident_bytes = g.resident_bytes.saturating_sub(c);
@@ -302,10 +359,10 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     }
 
     pub fn resident_bytes(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .resident_bytes
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap_or_else(|p| p.into_inner()).resident_bytes)
+            .sum()
     }
 
     pub const fn max_bytes(&self) -> usize {
@@ -313,18 +370,23 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> ByteLruCache<K, V> {
     }
 
     pub fn len(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .map
-            .len()
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap_or_else(|p| p.into_inner()).map.len())
+            .sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn clear(&self) {
-        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.map.clear();
-        g.order.clear();
-        g.resident_bytes = 0;
+        for shard in self.shards.iter() {
+            let mut g = shard.lock().unwrap_or_else(|p| p.into_inner());
+            g.map.clear();
+            g.order.clear();
+            g.resident_bytes = 0;
+        }
     }
 }
 
@@ -333,7 +395,9 @@ impl<K: Eq + Hash + Clone, V: Clone + ResidentBytes> std::fmt::Debug for ByteLru
         f.debug_struct("ByteLruCache")
             .field("resident_bytes", &self.resident_bytes())
             .field("max_bytes", &self.max_bytes)
-            .field("max_entries", &self.max_entries)
+            .field("shard_count", &self.shards.len())
+            .field("shard_bytes", &self.shard_bytes)
+            .field("shard_entries", &self.shard_entries)
             .finish()
     }
 }
@@ -452,5 +516,72 @@ impl<T: std::fmt::Debug> std::fmt::Debug for RayonSafeOnce<T> {
         f.debug_struct("RayonSafeOnce")
             .field("slot", &self.slot.get())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod byte_lru_tests {
+    use super::*;
+
+    /// Fixed-charge value so byte-budget arithmetic in the tests is exact.
+    #[derive(Clone, PartialEq, Debug)]
+    struct Payload(u64);
+    impl ResidentBytes for Payload {
+        fn resident_bytes(&self) -> usize {
+            8
+        }
+    }
+
+    #[test]
+    fn single_shard_round_trips_and_evicts_by_bytes() {
+        // 3 entries' worth of budget; a single shard preserves strict global LRU.
+        let cache: ByteLruCache<u64, Payload> = ByteLruCache::new(24);
+        for k in 0..3 {
+            cache.insert(k, Payload(k));
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.resident_bytes(), 24);
+        // Touch key 0 so it is most-recently-used, then overflow by one.
+        assert_eq!(cache.get(&0), Some(Payload(0)));
+        cache.insert(3, Payload(3));
+        // Key 1 (now least-recently-used) is evicted; 0 survives the touch.
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(&1), None);
+        assert_eq!(cache.get(&0), Some(Payload(0)));
+        assert_eq!(cache.get(&3), Some(Payload(3)));
+    }
+
+    #[test]
+    fn zero_entry_budget_disables_caching_in_every_shard() {
+        let single: ByteLruCache<u64, Payload> = ByteLruCache::with_max_entries(1 << 20, 0);
+        single.insert(7, Payload(7));
+        assert_eq!(single.get(&7), None);
+        let sharded: ByteLruCache<u64, Payload> =
+            ByteLruCache::with_max_entries_sharded(1 << 20, 0, 16);
+        sharded.insert(7, Payload(7));
+        assert_eq!(sharded.get(&7), None);
+    }
+
+    #[test]
+    fn sharded_cache_retrieves_all_keys_and_respects_aggregate_budget() {
+        // Generous budget split across 8 shards; every inserted key must be
+        // retrievable and the aggregate residency must never exceed the global
+        // budget (shard_bytes * shard_count, rounded up).
+        let shard_count = 8usize;
+        let max_bytes = 8 * 64; // 64 entries' worth, 8 per shard on average.
+        let cache: ByteLruCache<u64, Payload> =
+            ByteLruCache::new_sharded(max_bytes, shard_count);
+        for k in 0..64u64 {
+            cache.insert(k, Payload(k));
+        }
+        // Per-shard budgets sum to >= the requested global budget.
+        assert!(cache.resident_bytes() <= max_bytes.div_ceil(shard_count) * shard_count);
+        // Re-inserting then reading back a key returns the stored payload.
+        cache.insert(123, Payload(123));
+        assert_eq!(cache.get(&123), Some(Payload(123)));
+        assert!(!cache.is_empty());
+        cache.clear();
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.resident_bytes(), 0);
     }
 }

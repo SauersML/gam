@@ -1027,7 +1027,21 @@ pub(super) fn new_cell_moment_lru_cache(
     policy: &crate::resource::ResourcePolicy,
 ) -> Arc<exact_kernel::CellMomentLruCache> {
     let budget = policy.max_single_materialization_bytes;
-    Arc::new(exact_kernel::CellMomentLruCache::new(budget))
+    // The cell-moment memo holds many small entries and is consulted by every
+    // row of the parallel exact-cache build (one lookup per evaluated cubic
+    // cell, many per row, across all `n` rows in `into_par_iter`). A single
+    // lock therefore serializes the whole build — observed as ~1 busy core at
+    // biobank n. Partition the cache well past the worker count so concurrent
+    // lookups on distinct cells rarely land in the same shard; entries are
+    // small so splitting the byte budget is harmless.
+    let shard_count = std::thread::available_parallelism()
+        .map(|workers| workers.get().saturating_mul(8))
+        .unwrap_or(32)
+        .clamp(8, 256);
+    Arc::new(exact_kernel::CellMomentLruCache::new_sharded(
+        budget,
+        shard_count,
+    ))
 }
 
 pub(super) fn new_cell_moment_cache_stats() -> Arc<exact_kernel::CellMomentCacheStats> {
