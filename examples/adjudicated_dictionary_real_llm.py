@@ -39,7 +39,7 @@ import torch
 
 def load_normalized(path: str, n: int | None, npy_key: str | None = None,
                     shuffle_seed: int | None = None):
-    """Load activations and apply the per-dim z-score the baselines use."""
+    """Load activations; return (z-scored X, raw X, mu, sigma)."""
     if path.endswith(".npy"):
         X = torch.from_numpy(np.load(path, allow_pickle=False).astype(np.float32))
     else:
@@ -53,7 +53,7 @@ def load_normalized(path: str, n: int | None, npy_key: str | None = None,
     X = X.float()
     mu = X.mean(0, keepdim=True)
     sigma = X.std(0).clamp(min=1e-6)
-    return (X - mu) / sigma
+    return (X - mu) / sigma, X, mu, sigma
 
 
 def explained_variance(X: np.ndarray, Xhat: np.ndarray) -> float:
@@ -129,11 +129,54 @@ def vanilla_train(Xn: torch.Tensor, F: int, top_k: int, steps: int, lr: float,
     return out
 
 
+def official_topk_sae_eval(ckpt_path: str, X_raw: torch.Tensor,
+                           mu: torch.Tensor, sigma: torch.Tensor) -> dict:
+    """Evaluate a published top-k SAE (Qwen SAE-Res format: W_enc/W_dec/b_enc/b_dec).
+
+    Decode convention: z = topk(W_enc @ (x - b_dec) + b_enc, k);
+    xhat = W_dec @ z + b_dec. ``k`` is taken from the filename convention
+    (``k100``/``k50``) or defaults to 100.
+    """
+    sd = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    k = 100
+    low = ckpt_path.lower()
+    for cand in (25, 50, 100, 200):
+        if f"k{cand}" in low or f"l0_{cand}" in low:
+            k = cand
+    W_enc, W_dec = sd["W_enc"].float(), sd["W_dec"].float()
+    b_enc, b_dec = sd["b_enc"].float(), sd["b_dec"].float()
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    W_enc, W_dec, b_enc, b_dec = (t.to(dev) for t in (W_enc, W_dec, b_enc, b_dec))
+    outs = []
+    actives = []
+    with torch.no_grad():
+        for chunk in torch.split(X_raw.to(dev), 8192):
+            pre = (chunk - b_dec) @ W_enc.T + b_enc
+            vals, idx = torch.topk(torch.relu(pre), k, dim=1)
+            z = torch.zeros_like(pre).scatter_(1, idx, vals)
+            actives.append((z > 0).sum(1).float().mean().item())
+            outs.append((z @ W_dec.T + b_dec).cpu())
+    xhat_raw = torch.cat(outs)
+    xhat_z = (xhat_raw - mu) / sigma
+    Xn = ((X_raw - mu) / sigma).numpy()
+    return {
+        "label": "official_topk_sae",
+        "ckpt": ckpt_path,
+        "d_sae": int(W_enc.shape[0]),
+        "k": k,
+        "ev_raw": explained_variance(X_raw.numpy(), xhat_raw.numpy()),
+        "ev": explained_variance(Xn, xhat_z.numpy()),
+        "mean_active_per_row": float(np.mean(actives)),
+    }
+
+
 TOPOLOGY_DEFAULT_DIM = {"circle": 1, "sphere": 2, "torus": 2, "euclidean": 3}
 
 
 def run_candidate(Xn64: np.ndarray, k: int, topology: str, d_atom: int,
-                  n_iter: int, seed: int, assignment: str, top_k: int | None) -> dict:
+                  n_iter: int, seed: int, assignment: str, top_k: int | None,
+                  mu: np.ndarray | None = None, sigma: np.ndarray | None = None,
+                  X_raw: np.ndarray | None = None) -> dict:
     import gamfit
 
     t0 = time.time()
@@ -159,6 +202,8 @@ def run_candidate(Xn64: np.ndarray, k: int, topology: str, d_atom: int,
     )
     fitted = np.asarray(m.fitted)
     out["ev"] = explained_variance(Xn64, fitted)
+    if mu is not None and sigma is not None and X_raw is not None:
+        out["ev_raw"] = explained_variance(X_raw, fitted * sigma + mu)
     asg = np.asarray(m.assignments)
     out["mean_active_per_row"] = float((asg > 1e-3).sum(axis=1).mean())
     out["alive_atoms"] = int(((asg > 1e-3).sum(axis=0) > 0).sum())
@@ -198,6 +243,8 @@ def main() -> None:
     ap.add_argument("--assignment", default="ibp_map")
     ap.add_argument("--top-k", type=int, default=None)
     ap.add_argument("--vanilla-ckpt", default=None)
+    ap.add_argument("--official-sae", default=None, action="append",
+                    help="published top-k SAE checkpoint(s) to evaluate on the same rows")
     ap.add_argument("--train-vanilla", action="store_true",
                     help="train a fresh vanilla top-k baseline on the same rows")
     ap.add_argument("--vanilla-f", type=int, default=None,
@@ -209,7 +256,8 @@ def main() -> None:
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    Xn = load_normalized(args.acts, args.n, args.npy_key, args.shuffle_seed)
+    Xn, X_raw, mu, sigma = load_normalized(args.acts, args.n, args.npy_key,
+                                           args.shuffle_seed)
     report: dict = {
         "acts": args.acts,
         "n": int(Xn.shape[0]),
@@ -217,6 +265,11 @@ def main() -> None:
         "candidates": [],
     }
     print(f"[setup] X {tuple(Xn.shape)} var={float(Xn.var()):.3f}", flush=True)
+
+    for ckpt in args.official_sae or []:
+        entry = official_topk_sae_eval(ckpt, X_raw, mu, sigma)
+        report.setdefault("official", []).append(entry)
+        print(f"[baseline] {entry}", flush=True)
 
     if args.vanilla_ckpt:
         report["vanilla"] = vanilla_from_ckpt(args.vanilla_ckpt, Xn)
@@ -233,7 +286,10 @@ def main() -> None:
         d = args.d_atom if args.d_atom is not None else TOPOLOGY_DEFAULT_DIM.get(topo, 2)
         print(f"[fit] topology={topo} K={args.k} d={d} n_iter={args.n_iter}", flush=True)
         res = run_candidate(Xn64, args.k, topo, d, args.n_iter, args.seed,
-                            args.assignment, args.top_k)
+                            args.assignment, args.top_k,
+                            mu=mu.numpy().astype(np.float64),
+                            sigma=sigma.numpy().astype(np.float64),
+                            X_raw=X_raw.numpy().astype(np.float64))
         print(f"[fit] -> status={res['status']} ev={res.get('ev')} "
               f"reml={res.get('reml_score')} {res['seconds']:.1f}s", flush=True)
         report["candidates"].append(res)
