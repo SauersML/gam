@@ -5665,9 +5665,9 @@ fn run_survival(args: SurvivalArgs) -> Result<(), String> {
         };
         cli_out!();
         cli_out!(
-            "cause-specific survival fit | causes={} | converged={} | iterations={} | loglik={:.6e} | objective={:.6e}",
+            "cause-specific survival fit | causes={} | status={} | iterations={} | loglik={:.6e} | objective={:.6e}",
             cause_count,
-            fit.fit.outer_converged,
+            fit.fit.pirls_status.label(),
             fit.fit.outer_iterations,
             fit.fit.log_likelihood,
             fit.fit.reml_score
@@ -6496,8 +6496,9 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
             notes.push(format!("Block roles: {}", role_labels.join(", ")));
         }
         notes.push(format!(
-            "Outer iterations: {} (converged: {})",
-            unified.outer_iterations, unified.outer_converged
+            "Outer iterations: {} (status: {})",
+            unified.outer_iterations,
+            unified.pirls_status.label()
         ));
         notes.push(format!(
             "Log-likelihood: {:.4}, penalized objective: {:.4}",

@@ -277,6 +277,28 @@ impl PirlsStatus {
             PirlsStatus::MaxIterationsReached | PirlsStatus::LmStepSearchExhausted
         )
     }
+
+    /// Short human-readable label for reports and diagnostics. Stable text
+    /// (not the `Debug` rendering) so report output does not silently change if
+    /// the variant identifiers are ever renamed.
+    #[inline]
+    pub const fn label(self) -> &'static str {
+        match self {
+            PirlsStatus::Converged => "Converged",
+            PirlsStatus::StalledAtValidMinimum => "Stalled at valid minimum",
+            PirlsStatus::MaxIterationsReached => "Max iterations reached",
+            PirlsStatus::LmStepSearchExhausted => "LM step search exhausted",
+            PirlsStatus::Unstable => "Unstable (possible separation)",
+        }
+    }
+
+    /// Whether this status represents a clean convergence to the mode. Only
+    /// `Converged` qualifies; every other state carries a caveat a reader
+    /// should see flagged.
+    #[inline]
+    pub const fn is_converged(self) -> bool {
+        matches!(self, PirlsStatus::Converged)
+    }
 }
 
 /// Holds the result of a converged P-IRLS inner loop for a fixed rho.
