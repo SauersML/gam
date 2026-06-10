@@ -8405,3 +8405,169 @@ fn auto_outer_subsample_two_phase_converges_to_full_data_optimum() {
         "with auto_outer_subsample=false the counter must stay at 0"
     );
 }
+
+/// #740: the direction-contracted ψψ second-order kernel must reproduce the
+/// exact α-contraction of the per-pair `second_order_terms(i, j)`.
+///
+/// This is the family-side exactness gate for the profiled θ-HVP: the operator
+/// applies `second_order_terms_contracted(α_ψ)` once per matvec instead of the
+/// dense path's K² per-pair `second_order_terms`. The two MUST agree term for
+/// term — `Σ_j α_j second_order_terms(i, j) == second_order_terms_contracted(α)[i]`
+/// — for objective, score, and the (dense-materialized) Hessian operator, across
+/// a non-trivial ψ direction. A wrong contraction (sign, dropped i↔j leg, or a
+/// dropped same-block cross design term) shows up here as a non-zero residual.
+#[test]
+fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
+    use crate::custom_family::CustomFamilyBlockPsiDerivative;
+
+    let n = 40usize;
+    // Two-column marginal block + one-column logslope block, so the marginal ψ
+    // axes carry a genuine multi-coefficient design derivative `x_psi`.
+    let y: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| if (i * 37 + 11) % 5 >= 3 { 1.0 } else { 0.0 }));
+    let weights = Array1::from_elem(n, 1.0);
+    let z: Array1<f64> =
+        Array1::from_iter((0..n).map(|i| -1.2 + 2.4 * ((i % 7) as f64 + 0.5) / 7.0));
+    let marginal = Array2::from_shape_fn((n, 2), |(r, c)| {
+        if c == 0 {
+            1.0
+        } else {
+            ((r * 13 + 5) % 11) as f64 / 11.0 - 0.5
+        }
+    });
+    let logslope = Array2::from_shape_fn((n, 1), |_| 1.0);
+    let family = BernoulliMarginalSlopeFamily {
+        y: Arc::new(y),
+        weights: Arc::new(weights),
+        z: Arc::new(z),
+        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            marginal.clone(),
+        )),
+        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(logslope)),
+        ..default_test_family()
+    };
+
+    let states = vec![
+        ParameterBlockState {
+            beta: array![0.3, -0.2],
+            eta: marginal.dot(&array![0.3, -0.2]),
+        },
+        ParameterBlockState {
+            beta: array![0.25],
+            eta: Array1::from_elem(n, 0.25),
+        },
+    ];
+    let specs = vec![dummy_blockspec(2, n), dummy_blockspec(1, n)];
+
+    // Two ψ axes on the marginal block, each a distinct design-derivative column
+    // `x_psi` (shape n×2). Distinct columns make the ψ_i/ψ_j legs asymmetric so
+    // the i↔j contraction is genuinely exercised.
+    let x_psi_0 = Array2::from_shape_fn((n, 2), |(r, c)| {
+        ((r * 7 + c * 3 + 1) % 9) as f64 / 9.0 - 0.4
+    });
+    let x_psi_1 = Array2::from_shape_fn((n, 2), |(r, c)| {
+        ((r * 5 + c * 2 + 4) % 8) as f64 / 8.0 - 0.55
+    });
+    let derivative_blocks: Vec<Vec<CustomFamilyBlockPsiDerivative>> = vec![
+        vec![
+            CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi_0,
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            ),
+            CustomFamilyBlockPsiDerivative::new(
+                None,
+                x_psi_1,
+                Array2::zeros((2, 2)),
+                None,
+                None,
+                None,
+                None,
+            ),
+        ],
+        Vec::new(),
+    ];
+
+    let opts = BlockwiseFitOptions::default();
+    let ws = family
+        .exact_newton_joint_psi_workspace_with_options(&states, &specs, &derivative_blocks, &opts)
+        .expect("psi workspace with options")
+        .expect("psi workspace some");
+
+    let psi_dim: usize = derivative_blocks.iter().map(Vec::len).sum();
+    assert_eq!(psi_dim, 2, "fixture should expose two marginal ψ axes");
+
+    // A non-trivial ψ direction (no axis dominant, opposite signs).
+    let alpha = [0.7_f64, -1.3_f64];
+
+    let contracted = ws
+        .second_order_terms_contracted(&alpha)
+        .expect("contracted second-order call")
+        .expect("contracted second-order some (likelihood kernel available)");
+    assert_eq!(contracted.objective.len(), psi_dim);
+    assert_eq!(contracted.score.nrows(), psi_dim);
+    assert_eq!(contracted.hessian.len(), psi_dim);
+
+    // Reference: Σ_j α_j second_order_terms(i, j), per output row i.
+    for i in 0..psi_dim {
+        let mut ref_obj = 0.0_f64;
+        let mut ref_score: Option<Array1<f64>> = None;
+        let mut ref_hess: Option<Array2<f64>> = None;
+        for (j, &aj) in alpha.iter().enumerate() {
+            if aj == 0.0 {
+                continue;
+            }
+            let pair = ws
+                .second_order_terms(i, j)
+                .expect("per-pair second-order call")
+                .expect("per-pair second-order some");
+            ref_obj += aj * pair.objective_psi_psi;
+            let score_j = pair.score_psi_psi.mapv(|v| aj * v);
+            ref_score = Some(match ref_score {
+                Some(acc) => acc + &score_j,
+                None => score_j,
+            });
+            let hess_j = pair
+                .hessian_psi_psi_operator
+                .as_ref()
+                .expect("per-pair hessian operator")
+                .to_dense()
+                .mapv(|v| aj * v);
+            ref_hess = Some(match ref_hess {
+                Some(acc) => acc + &hess_j,
+                None => hess_j,
+            });
+        }
+        let ref_score = ref_score.expect("non-empty alpha");
+        let ref_hess = ref_hess.expect("non-empty alpha");
+
+        let obj_err = (contracted.objective[i] - ref_obj).abs()
+            / (1.0 + ref_obj.abs());
+        assert!(
+            obj_err < 1e-10,
+            "row {i}: contracted objective {} != Σ_j α_j V_ij {} (rel {obj_err:.3e})",
+            contracted.objective[i],
+            ref_obj
+        );
+
+        let score_err = rel_diff_array1(&contracted.score.row(i).to_owned(), &ref_score);
+        assert!(
+            score_err < 1e-9,
+            "row {i}: contracted score diverged from Σ_j α_j g_ij (rel {score_err:.3e})"
+        );
+
+        let hess_dense = match &contracted.hessian[i] {
+            crate::solver::estimate::reml::unified::DriftDerivResult::Operator(op) => op.to_dense(),
+            crate::solver::estimate::reml::unified::DriftDerivResult::Dense(m) => m.clone(),
+        };
+        let hess_err = rel_diff_array2(&hess_dense, &ref_hess);
+        assert!(
+            hess_err < 1e-9,
+            "row {i}: contracted Hessian diverged from Σ_j α_j D²_ψ H_L[ψ_i, ψ_j] (rel {hess_err:.3e})"
+        );
+    }
+}
