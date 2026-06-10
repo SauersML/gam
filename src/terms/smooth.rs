@@ -8546,9 +8546,17 @@ fn apply_global_smooth_identifiability(
         let term = &smooth.terms[idx];
         let termspec = &smoothspecs[idx];
         let design_local = smooth.term_designs[idx].clone();
-        let skip_global_transform =
-            smooth_has_frozen_identifiability(termspec) || term.lower_bounds_local.is_some();
-        let owner_indices = if skip_global_transform {
+        // A frozen global-orthogonality chart (#978) is a pure replay: the
+        // fit already decided this term's residualization against its owner
+        // terms, and that decision is training-row data — rederiving it from
+        // new rows would be wrong, and skipping it (the pre-#978 behavior)
+        // emitted an unresidualized design wider than the fitted coefficient
+        // block. So it bypasses both the owner analysis and the frozen-skip
+        // gate below.
+        let replay_z = frozen_global_orthogonality(termspec);
+        let skip_global_transform = replay_z.is_none()
+            && (smooth_has_frozen_identifiability(termspec) || term.lower_bounds_local.is_some());
+        let owner_indices = if replay_z.is_some() || skip_global_transform {
             Vec::new()
         } else {
             // Relative cross-residual above which a dependent smooth's design is
@@ -8583,7 +8591,8 @@ fn apply_global_smooth_identifiability(
                     .expect("owner design must be available before dependent smooth")
             })
             .collect::<Vec<_>>();
-        let needs_parametric_block = !skip_global_transform
+        let needs_parametric_block = replay_z.is_none()
+            && !skip_global_transform
             && (smooth_has_overlapping_linear_terms(linear_terms, termspec)
                 || !smooth_intrinsic_parametric_feature_cols(linear_terms, termspec).is_empty()
                 || smooth_requires_parametric_orthogonality(termspec)
