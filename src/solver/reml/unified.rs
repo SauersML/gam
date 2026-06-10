@@ -5154,9 +5154,18 @@ impl PenaltySubspaceTrace {
     /// solve — strictly cheaper than the `O(p²)` full `hop.solve_multi`
     /// when `r ≪ p`, and bounded regardless of `σ_min(H)`.
     pub fn apply_pseudo_inverse(&self, a: &Array1<f64>) -> Array1<f64> {
-        let proj_a = crate::faer_ndarray::fast_atv(&self.u_s, a);
-        let h_proj_inv_a = self.h_proj_inverse.dot(&proj_a);
-        crate::faer_ndarray::fast_av(&self.u_s, &h_proj_inv_a)
+        // The one sensitivity operator (#935): the projected inverse action
+        // `U_S · H_proj⁻¹ · U_Sᵀ · a` has a single spelling, shared with every
+        // other consumer of `FittedInverse::Projected`.
+        self.sensitivity().apply(a)
+    }
+
+    /// View this projected trace kernel as the unified [`FitSensitivity`]
+    /// (#935) over the rank-deficient LAML convention `K = U_S · H_proj⁻¹ ·
+    /// U_Sᵀ`. The trace machinery stays here; the *inverse action* is the
+    /// shared operator, so no site can disagree about what `H⁻¹` means.
+    pub fn sensitivity(&self) -> crate::solver::sensitivity::FitSensitivity<'_> {
+        crate::solver::sensitivity::FitSensitivity::from_projected(&self.u_s, &self.h_proj_inverse)
     }
 
     /// Build the **constrained pseudo-inverse kernel**

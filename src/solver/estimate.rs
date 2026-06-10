@@ -1511,12 +1511,12 @@ fn compute_smoothing_correction(
     // penalty block, and skip structurally inactive columns. Exact on a
     // block-decoupled Hessian (entries outside the cone are identically zero)
     // and identical to the full joint solve on a fully coupled Hessian.
-    let jacobian_trans = match crate::solver::evidence::ift_dbeta_drho_coned(
-        h_trans.view(),
-        dg_drho_trans.view(),
-        &col_supports,
-        |rhs| h_chol.solvevec(rhs),
-    ) {
+    let jacobian_trans = match crate::solver::sensitivity::FitSensitivity::from_faer_cholesky(
+        &h_chol,
+        n_coeffs_trans,
+    )
+    .mode_response_coned(h_trans.view(), dg_drho_trans.view(), &col_supports)
+    {
         Some(jacobian) => jacobian,
         None => {
             log::warn!("IFT beta-rho sensitivity solve failed for smoothing correction; skipping.");
