@@ -6532,11 +6532,28 @@ fn build_factor_smooth(
         );
     }
 
+    // `Fs` (order ≥ 1, the default) is the random-effect flavour: it penalizes
+    // each null-space dimension of the marginal wiggliness penalty separately
+    // below (mgcv's `bs="fs"` construction). That replaces the marginal's single
+    // *combined* double penalty, so disable the latter here to avoid penalizing
+    // the null space twice (once combined, once per dimension). The explicit
+    // `m=0` opt-out keeps the legacy combined double penalty and adds no
+    // per-dimension penalties.
+    let use_per_dim_null = matches!(
+        &spec.flavour,
+        FactorSmoothFlavour::Fs { m_null_penalty_orders }
+            if m_null_penalty_orders.iter().copied().max().unwrap_or(0) >= 1
+    );
+
     // Build the shared marginal design + penalties from the 1-D B-spline.
     // `Re` forces a degree-1 marginal (linear span) and replaces the marginal
     // wiggliness with an identity ridge below; `Fs` keeps the user's marginal
-    // (cubic by default) with its double penalty so the null space is shrunk.
-    let marginal_spec = factor_smooth_marginal_for_replay(&spec.marginal);
+    // (cubic by default) and, under the per-dimension null path, gets its null
+    // space penalized one dimension at a time after replication.
+    let mut marginal_spec = factor_smooth_marginal_for_replay(&spec.marginal);
+    if use_per_dim_null {
+        marginal_spec.double_penalty = false;
+    }
     let inner_term = SmoothTermSpec {
         name: format!("{term_name}::marginal"),
         basis: SmoothBasisSpec::BSpline1D {
@@ -6637,66 +6654,74 @@ fn build_factor_smooth(
     };
 
     // `Fs` is the random-effect flavour of a smooth: the per-group curve is an
-    // exchangeable Gaussian *function*, so its WHOLE coefficient vector — not
-    // only the {const, linear} null space the double penalty already ridges —
-    // must be shrinkable toward zero under one shared variance. The marginal's
-    // derivative (wiggliness) penalty `S_wiggle` shapes the curvature but leaves
-    // its overall MAGNITUDE governed only by the curvature eigenvalues; the
-    // softest curvature mode (just past linear) is then barely penalized, so
-    // REML can park ~0.8 residual curvature DF per group on within-window noise
-    // and the held-out forecast curves away from the true per-group line
-    // (gam#712 real arm, gam#713). Capping the basis dimension (dc912b30) shrank
-    // the count of those modes but not their variance.
+    // exchangeable Gaussian *function*, so EVERY coefficient — including the
+    // {const, linear} null space of the marginal wiggliness penalty — must be
+    // shrinkable toward zero under its own shared variance. The wiggliness
+    // penalty `S_wiggle` shapes curvature but leaves the per-group intercept and
+    // slope (its null space) completely UNPENALIZED. With the null space free,
+    // each group fits its own intercept and slope with NO partial pooling, so
+    // the held-out per-subject forecast inherits the full no-pooling variance
+    // and curves away from the true per-group line (gam#712 real arm, gam#713;
+    // gam#903 sleepstudy forecast ran ~74% over the lme4 BLUP bar).
     //
-    // Add a range-space identity ridge `I_L ⊗ (I_p − Z Zᵀ)` (Z = the marginal
-    // wiggliness null basis = the {const, linear} directions), shared across all
-    // groups under a single λ, so the curvature MAGNITUDE of every group's curve
-    // is a proper zero-mean random effect. With linear data REML drives this λ
-    // up and the per-group curvature variance → 0, degrading `fs` to the linear
-    // random slope the DGP is (edf → ≈2/group); with genuine curvature the same
-    // λ stays small and the wiggle survives (it is data-adaptive, not a cap).
-    // The ridge is gated by `m_null_penalty_orders`: order ≥ 1 enables it, the
-    // explicit `m=0` form opts out and keeps the legacy null-only double penalty.
-    if let FactorSmoothFlavour::Fs {
-        m_null_penalty_orders,
-    } = &spec.flavour
-        && m_null_penalty_orders.iter().copied().max().unwrap_or(0) >= 1
+    // mgcv's `bs="fs"` fixes this by penalizing each null-space dimension
+    // SEPARATELY (`smooth.construct.fs.smooth.spec` adds one rank-1 penalty per
+    // null coordinate), each replicated block-diagonally across levels under a
+    // single shared smoothing parameter — so REML fits a distinct
+    // random-intercept variance and random-slope variance, the partial pooling
+    // that makes the forecast track lme4's correlated random-effect BLUP. A
+    // single *combined* null penalty (one λ for intercept+slope together) cannot
+    // express the typically very different intercept and slope variances, which
+    // is the residual forecast gap. We mirror mgcv exactly: for each orthonormal
+    // null direction `z_k` of the marginal wiggliness penalty add
+    // `I_L ⊗ (z_k z_kᵀ)` as its own penalty. The marginal's combined double
+    // penalty was disabled above, so the null space is penalized once, per
+    // dimension. With linear data REML drives the curvature λ up and degrades
+    // `fs` to a linear random slope (edf → ≈2/group); with genuine curvature the
+    // wiggliness λ stays small and the wiggle survives (data-adaptive, not a
+    // cap). Gated by `m_null_penalty_orders`: order ≥ 1 (default) enables the
+    // per-dimension null penalties; `m=0` keeps the legacy combined double
+    // penalty and adds nothing here.
+    if use_per_dim_null
+        && let Some(Some(z)) = inner.null_eigenvectors.first()
+        && z.nrows() == p
     {
-        // Range-space projector for one marginal block: `P = I_p − Z Zᵀ`, the
-        // orthogonal complement of the wiggliness penalty's null space (the
-        // curvature subspace). `inner.null_eigenvectors[0]` is the orthonormal
-        // null basis of the primary marginal penalty `S_wiggle`; when the
-        // marginal is full-rank (`None`) the whole block is curvature and the
-        // projector is the identity.
-        let mut p_range = Array2::<f64>::eye(p);
-        if let Some(Some(z)) = inner.null_eigenvectors.first()
-            && z.nrows() == p
-        {
-            p_range -= &z.dot(&z.t());
-        }
-        let mut s_range = Array2::<f64>::zeros((q, q));
-        for level in 0..n_levels {
-            let start = level * p;
-            s_range
-                .slice_mut(s![start..start + p, start..start + p])
-                .assign(&p_range);
-        }
-        let (s_range, range_scale) = normalize_penalty_in_constrained_space(&s_range);
-        let range_block = crate::terms::basis::analyze_penalty_block_with_op(&s_range, None)?;
-        if range_block.rank > 0 {
-            let original_index = penalties.len();
-            penalties.push(range_block.sym_penalty);
-            nullspaces.push(range_block.nullity);
-            penaltyinfo.push(PenaltyInfo {
-                source: PenaltySource::Primary,
-                original_index,
-                active: true,
-                effective_rank: range_block.rank,
-                dropped_reason: None,
-                nullspace_dim_hint: range_block.nullity,
-                normalization_scale: range_scale,
-                kronecker_factors: None,
-            });
+        for k in 0..z.ncols() {
+            // Rank-1 marginal penalty `z_k z_kᵀ`, replicated block-diagonally
+            // across levels into `I_L ⊗ (z_k z_kᵀ)`. Its own λ is one shared
+            // variance for this null component (intercept or slope) across all
+            // groups — the random-effect structure of mgcv `fs`.
+            let zk = z.column(k);
+            let mut p_k = Array2::<f64>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    p_k[[a, b]] = zk[a] * zk[b];
+                }
+            }
+            let mut s_null = Array2::<f64>::zeros((q, q));
+            for level in 0..n_levels {
+                let start = level * p;
+                s_null
+                    .slice_mut(s![start..start + p, start..start + p])
+                    .assign(&p_k);
+            }
+            let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null);
+            let null_block = crate::terms::basis::analyze_penalty_block_with_op(&s_null, None)?;
+            if null_block.rank > 0 {
+                let original_index = penalties.len();
+                penalties.push(null_block.sym_penalty);
+                nullspaces.push(null_block.nullity);
+                penaltyinfo.push(PenaltyInfo {
+                    source: PenaltySource::Primary,
+                    original_index,
+                    active: true,
+                    effective_rank: null_block.rank,
+                    dropped_reason: None,
+                    nullspace_dim_hint: null_block.nullity,
+                    normalization_scale: null_scale,
+                    kronecker_factors: None,
+                });
+            }
         }
     }
     let null_eigenvectors = crate::terms::basis::recompute_null_eigenvectors(&penalties)?;
