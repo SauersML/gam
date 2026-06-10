@@ -10432,14 +10432,17 @@ fn compute_outer_hessian(
                 // projected kernel so the outer Hessian matches the projected
                 // `½ log|U_Sᵀ H U_S|_+` cost.
                 let base = if kk == ll {
+                    // Pure Aₖ for the diagonal base term: the stored override when
+                    // a correction made Aₖ ≠ Ḣₖ, else Ḣₖ itself (they coincide).
+                    let a_kk = a_k_matrices[kk].as_ref().unwrap_or(&h_k_matrices[kk]);
                     if let Some(kernel) = subspace {
-                        kernel.trace_projected_logdet(&a_k_matrices[kk])
+                        kernel.trace_projected_logdet(a_kk)
                     } else if solution.penalty_coords[kk].is_block_local() {
                         let (block, start, end) =
                             solution.penalty_coords[kk].scaled_block_local(1.0);
                         hop.trace_logdet_block_local(&block, curvature_lambdas[kk], start, end)
                     } else {
-                        hop.trace_logdet_gradient(&a_k_matrices[kk])
+                        hop.trace_logdet_gradient(a_kk)
                     }
                 } else {
                     0.0
