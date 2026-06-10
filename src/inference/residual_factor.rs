@@ -709,3 +709,78 @@ fn penalized_log_evidence(
     let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
     log_lik - 0.5 * k_params * (n.max(2) as f64).ln()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::{Array1, Array2};
+
+    fn lcg_uniform(state: &mut u64) -> f64 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    fn lcg_normal(state: &mut u64) -> f64 {
+        let u1 = lcg_uniform(state).max(1e-12);
+        let u2 = lcg_uniform(state);
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+
+    /// Per-rank evidence breakdown on the planted single-factor activity-law
+    /// DGP (the `fitted_scale_recovers_planted_activity_law` plant). Pins the
+    /// rank-selection decision itself: the ladder must prefer rank 1, and this
+    /// test names the margin so an over-selection regression is diagnosable
+    /// from the failure message alone.
+    #[test]
+    fn evidence_ladder_prefers_planted_rank_one() {
+        let n = 5000usize;
+        let p = 4usize;
+        let lambda0 = ndarray::array![[1.5], [1.2], [-0.4], [0.3]];
+        let sigma_eps = 0.2_f64;
+        let slope = 1.3_f64;
+        let mut seed = 0xD1B54A32D192ED03_u64;
+        let mut residuals = Array2::<f64>::zeros((n, p));
+        let mut activity = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let z = (row as f64) / (n as f64 - 1.0);
+            activity[row] = z;
+            let amp = (slope * z).exp().sqrt();
+            let f = lcg_normal(&mut seed);
+            for i in 0..p {
+                residuals[[row, i]] = amp * lambda0[[i, 0]] * f + sigma_eps * lcg_normal(&mut seed);
+            }
+        }
+        // Reproduce fit()'s bin assignment, then score each rank directly.
+        let bins = ACTIVITY_SCALE_BINS.max(1);
+        let row_bin: Vec<usize> = (0..n)
+            .map(|i| {
+                let frac = activity[i];
+                (frac * bins as f64).floor().clamp(0.0, bins as f64 - 1.0) as usize
+            })
+            .collect();
+        let mut report = String::new();
+        let mut ev = Vec::new();
+        for rank in 0..=2usize {
+            let m = StructuredResidualModel::fit_fixed_rank(residuals.view(), &row_bin, bins, rank)
+                .expect("fixed-rank fit");
+            let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
+            let log_lik = m.log_evidence() + 0.5 * k_params * (n as f64).ln();
+            let col_norms: Vec<f64> = (0..rank)
+                .map(|k| m.factor().column(k).iter().map(|v| v * v).sum::<f64>().sqrt())
+                .collect();
+            report.push_str(&format!(
+                "rank {rank}: evidence={:.3} loglik={:.3} penalty={:.3} col_norms={:?} diag={:?}\n",
+                m.log_evidence(),
+                log_lik,
+                0.5 * k_params * (n as f64).ln(),
+                col_norms,
+                m.diagonal().iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>()
+            ));
+            ev.push(m.log_evidence());
+        }
+        assert!(
+            ev[1] > ev[0] && ev[1] > ev[2],
+            "evidence ladder must prefer the planted rank 1; breakdown:\n{report}"
+        );
+    }
+}
