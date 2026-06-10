@@ -16,7 +16,7 @@ use gam::inference::row_metric::{MetricProvenance, RowMetric};
 use gam::sae_identifiability::{
     AtomTopology, FittedAtom, FittedSaeManifold, GeneratorFamily, residual_gauge,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use std::sync::Arc;
 
 /// A single 2-latent-dim Euclidean-patch atom with output_dim = 1 and decoder
@@ -306,4 +306,167 @@ fn sym_f_triviality_checked_only_under_output_fisher() {
     };
     let report_euc = residual_gauge(&model_euc).expect("certificate euc");
     assert_eq!(report_euc.sym_f_trivial_under_output_fisher, None);
+}
+
+/// One 2-latent Euclidean-patch atom with output_dim = 1 (frame `[[1, 0]]`,
+/// param_dim = 2) carrying an explicit ARD prior on its two latent axes. The
+/// data is invariant to the `so(2)` axis rotation and the isometry pin is
+/// inactive, so whether the prior leaves that rotation free is decided purely by
+/// the ARD variances — exactly the planted degeneracy the issue names: equal-ARD
+/// axes ⇒ the report must name a rotation subgroup of the right dimension.
+fn equal_ard_patch_atom(ard: [f64; 2]) -> FittedAtom {
+    let mut frame = Array2::<f64>::zeros((1, 2));
+    frame[[0, 0]] = 1.0;
+    FittedAtom {
+        name: "ard-patch".to_string(),
+        topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
+        frame,
+        ard_variances: Some(Array1::from(ard.to_vec())),
+    }
+}
+
+#[test]
+fn equal_ard_axes_name_the_rotation_subgroup_of_the_right_dimension() {
+    // EQUAL ARD: the two latent axes carry identical prior variances, so the
+    // ARD prior cannot distinguish them and the axis rotation between them is a
+    // candidate residual freedom. With the data invariant to that rotation and
+    // no isometry pin, the equal-ARD rotation must come back UNPINNED — and
+    // there must be exactly one such generator (the so(2) rotation of a 2-axis
+    // patch has dimension 1).
+    let model_equal = FittedSaeManifold {
+        atoms: vec![equal_ard_patch_atom([1.0, 1.0])],
+        jacobian_rows: data_jacobian_rows_invariant_to_rotation(),
+        isometry_penalty_root: Array2::<f64>::zeros((0, 2)),
+        metric: euclidean_metric(3, 1),
+    };
+    let report_equal = residual_gauge(&model_equal).expect("certificate equal-ARD");
+    let unpinned_equal_ard = report_equal
+        .generators
+        .iter()
+        .filter(|g| g.family == GeneratorFamily::EqualArdRotation && g.unpinned)
+        .count();
+    assert_eq!(
+        unpinned_equal_ard, 1,
+        "equal-ARD axes must expose exactly one unpinned rotation generator (the \
+         so(2) subgroup of a 2-axis patch, dimension 1). {}",
+        report_equal.summary
+    );
+
+    // DISTINCT ARD: the prior variances differ, so the prior pins the axis
+    // rotation — no equal-ARD rotation is even a candidate. The certificate must
+    // enumerate zero equal-ARD generators (the subgroup has dimension 0), so the
+    // reported rotation-freedom dimension drops by exactly one relative to the
+    // equal case. The non-prior Isom(M_k) rotation is unaffected (the ARD prior
+    // is not the isometry pin), so this is purely the prior's doing.
+    let model_distinct = FittedSaeManifold {
+        atoms: vec![equal_ard_patch_atom([1.0, 4.0])],
+        jacobian_rows: data_jacobian_rows_invariant_to_rotation(),
+        isometry_penalty_root: Array2::<f64>::zeros((0, 2)),
+        metric: euclidean_metric(3, 1),
+    };
+    let report_distinct = residual_gauge(&model_distinct).expect("certificate distinct-ARD");
+    let any_equal_ard = report_distinct
+        .generators
+        .iter()
+        .any(|g| g.family == GeneratorFamily::EqualArdRotation);
+    assert!(
+        !any_equal_ard,
+        "distinct ARD variances must pin the axis rotation: no equal-ARD rotation \
+         generator may be enumerated (the prior-free subgroup has dimension 0). {}",
+        report_distinct.summary
+    );
+}
+
+#[test]
+fn exchangeable_atom_pair_surfaces_the_permutation_factor_under_euclidean() {
+    // Two topology-identical patch atoms with DISTINCT frames, output_dim = 2,
+    // param_dim = 8. The atom-exchange (swap) generator is the planted
+    // permutation degeneracy. With no isometry pin and a data Jacobian that does
+    // NOT span the swap direction, the certificate must report the permutation
+    // generator as an UNPINNED residual gauge freedom — the `Sym(F)` permutation
+    // factor of the gauge group. Under Euclidean provenance the Sym(F)-triviality
+    // check does not apply, so no certificate-violation flag fires; the freedom
+    // is honestly reported as a residual permutation.
+    let make = |name: &str, frame: Array2<f64>| FittedAtom {
+        name: name.to_string(),
+        topology: AtomTopology::EuclideanPatch { latent_dim: 2 },
+        frame,
+        ard_variances: None,
+    };
+    let frame_a = Array2::<f64>::eye(2);
+    let mut frame_b = Array2::<f64>::zeros((2, 2));
+    frame_b[[0, 0]] = 2.0;
+    frame_b[[1, 1]] = 3.0;
+    let param_dim = 8usize;
+    let p = 2usize;
+
+    // FREE: no isometry pin, a single all-zero Jacobian row (the data gives no
+    // curvature) ⇒ the swap direction is unpinned.
+    let model_free = FittedSaeManifold {
+        atoms: vec![make("a", frame_a.clone()), make("b", frame_b.clone())],
+        jacobian_rows: vec![vec![0.0_f64; p * param_dim]],
+        isometry_penalty_root: Array2::<f64>::zeros((0, param_dim)),
+        metric: euclidean_metric(1, p),
+    };
+    let report_free = residual_gauge(&model_free).expect("certificate exchangeable-free");
+    assert_eq!(report_free.metric_provenance, MetricProvenance::Euclidean);
+    // Euclidean ⇒ the Sym(F)-triviality check does not apply.
+    assert_eq!(report_free.sym_f_trivial_under_output_fisher, None);
+    let perm_free = report_free
+        .generators
+        .iter()
+        .find(|g| g.family == GeneratorFamily::AtomPermutation)
+        .expect("an atom-permutation generator must be enumerated");
+    assert!(
+        perm_free.generator_norm > 0.0,
+        "distinct frames must give a non-trivial atom-exchange generator"
+    );
+    assert!(
+        perm_free.unpinned,
+        "an exchangeable atom pair with no pinning must surface the permutation \
+         factor as a residual gauge freedom. {}",
+        report_free.summary
+    );
+
+    // PINNED (under-claim guard): give the data exactly the swap tangent
+    //   g = [1,0,0,2,-1,0,0,-2]  (frame_b − frame_a placed antisymmetrically:
+    //   base_a slot = +diff, base_b slot = −diff; only the (0,0) and (1,1)
+    //   frame entries differ, by 1 and 2 respectively).
+    // Loading output coordinate 0's Jacobian row with g makes range(H_data)
+    // span the swap, so the permutation must now be reported PINNED.
+    let g = [1.0, 0.0, 0.0, 2.0, -1.0, 0.0, 0.0, -2.0];
+    let mut j_flat = vec![0.0_f64; p * param_dim];
+    for (c, &gc) in g.iter().enumerate() {
+        j_flat[c] = gc; // output coordinate 0: j_flat[0*param_dim + c]
+    }
+    let model_pinned = FittedSaeManifold {
+        atoms: vec![make("a", frame_a), make("b", frame_b)],
+        jacobian_rows: vec![j_flat],
+        isometry_penalty_root: Array2::<f64>::zeros((0, param_dim)),
+        metric: euclidean_metric(1, p),
+    };
+    let report_pinned = residual_gauge(&model_pinned).expect("certificate exchangeable-pinned");
+    let perm_pinned = report_pinned
+        .generators
+        .iter()
+        .find(|g| g.family == GeneratorFamily::AtomPermutation)
+        .expect("an atom-permutation generator must be enumerated");
+    assert!(
+        !perm_pinned.unpinned,
+        "data spanning the swap tangent must pin the permutation factor \
+         (under-claim guard). {}",
+        report_pinned.summary
+    );
+
+    // The two fixtures differ only in whether the swap is pinned ⇒ their certified
+    // group signatures must differ: the permutation factor is present in one and
+    // absent in the other.
+    assert_ne!(
+        report_free.group_signature(),
+        report_pinned.group_signature(),
+        "the exchangeable (free-permutation) and pinned fixtures must NOT be \
+         certified up to the same group.\nfree:   {}\npinned: {}",
+        report_free.summary,
+        report_pinned.summary
+    );
 }
