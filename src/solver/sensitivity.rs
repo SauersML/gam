@@ -39,7 +39,7 @@
 //!    pseudo-inverse construct the [`FittedInverse::Projected`] variant.
 //! 3. #461 `score_influence_jacobian` sites.
 
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::linalg::faer_ndarray::FaerCholeskyFactor;
 
@@ -246,6 +246,108 @@ impl<'a> FitSensitivity<'a> {
         assert_eq!(design.ncols(), self.dim, "FitSensitivity design width");
         self.apply_multi(design.t())
     }
+
+    /// Case-deletion influence (dfbetas + Cook's distance) for every
+    /// observation, built from the one sensitivity operator — the
+    /// "leave-one-out" channel #935 was designed to unify.
+    ///
+    /// Deleting observation `i` perturbs the penalized score by exactly its
+    /// own contribution, so the IFT mode response gives the coefficient
+    /// change in closed form (the penalized Sherman–Morrison identity):
+    ///
+    /// ```text
+    ///   β̂ − β̂₍ᵢ₎ = (w_i r_i / (1 − h_ii)) · H⁻¹ x_i
+    /// ```
+    ///
+    /// where `x_i` is row `i` of `design`, `w_i = working_weights[i]` the
+    /// IRLS working weight, `r_i = working_residual[i]` the working residual
+    /// `z_i − x_iᵀβ̂`, and `h_ii = w_i x_iᵀ H⁻¹ x_i` the leverage. Column `i`
+    /// of [`Self::leverage_block`] **is** `H⁻¹ x_i`, so each dfbeta is one
+    /// scaled column — no per-observation refit, no second factorization.
+    /// For a Gaussian penalized fit the identity is exact; for a GLM it is
+    /// the standard one-step (ALO) approximation, consistent with the
+    /// leverage already reported by `AloDiagnostics`.
+    ///
+    /// Cook's distance uses the metric the fit actually moves in,
+    /// `H = XᵀWX + S`:
+    ///
+    /// ```text
+    ///   D_i = (β̂−β̂₍ᵢ₎)ᵀ H (β̂−β̂₍ᵢ₎) / (p · φ)
+    ///       = (w_i r_i / (1 − h_ii))² · (h_ii / w_i) / (p · φ),
+    /// ```
+    ///
+    /// the second form following from `(H⁻¹x_i)ᵀ H (H⁻¹x_i) = x_iᵀ H⁻¹ x_i`,
+    /// so no separate `H` apply is needed.
+    ///
+    /// This is an *opt-in* diagnostic: `dfbeta` is `n × p` and is never
+    /// materialized on the default fit path (it would be ruinous at biobank
+    /// scale). Returns `None` on a shape mismatch or if any leverage reaches
+    /// `1` (a point the deletion identity cannot resolve).
+    pub fn case_deletion(
+        &self,
+        design: &Array2<f64>,
+        working_weights: ArrayView1<'_, f64>,
+        working_residual: ArrayView1<'_, f64>,
+        phi: f64,
+    ) -> Option<CaseDeletionInfluence> {
+        let n = design.nrows();
+        let p = design.ncols();
+        if p != self.dim
+            || working_weights.len() != n
+            || working_residual.len() != n
+            || !(phi.is_finite() && phi > 0.0)
+            || p == 0
+        {
+            return None;
+        }
+        // Column i of H⁻¹Xᵀ is H⁻¹ x_i — one blocked solve for all n.
+        let h_inv_xt = self.leverage_block(design);
+
+        let mut dfbeta = Array2::<f64>::zeros((n, p));
+        let mut leverage = Array1::<f64>::zeros(n);
+        let mut cooks = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let x_i = design.row(i);
+            let hinv_xi = h_inv_xt.column(i);
+            let w_i = working_weights[i];
+            // x_iᵀ H⁻¹ x_i appears in both the leverage and Cook's distance.
+            let xhx = x_i.dot(&hinv_xi);
+            let h_ii = w_i * xhx;
+            let denom = 1.0 - h_ii;
+            // A leverage of exactly 1 means the row pins its own fit; the
+            // closed-form deletion is singular there and we refuse rather
+            // than emit an infinity.
+            if !denom.is_finite() || denom.abs() < f64::EPSILON {
+                return None;
+            }
+            let scale = w_i * working_residual[i] / denom;
+            for j in 0..p {
+                dfbeta[[i, j]] = scale * hinv_xi[j];
+            }
+            leverage[i] = h_ii;
+            // D_i = (β̂−β̂₍ᵢ₎)ᵀ H (β̂−β̂₍ᵢ₎) / (p·φ) and
+            // (H⁻¹x_i)ᵀ H (H⁻¹x_i) = x_iᵀ H⁻¹ x_i = xhx, so the quadratic
+            // form is scale²·xhx with no separate `H` apply.
+            cooks[i] = scale * scale * xhx / (p as f64 * phi);
+        }
+        Some(CaseDeletionInfluence {
+            dfbeta,
+            leverage,
+            cooks_distance: cooks,
+        })
+    }
+}
+
+/// Exact (Gaussian) / one-step (GLM) case-deletion influence produced by
+/// [`FitSensitivity::case_deletion`]. See that method for the identities.
+pub struct CaseDeletionInfluence {
+    /// `dfbeta[[i, j]]` = change in coefficient `j` when observation `i` is
+    /// left out, `β̂_j − β̂₍ᵢ₎_j`.
+    pub dfbeta: Array2<f64>,
+    /// Leverage (hat value) `h_ii = w_i x_iᵀ H⁻¹ x_i` per observation.
+    pub leverage: Array1<f64>,
+    /// Cook's distance per observation.
+    pub cooks_distance: Array1<f64>,
 }
 
 #[cfg(test)]
@@ -318,6 +420,95 @@ mod tests {
         let back = h.dot(&a);
         for i in 0..3 {
             assert!((back[i] - rhs[i]).abs() <= 1e-12, "inverse residual [{i}]");
+        }
+    }
+
+    /// Case-deletion dfbetas from the operator must equal the EXACT
+    /// leave-one-out refit of a ridge-penalized Gaussian fit — brute-force
+    /// dropping each row and re-solving — to machine precision. This is the
+    /// penalized Sherman–Morrison identity, analytic ground truth, no
+    /// external tool. Cook's distance is checked against its own definition
+    /// `(β−β₍ᵢ₎)ᵀ H (β−β₍ᵢ₎)/(p·φ)` using the exact refit.
+    #[test]
+    fn case_deletion_matches_exact_loo_refit() {
+        // Small over-determined ridge problem: H = XᵀX + S, β = H⁻¹ Xᵀ y,
+        // working weights w_i = 1 and working residual r_i = y_i − x_iᵀβ
+        // (the Gaussian identity-link IRLS reduction).
+        let x = array![
+            [1.0, 0.2, -0.5],
+            [1.0, -1.1, 0.3],
+            [1.0, 0.7, 1.4],
+            [1.0, 2.0, -0.8],
+            [1.0, -0.4, 0.9],
+            [1.0, 1.3, 0.1],
+        ];
+        let y = array![0.5, -1.2, 2.1, 0.3, -0.7, 1.0];
+        let n = x.nrows();
+        let p = x.ncols();
+        // Penalty S (a mild ridge on the two slopes, intercept unpenalized).
+        let mut s = Array2::<f64>::zeros((p, p));
+        s[[1, 1]] = 0.4;
+        s[[2, 2]] = 0.4;
+
+        let xtx = x.t().dot(&x);
+        let h = &xtx + &s;
+        let h_inv = {
+            let f = h.cholesky(Side::Lower).expect("SPD");
+            let mut out: Array2<f64> = Array2::eye(p);
+            f.solve_mat_in_place(&mut out);
+            out
+        };
+        let xty = x.t().dot(&y);
+        let beta = h_inv.dot(&xty);
+
+        let w = Array1::<f64>::ones(n);
+        let resid = &y - &x.dot(&beta);
+
+        let faer = h.cholesky(Side::Lower).expect("SPD");
+        let op = FitSensitivity::from_faer_cholesky(&faer, p);
+        let infl = op
+            .case_deletion(&x, w.view(), resid.view(), 1.0)
+            .expect("case deletion");
+
+        for i in 0..n {
+            // Exact refit with row i removed: H₍ᵢ₎ = H − x_i x_iᵀ (penalty S
+            // is a prior, unchanged by data deletion), rhs = Xᵀy − x_i y_i.
+            let x_i = x.row(i).to_owned();
+            let mut h_del = h.clone();
+            for a in 0..p {
+                for b in 0..p {
+                    h_del[[a, b]] -= x_i[a] * x_i[b];
+                }
+            }
+            let rhs_del = &xty - &(&x_i * y[i]);
+            let h_del_inv = {
+                let f = h_del.cholesky(Side::Lower).expect("SPD deleted");
+                let mut out: Array2<f64> = Array2::eye(p);
+                f.solve_mat_in_place(&mut out);
+                out
+            };
+            let beta_del = h_del_inv.dot(&rhs_del);
+            let exact_dfbeta = &beta - &beta_del;
+
+            for j in 0..p {
+                assert!(
+                    (infl.dfbeta[[i, j]] - exact_dfbeta[j]).abs() < 1e-9,
+                    "dfbeta[{i},{j}]: operator {} vs exact refit {}",
+                    infl.dfbeta[[i, j]],
+                    exact_dfbeta[j]
+                );
+            }
+            // Cook's distance against its definition with the exact refit.
+            let cook_exact = exact_dfbeta.dot(&h.dot(&exact_dfbeta)) / (p as f64 * 1.0);
+            assert!(
+                (infl.cooks_distance[i] - cook_exact).abs() < 1e-9,
+                "cooks[{i}]: {} vs {}",
+                infl.cooks_distance[i],
+                cook_exact
+            );
+            // Leverage must match the hat value x_iᵀ H⁻¹ x_i (w_i = 1).
+            let h_ii = x_i.dot(&h_inv.dot(&x_i));
+            assert!((infl.leverage[i] - h_ii).abs() < 1e-12, "leverage[{i}]");
         }
     }
 
