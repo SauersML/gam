@@ -4495,6 +4495,110 @@ impl SaeManifoldTerm {
         Ok(activated)
     }
 
+    /// Closed-form streaming POLAR refresh of every ACTIVE decoder frame from the
+    /// current data evidence (issue #972 / #977 T1) — the U-block of the
+    /// alternating block-coordinate ascent that complements the border's
+    /// C-block Newton step.
+    ///
+    /// For each framed atom `k` we accumulate the `p × r_k` cross-moment
+    ///   `A_k = Σ_n a_{n,k} · e_{n,k} · ĉ_{n,k}ᵀ`,
+    /// where `e_{n,k} = z_n − Σ_{k'≠k} a_{n,k'}·decoded_{k'}(n)` is the row's
+    /// partial reconstruction residual (everything except atom `k`) and
+    /// `ĉ_{n,k} = Φ_k(t_n)·C_k ∈ ℝ^{r_k}` is atom `k`'s in-span decoded
+    /// coordinate. The polar factor `U_new = polar(A_k)` is the closed-form MAP
+    /// frame on `Gr(r_k, p)` given the C-coordinates held fixed — the same
+    /// `O(p r²)` thin SVD the issue prescribes, run OUTSIDE the border. The frame
+    /// is then re-installed and the decoder re-projected onto it so the
+    /// authoritative `B_k = C_k U_newᵀ` and the `(C_k, U_new)` pair stay
+    /// consistent (a no-op in span for a truly rank-`r` atom). Un-framed atoms
+    /// are skipped. Returns the number of frames refreshed.
+    fn refresh_active_frames_from_data(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+    ) -> Result<usize, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        if n == 0 {
+            return Ok(0);
+        }
+        // Per-row assignments and per-(row, atom) decoded outputs, computed once.
+        let mut assignments = Vec::with_capacity(n);
+        for row in 0..n {
+            assignments.push(self.assignment.try_assignments_row(row)?);
+        }
+        let mut decoded = Array3::<f64>::zeros((n, k_atoms, p));
+        let mut dbuf = vec![0.0_f64; p];
+        for row in 0..n {
+            for atom_idx in 0..k_atoms {
+                self.atoms[atom_idx].fill_decoded_row(row, &mut dbuf);
+                for c in 0..p {
+                    decoded[[row, atom_idx, c]] = dbuf[c];
+                }
+            }
+        }
+        // Full fitted reconstruction `Σ_k a_k decoded_k`, so the per-atom partial
+        // residual is `e_k = (z − fitted) + a_k decoded_k` (add atom k back in).
+        let mut fitted = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            for atom_idx in 0..k_atoms {
+                let a = assignments[row][atom_idx];
+                if a == 0.0 {
+                    continue;
+                }
+                for c in 0..p {
+                    fitted[[row, c]] += a * decoded[[row, atom_idx, c]];
+                }
+            }
+        }
+        let mut refreshed = 0usize;
+        for atom_idx in 0..k_atoms {
+            // Only atoms with an active frame are refreshed.
+            let Some(coords_c) = self.atoms[atom_idx].factored_coordinates()? else {
+                continue;
+            };
+            let r = self.atoms[atom_idx].border_frame_rank();
+            let m = self.atoms[atom_idx].basis_size();
+            // Accumulate `A_k = Σ_n a_k · e_{n,k} · ĉ_{n,k}ᵀ` directly (p × r).
+            let mut cross = GrassmannCrossMoment::new(p, r);
+            // Build per-row p-target `a_k·e_k` and r-coord `a_k·ĉ` batched, then
+            // accumulate as one outer-product sum. `accumulate` forms
+            // `targetsᵀ·coords`, so scaling EITHER side by `a_k` once gives the
+            // `a_k²` weight on the cross-moment that matches the C-block normal
+            // equations (residual leg carries `a_k`, coordinate leg carries
+            // `a_k`).
+            let mut targets = Array2::<f64>::zeros((n, p));
+            let mut rcoords = Array2::<f64>::zeros((n, r));
+            for row in 0..n {
+                let a = assignments[row][atom_idx];
+                // Partial residual e_{n,k} = z_n − (fitted − a_k decoded_k).
+                for c in 0..p {
+                    let e = target[[row, c]] - fitted[[row, c]]
+                        + a * decoded[[row, atom_idx, c]];
+                    targets[[row, c]] = a * e;
+                }
+                // In-span coordinate ĉ_{n,k} = Φ_k(t_n)·C_k ∈ ℝ^r.
+                for j in 0..r {
+                    let mut acc = 0.0_f64;
+                    for basis_col in 0..m {
+                        acc += self.atoms[atom_idx].basis_values[[row, basis_col]]
+                            * coords_c[[basis_col, j]];
+                    }
+                    rcoords[[row, j]] = a * acc;
+                }
+            }
+            cross.accumulate(targets.view(), rcoords.view())?;
+            // `polar(A_k)` is well-defined only when the moment is non-trivial;
+            // a zero moment (e.g. a fully collapsed atom) leaves the frame as-is.
+            if cross.moment().iter().all(|&v| v == 0.0) {
+                continue;
+            }
+            self.atoms[atom_idx].refresh_frame_from_cross_moment(cross.moment())?;
+            refreshed += 1;
+        }
+        Ok(refreshed)
+    }
+
     pub fn beta_offsets(&self) -> Vec<usize> {
         let p = self.output_dim();
         let mut out = Vec::with_capacity(self.k_atoms());
@@ -6067,7 +6171,8 @@ impl SaeManifoldTerm {
                 if data.iter().all(|&v| v == 0.0) {
                     continue;
                 }
-                let w = self.frame_cross_factor(atom_i, atom_j);
+                // `W_{ij} = U_iᵀ U_j` from the precomputed per-atom frames.
+                let w = fast_atb(&frames[atom_i], &frames[atom_j]);
                 frame_blocks.push(FactoredFrameGBlock {
                     atom_i,
                     atom_j,
@@ -6767,8 +6872,16 @@ impl SaeManifoldTerm {
         }
         let n_total = self.n_obs();
         let chunk_size = self.streaming_plan().chunk_size.min(n_total.max(1));
-        let beta_dim = self.beta_dim();
-        let mut schur_acc = Array2::<f64>::zeros((beta_dim, beta_dim));
+        // #972 / #977 T1: the reduced β-Schur is over the FACTORED border when
+        // frames are active (each chunk inherits the frames via
+        // `materialize_chunk`, so every `chunk_schur` is `border_dim²`), matching
+        // the dense path's factored log-det. Full-`B` ⇒ `border_dim == beta_dim`.
+        let border_dim = if self.frames_active() {
+            self.factored_border_dim()
+        } else {
+            self.beta_dim()
+        };
+        let mut schur_acc = Array2::<f64>::zeros((border_dim, border_dim));
         let mut log_det_tt = 0.0_f64;
         let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
         let mut start = 0usize;
@@ -6799,8 +6912,8 @@ impl SaeManifoldTerm {
                 .reduced_schur_and_log_det_tt(0.0, 0.0, &options)
                 .map_err(|err| format!("SaeManifoldTerm::streaming_exact_arrow_log_det: {err}"))?;
             log_det_tt += chunk_log_det_tt;
-            for row in 0..beta_dim {
-                for col in 0..beta_dim {
+            for row in 0..border_dim {
+                for col in 0..border_dim {
                     schur_acc[[row, col]] += chunk_schur[[row, col]];
                 }
             }
@@ -6947,22 +7060,40 @@ impl SaeManifoldTerm {
         lambda_smooth: f64,
     ) -> Result<f64, ArrowSchurError> {
         let p = self.output_dim();
-        let beta_offsets = self.beta_offsets();
+        // #972 / #977 T1: the cache's β block is the FACTORED border when frames
+        // are active (`cache.k == factored_border_dim`), so the smoothness edf
+        // trace `tr((H⁻¹)_ββ · M)` is taken over the same factored layout, with
+        // `M = ⊕_k (λ S_k) ⊗ I_{r_k}` at the factored offsets (the `U_kᵀU_k = I`
+        // collapse means the per-coordinate-channel penalty is `λ S_k`, exactly
+        // as in the full-`B` `⊗ I_p` case but with `r_k` channels). On the
+        // full-`B` path `frames_active` is false: `out_dim_k = p`, the offsets
+        // are `beta_offsets`, and this is bit-for-bit the historical trace.
+        let frames_active = self.frames_active();
+        let (offsets, out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) = if frames_active {
+            let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
+            (
+                self.factored_beta_offsets(),
+                Box::new(move |k: usize| ranks[k]),
+            )
+        } else {
+            (self.beta_offsets(), Box::new(move |_k: usize| p))
+        };
         let k = cache.k;
         let mut trace = 0.0_f64;
         let mut m_col = Array1::<f64>::zeros(k);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let s = &atom.smooth_penalty;
             let m = atom.basis_size();
-            let off = beta_offsets[atom_idx];
+            let off = offsets[atom_idx];
+            let r = out_dim(atom_idx);
             for mu in 0..m {
-                for oc in 0..p {
-                    let col = off + mu * p + oc;
-                    // M[:,col] = λ · S_k[:,mu] ⊗ e_oc (nonzero at off+ν·p+oc).
+                for oc in 0..r {
+                    let col = off + mu * r + oc;
+                    // M[:,col] = λ · S_k[:,mu] ⊗ e_oc (nonzero at off+ν·r+oc).
                     m_col.fill(0.0);
                     for nu in 0..m {
                         let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
-                        m_col[off + nu * p + oc] = lambda_smooth * s_nu_mu;
+                        m_col[off + nu * r + oc] = lambda_smooth * s_nu_mu;
                     }
                     let z = cache.schur_inverse_apply(m_col.view())?;
                     trace += z[col];
@@ -7014,7 +7145,19 @@ impl SaeManifoldTerm {
         let smooth_edf = self
             .decoder_smoothness_effective_dof(cache, rho.lambda_smooth())
             .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?;
-        let beta_edf = (self.beta_dim() as f64 - smooth_edf).max(0.0);
+        // #972 / #977 T1: the raw decoder-parameter count is `beta_dim` on the
+        // full-`B` path, but when frames are active the estimated decoder freedom
+        // is the factored border `Σ M_k·r_k` PLUS the `Σ r_k·(p−r_k)` Grassmann
+        // frame degrees profiled out (both are genuinely estimated), which the
+        // smoothness shrinkage `smooth_edf` (taken over the factored border) then
+        // discounts. On the full-`B` path `factored_border_dim == beta_dim` and
+        // `grassmann_evidence_dimension == 0`, so this is exactly `beta_dim`.
+        let raw_decoder_dof = if self.frames_active() {
+            (self.factored_border_dim() + self.grassmann_evidence_dimension()) as f64
+        } else {
+            self.beta_dim() as f64
+        };
+        let beta_edf = (raw_decoder_dof - smooth_edf).max(0.0);
         // Exact ARD-shrunk latent-coordinate edf, reusing the EFS trace cache.
         let traces = self
             .ard_inverse_traces(cache)
@@ -7098,15 +7241,67 @@ impl SaeManifoldTerm {
         dispersion: f64,
     ) -> Result<SaeShapeUncertainty, String> {
         let p = self.output_dim();
-        let blocks = self.beta_block_offsets();
+        // #972 / #977 T1: the cache β block is the FACTORED border when frames
+        // are active, so each atom's Schur inverse block is the `(M_k·r_k)`
+        // coordinate covariance `Cov(vec C_k)`. We LIFT it to the full
+        // `(M_k·p)` decoder covariance `Cov(vec B_k) = (I_{M_k} ⊗ U_k) Cov(vec
+        // C_k)(I_{M_k} ⊗ U_k)ᵀ` (since `B_k = C_k U_kᵀ`) so the downstream band
+        // code — which reads the `b·p + c` flat layout — is unchanged. On the
+        // full-`B` path the block is already `(M_k·p)` and the lift is skipped.
+        let frames_active = self.frames_active();
+        let block_ranges = if frames_active {
+            let off_c = self.factored_beta_offsets();
+            (0..self.k_atoms())
+                .map(|k| {
+                    let start = off_c[k];
+                    start..start + self.atoms[k].border_coeff_count()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.beta_block_offsets().to_vec()
+        };
         let mut atoms = Vec::with_capacity(self.k_atoms());
         for (k, atom) in self.atoms.iter().enumerate() {
-            let mut cov = cache
-                .schur_inverse_block(blocks[k].clone())
+            let m = atom.basis_size();
+            let cov_block = cache
+                .schur_inverse_block(block_ranges[k].clone())
                 .map_err(|e| format!("assemble_shape_uncertainty: atom {k}: {e}"))?;
+            // Lift the factored `(M_k·r_k)` coordinate covariance to the full
+            // `(M_k·p)` decoder covariance through this atom's frame; identity
+            // (a plain scaled copy) on the un-framed full-`B` path.
+            let mut cov = if frames_active && atom.decoder_frame.is_some() {
+                let r = atom.border_frame_rank();
+                let uk = self.frame_output_matrix(k);
+                let mut lifted = Array2::<f64>::zeros((m * p, m * p));
+                for b1 in 0..m {
+                    for b2 in 0..m {
+                        // Cov(B)[(b1,c1),(b2,c2)]
+                        //   = Σ_{j1,j2} U[c1,j1] Cov(C)[(b1,j1),(b2,j2)] U[c2,j2].
+                        for c1 in 0..p {
+                            for c2 in 0..p {
+                                let mut acc = 0.0_f64;
+                                for j1 in 0..r {
+                                    let u1 = uk[[c1, j1]];
+                                    if u1 == 0.0 {
+                                        continue;
+                                    }
+                                    for j2 in 0..r {
+                                        acc += u1
+                                            * cov_block[[b1 * r + j1, b2 * r + j2]]
+                                            * uk[[c2, j2]];
+                                    }
+                                }
+                                lifted[[b1 * p + c1, b2 * p + c2]] = acc;
+                            }
+                        }
+                    }
+                }
+                lifted
+            } else {
+                cov_block
+            };
             cov.mapv_inplace(|v| v * dispersion);
 
-            let m = atom.basis_size();
             let n_rows = atom.n_obs();
             let d = atom.latent_dim;
             // Evenly-strided evaluation rows bound the band cost; the full
@@ -8334,11 +8529,22 @@ impl SaeManifoldTerm {
         let q = self.assignment.row_block_dim();
         let k_atoms = self.k_atoms();
         let assignment_dim = self.assignment.assignment_coord_dim();
-        if delta_beta.len() != self.beta_dim() {
+        // #972 / #977 T1: when the most recent assembly built the factored
+        // β-tier, `delta_beta` is a factored ΔC (length `factored_border_dim`)
+        // that must be LIFTED through each active frame (`ΔB_k = ΔC_k U_kᵀ`)
+        // before being applied to the p-wide decoder. Otherwise it is a plain
+        // ΔB of length `beta_dim`. The expected length and the application path
+        // both branch on `last_frames_active`.
+        let expected_delta_len = if self.last_frames_active {
+            self.factored_border_dim()
+        } else {
+            self.beta_dim()
+        };
+        if delta_beta.len() != expected_delta_len {
             return Err(format!(
                 "SaeManifoldTerm::apply_newton_step: delta_beta length {} != expected {}",
                 delta_beta.len(),
-                self.beta_dim()
+                expected_delta_len
             ));
         }
 
@@ -8442,8 +8648,40 @@ impl SaeManifoldTerm {
         }
 
         let mut beta = self.flatten_beta();
-        for idx in 0..beta.len() {
-            beta[idx] += step_size * delta_beta[idx];
+        if self.last_frames_active {
+            // Factored ΔC → lift to a p-wide ΔB and add `step·ΔB`. For atom `k`,
+            // basis row `m`, output channel `i`:
+            //   ΔB_k[m,i] = Σ_j ΔC[off_C[k] + m·r_k + j] · U_k[i,j].
+            // Un-framed atoms (`U_k = I_p`, `r_k = p`) lift by identity, so a
+            // mixed dictionary is handled uniformly. The decoder is then
+            // refreshed below via `set_flat_beta` (the authoritative `B_k` is the
+            // p-wide flatten; the active frames are re-synced from the decoder by
+            // the polar refresh in the joint-fit driver).
+            let p = self.output_dim();
+            let beta_offsets = self.beta_offsets();
+            let off_c = self.factored_beta_offsets();
+            for atom_idx in 0..k_atoms {
+                let m = self.atoms[atom_idx].basis_size();
+                let r = self.atoms[atom_idx].border_frame_rank();
+                let uk = self.frame_output_matrix(atom_idx);
+                let ob = beta_offsets[atom_idx];
+                let oc = off_c[atom_idx];
+                for basis_col in 0..m {
+                    let base_b = ob + basis_col * p;
+                    let base_c = oc + basis_col * r;
+                    for i in 0..p {
+                        let mut acc = 0.0_f64;
+                        for j in 0..r {
+                            acc += delta_beta[base_c + j] * uk[[i, j]];
+                        }
+                        beta[base_b + i] += step_size * acc;
+                    }
+                }
+            }
+        } else {
+            for idx in 0..beta.len() {
+                beta[idx] += step_size * delta_beta[idx];
+            }
         }
         self.set_flat_beta(beta.view())
     }
@@ -8770,6 +9008,16 @@ impl SaeManifoldTerm {
         }
         self.refresh_basis_from_current_coords()
             .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
+        // #972 / #977 T1 — magic-by-default decoder-frame activation. Before the
+        // outer loop, auto-derive and install the low-rank Grassmann frames
+        // (each atom independently, only when the factorization materially
+        // shrinks its border and leaves a positive Grassmann dimension). No
+        // flag: small-`p` / full-rank atoms stay on the bit-for-bit full-`B`
+        // path, so the small-model fits are unchanged; large-ambient-`p`,
+        // low-decoder-rank atoms collapse their border `M_k·p → M_k·r_k` and the
+        // joint solve runs in the factored coordinate space.
+        self.auto_activate_decoder_frames()
+            .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}"))?;
         // #976 Layer-1 guard ledger is per joint fit: each inner solve gets a
         // fresh re-seed budget and reports only its own breaches.
         self.collapse_events.clear();
@@ -8934,7 +9182,11 @@ impl SaeManifoldTerm {
                     ridge_ext_coord,
                     ridge_beta,
                     pre_step_total,
-                    &ArrowSolveOptions::automatic(self.beta_dim()),
+                    // `sys.k` is the actual border width — factored
+                    // (`factored_border_dim`) when frames are active, else
+                    // `beta_dim` — so the direct/PCG mode threshold keys on the
+                    // dimension the solve actually runs at.
+                    &ArrowSolveOptions::automatic(sys.k),
                     &correction,
                     |trial_delta_t, trial_delta_beta| {
                         self.restore_mutable_state(&snapshot);
@@ -8965,6 +9217,22 @@ impl SaeManifoldTerm {
             // line-search trial, and any re-seed is simply the next
             // iteration's starting state.
             self.enforce_active_mass_guard(outer_iteration)?;
+            // #972 / #977 T1 — U-block of the alternating block-coordinate ascent.
+            // After the decoder `B` has been updated by the accepted (t, ΔC) step
+            // (lifted through the OLD frames in `apply_newton_step`), re-polar each
+            // ACTIVE atom's frame from the refreshed data evidence and re-project
+            // the decoder onto it, so the next assembly's C-block solve runs in an
+            // up-to-date frame. The refresh is a closed-form `O(p r²)` thin SVD per
+            // atom run OUTSIDE the border; the C-coordinates are held fixed during
+            // it (the block-coordinate split). Skipped entirely when no frame is
+            // active (the full-`B` path never touches this). One refresh per
+            // accepted outer iteration is a sensible cadence (the issue's
+            // streaming-polar fixed point).
+            if self.frames_active() {
+                self.refresh_active_frames_from_data(target).map_err(|err| {
+                    format!("SaeManifoldTerm::run_joint_fit_arrow_schur: {err}")
+                })?;
+            }
         }
         // ρ is owned by the outer engine and unchanged here; just return the
         // converged inner loss at the fixed ρ.
@@ -9237,6 +9505,14 @@ impl SaeManifoldTerm {
             )?;
             chunk_atom.basis_evaluator = atom.basis_evaluator.clone();
             chunk_atom.basis_second_jet = atom.basis_second_jet.clone();
+            // #972 / #977 T1: carry the active Grassmann frame onto the chunk
+            // atom so the streaming per-chunk assembly uses the SAME factored
+            // border layout as the dense path. Without this the chunk would
+            // default to the full-`B` path and the streaming REML log-det would
+            // be taken over a different (larger) β block than the dense one,
+            // breaking the streaming↔dense log-det agreement (#847). The
+            // decoder is unchanged, so the frame stays consistent with `B_k`.
+            chunk_atom.decoder_frame = atom.decoder_frame.clone();
             atoms.push(chunk_atom);
         }
         // Rebuild the assignment from the chunk's logits + coords, preserving
@@ -9329,7 +9605,22 @@ impl SaeManifoldTerm {
                     .to_string(),
             );
         }
-        let beta_dim = self.beta_dim();
+        // #972 / #977 T1: magic-by-default frame activation, mirroring the dense
+        // driver, so the streaming fit runs in the same factored coordinate
+        // space (the chunk terms inherit the frames via `materialize_chunk`).
+        self.auto_activate_decoder_frames()
+            .map_err(|err| format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}"))?;
+        // The β-tier width the reduced-Schur accumulators are sized at: the
+        // FACTORED border `Σ M_k·r_k` when frames are active (every chunk's
+        // `sys.gb` / reduced Schur is in that space), else the full-`B`
+        // `beta_dim`. The accepted `delta_beta` is a factored ΔC in the former
+        // case and is lifted through the frames before being applied.
+        let frames_engaged = self.frames_active();
+        let border_dim = if frames_engaged {
+            self.factored_border_dim()
+        } else {
+            self.beta_dim()
+        };
 
         // ── Chunk-aware pre-fit decoder identifiability audit ───────────────
         {
@@ -9354,10 +9645,10 @@ impl SaeManifoldTerm {
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
             // ── Pass 1: accumulate the global reduced Schur over β online. ──
-            let options = ArrowSolveOptions::automatic(beta_dim);
-            let mut s_acc = Array2::<f64>::zeros((beta_dim, beta_dim));
-            let mut rhs_acc = Array1::<f64>::zeros(beta_dim);
-            let mut gb_acc = Array1::<f64>::zeros(beta_dim);
+            let options = ArrowSolveOptions::automatic(border_dim);
+            let mut s_acc = Array2::<f64>::zeros((border_dim, border_dim));
+            let mut rhs_acc = Array1::<f64>::zeros(border_dim);
+            let mut gb_acc = Array1::<f64>::zeros(border_dim);
             // ρ (including the ARD precisions) is owned by the outer engine and
             // held FIXED across this streaming inner solve; the former online
             // `Σ t²` ARD accumulator + `update_ard_reml_from_sumsq` rule has
@@ -9407,8 +9698,10 @@ impl SaeManifoldTerm {
                         format!("SaeManifoldTerm::run_joint_fit_arrow_schur_streaming: {err}")
                     })?;
                 // Accumulate the chunk's data-fit β gradient (its g_β already
-                // carries the minibatch-scaled β-penalty gradient).
-                for j in 0..beta_dim {
+                // carries the minibatch-scaled β-penalty gradient). `sys.gb` is
+                // in the factored C-space when frames are engaged (the chunk
+                // inherits them), matching `gb_acc`'s `border_dim` width.
+                for j in 0..border_dim {
                     gb_acc[j] += sys.gb[j];
                 }
                 Self::accumulate_chunk_reduced_schur(
@@ -9427,7 +9720,7 @@ impl SaeManifoldTerm {
             // negated Schur-reduced β gradient `−g_reduced`, so the reduced
             // system `S Δβ = rhs_acc` yields the marginal Newton step in β with
             // the per-row latent eliminated.
-            for j in 0..beta_dim {
+            for j in 0..border_dim {
                 s_acc[[j, j]] += ridge_beta;
                 rhs_acc[j] -= gb_acc[j];
             }
@@ -9443,7 +9736,7 @@ impl SaeManifoldTerm {
             // latent block is profiled out, not stepped, in streaming).
             let beta0 = self.flatten_beta();
             let mut directional_decrease = 0.0_f64;
-            for j in 0..beta_dim {
+            for j in 0..border_dim {
                 // dd = −(g_reduced · Δβ) = −((−rhs_acc) · Δβ) = rhs_acc · Δβ.
                 directional_decrease += rhs_acc[j] * delta_beta[j];
             }
@@ -9456,12 +9749,44 @@ impl SaeManifoldTerm {
                 last_loss = self.streaming_loss(&chunk_ranges, rho, n_total, &mut chunk_init)?;
                 break;
             }
+            // #972 / #977 T1: when frames are engaged, `delta_beta` is a factored
+            // ΔC; pre-lift it ONCE to a full-`B` ΔB (`ΔB_k = ΔC_k U_kᵀ`) so the
+            // per-trial β update is a plain `beta0 + step·ΔB` (the decoder lives
+            // in the full p-space). Un-framed atoms lift by identity. On the
+            // full-`B` path `delta_b` is just `delta_beta`.
+            let p = self.output_dim();
+            let delta_b: Array1<f64> = if frames_engaged {
+                let mut lifted = Array1::<f64>::zeros(self.beta_dim());
+                let beta_offsets = self.beta_offsets();
+                let off_c = self.factored_beta_offsets();
+                for atom_idx in 0..self.k_atoms() {
+                    let m = self.atoms[atom_idx].basis_size();
+                    let r = self.atoms[atom_idx].border_frame_rank();
+                    let uk = self.frame_output_matrix(atom_idx);
+                    let ob = beta_offsets[atom_idx];
+                    let oc = off_c[atom_idx];
+                    for basis_col in 0..m {
+                        let base_b = ob + basis_col * p;
+                        let base_c = oc + basis_col * r;
+                        for i in 0..p {
+                            let mut acc = 0.0_f64;
+                            for j in 0..r {
+                                acc += delta_beta[base_c + j] * uk[[i, j]];
+                            }
+                            lifted[base_b + i] = acc;
+                        }
+                    }
+                }
+                lifted
+            } else {
+                delta_beta.clone()
+            };
             let mut trial_step = step_size;
             let mut accepted_loss: Option<SaeManifoldLoss> = None;
             for _ in 0..=SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS {
                 let mut trial_beta = beta0.clone();
-                for j in 0..beta_dim {
-                    trial_beta[j] += trial_step * delta_beta[j];
+                for j in 0..self.beta_dim() {
+                    trial_beta[j] += trial_step * delta_b[j];
                 }
                 self.set_flat_beta(trial_beta.view())?;
                 let (trial_loss, trial_total) = self.streaming_loss_and_penalized_objective_total(
