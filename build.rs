@@ -1739,10 +1739,27 @@ fn scan_for_cargo_feature_entries(
             while k < bytes.len() && bytes[k].is_ascii_whitespace() {
                 k += 1;
             }
+            // The published `gamfit` wheel requires PyO3's `extension-module`
+            // feature: it tells PyO3 NOT to link libpython, because the host
+            // interpreter supplies those symbols at import time. A standalone
+            // `cargo test` binary for `gam-pyffi`, however, MUST link libpython
+            // (there is no host interpreter), so the feature has to be
+            // toggleable off for the test harness. PyO3's documented recipe is
+            // exactly this default-on passthrough feature plus `cargo test
+            // --no-default-features`. There is no `cfg(feature = ...)` fork in
+            // our own code — the sole consumer is PyO3's own build script — so
+            // the conditionally-compiled-fork hazard this rule guards against
+            // does not apply. Sanction the two canonical lines, and only in the
+            // FFI crate's manifest.
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let pyo3_extension_module_idiom = rel_str == "crates/gam-pyffi/Cargo.toml"
+                && (code_part == "default = [\"extension-module\"]"
+                    || code_part == "extension-module = [\"pyo3/extension-module\"]");
             if k < bytes.len()
                 && bytes[k] == b'='
                 && code_part != "default = []"
                 && !code_part.starts_with("cuda = ")
+                && !pyo3_extension_module_idiom
             {
                 offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
             }
