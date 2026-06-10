@@ -24589,6 +24589,19 @@ mod tests {
         ] {
             let (cost_an, grad_an) = analytic_at(theta, &mut cache, &mut evaluator);
             assert!(cost_an.is_finite(), "{label} {probe}: cost not finite");
+            // Objective↔gradient desync probe: the analytic gradient path
+            // (evaluate_joint_reml_outer_eval_at_theta) and the cost-only FD
+            // path (evaluate_cost_only) must agree on the COST itself at the
+            // unperturbed θ. If they disagree, FD differences a different
+            // function than the gradient differentiates and no gradient fix
+            // can make them match. eprintln for the diagnostic build only.
+            let cost_via_fd_path = cost_at(theta, &mut cache, &mut evaluator);
+            eprintln!(
+                "[{label} {probe}] COST an={:+.10e} fd_path={:+.10e} diff={:.3e}",
+                cost_an,
+                cost_via_fd_path,
+                (cost_an - cost_via_fd_path).abs()
+            );
             for j in 0..theta_dim {
                 let is_psi = j >= rho_dim;
                 if skip_psi && is_psi {
