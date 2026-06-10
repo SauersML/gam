@@ -55,13 +55,17 @@
 //!
 //! The instruments, bottom-up: [`EProcess`] (running evidence, Ville
 //! semantics) → [`PredictablePluginEProcess`] (streaming universal
-//! inference) → [`AtomBirthGate`] (the K vs K+1 gate with
-//! demote-never-reject [`GateVerdict`]s) → [`StructureLedger`] (one
+//! inference) → [`AtomBirthGate`] + [`run_atom_birth_gate`] (the K vs K+1
+//! gate with demote-never-reject [`GateVerdict`]s; the runner enforces
+//! the predictability contract by call order) → [`StructureLedger`] (one
 //! e-process per claim, serializable across #973 shards) →
-//! [`StructureLedger::certify`] (the e-BH [`StructureCertificate`]) →
+//! [`StructureLedger::certify`] (the e-BH [`StructureCertificate`],
+//! shipped beside the gauge report via
+//! `crate::sae_identifiability::dictionary_report`) →
 //! [`plan_probe_for_contested_claim`] (the design loop: contested claims
 //! get a [`ProbePlan`] whose δ runs through
-//! `crate::inference::steering::steer_delta`).
+//! `crate::inference::steering::steer_delta` and whose per-hypothesis
+//! μ₀/μ₁ come from `crate::inference::steering::predicted_response`).
 //!
 //! # The math, fixed here so implementations cannot drift
 //!
@@ -923,5 +927,94 @@ mod tests {
             predicted_mean_alt: array![5.0, 5.0],
         }];
         assert!(plan_probe_for_contested_claim(&blind, &fisher, 0.05, 0.0).is_none());
+    }
+
+    /// POWER STUDY, null side: the heuristic gate every dictionary paper
+    /// runs — "accept the K+1-th atom the first time the cumulative
+    /// likelihood ratio shows improvement" — versus the e-gate, on a
+    /// family of NULL streams peeked at after every shard. The per-shard
+    /// log-LR is `μ x_t − μ²/2` with `x_t = A sin(ω t + φ)` (a
+    /// deterministic null surrogate: mean drift −μ²/2 < 0, bounded
+    /// fluctuation). The naive gate's false-accept mechanism is exactly
+    /// optional stopping: any phase whose partial sums wander above zero
+    /// at ANY peek accepts a nonexistent atom. The e-gate needs
+    /// log(1/α) ≈ 3.0 nats, and the partial-sum fluctuation is bounded by
+    /// `μ·A/sin(ω/2) ≈ 1.51` nats (Dirichlet-kernel bound) BEFORE the
+    /// negative drift — so it can never certify on any phase, which is
+    /// Ville's inequality made concrete.
+    #[test]
+    fn power_study_null_naive_peeking_gate_false_accepts_e_gate_never() {
+        let mu = 0.6f64;
+        let amp = 0.9f64;
+        let omega = 0.7321f64;
+        let n_phases = 60usize;
+        let n_shards = 200usize;
+
+        let mut naive_false_accepts = 0usize;
+        let mut e_gate_false_accepts = 0usize;
+        for k in 0..n_phases {
+            let phase = 2.0 * std::f64::consts::PI * (k as f64) / (n_phases as f64);
+            let mut gate = AtomBirthGate::new(0.05).expect("alpha");
+            let mut cum_log_lr = 0.0f64;
+            let mut naive_accepted = false;
+            for t in 0..n_shards {
+                let x = amp * ((t as f64) * omega + phase).sin();
+                let log_lr = mu * x - 0.5 * mu * mu;
+                cum_log_lr += log_lr;
+                // The broken test: peek, accept on any improvement.
+                if cum_log_lr > 0.0 {
+                    naive_accepted = true;
+                }
+                gate.absorb_shard(log_lr, 0.0);
+            }
+            if naive_accepted {
+                naive_false_accepts += 1;
+            }
+            if matches!(gate.verdict(), GateVerdict::Certified { .. }) {
+                e_gate_false_accepts += 1;
+            }
+        }
+        // The naive gate false-accepts on a large fraction of null phases
+        // (any phase with early-positive partial sums); the e-gate on none.
+        assert!(
+            naive_false_accepts >= n_phases / 3,
+            "the peeking gate should false-accept often under the null \
+             (got {naive_false_accepts}/{n_phases})"
+        );
+        assert_eq!(
+            e_gate_false_accepts, 0,
+            "the e-gate must never certify under the null"
+        );
+    }
+
+    /// POWER STUDY, alternative side, through the orchestration harness:
+    /// a planted K+1-th atom worth 0.5 nats/shard certifies in
+    /// ⌈log(1/α)/0.5⌉ = 6 shards — matching the design-time
+    /// `expected_resolution_budget` — after which the gate stops absorbing
+    /// (the crossing is permanent) while the alternative keeps refitting
+    /// on the remaining shards.
+    #[test]
+    fn power_study_planted_atom_certifies_at_the_predicted_budget() {
+        let growth = 0.5f64;
+        let (gate, alt_state) = run_atom_birth_gate(
+            0.05,
+            0usize, // alt state = number of shards folded into the fit
+            0..20usize,
+            |_, _| -99.5, // prefit alternative log-lik on the shard
+            |_| -100.0,   // honest null sup on the shard
+            |folded, _| folded + 1,
+        )
+        .expect("valid alpha");
+
+        match gate.verdict() {
+            GateVerdict::Certified { log_e } => assert!((log_e - 3.0).abs() < 1e-12),
+            v => panic!("planted atom must certify, got {v:?}"),
+        }
+        // Realized time-to-certification == the design-time budget, rounded up.
+        let budget = expected_resolution_budget(0.05, growth).expect("budget");
+        assert_eq!(gate.test.process.steps(), budget.ceil() as usize);
+        assert_eq!(gate.test.process.steps(), 6);
+        // The alternative state saw the whole stream despite early stopping.
+        assert_eq!(alt_state, 20);
     }
 }
