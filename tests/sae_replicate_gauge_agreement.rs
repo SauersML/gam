@@ -31,8 +31,8 @@ use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
 use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
-    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeManifoldAtom,
-    SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
+    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
+    SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
 use ndarray::{Array1, Array2};
 use std::sync::Arc;
