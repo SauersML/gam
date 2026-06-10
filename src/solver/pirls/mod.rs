@@ -1797,7 +1797,7 @@ impl<'a> GamWorkingModel<'a> {
     ) -> Result<Array2<f64>, EstimationError> {
         match design {
             // Only the materialized arm can use the shared dense assembly path.
-            // Lazy operator-backed dense designs (TPS/Matern at biobank scale)
+            // Lazy operator-backed dense designs (TPS/Matern at large scale)
             // cannot be densified; fall through to the operator XᵀWX path.
             DesignMatrix::Dense(x) if x.is_materialized_dense() => {
                 let p = x.ncols();
@@ -3362,7 +3362,7 @@ pub(super) enum PirlsSoftAccept {
     /// Projected gradient is small *relative to the objective magnitude*
     /// (not just the dimension scale) AND the deviance has plateaued
     /// strictly (×0.1 floor) AND is non-decreasing. This is the
-    /// per-observation rescue for biobank-scale GLMs where ‖g‖ scales
+    /// per-observation rescue for large-scale GLMs where ‖g‖ scales
     /// with √n and the absolute KKT test becomes systematically too
     /// tight even when the fit is functionally converged. Like
     /// [`PirlsSoftAccept::BoundarySaturation`], this is only meaningful
@@ -5839,7 +5839,7 @@ fn compute_observed_hessian_curvature_arrays_into(
     let weight_link = weight_link_for_inverse_link(inverse_link);
     let phi = fixed_glm_dispersion(likelihood);
 
-    // Parallel per-row weight assembly. At biobank scale (n = 320k) this loop
+    // Parallel per-row weight assembly. At large scale (n = 320k) this loop
     // dominates non-canonical paths because each row independently evaluates
     // inverse-link jets and residual-dependent observed curvature. Write
     // directly into reusable output slices rather than collecting row tuples,
@@ -9063,13 +9063,13 @@ mod root_cause_tests {
         assert!(kkt.stationarity <= 1e-12);
     }
 
-    /// The user's biobank pathological case: a fit with `n=320000`,
+    /// The user's large-scale pathological case: a fit with `n=320000`,
     /// `p=20`, projected stationarity residual `‖g‖ = 1.465e-5`. The old
     /// absolute test `‖g‖ < 1e-6` rejects this as non-converged, even
     /// though the normalized residual is ~2.6e-8. After the fix, the
     /// scale-invariant certificate accepts it under EITHER bound.
     #[test]
-    fn certifies_kkt_accepts_biobank_pathological_case() {
+    fn certifies_kkt_accepts_large_scale_pathological_case() {
         let n = 320_000usize;
         let p = 20usize;
         let g_norm = 1.465e-5;
@@ -9096,7 +9096,7 @@ mod root_cause_tests {
         // Both pass; old absolute test 1.465e-5 < 1e-6 fails.
         assert!(
             state.certifies_kkt(g_norm, tol),
-            "scale-invariant certificate should accept biobank pathological case"
+            "scale-invariant certificate should accept large-scale pathological case"
         );
         assert!(
             !(g_norm < tol),

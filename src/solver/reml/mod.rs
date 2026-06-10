@@ -124,7 +124,7 @@ pub(crate) struct IftWarmStartCache {
     /// otherwise recompute on every predict call. With H_pen factor
     /// caching (commit ec18559d) the per-call cost dropped from
     /// `O(p³)` Cholesky to `O(p²) ≈ k · O(block²)` rhs construction;
-    /// at biobank-scale CTN (p ≈ several thousand) that's several ms
+    /// at large-scale CTN (p ≈ several thousand) that's several ms
     /// per predict call still being paid. By stashing `S_k · β_cur`
     /// at cache-write time the predictor's per-call work drops to
     /// just the `Δρ_k · e^{ρ_k} · sb_block` accumulation, which is
@@ -4646,7 +4646,7 @@ pub(crate) struct RemlState<'a> {
     /// Cached Cholesky factorization of `IftWarmStartCache::penalized_hessian_transformed`.
     /// Lazily computed on the first IFT predict call after a fresh
     /// `updatewarm_start_from`, then reused by every subsequent
-    /// predict call until the IFT cache is invalidated. At biobank
+    /// predict call until the IFT cache is invalidated. At large-scale
     /// scale where p can reach several thousand, the dense Cholesky
     /// is O(p³)/3 — multiple seconds per refactor — so caching saves
     /// real wall time across the typical 5-10 IFT predict calls per

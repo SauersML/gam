@@ -572,7 +572,7 @@ impl<'a> RemlState<'a> {
         // smoothing correction is the local linearization at ρ̂; cubature
         // upgrades it when the linearization is suspect (boundary contact, or
         // the outer gradient is genuinely large). An absolute ‖g‖>1e-3 gate
-        // is wrong at every scale: biobank deviance ≈ 10⁵–10⁶ makes ‖g‖≈1
+        // is wrong at every scale: large-scale deviance ≈ 10⁵–10⁶ makes ‖g‖≈1
         // perfectly fine but trips the gate unconditionally, while tiny CI
         // problems with deviance ≈ 10–100 stay under 1e-3 even when actually
         // unconverged. Use the same `τ·(1+|F|)` rescaling the OUTER paths use
@@ -1580,11 +1580,11 @@ mod sigma_cubature_accumulation_tests {
     /// V100 hill-climb scaffold — sigma loop perf baseline + 5× target.
     ///
     /// This codifies the per-charter perf goal (5× speedup over the CPU
-    /// Rayon sigma loop at biobank scale on V100) in CI. It runs in two
+    /// Rayon sigma loop at large scale on V100) in CI. It runs in two
     /// layers:
     ///
     ///   * **Today (this test)**: measures the *accumulator-only* cost
-    ///     at biobank shape — `p = 50`, `M = 8`, synthetic
+    ///     at large-scale shape — `p = 50`, `M = 8`, synthetic
     ///     `(A_m = SPD, b_m = random)` pairs — and asserts the
     ///     measurement completes in well under a wall-clock ceiling
     ///     (sanity-check that the math kernel scales as expected). The
@@ -1595,7 +1595,7 @@ mod sigma_cubature_accumulation_tests {
     ///
     ///   * **Future (when `device_pirls_stage3_ready()` flips)**:
     ///     promote this test to drive `sigma_cubature_dispatch` on a
-    ///     real biobank-shaped REML state, time both branches via
+    ///     real large-scale-shaped REML state, time both branches via
     ///     `std::time::Instant::elapsed`, and assert
     ///     `t_cpu / t_gpu >= 5.0`. The promotion is one block of edits
     ///     to the same test function (no new test name, no CI churn).
@@ -1607,7 +1607,7 @@ mod sigma_cubature_accumulation_tests {
     /// to encode it.
     #[test]
     fn sigma_loop_v100_hill_climb_baseline() {
-        // Biobank-shape accumulator inputs: p=50, M=8.
+        // Large-scale accumulator inputs: p=50, M=8.
         let p = 50_usize;
         let m = 8_usize;
 

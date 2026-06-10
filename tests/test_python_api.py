@@ -652,7 +652,7 @@ def _pc_duchon(centers: int = 6) -> str:
     )
 
 
-def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_factory: typing.Any) -> None:
+def test_transformation_normal_pgs_calibration_roundtrip(synthetic_large_scale_factory: typing.Any) -> None:
     """Stage 1: fit h(PGS | PCs) ~ N(0, 1) and verify PIT properties.
 
     After conditional Gaussianization on the PC manifold the predicted
@@ -661,7 +661,7 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
     deviation invariant used throughout the methods section.
     """
     _require_extension()
-    df = synthetic_biobank_factory(seed=0, n=128)
+    df = synthetic_large_scale_factory(seed=0, n=128)
 
     model = gamfit.fit(
         df,
@@ -682,9 +682,9 @@ def test_transformation_normal_pgs_calibration_roundtrip(synthetic_biobank_facto
         assert abs(corr) < 0.3, f"|corr(z, {pc})| = {abs(corr):.3f} too large"
 
 
-def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory: typing.Any) -> None:
+def test_transformation_normal_check_requires_raw_pgs(synthetic_large_scale_factory: typing.Any) -> None:
     _require_extension()
-    df = synthetic_biobank_factory(seed=11, n=128)
+    df = synthetic_large_scale_factory(seed=11, n=128)
 
     model = gamfit.fit(
         df,
@@ -703,7 +703,7 @@ def test_transformation_normal_check_requires_raw_pgs(synthetic_biobank_factory:
 
 
 def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
-    synthetic_biobank_factory: typing.Any, tmp_path: typing.Any
+    synthetic_large_scale_factory: typing.Any, tmp_path: typing.Any
 ) -> None:
     """Stage 2a: Bernoulli marginal-slope on the calibrated score.
 
@@ -713,7 +713,7 @@ def test_bernoulli_marginal_slope_roundtrip_tracks_calibrated_score(
     that track ``pgs_ctn_z`` monotonically.
     """
     _require_extension()
-    df = synthetic_biobank_factory(seed=1, n=128)
+    df = synthetic_large_scale_factory(seed=1, n=128)
 
     calib = gamfit.fit(
         df,

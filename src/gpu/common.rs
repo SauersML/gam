@@ -33,7 +33,7 @@ mod linux {
     /// Allocations round the requested element count up to the next
     /// `usize::next_power_of_two`. On drop the slab is handed back to the
     /// arena under the same bucket via [`DeviceArena::release`]. Held under
-    /// a `Mutex` by every backend that uses it because biobank-scale fits
+    /// a `Mutex` by every backend that uses it because large-scale fits
     /// dispatch from multiple rayon workers; the mutex is only held during
     /// `alloc` / `release`, never across kernel launches.
     #[derive(Default)]

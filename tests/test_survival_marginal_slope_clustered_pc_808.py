@@ -1,6 +1,6 @@
 """Regression guard for #808 (survival-marginal-slope clustered-PC stall).
 
-#808: on a clustered-PC biobank-style survival marginal-slope design (a matern
+#808: on a clustered-PC large-scale-style survival marginal-slope design (a matern
 PC surface shared by the marginal-mean and log-slope channels, with enough
 well-separated centers to create an operating-point alias), the inner
 joint-Newton solve freezes with a huge non-stationary residual

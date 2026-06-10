@@ -77,7 +77,7 @@
 //!   pseudo-inverse convention, the #901 spectral-threshold matching, and
 //!   the Smooth/HardPseudo floor semantics live inside `Sensitivity`; the
 //!   five existing dialects (`ift_dbeta_drho_from_solver`, ALO, the #461
-//!   influence Jacobian, the unified.rs correction traces, the biobank
+//!   influence Jacobian, the unified.rs correction traces, the large-scale
 //!   marginal-slope route) become contractions of it and their private
 //!   factorizations are DELETED (no parallel layers).
 //!

@@ -5,7 +5,7 @@
 //! exercises every parallel hot path at N = 1k, 10k, 100k and validates
 //! that the core invariants (partition of unity, periodicity, kernel
 //! symmetry, rotation invariance of intrinsic S² smooths) all still hold
-//! at biobank scale.
+//! at large scale.
 
 use gam::basis::{
     BSplineBasisSpec, BSplineBoundaryConditions, BSplineEndpointBoundaryCondition,

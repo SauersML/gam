@@ -717,7 +717,7 @@ pub struct ResponseSupportViolation {
 
 impl ResponseSupportViolation {
     /// Maximum number of offending row indices reported in the error message.
-    /// Keeps the message bounded on biobank-scale data while still pointing
+    /// Keeps the message bounded on large-scale data while still pointing
     /// the user at concrete bad rows to inspect.
     pub const MAX_REPORTED: usize = 5;
 

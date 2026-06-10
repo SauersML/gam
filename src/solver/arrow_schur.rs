@@ -3845,96 +3845,6 @@ impl ArrowFactorCache {
             .apply_row_transpose_accumulate(row, v, out, di, self.k, fallback_op)
     }
 
-    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) · Δβ)` per row, returning
-    /// the flat `Δt` of total length `row_offsets[N]`.
-    ///
-    /// IFT first-order predictor for the latent field under a
-    /// shape-coefficient perturbation `Δβ`. BA analogue: back-substitution
-    /// after the reduced-camera-system solve.
-    pub fn predict_delta_t_from_delta_beta(&self, delta_beta: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.undamped_factor_count();
-        let total_len = self.delta_t_len();
-        assert_eq!(delta_beta.len(), self.k);
-        if !self.htbeta_available() {
-            return Array1::<f64>::zeros(total_len);
-        }
-        let mut out = Array1::<f64>::zeros(total_len);
-        let mut rhs = Array1::<f64>::zeros(self.d);
-        for i in 0..n {
-            let di = self.row_dims[i];
-            rhs.fill(0.0);
-            let rhs_i = rhs.slice_mut(ndarray::s![..di]);
-            let mut rhs_slice = rhs_i.to_owned();
-            if !self.apply_htbeta_row(i, delta_beta.view(), &mut rhs_slice) {
-                return Array1::<f64>::zeros(total_len);
-            }
-            let v = cholesky_solve_vector(self.undamped_factor(i), &rhs_slice);
-            let row_base = self.row_offsets[i];
-            for c in 0..di {
-                out[row_base + c] = -v[c];
-            }
-        }
-        out
-    }
-
-    /// Apply the *combined* IFT predictor
-    /// `Δt_i = -(H_tt^(i))⁻¹ · (H_tβ^(i) Δβ + δg_t^(i))` per row.
-    ///
-    /// This is the canonical single-pass form of the IFT formula. Compared to
-    /// the legacy split
-    /// path (`predict_delta_t_from_delta_beta` + `predict_delta_t_from_delta_gt`),
-    /// this routine performs *one* per-row Cholesky back-substitution
-    /// instead of two — halving the IFT predictor cost for callers that
-    /// have both a β perturbation and a per-row gradient perturbation.
-    pub fn predict_delta_t_combined(
-        &self,
-        delta_beta: Option<ArrayView1<'_, f64>>,
-        delta_gt: Option<ArrayView1<'_, f64>>,
-    ) -> Array1<f64> {
-        let n = self.undamped_factor_count();
-        let total_len = self.delta_t_len();
-        if let Some(db) = delta_beta.as_ref() {
-            assert_eq!(db.len(), self.k);
-        }
-        if let Some(dg) = delta_gt.as_ref() {
-            assert_eq!(dg.len(), total_len);
-        }
-        let mut out = Array1::<f64>::zeros(total_len);
-        // Hoist per-row scratch outside the loop; sized to max_d.
-        let mut rhs = Array1::<f64>::zeros(self.d);
-        let mut htbeta_delta = Array1::<f64>::zeros(self.d);
-        for i in 0..n {
-            let di = self.row_dims[i];
-            let row_base = self.row_offsets[i];
-            for c in 0..di {
-                rhs[c] = 0.0;
-            }
-            if let Some(db) = delta_beta.as_ref() {
-                for c in 0..di {
-                    htbeta_delta[c] = 0.0;
-                }
-                let mut htbeta_slice = htbeta_delta.slice_mut(ndarray::s![..di]).to_owned();
-                if !self.apply_htbeta_row(i, db.view(), &mut htbeta_slice) {
-                    return Array1::<f64>::zeros(total_len);
-                }
-                for c in 0..di {
-                    rhs[c] += htbeta_slice[c];
-                }
-            }
-            if let Some(dg) = delta_gt.as_ref() {
-                for c in 0..di {
-                    rhs[c] += dg[row_base + c];
-                }
-            }
-            let rhs_slice = rhs.slice(ndarray::s![..di]).to_owned();
-            let v = cholesky_solve_vector(self.undamped_factor(i), &rhs_slice);
-            for c in 0..di {
-                out[row_base + c] = -v[c];
-            }
-        }
-        out
-    }
-
     /// Arrow log-determinant
     /// `log|H| = Σ_i log|H_{t_i t_i}| + log|Schur_β|`
     /// using the cached (damped) factors.
@@ -3963,36 +3873,6 @@ impl ArrowFactorCache {
             2.0 * s
         });
         (log_det_tt, log_det_schur)
-    }
-
-    /// Apply `Δt_i = -(H_tt^(i))⁻¹ · δg_t^(i)` per row.
-    ///
-    /// IFT first-order predictor for the latent field under a
-    /// per-row gradient perturbation (typically `∂g_t/∂ρ · Δρ`
-    /// resolved externally by the driver). BA analogue: reuse point-block
-    /// factors for local point updates after shared parameters move.
-    pub fn predict_delta_t_from_delta_gt(&self, delta_gt: ArrayView1<'_, f64>) -> Array1<f64> {
-        let n = self.undamped_factor_count();
-        let total_len = self.delta_t_len();
-        assert_eq!(delta_gt.len(), total_len);
-        assert_eq!(
-            self.undamped_factor_count(),
-            n,
-            "undamped factor cache and N must agree"
-        );
-        let mut out = Array1::<f64>::zeros(total_len);
-        for i in 0..n {
-            let di = self.row_dims[i];
-            let row_base = self.row_offsets[i];
-            let rhs = delta_gt
-                .slice(ndarray::s![row_base..row_base + di])
-                .to_owned();
-            let v = cholesky_solve_vector(self.undamped_factor(i), &rhs);
-            for c in 0..di {
-                out[row_base + c] = -v[c];
-            }
-        }
-        out
     }
 
     /// Diagonal of the latent (`t`-block) of the *full* bordered-arrow

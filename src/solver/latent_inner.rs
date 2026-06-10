@@ -15,8 +15,8 @@
 //!   `(t, β)` Newton system with arrow structure;
 //! * [`crate::solver::arrow_schur::ArrowFactorCache`] — the per-row
 //!   Cholesky factors saved between inner iterations and reused by the
-//!   IFT delta-t predictors
-//!   ([`crate::solver::arrow_schur::ArrowFactorCache::predict_delta_t_from_delta_beta`]).
+//!   evidence-side IFT delta-t predictor loop in
+//!   [`crate::solver::evidence`].
 //!
 //! The driver is a thin coordinator: it expects the caller to supply a
 //! closure that, given the current `(β, t)`, assembles a fresh
@@ -115,8 +115,8 @@ pub struct LatentInnerOutcome {
     /// Final β coefficient vector.
     pub beta: Array1<f64>,
     /// Per-row Cholesky factor cache from the *last* accepted Newton
-    /// step. Consumed by the IFT delta-t predictors
-    /// ([`crate::solver::arrow_schur::ArrowFactorCache::predict_delta_t_from_delta_beta`]).
+    /// step. Consumed by the evidence-side IFT delta-t predictor loop in
+    /// [`crate::solver::evidence`].
     pub factor_cache: Option<ArrowFactorCache>,
     /// Number of iterations executed.
     pub iterations: usize,

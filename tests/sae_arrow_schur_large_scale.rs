@@ -1,4 +1,4 @@
-//! Regression gate for SAE arrow-Schur assembly and solve at biobank-adjacent
+//! Regression gate for SAE arrow-Schur assembly and solve at large-scale-adjacent
 //! scale (`K_atoms ∈ {8, 16, 32}`).
 //!
 //! Exercises the structural costs that are invisible at K≤2:

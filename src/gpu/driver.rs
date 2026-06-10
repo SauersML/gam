@@ -289,7 +289,7 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
 /// cudarc 0.19 attempts to lazy-load these via its own generated
 /// `panic_no_lib_found` helpers the first time `CudaBlas::new` /
 /// `DnHandle::new` / cuSPARSE handle creation is invoked. On a host that
-/// has only the CUDA *driver* (e.g. AoU workbench images expose
+/// has only the CUDA *driver* (e.g. large-scale workbench images expose
 /// `libcuda.so.1` but no cuBLAS at all), those calls panic out of the
 /// PyO3 FFI boundary instead of returning a typed error.
 ///
@@ -635,25 +635,15 @@ pub fn cuda_library_candidates() -> &'static [&'static str] {
 }
 
 #[inline]
-pub fn bytes_len<T>(len: usize) -> Option<usize> {
-    len.checked_mul(std::mem::size_of::<T>())
-}
-
-#[inline]
 pub fn to_i32(value: usize) -> Option<i32> {
     i32::try_from(value).ok()
-}
-
-#[inline]
-pub fn to_i64(value: usize) -> Option<i64> {
-    i64::try_from(value).ok()
 }
 
 /// Repack a 2D `ndarray::ArrayBase` (row-major) into the column-major
 /// layout expected by every cuBLAS / cuSOLVER entry point.
 ///
 /// Walks each column once via ndarray's iter (no per-element bounds checks)
-/// and extends into a pre-sized `Vec`. On biobank-shape inputs (n≈3×10⁵,
+/// and extends into a pre-sized `Vec`. On large-scale inputs (n≈3×10⁵,
 /// p≈35) this replaces a per-element `a[[row, col]]` indexing loop that
 /// dominated the host side of every GPU dispatch.
 ///

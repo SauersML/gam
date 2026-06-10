@@ -1,13 +1,13 @@
 //! Ignored-by-default Criterion workload for the BVN primitive used by the
-//! biobank marginal-slope cycle-0 affine cells.
+//! large-scale marginal-slope cycle-0 affine cells.
 //!
-//! Run with: `cargo bench --bench bvn_biobank_shape`
+//! Run with: `cargo bench --bench bvn_large_scale_shape`
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use gam::families::cubic_cell_kernel::bivariate_normal_cdf;
 use std::hint::black_box;
 
-fn biobank_shape_args() -> Vec<(f64, f64, f64)> {
+fn large_scale_shape_args() -> Vec<(f64, f64, f64)> {
     // Cycle-0 affine cells use h = alpha/sqrt(1+beta^2), k = cell boundary,
     // rho = -beta/sqrt(1+beta^2).  The grid below concentrates on the common
     // central support boundaries and moderately strong slopes, with a few tail
@@ -26,9 +26,9 @@ fn biobank_shape_args() -> Vec<(f64, f64, f64)> {
     out
 }
 
-fn bench_bivariate_normal_cdf_biobank_shape(c: &mut Criterion) {
-    let args = biobank_shape_args();
-    c.bench_function("bvn_cdf_biobank_shape_cycle0", |b| {
+fn bench_bivariate_normal_cdf_large_scale_shape(c: &mut Criterion) {
+    let args = large_scale_shape_args();
+    c.bench_function("bvn_cdf_large_scale_shape_cycle0", |b| {
         b.iter(|| {
             let mut acc = 0.0;
             for &(h, k, rho) in &args {
@@ -40,5 +40,5 @@ fn bench_bivariate_normal_cdf_biobank_shape(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_bivariate_normal_cdf_biobank_shape);
+criterion_group!(benches, bench_bivariate_normal_cdf_large_scale_shape);
 criterion_main!(benches);

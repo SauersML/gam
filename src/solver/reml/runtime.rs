@@ -839,7 +839,7 @@ fn decode_efs_single_loop_cap(raw_cap: usize) -> Option<usize> {
 ///
 /// where r_g = ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖) is the scale-invariant
 /// relative gradient residual. Using r_g rather than the absolute ‖g‖ keeps
-/// the penalty meaningful at biobank n: the absolute score grows as O(√n),
+/// the penalty meaningful at large-scale n: the absolute score grows as O(√n),
 /// so an absolute residual term would swamp the actual REML cost differences
 /// across seeds and reduce the screen to a √n-scaled tie-break. r_g is
 /// dimensionless and bounded above by 1 for any well-defined PIRLS state, so
@@ -1427,7 +1427,7 @@ pub(crate) fn analytic_penalty_registry_fingerprint(
 }
 
 fn hash_design_matrix(hasher: &mut Fingerprinter, design: &DesignMatrix) -> Result<(), String> {
-    // Stream the design through fixed-byte row blocks so a biobank-scale design
+    // Stream the design through fixed-byte row blocks so a large-scale design
     // is never fully materialized just to fingerprint it. Target ~8 MiB of
     // working set per chunk, with a row-count floor of 1 (always make progress)
     // and a ceiling so a very narrow design does not request an unbounded chunk.
@@ -2226,10 +2226,10 @@ impl<'a> RemlState<'a> {
         // implementation; it is now stale and was suppressing the analytic
         // path that was actually in place.
         //
-        // Biobank-scale fallback: analytic outer Hessian is only safe when
+        // Large-scale fallback: analytic outer Hessian is only safe when
         // the unified evaluator can express it as a matrix-free Hv operator
         // (`prefer_outer_hessian_operator`). Whenever that path is
-        // unavailable at biobank scale, the dense `O(K²·n·p²)` LAML pairwise
+        // unavailable at large scale, the dense `O(K²·n·p²)` LAML pairwise
         // assembly would run instead — route to BFGS.
         let n_obs = self.x.nrows();
         let p_dim = self.x.ncols();
@@ -3874,7 +3874,7 @@ impl<'a> RemlState<'a> {
 
         // Problem-scale gate. The non-Gaussianity diagnostic costs an O(p³)
         // dense eigendecomposition plus O(n·p) cubic contractions, and the
-        // sampler adds O(draws · n · m) deviance work. At biobank scale that is
+        // sampler adds O(draws · n · m) deviance work. At large scale that is
         // prohibitive on every inner evaluation, and the Laplace floor error is
         // already O(1/n) → negligible there, so the correction would be a
         // no-op anyway. Mirror the established TK scale caps: skip the audit
@@ -4534,7 +4534,7 @@ impl<'a> RemlState<'a> {
 
         if canonical_logit {
             // Canonical Logit fast path: per-row 5-jet evaluation, no
-            // cross-row dependency. At biobank n the 5-jet exp/log work
+            // cross-row dependency. At large-scale n the 5-jet exp/log work
             // is the dominant cost.
             use rayon::prelude::*;
             let final_eta = &pirls_result.final_eta;
@@ -5861,21 +5861,21 @@ impl<'a> RemlState<'a> {
                 // Precompute the per-penalty `S_k · (β_cur-μ_k)` block-local
                 // mat-vecs once at cache-write time so the IFT
                 // predictor's per-call rhs construction skips the
-                // `O(block²)` mat-vec on every penalty. At biobank-scale
+                // `O(block²)` mat-vec on every penalty. At large-scale
                 // CTN this saves a few ms per predict call; combined
                 // with the H_pen factor cache (commit ec18559d) the
                 // predictor's per-call work is now dominated by the
                 // back-solve plus the `O(p)` rhs accumulation.
                 let lambda_s_beta_blocks: Option<Vec<ndarray::Array1<f64>>> = {
                     // Parallelize across penalties: each `S_k · (β_cur-μ_k)`
-                    // mat-vec is independent of the others. At biobank-
+                    // mat-vec is independent of the others. At large-scale-
                     // scale CTN with p ≈ several thousand and ~10
                     // penalties, the serial precompute is ~250M flops
                     // per cache write — repeated 5-10× per fit as the
                     // outer optimizer accepts new ρ. Parallelizing
                     // across rayon's thread pool brings this down to
                     // (~250M / cores) flops per write, eliminating
-                    // the precompute as a meaningful biobank-scale
+                    // the precompute as a meaningful large-scale
                     // serial cost.
                     use rayon::prelude::*;
                     let blocks: Vec<ndarray::Array1<f64>> = self
@@ -6183,7 +6183,7 @@ impl<'a> RemlState<'a> {
     /// The factor is cached at `self.ift_cached_factor` and reused across
     /// successive predict calls until the IFT cache itself is replaced (a
     /// new `updatewarm_start_from`) or invalidated (failed solve, link
-    /// change, surface reset). At biobank scale (p ≈ several thousand)
+    /// change, surface reset). At large scale (p ≈ several thousand)
     /// the dense Cholesky is O(p³)/3 — multiple seconds per refactor —
     /// so caching saves real wall time across the typical 5-10 IFT
     /// predict calls per outer fit.
@@ -6220,7 +6220,7 @@ impl<'a> RemlState<'a> {
         // the H_pen factor. The inner function detects both cases and
         // returns the same outcome, but only AFTER the factor cache
         // lookup — which on a miss pays a fresh O(p³)/3 Cholesky
-        // (multiple seconds at biobank-scale p) for a prediction
+        // (multiple seconds at large-scale p) for a prediction
         // that's about to be discarded.
         //
         // The dim-check guards mirror the inner function's so an
@@ -6308,7 +6308,7 @@ impl<'a> RemlState<'a> {
                 // Cache hit: H_pen factor was already computed by an
                 // earlier predict call at the same surface. The
                 // [IFT-CACHE] marker validates that the factor cache
-                // (commit ec18559d) is paying off at biobank scale —
+                // (commit ec18559d) is paying off at large scale —
                 // every cache hit avoids a fresh O(p³)/3 Cholesky,
                 // which is multiple seconds at p ≈ several thousand.
                 log::info!(
@@ -6520,7 +6520,7 @@ impl<'a> RemlState<'a> {
             // non-cache reasons (large Δρ, factor failed, etc.), so
             // this represents the "linear predictor stack failed
             // entirely → fall back to flat warm-start" case. Counting
-            // the rate at biobank scale tells us how often the warm-
+            // the rate at large scale tells us how often the warm-
             // start is degenerating to flat after IFT rejects.
             let reason = if alpha <= 0.0 {
                 "alpha_negative"
@@ -7294,7 +7294,7 @@ impl<'a> RemlState<'a> {
             if let Ok((ref res, ref wm)) = result {
                 // Surface every non-screening PIRLS call at INFO so CI logs
                 // reveal exactly which inner solves dominate wall-clock at
-                // biobank scale — the main signal for "what's the slow path"
+                // large scale — the main signal for "what's the slow path"
                 // when an outer BFGS / line-search step blows past the
                 // 2400 s job budget.
                 log::info!(
@@ -7466,7 +7466,7 @@ impl<'a> RemlState<'a> {
                 // bias_proxy guard (max(gradient_residual, inner_residual) > 0.10
                 // for K=3 consecutive iters triggers fallback to the standard
                 // two-loop driver). This is the bam (Wood 2015) tradeoff: tolerate
-                // uncertified inner accuracy at biobank n to amortize per-outer-iter
+                // uncertified inner accuracy at large-scale n to amortize per-outer-iter
                 // cost, then bail to the certified path if the EFS surrogate drifts.
                 if in_efs_single_loop
                     && pirls_result.deviance.is_finite()
@@ -7728,13 +7728,13 @@ const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
 /// `last_residual = ‖β_converged − β_predicted‖ / ‖β_converged‖`:
 /// - `r < 0.01` → linearization was excellent; allow Δρ up to **4.0**
 ///   (54× λ-step). At this regime the local Jacobian is faithful and
-///   tightening to 2.0 leaves performance on the table at biobank Δρ
+///   tightening to 2.0 leaves performance on the table at large-scale Δρ
 ///   magnitudes (where outer optimizers commonly take ρ-jumps of ~1).
 /// - `0.01 ≤ r < 0.05` → very good; modest expansion to **3.0**.
 /// - `0.05 ≤ r < 0.20` → ok; default **2.0** (the original constant).
 /// - `0.20 ≤ r < 0.50` → marginal; tighten to **1.0** (2.7× λ-step).
 /// - `r ≥ 0.50` → poor; tighten to **0.5** (1.6× λ-step). The IFT
-///   prediction is not paying off at biobank Δρ; fall back to flat
+///   prediction is not paying off at large-scale Δρ; fall back to flat
 ///   warm-start (β_cur) for any non-trivial outer step.
 /// - `None` → no signal yet (first PIRLS solve at this surface) → default 2.0.
 ///
@@ -8025,7 +8025,7 @@ fn predict_warm_start_beta_ift_inner_with_outcome(
         // Emit a structured reject marker so the bench runner can
         // count predictor rejections alongside accepts (the
         // `[IFT-QUALITY]` markers count only the accepts). The
-        // accept/reject ratio at biobank scale tells us how often
+        // accept/reject ratio at large scale tells us how often
         // the warm-start machinery is actually delivering, vs
         // falling through to flat warm-start at every accepted
         // outer iter.
@@ -9473,7 +9473,7 @@ impl<'a> RemlState<'a> {
         // backends that select sparse-exact:
         //
         //   1. `estimate_sparse_native_decision` gates on H density, which
-        //      implies large p and typically n ≫ p (biobank-scale) — i.e.
+        //      implies large p and typically n ≫ p (large-scale) — i.e.
         //      `X'WX` is rank-full, so `X'WX + S` is rank-full, so
         //      `ridge_used = 0` and no leak term exists.
         //   2. The small-n/high-dim regime that motivated e33c06be (n=120,
@@ -11537,7 +11537,7 @@ mod tk_math_tests {
 
     /// Probit + Bernoulli: closed-form e_obs (via `pirls::e_obs_from_jets`)
     /// matches the Dual3-AD third η-derivative of W_obs at every fixture
-    /// point.  This is the production link for biobank-scale GAMLSS
+    /// point.  This is the production link for large-scale GAMLSS
     /// marginal-slope inference, so we cover both shoulders and the
     /// origin to exercise the (η³,η²,η) polynomial structure of the
     /// Probit jets.

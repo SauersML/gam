@@ -1,7 +1,7 @@
-//! Scaling-law probe for standard-GAM Bernoulli-probit at biobank shape.
+//! Scaling-law probe for standard-GAM Bernoulli-probit at large-scale shape.
 //!
 //! Times one full fit at each of several n values, then prints a summary
-//! table that lets us extrapolate to the biobank n=320_000 target without
+//! table that lets us extrapolate to the large-scale n=320_000 target without
 //! waiting on a 30-50 minute CI cycle.
 //!
 //! Run with:
@@ -269,8 +269,8 @@ fn standard_gam_p_scaling_law() {
             .collect(),
         &[("k=42", 42.0), ("k=80", 80.0)],
         // P-scaling here is at fixed n=50k. The 2400s budget is at
-        // biobank n=320k. Approx target at fixed n=50k for "fits at
-        // biobank": 2400 / (320/50)^1 = 375s (assuming n^1 scaling).
+        // large-scale n=320k. Approx target at fixed n=50k for "fits at
+        // large-scale": 2400 / (320/50)^1 = 375s (assuming n^1 scaling).
         // Use this as the budget so verdicts at this n make sense.
         375.0,
     );

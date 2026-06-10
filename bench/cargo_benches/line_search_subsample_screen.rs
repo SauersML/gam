@@ -16,7 +16,7 @@ fn bench_line_search_subsample_screen(c: &mut Criterion) {
     // Ignored-style Criterion benchmark: it is not part of `cargo test`, and
     // must be run explicitly with
     // `cargo bench --bench line_search_subsample_screen`. The row counts mimic
-    // the biobank outer-score pattern: exact full LL over 320k rows versus an
+    // the large-scale outer-score pattern: exact full LL over 320k rows versus an
     // HT-weighted 20k outer-score subsample used for outer gradient passes.
     // NOTE: the BMS line-search accept/reject is an exact full-data decision;
     // the subsample path benchmarked here applies only to outer derivative
@@ -35,7 +35,7 @@ fn bench_line_search_subsample_screen(c: &mut Criterion) {
     let subsample_rows: Vec<usize> = (0..k).map(|j| (j * 15_919 + 7) % n).collect();
     let scale = n as f64 / k as f64;
 
-    let mut group = c.benchmark_group("line_search_ll_screen_biobank_shape");
+    let mut group = c.benchmark_group("line_search_ll_screen_large_scale_shape");
     group.bench_function("full_ll_each_attempt_320k", |b| {
         b.iter(|| {
             paired_objective_delta(

@@ -14,7 +14,7 @@ pub const OWNED_DATA_CACHE_MAX_ENTRIES: usize = 2;
 
 /// Auto-strict triggers for [`ResourcePolicy::for_problem`].
 ///
-/// Tuned for biobank-scale problems where dense materialization of any
+/// Tuned for large-scale problems where dense materialization of any
 /// design factor would itself be tens of GiB. Below these thresholds we
 /// stay on `default_library` so small-data and ad-hoc fits keep working
 /// without operator implementations.
@@ -25,7 +25,7 @@ pub const STRICT_POLICY_P_THRESHOLD: usize = 5_000;
 /// is structurally operator-only and any dense fallback would be a bug.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProblemHints {
-    pub marginal_slope_biobank_active: bool,
+    pub marginal_slope_large_scale_active: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,9 +91,9 @@ impl ResourcePolicy {
     /// reject all dense fallback.
     ///
     /// The 1 GiB single-materialization budget matches the established
-    /// biobank-scale densification ceiling used elsewhere in the codebase
+    /// large-scale densification ceiling used elsewhere in the codebase
     /// (e.g. `CoefficientTransformOperator::MATERIALIZE_MAX_BYTES`). Real
-    /// biobank-scale GAMLSS spatial designs (320k rows × ~130 cols ≈ 0.32 GiB)
+    /// large-scale GAMLSS spatial designs (320k rows × ~130 cols ≈ 0.32 GiB)
     /// must be materializable under this default because their families
     /// (e.g. `BinomialLocationScale`) eagerly densify in
     /// `build_location_scale_block` and have no operator-only fallback. A
@@ -111,7 +111,7 @@ impl ResourcePolicy {
     }
 
     /// Strict mode that rejects every dense fallback. Use when you intend to
-    /// run only on operator-backed bases (biobank-scale Duchon/TPS, exact
+    /// run only on operator-backed bases (large-scale Duchon/TPS, exact
     /// GAMLSS marginal slope, CTN, etc.).
     pub const fn analytic_operator_required() -> Self {
         Self {
@@ -132,15 +132,15 @@ impl ResourcePolicy {
     /// non-operator bases still work out of the box.
     ///
     /// Strict mode (`AnalyticOperatorRequired`) is selected when ANY of:
-    ///   * `n_rows >= STRICT_POLICY_NROWS_THRESHOLD` (biobank scale by row count)
-    ///   * `p_estimate >= STRICT_POLICY_P_THRESHOLD` (biobank scale by coefficient count)
-    ///   * `hints.marginal_slope_biobank_active` (the GAMLSS marginal-slope
-    ///     biobank path is in play; the corresponding operators MUST stay
+    ///   * `n_rows >= STRICT_POLICY_NROWS_THRESHOLD` (large scale by row count)
+    ///   * `p_estimate >= STRICT_POLICY_P_THRESHOLD` (large scale by coefficient count)
+    ///   * `hints.marginal_slope_large_scale_active` (the GAMLSS marginal-slope
+    ///     large-scale path is in play; the corresponding operators MUST stay
     ///     matrix-free regardless of n)
     pub const fn for_problem(n_rows: usize, p_estimate: usize, hints: ProblemHints) -> Self {
         let strict = n_rows >= STRICT_POLICY_NROWS_THRESHOLD
             || p_estimate >= STRICT_POLICY_P_THRESHOLD
-            || hints.marginal_slope_biobank_active;
+            || hints.marginal_slope_large_scale_active;
         if strict {
             Self::analytic_operator_required()
         } else {
@@ -199,7 +199,7 @@ use std::sync::{Arc, Mutex};
 /// Unlike an entry-count-limited LRU, this cache tracks the resident byte cost
 /// of each value (via [`ResidentBytes`]) and evicts the least-recently-used
 /// entries until the total resident bytes fit under `max_bytes`. This is the
-/// correct policy for biobank-scale payloads where a single cache entry (e.g.
+/// correct policy for large-scale payloads where a single cache entry (e.g.
 /// an n*K distance matrix) can itself be multiple gigabytes and an entry-count
 /// cap would silently blow the memory budget. Small entry caps are still useful
 /// for payloads with known shape, such as owned PC data matrices shared across
@@ -481,22 +481,6 @@ impl<T> RayonSafeOnce<T> {
         self.slot
             .get()
             .expect("RayonSafeOnce slot populated by set() above")
-    }
-
-    /// Fallible variant of `get_or_compute`.
-    pub fn get_or_try_compute<F, E>(&self, init: F) -> Result<&T, E>
-    where
-        F: FnOnce() -> Result<T, E>,
-    {
-        if let Some(v) = self.slot.get() {
-            return Ok(v);
-        }
-        let candidate = init()?;
-        self.slot.set(candidate).ok();
-        Ok(self
-            .slot
-            .get()
-            .expect("RayonSafeOnce slot populated by set() above"))
     }
 }
 

@@ -366,28 +366,6 @@ impl StructuredResidualModel {
         self.log_evidence
     }
 
-    /// Per-row covariance `Σ_n = Λ c(z_n) Λᵀ + D` (dense `p × p`). Diagnostic /
-    /// test surface; the hot path uses the factored precision via
-    /// [`Self::row_metric`].
-    pub fn row_covariance(&self, row: usize) -> Array2<f64> {
-        let p = self.p;
-        let c = self.row_scale[row];
-        let mut sigma = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            sigma[[i, i]] = self.diagonal[i];
-        }
-        for i in 0..p {
-            for j in 0..p {
-                let mut acc = 0.0_f64;
-                for k in 0..self.factor_rank {
-                    acc += self.lambda[[i, k]] * self.lambda[[j, k]];
-                }
-                sigma[[i, j]] += c * acc;
-            }
-        }
-        sigma
-    }
-
     /// Build the per-row precision factor stack `U_n ∈ ℝ^{p×p}` with
     /// `U_n U_nᵀ = Σ_n^{-1}` and package it as a
     /// [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured)

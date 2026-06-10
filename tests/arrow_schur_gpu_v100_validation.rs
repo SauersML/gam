@@ -449,7 +449,7 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
 ///   * Layer A+B+C ≥ 5× the CPU host-loop baseline.
 ///   * Layer A+B+C+D (fused) ≥ 10× the CPU host-loop baseline.
 ///
-/// The benchmark fixture is biobank-shape `(n=5000, d=16, k=6)` per the
+/// The benchmark fixture is large-scale `(n=5000, d=16, k=6)` per the
 /// charter; ridge stays at 1e-9 so both factor paths run their hot loops
 /// without escalation. Each path is timed across `iters=3` repetitions
 /// (median taken via `min` of the trailing two — the first run

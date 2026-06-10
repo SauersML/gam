@@ -263,7 +263,7 @@ fn duchon_lazy_chunked_path_is_exercised_and_recovers_truth() {
     // when the would-be dense `n × p` design exceeds the auto-derived policy's
     // `max_single_materialization_bytes`. The fit path derives that policy via
     // `ResourcePolicy::for_problem(n_rows, 0, ProblemHints::default())`; below
-    // the biobank row threshold this is the 256 MiB default budget.
+    // the large-scale row threshold this is the 256 MiB default budget.
     //
     // n = 40_000, k = 900. WHY THESE NUMBERS: the design has p ≈ k centers (plus
     // a 2-column affine null space). dense_bytes = n·p·8 ≈ 40_000·902·8

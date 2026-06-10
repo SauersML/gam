@@ -42,7 +42,7 @@ use gam::terms::{
 };
 
 /// Deterministic pseudo-random f64 ∈ (-1, 1) via LCG, matching the sibling
-/// `sae_arrow_schur_biobank_scale` fixture.
+/// `sae_arrow_schur_large_scale` fixture.
 fn lcg_f64(state: &mut u64) -> f64 {
     *state = state
         .wrapping_mul(6364136223846793005)

@@ -1,4 +1,4 @@
-// Regression guard for the biobank-scale dense Bernoulli-logit convergence
+// Regression guard for the large-scale dense Bernoulli-logit convergence
 // fixes. Four mechanisms must all stay healthy:
 //
 //   (1) `pirls_soft_acceptance` per-iteration early-exit on a 2-iter
@@ -112,7 +112,7 @@ fn second_difference_penalty(k: usize) -> Array2<f64> {
 }
 
 #[test]
-fn biobank_convergence_regression() {
+fn large_scale_convergence_regression() {
     let n = N;
     let k = K;
     let mut rng = StdRng::seed_from_u64(SEED);
@@ -186,7 +186,7 @@ fn biobank_convergence_regression() {
             kronecker_factored: None,
         },
     )
-    .expect("biobank-scale dense Bernoulli-logit fit must succeed");
+    .expect("large-scale dense Bernoulli-logit fit must succeed");
     let elapsed = start.elapsed();
 
     // (a) Inner solver landed at a valid minimum. Soft-acceptance regressions
@@ -267,7 +267,7 @@ fn biobank_convergence_regression() {
     );
 
     eprintln!(
-        "[biobank_convergence_regression] n={n}, p={p}, k_smoothing=1 \
+        "[large_scale_convergence_regression] n={n}, p={p}, k_smoothing=1 \
          | wall_clock={:.3}s, outer_iter={}, pirls_iter={}, corr_eta={:.4}, mad_eta={:.4}, status={:?}, weighted_rows=true",
         elapsed.as_secs_f64(),
         fit.outer_iterations,

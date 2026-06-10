@@ -206,7 +206,7 @@ fn channel_aware_audit_accepts_intra_block_rank_deficiency() {
     // already drops the redundant columns and the fit proceeds on the
     // reduced basis; the audit must surface this as NON-fatal.
     //
-    // This mirrors the biobank GAMLSS jointpc failure mode: shared
+    // This mirrors the large-scale GAMLSS jointpc failure mode: shared
     // covariates between the threshold and log-sigma designs leave the
     // log-sigma block with most columns linearly dependent (after the
     // scale-deviation reparameterisation residualises against the

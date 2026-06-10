@@ -22,12 +22,12 @@ fn trust_region_pattern(radius: f64, newton_step: &Array1<f64>) -> (usize, f64) 
     black_box((1usize, norm * scale))
 }
 
-fn bench_biobank_shape_line_search_pattern(c: &mut Criterion) {
+fn bench_large_scale_shape_line_search_pattern(c: &mut Criterion) {
     let p = 256usize;
     let newton_step = Array1::from_iter((0..p).map(|i| 0.25 + (i as f64 % 17.0) / 17.0));
     let radius = newton_step.iter().map(|v| v * v).sum::<f64>().sqrt() / 16.0;
 
-    let mut group = c.benchmark_group("biobank_shape_line_search_pattern");
+    let mut group = c.benchmark_group("large_scale_shape_line_search_pattern");
     group.bench_function("before_backtracking_accepts_fifth", |b| {
         b.iter(|| backtracking_pattern(black_box(radius), black_box(&newton_step)))
     });
@@ -37,5 +37,5 @@ fn bench_biobank_shape_line_search_pattern(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_biobank_shape_line_search_pattern);
+criterion_group!(benches, bench_large_scale_shape_line_search_pattern);
 criterion_main!(benches);

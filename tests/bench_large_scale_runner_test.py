@@ -8,10 +8,10 @@ from pathlib import Path
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_RUNNER_PATH = _REPO_ROOT / "bench" / "biobank_scale" / "runner.py"
-_SPEC = importlib.util.spec_from_file_location("bench_biobank_scale_runner", _RUNNER_PATH)
+_RUNNER_PATH = _REPO_ROOT / "bench" / "large_scale" / "runner.py"
+_SPEC = importlib.util.spec_from_file_location("bench_large_scale_runner", _RUNNER_PATH)
 if _SPEC is None or _SPEC.loader is None:
-    raise RuntimeError(f"failed to load biobank benchmark runner from {_RUNNER_PATH}")
+    raise RuntimeError(f"failed to load large-scale benchmark runner from {_RUNNER_PATH}")
 _RUNNER: typing.Any = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _RUNNER
 _SPEC.loader.exec_module(_RUNNER)
@@ -25,7 +25,7 @@ def _write_csv(path: Path, rows: typing.Sequence[typing.Mapping[str, object]]) -
         writer.writerows(rows)
 
 
-class BiobankScaleRunnerTests(unittest.TestCase):
+class LargeScaleRunnerTests(unittest.TestCase):
     def test_terminal_output_sanitizer_removes_cursor_controls_across_chunks(self) -> None:
         sanitizer = _RUNNER._TerminalOutputSanitizer()
         text = (
@@ -35,7 +35,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         )
         self.assertEqual(text, "progress\n[1s] ok  next done\n")
 
-    def test_default_biobank_matrix_keeps_400k_binomial_marginal_slope_lane(self) -> None:
+    def test_default_large_scale_matrix_keeps_400k_binomial_marginal_slope_lane(self) -> None:
         cfg = _RUNNER.load_config(_RUNNER.DEFAULT_CONFIG)
 
         self.assertEqual(int(cfg["target_n"]), 400000)
@@ -54,7 +54,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
             len(marginal_slope_disease),
             1,
             "expected exactly one disease + Rust + binomial + marginal-slope lane in the "
-            "default biobank matrix; found "
+            "default large-scale matrix; found "
             f"{[s.name for s in marginal_slope_disease]}",
         )
         lane = marginal_slope_disease[0]
@@ -77,7 +77,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
 
         self.assertIsNotNone(
             lane.max_centers,
-            f"{lane.name} must declare a max-centers cap for biobank scale",
+            f"{lane.name} must declare a max-centers cap for large scale",
         )
         self.assertLessEqual(
             int(lane.centers),
@@ -86,13 +86,13 @@ class BiobankScaleRunnerTests(unittest.TestCase):
             f"{lane.max_centers}",
         )
 
-        capped_at_biobank_n = _RUNNER.effective_marginal_slope_centers(
+        capped_at_large_scale_n = _RUNNER.effective_marginal_slope_centers(
             lane, train_rows=int(cfg["target_n"])
         )
         self.assertLessEqual(
-            capped_at_biobank_n,
+            capped_at_large_scale_n,
             int(lane.max_centers),
-            f"{lane.name} effective centers at n={cfg['target_n']} ({capped_at_biobank_n}) "
+            f"{lane.name} effective centers at n={cfg['target_n']} ({capped_at_large_scale_n}) "
             f"must not exceed max_centers cap {lane.max_centers}",
         )
 
@@ -119,7 +119,7 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertIn("linkwiggle(internal_knots=8)", mean_formula)
         self.assertIn("linkwiggle(internal_knots=7)", logslope_formula)
 
-    def test_effective_marginal_slope_centers_caps_biobank_and_wiggle_modes(self) -> None:
+    def test_effective_marginal_slope_centers_caps_large_scale_and_wiggle_modes(self) -> None:
         spec = _RUNNER.MethodSpec(
             name="margslope_variant",
             dataset="disease",
@@ -134,8 +134,8 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=10000), 22)
         self.assertEqual(_RUNNER.effective_marginal_slope_centers(spec, train_rows=400000), 22)
 
-    def test_biobank_preflight_rejects_unsafe_dense_duchon_width_before_allocation(self) -> None:
-        report = _RUNNER.preflight_marginal_slope_biobank(
+    def test_large_scale_preflight_rejects_unsafe_dense_duchon_width_before_allocation(self) -> None:
+        report = _RUNNER.preflight_marginal_slope_large_scale(
             n_train=400000,
             d_pc=16,
             centers=1400,
@@ -145,8 +145,8 @@ class BiobankScaleRunnerTests(unittest.TestCase):
         self.assertIn("anisotropic derivative dense estimate", text)
         self.assertIn("status: FAIL", text)
 
-    def test_biobank_preflight_accepts_production_marginal_slope_width(self) -> None:
-        report = _RUNNER.preflight_marginal_slope_biobank(
+    def test_large_scale_preflight_accepts_production_marginal_slope_width(self) -> None:
+        report = _RUNNER.preflight_marginal_slope_large_scale(
             n_train=400000,
             d_pc=16,
             centers=24,
@@ -177,11 +177,11 @@ class BiobankScaleRunnerTests(unittest.TestCase):
             grid_points=1000,
         )
         self.assertEqual(report.status, "PASS")
-        self.assertEqual(report.chunk_rows, _RUNNER.BIOBANK_SURVIVAL_PREDICTION_CHUNK_ROWS)
+        self.assertEqual(report.chunk_rows, _RUNNER.LARGE_SCALE_SURVIVAL_PREDICTION_CHUNK_ROWS)
         self.assertLess(report.largest_single_allocation_bytes, 400000 * 1000 * 8)
 
     def test_marginal_slope_preflight_status_is_grep_friendly(self) -> None:
-        report = _RUNNER.preflight_marginal_slope_biobank(
+        report = _RUNNER.preflight_marginal_slope_large_scale(
             n_train=400000,
             d_pc=16,
             centers=20,
@@ -760,12 +760,12 @@ class MarkerPatternTests(unittest.TestCase):
     def test_seed_cascade_pattern_captures_cascade_summary(self) -> None:
         cases = [
             (
-                "[OUTER] biobank_fit_001: seed screening cascade complete "
+                "[OUTER] large_scale_fit_001: seed screening cascade complete "
                 "elapsed=12.345s stages_used=2 final_cap=uncapped ranked=8/10",
                 "12.345", "2", "uncapped", "8", "10",
             ),
             (
-                "[OUTER] survival-marginal-slope/biobank-1: seed screening cascade complete "
+                "[OUTER] survival-marginal-slope/large-scale-1: seed screening cascade complete "
                 "elapsed=0.500s stages_used=1 final_cap=10 ranked=4/4",
                 "0.500", "1", "10", "4", "4",
             ),

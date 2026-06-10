@@ -1,5 +1,5 @@
 //! Reproduce the failing path from
-//! `gnomon/examples/biobank/test_local_synthetic.py`:
+//! `gnomon/examples/large-scale/test_local_synthetic.py`:
 //!     duchon(PC1..PC10, centers=40, order=0, power=2, length_scale=1.0)
 //! against parametric block [intercept | sex | prs_z], with 200 training rows
 //! drawn from a synthetic case/control cohort identical to the script.

@@ -1,5 +1,5 @@
 //! Opt-in Criterion microbenchmark for the joint-Newton line-search latency
-//! pattern seen at biobank shape.
+//! pattern seen at large-scale shape.
 //!
 //! The benchmark models the observed cycle-0 pattern where alpha attempts
 //! 1.0, 0.5, 0.25, and 0.125 reject and alpha 0.0625 accepts.  Each simulated
@@ -58,7 +58,7 @@ fn bench_joint_line_search_speculative(c: &mut Criterion) {
     gam::init_parallelism();
     let work = Duration::from_millis(BENCH_WORK_MS);
 
-    let mut group = c.benchmark_group("joint_line_search_biobank_pattern");
+    let mut group = c.benchmark_group("joint_line_search_large_scale_pattern");
     group.bench_function("sequential_5_attempts", |b| {
         b.iter(|| assert_eq!(sequential_backtracking(work), ACCEPT_BT));
     });

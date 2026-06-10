@@ -3000,7 +3000,7 @@ fn should_cache_implicit_radial_components(
 pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) {
     let first = dense_design_bytes(n, p).saturating_mul(d_pc);
     let second = dense_design_bytes(n, p).saturating_mul(d_pc.saturating_mul(d_pc));
-    // Consult the library default ResourcePolicy. Production biobank-scale runs
+    // Consult the library default ResourcePolicy. Production large-scale runs
     // configure `AnalyticOperatorRequired`, which still refuses every dense
     // materialization here. The default `MaterializeIfSmall` mode lets tiny
     // problems (and small-data/test usage) materialize as long as the combined
@@ -3013,7 +3013,7 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
     match policy.derivative_storage_mode {
         crate::resource::DerivativeStorageMode::AnalyticOperatorRequired => {
             // SAFETY: this assertion helper exists specifically to enforce
-            // the biobank-scale invariant that spatial-PC Duchon derivative
+            // the large-scale invariant that spatial-PC Duchon derivative
             // designs never persist as dense `Array2<f64>` storage. When the
             // resource policy is `AnalyticOperatorRequired`, any caller that
             // reached this point has materialized something the strict
@@ -3038,7 +3038,7 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
     }
 }
 
-pub fn assert_spatial_centers_below_biobank_cap(
+pub fn assert_spatial_centers_below_large_scale_cap(
     d_pc: usize,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(), BasisError> {
@@ -3060,7 +3060,7 @@ pub fn assert_spatial_centers_below_biobank_cap(
     }
     if center_center_bytes > SPATIAL_CENTER_CENTER_MAX_BYTES {
         crate::bail_invalid_basis!(
-            "spatial PC centers exceed center-center biobank cap: K={k}, d_pc={d_pc}, KxK={:.1} MiB, cap={:.1} MiB",
+            "spatial PC centers exceed center-center large-scale cap: K={k}, d_pc={d_pc}, KxK={:.1} MiB, cap={:.1} MiB",
             center_center_bytes as f64 / (1024.0 * 1024.0),
             SPATIAL_CENTER_CENTER_MAX_BYTES as f64 / (1024.0 * 1024.0),
         );
@@ -3107,7 +3107,7 @@ fn wrap_dense_design_with_transform(
 /// the constraint cross `Bᵀ(W·C)` and the Gram `BᵀB`. On the lazy chunked
 /// spatial path each `try_row_chunk` re-evaluates all kernel columns for the
 /// chunk, so accumulating both products in a single sweep halves the per-build
-/// kernel re-evaluation work (the dominant cost at biobank scale) versus two
+/// kernel re-evaluation work (the dominant cost at large scale) versus two
 /// independent streaming passes — without changing the result beyond
 /// floating-point reassociation. The cross is masked off (`q == 0`) by the
 /// caller, which never invokes this when there is no constraint block.
@@ -3482,7 +3482,7 @@ impl RadialScalarKind {
     /// dense `(n × p)` ψ-derivative materialization. Duchon-family terms
     /// always do (they are streaming-only at any scale). ThinPlate joins
     /// the guard list because the new scalar-streaming routing makes it
-    /// genuine to rely on the implicit operator at biobank scale, and a
+    /// genuine to rely on the implicit operator at large scale, and a
     /// downstream consumer that sneaks in a `materialize_dense()` call
     /// would silently re-introduce the same `n × p` allocation we wired
     /// streaming to avoid. The guard panics only when the resource
@@ -4285,7 +4285,7 @@ impl StreamingRadialState {
         // global rayon pool — every outer worker blocks on the OnceLock
         // while the one that won the race tries to schedule child tasks no
         // worker is free to pick up (see `feedback_oncelock_rayon_deadlock`).
-        // The serial sweep is ~100 ms at biobank shapes (n ≈ 2e5,
+        // The serial sweep is ~100 ms at large-scale shapes (n ≈ 2e5,
         // n_knots ≈ 10), amortized once over many subsequent O(1) reads.
         for i in 0..n {
             let row_off = i * n_knots;
@@ -4382,7 +4382,7 @@ impl StreamingRadialState {
 /// - `axis_components[i*n_knots + j, d]` = exp(2 eta_d) * (x_{id} - c_{jd})^2
 /// Memory: O(n * k * (D + 2)).
 ///
-/// **Streaming** (biobank scale): stores only data/centers/eta/kernel params
+/// **Streaming** (large scale): stores only data/centers/eta/kernel params
 /// and recomputes (q, t, s_a) on the fly during each matvec.
 /// Memory: O(n*d + k*d) -- no per-(data,knot) storage.
 ///
@@ -5135,7 +5135,7 @@ impl ImplicitDesignPsiDerivative {
 
     /// Construct a streaming operator that recomputes (q, t, s_a) on the fly
     /// from raw data/centers/eta during each matvec. No O(n*k) arrays are stored.
-    /// This is the biobank-scale path.
+    /// This is the large-scale path.
     pub(crate) fn new_streaming(
         data: Arc<Array2<f64>>,
         centers: Arc<Array2<f64>>,
@@ -5254,7 +5254,7 @@ impl ImplicitDesignPsiDerivative {
         }) || self.psi_scale_share != 0.0
     }
 
-    /// Whether this operator is wired up by a basis whose biobank-scale path
+    /// Whether this operator is wired up by a basis whose large-scale path
     /// is supposed to stay implicit, so a dense `(n × p)` materialization
     /// here is a regression rather than a normal compute path. Duchon-family
     /// terms qualify because they are streaming-only at any scale; ThinPlate
@@ -6577,7 +6577,7 @@ impl ImplicitDesignPsiDerivative {
     /// kernel scalars without the identifiability/padding projection. Used
     /// by `forward_mul_matrix`, which does the projection on the rank side
     /// instead (`unproject_matrix(F)`) so the (n × p_out) projected
-    /// derivative is never materialized for biobank-scale row counts.
+    /// derivative is never materialized for large-scale row counts.
     fn row_chunk_with_kernel_raw<G>(
         &self,
         rows: std::ops::Range<usize>,
@@ -6954,7 +6954,7 @@ fn build_aniso_design_psi_derivatives_shared(
     let operator_only = force_operator || dense_derivatives_exceed_budget;
     let cache_radial_components = should_cache_implicit_radial_components(n, k, dim, &policy);
 
-    // ── Streaming path: biobank scale ─────────────────────────────────────
+    // ── Streaming path: large scale ─────────────────────────────────────
     // When even the compact radial cache would exceed the operator-cache
     // budget, store only data/centers/eta/radial_kind and recompute
     // (q, t, s_a) chunkwise during each matvec. Otherwise the operator-only
@@ -7544,7 +7544,7 @@ fn select_kmeans_centers(
     let mut assign = vec![0usize; n];
     let iters = max_iter.max(1);
 
-    // For large n (biobank-scale), parallelize the assignment step.
+    // For large n (large-scale), parallelize the assignment step.
     // Each observation's nearest-center query is independent.
     let use_parallel = n >= 10_000;
 
@@ -14217,7 +14217,7 @@ pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> O
     }
     // Deterministic stride sampling: pick K_CAP evenly spaced indices.
     // This preserves any spatial stratification already present in the
-    // data ordering (biobank data is typically in insertion order, not
+    // data ordering (large-scale data is typically in insertion order, not
     // spatially stratified, so stride sampling is effectively uniform).
     let stride = n / K_CAP;
     let k = K_CAP; // exactly K_CAP samples by construction (stride rounds down)
@@ -14303,7 +14303,7 @@ impl Default for BasisCacheContext {
 ///
 /// Owned-data cache entries are byte-limited via the
 /// [`crate::resource::ResourcePolicy`] provided at construction; use
-/// [`BasisWorkspace::with_policy`] for biobank-scale workloads where a single
+/// [`BasisWorkspace::with_policy`] for large-scale workloads where a single
 /// entry can be multiple gigabytes.
 #[derive(Debug)]
 pub struct BasisWorkspace {
@@ -14863,7 +14863,7 @@ pub fn spherical_wahba_kernel_matrix_with_kind(
     // Using cos(lon - lon_c) = cos(lon)·cos(lon_c) + sin(lon)·sin(lon_c)
     // collapses the inner-loop trig from one `.cos()` per (i, j) down to
     // four multiplies and an add — a ~10x speedup on the inner body at
-    // biobank N·K.
+    // large-scale N·K.
     let mut sin_lat_c = Vec::<f64>::with_capacity(k);
     let mut cos_lat_c = Vec::<f64>::with_capacity(k);
     let mut sin_lon_c = Vec::<f64>::with_capacity(k);
@@ -15500,7 +15500,7 @@ fn build_spherical_harmonic_basis(
     let l_cap = l_max + 1;
     let mut design = Array2::<f64>::zeros((n, p));
     // Per-row buffer is small (≤ 33² ≈ 1KB at L=32), so per-thread allocation
-    // dominates only at tiny n. For biobank n we want rows to fan out across
+    // dominates only at tiny n. For large-scale n we want rows to fan out across
     // threads; rayon::par_iter over a row range with thread-local scratch.
     {
         let mut row_blocks = design
@@ -16965,7 +16965,7 @@ fn prepare_duchon_derivative_contextwithworkspace(
 ) -> Result<(Array2<f64>, Option<Array2<f64>>), BasisError> {
     let original_centers = select_centers_by_strategy(data, &spec.center_strategy)?;
     let centers = expand_periodic_centers(&original_centers, spec.periodic.as_deref())?;
-    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
+    assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;
     let raw_design = build_duchon_basis_designwithworkspace(
         data,
         centers.view(),
@@ -17126,7 +17126,7 @@ fn build_periodic_duchon_basis_log_kappa_derivativeswithworkspace(
         )
     })?;
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
+    assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;
     let (centers, left, period) = prepare_periodic_duchon_centers_1d(centers)?;
     let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
@@ -19270,7 +19270,7 @@ fn build_duchon_basis_designwithworkspace(
     );
     let mut basis = Array2::<f64>::zeros((n, total_cols));
     // Process rows in chunks to amortize thread-local allocation across many rows.
-    // Use larger chunks (1024) for better cache utilization at biobank scale.
+    // Use larger chunks (1024) for better cache utilization at large scale.
     let chunk_size = 1024.min(n);
     let basis_result: Result<(), BasisError> = basis
         .axis_chunks_iter_mut(Axis(0), chunk_size)
@@ -22083,7 +22083,7 @@ fn build_periodic_duchon_basis_1d(
     let err_flag = std::sync::atomic::AtomicBool::new(false);
     // Hoist the kernel-form choice out of the inner row × center loop. The
     // pure-Duchon vs. hybrid-Matern branch is the same for every row, so a
-    // single-time dispatch saves N·K conditional branches at biobank scale.
+    // single-time dispatch saves N·K conditional branches at large scale.
     let amp = kernel_amp;
     if pure_poly_coeff.is_some() {
         // Pure polyharmonic case (no Matern length-scale). Use the periodic
@@ -22492,7 +22492,7 @@ pub fn build_duchon_basis_mixed_periodicity_auto(
 ) -> Result<BasisBuildResult, BasisError> {
     let mut workspace = BasisWorkspace::default();
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
+    assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;
     let d = data.ncols();
     if periodic_per_axis.len() != d {
         crate::bail_invalid_basis!(
@@ -22869,7 +22869,7 @@ pub fn build_duchon_basiswithworkspace(
         return build_cyclic_duchon_basis_1dwithworkspace(data, spec, start, end);
     }
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    assert_spatial_centers_below_biobank_cap(data.ncols(), centers.view())?;
+    assert_spatial_centers_below_large_scale_cap(data.ncols(), centers.view())?;
     if spec.periodic.is_some() {
         return build_periodic_duchon_basis_1d(data, spec, centers, workspace);
     }
@@ -23751,7 +23751,7 @@ fn active_thin_plate_penalty_derivatives(
 // The dense per-pair ThinPlate ψ-derivative builder used to live here. It has
 // been replaced by `build_thin_plate_scalar_design_psi_derivatives`, which
 // drives the same math through the shared scalar streaming infrastructure
-// (`build_scalar_design_psi_derivatives_shared`) so biobank-scale TPS terms no
+// (`build_scalar_design_psi_derivatives_shared`) so large-scale TPS terms no
 // longer materialize dense `(n × p)` first/second derivative arrays.
 
 fn build_thin_plate_penalty_psi_derivativeswithworkspace(
@@ -23972,10 +23972,10 @@ fn build_thin_plate_penalty_psi_derivativeswithworkspace(
 }
 
 /// Build the design ψ-derivatives for a Thin-Plate Spline term via the shared
-/// scalar streaming infrastructure that Duchon already uses at biobank scale.
+/// scalar streaming infrastructure that Duchon already uses at large scale.
 ///
 /// At small `n` this materializes both the first and second derivative arrays
-/// just like the legacy dense path; at biobank scale the policy elects
+/// just like the legacy dense path; at large scale the policy elects
 /// streaming and both arrays come back as zero-sized — only an
 /// `ImplicitDesignPsiDerivative` is returned, and downstream consumers
 /// (`spatial_log_kappa_hyper_dirs_frominfo_list`) dispatch matvecs through it

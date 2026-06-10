@@ -1238,7 +1238,7 @@ fn invert_regularized_rho_hessian(hessian_rho: &Array2<f64>) -> Option<InvertedR
 const INDEF_HESS_STRUCTURAL_REDUNDANCY_COS: f64 = 0.999;
 
 /// Penalty-count crossover at which the [INDEF-HESS] pair dump switches from
-/// the full O(k²) grid to top-3 pairs only. Bounds log volume on biobank-scale
+/// the full O(k²) grid to top-3 pairs only. Bounds log volume on large-scale
 /// rho_dim while keeping the per-pair detail useful for small models.
 const INDEF_HESS_PAIR_DUMP_GRID_MAX_K: usize = 16;
 
@@ -3676,7 +3676,7 @@ where
         let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
         // Standard-GAM dense problem dimensions configure both cost models
         // the planner uses to decide whether ARC+Hessian or BFGS+gradient
-        // is faster end-to-end at biobank scale:
+        // is faster end-to-end at large scale:
         //
         //   - per-inner-solve cost (n · p²) gates the single-Hessian-
         //     assembly downgrade,
@@ -3694,7 +3694,7 @@ where
         //
         //   1. The REML cost is dominated by an O(n) likelihood constant,
         //      so ∂/∂logλ inherits the same scale. A unit-magnitude
-        //      `abs` gradient floor (1e-6) becomes binding at biobank n
+        //      `abs` gradient floor (1e-6) becomes binding at large-scale n
         //      even after the relative-from-seed component declared
         //      convergence iters earlier. `with_objective_scale(n)`
         //      lifts the floor to ~n·1e-9 so the loop terminates once
@@ -3920,7 +3920,7 @@ where
             // Only re-eval when the schedule had actually capped the inner
             // solve. If prev_cap was already 0 the cached β is at full
             // tolerance and the refit would be a wasted inner Newton solve
-            // (~30s at biobank n=320k).
+            // (~30s at large-scale n=320k).
             let guard_start = std::time::Instant::now();
             reml_state.compute_cost(&strategy_result.rho)?;
             log::info!(

@@ -1,4 +1,4 @@
-// Regression guard for the biobank-scale dense Duchon timeout fixes that
+// Regression guard for the large-scale dense Duchon timeout fixes that
 // landed in `src/solver/pirls.rs::pirls_soft_acceptance`,
 // `src/solver/outer_strategy.rs::SEED_SCREENING_CASCADE_MULTIPLIERS`, and
 // `OuterProblem::with_standard_gam_dimensions`.
@@ -22,7 +22,7 @@
 //       in metric (Brier score) — guards against a fit that "converges" to
 //       the wrong place.
 //
-// The problem is intentionally smaller than a real biobank fit (k_smoothing
+// The problem is intentionally smaller than a real large-scale fit (k_smoothing
 // = 2, below the BFGS-min-k cutoff, so the gradient-only routing in
 // `with_standard_gam_dimensions` is not triggered here). This is a smoke
 // test for the per-iter soft-acceptance and seed-screening fixes; the
@@ -119,7 +119,7 @@ fn second_difference_penalty(k: usize) -> Array2<f64> {
 }
 
 #[test]
-fn biobank_dense_logit_regression_guard() {
+fn large_scale_dense_logit_regression_guard() {
     let n = 2_000usize;
     let p = 30usize;
     let (x, y, weights, s_list, true_p) = build_problem(n, 0xB10B_A2C);
@@ -155,7 +155,7 @@ fn biobank_dense_logit_regression_guard() {
             kronecker_factored: None,
         },
     )
-    .expect("biobank-scale dense Bernoulli-logit fit must succeed");
+    .expect("large-scale dense Bernoulli-logit fit must succeed");
     let elapsed = start.elapsed();
 
     // (a) Inner solver landed at a valid minimum. Soft-acceptance regressions
@@ -226,7 +226,7 @@ fn biobank_dense_logit_regression_guard() {
 
     // Diagnostic landmark for future regression triage.
     eprintln!(
-        "[biobank_dense_regression_guard] n={n}, p={p}, k_smoothing=2 \
+        "[large_scale_dense_regression_guard] n={n}, p={p}, k_smoothing=2 \
          | wall_clock={:.3}s, outer_iter={}, pirls_iter={}, mse_vs_truth={mse_vs_truth:.4e}, status={:?}",
         elapsed.as_secs_f64(),
         fit.outer_iterations,

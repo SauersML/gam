@@ -269,7 +269,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
     /// ndarray's `.dot(matrix)` which hits BLAS-3 (`matrixmultiply`)
     /// directly. For other backings we fall back to the generic per-
     /// row path by returning `None`; the operator-backed regime where
-    /// the row kernel was deliberately matrix-free at biobank scale
+    /// the row kernel was deliberately matrix-free at large scale
     /// still pays the per-row jet costs we have today.
     ///
     /// **Correctness contract.** Output matches the per-row reference
@@ -305,7 +305,7 @@ impl RowKernel<2> for BernoulliRigidRowKernel {
         // backing we hit ndarray's `dot(matrix)` directly, which routes
         // through `matrixmultiply` (BLAS-3) and reduces ~n×rank
         // strided per-row gathers to one cache-friendly contiguous
-        // matmul per axis. At biobank shape (n ≈ 1e4–1e5, rank ≈ 81)
+        // matmul per axis. At large-scale shape (n ≈ 1e4–1e5, rank ≈ 81)
         // this turns the dominant per-trace cost from ~3 s into ~50 ms.
         //
         // Generic path: for operator-backed / sparse / chunked designs
@@ -370,7 +370,7 @@ pub(super) struct BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
     /// `outer_score_subsample` field is the row mask threaded through the
     /// `_with_options` directional-derivative helpers so the cached joint
     /// Hessian Hv-action paths can downscale to the stratified subsample at
-    /// biobank scale. When `None`, the row iteration is identical to the
+    /// large scale. When `None`, the row iteration is identical to the
     /// legacy full-data path.
     pub(super) options: BlockwiseFitOptions,
 }
@@ -484,7 +484,7 @@ mod early_exit_soundness_tests {
         );
     }
 
-    /// Regression for the biobank `IntegrationError`: a Horvitz-Thompson
+    /// Regression for the large-scale `IntegrationError`: a Horvitz-Thompson
     /// subsample sum is an *unbiased estimator* of the full-data NLL, not a
     /// lower bound on it, so feeding the kernel an HT-weighted subset against a
     /// full-data threshold can falsely reject a trial whose true full-data NLL

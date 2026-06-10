@@ -445,12 +445,6 @@ impl ExactGaussianFullConformal {
         }
     }
 
-    /// Brute-force membership oracle (refit-free here because the affine
-    /// algebra IS the refit, but evaluated pointwise): used by tests to
-    /// verify the breakpoint scan against dense-grid evaluation.
-    pub fn member_at(&self, z: f64, alpha: f64) -> bool {
-        self.member(z, alpha)
-    }
 }
 
 /// The symmetric augmented fitting map the discrete enumeration arm walks.

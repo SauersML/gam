@@ -105,7 +105,7 @@ mod linux {
     /// successful probe: the [`CudaContext`], its default [`CudaStream`], the
     /// lazily NVRTC-compiled [`PtxModuleCache`], and the bucketed
     /// [`DeviceArena`] of reusable f64 device buffers (held under a `Mutex`
-    /// because biobank fits dispatch from multiple rayon worker threads; the
+    /// because large-scale fits dispatch from multiple rayon worker threads; the
     /// mutex is only held during `alloc` / `release`, not across kernel
     /// launches). Module-specific backends (`bms_flex`, `survival_flex`, …)
     /// wrap one of these as their `inner` context so the host-side

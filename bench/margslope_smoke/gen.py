@@ -1,6 +1,6 @@
-"""Generate biobank-shape margslope CSVs at varying n.
+"""Generate large-scale margslope CSVs at varying n.
 
-Schema mirrors `rust_margslope_aniso_duchon16d_rigid` from biobank_scale.yml:
+Schema mirrors `rust_margslope_aniso_duchon16d_rigid` from large_scale.yml:
   phenotype (binary), sex (0/1), age_entry_std (z), pgs_ctn_z (z),
   pc1_std .. pc16_std (z, standard normal).
 

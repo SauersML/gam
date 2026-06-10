@@ -159,7 +159,7 @@ const MIN_DERIV: f64 = 1e-8;
 /// the inner Newton system); the floor only fires for *strictly
 /// positive* tiny weights. The 1e-12 magnitude is chosen so that
 /// `1e-12 · max|x|² · n` stays comfortably above `f64::MIN_POSITIVE`
-/// at biobank scale.
+/// at large scale.
 ///
 /// This is the canonical PIRLS positive-weight floor (`1e-12`); the value is
 /// owned by [`crate::solver::pirls::MIN_WEIGHT`] so every floored family shares
@@ -2116,7 +2116,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     // Large-n location-scale fits keep the caller's explicit Hessian request.
     // The unified REML evaluator chooses a dense or matrix-free exact
     // representation from the realized (n, p, K) work model, so there is no
-    // biobank-scale downgrade to BFGS here.
+    // large-scale downgrade to BFGS here.
 
     let mut mean_beta_hint: Option<Array1<f64>> = None;
     let mut noise_beta_hint: Option<Array1<f64>> = None;
@@ -2223,7 +2223,7 @@ fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                 // total p — produces honest `predicted_*_work` estimates.
                 // Previously this fed `predicted_*_work: 0` to the planner,
                 // which then ungated dense outer Hessian work that costs
-                // hundreds of seconds per eval at biobank scale (see
+                // hundreds of seconds per eval at large scale (see
                 // `OuterDerivativePolicy::OUTER_HESSIAN_WORK_BUDGET`).
                 let theta_seed = joint_setup.theta0();
                 let rho_dim = joint_setup.rho_dim();
@@ -4867,7 +4867,7 @@ fn binomial_location_scalerow(
 
 /// Compute only the log-likelihood scalar for the binomial location-scale model.
 /// This avoids allocating 7 n-vectors that `binomial_location_scale_core` would produce,
-/// making backtracking line searches much cheaper at biobank scale.
+/// making backtracking line searches much cheaper at large scale.
 fn binomial_location_scale_ll_only(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -4931,7 +4931,7 @@ fn binomial_location_scale_core(
         .into());
     }
 
-    // Parallel per-row probit/inverse-link evaluation. At biobank scale
+    // Parallel per-row probit/inverse-link evaluation. At large scale
     // (n = 320K) the sequential probit erfc loop was a major single-thread
     // hotspot called dozens of times per outer REML gradient evaluation.
     let y_slice = y.as_slice().expect("y must be contiguous");
@@ -4944,7 +4944,7 @@ fn binomial_location_scale_core(
     // output buffers in parallel, reducing the per-row log-likelihood
     // alongside. The previous path collected a `Vec<BinomialLocationScaleRow>`
     // (8 scalar fields plus alignment) and then serially scattered into the
-    // seven `Array1`s, which at biobank scale n=3e5 cost ~50 MB of transient
+    // seven `Array1`s, which at large scale n=3e5 cost ~50 MB of transient
     // allocation and a single-threaded post-pass.
     let mut sigma = vec![0.0_f64; n];
     let mut dsigma_deta = vec![0.0_f64; n];
@@ -8927,7 +8927,7 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         // Same Hv structure as `hessian_matvec`, but built once via 3 GEMMs
         // (`Xᵀ diag(W) X` per block) instead of letting
         // `MatrixFreeSpdOperator::materialize_dense_operator` reconstruct the
-        // dense Hessian via `total` canonical-basis HVPs. At biobank scale
+        // dense Hessian via `total` canonical-basis HVPs. At large scale
         // (n≈320k, p_total≈82) the canonical-basis path takes ~568s per κ-iter
         // while the dense build via fast_xt_diag_x/y is ~1s.
         let pmu = self.xmu.ncols();
@@ -11958,7 +11958,7 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         // already-existing `assemble_dense` row-pieces helper (six GEMMs:
         // h_mm, h_ml, h_mw_b, h_mw_d, h_lw, h_ww). Avoids `total` canonical-
         // basis HVPs in `MatrixFreeSpdOperator::materialize_dense_operator`,
-        // which at biobank scale (n≈320k, p_total≈82) costs ~568s per κ-iter
+        // which at large scale (n≈320k, p_total≈82) costs ~568s per κ-iter
         // versus ~1s for the dense build.
         let dense = self
             .pieces
@@ -15241,7 +15241,7 @@ impl BinomialLocationScaleFamily {
         let (z_t, z_ls) = (&dir_a.z_primary_psi, &dir_a.z_ls_psi);
 
         // Per-row scalars assembled in parallel. The probit/inverse-link
-        // derivatives are O(n) at biobank scale and are called O(K) times per
+        // derivatives are O(n) at large scale and are called O(K) times per
         // outer REML gradient (K = number of psi coords), so a parallel pass is
         // worthwhile here.
         struct PsiTermsRow {
@@ -16688,7 +16688,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
     /// Falls through to `None` (generic per-θ_j path) whenever any θ_j is a
     /// ψ coordinate; the design-drift composition for ψ is handled by the
     /// existing unified evaluator. ρ-only is the common warm-start regime
-    /// and the dominant biobank-scale cost.
+    /// and the dominant large-scale cost.
     fn batched_outer_gradient_terms(
         &self,
         block_states: &[ParameterBlockState],
@@ -16735,7 +16735,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
         // (matvec + dH/d²H operators) and never materializes the dense
         // total×total joint Hessian, the dense Cholesky factor, or the
         // total×n leverage panels (`Q_t`, `Q_l`) that this batched fast-path
-        // builds below. At biobank scale (e.g. n≈4·10⁵, total≈120) those
+        // builds below. At large scale (e.g. n≈4·10⁵, total≈120) those
         // dense allocations and the n·total² leverage solve dominate
         // wall-clock time and inflate resident memory by ~6 GiB. Decline
         // the batched path when the joint dimensions cross the same gate
@@ -17188,7 +17188,7 @@ struct BinomialLocationScaleHessianWorkspace {
     direction_eta_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialDirectionEta>>>,
     first_coeff_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialRowCoeffTriple>>>,
     // No `second_coeff_cache` deliberately: see `second_coefficients` for why
-    // the per-pair cache was a memory-only loss at biobank shape.
+    // the per-pair cache was a memory-only loss at large-scale shape.
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -17318,7 +17318,7 @@ impl BinomialLocationScaleHessianWorkspace {
             .clone()
     }
 
-    /// No caching here, deliberately: at biobank shape (n=320k, K=14 outer
+    /// No caching here, deliberately: at large-scale shape (n=320k, K=14 outer
     /// coords) the K² ≈ 196 unique direction-pairs are queried exactly once
     /// per outer Hessian eval, and each cached entry stored 3·n f64s
     /// = ~7.7 MB → ~1.5 GB peak per eval with zero practical hit-rate.
@@ -17383,7 +17383,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         //   H_ll = X_lsᵀ diag(coeff_ll) X_ls,
         // versus letting `MatrixFreeSpdOperator::materialize_dense_operator`
         // reconstruct the dense Hessian via `total` canonical-basis HVPs. At
-        // biobank scale, canonical-basis materialization costs p_total full
+        // large scale, canonical-basis materialization costs p_total full
         // Hessian-vector products. The design helpers below stream row chunks,
         // so the only dense object retained here is the small p_total×p_total
         // coefficient Hessian.
@@ -21877,7 +21877,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleWiggleHessianWork
         // covering h_tt, h_tl, h_ll, h_tw_b, h_tw_d, h_lw_b, h_lw_d, h_ww).
         // Avoids `total` canonical-basis HVPs in
         // `MatrixFreeSpdOperator::materialize_dense_operator`, which at
-        // biobank scale (n≈320k, p_total≈82) costs ~568s per κ-iter versus
+        // large scale (n≈320k, p_total≈82) costs ~568s per κ-iter versus
         // ~1s for the dense build.
         let dense = self
             .pieces
@@ -23019,7 +23019,7 @@ mod tests {
 
     /// Bit-equivalence guard for the `hessian_dense` hook. The dispatch site
     /// `exact_newton_joint_hessian_source_from_workspace` prefers
-    /// `hessian_dense` over the canonical-basis HVP fallback at biobank
+    /// `hessian_dense` over the canonical-basis HVP fallback at large-scale
     /// scale; this test pins the dense build against the same column-by-
     /// column HVP path it replaces. Any future regression in the GEMM
     /// fill (e.g. swapped block coordinates, sign error in `coeff_ml`)

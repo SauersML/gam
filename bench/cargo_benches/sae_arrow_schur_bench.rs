@@ -1,4 +1,4 @@
-//! Biobank-scale SAE arrow-Schur benchmark.
+//! Large-scale SAE arrow-Schur benchmark.
 //!
 //! Exercises `K_atoms ∈ {8, 32, 64}` with realistic N and p so the structural
 //! costs that are invisible at K≤2 become visible:
@@ -19,7 +19,7 @@
 //!   N=10_000, K=32, M=8,  d=1 → rows=10k × q=64  × beta=256 → moderate
 //!   N=10_000, K=64, M=16, d=1 → rows=10k × q=128 × beta=1024 → large
 //!
-//! The CI machine can select `N_SMALL` variants; full biobank uses `N_LARGE`.
+//! The CI machine can select `N_SMALL` variants; full large-scale uses `N_LARGE`.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ndarray::{Array1, Array2, Array3};
@@ -69,8 +69,8 @@ const CONFIGS_CI: &[BenchConfig] = &[
     },
 ];
 
-/// Biobank-scale configs for local benchmarking.
-const CONFIGS_BIOBANK: &[BenchConfig] = &[
+/// Large-scale configs for local benchmarking.
+const CONFIGS_LARGE_SCALE: &[BenchConfig] = &[
     BenchConfig {
         k_atoms: 8,
         basis_size: 4,
@@ -339,13 +339,13 @@ fn bench_full_newton_step(c: &mut Criterion) {
     group.finish();
 }
 
-/// Biobank-scale assembly timings (not run in CI — too slow, but wired so
-/// `cargo bench --bench sae_arrow_schur_bench biobank` runs them locally).
-fn bench_biobank_assembly(c: &mut Criterion) {
-    let mut group = c.benchmark_group("sae_arrow_schur_biobank_assembly");
+/// Large-scale assembly timings (not run in CI — too slow, but wired so
+/// `cargo bench --bench sae_arrow_schur_bench large-scale` runs them locally).
+fn bench_large_scale_assembly(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sae_arrow_schur_large_scale_assembly");
     group.sample_size(10);
 
-    for cfg in CONFIGS_BIOBANK {
+    for cfg in CONFIGS_LARGE_SCALE {
         for (variant, mode) in [
             ("softmax", AssignmentMode::softmax(1.0)),
             ("jumprelu", AssignmentMode::jumprelu(1.0, 0.0)),
@@ -379,6 +379,6 @@ criterion_group!(
     bench_solve_direct,
     bench_solve_pcg,
     bench_full_newton_step,
-    bench_biobank_assembly,
+    bench_large_scale_assembly,
 );
 criterion_main!(benches);

@@ -1,12 +1,12 @@
-//! CI gate: biobank-class survival marginal-slope identifiability fix.
+//! CI gate: large-scale-class survival marginal-slope identifiability fix.
 //!
-//! Exactly mirrors the production biobank failure shape:
+//! Exactly mirrors the production large-scale failure shape:
 //!   formula      = Surv(entry_age, exit_age, event)
 //!                  ~ duchon(PC1, PC2, PC3, centers=10, order=1) + sex + linkwiggle()
 //!   logslope     =   duchon(PC1, PC2, PC3, centers=10, order=1) + linkwiggle()
 //!
 //! The duplicated `duchon(PC1,PC2,PC3)` term across both formulas is the
-//! exact alias pencil that caused the original biobank job to fail closed.
+//! exact alias pencil that caused the original large-scale job to fail closed.
 //! The test runs at n=5000 (small enough for a CI laptop, large enough that
 //! the audit cannot trivially declare the joint design full-rank from tiny n).
 //!
@@ -43,7 +43,7 @@ use std::sync::{Arc, Mutex, Once, OnceLock};
 /// mask the alias, yet finishes in a few minutes on a CI laptop.
 const N: usize = 5_000;
 
-/// centers=10 exactly matches the original biobank formula.  order=1 in 3D
+/// centers=10 exactly matches the original large-scale formula.  order=1 in 3D
 /// has a 4-dimensional polynomial null space (constant + 3 linear terms), so
 /// at centers=10 each block contributes 10 kernel columns + 4 parametric
 /// columns = 14 raw columns — identical to production.
@@ -130,7 +130,7 @@ fn next_gauss(state: &mut u64) -> f64 {
 
 // ── synthetic dataset ─────────────────────────────────────────────────────────
 
-/// Build a survival dataset that mirrors the biobank shape:
+/// Build a survival dataset that mirrors the large-scale shape:
 ///   - 3 principal-component columns (PC1, PC2, PC3) — standard-normal
 ///   - z_prs column: standardized PRS, mean≈0, var≈1
 ///   - sex covariate: Bernoulli(0.5)
@@ -210,13 +210,13 @@ fn build_dataset() -> gam::inference::data::EncodedDataset {
     }
 
     encode_recordswith_inferred_schema(headers, rows)
-        .expect("encode biobank-class integration test dataset")
+        .expect("encode large-scale-class integration test dataset")
 }
 
 // ── test ──────────────────────────────────────────────────────────────────────
 
 #[test]
-fn biobank_survival_marginal_slope_canonical_gauge_fix() {
+fn large_scale_survival_marginal_slope_canonical_gauge_fix() {
     install_logger();
     init_parallelism();
 
@@ -226,7 +226,7 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
 
     let data = build_dataset();
 
-    // Exactly the biobank formula shape: shared duchon + linkwiggle on both
+    // Exactly the large-scale formula shape: shared duchon + linkwiggle on both
     // the main (marginal) formula and the logslope formula.
     let duchon = format!("duchon(PC1, PC2, PC3, centers={CENTERS}, order=1)");
     let formula = format!("Surv(entry_age, exit_age, event) ~ {duchon} + sex + linkwiggle()");
@@ -247,7 +247,7 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
 
     // ── Assertion 1: fit COMPLETES without FATAL ──────────────────────────
     let outcome = fit_from_formula(&formula, &data, &config)
-        .expect("biobank-class survival marginal-slope fit must complete — no audit FATAL");
+        .expect("large-scale-class survival marginal-slope fit must complete — no audit FATAL");
 
     let result = match outcome {
         FitResult::SurvivalMarginalSlope(r) => r,
@@ -260,7 +260,7 @@ fn biobank_survival_marginal_slope_canonical_gauge_fix() {
     // ── Assertion 2: outer solver converged ──────────────────────────────
     assert!(
         result.fit.outer_converged,
-        "biobank-class fit must converge; outer_converged=false \
+        "large-scale-class fit must converge; outer_converged=false \
          (iters={}, reml={:.6})",
         result.fit.outer_iterations, result.fit.reml_score,
     );

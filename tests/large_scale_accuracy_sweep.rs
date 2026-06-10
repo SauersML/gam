@@ -28,7 +28,7 @@ use std::f64::consts::{PI, TAU};
 
 // -----------------------------------------------------------------------------
 // Deterministic noise (LCG + Box-Muller) — same construction the existing
-// noisy_cylinder_data helper in biobank_perf_benchmark.rs uses.
+// noisy_cylinder_data helper in large_scale_perf_benchmark.rs uses.
 // -----------------------------------------------------------------------------
 
 struct LcgNormal {

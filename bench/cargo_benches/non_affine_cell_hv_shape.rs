@@ -2,7 +2,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use gam::families::cubic_cell_kernel::{DenestedCubicCell, evaluate_cell_moments};
 use std::hint::black_box;
 
-fn biobank_shape_cells() -> Vec<DenestedCubicCell> {
+fn large_scale_shape_cells() -> Vec<DenestedCubicCell> {
     (0..64)
         .map(|i| {
             let lane = i as f64;
@@ -21,7 +21,7 @@ fn biobank_shape_cells() -> Vec<DenestedCubicCell> {
 }
 
 fn bench_non_affine_cell_hv_shape(c: &mut Criterion) {
-    let cells = biobank_shape_cells();
+    let cells = large_scale_shape_cells();
     let mut group = c.benchmark_group("non_affine_cell_hv_shape");
     for max_degree in [4_usize, 12, 24] {
         group.bench_with_input(

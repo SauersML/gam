@@ -1372,7 +1372,7 @@ mod tests {
         }
     }
 
-    /// Five-block biobank-shape aliasing repro. Each block carries an
+    /// Five-block large-scale aliasing repro. Each block carries an
     /// intercept-like constant column; gauge_priority is set per the
     /// survival marginal-slope ownership policy (time=200 > marginal=150
     /// > logslope=120 > score_warp=80 > link_dev=60). The joint design

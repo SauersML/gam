@@ -1671,7 +1671,7 @@ fn gamma_log_logp_and_grad(data: &SharedData, eta: &Array1<f64>) -> (f64, Array1
     let shape = data.gamma_shape.max(1e-10);
     // Hoist shape-only constants out of the per-sample loop: ln Γ(shape) and
     // shape · ln(shape) are independent of i, so previously each sample paid
-    // an extra `ln_gamma` and `ln` plus a multiply. n is typically biobank-
+    // an extra `ln_gamma` and `ln` plus a multiply. n is typically large-scale-
     // scale, so this collapses Θ(n) gamma-function evaluations to one.
     let shape_ln_shape = shape * shape.ln();
     let log_gamma_shape = statrs::function::gamma::ln_gamma(shape);

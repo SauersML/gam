@@ -1,4 +1,4 @@
-//! Regression: high-dim isotropic Duchon (16D PCs at biobank shape) used to
+//! Regression: high-dim isotropic Duchon (16D PCs at large-scale shape) used to
 //! abort with "Failed to identify a constraint nullspace basis; matrix is
 //! ill-conditioned" because the spectral normalization
 //! `c = κ^{d/2-n} / ((2π)^{d/2}·2^{n-1}·Γ(n))` underflows to ~1e-14 in d=16,
@@ -70,7 +70,7 @@ fn ctn_bootstrap_design_16d_duchon_order0_power9_centers24_succeeds() {
         smooth_terms: vec![duchon_pc_term("duchon_pc16", d, 24, 9)],
     };
     let design = build_term_collection_design(data.view(), &spec)
-        .expect("bootstrap CTN design build should succeed at biobank shape");
+        .expect("bootstrap CTN design build should succeed at large-scale shape");
     assert_eq!(
         design.design.nrows(),
         n,

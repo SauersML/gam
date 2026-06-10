@@ -419,7 +419,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// Per-row uncontracted third-derivative tensor in the rigid path,
     /// lazily built on first access. The `build_psi_hyper_coords` row pass
     /// hits `rigid_row_third_contracted` once per (row, ψ-axis) — 32× per
-    /// row at biobank shape — but the per-row jet is axis-invariant. This
+    /// row at large-scale shape — but the per-row jet is axis-invariant. This
     /// cache lets the closed-form third-derivative tensor
     /// (`empirical_rigid_third_full_closed_form`, or `rigid_transformed_third_full`
     /// for the standard-normal measure) run at most once per row per cache
@@ -434,7 +434,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
     /// the second-order analogue of `rigid_third_full`. The outer-Hessian
-    /// build at biobank shape evaluates `rigid_row_fourth_contracted` for
+    /// build at large-scale shape evaluates `rigid_row_fourth_contracted` for
     /// every (ψ-axis-i, ψ-axis-j) pair: `(rank² + rank)/2 ≈ 528` pairs at
     /// rank=32. Per-row, the five distinct components are axis-invariant,
     /// so caching them lets every pair contraction be a 16-multiply 2×2

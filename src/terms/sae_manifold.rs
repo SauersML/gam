@@ -1807,12 +1807,6 @@ impl GrassmannFrame {
         self.frame.view()
     }
 
-    /// Descending singular values of the cross-moment that defined this frame
-    /// (the canonical ordering gauge).
-    pub fn singular_value_gauge(&self) -> ArrayView1<'_, f64> {
-        self.gauge_singular_values.view()
-    }
-
     /// Grassmann manifold dimension `r·(p − r)` of this frame — the count of
     /// profiled-out degrees of freedom that must enter the Laplace evidence
     /// dimension accounting (issue #972, evidence honesty). A point on the
@@ -2878,19 +2872,6 @@ impl SaeAssignment {
         out
     }
 
-    pub fn try_assignments(&self) -> Result<Array2<f64>, String> {
-        let n = self.n_obs();
-        let k = self.k_atoms();
-        let mut out = Array2::<f64>::zeros((n, k));
-        for row in 0..n {
-            let a = self.try_assignments_row(row)?;
-            for atom in 0..k {
-                out[[row, atom]] = a[atom];
-            }
-        }
-        Ok(out)
-    }
-
     pub fn assignments_row(&self, row: usize) -> Array1<f64> {
         self.try_assignments_row(row)
             .expect("assignment logits must be finite")
@@ -2946,19 +2927,6 @@ impl SaeAssignment {
             }
         }
         out
-    }
-
-    #[must_use = "build error must be handled"]
-    pub fn from_blocks_with_no_gauge(
-        logits: Array2<f64>,
-        coord_blocks: Vec<Array2<f64>>,
-        temperature: f64,
-    ) -> Result<Self, String> {
-        let coords = coord_blocks
-            .iter()
-            .map(|c| LatentCoordValues::from_matrix(c.view(), LatentIdMode::None))
-            .collect();
-        Self::new(logits, coords, temperature)
     }
 
     #[must_use = "build error must be handled"]
@@ -4201,21 +4169,6 @@ impl SaeManifoldTerm {
             .iter()
             .map(|a| a.frame_manifold_dimension())
             .sum()
-    }
-
-    /// Active frame ranks `r_k`, one per frame-factored atom, in atom order
-    /// (atoms on the full-`B` path contribute no entry). This is the input to
-    /// the identifiability certificate's inner-rotation enumeration
-    /// (`ResidualGaugeReport::with_frame_inner_rotation`, issue #972): the
-    /// `U_k → U_k R, C_k → Rᵀ C_k` gauge is exact in the product, so the
-    /// certificate enumerates `∏_k O(r_k)` (dim `Σ_k r_k(r_k−1)/2`) and
-    /// records that the canonical orientation gauge fixes it, instead of
-    /// curvature-testing a freedom the parameterization already handles.
-    pub fn active_frame_ranks(&self) -> Vec<usize> {
-        self.atoms
-            .iter()
-            .filter_map(|a| a.decoder_frame.as_ref().map(|f| f.rank()))
-            .collect()
     }
 
     /// True iff any atom has an active low-rank Grassmann frame (issue #972).
@@ -9191,78 +9144,6 @@ impl SaeManifoldTerm {
         ))
     }
 
-    pub fn run_single_external_basis_refresh_step_arrow_schur(
-        &mut self,
-        target: ArrayView2<'_, f64>,
-        rho: &mut SaeManifoldRho,
-        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-        step_size: f64,
-        ridge_ext_coord: f64,
-        ridge_beta: f64,
-    ) -> Result<SaeManifoldLoss, String> {
-        self.advance_temperature_schedule()?;
-        // ρ is owned by the outer engine and held fixed across this single
-        // external-basis-refresh Newton step; no in-loop ARD update.
-        let pre_step_loss = self.loss(target, rho)?;
-        let (delta_ext_coord, delta_beta) = self
-            .solve_newton_step(target, rho, analytic_penalties, ridge_ext_coord, ridge_beta)
-            .map_err(|err| {
-                format!(
-                    "SaeManifoldTerm::run_single_external_basis_refresh_step_arrow_schur: {err}"
-                )
-            })?;
-        self.apply_newton_step_external_basis_refresh(
-            delta_ext_coord.view(),
-            delta_beta.view(),
-            step_size,
-        )?;
-        Ok(pre_step_loss)
-    }
-
-    /// Build the analytic-penalty descriptors that correspond to the current
-    /// SAE term. This is the bridge into `analytic_penalties.rs` for callers
-    /// that want to register the same ρ axes with a REML driver.
-    pub fn analytic_penalty_descriptors(&self) -> (AnalyticPenaltyKind, Vec<ARDPenalty>) {
-        let assignment = match self.assignment.mode {
-            AssignmentMode::Softmax { temperature, .. } => {
-                AnalyticPenaltyKind::SoftmaxAssignmentSparsity(Arc::new(
-                    SoftmaxAssignmentSparsityPenalty::new(self.k_atoms(), temperature),
-                ))
-            }
-            AssignmentMode::IBPMap {
-                temperature,
-                alpha,
-                learnable_alpha,
-            } => {
-                let penalty =
-                    IBPAssignmentPenalty::new(self.k_atoms(), alpha, temperature, learnable_alpha);
-                let penalty = match self.temperature_schedule.clone() {
-                    Some(schedule) => penalty.with_temperature_schedule(schedule),
-                    None => penalty,
-                };
-                AnalyticPenaltyKind::IBPAssignment(Arc::new(penalty))
-            }
-            AssignmentMode::JumpReLU { .. } => {
-                // SAFETY: `analytic_penalty_descriptors` is only called for
-                // assignment modes that have a corresponding REML descriptor
-                // (Softmax, IBPMap). JumpReLU is handled by the built-in
-                // gated-L1 assignment prior and never reaches this bridge —
-                // callers must dispatch on `self.assignment.mode` first. The
-                // panic guards against a future caller forgetting to do so.
-                panic!(
-                    "JumpReLU assignment mode uses the built-in gated L1 assignment prior and has no AnalyticPenaltyKind descriptor"
-                )
-            }
-        };
-        let mut ard = Vec::with_capacity(self.k_atoms());
-        for coord in &self.assignment.coords {
-            ard.push(ARDPenalty::new(
-                PsiSlice::full(coord.len(), Some(coord.latent_dim())),
-                coord.latent_dim(),
-            ));
-        }
-        (assignment, ard)
-    }
 }
 
 /// Outer REML objective for the SAE-manifold term.
@@ -9567,7 +9448,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             // coords: the multiplicative Fellner-Schall/Mackay step is O(1)
             // selected-inverse trace per outer iter, vs the cost-only path's
             // O(K³) dense Schur per cost eval × many derivative-free evals —
-            // intractable at biobank K. `eval_efs` implements it.
+            // intractable at large-scale K. `eval_efs` implements it.
             fixed_point_available: true,
             barrier_config: None,
             prefer_gradient_only: false,

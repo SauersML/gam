@@ -192,18 +192,6 @@ impl EProcess {
         Ok(())
     }
 
-    /// The #907 bridge, made literal: absorb one per-batch Bayes factor
-    /// whose prior was FROZEN before any of this stream's data was seen.
-    /// A fixed-prior BF against a simple (or sup-dominated) null satisfies
-    /// `E_{H0}[BF] ≤ 1`, so it is a conditionally-valid e-value and the
-    /// geometry-adjudication harness inherits anytime validity by routing
-    /// its per-batch BFs here instead of comparing a final BF to a
-    /// threshold. The caller owns the freeze: a prior tuned on data this
-    /// stream has touched voids the guarantee.
-    pub fn absorb_frozen_prior_log_bayes_factor(&mut self, log_bf: f64) {
-        self.absorb_log(log_bf);
-    }
-
     /// Absorb a batch e-value supplied in log space (the only numerically
     /// honest interface for long streams).
     pub fn absorb_log(&mut self, log_e_value: f64) {

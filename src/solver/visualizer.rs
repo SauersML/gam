@@ -330,7 +330,7 @@ pub fn record_outer_accept() {
 
 /// Throttled redraw helper for optimizer pushes. Avoids cloning the
 /// `VisualizerModel` on the hot path: only snapshots when the renderer's
-/// throttle says it's actually time to draw. At biobank scale (10⁴+ outer
+/// throttle says it's actually time to draw. At large scale (10⁴+ outer
 /// evals per fit) this matters — naively cloning a 1200-point history on
 /// every push is O(N²) total work just to render frames the throttle drops.
 ///
@@ -941,7 +941,7 @@ impl VisualizerSession {
             return Self::default();
         }
         // Disable live progress rendering. The renderer's carriage/cursor
-        // control interacts badly with captured biobank logs and makes the
+        // control interacts badly with captured large-scale logs and makes the
         // canonical run file harder to read than plain records. Keep an
         // active feed so solver internals can still publish progress samples,
         // but route the session to a silent dumb renderer.

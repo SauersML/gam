@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn fused_admission_accepts_dense_arrow_workloads() {
-        // Biobank-scale shape: large n, small p, moderate R. Total flops
+        // Large-scale shape: large n, small p, moderate R. Total flops
         // 5000 · 16^3 ≈ 2e7 — well above the 1e5 admission floor.
         assert!(fused_path_admitted(5000, 16, 6));
         // Big R alone admits even on a small n.

@@ -60,7 +60,7 @@ fn bench_reml_gpu(c: &mut Criterion) {
     let h = hessian();
     let dh = derivative_hessians();
     let dh_views: Vec<_> = dh.iter().map(|m| m.view()).collect();
-    let mut group = c.benchmark_group("reml_biobank_n100k_p2k_atoms10k");
+    let mut group = c.benchmark_group("reml_large_scale_n100k_p2k_atoms10k");
     group.sample_size(10);
 
     group.bench_function("cpu_logdet_reference", |b| {

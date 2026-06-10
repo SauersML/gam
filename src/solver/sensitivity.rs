@@ -20,7 +20,7 @@
 //! (evidence.rs), and the projected pseudo-inverse of the rank-deficient
 //! LAML kernel (unified.rs) — so each site had to answer on its own the
 //! question that actually causes bugs: **which inverse is "H⁻¹"?** The
-//! biobank fix 0dc469bd and the #901 layer-2 investigation are both
+//! large-scale fix 0dc469bd and the #901 layer-2 investigation are both
 //! incidents of two sites answering differently.
 //!
 //! [`FitSensitivity`] is the single answer. It is built once at the optimum
@@ -329,7 +329,7 @@ impl<'a> FitSensitivity<'a> {
     /// deletion denominator, and Cook's distance alike — no separate `H` apply.
     ///
     /// This is an *opt-in* diagnostic: `dfbeta` is `n × p` and is never
-    /// materialized on the default fit path (it would be ruinous at biobank
+    /// materialized on the default fit path (it would be ruinous at large-scale
     /// scale). Returns `None` on a shape mismatch or if any leverage reaches
     /// `1` (a point the deletion identity cannot resolve).
     pub fn case_deletion(

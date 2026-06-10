@@ -32,7 +32,7 @@ use ndarray::{Array1, Array2, Array3};
 
 use crate::families::custom_family::{FamilyChannelHessian, PenaltyMatrix};
 use crate::families::identifiability_compiler::{
-    AnchorRowEvaluator, BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
+    BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
 use crate::linalg::faer_ndarray::{FaerEigh, fast_ab, fast_abt};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
@@ -579,80 +579,6 @@ impl RowJacobianOperator for LogslopeBlockOperator {
         scale_jacobian_by_sqrt_h_with(n, p, K_SURVIVAL, h_full, |i, a, c| {
             if c == 3 { self.dg[[i, a]] } else { 0.0 }
         })
-    }
-}
-
-/// Predict-time anchor row evaluator for a parametric survival block.
-/// Returns the supplied design as-is (already materialised at the requested
-/// rows). Phase 4b's predict-path migration introduces the variant that
-/// recomputes from a constructor at predict rows.
-pub struct ParametricAnchorEvaluator {
-    design: Array2<f64>,
-}
-
-impl ParametricAnchorEvaluator {
-    pub fn new(design: Array2<f64>) -> Self {
-        Self { design }
-    }
-}
-
-impl AnchorRowEvaluator for ParametricAnchorEvaluator {
-    fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if predict_arg.len() != self.design.nrows() {
-            return Err(format!(
-                "ParametricAnchorEvaluator: predict_arg length {} must match \
-                 materialised design rows {}",
-                predict_arg.len(),
-                self.design.nrows()
-            ));
-        }
-        Ok(self.design.clone())
-    }
-    fn ncols(&self) -> usize {
-        self.design.ncols()
-    }
-}
-
-/// Predict-time anchor row evaluator for a compiled survival flex block.
-/// Composes `C(x)·V − A(x)·M` exactly as the Bernoulli analogue does.
-pub struct CompiledFlexAnchorEvaluator {
-    raw_basis: Arc<dyn Fn(&Array1<f64>) -> Result<Array2<f64>, String> + Send + Sync>,
-    t_lw: Array2<f64>,
-    anchor_correction: Option<Array2<f64>>,
-    parent: Option<Arc<dyn AnchorRowEvaluator>>,
-}
-
-impl CompiledFlexAnchorEvaluator {
-    pub fn new(
-        raw_basis: Arc<dyn Fn(&Array1<f64>) -> Result<Array2<f64>, String> + Send + Sync>,
-        t_lw: Array2<f64>,
-        anchor_correction: Option<Array2<f64>>,
-        parent: Option<Arc<dyn AnchorRowEvaluator>>,
-    ) -> Self {
-        Self {
-            raw_basis,
-            t_lw,
-            anchor_correction,
-            parent,
-        }
-    }
-}
-
-impl AnchorRowEvaluator for CompiledFlexAnchorEvaluator {
-    fn anchor_rows(&self, predict_arg: &Array1<f64>) -> Result<Array2<f64>, String> {
-        let raw = (self.raw_basis)(predict_arg)?;
-        let rotated = fast_ab(&raw, &self.t_lw);
-        match (&self.anchor_correction, &self.parent) {
-            (Some(m), Some(parent)) => {
-                let anchor = parent.anchor_rows(predict_arg)?;
-                let correction = fast_ab(&anchor, m);
-                Ok(&rotated - &correction)
-            }
-            (None, _) | (_, None) => Ok(rotated),
-        }
-    }
-    fn ncols(&self) -> usize {
-        self.t_lw.ncols()
     }
 }
 

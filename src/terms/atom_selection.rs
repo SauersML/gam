@@ -135,10 +135,9 @@
 
 use ndarray::{Array1, ArrayView1};
 
-use crate::solver::continuation_path::ContinuationPath;
 use crate::terms::analytic_penalties::{AnalyticPenalty, SparsityPenalty};
-use crate::terms::atom_codes::{BitVec, SparseAtomCode, SparseAtomCodes};
-use crate::terms::latent_coord::{LatentCoordValues, active_mass_breached};
+use crate::terms::atom_codes::{BitVec, SparseAtomCode};
+use crate::terms::latent_coord::LatentCoordValues;
 
 // ---------------------------------------------------------------------------
 // Atom shape (decoder reference) — kept as an opaque token here.
@@ -238,10 +237,6 @@ impl AtomLibrary {
         &self.atoms[k]
     }
 
-    pub fn atom_mut(&mut self, k: usize) -> &mut AtomRecord {
-        &mut self.atoms[k]
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &AtomRecord> {
         self.atoms.iter()
     }
@@ -250,198 +245,6 @@ impl AtomLibrary {
     /// size `K + Σ_k d_k` (assignment plus per-atom coord).
     pub fn total_intrinsic_dim(&self) -> usize {
         self.atoms.iter().map(|a| a.intrinsic_dim()).sum()
-    }
-
-    /// Allocate matching [`SparseAtomCodes`] storage (all-empty).
-    pub fn fresh_codes(&self) -> SparseAtomCodes {
-        SparseAtomCodes::empty(self.n_obs, self.k_atoms())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Per-iteration assignment-logit trust region (ContinuationPath hardening hook)
-// ---------------------------------------------------------------------------
-
-/// Per-iteration trust-region cap on the assignment logits.
-///
-/// The assignment `a_n` is a *soft* function of the free amplitudes `ℓ_n`
-/// (softmax for [`EntropicSoftmax`], the kept-amplitude support for [`TopK`],
-/// the clipped amplitudes for [`L1Relaxed`]). A single unconstrained Newton /
-/// gradient step on `ℓ_n` can move the support discontinuously and **collapse
-/// the active set** in one shot — the row goes from a healthy multi-atom mix to
-/// a single saturated atom (or to all-zero mass), which the downstream
-/// arrow-Schur reduction cannot recover from because the eliminated atoms drop
-/// out of the border at first order.
-///
-/// To make every joint step a *bounded* move, the
-/// [`crate::solver::continuation_path::ContinuationPath`] supplies a base step
-/// radius (smaller in heavier regimes), and we scale it **per latent axis** by
-/// the atom's latent trust-region metric: an atom whose coordinate lives on a
-/// tightly-scaled manifold axis (large `1/scale²` weight) gets a
-/// correspondingly tighter cap on its assignment logit, so the assignment and
-/// the on-atom coordinate move on commensurate scales. The cap clamps the
-/// proposed *step* `Δℓ_{n,k}`, never the absolute logit, so the relaxation's
-/// own simplex / non-negativity geometry is untouched.
-#[derive(Debug, Clone)]
-pub struct LogitTrustRegion {
-    /// Per-atom cap on `|Δℓ_{n,k}|` (length `K`). Each entry is the
-    /// ContinuationPath base radius divided by the atom's metric scale, so a
-    /// tighter manifold metric yields a tighter logit cap.
-    per_atom_cap: Vec<f64>,
-}
-
-impl LogitTrustRegion {
-    /// Build the per-atom logit caps from the library's per-atom latent metric
-    /// and the ContinuationPath's current base step radius.
-    ///
-    /// Each atom `k` carries `d_k` per-axis trust-region weights
-    /// (`coords.logit_trust_cap_weights()`); we reduce them to one scalar by
-    /// taking the **tightest** axis (max weight ⇒ smallest geodesic step per
-    /// unit coordinate move), so the atom's logit cap respects its most
-    /// constrained coordinate direction. The base radius is the
-    /// regime-dependent ContinuationPath cap: heavier regimes (after a recorded
-    /// demotion) hand back a smaller radius, automatically shrinking every
-    /// atom's logit trust region without any new knob.
-    pub fn from_library(library: &AtomLibrary, path: &ContinuationPath) -> Self {
-        let base_radius = path.logit_step_radius();
-        assert!(
-            base_radius.is_finite() && base_radius > 0.0,
-            "ContinuationPath logit step radius must be finite and positive, got {base_radius}"
-        );
-        let mut per_atom_cap = Vec::with_capacity(library.k_atoms());
-        for k in 0..library.k_atoms() {
-            let weights = library.atom(k).coords.logit_trust_cap_weights();
-            // Tightest axis governs: the largest `1/scale²` weight is the most
-            // constrained direction, so it sets the smallest admissible step.
-            let tightest = weights
-                .iter()
-                .copied()
-                .fold(0.0_f64, |acc, w| if w > acc { w } else { acc });
-            // `tightest == 0` only if the atom has no axes; clamp the scale to
-            // 1 so a degenerate metric falls back to the bare base radius.
-            let scale = if tightest > 0.0 { tightest.sqrt() } else { 1.0 };
-            per_atom_cap.push(base_radius / scale);
-        }
-        Self { per_atom_cap }
-    }
-
-    /// Number of atoms this trust region caps.
-    pub fn k_atoms(&self) -> usize {
-        self.per_atom_cap.len()
-    }
-
-    /// Clamp a proposed per-row logit step `Δℓ_n` (length `K`) to the per-atom
-    /// trust region, in place. Returns `true` if any component was clipped (the
-    /// step would otherwise have exited the trust region).
-    pub fn cap_logit_step(&self, step: &mut Array1<f64>) -> bool {
-        assert_eq!(
-            step.len(),
-            self.per_atom_cap.len(),
-            "LogitTrustRegion::cap_logit_step length {} != K {}",
-            step.len(),
-            self.per_atom_cap.len(),
-        );
-        let mut clipped = false;
-        for k in 0..step.len() {
-            let cap = self.per_atom_cap[k];
-            if step[k] > cap {
-                step[k] = cap;
-                clipped = true;
-            } else if step[k] < -cap {
-                step[k] = -cap;
-                clipped = true;
-            }
-        }
-        clipped
-    }
-}
-
-/// Outcome of a hardened assignment-logit step.
-#[derive(Debug, Clone)]
-pub struct HardenedLogitStep {
-    /// The post-cap free amplitudes for the row (`ℓ_old + clamp(Δℓ)`).
-    pub free_amplitudes: Array1<f64>,
-    /// The atom code produced by the strategy at the capped amplitudes.
-    pub code: SparseAtomCode,
-    /// Whether the trust-region cap clipped any logit component this step.
-    pub capped: bool,
-    /// Whether the post-step active mass breached
-    /// [`crate::terms::latent_coord::LATENT_ACTIVE_MASS_FLOOR`] and the
-    /// ContinuationPath was asked to re-seed from scaffold (recorded, never
-    /// fatal).
-    pub reseeded_from_scaffold: bool,
-}
-
-/// Apply the ContinuationPath hardening hook to one proposed assignment-logit
-/// step for row `n`.
-///
-/// This is the call site that wires the per-iteration trust-region cap into the
-/// joint SAE-manifold step:
-///
-/// 1. Build the per-atom [`LogitTrustRegion`] from the library's latent metric
-///    and the path's current (regime-dependent) base radius.
-/// 2. Clamp the proposed step `Δℓ_n` so a single iteration cannot collapse the
-///    active set.
-/// 3. Apply the capped step and re-run the strategy's forward map to get the
-///    new code.
-/// 4. Check the active-mass floor on the new code. A breach means the cap was
-///    not enough to keep the row alive (e.g. the relaxation saturated): route
-///    it to [`ContinuationPath::note_active_mass_breach`], which records the
-///    event and re-seeds from the scaffold — never fatal, the candidate is
-///    demoted to a heavier regime, not dropped.
-///
-/// `strategy` is the active [`AtomSelectionStrategy`] (softmax / TopK / L¹),
-/// `free_amplitudes_row` is the current `ℓ_n`, and `proposed_step` is the raw
-/// (uncapped) `Δℓ_n` the joint solver wants to take.
-pub fn apply_continuation_logit_hardening(
-    strategy: &dyn AtomSelectionStrategy,
-    library: &AtomLibrary,
-    path: &mut ContinuationPath,
-    free_amplitudes_row: ArrayView1<'_, f64>,
-    proposed_step: ArrayView1<'_, f64>,
-) -> HardenedLogitStep {
-    assert_eq!(
-        free_amplitudes_row.len(),
-        proposed_step.len(),
-        "apply_continuation_logit_hardening: ℓ_n / Δℓ_n length mismatch"
-    );
-    assert_eq!(
-        free_amplitudes_row.len(),
-        library.k_atoms(),
-        "apply_continuation_logit_hardening: ℓ_n length {} != K {}",
-        free_amplitudes_row.len(),
-        library.k_atoms(),
-    );
-    let trust_region = LogitTrustRegion::from_library(library, path);
-    let mut step = proposed_step.to_owned();
-    let capped = trust_region.cap_logit_step(&mut step);
-
-    let mut new_amplitudes = free_amplitudes_row.to_owned();
-    for k in 0..new_amplitudes.len() {
-        new_amplitudes[k] += step[k];
-    }
-    let code = strategy.apply(new_amplitudes.view());
-
-    // Active-mass floor: sum the magnitudes on the active support. A breach is
-    // a collapsed row even after capping; the ContinuationPath re-seeds from the
-    // scaffold (recorded, never fatal).
-    let active_weights: Vec<f64> = code
-        .active_mask
-        .iter_ones()
-        .map(|k| code.weights[k])
-        .collect();
-    let reseeded_from_scaffold = if active_mass_breached(&active_weights) {
-        path.note_active_mass_breach();
-        true
-    } else {
-        false
-    };
-
-    HardenedLogitStep {
-        free_amplitudes: new_amplitudes,
-        code,
-        capped,
-        reseeded_from_scaffold,
     }
 }
 

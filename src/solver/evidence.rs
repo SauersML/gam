@@ -22,8 +22,8 @@
 //!     surrogate. Matrix-free evidence callers must provide the matching
 //!     undamped HVP so the same log-det is estimated by SLQ.
 //!   * IFT solves invert `H_uu`, not `H_uu + ridge_u I` (proposal §1.7,
-//!     §6.6). `predict_delta_t_from_delta_beta` and
-//!     `predict_delta_t_from_delta_gt` already use the undamped factors.
+//!     §6.6). The evidence-side IFT predictor loop here uses the undamped
+//!     `htt_factors_undamped` factors for exactly this reason.
 //!   * Penalty pseudo-logdet `log|S(ρ)|+` is the prior penalty, distinct
 //!     from the arrow Schur complement (proposal §3.1, §3.6). The variable
 //!     names below preserve that distinction:

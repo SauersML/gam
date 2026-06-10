@@ -1423,7 +1423,7 @@ mod cuda {
     // per-block Schur partials `partial_S[i] = Yᵀ Y` (R×R) and
     // `partial_r[i] = Yᵀ u` (R). The host reduces partials on the CPU after
     // dtoh (one fused sum across `n` blocks of R²+R doubles; cheap because
-    // n·R² ≲ 5M doubles at biobank scale), assembles `S_β`, factors it via
+    // n·R² ≲ 5M doubles at large scale), assembles `S_β`, factors it via
     // cuSOLVER, and launches the back-substitution kernel
     // `arrow_schur_back_sub_pgroup` to recover `δt_i = -L_i⁻ᵀ(u_i + Y_i δβ)`
     // without re-uploading the local factors.

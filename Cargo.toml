@@ -8,7 +8,7 @@ default-run = "gam"
 description = "Generalized penalized likelihood engine"
 license = "AGPL-3.0-or-later"
 # Limit the published `.crate` to source + bench harnesses + license + readme.
-# Without this, `bench/biobank_scale/` (>1 GB of benchmark data) is bundled
+# Without this, `bench/large_scale/` (>1 GB of benchmark data) is bundled
 # into the package and crates.io rejects the upload at the 10 MiB limit.
 # Patterns are gitignore-style; leading `/` anchors to crate root.
 include = [
@@ -116,13 +116,13 @@ path = "bench/cargo_benches/spatial_basis_construction.rs"
 harness = false
 
 [[bench]]
-name = "bvn_biobank_shape"
-path = "bench/cargo_benches/bvn_biobank_shape.rs"
+name = "bvn_large_scale_shape"
+path = "bench/cargo_benches/bvn_large_scale_shape.rs"
 harness = false
 
 [[bench]]
-name = "margslope_flex_biobank_hv"
-path = "bench/cargo_benches/margslope_flex_biobank_hv.rs"
+name = "margslope_flex_large_scale_hv"
+path = "bench/cargo_benches/margslope_flex_large_scale_hv.rs"
 harness = false
 
 [[bench]]
@@ -131,13 +131,13 @@ path = "bench/cargo_benches/non_affine_cell_hv_shape.rs"
 harness = false
 
 [[bench]]
-name = "cell_moment_lru_biobank_shape"
-path = "bench/cargo_benches/cell_moment_lru_biobank_shape.rs"
+name = "cell_moment_lru_large_scale_shape"
+path = "bench/cargo_benches/cell_moment_lru_large_scale_shape.rs"
 harness = false
 
 [[bench]]
-name = "tail_cell_memo_biobank_shape"
-path = "bench/cargo_benches/tail_cell_memo_biobank_shape.rs"
+name = "tail_cell_memo_large_scale_shape"
+path = "bench/cargo_benches/tail_cell_memo_large_scale_shape.rs"
 harness = false
 
 [[bench]]
@@ -156,13 +156,13 @@ path = "bench/cargo_benches/joint_line_search_speculative.rs"
 harness = false
 
 [[bench]]
-name = "cell_moment_dedup_biobank_shape"
-path = "bench/cargo_benches/cell_moment_dedup_biobank_shape.rs"
+name = "cell_moment_dedup_large_scale_shape"
+path = "bench/cargo_benches/cell_moment_dedup_large_scale_shape.rs"
 harness = false
 
 [[bench]]
-name = "row_cell_moments_biobank_shape"
-path = "bench/cargo_benches/row_cell_moments_biobank_shape.rs"
+name = "row_cell_moments_large_scale_shape"
+path = "bench/cargo_benches/row_cell_moments_large_scale_shape.rs"
 harness = false
 
 [[bench]]
@@ -236,12 +236,12 @@ lto = false
 codegen-units = 16
 debug = false
 
-# PyPI wheel profile — tuned for MAXIMUM runtime performance on biobank
+# PyPI wheel profile — tuned for MAXIMUM runtime performance on large-scale
 # workloads, accepting longer CI build times in exchange.
 #
 #   * `lto = "fat"` — whole-program LTO across all crates including
 #     dependencies. Squeezes out cross-crate inlining that thin-LTO
-#     misses; biobank-shape numerics gain ~5–10 % over thin-LTO from
+#     misses; large-scale numerics gain ~5–10 % over thin-LTO from
 #     better inlining of `faer` / `ndarray` inner loops into the
 #     custom-family hot paths.
 #
@@ -249,13 +249,13 @@ debug = false
 #     full crate to be optimized as one IR module so monomorphization
 #     constants and per-call autovec opportunities aren't fragmented
 #     across parallel codegen workers. Empirically ~2–3 % runtime
-#     improvement at biobank shape over `codegen-units = 16`, on top
+#     improvement at large scale over `codegen-units = 16`, on top
 #     of the LTO win.
 #
 # Combined cost: cold-cache wheel builds go from ~12 min to ~22 min on
 # the slowest runner (macos-15-intel). The Swatinem/rust-cache hit on
 # warm rebuilds keeps the typical-case at ~4 min. For PyPI consumers
-# who pip-install once and run biobank fits for hours, the runtime win
+# who pip-install once and run large-scale fits for hours, the runtime win
 # is the production lever; the build-time hit is amortized to ~zero.
 # When a faster turnaround is needed during development, dispatch the
 # workflow with `linux_only=true` to skip the slow macOS + Windows

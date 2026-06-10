@@ -299,7 +299,7 @@ fn bench_operator_matvec(c: &mut Criterion) {
 }
 
 /// Phase 3 benchmark: compare dense Cholesky vs PCG-against-implicit-H for
-/// the inner Newton direction solve at biobank-scale `K`. The Hessian is
+/// the inner Newton direction solve at large-scale `K`. The Hessian is
 /// `H = X^T W X + λ S`, where `X^T W X` is a synthetic positive-definite
 /// matrix (built once and reused across both paths), `S` is the closed-form
 /// penalty Gram, and `λ = 0.1`. Both paths solve `H β = g` for the same RHS;
@@ -376,7 +376,7 @@ fn bench_hessian_solve_dense_vs_implicit(c: &mut Criterion) {
                     .expect("synthetic dense H should factor");
                 // faer_ndarray's cholesky returns a struct; for solve we use
                 // its diag for a manual back/forward sub or just measure the
-                // factorization cost which dominates at biobank p.
+                // factorization cost which dominates at large-scale p.
                 black_box(&chol);
                 black_box(&gradient);
             })

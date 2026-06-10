@@ -1132,7 +1132,7 @@ pub(crate) const HVP_THREADS: u32 = 128;
 /// `blockDim.x` for the partial-sum reduction kernels (one element per thread,
 /// grid-strided over the `p_total`/`rhs_elems` partial buffer). A full warp
 /// multiple that keeps the reduce launch occupancy-bound rather than tail-bound
-/// for the typical biobank `p_total`.
+/// for the typical large-scale `p_total`.
 #[cfg(target_os = "linux")]
 const REDUCTION_THREADS: u32 = 256;
 
@@ -1157,7 +1157,7 @@ pub(crate) const BMS_FLEX_ROW_HVP_MAX_RHS: usize = 8;
 /// Charter (Block 9 Phase 4): packed-upper halves the DRAM footprint of the
 /// `n × r²` cache (per-row `r*(r+1)/2` doubles instead of `r²`), at the cost
 /// of a single per-entry index conversion in the kernel. The benchmark
-/// decides whether the packed path becomes the default for biobank-shape
+/// decides whether the packed path becomes the default for large-scale
 /// fits (`r = 20` → 210 vs 400 doubles per row, ~47.5% smaller). The
 /// numerics are bit-equal because each `H_i` is symmetric by construction
 /// (the row kernel emits a symmetric block by construction — see the
@@ -1714,7 +1714,7 @@ extern "C" __global__ void bms_flex_row_hvp_partial_packed(
 //   * u = 2+h+l:    phi_u = e_{w_block_start + l}  (l ∈ 0..w_block_len)
 // Then `H_full[m, n] += sum_{u,v} H_i[u,v] * phi_u[m] * phi_v[n]`.
 //
-// Shared-memory budget: at biobank shape p_total = 44, a [44, 44] f64
+// Shared-memory budget: at large-scale shape p_total = 44, a [44, 44] f64
 // partial is 44*44*8 = 15.5 KiB — well below the V100 48 KiB/SM cap.
 // At p_total ≤ 80 the kernel still fits (80*80*8 = 50 KiB → just over
 // V100 cap; caller must enforce p_total ≤ DENSE_BLOCK_MAX_P). The
@@ -4293,13 +4293,13 @@ mod tests {
     }
 
     #[test]
-    fn bms_flex_row_hvp_multi_scratch_is_bounded_at_biobank_shape() {
+    fn bms_flex_row_hvp_multi_scratch_is_bounded_at_large_scale_shape() {
         let n = 195_000_usize;
         let r = 20_usize;
         let p_total = 44_usize;
         let rhs_count = 4_usize;
         let scratch = bms_flex_row_hvp_multi_scratch_bytes_for_shape(n, p_total, rhs_count)
-            .expect("biobank multi-RHS scratch budget");
+            .expect("large-scale multi-RHS scratch budget");
         let per_rhs_full_row_cache =
             (n * r * r * std::mem::size_of::<f64>()) as u64 * rhs_count as u64;
         assert!(
@@ -5007,7 +5007,7 @@ mod tests {
     }
 
     /// Block 9 final hill-climb gate — GPU HVP must be at least 5× faster
-    /// than a Rayon-parallel CPU HVP at biobank shape (n=195_000, r=20,
+    /// than a Rayon-parallel CPU HVP at large-scale shape (n=195_000, r=20,
     /// p_total=44). This is the charter pass/fail metric for whether the
     /// device-resident row-Hessian path is a real perf win for the
     /// production marginal-slope fit.
@@ -5026,7 +5026,7 @@ mod tests {
     ///
     /// Skips on non-Linux / no-CUDA hosts.
     #[test]
-    fn bms_flex_row_hvp_v100_hill_climb_5x_vs_cpu_at_biobank() {
+    fn bms_flex_row_hvp_v100_hill_climb_5x_vs_cpu_at_large_scale() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!("[bms_flex_row hvp hill-climb] non-Linux host — skipping V100 perf gate");
@@ -5061,7 +5061,7 @@ mod tests {
                 r,
             };
 
-            // Same deterministic fixture as the Phase 4 biobank benchmark.
+            // Same deterministic fixture as the Phase 4 large-scale benchmark.
             let mut row_hessians = vec![0.0_f64; n * r * r];
             for row in 0..n {
                 let base = row * r * r;
@@ -5218,13 +5218,13 @@ mod tests {
 
             let speedup = (cpu_median as f64) / (gpu_median.max(1) as f64);
             eprintln!(
-                "[bms_flex_row hvp hill-climb] biobank n={n} r={r} p={p_total}: \
+                "[bms_flex_row hvp hill-climb] large-scale n={n} r={r} p={p_total}: \
                  cpu_median={cpu_median}us gpu_median={gpu_median}us \
                  speedup={speedup:.2}× (charter target ≥ 5×)"
             );
             assert!(
                 speedup >= 5.0,
-                "biobank HVP perf gate: GPU only {speedup:.2}× faster than CPU; \
+                "large-scale HVP perf gate: GPU only {speedup:.2}× faster than CPU; \
                  need ≥ 5× per Block 9 charter (cpu_median={cpu_median}us, \
                  gpu_median={gpu_median}us). Hill-climb the kernel until met or \
                  prove the kernel is at hardware roofline."
@@ -5233,11 +5233,11 @@ mod tests {
     }
 
     /// Companion to the HVP hill-climb: GPU dense-block build must be at
-    /// least 10× faster than a Rayon-parallel CPU dense build at biobank
+    /// least 10× faster than a Rayon-parallel CPU dense build at large-scale
     /// shape. The dense build is `O(n * r² * p_total)` work for both
     /// paths so the ratio is well-defined.
     #[test]
-    fn bms_flex_row_dense_block_v100_hill_climb_10x_vs_cpu_at_biobank() {
+    fn bms_flex_row_dense_block_v100_hill_climb_10x_vs_cpu_at_large_scale() {
         #[cfg(not(target_os = "linux"))]
         {
             eprintln!(
@@ -5274,7 +5274,7 @@ mod tests {
                 r,
             };
 
-            // Reuse the same biobank fixture recipe.
+            // Reuse the same large-scale fixture recipe.
             let mut row_hessians = vec![0.0_f64; n * r * r];
             for row in 0..n {
                 let base = row * r * r;
@@ -5312,7 +5312,7 @@ mod tests {
             }
 
             // GPU dense_block kernel rejects p_total > DENSE_BLOCK_MAX_P
-            // (72 at V100 48 KiB/block). Biobank's p_total = 44 fits.
+            // (72 at V100 48 KiB/block). LargeScale's p_total = 44 fits.
             if p_total > DENSE_BLOCK_MAX_P {
                 eprintln!(
                     "[bms_flex_row dense_block hill-climb] p_total={p_total} > MAX={DENSE_BLOCK_MAX_P}, skipping"
@@ -5464,13 +5464,13 @@ mod tests {
 
             let speedup = (cpu_median as f64) / (gpu_median.max(1) as f64);
             eprintln!(
-                "[bms_flex_row dense_block hill-climb] biobank n={n} r={r} p={p_total}: \
+                "[bms_flex_row dense_block hill-climb] large-scale n={n} r={r} p={p_total}: \
                  cpu_median={cpu_median}us gpu_median={gpu_median}us \
                  speedup={speedup:.2}× (charter target ≥ 10×)"
             );
             assert!(
                 speedup >= 10.0,
-                "biobank dense-H perf gate: GPU only {speedup:.2}× faster than CPU; \
+                "large-scale dense-H perf gate: GPU only {speedup:.2}× faster than CPU; \
                  need ≥ 10× per Block 9 charter (cpu_median={cpu_median}us, \
                  gpu_median={gpu_median}us). Hill-climb the dense_block kernel \
                  (warp-stripe the u-v-m-n loop, vectorise loads, etc.) until met \

@@ -1,10 +1,10 @@
 //! Fast local reproducer for the FLEX bernoulli marginal-slope cycle-0 cost
-//! cliff seen in the biobank-scale lane.
+//! cliff seen in the large-scale lane.
 //!
 //! Manual invocation:
 //!
 //! ```text
-//! cargo test --release --test margslope_flex_biobank_repro \
+//! cargo test --release --test margslope_flex_large_scale_repro \
 //!     -- --nocapture
 //! ```
 //!
@@ -14,7 +14,7 @@
 //! `length_scale=1.0`), a separate smooth age term, and a standard-normal
 //! latent `z`.  The primary repro uses `n = DEFAULT_REPRO_N` and caps the
 //! full blockwise fit at joint-Newton cycle 0 (`inner_max_cycles=1`) so the
-//! printed wall time is a local proxy for the biobank
+//! printed wall time is a local proxy for the large-scale
 //! `[PIRLS/blockwise joint-Newton] cycle 0/100` region.  Run under `samply`,
 //! `cargo flamegraph`, or macOS `sample` for a flame graph/profile;
 //! `--nocapture` preserves the per-fit phase summaries already emitted by
@@ -26,7 +26,7 @@ mod margslope_flex_equivalence;
 use gam::families::custom_family::BlockwiseFitOptions;
 use gam::families::marginal_slope_shared::OuterScoreSubsample;
 use margslope_flex_equivalence::{
-    DEFAULT_REPRO_N, build_biobank_shape_problem, cycle_capped_options, fit_problem,
+    DEFAULT_REPRO_N, build_large_scale_shape_problem, cycle_capped_options, fit_problem,
 };
 use ndarray::Array1;
 use std::sync::Arc;
@@ -57,7 +57,7 @@ fn fit_synthetic_beta(
     n: usize,
     inner_max_cycles: usize,
 ) -> Result<(Array1<f64>, margslope_flex_equivalence::FitTiming), String> {
-    let problem = build_biobank_shape_problem(n);
+    let problem = build_large_scale_shape_problem(n);
     let (fit, timing) = fit_problem(problem, cycle_capped_options(inner_max_cycles))?;
     Ok((fit.fit.beta, timing))
 }
@@ -142,15 +142,15 @@ fn assert_repeated_fit_beta_equivalent(
 }
 
 #[test]
-fn margslope_flex_biobank_repro_cycle0() {
+fn margslope_flex_large_scale_repro_cycle0() {
     gam::init_parallelism();
     let n = DEFAULT_REPRO_N;
     let bound = DEFAULT_WALL_BOUND;
-    let problem = build_biobank_shape_problem(n);
+    let problem = build_large_scale_shape_problem(n);
     let (out, timing) = fit_problem(problem, cycle_capped_options(1))
-        .expect("biobank-shape FLEX margslope cycle-0 repro fit");
+        .expect("large-scale FLEX margslope cycle-0 repro fit");
     eprintln!(
-        "[MS-FLEX-BIOBANK-REPRO] n={} inner_max_cycles=1 elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
+        "[MS-FLEX-LARGE_SCALE-REPRO] n={} inner_max_cycles=1 elapsed_s={:.3} outer_iters={} inner_cycles={} converged={} beta_len={}",
         n,
         timing.elapsed.as_secs_f64(),
         timing.outer_iterations,
@@ -185,7 +185,7 @@ fn margslope_flex_beta_equivalence_smoke() {
 }
 
 /// gam#683 regression: multiple real REML/continuation outer iterations under
-/// `linkwiggle()` must return. Unlike `margslope_flex_biobank_repro_cycle0`
+/// `linkwiggle()` must return. Unlike `margslope_flex_large_scale_repro_cycle0`
 /// (which caps `outer_max_iter = 1`), this allows several outer iterations so
 /// the degree-15/21 BMS row-cell-moment derivative path and the continuation
 /// pre-warm actually fire repeatedly — the exact regime #683 reported as
@@ -200,7 +200,7 @@ fn margslope_flex_beta_equivalence_smoke() {
 fn flex_full_outer_completes_under_budget_683() {
     gam::init_parallelism();
     let n = 96usize;
-    let problem = build_biobank_shape_problem(n);
+    let problem = build_large_scale_shape_problem(n);
     let outer_mask = (0..16usize).collect::<Vec<_>>();
     let options = BlockwiseFitOptions {
         inner_max_cycles: FULL_OUTER_SMOKE_INNER_CYCLES,

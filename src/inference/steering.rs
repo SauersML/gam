@@ -67,7 +67,6 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::inference::row_metric::{MetricProvenance, RowMetric};
-use crate::inference::structure_evidence::CandidateProbe;
 use crate::terms::sae_manifold::SaeManifoldTerm;
 
 /// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for
@@ -314,51 +313,6 @@ pub fn predicted_response(
     })?;
     let tangents = decode_tangents_at(evaluator.as_ref(), &atom.decoder_coefficients, t_at, p, d)?;
     Ok(project_onto_tangent_span(&tangents, delta))
-}
-
-/// Build the [`CandidateProbe`] for one contested structural claim from the
-/// two hypotheses' FITTED dictionaries — the bridge that closes the design
-/// loop (probe → dosimetry → likelihood → absorb): the probe's δ comes from a
-/// [`SteerPlan`] (so the steering primitive's validity radius and dosimetry
-/// govern it), and each hypothesis predicts its own response via
-/// [`predicted_response`] at its own operating point (its atom + latent
-/// coordinate representing the same activations — under "one curved atom vs
-/// two flat atoms" the hypotheses do not even share an atom index, hence the
-/// per-hypothesis anchors). Feed the result to
-/// `structure_evidence::select_probe_by_expected_evidence` /
-/// `plan_probe_for_contested_claim` with the #980 output-Fisher metric.
-pub struct HypothesisAnchor<'a> {
-    pub model: &'a SaeManifoldTerm,
-    /// The atom whose local surface represents the probed activations under
-    /// this hypothesis.
-    pub atom: usize,
-    /// The latent operating point on that atom.
-    pub t_at: &'a [f64],
-}
-
-/// See [`HypothesisAnchor`].
-pub fn candidate_probe_from_hypotheses(
-    plan: &SteerPlan,
-    null_hypothesis: HypothesisAnchor<'_>,
-    alt_hypothesis: HypothesisAnchor<'_>,
-) -> Result<CandidateProbe, String> {
-    let predicted_mean_null = predicted_response(
-        null_hypothesis.model,
-        null_hypothesis.atom,
-        null_hypothesis.t_at,
-        plan.delta.view(),
-    )?;
-    let predicted_mean_alt = predicted_response(
-        alt_hypothesis.model,
-        alt_hypothesis.atom,
-        alt_hypothesis.t_at,
-        plan.delta.view(),
-    )?;
-    Ok(CandidateProbe {
-        delta: plan.delta.clone(),
-        predicted_mean_null,
-        predicted_mean_alt,
-    })
 }
 
 /// Does this provenance carry behavioral (output-Fisher) information? Euclidean

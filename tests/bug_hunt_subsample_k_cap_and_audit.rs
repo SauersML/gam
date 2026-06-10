@@ -1,17 +1,17 @@
-//! Regression guards for the biobank 8h-hang investigation.
+//! Regression guards for the large-scale 8h-hang investigation.
 //!
 //! Pinned mechanism (validated via multiple orthogonal lines):
 //!
 //!   * `marginal_slope_shared.rs:maybe_install_auto_outer_subsample`
 //!     used to construct `AutoOuterSubsampleOptions::default()` and
-//!     discard the `outer_work_per_k_unit` argument. At biobank n the
+//!     discard the `outer_work_per_k_unit` argument. At large-scale n the
 //!     noise-only rule then picked K ≈ 0.10·n = 19_661, ~9× larger
 //!     than the survival family's intended K ≈ 2_000. The first outer
 //!     analytic Hessian evaluation then exhausted RAM and disk; the
 //!     kernel killed the process with SIGKILL (exit 137) after 8h of
 //!     silent grinding.
 //!
-//!   * The identifiability audit / canonicalization halts the biobank
+//!   * The identifiability audit / canonicalization halts the large-scale
 //!     5-block shape (51 cols, rank 38) with
 //!     `CustomFamilyError::IdentifiabilityFailure`. The release binary
 //!     that emitted the failing log predates this gate — the literal
@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 
-const BIOBANK_N: usize = 195_780;
+const LARGE_SCALE_N: usize = 195_780;
 const SURVIVAL_WORK_PER_K_UNIT: u64 = 250_000;
 const OBSERVED_K_IN_RUN: usize = 19_661;
 
@@ -41,8 +41,8 @@ const OBSERVED_K_IN_RUN: usize = 19_661;
 fn h1a_target_k_with_default_work_per_k_picks_noise_rule() {
     let opts = AutoOuterSubsampleOptions::default();
     let choice = opts
-        .target_k_detailed(BIOBANK_N)
-        .expect("biobank n should auto-subsample");
+        .target_k_detailed(LARGE_SCALE_N)
+        .expect("large-scale n should auto-subsample");
     assert_eq!(
         choice.cap_reason,
         AutoOuterCapReason::Noise,
@@ -66,8 +66,8 @@ fn h1b_target_k_with_survival_work_per_k_picks_work_rule() {
         ..AutoOuterSubsampleOptions::default()
     };
     let choice = opts
-        .target_k_detailed(BIOBANK_N)
-        .expect("biobank n should auto-subsample");
+        .target_k_detailed(LARGE_SCALE_N)
+        .expect("large-scale n should auto-subsample");
     let expected_k_work = (AUTO_OUTER_WORK_BUDGET / SURVIVAL_WORK_PER_K_UNIT) as usize;
     assert_eq!(
         choice.k_work, expected_k_work,
@@ -96,15 +96,15 @@ fn h1c_maybe_install_honors_outer_work_per_k_unit_argument() {
     // Pre-fix: the function constructed `AutoOuterSubsampleOptions::default()`
     // and discarded the `outer_work_per_k_unit` argument, so the work-budget
     // cap never bound; the noise-only rule picked K ≈ 0.10·n (≈ 19_661 at
-    // biobank n=195_780) instead of the survival family's intended K ≈ 2_000.
-    // That ~9× inflation drove the observed 8h biobank hang (exit 137).
+    // large-scale n=195_780) instead of the survival family's intended K ≈ 2_000.
+    // That ~9× inflation drove the observed 8h large-scale hang (exit 137).
     //
     // Post-fix: the function threads `outer_work_per_k_unit` into the options
     // it constructs, so the cap binds and K lands near 2_000.
-    let z: Vec<f64> = (0..BIOBANK_N)
-        .map(|i| (i as f64) / (BIOBANK_N as f64))
+    let z: Vec<f64> = (0..LARGE_SCALE_N)
+        .map(|i| (i as f64) / (LARGE_SCALE_N as f64))
         .collect();
-    let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
+    let stratum: Vec<u8> = (0..LARGE_SCALE_N).map(|i| (i & 1) as u8).collect();
     let opts_struct = gam::families::custom_family::BlockwiseFitOptions {
         auto_outer_subsample: true,
         ..Default::default()
@@ -124,7 +124,7 @@ fn h1c_maybe_install_honors_outer_work_per_k_unit_argument() {
         "h1c-test",
         SURVIVAL_WORK_PER_K_UNIT,
     )
-    .expect("auto-subsample should install at biobank n");
+    .expect("auto-subsample should install at large-scale n");
 
     let mask = installed
         .outer_score_subsample
@@ -167,16 +167,16 @@ fn h1d_direct_capped_options_do_produce_small_k() {
     // mask comes out small. This proves the cap mechanism itself works,
     // so the bug is specifically in `maybe_install_auto_outer_subsample`
     // constructing default options at line 1109.
-    let z: Vec<f64> = (0..BIOBANK_N)
-        .map(|i| (i as f64) / (BIOBANK_N as f64))
+    let z: Vec<f64> = (0..LARGE_SCALE_N)
+        .map(|i| (i as f64) / (LARGE_SCALE_N as f64))
         .collect();
-    let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
+    let stratum: Vec<u8> = (0..LARGE_SCALE_N).map(|i| (i & 1) as u8).collect();
     let capped = AutoOuterSubsampleOptions {
         outer_work_per_k_unit: SURVIVAL_WORK_PER_K_UNIT,
         ..AutoOuterSubsampleOptions::default()
     };
     let mask = auto_outer_score_subsample(&z, Some(&stratum), &capped)
-        .expect("capped subsample should still install at biobank n");
+        .expect("capped subsample should still install at large-scale n");
     let k = mask.len();
     let expected_work_capped_k = (AUTO_OUTER_WORK_BUDGET / SURVIVAL_WORK_PER_K_UNIT) as usize;
     // Allow stratification ceil overshoot (≤ 2 × stratum_count rows over).
@@ -207,14 +207,14 @@ fn h3a_uncapped_vs_capped_subsample_size_ratio_is_about_10x() {
     // HT-weighted row pass dominates, so this K ratio is the wall-time
     // and intermediate-working-set blowup the survival family would
     // suffer if the cap argument were not honoured.
-    let z: Vec<f64> = (0..BIOBANK_N)
-        .map(|i| (i as f64) / (BIOBANK_N as f64))
+    let z: Vec<f64> = (0..LARGE_SCALE_N)
+        .map(|i| (i as f64) / (LARGE_SCALE_N as f64))
         .collect();
-    let stratum: Vec<u8> = (0..BIOBANK_N).map(|i| (i & 1) as u8).collect();
+    let stratum: Vec<u8> = (0..LARGE_SCALE_N).map(|i| (i & 1) as u8).collect();
 
     let uncapped = AutoOuterSubsampleOptions::default();
     let k_uncapped = auto_outer_score_subsample(&z, Some(&stratum), &uncapped)
-        .expect("uncapped default still installs at biobank n")
+        .expect("uncapped default still installs at large-scale n")
         .len();
 
     let capped = AutoOuterSubsampleOptions {
@@ -222,7 +222,7 @@ fn h3a_uncapped_vs_capped_subsample_size_ratio_is_about_10x() {
         ..AutoOuterSubsampleOptions::default()
     };
     let k_capped = auto_outer_score_subsample(&z, Some(&stratum), &capped)
-        .expect("capped install at biobank n")
+        .expect("capped install at large-scale n")
         .len();
 
     let multiplier = (k_uncapped as f64) / (k_capped as f64);
@@ -250,13 +250,13 @@ fn h3a_uncapped_vs_capped_subsample_size_ratio_is_about_10x() {
     );
 }
 
-// -------- H2: identifiability audit halts the biobank shape ----------
+// -------- H2: identifiability audit halts the large-scale shape ----------
 
-/// Build five overlapping blocks that mimic the biobank-shape rank
+/// Build five overlapping blocks that mimic the large-scale rank
 /// deficiency the user's log reported: joint rank ≪ joint cols, many
 /// near-1.0 aliases across blocks, mirroring time/marginal/logslope/
 /// score_warp/link_dev sharing the same polynomial/nullspace directions.
-fn build_biobank_like_aliased_specs() -> Vec<gam::families::custom_family::ParameterBlockSpec> {
+fn build_large_scale_like_aliased_specs() -> Vec<gam::families::custom_family::ParameterBlockSpec> {
     use gam::families::custom_family::ParameterBlockSpec;
     use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 
@@ -331,15 +331,15 @@ fn build_biobank_like_aliased_specs() -> Vec<gam::families::custom_family::Param
 }
 
 #[test]
-fn h2a_audit_marks_biobank_shape_fatal() {
-    let specs = build_biobank_like_aliased_specs();
+fn h2a_audit_marks_large_scale_shape_fatal() {
+    let specs = build_large_scale_like_aliased_specs();
     let total_cols: usize = specs.iter().map(|s| s.design.ncols()).sum();
     // Sanity: the synthetic design matches the user's reported widths.
-    assert_eq!(total_cols, 51, "biobank-like total cols");
+    assert_eq!(total_cols, 51, "large-scale-like total cols");
     let audit = audit_identifiability(&specs).expect("audit must run mechanically");
     assert!(
         audit.fatal,
-        "current source MUST halt on the biobank rank-deficient shape; \
+        "current source MUST halt on the large-scale rank-deficient shape; \
          got fatal=false, summary={:?}",
         audit.summary
     );
@@ -362,7 +362,7 @@ fn h2b_release_log_string_absent_from_current_source() {
     // audit on a known shape and confirming the modern summary uses
     // either "FATAL" or "partial alias(es) below halt threshold" or
     // "clean" instead.
-    let specs = build_biobank_like_aliased_specs();
+    let specs = build_large_scale_like_aliased_specs();
     let audit = audit_identifiability(&specs).expect("audit must run");
     assert!(
         !audit
@@ -379,10 +379,10 @@ fn h2b_release_log_string_absent_from_current_source() {
 }
 
 #[test]
-fn h2c_canonicalize_returns_identifiability_failure_on_biobank_shape() {
+fn h2c_canonicalize_returns_identifiability_failure_on_large_scale_shape() {
     use gam::families::custom_family::CustomFamilyError;
     use gam::solver::identifiability_canonical::canonicalize_for_identifiability;
-    let specs = build_biobank_like_aliased_specs();
+    let specs = build_large_scale_like_aliased_specs();
     let outcome = canonicalize_for_identifiability(&specs);
     match outcome {
         Err(CustomFamilyError::IdentifiabilityFailure { audit }) => {
@@ -392,7 +392,7 @@ fn h2c_canonicalize_returns_identifiability_failure_on_biobank_shape() {
             );
         }
         Ok(_) => panic!(
-            "canonicalize_for_identifiability should refuse the biobank shape; \
+            "canonicalize_for_identifiability should refuse the large-scale shape; \
              it instead returned Ok (current source is missing the halt)."
         ),
         Err(other) => panic!("expected IdentifiabilityFailure, got: {:?}", other),

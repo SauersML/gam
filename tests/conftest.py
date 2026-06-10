@@ -19,10 +19,10 @@ class _Pytest(Protocol):
 
 pytest = cast(_Pytest, import_module("pytest"))
 
-SyntheticBiobankFactory = Callable[[int, int], pd.DataFrame]
+SyntheticLargeScaleFactory = Callable[[int, int], pd.DataFrame]
 
 
-def _build_synthetic_biobank(seed: int = 0, n: int = 200) -> pd.DataFrame:
+def _build_synthetic_large_scale(seed: int = 0, n: int = 200) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
 
     pc1 = rng.normal(0.0, 1.0, n)
@@ -64,8 +64,8 @@ def _build_synthetic_biobank(seed: int = 0, n: int = 200) -> pd.DataFrame:
 
 
 @pytest.fixture
-def synthetic_biobank_factory() -> SyntheticBiobankFactory:
+def synthetic_large_scale_factory() -> SyntheticLargeScaleFactory:
     def _factory(seed: int = 0, n: int = 200) -> pd.DataFrame:
-        return _build_synthetic_biobank(seed=seed, n=n)
+        return _build_synthetic_large_scale(seed=seed, n=n)
 
     return _factory

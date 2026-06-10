@@ -1,7 +1,7 @@
 //! Integration test for the V+M-exact construction-site cutover (team
 //! `smgs-vm-exact`, sub-task J).
 //!
-//! Aim: prove end-to-end that on a synthetic biobank-shape survival
+//! Aim: prove end-to-end that on a synthetic large-scale survival
 //! marginal-slope problem with intentional cross-block parametric
 //! aliasing, the V+M cutover engages, the fit converges, and predict
 //! still runs on raw-width β.

@@ -37,7 +37,7 @@
 //!   materialising the `p × p` `H_j` matrix. Cost: 2 GEMMs of size
 //!   `n × p × K` shared across all `D` derivatives.
 //!
-//! The structural path is the high-value route for biobank-scale models
+//! The structural path is the high-value route for large-scale models
 //! where `p` is hundreds and there are many derivatives.
 //!
 //! # Stateless probe RNG
@@ -559,7 +559,7 @@ pub const PCG_HVP_MAX_ITERS: usize = 200;
 /// closure rather than a dense `ArrayView2`. Used by call sites where the
 /// penalized Hessian is implicit (operator-only) and forming it densely
 /// would blow the memory budget — e.g. the device-resident PCG path in
-/// `gpu/bms_flex_row.rs` or the biobank-scale BMS Schur operator.
+/// `gpu/bms_flex_row.rs` or the large-scale BMS Schur operator.
 ///
 /// `hvp` must compute `out ← H · v` for an SPD `H`. The closure is called
 /// once per CG iteration per probe (so `K · iters_per_probe` times in
@@ -1016,7 +1016,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
 
         // ── 5a. Dense path: for each dense H_j run a p×p × p×K GEMM and
         //       reduce. We loop over j rather than stacking the H_j's
-        //       (would explode memory at biobank-p), but the GEMMs share
+        //       (would explode memory at large-scale-p), but the GEMMs share
         //       the resident W buffer.
         if !dense_indices.is_empty() {
             for &j in &dense_indices {

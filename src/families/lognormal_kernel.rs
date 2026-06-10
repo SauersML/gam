@@ -62,7 +62,7 @@ pub enum HazardLoading {
     /// Frailty multiplies only the disease-like component; an exogenous
     /// background ("Makeham") component is unloaded:
     ///   h(t|U) = exp(U) · h_loaded(t) + h_unloaded(t).
-    /// This is the biologically faithful model for Gompertz-Makeham.
+    /// This is the faithful model for Gompertz-Makeham.
     LoadedVsUnloaded,
 }
 

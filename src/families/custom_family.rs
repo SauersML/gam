@@ -1388,7 +1388,7 @@ impl ExactOuterDerivativeOrder {
 /// Exact outer derivative order for families that expose second-order
 /// coefficient geometry.
 ///
-/// This used to be a cost gate that demoted large biobank-scale problems to
+/// This used to be a cost gate that demoted large large-scale problems to
 /// first-order BFGS. That was a policy leak into the math layer: if the family
 /// supplies analytic dense Hessian blocks or an analytic profiled-Hessian HVP,
 /// the outer optimizer should see the exact second-order objective. Runtime
@@ -1589,7 +1589,7 @@ pub struct OuterDerivativePolicy {
 
 impl OuterDerivativePolicy {
     /// Per-eval gradient work ceiling above which the κ schedule switches
-    /// to the staged pilot/polish path. At biobank scale (n ≳ 100 k) even
+    /// to the staged pilot/polish path. At large scale (n ≳ 100 k) even
     /// the gradient sweep takes minutes per outer iter; subsampling the
     /// pilot stage cuts that to seconds and leaves the final polish on
     /// full data to recover the MLE.
@@ -1774,7 +1774,7 @@ pub fn block_offsets_from_specs(specs: &[ParameterBlockSpec]) -> Arc<[Range<usiz
 }
 
 /// Bound first-order outer iterations when each analytic-gradient evaluation is
-/// already biobank-scale work. This is only applied after the planner has
+/// already large-scale work. This is only applied after the planner has
 /// selected a gradient-only route; second-order/ARC plans keep their requested
 /// iteration budget.
 pub fn cost_gated_first_order_max_iter(
@@ -1798,7 +1798,7 @@ pub fn cost_gated_first_order_max_iter(
 /// One unit in `rho = log(lambda)` is an `e`-fold smoothing-parameter change.
 /// Previously this cap was `1.0`, which throttled BFGS to ~1/5 of its
 /// quasi-Newton step on flat REML surfaces (the natural BFGS direction has
-/// `|d|_inf` of ~5 in log-λ for biobank-scale survival fits). Probes whose
+/// `|d|_inf` of ~5 in log-λ for large-scale survival fits). Probes whose
 /// `step_inf > cap` are rejected for free in `OuterFirstOrderBridge::eval_cost`
 /// (returning `BFGS_LINE_SEARCH_REJECT_COST` without running an inner solve),
 /// so a larger cap costs nothing on rejection — it only lets Strong-Wolfe
@@ -1916,7 +1916,7 @@ pub trait CustomFamily {
     /// Families that consult `options.outer_score_subsample` (or other
     /// per-call options that affect the LL value) must override this so the
     /// joint-Newton line search and the post-accept gradient reload agree
-    /// on which row subset is being evaluated. Biobank-scale outer-only
+    /// on which row subset is being evaluated. Large-scale outer-only
     /// callers (including the joint-Newton line-search screening path) can
     /// override this to evaluate a deterministic paired Horvitz-Thompson
     /// estimate without constructing a full exact-Newton workspace.
@@ -2033,7 +2033,7 @@ pub trait CustomFamily {
     ///   `n · p²` reduces correctly to `n · p_resp² · p_cov²`.
     /// * **Matrix-free Hessian operator**: families that expose
     ///   [`Self::exact_newton_joint_hessian_workspace`] with operator-form
-    ///   directional derivatives (CTN at biobank scale) may instead return
+    ///   directional derivatives (CTN at large scale) may instead return
     ///   the per-`Hv` matvec cost (e.g. `n·(p_resp + p_cov)` for Khatri–Rao)
     ///   so the gate reflects the operator path rather than the dense
     ///   build that the unified evaluator skips.
@@ -2497,25 +2497,6 @@ pub trait CustomFamily {
         self.exact_newton_joint_hessian_workspace(states, specs)
     }
 
-    /// Optional line-search evaluator that can return the exact workspace
-    /// corresponding to a full accepted-trial log-likelihood sweep.
-    ///
-    /// Implementations must preserve the same accept/reject semantics as
-    /// [`Self::log_likelihood_only_with_options`], including any certified
-    /// early-exit rejection. Returning a workspace is only valid when the full
-    /// log-likelihood was evaluated at the same coefficient state.
-    fn joint_line_search_log_likelihood_workspace(
-        &self,
-        states: &[ParameterBlockState],
-        specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
-    ) -> Result<Option<(f64, Arc<dyn ExactNewtonJointHessianWorkspace>)>, String> {
-        assert_valid_blockspecs(specs, "joint line-search workspace");
-        assert_states_match_specs(states, specs, "joint line-search workspace");
-        assert_valid_options(options, "joint line-search workspace");
-        Ok(None)
-    }
-
     /// Optional batched analytic-gradient hook.
     ///
     /// Returns the K per-θ_j gradient contributions ([`BatchedOuterGradientTerms`])
@@ -2531,7 +2512,7 @@ pub trait CustomFamily {
     ///                   with `m` = per-row predictor dimension; m = 2 for
     ///                   GAMLSS location-scale, 1 for scalar GLMs).
     ///
-    /// At biobank scale with K ≈ 15, p ≈ 64, m = 2 the batched path is
+    /// At large scale with K ≈ 15, p ≈ 64, m = 2 the batched path is
     /// ≈ K·p²/(p² + K·m²) ≈ 15× cheaper.
     ///
     /// # Default
@@ -2764,7 +2745,7 @@ pub trait CustomFamily {
         //
         // * Multi-block coupled with `has_explicit_joint_hessian = true` —
         //   the family override IS the only trusted joint Hessian.  If it
-        //   returns None (e.g. dense form too large for memory at biobank
+        //   returns None (e.g. dense form too large for memory at large-scale
         //   scale), propagate None.  Substituting the working-sets
         //   block-diagonal would silently drop the cross-block
         //   ∂²L/∂β_a∂β_b curvature the family is the only source of —
@@ -2858,7 +2839,7 @@ pub trait CustomFamily {
     /// term is pure overhead: each evaluation runs `p` directional
     /// derivatives of the joint Hessian (`O(n·p²)` per call for the SCOP
     /// directional derivative), called multiple times per inner cycle and
-    /// once per outer evaluation. At biobank scale (`p=144`, `n=20000`) the
+    /// once per outer evaluation. At large scale (`p=144`, `n=20000`) the
     /// overhead is the dominant per-cycle cost and exhausts the CI budget
     /// long before the inner Newton converges, while contributing
     /// essentially zero to the converged gradient and curvature.
@@ -3420,14 +3401,6 @@ pub struct BlockwiseFitOptions {
     /// this is only a budget: capped solves still have to earn the ordinary
     /// KKT certificate before derivatives may be exposed.
     pub outer_inner_max_iterations: Option<Arc<AtomicUsize>>,
-    /// If true, the joint-Newton line search may reuse an exact-Newton
-    /// workspace to read trial log-likelihood values. This preserves the
-    /// legacy path for A/B regression tests, but defaults to false because
-    /// rejected backtracking attempts discard that workspace and can dominate
-    /// FLEX marginal-slope fits — the cheap scalar log-likelihood is
-    /// sufficient for the accept/reject decision; the full state is built
-    /// only after a step is accepted.
-    pub line_search_prefer_workspace: bool,
     /// Optional line-search objective ceiling for lazy log-likelihood-only
     /// evaluations. Families whose per-row log-likelihood contributions are
     /// non-positive may stop once the partial negative log-likelihood is already
@@ -3448,7 +3421,7 @@ pub struct BlockwiseFitOptions {
     pub outer_score_subsample:
         Option<Arc<crate::families::marginal_slope_shared::OuterScoreSubsample>>,
     /// Gate for marginal-slope families to auto-derive a stratified
-    /// outer-score subsample at biobank scale (see
+    /// outer-score subsample at large scale (see
     /// [`crate::families::marginal_slope_shared::auto_outer_score_subsample`]).
     ///
     /// **Default `true`.** Auto-subsampling makes the early rho-gradient
@@ -3560,7 +3533,7 @@ pub const DEFAULT_CUSTOM_FAMILY_INNER_MAX_CYCLES: usize = 1200;
 impl Default for BlockwiseFitOptions {
     fn default() -> Self {
         Self {
-            // Biobank-scale custom-family marginal-slope fits can have a
+            // Large-scale custom-family marginal-slope fits can have a
             // long, monotone joint-Newton tail: objective and step size keep
             // shrinking, but the exact KKT residual may need several hundred
             // additional cycles after the old 300-cycle cap. The outer
@@ -3593,7 +3566,6 @@ impl Default for BlockwiseFitOptions {
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
             seed_screening: false,
-            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: true,
@@ -3931,7 +3903,6 @@ fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     hasher.write_bool(options.use_remlobjective);
     hasher.write_bool(options.use_outer_hessian);
     hasher.write_bool(options.compute_covariance);
-    hasher.write_bool(options.line_search_prefer_workspace);
     hasher.write_bool(options.early_exit_threshold.is_some());
     if let Some(value) = options.early_exit_threshold {
         hasher.write_f64(value);
@@ -5123,7 +5094,7 @@ impl MaterializablePsiDerivativeOperator for EmbeddedImplicitPsiDerivativeOperat
 /// All matvec/transpose_mul methods return zero vectors of the correct
 /// length, all row-chunk methods return chunk-sized zero matrices. The
 /// operator never allocates an `(n, p)` dense buffer, which saves ~1.45 GiB
-/// at the biobank-scale spatial-adaptive overlay (n ≈ 320 000, p ≈ 101,
+/// at the large-scale spatial-adaptive overlay (n ≈ 320 000, p ≈ 101,
 /// six hyperparameters).
 pub(crate) struct ZeroPsiDerivativeOperator {
     n: usize,
@@ -7075,7 +7046,7 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
     /// Write-into variant of `hessian_matvec`. The default implementation
     /// delegates to the legacy owned-return form and copies the result into
     /// `out`, providing back-compat without per-impl work. Concrete impls in
-    /// the inner-Newton biobank-scale hot path (Bernoulli marginal-slope and
+    /// the inner-Newton large-scale hot path (Bernoulli marginal-slope and
     /// survival marginal-slope) override this to write directly into the
     /// caller-owned buffer, eliminating per-PCG-iter `Array1` allocations.
     fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
@@ -10439,7 +10410,7 @@ enum JointHessianSource {
         apply: Arc<dyn Fn(&Array1<f64>) -> Result<Array1<f64>, String> + Send + Sync>,
         /// Write-into matvec used by the inner-Newton PCG hot path so the
         /// matvec result no longer allocates an `Array1<f64>` per CG iter.
-        /// At biobank scale (~6400 inner CG iters per outer iter, p~200) this
+        /// At large scale (~6400 inner CG iters per outer iter, p~200) this
         /// removes thousands of small Vec<f64> allocations from the tightest
         /// loop. Wired from `workspace.hessian_matvec_into`.
         apply_into: Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) -> Result<(), String> + Send + Sync>,
@@ -12072,7 +12043,7 @@ fn blockwise_logdet_terms_with_workspace<F: CustomFamily + Clone + Send + Sync +
         // exact traces violates that identity and gives ARC a Hessian for a
         // different objective.  Materializing the coefficient Hessian by
         // canonical-basis HVPs keeps the objective/derivative pair exact.  At
-        // biobank CTN scale `total` is a few hundred, so this is sub-MiB; the
+        // large-scale CTN scale `total` is a few hundred, so this is sub-MiB; the
         // materializer below refuses oversized systems before allocation.
         let mut h_joint = materialize_joint_hessian_source(
             &source,
@@ -12381,7 +12352,7 @@ fn joint_objective_roundoff_slack(old_objective: f64, trial_objective: f64) -> f
 // `outer_lamlgradient_matches_finite_differencewhen_joint_exact_path_is_active`
 // at HardPseudo σ_min ~ 1e-10 fails when symmetric. The asymmetric guard
 // preserves the spin avoidance for the common (negative-noise) case at
-// biobank scale while leaving the rank-deficient FD identity intact.
+// large scale while leaving the rank-deficient FD identity intact.
 fn joint_objective_floor_reached(
     old_objective: f64,
     trial_objective: f64,
@@ -12662,7 +12633,7 @@ fn apply_joint_feasibility_limit<F: CustomFamily + ?Sized>(
     // neither δ̂ nor α·δ̂ and is not, in general, a descent direction on
     // the joint quadratic.
     //
-    // Production survival_marginal_slope failure mode at biobank scale:
+    // Production survival_marginal_slope failure mode at large scale:
     // the time block returned α ≈ 1e-4 (monotonicity guard); per-block
     // scaling crushed δ_time to ~2.3e-4 while logslope kept its full
     // unconstrained Newton step. The joint step was no longer a Newton
@@ -14027,31 +13998,9 @@ fn joint_preconditioned_descent_delta(
 
 fn joint_line_search_log_likelihood<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
-    specs: &[ParameterBlockSpec],
     line_search_options: &BlockwiseFitOptions,
-    workspace_options: &BlockwiseFitOptions,
     states: &[ParameterBlockState],
-    prefer_workspace: bool,
 ) -> Result<(f64, Option<Arc<dyn ExactNewtonJointHessianWorkspace>>), String> {
-    if prefer_workspace
-        && let Some((log_likelihood, workspace)) =
-            family.joint_line_search_log_likelihood_workspace(states, specs, workspace_options)?
-    {
-        return Ok((log_likelihood, Some(workspace)));
-    }
-    if (!family.supports_log_likelihood_early_exit()
-        || line_search_options.early_exit_threshold.is_none())
-        && prefer_workspace
-        && family.inner_joint_workspace_log_likelihood_available(specs)
-        && let Some(workspace) = family.exact_newton_joint_hessian_workspace_with_options(
-            states,
-            specs,
-            workspace_options,
-        )?
-        && let Some(log_likelihood) = workspace.joint_log_likelihood_evaluation()?
-    {
-        return Ok((log_likelihood, Some(workspace)));
-    }
     family
         .log_likelihood_only_with_options(states, line_search_options)
         .map(|log_likelihood| (log_likelihood, None))
@@ -14337,12 +14286,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     options: &BlockwiseFitOptions,
     warm_start: Option<&ConstrainedWarmStart>,
 ) -> Result<BlockwiseInnerResult, String> {
-    // Inner-blockwise prelude waypoints. At biobank n the cold-start
+    // Inner-blockwise prelude waypoints. At large-scale n the cold-start
     // path between function entry and the first PIRLS/JN cycle-summary
     // log can run for many minutes (sometimes hours) silently while
     // row-kernel workspace builds run. Emit a `[STAGE] PIRLS/inner`
     // line at each transition so the next failed run pinpoints which
-    // named step holds time. Gated on biobank-scale n so small-fit
+    // named step holds time. Gated on large-scale n so small-fit
     // tests stay quiet.
     let inner_started = std::time::Instant::now();
     let mut states = buildblock_states(family, specs)?;
@@ -14655,7 +14604,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // regime, the Fisher information is `O(n)` on every identified
         // direction by construction, and each Jeffreys evaluation costs
         // `p` directional-derivative calls into the family's exact joint
-        // Hessian — at biobank scale (CTN duchon16d, p=144, n=20000) that
+        // Hessian — at large scale (CTN duchon16d, p=144, n=20000) that
         // is the dominant per-cycle cost (~200 s/cycle on three calls per
         // cycle), exhausting the inner budget before the algorithm converges
         // while contributing essentially zero to the gradient/curvature.
@@ -14750,7 +14699,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // that one requires the log-likelihood to be unchanged for K
         // cycles AND the per-block Newton step pinned at the cap.
         //
-        // Biobank-scale survival marginal-slope hits a different pattern —
+        // Large-scale survival marginal-slope hits a different pattern —
         // the joint objective decreases monotonically by O(1) per cycle
         // (so loglik is NOT frozen), the TR repeatedly clamps proposals
         // with |prop|∞ >> trust_radius, and the post-step KKT residual
@@ -14873,7 +14822,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // log at end of cycle.
             // Per-cycle phase-timing accumulators. Surface where the inner
             // joint-Newton spends time so a 18-min silent cycle 0 (the
-            // bernoulli marginal-slope FLEX biobank failure mode) becomes a
+            // bernoulli marginal-slope FLEX large-scale failure mode) becomes a
             // logged timeline at the end of the cycle. Phases:
             //   * hessian: joint Hessian source build (matrix-free workspace
             //     OR dense fallback assembly)
@@ -15369,7 +15318,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         };
                         // Pre-allocate the penalty workspace ONCE outside the
                         // PCG closure so each CG iter (called hundreds-to-
-                        // thousands of times per outer iter at biobank scale)
+                        // thousands of times per outer iter at large scale)
                         // reuses the buffer instead of allocating per call.
                         // RefCell because solve_spd_pcg* expects `Fn` (immutable
                         // borrow of captures) and we need interior mutability
@@ -15597,7 +15546,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
 
             // Trust-region globalization for the joint Newton proposal.  The
             // previous implementation used up to eight backtracking likelihood
-            // evaluations (each can build the exact joint workspace at biobank
+            // evaluations (each can build the exact joint workspace at large-scale
             // scale).  Here the step is truncated before evaluation and the
             // single trial objective is accepted only when the actual decrease
             // is positive relative to the local quadratic model.
@@ -15692,7 +15641,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Scale the KKT residual tolerance against the natural magnitude
             // of ‖Sβ − ∇L‖∞ (i.e. max(‖∇L‖∞, ‖Sβ‖∞)), not the objective. The
             // gradient and Sβ scale independently of the likelihood — at
-            // biobank scale with |β|∞ ~ 10²–10³ and non-trivial smoothing,
+            // large scale with |β|∞ ~ 10²–10³ and non-trivial smoothing,
             // ‖Sβ‖∞ can sit orders of magnitude above |obj| and FP noise
             // alone keeps the residual above any obj-scaled tol, so KKT is
             // never certified even when the iterate is the true optimum.
@@ -15892,7 +15841,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // predicted = ½·rhs·δ while actual = rhs·δ, giving ρ = 2
                 // exactly. The trust-region loop then accepts the step
                 // (ρ > 0.75 expands the radius), and the same regime
-                // repeats every cycle — exactly the biobank-saturated
+                // repeats every cycle — exactly the large-scale-saturated
                 // failure trace. Pinned by
                 // `ridge_stabilization_gap_produces_exact_rho_two_in_null_direction`.
                 //
@@ -16059,13 +16008,10 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     );
                 }
                 // Cheap-LL line-search path: rejected backtracking attempts
-                // discard the exact-Newton workspace they build, so by default
-                // we evaluate just the scalar full-data log-likelihood for the
-                // accept/reject decision and only build the full state once the
-                // step is accepted (via the gradient reload below). The
-                // workspace path is preserved behind
-                // `options.line_search_prefer_workspace` for A/B regression
-                // checks against the legacy numerics.
+                // discard the exact-Newton workspace they build, so we evaluate
+                // just the scalar full-data log-likelihood for the accept/reject
+                // decision and only build the full state once the step is
+                // accepted (via the gradient reload below).
                 //
                 // EARLY-EXIT THRESHOLD MUST BOUND THE NLL, NOT THE FULL OBJECTIVE
                 // (was a stall — gam#787/#785, duchon centers≥20). The family's
@@ -16089,11 +16035,8 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     coefficient_line_search_options(options, old_objective + 1e-10 - trial_penalty);
                 let trial_ll = match joint_line_search_log_likelihood(
                     family,
-                    specs,
                     &line_search_options,
-                    options,
                     &states,
-                    joint_workspace_requested && options.line_search_prefer_workspace,
                 ) {
                     Ok((value, workspace)) => {
                         accepted_joint_workspace = workspace;
@@ -16259,7 +16202,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // Surface the TR-policy decision so future failures
                 // distinguish "TR is throttling Newton" from "TR is not
                 // the bottleneck — Newton itself finds short steps".
-                // For the biobank linear-convergence pattern the policy
+                // For the large-scale linear-convergence pattern the policy
                 // is consistently `hold_inside` (ρ≈1, |δ| ≪ radius),
                 // which proves the TR is not what is keeping the step
                 // small — that came up before via "(held)" alone but
@@ -16618,12 +16561,12 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Scale-aware tolerances. The objective check was already
             // relative (`inner_tol * (1 + |obj|)`), but the step and
             // residual checks were absolute against the bare `inner_tol`
-            // — at biobank scale (n ≈ 320k), β iterates can keep moving
+            // — at large scale (n ≈ 320k), β iterates can keep moving
             // by ~1e-5 per cycle along the monotonicity-feasible
             // manifold even after the likelihood has gone flat, and the
             // joint gradient ‖·‖_∞ is O(|obj|), not O(1). Running
             // 50-100 cycles past objective convergence is the
-            // dominant inner-PIRLS cost at biobank scale. Switching to
+            // dominant inner-PIRLS cost at large scale. Switching to
             // relative scaling (`inner_tol * (1 + ‖β‖_∞)` for steps,
             // `inner_tol * (1 + |obj|)` for the gradient residual)
             // exits PIRLS as soon as the optimum is statistically
@@ -16639,7 +16582,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             let objective_tol = inner_tol * (1.0 + lastobjective.abs());
             // KKT residual tolerance must scale with the natural magnitude of
             // ‖Sβ − ∇L‖∞ (i.e. max(‖∇L‖∞, ‖Sβ‖∞)), not the objective. At
-            // biobank scale with |β|∞ in the 10²–10³ range the gradient and
+            // large scale with |β|∞ in the 10²–10³ range the gradient and
             // penalty norms can sit orders of magnitude above |obj| and FP
             // noise alone keeps the residual above any obj-scaled tol. The
             // pre-line-search check at the head of the cycle already uses
@@ -17117,7 +17060,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     // in the direction of g, so Hδ ≈ 0 along the null
                     // direction regardless of whether g is a multiplier or a
                     // real defect. Case (b) is the survival marginal-slope
-                    // pathology at biobank scale: H σ_min ≈ 1e-12 and Newton
+                    // pathology at large scale: H σ_min ≈ 1e-12 and Newton
                     // genuinely cannot move g, but the residual is NOT a
                     // captured multiplier — it's an unresolved KKT defect in
                     // the H-null subspace.
@@ -17534,7 +17477,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             // Residual-stall early-exit. The strict and noise-floor
             // certificates above require the KKT residual to land within
             // a small multiple of residual_tol. On survival marginal-slope
-            // at biobank scale the residual oscillates in a band that is
+            // at large scale the residual oscillates in a band that is
             // orders of magnitude above tol without trending down while
             // the unconstrained proposal has |prop|∞ in the 10³–10⁶ range,
             // the TR clamps it, and each clamped step moves β by O(1)
@@ -18048,7 +17991,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     // MAX_NEWTON_STEP every cycle while β grows linearly along it; the
     // log-likelihood stays frozen, only the penalty changes (slowly).
     // Without an early-exit the loop runs to inner_max_cycles producing
-    // the same -loglik over and over, which at biobank scale (each cycle
+    // the same -loglik over and over, which at large scale (each cycle
     // ~0.5s) burns ~50s per ρ-cost call and stacks up to a 2400s timeout.
     //
     // Detect the pattern and bail with `converged = false` so the cost
@@ -18511,7 +18454,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         }
 
         // Scale-aware tolerances — see the matching joint-Newton path
-        // above for the rationale. At biobank scale absolute step/residual
+        // above for the rationale. At large scale absolute step/residual
         // tolerances against `inner_tol = 1e-6` keep this loop spinning
         // long after the objective has gone flat.
         let beta_inf = states
@@ -18760,7 +18703,7 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                 .map(|(v, _)| v.abs())
                 .fold(0.0_f64, f64::max);
             // Scale-aware residual tolerance — the joint stationarity
-            // residual ‖∇ℓ − Sβ‖_∞ scales with |obj| (≈ O(n) at biobank
+            // residual ‖∇ℓ − Sβ‖_∞ scales with |obj| (≈ O(n) at large-scale
             // scale), so the historical absolute `inner_tol = 1e-6` is
             // unachievable here even at the true minimum. Same rationale
             // as the joint-Newton convergence test above.
@@ -22962,7 +22905,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                             });
                         // Same X'(W·Y) pattern as the parallel sibling at
                         // line ~9258; route through faer for SIMD GEMM
-                        // (n × p² flops at biobank moderate scale).
+                        // (n × p² flops at large-scale moderate scale).
                         correction_mat += &fast_atb(&dx, &wx);
                         correction_mat += &fast_atb(&x_dense, &wdx);
                     }
@@ -23233,7 +23176,7 @@ fn derivative_quality_options_and_warm_start(
     }
     //
     // Do not hard-force f64-precision KKT solves for every ψ-bearing model:
-    // biobank-scale survival marginal-slope fits have row-summed objectives
+    // large-scale survival marginal-slope fits have row-summed objectives
     // around 1e5-1e6, so `1e-10 * objective` asks the inner loop to resolve
     // gradient components far below the outer optimizer's own `outer_tol`.
     // Matching the inner target to the outer target keeps the IFT gradient
@@ -24038,7 +23981,7 @@ fn joint_observation_count(states: &[ParameterBlockState]) -> usize {
 /// families with matrix-free operators can branch their `coefficient_hessian_cost`
 /// estimate on the same predicate the evaluator will use at fit time.
 ///
-/// For biobank-scale row counts with only tens of coefficients, exact
+/// For large-scale row counts with only tens of coefficients, exact
 /// materialization is bounded by `total_p` Hessian-vector products and then a
 /// tiny dense factorization. That is cheaper and more predictable than PCG when
 /// each matrix-free product streams all rows through expensive FLEX marginal-
@@ -24077,7 +24020,7 @@ fn apply_joint_block_penalty(
 ///
 /// Uses `fast_av_view_into` to write directly into the per-block slice of
 /// `out`, avoiding the per-block intermediate `Array1` from `fast_av`. At
-/// biobank scale this is invoked inside the PCG matvec closure (called
+/// large scale this is invoked inside the PCG matvec closure (called
 /// once per CG iter, hundreds-to-thousands of times per outer iter per
 /// the perf-scout report).
 fn apply_joint_block_penalty_into(
@@ -27124,7 +27067,7 @@ mod tests {
     }
 
     #[test]
-    fn default_inner_cycle_budget_covers_biobank_joint_newton_tail() {
+    fn default_inner_cycle_budget_covers_large_scale_joint_newton_tail() {
         let options = BlockwiseFitOptions::default();
 
         assert_eq!(
@@ -27392,7 +27335,7 @@ mod tests {
 
     // Experimental scan documenting that on THIS fixture's geometry the
     // joint_outer_evaluate path does not show divergence between
-    // project_hessian_logdet=true and =false at biobank-scale ρ: the dominant
+    // project_hessian_logdet=true and =false at large-scale ρ: the dominant
     // term ½ λ β'Sβ grows linearly in λ regardless of projection, and the trace
     // pair cancels in both routes here. The clustered-PC marginal-slope failure
     // (#808/#787) is a DIFFERENT geometry — a near-collinear penalty-null trend
@@ -27402,7 +27345,7 @@ mod tests {
     // `use_projected_penalty_logdet()` (default true), so value and analytic
     // gradient share the range(H+Sλ) generalized determinant.
     #[test]
-    fn biobank_scale_rho_scan_joint_outer_evaluate_is_projection_invariant() {
+    fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant() {
         // Same fixture shape as the rank-deficient projected-trace test,
         // but with H_unpen scaled to data-Hessian magnitude (n ~ 2e5).
         let ranges = vec![(0, 3)];
@@ -27417,7 +27360,7 @@ mod tests {
                       _v: &Array1<f64>|
          -> Result<Option<DriftDerivResult>, String> { Ok(None) };
 
-        eprintln!("\n=== biobank rho-scan: unprojected vs projected outer gradient ===");
+        eprintln!("\n=== large-scale rho-scan: unprojected vs projected outer gradient ===");
         eprintln!(
             "{:>5}  {:>10}  {:>16}  {:>16}  {:>10}",
             "rho", "lambda", "g_unprojected", "g_projected", "ratio"
@@ -27568,7 +27511,7 @@ mod tests {
         // Finding: at this fixture geometry the two routes agree to
         // ~1e-6 relative precision at every ρ in [0, 10].  Both grow
         // linearly in λ (≈ ½ λ β'Sβ + bounded trace contribution).
-        // The optimizer-visible blow-up in biobank therefore cannot be
+        // The optimizer-visible blow-up in large-scale therefore cannot be
         // a missing projection in joint_outer_evaluate — it must live
         // in the survival-marginal-slope custom gradient path.
         let rel_diff = (g_un_at_10 - g_pr_at_10).abs() / g_pr_at_10.max(1e-30);
@@ -27582,20 +27525,20 @@ mod tests {
         );
     }
 
-    // ── Biobank-shape reproducer for the marginal-slope ρ-saturation
+    // ── Large-scale reproducer for the marginal-slope ρ-saturation
     // failure ────────────────────────────────────────────────────────────
     //
     // Failure being investigated:
     //   outer iter=60, |g|=4.18e13, three of four ρ-coords pinned at the
     //   box bound ±10 (`with_rho_bound(10.0)`). The dominant explicit term
-    //   ½λβ'Sβ at biobank scale (n≈2e5, p≈60, β'Sβ~10⁴, λ=exp(10)≈22k) is
+    //   ½λβ'Sβ at large scale (n≈2e5, p≈60, β'Sβ~10⁴, λ=exp(10)≈22k) is
     //   only ~10⁸ — observed gradient is ~10¹³, FIVE orders of magnitude
     //   beyond what the projected-trace kernel cancellation predicts.
     //
-    // The existing `biobank_scale_rho_scan_joint_outer_evaluate_is_projection_invariant`
+    // The existing `large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant`
     // test uses single-block, p=3, nullspace_dims=1, and supplies
     // `compute_dh = Ok(None)` — that path SKIPS the trace pair entirely and
-    // therefore cannot reproduce the failure. The biobank fit has:
+    // therefore cannot reproduce the failure. The large-scale fit has:
     //   - 3 blocks (time_surface, marginal_surface, logslope_surface)
     //   - 4 penalty coords (time:1, marginal:2 [anisotropic], logslope:1)
     //   - Duchon-shape penalties: large nullspace_dims (d+1=4 for d=3 PCs)
@@ -27604,8 +27547,8 @@ mod tests {
     //   - Realistic `compute_dh(d)` returning the per-coord penalty drift
     //     ∂H/∂ρ_k = λ_k S_k (chained through the direction d)
     //
-    // This test reproduces the SHAPE: builds biobank-dimensioned blocks
-    // with rank-deficient Duchon-shape penalties, scales H to biobank
+    // This test reproduces the SHAPE: builds large-scale-dimensioned blocks
+    // with rank-deficient Duchon-shape penalties, scales H to large-scale
     // magnitude, supplies a realistic penalty-drift `compute_dh`, evaluates
     // `joint_outer_evaluate` at the actual failure ρ point
     // [time=10, marg=10, marg=10, logslope=4.5], and asserts every gradient
@@ -27617,12 +27560,12 @@ mod tests {
     //   specific drift derivatives (`evaluate_exact_newton_joint_gradient_*`
     //   in survival_marginal_slope.rs) that feed the closure.
     // If this test fails: joint_outer_evaluate has a numerical defect that
-    //   surfaces at biobank scale + realistic Ḣ. We then bisect inside the
+    //   surfaces at large scale + realistic Ḣ. We then bisect inside the
     //   evaluator.
     //
     #[test]
-    fn biobank_multiblock_outer_gradient_with_realistic_drift_is_bounded() {
-        // Biobank-realistic dimensions for hypertension marginal-slope.
+    fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_bounded() {
+        // LargeScale-realistic dimensions for hypertension marginal-slope.
         // Duchon(PC1,PC2,PC3, centers=10, order=1) → p_basis = centers +
         // null_basis(d+1=4) = 14 columns per spatial block, nullspace dim=4.
         // The actual fit has time_surface with a different basis (B-spline
@@ -27702,10 +27645,10 @@ mod tests {
             s_logs.mapv(|v| v * lams[3]),
         ];
 
-        // β at biobank scale: |β|∞ ~ 1, β'Sβ ~ trace(S) ~ O(p) ~ 10.
+        // β at large scale: |β|∞ ~ 1, β'Sβ ~ trace(S) ~ O(p) ~ 10.
         let beta_flat = Array1::<f64>::from_iter((0..p_total).map(|i| ((i as f64) * 0.13).sin()));
 
-        // ── Biobank-scale joint unpenalized Hessian.
+        // ── Large-scale joint unpenalized Hessian.
         // Real survival Hessian = Xᵀ W X with W diagonal and n=2e5. We
         // mimic the SCALE by H = n * (I + small dense perturbation).
         let n_scale = 2.0e5_f64;
@@ -27733,7 +27676,7 @@ mod tests {
         // For an idealized H_unpen that is independent of β (linear model
         // limit, no nonlinear inner geometry), `D_beta H = 0` and the
         // closure returns `Ok(None)`. This is exactly the regime the
-        // existing single-block `biobank_scale_rho_scan_*` test exercises
+        // existing single-block `large_scale_rho_scan_*` test exercises
         // and finds projection-invariant. The marginal-slope family's
         // Hessian DOES depend on β (through the joint geometry), so the
         // closure is non-trivial in production — and that is the
@@ -27745,7 +27688,7 @@ mod tests {
         // PASSES (gradient bounded), the bug must live in the family's
         // `hessian_derivative_correction_result` β-chain — not in the
         // evaluator. If it FAILS, the evaluator itself has the defect at
-        // biobank scale + Duchon-shape S.
+        // large scale + Duchon-shape S.
         let no_dh = |_v_k: &Array1<f64>| -> Result<Option<DriftDerivResult>, String> { Ok(None) };
         let compute_dh = no_dh;
         let no_d2h = |_u: &Array1<f64>,
@@ -27891,9 +27834,9 @@ mod tests {
             None,
             None,
         )
-        .expect("biobank-shape projected eval");
+        .expect("large-scale projected eval");
 
-        eprintln!("\n=== biobank multi-block reproducer with realistic Ḣ ===");
+        eprintln!("\n=== large-scale multi-block reproducer with realistic Ḣ ===");
         eprintln!("ρ = {:?}", rho.as_slice().unwrap());
         eprintln!("λ = {:?}", lams.as_slice().unwrap());
         eprintln!(
@@ -27904,7 +27847,7 @@ mod tests {
         eprintln!("gradient = {:?}", projected.gradient.as_slice().unwrap());
 
         // Physical-bound check: ½λ_k β'_k S_k β_k is the dominant explicit
-        // term per coord. For biobank shape this is ~10⁸ at ρ=10 with
+        // term per coord. For large-scale shape this is ~10⁸ at ρ=10 with
         // β-scale O(1). The full gradient including the projected trace
         // pair should be of THE SAME ORDER (or smaller after cancellation),
         // never 10⁵× larger.
@@ -27943,14 +27886,14 @@ mod tests {
         {
             // Bound: trace pair adds ~p contributions, plus H⁻¹ Ḣ trace
             // bounded by Σ |λ_k| / |H_diag| × p ~ λ_k p / n ~ tiny at
-            // biobank scale. Total gradient should be within 10× of the
+            // large scale. Total gradient should be within 10× of the
             // dominant term (allowing for projection-correction sign).
             let bound = dominant_term.abs().max(1.0) * 100.0;
             assert!(g.is_finite(), "gradient[{k}] is non-finite: {g}");
             assert!(
                 g.abs() <= bound,
                 "gradient[{k}] = {:.6e} exceeds physical bound 100·|½λβ'Sβ| = {:.6e} \
-                 (dominant_term={:.6e}); this reproduces the biobank blowup \
+                 (dominant_term={:.6e}); this reproduces the large-scale blowup \
                  inside joint_outer_evaluate.",
                 g,
                 bound,
@@ -27979,10 +27922,10 @@ mod tests {
             strict_warm_start.is_none(),
             "loosening to the outer scale should not discard cached inner state"
         );
-        let biobank_scale_objective = 3.689e5;
+        let large_scale_objective = 3.689e5;
         let posted_residual = 6.788e-1;
         let posted_objective_change = 4.209e-2;
-        let eval_tol = eval_options.inner_tol * (1.0 + biobank_scale_objective);
+        let eval_tol = eval_options.inner_tol * (1.0 + large_scale_objective);
         assert!(
             posted_residual <= 2.0 * eval_tol && posted_objective_change <= eval_tol,
             "the exact outer startup validation should accept numerically flat inner solves at outer scale"
@@ -28033,10 +27976,10 @@ mod tests {
             "loosening an over-tight caller tolerance should preserve the cached inner state"
         );
 
-        let biobank_scale_objective = 3.689e5;
+        let large_scale_objective = 3.689e5;
         let posted_residual_plateau = 6.788e-1;
         let posted_objective_change = 4.209e-2;
-        let eval_tol = eval_options.inner_tol * (1.0 + biobank_scale_objective);
+        let eval_tol = eval_options.inner_tol * (1.0 + large_scale_objective);
         assert!(
             posted_residual_plateau <= eval_tol && posted_objective_change <= eval_tol,
             "the posted saturated Newton plateau is below the spatial outer derivative accuracy target"
@@ -28178,7 +28121,7 @@ mod tests {
     }
 
     #[test]
-    fn biobank_exact_adaptive_hessian_order_stays_second_order() {
+    fn large_scale_exact_adaptive_hessian_order_stays_second_order() {
         let n_train = 320_000u64;
         let p = 101usize;
         let retained_rho_dim = 3usize;
@@ -28220,7 +28163,7 @@ mod tests {
         assert!(!use_joint_matrix_free_path(511, 1));
 
         // n ≥ 50_000 AND p ≥ 128: both must hold. This keeps p≈51 FLEX
-        // marginal-slope biobank fits on the bounded dense-materialized path.
+        // marginal-slope large-scale fits on the bounded dense-materialized path.
         assert!(use_joint_matrix_free_path(128, 50_000));
         assert!(!use_joint_matrix_free_path(127, 50_000));
         assert!(!use_joint_matrix_free_path(128, 31_249));
@@ -28238,7 +28181,7 @@ mod tests {
     }
 
     #[test]
-    fn biobank_shape_margslope_flex_cycle0_uses_bounded_dense_route() {
+    fn large_scale_shape_margslope_flex_cycle0_uses_bounded_dense_route() {
         let total_p = 51;
         let total_n = 320_000;
         let max_pcg_hvps_before_fix = JOINT_PCG_MAX_ITER_MULTIPLIER * total_p;
@@ -30097,7 +30040,6 @@ mod tests {
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
             seed_screening: false,
-            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
@@ -30151,7 +30093,6 @@ mod tests {
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
             seed_screening: false,
-            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
@@ -30208,7 +30149,6 @@ mod tests {
             screening_max_inner_iterations: None,
             outer_inner_max_iterations: None,
             seed_screening: false,
-            line_search_prefer_workspace: false,
             early_exit_threshold: None,
             outer_score_subsample: None,
             auto_outer_subsample: false,
@@ -30493,7 +30433,7 @@ mod tests {
     }
 
     /// Independent derivation and direct numerical proof of the
-    /// ρ ≈ 2 inner-PIRLS pathology pinned by the biobank saturated-probit
+    /// ρ ≈ 2 inner-PIRLS pathology pinned by the large-scale saturated-probit
     /// failure trace.
     ///
     /// # Mechanism
@@ -30550,7 +30490,7 @@ mod tests {
     #[test]
     fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction() {
         // Synthetic 3D joint Hessian with the structure of the
-        // saturated-probit failure case at biobank scale:
+        // saturated-probit failure case at large scale:
         //   - dim 0: indefinite contribution (eigenvalue −1) from the
         //     concave entry-survival term `+w·log Φ(−η₀)`. This triggers
         //     the SPD stabilizer in the solver.
@@ -33007,7 +32947,7 @@ mod tests {
     ///   3. `|Δobjective|` ≤ `objective_tol`
     ///      — the objective has ceased moving.
     ///
-    /// Reproduces the AoU survival-marginal-slope failure numerics:
+    /// Reproduces the large-scale survival-marginal-slope failure numerics:
     /// `old_kkt ≈ 8.6e5`, `linearized_next ≈ 8.6e5`, `actual ≈ pred ≈ 1.6e-2`.
     #[test]
     fn joint_newton_math_constrained_stationary_signature_matches_aou_failure() {
@@ -33025,7 +32965,7 @@ mod tests {
         let linearized_rel = math.linearized_next_kkt_inf / (1.0 + math.old_kkt_inf);
         assert!(
             linearized_rel >= 0.5,
-            "AoU exit has linearized_rel = {:.3e}, must be >= 0.5 for the \
+            "large-scale exit has linearized_rel = {:.3e}, must be >= 0.5 for the \
              constrained-stationary certificate to fire",
             linearized_rel,
         );
@@ -33033,7 +32973,7 @@ mod tests {
         let relerr = math.scalar_model_relative_error();
         assert!(
             relerr <= 1e-3,
-            "AoU exit has scalar_model_relerr = {:.3e}, must be <= 1e-3 \
+            "large-scale exit has scalar_model_relerr = {:.3e}, must be <= 1e-3 \
              (model agrees with actual ⇒ residual is a real multiplier)",
             relerr,
         );
@@ -33043,13 +32983,13 @@ mod tests {
         let objective_tol = 1e-6 * (1.0 + 3.484783e5_f64);
         assert!(
             objective_change <= objective_tol,
-            "AoU exit has |Δobj| = {:.3e}, must be <= obj_tol {:.3e}",
+            "large-scale exit has |Δobj| = {:.3e}, must be <= obj_tol {:.3e}",
             objective_change,
             objective_tol,
         );
     }
 
-    /// Reproduces the post-diagnostic biobank trace: the scalar Newton model
+    /// Reproduces the post-diagnostic large-scale trace: the scalar Newton model
     /// and objective plateau tests alone look like a constrained-stationary
     /// point, but the projected KKT residual is hundreds of times above
     /// tolerance and the accepted Newton step is still macroscopic. That is
@@ -33505,7 +33445,7 @@ mod tests {
         assert!(op.as_materializable().is_none());
     }
 
-    /// At biobank scale (n=320 000, p=101) a dense `Array2::zeros((n, p))`
+    /// At large scale (n=320 000, p=101) a dense `Array2::zeros((n, p))`
     /// for an unused ψ-derivative slot consumes ≈ 0.24 GiB; the spatial-
     /// adaptive baseline used to allocate one per ψ coordinate (≈ 1.4 GiB
     /// of guaranteed-zero memory at six coords). Replacing the dense zero
@@ -33716,13 +33656,13 @@ mod tests {
     }
 
     #[test]
-    fn joint_objective_roundoff_slack_accepts_biobank_scale_wobble() {
+    fn joint_objective_roundoff_slack_accepts_large_scale_wobble() {
         let old_objective = 1.218530e5;
         let trial_objective = old_objective + 2.183e-10;
         assert!(
             trial_objective
                 <= old_objective + joint_objective_roundoff_slack(old_objective, trial_objective),
-            "sub-nanounit objective wobble at biobank scale should not burn all trust attempts"
+            "sub-nanounit objective wobble at large scale should not burn all trust attempts"
         );
     }
 
@@ -33741,7 +33681,7 @@ mod tests {
                 predicted_reduction,
                 objective_tol,
             ),
-            "the repeated biobank-scale roundoff wobble should terminate immediately"
+            "the repeated large-scale roundoff wobble should terminate immediately"
         );
 
         assert!(
@@ -34237,7 +34177,7 @@ mod tests {
     }
 
     /// Regression canary: a synthetic 3-block fixture chosen to mimic the
-    /// biobank rank-deficient-H_pen failure mode — block-diagonal H with
+    /// large-scale rank-deficient-H_pen failure mode — block-diagonal H with
     /// a fully degenerate third block and zero s_lambdas — must classify
     /// as `RankDeficientHPen` with nullity matching the structural rank
     /// deficiency. When `nullspace-lead`'s smooth-construction
@@ -34248,7 +34188,7 @@ mod tests {
     /// per the lead's note; the diagnosis half here is active so the
     /// canary fires today on the failure mode the rework targets.
     #[test]
-    fn rank_deficient_hpen_canary_fires_on_biobank_shaped_failure() {
+    fn rank_deficient_hpen_canary_fires_on_large_scale_shaped_failure() {
         let block_widths = [4usize, 4, 4];
         let total_p: usize = block_widths.iter().sum();
         let block_count = block_widths.len();
@@ -34344,7 +34284,7 @@ mod tests {
         assert_eq!(
             report.diagnosis,
             KktRefusalDiagnosis::RankDeficientHPen,
-            "biobank-shaped marginal-slope failure must classify as RankDeficientHPen \
+            "large-scale-shaped marginal-slope failure must classify as RankDeficientHPen \
              (this is the canary nullspace-lead's smooth-construction rework targets)",
         );
         assert!(

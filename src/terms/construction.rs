@@ -1032,7 +1032,7 @@ impl CanonicalPenalty {
 ///   cost has a Z₂-symmetric saddle that ARC's cubic regularization will
 ///   happily converge to under first-order stationarity).
 /// - `0.99 < cos ≤ 1 - 1e-8` → `log::info!` with `[PENALTY-SIMILARITY]`.
-///   At biobank scale (`k > 64`) only the top-3 highest-cosine such pairs are
+///   At large scale (`k > 64`) only the top-3 highest-cosine such pairs are
 ///   logged to bound log volume.
 ///
 /// Returns `Vec<(i, j, cos)>` for the **redundant** pairs (cos > 1 - 1e-8),
@@ -1043,7 +1043,7 @@ impl CanonicalPenalty {
 pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(usize, usize, f64)> {
     const REDUNDANCY_THRESHOLD: f64 = 1.0 - 1e-8;
     const SIMILARITY_THRESHOLD: f64 = 0.99;
-    const BIOBANK_K_THRESHOLD: usize = 64;
+    const LARGE_SCALE_K_THRESHOLD: usize = 64;
     const TOP_SIMILARITY_PAIRS: usize = 3;
 
     let k = canonical.len();
@@ -1106,8 +1106,8 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
         );
     }
 
-    // Cap similarity log volume at biobank scale.
-    if k > BIOBANK_K_THRESHOLD && similar.len() > TOP_SIMILARITY_PAIRS {
+    // Cap similarity log volume at large scale.
+    if k > LARGE_SCALE_K_THRESHOLD && similar.len() > TOP_SIMILARITY_PAIRS {
         similar.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         similar.truncate(TOP_SIMILARITY_PAIRS);
     }
@@ -1643,7 +1643,7 @@ pub fn precompute_reparam_invariant_from_canonical(
 
     if overlapping {
         // Mirror the dense-fallback guard from
-        // `create_balanced_penalty_root_from_canonical`. Without this, biobank-
+        // `create_balanced_penalty_root_from_canonical`. Without this, large-scale-
         // scale models with overlapping penalties allocated a full
         // p_total × p_total workspace and ran an O(p³) eigendecomposition
         // before any solver code saw the problem size.
