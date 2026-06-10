@@ -359,7 +359,22 @@ pub enum ResponseFamily {
     Binomial,
     Poisson,
     Tweedie { p: f64 },
-    NegativeBinomial { theta: f64 },
+    NegativeBinomial {
+        theta: f64,
+        /// `true` when `theta` was supplied by the user as a held-fixed value
+        /// (`--negative-binomial-theta`, issue #983): the fit must use exactly
+        /// this overdispersion — `Var(y) = μ + μ²/θ`, IRLS weight
+        /// `W = μθ/(θ+μ)`, coefficients/covariance/SEs all reflect it — and
+        /// the inner solver must never overwrite it. `false` means `theta` is
+        /// the running seed/estimate refined from the data each inner solve
+        /// (the #802 default). Carried on the family variant — the canonical
+        /// `theta` store — so the estimated-vs-fixed contract can never desync
+        /// from the value itself; `default_scale_metadata` derives the
+        /// matching scale variant. Serde-defaulted so pre-#983 saved models
+        /// (always estimated) deserialize unchanged.
+        #[serde(default)]
+        theta_fixed: bool,
+    },
     Beta { phi: f64 },
     Gamma,
     RoystonParmar,
@@ -1114,10 +1129,28 @@ impl LikelihoodSpec {
         )
     }
 
+    /// Estimated-theta NB spec: `theta` is the seed, refined by the inner
+    /// solver (#802 default).
     #[inline]
     pub const fn negative_binomial_log(theta: f64) -> Self {
         Self::new(
-            ResponseFamily::NegativeBinomial { theta },
+            ResponseFamily::NegativeBinomial {
+                theta,
+                theta_fixed: false,
+            },
+            InverseLink::Standard(StandardLink::Log),
+        )
+    }
+
+    /// Fixed-theta NB spec: the fit holds `theta` at exactly this value
+    /// (`--negative-binomial-theta`, issue #983).
+    #[inline]
+    pub const fn negative_binomial_log_fixed(theta: f64) -> Self {
+        Self::new(
+            ResponseFamily::NegativeBinomial {
+                theta,
+                theta_fixed: true,
+            },
             InverseLink::Standard(StandardLink::Log),
         )
     }
@@ -1167,7 +1200,7 @@ impl LikelihoodSpec {
             (ResponseFamily::Gaussian, _) => FamilySpecKind::GaussianIdentity,
             (ResponseFamily::Poisson, _) => FamilySpecKind::PoissonLog,
             (ResponseFamily::Tweedie { p }, _) => FamilySpecKind::TweedieLog { p: *p },
-            (ResponseFamily::NegativeBinomial { theta }, _) => {
+            (ResponseFamily::NegativeBinomial { theta, .. }, _) => {
                 FamilySpecKind::NegativeBinomialLog { theta: *theta }
             }
             (ResponseFamily::Beta { phi }, _) => FamilySpecKind::BetaLogit { phi: *phi },
@@ -1255,8 +1288,18 @@ impl LikelihoodSpec {
             // every variance-derived output (coefficient/η SEs, Wald and credible
             // intervals, predictive intervals, `generate` draws) ignore the
             // data's overdispersion (issue #802). `phi` itself stays `≡ 1`.
-            ResponseFamily::NegativeBinomial { theta } => {
-                LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: *theta }
+            //
+            // A user-supplied `--negative-binomial-theta` is the opposite
+            // contract (issue #983): `theta_fixed = true` routes to the
+            // non-estimated scale variant, so the inner solver's refresh gate
+            // (`negbin_theta_is_estimated()`) stays closed and the fit honours
+            // the held value everywhere it enters.
+            ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
+                if *theta_fixed {
+                    LikelihoodScaleMetadata::FixedNegBinTheta { theta: *theta }
+                } else {
+                    LikelihoodScaleMetadata::EstimatedNegBinTheta { theta: *theta }
+                }
             }
             // Tweedie's dispersion `phi` is a genuine free parameter
             // (`Var(y) = phi · mu^p`) and is estimated jointly with the mean by
@@ -1454,6 +1497,14 @@ pub enum LikelihoodScaleMetadata {
     /// `with_negbin_theta`, exactly as `EstimatedBetaPhi` mirrors `Beta { phi }`
     /// (issue #802).
     EstimatedNegBinTheta { theta: f64 },
+    /// Negative-Binomial overdispersion `theta` held fixed at a user-supplied
+    /// value (`--negative-binomial-theta`, issue #983). Identical role to
+    /// `EstimatedNegBinTheta` in every weight / variance / covariance
+    /// expression (`W = μθ/(θ+μ)`, `Var(y) = μ + μ²/θ`, `phi ≡ 1`), but the
+    /// inner solver's ML refresh is gated off: the recorded `theta` is the
+    /// user's, by construction. The fixed/estimated split mirrors
+    /// `FixedGammaShape` vs `EstimatedGammaShape`.
+    FixedNegBinTheta { theta: f64 },
     /// The engine does not expose fixed-scale semantics for this family.
     Unspecified,
 }
@@ -1471,7 +1522,7 @@ impl LikelihoodScaleMetadata {
             // NB's dispersion scale is `phi ≡ 1` (the overdispersion is carried
             // by `theta` inside the variance function, not a scale multiply), so
             // the fixed-`phi` contract is `Some(1.0)` — NOT `theta`.
-            Self::EstimatedNegBinTheta { .. } => Some(1.0),
+            Self::EstimatedNegBinTheta { .. } | Self::FixedNegBinTheta { .. } => Some(1.0),
             Self::ProfiledGaussian | Self::Unspecified => None,
         }
     }
@@ -1483,12 +1534,12 @@ impl LikelihoodScaleMetadata {
         matches!(self, Self::EstimatedNegBinTheta { .. })
     }
 
-    /// The estimated Negative-Binomial `theta` carried in the scale metadata,
-    /// or `None` for non-NB families.
+    /// The Negative-Binomial `theta` carried in the scale metadata (estimated
+    /// or user-fixed), or `None` for non-NB families.
     #[inline]
     pub const fn negbin_theta(self) -> Option<f64> {
         match self {
-            Self::EstimatedNegBinTheta { theta } => Some(theta),
+            Self::EstimatedNegBinTheta { theta } | Self::FixedNegBinTheta { theta } => Some(theta),
             _ => None,
         }
     }
@@ -1622,7 +1673,9 @@ impl GlmLikelihoodSpec {
             // covariance scale is `1.0` (`phi ≡ 1`). The reported SEs respond to
             // the data's overdispersion entirely through that `theta`-dependent
             // weight (issue #802) — multiplying again would double-count it.
+            // The same holds verbatim for a user-fixed `theta` (issue #983).
             | LikelihoodScaleMetadata::EstimatedNegBinTheta { .. }
+            | LikelihoodScaleMetadata::FixedNegBinTheta { .. }
             | LikelihoodScaleMetadata::Unspecified => 1.0,
         }
     }
@@ -1712,11 +1765,18 @@ impl GlmLikelihoodSpec {
     /// the data's overdispersion rather than the seed `theta` (issue #802). This
     /// mirrors `with_beta_phi` exactly — both keep the family variant and the
     /// scale metadata as two synchronized views of one estimated parameter.
+    /// No-op for a user-fixed `theta` (`theta_fixed = true` /
+    /// `FixedNegBinTheta`, issue #983): the held value is the contract, and
+    /// this mutator must never let an estimation path overwrite it — the
+    /// PIRLS refresh gate (`negbin_theta_is_estimated()`) already skips the
+    /// call, this enforces the same invariant at the data itself.
     #[inline]
     pub fn with_negbin_theta(mut self, theta: f64) -> Self {
         if let ResponseFamily::NegativeBinomial {
             theta: family_theta,
+            theta_fixed,
         } = &mut self.spec.response
+            && !*theta_fixed
         {
             *family_theta = theta;
             self.scale = LikelihoodScaleMetadata::EstimatedNegBinTheta { theta };
@@ -1729,7 +1789,7 @@ impl GlmLikelihoodSpec {
     #[inline]
     pub fn negbin_theta(&self) -> Option<f64> {
         match self.spec.response {
-            ResponseFamily::NegativeBinomial { theta } => Some(theta),
+            ResponseFamily::NegativeBinomial { theta, .. } => Some(theta),
             _ => None,
         }
     }

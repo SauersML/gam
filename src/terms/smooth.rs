@@ -362,6 +362,18 @@ pub enum SmoothBasisSpec {
         inner: Box<SmoothBasisSpec>,
         by_col: usize,
         levels: Vec<u64>,
+        /// Global-orthogonality column map `Z` captured at fit time when this
+        /// term overlapped an owner smooth (`s(x) + s(g, x, bs=sz)`, #978):
+        /// the hierarchical-ownership pass residualized this term's realized
+        /// design as `X ← X·Z`, shrinking its coefficient block. `Z` depends
+        /// on the *training-row* owner designs, so prediction cannot rederive
+        /// it — it must be persisted and replayed
+        /// (`apply_global_smooth_identifiability` consumes it verbatim).
+        /// Chart convention: `Z` lives in the post-restack, post-joint-null-Q
+        /// coordinates — the raw `sz` rebuild reapplies `Q` deterministically
+        /// (#700), then `Z` applies on top. `None` for non-overlapping terms.
+        #[serde(default)]
+        frozen_global_orthogonality: Option<Array2<f64>>,
     },
     BSpline1D {
         feature_col: usize,
@@ -643,6 +655,14 @@ pub struct FactorSmoothSpec {
     pub marginal: BSplineBasisSpec,
     pub flavour: FactorSmoothFlavour,
     pub group_frozen_levels: Option<Vec<u64>>,
+    /// Fit-time global-orthogonality chart for this term (`s(x) + fs(x, g)`
+    /// overlap residualization, #978). Unlike the per-marginal `sz` case this
+    /// stores the FULL realized raw→coefficient transform (any joint-null `Q`
+    /// composed with the overlap `Z`), because the `fs` raw rebuild applies no
+    /// rotation of its own at predict time. Training-row dependent, hence
+    /// persisted; replayed verbatim by `apply_global_smooth_identifiability`.
+    #[serde(default)]
+    pub frozen_global_orthogonality: Option<Array2<f64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -740,6 +760,16 @@ pub struct SmoothTerm {
     /// therefore replay the same `X_new_raw · Q` transform as in-memory
     /// prediction.
     pub joint_null_rotation: Option<crate::terms::basis::JointNullRotation>,
+    /// Global-orthogonality transform that `apply_global_smooth_identifiability`
+    /// applied to this term's design but could NOT embed into `metadata`
+    /// (factor-smooth kinds: `sz` metadata is per-marginal, `fs` metadata has
+    /// no transform slot — #978). `freeze_term_collection_from_design` copies
+    /// it onto the term's basis spec (`frozen_global_orthogonality`) so the
+    /// predict-side rebuild replays it instead of emitting the unresidualized
+    /// (wider) design that the fitted coefficients no longer match.
+    /// Chart convention is per kind: post-`Q` `Z` for `sz` (the raw rebuild
+    /// reapplies `Q` itself, #700), full `Q·Z` chart for `fs`.
+    pub unabsorbed_global_orthogonality: Option<Array2<f64>>,
 }
 
 impl SmoothTerm {
@@ -9010,6 +9040,22 @@ fn design_frobenius_norm(design: &DesignMatrix) -> Result<f64, BasisError> {
         sumsq += chunk.iter().map(|v| v * v).sum::<f64>();
     }
     Ok(sumsq.sqrt())
+}
+
+/// The persisted fit-time global-orthogonality chart for a factor-smooth
+/// term, if one was frozen onto its spec (#978). `Some` means this term was
+/// residualized against owner terms at fit time and prediction/refit rebuilds
+/// must replay exactly that column map instead of rederiving anything from
+/// the (new) rows.
+fn frozen_global_orthogonality(termspec: &SmoothTermSpec) -> Option<&Array2<f64>> {
+    match &termspec.basis {
+        SmoothBasisSpec::FactorSumToZero {
+            frozen_global_orthogonality,
+            ..
+        } => frozen_global_orthogonality.as_ref(),
+        SmoothBasisSpec::FactorSmooth { spec } => spec.frozen_global_orthogonality.as_ref(),
+        _ => None,
+    }
 }
 
 fn maybe_smooth_identifiability_transform(

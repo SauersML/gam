@@ -65,11 +65,26 @@ impl fmt::Display for Fingerprint {
 
 /// Streaming hasher for building a [`Fingerprint`].
 ///
-/// Each `absorb_*` writes a short type-tag + length before the data, so
-/// `absorb_f64(b"x", 0.5)` cannot collide with `absorb_bytes(b"x", <the 8
-/// little-endian bytes of 0.5>)`.
+/// Each `absorb_*` writes a per-type discriminator byte, the caller's content
+/// tag, and a length before the data, so `absorb_f64(b"x", 0.5)` cannot
+/// collide with `absorb_bytes(b"x", <the 8 little-endian bytes of 0.5>)`, nor
+/// with `absorb_u64(b"x", 0.5f64.to_bits())` — heterogeneous fields sharing a
+/// tag can never alias.
 pub struct Fingerprinter {
     h: Sha256,
+}
+
+/// Per-type frame discriminators for the `absorb_*` family. Written before
+/// the content tag so values of different primitive types absorbed under the
+/// same tag with coinciding payload bytes still produce distinct digests.
+mod type_code {
+    pub const TAG: u8 = 0;
+    pub const BYTES: u8 = 1;
+    pub const STR: u8 = 2;
+    pub const U64: u8 = 3;
+    pub const F64: u8 = 4;
+    pub const F64_SLICE: u8 = 5;
+    pub const F64_2D: u8 = 6;
 }
 
 impl Fingerprinter {
@@ -77,38 +92,48 @@ impl Fingerprinter {
         Self { h: Sha256::new() }
     }
 
-    /// Absorb a tag with no payload. Useful for structural separators.
-    pub fn absorb_tag(&mut self, tag: &[u8]) {
+    /// Write one frame header: type discriminator, then length-prefixed tag.
+    fn frame(&mut self, code: u8, tag: &[u8]) {
+        self.h.update([code]);
         self.h.update((tag.len() as u32).to_le_bytes());
         self.h.update(tag);
     }
 
+    /// Absorb a tag with no payload. Useful for structural separators.
+    pub fn absorb_tag(&mut self, tag: &[u8]) {
+        self.frame(type_code::TAG, tag);
+    }
+
     pub fn absorb_bytes(&mut self, tag: &[u8], data: &[u8]) {
-        self.absorb_tag(tag);
+        self.frame(type_code::BYTES, tag);
         self.h.update((data.len() as u64).to_le_bytes());
         self.h.update(data);
     }
 
     pub fn absorb_str(&mut self, tag: &[u8], s: &str) {
-        self.absorb_bytes(tag, s.as_bytes());
+        self.frame(type_code::STR, tag);
+        self.h.update((s.len() as u64).to_le_bytes());
+        self.h.update(s.as_bytes());
     }
 
     pub fn absorb_u64(&mut self, tag: &[u8], v: u64) {
-        self.absorb_bytes(tag, &v.to_le_bytes());
+        self.frame(type_code::U64, tag);
+        self.h.update(v.to_le_bytes());
     }
 
     pub fn absorb_f64(&mut self, tag: &[u8], v: f64) {
-        self.absorb_bytes(tag, &v.to_bits().to_le_bytes());
+        self.frame(type_code::F64, tag);
+        self.h.update(v.to_bits().to_le_bytes());
     }
 
     pub fn absorb_f64_slice(&mut self, tag: &[u8], xs: &[f64]) {
-        self.absorb_tag(tag);
+        self.frame(type_code::F64_SLICE, tag);
         self.h.update((xs.len() as u64).to_le_bytes());
         absorb_f64_bytes(&mut self.h, xs);
     }
 
     pub fn absorb_f64_2d(&mut self, tag: &[u8], rows: usize, cols: usize, xs: &[f64]) {
-        self.absorb_tag(tag);
+        self.frame(type_code::F64_2D, tag);
         self.h.update((rows as u64).to_le_bytes());
         self.h.update((cols as u64).to_le_bytes());
         absorb_f64_bytes(&mut self.h, xs);
@@ -279,6 +304,46 @@ mod tests {
         let kb = b.finalize();
 
         assert_ne!(ka, kb);
+    }
+
+    #[test]
+    fn same_tag_cross_type_absorptions_dont_collide() {
+        // The documented contract: heterogeneous fields sharing a tag whose
+        // payload bytes coincide must still produce distinct fingerprints.
+        let v = 0.5f64;
+
+        let mut f = Fingerprinter::new();
+        f.absorb_f64(b"t", v);
+        let kf = f.finalize();
+
+        let mut u = Fingerprinter::new();
+        u.absorb_u64(b"t", v.to_bits());
+        let ku = u.finalize();
+
+        let mut raw = Fingerprinter::new();
+        raw.absorb_bytes(b"t", &v.to_bits().to_le_bytes());
+        let kraw = raw.finalize();
+
+        assert_ne!(kf, ku, "f64/u64 type confusion under a shared tag");
+        assert_ne!(kf, kraw, "f64/bytes type confusion under a shared tag");
+        assert_ne!(ku, kraw, "u64/bytes type confusion under a shared tag");
+
+        let mut s = Fingerprinter::new();
+        s.absorb_str(b"k", "AB");
+        let ks = s.finalize();
+        let mut sb = Fingerprinter::new();
+        sb.absorb_bytes(b"k", b"AB");
+        let ksb = sb.finalize();
+        assert_ne!(ks, ksb, "str/bytes type confusion under a shared tag");
+
+        // A bare structural tag must not alias an empty-payload absorption.
+        let mut t = Fingerprinter::new();
+        t.absorb_tag(b"sep");
+        let kt = t.finalize();
+        let mut e = Fingerprinter::new();
+        e.absorb_bytes(b"sep", b"");
+        let ke = e.finalize();
+        assert_ne!(kt, ke, "tag/empty-bytes confusion under a shared tag");
     }
 
     #[test]
