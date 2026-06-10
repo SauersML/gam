@@ -12,11 +12,12 @@ use crate::solver::active_set::{
 };
 use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 use crate::solver::estimate::reml::unified::{
-    BlockCoupledOperator, DenseSpectralOperator, DispersionHandling, DriftDerivResult,
-    FixedDriftDerivFn, HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift,
-    HyperCoordPair, HyperOperator, MatrixFreeSpdOperator, PenaltySubspaceTrace,
-    ProjectedKktResidual, StochasticTraceState, compute_block_penalty_logdet_derivs,
-    exact_pseudo_logdet, positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
+    BlockCoupledOperator, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
+    DenseSpectralOperator, DispersionHandling, DriftDerivResult, FixedDriftDerivFn,
+    HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordDrift, HyperCoordPair,
+    HyperOperator, MatrixFreeSpdOperator, PenaltySubspaceTrace, ProjectedKktResidual,
+    StochasticTraceState, compute_block_penalty_logdet_derivs, exact_pseudo_logdet,
+    positive_eigenvalue_threshold, spectral_epsilon, spectral_regularize,
 };
 use crate::solver::estimate::{
     EstimationError, FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
@@ -19481,6 +19482,13 @@ struct ExtCoordBundle {
     ext_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     rho_ext_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     drift_fn: Option<FixedDriftDerivFn>,
+    /// Direction-contracted ψψ second-order hook (#740). When `Some`, the
+    /// outer-Hessian operator builder skips the `K²` per-pair ψψ assembly
+    /// (`ext_ext_fn`) and applies this once per matvec. `ext_ext_fn` is still
+    /// kept as the documented fallback for the dense `compute_outer_hessian`
+    /// path and for outer evaluations that do not build the matrix-free
+    /// operator.
+    contracted_psi_fn: Option<ContractedPsiSecondOrderFn>,
 }
 
 struct ScaledHyperOperator {
@@ -19603,11 +19611,33 @@ impl ExtCoordBundle {
                 callback(ext_idx, direction).map(|result| scale_drift_deriv_result(result, scale))
             }) as FixedDriftDerivFn
         });
+        // The contracted ψψ hook is a (scaled) linear functional of the same
+        // family curvature `ext_ext_fn` reproduces, so the `rho_curvature_scale`
+        // applies term-for-term: objective/score/ld_s by `scale`, and each
+        // `hessian[i]` drift via `scale_drift_deriv_result` (matching how
+        // `scale_hypercoord_pair` scales the per-pair `b_mat`/`b_operator`).
+        let contracted_psi_fn = self.contracted_psi_fn.map(|callback| {
+            Arc::new(move |alpha_psi: &[f64]| {
+                callback(alpha_psi).map(|opt| {
+                    opt.map(|contracted| ContractedPsiSecondOrder {
+                        objective: contracted.objective.mapv(|v| scale * v),
+                        score: contracted.score.mapv(|v| scale * v),
+                        hessian: contracted
+                            .hessian
+                            .into_iter()
+                            .map(|drift| scale_drift_deriv_result(drift, scale))
+                            .collect(),
+                        ld_s: contracted.ld_s.mapv(|v| scale * v),
+                    })
+                })
+            }) as ContractedPsiSecondOrderFn
+        });
         Self {
             coords,
             ext_ext_fn,
             rho_ext_fn,
             drift_fn,
+            contracted_psi_fn,
         }
     }
 }
@@ -19675,16 +19705,17 @@ fn build_custom_family_inner_assembly<'dp>(
     let n_observations = inner.block_states.first().map(|s| s.eta.len()).unwrap_or(0);
 
     // Unpack optional ext-coord bundle.
-    let (ext_coords, ext_coord_pair_fn, rho_ext_pair_fn, fixed_drift_deriv) =
+    let (ext_coords, ext_coord_pair_fn, rho_ext_pair_fn, fixed_drift_deriv, contracted_psi_fn) =
         if let Some(bundle) = ext_bundle {
             (
                 bundle.coords,
                 bundle.ext_ext_fn,
                 bundle.rho_ext_fn,
                 bundle.drift_fn,
+                bundle.contracted_psi_fn,
             )
         } else {
-            (Vec::new(), None, None, None)
+            (Vec::new(), None, None, None, None)
         };
 
     let ext_dim = ext_coords.len();
@@ -19719,6 +19750,7 @@ fn build_custom_family_inner_assembly<'dp>(
         ext_coord_pair_fn,
         rho_ext_pair_fn,
         fixed_drift_deriv,
+        contracted_psi_second_order: contracted_psi_fn,
         kkt_residual: inner.kkt_residual.clone(),
         active_constraints: inner.active_constraints.clone(),
     };
@@ -21737,6 +21769,199 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
     Ok(coords)
 }
 
+/// Build the direction-contracted ψψ second-order hook for the profiled θ-HVP
+/// (#740).
+///
+/// Returns `Some(hook)` only when the family's psi workspace supplies a
+/// combined-direction likelihood kernel (`second_order_terms_contracted`);
+/// otherwise `None`, which keeps the outer-Hessian operator on the exact
+/// per-pair `ext_ext_fn` assembly.
+///
+/// The hook produces, for the ψ-direction weights `α_ψ`, the
+/// [`ContractedPsiSecondOrder`] ψψ-block contraction: it sums the family
+/// likelihood contraction (from the workspace) with the generic ψψ penalty
+/// motion, mirroring exactly the `α`-contraction of the per-pair `ext_ext`
+/// callback's penalty terms (`½βᵀS_{ψiψj}β` into `objective`, `S_{ψiψj}β` into
+/// `score`, `S_{ψiψj}` as a `BlockLocalDrift` into `hessian`, and the
+/// `tau_hessian_component` into `ld_s`). Same-block-only, matching `ext_ext`.
+fn build_contracted_psi_hook(
+    synced_states: &[ParameterBlockState],
+    specs: &[ParameterBlockSpec],
+    derivative_blocks: SharedDerivativeBlocks,
+    beta_flat: &Array1<f64>,
+    rho: &[f64],
+    penalty_counts: &[usize],
+    s_logdet_blocks: Option<&[PenaltyPseudologdet]>,
+    psi_workspace: Option<Arc<dyn ExactNewtonJointPsiWorkspace>>,
+) -> Result<Option<ContractedPsiSecondOrderFn>, String> {
+    // The contraction is a representation/cost choice for the family likelihood
+    // ψψ second-order; without a contracted family kernel there is nothing to
+    // accelerate, so decline (the per-pair `ext_ext_fn` path stays).
+    let Some(workspace) = psi_workspace else {
+        return Ok(None);
+    };
+
+    let total = beta_flat.len();
+    let ranges = block_param_ranges(specs);
+    let per_block = Arc::new(split_log_lambdas(
+        &Array1::from_vec(rho.to_vec()),
+        penalty_counts,
+    )?);
+    let beta_arc = Arc::new(beta_flat.clone());
+    let ranges_arc = Arc::new(ranges);
+    let s_logdet_block_cache = Arc::new(s_logdet_blocks.map(|blocks| blocks.to_vec()));
+
+    // ψ → (block, local) location and block-local S_ψ for every ψ axis, built
+    // once. `s_local` (block-local S_ψ) is reused for the τ-Hessian and as the
+    // first leg of the bilinear `tr(S⁺ S_ψi S⁺ S_ψj)` penalty-logdet term.
+    struct PsiAxis {
+        block: usize,
+        local: usize,
+        start: usize,
+        end: usize,
+        s_psi_local: Array2<f64>,
+    }
+    let mut axes: Vec<PsiAxis> = Vec::new();
+    for (block_idx, block_derivs) in derivative_blocks.iter().enumerate() {
+        let (start, end) = ranges_arc[block_idx];
+        let p_block = end - start;
+        for (local_idx, deriv) in block_derivs.iter().enumerate() {
+            let s_psi_local = assemble_block_local_s_psi(deriv, &per_block[block_idx], p_block);
+            axes.push(PsiAxis {
+                block: block_idx,
+                local: local_idx,
+                start,
+                end,
+                s_psi_local,
+            });
+        }
+    }
+    let axes = Arc::new(axes);
+    let psi_dim = axes.len();
+    if psi_dim == 0 {
+        return Ok(None);
+    }
+
+    let derivative_blocks = Arc::clone(&derivative_blocks);
+
+    let hook = move |alpha_psi: &[f64]| -> Result<Option<ContractedPsiSecondOrder>, String> {
+        if alpha_psi.len() != psi_dim {
+            return Err(format!(
+                "contracted ψψ hook: alpha_psi length {} != psi_dim {psi_dim}",
+                alpha_psi.len()
+            ));
+        }
+        // Family likelihood ψψ contraction (one combined-direction row pass).
+        // Declining here (e.g. a σ-aux axis carried weight) declines the whole
+        // hook so the operator builder keeps the per-pair assembly.
+        let Some(likelihood) = workspace.second_order_terms_contracted(alpha_psi)? else {
+            return Ok(None);
+        };
+        let mut objective = likelihood.objective;
+        let mut score = likelihood.score;
+        let mut ld_s = Array1::<f64>::zeros(psi_dim);
+        // Per-output-row penalty drift `Σ_j α_j S_{ψi ψj}` (block-local),
+        // composed onto the likelihood `hessian[i]` operator below.
+        let mut hessian: Vec<DriftDerivResult> = likelihood.hessian;
+        if objective.len() != psi_dim || score.nrows() != psi_dim || hessian.len() != psi_dim {
+            return Err(format!(
+                "contracted ψψ hook: family kernel shape mismatch (objective={}, score_rows={}, hessian={}, psi_dim={psi_dim})",
+                objective.len(),
+                score.nrows(),
+                hessian.len(),
+            ));
+        }
+
+        for (i, axis_i) in axes.iter().enumerate() {
+            let p_block = axis_i.end - axis_i.start;
+            let beta_block = beta_arc.slice(s![axis_i.start..axis_i.end]).to_owned();
+            // Combined same-block penalty second derivative
+            //   S_{ψi ψ(α)}_local = Σ_{j: block_j == block_i} α_j S_{ψi ψj}_local,
+            // and the combined first-leg penalty derivative
+            //   S_ψ(α)_local = Σ_{j: block_j == block_i} α_j S_ψj_local
+            // (the second leg of the bilinear penalty-logdet cross term).
+            let mut s_psi_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
+            let mut s_psi_alpha = Array2::<f64>::zeros((p_block, p_block));
+            for (j, axis_j) in axes.iter().enumerate() {
+                let aj = alpha_psi[j];
+                if aj == 0.0 || axis_j.block != axis_i.block {
+                    continue;
+                }
+                let deriv_i = &derivative_blocks[axis_i.block][axis_i.local];
+                let s_ij = assemble_block_local_s_psi_psi(
+                    deriv_i,
+                    axis_j.local,
+                    &per_block[axis_i.block],
+                    p_block,
+                );
+                s_psi_psi_alpha.scaled_add(aj, &s_ij);
+                s_psi_alpha.scaled_add(aj, &axis_j.s_psi_local);
+            }
+
+            // objective += 0.5 βᵀ S_{ψi ψ(α)} β  (matches ext_ext `a`).
+            let s_beta = s_psi_psi_alpha.dot(&beta_block);
+            objective[i] += 0.5 * beta_block.dot(&s_beta);
+            // score[i] (block-local slice) += S_{ψi ψ(α)} β  (matches ext_ext `g`).
+            {
+                let mut score_local = score.row_mut(i);
+                let mut slot = score_local.slice_mut(s![axis_i.start..axis_i.end]);
+                slot += &s_beta;
+            }
+            // hessian[i] += S_{ψi ψ(α)} as a block-local drift (matches the
+            // ext_ext `b_operator` BlockLocalDrift composite).
+            let block_drift: Arc<dyn HyperOperator> =
+                Arc::new(crate::solver::estimate::reml::unified::BlockLocalDrift {
+                    local: s_psi_psi_alpha.clone(),
+                    start: axis_i.start,
+                    end: axis_i.end,
+                    total_dim: total,
+                });
+            let combined = match std::mem::replace(
+                &mut hessian[i],
+                DriftDerivResult::Operator(Arc::clone(&block_drift)),
+            ) {
+                DriftDerivResult::Operator(existing) => DriftDerivResult::Operator(Arc::new(
+                    crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                        dense: None,
+                        operators: vec![existing, block_drift],
+                        dim_hint: total,
+                    },
+                )),
+                DriftDerivResult::Dense(dense) => DriftDerivResult::Operator(Arc::new(
+                    crate::solver::estimate::reml::unified::CompositeHyperOperator {
+                        dense: Some(dense),
+                        operators: vec![block_drift],
+                        dim_hint: total,
+                    },
+                )),
+            };
+            hessian[i] = combined;
+
+            // ld_s[i] += Σ_j α_j tau_hessian_component(S_ψi, S_ψj, S_{ψiψj})
+            //         = tau_hessian_component(S_ψi, S_ψ(α), S_{ψi ψ(α)})
+            // by the (linearity in the second leg + bilinearity of the cross)
+            // of the τ-Hessian; matches the ext_ext `ld_s` contraction.
+            if let Some(ref logdet_blocks) = *s_logdet_block_cache {
+                let pld = &logdet_blocks[axis_i.block];
+                ld_s[i] = pld.tau_hessian_component(
+                    &axis_i.s_psi_local,
+                    &s_psi_alpha,
+                    Some(&s_psi_psi_alpha),
+                );
+            }
+        }
+
+        Ok(Some(ContractedPsiSecondOrder {
+            objective,
+            score,
+            hessian,
+            ld_s,
+        }))
+    };
+
+    Ok(Some(Arc::new(hook) as ContractedPsiSecondOrderFn))
+}
+
 /// Build pair callbacks for ψ-ψ and ρ-ψ Hessian entries.
 ///
 /// Returns two closures:
@@ -22430,10 +22655,28 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 psi_workspace.clone(),
             )?;
 
-            let (ext_ext_fn, rho_ext_fn, drift_fn) = if eval_mode == EvalMode::ValueGradientHessian
+            let (ext_ext_fn, rho_ext_fn, drift_fn, contracted_psi_fn) = if eval_mode
+                == EvalMode::ValueGradientHessian
             {
                 let (ext_ext_fn, rho_ext_fn) = build_psi_pair_callbacks(
                     family,
+                    synced_joint_states.as_ref(),
+                    specs,
+                    Arc::clone(&derivative_blocks),
+                    &beta_flat,
+                    rho_slice,
+                    penalty_counts,
+                    s_logdet_blocks.as_deref(),
+                    psi_workspace.clone(),
+                )?;
+                // #740: build the direction-contracted ψψ hook from the same psi
+                // workspace + penalty data the per-pair `ext_ext_fn` uses, so the
+                // matrix-free outer-Hessian operator collapses the `K²` per-pair
+                // ψψ assembly to one combined-direction family row pass per
+                // matvec. `None` (no contracted family kernel) keeps the exact
+                // per-pair `ext_ext_fn` path. Built before the drift callback
+                // moves `psi_workspace`.
+                let contracted_psi_fn = build_contracted_psi_hook(
                     synced_joint_states.as_ref(),
                     specs,
                     Arc::clone(&derivative_blocks),
@@ -22451,9 +22694,9 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                     hessian_beta_independent,
                     psi_workspace,
                 );
-                (Some(ext_ext_fn), Some(rho_ext_fn), drift_fn)
+                (Some(ext_ext_fn), Some(rho_ext_fn), drift_fn, contracted_psi_fn)
             } else {
-                (None, None, None)
+                (None, None, None, None)
             };
 
             Some(ExtCoordBundle {
@@ -22461,6 +22704,7 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 ext_ext_fn,
                 rho_ext_fn,
                 drift_fn,
+                contracted_psi_fn,
             })
         };
 
@@ -23509,6 +23753,7 @@ fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         ext_ext_fn: None,
         rho_ext_fn: None,
         drift_fn: None,
+        contracted_psi_fn: None,
     };
 
     let compute_dh = exact_newton_dh_closure(

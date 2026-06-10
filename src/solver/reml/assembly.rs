@@ -9,10 +9,10 @@
 
 use super::FirthDenseOperator;
 use super::unified::{
-    BarrierConfig, DispersionHandling, EvalMode, FixedDriftDerivFn, HessianDerivativeProvider,
-    HessianOperator, HyperCoord, HyperCoordPair, InnerSolution, InnerSolutionBuilder,
-    PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace, ProjectedKktResidual,
-    RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
+    BarrierConfig, ContractedPsiSecondOrderFn, DispersionHandling, EvalMode, FixedDriftDerivFn,
+    HessianDerivativeProvider, HessianOperator, HyperCoord, HyperCoordPair, InnerSolution,
+    InnerSolutionBuilder, PenaltyCoordinate, PenaltyLogdetDerivs, PenaltySubspaceTrace,
+    ProjectedKktResidual, RemlLamlResult, penalty_matrix_root, reml_laml_evaluate,
 };
 use crate::faer_ndarray::fast_xt_diag_y;
 use ndarray::{Array1, Array2};
@@ -334,6 +334,10 @@ pub struct InnerAssembly<'dp> {
     pub ext_coord_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     pub rho_ext_pair_fn: Option<Box<dyn Fn(usize, usize) -> HyperCoordPair + Send + Sync>>,
     pub fixed_drift_deriv: Option<FixedDriftDerivFn>,
+    /// Direction-contracted ψψ second-order hook (#740). When set, the
+    /// outer-Hessian operator builder skips the `K²` per-pair ψψ assembly and
+    /// applies this once per matvec.
+    pub contracted_psi_second_order: Option<ContractedPsiSecondOrderFn>,
 }
 
 impl<'dp> InnerAssembly<'dp> {
@@ -378,6 +382,7 @@ impl<'dp> InnerAssembly<'dp> {
         if let Some(f) = self.fixed_drift_deriv {
             builder = builder.fixed_drift_deriv(f);
         }
+        builder = builder.contracted_psi_second_order(self.contracted_psi_second_order);
 
         builder.build()
     }

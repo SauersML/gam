@@ -2395,6 +2395,7 @@ impl WorkingModelSurvival {
             ext_coord_pair_fn: None,
             rho_ext_pair_fn: None,
             fixed_drift_deriv: None,
+            contracted_psi_second_order: None,
             kkt_residual: None,
             active_constraints: None,
         }
