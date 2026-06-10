@@ -46,7 +46,7 @@ use crate::terms::analytic_penalties::{
 };
 use crate::terms::latent_coord::{LatentCoordValues, LatentIdMode, LatentManifold};
 
-use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
+use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd, fast_ab, fast_abt, fast_atb};
 use crate::solver::arrow_schur::{ArrowFactorCache, solve_arrow_newton_step_with_options};
 use crate::solver::estimate::EstimationError;
 use crate::solver::evidence::arrow_log_det_from_cache;
@@ -1718,6 +1718,262 @@ impl SaeBasisThirdJet for EuclideanPatchEvaluator {
     }
 }
 
+/// Relative spectral cutoff used when the Grassmann-frame factorization decides
+/// the effective column rank `r` of an atom's decoder `B_k` (issue #972). A
+/// singular value of `B_k` below `cutoff · σ_max` carries `< (σ/σ_max)²` of the
+/// decoder energy and is dropped from the profiled frame.
+const SAE_FRAME_RANK_CUTOFF: f64 = 1.0e-7;
+
+/// Border-saving threshold for auto-activating the low-rank Grassmann
+/// factorization (issue #972). The factored border holds `Σ_k M_k · r` instead
+/// of `Σ_k M_k · p`, so factorization is beneficial only when the chosen frame
+/// rank `r` is materially smaller than the ambient output dimension `p`. We
+/// require `r ≤ p · (1 − margin)` (frame must shrink the per-atom border by at
+/// least this fraction) AND a positive absolute gap `p − r ≥ 1`, so a full-rank
+/// atom (`r == p`) never pays the polar-step / frame-storage cost for zero
+/// border saving and stays bit-for-bit on the historical full-`B` path.
+const SAE_FRAME_ACTIVATION_MARGIN: f64 = 0.25;
+
+/// A Grassmann point: a `p × r` column-orthonormal FRAME `U` spanning an atom's
+/// decoder column space (issue #972).
+///
+/// The decoder coefficient matrix `B_k` (`M_k × p`) factors as `B_k = C_k · Uᵀ`
+/// where `C_k` (`M_k × r`) is the coordinate matrix that lives IN the
+/// arrow-Schur border and `U` (`p × r`) is this frame, profiled OUT of the
+/// border by closed-form streaming polar steps. The border then carries only
+/// `Σ_k M_k · r` coefficients rather than `Σ_k M_k · p` — the reduction that
+/// keeps the border Cholesky / evidence log-det tractable at frontier `p`.
+///
+/// **Canonical inner gauge.** `U` is only defined up to a right `r × r`
+/// orthogonal rotation `U → U R` (with the matching `C_k → C_k R`); the column
+/// span (the Grassmann point) is invariant. For deterministic serialization we
+/// pin a canonical representative: the frame is the left-singular subspace of
+/// the cross-moment, ordered by descending singular value, with each column's
+/// sign fixed so its largest-magnitude entry is non-negative. This is recorded
+/// by [`Self::singular_value_gauge`] so the same span always serializes to the
+/// same bytes (no run-to-run rotation drift).
+#[derive(Debug, Clone)]
+pub struct GrassmannFrame {
+    /// Column-orthonormal frame `U`, shape `(p, r)` with `Uᵀ U = I_r`.
+    frame: Array2<f64>,
+    /// Singular values of the most recent cross-moment used to build `U`,
+    /// descending, length `r`. The canonical ordering gauge (issue #972).
+    gauge_singular_values: Array1<f64>,
+}
+
+impl GrassmannFrame {
+    /// Ambient output dimension `p`.
+    pub fn output_dim(&self) -> usize {
+        self.frame.nrows()
+    }
+
+    /// Frame rank `r` (number of profiled column directions).
+    pub fn rank(&self) -> usize {
+        self.frame.ncols()
+    }
+
+    /// Read-only view of the orthonormal frame `U` (`p × r`).
+    pub fn frame(&self) -> ArrayView2<'_, f64> {
+        self.frame.view()
+    }
+
+    /// Descending singular values of the cross-moment that defined this frame
+    /// (the canonical ordering gauge).
+    pub fn singular_value_gauge(&self) -> ArrayView1<'_, f64> {
+        self.gauge_singular_values.view()
+    }
+
+    /// Grassmann manifold dimension `r·(p − r)` of this frame — the count of
+    /// profiled-out degrees of freedom that must enter the Laplace evidence
+    /// dimension accounting (issue #972, evidence honesty). A point on the
+    /// Grassmannian `Gr(r, p)` has exactly this many intrinsic coordinates.
+    pub fn manifold_dimension(&self) -> usize {
+        let r = self.rank();
+        let p = self.output_dim();
+        r * (p - r)
+    }
+
+    /// Build the canonical-gauge frame for a `p × r` orthonormal `U` paired with
+    /// its `gauge_singular_values`. Enforces the column-sign convention
+    /// (largest-magnitude entry per column non-negative) so the span serializes
+    /// deterministically. The caller guarantees `U` is already column-orthonormal
+    /// and its columns are ordered by descending singular value.
+    fn from_oriented(mut frame: Array2<f64>, gauge_singular_values: Array1<f64>) -> Self {
+        let (p, r) = frame.dim();
+        for col in 0..r {
+            // Sign-fix: make the largest-magnitude entry of each column
+            // non-negative so `U` and `−U` (same span) serialize identically.
+            let mut pivot_abs = 0.0_f64;
+            let mut pivot_val = 0.0_f64;
+            for row in 0..p {
+                let v = frame[[row, col]];
+                if v.abs() > pivot_abs {
+                    pivot_abs = v.abs();
+                    pivot_val = v;
+                }
+            }
+            if pivot_val < 0.0 {
+                for row in 0..p {
+                    frame[[row, col]] = -frame[[row, col]];
+                }
+            }
+        }
+        Self {
+            frame,
+            gauge_singular_values,
+        }
+    }
+
+    /// Closed-form streaming POLAR step (issue #972): given an accumulated
+    /// `p × r` cross-moment `Mcm` (a sum of decoder-target outer products that
+    /// pulls the frame toward the current column-span evidence), return the
+    /// orthogonal polar factor `U_new = polar(Mcm)`.
+    ///
+    /// `polar(M) = W Vᵀ` from the thin SVD `M = W Σ Vᵀ`: the nearest
+    /// column-orthonormal matrix to `M` in Frobenius norm, and the closed-form
+    /// MAP frame update on the Grassmannian. Runs OUTSIDE the border (an
+    /// `O(p r² )` thin SVD), so the border never carries the `p` factor.
+    /// `gauge_singular_values = Σ` records the canonical descending-σ ordering.
+    pub fn polar_update(cross_moment: ArrayView2<'_, f64>) -> Result<Self, String> {
+        let (p, r) = cross_moment.dim();
+        if p == 0 || r == 0 {
+            return Err("GrassmannFrame::polar_update: cross-moment must be non-empty".into());
+        }
+        if r > p {
+            return Err(format!(
+                "GrassmannFrame::polar_update: frame rank r={r} cannot exceed output dim p={p}"
+            ));
+        }
+        let owned = cross_moment.to_owned();
+        let (u_opt, sv, vt_opt) = owned
+            .svd(true, true)
+            .map_err(|e| format!("GrassmannFrame::polar_update: SVD failed: {e}"))?;
+        let w = u_opt.ok_or_else(|| {
+            "GrassmannFrame::polar_update: thin SVD returned no left factor".to_string()
+        })?;
+        let vt = vt_opt.ok_or_else(|| {
+            "GrassmannFrame::polar_update: thin SVD returned no right factor".to_string()
+        })?;
+        // `W` is `p × r`, `Vᵀ` is `r × r`. polar(M) = W·Vᵀ is `p × r`,
+        // column-orthonormal because both factors have orthonormal columns/rows.
+        let polar = fast_ab(&w, &vt);
+        Ok(Self::from_oriented(polar, sv))
+    }
+
+    /// Project a coordinate matrix `C_k` (`M_k × r`) back to the full decoder
+    /// `B_k = C_k · Uᵀ` (`M_k × p`) — the reconstruction used wherever the
+    /// full-`B` consumers (assembly, decode, smoothness pullback) read the
+    /// decoder. `fast_abt` computes `C_k · Uᵀ` without materializing `Uᵀ`.
+    pub fn reconstruct_decoder(&self, coords: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        if coords.ncols() != self.rank() {
+            return Err(format!(
+                "GrassmannFrame::reconstruct_decoder: coord cols {} must equal frame rank {}",
+                coords.ncols(),
+                self.rank()
+            ));
+        }
+        Ok(fast_abt(&coords.to_owned(), &self.frame))
+    }
+
+    /// Project a full decoder `B_k` (`M_k × p`) onto this frame, returning the
+    /// coordinate matrix `C_k = B_k · U` (`M_k × r`) that the border stores.
+    /// The frame is orthonormal so `U` is its own pseudo-inverse-from-the-right:
+    /// `C_k = B_k U` recovers the in-span coordinates exactly and discards the
+    /// component of `B_k` orthogonal to the frame (zero when `B_k`'s span lies in
+    /// `range(U)`, i.e. when the frame rank matched the decoder rank).
+    pub fn project_decoder(&self, decoder: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        if decoder.ncols() != self.output_dim() {
+            return Err(format!(
+                "GrassmannFrame::project_decoder: decoder cols {} must equal output dim {}",
+                decoder.ncols(),
+                self.output_dim()
+            ));
+        }
+        Ok(fast_ab(&decoder.to_owned(), &self.frame))
+    }
+
+    /// Largest principal angle (radians) between this frame's column span and
+    /// another `p × r'` orthonormal frame's span — the Grassmann geodesic
+    /// distance component used by the planted-atom recovery verifier (issue
+    /// #972). Computed from the singular values of `Uᵀ U_other` (`cos θ_i`).
+    pub fn max_principal_angle(&self, other: ArrayView2<'_, f64>) -> Result<f64, String> {
+        if other.nrows() != self.output_dim() {
+            return Err(format!(
+                "GrassmannFrame::max_principal_angle: other rows {} must equal output dim {}",
+                other.nrows(),
+                self.output_dim()
+            ));
+        }
+        let overlap = fast_atb(&self.frame, &other.to_owned());
+        let (_u, sv, _vt) = overlap
+            .svd(false, false)
+            .map_err(|e| format!("GrassmannFrame::max_principal_angle: SVD failed: {e}"))?;
+        // Smallest cosine ⇒ largest principal angle. Clamp for acos domain.
+        let min_cos = sv.iter().copied().fold(1.0_f64, f64::min).clamp(-1.0, 1.0);
+        Ok(min_cos.acos())
+    }
+}
+
+/// Streaming `p × r` cross-moment accumulator for the closed-form polar frame
+/// update (issue #972). Sums decoder-target outer products `Σ_i t_i c_iᵀ`
+/// (ambient target `t_i ∈ ℝ^p` against in-span coordinate `c_i ∈ ℝ^r`) so the
+/// frame can be re-polared from accumulated evidence WITHOUT re-touching the
+/// border. Accumulation is `O(p r)` per update and never forms a `p × p` matrix.
+#[derive(Debug, Clone)]
+pub struct GrassmannCrossMoment {
+    moment: Array2<f64>,
+}
+
+impl GrassmannCrossMoment {
+    /// Empty `p × r` accumulator.
+    pub fn new(output_dim: usize, rank: usize) -> Self {
+        Self {
+            moment: Array2::<f64>::zeros((output_dim, rank)),
+        }
+    }
+
+    /// Accumulate the full-batch cross-moment `Targetᵀ · Coords` where
+    /// `targets` is `(N × p)` ambient decoder targets and `coords` is `(N × r)`
+    /// in-span coordinates. `fast_atb` forms `Targetᵀ Coords` (`p × r`) directly.
+    pub fn accumulate(
+        &mut self,
+        targets: ArrayView2<'_, f64>,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        if targets.ncols() != self.moment.nrows() || coords.ncols() != self.moment.ncols() {
+            return Err(format!(
+                "GrassmannCrossMoment::accumulate: expected targets (·,{}) and coords (·,{}); \
+                 got (·,{}) and (·,{})",
+                self.moment.nrows(),
+                self.moment.ncols(),
+                targets.ncols(),
+                coords.ncols()
+            ));
+        }
+        if targets.nrows() != coords.nrows() {
+            return Err(format!(
+                "GrassmannCrossMoment::accumulate: targets rows {} must equal coords rows {}",
+                targets.nrows(),
+                coords.nrows()
+            ));
+        }
+        let block = fast_atb(&targets.to_owned(), &coords.to_owned());
+        self.moment += &block;
+        Ok(())
+    }
+
+    /// Read the accumulated `p × r` cross-moment.
+    pub fn moment(&self) -> ArrayView2<'_, f64> {
+        self.moment.view()
+    }
+
+    /// Re-polar the frame from the accumulated cross-moment (the streaming
+    /// closed-form step): `U_new = polar(Mcm)`.
+    pub fn polar_frame(&self) -> Result<GrassmannFrame, String> {
+        GrassmannFrame::polar_update(self.moment.view())
+    }
+}
+
 /// One manifold atom.
 ///
 /// `basis_values` is `Phi_k(t_{ik})`, shape `(N, M_k)`.
@@ -1772,6 +2028,19 @@ pub struct SaeManifoldAtom {
     /// the `H` cache on isometry penalties when the second jet is
     /// analytically available.
     pub basis_second_jet: Option<Arc<dyn SaeBasisSecondJet>>,
+    /// Profiled low-rank Grassmann decoder frame `U_k` (`p × r`), issue #972.
+    ///
+    /// `None` ⇒ the historical full-`B` path: the border carries the entire
+    /// `M_k · p` decoder block and is bit-for-bit unchanged. `Some(frame)` ⇒ the
+    /// decoder factors as `B_k = C_k · Uᵀ` with the `M_k · r` coordinate matrix
+    /// `C_k = B_k · U` in the border and the frame `U` profiled out by streaming
+    /// polar steps. [`Self::decoder_coefficients`] stays the authoritative
+    /// reconstructed `B_k` (so every existing consumer is unchanged); the frame
+    /// is the *representation* that shrinks the border and contributes the
+    /// `r·(p − r)` Grassmann dimensions to the Laplace evidence normalizer.
+    /// Activated automatically by [`Self::maybe_activate_decoder_frame`] when the
+    /// decoder's effective column rank is materially below `p`; never a flag.
+    pub decoder_frame: Option<GrassmannFrame>,
 }
 
 impl SaeManifoldAtom {
@@ -1827,6 +2096,7 @@ impl SaeManifoldAtom {
             basis_jacobian,
             basis_evaluator: None,
             basis_second_jet: None,
+            decoder_frame: None,
         };
         // Seed `smooth_penalty` with the intrinsic Gram at the initial
         // decoder/coordinates so the very first assembly already reads the
@@ -1896,6 +2166,201 @@ impl SaeManifoldAtom {
 
     pub fn output_dim(&self) -> usize {
         self.decoder_coefficients.ncols()
+    }
+
+    /// Effective profiled frame rank `r` of this atom's decoder block in the
+    /// arrow-Schur border (issue #972). `r == p` (full output dim) when no
+    /// Grassmann frame is active — the historical full-`B` border width. When a
+    /// frame is active the border holds only `M_k · r` coordinates.
+    pub fn border_frame_rank(&self) -> usize {
+        match &self.decoder_frame {
+            Some(frame) => frame.rank(),
+            None => self.output_dim(),
+        }
+    }
+
+    /// Per-atom arrow-Schur border coefficient count: `M_k · r` when a frame is
+    /// active (the factored width), else the full `M_k · p` (issue #972).
+    pub fn border_coeff_count(&self) -> usize {
+        self.basis_size() * self.border_frame_rank()
+    }
+
+    /// Grassmann manifold dimension `r·(p − r)` profiled OUT of the border for
+    /// this atom (issue #972). `0` when no frame is active. This is the number
+    /// of frame degrees of freedom that must enter the Laplace evidence
+    /// dimension accounting (evidence honesty).
+    pub fn frame_manifold_dimension(&self) -> usize {
+        match &self.decoder_frame {
+            Some(frame) => frame.manifold_dimension(),
+            None => 0,
+        }
+    }
+
+    /// Effective numerical column rank of the decoder `B_k` (`M_k × p`) from its
+    /// singular values, with the relative cutoff [`SAE_FRAME_RANK_CUTOFF`]. This
+    /// is the smallest frame rank `r` that captures `B_k`'s span up to that
+    /// energy floor; the auto-activation heuristic compares it against `p`.
+    pub fn decoder_numerical_rank(&self) -> Result<usize, String> {
+        let p = self.output_dim();
+        if p == 0 || self.basis_size() == 0 {
+            return Ok(0);
+        }
+        let (_u, sv, _vt) = self
+            .decoder_coefficients
+            .svd(false, false)
+            .map_err(|e| format!("SaeManifoldAtom::decoder_numerical_rank: SVD failed: {e}"))?;
+        let max_sv = sv.iter().copied().fold(0.0_f64, f64::max);
+        if !(max_sv > 0.0) {
+            // A zero decoder has rank 0 but still needs a rank-1 frame so the
+            // border carries a non-degenerate coordinate column.
+            return Ok(0);
+        }
+        let tol = SAE_FRAME_RANK_CUTOFF * max_sv;
+        Ok(sv.iter().filter(|&&v| v > tol).count())
+    }
+
+    /// Auto-derive whether the low-rank Grassmann factorization is beneficial for
+    /// this atom and, if so, activate it (issue #972) — magic-by-default, no
+    /// flag. The frame is installed (decoder factored as `B_k = C_k Uᵀ`) only
+    /// when the decoder's effective rank `r` shrinks the per-atom border
+    /// `M_k · p → M_k · r` by at least [`SAE_FRAME_ACTIVATION_MARGIN`] AND leaves
+    /// a positive Grassmann dimension (`p − r ≥ 1`). Otherwise the atom stays on
+    /// the bit-for-bit full-`B` path (`decoder_frame == None`).
+    ///
+    /// `B_k` is unchanged numerically: the installed frame spans exactly
+    /// `range(B_kᵀ)` (the column space of the decoder) up to the truncation
+    /// floor, so [`Self::reconstruct_decoder_coefficients`] recovers `B_k` to
+    /// machine precision when `r` equals the true rank. Returns the activated
+    /// frame rank, or `None` if the full-`B` path was kept.
+    pub fn maybe_activate_decoder_frame(&mut self) -> Result<Option<usize>, String> {
+        let p = self.output_dim();
+        if p == 0 || self.basis_size() == 0 {
+            return Ok(None);
+        }
+        let numerical_rank = self.decoder_numerical_rank()?;
+        // A degenerate all-zero decoder keeps a rank-1 frame so the coordinate
+        // column is non-empty; otherwise use the numerical rank.
+        let r = numerical_rank.max(1).min(p);
+        // Beneficial only if the frame materially shrinks the border AND there
+        // is a positive Grassmann dimension to profile out.
+        let shrink_ok = (r as f64) <= (p as f64) * (1.0 - SAE_FRAME_ACTIVATION_MARGIN);
+        if !shrink_ok || p.saturating_sub(r) == 0 {
+            self.decoder_frame = None;
+            return Ok(None);
+        }
+        // Build the canonical frame from the decoder's own column-span evidence:
+        // the cross-moment `B_kᵀ B_k`-induced left subspace is exactly the top-`r`
+        // right-singular subspace of `B_k`. We obtain it by polaring the rank-`r`
+        // truncation of the column cross-moment `B_kᵀ · (B_k · Vr)` — equivalently
+        // the top-`r` right singular vectors of `B_k`. Use the SVD of `B_k`
+        // directly: `B_k = W Σ Vᵀ` (W: M×?, Vᵀ: ?×p) ⇒ frame = top-`r` rows of `Vᵀ`
+        // transposed = top-`r` columns of `V` (`p × r`).
+        let (_w, sv, vt_opt) = self
+            .decoder_coefficients
+            .svd(false, true)
+            .map_err(|e| format!("SaeManifoldAtom::maybe_activate_decoder_frame: SVD failed: {e}"))?;
+        let vt = vt_opt.ok_or_else(|| {
+            "SaeManifoldAtom::maybe_activate_decoder_frame: SVD returned no right factor".to_string()
+        })?;
+        // `vt` is `min(M,p) × p`; take its top-`r` rows as the frame columns.
+        let available = vt.nrows();
+        let r_eff = r.min(available);
+        if r_eff == 0 || p.saturating_sub(r_eff) == 0 {
+            self.decoder_frame = None;
+            return Ok(None);
+        }
+        let mut frame = Array2::<f64>::zeros((p, r_eff));
+        for col in 0..r_eff {
+            for row in 0..p {
+                frame[[row, col]] = vt[[col, row]];
+            }
+        }
+        let mut gauge = Array1::<f64>::zeros(r_eff);
+        for i in 0..r_eff {
+            gauge[i] = sv.get(i).copied().unwrap_or(0.0);
+        }
+        self.decoder_frame = Some(GrassmannFrame::from_oriented(frame, gauge));
+        Ok(Some(r_eff))
+    }
+
+    /// Deactivate the Grassmann frame, returning this atom to the full-`B`
+    /// border path (issue #972). `decoder_coefficients` already holds the
+    /// reconstructed `B_k`, so no numerical change occurs.
+    pub fn deactivate_decoder_frame(&mut self) {
+        self.decoder_frame = None;
+    }
+
+    /// Coordinate matrix `C_k = B_k · U` (`M_k × r`) that the border stores when
+    /// a frame is active (issue #972). Returns `None` on the full-`B` path.
+    pub fn factored_coordinates(&self) -> Result<Option<Array2<f64>>, String> {
+        match &self.decoder_frame {
+            Some(frame) => Ok(Some(frame.project_decoder(self.decoder_coefficients.view())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Reconstruct the full decoder `B_k = C_k · Uᵀ` from a border coordinate
+    /// matrix `C_k` (`M_k × r`) and the active frame (issue #972). Used when the
+    /// border solver returns updated coordinates and the authoritative
+    /// `decoder_coefficients` must be refreshed for the full-`B` consumers.
+    pub fn reconstruct_decoder_coefficients(
+        &self,
+        coords: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let frame = self.decoder_frame.as_ref().ok_or_else(|| {
+            "SaeManifoldAtom::reconstruct_decoder_coefficients: no active frame".to_string()
+        })?;
+        frame.reconstruct_decoder(coords)
+    }
+
+    /// Install border coordinates `C_k` (`M_k × r`) returned by the factored
+    /// border solve, refreshing `decoder_coefficients = C_k · Uᵀ` so all
+    /// full-`B` consumers stay consistent with the profiled frame (issue #972).
+    pub fn set_factored_coordinates(&mut self, coords: ArrayView2<'_, f64>) -> Result<(), String> {
+        let reconstructed = self.reconstruct_decoder_coefficients(coords)?;
+        if reconstructed.dim() != self.decoder_coefficients.dim() {
+            return Err(format!(
+                "SaeManifoldAtom::set_factored_coordinates: reconstructed decoder {:?} \
+                 must match {:?}",
+                reconstructed.dim(),
+                self.decoder_coefficients.dim()
+            ));
+        }
+        self.decoder_coefficients = reconstructed;
+        Ok(())
+    }
+
+    /// Closed-form streaming polar refresh of the active frame from an
+    /// accumulated `p × r` cross-moment (issue #972): `U ← polar(Mcm)`, then
+    /// re-project the coordinates so `B_k` is unchanged in span. The frame
+    /// update happens OUTSIDE the border; the coordinate matrix is re-derived by
+    /// projection onto the new frame. No-op (error) when no frame is active.
+    pub fn refresh_frame_from_cross_moment(
+        &mut self,
+        cross_moment: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
+        if self.decoder_frame.is_none() {
+            return Err(
+                "SaeManifoldAtom::refresh_frame_from_cross_moment: no active frame".into(),
+            );
+        }
+        let new_frame = GrassmannFrame::polar_update(cross_moment)?;
+        if new_frame.output_dim() != self.output_dim() {
+            return Err(format!(
+                "SaeManifoldAtom::refresh_frame_from_cross_moment: frame output dim {} \
+                 must equal decoder output dim {}",
+                new_frame.output_dim(),
+                self.output_dim()
+            ));
+        }
+        // Re-express the current decoder in the new frame's coordinates, then
+        // reconstruct `B_k` so its in-span component is carried forward exactly
+        // and the out-of-span residual (orthogonal to the refreshed span) is
+        // dropped — the streaming-polar fixed point.
+        let coords = new_frame.project_decoder(self.decoder_coefficients.view())?;
+        self.decoder_coefficients = new_frame.reconstruct_decoder(coords.view())?;
+        self.decoder_frame = Some(new_frame);
+        Ok(())
     }
 
     /// `g_k(t_{ik}) = Phi_k(t_{ik}) B_k`.
@@ -3481,6 +3946,138 @@ impl SaeManifoldTerm {
     pub fn beta_dim(&self) -> usize {
         let p = self.output_dim();
         self.atoms.iter().map(|a| a.basis_size() * p).sum()
+    }
+
+    /// Factored arrow-Schur border dimension `Σ_k M_k · r_k` (issue #972): the
+    /// number of decoder coordinates the border actually carries once the
+    /// low-rank Grassmann frames are profiled out. Atoms with no active frame
+    /// contribute their full `M_k · p` (`r_k == p`), so on the all-full-`B` path
+    /// this equals [`Self::beta_dim`]. The border Cholesky / evidence log-det
+    /// scale with THIS count, not `beta_dim`.
+    pub fn factored_border_dim(&self) -> usize {
+        self.atoms.iter().map(|a| a.border_coeff_count()).sum()
+    }
+
+    /// Total profiled-out Grassmann manifold dimension `Σ_k r_k·(p − r_k)` across
+    /// all active frames (issue #972). This is the count of decoder-frame degrees
+    /// of freedom estimated OUTSIDE the border by closed-form polar steps, and it
+    /// must enter the Laplace evidence dimension accounting (evidence honesty):
+    /// the profiled frame is a MAP point on `∏_k Gr(r_k, p)`, contributing this
+    /// many free dimensions to the model. `0` when every atom is on the full-`B`
+    /// path. Threaded into [`Self::reml_occam_term`].
+    pub fn grassmann_evidence_dimension(&self) -> usize {
+        self.atoms.iter().map(|a| a.frame_manifold_dimension()).sum()
+    }
+
+    /// True iff any atom has an active low-rank Grassmann frame (issue #972).
+    pub fn frames_active(&self) -> bool {
+        self.atoms.iter().any(|a| a.decoder_frame.is_some())
+    }
+
+    /// Per-atom column offsets of the *factored* border (issue #972): the
+    /// running prefix sum of `M_k · r_k`. The analogue of [`Self::beta_offsets`]
+    /// for the reduced coordinate layout — atom `k`'s `C_k` occupies
+    /// `[factored_border_offsets()[k] .. + M_k·r_k)`. On the full-`B` path this
+    /// equals `beta_offsets`.
+    pub fn factored_border_offsets(&self) -> Vec<usize> {
+        let mut out = Vec::with_capacity(self.k_atoms());
+        let mut cursor = 0usize;
+        for atom in &self.atoms {
+            out.push(cursor);
+            cursor += atom.border_coeff_count();
+        }
+        out
+    }
+
+    /// Assemble the factored border coordinate vector `C = [vec(C_1); …; vec(C_K)]`
+    /// in row-major `C_k[m, j] → C[off_k + m·r_k + j]` layout (issue #972).
+    ///
+    /// This is the reduced state the arrow-Schur border carries when frames are
+    /// active: its length is [`Self::factored_border_dim`] (`Σ M_k·r_k`), the
+    /// border-size invariant verified by [`grassmann_assert_border_dim_invariant`].
+    /// Atoms
+    /// without an active frame contribute their full `vec(B_k)` (their `r_k == p`
+    /// coordinates are the decoder itself), so on the all-full-`B` path this
+    /// reproduces [`Self::flatten_beta`].
+    pub fn flatten_factored_border(&self) -> Result<Array1<f64>, String> {
+        let offsets = self.factored_border_offsets();
+        let mut out = Array1::<f64>::zeros(self.factored_border_dim());
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
+            let off = offsets[atom_idx];
+            let r = atom.border_frame_rank();
+            let m = atom.basis_size();
+            let coords = match atom.factored_coordinates()? {
+                Some(c) => c,
+                // Full-`B` path: the decoder itself is the coordinate matrix.
+                None => atom.decoder_coefficients.clone(),
+            };
+            for basis_col in 0..m {
+                for j in 0..r {
+                    out[off + basis_col * r + j] = coords[[basis_col, j]];
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Scatter a factored border coordinate vector `C` (length
+    /// [`Self::factored_border_dim`]) back into the per-atom decoders, refreshing
+    /// each `decoder_coefficients = C_k · U_kᵀ` so the full-`B` consumers stay
+    /// consistent after a factored border solve (issue #972). The inverse of
+    /// [`Self::flatten_factored_border`].
+    pub fn scatter_factored_border(&mut self, border: ArrayView1<'_, f64>) -> Result<(), String> {
+        let expected = self.factored_border_dim();
+        if border.len() != expected {
+            return Err(format!(
+                "SaeManifoldTerm::scatter_factored_border: border length {} must equal \
+                 factored border dim {expected}",
+                border.len()
+            ));
+        }
+        let offsets = self.factored_border_offsets();
+        for atom_idx in 0..self.atoms.len() {
+            let off = offsets[atom_idx];
+            let (r, m, has_frame) = {
+                let atom = &self.atoms[atom_idx];
+                (atom.border_frame_rank(), atom.basis_size(), atom.decoder_frame.is_some())
+            };
+            let mut coords = Array2::<f64>::zeros((m, r));
+            for basis_col in 0..m {
+                for j in 0..r {
+                    coords[[basis_col, j]] = border[off + basis_col * r + j];
+                }
+            }
+            if has_frame {
+                self.atoms[atom_idx].set_factored_coordinates(coords.view())?;
+            } else {
+                // Full-`B` path: the coordinates ARE the decoder.
+                self.atoms[atom_idx].decoder_coefficients = coords;
+            }
+        }
+        Ok(())
+    }
+
+    /// Auto-derive and install low-rank Grassmann decoder frames across all
+    /// atoms (issue #972) — magic-by-default, no flag. Each atom independently
+    /// activates its frame iff the factorization materially shrinks its border
+    /// (see [`SaeManifoldAtom::maybe_activate_decoder_frame`]). Returns the
+    /// number of atoms that activated a frame. Idempotent: re-running re-derives
+    /// each frame from the current decoder.
+    ///
+    /// The decision keys on the *frontier* regime the issue targets: at large
+    /// ambient `p` the full border `Σ M_k · p` reaches `10^7`–`10^8` and the
+    /// border Cholesky dies, while the decoder's effective column rank `r` stays
+    /// `≪ p`. Small-`p` atoms (where `r` cannot beat the activation margin)
+    /// keep the bit-for-bit full-`B` path, so the small-model evidence is
+    /// unchanged (verified by `factored_evidence_matches_full_b_at_small_p`).
+    pub fn auto_activate_decoder_frames(&mut self) -> Result<usize, String> {
+        let mut activated = 0usize;
+        for atom in &mut self.atoms {
+            if atom.maybe_activate_decoder_frame()?.is_some() {
+                activated += 1;
+            }
+        }
+        Ok(activated)
     }
 
     pub fn beta_offsets(&self) -> Vec<usize> {
@@ -5135,13 +5732,14 @@ impl SaeManifoldTerm {
                 .to_string()
         })?;
 
-        // 3. Smoothing-penalty Occam term: −½·p·(Σ_k rank S_k)·log λ_smooth.
-        let p_out = self.output_dim() as f64;
-        let mut smooth_rank_total = 0usize;
-        for atom in &self.atoms {
-            smooth_rank_total += Self::symmetric_rank(&atom.smooth_penalty)?;
-        }
-        let occam = 0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth;
+        // 3. Smoothing-penalty Occam term `−½·Σ_k r_k·rank(S_k)·log λ_smooth`
+        //    plus the profiled-frame evidence-dimension correction
+        //    `+½·Σ_k r_k·(p−r_k)·log λ_smooth` (issue #972). On the full-`B` path
+        //    (`r_k == p`, no frames) this is exactly the historical
+        //    `½·p·(Σ rank S_k)·log λ_smooth`, so the small-model criterion is
+        //    unchanged. The single seam is `reml_occam_term`, shared with the
+        //    streaming path so both rank the identical Laplace dimension count.
+        let occam = self.reml_occam_term(rho)?;
 
         // Decoder-block analytic-penalty energy (#671/#672). The inner solve
         // descended this energy (it enters `gb`/`hbb`) but it had no native
@@ -5326,13 +5924,39 @@ impl SaeManifoldTerm {
         }
     }
 
+    /// Smoothing-penalty Occam normalizer `−½ Σ_k r_k·rank(S_k)·log λ_smooth`
+    /// PLUS the profiled-frame evidence-dimension term `½ Σ_k r_k·(p−r_k)·log
+    /// λ_smooth` (issue #972).
+    ///
+    /// On the full-`B` path every atom's frame rank `r_k == p`, so the first
+    /// piece reduces to the historical `½ p·(Σ rank S_k)·log λ_smooth` and the
+    /// Grassmann term is zero — bit-for-bit unchanged. When a frame is active the
+    /// decoder coordinates `C_k` carry the `⊗ I_{r_k}` Kronecker structure (the
+    /// smoothing penalty `S_k` now acts on `r_k` channels, not `p`), so the
+    /// penalty-logdet normalizer uses `r_k·rank(S_k)`; and the `r_k·(p−r_k)`
+    /// frame degrees of freedom profiled OUT of the border are counted explicitly
+    /// in the Laplace dimension accounting (evidence honesty) so the criterion
+    /// cannot buy a free evidence boost by hiding decoder freedom in the frame.
     fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
-        let p_out = self.output_dim() as f64;
-        let mut smooth_rank_total = 0usize;
+        let mut penalized_channel_dim = 0usize;
         for atom in &self.atoms {
-            smooth_rank_total += Self::symmetric_rank(&atom.smooth_penalty)?;
+            let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
+            // Penalized decoder dimension: `r_k` coordinate channels carry the
+            // `S_k` roughness penalty (full-`B` path ⇒ `r_k == p`).
+            penalized_channel_dim += atom.border_frame_rank() * rank_s;
         }
-        Ok(0.5 * p_out * (smooth_rank_total as f64) * rho.log_lambda_smooth)
+        // Profiled Grassmann dimensions enter the Laplace evidence dimension
+        // count with the OPPOSITE sign of the penalty Occam term (they are
+        // free, unpenalized-by-`S` profiled directions), so `−occam` adds
+        // `+½ Σ r(p−r) log λ` to the criterion `V` — the honesty correction.
+        let grassmann_dim = self.grassmann_evidence_dimension();
+        let occam_penalty = 0.5 * (penalized_channel_dim as f64) * rho.log_lambda_smooth;
+        let frame_dim_term = 0.5 * (grassmann_dim as f64) * rho.log_lambda_smooth;
+        // `V = … − occam`, so we want the net occam to SUBTRACT the penalty
+        // normalizer and ADD the frame-dimension count. Returning
+        // `occam_penalty − frame_dim_term` achieves that after the caller's
+        // `− occam`.
+        Ok(occam_penalty - frame_dim_term)
     }
 
     pub fn reml_criterion_streaming_exact(
@@ -9667,6 +10291,56 @@ pub fn refresh_isometry_caches_from_term(
         }
     }
     Ok(refreshed_with_second)
+}
+
+/// Verification helper (issue #972): recover the planted low-rank column span of
+/// an atom by polaring the decoder-target cross-moment and report the largest
+/// principal angle (radians) between the recovered frame and a planted
+/// orthonormal frame `planted` (`p × r`).
+///
+/// `targets` (`N × p`) are the ambient decoder targets and `coords` (`N × r`)
+/// the latent coordinates that generated them (`targets ≈ coords · plantedᵀ`).
+/// The closed-form polar of `Σ targetsᵀ coords` recovers `range(planted)`; a
+/// successful low-rank fit drives the returned angle to `0`. Used by the
+/// `planted_low_rank_frame_recovered_by_polar` test, and available to callers
+/// that want a runtime span-recovery diagnostic.
+pub fn grassmann_recover_planted_span_angle(
+    targets: ArrayView2<'_, f64>,
+    coords: ArrayView2<'_, f64>,
+    planted: ArrayView2<'_, f64>,
+) -> Result<f64, String> {
+    let p = targets.ncols();
+    let r = coords.ncols();
+    if planted.dim() != (p, r) {
+        return Err(format!(
+            "grassmann_recover_planted_span_angle: planted frame must be ({p}, {r}); got {:?}",
+            planted.dim()
+        ));
+    }
+    let mut cross = GrassmannCrossMoment::new(p, r);
+    cross.accumulate(targets, coords)?;
+    let frame = cross.polar_frame()?;
+    frame.max_principal_angle(planted)
+}
+
+/// Verification helper (issue #972): the factored arrow-Schur border dimension
+/// equals `Σ_k M_k · r_k` exactly. Returns `Ok(())` iff the invariant holds for
+/// `term`, else an explanatory error. Compiled-in so the border-size contract is
+/// checkable at runtime, not only in tests.
+pub fn grassmann_assert_border_dim_invariant(term: &SaeManifoldTerm) -> Result<(), String> {
+    let expected: usize = term
+        .atoms
+        .iter()
+        .map(|a| a.basis_size() * a.border_frame_rank())
+        .sum();
+    let got = term.factored_border_dim();
+    if got != expected {
+        return Err(format!(
+            "grassmann border-dim invariant violated: factored_border_dim() = {got}, \
+             expected Σ M_k·r_k = {expected}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -14133,6 +14807,260 @@ mod tests {
             err.contains("centered Z is non-finite") || err.contains("SVD failed"),
             "unexpected PCA seed error: {err}"
         );
+    }
+
+    // ---- Issue #972: low-rank Grassmann decoder frame verification ----
+
+    /// `polar(M) = W Vᵀ` is exactly column-orthonormal and equals `M` when `M`
+    /// is already orthonormal (idempotence of the polar projection on the
+    /// Stiefel manifold), and recovers the planted span of a low-rank decoder.
+    #[test]
+    fn planted_low_rank_frame_recovered_by_polar() {
+        let p = 12usize;
+        let r = 3usize;
+        let n = 200usize;
+        // Planted orthonormal frame: first `r` canonical axes (any rotation
+        // would do; canonical axes make the angle assertion transparent).
+        let mut planted = Array2::<f64>::zeros((p, r));
+        for j in 0..r {
+            planted[[j, j]] = 1.0;
+        }
+        // Latent coords drive targets onto the planted span: targets = coords·plantedᵀ.
+        let mut coords = Array2::<f64>::zeros((n, r));
+        for i in 0..n {
+            for j in 0..r {
+                // Deterministic, index-keyed pseudo-data (no clock RNG).
+                let x = ((i * 7 + j * 13 + 1) % 97) as f64 / 97.0 - 0.5;
+                coords[[i, j]] = x;
+            }
+        }
+        let targets = fast_abt(&coords, &planted);
+        let angle =
+            grassmann_recover_planted_span_angle(targets.view(), coords.view(), planted.view())
+                .expect("span recovery");
+        assert_abs_diff_eq!(angle, 0.0, epsilon = 1.0e-9);
+
+        // Polar of an already-orthonormal frame is itself (up to canonical sign).
+        let frame = GrassmannFrame::polar_update(planted.view()).expect("polar");
+        let recovered_angle = frame
+            .max_principal_angle(planted.view())
+            .expect("principal angle");
+        assert_abs_diff_eq!(recovered_angle, 0.0, epsilon = 1.0e-9);
+        // Orthonormality: UᵀU = I_r.
+        let gram = fast_atb(&frame.frame().to_owned(), &frame.frame().to_owned());
+        for i in 0..r {
+            for j in 0..r {
+                let expect = if i == j { 1.0 } else { 0.0 };
+                assert_abs_diff_eq!(gram[[i, j]], expect, epsilon = 1.0e-9);
+            }
+        }
+    }
+
+    /// Build a low-rank decoder atom (`p` large, true column rank `r ≪ p`) and
+    /// verify the auto-activation installs a frame, the factored border holds
+    /// exactly `Σ M_k·r_k`, and reconstruction recovers `B_k` to machine
+    /// precision.
+    #[test]
+    fn factored_border_dim_invariant_and_reconstruction() {
+        let m = 6usize;
+        let p = 16usize;
+        let r = 2usize;
+        // B = C0 · Frameᵀ with a planted rank-`r` column span.
+        let mut frame = Array2::<f64>::zeros((p, r));
+        frame[[0, 0]] = 1.0;
+        frame[[1, 1]] = 1.0;
+        let mut c0 = Array2::<f64>::zeros((m, r));
+        for mu in 0..m {
+            c0[[mu, 0]] = 1.0 + mu as f64;
+            c0[[mu, 1]] = 0.5 * mu as f64 - 1.0;
+        }
+        let decoder = fast_abt(&c0, &frame);
+        let mut phi = Array2::<f64>::zeros((m, m));
+        let mut jet = Array3::<f64>::zeros((m, m, 1));
+        for mu in 0..m {
+            phi[[mu, mu]] = 1.0;
+            jet[[mu, mu, 0]] = 1.0;
+        }
+        let s_raw = crate::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
+        let mut atom = SaeManifoldAtom::new(
+            "lowrank",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder.clone(),
+            s_raw,
+        )
+        .unwrap();
+        let activated = atom.maybe_activate_decoder_frame().expect("activate");
+        assert_eq!(activated, Some(r), "rank-{r} decoder should profile to r={r}");
+        assert_eq!(atom.border_frame_rank(), r);
+        assert_eq!(atom.frame_manifold_dimension(), r * (p - r));
+
+        // Reconstruction recovers B_k to machine precision.
+        let coords = atom.factored_coordinates().unwrap().expect("coords");
+        assert_eq!(coords.dim(), (m, r));
+        let reconstructed = atom.reconstruct_decoder_coefficients(coords.view()).unwrap();
+        for mu in 0..m {
+            for j in 0..p {
+                assert_abs_diff_eq!(
+                    reconstructed[[mu, j]],
+                    decoder[[mu, j]],
+                    epsilon = 1.0e-9
+                );
+            }
+        }
+
+        let term = SaeManifoldTerm::new(
+            vec![atom],
+            SaeAssignment::from_blocks_with_mode(
+                Array2::<f64>::zeros((m, 1)),
+                vec![Array2::<f64>::zeros((m, 1))],
+                AssignmentMode::softmax(0.7),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Border-size invariant: factored border == Σ M_k·r_k.
+        grassmann_assert_border_dim_invariant(&term).expect("border invariant");
+        assert_eq!(term.factored_border_dim(), m * r);
+        assert_eq!(term.grassmann_evidence_dimension(), r * (p - r));
+        // Round-trip flatten/scatter of the factored border preserves B_k.
+        let mut term = term;
+        let border = term.flatten_factored_border().unwrap();
+        assert_eq!(border.len(), m * r);
+        let saved = term.atoms[0].decoder_coefficients.clone();
+        term.scatter_factored_border(border.view()).unwrap();
+        for mu in 0..m {
+            for j in 0..p {
+                assert_abs_diff_eq!(
+                    term.atoms[0].decoder_coefficients[[mu, j]],
+                    saved[[mu, j]],
+                    epsilon = 1.0e-9
+                );
+            }
+        }
+    }
+
+    /// A full-rank small-`p` decoder must NOT activate a frame: the factored
+    /// border equals the full `M_k·p`, the Grassmann evidence dimension is `0`,
+    /// and the Occam normalizer is bit-for-bit the historical
+    /// `½·p·rank(S)·log λ` — the small-`p` evidence-equality contract.
+    #[test]
+    fn factored_evidence_matches_full_b_at_small_p() {
+        let m = 5usize;
+        let p = 2usize;
+        // Full-rank decoder (rank 2 == p): no border saving, frame must stay off.
+        let mut decoder = Array2::<f64>::zeros((m, p));
+        for mu in 0..m {
+            decoder[[mu, 0]] = 1.0 + mu as f64;
+            decoder[[mu, 1]] = (mu as f64) - 2.0;
+        }
+        let mut phi = Array2::<f64>::zeros((m, m));
+        let mut jet = Array3::<f64>::zeros((m, m, 1));
+        for mu in 0..m {
+            phi[[mu, mu]] = 1.0;
+            jet[[mu, mu, 0]] = 1.0;
+        }
+        let s_raw = crate::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
+        let mut atom = SaeManifoldAtom::new(
+            "fullrank",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            s_raw,
+        )
+        .unwrap();
+        let activated = atom.maybe_activate_decoder_frame().expect("activate");
+        assert_eq!(activated, None, "full-rank small-p must stay on full-B path");
+        assert!(atom.decoder_frame.is_none());
+        assert_eq!(atom.border_frame_rank(), p);
+        assert_eq!(atom.frame_manifold_dimension(), 0);
+
+        let mut term = SaeManifoldTerm::new(
+            vec![atom],
+            SaeAssignment::from_blocks_with_mode(
+                Array2::<f64>::zeros((m, 1)),
+                vec![Array2::<f64>::zeros((m, 1))],
+                AssignmentMode::softmax(0.7),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!term.frames_active());
+        assert_eq!(term.factored_border_dim(), term.beta_dim());
+        assert_eq!(term.grassmann_evidence_dimension(), 0);
+        let activated_n = term.auto_activate_decoder_frames().expect("auto");
+        assert_eq!(activated_n, 0, "small-p auto-activation must be a no-op");
+
+        // Occam normalizer equals the historical ½·p·rank(S)·log λ exactly.
+        let rho = SaeManifoldRho::new(0.0, 0.37, vec![array![0.0_f64]]);
+        let occam = term.reml_occam_term(&rho).expect("occam");
+        let rank_s = SaeManifoldTerm::symmetric_rank(&term.atoms[0].smooth_penalty).unwrap();
+        let expected = 0.5 * (p as f64) * (rank_s as f64) * rho.log_lambda_smooth;
+        assert_abs_diff_eq!(occam, expected, epsilon = 1.0e-12);
+    }
+
+    /// Streaming polar refresh from an accumulated cross-moment re-orients the
+    /// frame toward the cross-moment span and keeps `B_k`'s in-span component
+    /// while staying column-orthonormal (the closed-form streaming step).
+    #[test]
+    fn streaming_polar_refresh_reorients_frame() {
+        let m = 4usize;
+        let p = 8usize;
+        let r = 2usize;
+        let mut frame0 = Array2::<f64>::zeros((p, r));
+        frame0[[0, 0]] = 1.0;
+        frame0[[1, 1]] = 1.0;
+        let mut c0 = Array2::<f64>::zeros((m, r));
+        for mu in 0..m {
+            c0[[mu, 0]] = 1.0 + mu as f64;
+            c0[[mu, 1]] = 0.5 - mu as f64;
+        }
+        let decoder = fast_abt(&c0, &frame0);
+        let mut phi = Array2::<f64>::zeros((m, m));
+        let mut jet = Array3::<f64>::zeros((m, m, 1));
+        for mu in 0..m {
+            phi[[mu, mu]] = 1.0;
+            jet[[mu, mu, 0]] = 1.0;
+        }
+        let s_raw = crate::basis::create_difference_penalty_matrix(m, 2, None).unwrap();
+        let mut atom = SaeManifoldAtom::new(
+            "stream",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi,
+            jet,
+            decoder,
+            s_raw,
+        )
+        .unwrap();
+        atom.maybe_activate_decoder_frame().expect("activate");
+        // New cross-moment pointing at axes {2,3}: refreshed frame must span them.
+        let mut cross = Array2::<f64>::zeros((p, r));
+        cross[[2, 0]] = 3.0;
+        cross[[3, 1]] = 2.0;
+        atom.refresh_frame_from_cross_moment(cross.view())
+            .expect("refresh");
+        let frame = atom.decoder_frame.as_ref().expect("frame");
+        // Frame stays orthonormal.
+        let gram = fast_atb(&frame.frame().to_owned(), &frame.frame().to_owned());
+        for i in 0..r {
+            for j in 0..r {
+                let expect = if i == j { 1.0 } else { 0.0 };
+                assert_abs_diff_eq!(gram[[i, j]], expect, epsilon = 1.0e-9);
+            }
+        }
+        // Refreshed span aligns with the cross-moment axes {2,3} (angle ~0).
+        let mut target_span = Array2::<f64>::zeros((p, r));
+        target_span[[2, 0]] = 1.0;
+        target_span[[3, 1]] = 1.0;
+        let angle = frame
+            .max_principal_angle(target_span.view())
+            .expect("angle");
+        assert_abs_diff_eq!(angle, 0.0, epsilon = 1.0e-9);
     }
 }
 
