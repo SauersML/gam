@@ -134,7 +134,11 @@ impl RowMeasure {
 
     /// Construct from raw per-row masses, normalizing to a proper measure.
     /// Falls back to uniform if the masses carry no usable signal.
-    fn from_masses(metric_provenance: MetricProvenance, masses: Vec<f64>) -> Self {
+    ///
+    /// Crate-visible so the two-tier harvest ([`crate::inference::harvest`])
+    /// can lift designed-subsample Fisher masses to a full-corpus measure
+    /// through the same validation/normalization path.
+    pub(crate) fn from_masses(metric_provenance: MetricProvenance, masses: Vec<f64>) -> Self {
         let n = masses.len();
         if n == 0 {
             return Self::uniform(0);
@@ -263,7 +267,182 @@ impl RowMeasure {
         let c = count as f64;
         self.weights.iter().map(|&w| c * w).collect()
     }
+
+    /// Draw a **designed subsample** with honest inclusion weights — the
+    /// frontier estimator of #987 (mechanizing the #973 subsample-honesty
+    /// contract for measure-driven designs).
+    ///
+    /// This is a different animal from [`Self::enrichment_order`], and the
+    /// distinction is load-bearing:
+    ///
+    /// * **Enrichment** orders rows for *discovery/seeding attention*; each
+    ///   visited row keeps its ordinary, unweighted per-row objective. The
+    ///   measure never touches the loss.
+    /// * A **designed subsample** *replaces the full corpus* as what the fit
+    ///   sums over. That is only sound if every selected row's loss term is
+    ///   multiplied by `1 / π_i` (its inclusion probability), so that the
+    ///   subsampled criterion is **unbiased** for the full-corpus criterion:
+    ///   `E[Σ_{i ∈ S} ℓ_i / π_i] = Σ_i ℓ_i`. The returned
+    ///   [`DesignedRowSample`] carries exactly those weights; the caller folds
+    ///   them into the likelihood as row weights. These are sampling-design
+    ///   corrections — they are *not* a Fisher reweighting of residuals (the
+    ///   #980 failure mode), and under the uniform measure they degrade to the
+    ///   constant `n / budget`, the plain Horvitz–Thompson scale-up.
+    ///
+    /// Design: inclusion probabilities are water-filled as
+    /// `π_i = min(1, τ · w'_i)` with `τ` solved so `Σ π_i = budget`, where
+    /// `w'` is the measure defensively mixed with
+    /// [`DESIGNED_SAMPLE_UNIFORM_MIX`] of uniform — the standard
+    /// defensive-mixture guard that keeps every row's `π_i > 0` (no row's loss
+    /// is unreachable, so the estimator stays unbiased) and bounds the largest
+    /// weight. Selection is Madow systematic sampling against the cumulative
+    /// `π` with a single deterministic `splitmix64`-derived offset — no clock
+    /// randomness; the same `(measure, budget, seed)` always yields the same
+    /// sample. Rows are returned in ascending order (stream-friendly).
+    ///
+    /// `budget ≥ n` returns every row with weight `1.0` — the exact full pass,
+    /// bit-for-bit today's behavior, so a driver can call this unconditionally
+    /// and let the budget decide.
+    pub fn designed_subsample(&self, budget: usize, seed: u64) -> DesignedRowSample {
+        let n = self.weights.len();
+        if n == 0 || budget == 0 {
+            return DesignedRowSample {
+                provenance: self.provenance,
+                rows: Vec::new(),
+                likelihood_weights: Vec::new(),
+                expected_size: 0.0,
+            };
+        }
+        if budget >= n {
+            return DesignedRowSample {
+                provenance: self.provenance,
+                rows: (0..n).collect(),
+                likelihood_weights: vec![1.0; n],
+                expected_size: n as f64,
+            };
+        }
+
+        // Defensive mixture: w' = (1 − ε)·w + ε/n. Keeps every π_i > 0.
+        let eps = DESIGNED_SAMPLE_UNIFORM_MIX;
+        let unif = 1.0 / n as f64;
+        let mixed: Vec<f64> = self
+            .weights
+            .iter()
+            .map(|&w| (1.0 - eps) * w + eps * unif)
+            .collect();
+
+        // Water-fill τ so that Σ min(1, τ·w'_i) = budget. Sort descending and
+        // peel off the capped prefix; deterministic (index tie-break).
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| {
+            mixed[b]
+                .partial_cmp(&mixed[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        let total: f64 = mixed.iter().sum();
+        let mut capped = 0usize;
+        let mut tail_mass = total;
+        let mut tau = budget as f64 / tail_mass;
+        while capped < n {
+            let next = mixed[order[capped]];
+            if tau * next <= 1.0 {
+                break;
+            }
+            // Cap this row at π = 1 and re-solve τ over the remainder.
+            capped += 1;
+            tail_mass -= next;
+            let remaining_budget = budget as f64 - capped as f64;
+            if remaining_budget <= 0.0 || tail_mass <= 0.0 {
+                break;
+            }
+            tau = remaining_budget / tail_mass;
+        }
+        let mut pi = vec![0.0_f64; n];
+        for (rank, &i) in order.iter().enumerate() {
+            pi[i] = if rank < capped {
+                1.0
+            } else {
+                (tau * mixed[i]).min(1.0)
+            };
+        }
+
+        // Madow systematic selection in row order: row i is selected iff an
+        // integer pointer k + u falls inside its cumulative-π interval.
+        // Deterministic offset u ∈ [0, 1) from the seed.
+        let u = {
+            let bits = splitmix64_hash(seed ^ DESIGNED_SAMPLE_SALT);
+            let mantissa = (bits >> 11) as f64;
+            mantissa / ((1_u64 << 53) as f64)
+        };
+        let mut rows = Vec::with_capacity(budget + 1);
+        let mut likelihood_weights = Vec::with_capacity(budget + 1);
+        let mut acc = 0.0_f64;
+        for (i, &p) in pi.iter().enumerate() {
+            let before = acc;
+            acc += p;
+            // Selected iff ⌊acc − u⌋ > ⌊before − u⌋ (a pointer crossed).
+            if (acc - u).floor() > (before - u).floor() {
+                rows.push(i);
+                likelihood_weights.push(1.0 / p);
+            }
+        }
+        DesignedRowSample {
+            provenance: self.provenance,
+            rows,
+            likelihood_weights,
+            expected_size: pi.iter().sum(),
+        }
+    }
 }
+
+/// A designed importance subsample with honest Horvitz–Thompson likelihood
+/// weights — what a frontier fit sums over instead of the full corpus
+/// (#987 / #973). Produced by [`RowMeasure::designed_subsample`].
+#[derive(Clone, Debug)]
+pub struct DesignedRowSample {
+    /// Provenance of the measure that shaped the design (uniform fallback or
+    /// Fisher mass), echoed for consumer certification.
+    pub provenance: MeasureProvenance,
+    /// Selected row indices, ascending.
+    pub rows: Vec<usize>,
+    /// Per-selected-row likelihood weight `1 / π_i`, aligned with `rows`.
+    /// Multiplying row `i`'s loss term by this makes the subsampled criterion
+    /// unbiased for the full-corpus criterion.
+    pub likelihood_weights: Vec<f64>,
+    /// `Σ π_i` — the design's expected sample size (≈ the requested budget;
+    /// Madow selection realizes `⌊·⌋` or `⌈·⌉` of it).
+    pub expected_size: f64,
+}
+
+impl DesignedRowSample {
+    /// Number of rows actually selected.
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// `Σ 1/π_i` over the selected rows — the Horvitz–Thompson estimate of the
+    /// corpus row count. A consumer can sanity-gate the design by checking
+    /// this lands near `n` (it is exactly `n` in expectation).
+    pub fn estimated_corpus_rows(&self) -> f64 {
+        self.likelihood_weights.iter().sum()
+    }
+}
+
+/// Defensive uniform mixture fraction for [`RowMeasure::designed_subsample`]:
+/// the design samples from `(1 − ε)·measure + ε·uniform`. Guarantees every
+/// row's inclusion probability is positive (unbiasedness needs `π_i > 0`
+/// wherever `ℓ_i ≠ 0`) and caps the worst-case `1/π` weight at
+/// `n / (ε · budget)`. The standard defensive-importance-sampling guard.
+const DESIGNED_SAMPLE_UNIFORM_MIX: f64 = 0.1;
+
+/// Salt for the designed-sample systematic offset, distinct from
+/// [`ENRICHMENT_SALT`] so the two draws never share a stream for one seed.
+const DESIGNED_SAMPLE_SALT: u64 = 0x73AD_0987_5EED_D51F;
 
 /// Salt mixed into the enrichment seed so the offset hash is distinct from any
 /// other `splitmix64_hash` use of the same numeric seed elsewhere in the crate.
@@ -275,7 +454,7 @@ const ENRICHMENT_SALT: u64 = 0x980E_1C45_F00D_AC70;
 /// blocks, so the solver `δ` never enters the measure — consistent with the
 /// `RowMetric` #747 discipline, and irrelevant anyway because the measure feeds
 /// no criterion. Pure read; touches nothing.
-fn per_row_fisher_mass(metric: &RowMetric) -> Vec<f64> {
+pub(crate) fn per_row_fisher_mass(metric: &RowMetric) -> Vec<f64> {
     let blocks = metric.blocks();
     let n = metric.n_rows();
     let p = metric.p_out();
@@ -389,5 +568,104 @@ mod tests {
         // masses 1, 9 ⇒ weights 0.1, 0.9 ⇒ reps 1.0, 9.0.
         assert!((rep[0] - 1.0).abs() < 1e-12);
         assert!((rep[1] - 9.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn designed_subsample_is_deterministic_and_honest() {
+        // 200 rows, one loud block. The design must (a) be reproducible for a
+        // fixed seed, (b) carry weights 1/π whose HT total estimates n, and
+        // (c) hit roughly the requested budget.
+        let n = 200usize;
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![if i % 10 == 0 { 3.0 } else { 1.0 }])
+            .collect();
+        let u = factors_from_rows(&rows, 1, 1);
+        let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
+        let measure = RowMeasure::from_metric(&metric);
+
+        let budget = 40usize;
+        let a = measure.designed_subsample(budget, 17);
+        let b = measure.designed_subsample(budget, 17);
+        assert_eq!(a.rows, b.rows, "same seed must give the identical design");
+        assert_eq!(a.likelihood_weights, b.likelihood_weights);
+
+        // Madow realizes ⌊Σπ⌋ or ⌈Σπ⌉ rows; Σπ is the budget by construction.
+        assert!((a.expected_size - budget as f64).abs() < 1e-9);
+        assert!(a.len() == budget || a.len() == budget + 1 || a.len() + 1 == budget);
+
+        // Horvitz–Thompson corpus-size identity: Σ 1/π over a systematic
+        // sample concentrates near n (exact in expectation; systematic
+        // sampling keeps it within a small relative band here).
+        let est = a.estimated_corpus_rows();
+        assert!(
+            (est - n as f64).abs() < 0.25 * n as f64,
+            "HT corpus estimate {est} too far from n = {n}"
+        );
+
+        // Rows ascend and weights are finite and ≥ 1 (π ≤ 1).
+        assert!(a.rows.windows(2).all(|w| w[0] < w[1]));
+        assert!(
+            a.likelihood_weights
+                .iter()
+                .all(|&w| w.is_finite() && w >= 1.0 - 1e-12)
+        );
+    }
+
+    #[test]
+    fn designed_subsample_full_budget_is_the_exact_pass() {
+        let measure = RowMeasure::uniform(7);
+        let s = measure.designed_subsample(7, 3);
+        assert_eq!(s.rows, (0..7).collect::<Vec<_>>());
+        assert!(s.likelihood_weights.iter().all(|&w| w == 1.0));
+        let s = measure.designed_subsample(100, 3);
+        assert_eq!(s.rows.len(), 7);
+    }
+
+    #[test]
+    fn designed_subsample_uniform_measure_gives_flat_weights() {
+        // Under the uniform fallback every π is budget/n, so every selected
+        // row carries the same n/budget weight — plain HT scale-up.
+        let n = 120usize;
+        let budget = 30usize;
+        let measure = RowMeasure::uniform(n);
+        let s = measure.designed_subsample(budget, 5);
+        assert_eq!(s.provenance, MeasureProvenance::Uniform);
+        let expect = n as f64 / budget as f64;
+        for &w in &s.likelihood_weights {
+            assert!(
+                (w - expect).abs() < 1e-9,
+                "uniform design weight {w} != {expect}"
+            );
+        }
+        assert_eq!(s.len(), budget);
+    }
+
+    #[test]
+    fn designed_subsample_oversamples_loud_rows_with_downweighted_loss() {
+        // A loud row should be (nearly) always included — but with a SMALLER
+        // likelihood weight (its π is larger), so inclusion does not bias the
+        // criterion toward loud rows.
+        let rows: Vec<Vec<f64>> = (0..50)
+            .map(|i| vec![if i == 7 { 30.0 } else { 1.0 }])
+            .collect();
+        let u = factors_from_rows(&rows, 1, 1);
+        let metric = RowMetric::output_fisher(u, 1, 1).expect("of");
+        let measure = RowMeasure::from_metric(&metric);
+        let s = measure.designed_subsample(10, 99);
+        let pos = s.rows.iter().position(|&r| r == 7);
+        assert!(pos.is_some(), "the dominant-mass row must be in the design");
+        let w7 = s.likelihood_weights[pos.unwrap()];
+        let w_other = s
+            .likelihood_weights
+            .iter()
+            .enumerate()
+            .filter(|&(k, _)| s.rows[k] != 7)
+            .map(|(_, &w)| w)
+            .next()
+            .expect("some quiet row selected");
+        assert!(
+            w7 < w_other,
+            "loud row weight {w7} must be below quiet row weight {w_other}"
+        );
     }
 }
