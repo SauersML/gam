@@ -46,8 +46,11 @@
 //! it re-enters a heavier regime (raises `s` back toward 1 by a back-off
 //! fraction) and re-descends with a finer step. This is a *floor* the iterate
 //! bounces off, never a trapdoor it falls through. The structural guarantee is
-//! encoded in the API: every hook on the path either succeeds-by-descending or
-//! reports a [`PathRegime`] it re-entered — nothing surfaces "give up".
+//! encoded in the type: [`ContinuationStep`] — the per-step outcome enum — has
+//! **no `Reject` / `Failed` / `NoUsableSeed` arm**. The worst a step can report
+//! is [`ContinuationStep::Reentered`] (bounced off the floor, re-descending),
+//! which is progress toward, not abandonment of, the fit. There is no value of
+//! the outcome type that means "give up".
 //!
 //! # How this absorbs #969 (warm-invariance) and #976 (hardening)
 //!
@@ -76,6 +79,10 @@
 
 use ndarray::{Array1, ArrayView2};
 
+use crate::solver::estimate::reml::continuation::{
+    ContinuationFailure, ContinuationState, fit_with_continuation,
+};
+use crate::solver::outer_strategy::{OuterEvalOrder, OuterObjective};
 use crate::terms::analytic_penalties::ScalarWeightSchedule;
 use crate::terms::sae_manifold::{GumbelTemperatureSchedule, ScheduleKind};
 
@@ -380,7 +387,7 @@ impl ReseedLedger {
 //  asked for the demotion. A demotion is exactly a re-entry into a heavier
 //  regime (it routes onto the same `reenter_heavier` mechanism as a spine
 //  struggle or a mass-floor breach); there is NO rejection / disqualification
-//  arm.
+//  arm, mirroring `ContinuationStep`.
 // ─────────────────────────────────────────────────────────────────────────
 
 /// The coarse "which heavy-smoothing regime is the path currently entering at"
@@ -436,6 +443,62 @@ pub enum PathDemotionReason {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+//  The per-step outcome enum. Note: NO Reject / Failed / NoUsableSeed arm.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Outcome of one [`ContinuationPath`] waypoint step. The defining structural
+/// property: **there is no rejection arm.** A step either descends, arrives, or
+/// bounces off the homotopy floor back into a heavier regime. None of these
+/// means "give up"; the tail is a floor, not a gate. The absence of a `Reject`
+/// variant is the whole point — the type cannot represent "no usable seed".
+#[derive(Debug, Clone)]
+pub(crate) enum ContinuationStep {
+    /// `s` was lowered toward `0` and the inner solve at the new waypoint
+    /// succeeded. Carries the accepted spine state and the new `s`.
+    Descended {
+        s: f64,
+        state: ContinuationState,
+    },
+    /// `s` reached `0`: the path arrived at the real objective (ρ\*, τ_min,
+    /// tight isometry). Terminal-but-successful; the criterion is the real
+    /// objective's, identical for cold and warm entry (#969).
+    Arrived {
+        state: ContinuationState,
+    },
+    /// The inner solve at the attempted waypoint struggled, so the path
+    /// re-entered a heavier regime (`s` raised back toward `1` by the back-off
+    /// fraction) and will re-descend with a finer step. This is the homotopy
+    /// floor in action — progress toward the fit, never abandonment. Carries
+    /// the heavier `s` to descend from next and the underlying spine signal
+    /// that prompted the back-off (for diagnostics only; it is **not** an
+    /// error the path surfaces upward).
+    Reentered {
+        s: f64,
+        reason: ReentryReason,
+    },
+}
+
+/// Why a waypoint re-entered a heavier regime. Purely diagnostic — every
+/// variant resolves to "re-descend from a heavier `s`", never to a rejection.
+#[derive(Debug, Clone)]
+pub(crate) enum ReentryReason {
+    /// The ρ-anneal spine could not complete the descent to this waypoint's ρ
+    /// target from the current regime. The underlying `ContinuationFailure` is
+    /// kept for logging; the path's response is unconditionally to re-enter a
+    /// heavier regime, because at the heaviest regime the inner solve is a
+    /// contraction and *must* converge.
+    SpineStruggled(ContinuationFailure),
+    /// The active-mass floor was breached at this waypoint; a scaffold re-seed
+    /// was recorded and the path re-enters a heavier regime to let τ re-diffuse
+    /// the assignment before re-sharpening.
+    MassFloorBreached(MassFloorBreach),
+    /// The descent step in `s` underflowed `S_STEP_FLOOR`; the path pins `s` at
+    /// the current heavier regime and keeps re-descending from there rather
+    /// than taking vanishing steps. Still not a rejection — the floor holds.
+    StepUnderflow,
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 //  The ContinuationPath object.
 // ─────────────────────────────────────────────────────────────────────────
 
@@ -444,9 +507,11 @@ pub enum PathDemotionReason {
 /// homotopy. Entry is always `s = 1` (heavy-smoothing contraction regime); the
 /// tail is a homotopy floor with no rejection exit.
 ///
-/// The wiring agent installs the current waypoint's [`ScalarLegTargets`]
-/// (τ on the SAE term, isometry weight on the gauge penalty) and applies the
-/// [`LogitTrustRegion`] / [`ActiveMassFloor`] hooks inside the inner solve.
+/// The wiring agent drives the path one waypoint at a time:
+/// `let step = path.step(obj, &mut ledger);` and, per [`ContinuationStep`],
+/// installs the next waypoint's [`ScalarLegTargets`] (τ on the SAE term,
+/// isometry weight on the gauge penalty) and applies the [`LogitTrustRegion`] /
+/// [`ActiveMassFloor`] hooks inside the inner solve.
 #[derive(Debug, Clone)]
 pub struct ContinuationPath {
     schedules: CoupledSchedules,
@@ -590,9 +655,18 @@ impl ContinuationPath {
         // the path-owned one — so we lend that ledger to the shared driver and
         // hand it back afterwards.
         let mut owned = std::mem::take(&mut self.reseed_ledger);
-        let regime = self.note_mass_breach(breach, &mut owned);
+        let step = self.note_mass_breach(breach, &mut owned);
         self.reseed_ledger = owned;
-        regime
+        // The shared driver always re-enters a heavier regime (never rejects);
+        // the bare hook's contract is the coarse regime it landed in. Match the
+        // step exhaustively so the outcome is observed (no silent discard) and
+        // the "every breach is progress" invariant is documented at the use
+        // site: every arm resolves to the heavier live regime.
+        match step {
+            ContinuationStep::Reentered { .. }
+            | ContinuationStep::Descended { .. }
+            | ContinuationStep::Arrived { .. } => self.enter_regime(),
+        }
     }
 
     /// Number of scaffold re-seeds recorded through the bare
@@ -638,18 +712,21 @@ impl ContinuationPath {
     }
 
     /// Record an active-mass-floor breach into the ledger and re-enter a
-    /// heavier regime. Returns the [`PathRegime`] the path landed in. **Never
-    /// fatal** — a breach is a re-entry, never a rejection. This is the hook
-    /// the wiring agent calls when [`ActiveMassFloor::check`] returns `Some`
-    /// from inside the inner solve.
+    /// heavier regime. Returns the [`ContinuationStep::Reentered`] the wiring
+    /// agent should act on. **Never fatal** — a breach is a re-entry, never a
+    /// rejection. This is the hook the wiring agent calls when
+    /// [`ActiveMassFloor::check`] returns `Some` from inside the inner solve.
     pub(crate) fn note_mass_breach(
         &mut self,
         breach: MassFloorBreach,
         ledger: &mut ReseedLedger,
-    ) -> PathRegime {
+    ) -> ContinuationStep {
         ledger.record(self.s, breach);
         self.reenter_heavier();
-        self.enter_regime()
+        ContinuationStep::Reentered {
+            s: self.s,
+            reason: ReentryReason::MassFloorBreached(breach),
+        }
     }
 
     /// Raise `s` back toward the entry regime by the back-off fraction and
@@ -1041,12 +1118,14 @@ mod tests {
             observed_mean_mass: 0.05,
             floor: ActiveMassFloor::DEFAULT_FLOOR,
         };
-        let regime = path.note_mass_breach(breach, &mut ledger);
-        assert_eq!(
-            regime,
-            path.enter_regime(),
-            "note_mass_breach must report the heavier regime it landed in"
-        );
+        let step = path.note_mass_breach(breach, &mut ledger);
+        assert!(matches!(
+            step,
+            ContinuationStep::Reentered {
+                reason: ReentryReason::MassFloorBreached(_),
+                ..
+            }
+        ));
         assert!(path.s() > 0.5, "re-entry must raise s toward the entry regime");
         assert_eq!(ledger.reseed_count(), 1);
     }
