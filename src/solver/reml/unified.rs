@@ -11336,6 +11336,7 @@ impl UnifiedOuterHessianOperator {
         alpha: &Array1<f64>,
         v_i: &Array1<f64>,
         m_alpha: &Array1<f64>,
+        psi_score_alpha: Option<&Array1<f64>>,
     ) -> Result<f64, String> {
         let OuterHessianDerivativeKernel::ScalarGlm {
             c_array,
@@ -11370,6 +11371,15 @@ impl UnifiedOuterHessianOperator {
                 continue;
             }
             c_trace += alpha_j * self.pair_rhs_dot(idx, j, z_c.view());
+        }
+        // #740: `pair_rhs_dot` reads `pair_g[idx][j]` for the `−g_{ij}·z_c`
+        // adjoint term, but the build SKIPPED the ψψ `pair_g` when the contracted
+        // hook is installed. `pair_rhs_dot` therefore drops the `−Σ_j α_j
+        // g_{ψ_i ψ_j}` ψψ contribution; the hook supplies it as `score.row(i)`,
+        // so add the missing `−score·z_c` here (mirrors the `−score` rhs
+        // injection on the Callback path in `outer_hessian_index_entry`).
+        if let Some(score_alpha) = psi_score_alpha {
+            c_trace -= score_alpha.dot(z_c);
         }
         let d_trace = if let Some(trace) = self.fourth_trace.as_ref() {
             let mut combo = 0.0;
@@ -11509,7 +11519,17 @@ impl UnifiedOuterHessianOperator {
             match &self.kernel {
                 OuterHessianDerivativeKernel::Gaussian => 0.0,
                 OuterHessianDerivativeKernel::ScalarGlm { .. } => {
-                    self.scalar_correction_trace(idx, alpha, &coord.v, correction_m_alpha)?
+                    // For ψ rows with the contracted hook, supply the
+                    // `−Σ_j α_j g_{ψ_i ψ_j}` (= score.row(i)) that the skipped ψψ
+                    // `pair_g` no longer provides to the scalar adjoint trace.
+                    let psi_score = psi_row.map(|(contrib, i)| contrib.score.row(i).to_owned());
+                    self.scalar_correction_trace(
+                        idx,
+                        alpha,
+                        &coord.v,
+                        correction_m_alpha,
+                        psi_score.as_ref(),
+                    )?
                 }
                 OuterHessianDerivativeKernel::Callback { .. } => {
                     let second_v = &self
