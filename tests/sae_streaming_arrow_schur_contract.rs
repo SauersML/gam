@@ -30,7 +30,7 @@
 //! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`, no new
 //! public knobs. Sizing fits comfortably in CI RAM.
 
-use ndarray::{Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, s};
 
 use gam::gpu::arrow_schur::{ArrowSchurGpuFailure, solve_reduced_beta_pcg};
 use gam::solver::arrow_schur::{
@@ -363,4 +363,77 @@ fn gpu_reduced_beta_solve_matches_cpu_when_available() {
         max_abs < 1e-7,
         "GPU reduced-β solve deviates from CPU on the same S/rhs: max|Δ|={max_abs:.3e}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// (d) The out-of-core streaming FIT driver is chunk-size invariant.
+// ---------------------------------------------------------------------------
+//
+// `run_joint_fit_arrow_schur_streaming` is the memory-bounded fit driver for
+// the LLM-scale teacher: it re-seeds each chunk's `(logits, coords, Z)` from a
+// `chunk_init` closure and never materializes the `(N×M)`/`(N×K)` per-row
+// buffers. Because it re-seeds the per-row latent state from `chunk_init` on
+// every pass (rather than carrying it forward), each outer iteration's reduced
+// β-Newton step, line-search objective, and decoder-Gram audit are all exact
+// sums over rows — independent of how the rows are partitioned into chunks.
+//
+// So the FITTED decoder β must not depend on `chunk_size`. Test (a) pins this
+// for a single reduction; this pins it for the full multi-iteration driver
+// end-to-end. A genuine chunking bug (e.g. a mis-scaled minibatch penalty, a
+// dropped per-chunk contribution, or per-chunk ridge double-counting) breaks
+// the invariance by O(1), far above float-reordering noise.
+#[test]
+fn streaming_full_fit_is_chunk_size_invariant() {
+    let (k, m, d, n, p) = (4usize, 4usize, 1usize, 36usize, 2usize);
+
+    // Deterministic per-row seed (logits, coords) + targets, generated once and
+    // sliced identically for every chunking. The driver re-seeds from this each
+    // pass, so it fully determines the fit independent of any resident state.
+    let mut rng = 0xA11CE_u64;
+    let full_logits = Array2::<f64>::from_shape_fn((n, k), |_| 0.4 * lcg_f64(&mut rng));
+    let full_coords: Vec<Array2<f64>> = (0..k)
+        .map(|_| Array2::<f64>::from_shape_fn((n, d), |_| 0.3 * lcg_f64(&mut rng)))
+        .collect();
+    let full_target = Array2::<f64>::from_shape_fn((n, p), |_| lcg_f64(&mut rng));
+
+    let fit_with_chunk = |chunk_size: usize| -> Array1<f64> {
+        // Rebuild an identical term (deterministic seed) for each fit, so only
+        // the chunking differs between runs.
+        let (mut term, _t, mut rho) =
+            build_term(k, m, d, n, p, AssignmentMode::softmax(1.0), k, 0x5EED_99);
+        let logits = full_logits.clone();
+        let coords = full_coords.clone();
+        let z_full = full_target.clone();
+        let seeder = move |start: usize, end: usize| {
+            let lg = logits.slice(s![start..end, ..]).to_owned();
+            let cd: Vec<Array2<f64>> = coords
+                .iter()
+                .map(|c| c.slice(s![start..end, ..]).to_owned())
+                .collect();
+            let z = z_full.slice(s![start..end, ..]).to_owned();
+            Ok::<_, String>((lg, cd, z))
+        };
+        term.run_joint_fit_arrow_schur_streaming(
+            n, chunk_size, &mut rho, None, 2, 1.0, 1e-4, 1e-4, seeder,
+        )
+        .unwrap_or_else(|e| panic!("streaming fit (chunk_size={chunk_size}) failed: {e}"));
+        term.flatten_beta()
+    };
+
+    let beta_one_chunk = fit_with_chunk(n);
+    assert!(
+        beta_one_chunk.iter().all(|v| v.is_finite()),
+        "single-chunk streaming fit produced non-finite decoder β"
+    );
+    for chunk_size in [7usize, 13, 25] {
+        let beta_chunked = fit_with_chunk(chunk_size);
+        let mut max_dev = 0.0_f64;
+        for (a, b) in beta_one_chunk.iter().zip(beta_chunked.iter()) {
+            max_dev = max_dev.max((a - b).abs());
+        }
+        assert!(
+            max_dev < 1e-6,
+            "streaming fit decoder β depends on chunk_size={chunk_size}: max|Δβ|={max_dev:.3e}"
+        );
+    }
 }
