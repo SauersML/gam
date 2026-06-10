@@ -399,7 +399,7 @@ fn build_sae_term(
     seed: u64,
 ) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let mut rng = seed;
-    let mut next = |state: &mut u64| -> f64 {
+    let next = |state: &mut u64| -> f64 {
         *state = state
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
