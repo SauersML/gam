@@ -305,7 +305,6 @@ from ._sae_benchmark import (
     sweep as sweep_sae_benchmark,
 )
 from ._schema import SchemaCheck, SchemaIssue
-from .sindy import SINDyAtoms
 from ._summary import Summary
 from ._validation import FormulaValidation
 from .geometry import (

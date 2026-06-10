@@ -181,7 +181,7 @@ jobs:
           pip install pygam lifelines scikit-survival properscoring scoringrules || true
           pip install geomstats GPy gpytorch || true
           pip install numpyro arviz pymc || true
-          pip install interpret pysindy ngboost || true
+          pip install interpret ngboost || true
           pip install xgboostlss lightgbmlss || true
           python -c "import numpy,scipy,sklearn,statsmodels,pandas; print('core python refs ok')"
 

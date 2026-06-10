@@ -1,0 +1,190 @@
+==== GAM WAVE-1 VERIFICATION — commit 9f427fda2 (cap-lints build) — Wed Jun 10 00:00:34 CDT 2026 ====
+
+########## objective_gradient_consistency_universal ##########
+
+running 11 tests
+test sae_outputfisher_gauge_leaves_likelihood_isotropic_and_value_path_bit_identical ... ok
+test custom_family_lamlobjective_gradient_consistent_near_degenerate ... ok
+test custom_family_lamlobjective_gradient_consistent_at_large_lambda_boundary ... ok
+test custom_family_lamlobjective_gradient_consistent_interior ... ok
+test glm_objective_gradient_consistent_at_shrinkage_floor_boundary ... ok
+test survival_objective_gradient_consistent_interior ... FAILED
+test glm_objective_gradient_consistent_near_degenerate_eigenpair ... ok
+test survival_objective_gradient_consistent_at_large_lambda_boundary ... FAILED
+test glm_objective_gradient_consistent_interior_multifamily ... ok
+test survival_objective_gradient_consistent_near_degenerate_eigenpair ... FAILED
+test glm_objective_gradient_consistent_noncanonical_binomial_with_firth ... ok
+
+failures:
+
+---- survival_objective_gradient_consistent_interior stdout ----
+
+thread 'survival_objective_gradient_consistent_interior' (1634307) panicked at tests/objective_gradient_consistency_universal.rs:1126:5:
+OBJECTIVE↔GRADIENT DESYNC in survival LAML regime [interior/survival-net]: analytic ρ-gradient of the survival LAML objective disagrees with the centered finite difference of its own (inner-re-converged) value surface. rho=[-0.5] analytic=[1.12255998185226] fd=[0.8838247335773984] worst_rel_err=2.127e-1 (>= tol 1.0e-4). The survival LAML value and its analytic ρ-gradient are computed in different code and have drifted apart.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- survival_objective_gradient_consistent_at_large_lambda_boundary stdout ----
+
+thread 'survival_objective_gradient_consistent_at_large_lambda_boundary' (1634306) panicked at tests/objective_gradient_consistency_universal.rs:1126:5:
+OBJECTIVE↔GRADIENT DESYNC in survival LAML regime [boundary/large-lambda]: analytic ρ-gradient of the survival LAML objective disagrees with the centered finite difference of its own (inner-re-converged) value surface. rho=[4.0] analytic=[0.09278189203732701] fd=[0.18570815427665363] worst_rel_err=5.004e-1 (>= tol 2.0e-3). The survival LAML value and its analytic ρ-gradient are computed in different code and have drifted apart.
+
+---- survival_objective_gradient_consistent_near_degenerate_eigenpair stdout ----
+
+thread 'survival_objective_gradient_consistent_near_degenerate_eigenpair' (1634308) panicked at tests/objective_gradient_consistency_universal.rs:1126:5:
+OBJECTIVE↔GRADIENT DESYNC in survival LAML regime [near-degenerate/eigenpair]: analytic ρ-gradient of the survival LAML objective disagrees with the centered finite difference of its own (inner-re-converged) value surface. rho=[0.3, 0.3] analytic=[0.5956266405103875, 0.5954835551984309] fd=[0.4436218965508942, 0.4434866188063324] worst_rel_err=2.552e-1 (>= tol 2.0e-3). The survival LAML value and its analytic ρ-gradient are computed in different code and have drifted apart.
+
+
+failures:
+    survival_objective_gradient_consistent_at_large_lambda_boundary
+    survival_objective_gradient_consistent_interior
+    survival_objective_gradient_consistent_near_degenerate_eigenpair
+
+test result: FAILED. 8 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s
+
+
+########## structured_residual_974 ##########
+
+running 5 tests
+test euclidean_metric_leaves_assembled_gradient_bit_identical ... ok
+test whitened_data_fit_value_matches_assembled_beta_gradient_fd ... ok
+test fitted_scale_recovers_planted_activity_law ... FAILED
+test structured_likelihood_removes_spurious_topology_preference ... ok
+test fitted_factor_recovers_planted_interference_subspace ... ok
+
+failures:
+
+---- fitted_scale_recovers_planted_activity_law stdout ----
+
+thread 'fitted_scale_recovers_planted_activity_law' (1634486) panicked at tests/structured_residual_974.rs:253:5:
+assertion `left == right` failed: single planted factor
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    fitted_scale_recovers_planted_activity_law
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s
+
+
+########## sae_residual_gauge ##########
+
+running 5 tests
+test fixture_a_certifies_a_genuine_residual_rotation_freedom ... ok
+test under_claim_is_caught_data_pins_rotation_directly ... ok
+test fixture_b_isometry_pin_removes_the_rotation_freedom ... ok
+test sym_f_triviality_checked_only_under_output_fisher ... FAILED
+test replicate_fits_agree_up_to_exactly_the_named_group ... ok
+
+failures:
+
+---- sym_f_triviality_checked_only_under_output_fisher stdout ----
+
+thread 'sym_f_triviality_checked_only_under_output_fisher' (1634665) panicked at /projects/standard/hsiehph/sauer354/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ndarray-0.17.2/src/lib.rs:1801:13:
+ndarray: could not broadcast array from shape: [4] to: [8]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    sym_f_triviality_checked_only_under_output_fisher
+
+test result: FAILED. 4 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+########## row_metric_contract ##########
+
+running 6 tests
+test whitening_a_planted_anisotropic_residual_recovers_isotropy ... ok
+test whiten_jacobian_factored_matches_dense_pullback ... ok
+test whitened_structured_is_a_scoped_seam_for_974 ... ok
+test euclidean_provenance_is_bit_identical_no_op ... ok
+test factored_quad_form_matches_dense_oracle ... ok
+test delta_floor_is_solver_only_and_never_enters_the_criterion ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+########## row_metric_loud_vs_loadbearing ##########
+
+running 1 test
+test lens_flags_loud_represented_not_used_and_quiet_used ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+########## sae_streaming_arrow_schur_contract ##########
+
+running 3 tests
+test per_token_block_dim_is_independent_of_k_at_fixed_active ... FAILED
+test gpu_reduced_beta_solve_matches_cpu_when_available ... ok
+test streaming_reduction_matches_in_core_single_chunk ... ok
+
+failures:
+
+---- per_token_block_dim_is_independent_of_k_at_fixed_active stdout ----
+
+thread 'per_token_block_dim_is_independent_of_k_at_fixed_active' (1718152) panicked at tests/sae_streaming_arrow_schur_contract.rs:273:13:
+assertion `left == right` failed: K=16 row=0: per-token block dim 48 != n_active·(1+d)=9; the per-row cost must track k_active, not K
+  left: 48
+ right: 9
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    per_token_block_dim_is_independent_of_k_at_fixed_active
+
+test result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+
+########## sae_manifold_joint_two_circle_recovery ##########
+
+running 1 test
+test sae_manifold_joint_two_circle_recovery_ibp_map has been running for over 60 seconds
+test sae_manifold_joint_two_circle_recovery_ibp_map ... FAILED
+
+failures:
+
+---- sae_manifold_joint_two_circle_recovery_ibp_map stdout ----
+
+thread 'sae_manifold_joint_two_circle_recovery_ibp_map' (1718167) panicked at tests/sae_manifold_joint_two_circle_recovery.rs:397:10:
+outer cascade must complete: REML smoothing optimization failed to converge: no candidate seeds passed outer startup validation (SAE manifold two-circle recovery):
+  generated=12, screened=12, exact_validated=12, solver_started=0
+  rejection breakdown: rejected_by_kkt=12, rejected_by_domain=0, rejected_by_objective=0, rejected_by_budget=0, rejected_other=0 (total=12)
+  per-seed reasons:
+    seed 0 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 1 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 2 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 3 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 4 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 5 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 6 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 7 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 8 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 9 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 10 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+    seed 11 (validation): aux direct-search seed cost failed (SAE manifold two-circle recovery): REML smoothing optimization failed to converge: SaeManifoldTerm: pre-fit identifiability audit: decoder atom 'circle_0' has rank-0 weighted design (n=600, M_k=3); all assignment weights vanish or the basis is degenerate, so the Arrow-Schur Newton system for this block is singular
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    sae_manifold_joint_two_circle_recovery_ibp_map
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 561.42s
+
+
+########## sae_manifold_k_ladder_recovery ##########
+
+running 2 tests
+test sae_manifold_k_ladder_recovery_k64 ... FAILED
+test sae_manifold_k_ladder_recovery_k1024 has been running for over 60 seconds
+
+########## sae_encode_throughput_bench ##########
+   Compiling gam v0.3.108 (/projects/standard/hsiehph/sauer354/gam)
+    Finished `release` profile [optimized] target(s) in 11m 10s
+     Running tests/sae_encode_throughput_bench.rs (target/release/deps/sae_encode_throughput_bench-a89b8707265caa26)
+
+running 1 test
+=== Stage-3 SAE encode throughput benchmark (#988) ===
+GPU deployment gate = 100000 rows/sec/GPU; meeting the CPU-scaled floor => exact encode clears the gate on the GPU seam => Stage-3 amortized surrogate is NEVER built.
+test sae_encode_throughput_decision_gate has been running for over 60 seconds

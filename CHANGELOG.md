@@ -48,10 +48,12 @@ Geometry / manifolds / REML:
 - fix(#978): persisted + replayed global-orthogonality chart so an overlapping
   global + factor smooth on the same covariate residualizes consistently.
 - fix(#780): the LinearOperator seam is wired into weighted_design_products.
-
-SINDy / SCAD-MCP:
-- fix(#958/#959): per-output STLSQ support masks and per-coordinate SCAD/MCP
-  LQA weights.
+- remove: the standalone SINDy sparse-dynamics module (STLSQ + library + FD +
+  equation renderer, `SindyAtoms`) and its pysindy reference-quality suite.
+  It shared no machinery with gam's REML/penalized-spline core, contradicted
+  the REML-always selection policy (BIC + hard-threshold), and existed only as
+  a pysindy benchmark target; its sole prospective consumer (#908 Manifold-
+  SINDy) was unbuilt research. Removed with #482/#908/#945/#958/#959.
 
 New surface:
 - feat(#986): per-atom decoupled Extended Fellner–Schall as the primary outer

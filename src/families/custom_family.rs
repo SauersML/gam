@@ -13445,253 +13445,6 @@ mod trust_region_subproblem_tests {
     }
 }
 
-fn solve_joint_newton_step_on_spectral_range(
-    h_pen: &Array2<f64>,
-    rhs: &Array1<f64>,
-    rank_tol: f64,
-    null_tol: f64,
-    levenberg_mu: f64,
-    engage_ill_conditioned_levenberg: bool,
-) -> Result<JointSpectralNewtonStep, String> {
-    let p = h_pen.nrows();
-    if h_pen.ncols() != p || rhs.len() != p {
-        return Err(format!(
-            "joint Newton spectral solve dimension mismatch: H={}x{}, rhs={}",
-            h_pen.nrows(),
-            h_pen.ncols(),
-            rhs.len()
-        ));
-    }
-    if p == 0 {
-        return Ok(JointSpectralNewtonStep {
-            delta: Array1::zeros(0),
-            range_rhs_inf: 0.0,
-            null_rhs_inf: 0.0,
-            lambda_max_abs: 0.0,
-            lambda_min_positive: f64::INFINITY,
-            nullity: 0,
-            rank_tol,
-            reflected_negative_modes: 0,
-            most_negative_eigenvalue: 0.0,
-        });
-    }
-
-    let (evals, evecs) = FaerEigh::eigh(h_pen, Side::Lower)
-        .map_err(|e| format!("joint Newton spectral solve eigendecomposition failed: {e}"))?;
-    let lambda_max_abs = evals.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    if !lambda_max_abs.is_finite() || lambda_max_abs <= 0.0 {
-        let rhs_inf = rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        if rhs_inf <= null_tol {
-            return Ok(JointSpectralNewtonStep {
-                delta: Array1::zeros(p),
-                range_rhs_inf: 0.0,
-                null_rhs_inf: rhs_inf,
-                lambda_max_abs,
-                lambda_min_positive: f64::INFINITY,
-                nullity: p,
-                rank_tol,
-                reflected_negative_modes: 0,
-                most_negative_eigenvalue: 0.0,
-            });
-        }
-        return Err(format!(
-            "joint Newton model-space error: penalized Hessian is numerically zero but \
-             stationarity RHS has |P0 rhs|∞={rhs_inf:.3e} > tol={null_tol:.3e}; no finite \
-             Newton/KKT stationary point exists in the current parameterization"
-        ));
-    }
-
-    // Two distinct thresholds on the eigenvalue magnitude:
-    //
-    //   * `cutoff = rank_tol · λ_max` is the caller's relative near-singularity
-    //     tol. Directions at or below it are "small curvature" — historically
-    //     they were *dropped* as null.
-    //   * `numerical_floor = λ_max · √p · f64::EPSILON` is the genuine numerical
-    //     rank floor: a curvature below it is indistinguishable from zero given
-    //     the matrix's own working precision.
-    //
-    // The two coincide when the spectrum has moderate dynamic range, but they
-    // diverge by many orders of magnitude at the oversmoothed-ρ operating point
-    // of a coupled location-scale inner solve (#826): there `λ_max` is dominated
-    // by the huge `S_λ` eigenvalues (`λ ~ exp(2·EXACT_JOINT_RHO_BOUND)`), so the
-    // RELATIVE `cutoff = 1e-10·λ_max` rises into the regime of the GENUINE
-    // likelihood curvature of the penalty-null (trend/mean) directions. Dropping
-    // those as null is the bug: they are identified by the data (curvature > 0),
-    // their Newton component is finite, and silently zeroing it freezes the
-    // block's stationarity residual at the unpenalized gradient while β stays at
-    // 0 — the "non-descent / frozen residual" stall the issue describes.
-    //
-    // Fix: only directions below the TRUE numerical floor are dropped as null.
-    // Directions in the band `(numerical_floor, cutoff]` carry small-but-real
-    // curvature; they are solved (range branch below) with the self-vanishing LM
-    // damping `relative_mu` that already caps the `component/λ` step on the
-    // near-singular modes the relative `cutoff` was meant to tame. Because μ ∝
-    // ‖∇L − Sβ‖∞ → 0 at the KKT fixed point, the converged β and the
-    // well-identified fast path are unchanged; far from the optimum the band is
-    // a bounded descent step instead of a discarded gradient component.
-    let cutoff = rank_tol * lambda_max_abs;
-    let numerical_floor = lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
-    let null_cutoff = cutoff.min(numerical_floor);
-    let mut delta = Array1::<f64>::zeros(p);
-    let mut range_rhs_inf = 0.0_f64;
-    let mut null_rhs_inf = 0.0_f64;
-    let mut lambda_min_positive = f64::INFINITY;
-    let mut nullity = 0usize;
-    let mut most_negative = 0.0_f64;
-    let mut reflected_negative_modes = 0usize;
-
-    // Spectral modified-Newton step. The penalized inner Hessian is positive
-    // semidefinite for canonical single-block GLMs (Xᵀ W X + Sλ with W ≥ 0),
-    // so the reflection branch below is a no-op there. For two-block GAMLSS /
-    // location-scale likelihoods the *observed* joint Hessian is genuinely
-    // indefinite away from the optimum (the cross block 2κm and the κ'(a−n)
-    // piece of the scale curvature are residual-linear and mean-zero, so a
-    // single negative residual fluctuation tips an eigenvalue negative at
-    // small/medium n). Erroring out there aborts an otherwise well-posed fit;
-    // instead we reflect each negative eigenvalue to |λ| (Gill–Murray–Wright /
-    // Greenstadt eigenvalue modification). On a direction u_k with curvature
-    // λ_k < 0 the modified step component is (u_kᵀ rhs / |λ_k|) u_k, so the
-    // assembled δ satisfies (∇L − Sβ)·δ = Σ_k (u_kᵀ rhs)²/|λ_k| > 0, i.e. δ is
-    // a strict descent direction for the penalized objective. The downstream
-    // trust-region globalization (full-objective accept/reject + gradient
-    // fallback) then validates the actual decrease, so no curvature guarantee
-    // is weakened — an indefinite model yields a safe descent step rather than
-    // a hard failure, and a PSD model still gets the exact Newton step.
-    //
-    // `levenberg_mu` is a self-vanishing Levenberg–Marquardt damping added to
-    // each range-space curvature: the per-direction step is
-    // `(u_kᵀ rhs)/(|λ_k| + μ)` rather than `(u_kᵀ rhs)/|λ_k|`. It is chosen by
-    // the caller proportional to the current stationarity-residual norm
-    // (μ = c·‖∇L − Sβ‖∞), so it has two regimes that make the inner solve
-    // converge on a genuinely ill-conditioned degenerate design WITHOUT moving
-    // the KKT fixed point:
-    //   * Far from the optimum (residual O(1)), a direction whose curvature
-    //     `|λ_k|` is tiny-but-above-`cutoff` (a near-singular but not-quite-null
-    //     mode of the n=23 binary-covariate CTM Hessian) would otherwise take an
-    //     enormous `component/λ_k` step. Those modes are exactly what makes the
-    //     undamped range-restricted Newton step oscillate: the trust region
-    //     clips a huge proposal every cycle and the residual along that mode
-    //     never settles, so neither `step_inf ≤ step_tol` nor the identified-
-    //     subspace residual ever reaches tolerance and the solve burns its
-    //     cycle budget. Adding μ caps the component at ≈ `component/μ`, turning
-    //     the proposal into a bounded, stable descent step.
-    //   * At the optimum (residual → 0 ⇒ μ → 0), the damping vanishes and the
-    //     step is exactly the undamped range-restricted (Moore–Penrose) Newton
-    //     step, so the converged β and the KKT certificate are identical to the
-    //     undamped solve. A well-identified problem (e.g. the #720 continuous
-    //     fast path) sits at small residual quickly, so μ is negligible there
-    //     and quadratic Newton convergence is preserved.
-    //
-    // The damping is only ever needed when `H_pen` carries a numerical
-    // nullspace (`nullity > 0`): that is when near-singular-but-above-cutoff
-    // modes exist whose undamped `component/λ` step oscillates. On a FULLY
-    // IDENTIFIED Hessian (`nullity == 0`, e.g. the post-reduction
-    // constant-scale AFT, #736/#735/#721/#733/#734) every range curvature is a
-    // genuine non-degenerate eigenvalue and the exact Newton step converges
-    // quadratically; applying even the self-vanishing μ then throttles the
-    // step by the geometric ratio λ/(λ+μ) per cycle and stalls the small-
-    // curvature blocks (an unpenalized intercept at small n) at a residual
-    // plateau orders above `residual_tol`. So count the nullity first and use
-    // μ only when the model is genuinely rank-deficient.
-    //
-    // CRITICAL (#826): the rank test that gates the damping must use the TRUE
-    // numerical rank floor `null_cutoff`, NOT the penalty-inflated RELATIVE
-    // `cutoff = 1e-10·λ_max`. At the maximally-oversmoothed continuation seed
-    // (λ ~ exp(2·EXACT_JOINT_RHO_BOUND) ≈ e²⁴) λ_max is dominated by the huge
-    // S_λ eigenvalues, so `cutoff` rises to O(1)–O(10) — right into the band of
-    // the GENUINE likelihood curvature of the penalty-null mean/threshold/wiggle
-    // trend directions (XᵀWX ~ O(n·w), but per-direction curvature can be O(1)).
-    // Counting those data-identified directions as "rank-deficient" engages the
-    // self-vanishing μ on them, and because μ = c·‖∇L − Sβ‖∞ is set by the
-    // PENALTY-inflated joint residual it can exceed their small likelihood
-    // curvature, throttling their Newton step by λ/(λ+μ) ≪ 1. β then barely
-    // moves while ‖∇L − Sβ‖∞ stays frozen — exactly the "block β ≈ 0, residual
-    // large" stall the issue reports, which leaves the inner solve unconverged
-    // at every oversmooth seed and forces the continuation to expand the offset
-    // outward (making the problem strictly worse) until it gives up.
-    //
-    // The genuine-rank test (`null_cutoff = min(cutoff, numerical_floor)`)
-    // separates penalty scale from likelihood scale: a likelihood-identified
-    // mean-trend direction sits far above `numerical_floor` even when the penalty
-    // eigenvalues are astronomically large, so it is correctly classified as
-    // identified and — under the scale-invariant multiplicative damping below —
-    // takes the same `1/(1+ν)` fraction of its Newton component as every other
-    // mode (ν → 0 at the fixed point), so the near-exact Newton
-    // step `component/λ` drives the trend to its oversmoothed optimum in O(1)
-    // cycles. Genuine numerical rank deficiency (curvature below the working-
-    // precision floor) still engages μ. The ill-conditioned-Newton branch below
-    // (gated on `engage_ill_conditioned_levenberg`) independently handles the
-    // full-rank-but-ill-conditioned survival regime (#808).
-    let spectral_nullity = evals
-        .iter()
-        .filter(|v| !v.is_finite() || v.abs() <= null_cutoff)
-        .count();
-    // The `nullity > 0` gate above (which engages the self-vanishing μ) is too
-    // narrow for the survival marginal-slope path: it assumes `nullity == 0 ⇒
-    // well-conditioned ⇒ exact Newton converges quadratically`. That misses the
-    // FULL-RANK-but-ILL-CONDITIONED regime (#808: the clustered-PC survival
-    // marginal-slope inner has `λ_min ≈ 17`, `λ_max ≈ 4.5e8`, cond ≈ 5.8e6,
-    // nullity == 0 because every mode is above the rank cutoff). That spectrum is
-    // EXACTLY the first regime the μ doc above describes — a tiny-but-above-cutoff
-    // curvature whose undamped `component/λ` step makes the trust-region Newton
-    // oscillate and never settle (the #733/#734 oscillation μ exists to tame) —
-    // so it needs the same self-vanishing damping, but the nullity-only gate
-    // leaves `μ = 0` and the solve burns its cycle budget at a frozen residual.
-    //
-    // So also engage μ when the range spectrum is numerically ill-conditioned for
-    // Newton (cond > COND_NEWTON_SAFETY), via a cheap pre-pass over the already-
-    // computed `evals` for the smallest positive (above-null) curvature. This is
-    // SOUND and SELF-VANISHING: μ ∝ ‖∇L − Sβ‖∞ → 0 at the KKT fixed point, so the
-    // damping shapes only the TRAJECTORY (oscillation → bounded descent), NOT the
-    // fixed point — the converged β is the EXACT unconditioned solution, zero
-    // bias. It is BINARY-SAFE / no-op where μ is already on: a near-separating
-    // rank-deficient fit (binary c12) has nullity > 0 → μ already engaged → the
-    // cond clause adds nothing; and it does NOT throttle genuinely well-
-    // conditioned fits (the doc's concern) because those have cond ≪
-    // COND_NEWTON_SAFETY so the clause stays off.
-    let ill_conditioned_for_newton = if engage_ill_conditioned_levenberg {
-        let mut lmax = 0.0_f64;
-        let mut lmin = f64::INFINITY;
-        for &lambda in evals.iter() {
-            if !lambda.is_finite() {
-                continue;
-            }
-            let a = lambda.abs();
-            if a <= null_cutoff {
-                continue;
-            }
-            lmax = lmax.max(a);
-            lmin = lmin.min(a);
-        }
-        let range_cond = if lmin.is_finite() && lmin > 0.0 && lmax > 0.0 {
-            lmax / lmin
-        } else {
-            0.0
-        };
-        range_cond > COND_NEWTON_SAFETY
-    } else {
-        false
-    };
-    // CRITICAL (#826, scale-invariant damping). The caller passes
-    // `levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR · ‖∇L − Sβ‖∞`, an
-    // ABSOLUTE damping in the units of the residual. Adding it directly to a
-    // range curvature (`curvature + μ`) is correct on a single-scale Hessian,
-    // but it is the residual stall on a coupled location-scale joint Hessian:
-    // there the spectrum spans the penalty scale (`λ ~ exp(2·ρ_bound) ≈ e²⁴`
-    // at the oversmoothed continuation seed) AND the likelihood scale (the
-    // mean/threshold/wiggle block's XᵀWX curvature, per-direction O(n·w)). The
-    // residual ‖∇L − Sβ‖∞ that sets μ is dominated by the huge `Sβ` term, so μ
-    // is astronomically larger than the small likelihood curvature of the
-    // mean/wiggle directions. The additive throttle on those directions is then
-    // `λ/(λ+μ) ≈ λ/μ → 0`: β in that block barely moves while its stationarity
-    // residual stays frozen — EXACTLY the "block β ≈ 0, residual large" stall
-    // the issue reports, which never escapes the oversmooth seed and forces the
-    // continuation to expand outward until it gives up.
-    //
-    // Fix: damp MULTIPLICATIVELY (Marquardt's diagonal scaling), not additively.
-    // In the eigenbasis `diag(H)` per-direction IS the curvature, so Marquardt
-    // damping `H + ν·diag(H)` is `curvature·(1 + ν)`, giving the SCALE-INVARIANT
-    // per-direction throttle `λ/(λ·(1+ν)) = 1/(1+ν)` — identical for the huge
     // penalty modes and the small likelihood modes. No block is frozen relative
     // to another: a near-singular mode is bounded relative to its OWN curvature
     // scale (stopping the `component/λ` oscillation the absolute μ existed to
@@ -15164,7 +14917,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // solve crosses it, which is exactly when the damping is sound. Set a
         // few cycles below the stall-exit window so the damping gets a chance to
         // rescue the solve well before the early-exit / budget tripwire fires.
-        const COND_LEVENBERG_ARM_AFTER_NO_IMPROVE_CYCLES: usize = 4;
+        // (The conditioning-gated self-vanishing μ this armed now lives ONLY in the
+        // test-retained `solve_joint_newton_step_on_spectral_range`; the production
+        // joint step takes the exact trust-region multiplier λ instead — gam#979.)
         // Recent KKT-residual values (oldest→newest) used to detect STEADY
         // geometric descent at the certificate-refusal gate. A still-converging
         // Newton direction (residual dropping by a steady factor < 1 each cycle)
@@ -15706,16 +15461,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                     let inner_jeffreys_hphi: Option<Arc<Array2<f64>>> = inner_jeffreys_term
                         .as_ref()
                         .map(|(_grad_phi, hphi)| Arc::new(hphi.clone()));
-                    let grad_inf_for_solve = grad_joint
-                        .iter()
-                        .map(|x: &f64| x.abs())
-                        .fold(0.0_f64, f64::max);
-                    let penalty_inf_for_solve = penalty_beta
-                        .iter()
-                        .map(|x: &f64| x.abs())
-                        .fold(0.0_f64, f64::max);
-                    let residual_tol_for_solve =
-                        inner_tol * (1.0 + grad_inf_for_solve.max(penalty_inf_for_solve));
                     let pcg_started = std::time::Instant::now();
                     let pcg_requested = matrix_free_joint_requested && !joint_hessian_is_dense;
                     let mut spectral_nullity_for_step = 0usize;
@@ -15886,41 +15631,34 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                         if let Some((_grad_phi, hphi)) = inner_jeffreys_term.as_ref() {
                             lhs_true += hphi;
                         }
-                        // Self-vanishing Levenberg–Marquardt damping for the
-                        // range-restricted spectral step. Scaled to the current
-                        // stationarity-residual magnitude ‖∇L − Sβ‖∞ so it is
-                        // dimensionally consistent with the eigenvalues it floors
-                        // (μ = JOINT_SPECTRAL_LEVENBERG_FACTOR · ‖rhs‖∞). As the
-                        // inner solve converges (‖rhs‖∞ → 0) μ → 0 and the step
-                        // collapses to the exact range-restricted Newton step, so
-                        // the KKT fixed point and the well-identified #720 fast
-                        // path are unchanged; far from the optimum on a
-                        // near-singular degenerate design it caps the otherwise
-                        // unbounded component/λ step along ill-conditioned modes
-                        // and stops the oscillation that prevented the n=23
-                        // binary-covariate CTM from settling (#733/#734).
-                        let rhs_inf = spectral_rhs.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-                        let spectral_levenberg_mu = JOINT_SPECTRAL_LEVENBERG_FACTOR * rhs_inf;
-                        // Engage the conditioning-based self-vanishing μ when the
-                        // family always wants it (survival marginal-slope, #808)
-                        // OR when this solve has stopped making progress for a few
-                        // consecutive cycles — the universal oscillation signature
-                        // on a full-rank-but-ill-conditioned penalized Hessian at
-                        // the oversmoothed-ρ seed (#826). A quadratically
-                        // converging fit never trips the cycle threshold, so this
-                        // is byte-identical for well-conditioned / AFT endgames;
-                        // see `COND_LEVENBERG_ARM_AFTER_NO_IMPROVE_CYCLES`.
-                        let cond_levenberg_armed = family.levenberg_on_ill_conditioning()
-                            || cycles_since_residual_improved
-                                >= COND_LEVENBERG_ARM_AFTER_NO_IMPROVE_CYCLES;
-                        let spectral_step = solve_joint_newton_step_on_spectral_range(
+                        // Single metric-whitened eigendecomposition drives BOTH the
+                        // seed step and every trust-region re-solve this cycle
+                        // (gam#979). The prior code ran a SECOND O(p³)
+                        // eigendecomposition of the raw Hessian here purely to form
+                        // the seed step — doubling the dominant per-cycle cost on the
+                        // ~5 s/cycle ill-conditioned survival marginal-slope inner.
+                        // The exact trust-region multiplier λ (chosen so ‖δ‖_D = r)
+                        // subsumes the old self-vanishing Levenberg-μ seed: `decompose`
+                        // whitens by the trust metric so the penalty (λ~e²⁴) and the
+                        // likelihood scales are throttled uniformly — the scale
+                        // invariance the multiplicative μ approximated. `lhs_true`
+                        // already carries the penalty and the Firth/Jeffreys curvature
+                        // H_Φ and `spectral_rhs` the augmented stationarity RHS, so the
+                        // subproblem model matches the predicted-reduction model and the
+                        // accept/reject gain ratio exactly.
+                        let spectrum = whitened_spectrum::WhitenedHessianSpectrum::decompose(
                             &lhs_true,
                             &spectral_rhs,
+                            &joint_trust_metric_diag,
                             KKT_REFUSAL_RANK_TOL,
-                            residual_tol_for_solve,
-                            spectral_levenberg_mu,
-                            cond_levenberg_armed,
                         )?;
+                        // Seed = the unconstrained (Moore–Penrose, range-restricted)
+                        // exact step, so cycle 0 can take the full Newton step on a
+                        // well-conditioned model (the cycle-0 radius bump below relies
+                        // on this); the trust loop re-solves at finite radius for every
+                        // subsequent attempt. An indefinite model reflects negative
+                        // curvature to |λ|, exactly as the prior spectral solve did.
+                        let spectral_step = spectrum.trust_region_step(f64::INFINITY);
                         spectral_nullity_for_step = spectral_step.nullity;
                         if spectral_step.reflected_negative_modes > 0 {
                             log::info!(
@@ -15947,22 +15685,9 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
                             );
                         }
                         delta = Some(spectral_step.delta);
-                        // Retain the metric-whitened factorization so the trust
-                        // loop below re-solves the EXACT Moré–Sorensen subproblem
-                        // at each radius (gam#979). `lhs_true` already carries the
-                        // penalty and the Firth/Jeffreys curvature H_Φ, and
-                        // `spectral_rhs` the augmented stationarity RHS, so the
-                        // subproblem model matches the predicted-reduction model
-                        // and the accept/reject gain ratio exactly. The reflected
-                        // `spectral_step` above still seeds candidate_beta / the
-                        // cycle-0 radius / the pre-line-search step_inf.
-                        joint_spectrum =
-                            Some(whitened_spectrum::WhitenedHessianSpectrum::decompose(
-                                &lhs_true,
-                                &spectral_rhs,
-                                &joint_trust_metric_diag,
-                                KKT_REFUSAL_RANK_TOL,
-                            )?);
+                        // The same factorization powers every trust-radius re-solve
+                        // in the loop below (gam#979) — no second eigendecomposition.
+                        joint_spectrum = Some(spectrum);
                     }
 
                     let Some(delta) = delta else {
