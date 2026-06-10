@@ -21784,7 +21784,11 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// callback's penalty terms (`½βᵀS_{ψiψj}β` into `objective`, `S_{ψiψj}β` into
 /// `score`, `S_{ψiψj}` as a `BlockLocalDrift` into `hessian`, and the
 /// `tau_hessian_component` into `ld_s`). Same-block-only, matching `ext_ext`.
-fn build_contracted_psi_hook(
+///
+/// `pub(crate)` so the #740 in-crate gate
+/// `bernoulli_contracted_psi_hook_matches_per_pair_with_penalty` can assert the
+/// generic penalty fold here equals `Σ_j α_j · build_psi_pair_callbacks().ext_ext(i, j)`.
+pub(crate) fn build_contracted_psi_hook(
     specs: &[ParameterBlockSpec],
     derivative_blocks: SharedDerivativeBlocks,
     beta_flat: &Array1<f64>,
