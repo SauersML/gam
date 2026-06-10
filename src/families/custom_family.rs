@@ -14663,8 +14663,6 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
         // directly. Extra damping must be wired through an accepted/rejected
         // step policy before it belongs here; keep the matvec faithful to the
         // objective until then.
-        // EMA of per-cycle wall-clock for timing-driven adaptive early-exit (#289).
-        let mut ema_joint_cycle_secs: Option<f64> = None;
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
                 break;
@@ -17427,36 +17425,21 @@ fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
             last_cycle_residual_below_tol = residual <= residual_tol;
             last_cycle_obj_change_below_tol = objective_change <= objective_tol;
 
-            // ── Timing-driven adaptive early-exit (#289) ────────────────────
-            // Mirror the EMA predicate from the PIRLS LM loop: when cycles
-            // become trivially cheap AND objective/residual are near-stationary,
-            // accept convergence rather than spinning to inner_max_cycles.
-            let cycle_secs_joint = cycle_started.elapsed().as_secs_f64();
-            let ema_joint = match ema_joint_cycle_secs {
-                None => cycle_secs_joint,
-                Some(prev) => 0.3 * cycle_secs_joint + 0.7 * prev,
-            };
-            ema_joint_cycle_secs = Some(ema_joint);
-            if cycle >= 2 {
-                let cycle_cheap = ema_joint > 0.0 && cycle_secs_joint < 0.25 * ema_joint;
-                let f_abs = lastobjective.abs().max(1.0);
-                let deviance_ok = (objective_change / f_abs) < inner_tol * 10.0;
-                let residual_ok = residual <= residual_tol * 10.0;
-                if cycle_cheap && deviance_ok && residual_ok {
-                    log::info!(
-                        "[PIRLS/joint-Newton] cycle {} timing-driven adaptive early-exit: \
-                         cycle={:.4}s ema={:.4}s obj_rel={:.3e} residual={:.3e}",
-                        cycle,
-                        cycle_secs_joint,
-                        ema_joint,
-                        objective_change / f_abs,
-                        residual,
-                    );
-                    converged = true;
-                    break;
-                }
-            }
-            // ── end timing-driven adaptive early-exit ────────────────────────
+            // NOTE: there is deliberately NO wall-clock-driven "adaptive
+            // early-exit" here. A convergence verdict that fires when a cycle's
+            // wall-clock happens to fall below a fraction of a running EMA is
+            // non-deterministic — under CPU contention (a parallel sweep) the
+            // same fit accepts at a different iterate than it does run alone,
+            // which cascades into a different outer seed and a different
+            // continuation-pre-warm fire/collapse decision (gam#979's
+            // "collapses sequentially, fires in parallel" instability). It also
+            // accepts iterates up to 10× outside the real KKT/objective
+            // tolerance, biasing the REML/LAML criterion the inner residual
+            // feeds. Convergence is certified ONLY by the mathematical tests
+            // above (KKT residual / Newton step / objective change at their
+            // scale-aware tolerances); whether convergence is *reachable within
+            // the cycle budget* is judged by the deterministic descent-rate
+            // guard alongside the residual-stall detector above.
         }
 
         // Explicit terminal verdict for the joint-Newton inner solve.
