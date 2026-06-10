@@ -24784,6 +24784,17 @@ fn fit_dataset_impl(
             };
             build_latent_binary_ffi_payload(formula, &dataset, &fit_config, frailty, lat_result)?
         }
+        FitRequest::DispersionLocationScale(_) => {
+            // The genuine-dispersion location-scale family (#913) is wired
+            // through the core fit engine and the CLI, but the Python FFI
+            // payload builder does not yet construct or persist it (no Python
+            // entry point routes to this variant). Reject explicitly rather
+            // than mis-serialize a half-built payload.
+            return Err(gam::WorkflowError::SchemaMismatch {
+                reason: "dispersion location-scale fits are not yet surfaced through the Python FFI payload builder"
+                    .to_string(),
+            });
+        }
     };
     payload.group_metadata = fit_config.group_metadata.clone();
     payload.training_table_kind = training_table_kind;
@@ -27943,6 +27954,9 @@ fn report_html_impl(model_bytes: &[u8]) -> Result<String, String> {
         deviance: fit.deviance,
         reml_score: fit.reml_score,
         iterations: fit.outer_iterations,
+        convergence_status: fit.pirls_status.label().to_string(),
+        converged: fit.pirls_status.is_converged(),
+        outer_gradient_norm: fit.outer_gradient_norm,
         edf_total: fit.edf_total().unwrap_or(0.0),
         r_squared: None,
         coefficients,
@@ -29121,6 +29135,9 @@ fn request_metadata(request: &FitRequest<'_>) -> (&'static str, &'static str, bo
         FitRequest::LatentBinary(_) => ("Latent binary", "latent binary", true),
         FitRequest::TransformationNormal(_) => {
             ("Transformation-normal", "transformation-normal", true)
+        }
+        FitRequest::DispersionLocationScale(_) => {
+            ("Dispersion location-scale", "dispersion location-scale", true)
         }
     }
 }
