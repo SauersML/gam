@@ -227,7 +227,7 @@ impl MappedShard {
     /// Read a single row's `p` `f32` lanes, upcasting each to `f64`.
     #[inline]
     fn read_row_into(&self, local_row: usize, out: &mut [f64]) {
-        debug_assert_eq!(out.len(), self.p);
+        assert_eq!(out.len(), self.p);
         let byte_start = self.data_offset + local_row * self.p * std::mem::size_of::<f32>();
         let bytes = &self.mmap[byte_start..byte_start + self.p * std::mem::size_of::<f32>()];
         for (c, slot) in out.iter_mut().enumerate() {

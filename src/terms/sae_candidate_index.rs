@@ -421,7 +421,7 @@ impl SaeCandidateIndex {
         candidate_budget: usize,
         config_multiprobe: bool,
     ) -> Proposal {
-        let query_sketch = global_query_sketch(sketch, direction, self.sketch_dim, self.bits_per_table);
+        let query_sketch = global_query_sketch(sketch, direction, self.sketch_dim);
         let gathered = self.gather_candidates(query_sketch.view(), config_multiprobe);
 
         // Exact-score every gathered candidate by frame alignment.
@@ -743,7 +743,6 @@ fn global_query_sketch<S: AtomFrameSketch>(
     sketch: &S,
     direction: ArrayView1<f64>,
     sketch_dim: usize,
-    _bits_per_table: usize,
 ) -> Array1<f64> {
     // Project the direction through every atom would be O(K); instead we use a
     // deterministic O(sqrt(K)) stratified sample of atoms and average their
