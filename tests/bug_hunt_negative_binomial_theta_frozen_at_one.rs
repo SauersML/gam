@@ -91,7 +91,7 @@ fn fit_negbin_theta_and_se(x: &[f64], y: &[f64]) -> (f64, f64) {
         .expect("NB fit must record a likelihood family")
         .response
     {
-        ResponseFamily::NegativeBinomial { theta } => theta,
+        ResponseFamily::NegativeBinomial { theta, .. } => theta,
         ref other => panic!("expected NegativeBinomial family, got {other:?}"),
     };
     assert!(
@@ -110,7 +110,10 @@ fn fit_negbin_theta_and_se(x: &[f64], y: &[f64]) -> (f64, f64) {
         build_term_collection_design(grid.view(), &fit.resolvedspec).expect("design at eval grid");
     let dense = design.design.to_dense();
     let nb_log = LikelihoodSpec::new(
-        ResponseFamily::NegativeBinomial { theta: theta_hat },
+        ResponseFamily::NegativeBinomial {
+            theta: theta_hat,
+            theta_fixed: false,
+        },
         InverseLink::Standard(StandardLink::Log),
     );
     let offset = Array1::<f64>::zeros(m);

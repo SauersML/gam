@@ -13980,6 +13980,7 @@ fn latent_glm_family_from_str(
             Ok(LikelihoodSpec::new(
                 ResponseFamily::NegativeBinomial {
                     theta: negbin_theta,
+                    theta_fixed: false,
                 },
                 InverseLink::Standard(StandardLink::Log),
             ))

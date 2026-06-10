@@ -90,7 +90,10 @@ fn cross_cutting_tweedie_negbin_beta_scalars_passthrough() {
     let nb_y = array![0.0, 1.0, 1.0, 2.0, 3.0, 2.0, 5.0, 7.0];
     let nb_spec_seed = |seed| {
         LikelihoodSpec::new(
-            ResponseFamily::NegativeBinomial { theta: seed },
+            ResponseFamily::NegativeBinomial {
+                theta: seed,
+                theta_fixed: false,
+            },
             InverseLink::Standard(StandardLink::Log),
         )
     };

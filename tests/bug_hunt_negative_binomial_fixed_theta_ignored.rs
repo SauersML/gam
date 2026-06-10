@@ -82,7 +82,7 @@ fn fit_with_fixed_theta(x: &[f64], y: &[i64], fixed_theta: f64) -> f64 {
         .expect("NB fit must record a likelihood family")
         .response
     {
-        ResponseFamily::NegativeBinomial { theta } => theta,
+        ResponseFamily::NegativeBinomial { theta, .. } => theta,
         ref other => panic!("expected NegativeBinomial family, got {other:?}"),
     };
     assert!(

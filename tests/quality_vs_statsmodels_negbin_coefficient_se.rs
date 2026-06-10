@@ -111,7 +111,10 @@ fn negbin_log_coefficient_se_matches_statsmodels_no_theta_inflation() {
 
     // gam's per-point linear-predictor SE SE(eta_i) = sqrt(xᵢᵀ Vb xᵢ).
     let nb_log = LikelihoodSpec::new(
-        ResponseFamily::NegativeBinomial { theta },
+        ResponseFamily::NegativeBinomial {
+            theta,
+            theta_fixed: false,
+        },
         InverseLink::Standard(StandardLink::Log),
     );
     let offset = Array1::<f64>::zeros(n);

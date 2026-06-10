@@ -181,37 +181,12 @@ pub struct SharedBorderTopology {
 }
 
 impl SharedBorderTopology {
-    /// Construct from the explicit set of border axes. Out-of-range and
-    /// duplicate axes are dropped; the set is deduplicated and sorted so the
-    /// restricted `m × m` correction has a stable, deterministic ordering (no
-    /// clock, no hash-iteration order).
-    pub fn new(rho_dim: usize, border_axes: impl IntoIterator<Item = usize>) -> Self {
-        let mut axes: Vec<usize> = border_axes.into_iter().filter(|&i| i < rho_dim).collect();
-        axes.sort_unstable();
-        axes.dedup();
-        Self {
-            border_axes: axes,
-            rho_dim,
-        }
-    }
-
     /// No shared border: every atom is block-disjoint and the decoupled
     /// per-atom step is exact. This is the common ARD-per-atom case where each
     /// atom owns a private penalty block.
     pub fn disjoint(rho_dim: usize) -> Self {
         Self {
             border_axes: Vec::new(),
-            rho_dim,
-        }
-    }
-
-    /// The whole ρ-vector is one shared border (small-K / fully-coupled
-    /// regime). Used by the FD-consistency reduction: with this topology the
-    /// layer-2 correction is the exact dense Newton step on the outer gradient,
-    /// matching the coupled objective.
-    pub fn fully_coupled(rho_dim: usize) -> Self {
-        Self {
-            border_axes: (0..rho_dim).collect(),
             rho_dim,
         }
     }
@@ -736,30 +711,4 @@ pub fn run_per_atom_efs(
         final_step_inf_norm: final_step_inf,
         converged,
     })
-}
-
-#[cfg(test)]
-mod topology_tests {
-    use super::SharedBorderTopology;
-
-    /// `new` must sort, deduplicate, and drop out-of-range axes so the
-    /// restricted border correction has a deterministic ordering; `disjoint`
-    /// and `fully_coupled` are its two extremes (m = 0 and m = rho_dim).
-    #[test]
-    fn shared_border_topology_constructors_pin_their_semantics() {
-        let t = SharedBorderTopology::new(5, [4usize, 1, 4, 9, 1]);
-        assert_eq!(t.border_axes(), &[1, 4], "sorted, deduped, in-range");
-        assert_eq!(t.border_count(), 2);
-
-        let d = SharedBorderTopology::disjoint(5);
-        assert_eq!(d.border_count(), 0, "disjoint = exact decoupled step");
-
-        let f = SharedBorderTopology::fully_coupled(3);
-        assert_eq!(f.border_axes(), &[0, 1, 2]);
-        assert_eq!(
-            f.border_count(),
-            3,
-            "fully coupled = dense Newton on the whole rho vector"
-        );
-    }
 }

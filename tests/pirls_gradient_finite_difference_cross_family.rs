@@ -38,7 +38,7 @@ fn loglik(y: &Array1<f64>, eta: &Array1<f64>, spec: &GlmLikelihoodSpec, w: &Arra
                 wi * (yi * mi.powf(1.0 - p) / (1.0 - p) - mi.powf(2.0 - p) / (2.0 - p))
             })
             .sum(),
-        ResponseFamily::NegativeBinomial { theta } => y
+        ResponseFamily::NegativeBinomial { theta, .. } => y
             .iter()
             .zip(mu.iter())
             .zip(w.iter())
