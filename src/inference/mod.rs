@@ -26,3 +26,4 @@ pub mod row_metric;
 pub mod sample;
 pub mod smooth_test;
 pub mod steering;
+pub mod structure_evidence;
