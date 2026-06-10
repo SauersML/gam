@@ -101,58 +101,195 @@ fn planted_z(truth: &SmallTruth, p: usize) -> Array2<f64> {
     z
 }
 
-/// Build a small seeded term over the planted data: coords near truth, logits
-/// hard ±4 by planted activity, decoder per atom from a ridge LS of `z` on the
-/// atom's basis over its active rows (rank ≤ M = 3 ≪ p by construction, so the
-/// frame activation margin is satisfied for every atom).
-fn build_small_term(truth: &SmallTruth, z: &Array2<f64>, p: usize) -> SaeManifoldTerm {
+/// Residual-energy IBP cold seed (the production `sae_residual_seed_logits`
+/// path): logit ∝ −gain·(per-atom reconstruction residual − row mean)/row mean,
+/// so each row routes toward the atom that explains it best. Data-driven and
+/// soft (no hard ±gain saturation), which keeps the inner t-block PD-reachable.
+fn residual_seed_logits(
+    basis_values: ArrayView3<'_, f64>,
+    basis_sizes: &[usize],
+    z: ArrayView2<'_, f64>,
+    gain: f64,
+) -> Array2<f64> {
+    let k_atoms = basis_sizes.len();
+    let (n_obs, p_out) = z.dim();
+    let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
+    if n_obs == 0 || p_out == 0 || k_atoms <= 1 {
+        return logits;
+    }
+    let z_owned = z.to_owned();
+    let mut resid = Array2::<f64>::zeros((n_obs, k_atoms));
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        let mut phi = Array2::<f64>::zeros((n_obs, m_k));
+        for row in 0..n_obs {
+            for c in 0..m_k {
+                phi[[row, c]] = basis_values[[atom_idx, row, c]];
+            }
+        }
+        let mut gram = fast_ata(&phi);
+        let mut trace = 0.0_f64;
+        for i in 0..m_k {
+            trace += gram[[i, i]];
+        }
+        let jitter = (trace / m_k as f64).max(1.0).max(1.0e-12) * 1.0e-8;
+        for i in 0..m_k {
+            gram[[i, i]] += jitter;
+        }
+        let rhs = fast_atb(&phi, &z_owned);
+        let factor = gram
+            .cholesky(FaerSide::Lower)
+            .expect("residual seed Cholesky");
+        let b_k = factor.solve_mat(&rhs);
+        let fitted = phi.dot(&b_k);
+        for row in 0..n_obs {
+            let mut e = 0.0_f64;
+            for col in 0..p_out {
+                let d = z[[row, col]] - fitted[[row, col]];
+                e += d * d;
+            }
+            resid[[row, atom_idx]] = e;
+        }
+    }
+    let mut global_mean = 0.0_f64;
+    for row in 0..n_obs {
+        for k in 0..k_atoms {
+            global_mean += resid[[row, k]];
+        }
+    }
+    global_mean /= (n_obs * k_atoms) as f64;
+    let floor = (global_mean * 1.0e-6).max(1.0e-12);
+    for row in 0..n_obs {
+        let mut row_mean = 0.0_f64;
+        for k in 0..k_atoms {
+            row_mean += resid[[row, k]];
+        }
+        row_mean = (row_mean / k_atoms as f64).max(floor);
+        for k in 0..k_atoms {
+            logits[[row, k]] = -gain * (resid[[row, k]] - row_mean) / row_mean;
+        }
+    }
+    logits
+}
+
+/// Weighted-LSQ decoder seed at the IBP gate (the production
+/// `sae_decoder_lsq_init` path): per-atom decoder from a joint ridge LS of `z`
+/// on the gate-weighted bases.
+fn decoder_lsq_init(
+    basis_values: ArrayView3<'_, f64>,
+    basis_sizes: &[usize],
+    z: ArrayView2<'_, f64>,
+    initial_logits: ArrayView2<'_, f64>,
+    tau: f64,
+) -> Array3<f64> {
+    let k_atoms = basis_sizes.len();
+    let (n_obs, p_out) = z.dim();
+    let m_max = basis_sizes.iter().copied().max().unwrap_or(1).max(1);
+    let mut out = Array3::<f64>::zeros((k_atoms, m_max, p_out));
+    let mut a_init = Array2::<f64>::zeros((n_obs, k_atoms));
+    let inv_tau = 1.0 / tau;
+    for row in 0..n_obs {
+        for k in 0..k_atoms {
+            let x = initial_logits[[row, k]] * inv_tau;
+            a_init[[row, k]] = if x >= 0.0 {
+                1.0 / (1.0 + (-x).exp())
+            } else {
+                let ex = x.exp();
+                ex / (1.0 + ex)
+            };
+        }
+    }
+    let offsets: Vec<usize> = {
+        let mut acc = 0usize;
+        let mut v = Vec::with_capacity(k_atoms + 1);
+        v.push(0);
+        for &m in basis_sizes {
+            acc += m;
+            v.push(acc);
+        }
+        v
+    };
+    let m_total = offsets[k_atoms];
+    let mut x = Array2::<f64>::zeros((n_obs, m_total));
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        let off = offsets[atom_idx];
+        for row in 0..n_obs {
+            let w = a_init[[row, atom_idx]];
+            for c in 0..m_k {
+                x[[row, off + c]] = w * basis_values[[atom_idx, row, c]];
+            }
+        }
+    }
+    let mut xtx = fast_ata(&x);
+    let mut trace = 0.0_f64;
+    for i in 0..m_total {
+        trace += xtx[[i, i]];
+    }
+    let jitter = (trace / m_total as f64).max(1.0) * 1.0e-8;
+    for i in 0..m_total {
+        xtx[[i, i]] += jitter;
+    }
+    let xtz = fast_atb(&x, &z.to_owned());
+    let b_joint = xtx
+        .cholesky(FaerSide::Lower)
+        .expect("decoder LSQ Cholesky")
+        .solve_mat(&xtz);
+    for atom_idx in 0..k_atoms {
+        let m_k = basis_sizes[atom_idx];
+        let off = offsets[atom_idx];
+        for c in 0..m_k {
+            for j in 0..p_out {
+                out[[atom_idx, c, j]] = b_joint[[off + c, j]];
+            }
+        }
+    }
+    out
+}
+
+/// Build a small cold term over the planted data with the production
+/// residual-energy seed + weighted-LSQ decoder init (the basin the engine
+/// fits from), coords seeded near truth.
+fn build_small_term(truth: &SmallTruth, z: &Array2<f64>) -> SaeManifoldTerm {
     let n = truth.n;
     let k = truth.k;
     let evaluator = PeriodicHarmonicEvaluator::new(M).unwrap();
-    let mut atoms = Vec::with_capacity(k);
-    let mut coords_k = Vec::with_capacity(k);
-    let mut logits = Array2::<f64>::zeros((n, k));
+    let mut coords_k: Vec<Array2<f64>> = Vec::with_capacity(k);
+    let mut phi_k: Vec<Array2<f64>> = Vec::with_capacity(k);
+    let mut jet_k: Vec<Array3<f64>> = Vec::with_capacity(k);
+    let mut basis_values = Array3::<f64>::zeros((k, n, M));
     for a in 0..k {
         let coords =
             Array2::from_shape_fn((n, 1), |(i, _)| (truth.theta[a][i] + 0.03).rem_euclid(1.0));
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
-        // Ridge LS decoder over the atom's active rows: B_a = (ΦᵀΦ+εI)⁻¹ΦᵀZ.
-        let act_rows: Vec<usize> = (0..n).filter(|&i| truth.active[a][i]).collect();
-        let mut phi_act = Array2::<f64>::zeros((act_rows.len(), M));
-        let mut z_act = Array2::<f64>::zeros((act_rows.len(), p));
-        for (r, &i) in act_rows.iter().enumerate() {
+        for row in 0..n {
             for c in 0..M {
-                phi_act[[r, c]] = phi[[i, c]];
-            }
-            for j in 0..p {
-                z_act[[r, j]] = z[[i, j]];
+                basis_values[[a, row, c]] = phi[[row, c]];
             }
         }
-        let mut xtx = fast_ata(&phi_act);
-        for d in 0..M {
-            xtx[[d, d]] += 1.0e-8;
-        }
-        let xtz = fast_atb(&phi_act, &z_act);
-        let b = xtx
-            .cholesky(FaerSide::Lower)
-            .expect("decoder LS Cholesky")
-            .solve_mat(&xtz);
-        for i in 0..n {
-            logits[[i, a]] = if truth.active[a][i] { 4.0 } else { -4.0 };
-        }
+        coords_k.push(coords);
+        phi_k.push(phi);
+        jet_k.push(jet);
+    }
+    let basis_sizes = vec![M; k];
+    let logits = residual_seed_logits(basis_values.view(), &basis_sizes, z.view(), 4.0);
+    let decoder = decoder_lsq_init(basis_values.view(), &basis_sizes, z.view(), logits.view(), TAU);
+
+    let mut atoms = Vec::with_capacity(k);
+    for a in 0..k {
+        let b = decoder.slice(ndarray::s![a, 0..M, ..]).to_owned();
         let atom = SaeManifoldAtom::new(
             format!("circle_{a}"),
             SaeAtomBasisKind::Periodic,
             1,
-            phi,
-            jet,
+            phi_k[a].clone(),
+            jet_k[a].clone(),
             b,
             Array2::<f64>::eye(M),
         )
         .unwrap()
         .with_basis_evaluator(Arc::new(PeriodicHarmonicEvaluator::new(M).unwrap()));
         atoms.push(atom);
-        coords_k.push(coords);
     }
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
@@ -164,6 +301,37 @@ fn build_small_term(truth: &SmallTruth, z: &Array2<f64>, p: usize) -> SaeManifol
     SaeManifoldTerm::new(atoms, assignment).unwrap()
 }
 
+/// Drive a term through the production outer engine (the only blessed fit
+/// entry; it handles the inner-solve ridging that reaches a PD basin). Returns
+/// the fitted term and the engine's converged criterion value. Empty ARD axes
+/// mirror the proven small-SAE fixtures.
+fn fit_via_engine(term: SaeManifoldTerm, z: &Array2<f64>, label: &str) -> (SaeManifoldTerm, f64) {
+    let k = term.atoms.len();
+    let init_rho = SaeManifoldRho::new(
+        1.0_f64.ln(),
+        1.0_f64.ln(),
+        vec![Array1::<f64>::zeros(0); k],
+    );
+    let init_rho_flat = init_rho.to_flat();
+    let n_params = init_rho_flat.len();
+    let mut objective = SaeManifoldOuterObjective::new(
+        term,
+        z.clone(),
+        None,
+        init_rho,
+        INNER_MAX_ITER,
+        LEARNING_RATE,
+        RIDGE_EXT_COORD,
+        RIDGE_BETA,
+    );
+    let problem = OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
+    let result = problem
+        .run(&mut objective, label)
+        .expect("outer cascade must complete");
+    let (fitted, _rho, _loss) = objective.into_fitted();
+    (fitted, result.final_value)
+}
+
 #[test]
 fn frame_factored_evidence_matches_full_b_at_small_p() {
     let p = 12usize;
@@ -171,31 +339,25 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
     let n = 240usize;
     let truth = small_truth(n, k);
     let z = planted_z(&truth, p);
-    let base = build_small_term(&truth, &z, p);
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::zeros(1); k]);
+    let base = build_small_term(&truth, &z);
 
-    // Arm 1: full-B border (frames never activated).
-    let mut full = base.clone();
-    for atom in &mut full.atoms {
+    // --- Structural exactness (no fit needed): activation re-REPRESENTS the
+    // decoder; it must not change the reconstruction, must shrink the border,
+    // and must register profiled Grassmann dims for the evidence normalizer.
+    let mut full_state = base.clone();
+    for atom in &mut full_state.atoms {
         atom.deactivate_decoder_frame();
     }
-    // Arm 2: frame-factored border. Every atom's decoder has rank ≤ M = 3 ≪ p,
-    // so the activation margin is satisfied and activation must engage.
-    let mut framed = base.clone();
-    let mut total_rank = 0usize;
-    for atom in &mut framed.atoms {
+    let mut framed_state = base.clone();
+    for atom in &mut framed_state.atoms {
         let r = atom
             .maybe_activate_decoder_frame()
             .expect("frame activation")
-            .expect("rank-3-in-p=12 atom must activate its frame");
+            .expect("rank-≤3-in-p=12 atom must activate its frame");
         assert!(r <= M, "activated rank {r} cannot exceed basis size {M}");
-        total_rank += r;
     }
-
-    // Exactness discipline: activation re-REPRESENTS the decoder, it does not
-    // change it. Fitted values must be identical bit-for-bit.
-    let f_full = full.fitted();
-    let f_framed = framed.fitted();
+    let f_full = full_state.fitted();
+    let f_framed = framed_state.fitted();
     for (a, b) in f_full.iter().zip(f_framed.iter()) {
         assert_eq!(
             a.to_bits(),
@@ -203,63 +365,80 @@ fn frame_factored_evidence_matches_full_b_at_small_p() {
             "frame activation changed a fitted value"
         );
     }
-
-    // The border-size collapse is a tested invariant, not a hope.
-    gam::terms::sae_manifold::grassmann_assert_border_dim_invariant(&framed)
+    gam::terms::sae_manifold::grassmann_assert_border_dim_invariant(&framed_state)
         .expect("border-dim invariant");
     assert!(
-        framed.factored_border_dim() < full.factored_border_dim(),
+        framed_state.factored_border_dim() < full_state.factored_border_dim(),
         "factored border {} must be strictly below the full-B border {}",
-        framed.factored_border_dim(),
-        full.factored_border_dim()
+        framed_state.factored_border_dim(),
+        full_state.factored_border_dim()
     );
     assert!(
-        framed.grassmann_evidence_dimension() > 0,
+        framed_state.grassmann_evidence_dimension() > 0,
         "profiled Grassmann dims must be counted for the evidence normalizer"
     );
-    let _ = total_rank;
 
-    // Evidence consistency: the same criterion entry on both representations
-    // of the same model state. The factored log-det plus the profiled-frame
-    // dimension term must reproduce the full-B evidence within a small
-    // relative tolerance; a drift here is exactly the dimension-accounting
-    // bug class the test exists to catch.
-    let (v_full, loss_full) = full
+    // --- Evidence consistency at a FIXED smoothness λ = 1 (log λ = 0).
+    //
+    // The criterion is `V = data_fit + ½ log|H| − occam`. The reconstruction
+    // data-fit and log-det are assembled on the FULL decoder in both arms (the
+    // frame profiles the border representation but never enters the assembly).
+    // The ONLY frame-dependent term is the occam normalizer's frame-dimension
+    // contribution `½·grassmann_dim·log λ`, which VANISHES at log λ = 0. So at
+    // a fixed log λ = 0 a correct framed path must reproduce the full-B
+    // criterion to round-off; a gap means the factored representation leaked
+    // into the data-fit/log-det or the dimension accounting drifted (the
+    // desync class this guards). (Note: at the *optimized* λ ≠ 1 the two
+    // criteria correctly DIFFER by that occam term — equality is a fixed-λ=0
+    // property, not an optimized-fit property.)
+    //
+    // We first drive the term to a PD inner basin through the engine, then
+    // evaluate the criterion at the fixed log λ = 0 ρ on both representations
+    // (re-solving the inner state from the converged decoder stays PD).
+    let (converged, _) = fit_via_engine(base.clone(), &z, "frame battery seed fit");
+    let rho0 = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(0); k]);
+
+    let mut full = converged.clone();
+    for atom in &mut full.atoms {
+        atom.deactivate_decoder_frame();
+    }
+    let mut framed = converged.clone();
+    for atom in &mut framed.atoms {
+        atom.maybe_activate_decoder_frame().expect("activate");
+    }
+    let (v_full, _) = full
         .reml_criterion(
             z.view(),
-            &rho,
+            &rho0,
             None,
             INNER_MAX_ITER,
             LEARNING_RATE,
             RIDGE_EXT_COORD,
             RIDGE_BETA,
         )
-        .expect("full-B criterion");
-    let (v_framed, loss_framed) = framed
+        .expect("full-B criterion at log λ=0");
+    let (v_framed, _) = framed
         .reml_criterion(
             z.view(),
-            &rho,
+            &rho0,
             None,
             INNER_MAX_ITER,
             LEARNING_RATE,
             RIDGE_EXT_COORD,
             RIDGE_BETA,
         )
-        .expect("framed criterion");
+        .expect("framed criterion at log λ=0");
     let scale = v_full.abs().max(1.0);
     let gap = (v_framed - v_full).abs();
     println!(
-        "evidence: full={v_full:.8} framed={v_framed:.8} gap={gap:.3e} (rel {:.3e}); \
-         data_fit full={:.6} framed={:.6}",
-        gap / scale,
-        loss_full.data_fit,
-        loss_framed.data_fit
+        "evidence@logλ=0: full={v_full:.8} framed={v_framed:.8} gap={gap:.3e} (rel {:.3e})",
+        gap / scale
     );
     assert!(
-        gap <= 1.0e-2 * scale,
+        gap <= 1.0e-6 * scale,
         "EVIDENCE DRIFT: frame-factored criterion {v_framed:.8} vs full-B {v_full:.8} \
-         (gap {gap:.3e}, scale {scale:.3e}) — check grassmann_evidence_dimension / \
-         reml_occam_term accounting"
+         (gap {gap:.3e}) at log λ=0 — the factored representation leaked into the \
+         log-det / data-fit, or grassmann_evidence_dimension/reml_occam_term drifted"
     );
 }
 
@@ -303,7 +482,6 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
     let n = 240usize;
     let truth = small_truth(n, k);
     let z = planted_z(&truth, p);
-    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::zeros(1); k]);
 
     // Planted plane of atom a: {e_{2a}, e_{2a+1}, e_{4+a}}.
     let planted_plane = |a: usize| -> Array2<f64> {
@@ -314,18 +492,9 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
         q
     };
 
-    // ---- full fit -----------------------------------------------------------
-    let mut full = build_small_term(&truth, &z, p);
-    full.reml_criterion(
-        z.view(),
-        &rho,
-        None,
-        INNER_MAX_ITER,
-        LEARNING_RATE,
-        RIDGE_EXT_COORD,
-        RIDGE_BETA,
-    )
-    .expect("full fit");
+    // ---- full fit (production engine) ---------------------------------------
+    let full = build_small_term(&truth, &z);
+    let (full_fit, _) = fit_via_engine(full, &z, "designed-fit full");
 
     // ---- designed, non-uniform, HT-weighted subsample fit -------------------
     // A deliberately biased design measure: atom-0 rows carry 3× the mass of
@@ -368,7 +537,7 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
             z_sub[[s_idx, j]] = z[[row, j]];
         }
     }
-    let mut designed = build_small_term(&sub_truth, &z_sub, p);
+    let mut designed = build_small_term(&sub_truth, &z_sub);
     designed
         .set_row_loss_weights(sample.likelihood_weights.clone())
         .expect("install honesty weights");
@@ -376,23 +545,13 @@ fn designed_weighted_subsample_fit_recovers_what_the_full_fit_recovers() {
         designed.row_loss_weights().is_some(),
         "a non-uniform design must install non-trivial weights"
     );
-    designed
-        .reml_criterion(
-            z_sub.view(),
-            &rho,
-            None,
-            INNER_MAX_ITER,
-            LEARNING_RATE,
-            RIDGE_EXT_COORD,
-            RIDGE_BETA,
-        )
-        .expect("designed fit");
+    let (designed_fit, _) = fit_via_engine(designed, &z_sub, "designed-fit weighted subsample");
 
     // ---- both arms recover the planted planes --------------------------------
     for a in 0..k {
         let truth_q = planted_plane(a);
-        let full_q = decoder_plane(&full.atoms[a].decoder_coefficients, p, 3);
-        let designed_q = decoder_plane(&designed.atoms[a].decoder_coefficients, p, 3);
+        let full_q = decoder_plane(&full_fit.atoms[a].decoder_coefficients, p, 3);
+        let designed_q = decoder_plane(&designed_fit.atoms[a].decoder_coefficients, p, 3);
         let ang_full = max_principal_angle(&full_q, &truth_q);
         let ang_designed = max_principal_angle(&designed_q, &truth_q);
         println!(
