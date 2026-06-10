@@ -1685,6 +1685,26 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
         psi_j: usize,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms>, String>;
 
+    /// Direction-contracted second-order ψ terms over the non-σ derivative
+    /// axes (#740). `alpha_psi` is the full ψ-block weight vector; the
+    /// contraction is against the combined non-σ direction
+    /// `ψ(α) = Σ_j alpha_psi[j] · ψ_j`, streaming the family's rows ONCE so the
+    /// profiled θ-HVP operator applies one combined-direction n-pass per matvec
+    /// instead of `K²` per-pair [`Self::psi_second_order_terms`] passes.
+    ///
+    /// Default `None` keeps the family on the exact per-pair path. The generic
+    /// workspace only calls this when no σ-auxiliary axis carries weight (a σ
+    /// term routes the whole direction back to the per-pair fallback), so an
+    /// override only handles the pure non-σ derivative axes — the same domain
+    /// as [`Self::psi_second_order_terms`].
+    fn psi_second_order_terms_contracted(
+        &self,
+        alpha_psi: &[f64],
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String> {
+        assert!(alpha_psi.len() < usize::MAX);
+        Ok(None)
+    }
+
     /// Hessian directional derivative for the σ-auxiliary parameter, returned
     /// as a dense matrix (the generic wraps it into
     /// [`DriftDerivResult::Dense`](crate::solver::estimate::reml::unified::DriftDerivResult::Dense)).
@@ -1747,6 +1767,26 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
             return self.family.mixed_sigma_aux_second_order();
         }
         self.family.psi_second_order_terms(psi_i, psi_j)
+    }
+
+    fn second_order_terms_contracted(
+        &self,
+        alpha_psi: &[f64],
+    ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String> {
+        // The σ-auxiliary axes do not participate in the family's combined
+        // non-σ row stream (their second-order terms come from a separate
+        // σ/σ and mixed-σ path with no directional row kernel). If any
+        // σ-aux axis carries weight in this applied direction, decline the
+        // contracted fast path entirely so the caller keeps the exact
+        // per-pair assembly — the contracted hook is a representation/cost
+        // choice, never an approximation, so falling back is the correct
+        // behaviour rather than dropping the σ contribution.
+        for (j, &weight) in alpha_psi.iter().enumerate() {
+            if weight != 0.0 && self.family.is_sigma_aux(j) {
+                return Ok(None);
+            }
+        }
+        self.family.psi_second_order_terms_contracted(alpha_psi)
     }
 
     fn hessian_directional_derivative(
