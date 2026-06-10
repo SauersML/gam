@@ -1076,6 +1076,37 @@ impl HessianDerivativeProvider for SinglePredictorGlmDerivatives {
         Ok(Some(result))
     }
 
+    /// #901 layer-2 fix: the first-order correction stays in OPERATOR form.
+    ///
+    /// `coord_corrections` (the ρ AND ψ logdet-gradient drifts) are built
+    /// through this method; returning `DriftDerivResult::Operator` routes
+    /// every downstream spectral-kernel trace through
+    /// `reduce_operator`/`trace_operator`, whose `C·u_a` probes evaluate the
+    /// near-null quadratic forms stably (see
+    /// [`GlmCurvatureCorrectionOperator`]). The dense
+    /// `hessian_derivative_correction` above remains for consumers that
+    /// genuinely need the materialized block (outer-Hessian pair assembly).
+    fn hessian_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        let x_v = self.x_transformed.matrixvectormultiply(v_k);
+        let crate::pirls::DirectionalWorkingCurvature::Diagonal(mut neg_c_xv) =
+            crate::pirls::directionalworking_curvature_from_c_array(
+                &self.c_array,
+                &self.hessian_weights,
+                &x_v,
+            );
+        neg_c_xv.mapv_inplace(|value| -value);
+        Ok(Some(DriftDerivResult::Operator(Arc::new(
+            GlmCurvatureCorrectionOperator {
+                x_design: self.x_transformed.clone(),
+                neg_c_xv,
+                p: self.x_transformed.ncols(),
+            },
+        ))))
+    }
+
     fn hessian_second_derivative_correction(
         &self,
         v_k: &Array1<f64>,
@@ -1214,6 +1245,39 @@ impl HessianDerivativeProvider for FirthAwareGlmDerivatives {
         result -= &firth_first;
         result -= &firth_second;
         Ok(Some(result))
+    }
+
+    /// #901 layer-2: keep the base GLM cubic correction in operator form and
+    /// graft the (dense, well-conditioned) Firth part on through
+    /// [`CompositeHyperOperator`], mirroring `BarrierDerivativeProvider`.
+    /// The roundoff-critical near-null quadratic forms live entirely in the
+    /// base `Xᵀ diag(c⊙Xv) X` sandwich; the Firth `−D(Hφ)[B_k]` block stays
+    /// dense as before.
+    fn hessian_derivative_correction_result(
+        &self,
+        v_k: &Array1<f64>,
+    ) -> Result<Option<DriftDerivResult>, String> {
+        let base = self.base.hessian_derivative_correction_result(v_k)?;
+
+        let deta_k: Array1<f64> =
+            crate::faer_ndarray::fast_av(&self.firth_op.x_dense, v_k).mapv(|v| -v);
+        let dir_k = self.firth_op.direction_from_deta(deta_k);
+        let neg_firth_corr = -self.firth_op.hphi_direction(&dir_k);
+
+        match base {
+            Some(DriftDerivResult::Operator(operator)) => Ok(Some(DriftDerivResult::Operator(
+                Arc::new(CompositeHyperOperator {
+                    dense: Some(neg_firth_corr),
+                    operators: vec![operator],
+                    dim_hint: self.base.x_transformed.ncols(),
+                }),
+            ))),
+            Some(DriftDerivResult::Dense(mut dense)) => {
+                dense += &neg_firth_corr;
+                Ok(Some(DriftDerivResult::Dense(dense)))
+            }
+            None => Ok(Some(DriftDerivResult::Dense(neg_firth_corr))),
+        }
     }
 
     fn has_corrections(&self) -> bool {
@@ -4129,6 +4193,54 @@ impl HyperOperator for SparseDirectionalHyperOperator {
     }
     fn as_sparse_directional(&self) -> Option<&SparseDirectionalHyperOperator> {
         Some(self)
+    }
+}
+
+/// Matrix-free GLM cubic-correction drift `C[v] = −Xᵀ diag(c ⊙ X v) X`
+/// (rows masked to the active Hessian-curvature surface, sign folded into
+/// the stored diagonal).
+///
+/// # Why this must stay an operator (#901 layer 2)
+///
+/// The spectral logdet kernel evaluates `tr(H⁺ · C)` as
+/// `Σ_a (1/σ_a) · u_aᵀ C u_a` over the eigenpairs of `H_pen`. For a
+/// near-null eigenvector (`σ_min ~ 1e−4` on the Duchon fixtures) the true
+/// quadratic form is tiny — `‖X u_a‖² ≲ σ_a / w_min` — but a DENSE
+/// materialization of `C` computes it as a cancellation across entries of
+/// magnitude `‖C‖`, leaving roundoff `~ ε‖C‖p` that the kernel then
+/// amplifies by `1/σ_min`. On the iso-κ Duchon binomial FD drivers this
+/// turned a true cubic trace of `−0.30` into `+39.0`, and `~−7.7e5` on the
+/// κ-scaled ψ arms where `‖C‖ ~ λ · ∂S/∂ψ` — the dominant #901 blow-up.
+///
+/// In operator form the kernel probes `C · u_a = −Xᵀ(d ⊙ (X u_a))`: the
+/// cancellation happens inside the `X u_a` matvec (error `~ ε‖X‖‖u_a‖`),
+/// and the quadratic form is the *square* of that already-small vector —
+/// tiny² stays tiny, so the `1/σ_a` amplification acts on a relatively
+/// accurate value. This is the same stability argument as evaluating
+/// leverages via `(X u)ᵀ d (X u)` instead of `uᵀ (XᵀdX) u`.
+pub struct GlmCurvatureCorrectionOperator {
+    /// Design matrix X in the transformed basis (matrix-free capable).
+    pub(crate) x_design: DesignMatrix,
+    /// Pre-masked, sign-folded diagonal `−(c ⊙ X v)` over active rows.
+    pub(crate) neg_c_xv: Array1<f64>,
+    /// Total coefficient dimension.
+    pub(crate) p: usize,
+}
+
+impl HyperOperator for GlmCurvatureCorrectionOperator {
+    fn dim(&self) -> usize {
+        self.p
+    }
+
+    fn mul_vec(&self, v: &Array1<f64>) -> Array1<f64> {
+        assert_eq!(v.len(), self.p);
+        let x_v = self.x_design.matrixvectormultiply(v);
+        let weighted = &self.neg_c_xv * &x_v;
+        self.x_design.transpose_vector_multiply(&weighted)
+    }
+
+    fn is_implicit(&self) -> bool {
+        false
     }
 }
 
