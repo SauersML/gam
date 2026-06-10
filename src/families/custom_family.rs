@@ -21785,7 +21785,6 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
 /// `score`, `S_{ψiψj}` as a `BlockLocalDrift` into `hessian`, and the
 /// `tau_hessian_component` into `ld_s`). Same-block-only, matching `ext_ext`.
 fn build_contracted_psi_hook(
-    synced_states: &[ParameterBlockState],
     specs: &[ParameterBlockSpec],
     derivative_blocks: SharedDerivativeBlocks,
     beta_flat: &Array1<f64>,
@@ -22677,7 +22676,6 @@ fn evaluate_custom_family_hyper_internal_shared<F: CustomFamily + Clone + Send +
                 // per-pair `ext_ext_fn` path. Built before the drift callback
                 // moves `psi_workspace`.
                 let contracted_psi_fn = build_contracted_psi_hook(
-                    synced_joint_states.as_ref(),
                     specs,
                     Arc::clone(&derivative_blocks),
                     &beta_flat,

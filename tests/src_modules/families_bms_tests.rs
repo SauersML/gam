@@ -6166,6 +6166,12 @@ fn auto_latent_measure_uses_rank_int_calibration_for_bad_normal_diagnostics() {
         LatentMeasureCalibration::None => {
             panic!("bad-normal latent z must produce a RankInverseNormal calibration")
         }
+        LatentMeasureCalibration::ConditionalLocationScale(_) => {
+            panic!(
+                "conditioning=None cannot fire the E[z|C]/Var(z|C) Rao gate, so the \
+                 calibration must never be ConditionalLocationScale here"
+            )
+        }
     }
 }
 

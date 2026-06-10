@@ -1802,6 +1802,14 @@ impl GrassmannFrame {
         self.frame.ncols()
     }
 
+    /// Canonical descending singular values of the cross-moment that fixed this
+    /// frame's column ordering (issue #972). Exposed so the serialization /
+    /// canonicalization path can read the recorded gauge and reproduce the same
+    /// span byte-for-byte (no run-to-run rotation drift).
+    pub fn gauge_singular_values(&self) -> &Array1<f64> {
+        &self.gauge_singular_values
+    }
+
     /// Read-only view of the orthonormal frame `U` (`p × r`).
     pub fn frame(&self) -> ArrayView2<'_, f64> {
         self.frame.view()
@@ -10764,6 +10772,7 @@ pub fn grassmann_assert_border_dim_invariant(term: &SaeManifoldTerm) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terms::analytic_penalties::ARDPenalty;
     use crate::terms::analytic_penalties::IsometryReference;
     use approx::assert_abs_diff_eq;
     use ndarray::array;
