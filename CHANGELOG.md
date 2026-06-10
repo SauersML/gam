@@ -1,3 +1,87 @@
+## v0.3.109 — gam 0.3.109 / gamfit 0.1.190 (2026-06-10)
+
+Crate + wheel release rolling up the correctness fixes and the new
+inference / SAE / topology / survival surface landed since gam 0.3.108 /
+gamfit 0.1.189. (The intervening gamfit 0.1.190 wheel never reached PyPI —
+its build broke on a `gam-pyffi` site that lagged the #983 `theta_fixed`
+refactor; that and the rest of the `-D warnings` / ban-gate breaks are fixed
+here, so the wheel builds green again.)
+
+Family / link / survival correctness:
+- fix(#947): binomial 4th central moment uses the 3rd inverse-link pdf
+  derivative (μ''''), not the 5th.
+- fix(#948): exact binomial derivative towers in the saturated tails — no
+  clamped-μ surrogate (the derivative path is the derivative of the evaluated
+  row loss).
+- fix(#953): integrated observation variance uses the Tweedie φ / Gamma
+  shape, not a hard-wired φ=1.
+- fix(#961): the link is validated against the explicit family instead of
+  inferring a conflicting family from the link.
+- fix(#963): exact public Log inverse-link jet on the predict surface (the
+  solver keeps its internal clamp).
+- fix(#964/#965/#966): survival FFI fallback S→H, negative-time handling, and
+  hazard-differencing math corrected.
+- fix(#983): a fixed `--negative-binomial-theta` is honored end-to-end
+  (`theta_fixed` routed through every call site) instead of being silently
+  re-estimated.
+
+Geometry / manifolds / REML:
+- fix(#949): Sphere / Euclidean `sectional_curvature` validates a
+  nondegenerate tangent 2-plane before dividing by the wedge area.
+- fix(#950): `simplex_exp_map` CLR requires a strictly-positive base.
+- fix(#951): `signed_log_sum_exp` propagates +∞ log-magnitudes correctly.
+- fix(#952): Fisher-Rao precision blocks validated PSD (PD on the Cholesky
+  path), not merely symmetric with non-negative diagonal.
+- fix(#954): optimizer stationarity uses the shift-invariant
+  ‖grad_k‖/‖grad_0‖ measure at both call sites.
+- fix(#955): the Euclidean differential is raised to the Riemannian gradient
+  through the metric.
+- fix(#957): the trust-region radius is constrained 0 < radius ≤ max_radius
+  before the first step.
+- fix(#967): a shared per-smooth λ makes the response-geometry tangent fit
+  frame-equivariant.
+- fix(#901): intrinsic pseudo-logdet over range(H_pen); the custom-family
+  joint trace kernel uses the full spectral M⁺; the GLM cubic-correction drift
+  stays in operator form (no near-null dense-C[v] roundoff blow-up).
+- fix(#902): Matérn ψ-derivative penalty enumeration aligned with the forward
+  gate (RKHS rule j ≤ ν + d/2).
+- fix(#978): persisted + replayed global-orthogonality chart so an overlapping
+  global + factor smooth on the same covariate residualizes consistently.
+- fix(#780): the LinearOperator seam is wired into weighted_design_products.
+
+SINDy / SCAD-MCP:
+- fix(#958/#959): per-output STLSQ support masks and per-coordinate SCAD/MCP
+  LQA weights.
+
+New surface:
+- feat(#986): per-atom decoupled Extended Fellner–Schall as the primary outer
+  at frontier ρ-scale (auto-switched into `run_outer`), with a matrix-free
+  θ-HVP (#740) for the shared-border coupled correction.
+- feat(#931/#935): the profiled criterion calculus — LAML as
+  self-differentiating atoms over one sensitivity operator (factored H⁺;
+  β̇ / ALO / influence / case-deletion / θ-HVP as its contractions).
+- feat(#932): Taylor-jet tower algebra (`Tower4<K>`) — write a family's row
+  log-likelihood once, derive its whole `RowKernel` derivative tower exactly.
+- feat(#942): exact full-conformal prediction for penalized GAMs (Layer 1).
+- feat(#944): a `ConstantCurvature` manifold family through κ=0 with exact
+  κ-jets riding the #932 tower.
+- feat(#973): streaming out-of-core border-Gram accumulator on a deterministic
+  pairwise-reduction tree (order-invariant, resumable) + the streaming SAE
+  corpus driver.
+- feat(#974): structured-residual estimator with a single likelihood-whitening
+  seam.
+- feat(#972/#985/#987): low-rank Grassmann decoder frames; a sublinear
+  candidate-atom index for active-set proposal; frontier distribution +
+  two-tier Fisher-on-subsample harvest economics.
+- feat(inference): SAE-manifold diagnostics — two-lens per-atom (presence vs
+  behavioral coupling) diagnostic, residual-gauge certificate, Fisher-mass
+  enrichment ordering, provenance-carrying RowMetric; plus the steering
+  primitive (`sae_steer_delta` FFI + `ManifoldSAE.steer`) with output
+  dosimetry, validity radius, and an off-manifold guard.
+- feat(#907): discrete-mixture and union-candidate rungs in the topology race
+  with selection-time stacking.
+- feat(#741): `SmgsLiftViaT::lift_covariance_via_t` inference pushforward.
+
 ## gamfit 0.1.189 (2026-06-09)
 
 PyPI wheel release on top of gam 0.3.108, rolling up the survival + predict
