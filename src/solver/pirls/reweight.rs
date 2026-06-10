@@ -131,6 +131,61 @@ fn constraint_kkt_admits_soft_accept(
     }
 }
 
+/// Constraint-KKT cleanliness gate for the LONG (20-iteration) constrained
+/// objective-plateau certificate — the stall exit for fits whose objective is
+/// genuinely exhausted while the raw stationarity residual stays above the
+/// `near_stationary_kkt` band (e.g. a shallow, almost-linear direction where
+/// the gradient is small-but-not-tiny and every Newton step buys progress far
+/// below the convergence tolerance).
+///
+/// Deliberately DIFFERENT from [`constraint_kkt_admits_soft_accept`]: the
+/// stationarity band is *not* required here. What discriminates a legitimate
+/// progress-exhausted stall from the failure modes the stationarity band
+/// protects against is carried by the certificate's other conjuncts:
+///
+/// * **Value↔gradient desync** (the recurring objective/gradient drift class)
+///   cannot certify: its quadratic model keeps PREDICTING above-tolerance
+///   progress that the value never realizes, and the long-plateau branch
+///   requires the model-predicted reduction itself to be sub-tolerance for
+///   the whole streak (see `model_progress_exhausted` at the call site).
+/// * **The #873 degenerate-vertex stall** cannot certify: a rank-deficient
+///   working set is refused outright here (the fast 2-iteration path keeps
+///   its relaxed degenerate band — that path still demands stationarity).
+/// * **A wrong-side or infeasible iterate** cannot certify: primal
+///   feasibility, dual feasibility (no wrong-sign multipliers), and
+///   complementarity must all sit inside the same bands the outer gate uses.
+///
+/// At a strictly-interior iterate every constraint-KKT component except
+/// stationarity is exactly zero, so this gate reduces to "feasible, clean,
+/// non-degenerate" — which is precisely the set of states for which a
+/// 20-iteration monotone sub-tolerance plateau with a sub-tolerance model
+/// prediction is an honest "no useful progress is available" certificate.
+fn constraint_kkt_admits_progress_exhausted_stall(
+    options: &WorkingModelPirlsOptions,
+    beta: &Array1<f64>,
+    gradient: &Array1<f64>,
+    kkt_tolerance: f64,
+) -> bool {
+    let diag = match options.linear_constraints.as_ref() {
+        Some(lin) => Some(compute_constraint_kkt_diagnostics(beta, gradient, lin)),
+        None => options.coefficient_lower_bounds.as_ref().and_then(|lb| {
+            linear_constraints_from_lower_bounds(lb)
+                .map(|lin| compute_constraint_kkt_diagnostics(beta, gradient, &lin))
+        }),
+    };
+    match diag {
+        None => true,
+        Some(kkt) => {
+            let cleanliness_band = kkt_tolerance * 10.0;
+            !kkt.working_set_rank_deficient
+                && kkt.primal_feasibility
+                    <= crate::solver::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+                && kkt.dual_feasibility <= cleanliness_band
+                && kkt.complementarity <= cleanliness_band
+        }
+    }
+}
+
 pub fn runworking_model_pirls<M, F>(
     model: &mut M,
     mut beta: Coefficients,
