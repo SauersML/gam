@@ -1987,29 +1987,36 @@ pub type FixedDriftDerivFn =
 
 /// Direction-contracted second-order ψ terms for the profiled θ-HVP (#740).
 ///
-/// Given the ψ-block weights `α_ψ` (the ψ slice of one applied outer
-/// direction), returns the `α`-contraction of every `(ψ_i, ψ_j)` second-order
-/// likelihood term against the combined ψ-direction `ψ(α) = Σ_j α_j ψ_j`, as a
-/// per-ψ-output-row triple:
+/// One applied outer direction `α = (α_ρ, α_ψ)` contracted against the combined
+/// ψ-direction `ψ(α) = Σ_j α_ψ[j] ψ_j`, returned per ψ output row `i`. Carries
+/// BOTH the family likelihood ψψ second-order terms AND the generic penalty
+/// motion (S_ψψ and the ρψ cross S_ρψ from the ρ part of `α`), so the consumer
+/// reproduces exactly the `α`-contraction of the per-pair ψ rows the dense path
+/// assembles via `rho_ext_pair_fn` / `ext_coord_pair_fn`.
 ///
-/// - `objective[i] = Σ_j α_j V_{ψ_i ψ_j}`,
-/// - `score` rows `score.row(i) = Σ_j α_j g_{ψ_i ψ_j}` (`ψ_dim × p`),
-/// - `hessian[i] = D²_ψ H_L[ψ_i, ψ(α)]` (the fixed-β ψ-design second drift
-///   `tr`-able through the logdet kernel, i.e. the `base_h2` ψψ contribution).
+/// Indexing of every field is the ψ output row (`ext_dim` of them, the order of
+/// `solution.ext_coords`):
+/// - `objective[i] = Σ_j α_ψ[j] V_{ψ_i ψ_j}` (+ penalty `½βᵀS_{ψ_iψ_j}β`),
+/// - `score.row(i) = Σ_j α_ψ[j] g_{ψ_i ψ_j}` (+ penalty `S_{ψ_iψ_j}β` and the
+///   ρψ cross `Σ_k α_ρ[k] S_{ρ_k ψ_i}β`), an `ext_dim × p` matrix,
+/// - `hessian[i] = Σ_j α_ψ[j] D²_ψ H_L[ψ_i, ψ_j]` (+ penalty `S_{ψ_iψ_j}`), the
+///   `base_h2` ψψ contribution as a `tr`-able drift,
+/// - `ld_s[i] = Σ_j α_ψ[j] ∂²log|S|/∂ψ_i∂ψ_j` (+ the ρψ cross), the
+///   `pair_ld_s` ψ-row contribution.
 ///
-/// This is the single-pass replacement for the `K²` per-pair callbacks the
-/// outer-Hessian builder would otherwise enumerate (each tracing a distinct
-/// `D²_ψ H_L[ψ_i, ψ_j]` operator at `O(n·r)`): one call produces every output
-/// row in one family row pass, so densifying the operator costs `K` such passes
-/// instead of `K²`.  Returns `None` to decline the fast path (the builder then
-/// keeps the exact per-pair assembly).  Defined over solver-level types so the
-/// solver layer carries no `families::*` coupling; the family side fills it from
-/// `ExactNewtonJointPsiSecondOrderContracted`.
-pub type ContractedPsiSecondOrderFn = Arc<
-    dyn Fn(&[f64]) -> Result<Option<(Array1<f64>, Array2<f64>, Vec<DriftDerivResult>)>, String>
-        + Send
-        + Sync,
->;
+/// One call produces every output row in a single family row pass (the family
+/// likelihood part) plus cheap block-local penalty assembly, so densifying the
+/// operator costs `K` such passes instead of the dense path's `K²`. `None`
+/// declines the fast path (the builder keeps the exact per-pair assembly).
+pub struct ContractedPsiSecondOrder {
+    pub objective: Array1<f64>,
+    pub score: Array2<f64>,
+    pub hessian: Vec<DriftDerivResult>,
+    pub ld_s: Array1<f64>,
+}
+
+pub type ContractedPsiSecondOrderFn =
+    Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Implicit Hessian-drift operators for scalable anisotropic REML
