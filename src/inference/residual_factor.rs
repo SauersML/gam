@@ -726,7 +726,9 @@ mod tests {
     use ndarray::{Array1, Array2};
 
     fn lcg_uniform(state: &mut u64) -> f64 {
-        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((*state >> 11) as f64) / ((1u64 << 53) as f64)
     }
 
@@ -776,7 +778,14 @@ mod tests {
             let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
             let log_lik = m.log_evidence() + 0.5 * k_params * (n as f64).ln();
             let col_norms: Vec<f64> = (0..rank)
-                .map(|k| m.factor().column(k).iter().map(|v| v * v).sum::<f64>().sqrt())
+                .map(|k| {
+                    m.factor()
+                        .column(k)
+                        .iter()
+                        .map(|v| v * v)
+                        .sum::<f64>()
+                        .sqrt()
+                })
                 .collect();
             report.push_str(&format!(
                 "rank {rank}: evidence={:.3} loglik={:.3} penalty={:.3} col_norms={:?} diag={:?}\n",
@@ -784,7 +793,10 @@ mod tests {
                 log_lik,
                 0.5 * k_params * (n as f64).ln(),
                 col_norms,
-                m.diagonal().iter().map(|v| (v * 1e4).round() / 1e4).collect::<Vec<_>>()
+                m.diagonal()
+                    .iter()
+                    .map(|v| (v * 1e4).round() / 1e4)
+                    .collect::<Vec<_>>()
             ));
             ev.push(m.log_evidence());
         }

@@ -2255,12 +2255,12 @@ impl SaeManifoldAtom {
         // the top-`r` right singular vectors of `B_k`. Use the SVD of `B_k`
         // directly: `B_k = W Σ Vᵀ` (W: M×?, Vᵀ: ?×p) ⇒ frame = top-`r` rows of `Vᵀ`
         // transposed = top-`r` columns of `V` (`p × r`).
-        let (_w, sv, vt_opt) = self
-            .decoder_coefficients
-            .svd(false, true)
-            .map_err(|e| format!("SaeManifoldAtom::maybe_activate_decoder_frame: SVD failed: {e}"))?;
+        let (_w, sv, vt_opt) = self.decoder_coefficients.svd(false, true).map_err(|e| {
+            format!("SaeManifoldAtom::maybe_activate_decoder_frame: SVD failed: {e}")
+        })?;
         let vt = vt_opt.ok_or_else(|| {
-            "SaeManifoldAtom::maybe_activate_decoder_frame: SVD returned no right factor".to_string()
+            "SaeManifoldAtom::maybe_activate_decoder_frame: SVD returned no right factor"
+                .to_string()
         })?;
         // `vt` is `min(M,p) × p`; take its top-`r` rows as the frame columns.
         let available = vt.nrows();
@@ -2294,7 +2294,9 @@ impl SaeManifoldAtom {
     /// a frame is active (issue #972). Returns `None` on the full-`B` path.
     pub fn factored_coordinates(&self) -> Result<Option<Array2<f64>>, String> {
         match &self.decoder_frame {
-            Some(frame) => Ok(Some(frame.project_decoder(self.decoder_coefficients.view())?)),
+            Some(frame) => Ok(Some(
+                frame.project_decoder(self.decoder_coefficients.view())?,
+            )),
             None => Ok(None),
         }
     }
@@ -2340,9 +2342,7 @@ impl SaeManifoldAtom {
         cross_moment: ArrayView2<'_, f64>,
     ) -> Result<(), String> {
         if self.decoder_frame.is_none() {
-            return Err(
-                "SaeManifoldAtom::refresh_frame_from_cross_moment: no active frame".into(),
-            );
+            return Err("SaeManifoldAtom::refresh_frame_from_cross_moment: no active frame".into());
         }
         let new_frame = GrassmannFrame::polar_update(cross_moment)?;
         if new_frame.output_dim() != self.output_dim() {
@@ -3558,10 +3558,9 @@ impl SaeManifoldTerm {
     fn diagnostic_metric(&self) -> Result<crate::inference::row_metric::RowMetric, String> {
         match self.row_metric() {
             Some(metric) => Ok(metric.clone()),
-            None => crate::inference::row_metric::RowMetric::euclidean(
-                self.n_obs(),
-                self.output_dim(),
-            ),
+            None => {
+                crate::inference::row_metric::RowMetric::euclidean(self.n_obs(), self.output_dim())
+            }
         }
     }
 
@@ -3966,7 +3965,10 @@ impl SaeManifoldTerm {
     /// many free dimensions to the model. `0` when every atom is on the full-`B`
     /// path. Threaded into [`Self::reml_occam_term`].
     pub fn grassmann_evidence_dimension(&self) -> usize {
-        self.atoms.iter().map(|a| a.frame_manifold_dimension()).sum()
+        self.atoms
+            .iter()
+            .map(|a| a.frame_manifold_dimension())
+            .sum()
     }
 
     /// True iff any atom has an active low-rank Grassmann frame (issue #972).
@@ -4039,7 +4041,11 @@ impl SaeManifoldTerm {
             let off = offsets[atom_idx];
             let (r, m, has_frame) = {
                 let atom = &self.atoms[atom_idx];
-                (atom.border_frame_rank(), atom.basis_size(), atom.decoder_frame.is_some())
+                (
+                    atom.border_frame_rank(),
+                    atom.basis_size(),
+                    atom.decoder_frame.is_some(),
+                )
             };
             let mut coords = Array2::<f64>::zeros((m, r));
             for basis_col in 0..m {
@@ -14893,21 +14899,23 @@ mod tests {
         )
         .unwrap();
         let activated = atom.maybe_activate_decoder_frame().expect("activate");
-        assert_eq!(activated, Some(r), "rank-{r} decoder should profile to r={r}");
+        assert_eq!(
+            activated,
+            Some(r),
+            "rank-{r} decoder should profile to r={r}"
+        );
         assert_eq!(atom.border_frame_rank(), r);
         assert_eq!(atom.frame_manifold_dimension(), r * (p - r));
 
         // Reconstruction recovers B_k to machine precision.
         let coords = atom.factored_coordinates().unwrap().expect("coords");
         assert_eq!(coords.dim(), (m, r));
-        let reconstructed = atom.reconstruct_decoder_coefficients(coords.view()).unwrap();
+        let reconstructed = atom
+            .reconstruct_decoder_coefficients(coords.view())
+            .unwrap();
         for mu in 0..m {
             for j in 0..p {
-                assert_abs_diff_eq!(
-                    reconstructed[[mu, j]],
-                    decoder[[mu, j]],
-                    epsilon = 1.0e-9
-                );
+                assert_abs_diff_eq!(reconstructed[[mu, j]], decoder[[mu, j]], epsilon = 1.0e-9);
             }
         }
 
@@ -14974,7 +14982,10 @@ mod tests {
         )
         .unwrap();
         let activated = atom.maybe_activate_decoder_frame().expect("activate");
-        assert_eq!(activated, None, "full-rank small-p must stay on full-B path");
+        assert_eq!(
+            activated, None,
+            "full-rank small-p must stay on full-B path"
+        );
         assert!(atom.decoder_frame.is_none());
         assert_eq!(atom.border_frame_rank(), p);
         assert_eq!(atom.frame_manifold_dimension(), 0);

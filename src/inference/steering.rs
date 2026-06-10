@@ -211,9 +211,8 @@ pub fn steer_delta(
 
     // Whether the metric can/does match this term and carries behavior.
     let provenance = metric.provenance();
-    let behavior_available = metric_carries_behavior(provenance)
-        && metric.n_rows() == n
-        && metric.p_out() == p;
+    let behavior_available =
+        metric_carries_behavior(provenance) && metric.n_rows() == n && metric.p_out() == p;
 
     // --- off-manifold guard -------------------------------------------------
     // Project δ onto the span of the local decoder tangents ∂g_k/∂t and report
@@ -228,7 +227,8 @@ pub fn steer_delta(
     for a in 0..d {
         t_mid[a] = 0.5 * (t_from[a] + t_to[a]);
     }
-    let tangents = decode_tangents_at(evaluator.as_ref(), &atom.decoder_coefficients, &t_mid, p, d)?;
+    let tangents =
+        decode_tangents_at(evaluator.as_ref(), &atom.decoder_coefficients, &t_mid, p, d)?;
     let off_manifold_norm = off_manifold_residual_norm(&tangents, delta.view());
 
     // --- dosimetry: path-integrated Fisher dose -----------------------------
@@ -526,11 +526,7 @@ fn path_integrated_dose(
 /// pure surface curvature: on a flat decoder the two agree for every `τ` and the
 /// radius is the whole move. If the metric kills the tangent (no linear effect to
 /// validate), the move is trusted to its full length.
-fn validity_radius(
-    ctx: &SteerContext<'_>,
-    t_from: &[f64],
-    t_to: &[f64],
-) -> Result<f64, String> {
+fn validity_radius(ctx: &SteerContext<'_>, t_from: &[f64], t_to: &[f64]) -> Result<f64, String> {
     let d = ctx.d;
     let p = ctx.p;
     let full_len: f64 = t_from

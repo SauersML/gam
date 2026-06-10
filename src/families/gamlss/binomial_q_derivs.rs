@@ -639,8 +639,7 @@ mod tests {
             (0.1_f64, 3.0_f64, 1.3_f64),
             (0.6_f64, 0.5_f64, -1.1_f64),
         ] {
-            let fd = (-cauchit_m3(y, weight, q + 2.0 * h)
-                + 8.0 * cauchit_m3(y, weight, q + h)
+            let fd = (-cauchit_m3(y, weight, q + 2.0 * h) + 8.0 * cauchit_m3(y, weight, q + h)
                 - 8.0 * cauchit_m3(y, weight, q - h)
                 + cauchit_m3(y, weight, q - 2.0 * h))
                 / (12.0 * h);
@@ -676,7 +675,13 @@ mod tests {
     fn logit_jet(q: f64) -> (f64, f64, f64, f64, f64) {
         let p = 1.0 / (1.0 + (-q).exp());
         let s = p * (1.0 - p);
-        (p, s, s * (1.0 - 2.0 * p), s * (1.0 - 6.0 * s), s * (1.0 - 2.0 * p) * (1.0 - 12.0 * s))
+        (
+            p,
+            s,
+            s * (1.0 - 2.0 * p),
+            s * (1.0 - 6.0 * s),
+            s * (1.0 - 2.0 * p) * (1.0 - 12.0 * s),
+        )
     }
 
     #[test]
@@ -701,10 +706,22 @@ mod tests {
             let j4 = binomial_neglog_q_fourth_derivative_from_jet(y, w, mu, d1, d2, d3, d4);
 
             let tol = 1e-9 * (1.0 + m1.abs() + m2.abs() + m3.abs() + m4.abs());
-            assert!((m1 - s1).abs() < tol, "m1 mismatch q={q}: closed={m1} jet={s1}");
-            assert!((m2 - c2).abs() < tol, "m2 mismatch q={q}: closed={m2} jet={c2}");
-            assert!((m3 - t3).abs() < tol, "m3 mismatch q={q}: closed={m3} jet={t3}");
-            assert!((m4 - j4).abs() < tol, "m4 mismatch q={q}: closed={m4} jet={j4}");
+            assert!(
+                (m1 - s1).abs() < tol,
+                "m1 mismatch q={q}: closed={m1} jet={s1}"
+            );
+            assert!(
+                (m2 - c2).abs() < tol,
+                "m2 mismatch q={q}: closed={m2} jet={c2}"
+            );
+            assert!(
+                (m3 - t3).abs() < tol,
+                "m3 mismatch q={q}: closed={m3} jet={t3}"
+            );
+            assert!(
+                (m4 - j4).abs() < tol,
+                "m4 mismatch q={q}: closed={m4} jet={j4}"
+            );
         }
     }
 
@@ -775,8 +792,7 @@ mod tests {
         // exactly zero — never NaN, ∞, or a clipped surrogate.
         for &mu in &[0.0_f64, 1.0, -0.0, f64::NAN, f64::INFINITY] {
             let (s, c, t) = binomial_score_curvaturethird_from_jet(0.7, 2.0, mu, 1.0, 0.5, 0.1);
-            let m4 =
-                binomial_neglog_q_fourth_derivative_from_jet(0.7, 2.0, mu, 1.0, 0.5, 0.1, 0.2);
+            let m4 = binomial_neglog_q_fourth_derivative_from_jet(0.7, 2.0, mu, 1.0, 0.5, 0.1, 0.2);
             assert_eq!(
                 (s, c, t),
                 (0.0, 0.0, 0.0),

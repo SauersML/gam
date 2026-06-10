@@ -171,8 +171,7 @@ pub fn t_stacks(w: f64) -> [f64; 5] {
             for m in j..(j + T_SERIES_TERMS) {
                 let mf = m as f64;
                 let jf = j as f64;
-                term *= -w * (mf + 1.0) * (2.0 * mf + 1.0)
-                    / ((mf + 1.0 - jf) * (2.0 * mf + 3.0));
+                term *= -w * (mf + 1.0) * (2.0 * mf + 1.0) / ((mf + 1.0 - jf) * (2.0 * mf + 3.0));
                 acc += term;
             }
             *slot = acc;
@@ -277,11 +276,7 @@ impl ConstantCurvature {
     }
 
     /// Geodesic distance `d_κ(x, y) = 2·‖w‖·T(κ‖w‖²)`, `w = (−x) ⊕_κ y`.
-    pub fn distance(
-        &self,
-        x: ArrayView1<'_, f64>,
-        y: ArrayView1<'_, f64>,
-    ) -> GeometryResult<f64> {
+    pub fn distance(&self, x: ArrayView1<'_, f64>, y: ArrayView1<'_, f64>) -> GeometryResult<f64> {
         self.check_len("constant-curvature distance x", x.len())?;
         self.check_len("constant-curvature distance y", y.len())?;
         self.chart_gauge(x)?;
@@ -461,7 +456,10 @@ impl RiemannianManifold for ConstantCurvature {
     ) -> GeometryResult<(Array1<f64>, Array1<f64>)> {
         self.check_len("constant-curvature exp_map_vjp point", point.len())?;
         self.check_len("constant-curvature exp_map_vjp tangent", tangent_vec.len())?;
-        self.check_len("constant-curvature exp_map_vjp grad_output", grad_output.len())?;
+        self.check_len(
+            "constant-curvature exp_map_vjp grad_output",
+            grad_output.len(),
+        )?;
         if self.kappa.abs() <= GEOMETRY_EPS {
             return Ok((grad_output.to_owned(), grad_output.to_owned()));
         }
@@ -654,7 +652,9 @@ mod tests {
     #[test]
     fn scalar_stacks_are_fd_consistent_across_branches() {
         let h = 1e-6;
-        for &u in &[-3.0, -0.6, -0.49, -0.2, -1e-9, 0.0, 1e-9, 0.2, 0.49, 0.6, 3.0] {
+        for &u in &[
+            -3.0, -0.6, -0.49, -0.2, -1e-9, 0.0, 1e-9, 0.2, 0.49, 0.6, 3.0,
+        ] {
             let up = cs_stacks(u + h);
             let dn = cs_stacks(u - h);
             let at = cs_stacks(u);
@@ -718,11 +718,17 @@ mod tests {
         let v = array![0.2, -0.5, 0.3];
         let e = flat.exp_map(x.view(), v.view()).expect("flat exp");
         for i in 0..3 {
-            assert!((e[i] - (x[i] + v[i])).abs() <= 1e-14, "flat exp is translation");
+            assert!(
+                (e[i] - (x[i] + v[i])).abs() <= 1e-14,
+                "flat exp is translation"
+            );
         }
         let l = flat.log_map(x.view(), y.view()).expect("flat log");
         for i in 0..3 {
-            assert!((l[i] - (y[i] - x[i])).abs() <= 1e-14, "flat log is difference");
+            assert!(
+                (l[i] - (y[i] - x[i])).abs() <= 1e-14,
+                "flat log is difference"
+            );
         }
     }
 
@@ -791,7 +797,10 @@ mod tests {
             let d_up = up.distance(x.view(), y.view()).expect("d+");
             let d_dn = dn.distance(x.view(), y.view()).expect("d-");
             let d_at = m.distance(x.view(), y.view()).expect("d0");
-            assert!((d - d_at).abs() <= 1e-13 * d_at.max(1.0), "jet value channel");
+            assert!(
+                (d - d_at).abs() <= 1e-13 * d_at.max(1.0),
+                "jet value channel"
+            );
             let fd1 = (d_up - d_dn) / (2.0 * h);
             let fd2 = (d_up - 2.0 * d_at + d_dn) / (h * h);
             assert!(
@@ -900,9 +909,8 @@ mod tests {
                 for i in 0..d {
                     for j in 0..d {
                         // g^{kl} is diagonal, so only l = k contributes.
-                        let expected = 0.5
-                            * g_inv_diag
-                            * (dg[i][[j, k]] + dg[j][[i, k]] - dg[k][[i, j]]);
+                        let expected =
+                            0.5 * g_inv_diag * (dg[i][[j, k]] + dg[j][[i, k]] - dg[k][[i, j]]);
                         assert!(
                             (gamma[k][[i, j]] - expected).abs() <= 1e-6 * expected.abs().max(1.0),
                             "κ={kappa}: Γ^{k}_{{{i}{j}}} analytic {} vs FD-metric {expected}",

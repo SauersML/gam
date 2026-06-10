@@ -4746,7 +4746,8 @@ pub fn resolve_family(
             }
             // A family name that pinned its own link (e.g. "binomial-probit")
             // may not be re-pointed at a different link by `link(type=...)`.
-            if *link_pinned && explicit_spec.link.link_function() != from_link.link.link_function() {
+            if *link_pinned && explicit_spec.link.link_function() != from_link.link.link_function()
+            {
                 return Err(WorkflowError::InvalidConfig {
                     reason: format!(
                         "family '{}' pins link '{}', which conflicts with requested link '{}'",

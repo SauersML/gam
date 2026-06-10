@@ -9789,7 +9789,10 @@ fn sae_manifold_fit_inner<'py>(
     // residual-gauge certificate. Both are read through the same single metric;
     // coupling is `None` (NaN array entries) under a Euclidean / no-harvest
     // provenance, and the gauge is then certified under Euclidean provenance.
-    out.set_item("atom_two_lens", sae_atom_two_lens_dict(py, &fit_diagnostics.atom_two_lens)?)?;
+    out.set_item(
+        "atom_two_lens",
+        sae_atom_two_lens_dict(py, &fit_diagnostics.atom_two_lens)?,
+    )?;
     out.set_item(
         "residual_gauge",
         sae_residual_gauge_dict(py, &fit_diagnostics.residual_gauge)?,
@@ -9832,13 +9835,14 @@ fn sae_atom_two_lens_dict<'py>(
         "coupling_normalized",
         Array1::from_vec(coupling_norm).into_pyarray(py),
     )?;
-    d.set_item("discrepancy", Array1::from_vec(discrepancy).into_pyarray(py))?;
+    d.set_item(
+        "discrepancy",
+        Array1::from_vec(discrepancy).into_pyarray(py),
+    )?;
     d.set_item("coupling_available", report.coupling_available())?;
     d.set_item(
         "coupling_provenance",
-        report
-            .coupling_provenance
-            .map(|p| format!("{p:?}")),
+        report.coupling_provenance.map(|p| format!("{p:?}")),
     )?;
     Ok(d)
 }
@@ -9853,7 +9857,10 @@ fn sae_residual_gauge_dict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("group_signature", report.group_signature())?;
-    d.set_item("metric_provenance", format!("{:?}", report.metric_provenance))?;
+    d.set_item(
+        "metric_provenance",
+        format!("{:?}", report.metric_provenance),
+    )?;
     d.set_item("pinning_rank", report.pinning_rank)?;
     d.set_item("residual_gauge_dim", report.residual_gauge_dim)?;
     d.set_item("diffeomorphism_unpinned", report.diffeomorphism_unpinned)?;

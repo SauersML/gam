@@ -357,7 +357,9 @@ fn replicate_fits_agree_up_to_exactly_the_reported_gauge() {
     // (2) WITH the reported gauge — O(2) Procrustes on the circle embedding,
     // the Isom(S¹) factor of the certified group — they must agree.
     let aligned_cos = o2_aligned_mean_cos(&theta_a, &theta_b);
-    println!("replicate agreement: raw mean cos={raw_cos:.6}, O(2)-aligned mean cos={aligned_cos:.6}");
+    println!(
+        "replicate agreement: raw mean cos={raw_cos:.6}, O(2)-aligned mean cos={aligned_cos:.6}"
+    );
     assert!(
         raw_cos < 0.5,
         "replicates must NOT agree without gauge alignment (raw mean cos = \

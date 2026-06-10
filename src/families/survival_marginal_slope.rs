@@ -24270,10 +24270,12 @@ mod tests {
     ) -> SurvivalMarginalSlopeFamily {
         let z_col = Array2::from_shape_fn((n, 1), |(r, _)| z[r]);
         // Distinct entry/exit/derivative rows so q0 != q1 != qd1.
-        let design_entry =
-            Array2::from_shape_fn((n, 1), |(r, _)| 0.4 + 0.13 * (r as f64) - 0.05 * (r as f64).cos());
-        let design_exit =
-            Array2::from_shape_fn((n, 1), |(r, _)| 0.9 + 0.07 * (r as f64) + 0.04 * (r as f64).sin());
+        let design_entry = Array2::from_shape_fn((n, 1), |(r, _)| {
+            0.4 + 0.13 * (r as f64) - 0.05 * (r as f64).cos()
+        });
+        let design_exit = Array2::from_shape_fn((n, 1), |(r, _)| {
+            0.9 + 0.07 * (r as f64) + 0.04 * (r as f64).sin()
+        });
         // Strictly positive derivative-exit design so qd1 > 0 (monotone).
         let design_deriv =
             Array2::from_shape_fn((n, 1), |(r, _)| 1.2 + 0.21 * (r as f64).abs().sqrt());
@@ -24321,7 +24323,7 @@ mod tests {
     #[test]
     fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
         use crate::families::jet_tower::{
-            evaluate_program, verify_kernel_channels, KernelChannels,
+            KernelChannels, evaluate_program, verify_kernel_channels,
         };
         use crate::families::row_kernel::RowKernel;
 
@@ -24361,8 +24363,7 @@ mod tests {
                 },
             ];
 
-            let kernel =
-                SurvivalMarginalSlopeRowKernel::new(family.clone(), block_states.clone());
+            let kernel = SurvivalMarginalSlopeRowKernel::new(family.clone(), block_states.clone());
 
             // Build the tower program's primaries exactly as `row_kernel` reads
             // them (designs · beta_time + offsets + shared marginal/logslope eta).

@@ -119,7 +119,10 @@ fn fixture_a_certifies_a_genuine_residual_rotation_freedom() {
          rotation-invariant and the isometry pin is inactive; got pinned. {}",
         report.summary
     );
-    assert!(rot.generator_norm > 0.0, "rotation generator must be non-trivial");
+    assert!(
+        rot.generator_norm > 0.0,
+        "rotation generator must be non-trivial"
+    );
 
     // Exactly one residual freedom (the rotation): OVER-claiming guard — if the
     // certificate invented extra freedoms this count would exceed 1.

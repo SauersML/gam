@@ -185,11 +185,7 @@ impl RowMetric {
     /// through here. Because the provenance is
     /// [`MetricProvenance::WhitenedStructured`], [`Self::whitens_likelihood`] is
     /// `true`: a metric built this way is the first that whitens the likelihood.
-    pub fn whitened_structured(
-        u: Arc<Array2<f64>>,
-        p: usize,
-        rank: usize,
-    ) -> Result<Self, String> {
+    pub fn whitened_structured(u: Arc<Array2<f64>>, p: usize, rank: usize) -> Result<Self, String> {
         Self::from_factors(
             MetricProvenance::WhitenedStructured { factor_rank: rank },
             u,

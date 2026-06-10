@@ -302,7 +302,7 @@ pub fn simplex_exp_map(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{array, Array1};
+    use ndarray::{Array1, array};
 
     /// CLR exp map at a strictly-interior base with a finite tangent succeeds
     /// and lands in the open simplex (all components strictly positive, summing

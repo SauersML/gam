@@ -75,7 +75,11 @@ fn factored_quad_form_matches_dense_oracle() {
     assert_eq!(metric.provenance(), MetricProvenance::OutputFisher { rank });
 
     let residuals: Vec<Vec<f64>> = (0..n)
-        .map(|row| (0..p).map(|i| 0.5 - 0.21 * (i as f64) + 0.4 * (row as f64)).collect())
+        .map(|row| {
+            (0..p)
+                .map(|i| 0.5 - 0.21 * (i as f64) + 0.4 * (row as f64))
+                .collect()
+        })
         .collect();
 
     for row in 0..n {
@@ -91,7 +95,10 @@ fn factored_quad_form_matches_dense_oracle() {
         );
         // fisher_mass is the same quadratic read as an information mass.
         let mass = metric.fisher_mass(row, r_arr.view());
-        assert_eq!(mass, got, "fisher_mass must equal quad_form for the same vector");
+        assert_eq!(
+            mass, got,
+            "fisher_mass must equal quad_form for the same vector"
+        );
     }
 }
 
@@ -166,7 +173,9 @@ fn delta_floor_is_solver_only_and_never_enters_the_criterion() {
 
     // Every criterion-facing quantity is bit-identical between the two.
     for row in 0..n {
-        let r: Vec<f64> = (0..p).map(|i| 0.9 - 0.3 * (i as f64) + 0.2 * (row as f64)).collect();
+        let r: Vec<f64> = (0..p)
+            .map(|i| 0.9 - 0.3 * (i as f64) + 0.2 * (row as f64))
+            .collect();
         let r_arr = Array1::from(r);
         let qf0 = no_floor.quad_form(row, r_arr.view());
         let qf1 = with_floor.quad_form(row, r_arr.view());
@@ -174,7 +183,10 @@ fn delta_floor_is_solver_only_and_never_enters_the_criterion() {
 
         let w0 = no_floor.whiten_residual_row(row, r_arr.view());
         let w1 = with_floor.whiten_residual_row(row, r_arr.view());
-        assert_eq!(w0, w1, "row {row}: δ floor must not change whitened residual");
+        assert_eq!(
+            w0, w1,
+            "row {row}: δ floor must not change whitened residual"
+        );
 
         let m0 = no_floor.fisher_mass(row, r_arr.view());
         let m1 = with_floor.fisher_mass(row, r_arr.view());
@@ -205,7 +217,9 @@ fn euclidean_provenance_is_bit_identical_no_op() {
     assert_eq!(metric.solver_floor(), 0.0);
 
     for row in 0..n {
-        let r: Vec<f64> = (0..p).map(|i| 0.4 - 0.13 * (i as f64) + 0.25 * (row as f64)).collect();
+        let r: Vec<f64> = (0..p)
+            .map(|i| 0.4 - 0.13 * (i as f64) + 0.25 * (row as f64))
+            .collect();
         let r_arr = Array1::from(r.clone());
 
         // whitening is the identity (same values, same order)
@@ -320,7 +334,9 @@ fn whitened_structured_is_a_scoped_seam_for_974() {
     // For now it whitens exactly like OutputFisher (same factors).
     let of = RowMetric::output_fisher(Arc::clone(&u), p, rank).unwrap();
     for row in 0..n {
-        let r: Vec<f64> = (0..p).map(|i| 0.6 - 0.2 * i as f64 + 0.1 * row as f64).collect();
+        let r: Vec<f64> = (0..p)
+            .map(|i| 0.6 - 0.2 * i as f64 + 0.1 * row as f64)
+            .collect();
         let r_arr = Array1::from(r);
         assert_eq!(
             metric.whiten_residual_row(row, r_arr.view()),

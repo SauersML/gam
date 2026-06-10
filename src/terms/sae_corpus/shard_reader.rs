@@ -67,15 +67,24 @@ const DEFAULT_BATCH_ROWS: usize = 1024;
 #[derive(Debug)]
 pub enum ShardError {
     Io(std::io::Error),
-    BadMagic { path: PathBuf },
-    BadDtype { path: PathBuf, tag: u32 },
+    BadMagic {
+        path: PathBuf,
+    },
+    BadDtype {
+        path: PathBuf,
+        tag: u32,
+    },
     Truncated {
         path: PathBuf,
         expected: usize,
         actual: usize,
     },
     /// Two shards in one source disagree on activation width `p`.
-    WidthMismatch { expected: usize, found: usize, path: PathBuf },
+    WidthMismatch {
+        expected: usize,
+        found: usize,
+        path: PathBuf,
+    },
     Empty,
 }
 
@@ -91,12 +100,20 @@ impl std::fmt::Display for ShardError {
                 "shard '{}' has unsupported dtype tag {tag} (only f32={DTYPE_F32})",
                 path.display()
             ),
-            ShardError::Truncated { path, expected, actual } => write!(
+            ShardError::Truncated {
+                path,
+                expected,
+                actual,
+            } => write!(
                 f,
                 "shard '{}' is truncated: header expects {expected} bytes, file has {actual}",
                 path.display()
             ),
-            ShardError::WidthMismatch { expected, found, path } => write!(
+            ShardError::WidthMismatch {
+                expected,
+                found,
+                path,
+            } => write!(
                 f,
                 "shard '{}' has width p={found}, expected p={expected}",
                 path.display()
@@ -400,8 +417,8 @@ impl CorpusRowSource for MmapShardSource {
         // same deterministic order, before touching them.
         {
             let shard = &self.shards[shard_idx];
-            let first_byte = shard.data_offset
-                + self.cursor_local_row * shard.p * std::mem::size_of::<f32>();
+            let first_byte =
+                shard.data_offset + self.cursor_local_row * shard.p * std::mem::size_of::<f32>();
             let want = take * shard.p * std::mem::size_of::<f32>();
             shard.prefetch(first_byte, want.min(self.prefetch_window_bytes));
         }
@@ -460,7 +477,11 @@ mod tests {
     fn write_temp_shard(name: &str, rows: ndarray::ArrayView2<'_, f64>) -> PathBuf {
         let bytes = encode_shard_bytes(rows);
         let mut path = std::env::temp_dir();
-        path.push(format!("gam-sae-corpus-test-{}-{}.shard", std::process::id(), name));
+        path.push(format!(
+            "gam-sae-corpus-test-{}-{}.shard",
+            std::process::id(),
+            name
+        ));
         let mut f = File::create(&path).expect("create temp shard");
         f.write_all(&bytes).expect("write shard");
         f.sync_all().expect("sync shard");
@@ -530,7 +551,10 @@ mod tests {
     #[test]
     fn bad_magic_is_rejected() {
         let mut path = std::env::temp_dir();
-        path.push(format!("gam-sae-corpus-badmagic-{}.shard", std::process::id()));
+        path.push(format!(
+            "gam-sae-corpus-badmagic-{}.shard",
+            std::process::id()
+        ));
         let mut f = File::create(&path).expect("create");
         f.write_all(&[0u8; 64]).expect("write");
         f.sync_all().ok();

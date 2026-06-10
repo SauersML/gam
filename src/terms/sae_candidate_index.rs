@@ -164,10 +164,7 @@ impl RandomProjectionFrameSketch {
             }
         }
 
-        let frames: Vec<Array2<f64>> = decoder_blocks
-            .iter()
-            .map(orthonormal_frame)
-            .collect();
+        let frames: Vec<Array2<f64>> = decoder_blocks.iter().map(orthonormal_frame).collect();
 
         let projection = gaussian_projection(sketch_dim, output_dim, seed ^ SKETCH_PROJECTION_SALT);
 
@@ -435,8 +432,7 @@ impl SaeCandidateIndex {
 
         let keep = candidate_budget.min(scored.len());
         let proposed: Vec<usize> = scored[..keep].iter().map(|&(id, _)| id).collect();
-        let dropped_for_budget: Vec<usize> =
-            scored[keep..].iter().map(|&(id, _)| id).collect();
+        let dropped_for_budget: Vec<usize> = scored[keep..].iter().map(|&(id, _)| id).collect();
 
         Proposal {
             proposed,
@@ -470,8 +466,7 @@ impl SaeCandidateIndex {
             // A candidate that was gathered but truncated by the budget counts
             // as a miss *attributable to the budget*; one never gathered at all
             // is a miss *attributable to the index*. We record both, flagged.
-            let dropped_set: HashSet<usize> =
-                proposal.dropped_for_budget.iter().copied().collect();
+            let dropped_set: HashSet<usize> = proposal.dropped_for_budget.iter().copied().collect();
 
             for &atom in planted {
                 total_planted += 1;
@@ -831,7 +826,10 @@ mod tests {
         // An orthogonal-ish direction (atom 5's column is generically nearly
         // orthogonal to atom 3) aligns weakly with atom 3.
         let a_off = sketch.alignment(3, dirs[5].view());
-        assert!(a_off < a, "off-atom alignment {a_off} should be below in-range {a}");
+        assert!(
+            a_off < a,
+            "off-atom alignment {a_off} should be below in-range {a}"
+        );
     }
 
     #[test]
@@ -844,7 +842,10 @@ mod tests {
             let a = s1.atom_sketch(i);
             let b = s2.atom_sketch(i);
             let diff = vec_norm((&a - &b).view());
-            assert!(diff < 1e-12, "atom {i} sketch differs across builds: {diff:e}");
+            assert!(
+                diff < 1e-12,
+                "atom {i} sketch differs across builds: {diff:e}"
+            );
         }
         let cfg = IndexConfig::auto(16, blocks.len(), 5);
         let idx1 = SaeCandidateIndex::build(&s1, cfg).unwrap();

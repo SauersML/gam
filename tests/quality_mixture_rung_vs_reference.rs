@@ -67,9 +67,7 @@
 //! weakened to pass. All math is in Rust; Python is reached only through the
 //! reference harness shell.
 
-use gam::solver::evidence::{
-    GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture,
-};
+use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, HeldOutDensityProvider, MIXTURE_K_LADDER,
     STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung, mixture_density_provider,
@@ -219,19 +217,21 @@ impl CircleRingDensity {
 /// data so it can refit per CV fold (genuinely held out).
 fn circle_density_provider<'a>(data: ArrayView2<'a, f64>) -> HeldOutDensityProvider<'a> {
     let owned = data.to_owned();
-    Box::new(move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
-        let mut train_mat = Array2::<f64>::zeros((train.len(), owned.ncols()));
-        for (r, &i) in train.iter().enumerate() {
-            for c in 0..owned.ncols() {
-                train_mat[[r, c]] = owned[[i, c]];
+    Box::new(
+        move |train: &[usize], eval: &[usize]| -> Result<Vec<f64>, String> {
+            let mut train_mat = Array2::<f64>::zeros((train.len(), owned.ncols()));
+            for (r, &i) in train.iter().enumerate() {
+                for c in 0..owned.ncols() {
+                    train_mat[[r, c]] = owned[[i, c]];
+                }
             }
-        }
-        let ring = CircleRingDensity::fit(train_mat.view())?;
-        Ok(eval
-            .iter()
-            .map(|&i| ring.log_density(owned[[i, 0]], owned[[i, 1]]))
-            .collect())
-    })
+            let ring = CircleRingDensity::fit(train_mat.view())?;
+            Ok(eval
+                .iter()
+                .map(|&i| ring.log_density(owned[[i, 0]], owned[[i, 1]]))
+                .collect())
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -373,13 +373,9 @@ fn cluster_regime_gam_selects_mixture_and_recovers_k_match_or_beat_sklearn() {
 
     // gam cross-class adjudication: must headline the mixture rung.
     let candidates = build_cross_class_candidates(data.view(), cfg);
-    let verdict = adjudicate_cross_class_race(
-        N,
-        candidates,
-        STACKING_CV_FOLDS,
-        StackingConfig::default(),
-    )
-    .expect("cross-class race adjudicates on cluster data");
+    let verdict =
+        adjudicate_cross_class_race(N, candidates, STACKING_CV_FOLDS, StackingConfig::default())
+            .expect("cross-class race adjudicates on cluster data");
 
     let winner_name = &verdict.candidate_names[verdict.winner_index];
     assert!(
@@ -431,13 +427,9 @@ fn circle_regime_gam_selects_smooth_circle_not_mixture_via_interpolated_holdout(
 
     // --- METRIC 3 (HEADLINE): cross-class verdict picks the smooth circle. ---
     let candidates = build_cross_class_candidates(data.view(), cfg);
-    let verdict = adjudicate_cross_class_race(
-        N,
-        candidates,
-        STACKING_CV_FOLDS,
-        StackingConfig::default(),
-    )
-    .expect("cross-class race adjudicates on circle data");
+    let verdict =
+        adjudicate_cross_class_race(N, candidates, STACKING_CV_FOLDS, StackingConfig::default())
+            .expect("cross-class race adjudicates on circle data");
 
     assert!(
         verdict.is_cross_class,
@@ -445,7 +437,8 @@ fn circle_regime_gam_selects_smooth_circle_not_mixture_via_interpolated_holdout(
     );
     let winner_name = &verdict.candidate_names[verdict.winner_index];
     assert_eq!(
-        winner_name, "circle",
+        winner_name,
+        "circle",
         "METRIC 3 (HEADLINE class discrimination): on genuinely continuous circular data the \
          cross-class headline winner must be the SMOOTH CIRCLE, not a mixture order — even \
          though a high-k ring of blobs can mimic the circle in-sample. Got {winner_name:?} \
@@ -495,8 +488,8 @@ fn circle_regime_gam_selects_smooth_circle_not_mixture_via_interpolated_holdout(
         if k == 0 || k > train_mat.nrows() {
             continue;
         }
-        let fit = fit_gaussian_mixture(train_mat.view(), k, cfg)
-            .expect("mixture fits on circle train");
+        let fit =
+            fit_gaussian_mixture(train_mat.view(), k, cfg).expect("mixture fits on circle train");
         let dens = fit
             .per_point_log_density(eval_mat.view())
             .expect("mixture scores held-out circle points");

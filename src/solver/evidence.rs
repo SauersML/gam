@@ -458,13 +458,14 @@ impl GaussianMixtureFit {
         let n = data.nrows();
         let mut comp = vec![GaussianComponentEval::new(self.d); self.k];
         for j in 0..self.k {
-            comp[j] = GaussianComponentEval::factor(
-                self.means.row(j),
-                &self.covariances[j],
-            )?;
+            comp[j] = GaussianComponentEval::factor(self.means.row(j), &self.covariances[j])?;
         }
         let mut out = Array1::<f64>::zeros(n);
-        let log_w: Vec<f64> = self.weights.iter().map(|w| w.max(f64::MIN_POSITIVE).ln()).collect();
+        let log_w: Vec<f64> = self
+            .weights
+            .iter()
+            .map(|w| w.max(f64::MIN_POSITIVE).ln())
+            .collect();
         for i in 0..n {
             let row = data.row(i);
             let mut log_terms = vec![f64::NEG_INFINITY; self.k];
@@ -486,10 +487,7 @@ impl GaussianMixtureFit {
     /// by calling [`laplace_evidence`] with `residual_objective = −loglik`,
     /// `penalty_log_det = 0`, `penalty_rank = 0`, `effective_dim = P`, and
     /// `log|H|` the observed empirical-Fisher information at the optimum.
-    pub fn laplace_negative_log_evidence(
-        &self,
-        data: ArrayView2<'_, f64>,
-    ) -> Result<f64, String> {
+    pub fn laplace_negative_log_evidence(&self, data: ArrayView2<'_, f64>) -> Result<f64, String> {
         let p = self.num_free_parameters();
         let information = self.empirical_fisher_information(data)?;
         if information.nrows() != p {
@@ -807,7 +805,10 @@ pub fn fit_gaussian_mixture(
         // E-step: responsibilities and total log-likelihood.
         let mut comp = Vec::with_capacity(k);
         for j in 0..k {
-            comp.push(GaussianComponentEval::factor(means.row(j), &covariances[j])?);
+            comp.push(GaussianComponentEval::factor(
+                means.row(j),
+                &covariances[j],
+            )?);
         }
         let log_w: Vec<f64> = weights
             .iter()

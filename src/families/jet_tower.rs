@@ -234,8 +234,7 @@ impl<const K: usize> Tower4<K> {
             for j in 0..K {
                 for k in 0..K {
                     out.t3[i][j][k] = d[1] * u.t3[i][j][k]
-                        + d[2]
-                            * (u.g[i] * u.h[j][k] + u.g[j] * u.h[i][k] + u.g[k] * u.h[i][j])
+                        + d[2] * (u.g[i] * u.h[j][k] + u.g[j] * u.h[i][k] + u.g[k] * u.h[i][j])
                         + d[3] * u.g[i] * u.g[j] * u.g[k];
                 }
             }
@@ -554,7 +553,12 @@ pub fn verify_kernel_channels<const K: usize>(
 
     let g_floor = tower.g.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     for a in 0..K {
-        check(&format!("gradient[{a}]"), claims.gradient[a], tower.g[a], g_floor)?;
+        check(
+            &format!("gradient[{a}]"),
+            claims.gradient[a],
+            tower.g[a],
+            g_floor,
+        )?;
     }
 
     let h_floor = tower
@@ -649,7 +653,11 @@ mod tests {
                 (t.g[0], mu - y, "grad"),
                 (t.h[0][0], w, "hess"),
                 (t.t3[0][0][0], w * (1.0 - 2.0 * mu), "third"),
-                (t.t4[0][0][0][0], w * (1.0 - 6.0 * mu + 6.0 * mu * mu), "fourth"),
+                (
+                    t.t4[0][0][0][0],
+                    w * (1.0 - 6.0 * mu + 6.0 * mu * mu),
+                    "fourth",
+                ),
             ];
             for (got, want, label) in expect {
                 assert!(
@@ -833,71 +841,63 @@ mod tests {
                 self.base.row_nll(self.row, vars)
             }
         }
-        evaluate_program(
-            &At {
-                base: prog,
-                row,
-                p,
-            },
-            0,
-        )
-        .expect("gnarly tower")
+        evaluate_program(&At { base: prog, row, p }, 0).expect("gnarly tower")
     }
 
     #[test]
     fn gnarly_tower_is_fd_consistent_order_by_order() {
         let prog = GnarlyProgram::fixture();
         for row in 0..prog.n_rows() {
-        let base = prog.primaries(row).expect("primaries");
-        let t = gnarly_tower_at(&prog, row, base);
-        let h_step = 1e-5;
-        let tol = 1e-6;
-        for c in 0..3 {
-            let mut up = base;
-            let mut dn = base;
-            up[c] += h_step;
-            dn[c] -= h_step;
-            let t_up = gnarly_tower_at(&prog, row, up);
-            let t_dn = gnarly_tower_at(&prog, row, dn);
-            // value → gradient.
-            let fd_g = (t_up.v - t_dn.v) / (2.0 * h_step);
-            assert!(
-                (t.g[c] - fd_g).abs() <= tol * fd_g.abs().max(1.0),
-                "grad[{c}]: analytic {} fd {}",
-                t.g[c],
-                fd_g
-            );
-            for a in 0..3 {
-                // gradient → Hessian.
-                let fd_h = (t_up.g[a] - t_dn.g[a]) / (2.0 * h_step);
+            let base = prog.primaries(row).expect("primaries");
+            let t = gnarly_tower_at(&prog, row, base);
+            let h_step = 1e-5;
+            let tol = 1e-6;
+            for c in 0..3 {
+                let mut up = base;
+                let mut dn = base;
+                up[c] += h_step;
+                dn[c] -= h_step;
+                let t_up = gnarly_tower_at(&prog, row, up);
+                let t_dn = gnarly_tower_at(&prog, row, dn);
+                // value → gradient.
+                let fd_g = (t_up.v - t_dn.v) / (2.0 * h_step);
                 assert!(
-                    (t.h[a][c] - fd_h).abs() <= tol * fd_h.abs().max(1.0),
-                    "hess[{a}][{c}]: analytic {} fd {}",
-                    t.h[a][c],
-                    fd_h
+                    (t.g[c] - fd_g).abs() <= tol * fd_g.abs().max(1.0),
+                    "grad[{c}]: analytic {} fd {}",
+                    t.g[c],
+                    fd_g
                 );
-                for b in 0..3 {
-                    // Hessian → third.
-                    let fd_t3 = (t_up.h[a][b] - t_dn.h[a][b]) / (2.0 * h_step);
+                for a in 0..3 {
+                    // gradient → Hessian.
+                    let fd_h = (t_up.g[a] - t_dn.g[a]) / (2.0 * h_step);
                     assert!(
-                        (t.t3[a][b][c] - fd_t3).abs() <= tol * fd_t3.abs().max(1.0),
-                        "t3[{a}][{b}][{c}]: analytic {} fd {}",
-                        t.t3[a][b][c],
-                        fd_t3
+                        (t.h[a][c] - fd_h).abs() <= tol * fd_h.abs().max(1.0),
+                        "hess[{a}][{c}]: analytic {} fd {}",
+                        t.h[a][c],
+                        fd_h
                     );
-                    for d in 0..3 {
-                        // third → fourth.
-                        let fd_t4 = (t_up.t3[a][b][d] - t_dn.t3[a][b][d]) / (2.0 * h_step);
+                    for b in 0..3 {
+                        // Hessian → third.
+                        let fd_t3 = (t_up.h[a][b] - t_dn.h[a][b]) / (2.0 * h_step);
                         assert!(
-                            (t.t4[a][b][d][c] - fd_t4).abs() <= tol * fd_t4.abs().max(1.0),
-                            "t4[{a}][{b}][{d}][{c}]: analytic {} fd {}",
-                            t.t4[a][b][d][c],
-                            fd_t4
+                            (t.t3[a][b][c] - fd_t3).abs() <= tol * fd_t3.abs().max(1.0),
+                            "t3[{a}][{b}][{c}]: analytic {} fd {}",
+                            t.t3[a][b][c],
+                            fd_t3
                         );
+                        for d in 0..3 {
+                            // third → fourth.
+                            let fd_t4 = (t_up.t3[a][b][d] - t_dn.t3[a][b][d]) / (2.0 * h_step);
+                            assert!(
+                                (t.t4[a][b][d][c] - fd_t4).abs() <= tol * fd_t4.abs().max(1.0),
+                                "t4[{a}][{b}][{d}][{c}]: analytic {} fd {}",
+                                t.t4[a][b][d][c],
+                                fd_t4
+                            );
+                        }
                     }
                 }
             }
-        }
         }
     }
 
@@ -960,28 +960,46 @@ mod tests {
         ];
         // 4! = 24 permutations of four indices.
         let perms4: [[usize; 4]; 24] = [
-            [0, 1, 2, 3], [0, 1, 3, 2], [0, 2, 1, 3], [0, 2, 3, 1], [0, 3, 1, 2], [0, 3, 2, 1],
-            [1, 0, 2, 3], [1, 0, 3, 2], [1, 2, 0, 3], [1, 2, 3, 0], [1, 3, 0, 2], [1, 3, 2, 0],
-            [2, 0, 1, 3], [2, 0, 3, 1], [2, 1, 0, 3], [2, 1, 3, 0], [2, 3, 0, 1], [2, 3, 1, 0],
-            [3, 0, 1, 2], [3, 0, 2, 1], [3, 1, 0, 2], [3, 1, 2, 0], [3, 2, 0, 1], [3, 2, 1, 0],
+            [0, 1, 2, 3],
+            [0, 1, 3, 2],
+            [0, 2, 1, 3],
+            [0, 2, 3, 1],
+            [0, 3, 1, 2],
+            [0, 3, 2, 1],
+            [1, 0, 2, 3],
+            [1, 0, 3, 2],
+            [1, 2, 0, 3],
+            [1, 2, 3, 0],
+            [1, 3, 0, 2],
+            [1, 3, 2, 0],
+            [2, 0, 1, 3],
+            [2, 0, 3, 1],
+            [2, 1, 0, 3],
+            [2, 1, 3, 0],
+            [2, 3, 0, 1],
+            [2, 3, 1, 0],
+            [3, 0, 1, 2],
+            [3, 0, 2, 1],
+            [3, 1, 0, 2],
+            [3, 1, 2, 0],
+            [3, 2, 0, 1],
+            [3, 2, 1, 0],
         ];
         for row in 0..prog.n_rows() {
             let t = evaluate_program(&prog, row).expect("gnarly tower");
-            let scale_t3 = t
-                .t3
-                .iter()
-                .flatten()
-                .flatten()
-                .fold(0.0_f64, |m, x| m.max(x.abs()))
-                .max(1.0);
-            let scale_t4 = t
-                .t4
-                .iter()
-                .flatten()
-                .flatten()
-                .flatten()
-                .fold(0.0_f64, |m, x| m.max(x.abs()))
-                .max(1.0);
+            let scale_t3 =
+                t.t3.iter()
+                    .flatten()
+                    .flatten()
+                    .fold(0.0_f64, |m, x| m.max(x.abs()))
+                    .max(1.0);
+            let scale_t4 =
+                t.t4.iter()
+                    .flatten()
+                    .flatten()
+                    .flatten()
+                    .fold(0.0_f64, |m, x| m.max(x.abs()))
+                    .max(1.0);
             for i in 0..3 {
                 for j in 0..3 {
                     for k in 0..3 {

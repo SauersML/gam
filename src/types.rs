@@ -358,7 +358,9 @@ pub enum ResponseFamily {
     Gaussian,
     Binomial,
     Poisson,
-    Tweedie { p: f64 },
+    Tweedie {
+        p: f64,
+    },
     NegativeBinomial {
         theta: f64,
         /// `true` when `theta` was supplied by the user as a held-fixed value
@@ -375,7 +377,9 @@ pub enum ResponseFamily {
         #[serde(default)]
         theta_fixed: bool,
     },
-    Beta { phi: f64 },
+    Beta {
+        phi: f64,
+    },
     Gamma,
     RoystonParmar,
 }

@@ -484,16 +484,11 @@ pub enum PathDemotionReason {
 pub(crate) enum ContinuationStep {
     /// `s` was lowered toward `0` and the inner solve at the new waypoint
     /// succeeded. Carries the accepted spine state and the new `s`.
-    Descended {
-        s: f64,
-        state: ContinuationState,
-    },
+    Descended { s: f64, state: ContinuationState },
     /// `s` reached `0`: the path arrived at the real objective (ρ\*, τ_min,
     /// tight isometry). Terminal-but-successful; the criterion is the real
     /// objective's, identical for cold and warm entry (#969).
-    Arrived {
-        state: ContinuationState,
-    },
+    Arrived { state: ContinuationState },
     /// The inner solve at the attempted waypoint struggled, so the path
     /// re-entered a heavier regime (`s` raised back toward `1` by the back-off
     /// fraction) and will re-descend with a finer step. This is the homotopy
@@ -501,10 +496,7 @@ pub(crate) enum ContinuationStep {
     /// the heavier `s` to descend from next and the underlying spine signal
     /// that prompted the back-off (for diagnostics only; it is **not** an
     /// error the path surfaces upward).
-    Reentered {
-        s: f64,
-        reason: ReentryReason,
-    },
+    Reentered { s: f64, reason: ReentryReason },
 }
 
 /// Why a waypoint re-entered a heavier regime. Purely diagnostic — every
@@ -1079,7 +1071,11 @@ mod tests {
     #[test]
     fn entry_is_the_heavy_smoothing_regime() {
         let path = ContinuationPath::enter(schedules());
-        assert_eq!(path.s(), 1.0, "entry must be s = 1 (heavy-smoothing regime)");
+        assert_eq!(
+            path.s(),
+            1.0,
+            "entry must be s = 1 (heavy-smoothing regime)"
+        );
         let targets = path.current_scalar_targets();
         // τ at entry is the diffuse extreme (tau_start), isometry is loose
         // (w_start).
@@ -1097,13 +1093,19 @@ mod tests {
     fn target_endpoint_is_the_real_objective() {
         let sch = schedules();
         let targets0 = sch.scalar_targets_at(0.0);
-        assert!((targets0.tau - 0.1).abs() < 1e-12, "s=0 τ = tau_min (sharp)");
+        assert!(
+            (targets0.tau - 0.1).abs() < 1e-12,
+            "s=0 τ = tau_min (sharp)"
+        );
         assert!(
             (targets0.isometry_weight - 1.0).abs() < 1e-12,
             "s=0 isometry = w_end (tight)"
         );
         let rho0 = sch.rho_target_at(0.0);
-        assert!((rho0[0]).abs() < 1e-12 && (rho0[1]).abs() < 1e-12, "s=0 ρ = ρ*");
+        assert!(
+            (rho0[0]).abs() < 1e-12 && (rho0[1]).abs() < 1e-12,
+            "s=0 ρ = ρ*"
+        );
     }
 
     #[test]
@@ -1170,7 +1172,10 @@ mod tests {
                 ..
             }
         ));
-        assert!(path.s() > 0.5, "re-entry must raise s toward the entry regime");
+        assert!(
+            path.s() > 0.5,
+            "re-entry must raise s toward the entry regime"
+        );
         assert_eq!(ledger.reseed_count(), 1);
     }
 
@@ -1243,7 +1248,10 @@ mod tests {
         path.s_step = 0.1;
         let before = path.s;
         let regime = path.demote_with_reason(PathDemotionReason::UniformStructural);
-        assert!(path.s > before, "demotion must raise s toward the entry regime");
+        assert!(
+            path.s > before,
+            "demotion must raise s toward the entry regime"
+        );
         // The returned regime is the coarse band of the (heavier) live s.
         assert_eq!(regime, path.enter_regime());
         // A second reason demotes the same way — reason-agnostic escalation.
@@ -1259,7 +1267,11 @@ mod tests {
         assert_eq!(path.reseed_count(), 0);
         let before = path.s;
         let regime = path.note_active_mass_breach();
-        assert_eq!(path.reseed_count(), 1, "breach must be recorded in the path ledger");
+        assert_eq!(
+            path.reseed_count(),
+            1,
+            "breach must be recorded in the path ledger"
+        );
         assert!(path.s > before, "breach must re-enter a heavier regime");
         assert_eq!(regime, path.enter_regime());
     }

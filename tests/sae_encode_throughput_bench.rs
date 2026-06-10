@@ -113,7 +113,8 @@ fn planted_atom_frame(atom: usize) -> Array2<f64> {
     let mut plane = Array2::<f64>::zeros((P, 2));
     for col in 0..2 {
         for i in 0..P {
-            plane[[i, col]] = idx_normal((atom as u64) * 1_000_003 + (col as u64) * 9_973 + i as u64);
+            plane[[i, col]] =
+                idx_normal((atom as u64) * 1_000_003 + (col as u64) * 9_973 + i as u64);
         }
     }
     // Gram-Schmidt within the atom.
@@ -356,8 +357,7 @@ fn sae_encode_throughput_decision_gate() {
     // per row is fixed at ACTIVE_PER_ROW, but the dense arrow spine the assembly
     // walks grows with K, so this is the conservative, defensible scaling.)
     let floor_small = CPU_THROUGHPUT_FLOOR_K64_ROWS_PER_SEC;
-    let floor_large =
-        CPU_THROUGHPUT_FLOOR_K64_ROWS_PER_SEC * (K_SMALL as f64) / (K_LARGE as f64);
+    let floor_large = CPU_THROUGHPUT_FLOOR_K64_ROWS_PER_SEC * (K_SMALL as f64) / (K_LARGE as f64);
 
     println!(
         "DECISION: K={K_SMALL} {rps_small:.1} rows/sec (floor {floor_small:.1}); \
@@ -366,7 +366,11 @@ fn sae_encode_throughput_decision_gate() {
     let surrogate_unneeded = rps_small >= floor_small && rps_large >= floor_large;
     println!(
         "Stage-3 amortized surrogate needed? {}",
-        if surrogate_unneeded { "NO" } else { "YES (exact encode below floor)" }
+        if surrogate_unneeded {
+            "NO"
+        } else {
+            "YES (exact encode below floor)"
+        }
     );
 
     assert!(

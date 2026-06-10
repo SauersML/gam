@@ -267,23 +267,18 @@ pub fn atom_two_lens(model: &SaeManifoldTerm, metric: &RowMetric) -> AtomTwoLens
             0.0
         };
 
-        let (coupling, coupling_normalized, discrepancy) = if coupling_axis_available
-            && any_coupling[atom_idx]
-        {
-            let c = coupling_raw[atom_idx];
-            let c_norm = if coupling_max > 0.0 {
-                c / coupling_max
+        let (coupling, coupling_normalized, discrepancy) =
+            if coupling_axis_available && any_coupling[atom_idx] {
+                let c = coupling_raw[atom_idx];
+                let c_norm = if coupling_max > 0.0 {
+                    c / coupling_max
+                } else {
+                    0.0
+                };
+                (Some(c), Some(c_norm), Some(presence_normalized - c_norm))
             } else {
-                0.0
+                (None, None, None)
             };
-            (
-                Some(c),
-                Some(c_norm),
-                Some(presence_normalized - c_norm),
-            )
-        } else {
-            (None, None, None)
-        };
 
         entries.push(AtomLensEntry {
             name: atom.name.clone(),

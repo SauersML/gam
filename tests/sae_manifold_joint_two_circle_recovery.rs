@@ -23,11 +23,11 @@
 
 use gam::linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
 use gam::solver::outer_strategy::OuterProblem;
+use gam::terms::latent_coord::LatentManifold;
 use gam::terms::{
     AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
     SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho, SaeManifoldTerm,
 };
-use gam::terms::latent_coord::LatentManifold;
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3, s};
 use std::sync::Arc;
 
@@ -167,8 +167,7 @@ fn planted_response(truth: &Truth, u_a: &Array2<f64>, u_b: &Array2<f64>) -> (Arr
             let u = idx_uniform(((i * P + col) as u64) * 7 + 3);
             let u2 = idx_uniform(((i * P + col) as u64) * 7 + 5);
             // Box-Muller, deterministic
-            let g = (-2.0 * (u.max(1.0e-12)).ln()).sqrt()
-                * (std::f64::consts::TAU * u2).cos();
+            let g = (-2.0 * (u.max(1.0e-12)).ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
             z[[i, col]] += sigma * g;
         }
     }
@@ -208,7 +207,9 @@ fn residual_seed_logits(
             gram[[i, i]] += jitter;
         }
         let rhs = fast_atb(&phi, &z_owned);
-        let factor = gram.cholesky(FaerSide::Lower).expect("residual seed Cholesky");
+        let factor = gram
+            .cholesky(FaerSide::Lower)
+            .expect("residual seed Cholesky");
         let b_k = factor.solve_mat(&rhs);
         let fitted = phi.dot(&b_k);
         for row in 0..n_obs {
@@ -378,7 +379,11 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>) -> SaeManifoldTerm {
 /// the converged assignments, and the engine's final criterion value.
 fn run_production_fit(truth: &Truth, z: &Array2<f64>) -> (SaeManifoldTerm, Array2<f64>, f64) {
     let term = build_cold_term(truth, z.view());
-    let init_rho = SaeManifoldRho::new(SPARSITY.ln(), SMOOTHNESS.ln(), vec![Array1::<f64>::zeros(0); K]);
+    let init_rho = SaeManifoldRho::new(
+        SPARSITY.ln(),
+        SMOOTHNESS.ln(),
+        vec![Array1::<f64>::zeros(0); K],
+    );
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
     let mut objective = SaeManifoldOuterObjective::new(
@@ -438,11 +443,7 @@ fn plane_sigma_min(u_fit: &Array2<f64>, u_true: &Array2<f64>) -> f64 {
 /// Circular correlation of fitted vs planted θ up to O(2) gauge: Procrustes on
 /// (cosθ, sinθ) then correlation of the aligned unit vectors, restricted to the
 /// truly-active rows. Returns value in [-1, 1] (≈1 ⇒ recovered).
-fn circular_corr_active(
-    theta_true: &[f64],
-    theta_fit: &[f64],
-    active: &[bool],
-) -> f64 {
+fn circular_corr_active(theta_true: &[f64], theta_fit: &[f64], active: &[bool]) -> f64 {
     let idx: Vec<usize> = (0..theta_true.len()).filter(|&i| active[i]).collect();
     if idx.len() < 3 {
         return 0.0;
@@ -584,8 +585,14 @@ fn sae_manifold_joint_two_circle_recovery_ibp_map() {
 
     // ---- VERBATIM diagnostic dump -----------------------------------------
     println!("=== SAE two-circle recovery (IBP-MAP, production cold driver) ===");
-    println!("signal_scale={signal_scale:.6}  noise_sigma={:.6}", 0.04 * signal_scale);
-    println!("Hungarian match planted->fitted: A<-{}  B<-{}", matched[0], matched[1]);
+    println!(
+        "signal_scale={signal_scale:.6}  noise_sigma={:.6}",
+        0.04 * signal_scale
+    );
+    println!(
+        "Hungarian match planted->fitted: A<-{}  B<-{}",
+        matched[0], matched[1]
+    );
     println!(
         "determinism: |final1-final2|={determinism_gap:.3e} (final1={final1:.12}, final2={final2:.12}) deterministic={deterministic}"
     );
@@ -640,6 +647,11 @@ fn sae_manifold_joint_two_circle_recovery_ibp_map() {
          active_mass fitted=[{:.6}, {:.6}] (planted {PLANTED_ACTIVE_MASS}); \
          sigma_min=[{:.6}, {:.6}]; circ_corr=[{:.6}, {:.6}]; R2={r2:.6}; \
          determinism_gap={determinism_gap:.3e}",
-        fitted_mass[0], fitted_mass[1], sigma_min[0], sigma_min[1], circ_corr[0], circ_corr[1],
+        fitted_mass[0],
+        fitted_mass[1],
+        sigma_min[0],
+        sigma_min[1],
+        circ_corr[0],
+        circ_corr[1],
     );
 }

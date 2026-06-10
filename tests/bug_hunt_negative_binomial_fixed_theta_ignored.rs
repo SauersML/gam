@@ -31,10 +31,11 @@
 //! Today both fits ignore the knob and record the same data-driven theta_hat, so
 //! both assertions fail. When fixed-theta is honoured they pass unchanged.
 
-use gam::types::ResponseFamily;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula,
-    init_parallelism};
 use csv::StringRecord;
+use gam::types::ResponseFamily;
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma, Poisson, Uniform};
@@ -43,7 +44,9 @@ use rand_distr::{Distribution, Gamma, Poisson, Uniform};
 fn sample_negbin(mu: f64, theta: f64, rng: &mut StdRng) -> i64 {
     let gamma = Gamma::new(theta, mu / theta).expect("gamma params valid");
     let lambda = gamma.sample(rng).max(1e-12);
-    Poisson::new(lambda).expect("poisson rate valid").sample(rng) as i64
+    Poisson::new(lambda)
+        .expect("poisson rate valid")
+        .sample(rng) as i64
 }
 
 /// Fit `y ~ x` as NB(log) with an explicitly FIXED theta and return the theta the

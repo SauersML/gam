@@ -401,7 +401,10 @@ impl ExactGaussianFullConformal {
                     });
                 }
             } else if let Some(lo_open) = open_lo.take() {
-                intervals.push(ConformalInterval { lo: lo_open, hi: lo });
+                intervals.push(ConformalInterval {
+                    lo: lo_open,
+                    hi: lo,
+                });
             }
         }
 
@@ -545,10 +548,7 @@ mod tests {
         let grid = 4001usize;
         for g in 0..grid {
             let z = z_lo + (z_hi - z_lo) * g as f64 / (grid as f64 - 1.0);
-            let in_set = set
-                .intervals
-                .iter()
-                .any(|itv| z >= itv.lo && z <= itv.hi);
+            let in_set = set.intervals.iter().any(|itv| z >= itv.lo && z <= itv.hi);
             assert_eq!(
                 in_set,
                 oracle(z),

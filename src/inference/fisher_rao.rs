@@ -41,7 +41,12 @@ pub fn normalize_fisher_rao_blocks(
     n_rows: usize,
     dim: usize,
 ) -> Result<Array3<f64>, String> {
-    normalize_fisher_rao_blocks_with(arr, n_rows, dim, FisherRaoDefiniteness::PositiveSemidefinite)
+    normalize_fisher_rao_blocks_with(
+        arr,
+        n_rows,
+        dim,
+        FisherRaoDefiniteness::PositiveSemidefinite,
+    )
 }
 
 /// Broadcast and validate Fisher–Rao weight blocks requiring each block to be
@@ -167,10 +172,7 @@ fn validate_block_definiteness(
         .iter()
         .fold(0.0_f64, |acc, &value| acc.max(value.abs()))
         .max(1.0);
-    let min_eigenvalue = eigenvalues
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let min_eigenvalue = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
     // Relative spectral tolerance: a block is treated as PSD when its smallest
     // eigenvalue is no more negative than this fraction of its spectral scale,
     // absorbing the rounding of the symmetric eigensolve.

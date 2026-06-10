@@ -9,8 +9,8 @@ pub mod identifiability_audit;
 pub mod identifiability_canonical;
 pub mod inner_status;
 pub(crate) mod latent_cache;
-pub mod loop_guard;
 pub mod latent_inner;
+pub mod loop_guard;
 pub mod mixture_link;
 pub mod orthogonal_reparam;
 pub mod outer_strategy;
@@ -37,16 +37,17 @@ pub use evidence::{
     UnionComponentFit, UnionComponentKind, UnionStructure, UnionStructureFit, evidence_grad_rho,
     evidence_hessian_log_det, evidence_ift_gradient_correction, fit_gaussian_mixture,
     fit_union_ladder, fit_union_structure, hessian_log_det_from_hvp, laplace_evidence,
-    select_topology, solve_stacking_weights, union_per_point_log_density, union_responsibility_split,
+    select_topology, solve_stacking_weights, union_per_point_log_density,
+    union_responsibility_split,
 };
 pub use topology_selector::{
     AutoTopologyKind, CrossClassCandidate, CrossClassRaceVerdict, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS, TopologyAutoFitEvidence,
-    TopologyAutoRankedFit, TopologyAutoSelector, TopologyAutoSelectorResult, UnionRungFit,
-    UnionRungResult, adjudicate_cross_class_race, build_cv_log_density_table,
-    deterministic_cv_folds, fit_mixture_rung, fit_union_candidate, fit_union_rung,
-    mixture_density_provider, parse_union_name, select_topology_with_fit, tk_normalized_score,
-    union_density_provider,
+    MIXTURE_K_LADDER, MixtureRungFit, MixtureRungResult, STACKING_CV_FOLDS,
+    TopologyAutoFitEvidence, TopologyAutoRankedFit, TopologyAutoSelector,
+    TopologyAutoSelectorResult, UnionRungFit, UnionRungResult, adjudicate_cross_class_race,
+    build_cv_log_density_table, deterministic_cv_folds, fit_mixture_rung, fit_union_candidate,
+    fit_union_rung, mixture_density_provider, parse_union_name, select_topology_with_fit,
+    tk_normalized_score, union_density_provider,
 };
 
 /// Process-wide counter of smoothing-corrections that took the sigma-cubature

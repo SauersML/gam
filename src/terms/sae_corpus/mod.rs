@@ -62,15 +62,15 @@ pub mod warm_state;
 
 /// Deterministic, restartable source of activation row batches (seam half 1).
 pub use shard_reader::{
-    CorpusRowSource, MmapShardSource, RowBatch, ShardError, encode_shard_bytes, DTYPE_F32,
-    HEADER_LEN, SHARD_MAGIC,
+    CorpusRowSource, DTYPE_F32, HEADER_LEN, MmapShardSource, RowBatch, SHARD_MAGIC, ShardError,
+    encode_shard_bytes,
 };
 
 /// Per-row inner-solve warm-state cache (seam half 2).
 pub use warm_state::{DiskRowWarmCache, RowWarmCache, RowWarmState};
 
 /// Subsample → full-pass ρ schedule with importance weights.
-pub use rho_cascade::{row_in_fraction, RhoCascadeSchedule, RhoStepPlan};
+pub use rho_cascade::{RhoCascadeSchedule, RhoStepPlan, row_in_fraction};
 
 /// Mixed-precision fused kernels (read `f32`, accumulate `f64`).
 pub use kernels::{

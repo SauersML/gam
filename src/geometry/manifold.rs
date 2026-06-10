@@ -148,7 +148,11 @@ pub trait RiemannianManifold: Send + Sync {
     ) -> GeometryResult<Array1<f64>> {
         let m = self.ambient_dim();
         check_len("riemannian_gradient point", point.len(), m)?;
-        check_len("riemannian_gradient euclidean_grad", euclidean_grad.len(), m)?;
+        check_len(
+            "riemannian_gradient euclidean_grad",
+            euclidean_grad.len(),
+            m,
+        )?;
         let b = self.tangent_basis(point)?; // m × d
         let g = self.metric_tensor(point)?; // m × m
         // Bᵀ e  (length d) and the Gram matrix Bᵀ G B  (d × d).

@@ -107,7 +107,10 @@ fn planted_frames(k: usize, p: usize) -> Vec<Array2<f64>> {
             }
         }
         let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        assert!(nrm > 1.0e-9, "planted ambient basis rank-deficient at col {j}");
+        assert!(
+            nrm > 1.0e-9,
+            "planted ambient basis rank-deficient at col {j}"
+        );
         for i in 0..p {
             q[[i, j]] = v[i] / nrm;
         }
@@ -124,9 +127,9 @@ fn planted_frames(k: usize, p: usize) -> Vec<Array2<f64>> {
 struct Truth {
     k: usize,
     n: usize,
-    theta: Vec<Vec<f64>>,  // [k][n]
+    theta: Vec<Vec<f64>>,   // [k][n]
     active: Vec<Vec<bool>>, // [k][n]
-    amp: Vec<Vec<f64>>,    // [k][n]
+    amp: Vec<Vec<f64>>,     // [k][n]
     radii: Vec<f64>,
 }
 
@@ -136,7 +139,9 @@ fn planted_truth(rung: &Rung) -> Truth {
     let mut theta = vec![vec![0.0; n]; k];
     let mut active = vec![vec![false; n]; k];
     let mut amp = vec![vec![0.0; n]; k];
-    let radii: Vec<f64> = (0..k).map(|a| 1.0 + 0.1 * (a as f64 / k.max(1) as f64)).collect();
+    let radii: Vec<f64> = (0..k)
+        .map(|a| 1.0 + 0.1 * (a as f64 / k.max(1) as f64))
+        .collect();
 
     // We want each atom active on ~PLANTED_ACTIVE_MASS * n rows, with the
     // supports spread evenly so no atom is starved. Assign each atom a
@@ -246,7 +251,9 @@ fn residual_seed_logits(
             gram[[i, i]] += jitter;
         }
         let rhs = fast_atb(&phi, &z_owned);
-        let factor = gram.cholesky(FaerSide::Lower).expect("residual seed Cholesky");
+        let factor = gram
+            .cholesky(FaerSide::Lower)
+            .expect("residual seed Cholesky");
         let b_k = factor.solve_mat(&rhs);
         let fitted = phi.dot(&b_k);
         for row in 0..n_obs {
@@ -367,8 +374,9 @@ fn build_cold_term(truth: &Truth, z: ArrayView2<'_, f64>, p: usize) -> SaeManifo
     for a in 0..k {
         // small atom-specific offset so the seed is not exactly the truth.
         let offset = 0.04 + 0.013 * ((a % 5) as f64);
-        let coords =
-            Array2::from_shape_fn((n, 1), |(i, _)| (truth.theta[a][i] + offset).rem_euclid(1.0));
+        let coords = Array2::from_shape_fn((n, 1), |(i, _)| {
+            (truth.theta[a][i] + offset).rem_euclid(1.0)
+        });
         let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
         coords_k.push(coords);
         phi_k.push(phi);
@@ -485,10 +493,7 @@ fn fitted_plane(atom_decoder: ArrayView2<'_, f64>, p: usize) -> Array2<f64> {
 fn principal_angles(u_fit: &Array2<f64>, u_true: &Array2<f64>) -> (f64, f64) {
     let m = u_fit.t().dot(u_true);
     let (_u, sv, _vt) = m.svd(false, false).expect("principal-angle SVD");
-    let mut angles: Vec<f64> = sv
-        .iter()
-        .map(|&s| s.clamp(-1.0, 1.0).acos())
-        .collect();
+    let mut angles: Vec<f64> = sv.iter().map(|&s| s.clamp(-1.0, 1.0).acos()).collect();
     angles.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let theta_min = angles.first().copied().unwrap_or(0.0);
     let theta_max = angles.last().copied().unwrap_or(0.0);
@@ -498,10 +503,7 @@ fn principal_angles(u_fit: &Array2<f64>, u_true: &Array2<f64>) -> (f64, f64) {
 /// Greedy best-alignment matching: for each planted atom (in descending order
 /// of how cleanly its best fitted candidate matches), claim the unused fitted
 /// atom with the smallest max-principal-angle. Returns match[t] = fitted index.
-fn match_atoms(
-    fitted_planes: &[Array2<f64>],
-    planted_planes: &[Array2<f64>],
-) -> Vec<usize> {
+fn match_atoms(fitted_planes: &[Array2<f64>], planted_planes: &[Array2<f64>]) -> Vec<usize> {
     let k = planted_planes.len();
     // cost[t][f] = max principal angle between planted t and fitted f.
     let mut cost = vec![vec![0.0_f64; k]; k];
@@ -645,7 +647,10 @@ fn run_rung(rung: &Rung) {
     let n_recovered = theta_max.iter().filter(|&&t| t < 0.25).count();
 
     // ---- VERBATIM diagnostic dump -----------------------------------------
-    println!("=== SAE K-ladder recovery (IBP-MAP, production cold driver) K={k}, p={p}, N={} ===", truth.n);
+    println!(
+        "=== SAE K-ladder recovery (IBP-MAP, production cold driver) K={k}, p={p}, N={} ===",
+        truth.n
+    );
     println!(
         "signal_scale={signal_scale:.6}  noise_sigma={:.6}",
         0.04 * signal_scale
