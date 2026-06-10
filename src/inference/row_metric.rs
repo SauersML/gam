@@ -359,6 +359,25 @@ impl RowMetric {
         }
     }
 
+    /// The factor entry `U_n[i, k]` for one row (`i ∈ [0, p)`, `k ∈ [0, rank)`).
+    /// For [`MetricProvenance::Euclidean`] the implicit factor is `I_p`, so this
+    /// returns `1.0` when `i == k` and `0.0` otherwise — letting a consumer that
+    /// whitens a Jacobian via `factor_entry` produce the identity whitening
+    /// without a provenance branch. Reads the **un-floored** factors (criterion
+    /// face, #747).
+    pub fn factor_entry(&self, row: usize, i: usize, k: usize) -> f64 {
+        match &self.factors {
+            None => {
+                if i == k {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            Some(u) => u[[row, i * self.rank + k]],
+        }
+    }
+
     /// Apply the full per-row metric `M_n x = U_n (U_nᵀ x) ∈ ℝ^p` for one
     /// `p`-vector `x`, formed factored (`rank` flops in, `p` flops out) — never
     /// materializing `M_n` as `p × p`. Euclidean returns `x` unchanged
