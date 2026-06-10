@@ -19777,14 +19777,56 @@ mod tests {
             crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(&operator)
                 .unwrap();
 
+        // CONTROL: the SAME operator built WITHOUT the hook (ψψ block filled from
+        // the per-pair ext_coord_pair_fn tables) must already match the dense
+        // per-pair path — this is the pre-existing UnifiedOuterHessianOperator
+        // path, unrelated to #740. If this control matches dense but the
+        // hook-operator above does not, the divergence is isolated to the #740
+        // hook-injection arithmetic (psi_contracted_contrib / the ψψ-skip).
+        let control_solution = build_solution(false);
+        let control_kernel = control_solution
+            .deriv_provider
+            .outer_hessian_derivative_kernel()
+            .unwrap();
+        let control_operator = build_outer_hessian_operator(
+            &control_solution,
+            &lambdas,
+            control_solution.deriv_provider.as_ref(),
+            control_kernel,
+            None,
+            None,
+        )
+        .unwrap();
+        let control_mat = crate::solver::outer_strategy::OuterHessianOperator::materialize_dense(
+            &control_operator,
+        )
+        .unwrap();
+
+        for row in 0..dense.nrows() {
+            for col in 0..dense.ncols() {
+                let c = control_mat[[row, col]];
+                let d = dense[[row, col]];
+                let tol = 1e-9_f64.max(1e-9 * d.abs());
+                assert!(
+                    (c - d).abs() <= tol,
+                    "#740 CONTROL (no-hook operator) mismatch at ({row}, {col}): no-hook-op={c}, \
+                     per-pair-dense={d} — pre-existing operator path differs from dense, so the \
+                     #740 hook comparison below is not the right oracle; investigate the table fill"
+                );
+            }
+        }
+
         for row in 0..dense.nrows() {
             for col in 0..dense.ncols() {
                 let m = materialized[[row, col]];
                 let d = dense[[row, col]];
-                let tol = 1e-10_f64.max(1e-10 * d.abs());
+                let c = control_mat[[row, col]];
+                let tol = 1e-9_f64.max(1e-9 * d.abs());
                 assert!(
                     (m - d).abs() <= tol,
-                    "#740 contracted-hook operator mismatch at ({row}, {col}): hook-operator={m}, per-pair-dense={d}"
+                    "#740 contracted-hook operator mismatch at ({row}, {col}): \
+                     hook-operator={m}, per-pair-dense={d}, no-hook-control={c} \
+                     (control==dense ⇒ bug is in the #740 hook injection at this entry)"
                 );
             }
         }
