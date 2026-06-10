@@ -8945,6 +8945,13 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         build_term_collection_design(data.view(), &base_spec).expect("base spatial design");
     let frozen_spec = freeze_term_collection_from_design(&base_spec, &base_design)
         .expect("freeze spatial spec (locks centers)");
+    // A matern block produces SEVERAL penalty components (main smoothness +
+    // nullspace/aux blocks), not one — so θ carries `n_rho` ρ coordinates on the
+    // logslope block plus the ψ length-scale axes. Discover the real count from
+    // the design rather than assuming 1 (it's structural: same at every
+    // length-scale).
+    let n_rho = base_design.penalties_as_penalty_matrix().len();
+    assert!(n_rho >= 1, "matern block must carry at least one penalty");
 
     // Build (family, specs, derivative_blocks, gradient, Hessian) for a given ψ
     // offset (in −log(length_scale)) and ρ offset. ψ-offset δ ⇒ length_scale =
@@ -8985,13 +8992,12 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         };
 
         // Block specs: marginal (intercept, no penalty), logslope (matern design
-        // + its penalty/penalties). The matern block carries one (double_penalty
-        // off) penalty.
+        // + its `n_rho` penalty components).
         let logslope_penalties: Vec<PenaltyMatrix> = design.penalties_as_penalty_matrix();
         assert_eq!(
             logslope_penalties.len(),
-            1,
-            "fixture expects a single matern penalty on the logslope block"
+            n_rho,
+            "matern penalty count must be structural (same as the base design)"
         );
         let mut marginal_spec = dummy_blockspec(1, n);
         marginal_spec.design = marginal_design;
@@ -9003,9 +9009,11 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         logslope_spec.penalties = logslope_penalties;
         let specs = vec![marginal_spec, logslope_spec];
 
-        // θ = [ρ_logslope, ψ]. One ρ on the logslope penalty; ψ_dim from the
-        // spatial derivative blocks (evaluated at ψ=0 of the perturbed center).
-        let rho = array![0.1_f64 + rho_offset];
+        // θ = [ρ_0..ρ_{n_rho-1}, ψ_0..]. The ρ block is shifted UNIFORMLY by
+        // rho_offset (so the ρ-FD direction below is the all-ones ρ block); ψ_dim
+        // comes from the spatial derivative blocks (evaluated at ψ=0 of the
+        // perturbed center).
+        let rho = Array1::from_elem(n_rho, 0.1_f64 + rho_offset);
 
         let opts = BlockwiseFitOptions::default();
         let res = evaluate_custom_family_joint_hyper(
@@ -9020,7 +9028,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     let (grad0, hess0) =
         outer_at(0.0, 0.0, EvalMode::ValueGradientHessian);
     let theta_dim = grad0.len();
-    let psi_dim = theta_dim - 1; // one ρ
+    let psi_dim = theta_dim - n_rho;
     assert!(psi_dim >= 1, "fixture must expose at least one spatial ψ axis");
     // The ψ-active path returns the outer Hessian as a matrix-free OPERATOR
     // (#740 forces the operator route when the contracted hook is present, and
@@ -9035,16 +9043,18 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
 
     let eps = 1e-4_f64;
 
-    // Centered FD of the outer GRADIENT along a θ direction `dir`
-    // (dir = [d_ρ, d_ψ...]): rebuild design+blocks at ±eps·dir, take
-    // (g(+)-g(-))/(2eps). For the ρ component we shift `rho`; for ψ we shift the
-    // length-scale (−log scale). Compare to H·dir.
+    // The single spatial length-scale knob maps to one ψ offset; restrict to one
+    // ψ axis so the ψ FD perturbation is unambiguous.
+    assert_eq!(psi_dim, 1, "FD ψ arm assumes one spatial ψ axis (one length-scale)");
+
+    // Centered FD of the outer GRADIENT along a θ direction `dir` of length
+    // theta_dim = n_rho + 1. The ρ block (dir[0..n_rho]) is shifted UNIFORMLY by
+    // its common value (the directions below set it all-ones or all-zeros), and
+    // the ψ component (dir[n_rho]) shifts the length-scale (−log scale). Rebuild
+    // design+blocks at ±eps·dir, take (g(+)-g(-))/2eps. Compare to H·dir.
     let fd_along = |dir: &Array1<f64>| -> Array1<f64> {
-        let rho_step = dir[0];
-        // ψ direction packed into a single length-scale offset is only
-        // well-defined for a single ψ axis; assert that and use dir[1].
-        assert_eq!(psi_dim, 1, "FD ψ arm assumes one spatial ψ axis");
-        let psi_step = dir[1];
+        let rho_step = dir[0]; // ρ block is uniform in the directions used below
+        let psi_step = dir[n_rho];
         let (gp, _) = outer_at(eps * psi_step, eps * rho_step, EvalMode::ValueAndGradient);
         let (gm, _) = outer_at(-eps * psi_step, -eps * rho_step, EvalMode::ValueAndGradient);
         (&gp - &gm).mapv(|v| v / (2.0 * eps))
@@ -9066,9 +9076,13 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         }
     };
 
-    // Pure-ψ: dir = [0, 1].
-    check(array![0.0, 1.0], "pure-ψ");
-    // Mixed-ρψ: dir = [1, 1] — perturbs ρ and ψ together; exposes a ρψ/ψψ
-    // block-split error that pure-ρ and pure-ψ would both miss.
-    check(array![1.0, 1.0], "mixed-ρψ");
+    // Pure-ψ: ρ block all-zero, ψ = 1.
+    let mut pure_psi = Array1::<f64>::zeros(theta_dim);
+    pure_psi[n_rho] = 1.0;
+    check(pure_psi, "pure-ψ");
+    // Mixed-ρψ: ρ block all-ones + ψ = 1 — perturbs ρ and ψ together; exposes a
+    // ρψ/ψψ block-split error that pure-ρ and pure-ψ would both miss.
+    let mut mixed = Array1::<f64>::ones(theta_dim);
+    mixed[n_rho] = 1.0;
+    check(mixed, "mixed-ρψ");
 }
