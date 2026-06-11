@@ -5875,7 +5875,9 @@ fn try_mixed_precision_arrow_solve(
         }
     }
 
-    unreachable!("mixed refinement loop returns on certification, fallback, or max-step exhaustion")
+    Ok(Some(MixedPrecisionAttempt::Fallback {
+        reason: "mixed refinement loop exhausted without certification".to_string(),
+    }))
 }
 
 fn mixed_precision_kappa_gate_failure(
@@ -6217,7 +6219,7 @@ fn solve_arrow_newton_step_artifacts(
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
-                        eprintln!("arrow-Schur mixed precision fallback to f64: {reason}");
+                        log::info!("arrow-Schur mixed precision fallback to f64: {reason}");
                         mixed_precision_status = MixedPrecisionStatus::F64Fallback;
                     }
                 }
@@ -6255,7 +6257,7 @@ fn solve_arrow_newton_step_artifacts(
                         });
                     }
                     MixedPrecisionAttempt::Fallback { reason } => {
-                        eprintln!("arrow-Schur mixed precision fallback to f64: {reason}");
+                        log::info!("arrow-Schur mixed precision fallback to f64: {reason}");
                         mixed_precision_status = MixedPrecisionStatus::F64Fallback;
                     }
                 }
@@ -6266,7 +6268,7 @@ fn solve_arrow_newton_step_artifacts(
         }
         ArrowSolverMode::InexactPCG => {
             if options.mixed_precision.is_enabled() {
-                eprintln!(
+                log::info!(
                     "arrow-Schur mixed precision fallback to f64: InexactPCG does not expose a dense Schur factor for certified f32 refinement"
                 );
                 mixed_precision_status = MixedPrecisionStatus::F64Fallback;
